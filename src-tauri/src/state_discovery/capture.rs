@@ -51,9 +51,37 @@ const SAMPLE_RATE: u32 = 1;
 /// when nothing yields a usable slug; the observation is then recorded
 /// unlabelled rather than dropped, since it still carries co-occurrence
 /// signal for the global derivation.
-fn resolve_page_label(snapshot: &serde_json::Value) -> Option<String> {
-    let page = snapshot.get("page");
-    let page_context = page.and_then(|p| p.get("pageContext"));
+///
+/// Sources 1–3 are [`resolve_declared_page_label`]; this function only adds
+/// the pathname arm after them. A caller that must never carry URL-path
+/// content (the journey ledger — a concrete path can embed user input such as
+/// `/search/<term>`) calls [`resolve_declared_page_label`] instead.
+pub(crate) fn resolve_page_label(snapshot: &serde_json::Value) -> Option<String> {
+    resolve_declared_page_label(snapshot).or_else(|| {
+        let raw = snapshot
+            .get("page")
+            .and_then(|p| p.get("pathname"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())?;
+        Some(pathname_to_spec_id(raw))
+    })
+}
+
+/// The APP-DECLARED page identity of a snapshot: sources 1–3 of
+/// [`resolve_page_label`] (`pageContext.meta.tabId`, then `activeTab`, then
+/// the slugged `pageContext.name`) and NEVER `page.pathname`, raw or slugged.
+///
+/// This is the privacy-safe half of the resolver. Every value it can return
+/// was declared by the app's developer (a tab id, or a display name passed to
+/// `usePageContext`), so none of it is user input; the pathname arm is where
+/// user input can ride in (`/search/secret` slugs to `search-secret`). The
+/// value is always slugged, so a display name such as `"Import / Export"`
+/// becomes `import-export` and never contains a `/`.
+///
+/// Same blank-skipping rule as [`resolve_page_label`]: a whitespace-only
+/// candidate falls through instead of shadowing the next source.
+pub(crate) fn resolve_declared_page_label(snapshot: &serde_json::Value) -> Option<String> {
+    let page_context = snapshot.get("page").and_then(|p| p.get("pageContext"));
 
     let candidates = [
         page_context
@@ -61,7 +89,6 @@ fn resolve_page_label(snapshot: &serde_json::Value) -> Option<String> {
             .and_then(|m| m.get("tabId")),
         snapshot.get("activeTab"),
         page_context.and_then(|c| c.get("name")),
-        page.and_then(|p| p.get("pathname")),
     ];
 
     let raw = candidates
@@ -718,6 +745,44 @@ mod tests {
             resolve_page_label(&json!({ "page": { "pathname": "   " } })),
             None
         );
+    }
+
+    #[test]
+    fn declared_label_never_reads_the_pathname() {
+        // The privacy half of the resolver: a snapshot whose ONLY page
+        // identity is the URL path yields no declared label, while the
+        // co-occurrence resolver still falls back to the slugged path.
+        let snap = json!({ "page": { "pathname": "/search/secret" } });
+        assert_eq!(resolve_declared_page_label(&snap), None);
+        assert_eq!(
+            resolve_page_label(&snap).as_deref(),
+            Some("search-secret"),
+            "the co-occurrence resolver's pathname arm must be unchanged"
+        );
+    }
+
+    #[test]
+    fn declared_label_slugs_a_display_name_with_a_slash() {
+        let snap = json!({
+            "page": { "pathname": "/x", "pageContext": { "name": "Import / Export" } }
+        });
+        let label = resolve_declared_page_label(&snap).unwrap();
+        assert_eq!(label, "import-export");
+        assert!(!label.contains('/'));
+    }
+
+    #[test]
+    fn declared_label_agrees_with_the_full_resolver_when_declared() {
+        for snap in [
+            json!({ "page": { "pathname": "/", "pageContext": { "meta": { "tabId": "t-1" } } } }),
+            json!({ "activeTab": "capture", "page": { "pathname": "/" } }),
+            json!({ "page": { "pathname": "/", "pageContext": { "name": "Active Dashboard" } } }),
+        ] {
+            assert_eq!(
+                resolve_declared_page_label(&snap),
+                resolve_page_label(&snap)
+            );
+        }
     }
 
     #[test]

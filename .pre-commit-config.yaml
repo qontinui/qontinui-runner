@@ -93,10 +93,16 @@ repos:
       # instead of after the PR does. Moving it into CI is a live option to be
       # judged on that trade, not a blocked one.
       #
-      # Triggered ONLY by edits to the decision or its test, so a normal commit
-      # pays nothing. That is what lets it live at pre-commit at all: it needs no
-      # Rust toolchain, no qontinui-schemas checkout and no network, only
-      # throwaway git repos under $TMPDIR (which it now cleans up after itself).
+      # Triggered ONLY by edits to the decision, its test, the drift hook
+      # (whose MINE message the test now pins through the library's renderer),
+      # or gen-events-path-deps-check.sh (which the test runs on fixtures),
+      # so a normal commit pays nothing. That is what lets it live at pre-commit
+      # at all: it needs no Rust toolchain, no qontinui-schemas checkout and no
+      # network, only throwaway git repos under $TMPDIR (which it now cleans up
+      # after itself). The markdown premise guard does NOT depend on this
+      # trigger: the library re-runs it on every attribution decision the drift
+      # hook makes. Nor does the path-dependency completeness check, which
+      # guards Cargo.toml rather than these files: it has its own hook below.
       #
       # It is deliberately NOT `always_run`. A guard's guard that fires on every
       # commit gets SKIP=-ed, and then neither runs.
@@ -108,7 +114,25 @@ repos:
         # output only when it fails, and a passing run should still say which
         # arms it exercised (it reports skips, which a bare "Passed" would hide).
         verbose: true
-        files: '^\.pre-commit-hooks/(lib/gen-events-attribution\.sh|gen-events-drift-attribution-test\.sh)$'
+        files: '^\.pre-commit-hooks/(lib/gen-events-attribution\.sh|gen-events-drift-attribution-test\.sh|gen-events-drift\.sh|gen-events-path-deps-check\.sh)$'
+        pass_filenames: false
+
+      # Every in-repo path dependency of the export build must be an attribution
+      # input, or an edit to that crate clears a guilty pusher (two crates were
+      # once missing). What can break that is a MANIFEST edit, so this runs on
+      # any Cargo.toml — and on the library that holds the list. Its own hook
+      # rather than a wider trigger on the attribution test: the manifest walk
+      # takes well under a second, the full test ~16s, and Cargo.toml changes
+      # in a few percent of commits (38 of 2021 since 2026-06-30, measured
+      # 2026-09-30). `stages: [pre-commit]` for the reason push-range-test
+      # gives below: the pre-push stage set is what the direct-shim installer
+      # mirrors, and this gates the edit, not the push.
+      - id: gen-events-path-deps
+        name: gen-events drift — in-repo path deps are attribution inputs
+        entry: bash .pre-commit-hooks/gen-events-path-deps-check.sh
+        language: system
+        stages: [pre-commit]
+        files: '(^|/)Cargo\.toml$|^\.pre-commit-hooks/(lib/gen-events-attribution\.sh|gen-events-path-deps-check\.sh)$'
         pass_filenames: false
 
       # Same reasoning one file over: the base-ref cascade in
@@ -122,7 +146,7 @@ repos:
       # assert on cargo's own manifest-load error text; they SKIP with a stated
       # reason when cargo is absent.)
       #
-      # Explicitly `stages: [pre-commit]`, unlike the entry above. The pre-push
+      # Explicitly `stages: [pre-commit]`, unlike gen-events-attribution-test. The pre-push
       # stage set is what a direct-shim installer has to mirror, so this test
       # deliberately does not enlarge it — it gates the edit, which is when it
       # can actually catch something.
@@ -158,6 +182,18 @@ repos:
         stages: [pre-commit]
         verbose: true
         files: '^(\.pre-commit-hooks/(lib/crate-inputs\.sh|crate-inputs-test\.sh)|src-tauri/build\.rs|src-tauri/Cargo\.toml|Cargo\.toml)$'
+        pass_filenames: false
+
+      # `lib/scratch-cleanup.sh` keeps a read-only baseline snapshot (the
+      # SHA-keyed sibling store) from turning gen-events-drift's EXIT-trap
+      # cleanup into a failed push after a passing drift check (finding 51901722).
+      - id: scratch-cleanup-test
+        name: hook scratch-tree cleanup — tests
+        entry: bash .pre-commit-hooks/scratch-cleanup-test.sh
+        language: system
+        stages: [pre-commit]
+        verbose: true
+        files: '^\.pre-commit-hooks/(lib/scratch-cleanup\.sh|scratch-cleanup-test\.sh|gen-events-drift\.sh)$'
         pass_filenames: false
 
       # `lib/shared-target.sh` is what makes BOTH pre-push hooks build into the

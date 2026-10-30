@@ -16,6 +16,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { createLogger } from "@/lib/logger";
+import { describeThrown } from "@/lib/utils";
 
 const log = createLogger("useSavedProjects");
 
@@ -119,7 +120,7 @@ export function useSavedProjects(): UseSavedProjectsResult {
       const result = await invoke<SavedProject[]>("list_saved_projects");
       setProjects(Array.isArray(result) ? result : []);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Failed to list saved projects");
       log.error("Failed to list saved projects", msg);
       setError(msg);
       setProjects([]);
@@ -137,7 +138,7 @@ export function useSavedProjects(): UseSavedProjectsResult {
       try {
         await invoke<void>("add_saved_project", { project });
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describeThrown(err, "Failed to add saved project");
         log.error("Failed to add saved project", msg);
         setError(msg);
         throw err;
@@ -156,7 +157,7 @@ export function useSavedProjects(): UseSavedProjectsResult {
       try {
         await invoke<void>("remove_saved_project", { id });
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describeThrown(err, "Failed to remove saved project");
         log.error("Failed to remove saved project", msg);
         setError(msg);
         throw err;
@@ -175,7 +176,7 @@ export function useSavedProjects(): UseSavedProjectsResult {
       try {
         await invoke<void>("save_saved_projects", { projects: next });
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describeThrown(err, "Failed to save saved projects");
         log.error("Failed to save saved projects", msg);
         setError(msg);
         throw err;

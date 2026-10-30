@@ -1,4 +1,4 @@
-import { getApiPort } from "@/lib/runner-api";
+import { getApiPort, runnerBaseForPort } from "@/lib/runner-api";
 import {
   type RegisteredElement,
   type RegisteredComponent,
@@ -13,7 +13,7 @@ import type { SerializedElement, SerializedComponent } from "./types";
 export async function httpSendResponse(response: unknown): Promise<boolean> {
   try {
     const port = getApiPort();
-    const resp = await fetch(`http://localhost:${port}/ui-bridge/ipc-response`, {
+    const resp = await fetch(`${runnerBaseForPort(port)}/ui-bridge/ipc-response`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(response),
@@ -92,7 +92,7 @@ function mintDocumentNonce(): string {
  */
 export function pongUrl(port: number | string, source: PongSource, windowLabel: string): string {
   return (
-    `http://localhost:${port}/ui-bridge/pong?source=${source}` +
+    `${runnerBaseForPort(port)}/ui-bridge/pong?source=${source}` +
     `&label=${encodeURIComponent(windowLabel)}&doc=${encodeURIComponent(DOCUMENT_NONCE)}`
   );
 }
@@ -122,14 +122,100 @@ export function pongEventPayload(windowLabel: string): {
  * not evidence that the main window is alive.
  */
 export async function httpSendPong(source: PongSource, windowLabel: string): Promise<boolean> {
+  // Bounded: a request to a stalled API runtime (or one parked in the accept
+  // backlog) would otherwise neither resolve nor reject, so the caller's
+  // fallback never runs and one hung fetch piles up per ping. An
+  // AbortController + timer needs nothing newer than AbortController itself;
+  // `AbortSignal.timeout` is newer (Chromium 103, Safari 16 per MDN's
+  // compatibility table), and where it is missing the call would throw and
+  // fail every pong.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PONG_HTTP_TIMEOUT_MS);
   try {
     const resp = await fetch(pongUrl(getApiPort(), source, windowLabel), {
       method: "POST",
+      signal: controller.signal,
     });
     return resp.ok;
   } catch {
     return false;
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+/**
+ * How long one HTTP pong may take before it counts as failed. Well under the
+ * 3 s ping cadence, so a hung leg is abandoned before the next ping arrives.
+ */
+export const PONG_HTTP_TIMEOUT_MS = 2_000;
+
+/** `promise`, or `fallback` once `ms` elapse without it settling. */
+function settleWithin<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise<T>((resolve) => {
+    const timer = setTimeout(() => resolve(fallback), ms);
+    promise.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(fallback);
+      },
+    );
+  });
+}
+
+/**
+ * Answer one `ui-bridge-ping`: HTTP FIRST, the Tauri event only as fallback.
+ *
+ * Reaching the ping listener at all proves the native event loop delivered
+ * the ping, so the answer carries "event" provenance on either leg. The order
+ * matters because the two legs run on different Rust runtimes. A Tauri
+ * `emit` from JS is an async Tauri command, which Tauri runs on its async
+ * runtime — the runner's `app-rt`. When `app-rt`'s workers are all parked
+ * (synchronous process creation, spaceship 2026-10-18/19) that promise
+ * neither resolves nor rejects, the event pong never lands, and the runner
+ * reads a pumping UI as wedged. `POST /ui-bridge/pong?source=event` is served
+ * by the API's own runtime (`mcp-api-rt`), so it lands regardless (plan
+ * 2026-10-19-runner-ui-wedge-signal-fires-when-the-app-runtime-is-starved-by-process-spawns).
+ * The emit is kept as the fallback for an HTTP failure — including an HTTP
+ * leg that does not settle within `httpTimeoutMs` (a stalled API runtime) —
+ * and is bounded by the same timeout; it cannot delay the HTTP leg.
+ *
+ * `http` and `emit` are injectable for tests.
+ */
+export async function answerPing(
+  windowLabel: string,
+  emit: (payload: ReturnType<typeof pongEventPayload>) => Promise<void>,
+  http: (source: PongSource, windowLabel: string) => Promise<boolean> = httpSendPong,
+  httpTimeoutMs: number = PONG_HTTP_TIMEOUT_MS,
+): Promise<"http" | "event" | "failed"> {
+  // The HTTP leg is bounded here as well as inside `httpSendPong`, so an
+  // injected or future transport that never settles still reaches the
+  // fallback: a stalled API runtime must not swallow the pong either.
+  // (`Promise.resolve().then` on both legs, so a synchronous throw is a failed
+  // leg rather than a rejected `answerPing`.)
+  const httpLanded = await settleWithin(
+    Promise.resolve().then(() => http("event", windowLabel)),
+    httpTimeoutMs,
+    false,
+  );
+  if (httpLanded) {
+    return "http";
+  }
+  // The fallback is bounded too: while both legs are stalled, an unbounded
+  // wait would leave one pending handler behind per ping. The bound frees this
+  // handler only; the underlying IPC emit stays pending until `app-rt` drains.
+  const emitted = await settleWithin(
+    Promise.resolve()
+      .then(() => emit(pongEventPayload(windowLabel)))
+      .then(() => true),
+    httpTimeoutMs,
+    false,
+  );
+  return emitted ? "event" : "failed";
 }
 
 /**
@@ -1004,12 +1090,12 @@ export function toFindRequest(source: unknown): Record<string, unknown> {
     // forwarding the key would turn the SDK's `!== undefined` checks into
     // present-but-undefined, which reads differently in a `key in obj` test.
     //
-    // `null` is deliberately NOT skipped. `ui_bridge_discover_handler` builds
-    // `options` from six `Option<T>` fields, so an unspecified filter arrives
-    // as an explicit null; the previous allowlists forwarded those too (their
-    // guard was `!== undefined`), and the SDK reads each through a truthiness
-    // or `=== false` check, so they are inert. Skipping them here would be a
-    // behaviour change dressed as a tidy-up.
+    // `null` is deliberately NOT skipped: a caller that sends an explicit null
+    // gets it forwarded, as the previous allowlists did (their guard was
+    // `!== undefined`). `ui_bridge_discover_handler` no longer manufactures
+    // nulls for unset filters — it omits them — and `withIncludeHiddenDefault`
+    // treats an explicit `includeHidden: null` as unset, since the SDK would
+    // otherwise read it as false.
     if (value === undefined) continue;
     if ((FIND_ENVELOPE_KEYS as readonly string[]).includes(key)) continue;
     request[key] = value;
@@ -1017,10 +1103,12 @@ export function toFindRequest(source: unknown): Record<string, unknown> {
 
   for (const [snake, camel] of FIND_SNAKE_ALIASES) {
     if (!(snake in request)) continue;
-    // The caller's own camelCase value wins; the alias only fills a gap. Then
-    // the snake key is dropped so exactly one spelling reaches the SDK, which
-    // is what the previous per-key mapping did.
-    if (!(camel in request)) request[camel] = request[snake];
+    // The caller's own camelCase value wins; the alias only fills a gap — and
+    // a camelCase `null` is a gap, since downstream defaults treat `null` as
+    // unset (`withIncludeHiddenDefault`). Then the snake key is dropped so
+    // exactly one spelling reaches the SDK, which is what the previous per-key
+    // mapping did.
+    if (request[camel] == null) request[camel] = request[snake];
     delete request[snake];
   }
 

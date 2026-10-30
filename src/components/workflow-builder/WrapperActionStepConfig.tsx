@@ -26,6 +26,7 @@ import { listWrappers } from "@/lib/wrappers/api";
 import type { ActionDescriptor, InstalledWrapper } from "@/lib/wrappers/types";
 import { ParamSchemaForm } from "../wrappers/ParamSchemaForm";
 import type { UnifiedStep } from "../../types/unified-workflow";
+import { describeThrown } from "@/lib/utils";
 
 type WrapperActionStep = UnifiedStep & { type: "wrapper_action" };
 type StepUpdater = (updates: Partial<WrapperActionStep>) => void;
@@ -53,7 +54,7 @@ export function WrapperActionStepConfig({ step, onUpdate }: Props) {
       })
       .catch((err: unknown) => {
         if (cancelled) return;
-        setLoadError(err instanceof Error ? err.message : String(err));
+        setLoadError(describeThrown(err, "Failed to load wrappers"));
         setWrappers([]);
       })
       .finally(() => {

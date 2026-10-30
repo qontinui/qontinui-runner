@@ -11,7 +11,7 @@
  */
 
 import { getPerformanceMonitor } from "./performance";
-import { getErrorMessage } from "./utils";
+import { describeThrown } from "./utils";
 
 // ============================================================================
 // Types
@@ -115,7 +115,7 @@ export class NetworkMonitor {
         return response;
       } catch (error) {
         // End tracking with error
-        this.endRequest(requestId, 0, getErrorMessage(error));
+        this.endRequest(requestId, 0, describeThrown(error, "network request failed"));
         throw error;
       }
     };

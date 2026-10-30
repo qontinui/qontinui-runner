@@ -2,8 +2,8 @@
 //!
 //! Follows the same HashMap-based manager pattern as `claude_session::SessionManager`.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tauri::{AppHandle, Emitter};
 use tracing::{debug, error, info, warn};
@@ -30,7 +30,63 @@ pub struct TerminalManager {
     /// `2026-09-16-remote-tab-cannot-be-released-so-the-target-terminal-stays-claimed`).
     /// Removed with the session in [`Self::close`].
     remote_panes: Mutex<HashMap<TerminalId, Arc<super::remote_pane_io::RemotePaneIo>>>,
+    /// Told `(pinned harness id, terminal id, coord session id)` every time a
+    /// terminal is wired to its coord session row
+    /// ([`Self::bind_coord_session`]). main.rs
+    /// attaches the finished-marker late delivery here, so a mark made before
+    /// the terminal had a coord row is not stranded local-only. Unattached →
+    /// binding just sets the id.
+    coord_bind_observer: OnceLock<CoordBindObserver>,
+    /// Terminal ids being BUILT right now — by [`Self::create`] (whose holder
+    /// pane exists before its session is inserted) or by
+    /// [`Self::adopt_holder_pane`]. Claimed under the sessions lock together
+    /// with the "not already open" check ([`Self::claim_in_flight`]), so no
+    /// build can insert over another (orphaning a session, unlisted but
+    /// running), and the boot sweep skips them.
+    in_flight: Mutex<HashSet<String>>,
 }
+
+/// Why [`TerminalManager::adopt_holder_pane`] adopted nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdoptError {
+    /// The terminal id is already open or being built: another path owns it.
+    Claimed(String),
+    /// The attach to the holder failed — definitively or not
+    /// ([`super::daemon_pane_io::AttachError::definitive`]).
+    Attach(super::daemon_pane_io::AttachError),
+    /// The session could not be built around the attached pane, which was
+    /// detached again (the holder keeps its child).
+    Session(String),
+}
+
+impl std::fmt::Display for AdoptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdoptError::Claimed(m) => write!(f, "{m}"),
+            AdoptError::Attach(e) => write!(f, "{e}"),
+            AdoptError::Session(m) => write!(f, "session: {m}"),
+        }
+    }
+}
+
+/// A [`TerminalManager::claim_in_flight`] claim, released on drop.
+struct InFlightClaim<'a> {
+    manager: &'a TerminalManager,
+    id: String,
+}
+
+impl Drop for InFlightClaim<'_> {
+    fn drop(&mut self) {
+        self.manager
+            .in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.id);
+    }
+}
+
+/// See [`TerminalManager::coord_bind_observer`].
+type CoordBindObserver = Box<dyn Fn(&str, &str, uuid::Uuid) + Send + Sync>;
 
 /// Whether opening a terminal in `dir` should pre-accept Claude's workspace
 /// trust for it.
@@ -157,6 +213,25 @@ fn is_within(dir: &str, root: &str) -> bool {
     d == r || d.starts_with(&r_prefix)
 }
 
+/// The rule behind [`TerminalManager::coord_session_id_for_pinned`], over
+/// `(pinned harness id, coord session id)` for every live terminal — pure so
+/// the production rule is unit-testable without a PTY: the coord row of a live
+/// terminal PINNED to `claude_session_id` that has one.
+///
+/// It resolves by pinned id ONLY. A session the provider adopted onto a
+/// terminal (`/clear`) resolves through its predecessor's id instead
+/// (`TerminalSessionRecord::adopted_from`), never through whatever terminal it
+/// happens to name: a typed `claude --resume X` names a pane pinned to some
+/// other id, and that pane's row is not X's.
+pub(crate) fn resolve_pinned_coord<'a>(
+    terminals: impl Iterator<Item = (&'a str, Option<uuid::Uuid>)>,
+    claude_session_id: &str,
+) -> Option<uuid::Uuid> {
+    terminals
+        .filter(|(pinned, _)| *pinned == claude_session_id)
+        .find_map(|(_, coord)| coord)
+}
+
 impl TerminalManager {
     /// Create a new terminal manager with an empty interceptor pipeline.
     pub fn new() -> Self {
@@ -165,7 +240,50 @@ impl TerminalManager {
             interceptor: Arc::new(OutputInterceptor::new()),
             remote_identities: Mutex::new(HashMap::new()),
             remote_panes: Mutex::new(HashMap::new()),
+            coord_bind_observer: OnceLock::new(),
+            in_flight: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Attach the coord-bind observer (once, at startup). See
+    /// [`Self::coord_bind_observer`].
+    pub fn attach_coord_bind_observer(
+        &self,
+        f: impl Fn(&str, &str, uuid::Uuid) + Send + Sync + 'static,
+    ) {
+        if self.coord_bind_observer.set(Box::new(f)).is_err() {
+            warn!("terminal manager: coord-bind observer already attached — ignoring");
+        }
+    }
+
+    /// Wire `session` to its coord session row — the ONE door every create
+    /// path uses instead of calling [`TerminalSession::set_coord_session_id`]
+    /// directly, so the coord-bind observer sees every binding.
+    ///
+    /// The observer runs with no manager lock held: the production observer
+    /// resolves through [`Self::coord_session_id_for_pinned`] (the `sessions`
+    /// lock) and takes the lifecycle store's `finish_forward`, so this must
+    /// never be called while holding `sessions` or from a finish observer.
+    pub fn bind_coord_session(&self, session: &TerminalSession, coord_id: uuid::Uuid) {
+        session.set_coord_session_id(coord_id);
+        if let Some(obs) = self.coord_bind_observer.get() {
+            obs(session.pinned_session_id(), session.id(), coord_id);
+        }
+    }
+
+    /// The coord session id of the live terminal whose pinned harness id is
+    /// `pinned_session_id` — the id a terminal-hosted `claude` runs under and
+    /// that its coord row is registered by. `None` when no live terminal is
+    /// pinned to it, or that terminal has no coord row yet. See
+    /// [`resolve_pinned_coord`].
+    pub fn coord_session_id_for_pinned(&self, pinned_session_id: &str) -> Option<uuid::Uuid> {
+        let sessions = self.sessions.lock().ok()?;
+        resolve_pinned_coord(
+            sessions
+                .values()
+                .map(|s| (s.pinned_session_id(), s.coord_session_id())),
+            pinned_session_id,
+        )
     }
 
     /// Record the pane behind a remote tab (see `remote_panes`).
@@ -247,6 +365,9 @@ impl TerminalManager {
         spawn_tenant: Option<uuid::Uuid>,
     ) -> Result<TerminalInfo, String> {
         let id = uuid::Uuid::new_v4().to_string();
+        // Claimed until the session is inserted (the claim drops at return):
+        // the boot sweep never probes or adopts this pane meanwhile.
+        let _building = self.claim_in_flight(&id)?;
         let title = title.unwrap_or_else(|| format!("Terminal {}", self.count() + 1));
         let working_dir = working_dir
             .filter(|d| !d.is_empty())
@@ -446,7 +567,143 @@ impl TerminalManager {
         io: Arc<dyn super::pane_io::PaneIo>,
         pinned_session_id: String,
     ) -> Result<TerminalInfo, String> {
-        let id = uuid::Uuid::new_v4().to_string();
+        self.insert_with_io(
+            uuid::Uuid::new_v4().to_string(),
+            title,
+            working_dir,
+            page_id,
+            cols,
+            rows,
+            app_handle,
+            io,
+            pinned_session_id,
+        )
+    }
+
+    /// Re-adopt a terminal whose PTY a holder kept alive across a runner
+    /// restart (plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+    /// D14): attach a FRESH consumer to holder pane `terminal_id` — restore
+    /// envelope and size nudge included ([`DaemonPaneIo::attach_existing`]) —
+    /// and build the session around it under that same id (the pane id is the
+    /// local correlation key). The tab's title and working directory come from
+    /// the holder's restore metadata ([`DaemonPaneIo::session_identity`]): the
+    /// remote path passes `""` for a cwd it cannot know, a local holder can.
+    ///
+    /// `from_offset` is the first byte this runner already holds for the pane
+    /// (`None`: none — the ring's tail); `size` is the consumer's fitted size,
+    /// or `None` to keep the PTY's own (the boot sweep adopts before any
+    /// webview has fit a tab). `pinned_session_id` is the harness session id
+    /// the caller resolved for the pane (the holder does not carry one).
+    ///
+    /// [`DaemonPaneIo::attach_existing`]: super::daemon_pane_io::DaemonPaneIo::attach_existing
+    /// [`DaemonPaneIo::session_identity`]: super::daemon_pane_io::DaemonPaneIo::session_identity
+    #[allow(clippy::too_many_arguments)]
+    pub fn adopt_holder_pane(
+        &self,
+        terminal_id: &str,
+        from_offset: Option<u64>,
+        page_id: Option<String>,
+        size: Option<(u16, u16)>,
+        app_handle: AppHandle,
+        pinned_session_id: String,
+    ) -> Result<TerminalInfo, AdoptError> {
+        // Insert-if-absent: never over an open terminal, and never over one
+        // being built (inserting under a live id would orphan that session —
+        // still running, no longer listed).
+        let _building = self
+            .claim_in_flight(terminal_id)
+            .map_err(AdoptError::Claimed)?;
+        let pane = Arc::new(
+            super::daemon_pane_io::reattach_holder_pane(terminal_id, from_offset, size)
+                .map_err(AdoptError::Attach)?,
+        );
+        let (title, cwd) = pane.session_identity();
+        let (cols, rows) = pane.dims();
+        let io: Arc<dyn super::pane_io::PaneIo> = pane.clone();
+        self.insert_with_io(
+            terminal_id.to_string(),
+            title,
+            cwd,
+            page_id,
+            cols,
+            rows,
+            app_handle,
+            io,
+            pinned_session_id,
+        )
+        .map_err(|e| {
+            // The session could not be built around the attached pane. DETACH
+            // it, so that dropping it does not kill the live session: the
+            // holder keeps the child for a retry.
+            let _ = super::pane_io::PaneIo::release(
+                pane.as_ref(),
+                super::daemon_pane_io::DETACH_FRAME_BUDGET,
+            );
+            AdoptError::Session(e)
+        })
+    }
+
+    /// Claim `id` as being built: refused when it is already open or already
+    /// claimed. The check and the claim are one step under the sessions lock.
+    /// The claim is released when the returned guard drops.
+    fn claim_in_flight(&self, id: &str) -> Result<InFlightClaim<'_>, String> {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|e| format!("Sessions lock poisoned: {}", e))?;
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        if sessions.contains_key(id) || !in_flight.insert(id.to_string()) {
+            return Err(format!(
+                "terminal {id} is already open or being built; not building it again"
+            ));
+        }
+        Ok(InFlightClaim {
+            manager: self,
+            id: id.to_string(),
+        })
+    }
+
+    /// Ids being built right now — a holder being spawned for one of them may
+    /// not hold its lock yet, so a probe could steal it (the holder census
+    /// skips these and counts them as unknown).
+    pub fn in_flight_ids(&self) -> Vec<String> {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Ids open now AND ids being built: what the boot sweep must not probe.
+    pub fn open_or_in_flight_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.list().into_iter().map(|t| t.id).collect();
+        ids.extend(
+            self.in_flight
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .cloned(),
+        );
+        ids
+    }
+
+    /// The registry half of [`Self::create_with_io`] and
+    /// [`Self::adopt_holder_pane`]: build the session around `io` under `id`,
+    /// insert it, emit `terminal-created`.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_with_io(
+        &self,
+        id: String,
+        title: String,
+        working_dir: String,
+        page_id: Option<String>,
+        cols: u16,
+        rows: u16,
+        app_handle: AppHandle,
+        io: Arc<dyn super::pane_io::PaneIo>,
+        pinned_session_id: String,
+    ) -> Result<TerminalInfo, String> {
         let page_id = page_id.unwrap_or_else(|| "default".to_string());
 
         let emitter = app_handle.clone();
@@ -483,6 +740,16 @@ impl TerminalManager {
     /// Get a terminal session by ID.
     pub fn get(&self, id: &str) -> Option<Arc<TerminalSession>> {
         self.sessions.lock().ok().and_then(|s| s.get(id).cloned())
+    }
+
+    /// Test seam: mark `id` as being built, as `create` does for the length
+    /// of a spawn.
+    #[cfg(test)]
+    pub(crate) fn mark_in_flight_for_test(&self, id: &str) {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id.to_string());
     }
 
     /// Test seam: hold `session` under `id` without spawning a PTY.
@@ -584,6 +851,11 @@ impl TerminalManager {
 
     /// Remove and close a terminal session.
     pub fn close(&self, id: &str) -> Result<(), String> {
+        // The whole close the operator waits for: the tree kill (its own
+        // `terminal_close.kill` span, inside `PaneIo::kill`), the joins and the
+        // writer/master release (plan
+        // `2026-10-19-served-corpus-probe-budget-excludes-process-creation`).
+        let _span = tracing::debug_span!("terminal_close", terminal_id = %id).entered();
         let session = {
             let mut sessions = self
                 .sessions
@@ -823,13 +1095,22 @@ impl TerminalManager {
     /// child process tree still dies (that is the part whose omission would
     /// leak processes), while the thread joins and the shim-dir sweep are
     /// skipped. The imminent `process::exit` reclaims the rest.
-    pub fn close_all(&self, deadline: std::time::Instant) {
+    ///
+    /// Returns whether the teardown was COMPLETE: `true` when every terminal
+    /// got its full close (none fell to the kill-only fallback), or there was
+    /// none to close; `false` when any was degraded, or the sessions lock was
+    /// poisoned and nothing was closed. `run_teardown` stamps the shutdown
+    /// marker `teardown_complete` only on `true` (plan
+    /// `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
+    /// Phase 3).
+    #[must_use = "the result says whether the teardown finished; the shutdown marker records it"]
+    pub fn close_all(&self, deadline: std::time::Instant) -> bool {
         let sessions: Vec<Arc<TerminalSession>> = {
             match self.sessions.lock() {
                 Ok(mut s) => s.drain().map(|(_, v)| v).collect(),
                 Err(e) => {
                     error!("Sessions lock poisoned during close_all: {}", e);
-                    return;
+                    return false;
                 }
             }
         };
@@ -841,7 +1122,7 @@ impl TerminalManager {
         }
 
         if sessions.is_empty() {
-            return;
+            return true;
         }
 
         info!("Closing {} terminal session(s)", sessions.len());
@@ -863,6 +1144,7 @@ impl TerminalManager {
             );
         }
         info!("All terminal sessions closed");
+        degraded == 0
     }
 
     /// Get a reference to the output interceptor (for adding hooks).
@@ -900,6 +1182,107 @@ pub(crate) fn command_implies_bypass_permissions(argv: &[String]) -> bool {
 mod tests {
     use super::{apply_trust_arm, command_implies_bypass_permissions, TerminalManager, TrustArm};
 
+    /// Review (adoption) M1: the late-delivery wiring end to end on a REAL
+    /// manager. `bind_coord_session` must fire the observer with the
+    /// terminal's PINNED harness id (not its terminal id), and
+    /// `coord_session_id_for_pinned` must resolve that pinned id — never the
+    /// terminal id — to the bound row.
+    #[test]
+    fn bind_coord_session_fires_the_observer_with_the_pinned_id() {
+        use std::sync::{Arc, Mutex};
+        let tm = Arc::new(TerminalManager::new());
+        let session = Arc::new(crate::terminal::session::tests::make_test_session(
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        tm.insert_for_test("term-1", session.clone());
+        let seen: Arc<Mutex<Vec<(String, String, uuid::Uuid)>>> = Default::default();
+        let resolved_in_observer: Arc<Mutex<Vec<Option<uuid::Uuid>>>> = Default::default();
+        {
+            let seen = seen.clone();
+            let resolved_in_observer = resolved_in_observer.clone();
+            let weak = Arc::downgrade(&tm);
+            tm.attach_coord_bind_observer(move |pinned, terminal, coord| {
+                seen.lock()
+                    .unwrap()
+                    .push((pinned.to_string(), terminal.to_string(), coord));
+                // The production observer resolves through the manager's
+                // `sessions` lock: this would self-deadlock if the bind ran
+                // the observer under that lock, and it must already see the
+                // bind in flight.
+                let tm = weak.upgrade().expect("manager alive");
+                resolved_in_observer
+                    .lock()
+                    .unwrap()
+                    .push(tm.coord_session_id_for_pinned(pinned));
+            });
+        }
+        assert_eq!(
+            tm.coord_session_id_for_pinned("test-pinned-session"),
+            None,
+            "no row before the bind"
+        );
+
+        let coord = uuid::Uuid::new_v4();
+        tm.bind_coord_session(&session, coord);
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(
+                "test-pinned-session".to_string(),
+                session.id().to_string(),
+                coord
+            )],
+            "the observer sees every bind, keyed by the pinned harness id"
+        );
+        assert_eq!(
+            *resolved_in_observer.lock().unwrap(),
+            vec![Some(coord)],
+            "inside the observer the bind is already visible to the lookup"
+        );
+        assert_eq!(
+            tm.coord_session_id_for_pinned("test-pinned-session"),
+            Some(coord)
+        );
+        assert_eq!(
+            tm.coord_session_id_for_pinned(session.id()),
+            None,
+            "the terminal id is not a harness id and never resolves"
+        );
+    }
+
+    /// The production rule behind `coord_session_id_for_pinned`: a live
+    /// terminal pinned to the id, and only one that has a coord row.
+    #[test]
+    fn coord_session_id_for_pinned_resolves_only_a_pinned_terminal_with_a_row() {
+        use super::resolve_pinned_coord;
+        let (c1, c2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let live = || {
+            vec![
+                ("pinned-1", Some(c1)),
+                ("pinned-2", Some(c2)),
+                ("pinned-3", None),
+                // A second terminal pinned to the same id (a re-spawn) — the
+                // one with a row wins over the one without.
+                ("pinned-3", Some(c2)),
+                ("pinned-4", None),
+            ]
+            .into_iter()
+        };
+        assert_eq!(resolve_pinned_coord(live(), "pinned-1"), Some(c1));
+        assert_eq!(resolve_pinned_coord(live(), "pinned-2"), Some(c2));
+        assert_eq!(resolve_pinned_coord(live(), "pinned-3"), Some(c2));
+        assert_eq!(
+            resolve_pinned_coord(live(), "pinned-4"),
+            None,
+            "a pinned terminal with no coord row yet resolves nothing"
+        );
+        assert_eq!(
+            resolve_pinned_coord(live(), "typed-resume"),
+            None,
+            "an id no terminal is pinned to never resolves by terminal"
+        );
+    }
+
     /// Every close path clears BOTH remote maps. `close` and `close_all`
     /// always did; `close_after_graceful_exit` cleared only the identity, so
     /// a remote tab torn down by `graceful_exit` leaked its pane.
@@ -924,6 +1307,7 @@ mod tests {
                     remote_terminal_id: "490212f5-aaaa-bbbb-cccc-dddddddddddd".into(),
                     grant_jti: "jti-1".into(),
                     history_available: false,
+                    tenant: None,
                 },
             );
             let sink: Arc<dyn RemoteFrameSink> = Arc::new(RecordingSink::default());
@@ -966,9 +1350,49 @@ mod tests {
 
         let tm = TerminalManager::new();
         seed(&tm, "close-all-tab");
-        tm.close_all(std::time::Instant::now());
+        let _ = tm.close_all(std::time::Instant::now());
         assert!(tm.remote_identity("close-all-tab").is_none());
         assert!(tm.remote_pane("close-all-tab").is_none());
+    }
+
+    /// `close_all` reports whether the teardown FINISHED, which `run_teardown`
+    /// records as the shutdown marker's `teardown_complete` (plan
+    /// `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
+    /// Phase 3): no terminal → complete; every terminal closed before the
+    /// deadline → complete; one reached after it (kill-only) → NOT complete.
+    #[test]
+    fn close_all_reports_degraded_teardown() {
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        let session = || {
+            Arc::new(crate::terminal::session::tests::make_test_session(
+                Arc::new(Mutex::new(Vec::new())),
+            ))
+        };
+
+        let empty = TerminalManager::new();
+        assert!(
+            empty.close_all(Instant::now()),
+            "nothing to close is a complete teardown"
+        );
+
+        let in_budget = TerminalManager::new();
+        in_budget.insert_for_test("term-a", session());
+        in_budget.insert_for_test("term-b", session());
+        assert!(
+            in_budget.close_all(Instant::now() + Duration::from_secs(600)),
+            "every terminal closed inside the budget"
+        );
+        assert_eq!(in_budget.count_checked(), Some(0));
+
+        let exhausted = TerminalManager::new();
+        exhausted.insert_for_test("term-a", session());
+        exhausted.insert_for_test("term-b", session());
+        assert!(
+            !exhausted.close_all(Instant::now()),
+            "a kill-only fallback is a degraded teardown"
+        );
+        assert_eq!(exhausted.count_checked(), Some(0));
     }
 
     fn account_with(projects: serde_json::Value) -> tempfile::TempDir {

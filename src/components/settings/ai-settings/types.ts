@@ -1,6 +1,7 @@
 import type {
   AiSettings,
   AiProvider,
+  AccountSelectionMode,
   CliExecutionMode,
   GeminiAuthMethod,
   AiConnectionTestResult,
@@ -98,12 +99,12 @@ export const DEFAULT_AI_SETTINGS: AiSettings = {
     execution_mode: "auto",
     timeout_seconds: 600,
     config_dir: undefined,
-    // Default to highest-expected-usage so a multi-account runner
-    // auto-balances across accounts (and never pins to a single,
-    // possibly-exhausted one). No-op with fewer than two config dirs, so
-    // safe as the default. Matches the Rust default (settings.rs
-    // AccountSelectionMode::HighestExpectedUsage).
-    account_selection_mode: "highest_expected_usage",
+    // `account_selection_mode` and `account_selection_pinned` are deliberately
+    // ABSENT: these defaults are what the form shows when the load failed, and
+    // both are MACHINE-GLOBAL (mirrored into claude-accounts.json). An unknown
+    // value must be sent as "not provided" (the runner keeps the stored one) —
+    // never as an explicit default that would re-point or unpin every runner
+    // on the machine. The selector shows nothing selected until loaded.
   },
   claude_api: {
     model: "claude-sonnet-4-20250514",
@@ -149,6 +150,30 @@ export const PROVIDER_OPTIONS: {
     label: "Gemini API",
     description: "Direct Gemini API access with per-token billing",
   },
+];
+
+export const SELECTION_MODE_OPTIONS: {
+  mode: AccountSelectionMode;
+  label: string;
+  hint: string;
+}[] = [
+  { mode: "manual", label: "Manual", hint: "Select account above" },
+  {
+    mode: "alternating_handoff",
+    label: "Alternating Handoff",
+    hint: "Handoffs alternate between the top under-pace account and each of the others",
+  },
+  {
+    mode: "weighted_random",
+    label: "Weighted Random",
+    hint: "Random under-pace account, weighted by expected usage times how far behind it is",
+  },
+  {
+    mode: "highest_expected_usage",
+    label: "Highest Expected Usage",
+    hint: "Auto-select the under-pace account closest to its reset",
+  },
+  { mode: "least_usage", label: "Least Usage", hint: "Auto-select & failover on rate-limit" },
 ];
 
 export const EXECUTION_MODE_OPTIONS: {

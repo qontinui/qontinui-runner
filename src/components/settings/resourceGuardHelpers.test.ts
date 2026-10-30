@@ -32,13 +32,13 @@ import {
   SESSION_FLOOR_DEFAULT_WARN_GIB,
   SESSION_FLOOR_MAX_GIB,
   SESSION_FLOOR_MIN_GIB,
-  THREAD_CEILING_DEFAULT_CRITICAL,
-  THREAD_CEILING_DEFAULT_WARN,
-  THREAD_CEILING_FLOOR,
-  THREAD_CEILING_INPUT_MAX,
+  THREAD_CEILING_ABS_MAX,
   THREAD_CEILING_INPUT_MIN,
-  effectiveThreadCeilings,
+  parseThreadCeilingInput,
+  threadCeilingPlaceholder,
+  threadCeilingSourceText,
   threadCeilingsAreInverted,
+  type ThreadCeilingsReport,
 } from "./resourceGuardHelpers";
 
 describe("byte ↔ GiB conversion", () => {
@@ -158,15 +158,17 @@ describe("repo allowlist parsing", () => {
   });
 });
 
-describe("thread ceilings — every rule the mirror of the floors'", () => {
+describe("thread ceilings — the panel renders the runner's fold, never its own", () => {
   it("a ceiling is transposed when critical sits BELOW warn — the inverse comparison", () => {
     // `commands::resource_guard_settings::thread_ceilings_are_inverted`.
     expect(threadCeilingsAreInverted(256, 200)).toBe(true);
     expect(threadCeilingsAreInverted(256, 256)).toBe(false);
     expect(threadCeilingsAreInverted(256, 400)).toBe(false);
-    expect(
-      threadCeilingsAreInverted(THREAD_CEILING_DEFAULT_WARN, THREAD_CEILING_DEFAULT_CRITICAL),
-    ).toBe(false);
+    // Half a pair is never a transposition: the unset half is the machine
+    // default, which moves with the box and which the runner's fold coerces.
+    expect(threadCeilingsAreInverted(1000, null)).toBe(false);
+    expect(threadCeilingsAreInverted(null, 210)).toBe(false);
+    expect(threadCeilingsAreInverted(null, null)).toBe(false);
   });
 
   it("disagrees with the floor predicate on every non-equal pair", () => {
@@ -183,50 +185,159 @@ describe("thread ceilings — every rule the mirror of the floors'", () => {
     }
   });
 
-  it("folds with a min and clamps UP, the mirror of the floors' max-and-cap", () => {
-    // Shipped defaults enforce themselves.
+  it("the upper bound IS the runner's THREAD_CEILING_ABS_MAX, read from source", () => {
+    const src = readFileSync(
+      fileURLToPath(new URL("../../../src-tauri/src/resource_guard.rs", import.meta.url)),
+      "utf8",
+    );
+    const m = src.match(/const\s+THREAD_CEILING_ABS_MAX\s*:\s*usize\s*=\s*(\d+)\s*;/);
+    if (!m) throw new Error("THREAD_CEILING_ABS_MAX not found in resource_guard.rs");
+    expect(THREAD_CEILING_ABS_MAX).toBe(Number(m[1]));
+  });
+
+  it("commits clamped explicit values and reverts empty/invalid drafts, never to null", () => {
+    expect(parseThreadCeilingInput("600", null)).toBe(600);
+    expect(parseThreadCeilingInput("1", 300)).toBe(THREAD_CEILING_INPUT_MIN);
+    expect(parseThreadCeilingInput("99999", 300)).toBe(THREAD_CEILING_ABS_MAX);
+    // An explicit value stays explicit, an unset one stays unset: only the
+    // "Use machine default" button writes null.
+    expect(parseThreadCeilingInput("", 300)).toBe(300);
+    expect(parseThreadCeilingInput("abc", 300)).toBe(300);
+    expect(parseThreadCeilingInput("", null)).toBeNull();
+  });
+
+  /** merytshost under the 2026-10-01 load, as the runner reports it. */
+  const report = (over: Partial<ThreadCeilingsReport> = {}): ThreadCeilingsReport => ({
+    enabled: true,
+    warn: 555,
+    critical: 747,
+    provenance: { warn: "scaled", critical: "scaled" },
+    local: { warn: null, critical: null },
+    fleet: { warn: null, critical: null },
+    floor: { warn: 276, critical: 420 },
+    shift: 20,
+    clampMin: 220,
+    absMax: 2048,
+    scaled: {
+      warn: 555,
+      critical: 747,
+      sessionArm: { warn: 555, critical: 747 },
+      poolArm: { warn: 604, critical: 748 },
+      sessionCapacity: { warn: 192, critical: 288 },
+      baselineUsed: 171,
+      perSessionThreadsUsed: 2,
+    },
+    scaledUnknown: null,
+    inputs: {
+      cores: 48,
+      memTotalBytes: 368_000_000_000,
+      baseline: 171,
+      perSessionThreads: 2,
+      sessionThreadsNow: 328,
+      sessionCensusMisread: false,
+    },
+    ladderCoerced: false,
+    ...over,
+  });
+
+  it("names the term that decided each enforced ceiling, from the runner's report", () => {
+    expect(threadCeilingSourceText("warn", report())).toMatch(/48 cores.*session capacity/);
+    const light = report({
+      warn: 296,
+      scaled: { ...report().scaled!, warn: 296, poolArm: { warn: 296, critical: 440 } },
+    });
+    expect(threadCeilingSourceText("warn", light)).toMatch(/blocking-pool headroom/);
     expect(
-      effectiveThreadCeilings(THREAD_CEILING_DEFAULT_WARN, THREAD_CEILING_DEFAULT_CRITICAL),
-    ).toEqual({
-      warnThreads: THREAD_CEILING_DEFAULT_WARN,
-      criticalThreads: THREAD_CEILING_DEFAULT_CRITICAL,
-    });
-    // Above the built-in ceilings is inert — a local value may only TIGHTEN,
-    // and on a ceiling that means lowering.
-    expect(effectiveThreadCeilings(THREAD_CEILING_INPUT_MAX, THREAD_CEILING_INPUT_MAX)).toEqual({
-      warnThreads: THREAD_CEILING_DEFAULT_WARN,
-      criticalThreads: THREAD_CEILING_DEFAULT_CRITICAL,
-    });
-    // Below the clamp is raised back to it: a ceiling under a 150-151-thread
-    // idle runner is an unspawnable machine, not a stricter guard.
-    expect(effectiveThreadCeilings(THREAD_CEILING_INPUT_MIN, THREAD_CEILING_INPUT_MIN)).toEqual({
-      warnThreads: THREAD_CEILING_FLOOR,
-      criticalThreads: THREAD_CEILING_FLOOR,
-    });
-    // A tightened pair inside the band is honoured verbatim.
-    expect(effectiveThreadCeilings(220, 300)).toEqual({ warnThreads: 220, criticalThreads: 300 });
+      threadCeilingSourceText(
+        "warn",
+        report({
+          provenance: { warn: "floor", critical: "floor" },
+          scaled: null,
+          scaledUnknown: "cores_unknown",
+        }),
+      ),
+    ).toMatch(/unavailable \(cores unknown\)/);
+    expect(
+      threadCeilingSourceText(
+        "warn",
+        report({ provenance: { warn: "local", critical: "scaled" } }),
+      ),
+    ).toMatch(/your value/);
+    expect(
+      threadCeilingSourceText(
+        "critical",
+        report({ provenance: { warn: "scaled", critical: "fleet" } }),
+      ),
+    ).toMatch(/fleet ceiling/);
+    expect(
+      threadCeilingSourceText(
+        "warn",
+        report({ provenance: { warn: "clamp_min", critical: "scaled" } }),
+      ),
+    ).toMatch(/220/);
+    expect(
+      threadCeilingSourceText(
+        "warn",
+        report({ provenance: { warn: "clamp_max", critical: "scaled" } }),
+      ),
+    ).toMatch(/2048/);
+    expect(
+      threadCeilingSourceText(
+        "critical",
+        report({ provenance: { warn: "local", critical: "ladder" } }),
+      ),
+    ).toMatch(/warn ceiling/);
+    expect(
+      threadCeilingSourceText(
+        "warn",
+        report({
+          provenance: { warn: "census_misread", critical: "census_misread" },
+          scaled: null,
+          scaledUnknown: "session_census_misread",
+        }),
+      ),
+    ).toMatch(/census disagreed/);
   });
 
-  it("raises the block ceiling up to the warn ceiling, never lowers warn", () => {
-    // Mirrors `resource_guard::coerce_ceiling_ladder`: lowering warn would
-    // enforce a ceiling nobody asked for, and push it toward a count the runner
-    // reaches at rest.
-    expect(effectiveThreadCeilings(250, 210)).toEqual({ warnThreads: 250, criticalThreads: 250 });
-  });
-
-  it("never returns an inverted ladder, an unreachable ceiling, or a non-number", () => {
-    for (const warn of [Number.NaN, 0, 1, 50, 199, 200, 256, 400, 2048, 1e9]) {
-      for (const critical of [Number.NaN, 0, 1, 50, 199, 200, 256, 400, 2048, 1e9]) {
-        const eff = effectiveThreadCeilings(warn, critical);
-        expect(Number.isFinite(eff.warnThreads)).toBe(true);
-        expect(Number.isFinite(eff.criticalThreads)).toBe(true);
-        // The ladder, in its mirrored direction.
-        expect(eff.criticalThreads).toBeGreaterThanOrEqual(eff.warnThreads);
-        // Both clamps, in theirs.
-        expect(eff.warnThreads).toBeGreaterThanOrEqual(THREAD_CEILING_FLOOR);
-        expect(eff.warnThreads).toBeLessThanOrEqual(THREAD_CEILING_DEFAULT_WARN);
-        expect(eff.criticalThreads).toBeLessThanOrEqual(THREAD_CEILING_DEFAULT_CRITICAL);
-      }
+  it("quotes a number in the placeholder only when it IS the machine default", () => {
+    expect(threadCeilingPlaceholder("warn", report())).toBe("machine default (555)");
+    expect(threadCeilingPlaceholder("critical", report())).toBe("machine default (747)");
+    expect(threadCeilingPlaceholder("warn", null)).toBe("machine default");
+    expect(
+      threadCeilingPlaceholder(
+        "critical",
+        report({
+          warn: 276,
+          critical: 420,
+          provenance: { warn: "census_misread", critical: "census_misread" },
+          scaled: null,
+          scaledUnknown: "session_census_misread",
+        }),
+      ),
+    ).toBe("machine default (420)");
+    expect(
+      threadCeilingPlaceholder(
+        "warn",
+        report({ warn: 276, provenance: { warn: "floor", critical: "floor" } }),
+      ),
+    ).toBe("machine default (276)");
+    // The 2026-10-02 nit: a typed warn of 1000 raises an unset critical to
+    // 1000 via the ladder, which is not this machine's default.
+    expect(
+      threadCeilingPlaceholder(
+        "critical",
+        report({
+          warn: 1000,
+          critical: 1000,
+          provenance: { warn: "local", critical: "ladder" },
+          ladderCoerced: true,
+        }),
+      ),
+    ).toBe("machine default");
+    for (const src of ["fleet", "clamp_min", "clamp_max", "local"] as const) {
+      expect(
+        threadCeilingPlaceholder("warn", report({ provenance: { warn: src, critical: "scaled" } })),
+      ).toBe("machine default");
     }
   });
 });

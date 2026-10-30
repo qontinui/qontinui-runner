@@ -70,6 +70,16 @@ pub enum CredentialScrub {
     /// The implementation launches no child and hands no environment to
     /// anything. Only an in-memory double can honestly answer this.
     NoChildEnv,
+    /// The child's environment was assembled in THIS process and passed
+    /// through [`super::scrub_credential_env_pty`] — witnessed by
+    /// [`ScrubbedCommand`] — and then shipped, complete, to an OUT-OF-PROCESS
+    /// PTY holder that spawns the child with exactly that environment and
+    /// nothing else (`qontinui-pty-holder` clears its own environment first).
+    /// [`ScrubbedCommand::to_holder_spec`] is the only constructor of a holder
+    /// spec from a runner command, so the proof travels in the type (plan
+    /// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+    /// D6 as resolved 2026-09-27). `DaemonPaneIo` answers this.
+    ScrubbedOutOfProcess,
 }
 
 /// A byte source and sink for one terminal pane.
@@ -126,6 +136,27 @@ pub trait PaneIo: Send + Sync {
     /// pid namespace.
     fn pid(&self) -> Option<u32>;
 
+    /// The pid the runner's own crash-safety reaping (the Windows
+    /// `KILL_ON_JOB_CLOSE` Job Object, `TerminalSession::spawn_with_io`) may
+    /// enroll — by default [`Self::pid`]. A pane whose child is owned by an
+    /// out-of-process holder answers `None`: enrolling it would end the child
+    /// exactly when the runner exits, the event the holder exists to survive,
+    /// and reaping is the holder's job (plan
+    /// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`, D8).
+    fn job_enroll_pid(&self) -> Option<u32> {
+        self.pid()
+    }
+
+    /// Whether `WireFlow` should pause this source while NO pane renders the
+    /// terminal (the `Unwatched` tier). True by default — a remote pane's
+    /// state is tracked on its target, so nothing here needs the bytes. A pane
+    /// whose state tracking (grid, auto-response, needs-input) happens in THIS
+    /// runner answers `false`: pausing it would starve those readers. Only
+    /// the emission gate's backpressure is projected onto such a source.
+    fn unwatched_pauses_source(&self) -> bool {
+        true
+    }
+
     /// How this implementation discharged the credential-scrub obligation.
     fn credential_scrub(&self) -> CredentialScrub;
 
@@ -155,6 +186,41 @@ impl ScrubbedCommand {
     pub(crate) fn as_command(&self) -> &CommandBuilder {
         &self.0
     }
+
+    /// The child spec an out-of-process PTY holder runs this command from
+    /// (plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+    /// D6 as resolved 2026-09-27: "the holder's spawn path builds its child
+    /// through `ScrubbedCommand::seal` — the proof travels in the type"). This
+    /// is the ONLY constructor of a holder spec from a runner command, so a
+    /// holder child's environment is always one that went through the scrub;
+    /// the holder clears its own environment and sets exactly these pairs.
+    ///
+    /// argv and cwd are copied as OS strings. The environment is copied
+    /// through `CommandBuilder::iter_full_env_as_str`, the builder's only
+    /// whole-environment iterator, which SKIPS any variable whose name or
+    /// value is not valid UTF-8 — such a variable does not reach a holder pane
+    /// (it does reach a `LocalPty` one). Ring size and exit linger are left at
+    /// the holder's defaults.
+    pub(crate) fn to_holder_spec(
+        &self,
+        cols: u16,
+        rows: u16,
+    ) -> qontinui_pty_holder::spec::ChildSpec {
+        let b = &self.0;
+        let mut spec = qontinui_pty_holder::spec::ChildSpec::new(if b.is_default_prog() {
+            Vec::new()
+        } else {
+            b.get_argv().clone()
+        });
+        spec.cwd = b.get_cwd().cloned();
+        spec.env = b
+            .iter_full_env_as_str()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+        spec.cols = cols.max(1);
+        spec.rows = rows.max(1);
+        spec
+    }
 }
 
 /// A PTY pair that has been opened but not yet given a child.
@@ -177,11 +243,33 @@ impl OpenedPty {
             .spawn_command(cmd.0)
             .map_err(|e| format!("Failed to spawn shell: {}", e))?;
         let pid = child.process_id();
+        // Our own handle on the root, taken while the child is certainly
+        // alive and ours: while it is open the pid cannot be reused, so the
+        // tree kill below is about THIS process however late it runs. A
+        // failed duplicate degrades to the child's own handle at kill time.
+        #[cfg(windows)]
+        let root = child.as_raw_handle().and_then(|raw| {
+            // SAFETY: `child` is owned right here and alive for this call, so
+            // its process handle is open for the duration of the borrow.
+            let borrowed = unsafe { std::os::windows::io::BorrowedHandle::borrow_raw(raw) };
+            qontinui_runner_win32::process_tree::OwnedProcess::duplicate(borrowed)
+                .inspect_err(|e| {
+                    tracing::warn!(
+                        terminal_id = %label,
+                        error = %e,
+                        "could not duplicate the pane's process handle; the close-time \
+                         tree kill will fall back to the child's own handle"
+                    )
+                })
+                .ok()
+        });
         // `pair.slave` drops here, after the child holds its own copy of the
         // slave side, so the master sees EOF once the child exits.
         Ok(LocalPty {
             label,
             pid,
+            #[cfg(windows)]
+            root,
             master: Mutex::new(Some(pair.master)),
             child: Mutex::new(Some(child)),
         })
@@ -193,6 +281,10 @@ pub struct LocalPty {
     /// Terminal id, for tracing fields only.
     label: String,
     pid: Option<u32>,
+    /// A handle on the pane's root process, held for the pane's life: the
+    /// identity [`PaneIo::kill`]'s in-process tree termination is rooted at.
+    #[cfg(windows)]
+    root: Option<qontinui_runner_win32::process_tree::OwnedProcess>,
     /// `None` once [`PaneIo::release`] has dropped the OS handle.
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     /// `None` once the waiter thread has taken it via [`PaneIo::wait`].
@@ -288,20 +380,66 @@ impl PaneIo for LocalPty {
         let Some(pid) = self.pid else {
             return Ok(());
         };
-        // `/T` is CORRECT here: this is the terminal's OWN shell and whatever
-        // it spawned, and leaving that tree behind is precisely the process
-        // leak this call exists to prevent. It is categorically different from
-        // `/T` on the runner's own PID.
+        // The WHOLE tree is correct here: this is the terminal's OWN shell
+        // and whatever it spawned, and leaving that tree behind is precisely
+        // the process leak this call exists to prevent. It is categorically
+        // different from a tree kill of the runner's own PID.
+        //
+        // In-process (Toolhelp walk + TerminateProcess), never `taskkill`: a
+        // close must not need a process creation, because on a box where
+        // `CreateProcessW` is slow that one spawn made closing a terminal take
+        // 62.7 s (plan
+        // `2026-10-19-served-corpus-probe-budget-excludes-process-creation`,
+        // Phase 3). `budget` caps the walk's passes.
         #[cfg(target_os = "windows")]
         {
-            let mut cmd = crate::process_helpers::no_window("taskkill");
-            cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
-            match crate::drain::output_with_timeout(cmd, budget) {
-                Ok(Some(_)) => Ok(()),
-                Ok(None) => Err(format!(
-                    "taskkill of pid {pid} exceeded its {budget:?} budget — abandoned"
+            use qontinui_runner_win32::process_tree::{terminate_tree_of, OwnedProcess};
+            let _span =
+                tracing::debug_span!("terminal_close.kill", terminal_id = %self.label).entered();
+            let fallback;
+            let root = match &self.root {
+                Some(r) => r,
+                None => {
+                    // The child's own handle, while the waiter has not taken
+                    // it — duplicated UNDER the lock, so the `Child` (and its
+                    // handle) cannot be dropped mid-call; else the bare pid,
+                    // only reached when the duplicate at spawn failed.
+                    let from_child = self.child.lock().ok().and_then(|c| {
+                        let raw = c.as_ref()?.as_raw_handle()?;
+                        // SAFETY: the guard `c` keeps the `Child`, and so its
+                        // process handle, alive for this whole call.
+                        let borrowed =
+                            unsafe { std::os::windows::io::BorrowedHandle::borrow_raw(raw) };
+                        OwnedProcess::duplicate(borrowed).ok()
+                    });
+                    fallback = match from_child {
+                        Some(p) => p,
+                        None => OwnedProcess::open(pid).map_err(|e| {
+                            format!("pid {pid}: cannot open the pane's process: {e}")
+                        })?,
+                    };
+                    &fallback
+                }
+            };
+            match terminate_tree_of(root, pid, budget) {
+                Ok(report) if report.budget_spent => Err(format!(
+                    "tree kill of pid {pid} exceeded its {budget:?} budget after {} pass(es); \
+                     killed {:?}",
+                    report.passes, report.killed
                 )),
-                Err(e) => Err(format!("taskkill of pid {pid} could not be spawned: {e}")),
+                Ok(report) => {
+                    tracing::debug!(
+                        terminal_id = %self.label,
+                        pid,
+                        killed = ?report.killed,
+                        root_exited = report.root_exited,
+                        passes = report.passes,
+                        recheck_snapshot_failed = report.recheck_snapshot_failed,
+                        "pane process tree terminated in-process"
+                    );
+                    Ok(())
+                }
+                Err(e) => Err(format!("tree kill of pid {pid} failed: {e}")),
             }
         }
         #[cfg(not(target_os = "windows"))]
@@ -551,6 +689,38 @@ mod tests {
         );
     }
 
+    /// Plan 2026-09-12 D6: a holder spec built from a sealed command carries
+    /// the scrubbed environment — no credential value reaches an
+    /// out-of-process pane — plus argv, cwd and the size.
+    #[test]
+    fn pty_holder_spec_from_a_sealed_command_is_scrubbed() {
+        let mut cmd = CommandBuilder::new("claude");
+        cmd.arg("--resume");
+        cmd.cwd("/work/tree");
+        for name in crate::terminal::CREDENTIAL_VALUE_ENV_VARS {
+            cmd.env(name, "hunter2");
+        }
+        cmd.env("KEEP_ME", "yes");
+        let spec = ScrubbedCommand::seal(cmd).to_holder_spec(120, 0);
+
+        assert_eq!(
+            spec.argv,
+            vec![std::ffi::OsString::from("claude"), "--resume".into()]
+        );
+        assert_eq!(spec.cwd, Some("/work/tree".into()));
+        assert_eq!((spec.cols, spec.rows), (120, 1), "a zero size is clamped");
+        for (k, v) in &spec.env {
+            assert!(
+                !crate::terminal::CREDENTIAL_VALUE_ENV_VARS
+                    .iter()
+                    .any(|n| k == *n),
+                "credential {k:?} reached the holder spec"
+            );
+            assert_ne!(v, "hunter2");
+        }
+        assert!(spec.env.iter().any(|(k, v)| k == "KEEP_ME" && v == "yes"));
+    }
+
     /// The inert double answers the way the old `NoopMaster` placeholder did:
     /// a resize after release still succeeds, and there is nothing to read.
     #[test]
@@ -687,5 +857,92 @@ mod tests {
         );
         pane.release(Duration::from_secs(2)).expect("release");
         let _ = reader_thread.join();
+    }
+}
+
+/// [`LocalPty::kill`] on a real ConPTY pane, in the states the held root
+/// handle exists for.
+#[cfg(all(test, windows))]
+mod local_pty_kill_tests {
+    use super::*;
+    use qontinui_runner_win32::process_tree::{snapshot, OwnedProcess};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    /// Spawn `args` in a ConPTY pane and return it with handles on the
+    /// shell's own children (taken at once, so a reused pid cannot read as
+    /// alive later).
+    fn pane_with_children(args: &[&str]) -> (Arc<LocalPty>, Vec<OwnedProcess>) {
+        let opened = LocalPty::open("local-pty-kill-test", 80, 24).expect("openpty");
+        let mut cmd = CommandBuilder::new(args[0]);
+        cmd.args(&args[1..]);
+        let pane = Arc::new(opened.spawn(ScrubbedCommand::seal(cmd)).expect("spawn"));
+        assert!(
+            pane.root.is_some(),
+            "the spawn-time handle duplicate failed"
+        );
+        let root = pane.pid.expect("the pane's pid");
+        let end = Instant::now() + Duration::from_secs(20);
+        loop {
+            let kids: Vec<OwnedProcess> = snapshot()
+                .expect("snapshot")
+                .into_iter()
+                .filter(|&(pid, ppid)| ppid == root && pid != root)
+                .filter_map(|(pid, _)| OwnedProcess::open(pid).ok())
+                .collect();
+            if !kids.is_empty() {
+                return (pane, kids);
+            }
+            assert!(
+                Instant::now() < end,
+                "the pane's shell never started a child"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn wait_all_gone(procs: &[OwnedProcess]) {
+        let end = Instant::now() + Duration::from_secs(5);
+        for p in procs {
+            while !p.has_exited() {
+                assert!(Instant::now() < end, "a pane descendant survived the kill");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    /// The waiter thread has taken the `Child` (it holds it for the pane's
+    /// life), so the kill reaches the tree through the handle held since spawn.
+    #[test]
+    fn local_pty_kill_ends_the_pane_tree_after_the_waiter_took_the_child() {
+        let (pane, below) = pane_with_children(&["cmd", "/c", "ping", "-n", "60", "127.0.0.1"]);
+        let waiter = {
+            let pane = Arc::clone(&pane);
+            std::thread::spawn(move || pane.wait())
+        };
+        let end = Instant::now() + Duration::from_secs(5);
+        while pane.child.lock().map(|c| c.is_some()).unwrap_or(false) {
+            assert!(Instant::now() < end, "the waiter never took the child");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        pane.kill(Duration::from_secs(2)).expect("kill");
+        wait_all_gone(&below);
+        waiter
+            .join()
+            .expect("the waiter thread")
+            .expect("wait() returns once the pane's root is gone");
+    }
+
+    /// The pane's shell has EXITED and been reaped, leaving its child running
+    /// with the dead shell's pid as its parent. Only the handle held since
+    /// spawn still names that shell (the pid fallback cannot open an exited,
+    /// unreferenced process), so this kill reaches the orphan only through it.
+    #[test]
+    fn local_pty_kill_reaches_an_exited_shells_children_through_the_held_handle() {
+        let (pane, below) =
+            pane_with_children(&["cmd", "/c", "start", "/b", "ping", "-n", "60", "127.0.0.1"]);
+        pane.wait().expect("the shell exits at once");
+        pane.kill(Duration::from_secs(2)).expect("kill");
+        wait_all_gone(&below);
     }
 }

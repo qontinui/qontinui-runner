@@ -74,20 +74,21 @@ pub fn canonical_segment(repo_slug: &str) -> Result<String, String> {
 /// `qontinui_types::paths`, which probes `<home>/qontinui-root` on every OS.
 ///
 /// **Fails closed.** This surface *creates* git checkouts, so an unresolved root
-/// is an error naming `$QONTINUI_ROOT`, never a guess — `WorkspaceRoot::require`
-/// rather than `into_root`. The signature was already `Result`, so every caller
+/// is the typed `WorkspaceRootUnresolved` refusal, rendered, never a guess —
+/// `WorkspaceRoot::require` (via `require_workspace_root`) rather than
+/// `into_root`. The signature was already `Result`, so every caller
 /// already handles the arm; what changes is that on POSIX it can now actually be
 /// taken instead of silently resolving to `/tmp`.
 pub fn default_canonical_path(repo: &str) -> Result<PathBuf, String> {
     // Validate the slug BEFORE resolving the root: a malformed slug is a caller
-    // bug that holds on every machine, and answering it with "cannot resolve the
-    // Qontinui workspace root" would name the wrong thing entirely.
+    // bug that holds on every machine, and answering it with "no workspace
+    // folder could be found" would name the wrong thing entirely.
     let segment = canonical_segment(repo)?;
     // The ambient canary for `$QONTINUI_ROOT` lives in the resolver every
     // workspace-root reader funnels through (`runner_workspace_root`), so an
     // unguarded test reaching this from the plan's `on_demand` ledger row is
     // deflected there rather than measuring the box.
-    let root = crate::workspace_paths::runner_workspace_root().require()?;
+    let root = crate::workspace_paths::require_workspace_root()?;
     if !has_foreign_owner(repo) {
         // `qontinui/*` and bare slugs: the layout rule, with no settings read
         // and no filesystem probe — byte-for-byte what this returned before
@@ -375,7 +376,7 @@ pub fn resolve_checkout(repo: &str) -> Result<PathBuf, CheckoutUnresolved> {
             )),
         }
     }
-    let root = match crate::workspace_paths::runner_workspace_root().require() {
+    let root = match crate::workspace_paths::require_workspace_root() {
         Ok(root) => root,
         Err(detail) => {
             return Err(CheckoutUnresolved {
@@ -671,6 +672,14 @@ fn allocated_worktree_for_path_with(
     // `path` must be the `<agent_id>/<repo_name>` dir or a descendant of it.
     let agent_id = path_parts.next()?;
     let repo_name = path_parts.next()?;
+    // Both must be NORMAL segments: `<root>/../<checkout>` would otherwise
+    // "resolve" to an allocation outside the worktree root.
+    if [agent_id, repo_name]
+        .iter()
+        .any(|s| *s == "." || *s == "..")
+    {
+        return None;
+    }
 
     let candidate = worktree_root.join(agent_id).join(repo_name);
     if is_live(&candidate) {
@@ -1052,6 +1061,25 @@ mod allocated_worktree_probe_tests {
                 "D:/qontinui-root/qontinui-worktrees/019e-agent/qontinui-runner"
             ))
         );
+    }
+
+    /// A `.` / `..` segment where the agent id or repo name belongs never
+    /// names an allocation — `<root>/../<checkout>` would otherwise resolve to
+    /// a directory OUTSIDE the worktree root (review of plan 2026-10-10).
+    #[test]
+    fn dot_segments_never_name_an_allocation() {
+        for p in [
+            "D:/qontinui-root/qontinui-worktrees/../qontinui-runner",
+            "D:/qontinui-root/qontinui-worktrees/./qontinui-runner",
+            "D:/qontinui-root/qontinui-worktrees/019e-agent/..",
+            "D:/qontinui-root/qontinui-worktrees/019e-agent/.",
+        ] {
+            assert_eq!(
+                allocated_worktree_for_path_with(Path::new(ROOT), Path::new(p), live),
+                None,
+                "{p}"
+            );
+        }
     }
 
     /// A pane whose cwd is a SUBDIRECTORY of the allocation still resolves to

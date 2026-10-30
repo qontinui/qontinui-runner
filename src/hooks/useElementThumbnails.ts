@@ -17,6 +17,7 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { cropThumbnails, cropThumbnail, type ElementBounds } from "../lib/thumbnail-cropper";
 import { ThumbnailCache, hashScreenshot } from "../lib/thumbnail-cache";
+import { describeThrown } from "@/lib/utils";
 
 export interface ElementWithBounds {
   id: string;
@@ -285,7 +286,7 @@ export function useElementThumbnails(
         if (processingId !== processingIdRef.current) {
           return;
         }
-        const errorMessage = err instanceof Error ? err.message : "Failed to process thumbnails";
+        const errorMessage = describeThrown(err, "Failed to process thumbnails");
         setError(errorMessage);
         console.error("[useElementThumbnails] Processing failed:", err);
       } finally {

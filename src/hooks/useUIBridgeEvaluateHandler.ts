@@ -47,7 +47,7 @@ import { useEffect } from "react";
 import { emit, type Event } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { createLogger } from "@/lib/logger";
-import { getErrorMessage } from "@/lib/utils";
+import { describeThrown } from "@/lib/utils";
 import {
   awaitWithTimeout,
   checkEvaluateBlocklist,
@@ -259,7 +259,7 @@ export async function handleEvaluateRequest(
         result: describeEvaluateResult(resolved),
       };
     } catch (err) {
-      const message = getErrorMessage(err);
+      const message = describeThrown(err, "evaluate threw");
       log.debug(`evaluate(${request_id}) threw:`, message);
       response = { request_id, ok: false, error: message };
     }

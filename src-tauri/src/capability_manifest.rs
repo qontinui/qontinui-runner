@@ -34,8 +34,9 @@
 //! This module makes the opposite trade, deliberately, and the plan's Design
 //! decision 1 is explicit about it: **the manifest is emitted by the shipped app
 //! binary `qontinui-runner.exe`, not by a twelfth helper bin.**
-//! `tauri.conf.json`'s `bundle.externalBin` ships exactly two sidecars
-//! (`qontinui_profile`, `qontinui-pr`); a new `[[bin]]` would not be in the
+//! `tauri.conf.json`'s `bundle.externalBin` ships exactly three sidecars
+//! (`qontinui_profile`, `qontinui-pr`, and the per-pane `qontinui-pty-holder`);
+//! a new `[[bin]]` would not be in the
 //! installer, so it could not answer the one question that matters. It would
 //! also inherit `config_report`'s blindness — which here is *most of the subject
 //! matter*: every capability in [`CAPABILITY_SPECS`] is resolved by a bin-only
@@ -56,7 +57,7 @@
 //!
 //! | Existing provenance | Owner | Conversion here |
 //! |---|---|---|
-//! | `WorkspaceRootKind` (`Declared`/`Discovered`/`HomeDefault`/`Unresolved`) | `qontinui_types::paths` | [`impl From<WorkspaceRootKind> for Rung`](#impl-From<WorkspaceRootKind>-for-Rung) |
+//! | `WorkspaceRootKind` (`Declared`/`Discovered`/`SessionRepoParent`/`HomeDefault`/`Unresolved`) | `qontinui_types::paths` | [`impl From<WorkspaceRootKind> for Rung`](#impl-From<WorkspaceRootKind>-for-Rung) |
 //! | `CommandSource` (`Builtin`/`Served`/`DiskCache`) | [`crate::agent_commands`] | [`impl From<CommandSource> for Rung`](#impl-From<CommandSource>-for-Rung) |
 //! | `AgentSkillSource` (`Builtin`/`Served`/`DiskCache`) | [`crate::agent_skills`] | [`Rung::from_agent_skill_source`] |
 //! | `SkillSource` (`Builtin`/`User`/`Community`/`Other`) | [`crate::skills`] | [`rung_for_skill_source`] |
@@ -419,13 +420,19 @@ impl From<WorkspaceRootKind> for Rung {
     ///   [`crate::workspace_paths::runner_workspace_root_from`] passes
     ///   `exe_anchor(std::env::current_exe().ok())` and nothing else — so
     ///   `Discovered` here is exactly "found relative to where this exe sits".
+    /// - `SessionRepoParent` → [`Rung::OperatorCheckout`]. The folder holding the
+    ///   checkout a session was opened on: a checkout on the operator's disk,
+    ///   inferred rather than declared. The runner's own resolver passes no
+    ///   session repository (it is process-wide), so this arm is reached only by
+    ///   a caller that supplies one; it maps anyway because the match must be
+    ///   total.
     /// - `HomeDefault` → [`Rung::OperatorCheckout`]. `<home>/qontinui-root`, the
     ///   portable last-resort convention. Still a checkout on the operator's
     ///   disk; the fact that convention rather than declaration found it is
     ///   preserved in the row's `detail`, not in the rung.
     /// - `Unresolved` → [`Rung::Unresolved`], one to one.
     ///
-    /// **Two upstream variants collapse onto `OperatorCheckout`, and that loss
+    /// **Three upstream variants collapse onto `OperatorCheckout`, and that loss
     /// is deliberate but must not be silent.** Callers building a row from a
     /// `WorkspaceRoot` are required to put the upstream `kind.wire()` in
     /// [`CapabilityRow::detail`] — [`CapabilityObservation::from_workspace_root_kind`]
@@ -435,6 +442,7 @@ impl From<WorkspaceRootKind> for Rung {
         match kind {
             WorkspaceRootKind::Declared => Rung::OperatorCheckout,
             WorkspaceRootKind::Discovered => Rung::ExeRelativeCheckout,
+            WorkspaceRootKind::SessionRepoParent => Rung::OperatorCheckout,
             WorkspaceRootKind::HomeDefault => Rung::OperatorCheckout,
             WorkspaceRootKind::Unresolved => Rung::Unresolved,
         }
@@ -479,6 +487,12 @@ impl Rung {
     /// - `Served` → [`Rung::Served`] (fetched over the network this run).
     /// - `DiskCache` → [`Rung::DiskCache`] (this device's own cache file).
     ///
+    /// - `Canonical` → [`Rung::Served`], WITH a caveat. It is a per-body rung
+    ///   (the runner's git mirror of `qontinui-claude-config`, fetched at run
+    ///   time) and never a registry arm, so a resolution-arm row never carries
+    ///   it; the caveat says so rather than letting it pass for the account's
+    ///   served arm.
+    ///
     /// Exhaustive with no `_` arm, deliberately: a variant added upstream must
     /// break this build rather than silently default.
     #[must_use]
@@ -487,6 +501,13 @@ impl Rung {
             CommandSource::Builtin => (Rung::Embedded, None),
             CommandSource::Served => (Rung::Served, None),
             CommandSource::DiskCache => (Rung::DiskCache, None),
+            CommandSource::Canonical => (
+                Rung::Served,
+                Some(
+                    "canonical: a per-body rung (the runner's git mirror of \
+                     qontinui-claude-config origin/main), not an account-layer arm",
+                ),
+            ),
         }
     }
 
@@ -906,7 +927,7 @@ impl CapabilityObservation {
     /// [`resolved_path`](Self::resolved_path).
     ///
     /// The upstream `kind.wire()` is preserved in
-    /// [`detail`](Self::detail) so the `Declared`/`HomeDefault` collapse
+    /// [`detail`](Self::detail) so the `Declared`/`SessionRepoParent`/`HomeDefault` collapse
     /// documented on [`impl From<WorkspaceRootKind> for Rung`](Rung) is
     /// recoverable from the manifest rather than lost in it.
     #[must_use]
@@ -968,6 +989,14 @@ pub enum SkipReason {
     /// The intended outcome, not a fault — see [`crate::provision_guard`] — but
     /// it still means the session did not get this unit.
     GitTracked,
+    /// The destination exists, the tracked-file probe could NOT answer (git
+    /// missing, failed or timed out), and the destination sits inside a git
+    /// repository — so it was kept rather than overwritten, since nothing could
+    /// say it is safe to replace. See [`crate::provision_guard`]'s "UNKNOWN
+    /// inside a repository" section. Absent destinations are still written, and
+    /// `fleet_skills` applies it per skill (a skill without `SKILL.md` is
+    /// written whole, so this reason never lands on one of its files).
+    ProbeUnknownInRepo,
     /// The write itself failed. Fail-soft: the pass continues and the spawn
     /// proceeds; the session simply lacks this unit.
     WriteFailed(String),
@@ -986,6 +1015,17 @@ pub enum SkipReason {
     /// bucket. Nothing here is an error value: the pass continues and the spawn
     /// proceeds, the session simply lacks that skill.
     Rejected(String),
+    /// The session's WHOLE `.claude/` tree is authored by the enclosing
+    /// repository (it tracks paths under `.claude/`), so the provisioner did
+    /// not run at all for this workdir.
+    ///
+    /// Distinct from [`SkipReason::GitTracked`] on purpose: that one says
+    /// "this destination FILE is tracked", this one says "the whole tree is the
+    /// repo's own" — different facts with different remedies. It is also the
+    /// answer when the tracked-tree probe did not answer inside its budget, or
+    /// git could not be started for want of a machine resource, and the skip
+    /// was taken to avoid clobbering files it could not see.
+    RepoAuthored,
 }
 
 impl SkipReason {
@@ -994,9 +1034,11 @@ impl SkipReason {
     pub fn wire(&self) -> &'static str {
         match self {
             SkipReason::GitTracked => "git_tracked",
+            SkipReason::ProbeUnknownInRepo => "probe_unknown_in_repo",
             SkipReason::WriteFailed(_) => "write_failed",
             SkipReason::Unresolved(_) => "unresolved",
             SkipReason::Rejected(_) => "rejected",
+            SkipReason::RepoAuthored => "repo_authored",
         }
     }
 
@@ -1007,9 +1049,17 @@ impl SkipReason {
             SkipReason::GitTracked => {
                 "tracked by the enclosing git repository — left alone deliberately".to_string()
             }
+            SkipReason::ProbeUnknownInRepo => "kept: inside a git repository whose tracked-file \
+                 probe could not answer, so what is already on disk was not overwritten"
+                .to_string(),
             SkipReason::WriteFailed(why) => format!("write failed: {why}"),
             SkipReason::Unresolved(why) => format!("source rung did not resolve: {why}"),
             SkipReason::Rejected(why) => format!("refused by validation: {why}"),
+            SkipReason::RepoAuthored => {
+                "the workdir's .claude/ is authored by its repository — provisioning skipped \
+                 for the whole tree"
+                    .to_string()
+            }
         }
     }
 }
@@ -1057,6 +1107,11 @@ pub struct ProvisionReport {
     pub destination: Option<String>,
     /// Provisioner-specific extra, in its own vocabulary.
     pub detail: Option<String>,
+    /// When the pass ran (the report is built as the pass begins, and a pass
+    /// lasts milliseconds). Load-bearing for a reader of the ledger that may
+    /// be looking at a PREVIOUS spawn's report for the same workdir — the
+    /// served-corpus header line renders it as `as-of`.
+    pub at: chrono::DateTime<chrono::Utc>,
 }
 
 impl ProvisionReport {
@@ -1071,6 +1126,7 @@ impl ProvisionReport {
             rung,
             destination: None,
             detail: None,
+            at: chrono::Utc::now(),
         }
     }
 
@@ -1925,6 +1981,24 @@ pub fn render_manifest_doc() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_authored_is_its_own_skip_reason() {
+        assert_eq!(SkipReason::RepoAuthored.wire(), "repo_authored");
+        assert_ne!(SkipReason::RepoAuthored, SkipReason::GitTracked);
+        assert!(SkipReason::RepoAuthored
+            .describe()
+            .contains("authored by its repository"));
+        let json = serde_json::to_value(SkipReason::RepoAuthored).unwrap();
+        assert_eq!(json["reason"], "repo_authored");
+    }
+
+    #[test]
+    fn a_report_is_stamped_when_its_pass_runs() {
+        let before = chrono::Utc::now();
+        let report = ProvisionReport::new("fleet_commands", 1, Rung::Embedded);
+        assert!(report.at >= before && report.at <= chrono::Utc::now());
+    }
     use std::collections::BTreeSet;
 
     fn unobserved_inputs() -> ManifestInputs {
@@ -2098,6 +2172,7 @@ mod tests {
         let all = [
             WorkspaceRootKind::Declared,
             WorkspaceRootKind::Discovered,
+            WorkspaceRootKind::SessionRepoParent,
             WorkspaceRootKind::HomeDefault,
             WorkspaceRootKind::Unresolved,
         ];
@@ -2105,6 +2180,7 @@ mod tests {
             let expected = match kind {
                 WorkspaceRootKind::Declared => Rung::OperatorCheckout,
                 WorkspaceRootKind::Discovered => Rung::ExeRelativeCheckout,
+                WorkspaceRootKind::SessionRepoParent => Rung::OperatorCheckout,
                 WorkspaceRootKind::HomeDefault => Rung::OperatorCheckout,
                 WorkspaceRootKind::Unresolved => Rung::Unresolved,
             };
@@ -2177,6 +2253,7 @@ mod tests {
                 CommandSource::Builtin => assert_eq!(rung, Rung::Embedded),
                 CommandSource::Served => assert_eq!(rung, Rung::Served),
                 CommandSource::DiskCache => assert_eq!(rung, Rung::DiskCache),
+                CommandSource::Canonical => unreachable!("not a registry arm"),
             }
             assert!(
                 note.is_none(),
@@ -2193,6 +2270,15 @@ mod tests {
             all.len(),
             "two arms sharing a rung is the collapse Phase 3 removed"
         );
+    }
+
+    /// The canonical per-body rung is not an account-layer arm, and its
+    /// mapping says so rather than passing for `served`.
+    #[test]
+    fn the_canonical_command_source_carries_its_caveat() {
+        let (rung, note) = Rung::from_command_source(CommandSource::Canonical);
+        assert_eq!(rung, Rung::Served);
+        assert!(note.is_some_and(|n| n.contains("per-body")), "{note:?}");
     }
 
     /// The observation builder states the upstream variant in `detail`, so the
@@ -2253,6 +2339,7 @@ mod tests {
     /// store. `cargo test` runs a binary's tests in parallel threads, so two
     /// tests each calling `reset_provision_store` would otherwise erase each
     /// other's writes intermittently — a flake, not a finding.
+    // test-lock: standalone — module-private; its two holders take no other test lock and never touch env
     fn store_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())

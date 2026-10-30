@@ -615,6 +615,95 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         probe_with_empty_args: false,
         observe_projection: None,
     },
+    // ---- New Project create flow (plan
+    // 2026-09-22-new-project-initiation-pr-f-doctor-step-and-funnel-telemetry
+    // Phase 2) ----
+    //
+    // `create_new_project` (`crate::commands::new_project`) has NO frontend
+    // caller on `origin/main` -- the runner UI that hosts it is the parent
+    // plan's unlanded Phase 4 -- so before this entry it was reachable only by
+    // a hand-issued `__TAURI_INTERNALS__.invoke` through
+    // `POST /ui-bridge/control/page/evaluate`. That door is dead on every
+    // CSP-enforcing build: `tauri.conf.json`'s `script-src 'self'` refuses the
+    // evaluator's `new Function` ("Refused to evaluate a string as JavaScript
+    // because 'unsafe-eval' ..."), measured on a Linux temp runner 2026-10-03.
+    // So the funnel telemetry this command emits had no verification path.
+    //
+    // This is a WIDENING of the HTTP-reachable surface, not a reduction: on a
+    // CSP-enforcing build `page/evaluate` cannot reach this command at all, so
+    // unlike `get_coord_device_token` (which restored a capability consumers
+    // already had) it makes something reachable that was not. Its effects
+    // leave the box: a directory under a caller-chosen `location`, a GitHub
+    // repo under the operator's identity, and an optional enrollment in the
+    // Qontinui GitHub Apps. It is justified by SUBSUMPTION: the same loopback,
+    // origin-guarded caller can already spawn a PTY and run arbitrary commands
+    // (and so `gh repo create`) through `POST /ui-bridge/tauri/invoke` ->
+    // `terminal_create` (`mcp/tauri_proxy.rs`, gated there by the coord drain
+    // gate and `admit_spawn_tenant`). The cloud relay cannot reach either door
+    // (`relay_path_policy.rs` leaves the whole `/ui-bridge/invoke/*` family
+    // off its allowlist).
+    //
+    // `Dispatch::Frontend` because the command takes Tauri-managed state and
+    // an `AppHandle` it emits progress events through; the generic frontend
+    // `invoke()` supplies both. The consequence is that a headless
+    // (`QONTINUI_SERVER_MODE`) runner answers 503 `SERVER_MODE_NO_WEBVIEW`:
+    // this door works on a windowed runner only. Step failures come back as
+    // `ok: false` in the result, never as an invoke error, so read `ok` /
+    // `failedStep` rather than `success`.
+    // ---- Remote-session interactivity read/resize doors (plan
+    // 2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold,
+    // Phase C) ----
+    //
+    // The Phase C live sweep drives the remote-attach picker and a remote tab
+    // over the UI Bridge. These three commands are already registered in Tauri
+    // (`commands/fleet_sessions.rs`, `commands/remote_attach.rs`,
+    // `commands/terminal.rs`); this block only allowlists them over HTTP. All
+    // three take Tauri-managed state or run a coord round-trip through the
+    // webview's `invoke()`, so they are `Dispatch::Frontend` (a headless
+    // `QONTINUI_SERVER_MODE` runner answers 503 `SERVER_MODE_NO_WEBVIEW`). None
+    // is a PTY spawn site and none takes a path or a PTY handle other than the
+    // caller's own `terminalId`.
+    ProxyableCommand {
+        name: "fleet_sessions_list",
+        dispatch: Dispatch::Frontend,
+        description: "List the tenant's coord sessions across devices (wrapper around coord's `GET /coord/sessions/fleet`; already registered in Tauri, this entry only allowlists it over HTTP). Returns coord's body verbatim. A transport failure or non-200 from coord is an invoke error carrying the status and body, never an empty list. `args` is required (may be `{}`): all filters optional -- `deviceId`, `state`, `includeClosed` (default false), `limit`, and `cursor`, an OPAQUE `nextCursor` from a previous page of the SAME scope (forwarded unchanged; coord answers 400 `cursor_scope_mismatch` otherwise). Default order is `started_at DESC`, not activity recency.",
+        args_schema: r#"{"type":"object","required":["args"],"properties":{"args":{"type":"object","properties":{"deviceId":{"type":["string","null"]},"state":{"type":["string","null"]},"includeClosed":{"type":"boolean"},"limit":{"type":["integer","null"]},"cursor":{"type":["string","null"]}}}}}"#,
+        response_schema: r#"{"type":"object","description":"coord's /coord/sessions/fleet body, verbatim (rows plus `nextCursor` and the effective `limit`)"}"#,
+        // A real coord round-trip on every call; the startup probe would add a
+        // boot-time network read for no schema-drift benefit.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
+    ProxyableCommand {
+        name: "terminal_remote_identities",
+        dispatch: Dispatch::Frontend,
+        description: "Return the remote identity (target device / session) of every remote-attached terminal tab, keyed by terminal id (already registered in Tauri; this entry only allowlists it over HTTP). READ-ONLY. A terminal absent from `data` is a local tab, or one that never attached remotely. This exists because `terminal_list`'s shared-schema `TerminalInfo` cannot carry the remote identity.",
+        args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+        response_schema: r#"{"type":"object","required":["success"],"properties":{"success":{"type":"boolean"},"message":{"type":["string","null"]},"data":{"type":"object","description":"map of terminalId -> remote identity"}}}"#,
+        probe_with_empty_args: true,
+        observe_projection: None,
+    },
+    ProxyableCommand {
+        name: "terminal_resize",
+        dispatch: Dispatch::Frontend,
+        description: "Resize an existing terminal's PTY to `cols` x `rows` (already registered in Tauri; this entry only allowlists it over HTTP). Errors with `Terminal not found: <id>` for an unknown `terminalId`. Does not create, attach or close anything.",
+        args_schema: r#"{"type":"object","required":["terminalId","cols","rows"],"properties":{"terminalId":{"type":"string"},"cols":{"type":"integer","minimum":1,"maximum":65535},"rows":{"type":"integer","minimum":1,"maximum":65535}}}"#,
+        response_schema: r#"{"type":"object","required":["success"],"properties":{"success":{"type":"boolean"},"message":{"type":["string","null"]},"data":{"type":["object","null"]}}}"#,
+        // Required args and it mutates a live PTY -- never probe it.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
+    ProxyableCommand {
+        name: "create_new_project",
+        dispatch: Dispatch::Frontend,
+        description: "Create a new project end-to-end (scaffold, git init, optional GitHub repo + push + Qontinui enrollment), emitting `new-project://progress` per step and the new_project_* funnel workflow events. Args: {\"req\": {name, location, owner?, private?, template, enroll?, resumeFrom?}} -- `owner` null/absent = local-only (create_remote, push and enroll are skipped). Never an invoke error for a step failure: the result carries `ok: false` plus `failedStep`, a typed `error` and a `resumeToken` (keys absent, not null, on success). Long-running when it reaches GitHub -- pass `?timeoutMs=`. A 504 does NOT cancel the run: the webview keeps executing and may still create the remote repo, so after a 504 read the target's state (or retry with `resumeFrom`) rather than re-invoking blind. Windowed runners only (headless answers 503 SERVER_MODE_NO_WEBVIEW).",
+        args_schema: r#"{"type":"object","required":["req"],"properties":{"req":{"type":"object","required":["name","location","template"],"properties":{"name":{"type":"string"},"location":{"type":"string"},"owner":{"type":["string","null"]},"private":{"type":"boolean"},"template":{"type":"string"},"enroll":{"type":"boolean"},"resumeFrom":{"type":["string","null"]}}}}}"#,
+        response_schema: r#"{"type":"object","required":["ok","projectPath","completedSteps","warnings"],"properties":{"ok":{"type":"boolean"},"projectPath":{"type":"string"},"repo":{"type":["object","null"]},"completedSteps":{"type":"array","items":{"type":"string"}},"failedStep":{"type":["string","null"]},"error":{"type":["object","null"]},"resumeToken":{"type":["string","null"]},"warnings":{"type":"array","items":{"type":"string"}}}}"#,
+        // Required `req` arg, and a real invocation creates a directory and
+        // may create a GitHub repository -- never probe it.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
 ];
 
 /// Whether a command name is in the UI Bridge invoke allowlist.
@@ -859,6 +948,37 @@ mod tests {
                 Dispatch::InProcess,
                 "{name}"
             );
+        }
+    }
+
+    /// Plan `2026-09-22-new-project-initiation-pr-f-doctor-step-and-funnel-telemetry`
+    /// Phase 2: the create flow has no UI caller and `page/evaluate` is
+    /// CSP-refused, so the eval-free invoke proxy is its automation door on a
+    /// windowed runner.
+    /// It must round-trip through the frontend (it needs an `AppHandle` and
+    /// managed state) and must never be boot-probed (it has side effects).
+    #[test]
+    fn is_allowlisted_recognizes_create_new_project() {
+        assert!(is_allowlisted("create_new_project"));
+        let entry = UI_BRIDGE_COMMANDS
+            .iter()
+            .find(|c| c.name == "create_new_project")
+            .unwrap();
+        assert_eq!(entry.dispatch, Dispatch::Frontend);
+        assert!(!entry.probe_with_empty_args);
+        let args: serde_json::Value = serde_json::from_str(entry.args_schema).unwrap();
+        assert_eq!(args["required"], serde_json::json!(["req"]));
+    }
+
+    #[test]
+    fn is_allowlisted_recognizes_remote_session_interactivity_commands() {
+        for name in [
+            "fleet_sessions_list",
+            "terminal_remote_identities",
+            "terminal_resize",
+        ] {
+            assert!(is_allowlisted(name), "{name} must be allowlisted");
+            assert_eq!(dispatch_for(name), Some(Dispatch::Frontend), "{name}");
         }
     }
 

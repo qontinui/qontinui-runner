@@ -56,7 +56,7 @@ pub fn stable_element_fingerprint(element_json: &serde_json::Value) -> String {
     out
 }
 
-fn extract_role(el: &serde_json::Value) -> Option<String> {
+pub(crate) fn extract_role(el: &serde_json::Value) -> Option<String> {
     el.get("role")
         .and_then(|v| v.as_str())
         .or_else(|| {

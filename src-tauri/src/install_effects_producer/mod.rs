@@ -182,6 +182,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .merge(registry_routes::routes())
 }
 
+/// The `SessionStart` source a provider reports after `/clear` — the only
+/// source that ADOPTS a new harness id onto a terminal already running one.
+const HOOK_SOURCE_CLEAR: &str = "clear";
+
 /// Body of `POST /control/session-open` — the session-restore registration
 /// payload the always-on identity shim / SessionStart hook POSTs. `config_dir`
 /// and `cwd` are optional (a provider that doesn't expose them omits them).
@@ -192,7 +196,9 @@ pub struct SessionOpenRequest {
     /// The provider session id (the runner-pinned `QONTINUI_PINNED_SESSION_ID`,
     /// echoed back by the hook for confirmation).
     pub session_id: String,
-    /// `"startup"` | `"resume"` — the hook's source signal (liveness only).
+    /// The hook's `SessionStart` source: `"startup"` | `"resume"` | `"clear"`
+    /// | `"compact"`. `"clear"` ([`HOOK_SOURCE_CLEAR`]) marks the id as ADOPTED
+    /// onto this terminal; every other value is liveness only.
     #[serde(default)]
     pub source: Option<String>,
     /// Which provider owns the session (`"claude"`, `"gemini"`). Defaults to
@@ -1020,11 +1026,18 @@ async fn get_sessions_restore_census(
 ///       { "claudeSessionId": "aaaa…", "sessionName": "amber-otter",
 ///         "worktreePath": "D:/qontinui-root/_wt/foo",
 ///         "planSlug": "2026-08-22-wip-custody", "wipState": "captured",
+///         "displayName": "amber-otter", "accountLabel": "gmail",
+///         "configDirKnown": true, "outcome": "missing",
 ///         "reason": "no-attempt",
 ///         "resumeCommand": "cd \"D:/…/foo\" && CLAUDE_CONFIG_DIR=\"C:/claude/.claude-gmail\" claude --resume aaaa…" }
 ///     ],
-///     "current": { /* what is open right now */ } } }
+///     "finished": [ /* marked finished — never counted as missing */ ],
+///     "current": { /* the roster right now */ },
+///     "generations": [ /* every retained prior boot, newest first */ ] } }
 /// ```
+///
+/// The body is [`crate::session::session_ledger::report`] — the one builder
+/// the Tauri `session_ledger_report` also calls.
 ///
 /// ### The honesty contract
 ///
@@ -1035,66 +1048,33 @@ async fn get_sessions_restore_census(
 /// * **A missing session with an unknown account root gets NO resume line**
 ///   rather than a guessed one, and the `note` counts how many were omitted
 ///   for that reason.
+/// * **A finished session is never `missing`** — it has its own bucket.
 /// * Read-only: it stats disk and touches no registry state.
 async fn get_sessions_ledger(
     State(state): State<Arc<ApiState>>,
 ) -> Json<ApiResponse<crate::session::session_ledger::LedgerReport>> {
-    use crate::session::reconcile::DiskTranscriptIndex;
-    use crate::session::session_ledger as ledger;
     use crate::session::session_lifecycle_store::SessionLifecycleStore;
     use tauri::Manager;
-
-    let now = chrono::Utc::now().timestamp_millis();
-    let boot = crate::session::shutdown_marker::boot_classification();
-    // Latch the PRIOR ledger before anything in this process can overwrite it.
-    // Idempotent, so calling it here as well as at boot is safe — and doing it
-    // here means the route still answers on a build whose boot path did not
-    // run the latch.
-    let prior = ledger::load_prior_once();
 
     let store = state
         .app_handle
         .try_state::<Arc<SessionLifecycleStore>>()
         .map(|s| s.inner().clone());
-    let Some(store) = store else {
-        warn!(
-            "control/sessions/ledger: lifecycle store not in Tauri state — reporting \
-             unavailable WITH a reason (never a bare empty ledger)"
-        );
-        let empty = ledger::SessionLedger {
-            ledger_version: ledger::LEDGER_VERSION,
-            captured_at_ms: now,
-            captured_at: chrono::Utc::now().to_rfc3339(),
-            reason: "unavailable".to_string(),
-            shutdown_at: boot.and_then(|b| b.prior_marker_at),
-            clean_shutdown: boot.map(|b| !b.crash_recovery),
-            sessions: Vec::new(),
-        };
-        let mut report = ledger::diff(prior, &[], empty, false);
-        report.status = "unavailable".to_string();
-        report.reason = Some("lifecycle_store_unavailable".to_string());
-        report.verdict = ledger::VERDICT_UNKNOWN.to_string();
-        return Json(ApiResponse::success(report));
-    };
-
-    let index = DiskTranscriptIndex::discover();
-    let current = ledger::capture(&store, &index, "read", now, boot);
-    // "Came back" = open now, UNION anything stamped restored by THIS boot —
-    // a session that returned and was then closed did in fact return.
-    // `None` when the boot census never latched — see `observed_back`: an
-    // absent boot instant SKIPS the sticky-restore-stamp arm rather than
-    // admitting it with a `0` floor.
-    let boot_at = crate::session::restore_census::latched().map(|c| c.boot_at_ms);
-    let back = ledger::observed_back(&store, boot_at);
-    // `boot_at == None` means the sticky-restore-stamp arm was SKIPPED, so a
-    // session that returned and was then closed cannot be told from one that
-    // never came back. That is reported, not laundered into a miss count.
-    Json(ApiResponse::success(ledger::diff(
-        prior,
-        &back,
-        current,
-        boot_at.is_some(),
-    )))
+    // The ONE report builder, shared with the Tauri `session_ledger_report`.
+    // It stats disk (transcripts, custody records), so it runs off the
+    // async executor.
+    let live = crate::session::session_ledger::live_terminal_ids(&state.app_handle);
+    let report = spawn_blocking_tracked(move || {
+        crate::session::session_ledger::report(store.as_deref(), live.as_ref())
+    })
+    .await;
+    match report {
+        Ok(report) => Json(ApiResponse::success(report)),
+        Err(e) => {
+            warn!(error = %e, "control/sessions/ledger: report task failed");
+            Json(ApiResponse::error(format!("ledger report failed: {e}")))
+        }
+    }
 }
 
 /// Query for `POST /control/sessions/ledger/capture`.
@@ -1125,8 +1105,10 @@ pub struct LedgerCaptureQuery {
 async fn post_sessions_ledger_capture(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<LedgerCaptureQuery>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    use crate::session::reconcile::DiskTranscriptIndex;
+) -> Result<
+    Json<ApiResponse<crate::session::session_ledger::LedgerCapture>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     use crate::session::session_ledger as ledger;
     use crate::session::session_lifecycle_store::SessionLifecycleStore;
     use tauri::Manager;
@@ -1149,30 +1131,27 @@ async fn post_sessions_ledger_capture(
         ));
     };
 
-    // Latch the prior ledger first, so a capture taken before any read cannot
-    // destroy the previous boot's record of what was open.
-    let _ = ledger::load_prior_once();
-
-    let now = chrono::Utc::now().timestamp_millis();
-    let boot = crate::session::shutdown_marker::boot_classification();
-    let index = DiskTranscriptIndex::discover();
     let reason = query
         .reason
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or(ledger::REASON_PRE_REBUILD);
-    let captured = ledger::capture(&store, &index, reason, now, boot);
-    // `persist_capture`, not `persist_if_changed`: an empty capture must never
-    // erase a non-empty prior ledger — that is how a later boot manufactures a
-    // vacuous `match`.
-    let persisted = ledger::persist_capture(&captured);
-    let path = ledger::ledger_path().to_string_lossy().replace('\\', "/");
-    Ok(Json(ApiResponse::success(serde_json::json!({
-        "persisted": persisted,
-        "path": path,
-        "ledger": captured,
-    }))))
+        .unwrap_or(ledger::REASON_PRE_REBUILD)
+        .to_string();
+    // The ONE capture, shared with the Tauri `session_ledger_capture`. It
+    // persists through `persist_capture`, so an empty capture can never erase
+    // a non-empty prior ledger.
+    let captured = spawn_blocking_tracked(move || ledger::capture_now(&store, &reason))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!(
+                    "ledger capture task failed — NOTHING may have been captured: {e}"
+                ))),
+            )
+        })?;
+    Ok(Json(ApiResponse::success(captured)))
 }
 
 /// Body of `POST /control/shim-beacon` — a fire-and-forget diagnostic the
@@ -1272,11 +1251,17 @@ fn record_session_open_into(
     provider: &str,
 ) {
     let existing = store.get(&req.session_id);
-    // Only consulted when the provider's id has no record of its own; see the
-    // "inherited by TERMINAL" paragraph above.
+    // The most recent OTHER session open on this terminal, read before
+    // `record_open` below can supersede it. Deterministic, not a first match:
+    // a terminal can carry several open rows (see
+    // `SessionLifecycleStore::latest_open_on_terminal`), and the `/clear`
+    // predecessor below must be the one that was actually running here.
+    let terminal_latest = store.latest_open_on_terminal(&req.terminal_id, &req.session_id);
+    // Layout inheritance consults it only when the provider's id has no record
+    // of its own; see the "inherited by TERMINAL" paragraph above.
     let terminal_prior = existing
         .is_none()
-        .then(|| store.find_open_by_terminal(&req.terminal_id))
+        .then(|| terminal_latest.clone())
         .flatten();
     let (page_id, zone_index, working_dir, title) =
         match existing.as_ref().or(terminal_prior.as_ref()) {
@@ -1334,6 +1319,26 @@ fn record_session_open_into(
     // a provider therefore never gets a hook and stays provisional, so Phase 4's
     // restore classifier won't try to `--resume` a phantom shell "session".
     store.confirm_session(&req.session_id);
+    // This id's process is now the one running in the terminal — the order
+    // `latest_open_on_terminal` ranks by. Stamped AFTER `terminal_latest` was
+    // read (which excludes this id anyway).
+    store.note_session_start_hook(&req.session_id);
+
+    // ADOPTION marker. `source: "clear"` is the provider reporting that
+    // `/clear` minted a NEW harness id inside the process already running on
+    // this PTY — so the session it continues is the one that STARTED most
+    // recently on this terminal (`terminal_latest`, read before `record_open`
+    // could supersede it). Record THAT session as the predecessor, not the
+    // terminal: a restored session is a typed `claude --resume X` in a pane
+    // pinned to some other id P, both rows stay open, and a `/clear` in X
+    // continues X (X's own coord row), never P. Every other source (`resume`,
+    // `startup`, `compact`, absent) records no predecessor. See
+    // `TerminalSessionRecord::adopted_from`.
+    if req.source.as_deref() == Some(HOOK_SOURCE_CLEAR) {
+        if let Some(prior) = terminal_latest.as_ref() {
+            store.mark_adopted_from(&req.session_id, &prior.claude_session_id);
+        }
+    }
 
     // D1 name stamp at confirmation. The account is already durable (the
     // `record_pinned_session_open` above derives it from `config_dir`), but the
@@ -1376,7 +1381,22 @@ async fn post_run(
     // Phase 4: the production registry-credential store (OS keyring). Tests call
     // `run_with_base` directly with a fake lookup so no real keyring is touched.
     let store = RegistryCredentialStore;
-    run_with_base(req, &base, &loopback_base, &store)
+    // ---- DYNAMIC interception mode (P4) -------------------------------------
+    // Read the device's EFFECTIVE install-interception level (`off` | `observe`
+    // | `gate`) from the process-global fleet-policy cache (refreshed every
+    // ~45s by `mcp::fleet_policy_poller`). The accessor is a synchronous lock
+    // read — no I/O on the request path — and defaults to `"off"` until the
+    // poller's first success (fail-safe — never gate).
+    //
+    // Read ONCE, HERE, and handed to `run_with_base` as an explicit input rather
+    // than read inside it: `run_with_base` is then a function of its arguments,
+    // so a test passes the mode it means instead of pinning a cache that every
+    // other test in the binary shares (plan
+    // `2026-10-10-install-effects-intercept-tests-race-on-the-process-global-fleet-policy-mode-cache`).
+    // The read still happens before `run_with_base`'s first await, so a request
+    // sees the same single mode snapshot it did when the read lived inside it.
+    let effective_mode = crate::mcp::fleet_policy_poller::effective_install_intercept_mode();
+    run_with_base(req, effective_mode, &base, &loopback_base, &store)
         .await
         .map(Json)
         .map_err(|e| e.into_response())
@@ -1539,11 +1559,15 @@ impl From<CoordError> for RunError {
     }
 }
 
-/// The orchestration body with the coord base URL + the runner's own typecheck
-/// loopback base injected. The route resolves both from config/AppState; tests
-/// pass a mock-server base for each.
+/// The orchestration body with the device's EFFECTIVE install-interception mode
+/// (`off` | `observe` | `gate`), the coord base URL and the runner's own
+/// typecheck loopback base injected. The route reads the mode from the
+/// fleet-policy cache ([`post_run`]) and resolves both bases from
+/// config/AppState; tests pass the mode they mean and a mock-server base for
+/// each, so the mode is an input here, never an ambient read.
 async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
     req: RunRequest,
+    effective_mode: String,
     coord_base: &str,
     loopback_base: &str,
     cred_store: &L,
@@ -1559,12 +1583,10 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
     let repo = repo_basename(&req.repo_path);
 
     // ---- DYNAMIC interception mode (P4) -------------------------------------
-    // Read the device's EFFECTIVE install-interception level from the
-    // process-global fleet-policy cache (refreshed every ~45s by
-    // `mcp::fleet_policy_poller`). `run_with_base` has no app state, so the
-    // accessor is a synchronous lock read of the cache directly. Defaults to
-    // `"off"` until the poller's first success (fail-safe — never gate).
-    let effective_mode = crate::mcp::fleet_policy_poller::effective_install_intercept_mode();
+    // `effective_mode` is the device's EFFECTIVE install-interception level,
+    // supplied by the caller: `post_run` reads it once from the process-global
+    // fleet-policy cache (where it defaults to `"off"` until the poller's first
+    // success — fail-safe, never gate), and a test passes the mode it means.
 
     // OFF short-circuit (D6): when the effective mode is `off`, an interception
     // pre-call must SKIP declare/predict entirely, return NO `correlation_id`
@@ -1807,8 +1829,7 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
     // every coord write the synchronous path makes. Resolved only NOW: after
     // the OFF short-circuit (which makes no coord write at all) and after the
     // observe fast path (which resolves it inside its own deferred task), so
-    // neither of those pays a `git` probe or a cold coord read, and
-    // `effective_mode` above is read before this function's first await.
+    // neither of those pays a `git` probe or a cold coord read.
     let scope = crate::repo_detection::tenant_scope_for_path(repo_path).await;
 
     // ---- Phase 2: read-only dry-run + native-audit probes --------------------
@@ -2420,6 +2441,7 @@ mod tests {
             provider: "claude".to_string(),
             origin: Some("authoritative".to_string()),
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: confirmed.then_some(3),
             handle: None,
             account_label: None,
@@ -2437,6 +2459,8 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
+            adopted_from: None,
+            last_session_start_at: None,
         }
     }
 
@@ -2597,7 +2621,7 @@ mod tests {
 
         let seed = health_rec("mid-restore", "term-1", true);
         store.record_open(seed);
-        store.mark_restore_pending("mid-restore");
+        store.mark_restore_pending("mid-restore", true);
         assert_eq!(
             store.get("mid-restore").unwrap().restore_tier.as_deref(),
             Some(RESTORE_TIER_FAILED),
@@ -2937,6 +2961,7 @@ mod tests {
             provider: "claude".to_string(),
             origin: Some(ORIGIN_OBSERVED.to_string()),
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: None,
             handle: None,
             account_label: None,
@@ -2954,6 +2979,8 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
+            adopted_from: None,
+            last_session_start_at: None,
         });
 
         // The confirming hook fires with bash-flavored context.
@@ -2986,6 +3013,216 @@ mod tests {
             "config dir not erased by a None from the hook"
         );
         assert!(rec.confirmed_at.is_some(), "hook still confirms");
+    }
+
+    /// The ADOPTION predecessor is set only by a `source: "clear"` hook — the
+    /// provider minting a new id inside the process already on this PTY —
+    /// and it names the session that was OPEN on that terminal (whose
+    /// session was cleared), not the terminal. A `resume` (a typed
+    /// `claude --resume X` reports that too), a `startup`, a `compact` and an
+    /// absent source record no predecessor, so those sessions never resolve
+    /// their finish through another session's coord row.
+    #[test]
+    fn only_a_clear_source_records_the_predecessor_it_continued() {
+        use crate::session::session_lifecycle_store::SessionLifecycleStore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let config = dir.path().join("cfg").to_string_lossy().into_owned();
+        let open = |id: &str, term: &str, source: Option<&str>| {
+            let req = SessionOpenRequest {
+                terminal_id: term.to_string(),
+                session_id: id.to_string(),
+                source: source.map(str::to_string),
+                provider: Some("claude".to_string()),
+                config_dir: Some(config.clone()),
+                cwd: None,
+            };
+            record_session_open_into(&store, &req, "claude");
+        };
+        // Each terminal first hosts an open session, then the hook reports a
+        // NEW id on it under each source.
+        let cases = [
+            ("cleared-id", "term-c", Some("clear")),
+            ("resumed-id", "term-r", Some("resume")),
+            ("started-id", "term-s", Some("startup")),
+            ("compacted-id", "term-k", Some("compact")),
+            ("no-source-id", "term-n", None),
+        ];
+        for (id, term, source) in cases {
+            open(&format!("prior-on-{term}"), term, Some("startup"));
+            open(id, term, source);
+        }
+        let cleared = store.get("cleared-id").expect("recorded");
+        assert_eq!(
+            cleared.adopted_from.as_deref(),
+            Some("prior-on-term-c"),
+            "a clear records WHOSE session it continued"
+        );
+        for (id, _, source) in &cases[1..] {
+            let rec = store.get(id).expect("recorded");
+            assert_eq!(
+                rec.adopted_from, None,
+                "source {source:?} is not an adoption"
+            );
+        }
+        // A clear on a terminal with no open session has no predecessor.
+        open("cleared-alone", "term-empty", Some("clear"));
+        assert_eq!(store.get("cleared-alone").unwrap().adopted_from, None);
+        // The first session on each terminal records none either.
+        assert_eq!(store.get("prior-on-term-c").unwrap().adopted_from, None);
+    }
+
+    /// A pane pinned to P whose operator exited and typed `claude --resume X`
+    /// carries TWO open, confirmed rows on one terminal: the hook bind of X
+    /// evicts only unconfirmed siblings, and confirming runs no supersede
+    /// scan. A `/clear` inside X continues X, so the clear's predecessor must
+    /// be X — never the pane's P, whose coord row would then take C's finished
+    /// mark and its ACK. A first match over the store's `HashMap` picks either
+    /// by iteration order, which is randomly seeded per map, so each round
+    /// uses a FRESH store and the rounds cover both orders many times over.
+    #[test]
+    fn a_clear_after_a_typed_resume_continues_the_resumed_session_not_the_pane() {
+        use crate::session::session_lifecycle_store::SessionLifecycleStore;
+        for round in 0..64 {
+            let dir = tempfile::tempdir().unwrap();
+            let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+            let config = dir.path().join("cfg").to_string_lossy().into_owned();
+            let hook = |id: &str, source: &str| {
+                let req = SessionOpenRequest {
+                    terminal_id: "term-pane".to_string(),
+                    session_id: id.to_string(),
+                    source: Some(source.to_string()),
+                    provider: Some("claude".to_string()),
+                    config_dir: Some(config.clone()),
+                    cwd: None,
+                };
+                record_session_open_into(&store, &req, "claude");
+            };
+            // Vary which id sorts first too, so a tie-break on the id cannot
+            // pass the test by accident either.
+            let (pane, resumed) = if round % 2 == 0 {
+                ("aaaa-pane", "zzzz-resumed")
+            } else {
+                ("zzzz-pane", "aaaa-resumed")
+            };
+            hook(pane, "startup");
+            hook(resumed, "resume");
+            let open_on_pane: Vec<_> = store
+                .open_records()
+                .into_iter()
+                .filter(|r| r.terminal_id == "term-pane" && r.confirmed_at.is_some())
+                .collect();
+            assert_eq!(
+                open_on_pane.len(),
+                2,
+                "fixture precondition: both sessions stay open and confirmed on the pane"
+            );
+
+            hook("cleared", "clear");
+            assert_eq!(
+                store.get("cleared").unwrap().adopted_from.as_deref(),
+                Some(resumed),
+                "round {round}: a /clear in the typed-resume session continues IT, not the pane"
+            );
+
+            // A second /clear continues the session the first one minted.
+            hook("cleared-again", "clear");
+            assert_eq!(
+                store.get("cleared-again").unwrap().adopted_from.as_deref(),
+                Some("cleared"),
+                "round {round}: the latest start on the terminal is the cleared session"
+            );
+        }
+    }
+
+    /// `confirmed_at` is monotonic, so it cannot say which session started
+    /// LAST: a typed `claude --resume X` of a session confirmed before the
+    /// pane's own P keeps X's older stamp. The hook order decides, so a
+    /// `/clear` in X still continues X.
+    #[test]
+    fn a_clear_follows_the_latest_hook_not_the_latest_confirmation() {
+        use crate::session::session_lifecycle_store::{
+            SessionLifecycleStore, TerminalSessionRecord, ORIGIN_AUTHORITATIVE,
+        };
+        for round in 0..64 {
+            let dir = tempfile::tempdir().unwrap();
+            let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+            let config = dir.path().join("cfg").to_string_lossy().into_owned();
+            let seed = |id: &str, terminal: &str, confirmed_at: i64| {
+                store.record_open(TerminalSessionRecord {
+                    claude_session_id: id.to_string(),
+                    config_dir: Some(config.clone()),
+                    working_dir: None,
+                    page_id: "p".to_string(),
+                    zone_index: 0,
+                    title: None,
+                    terminal_id: terminal.to_string(),
+                    opened_at: 0,
+                    last_seen_at: 0,
+                    state: "open".to_string(),
+                    closed_at: None,
+                    close_reason: None,
+                    provider: "claude".to_string(),
+                    origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
+                    restore_pending_at: None,
+                    awaiting_account_since: None,
+                    confirmed_at: Some(confirmed_at),
+                    handle: None,
+                    account_label: None,
+                    account_wrapper: None,
+                    session_name: None,
+                    name_source: None,
+                    tenant_id: None,
+                    task_run_id: None,
+                    bypass_permissions: None,
+                    restored_from_boot_at: None,
+                    restore_tier: None,
+                    finished_at: None,
+                    wind_down_outcome: None,
+                    wind_down_at: None,
+                    finish_reason: None,
+                    finish_synced: false,
+                    spawn_device_default: None,
+                    adopted_from: None,
+                    last_session_start_at: None,
+                });
+            };
+            let hook = |id: &str, source: &str| {
+                let req = SessionOpenRequest {
+                    terminal_id: "term-pane".to_string(),
+                    session_id: id.to_string(),
+                    source: Some(source.to_string()),
+                    provider: Some("claude".to_string()),
+                    config_dir: Some(config.clone()),
+                    cwd: None,
+                };
+                record_session_open_into(&store, &req, "claude");
+            };
+            let (pane, resumed) = if round % 2 == 0 {
+                ("aaaa-pane", "zzzz-resumed")
+            } else {
+                ("zzzz-pane", "aaaa-resumed")
+            };
+            // X was confirmed long ago elsewhere; the pane's P confirmed later.
+            seed(resumed, "term-elsewhere", 1_000);
+            seed(pane, "term-pane", 2_000);
+            hook(pane, "startup");
+            hook(resumed, "resume");
+            let x = store.get(resumed).unwrap();
+            assert_eq!(x.terminal_id, "term-pane", "fixture: X moved onto the pane");
+            assert_eq!(
+                x.confirmed_at,
+                Some(1_000),
+                "fixture: X keeps its OLDER confirmation (monotonic)"
+            );
+
+            hook("cleared", "clear");
+            assert_eq!(
+                store.get("cleared").unwrap().adopted_from.as_deref(),
+                Some(resumed),
+                "round {round}: the latest hook wins over the latest confirmation"
+            );
+        }
     }
 
     /// The case PR #1201 exists for: the provider adopts an id the runner did
@@ -3025,6 +3262,7 @@ mod tests {
             provider: "claude".to_string(),
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: None,
             handle: None,
             account_label: None,
@@ -3042,6 +3280,8 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
+            adopted_from: None,
+            last_session_start_at: None,
         });
 
         // The provider reports a DIFFERENT id about itself, from bash.
@@ -3110,6 +3350,7 @@ mod tests {
             provider: "claude".to_string(),
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: None,
             handle: None,
             account_label: None,
@@ -3127,6 +3368,8 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
+            adopted_from: None,
+            last_session_start_at: None,
         });
 
         let req = SessionOpenRequest {
@@ -3406,6 +3649,15 @@ mod tests {
         })
     }
 
+    /// The effective interception mode the `Full`-route tests hand to
+    /// `run_with_base`: the fleet-policy cache's fail-safe default. For a `Full`
+    /// request `run_with_base` never branches on the mode — both of its mode
+    /// branches are guarded by `req.mode == RunMode::Intercept` — it only echoes
+    /// it into the `RunResponse`, so the value is immaterial to what those
+    /// tests assert. The interception tests, where the mode decides the path
+    /// taken, state theirs through [`run_in_mode`].
+    const FULL_ROUTE_MODE: &str = "off";
+
     /// A repo dir an autodetect would call `cargo` for — but the bogus package
     /// makes `cargo add` fail fast, so the test never mutates anything real.
     /// We instead drive the manager explicitly to avoid running cargo.
@@ -3420,14 +3672,24 @@ mod tests {
         base: &str,
         loopback: &str,
     ) -> Result<ApiResponse<RunResponse>, RunError> {
-        run_lb_creds(req, base, loopback, &FakeCredStore::empty())
+        run_lb_creds(
+            req,
+            FULL_ROUTE_MODE,
+            base,
+            loopback,
+            &FakeCredStore::empty(),
+        )
     }
 
-    /// As [`run_lb`] but with an explicit fake registry-credential store so a
-    /// test can prove the secret threads into subprocesses without leaking into
-    /// any coord body.
+    /// As [`run_lb`] but with an explicit effective interception mode and an
+    /// explicit fake registry-credential store, so a test can prove the secret
+    /// threads into subprocesses without leaking into any coord body. The mode
+    /// is handed straight to `run_with_base` as an argument, so this helper
+    /// neither reads nor writes the process-global fleet-policy cache that the
+    /// rest of the binary shares.
     fn run_lb_creds<L: RegistryTokenLookup + ?Sized>(
         req: RunRequest,
+        mode: &str,
         base: &str,
         loopback: &str,
         store: &L,
@@ -3437,7 +3699,20 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(run_with_base(req, base, loopback, store))
+        rt.block_on(run_with_base(req, mode.to_string(), base, loopback, store))
+    }
+
+    /// As [`run`] but at an EXPLICIT effective interception mode — the helper
+    /// the interception tests use, because for an `Intercept` request the mode
+    /// decides the path taken: `off` short-circuits before declare, `observe`
+    /// returns before coord's verdict, and `gate` runs the synchronous
+    /// declare→predict→gate path.
+    fn run_in_mode(
+        req: RunRequest,
+        mode: &str,
+        base: &str,
+    ) -> Result<ApiResponse<RunResponse>, RunError> {
+        run_lb_creds(req, mode, base, DEAD_LOOPBACK, &FakeCredStore::empty())
     }
 
     /// In-memory fake registry-credential store for tests — NEVER touches a real
@@ -3878,6 +4153,7 @@ mod tests {
         let store = FakeCredStore::with("NPM_TOKEN", FAKE_SECRET);
         let resp = run_lb_creds(
             cargo_req(&d.path().display().to_string()),
+            FULL_ROUTE_MODE,
             &base,
             DEAD_LOOPBACK,
             &store,
@@ -4006,26 +4282,25 @@ mod tests {
     // Interception — `mode:"intercept"` pre-call + `/observe-verify` post
     // ===================================================================
 
-    /// Build an intercept-mode pre-call request for a real `repo_path`, pinned
-    /// to GATE mode.
+    /// Build an intercept-mode pre-call request for a real `repo_path`.
     ///
-    /// Pins the process-global fleet-policy cache to `gate` as a side effect so
-    /// (a) the P4 `off` short-circuit does NOT trigger and (b) the SYNCHRONOUS
-    /// declare→predict→gate→stash path runs on the request thread. GATE mode is
-    /// the deterministic path for asserting declare/predict hit counts, the gate
-    /// verdict, the override/escalation flag, and the stashed declare body — all
-    /// of which are computed BEFORE the response returns.
+    /// A PURE builder: it pins nothing. The effective interception mode is an
+    /// explicit argument to `run_with_base` — through [`run_in_mode`], or
+    /// directly as the observe test does — so each test states the mode it
+    /// means (the GATE tests pass `"gate"`, the observe test `"observe"`) and
+    /// none touches the process-global fleet-policy cache that every other test
+    /// in the binary shares.
+    ///
+    /// GATE is the deterministic path for asserting declare/predict hit counts,
+    /// the gate verdict, the override/escalation flag, and the stashed declare
+    /// body: the SYNCHRONOUS declare→predict→gate→stash path runs on the request
+    /// thread, so all of those are computed BEFORE the response returns, and the
+    /// P4 `off` short-circuit does not trigger.
     ///
     /// (The §6 async-observe fast-path defers declare/predict to a `tokio::spawn`,
     /// so those assertions can't be made synchronously in observe mode — observe
     /// has its own dedicated test below.)
     fn intercept_req(repo_path: &str, packages: Vec<&str>) -> RunRequest {
-        intercept_req_mode(repo_path, packages, "gate")
-    }
-
-    /// As [`intercept_req`] but pins the effective interception mode explicitly.
-    fn intercept_req_mode(repo_path: &str, packages: Vec<&str>, mode: &str) -> RunRequest {
-        crate::mcp::fleet_policy_poller::set_mode_for_test(mode);
         RunRequest {
             repo_path: repo_path.to_string(),
             package_manager: Some("npm".to_string()),
@@ -4074,8 +4349,9 @@ mod tests {
         )
         .unwrap();
         let (base, hits, _sd) = spawn_coord_mock(proceed_resolution(), vec![]);
-        let resp = run(
+        let resp = run_in_mode(
             intercept_req(&d.path().display().to_string(), vec!["left-pad"]),
+            "gate",
             &base,
         )
         .unwrap();
@@ -4120,8 +4396,9 @@ mod tests {
         let (base, hits, _sd) = spawn_coord_mock(proceed_resolution(), vec![]);
 
         // Pre-call.
-        let resp = run(
+        let resp = run_in_mode(
             intercept_req(&d.path().display().to_string(), vec!["left-pad"]),
+            "gate",
             &base,
         )
         .unwrap();
@@ -4202,8 +4479,9 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("package.json"), "{\"name\":\"x\"}").unwrap();
         let (base, hits, _sd) = spawn_coord_mock(proceed_resolution(), vec![]);
-        let resp = run(
+        let resp = run_in_mode(
             intercept_req(&d.path().display().to_string(), vec!["bad-pkg"]),
+            "gate",
             &base,
         )
         .unwrap();
@@ -4245,7 +4523,7 @@ mod tests {
         // PRE-call: intercept mode, override on, escalate verdict.
         let mut pre = intercept_req(&d.path().display().to_string(), vec!["left-pad"]);
         pre.override_escalation = true;
-        let resp = run(pre, &base).unwrap();
+        let resp = run_in_mode(pre, "gate", &base).unwrap();
         let data = resp.data.unwrap();
         assert_eq!(data.gate, GateOutcome::Escalate, "verdict is escalate");
         assert!(
@@ -4288,8 +4566,9 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("package.json"), "{\"name\":\"x\"}").unwrap();
         let (base, hits, _sd) = spawn_coord_mock(proceed_resolution(), vec![]);
-        let resp = run(
+        let resp = run_in_mode(
             intercept_req(&d.path().display().to_string(), vec![]),
+            "gate",
             &base,
         )
         .unwrap();
@@ -4335,10 +4614,11 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let req = intercept_req_mode(&d.path().display().to_string(), vec!["left-pad"], "observe");
+        let req = intercept_req(&d.path().display().to_string(), vec!["left-pad"]);
         let resp = rt
             .block_on(run_with_base(
                 req,
+                "observe".to_string(),
                 &base,
                 DEAD_LOOPBACK,
                 &FakeCredStore::empty(),

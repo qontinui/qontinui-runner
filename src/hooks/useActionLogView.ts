@@ -32,6 +32,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { ActionLogViewData, CommandResponse } from "../types/displayProfile";
 import { actionLogManager } from "../managers";
 import { createLogger } from "@/lib/logger";
+import { describeThrown } from "@/lib/utils";
 
 const log = createLogger("ActionLogView");
 
@@ -123,7 +124,7 @@ export function useActionLogView(options: UseActionLogViewOptions = {}): UseActi
       }
 
       // Tauri commands return string errors when Rust returns Err(String)
-      const errorMessage = err instanceof Error ? err.message : String(err);
+      const errorMessage = describeThrown(err, "Failed to fetch action log view");
       log.debug("Exception caught:", errorMessage, err);
       setError(errorMessage);
       log.error("Failed to fetch action log view:", err);

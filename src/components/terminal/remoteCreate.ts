@@ -21,6 +21,8 @@
  * it is NOT the create dial that refused.
  */
 
+import { describeThrown } from "@/lib/utils";
+
 /** The object `terminal_create_remote` rejects with (Rust `RemoteCreateError`). */
 export interface RemoteCreateErrorWire {
   stage?: string;
@@ -121,12 +123,11 @@ function preferenceOffRemedy(
  */
 export function describeRemoteCreateFailure(err: unknown): RemoteCreateRefusal {
   if (err === null || typeof err !== "object") {
-    const raw = err instanceof Error ? err.message : typeof err === "string" ? err : String(err);
     return {
       code: "",
       stage: "unknown",
       headline: "Remote create failed",
-      explanation: raw.trim() || "the runner gave no reason",
+      explanation: describeThrown(err, "the runner gave no reason"),
       remedy: [],
       strandedTerminalId: null,
     };
@@ -194,6 +195,31 @@ export function describeRemoteCreateFailure(err: unknown): RemoteCreateRefusal {
       remedy: [
         "This is a reachability answer, not a policy one — nothing about the target device is known from it.",
         "Retry once coord is reachable.",
+      ],
+    };
+  }
+
+  // --- the TARGET's coord device drain refused it ----------------------------
+  // `handle_terminal_create` checks the drain BEFORE its create gate, so
+  // neither of these says anything about either create dial — and the relay
+  // passes both codes through by name (qontinui-web#1607).
+  if (code === "device_drained") {
+    return {
+      ...base,
+      headline: "That device is drained — it is not accepting new work",
+      remedy: [
+        "coord has drained that device, and its runner refuses remote creates until the drain lifts or expires. Nothing was spawned, and the create is not queued.",
+        "This is not the create dial: changing `accept_remote_create` will not help. Retry once the drain is lifted, or pick another device.",
+      ],
+    };
+  }
+  if (code === "drain_unreadable") {
+    return {
+      ...base,
+      headline: "That device cannot read its own drain state",
+      remedy: [
+        "Until it can confirm with coord that it is not drained, its runner fails closed and refuses remote creates. Nothing was spawned, and the create is not queued.",
+        "This reflects that runner's connection to coord, not anything about this request or your permissions: retry once it reads its drain state again.",
       ],
     };
   }
@@ -321,4 +347,60 @@ export function createButtonState(group: { deviceId: string; isCallerDevice: boo
     return { disabled: true, reason: "coord did not report a device id to address." };
   }
   return { disabled: false, reason: null };
+}
+
+/**
+ * One "New terminal" the fleet picker's EMPTY state may offer for a device
+ * pinned by id — the create that has no device group (and so no group tenant)
+ * behind it.
+ */
+export interface EmptyCreateTarget {
+  /** The tenant the create mints its grant under — and so the tenant the new
+   * session is created in. `null` only in a single-tenant read that named no
+   * tenant, where the runner's own authority order is the read's own. */
+  tenant: string | null;
+  /** Shown beside the button in a merged read, so the operator sees which
+   * tenant each one creates in. `null` in a single-tenant read. */
+  tenantLabel: string | null;
+}
+
+/** Why a merged empty state offers no create: no tenant answered to create in. */
+export const EMPTY_CREATE_NO_TENANT_REASON =
+  "choose a tenant to create in — no tenant's read answered, so there is none this page belongs to";
+
+/**
+ * The creates the fleet picker's empty state offers, given which tenants the
+ * read covered (plan
+ * `2026-09-29-fleet-view-reads-one-unchosen-tenant-so-a-multi-bound-device-sees-a-fraction-of-its-fleet`).
+ *
+ * - A SINGLE-tenant read offers one create under the tenant that read
+ *   presented (`singleTenant`; null when it named none) — the pre-merge
+ *   behaviour.
+ * - A MERGED read has no one tenant the empty page belongs to, and sending none
+ *   would let the runner's authority order pick a tenant the operator never
+ *   chose. So it offers one create PER tenant that answered, each naming its
+ *   tenant. An answered walk whose tenant is unnamed is skipped for the same
+ *   reason. With none left, `targets` is empty and `disabledReason` says why.
+ */
+export function emptyCreateTargets(args: {
+  merged: boolean;
+  singleTenant: string | null;
+  answeredTenants: readonly (string | null)[];
+  shortTenant: (tenant: string) => string;
+}): { targets: EmptyCreateTarget[]; disabledReason: string | null } {
+  if (!args.merged) {
+    return { targets: [{ tenant: args.singleTenant, tenantLabel: null }], disabledReason: null };
+  }
+  const seen = new Set<string>();
+  const targets: EmptyCreateTarget[] = [];
+  for (const t of args.answeredTenants) {
+    const tenant = t?.trim();
+    if (!tenant || seen.has(tenant)) continue;
+    seen.add(tenant);
+    targets.push({ tenant, tenantLabel: args.shortTenant(tenant) });
+  }
+  return {
+    targets,
+    disabledReason: targets.length === 0 ? EMPTY_CREATE_NO_TENANT_REASON : null,
+  };
 }

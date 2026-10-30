@@ -9,6 +9,7 @@ import { Upload, X, Loader2, AlertCircle, Check } from "lucide-react";
 import type { WorkflowPhase, HttpMethod } from "../../types";
 import { getAccentColors, getStatusColors } from "@/design-system";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 // Parsed cURL response from the backend
 interface ParsedCurl {
@@ -71,7 +72,7 @@ export function CurlImportDialog({ isOpen, onClose, onImport, phase }: CurlImpor
         setError(data.error || "Failed to parse cURL command");
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to parse cURL command");
+      setError(describeThrown(err, "Failed to parse cURL command"));
     } finally {
       setIsLoading(false);
     }

@@ -18,6 +18,7 @@ import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { extractRunningTaskRuns } from "@/lib/running-task-runs";
 import { createLogger } from "@/lib/logger";
 import { useRunnerEvents } from "@/hooks/graphql";
+import { describeThrown } from "@/lib/utils";
 
 const log = createLogger("useDashboardState");
 
@@ -149,7 +150,7 @@ export function useDashboardState(): DashboardState {
     try {
       await Promise.all([fetchRunningTasks(), fetchActionLog(), fetchScreenshots()]);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to fetch dashboard data");
+      setError(describeThrown(e, "Failed to fetch dashboard data"));
     } finally {
       setLoading(false);
     }

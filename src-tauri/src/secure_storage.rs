@@ -64,9 +64,11 @@ use anyhow::{Context, Result};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
-use tracing::{debug, info, warn};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use tracing::{debug, info, trace, warn};
 
 /// Service identifier for the storage
 const SERVICE_NAME: &str = "com.qontinui.runner";
@@ -78,6 +80,211 @@ const TENANT_DEVICE_JWT_PREFIX: &str = "device_jwt:";
 
 /// Storage file name
 const STORAGE_FILE: &str = "auth_tokens.enc";
+
+/// Bounded wait for the cross-process store lock (see [`SecureStorage::lock_store`]).
+/// A healthy read-modify-write holds it for milliseconds; ten seconds of
+/// contention means a peer is wedged, and the write fails loudly rather than
+/// blocking a heartbeat or a refresher tick forever.
+pub(crate) const STORE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Poll interval while waiting for the store lock.
+const STORE_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(15);
+
+thread_local! {
+    /// Lock files this THREAD currently holds. Used only to REFUSE a nested
+    /// acquisition: `flock`/`LockFileEx` conflict per open handle, so a nested
+    /// lock on the same file from the same thread would otherwise wait out the
+    /// whole timeout against itself.
+    static HELD_FILE_LOCKS: std::cell::RefCell<std::collections::HashSet<PathBuf>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// `pid=<n> exe=<path>` for the process doing a credential-store write.
+///
+/// Plan `2026-09-30-runner-says-connected-while-bound-tenants-have-no-credential-and-offers-only-a-terminal-command`
+/// D4: a tenant slot vanished from the shared `auth_tokens.enc` with no log line
+/// naming the writer. Every slot write and clear now carries this, so the next
+/// foreign writer (CLI, instance runner, test binary) is named by the log.
+pub fn process_attribution() -> String {
+    static EXE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let exe = EXE.get_or_init(|| match std::env::current_exe() {
+        Ok(p) => p.display().to_string(),
+        Err(e) => format!("<unknown: {e}>"),
+    });
+    format!("pid={} exe={exe}", std::process::id())
+}
+
+/// An exclusive advisory lock on one lock file; dropping it releases the lock
+/// (closing the handle unlocks it).
+pub(crate) struct FileLockGuard {
+    file: fs::File,
+    path: PathBuf,
+    /// `!Send`: the guard's bookkeeping lives in a THREAD-local set, so it must
+    /// be dropped on the thread that took it.
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for FileLockGuard {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+        HELD_FILE_LOCKS.with(|h| h.borrow_mut().remove(&self.path));
+    }
+}
+
+/// `<path>.lock` with the parent directory canonicalized, so two spellings of
+/// one directory (a symlink, a relative path) cannot yield two different locks.
+/// Resolve it ONCE per store / per reconcile and reuse it.
+pub(crate) fn lock_path_for(path: &std::path::Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    let parent = path
+        .parent()
+        .map(|p| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()))
+        .unwrap_or_default();
+    parent.join(name)
+}
+
+/// `true` only the first time `path` is seen in `seen`: the pure half of
+/// [`first_initialization`], so the once-guard is testable without the
+/// process-global set. Same shape as `commands::transcript::first_sighting`,
+/// which lives in the bin crate and so cannot be reused from this lib module.
+fn first_sighting(seen: &mut HashSet<PathBuf>, path: &Path) -> bool {
+    seen.insert(path.to_path_buf())
+}
+
+/// `true` only the first time THIS PROCESS initializes a [`SecureStorage`] at
+/// `path`.
+///
+/// `AuthManager::new()` builds a `SecureStorage` on every use, from every
+/// periodic loop (heartbeat, coord sync, the message poller, ...), so without
+/// this memo the init log line and the temp-file sweep's `read_dir` ran about
+/// once a second, in bursts of 100+ (plan
+/// `2026-10-19-runner-secure-storage-reinitialises-and-logs-every-five-seconds`).
+/// Keyed on the path rather than a single flag so a different store (another
+/// instance root, a test fixture's directory) still gets its own first sweep.
+///
+/// A poisoned lock is recovered: the guarded region is one `HashSet::insert`,
+/// so a poisoned set holds no torn state.
+fn first_initialization(path: &Path) -> bool {
+    static INITIALIZED_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    first_sighting(
+        &mut INITIALIZED_PATHS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        path,
+    )
+}
+
+/// `true` under `cfg(test)` when `QONTINUI_TEST_DISABLE_STORE_LOCK=1`: the
+/// mutation switch the concurrency tests are checked against (they must FAIL
+/// with locking disabled). Compiled out of every non-test build.
+#[cfg(test)]
+fn locking_disabled_for_mutation_check() -> bool {
+    std::env::var("QONTINUI_TEST_DISABLE_STORE_LOCK").as_deref() == Ok("1")
+}
+#[cfg(not(test))]
+fn locking_disabled_for_mutation_check() -> bool {
+    false
+}
+
+/// Take an exclusive cross-process advisory lock on `lock_path`, waiting at
+/// most [`STORE_LOCK_TIMEOUT`].
+///
+/// - The lock file is created owner-only (`0600` on Unix).
+/// - The holder's `pid`/`exe` go to a SEPARATE, never-locked `<lock>.holder`
+///   file, because on Windows a waiter cannot read a file whose bytes another
+///   handle has locked. A waiter that times out names that holder.
+/// - A NESTED acquisition of the same lock on the same thread is a bug and
+///   fails immediately (and trips a `debug_assert!`) instead of deadlocking.
+///
+/// BLOCKING: under contention it sleeps on the calling thread, so async
+/// callers run the locked work through `spawn_blocking`.
+pub(crate) fn lock_file_exclusive(lock_path: &std::path::Path) -> Result<FileLockGuard> {
+    lock_file_exclusive_within(lock_path, STORE_LOCK_TIMEOUT)
+}
+
+/// [`lock_file_exclusive`] with an explicit wait budget, for a caller whose
+/// lock may legitimately be held longer than one store write.
+pub(crate) fn lock_file_exclusive_within(
+    lock_path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<FileLockGuard> {
+    let path = lock_path.to_path_buf();
+    if HELD_FILE_LOCKS.with(|h| h.borrow().contains(&path)) {
+        let msg = format!(
+            "nested acquisition of lock {} on the same thread — a lock-holding section \
+             re-entered a locked mutator",
+            path.display()
+        );
+        debug_assert!(false, "{msg}");
+        anyhow::bail!(msg);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context("Failed to create lock directory")?;
+    }
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts
+        .open(&path)
+        .with_context(|| format!("Failed to open lock {}", path.display()))?;
+    let mut holder_path = path.clone().into_os_string();
+    holder_path.push(".holder");
+    let holder_path = PathBuf::from(holder_path);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    let holder = fs::read_to_string(&holder_path)
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    anyhow::bail!(
+                        "lock {} is still held after {:?} (last holder: {holder}); refusing to \
+                         write without it (a lock-free read-modify-write can silently drop \
+                         another tenant's credential slot) [waiter {}]",
+                        path.display(),
+                        timeout,
+                        process_attribution()
+                    );
+                }
+                std::thread::sleep(STORE_LOCK_POLL);
+            }
+            Err(fs::TryLockError::Error(e)) => {
+                return Err(
+                    anyhow::Error::new(e).context(format!("Failed to lock {}", path.display()))
+                );
+            }
+        }
+    }
+    // Best-effort: the lock, not this text, is the exclusion.
+    {
+        let mut hopts = fs::OpenOptions::new();
+        hopts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            hopts.mode(0o600);
+        }
+        if let Ok(mut h) = hopts.open(&holder_path) {
+            use std::io::Write;
+            let _ = h.write_all(process_attribution().as_bytes());
+        }
+    }
+    HELD_FILE_LOCKS.with(|h| h.borrow_mut().insert(path.clone()));
+    Ok(FileLockGuard {
+        file,
+        path,
+        _not_send: std::marker::PhantomData,
+    })
+}
 
 /// Stored token data structure
 ///
@@ -294,6 +501,19 @@ pub struct StoredGracedNonce {
     /// The pin's provenance — see [`StoredNonceBinding::session_tenant_origin`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_tenant_origin: Option<StoredPinOrigin>,
+    /// The evicted binding's SETTLED repo expectation — see
+    /// [`StoredNonceBinding::expected_tenant`]. A superseded key is still
+    /// presented by a live session for the grace window, and row 1d of the
+    /// session-tenant authority order needs the same repo answer the live key
+    /// was served by, or one session gets two tenants. `None` for an entry
+    /// written before the field, or evicted before its resolution settled; the
+    /// restore reads that as PENDING and re-resolves from `workdir`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_expected_tenant",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expected_tenant: Option<qontinui_runner_lib::repo_tenant::CwdTenant>,
 }
 
 /// The on-disk value shape for `coord_mcp_nonces`, with the legacy arm kept
@@ -509,8 +729,11 @@ pub enum StoredTokenRead {
 /// tokens to this machine/user. See the module docs for the honest guarantee:
 /// this is same-machine binding + tamper evidence, NOT confidentiality
 /// against a local same-user reader.
+#[derive(Clone)]
 pub struct SecureStorage {
     storage_path: PathBuf,
+    /// `auth_tokens.enc.lock`, resolved once at construction ([`lock_path_for`]).
+    lock_file: PathBuf,
 }
 
 impl SecureStorage {
@@ -518,36 +741,61 @@ impl SecureStorage {
     ///
     /// The storage file will be created in the app's data directory.
     pub fn new() -> Result<Self> {
-        let data_dir = std::env::var("QONTINUI_SECURE_STORAGE_DIR")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(std::path::PathBuf::from)
-            .or_else(|| dirs::data_local_dir().map(|d| d.join(SERVICE_NAME)))
-            .context("Failed to get data directory")?;
+        let data_dir =
+            crate::instance_env::secure_storage_dir().context("Failed to get data directory")?;
 
-        // Ensure directory exists
+        // Ensure directory exists. Per call, deliberately not memoised: a store
+        // directory deleted at runtime is recreated by the next construction,
+        // and the directory itself is re-resolved every time (instance roots,
+        // per-test fixtures).
         fs::create_dir_all(&data_dir).context("Failed to create data directory")?;
 
         let storage_path = data_dir.join(STORAGE_FILE);
-        debug!("SecureStorage initialized at: {:?}", storage_path);
+        // The init line and the sweep below run once per storage path per
+        // process, not once per construction (see `first_initialization`).
+        let first_for_path = first_initialization(&storage_path);
+        if first_for_path {
+            debug!("SecureStorage initialized at: {:?}", storage_path);
+        }
 
-        let storage = Self { storage_path };
+        let lock_file = lock_path_for(&storage_path);
+        let storage = Self {
+            storage_path,
+            lock_file,
+        };
         // Best-effort boot sweep of crash-orphaned atomic-write temp files
-        // (older than 5 min so we never race a live writer). Never fatal.
-        storage.sweep_stale_temp_files(std::time::Duration::from_secs(5 * 60));
+        // (older than 5 min so we never race a live writer), once per storage
+        // path per process. That is still a boot sweep for every orphan a
+        // previous process left behind; a temp orphaned during THIS process's
+        // lifetime waits for the next start, which is harmless (readers only
+        // ever open the real store path). Never fatal.
+        if first_for_path {
+            storage.sweep_stale_temp_files(std::time::Duration::from_secs(5 * 60));
+        }
         Ok(storage)
     }
 
     /// Creates a SecureStorage instance with a custom storage path.
     ///
     /// This is primarily used for testing to ensure test isolation.
-    #[cfg(test)]
+    ///
+    /// Gated on `any(test, debug_assertions)` rather than `cfg(test)` because
+    /// the runner BIN's tests call it and this module is a lib module: `cargo
+    /// test` builds the bin's dependencies (this rlib included) without
+    /// `cfg(test)` but WITH `debug_assertions` — the same boundary as
+    /// `ambient::test_support`. A release build compiles none of it.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
     pub fn with_path(storage_path: PathBuf) -> Result<Self> {
         // Ensure parent directory exists
         if let Some(parent) = storage_path.parent() {
             fs::create_dir_all(parent).context("Failed to create data directory")?;
         }
-        Ok(Self { storage_path })
+        let lock_file = lock_path_for(&storage_path);
+        Ok(Self {
+            storage_path,
+            lock_file,
+        })
     }
 
     /// Derives an encryption key from machine-specific identifiers.
@@ -627,7 +875,10 @@ impl SecureStorage {
     /// Loads tokens from encrypted storage.
     fn load_tokens(&self) -> Result<StoredTokens> {
         if !self.storage_path.exists() {
-            debug!("Storage file does not exist, returning empty tokens");
+            // TRACE, not DEBUG: this runs on every token read of an unpaired
+            // store, so at DEBUG it floods (plan
+            // `2026-10-19-runner-secure-storage-reinitialises-and-logs-every-five-seconds`).
+            trace!("Storage file does not exist, returning empty tokens");
             return Ok(StoredTokens::default());
         }
 
@@ -638,7 +889,8 @@ impl SecureStorage {
         let tokens: StoredTokens =
             serde_json::from_slice(&decrypted).context("Failed to parse stored tokens")?;
 
-        debug!("Loaded tokens from secure storage");
+        // TRACE: every token read lands here (thousands per hour at DEBUG).
+        trace!("Loaded tokens from secure storage");
         Ok(tokens)
     }
 
@@ -692,6 +944,43 @@ impl SecureStorage {
 
         debug!("Saved tokens to secure storage");
         Ok(())
+    }
+
+    /// The advisory lock file beside the store: `auth_tokens.enc.lock`.
+    fn lock_path(&self) -> PathBuf {
+        self.lock_file.clone()
+    }
+
+    /// Take the CROSS-PROCESS store lock ([`lock_file_exclusive`]).
+    ///
+    /// [`Self::save_tokens`] is atomic but a read-modify-write is not: two
+    /// processes (the primary, the CLI, an instance runner, a test binary)
+    /// that both load before either saves each write back a struct missing the
+    /// other's slot, and one tenant's credential silently disappears with no
+    /// clear line anywhere (plan `2026-09-30-runner-says-connected-…` F2/D4).
+    /// Every mutator therefore runs load → modify → save under this lock via
+    /// [`Self::locked_rmw`]. Readers stay lock-free: the atomic rename already
+    /// guarantees they see a whole file. NOT re-entrant: no mutator may call
+    /// another mutator while holding it.
+    fn lock_store(&self) -> Result<Option<FileLockGuard>> {
+        if locking_disabled_for_mutation_check() {
+            return Ok(None);
+        }
+        lock_file_exclusive(&self.lock_file).map(Some)
+    }
+
+    /// One locked read-modify-write: take the store lock, `load`, apply
+    /// `modify`, save, release. The ONLY way a mutator touches the store.
+    fn locked_rmw<R>(
+        &self,
+        load: impl FnOnce(&Self) -> Result<StoredTokens>,
+        modify: impl FnOnce(&mut StoredTokens) -> R,
+    ) -> Result<R> {
+        let _guard = self.lock_store()?;
+        let mut tokens = load(self)?;
+        let out = modify(&mut tokens);
+        self.save_tokens(&tokens)?;
+        Ok(out)
     }
 
     /// `true` iff the store file EXISTS but cannot be read/decrypted/parsed.
@@ -752,8 +1041,9 @@ impl SecureStorage {
                          prior encrypted bytes were undecryptable on this machine (the AES key \
                          derives from hostname + username, so a machine rename / disk move \
                          produces exactly this) and are discarded — a background refresh would \
-                         have refused here instead.",
-                        self.storage_path.display()
+                         have refused here instead. [{}]",
+                        self.storage_path.display(),
+                        process_attribution()
                     );
                     Ok(StoredTokens::default())
                 }
@@ -766,15 +1056,27 @@ impl SecureStorage {
 
     /// Stores both access and refresh tokens. Background/default posture:
     /// refuses over a present-but-unreadable store ([`WriteMode::Merge`]).
+    #[track_caller]
     pub fn store_tokens(&self, access_token: &str, refresh_token: &str) -> Result<()> {
-        self.store_tokens_mode(access_token, refresh_token, WriteMode::Merge)
+        self.store_tokens_mode(
+            access_token,
+            refresh_token,
+            WriteMode::Merge,
+            std::panic::Location::caller(),
+        )
     }
 
     /// Explicit-acquisition variant of [`Self::store_tokens`]: overwrites a
     /// present-but-unreadable store from blank rather than refusing. Only the
     /// explicit pairing path (`pair::persist_pairing`) calls this.
+    #[track_caller]
     pub fn store_tokens_fresh(&self, access_token: &str, refresh_token: &str) -> Result<()> {
-        self.store_tokens_mode(access_token, refresh_token, WriteMode::Fresh)
+        self.store_tokens_mode(
+            access_token,
+            refresh_token,
+            WriteMode::Fresh,
+            std::panic::Location::caller(),
+        )
     }
 
     fn store_tokens_mode(
@@ -782,12 +1084,19 @@ impl SecureStorage {
         access_token: &str,
         refresh_token: &str,
         mode: WriteMode,
+        caller: &std::panic::Location<'static>,
     ) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write_mode(mode)?;
-        tokens.access_token = Some(access_token.to_string());
-        tokens.refresh_token = Some(refresh_token.to_string());
-        self.save_tokens(&tokens)?;
-        info!("Tokens stored in secure file storage");
+        self.locked_rmw(
+            |s| s.load_tokens_for_write_mode(mode),
+            |tokens| {
+                tokens.access_token = Some(access_token.to_string());
+                tokens.refresh_token = Some(refresh_token.to_string());
+            },
+        )?;
+        info!(
+            "Tokens stored in secure file storage (mode={mode:?} caller={caller} {})",
+            process_attribution()
+        );
         Ok(())
     }
 
@@ -824,8 +1133,34 @@ impl SecureStorage {
     /// only thing lost relative to a readable run, and it is a regenerable local
     /// identifier, not a credential. (Every other writer refuses, because for
     /// them a blank rewrite is silent credential loss, not the point.)
+    #[track_caller]
     pub fn clear_tokens(&self) -> Result<()> {
-        let mut tokens = self.load_tokens().unwrap_or_default();
+        let caller = std::panic::Location::caller();
+        let cleared_tenants = self.locked_rmw(
+            |s| Ok(s.load_tokens().unwrap_or_default()),
+            Self::wipe_all_credentials,
+        )?;
+        warn!(
+            "Tokens cleared from secure file storage — FULL wipe incl. {} per-tenant \
+             device-JWT slot(s) {cleared_tenants:?} (caller={caller} {})",
+            cleared_tenants.len(),
+            process_attribution()
+        );
+        Ok(())
+    }
+
+    /// The field-level body of [`Self::clear_tokens`]; returns the tenant ids
+    /// whose device-JWT slots it removed (for the attribution line).
+    fn wipe_all_credentials(tokens: &mut StoredTokens) -> Vec<String> {
+        let cleared_tenants: Vec<String> = tokens
+            .tenant_device_jwts
+            .keys()
+            .map(|k| {
+                k.strip_prefix(TENANT_DEVICE_JWT_PREFIX)
+                    .unwrap_or(k)
+                    .to_string()
+            })
+            .collect();
         tokens.access_token = None;
         tokens.refresh_token = None;
         tokens.oauth_access_token = None;
@@ -847,9 +1182,7 @@ impl SecureStorage {
         // already reports signed-out, but keep the flag consistent so a
         // partially-failed wipe can't leave the UI showing signed-in.
         tokens.interactive_signed_out = true;
-        self.save_tokens(&tokens)?;
-        info!("Tokens cleared from secure file storage");
-        Ok(())
+        cleared_tenants
     }
 
     /// Clears ONLY the device-JWT pair (`access_token` / `refresh_token`),
@@ -863,19 +1196,19 @@ impl SecureStorage {
     /// runner's autonomous terminal sessions running. Contrast with
     /// [`Self::clear_tokens`], which wipes everything.
     pub fn clear_interactive_session(&self) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
-        tokens.access_token = None;
-        tokens.refresh_token = None;
-        // oauth_* slots, device_id, and the long-lived autonomy machine keys
-        // (device_machine_key / agent_machine_key) are intentionally preserved
-        // so the refresher can re-mint a device JWT after a default logout.
-        //
-        // Because those credentials survive, the presence-based signed-in check
-        // would otherwise report the operator as still signed in on the next
-        // status re-check. Mark the interactive session as deliberately ended so
-        // the logout sticks while autonomy keeps running.
-        tokens.interactive_signed_out = true;
-        self.save_tokens(&tokens)?;
+        self.locked_rmw(Self::load_tokens_for_write, |tokens| {
+            tokens.access_token = None;
+            tokens.refresh_token = None;
+            // oauth_* slots, device_id, and the long-lived autonomy machine keys
+            // (device_machine_key / agent_machine_key) are intentionally preserved
+            // so the refresher can re-mint a device JWT after a default logout.
+            //
+            // Because those credentials survive, the presence-based signed-in check
+            // would otherwise report the operator as still signed in on the next
+            // status re-check. Mark the interactive session as deliberately ended so
+            // the logout sticks while autonomy keeps running.
+            tokens.interactive_signed_out = true;
+        })?;
         info!(
             "Device-JWT pair cleared from secure file storage (Cognito session preserved for \
              autonomous refresh)"
@@ -945,9 +1278,9 @@ impl SecureStorage {
     /// pair-code redeem, CLI `device pair`) once the acquisition has actually
     /// been persisted — see the `interactive_signed_out` field docs.
     pub fn clear_interactive_signed_out(&self) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
-        tokens.interactive_signed_out = false;
-        self.save_tokens(&tokens)?;
+        self.locked_rmw(Self::load_tokens_for_write, |tokens| {
+            tokens.interactive_signed_out = false;
+        })?;
         debug!("Interactive sign-out marker cleared (user signed back in)");
         Ok(())
     }
@@ -966,9 +1299,10 @@ impl SecureStorage {
     }
 
     fn store_device_id_mode(&self, device_id: &str, mode: WriteMode) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write_mode(mode)?;
-        tokens.device_id = Some(device_id.to_string());
-        self.save_tokens(&tokens)?;
+        self.locked_rmw(
+            |s| s.load_tokens_for_write_mode(mode),
+            |tokens| tokens.device_id = Some(device_id.to_string()),
+        )?;
         info!("Device ID stored in secure file storage: {}", device_id);
         Ok(())
     }
@@ -1071,12 +1405,15 @@ impl SecureStorage {
         expires_at: i64,
         mode: WriteMode,
     ) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write_mode(mode)?;
-        tokens.oauth_access_token = Some(access_token.to_string());
-        tokens.oauth_id_token = Some(id_token.to_string());
-        tokens.oauth_refresh_token = Some(refresh_token.to_string());
-        tokens.oauth_expires_at = Some(expires_at);
-        self.save_tokens(&tokens)?;
+        self.locked_rmw(
+            |s| s.load_tokens_for_write_mode(mode),
+            |tokens| {
+                tokens.oauth_access_token = Some(access_token.to_string());
+                tokens.oauth_id_token = Some(id_token.to_string());
+                tokens.oauth_refresh_token = Some(refresh_token.to_string());
+                tokens.oauth_expires_at = Some(expires_at);
+            },
+        )?;
         info!("Cognito (oauth) tokens stored in secure file storage");
         Ok(())
     }
@@ -1114,12 +1451,12 @@ impl SecureStorage {
     /// Clears only the Cognito (oauth) token slots, leaving the device-JWT
     /// slot intact. Used on Cognito sign-out.
     pub fn clear_oauth_tokens(&self) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
-        tokens.oauth_access_token = None;
-        tokens.oauth_id_token = None;
-        tokens.oauth_refresh_token = None;
-        tokens.oauth_expires_at = None;
-        self.save_tokens(&tokens)?;
+        self.locked_rmw(Self::load_tokens_for_write, |tokens| {
+            tokens.oauth_access_token = None;
+            tokens.oauth_id_token = None;
+            tokens.oauth_refresh_token = None;
+            tokens.oauth_expires_at = None;
+        })?;
         info!("Cognito (oauth) tokens cleared from secure file storage");
         Ok(())
     }
@@ -1138,12 +1475,12 @@ impl SecureStorage {
         &self,
         nonces: &std::collections::HashMap<String, StoredNonceBinding>,
     ) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
-        tokens.coord_mcp_nonces = nonces
-            .iter()
-            .map(|(n, b)| (n.clone(), StoredNonceEntry::Modern(b.clone())))
-            .collect();
-        self.save_tokens(&tokens)?;
+        self.locked_rmw(Self::load_tokens_for_write, |tokens| {
+            tokens.coord_mcp_nonces = nonces
+                .iter()
+                .map(|(n, b)| (n.clone(), StoredNonceEntry::Modern(b.clone())))
+                .collect();
+        })?;
         Ok(())
     }
 
@@ -1157,13 +1494,13 @@ impl SecureStorage {
         nonces: &std::collections::HashMap<String, StoredNonceBinding>,
         graced: &std::collections::HashMap<String, StoredGracedNonce>,
     ) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
-        tokens.coord_mcp_nonces = nonces
-            .iter()
-            .map(|(n, b)| (n.clone(), StoredNonceEntry::Modern(b.clone())))
-            .collect();
-        tokens.coord_mcp_graced_nonces = graced.clone();
-        self.save_tokens(&tokens)?;
+        self.locked_rmw(Self::load_tokens_for_write, |tokens| {
+            tokens.coord_mcp_nonces = nonces
+                .iter()
+                .map(|(n, b)| (n.clone(), StoredNonceEntry::Modern(b.clone())))
+                .collect();
+            tokens.coord_mcp_graced_nonces = graced.clone();
+        })?;
         Ok(())
     }
 
@@ -1230,9 +1567,9 @@ impl SecureStorage {
     /// (`mk_<token>`). Minted ONCE by the enroll endpoint; overwrites any
     /// prior key. Leaves all other slots untouched.
     pub fn store_agent_machine_key(&self, key: &str) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
-        tokens.agent_machine_key = Some(key.to_string());
-        self.save_tokens(&tokens)?;
+        self.locked_rmw(Self::load_tokens_for_write, |tokens| {
+            tokens.agent_machine_key = Some(key.to_string());
+        })?;
         info!("env-agent machine key stored in secure file storage");
         Ok(())
     }
@@ -1248,9 +1585,9 @@ impl SecureStorage {
     /// Clear the dev-environment capture agent's per-machine API key, leaving
     /// all other slots intact. Used when re-enrolling or unenrolling.
     pub fn clear_agent_machine_key(&self) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
-        tokens.agent_machine_key = None;
-        self.save_tokens(&tokens)?;
+        self.locked_rmw(Self::load_tokens_for_write, |tokens| {
+            tokens.agent_machine_key = None;
+        })?;
         info!("env-agent machine key cleared from secure file storage");
         Ok(())
     }
@@ -1275,8 +1612,14 @@ impl SecureStorage {
     /// Store (or overwrite) the device JWT for one tenant binding. Leaves the
     /// legacy `access_token` slot and every other slot untouched. Background/
     /// default posture: refuses over a present-but-unreadable store.
+    #[track_caller]
     pub fn store_tenant_device_jwt(&self, tenant_id: &uuid::Uuid, jwt: &str) -> Result<()> {
-        self.store_tenant_device_jwt_mode(tenant_id, jwt, WriteMode::Merge)
+        self.store_tenant_device_jwt_mode(
+            tenant_id,
+            jwt,
+            WriteMode::Merge,
+            std::panic::Location::caller(),
+        )
     }
 
     /// Explicit-acquisition variant of [`Self::store_tenant_device_jwt`]:
@@ -1285,8 +1628,14 @@ impl SecureStorage {
     /// undecryptable `.enc` it heals the store and every subsequent write in the
     /// same explicit pairing sequence then merges over the now-readable store.
     /// The background refresher's per-tenant write uses the plain (Merge) method.
+    #[track_caller]
     pub fn store_tenant_device_jwt_fresh(&self, tenant_id: &uuid::Uuid, jwt: &str) -> Result<()> {
-        self.store_tenant_device_jwt_mode(tenant_id, jwt, WriteMode::Fresh)
+        self.store_tenant_device_jwt_mode(
+            tenant_id,
+            jwt,
+            WriteMode::Fresh,
+            std::panic::Location::caller(),
+        )
     }
 
     fn store_tenant_device_jwt_mode(
@@ -1294,13 +1643,23 @@ impl SecureStorage {
         tenant_id: &uuid::Uuid,
         jwt: &str,
         mode: WriteMode,
+        caller: &std::panic::Location<'static>,
     ) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write_mode(mode)?;
-        tokens
-            .tenant_device_jwts
-            .insert(Self::tenant_device_jwt_key(tenant_id), jwt.to_string());
-        self.save_tokens(&tokens)?;
-        info!("Per-tenant device JWT stored for tenant {tenant_id}");
+        let slots_after = self.locked_rmw(
+            |s| s.load_tokens_for_write_mode(mode),
+            |tokens| {
+                tokens
+                    .tenant_device_jwts
+                    .insert(Self::tenant_device_jwt_key(tenant_id), jwt.to_string());
+                tokens.tenant_device_jwts.len()
+            },
+        )?;
+        // Never the token: tenant, slot count, mode, caller and process only.
+        info!(
+            "Per-tenant device JWT stored for tenant {tenant_id} (slots_after={slots_after} \
+             mode={mode:?} caller={caller} {})",
+            process_attribution()
+        );
         Ok(())
     }
 
@@ -1317,14 +1676,81 @@ impl SecureStorage {
 
     /// Remove one tenant's device-JWT slot, leaving all other slots (incl.
     /// the legacy `access_token`) intact. Idempotent.
+    #[track_caller]
     pub fn clear_tenant_device_jwt(&self, tenant_id: &uuid::Uuid) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
-        tokens
-            .tenant_device_jwts
-            .remove(&Self::tenant_device_jwt_key(tenant_id));
-        self.save_tokens(&tokens)?;
-        info!("Per-tenant device JWT cleared for tenant {tenant_id}");
+        let caller = std::panic::Location::caller();
+        let (existed, slots_after) = self.locked_rmw(Self::load_tokens_for_write, |tokens| {
+            let existed = tokens
+                .tenant_device_jwts
+                .remove(&Self::tenant_device_jwt_key(tenant_id))
+                .is_some();
+            (existed, tokens.tenant_device_jwts.len())
+        })?;
+        // WARN when a slot actually went away: a vanished credential is the
+        // incident this line exists to attribute. An idempotent no-op is info.
+        if existed {
+            warn!(
+                "Per-tenant device JWT cleared for tenant {tenant_id} (slots_after={slots_after} \
+                 caller={caller} {})",
+                process_attribution()
+            );
+        } else {
+            info!(
+                "Per-tenant device JWT cleared for tenant {tenant_id} (no slot was present; \
+                 slots_after={slots_after} caller={caller} {})",
+                process_attribution()
+            );
+        }
         Ok(())
+    }
+
+    /// Remove each tenant's slot ONLY if it still holds `observed` — the token
+    /// the caller saw when it DECIDED to clear — so a slot rewritten in between
+    /// (a re-pair, a refresher re-mint) survives. Every `(tenant, observed)`
+    /// pair is compared and (if unchanged) removed under
+    /// ONE store-lock acquisition and at most one save. Returns, per tenant,
+    /// whether its slot was removed.
+    #[track_caller]
+    pub fn clear_tenant_device_jwts_if_unchanged(
+        &self,
+        expected: &[(uuid::Uuid, String)],
+    ) -> Result<Vec<(uuid::Uuid, bool)>> {
+        let caller = std::panic::Location::caller();
+        if expected.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _guard = self.lock_store()?;
+        let mut tokens = self.load_tokens_for_write()?;
+        let mut out = Vec::with_capacity(expected.len());
+        for (tenant_id, observed) in expected {
+            let key = Self::tenant_device_jwt_key(tenant_id);
+            let unchanged =
+                tokens.tenant_device_jwts.get(&key).map(String::as_str) == Some(observed.as_str());
+            if unchanged {
+                tokens.tenant_device_jwts.remove(&key);
+            }
+            out.push((*tenant_id, unchanged));
+        }
+        let slots_after = tokens.tenant_device_jwts.len();
+        if out.iter().any(|(_, removed)| *removed) {
+            self.save_tokens(&tokens)?;
+        }
+        for (tenant_id, removed) in &out {
+            if *removed {
+                warn!(
+                    "Per-tenant device JWT cleared for tenant {tenant_id} (conditional batch; \
+                     slots_after={slots_after} caller={caller} {})",
+                    process_attribution()
+                );
+            } else {
+                warn!(
+                    "Per-tenant device JWT for tenant {tenant_id} NOT cleared: the slot changed \
+                     since the clear was decided (caller={caller} {})",
+                    process_attribution()
+                );
+            }
+        }
+        Ok(out)
     }
 
     /// Enumerate the tenant ids that currently have a device-JWT slot, in
@@ -1374,9 +1800,10 @@ impl SecureStorage {
     }
 
     fn store_device_machine_key_mode(&self, key: &str, mode: WriteMode) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write_mode(mode)?;
-        tokens.device_machine_key = Some(key.to_string());
-        self.save_tokens(&tokens)?;
+        self.locked_rmw(
+            |s| s.load_tokens_for_write_mode(mode),
+            |tokens| tokens.device_machine_key = Some(key.to_string()),
+        )?;
         info!("device machine key stored in secure file storage");
         Ok(())
     }
@@ -1394,9 +1821,9 @@ impl SecureStorage {
     /// Used on revocation / re-issue. Mirror of
     /// [`Self::clear_agent_machine_key`].
     pub fn clear_device_machine_key(&self) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
-        tokens.device_machine_key = None;
-        self.save_tokens(&tokens)?;
+        self.locked_rmw(Self::load_tokens_for_write, |tokens| {
+            tokens.device_machine_key = None;
+        })?;
         info!("device machine key cleared from secure file storage");
         Ok(())
     }
@@ -1408,10 +1835,21 @@ impl SecureStorage {
     /// present-but-unreadable, deleting it turns the next launch back into a
     /// clean first-run (absent store ⇒ no interactive-sign-out marker, sign-in
     /// writes succeed) so the operator can sign in again from the LoginScreen.
+    #[track_caller]
     pub fn delete_storage(&self) -> Result<()> {
+        let caller = std::panic::Location::caller();
+        let _guard = self.lock_store()?;
         if self.storage_path.exists() {
+            // Unreadable is the usual reason for a delete, so this is often "?".
+            let slots = self
+                .try_list_tenant_device_jwt_tenants()
+                .map(|v| format!("{v:?}"))
+                .unwrap_or_else(|_| "? (store unreadable)".to_string());
             fs::remove_file(&self.storage_path).context("Failed to delete storage file")?;
-            info!("Secure storage file deleted");
+            warn!(
+                "Secure storage file deleted — per-tenant slots {slots} gone (caller={caller} {})",
+                process_attribution()
+            );
         }
         Ok(())
     }
@@ -1475,12 +1913,11 @@ impl Default for SecureStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
 
     /// Create an isolated storage instance for testing.
     /// Each test gets its own unique storage file to avoid test interference.
     fn create_test_storage(test_name: &str) -> SecureStorage {
-        let temp_dir = env::temp_dir().join("qontinui_test_storage");
+        let temp_dir = crate::test_env::process_scratch_dir("qontinui_test_storage");
         let storage_path = temp_dir.join(format!("{}.enc", test_name));
         // Clean up any existing file from previous test runs
         let _ = fs::remove_file(&storage_path);
@@ -1909,6 +2346,325 @@ mod tests {
             "cog.r",
             "a Fresh write over a readable store must preserve sibling slots"
         );
+    }
+
+    /// Wait for a concurrent peer writer to reach a step, failing only if the
+    /// peer makes NO progress for [`PEER_STALL_LIMIT`] — a dead peer, not a
+    /// slow disk.
+    ///
+    /// The writers below run in LOCKSTEP: a writer starts write `i` only once
+    /// its peer has finished write `i - 1`. The store lock is polled and so not
+    /// fair, and with two free-running writers the one that releases re-takes
+    /// it within microseconds while the other sleeps between polls. On a slow
+    /// Windows disk a writer was starved behind the peer's whole burst of 120
+    /// writes for more than [`STORE_LOCK_TIMEOUT`] and failed "lock … still
+    /// held after 10s" although every single hold lasted milliseconds. In
+    /// lockstep a waiter waits behind at most ONE peer write, so nothing here
+    /// depends on how fast the disk is — and both writers still race for the
+    /// lock at every step, which is what the lost-update check needs (with
+    /// `QONTINUI_TEST_DISABLE_STORE_LOCK=1` they load together every round).
+    fn wait_for_peer(peer_reached: impl Fn() -> bool, what: &str) {
+        let stall_started = std::time::Instant::now();
+        while !peer_reached() {
+            assert!(
+                stall_started.elapsed() < PEER_STALL_LIMIT,
+                "peer writer made no progress for {PEER_STALL_LIMIT:?} waiting for {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// How long a lockstep writer waits for its peer's NEXT step before
+    /// concluding the peer died. One step is one store write.
+    const PEER_STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// D4: two writers — separate `SecureStorage` instances (separate lock
+    /// handles, exactly as two processes would hold them) on the SAME store —
+    /// each add a NEW tenant slot per iteration, concurrently and in lockstep
+    /// ([`wait_for_peer`]). Every slot is a distinct key, so any lost update (a
+    /// load→insert→save interleaving that drops a peer's insert) stays visible
+    /// at the end rather than being papered over by the next round.
+    #[test]
+    fn test_concurrent_writers_of_different_tenants_both_survive() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const N: usize = 120;
+        let storage = create_test_storage("concurrent_tenant_writers");
+        let path = storage.storage_path.clone();
+        let _ = fs::remove_file(storage.lock_path());
+        let done = std::sync::Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let writer = |me: usize, base: u128| {
+            let path = path.clone();
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let s = SecureStorage::with_path(path).unwrap();
+                let peer = 1 - me;
+                for i in 0..N {
+                    wait_for_peer(
+                        || done[peer].load(Ordering::Acquire) >= i,
+                        &format!("write {i}"),
+                    );
+                    s.store_tenant_device_jwt(&uuid::Uuid::from_u128(base + i as u128), "x")
+                        .unwrap();
+                    done[me].store(i + 1, Ordering::Release);
+                }
+            })
+        };
+        let a = writer(0, 0xA000);
+        let b = writer(1, 0xB000);
+        a.join().unwrap();
+        b.join().unwrap();
+        let slots = storage.try_list_tenant_device_jwt_tenants().unwrap();
+        assert_eq!(slots.len(), 2 * N, "a concurrent writer lost slots");
+        let _ = fs::remove_file(&storage.storage_path);
+    }
+
+    /// While one handle holds the store lock, another handle cannot take it
+    /// (exclusion, not just release), and it can once the holder drops.
+    #[test]
+    fn test_store_lock_excludes_a_second_handle_until_released() {
+        let storage = create_test_storage("store_lock_excludes");
+        let guard = storage.lock_store().unwrap();
+        let path = storage.storage_path.clone();
+        let blocked = std::thread::spawn(move || {
+            let other = SecureStorage::with_path(path).unwrap();
+            let f = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(other.lock_path())
+                .unwrap();
+            matches!(f.try_lock(), Err(fs::TryLockError::WouldBlock))
+        })
+        .join()
+        .unwrap();
+        assert!(blocked, "a second handle took the lock while it was held");
+        drop(guard);
+        let other = SecureStorage::with_path(storage.storage_path.clone()).unwrap();
+        drop(other.lock_store().unwrap());
+        let _ = fs::remove_file(&storage.storage_path);
+    }
+
+    /// Env var naming the store a re-invoked child test process writes to.
+    const LOCK_CHILD_STORE_ENV: &str = "QONTINUI_TEST_SS_LOCK_CHILD_STORE";
+    /// Env var naming the first tenant (u128) of the range that child writes.
+    const LOCK_CHILD_TENANT_ENV: &str = "QONTINUI_TEST_SS_LOCK_CHILD_TENANT";
+    /// Env var naming the PEER child's first tenant, whose step markers this
+    /// child waits on to stay in lockstep ([`wait_for_peer`]).
+    const LOCK_CHILD_PEER_ENV: &str = "QONTINUI_TEST_SS_LOCK_CHILD_PEER";
+    /// Distinct tenant slots each child adds.
+    const LOCK_CHILD_WRITES: u128 = 120;
+
+    /// A barrier marker file beside the child-test store.
+    fn lock_child_marker(store: &std::path::Path, tag: &str) -> PathBuf {
+        let mut os = store.as_os_str().to_os_string();
+        os.push(format!(".{tag}"));
+        PathBuf::from(os)
+    }
+
+    /// Remove both children's `ready.*` and `step.*` markers, so a stale one
+    /// from an earlier run cannot let a child skip a wait.
+    fn remove_child_markers(store: &std::path::Path) {
+        for base in [0xA000u128, 0xB000] {
+            let _ = fs::remove_file(lock_child_marker(store, &format!("ready.{base}")));
+            for i in 0..LOCK_CHILD_WRITES {
+                let _ = fs::remove_file(lock_child_marker(store, &format!("step.{base}.{i}")));
+            }
+        }
+    }
+
+    /// Child half of the two-PROCESS test below: a no-op in a normal run; when
+    /// the parent re-invokes this test binary with the env vars set, it
+    /// hammers one tenant slot of the shared store.
+    #[test]
+    fn lock_child_process_writer() {
+        let (Ok(store), Ok(tenant), Ok(peer)) = (
+            std::env::var(LOCK_CHILD_STORE_ENV),
+            std::env::var(LOCK_CHILD_TENANT_ENV),
+            std::env::var(LOCK_CHILD_PEER_ENV),
+        ) else {
+            return;
+        };
+        let base: u128 = tenant.parse().unwrap();
+        let peer: u128 = peer.parse().unwrap();
+        let store = PathBuf::from(store);
+        let s = SecureStorage::with_path(store.clone()).unwrap();
+        // Start barrier: announce readiness, then wait for the parent's GO so
+        // both children's write loops genuinely overlap.
+        fs::write(lock_child_marker(&store, &format!("ready.{base}")), b"").unwrap();
+        let go = lock_child_marker(&store, "go");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !go.exists() {
+            assert!(std::time::Instant::now() < deadline, "parent never said GO");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Lockstep with the peer child: write `i` starts once the peer has
+        // finished write `i - 1` (its `step.<peer>.<i - 1>` marker exists).
+        for i in 0..LOCK_CHILD_WRITES {
+            if i > 0 {
+                let peer_step = lock_child_marker(&store, &format!("step.{peer}.{}", i - 1));
+                wait_for_peer(|| peer_step.exists(), &format!("peer step {}", i - 1));
+            }
+            s.store_tenant_device_jwt(&uuid::Uuid::from_u128(base + i), "x")
+                .unwrap();
+            fs::write(lock_child_marker(&store, &format!("step.{base}.{i}")), b"").unwrap();
+        }
+    }
+
+    /// D4 two-PROCESS test: the test binary re-invokes itself twice
+    /// (`lock_child_process_writer`), each child rewriting a different tenant
+    /// slot of the same store concurrently. Both slots must survive.
+    #[test]
+    fn test_two_processes_writing_different_tenants_both_survive() {
+        let storage = create_test_storage("two_process_tenant_writers");
+        let _ = fs::remove_file(storage.lock_path());
+        let exe = std::env::current_exe().unwrap();
+        let spawn = |tenant: u128, peer: u128| {
+            std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "secure_storage::tests::lock_child_process_writer",
+                    "--test-threads=1",
+                    "--quiet",
+                ])
+                .env(LOCK_CHILD_STORE_ENV, &storage.storage_path)
+                .env(LOCK_CHILD_TENANT_ENV, tenant.to_string())
+                .env(LOCK_CHILD_PEER_ENV, peer.to_string())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let go = lock_child_marker(&storage.storage_path, "go");
+        let _ = fs::remove_file(&go);
+        remove_child_markers(&storage.storage_path);
+        let a = spawn(0xA000, 0xB000);
+        let b = spawn(0xB000, 0xA000);
+        // Release both children together once each has reported ready.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while ![0xA000u128, 0xB000]
+            .iter()
+            .all(|base| lock_child_marker(&storage.storage_path, &format!("ready.{base}")).exists())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "children never became ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        fs::write(&go, b"").unwrap();
+        for child in [a, b] {
+            let out = child.wait_with_output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success(),
+                "child failed: {}\n{stdout}\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            // Guard against a vacuous pass: the child must have RUN the test.
+            assert!(
+                stdout.contains("1 passed"),
+                "child ran no test (filter mismatch?): {stdout}"
+            );
+        }
+        let slots = storage.try_list_tenant_device_jwt_tenants().unwrap();
+        assert_eq!(
+            slots.len() as u128,
+            2 * LOCK_CHILD_WRITES,
+            "one process's slots were lost to the other"
+        );
+        let _ = fs::remove_file(&go);
+        remove_child_markers(&storage.storage_path);
+        let _ = fs::remove_file(&storage.storage_path);
+    }
+
+    /// A nested acquisition of the store lock on one thread is refused at
+    /// once (it would otherwise wait out the timeout against itself). A debug
+    /// build trips the debug_assert; a release build returns the error.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "nested acquisition")]
+    fn test_nested_store_lock_on_one_thread_is_refused() {
+        let storage = create_test_storage("store_lock_nested");
+        let _outer = storage.lock_store().unwrap();
+        let _ = storage.lock_store();
+    }
+
+    /// Release twin of the test above: the nested call returns the error.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn test_nested_store_lock_on_one_thread_is_refused() {
+        let storage = create_test_storage("store_lock_nested");
+        let _outer = storage.lock_store().unwrap();
+        let started = std::time::Instant::now();
+        let err = storage
+            .lock_store()
+            .err()
+            .expect("nested lock must be refused");
+        assert!(format!("{err:#}").contains("nested acquisition"), "{err:#}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "refused, not waited"
+        );
+    }
+
+    /// The batch conditional clear removes only the slots that still hold
+    /// their observed token, in one pass.
+    #[test]
+    fn test_batch_conditional_clear_spares_rewritten_slots() {
+        let storage = create_test_storage("batch_conditional_clear");
+        let (a, b) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+        storage.store_tenant_device_jwt(&a, "a1").unwrap();
+        storage.store_tenant_device_jwt(&b, "b1").unwrap();
+        storage.store_tenant_device_jwt(&b, "b2").unwrap();
+        let out = storage
+            .clear_tenant_device_jwts_if_unchanged(&[(a, "a1".into()), (b, "b1".into())])
+            .unwrap();
+        assert_eq!(out, vec![(a, true), (b, false)]);
+        assert!(storage.get_tenant_device_jwt(&a).unwrap().is_none());
+        assert_eq!(
+            storage.get_tenant_device_jwt(&b).unwrap().as_deref(),
+            Some("b2")
+        );
+        let _ = fs::remove_file(&storage.storage_path);
+    }
+
+    /// The conditional clear removes the slot only while it still holds the
+    /// observed token; a slot rewritten since the decision survives.
+    #[test]
+    fn test_conditional_clear_spares_a_rewritten_slot() {
+        let storage = create_test_storage("conditional_clear");
+        let t = uuid::Uuid::from_u128(7);
+        storage.store_tenant_device_jwt(&t, "old").unwrap();
+        storage.store_tenant_device_jwt(&t, "new").unwrap();
+        let once = |tok: &str| {
+            storage
+                .clear_tenant_device_jwts_if_unchanged(&[(t, tok.to_string())])
+                .unwrap()[0]
+                .1
+        };
+        assert!(!once("old"));
+        assert_eq!(
+            storage.get_tenant_device_jwt(&t).unwrap().as_deref(),
+            Some("new")
+        );
+        assert!(once("new"));
+        assert!(storage.get_tenant_device_jwt(&t).unwrap().is_none());
+        let _ = fs::remove_file(&storage.storage_path);
+    }
+
+    /// The lock file is owner-only on Unix.
+    #[cfg(unix)]
+    #[test]
+    fn test_store_lock_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let storage = create_test_storage("store_lock_mode");
+        let _ = fs::remove_file(storage.lock_path());
+        drop(storage.lock_store().unwrap());
+        let mode = fs::metadata(storage.lock_path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "lock file mode {mode:o}");
     }
 
     /// The boot sweep unlinks crash-orphaned `*.enc.tmp.<...>` files older than
@@ -2374,6 +3130,7 @@ mod tests {
                 grace_until_unix: 1_700_021_600,
                 session_tenant: None,
                 session_tenant_origin: None,
+                expected_tenant: None,
             },
         )]);
         storage
@@ -2439,6 +3196,284 @@ mod tests {
         assert!(
             uuid::Uuid::parse_str(&retrieved).is_ok(),
             "Device ID should be a valid UUID"
+        );
+    }
+
+    // ---- once-per-path init, and the per-read lines at TRACE (plan
+    // `2026-10-19-runner-secure-storage-reinitialises-and-logs-every-five-seconds`
+    // Phase 1) ----------------------------------------------------------------
+
+    /// Logged first by every capture closure below. An absence assertion is
+    /// only meaningful on a capture that demonstrably received output, so
+    /// each test also asserts this line IS present: an empty capture can
+    /// never pass.
+    const CAPTURE_SENTINEL: &str = "secure-storage-capture-sentinel";
+
+    /// Run `f` under a scoped fmt subscriber at `level` and return what it
+    /// logged on this thread: the first capture that holds
+    /// [`CAPTURE_SENTINEL`] and satisfies `complete`, or the last attempt when
+    /// none does.
+    ///
+    /// Adopts the guards of `terminal::session`'s `capture_logs` (a bin-crate
+    /// test helper, so not reachable from this lib module). Tracing's callsite
+    /// `Interest` cache and global max level are PROCESS-global, which a scoped
+    /// subscriber does not escape, and parallel captures measurably lost a
+    /// whole log. So captures here run one at a time, and each rebuilds the
+    /// interest cache once its own subscriber is the thread default.
+    ///
+    /// Those guards narrow the race but cannot close it, and here it was seen
+    /// to lose PART of a capture as well: one TRACE callsite missing while its
+    /// neighbours in the same capture arrived. So a capture that lacks the
+    /// sentinel, or is not `complete`, is re-run, up to `CAPTURE_ATTEMPTS`
+    /// times. That cannot hide a real defect, which fails every attempt the
+    /// same way. `f` must therefore be safe to run more than once.
+    fn capture_logs(
+        level: tracing::Level,
+        f: impl Fn(),
+        complete: impl Fn(&str) -> bool,
+    ) -> String {
+        const CAPTURE_ATTEMPTS: usize = 5;
+        let mut logs = String::new();
+        for _ in 0..CAPTURE_ATTEMPTS {
+            logs = capture_logs_once(level, &f);
+            if logs.contains(CAPTURE_SENTINEL) && complete(&logs) {
+                break;
+            }
+        }
+        logs
+    }
+
+    /// How many lines of `logs` were emitted at exactly `level` (`"DEBUG"`,
+    /// `"TRACE"`, ...) and contain `needle`.
+    ///
+    /// Reads the level token the fmt layer prints, not only the text. A stale
+    /// process-global interest can hand a TRACE event to a DEBUG capture, and
+    /// that event is still printed as TRACE, so it is never miscounted as a
+    /// DEBUG line.
+    fn count_at(logs: &str, level: &str, needle: &str) -> usize {
+        logs.lines()
+            .filter(|line| line.split_whitespace().next() == Some(level))
+            .filter(|line| line.contains(needle))
+            .count()
+    }
+
+    /// One attempt of [`capture_logs`].
+    fn capture_logs_once(level: tracing::Level, f: &impl Fn()) -> String {
+        static CAPTURE_SERIAL: Mutex<()> = Mutex::new(());
+        let _serial = CAPTURE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Captured;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let sink = Captured::default();
+        let buf = sink.0.clone();
+        // No timestamp, so every line starts with its level (see `count_at`).
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink)
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(level)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            f()
+        });
+        let bytes = buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Plant `<dir>/auth_tokens.enc.tmp.<tag>` with an mtime ten minutes ago,
+    /// past `new()`'s five-minute sweep threshold.
+    fn plant_stale_temp(dir: &Path, tag: &str) -> PathBuf {
+        let temp = dir.join(format!("{STORAGE_FILE}.tmp.{tag}"));
+        fs::write(&temp, b"orphaned").unwrap();
+        let ten_minutes_ago = filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 60),
+        );
+        filetime::set_file_mtime(&temp, ten_minutes_ago).unwrap();
+        temp
+    }
+
+    /// The pure half of the memo: new the first time per path, then not.
+    #[test]
+    fn first_sighting_is_true_once_per_path() {
+        let mut seen = HashSet::new();
+        let a = Path::new("store-a").join(STORAGE_FILE);
+        let b = Path::new("store-b").join(STORAGE_FILE);
+        assert!(
+            first_sighting(&mut seen, &a),
+            "a path's first sighting is new"
+        );
+        assert!(
+            !first_sighting(&mut seen, &a),
+            "the same path a second time is not new"
+        );
+        assert!(
+            first_sighting(&mut seen, &b),
+            "a different path is new even after another was seen"
+        );
+        assert!(!first_sighting(&mut seen, &b));
+    }
+
+    /// `new()` sweeps stale temps the FIRST time it initializes a storage path
+    /// in this process, and not on every construction after that.
+    #[test]
+    fn new_sweeps_stale_temps_once_per_storage_path() {
+        let amb = crate::ambient::test_support::isolated_ambient();
+        let dir = amb.dir().to_path_buf();
+
+        let first = plant_stale_temp(&dir, "first");
+        let storage = SecureStorage::new().unwrap();
+        assert_eq!(
+            storage.storage_path,
+            dir.join(STORAGE_FILE),
+            "the fixture must redirect the store into its own directory"
+        );
+        assert!(
+            !first.exists(),
+            "the first construction for a storage path must sweep a stale temp"
+        );
+
+        let second = plant_stale_temp(&dir, "second");
+        let _again = SecureStorage::new().unwrap();
+        assert!(
+            second.exists(),
+            "a second construction for the same storage path must not sweep again"
+        );
+    }
+
+    /// Every per-read and absent-store line demoted from DEBUG to TRACE.
+    const PER_READ_LINES: &[&str] = &[
+        // secure_storage `load_tokens`, store present
+        "Loaded tokens from secure storage",
+        // auth `get_access_token`, store present
+        "Retrieved access token from secure storage",
+        // auth `get_refresh_token`, store present
+        "Retrieved refresh token from secure storage",
+        // secure_storage `load_tokens`, store absent
+        "Storage file does not exist",
+        // auth `get_access_token`, store absent
+        "Access token not in secure storage",
+        // auth `get_access_token`, store absent and no keychain
+        "Access token not in keychain",
+        // auth `get_refresh_token`, store absent
+        "Refresh token not in secure storage",
+        // auth `get_refresh_token`, store absent and no keychain
+        "Refresh token not in keychain",
+    ];
+
+    /// The per-read and absent-store lines are silent at DEBUG and still
+    /// emitted at TRACE (the positive control: the same reads demonstrably
+    /// reach every one of them, so their absence at DEBUG is not vacuous).
+    #[test]
+    fn per_read_and_absent_store_lines_are_trace_not_debug() {
+        let present = create_test_storage("per_read_lines_present");
+        present.store_tokens("t", "").unwrap();
+        let absent = create_test_storage("per_read_lines_absent");
+        assert!(
+            !absent.store_file_exists(),
+            "the absent store must be absent"
+        );
+
+        let reads = || {
+            // DEBUG, not INFO: the DEBUG capture's sentinel then also proves
+            // that capture really admitted DEBUG events.
+            tracing::debug!("{CAPTURE_SENTINEL}");
+            let paired = crate::auth::AuthManager::with_storage_no_keychain(present.clone());
+            assert_eq!(paired.get_access_token().unwrap(), "t");
+            assert_eq!(paired.get_refresh_token().unwrap(), "");
+            let unpaired = crate::auth::AuthManager::with_storage_no_keychain(absent.clone());
+            assert!(unpaired.get_access_token().is_err());
+            assert!(unpaired.get_refresh_token().is_err());
+        };
+
+        // Every line that `logs` carries at `level`, or that it lacks there.
+        let logged_at = |logs: &str, level: &str| -> Vec<&'static str> {
+            PER_READ_LINES
+                .iter()
+                .copied()
+                .filter(|line| count_at(logs, level, line) > 0)
+                .collect()
+        };
+        let missing_at = |logs: &str, level: &str| -> Vec<&'static str> {
+            PER_READ_LINES
+                .iter()
+                .copied()
+                .filter(|line| count_at(logs, level, line) == 0)
+                .collect()
+        };
+
+        let at_debug = capture_logs(tracing::Level::DEBUG, reads, |_| true);
+        assert!(
+            at_debug.contains(CAPTURE_SENTINEL),
+            "positive control: the DEBUG capture lost the sentinel:\n{at_debug}"
+        );
+        // Collected rather than asserted one by one, so a failure names every
+        // line still at DEBUG, not only the first.
+        let leaked = logged_at(&at_debug, "DEBUG");
+        assert!(
+            leaked.is_empty(),
+            "per-read lines still logged at DEBUG: {leaked:?}\n{at_debug}"
+        );
+
+        let at_trace = capture_logs(tracing::Level::TRACE, reads, |logs| {
+            missing_at(logs, "TRACE").is_empty()
+        });
+        assert!(
+            at_trace.contains(CAPTURE_SENTINEL),
+            "positive control: the TRACE capture lost the sentinel:\n{at_trace}"
+        );
+        let unreached = missing_at(&at_trace, "TRACE");
+        assert!(
+            unreached.is_empty(),
+            "the reads never reached these lines even at TRACE, so their absence at DEBUG \
+             proves nothing: {unreached:?}\n{at_trace}"
+        );
+    }
+
+    /// Two `SecureStorage::new()` constructions of one storage path log the
+    /// init line once, at DEBUG.
+    #[test]
+    fn init_line_logs_once_per_storage_path() {
+        const INIT_LINE: &str = "SecureStorage initialized at";
+        let logs = capture_logs(
+            tracing::Level::DEBUG,
+            || {
+                // A fresh fixture per attempt, so a re-run capture still starts
+                // from a storage path the memo has never recorded.
+                let _amb = crate::ambient::test_support::isolated_ambient();
+                tracing::info!("{CAPTURE_SENTINEL}");
+                let _first = SecureStorage::new().unwrap();
+                let _second = SecureStorage::new().unwrap();
+            },
+            // A capture with no init line at all lost it to the race (the
+            // positive control below), so it is re-run rather than trusted.
+            |logs| count_at(logs, "DEBUG", INIT_LINE) > 0,
+        );
+        assert!(
+            logs.contains(CAPTURE_SENTINEL),
+            "positive control: the capture lost the sentinel:\n{logs}"
+        );
+        let inits = count_at(&logs, "DEBUG", INIT_LINE);
+        assert_eq!(
+            inits, 1,
+            "two constructions of one storage path must log the init line exactly once:\n{logs}"
         );
     }
 }

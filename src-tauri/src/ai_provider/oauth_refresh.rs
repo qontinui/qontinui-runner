@@ -517,6 +517,7 @@ pub(crate) fn default_location_has_valid_credentials() -> bool {
 /// triggers a Keychain access-control prompt.
 #[cfg(target_os = "macos")]
 fn macos_keychain_has_claude_credentials() -> bool {
+    // console-ok: a macOS-only arm, so there is no Windows console to flash.
     std::process::Command::new("security")
         .args(["find-generic-password", "-s", "Claude Code-credentials"])
         .output()
@@ -671,6 +672,7 @@ mod tests {
     /// Hold for the duration of any test that queues or inspects refresh
     /// requests. Recovers from a poisoned guard (a panicking test must not
     /// cascade into every sibling).
+    // test-lock: standalone — module-private; its holders take no other test lock and never touch env
     fn refresh_log_guard() -> std::sync::MutexGuard<'static, ()> {
         REFRESH_LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner())
     }

@@ -16,6 +16,7 @@ import { useState, useEffect, useCallback } from "react";
 import { X, AlertCircle, CheckCircle2, Loader } from "lucide-react";
 import type { LoadedSpec } from "./types";
 import { useSpecAuthor } from "./useSpecAuthor";
+import { describeThrown } from "@/lib/utils";
 
 interface SpecEditorModalProps {
   open: boolean;
@@ -95,7 +96,7 @@ export function SpecEditorModal({
       setJsonParseError(null);
       return { valid: true, parsed };
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Invalid JSON";
+      const msg = describeThrown(err, "Invalid JSON");
       setJsonParseError(`JSON parse error: ${msg}`);
       return { valid: false };
     }
@@ -144,9 +145,7 @@ export function SpecEditorModal({
           ...config.metadata,
           description: formData.description,
           purpose: formData.purpose || undefined,
-          tags: formData.tags
-            ? formData.tags.split(",").map((t) => t.trim())
-            : undefined,
+          tags: formData.tags ? formData.tags.split(",").map((t) => t.trim()) : undefined,
           notes: formData.notes || undefined,
         };
         specToSave.states = config.states;
@@ -172,7 +171,17 @@ export function SpecEditorModal({
         // Error is handled by useSpecAuthor hook
       }
     }
-  }, [spec, formData, showJsonEditor, jsonText, saveSpec, validateForm, validateJson, onClose, onSaveSuccess]);
+  }, [
+    spec,
+    formData,
+    showJsonEditor,
+    jsonText,
+    saveSpec,
+    validateForm,
+    validateJson,
+    onClose,
+    onSaveSuccess,
+  ]);
 
   if (!open || !spec) {
     return null;
@@ -223,18 +232,14 @@ export function SpecEditorModal({
             <div className="space-y-4">
               {/* ID Field - Read-only */}
               <div>
-                <label className="block text-sm font-medium text-foreground mb-1">
-                  Spec ID
-                </label>
+                <label className="block text-sm font-medium text-foreground mb-1">Spec ID</label>
                 <input
                   type="text"
                   value={formData.id}
                   disabled
                   className="w-full px-3 py-2 bg-white/5 border border-border rounded text-muted-foreground text-sm"
                 />
-                <p className="text-xs text-muted-foreground/60 mt-1">
-                  Spec ID cannot be changed
-                </p>
+                <p className="text-xs text-muted-foreground/60 mt-1">Spec ID cannot be changed</p>
               </div>
 
               {/* Name Field */}
@@ -258,9 +263,7 @@ export function SpecEditorModal({
                       : "border-border focus:border-blue-500"
                   }`}
                 />
-                {errors.name && (
-                  <p className="text-xs text-red-500 mt-1">{errors.name}</p>
-                )}
+                {errors.name && <p className="text-xs text-red-500 mt-1">{errors.name}</p>}
               </div>
 
               {/* Description Field */}
@@ -270,9 +273,7 @@ export function SpecEditorModal({
                 </label>
                 <textarea
                   value={formData.description}
-                  onChange={(e) =>
-                    setFormData({ ...formData, description: e.target.value })
-                  }
+                  onChange={(e) => setFormData({ ...formData, description: e.target.value })}
                   placeholder="Describe what this spec covers"
                   rows={3}
                   className="w-full px-3 py-2 bg-white/5 border border-border rounded text-sm focus:border-blue-500 transition-colors"
@@ -281,15 +282,11 @@ export function SpecEditorModal({
 
               {/* Purpose Field */}
               <div>
-                <label className="block text-sm font-medium text-foreground mb-1">
-                  Purpose
-                </label>
+                <label className="block text-sm font-medium text-foreground mb-1">Purpose</label>
                 <input
                   type="text"
                   value={formData.purpose}
-                  onChange={(e) =>
-                    setFormData({ ...formData, purpose: e.target.value })
-                  }
+                  onChange={(e) => setFormData({ ...formData, purpose: e.target.value })}
                   placeholder="e.g., Verify dashboard layout and content"
                   className="w-full px-3 py-2 bg-white/5 border border-border rounded text-sm focus:border-blue-500 transition-colors"
                 />
@@ -303,9 +300,7 @@ export function SpecEditorModal({
                 <input
                   type="text"
                   value={formData.tags}
-                  onChange={(e) =>
-                    setFormData({ ...formData, tags: e.target.value })
-                  }
+                  onChange={(e) => setFormData({ ...formData, tags: e.target.value })}
                   placeholder="e.g., ui, dashboard, layout"
                   className="w-full px-3 py-2 bg-white/5 border border-border rounded text-sm focus:border-blue-500 transition-colors"
                 />
@@ -313,14 +308,10 @@ export function SpecEditorModal({
 
               {/* Notes Field */}
               <div>
-                <label className="block text-sm font-medium text-foreground mb-1">
-                  Notes
-                </label>
+                <label className="block text-sm font-medium text-foreground mb-1">Notes</label>
                 <textarea
                   value={formData.notes}
-                  onChange={(e) =>
-                    setFormData({ ...formData, notes: e.target.value })
-                  }
+                  onChange={(e) => setFormData({ ...formData, notes: e.target.value })}
                   placeholder="Additional notes about this spec"
                   rows={2}
                   className="w-full px-3 py-2 bg-white/5 border border-border rounded text-sm focus:border-blue-500 transition-colors"

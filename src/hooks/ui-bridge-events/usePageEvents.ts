@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import { getApiPort } from "@/lib/runner-api";
+import { getApiBase } from "@/lib/runner-api";
 import type { UIBridgeRequestPayload, UIBridgeEventContext, PageEventTypes } from "./types";
 import { createLogger } from "@/lib/logger";
 import {
@@ -25,6 +25,7 @@ import {
   describeEvaluateResult,
   describeEvaluateBudget,
 } from "./utils";
+import { describeThrown } from "@/lib/utils";
 
 const logger = createLogger("UIBridgePageEvents");
 
@@ -226,7 +227,7 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
             });
 
             try {
-              fetch(`http://localhost:${getApiPort()}/ui-bridge/control/render-log`, {
+              fetch(`${getApiBase()}/ui-bridge/control/render-log`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -245,7 +246,7 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               requestId,
               type,
               success: false,
-              error: `Navigation failed: ${err instanceof Error ? err.message : String(err)}`,
+              error: `Navigation failed: ${describeThrown(err, "unknown error")}`,
               timestamp: Date.now(),
             });
           }

@@ -146,6 +146,7 @@ pub(crate) fn apply_typed_resume_effects(
                     crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string(),
                 ),
                 restore_pending_at: None,
+                awaiting_account_since: None,
                 confirmed_at: None,
                 handle: None,
                 account_label: None,
@@ -166,6 +167,8 @@ pub(crate) fn apply_typed_resume_effects(
                 finish_reason: None,
                 finish_synced: false,
                 spawn_device_default: None,
+                adopted_from: None,
+                last_session_start_at: None,
             });
             info!(
                 terminal_id = %terminal_id,

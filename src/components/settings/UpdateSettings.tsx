@@ -4,6 +4,8 @@ import { Download, RefreshCw, CheckCircle, AlertCircle, Info } from "lucide-reac
 import { SectionHeader } from "./SectionHeader";
 import { getStatusColors } from "@/design-system";
 import type { LogFunction, UpdateInfo, UpdateStatus } from "./types";
+import { describeThrown } from "@/lib/utils";
+import { isUpdateEgressOff, UPDATE_EGRESS_OFF_MESSAGE } from "./egressPrivacyHelpers";
 
 interface UpdateSettingsProps {
   onLog: LogFunction;
@@ -30,7 +32,9 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
         setUpdateInfo(result.data);
         setLastChecked(new Date());
 
-        if (result.data.available) {
+        if (isUpdateEgressOff(result.data)) {
+          onLog("info", UPDATE_EGRESS_OFF_MESSAGE);
+        } else if (result.data.available) {
           onLog("info", `Update available: v${result.data.version}`);
         } else if (result.data.development) {
           onLog("info", "Update checking disabled in development mode");
@@ -40,7 +44,7 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
       }
       setStatus("idle");
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
+      const errorMessage = describeThrown(err, "Failed to check for updates");
       setError(errorMessage);
       setStatus("error");
       onLog("error", `Failed to check for updates: ${errorMessage}`);
@@ -69,10 +73,13 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
       const result = (await invoke("install_update")) as {
         success: boolean;
         message?: string;
-        data?: { installed: boolean; version?: string; development?: boolean };
+        data?: { installed: boolean; version?: string; development?: boolean; status?: string };
       };
 
-      if (result.success && result.data?.installed) {
+      if (isUpdateEgressOff(result.data)) {
+        onLog("info", UPDATE_EGRESS_OFF_MESSAGE);
+        setStatus("idle");
+      } else if (result.success && result.data?.installed) {
         onLog("success", "Update installed. The application will restart.");
       } else if (result.data?.development) {
         onLog("warning", "Updates are disabled in development mode");
@@ -83,7 +90,7 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
         onLog("error", result.message || "Failed to install update");
       }
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
+      const errorMessage = describeThrown(err, "Failed to install update");
       setError(errorMessage);
       setStatus("error");
       onLog("error", `Failed to install update: ${errorMessage}`);
@@ -149,7 +156,28 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
         <div className="rounded-lg bg-card/50 p-4">
           <h4 className="font-medium text-sm mb-3">Update Status</h4>
 
-          {updateInfo.development ? (
+          {isUpdateEgressOff(updateInfo) ? (
+            <div className="flex items-start gap-2 p-3 bg-muted/30 rounded-lg">
+              <Info className="w-4 h-4 text-muted-foreground mt-0.5 shrink-0" />
+              <div>
+                <div
+                  data-content-role="status"
+                  data-content-label="update checks off"
+                  className="text-sm font-medium"
+                >
+                  {UPDATE_EGRESS_OFF_MESSAGE}
+                </div>
+                <div
+                  data-content-role="description"
+                  data-content-label="update checks off info"
+                  className="text-xs text-muted-foreground"
+                >
+                  This runner made no request for a newer version. The setting belongs to your
+                  project and is changed in the web console under Coord → Tenant policy.
+                </div>
+              </div>
+            </div>
+          ) : updateInfo.development ? (
             <div className="flex items-start gap-2 p-3 bg-muted/30 rounded-lg">
               <Info className="w-4 h-4 text-muted-foreground mt-0.5 shrink-0" />
               <div>

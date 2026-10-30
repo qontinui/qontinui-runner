@@ -82,7 +82,13 @@ mod tests {
             expect_needle: "#[expect(clippy::disallowed_methods",
             // 537 -> 536: qontinui_specs.rs `table_exists` migrated to
             // try_get (plan 2026-05-14-atlas-wave-6-triage).
-            baseline: 536,
+            // 536 -> 535: task_run_events.rs `count_task_run_table` deleted —
+            // the per-run log pages carry a window count (plan
+            // 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus, 5b).
+            // 535 -> 533: pr_watch_ops.rs `upsert_pr_watch_state` and
+            // `get_pr_watch_token_for_task` deleted with the plaintext PR-watch
+            // token slot (coord finding e871ac27).
+            baseline: 533,
             gate_wiring: &[
                 ("clippy.toml", "disallowed-methods"),
                 ("clippy.toml", "tokio_postgres::Row::get"),
@@ -109,7 +115,15 @@ mod tests {
         Ratchet {
             lint: "clippy::string_slice",
             expect_needle: "#[expect(clippy::string_slice",
-            baseline: 435,
+            // 435 -> 434: graphql `task_run_output` moved to char-boundary
+            // `str::get` slicing in `graphql::output_page` (plan
+            // 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus, 5b).
+            // 434 -> 428: pr_watcher.rs `poll_active_prs` and review_subtask.rs
+            // `process_review_outcome` lost their only slices when the per-watch
+            // token and the GitHub review post were deleted (coord finding
+            // e871ac27), 430 -> 428 measured. The other 4 were slack left when
+            // 93a2ca093 pinned 434 against a measured 430.
+            baseline: 428,
             gate_wiring: &[
                 ("src-tauri/Cargo.toml", "string_slice = { level = \"deny\""),
                 (

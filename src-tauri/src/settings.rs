@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::ai_router::RoutingConfig;
 use crate::orchestrator::{CompressionConfig, RetryConfig};
@@ -99,14 +99,41 @@ pub enum CliExecutionMode {
     Native,        // Native *nix execution
 }
 
-/// Account selection strategy for multi-account Claude CLI setups
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+/// Account selection strategy for multi-account Claude CLI setups.
+///
+/// Deserialization is tolerant: a spelling this build does not know (a mode
+/// added by a newer runner, written into the machine-wide
+/// `claude-accounts.json` every runner on the box reads) decodes to the
+/// default with a warning instead of failing the whole document.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountSelectionMode {
-    Manual,     // Use the explicitly configured config_dir
+    Manual,               // Use the explicitly configured config_dir
     LeastUsage, // Auto-select the account with lowest utilization relative to expected pace.
+    HighestExpectedUsage, // Auto-select, among accounts under their expected pace, the one with the highest expected usage.
+    /// Among accounts under their expected pace, pick at random, weighted by
+    /// `expected * (expected - actual)`.
+    WeightedRandom,
+    /// Among accounts under their expected pace, ranked by expected usage
+    /// (highest first), alternate handoffs between the first account and each
+    /// of the others in turn (1,2,1,3,1,4,1,2,...), from the handoffs of the
+    /// last 3 hours. Spawn-time selection takes the first account. No-op when
+    /// fewer than two config dirs are configured, so safe as the default.
     #[default]
-    HighestExpectedUsage, // Auto-select, among accounts under their expected pace, the one with the highest expected usage. No-op when fewer than two config dirs are configured, so safe as the default.
+    AlternatingHandoff,
+}
+
+impl<'de> Deserialize<'de> for AccountSelectionMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Ok(AccountSelectionMode::from_wire(&raw).unwrap_or_else(|| {
+            tracing::warn!(
+                mode = %raw,
+                "unknown account_selection_mode — using the default; a newer runner may have written it"
+            );
+            AccountSelectionMode::default()
+        }))
+    }
 }
 
 impl AccountSelectionMode {
@@ -123,7 +150,26 @@ impl AccountSelectionMode {
             AccountSelectionMode::Manual => "manual",
             AccountSelectionMode::LeastUsage => "least_usage",
             AccountSelectionMode::HighestExpectedUsage => "highest_expected_usage",
+            AccountSelectionMode::WeightedRandom => "weighted_random",
+            AccountSelectionMode::AlternatingHandoff => "alternating_handoff",
         }
+    }
+
+    /// Every mode, in declaration order — the one list wire-spelling parsers
+    /// walk, so a new variant cannot be missed by one of them.
+    pub const ALL: [AccountSelectionMode; 5] = [
+        AccountSelectionMode::Manual,
+        AccountSelectionMode::LeastUsage,
+        AccountSelectionMode::HighestExpectedUsage,
+        AccountSelectionMode::WeightedRandom,
+        AccountSelectionMode::AlternatingHandoff,
+    ];
+
+    /// Parse a wire spelling (trimmed, case-insensitive); `None` when it names
+    /// no mode.
+    pub fn from_wire(raw: &str) -> Option<AccountSelectionMode> {
+        let level = raw.trim().to_ascii_lowercase();
+        Self::ALL.into_iter().find(|mode| mode.as_str() == level)
     }
 }
 
@@ -140,12 +186,21 @@ pub struct ClaudeCliSettings {
     /// How to select which account to use when multiple config dirs exist
     #[serde(default)]
     pub account_selection_mode: AccountSelectionMode,
+    /// Pin this machine's `account_selection_mode` against the fleet's
+    /// `account_selection_mode` fleet-policy domain. `false` (the default, and
+    /// what every settings file predating the field decodes to) lets a fleet
+    /// value override the local mode; `true` makes the local mode win
+    /// regardless. Machine-global exactly like the mode itself: when
+    /// `claude-accounts.json` exists its copy overlays this one — see
+    /// `claude_accounts::resolve_selection_mode`.
+    #[serde(default)]
+    pub account_selection_pinned: bool,
     /// Automatically migrate a terminal Claude session to another configured
     /// account when its account runs out of tokens: a usage-limit message in
     /// the PTY output, confirmed by a fresh usage probe, triggers a
-    /// transcript copy + `claude --resume` respawn under the account whose
-    /// spare weekly capacity is closest to expiring — unused capacity does not
-    /// roll over past the reset (see `terminal::account_migration`).
+    /// transcript copy + `claude --resume` respawn under the account the
+    /// selection mode's handoff strategy picks (see
+    /// `terminal::account_migration` and `ai_provider::account_usage`).
     /// No-op when fewer than two accounts are configured.
     #[serde(default = "default_auto_migrate_on_token_exhaustion")]
     pub auto_migrate_on_token_exhaustion: bool,
@@ -172,7 +227,8 @@ impl Default for ClaudeCliSettings {
             custom_path: None,
             timeout_seconds: 600,
             config_dir: None,
-            account_selection_mode: AccountSelectionMode::HighestExpectedUsage,
+            account_selection_mode: AccountSelectionMode::default(),
+            account_selection_pinned: false,
             auto_migrate_on_token_exhaustion: default_auto_migrate_on_token_exhaustion(),
             auto_continue_after_migration: default_auto_continue_after_migration(),
         }
@@ -524,6 +580,60 @@ pub struct AiSettings {
     /// Plan: `2026-07-28-git-op-federation-lost-its-kill-switch`.
     #[serde(default = "default_git_op_federation_enabled")]
     pub git_op_federation_enabled: bool,
+}
+
+/// The READ shape of the AI settings: the stored [`AiSettings`] plus the
+/// account-selection mode that actually governs this machine and the input
+/// that decided it ([`crate::claude_accounts::effective_selection`]).
+///
+/// Read-only by construction — it is `Serialize` only, and the three derived
+/// keys (`effective_account_selection_mode`, `account_selection_source`,
+/// `fleet_account_selection_mode`) are never fields of [`AiSettings`]: a
+/// derived value persisted into `settings.json` would be written back by every
+/// save. A client that echoes the view back on `PUT /settings/ai` is harmless,
+/// because `AiSettings` has no `deny_unknown_fields` and the three keys are
+/// dropped on deserialize (pinned by `mcp::settings` tests).
+///
+/// Plan `2026-10-01-fleet-account-selection-effective-mode-visibility-and-pin-safe-saves`
+/// Phase 2.
+#[derive(Debug, Clone, Serialize)]
+pub struct AiSettingsView {
+    #[serde(flatten)]
+    pub settings: AiSettings,
+    pub effective_account_selection_mode: AccountSelectionMode,
+    pub account_selection_source: crate::claude_accounts::AccountSelectionSource,
+    /// The RAW fleet-policy `account_selection_mode` (`null` = the fleet has
+    /// no opinion), so a client can re-apply
+    /// [`crate::claude_accounts::resolve_selection`] to UNSAVED form state.
+    pub fleet_account_selection_mode: Option<AccountSelectionMode>,
+}
+
+impl AiSettingsView {
+    /// PURE constructor from a settings document and an already-resolved
+    /// `(mode, source, fleet)` triple.
+    pub fn from_parts(
+        settings: AiSettings,
+        (mode, source, fleet): (
+            AccountSelectionMode,
+            crate::claude_accounts::AccountSelectionSource,
+            Option<AccountSelectionMode>,
+        ),
+    ) -> Self {
+        Self {
+            settings,
+            effective_account_selection_mode: mode,
+            account_selection_source: source,
+            fleet_account_selection_mode: fleet,
+        }
+    }
+
+    /// The current stored settings plus this machine's effective selection.
+    pub fn current() -> Self {
+        Self::from_parts(
+            get_ai_settings(),
+            crate::claude_accounts::effective_selection_with_fleet(),
+        )
+    }
 }
 
 fn default_interactive_sessions_enabled() -> bool {
@@ -2519,6 +2629,135 @@ mod session_guard_tests {
         assert_eq!(parsed.session_guard.warn_free_commit_bytes, 6 * GIB);
         assert_eq!(parsed.session_guard.critical_free_commit_bytes, 3 * GIB / 2);
         assert!(parsed.session_guard.enabled);
+        assert_eq!(parsed.session_guard.warn_thread_count, None);
+        assert_eq!(parsed.session_guard.critical_thread_count, None);
+    }
+
+    /// Plan `2026-10-01-runner-thread-ceilings-ignore-the-machine-and-the-guard-
+    /// dialog-says-low-memory`, Phase 2: the load migration. Every panel save
+    /// wrote all four limits, so the fleet's files carry a literal 256 / 400
+    /// nobody chose — those read as UNSET (they behaved identically under the
+    /// old `min` fold). A value ABOVE the old default was inert until now and is
+    /// honoured as the operator's stated intent; one BELOW it was enforced and
+    /// is kept. A missing key and an explicit `null` are both unset.
+    #[test]
+    fn stored_thread_ceilings_migrate_the_old_default_to_unset() {
+        let load = |warn: &str, critical: &str| -> SessionGuardSettings {
+            serde_json::from_str::<Settings>(&format!(
+                r#"{{"session_guard": {{"warn_thread_count": {warn},
+                     "critical_thread_count": {critical}}}}}"#
+            ))
+            .expect("must deserialize")
+            .session_guard
+        };
+        let g = load("256", "400");
+        assert_eq!((g.warn_thread_count, g.critical_thread_count), (None, None));
+        let g = load("1000", "1200");
+        assert_eq!(
+            (g.warn_thread_count, g.critical_thread_count),
+            (Some(1000), Some(1200))
+        );
+        let g = load("220", "300");
+        assert_eq!(
+            (g.warn_thread_count, g.critical_thread_count),
+            (Some(220), Some(300))
+        );
+        // Each field migrates against ITS OWN old default: 400 is a real
+        // choice in the warn column, 256 a real choice in the critical one.
+        let g = load("400", "256");
+        assert_eq!(
+            (g.warn_thread_count, g.critical_thread_count),
+            (Some(400), Some(256))
+        );
+        let g = load("null", "null");
+        assert_eq!((g.warn_thread_count, g.critical_thread_count), (None, None));
+
+        // And unset round-trips as unset — never re-materialised as a number,
+        // and written as an ABSENT key, not `null`: an older runner build reads
+        // these as a plain `usize` and fails the whole document on a `null`.
+        let json = serde_json::to_string(&Settings::default()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let guard = value["session_guard"]
+            .as_object()
+            .expect("session_guard object");
+        assert!(!guard.contains_key("warn_thread_count"), "{json}");
+        assert!(!guard.contains_key("critical_thread_count"), "{json}");
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.session_guard.warn_thread_count, None);
+        assert_eq!(back.session_guard.critical_thread_count, None);
+        assert_eq!(
+            migrate_thread_ceiling(Some(256), SHIPPED_WARN_THREAD_CEILING),
+            None
+        );
+        assert_eq!(
+            migrate_thread_ceiling(Some(257), SHIPPED_WARN_THREAD_CEILING),
+            Some(257)
+        );
+    }
+}
+
+#[cfg(test)]
+mod pty_holder_setting_tests {
+    use super::*;
+
+    /// Plan 2026-09-12 Phase 5 (as amended 2026-10-15): `terminal.pty_holder`
+    /// defaults ON on Linux and OFF on Windows and macOS, for a fresh install,
+    /// an empty settings.json, and a `terminal` object that names no field.
+    #[test]
+    fn pty_holder_setting_defaults_on_linux_only() {
+        let expected = cfg!(target_os = "linux");
+        assert_eq!(PTY_HOLDER_DEFAULT, expected);
+        for s in [
+            Settings::default(),
+            serde_json::from_str::<Settings>("{}").expect("empty object"),
+            serde_json::from_str::<Settings>(r#"{"terminal": {}}"#).expect("empty terminal"),
+        ] {
+            assert_eq!(s.terminal.pty_holder, expected);
+            assert_eq!(s.terminal, TerminalSettings::default());
+        }
+    }
+
+    /// An explicit opt-IN round-trips too — what a Windows or macOS operator
+    /// writes to try the holder.
+    #[test]
+    fn pty_holder_setting_round_trips_when_on() {
+        let parsed: Settings =
+            serde_json::from_str(r#"{"terminal": {"pty_holder": true}}"#).expect("parse");
+        assert!(parsed.terminal.pty_holder);
+        let back: Settings =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(back.terminal, parsed.terminal);
+    }
+
+    /// Review F4: an unreadable settings file never turns the holder on —
+    /// its default placeholder must not override an explicit opt-out — while
+    /// a loaded or fresh-install read is honoured as written.
+    #[test]
+    fn pty_holder_setting_unreadable_file_means_local_pty() {
+        let load = |provenance, pty_holder| LoadedSettings {
+            settings: Settings {
+                terminal: TerminalSettings { pty_holder },
+                ..Settings::default()
+            },
+            provenance,
+            error: None,
+        };
+        assert!(!terminal_settings_from(load(SettingsProvenance::Unreadable, true)).pty_holder);
+        assert!(terminal_settings_from(load(SettingsProvenance::Loaded, true)).pty_holder);
+        assert!(!terminal_settings_from(load(SettingsProvenance::Loaded, false)).pty_holder);
+        assert!(terminal_settings_from(load(SettingsProvenance::FreshInstall, true)).pty_holder);
+    }
+
+    /// The hand-edit the doc names turns it OFF and round-trips — the
+    /// operator's opt-out survives a load/save.
+    #[test]
+    fn pty_holder_setting_round_trips_when_off() {
+        let parsed: Settings =
+            serde_json::from_str(r#"{"terminal": {"pty_holder": false}}"#).expect("parse");
+        assert!(!parsed.terminal.pty_holder);
+        let back: Settings =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(back.terminal, parsed.terminal);
     }
 }
 
@@ -2929,69 +3168,70 @@ pub struct SessionGuardSettings {
     /// warning. Default 1.5 GiB.
     #[serde(default = "default_session_guard_critical_free_commit_bytes")]
     pub critical_free_commit_bytes: u64,
-    /// OS threads in the runner process **above** which spawning a new session
-    /// is still allowed but the user is warned. Default 256.
+    /// The operator's own warn ceiling on the runner process's OS thread count,
+    /// or `None` — **not operator-set**, i.e. "use this machine's default".
     ///
     /// ## A CEILING, not a floor — the direction is inverted here
     ///
     /// The two `*_free_commit_bytes` fields above are floors: LOWER is worse.
     /// These two are ceilings: HIGHER is worse. Everything downstream mirrors
-    /// accordingly — the effective limit is a `min` over the three terms rather
-    /// than a `max` ([`crate::resource_guard::tighten_ceiling`]), the ladder
-    /// invariant is `critical >= warn` rather than `critical <= warn`
-    /// ([`crate::resource_guard::coerce_ceiling_ladder`]), and the clamp that
-    /// keeps a machine spawnable pushes the limit UP
+    /// accordingly — the ladder invariant is `critical >= warn` rather than
+    /// `critical <= warn` ([`crate::resource_guard::coerce_ceiling_ladder`]), and
+    /// the clamp that keeps a machine spawnable pushes the limit UP
     /// ([`crate::resource_guard::THREAD_CEILING_MIN`]) rather than down.
     ///
-    /// ## Why 256 — and why NOT the health monitor's 150
+    /// ## Why an `Option`, and what `Some` means
     ///
-    /// Both ceilings on this lane are fractions of the one resource they
-    /// protect: tokio's blocking pool, whose default `max_blocking_threads` is
-    /// **512**. 256 is half of it — half the pool consumed is the point where
-    /// back-pressure starts being worth its cost, and it is the number
-    /// `thread_pressure`'s WARN band hands to a gate continuation deciding
-    /// whether to wait.
+    /// Plan `2026-10-01-runner-thread-ceilings-ignore-the-machine-and-the-guard-
+    /// dialog-says-low-memory`, Phase 2. The machine default is no longer a
+    /// constant: [`crate::resource_guard::merge_thread_ceilings`] derives it from
+    /// the box (cores, `MemTotal`, the measured at-rest floor), floored at
+    /// [`SHIPPED_WARN_THREAD_CEILING`]. An operator-set value REPLACES that
+    /// default — it may loosen as well as tighten, within
+    /// [`crate::resource_guard::THREAD_CEILING_MIN`] (plus the machine shift) and
+    /// [`crate::resource_guard::THREAD_CEILING_ABS_MAX`] — while the fleet term
+    /// still only tightens. That needs "operator-set" to be distinguishable from
+    /// "default", which a plain `usize` with a serde default cannot express: the
+    /// Settings panel's save writes every field, so most `settings.json` files on
+    /// the fleet carry a literal 256 that nobody chose.
     ///
-    /// The obvious alternative was to reuse
-    /// [`crate::health_monitor::THREAD_WARNING_THRESHOLD`] (150) so this lane
-    /// carried no second opinion about the same quantity. **Measurement killed
-    /// it.** Sampled every 3 s on 2026-08-30, a live idle runner (debug build,
-    /// embedded Postgres, full bridge set) sat at **150-151** threads — on and
-    /// over that constant. A warn ceiling there fires on every spawn of an idle
-    /// machine, which is not a warning, it is a permanent toast; and via Phase 1
-    /// of the load-aware-admission plan it would defer every gate continuation
-    /// on a box doing nothing. The relationship to that constant is kept, but as
-    /// an ORDERING rather than an equality: `resource_guard`'s tests pin both
-    /// ceilings strictly above it, so the spawn gate can never fire before the
-    /// health monitor's own "this is unusual" line.
-    #[serde(default = "default_session_guard_warn_thread_count")]
-    pub warn_thread_count: usize,
-    /// OS threads in the runner process above which a new spawn is refused by
-    /// default (always overridable at the point of refusal). Default 400.
+    /// ## The load migration
     ///
-    /// ## Why 400
+    /// [`deserialize_warn_thread_ceiling`] reads a stored value EQUAL to the old
+    /// default (256) as `None`. Under the old `min` fold such a value behaved
+    /// exactly like "unset", so nothing observable is lost. A stored value above
+    /// it (inert until now, silently dropped by the `min`) is honoured as the
+    /// operator's stated intent, and one below it (enforced until now) is kept.
+    /// The one residue, stated rather than discovered: an explicit 256 is no
+    /// longer expressible — it reads back as the machine default. An operator who
+    /// wants exactly today's number on a box whose default has risen writes 255
+    /// or 257.
     ///
-    /// tokio's blocking pool is the resource this protects, and its default
-    /// `max_blocking_threads` is **512** — confirmed unreconfigured in every
-    /// runtime this binary actually runs on: the only two
-    /// `.max_blocking_threads(…)` calls in `src-tauri` are inside
-    /// `health_monitor`'s own `#[test]` fixtures (which build 1- and 2-slot
-    /// runtimes on purpose, to saturate them), and every production runtime
-    /// built by hand (`logging.rs`, `off_runtime.rs`, `main.rs`) sets only
-    /// `worker_threads`. When the
-    /// primary runner wedged on 2026-08-29 the process carried **540** threads,
-    /// 119 of them inside `CreateProcess`: the pool was full and every further
-    /// blocking call was queued behind a spawn that could not finish.
+    /// ## `None` is written as an ABSENT key, never `null`
     ///
-    /// 400 leaves ~112 slots of the 512 for the runtime's own core workers, the
-    /// reactor, the dedicated health/watchdog threads, and — the reason it is
-    /// not 500 — the race this gate cannot close: the reading is taken before
-    /// the PTY opens, and a burst of concurrent admissions can each pass the
-    /// ceiling and only then create their threads. A margin narrower than the
-    /// burst that caused the incident (~130 concurrent spawns) would let the
-    /// gate say yes 130 times at 500 and land at 630.
-    #[serde(default = "default_session_guard_critical_thread_count")]
-    pub critical_thread_count: usize,
+    /// Older runner builds read this field as a plain `usize` with a serde
+    /// default. They accept a missing key, but a `null` fails the parse of the
+    /// WHOLE `Settings` document — which they then treat as unreadable, losing
+    /// every setting. `settings.json` is shared with secondary, temp and
+    /// rolled-back runners, so the new build must never write a shape an older
+    /// one cannot load: `skip_serializing_if` keeps "unset" as no key at all.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_warn_thread_ceiling",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub warn_thread_count: Option<usize>,
+    /// The operator's own critical (refusal) ceiling, or `None` for this
+    /// machine's default. Always overridable at the point of refusal. Same
+    /// `Option` semantics and the same load migration as
+    /// [`Self::warn_thread_count`], against the old 400 default
+    /// ([`SHIPPED_CRITICAL_THREAD_CEILING`]).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_critical_thread_ceiling",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub critical_thread_count: Option<usize>,
     /// Master switch for the whole guard — **both lanes**, the free-commit
     /// floors and the thread ceilings alike. Default **TRUE**, unlike
     /// [`CiNodeSettings::enabled`]: `ci_node` opts a machine INTO accepting
@@ -3018,17 +3258,100 @@ fn default_session_guard_critical_free_commit_bytes() -> u64 {
     3 * 1024 * 1024 * 1024 / 2
 }
 
-/// 256 threads — half tokio's 512-slot blocking pool. See
-/// [`SessionGuardSettings::warn_thread_count`] for why it is not the health
-/// monitor's 150, which a live runner was measured sitting on.
-fn default_session_guard_warn_thread_count() -> usize {
-    256
+/// The shipped warn ceiling on the runner's OS thread count: **256, on the
+/// calibration box** (a runner idling at 151 threads,
+/// [`crate::resource_guard::CALIBRATION_BASELINE`]).
+///
+/// It is no longer what every machine enforces. It is the FLOOR of the machine
+/// default — `max(256 + machine_thread_shift, scaled)` in
+/// [`crate::resource_guard::merge_thread_ceilings`] — so no box is ever stricter
+/// than it was before the ceilings scaled, and it is the number the
+/// [`SessionGuardSettings::warn_thread_count`] load migration reads as "unset".
+///
+/// ## Why 256 — and why NOT the health monitor's 150
+///
+/// Both shipped ceilings are fractions of the one resource they protect:
+/// tokio's blocking pool, whose default `max_blocking_threads` is **512**.
+/// 256 is half of it — half the pool consumed is the point where back-pressure
+/// starts being worth its cost, and it is the number the thread lane's WARN
+/// band hands to a gate continuation deciding whether to wait. The headroom it
+/// leaves above the calibration box's idle floor (256 − 151 = 105) is what
+/// `resource_guard` keeps CONSTANT on every machine as the blocking-pool arm of
+/// the scaled ceiling, because the pool is per-runtime and does not grow with
+/// cores or RAM.
+///
+/// The obvious alternative was to reuse
+/// [`crate::health_monitor::THREAD_WARNING_THRESHOLD`] (150) so this lane
+/// carried no second opinion about the same quantity. **Measurement killed
+/// it.** Sampled every 3 s on 2026-08-30, a live idle runner (debug build,
+/// embedded Postgres, full bridge set) sat at **150-151** threads — on and
+/// over that constant. A warn ceiling there fires on every spawn of an idle
+/// machine, which is not a warning, it is a permanent toast; and via Phase 1
+/// of the load-aware-admission plan it would defer every gate continuation
+/// on a box doing nothing. The relationship to that constant is kept, but as
+/// an ORDERING rather than an equality: `resource_guard`'s tests pin both
+/// ceilings strictly above it, so the spawn gate can never fire before the
+/// health monitor's own "this is unusual" line.
+pub(crate) const SHIPPED_WARN_THREAD_CEILING: usize = 256;
+
+/// The shipped critical ceiling: **400, on the calibration box** — the floor
+/// of the machine's critical default, exactly as
+/// [`SHIPPED_WARN_THREAD_CEILING`] is of its warn default.
+///
+/// ## Why 400
+///
+/// tokio's blocking pool is the resource this protects, and its default
+/// `max_blocking_threads` is **512** — confirmed unreconfigured in every
+/// runtime this binary actually runs on: the only two
+/// `.max_blocking_threads(…)` calls in `src-tauri` are inside
+/// `health_monitor`'s own `#[test]` fixtures (which build 1- and 2-slot
+/// runtimes on purpose, to saturate them), and every production runtime
+/// built by hand (`logging.rs`, `off_runtime.rs`, `main.rs`) sets only
+/// `worker_threads`. When the primary runner wedged on 2026-08-29 the process
+/// carried **540** threads, 119 of them inside `CreateProcess`: the pool was
+/// full and every further blocking call was queued behind a spawn that could
+/// not finish.
+///
+/// 400 leaves ~112 slots of the 512 for the runtime's own core workers, the
+/// reactor, the dedicated health/watchdog threads, and — the reason it is
+/// not 500 — the race this gate cannot close: the reading is taken before
+/// the PTY opens, and a burst of concurrent admissions can each pass the
+/// ceiling and only then create their threads. A margin narrower than the
+/// burst that caused the incident (~130 concurrent spawns) would let the
+/// gate say yes 130 times at 500 and land at 630. The headroom above the
+/// calibration floor (400 − 151 = 249) is the critical blocking-pool arm
+/// `resource_guard` keeps constant on every machine.
+pub(crate) const SHIPPED_CRITICAL_THREAD_CEILING: usize = 400;
+
+/// [`SessionGuardSettings::warn_thread_count`]'s load migration: a stored
+/// value equal to the old default ([`SHIPPED_WARN_THREAD_CEILING`]) was never
+/// distinguishable from "unset" and reads as `None`; anything else is kept.
+fn deserialize_warn_thread_ceiling<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let stored = Option::<usize>::deserialize(deserializer)?;
+    Ok(migrate_thread_ceiling(stored, SHIPPED_WARN_THREAD_CEILING))
 }
 
-/// 400 threads — see [`SessionGuardSettings::critical_thread_count`] for the
-/// 512-slot blocking pool and the 540-thread wedge this is sized against.
-fn default_session_guard_critical_thread_count() -> usize {
-    400
+/// [`SessionGuardSettings::critical_thread_count`]'s load migration, against
+/// [`SHIPPED_CRITICAL_THREAD_CEILING`].
+fn deserialize_critical_thread_ceiling<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let stored = Option::<usize>::deserialize(deserializer)?;
+    Ok(migrate_thread_ceiling(
+        stored,
+        SHIPPED_CRITICAL_THREAD_CEILING,
+    ))
+}
+
+/// PURE: the one rule both migrations apply. See
+/// [`SessionGuardSettings::warn_thread_count`] for why the old default is the
+/// value that means "unset".
+fn migrate_thread_ceiling(stored: Option<usize>, old_default: usize) -> Option<usize> {
+    stored.filter(|&n| n != old_default)
 }
 
 fn default_session_guard_enabled() -> bool {
@@ -3040,8 +3363,8 @@ impl Default for SessionGuardSettings {
         Self {
             warn_free_commit_bytes: default_session_guard_warn_free_commit_bytes(),
             critical_free_commit_bytes: default_session_guard_critical_free_commit_bytes(),
-            warn_thread_count: default_session_guard_warn_thread_count(),
-            critical_thread_count: default_session_guard_critical_thread_count(),
+            warn_thread_count: None,
+            critical_thread_count: None,
             enabled: default_session_guard_enabled(),
         }
     }
@@ -3148,6 +3471,15 @@ impl AcceptRemoteAttach {
 pub struct RemoteAttachSettings {
     #[serde(default)]
     pub accept_remote_attach: AcceptRemoteAttach,
+    /// When this runner's Fleet view last opened a device's session list,
+    /// keyed by the device id, RFC 3339 UTC. The runner's own interactivity
+    /// probe scheduler sweeps a device every `PROBE_EVERY` while its entry is
+    /// under seven days old (plan
+    /// `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+    /// A3) — an operator who has not looked at a device in a week is not
+    /// served by probing it. Pruned on every write.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub fleet_view_opened_at: std::collections::BTreeMap<String, String>,
 }
 
 /// Who may ask this device to CREATE a terminal remotely (plan
@@ -3520,6 +3852,114 @@ pub struct Settings {
     /// runner restart.
     #[serde(default)]
     pub api: ApiSettings,
+    /// Terminal pane backend knobs. See [`TerminalSettings`]; the one field,
+    /// `terminal.pty_holder`, defaults to [`PTY_HOLDER_DEFAULT`] (ON on Linux only,
+    /// since plan 2026-09-12 Phase 5).
+    #[serde(default)]
+    pub terminal: TerminalSettings,
+    /// Model gateway declaration (plan
+    /// `2026-10-09-spec-front-end-of-the-software-factory` Phase 9, D12). An
+    /// empty `base_url` (the default) means no gateway: every behavior is
+    /// unchanged. See [`crate::model_gateway`].
+    #[serde(default)]
+    pub model_gateway: crate::model_gateway::ModelGatewaySettings,
+    /// Permission posture for runner-spawned `claude` sessions (plan
+    /// `2026-10-09-spec-front-end-of-the-software-factory` Phase 9, D7). The
+    /// default keeps each spawn site's bypass flag. `allow_list` replaces it
+    /// with a pre-approved tool list, for machines whose IT-managed Claude Code
+    /// settings disable bypass mode. Read per spawn: into
+    /// [`crate::claude_session::launch_spec::LaunchConfig::from_settings`] (every
+    /// `LaunchSpec` spawn site, the typed resume renderer
+    /// `commands::config::build_ai_resume_command`, and the provider-adapter
+    /// launch spec), by the scheduler's RemoteAgent launch (intersected with the
+    /// task's tools), and by the orchestration fix agent. Settings layers the
+    /// runner does not own (a repository's `.claude/settings.json`, managed
+    /// settings) can still pre-approve more tools.
+    #[serde(default)]
+    pub claude_session_permission: crate::claude_session::launch_spec::SessionPermissionSetting,
+}
+
+/// `terminal.*` — how a LOCAL terminal pane is backed.
+///
+/// Plan `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+/// Phase 2 (vetted 2026-09-27, "Missing — no default-on switch"), flipped ON
+/// for Linux by Phase 5. Struct-level `#[serde(default)]` over the
+/// hand-written [`Default`] below, so a `settings.json` written before this
+/// key — or an empty `terminal` object — loads with the platform default
+/// ([`PTY_HOLDER_DEFAULT`]), and a hand-edit naming one field keeps the
+/// default for the rest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TerminalSettings {
+    /// Run each new local pane's PTY in its own out-of-process holder
+    /// (`qontinui-pty-holder`, driven by `terminal::daemon_pane_io`) instead
+    /// of in this process (`LocalPty`). Default [`PTY_HOLDER_DEFAULT`]: **true
+    /// on Linux** since Phase 5 of that plan, which flipped it in the same
+    /// change that makes
+    /// `/restart-readiness` count holder panes (`terminal::holder_census`,
+    /// the fifth class of `session::tracking_health`'s partition) — the
+    /// ordering the plan's Risk 2 requires: a holder pane's processes can
+    /// leave the runner's process subtree, and before that census a restart
+    /// would have read "safe" by making those sessions invisible. **false on
+    /// Windows and macOS** (coordinator decision recorded on the plan as a
+    /// Phase 5 amendment, 2026-10-15): the Windows holder paths — job
+    /// breakaway, the WMI fallback, the named-pipe census, Toolhelp reaping —
+    /// have only ever been type-checked, and macOS has never been built. The
+    /// setting is honoured everywhere: `{"terminal": {"pty_holder": true}}`
+    /// opts a Windows or macOS box in.
+    ///
+    /// A holder that cannot be started falls back, visibly, to an in-process
+    /// PTY (`daemon_pane_io::spawn_holder_pane_or_fallback`), so ON never
+    /// costs a working terminal. `{"terminal": {"pty_holder": false}}` turns
+    /// it off for new panes, on any platform.
+    ///
+    /// Read once per spawn, from the non-mutating cached settings read
+    /// ([`get_terminal_settings`]), so a change applies to the next terminal;
+    /// an open pane keeps the backend it was born with. No settings UI: a
+    /// hand-edit of `settings.json` (`{"terminal": {"pty_holder": false}}`).
+    pub pty_holder: bool,
+}
+
+/// `terminal.pty_holder`'s default on this platform: ON on Linux only (see
+/// [`TerminalSettings::pty_holder`]).
+pub const PTY_HOLDER_DEFAULT: bool = cfg!(target_os = "linux");
+
+impl Default for TerminalSettings {
+    fn default() -> Self {
+        Self {
+            pty_holder: PTY_HOLDER_DEFAULT,
+        }
+    }
+}
+
+/// The `terminal.*` settings for a spawn happening now.
+///
+/// Reads through [`read_settings_from_disk`] — the NON-MUTATING, cached read —
+/// rather than [`load_settings`], whose loader can write the operator's
+/// settings file, mint ids and touch the keyring: nothing a terminal spawn
+/// should do.
+///
+/// **An UNREADABLE settings file turns the holder OFF for the spawn**, whatever
+/// the platform default: its `Settings` is a default placeholder, and reading
+/// the default ON from it would override an operator's explicit
+/// `"pty_holder": false` the moment the file stops parsing. `LocalPty` is
+/// today's terminal, so OFF costs nothing but survival — the opt-out is never
+/// silently overridden. Logged at `warn`.
+pub fn get_terminal_settings() -> TerminalSettings {
+    terminal_settings_from(read_settings_from_disk())
+}
+
+/// [`get_terminal_settings`]'s decision over one load — the testable seam.
+fn terminal_settings_from(loaded: LoadedSettings) -> TerminalSettings {
+    if loaded.provenance == SettingsProvenance::Unreadable {
+        warn!(
+            error = ?loaded.error,
+            "terminal.pty_holder: settings.json is unreadable — new panes use an in-process PTY \
+             so an operator's opt-out is never overridden by a default"
+        );
+        return TerminalSettings { pty_holder: false };
+    }
+    loaded.settings.terminal
 }
 
 /// Settings → Runner → "Allowed browser origins".
@@ -3531,12 +3971,12 @@ pub struct ApiSettings {
     /// NON-door routes (`TRUSTED_ROUTES`, which include running workflows and
     /// checks) and never the credential doors (secrets, caller-named paths,
     /// caller-directed requests, process execution). Origins listed HERE never
-    /// get a door. Only the four built-in default dev origins
-    /// (`http://localhost:3001`, `http://127.0.0.1:3001`,
-    /// `http://localhost:9875`, `http://127.0.0.1:9875`) currently retain the
-    /// graced doors — including local
-    /// command execution and file reads — until qontinui-web #1380 deploys
-    /// and `TRUSTED_DOOR_GRACE` is removed. List only origins served by
+    /// get a door. Only the two built-in qontinui-web dev origins
+    /// (`GRACE_ORIGINS`: `http://localhost:3001`, `http://127.0.0.1:3001`)
+    /// currently retain the graced doors — including local command execution
+    /// and file reads — while `TRUSTED_DOOR_GRACE` exists; plan
+    /// `2026-09-17-retire-the-runner-origin-guard-dev-grace` is its
+    /// retirement path. List only origins served by
     /// software trusted like the runner. Agents and scripts send no
     /// `Origin` and need no entry.
     #[serde(default)]
@@ -4017,7 +4457,9 @@ impl ConfigDirSource {
 pub(crate) fn resolve_config_dir() -> Result<(PathBuf, ConfigDirSource), String> {
     resolve_config_dir_from(
         std::env::var("QONTINUI_CONFIG_DIR").ok(),
-        dirs::config_dir(),
+        qontinui_runner_lib::instance_env::platform_dir(
+            qontinui_runner_lib::instance_env::PlatformDir::Config,
+        ),
     )
 }
 
@@ -4030,16 +4472,14 @@ pub(crate) fn resolve_config_dir_from(
     env_config_dir: Option<String>,
     platform_config_dir: Option<PathBuf>,
 ) -> Result<(PathBuf, ConfigDirSource), String> {
-    env_config_dir
-        .filter(|s| !s.is_empty())
-        .map(|s| (PathBuf::from(s), ConfigDirSource::EnvConfigDir))
-        .or_else(|| {
-            platform_config_dir.map(|d| {
-                (
-                    d.join("com.qontinui.runner"),
-                    ConfigDirSource::PlatformConfigDir,
-                )
-            })
+    qontinui_runner_lib::instance_env::runner_config_dir_from(env_config_dir, platform_config_dir)
+        .map(|(dir, from_env)| {
+            let source = if from_env {
+                ConfigDirSource::EnvConfigDir
+            } else {
+                ConfigDirSource::PlatformConfigDir
+            };
+            (dir, source)
         })
         .ok_or_else(|| "Failed to get config directory".to_string())
 }
@@ -4699,7 +5139,7 @@ pub fn load_settings_full() -> LoadedSettings {
             provenance.as_str()
         );
     }
-    let is_secondary = crate::instance::is_secondary();
+    let is_secondary = crate::instance::shares_primary_settings();
     if needs_persist && is_secondary {
         // ONCE per process, at info!. This branch re-runs on every settings
         // load (the relay loop re-reads every iteration), so it used to emit
@@ -4739,8 +5179,9 @@ pub fn load_settings_full() -> LoadedSettings {
     // Tier env-var overlay. In-memory only; never persisted. Lets a parent
     // process (notably the supervisor spawning a temp runner) force the
     // booted runner onto a specific tier without writing to the shared
-    // settings.json — which is keyed off `dirs::config_dir()` and is the
-    // same file for primary + temp + named runners. Persisting tier=Local
+    // settings.json — which is keyed off the platform config dir and is the
+    // same file for primary + temp + named runners that carry no
+    // `QONTINUI_CONFIG_DIR`. Persisting tier=Local
     // for a temp runner would silently strip the primary runner's Tier 2
     // state, so the only safe override is this in-memory overlay.
     if let Ok(raw) = std::env::var("QONTINUI_RUNNER_TIER") {
@@ -5535,22 +5976,66 @@ pub fn save_ci_node_settings(ci_node: CiNodeSettings) -> Result<(), String> {
     update_settings(|settings| settings.ci_node = ci_node)
 }
 
-/// Save AI settings.
+/// Persist AI settings WITHOUT the write lock — private on purpose: every
+/// writer goes through [`update_ai_settings`], which holds
+/// `AI_SETTINGS_WRITE_LOCK` across the read and this write. A second public
+/// door here is how a lock-free read-modify-write loses a concurrent change.
 ///
 /// The whole-`AiSettings` per-instance save stays as-is (its embedded
-/// `claude_cli.config_dir` / `account_selection_mode` copies become stale
-/// shadows — harmless, because the machine-global overlay in `load_settings`
-/// wins unconditionally). ADDITIONALLY mirrors those two roster fields into
-/// the machine-global `claude-accounts.json` so mode/pin changes made on any
-/// instance reach every instance.
-pub fn save_ai_settings(ai_settings: AiSettings) -> Result<(), String> {
+/// `claude_cli.config_dir` / `account_selection_mode` / `account_selection_pinned`
+/// copies become stale shadows — harmless, because the machine-global overlay
+/// in `load_settings` wins unconditionally). ADDITIONALLY mirrors those three
+/// roster fields into the machine-global `claude-accounts.json` so mode/pin
+/// changes made on any instance reach every instance.
+fn save_ai_settings_unlocked(ai_settings: AiSettings) -> Result<(), String> {
     let config_dir = ai_settings.claude_cli.config_dir.clone();
     let selection_mode = ai_settings.claude_cli.account_selection_mode;
+    let selection_pinned = ai_settings.claude_cli.account_selection_pinned;
     crate::config_facade::save_setting(ai_settings)?;
     crate::claude_accounts::update(move |roster| {
         roster.config_dir = config_dir;
         roster.account_selection_mode = selection_mode;
+        roster.account_selection_pinned = selection_pinned;
     })
+}
+
+/// Serializes every read-modify-write of the AI settings in this process
+/// (`PUT /settings/ai`, the path-prediction toggle, the Tauri save), so two
+/// concurrent partial writes cannot each read the same base and have the later
+/// save drop the earlier one's change.
+///
+/// A process mutex rather than [`update_settings`]: that primitive hands its
+/// closure the RAW on-disk document, whose roster fields are stale shadows of
+/// `claude-accounts.json` — merging over it would write a stale
+/// `config_dir` / mode / pin back machine-wide. The base here is
+/// [`get_ai_settings`] (roster overlaid), and the write is
+/// [`save_ai_settings_unlocked`] (per-instance save + roster mirror).
+/// That writer is private to this module, so this function is the ONLY door
+/// through which `settings.ai` is written.
+static AI_SETTINGS_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Why [`update_ai_settings`] did not save.
+#[derive(Debug)]
+pub enum AiSettingsUpdateError<E> {
+    /// The caller's transform refused the stored document (e.g. a bad body).
+    Rejected(E),
+    /// The transform succeeded but persisting failed.
+    SaveFailed(String),
+}
+
+/// Read the current AI settings, transform them with `f`, and save the result
+/// — atomically with respect to every other caller of this function.
+pub fn update_ai_settings<E>(
+    f: impl FnOnce(AiSettings) -> Result<AiSettings, E>,
+) -> Result<AiSettings, AiSettingsUpdateError<E>> {
+    // Poison-tolerant: a panic in another writer leaves no partial state
+    // behind this lock (the save itself is atomic on disk).
+    let _guard = AI_SETTINGS_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let next = f(get_ai_settings()).map_err(AiSettingsUpdateError::Rejected)?;
+    save_ai_settings_unlocked(next.clone()).map_err(AiSettingsUpdateError::SaveFailed)?;
+    Ok(next)
 }
 
 /// Get the World State Verifier settings.
@@ -5700,12 +6185,13 @@ static PERF_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Acquire the performance-cache test lock. Poison is ignored: a panicking
 /// test must not wedge every other test that touches the cache.
+///
+/// A CHILD of `env_lock` in the test-lock hierarchy (`hierarchy_lock` takes the
+/// env lock first): it is shared across three modules, so a future holder that
+/// also touches env cannot invert the order against an env-first one.
 #[cfg(test)]
-pub fn perf_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    match PERF_TEST_LOCK.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+pub fn perf_test_lock() -> crate::test_env::TestLockGuard {
+    crate::test_env::hierarchy_lock(&PERF_TEST_LOCK)
 }
 
 fn store_performance_cache(entry: CachedPerformance) {
@@ -5720,11 +6206,6 @@ fn store_performance_cache(entry: CachedPerformance) {
 /// Get the interactive sessions enabled setting
 pub fn get_interactive_sessions_enabled() -> bool {
     crate::config_facade::get_interactive_sessions_enabled()
-}
-
-/// Save the interactive sessions enabled setting
-pub fn save_interactive_sessions_enabled(enabled: bool) -> Result<(), String> {
-    crate::config_facade::save_interactive_sessions_enabled(enabled)
 }
 
 /// Get the auto-continue AI workflow setting
@@ -6113,6 +6594,21 @@ pub fn save_remote_attach_preference(pref: AcceptRemoteAttach) -> Result<(), Str
     Ok(())
 }
 
+/// When the Fleet view last opened each device (see
+/// [`RemoteAttachSettings::fleet_view_opened_at`]).
+pub fn get_fleet_view_opened_at() -> std::collections::BTreeMap<String, String> {
+    load_settings().remote_attach.fleet_view_opened_at
+}
+
+/// Rewrite the Fleet-view opened-at map through `mutate` (the caller records
+/// and prunes; this persists).
+pub fn update_fleet_view_opened_at<F>(mutate: F) -> Result<(), String>
+where
+    F: FnOnce(&mut std::collections::BTreeMap<String, String>),
+{
+    update_settings(|settings| mutate(&mut settings.remote_attach.fleet_view_opened_at))
+}
+
 /// The remote-CREATE preference. Default [`AcceptRemoteCreate::Off`].
 ///
 /// Deliberately uncached, unlike [`get_remote_attach_preference`]: that one is
@@ -6133,6 +6629,46 @@ pub fn get_remote_create_settings() -> RemoteCreateSettings {
 /// Persist the remote-create preference.
 pub fn save_remote_create_preference(pref: AcceptRemoteCreate) -> Result<(), String> {
     update_settings(|settings| settings.remote_create.accept_remote_create = pref)
+}
+
+/// Get the model gateway declaration. See [`crate::model_gateway`].
+pub fn get_model_gateway() -> crate::model_gateway::ModelGatewaySettings {
+    crate::model_gateway::current_settings()
+}
+
+/// Validate, normalize and persist the model gateway declaration. An invalid
+/// declaration is refused and nothing is written. Returns what was stored.
+pub fn save_model_gateway(
+    value: crate::model_gateway::ModelGatewaySettings,
+) -> Result<crate::model_gateway::ModelGatewaySettings, String> {
+    let normalized = value.normalized();
+    normalized.validate()?;
+    let stored = normalized.clone();
+    update_settings(move |settings| settings.model_gateway = normalized)?;
+    // The sticky marker (written for a gateway, deleted for an explicit clear)
+    // is what lets a later settings reset read as UNKNOWN rather than "no
+    // gateway" — see `model_gateway` "Fail closed".
+    crate::model_gateway::record_saved_declaration(&stored)?;
+    Ok(stored)
+}
+
+/// Get the session permission posture. See [`Settings::claude_session_permission`].
+///
+/// Read-only loader: consulted per spawn by `LaunchConfig::from_settings`.
+pub fn get_claude_session_permission(
+) -> crate::claude_session::launch_spec::SessionPermissionSetting {
+    read_settings_from_disk().settings.claude_session_permission
+}
+
+/// Validate, normalize and persist the session permission posture. Returns what
+/// was stored.
+pub fn save_claude_session_permission(
+    value: crate::claude_session::launch_spec::SessionPermissionSetting,
+) -> Result<crate::claude_session::launch_spec::SessionPermissionSetting, String> {
+    let normalized = value.normalized()?;
+    let stored = normalized.clone();
+    update_settings(move |settings| settings.claude_session_permission = normalized)?;
+    Ok(stored)
 }
 
 /// Get the cloud memory link-expansion arm flag. Default false — see
@@ -6702,14 +7238,30 @@ mod account_selection_mode_tests {
     /// silently seeing an unknown mode.
     #[test]
     fn selection_mode_str_matches_serde() {
-        for mode in [
-            AccountSelectionMode::Manual,
-            AccountSelectionMode::LeastUsage,
-            AccountSelectionMode::HighestExpectedUsage,
-        ] {
+        for mode in AccountSelectionMode::ALL {
             let serde_spelling = serde_json::to_value(mode).expect("serializes");
             assert_eq!(serde_spelling, serde_json::json!(mode.as_str()));
+            let back: AccountSelectionMode =
+                serde_json::from_value(serde_spelling).expect("round-trips");
+            assert_eq!(back, mode);
         }
+        // A spelling this build does not know decodes to the default rather
+        // than failing the document it sits in.
+        let unknown: AccountSelectionMode =
+            serde_json::from_value(serde_json::json!("from_a_newer_runner")).unwrap();
+        assert_eq!(unknown, AccountSelectionMode::default());
+        assert_eq!(
+            AccountSelectionMode::default(),
+            AccountSelectionMode::AlternatingHandoff
+        );
+        assert_eq!(
+            AccountSelectionMode::WeightedRandom.as_str(),
+            "weighted_random"
+        );
+        assert_eq!(
+            AccountSelectionMode::AlternatingHandoff.as_str(),
+            "alternating_handoff"
+        );
         // Pin the literals too: the coord half codes against these strings.
         assert_eq!(AccountSelectionMode::Manual.as_str(), "manual");
         assert_eq!(AccountSelectionMode::LeastUsage.as_str(), "least_usage");
@@ -6717,6 +7269,43 @@ mod account_selection_mode_tests {
             AccountSelectionMode::HighestExpectedUsage.as_str(),
             "highest_expected_usage"
         );
+    }
+
+    /// A settings file written before the pin existed carries no
+    /// `account_selection_pinned` key. It must decode to `false` — unpinned,
+    /// i.e. the fleet policy governs — never to an error and never to `true`,
+    /// which would silently exempt every pre-existing machine from the fleet.
+    #[test]
+    fn pin_defaults_to_false_on_a_settings_file_that_predates_it() {
+        let cli: super::ClaudeCliSettings = serde_json::from_value(serde_json::json!({
+            "execution_mode": "auto",
+            "custom_path": null,
+            "timeout_seconds": 600,
+            "config_dir": "/acct-a",
+            "account_selection_mode": "least_usage",
+        }))
+        .expect("an old claude_cli block decodes");
+        assert!(!cli.account_selection_pinned);
+        assert_eq!(cli.account_selection_mode, AccountSelectionMode::LeastUsage);
+        assert!(!super::ClaudeCliSettings::default().account_selection_pinned);
+    }
+
+    /// The pin survives a serialize → deserialize round trip in both states.
+    #[test]
+    fn pin_round_trips() {
+        for pinned in [true, false] {
+            let cli = super::ClaudeCliSettings {
+                account_selection_mode: AccountSelectionMode::Manual,
+                account_selection_pinned: pinned,
+                ..Default::default()
+            };
+            let json = serde_json::to_value(&cli).expect("serializes");
+            assert_eq!(json["account_selection_pinned"], serde_json::json!(pinned));
+            let back: super::ClaudeCliSettings =
+                serde_json::from_value(json).expect("deserializes");
+            assert_eq!(back.account_selection_pinned, pinned);
+            assert_eq!(back.account_selection_mode, AccountSelectionMode::Manual);
+        }
     }
 }
 

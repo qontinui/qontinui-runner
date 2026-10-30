@@ -42,6 +42,7 @@ import {
 } from "../hooks/useUnifiedEvents";
 import { useActiveRunsOptional } from "./ActiveRunsContext";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 // =============================================================================
 // API Constants
@@ -963,7 +964,7 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
       setState((prev) => ({
         ...prev,
         isLoading: false,
-        error: e instanceof Error ? e.message : "Unknown error",
+        error: describeThrown(e, "Unknown error"),
         isReconnecting: false,
       }));
     } finally {

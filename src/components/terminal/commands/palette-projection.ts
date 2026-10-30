@@ -41,6 +41,7 @@ import { describeParams } from "./parse";
 import { getAll } from "./registry";
 import type { CommandAction } from "./types";
 import { callRegistry } from "./uibridge";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * Subset of the palette's local `PaletteAction` shape that this module
@@ -99,7 +100,7 @@ function toPaletteRow(action: CommandAction): PaletteActionLike {
       // params hint in the row label. Returning a sync `void` matches
       // the palette's existing action contract.
       callRegistry(action.id, {}).catch((err: unknown) => {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describeThrown(err, "unknown error");
         // `console.warn` is allowed by the no-console rule; no disable needed.
         console.warn(
           `[CommandPalette] ${action.slash} failed: ${msg} — use Ctrl+/ to supply arguments.`,

@@ -134,6 +134,7 @@ pub mod relay_binding; // UI Bridge relay registrant principal binding (plan 202
 pub mod relay_path_policy; // The closed allowlist of local API paths `backend_relay`'s `http_request` arm may reach (review round 2 finding 1; inverted to an allowlist in round 4)
 pub mod relay_routable;
 pub mod remote_create_reaper; // Attach-deadline reaper for remote-created terminals (plan 2026-09-23-remote-create-residuals-after-coord-registration-confirm, Phase 1)
+pub mod remote_interactivity; // Remote session interactivity: the coalescing, never-blocking reporter to coord's observation door (plan 2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold, A2)
 pub mod remote_terminal; // Remote terminal attach: target-side grant table + source-side client (plan 2026-08-31-remote-session-tabs-in-runner-terminal, Phase 3c)
 pub mod restart_readiness;
 pub mod restate_api;
@@ -141,6 +142,10 @@ pub mod reviews;
 pub mod saved_api_requests;
 pub mod scheduler;
 pub mod sdk_client;
+// The connect handshake's door tests (coord finding c89c2766), in a file of
+// their own so a whole-file revert of sdk_client.rs keeps them.
+#[cfg(test)]
+mod sdk_connect_door_tests;
 pub mod sdk_terminal_buffer;
 pub mod security_audit;
 pub mod server;
@@ -149,6 +154,7 @@ pub mod session_compliance;
 pub mod session_message_poller;
 pub mod session_recap;
 pub mod session_repository;
+pub mod session_review;
 pub mod session_work_status;
 pub mod sessions;
 pub mod settings;
@@ -427,11 +433,6 @@ mod route_registration_tests {
     #[test]
     fn the_control_flags_a_family_whose_merge_was_deleted() {
         let mut sources = crate_sources();
-        let api = sources
-            .keys()
-            .find(|p| p.ends_with("mcp_api.rs"))
-            .expect("mcp_api.rs is in the tree")
-            .clone();
         // Composed at runtime on purpose. Spelled as one literal, this needle
         // would ITSELF be a `session_briefing::routes()` occurrence in this
         // file, and would mount the very family the test is trying to unmount
@@ -440,11 +441,25 @@ mod route_registration_tests {
         let family = "session_briefing";
         let merge = format!(".merge(crate::mcp::{family}::routes())");
 
-        let text = sources.get_mut(&api).expect("just found it");
+        // The file that REGISTERS the family, found by its code rather than by
+        // its name: the registration moves as `mcp_api` is split into
+        // `mcp_api/` (plan
+        // `2026-10-04-runner-mcp-api-rs-holds-the-http-composition-root-health-and-five-proxies-in-one-file`
+        // D5), so a hardcoded `mcp_api.rs` would one day mutate a file that no
+        // longer carries it. Comment-stripped, because this module's own doc
+        // comments QUOTE the merge and must not be mistaken for it.
+        let registering: Vec<PathBuf> = sources
+            .iter()
+            .filter(|(_, text)| strip_comments(text).contains(&merge))
+            .map(|(path, _)| path.clone())
+            .collect();
         assert!(
-            text.contains(&merge),
-            "the registration this test deletes must exist to begin with"
+            registering.len() == 1,
+            "the registration this test deletes must exist to begin with, in \
+             exactly one file; found it in {registering:?}"
         );
+
+        let text = sources.get_mut(&registering[0]).expect("just found it");
         *text = text.replace(&merge, "");
 
         assert!(

@@ -1013,8 +1013,6 @@ pub fn save_ai_provider_from_setup(
 ) -> Result<(), String> {
     info!("Setup wizard: saving AI provider: {}", provider);
 
-    let mut ai_settings = settings::get_ai_settings();
-
     let ai_provider = match provider.as_str() {
         "claude_cli" => AiProvider::ClaudeCli,
         "claude_api" => AiProvider::ClaudeApi,
@@ -1024,8 +1022,6 @@ pub fn save_ai_provider_from_setup(
         _ => return Err(format!("Unknown AI provider: {}", provider)),
     };
 
-    ai_settings.provider = ai_provider.clone();
-
     let exec_mode = execution_mode.as_deref().map(|m| match m {
         "windows_native" => CliExecutionMode::WindowsNative,
         "wsl" => CliExecutionMode::Wsl,
@@ -1033,51 +1029,60 @@ pub fn save_ai_provider_from_setup(
         _ => CliExecutionMode::Auto,
     });
 
-    match ai_provider {
-        AiProvider::ClaudeCli => {
-            if let Some(mode) = exec_mode {
-                ai_settings.claude_cli.execution_mode = mode;
+    // Read-modify-write under the AI-settings write lock, so a concurrent
+    // save (the Settings page, `PUT /settings/ai`) cannot be lost.
+    settings::update_ai_settings(|mut ai_settings| {
+        ai_settings.provider = ai_provider.clone();
+        match ai_provider {
+            AiProvider::ClaudeCli => {
+                if let Some(mode) = exec_mode {
+                    ai_settings.claude_cli.execution_mode = mode;
+                }
+            }
+            AiProvider::ClaudeApi => {
+                if let Some(m) = model {
+                    ai_settings.claude_api.model = m;
+                }
+            }
+            AiProvider::GeminiCli => {
+                if let Some(mode) = exec_mode {
+                    ai_settings.gemini_cli.execution_mode = mode;
+                }
+                if let Some(m) = model {
+                    ai_settings.gemini_cli.model = m;
+                }
+            }
+            AiProvider::GeminiApi => {
+                if let Some(m) = model {
+                    ai_settings.gemini_api.model = m;
+                }
+            }
+            AiProvider::PiCli => {
+                if let Some(mode) = exec_mode {
+                    ai_settings.pi_cli.execution_mode = mode;
+                }
+                if let Some(m) = model {
+                    ai_settings.pi_cli.model = Some(m);
+                }
+            }
+            AiProvider::Ollama => {
+                if let Some(m) = model {
+                    ai_settings.ollama.model = m;
+                }
+            }
+            AiProvider::OpenAiCompatible => {
+                if let Some(m) = model {
+                    ai_settings.openai_compatible.model = m;
+                }
             }
         }
-        AiProvider::ClaudeApi => {
-            if let Some(m) = model {
-                ai_settings.claude_api.model = m;
-            }
-        }
-        AiProvider::GeminiCli => {
-            if let Some(mode) = exec_mode {
-                ai_settings.gemini_cli.execution_mode = mode;
-            }
-            if let Some(m) = model {
-                ai_settings.gemini_cli.model = m;
-            }
-        }
-        AiProvider::GeminiApi => {
-            if let Some(m) = model {
-                ai_settings.gemini_api.model = m;
-            }
-        }
-        AiProvider::PiCli => {
-            if let Some(mode) = exec_mode {
-                ai_settings.pi_cli.execution_mode = mode;
-            }
-            if let Some(m) = model {
-                ai_settings.pi_cli.model = Some(m);
-            }
-        }
-        AiProvider::Ollama => {
-            if let Some(m) = model {
-                ai_settings.ollama.model = m;
-            }
-        }
-        AiProvider::OpenAiCompatible => {
-            if let Some(m) = model {
-                ai_settings.openai_compatible.model = m;
-            }
-        }
-    }
-
-    settings::save_ai_settings(ai_settings)
+        Ok::<_, std::convert::Infallible>(ai_settings)
+    })
+    .map(|_| ())
+    .map_err(|e| match e {
+        settings::AiSettingsUpdateError::SaveFailed(msg) => msg,
+        settings::AiSettingsUpdateError::Rejected(never) => match never {},
+    })
 }
 
 // ============================================================================
@@ -1623,9 +1628,10 @@ pub async fn suggest_dev_services_for_setup(
     // `.git`-less predicate; this is a first-run surface, so a wrong root means
     // a broken install rather than a degraded background sweep (plan
     // `2026-08-04-remove-hardcoded-machine-paths-from-product-code`, slice 5
-    // Phase 8). `require_workspace_root`'s error names the input at fault, every
-    // probe tried, and `$QONTINUI_ROOT` — it surfaces in the wizard where the old
-    // "Could not find qontinui workspace root" string did, but is actionable.
+    // Phase 8). `require_workspace_root`'s error names the Workspace root
+    // setting to fix, and the input at fault when the operator set one — it
+    // surfaces in the wizard where the old "Could not find qontinui workspace
+    // root" string did, but is actionable.
     let workspace = crate::workspace_paths::require_workspace_root()?;
 
     let mut existing = settings::get_managed_process_configs();

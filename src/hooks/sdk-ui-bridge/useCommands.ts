@@ -16,6 +16,7 @@ import { extractFingerprintHashes } from "../../lib/ui-bridge/fingerprintGenerat
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { createLogger } from "@/lib/logger";
 import { readVerdict, relayVerdict } from "./actionOutcome";
+import { describeThrown } from "@/lib/utils";
 
 const log = createLogger("useCommands");
 
@@ -140,7 +141,7 @@ export function useCommands(
       } catch (e) {
         const result: CommandResult = {
           success: false,
-          error: e instanceof Error ? e.message : "Action failed",
+          error: describeThrown(e, "Action failed"),
           duration: Date.now() - startTime,
         };
         setLastCommandResult(result);
@@ -266,7 +267,7 @@ export function useCommands(
         const duration = Date.now() - startTime;
         const result: CommandResult<T> = {
           success: false,
-          error: e instanceof Error ? e.message : "Command failed",
+          error: describeThrown(e, "Command failed"),
           duration,
         };
 

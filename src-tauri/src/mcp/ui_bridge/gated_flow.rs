@@ -304,6 +304,23 @@ fn with_view_control_capability(views: Value) -> Value {
     }
 }
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/view/open` opens an app-registered view: a `navigation` edge
+/// (`push`, `view:<name>`).
+pub async fn ui_bridge_view_open_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<ViewOpenRequest>,
+) -> Result<Json<ApiResponse<Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::navigation(
+        &format!("view:{}", body.name),
+        qontinui_types::journey::NavigationTriggerKind::Push,
+    );
+    let result = ui_bridge_view_open_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
 /// `POST /ui-bridge/control/view/open` — body `{ "name": "setup-wizard" }`
 ///
 /// Drive the app into a named, state-gated view (P1). The runner has no router,
@@ -317,7 +334,7 @@ fn with_view_control_capability(views: Value) -> Value {
 ///
 /// IPC-bridge route: the opener registry lives in React, so this funnels through
 /// `ui_bridge_request_sync`.
-pub async fn ui_bridge_view_open_handler(
+async fn ui_bridge_view_open_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<ViewOpenRequest>,
 ) -> Result<Json<ApiResponse<Value>>, (StatusCode, Json<ApiResponse<()>>)> {

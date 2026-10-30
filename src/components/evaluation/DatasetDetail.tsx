@@ -11,6 +11,7 @@ import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import type { EvaluationDataset } from "@/hooks/useEvaluationDatasets";
 import type { EvaluationDatasetItem, AddItemsRequest } from "@/hooks/useEvaluationDatasets";
+import { describeThrown } from "@/lib/utils";
 
 interface DatasetDetailProps {
   dataset: EvaluationDataset;
@@ -176,7 +177,7 @@ export function DatasetDetail({
       });
       setShowAddForm(false);
     } catch (err) {
-      setParseError(err instanceof Error ? err.message : "Failed to parse file");
+      setParseError(describeThrown(err, "Failed to parse file"));
     } finally {
       // Reset file input so the same file can be re-imported
       if (fileInputRef.current) fileInputRef.current.value = "";
@@ -214,7 +215,7 @@ export function DatasetDetail({
         setJsonInput("");
         setShowAddForm(false);
       } catch (err) {
-        setParseError(err instanceof Error ? err.message : "Failed to add items");
+        setParseError(describeThrown(err, "Failed to add items"));
       }
     } catch {
       setParseError("Invalid JSON");

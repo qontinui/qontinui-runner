@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import { getApiPort } from "@/lib/runner-api";
+import { getApiPort, getApiBase } from "@/lib/runner-api";
 import type { MainTabId } from "@/components/app/tab-types";
 import { migrateTabId } from "@/components/app/tab-types";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
@@ -11,6 +11,7 @@ import {
   toControlActionRequest,
 } from "./utils";
 import { buildKeyboardEventInit, shouldKeypress } from "./keyEventInit";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * Handles: get_elements, get_element, execute_action, get_components, get_component,
@@ -218,7 +219,7 @@ export function useControlEvents(
 
           // Capture render log entry for the interaction
           try {
-            fetch(`http://localhost:${getApiPort()}/ui-bridge/control/render-log`, {
+            fetch(`${getApiBase()}/ui-bridge/control/render-log`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
@@ -593,7 +594,7 @@ export function useControlEvents(
               requestId,
               type,
               success: false,
-              error: err instanceof Error ? err.message : String(err),
+              error: describeThrown(err, "Control request failed"),
               timestamp: Date.now(),
             });
           }

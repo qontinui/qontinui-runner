@@ -31,7 +31,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useUIBridge } from "@qontinui/ui-bridge";
 import type { StyleGuideConfig } from "@qontinui/ui-bridge";
 import { createLogger } from "@/lib/logger";
-import { getErrorMessage } from "@/lib/utils";
+import { describeThrown } from "@/lib/utils";
 
 const log = createLogger("UIBridgeEventHandler");
 
@@ -52,7 +52,7 @@ import {
 } from "./ui-bridge-events";
 
 import type { UIBridgeRequestPayload, UIBridgeResponsePayload } from "./ui-bridge-events/types";
-import { httpSendResponse, httpSendPong, pongEventPayload } from "./ui-bridge-events/utils";
+import { answerPing, httpSendResponse, httpSendPong } from "./ui-bridge-events/utils";
 
 /**
  * Hook that handles UI Bridge requests from Tauri events.
@@ -208,7 +208,7 @@ export function useUIBridgeEventHandler(): void {
           requestId,
           type,
           success: false,
-          error: getErrorMessage(error),
+          error: describeThrown(error, `Failed to handle ${type}`),
           timestamp: Date.now(),
         });
       }
@@ -279,13 +279,14 @@ export function useUIBridgeEventHandler(): void {
         // the main window's label, so a live pop-out can no longer keep a
         // crashed main renderer reading healthy (plan
         // 2026-09-19-runner-render-process-crash-recovery-is-a-no-op-and-popout-pongs-mask-it).
+        //
+        // HTTP FIRST, the Tauri event as fallback: a JS `emit` is an async
+        // Tauri command run on the runner's `app-rt`, so a starved `app-rt`
+        // swallowed every event pong and the runner read a pumping UI as
+        // wedged. The HTTP route is served on the API's own runtime. See
+        // `answerPing`.
         const unlistenPing = await listen("ui-bridge-ping", async () => {
-          try {
-            await emit("ui-bridge-pong", pongEventPayload(myWindowLabelRef.current));
-          } catch {
-            // Tauri event failed — use HTTP fallback
-            await httpSendPong("event", myWindowLabelRef.current);
-          }
+          await answerPing(myWindowLabelRef.current, (payload) => emit("ui-bridge-pong", payload));
         });
 
         // Also set up a periodic HTTP pong as a safety net in case

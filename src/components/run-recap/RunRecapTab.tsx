@@ -44,6 +44,7 @@ import { PhaseTimelineTab } from "./PhaseTimelineTab";
 import { useErrorBadge } from "../../hooks/useErrorMonitor";
 import { FeedbackScoresPanel } from "../feedback-scores/FeedbackScoresPanel";
 import { RunCostBreakdown } from "./RunCostBreakdown";
+import { describeThrown } from "@/lib/utils";
 
 // ============================================================================
 // Main Component
@@ -157,7 +158,7 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
       <div className="h-full flex flex-col items-center justify-center text-muted-foreground p-8">
         <XCircle className="w-12 h-12 mb-4 text-red-500 opacity-50" />
         <p className="text-lg font-medium">Failed to load recap</p>
-        <p className="text-sm mt-2">{error instanceof Error ? error.message : "Unknown error"}</p>
+        <p className="text-sm mt-2">{describeThrown(error, "Unknown error")}</p>
       </div>
     );
   }

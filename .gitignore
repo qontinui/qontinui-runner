@@ -132,6 +132,7 @@ python-bridge/dist/
 src-tauri/binaries/qontinui-executor-*
 src-tauri/binaries/qontinui_profile-*
 src-tauri/binaries/qontinui-pr-*
+src-tauri/binaries/qontinui-pty-holder-*
 !src-tauri/binaries/.gitkeep
 
 .claude/
@@ -187,13 +188,15 @@ target-wt/
 # (Was only in .git/info/exclude — local-only, lost on fresh clone/CI.)
 .mcp.json
 
-# Vision capture scratch cache. The runner writes UI Bridge captures here at
-# RUNTIME, into its own repo root:
-#   src-tauri/src/mcp/ui_bridge/vision_routes.rs -> current_runner_path().join("tmp_vision_cache")
-# Leaving it untracked-but-not-ignored makes any checkout that has served a
-# capture permanently dirty, which silently disables dev-start's
-# Resolve-PrimaryTreeStaleness auto-fast-forward (it self-heals only a CLEAN
-# tree) — that is how a shared checkout drifts tens of commits behind main.
+# Legacy vision capture cache. Written ONLY by runner builds older than the
+# change that moved the cache to the instance-scoped DataLocal dir
+# (<data_local>/com.qontinui.runner/vision_cache, see
+# src-tauri/src/mcp/ui_bridge/vision_capture_access.rs); those builds wrote
+# captures into their own repo root at RUNTIME. Kept because older runners
+# still run in checkouts across the fleet: leaving it untracked-but-not-ignored
+# makes any such checkout permanently dirty, which silently disables
+# dev-start's Resolve-PrimaryTreeStaleness auto-fast-forward (it self-heals
+# only a CLEAN tree). Existing contents are reconstructable cache, safe to delete.
 tmp_vision_cache/
 
 # Perf-harness run artifacts (scripts/perf-harness.mjs). Run JSONs and rendered

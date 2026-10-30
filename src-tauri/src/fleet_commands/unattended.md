@@ -1,5 +1,5 @@
 ---
-description: "Session-close holistic audit — answers one question: if NO operator ever reads this session's output, will the implementation still be complete and correct? Classifies every unit of this session's work as LANDED / WATCHED / RECORDED / IMPEDED / DROPPED, converts every DROPPED item into a durable store, and where no store could hold it, sweeps for unactivated functionality and unimplemented plans before authoring a new one."
+description: "Session-close holistic audit — answers one question: if NO operator ever reads this session's output, will the implementation still be complete and correct? Classifies every unit of this session's work as LANDED / WATCHED / RECORDED / IMPEDED / DROPPED (plus RECEIPTED-UNVERIFIED for a memory-write receipt no door confirmed), converts every DROPPED item into a durable store, and where no store could hold it, sweeps for unactivated functionality and unimplemented plans before authoring a new one."
 argument-hint: "[optional: area to focus on, or a plan slug this session was working]"
 allowed-tools: Read, Write, Edit, Bash, PowerShell, Glob, Grep, ToolSearch, Agent, AskUserQuestion
 ---
@@ -24,9 +24,10 @@ plan corpus — actually captured the work, and you are repairing what it did no
 > an instance of the defect it measures. Escalate only on the fleet's closed
 > list (`escalation-bar` `escalation-closed-list`).
 
-## Step 0 — Re-read served policy LIVE (do not skip, do not use memory)
+## Step 0 — Re-read served policy LIVE (do not skip, do not use memory of an earlier session)
 
-Run **`/policy list`**, then fetch the documents this audit turns on:
+Run **`/policy list`**, then fetch each of the documents this audit turns on
+that is not held (below):
 
 `planning-and-scope` (`finish-to-zero`), `session-protocol`, `operating-rules`,
 `verification-and-evidence`, `memory-and-notes`, `coordination`
@@ -36,6 +37,87 @@ Run **`/policy list`**, then fetch the documents this audit turns on:
 mid-session; a declaration made against v5 goes stale when v6 lands, and this
 command's entire output is a set of declarations. Record the version of each
 document you read and cite it in the report.
+
+**The listing is mandatory every run. Whether a body must be fetched again
+depends on two things.** Run `/policy list` at the start of this `/unattended`
+run. Each line gives a document's `current_version`. Then decide, per document:
+
+- **fetched:** this `/unattended` run fetched the body.
+- **held:** this session already holds the body at the version the listing
+  shows now, and can point to where it got it. Fetching an unchanged version
+  again returns the same text, so it adds nothing. There are two ways to hold a
+  body:
+  - an earlier fetch by this session (`coord_get_prompt_document`, `/policy
+    get`, or the HTTP door), at the same version the listing shows now;
+  - a body the runner injected at spawn or resume, under a header naming the
+    document and version (the `===== policy/<name> (v<N>) =====` block). In
+    practice this covers `session-protocol`. Compare the header's version with
+    this run's listing: on resume the runner can re-send an older block, and a
+    header that does not carry a `v<N>` version cannot establish held.
+
+  A served version number is treated as naming fixed content: an edit to a
+  document's body bumps its version. "Held" needs a pointer, which the Step 4
+  line carries. A body remembered from an earlier session, or a version you
+  think you know, is not held.
+- **NOT READ:** everything else. That includes a document whose version moved
+  since the body you hold.
+
+**Stop decisions need all eight fetched fresh in this run, and each decision
+checked or re-checked against them.**
+A stop decision is any of these, made anywhere in this session:
+
+- writing a row as `IMPEDED (operator_reserved)`;
+- writing any unit with `(no_agent_door)`, whatever its state, or otherwise
+  deciding that a step has no agent door;
+- asking the operator anything (`coord_ask_question`, `/ask-operator`), or
+  handing an item to the operator (a hand-off finding, `/blocked`, a
+  recommendation in place of doing it);
+- declining, deferring or handing back work this session was assigned or
+  found, including a scope cut, a decision not to adopt, and a stand-down from
+  a gate continuation;
+- recording a POLICY_GAP in place of taking the action;
+- a `deferred` row in the POLICY_COMPLIANCE footer that served
+  `session-protocol` Step 3 requires.
+
+"Held" never counts for a stop decision. So when any step from Step 1 on is
+about to produce one, go back to Step 0 first and fetch all eight in this run. Then
+check it in one of two ways:
+
+- **checked:** a decision made during this `/unattended` run is made after that
+  fetch, against those bodies;
+- **re-checked:** a decision made earlier in the session (before this run) is
+  re-checked against this run's bodies. If the bodies say the decision was
+  wrong, undo it: do the work, withdraw the question, and change the row.
+  Record the outcome as `re-checked (upheld)` or
+  `re-checked (reversed → <new row state>)`. A re-check that finds the
+  decision wrong and cannot finish the undo in this run makes that unit
+  DROPPED (owed agent work), converted through Step 2. Record it as
+  `re-checked (reversal unfinished → DROPPED)`, never as `upheld` or
+  `reversed`.
+
+Fetching the bodies does not check a decision. Each stop decision records which
+of the two it got, and Step 4 carries it.
+
+These are the decisions a skipped clause has already got wrong. On 2026-10-04
+a closeout read three of the eight (plus `agent-restricted-actions`, which is
+not among them), skipped `operating-rules`, and escalated as an operator
+reservation a step that `operating-rules`
+`operator-asks-are-decisions-never-api-calls` assigns to the agent. The clauses
+cite one another, and the one that decides a stop is often in the document you
+skipped. A version that has not moved since session start is no protection
+there: the session may never have read the clause that applies.
+
+**How it reaches the verdict.** Step 4 carries the required fleet policy read
+this run line, listing each of the eight with its state, and a separate
+**policy-read confidence** line. A run that made no stop decision has nothing a
+`NOT READ` could have got wrong, so on such a run a `NOT READ` lowers
+confidence to PARTIAL and leaves the work verdict alone. On a run that made a
+stop decision, any of the eight that is not `fetched` makes the work verdict
+INCOMPLETE, because the decision itself is then unchecked. So does a stop
+decision that carries none of the four Step 4 markers. Until coord can
+issue a read receipt (plan
+`2026-10-04-a-missing-agent-door-was-escalated-as-an-operator-reservation`,
+Slice 5), both lines are self-reported, and the report says that too.
 
 If the policy door is unreachable on every transport, say so explicitly and name
 the failure you actually saw. **An unreadable policy door is UNKNOWN, not "no
@@ -79,7 +161,7 @@ Enumerate what this session actually did. Sources, in order of trustworthiness:
    stamp push an earlier, unstamped version is already at that path. **A plan that is committed and pushed is not thereby LANDED**: a bare
    `git push` lands it on whatever branch the plans checkout was on, and nothing
    opens a PR for that branch or merges it. Measured 2026-09-02 on
-   `qontinui-dev-notes`: 45 plan files reachable only from unlanded remote
+   the fleet's plans repo: 45 plan files reachable only from unlanded remote
    branches, the oldest ~4 months stale. A plan whose read-back fails is
    **DROPPED** — route it to a store in Step 2 by landing it per
    `/implement-plan` Step 6 item 3, which is the durable store for this class.
@@ -120,16 +202,26 @@ Enumerate what this session actually did. Sources, in order of trustworthiness:
      wrote). Untracked files are outside every `refs/wip/` snapshot;
      `.gitignore`d files are not listed, by design. Classify the tracked
      changes with
-     `bash <workspace-root>/qontinui-claude-config/scripts/dirty-provenance.sh <tree>`
-     and branch on its EXIT code: 0 clean (every modified file is provisioner
-     residue), 1 found, 3 UNKNOWN, anything else UNKNOWN. In a shared tree the
-     exit code judges every file, peers' included, so run it with `--json`
-     and read `files[]` only for the paths this session wrote. A non-empty
-     top-level `error` makes the whole tree UNKNOWN. Per file, `class:
-     UNKNOWN` is UNKNOWN (it wins over `restorable: false`), then
-     `class: UNIQUE` or `restorable: false` is found, and `restorable: true`
-     is clean. A path of this session's that is absent from `files[]` is clean
-     only when `error` is empty.
+     `bash <workspace-root>/qontinui-claude-config/scripts/dirty-provenance.sh --json <tree>`
+     and read the JSON, not only the exit code: exit 1 also covers
+     `EOL_REWRITE_ONLY`, a tree whose only UNIQUE files are line-ending
+     rewrites of the upstream tip's own blob. A non-empty top-level `error`, a
+     body that does not parse, or an exit other than 0/1/3 is UNKNOWN. A body
+     with no `content_unique_count` field comes from a copy that predates it:
+     there exit 1 is found, never read as a count of 0, and the rest of this
+     rule does not apply. Otherwise: `content_unique_count > 0` or
+     `outside_footprint_count > 0` is found; otherwise `unknown_count > 0` is
+     UNKNOWN; otherwise clean. A UNIQUE file with
+     `content_upstream: true` is clean, because nothing in it exists only on
+     disk. For a clean tree anyway, name its remedy,
+     `git restore --source=<upstream> --worktree -- <path>` (`<upstream>` is
+     the JSON's `upstream`). In a shared tree the counts judge every file,
+     peers' included, so read `files[]` only for the paths this session
+     wrote. Per file, `class: UNKNOWN` is UNKNOWN (it wins over
+     `restorable: false`), then `class: UNIQUE` with `content_upstream: true`
+     is clean, then `class: UNIQUE` or `restorable: false` is found, and
+     `restorable: true` is clean. A path of this session's that is absent
+     from `files[]` is clean only when `error` is empty.
    - **Unpushed commits:** `git -C <tree> fetch --prune` (without `--prune`, a
      remote branch deleted before it landed still hides the commits it held),
      then `git -C <tree> rev-list HEAD --not --remotes` (also for a branch this
@@ -182,12 +274,53 @@ Now put **every** unit into exactly one terminal state:
 | **LANDED** | On `main`, verified **by content** on `origin/main` | The landed SHA plus the content check. `gh` PR state is not evidence in EITHER direction — `closed, merged=false` and `MERGED` with `mergeCommit.oid == headRefOid` are **both** normal coord lands (`coord-ff-lands.md`). Ancestry only on the LANDED sha, never the head |
 | **WATCHED** | Incomplete, but a coord gate watches the trigger and can resume it after every session dies | `gate_id`, **read back** after registration (`coordination` `gate-read-back`) |
 | **RECORDED** | Not resumable work, but a durable record exists so the next session need not re-derive it | The memory record id / plan slug / policy clause |
-| **IMPEDED** | Not done because a condition that is **currently true, environmental and shared** blocks it — and that condition is now posted where the next session will be handed it | The returned `finding_id`. Cite an `alert_key` too *if you actually have one* — `GET /coord/alerts` takes a device JWT, and coord#1601 added a machine arm over a closed allowlist (`FLEET_INFRA_MACHINE_KINDS`), but that arm is **legacy-posture only** and production runs `COORD_ALERTS_TENANT_STRICT=1`, so it never fires. What decides whether you can read this class is your principal's **tenant**, not its kind — measure yours before reading a quiet result in either direction: from the system tenant it is a real read, from an ordinary tenant it is UNKNOWN. Table: `coord-gates-and-access.md` -> "A `200` from a fleet read is not a COMPLETE answer"; mechanics in the alerts note under 2b-findings. Where the blocker is an agent-responder alert, read it from the agent queue, `GET /coord/alerts/queue` (same visibility): a live claim on it means another agent is working it, so cite the row and its claimant rather than working it in parallel. A `404` there, or a body naming `schema_migration_pending`, means the queue is not served yet: cite from `/coord/alerts` and say so. Any other `5xx` is transient: retry |
+| **RECEIPTED-UNVERIFIED** | A 2c memory write returned a `memory_id`, but no door CONFIRMED the row: no read-back door was reachable, or the by-id read was not served or UNKNOWN and search did not find it. Memory-write receipts only; counts as neither RECORDED nor DROPPED | The `memory_id` plus each named read-back door failure or zero-hit query (2c's by-id read-back rule) |
+| **IMPEDED** | Not done, for one of exactly two causes, written in the row as `IMPEDED (<cause>)`. **`environment`**: a condition that is **currently true, environmental and shared** blocks it, and that condition is now posted where the next session will be handed it. **`operator_reserved`**: a served clause reserves the step or decision to the operator, and the hand-off is recorded (see the paragraph under this table). A missing agent door is never IMPEDED (the `no_agent_door` paragraph below) | `environment`: the returned `finding_id`. `operator_reserved`: the clause quoted as `<doc>@<current_version> <clause>`, for closed-list item 2 also the door test's `class: "B"` verdict, and the `question_id` or hand-off `finding_id`. Cite an `alert_key` too *if you actually have one* — `GET /coord/alerts` takes a device JWT, and coord#1601 added a machine arm over a closed allowlist (`FLEET_INFRA_MACHINE_KINDS`), but that arm is **legacy-posture only** and production runs `COORD_ALERTS_TENANT_STRICT=1`, so it never fires. What decides whether you can read this class is your principal's **tenant**, not its kind — measure yours before reading a quiet result in either direction: from the system tenant it is a real read, from an ordinary tenant it is UNKNOWN. Table: `coord-gates-and-access.md` -> "A `200` from a fleet read is not a COMPLETE answer"; mechanics in the alerts note under 2b-findings. Where the blocker is an agent-responder alert, read it from the agent queue, `GET /coord/alerts/queue` (same visibility): a live claim on it means another agent is working it, so cite the row and its claimant rather than working it in parallel. A `404` there, or a body naming `schema_migration_pending`, means the queue is not served yet: cite from `/coord/alerts` and say so. Any other `5xx` is transient: retry |
 | **DROPPED** | Exists only in this transcript | — |
 
 IMPEDED is a *converted* state, not a softer DROPPED: it is earned by the
 returned id, never by the blocker being real. An item whose post returned no
-`finding_id` is **DROPPED**, exactly as a gate you did not read back is.
+id (no `finding_id`, or for `operator_reserved` no `question_id` or hand-off
+`finding_id`) is **DROPPED**, exactly as a gate you did not read back is.
+
+**`operator_reserved` needs the clause, not the belief.** The row quotes the
+reserving clause from the `agent-restricted-actions` catalog or the
+`escalation-bar` closed list. When that clause is closed-list item 2, the row
+also carries the door test's verdict with `class: "B"` and the reason only a
+human can grant the resource (`/next-move` C0, "Item 2 is a hit only after the
+door test"). No quoted clause, or a door test that answered A, means the row is
+not `operator_reserved`: it is the next case.
+
+**A missing agent door is NOT IMPEDED. It is agent work, and it is owed.** This
+covers any blocker that is only the absence of a door an agent can open for a
+mechanical step: an operator-only route, a refusal such as
+`no_agent_clearable_hits`, a route with no agent twin. A missing door for a
+mechanical action is NOT a closed-list item-2 hit, because building the door is
+agent work [policy: operator-asks-are-decisions-never-api-calls]. Find a door in
+flight first:
+
+```bash
+python3 <workspace-root>/qontinui-claude-config/scripts/escalation-door-test.py search \
+  --terms "<words from the refusal>" --plans-repo <workspace-root>/qontinui-dev-notes; echo "search exit=$?"
+```
+
+It prints its JSON; exit 3 means a half of the search failed, which is UNKNOWN,
+never "no door", and so is a cut result (a term in `truncated_terms`, or
+`prs`/`plans` shorter than `prs_matched`/`plans_matched`).
+
+Then land or adopt the confirmed door, or build it, and take the step as an
+agent. The unit ends in one of three states, never IMPEDED:
+- **LANDED**: the door landed and the step ran.
+- **WATCHED**: a read-back gate watches the door (its PR's land, or, when the
+  door is still to be built, a time or plan trigger), and its continuation
+  builds or lands the door and then runs the step as an agent. A gate whose
+  clearance is an operator doing the step does not count.
+- **DROPPED**: neither of the above. A plan alone (RECORDED) does not discharge
+  it: pair the plan with such a gate
+  [policy: operator-asks-are-decisions-never-api-calls].
+
+Write `(no_agent_door)` after the state, so a reader can tell owed agent work
+from a hand-off that really needs the operator.
 
 **A commit on a pushed branch that is not on `origin/main` by content cannot be
 WATCHED unless a PR carries it.** Whether one does is decided by
@@ -251,14 +384,14 @@ to `origin/main` as `qontinui/qontinui-coord`**#2076** on 2026-09-11, adding
 an `unproposed_branches` list to `coord_query_train_health`. LANDED is not
 SERVED — whether the coord instance answering YOU carries it is a separate
 fact you read rather than assume. Measured on
-`qontinui/qontinui-dev-notes`: **absent** at 2026-09-11T23:50Z, **present**
+the fleet's plans repo: **absent** at 2026-09-11T23:50Z, **present**
 (`[]`, `unproposed_branches_total: 0`,
 `unproposed_branches_truncated: false`) at 2026-09-12T00:41Z — the deploy
 went through in between. That is a dated observation, not a guarantee for
 your box: read the table below rather than expecting any particular row from
 it. If `coord_query_train_health` is not a visible tool, load it with
 `ToolSearch` first. Then call it once per repo this session pushed to, with
-`repo` as the full `owner/name` slug (`qontinui/qontinui-dev-notes`), not the
+`repo` as the full `owner/name` slug (`<owner>/<repo>`), not the
 bare name every other line here uses. Classify the RESPONSE before you read
 anything into a branch:
 
@@ -266,7 +399,7 @@ anything into a branch:
 |---|---|---|
 | the `unproposed_branches` key is **absent**, and the payload is an ordinary train-health object | the coord build serving you predates `qontinui/qontinui-coord`#2076 | UNKNOWN |
 | the payload is a lone `{note}` — no `repo`, no `as_of` — naming a **tenant-blind token** | a credential problem, not a repo problem: the tenant comes from the verified identity, never from arguments, so it repeats on every repo. Retry over a tenant-bound door — the native MCP tool, or `coord-revive.sh call` against a proxy nonce, both of which carry a device identity — rather than over whatever bearer produced this | UNKNOWN after one such retry; record it as a credential condition, not as a repo fact |
-| the payload is `{repo, as_of, note}` naming that repo as outside your tenant's **coord authority** | TWO artifacts look exactly like this before a real one does. (a) A bare slug: the authority test is exact string equality against `canonical_repos ∪ tenant_repos` with no trimming and no owner-prefixing, so `qontinui-dev-notes` lands HERE rather than erroring — re-issue with the full `owner/name`. (b) A credential that is not tenant-bound: a door the resolver marks `PARTIAL` answers every tenant-scoped read vacuously, and **it answers exactly this note**. So the test is the door, not the repo count: only a correct slug over a NON-`PARTIAL` door makes this a statement about the repo. Seeing it on every repo you tried is corroboration of a credential artifact, not the test — one repo is the ordinary closeout | UNKNOWN. Once both are excluded, stop expecting it for that repo for the rest of this closeout — but never write it down as a permanent fact; authority is mutable state |
+| the payload is `{repo, as_of, note}` naming that repo as outside your tenant's **coord authority** | TWO artifacts look exactly like this before a real one does. (a) A bare slug: the authority test is exact string equality against `canonical_repos ∪ tenant_repos` with no trimming and no owner-prefixing, so a bare `<repo>` lands HERE rather than erroring — re-issue with the full `owner/name`. (b) A credential that is not tenant-bound: a door the resolver marks `PARTIAL` answers every tenant-scoped read vacuously, and **it answers exactly this note**. So the test is the door, not the repo count: only a correct slug over a NON-`PARTIAL` door makes this a statement about the repo. Seeing it on every repo you tried is corroboration of a credential artifact, not the test — one repo is the ordinary closeout | UNKNOWN. Once both are excluded, stop expecting it for that repo for the rest of this closeout — but never write it down as a permanent fact; authority is mutable state |
 | the key is present and **`null`** | coord's own record read failed. If `superseded_candidate_heads_basis` beside it says the merge-proposal tables are missing, no derivation ran at all. (`table_provisioned` is NOT this discriminator — it reports the CI-samples table and appears on ordinary payloads too) | UNKNOWN |
 | a client-side **`InputValidationError`**, naming no accepted arguments | the tool's schema is not loaded — nothing was sent. `ToolSearch`, then re-issue | not a reading yet; UNKNOWN if it recurs after one load |
 | coord answers **`unknown_argument`** and names the accepted set | your argument name is wrong — and this also PROVES the transport is live end to end. Fix the name against what it printed and re-issue ONCE | UNKNOWN if it refuses again |
@@ -356,7 +489,7 @@ algorithm, so the two can disagree.
   from exactly two inputs: whether a PR ever named the branch, and whether any
   of the branch's content is already on the base. Do not expect the
   `grew_after_land` shape the exclusions bullet further down uses as its
-  example: all three entries `qontinui/qontinui-claude-config` served at
+  example: all three entries the fleet's agent-config repo served at
   2026-09-12T03:24Z read `grew_after_unlanded_close`.
   - `never_proposed` — no PR ever named this branch, and its newest push is
     over 24h old. Owed a PR, subject to the per-commit "if nothing is unlanded,
@@ -463,32 +596,425 @@ Independently of capture, audit this session against `planning-and-scope`
   re-verification IS the census below — a probe of one URL does not count:
 
 <!-- detector-reach-fence:start -->
-> **A capability negative cites a CENSUS, never a probe.** Before recording
-> "no door", "agents cannot", "this route does not exist" or any other claim
-> that a capability is ABSENT, run
-> `bash <workspace-root>/qontinui-claude-config/scripts/coord-route-census.sh <fragment>`
-> — spelled absolutely, because a bare `scripts/...` resolves only from a
-> checkout of `qontinui-claude-config`, and a session standing anywhere else
-> gets exit 127
-> (it reads `origin/main` of BOTH `qontinui-coord` and `qontinui-web`, never
-> a working tree and never a live host) — and paste its trailer verbatim
-> beside the claim:
-> `census: fragment=<f> hosts_read=coord.qontinui.io,api.qontinui.io ref=<sha>,<sha> routes=<n> unextracted=<n> unmounted=<n> generated=<ISO time>`
-> — the line that parses under `CENSUS_TRAILER_RE` in
-> `scripts/detector_reach/__init__.py`. A 401, 404 or 405 on ONE spelling of
+> **A capability negative cites EMITTED EVIDENCE, never a probe.** Before
+> recording "no door", "agents cannot", "this route does not exist" or any
+> other claim that a capability is ABSENT, paste beside it, verbatim, ONE of
+> the two lines that can evidence one (items 1 and 2; item 3 can only refute
+> one) — each from a tool run from wherever your deployment installs it,
+> spelled by its absolute path, because a bare relative path resolves only
+> from the checkout that ships it, and a session standing anywhere else gets
+> exit 127:
+>
+> 1. **A census trailer** from the route census,
+>    `coord-route-census.sh <fragment>` (it reads `origin/main` of BOTH
+>    `qontinui-coord` and `qontinui-web`, never a working tree and never a
+>    live host):
+>    `census: fragment=<f> hosts_read=coord.qontinui.io,api.qontinui.io ref=<sha>,<sha> routes=<n> unextracted=<n> unmounted=<n> generated=<ISO time>`
+>    — the line that parses under the census tool's own `CENSUS_TRAILER_RE`.
+>    `routes=UNKNOWN` (exit 2) settles nothing; `routes=0` with both refs
+>    resolved is the only honest negative; `routes=` above 0 contradicts it;
+>    `admits=unknown` on a listed row means unmeasured, never "operator-only".
+> 2. **A `FLOOR-CLAIM:` line** from
+>    `coord-revive.sh --floor-claim` (the coord-revive skill's resolver)
+>    whose verdict is `FLOOR` — `verdict=LIVE` contradicts the negative, and
+>    `verdict=UNKNOWN` settles nothing.
+> 3. **A `refusal-read:` line is NOT evidence FOR a negative.** It comes from
+>    `refusal-remedy.sh`:
+>    `refusal-read: code=<code> tool=<tool> state=<REMEDY_WORKS|REMEDY_PRECONDITION_UNMET|REMEDY_FAILED|NO_REMEDY_PROBE|UNKNOWN> detail=<token> measured=<ISO>`
+>    — and a typed refusal shows coord ANSWERED and named a precondition, so
+>    it never stamps a negative. Any state that shows coord answered
+>    CONTRADICTS the negative whose code (or the tool the probe called) it
+>    matches: `state=REMEDY_WORKS`, `REMEDY_PRECONDITION_UNMET` with
+>    `detail=` `session_not_owned_by_caller`, `caller_owns_no_active_session`,
+>    `harness_session_id_required_measured`, `header_not_honored` or
+>    `stale_build`, and `REMEDY_FAILED detail=build_current`. Publish the
+>    precondition and its remedy instead of the negative. Every other line
+>    shows nothing either way: `UNKNOWN`, `NO_REMEDY_PROBE` (no probe ran),
+>    `REMEDY_FAILED detail=orient_refused` (the probe's own call was
+>    refused), a detail this list does not name.
+>
+> Where no census tool is reachable at all, a route negative cannot be
+> settled and is UNVERIFIED.
+>
+> A stamp counts only when the tool EMITTED it on this box; a line you typed,
+> however well-formed, is not evidence. It counts only beside the negative it
+> is offered for: a census only for a negative about the route it names —
+> never a refusal, never one in a sentence naming a coord tool — and only
+> when censuses cover every route that negative names; a `FLOOR-CLAIM:` for
+> a door or credential negative with no refusal in it — and every negative
+> in the text, clause by clause, needs its own. A 401, 404 or 405 on ONE spelling of
 > ONE host is a sample, not a search: `/api/v1/memory` refuses on
-> `coord.qontinui.io` and answers on `api.qontinui.io`. A claim without the
-> trailer is **UNVERIFIED and is not recorded** — not as a finding, not as a
-> memory, not as a plan premise. `routes=UNKNOWN` (exit 2) means the census
-> could not read a source and settles nothing; `routes=0` with both refs
-> resolved is the only honest negative, and `admits=unknown` on a listed row
-> means unmeasured, never "operator-only".
+> `coord.qontinui.io` and answers on `api.qontinui.io`. `_routes` is not a
+> census either — of the five `user_id`-bearing credential doors (roster in
+> `knowledge-base/qontinui-specific/coord-gates-and-access.md`), "three of
+> them are not routes at all, and one of them (door 5) is a file on local disk
+> that no route census, `_routes` enumeration or allowlist read can surface."
+> So **a credential-door class-negative is settled by probing the roster,
+> never by enumerating a surface**, and a report that could not probe a
+> member says `UNKNOWN (door N unprobed)` for it rather than folding the miss
+> into a class verdict. A claim without accepted evidence is **UNVERIFIED and
+> is not recorded** — not as a finding, not as a memory, not as a plan
+> premise. The publication-time capability-negative gate quotes this very
+> block as its deny message.
 <!-- detector-reach-fence:end -->
 
 - Did anything claimed as "verified" inspect the working tree instead of the
   committed one?
 
 Report conformance per policy clause, by clause name — not as a summary grade.
+
+### Step 1c — Reap this session's stale processes
+
+`/unattended` asks whether this session's work survives an unread transcript.
+A stale process is the same question inverted: something that **survives when it
+should not**. Both harms are real, and the second is the one this step exists
+for.
+
+- **Resource.** A background shell holds a harness slot, a PID against this
+  box's task/PID ceiling, and whatever RSS its child allocated — the two
+  exhaustion signatures are OOM kills and a fork/spawn that fails while memory
+  looks fine. A box that saturates stops being able to allocate, which is the
+  state every other step here depends on.
+- **Honesty, which is worse.** A dead waiter and a live one are
+  **indistinguishable** in a background listing: both report nothing. So a
+  session waits on an answer that can no longer arrive and reads the silence as
+  *still running*. That is served policy `verification-and-evidence`
+  `silent-empty-is-unknown` applied to process state — the same shape dossier
+  `empty-read-published-as-verdict` records for reads, a probe that could not
+  answer answering anyway. Measured 2026-10-03: two subagents each spent a turn
+  re-reporting on waiter shells that had already been reaped, while the verdicts
+  they were meant to carry sat in the logs the whole time.
+
+**It runs HERE, after Step 1 and before Step 2, for a reason.** Staleness is not
+a property of a process; it is a property of the relation between a process and
+what this session owes. You cannot tell a dead waiter from a live verifier
+without Step 1's inventory. A verdict this step rescues out of an artifact
+resolves a unit; one it cannot rescue **demotes** a unit — and Step 2 routes
+both.
+
+#### The governing constraint: identity cannot authorize a kill here
+
+Read this before writing any predicate, because two plausible ones were built
+and measured wrong on this exact box.
+
+⚠️ **"The command line contains my session id" is UNSOUND in both directions.**
+Coord names every allocated worktree
+`agent-worktrees/<allocating-session-uuid>/<repo>`, so a uuid in argv identifies
+**the tree a process stands in, not its owner**. And it *misses* most of what it
+should find: a harness background job is a wrapper `bash -c '<cd …/<id>/… && cmd>'`
+whose **child** is the real worker, and the child's argv is just `sleep 240` —
+no path at all. Measured 2026-10-03: of this session's own stale orphans, a path
+test found **1 of 3**, and the two it missed were the leaf workers holding the
+RSS and the PID that the "Resource" rationale above is about.
+
+⚠️ **"It descends from my `claude` process" is ALSO unsound, and here it is
+WORSE.** A session and **every subagent it spawns share one `claude` process and
+one `CLAUDE_CODE_SESSION_ID`**. Measured: five live processes —
+`bash → bash → {tee, tail}` running `cargo-verify.sh check` — carried <!-- lint-cargo-verification-form: ok this names a MEASURED PAST RUN as the subject of a mis-kill, not a verification recipe this step prescribes -->
+`CLAUDE_PID` and `CLAUDE_CODE_SESSION_ID` identical to the reaping session's
+while belonging to a *subagent* mid-build in another worktree. Descendancy
+claims all five; the substring predicate would have spared them, because their
+argv carried the worktree's uuid and not the session's. Descendancy is
+transitive, so it crosses every session boundary *below* the anchor.
+
+**Therefore ownership NEVER licenses a kill in this step.** No identity test on
+this harness can separate "my stale waiter" from "my subagent's live build",
+because the two are the same session. Ownership narrows the candidate set and
+nothing more. What licenses a kill is the orphan gate plus a staleness proof.
+
+**Read ownership from `/proc/<pid>/environ`, not from argv.** It is readable for
+a same-uid process, it carries `CLAUDE_CODE_SESSION_ID` verbatim, and it reaches
+the leaf workers argv cannot: measured, a child spawned as `exec sleep 47` with
+no path in its command line still carries the session id in its environment. It
+inherits the subagent-shares-one-id property above — which is exactly why it
+narrows rather than authorizes.
+
+#### Only an ORPHAN is reapable
+
+A process re-parented to **`PPid: 1`** has been abandoned: the shell that started
+it is gone, so nothing is left to consume what it produces. That is the whole
+reapable population, and restricting to it buys two safety properties
+mechanically rather than by judgement:
+
+- **a subagent's live work is excluded**, because its parent is alive. Measured:
+  the build above sits under a live shell, and the harness parents both
+  tool-call shells and `run_in_background` shells **directly to the long-lived
+  `claude`**, so a wanted background job stays a non-orphan for the life of the
+  session. The one shape that does reach `PPid: 1` while still wanted is a
+  process the session *deliberately* detached (`setsid`/`nohup` from a shell
+  that then exited) — which is what the staleness proof below is for.
+- **this step's own pipeline is excluded.** A `tee` or `head` in the same
+  pipeline is a *sibling* of the shell running the step, not an ancestor, so an
+  ancestor-exclusion list does not cover it — and the step nominates `tee` as a
+  staleness example, so it could otherwise kill the process capturing its own
+  output.
+
+An orphan is a **candidate**, not a target. It is reaped only on a positive
+staleness proof:
+
+1. **Orphaned waiter or follower** — the consumer that would read what it
+   produces is gone. A `tail -f`, `tee` or poll loop whose reader exited
+   qualifies **even though its file still exists**; the artifact outliving the
+   reader is the normal case, not a disqualifier.
+2. **Unsatisfiable waiter** — its exit condition can no longer become true: the
+   sentinel it polls can only be written by a producer that is gone, or its own
+   command line satisfies its own match pattern so it sees itself forever.
+3. **Answered waiter** — the artifact it polls already carries a terminal
+   verdict. It has nothing left to report.
+4. **Superseded waiter** — its subject moved: the head it was armed against is
+   no longer the branch head, or the PR it polls has landed.
+
+**The default is RETAIN.** A candidate with no proof is reported and left alone.
+
+> ⚠️ **Duration is NOT staleness, and treating it as such destroys work.**
+> Measured 2026-10-03: a `cargo-verify.sh check` on a cold target was killed at <!-- lint-cargo-verification-form: ok this names a MEASURED PAST RUN as the subject of a mis-kill, not a verification recipe this step prescribes -->
+> 580 s for looking hung. The same build, left alone, needed **65m48s** and
+> finished clean — so the kill destroyed an hour of work and produced nothing,
+> leaving compilation UNKNOWN. Age bounds nothing; only the four proofs do.
+
+#### The never-kill fences — a backstop, not the gate
+
+The first two are served policy `production-and-cost` `runner-lifecycle`.
+
+- **Never `node`, `claude`, `pwsh`/`powershell`** — killing one ends live Claude
+  Code sessions, this one and peers'.
+- **Never the runner or the supervisor**, primary or secondary.
+- **Never a build** — `cargo`, `rustc`.
+- **Never a session host or a service manager** — `tmux`, `systemd`. Both are
+  `PPid: 1` by design, so the orphan gate does not exclude them: measured, the
+  `tmux: server` on this box is an unfenced orphan hosting **230** sessions, and
+  the user `systemd` manager is another. Killing either takes down work that was
+  never this session's.
+- **Never the Python side** — `python`, `python3`, `poetry`, `uvicorn`. The
+  runner drives a Python subprocess, and 214 `python3` orphans were measured
+  here in one pass.
+
+⚠️ **Test BOTH `/proc/<pid>/exe` and `/proc/<pid>/comm`, matching if either
+hits.** Neither alone is sufficient. `comm` is the settable thread name (default
+basename of argv[0], rewritable by `prctl`), so it is not the image: measured,
+two live processes read `comm = next-server (v1` and `comm = MainThread` while
+`readlink exe` resolved both to `…/bin/node`. But `exe` alone misses a wrapper
+launched as `node <cli.js>`, where `exe` is `node` while `comm` carries the
+wrapper's own name. Patterns stay **prefixes**: userspace `comm` is capped at 15
+bytes (`qontinui-supervisor-longname-test` reads back `qontinui-superv`), and
+`exe` may carry a ` (deleted)` suffix that must be stripped.
+
+⚠️ **A fence is a denylist and denylists cannot be completed, so it is not what
+makes this safe.** A build driven through a shell wrapper runs under image `bash`
+and passes every pattern above. The orphan gate and the staleness proof are the
+gate; the fence only catches what must never be signalled even if those admit
+it.
+
+#### A process's identity is `(pid, starttime)`, never the pid alone
+
+The window between enumerating and killing is long by design — classification
+reads each candidate's artifact — and the kernel recycles pids inside it.
+
+⚠️ **Comparing command lines does not establish identity.** Measured: two *live*
+processes with byte-identical cmdlines
+(`bash …/cargo-verify.sh check`), because shared boxes routinely run several <!-- lint-cargo-verification-form: ok this names a MEASURED PAST RUN as the subject of a mis-kill, not a verification recipe this step prescribes -->
+identical build wrappers. A cmdline-equality guard discriminates nothing inside
+exactly the population that must never be killed.
+
+`/proc/<pid>/stat` field 22 (`starttime`, clock ticks since boot) distinguishes
+process *instances*: those two wrappers read `311563291` and `311563304`.
+Capture it at enumeration and require it unchanged at kill time.
+
+Read it by **stripping through the last `)` first** — `stat` is
+`pid (comm) state ppid …`, and a `comm` containing a space shifts every later
+field. Measured: `tmux: server`, `tmux: client` and five `next-server (v1`
+processes all mis-parse, and this session's own ancestor chain runs through
+`tmux: server`. Read the parent from `/proc/<pid>/status` `PPid:` for the same
+reason. **Require the result to be all digits**: `comm` may contain a newline,
+which splits the `sed` input and yields a value that passes a bare `-n` test
+while carrying a stray line.
+
+And read both with **no positional parameter**. A command body is injected with
+its ARGUMENTS substituted, so a dollar-digit inside one of these fences is
+consumed as the command's argument before any shell sees it. Unfilled it stays
+literal and the code works — which is why review misses it — and filled, the
+field reference vanishes. `/unattended` takes an argument, so this is live.
+Check #18's harness-placeholder guard refuses it, and it refused exactly these
+helpers twice during authoring.
+
+#### Enumerate
+
+```bash
+# Helpers take their argument in PID_IN and answer in *_OUT. No positional
+# parameters: a dollar-digit in this fence is a harness argument (see above).
+read_ppid()  { PPID_OUT=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$PID_IN/status" 2>/dev/null); }
+read_start() { START_OUT=$(sed -e 's/^.*) //' "/proc/$PID_IN/stat" 2>/dev/null | cut -d' ' -f20)
+               case $START_OUT in ''|*[!0-9]*) START_OUT="" ;; esac; }
+read_img()   { IMG_EXE=$(readlink "/proc/$PID_IN/exe" 2>/dev/null); IMG_EXE=${IMG_EXE##*/}
+               IMG_EXE=${IMG_EXE% (deleted)}
+               IMG_COMM=$(cat "/proc/$PID_IN/comm" 2>/dev/null); }
+read_sid()   { SID_OUT=$( { tr '\0' '\n' <"/proc/$PID_IN/environ"; } 2>/dev/null \
+                 | sed -n 's/^CLAUDE_CODE_SESSION_ID=//p' | head -1); }
+
+SID="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-}}"
+[ -d /proc ] || { echo 'PROCESS REAP UNKNOWN - no /proc on this box'; return 2>/dev/null || exit 0; }
+[ -n "$SID" ] || { echo 'PROCESS REAP UNKNOWN - no session id in the environment'; return 2>/dev/null || exit 0; }
+PID_IN=$$; read_start; MY_START=$START_OUT
+[ -n "$MY_START" ] || { echo 'PROCESS REAP UNKNOWN - could not read this shell starttime'; return 2>/dev/null || exit 0; }
+
+n_fence=0; n_unreadable=0; n_not_orphan=0; n_other_session=0; n_cand=0; n_unclaimed=0
+for d in /proc/[0-9]*; do
+  pid=${d#/proc/}
+  [ "$pid" = "$$" ] && continue
+  # Not readable by us. `-O` is euid-AND-dumpable, so it also excludes a
+  # privilege-changing exec of ours; it over-excludes, which is the safe
+  # direction, and such a process is counted here rather than claimed.
+  [ -O "$d" ] || { n_unreadable=$((n_unreadable+1)); continue; }
+  [ -r "$d/cmdline" ] || { n_unreadable=$((n_unreadable+1)); continue; }
+  # The process can exit between that test and this read; group the redirection
+  # so the shell's own error does not leak. `|| continue` is the handler.
+  cl=$( { tr '\0' ' ' <"$d/cmdline"; } 2>/dev/null ) || { n_unreadable=$((n_unreadable+1)); continue; }
+  [ -n "$cl" ] || continue                        # kernel thread
+  PID_IN=$pid; read_img
+  [ -n "$IMG_EXE$IMG_COMM" ] || { n_unreadable=$((n_unreadable+1)); continue; }
+  # Spelled out twice rather than shared through a variable: a fence is not a
+  # place for `eval`, and either read hitting is enough to refuse.
+  case $IMG_EXE in
+    node*|claude*|pwsh*|powershell*|qontinui-*|cargo*|rustc*|tmux*|systemd*|python*|poetry*|uvicorn*)
+      n_fence=$((n_fence+1)); continue ;;
+  esac
+  case $IMG_COMM in
+    node*|claude*|pwsh*|powershell*|qontinui-*|cargo*|rustc*|tmux*|systemd*|python*|poetry*|uvicorn*)
+      n_fence=$((n_fence+1)); continue ;;
+  esac
+  # ONLY an orphan is reapable. This is the gate, not a heuristic.
+  PID_IN=$pid; read_ppid
+  [ "$PPID_OUT" = 1 ] || { n_not_orphan=$((n_not_orphan+1)); continue; }
+  PID_IN=$pid; read_start
+  [ -n "$START_OUT" ] || { n_unreadable=$((n_unreadable+1)); continue; }
+  # Started at or after this shell: it belongs to THIS invocation, not a past
+  # turn, so it is never a stale waiter.
+  [ "$START_OUT" -lt "$MY_START" ] 2>/dev/null || continue
+  PID_IN=$pid; read_sid
+  if [ "x$SID_OUT" = "x$SID" ]; then
+    n_cand=$((n_cand+1)); printf 'candidate\t%s\t%s\t%s\n' "$pid" "$START_OUT" "$cl"
+  elif [ -z "$SID_OUT" ]; then
+    n_unclaimed=$((n_unclaimed+1)); printf 'unclaimed\t%s\t%s\tno session id in environ\n' "$pid" "$START_OUT"
+  else
+    n_other_session=$((n_other_session+1))
+  fi
+done
+printf 'collateral\tfence=%s\tunreadable=%s\tnot_orphan=%s\tother_session=%s\tunclaimed=%s\tcandidates=%s\n' \
+  "$n_fence" "$n_unreadable" "$n_not_orphan" "$n_other_session" "$n_unclaimed" "$n_cand"
+```
+
+An `unclaimed` row is an orphan this step could not attribute — reported, never
+signalled. Let the artifact decide it, rather than widening a test that cannot
+tell your work from a peer's.
+
+Live owned work is worth *reporting* even though it is never reaped. Where you
+want that line, resolve the nearest ancestor whose `exe` or `comm` matches
+`claude*` and count its descendants; if no such ancestor resolves, that count is
+UNKNOWN, which changes nothing about the reap.
+
+#### Kill, then observe
+
+```bash
+# $pid and $START_SEEN as enumerated
+START_NOW=$(sed -e 's/^.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f20)
+case $START_NOW in ''|*[!0-9]*) START_NOW="" ;; esac
+if [ -n "$START_NOW" ] && [ "x$START_NOW" != "x$START_SEEN" ]; then
+  printf 'SKIPPED\t%s\tstarttime changed - pid recycled since enumeration\n' "$pid"
+elif [ -z "$START_NOW" ] && [ -d "/proc/$pid" ]; then
+  # The directory is there but the read failed: that is an UNREADABLE PROBE,
+  # never a death. Send nothing.
+  printf 'UNKNOWN\t%s\tstarttime unreadable while /proc entry exists - no signal sent\n' "$pid"
+elif [ -z "$START_NOW" ]; then
+  printf 'ALREADY-GONE\t%s\tno /proc entry before the signal\n' "$pid"
+else
+  kill -TERM "$pid" 2>/dev/null
+  # A dying process keeps /proc/<pid> for a moment, so an immediate test
+  # reports a healthy exit as "survived". Poll, bounded: 25 x 0.2s = 5s.
+  i=0
+  while [ "$i" -lt 25 ]; do
+    [ -d "/proc/$pid" ] || break
+    command sleep 0.2; i=$((i+1))
+  done
+  if [ -d "/proc/$pid" ]; then printf 'PRESENT\t%s\tstill present after TERM + 5s\n' "$pid"
+  else                         printf 'KILLED\t%s\n' "$pid"
+  fi
+fi
+```
+
+⚠️ **An empty starttime is UNKNOWN, not death — and this is the branch most
+likely to be got wrong, because its failure is CORRELATED with the condition the
+step exists to relieve.** The read is two forks (`sed`, `cut`); on a box at its
+task/PID ceiling — the exhaustion signature named at the top of this step —
+those forks are what fails. Measured during authoring: with `cut` off `PATH`,
+and again with `sed` forced to fail, an earlier version printed
+`ABSENT … already gone before the signal` for a process that was verifiably
+alive, **and sent no signal** — so it both spared and buried every candidate,
+while the headline computed a full reap. `KILLED`, `ALREADY-GONE` and `UNKNOWN`
+are therefore three distinct tokens: one verdict word for "I killed it" and
+"it was already dead" makes the reaped count uncomputable.
+
+`kill` exiting 0 means the signal was delivered, not that the process is gone,
+and served policy `ux-priorities`
+`a-status-signal-must-observe-the-state-it-names` forbids reporting the one as
+the other — hence the poll. Without it the *successful* case reports a false
+`PRESENT`: `/proc/<pid>` is sometimes still there the instant after `TERM` and
+gone 0.2 s later, so the naive test is a race that resolves toward the alarming
+answer. A still-`PRESENT` process is **not** escalated to `KILL` silently: name
+it on the verdict line. Exit status is only readable where the shell owns the
+process as a job, and `TERM` yields **143** there (measured: `143` for `TERM`,
+`144` for `SIGSTKFLT`) — so a reported 144 is *not* evidence of a plain
+`kill`/`pkill` and must not be quoted as one.
+
+This fence is **self-contained on purpose**: every tool call is a fresh shell,
+so a block reusing the helpers above would die with `read_start: command not
+found`, and that failure would land in the equality test — skipping every kill
+while reporting nothing wrong. Safe, but a silently dead step.
+
+#### Reap in dependency order, and never let a kill discharge a unit
+
+Killing a producer orphans every waiter on it, so a reap that ignores order
+**manufactures the class it is clearing**. Enumerate and classify everything
+first; then reap; and never kill a live producer to tidy up.
+
+**Before killing a waiter, read the artifact it was polling** — this is what
+keeps a reap from turning a WATCHED unit into a lost one:
+
+- the artifact carries a terminal verdict → **record the verdict from the
+  artifact**, and the waiter's death loses nothing. Measured 2026-10-03: four
+  `EXIT=0` verdicts outlived their reaped waiters and were read off the logs.
+- the artifact carries no verdict → the unit it was watching is **UNKNOWN**, and
+  it reverts to Step 1's classification for Step 2 to route like any other
+  DROPPED item.
+
+Killing the carrier never settles the thing carried. Say which of the two
+happened, per process.
+
+#### Reporting it
+
+One headline, fail-closed, highest precedence first, then one line per process
+with the verdict token the fences printed. Report it under Step 4's
+**Process reap (Step 1c)** item:
+
+- `PROCESS REAP UNKNOWN — <reason>`, when the enumeration could not run (no
+  `/proc`, no session id, no readable starttime for this shell) or any kill
+  returned the `UNKNOWN` token;
+- else `STALE PROCESSES LEFT — <present> of <proven_stale>`, when something
+  proven stale was still `PRESENT` after its signal;
+- else `REAPED <killed> of <candidates> candidates — <retained> retained,
+  <skipped> skipped, <already_gone> already gone`, counting the `KILLED`,
+  `SKIPPED` and `ALREADY-GONE` tokens, with `<retained>` the candidates that
+  reached no staleness proof;
+- else `NO CANDIDATES — nothing orphaned and attributable to reap`.
+
+Every headline carries the **collateral check** the enumeration prints:
+`fence`, `unreadable`, `not_orphan`, `other_session` and `unclaimed`, measured in
+this run. Note what `unreadable` is and is not — on these boxes **peer sessions
+run as the same Unix user**, so it counts processes this step could not read
+(kernel threads, daemons, privilege-changing execs), *not* other tenants' work.
+That is what makes the claim auditable rather than reassuring: a reap that
+reports only what it killed cannot be told from one that killed too much.
+Process populations on a shared box move by the minute, so a count carried over
+from another run is not evidence about this one.
 
 ## Step 2 — Convert every DROPPED item into a durable store
 
@@ -729,6 +1255,21 @@ coord_post_finding(
   dossier_slug  = "<slug>",
   title = "<the one-sentence CLAIM a reader sees when bodies are projected away>",
   body  = "<evidence, then method, then what a peer should do differently — in that order>")
+
+# The same write from bash, and the read it owes (the 201/200 is not the answer):
+W=<workspace-root>/qontinui-claude-config; . "$W/scripts/lib/envelope.sh"; R=$(mktemp -d)
+bash "$W/.claude/skills/coord-revive/coord-revive.sh" call coord_post_finding \
+  '{"kind":"status","scope":"tenant","topic":"plan-corpus","dossier_slug":"<slug>","resource_keys":["<key>"],"title":"<claim>","body":"<evidence>"}' > "$R/p"
+envelope_mcp_body coord_post_finding "$R/p" > "$R/b"
+P=$(envelope_require coord_post_finding posted "$R/b")          # FIRST - enforced, not printed
+if [ "$P" = true ]; then
+  envelope_require coord_post_finding finding.finding_id "$R/b"   # nested - never `finding_id` off the envelope
+elif [ "$P" = false ]; then  # coord answered: nothing stored, and the reason says why
+  echo "NOT STORED (posted=false)"; envelope_require coord_post_finding reason "$R/b"
+else  # posted unreadable = UNKNOWN, never "not stored": the write is presumed LOST
+  echo "UNKNOWN (write presumed LOST - verify by read)" >&2
+fi
+rm -rf "$R"
 ```
 
 Those are the argument names on both doors — the HTTP twin under **Transport**
@@ -817,26 +1358,66 @@ says a route, tool or host is absent, refuses, or cannot be reached by agents):
 the census trailer is part of the body, or the finding is not posted.
 
 <!-- detector-reach-fence:start -->
-> **A capability negative cites a CENSUS, never a probe.** Before recording
-> "no door", "agents cannot", "this route does not exist" or any other claim
-> that a capability is ABSENT, run
-> `bash <workspace-root>/qontinui-claude-config/scripts/coord-route-census.sh <fragment>`
-> — spelled absolutely, because a bare `scripts/...` resolves only from a
-> checkout of `qontinui-claude-config`, and a session standing anywhere else
-> gets exit 127
-> (it reads `origin/main` of BOTH `qontinui-coord` and `qontinui-web`, never
-> a working tree and never a live host) — and paste its trailer verbatim
-> beside the claim:
-> `census: fragment=<f> hosts_read=coord.qontinui.io,api.qontinui.io ref=<sha>,<sha> routes=<n> unextracted=<n> unmounted=<n> generated=<ISO time>`
-> — the line that parses under `CENSUS_TRAILER_RE` in
-> `scripts/detector_reach/__init__.py`. A 401, 404 or 405 on ONE spelling of
+> **A capability negative cites EMITTED EVIDENCE, never a probe.** Before
+> recording "no door", "agents cannot", "this route does not exist" or any
+> other claim that a capability is ABSENT, paste beside it, verbatim, ONE of
+> the two lines that can evidence one (items 1 and 2; item 3 can only refute
+> one) — each from a tool run from wherever your deployment installs it,
+> spelled by its absolute path, because a bare relative path resolves only
+> from the checkout that ships it, and a session standing anywhere else gets
+> exit 127:
+>
+> 1. **A census trailer** from the route census,
+>    `coord-route-census.sh <fragment>` (it reads `origin/main` of BOTH
+>    `qontinui-coord` and `qontinui-web`, never a working tree and never a
+>    live host):
+>    `census: fragment=<f> hosts_read=coord.qontinui.io,api.qontinui.io ref=<sha>,<sha> routes=<n> unextracted=<n> unmounted=<n> generated=<ISO time>`
+>    — the line that parses under the census tool's own `CENSUS_TRAILER_RE`.
+>    `routes=UNKNOWN` (exit 2) settles nothing; `routes=0` with both refs
+>    resolved is the only honest negative; `routes=` above 0 contradicts it;
+>    `admits=unknown` on a listed row means unmeasured, never "operator-only".
+> 2. **A `FLOOR-CLAIM:` line** from
+>    `coord-revive.sh --floor-claim` (the coord-revive skill's resolver)
+>    whose verdict is `FLOOR` — `verdict=LIVE` contradicts the negative, and
+>    `verdict=UNKNOWN` settles nothing.
+> 3. **A `refusal-read:` line is NOT evidence FOR a negative.** It comes from
+>    `refusal-remedy.sh`:
+>    `refusal-read: code=<code> tool=<tool> state=<REMEDY_WORKS|REMEDY_PRECONDITION_UNMET|REMEDY_FAILED|NO_REMEDY_PROBE|UNKNOWN> detail=<token> measured=<ISO>`
+>    — and a typed refusal shows coord ANSWERED and named a precondition, so
+>    it never stamps a negative. Any state that shows coord answered
+>    CONTRADICTS the negative whose code (or the tool the probe called) it
+>    matches: `state=REMEDY_WORKS`, `REMEDY_PRECONDITION_UNMET` with
+>    `detail=` `session_not_owned_by_caller`, `caller_owns_no_active_session`,
+>    `harness_session_id_required_measured`, `header_not_honored` or
+>    `stale_build`, and `REMEDY_FAILED detail=build_current`. Publish the
+>    precondition and its remedy instead of the negative. Every other line
+>    shows nothing either way: `UNKNOWN`, `NO_REMEDY_PROBE` (no probe ran),
+>    `REMEDY_FAILED detail=orient_refused` (the probe's own call was
+>    refused), a detail this list does not name.
+>
+> Where no census tool is reachable at all, a route negative cannot be
+> settled and is UNVERIFIED.
+>
+> A stamp counts only when the tool EMITTED it on this box; a line you typed,
+> however well-formed, is not evidence. It counts only beside the negative it
+> is offered for: a census only for a negative about the route it names —
+> never a refusal, never one in a sentence naming a coord tool — and only
+> when censuses cover every route that negative names; a `FLOOR-CLAIM:` for
+> a door or credential negative with no refusal in it — and every negative
+> in the text, clause by clause, needs its own. A 401, 404 or 405 on ONE spelling of
 > ONE host is a sample, not a search: `/api/v1/memory` refuses on
-> `coord.qontinui.io` and answers on `api.qontinui.io`. A claim without the
-> trailer is **UNVERIFIED and is not recorded** — not as a finding, not as a
-> memory, not as a plan premise. `routes=UNKNOWN` (exit 2) means the census
-> could not read a source and settles nothing; `routes=0` with both refs
-> resolved is the only honest negative, and `admits=unknown` on a listed row
-> means unmeasured, never "operator-only".
+> `coord.qontinui.io` and answers on `api.qontinui.io`. `_routes` is not a
+> census either — of the five `user_id`-bearing credential doors (roster in
+> `knowledge-base/qontinui-specific/coord-gates-and-access.md`), "three of
+> them are not routes at all, and one of them (door 5) is a file on local disk
+> that no route census, `_routes` enumeration or allowlist read can surface."
+> So **a credential-door class-negative is settled by probing the roster,
+> never by enumerating a surface**, and a report that could not probe a
+> member says `UNKNOWN (door N unprobed)` for it rather than folding the miss
+> into a class verdict. A claim without accepted evidence is **UNVERIFIED and
+> is not recorded** — not as a finding, not as a memory, not as a plan
+> premise. The publication-time capability-negative gate quotes this very
+> block as its deny message.
 <!-- detector-reach-fence:end -->
 
 `kind="status"` for *this is how the world is right now*; `kind="gotcha"` for an
@@ -921,6 +1502,13 @@ session the second door was built for. So try, in order:
      later read a `NULL` author as evidence that no session filed it, and expect
      anything that ranks or filters by `author_session` to see arm 2's output as
      unattributed.
+   - **Declare the rung on the request**:
+     `-H 'x-qontinui-transport: http_agent_door'`
+     `-H 'x-qontinui-reporter: unattended'`, plus
+     `-H 'x-qontinui-transport-attempted: native_mcp'` when arm 1 is the rung
+     that refused you. These are not credentials and may ride on argv; they let
+     coord count this closeout as the degraded session it is (plan
+     `2026-09-20-first-rung-coord-reachability-is-unmeasured-then-unfixed`).
    - **Identity is refused, not ignored.** `tenant_id`, `author_session` and
      `author_device` are lifted from the credential, and a body carrying any of
      them is rejected with a `400` naming the field — so do not "fix" that error
@@ -1063,9 +1651,10 @@ runner is not on that tenant and would not. The full principal x endpoint
 matrix — including the asymmetry that runs the OTHER way on
 `/coord/fleet/health`, where `is_admin` is tested first and unconditionally, so
 an ordinary tenant's admin gets the WIDE rollup and the NARROW list — is in
-`qontinui-claude-config/knowledge-base/qontinui-specific/coord-gates-and-access.md`
--> "A `200` from a fleet read is not a COMPLETE answer". Read it there; it is one
-home for a fact this command, `/manual-test-coord` and `/dev-ops-steward` all
+the coord gates-and-access reference in your deployment's knowledge base, where
+it ships one, -> "A `200` from a fleet read is not a COMPLETE answer". Read it
+there; it is one home for a fact this command, `/manual-test-coord` (where your
+deployment provides it) and `/dev-ops-steward` all
 consume, and re-deriving it is how its direction got written backwards once
 already (ccfg#437).
 
@@ -1112,6 +1701,41 @@ coord_recent_findings(topic="dossier:<slug>", kind="dossier")   # the live head 
 coord_memory_search(query_text="DOSSIER <slug>", kinds=["mental_model"])   # the literal KEY — fallback
 coord_memory_search(query_text="<the condition in its own words>")
 coord_memory_search(query_text="<the condition, phrased a second way>")
+
+# The same lookup from bash, with every read it owes. Copy THIS, not a hand-rolled
+# `.get(...)`: coord_memory_search has NO `count` and its rows are `hits`.
+W=<workspace-root>/qontinui-claude-config; . "$W/scripts/lib/envelope.sh"
+REVIVE="$W/.claude/skills/coord-revive/coord-revive.sh"; R=$(mktemp -d)
+bash "$REVIVE" call coord_recent_findings '{"topic":"dossier:<slug>","kind":"dossier","limit":5}' > "$R/f"
+envelope_mcp_body coord_recent_findings "$R/f" > "$R/fb"
+if [ "$(envelope_require coord_recent_findings available "$R/fb")" = true ]; then
+  envelope_collection coord_recent_findings findings "$R/fb"   # the head(s); `count` must equal the rows
+else echo "UNKNOWN: findings store unavailable or unread - never \"no head\""; fi
+# Three probes, each ending HIT / MISS / UNKNOWN - never a bare zero.
+for Q in '{"query_text":"DOSSIER <slug>","kinds":["mental_model"],"limit":50}' \
+         '{"query_text":"<the condition in its own words>","limit":50}' \
+         '{"query_text":"<the condition, phrased a second way>","limit":50}'; do
+  bash "$REVIVE" call coord_memory_search "$Q" > "$R/m" || { echo "UNKNOWN (door): $Q"; continue; }
+  H=$(envelope_mcp_body coord_memory_search "$R/m" | envelope_require coord_memory_search hits -) \
+    || { echo "UNKNOWN (envelope): $Q"; continue; }
+  [ "$H" != "[]" ] && { echo "HIT: $Q"; printf '%s\n' "$H"; continue; }
+  # An empty `hits` is a hypothesis. It is a MISS only beside a populated store
+  # (this response's own `live_row_count`) AND a common-word control query that
+  # returns rows through the same door; anything else is UNKNOWN.
+  # `vector_arm` says which retrieval ran: `skipped_no_embedding` (the normal
+  # case) means full-text only, so a rephrasing may still hit.
+  L=$(envelope_mcp_body coord_memory_search "$R/m" | envelope_require coord_memory_search live_row_count -)
+  V=$(envelope_mcp_body coord_memory_search "$R/m" | envelope_require coord_memory_search vector_arm -)
+  # Control word: pick one that is common in the corpus yet selective
+  # (`dossier`). A stopword such as `the` is dropped by full-text search and
+  # always returns 0; a control that errors or times out leaves `C` unread,
+  # which is UNKNOWN - never a MISS.
+  bash "$REVIVE" call coord_memory_search '{"query_text":"dossier","limit":1}' > "$R/c"
+  C=$(envelope_mcp_body coord_memory_search "$R/c" | envelope_require coord_memory_search hits -)
+  if [ "${L:-0}" -gt 0 ] 2>/dev/null && [ -n "$C" ] && [ "$C" != "[]" ]; then echo "MISS (vector_arm=${V:-unread}): $Q"
+  else echo "UNKNOWN (live_row_count=${L:-unread}, vector_arm=${V:-unread}, control=${C:-unread}): $Q"; fi
+done
+rm -rf "$R"
 ```
 
 **The finding is the primary store; memory is the fallback.** When the first
@@ -1156,10 +1780,8 @@ prefix rule is what makes the head the only row whose title starts with
 **Interim lookup rule (until `title_prefix` lands).** `coord_memory_search` is
 **full-text only** unless the call carries a query vector — read its
 `vector_arm` (`skipped_no_embedding` is the normal case) — so run **at least
-three differently-phrased probes, one of them the literal key above**, and
-treat **every empty answer as UNKNOWN, never as "no dossier"**. Read every coord/web/runner response through `scripts/lib/envelope.py` / `envelope.sh`; assert `count`-vs-rows agreement before acting on any zero; an `UNKNOWN:` line is UNKNOWN, not a negative.
-The discriminating keys (`live_row_count` from `coord_memory_overview`,
-`vector_arm`) are named in the helper's docstring, not here — the dossier
+three differently-phrased probes, one of them the literal key above** — the
+recipe's loop does, and only its `MISS` line is "no dossier"; the dossier
 `0585cd3f` records why one probe is never enough.
 
 **Resolution path once it lands.** Plan
@@ -1365,6 +1987,17 @@ If the item is knowledge rather than work — a non-obvious property of the
 system, a trap that cost this session time, a correction to a belief this session
 started with, an approach that was confirmed — record it.
 
+**Re-read every environmental claim before you write it down.** A claim this
+session made earlier — a file says X, a function lives at line N — was true of
+the tree it was read in, and that tree has moved since. Before the durable
+write, re-read each one at `origin/main` through the pinned-read helper that
+Step 3b's Door 2 runs (`git fetch` first; its `cat` or `grep`, whose `pin:` line
+names the sha it resolved) and cite it as `<repo>@<sha12>:<path>:<line>`. A claim that no longer
+reads FOUND there — exit 1 `MISSING_AT_REF`, a `grep` that no longer
+matches (exit 1), or a `grep` exit 3 `PATHSPEC_EMPTY` (the cited path is gone
+at that ref; never fold it into "no match") — is re-verified or dropped, never written as standing; exit 2 is
+UNKNOWN, and is recorded as UNKNOWN rather than as the old answer.
+
 - When **`coord_memory_record` is visible and answers**, author through it.
   Kind mapping: `feedback`→`feedback`, `reference`→`reference`,
   user-fact→`fact`, project-state→`observation`. Redaction, dedup and quotas
@@ -1372,30 +2005,35 @@ started with, an approach that was confirmed — record it.
   redundant.
 - When it is **masked**, or answers `"Command failed with no output"`, do NOT
   fall back to a file on that evidence. Visibility is not the predicate;
-  **reachability** is, and one resolver decides it. Four steps:
-  1. `bash <workspace-root>/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh`
-     from the real cwd, SUBSTITUTING the real workspace root — the ONE door
-     resolver (its L2 is the same sibling sweep `/gate` Step 2 runs). Spell
-     it absolutely: the relative `.claude/skills/...` form resolves only from
-     a checkout that has that tree, which most agent worktrees do not. Note
-     that an unsubstituted `<workspace-root>` produces `No such file or
-     directory` too, so read your own paste error before reading a missing
-     door. Branch on its `VERDICT:` line.
+  **reachability** is, and one resolver decides it. Five steps:
+  1. `bash <session-workdir>/.claude/skills/coord-revive/coord-revive.sh`
+     from the real cwd, SUBSTITUTING the directory the runner provisioned the
+     skill into (or wherever your deployment keeps a checked-out copy of it)
+     — the ONE door resolver (its L2 is the same sibling sweep `/gate` Step 2
+     runs). Spell it absolutely: the relative `.claude/skills/...` form
+     resolves only from a directory that has that tree, which most agent
+     worktrees do not. Note that an unsubstituted `<session-workdir>` produces
+     `No such file or directory` too, so read your own paste error before
+     reading a missing door. Branch on its `VERDICT:` line.
      Never paste the sweep into this file: the cascade's only implementations
      are the two scripts `lint-shared-door-classifier.py` (check #35) pins.
      **A correctly-substituted path that STILL says `No such file or
-     directory` means no `qontinui-claude-config` checkout exists on this
+     directory` means no copy of the coord-revive skill exists on this
      box at all** — steps 2
-     and 3 below need the `VERDICT:` line this step produces, so neither is
+     to 4 below need the `VERDICT:` line this step produces, so none of them is
      reachable either. That is functionally the same operational state as
-     step 4's `DEAD`, so treat it as `DEAD` (skip straight to step 4) rather
+     step 5's `DEAD`, so treat it as `DEAD` (skip straight to step 5) rather
      than as a masked-tool retry.
   2. **LIVE loopback proxy (L1/L2)** → raw JSON-RPC `tools/call`
      `{"name":"coord_memory_record","arguments":{title,content,kind}}`:
      against the `url=` that the `VERDICT: LIVE door=<file> url=<url>` line
      names, with that file's nonce, using the recipe `gate.md` Part B Step 2
      uses for `coord_register_gate` (nonce staged in a tempfile, `-H @file`,
-     never on argv). **`coord-revive.sh` DOES have `call` and `tools` verbs**
+     never on argv), and with the rung DECLARED beside it:
+     `-H 'x-qontinui-transport: loopback_proxy'`
+     `-H 'x-qontinui-reporter: unattended'` (the `DECLARE:` line under a LIVE `VERDICT:` prints the
+     transport and the refused rungs to copy; its reporter is coord-revive's
+     own, so send `unattended` in its place). **`coord-revive.sh` DOES have `call` and `tools` verbs**
      — and `coord-revive.sh --help` prints them, which settles it without
      trusting any document, this one included. So the hand recipe is A path,
      not the only one. What bounds the
@@ -1414,9 +2052,12 @@ started with, an approach that was confirmed — record it.
      **The refusal text is on stdout: read it.** It names what was wrong, so
      fix the payload and re-issue — re-sending an identical call that your own
      arguments got refused only reproduces the refusal.
-     Then read back with `coord_memory_search` over the same door
-     (`query_text` is required there too — omit it and the search is refused
-     the same way, `OK over` and all). A zero-hit search is self-describing:
+     Then read back **by id** over the same door: `coord_memory_get` on the
+     receipt's `memory_id`, under the by-id read-back rule below the steps.
+     `coord_memory_search` is the secondary — for checking dedup or that the
+     row is discoverable — and the fallback when that rule finds the by-id
+     tool not served or UNKNOWN (`query_text` is required there — omit it and the search
+     is refused the same way, `OK over` and all). A zero-hit search is self-describing:
      read `live_row_count`, `query_echo` and `anchored_hit_count` before
      concluding anything, exactly as 2b-bis requires. Only a CORRECTED
      payload that is still refused, over a door that carries the call, is a
@@ -1427,8 +2068,35 @@ started with, an approach that was confirmed — record it.
      `{"records":[{title,content,kind}]}` and a FRESH device JWT
      (`get_memory_tenant` verifies coord-signed device JWTs; measured HTTP 200
      on 2026-09-02; `~/.qontinui/coord-device-jwt` lives ~4h — check `exp`
-     first). Read back with `POST …/memory/query` (`query_text` is required).
-  4. **`DEAD`** — and only then — a topic file plus a **one-line** `MEMORY.md`
+     first). Read back by id, under the rule below: `coord_memory_get` over
+     coord's generic remote MCP door `POST https://coord.qontinui.io/mcp`
+     with the same device JWT (`gate.md` Step 4's door). `POST …/memory/query`
+     (`query_text` is required) is the secondary, and the fallback when the
+     by-id tool is not served or UNKNOWN.
+  4. **LIVE bootstrap credential, no runner (L5)** → coord's generic remote
+     MCP door. Mint the token as `coord-revive.sh`'s L5 rung does, by
+     `gate.md` Step 4b's recipe: an anonymous
+     `POST https://coord.qontinui.io/agents/credential` with
+     `{"device_id": …}` (plus the session's `tenant_id` when known). Stage it
+     straight into a `chmod 600` header file as `Authorization: Bearer …`:
+     never on argv, never echoed, never pasted into a transcript or a file
+     anyone else reads. Declare the rung in the same file, one header per
+     line, after the bearer:
+     `x-qontinui-transport: bootstrap_credential`,
+     `x-qontinui-transport-attempted: <the rungs that refused you, in order>`
+     and `x-qontinui-reporter: unattended`. Write with JSON-RPC `tools/call`
+     `{"name":"coord_memory_record","arguments":{title,content,kind}}` to
+     `POST https://coord.qontinui.io/mcp`, with `-H @<that file>`,
+     `Content-Type: application/json` and
+     `Accept: application/json, text/event-stream`. That door was measured
+     carrying `coord_memory_record` on 2026-09-21 (memory `d06de56c`). Read
+     back by id over the same door, under the rule below. This arm is
+     hand-run: `coord-revive.sh call` runs over a `.mcp.json` nonce and never
+     mints, so it does not reach L5. Step 3's web API is no fallback here
+     either. It answers this token 401 because the token has no `user_id`
+     claim (measured on the list route), so before `coord_memory_get` an L5
+     session had no read-back at all.
+  5. **`DEAD`** — and only then — a topic file plus a **one-line** `MEMORY.md`
      index entry (one target per line, as plain index hygiene), with
      frontmatter `metadata.coord_fallback: <YYYY-MM-DD> no-door` so a backfill
      can grep for it. That file is a **single-machine, single-project record
@@ -1437,6 +2105,73 @@ started with, an approach that was confirmed — record it.
      it anywhere. It is readable on this box only, and invisible to every
      other session — including the `coord_memory_search` probes 2b-bis
      prescribes.
+- **The by-id read-back rule — steps 2, 3 and 4.** Plan
+  `2026-09-21-a-memory-write-receipt-cannot-be-read-back-by-any-door-a-degraded-session-holds`.
+  The receipt is the `memory_id` the write returned. The control is
+  `tools/call` `coord_memory_get` with `{"memory_ids":["<that id>"]}`. It takes
+  1 to 50 ids, so one call reads back every memory a closeout wrote. It is
+  deterministic, where search is full-text and can miss a row that exists.
+  - **Probe before relying on it.** The tool is new, so the coord, or the
+    runner-proxy build, that your door reaches may not serve it yet. Confirm it
+    is listed: `tools/list` on that door, or `coord-revive.sh tools` on the
+    proxy arm. If it is absent from the list, or answers `-32601` or "unknown
+    tool", it is **not served**. That never means "write lost". Fall back to
+    that arm's search read-back, and say in the classification that the by-id
+    control was unavailable.
+  - **A tool-level error, or an id in `errors`, is UNKNOWN — never missing.**
+    `coord_memory_get` answers with a tool error when no id got a 200 or the
+    route's own 404, and it lists per-id `errors` entries: a `405` (the web
+    backend predates the by-id route), any other non-2xx, or a transport
+    failure. None of these says anything about the row. Fall back to that
+    arm's search read-back, and if that does not confirm the row either, the
+    item is RECEIPTED-UNVERIFIED.
+  - **An id in `records` is RECORDED, whatever its `state`. The state is the
+    annotation, not the class:**
+    - `live` → **RECORDED**.
+    - `superseded` → **RECORDED**, annotated `superseded → <superseded_by>`.
+    - `tombstoned` → **RECORDED**, annotated `tombstoned`: the write landed and
+      was later deleted. `title` and `content` come back null.
+    - `expired` → **RECORDED**, annotated `expired at <valid_until>`. Say also
+      that the row is no longer discoverable by search.
+    - For `tombstoned` and `expired`, the receipt is confirmed but the
+      knowledge is NOT retrievable by the next session, which is what RECORDED
+      exists to guarantee. Say so in the closeout. Re-record still-true content
+      as a new memory (and read THAT id back) only for an `expired` row; a
+      `tombstoned` row was deleted on purpose unless this session can show
+      otherwise, so report it and leave it rather than undo a peer's delete.
+  - **Read `missing` beside the echoed `tenant_id`.** An id lands in `missing`
+    only on the route's own "not found in your tenant" 404. Another principal's
+    agent- or session-scoped row also reads as missing, because the two cannot
+    be told apart.
+    - **The tenant does NOT match the one this session acts for:** this is a
+      wrong-tenant read, not a lost write. On a device bound to several
+      tenants, a mint that names no tenant resolves the device's DEFAULT
+      binding (memory `c50aefbf`). Retry under the right tenant, and do not
+      count it DROPPED.
+    - **The tenant MATCHES, and the write was `agent`- or `session`-scoped
+      with a `scope_ref` that is not the reading door's own claim** (the
+      device id for `agent`, the session id for `session`): the row may be
+      hidden by coord's private-partition filter, which compares against the
+      READER's claim. Step 3's web write does not clamp `scope_ref`, so this is
+      reachable. Do NOT re-issue: classify it **RECEIPTED-UNVERIFIED** and name
+      the scope mismatch. To avoid it, write `agent`/`session` rows with
+      `scope_ref` set to the writing door's own claim, or use `tenant` scope.
+    - **The tenant MATCHES otherwise:** the write did not land where the
+      receipt claims. Re-issue the write once over the same door and read the
+      new id back. If it is still missing, the item is **DROPPED**, with both
+      ids recorded.
+  - **A receipt that no door CONFIRMED is RECEIPTED-UNVERIFIED** (Step 1's
+    table). A `memory_id` came back, and neither the by-id read nor search
+    confirmed the row. That covers:
+    - every read-back door unreachable, or the door dying between the write
+      and the read;
+    - the by-id tool not served or answering UNKNOWN (above) while search is
+      unreachable;
+    - the by-id tool not served or UNKNOWN, search reachable, and search
+      returning zero hits for the row.
+    Record the `memory_id`, each door failure you actually saw, and each
+    zero-hit query. It counts as neither RECORDED, because nothing confirmed
+    the row, nor DROPPED, because a receipt exists.
 - **A memory written to a file while a door was reachable is RECORDED locally
   but DROPPED fleet-wide.** Report it as **DROPPED** in Step 4's classification
   table — the file is not the evidence RECORDED requires — and re-issue it over
@@ -1545,7 +2280,7 @@ env-gated arms, dry-run/shadow modes, dark routes, unwired exports.
 > per-runbook: SSM `eu-central-1`; ECS and Cognito `us-east-1`. Same read, with
 > the debounce evidence that motivates it, in
 > `.claude/commands/cleanup-steward.md` → **"A shipped fix is not a serving fix"**
-> and `.claude/commands/merge-train-steward.md` → the **"Honest bookkeeping"**
+> and, where your deployment provides it, `/merge-train-steward` → the **"Honest bookkeeping"**
 > bullet (a bullet, not a step — searching for a step of that name finds nothing).
 >
 > ⚠️ **A green `Deploy coord` run is not evidence the flag you are reading is the
@@ -1584,8 +2319,8 @@ session is meant to trust. Do not write one.
 
 **Repetition is a version, not a row.** Upsert on the stable slug
 `probe-<topic>-<YYYY-MM-DD>`, so a second sweep the same day appends a version
-to one row instead of adding a second. `source_repo` is the constant
-`qontinui-dev-notes/diagnostics`; `kind` is `diagnostic`;
+to one row instead of adding a second. `source_repo` is your deployment's
+constant diagnostics root, in `<repo>/<dir>` form; `kind` is `diagnostic`;
 `kind_is_heuristic: false`; `intent_refs` cites the served `success_metric/` or
 `domain_spec/` the finding bears on, so its significance is INHERITED rather
 than asserted.
@@ -1604,8 +2339,8 @@ box whose runner forwards to an unreachable web base it answers **502** and the
 live door is the direct `POST https://api.qontinui.io/api/v1/plan-library` with
 a device JWT carrying `user_id`. **Verify by read, never by the 201** —
 `GET …/plan-library?kind=diagnostic&work_unit_slug=<stem>`; `?q=` matches title
-and body but NOT the slug. Say which door you wrote through. Worked instance:
-`probe-plan-corpus-2026-09-06-write-door-on-merytshost`.
+and body but NOT the slug. Say which door you wrote through. Worked instance: a
+`probe-plan-corpus-2026-09-06-write-door-on-<host>` diagnostic.
 
 ### 3b — Is it already PLANNED but not IMPLEMENTED?
 
@@ -1616,7 +2351,7 @@ and selection resolve against `agent.work_artifacts` behind qontinui-web
 error.
 
 **Three doors, in this order** (plan `2026-08-27-plan-corpus-read-path-is-dark`
-Phase 4). `http://127.0.0.1:8000` is on no rung: it is a per-box dev backend,
+Phase 4). A local dev backend, where your deployment runs one, is on no rung: it is a per-box dev backend,
 and whatever it answers is an observation about that process, never about the
 corpus. Do not diagnose it here, and do not quote a cause for it from any
 document — the cause of that box's local 404 has flipped repeatedly, and a
@@ -1626,10 +2361,15 @@ session that repeats a stale one forecloses the reader's search.
 server-side; the caller presents nothing.
 
 ```bash
-curl -sS -w '\nHTTP %{http_code}\n' \
-  'http://127.0.0.1:9876/plan-library/search?kind=plan&slug=<stem>'
+W=<workspace-root>/qontinui-claude-config; . "$W/scripts/lib/envelope.sh"; R=$(mktemp -d)
+curl -sS -w '%{stderr}HTTP %{http_code}\n' \
+  'http://127.0.0.1:9876/plan-library/search?kind=plan&slug=<stem>' > "$R/s"
+envelope_collection 'runner /plan-library/search' data.items "$R/s"   # rows; data.count must agree
+envelope_require    'runner /plan-library/search' data.corpus_health "$R/s"
 # the body, on a runner build that carries the by-id forward (READ-PLAN Phase 2):
-curl -sS 'http://127.0.0.1:9876/plan-library/artifacts/<id>'
+curl -sS -w '%{stderr}HTTP %{http_code}\n' 'http://127.0.0.1:9876/plan-library/artifacts/<id>' > "$R/a"
+envelope_require 'runner /plan-library/artifacts' data "$R/a"
+rm -rf "$R"
 ```
 
 A non-2xx names the host the runner dialled — its configured web base. Record
@@ -1641,10 +2381,27 @@ authored through the web UI is invisible here), exact stem, `origin/main` as of
 the last fetch:
 
 ```bash
-git -C qontinui-dev-notes fetch -q origin main
-bash qontinui-claude-config/scripts/lib/pinned-read.sh \
-  --root qontinui-dev-notes cat origin/main plans/<stem>.md | head -5
-git -C qontinui-dev-notes ls-tree --name-only origin/main plans/ | wc -l
+# The git checkout holding $QONTINUI_PLANS_DIR, and the plans dir inside it.
+# Unset, or not inside a git checkout: Door 2 is UNKNOWN on this box, never
+# "absent". Test the variable FIRST: `git -C ""` silently reads the cwd.
+if [ -n "$QONTINUI_PLANS_DIR" ] \
+   && PLANS_REPO=$(git -C "$QONTINUI_PLANS_DIR" rev-parse --show-toplevel 2>/dev/null) \
+   && PLANS_REL=$(git -C "$QONTINUI_PLANS_DIR" rev-parse --show-prefix 2>/dev/null); then
+  git -C "$PLANS_REPO" fetch -q origin main
+  bash qontinui-claude-config/scripts/lib/pinned-read.sh \
+    --root "$PLANS_REPO" cat origin/main "${PLANS_REL}<stem>.md" | head -5
+  # PLANS_REL is empty when the plans dir IS the repo top level: list "." then.
+  # No such tree on origin/main, or a failed ls-tree, is UNKNOWN, never 0:
+  # ls-tree on a path the ref lacks exits 0 and prints nothing.
+  if git -C "$PLANS_REPO" rev-parse -q --verify "origin/main:${PLANS_REL}" >/dev/null \
+     && listing=$(git -C "$PLANS_REPO" ls-tree --name-only origin/main "${PLANS_REL:-.}" 2>/dev/null); then
+    printf "%s\n" "$listing" | grep -c .
+  else
+    echo "Door 2: no readable origin/main:${PLANS_REL:-.} tree - plan count UNKNOWN, not 0" >&2
+  fi
+else
+  echo "Door 2 N/A: \$QONTINUI_PLANS_DIR is unset or not in a git checkout - UNKNOWN" >&2
+fi
 ```
 
 ⚠️ Read the pinned-read helper's EXIT CODE, not the emptiness of its output --
@@ -1657,8 +2414,10 @@ and emits content on stdout only in state 0. A `2` here is UNKNOWN -- never
 
 **Door 3 — the deployed backend, with a coord DEVICE JWT.**
 `~/.qontinui/coord-device-jwt` carries the `user_id` claim the route requires;
-an `/agents/allocate` agent token does not. When the file token is expired,
-mint one from the runner (it holds no secret at rest):
+an `/agents/allocate` agent token does not. Use it only when its `tenant_id`
+claim is this session's tenant (the same check the snippet below applies to a
+minted token); when it is expired or claims another tenant, mint one from the
+runner (it holds no secret at rest):
 
 ```bash
 # DOOR 3a, always first: the runner's IN-PROCESS invoke mint - no WebView hop,
@@ -1669,10 +2428,64 @@ mint one from the runner (it holds no secret at rest):
 # `data: null` from get_coord_device_token is "this device is unpaired" - a
 # verdict, not a reason to try the next name. Only an HTTP 400 "not in UI Bridge
 # allowlist" (or 404) moves on to the older name for the same slot.
-curl -sS -X POST http://127.0.0.1:9876/ui-bridge/invoke/get_coord_device_token \
-  -H 'Content-Type: application/json' -d '{}'      # -> .data (source: runner-invoke)
-curl -sS -X POST http://127.0.0.1:9876/ui-bridge/invoke/get_access_token_for_websocket \
-  -H 'Content-Type: application/json' -d '{}'      # only after the 400/404 above
+# $R holds a LIVE bearer in $AUTHFILE: `rm -rf "$R"` at the end is not optional.
+W=<workspace-root>/qontinui-claude-config; . "$W/scripts/lib/envelope.sh"
+R=$(mktemp -d); AUTHFILE="$R/auth"
+# THE TENANT this session reads for: $QONTINUI_TENANT_ID, else the runner
+# session census row for $QONTINUI_TERMINAL_ID (coord-revive.sh
+# resolve_session_tenant's rule). Sent ONLY as {"args":{"tenantId":...}} - the
+# runner reads `args` and drops a top-level key, which on a multi-slot runner
+# is a 409 tenant_required. Named, the older name and 3b (the DEFAULT slot,
+# which cannot be asked for a tenant) are skipped, and the token's claim is
+# checked below. A malformed value is an error, never ignored.
+TEN="${QONTINUI_TENANT_ID:-}"
+if [ -z "$TEN" ] && [ -n "${QONTINUI_TERMINAL_ID:-}" ]; then
+  curl -sS -m 10 http://127.0.0.1:9876/control/sessions/info > "$R/census" 2>/dev/null
+  TEN=$(QT="$QONTINUI_TERMINAL_ID" python3 -c 'import json,os,sys
+try: rows=json.load(open(sys.argv[1]))["data"]["sessions"]  # envelope-ok: a predicate search over the census rows; any miss prints nothing, never a default
+except Exception: sys.exit(0)
+for r in rows:
+    if isinstance(r,dict) and (r.get("identity") or {}).get("terminalId")==os.environ["QT"]:
+        t=r.get("tenancy") or {}; c=t.get("credential") or {}
+        print((t.get("row") or {}).get("tenantId") or (c.get("tenantId") if c.get("status")=="resolved" else "") or ""); break' "$R/census" 2>/dev/null)
+fi
+[ -z "$TEN" ] || [[ "$TEN" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || { echo "tenant '$TEN' is not a uuid - refusing to mint" >&2; TEN=INVALID; }
+echo "tenant: ${TEN:-UNKNOWN (none named; tenant-less mint)}" >&2
+MB='{}'; [ -n "$TEN" ] && MB="{\"args\":{\"tenantId\":\"${TEN,,}\"}}"
+S1=; [ "$TEN" = INVALID ] || S1=$(curl -sS -w '%{stderr}%{http_code}\n' -X POST \
+  http://127.0.0.1:9876/ui-bridge/invoke/get_coord_device_token \
+  -H 'Content-Type: application/json' -d "$MB" 2>&1 >"$R/mint1" | tail -n 1)   # (source: runner-invoke)
+# The token never reaches the terminal or argv: it is read (exit 3 on
+# `data: null` = unpaired, or any other shape) straight into the header file.
+S2=""
+if [ -z "$TEN" ] && { [ "$S1" = 400 ] || [ "$S1" = 404 ]; }; then   # the older name, ONLY on 400/404, ONLY with no tenant named
+  S2=$(curl -sS -w '%{stderr}%{http_code}\n' -X POST \
+    http://127.0.0.1:9876/ui-bridge/invoke/get_access_token_for_websocket \
+    -H 'Content-Type: application/json' -d '{}' 2>&1 >"$R/mint2" | tail -n 1)
+  echo "HTTP $S1 then $S2" >&2
+  T=$(envelope_first_present runner-mint data.value,data.result.value,data "$R/mint2")
+else
+  echo "HTTP $S1" >&2
+  T=$(envelope_first_present runner-mint data.value,data.result.value,data "$R/mint1")
+fi
+# The runner's typed 401 DEVICE_TOKEN_EXPIRED (either name): its OWN coord
+# credential has expired. Its own outcome - never "unpaired", never a reason to
+# retry the mint. No bearer is staged (the read below reports the UNKNOWN); the
+# fix is to sign the runner in. An expired token handed back as a SUCCESS (an
+# older build) is caught by the exp check after Door 3b, below - AFTER the
+# claim check here, so a wrong-tenant token is named as such whatever its exp.
+if grep -q 'DEVICE_TOKEN_EXPIRED:' "$R/mint1" "$R/mint2" 2>/dev/null; then
+  echo "RUNNER_MINT_EXPIRED: the runner's coord credential has expired - sign in to the runner (not retried)" >&2; T=""
+fi
+# CLAIM CHECK: a token claiming ANOTHER tenant is discarded, never staged - its
+# claim is printed, the token never is (it rides the environment, not argv).
+if [ -n "$T" ] && [ -n "$TEN" ]; then
+  CLAIM=$(T="$T" python3 -c 'import os,json,base64
+p=os.environ["T"].split(".")[1]; p+="="*(-len(p)%4)
+print(json.loads(base64.urlsafe_b64decode(p)).get("tenant_id") or "")' 2>/dev/null)
+  [ "${CLAIM,,}" = "${TEN,,}" ] || { echo "minted token claims tenant '${CLAIM:-none}', not $TEN - DISCARDED" >&2; T=; }
+fi
+[ -n "$T" ] && printf 'Authorization: Bearer %s\n' "$T" > "$AUTHFILE"; unset T
 
 # DOOR 3b, ONLY when 3a answered HTTP 400 "not in UI Bridge allowlist" (or 404
 # for the route) for BOTH names - a runner build that predates both entries; a
@@ -1692,15 +2505,41 @@ curl -sS -X POST http://127.0.0.1:9876/ui-bridge/invoke/get_access_token_for_web
 # runner unwraps the frontend's `result` envelope before it reaches HTTP.
 # Plans 2026-08-24-headless-box-has-no-working-coord-credential-door,
 # 2026-09-02-steering-layers-unreadable-without-a-credential (1f).
-curl -sS http://127.0.0.1:9876/health   # -> .data.frontendReady
+# The gate is CODE, not the comment above: no bearer from 3a, and BOTH names
+# refused with 400/404.
+case "$S1:$S2" in 400:400|400:404|404:400|404:404) B3=1 ;; *) B3= ;; esac
+if [ ! -s "$AUTHFILE" ] && [ -n "$B3" ]; then
+  curl -sS -w '%{stderr}HTTP %{http_code}\n' http://127.0.0.1:9876/health > "$R/h"
+  if [ "$(envelope_require 'runner /health' data.frontendReady "$R/h")" = true ]; then
+    curl -sS -w '%{stderr}HTTP %{http_code}\n' -X POST http://127.0.0.1:9876/ui-bridge/control/page/evaluate \
+      -H 'Content-Type: application/json' \
+      -d '{"expression":"window.__TAURI__ ? window.__TAURI__.core.invoke(\"get_access_token_for_websocket\") : invoke(\"get_access_token_for_websocket\")","await_promise":true}' > "$R/mint3"   # (source: runner-eval)
+    T=$(envelope_first_present runner-mint data.value,data.result.value,data "$R/mint3") \
+      && printf 'Authorization: Bearer %s\n' "$T" > "$AUTHFILE"; unset T
+  else echo "eval door DEAD (frontendReady false or unread) - NOT signed out" >&2; fi
+fi
+# AFTER BOTH doors: an OLDER runner build hands an EXPIRED token back as a
+# success (3a or 3b). Decode `exp` (expired = exp <= now - 30, the runner's own
+# 30 s post-expiry grace, EXPIRY_LEEWAY_SECS)
+# and refuse it rather than send it - RUNNER_MINT_EXPIRED, sign in to the runner.
+if [ -s "$AUTHFILE" ]; then
+  P=$(sed -n 's/^Authorization: Bearer //p' "$AUTHFILE" | cut -d. -f2 | tr '_-' '/+'); while [ $(( ${#P} % 4 )) -ne 0 ]; do P="$P="; done
+  EXP=$(printf '%s' "$P" | base64 -d 2>/dev/null | grep -o '"exp": *[0-9]*' | grep -o '[0-9]*$')
+  if [ -n "$EXP" ] && [ "$EXP" -le $(( $(date +%s) - 30 )) ]; then
+    echo "RUNNER_MINT_EXPIRED: the runner's coord credential has expired - sign in to the runner (an older build returned it as a success; not used)" >&2; rm -f "$AUTHFILE"
+  fi
+  unset P EXP
+fi
 
-curl -sS -X POST http://127.0.0.1:9876/ui-bridge/control/page/evaluate \
-  -H 'Content-Type: application/json' \
-  -d '{"expression":"window.__TAURI__ ? window.__TAURI__.core.invoke(\"get_access_token_for_websocket\") : invoke(\"get_access_token_for_websocket\")","await_promise":true}'   # (source: runner-eval)
-
-# Then read the corpus, staging the bearer OFF argv into $AUTHFILE:
-curl -sS --get 'https://api.qontinui.io/api/v1/plan-library' \
-  --data-urlencode 'kind=plan' --data-urlencode 'slug=<stem>' -H @"$AUTHFILE"
+# Then read the corpus, the bearer staged OFF argv in $AUTHFILE. No bearer at
+# all (3a gave no token, and 3b did not fire or minted nothing) is its own UNKNOWN - name
+# it, rather than let curl's unreadable -H file surface as an empty body:
+if [ -s "$AUTHFILE" ]; then
+  curl -sS -w '%{stderr}HTTP %{http_code}\n' --get 'https://api.qontinui.io/api/v1/plan-library' \
+    --data-urlencode 'kind=plan' --data-urlencode 'slug=<stem>' -H @"$AUTHFILE" > "$R/p"
+  envelope_collection 'web /api/v1/plan-library' items "$R/p"   # `total` is the UNPAGED total
+else echo "UNKNOWN: no bearer minted (Door 3a/3b) - plan-library NOT read" >&2; fi
+rm -rf "$R"                                                    # the bearer goes with it
 ```
 
 Two independent sessions on 2026-08-25 both reported PLAN-STATUS UNKNOWN off a
@@ -1717,8 +2556,8 @@ far below Door 2's `ls-tree` count is a FROZEN corpus; write that observation.
 **The cache is the last rung, and only where a PowerShell interpreter exists**
 (`pwsh` on Linux via `scripts/install-pwsh-linux.sh`; where none is present
 `scripts/capability-doctor.sh` reports the renderer INOPERATIVE, and it is not a
-degraded arm at all). `$QONTINUI_PLAN_CACHE_DIR` (default
-`C:/claude/plan-corpus-cache/`, `${XDG_CACHE_HOME:-~/.cache}/qontinui/plan-corpus-cache/`
+degraded arm at all). `$QONTINUI_PLAN_CACHE_DIR` (unset: the
+renderer's platform default, `${XDG_CACHE_HOME:-~/.cache}/qontinui/plan-corpus-cache/`
 on Linux) — `PLANS-CACHE.md` for the index, `bodies/<kind>__<slug>.md` for
 bodies. Refresh with `scripts/render-plan-cache.ps1 -MaxAgeHours 0`; it dials
 the deployed backend unless `-ApiBase` or the runner's backend variables say
@@ -1727,8 +2566,8 @@ rewrites only the header's `Last attempt:` line.
 
 Its sidecar `PLANS-CACHE.state.json` records what the last attempt SAW, never
 what it meant: `render_exit_reason` is one of `http_<code>` (`http_404`,
-`http_401`, ...), `transport_error`, `empty_response`, `no_credential`,
-`runner_headless`, `mint_door_refused`, `mint_transport_failed`,
+`http_401`, ...), `transport_error`, `empty_response`, `paging_incomplete`, `no_credential`,
+`runner_mint_expired`, `runner_headless`, `mint_door_refused`, `mint_transport_failed`,
 `skipped_fresh`, `write_failed` or `ok`, with `attempt_url` beside it — the URL
 that answered — and, on a 404 against a loopback base, `checkout_probe`, the
 shared checkout-staleness module's observation about this box's qontinui-web
@@ -1810,6 +2649,21 @@ Enter 3c **only when 3a and 3b each returned a definite no.** An UNKNOWN from
 either — an unreachable deploy config, an unreadable corpus, an unrendered cache
 — routes to the UNKNOWN handling above, never here.
 
+**Read the fleet policy before you write a line of the plan.** Plans authored
+without it keep making decisions the engineering and other policies already
+decide. Fetch FRESH — never from memory, they version frequently:
+`coord_list_prompt_documents`, then `coord_get_prompt_document` (kind `policy`)
+for at least `engineering-priorities`, `planning-and-scope`, `plan-discipline`,
+`implementation-priorities`, `testing`, `verification-and-evidence`,
+`operating-rules`, `security-and-autonomy`, `production-and-cost` and
+`git-operations`, plus `ux-priorities` when the work touches a user-facing
+surface. Where those tools are not visible, `/policy list` / `/policy get policy
+<name>` reads the same documents. Apply them: every design choice a clause
+decides is written to that clause, with `[policy: <doc>/<clause>]` beside it, and
+a plan never contradicts a clause silently. If a document cannot be read, say so
+in the plan as `Policy review: UNKNOWN (<what failed>)` — an unread policy is not
+a policy that said nothing.
+
 Only now author a new plan. It must state the **capture gap** it closes, in those
 terms: what information the loop lost, where it should have been stored, and what
 surface is missing. A plan that describes only the symptom ("a session forgot X")
@@ -1830,13 +2684,70 @@ Lead with the verdict, one line, in this command's own terms:
 
 > **Unattended verdict: COMPLETE / INCOMPLETE — N units, M converted, K still DROPPED.**
 
+The work verdict says whether this session's units survive an unread session.
+The classification table decides it, not the policy read, with the one
+exception below.
+
+The next two lines are required, in this exact shape, directly under the
+verdict:
+
+> **Fleet policy read this run (self-reported):** planning-and-scope@<s>, session-protocol@<s>, operating-rules@<s>, verification-and-evidence@<s>, memory-and-notes@<s>, coordination@<s>, escalation-bar@<s>, git-operations@<s>
+>
+> **Policy-read confidence: FULL / PARTIAL** — stop decisions: <none, or each one as `<row> — <marker>`, markers below>
+
+Each `<s>` is one of the Step 0 states:
+
+- `<v> fetched`;
+- `<v> held (<where>)`, where `<where>` points to the earlier fetch (the tool
+  call and roughly when) or names `runner-injected`;
+- `NOT READ`.
+
+`<v>` is always the `current_version` from this run's listing.
+
+**The stop-decision list is derived, not declared.** It is every item that
+matches a Step 0 stop-decision item in the classification table, in the
+footer, or in this session's own actions. For the actions, read the
+transcript (Step 1 source 4): every `coord_ask_question`, `/ask-operator`,
+`/blocked` and operator hand-off it shows counts, even when the unit it was
+about later LANDED. The list includes:
+
+- every `IMPEDED (operator_reserved)` row;
+- every `(no_agent_door)` row, and every decision that a step has no agent
+  door;
+- every `question_id` and every operator hand-off;
+- every declined, deferred or handed-back item, including a scope cut;
+- every POLICY_GAP taken in place of an action;
+- every footer `deferred` row.
+
+Each listed stop decision carries exactly one marker: `checked`,
+`re-checked (upheld)`, `re-checked (reversed → <state>)` or
+`re-checked (reversal unfinished → DROPPED)`. A bare `re-checked` has no
+outcome and counts as no marker.
+
+Confidence is FULL only when every document reads `fetched` or `held`, and,
+when there is any stop decision, only when every document reads `fetched`.
+Otherwise it is PARTIAL.
+
+The policy read changes the work verdict in these three cases only. Each
+makes it INCOMPLETE, whatever else the table says:
+
+1. there is a stop decision, and a document does not read `fetched`;
+2. `none` is written while the derived list has an item;
+3. a listed stop decision carries no marker.
+
+With no stop decision, a PARTIAL confidence leaves the work verdict as the
+table decides it. Never fold a policy-read gap into the work verdict in any
+other case. An INCOMPLETE that means "an audit step was
+skipped" cannot be told apart from one that means "work is owed", and a verdict
+that fires on a formality stops being read.
+
 Then:
 
 1. **The classification table** — every unit, its terminal state, and its
    evidence (landed SHA, `gate_id`, `finding_id`, memory id, plan slug). **A
    row without evidence is DROPPED**, regardless of what it claims.
-2. **Policy conformance** (Step 1b) — per clause, with the document versions read
-   in Step 0.
+2. **Policy conformance** (Step 1b) — per clause, with the closeout versions
+   from the fleet policy read line.
 3. **Conversions performed** — gates registered *and read back*, findings
    posted (each with the transport that actually carried it), memories written,
    plans authored; each with its identifier.
@@ -1865,13 +2776,21 @@ Then:
    Report the reason **verbatim**, with the sidecar's `attempt_url` beside it,
    and do not translate either into a cause: the field holds what the last
    attempt SAW — `http_<code>`, `transport_error`, `empty_response`,
-   `no_credential`, `runner_headless`, `mint_door_refused`,
+   `no_credential`, `runner_mint_expired`, `runner_headless`, `mint_door_refused`,
    `mint_transport_failed`, `skipped_fresh`, `write_failed` or `ok` — and a
    `checkout_probe` observation where a 404 came from a loopback base. **None**
    of those is evidence the plan library is unshipped, and rendering an
    `http_404` as "the route does not exist" is the absence-vs-unknown
    conflation this whole step exists to prevent. Quote whatever you actually
    read rather than forcing it into a vocabulary from this document.
+
+9. **Process reap (Step 1c)** — the headline that step computed, verbatim, with
+   its collateral check. `PROCESS REAP UNKNOWN` is a real outcome and is
+   reported as itself, never softened to "nothing to reap": the two are
+   indistinguishable in a background listing, which is the whole reason that
+   step exists. For each process it killed, say whether a verdict was
+   transferred out of the artifact first or whether the unit it carried went
+   back to the classification table as UNKNOWN.
 
 ### Honesty rules for the report
 
@@ -1901,7 +2820,7 @@ uses, so the two writes can never disagree:
 | Step 1 outcome | Outcome to post |
 |---|---|
 | every unit LANDED / WATCHED / RECORDED | `work_completed` |
-| any unit IMPEDED or DROPPED | `work_abandoned`, detail = the reason |
+| any unit IMPEDED, RECEIPTED-UNVERIFIED or DROPPED | `work_abandoned`, detail = the reason |
 
 A residual DROPPED item you could not convert counts as DROPPED here exactly as
 it does in Step 5. An audit that classified everything as converted **because**
@@ -1931,17 +2850,27 @@ escalation.
 (`$COORD_HTTP_URL` defaults to `https://coord.qontinui.io`):
 
 ```bash
+W=<workspace-root>/qontinui-claude-config; . "$W/scripts/lib/envelope.sh"; R=$(mktemp -d)
+: "${COORD_HTTP_URL:=https://coord.qontinui.io}"
+# Both calls DECLARE their rung - coord's agent routes, reached directly -
+# and this command as the reporter (plan
+# 2026-09-20-first-rung-coord-reachability-is-unmeasured-then-unfixed).
 # every unit LANDED / WATCHED / RECORDED
-curl -sS -X POST \
+curl -sS -w '%{stderr}HTTP %{http_code}\n' -X POST \
   "$COORD_HTTP_URL/coord/gates/$GATE_ID/continuation-consumed" \
   -H 'Content-Type: application/json' \
-  -d "{\"device_id\":\"$GATE_DEVICE_ID\",\"outcome\":\"work_completed\"}"
+  -H 'x-qontinui-transport: http_agent_door' -H 'x-qontinui-reporter: unattended' \
+  -d "{\"device_id\":\"$GATE_DEVICE_ID\",\"outcome\":\"work_completed\"}" > "$R/o"
+envelope_require 'POST /coord/gates/<id>/continuation-consumed' outcome_recorded "$R/o"   # what coord PERSISTED
 
-# any unit IMPEDED or DROPPED - detail is ONE line, naming the items
-curl -sS -X POST \
+# any unit IMPEDED, RECEIPTED-UNVERIFIED or DROPPED - detail is ONE line, naming the items
+curl -sS -w '%{stderr}HTTP %{http_code}\n' -X POST \
   "$COORD_HTTP_URL/coord/gates/$GATE_ID/continuation-consumed" \
   -H 'Content-Type: application/json' \
-  -d "{\"device_id\":\"$GATE_DEVICE_ID\",\"outcome\":\"work_abandoned\",\"detail\":\"<the IMPEDED/DROPPED items and why>\"}"
+  -H 'x-qontinui-transport: http_agent_door' -H 'x-qontinui-reporter: unattended' \
+  -d "{\"device_id\":\"$GATE_DEVICE_ID\",\"outcome\":\"work_abandoned\",\"detail\":\"<the IMPEDED/RECEIPTED-UNVERIFIED/DROPPED items and why>\"}" > "$R/o"
+envelope_require 'POST /coord/gates/<id>/continuation-consumed' outcome_recorded "$R/o"   # compare by PREFIX
+rm -rf "$R"
 ```
 
 `work_completed` is persisted **bare** — coord carries no detail on it, so the
@@ -2066,20 +2995,90 @@ runner rebuild it does not reappear among the sessions asking to be resumed.
 That is the whole point — an operator rebuilding a runner should be handed the
 work that is still open, not everything that ever ran.
 
+### A session finishes before its plan does
+
+The authority is served policy `finished-criteria`; read it live, this section
+only applies it. A **plan** is finished when every PR implementing it is merged
+or closed. A **session** that authored PRs is finished once those PRs are
+**pushed and nothing it can act on right now remains**, and each is in coord's
+hands [policy: `finished-criteria` `session-finished-at-green-not-at-merged`,
+tightened by operator decision 2026-10-17: checks still RUNNING on the last
+push no longer hold the session open]. Waiting is never owed work: the session
+does not poll CI, wait for a merge, or stay alive to watch. Coord observes
+check results by webhook and pushes red to the author — its `ci_rework` prompt
+to a live author, its `pr_fix` fixer lane for a dead one — merges, and
+dispatches `stuck_pr_nudge`; `/babysit-prs` is a separate activity in its own
+session [policy: `finished-criteria`
+`finishing-is-a-handoff-not-an-abandonment`].
+
+So, per PR this session opened:
+
+- **Pushed, not yet merged** (checks still running or queued on the last push,
+  green, queued for land, BEHIND, or UNSTABLE because `main` moved — a
+  textual conflict is the owed case below, not this one)
+  → **WATCHED**, once Step 1's evidence holds: a read-back `pr_merged` gate
+  (register one if none exists). It never holds the session open.
+- **Red, but not a code error** → also **WATCHED**, not IMPEDED, when EVERY
+  failing check is one of: a job refused before it ran (`runner_name: ""`,
+  `steps: 0`), a job abandoned or starved in a queue, or a real failure that a
+  pristine-`main` control proves pre-existing
+  [policy: `finished-criteria` `a-red-check-is-not-automatically-a-code-error`].
+  Name the class in the row, and cite the `finding_id` or `alert_key` that
+  records the shared condition (a refused pool, a red `main`) as a RECORDED
+  companion: a `pr_merged` gate behind a broken `main` may never fire, and a
+  chat mention is not durable [policy: `escalation-bar`
+  `surface-unchased-anomalies`].
+- **Red for a code reason in this session's diff** — a check its OWN push
+  turned red, already concluded when you look — or a defect in it this
+  session knows of → owed. Fix it in this session and push; the PR is then
+  classified again by these bullets.
+- **Textual conflict** — `coord_pr_status` reads
+  `rebase_block_disposition: author_acts` → owed, **not** watched: coord never
+  proposes a conflicting PR, so no lane acts and no `pr_merged` gate can fire.
+  Rebase and push once — that is not babysitting — and the PR is then
+  classified again by these bullets
+  [policy: `finished-criteria` `a-textual-conflict-is-owed-not-watched`].
+  `mergeable: false` alone decides nothing. When the branch's author session is
+  gone, adopt by route-around [policy: `git-operations`
+  `abandoned-pr-branch-is-adoptable-by-route-around`].
+
+**An owed PR is never WATCHED.** A `pr_merged` gate on it does not make it
+WATCHED: on a conflict no land can fire it, and on a code-red head it waits on
+work nobody else owes. An owed PR still unfixed at close is **DROPPED**, and so
+holds the session open through the gate below. Step 2 cannot convert it either:
+no gate, finding, memory or plan discharges an owed PR. Only the fix or the
+rebase does, or an IMPEDED row that meets Step 1's own evidence rules.
+
+A plan whose PRs are all pushed but unmerged is **not** stamped SHIPPED by this
+session. The plan stays IN PROGRESS; coord's land plus the work-unit citations
+derive `shipped` [policy: `plan-discipline`]. What this session still owes is a
+citation on its work unit for every PR it opened, so that derivation can happen
+[policy: `finished-criteria` `finishing-is-a-handoff-not-an-abandonment`]. A
+missing citation is a DROPPED unit until it is recorded.
+
 ### The gate
 
-**Mark the session finished UNLESS Step 1 classified any unit as IMPEDED or
-DROPPED.**
+**Mark the session finished UNLESS Step 1 classified any unit as IMPEDED,
+RECEIPTED-UNVERIFIED or DROPPED.**
 
-Those two are exactly the states that mean a human must return. LANDED, WATCHED
+Those are exactly the states that mean a human must return. LANDED, WATCHED
 and RECORDED are all "this is in a durable store and will be picked up without
-me"; IMPEDED and DROPPED are not. So:
+me"; IMPEDED and DROPPED are not, and neither is RECEIPTED-UNVERIFIED until a
+session with a read-back door confirms the id. So:
 
 | Step 1 outcome | Action |
 |---|---|
-| every unit LANDED / WATCHED / RECORDED AND Step 4.9 headline `SAFE TO CLOSE` | **finish** the session |
-| any unit IMPEDED or DROPPED | **leave it unfinished**, and say which items held it open |
+| every unit LANDED / WATCHED / RECORDED (an open pushed PR that is not owed — green, or with checks still running — counts as WATCHED once its `pr_merged` gate is read back; an owed PR never does) AND Step 4.9 headline `SAFE TO CLOSE` | **finish** the session |
+| any unit IMPEDED, RECEIPTED-UNVERIFIED or DROPPED | **leave it unfinished**, and say which items held it open |
 | Step 4.9 headline `NOT SAFE` / `UNKNOWN` | **leave it unfinished**, and name the trees |
+
+**An open PR is not a reason to leave the session unfinished** (operator
+instruction 2026-10-08, now served as `finished-criteria`). The per-PR rules
+are in "A session finishes before its plan does" above: what holds the session
+open is only an owed PR (the bullets above), a missing work-unit citation, or
+the other states in the table. Do not keep a session
+alive to poll CI, to wait for running checks to conclude, or to wait for a land:
+a wait is a gate, never a kept-alive session.
 
 A residual DROPPED item you could not convert (Step 2) counts as DROPPED here —
 converting it is what would have cleared the gate, and reporting it as converted
@@ -2115,10 +3114,39 @@ never recorded as finished.
 > `2026-09-04-closeout-commands-have-no-subagent-arm-and-finish-their-parent`.
 
 Run **`/finish-session`** with a reason naming the audit result, e.g.
-`--reason "unattended: 7 units, all landed"`. It runs the transport cascade and
-handles the id resolution.
+`--reason "unattended: 7 units, all landed"`, and enter it at **Part A** —
+never past it. Part A's steps 0 / 0.5 / 1 / 1a (the subagent stop, the
+live-claims fence, the ownership check) run BEFORE any write, and a
+path-addressed door finishes exactly the id it is given, so a wrong id, or a
+session still holding claims, is still a wrong finish. `/finish-session` then
+runs the transport cascade, and its first rung (Part B Step 1) is the runner's
+path-addressed door: the target is the URL path, and it names no work unit.
 
-If you write it directly instead, **pass `claude_code_session_id` explicitly**,
+That rung is shown here for reference only, so the door is visible from this
+step. **Do not run it yourself** — `/finish-session` Part B Step 1 makes exactly
+this call, behind a `/health` probe, after Part A:
+
+```text
+POST http://127.0.0.1:9876/sessions/<your-own-harness-session-id>/finish
+     {"reason": "unattended: <N> units, all landed"}      # --undo: {"finished": false}
+```
+
+Its answer is read by `/finish-session` Part B Step 1's table, not by its
+status line, branching on `changed` first. `changed: "marker"` with
+`coord.queued: true`, read back `finishSynced: true` (after the table's
+wait-and-re-read when the first read-back shows the write re-queued), is done,
+and so is a `"none"` / `"reason_only"` with `finishSynced: true` (already
+finished and synced). A `404`, a `"marker"` with `coord.queued: false`, a
+`"none"` / `"reason_only"` with `finishSynced: false` and `coord.queued: false`,
+a `finishSynced` still false after that re-read, a body with no `coord` key, or any other status or an empty
+body means the coord half is still owed, and the cascade continues. `9876` is the primary runner's port; Part B Step 1 says when to use
+another.
+
+If you write the coord half directly with `coord_report_status` instead, make
+it progress-only (`session_status` plus the id, no `work_unit_id`,
+`correlation_topic` or `status_text`). If that is refused
+`missing required argument`, pass all three for what this session was actually
+working on, never a placeholder. And **pass `claude_code_session_id` explicitly**,
 and pass **your own** — not whatever `~/.qontinui/agent_session_id` happens to
 hold, which is box-global and has twice been measured pointing at a live peer.
 An unscoped call is refused outright (`harness_session_id_required`); there is no
@@ -2128,13 +3156,23 @@ their resume set.
 
 **When that scoped write is refused, read WHICH refusal you got.** Since
 `qontinui-coord#2052` there are two strings with two different remedies:
-`caller_owns_no_active_session` (absence — *"Register one with `POST /sessions`
-and re-report"*) and `session_not_owned_by_caller` (you own rows, this id
+`caller_owns_no_active_session` (absence — as served at `qontinui-coord`
+`07a192bae`: *"Register one YOURSELF: call `coord_bind_self_session` with that
+same `claude_code_session_id` and `create_if_absent: true`, then re-report"*,
+and it warns that hand-registering through `POST /sessions` takes device and
+tenant from the request body, so a guessed value makes a row your own reads
+never see) and `session_not_owned_by_caller` (you own rows, this id
 resolved to none — *"a row whose `claude_code_session_id` is still NULL is
-invisible to this resolver, and is repaired by
-`POST /coord/sessions/bind-harness-session`"*). The second no longer means "owns
-no row for this device"; that gloss predates `#2052`. Both are expanded, with the
-terminal state to report, in the two-failure split at the end of this step.
+invisible to this resolver, and is repaired by `coord_bind_self_session` (or its
+HTTP twin `POST /coord/sessions/bind-harness-session`)"*). The second no longer
+means "owns no row for this device"; that gloss predates `#2052`. Either way the
+next move is the same. For a runner-hosted session whose `/finish-session`
+run has NOT already taken the runner rung, take it (through `/finish-session`,
+not by hand), which does not consult this predicate. When that rung left the
+coord half owed, a runner-hosted session does NOT create a row — `/finish-session`
+Part A step 1b's runner-hosted arm is the terminal state. An operator-launched
+session **binds its own row, then re-issues the write** — the same step 1b. Both strings are expanded, with the remedy and
+the terminal state that remains, in the two-failure split at the end of this step.
 
 ### What this step is NOT
 
@@ -2147,19 +3185,23 @@ terminal state to report, in the two-failure split at the end of this step.
 
 ### Reporting it
 
-Add one line under the Step 4 verdict:
+Add one line under the Step 4 verdict, after its two policy-read lines:
 
 > **Session marked finished** — carried by <rung>, read back <where>.
 
 or, when the gate held:
 
-> **Session left UNFINISHED** — <N> IMPEDED / <M> DROPPED: <the items>.
+> **Session left UNFINISHED** — <N> IMPEDED / <R> RECEIPTED-UNVERIFIED / <M> DROPPED: <the items>.
 
 or, when Step 4.9 held it:
 
 > **Session left UNFINISHED** — Step 4.9 headline `<NOT SAFE | UNKNOWN>`: <the trees>.
 
-All three are complete outcomes. A session left unfinished because work genuinely
+All of these, and the terminal lines further down ("Session NOT finished — bind
+attempted and failed" and, runner-hosted, "Session coord half NOT written —
+runner-hosted, own row unbound"), are complete outcomes. When the runner rung
+marked the session but coord was not told, add *"resume set corrected locally;
+coord NOT told"* to whichever line you write. A session left unfinished because work genuinely
 remains is this step working, not failing.
 
 **Bookkeeping, so it never blocks.** This write is visibility, not correctness.
@@ -2169,13 +3211,23 @@ a session reported finished on the strength of an unverified write is exactly
 the false-completeness this whole command exists to prevent.
 
 ⚠️ **"Every rung probed and unavailable" is not one failure — say which of two
-you hit.** `/finish-session`'s cascade is **two** rungs, not three (the
-runner-local `POST /sessions/<id>/finish` was deleted 2026-09-05: it existed on
-no runner build, upstream included — plan
-`2026-09-03-a-finished-session-cannot-record-that-it-finished`). Both remaining
-rungs carry the SAME tool to the SAME server over different transports, so a
-cascade that ends without a write means one of two things, with different
-remedies and different write-ups:
+you hit.** `/finish-session`'s cascade is **three** rungs, runner-local first:
+`POST /sessions/<id>/finish` on the runner, then `coord_report_status` natively,
+then the same tool over the loopback proxy. The dated history: the runner route
+was absent from every build on 2026-09-05, so plan
+`2026-09-03-a-finished-session-cannot-record-that-it-finished` removed it from
+the commands. It landed on 2026-09-10 as `qontinui-runner` `44870ff25` (#1271).
+Plan
+`2026-09-20-the-one-finish-door-that-names-its-target-in-the-path-is-disowned-by-both-closeout-commands`
+put it back first, and makes it coord-reaching and self-describing on a runner
+build carrying that plan's Phase 1. An older build answers with no `coord` key,
+and its coord half is UNKNOWN. The last two
+rungs carry the SAME tool to the SAME server over different transports. So once
+the runner rung is absent (`404`, not runner-hosted) or has left the coord half
+owed, a cascade that ends without a coord write means one of two things, with
+different remedies and different write-ups. When the runner rung answered
+`coord.queued: false`, say *"resume set corrected locally; coord NOT told"*
+beside whichever of the two it was:
 
 - **A transport floor** — no door answered. Run `/coord-revive`, re-issue over
   the door it reports LIVE, and treat a `"Command failed with no output"` write
@@ -2193,14 +3245,29 @@ remedies and different write-ups:
     active `coord.sessions` row at all, so nothing here is a permission problem.
     Coord's own hint: *"this is ABSENCE, not an authorization violation: there is
     no peer's row you reached for … The usual cause is a session that was not
-    runner-spawned, so coord was never told it exists. **Register one with
-    `POST /sessions` and re-report.** Do NOT retry without the argument."*
+    runner-spawned, so coord was never told it exists. **Register one YOURSELF:
+    call `coord_bind_self_session` with that same `claude_code_session_id` and
+    `create_if_absent: true`, then re-report.** … Do NOT retry without the
+    argument."* (as served at `qontinui-coord` `07a192bae`). Never hand-register
+    a row through `POST /sessions`: it takes device and tenant from the request
+    body, and a guessed value creates a row your own reads cannot see. On the
+    runner-hosted arm, `/finish-session` step 1b still does not create (it says
+    why); the remedy above is the operator-launched arm's.
   - **`session_not_owned_by_caller`** — you own rows; this id resolved to none of
-    them. Coord's own hint: *"If you DO own an active session, check whether its
-    row is simply UNBOUND before assuming you mistyped the id: a row whose
-    `claude_code_session_id` is still NULL is invisible to this resolver, and is
-    **repaired by `POST /coord/sessions/bind-harness-session`** — not by
-    re-sending a different UUID."*
+    them. Coord's own hint (served from `qontinui-coord` `59fcdb564` and still served
+at `07a192bae`, until qontinui-coord#2608 lands): *"If you
+    DO own an active session, check whether its row is simply UNBOUND before
+    assuming you mistyped the id: a row whose `claude_code_session_id` is still
+    NULL is invisible to this resolver, and is **repaired by
+    `coord_bind_self_session` (or its HTTP twin
+    `POST /coord/sessions/bind-harness-session`)** NAMING THAT ROW as
+    `coord_session_id` — not by re-sending a different UUID."* That same hint
+    goes on to argue against the create arm on the strength of
+    the device owning rows at all. The device's rows are not the question; an
+    unbound row belonging to THIS session is, and only a runner-hosted session
+    can have one. The discriminator is the `$QONTINUI_RUNNER_CONTEXT` branch
+    before the call and `unbound_sibling_rows` after it — `/finish-session`
+    Part A step 1b.
 
   ⚠️ **This string no longer means "owns no row for this device."** That was true
   before `#2052` (landed `3014d7c6`, 2026-09-09) split absence out, and it is the
@@ -2209,20 +3276,59 @@ remedies and different write-ups:
   `session_not_owned_by_caller` carries **no** diagnostic weight and the split
   above does not apply — check the serving build before reading it as "owns rows".
 
-**On the authorization verdict, record the honest terminal state — this is a
-CHECKED step, not prose.** When the refusal is `session_not_owned_by_caller` and
-the id you sent was your own `$CLAUDE_CODE_SESSION_ID`, the outcome line is:
+**On the authorization verdict, BIND FIRST — this is a CHECKED step, not
+prose.** When either refusal came back for your own `$CLAUDE_CODE_SESSION_ID`,
+first make sure the runner rung above was tried if you are runner-hosted. A
+`coord.queued: true` there, read back `finishSynced: true`, settles the coord
+half with no bind and no fork risk. Otherwise run `/finish-session` Part A
+step 1b before writing any outcome line. In one
+line: branch on `$QONTINUI_RUNNER_CONTEXT` (empty: call
+`coord_bind_self_session` with `create_if_absent: true`, read `unbound_sibling_rows`
+in the answer and name a non-zero value as a possible fork; non-empty: do NOT
+create — the runner binds its own row, as Step 4.9 says — and report the session
+not finished, runner-hosted, own row unbound). Never bind a row picked out of
+`coord_orient`'s `session_activity` — those rows carry no harness id, so a pick
+can bind a PEER. Read the binding back with `coord_orient`
+(`your_session.coord_session_id` non-null), re-run Step 4.9's
+`worktree-handoff.sh` for any tree it reported `coord_row_unbound` (and re-print
+the verdict with the re-run's `transcript:` line in place of the old one), then
+re-issue the finish. The full recipe — including the `coord-revive.sh call` fallback and its
+cwd trap — lives there, once; do not copy it here.
 
-> **Session NOT finished — owns rows, none bound.** `<session id>` on device
-> `<device id>`; coord answered `session_not_owned_by_caller`. The remedy
-> (`POST /coord/sessions/bind-harness-session`) needs the `coord_session_id`
-> this caller cannot learn. Dossier
+**The terminal state is what remains after that attempt**, and it has four
+shapes: the session is runner-hosted (no create, by rule), the bind itself was
+refused, no door carried it, or the bind answered and yet the read-back after
+it still does not resolve `your_session` (including a
+`subject_already_registered: true` whose row is not yours to write). Name that
+fourth shape "bind's read-back did not resolve" in the line below. The outcome line
+is then:
+
+> **Session NOT finished — bind attempted and failed.** `<session id>` on device
+> `<device id>`; the finish write was refused `<reason>`, and
+> `coord_bind_self_session` was then <refused `<its reason>` | not carried:
+> `<the door failure>` | answered, but its read-back did not resolve:
+> `<coord_orient's your_session.reason>`>. Dossier
 > `finish-session-no-safe-rung-for-unregistered-session`.
 
-Record it on that dossier as the next occurrence — a finding ON the dossier, not
-a fresh unattached one; this condition has recurred a dozen times across two
-devices and an unattached finding starts the count over. Quote the reason string,
-the serving build id, and the transport that carried the call.
+On the runner-hosted arm, where no bind is attempted, the line is instead:
+
+> **Session coord half NOT written — runner-hosted, own row unbound.** `<session
+> id>` on device `<device id>`; runner rung: `<Step 1's answer — coord.reason or
+> status; "resume set corrected locally; coord NOT told" when it marked>`; the
+> finish write was refused `<reason>`, and the runner's own row is not bound to
+> this harness id. No row was created (Step 4.9's rule).
+> Dossier `finish-session-no-safe-rung-for-unregistered-session`.
+
+A bind that succeeded on the operator-launched arm but reported a non-zero
+`unbound_sibling_rows` is not a terminal state — it is a finished session with a
+possible fork to name in the report beside it.
+
+Only then, record it on that dossier as the next occurrence — a finding ON the
+dossier, not a fresh unattached one; this condition has recurred across devices
+and an unattached finding starts the count over. Quote the finish write's reason
+string, the bind's reason or door failure, the serving build id, and the
+transport that carried each call. A dossier occurrence recorded **instead of**
+attempting the bind is the failure this step exists to stop.
 
 ⛔ **Do not reach for `~/.qontinui/agent_session_id` to make the write succeed.**
 It is box-global and has twice resolved to a LIVE peer; `/finish-session` step 1a

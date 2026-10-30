@@ -19,6 +19,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type { CommandResponse } from "../../types";
+import { describeThrown } from "@/lib/utils";
 
 export interface AiLaunchCommand {
   /** Full command to type into the PTY (no trailing newline). */
@@ -34,9 +35,10 @@ export async function buildAiLaunchCommand(params: {
   sessionId: string;
 }): Promise<AiLaunchCommand> {
   const { configDir, isWindows, sessionId } = params;
-  const resp = await invoke<
-    CommandResponse<{ command: string; pinnedSessionId: string | null }>
-  >("build_ai_launch_command", { configDir, sessionId, isWindows });
+  const resp = await invoke<CommandResponse<{ command: string; pinnedSessionId: string | null }>>(
+    "build_ai_launch_command",
+    { configDir, sessionId, isWindows },
+  );
   const data = resp.data;
   if (!data) {
     throw new Error(resp.message ?? "build_ai_launch_command returned no data");
@@ -77,7 +79,7 @@ export async function buildAiLaunchCommandForTab(
   try {
     return await buildAiLaunchCommand(params);
   } catch (e) {
-    const detail = e instanceof Error ? e.message : String(e);
+    const detail = describeThrown(e, "Failed to build AI launch command");
     // Logged as well as toasted: the toast is dismissible and the operator may
     // not be looking, but a launch that produced no session must leave a trace.
     console.error(`[LaunchAI] launch-spec build failed for ${tabId}: ${detail}`);

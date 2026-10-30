@@ -17,6 +17,8 @@
  *   - `terminal.maximize`    — `/maximize [<n>]`
  *   - `terminal.close`       — `/close [<n>]`
  *   - `terminal.layout`      — `/layout <preset>`
+ *   - `terminal.mode`        — `/terminal.mode [grid|tmux]` (alias `/work-mode`;
+ *                              no argument toggles)
  *   - `terminal.restart`     — `/restart [<n>]`
  *   - `terminal.swap`        — `/swap <a> <b>`
  *
@@ -35,11 +37,11 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-
 import { instanceStorage } from "@/lib/instance-storage";
 import { writeClipboard } from "@/lib/clipboard";
 
 import {
+  usePageSessionGetter,
   useTerminalSession,
   useTransitionEffects,
   useUIStateCx,
@@ -49,21 +51,28 @@ import type { AccountUsageInfo } from "../useSessionManager";
 import { compareByUsageHeadroom } from "../../settings/types";
 import type { ResultCardSpec, ResultCardSection } from "../result-card";
 import { buildMetricsCardSpec, buildHistoryCardSpec } from "../result-card";
-import type { CommandResponse } from "../types";
+import { displayNameOf, getSessionLedgerReport, type LedgerEntry } from "@/lib/session-ledger";
 import {
-  extractLiveSessions,
-  groupByAccount,
-  sharedSessionIds,
-  type LiveClaudeSession,
-} from "../liveClaudeSessions";
-import { computeAutoGrowLayoutId, FLOW_GRID_ID, LAYOUT_PRESETS } from "../useZoneLayout";
+  computeAutoGrowLayoutId,
+  FLOW_GRID_ID,
+  LAYOUT_PRESETS,
+  resolveLayoutArg,
+} from "../useZoneLayout";
 import type { CommandAction, CommandResult, ResolverContext } from "./types";
 import { readTextArg, textArg } from "./parse";
 import { useCommandAction } from "./useCommandAction";
 import { getTerminalHotStore } from "../terminalHotStore";
+import { MAXIMIZE_IN_TMUX_ERROR } from "../zone-grid/maximizeActions";
 import { useOrchestrateCommand } from "./orchestrateCommand";
 import { deriveVerdict, effect, fail, ok, stateEffect, type EffectReport } from "./verdict";
+import { describeThrown } from "@/lib/utils";
 import type { ApprovalReport } from "../approveAll";
+import {
+  WORK_MODE_NAMES,
+  applyWorkModeRequest,
+  parseWorkModeRequest,
+  type WorkModeChange,
+} from "../terminalWorkModeControl";
 
 /**
  * Inputs that can't be read from the existing React contexts — handed in
@@ -178,6 +187,9 @@ export interface TerminalCommandsContext {
   showCard: (spec: ResultCardSpec) => void;
 }
 
+/** `/copy-names` stand-in for a session with no resume line. */
+const NO_RESUME_LINE = "no resume line — the account or the working directory is unknown";
+
 /**
  * Every layout id `zoneLayout.setLayoutId` will actually accept — the
  * static preset table plus the synthesized past-9 flow grid, which is the
@@ -223,7 +235,13 @@ const SCHEMA = {
     zone: "number (1-based zone index)",
     tabId: "string (explicit tab id; takes precedence over zone)",
   },
-  layout: { preset: `string — one of ${LAYOUT_IDS.join(", ")}` },
+  layout: {
+    preset: `string — one of ${LAYOUT_IDS.join(", ")}, or a window count (number >= 1)`,
+    // Declared as a FLAG so it never shifts `preset`. Absent → the page the
+    // operator is viewing; present → that page, which need not be on screen.
+    "--page": "string (optional terminal page id; defaults to the active page)",
+  },
+  mode: { mode: `string (optional) — one of ${WORK_MODE_NAMES.join(", ")}; omitted toggles` },
   restart: { zone: "number (1-based; defaults to the currently focused zone)" },
   swap: { a: "number (1-based zone index)", b: "number (1-based zone index)" },
 } as const;
@@ -617,6 +635,31 @@ export function resolveTenantArg(
   return { error: `no tenant binding matches "${value}"` };
 }
 
+/**
+ * The `/terminal.mode` verdict. A state report whose sentence is exactly the
+ * shared acknowledgement — "entered tmux mode", "left tmux mode — grid
+ * restored" — and a noop (`·`, "work mode was already tmux") when the mode was
+ * already the requested one, unless that request still opened the Session
+ * Manager, which is then the change it reports.
+ */
+export function workModeEffect(change: WorkModeChange): EffectReport {
+  if (change.changed) {
+    return change.mode === "tmux"
+      ? stateEffect(
+          "entered",
+          "tmux mode",
+          true,
+          change.sidebarOpened ? { detail: "session manager opened" } : {},
+        )
+      : stateEffect("left", "tmux mode", true, { detail: "grid restored" });
+  }
+  return change.sidebarOpened
+    ? stateEffect("opened", "the session manager", true, {
+        detail: `already in ${change.mode} mode`,
+      })
+    : stateEffect(change.mode, "work mode", false);
+}
+
 export function useTerminalCommands(ctx: TerminalCommandsContext): void {
   const session = useTerminalSession();
   const {
@@ -633,6 +676,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     findingsActions,
     analysis,
   } = session;
+  const getPageSession = usePageSessionGetter();
   const transitionEffects = useTransitionEffects();
   // `state` is read, not just dispatched into: several handlers below derive
   // their verdict by comparing the store's CURRENT value against the value
@@ -895,6 +939,10 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     paramSchema: SCHEMA.maximize,
     patterns: [/^maximize(?:\s+(?<zone>\d+))?$/i, /^fullscreen(?:\s+(?<zone>\d+))?$/i],
     handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
+      // tmux work mode already shows one session at full size and the layout
+      // ignores maximize there: refuse by name, exactly as the UI Bridge
+      // maximize actions do, rather than report a change nothing made.
+      if (zoneLayout.workMode === "tmux") return fail("tmux-mode", MAXIMIZE_IN_TMUX_ERROR);
       const zone = resolveZone(args);
       if (zone.kind === "invalid-zone") return invalidZone(zone.raw);
       if (zone.kind === "out-of-range") return fail("out-of-range");
@@ -979,24 +1027,46 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     id: "terminal.layout",
     slash: "/layout",
     label: "Change layout preset",
-    description: `Set the zone-grid layout preset. Accepts ${LAYOUT_IDS.join(", ")}.`,
+    description:
+      `Set the zone-grid layout preset. Accepts ${LAYOUT_IDS.join(", ")}, or a window count: ` +
+      "1 single, 2 split, 3 triptych, 4 quad, 5-6 six-pack, 7-9 full-grid, 10+ flow-grid.",
     paramSchema: SCHEMA.layout,
     // Named-group form so the preset is bound to `args.preset` for both
     // pattern and slash-form invocations.
     patterns: [
-      /^layout\s+(?<preset>single|split|quad|six-?pack|full-?grid)$/i,
+      /^layout\s+(?<preset>single|split|quad|six-?pack|full-?grid|[1-9]\d?)$/i,
       /^(?<preset>single|split|quad|six-?pack|full-?grid)\s+layout$/i,
     ],
     handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
-      const preset = textArg(args, "preset").toLowerCase();
-      // Normalize "six-pack" / "sixpack" → "six-pack"; same for full-grid.
-      const normalized = preset.replace(/sixpack/, "six-pack").replace(/fullgrid/, "full-grid");
+      // ONE resolver with the `select-layout` bridge action: preset ids, their
+      // unhyphenated spellings, and a window count (`4` → quad).
       // `setLayoutId` drops an unknown id silently, so an unvalidated
       // preset here reads as success while nothing moved. Same shape as
       // /select-by-state: name the accepted set in the error.
-      if (!LAYOUT_IDS.includes(normalized)) {
-        return fail("invalid-preset", `preset must be one of: ${LAYOUT_IDS.join(", ")}`);
+      const normalized = resolveLayoutArg(textArg(args, "preset"));
+      if (normalized === null) {
+        return fail(
+          "invalid-preset",
+          `preset must be one of: ${LAYOUT_IDS.join(", ")}, or a window count of 1 or more`,
+        );
       }
+      // `--page` targets a page other than the one on screen. Every page keeps
+      // a mounted scope, so its own `zoneLayout` and `tabs` are live; an id
+      // with no scope is refused rather than falling back to the active page,
+      // which would re-grid the page the operator is looking at instead.
+      const pageArg = readTextArg(args, "page");
+      if (pageArg.kind === "invalid") return fail("no-page", "--page needs a page id");
+      const target =
+        pageArg.kind === "text" && pageArg.text !== pageId
+          ? getPageSession(pageArg.text)
+          : { zoneLayout, tabs };
+      if (target === null) {
+        return fail(
+          "no-page",
+          `no terminal page with id ${pageArg.kind === "text" ? pageArg.text : ""}`,
+        );
+      }
+      const { zoneLayout: targetLayout, tabs: targetTabs } = target;
       // Observed pre-state, read off `layoutId` (the STATE `setLayoutId`
       // writes) rather than `layout.id` (derived, and synthesized for the
       // past-9 flow grid).
@@ -1017,9 +1087,17 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       // `useZoneLayout` rather than re-derived here for the obvious reason: a
       // second copy of the capacity rule would drift from the first, which is
       // the shape of this defect one level up.
-      const grown = computeAutoGrowLayoutId(normalized, tabs.length);
+      //
+      // `/layout` is an operator request, so in tmux mode it EXITS to the grid
+      // (`useZoneLayout::setLayoutId`) — the grid it lands in is a grid-mode
+      // one, and auto-grow is predicted for grid mode accordingly. Leaving the
+      // mode is itself a change, so it never reports the noop arm, and the
+      // detail says the mode was left rather than letting the swap to a grid
+      // pass as a plain preset change.
+      const leftTmux = targetLayout.workMode === "tmux";
+      const grown = computeAutoGrowLayoutId(normalized, targetTabs.length, "grid");
       const effective = grown ?? normalized;
-      const wasAlready = zoneLayout.layoutId === effective;
+      const wasAlready = !leftTmux && targetLayout.layoutId === effective;
       // The call is UNCONDITIONAL, and deliberately so. `setLayoutId`
       // delegates to `applyLayout`, which does three things besides writing
       // the id: it clears the maximized zone, re-flows unassigned tabs into
@@ -1031,14 +1109,46 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       // for `ZoneLayoutPicker`, which routes its clicks through this handler.
       // What was dishonest was never the call; it was reporting the same `✓`
       // whether or not the PRESET moved.
-      zoneLayout.setLayoutId(normalized);
-      const detail =
+      targetLayout.setLayoutId(normalized, { source: "operator" });
+      const layoutDetail =
         grown !== null
-          ? `grew to ${grown} — ${tabs.length} sessions do not fit ${normalized}`
+          ? `grew to ${grown} — ${targetTabs.length} sessions do not fit ${normalized}`
           : wasAlready
             ? `already ${normalized}; re-applied`
             : normalized;
+      const detail = leftTmux ? `left tmux mode — ${layoutDetail}` : layoutDetail;
       return ok(effect("changed", "layout", wasAlready ? 0 : 1, { detail }));
+    },
+  });
+
+  // ── 8b. /terminal.mode ────────────────────────────────────────────────
+  // Grid ⇄ tmux work mode. The decision, the Session Manager side effect and
+  // the acknowledgement sentence all come from `applyWorkModeRequest`, the
+  // rule the CommandBar toggle, Ctrl+Shift+Y and the UI Bridge action share,
+  // so the four surfaces cannot report different things for one change.
+  useCommandAction({
+    id: "terminal.mode",
+    slash: "/terminal.mode",
+    aliases: ["/work-mode"],
+    label: "Switch terminal work mode",
+    description:
+      "Switch between grid mode (every session in a zone) and tmux mode (one session on screen, the rest live off-screen; the session manager opens as its navigator). No argument toggles.",
+    paramSchema: SCHEMA.mode,
+    patterns: [/^(?<mode>tmux|grid)\s+mode$/i, /^work\s+mode\s+(?<mode>tmux|grid)$/i],
+    handler: async (args: Record<string, unknown>): Promise<CommandResult<EffectReport>> => {
+      const parsed = parseWorkModeRequest(args.mode);
+      if (!parsed.ok) return fail("invalid-mode", parsed.error);
+      const change = applyWorkModeRequest(
+        {
+          workMode: zoneLayout.workMode,
+          enterTmuxMode: zoneLayout.enterTmuxMode,
+          exitTmuxMode: zoneLayout.exitTmuxMode,
+          showSidebar: workflowGen.showSidebar,
+          setShowSidebar: workflowGen.setShowSidebar,
+        },
+        parsed.request,
+      );
+      return ok(workModeEffect(change));
     },
   });
 
@@ -1894,70 +2004,65 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     },
   });
 
-  // 36. /copy-names — copy the open sessions' RESUME names + resume commands
+  // 36. /copy-names — copy the roster's UNFINISHED sessions + resume lines
   //
-  // Written for the rebuild loop: write the open sessions down, rebuild the
-  // primary runner, resume them. That loop needs the name Claude Code shows in
-  // its `/resume` picker plus the `clX --resume <id>` command — NOT the tab
-  // title, which is what this command originally copied.
+  // Written for the rebuild loop: write the sessions down, rebuild the runner,
+  // resume them — and for pasting the list into notes or onto another machine.
   //
-  // Source: Claude Code's OWN live-session registry, via
-  // `terminal_claude_session_list_live`. `name` there is verbatim the string
-  // the session window and `/resume` show.
+  // Source: the session ledger's CURRENT roster (`session_ledger_report`,
+  // plan `2026-10-04-runner-session-roster-restore-picker` Phase 5) — the same
+  // roster a restart restores from, so this list is what would come back.
+  // Finished sessions are skipped (a restart does not bring them back), every
+  // name is THE display-name rule, and every line is the shared
+  // `session_ledger::resume_command_for` — `cd` + `CLAUDE_CONFIG_DIR`, omitted
+  // rather than guessed when the account or the directory is unknown.
   //
-  // Two sources were tried and rejected, both measured 2026-07-23:
-  //  - `terminal_list` (`TerminalInfo.title`) — the PTY/OSC *tab* title. Of
-  //    255 live terminals, 122 were titled just `"claude"` and 24
-  //    `powershell.exe`; tab titles agreed with the real name on 0 of 21
-  //    joinable rows, and the non-generic ones are working-dir-derived and not
-  //    unique (11 sessions shared `qontinui-runner-1d`).
-  //  - `terminal_session_list_history` (`PastSession.resumeName`) — better,
-  //    but transcript-derived: it knew 33 of 80 live sessions and matched the
-  //    real window name on 11 of those 33. The transcript preview is simply a
-  //    different string from the window name.
-  //
-  // The registry covers LIVE processes only (Claude Code deletes the file on
-  // exit) — exactly right for "write down what's open before I rebuild", and
-  // cross-page by construction, so the active-page React context is no limit.
+  // It replaced Claude Code's own live-process registry, which covered only
+  // running processes (a session whose PTY had already exited during a
+  // graceful stop was missing) and could not see the finished marker.
   useCommandAction({
     id: "terminal.copy-names",
     slash: "/copy-names",
     aliases: ["/copy-sessions", "/session-names"],
-    label: "Copy live sessions + resume commands",
+    label: "Copy unfinished sessions + resume commands",
     description:
-      "Copy every LIVE Claude Code session's real name (the one shown in the " +
-      "session window and in /resume) plus its ready-to-run `clX --resume <id>` " +
-      "command, grouped by account. Save this before a restart so the sessions " +
-      "can be resumed afterwards.",
+      "Copy every UNFINISHED session on the runner's roster — the sessions a " +
+      "restart would bring back — with its name and its ready-to-run " +
+      "`cd … && CLAUDE_CONFIG_DIR=… claude --resume <id>` line, grouped by " +
+      "account. Finished sessions are skipped.",
     paramSchema: SCHEMA.empty,
     patterns: [/^copy[- ]names$/i, /^copy[- ]sessions$/i, /^session[- ]names$/i],
     handler: async (): Promise<CommandResult<{ count: number }>> => {
-      let sessions: LiveClaudeSession[] = [];
+      let roster: LedgerEntry[];
       try {
-        const res = await invoke<CommandResponse>("terminal_claude_session_list_live");
-        // Normalize at the boundary: the command wraps its payload as
-        // `{sessions:[…]}`, and a shape surprise must degrade to an empty list
-        // rather than crash the grouping below.
-        if (res.success) sessions = extractLiveSessions(res.data);
+        const report = await getSessionLedgerReport();
+        // A shape surprise is a failed read, never "no sessions".
+        if (!Array.isArray(report?.current?.sessions)) {
+          return fail("list-failed", "the session roster came back in an unrecognized shape");
+        }
+        roster = report.current.sessions;
       } catch {
-        return fail("list-failed", "could not read Claude Code's session registry");
+        return fail("list-failed", "could not read the session roster");
       }
-      if (sessions.length === 0) {
-        return fail("no-sessions", "no live Claude Code sessions found");
+      const unfinished = roster.filter((e) => !e.finished);
+      const skipped = roster.length - unfinished.length;
+      if (unfinished.length === 0) {
+        return fail(
+          "no-sessions",
+          skipped > 0
+            ? `all ${skipped} session${skipped === 1 ? " on the roster is" : "s on the roster are"} marked finished`
+            : "no sessions on the runner's roster",
+        );
       }
 
-      // The Rust reader keeps nameless rows (old CLI builds) because they
-      // still prove liveness for the restore oracle — for DISPLAY, substitute
-      // a placeholder so the label/heading is never blank.
-      const displayName = (s: LiveClaudeSession) => s.name || "(unnamed)";
-
-      // Group by account: resume commands are per-wrapper (clg/clh/clp/…), so
-      // each block stays directly runnable as a unit.
-      const byAccount = groupByAccount(sessions);
-      // Several live processes can share one session id — the restore
-      // duplication symptom. Resuming that id once will not reproduce every
-      // window, so say so rather than implying the list is 1:1.
-      const shared = sharedSessionIds(sessions);
+      // Group by account, so each block reads as one account's sessions. Every
+      // line names its account by `CLAUDE_CONFIG_DIR`, so each stays runnable
+      // on its own.
+      const byAccount = new Map<string, LedgerEntry[]>();
+      for (const e of unfinished) {
+        const label = e.accountLabel?.trim() || "account unknown";
+        byAccount.set(label, [...(byAccount.get(label) ?? []), e]);
+      }
 
       const lines: string[] = [];
       const sections: ResultCardSection[] = [];
@@ -1965,38 +2070,31 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         lines.push(`# ${label} (${list.length})`);
         sections.push({
           heading: `${label} (${list.length})`,
-          rows: list.map((s) => ({ label: displayName(s), value: s.resumeCommand })),
+          rows: list.map((e) => ({
+            label: displayNameOf(e),
+            value: e.resumeCommand ?? NO_RESUME_LINE,
+          })),
         });
-        for (const s of list) {
-          lines.push(`# ${displayName(s)}   [${s.status}]`);
-          lines.push(s.resumeCommand);
+        for (const e of list) {
+          lines.push(`# ${displayNameOf(e)}`);
+          lines.push(e.resumeCommand ?? `# ${NO_RESUME_LINE}`);
         }
         lines.push("");
       }
-      if (shared.size > 0) {
-        lines.push(`# ${shared.size} session id(s) are shared by several live processes —`);
-        lines.push("# resuming one of these ids will NOT bring back every window:");
-        for (const [id, list] of shared) {
-          lines.push(`#   ${id}: ${list.map(displayName).join(", ")}`);
-        }
-        sections.push({
-          heading: `Shared session ids (${shared.size})`,
-          rows: [...shared].map(([id, list]) => ({
-            label: id,
-            value: list.map((s) => `${displayName(s)} [pid ${s.pid}]`).join(", "),
-          })),
-        });
+      if (skipped > 0) {
+        lines.push(`# ${skipped} finished session${skipped === 1 ? "" : "s"} skipped`);
       }
       const text = lines.join("\n").trimEnd();
 
       const copied = await writeClipboard(text);
-      const n = sessions.length;
-      const ids = new Set(sessions.map((s) => s.sessionId)).size;
+      const n = unfinished.length;
       ctx.showCard({
-        title: `${n} live session${n === 1 ? "" : "s"} ${copied ? "copied" : "gathered"}`,
-        subtitle: copied
-          ? `Names + resume commands are on your clipboard (${ids} distinct session id${ids === 1 ? "" : "s"}).`
-          : "Clipboard write failed — copy them from below.",
+        title: `${n} unfinished session${n === 1 ? "" : "s"} ${copied ? "copied" : "gathered"}`,
+        subtitle:
+          (copied
+            ? "Names + resume commands are on your clipboard."
+            : "Clipboard write failed — copy them from below.") +
+          (skipped > 0 ? ` ${skipped} finished skipped.` : ""),
         sections,
         footer: {
           label: "Copy again",
@@ -2006,6 +2104,35 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         },
       });
       return copied ? ok({ count: n }) : fail("clipboard-failed", "clipboard write failed");
+    },
+  });
+
+  // ── /elevated ────────────────────────────────────────────────────────
+  // Opens a separate Administrator PowerShell window through a UAC prompt. It
+  // is not a PTY tab (see `open_elevated_terminal`), so there is no tab id to
+  // report and nothing to zone-assign.
+  useCommandAction({
+    id: "terminal.elevated",
+    slash: "/elevated",
+    aliases: ["/admin"],
+    label: "Open elevated terminal",
+    description:
+      "Open an Administrator PowerShell window (Windows UAC prompt). The window is " +
+      "separate from the runner's terminal tabs.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^(?:open\s+)?(?:elevated|admin(?:istrator)?)\s+(?:terminal|shell|powershell)$/i],
+    // It raises a UAC prompt and leaves an Administrator process the operator
+    // has to close by hand — the same spend as `terminal.spawn`. No literal
+    // slash collides with its pattern today; declared so a future one can
+    // never be silently rerouted into it by a Tier-2 pattern.
+    costly: true,
+    handler: async (): Promise<CommandResult> => {
+      try {
+        await invoke("open_elevated_terminal");
+      } catch (err) {
+        return fail("elevation-failed", describeThrown(err, "could not open elevated terminal"));
+      }
+      return ok(effect("launched", "elevated terminal", 1));
     },
   });
 

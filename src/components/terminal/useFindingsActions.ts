@@ -9,11 +9,17 @@ interface UseFindingsActionsParams {
   tabs: Array<{ id: string; workingDir?: string }>;
   terminalRefs: React.MutableRefObject<Map<string, React.RefObject<TerminalInstanceHandle | null>>>;
   createTerminal: (title?: string, workingDir?: string) => Promise<string | null>;
-  pendingResumeRef: React.MutableRefObject<{ tabId: string; resumeCmd: string } | null>;
   runGeneration: (description: string, inlineContext: string) => Promise<void>;
   setRightPanelMode: React.Dispatch<
-    React.SetStateAction<"transcript" | "workflow" | "analysis" | "findings" | "file-ownership" | null>
+    React.SetStateAction<
+      "transcript" | "workflow" | "analysis" | "findings" | "file-ownership" | null
+    >
   >;
+  /**
+   * A terminal the operator just created (`useZoneLayout().showSpawnedTab`):
+   * shown in tmux mode, a no-op in grid mode where the reconcile zones it.
+   */
+  showSpawnedTab?: (tabId: string) => void;
 }
 
 export function useFindingsActions({
@@ -21,9 +27,9 @@ export function useFindingsActions({
   tabs,
   terminalRefs,
   createTerminal,
-  pendingResumeRef,
   runGeneration,
   setRightPanelMode,
+  showSpawnedTab,
 }: UseFindingsActionsParams): {
   handleFindingRespond: (findingId: string, text: string) => void;
   handleFixFinding: (finding: Finding) => Promise<void>;
@@ -47,6 +53,7 @@ export function useFindingsActions({
       const tabTitle = `fix: ${finding.title.slice(0, 20)}`;
       const tabId = await createTerminal(tabTitle, workingDir);
       if (!tabId) return;
+      showSpawnedTab?.(tabId);
 
       setRightPanelMode(null); // close findings panel to show terminal
 
@@ -55,22 +62,14 @@ export function useFindingsActions({
       const filePart = finding.codeContext?.file
         ? ` File: ${finding.codeContext.file}${finding.codeContext.line ? ":" + finding.codeContext.line : ""}.`
         : "";
-      const resumeCmd = `claude "Fix this issue: ${title}.${filePart} Details: ${desc}"`;
+      const fixCmd = `claude "Fix this issue: ${title}.${filePart} Details: ${desc}"`;
 
-      pendingResumeRef.current = { tabId, resumeCmd };
+      // Give the new shell a moment to draw its prompt before typing.
       setTimeout(() => {
-        const pending = pendingResumeRef.current;
-        if (!pending || pending.tabId !== tabId) return;
-        pendingResumeRef.current = null;
-        void writeToPaneOrReport(
-          terminalRefs.current,
-          tabId,
-          `${pending.resumeCmd}\r`,
-          "finding fix resume",
-        );
+        void writeToPaneOrReport(terminalRefs.current, tabId, `${fixCmd}\r`, "finding fix");
       }, 1500);
     },
-    [activeId, tabs, createTerminal, terminalRefs, pendingResumeRef, setRightPanelMode],
+    [activeId, tabs, createTerminal, terminalRefs, setRightPanelMode, showSpawnedTab],
   );
 
   const handleGenerateFromFindings = useCallback(

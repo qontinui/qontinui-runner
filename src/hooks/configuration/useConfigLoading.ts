@@ -7,7 +7,7 @@
 
 import { useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { getErrorMessage } from "@/lib/utils";
+import { describeThrown } from "@/lib/utils";
 import { open } from "@tauri-apps/plugin-dialog";
 import { configManager } from "../../managers";
 import type { Config, Workflow, LogFunction, LoadConfigurationResponse, Category } from "./types";
@@ -90,7 +90,7 @@ export function useConfigLoading(options: UseConfigLoadingOptions = {}): UseConf
         }
       } catch (error) {
         console.error("[CONFIG] Exception loading configuration:", error);
-        const errorMsg = getErrorMessage(error);
+        const errorMsg = describeThrown(error, "unknown error");
         onLog?.("error", `Failed to load configuration: ${errorMsg}`);
         throw error;
       }

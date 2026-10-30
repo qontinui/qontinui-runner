@@ -7,6 +7,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { getApiBase, tracedFetch } from "../lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -125,7 +126,7 @@ export function useCostTrends(): UseCostTrendsReturn {
     data,
     stats: { totalSpend, avgDailyCost, trendDirection },
     loading: query.isLoading,
-    error: query.error instanceof Error ? query.error.message : null,
+    error: query.error ? describeThrown(query.error, "Failed to load cost trends") : null,
     refetch: query.refetch,
   };
 }

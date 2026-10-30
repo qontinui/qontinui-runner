@@ -14,11 +14,18 @@ import {
   credentialDarkPresentation,
   effectiveCredentialDark,
   makeRePairClickHandler,
+  makeRetryRefreshHandler,
+  makeSwitchTenantHandler,
   normalizeCredentialDarkSignal,
   RE_PAIR_CTA_GRACE_MS,
+  RETRY_DID_NOT_RECOVER,
+  RETRY_STILL_RUNNING,
+  retryErrorSurvives,
+  retryRefreshResult,
   shouldShowAuthBanner,
   shouldShowRePairCta,
   statusSignature,
+  SWITCH_TENANT_LABEL,
   type AuthBannerStatus,
   type CredentialDarkSignal,
   type RePairCtaInputs,
@@ -206,6 +213,8 @@ const darkExpired: CredentialDarkSignal = {
     "the coord credential this runner holds has EXPIRED. Sessions spawned now have no coord access.",
   cta: "retry_refresh",
   since: 1_757_649_240, // 2026-09-12T03:54:00Z
+  tenantId: null,
+  pinnedTenant: false,
 };
 
 const stubTime = () => "03:54";
@@ -240,6 +249,8 @@ describe("credential-dark banner visibility", () => {
       message: "Coord access restored — this runner's credential is live again.",
       cta: null,
       since: null,
+      tenantId: null,
+      pinnedTenant: false,
     };
     // Recovered + paired + nothing else wrong → nothing to show.
     expect(shouldShowAuthBanner(baseFreshInstall, true, null, recovered)).toBe(false);
@@ -301,10 +312,36 @@ describe("credentialDarkPresentation", () => {
       titleFor("unrefreshable"),
       titleFor("absent"),
       titleFor("upstream_401"),
+      titleFor("no_default_binding"),
     ];
     expect(new Set(titles).size).toBe(titles.length);
     expect(titleFor("unrefreshable")).toContain("automatic refresh failed");
     expect(titleFor("upstream_401")).toContain("rejecting");
+  });
+
+  // Plan 2026-09-29-vanished-paired-user-json-…-no-coord-credential Phase 3:
+  // "valid slot, no default binding" must never read as "no coord credential".
+  it("tells a held credential with no default binding apart from no credential", () => {
+    const title = credentialDarkPresentation(
+      { ...darkExpired, cause: "no_default_binding", cta: "re_pair" },
+      stubTime,
+    ).title;
+    expect(title).not.toBe(
+      credentialDarkPresentation({ ...darkExpired, cause: "absent" }, stubTime).title,
+    );
+    expect(title).toContain("present");
+    expect(title).toContain("default binding");
+    expect(title).not.toContain("no coord credential");
+  });
+
+  it("an unknown cause still renders, under the generic title", () => {
+    expect(
+      credentialDarkPresentation({ ...darkExpired, cause: "some_future_cause" }, stubTime).title,
+    ).toBe("Coord credential problem");
+    // A prototype key is not a cause.
+    expect(credentialDarkPresentation({ ...darkExpired, cause: "toString" }, stubTime).title).toBe(
+      "Coord credential problem",
+    );
   });
 
   it("routes the HARD Cognito cause to the interactive sign-in", () => {
@@ -331,7 +368,7 @@ describe("credentialDarkPresentation", () => {
       expect(p.ctaLabel).toBe("Sign in");
     });
 
-    it.each(["absent", "unrefreshable", "upstream_401"])(
+    it.each(["absent", "unrefreshable", "upstream_401", "no_default_binding"])(
       "re_pair (%s) → the sign-in that re-pairs, never the exhausted refresher",
       (cause) => {
         const p = credentialDarkPresentation({ ...darkExpired, cause, cta: "re_pair" }, stubTime);
@@ -400,6 +437,8 @@ describe("normalizeCredentialDarkSignal", () => {
       message: "paused",
       cta: "sign_in",
       since: null,
+      tenantId: null,
+      pinnedTenant: false,
     });
     expect(shouldShowAuthBanner(baseFreshInstall, true, null, legacy)).toBe(true);
   });
@@ -425,6 +464,8 @@ describe("per-source credential-dark signals", () => {
     message: "Autonomous sessions paused — sign in again to resume.",
     cta: "sign_in",
     since: null,
+    tenantId: null,
+    pinnedTenant: false,
   };
   const cognitoRecovered: CredentialDarkSignal = {
     source: "cognito",
@@ -433,6 +474,8 @@ describe("per-source credential-dark signals", () => {
     message: "Autonomous sessions resumed — credentials refreshed.",
     cta: null,
     since: null,
+    tenantId: null,
+    pinnedTenant: false,
   };
   const postureUnrefreshable: CredentialDarkSignal = {
     source: "posture",
@@ -442,6 +485,8 @@ describe("per-source credential-dark signals", () => {
       "the coord credential expired and automatic refresh FAILED (unrefreshable). Sessions spawned now have no coord access.",
     cta: "re_pair",
     since: 1_757_649_240,
+    tenantId: null,
+    pinnedTenant: false,
   };
 
   it("THE bug: Cognito recovering must not clear a posture that is still dark", () => {
@@ -511,6 +556,8 @@ describe("credentialDarkFromPostureSnapshot", () => {
       reason: "coord is REJECTING this runner's credential even though it has not expired locally.",
       cta: "re_pair",
       since: 1_757_649_240,
+      tenantId: null,
+      pinnedTenant: false,
     });
     expect(signal).toEqual({
       source: "posture",
@@ -520,10 +567,34 @@ describe("credentialDarkFromPostureSnapshot", () => {
         "coord is REJECTING this runner's credential even though it has not expired locally.",
       cta: "re_pair",
       since: 1_757_649_240,
+      tenantId: null,
+      pinnedTenant: false,
     });
     // And it is enough on its own: this is the BOOT case, before
     // `get_web_integration_status` has resolved.
     expect(shouldShowAuthBanner(null, false, null, signal)).toBe(true);
+  });
+
+  it("carries the no-default-binding cause, its WHY and the re-pair CTA to the banner", () => {
+    const reason =
+      "a coord credential IS present (a valid per-tenant slot), but no default binding points " +
+      "at it. Why: coord's bound-tenant set is UNKNOWN";
+    const signal = credentialDarkFromPostureSnapshot({
+      posture: "dark",
+      cause: "no_default_binding",
+      canAnswer: false,
+      reason,
+      detail: "coord's bound-tenant set is UNKNOWN",
+      cta: "re_pair",
+      since: 1_757_649_240,
+    });
+    expect(signal?.dark).toBe(true);
+    expect(signal?.cause).toBe("no_default_binding");
+    const p = credentialDarkPresentation(signal!, stubTime);
+    expect(p.title).toBe("Coord credential present, but no default binding points at it");
+    expect(p.body).toContain("Why: coord's bound-tenant set is UNKNOWN");
+    expect(p.ctaAction).toBe("cognito_sign_in");
+    expect(p.ctaLabel).toBe("Sign in to re-pair");
   });
 
   it("reads the deprecated `state` spelling from an older runner build", () => {
@@ -533,6 +604,8 @@ describe("credentialDarkFromPostureSnapshot", () => {
       reason: "refresh failed",
       cta: "re_pair",
       since: null,
+      tenantId: null,
+      pinnedTenant: false,
     });
     expect(signal?.dark).toBe(true);
     expect(signal?.cause).toBe("unrefreshable");
@@ -546,6 +619,8 @@ describe("credentialDarkFromPostureSnapshot", () => {
       reason: "coord credential is live",
       cta: null,
       since: 1_757_649_240,
+      tenantId: null,
+      pinnedTenant: false,
     });
     expect(signal?.dark).toBe(false);
     expect(signal?.source).toBe("posture");
@@ -559,6 +634,8 @@ describe("credentialDarkFromPostureSnapshot", () => {
           message: "paused",
           cta: "sign_in",
           since: null,
+          tenantId: null,
+          pinnedTenant: false,
         },
       },
       signal!,
@@ -594,5 +671,310 @@ describe("credentialDarkFromPostureSnapshot", () => {
     ).toBeNull();
     expect(credentialDarkFromPostureSnapshot("dark")).toBeNull();
     expect(credentialDarkFromPostureSnapshot({})).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Plan 2026-09-14-credential-posture-third-residuals, Phase 3 — `absent(T)`'s
+// only button ("Sign in to re-pair") cannot change the pin: a sign-in lands in
+// whichever tenant coord stamps and never re-pins. So a tenant-naming
+// `absent`/`dark` banner names the tenant, and offers the tenant switch iff the
+// switcher can act.
+// ---------------------------------------------------------------------------
+
+describe("pinned-tenant credential banner (absent/dark with a tenant)", () => {
+  const T = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  const pinnedReason =
+    `this runner is pinned to tenant ${T} and holds no usable coord credential for it ` +
+    `(slot absent). Sessions pinned to it have no coord access. Sign in with an account ` +
+    `in ${T}, or switch this runner's active tenant.`;
+  const absentT: CredentialDarkSignal = {
+    source: "posture",
+    dark: true,
+    cause: "absent",
+    message: pinnedReason,
+    cta: "re_pair",
+    since: null,
+    tenantId: T,
+    pinnedTenant: true,
+  };
+  const darkT: CredentialDarkSignal = {
+    ...absentT,
+    cause: "upstream_401",
+    message: "coord is REJECTING this runner's credential even though it has not expired locally.",
+  };
+
+  it("reads the tenant off both wires: the event's tenant_id and the snapshot's tenantId", () => {
+    expect(normalizeCredentialDarkSignal({ ...absentT, tenant_id: T })?.tenantId).toBe(T);
+    expect(
+      credentialDarkFromPostureSnapshot({
+        posture: "absent",
+        canAnswer: false,
+        reason: pinnedReason,
+        cta: "re_pair",
+        since: null,
+        tenantId: T,
+      })?.tenantId,
+    ).toBe(T);
+    // An older runner build sends neither — that is "names no tenant".
+    expect(normalizeCredentialDarkSignal({ dark: true, message: "x" })?.tenantId).toBeNull();
+  });
+
+  it("for absent with a tenant, the body names the tenant (the runner's own composed reason)", () => {
+    const p = credentialDarkPresentation(absentT, stubTime, true);
+    expect(p.body).toContain(T);
+    expect(p.body).toBe(pinnedReason);
+    expect(p.title).toContain(T);
+  });
+
+  it("for dark with a tenant, a sentence that does not name it gets the tenant appended", () => {
+    const p = credentialDarkPresentation(darkT, stubTime, true);
+    expect(p.body).toContain(T);
+    expect(p.body.startsWith(darkT.message)).toBe(true);
+  });
+
+  it("the switch-tenant action renders iff the switcher can act", () => {
+    for (const signal of [absentT, darkT]) {
+      expect(credentialDarkPresentation(signal, stubTime, true).showSwitchTenant).toBe(true);
+      expect(credentialDarkPresentation(signal, stubTime, false).showSwitchTenant).toBe(false);
+    }
+    // The default is "cannot act": a caller that does not pass the switcher
+    // state never offers a button that could not do anything.
+    expect(credentialDarkPresentation(absentT, stubTime).showSwitchTenant).toBe(false);
+    expect(SWITCH_TENANT_LABEL).toBe("Switch active tenant");
+  });
+
+  it("the existing re-pair CTA stays alongside the switch", () => {
+    const p = credentialDarkPresentation(absentT, stubTime, true);
+    expect(p.ctaAction).toBe("cognito_sign_in");
+    expect(p.ctaLabel).toBe("Sign in to re-pair");
+  });
+
+  it("counterfactual: tenantId null keeps today's copy and no switch action", () => {
+    const generic =
+      "this runner holds NO coord credential. Sessions spawned now have no coord access.";
+    const absentNoTenant: CredentialDarkSignal = { ...absentT, message: generic, tenantId: null };
+    const p = credentialDarkPresentation(absentNoTenant, stubTime, true);
+    expect(p.body).toBe(generic);
+    expect(p.title).toBe("This runner has no coord credential");
+    expect(p.showSwitchTenant).toBe(false);
+  });
+
+  it("a cause that is not absent/dark never offers the switch, even with a tenant", () => {
+    const expiredT: CredentialDarkSignal = { ...darkExpired, tenantId: T };
+    const p = credentialDarkPresentation(expiredT, stubTime, true);
+    expect(p.showSwitchTenant).toBe(false);
+    expect(p.body).toBe(`Since 03:54 — ${darkExpired.message}`);
+  });
+
+  it("reads the pinned-tenant marker off both wires", () => {
+    expect(
+      normalizeCredentialDarkSignal({ ...absentT, tenant_id: T, pinned_tenant: true })
+        ?.pinnedTenant,
+    ).toBe(true);
+    expect(
+      credentialDarkFromPostureSnapshot({
+        posture: "absent",
+        canAnswer: false,
+        reason: pinnedReason,
+        cta: "re_pair",
+        since: null,
+        tenantId: T,
+        pinnedTenant: true,
+      })?.pinnedTenant,
+    ).toBe(true);
+    expect(normalizeCredentialDarkSignal({ dark: true, message: "x" })?.pinnedTenant).toBe(false);
+  });
+
+  it("a measured sibling slot's dark names its tenant but offers no switch", () => {
+    // Re-pinning cannot heal a slot coord keeps rejecting: the switch is gated
+    // on the runner's pinned-tenant marker, not on tenantId presence.
+    const siblingDark: CredentialDarkSignal = { ...darkT, pinnedTenant: false };
+    const p = credentialDarkPresentation(siblingDark, stubTime, true);
+    expect(p.showSwitchTenant).toBe(false);
+    expect(p.body).toContain(T);
+  });
+});
+
+describe("makeSwitchTenantHandler", () => {
+  it("re-pins, reports the pin, then kicks — and never re-reads the posture", async () => {
+    const calls: string[] = [];
+    const setDefaultTenant = vi.fn(async (t: string) => {
+      calls.push(`set:${t}`);
+    });
+    const invoker = vi.fn(async (cmd: string) => {
+      calls.push(cmd);
+      return undefined;
+    });
+    const onPinned = vi.fn(() => {
+      calls.push("pinned");
+    });
+    await makeSwitchTenantHandler({ setDefaultTenant, invoker, onPinned })("t2");
+    expect(calls).toEqual(["set:t2", "pinned", "kick_device_jwt_refresher_cmd"]);
+    expect(invoker).not.toHaveBeenCalledWith("get_coord_credential_posture", expect.anything());
+  });
+
+  it("a failed kick still reports the re-pin as done", async () => {
+    const onPinned = vi.fn();
+    const handler = makeSwitchTenantHandler({
+      setDefaultTenant: async () => undefined,
+      invoker: async () => {
+        throw new Error("kick failed");
+      },
+      onPinned,
+    });
+    await expect(handler("t2")).rejects.toThrow("kick failed");
+    expect(onPinned).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not report the pin or kick when the re-pin fails", async () => {
+    const invoker = vi.fn(async () => undefined);
+    const onPinned = vi.fn();
+    const failing = makeSwitchTenantHandler({
+      setDefaultTenant: async () => {
+        throw new Error("no device_id");
+      },
+      invoker,
+      onPinned,
+    });
+    await expect(failing("t2")).rejects.toThrow("no device_id");
+    expect(invoker).not.toHaveBeenCalled();
+    expect(onPinned).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// "Retry refresh now" reports what happened (plan
+// 2026-10-07-runner-credential-banner-offers-retry-when-only-sign-in-can-recover D5)
+// ---------------------------------------------------------------------------
+
+describe("retry refresh CTA reports the concluded posture", () => {
+  /** The `/health` `coordCredential` object, as the command returns it. */
+  const posture = (over: Record<string, unknown>) => ({
+    posture: "expired",
+    cause: null,
+    canAnswer: false,
+    reason: "the coord credential this runner holds has EXPIRED.",
+    cta: "retry_refresh",
+    since: 1_791_337_078,
+    tenantId: null,
+    pinnedTenant: false,
+    lastRefreshOutcome: null,
+    ...over,
+  });
+
+  /** The banner state before the click: the incident's `expired` posture. */
+  const expiredBefore = () =>
+    applyCredentialDarkSignal({}, credentialDarkFromPostureSnapshot(posture({}))!);
+
+  it("asks the runner to wait for the kicked pass", async () => {
+    const invoker = vi.fn().mockResolvedValue(null);
+    await makeRetryRefreshHandler(invoker)();
+    expect(invoker).toHaveBeenCalledWith("kick_device_jwt_refresher_cmd", {
+      awaitConclusion: true,
+    });
+  });
+
+  it("an `unrefreshable` result swaps the CTA to the sign-in and says the retry failed", async () => {
+    const invoker = vi.fn().mockResolvedValue({
+      concluded: true,
+      posture: posture({
+        posture: "unrefreshable",
+        reason: "the coord credential expired and automatic refresh FAILED (unrefreshable).",
+        cta: "re_pair",
+        lastRefreshOutcome: "needs-sign-in",
+      }),
+    });
+    const result = await makeRetryRefreshHandler(invoker)();
+    expect(result.error).toBe(`${RETRY_DID_NOT_RECOVER} Sign in to re-pair.`);
+    expect(result.signal?.dark).toBe(true);
+
+    const shown = effectiveCredentialDark(
+      applyCredentialDarkSignal(expiredBefore(), result.signal!),
+    );
+    const presentation = credentialDarkPresentation(shown!, () => "03:57");
+    expect(presentation.ctaLabel).toBe("Sign in to re-pair");
+    expect(presentation.ctaAction).toBe("cognito_sign_in");
+    expect(presentation.title).toBe("Coord credential expired — automatic refresh failed");
+  });
+
+  it("a `live` result clears the banner with no error", () => {
+    const result = retryRefreshResult({
+      concluded: true,
+      posture: posture({ posture: "live", canAnswer: true, cta: null }),
+    });
+    expect(result.error).toBeNull();
+    expect(result.signal?.dark).toBe(false);
+    expect(
+      effectiveCredentialDark(applyCredentialDarkSignal(expiredBefore(), result.signal!)),
+    ).toBe(null);
+  });
+
+  it("a still-dark `expired` result keeps the retry and says it did not recover", () => {
+    const result = retryRefreshResult({ concluded: true, posture: posture({}) });
+    expect(result.error).toBe(RETRY_DID_NOT_RECOVER);
+    expect(result.signal?.cta).toBe("retry_refresh");
+  });
+
+  it("a timeout renders as still running, never as success", () => {
+    // Even if the snapshot it carries reads `live`, an unconcluded pass is
+    // UNKNOWN: it must not clear the banner.
+    const live = retryRefreshResult({
+      concluded: false,
+      posture: posture({ posture: "live", canAnswer: true, cta: null }),
+    });
+    expect(live.error).toBe(RETRY_STILL_RUNNING);
+    expect(live.signal).toBeNull();
+    expect(effectiveCredentialDark(expiredBefore())?.dark).toBe(true);
+
+    const stillDark = retryRefreshResult({ concluded: false, posture: posture({}) });
+    expect(stillDark.error).toBe(RETRY_STILL_RUNNING);
+    expect(stillDark.signal?.dark).toBe(true);
+  });
+
+  it("a timed-out retry's 'still running' clears when that pass's posture event lands", () => {
+    // The click: the runner's bounded wait ran out with the slot still `expired`.
+    const timedOut = retryRefreshResult({ concluded: false, posture: posture({}) });
+    expect(timedOut.error).toBe(RETRY_STILL_RUNNING);
+    // A re-announcement of the SAME posture leaves the message standing.
+    const same = credentialDarkFromPostureSnapshot(posture({}))!;
+    expect(retryErrorSurvives(timedOut.signal, same)).toBe(true);
+    // The pass then concludes `unrefreshable` and its event arrives: the CTA
+    // swaps to the sign-in, and the stale "still running" must go with it.
+    const concluded = normalizeCredentialDarkSignal({
+      source: "posture",
+      dark: true,
+      cause: "unrefreshable",
+      message: "the coord credential expired and automatic refresh FAILED (unrefreshable).",
+      cta: "re_pair",
+      since: 1_791_337_100,
+    })!;
+    expect(retryErrorSurvives(timedOut.signal, concluded)).toBe(false);
+    // The formatter is injected: the default `formatSince` goes through
+    // `toLocaleTimeString`, whose first call initialises ICU/timezone data and
+    // took >5 s on a cold Windows CI runner. Nothing here is about the clock.
+    expect(credentialDarkPresentation(concluded, () => "03:57").ctaLabel).toBe(
+      "Sign in to re-pair",
+    );
+  });
+
+  it("a 'did not recover' does not outlive a recovery (no resurfacing on a later dark episode)", () => {
+    const failed = retryRefreshResult({
+      concluded: true,
+      posture: posture({ posture: "unrefreshable", cta: "re_pair" }),
+    });
+    expect(failed.error).not.toBeNull();
+    const recovered = credentialDarkFromPostureSnapshot(
+      posture({ posture: "live", canAnswer: true, cta: null }),
+    )!;
+    expect(retryErrorSurvives(failed.signal, recovered)).toBe(false);
+    // A retry that produced no signal (an older runner, a thrown invoke)
+    // survives nothing.
+    expect(retryErrorSurvives(null, recovered)).toBe(false);
+  });
+
+  it("an older runner that answers nothing changes nothing", () => {
+    expect(retryRefreshResult(null)).toEqual({ signal: null, error: null });
+    expect(retryRefreshResult(undefined)).toEqual({ signal: null, error: null });
   });
 });

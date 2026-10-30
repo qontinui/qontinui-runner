@@ -728,9 +728,12 @@ type RawReadResult = Result<(StatusCode, HeaderMap, Bytes), (StatusCode, Json<Ap
 /// request structs' docs (which point here rather than retype it) — is rendered
 /// from [`EdgeRelation::ALL`], so outside the tests the set is spelled once,
 /// in [`EdgeRelation::as_str`].
-/// The cross-repo drift alarm is the LITERAL list in
-/// `closed_vocabularies_match_the_web_literals`: a widening on the
-/// web side that is not carried here goes red there.
+/// `closed_vocabularies_match_the_web_literals` pins this set against a
+/// LITERAL copy of the web `Literal`, held in this repo. That catches a
+/// runner-side edit (a variant added or dropped here); it does NOT catch a
+/// widening on the web side, because the literal does not move when
+/// `qontinui-web` does. Cross-repo parity is re-established by hand when the
+/// web vocabulary changes (finding `f1c9b8bd`).
 ///
 /// Serializes to the snake_case wire string (`rename_all`), so the JSON
 /// forwarded upstream is byte-identical to what the untyped `String` sent.
@@ -1808,6 +1811,11 @@ pub async fn correct_link_handler(
 
 /// Query parameters this door forwards to the web list route. Anything else is
 /// dropped rather than passed through, so a typo cannot silently widen a read.
+///
+/// Paging is by the opaque `cursor` the previous response's `next_cursor`
+/// carried; `offset` no longer exists upstream (plan
+/// 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus D2) and is
+/// dropped here. The response's `BoundedReadMeta` rides through untouched.
 const SEARCH_PARAMS: [&str; 9] = [
     "q",
     "kind",
@@ -1816,7 +1824,7 @@ const SEARCH_PARAMS: [&str; 9] = [
     "repo",
     "since",
     "work_unit_slug",
-    "offset",
+    "cursor",
     "limit",
 ];
 
@@ -1834,7 +1842,7 @@ pub async fn search_handler(Query(params): Query<HashMap<String, String>>) -> Re
 }
 
 /// Query parameters forwarded to the web candidates route.
-const CANDIDATE_PARAMS: [&str; 3] = ["offset", "limit", "include_coord"];
+const CANDIDATE_PARAMS: [&str; 3] = ["cursor", "limit", "include_coord"];
 
 /// `GET /plan-library/candidates` — unshipped plans with the ranking INPUTS
 /// attached and **no score** (D6: the agent ranks). **Ungated**, and advertises
@@ -2072,9 +2080,14 @@ mod tests {
         }
     }
 
-    /// Pin the tenant dial. Taken BEFORE `with_flag`'s env lock, always — the
-    /// crate-wide ordering (`agent_runtime`'s briefing tests take the pin, then
-    /// an env capture), so there is one global order and no deadlock.
+    /// Pin the tenant dial. The pin acquires `env_lock` itself, before its own
+    /// mutex (it is a CHILD of `env_lock` in the test-lock hierarchy), so the
+    /// `with_flag` call that follows simply nests on the env lock this thread
+    /// already holds. No per-site order exists to get right: the earlier
+    /// comment here claimed "pin first" was the crate-wide order while
+    /// `agent_runtime` documented the opposite, and that disagreement was a
+    /// live deadlock (plan
+    /// `2026-10-02-plan-capture-test-pin-and-env-lock-are-taken-in-opposite-orders-so-one-cargo-test-run-can-deadlock`).
     fn pin(level: &str) -> crate::mcp::fleet_policy_poller::PlanCaptureLevelPin {
         crate::mcp::fleet_policy_poller::pin_plan_capture_level_for_test(level)
     }
@@ -2964,14 +2977,17 @@ mod tests {
         }
     }
 
-    /// The cross-repo drift alarm. The loopback's relation vocabulary now has
+    /// A runner-side drift alarm. The loopback's relation vocabulary now has
     /// ONE source (`EdgeRelation::ALL`, from which the refusal text and
     /// `writeVocabulary.relation` are rendered), and `kind`'s is
     /// `ArtifactKind::ALL`. The sets are spelled out as LITERALS here (not
-    /// built from a constant) and mirror the web `Literal`s
+    /// built from a constant), copied from the web `Literal`s
     /// (`WorkArtifactRelation`, `WorkArtifactKind` in
-    /// `qontinui-web/backend/app/schemas/plan_library.py`), so a widening on
-    /// the web side that is not carried here goes red.
+    /// `qontinui-web/backend/app/schemas/plan_library.py`). So an edit to the
+    /// runner's sets that does not update these literals goes red. A widening
+    /// on the WEB side does not: these literals live in this repo and do not
+    /// move when `qontinui-web` does. When the web vocabulary changes, update
+    /// the literals and the enums together (finding `f1c9b8bd`).
     #[test]
     fn closed_vocabularies_match_the_web_literals() {
         const VOCABULARY: [&str; 7] = [
@@ -3162,6 +3178,40 @@ mod tests {
     fn the_candidate_params_are_the_documented_three() {
         assert!(CANDIDATE_PARAMS.contains(&"include_coord"));
         assert!(!CANDIDATE_PARAMS.contains(&"organization_id"));
+        assert!(CANDIDATE_PARAMS.contains(&"cursor"));
+        assert!(!CANDIDATE_PARAMS.contains(&"offset"));
+    }
+
+    /// `offset` was deleted upstream; both list doors forward `cursor` and drop
+    /// `offset`.
+    #[test]
+    fn offset_is_not_forwarded_and_cursor_is() {
+        let raw: HashMap<String, String> = [("offset", "10"), ("cursor", "abc"), ("limit", "5")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        for allow in [&SEARCH_PARAMS[..], &CANDIDATE_PARAMS[..]] {
+            let forwarded = forward_only(raw.clone(), allow);
+            assert_eq!(forwarded.get("cursor").map(String::as_str), Some("abc"));
+            assert_eq!(forwarded.get("limit").map(String::as_str), Some("5"));
+            assert!(!forwarded.contains_key("offset"));
+        }
+    }
+
+    /// The proxy adds its capability keys but must leave the upstream
+    /// `BoundedReadMeta` keys exactly as sent.
+    #[test]
+    fn bounded_read_meta_passes_through_untouched() {
+        let meta = serde_json::json!({
+            "items": [], "count": 0, "limit": 50, "shown": 0, "total": 7,
+            "truncated": true, "bound_kind": "page", "next_cursor": "c2",
+            "available": 7, "filter_narrowed": false,
+            "enumerate_via": "GET /plan-library/candidates?cursor=c2",
+        });
+        let out = with_write_capability(meta.clone());
+        for (k, v) in meta.as_object().unwrap() {
+            assert_eq!(out.get(k), Some(v), "{k} must pass through untouched");
+        }
     }
 
     /// The exact-`slug` filter the web list route gains
@@ -4198,9 +4248,9 @@ mod tests {
     /// call would compile clean and only this test would notice.
     #[tokio::test]
     async fn both_edge_correction_routes_are_gated_the_same_three_layers() {
-        // Each layer takes the dial pin BEFORE the env lock — the crate-wide
-        // order `pin` documents — so this test cannot deadlock against one
-        // that takes them the same way.
+        // Each layer takes the dial pin and then the env lock. The order is
+        // not load-bearing: the pin holds `env_lock` itself (see `pin`), so the
+        // explicit `env_lock()` below nests rather than contends.
         // Layer 1: no nonce ⇒ 401, dial open, switch off.
         {
             let _pin = pin("record");

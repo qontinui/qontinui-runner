@@ -23,6 +23,7 @@ import {
 import type { InstalledWrapper, WrapperStatus } from "@/lib/wrappers/types";
 import { wrapperStatusFromInfo } from "@/lib/wrappers/status";
 import { WrapperCard } from "@/components/wrappers/WrapperCard";
+import { describeThrown } from "@/lib/utils";
 
 export interface InstalledTabProps {
   onOpenWrapper: (id: string) => void;
@@ -58,7 +59,7 @@ export function InstalledTab({
       setError(null);
     } catch (err) {
       if (!mountedRef.current) return;
-      setError(err instanceof Error ? err.message : String(err));
+      setError(describeThrown(err, "Failed to load wrappers"));
     } finally {
       if (mountedRef.current) setLoading(false);
     }
@@ -107,7 +108,7 @@ export function InstalledTab({
     try {
       await startWrapper(id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(describeThrown(err, "Failed to start wrapper"));
     } finally {
       setBusyFor(id, false);
       const info = await getWrapperStatus(id).catch(() => null);
@@ -120,7 +121,7 @@ export function InstalledTab({
     try {
       await stopWrapper(id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(describeThrown(err, "Failed to stop wrapper"));
     } finally {
       setBusyFor(id, false);
       const info = await getWrapperStatus(id).catch(() => null);
@@ -135,7 +136,7 @@ export function InstalledTab({
         await updateWrapper(id);
         await loadWrappers();
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
+        setError(describeThrown(err, "Failed to update wrapper"));
       } finally {
         setBusyFor(id, false);
       }
@@ -159,7 +160,7 @@ export function InstalledTab({
         await uninstallWrapper(id);
         await loadWrappers();
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
+        setError(describeThrown(err, "Failed to uninstall wrapper"));
       } finally {
         setBusyFor(id, false);
       }

@@ -196,8 +196,21 @@ pub async fn ui_bridge_ai_find_handler(
     wrap_ipc_result(processed)
 }
 
-/// Natural language action execution.
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/ai/execute` is ONE `batch_action` (`ai_execute`); the instruction is never recorded.
 pub async fn ui_bridge_ai_execute_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::batch_kind("ai_execute", None);
+    let result = ui_bridge_ai_execute_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
+/// Natural language action execution.
+async fn ui_bridge_ai_execute_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -382,8 +395,28 @@ pub struct ActionPlanResponse {
     pub cached: bool,
 }
 
-/// Execute a structured action plan: an ordered sequence of typed UI actions.
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/action-plan` and `/sdk/execute-action-plan` are ONE
+/// `batch_action` (`action_plan:<n>`) on the first planned element id.
 pub async fn ui_bridge_execute_action_plan_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(plan): Json<ActionPlanRequest>,
+) -> Result<Json<ApiResponse<ActionPlanResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::batch_kind(
+        &format!("action_plan:{}", plan.actions.len()),
+        plan.actions
+            .first()
+            .and_then(|a| a.target.element_id.clone()),
+    );
+    let result =
+        ui_bridge_execute_action_plan_handler_dispatch(State(Arc::clone(&state)), Json(plan)).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
+/// Execute a structured action plan: an ordered sequence of typed UI actions.
+async fn ui_bridge_execute_action_plan_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(plan): Json<ActionPlanRequest>,
 ) -> Result<Json<ApiResponse<ActionPlanResponse>>, (StatusCode, Json<ApiResponse<()>>)> {

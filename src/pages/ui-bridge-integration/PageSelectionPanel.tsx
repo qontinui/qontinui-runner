@@ -16,6 +16,7 @@ import type {
 } from "./types";
 import { getApiBase } from "@/lib/runner-api";
 import { usePageSelectionPanelRegistrations } from "@/lib/ui-bridge/pages/pageselectionpanel-registrations";
+import { describeThrown } from "@/lib/utils";
 
 interface PageSelectionPanelProps {
   projectPath: string;
@@ -80,7 +81,7 @@ export function PageSelectionPanel({
         setError(data.error || "Discovery failed");
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Discovery failed");
+      setError(describeThrown(err, "Discovery failed"));
     } finally {
       setLoading(false);
     }

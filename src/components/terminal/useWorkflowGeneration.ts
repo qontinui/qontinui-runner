@@ -9,6 +9,8 @@ import { buildPlanWorkflow } from "@/lib/workflow-builder/buildPlanWorkflow";
 import { buildPlanImplementationWorkflow } from "@/lib/workflow-builder/buildPlanImplementationWorkflow";
 import type { CommandResponse } from "./types";
 import { invokeOperatorDoor } from "@/lib/operatorDoors";
+import { describeThrown } from "@/lib/utils";
+import { usePersistedShowSidebar } from "./sessionSidebarPersistence";
 
 interface GenerateWorkflowResponse {
   success: boolean;
@@ -43,6 +45,10 @@ interface UseWorkflowGenerationParams {
   loadMessages: (sessionId: string) => Promise<TranscriptMessage[]>;
   onNavigateToBuilder?: () => void;
   onNavigateToActive?: () => void;
+  /** The terminal page this state belongs to — keys the persisted sidebar flag. */
+  pageId: string;
+  /** The window hosting the page (`"main"` or a pop-out label) — same reason. */
+  windowLabel?: string;
 }
 
 interface UseWorkflowGenerationResult {
@@ -92,6 +98,8 @@ export function useWorkflowGeneration({
   loadMessages,
   onNavigateToBuilder,
   onNavigateToActive,
+  pageId,
+  windowLabel,
 }: UseWorkflowGenerationParams): UseWorkflowGenerationResult {
   // ── Generation state ────────────────────────────────────────────────────────
   const [isGenerating, setIsGenerating] = useState(false);
@@ -111,7 +119,9 @@ export function useWorkflowGeneration({
   } | null>(null);
 
   // ── Sidebar + content panel state ──────────────────────────────────────────
-  const [showSidebar, setShowSidebar] = useState(false);
+  // Persisted per page/window: in tmux work mode the sidebar is the only
+  // navigator, so it must not reload closed (`sessionSidebarPersistence`).
+  const [showSidebar, setShowSidebar] = usePersistedShowSidebar(pageId, windowLabel);
   const [selectedTranscriptSessionId, setSelectedTranscriptSessionId] = useState<string | null>(
     null,
   );
@@ -162,7 +172,7 @@ export function useWorkflowGeneration({
       return {
         filename: null,
         chars: 0,
-        error: err instanceof Error ? err.message : String(err),
+        error: describeThrown(err, "plan lookup failed"),
       };
     } finally {
       setIsPlanLoading(false);
@@ -233,7 +243,7 @@ export function useWorkflowGeneration({
         setNotification({ message: errMsg, type: "error" });
       }
     } catch (err) {
-      const errMsg = err instanceof Error ? err.message : "Failed to generate workflow";
+      const errMsg = describeThrown(err, "Failed to generate workflow");
       setWorkflowError(errMsg);
       setNotification({ message: errMsg, type: "error" });
     } finally {
@@ -267,11 +277,11 @@ export function useWorkflowGeneration({
         setNotification({ message, type: "error" });
         return { ok: false, code: "no-session", message };
       } catch (err) {
-        const message = `Failed to detect session: ${err instanceof Error ? err.message : err}`;
+        const message = `Failed to detect session: ${describeThrown(err, "unknown error")}`;
         setNotification({ message, type: "error" });
         return { ok: false, code: "detect-failed", message };
       }
-    }, [activeId, tabs, handleSelectTranscriptSession]);
+    }, [activeId, tabs, handleSelectTranscriptSession, setShowSidebar]);
 
   // ── Generation entry points ────────────────────────────────────────────────
 
@@ -321,7 +331,7 @@ export function useWorkflowGeneration({
           setNotification({ message: errMsg, type: "error" });
         }
       } catch (err) {
-        const errMsg = err instanceof Error ? err.message : "Failed to generate workflow";
+        const errMsg = describeThrown(err, "Failed to generate workflow");
         setWorkflowError(errMsg);
         setNotification({ message: errMsg, type: "error" });
       } finally {
@@ -397,7 +407,7 @@ export function useWorkflowGeneration({
         type: "success",
       });
     } catch (err) {
-      const errMsg = err instanceof Error ? err.message : "Failed to parse plan";
+      const errMsg = describeThrown(err, "Failed to parse plan");
       setWorkflowError(errMsg);
       setNotification({ message: errMsg, type: "error" });
     }
@@ -422,7 +432,7 @@ export function useWorkflowGeneration({
         type: "success",
       });
     } catch (err) {
-      const errMsg = err instanceof Error ? err.message : "Failed to parse plan";
+      const errMsg = describeThrown(err, "Failed to parse plan");
       setWorkflowError(errMsg);
       setNotification({ message: errMsg, type: "error" });
     }

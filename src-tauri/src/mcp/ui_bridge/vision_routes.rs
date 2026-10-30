@@ -38,6 +38,7 @@ use tracing::{debug, info, warn};
 
 use super::screenshots::lookup_element_normalized_rect;
 use super::vision_ai::{self, OcrClient, VlmClient};
+use super::vision_capture_access::capture_access;
 use super::vision_frame_source::resolve_frame_provider;
 use crate::mcp::envelope::{RequestHints, UiBridgeJson};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
@@ -185,6 +186,13 @@ pub struct CaptureRequest {
     /// Participates in the cache key via the request's `Debug` formatting.
     #[serde(default)]
     pub target: Option<String>,
+    /// `true` returns the encoded bytes as `base64` in the response (capped
+    /// at [`super::vision_capture_access::INLINE_MAX_BYTES`]; over the cap the
+    /// request gets a 413 `INLINE_TOO_LARGE` naming `url`). The handlers
+    /// `take()` it before composing the cache key, so it never splits a cache
+    /// entry. In multi-output mode it applies to every output.
+    #[serde(default)]
+    pub inline: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -217,6 +225,8 @@ impl From<&NamedCapture> for CaptureRequest {
             // Parent `target` is threaded through `do_multi_capture` separately,
             // not via NamedCapture (which carries no per-capture target).
             target: None,
+            // Parent `inline` is threaded through `do_multi_capture` too.
+            inline: None,
         }
     }
 }
@@ -224,8 +234,17 @@ impl From<&NamedCapture> for CaptureRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureResponse {
-    /// `tmp_vision_cache/<sha256>.<ext>` (relative to the runner CWD).
-    pub path: String,
+    /// Relative HTTP path serving the bytes: `/ui-bridge/vision/cache/<sha256>`
+    /// ([`super::vision_capture_access::cache_url`]). Works through every door
+    /// (loopback, relay, remote) — resolve it against the runner origin.
+    pub url: String,
+    /// Standard base64 of the encoded bytes — present only when the request
+    /// set `inline: true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base64: Option<String>,
+    /// Hex SHA-256 of the cache KEY (`v=1|mut=<mutation_id>|req=<request>`),
+    /// NOT of the image bytes: identical images under different keys differ.
+    /// It names the cache entry `url` serves.
     pub sha256: String,
     pub width: u32,
     pub height: u32,
@@ -283,6 +302,7 @@ impl From<CaptureSpec> for CaptureRequest {
             // `CaptureSpec` carries no target; callers (diff, baseline) set it
             // explicitly on the produced `CaptureRequest` when needed.
             target: None,
+            inline: None,
         }
     }
 }
@@ -431,6 +451,10 @@ pub struct RawRequest {
     /// [`super::vision_frame_source`]. Participates in the cache key.
     #[serde(default)]
     pub target: Option<String>,
+    /// `true` returns the PNG bytes as `base64` (see
+    /// [`CaptureRequest::inline`]). Taken before the cache key is composed.
+    #[serde(default)]
+    pub inline: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -825,12 +849,15 @@ fn build_raw_pipeline(crop: Option<Region>) -> Pipeline {
 /// a single `read_dir` + prefix match suffices.
 ///
 /// `dir` MUST be the `VisionCache`'s own absolute root
-/// (`state.vision_cache.root()`). A previous version resolved a bare
-/// `"tmp_vision_cache"` against the process CWD — which is NOT the runner root
-/// (the Tauri exe is launched from elsewhere) — so every GET-by-sha 404'd with
-/// "cache empty" even though `VisionCache::put` had written the file under the
-/// absolute root `current_runner_path().join("tmp_vision_cache")`.
-fn find_cache_file(dir: &StdPath, sha: &str) -> std::io::Result<Option<(PathBuf, String)>> {
+/// (`state.vision_cache.root()`, built by
+/// [`super::vision_capture_access::vision_cache_root_from`]). A previous version
+/// resolved a bare relative directory name against the process CWD, so every
+/// GET-by-sha 404'd with "cache empty" even though `VisionCache::put` had
+/// written the file under the absolute root.
+pub(super) fn find_cache_file(
+    dir: &StdPath,
+    sha: &str,
+) -> std::io::Result<Option<(PathBuf, String)>> {
     let prefix = format!("{}.", sha);
     for entry in std::fs::read_dir(dir)?.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -839,25 +866,6 @@ fn find_cache_file(dir: &StdPath, sha: &str) -> std::io::Result<Option<(PathBuf,
         }
     }
     Ok(None)
-}
-
-/// Render a cache entry's on-disk path as the host-agnostic relative form
-/// `tmp_vision_cache/<sha256>.<ext>` for [`CaptureResponse::path`].
-///
-/// The `VisionCache` root is built **absolute** in `mcp_api::api_state_init`
-/// (`current_runner_path().join("tmp_vision_cache")`) so file IO is correct
-/// regardless of CWD. The response `path` is diagnostic-only — every consumer
-/// fetches bytes by `sha256` via `/vision/raw` (`fetchVisionCacheBytes`), never
-/// by `path` — so we strip the absolute prefix and emit the relative path the
-/// response contract already promises. Cache entries are always flat
-/// files directly under the root, so the file name plus the fixed
-/// `tmp_vision_cache/` prefix is sufficient; the smoke gate's
-/// `^tmp_vision_cache[\\/]` regex accepts either slash flavour.
-fn relative_cache_path(p: &StdPath) -> String {
-    match p.file_name() {
-        Some(name) => format!("tmp_vision_cache/{}", name.to_string_lossy()),
-        None => p.to_string_lossy().into_owned(),
-    }
 }
 
 // ============================================================================
@@ -873,14 +881,15 @@ async fn vision_capture_handler(
     body: Option<Json<CaptureRequest>>,
 ) -> Result<Json<ApiResponse<VisionCaptureResp>>, (StatusCode, Json<ApiResponse<()>>)> {
     let mut req = body.map(|b| b.0).unwrap_or_default();
+    let inline = req.inline.take().unwrap_or(false);
     if let Some(captures) = req.captures.take() {
         let force = req.force.unwrap_or(false);
-        let captures_map = do_multi_capture(&state, captures, force, &req.target).await?;
+        let captures_map = do_multi_capture(&state, captures, force, &req.target, inline).await?;
         return Ok(Json(ApiResponse::success(VisionCaptureResp::Multi {
             captures: captures_map,
         })));
     }
-    let resp = do_capture(&state, req, false).await?;
+    let resp = do_capture(&state, req, false, inline).await?;
     Ok(Json(ApiResponse::success(VisionCaptureResp::Single(resp))))
 }
 
@@ -891,7 +900,8 @@ async fn vision_annotate_handler(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<CaptureRequest>>,
 ) -> Result<Json<ApiResponse<VisionCaptureResp>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let req = body.map(|b| b.0).unwrap_or_default();
+    let mut req = body.map(|b| b.0).unwrap_or_default();
+    let inline = req.inline.take().unwrap_or(false);
     if req.annotate_elements.is_some() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -910,7 +920,7 @@ async fn vision_annotate_handler(
             )),
         ));
     }
-    let resp = do_capture(&state, req, true).await?;
+    let resp = do_capture(&state, req, true, inline).await?;
     Ok(Json(ApiResponse::success(VisionCaptureResp::Single(resp))))
 }
 
@@ -922,6 +932,7 @@ async fn do_capture(
     state: &Arc<ApiState>,
     req: CaptureRequest,
     require_annotations: bool,
+    inline: bool,
 ) -> Result<CaptureResponse, (StatusCode, Json<ApiResponse<()>>)> {
     if require_annotations
         && req
@@ -968,8 +979,11 @@ async fn do_capture(
                 &hit.sha256_hex[..12],
                 bytes.len()
             );
+            let access =
+                capture_access(&hit.sha256_hex, &bytes, inline).map_err(|e| e.into_api_error())?;
             return Ok(CaptureResponse {
-                path: relative_cache_path(&hit.path),
+                url: access.url,
+                base64: access.base64,
                 sha256: hit.sha256_hex,
                 width: decoded.width(),
                 height: decoded.height(),
@@ -1049,8 +1063,10 @@ async fn do_capture(
         height
     );
 
+    let access = capture_access(&hit.sha256_hex, &bytes, inline).map_err(|e| e.into_api_error())?;
     Ok(CaptureResponse {
-        path: relative_cache_path(&hit.path),
+        url: access.url,
+        base64: access.base64,
         sha256: hit.sha256_hex,
         width,
         height,
@@ -1104,6 +1120,7 @@ async fn do_multi_capture(
     captures: Vec<NamedCapture>,
     force: bool,
     target: &Option<String>,
+    inline: bool,
 ) -> Result<std::collections::HashMap<String, CaptureResponse>, (StatusCode, Json<ApiResponse<()>>)>
 {
     use std::collections::HashMap;
@@ -1163,10 +1180,13 @@ async fn do_multi_capture(
                         Json(api_error(format!("decode cached: {}", e))),
                     )
                 })?;
+                let access = capture_access(&hit.sha256_hex, &bytes, inline)
+                    .map_err(|e| e.into_api_error())?;
                 results.insert(
                     cap.name.clone(),
                     CaptureResponse {
-                        path: relative_cache_path(&hit.path),
+                        url: access.url,
+                        base64: access.base64,
                         sha256: hit.sha256_hex,
                         width: decoded.width(),
                         height: decoded.height(),
@@ -1274,10 +1294,13 @@ async fn do_multi_capture(
                     Json(api_error(format!("cache put '{}': {}", name, e))),
                 )
             })?;
+        let access =
+            capture_access(&hit.sha256_hex, &bytes, inline).map_err(|e| e.into_api_error())?;
         results.insert(
             name,
             CaptureResponse {
-                path: relative_cache_path(&hit.path),
+                url: access.url,
+                base64: access.base64,
                 sha256: hit.sha256_hex,
                 width,
                 height,
@@ -1419,7 +1442,9 @@ async fn vision_diff_handler(
 
     Ok(Json(ApiResponse::success(DiffResponse {
         capture: CaptureResponse {
-            path: relative_cache_path(&hit.path),
+            // `vision/diff` has no `inline` field: its capture is fetched by `url`.
+            url: super::vision_capture_access::cache_url(&hit.sha256_hex),
+            base64: None,
             sha256: hit.sha256_hex,
             width: decoded.width(),
             height: decoded.height(),
@@ -1617,12 +1642,15 @@ async fn vision_raw_handler(
         return Err((StatusCode::NOT_FOUND, Json(api_error(""))));
     }
 
-    let req = body.map(|b| b.0).unwrap_or(RawRequest {
+    let mut req = body.map(|b| b.0).unwrap_or(RawRequest {
         region: None,
         element: None,
         reason: None,
         target: None,
+        inline: None,
     });
+    // Taken before `req` is Debug-formatted into the cache key below.
+    let inline = req.inline.take().unwrap_or(false);
     let reason = req.reason.clone().unwrap_or_default();
     if !matches!(reason.as_str(), "vga_grounding" | "regression_baseline") {
         return Err((
@@ -1687,8 +1715,10 @@ async fn vision_raw_handler(
             )
         })?;
 
+    let access = capture_access(&hit.sha256_hex, &bytes, inline).map_err(|e| e.into_api_error())?;
     Ok(Json(ApiResponse::success(CaptureResponse {
-        path: relative_cache_path(&hit.path),
+        url: access.url,
+        base64: access.base64,
         sha256: hit.sha256_hex,
         width: decoded.width(),
         height: decoded.height(),
@@ -2105,7 +2135,7 @@ impl RequestHints for AnalyzeRequest {
     fn shape_error_suggestions() -> Option<Vec<String>> {
         Some(vec![
             "Required field: `analyzer` (one of: \"layout\", \"typography\", \"color\", \
-             \"dynamic\", \"elements\"). \
+             \"dynamic\", \"elements\", \"image\"). \
              Optional: `snapshot` (ElementSnapshot), `region`, `element`, `target`."
                 .to_string(),
             "Use `vision/assert` for targeted pass/fail checks; \
@@ -2115,7 +2145,7 @@ impl RequestHints for AnalyzeRequest {
     }
     fn shape_error_data() -> Option<serde_json::Value> {
         Some(serde_json::json!({
-            "allowedAnalyzers": ["layout", "typography", "color", "dynamic", "elements"]
+            "allowedAnalyzers": ["layout", "typography", "color", "dynamic", "elements", "image"]
         }))
     }
 }
@@ -2191,6 +2221,18 @@ pub struct AnalyzeResponse {
     /// confused with the REQUEST's `snapshot` field, which is an
     /// `ElementSnapshot` and a completely different shape.
     pub snapshot_attribution: SnapshotAttribution,
+    /// The per-image and page-level VALUES the `image` analyzer measured,
+    /// each an `Observation` with its own provenance — forwarded verbatim
+    /// from [`qontinui_vision_core::AnalyzerResult::image_values`].
+    ///
+    /// The image analyzer's output IS these values: its findings are `Info`
+    /// only, so a projection that dropped this field would return a
+    /// verdict and an empty-looking finding list while the measurements
+    /// were computed and thrown away. Omitted (never `null`) for every
+    /// other analyzer and for an `image` run that was `Blocked` (no frame,
+    /// so nothing was read).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_values: Option<qontinui_vision_core::analyzers::image::ImageValues>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2286,15 +2328,29 @@ impl AnalyzeResponse {
         snapshot: Option<&qontinui_vision_core::ElementSnapshot>,
         evaluated_at: chrono::DateTime<chrono::Utc>,
     ) -> Self {
+        // Destructured exhaustively, with no `..`, so a field vision-core
+        // adds to `AnalyzerResult` fails THIS build until it is either
+        // forwarded or deliberately dropped here. `image_values` is the
+        // field a field-by-field projection was most likely to lose.
+        // `conclusive` is derived from `verdict` by construction, so the
+        // wire carries the verdict and not the redundant bit.
+        let qontinui_vision_core::AnalyzerResult {
+            verdict,
+            conclusive: _,
+            coverage,
+            findings,
+            image_values,
+        } = result;
         Self {
             analyzer,
-            findings: result.findings,
-            verdict: result.verdict,
-            coverage: result.coverage,
+            findings,
+            verdict,
+            coverage,
             frame: frame.map(AnalyzedFrameInfo::of),
             frame_error,
             evaluated_at,
             snapshot_attribution: SnapshotAttribution::of(snapshot),
+            image_values,
         }
     }
 }
@@ -2386,6 +2442,18 @@ pub struct AssertRequest {
     /// instead — see [`super::vision_frame_source`].
     #[serde(default)]
     pub target: Option<String>,
+    /// A journey edge-observation id (plan
+    /// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time
+    /// Phase 4): the timeline stored on that ledger row is what the timeline
+    /// assertions (`animation_settled`, `settled_within`,
+    /// `state_entered_within`) evaluate against. A ref that does not resolve
+    /// to a stored timeline leaves those assertions `unknown`, with the
+    /// resolution's own code — never an error-as-pass. The ref is scoped to
+    /// the app the assertions are about: `target` when one is sent, else the
+    /// runner's own app (the default frame source); a ref naming another
+    /// app's observation does not resolve.
+    #[serde(default, alias = "timeline_ref")]
+    pub timeline_ref: Option<String>,
 }
 
 impl RequestHints for AssertRequest {
@@ -2397,10 +2465,17 @@ impl RequestHints for AssertRequest {
             "Assertion `type` values: no_overlap, element_above, contains_text, \
              text_fits_container, aligned_horizontally, aligned_vertically, color_within, \
              typography_consistent, no_layout_shift_since, no_clipping, animation_settled, \
-             contrast_meets_wcag."
+             contrast_meets_wcag, image_palette_within, no_near_duplicate_images, \
+             no_placeholder_images, image_focal_visible, transparent_image_legible, \
+             salience_order, image_sharpness_at_least, image_blockiness_within, \
+             settled_within, state_entered_within."
                 .to_string(),
             "Optional top-level fields: `snapshot` (ElementSnapshot from /discover), \
-             `ocr_blocks` (from /vision/extract), `target` (device/app id)."
+             `ocr_blocks` (from /vision/extract), `target` (device/app id), \
+             `timelineRef` (a journey edge-observation id whose stored timeline the \
+             timeline assertions read; it resolves only within the app the request is \
+             about — `target` when sent, else the runner's own app — so a ref from \
+             another app leaves them unknown)."
                 .to_string(),
         ])
     }
@@ -2418,7 +2493,17 @@ impl RequestHints for AssertRequest {
                 "no_layout_shift_since",
                 "no_clipping",
                 "animation_settled",
-                "contrast_meets_wcag"
+                "contrast_meets_wcag",
+                "image_palette_within",
+                "no_near_duplicate_images",
+                "no_placeholder_images",
+                "image_focal_visible",
+                "transparent_image_legible",
+                "salience_order",
+                "image_sharpness_at_least",
+                "image_blockiness_within",
+                "settled_within",
+                "state_entered_within"
             ],
             "exampleAssertion": {
                 "type": "no_overlap",
@@ -2433,20 +2518,26 @@ impl RequestHints for AssertRequest {
 pub struct AssertResponse {
     pub results: Vec<qontinui_vision_core::AssertionResult>,
     pub all_passed: bool,
-    /// Why frame capture failed, when it did. Every assertion in the DSL is
-    /// evaluated from the snapshot, so this is informational — but it must
-    /// be visible, not inferred from a missing field.
+    /// Why frame capture failed, when it did. Most assertions evaluate from
+    /// the snapshot and are untouched by it, but the pixel-reading image
+    /// assertions answer `unknown` without one (a slot placeholder marker can
+    /// still fail `no_placeholder_images`) — so it must be visible, not
+    /// inferred from a missing field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_error: Option<String>,
     /// Provenance of the frame this call captured, when it captured one.
     ///
-    /// No assertion in the DSL reads the frame — every one evaluates from
-    /// the snapshot, the OCR blocks or the baseline registry — so this
-    /// describes a resource that did not feed any verdict here. It is
-    /// reported anyway, because the handler pays the full capture cost on
-    /// every call and reporting neither the result nor the provenance is
-    /// strictly worse than either alternative: a caller cannot otherwise
-    /// tell what the runner was looking at when it answered.
+    /// Only the L1 image assertions read the frame (`image_palette_within`,
+    /// `no_near_duplicate_images`, `no_placeholder_images`,
+    /// `transparent_image_legible`, `salience_order`,
+    /// `image_sharpness_at_least`, `image_blockiness_within`). A verdict one
+    /// of those rests on pixels states a `confidence`, because a pixel read
+    /// from a composited frame is an estimate. Every other assertion
+    /// (`image_focal_visible` included: it reads media facts) evaluates from
+    /// the snapshot, the OCR blocks or the baseline registry, and for those
+    /// this describes a resource that did not feed the verdict. It is
+    /// reported either way, because a caller cannot otherwise tell what the
+    /// runner was looking at when it answered.
     ///
     /// `None` states that no frame was captured, and `frameError` says why.
     /// Same build-marker caveat as `coverage` below: the key is omitted
@@ -2467,9 +2558,10 @@ pub struct AssertResponse {
     ///
     /// An assert-only consumer previously got no answer at all to "what did
     /// this cover", while the analyze path had carried one since
-    /// `SnapshotCoverage` landed. Every assertion in the DSL evaluates from
-    /// the snapshot, so a `passed: true` over an impoverished snapshot is
-    /// exactly as vacuous here as an empty finding list is there.
+    /// `SnapshotCoverage` landed. Every assertion in the DSL reads the
+    /// snapshot (the image assertions too, to find the image's box), so a
+    /// `passed: true` over an impoverished snapshot is exactly as vacuous
+    /// here as an empty finding list is there.
     ///
     /// **`None` is a STATEMENT, not a gap**: no snapshot was supplied, so
     /// there was nothing to count — `snapshotAttribution.state == "absent"`
@@ -2492,11 +2584,10 @@ pub struct AssertResponse {
     pub coverage: Option<qontinui_vision_core::SnapshotCoverage>,
     /// When these assertions finished evaluating, on the runner's clock.
     ///
-    /// No assertion in the DSL reads the frame — every one evaluates from
-    /// the snapshot, the OCR blocks or the baseline registry — so while
-    /// `frame.capturedAt` is usually present beside this, it dates a
-    /// resource no verdict here consulted. This is the only time that dates
-    /// the ANSWER, and it is never absent. A failing gate line that cannot
+    /// `frame.capturedAt` dates the frame, which only the L1 image
+    /// assertions consult — for every other assertion it dates a resource
+    /// the verdict did not read. This is the only time that dates the
+    /// ANSWER, and it is never absent. A failing gate line that cannot
     /// be aged is a failing gate line a reviewer cannot separate from a
     /// stale one.
     pub evaluated_at: chrono::DateTime<chrono::Utc>,
@@ -2508,6 +2599,111 @@ pub struct AssertResponse {
     /// confused with the REQUEST's `snapshot` field, which is an
     /// `ElementSnapshot` and a completely different shape.
     pub snapshot_attribution: SnapshotAttribution,
+    /// How the request's `timelineRef` resolved; omitted when none was sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeline_ref: Option<TimelineRefResolution>,
+}
+
+/// How a `/vision/assert` `timelineRef` resolved.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineRefResolution {
+    /// The edge-observation id as sent.
+    pub id: String,
+    /// The app the ref was resolved within.
+    pub app_id: String,
+    /// Whether a stored timeline was loaded and fed to the evaluator.
+    pub loaded: bool,
+    /// Why not, when it was not: the code every timeline assertion then
+    /// carries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unknown: Option<qontinui_vision_core::UnknownInfo>,
+}
+
+impl TimelineRefResolution {
+    /// Map a ledger lookup to the timeline to evaluate against and the
+    /// resolution the response reports. Pure.
+    pub(crate) fn of(
+        id: &str,
+        app_id: &str,
+        lookup: crate::journey::read::TimelineRefLookup,
+    ) -> (
+        Option<Box<qontinui_vision_core::ChangeTimeline>>,
+        TimelineRefResolution,
+    ) {
+        use crate::journey::read::{LedgerUnavailable, TimelineRefLookup as L};
+        use qontinui_vision_core::{UnknownCode as C, UnknownInfo};
+        let fail = |code: C, detail: String| {
+            (
+                None,
+                TimelineRefResolution {
+                    id: id.to_string(),
+                    app_id: app_id.to_string(),
+                    loaded: false,
+                    unknown: Some(UnknownInfo::new(code, detail)),
+                },
+            )
+        };
+        match lookup {
+            L::Found(t) => (
+                Some(t),
+                TimelineRefResolution {
+                    id: id.to_string(),
+                    app_id: app_id.to_string(),
+                    loaded: true,
+                    unknown: None,
+                },
+            ),
+            L::NotFound => fail(
+                C::NoObservations,
+                format!("timelineRef {id:?} names no journey edge observation of app {app_id:?}"),
+            ),
+            L::NoTimeline => fail(
+                C::InputMissing,
+                format!(
+                    "journey edge observation {id:?} recorded no timeline (the action sent \
+                     `timeline: false`, or its choke point records none)"
+                ),
+            ),
+            L::Withdrawn(at) => fail(
+                C::StaleInput,
+                format!("journey edge observation {id:?} was withdrawn at {at}"),
+            ),
+            L::Unparseable => fail(
+                C::ProducerFailed,
+                format!("the timeline stored on journey edge observation {id:?} does not parse"),
+            ),
+            L::Unavailable(LedgerUnavailable::SchemaAbsent) => fail(
+                C::LedgerSchemaAbsent,
+                "the journey tables do not exist in this database".to_string(),
+            ),
+            L::Unavailable(LedgerUnavailable::Failed(e)) => fail(
+                C::ProducerFailed,
+                format!("the journey ledger could not be read: {e}"),
+            ),
+        }
+    }
+
+    /// Give every timeline assertion that came back `unknown` for want of a
+    /// timeline this resolution's code and detail, so the reader sees WHY the
+    /// ref did not supply one rather than the generic "no timeline".
+    pub(crate) fn annotate(&self, results: &mut [qontinui_vision_core::AssertionResult]) {
+        let Some(why) = &self.unknown else {
+            return;
+        };
+        for r in results.iter_mut() {
+            let is_timeline = matches!(
+                r.assertion,
+                qontinui_vision_core::Assertion::AnimationSettled { .. }
+                    | qontinui_vision_core::Assertion::SettledWithin { .. }
+                    | qontinui_vision_core::Assertion::StateEnteredWithin { .. }
+            );
+            if is_timeline && r.outcome.is_unknown() {
+                r.code = Some(why.code);
+                r.detail = Some(why.detail.clone());
+            }
+        }
+    }
 }
 
 impl AssertResponse {
@@ -2539,6 +2735,7 @@ impl AssertResponse {
             coverage: snapshot.map(qontinui_vision_core::SnapshotCoverage::of),
             evaluated_at,
             snapshot_attribution: SnapshotAttribution::of(snapshot),
+            timeline_ref: None,
         }
     }
 }
@@ -2604,10 +2801,10 @@ async fn vision_analyze_handler(
     //
     // Frame capture is BEST-EFFORT and must not gate the analysis.
     //
-    // Three of the five analyzers — layout, typography, elements — are pure
+    // Three of the six analyzers — layout, typography, elements — are pure
     // geometry over the caller's snapshot and never read a pixel, and
-    // `analyzers::run` already degrades the other two to an explicit
-    // "skipped" finding when `frame` is `None`. Capturing first and `?`-ing
+    // `analyzers::run` already answers the other three (color, dynamic,
+    // image) with an explicit Blocked verdict when `frame` is `None`. Capturing first and `?`-ing
     // on failure therefore threw away every frameless analysis for a
     // resource none of them needed: with the Tauri window absent
     // (`frontendState: "window_missing"`, a headless or crashed UI) the
@@ -2625,23 +2822,38 @@ async fn vision_analyze_handler(
         }
     };
 
-    let snapshot = req.snapshot.as_ref();
-    let prior = None; // future: look up by sha256 in cache
-
-    let input = qontinui_vision_core::AnalyzeInput {
-        frame: frame.as_ref(),
-        snapshot,
-        prior_frame: prior,
-    };
-    let result = qontinui_vision_core::analyzers::run(req.analyzer, &input);
-    // Stamped the instant the analyzer returns, not at response assembly —
-    // `evaluatedAt` says when the observation was made, and for a heavy
-    // analyzer over a large frame those are measurably different moments.
-    let evaluated_at = chrono::Utc::now();
+    // The analyzers are CPU-bound pure functions — the `image` analyzer
+    // hashes, clusters and filters every image crop of a full frame — so
+    // they run on the blocking pool, not inline on a tokio worker. The
+    // owned frame and snapshot move in and come back out for the response.
+    let analyzer = req.analyzer;
+    let snapshot = req.snapshot;
+    let (result, evaluated_at, frame, snapshot) = spawn_blocking_tracked(move || {
+        let input = qontinui_vision_core::AnalyzeInput {
+            frame: frame.as_ref(),
+            snapshot: snapshot.as_ref(),
+            prior_frame: None, // future: look up by sha256 in cache
+        };
+        let result = qontinui_vision_core::analyzers::run(analyzer, &input);
+        // Stamped the instant the analyzer returns, not at response assembly —
+        // `evaluatedAt` says when the observation was made, and for a heavy
+        // analyzer over a large frame those are measurably different moments.
+        let evaluated_at = chrono::Utc::now();
+        (result, evaluated_at, frame, snapshot)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!(
+                "vision/analyze: analyzer task join error: {e}"
+            ))),
+        )
+    })?;
 
     info!(
         "vision/analyze: analyzer={:?} findings={} verdict={:?} frame={}",
-        req.analyzer,
+        analyzer,
         result.findings.len(),
         result.verdict,
         if frame.is_some() {
@@ -2651,11 +2863,11 @@ async fn vision_analyze_handler(
         }
     );
     Ok(Json(ApiResponse::success(AnalyzeResponse::of(
-        req.analyzer,
+        analyzer,
         result,
         frame.as_ref(),
         frame_error,
-        snapshot,
+        snapshot.as_ref(),
         evaluated_at,
     ))))
 }
@@ -2663,6 +2875,14 @@ async fn vision_analyze_handler(
 /// `POST /ui-bridge/vision/assert` — evaluate a list of declarative
 /// assertions over a captured frame + caller-supplied snapshot/OCR.
 /// Returns per-assertion pass/fail + reason.
+///
+/// `timelineRef` (alias `timeline_ref`) names a journey edge observation
+/// whose stored timeline feeds the timeline assertions. It is SCOPED to the
+/// request's app: `target` when one is sent, else the runner's own app
+/// (`qontinui-runner`, the default frame source). A ref naming another app's
+/// observation, an unknown id, a withdrawn row or a row with no timeline
+/// leaves every timeline assertion `unknown` with that resolution's code —
+/// reported in `timelineRef` on the response, never a pass.
 async fn vision_assert_handler(
     State(state): State<Arc<ApiState>>,
     UiBridgeJson(req): UiBridgeJson<AssertRequest>,
@@ -2670,12 +2890,12 @@ async fn vision_assert_handler(
     // `target` selects the frame source: None = runner desktop (today's
     // behavior); a device/app id sources from that target. visual-audit relies
     // on this to assert against a paired device rather than the runner window.
-    // Best-effort, for the same reason as `vision/analyze` above — and more
-    // strongly here: NO assertion in the DSL reads `ctx.frame`. Every one of
-    // them evaluates from the snapshot, the OCR blocks or the baseline
-    // registry. Capturing a frame was a hard precondition for a value the
-    // evaluator never consulted, which made `no_overlap` and `no_clipping`
-    // unavailable on a headless runner for no reason at all.
+    // Best-effort, for the same reason as `vision/analyze` above. Only the
+    // L1 image assertions read `ctx.frame`, and without one their pixel
+    // checks answer `unknown`; every other assertion evaluates from the
+    // snapshot, the OCR blocks or the baseline registry. Capturing a frame
+    // as a hard precondition made `no_overlap` and `no_clipping` unavailable
+    // on a headless runner for a value they never consult.
     let frame_result = match resolve_frame_provider(&state, &req.target).await {
         Ok(provider) => provider.frame(&state).await,
         Err(e) => Err(e),
@@ -2703,41 +2923,84 @@ async fn vision_assert_handler(
             .collect()
     };
 
-    let ocr_borrowed: Option<Vec<qontinui_vision_core::OcrBlockRef<'_>>> =
-        req.ocr_blocks.as_ref().map(|blocks| {
-            blocks
-                .iter()
-                .map(|b| qontinui_vision_core::OcrBlockRef {
-                    bbox: qontinui_vision_core::Region {
-                        // OCR blocks are detected INSIDE a frame, so their
-                        // origin is a buffer index and can never be negative —
-                        // `OcrBbox` stays u32 and the widening cast is lossless.
-                        x: b.bbox.x as i32,
-                        y: b.bbox.y as i32,
-                        w: b.bbox.w,
-                        h: b.bbox.h,
-                    },
-                    text: b.text.as_str(),
-                    confidence: b.confidence,
-                })
-                .collect()
-        });
-
-    let ctx = qontinui_vision_core::EvalContext {
-        snapshot: req.snapshot.as_ref(),
-        frame: frame.as_ref(),
-        ocr_blocks: ocr_borrowed.as_deref(),
-        baselines: Some(&baselines_owned),
+    // `timelineRef`: the timeline stored on that journey edge row (plan
+    // 2026-09-20 Phase 4). Unresolved, the timeline assertions stay unknown.
+    // Read before the blocking hop, which only evaluates.
+    let (timeline, timeline_ref) = match req.timeline_ref.as_deref() {
+        None => (None, None),
+        Some(id) => {
+            let app_id = req
+                .target
+                .as_deref()
+                .unwrap_or(crate::spec_api::storage::RUNNER_APP_ID);
+            let lookup =
+                crate::journey::read::read_timeline_by_id(&state.app_state.pg_db, app_id, id).await;
+            let (t, resolution) = TimelineRefResolution::of(id, app_id, lookup);
+            (t, Some(resolution))
+        }
     };
 
-    let results: Vec<_> = req
-        .assertions
-        .iter()
-        .map(|a| qontinui_vision_core::evaluate_assertion(a, &ctx))
-        .collect();
-    // See the analyze handler: stamped when evaluation finishes, not at
-    // response assembly.
-    let evaluated_at = chrono::Utc::now();
+    // Evaluated on the blocking pool for the same reason as the analyze
+    // handler: the L1 image assertions read the frame and hash, cluster and
+    // filter image crops. Everything the evaluation borrows moves in owned;
+    // the frame and snapshot come back out for the response.
+    let AssertRequest {
+        assertions,
+        snapshot,
+        ocr_blocks,
+        target: _,
+        timeline_ref: _,
+    } = req;
+    let (mut results, evaluated_at, frame, snapshot) = spawn_blocking_tracked(move || {
+        let ocr_borrowed: Option<Vec<qontinui_vision_core::OcrBlockRef<'_>>> =
+            ocr_blocks.as_ref().map(|blocks| {
+                blocks
+                    .iter()
+                    .map(|b| qontinui_vision_core::OcrBlockRef {
+                        bbox: qontinui_vision_core::Region {
+                            // OCR blocks are detected INSIDE a frame, so their
+                            // origin is a buffer index and can never be negative —
+                            // `OcrBbox` stays u32 and the widening cast is lossless.
+                            x: b.bbox.x as i32,
+                            y: b.bbox.y as i32,
+                            w: b.bbox.w,
+                            h: b.bbox.h,
+                        },
+                        text: b.text.as_str(),
+                        confidence: b.confidence,
+                    })
+                    .collect()
+            });
+
+        let ctx = qontinui_vision_core::EvalContext {
+            snapshot: snapshot.as_ref(),
+            frame: frame.as_ref(),
+            ocr_blocks: ocr_borrowed.as_deref(),
+            baselines: Some(&baselines_owned),
+            timeline: timeline.as_deref(),
+        };
+
+        let results: Vec<_> = assertions
+            .iter()
+            .map(|a| qontinui_vision_core::evaluate_assertion(a, &ctx))
+            .collect();
+        // See the analyze handler: stamped when evaluation finishes, not at
+        // response assembly.
+        let evaluated_at = chrono::Utc::now();
+        (results, evaluated_at, frame, snapshot)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!(
+                "vision/assert: evaluation task join error: {e}"
+            ))),
+        )
+    })?;
+    if let Some(resolution) = &timeline_ref {
+        resolution.annotate(&mut results);
+    }
     info!(
         "vision/assert: {} assertions, {} passed, {} failed",
         results.len(),
@@ -2745,13 +3008,15 @@ async fn vision_assert_handler(
         results.iter().filter(|r| !r.passed).count()
     );
 
-    Ok(Json(ApiResponse::success(AssertResponse::of(
+    let mut response = AssertResponse::of(
         results,
-        req.snapshot.as_ref(),
+        snapshot.as_ref(),
         frame.as_ref(),
         frame_error,
         evaluated_at,
-    ))))
+    );
+    response.timeline_ref = timeline_ref;
+    Ok(Json(ApiResponse::success(response)))
 }
 
 /// `POST /ui-bridge/vision/baseline` — capture a baseline image + record
@@ -2937,19 +3202,272 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
 mod tests {
     use super::*;
 
+    /// The wire name of every `Assertion` variant. No `_` arm, on purpose: a
+    /// new variant fails the build here, beside [`ASSERTION_WIRE_NAMES`].
+    fn assertion_wire_name(a: &qontinui_vision_core::Assertion) -> &'static str {
+        use qontinui_vision_core::Assertion as A;
+        match a {
+            A::NoOverlap { .. } => "no_overlap",
+            A::ElementAbove { .. } => "element_above",
+            A::ContainsText { .. } => "contains_text",
+            A::TextFitsContainer { .. } => "text_fits_container",
+            A::AlignedHorizontally { .. } => "aligned_horizontally",
+            A::AlignedVertically { .. } => "aligned_vertically",
+            A::ColorWithin { .. } => "color_within",
+            A::TypographyConsistent { .. } => "typography_consistent",
+            A::NoLayoutShiftSince { .. } => "no_layout_shift_since",
+            A::NoClipping { .. } => "no_clipping",
+            A::AnimationSettled { .. } => "animation_settled",
+            A::ContrastMeetsWcag { .. } => "contrast_meets_wcag",
+            A::ImagePaletteWithin { .. } => "image_palette_within",
+            A::NoNearDuplicateImages { .. } => "no_near_duplicate_images",
+            A::NoPlaceholderImages { .. } => "no_placeholder_images",
+            A::ImageFocalVisible { .. } => "image_focal_visible",
+            A::TransparentImageLegible { .. } => "transparent_image_legible",
+            A::SalienceOrder { .. } => "salience_order",
+            A::ImageSharpnessAtLeast { .. } => "image_sharpness_at_least",
+            A::ImageBlockinessWithin { .. } => "image_blockiness_within",
+            A::SettledWithin { .. } => "settled_within",
+            A::StateEnteredWithin { .. } => "state_entered_within",
+        }
+    }
+
+    /// Every name [`assertion_wire_name`] returns, in its arm order. Keep the
+    /// two together: an arm added there belongs here too.
+    const ASSERTION_WIRE_NAMES: [&str; 22] = [
+        "no_overlap",
+        "element_above",
+        "contains_text",
+        "text_fits_container",
+        "aligned_horizontally",
+        "aligned_vertically",
+        "color_within",
+        "typography_consistent",
+        "no_layout_shift_since",
+        "no_clipping",
+        "animation_settled",
+        "contrast_meets_wcag",
+        "image_palette_within",
+        "no_near_duplicate_images",
+        "no_placeholder_images",
+        "image_focal_visible",
+        "transparent_image_legible",
+        "salience_order",
+        "image_sharpness_at_least",
+        "image_blockiness_within",
+        "settled_within",
+        "state_entered_within",
+    ];
+
+    /// One parsed instance of every assertion type, from the wire form a
+    /// caller writes — so a linked vision-core that lacks a type fails here
+    /// rather than 422-ing a caller the hint invited to send it.
+    fn assertion_samples() -> Vec<qontinui_vision_core::Assertion> {
+        serde_json::from_str(
+            r#"[
+                {"type":"no_overlap","elements":["a","b"]},
+                {"type":"element_above","elements":["a","b"]},
+                {"type":"contains_text","target":{"element":"a"},"text":"Save"},
+                {"type":"text_fits_container","element":"a"},
+                {"type":"aligned_horizontally","elements":["a","b"]},
+                {"type":"aligned_vertically","elements":["a","b"]},
+                {"type":"color_within","element":"a","expected":{"r":1,"g":2,"b":3},"delta_e_max":2.0},
+                {"type":"typography_consistent","elements":["a","b"],"dimensions":["font_size"]},
+                {"type":"no_layout_shift_since","baseline":"b0"},
+                {"type":"no_clipping"},
+                {"type":"animation_settled","settle_frames":3},
+                {"type":"contrast_meets_wcag","element":"a"},
+                {"type":"image_palette_within","element":"hero","palette":[{"r":10,"g":20,"b":30}],
+                 "max_delta_e":10.0,"min_coverage":0.6},
+                {"type":"no_near_duplicate_images","max_hamming":6},
+                {"type":"no_placeholder_images"},
+                {"type":"image_focal_visible","element":"hero",
+                 "focal":{"x":0.25,"y":0.25,"width":0.5,"height":0.5}},
+                {"type":"transparent_image_legible","element":"logo","min_ratio":3.0},
+                {"type":"salience_order","cta_id":"cta"},
+                {"type":"image_sharpness_at_least","element":"hero","min_sharpness":50.0},
+                {"type":"image_blockiness_within","element":"hero","max_blockiness":1.5},
+                {"type":"settled_within","ms":500},
+                {"type":"state_entered_within","state":"checkout","ms":500}
+            ]"#,
+        )
+        .expect("every advertised assertion type must parse against the linked vision-core")
+    }
+
+    /// No `_` arm: a new `Analyzer` variant fails this test build until it
+    /// is given an arm here, beside [`ANALYZER_WIRE_NAMES`].
+    fn analyzer_wire_name(a: qontinui_vision_core::Analyzer) -> &'static str {
+        use qontinui_vision_core::Analyzer as A;
+        match a {
+            A::Layout => "layout",
+            A::Typography => "typography",
+            A::Color => "color",
+            A::Dynamic => "dynamic",
+            A::Elements => "elements",
+            A::Image => "image",
+        }
+    }
+
+    /// Every name [`analyzer_wire_name`] returns, in its arm order. Keep the
+    /// two together: an arm added there belongs here too.
+    const ANALYZER_WIRE_NAMES: [&str; 6] = [
+        "layout",
+        "typography",
+        "color",
+        "dynamic",
+        "elements",
+        "image",
+    ];
+
+    /// The `/vision/analyze` 422 hint advertises the analyzer vocabulary the
+    /// same way the assert hint does, and drifts the same way: `image` (image
+    /// plan Phase 15) was added to vision-core while this list stayed at
+    /// five. [`analyzer_wire_name`]'s missing `_` arm forces a new variant
+    /// to be named beside [`ANALYZER_WIRE_NAMES`], which must equal the
+    /// advertised list; every name must parse as an `Analyzer` of the crate
+    /// this runner links and map back to itself through the match and
+    /// through vision-core's own `name()`. An arm added without its name in
+    /// the array is not detectable at runtime (nothing enumerates the enum).
+    #[test]
+    fn analyze_request_hint_advertises_every_analyzer() {
+        const EXPECTED: [&str; 6] = [
+            "layout",
+            "typography",
+            "color",
+            "dynamic",
+            "elements",
+            "image",
+        ];
+
+        let data = <AnalyzeRequest as RequestHints>::shape_error_data()
+            .expect("AnalyzeRequest must advertise shape_error_data");
+        let advertised: Vec<&str> = data["allowedAnalyzers"]
+            .as_array()
+            .expect("allowedAnalyzers must be an array")
+            .iter()
+            .map(|t| t.as_str().expect("each analyzer is a string"))
+            .collect();
+        assert_eq!(
+            advertised,
+            EXPECTED.as_slice(),
+            "allowedAnalyzers drifted from vision-core's Analyzer enum"
+        );
+        assert_eq!(
+            ANALYZER_WIRE_NAMES, EXPECTED,
+            "ANALYZER_WIRE_NAMES (beside the exhaustive match) drifted from EXPECTED"
+        );
+
+        for name in ANALYZER_WIRE_NAMES {
+            let parsed: qontinui_vision_core::Analyzer =
+                serde_json::from_value(serde_json::json!(name))
+                    .unwrap_or_else(|e| panic!("`{name}` must parse as an Analyzer: {e}"));
+            assert_eq!(parsed.name(), name);
+            assert_eq!(analyzer_wire_name(parsed), name);
+        }
+
+        let prose = <AnalyzeRequest as RequestHints>::shape_error_suggestions()
+            .expect("AnalyzeRequest must advertise shape_error_suggestions")
+            .join(" ");
+        for name in EXPECTED {
+            assert!(
+                prose.contains(&format!("\"{name}\"")),
+                "the prose hint omits `{name}`: {prose}"
+            );
+        }
+    }
+
+    /// `AnalyzeResponse::of` must forward the image analyzer's values. They
+    /// are its whole output — its findings are Info only — so a projection
+    /// that dropped them would answer `degraded`/`checked` with the
+    /// measurements computed and silently discarded. Through the REAL
+    /// analyzer, so the record is the one vision-core actually builds.
+    #[test]
+    fn analyze_response_forwards_image_values() {
+        let frame = Frame::from_rgba(
+            RgbaImage::from_pixel(16, 12, image::Rgba([200, 40, 40, 255])),
+            FrameSource {
+                kind: qontinui_vision_core::FrameSourceKind::Window,
+                scale_factor: 1.0,
+                captured_at: chrono::Utc::now(),
+                capture_backend: Some(qontinui_vision_core::CaptureBackend::MonitorCrop),
+            },
+        );
+        let result = qontinui_vision_core::analyzers::run(
+            qontinui_vision_core::Analyzer::Image,
+            &qontinui_vision_core::AnalyzeInput {
+                frame: Some(&frame),
+                snapshot: None,
+                prior_frame: None,
+            },
+        );
+        let expected = serde_json::to_value(
+            result
+                .image_values
+                .as_ref()
+                .expect("an image run with a frame carries image_values"),
+        )
+        .expect("serialize image values");
+
+        let v = serde_json::to_value(AnalyzeResponse::of(
+            qontinui_vision_core::Analyzer::Image,
+            result,
+            Some(&frame),
+            None,
+            None,
+            chrono::Utc::now(),
+        ))
+        .expect("serialize");
+
+        assert_eq!(v["analyzer"], "image");
+        assert_eq!(
+            v["imageValues"], expected,
+            "imageValues must reach the analyze wire verbatim"
+        );
+        assert!(
+            v["imageValues"]["page"].is_object(),
+            "the page-level values must be on the wire: {v}"
+        );
+
+        // And it is absent, not null, for an analyzer that measures none.
+        let layout = serde_json::to_value(AnalyzeResponse::of(
+            qontinui_vision_core::Analyzer::Layout,
+            qontinui_vision_core::AnalyzerResult::checked(None, vec![]),
+            None,
+            None,
+            None,
+            chrono::Utc::now(),
+        ))
+        .expect("serialize");
+        assert!(
+            layout.get("imageValues").is_none(),
+            "imageValues must be omitted when the analyzer measured none: {layout}"
+        );
+    }
+
     /// The `/vision/assert` 422 hint is the only place the assertion DSL's
     /// vocabulary is advertised to a caller, and it is a hand-maintained
     /// duplicate of `qontinui_vision_core::assertions::Assertion` rather than
-    /// a derivation of it — the enum has no `strum`-style variant iterator, so
-    /// nothing links the two. Adding `element_above` (U3) took the list from
-    /// 11 to 12; without a pin, a variant added upstream stays undiscoverable
-    /// while `evaluate_assertion` (which is variant-agnostic) handles it fine.
+    /// a derivation of it — the enum has no `strum`-style variant iterator.
+    /// Adding `element_above` (U3) took the list from 11 to 12, and the L1
+    /// image assertions (image plan Phase 15) from 12 to 20, and the timeline
+    /// assertions (plan 2026-09-20 Phase 4) to 22; without a pin, a variant
+    /// added upstream stays undiscoverable while `evaluate_assertion` (which
+    /// is variant-agnostic) handles it fine.
+    ///
+    /// What ties the list to the enum, and how far: [`assertion_wire_name`]
+    /// has no `_` arm, so a variant vision-core adds fails this test build
+    /// until it is given an arm there — beside [`ASSERTION_WIRE_NAMES`], which
+    /// this test holds equal to `EXPECTED` and to the names the parsed
+    /// samples map to. Nothing can enumerate the enum's variants at runtime,
+    /// so an arm added WITHOUT its name in that array is caught only if a
+    /// sample of it is added too; the compile error is what puts the author
+    /// next to both.
     ///
     /// The prose hint and the structured array are ALSO two separate copies of
     /// the same list, so both are checked here.
     #[test]
     fn assert_request_hint_advertises_the_full_assertion_vocabulary() {
-        const EXPECTED: [&str; 12] = [
+        const EXPECTED: [&str; 22] = [
             "no_overlap",
             "element_above",
             "contains_text",
@@ -2962,7 +3480,39 @@ mod tests {
             "no_clipping",
             "animation_settled",
             "contrast_meets_wcag",
+            "image_palette_within",
+            "no_near_duplicate_images",
+            "no_placeholder_images",
+            "image_focal_visible",
+            "transparent_image_legible",
+            "salience_order",
+            "image_sharpness_at_least",
+            "image_blockiness_within",
+            "settled_within",
+            "state_entered_within",
         ];
+
+        // The names the exhaustive match knows are the advertised ones.
+        assert_eq!(
+            ASSERTION_WIRE_NAMES, EXPECTED,
+            "ASSERTION_WIRE_NAMES (beside the exhaustive match) drifted from EXPECTED"
+        );
+        // One sample per name, each mapping through the match to that name and
+        // round-tripping through the linked crate's serde as that variant.
+        let sampled: Vec<&str> = assertion_samples()
+            .iter()
+            .map(|sample| {
+                let name = assertion_wire_name(sample);
+                let wire = serde_json::to_value(sample).expect("serialize assertion");
+                assert_eq!(wire["type"], name, "wire tag of {sample:?}");
+                name
+            })
+            .collect();
+        assert_eq!(
+            sampled,
+            ASSERTION_WIRE_NAMES.as_slice(),
+            "one sample per wire name, in order"
+        );
 
         let data = <AssertRequest as RequestHints>::shape_error_data()
             .expect("AssertRequest must advertise shape_error_data");
@@ -3035,7 +3585,8 @@ mod tests {
         // Mirror exactly the struct the cache-HIT branch builds: every field
         // populated from the cache entry, `capture_backend: None`.
         let resp = CaptureResponse {
-            path: "tmp_vision_cache/deadbeef.jpeg".to_string(),
+            url: "/ui-bridge/vision/cache/deadbeef".to_string(),
+            base64: None,
             sha256: "deadbeef".to_string(),
             width: 1280,
             height: 720,
@@ -3078,7 +3629,7 @@ mod tests {
 
     /// Regression: the GET-by-sha handler must scan the SAME absolute root the
     /// writer (`VisionCache::put`) uses (`VisionCache::root()`), not a
-    /// CWD-relative `"tmp_vision_cache"`. Before the fix, the reader resolved a
+    /// CWD-relative directory name. Before the fix, the reader resolved a
     /// bare relative path against the process CWD (≠ runner root), so every
     /// GET-by-sha 404'd with "cache empty" even though the file existed under the
     /// absolute cache root. `find_cache_file` driven by `cache.root()` finds it.
@@ -3231,6 +3782,7 @@ mod tests {
             ..Default::default()
         };
         let result = qontinui_vision_core::AnalyzerResult::blocked(
+            qontinui_vision_core::UnknownCode::InputMissing,
             "no element carries a bbox (0/7)".to_string(),
             None,
             vec![],
@@ -3280,7 +3832,12 @@ mod tests {
 
         let v = serde_json::to_value(AnalyzeResponse::of(
             qontinui_vision_core::Analyzer::Color,
-            qontinui_vision_core::AnalyzerResult::blocked("n/a".to_string(), None, vec![]),
+            qontinui_vision_core::AnalyzerResult::blocked(
+                qontinui_vision_core::UnknownCode::InputMissing,
+                "n/a".to_string(),
+                None,
+                vec![],
+            ),
             Some(&frame),
             None,
             None,
@@ -3569,6 +4126,7 @@ mod tests {
         let result = qontinui_vision_core::AssertionResult {
             passed: true,
             outcome: qontinui_vision_core::AssertionOutcome::Passed,
+            code: None,
             detail: Some("read 'Save' from 2 OCR blocks".to_string()),
             assertion: qontinui_vision_core::Assertion::NoOverlap {
                 elements: ["save-btn".to_string(), "cancel-btn".to_string()],
@@ -3582,6 +4140,7 @@ mod tests {
         let qontinui_vision_core::AssertionResult {
             passed: _,
             outcome: _,
+            code: _,
             detail: _,
             assertion: _,
             confidence: _,
@@ -3788,6 +4347,7 @@ mod tests {
         let deduced = qontinui_vision_core::AssertionResult {
             passed: true,
             outcome: qontinui_vision_core::AssertionOutcome::Passed,
+            code: None,
             detail: None,
             assertion: qontinui_vision_core::Assertion::NoOverlap {
                 elements: ["a".to_string(), "b".to_string()],
@@ -3799,6 +4359,7 @@ mod tests {
         let estimated = qontinui_vision_core::AssertionResult {
             passed: true,
             outcome: qontinui_vision_core::AssertionOutcome::Passed,
+            code: None,
             detail: Some("lowest contributing OCR block".to_string()),
             assertion: qontinui_vision_core::Assertion::NoOverlap {
                 elements: ["c".to_string(), "d".to_string()],
@@ -3924,5 +4485,128 @@ mod capture_fallback_tests {
             2,
             "monitor_crop_count must bump to 2 after the second fallback frame"
         );
+    }
+}
+
+/// Plan 2026-09-20 Phase 4 acceptance 3 through `/vision/assert`'s
+/// `timelineRef` path: the timeline a ref resolves to is what
+/// `animation_settled` evaluates; an unresolved ref is unknown, never a pass.
+#[cfg(test)]
+mod timeline_ref_tests {
+    use super::*;
+    use crate::journey::read::{LedgerUnavailable, TimelineRefLookup};
+    use crate::journey::test_fixtures::{anim, timeline};
+    use qontinui_vision_core::{Assertion, AssertionOutcome, EvalContext, UnknownCode};
+
+    fn evaluate(lookup: TimelineRefLookup) -> (Vec<AssertionResult>, TimelineRefResolution) {
+        let (t, resolution) = TimelineRefResolution::of("ref-1", "qontinui-web", lookup);
+        let ctx = EvalContext {
+            timeline: t.as_deref(),
+            ..Default::default()
+        };
+        let mut results: Vec<_> = [
+            Assertion::AnimationSettled { region: None },
+            Assertion::SettledWithin { ms: 500 },
+        ]
+        .iter()
+        .map(|a| qontinui_vision_core::evaluate_assertion(a, &ctx))
+        .collect();
+        resolution.annotate(&mut results);
+        (results, resolution)
+    }
+
+    use qontinui_vision_core::AssertionResult;
+
+    /// The stored projection, as the ledger read returns it.
+    fn stored(events: Vec<serde_json::Value>) -> TimelineRefLookup {
+        TimelineRefLookup::Found(Box::new(timeline(events, 120).for_ledger()))
+    }
+
+    #[test]
+    fn animation_settled_fails_when_the_last_event_is_animation_started() {
+        let (r, res) = evaluate(stored(vec![anim("animation-started", 50, "spin")]));
+        assert!(res.loaded);
+        assert_eq!(r[0].outcome, AssertionOutcome::Failed, "{r:?}");
+    }
+
+    #[test]
+    fn animation_settled_passes_when_it_ended() {
+        let (r, _) = evaluate(stored(vec![
+            anim("animation-started", 50, "spin"),
+            anim("animation-ended", 90, "spin"),
+        ]));
+        assert_eq!(r[0].outcome, AssertionOutcome::Passed, "{r:?}");
+        assert_eq!(
+            r[1].outcome,
+            AssertionOutcome::Passed,
+            "settled at 120 <= 500"
+        );
+    }
+
+    #[test]
+    fn a_bad_ref_is_unknown_with_the_resolution_code_never_a_pass() {
+        for (lookup, code) in [
+            (TimelineRefLookup::NotFound, UnknownCode::NoObservations),
+            (TimelineRefLookup::NoTimeline, UnknownCode::InputMissing),
+            (TimelineRefLookup::Unparseable, UnknownCode::ProducerFailed),
+            (
+                TimelineRefLookup::Withdrawn("2026-10-01T00:00:00Z".into()),
+                UnknownCode::StaleInput,
+            ),
+            (
+                TimelineRefLookup::Unavailable(LedgerUnavailable::SchemaAbsent),
+                UnknownCode::LedgerSchemaAbsent,
+            ),
+            (
+                TimelineRefLookup::Unavailable(LedgerUnavailable::Failed("x".into())),
+                UnknownCode::ProducerFailed,
+            ),
+        ] {
+            let (r, res) = evaluate(lookup);
+            assert!(!res.loaded);
+            for result in &r {
+                assert_eq!(result.outcome, AssertionOutcome::Unknown, "{result:?}");
+                assert!(!result.passed);
+                assert_eq!(result.code, Some(code));
+            }
+        }
+    }
+
+    /// A ref the app-scoped read did not find (another app's observation
+    /// included) is unknown and says which app it was looked up in.
+    #[test]
+    fn a_ref_not_found_in_the_app_names_the_app() {
+        let (r, res) = evaluate(TimelineRefLookup::NotFound);
+        assert_eq!(res.app_id, "qontinui-web");
+        assert!(res
+            .unknown
+            .as_ref()
+            .unwrap()
+            .detail
+            .contains("of app \"qontinui-web\""));
+        assert!(r.iter().all(|x| x.outcome == AssertionOutcome::Unknown));
+    }
+
+    /// The agent-facing hint states the scoping, so a caller is never left to
+    /// discover it from an unknown.
+    #[test]
+    fn the_request_hint_states_that_timeline_ref_is_app_scoped() {
+        let prose = <AssertRequest as RequestHints>::shape_error_suggestions()
+            .unwrap()
+            .join(" ");
+        assert!(prose.contains("timelineRef"), "{prose}");
+        assert!(prose.contains("resolves only within the app"), "{prose}");
+        assert!(prose.contains("`target`"), "{prose}");
+    }
+
+    #[test]
+    fn the_request_accepts_both_spellings_of_timeline_ref() {
+        for body in [
+            r#"{"assertions":[{"type":"animation_settled"}],"timelineRef":"abc"}"#,
+            r#"{"assertions":[{"type":"animation_settled"}],"timeline_ref":"abc"}"#,
+        ] {
+            let req: AssertRequest = serde_json::from_str(body).unwrap();
+            assert_eq!(req.timeline_ref.as_deref(), Some("abc"));
+        }
     }
 }

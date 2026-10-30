@@ -10,6 +10,12 @@
 //! | `GET /agent-worktrees/reclaimable` | Project coord's reap decision for THIS device — the reapable set PLUS every blocked worktree with the guard that blocked it. |
 //! | `POST /agent-worktrees/reclaim` | Remove ONLY coord-cleared, locally-reverified worktrees. Returns `{removed, skipped:[{id, reason}]}`. |
 //!
+//! Plus one mid-session door that removes nothing:
+//! `POST /agent-worktrees/edit-sibling {path, repo}` takes ONE declared build
+//! sibling off an allocation's `.siblings/` cargo override so the session's
+//! edits to that sibling reach its build (plan
+//! `2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits`).
+//!
 //! ### Why NOT `/worktrees/*`
 //!
 //! `/worktrees` on this same `:9876` API is **already taken** by an
@@ -69,6 +75,7 @@ use axum::{
     Router,
 };
 
+use crate::agent_worktree::edit_sibling::{EditSiblingError, EditSiblingOutcome};
 use crate::agent_worktree::on_demand::{self, ReclaimRequest, SurveyQuery};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
@@ -85,6 +92,98 @@ pub fn routes() -> Router<Arc<ApiState>> {
         // the worktrees holding real uncommitted work whose owning session is
         // NOT live, each with its WIP summary and a ready-to-run resume line.
         .route("/agent-worktrees/wip-orphans", get(wip_orphans_handler))
+        // Mid-session edit-sibling door (plan
+        // `2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits`,
+        // Phase 3). It writes under a caller-named path, so it is a
+        // `CREDENTIAL_DOORS` entry in `origin_guard.rs` (vet V4).
+        .route("/agent-worktrees/edit-sibling", post(edit_sibling_handler))
+}
+
+/// Body of `POST /agent-worktrees/edit-sibling`.
+#[derive(Debug, serde::Deserialize)]
+pub struct EditSiblingRequest {
+    /// Any directory inside the allocation (a worktree, or below one).
+    pub path: String,
+    /// The sibling to take off the store override — bare or `owner/name`.
+    pub repo: String,
+}
+
+/// The HTTP status a typed [`EditSiblingError`] answers with.
+fn edit_sibling_status(err: &EditSiblingError) -> StatusCode {
+    match err {
+        EditSiblingError::InvalidRepo(_) | EditSiblingError::NotAnAllocation(_) => {
+            StatusCode::BAD_REQUEST
+        }
+        EditSiblingError::NoSuchSiblingWorktree(_) => StatusCode::NOT_FOUND,
+        EditSiblingError::ConfigUnparseable(_) => StatusCode::CONFLICT,
+        EditSiblingError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// A typed refusal body: `success: false`, the detail in `error`, the stable
+/// code in `code`.
+fn edit_sibling_refusal(err: &EditSiblingError) -> (StatusCode, Json<ApiResponse<()>>) {
+    let mut body = api_error(err.message().to_string());
+    body.code = Some(err.code().to_string());
+    (edit_sibling_status(err), Json(body))
+}
+
+/// `POST /agent-worktrees/edit-sibling`
+///
+/// Take ONE declared build sibling off an allocation's sibling-store cargo
+/// override, mid-session, so cargo resolves the allocation's own editable
+/// `<agent_root>/<repo>` worktree instead of the read-only `.siblings/` copy.
+/// Every OTHER sibling stays on the store. See
+/// [`crate::agent_worktree::edit_sibling::apply`].
+///
+/// Request — a JSON body, so the caller MUST send
+/// `Content-Type: application/json` (axum's `Json` extractor answers 415
+/// without it); the coord-generated config header names this exact call:
+/// ```jsonc
+/// { "path": "<any dir inside the allocation>", "repo": "qontinui-schemas" }
+/// ```
+/// e.g. `curl -s -X POST http://127.0.0.1:9876/agent-worktrees/edit-sibling
+/// -H 'Content-Type: application/json' -d '{"path":"…","repo":"qontinui-schemas"}'`.
+///
+/// Response (`200`, idempotent — a repeat call answers `removed: []`):
+/// ```jsonc
+/// { "success": true, "data": {
+///     "repo": "qontinui-schemas", "agent_root": "…/qontinui-worktrees/<agent>",
+///     "removed": ["../.siblings/qontinui-schemas@<sha>/rust"],
+///     "config_path": "…/.cargo/config.toml", "config_present": true,
+///     "marker_path": "…/.cargo/edit-siblings", "edit_siblings": ["qontinui-schemas"],
+///     "sibling_worktree": "…/<agent>/qontinui-schemas",
+///     "head": "<sha>", "branch": "agent/…", "default_branch": "main",
+///     "behind_default": 28,
+///     "hint": "git -C …/qontinui-schemas merge --ff-only origin/main" } }
+/// ```
+///
+/// Typed refusals (`code`), each of the first four leaving the config and the
+/// marker untouched: `400 invalid_edit_sibling`, `400 not_an_allocation`,
+/// `404 no_such_sibling_worktree`, `409 config_unparseable`. A `500 io_error`
+/// raised while rewriting the config may follow an already-recorded marker; a
+/// repeat call converges.
+async fn edit_sibling_handler(
+    Json(req): Json<EditSiblingRequest>,
+) -> Result<Json<ApiResponse<EditSiblingOutcome>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Blocking: file I/O plus a few bounded `git` reads.
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::agent_worktree::edit_sibling::apply(std::path::Path::new(&req.path), &req.repo)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("edit-sibling task failed: {e}"))),
+        )
+    })?;
+    match outcome {
+        Ok(outcome) => Ok(Json(ApiResponse::success(outcome))),
+        Err(e) => {
+            tracing::warn!("POST /agent-worktrees/edit-sibling refused: {e}");
+            Err(edit_sibling_refusal(&e))
+        }
+    }
 }
 
 /// `GET /agent-worktrees/reclaimable`
@@ -95,7 +194,6 @@ pub fn routes() -> Router<Arc<ApiState>> {
 ///     "coord_reachable": true,
 ///     "coord_error": null,
 ///     "remove_armed": false,      // informational; this path does not need it
-///     "rejunction_armed": false,
 ///     "canonical_excluded": 12,   // canonical checkouts filtered out (never reapable)
 ///     "items": [
 ///       { "id": "d:/qontinui-root/qontinui-runner-wt-a",
@@ -235,7 +333,7 @@ async fn wip_orphans_handler(
 /// `building` (G6) | `not-landed` (G2) | `main-merge` (G4) | `grace` (G5) |
 /// `not-a-candidate` | `stale-census` | `undeclared-not-removable` |
 /// `landed-idle-not-removable` | `not-cleared` |
-/// `coord-unreachable` | `absent` | `not-reapable` | `error`. Every refusal is listed — never a silent drop.
+/// `coord-unreachable` | `absent` | `not-reapable` | `sibling-busy` | `error`. Every refusal is listed — never a silent drop.
 async fn reclaim_handler(
     State(_state): State<Arc<ApiState>>,
     body: Option<Json<ReclaimRequest>>,
@@ -247,5 +345,105 @@ async fn reclaim_handler(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error(format!("worktree reclaim failed: {e}"))),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{header, Request};
+    use tower::ServiceExt as _;
+
+    async fn post_edit_sibling(body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let app: Router =
+            Router::new().route("/agent-worktrees/edit-sibling", post(edit_sibling_handler));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/agent-worktrees/edit-sibling")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// Plan 2026-10-10 Phase 3: the route answers its typed refusals with the
+    /// right status and a stable `code`.
+    #[tokio::test]
+    async fn edit_sibling_route_answers_typed_refusals() {
+        let outside = tempfile::tempdir().unwrap();
+        let (status, body) = post_edit_sibling(serde_json::json!({
+            "path": outside.path().to_string_lossy(),
+            "repo": "qontinui-schemas",
+        }))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "not_an_allocation");
+        assert_eq!(body["success"], false);
+
+        let (status, body) = post_edit_sibling(serde_json::json!({
+            "path": outside.path().to_string_lossy(),
+            "repo": "..",
+        }))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "invalid_edit_sibling");
+    }
+
+    /// The contract the coord-generated config header documents: a JSON body
+    /// WITH `Content-Type: application/json`. Without the header axum refuses
+    /// before the handler runs, so the doc must keep naming it.
+    #[tokio::test]
+    async fn edit_sibling_route_requires_a_json_content_type() {
+        let app: Router =
+            Router::new().route("/agent-worktrees/edit-sibling", post(edit_sibling_handler));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/agent-worktrees/edit-sibling")
+            .body(Body::from(r#"{"path":"x","repo":"qontinui-schemas"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[test]
+    fn edit_sibling_statuses_are_typed() {
+        for (err, status, code) in [
+            (
+                EditSiblingError::InvalidRepo("x".into()),
+                StatusCode::BAD_REQUEST,
+                "invalid_edit_sibling",
+            ),
+            (
+                EditSiblingError::NotAnAllocation("x".into()),
+                StatusCode::BAD_REQUEST,
+                "not_an_allocation",
+            ),
+            (
+                EditSiblingError::NoSuchSiblingWorktree("x".into()),
+                StatusCode::NOT_FOUND,
+                "no_such_sibling_worktree",
+            ),
+            (
+                EditSiblingError::ConfigUnparseable("x".into()),
+                StatusCode::CONFLICT,
+                "config_unparseable",
+            ),
+            (
+                EditSiblingError::Io("x".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "io_error",
+            ),
+        ] {
+            let (s, Json(body)) = edit_sibling_refusal(&err);
+            assert_eq!(s, status, "{err}");
+            assert_eq!(body.code.as_deref(), Some(code));
+            assert_eq!(body.error.as_deref(), Some("x"));
+        }
     }
 }

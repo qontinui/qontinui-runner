@@ -755,6 +755,7 @@ fn pty_child_command(
         crate::terminal::runner_context(
             crate::terminal::spawn_seam_api_port(),
             crate::coord_mcp::CoordMcpDelivery::Unknown,
+            &crate::served_corpus::ServedCorpus::unknown("no session"),
         ),
     );
 
@@ -834,6 +835,7 @@ fn seam_reports(fp: &EnvFingerprinter, config_dir: Option<&str>) -> Vec<SeamEnvR
     crate::agent_runtime::finalize_headless_child_env(
         &mut headless,
         crate::coord_mcp::CoordMcpDelivery::Unknown,
+        &crate::served_corpus::ServedCorpus::unknown("no session"),
     );
 
     // console-ok: built to fingerprint the seam env, never spawned (see above).
@@ -1263,9 +1265,9 @@ pub(crate) fn coord_prompt_documents_reading(
 ///
 /// # The freshness asymmetry, reported rather than smoothed over
 ///
-/// Four caches sit behind one poll loop and they do not agree about what they
+/// Five caches sit behind one poll loop and they do not agree about what they
 /// can tell you. The session-briefing cache carries `fetched_at` +
-/// `provenance` per document, so this row prints them. The other three are a
+/// `provenance` per document, so this row prints them. The other four are a
 /// bare `RwLock<T>` holding a value and nothing else, so their last-refresh
 /// time is genuinely unavailable — and the row says `UNKNOWN` for it rather
 /// than substituting `captured_at`. Substituting would make every dial look
@@ -1348,8 +1350,8 @@ pub(crate) fn fleet_policy_dial_reading(
     let value = format!(
         "install_interception={}{} | session floors host warn={} crit={}, wsl warn={} crit={}, \
          thread ceilings warn={} crit={} | \
-         plan_capture={}{} (armed at {:?}; {}) | briefings: {} | poll interval {} ms | last refresh of \
-         the first three caches: {}",
+         plan_capture={}{} (armed at {:?}; {}) | account_selection_mode={} | briefings: {} | poll \
+         interval {} ms | last refresh of the value-only caches (all but the briefings): {}",
         dial.install_intercept_mode,
         ambiguous(&dial.install_intercept_mode, dial.install_intercept_default),
         floor(dial.host_warn_free_bytes),
@@ -1367,6 +1369,11 @@ pub(crate) fn fleet_policy_dial_reading(
             "coord has NOT answered this process — the level is the unconfirmed default and \
              plan-capture writes are held"
         },
+        // `None` is NO fleet opinion (the machine's local mode governs) — it
+        // must never render as a mode, or the row would claim a fleet value
+        // that is not there.
+        dial.account_selection_mode
+            .unwrap_or("(no fleet opinion — the local mode governs)"),
         briefings,
         dial.poll_interval_ms,
         if dial.caches_expose_refresh_time {
@@ -1378,7 +1385,7 @@ pub(crate) fn fleet_policy_dial_reading(
     );
     LayerReading::known(
         value,
-        "mcp::fleet_policy_poller::dial_snapshot (four process-global caches, one poll loop — \
+        "mcp::fleet_policy_poller::dial_snapshot (five process-global caches, one poll loop — \
          TIME-VARYING with no restart)",
         captured_at,
     )
@@ -1745,9 +1752,9 @@ pub(crate) struct SettingsDerivedInputs {
 ///   `load_with_migration()`, which runs the one-shot seed migration and WRITES
 ///   `claude-accounts.json`. The overlay itself is
 ///   `claude_accounts::apply_roster_overlay`, unchanged, because it overwrites
-///   `ai.claude_cli.{account_selection_mode, config_dir}` UNCONDITIONALLY when
-///   the roster exists and the per-instance copies in settings.json are stale
-///   shadows.
+///   `ai.claude_cli.{account_selection_mode, account_selection_pinned, config_dir}`
+///   UNCONDITIONALLY when the roster exists and the per-instance copies in
+///   settings.json are stale shadows.
 ///
 /// Layer 11's cost of taking the read variant is stated in
 /// [`claude_config_dir_reading`]: on a machine where the seed has NOT run, this
@@ -2027,7 +2034,9 @@ mod tests {
     /// Three assertions, and the middle one is the non-vacuity control.
     #[test]
     fn config_report_never_reaches_the_settings_writer() {
-        let _amb = crate::test_env::isolated_ambient();
+        // The report reaches `get_effective_config_dir` (the fleet term and
+        // `RESOLVED_CONFIG_DIR`): ambient THEN fleet pin, via the one helper.
+        let _amb = crate::mcp::fleet_policy_poller::isolated_ambient_with_fleet_pin();
         use crate::settings::settings_full_load_count;
 
         // (1) CONTROL — the instrument fires. Without this the whole test could
@@ -2404,6 +2413,14 @@ mod tests {
                 "C:/claude/acct-d",
                 "request_override",
             ),
+            (
+                (
+                    Some("C:/q/model-gateway/claude-config".to_string()),
+                    ClaudeConfigDirSource::ModelGateway,
+                ),
+                "C:/q/model-gateway/claude-config",
+                "model_gateway",
+            ),
             // An account IS configured and its credentials are dead …
             (
                 (None, ClaudeConfigDirSource::RejectedNoCredentials),
@@ -2434,10 +2451,12 @@ mod tests {
     /// only shows up here.
     #[test]
     fn config_report_live_command_injects_every_bin_layer() {
-        let _amb = crate::test_env::isolated_ambient();
+        // The report reaches `get_effective_config_dir` (the fleet term and
+        // `RESOLVED_CONFIG_DIR`): ambient THEN fleet pin, via the one helper.
+        let _amb = crate::mcp::fleet_policy_poller::isolated_ambient_with_fleet_pin();
         let report = config_report_run();
         let specs: Vec<&LayerSpec> = report.rows.iter().map(|r| r.spec).collect();
-        assert_eq!(specs.len(), 15, "every layer gets a row");
+        assert_eq!(specs.len(), 17, "every layer gets a row");
 
         match &report
             .row("api_endpoint_registry")
@@ -3202,6 +3221,7 @@ mod tests {
             plan_capture_default: "record",
             plan_capture_record_level: "record",
             plan_capture_answered: true,
+            account_selection_mode: None,
             briefings,
             caches_expose_refresh_time: false,
         }
@@ -3258,8 +3278,9 @@ mod tests {
 
         assert!(
             value.contains(
-                "last refresh of the first three caches: UNKNOWN — those caches hold a value \
-                 and no stamp; the report REFUSES to substitute its own read time"
+                "last refresh of the value-only caches (all but the briefings): UNKNOWN — those \
+                 caches hold a value and no stamp; the report REFUSES to substitute its own read \
+                 time"
             ),
             "the row must refuse to invent a refresh time: {value}"
         );
@@ -3326,6 +3347,26 @@ mod tests {
             "a non-default level (an explicit off row) must not be annotated as ambiguous: \
              {value}"
         );
+
+        // The fleet account-selection mode: `None` is NO fleet opinion and
+        // must never render as a mode; a named one renders its wire spelling.
+        assert!(
+            value.contains("account_selection_mode=(no fleet opinion — the local mode governs)"),
+            "got {value}"
+        );
+        let mut named = d.clone();
+        named.account_selection_mode = Some("highest_expected_usage");
+        let LayerReading::Known {
+            value: named_value, ..
+        } = fleet_policy_dial_reading(&named, fixed_stamp())
+        else {
+            panic!("the runner app always resolves layer 10");
+        };
+        assert!(
+            named_value.contains("account_selection_mode=highest_expected_usage |"),
+            "got {named_value}"
+        );
+
         assert!(
             source.contains("TIME-VARYING with no restart"),
             "got {source}"
@@ -3662,7 +3703,9 @@ mod tests {
     /// only here.
     #[test]
     fn config_report_live_command_injects_every_phase_4_layer() {
-        let _amb = crate::test_env::isolated_ambient();
+        // The report reaches `get_effective_config_dir` (the fleet term and
+        // `RESOLVED_CONFIG_DIR`): ambient THEN fleet pin, via the one helper.
+        let _amb = crate::mcp::fleet_policy_poller::isolated_ambient_with_fleet_pin();
         let report = config_report_run();
 
         for (name, expected_source_fragment) in [
@@ -3912,7 +3955,9 @@ mod tests {
     /// list). Guards the wiring the pure tests above bypass.
     #[test]
     fn config_report_live_command_injects_the_settings_struct_layer() {
-        let _amb = crate::test_env::isolated_ambient();
+        // The report reaches `get_effective_config_dir` (the fleet term and
+        // `RESOLVED_CONFIG_DIR`): ambient THEN fleet pin, via the one helper.
+        let _amb = crate::mcp::fleet_policy_poller::isolated_ambient_with_fleet_pin();
         let report = config_report_run();
         match &report.row("settings_struct").expect("row present").reading {
             LayerReading::Known { value, source, .. } => {
@@ -3950,7 +3995,9 @@ mod tests {
     /// this test, would catch.
     #[test]
     fn config_report_live_render_carries_no_settings_field_value() {
-        let _amb = crate::test_env::isolated_ambient();
+        // The report reaches `get_effective_config_dir` (the fleet term and
+        // `RESOLVED_CONFIG_DIR`): ambient THEN fleet pin, via the one helper.
+        let _amb = crate::mcp::fleet_policy_poller::isolated_ambient_with_fleet_pin();
         // The NON-MUTATING reader, deliberately: this test used to call
         // `load_settings_full`, which mints a `local_user_id` and persists it —
         // a test that writes the operator's settings.json to check that the
@@ -4345,7 +4392,9 @@ mod tests {
     /// boot has already consumed the one-shot migration.
     #[test]
     fn config_report_live_command_writes_nothing_it_reports_on() {
-        let _amb = crate::test_env::isolated_ambient();
+        // The report reaches `get_effective_config_dir` (the fleet term and
+        // `RESOLVED_CONFIG_DIR`): ambient THEN fleet pin, via the one helper.
+        let _amb = crate::mcp::fleet_policy_poller::isolated_ambient_with_fleet_pin();
         fn fingerprint(
             path: &std::path::Path,
         ) -> (bool, Option<u64>, Option<std::time::SystemTime>) {
@@ -4393,7 +4442,7 @@ mod tests {
 
         // …and the rows still resolved, so this is not a vacuous pass over a
         // report that failed to run.
-        assert_eq!(report.rows.len(), 15);
+        assert_eq!(report.rows.len(), 17);
         match &report.row("settings_struct").expect("row present").reading {
             LayerReading::Known { source, .. } => assert!(
                 source.contains("read_settings_from_disk"),
@@ -4444,7 +4493,9 @@ mod tests {
     /// failed.
     #[test]
     fn config_report_live_full_render_leaks_no_credential_value() {
-        let _amb = crate::test_env::isolated_ambient();
+        // The report reaches `get_effective_config_dir` (the fleet term and
+        // `RESOLVED_CONFIG_DIR`): ambient THEN fleet pin, via the one helper.
+        let _amb = crate::mcp::fleet_policy_poller::isolated_ambient_with_fleet_pin();
         let rendered = config_report_run().render();
         let mut checked = 0usize;
         // `vars_os` + lossy, not `vars()`: the leak check must not itself
@@ -4541,7 +4592,9 @@ mod tests {
     ///    absence assertion trivially.
     #[test]
     fn config_report_planted_credential_urls_never_reach_the_render() {
-        let _amb = crate::test_env::isolated_ambient();
+        // The report reaches `get_effective_config_dir` (the fleet term and
+        // `RESOLVED_CONFIG_DIR`): ambient THEN fleet pin, via the one helper.
+        let _amb = crate::mcp::fleet_policy_poller::isolated_ambient_with_fleet_pin();
         use qontinui_runner_lib::env_generations::{classify_env_var, WithholdReason};
 
         // (name, value, the substring that must not survive anywhere)

@@ -13,6 +13,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { PromptLibraryAuth, PromptTemplate } from "./promptLibraryApi";
 import { listPromptTemplates } from "./promptLibraryApi";
+import { describeThrown } from "@/lib/utils";
 
 export interface PromptLibraryState {
   prompts: PromptTemplate[];
@@ -45,9 +46,7 @@ export function usePromptLibrary(): PromptLibraryState {
         if (seq !== fetchSeq.current) return;
         setPrompts([]);
         setAuth({ state: "ok" });
-        setReason(
-          `prompt library unavailable: ${err instanceof Error ? err.message : String(err)}`,
-        );
+        setReason(`prompt library unavailable: ${describeThrown(err, "unknown error")}`);
       } finally {
         if (seq === fetchSeq.current) setLoading(false);
       }

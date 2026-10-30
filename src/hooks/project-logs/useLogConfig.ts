@@ -17,6 +17,7 @@ import type {
 } from "./types";
 import { convertRawConfigToTypescript } from "./types";
 import { createLogger } from "@/lib/logger";
+import { describeThrown } from "@/lib/utils";
 
 const logger = createLogger("LogConfig");
 
@@ -84,7 +85,7 @@ export function useLogConfig(): UseLogConfigReturn {
       }
     } catch (err) {
       console.error("[PROJECT_LOGS] Failed to load config:", err);
-      setError(err instanceof Error ? err.message : String(err));
+      setError(describeThrown(err, "Failed to load log config"));
     } finally {
       setLoading(false);
     }
@@ -129,7 +130,7 @@ export function useLogConfig(): UseLogConfigReturn {
       }
     } catch (err) {
       console.error("[PROJECT_LOGS] Failed to save config:", err);
-      setError(err instanceof Error ? err.message : String(err));
+      setError(describeThrown(err, "Failed to save log config"));
     } finally {
       setLoading(false);
     }

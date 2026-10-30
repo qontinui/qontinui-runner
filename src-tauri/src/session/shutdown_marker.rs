@@ -20,10 +20,25 @@
 //!     marker or `clean:false` ⇒ the previous shutdown was NOT clean ⇒ this
 //!     boot is **crash recovery**.
 //!
+//! ## `clean` is not "teardown finished"
+//!
+//! Both clean writers stamp the marker BEFORE the terminal teardown runs, so
+//! `clean:true` says a planned shutdown STARTED. It does not say the terminals
+//! were closed: a force-exit watchdog can still end the process mid-teardown,
+//! with the marker reading clean. `teardown_complete` is the separate bit that
+//! says it finished. It is set only by `run_teardown`, after
+//! `TerminalManager::close_all` reports a teardown with no kill-only fallback
+//! ([`mark_teardown_complete`]). The drain, a kill-only teardown and the
+//! watchdog all leave it `false`, and a marker written before the field
+//! existed reads `false`. Restore admission trusts the marker as an open-row
+//! anchor only when it is `true` (plan
+//! `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
+//! Phase 3).
+//!
 //! ## Storage
 //!
 //! A single JSON file co-located with the lifecycle store + pane store under
-//! `~/.qontinui/runner/last-shutdown.json` (object `{clean, at}`),
+//! `~/.qontinui/runner/last-shutdown.json` (object `{clean, at, teardown_complete}`),
 //! INSTANCE-scoped exactly like the lifecycle store
 //! ([`crate::session::session_lifecycle_store::store_path`]) so a secondary
 //! does not read/write the primary's marker. Atomic temp-file + rename. A
@@ -45,6 +60,12 @@ pub struct ShutdownMarker {
     pub clean: bool,
     /// Unix epoch millis when this marker was written.
     pub at: i64,
+    /// `true` iff the terminal teardown FINISHED: `close_all` closed every
+    /// terminal with no kill-only fallback. Written only together with
+    /// `clean:true`, by [`mark_teardown_complete`]. Absent in a marker written
+    /// before the field existed, which reads `false`.
+    #[serde(default)]
+    pub teardown_complete: bool,
 }
 
 /// Resolve the marker path for this runner instance — INSTANCE-scoped via
@@ -129,7 +150,7 @@ fn read_marker(path: &Path) -> Option<ShutdownMarker> {
 /// This must be called BEFORE [`mark_running`] overwrites the marker for the
 /// current process.
 pub fn was_unclean_shutdown(path: &Path) -> bool {
-    classify_prior_marker(read_marker(path).as_ref()).crash_recovery
+    classify_prior_marker(read_marker(path).as_ref(), 0).crash_recovery
 }
 
 /// The one-shot classification of THIS boot, derived from the PRIOR
@@ -148,14 +169,50 @@ pub struct BootClassification {
     /// boot instant. Used as one input to the restore path's anchored
     /// recency rule (the registry's "last moment of life").
     pub prior_marker_at: Option<i64>,
+    /// Epoch millis at which THIS process classified its boot — effectively
+    /// the boot instant. It partitions the lifecycle registry into rows whose
+    /// last sign of life predates this process (the prior boot's cohort, the
+    /// set a boot restore exists to bring back) and rows this process has
+    /// itself touched. See `SessionLifecycleStore::restorable_records` and
+    /// `withheld_boot_restore_candidate`.
+    pub booted_at_ms: i64,
+    /// The prior marker's [`ShutdownMarker::teardown_complete`]: `true` only
+    /// when the previous process FINISHED its terminal teardown. `false` for
+    /// an absent, corrupt, running or pre-field marker, and for a clean marker
+    /// whose teardown was cut short (a kill-only fallback, the force-exit
+    /// watchdog). Restore admission uses the marker as an open-row anchor only
+    /// when this is `true` (see `SessionLifecycleStore::restorable_records`).
+    pub teardown_complete: bool,
 }
 
 /// Pure classification core for [`classify_boot`] (testable without the
 /// process-wide [`OnceLock`]).
-fn classify_prior_marker(prior: Option<&ShutdownMarker>) -> BootClassification {
+fn classify_prior_marker(prior: Option<&ShutdownMarker>, booted_at_ms: i64) -> BootClassification {
     BootClassification {
         crash_recovery: prior.map(|m| !m.clean).unwrap_or(true),
         prior_marker_at: prior.map(|m| m.at),
+        booted_at_ms,
+        teardown_complete: prior.is_some_and(|m| m.teardown_complete),
+    }
+}
+
+/// Classify the marker at `path` WITHOUT rewriting it — the read half of
+/// [`classify_boot`] alone. For tests and diagnostics; the boot path must use
+/// [`classify_boot`], which latches once and re-marks the marker running.
+pub fn read_classification(path: &Path, booted_at_ms: i64) -> BootClassification {
+    classify_prior_marker(read_marker(path).as_ref(), booted_at_ms)
+}
+
+/// One line describing the marker on disk at `path`, for a log written just
+/// before the process ends (the force-exit watchdogs). Says `absent or
+/// corrupt` rather than inventing a state.
+pub fn describe_on_disk(path: &Path) -> String {
+    match read_marker(path) {
+        Some(m) => format!(
+            "clean={} teardown_complete={} at={}",
+            m.clean, m.teardown_complete, m.at
+        ),
+        None => "absent or corrupt".to_string(),
     }
 }
 
@@ -169,7 +226,10 @@ static BOOT_CLASSIFICATION: OnceLock<BootClassification> = OnceLock::new();
 /// AI-session resume spawn) cannot double-classify or double-overwrite.
 pub fn classify_boot(path: &Path) -> BootClassification {
     *BOOT_CLASSIFICATION.get_or_init(|| {
-        let classification = classify_prior_marker(read_marker(path).as_ref());
+        let classification = classify_prior_marker(
+            read_marker(path).as_ref(),
+            chrono::Utc::now().timestamp_millis(),
+        );
         mark_running(path);
         classification
     })
@@ -187,28 +247,38 @@ pub fn boot_classification() -> Option<BootClassification> {
 /// If this process later crashes, the `clean:false` marker is what the next
 /// boot reads → crash recovery.
 pub fn mark_running(path: &Path) {
-    write_marker(path, false);
+    write_marker(path, false, false);
 }
 
-/// Flip the marker to `clean:true`. Call from the clean-shutdown paths (drain
-/// completion + the `main.rs` exit seam). Idempotent.
+/// Flip the marker to `clean:true` with the teardown NOT yet complete. Call
+/// from the clean-shutdown paths (drain completion and `run_teardown`, both
+/// BEFORE the terminal teardown). Idempotent.
 pub fn mark_clean_shutdown(path: &Path) {
-    write_marker(path, true);
+    write_marker(path, true, false);
+}
+
+/// Stamp `clean:true, teardown_complete:true`. Only `run_teardown` calls it,
+/// after `TerminalManager::close_all` reported a teardown with no kill-only
+/// fallback. Idempotent.
+pub fn mark_teardown_complete(path: &Path) {
+    write_marker(path, true, true);
 }
 
 /// Best-effort atomic write. Failures are logged, not propagated — a marker
 /// we fail to persist simply degrades to "treated as unclean next boot",
 /// which is the safe direction.
-fn write_marker(path: &Path, clean: bool) {
+fn write_marker(path: &Path, clean: bool, teardown_complete: bool) {
     let marker = ShutdownMarker {
         clean,
         at: chrono::Utc::now().timestamp_millis(),
+        teardown_complete,
     };
     if let Err(e) = write_atomic(path, &marker) {
         warn!(
             error = %e,
             path = %path.display(),
             clean,
+            teardown_complete,
             "shutdown_marker: write failed — marker not persisted"
         );
     }
@@ -299,26 +369,93 @@ mod tests {
     #[test]
     fn classify_prior_marker_covers_all_marker_shapes() {
         // Absent marker → crash recovery, no anchor.
-        let absent = classify_prior_marker(None);
+        let absent = classify_prior_marker(None, 7);
+        assert_eq!(
+            absent.booted_at_ms, 7,
+            "the boot instant is carried verbatim"
+        );
         assert!(absent.crash_recovery);
         assert!(absent.prior_marker_at.is_none());
+        assert!(!absent.teardown_complete);
 
-        // Clean marker → planned restart, anchor = shutdown instant.
-        let clean = classify_prior_marker(Some(&ShutdownMarker {
-            clean: true,
-            at: 1_000,
-        }));
+        // Clean marker whose teardown was cut short → planned restart,
+        // anchor = shutdown instant, teardown NOT complete.
+        let clean = classify_prior_marker(
+            Some(&ShutdownMarker {
+                clean: true,
+                at: 1_000,
+                teardown_complete: false,
+            }),
+            7,
+        );
         assert!(!clean.crash_recovery);
         assert_eq!(clean.prior_marker_at, Some(1_000));
+        assert!(!clean.teardown_complete);
+
+        // Clean marker whose teardown finished.
+        let finished = classify_prior_marker(
+            Some(&ShutdownMarker {
+                clean: true,
+                at: 1_500,
+                teardown_complete: true,
+            }),
+            7,
+        );
+        assert!(!finished.crash_recovery);
+        assert_eq!(finished.prior_marker_at, Some(1_500));
+        assert!(finished.teardown_complete);
 
         // Running (clean:false) marker left by a crash → crash recovery, but
         // the prior `at` (the crashed process's boot instant) still anchors.
-        let crashed = classify_prior_marker(Some(&ShutdownMarker {
-            clean: false,
-            at: 2_000,
-        }));
+        let crashed = classify_prior_marker(
+            Some(&ShutdownMarker {
+                clean: false,
+                at: 2_000,
+                teardown_complete: false,
+            }),
+            7,
+        );
         assert!(crashed.crash_recovery);
         assert_eq!(crashed.prior_marker_at, Some(2_000));
+        assert!(!crashed.teardown_complete);
+
+        // A marker written before `teardown_complete` existed reads `false`:
+        // nothing in it says the teardown finished.
+        let pre_field: ShutdownMarker =
+            serde_json::from_str(r#"{"clean": true, "at": 3000}"#).unwrap();
+        let legacy = classify_prior_marker(Some(&pre_field), 7);
+        assert!(!legacy.crash_recovery);
+        assert_eq!(legacy.prior_marker_at, Some(3_000));
+        assert!(!legacy.teardown_complete);
+    }
+
+    /// The three writers, read back through the classifier: running and the
+    /// clean stamp (drain, and `run_teardown` before `close_all`) never claim
+    /// a finished teardown; only [`mark_teardown_complete`] does.
+    #[test]
+    fn only_mark_teardown_complete_claims_a_finished_teardown() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("last-shutdown.json");
+
+        mark_running(&path);
+        let running = read_classification(&path, 7);
+        assert!(running.crash_recovery);
+        assert!(!running.teardown_complete);
+
+        mark_clean_shutdown(&path);
+        let clean = read_classification(&path, 7);
+        assert!(!clean.crash_recovery);
+        assert!(!clean.teardown_complete);
+        assert!(describe_on_disk(&path).starts_with("clean=true teardown_complete=false at="));
+
+        mark_teardown_complete(&path);
+        let finished = read_classification(&path, 7);
+        assert!(!finished.crash_recovery);
+        assert!(finished.teardown_complete);
+        assert!(describe_on_disk(&path).starts_with("clean=true teardown_complete=true at="));
+
+        std::fs::write(&path, b"{not valid json").unwrap();
+        assert_eq!(describe_on_disk(&path), "absent or corrupt");
     }
 
     /// Replaces `marker_path_namespaces_by_port`, which pinned the OLD

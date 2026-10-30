@@ -33,7 +33,7 @@ const MEMORY_WARNING_THRESHOLD_MB: u64 = 1024; // 1 GB
 /// the band on every platform is not this change's job.
 ///
 /// It is `pub(crate)` so the spawn gate can say what it is NOT: the gate's
-/// thread ceilings ([`crate::settings::SessionGuardSettings::warn_thread_count`],
+/// thread ceilings ([`crate::settings::SHIPPED_WARN_THREAD_CEILING`],
 /// [`crate::resource_guard::THREAD_CEILING_MIN`]) must sit strictly ABOVE this
 /// number, and a test pins that. A ceiling at a count the process already
 /// carries at rest would refuse or warn on every spawn forever — which is what
@@ -1589,11 +1589,11 @@ pub(crate) fn thread_count_reading() -> Option<usize> {
 ///
 /// - **The published fleet sample already tolerates 30 s of staleness for this
 ///   same quantity.** `fleet::resource_sample` publishes `thread_count` on a
-///   30 s loop and coord grades it against the same 256/400 ceilings. A verdict
+///   30 s loop and coord grades it against the shipped 256/400 ceilings. A verdict
 ///   taken from a reading up to 250 ms old is two orders of magnitude fresher
 ///   than the number the fleet dashboard renders for the identical decision.
 /// - **The gate structurally cannot close the read-to-PTY race anyway.**
-///   [`crate::settings::SessionGuardSettings::critical_thread_count`]'s own doc
+///   [`crate::settings::SHIPPED_CRITICAL_THREAD_CEILING`]'s own doc
 ///   sizes 400 around exactly this: the reading is taken before the PTY opens,
 ///   and a burst of concurrent admissions can each pass the ceiling and only
 ///   then create their threads. A memo of 0 ms would not make the verdict
@@ -1762,7 +1762,8 @@ pub(crate) fn thread_name_census_memoized() -> Option<ThreadNameCensus> {
 }
 
 /// The memoized census as the `/health` object serves it under `threadCensus`:
-/// `{ total, byName: [{name, count}], sampledAt }`, or JSON `null` when the
+/// `{ total, byName: [{name, count}], sessionThreads, sampledAt }`, or JSON
+/// `null` when the
 /// census is UNKNOWN — never an empty list (served policy
 /// `verification-and-evidence` `silent-empty-is-unknown`).
 pub(crate) fn thread_name_census_json() -> serde_json::Value {
@@ -1783,6 +1784,10 @@ fn thread_name_census_to_json(census: &ThreadNameCensus) -> serde_json::Value {
             .iter()
             .map(|row| serde_json::json!({ "name": row.name, "count": row.count }))
             .collect::<Vec<_>>(),
+        // The UNCAPPED per-session tally (`terminal-reader` + `terminal-waiter`)
+        // the thread guard subtracts — `byName` is capped and must never be
+        // summed for it.
+        "sessionThreads": census.session_threads,
         "sampledAt": sampled_at,
     })
 }
@@ -2159,6 +2164,11 @@ mod tests {
                     count: *count,
                 })
                 .collect(),
+            session_threads: rows
+                .iter()
+                .filter(|(name, _)| name.starts_with("terminal-"))
+                .map(|(_, n)| n)
+                .sum(),
             sampled_at: std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
         }
     }
@@ -2215,6 +2225,7 @@ mod tests {
         assert_eq!(v["byName"][1]["name"], "terminal-reader-*");
         assert_eq!(v["byName"].as_array().map(Vec::len), Some(2));
         assert_eq!(v["sampledAt"], "2027-01-15T08:00:00+00:00");
+        assert_eq!(v["sessionThreads"], 19);
         assert!(v.get("by_name").is_none(), "wire keys are camelCase");
     }
 

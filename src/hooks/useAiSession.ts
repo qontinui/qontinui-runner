@@ -13,6 +13,7 @@ import { parseOutputLog } from "@qontinui/workflow-utils";
 import { instanceStorage } from "@/lib/instance-storage";
 import { FrameBatchScheduler } from "@/lib/ai-streaming/frameBatchScheduler";
 import { StreamingTextBuffer, formatRetainedResponse } from "@/lib/ai-streaming/streamingBuffer";
+import { describeThrown } from "@/lib/utils";
 
 /** Payload from the "ai-output" Tauri event. */
 interface AiOutputEvent {
@@ -420,7 +421,7 @@ export function useAiSession(options: UseAiSessionOptions = {}) {
             : "state read returned no state";
         }
       } catch (e) {
-        readError = `state read failed: ${e instanceof Error ? e.message : String(e)}`;
+        readError = `state read failed: ${describeThrown(e, "unknown error")}`;
       }
       if (taskRunIdRef.current !== newTaskRunId) return;
       setSessionState(resolvedState);
@@ -438,7 +439,7 @@ export function useAiSession(options: UseAiSessionOptions = {}) {
         }
       } catch (e) {
         console.error("[useAiSession] Failed to load session messages:", e);
-        readError ??= `history read failed: ${e instanceof Error ? e.message : String(e)}`;
+        readError ??= `history read failed: ${describeThrown(e, "unknown error")}`;
       }
 
       // Only the session still being observed may settle the read; a
@@ -542,7 +543,7 @@ export function useAiSession(options: UseAiSessionOptions = {}) {
         return { ok: true, queued: response.data?.queued === true, state };
       } catch (e) {
         console.error("[useAiSession] Failed to send message:", e);
-        return { ok: false, error: e instanceof Error ? e.message : String(e) };
+        return { ok: false, error: describeThrown(e, "Failed to send message") };
       }
     },
     [commitStreamingBuffer],

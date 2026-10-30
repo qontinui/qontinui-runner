@@ -38,6 +38,17 @@ pub const ALLOWED_PROXIED_COMMANDS: &[&str] = &[
     "list_terminals",
     "get_claude_config_dirs",
     "check_accounts_usage",
+    // The remote-interactivity probe sweep (plan
+    // `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+    // A3): a headless agent measures a device's sessions without a webview.
+    // It mints grants and attaches with this runner's own device credential,
+    // exactly as the Fleet view does, and carries no input byte by
+    // construction (`ProbeFrameSink`).
+    "remote_interactivity_probe",
+    // END a session on another device under an attach grant (plan
+    // `2026-09-30-close-remote-sessions-from-the-local-runner`, Phase 3) — the
+    // door a headless harness / UI Bridge drives.
+    "remote_session_end",
 ];
 
 // ============================================================================
@@ -62,6 +73,15 @@ pub struct TauriInvokeResponse {
     pub data: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Machine-readable refusal code, on the few refusals that carry one
+    /// (`invalid_edit_sibling`). Absent everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// The HTTP status this response is answered with. `None` = 200, which is
+    /// what every arm answered before typed refusals existed (an invoke error
+    /// rides in `error` with `success: false`); a typed input refusal sets 400.
+    #[serde(skip)]
+    pub status: Option<StatusCode>,
 }
 
 /// The `terminal_create` proxy's spawn-tenant admission: the shared
@@ -79,6 +99,8 @@ impl TauriInvokeResponse {
             success: true,
             data: Some(data),
             error: None,
+            code: None,
+            status: None,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
@@ -86,6 +108,21 @@ impl TauriInvokeResponse {
             success: false,
             data: None,
             error: Some(msg.into()),
+            code: None,
+            status: None,
+        }
+    }
+    /// A refused `editSiblings` input: a typed 400 `invalid_edit_sibling`,
+    /// answered before any allocation (vet V9).
+    fn edit_sibling_refusal(
+        refusal: crate::agent_worktree::edit_sibling::EditSiblingRefusal,
+    ) -> Self {
+        Self {
+            success: false,
+            data: None,
+            error: Some(refusal.message.clone()),
+            code: Some(refusal.code().to_string()),
+            status: Some(StatusCode::BAD_REQUEST),
         }
     }
 }
@@ -112,7 +149,7 @@ pub(crate) struct ForbiddenResponse {
 pub async fn tauri_invoke_handler(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<TauriInvokeRequest>,
-) -> Result<Json<TauriInvokeResponse>, (StatusCode, Json<ForbiddenResponse>)> {
+) -> Result<(StatusCode, Json<TauriInvokeResponse>), (StatusCode, Json<ForbiddenResponse>)> {
     if !ALLOWED_PROXIED_COMMANDS.contains(&req.command.as_str()) {
         return Err((
             StatusCode::FORBIDDEN,
@@ -127,7 +164,7 @@ pub async fn tauri_invoke_handler(
     info!(command = %req.command, "tauri_proxy: dispatching command");
 
     let response = dispatch(state, req).await;
-    Ok(Json(response))
+    Ok((response.status.unwrap_or(StatusCode::OK), Json(response)))
 }
 
 // ============================================================================
@@ -223,6 +260,13 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 /// (plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`).
                 #[serde(default)]
                 tenant_id: Option<String>,
+                /// The repos the session will EDIT beside `intentRepo` — the
+                /// `edit_siblings` argument of the `terminal_create` Tauri
+                /// command this route proxies (plan
+                /// `2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits`).
+                /// A bad entry is a typed 400 `invalid_edit_sibling`.
+                #[serde(default, alias = "edit_siblings")]
+                edit_siblings: Vec<String>,
             }
             let a = match serde_json::from_value::<Args>(req.args) {
                 Ok(v) => v,
@@ -273,6 +317,17 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 })
             });
 
+            // Judged before the allocate, against the EFFECTIVE intent repo, so
+            // a typo is a typed 400 rather than a silent shared-checkout pane.
+            let edit_siblings =
+                match crate::agent_worktree::edit_sibling::validate_spawn_edit_siblings(
+                    effective_intent_repo.as_deref(),
+                    &a.edit_siblings,
+                ) {
+                    Ok(v) => v,
+                    Err(refusal) => return TauriInvokeResponse::edit_sibling_refusal(refusal),
+                };
+
             let (working_dir, isolated_ctx) =
                 crate::agent_worktree::isolated_edit::acquire_for_terminal(
                     effective_intent_repo.as_deref(),
@@ -280,6 +335,7 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                     a.working_dir,
                     a.agent_session_id,
                     spawn_tenant,
+                    &edit_siblings,
                 )
                 .await;
 
@@ -413,6 +469,45 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
             TauriInvokeResponse::ok(serde_json::json!({ "terminals": terminals }))
         }
 
+        "remote_session_end" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                device_id: String,
+                session_id: String,
+                #[serde(default)]
+                force: bool,
+                #[serde(default)]
+                tenant: Option<String>,
+            }
+            let a = match serde_json::from_value::<Args>(req.args) {
+                Ok(v) => v,
+                Err(e) => return TauriInvokeResponse::err(format!("bad args: {}", e)),
+            };
+            let tm: Arc<TerminalManager> = state
+                .app_handle
+                .state::<Arc<TerminalManager>>()
+                .inner()
+                .clone();
+            let base = crate::commands::remote_attach::coord_base_for(&state.app_handle);
+            match crate::commands::remote_end::end_remote_session(
+                &tm,
+                &base,
+                &a.device_id,
+                &a.session_id,
+                a.force,
+                a.tenant,
+            )
+            .await
+            {
+                Ok(result) => match serde_json::to_value(&result) {
+                    Ok(v) => TauriInvokeResponse::ok(v),
+                    Err(e) => TauriInvokeResponse::err(format!("serialize: {}", e)),
+                },
+                Err(e) => TauriInvokeResponse::err(e),
+            }
+        }
+
         // ── config / accounts ────────────────────────────────────────────────
         "get_claude_config_dirs" => {
             let dirs = crate::settings::get_claude_config_dirs();
@@ -439,8 +534,58 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
             }
         }
 
+        // ── remote interactivity ─────────────────────────────────────────────
+        "remote_interactivity_probe" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                device_id: String,
+                #[serde(default)]
+                trigger: Option<String>,
+            }
+            let a = match serde_json::from_value::<Args>(req.args) {
+                Ok(v) => v,
+                Err(e) => return TauriInvokeResponse::err(format!("bad args: {}", e)),
+            };
+            // A headless caller is not the Fleet view: `fleet_view` would
+            // stamp the device into the scheduler's sweep set for a week on
+            // behalf of an operator who never opened it. So the proxy passes
+            // an explicit `manual` through and otherwise runs `unspecified`
+            // (which, unlike manual, honours the attempt memory); any other
+            // trigger is refused.
+            let trigger = match proxy_probe_trigger(a.trigger.as_deref()) {
+                Ok(t) => t,
+                Err(e) => return TauriInvokeResponse::err(e),
+            };
+            match crate::commands::remote_interactivity_probe::run_probe_command(
+                &state.app_handle,
+                &a.device_id,
+                Some(trigger),
+            )
+            .await
+            {
+                Ok(report) => TauriInvokeResponse::ok(report),
+                Err(e) => TauriInvokeResponse::err(e),
+            }
+        }
+
         // Unreachable: safelist check above prevents anything else.
         _ => TauriInvokeResponse::err(format!("command '{}' not implemented", req.command)),
+    }
+}
+
+/// The `remote_interactivity_probe` trigger a headless proxy caller may run:
+/// absent/blank → `unspecified`, `manual` → `manual`, anything else (notably
+/// `fleet_view`, which would stamp the device into the scheduler's sweep set)
+/// refused.
+fn proxy_probe_trigger(raw: Option<&str>) -> Result<&'static str, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok("unspecified"),
+        Some("manual") => Ok("manual"),
+        Some(t) => Err(format!(
+            "remote_interactivity_probe:trigger_not_allowed: {t:?} — the proxy runs only \
+             trigger \"manual\" (or none)"
+        )),
     }
 }
 
@@ -451,6 +596,54 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
 pub fn routes() -> axum::Router<Arc<ApiState>> {
     use axum::routing::post;
     axum::Router::new().route("/ui-bridge/tauri/invoke", post(tauri_invoke_handler))
+}
+
+#[cfg(test)]
+mod probe_trigger_tests {
+    use super::proxy_probe_trigger;
+
+    #[test]
+    fn the_proxy_maps_probe_triggers() {
+        assert_eq!(proxy_probe_trigger(None), Ok("unspecified"));
+        assert_eq!(proxy_probe_trigger(Some("")), Ok("unspecified"));
+        assert_eq!(proxy_probe_trigger(Some("   ")), Ok("unspecified"));
+        assert_eq!(proxy_probe_trigger(Some("manual")), Ok("manual"));
+        for refused in ["fleet_view", "scheduler", "Manual", "anything"] {
+            let e = proxy_probe_trigger(Some(refused)).unwrap_err();
+            assert!(
+                e.starts_with("remote_interactivity_probe:trigger_not_allowed:"),
+                "{e}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod edit_sibling_tests {
+    use super::*;
+
+    /// Plan 2026-10-10 Phase 2 (vet V9): the proxy answers a bad `editSiblings`
+    /// entry with a typed 400 `invalid_edit_sibling`, and every other response
+    /// keeps the 200 it always had.
+    #[test]
+    fn a_bad_edit_sibling_is_a_typed_400_and_nothing_else_changes_status() {
+        let refusal = crate::agent_worktree::edit_sibling::validate_spawn_edit_siblings(
+            Some("qontinui-coord"),
+            &["../x".to_string()],
+        )
+        .unwrap_err();
+        let r = TauriInvokeResponse::edit_sibling_refusal(refusal);
+        assert_eq!(r.status, Some(StatusCode::BAD_REQUEST));
+        let body = serde_json::to_value(&r).unwrap();
+        assert_eq!(body["code"], "invalid_edit_sibling");
+        assert_eq!(body["success"], false);
+        assert!(body.get("status").is_none(), "status is not serialised");
+
+        assert_eq!(TauriInvokeResponse::err("x").status, None);
+        assert_eq!(TauriInvokeResponse::ok(Value::Null).status, None);
+        let ok = serde_json::to_value(TauriInvokeResponse::ok(Value::Null)).unwrap();
+        assert!(ok.get("code").is_none());
+    }
 }
 
 #[cfg(test)]

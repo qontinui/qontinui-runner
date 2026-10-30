@@ -108,6 +108,10 @@ struct WireRow {
     /// RFC 3339. Absent on a coord that predates the field.
     #[serde(default)]
     since: Option<String>,
+    /// WHICH `coord.sessions` row answered (the latest for the harness id —
+    /// the key is not unique). Absent on a coord that predates the field.
+    #[serde(default)]
+    coord_session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,8 +122,15 @@ struct WireResponse {
     unknown: Vec<String>,
     #[serde(default)]
     invalid: Vec<String>,
-    #[serde(default)]
-    truncated: bool,
+    /// coord cut the INPUT id list (more ids than its per-request cap). Wire
+    /// name `input_truncated` since plan
+    /// `2026-09-12-fleet-principal-session-routes-disagree-about-being-capped`
+    /// Phase 3; the legacy `truncated` is accepted as an alias so this build
+    /// reads a coord from either side of the rename. It says nothing about a
+    /// capped RESULT page — that is what `truncated` meant on the sibling
+    /// routes, and why coord renamed it.
+    #[serde(default, alias = "truncated")]
+    input_truncated: bool,
     /// `false` means the join could not be expressed on that database at all —
     /// so every `statuses` entry it did or did not return is meaningless.
     #[serde(rename = "sessionBridgeColumnPresent", default = "default_true")]
@@ -141,11 +152,25 @@ pub struct StatusFetch {
     /// `claude_session_id` → the work axis coord served for it. Absent ⇒
     /// UNKNOWN ⇒ blocks.
     pub by_session_id: HashMap<String, SessionWorkStatus>,
-    /// `claude_session_id` → unix millis at which coord's row became
-    /// `finished`, for rows that read `finished` AND carried a parseable
-    /// `since`. Absent ⇒ the time is unknown (an older coord, or a null
-    /// `since`), and wind-down falls back to not bounding the idle window by
-    /// it. Never consulted by the restart verdict.
+    /// `claude_session_id` → unix millis of coord's `since` (its
+    /// `state_started_at`: when the row entered its CURRENT work-axis status),
+    /// for EVERY row that resolved a status into [`Self::by_session_id`] AND
+    /// carried a parseable `since`. Absent ⇒ the time is UNKNOWN (an older
+    /// coord that serves no `since`, a null one, or an unparseable one) —
+    /// never "now", never "the epoch". `/restart-readiness` passes it through
+    /// per process as `sessionStatusSince`. Never consulted by the restart
+    /// verdict.
+    pub since_by_session_id: HashMap<String, i64>,
+    /// The `finished` subset of [`Self::since_by_session_id`]: unix millis at
+    /// which coord's row became `finished` (the legacy `done` included).
+    /// Absent ⇒ the time is unknown, and wind-down falls back to not bounding
+    /// the idle window by it. Never consulted by the restart verdict.
+    ///
+    /// For a finish the runner delivered, this is the runner's DECLARED finish
+    /// instant on the runner's clock (its `finished` PATCH carries the mark's
+    /// `finished_at` as `last_progress_at`), not coord's receipt time — so the
+    /// wind-down's floor can sit earlier than it did before that change, by up
+    /// to the outbox lag.
     pub finished_at_by_session_id: HashMap<String, i64>,
     /// `"coord"` when the door answered, `"unavailable"` when it did not,
     /// `"not_needed"` when there was nothing to ask about.
@@ -171,6 +196,7 @@ impl StatusFetch {
     fn degraded(requested: usize, note: impl Into<String>) -> Self {
         Self {
             by_session_id: HashMap::new(),
+            since_by_session_id: HashMap::new(),
             finished_at_by_session_id: HashMap::new(),
             source: "unavailable",
             degraded: true,
@@ -250,17 +276,24 @@ fn map_from_body(body: &WireResponse) -> (HashMap<String, SessionWorkStatus>, St
     if !body.invalid.is_empty() {
         notes.push(format!("{} id(s) were not UUIDs", body.invalid.len()));
     }
-    if body.truncated {
-        notes.push("coord truncated the request (over its id cap)".to_string());
+    if body.input_truncated {
+        notes.push(
+            "coord truncated the INPUT id list (over its per-request id cap), so ids past \
+             the cap were not asked about"
+                .to_string(),
+        );
     }
     (out, notes.join("; "))
 }
 
 /// `claude_session_id` → unix millis of coord's `since` for every row that
-/// reads `finished` (including the legacy `done`) and carries a parseable RFC
-/// 3339 `since`. Pure. A body with `sessionBridgeColumnPresent: false` yields
-/// nothing, exactly like [`map_from_body`].
-fn finished_at_from_body(body: &WireResponse) -> HashMap<String, i64> {
+/// RESOLVED a status — the same rows [`map_from_body`] maps (a non-blank
+/// `session_status`, whatever its word) — and carries a parseable RFC 3339
+/// `since`. Pure. A body with `sessionBridgeColumnPresent: false` yields
+/// nothing, exactly like [`map_from_body`]; a row whose status is unset yields
+/// no time either, because a time for an UNKNOWN status is not an observation
+/// about anything.
+fn since_from_body(body: &WireResponse) -> HashMap<String, i64> {
     if !body.session_bridge_column_present {
         return HashMap::new();
     }
@@ -269,8 +302,7 @@ fn finished_at_from_body(body: &WireResponse) -> HashMap<String, i64> {
         .filter(|(_, row)| {
             row.session_status
                 .as_deref()
-                .map(SessionWorkStatus::parse)
-                .is_some_and(|s| s == SessionWorkStatus::Finished)
+                .is_some_and(|raw| !raw.trim().is_empty())
         })
         .filter_map(|(id, row)| {
             let since = row.since.as_deref()?;
@@ -281,24 +313,107 @@ fn finished_at_from_body(body: &WireResponse) -> HashMap<String, i64> {
         .collect()
 }
 
+/// The `finished` subset of [`since_from_body`]: every row that reads
+/// `finished` (including the legacy `done`) and carries a parseable `since`.
+/// Pure.
+fn finished_at_from_body(body: &WireResponse) -> HashMap<String, i64> {
+    let mut since = since_from_body(body);
+    since.retain(|id, _| {
+        body.statuses
+            .get(id)
+            .and_then(|row| row.session_status.as_deref())
+            .map(SessionWorkStatus::parse)
+            .is_some_and(|s| s == SessionWorkStatus::Finished)
+    });
+    since
+}
+
 // ---------------------------------------------------------------------------
 // The read
 // ---------------------------------------------------------------------------
 
-/// Bulk-read the coord work axis for `ids`. **Never fails** — see module docs.
-pub async fn fetch(ids: &[String]) -> StatusFetch {
-    if ids.is_empty() {
-        return StatusFetch {
-            by_session_id: HashMap::new(),
-            finished_at_by_session_id: HashMap::new(),
-            source: "not_needed",
-            degraded: false,
-            note: String::new(),
-            requested: 0,
-            resolved: 0,
-        };
-    }
+/// How long a resolved `(coord base, device JWT)` pair is reused. A boot with
+/// dozens of unbound transcripts would otherwise run the blocking credential
+/// resolution (secure storage, then an OS keychain call) once per transcript.
+/// Short, so a rotated or expired token is picked up within the minute; a
+/// failure is never cached.
+const CREDENTIAL_REUSE: Duration = Duration::from_secs(30);
 
+static CREDENTIAL: std::sync::Mutex<Option<(std::time::Instant, String, String)>> =
+    std::sync::Mutex::new(None);
+
+/// Serialises credential RESOLUTION so a burst of concurrent callers does the
+/// blocking work once, then reads the cache.
+static CREDENTIAL_RESOLVE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn cached_credential_now() -> Option<(String, String)> {
+    let g = CREDENTIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    g.as_ref()
+        .filter(|(at, _, _)| at.elapsed() < CREDENTIAL_REUSE)
+        .map(|(_, b, j)| (b.clone(), j.clone()))
+}
+
+/// The coord base + device JWT, reused for [`CREDENTIAL_REUSE`].
+async fn cached_credential() -> Result<(String, String), String> {
+    if let Some(p) = cached_credential_now() {
+        return Ok(p);
+    }
+    let _one_at_a_time = CREDENTIAL_RESOLVE.lock().await;
+    if let Some(p) = cached_credential_now() {
+        return Ok(p);
+    }
+    let parts = tokio::time::timeout(
+        CREDENTIAL_TIMEOUT,
+        tokio::task::spawn_blocking(crate::mcp::continuation_verdict::coord_client_parts),
+    )
+    .await;
+    let (base, jwt) = match parts {
+        Ok(Ok(Ok(p))) => p,
+        Ok(Ok(Err(e))) => return Err(format!("coord work-status: no credential ({e})")),
+        Ok(Err(e)) => {
+            return Err(format!(
+                "coord work-status: credential resolution panicked ({e})"
+            ))
+        }
+        Err(_) => {
+            return Err(format!(
+                "coord work-status: credential resolution timed out after {}s",
+                CREDENTIAL_TIMEOUT.as_secs()
+            ))
+        }
+    };
+    *CREDENTIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((std::time::Instant::now(), base.clone(), jwt.clone()));
+    Ok((base, jwt))
+}
+
+/// One pooled client for every work-status read.
+fn shared_client() -> Result<reqwest::Client, reqwest::Error> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(c) = CLIENT.get() {
+        return Ok(c.clone());
+    }
+    let c = reqwest::Client::builder().timeout(FETCH_TIMEOUT).build()?;
+    Ok(CLIENT.get_or_init(|| c).clone())
+}
+
+/// Upper bound on concurrent single-id resolutions ([`resolve_coord_row`]).
+/// A boot storm (every unbound transcript at once) otherwise opens one
+/// connection per transcript against coord.
+pub const MAX_CONCURRENT_RESOLUTIONS: usize = 4;
+
+static RESOLUTION_SLOTS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_RESOLUTIONS);
+
+/// One raw coord read: the decoded body plus the clamp note, or the note of
+/// whatever degraded it. Shared by [`fetch`] (the work axis) and
+/// [`resolve_coord_rows`] (which row answered) so there is ONE credential /
+/// timeout / decode path.
+async fn fetch_wire(ids: &[String]) -> Result<(WireResponse, String), String> {
     let requested = ids.len();
     let clamped: Vec<&String> = ids.iter().take(MAX_IDS).collect();
     let clamp_note = if requested > MAX_IDS {
@@ -320,42 +435,16 @@ pub async fn fetch(ids: &[String]) -> StatusFetch {
     // It is SYNCHRONOUS and can block (file I/O, then a keychain call bounded
     // at 3 s), so it runs on a blocking thread under its own timeout. See
     // `CREDENTIAL_TIMEOUT`.
-    let parts = tokio::time::timeout(
-        CREDENTIAL_TIMEOUT,
-        tokio::task::spawn_blocking(crate::mcp::continuation_verdict::coord_client_parts),
-    )
-    .await;
-    let (base, jwt) = match parts {
-        Ok(Ok(Ok(p))) => p,
-        Ok(Ok(Err(e))) => {
-            return StatusFetch::degraded(
-                requested,
-                format!("coord work-status: no credential ({e}){clamp_note}"),
-            )
-        }
-        Ok(Err(e)) => {
-            return StatusFetch::degraded(
-                requested,
-                format!("coord work-status: credential resolution panicked ({e}){clamp_note}"),
-            )
-        }
-        Err(_) => {
-            return StatusFetch::degraded(
-                requested,
-                format!(
-                    "coord work-status: credential resolution timed out after {}s{clamp_note}",
-                    CREDENTIAL_TIMEOUT.as_secs()
-                ),
-            )
-        }
+    let (base, jwt) = match cached_credential().await {
+        Ok(p) => p,
+        Err(e) => return Err(format!("{e}{clamp_note}")),
     };
-    let client = match reqwest::Client::builder().timeout(FETCH_TIMEOUT).build() {
+    let client = match shared_client() {
         Ok(c) => c,
         Err(e) => {
-            return StatusFetch::degraded(
-                requested,
-                format!("coord work-status: client build failed ({e}){clamp_note}"),
-            )
+            return Err(format!(
+                "coord work-status: client build failed ({e}){clamp_note}"
+            ))
         }
     };
 
@@ -374,27 +463,46 @@ pub async fn fetch(ids: &[String]) -> StatusFetch {
             } else {
                 format!("request failed ({e})")
             };
-            return StatusFetch::degraded(
-                requested,
-                format!("coord work-status: {what}{clamp_note}"),
-            );
+            return Err(format!("coord work-status: {what}{clamp_note}"));
         }
     };
     let status = resp.status();
     if !status.is_success() {
-        return StatusFetch::degraded(
-            requested,
-            format!("coord work-status: HTTP {}{clamp_note}", status.as_u16()),
-        );
+        return Err(format!(
+            "coord work-status: HTTP {}{clamp_note}",
+            status.as_u16()
+        ));
     }
     let body: WireResponse = match resp.json().await {
         Ok(b) => b,
         Err(e) => {
-            return StatusFetch::degraded(
-                requested,
-                format!("coord work-status: undecodable 2xx body ({e}){clamp_note}"),
-            )
+            return Err(format!(
+                "coord work-status: undecodable 2xx body ({e}){clamp_note}"
+            ))
         }
+    };
+    Ok((body, clamp_note))
+}
+
+/// Bulk-read the coord work axis for `ids`. **Never fails** — see module docs.
+pub async fn fetch(ids: &[String]) -> StatusFetch {
+    if ids.is_empty() {
+        return StatusFetch {
+            by_session_id: HashMap::new(),
+            since_by_session_id: HashMap::new(),
+            finished_at_by_session_id: HashMap::new(),
+            source: "not_needed",
+            degraded: false,
+            note: String::new(),
+            requested: 0,
+            resolved: 0,
+        };
+    }
+
+    let requested = ids.len();
+    let (body, clamp_note) = match fetch_wire(ids).await {
+        Ok(x) => x,
+        Err(note) => return StatusFetch::degraded(requested, note),
     };
 
     let (by_session_id, mut note) = map_from_body(&body);
@@ -420,6 +528,7 @@ pub async fn fetch(ids: &[String]) -> StatusFetch {
         resolved, "restart-readiness: coord work-axis read completed"
     );
     StatusFetch {
+        since_by_session_id: since_from_body(&body),
         finished_at_by_session_id: finished_at_from_body(&body),
         by_session_id,
         source: "coord",
@@ -427,6 +536,68 @@ pub async fn fetch(ids: &[String]) -> StatusFetch {
         note: note.trim_start_matches("; ").to_string(),
         requested,
         resolved,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Which coord row answers for a harness session id
+// ---------------------------------------------------------------------------
+
+/// What coord said about ONE harness session id — the three negative answers
+/// are kept apart because only one of them licenses minting a row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowResolution {
+    /// coord has a row for this id; this is the latest one (adopt it).
+    Existing(uuid::Uuid),
+    /// coord resolved NO session for this id in this tenant — the one answer
+    /// that licenses minting a fresh row.
+    Unknown,
+    /// coord could not be asked, or its answer does not settle the question
+    /// (degraded read, bridge column absent, id absent from every bucket, an
+    /// unparseable row id). Never mint on this: a second row beside an
+    /// existing one is the duplicate-row defect.
+    Unresolved(String),
+}
+
+/// Pure: settle `csid` against a decoded body.
+fn resolution_from_body(body: &WireResponse, csid: &str) -> RowResolution {
+    if !body.session_bridge_column_present {
+        return RowResolution::Unresolved(
+            "coord reported sessionBridgeColumnPresent: false".to_string(),
+        );
+    }
+    if let Some(row) = body.statuses.get(csid) {
+        return match row
+            .coord_session_id
+            .as_deref()
+            .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
+        {
+            Some(id) => RowResolution::Existing(id),
+            None => RowResolution::Unresolved(
+                "coord answered a row without a parseable coord_session_id \
+                 (a coord that predates the field)"
+                    .to_string(),
+            ),
+        };
+    }
+    if body.unknown.iter().any(|u| u == csid) {
+        return RowResolution::Unknown;
+    }
+    RowResolution::Unresolved("coord named the id in neither `statuses` nor `unknown`".to_string())
+}
+
+/// Ask coord which `coord.sessions` row answers for the harness session id
+/// `csid`. Never errors — see [`RowResolution`].
+pub async fn resolve_coord_row(csid: &str) -> RowResolution {
+    // Bounded: at most MAX_CONCURRENT_RESOLUTIONS reads in flight. The
+    // semaphore is never closed, so an acquire error is unreachable; treat it
+    // as unresolved rather than panic.
+    let Ok(_slot) = RESOLUTION_SLOTS.acquire().await else {
+        return RowResolution::Unresolved("resolution semaphore closed".to_string());
+    };
+    match fetch_wire(&[csid.to_string()]).await {
+        Ok((body, _)) => resolution_from_body(&body, csid),
+        Err(note) => RowResolution::Unresolved(note),
     }
 }
 
@@ -442,6 +613,65 @@ mod tests {
         serde_json::from_value(json).expect("decode")
     }
 
+    const ROW: &str = "01a11324-7598-7e22-82e3-7ed378f59c62";
+
+    #[test]
+    fn resolution_adopts_the_row_coord_names() {
+        let b = body(serde_json::json!({
+            "statuses": {"sid": {"session_status": null, "coord_session_id": ROW}},
+            "unknown": [], "invalid": [], "accepted": 1, "truncated": false,
+            "sessionBridgeColumnPresent": true
+        }));
+        assert_eq!(
+            resolution_from_body(&b, "sid"),
+            RowResolution::Existing(uuid::Uuid::parse_str(ROW).unwrap())
+        );
+    }
+
+    #[test]
+    fn resolution_mints_only_on_an_explicit_unknown() {
+        let unknown = body(serde_json::json!({
+            "statuses": {}, "unknown": ["sid"], "invalid": [], "accepted": 1,
+            "truncated": false, "sessionBridgeColumnPresent": true
+        }));
+        assert_eq!(
+            resolution_from_body(&unknown, "sid"),
+            RowResolution::Unknown
+        );
+
+        // In neither bucket: coord did not settle it — must NOT read as mintable.
+        let silent = body(serde_json::json!({
+            "statuses": {}, "unknown": [], "invalid": [], "accepted": 1,
+            "truncated": false, "sessionBridgeColumnPresent": true
+        }));
+        assert!(matches!(
+            resolution_from_body(&silent, "sid"),
+            RowResolution::Unresolved(_)
+        ));
+        // Bridge column absent: even an `unknown` entry is meaningless.
+        let no_bridge = body(serde_json::json!({
+            "statuses": {}, "unknown": ["sid"], "invalid": [], "accepted": 1,
+            "truncated": false, "sessionBridgeColumnPresent": false
+        }));
+        assert!(matches!(
+            resolution_from_body(&no_bridge, "sid"),
+            RowResolution::Unresolved(_)
+        ));
+    }
+
+    #[test]
+    fn resolution_refuses_a_row_without_a_parseable_id() {
+        let b = body(serde_json::json!({
+            "statuses": {"sid": {"session_status": "working"}},
+            "unknown": [], "invalid": [], "accepted": 1, "truncated": false,
+            "sessionBridgeColumnPresent": true
+        }));
+        assert!(matches!(
+            resolution_from_body(&b, "sid"),
+            RowResolution::Unresolved(_)
+        ));
+    }
+
     #[test]
     fn maps_the_five_canonical_words_and_the_legacy_alias() {
         let (m, note) = map_from_body(&body(serde_json::json!({
@@ -453,7 +683,7 @@ mod tests {
                 "e": {"session_status": "finished"},
                 "f": {"session_status": "done"},
             },
-            "unknown": [], "invalid": [], "accepted": 6, "truncated": false,
+            "unknown": [], "invalid": [], "accepted": 6, "input_truncated": false,
             "sessionBridgeColumnPresent": true
         })));
         assert_eq!(m.get("a"), Some(&SessionWorkStatus::Working));
@@ -476,7 +706,7 @@ mod tests {
                 "no-since": {"session_status": "finished"},
                 "bad-since": {"session_status": "finished", "since": "yesterday"},
             },
-            "unknown": [], "invalid": [], "accepted": 5, "truncated": false,
+            "unknown": [], "invalid": [], "accepted": 5, "input_truncated": false,
             "sessionBridgeColumnPresent": true
         }));
         let m = finished_at_from_body(&b);
@@ -490,6 +720,46 @@ mod tests {
             "sessionBridgeColumnPresent": false
         }));
         assert!(finished_at_from_body(&absent).is_empty());
+    }
+
+    /// `since` is decoded for EVERY resolved status, not only `finished` —
+    /// `/restart-readiness` serves it per process as `sessionStatusSince`, so a
+    /// revival (`working` again) carries its own transition time. A row with no
+    /// resolved status, a missing `since` or an unparseable one maps to
+    /// nothing (UNKNOWN), and an inexpressible join yields nothing at all.
+    #[test]
+    fn since_is_read_for_every_resolved_status_with_a_parseable_since() {
+        let b = body(serde_json::json!({
+            "statuses": {
+                "working": {"session_status": "working", "since": "2026-09-13T10:00:00Z"},
+                "waiting": {"session_status": "waiting_human", "since": "2026-09-13T10:00:02+00:00"},
+                "finished": {"session_status": "finished", "since": "2026-09-13T10:00:01Z"},
+                "unrecognised": {"session_status": "vacationing", "since": "2026-09-13T10:00:03Z"},
+                "unset": {"session_status": null, "since": "2026-09-13T10:00:00Z"},
+                "blank": {"session_status": "  ", "since": "2026-09-13T10:00:00Z"},
+                "no-since": {"session_status": "working"},
+                "bad-since": {"session_status": "working", "since": "yesterday"},
+            },
+            "unknown": [], "invalid": [], "accepted": 8, "input_truncated": false,
+            "sessionBridgeColumnPresent": true
+        }));
+        let m = since_from_body(&b);
+        assert_eq!(m.len(), 4, "{m:?}");
+        assert_eq!(m.get("working"), Some(&1_789_293_600_000));
+        assert_eq!(m.get("waiting"), Some(&1_789_293_602_000));
+        assert_eq!(m.get("finished"), Some(&1_789_293_601_000));
+        assert_eq!(m.get("unrecognised"), Some(&1_789_293_603_000));
+        // The finished subset is still exactly the finished rows.
+        let f = finished_at_from_body(&b);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f.get("finished"), Some(&1_789_293_601_000));
+
+        let no_bridge = body(serde_json::json!({
+            "statuses": {"x": {"session_status": "working", "since": "2026-09-13T10:00:00Z"}},
+            "unknown": [], "invalid": [], "accepted": 1, "truncated": false,
+            "sessionBridgeColumnPresent": false
+        }));
+        assert!(since_from_body(&no_bridge).is_empty());
     }
 
     #[test]
@@ -548,7 +818,32 @@ mod tests {
         assert!(m.is_empty());
         assert!(note.contains("2 id(s) resolved to no coord session"));
         assert!(note.contains("1 id(s) were not UUIDs"));
-        assert!(note.contains("truncated"));
+        assert!(note.contains("truncated the INPUT id list"));
+    }
+
+    /// Phase 3 of plan `2026-09-12-fleet-principal-session-routes-…` renames
+    /// the wire field `truncated` → `input_truncated`. This build must read
+    /// BOTH, because it may meet a coord from either side of that rename.
+    #[test]
+    fn input_truncated_is_read_under_both_the_new_and_the_legacy_name() {
+        for key in ["input_truncated", "truncated"] {
+            let mut v = serde_json::json!({
+                "statuses": {}, "unknown": [], "invalid": [], "accepted": 500,
+                "sessionBridgeColumnPresent": true
+            });
+            v[key] = serde_json::json!(true);
+            let b = body(v);
+            assert!(b.input_truncated, "`{key}: true` must be read");
+            let (_, note) = map_from_body(&b);
+            assert!(
+                note.contains("truncated the INPUT id list"),
+                "{key}: {note}"
+            );
+        }
+        // Absent under either name -> false, and no note.
+        let b = body(serde_json::json!({"statuses": {}, "sessionBridgeColumnPresent": true}));
+        assert!(!b.input_truncated);
+        assert!(map_from_body(&b).1.is_empty());
     }
 
     #[tokio::test]

@@ -147,8 +147,24 @@ DIRTYPROV="$(rtm_script dirty-provenance.sh)"
 SCHEDULE="$(rtm_script schedule-return-to-main.sh)"
 REAP="$(rtm_script reap-restore-snapshot.sh)"
 CENSUS="$(rtm_script recovery-ref-census.sh)"
-[ -n "$RUN_DIR" ] && for v in RTM_WS RUN_DIR QUIESCE SWEEP CLASSIFY LANDEV DIRTYPROV SCHEDULE REAP CENSUS; do printf '%s=%q\n' "$v" "${!v}"; done >"$RUN_DIR/run.env"
+REPOS="<the --repos value, empty when none was given>"
+# The wait budget ends a reserve (<= 30 min) before THIS task's own timeout_seconds, capped at
+# 2 h -- read off the installed task through the registration helper's --check
+# (bash + curl, no JSON parser), because a box still carrying an older install
+# has a shorter timeout than schedule-return-to-main.sh now writes.
+RTM_CHECK="$( [ -n "$SCHEDULE" ] && bash "$SCHEDULE" --check --root "$RTM_WS" 2>/dev/null )"
+RTM_TASK_TIMEOUT="$(printf '%s\n' "$RTM_CHECK" | sed -n 's/.*timeout_seconds: *\([0-9][0-9]*\).*/\1/p' | head -1)"
+RTM_TIMEOUT_SOURCE=read
+case "$RTM_CHECK" in *"timeout_seconds: <unset"*) RTM_TASK_TIMEOUT=600; RTM_TIMEOUT_SOURCE="unset: runner default" ;; esac
+case "$RTM_TASK_TIMEOUT" in ''|*[!0-9]*) RTM_TASK_TIMEOUT=3600; RTM_TIMEOUT_SOURCE="unreadable: assumed" ;; esac  # the shortest timeout ever installed
+RTM_RESERVE=$(( RTM_TASK_TIMEOUT / 2 ))   # kept for Steps 3-5: half the timeout, at most 30 min
+[ "$RTM_RESERVE" -gt 1800 ] && RTM_RESERVE=1800
+RTM_WAIT_BUDGET=$(( RTM_TASK_TIMEOUT - RTM_RESERVE ))
+[ "$RTM_WAIT_BUDGET" -gt 7200 ] && RTM_WAIT_BUDGET=7200
+RTM_WAIT_DEADLINE=$(( $(date +%s) + RTM_WAIT_BUDGET ))  # see "The turn never ends while a helper runs"
+[ -n "$RUN_DIR" ] && for v in RTM_WS RUN_DIR QUIESCE SWEEP CLASSIFY LANDEV DIRTYPROV SCHEDULE REAP CENSUS REPOS RTM_WAIT_DEADLINE; do printf '%s=%q\n' "$v" "${!v}"; done >"$RUN_DIR/run.env"
 echo "return-to-main: run directory ${RUN_DIR:-<none>}"
+echo "return-to-main: task timeout ${RTM_TASK_TIMEOUT}s (${RTM_TIMEOUT_SOURCE}), wait budget ${RTM_WAIT_BUDGET}s"
 ```
 
 **Run Step 0 once per night, never again.** Shell state does not survive
@@ -183,6 +199,117 @@ wrapper.
 Also confirm `RTM_WS` is the right directory: at least one `"$RTM_WS"/*/.git`
 must be a directory. If none is, the placeholder was substituted wrongly — stop
 and report UNKNOWN rather than sweep nothing and call it a clean night.
+
+### The turn never ends while a helper runs
+
+**A scheduled run is a headless `claude -p` session, and in that mode ENDING A
+TURN ENDS THE PROCESS.** Nothing wakes it again. A background-task notification,
+a "fallback wakeup" and a promise to "pick the run up when it finishes" are
+all lost, and so is everything after Step 2. The scheduler then records
+the run `completed` and `success: true`, because the process exited 0.
+
+This is measured, not hypothetical. On the Windows operator box,
+pass A of the dry-run sweep (39 checkouts, `--fetch` with a 120 s timeout per
+repo, run sequentially) took 15, 65 and 100 minutes on 2026-09-26, -28 and -30
+(`run_start` → `run_end` in each night's `pass-a.jsonl`). On -29 the first pass
+aborted in bash after 8 decisions and a second one, `pass-a2.jsonl`, took 45. Every one
+of those runs overran the Bash tool's foreground limit, so the harness moved it
+to the background. Three sessions then wrote a progress note and stopped. Their
+logs in the runner's per-run `scheduler-runs/` directory each end in one, for
+example *"I'll wait for it to complete … I'll be notified automatically"*, or
+*"A 20-minute fallback wakeup is set"*. Each sweep finished on its own after the
+session was gone, and no Step 3, 4 or 5 ever ran: three successful-looking
+nights with no record. The fourth night was killed by the job timeout instead.
+That one shows up as `scheduled session exceeded timeout_seconds`. Coord
+finding `4ba5c4c8` (the 2026-09-29 graduation review) listed 09-26, -28 and
+-29 among this box's nights with no record. This section is why
+they had none.
+
+So every helper call that can outlast one Bash call runs as a LAUNCH plus
+repeated bounded WAITs. No pass is launched, and no 1c re-check is taken for
+one, once `RTM_WAIT_DEADLINE` has passed. The launch refuses such a pass
+itself. Today that means each sweep invocation, which can run
+past the tool's limit on a loaded box. Run every WAIT in the same turn,
+back to back, until the helper's exit marker exists or the deadline passes.
+
+**Launch.** Issue it as a Bash call with `run_in_background: true` **and
+`timeout: 7200000`**. Both are needed. A foreground call that overruns is
+killed with the sweep inside it. A background call keeps the harness's default
+limit of 30 minutes unless the timeout is raised, and the sweep has run 100.
+7200000 ms is the tool's ceiling, and it equals the two-hour cap on the wait
+budget. It is also a hard stop: the harness ends a launch two hours after it
+began, and a sweep still running then is killed with it, possibly part-way
+through a move. That is why nothing new is launched past the deadline. The
+sweep's own snapshot-before-move keeps an interrupted move recoverable
+(`checkout-restore-contract.md`). Fill in three values from the pass's
+own line in Step 2 or Step 3. `OUT` is its `>` target, and `PASS_CMD` is the
+line up to that `>`. The wait's `LOG` is its `--log` file. Every marker hangs
+off `OUT`, so the summary lands exactly where Step 2 or Step 3 reads it. The
+exit marker is written only after the helper returns, through a rename, so its
+presence means the `--json` summary and the pass log are complete. A launch
+that cannot start writes a `refused:` marker instead, so the wait never spins
+on a pass that was never launched:
+
+```bash
+. "<RUN_DIR>/run.env"
+SWEEP_ARGS=()
+for r in $(printf '%s' "$REPOS" | tr ',' ' '); do SWEEP_ARGS+=(--only "$r"); done
+OUT="$RUN_DIR/pass-a.json"   # that pass line's ">" target, e.g. "$RUN_DIR/pass-b.json" or "$RUN_DIR/residue-<repo>.json"
+PASS_CMD=()                  # fill in: that pass line, up to its first ">"
+[ -d "${RUN_DIR:-}" ] || { echo "return-to-main: run.env did not load -- nothing launched" >&2; exit 2; }
+rm -f "$OUT.exit" "$OUT.exit.tmp" "$OUT.pid"
+if [ "${#PASS_CMD[@]}" -eq 0 ]; then echo "refused: PASS_CMD was empty" >"$OUT.exit"; exit 2; fi
+if [ "$(date +%s)" -ge "$RTM_WAIT_DEADLINE" ]; then echo "refused: past the night's wait deadline" >"$OUT.exit"; exit 2; fi
+"${PASS_CMD[@]}" >"$OUT" 2>"$OUT.err" &
+echo "$!" >"$OUT.pid"   # the SWEEP's own pid -- the wait's DIED check watches it, not this shell
+wait "$!"; rc=$?
+echo "$rc" >"$OUT.exit.tmp" && mv "$OUT.exit.tmp" "$OUT.exit"
+```
+
+**Wait.** Issue it as a FOREGROUND call. It returns within 100 seconds,
+under the Bash tool's default 120 s limit, so a wait issued without a
+`timeout` is still never moved to the background. Repeat it as often as the
+pass needs. Even a full two-hour budget is about 72 waits, which the task's
+`max_turns` (400) covers:
+
+```bash
+. "<RUN_DIR>/run.env"
+OUT="$RUN_DIR/pass-a.json"   # the same OUT as its launch
+LOG="$RUN_DIR/pass-a.jsonl"  # that pass line's --log file
+[ -d "${RUN_DIR:-}" ] || { echo "WAIT REFUSED: run.env did not load"; exit 2; }
+end=$(( SECONDS + 100 ))
+alive() { [ ! -s "$OUT.pid" ] || kill -0 "$(cat "$OUT.pid")" 2>/dev/null; }
+while [ ! -s "$OUT.exit" ] && [ "$SECONDS" -lt "$end" ] && [ "$(date +%s)" -lt "$RTM_WAIT_DEADLINE" ] && alive; do sleep 10; done
+if [ -s "$OUT.exit" ]; then echo "DONE exit=$(cat "$OUT.exit") $OUT"
+elif [ -s "$OUT.pid" ] && ! kill -0 "$(cat "$OUT.pid")" 2>/dev/null && { sleep 5; [ ! -s "$OUT.exit" ]; }; then echo "DIED: the sweep is gone and no exit marker was written $OUT"
+elif [ -s "$OUT.exit" ]; then echo "DONE exit=$(cat "$OUT.exit") $OUT"   # the marker landed during the 5 s grace
+elif [ "$(date +%s)" -ge "$RTM_WAIT_DEADLINE" ]; then echo "DEADLINE: still running at $(date -u +%H:%MZ) $OUT"
+else n="$(grep -c '"event":"decision"' "$LOG" 2>/dev/null)" || n=0; echo "RUNNING: ${n:-0} decision rows so far $OUT"; fi
+```
+
+| Wait prints | What you do next — in this same turn |
+|---|---|
+| `DONE exit=<n>` | Read the summary and the log exactly as Step 2 says; `<n>` is the sweep's exit code. |
+| `DONE exit=refused: …` | Nothing was launched. A refusal past the deadline is final: that pass is UNKNOWN, so go on as for `DEADLINE`. For any other refusal, fix what it names and launch again under a fresh `--log` and `OUT` (for example `pass-a2`), so the new launch can never read the old marker. |
+| (none of these: the harness says the WAIT itself was moved to the background) | The call ran longer than the harness allowed. Issue a new WAIT at once, and never end the turn on that notice. |
+| `DIED` | The sweep process is gone and nothing recorded its exit, for example because a harness limit killed it. That pass is UNKNOWN; report it, and read its log for how far it got. Relaunch only a `--dry-run` pass, and only while the wait budget lasts. Give the relaunch a fresh `--log` and `OUT` (for example `pass-a2.jsonl` and `pass-a2.json`): a reused log would carry a second `run_start` and read UNKNOWN. A pass that could act is not relaunched. Its repos stay as the dead pass left them, and the night goes on as for `DEADLINE`. |
+| `WAIT REFUSED` | `<RUN_DIR>` was substituted wrongly. Use the literal path Step 0 printed. |
+| `RUNNING` | Issue the same WAIT again at once. Do not write a progress note, and do not end the turn. A progress note followed by an ended turn is exactly the failure above. |
+| `DEADLINE` | Stop waiting. That pass's table is UNKNOWN (*"did not finish within the night's wait budget"*), and so is every later pass that depended on it. Never kill the sweep: it may be mid-fast-forward, and its own log records how it ends. Go straight to Step 4 for snapshots that already exist, then Step 5. |
+
+`RTM_WAIT_DEADLINE` is Step 0 plus the wait budget. The budget is this task's
+own `timeout_seconds` less a reserve for Steps 3 to 5, capped at two hours.
+The reserve is 30 minutes, or half the timeout when that is shorter, so even
+the runner's 600 s default leaves time to post the finding. It is read off the
+installed task through `--check`, taken as 600 when the task leaves it unset
+(the runner's default), and as 3600 when it cannot be read. Step 0 prints the
+timeout, where it came from and the budget; the Step 5 header quotes that line. With the 10800 that
+`schedule-return-to-main.sh` installs, the third hour is left for adjudication,
+gates and the report. A box still carrying an older 3600 install waits only 30
+minutes, and `--check` reports the timeout as drift until `--install` runs
+again. A night that runs out of time
+therefore still posts a finding that says so. A night that posts nothing
+cannot be shown not to have timed out.
 
 ## Management verbs — `--install`, `--check`, `--uninstall`
 
@@ -582,6 +709,19 @@ Two cases, decided by Step 1:
 | No repo is ACT for any move (shadow requested, or every repo BUSY / UNKNOWN for `checkout-ff`) | Pass A only, with `--dry-run` |
 | At least one repo is ACT for some move (`--act`, and its `checkout-ff` verdict QUIET) | Pass A with `--dry-run` over the whole scope, then the 1c re-check (`LABEL=pass-b`), then pass B without `--dry-run`: `--per-repo-quiet`, the re-check's `--quiet-ff` / `--quiet-return` lists, and one `--only` per still-ACT repo whose pass-A action was `WOULD_RETURN` or `WOULD_FAST_FORWARD` |
 
+**Every sweep invocation below runs as a LAUNCH plus WAITs** ("The turn never
+ends while a helper runs", Step 0). The lines below are each pass's command.
+Fill the launch block's `OUT` and `PASS_CMD`, and the wait's `LOG`, from
+that pass's line. Shell state does not carry between calls, so the launch
+template rebuilds `SWEEP_ARGS` from `REPOS` (run.env carries it). Paste every
+other value the line uses in as a literal, in the launch and in the wait
+alike: pass B's `QUIET_ARGS` and `ACT_ONLY`, Step 3's `REPO`, and 3a's pinned
+`H`.
+An empty one turns `residue-$REPO.json` into `residue-.json` and
+`--only "$REPO"` into `--only ""`.
+Then wait in the same turn until the exit marker exists. Never run a sweep as
+a bare foreground call and end the turn when the harness backgrounds it.
+
 Pass A is never gated: its dry-run rows are what the report shows for every
 repo, SHADOW ones included. Pass B moves only what its re-check allowed, and the
 sweep enforces that itself (1c). Every invocation gets its OWN log,
@@ -713,7 +853,7 @@ the upstream tip (listed under `untracked` as "on upstream").
 |---|---|
 | `0`, and the summary reads `untracked: … 0 not on upstream` | Every dirty path is already on main (or in-footprint residue). ACT repo for a fast-forward (1b: its `checkout-ff` verdict QUIET): the 1c re-check (`LABEL=residue-<repo>`), then re-run the sweep with `--restore-residue` (below), which removes exactly those files and lets the repo fast-forward. SHADOW: report "WOULD pass --restore-residue <repo>" with the class tally. |
 | `0`, with any `untracked-not-on-upstream:` line | The tracked dirt is restorable but an untracked file is content upstream lacks, which the sweep never removes. Leave the repo and list those untracked paths. |
-| `1` | Some file is decided NOT restorable: `UNIQUE` content (a mode-only change included), or a `RUNNER_BUNDLE` / `EOL_ONLY` file outside the provisioner footprint. Leave the repo exactly as found and report every `not-restorable:` line verbatim — that list is exactly what a human or agent has to decide. |
+| `1` | Some file is decided NOT restorable: `UNIQUE` content (a mode-only change included), or a `RUNNER_BUNDLE` / `EOL_ONLY` file outside the provisioner footprint. Leave the repo exactly as found and report every `not-restorable:` line verbatim — that list is exactly what a human or agent has to decide. A `verdict: EOL_REWRITE_ONLY` says every UNIQUE such file is a line-ending rewrite of the tip's own blob (one `eol-rewrite-only:` line each, naming the `git restore` that clears it): nothing in it exists only on disk, but it is still not restored here. |
 | `3` | UNKNOWN. Leave it. |
 | `4` | Usage — a defect in this skill's call. Leave it and report the message. |
 
@@ -838,8 +978,8 @@ forever.
 **`--adjudicated-landed` is NEVER the argument for superseded content.** Until
 `--adjudicated-superseded` existed it was the only argument that could move such
 a branch, so a session that correctly concluded "superseded" had to assert
-"landed" to act at all. On 2026-09-16 that is exactly what happened on
-`qontinui-dev-notes`: the durable decision row reads `verdict_source:
+"landed" to act at all. On 2026-09-16 that is exactly what happened on a
+plans repository: the durable decision row reads `verdict_source:
 adjudicated` for 8 commits that demonstrably never landed, while the evidence
 file beside it says `SUPERSEDED_BY_UPSTREAM`. A ledger that cannot distinguish
 the two will eventually be used to prove something false.
@@ -1015,7 +1155,9 @@ mode per repo and per move, the machine-wide verdict and both `--for` files'
 entry's `class` and `why`), every 1c re-check (its file, its
 verdict, and each downgrade it caused and why), the `--not-after` bound,
 `$RUN_DIR/bin/RESOLVED` (which rung each helper was copied from), the `--json`
-summary of every sweep invocation, the Step 4b reconciliation counts (refs,
+summary of every sweep invocation, Step 0's task-timeout / wait-budget line,
+every pass that ended `DEADLINE`, `DIED` or `refused:` and why, the Step 4b
+reconciliation counts (refs,
 gated, registered tonight, not reconciled with reasons), the 1d queue read
 (which door carried it — queue or fallback — its completeness signal, and each
 row's id, repo, `device_id` and claim `status`, including every downgrade a claim
@@ -1084,6 +1226,86 @@ as `kind="dossier"`, and never pass `supersedes` against the head — each of
 those impersonates the head, and merging a contribution into it is a dossier
 steward's job, not this job's.
 
+**A nightly DOSSIER-CONTRIB to `return-to-main-sweep-never-acts`, every night,
+new shape or not.** The block above records NEW shapes, so a standing problem
+that recurs unchanged is never recorded: each night's finding says "no new
+dossier shape" and expires in 14 days. The recurrence is the signal here — the
+sweep ran N nights and acted on nothing — so this contribution is unconditional,
+including on a late-fire or capped skip, a `DEADLINE` or `DIED` run, and a SHADOW
+night. It is posted AFTER the Step 5 report has been posted (or has failed with
+`COORD FINDING NOT RECORDED`), never before it and never in its place: the
+report is what hard rule 11 requires, and this is the second post. Read the head
+first, exactly as above:
+
+```text
+coord_recent_findings(kind="dossier", topic="dossier:return-to-main-sweep-never-acts")  # envelope-ok: an agent-issued MCP call whose answer the session reads by the keys named in the next paragraph (available before count), not a script parsing a response
+```
+
+`available: false` makes the head UNKNOWN; `count: 0` with `available: true`
+means no head is open yet. Either way post the contribution, and say which in
+its body.
+
+One contribution per sweep run. Every figure comes from this run's own files
+(`$RUN_DIR/quiesce*.json`, every `pass-*.jsonl`), none inferred, and every count
+is of DISTINCT repos, because one repo can have rows in several pass logs:
+
+- **acted** — repos whose final decision row (the latest by `ts`; on equal `ts` the later pass log in the order the run wrote them, then the later line) has `action`
+  `RETURNED` or `FAST_FORWARDED`, whatever its `verdict_source` (`classifier`,
+  `adjudicated` and `adjudicated_superseded` each count the repo once). A SHADOW
+  run measured clean is 0. Repos whose final row is `FAILED` are reported
+  separately in the body as `failed: <n>`.
+- **would-act** — repos with a `WOULD_RETURN` or `WOULD_FAST_FORWARD` row in any
+  `--dry-run` pass, plus each repo named in a "WOULD pass --adjudicated-…" or
+  "WOULD pass --restore-residue" line Step 3 reported. A repo counts once even
+  when several of these apply. `acted` and `would-act` are not additive: a repo
+  that WOULD act in pass A and moved in pass B is in both.
+- **quiet-eligible** — the number of repo names in the `per_repo_summary.act_eligible`
+  list (a flat list of repos whose quiet verdict was QUIET) of each Step 1b quiet
+  file, one number per move class (`checkout-ff`, `checkout-return`), counting
+  only repos that appear in pass A's decision rows (intersect the list with those
+  repo names; `examined` is a count of checkouts and can differ). It is independent of `--act`: it says how many
+  repos the quiet check would have let act, not how many did. The denominator is
+  pass A's `run_end.examined`; report `capped_out` when it is non-zero. Report
+  separately how many of those repos Step 1c or 1d then downgraded to SHADOW
+  (read from the `quiesce-<label>.json` re-checks and the 1d claim answers).
+  For each repo that was not quiet-eligible quote the class that held it: its
+  `per_repo[R].blocking[]` entries verbatim (the list is capped at 20, so say so
+  when `blocking_truncated` is set), or `unknown_because` for an UNKNOWN repo;
+  and quote the machine-level `blocking[]` / `overridable[]` classes once.
+
+If any figure cannot be read — a pass log that failed the Step 2 consistency
+check, a quiet verdict that was UNKNOWN, an empty `RUN_DIR`, or a run that ended
+`DEADLINE` or `DIED` — write `UNKNOWN` (or `skipped: <reason>` for a late-fire or
+capped skip) in that figure's slot, in place of the number. This outranks "a
+SHADOW run is 0": a zero you did not measure is the false signal this dossier
+exists to catch. Elapsed seconds go in the body only when you timed the run
+yourself; never infer them.
+
+```text
+coord_post_finding(  # envelope-ok: an agent-issued MCP call; success is read as posted:true with the id at finding.finding_id, as Step 5 says, not parsed by a script
+  title="DOSSIER-CONTRIB return-to-main-sweep-never-acts — <host> <YYYY-MM-DD>: <n|UNKNOWN|skipped: reason> acted, <n|UNKNOWN|skipped: reason> would-act, ff <n|UNKNOWN|skipped: reason>/return <n|UNKNOWN|skipped: reason> of <N|UNKNOWN|skipped: reason> repos quiet-eligible",
+  body="<head status (available:false / count:0 / head id); RUN_DIR timestamp; requested vs effective mode; failed count; capped_out; the blocking classes above; abstentions by verdict; any dirty-provenance timeout; the finding_id of tonight's Step 5 report, or 'Step 5 report NOT RECORDED'>",
+  kind="investigation",
+  topic="dossier:return-to-main-sweep-never-acts",
+  resource_keys=["2026-09-13-nightly-return-to-main-sweep", "<repo>", ...]
+)
+```
+
+Same rules as above: never title it `DOSSIER return-to-main-sweep-never-acts …`,
+never post it as `kind="dossier"`, never pass `supersedes`. A second run on the
+same device and date posts its own contribution; the RUN_DIR timestamp in the
+body is what tells them apart. If `coord_post_finding` is not a visible tool or
+a call answers `"Command failed with no output"`, follow Step 5's recovery
+(`/coord-revive`, re-issue over the live door), but verify by reading the
+CONTRIBUTION's own topic — `coord_recent_findings(topic="dossier:return-to-main-sweep-never-acts")`,
+matching this run's `RUN_DIR` timestamp in the body — never `checkout-staleness`,
+which would find the Step 5 report and read it as this post. If it still did not
+land, put `DOSSIER CONTRIBUTION NOT RECORDED: <the failure you saw>` in the same
+place Step 5 puts its own outcome (the final output when that arm was taken).
+This post is the second one of the run and is budgeted as such: if the wait
+budget is already spent at the Step 5 post, still make this one attempt, and
+skip only the `/coord-revive` recovery.
+
 ## Hard rules
 
 1. **Every checkout mutation goes through `return-to-main-sweep.sh`, and every
@@ -1126,6 +1348,12 @@ steward's job, not this job's.
    `--adjudicated-landed` SHA other than the HEAD you pinned in 3a, or an
    evidence file you did not generate for that repo tonight.
 10. **Never `gh pr merge`**, and never open a PR from this job.
+11. **Never end a turn while a helper is running, and never end the session
+    without the Step 5 finding.** A scheduled run is headless, and an ended
+    turn is an ended process. Wait as "The turn never ends while a helper
+    runs" says. When the wait budget runs out, report the pass UNKNOWN and
+    post the finding anyway. A night with no finding is indistinguishable
+    from a night that hung.
 
 ## Recovery, and what a moved checkout keeps
 

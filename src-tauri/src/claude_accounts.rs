@@ -11,13 +11,14 @@
 //! rotation across the configured accounts.
 //!
 //! This module owns the dedicated `claude-accounts.json` file at the
-//! UNSCOPED canonical path `dirs::config_dir()/com.qontinui.runner/`,
+//! UNSCOPED canonical path `<platform config dir>/com.qontinui.runner/`
+//! (a subject runner's platform dirs live inside its instance root),
 //! deliberately IGNORING `QONTINUI_CONFIG_DIR` — the same resolution rule
 //! as `active_instances.json` in `instance_manager.rs`. `load_settings()`
-//! overlays the four roster fields from this file onto the in-memory
+//! overlays the roster fields from this file onto the in-memory
 //! `Settings` for EVERY instance (primary + temp + named). Precedence is
-//! load-bearing: when the file EXISTS, the overlay overwrites all four
-//! fields UNCONDITIONALLY (not merge-if-non-empty) — per-instance
+//! load-bearing: when the file EXISTS, the overlay overwrites every roster
+//! field UNCONDITIONALLY (not merge-if-non-empty) — per-instance
 //! `settings.json` files keep accumulating stale shadow copies of the
 //! roster via whole-`Settings` saves, and those shadows are harmless only
 //! because the overlay always wins. When the file is ABSENT, per-instance
@@ -38,9 +39,10 @@ use crate::settings::AccountSelectionMode;
 
 const CLAUDE_ACCOUNTS_FILE: &str = "claude-accounts.json";
 
-/// On-disk shape of `claude-accounts.json`: exactly the five machine-global
+/// On-disk shape of `claude-accounts.json`: exactly the six machine-global
 /// roster fields, with types matching the corresponding `Settings` fields
 /// (`Settings.claude_config_dirs`, `Settings.ai.claude_cli.account_selection_mode`,
+/// `Settings.ai.claude_cli.account_selection_pinned`,
 /// `Settings.ai.claude_cli.config_dir`, `Settings.claude_account_launch_commands`,
 /// `Settings.claude_default_launch_command`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -51,6 +53,14 @@ pub struct ClaudeAccountsFile {
     /// How to pick the account when multiple config dirs exist (snake_case on disk).
     #[serde(default)]
     pub account_selection_mode: AccountSelectionMode,
+    /// `true` = this machine's `account_selection_mode` wins over the fleet's
+    /// `account_selection_mode` fleet-policy domain (see
+    /// [`resolve_selection_mode`]). Machine-global for the same reason the mode
+    /// is: a per-instance pin would let a temp runner and the primary on one
+    /// box disagree about whether the fleet governs them. Defaults to `false`
+    /// on a file written before the field existed.
+    #[serde(default)]
+    pub account_selection_pinned: bool,
     /// Manual `CLAUDE_CONFIG_DIR` pin (only meaningful in `Manual` mode).
     #[serde(default)]
     pub config_dir: Option<String>,
@@ -64,11 +74,20 @@ pub struct ClaudeAccountsFile {
     /// without the placeholder the runner appends `--session-id <uuid>`.
     #[serde(default)]
     pub claude_default_launch_command: Option<String>,
+    /// Every key this build does not know, carried through a read-modify-write
+    /// verbatim. The file is shared by every runner build on the machine, so
+    /// without this an OLDER build's roster write silently drops a field a
+    /// newer build added — which is exactly how `account_selection_pinned`
+    /// would be lost (unpinning the machine and handing it to the fleet) by a
+    /// build that predates it. Builds that predate THIS field still drop
+    /// unknown keys; this makes every later field survive them.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl ClaudeAccountsFile {
-    /// True when no roster data is present (selection mode alone — a plain
-    /// default — does not count as roster data).
+    /// True when no roster data is present (selection mode and its pin alone
+    /// — plain defaults — do not count as roster data).
     fn is_empty_roster(&self) -> bool {
         self.claude_config_dirs.is_empty()
             && self.config_dir.is_none()
@@ -83,26 +102,38 @@ impl ClaudeAccountsFile {
 /// unit-testable without touching process env or the real config dir.
 fn accounts_path_under(config_root: &Path) -> PathBuf {
     config_root
-        .join("com.qontinui.runner")
+        .join(qontinui_runner_lib::instance_env::RUNNER_BUNDLE_ID)
         .join(CLAUDE_ACCOUNTS_FILE)
 }
 
 /// Canonical machine-global path to `claude-accounts.json`.
 ///
-/// ALWAYS rooted at `dirs::config_dir()` — `QONTINUI_CONFIG_DIR` is
+/// ALWAYS rooted at the platform config dir — `QONTINUI_CONFIG_DIR` is
 /// deliberately ignored (unlike `settings::get_settings_path`), so every
 /// instance on the machine resolves the SAME file. Mirrors the unscoped
-/// `session_file_path` resolver for `active_instances.json`.
+/// `session_file_path` resolver for `active_instances.json`. The one
+/// exception is a SUBJECT runner (`QONTINUI_INSTANCE_ROOT`): through
+/// `instance_env::platform_dir` its "machine" is its own root, so it neither
+/// reads nor overwrites the harness's roster (plan
+/// `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`).
 pub fn claude_accounts_file_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| accounts_path_under(&d))
+    qontinui_runner_lib::instance_env::platform_dir(
+        qontinui_runner_lib::instance_env::PlatformDir::Config,
+    )
+    .map(|d| accounts_path_under(&d))
 }
 
 /// Unscoped canonical `settings.json` (the PRIMARY runner's file) — the
 /// migration source. Must NOT honor `QONTINUI_CONFIG_DIR`: a secondary
 /// running the migration has to probe the primary's file, not its own
-/// instance-scoped copy.
+/// instance-scoped copy. A SUBJECT runner has no primary to read from: its
+/// own `settings.json` (under its root's config dir) is the migration source.
 fn unscoped_settings_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("com.qontinui.runner").join("settings.json"))
+    if qontinui_runner_lib::instance_env::instance_root().is_some() {
+        return qontinui_runner_lib::instance_env::runner_config_dir()
+            .map(|(d, _)| d.join("settings.json"));
+    }
+    qontinui_runner_lib::instance_env::runner_config_base().map(|d| d.join("settings.json"))
 }
 
 /// Load the roster from `path`. Fail-open: missing or corrupt file → `None`
@@ -179,6 +210,8 @@ fn migrate_seed(accounts_path: &Path, unscoped_settings: &Path) -> bool {
         config_dir: Option<String>,
         #[serde(default)]
         account_selection_mode: AccountSelectionMode,
+        #[serde(default)]
+        account_selection_pinned: bool,
     }
     #[derive(Deserialize, Default)]
     struct AiProbe {
@@ -212,9 +245,11 @@ fn migrate_seed(accounts_path: &Path, unscoped_settings: &Path) -> bool {
     let seed = ClaudeAccountsFile {
         claude_config_dirs: probe.claude_config_dirs,
         account_selection_mode: probe.ai.claude_cli.account_selection_mode,
+        account_selection_pinned: probe.ai.claude_cli.account_selection_pinned,
         config_dir: probe.ai.claude_cli.config_dir,
         claude_account_launch_commands: probe.claude_account_launch_commands,
         claude_default_launch_command: probe.claude_default_launch_command,
+        extra: serde_json::Map::new(),
     };
     if seed.is_empty_roster() {
         return false; // empty roster — leave legacy per-instance behavior intact
@@ -250,7 +285,7 @@ pub fn load_with_migration() -> Option<ClaudeAccountsFile> {
     load()
 }
 
-/// Overwrite the five roster fields on `settings` from `roster` —
+/// Overwrite the six roster fields on `settings` from `roster` —
 /// UNCONDITIONALLY (even with empty values): when `claude-accounts.json`
 /// exists it is the single source of truth, and the stale shadow copies in
 /// per-instance settings.json files must never win. Pure so the precedence
@@ -261,29 +296,168 @@ pub fn apply_roster_overlay(settings: &mut crate::settings::Settings, roster: Cl
     settings.claude_default_launch_command = roster.claude_default_launch_command;
     settings.ai.claude_cli.config_dir = roster.config_dir;
     settings.ai.claude_cli.account_selection_mode = roster.account_selection_mode;
+    settings.ai.claude_cli.account_selection_pinned = roster.account_selection_pinned;
 }
 
-/// The account-selection mode that will ACTUALLY be applied on this machine.
+/// Which input decided the effective account-selection mode — reported beside
+/// the mode wherever the mode is SHOWN (the AI-settings reads, the env
+/// capture) so a reader can tell a fleet override from a local choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountSelectionSource {
+    /// Unpinned, and the fleet's `account_selection_mode` policy has a value.
+    Fleet,
+    /// Unpinned, and the fleet has no opinion — the local mode applies.
+    Local,
+    /// Pinned — the local mode applies whatever the fleet says.
+    Pinned,
+}
+
+impl AccountSelectionSource {
+    /// The snake_case wire spelling — byte-identical to what serde emits
+    /// (pinned by `selection_source_str_matches_serde`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccountSelectionSource::Fleet => "fleet",
+            AccountSelectionSource::Local => "local",
+            AccountSelectionSource::Pinned => "pinned",
+        }
+    }
+}
+
+/// The one rule deciding which account-selection mode governs, and which
+/// input decided it. PURE.
+///
+/// A PINNED machine uses its local mode, full stop (source `Pinned`, whether
+/// or not the fleet has a value — the pin is the thing the user controls). An
+/// unpinned machine uses the fleet's `account_selection_mode` fleet-policy
+/// value when the fleet has an opinion (`Some`, source `Fleet`), else its
+/// local mode (source `Local`). This is FORCE-APPLY, not a default-fill: the
+/// local mode is always a concrete value on disk (the field is not an
+/// `Option`), so a fleet term that only filled an absent local value would
+/// never take effect on any machine that has ever saved settings.
+///
+/// This is the ONE rule: every decision and report site goes through it —
+/// [`resolve_selection_mode`] is only its tested mode-half, used where the
+/// source is not needed. Sites: the picker
+/// ([`crate::ai_provider::account_usage::pick_best_account`]), the spawn-time
+/// config-dir resolution (`ai_provider::config::get_effective_config_dir`),
+/// the per-device account report, the AI-settings reads and the env capture —
+/// so the fleet value cannot half-apply and the source can never be computed
+/// by a second rule.
+pub fn resolve_selection(
+    local: AccountSelectionMode,
+    pinned: bool,
+    fleet: Option<AccountSelectionMode>,
+) -> (AccountSelectionMode, AccountSelectionSource) {
+    if pinned {
+        (local, AccountSelectionSource::Pinned)
+    } else {
+        match fleet {
+            Some(f) => (f, AccountSelectionSource::Fleet),
+            None => (local, AccountSelectionSource::Local),
+        }
+    }
+}
+
+/// The `selection_source` a REPORT (the env capture) should carry. PURE.
+///
+/// `answered` is whether coord has answered the fleet account-selection
+/// domain in this process. Before it has, an unpinned source is `unknown`
+/// rather than `local` — the cache's "no fleet opinion" then means "not yet
+/// asked". A pinned machine is `pinned` either way: no fleet answer can change
+/// that.
+pub fn reported_selection_source(source: AccountSelectionSource, answered: bool) -> &'static str {
+    if source == AccountSelectionSource::Pinned || answered {
+        source.as_str()
+    } else {
+        "unknown"
+    }
+}
+
+/// The mode half of [`resolve_selection`].
+pub fn resolve_selection_mode(
+    local: AccountSelectionMode,
+    pinned: bool,
+    fleet: Option<AccountSelectionMode>,
+) -> AccountSelectionMode {
+    resolve_selection(local, pinned, fleet).0
+}
+
+/// [`resolve_selection_mode`] applied to one `ClaudeCliSettings` document
+/// plus the fleet-policy cache.
+///
+/// For decision sites that are already handed the (roster-overlaid)
+/// `get_ai_settings().claude_cli` — reading the mode and the pin off the SAME
+/// document they were given keeps them consistent with it (and keeps their
+/// unit tests hermetic: a test's settings value, not the host machine's
+/// `claude-accounts.json`, decides the local half).
+pub fn resolve_for_cli_settings(cli: &crate::settings::ClaudeCliSettings) -> AccountSelectionMode {
+    resolve_selection(
+        cli.account_selection_mode,
+        cli.account_selection_pinned,
+        crate::mcp::fleet_policy_poller::fleet_account_selection_mode(),
+    )
+    .0
+}
+
+/// The machine's LOCAL `(mode, pinned)` pair, before any fleet term.
 ///
 /// Same precedence as [`apply_roster_overlay`], expressed once: when
 /// `claude-accounts.json` exists it is the single source of truth for the
-/// roster fields (including this one), and the per-instance `settings.json`
+/// roster fields (including these two), and the per-instance `settings.json`
 /// copy is a stale shadow. Only when the file is absent/corrupt does the
-/// per-instance value apply.
+/// per-instance value apply. Both halves come from the SAME source so a pin
+/// can never be read from one document and the mode it pins from another.
+fn local_selection() -> (AccountSelectionMode, bool) {
+    match load() {
+        Some(roster) => (
+            roster.account_selection_mode,
+            roster.account_selection_pinned,
+        ),
+        None => {
+            let cli = crate::settings::get_ai_settings().claude_cli;
+            (cli.account_selection_mode, cli.account_selection_pinned)
+        }
+    }
+}
+
+/// The account-selection mode that will ACTUALLY be applied on this machine:
+/// the local `(mode, pinned)` pair ([`local_selection`])
+/// resolved against the fleet's `account_selection_mode` policy by
+/// [`resolve_selection_mode`].
 ///
 /// Read this — never `get_ai_settings().claude_cli.account_selection_mode` —
 /// wherever the mode is being REPORTED (e.g. the per-device account feed to
-/// coord), because a report is a claim about the machine, not about one
-/// instance's settings document.
+/// coord) or ACTED on (the account picker), because a report is a claim about
+/// the machine, not about one instance's settings document, and the picker
+/// must rotate under the same mode the report names.
 pub fn effective_selection_mode() -> AccountSelectionMode {
-    match load() {
-        Some(roster) => roster.account_selection_mode,
-        None => {
-            crate::settings::get_ai_settings()
-                .claude_cli
-                .account_selection_mode
-        }
-    }
+    effective_selection().0
+}
+
+/// [`effective_selection_mode`] plus the [`AccountSelectionSource`] that
+/// decided it — the pair the AI-settings reads and the env capture report, so
+/// a fleet override is visible as one rather than as an unexplained mode.
+pub fn effective_selection() -> (AccountSelectionMode, AccountSelectionSource) {
+    let (mode, source, _fleet) = effective_selection_with_fleet();
+    (mode, source)
+}
+
+/// [`effective_selection`] plus the RAW fleet-policy value it was resolved
+/// against (`None` = the fleet has no opinion), all from ONE read of the
+/// fleet cache so the three can never disagree. The Settings page needs the
+/// raw value to re-apply [`resolve_selection`] to its unsaved form state (an
+/// un-ticked pin, a different local mode) without a round trip.
+pub fn effective_selection_with_fleet() -> (
+    AccountSelectionMode,
+    AccountSelectionSource,
+    Option<AccountSelectionMode>,
+) {
+    let (local, pinned) = local_selection();
+    let fleet = crate::mcp::fleet_policy_poller::fleet_account_selection_mode();
+    let (mode, source) = resolve_selection(local, pinned, fleet);
+    (mode, source, fleet)
 }
 
 /// Read-modify-write the machine-global roster file (last-writer-wins).
@@ -304,9 +478,11 @@ fn roster_from_current_settings() -> ClaudeAccountsFile {
     ClaudeAccountsFile {
         claude_config_dirs: s.claude_config_dirs,
         account_selection_mode: s.ai.claude_cli.account_selection_mode,
+        account_selection_pinned: s.ai.claude_cli.account_selection_pinned,
         config_dir: s.ai.claude_cli.config_dir,
         claude_account_launch_commands: s.claude_account_launch_commands,
         claude_default_launch_command: s.claude_default_launch_command,
+        extra: serde_json::Map::new(),
     }
 }
 
@@ -326,11 +502,12 @@ mod tests {
     }
 
     /// The canonical path must come straight from `dirs::config_dir()` —
-    /// `QONTINUI_CONFIG_DIR` plays no part. The resolver never reads env, so
-    /// this asserts equality with the dirs-derived path without mutating
-    /// process env (env-mutation would race other tests' `load_settings`).
+    /// `QONTINUI_CONFIG_DIR` plays no part. The resolver reads only
+    /// `QONTINUI_INSTANCE_ROOT` (through `instance_env::platform_dir`), so the
+    /// env lock keeps a sibling test's subject launch from racing it.
     #[test]
     fn canonical_path_ignores_qontinui_config_dir() {
+        let _lock = crate::test_env::env_lock();
         let expected = dirs::config_dir().map(|d| accounts_path_under(&d));
         assert_eq!(claude_accounts_file_path(), expected);
         if let Some(p) = claude_accounts_file_path() {
@@ -348,9 +525,11 @@ mod tests {
         let file = ClaudeAccountsFile {
             claude_config_dirs: vec!["C:\\Users\\x\\.claude-work".to_string()],
             account_selection_mode: AccountSelectionMode::LeastUsage,
+            account_selection_pinned: true,
             config_dir: Some("C:\\Users\\x\\.claude-work".to_string()),
             claude_account_launch_commands: cmds,
             claude_default_launch_command: None,
+            extra: serde_json::Map::new(),
         };
         let json = serde_json::to_string_pretty(&file).unwrap();
         assert!(
@@ -376,9 +555,11 @@ mod tests {
         assert_eq!(parsed.claude_config_dirs, vec!["/a".to_string()]);
         assert_eq!(
             parsed.account_selection_mode,
-            AccountSelectionMode::HighestExpectedUsage
+            AccountSelectionMode::default()
         );
         assert_eq!(parsed.config_dir, None);
+        // A roster written before the pin existed decodes UNPINNED.
+        assert!(!parsed.account_selection_pinned);
     }
 
     #[test]
@@ -398,7 +579,7 @@ mod tests {
     /// the shadow's.
     #[test]
     #[allow(clippy::field_reassign_with_default)] // Settings has ~60 fields; literal construction is impractical
-    fn overlay_overwrites_all_five_fields_unconditionally() {
+    fn overlay_overwrites_all_six_fields_unconditionally() {
         let mut settings = crate::settings::Settings::default();
         settings.claude_config_dirs = vec!["/stale-shadow".into()];
         settings
@@ -407,15 +588,18 @@ mod tests {
         settings.claude_default_launch_command = Some("stale-default".into());
         settings.ai.claude_cli.config_dir = Some("/stale-shadow".into());
         settings.ai.claude_cli.account_selection_mode = AccountSelectionMode::Manual;
+        settings.ai.claude_cli.account_selection_pinned = false;
 
         let mut cmds = HashMap::new();
         cmds.insert("/global".to_string(), "clg".to_string());
         let roster = ClaudeAccountsFile {
             claude_config_dirs: vec!["/global".into()],
             account_selection_mode: AccountSelectionMode::LeastUsage,
+            account_selection_pinned: true,
             config_dir: None, // must overwrite the Some(...) shadow
             claude_account_launch_commands: cmds.clone(),
             claude_default_launch_command: Some("claude --model opus".into()),
+            extra: serde_json::Map::new(),
         };
         apply_roster_overlay(&mut settings, roster);
 
@@ -430,10 +614,12 @@ mod tests {
             settings.ai.claude_cli.account_selection_mode,
             AccountSelectionMode::LeastUsage
         );
+        assert!(settings.ai.claude_cli.account_selection_pinned);
 
         // Empty-but-present roster also wins (unconditional, not merge-if-non-empty).
         apply_roster_overlay(&mut settings, ClaudeAccountsFile::default());
         assert!(settings.claude_config_dirs.is_empty());
+        assert!(!settings.ai.claude_cli.account_selection_pinned);
         assert!(settings.claude_account_launch_commands.is_empty());
         assert_eq!(settings.claude_default_launch_command, None);
     }
@@ -497,5 +683,189 @@ mod tests {
 
         assert!(!migrate_seed(&accounts, &settings));
         assert_eq!(load_from(&accounts), Some(existing));
+    }
+
+    /// The migration carries the pin across with the mode: a primary whose
+    /// unscoped settings.json says "pinned" must not seed an UNPINNED roster,
+    /// which would hand the machine to the fleet the moment the roster exists.
+    #[test]
+    fn migration_seeds_the_pin_beside_the_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let accounts = dir.path().join("claude-accounts.json");
+        let settings = dir.path().join("settings.json");
+        std::fs::write(
+            &settings,
+            br#"{
+                "claude_config_dirs": ["/acct-a"],
+                "ai": {"claude_cli": {"account_selection_mode": "manual",
+                                       "account_selection_pinned": true}}
+            }"#,
+        )
+        .unwrap();
+
+        assert!(migrate_seed(&accounts, &settings));
+        let seeded = load_from(&accounts).unwrap();
+        assert_eq!(seeded.account_selection_mode, AccountSelectionMode::Manual);
+        assert!(seeded.account_selection_pinned);
+    }
+
+    /// The resolver over its whole domain: 3 local modes × pinned/unpinned ×
+    /// {no fleet opinion, each of the 3 fleet modes}. The expected value is
+    /// spelled as the RULE ("pinned ⇒ local; unpinned ⇒ fleet, else local")
+    /// per cell rather than as a copy of the function body, and two cells are
+    /// additionally pinned to literals so a rule that inverted the pin would
+    /// not pass by agreeing with itself.
+    #[test]
+    fn resolver_grid_pinned_keeps_local_unpinned_takes_the_fleet() {
+        let modes = AccountSelectionMode::ALL;
+        let fleets: Vec<Option<AccountSelectionMode>> = std::iter::once(None)
+            .chain(modes.into_iter().map(Some))
+            .collect();
+        let mut cells = 0;
+        for local in modes {
+            for pinned in [true, false] {
+                for &fleet in &fleets {
+                    let expected = match (pinned, fleet) {
+                        (true, _) => (local, AccountSelectionSource::Pinned),
+                        (false, Some(f)) => (f, AccountSelectionSource::Fleet),
+                        (false, None) => (local, AccountSelectionSource::Local),
+                    };
+                    assert_eq!(
+                        resolve_selection(local, pinned, fleet),
+                        expected,
+                        "local={local:?} pinned={pinned} fleet={fleet:?}"
+                    );
+                    assert_eq!(
+                        resolve_selection_mode(local, pinned, fleet),
+                        expected.0,
+                        "mode half disagrees: local={local:?} pinned={pinned} fleet={fleet:?}"
+                    );
+                    cells += 1;
+                }
+            }
+        }
+        assert_eq!(cells, 60);
+
+        // Literal anchors for the two cells the design turns on.
+        assert_eq!(
+            resolve_selection_mode(
+                AccountSelectionMode::Manual,
+                false,
+                Some(AccountSelectionMode::HighestExpectedUsage)
+            ),
+            AccountSelectionMode::HighestExpectedUsage,
+            "an UNPINNED manual machine is force-applied by the fleet"
+        );
+        assert_eq!(
+            resolve_selection_mode(
+                AccountSelectionMode::Manual,
+                true,
+                Some(AccountSelectionMode::HighestExpectedUsage)
+            ),
+            AccountSelectionMode::Manual,
+            "a PINNED machine ignores the fleet"
+        );
+        assert_eq!(
+            resolve_selection(
+                AccountSelectionMode::Manual,
+                true,
+                Some(AccountSelectionMode::HighestExpectedUsage)
+            ),
+            (AccountSelectionMode::Manual, AccountSelectionSource::Pinned),
+            "a pin reports Pinned even when the fleet has a value"
+        );
+        assert_eq!(
+            resolve_selection(AccountSelectionMode::Manual, false, None),
+            (AccountSelectionMode::Manual, AccountSelectionSource::Local),
+            "unpinned with no fleet opinion is Local"
+        );
+    }
+
+    #[test]
+    fn reported_source_is_unknown_until_the_fleet_answered() {
+        use AccountSelectionSource::*;
+        assert_eq!(reported_selection_source(Local, false), "unknown");
+        assert_eq!(reported_selection_source(Fleet, false), "unknown");
+        assert_eq!(reported_selection_source(Pinned, false), "pinned");
+        assert_eq!(reported_selection_source(Local, true), "local");
+        assert_eq!(reported_selection_source(Fleet, true), "fleet");
+        assert_eq!(reported_selection_source(Pinned, true), "pinned");
+    }
+
+    #[test]
+    fn selection_source_str_matches_serde() {
+        for src in [
+            AccountSelectionSource::Fleet,
+            AccountSelectionSource::Local,
+            AccountSelectionSource::Pinned,
+        ] {
+            assert_eq!(
+                serde_json::to_value(src).unwrap(),
+                serde_json::Value::String(src.as_str().to_string())
+            );
+        }
+    }
+
+    /// `resolve_for_cli_settings` reads the mode AND the pin off the document
+    /// it is handed, and the fleet term from the poller cache — pinned here to
+    /// each state so a concurrently running poller test cannot decide it.
+    #[test]
+    fn resolve_for_cli_settings_reads_mode_and_pin_off_one_document() {
+        let pin = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(None);
+        let unpinned_manual = crate::settings::ClaudeCliSettings {
+            account_selection_mode: AccountSelectionMode::Manual,
+            account_selection_pinned: false,
+            ..Default::default()
+        };
+        let pinned_manual = crate::settings::ClaudeCliSettings {
+            account_selection_pinned: true,
+            ..unpinned_manual.clone()
+        };
+        // No fleet opinion ⇒ local either way.
+        assert_eq!(
+            resolve_for_cli_settings(&unpinned_manual),
+            AccountSelectionMode::Manual
+        );
+        assert_eq!(
+            resolve_for_cli_settings(&pinned_manual),
+            AccountSelectionMode::Manual
+        );
+
+        pin.set(Some(AccountSelectionMode::LeastUsage));
+        assert_eq!(
+            resolve_for_cli_settings(&unpinned_manual),
+            AccountSelectionMode::LeastUsage
+        );
+        assert_eq!(
+            resolve_for_cli_settings(&pinned_manual),
+            AccountSelectionMode::Manual
+        );
+    }
+
+    /// A key this build does not know survives a load → save round trip, so a
+    /// field a NEWER build adds (the way `account_selection_pinned` was added)
+    /// is not dropped by this build's roster writes.
+    #[test]
+    fn unknown_roster_keys_survive_a_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude-accounts.json");
+        std::fs::write(
+            &path,
+            br#"{"claude_config_dirs":["/a"],"account_selection_pinned":true,
+                 "some_future_field":{"nested":1}}"#,
+        )
+        .unwrap();
+        let mut loaded = load_from(&path).unwrap();
+        assert!(loaded.account_selection_pinned);
+        loaded.claude_config_dirs.push("/b".into());
+        save_to(&path, &loaded).unwrap();
+
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["some_future_field"], serde_json::json!({"nested": 1}));
+        assert_eq!(raw["account_selection_pinned"], serde_json::json!(true));
+        assert_eq!(raw["claude_config_dirs"], serde_json::json!(["/a", "/b"]));
+        // A KNOWN key is never duplicated into the catch-all.
+        assert!(!loaded.extra.contains_key("account_selection_pinned"));
     }
 }

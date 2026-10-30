@@ -5,11 +5,12 @@
  * (plan 2026-09-17-runner-loopback-api-accepts-any-origin, Phase 3).
  *
  * Trusted = local trust for non-door routes (which include running workflows
- * and checks). Origins added here never get credential doors. Only the four
- * built-in default dev origins (http://localhost:3001, http://127.0.0.1:3001,
- * http://localhost:9875, http://127.0.0.1:9875) still reach the guard's
- * transitional TRUSTED_DOOR_GRACE doors — local command execution and file
- * reads included — until qontinui-web#1380 deploys and the grace is removed.
+ * and checks). Origins added here never get credential doors. Only the two
+ * built-in qontinui-web dev origins (http://localhost:3001,
+ * http://127.0.0.1:3001 — the guard's GRACE_ORIGINS) still reach its
+ * transitional TRUSTED_DOOR_GRACE doors, local command execution and file
+ * reads included. Plan 2026-09-17-retire-the-runner-origin-guard-dev-grace is
+ * the grace's retirement path.
  * Agents, scripts and MCP clients send no Origin and need no entry here.
  * Saved values are live within ~2 s — no restart.
  */
@@ -19,6 +20,7 @@ import { Globe, Plus, Trash2 } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import type { LogFunction } from "./types";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 interface AllowedOriginsSettingsProps {
   onLog: LogFunction;
@@ -63,7 +65,7 @@ export function AllowedOriginsSettings({ onLog }: AllowedOriginsSettingsProps) {
       setDefaults(body.data?.defaults ?? []);
       if (body.data?.envVar) setEnvVar(body.data.envVar);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = describeThrown(e, "unknown error");
       setError(msg);
       onLog("error", `Failed to load allowed origins: ${msg}`);
     } finally {
@@ -81,8 +83,7 @@ export function AllowedOriginsSettings({ onLog }: AllowedOriginsSettingsProps) {
     };
   }, [load]);
 
-  const hasChanges =
-    origins.length !== initial.length || origins.some((o, i) => o !== initial[i]);
+  const hasChanges = origins.length !== initial.length || origins.some((o, i) => o !== initial[i]);
 
   const add = () => {
     const value = input.trim();
@@ -109,7 +110,7 @@ export function AllowedOriginsSettings({ onLog }: AllowedOriginsSettingsProps) {
       setInitial(saved);
       onLog("success", `Saved ${saved.length} allowed browser origin(s)`);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = describeThrown(e, "unknown error");
       setError(msg);
       onLog("error", `Failed to save allowed origins: ${msg}`);
     } finally {
@@ -121,7 +122,7 @@ export function AllowedOriginsSettings({ onLog }: AllowedOriginsSettingsProps) {
     <div className="space-y-4 mt-8" data-ui-bridge-content="allowed-origins-settings">
       <SectionHeader
         title="Allowed Browser Origins"
-        description={`Web pages at these origins get local trust for this runner's ordinary routes, including running workflows and checks, so add only origins served by software you trust as much as the runner itself. Origins you add here never get credential routes (secrets, file reads, server-side requests, command execution). Note: the four built-in default dev origins (localhost and 127.0.0.1, ports 3001 and 9875) currently still reach a transitional set of credential routes, including command execution and file reads, until the web app update that removes that need is deployed. Agents and scripts need no entry. Takes effect within a few seconds, no restart. Headless equivalent: ${envVar}.`}
+        description={`Web pages at these origins get local trust for this runner's ordinary routes, including running workflows and checks, so add only origins served by software you trust as much as the runner itself. Origins you add here never get credential routes (secrets, file reads, server-side requests, command execution). Note: the two built-in web app dev origins (localhost and 127.0.0.1, port 3001) currently still reach a transitional set of credential routes, including command execution and file reads, until that transition is retired. Agents and scripts need no entry. Takes effect within a few seconds, no restart. Headless equivalent: ${envVar}.`}
         icon={<Globe className="w-6 h-6" />}
       />
       <div className="space-y-3 rounded-lg bg-card/50 p-4">

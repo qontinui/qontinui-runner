@@ -15,6 +15,7 @@ import { ChevronDown, ChevronRight, Lock, Loader2 } from "lucide-react";
 import { ParamSchemaForm } from "@/components/wrappers/ParamSchemaForm";
 import { dispatchAction } from "@/lib/wrappers/api";
 import type { ActionDescriptor, DispatchResult } from "@/lib/wrappers/types";
+import { describeThrown } from "@/lib/utils";
 
 export interface ActionsTabProps {
   wrapperId: string;
@@ -81,7 +82,7 @@ export function ActionsTab({ wrapperId, actions }: ActionsTabProps) {
         ...p,
         [action.id]: {
           status: "error",
-          error: err instanceof Error ? err.message : String(err),
+          error: describeThrown(err, "action dispatch failed"),
           startedAt: p[action.id]?.startedAt,
           finishedAt: Date.now(),
         },

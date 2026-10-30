@@ -37,8 +37,8 @@
 //! [`ERROR_EXIT_CODE`] (`1`), matching `LocalPty`'s "non-zero falls back to 1".
 
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -46,6 +46,7 @@ use serde_json::{json, Value};
 use tracing::{debug, warn};
 
 use super::pane_io::{CredentialScrub, PaneIo};
+use super::pane_output::PaneOutput;
 
 /// Exit code `wait` reports after a LOCAL detach (`kill`/`release`).
 pub const DETACH_EXIT_CODE: i32 = 0;
@@ -231,21 +232,15 @@ pub struct RemotePaneIo {
     /// The grant JWT, kept so a relay reconnect can re-present it.
     grant: String,
     sink: Arc<dyn RemoteFrameSink>,
-    /// Sender half of the output channel. `None` once closed — the reader
-    /// sees EOF when the last sender drops.
-    output_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
-    /// Receiver half, taken exactly once by [`PaneIo::reader`].
-    output_rx: Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
-    /// The settled exit code; `wait` parks on the condvar until it is `Some`.
-    exit: Mutex<Option<i32>>,
-    exit_cv: Condvar,
+    /// The output channel, the absolute target offset of the next byte this
+    /// pane expects (the reconnect splice point), and the exit slot — shared
+    /// machinery with `DaemonPaneIo` (see [`PaneOutput`]), keyed by
+    /// `grant_jti`.
+    out: PaneOutput,
     /// `remote_terminal_detach` is QUEUED at most once per pane. A failed
     /// attempt does not latch, so the `release()` that follows a failed
     /// `kill()` on the close path retries it.
     detach: Mutex<DetachOutcome>,
-    /// Absolute target offset of the next byte this pane expects — the
-    /// reconnect splice point.
-    remote_offset: AtomicU64,
     cols: AtomicU16,
     rows: AtomicU16,
     /// Absolute target offset of the first seed byte — the upper bound of the
@@ -255,6 +250,15 @@ pub struct RemotePaneIo {
     history_start: Option<u64>,
     /// Input seq + the read/write receipts. See [`RemoteInteractivity`].
     interactivity: Arc<Mutex<InteractivityState>>,
+    /// Where this pane REPORTS what it measures (plan
+    /// `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
+    /// A2): set once, by the attach flow that knows the coord session and the
+    /// grant. Unset — a test pane, or the probe sweep, which reports its own
+    /// outcome explicitly — reports nothing.
+    report: OnceLock<(
+        crate::mcp::remote_interactivity::SourceReportContext,
+        Arc<crate::mcp::remote_interactivity::Reporter>,
+    )>,
 }
 
 impl RemotePaneIo {
@@ -270,33 +274,33 @@ impl RemotePaneIo {
         rows: u16,
         seed: AttachedRing,
     ) -> Self {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        let next_offset = seed.start_offset.saturating_add(seed.buffer.len() as u64);
         debug!(
             seed_bytes = seed.buffer.len(),
             start_offset = seed.start_offset,
             target_total = seed.total_bytes_produced,
             "remote pane: seeded from the target's ring"
         );
-        if !seed.buffer.is_empty() {
-            // The receiver is alive (we hold it), so this cannot fail.
-            let _ = tx.send(seed.buffer);
-        }
+        let grant_jti = grant_jti.into();
+        let seed_start = seed.start_offset;
+        let history_start = seed.history_start;
+        let out = PaneOutput::new(
+            grant_jti.clone(),
+            seed.buffer,
+            seed.start_offset,
+            lost_output_marker,
+        );
+        let next_offset = out.offset();
         Self {
-            grant_jti: grant_jti.into(),
+            grant_jti,
             terminal_id: terminal_id.into(),
             grant: grant.into(),
             sink,
-            output_tx: Mutex::new(Some(tx)),
-            output_rx: Mutex::new(Some(rx)),
-            exit: Mutex::new(None),
-            exit_cv: Condvar::new(),
+            out,
             detach: Mutex::new(DetachOutcome::NotAttempted),
-            remote_offset: AtomicU64::new(next_offset),
             cols: AtomicU16::new(cols),
             rows: AtomicU16::new(rows),
-            seed_start: seed.start_offset,
-            history_start: seed.history_start,
+            seed_start,
+            history_start,
             interactivity: Arc::new(Mutex::new(InteractivityState {
                 next_seq: 1,
                 snapshot: RemoteInteractivity {
@@ -315,6 +319,37 @@ impl RemotePaneIo {
                     }),
                 },
             })),
+            report: OnceLock::new(),
+        }
+    }
+
+    /// Start reporting this pane's measurements to coord through the
+    /// process-wide reporter. See [`Self::attach_report_context_to`].
+    pub fn attach_report_context(
+        &self,
+        ctx: crate::mcp::remote_interactivity::SourceReportContext,
+    ) {
+        self.attach_report_context_to(ctx, crate::mcp::remote_interactivity::reporter().clone());
+    }
+
+    /// Start reporting to `reporter`. The attach reply that built this pane IS
+    /// a frame from the target, so the read half is reported at once; every
+    /// later spliced frame offers another `read: ok`, which the reporter
+    /// coalesces to one row per `REPORT_EVERY` — never one per frame. A second
+    /// call is ignored (the context is the grant's, and a pane has one grant).
+    pub fn attach_report_context_to(
+        &self,
+        ctx: crate::mcp::remote_interactivity::SourceReportContext,
+        reporter: Arc<crate::mcp::remote_interactivity::Reporter>,
+    ) {
+        if self.report.set((ctx, reporter)).is_ok() {
+            self.report_read_ok();
+        }
+    }
+
+    fn report_read_ok(&self) {
+        if let Some((ctx, reporter)) = self.report.get() {
+            reporter.observe(ctx.read_ok(chrono::Utc::now()));
         }
     }
 
@@ -404,8 +439,17 @@ impl RemotePaneIo {
     /// phantom turns that slot exists to catch. Only a target that has ALREADY
     /// acked on this attachment is known to honour the flag.
     pub fn send_input_probe(&self) -> Result<u64, String> {
+        self.send_input_probe_given(false)
+    }
+
+    /// [`Self::send_input_probe`], with `target_known_to_ack` standing in for
+    /// the prior ack when something OTHER than this attachment has positively
+    /// established that the target honours `probe` — coord's target readiness
+    /// answering `supports` for input acknowledgement. An unknown capability
+    /// is `false`, never a guess: the probe sweep passes exactly that.
+    pub fn send_input_probe_given(&self, target_known_to_ack: bool) -> Result<u64, String> {
         let mut g = self.interactivity.lock().unwrap_or_else(|e| e.into_inner());
-        if g.snapshot.acks_since_attach == 0 {
+        if g.snapshot.acks_since_attach == 0 && !target_known_to_ack {
             return Err(format!(
                 "{TARGET_PREDATES_INPUT_ACK}: no input ack has been received on this attachment, \
                  so the target is not known to honour `probe` — an older build would write the \
@@ -433,11 +477,14 @@ impl RemotePaneIo {
     /// Stamp the read half: a frame from the target was just spliced.
     fn note_frame_received(&self) {
         let through_offset = self.remote_offset();
-        let mut g = self.interactivity.lock().unwrap_or_else(|e| e.into_inner());
-        g.snapshot.last_frame_received = Some(FrameReceived {
-            at_ms: now_epoch_ms(),
-            through_offset,
-        });
+        {
+            let mut g = self.interactivity.lock().unwrap_or_else(|e| e.into_inner());
+            g.snapshot.last_frame_received = Some(FrameReceived {
+                at_ms: now_epoch_ms(),
+                through_offset,
+            });
+        }
+        self.report_read_ok();
     }
 
     /// The `[from, to)` target range OLDER than the attach seed that the
@@ -459,7 +506,7 @@ impl RemotePaneIo {
 
     /// Absolute target offset of the next byte this pane expects.
     pub fn remote_offset(&self) -> u64 {
-        self.remote_offset.load(Ordering::Acquire)
+        self.out.offset()
     }
 
     /// The viewport last announced with `resize` (or the attach size).
@@ -472,29 +519,14 @@ impl RemotePaneIo {
 
     /// True once `wait` has an answer — the routing client sweeps these.
     pub fn is_finished(&self) -> bool {
-        self.exit.lock().map(|e| e.is_some()).unwrap_or(true)
+        self.out.is_finished()
     }
 
     /// Queue one output chunk from the target (already decoded). Silently
     /// dropped once the pane is closed — a late frame after exit has nowhere
     /// to go, exactly like bytes after a local PTY's EOF.
     pub fn push_output(&self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        let Ok(tx) = self.output_tx.lock() else {
-            return;
-        };
-        let delivered = match tx.as_ref() {
-            Some(tx) if tx.send(bytes.to_vec()).is_ok() => {
-                self.remote_offset
-                    .fetch_add(bytes.len() as u64, Ordering::AcqRel);
-                true
-            }
-            _ => false,
-        };
-        drop(tx);
-        if delivered {
+        if self.out.push_output(bytes) {
             self.note_frame_received();
         }
     }
@@ -503,15 +535,7 @@ impl RemotePaneIo {
     /// notice — without moving the remote offset, so the splice arithmetic
     /// stays anchored to the target's stream.
     pub fn push_local(&self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        let Ok(tx) = self.output_tx.lock() else {
-            return;
-        };
-        if let Some(tx) = tx.as_ref() {
-            let _ = tx.send(bytes.to_vec());
-        }
+        self.out.push_local(bytes);
     }
 
     /// The relay carrying this pane dropped. Say so in the pane; the session
@@ -527,56 +551,18 @@ impl RemotePaneIo {
     /// we were away — the loss is written into the pane as an in-band marker
     /// (never silently) and the whole ring is delivered after it.
     pub fn splice_replay(&self, ring: &AttachedRing) {
-        let have = self.remote_offset();
-        let start = ring.start_offset;
-        let end = start.saturating_add(ring.buffer.len() as u64);
-        if have >= end {
-            debug!(
-                grant_jti = %self.grant_jti,
-                have,
-                ring_end = end,
-                "remote pane: reattach ring adds nothing new"
-            );
-            // Still a frame the target answered with — the read half holds —
-            // but only while the pane is open, as in `push_output`: a frame
-            // after exit went nowhere and is not a receipt.
-            if self.output_open() {
-                self.note_frame_received();
-            }
-            return;
+        // A delivered ring, or one adding nothing while the pane is open, is a
+        // frame the target answered with — the read half holds. After exit it
+        // went nowhere and is not a receipt (`PaneOutput::splice` decides).
+        if self.out.splice(ring.start_offset, &ring.buffer) {
+            self.note_frame_received();
         }
-        let skip = if have > start {
-            (have - start) as usize
-        } else {
-            if have < start {
-                let lost = start - have;
-                warn!(
-                    grant_jti = %self.grant_jti,
-                    lost_bytes = lost,
-                    "remote pane: reattach ring starts past the last byte seen — output was lost while detached"
-                );
-                self.push_local(&lost_output_marker(lost));
-            }
-            0
-        };
-        // `push_output` advances the offset by the delivered length; align it
-        // to the ring's own start first so the arithmetic lands on `end`.
-        self.remote_offset
-            .store(start.saturating_add(skip as u64), Ordering::Release);
-        // `push_output` stamps the receipt when it delivers.
-        self.push_output(&ring.buffer[skip..]);
     }
 
     /// Settle the exit code (first writer wins) and close the output channel
     /// so a reader blocked in `read()` sees EOF.
     pub fn mark_exit(&self, code: i32) {
-        if let Ok(mut slot) = self.exit.lock() {
-            if slot.is_none() {
-                *slot = Some(code);
-            }
-        }
-        self.exit_cv.notify_all();
-        self.close_output();
+        self.out.settle(Ok(code));
     }
 
     /// A `remote_terminal_error` for this pane: logged, then treated as an
@@ -589,20 +575,25 @@ impl RemotePaneIo {
             message,
             "remote pane: target reported an error — closing the pane"
         );
+        // Only FATAL codes reach here (`settle_pane_error`), i.e. the
+        // attachment is gone: neither half works from this source any more.
+        // The reporter's classifier files a wire refusal as `failed`, a busy
+        // terminal / unreachable target as `unknown`, and a local code not at
+        // all.
+        if let Some((ctx, reporter)) = self.report.get() {
+            for obs in ctx.refusal(
+                code,
+                &crate::mcp::remote_interactivity::Half::BOTH,
+                chrono::Utc::now(),
+            ) {
+                reporter.observe(obs);
+            }
+        }
         self.mark_exit(ERROR_EXIT_CODE);
     }
 
-    fn output_open(&self) -> bool {
-        self.output_tx
-            .lock()
-            .map(|tx| tx.is_some())
-            .unwrap_or(false)
-    }
-
     fn close_output(&self) {
-        if let Ok(mut tx) = self.output_tx.lock() {
-            drop(tx.take());
-        }
+        self.out.close_output();
     }
 
     fn send(&self, frame: Value) -> Result<(), String> {
@@ -675,36 +666,6 @@ impl RemotePaneIo {
     }
 }
 
-/// Blocking `Read` over the output channel: yields queued chunks in order,
-/// EOF once every sender is gone.
-struct ChannelReader {
-    rx: mpsc::Receiver<Vec<u8>>,
-    pending: Vec<u8>,
-    pos: usize,
-}
-
-impl Read for ChannelReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        if self.pos >= self.pending.len() {
-            match self.rx.recv() {
-                Ok(chunk) => {
-                    self.pending = chunk;
-                    self.pos = 0;
-                }
-                // Every sender dropped: the pane exited or was released.
-                Err(mpsc::RecvError) => return Ok(0),
-            }
-        }
-        let n = (self.pending.len() - self.pos).min(buf.len());
-        buf[..n].copy_from_slice(&self.pending[self.pos..self.pos + n]);
-        self.pos += n;
-        Ok(n)
-    }
-}
-
 /// `Write` that ships each write as one `remote_terminal_input` frame,
 /// stamped with the pane's next `seq`.
 struct FrameWriter {
@@ -751,17 +712,7 @@ impl Write for FrameWriter {
 
 impl PaneIo for RemotePaneIo {
     fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
-        let rx = self
-            .output_rx
-            .lock()
-            .map_err(|e| format!("Remote pane reader lock poisoned: {}", e))?
-            .take()
-            .ok_or_else(|| "remote pane reader already taken".to_string())?;
-        Ok(Box::new(ChannelReader {
-            rx,
-            pending: Vec::new(),
-            pos: 0,
-        }))
+        self.out.take_reader()
     }
 
     fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
@@ -786,19 +737,7 @@ impl PaneIo for RemotePaneIo {
     }
 
     fn wait(&self) -> Result<i32, String> {
-        let mut slot = self
-            .exit
-            .lock()
-            .map_err(|e| format!("Remote pane exit lock poisoned: {}", e))?;
-        loop {
-            if let Some(code) = *slot {
-                return Ok(code);
-            }
-            slot = self
-                .exit_cv
-                .wait(slot)
-                .map_err(|e| format!("Remote pane exit lock poisoned: {}", e))?;
-        }
+        self.out.wait()
     }
 
     fn kill(&self, _budget: Duration) -> Result<(), String> {
@@ -1075,6 +1014,85 @@ pub(crate) mod tests {
             pane.interactivity().acks_received,
             1,
             "lifetime count survives"
+        );
+    }
+
+    /// A2 SOURCE role: a tab pane with a report context files `read: ok`
+    /// (via traffic, under its grant, as this device) on attach, and a burst
+    /// of spliced frames is ONE report, not one per frame; a fatal refusal
+    /// files `failed` on both halves with the wire code verbatim.
+    #[tokio::test]
+    async fn a_reporting_pane_files_read_ok_coalesced_and_refusals_on_both_halves() {
+        use crate::mcp::remote_interactivity::{
+            FactState, Half, Observation, ObservationSender, Reporter, Role, SourceReportContext,
+            Via, REPORT_EVERY,
+        };
+        #[derive(Default)]
+        struct Rec(Mutex<Vec<Observation>>);
+        #[async_trait::async_trait]
+        impl ObservationSender for Rec {
+            async fn send(&self, obs: &Observation) -> Result<(), String> {
+                self.0.lock().unwrap().push(obs.clone());
+                Ok(())
+            }
+        }
+        let rec = Arc::new(Rec::default());
+        let reporter = Reporter::new(rec.clone(), REPORT_EVERY, 64, false);
+        let sink = Arc::new(RecordingSink::default());
+        let pane = pane(&sink, AttachedRing::default());
+        let ctx = SourceReportContext {
+            session_id: uuid::Uuid::from_u128(1),
+            grant_jti: uuid::Uuid::from_u128(2),
+            source_device_id: uuid::Uuid::from_u128(3),
+            via: Via::Traffic,
+        };
+        pane.attach_report_context_to(ctx.clone(), reporter.clone());
+        for _ in 0..500 {
+            pane.push_output(b"x");
+        }
+        pane.mark_error(
+            "session_not_local",
+            "no local terminal hosts that coord session",
+        );
+        while reporter.drain_once().await.is_some() {}
+        let sent = rec.0.lock().unwrap().clone();
+        assert_eq!(sent.len(), 3, "one read-ok + two refusals: {sent:?}");
+        assert_eq!(
+            (sent[0].role, sent[0].half, sent[0].state, sent[0].via),
+            (Role::Source, Half::Read, FactState::Ok, Some(Via::Traffic))
+        );
+        assert_eq!(sent[0].grant_jti, Some(ctx.grant_jti));
+        assert_eq!(sent[0].source_device_id, ctx.source_device_id);
+        for (o, half) in sent[1..].iter().zip([Half::Read, Half::Write]) {
+            assert_eq!(o.half, half);
+            assert_eq!(o.state, FactState::Failed);
+            assert_eq!(o.reason.as_deref(), Some("session_not_local"));
+        }
+    }
+
+    /// A pane with NO report context (a test pane, a probe pane) reports
+    /// nothing — the probe sweep files its own outcome explicitly.
+    #[test]
+    fn a_pane_without_a_context_reports_nothing() {
+        let sink = Arc::new(RecordingSink::default());
+        let pane = pane(&sink, AttachedRing::default());
+        pane.push_output(b"x");
+        pane.mark_error("session_not_local", "gone");
+        assert!(pane.report.get().is_none());
+    }
+
+    /// The write probe may go to a target that has not acked on this
+    /// attachment only when the caller KNOWS it acks.
+    #[test]
+    fn a_probe_to_a_known_acker_needs_no_prior_ack() {
+        let sink = Arc::new(RecordingSink::default());
+        let pane = pane(&sink, AttachedRing::default());
+        assert!(pane.send_input_probe_given(false).is_err());
+        let seq = pane.send_input_probe_given(true).expect("known acker");
+        let f = sink.frames().last().cloned().unwrap();
+        assert_eq!(
+            (f["probe"].clone(), f["data"].clone(), f["seq"].clone()),
+            (json!(true), json!(""), json!(seq))
         );
     }
 

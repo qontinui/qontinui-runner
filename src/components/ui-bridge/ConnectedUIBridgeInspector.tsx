@@ -12,6 +12,7 @@ import { UIBridgeInspectorPanel } from "./UIBridgeInspectorPanel";
 import type { UIBridgeElement, UIBridgeEvent, UIBridgeSnapshot } from "./inspector-types";
 import { ElementOverlay } from "./ElementOverlay";
 import { ElementPicker } from "./ElementPicker";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * Convert a RegisteredElement from ui-bridge to our UIBridgeElement format
@@ -103,10 +104,10 @@ export function ConnectedUIBridgeInspector() {
         durationMs: 0,
       });
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(describeThrown(err, "Failed to refresh elements"));
       addEvent("error", {
         success: false,
-        errorMessage: err instanceof Error ? err.message : String(err),
+        errorMessage: describeThrown(err, "Failed to refresh elements"),
       });
     } finally {
       setLoading(false);
@@ -154,7 +155,7 @@ export function ConnectedUIBridgeInspector() {
           params,
           durationMs: Date.now() - startTime,
           success: false,
-          errorMessage: err instanceof Error ? err.message : String(err),
+          errorMessage: describeThrown(err, "Element action failed"),
         });
         throw err;
       }

@@ -68,8 +68,10 @@
 //!
 //! ## Sizing
 //!
-//! `node_modules` and the build `target` dir (`target` for cargo repos,
-//! `src-tauri/target` for the Tauri runner) are measured with a
+//! `node_modules` and the build `target` dir (resolved from the checked-in
+//! cargo manifests by [`target_dir_for`]: `<root>/target` for a root
+//! `Cargo.toml` — including the runner, whose cargo WORKSPACE is the repo
+//! root — `src-tauri/target` only for a Tauri-only layout) are measured with a
 //! recursive walk that **skips any reparse point** (junction) — it
 //! reports 0 bytes for a junctioned dir and never traverses it. This is
 //! the load-bearing safety property: junctioned build dirs (the runner
@@ -439,6 +441,7 @@ fn merged_snapshot(
             tenant_id,
             volumes,
             worktrees,
+            cargo_locks: None,
         }),
         taken_at: now,
         build_ms,
@@ -692,6 +695,7 @@ impl ChunkPoster {
             tenant_id: self.tenant_id,
             volumes,
             worktrees: chunk.rows,
+            cargo_locks: None,
         };
         self.send(body, true).await;
     }
@@ -706,7 +710,11 @@ impl ChunkPoster {
     /// exactly as stale after it as before, and letting a 60 s volume POST
     /// open the gate would hand the reclaim poller the previous boot's stale
     /// census — precisely the husk-creating race the gate exists to prevent.
-    async fn post_volumes(&mut self, volumes: Vec<VolumeReport>) {
+    async fn post_volumes(
+        &mut self,
+        volumes: Vec<VolumeReport>,
+        cargo_locks: Option<Vec<super::cargo_locks::CargoLockItem>>,
+    ) {
         // DEFENSIVE, not a live path: the only caller
         // ([`sample_and_publish_volumes`]) already returns on an empty probe,
         // so this branch is currently unreachable. It is kept because the
@@ -723,6 +731,7 @@ impl ChunkPoster {
             tenant_id: self.tenant_id,
             volumes,
             worktrees: Vec::new(),
+            cargo_locks,
         };
         self.send(body, false).await;
     }
@@ -868,6 +877,11 @@ pub(super) async fn build_and_publish() -> Result<BuildOutcome, String> {
 /// `true` when a new walk was started, `false` when one was already running.
 /// Never awaits the walk — the caller must stay bounded.
 pub(super) fn spawn_census_rebuild() -> bool {
+    // An explicit refresh asks for fresh numbers, so no memoised size may
+    // answer it — cleared BEFORE the active-walk check, because a refresh that
+    // joins a walk already running is answered by that walk's snapshot. Rows
+    // that walk had already sized keep the sizes it gave them.
+    super::census_size_memo::clear();
     if census_build_active() {
         return false;
     }
@@ -1076,7 +1090,7 @@ pub struct WorktreeCensus {
     /// exclusive-open probe + recent-activity mtime window). Reported every
     /// census tick regardless of reclaim arming, so coord can gauge
     /// "instructions that WOULD have been G6-skipped" while arming is still
-    /// OFF — the passive prove-out feed for the Q1 rejunction graduation.
+    /// OFF — the passive prove-out feed for arming reclaim.
     /// `Some(_)` is the live probe result; old runners omit the field and
     /// coord reads NULL (honest unknown).
     pub building: Option<bool>,
@@ -1237,6 +1251,14 @@ pub struct WorktreeCensusReq {
     pub tenant_id: Option<Uuid>,
     pub volumes: Vec<VolumeReport>,
     pub worktrees: Vec<WorktreeCensus>,
+    /// Shared cargo target-dir lock state (plan
+    /// `2026-09-19-build-slots-are-not-build-parallelism-cargo-target-lock-and-devops-allocation-stats`
+    /// Phase 2). Carried ONLY on the 60 s volumes-only POST — it is device-level
+    /// and minute-fresh, like `volumes`; a census chunk leaves it `None`.
+    /// OMITTED when `None` = UNKNOWN (non-Linux, or the probe failed), so an
+    /// older coord is unaffected; `Some(vec![])` = measured, no shared targets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cargo_locks: Option<Vec<super::cargo_locks::CargoLockItem>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1362,43 +1384,6 @@ pub(crate) fn remove_link(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Recursive byte size of `dir`, summing real file sizes. SKIPS any
-/// directory that is a reparse point (junction): it contributes 0 and is
-/// never traversed. The top-level `dir` is assumed already checked by
-/// the caller (we never even call this for a junctioned top-level dir),
-/// but nested junctions inside the tree are also skipped defensively so
-/// a junction buried under a real dir can't cause a 165 GB traversal.
-fn dir_size_skipping_junctions(dir: &Path) -> u64 {
-    let mut total: u64 = 0;
-    let read = match std::fs::read_dir(dir) {
-        Ok(r) => r,
-        Err(_) => return 0,
-    };
-    for entry in read.flatten() {
-        let path = entry.path();
-        // symlink_metadata: never follow a link/junction.
-        let meta = match std::fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let file_type = meta.file_type();
-        if file_type.is_symlink() {
-            // A symlink (file or dir) — skip, do not follow.
-            continue;
-        }
-        if file_type.is_dir() {
-            if is_junction(&path) {
-                // Reparse point — never traverse.
-                continue;
-            }
-            total = total.saturating_add(dir_size_skipping_junctions(&path));
-        } else if file_type.is_file() {
-            total = total.saturating_add(meta.len());
-        }
-    }
-    total
-}
-
 /// Measure one candidate dir (`node_modules` / `target`):
 /// `(present, is_junction, bytes)`. A junction reports
 /// `(true, true, 0)` and is never walked.
@@ -1409,24 +1394,61 @@ fn measure_dir(dir: &Path) -> (bool, bool, u64) {
     if is_junction(dir) {
         return (true, true, 0);
     }
-    (true, false, dir_size_skipping_junctions(dir))
+    // `present` and `is_junction` above are read live every time (one stat
+    // each), so a removal or a junction swap shows at once; only the byte total
+    // — a full walk of a `node_modules` or `target` — is memoised, because the
+    // census walk is now paced from its end and would otherwise size the same
+    // trees several times as often as before (plan
+    // `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs` Phase 3).
+    let bytes = super::census_size_memo::bytes_or_measure(dir, || {
+        super::orphan_target_reaper::measure_dir_size(dir).map(|m| m.bytes)
+    });
+    (true, false, bytes)
 }
 
-/// Pick the build `target` dir for a worktree. The Tauri runner's cargo
-/// workspace lives under `src-tauri/`, so its target is
-/// `src-tauri/target`; everything else uses `target`. We prefer
-/// `src-tauri/target` when `src-tauri/` exists, else fall back to the
-/// top-level `target`.
+/// [`is_junction`]'s test applied to metadata already in hand — a directory
+/// RECORD (`DirEntry::metadata`), which on Windows carries the attributes
+/// without opening the entry: `FILE_ATTRIBUTE_REPARSE_POINT` there, a symlink
+/// elsewhere.
+pub(crate) fn metadata_is_reparse_point(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
+/// Pick the build `target` dir to MEASURE for a worktree, keyed on the
+/// checked-in cargo manifests — cargo's own layout rule, not on which
+/// `target` dirs happen to exist:
+///
+/// 1. `<root>/Cargo.toml` is a file → `<root>/target`. It is either a
+///    workspace root (qontinui-runner: `[workspace] members = ["src-tauri",
+///    …]`) or a root package; cargo writes the build output there either way.
+/// 2. Otherwise `<root>/src-tauri/Cargo.toml` is a file → `<root>/src-tauri/target`
+///    (a Tauri-only layout with no root manifest).
+/// 3. Otherwise → `<root>/target`: not a cargo project, and the value is only
+///    a measurement path.
+///
+/// No `exists()` check on any `target` dir: the answer depends only on
+/// manifests, so it is the same at census time and at execution time. The old
+/// "prefer `src-tauri/target` when `src-tauri/` exists" fallback pointed the
+/// census at a ~2 MB `schemas.json` stub while the real workspace output sat in
+/// `<root>/target` (plan
+/// `2026-09-30-rejunction-sinks-follow-the-cargo-workspace-and-coord-stops-emitting-refused-rejunctions`,
+/// D1). A nested `[workspace]` under `src-tauri/` beside a root manifest is out
+/// of scope — no fleet repo has one.
 pub(super) fn target_dir_for(worktree: &Path) -> PathBuf {
+    if worktree.join("Cargo.toml").is_file() {
+        return worktree.join("target");
+    }
     let src_tauri = worktree.join("src-tauri");
-    if src_tauri.is_dir() {
-        let st_target = src_tauri.join("target");
-        // Use src-tauri/target if it exists OR if there's no top-level
-        // target (the Tauri layout). If the operator happens to have a
-        // top-level target too, prefer the one that actually exists.
-        if st_target.exists() || !worktree.join("target").exists() {
-            return st_target;
-        }
+    if src_tauri.join("Cargo.toml").is_file() {
+        return src_tauri.join("target");
     }
     worktree.join("target")
 }
@@ -2610,6 +2632,7 @@ fn build_census_chunked(
         tenant_id,
         volumes,
         worktrees,
+        cargo_locks: None,
     }
 }
 
@@ -2957,7 +2980,84 @@ async fn post_volumes_to_coord(volumes: Vec<VolumeReport>) {
     let Some(cached) = guard.as_mut() else {
         return;
     };
-    cached.poster.post_volumes(volumes).await;
+    // Nothing will be sent (coord unconfigured, or a secondary instance): skip
+    // the `/proc` probe entirely rather than measure for nobody.
+    if cached.poster.dest.is_none() {
+        return;
+    }
+    let cargo_locks = probe_cargo_locks().await;
+    cached.poster.post_volumes(volumes, cargo_locks).await;
+}
+
+/// Upper bound on the shared-target lock probe. It reads `/proc` and scans
+/// `/proc/*/fd` once per tick (on an unconfirmed holder or a lock file with no
+/// `/proc/locks` row — which every idle lock is, so in practice most ticks) —
+/// normally milliseconds, but a saturated box must not stall the volume POST
+/// behind it.
+const CARGO_LOCK_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Shared cargo target lock state for this tick
+/// ([`super::cargo_locks::probe_current`]) on the blocking pool, bounded by
+/// [`CARGO_LOCK_PROBE_TIMEOUT`]. A failed or timed-out probe is UNKNOWN
+/// (`None` → the field is omitted), never an empty list.
+async fn probe_cargo_locks() -> Option<Vec<super::cargo_locks::CargoLockItem>> {
+    // A timed-out probe keeps running on its blocking thread; while it does,
+    // later ticks skip instead of stacking one more blocked thread each.
+    if CARGO_LOCK_PROBE_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        debug!("worktree_census: previous cargo lock probe still running — cargo_locks UNKNOWN this tick");
+        return None;
+    }
+    // The guard exists BEFORE the spawn and moves into the closure, so the flag
+    // clears on every path: normal return, panic, and a closure dropped unrun
+    // (runtime shutdown while queued, or a panicking spawn).
+    let in_flight = ClearOnDrop(&CARGO_LOCK_PROBE_IN_FLIGHT);
+    let task = spawn_blocking_tracked(move || {
+        let _in_flight = in_flight;
+        super::cargo_locks::probe_current()
+    });
+    match tokio::time::timeout(CARGO_LOCK_PROBE_TIMEOUT, task).await {
+        Ok(Ok(locks)) => locks,
+        Ok(Err(e)) => {
+            debug!("worktree_census: cargo lock probe task failed: {e} — cargo_locks UNKNOWN");
+            None
+        }
+        Err(_) => {
+            emit_throttled(
+                &LAST_CARGO_LOCK_TIMEOUT_LOG_EPOCH,
+                now_epoch_secs(),
+                CARGO_LOCK_TIMEOUT_LOG_THROTTLE_SECS,
+                || {
+                    warn!(
+                        "worktree_census: cargo lock probe exceeded {}s — cargo_locks UNKNOWN; \
+                         later ticks skip the probe until it finishes",
+                        CARGO_LOCK_PROBE_TIMEOUT.as_secs()
+                    );
+                    true
+                },
+            );
+            None
+        }
+    }
+}
+
+/// Set while a cargo lock probe runs on the blocking pool (cleared by
+/// [`ClearOnDrop`] when that thread finishes, even on panic).
+static CARGO_LOCK_PROBE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Throttle for the probe-timeout warning: one per 10 minutes.
+const CARGO_LOCK_TIMEOUT_LOG_THROTTLE_SECS: u64 = 600;
+static LAST_CARGO_LOCK_TIMEOUT_LOG_EPOCH: AtomicU64 = AtomicU64::new(THROTTLE_NEVER);
+
+/// Clears an in-flight flag when dropped.
+struct ClearOnDrop(&'static AtomicBool);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Spawn the dedicated volume publisher on the ambient tokio runtime.
@@ -3627,8 +3727,70 @@ mod tests {",
         std::fs::create_dir(&sub).unwrap();
         std::fs::write(dir.path().join("a.bin"), vec![0u8; 100]).unwrap();
         std::fs::write(sub.join("b.bin"), vec![0u8; 250]).unwrap();
-        let total = dir_size_skipping_junctions(dir.path());
+        let total = super::super::orphan_target_reaper::measure_dir_size(dir.path())
+            .unwrap()
+            .bytes;
         assert_eq!(total, 350, "should sum nested real files");
+    }
+
+    #[test]
+    fn a_memoised_size_never_hides_a_removed_dir() {
+        // Only the BYTE total is memoised: presence is read live, so a tree
+        // that was sized and then removed reads absent at once.
+        let dir = tempfile::tempdir().unwrap();
+        let nm = dir.path().join("node_modules");
+        std::fs::create_dir(&nm).unwrap();
+        std::fs::write(nm.join("pkg.json"), vec![0u8; 42]).unwrap();
+        assert_eq!(measure_dir(&nm), (true, false, 42));
+        std::fs::remove_dir_all(&nm).unwrap();
+        assert_eq!(measure_dir(&nm), (false, false, 0));
+    }
+
+    #[test]
+    fn a_rebuilt_dir_is_sized_again_not_served_from_the_memo() {
+        // Sized, removed, recreated with different contents inside the TTL
+        // (a `cargo clean` + rebuild): the dir's own mtime moved, so the memo
+        // must not answer with the old total.
+        let dir = tempfile::tempdir().unwrap();
+        let t = dir.path().join("target");
+        std::fs::create_dir(&t).unwrap();
+        std::fs::write(t.join("old.bin"), vec![0u8; 42]).unwrap();
+        assert_eq!(measure_dir(&t), (true, false, 42));
+        std::fs::remove_dir_all(&t).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        std::fs::create_dir(&t).unwrap();
+        std::fs::write(t.join("new.bin"), vec![0u8; 9]).unwrap();
+        assert_eq!(measure_dir(&t), (true, false, 9));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_sized_dir_swapped_for_a_junction_reads_as_a_junction() {
+        let dir = tempfile::tempdir().unwrap();
+        let nm = dir.path().join("node_modules");
+        std::fs::create_dir(&nm).unwrap();
+        std::fs::write(nm.join("pkg.json"), vec![0u8; 42]).unwrap();
+        assert_eq!(measure_dir(&nm), (true, false, 42));
+        std::fs::remove_dir_all(&nm).unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("big.bin"), vec![0u8; 5000]).unwrap();
+        let made = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&nm)
+            .arg(&elsewhere)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !made {
+            eprintln!("skipping: mklink /J unavailable on this host");
+            return;
+        }
+        assert_eq!(
+            measure_dir(&nm),
+            (true, true, 0),
+            "the junction is read live"
+        );
     }
 
     #[test]
@@ -3657,17 +3819,52 @@ mod tests {",
         assert_eq!(drive_letter_of(Path::new("relative/path")), None);
     }
 
+    /// (a) The runner / merytshost case: a ROOT workspace manifest beside a
+    /// `src-tauri/Cargo.toml` member, a `src-tauri/target` stub and NO root
+    /// `target` yet → still `<root>/target`, where cargo writes.
     #[test]
-    fn target_dir_prefers_src_tauri_when_present() {
+    fn target_dir_follows_root_workspace_over_src_tauri_stub() {
         let dir = tempfile::tempdir().unwrap();
-        // No src-tauri → top-level target.
-        assert_eq!(target_dir_for(dir.path()), dir.path().join("target"));
-        // With src-tauri/ → src-tauri/target.
-        std::fs::create_dir(dir.path().join("src-tauri")).unwrap();
-        assert_eq!(
-            target_dir_for(dir.path()),
-            dir.path().join("src-tauri").join("target")
-        );
+        let root = dir.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"src-tauri\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src-tauri").join("target")).unwrap();
+        std::fs::write(root.join("src-tauri").join("Cargo.toml"), "[package]").unwrap();
+        assert!(!root.join("target").exists());
+        assert_eq!(target_dir_for(root), root.join("target"));
+    }
+
+    /// (b) Tauri-only: `src-tauri/Cargo.toml` and no root manifest →
+    /// `src-tauri/target`, whether or not it exists yet.
+    #[test]
+    fn target_dir_tauri_only_layout_uses_src_tauri_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src-tauri")).unwrap();
+        std::fs::write(root.join("src-tauri").join("Cargo.toml"), "[package]").unwrap();
+        assert_eq!(target_dir_for(root), root.join("src-tauri").join("target"));
+    }
+
+    /// (c) Plain cargo repo: root `Cargo.toml` only → `<root>/target`.
+    #[test]
+    fn target_dir_plain_cargo_repo_uses_root_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("Cargo.toml"), "[package]").unwrap();
+        assert_eq!(target_dir_for(root), root.join("target"));
+    }
+
+    /// (d) No manifest anywhere, even with a `src-tauri/` dir → `<root>/target`
+    /// (the retired "prefer src-tauri when present" fallback was the defect).
+    #[test]
+    fn target_dir_without_manifest_ignores_bare_src_tauri_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src-tauri").join("target")).unwrap();
+        assert_eq!(target_dir_for(root), root.join("target"));
     }
 
     // -----------------------------------------------------------------
@@ -4506,6 +4703,65 @@ mod tests {",
         assert_eq!(row.building, Some(false));
     }
 
+    const LANDED_TARGET_ENV: &str = "QONTINUI_TEST_LANDED_TARGET";
+
+    /// Child of [`compute_landed_in_main_ignores_an_inherited_git_dir`]:
+    /// skipped in a normal run, run only re-executed by it.
+    #[test]
+    #[ignore = "re-executed by compute_landed_in_main_ignores_an_inherited_git_dir"]
+    fn inherited_git_dir_child_landed_in_main_reads_the_named_repo() {
+        use crate::git_trunk::inherited_git_dir_reexec as reexec;
+        let Some(target) = reexec::child_input(LANDED_TARGET_ENV) else {
+            eprintln!("not under the re-exec parent; nothing to assert");
+            return;
+        };
+        let decoy_git_dir = reexec::child_input("GIT_DIR").expect("set with the child flag");
+        reexec::assert_inherited_git_dir(&decoy_git_dir);
+        let target = Path::new(&target);
+
+        // Control: a raw, UNscrubbed git with `-C <target>` answers for the
+        // inherited decoy, whose HEAD IS on its trunk.
+        let control = Command::new("git")
+            .arg("-C")
+            .arg(target)
+            .args(["merge-base", "--is-ancestor", "HEAD", "origin/main"])
+            .status()
+            .expect("git runs");
+        assert!(
+            control.success(),
+            "control: the inherited decoy must answer unscrubbed git"
+        );
+
+        // The production function answers for the repo it names: the
+        // target's HEAD carries a commit its trunk does not have.
+        assert_eq!(
+            compute_landed_in_main(target),
+            Some(false),
+            "compute_landed_in_main must read the worktree it names, not an inherited GIT_DIR — \
+             a wrong Some(true) here lets a worktree with unlanded work be reclaimed"
+        );
+        println!("{}", reexec::ASSERTED_MARKER);
+    }
+
+    /// The REAL census predicate under a `GIT_DIR` the process INHERITED (set
+    /// on a re-executed child only). The target holds unlanded work, the decoy
+    /// does not, so the inherited decoy would answer `Some(true)` — the
+    /// reclaim-permitting answer — for the target.
+    #[test]
+    fn compute_landed_in_main_ignores_an_inherited_git_dir() {
+        use crate::git_trunk::inherited_git_dir_reexec as reexec;
+        let target = reexec::repo_with_origin_main(true);
+        let decoy = reexec::repo_with_origin_main(false);
+        assert_eq!(compute_landed_in_main(target.path()), Some(false));
+        assert_eq!(compute_landed_in_main(decoy.path()), Some(true));
+        reexec::run_child(
+            module_path!(),
+            "inherited_git_dir_child_landed_in_main_reads_the_named_repo",
+            &decoy.path().join(".git"),
+            &[(LANDED_TARGET_ENV, target.path().as_os_str())],
+        );
+    }
+
     #[test]
     fn landed_in_main_is_none_without_origin_main() {
         // A real git repo but no `origin/main` ref → undeterminable → None.
@@ -5050,6 +5306,7 @@ mod tests {",
                     // Same PATH, different repo — must be a distinct key.
                     row("qontinui-coord", "D:/x/a", 30),
                 ],
+                cargo_locks: None,
             }),
             taken_at: chrono::Utc::now() - chrono::Duration::hours(2),
             build_ms: 12_345,
@@ -5146,6 +5403,7 @@ mod tests {",
                 tenant_id: None,
                 volumes: Vec::new(),
                 worktrees: vec![row("qontinui-runner", "D:/x/a", 5)],
+                cargo_locks: None,
             },
             777,
         );

@@ -19,7 +19,7 @@ use tracing::{error, info, warn};
 use crate::context;
 use crate::database::CreateTaskRunInput;
 use crate::mcp::shared::{
-    emit_ai_output, get_workspace_paths_internal, spawn_python_with_console, FINDING_INSTRUCTIONS,
+    emit_ai_output, get_workspace_paths_internal, spawn_python_script, FINDING_INSTRUCTIONS,
 };
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::prompts;
@@ -59,61 +59,81 @@ pub(crate) const AI_SESSION_SOURCE_MARKER: &str = concat!(
     "]"
 );
 
-/// Compiled-in FALLBACK for `session_briefing/ai-session-rules`, supervisor-up
-/// arm. NOT the source of truth — see [`runner_rules_prefix`].
-pub(crate) const AI_SESSION_RULES_SUPERVISOR_AVAILABLE: &str = r#"## IMPORTANT: Runner-Triggered Session Context
+/// The dev-box supervisor addendum: appended AFTER the rules block, and only on
+/// the supervisor-AVAILABLE arm of [`runner_rules_prefix`].
+///
+/// Compiled in rather than served for the same reason the rules block's
+/// supervisor-DOWN arm always was: whether a development supervisor answers is
+/// a statement about THIS machine's live process table, not tenant policy. A
+/// tenant-wide document cannot make it true or false, so the served
+/// `session_briefing/ai-session-rules` stays fleet-neutral (no supervisor, no
+/// port, no shell dialect) and every dev box that DOES run one keeps its
+/// working restart route. Placeholders: `{{supervisor_base}}` is the runner's
+/// own configured supervisor URL ([`crate::api_config::get_supervisor_url`]),
+/// `{{runner_api_base}}` the session's runner API base; both are resolved
+/// before the text is emitted.
+pub(crate) const AI_SESSION_SUPERVISOR_RESTART_RECIPE: &str = r#"## Development supervisor observed on this machine
 
-You are being run BY the qontinui-runner. You are a child process of the runner.
+(Runner-compiled addendum, not part of the served rules above. It is included only because a development supervisor answered at {{supervisor_base}} when this session was spawned.)
 
-**CRITICAL RULES:**
-1. Do NOT restart the qontinui-runner directly - it will kill your session
-2. You CAN restart backend and frontend without issues
-3. If the runner needs to be restarted, USE THE SUPERVISOR API
+The rules above still hold: you never decide on your own to restart the runner hosting you. This section changes only HOW a restart happens once the user has asked for one: the supervisor runs OUTSIDE the runner, so it can stop and restart the runner instead of the user restarting the application by hand. Nothing resumes this session afterwards - forcing the restart ends it, and the user continues after the restart. So commit, and tell the user what state you left, BEFORE sending the request. On this machine, carrying out a restart the user explicitly asked for, through this route, is the user's restart, not yours - so it does not break the rules above; it still ends this session.
 
-**Restarting Runner via Supervisor (SAFE):**
-```powershell
-# Simple restart (no rebuild)
-Invoke-RestMethod -Uri "http://localhost:9875/runner/restart" -Method Post -ContentType "application/json" -Body '{"trigger_auto_continue": true}'
+Use it only when ALL of these hold:
+1. The user has explicitly asked, in this session, for the runner to be restarted. Needing to load your own change is not that request: tell the user, quote the readiness verdict, and offer this route.
+2. `GET {{runner_api_base}}/restart-readiness` reports no live session other than your own (the counts include you). A refusal, a timeout, an error status or an unreadable body means do not restart.
+3. Your work is committed.
 
-# Restart with REBUILD (use after modifying runner Rust code)
-Invoke-RestMethod -Uri "http://localhost:9875/runner/restart" -Method Post -ContentType "application/json" -Body '{"rebuild": true, "trigger_auto_continue": true}'
+Otherwise follow the rules above: finish, commit, and tell the user. To check a runner change without restarting anything, prefer `cargo check` / `cargo test`, or a temporary runner from `POST {{supervisor_base}}/runners/spawn-test`.
+
+**The supervisor will refuse (HTTP 409) without `"force": true`**, because it asks the same restart-readiness question and your own session always counts as live work, and its refusal text will suggest forcing. Send `"force": true` ONLY immediately after a gate-2 readiness read that shows your session as the sole live session. Never force on an UNKNOWN verdict (refused, timed out, error status, unreadable), and never force past any other refusal.
+
+**Restarting Runner via Supervisor** (only when all three conditions above hold, and the force condition just stated holds):
+```bash
+# Restart (no rebuild)
+curl -fsS -X POST "{{supervisor_base}}/runner/restart" -H "Content-Type: application/json" -d '{"force": true}'
+
+# Restart with REBUILD (only if the user asked for a rebuild - see below)
+curl -fsS -X POST "{{supervisor_base}}/runner/restart" -H "Content-Type: application/json" -d '{"force": true, "rebuild": true}'
 ```
+From Windows PowerShell spell it `curl.exe` (bare `curl` there is an alias of `Invoke-WebRequest`), or use `Invoke-RestMethod -Method Post` with the same URL and body.
 
-**Supervisor API (port 9875):**
+**Supervisor API ({{supervisor_base}}):**
 - GET /health - Check if supervisor is running
-- POST /runner/stop - Stop the runner
-- POST /runner/restart - Restart runner (options: rebuild, trigger_auto_continue, wait_timeout_seconds)
-- POST /workflow-loop/signal-restart - Signal that runner restart is needed (use during workflow loops)
+- POST /runner/restart - Restart runner (body: force, rebuild, from_working_tree, use_lkg; query: ?wait=)
 
-**IMPORTANT:** If you modified qontinui-runner Rust code, use `"rebuild": true` to recompile before restart.
-
-**Workflow Loop Signal:** If you are running inside a supervisor workflow loop and you modify runner code, call:
-```powershell
-Invoke-RestMethod -Uri "http://localhost:9875/workflow-loop/signal-restart" -Method Post
-```
-This tells the supervisor to restart the runner between iterations. If you don't signal, the loop skips the restart (saving time when only non-runner repos were changed).
+**About `"rebuild": true`:** it compiles a fresh `origin/main`, NOT your unmerged change; the runner is down for the whole build (it can take ~40 minutes); and the request returns 202 and runs detached, so a refusal shows up in `GET {{supervisor_base}}/builds`, not as a synchronous 409. To exercise an unmerged runner change, use a temporary runner from `POST {{supervisor_base}}/runners/spawn-test` instead of restarting the runner hosting you.
 
 ---
 
 "#;
 
-/// The supervisor-DOWN arm. Deliberately NOT sourced from coord: what it says
-/// is a statement about this machine's live process table ("the supervisor is
-/// NOT currently running"), not tenant policy, so an operator editing a
-/// tenant-wide document has no way to make it true or false. Keeping it
-/// compiled in is what stops an edit from telling a session the supervisor is
-/// available when it is not.
-pub(crate) const AI_SESSION_RULES_SUPERVISOR_UNAVAILABLE: &str = r#"## IMPORTANT: Runner-Triggered Session Context
+/// The fleet-neutral rules text — byte-identical to coord's seed of
+/// `session_briefing/ai-session-rules` (qontinui-coord
+/// `crates/coord/src/prompt_documents/session_briefing/ai-session-rules.md`), in
+/// its placeholder form. Rendered through [`builtin_rules_text`].
+///
+/// It is BOTH arms' compiled-in text:
+///
+/// - supervisor-AVAILABLE: the fallback when coord has no usable cached body.
+/// - supervisor-DOWN: the ONLY text, never sourced from coord. Existing tenants
+///   hold older versions of the served document that carried a dev-box
+///   supervisor recipe until the neutral version is published to them; a box
+///   with no supervisor (every external operator) must never render that. So
+///   this arm stays compiled in, and names the next action a session can
+///   actually take: read the runner's own restart verdict, never restart its
+///   host, commit, and hand the restart to the user.
+pub(crate) const AI_SESSION_RULES_TEMPLATE: &str = r#"## IMPORTANT: Runner-Triggered Session Context
 
 You are being run BY the qontinui-runner. You are a child process of the runner.
 
 **CRITICAL RULES:**
-1. Do NOT restart the qontinui-runner directly - it will kill your session
-2. You CAN restart backend and frontend without issues
-3. The supervisor is NOT currently running - if runner restart is needed, inform the user
+1. Do NOT restart the qontinui-runner directly - it will kill your session, and every other session the runner is hosting
+2. Never stop, kill, close or rebuild the runner that hosts you, by any route - its process, its window, or any tool that restarts it on your behalf
+3. You CAN restart the other services your task works on (your application's own backend, frontend or database) - only the runner that hosts you is special
 
-**If runner restart is needed:**
-Tell the user: "The qontinui-runner needs to be restarted manually to apply changes."
+**If the runner needs a restart** (for example, to load a change you made to it):
+1. Ask the runner itself whether a restart is safe: `GET {{runner_api_base}}/restart-readiness`. Only an explicit `"safe_to_restart": true` means a restart would lose no work. A refusal, a timeout, an error status or an unreadable body means NOT safe - it is unknown, not idle.
+2. Either way, do not restart it: a session cannot restart its own host and survive it. Finish and commit your work, then tell the user that the runner needs a restart to apply the change, quoting the readiness verdict you read (it counts your own session as live work). The user restarts the application.
 
 ---
 
@@ -134,6 +154,70 @@ pub(crate) struct RenderedRules {
     pub(crate) fetched_at: Option<String>,
 }
 
+/// [`AI_SESSION_RULES_TEMPLATE`] with its one placeholder resolved — the
+/// compiled-in rules text for a session whose runner API is `api_base`.
+pub(crate) fn builtin_rules_text(api_base: &str) -> String {
+    AI_SESSION_RULES_TEMPLATE.replace("{{runner_api_base}}", api_base)
+}
+
+/// [`AI_SESSION_SUPERVISOR_RESTART_RECIPE`] with both placeholders resolved.
+/// `supervisor_base` is the runner's configured supervisor URL, never a
+/// literal port, so a box that moved its supervisor gets the right address.
+pub(crate) fn supervisor_restart_recipe(supervisor_base: &str, api_base: &str) -> String {
+    AI_SESSION_SUPERVISOR_RESTART_RECIPE
+        .replace("{{supervisor_base}}", supervisor_base.trim_end_matches('/'))
+        .replace("{{runner_api_base}}", api_base)
+}
+
+/// Markers of the LEGACY served `ai-session-rules` shape, which carried its own
+/// supervisor restart recipe. Existing tenants hold that version until the
+/// fleet-neutral one is published to them; rendering it beside
+/// [`AI_SESSION_SUPERVISOR_RESTART_RECIPE`] would give a session two
+/// conflicting recipes, one of them ungated.
+const LEGACY_SUPERVISOR_BODY_MARKERS: &[&str] = &[
+    "/runner/restart",
+    "USE THE SUPERVISOR API",
+    "/runner/stop",
+    "signal-restart",
+];
+
+/// Refuse a served body with the legacy supervisor shape: the builtin renders
+/// instead, named as [`session_briefing::Provenance::BuiltinRejected`] with the
+/// refused version, exactly like a guard failure.
+///
+/// The needles are case-sensitive substrings. That is deliberately broad: a
+/// tenant body that merely MENTIONS `/runner/restart` is rejected too. It errs
+/// safe — the builtin still carries every required rule — and the provenance
+/// line names the refused version, so the rejection is visible, not silent.
+fn reject_legacy_supervisor_body(
+    served: crate::mcp::session_briefing::RenderedBlock,
+    builtin: &str,
+) -> crate::mcp::session_briefing::RenderedBlock {
+    use crate::mcp::session_briefing::{Provenance, RenderedBlock};
+    let version = match served.provenance {
+        Provenance::Coord { version, .. } | Provenance::Cached { version } => version,
+        Provenance::Builtin | Provenance::BuiltinRejected { .. } => return served,
+    };
+    let Some(marker) = LEGACY_SUPERVISOR_BODY_MARKERS
+        .iter()
+        .find(|m| served.text.contains(**m))
+    else {
+        return served;
+    };
+    // Once per (version, reason), like the guard's own refusals: this runs on
+    // every render, and a tenant may hold the legacy body for a long time.
+    crate::mcp::session_briefing::log_rejection_once(
+        crate::mcp::fleet_policy_poller::BRIEFING_AI_SESSION_RULES,
+        version,
+        &format!("legacy supervisor recipe (`{marker}`)"),
+    );
+    RenderedBlock {
+        text: builtin.to_string(),
+        provenance: Provenance::BuiltinRejected { version },
+        fetched_at: None,
+    }
+}
+
 /// Render the runner-triggered rules block from the coord document
 /// `session_briefing/ai-session-rules`, falling back to the compiled-in text.
 ///
@@ -145,8 +229,10 @@ pub(crate) struct RenderedRules {
 /// the briefing.
 ///
 /// Coord is consulted only on the supervisor-AVAILABLE arm; see
-/// [`AI_SESSION_RULES_SUPERVISOR_UNAVAILABLE`] for why the other arm stays
-/// compiled in.
+/// [`AI_SESSION_RULES_TEMPLATE`] for why the other arm stays compiled in. That
+/// arm also, and only that arm, gets [`AI_SESSION_SUPERVISOR_RESTART_RECIPE`]
+/// appended after the rules — after the SERVED text when coord supplied one,
+/// so no tenant edit can remove or forge the machine-local recipe.
 ///
 /// # The one thing an edit may not delete
 ///
@@ -166,18 +252,31 @@ pub(crate) fn runner_rules_prefix(supervisor_available: bool, api_port: u16) -> 
     let api_base = session_briefing::runner_api_base(api_port);
     let web_base = session_briefing::web_api_base();
 
+    let builtin = builtin_rules_text(&api_base);
+
     let block = if supervisor_available {
-        session_briefing::resolve_requiring(
-            BRIEFING_AI_SESSION_RULES,
-            AI_SESSION_RULES_SUPERVISOR_AVAILABLE,
-            &api_base,
-            &coord_url,
-            &web_base,
-            &[AI_SESSION_RULES_REQUIRED_PROHIBITION],
-        )
+        let served = reject_legacy_supervisor_body(
+            session_briefing::resolve_requiring(
+                BRIEFING_AI_SESSION_RULES,
+                &builtin,
+                &api_base,
+                &coord_url,
+                &web_base,
+                &[AI_SESSION_RULES_REQUIRED_PROHIBITION],
+            ),
+            &builtin,
+        );
+        let recipe = supervisor_restart_recipe(&crate::api_config::get_supervisor_url(), &api_base);
+        session_briefing::RenderedBlock {
+            // `trim_end` + a blank line: an operator-edited body usually has
+            // its trailing blank lines stripped, and the addendum must start
+            // its own section rather than run into the served text.
+            text: format!("{}\n\n{recipe}", served.text.trim_end()),
+            ..served
+        }
     } else {
         session_briefing::RenderedBlock {
-            text: AI_SESSION_RULES_SUPERVISOR_UNAVAILABLE.to_string(),
+            text: builtin,
             provenance: session_briefing::Provenance::Builtin,
             fetched_at: None,
         }
@@ -1736,34 +1835,36 @@ pub async fn stop_ai_analysis(
         pids_copy
     };
 
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut killed_count = 0;
     for pid in &pids_to_kill {
         info!("MCP API: Killing AI process PID {}", pid);
-        // Use taskkill with /T to kill the entire process tree (cmd.exe spawns node.exe for claude)
-        // /F forces termination, /T terminates child processes
-        let result = crate::process_helpers::no_window("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .output();
-
-        match result {
-            Ok(output) => {
-                if output.status.success() {
-                    info!("MCP API: Successfully killed process tree for PID {}", pid);
-                    killed_count += 1;
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    warn!(
-                        "MCP API: taskkill for PID {} returned error: {}",
-                        pid, stderr
-                    );
-                    // Process may have already exited, which is fine
-                    killed_count += 1;
-                }
+        // The entire process tree (cmd.exe spawns node.exe for claude), ended
+        // in-process: no `taskkill` is spawned to do it.
+        #[cfg(windows)]
+        match crate::tree_kill::kill_tree_by_pid_async(*pid, std::time::Duration::from_secs(5))
+            .await
+        {
+            Ok(report) => {
+                info!(
+                    "MCP API: Successfully killed process tree for PID {} ({:?})",
+                    pid, report.killed
+                );
+                killed_count += 1;
             }
             Err(e) => {
-                error!("MCP API: Failed to execute taskkill for PID {}: {}", pid, e);
+                // Most often the process had already exited, which is fine.
+                warn!("MCP API: tree kill for PID {} returned error: {}", pid, e);
+                killed_count += 1;
             }
         }
+        // Unchanged off Windows: this path never killed anything there (it
+        // spawned `taskkill`, which does not exist). A separate defect.
+        #[cfg(not(windows))]
+        error!(
+            "MCP API: no process-tree kill on this platform; AI process PID {} was not signalled",
+            pid
+        );
     }
 
     if !pids_to_kill.is_empty() {
@@ -2732,7 +2833,7 @@ A workflow configuration has been auto-loaded:
 **Runner MCP API (port 9876):**
 - GET /status - Check runner and config status
 - POST /run-workflow - Run a workflow by name
-  Example: `Invoke-RestMethod -Uri "http://localhost:9876/run-workflow" -Method Post -ContentType "application/json" -Body '{{"workflow_id": "workflow-name", "monitor_index": 0}}'`
+  Example: `Invoke-RestMethod -Uri "http://127.0.0.1:9876/run-workflow" -Method Post -ContentType "application/json" -Body '{{"workflow_id": "workflow-name", "monitor_index": 0}}'`
 - GET /monitors - List available monitors
 
 If your task requires running visual automation, use the Runner API to execute workflows.
@@ -2923,7 +3024,7 @@ If your task requires running visual automation, use the Runner API to execute w
             // set. The Python wrapper forwards each verbatim to `claude`.
             //
             // We hold the formatted strings (max_turns_str) in this scope so
-            // their `OsStr` borrow stays valid until spawn_python_with_console
+            // their `OsStr` borrow stays valid until spawn_python_script
             // returns.
             let max_turns_str = remote_max_turns_for_spawn.map(|n| n.to_string());
 
@@ -2955,9 +3056,11 @@ If your task requires running visual automation, use the Runner API to execute w
                 spawn_args.push(std::ffi::OsStr::new(cd.as_str()));
             }
 
-            // Spawn Claude independently using the spawn script
-            // Use spawn_python_with_console to ensure Claude CLI gets a console window
-            let spawn_result = spawn_python_with_console("python", &spawn_args, &workspace_root);
+            // Spawn Claude independently using the spawn script, with no
+            // console window: `claude` runs under the script's own
+            // `powershell.exe` child, not in python's console (see
+            // `spawn_python_script`).
+            let spawn_result = spawn_python_script("python", &spawn_args, &workspace_root);
 
             match spawn_result {
                 Ok(child) => {
@@ -3210,16 +3313,19 @@ mod tests {
     };
 
     /// NO-REGRESSION ANCHOR for the SECOND runner-injected prompt: with nothing
-    /// cached, the block is byte-identical to the text this build shipped
-    /// before it became a coord document, under an unchanged marker line and a
-    /// provenance line that says where it came from.
+    /// cached, the supervisor-available block is exactly the compiled-in rules
+    /// text followed by the dev-box supervisor addendum, under an unchanged
+    /// marker line and a provenance line that says where it came from.
     #[test]
-    fn the_builtin_rules_block_is_byte_identical_under_marker_and_provenance() {
+    fn the_builtin_rules_block_renders_under_marker_and_provenance() {
         let _pin = pin_plan_capture_level_for_test("off");
 
         let rules = runner_rules_prefix(true, 9876);
+        let base = "http://127.0.0.1:9876";
         let expected = format!(
-            "{AI_SESSION_SOURCE_MARKER}\n[briefing: builtin-fallback]\n{AI_SESSION_RULES_SUPERVISOR_AVAILABLE}"
+            "{AI_SESSION_SOURCE_MARKER}\n[briefing: builtin-fallback]\n{}\n\n{}",
+            builtin_rules_text(base).trim_end(),
+            supervisor_restart_recipe(&crate::api_config::get_supervisor_url(), base),
         );
         assert_eq!(rules.text, expected);
         assert_eq!(rules.text.lines().next(), Some(AI_SESSION_SOURCE_MARKER));
@@ -3255,31 +3361,248 @@ mod tests {
             lines.next(),
             Some("[briefing: coord session_briefing/ai-session-rules v6]")
         );
-        assert_eq!(
-            lines.next(),
-            Some("Edited rules. Do NOT restart the qontinui-runner directly. Runner API: http://127.0.0.1:9876.")
+        let rest = lines.next().unwrap();
+        assert!(
+            rest.starts_with(
+                "Edited rules. Do NOT restart the qontinui-runner directly. Runner API: http://127.0.0.1:9876.\n\n"
+            ),
+            "{rest}"
         );
     }
 
-    /// The supervisor-DOWN arm is a statement about THIS machine's live process
-    /// table, not tenant policy, so a coord edit must never be able to tell a
-    /// session the supervisor is available when it is not.
+    /// The supervisor-AVAILABLE arm: the SERVED text renders first, and the
+    /// compiled-in dev-box supervisor recipe follows it — after the served
+    /// body, never instead of it, and fully resolved.
     #[test]
-    fn a_coord_body_cannot_override_the_supervisor_down_notice() {
+    fn the_supervisor_recipe_follows_the_served_rules_only_when_a_supervisor_answered() {
         let pin = pin_plan_capture_level_for_test("off");
         pin.set_briefing(
             BRIEFING_AI_SESSION_RULES,
-            briefing_for_test("USE THE SUPERVISOR API", 6, BriefingProvenance::Coord),
+            briefing_for_test(
+                "Served rules. Do NOT restart the qontinui-runner directly.",
+                9,
+                BriefingProvenance::Coord,
+            ),
+        );
+        let base = "http://127.0.0.1:9876";
+        let recipe = supervisor_restart_recipe(&crate::api_config::get_supervisor_url(), base);
+
+        let up = runner_rules_prefix(true, 9876);
+        let served_at = up.text.find("Served rules.").expect("served text renders");
+        let recipe_at = up
+            .text
+            .find("## Development supervisor observed on this machine")
+            .expect("recipe renders on the supervisor-available arm");
+        assert!(served_at < recipe_at, "{}", up.text);
+        assert!(up.text.ends_with(&recipe), "{}", up.text);
+        assert!(
+            !recipe.contains("{{"),
+            "no placeholder may survive: {recipe}"
+        );
+        assert!(recipe.contains(&format!("{base}/restart-readiness")));
+
+        let down = runner_rules_prefix(false, 9876);
+        assert!(
+            !down.text.contains("Development supervisor"),
+            "{}",
+            down.text
+        );
+        assert!(!down.text.contains("Served rules."), "{}", down.text);
+    }
+
+    /// The recipe addresses the runner's CONFIGURED supervisor, not a literal
+    /// port.
+    #[test]
+    fn the_supervisor_recipe_uses_the_configured_supervisor_base() {
+        let recipe = supervisor_restart_recipe("http://10.0.0.5:4242/", "http://127.0.0.1:9877");
+        assert!(recipe.contains(r#"curl -fsS -X POST "http://10.0.0.5:4242/runner/restart""#));
+        assert!(recipe.contains("answered at http://10.0.0.5:4242 when"));
+        assert!(recipe.contains("GET http://127.0.0.1:9877/restart-readiness"));
+        assert!(!recipe.contains("{{"));
+    }
+
+    /// The addendum changes HOW a user-requested restart happens, never
+    /// WHETHER a session may decide one (served policy `production-and-cost`
+    /// `runner-lifecycle`).
+    #[test]
+    fn the_supervisor_recipe_is_gated_on_an_explicit_user_request() {
+        let _pin = pin_plan_capture_level_for_test("off");
+        let up = runner_rules_prefix(true, 9876);
+        assert!(up.text.contains("explicitly asked"), "{}", up.text);
+        assert!(!up.text.contains("sanctioned exception"), "{}", up.text);
+        assert!(!up.text.contains("/runner/stop"), "{}", up.text);
+        // The supervisor refuses without force, and force is gated on a
+        // sole-live-session readiness read.
+        assert!(up.text.contains(r#""force": true"#), "{}", up.text);
+        assert!(up.text.contains("sole live session"), "{}", up.text);
+        assert!(
+            up.text.contains("Never force on an UNKNOWN verdict"),
+            "{}",
+            up.text
+        );
+        assert!(
+            up.text.contains("is the user's restart, not yours"),
+            "{}",
+            up.text
+        );
+        // The workflow-loop signal route does not exist on the supervisor.
+        assert!(!up.text.contains("signal-restart"), "{}", up.text);
+        // No literal port: the rendered text carries only the CONFIGURED
+        // supervisor base, which on a default box does happen to be :9875.
+        assert!(!AI_SESSION_SUPERVISOR_RESTART_RECIPE.contains("9875"));
+        // Fields the supervisor's RestartRequest does not have.
+        assert!(!up.text.contains("trigger_auto_continue"), "{}", up.text);
+        assert!(!up.text.contains("wait_timeout_seconds"), "{}", up.text);
+        assert!(
+            !up.text.contains("from_working_tree\": true"),
+            "{}",
+            up.text
+        );
+        assert!(
+            up.text.contains("Nothing resumes this session"),
+            "{}",
+            up.text
+        );
+    }
+
+    /// A served body with the LEGACY supervisor shape is refused on the
+    /// supervisor-up arm: the builtin renders, named as rejected, and the
+    /// gated recipe follows it — so a session never sees two recipes.
+    #[test]
+    fn a_legacy_supervisor_body_falls_back_to_the_builtin_on_the_up_arm() {
+        let pin = pin_plan_capture_level_for_test("off");
+        pin.set_briefing(
+            BRIEFING_AI_SESSION_RULES,
+            briefing_for_test(
+                "Do NOT restart the qontinui-runner directly. USE THE SUPERVISOR API",
+                6,
+                BriefingProvenance::Coord,
+            ),
+        );
+        let base = "http://127.0.0.1:9876";
+        let up = runner_rules_prefix(true, 9876);
+        assert_eq!(
+            up.text.lines().nth(1),
+            Some("[briefing: builtin-fallback (rejected coord v6)]")
+        );
+        assert!(!up.text.contains("USE THE SUPERVISOR API"), "{}", up.text);
+        assert!(up.text.contains(builtin_rules_text(base).trim_end()));
+        assert!(up.text.ends_with(&supervisor_restart_recipe(
+            &crate::api_config::get_supervisor_url(),
+            base
+        )));
+    }
+
+    /// The other legacy marker is refused too, not only `USE THE SUPERVISOR API`.
+    #[test]
+    fn a_legacy_runner_restart_body_falls_back_to_the_builtin_on_the_up_arm() {
+        let pin = pin_plan_capture_level_for_test("off");
+        pin.set_briefing(
+            BRIEFING_AI_SESSION_RULES,
+            briefing_for_test(
+                "Do NOT restart the qontinui-runner directly. Ask for POST /runner/restart.",
+                7,
+                BriefingProvenance::Coord,
+            ),
+        );
+        let up = runner_rules_prefix(true, 9876);
+        assert_eq!(
+            up.text.lines().nth(1),
+            Some("[briefing: builtin-fallback (rejected coord v7)]")
+        );
+    }
+
+    /// The fleet-neutral seed itself, served by coord, is ACCEPTED on the up
+    /// arm: the legacy markers must never match the current template, or every
+    /// tenant's correct body would be refused without anyone noticing.
+    #[test]
+    fn the_neutral_template_served_by_coord_is_accepted_on_the_up_arm() {
+        for m in LEGACY_SUPERVISOR_BODY_MARKERS {
+            assert!(
+                !AI_SESSION_RULES_TEMPLATE.contains(m),
+                "the template carries legacy marker {m:?}"
+            );
+        }
+        let pin = pin_plan_capture_level_for_test("off");
+        pin.set_briefing(
+            BRIEFING_AI_SESSION_RULES,
+            briefing_for_test(AI_SESSION_RULES_TEMPLATE, 10, BriefingProvenance::Coord),
+        );
+        let base = "http://127.0.0.1:9876";
+        let up = runner_rules_prefix(true, 9876);
+        assert_eq!(
+            up.text.lines().nth(1),
+            Some("[briefing: coord session_briefing/ai-session-rules v10]"),
+            "{}",
+            up.text
+        );
+        assert!(up.text.ends_with(&supervisor_restart_recipe(
+            &crate::api_config::get_supervisor_url(),
+            base
+        )));
+    }
+
+    /// Lockstep pin with coord's seed of `session_briefing/ai-session-rules`:
+    /// coord's seed body must hash to this same value. A coord-side pin of the
+    /// digest does not exist yet; adding one is a follow-up.
+    #[test]
+    fn the_rules_template_digest_is_pinned() {
+        use sha2::{Digest, Sha256};
+        let digest = format!("{:x}", Sha256::digest(AI_SESSION_RULES_TEMPLATE.as_bytes()));
+        assert_eq!(
+            digest,
+            "9a42163a9a4b8212e6ce092a23515cd7bd7bc0b4a2bdd6ced6d207956cb1fd66"
+        );
+    }
+
+    /// The text every external operator receives (no supervisor on the box)
+    /// names no supervisor, no dev port and no PowerShell, and names the next
+    /// action: the runner's own restart verdict.
+    #[test]
+    fn the_supervisor_down_arm_names_no_supervisor_and_a_next_action() {
+        let _pin = pin_plan_capture_level_for_test("off");
+        let rules = runner_rules_prefix(false, 9876);
+        let body = rules.text.splitn(3, '\n').nth(2).unwrap();
+        for banned in [
+            "supervisor",
+            "Supervisor",
+            "9875",
+            "Invoke-RestMethod",
+            "powershell",
+        ] {
+            assert!(!body.contains(banned), "`{banned}` in: {body}");
+        }
+        assert!(body.contains("GET http://127.0.0.1:9876/restart-readiness"));
+        assert!(body.contains(AI_SESSION_RULES_REQUIRED_PROHIBITION));
+        assert!(body.contains("commit your work"));
+        assert!(body.contains("The user restarts the application."));
+        for banned in ["supervisor", "9875", "Invoke-RestMethod"] {
+            assert!(!AI_SESSION_RULES_TEMPLATE.contains(banned));
+        }
+    }
+
+    /// The supervisor-DOWN arm never reads coord: existing tenants hold served
+    /// versions that still carry a dev-box supervisor recipe, and a box with no
+    /// supervisor must never render one.
+    #[test]
+    fn a_coord_body_cannot_override_the_supervisor_down_arm() {
+        let pin = pin_plan_capture_level_for_test("off");
+        pin.set_briefing(
+            BRIEFING_AI_SESSION_RULES,
+            briefing_for_test(
+                "Do NOT restart the qontinui-runner directly. USE THE SUPERVISOR API",
+                6,
+                BriefingProvenance::Coord,
+            ),
         );
 
         let rules = runner_rules_prefix(false, 9876);
         assert!(
-            rules
-                .text
-                .contains("The supervisor is NOT currently running"),
+            !rules.text.contains("USE THE SUPERVISOR API"),
             "{}",
             rules.text
         );
+        assert!(rules.text.contains("/restart-readiness"), "{}", rules.text);
         assert_eq!(
             rules.text.lines().nth(1),
             Some("[briefing: builtin-fallback]")
@@ -3325,7 +3648,7 @@ mod tests {
             joined.ends_with("\n\nUSER PROMPT"),
             "the prompt must start its own paragraph: {joined:?}"
         );
-        assert!(!joined.contains("changes.USER PROMPT"));
+        assert!(!joined.contains("---USER PROMPT"));
     }
 
     /// The prohibition an edit may not delete. Losing it is not a wording
@@ -3333,12 +3656,12 @@ mod tests {
     /// on the box (served policy `production-and-cost` `runner-lifecycle`).
     #[test]
     fn the_required_prohibition_is_present_in_both_compiled_in_arms() {
-        assert!(
-            AI_SESSION_RULES_SUPERVISOR_AVAILABLE.contains(AI_SESSION_RULES_REQUIRED_PROHIBITION)
-        );
-        assert!(
-            AI_SESSION_RULES_SUPERVISOR_UNAVAILABLE.contains(AI_SESSION_RULES_REQUIRED_PROHIBITION)
-        );
+        assert!(AI_SESSION_RULES_TEMPLATE.contains(AI_SESSION_RULES_REQUIRED_PROHIBITION));
+        for up in [true, false] {
+            assert!(runner_rules_prefix(up, 9876)
+                .text
+                .contains(AI_SESSION_RULES_REQUIRED_PROHIBITION));
+        }
     }
 
     /// …and an edit that drops it falls back to the builtin, which still
@@ -3536,6 +3859,9 @@ pub mod emergency_quit {
         std::thread::spawn(move || {
             std::thread::sleep(hard_deadline);
             warn!(
+                marker = %crate::session::shutdown_marker::describe_on_disk(
+                    &crate::session::shutdown_marker::marker_path()
+                ),
                 "Force-close watchdog: teardown did not finish within {}s — exiting process",
                 hard_deadline.as_secs()
             );
@@ -3724,7 +4050,10 @@ pub mod emergency_quit {
         // Stamp the marker so the next boot classifies the restart as quiet,
         // and retract the out-of-process port advertisement (plan 2026-07-17
         // §4) so the runner stops advertising a port it is releasing. Both are
-        // idempotent backstops for `drain()`'s own stamping/retraction.
+        // idempotent backstops for `drain()`'s own stamping/retraction. The
+        // stamp says the shutdown STARTED, not that it finished:
+        // `teardown_complete` stays false until `close_all` below reports a
+        // teardown with no kill-only fallback.
         let marker_path = crate::session::shutdown_marker::marker_path();
         crate::session::shutdown_marker::mark_clean_shutdown(&marker_path);
         qontinui_runner_lib::runner_breadcrumb::remove_published();
@@ -3746,9 +4075,17 @@ pub mod emergency_quit {
         // i.e. ≈4s each and `O(terminals)` unbounded without the cap. Past the
         // deadline the remaining sessions get a kill-only teardown: the child
         // process tree still dies, the joins and the shim-dir sweep are
-        // skipped.
+        // skipped. Only a teardown with no such fallback stamps the marker
+        // `teardown_complete` — the one bit that lets the next boot trust the
+        // marker as the open rows' anchor (plan
+        // `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
+        // Phase 3).
         if let Some(tm) = app_handle.try_state::<Arc<crate::terminal::TerminalManager>>() {
-            tm.close_all(budget.sub_deadline(shutdown_budget::TERMINAL_CLOSE_BUDGET));
+            if tm.close_all(budget.sub_deadline(shutdown_budget::TERMINAL_CLOSE_BUDGET)) {
+                crate::session::shutdown_marker::mark_teardown_complete(&marker_path);
+            } else {
+                warn!("Shutdown: terminal teardown degraded — marker left teardown_complete=false");
+            }
         }
 
         kill_orphaned_ai_processes(app_state, budget);
@@ -3845,13 +4182,12 @@ pub mod emergency_quit {
                 );
                 break;
             }
-            // `/T` is CORRECT here and must stay: it kills a CHILD AGENT'S OWN
-            // process tree (the `claude` CLI and whatever it spawned), which is
-            // the semantics of quitting the app. Categorically different from
-            // `/T` on the RUNNER's own PID, which would take every live Claude
-            // Code session on the box down with it and is forbidden.
-            let mut cmd = crate::process_helpers::no_window("taskkill");
-            cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
+            // The whole tree is CORRECT here and must stay: it kills a CHILD
+            // AGENT'S OWN process tree (the `claude` CLI and whatever it
+            // spawned), which is the semantics of quitting the app.
+            // Categorically different from a tree kill of the RUNNER's own
+            // PID, which would take every live Claude Code session on the box
+            // down with it and is forbidden. In-process: no `taskkill` spawn.
             let per_kill = std::cmp::max(
                 std::cmp::min(
                     shutdown_budget::TASKKILL_TIMEOUT,
@@ -3861,19 +4197,22 @@ pub mod emergency_quit {
                 // the runner.
                 shutdown_budget::TASKKILL_FLOOR,
             );
-            match crate::drain::output_with_timeout(cmd, per_kill) {
-                Ok(Some(output)) => {
-                    if output.status.success() {
-                        info!("Shutdown: killed AI process tree for PID {pid}");
-                    } else {
-                        info!("Shutdown: AI process PID {pid} already exited");
-                    }
-                }
-                Ok(None) => warn!(
-                    "Shutdown: taskkill for PID {pid} exceeded its {per_kill:?} timeout — \
-                     abandoned"
+            #[cfg(windows)]
+            match crate::tree_kill::kill_tree_by_pid(*pid, per_kill) {
+                Ok(report) if report.budget_spent => warn!(
+                    "Shutdown: tree kill for PID {pid} exceeded its {per_kill:?} budget — \
+                     killed {:?}",
+                    report.killed
                 ),
-                Err(e) => error!("Shutdown: failed to taskkill PID {pid}: {e}"),
+                Ok(_) => info!("Shutdown: killed AI process tree for PID {pid}"),
+                // Most often the process had already exited.
+                Err(e) => info!("Shutdown: AI process PID {pid} not killed: {e}"),
+            }
+            // Unchanged off Windows (never killed anything there).
+            #[cfg(not(windows))]
+            {
+                let _ = per_kill;
+                error!("Shutdown: no process-tree kill on this platform; PID {pid} not signalled");
             }
         }
     }
@@ -4057,11 +4396,15 @@ mod commit_state_limiter_tests {
     use std::time::Duration;
     use tokio::time::Instant;
 
-    fn rt() -> tokio::runtime::Runtime {
+    /// Run `fut` to completion on a fresh current-thread runtime. The runtime
+    /// is built and dropped inside this call, on a plain `#[test]` thread, so
+    /// no owned runtime ever escapes to be dropped from an async context.
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap()
+            .block_on(fut)
     }
 
     /// A probe that counts itself; the FIRST call signals `started` and then
@@ -4151,7 +4494,7 @@ mod commit_state_limiter_tests {
             Arc::new(tokio::sync::Notify::new()),
             Arc::new(tokio::sync::Notify::new()),
         );
-        rt().block_on(async {
+        block_on(async {
             assert!(limiter.claim("s", false));
             let l = limiter.clone();
             let probe = gated_probe(probes.clone(), started.clone(), release.clone());
@@ -4187,7 +4530,7 @@ mod commit_state_limiter_tests {
             Arc::new(tokio::sync::Notify::new()),
             Arc::new(tokio::sync::Notify::new()),
         );
-        rt().block_on(async {
+        block_on(async {
             assert!(limiter.claim("s", false));
             let l = limiter.clone();
             let probe = gated_probe(probes.clone(), started.clone(), release.clone());
@@ -4212,7 +4555,7 @@ mod commit_state_limiter_tests {
             Arc::new(tokio::sync::Notify::new()),
             Arc::new(tokio::sync::Notify::new()),
         );
-        rt().block_on(async {
+        block_on(async {
             assert!(limiter.claim("s", false));
             let l = limiter.clone();
             let probe = gated_probe(probes.clone(), started.clone(), release.clone());
@@ -4239,7 +4582,7 @@ mod commit_state_limiter_tests {
     #[test]
     fn a_panicking_probe_does_not_wedge_the_session() {
         let limiter = Arc::new(CommitStateLimiter::new(4));
-        rt().block_on(async {
+        block_on(async {
             assert!(limiter.claim("s", false));
             let l = limiter.clone();
             let driver = tokio::spawn(async move {
@@ -4257,7 +4600,7 @@ mod commit_state_limiter_tests {
         // And the permit came back: a cap-1 limiter still admits a probe.
         let one = CommitStateLimiter::new(1);
         let ran = Arc::new(AtomicUsize::new(0));
-        rt().block_on(async {
+        block_on(async {
             let one = Arc::new(one);
             assert!(one.claim("a", false));
             let o = one.clone();
@@ -4294,8 +4637,8 @@ mod commit_state_limiter_tests {
             decide_commit_state_emit(&test_skip_verdict(), &limiter, "s", now),
             EmitDecision::Shed
         );
-        assert!(limiter.book().last_start.get("s").is_none());
-        assert!(limiter.book().slots.get("s").is_none());
+        assert!(!limiter.book().last_start.contains_key("s"));
+        assert!(!limiter.book().slots.contains_key("s"));
         assert_eq!(
             decide_commit_state_emit(&BackgroundWork::Run, &limiter, "s", now),
             EmitDecision::Start(None)
@@ -4341,12 +4684,14 @@ mod commit_state_limiter_tests {
         }
     }
 
-    fn paused_rt() -> tokio::runtime::Runtime {
+    /// [`block_on`] on a runtime whose clock starts paused.
+    fn block_on_paused<F: std::future::Future>(fut: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .start_paused(true)
             .build()
             .unwrap()
+            .block_on(fut)
     }
 
     /// W2 end to end, on a paused clock so the timing is exact: a burst inside
@@ -4356,7 +4701,7 @@ mod commit_state_limiter_tests {
     fn a_burst_gets_exactly_one_trailing_probe() {
         let limiter = Arc::new(CommitStateLimiter::new(4));
         let starts = Arc::new(std::sync::Mutex::new(Vec::<Instant>::new()));
-        paused_rt().block_on(async {
+        block_on_paused(async {
             let t0 = Instant::now();
             let mut drivers = Vec::new();
             for _ in 0..6 {
@@ -4397,7 +4742,7 @@ mod commit_state_limiter_tests {
     fn a_forced_claim_wakes_a_sleeping_driver() {
         let limiter = Arc::new(CommitStateLimiter::new(4));
         let starts = Arc::new(std::sync::Mutex::new(Vec::<Instant>::new()));
-        paused_rt().block_on(async {
+        block_on_paused(async {
             let t0 = Instant::now();
             assert!(limiter.claim("s", false));
             let (l, st) = (limiter.clone(), starts.clone());
@@ -4432,7 +4777,7 @@ mod commit_state_limiter_tests {
             Arc::new(tokio::sync::Notify::new()),
             Arc::new(tokio::sync::Notify::new()),
         );
-        paused_rt().block_on(async {
+        block_on_paused(async {
             let t0 = Instant::now();
             assert!(limiter.claim("s", false));
             let l = limiter.clone();
@@ -4461,7 +4806,7 @@ mod commit_state_limiter_tests {
     fn a_deferred_probe_is_shed_if_the_verdict_went_skip_while_waiting() {
         let limiter = Arc::new(CommitStateLimiter::new(4));
         let probes = Arc::new(AtomicUsize::new(0));
-        paused_rt().block_on(async {
+        block_on_paused(async {
             assert!(limiter.claim("s", false));
             let (l, p) = (limiter.clone(), probes.clone());
             l.drive(
@@ -4489,7 +4834,7 @@ mod commit_state_limiter_tests {
             Arc::new(tokio::sync::Notify::new()),
             Arc::new(tokio::sync::Notify::new()),
         );
-        paused_rt().block_on(async {
+        block_on_paused(async {
             assert!(limiter.claim("s", false));
             let l = limiter.clone();
             let probe = gated_probe(probes.clone(), started.clone(), release.clone());
@@ -4516,7 +4861,7 @@ mod commit_state_limiter_tests {
     #[test]
     fn release_prunes_stale_pacing_entries() {
         let limiter = Arc::new(CommitStateLimiter::new(4));
-        paused_rt().block_on(async {
+        block_on_paused(async {
             limiter.record_start("gone", Instant::now());
             tokio::time::advance(COMMIT_STATE_MAX_WINDOW + Duration::from_millis(1)).await;
             assert!(limiter.claim("live", false));

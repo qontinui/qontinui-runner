@@ -74,9 +74,17 @@
 #                     the one spelling that clears a probe a previous
 #                     condition-mode install left behind.
 #   task              {"task_type":"RemoteAgent", prompt, working_directory,
-#                     max_turns 200, timeout_seconds 3600}. The runner's own
+#                     max_turns 400, timeout_seconds 10800}. The runner's own
 #                     defaults (50 turns, 600 s) apply only when these are unset,
-#                     and a sweep plus adjudication does not fit in them.
+#                     and a sweep plus adjudication does not fit in them. 10800
+#                     because a dry-run pass A alone measured 15-100 min on the
+#                     Windows operator box (2026-09-26..30) and a 3600 s bound
+#                     killed one night outright; the skill stops WAITING two
+#                     hours in (RTM_WAIT_DEADLINE) and keeps the third hour to
+#                     adjudicate and post the night's finding. 400 turns
+#                     because each bounded 100 s wait on a long pass is a turn
+#                     of its own: about 72 across a full 2 h wait budget,
+#                     plus Step 3's calls for each abstained repo.
 #   prompt            cron:      /return-to-main --shadow --not-after 09:30
 #                                (--act: /return-to-main --act --not-after 09:30)
 #                     condition: /return-to-main --shadow --daily-cap 3
@@ -328,8 +336,8 @@ fi
 
 # ---- the intended body ------------------------------------------------------
 if [ "$ACT" = 1 ]; then MODE_FLAG=--act; else MODE_FLAG=--shadow; fi
-MAX_TURNS=200
-TIMEOUT_SECONDS=3600
+MAX_TURNS=400
+TIMEOUT_SECONDS=10800
 PROBE_POLL_SECONDS=300
 PROBE_TIMEOUT_SECONDS=120
 REARM_DELAY_MINUTES=120

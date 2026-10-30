@@ -86,6 +86,15 @@ pub struct CreateTerminalRequest {
     /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`).
     #[serde(default, alias = "tenant_id")]
     pub tenant_id: Option<String>,
+    /// Repos the session will EDIT beside `intentRepo` (bare or `owner/name`),
+    /// taken off the sibling-store cargo override so its edits reach its build
+    /// (plan
+    /// `2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits`).
+    /// Each is validated before any allocate — a bad name, one with no checkout
+    /// on this device, or a non-empty list with no `intentRepo` is a 400
+    /// `invalid_edit_sibling`.
+    #[serde(default, alias = "edit_siblings")]
+    pub edit_siblings: Vec<String>,
 }
 
 /// Request body for writing data to a terminal.
@@ -218,12 +227,48 @@ pub async fn list_terminals_handler(
     }))))
 }
 
-/// `POST /terminals`' answer to a refused spawn tenant: a 400 naming the
-/// refusal, since a malformed or unpaired tenant is the caller's to fix. The
-/// refusal itself is the shared [`crate::commands::terminal::admit_spawn_tenant`].
+/// `POST /terminals`' answer to a refused spawn tenant. The refusal itself is
+/// the shared [`crate::commands::terminal::admit_spawn_tenant`], whose text
+/// always opens with a stable `terminal:tenant_<kind>:` prefix.
+///
+/// That prefix is lifted into the envelope's top-level `code`
+/// (`TERMINAL_TENANT_<KIND>`) so a client can branch on it. Without one, the
+/// envelope derived the code from the status and a live refusal read
+/// `"code": "INVALID_JSON"` (coord finding `9f2a0a0d`), which is a lie about
+/// what failed. The status follows the kind: an unreadable credential store is
+/// UNKNOWN and not the caller's to fix, so it is a 503 — as the
+/// provision-session door answers it — and every other kind (malformed,
+/// unpaired, a cwd declaring another tenant) is a 400.
 fn spawn_tenant_bad_request(refusal: String) -> (StatusCode, Json<ApiResponse<()>>) {
     warn!("HTTP: rejecting terminal create — {refusal}");
-    (StatusCode::BAD_REQUEST, Json(api_error(refusal)))
+    let kind = refusal
+        .strip_prefix("terminal:tenant_")
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(kind, _)| kind)
+        .filter(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'));
+    let Some(kind) = kind else {
+        // Not a spawn-tenant refusal text; keep the untyped 400 rather than
+        // inventing a code for it.
+        return (StatusCode::BAD_REQUEST, Json(api_error(refusal)));
+    };
+    let status = if kind == "credential_store_unreadable" {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    let code = format!("TERMINAL_TENANT_{}", kind.to_ascii_uppercase());
+    (status, Json(ApiResponse::error_with_code(refusal, code)))
+}
+
+/// A refused `editSiblings` input → the typed 400 `invalid_edit_sibling`,
+/// answered before any allocation (vet V9).
+pub(crate) fn edit_sibling_bad_request(
+    refusal: crate::agent_worktree::edit_sibling::EditSiblingRefusal,
+) -> (StatusCode, Json<ApiResponse<()>>) {
+    warn!("HTTP: rejecting terminal create — {refusal}");
+    let mut body = api_error(refusal.message.clone());
+    body.code = Some(refusal.code().to_string());
+    (StatusCode::BAD_REQUEST, Json(body))
 }
 
 /// Create a new terminal session.
@@ -281,9 +326,19 @@ pub async fn create_terminal_handler(
 
     // The spawn tenant is judged BEFORE the worktree allocation below, which a
     // refusal would otherwise leak. A malformed or unpaired tenant is the
-    // caller's to fix, so both are a 400 naming the heal.
+    // caller's to fix (a typed 400 naming the heal); an unreadable credential
+    // store is UNKNOWN, so a 503 — see `spawn_tenant_bad_request`.
     let spawn_tenant = crate::commands::terminal::admit_spawn_tenant(request.tenant_id.as_deref())
         .map_err(spawn_tenant_bad_request)?;
+
+    // The declared edit siblings are judged here too, before the allocation a
+    // refusal would otherwise leak — and before `acquire_for_terminal`'s
+    // fail-open policy could turn a typo into a pane in the shared checkout.
+    let edit_siblings = crate::agent_worktree::edit_sibling::validate_spawn_edit_siblings(
+        request.intent_repo.as_deref(),
+        &request.edit_siblings,
+    )
+    .map_err(edit_sibling_bad_request)?;
 
     // Phase 2 round 2 — route through the shared `acquire_for_terminal`
     // helper so this entry point matches the other five
@@ -298,6 +353,7 @@ pub async fn create_terminal_handler(
         request.working_dir,
         request.agent_session_id,
         spawn_tenant,
+        &edit_siblings,
     )
     .await;
 
@@ -789,13 +845,17 @@ pub async fn ws_terminal_handler(
 
     // Subscribe before reading scrollback to avoid missing data in between
     let output_rx = session.subscribe_output();
+    // An external reader of the output broadcast: while it lives, no SSE-leg
+    // encode is counted as waste (`terminal::transport_stats`).
+    let external = crate::terminal::transport_stats::ExternalOutputSubscriber::acquire();
     let (scrollback_data, _) = session.get_scrollback_buffer();
     let is_alive = session.is_alive();
 
     info!("WebSocket client connecting for terminal {}", id);
 
-    Ok(ws.on_upgrade(move |socket| {
-        handle_ws_terminal(socket, id, session, output_rx, scrollback_data, is_alive)
+    Ok(ws.on_upgrade(move |socket| async move {
+        let _external = external;
+        handle_ws_terminal(socket, id, session, output_rx, scrollback_data, is_alive).await
     }))
 }
 
@@ -1017,6 +1077,27 @@ pub async fn get_coord_session_handler(
     coord_session_response(&id, lookup)
 }
 
+/// GET /terminals/transport-stats — the terminal output transport counters
+/// (plan `2026-09-20-terminal-output-transport-is-unmeasured-encoded-broadcast`
+/// Phase 1). What each counter measures is documented on
+/// [`crate::terminal::transport_stats`]. Read-only; process-global.
+pub async fn get_transport_stats_handler(
+) -> Json<ApiResponse<crate::terminal::transport_stats::TransportSnapshot>> {
+    Json(ApiResponse::success(
+        crate::terminal::transport_stats::snapshot(),
+    ))
+}
+
+/// POST /terminals/transport-stats — zero the counters and return the
+/// snapshot they held just before, so a harness gets one clean measurement
+/// window per reset without a separate read.
+pub async fn reset_transport_stats_handler(
+) -> Json<ApiResponse<crate::terminal::transport_stats::TransportSnapshot>> {
+    Json(ApiResponse::success(
+        crate::terminal::transport_stats::reset(),
+    ))
+}
+
 // ============================================================================
 // Routes
 // ============================================================================
@@ -1032,6 +1113,14 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         )
         // Page-centric grouping of live terminals (which sessions on which page).
         .route("/terminal-pages", get(list_terminal_pages_handler))
+        // Transport counters. A literal segment, registered before the
+        // `/terminals/{id}/…` family; axum's router prefers a static segment
+        // over a `{id}` capture regardless of order, and
+        // `transport_stats_route_is_not_captured_by_the_id_routes` pins it.
+        .route(
+            "/terminals/transport-stats",
+            get(get_transport_stats_handler).post(reset_transport_stats_handler),
+        )
         .route("/terminals/{id}/write", post(write_terminal_handler))
         .route("/terminals/{id}/buffer", get(get_buffer_handler))
         // Alias — the cheatsheet and intuition both reach for `/output`.
@@ -1069,6 +1158,8 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("GET", "/terminals"),
         ("POST", "/terminals"),
         ("GET", "/terminal-pages"),
+        ("GET", "/terminals/transport-stats"),
+        ("POST", "/terminals/transport-stats"),
         ("POST", "/terminals/{id}/write"),
         ("GET", "/terminals/{id}/buffer"),
         ("GET", "/terminals/{id}/output"),
@@ -1106,6 +1197,8 @@ mod tests {
         };
         let (status, Json(body)) = admit(Some(&b.to_string())).expect_err("unpaired → refused");
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Finding 9f2a0a0d: the code is the refusal's own, not status-derived.
+        assert_eq!(body.code.as_deref(), Some("TERMINAL_TENANT_NOT_PAIRED"));
         let text = serde_json::to_string(&body).unwrap();
         assert!(text.contains("terminal:tenant_not_paired"), "{text}");
         assert!(
@@ -1113,10 +1206,86 @@ mod tests {
             "{text}"
         );
 
-        let (status, _) = admit(Some("not-a-uuid")).unwrap_err();
+        let (status, Json(body)) = admit(Some("not-a-uuid")).unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.code.as_deref(), Some("TERMINAL_TENANT_INVALID"));
         assert_eq!(admit(Some(&a.to_string())).ok(), Some(Some(a)));
         assert_eq!(admit(None).ok(), Some(None));
+    }
+
+    /// Plan 2026-10-10 Phase 2: `editSiblings` and `edit_siblings` both reach
+    /// the field, and an absent one is empty.
+    #[test]
+    fn create_terminal_request_accepts_edit_siblings_both_spellings() {
+        let camel: CreateTerminalRequest = serde_json::from_value(serde_json::json!({
+            "intentRepo": "qontinui-coord",
+            "editSiblings": ["qontinui-schemas"]
+        }))
+        .unwrap();
+        assert_eq!(camel.edit_siblings, vec!["qontinui-schemas".to_string()]);
+        let snake: CreateTerminalRequest = serde_json::from_value(serde_json::json!({
+            "intent_repo": "qontinui-coord",
+            "edit_siblings": ["qontinui/qontinui-schemas"]
+        }))
+        .unwrap();
+        assert_eq!(
+            snake.edit_siblings,
+            vec!["qontinui/qontinui-schemas".to_string()]
+        );
+        let none: CreateTerminalRequest =
+            serde_json::from_value(serde_json::json!({ "intentRepo": "qontinui-coord" })).unwrap();
+        assert!(none.edit_siblings.is_empty());
+    }
+
+    /// Vet V8/V9: a bad element is a typed 400 `invalid_edit_sibling`, decided
+    /// before any allocation.
+    #[test]
+    fn create_terminal_refuses_a_bad_edit_sibling_with_a_typed_400() {
+        let refusal = crate::agent_worktree::edit_sibling::validate_spawn_edit_siblings(
+            Some("qontinui-coord"),
+            &["..".to_string()],
+        )
+        .unwrap_err();
+        let (status, Json(body)) = edit_sibling_bad_request(refusal);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.code.as_deref(), Some("invalid_edit_sibling"));
+        assert!(!body.success);
+        let refusal = crate::agent_worktree::edit_sibling::validate_spawn_edit_siblings(
+            None,
+            &["qontinui-schemas".to_string()],
+        )
+        .unwrap_err();
+        let (status, Json(body)) = edit_sibling_bad_request(refusal);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.code.as_deref(), Some("invalid_edit_sibling"));
+    }
+
+    /// Finding 9f2a0a0d, the other arms: an unreadable credential store is
+    /// UNKNOWN, so 503 with its own code, and a text outside the
+    /// `terminal:tenant_` family keeps the untyped 400 rather than a made-up code.
+    #[test]
+    fn spawn_tenant_refusal_code_and_status_follow_the_refusal_kind() {
+        let (status, Json(body)) = spawn_tenant_bad_request(
+            "terminal:tenant_credential_store_unreadable: tenant x: io error".to_string(),
+        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body.code.as_deref(),
+            Some("TERMINAL_TENANT_CREDENTIAL_STORE_UNREADABLE")
+        );
+
+        let (status, Json(body)) = spawn_tenant_bad_request(
+            "terminal:tenant_workdir_declares_other_tenant: /w/.mcp.json".to_string(),
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.code.as_deref(),
+            Some("TERMINAL_TENANT_WORKDIR_DECLARES_OTHER_TENANT")
+        );
+
+        let (status, Json(body)) = spawn_tenant_bad_request("something else".to_string());
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.code, None);
     }
 
     #[test]
@@ -1324,6 +1493,67 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `/terminals/transport-stats` must reach its own handlers, not the
+    /// `{id}` family (a terminal literally named `transport-stats` is not a
+    /// thing this route should ever address). Built on the REAL path strings
+    /// and the REAL GET handler; the `{id}` routes are stand-ins because
+    /// `routes()` needs a full `ApiState`. POST is a stand-in too so this test
+    /// does not zero the process-global counters other tests read.
+    #[tokio::test]
+    async fn transport_stats_route_is_not_captured_by_the_id_routes() {
+        use axum::body::Body;
+        use axum::http::{Method, Request};
+        use axum::routing::{delete, get, post};
+        use tower::ServiceExt;
+
+        let app = axum::Router::new()
+            .route(
+                "/terminals/transport-stats",
+                get(get_transport_stats_handler).post(|| async { "reset-handler" }),
+            )
+            .route("/terminals/{id}/write", post(|| async { "id-route" }))
+            .route("/terminals/{id}/ws", get(|| async { "id-route" }))
+            .route("/terminals/{id}", delete(|| async { "id-route" }));
+
+        let call = |method: Method| {
+            let app = app.clone();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri("/terminals/transport-stats")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                (status, String::from_utf8(bytes.to_vec()).unwrap())
+            }
+        };
+
+        let (status, body) = call(Method::GET).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["success"], true);
+        assert!(
+            v.pointer("/data/frame_size_hist/counts").is_some(),
+            "{body}"
+        );
+
+        let (status, body) = call(Method::POST).await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "reset-handler"));
+
+        // A method the literal route does not serve is a 405 on IT, not a
+        // fall-through to `DELETE /terminals/{id}` closing a terminal.
+        let (status, body) = call(Method::DELETE).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{body}");
     }
 
     /// `route_entries()` is the policy's view of this module, so it must not

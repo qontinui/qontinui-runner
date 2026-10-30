@@ -30,7 +30,10 @@
 #   supervisor_builds    GET 127.0.0.1:9875/builds; refused -> not_applicable
 #   cargo_guard_lock     <root>/*/.build-state/locks/cargo.lockdir mtime
 #                        (fresh = touched within $CARGO_GUARD_LOCK_STALE_AFTER,
-#                        default 120 s); none present -> not_applicable
+#                        default 120 s); none present -> not_applicable; a
+#                        STALE_AFTER cargo-guard.sh refuses (lock-config-
+#                        invalid: not digits, a leading zero, over 9
+#                        digits, or not above the heartbeat) -> unknown
 #   coord_sessions       coord GET /coord/sessions/fleet?device_id=<this device>
 #                        -- `active` rows other than this job's own
 #   custody              <repo>/.git/qontinui-custody.d/*.json `last_seen`
@@ -338,6 +341,10 @@ http_fetch() {
   if [ -n "${QMQC_FIXTURE_DIR:-}" ]; then
     local f="$QMQC_FIXTURE_DIR/http/$name"
     printf '%s %s\n' "$method" "$url" >>"$QMQC_FIXTURE_DIR/requests.log"
+    # The header set this request WOULD have sent, kept beside the log so a
+    # suite can assert what a credential resolved to (fixture mode only; the
+    # values there are synthetic).
+    if [ -n "$hdr" ] && [ -f "$hdr" ]; then mkdir -p "$QMQC_FIXTURE_DIR/hdr" && cp "$hdr" "$QMQC_FIXTURE_DIR/hdr/$name"; fi
     if [ ! -f "$f.status" ]; then echo "error fixture-missing:$name" >"$st"; return 0; fi
     code="$(tr -d ' \r\n' <"$f.status")"
     case "$code" in
@@ -429,6 +436,28 @@ def cmd_device_id(home):
         print(v)
 
 
+def expand_env_ref_for_url(value, url):
+    """`${NAME:-default}` -> this process's NAME when set and non-empty, else the
+    default - reading the environment ONLY for a strictly-loopback `url` (any
+    other URL resolves on the default arm, so no environment value leaves this
+    box); a no-default reference raises ValueError (UNEXPANDED_ENV_REF). The one
+    python implementation is lib/mcp_env_ref.py (plan
+    2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages);
+    without it a value that carries a reference is refused, never sent."""
+    lib = os.environ.get("QMQC_PY_LIB") or ""
+    try:
+        if lib and lib not in sys.path:
+            sys.path.insert(0, lib)
+        from mcp_env_ref import expand_env_ref_for_url as _expand
+    except ImportError:
+        start = value.find("${")
+        if start != -1 and value.find("}", start + 2) != -1:
+            raise ValueError("UNEXPANDED_ENV_REF (helper absent): lib/mcp_env_ref.py not found - "
+                             "refusing to send a ${...} reference literally (LOCAL fault)")
+        return value
+    return _expand(value, url)
+
+
 def cmd_proxy(mcp_json, hdr_out):
     """Write the coord-mcp proxy's headers to hdr_out; print its URL base."""
     doc = load(mcp_json)
@@ -436,10 +465,28 @@ def cmd_proxy(mcp_json, hdr_out):
     if not isinstance(srv, dict) or not srv.get("url"):
         return
     hdrs = srv.get("headers") or {}
+    lines = []
+    for k, v in hdrs.items():
+        if k in ("Authorization", "X-Coord-Mcp-Proxy-Key") and isinstance(v, str) and "\n" not in v:
+            try:
+                v = expand_env_ref_for_url(v, str(srv["url"]))
+            except ValueError as e:
+                # Not sent: an empty header file makes the caller fall through
+                # to the bootstrap credential, and the reason is named.
+                sys.stderr.write("machine-quiesce-check: coord-mcp proxy skipped: %s\n" % e)
+                lines = []
+                break
+            lines.append("%s: %s\n" % (k, v))
     with open(hdr_out, "w") as fh:
-        for k, v in hdrs.items():
-            if k in ("Authorization", "X-Coord-Mcp-Proxy-Key") and isinstance(v, str) and "\n" not in v:
-                fh.write("%s: %s\n" % (k, v))
+        fh.write("".join(lines))
+        # The transport-rung declaration, set EXPLICITLY (check #89): this
+        # reader enumerates the whole headers block, and a runner that writes a
+        # declaration INTO that block (the http arm's `native_mcp`) must never
+        # have it ride along on a call this script makes over the loopback door.
+        # Only beside a credential: an EMPTY file is how a refused nonce falls
+        # through to the bootstrap, so a lone declaration must not fill it.
+        if lines:
+            fh.write("x-qontinui-transport: loopback_proxy\n")
     print(str(srv["url"]).rstrip("/"))
 
 
@@ -1030,11 +1077,26 @@ def cmd_final(work, census_path, census_rc, root, root_native, self_sid, device_
         probe("supervisor_builds", "unknown", "supervisor /builds: %s" % st)
 
     # ---- cargo-guard lock ---------------------------------------------------
-    stale_after = int(os.environ.get("CARGO_GUARD_LOCK_STALE_AFTER") or 120)
+    # Read the knobs by cargo-guard.sh's own rules (its LOCK_HEARTBEAT_INTERVAL
+    # case and acquire_build_lock's lock-config-invalid check): a heartbeat that
+    # is not 1-9999 falls back to 30; a STALE_AFTER that is not digits, has a
+    # leading zero, runs past 9 digits, or is not above the heartbeat is one
+    # cargo-guard refuses -- read here it would count a LIVE lock as stale
+    # (negative, or between two heartbeats) and discount it into quiet.
+    hb = os.environ.get("CARGO_GUARD_LOCK_HEARTBEAT_INTERVAL") or "30"
+    hb = int(hb) if re.fullmatch(r"[1-9][0-9]{0,3}", hb) else 30
+    stale_raw = os.environ.get("CARGO_GUARD_LOCK_STALE_AFTER") or "120"
+    stale_ok = re.fullmatch(r"[1-9][0-9]{0,8}", stale_raw) is not None and int(stale_raw) > hb
+    stale_after = int(stale_raw) if stale_ok else 0
     locks = sorted(set(glob.glob(os.path.join(root_native, "*", ".build-state", "locks", "cargo.lockdir")) +
                        glob.glob(os.path.join(root_native, "agent-worktrees", "*", "*", ".build-state", "locks", "cargo.lockdir"))))
     if not locks:
         probe("cargo_guard_lock", "not_applicable", "no cargo.lockdir under any checkout")
+    elif not stale_ok:
+        probe("cargo_guard_lock", "unknown",
+              "CARGO_GUARD_LOCK_STALE_AFTER=%r is not a whole number of seconds above the %ds heartbeat "
+              "(cargo-guard.sh refuses it: lock-config-invalid), so no lockdir's freshness can be read"
+              % (stale_raw, hb))
     else:
         fresh = 0
         for lk in locks:
@@ -1346,7 +1408,7 @@ fetch_fleet_pages() { # <prefix> <base> <header-file>
 if [ -n "$DEVICE_ID" ] && [ "$FOR" != checkout-ff ]; then
   PROXY_OK=0
   if [ -f "$ROOT/.mcp.json" ]; then
-    PROXY_BASE="$(qpy proxy "$(native "$ROOT/.mcp.json")" "$(native "$WORK/proxy.hdr")")"
+    PROXY_BASE="$(QMQC_PY_LIB="$(native "$LIB_DIR")" qpy proxy "$(native "$ROOT/.mcp.json")" "$(native "$WORK/proxy.hdr")")"
     if [ -n "$PROXY_BASE" ] && [ -s "$WORK/proxy.hdr" ]; then
       fetch_fleet_pages coord_proxy_fleet_ "$PROXY_BASE" "$WORK/proxy.hdr" && PROXY_OK=1
     fi

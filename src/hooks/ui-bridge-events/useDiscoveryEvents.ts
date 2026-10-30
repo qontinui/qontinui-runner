@@ -5,6 +5,7 @@ import { getUIBridgeGlobal, toFindRequest } from "./utils";
 import { createLogger } from "@/lib/logger";
 import { ACTIVE_TAB_STORAGE_KEY, DEFAULT_TAB_ID } from "@/components/app/tab-types";
 import { instanceStorage } from "@/lib/instance-storage";
+import { describeThrown } from "@/lib/utils";
 
 const logger = createLogger("UIBridgeDiscoveryEvents");
 
@@ -65,6 +66,55 @@ export function readModalContext(bridge: unknown): unknown {
 }
 
 /**
+ * Build the `FindRequest` the `discover` arm hands to `bridge.discover()`.
+ *
+ * Options are read from nested `payload.options` or, failing that, the payload
+ * root. `toFindRequest` carries them by identity — this arm used to run its own
+ * allowlist, which had drifted from the `find` arm's list even though both call
+ * `bridge.discover()` with the same SDK type.
+ *
+ * `includeHidden` defaults beneath the caller's own filters, exactly as the
+ * `find` arm does — see {@link withIncludeHiddenDefault}. Without it the two
+ * arms answered the same request differently: the SDK executor behind
+ * `bridge.discover()` filters on `!options.includeHidden`, so an unset flag
+ * dropped off-viewport and zero-rect elements on `discover` only.
+ */
+export function toDiscoverRequest(payload: object): Record<string, unknown> {
+  const nested = (payload as { options?: unknown }).options;
+  return withIncludeHiddenDefault(toFindRequest(nested ?? payload));
+}
+
+/**
+ * Default `includeHidden` to `true` on a built `FindRequest`, leaving an
+ * explicit boolean alone.
+ *
+ * An explicit `null` counts as unset. `toFindRequest` forwards `null` by
+ * identity, and the SDK executor filters on `!options.includeHidden`, so a
+ * `null` that slipped past the default would read as `false` and silently drop
+ * hidden elements — which is what `/control/find` did with
+ * `{"includeHidden": null}` while `/control/discover` (whose Rust handler folds
+ * a typed `null` to "unset") did not.
+ */
+export function withIncludeHiddenDefault(
+  request: Record<string, unknown>,
+): Record<string, unknown> {
+  const includeHidden = request.includeHidden ?? true;
+  return { ...request, includeHidden };
+}
+
+/** Build the `FindRequest` the `find` arm hands to `bridge.discover()`. */
+export function toFindArmRequest(payload: object): Record<string, unknown> {
+  // The Rust backend merges the HTTP request body at the top level of the
+  // payload (alongside requestId and type), so the filters are read off the
+  // payload itself, falling back to nested params/body for backward
+  // compatibility. `toFindRequest` then carries them by identity.
+  const { params, body } = payload as { params?: unknown; body?: unknown };
+  const nested = params ?? body;
+  const source = nested && typeof nested === "object" ? nested : payload;
+  return withIncludeHiddenDefault(toFindRequest(source));
+}
+
+/**
  * Handles: discover, find, get_snapshot, get_modal_context, get_component_state,
  *          get_states, get_active_states, get_state_snapshot, get_state,
  *          activate_state, deactivate_state, get_state_groups,
@@ -84,12 +134,7 @@ export function useDiscoveryEvents(
 
       switch (type) {
         case "discover": {
-          // Extract options from nested payload.options or top-level payload fields.
-          // `toFindRequest` carries them by identity — this arm used to run its
-          // own allowlist, which had drifted from the `find` arm's list below
-          // even though both call `bridge.discover()` with the same SDK type.
-          const discoverSource = (payload.options ?? payload) as Record<string, unknown>;
-          const discoverOptions = toFindRequest(discoverSource);
+          const discoverOptions = toDiscoverRequest(payload);
 
           // Force-rescan path: useAutoRegister listens for `ui-bridge-route-change`
           // and on receipt clears the registry, bbox trackers, and the local
@@ -145,25 +190,9 @@ export function useDiscoveryEvents(
         }
 
         case "find": {
-          // The Rust backend merges the HTTP request body at the top level
-          // of the payload (alongside requestId and type), so the filters are
-          // read off the payload itself, falling back to nested params/body
-          // for backward compatibility. `toFindRequest` then carries them by
-          // identity — see the `discover` arm above for the drift that shared
-          // seam closes.
-          const nested = payload.params ?? payload.body;
-          const source = (nested && typeof nested === "object" ? nested : payload) as Record<
-            string,
-            unknown
-          >;
-          // `includeHidden` is seeded before the caller's own filters so an
-          // explicit `false` still wins. The SDK has defaulted it to true since
-          // 0.22.0, so this only pins the runner's behaviour against a future
-          // default change.
-          const findOptions: Record<string, unknown> = {
-            includeHidden: true,
-            ...toFindRequest(source),
-          };
+          // `toFindArmRequest` shares `toFindRequest` with the `discover` arm
+          // above — see there for the drift that shared seam closes.
+          const findOptions = toFindArmRequest(payload);
           const discovered = await currentBridge.discover(findOptions);
           await sendResponse({
             requestId,
@@ -397,7 +426,7 @@ export function useDiscoveryEvents(
               requestId,
               type,
               success: false,
-              error: err instanceof Error ? err.message : String(err),
+              error: describeThrown(err, "Discovery request failed"),
               timestamp: Date.now(),
             });
           }
@@ -431,7 +460,7 @@ export function useDiscoveryEvents(
               requestId,
               type,
               success: false,
-              error: err instanceof Error ? err.message : String(err),
+              error: describeThrown(err, "Discovery request failed"),
               timestamp: Date.now(),
             });
           }
@@ -478,7 +507,7 @@ export function useDiscoveryEvents(
               requestId,
               type,
               success: false,
-              error: err instanceof Error ? err.message : String(err),
+              error: describeThrown(err, "Discovery request failed"),
               timestamp: Date.now(),
             });
           }
@@ -512,7 +541,7 @@ export function useDiscoveryEvents(
               requestId,
               type,
               success: false,
-              error: err instanceof Error ? err.message : String(err),
+              error: describeThrown(err, "Discovery request failed"),
               timestamp: Date.now(),
             });
           }
@@ -583,7 +612,7 @@ export function useDiscoveryEvents(
               requestId,
               type,
               success: false,
-              error: err instanceof Error ? err.message : String(err),
+              error: describeThrown(err, "Discovery request failed"),
               timestamp: Date.now(),
             });
           }
@@ -654,7 +683,7 @@ export function useDiscoveryEvents(
               requestId,
               type,
               success: false,
-              error: err instanceof Error ? err.message : String(err),
+              error: describeThrown(err, "Discovery request failed"),
               timestamp: Date.now(),
             });
           }

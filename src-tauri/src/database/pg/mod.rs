@@ -37,6 +37,8 @@ pub mod generation;
 pub mod generation_artifacts;
 pub mod generation_feedback;
 pub mod graph_ops;
+/// `/health`'s cached database block (plan 2026-10-19-runner-pg-unreachable-costs-every-caller-a-pool-timeout Phase 5).
+pub mod health;
 pub mod hooks;
 pub mod instances;
 pub mod knowledge;
@@ -71,6 +73,7 @@ pub mod scheduler;
 pub mod security_audit;
 pub mod session_file_snapshots;
 pub mod session_pr_ops;
+pub mod session_review;
 pub mod session_touched_files;
 pub mod settings;
 pub mod skills;
@@ -97,34 +100,47 @@ pub mod worktrees;
 pub mod wsv_disagreements;
 
 use std::sync::{Arc, OnceLock};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
+
+pub use qontinui_runner_lib::pg_circuit::GuardedPool;
 
 /// Global PgDb instance, set once during app initialization.
 /// Allows sync-context code (thread spawns, closures) to access PG
 /// without threading Arc<PgDb> through every call chain.
 static GLOBAL_PG_DB: OnceLock<Arc<PgDb>> = OnceLock::new();
 
-/// Whether the canonical PG was reachable at boot. `true` after a successful
-/// `PgDb::new`; `false` when the runner booted degraded -- `QONTINUI_ALLOW_NO_DB`
-/// with a configured external PG unreachable, or the bundled cluster failing to
-/// start or connect. DB-backed HTTP handlers consult `pg_available()` to
-/// return a clean `503 database unavailable` instead of hitting a dead pool.
+/// Whether the canonical PG is usable RIGHT NOW: `true` while the global
+/// pool's circuit breaker is Closed (plan
+/// `2026-10-19-runner-pg-unreachable-costs-every-caller-a-pool-timeout` D4).
+/// It reads `false` both on a degraded boot (`QONTINUI_ALLOW_NO_DB` with an
+/// unreachable configured PG, or a bundled cluster that failed to start or
+/// connect: the breaker starts Open with `cause=boot`) AND at runtime, from the
+/// first connect-class failure until the background prober reconnects. DB-backed
+/// HTTP handlers consult it (`pg_guard`) to return a clean
+/// `503 database unavailable` instead of hitting a dead pool.
 ///
-/// Defaults to `true` so the overwhelmingly common path (PG present) needs no
-/// explicit set and any code that reads it before boot completes does not
-/// spuriously 503; the degraded-boot path explicitly flips it to `false`.
-static PG_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-/// Record whether the canonical PG is available. Called once at boot:
-/// `true` on a verified connection, `false` on degraded boot.
-pub fn set_pg_available(available: bool) {
-    PG_AVAILABLE.store(available, std::sync::atomic::Ordering::Relaxed);
+/// Defaults to `true` when no global `PgDb` is set yet, so any code that reads
+/// it before boot completes does not spuriously 503. One atomic load.
+pub fn pg_available() -> bool {
+    GLOBAL_PG_DB.get().is_none_or(|pg| pg.pool.is_available())
 }
 
-/// Returns `false` only when the runner booted degraded with PG unreachable.
-/// DB-backed handlers use this to short-circuit to a 503 in degraded mode.
-pub fn pg_available() -> bool {
-    PG_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
+/// `false` only while the runner has had NO usable database since boot (a
+/// degraded boot whose breaker has not yet closed). One-shot boot work gates
+/// on this rather than on [`pg_available`], so a single runtime blip at the
+/// wrong moment does not silently skip it for the life of the process.
+pub fn pg_available_since_boot() -> bool {
+    GLOBAL_PG_DB.get().is_none_or(|pg| {
+        pg.pool.is_available()
+            || pg.pool.breaker_snapshot().cause.as_deref()
+                != Some(qontinui_runner_lib::pg_circuit::CAUSE_BOOT)
+    })
+}
+
+/// The global pool's breaker facts while it is open (`None` while Closed or
+/// before boot): what `pg_guard`'s 503 body reports.
+pub fn pg_unavailable_facts() -> Option<qontinui_runner_lib::pg_circuit::DbUnavailable> {
+    GLOBAL_PG_DB.get().and_then(|pg| pg.pool.unavailable_now())
 }
 
 /// The PostgreSQL condition name for a SQLSTATE, or `None` when the code is one
@@ -549,9 +565,10 @@ fn force_c_locale_messages(pg_config: &mut tokio_postgres::Config) {
     pg_config.options(options);
 }
 
-/// PostgreSQL connection pool backed by deadpool-postgres.
+/// PostgreSQL connection pool backed by deadpool-postgres, behind the
+/// runner's PG circuit breaker ([`GuardedPool`]).
 pub struct PgDb {
-    pool: deadpool_postgres::Pool,
+    pool: GuardedPool,
 }
 
 impl PgDb {
@@ -584,7 +601,7 @@ impl PgDb {
     /// `create`/`wait`/`recycle` timeouts and the `Tokio1` runtime; timers are
     /// registered lazily at `get()` time, never at build time) — so it is safe
     /// to call from a synchronous context outside a Tokio runtime.
-    fn build_pool(database_url: &str) -> Result<deadpool_postgres::Pool, String> {
+    fn build_pool(database_url: &str) -> Result<GuardedPool, String> {
         let mut pg_config: tokio_postgres::Config = database_url
             .parse()
             .map_err(|e| format!("Invalid PostgreSQL connection string: {}", e))?;
@@ -652,19 +669,37 @@ impl PgDb {
                 })
             }))
             .build()
+            .map(GuardedPool::new)
             .map_err(|e| format!("Failed to create PG pool: {}", e))
     }
 
     /// Construct a DEGRADED PgDb for `QONTINUI_ALLOW_NO_DB` boot: the pool is
-    /// built (and reconnects lazily if PG later becomes reachable) but initial
-    /// connectivity is NOT verified and the self-provision DDL is skipped.
+    /// built but initial connectivity is NOT verified and the self-provision
+    /// DDL is skipped.
     ///
-    /// Used only by the degraded-boot path in `main.rs` when the canonical PG
-    /// is unreachable AND degraded boot is explicitly enabled. The caller MUST
-    /// flip `set_pg_available(false)` so DB-backed handlers can return 503
-    /// instead of repeatedly hitting a pool that has no live backend.
+    /// The pool's circuit breaker starts OPEN with `cause=boot`, so
+    /// `pg_available()` is false and DB-backed handlers 503 instead of hitting
+    /// a pool with no live backend. Its prober's trial is installed here: until
+    /// it first succeeds it runs `verify_and_provision` on the GLOBAL `PgDb`
+    /// (the one `main.rs` sets right after this), so a runner that booted
+    /// degraded provisions exactly as a normal boot would once PG becomes
+    /// reachable. The prober itself starts when `start_server` hands the pool
+    /// its background runtime (`PgDb::start_background`), never here: this
+    /// runs on the `pg-boot-rt` current-thread runtime.
     pub fn new_degraded(database_url: &str) -> Result<Self, String> {
         let pool = Self::build_pool(database_url)?;
+        pool.force_open(
+            qontinui_runner_lib::pg_circuit::CAUSE_BOOT,
+            "the runner booted without a reachable PostgreSQL",
+        );
+        pool.install_trial_until_first_success(qontinui_runner_lib::pg_circuit::trial_fn(
+            || async {
+                match PgDb::try_global() {
+                    Some(pg) => pg.verify_and_provision().await,
+                    None => Err("no global PgDb to provision yet".to_string()),
+                }
+            },
+        ));
         Ok(Self { pool })
     }
 
@@ -683,8 +718,8 @@ impl PgDb {
 
     /// Verify connectivity and run the idempotent self-provision DDL (schema +
     /// pgvector extension + the workflow-verification self-heals). Shared by
-    /// `new` at boot and the degraded-mode reconnect probe
-    /// (`spawn_reconnect_probe`), so a runner that booted with
+    /// `new` at boot and the degraded-boot prober trial installed by
+    /// `new_degraded`, so a runner that booted with
     /// `QONTINUI_ALLOW_NO_DB` provisions exactly as a normal boot would once PG
     /// becomes reachable. Idempotent — safe to re-run on every retry.
     pub async fn verify_and_provision(&self) -> Result<(), String> {
@@ -1152,6 +1187,15 @@ impl PgDb {
         .await
         .map_err(|e| format!("Phase 1 orchestration schema self-heal failed: {}", e))?;
 
+        // Operator review of a session's changes — read hunks and review
+        // notes. Plan
+        // `2026-09-20-terminal-page-review-notes-become-prompts-and-prompt-matrix-fan-out`
+        // Phase 3. Runner-native `project.*` tables, NOT re-homed ones; see
+        // `session_review.rs`.
+        conn.batch_execute(session_review::SESSION_REVIEW_DDL)
+            .await
+            .map_err(|e| format!("session review schema self-heal failed: {}", e))?;
+
         // P3 of plan
         // `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration`:
         // provision the 12 machine-local tables re-homed out of `coord.*`
@@ -1180,7 +1224,7 @@ impl PgDb {
         // already self-heals two blocks up is the same class of self-heal.
         //
         // Runs here rather than in `main.rs` so the degraded-boot reconnect path
-        // (`spawn_reconnect_probe` → `verify_and_provision`) gets it too. Never
+        // (the degraded-boot prober trial → `verify_and_provision`) gets it too. Never
         // fatal: `ensure_self_registered` logs and returns on every failure.
         //
         // `conn` is released first — `ensure_self_registered` checks out its own
@@ -1193,46 +1237,13 @@ impl PgDb {
         Ok(())
     }
 
-    /// D3 (self-healing degraded mode): when the runner booted degraded
-    /// (`QONTINUI_ALLOW_NO_DB` + PG unreachable, so `pg_available()` is false),
-    /// spawn a background task that retries `verify_and_provision` with
-    /// exponential backoff (2s → 60s cap). On the first success it provisions
-    /// the schema/extension that degraded boot skipped, flips
-    /// `set_pg_available(true)` so `pg_guard` stops 503-ing DB-backed routes,
-    /// and exits. The deadpool pool reconnects lazily, so a transient PG outage
-    /// self-heals without a runner restart. No-op if PG is already available.
-    pub fn spawn_reconnect_probe(self: Arc<Self>) {
-        if pg_available() {
-            return;
-        }
-        tokio::spawn(async move {
-            let mut delay = std::time::Duration::from_secs(2);
-            let max_delay = std::time::Duration::from_secs(60);
-            loop {
-                tokio::time::sleep(delay).await;
-                // Another path may have already lifted the gate — stop probing.
-                if pg_available() {
-                    break;
-                }
-                match self.verify_and_provision().await {
-                    Ok(()) => {
-                        set_pg_available(true);
-                        info!(
-                            "PG reconnect probe: PostgreSQL is reachable and provisioned — \
-                             exiting degraded mode, DB-backed routes resumed"
-                        );
-                        break;
-                    }
-                    Err(e) => {
-                        debug!(
-                            "PG reconnect probe: still unavailable ({}); retrying in {:?}",
-                            e, delay
-                        );
-                        delay = (delay * 2).min(max_delay);
-                    }
-                }
-            }
-        });
+    /// Hand the pool its process-lived background runtime. The breaker's prober
+    /// runs there (and starts now if the runner booted degraded); without it a
+    /// prober would have nowhere to run but a caller's runtime. Called once by
+    /// `start_server`, which runs on the API's runtime for the life of the
+    /// process.
+    pub fn start_background(&self, handle: tokio::runtime::Handle) {
+        self.pool.start_background(handle);
     }
 
     // ========================================================================
@@ -1343,8 +1354,9 @@ impl PgDb {
         Ok(())
     }
 
-    /// Get a reference to the connection pool.
-    pub fn pool(&self) -> &deadpool_postgres::Pool {
+    /// Get a reference to the connection pool. Every checkout through it goes
+    /// through the PG circuit breaker.
+    pub fn pool(&self) -> &GuardedPool {
         &self.pool
     }
 
@@ -1398,7 +1410,9 @@ impl PgDb {
         let pool = cfg
             .create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls)
             .expect("noop pool creation should not fail (no connection attempted)");
-        std::sync::Arc::new(Self { pool })
+        std::sync::Arc::new(Self {
+            pool: GuardedPool::new(pool),
+        })
     }
 }
 
@@ -1714,5 +1728,48 @@ mod lc_messages_tests {
             "build_pool no longer forces C-locale server messages — a German \
              PostgreSQL will start emitting untranslatable error bodies again"
         );
+    }
+}
+
+#[cfg(test)]
+mod breaker_wiring_tests {
+    use super::*;
+    use qontinui_runner_lib::circuit::CircuitState;
+    use qontinui_runner_lib::pg_circuit::CAUSE_BOOT;
+
+    /// D4: a degraded boot is the same machine as a runtime outage. The
+    /// breaker starts Open with `cause=boot`, the provisioning trial is
+    /// installed, and nothing was spawned (this is a synchronous context, as
+    /// the `pg-boot-rt` boot path is).
+    #[test]
+    fn a_degraded_pgdb_starts_with_its_breaker_open_on_boot() {
+        let pg = PgDb::new_degraded("postgres://nobody@127.0.0.1:1/none")
+            .expect("building a degraded pool does no I/O");
+        assert_eq!(pg.pool().breaker_state(), CircuitState::Open);
+        let facts = pg.pool().unavailable_now().expect("open");
+        assert_eq!(facts.cause, CAUSE_BOOT);
+        assert!(facts.to_string().contains("booted without its database"));
+        assert!(!pg.pool().is_available());
+    }
+
+    #[test]
+    fn a_normally_built_pool_starts_closed() {
+        let pool = PgDb::build_pool("postgres://nobody@127.0.0.1:1/none").expect("builds");
+        assert!(pool.is_available());
+        assert!(pool.unavailable_now().is_none());
+    }
+
+    /// The boot-only globals are gone for good: a source assertion, so a
+    /// revert that re-adds a second availability flag beside the breaker is
+    /// caught here rather than by two signals disagreeing at runtime.
+    #[test]
+    fn the_boot_only_availability_globals_are_deleted() {
+        let src = include_str!("mod.rs");
+        let needle_static = ["static PG_", "AVAILABLE"].concat();
+        let needle_setter = ["fn set_pg_", "available"].concat();
+        let needle_probe = ["fn spawn_reconnect_", "probe"].concat();
+        assert!(!src.contains(&needle_static));
+        assert!(!src.contains(&needle_setter));
+        assert!(!src.contains(&needle_probe));
     }
 }

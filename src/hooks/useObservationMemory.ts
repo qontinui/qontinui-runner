@@ -8,6 +8,7 @@
 
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 // ============================================================================
 // Types
@@ -128,7 +129,7 @@ export function useObservationMemory(
         setError(result.error || "Failed to fetch observations");
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to fetch memory context");
+      setError(describeThrown(err, "Failed to fetch memory context"));
     } finally {
       setLoading(false);
     }

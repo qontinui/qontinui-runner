@@ -229,6 +229,9 @@ impl ClaudeSession {
             "Spawning interactive Claude session: {} in {}",
             session_id, working_dir
         );
+        if let Some(refusal) = crate::model_gateway::spawn_refusal() {
+            return Err(refusal);
+        }
 
         // Spawn CLI with stream-json input AND output. The Command itself is
         // built further down, once `render_program_and_argv` has resolved the
@@ -418,8 +421,10 @@ impl ClaudeSession {
             // tenant `AiCoordRegistrar` stamped them with, looked up by this
             // spawn's own id, then by the owning task run's id (a workflow
             // phase session's id is suffixed; the run is what registered).
-            // Neither registered yet, or no tenant recorded: the registrar's
-            // own resolver. `None` on an unresolvable or unpaired machine.
+            // Neither registered yet, or no tenant recorded: resolve it as
+            // a registration would, from the workspace and the repo in this
+            // spawn's working directory (plan 2026-09-20 Phase 5). A REFUSED
+            // decision skips federation rather than federating the default.
             crate::claude_session::coord_register::federation_session_tenant(
                 tauri::Manager::try_state::<
                     std::sync::Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
@@ -431,6 +436,11 @@ impl ClaudeSession {
                     None,
                     session_ctx.as_ref(),
                 ),
+                || {
+                    Self::block_on_async(crate::session::resolve_new_session_tenant_in(Some(
+                        std::path::Path::new(working_dir),
+                    )))
+                },
             ),
         ) {
             Ok(ctx) => Some(ctx),
@@ -1267,6 +1277,16 @@ impl ClaudeSession {
                 session_id_for_waiter, is_rate_limited
             );
 
+            // Review notes sent into this worker are never confirmed from a
+            // transcript (worker transcripts are not tailed); with the process
+            // gone they can no longer arrive, so settle them `unknown` — unless
+            // a rate-limit restart above already registered a live successor
+            // under the same id. Fire-and-forget.
+            crate::mcp::session_review::settle_on_task_run_end(
+                app_handle_for_waiter.clone(),
+                session_id_for_waiter.clone(),
+            );
+
             // Phase 1b — terminal coord agent_logs milestone + final flush.
             // No-op unless the emitter was built (gate ON). Done last so the
             // `session_closed` row reflects the real process-exit moment.
@@ -1676,6 +1696,17 @@ impl ClaudeSession {
         if let Ok(mut slot) = self.isolated_edit_ctx.lock() {
             *slot = Some(ctx);
         }
+    }
+
+    /// `(worktree_path, parent_sha)` of every coord-allocated worktree the
+    /// parked `IsolatedEditContext` holds; empty for a fresh or
+    /// shared-checkout session. Mirrors `TerminalSession::allocation_bases`.
+    pub fn allocation_bases(&self) -> Vec<(std::path::PathBuf, String)> {
+        self.isolated_edit_ctx
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|ctx| ctx.allocation_bases()))
+            .unwrap_or_default()
     }
 
     #[expect(

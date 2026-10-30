@@ -1,7 +1,7 @@
 import { useState, useCallback, useRef } from "react";
 import type { MemoryResult, MemorySearchResponse, MemorySourceFilter } from "./types";
-
-const API_BASE = "http://localhost:9876";
+import { describeThrown } from "@/lib/utils";
+import { getApiBase } from "@/lib/runner-api";
 
 interface SearchParams {
   query: string;
@@ -45,7 +45,7 @@ export function useMemorySearch() {
     if (params.minScore !== undefined) searchParams.set("min_score", String(params.minScore));
 
     try {
-      const res = await fetch(`${API_BASE}/memory/search?${searchParams}`, {
+      const res = await fetch(`${getApiBase()}/memory/search?${searchParams}`, {
         signal: controller.signal,
       });
       const json: MemorySearchResponse = await res.json();
@@ -64,7 +64,7 @@ export function useMemorySearch() {
       setState((prev) => ({
         ...prev,
         loading: false,
-        error: err instanceof Error ? err.message : "Network error",
+        error: describeThrown(err, "Network error"),
       }));
     }
   }, []);

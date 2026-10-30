@@ -24,6 +24,7 @@ import {
   GitCommitHorizontal,
   Layers,
 } from "lucide-react";
+import { describeThrown } from "@/lib/utils";
 
 // ============================================================================
 // Types (mirror Rust `PhaseResult` / `StepResultRecord` in
@@ -340,7 +341,7 @@ export function PhaseTimelineTab({ taskRunId }: { taskRunId: string }) {
       <div className="flex flex-col items-center justify-center p-8 text-muted-foreground">
         <XCircle className="w-10 h-10 mb-3 text-red-500 opacity-50" />
         <p className="text-sm font-medium">Failed to load phase results</p>
-        <p className="text-xs mt-1">{error instanceof Error ? error.message : "Unknown error"}</p>
+        <p className="text-xs mt-1">{describeThrown(error, "Unknown error")}</p>
       </div>
     );
   }

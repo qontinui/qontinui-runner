@@ -39,6 +39,7 @@ import type { NarrationOutput } from "@/lib/demo-video/narration-generator";
 import type { DiscoveredSpec } from "@/lib/spec-prompt-builder";
 import { loadDiscoveredSpecs } from "@/lib/ui-bridge/use-discovered-specs";
 import { ScriptPreview } from "./ScriptPreview";
+import { describeThrown } from "@/lib/utils";
 
 // =============================================================================
 // Recording Config Panel
@@ -193,7 +194,7 @@ export function DemoVideoPanel() {
       // Show the first script in the preview
       setState((s) => ({ ...s, phase: "previewing", script: scripts[0] }));
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Failed to plan demo scripts");
       setState((s) => ({ ...s, phase: "error", error: msg }));
     }
   }, [selectedSpecs]);
@@ -241,7 +242,7 @@ export function DemoVideoPanel() {
       }));
       setNarration(results[0]?.narration ?? null);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Demo run failed");
       setState((s) => ({ ...s, phase: "error", error: msg }));
     }
   }, [config]);

@@ -514,6 +514,39 @@ fn an_expiry_is_explained_and_the_memory_peak_is_sampled() {
          precisely the ones the CARGO_BUILD_JOBS retune is gated on"
     );
 
+    // Phase 3 step 1b: the reading must reach the job LOG, not only the job
+    // summary. No API exposes a job summary (`check-runs/<id>` returns
+    // `output.summary: ""`), so a summary-only sampler produces a peak nobody
+    // can collect and the soak it exists for never completes. `tee -a` keeps
+    // the summary AND writes the log; `MEMPEAK` is the line the soak greps.
+    let sampler_body = command_lines(sampler, "Windows memory peak after the Rust test steps");
+    assert!(
+        sampler_body.contains("MEMPEAK name=") && sampler_body.contains("peak_mb="),
+        "the memory sampler must emit one greppable `MEMPEAK name=… peak_mb=…` \
+         line per pagefile — that line is what the CARGO_BUILD_JOBS soak reads \
+         back out of `gh api …/actions/jobs/<id>/logs`"
+    );
+    assert!(
+        sampler_body.contains("MEMPEAK unknown=1"),
+        "a sampler that read no pagefile must say `MEMPEAK unknown=1`, never \
+         print nothing (an absent line reads as \"no data\", a zero as \"no peak\")"
+    );
+    assert!(
+        sampler_body.contains("tee -a \"$GITHUB_STEP_SUMMARY\""),
+        "the memory sampler must write the summary through `tee -a \
+         \"$GITHUB_STEP_SUMMARY\"` so the same lines land in the job log"
+    );
+    // Every OTHER mention of the summary is a write that bypasses the log
+    // (`>>`, `>>"$…"`, `> $…`, any spelling): with the one `tee -a` removed,
+    // nothing in the commands may name the summary file at all.
+    let without_tee = sampler_body.replace("tee -a \"$GITHUB_STEP_SUMMARY\"", "");
+    assert!(
+        !without_tee.contains("GITHUB_STEP_SUMMARY"),
+        "the memory sampler must reach $GITHUB_STEP_SUMMARY ONLY through `tee -a` \
+         — any other write sends the reading to the summary alone, which no API \
+         exposes"
+    );
+
     // Neither diagnostic may become a second way to fail the job.
     for (name, step) in [
         (
@@ -608,5 +641,79 @@ fn the_memory_sampler_is_gated_to_the_windows_leg() {
         cond.contains("matrix.platform == 'windows-latest'"),
         "the memory sampler's `if:` must gate on \
          `matrix.platform == 'windows-latest'`, got `{cond}`"
+    );
+}
+
+/// Phase 5a of 2026-09-17-the-windows-test-gate-is-a-90-minute-build-wearing-a-test-shaped-bound:
+/// the JOB cap must contain the two Rust step bounds plus the measured time
+/// outside them (max 49.0 min over 881 windows jobs, 2026-09-24..10-07).
+/// Otherwise a build that runs to its own bound becomes a job timeout, which
+/// GitHub concludes `cancelled`, and the `if: failure()` expiry summariser
+/// never runs — the attribution the build/run split exists to provide is
+/// erased one level up. 150 failed this: 90 + 20 + 49 = 159.
+#[test]
+fn the_job_cap_contains_both_rust_step_bounds_plus_measured_overhead() {
+    const MEASURED_OVERHEAD_MAX_MINUTES: u64 = 50; // 49.0 measured, rounded up
+    let doc = ci_workflow();
+    let steps = job_steps(&doc, "test");
+    let build_bound = timeout_minutes(find_step(&steps, BUILD), BUILD);
+    let run_bound = timeout_minutes(find_step(&steps, RUN), RUN);
+    let job_cap = doc
+        .get("jobs")
+        .and_then(|j| j.get("test"))
+        .and_then(|j| j.get("timeout-minutes"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| panic!("job `test` must carry an integer job-level `timeout-minutes`"));
+    let floor = build_bound + run_bound + MEASURED_OVERHEAD_MAX_MINUTES;
+    assert!(
+        job_cap >= floor,
+        "job `test` timeout-minutes ({job_cap}) must be >= `{BUILD}` ({build_bound}) \
+         + `{RUN}` ({run_bound}) + measured non-Rust overhead ({MEASURED_OVERHEAD_MAX_MINUTES}) \
+         = {floor}. A smaller cap turns a build-bound expiry into a job-level \
+         `cancelled`, which the `if: failure()` expiry summariser never explains."
+    );
+}
+
+#[test]
+fn no_step_after_the_build_half_invokes_cargo_again() {
+    // The run half is not the only place a second cargo invocation pays the
+    // full rebuild. The package is an input to itself (see the `Run Rust tests`
+    // comment), so ANY later cargo invocation in this job finds it Dirty and
+    // recompiles the main crate. That covers `build`, `check` and `clippy` as
+    // well as `test`. This test sees only cargo invocations written in a
+    // step's `run:` body. `Build Tauri app (development)` runs
+    // `pnpm run tauri build`, which calls cargo internally, and no pattern on
+    // the step text can see that. So a pass here does not prove the job has
+    // no second compile. `Live AI extractor smoke` ran `cargo test` there until
+    // this test was added, with no bound of its own and no compile throttle. It stayed
+    // dormant only because its secret is unset. Later steps run the binaries
+    // the build half produced, as the run half does.
+    //
+    // Unnamed steps are checked too. `step_name` returns `None` for them, and
+    // skipping them would let an anonymous `run: cargo test` through.
+    let doc = ci_workflow();
+    let steps = job_steps(&doc, "test");
+    let start = position(&steps, BUILD) + 1;
+    let mut offenders = Vec::new();
+    for (i, step) in steps.iter().enumerate().skip(start) {
+        let label = step_name(step)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("<unnamed step #{i}>"));
+        if step.get("run").is_none() {
+            continue;
+        }
+        let body = command_lines(step, &label);
+        for caps in CARGO_INVOCATION.captures_iter(&body) {
+            offenders.push(format!(
+                "`{label}`: `{}`",
+                caps.get(0).unwrap().as_str().trim()
+            ));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these steps invoke cargo after `{BUILD}`, and each one pays a full \
+         recompile of the main crate: {offenders:?}. Recover the binary from \
+         `cargo-test-build.log` and run it directly, as `{RUN}` does."
     );
 }

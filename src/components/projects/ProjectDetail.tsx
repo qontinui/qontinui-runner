@@ -28,6 +28,7 @@ import { isLiveProcessState } from "./types";
 import { buildDigest, describeSessionWhen, type DigestLine } from "./projectDigest";
 import { isOpenBusy, openProse, type OpenPhase } from "./openProject";
 import { FrontPageAddress } from "./FrontPageAddress";
+import { describeThrown } from "@/lib/utils";
 
 const log = createLogger("ProjectDetail");
 
@@ -77,7 +78,7 @@ export function ProjectDetail({
         await invoke(command, { id });
         await onRefresh?.();
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describeThrown(err, "Process command failed");
         log.error(`${command}(${id}) failed`, msg);
         setActionError(msg);
       } finally {
@@ -236,6 +237,7 @@ export function ProjectDetail({
                   <span className="font-medium">{proc.name}</span>
                   {proc.healthPort ? (
                     <span className="text-muted-foreground">
+                      {/* runner-localhost-ok: a project process's own health port, not a runner */}
                       http://localhost:{proc.healthPort}
                     </span>
                   ) : null}

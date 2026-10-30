@@ -643,8 +643,14 @@ fn resolve_step_cwd(worktree: &Path, step: &CiStep) -> Result<PathBuf, String> {
 /// Build the tokio Command for a step's argv. On Windows the creation
 /// flags combine `CREATE_NO_WINDOW` with `BELOW_NORMAL_PRIORITY_CLASS` so a
 /// CI build never steals the foreground from the developer.
+///
+/// Built on [`crate::process_helpers::tokio_no_window`] so a step whose argv
+/// starts with `git` gets the same git posture as every other runner git
+/// spawn: prompt-proof, and scrubbed of a repository-local env (`GIT_DIR`, …)
+/// inherited from whoever launched the runner — which would otherwise point
+/// the step at the launcher's repo instead of the worktree it runs in.
 fn build_step_command(program: &str, args: &[String]) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(program);
+    let mut cmd = crate::process_helpers::tokio_no_window(program);
     cmd.args(args);
     #[cfg(target_os = "windows")]
     {
@@ -691,17 +697,20 @@ fn spawn_step_child(
     }
 }
 
-/// Kill a step's process tree. On Windows `taskkill /T` takes the whole
-/// tree (killing only the direct child would orphan cargo/node under a
-/// `cmd.exe` shim until Job-Object close); elsewhere `start_kill` suffices.
+/// Kill a step's process tree. On Windows the in-process tree kill takes the
+/// whole tree (killing only the direct child would orphan cargo/node under a
+/// `cmd.exe` shim until Job-Object close) without spawning a process;
+/// elsewhere `start_kill` suffices.
 async fn kill_step_tree(child: &mut tokio::process::Child) {
     #[cfg(target_os = "windows")]
     {
         if let Some(pid) = child.id() {
-            let _ = crate::process_helpers::tokio_no_window("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .output()
-                .await;
+            if let Err(e) =
+                crate::tree_kill::kill_tree_by_pid_async(pid, std::time::Duration::from_secs(5))
+                    .await
+            {
+                tracing::debug!("ci step tree kill of pid {pid}: {e}");
+            }
         }
     }
     let _ = child.start_kill();
@@ -900,6 +909,28 @@ async fn pump_lines<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CI step whose argv starts with `git` gets the runner's git posture:
+    /// every repository-local variable is removed (`get_envs` reports a
+    /// removal as `None`), so a `GIT_DIR` inherited from the runner's launcher
+    /// cannot point the step at another repo. Pins `build_step_command` to
+    /// `tokio_no_window` — a bare `Command::new(program)` fails this.
+    #[test]
+    fn a_git_step_is_scrubbed_of_the_repo_local_env() {
+        let cmd = build_step_command("git", &["status".to_string()]);
+        let removed: Vec<String> = cmd
+            .as_std()
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        for var in qontinui_runner_lib::git_posture::REPO_LOCAL_GIT_ENV {
+            assert!(
+                removed.iter().any(|r| r == var),
+                "a git CI step must not inherit {var}; removed: {removed:?}"
+            );
+        }
+    }
 
     #[test]
     fn step_outcome_conclusions() {

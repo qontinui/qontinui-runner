@@ -33,6 +33,7 @@ import { ActionsTab } from "./ActionsTab";
 import { SettingsTab } from "./SettingsTab";
 import { LogsTab } from "./LogsTab";
 import { AboutTab } from "./AboutTab";
+import { describeThrown } from "@/lib/utils";
 
 export type WrapperDetailTab = "actions" | "settings" | "logs" | "about";
 
@@ -67,7 +68,7 @@ export function WrapperDetailPage({
       setWrapper(w);
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(describeThrown(err, "Failed to load wrapper"));
     } finally {
       setLoading(false);
     }
@@ -109,7 +110,7 @@ export function WrapperDetailPage({
       }
       await refreshStatus();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(describeThrown(err, "Failed to start or stop wrapper"));
     } finally {
       setBusy(false);
     }

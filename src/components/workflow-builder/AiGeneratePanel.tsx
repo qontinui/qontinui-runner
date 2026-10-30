@@ -62,6 +62,7 @@ import {
 import type { UnifiedWorkflow } from "../../types/unified-workflow";
 import { createLogger } from "@/lib/logger";
 import { invokeOperatorDoor } from "@/lib/operatorDoors";
+import { describeThrown } from "@/lib/utils";
 
 const log = createLogger("AiGeneratePanel");
 
@@ -400,7 +401,7 @@ export function AiGeneratePanel({
       // Auto-dismiss success after 3s
       setTimeout(() => setImportFeedback(null), 3000);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Failed to import file";
+      const msg = describeThrown(err, "Failed to import file");
       setImportFeedback({ type: "error", message: msg });
     } finally {
       setIsImportingFile(false);
@@ -520,7 +521,7 @@ export function AiGeneratePanel({
       }
       onNavigateToActiveRuns();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Failed to start workflow generation";
+      const msg = describeThrown(err, "Failed to start workflow generation");
       setError(msg);
       console.error("[AiGeneratePanel] Generation failed:", err);
     } finally {
@@ -599,7 +600,7 @@ export function AiGeneratePanel({
       }
       onNavigateToActiveRuns();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Failed to start workflow generation";
+      const msg = describeThrown(err, "Failed to start workflow generation");
       setError(msg);
       console.error("[AiGeneratePanel] Generate & Run failed:", err);
     } finally {

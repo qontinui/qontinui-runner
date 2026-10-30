@@ -91,8 +91,24 @@ pub async fn ui_bridge_get_forms_handler(
     wrap_ipc_result(ui_bridge_request_sync(&state, "get_forms", serde_json::json!({})).await)
 }
 
-/// Smart form fill action via the UI Bridge.
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/ai/fill-form` and `/control/fill` are ONE `batch_action` (`fill_form:<n>`) on the first field; values are never read.
 pub async fn ui_bridge_fill_form_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = {
+        let (n, first) = crate::journey::cursor::form_fields(&body);
+        crate::journey::cursor::ActionSpec::batch_kind(&format!("fill_form:{n}"), first)
+    };
+    let result = ui_bridge_fill_form_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
+/// Smart form fill action via the UI Bridge.
+async fn ui_bridge_fill_form_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {

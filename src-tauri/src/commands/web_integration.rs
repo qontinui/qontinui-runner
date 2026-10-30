@@ -858,7 +858,12 @@ pub async fn redeem_pair_code(
     let tenant_id = uuid::Uuid::parse_str(tenant_id_str.trim())
         .map_err(|e| format!("server returned malformed tenant_id: {e}"))?;
 
-    persist_pairing(&resp, tenant_id).map_err(|e| format!("persist pairing: {}", e))?;
+    // Blocking file + lock I/O (it may wait on a heartbeat reconcile): off the runtime.
+    let resp_for_persist = resp.clone();
+    spawn_blocking_tracked(move || persist_pairing(&resp_for_persist, tenant_id))
+        .await
+        .map_err(|e| format!("persist pairing task panicked: {e}"))?
+        .map_err(|e| format!("persist pairing: {}", e))?;
 
     // A NEW credential is in `tenant_id`'s slot (and in the legacy slot when that
     // tenant is the default), so every rejection coord recorded against the OLD

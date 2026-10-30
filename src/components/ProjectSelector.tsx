@@ -9,6 +9,7 @@ import { useState, useEffect, useCallback } from "react";
 import { FolderOpen, RefreshCw, Loader2, Check, AlertCircle } from "lucide-react";
 import { getStatusColors } from "@/design-system";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 interface RAGProject {
   project_id: string;
@@ -52,7 +53,7 @@ export function ProjectSelector({ onProjectLoad, onLog }: ProjectSelectorProps) 
         throw new Error(data.error || "Unknown error");
       }
     } catch (err) {
-      const message = err instanceof Error ? err.message : "Failed to fetch projects";
+      const message = describeThrown(err, "Failed to fetch projects");
       setError(message);
       onLog?.("error", message);
     } finally {
@@ -98,7 +99,7 @@ export function ProjectSelector({ onProjectLoad, onLog }: ProjectSelectorProps) 
           throw new Error(data.data?.message || data.error || "Unknown error");
         }
       } catch (err) {
-        const message = err instanceof Error ? err.message : "Failed to load project";
+        const message = describeThrown(err, "Failed to load project");
         setError(message);
         onLog?.("error", message);
       } finally {

@@ -24,6 +24,7 @@ import {
   GripVertical,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { describeThrown } from "@/lib/utils";
 
 // ============================================================================
 // Default template
@@ -157,7 +158,7 @@ export function DagWorkflowEditor() {
           setValidationStatus("error");
         }
       } catch (yamlErr) {
-        const errMsg = yamlErr instanceof Error ? yamlErr.message : String(yamlErr);
+        const errMsg = describeThrown(yamlErr, "Invalid YAML");
         setValidationResult({ valid: false, errors: [errMsg] });
         setValidationStatus("error");
       }

@@ -36,13 +36,13 @@ pub fn export_all_schemas() -> Value {
         accessibility as qa, agent_commands as qac, agent_text_units as qatu, ai_workflows as qaw,
         app_events as qae, apps as qap, completeness_verdict as qcv, config as qcfg,
         constraints as qc, discovery as qdc, execution as qe, findings as qfn,
-        functional_spec as qfs, geometry as qg, git_ops as qgo, helper_task as qht, ir as qir,
-        mcp_config as qmc, memory as qmem, orchestration_config as qoc, priorities_profile as qpp,
-        process_management as qpm, projects as qprj, rag as qr, runner as qrn, scheduler as qs,
-        spec_api_events as qsae, spec_check as qsc, state_machine as qsm, targets as qt,
-        task_run as qtr, terminal as qtm, ticket_system as qts, tree_events as qte,
-        ui_bridge as qub, verification as qv, worker_output as qwo, workflow as qw,
-        workflow_step as qws,
+        functional_spec as qfs, geometry as qg, git_ops as qgo, helper_task as qht,
+        image_slot as qis, ir as qir, journey as qj, mcp_config as qmc, memory as qmem,
+        orchestration_config as qoc, priorities_profile as qpp, process_management as qpm,
+        projects as qprj, rag as qr, runner as qrn, scheduler as qs, spec_api_events as qsae,
+        spec_check as qsc, state_machine as qsm, targets as qt, task_run as qtr, terminal as qtm,
+        ticket_system as qts, tree_events as qte, ui_bridge as qub, verification as qv,
+        worker_output as qwo, workflow as qw, workflow_step as qws,
     };
 
     // Built via a plain Map instead of `json!` to avoid the
@@ -876,6 +876,89 @@ pub fn export_all_schemas() -> Value {
     add!("RefusalSource", qontinui_types::refusal::RefusalSource);
     add!("NextAction", qontinui_types::refusal::NextAction);
     add!("NextActionKind", qontinui_types::refusal::NextActionKind);
+    // ── qontinui-types: journey (plan
+    // 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time,
+    // Phase 1). STRUCTS ONLY: every journey enum (`NavigationTriggerKind`,
+    // `ChokePoint`, `RunKind`, `EdgeOutcome`, `FrontierReason`, `LedgerState`)
+    // is `#[schemars(inline)]`, so each struct's schema carries its closed
+    // value sets inline and registering the enums would add unreferenced
+    // top-level names. (5) ──
+    add!("JourneyNode", qj::JourneyNode);
+    add!("JourneyTrigger", qj::JourneyTrigger);
+    add!("JourneyEdgeObservation", qj::JourneyEdgeObservation);
+    add!("FrontierEntry", qj::FrontierEntry);
+    add!("JourneyLedgerHealth", qj::JourneyLedgerHealth);
+    // ── journey queries + the temporal track (same plan, Phases 2 and 4).
+    // The answer VALUES of `GET /apps/{app_id}/journey/*` — the shared query
+    // results (their sub-types — nodes, edges, coverage, search frontier —
+    // are `$defs`), the runner's two route-local answer, and the
+    // vision-core timeline and edge-timing types the ledger stores and
+    // `edge-timing` returns. The `Observation<T>` envelope around them is
+    // registered with its own plan, not here. (11) ──
+    add!("JourneyFilter", qj::JourneyFilter);
+    add!("JourneyGraph", qj::JourneyGraph);
+    add!("JourneyReachable", qj::JourneyReachable);
+    add!("JourneySteps", qj::JourneySteps);
+    add!("JourneyDeadEnds", qj::JourneyDeadEnds);
+    add!("JourneyPriorKnowledge", qj::JourneyPriorKnowledge);
+    add!("JourneyFrontier", qj::JourneyFrontier);
+    add!(
+        "JourneyUnmeasuredDepartures",
+        qj::JourneyUnmeasuredDepartures
+    );
+    add!("JourneyArrivalDoubt", qj::JourneyArrivalDoubt);
+    add!(
+        "JourneyEdgeTimingAnswer",
+        crate::journey_wire::JourneyEdgeTimingAnswer
+    );
+    add!("ChangeTimeline", qontinui_vision_core::ChangeTimeline);
+    add!("EdgeTiming", qontinui_vision_core::EdgeTiming);
+    // Types more than one of the answers above reference. Each is top-level so
+    // the TypeScript pass imports ONE declaration instead of inlining a
+    // structural copy per file (compile_typescript.mjs refuses a fork). The
+    // nine envelope types are registered exactly as qontinui-runner#2118
+    // (the Observation-envelope plan) registers them — `Observation<Value>`,
+    // since a binding cannot be generic — and are already pending-registration
+    // bindings in qontinui-schemas; whichever PR lands second drops its copy.
+    // (+15) ──
+    add!("JourneyCoverage", qj::JourneyCoverage);
+    add!("JourneySearchFrontier", qj::JourneySearchFrontier);
+    add!("JourneySearchFrontierNode", qj::JourneySearchFrontierNode);
+    add!("JourneyGraphEdge", qj::JourneyGraphEdge);
+    add!("DetectedAnimation", qontinui_vision_core::DetectedAnimation);
+    add!(
+        "MetricDistribution",
+        qontinui_vision_core::MetricDistribution
+    );
+    {
+        use qontinui_vision_core::observation as qob;
+        add!("Observation", qob::Observation<serde_json::Value>);
+        add!("ObservationStatus", qob::ObservationStatus);
+        add!("UnknownCode", qob::UnknownCode);
+        add!("UnknownInfo", qob::UnknownInfo);
+        add!("Provenance", qob::Provenance);
+        add!("Producer", qob::Producer);
+        add!("ObservationCoverage", qob::ObservationCoverage);
+        add!("UnmeasuredDimension", qob::UnmeasuredDimension);
+        add!("CacheProvenance", qob::CacheProvenance);
+    }
+    // ── qontinui-types: page (plan
+    // 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus,
+    // qontinui-schemas#186). The bounded-read wire contract every list
+    // surface reports: `BoundedReadMeta` references `BoundKind` and
+    // `FilterNarrowing` by name, so all three are top-level. (3) ──
+    add!("BoundKind", qontinui_types::page::BoundKind);
+    add!("BoundedReadMeta", qontinui_types::page::BoundedReadMeta);
+    add!("FilterNarrowing", qontinui_types::page::FilterNarrowing);
+    // ── qontinui-types: image_slot (plan
+    // 2026-10-13-image-generation-and-visual-judgment Phase 14,
+    // qontinui-schemas#230). The ROOT only: every `ImageSlot*` sub-type is a
+    // `$defs` entry of this schema, so the generated `ImageSlotSpec.d.ts` and
+    // `image_slot_spec.py` declare each one beside it. Read the
+    // `qontinui_types::image_slot` module doc before registering a sub-type on
+    // its own: the TypeScript generator's fork guard is why each one has a
+    // single reference site. (1) ──
+    add!("ImageSlotSpec", qis::ImageSlotSpec);
 
     Value::Object(m)
 }
@@ -949,8 +1032,59 @@ mod tests {
         // + the 1 scheduler probe condition (ProbeCondition — plan
         // 2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one
         // Phase 4) = 561.
-        // The codegen's "Processing N top-level types" line should read 561 here.
-        assert_eq!(obj.len(), 561, "Expected 561 schema entries");
+        // + the 5 journey structs (JourneyNode, JourneyTrigger,
+        // JourneyEdgeObservation, FrontierEntry, JourneyLedgerHealth — plan
+        // 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time
+        // Phase 1; the journey enums are schemars-inline) = 566.
+        // + the 3 bounded-read page types (BoundKind, BoundedReadMeta,
+        // FilterNarrowing — plan
+        // 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus,
+        // qontinui-schemas#186) = 569.
+        // + the 1 image-slot spec (ImageSlotSpec — plan
+        // 2026-10-13-image-generation-and-visual-judgment Phase 14,
+        // qontinui-schemas#230; its sub-types are `$defs`) = 570.
+        // + the 11 journey query / temporal-track answer types (JourneyFilter,
+        // JourneyGraph, JourneyReachable, JourneySteps, JourneyDeadEnds,
+        // JourneyPriorKnowledge, JourneyFrontier, JourneyUnmeasuredDepartures,
+        // JourneyEdgeTimingAnswer, ChangeTimeline, EdgeTiming — plan
+        // 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time
+        // Phases 2 and 4) = 581.
+        // + the 15 types those answers share (JourneyCoverage,
+        // JourneySearchFrontier, JourneySearchFrontierNode, JourneyGraphEdge,
+        // DetectedAnimation, MetricDistribution, and the 9 Observation-envelope
+        // types) so the TS pass declares each once = 596.
+        // + JourneyArrivalDoubt (shared by JourneyGraph and
+        // JourneyPriorKnowledge) = 597.
+        // The codegen's "Processing N top-level types" line should read 597 here.
+        assert_eq!(obj.len(), 597, "Expected 597 schema entries");
+        for journey in [
+            "JourneyNode",
+            "JourneyTrigger",
+            "JourneyEdgeObservation",
+            "FrontierEntry",
+            "JourneyLedgerHealth",
+            "JourneyFilter",
+            "JourneyGraph",
+            "JourneyReachable",
+            "JourneySteps",
+            "JourneyDeadEnds",
+            "JourneyPriorKnowledge",
+            "JourneyFrontier",
+            "JourneyUnmeasuredDepartures",
+            "JourneyArrivalDoubt",
+            "JourneyEdgeTimingAnswer",
+            "ChangeTimeline",
+            "EdgeTiming",
+        ] {
+            assert!(obj.contains_key(journey), "Missing {journey} schema");
+        }
+        for page in ["BoundKind", "BoundedReadMeta", "FilterNarrowing"] {
+            assert!(obj.contains_key(page), "Missing {page} schema");
+        }
+        assert!(
+            obj.contains_key("ImageSlotSpec"),
+            "Missing ImageSlotSpec schema from qontinui_types::image_slot"
+        );
         assert!(
             obj.contains_key("RunnerInstance") && obj.contains_key("RunnerInstanceRole"),
             "Missing RunnerInstance / RunnerInstanceRole schema"

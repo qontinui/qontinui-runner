@@ -10,6 +10,7 @@ import { cn } from "../../lib/utils";
 import { useFixWorkflow } from "../../hooks/useErrorMonitor";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { invokeOperatorDoor, doorError } from "@/lib/operatorDoors";
+import { describeThrown } from "@/lib/utils";
 
 interface FixErrorsButtonProps {
   /** Task run ID to scope errors to */
@@ -78,7 +79,7 @@ export function FixErrorsButton({
         );
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to generate workflow");
+      setError(describeThrown(err, "Failed to generate workflow"));
       setTimeout(() => setError(null), 5000);
     } finally {
       setGenerating(false);
@@ -124,7 +125,7 @@ export function FixErrorsButton({
       // Navigate to the Active page to show the running workflow
       window.dispatchEvent(new CustomEvent("navigate-to-active"));
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to start fix workflow");
+      setError(describeThrown(err, "Failed to start fix workflow"));
       setTimeout(() => setError(null), 5000);
     } finally {
       setGenerating(false);

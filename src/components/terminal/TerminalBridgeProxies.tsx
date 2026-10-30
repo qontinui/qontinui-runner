@@ -13,6 +13,7 @@ import { writePtyById } from "./writePtyById";
 import { stripAnsi } from "./outputLineTracking";
 import { readLocalScrollbackRing } from "./backends/localScrollbackRing";
 import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
+import { describeThrown } from "@/lib/utils";
 import {
   GET_SCROLLBACK_SCHEMA,
   SEND_KEYS_SCHEMA,
@@ -101,7 +102,7 @@ function reportRegistrationFailure(
     elementId,
     reason,
     elapsedMs: Math.round(elapsedMs),
-    detail: detail instanceof Error ? detail.message : detail === undefined ? null : String(detail),
+    detail: detail === undefined ? null : describeThrown(detail, "no detail"),
   }).catch(() => {
     // Best-effort observability: a failed report must not become a second
     // silent failure, but there is nothing useful to do about it here.

@@ -1,0 +1,4 @@
+// Planted fixture for class `fleet_host_name` (from qontinui-schemas/fleet-nouns.toml).
+fn planted_fleet_host_name() -> &'static str {
+    "measured on merytshost"
+}

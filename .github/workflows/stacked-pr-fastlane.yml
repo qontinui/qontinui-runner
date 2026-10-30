@@ -104,12 +104,19 @@ on:
     # covers in full.
     branches-ignore: [main, develop]
 
+# RE-RUN-SAFE (shared hosted-job cap relief, 2026-10-05; pattern:
+# qontinui-claude-config#1475). Only a FIRST-attempt `pull_request` run uses the
+# bare per-branch group below and cancels within it. A re-run (run_attempt > 1)
+# appends `-run-<id>-<attempt>`, so it is alone in its group: it never cancels
+# the current head's run and is never cancelled itself. coord models this
+# template by interpolating only `github.event_name` / `github.ref` and
+# collapsing every other expression to "", so its modelled group is unchanged.
 concurrency:
   # A loop session force-pushes the same head branch repeatedly. Cancel the
   # superseded run rather than paying for an answer about a commit nobody is
   # looking at any more.
-  group: stacked-fastlane-${{ github.head_ref }}
-  cancel-in-progress: true
+  group: stacked-fastlane-${{ github.head_ref }}${{ !(github.event_name == 'pull_request' && github.run_attempt == 1) && format('-run-{0}-{1}', github.run_id, github.run_attempt) || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
 
 # Least-privilege, stated explicitly rather than inherited from the repo-level
 # `default_workflow_permissions` (an operator-flippable setting invisible in

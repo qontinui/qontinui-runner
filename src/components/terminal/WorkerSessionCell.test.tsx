@@ -33,7 +33,10 @@ import type { FileChangesRead, SessionFileChangesResponse } from "./workerFileCh
 
 describe("describeWorkerState", () => {
   it("is UNKNOWN until a read settles, and UNKNOWN when it failed — whatever the state value", () => {
-    expect(describeWorkerState("ready", "pending")).toEqual({ label: "attaching…", tone: "unknown" });
+    expect(describeWorkerState("ready", "pending")).toEqual({
+      label: "attaching…",
+      tone: "unknown",
+    });
     expect(describeWorkerState("closed", "failed")).toEqual({ label: "UNKNOWN", tone: "unknown" });
     expect(describeWorkerState("processing", "failed").tone).toBe("unknown");
   });
@@ -130,9 +133,9 @@ describe("settleQueuedOnTransition", () => {
   it("treats error and not_found as ends too, and settles from any live state", () => {
     for (const end of ["closed", "error", "not_found"] as const) {
       for (const from of ["processing", "ready", "interrupting"] as const) {
-        expect(
-          settleQueuedOnTransition([queued], from, end).map((e) => e.delivery),
-        ).toEqual(["undelivered"]);
+        expect(settleQueuedOnTransition([queued], from, end).map((e) => e.delivery)).toEqual([
+          "undelivered",
+        ]);
       }
     }
   });
@@ -383,7 +386,11 @@ describe("the direct-send arm", () => {
 describe("WorkerStateBadge", () => {
   it("renders UNKNOWN (with the error as title) when the read failed", () => {
     const html = renderToStaticMarkup(
-      <WorkerStateBadge state="closed" readStatus="failed" lastReadError="state read failed: boom" />,
+      <WorkerStateBadge
+        state="closed"
+        readStatus="failed"
+        lastReadError="state read failed: boom"
+      />,
     );
     expect(html).toContain("UNKNOWN");
     expect(html).toContain('data-worker-state="unknown"');
@@ -428,6 +435,8 @@ const okResponse = (
   files,
   filesTruncated: false,
   omittedFiles: 0,
+  baseKind: null,
+  baseSha: null,
   readAtMs: 0,
   ...extra,
 });
@@ -449,7 +458,9 @@ describe("shouldFetchChanges", () => {
   });
 
   it("reads again when a refresh fell due while hidden, or the worker changed", () => {
-    expect(shouldFetchChanges({ ...base, visible: true, fetchedFor: "w1", stale: true })).toBe(true);
+    expect(shouldFetchChanges({ ...base, visible: true, fetchedFor: "w1", stale: true })).toBe(
+      true,
+    );
     expect(shouldFetchChanges({ ...base, visible: true, fetchedFor: "other" })).toBe(true);
   });
 });
@@ -480,6 +491,9 @@ describe("FileChangesPanel", () => {
         truncated: false,
         takenAt: null,
         detail: null,
+        beforeSource: "snapshot",
+        baseKind: null,
+        baseSha: null,
       },
     ]);
     const read: FileChangesRead = { status: "error", error: "boom", atMs: 0, previous };
@@ -506,6 +520,9 @@ describe("FileChangesPanel", () => {
             truncated: false,
             takenAt: null,
             detail: null,
+            beforeSource: "snapshot",
+            baseKind: null,
+            baseSha: null,
           },
         ],
         { filesTruncated: true, omittedFiles: 12 },
@@ -540,6 +557,9 @@ describe("FileChangesPanel", () => {
           truncated: false,
           takenAt: null,
           detail: "pre-edit snapshot blob is missing on disk",
+          beforeSource: "snapshot",
+          baseKind: null,
+          baseSha: null,
         },
         {
           filePath: "/repo/c.ts",
@@ -553,6 +573,9 @@ describe("FileChangesPanel", () => {
           truncated: false,
           takenAt: null,
           detail: null,
+          beforeSource: "git_base",
+          baseKind: "head",
+          baseSha: "abc",
         },
       ]),
     };
@@ -562,6 +585,50 @@ describe("FileChangesPanel", () => {
     expect(html).toContain('data-file-change="created"');
     expect(html).toContain("+1");
     expect(html).toContain("2 changed");
+  });
+
+  it("never shows a path with no established before side as a creation", () => {
+    // A PTY-hosted session's path with no pre-edit snapshot and no git base:
+    // diffing it from empty would claim the whole file is new.
+    const read: FileChangesRead = {
+      status: "ok",
+      response: okResponse([
+        {
+          filePath: "/repo/d.ts",
+          status: "created",
+          before: null,
+          after: "existing\n",
+          beforeBytes: null,
+          afterBytes: 9,
+          beforeSha256: null,
+          afterSha256: "w",
+          truncated: false,
+          takenAt: null,
+          detail: null,
+          beforeSource: "none",
+          baseKind: null,
+          baseSha: null,
+        },
+      ]),
+    };
+    // Called as a function (it holds no hooks) so the render enters through
+    // the panel itself, exactly as the worker cell and review panel mount it.
+    const html = renderToStaticMarkup(FileChangesPanel({ read, onRefresh: noop }));
+    expect(html).toContain("d.ts");
+    expect(html).toContain("UNKNOWN — no pre-edit snapshot and no git base to diff against");
+    expect(html).not.toContain("+1");
+  });
+
+  it("names the git base the changes are diffed against in the panel header", () => {
+    const read: FileChangesRead = {
+      status: "ok",
+      response: okResponse([], { baseKind: "head", baseSha: "abc1234567890" }),
+    };
+    // Called as a function (it holds no hooks) so the render enters through
+    // the panel itself, exactly as the worker cell and review panel mount it.
+    const html = renderToStaticMarkup(FileChangesPanel({ read, onRefresh: noop }));
+    expect(html).toContain('data-review-base="head"');
+    expect(html).toContain("vs HEAD abc123456 — committed work not shown");
   });
 });
 
@@ -617,20 +684,30 @@ describe("ConversationView", () => {
 });
 
 describe("ZoneGrid wiring", () => {
-  const source = readFileSync(resolve(__dirname, "./ZoneGrid.tsx"), "utf8");
+  // Every zone content — grid cells, the maximized zone and the tmux
+  // viewport's panes — is zone-grid/ZoneCell, in one of its presentations.
+  const source = [
+    readFileSync(resolve(__dirname, "./ZoneGrid.tsx"), "utf8"),
+    readFileSync(resolve(__dirname, "./zone-grid/ZoneCell.tsx"), "utf8"),
+  ].join("\n");
 
-  it("mounts WorkerSessionCell at both TerminalInstance sites (maximized + zoned)", () => {
-    expect(source.match(/<WorkerSessionCell\s/g)?.length).toBe(2);
+  it("mounts WorkerSessionCell beside the one TerminalInstance site (zoned, maximized, parked)", () => {
+    expect(source.match(/<WorkerSessionCell\s/g)?.length).toBe(1);
+    expect(source.match(/<TerminalInstance\s/g)?.length).toBe(1);
   });
 
   it("never gives a worker tab the hidden TerminalInstance mount", () => {
-    expect(source).toContain("!t.sessionBacked");
+    // The parked (hidden / off-screen) mount is decided in the cell list.
+    const cells = readFileSync(resolve(__dirname, "./zone-grid/zoneCells.tsx"), "utf8");
+    expect(cells).toContain(
+      'return classification === "hidden" && tab.type !== "plan" && !tab.sessionBacked;',
+    );
   });
 
   it("passes the zone's visibility through to every WorkerSessionCell mount", () => {
     // The cell's file-changes read is gated on `visible`; a mount that hard-
     // coded `visible` would defeat that silently.
-    expect(source.match(/<WorkerSessionCell[^>]*visible=\{/g)?.length).toBe(2);
+    expect(source.match(/<WorkerSessionCell[^>]*visible=\{paneVisible\}/g)?.length).toBe(1);
   });
 });
 
@@ -638,10 +715,10 @@ describe("WorkerSessionCell wiring", () => {
   const source = readFileSync(resolve(__dirname, "./WorkerSessionCell.tsx"), "utf8");
 
   it("hands the cell's visibility to the file-changes hook", () => {
-    // Pins the fix: `visible` must reach `useWorkerFileChanges`, not just the
+    // Pins the fix: `visible` must reach `useSessionReview` (formerly `useWorkerFileChanges`), not just the
     // `data-visible` attribute it used to be spent on.
     expect(source).toMatch(
-      /useWorkerFileChanges\(\s*taskRunId,\s*session\.sessionState,\s*visible,\s*\)/,
+      /useSessionReview\(taskRunId,\s*\{\s*visible,\s*sessionState:\s*session\.sessionState\s*\}\)/,
     );
   });
 });

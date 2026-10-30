@@ -4,20 +4,6 @@
 //! the command handlers instead, because it resolves `AppState` out of
 //! Tauri's managed state and that type is owned there.
 
-use serde::Serialize;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
-
-/// Health status info for a single monitored process (for frontend display).
-#[derive(Debug, Clone, Serialize)]
-pub struct ProcessHealthInfo {
-    pub pid: u32,
-    pub process_type: String,
-    pub label: String,
-    pub status: String,
-    pub inactive_checks: u32,
-}
-
 /// Force stop a process by PID.
 #[tauri::command]
 pub async fn stop_process_by_pid(pid: u32) -> Result<(), String> {
@@ -25,17 +11,17 @@ pub async fn stop_process_by_pid(pid: u32) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
-        let output = crate::process_helpers::no_window("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .output()
-            .map_err(|e| format!("Failed to execute taskkill: {}", e))?;
-        if output.status.success() {
-            tracing::info!("Doctor: Successfully force-stopped process PID {}", pid);
-            Ok(())
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(format!("taskkill failed: {}", stderr))
-        }
+        // In-process tree kill: no process is created to end one.
+        let report =
+            crate::tree_kill::kill_tree_by_pid_async(pid, std::time::Duration::from_secs(5))
+                .await
+                .map_err(|e| format!("Failed to force-stop process tree: {e}"))?;
+        tracing::info!(
+            "Doctor: Successfully force-stopped process PID {} (tree: {:?})",
+            pid,
+            report.killed
+        );
+        Ok(())
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -49,11 +35,4 @@ pub async fn stop_process_by_pid(pid: u32) -> Result<(), String> {
             Err(format!("Failed to kill process {}", pid))
         }
     }
-}
-
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_doctor_commands")
-        .invoke_handler(tauri::generate_handler![stop_process_by_pid])
-        .build()
 }

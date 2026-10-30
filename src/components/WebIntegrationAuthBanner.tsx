@@ -39,6 +39,7 @@ import { useUIElement } from "@qontinui/ui-bridge";
 import { AlertCircle, X } from "lucide-react";
 
 import { useRunnerTier } from "@/hooks/useRunnerTier";
+import { useTenant } from "@/contexts/TenantContext";
 
 import {
   applyCredentialDarkSignal,
@@ -47,11 +48,15 @@ import {
   effectiveCredentialDark,
   GET_COORD_CREDENTIAL_POSTURE_CMD,
   makeRePairClickHandler,
+  makeRetryRefreshHandler,
+  makeSwitchTenantHandler,
   normalizeCredentialDarkSignal,
   RE_PAIR_CTA_GRACE_MS,
+  retryErrorSurvives,
   shouldShowAuthBanner,
   shouldShowRePairCta,
   statusSignature,
+  SWITCH_TENANT_LABEL,
   type AuthBannerStatus,
   type CredentialDarkSignal,
 } from "./web-integration-banner-logic";
@@ -120,6 +125,16 @@ export function WebIntegrationAuthBanner() {
   const [nowTick, setNowTick] = useState<number>(() => Date.now());
   const [reKicking, setReKicking] = useState(false);
   const [reKickError, setReKickError] = useState<string | null>(null);
+  // The credential banner's "Retry refresh now" result: its inline error and
+  // the posture signal it was written about. Held apart from `reKickError`
+  // because a concluded `unrefreshable` swaps the CTA to the sign-in, and the
+  // error must stay visible beside the new button — but only until a posture
+  // signal that says something else arrives (`retryErrorSurvives`).
+  const [retryRefresh, setRetryRefresh] = useState<{
+    error: string;
+    signal: CredentialDarkSignal | null;
+  } | null>(null);
+  const retryRefreshError = retryRefresh?.error ?? null;
 
   // Credential-dark signal. The device-JWT refresher emits
   // `autonomy-credential-dark` with `{dark, cause, message, cta, since}` for
@@ -141,6 +156,22 @@ export function WebIntegrationAuthBanner() {
   >({});
   const credentialDark = effectiveCredentialDark(credentialDarkBySource);
 
+  // Plan 2026-09-14-credential-posture-third-residuals Phase 3: the tenant
+  // switch for a pinned tenant this runner holds no credential for. It is the
+  // EXISTING re-pin (`set_active_tenant`, via TenantContext) behind an explicit
+  // operator pick from this device's bound tenants — never a guessed tenant.
+  // Offered only when `showSwitcher` (more than one binding), so a
+  // single-tenant box never sees a second button that could not act.
+  const {
+    showSwitcher,
+    candidates: tenantCandidates,
+    defaultTenantIdForNewSessions,
+    setDefaultTenantForNewSessions,
+  } = useTenant();
+  const [tenantSwitcherOpen, setTenantSwitcherOpen] = useState(false);
+  const [switchingTenant, setSwitchingTenant] = useState(false);
+  const [switchTenantError, setSwitchTenantError] = useState<string | null>(null);
+
   const { ref: rootRef } = useUIElement({
     id: "web-integration-banner",
     label: "Web integration authorization banner",
@@ -159,6 +190,11 @@ export function WebIntegrationAuthBanner() {
   const { ref: rePairButtonRef } = useUIElement({
     id: "web-integration-banner-re-pair",
     label: "Retry device re-pair manually",
+    type: "button",
+  });
+  const { ref: switchTenantButtonRef } = useUIElement({
+    id: "web-integration-banner-switch-tenant",
+    label: "Switch this runner's active tenant",
     type: "button",
   });
 
@@ -244,6 +280,7 @@ export function WebIntegrationAuthBanner() {
       const signal = normalizeCredentialDarkSignal(event.payload);
       if (!cancelled && signal !== null) {
         setCredentialDarkBySource((prev) => applyCredentialDarkSignal(prev, signal));
+        setRetryRefresh((prev) => (prev && retryErrorSurvives(prev.signal, signal) ? prev : null));
       }
     });
     return () => {
@@ -277,6 +314,9 @@ export function WebIntegrationAuthBanner() {
           // health, and it is not a recovery: contribute nothing.
           if (signal !== null) {
             setCredentialDarkBySource((prev) => applyCredentialDarkSignal(prev, signal));
+            setRetryRefresh((prev) =>
+              prev && retryErrorSurvives(prev.signal, signal) ? prev : null,
+            );
           }
         })
         .catch(() => {
@@ -355,6 +395,8 @@ export function WebIntegrationAuthBanner() {
       // `web-integration-changed`, which refreshes the status + device-JWT
       // probe above and hides the banner.
       await invoke<void>("cognito_sign_in", { backendUrl });
+      // A retry's "did not recover" is answered by this sign-in.
+      setRetryRefresh(null);
       window.dispatchEvent(new CustomEvent("runner-tier-changed"));
     } catch (err) {
       setAuthorizeError(String(err));
@@ -362,6 +404,41 @@ export function WebIntegrationAuthBanner() {
       setAuthorizing(false);
     }
   }, [backendUrl]);
+
+  // The operator picked `tenantId` in the switcher. Re-pin (machine.json,
+  // future sessions only — running sessions keep their tenant), close the
+  // switcher as soon as the re-pin lands, then kick the refresher so the
+  // posture is re-derived against the new pin now. The banner updates from the
+  // kicked pass's own event, never from an immediate re-read (see
+  // `makeSwitchTenantHandler`).
+  const handleSwitchTenant = useCallback(
+    async (tenantId: string) => {
+      setSwitchingTenant(true);
+      setSwitchTenantError(null);
+      let pinned = false;
+      try {
+        await makeSwitchTenantHandler({
+          setDefaultTenant: setDefaultTenantForNewSessions,
+          invoker: (cmd, args) => invoke<unknown>(cmd, args),
+          onPinned: () => {
+            pinned = true;
+            setTenantSwitcherOpen(false);
+          },
+        })(tenantId);
+      } catch (err) {
+        // After a successful re-pin only the refresher kick can have failed:
+        // say the switch landed, so the error never reads as a failed switch.
+        setSwitchTenantError(
+          pinned
+            ? `Switched to tenant ${tenantId}; the credential refresh kick failed (${String(err)}). The banner updates at the next refresh.`
+            : String(err),
+        );
+      } finally {
+        setSwitchingTenant(false);
+      }
+    },
+    [setDefaultTenantForNewSessions],
+  );
 
   const handleDismiss = useCallback(() => {
     // `deviceJwtPresent !== false` treats the not-yet-loaded (null) state as
@@ -373,6 +450,28 @@ export function WebIntegrationAuthBanner() {
     setDismissedSignature(sig);
   }, [status, deviceJwtPresent, credentialDark]);
 
+  // "Retry refresh now": kick the refresher, WAIT for the pass it triggers,
+  // and render from the posture that pass left behind — so a retry that could
+  // not recover the credential says so (and an `unrefreshable` verdict swaps
+  // the button to the sign-in) instead of silently changing nothing.
+  const handleRetryRefresh = useCallback(async () => {
+    setReKicking(true);
+    setRetryRefresh(null);
+    try {
+      const retry = makeRetryRefreshHandler((cmd, args) => invoke<unknown>(cmd, args));
+      const result = await retry();
+      const signal = result.signal;
+      if (signal !== null) {
+        setCredentialDarkBySource((prev) => applyCredentialDarkSignal(prev, signal));
+      }
+      setRetryRefresh(result.error === null ? null : { error: result.error, signal });
+    } catch (err) {
+      setRetryRefresh({ error: String(err), signal: null });
+    } finally {
+      setReKicking(false);
+    }
+  }, []);
+
   // The credential banner's CTA. Both destinations are commands that already
   // exist: an interactive Cognito re-login, or the headless refresher kick.
   const handleCredentialCta = useCallback(
@@ -381,9 +480,9 @@ export function WebIntegrationAuthBanner() {
         await handleAuthorize();
         return;
       }
-      await handleRePair();
+      await handleRetryRefresh();
     },
-    [handleAuthorize, handleRePair],
+    [handleAuthorize, handleRetryRefresh],
   );
 
   if (tier !== "qontinui_account") return null;
@@ -395,9 +494,12 @@ export function WebIntegrationAuthBanner() {
   // defect this banner closes, so it is not dismissable and it renders the
   // CAUSE rather than one generic sentence.
   if (credentialDark?.dark) {
-    const presentation = credentialDarkPresentation(credentialDark);
+    const presentation = credentialDarkPresentation(credentialDark, undefined, showSwitcher);
     const busy = presentation.ctaAction === "cognito_sign_in" ? authorizing : reKicking;
-    const ctaError = presentation.ctaAction === "cognito_sign_in" ? authorizeError : reKickError;
+    const ctaError =
+      (presentation.ctaAction === "cognito_sign_in" ? authorizeError : reKickError) ??
+      retryRefreshError ??
+      (presentation.showSwitchTenant ? switchTenantError : null);
     return (
       <div
         ref={rootRef}
@@ -438,6 +540,41 @@ export function WebIntegrationAuthBanner() {
               </>
             ) : null}
           </div>
+          {presentation.showSwitchTenant && tenantSwitcherOpen ? (
+            <div
+              role="group"
+              aria-label="Choose this runner's active tenant"
+              style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 6 }}
+            >
+              {tenantCandidates.map((candidate) => {
+                const current = candidate === defaultTenantIdForNewSessions;
+                return (
+                  <button
+                    key={candidate}
+                    type="button"
+                    title={candidate}
+                    disabled={switchingTenant || current}
+                    onClick={() => {
+                      void handleSwitchTenant(candidate);
+                    }}
+                    style={{
+                      background: "transparent",
+                      color: "inherit",
+                      border: "1px solid var(--border, #3f3f46)",
+                      borderRadius: 4,
+                      padding: "2px 8px",
+                      fontSize: "0.75rem",
+                      fontFamily: "monospace",
+                      cursor: switchingTenant || current ? "default" : "pointer",
+                      opacity: current ? 0.6 : 1,
+                    }}
+                  >
+                    {current ? `${candidate} (current)` : candidate}
+                  </button>
+                );
+              })}
+            </div>
+          ) : null}
         </div>
         {presentation.ctaAction ? (
           <button
@@ -463,6 +600,28 @@ export function WebIntegrationAuthBanner() {
             }}
           >
             {busy ? "Working…" : presentation.ctaLabel}
+          </button>
+        ) : null}
+        {presentation.showSwitchTenant ? (
+          <button
+            ref={switchTenantButtonRef}
+            type="button"
+            aria-expanded={tenantSwitcherOpen}
+            onClick={() => setTenantSwitcherOpen((open) => !open)}
+            disabled={switchingTenant}
+            style={{
+              background: "transparent",
+              color: "inherit",
+              border: "1px solid var(--accent, #6366f1)",
+              borderRadius: 4,
+              padding: "4px 10px",
+              fontSize: "0.8125rem",
+              fontWeight: 600,
+              cursor: switchingTenant ? "wait" : "pointer",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {switchingTenant ? "Switching…" : SWITCH_TENANT_LABEL}
           </button>
         ) : null}
       </div>

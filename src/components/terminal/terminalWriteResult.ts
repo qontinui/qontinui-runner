@@ -2,11 +2,14 @@
  * PTY-write result envelope — the one shape every write path in
  * `TerminalInstance` returns.
  *
- * A leaf module (zero imports) for the same reason `consumeInputChunk.ts` is
- * one: `TerminalInstance` transitively pulls `@xterm/addon-canvas`, which
- * touches `self` at module init and crashes under the runner's `environment:
- * "node"` vitest config, so nothing exported from that file is testable.
+ * A leaf module (its only import is the DOM-free `@/lib/utils`) for the same
+ * reason `consumeInputChunk.ts` is one: `TerminalInstance` transitively pulls
+ * `@xterm/addon-canvas`, which touches `self` at module init and crashes under
+ * the runner's `environment: "node"` vitest config, so nothing exported from
+ * that file is testable.
  */
+
+import { describeThrown } from "@/lib/utils";
 
 /** Machine-readable failure code: the PTY behind this pane is gone. */
 export const TERMINAL_EXITED = "TERMINAL_EXITED";
@@ -24,7 +27,6 @@ export type TerminalWriteResult =
       terminalId: string;
       exitCode?: number | null;
     };
-
 
 /**
  * Pull the exit code out of a backend `TERMINAL_EXITED: ...` refusal.
@@ -62,7 +64,7 @@ export function buildWriteFailure(
   exit: { exitCode: number | null } | null,
   cause: unknown,
 ): Extract<TerminalWriteResult, { success: false }> {
-  const detail = cause instanceof Error ? cause.message : cause == null ? "" : String(cause);
+  const detail = describeThrown(cause, "no detail");
   // The Rust write funnel (`TerminalSession::write`) now refuses a write to an
   // exited PTY with its OWN `TERMINAL_EXITED: ...` envelope. Recognise it, so a
   // pane whose `terminal-exit` event has not yet landed in this component
@@ -103,7 +105,6 @@ export function buildWriteFailure(
   };
 }
 
-
 /**
  * Turn a failed {@link TerminalWriteResult} into a throw, so the UI Bridge
  * executor reports `success: false` with the envelope's message.
@@ -138,7 +139,7 @@ export function buildClipboardReadFailure(cause: unknown): Error & {
   code: typeof CLIPBOARD_READ_FAILED;
   hint: string;
 } {
-  const detail = cause instanceof Error ? cause.message : cause == null ? "" : String(cause);
+  const detail = describeThrown(cause, "");
   const hint =
     "The page may lack focus or clipboard permission. Focus the runner window " +
     "and retry, or send the text directly with `pasteText`.";

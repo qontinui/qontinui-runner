@@ -5,6 +5,7 @@ import type { SessionRecap } from "@/lib/session-recap/types";
 import { SessionSummaryCard } from "./SessionSummaryCard";
 import { SessionTimeline } from "./SessionTimeline";
 import { SessionGraphView } from "./SessionGraphView";
+import { describeThrown } from "@/lib/utils";
 
 type ViewMode = "graph" | "timeline";
 
@@ -32,7 +33,7 @@ export function SessionRecapPage() {
         setError(json.error ?? "Analysis failed");
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Network error");
+      setError(describeThrown(e, "Network error"));
     } finally {
       setLoading(false);
     }

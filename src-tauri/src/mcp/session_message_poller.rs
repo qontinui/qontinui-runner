@@ -2266,6 +2266,7 @@ mod tests {
             provider: DEFAULT_PROVIDER.to_string(),
             origin: Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: Some(1),
             handle: None,
             account_label: None,
@@ -2283,6 +2284,8 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
+            adopted_from: None,
+            last_session_start_at: None,
         }
     }
 
@@ -2472,6 +2475,7 @@ mod tests {
     /// cascade into the next one's lock.
     static COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    // test-lock: standalone — module-private; its holders take no other test lock and never touch env
     fn counter_test_guard() -> std::sync::MutexGuard<'static, ()> {
         COUNTER_TEST_LOCK
             .lock()

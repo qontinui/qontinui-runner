@@ -119,6 +119,9 @@ struct FlywheelArgs {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
+    // A subject runner's root (`QONTINUI_INSTANCE_ROOT`) is validated and its
+    // defaults exported before anything here reads a path; no-op otherwise.
+    qontinui_runner_lib::instance_env::enforce_instance_root_or_exit(false);
     let cli = Cli::parse();
 
     let client = match open_pg().await {

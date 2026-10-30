@@ -8,7 +8,7 @@
  * `resolveCount` had a floor but no ceiling. A fixture registry cannot see
  * either, because a fixture declares whatever the test needs.
  *
- * So this file registers the ACTUAL 40 actions. `useTerminalCommands` is a
+ * So this file registers the ACTUAL 41 actions. `useTerminalCommands` is a
  * hook only in the sense that it calls context hooks and `useCommandAction`;
  * with those mocked it is an ordinary function, which is why this runs under
  * vitest's `environment: "node"` with no React renderer.
@@ -34,12 +34,8 @@ vi.mock("../result-card", () => ({
   buildMetricsCardSpec: () => ({ title: "m", sections: [] }),
   buildHistoryCardSpec: () => ({ title: "h", sections: [] }),
 }));
-vi.mock("../liveClaudeSessions", () => ({
-  extractLiveSessions: () => [],
-  groupByAccount: () => new Map(),
-  sharedSessionIds: () => new Set(),
-}));
 vi.mock("../contexts", () => ({
+  usePageSessionGetter: () => () => null,
   useTerminalSession: () => ({
     tabs: [{ id: "tab-a" }],
     activeId: "tab-a",
@@ -67,6 +63,9 @@ vi.mock("../contexts", () => ({
       toggleMaximize: () => {},
       setLayoutId: () => {},
       assignTabToZone: () => {},
+      workMode: "grid",
+      enterTmuxMode: () => {},
+      exitTmuxMode: () => {},
     },
     workflowGen: {
       generatedWorkflow: null,
@@ -164,7 +163,7 @@ const err = (r: CommandResult): string => (r.ok ? "OK" : `${r.code}: ${r.message
 
 describe("registered actions — the cost/destruction declarations are not empty", () => {
   it("registers the whole set", () => {
-    expect(getAll().length).toBe(40);
+    expect(getAll().length).toBe(42);
   });
 
   /**
@@ -181,6 +180,7 @@ describe("registered actions — the cost/destruction declarations are not empty
         .sort(),
     ).toEqual([
       "terminal.analyze",
+      "terminal.elevated",
       "terminal.generate-workflow",
       "terminal.orchestrate",
       "terminal.plan-implement",
@@ -205,6 +205,7 @@ describe("registered actions — the cost/destruction declarations are not empty
       "terminal.toggle-focus-mode",
       "terminal.maximize",
       "terminal.layout",
+      "terminal.mode",
       "terminal.swap",
       "terminal.tag-toggle",
       "terminal.plan-verify",

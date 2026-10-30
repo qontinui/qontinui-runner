@@ -935,7 +935,7 @@ pub fn next_release_slot(
 /// up — each holding a `WorkflowDropGuard` and a task-run row that reads
 /// *running* with no progress. `tx.send_replace` then wakes ALL N in the same
 /// instant. The machine-load backstop (`agent_runtime::admit_launch` /
-/// `evaluate_load_guard`) sits on the COORD-LAUNCH path and does not see this
+/// `resource_guard::probe_for_spawn`) sits on the COORD-LAUNCH path and does not see this
 /// one, so nothing downstream bounds the wave.
 ///
 /// **What bounds it here, exactly:** the release RATE, to one task per
@@ -1101,7 +1101,9 @@ async fn read_me_drain(base: &str) -> Result<DrainObservation, String> {
     // A per-read client, like the heartbeat's: the caller may run on the
     // heartbeat's dedicated current-thread runtime, and a pooled connection
     // must not outlive the runtime that opened it.
-    let client = reqwest::Client::builder()
+    // OS resolver (outbound_net::os_dns): the hickory resolver this replaced
+    // spent the whole timeout on DNS on a VPN box.
+    let client = qontinui_runner_lib::outbound_net::os_dns::client_builder()
         .timeout(ME_DRAIN_TIMEOUT)
         .build()
         .map_err(|e| format!("reqwest builder: {e}"))?;

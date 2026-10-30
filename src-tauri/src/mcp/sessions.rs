@@ -764,25 +764,57 @@ pub struct FinishSessionRequest {
 /// `POST /sessions/{id}/finish` — mark a session's WORK as complete, or unmark
 /// it with `{"finished": false}`.
 ///
-/// This is the LOCAL rung of the `/finish-session` transport cascade: it works
-/// with coord unreachable, writing the marker locally with `finishSynced:false`
-/// so the outbox carries it to coord when coord returns. A local-only mark is a
-/// legitimate terminal state, not a failure.
+/// The runner-local, PATH-ADDRESSED rung of the `/finish-session` cascade: the
+/// target is the URL path, so no spelling of it can land on a peer, and it
+/// names no work unit. It works with coord unreachable — the marker is written
+/// locally and the outbox carries it to coord when coord returns.
 ///
-/// **Metadata only — never touches the process.** Its one behavioural effect is
-/// that `restorable_records` stops offering the session for resume, which is
-/// what makes a rebuilt runner bring back only the UNFINISHED sessions.
+/// **Metadata only — never touches the process.** Its one local behavioural
+/// effect is that `restorable_records` stops offering the session for resume,
+/// which is what makes a rebuilt runner bring back only the UNFINISHED
+/// sessions.
 ///
-/// `404` when the id is unknown or the marker was already in the requested
-/// state; the store reports a no-op as `None`, and a no-op must not read as a
-/// successful write.
+/// Responses:
+/// - `404` — the id is unknown to this runner's lifecycle registry (a session
+///   no runner plane tracks, or a different runner instance's). Only that:
+///   an unreadable registry is a `500`, never a `404`.
+/// - `500` — the lifecycle registry is unavailable (its lock is poisoned),
+///   so whether the id is known is itself unknown.
+/// - `503` — this runner manages no lifecycle store at all (not in Tauri
+///   state: an early-boot window or a build/instance that never attached
+///   one). Nothing was read or written.
+/// - `200` otherwise, INCLUDING a re-run whose marker was already in the
+///   requested state. The body ([`FinishOutcome::response_json`]) says what
+///   changed (`"marker"`, `"none"`) and whether coord was told
+///   (`coord.queued`, `coord.coordSessionId`, `coord.reason`), beside the
+///   record's own `finishSynced`. A `200` is never by itself evidence coord
+///   heard: `coord.queued: false` means the resume set is corrected and coord
+///   is NOT told. A re-finish that carries a `reason` RESTAMPS an
+///   already-finished mark (`changed: "marker"`, a new `finishedAt`,
+///   `finishSynced: false`, the finish re-sent to coord with the new time).
+///   A caller that sends a `reason` on EVERY call (a poll, say) therefore
+///   restamps and re-queues on every call and keeps `finishSynced` false; a
+///   poll must send no reason.
+///   `changed: "none"` — a re-finish with no reason, i.e. the read-back —
+///   wrote nothing locally; on a mark coord has not ACKed it RE-OFFERS the
+///   owed coord write (the retry door) and reports that attempt's verdict,
+///   while on a synced mark it queues nothing (`reason: "not_requeued"`) —
+///   read `session.finishSynced` for the current verdict.
+///
+/// Honest local-only cases: a session whose harness id changed inside the
+/// provider WITHOUT a SessionStart hook reporting `source: "clear"` — the
+/// in-process `/resume` picker, or an adoption whose hook posted `startup`
+/// (the Windows `.cmd` shim) or never fired — records no predecessor, so its
+/// mark answers `coord.queued: false` (`reason: "no_coord_session"`) until
+/// that id gets a coord row of its own.
+///
+/// [`FinishOutcome::response_json`]: crate::session::session_lifecycle_store::FinishOutcome::response_json
 async fn finish_session(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     body: Option<Json<FinishSessionRequest>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let req = body.map(|Json(b)| b).unwrap_or_default();
-    let finished = req.finished.unwrap_or(true);
 
     let store = state
         .app_handle
@@ -792,25 +824,51 @@ async fn finish_session(
             "session lifecycle store unavailable".to_string(),
         ))?;
 
-    match store.set_finished(&id, finished, req.reason) {
-        Some(rec) => {
-            info!(
-                claude_session_id = %id,
-                finished,
-                "sessions: finished marker updated"
-            );
-            Ok(Json(serde_json::json!({
-                "success": true,
-                "session": rec,
-            })))
-        }
-        None => Err((
+    apply_finish(store.inner(), &id, req).map(Json)
+}
+
+/// The finish route's body, minus axum — pure over the store so the response
+/// contract is unit-testable without an app handle.
+fn apply_finish(
+    store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    id: &str,
+    req: FinishSessionRequest,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let finished = req.finished.unwrap_or(true);
+    let outcome = store
+        .set_finished(id, finished, req.reason)
+        .map_err(|e| finish_error_response(id, e))?;
+    info!(
+        claude_session_id = %id,
+        finished,
+        changed = outcome.changed.as_str(),
+        coord = ?outcome.coord,
+        "sessions: finished marker request"
+    );
+    Ok(outcome.response_json())
+}
+
+/// The finish route's error status for a [`SetFinishedError`]: an unknown id
+/// is a `404`, an unreadable registry a `500` — never collapsed into each
+/// other.
+///
+/// [`SetFinishedError`]: crate::session::session_lifecycle_store::SetFinishedError
+fn finish_error_response(
+    id: &str,
+    e: crate::session::session_lifecycle_store::SetFinishedError,
+) -> (StatusCode, String) {
+    use crate::session::session_lifecycle_store::SetFinishedError;
+    match e {
+        SetFinishedError::UnknownSession => (
             StatusCode::NOT_FOUND,
-            format!(
-                "no session `{id}` in the lifecycle registry, or its finished marker was \
-                 already in that state"
-            ),
-        )),
+            format!("no session `{id}` in the lifecycle registry"),
+        ),
+        SetFinishedError::Unavailable => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session lifecycle registry unavailable (lock poisoned) — whether \
+             the session exists is unknown"
+                .to_string(),
+        ),
     }
 }
 
@@ -855,8 +913,11 @@ type AdoptionCheck =
 /// tests drive every arm without the machine's settings, credential store,
 /// lifecycle store, coord, or a Tauri app.
 pub(crate) struct TranscriptBindEnv {
-    /// Gate 1, `Settings.cloud_sync_enabled`.
-    pub cloud_sync_enabled: bool,
+    /// Transcript sync's gate for the caller's tenant: the tenant's
+    /// `egress_transcript_sync` switch AND the user's own toggle
+    /// ([`crate::egress::transcript_sync_gate_for`]).
+    pub transcript_gate:
+        Box<dyn Fn(Option<uuid::Uuid>) -> crate::egress::TranscriptGate + Send + Sync>,
     pub tailer: Option<Arc<crate::session::session_transcript_tailer::SessionTranscriptTailer>>,
     /// The config dirs the transcript watcher actually watches.
     pub watched_config_dirs: Vec<std::path::PathBuf>,
@@ -916,7 +977,8 @@ pub(crate) struct TranscriptBindEnv {
 /// - `400 {"error":"malformed_request"|"malformed_id"}`
 /// - `403 {"error":"tenant_unresolvable"}` — the nonce's tenant is not knowable
 /// - `403 {"error":"not_caller_session"}` — the session is not the caller's
-/// - `409 {"error":"sync_disabled"}` — `Settings.cloud_sync_enabled` is off; nothing written
+/// - `409 {"error":"sync_disabled"}` — the user's own transcript-sync toggle is off; nothing written
+/// - `409 {"error":"egress_off","flow":"transcript_sync"}` — the tenant's `egress_transcript_sync` switch is off; nothing written
 /// - `409 {"error":"registration_disabled"}` — the registrar declined the binding
 /// - `409 {"error":"coord_session_in_use"}` — the id to adopt is bound to another session
 /// - `409 {"error":"bound_to_other_row","bound":x,"requested":y}` — already bound to another row; nothing written
@@ -941,7 +1003,7 @@ async fn transcript_bind(
         .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
         .map(|s| s.inner().clone());
     let env = TranscriptBindEnv {
-        cloud_sync_enabled: crate::settings::get_cloud_sync_enabled(),
+        transcript_gate: Box::new(crate::egress::transcript_sync_gate_for),
         tailer,
         watched_config_dirs: crate::terminal::transcript_watcher::watched_config_dirs(),
         session_tenant: Box::new(|nonce| {
@@ -1065,17 +1127,39 @@ pub(crate) async fn transcript_bind_core(
         },
     };
 
-    // 3. Gate 1 — the runner's transcript-sync toggle. Off writes nothing.
-    if !env.cloud_sync_enabled {
-        return bind_error(
-            StatusCode::CONFLICT,
-            "sync_disabled",
-            Some(
-                "transcript sync is off on this runner (Settings.cloud_sync_enabled = false); \
-                 nothing was bound or written"
-                    .to_string(),
-            ),
-        );
+    // 3. Transcript sync's gate — the tenant's `egress_transcript_sync` switch
+    // and the user's own toggle — asked in the caller's tenant, which the
+    // nonce resolves here. A nonce that resolves to no tenant (`Ok(None)`)
+    // writes under the device default, so the default scope is the right one
+    // to ask. A resolution that FAILS also lands on the default scope here,
+    // which says nothing about the caller's tenant — harmless only because
+    // step 4 then refuses (`tenant_unresolvable`) before anything is bound or
+    // written. Closed writes nothing.
+    let tenant_hint = (env.session_tenant)(&nonce).ok().flatten();
+    match (env.transcript_gate)(tenant_hint) {
+        crate::egress::TranscriptGate::Open => {}
+        crate::egress::TranscriptGate::UserConsentOff => {
+            return bind_error(
+                StatusCode::CONFLICT,
+                "sync_disabled",
+                Some(
+                    "transcript sync is off on this runner (the user's AI content sync toggle \
+                     is off); nothing was bound or written"
+                        .to_string(),
+                ),
+            );
+        }
+        crate::egress::TranscriptGate::TenantSwitchOff => {
+            let mut body = serde_json::json!({
+                "error": "egress_off",
+                "flow": crate::egress::Flow::TranscriptSync.key(),
+                "domain": crate::egress::Flow::TranscriptSync.domain(),
+                "detail": "transcript sync is off for this project \
+                     (egress_transcript_sync); nothing was bound or written",
+            });
+            body["tenant_id"] = serde_json::json!(tenant_hint);
+            return (StatusCode::CONFLICT, body);
+        }
     }
     let Some(tailer) = env.tailer else {
         return bind_error(
@@ -1088,7 +1172,11 @@ pub(crate) async fn transcript_bind_core(
         );
     };
 
-    // 4. The caller's tenant.
+    // 4. The caller's tenant. Establish the session's repo expectation FIRST
+    // (row 1d decides from what the binding has already established): without
+    // this the bind could stamp the machine tenant on a session whose coord
+    // calls go to its repo's tenant.
+    crate::coord_mcp::establish_session_expectation(&nonce).await;
     let tenant = match (env.session_tenant)(&nonce) {
         Ok(t) => t,
         Err(refusal) => {
@@ -1175,13 +1263,17 @@ pub(crate) async fn transcript_bind_core(
     };
 
     // 8. Bind + replay — file I/O and fsyncs, off the async runtime.
-    let sync_enabled = env.cloud_sync_enabled;
     let joined = spawn_blocking_tracked(move || {
         tailer.bind_and_replay(
             &session_key,
             &path,
-            BindRequest { adopt, tenant },
-            sync_enabled,
+            BindRequest {
+                adopt,
+                tenant,
+                ..BindRequest::default()
+            },
+            // Step 3 returned on every closed gate arm, so it is open here.
+            true,
         )
     })
     .await;
@@ -1551,12 +1643,294 @@ async fn compliance_coverage() -> Json<crate::mcp::session_compliance::CoverageB
 }
 
 // =============================================================================
+// /sessions/transcript-coverage
+// =============================================================================
+
+/// `GET /sessions/transcript-coverage` — the interactive transcript tailer's
+/// [`CoverageReport`](crate::session::session_transcript_tailer::CoverageReport):
+/// how many panes it reaches, which ids it is dropping for want of a coord
+/// binding (the ones `POST /sessions/transcript-bind` exists to fix), and the
+/// `transcript_holes` / `held_batches` counts that make a lost or deferred
+/// range visible. Until now the report reached only the periodic log line.
+///
+/// - `200` — the report. Every counter is since this runner process started.
+/// - `503 {"error":"tailer_unavailable"}` — this runner booted without its
+///   session outbox, so it has no tailer and NO coverage answer: UNKNOWN, not
+///   zero.
+async fn transcript_coverage(
+    State(state): State<Arc<ApiState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let tailer = state
+        .app_handle
+        .try_state::<Arc<crate::session::session_transcript_tailer::SessionTranscriptTailer>>()
+        .map(|s| s.inner().clone());
+    let (status, body) = transcript_coverage_body(tailer.as_deref());
+    (status, Json(body))
+}
+
+/// The route's answer for an optional tailer, split out so it is testable
+/// without a Tauri app.
+fn transcript_coverage_body(
+    tailer: Option<&crate::session::session_transcript_tailer::SessionTranscriptTailer>,
+) -> (StatusCode, serde_json::Value) {
+    match tailer {
+        Some(t) => match serde_json::to_value(t.coverage()) {
+            Ok(v) => (StatusCode::OK, v),
+            Err(e) => bind_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "coverage_unserializable",
+                Some(e.to_string()),
+            ),
+        },
+        None => bind_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tailer_unavailable",
+            Some(
+                "this runner booted without its session outbox, so it has no transcript \
+                 tailer and no coverage to report (UNKNOWN, not zero)"
+                    .to_string(),
+            ),
+        ),
+    }
+}
+
+// =============================================================================
 // Routes
 // =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =========================================================================
+    // POST /sessions/{id}/finish — the response contract
+    //
+    // Plan `2026-09-20-the-one-finish-door-that-names-its-target-in-the-path-
+    // is-disowned-by-both-closeout-commands` Phase 1.
+    // =========================================================================
+
+    use crate::claude_session::coord_register::AiCoordRegistrar;
+    use crate::session::session_lifecycle_store::{self as lifecycle, SessionLifecycleStore};
+
+    /// A store wired the way main.rs wires it: the finish observer forwards to
+    /// a real registrar, whose terminal-plane lookup answers `terminal_coord`
+    /// for every id (or nothing).
+    fn finish_fixture(
+        terminal_coord: Option<uuid::Uuid>,
+    ) -> (
+        Arc<SessionLifecycleStore>,
+        AiCoordRegistrar,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(
+            crate::session::local_store::OutboxWriter::open(dir.path().join("outbox.jsonl"))
+                .unwrap(),
+        );
+        let reg = AiCoordRegistrar::with_tenant_resolver(outbox, uuid::Uuid::new_v4(), || None);
+        reg.attach_terminal_coord_lookup(move |_| terminal_coord);
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        {
+            let reg = reg.clone();
+            store.attach_finish_observer(move |rec| reg.forward_finish_change(rec));
+        }
+        store.record_open(lifecycle::test_open_record("s"));
+        (store, reg, dir)
+    }
+
+    /// An unreadable registry is a 500 that says "unknown", never the 404
+    /// an unknown id gets.
+    #[test]
+    fn finish_error_response_maps_unavailable_to_500_and_unknown_to_404() {
+        use crate::session::session_lifecycle_store::SetFinishedError;
+        let (status, msg) = finish_error_response("s", SetFinishedError::Unavailable);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(msg.contains("unknown"), "{msg}");
+        let (status, msg) = finish_error_response("s", SetFinishedError::UnknownSession);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(msg.contains("`s`"), "{msg}");
+    }
+
+    fn finish_req(reason: Option<&str>) -> FinishSessionRequest {
+        FinishSessionRequest {
+            reason: reason.map(str::to_string),
+            finished: None,
+        }
+    }
+
+    #[test]
+    fn finish_response_names_a_local_only_mark() {
+        let (store, _reg, _dir) = finish_fixture(None);
+
+        let body = apply_finish(&store, "s", finish_req(None)).expect("a known id is 200");
+        assert_eq!(body["success"], true);
+        assert_eq!(body["changed"], "marker");
+        assert_eq!(
+            body["coord"]["queued"], false,
+            "no plane knows a coord row — coord was NOT told: {body}"
+        );
+        assert_eq!(body["coord"]["reason"], "no_coord_session");
+        assert!(body["coord"]["coordSessionId"].is_null());
+        assert!(
+            body["session"]["finishedAt"].is_i64(),
+            "the local mark landed"
+        );
+        assert_eq!(body["session"]["finishSynced"], false);
+    }
+
+    #[test]
+    fn a_terminal_plane_finish_reports_the_coord_row_it_queued_for() {
+        let coord_id = uuid::Uuid::new_v4();
+        let (store, _reg, _dir) = finish_fixture(Some(coord_id));
+
+        let body = apply_finish(&store, "s", finish_req(Some("done"))).unwrap();
+        assert_eq!(body["changed"], "marker");
+        assert_eq!(body["coord"]["queued"], true);
+        assert_eq!(body["coord"]["coordSessionId"], coord_id.to_string());
+        assert!(body["coord"]["reason"].is_null());
+    }
+
+    #[test]
+    fn re_finishing_is_200_changed_none_not_404() {
+        let (store, _reg, _dir) = finish_fixture(None);
+        apply_finish(&store, "s", finish_req(None)).unwrap();
+
+        let again = apply_finish(&store, "s", finish_req(None))
+            .expect("a re-run on a known id is 200, not 404");
+        assert_eq!(again["changed"], "none", "nothing was written: {again}");
+        assert_eq!(again["coord"]["queued"], false);
+        assert_eq!(
+            again["coord"]["reason"], "no_coord_session",
+            "the unsynced mark's owed write was re-offered, and still no coord row \
+             resolves: {again}"
+        );
+        assert_eq!(
+            again["session"]["finishSynced"], false,
+            "the re-run reads the CURRENT sync verdict"
+        );
+
+        let unmark = FinishSessionRequest {
+            reason: None,
+            finished: Some(false),
+        };
+        assert_eq!(
+            apply_finish(&store, "s", unmark).unwrap()["changed"],
+            "marker"
+        );
+        let unmark_again = FinishSessionRequest {
+            reason: None,
+            finished: Some(false),
+        };
+        let again = apply_finish(&store, "s", unmark_again).unwrap();
+        assert_eq!(again["changed"], "none");
+        assert_eq!(
+            again["coord"]["reason"], "not_requeued",
+            "a no-op unmark owes coord nothing: {again}"
+        );
+
+        let (status, _) = apply_finish(&store, "ghost", finish_req(None))
+            .expect_err("an unknown id is still an error");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// The retry door: a no-op re-finish on a mark coord has NOT ACKed
+    /// re-offers the owed write instead of reporting `not_requeued` forever.
+    /// A mark that went local-only (no coord row yet) is pushed once a row
+    /// resolves, by re-running the same call.
+    #[test]
+    fn re_finishing_an_unsynced_mark_retries_the_coord_write() {
+        let coord_id = uuid::Uuid::new_v4();
+        let resolves = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(
+            crate::session::local_store::OutboxWriter::open(dir.path().join("outbox.jsonl"))
+                .unwrap(),
+        );
+        let reg = AiCoordRegistrar::with_tenant_resolver(outbox, uuid::Uuid::new_v4(), || None);
+        {
+            let resolves = resolves.clone();
+            reg.attach_terminal_coord_lookup(move |_| {
+                resolves
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .then_some(coord_id)
+            });
+        }
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        {
+            let reg = reg.clone();
+            store.attach_finish_observer(move |rec| reg.forward_finish_change(rec));
+        }
+        store.record_open(lifecycle::test_open_record("s"));
+
+        let first = apply_finish(&store, "s", finish_req(None)).unwrap();
+        assert_eq!(first["coord"]["queued"], false, "no coord row yet: {first}");
+
+        resolves.store(true, std::sync::atomic::Ordering::SeqCst);
+        let again = apply_finish(&store, "s", finish_req(None)).unwrap();
+        assert_eq!(
+            again["changed"], "none",
+            "nothing local was written: {again}"
+        );
+        assert_eq!(
+            again["coord"]["queued"], true,
+            "the owed write is retried on a no-op re-run of an UNSYNCED mark: {again}"
+        );
+        assert_eq!(again["coord"]["coordSessionId"], coord_id.to_string());
+        assert_eq!(
+            again["session"]["finishedAt"], first["session"]["finishedAt"],
+            "the retry does not restamp the mark"
+        );
+    }
+
+    /// A revived session finished AGAIN (a re-finish carrying a reason, on a
+    /// mark coord already ACKed) restamps and re-sends; the protocol's
+    /// reason-less read-back then still observes the new mark's own ACK.
+    #[test]
+    fn re_finishing_with_a_reason_on_a_synced_mark_restamps_and_re_sends() {
+        let coord_id = uuid::Uuid::new_v4();
+        let (store, _reg, _dir) = finish_fixture(Some(coord_id));
+        let first = apply_finish(&store, "s", finish_req(Some("first"))).unwrap();
+        assert_eq!(first["coord"]["queued"], true);
+        let first_at = first["session"]["finishedAt"].as_i64().unwrap();
+        store.mark_finish_synced("s", Some(first_at));
+
+        let again = apply_finish(&store, "s", finish_req(Some("second"))).unwrap();
+        assert_eq!(
+            again["changed"], "marker",
+            "the mark was rewritten: {again}"
+        );
+        assert_eq!(again["session"]["finishReason"], "second");
+        let again_at = again["session"]["finishedAt"].as_i64().unwrap();
+        assert_ne!(again_at, first_at, "restamped");
+        assert_eq!(
+            again["coord"]["queued"], true,
+            "the restamped finish is re-sent to coord: {again}"
+        );
+        assert_eq!(again["coord"]["coordSessionId"], coord_id.to_string());
+        assert_eq!(again["session"]["finishSynced"], false);
+
+        // The read-back (no reason): reads, re-offers the owed write, and does
+        // NOT restamp — so it can observe the new mark's ACK.
+        let read = apply_finish(&store, "s", finish_req(None)).unwrap();
+        assert_eq!(read["changed"], "none");
+        assert_eq!(read["session"]["finishedAt"], again_at);
+        assert_eq!(read["coord"]["queued"], true);
+        store.mark_finish_synced("s", Some(first_at)); // the OLD row's late ACK
+        assert_eq!(
+            apply_finish(&store, "s", finish_req(None)).unwrap()["session"]["finishSynced"],
+            false,
+            "a stale ACK does not sync the restamped mark"
+        );
+        store.mark_finish_synced("s", Some(again_at));
+        let read = apply_finish(&store, "s", finish_req(None)).unwrap();
+        assert_eq!(read["session"]["finishSynced"], true, "{read}");
+        assert_eq!(read["coord"]["reason"], "not_requeued");
+        assert_eq!(read["session"]["finishedAt"], again_at);
+    }
 
     const GENERIC: &str = "You are an AI assistant in a session initiated from the Coordinator.";
 
@@ -1593,6 +1967,38 @@ mod tests {
                 Arc::new(SessionTranscriptTailer::new(emitter, registrar)),
                 outbox,
             )
+        }
+
+        /// `GET /sessions/transcript-coverage`: no tailer is UNKNOWN (503),
+        /// never a zero report; a tailer serves its report with the hole and
+        /// held-batch counters a client reads.
+        #[test]
+        fn coverage_route_is_unknown_without_a_tailer_and_serves_the_report() {
+            let (status, body) = transcript_coverage_body(None);
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body["error"], "tailer_unavailable");
+            assert!(body.get("appends_emitted").is_none());
+
+            let dir = tempfile::tempdir().unwrap();
+            let (t, _outbox) = tailer(dir.path());
+            let (status, body) = transcript_coverage_body(Some(&t));
+            assert_eq!(status, StatusCode::OK);
+            for key in [
+                "transcript_sync_permitted",
+                "sessions_tailed",
+                "sessions_unbound",
+                "unbound_session_ids",
+                "appends_emitted",
+                "transcript_holes",
+                "held_batches",
+            ] {
+                assert!(body.get(key).is_some(), "missing {key}: {body}");
+            }
+            assert_eq!(body["transcript_holes"], 0);
+            assert!(
+                body["transcript_sync_permitted"].is_null(),
+                "no append observed yet"
+            );
         }
 
         /// A registered nonce and the workdir it is bound to, via the one
@@ -1648,7 +2054,7 @@ mod tests {
             confirm: bool,
         ) -> TranscriptBindEnv {
             TranscriptBindEnv {
-                cloud_sync_enabled: true,
+                transcript_gate: Box::new(|_| crate::egress::TranscriptGate::Open),
                 tailer: t,
                 watched_config_dirs: cfg,
                 session_tenant: Box::new(|_| Ok(None)),
@@ -1790,10 +2196,36 @@ mod tests {
             let csid = uuid::Uuid::new_v4().to_string();
             let cfg = config_with(dir.path(), &csid, &wd);
             let mut e = env(Some(t), vec![cfg], true);
-            e.cloud_sync_enabled = false;
+            e.transcript_gate = Box::new(|_| crate::egress::TranscriptGate::UserConsentOff);
             let (status, v) = transcript_bind_core(&bearer(&nonce), &body(&csid), e).await;
             assert_eq!(status, StatusCode::CONFLICT);
             assert_eq!(v["error"], "sync_disabled");
+            assert!(outbox.pending().unwrap().is_empty());
+        }
+
+        /// M1: the TENANT's switch off answers 409 `egress_off`, asks the gate
+        /// in the caller's tenant scope, and writes nothing.
+        #[tokio::test]
+        async fn tenant_switch_off_is_egress_off_and_writes_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            let (t, outbox) = tailer(dir.path());
+            let (nonce, wd) = registered_nonce();
+            let csid = uuid::Uuid::new_v4().to_string();
+            let cfg = config_with(dir.path(), &csid, &wd);
+            let tenant = uuid::Uuid::from_u128(0x7e);
+            let asked = Arc::new(std::sync::Mutex::new(None));
+            let seen = asked.clone();
+            let mut e = env(Some(t), vec![cfg], true);
+            e.session_tenant = Box::new(move |_| Ok(Some(tenant)));
+            e.transcript_gate = Box::new(move |t| {
+                *seen.lock().unwrap() = Some(t);
+                crate::egress::TranscriptGate::TenantSwitchOff
+            });
+            let (status, v) = transcript_bind_core(&bearer(&nonce), &body(&csid), e).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(v["error"], "egress_off");
+            assert_eq!(v["flow"], "transcript_sync");
+            assert_eq!(*asked.lock().unwrap(), Some(Some(tenant)));
             assert!(outbox.pending().unwrap().is_empty());
         }
 
@@ -2134,4 +2566,6 @@ pub fn routes() -> Router<Arc<ApiState>> {
         // credential door (`origin_guard::CREDENTIAL_DOORS`) that authorizes
         // on the coord-mcp proxy nonce — see `transcript_bind`.
         .route("/sessions/transcript-bind", post(transcript_bind))
+        // The tailer's coverage report — the read side of transcript-bind.
+        .route("/sessions/transcript-coverage", get(transcript_coverage))
 }

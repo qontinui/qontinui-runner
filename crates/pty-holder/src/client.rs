@@ -20,6 +20,15 @@
 //! runtime). A pane whose probe has not reported by the deadline is counted as
 //! `Unknown`, never dropped (D9: an unanswered holder is counted, as unknown).
 //!
+//! [`Client::attach`] (protocol version 2) turns a connection into the pane's
+//! data path, split in two so one thread can read while another writes:
+//! [`StreamReader::next_event`] yields output (with its absolute offset), loss
+//! reports, replies and the final exit; [`StreamWriter`] sends resize,
+//! pause/resume, kill and detach. Input goes on a SECOND connection,
+//! [`Client::open_input`] → [`InputStream`], so input the child is slow to read
+//! never queues the attached connection's control verbs. Its requests are fire-and-forget on the
+//! writer side; their `ok` replies arrive on the reader as [`Event::Reply`].
+//!
 //! DATA-PATH module: `source_guard` bans text decoding here.
 
 use std::io;
@@ -27,11 +36,15 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use crate::frame::{read_frame, write_frame, Frame, KIND_CONTROL};
+use crate::frame::{
+    parse_output, parse_synthetic, read_frame, write_frame, Frame, SyntheticPart, KIND_CONTROL,
+    KIND_DATA, KIND_OUTPUT, KIND_SYNTHETIC,
+};
 use crate::lock::{read_record, LockRecord, PaneLock, TryLock};
 use crate::pane::{check_private_dir, lock_path, PaneId};
 use crate::protocol::{
-    parse_reply, to_payload, CensusReply, HelloAck, Reply, Request, PROTOCOL_VERSIONS,
+    parse_reply, to_payload, AttachedReply, CensusReply, ExitReply, HelloAck, RejectReason, Reply,
+    Request, DATA_PATH_VERSION, PROTOCOL_VERSIONS, RESTORE_VERSION,
 };
 use crate::transport::{self, remaining, Conn, DeadlineIo};
 
@@ -40,10 +53,20 @@ use crate::transport::{self, remaining, Conn, DeadlineIo};
 pub enum ConnectError {
     /// The holder answered, and speaks none of our versions. It is alive.
     Incompatible { holder_versions: Vec<u32> },
+    /// The handshake succeeded, but at a version below the data path
+    /// ([`DATA_PATH_VERSION`]): the holder is live and cannot be attached to.
+    NoDataPath { version: u32 },
     /// The holder answered something that is not a handshake reply.
     Protocol(String),
     /// Connect, write, read or deadline failure.
     Io(io::Error),
+    /// The holder refused the request (`rejected`, which also closes the
+    /// connection). Whether that is final is the reason's to say
+    /// ([`ConnectError::is_definitive`]).
+    Rejected {
+        reason: RejectReason,
+        detail: String,
+    },
     /// An earlier call on this [`Client`] failed, so the stream's position is
     /// unknown (a reply may be half-read, a request half-written). Nothing
     /// more is sent or read on it; the string is the failure that poisoned it.
@@ -59,7 +82,14 @@ impl std::fmt::Display for ConnectError {
                     "no common protocol version; holder speaks {holder_versions:?}"
                 )
             }
+            ConnectError::NoDataPath { version } => write!(
+                f,
+                "holder negotiated version {version}; the data path needs {DATA_PATH_VERSION}"
+            ),
             ConnectError::Protocol(m) => write!(f, "protocol error: {m}"),
+            ConnectError::Rejected { reason, detail } => {
+                write!(f, "holder rejected the request ({reason:?}: {detail})")
+            }
             ConnectError::Io(e) => write!(f, "{e}"),
             ConnectError::Poisoned(why) => write!(
                 f,
@@ -70,6 +100,69 @@ impl std::fmt::Display for ConnectError {
 }
 
 impl std::error::Error for ConnectError {}
+
+/// What a caller that wants to ADOPT a live holder should do after an attach
+/// failed ([`ConnectError::disposition`]; review round 4, H1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureDisposition {
+    /// The holder can never be driven by this runner, and that is FINAL: it
+    /// answered `no_common_version`, refused our peer identity
+    /// (`peer_not_authorized`), or refused a verb its own negotiated version
+    /// lacks (`verb_not_in_version`, which can only follow a successful
+    /// handshake). The only failures that may end a live session.
+    End,
+    /// A live holder this runner cannot drive the data path of — it
+    /// negotiated a version below [`DATA_PATH_VERSION`]. Exactly like a
+    /// census `Incompatible` (plan D15): not adopted, NOT touched.
+    LeaveAlone,
+    /// Anything a retry may clear, or that says nothing final about the
+    /// holder: IO errors and timeouts, a busy holder, a garbled reply, a
+    /// reason this build does not know (a newer holder's), and a rejection of
+    /// a MALFORMED request — the last a bug in this runner, never a reason to
+    /// end the user's session ([`ConnectError::is_runner_bug`]).
+    Retry,
+}
+
+impl ConnectError {
+    /// See [`FailureDisposition`].
+    pub fn disposition(&self) -> FailureDisposition {
+        match self {
+            // Corner, kept on purpose: the census filters `no_common_version`
+            // holders out (left alone, D15), so this only meets one whose
+            // answer CHANGED between the census and the attach.
+            ConnectError::Incompatible { .. } => FailureDisposition::End,
+            ConnectError::NoDataPath { .. } => FailureDisposition::LeaveAlone,
+            ConnectError::Rejected { reason, .. } => match reason {
+                RejectReason::PeerNotAuthorized | RejectReason::VerbNotInVersion => {
+                    FailureDisposition::End
+                }
+                _ => FailureDisposition::Retry,
+            },
+            ConnectError::Protocol(_) | ConnectError::Io(_) | ConnectError::Poisoned(_) => {
+                FailureDisposition::Retry
+            }
+        }
+    }
+
+    /// The holder rejected a request THIS runner malformed or sent out of
+    /// order: a runner bug, to be logged loudly — and still only retried.
+    pub fn is_runner_bug(&self) -> bool {
+        matches!(
+            self,
+            ConnectError::Rejected {
+                reason: RejectReason::Malformed
+                    | RejectReason::HandshakeRequired
+                    | RejectReason::DuplicateHello
+                    | RejectReason::UnexpectedDataFrame
+                    | RejectReason::NotAttached
+                    | RejectReason::AlreadyAttached
+                    | RejectReason::UnknownVerb
+                    | RejectReason::UnknownFrameKind,
+                ..
+            }
+        )
+    }
+}
 
 impl From<io::Error> for ConnectError {
     fn from(e: io::Error) -> Self {
@@ -252,6 +345,37 @@ impl Client {
         }
     }
 
+    /// `prepare_upgrade` (plan Phase 8, a FROZEN envelope verb, so it works
+    /// on a holder that speaks none of this runner's data-path versions):
+    /// hand the pane to a successor holder started from the holder's own
+    /// executable path. Waits for the whole exchange. Its worst case is the
+    /// sum of the holder's bounds — input freeze 2 s, quiesce 2 s, ack 15 s,
+    /// input drain 2 s, commit write 15 s, `serving` 5 s: about 41 s — so give
+    /// `deadline` at least 45 s. A client that gives up first gets an error
+    /// for an upgrade whose outcome is UNKNOWN: it may have committed or been
+    /// rolled back; probe the pane (`hello_ack.holder_pid`) to learn which.
+    ///
+    /// After [`UpgradeOutcome::Upgraded`] this connection is dead (the old
+    /// holder exits) and every other connection to the pane drops; a client
+    /// reattaches at its own last offset and finds the successor. After
+    /// `Failed`/`Unsupported` the old holder still serves, untouched.
+    pub fn prepare_upgrade(&mut self, deadline: Instant) -> Result<UpgradeOutcome, ConnectError> {
+        match self.request(&Request::PrepareUpgrade, deadline)? {
+            Reply::Upgraded {
+                successor_pid,
+                handoff_offset,
+            } => Ok(UpgradeOutcome::Upgraded {
+                successor_pid,
+                handoff_offset,
+            }),
+            Reply::UpgradeFailed { reason } => Ok(UpgradeOutcome::Failed(reason)),
+            Reply::Unsupported { reason, .. } => Ok(UpgradeOutcome::Unsupported(reason)),
+            other => self.poison_on_err(Err(ConnectError::Protocol(format!(
+                "expected upgraded / upgrade_failed / unsupported, got {other:?}"
+            )))),
+        }
+    }
+
     /// Send a raw frame. For tests of the holder's refusal paths; a runner
     /// sends typed requests. Poisons on failure, like [`Client::request`].
     pub fn send_raw_frame(
@@ -276,6 +400,332 @@ impl Client {
         let r =
             read_frame(&mut DeadlineIo::new(&mut self.conn, deadline)).map_err(ConnectError::from);
         self.poison_on_err(r)
+    }
+}
+
+impl Client {
+    /// Attach to the pane's output (protocol version 2): send `attach`, read
+    /// `attached`, and split the connection into a reader and a writer.
+    ///
+    /// `from_offset: None` is a fresh consumer (the ring's last
+    /// `ATTACH_TAIL_BYTES`); `Some(n)` resumes at the first byte the caller has
+    /// not seen. Consumes the client: the connection now belongs to the stream.
+    ///
+    /// No restore envelope: for a consumer that keeps its own mode state
+    /// across the reattach (a dropped connection, a resume after a detach in
+    /// the same process). A consumer starting from nothing uses
+    /// [`Client::attach_restoring`].
+    pub fn attach(
+        self,
+        from_offset: Option<u64>,
+        deadline: Instant,
+    ) -> Result<AttachedStream, ConnectError> {
+        self.attach_with(from_offset, false, deadline)
+    }
+
+    /// [`Client::attach`] for a consumer with NO mode state of its own — a
+    /// restarted runner's fresh `Grid` and xterm (plan D14). At protocol
+    /// version 3 the holder answers with `restore` metadata
+    /// ([`AttachedStream::info`]`.restore`) and brackets the tail with
+    /// [`Event::Synthetic`] preamble/postamble frames. A holder that
+    /// negotiated less is not asked (it could not answer); then
+    /// `info.restore` is `None` and no synthetic frame arrives — which is how
+    /// the caller learns the restore was unavailable.
+    pub fn attach_restoring(
+        self,
+        from_offset: Option<u64>,
+        deadline: Instant,
+    ) -> Result<AttachedStream, ConnectError> {
+        let restore = self.ack.version >= RESTORE_VERSION;
+        self.attach_with(from_offset, restore, deadline)
+    }
+
+    fn attach_with(
+        mut self,
+        from_offset: Option<u64>,
+        restore: bool,
+        deadline: Instant,
+    ) -> Result<AttachedStream, ConnectError> {
+        self.check()?;
+        if self.ack.version < DATA_PATH_VERSION {
+            // The holder answered, and cannot serve the data path this runner
+            // drives: leave it alone, as a census Incompatible.
+            return Err(ConnectError::NoDataPath {
+                version: self.ack.version,
+            });
+        }
+        let request = Request::Attach {
+            from_offset,
+            restore,
+        };
+        let info = match self.request(&request, deadline)? {
+            Reply::Attached(a) => a,
+            Reply::Rejected { reason, detail } => {
+                return Err(ConnectError::Rejected { reason, detail })
+            }
+            other => {
+                return Err(ConnectError::Protocol(format!(
+                    "expected attached, got {other:?}"
+                )))
+            }
+        };
+        let writer = self.conn.try_clone()?;
+        Ok(AttachedStream {
+            info,
+            hello_ack: self.ack,
+            reader: StreamReader {
+                conn: self.conn,
+                restoring: restore,
+            },
+            writer: StreamWriter { conn: writer },
+        })
+    }
+}
+
+/// How a `prepare_upgrade` ended ([`Client::prepare_upgrade`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpgradeOutcome {
+    /// `successor_pid` serves the pane now, from stream offset
+    /// `handoff_offset`; same child, same offsets.
+    Upgraded {
+        successor_pid: u32,
+        handoff_offset: u64,
+    },
+    /// Rolled back: the old holder keeps serving; nothing was lost.
+    Failed(String),
+    /// This holder cannot be upgraded in place — a Windows holder (plan D12:
+    /// leave it running, or end and resume it) or one built before Phase 8.
+    Unsupported(String),
+}
+
+/// An attached connection, split. Drop both halves to close it (the child
+/// keeps running; [`StreamWriter::detach`] says so explicitly first).
+#[derive(Debug)]
+pub struct AttachedStream {
+    /// Where the stream begins; see `protocol::AttachedReply`.
+    pub info: AttachedReply,
+    pub hello_ack: HelloAck,
+    pub reader: StreamReader,
+    pub writer: StreamWriter,
+}
+
+/// One thing the holder sent on an attached connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    /// Pane output: `bytes` begin at absolute stream offset `offset`.
+    Output { offset: u64, bytes: Vec<u8> },
+    /// `[from_offset, to_offset)` left the holder's ring before it reached
+    /// this connection. The stream continues at `to_offset`.
+    Lost { from_offset: u64, to_offset: u64 },
+    /// The child exited; the last frame of the stream.
+    Exit(ExitReply),
+    /// Bytes the HOLDER synthesized for a restoring attach (protocol version
+    /// 3): display them where `anchor` says, but never count them as stream
+    /// bytes — they advance no offset (plan D14). A preamble precedes every
+    /// output event; a postamble arrives exactly when the stream reaches its
+    /// anchor.
+    Synthetic {
+        part: SyntheticPart,
+        anchor: u64,
+        bytes: Vec<u8>,
+    },
+    /// Any other reply — `ok {verb}` to a writer-side request, `pong`,
+    /// `census_reply`, or a `rejected` (after which the holder closes).
+    Reply(Reply),
+}
+
+/// The reading half of an attached connection.
+#[derive(Debug)]
+pub struct StreamReader {
+    conn: Conn,
+    /// This connection asked for the restore envelope. A synthetic frame on
+    /// one that did not is a protocol error, never displayed: those bytes
+    /// would land in a consumer whose own mode state is already right.
+    restoring: bool,
+}
+
+impl StreamReader {
+    /// The next event, or `None` at a clean end of stream (the holder closed
+    /// the connection — after an `exit`, or because it dropped a client that
+    /// stopped reading). `deadline: None` waits indefinitely.
+    ///
+    /// Any error leaves the stream position unknown: drop the stream and
+    /// reattach at the last offset seen.
+    pub fn next_event(&mut self, deadline: Option<Instant>) -> Result<Option<Event>, ConnectError> {
+        let frame = match deadline {
+            Some(d) => read_frame(&mut DeadlineIo::new(&mut self.conn, d))?,
+            None => {
+                self.conn.set_read_timeout(None)?;
+                read_frame(&mut self.conn)?
+            }
+        };
+        let Some(frame) = frame else {
+            return Ok(None);
+        };
+        match frame.kind {
+            KIND_OUTPUT => {
+                let (offset, bytes) = parse_output(&frame.payload).ok_or_else(|| {
+                    ConnectError::Protocol("output frame shorter than its offset header".into())
+                })?;
+                Ok(Some(Event::Output {
+                    offset,
+                    bytes: bytes.to_vec(),
+                }))
+            }
+            KIND_SYNTHETIC if !self.restoring => Err(ConnectError::Protocol(
+                "a synthetic frame on a connection that did not ask for a restore".into(),
+            )),
+            KIND_SYNTHETIC => {
+                let (part, anchor, bytes) = parse_synthetic(&frame.payload)
+                    .ok_or_else(|| ConnectError::Protocol("malformed synthetic frame".into()))?;
+                Ok(Some(Event::Synthetic {
+                    part,
+                    anchor,
+                    bytes: bytes.to_vec(),
+                }))
+            }
+            KIND_CONTROL => {
+                let reply = parse_reply(&frame.payload)
+                    .map_err(|e| ConnectError::Protocol(e.to_string()))?;
+                Ok(Some(match reply {
+                    Reply::OutputLost {
+                        from_offset,
+                        to_offset,
+                    } => Event::Lost {
+                        from_offset,
+                        to_offset,
+                    },
+                    Reply::Exit(e) => Event::Exit(e),
+                    other => Event::Reply(other),
+                }))
+            }
+            other => Err(ConnectError::Protocol(format!(
+                "unexpected frame kind 0x{other:02x} on an attached connection"
+            ))),
+        }
+    }
+}
+
+/// The writing half of an attached connection. Every call is bounded by its
+/// `deadline`; a failed call leaves the stream unusable (reattach).
+#[derive(Debug)]
+pub struct StreamWriter {
+    conn: Conn,
+}
+
+impl StreamWriter {
+    /// Send a request; its reply arrives on the [`StreamReader`].
+    pub fn request(&mut self, req: &Request, deadline: Instant) -> Result<(), ConnectError> {
+        send(&mut self.conn, req, deadline)?;
+        Ok(())
+    }
+
+    pub fn resize(&mut self, cols: u16, rows: u16, deadline: Instant) -> Result<(), ConnectError> {
+        self.request(&Request::Resize { cols, rows }, deadline)
+    }
+
+    pub fn pause(&mut self, deadline: Instant) -> Result<(), ConnectError> {
+        self.request(&Request::Pause, deadline)
+    }
+
+    pub fn resume(&mut self, deadline: Instant) -> Result<(), ConnectError> {
+        self.request(&Request::Resume, deadline)
+    }
+
+    pub fn kill(&mut self, deadline: Instant) -> Result<(), ConnectError> {
+        self.request(&Request::Kill, deadline)
+    }
+
+    /// Leave without ending the child. The holder answers `ok` and closes.
+    pub fn detach(&mut self, deadline: Instant) -> Result<(), ConnectError> {
+        self.request(&Request::Detach, deadline)
+    }
+
+    /// A second handle on this connection that can end it while a writer or
+    /// reader on it is blocked. Ending the connection is itself a detach: the
+    /// holder keeps the child. See [`ShutdownHandle::shutdown`] for what that
+    /// takes on each platform.
+    pub fn shutdown_handle(&self) -> io::Result<ShutdownHandle> {
+        Ok(ShutdownHandle {
+            conn: self.conn.try_clone()?,
+        })
+    }
+}
+
+/// See [`StreamWriter::shutdown_handle`] / [`InputStream::shutdown_handle`].
+#[derive(Debug)]
+pub struct ShutdownHandle {
+    conn: Conn,
+}
+
+impl ShutdownHandle {
+    /// Unblock every handle on this connection, and end it.
+    ///
+    /// - **Unix:** `shutdown(SHUT_RDWR)` on the socket — every handle on it
+    ///   sees EOF / `EPIPE` at once and the holder reads EOF.
+    /// - **Windows:** `Conn::shutdown` marks the connection's shared shut
+    ///   flag — so every later read on the reader or writer returns EOF and
+    ///   every later write fails, as after `SHUT_RDWR` — and then cancels the
+    ///   I/O pending on the pipe's file object, so blocked calls return. A
+    ///   client cannot disconnect a named pipe, though: the HOLDER sees the
+    ///   connection end only once every handle (reader, writer and this one)
+    ///   has been DROPPED; the caller must drop them. (Executed only on the
+    ///   Windows CI leg.)
+    ///
+    /// Consumes the handle so it cannot be the one that keeps a Windows pipe
+    /// alive.
+    pub fn shutdown(self) {
+        self.conn.shutdown();
+    }
+}
+
+impl Client {
+    /// Make this connection the pane's INPUT stream (protocol version 2): send
+    /// `open_input` and read `ok`. Consumes the client. Input never rides the
+    /// attached connection, so a child slow to read its stdin back-pressures
+    /// only this stream, never the attached one's control verbs.
+    pub fn open_input(mut self, deadline: Instant) -> Result<InputStream, ConnectError> {
+        self.check()?;
+        if self.ack.version < DATA_PATH_VERSION {
+            return Err(ConnectError::Protocol(format!(
+                "holder negotiated version {}; input needs {DATA_PATH_VERSION}",
+                self.ack.version
+            )));
+        }
+        match self.request(&Request::OpenInput, deadline)? {
+            Reply::Ok { verb } if verb == "open_input" => Ok(InputStream { conn: self.conn }),
+            other => Err(ConnectError::Protocol(format!(
+                "expected ok {{open_input}}, got {other:?}"
+            ))),
+        }
+    }
+}
+
+/// A pane's input stream. See [`Client::open_input`]. Drop it to close it; the
+/// child keeps running.
+#[derive(Debug)]
+pub struct InputStream {
+    conn: Conn,
+}
+
+impl InputStream {
+    /// Raw input bytes for the child. No reply. Bounded by `deadline`; waits
+    /// while the child is slow to read (the holder's input queue is full).
+    /// Any failure leaves the stream position unknown: drop it and reopen.
+    pub fn input(&mut self, bytes: &[u8], deadline: Instant) -> Result<(), ConnectError> {
+        write_frame(
+            &mut DeadlineIo::new(&mut self.conn, deadline),
+            KIND_DATA,
+            bytes,
+        )?;
+        Ok(())
+    }
+
+    /// See [`StreamWriter::shutdown_handle`].
+    pub fn shutdown_handle(&self) -> io::Result<ShutdownHandle> {
+        Ok(ShutdownHandle {
+            conn: self.conn.try_clone()?,
+        })
     }
 }
 
@@ -433,6 +883,24 @@ pub fn census_with_versions(
     skip: &[PaneId],
     versions: &[u32],
 ) -> io::Result<Vec<CensusEntry>> {
+    census_with_skip(pane_dir, timeout, || skip.to_vec(), versions)
+}
+
+/// [`census_with_versions`] with the skip list read LATE: `skip` is called
+/// once, AFTER the pane directory has been enumerated and before any pane is
+/// probed. A caller whose set of panes-being-spawned changes concurrently
+/// (the runner's in-flight terminal ids) reads it here, so a pane that began
+/// spawning before the walk saw its lock file is in the list the walk is
+/// filtered by — never probed, so never robbed of its lock. A pane that
+/// begins spawning after this read had no lock file when the directory was
+/// enumerated, so the walk cannot see it; the caller must account for it
+/// separately (the runner adds a row for every in-flight id afterwards).
+pub fn census_with_skip(
+    pane_dir: &Path,
+    timeout: Duration,
+    skip: impl FnOnce() -> Vec<PaneId>,
+    versions: &[u32],
+) -> io::Result<Vec<CensusEntry>> {
     let deadline = Instant::now() + timeout;
     match check_private_dir(pane_dir) {
         Ok(()) => {}
@@ -457,6 +925,7 @@ pub fn census_with_versions(
         };
         stems.push(stem);
     }
+    let skip = skip();
 
     let (tx, rx) = mpsc::channel::<CensusEntry>();
     let mut rows: Vec<CensusEntry> = Vec::new();
@@ -530,4 +999,94 @@ pub fn census_with_versions(
     }
     rows.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::synthetic_payload;
+
+    /// A reader over one end of a socketpair, and the other end to write to.
+    #[cfg(unix)]
+    fn reader_pair(restoring: bool) -> (StreamReader, std::os::unix::net::UnixStream) {
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        (
+            StreamReader {
+                conn: Conn::from_stream(ours),
+                restoring,
+            },
+            theirs,
+        )
+    }
+
+    /// Review round 4, H1: only a final answer ends a session. A v1-only
+    /// holder is left alone; an unknown (newer) reason and a malformed-request
+    /// rejection (a runner bug) are retried.
+    #[test]
+    fn pty_holder_boot_sweep_attach_failure_disposition() {
+        use FailureDisposition::*;
+        let rejected = |reason| ConnectError::Rejected {
+            reason,
+            detail: String::new(),
+        };
+        assert_eq!(
+            ConnectError::Incompatible {
+                holder_versions: vec![9]
+            }
+            .disposition(),
+            End
+        );
+        assert_eq!(rejected(RejectReason::PeerNotAuthorized).disposition(), End);
+        assert_eq!(rejected(RejectReason::VerbNotInVersion).disposition(), End);
+        assert_eq!(
+            ConnectError::NoDataPath { version: 1 }.disposition(),
+            LeaveAlone
+        );
+        assert_eq!(rejected(RejectReason::Unknown).disposition(), Retry);
+        assert_eq!(rejected(RejectReason::Busy).disposition(), Retry);
+        for bug in [
+            RejectReason::Malformed,
+            RejectReason::HandshakeRequired,
+            RejectReason::DuplicateHello,
+            RejectReason::UnexpectedDataFrame,
+            RejectReason::NotAttached,
+            RejectReason::AlreadyAttached,
+        ] {
+            let e = rejected(bug);
+            assert_eq!(e.disposition(), Retry, "{bug:?}");
+            assert!(e.is_runner_bug(), "{bug:?}");
+        }
+        assert!(!rejected(RejectReason::Busy).is_runner_bug());
+        assert_eq!(
+            ConnectError::Io(io::Error::from(io::ErrorKind::TimedOut)).disposition(),
+            Retry
+        );
+        assert_eq!(ConnectError::Protocol("x".into()).disposition(), Retry);
+        assert_eq!(ConnectError::Poisoned("x".into()).disposition(), Retry);
+    }
+
+    /// Nit from review: a synthetic frame is accepted only on a connection
+    /// that asked for the restore envelope — elsewhere it is a protocol error,
+    /// never bytes handed to a consumer whose state is already right.
+    #[cfg(unix)]
+    #[test]
+    fn pty_holder_attach_synthetic_frames_only_on_a_restoring_connection() {
+        let frame = synthetic_payload(SyntheticPart::Postamble, 7, b"\x1b[?2004h");
+        let soon = Some(Instant::now() + Duration::from_secs(5));
+
+        let (mut r, mut w) = reader_pair(false);
+        write_frame(&mut w, KIND_SYNTHETIC, &frame).unwrap();
+        assert!(matches!(r.next_event(soon), Err(ConnectError::Protocol(_))));
+
+        let (mut r, mut w) = reader_pair(true);
+        write_frame(&mut w, KIND_SYNTHETIC, &frame).unwrap();
+        assert_eq!(
+            r.next_event(soon).unwrap(),
+            Some(Event::Synthetic {
+                part: SyntheticPart::Postamble,
+                anchor: 7,
+                bytes: b"\x1b[?2004h".to_vec(),
+            })
+        );
+    }
 }

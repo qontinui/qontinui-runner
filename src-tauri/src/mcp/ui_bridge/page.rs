@@ -45,7 +45,27 @@ ipc_handler_post!(
     "set_viewport_constraints"
 );
 ipc_handler_get!(ui_bridge_page_get_routes_handler, "get_routes");
-ipc_handler_post!(ui_bridge_page_navigate_to_handler, "navigate_by_adapter");
+ipc_handler_post!(
+    ui_bridge_page_navigate_to_handler_dispatch,
+    "navigate_by_adapter"
+);
+
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/page/navigate-to` is a `navigation` edge (`push`, or `replace` when the request says so); the target route is never recorded.
+pub async fn ui_bridge_page_navigate_to_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::navigation(
+        "navigate_to",
+        crate::journey::cursor::push_or_replace(&body),
+    );
+    let result =
+        ui_bridge_page_navigate_to_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
 
 // ============================================================================
 // Request / response types
@@ -428,7 +448,26 @@ pub(crate) fn resolve_navigate_page(url: &str) -> Result<String, String> {
 // Navigate-and-wait
 // ============================================================================
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/navigate-and-wait` acts on ONE element (`elementId` +
+/// `action`), so it is an `element_action` on that element.
 pub async fn ui_bridge_navigate_and_wait_handler(
+    State(state): State<Arc<ApiState>>,
+    request: UiBridgeJson<NavigateAndWaitRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::element(
+        &request.0.element_id,
+        &request.0.action,
+        qontinui_types::journey::ChokePoint::ElementAction,
+    );
+    let result =
+        ui_bridge_navigate_and_wait_handler_dispatch(State(Arc::clone(&state)), request).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
+async fn ui_bridge_navigate_and_wait_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     UiBridgeJson(req): UiBridgeJson<NavigateAndWaitRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -541,6 +580,24 @@ pub async fn ui_bridge_navigate_and_wait_handler(
 // Page lifecycle (refresh, hard-refresh, close-request, navigate, back, forward)
 // ============================================================================
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/page/refresh` is a `navigation` edge: a reload is an `initial` load.
+pub async fn ui_bridge_page_refresh_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let result = ui_bridge_page_refresh_handler_dispatch(State(Arc::clone(&state))).await;
+    crate::journey::capture::record_control_result(
+        &state,
+        &result,
+        crate::journey::cursor::ActionSpec::navigation(
+            "refresh",
+            qontinui_types::journey::NavigationTriggerKind::Initial,
+        ),
+    );
+    result
+}
+
 /// Refresh the page — a DOCUMENTED NO-OP in the runner, now reported as one.
 ///
 /// This route used to answer a bare `200 {"success": true, "url": "…"}` for a
@@ -567,7 +624,7 @@ pub async fn ui_bridge_navigate_and_wait_handler(
 /// The honest reload door is the sibling `POST /control/page/hard-refresh`,
 /// which really does reload — it is named in the `message` so a caller that
 /// wanted a reload can get one instead of retrying this route forever.
-pub async fn ui_bridge_page_refresh_handler(
+async fn ui_bridge_page_refresh_handler_dispatch(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Page refresh (no-op in the runner — reporting reloaded:false)");
@@ -609,8 +666,26 @@ pub(crate) fn augment_refresh_response(data: &mut serde_json::Value) {
     );
 }
 
-/// Hard refresh the page, bypassing browser cache.
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/page/hard-refresh` is a `navigation` edge: a reload is an `initial` load.
 pub async fn ui_bridge_page_hard_refresh_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let result = ui_bridge_page_hard_refresh_handler_dispatch(State(Arc::clone(&state))).await;
+    crate::journey::capture::record_control_result(
+        &state,
+        &result,
+        crate::journey::cursor::ActionSpec::navigation(
+            "hard_refresh",
+            qontinui_types::journey::NavigationTriggerKind::Initial,
+        ),
+    );
+    result
+}
+
+/// Hard refresh the page, bypassing browser cache.
+async fn ui_bridge_page_hard_refresh_handler_dispatch(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     use tauri::Manager;
@@ -1221,6 +1296,26 @@ pub(crate) fn navigate_rejection_response(
     api_error_detailed(message, detail)
 }
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/page/navigate` is a `navigation` edge (`push`: both modes
+/// pushState — neither replaces); the URL is never recorded.
+pub async fn ui_bridge_page_navigate_handler(
+    State(state): State<Arc<ApiState>>,
+    request: UiBridgeJson<PageNavigateRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let result = ui_bridge_page_navigate_handler_dispatch(State(Arc::clone(&state)), request).await;
+    crate::journey::capture::record_control_result(
+        &state,
+        &result,
+        crate::journey::cursor::ActionSpec::navigation(
+            "navigate",
+            qontinui_types::journey::NavigationTriggerKind::Push,
+        ),
+    );
+    result
+}
+
 /// Navigate to a URL.
 ///
 /// Accepts an optional `mode` field. **Neither mode reloads the document** —
@@ -1283,7 +1378,7 @@ pub(crate) fn navigate_rejection_response(
 /// (`http://localhost:9881/terminal`) is rewritten to its path (`/terminal`)
 /// before anything else happens, because that is what actually gets navigated
 /// to. See [`same_origin_absolute_path`].
-pub async fn ui_bridge_page_navigate_handler(
+async fn ui_bridge_page_navigate_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     UiBridgeJson(request): UiBridgeJson<PageNavigateRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -1414,8 +1509,26 @@ pub(crate) fn augment_navigate_response(data: &mut serde_json::Value, url: &str,
     obj.insert("reloaded".to_string(), serde_json::Value::Bool(false));
 }
 
-/// Go back in browser history.
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/page/back` is a `navigation` edge triggered by history `pop`.
 pub async fn ui_bridge_page_go_back_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let result = ui_bridge_page_go_back_handler_dispatch(State(Arc::clone(&state))).await;
+    crate::journey::capture::record_control_result(
+        &state,
+        &result,
+        crate::journey::cursor::ActionSpec::navigation(
+            "back",
+            qontinui_types::journey::NavigationTriggerKind::Pop,
+        ),
+    );
+    result
+}
+
+/// Go back in browser history.
+async fn ui_bridge_page_go_back_handler_dispatch(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Page go back");
@@ -1423,8 +1536,26 @@ pub async fn ui_bridge_page_go_back_handler(
     wrap_ipc_result(ui_bridge_request_sync(&state, "page_go_back", serde_json::json!({})).await)
 }
 
-/// Go forward in browser history.
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/page/forward` is a `navigation` edge triggered by history `pop`.
 pub async fn ui_bridge_page_go_forward_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let result = ui_bridge_page_go_forward_handler_dispatch(State(Arc::clone(&state))).await;
+    crate::journey::capture::record_control_result(
+        &state,
+        &result,
+        crate::journey::cursor::ActionSpec::navigation(
+            "forward",
+            qontinui_types::journey::NavigationTriggerKind::Pop,
+        ),
+    );
+    result
+}
+
+/// Go forward in browser history.
+async fn ui_bridge_page_go_forward_handler_dispatch(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Page go forward");
@@ -2124,6 +2255,23 @@ pub async fn ui_bridge_page_evaluate_batch_handler(
 // Tab switching (set-tab, activate-tab)
 // ============================================================================
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/page/set-tab` is a `navigation` edge (`push`) to an
+/// app-declared tab id.
+pub async fn ui_bridge_page_set_tab_handler(
+    State(state): State<Arc<ApiState>>,
+    request: UiBridgeJson<SetTabRequest>,
+) -> Result<Json<ApiResponse<SetTabResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::navigation(
+        &format!("tab:{}", request.0.tab),
+        qontinui_types::journey::NavigationTriggerKind::Push,
+    );
+    let result = ui_bridge_page_set_tab_handler_dispatch(State(Arc::clone(&state)), request).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
 /// POST /ui-bridge/control/page/set-tab
 ///
 /// Dispatches `ui-bridge-set-tab`, waits 100 ms, then reads back three page-id
@@ -2132,7 +2280,7 @@ pub async fn ui_bridge_page_evaluate_batch_handler(
 /// deepest visible `[data-page-id]` inside that wrapper, i.e. the sub-view) and
 /// `pageIdChain` (outer → inner along that element's ancestors). See
 /// [`SetTabResponse`].
-pub async fn ui_bridge_page_set_tab_handler(
+async fn ui_bridge_page_set_tab_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     UiBridgeJson(request): UiBridgeJson<SetTabRequest>,
 ) -> Result<Json<ApiResponse<SetTabResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -2195,8 +2343,26 @@ pub async fn ui_bridge_page_set_tab_handler(
     }
 }
 
-/// POST /ui-bridge/control/activate-tab/{tab_id}
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/activate-tab/{tab_id}` is a `navigation` edge (`push`) to an
+/// app-declared tab id (an unknown id is a 4xx and records nothing).
 pub async fn ui_bridge_activate_tab_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(tab_id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::navigation(
+        &format!("tab:{tab_id}"),
+        qontinui_types::journey::NavigationTriggerKind::Push,
+    );
+    let result =
+        ui_bridge_activate_tab_handler_dispatch(State(Arc::clone(&state)), Path(tab_id)).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
+/// POST /ui-bridge/control/activate-tab/{tab_id}
+async fn ui_bridge_activate_tab_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Path(tab_id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -2297,6 +2463,24 @@ pub async fn ui_bridge_tabs_list_handler(
     }
 }
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/tab/activate` is a `navigation` edge (`push`) to an app-declared
+/// tab id.
+pub async fn ui_bridge_tab_activate_handler(
+    State(state): State<Arc<ApiState>>,
+    request: UiBridgeJson<TabActivateRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<serde_json::Value>>)>
+{
+    let action = crate::journey::cursor::ActionSpec::navigation(
+        &format!("tab:{}", request.0.tab_id),
+        qontinui_types::journey::NavigationTriggerKind::Push,
+    );
+    let result = ui_bridge_tab_activate_handler_dispatch(State(Arc::clone(&state)), request).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
 /// `POST /ui-bridge/control/tab/activate`
 ///
 /// Body: `{ "tabId": "<id>" }`. Fires the same code path a user click would
@@ -2309,7 +2493,7 @@ pub async fn ui_bridge_tabs_list_handler(
 /// static `VALID_TAB_IDS` registry so the caller gets the error without an
 /// IPC round-trip; the React handler repeats the check as a defence-in-depth
 /// guard in case the two lists ever diverge.
-pub async fn ui_bridge_tab_activate_handler(
+async fn ui_bridge_tab_activate_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     UiBridgeJson(request): UiBridgeJson<TabActivateRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<serde_json::Value>>)>

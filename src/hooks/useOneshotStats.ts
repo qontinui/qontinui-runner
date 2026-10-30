@@ -17,6 +17,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * Shape returned by the `get_oneshot_stats` Tauri command. Stable wire keys
@@ -67,7 +68,7 @@ export function useOneshotStats(): UseOneshotStatsResult {
   return {
     stats: query.data ?? null,
     loading: query.isLoading,
-    error: query.error instanceof Error ? query.error.message : null,
+    error: query.error ? describeThrown(query.error, "Failed to load oneshot stats") : null,
     refresh: () => query.refetch(),
   };
 }

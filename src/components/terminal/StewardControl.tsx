@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Bot } from "lucide-react";
 import { resolvePort } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * One-click start/stop for each steward session the runner can launch
@@ -58,17 +59,6 @@ interface StewardApiResponse<T> {
   success: boolean;
   data?: T;
   error?: string;
-}
-
-/**
- * The reason a thrown action carries: a Tauri command's `Err(String)` rejects
- * with the bare string (the `steward_start` refusals), `fetch` with an `Error`.
- * Exported for tests.
- */
-export function invokeErrorDetail(e: unknown): string {
-  if (typeof e === "string" && e.length > 0) return e;
-  if (e instanceof Error) return e.message;
-  return "request failed";
 }
 
 /** The roster endpoint: every steward plus its live status, in one request. */
@@ -244,7 +234,7 @@ export function StewardControl() {
     } catch (e) {
       setErrors((prev) => ({
         ...prev,
-        [kind]: invokeErrorDetail(e),
+        [kind]: describeThrown(e, "request failed"),
       }));
     } finally {
       // Clear only THIS kind's flag. A single `busyKind` string was cleared

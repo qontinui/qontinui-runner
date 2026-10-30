@@ -454,8 +454,33 @@ fn batch_execute_bad_request(error: &str, detail: &str) -> (StatusCode, Json<Api
     )
 }
 
-/// POST /ui-bridge/control/batch-execute
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/batch-execute` is ONE `batch_action` (`batch:<n>`) on its first target; an empty batch
+/// records nothing.
 pub async fn ui_bridge_control_batch_execute_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::batch(
+        body.get("actions")
+            .or_else(|| body.get("steps"))
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+    );
+    let result =
+        ui_bridge_control_batch_execute_handler_dispatch(State(Arc::clone(&state)), Json(body))
+            .await;
+    // An empty batch acted on nothing: no edge (N7).
+    if let Some(action) = action {
+        crate::journey::capture::record_control_result(&state, &result, action);
+    }
+    result
+}
+
+/// POST /ui-bridge/control/batch-execute
+async fn ui_bridge_control_batch_execute_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -631,16 +656,16 @@ pub async fn ui_bridge_capabilities_handler() -> Json<ApiResponse<serde_json::Va
                 }
             },
             "ai": {
-                "description": "AI-powered search, assertions, semantic snapshots, NL actions",
+                "description": "AI-powered search, assertions, semantic snapshots, NL actions, and a pixel diff of two base64 images",
+                // `image-diff` is the one live route of the retired `media`
+                // category. The `/ai/media/*` family it sat beside had
+                // returned no image fact since the SDK removed its media
+                // handlers (ui-bridge 2d35d0d, 2026-05-14), and was deleted
+                // (plan 2026-10-13-image-generation-and-visual-judgment D6).
+                // Image capture and analysis live under `/ui-bridge/vision/*`.
                 "endpoints": ["find", "search", "execute", "assert", "assert-batch", "snapshot", "summary",
                     "semantic-search", "diff", "execute-with-diff", "bookmarks", "scoped-diff",
-                    "summarize-diff", "categorize-last-diff"]
-            },
-            "media": {
-                "description": "Media element discovery, audits, and analysis",
-                "endpoints": ["media/find", "media/audit/accessibility", "media/audit/performance",
-                    "media/snapshot", "media/analyze", "media/analyze/batch", "media/analyze/page", "media/compare",
-                    "image-diff"]
+                    "summarize-diff", "categorize-last-diff", "image-diff"]
             },
             "stateMachine": {
                 "description": "State discovery, activation, transitions, navigation",
@@ -786,9 +811,25 @@ pub async fn ui_bridge_get_interaction_metrics_handler(
 // Workflow run/status + element state
 // ============================================================================
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/workflow/{id}/run` is ONE `batch_action` (`workflow:<id>`, an
+/// app-registered workflow id).
+pub async fn ui_bridge_run_workflow_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::batch_kind(&format!("workflow:{id}"), None);
+    let result =
+        ui_bridge_run_workflow_handler_dispatch(State(Arc::clone(&state)), Path(id), body).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
 /// POST /ui-bridge/control/workflow/:id/run — Run a workflow via the unified workflow engine.
 /// Proxies to the runner's existing `/unified-workflows/:id/run` endpoint via internal HTTP.
-pub async fn ui_bridge_run_workflow_handler(
+async fn ui_bridge_run_workflow_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     body: Option<Json<serde_json::Value>>,
@@ -1046,8 +1087,11 @@ pub async fn ui_bridge_list_runner_windows_handler(
 /// atomic and were indistinguishable after the fact:
 ///
 /// * `?source=event` — the `ui-bridge-ping` Tauri event was DELIVERED to the
-///   renderer. The pong itself may still travel back over HTTP (the JS→Rust
-///   `emit` fallback for the WebView2 IPC failure mode), but delivery of the
+///   renderer. Since the 2026-10-19 ui-wedge plan this is the PRIMARY answer
+///   to a ping (`answerPing` in `src/hooks/ui-bridge-events/utils.ts`): a JS
+///   `emit` is an async Tauri command run on `app-rt`, which never settles
+///   while `app-rt` is starved, whereas this route is served on `mcp-api-rt`.
+///   The Tauri `ui-bridge-pong` event is the fallback leg. Delivery of the
 ///   ping is proof the native message loop pumped, so this stamps the
 ///   event-provenance clock.
 /// * `?source=safety-net` — the frontend's unconditional 3s interval, which is
@@ -1247,8 +1291,54 @@ pub struct BatchOperationResult {
     pub duration_ms: u64,
 }
 
-/// Execute multiple UI Bridge operations in a single HTTP call.
+/// IPC operation types that ACT on the UI. A `/ui-bridge/batch` carrying any
+/// of them is a journey action; one carrying only reads is not.
+const JOURNEY_ACTION_OPERATIONS: &[&str] = &[
+    "execute_action",
+    "execute_component_action",
+    "execute_with_diff",
+    "execute_batch_with_diff",
+    "ai_execute",
+    "fill_form",
+    "scroll_page",
+    "navigate_tab",
+    "navigate_by_adapter",
+    "execute_transition",
+    "navigate_to_state",
+    "execute_intent",
+    "undo",
+    "redo",
+];
+
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/ui-bridge/batch` carries arbitrary IPC operations; when any of them acts
+/// on the UI it is ONE `batch_action` (`ipc_batch:<n>`) on the first acting
+/// operation's `elementId`, else nothing is recorded.
 pub async fn ui_bridge_batch_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(batch): Json<BatchRequest>,
+) -> Result<Json<ApiResponse<BatchResponse>>, (StatusCode, Json<ApiResponse<serde_json::Value>>)> {
+    let acting: Vec<&BatchOperation> = batch
+        .operations
+        .iter()
+        .filter(|op| JOURNEY_ACTION_OPERATIONS.contains(&op.operation.as_str()))
+        .collect();
+    let action = acting.first().map(|first| {
+        crate::journey::cursor::ActionSpec::batch_kind(
+            &format!("ipc_batch:{}", acting.len()),
+            crate::journey::cursor::first_target(&first.params),
+        )
+    });
+    let result = ui_bridge_batch_handler_dispatch(State(Arc::clone(&state)), Json(batch)).await;
+    if let Some(action) = action {
+        crate::journey::capture::record_control_result(&state, &result, action);
+    }
+    result
+}
+
+/// Execute multiple UI Bridge operations in a single HTTP call.
+async fn ui_bridge_batch_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(batch): Json<BatchRequest>,
 ) -> Result<Json<ApiResponse<BatchResponse>>, (StatusCode, Json<ApiResponse<serde_json::Value>>)> {
@@ -1362,11 +1452,34 @@ pub async fn ui_bridge_batch_handler(
 // /control/batch (step-level, distinct from /batch which is operation-level)
 // ============================================================================
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/batch` is ONE `batch_action` (`batch:<n>`) on its first target; an empty batch
+/// records nothing.
+pub async fn ui_bridge_control_batch_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::batch(
+        body.get("steps")
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+    );
+    let result =
+        ui_bridge_control_batch_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    // An empty batch acted on nothing: no edge (N7).
+    if let Some(action) = action {
+        crate::journey::capture::record_control_result(&state, &result, action);
+    }
+    result
+}
+
 /// POST /ui-bridge/control/batch
 ///
 /// Execute a sequence of element actions and report per-step timing plus a
 /// snapshot diff (element ids added / removed) between pre- and post-batch.
-pub async fn ui_bridge_control_batch_handler(
+async fn ui_bridge_control_batch_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {

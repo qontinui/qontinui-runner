@@ -218,11 +218,13 @@ again, which cuts its own fresh branch; a NON-stamp push to an existing branch
 stays governed by
 `knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing to a
 branch whose PR may already have landed". **Never `gh pr merge`, never `--admin`.**
-That marker is an **indexability** claim, not a delivery one: once plan
+That marker is an **indexability** claim, not a delivery one: now that plan
 `2026-09-04-docs-only-plan-marker-prs-derive-shipped` Phase 1 is deployed
-(authored 2026-09-04, not deployed as of that date), coord classifies a citation
-whose PR changed only plan documents as a *document citation*, which neither
-derives nor blocks `shipped` — so stamping this PR is safe.
+(qontinui-coord#1924, `483659578` on `origin/main`; the plan is stamped SHIPPED
+2026-09-07), coord classifies a citation whose PR changed only plan documents as
+a *document citation* (`document_citation: true` on
+`coord_work_unit_list_citations`), which neither derives nor blocks `shipped` —
+so stamping this PR is safe.
 Runbook: `knowledge-base/qontinui-specific/bodyless-work-units-and-stranded-plans.md`.
 
 Committing it does **not**, however, by itself make the coord work unit attestable.
@@ -241,8 +243,11 @@ so the next author does not reintroduce them:
   `{device, agent, session}` for the work-unit check. **That is not the code.**
   On qontinui-coord `origin/main`,
   `work_unit_registry::authorize_target_transition` takes the two actor keys
-  **plus an optional `independence` declaration**, and does a flat
-  `owner == attester` compare **when no declaration is sent**;
+  **plus an optional `independence` declaration**, and does an
+  `owner == attester` compare **when no declaration is sent** — on the DEVICE
+  half of each key since qontinui-coord#2561 (`parse_actor_key`, landed
+  2026-09-28, after the correction above), so a same-device agent JWT, however
+  freshly allocated, is the same actor;
   `non_author_allows_identities` is called only from `gates.rs`.
 - It said *"a subagent never qualifies"*. The operator ruled the opposite on
   2026-09-03, and **that ruling stands unchanged**: independence means the
@@ -311,7 +316,7 @@ attester. §5.4 covers what to write when the check actually refuses.
 
 ⚠️ **Do NOT re-allocate to get past `self_attestation_forbidden`.** A re-allocate no longer changes the verdict by itself (qontinui-coord#2561 — the refusal now says in its own words that the compare reads the device, not the agent id). A different hole — in GATE clearance, not this refusal: the `agent_non_author` ladder's caller-mintable session rung — is tracked by plan `2026-09-26-gate-ladder-session-rung-is-caller-mintable-so-tier-5-proves-a-session-not-an-actor`. A `vetted` stamp obtained by any route around the compare is indistinguishable
 from a real review forever after. (The re-allocate prohibition is that refusal's alone;
-`attester_unresolved` wants a device- or agent-identified caller, which is
+`attester_unresolved` wants a caller coord admits as an SoD actor, which is
 §5.4's remedy, not a route around anything.)
 
 ## Decision policy (binding)
@@ -524,7 +529,7 @@ regressed: report the measured number, do not quietly raise the floor.
 takes over the first's reservation — the identical bug that plan
 `2026-06-03-coord-session-scoped-claim-owner-plan` (SHIPPED 2026-06-03; coord
 PR #271 makes `acquire` SET/compare the owner token and the heartbeat/release Lua
-match on it, qontinui-claude-config PR #49 sends it) fixed for phase claims.
+match on it, and the client-side config change sends it) fixed for phase claims.
 
 #### Branch on the result
 
@@ -536,18 +541,36 @@ match on it, qontinui-claude-config PR #49 sends it) fixed for phase claims.
   invoked this skill inside the same harness session. **A re-reserve by the same
   owner token is a renewal, not a conflict** — proceed, and do **not** release at
   the end of this run; the acquirer releases.
-  **`renewed` is only as narrow as the door's owner token.** Over
-  `coord_reserve_resource` (MCP) that token is the bare DEVICE, so a second
-  session on this same box re-reserving the plan ALSO reads `renewed`; only the
-  HTTP `/claims/acquire` fallback, which carries `agent_session_id`, makes it
-  session-scoped. So a `renewed` is YOUR hold only if something earlier in THIS
-  session reserved the plan (you are nested under `/vet-imp`, or this run
-  re-reserves its own key). If nothing did, treat it as `held` by a same-box
-  peer — the rule below.
+  **`renewed` is only as narrow as the door's owner token, and the MCP result
+  says which.** The HTTP `/claims/acquire` fallback is session-scoped
+  when it carries `agent_session_id`. Over `coord_reserve_resource`
+  (MCP) read the result's `owner_scope`: `"session"` means coord scoped the
+  token to your verified session, so `renewed` is YOUR hold — a second session
+  on this box would read `held`. `"device"` means the runner did not resolve
+  your session on that call, so the token is the bare DEVICE and a second
+  session on this same box ALSO reads `renewed`; an ABSENT `owner_scope` (a
+  coord build predating qontinui-coord#2697) means the same. On `"device"` or
+  absent, a `renewed` is YOUR hold only if something earlier in THIS session
+  reserved the plan (you are nested under `/vet-imp`, or this run re-reserves
+  its own key). If nothing did, treat it as `held` by a same-box peer — the
+  rule below.
+  A scope flip changes what `held` means. Coord's acquire compares tokens
+  exactly, so if THIS session's earlier reserve read `"device"` and this one
+  reads `"session"`, your own bare-device hold answers `held` naming THIS
+  machine (`holder`). Read the result's `current_holder_session`
+  (`coord_claim_check` carries it as `holder.session_id`): present and equal to
+  your own session id = YOUR hold, read it as `renewed`; present and different =
+  that peer session holds it. ABSENT = a bare-device hold: yours only if THIS
+  session, or the chain enclosing it, received `granted` on a device-scoped
+  (`owner_scope: "device"`) reserve of this key (a `renewed` does not count — it
+  can mean a same-box peer already held the bare-device token); otherwise a
+  same-box peer. A coord predating qontinui-coord#3213 sends no
+  `current_holder_session` on any reserve `held`, so keep the conservative
+  reading there — treat it as `held` by a same-box peer, the rule below.
 - **`held` by a DIFFERENT owner — STOP.** Do not edit the plan and do not stamp
   it. Report the holder and surface to the operator via `AskUserQuestion`
   (header `Plan reserved`, options **Abort** / **Wait** — poll every 30 s, then
-  re-acquire). When `current_holder` equals THIS machine and
+  re-acquire). When `holder` equals THIS machine and
   `current_holder_session` differs, say so explicitly rather than implying a
   different box:
 
@@ -664,21 +687,26 @@ three ways relative to a whole-plan vet:
    phase is expected concurrency, not a collision. **STOP only on a foreign
    `held` of the phase key itself** — someone else is already vetting or
    implementing this exact phase.
-2. **Edit only that phase's section, plus ONE scoped line in the status
-   block.** Do not touch other phases' sections, and do not run the
+2. **Edit only that phase's section, plus ONE scoped two-line entry in the
+   status block.** Do not touch other phases' sections, and do not run the
    single-stamp-invariant full-block replace §5 describes for a whole-plan
-   vet. Instead, splice a single scoped line into the existing status
+   vet. Instead, splice that scoped entry into the existing status
    blockquote using the same separate-index, pinned-`$BASE` push recipe
    `CLAUDE.md` already documents for a shared checkout (`git hash-object -w`
    → `GIT_INDEX_FILE=<tmp> git read-tree "$BASE"` → `update-index` →
    `write-tree` → `commit-tree -p "$BASE"` → push), so a concurrent phase
    session's own scoped edit is never clobbered by a full-block rewrite. The
-   scoped line reads:
+   scoped entry reads:
    ```
    Phase N: VETTED <date> (session <short-id>) — see § Phase N.
+   Vetted-by: <as §5>. Independence: context — <as §5>.
    ```
-   appended after the existing status paragraph, never replacing it and never
-   producing a second top-level `> **Status:` blockquote.
+   When Step 1.5 could not spawn, its first line reads `Phase N: VETTED (self)
+   <date> …` and its second ends `Independence: NONE — vetted in the invoking
+   session's context` — the qualification §5 requires of a whole-plan stamp,
+   with `VETTED` still first. Either form is appended after the existing
+   status paragraph, never replacing it and never producing a second
+   top-level `> **Status:` blockquote.
 3. **Skip the coord registry transition and BOTH §5.4 gates.** §5.4's
    `→ vetted` registry transition and its `unit_ready` / `time_elapsed` gate
    registrations are whole-plan primitives — they answer "is THE PLAN ready,
@@ -711,9 +739,11 @@ them **here**, while the plan on disk is still untouched and nothing has been
 written.
 
 **1. The existing status block, verbatim** — its lifecycle token, its date, and
-any session marker. §5's single-stamp invariant instructs you to DELETE every
+any session marker, plus whether its HEADLINE carries `IN PROGRESS` after a
+non-terminal first token (guard rule 1 below — such a stamp is `IN PROGRESS`
+for every rule in this section, whatever its first token says). §5's single-stamp invariant instructs you to DELETE every
 status-adjacent blockquote before writing yours, so a rule that reads the marker
-*after* that point cannot discriminate anything. Hold these three values.
+*after* that point cannot discriminate anything. Hold these values.
 
 **2. Coord's derived delivery for this plan.** The stamp is an authoring-surface
 artifact that lags by construction; coord derives `work_unit.status = shipped`
@@ -738,12 +768,76 @@ conclusive ones). **Arm 6 is the DEFAULT**: anything not positively matched by
 
 | # | Response | Reading | Do |
 |---|---|---|---|
-| 4 | the error `no work-unit with that slug` (the MCP tool appends ` in your tenant`; the HTTP twin's 404 body deliberately does not, so it cannot leak whether the slug belongs to another tenant — match on the short form) | The unit does not exist. **The COMMONEST case** — a first-time vet of a `DRAFT` plan has no work unit, because §5.4 upserts it at the *end* of this run. | **Proceed to vet, and SAY the read was not-found.** An absent unit and an uncited-but-present unit are different facts; do not fold one into the other. |
+| 4 | the error `no work-unit with that slug` (the MCP tool appends ` in your tenant`; the HTTP twin's 404 body deliberately does not, so it cannot leak whether the slug belongs to another tenant — match on the short form) — **and** `recon-tenant.sh` answered `MATCH`, or `MULTI` with every listed tenant folded `clear` (below the table) | The unit does not exist **in any tenant this device is bound to**. **The COMMONEST case** — a first-time vet of a `DRAFT` plan has no work unit, because §5.4 upserts it at the *end* of this run. | **Proceed to vet, and SAY the read was not-found.** An absent unit and an uncited-but-present unit are different facts; do not fold one into the other. |
 | 3 | a top-level `merged_degraded_reason` is present | **UNKNOWN, whatever `delivery` says.** The field sits BESIDE `delivery` and is present even when the verdict could not be derived at all; while it is set, every citation's `merged: false` is UNKNOWN rather than an observation. | Treat as arm 2. |
 | 2 | `evidence_complete: false` — **regardless of `shipped`** | **UNKNOWN — never "undelivered".** `evidence_gaps` names each gap. | Fall through to the stamp arms and **say the read was inconclusive**, per `verification-and-evidence` `unknown-must-not-render-as-a-default`. |
 | 1 | `shipped: true` ∧ `evidence_complete: true` ∧ the phase axis CORROBORATES it (the three extra conjuncts below the table — do not apply this arm without them) | The plan is closed **in substance**. | **Do NOT vet** (see "Act here" below). Route to closeout. |
-| 5 | `delivery` present ∧ no `merged_degraded_reason` ∧ `evidence_complete: true` ∧ `shipped: false` | A clean, complete observation of *not delivered* — including the zero-citation case. | Proceed to vet. |
+| 5 | `delivery` present ∧ no `merged_degraded_reason` ∧ `evidence_complete: true` ∧ `shipped: false` — **and** `recon-tenant.sh` answered `MATCH`, or `MULTI` with every listed tenant folded `clear` (below the table) | A clean, complete observation of *not delivered* **in every tenant this device is bound to** — including the zero-citation case. | Proceed to vet. |
 | 6 | **DEFAULT — anything not positively matched above.** Any error other than arm 4's, any unparseable or non-2xx body, a `citations_error` / `delivery_error` key, an absent `delivery`, or the tool masked / absent / on a dead transport (`"Command failed with no output"`) | **UNKNOWN.** Includes coord's `citation surface unavailable for work-unit …` (whose own text says it is NOT "this unit has no citations") and its generic `citation list failed: …`. | Treat as arm 2. On a dead transport run **`/coord-revive`** and re-issue over the live door before concluding anything. |
+
+**Arm 4's not-found is TENANT-RELATIVE, so run the tenant check before you
+trust it.** The read is tenant-scoped: on a device bound to several tenants the
+session's MCP credential resolves the DEFAULT binding, and `no work-unit with that
+slug` is then a true answer about ONE tenant, while the unit may have been
+written under any tenant this device is bound to (the writer's credential picks
+it, not the repo's owner). From the same cwd whose `.mcp.json` serves this
+session's coord tools:
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/recon-tenant.sh <owner/repo>...   # every one of the plan's Repo(s)
+```
+
+`MATCH <tenant>` lets the table run on the one answer, as written. **Under
+`MULTI read=<t> plan=<t> tenants=<…> set=<h>` the delivery read is re-issued in
+EVERY listed tenant** — not only arm 4: a clean arm-5 "not delivered" from the
+session's tenant says nothing about a `shipped` unit with its citations sitting
+in another bound tenant. Re-issue it under each printed `bearer <tenant>=<path>`
+over `POST https://coord.qontinui.io/mcp` (`-H "@<path>"`), classify each
+tenant's answer **by its RESPONSE SHAPE alone**, and fold with
+`bash <workspace-root>/qontinui-claude-config/scripts/recon-tenant.sh --union --tenants <…> --set <h>`
+(`tenants=` and `set=` copied off the MULTI line):
+
+| That tenant's answer (its SHAPE) | Fold it as |
+|---|---|
+| the error `no work-unit with that slug` (arm 4's body) | `clear` |
+| `delivery` present ∧ no `merged_degraded_reason` ∧ `evidence_complete: true` ∧ `shipped: false` (arm 5's body) | `clear` |
+| arm 1's body, all seven conjuncts — `shipped: true` ∧ `evidence_complete: true` ∧ no top-level `merged_degraded_reason` ∧ `phases_declared` not `null` ∧ `phases_remaining` the LITERAL `[]` ∧ that `[]` corroborated by the same response ∧ no `NO PHASE ATTRIBUTION` gap (the corroboration rule is arm 1's, below this table) | `found` |
+| **any** body carrying a top-level `merged_degraded_reason`, whatever else it says (arm 3's rule, which shape-classification would otherwise bypass) | `unknown` |
+| anything else, or no answer at all | `unknown` |
+
+**The per-tenant classification is by shape, NOT by the arm table's rows.** Arms
+4 and 5 carry a recon conjunct (MATCH, or MULTI folded `clear`), and applying it
+to ONE tenant's answer would be circular: that tenant's not-found would fail it,
+fold `unknown`, and `CLEAR` would be unreachable on any multi-bound device. So
+the shape table above classifies each answer, and the recon conjunct is applied
+ONCE, to the FOLDED result below.
+
+- **`FOUND in=<t,...>`** — arm 1 applies (it wins over any UNKNOWN beside it):
+  **do NOT vet; STOP and route to closeout**, naming the tenant that holds the
+  delivered unit.
+- **`CLEAR`** — this satisfies arms 4 and 5's recon conjunct: proceed, as arm
+  5 if any tenant answered the arm-5 shape, else as arm 4.
+- **`UNKNOWN`** — arm 6.
+
+`recon-tenant.sh` exiting `2` (a usage error, e.g. a plan whose `Repo(s)` line
+names bare repos instead of `owner/repo`) prints no verdict line at all. That is
+a recon UNKNOWN, so it is arm 6 too, and the report says the recon call itself
+was malformed. Fix the argument and re-run; never read the missing verdict as
+`MATCH`.
+
+Until every listed tenant has answered — and under a recon `UNKNOWN <why>` —
+a not-found is **arm 6 (UNKNOWN), never "the unit does not exist"**, and a clean
+arm 5 from one tenant is **arm 6 too, never "not delivered"**, because another
+bound tenant may hold the `shipped` unit and its citations. That is the ordinary
+arm 6, with its ordinary meaning: the delivery read gives NO permission to
+proceed and is not evidence in either direction, the run falls through to the
+stamp arms only, and the report says the delivery read was inconclusive across
+tenants and names each tenant that could not be read (or that the tenant set
+itself could not be established). A false STOP is the outcome these readers are
+built to avoid, so a recon UNKNOWN never becomes one. Record every tenant
+consulted beside the delivery verdict, then delete the bearers (`rm -rf` the
+directory the printed bearer paths sit in — recon-tenant.sh's own per-run
+directory, so this never touches anything else).
 
 Arm 5 is stated as a **positive predicate on purpose.** It was written as
 "anything else" and that was a fail-open default: every shape in arm 6 — coord
@@ -846,7 +940,9 @@ attribution is rare), not an edge case.
 **That false negative is not free — say what actually catches it.** The stamp
 arms read the status block captured from disk at item 1, a stamp that lags by
 construction (see above). A `SHIPPED`, `SUPERSEDED` or `OBSOLETE` stamp, or a
-foreign `IN PROGRESS` whose session left PRs, still stops there; a complete plan
+foreign `IN PROGRESS` whose session left PRs (unless it is case 2b's
+gate-delegated stamp and this run is that hold gate's continuation), still
+stops there; a complete plan
 still stamped `VETTED` or `DRAFT` (or `PARTIAL` / `NOT STARTED`) is re-vetted, and under `/vet-imp` the only
 remaining MECHANICAL guard is `/implement-plan` Step 0.45 check 2 — a `git log
 origin/main -20` grep that misses anything older — though §2's claim
@@ -906,7 +1002,11 @@ If, on the values captured above:
   them is read-only: does the stamping session's transcript tail show it died;
   are its worktrees clean and 0 ahead of `origin/main`; do any PRs or branches
   exist for the plan. If all of them hold this is case 2 (**adopt**) and you
-  proceed — do not STOP. If any fails, STOP.
+  proceed — do not STOP. **Evaluate case 2b HERE too, before taking any STOP**:
+  when `printenv QONTINUI_GATE_ID` names the gate in the captured block's last
+  `Held behind gate` line, run case 2b's fresh `coord_gate_inspect` read (also read-only); if every
+  2b conjunct holds you **adopt** and proceed. If neither case 2 nor case 2b
+  holds, STOP.
 
   **An ABSENT marker cannot reach case 2 at all**, because case 2's probes are
   keyed on "the marker is a session id ≠ yours" and there is no session to probe.
@@ -942,6 +1042,29 @@ trailing ` plan` / `-plan` / `_plan` word if present.
 (e.g. `2026-05-21-coordination-improvements` → `coordination-improvements`;
 `2026-06-02-fleet-auth-plan` → `fleet-auth`.)
 
+> ⚠️ **FIRST: are you a SUBAGENT? If so, write NO title-hint file — report a
+> `/rename` line instead.**
+>
+> A Claude Code subagent inherits its parent's `$CLAUDE_CODE_SESSION_ID` — it is
+> a context inside one harness session, not a session of its own — so the
+> hint file the snippet below writes, `~/.qontinui/session-titles/<id>`, is the
+> **parent's**. A `/vet-plan` run inside a batch subagent (`/vet-imp` calls it in
+> its own context) would retitle the orchestrator's terminal with its own plan
+> name, and every later subagent would overwrite the one before. It reaches the
+> parent's commit attribution too: the fleet's session-name populator (its tier
+> 2) copies that hint file into `~/.qontinui/session-names/<id>` when no name
+> exists yet, and that file is the source of the `Session-Name:` commit trailer
+> and the `ListAgents` address. The two contexts are **not separable by any
+> mechanical signal** (measured 2026-09-04: identical environment, identical
+> pid, no per-context marker), so you are the only thing that knows — the same
+> arm `/vet-imp` Step 1.5, `/unattended` Step 5 and `/finish-session` Part A
+> step 0 carry. In a subagent, derive the name (the snippet's `DISPLAY=`
+> assignment only) but skip the `mkdir` and the `printf` into the hint
+> file, and put the
+> name in your report as a ready-to-paste `/rename <name>` line for the parent
+> to apply. Plan
+> `2026-10-12-vet-plan-and-implement-plan-title-hint-retitles-the-parent-terminal-from-a-subagent`.
+
 Run this once, substituting `<plan-stem>` (the same stem Step 0 computed):
 
 ```bash
@@ -969,7 +1092,8 @@ The paste only affects the in-app session label; the terminal title is already
 handled by the title-hint file above.
 
 This step is best-effort: if `$CLAUDE_CODE_SESSION_ID` is unset or the write
-fails, skip it silently and continue — naming never blocks vetting.
+fails (or you are a subagent, per the arm above), skip the write and
+continue — naming never blocks vetting.
 
 ### 1. Read the plan in full
 
@@ -981,7 +1105,125 @@ Use `Read` on the path. Don't skim — note every concrete claim:
 
 A plan written by someone else (or by past-you) usually has 2–4 things that look right but aren't. Your job is to find them.
 
+### 1.5. Hand the JUDGEMENT to a fresh-context subagent — always
+
+**The vet is performed by a subagent that received the artifact and not the
+reasoning.** Spawn exactly one `general-purpose` subagent (the `Agent` tool)
+and give it the work of Steps 2 and 3 — verify every claim, record each as a
+§2a manifest entry, classify the defects, resolve the open questions under the
+Decision policy. It is the authority for that judgement; this session is not.
+The property is served policy `verification-and-evidence`
+`independence-is-context-not-credential` — read the clause live, do not restate
+it here [policy: never-pin-a-mutable-policy-value].
+
+**Spawn unconditionally — including when this session did not author the
+plan.** A session cannot reliably tell whether its context carries authoring
+reasoning: it may be `/pvi`, a resumed run, or a compacted one whose summary
+still holds the author's rationale. A uniform rule has no such failure mode
+(robustness). A re-vet of an already-VETTED plan gets a FRESH subagent too: the
+artifact changed, so a prior verdict names a different `against`.
+
+**The prompt carries these things, and nothing else:**
+
+1. the resolved plan path;
+2. the plan body **as read from `origin/main`** of the repo holding it (`git -C
+   <plans repo> fetch` then `git show origin/main:<path>`) — not its git
+   history, not earlier drafts — and, beside it, the sha it was read at
+   (`git -C <plans repo> rev-parse --short origin/main`). Keep that sha: it is
+   the "plan at `origin/main <sha>`" in §5.4 Step B's `against`. If the plan
+   is not on `origin/main` yet, pass the body Step 1 read and say so — the
+   stamp's `Vetted-by:` then reads "working-tree body (not on origin/main)" in
+   place of "`origin/main` body", and its `Plan:` field says the same in place
+   of a sha;
+3. the repos it touches;
+4. the vetting rubric, **PASTED into the prompt** — exactly these spans and no
+   more:
+   - Step 2 from "For each claim in the plan" through the end of §2a (the
+     line before "### 3. Identify defects");
+   - Step 3 from its "**Wrong**" bullet through "Don't flag style
+     preferences…";
+   - the **Decision priorities** section whole, from "When the plan's choices
+     need to be evaluated" through "…that is itself a defect worth flagging."
+     — the engineering order, the UX gates, and the implementation priorities
+     with the three places they bind a vet;
+   - the **Decision policy** section whole, from "When vetting surfaces a
+     question" through its last paragraph — the priorities, the not-factors,
+     the tie-break, the do-not-escalate rule with its two surfacing
+     exceptions, and the write-the-decision sentence, which the
+     return-in-verdict rule below converts.
+
+   Each step's own lead-in sentence addressed to this session ("The Step 1.5
+   subagent does this step…") sits outside those spans and is never pasted.
+   Never point at this file's path: it also carries Steps 4, 5 and §5.4,
+   which WRITE, and a subagent told to follow `/vet-plan` will follow them;
+5. **`--phase N` only:** the phase number. It is scope, not reasoning — the
+   subagent vets that phase's own section, plus the claims elsewhere in the
+   plan that the phase relies on.
+
+The prompt also says, in terms: **return the verdict only — no `Edit` or
+`Write`, no commit or push, no coord write of any kind.** And: **inside the
+pasted rubric, every instruction to write — into the plan, as a plan edit, or
+as a §5.4 submission — means RETURN IT IN THE VERDICT.** A resolved question
+goes in "resolved open questions", an item for the operator in "surfaced for
+user", a manifest entry the rubric says "you
+submit … in §5.4" goes in "manifest", and a fix goes in its defect's
+"proposed fix". The subagent reads; this session writes.
+
+⚠️ **Do NOT put the authoring conversation, a defect list, or "what the author
+meant" into that prompt** — no "here is why I chose this design", no "I already
+noticed X", no prior turn, no summary of this session. That omission IS the
+control, and it is the one thing an implementer would "helpfully" add. A
+subagent briefed on the author's intent is the reviewer who cannot catch what
+the author assumed. The subagent may still run `git log` or read anything
+itself: that is verification, not inherited context.
+
+**It returns a structured verdict**, and you ask for exactly this shape:
+
+- **defects** — each `{category, section, evidence file:line, proposed fix}`,
+  with `category` one of Step 3's five;
+- **resolved open questions** — each with the deciding priority named;
+- **surfaced for user** — the ONE set of items left for the operator, each
+  with why: the Decision policy's two surfacing exceptions (an
+  operator-resource need, a plan too large for coordinator orchestration),
+  plus a genuine product/scope call that changes user-facing semantics, which
+  served `escalation-bar` `escalation-closed-list` keeps with the operator
+  whatever the priority sets say. An engineering trade-off is never in it. It
+  is the stamp's "Surfaced for user: <count>" and the §6 report's
+  flagged-for-user line, and both read this field rather than re-deriving it;
+- **report notes** — work the plan missed (never added as a phase; see Rules),
+  and any note that the priority sets should be expanded;
+- **manifest** — the §2a entries it computed, as the JSON array §5.4 submits;
+- **read list** — every `repo@sha` it read (`git rev-parse --short
+  origin/main` after its own fetch), which is what the stamp's `against` and
+  §5.4's `independence.against` are built from;
+- **policies** — every served policy document it read to decide (`/policy`,
+  `name@version`), which is the stamp's `served policy` list;
+- **checks** — one line naming what it verified (premises re-derived, counts
+  recounted, prior art searched), which becomes `independence.verified`.
+
+**This session stays the single writer.** Independence is a property of the
+judgement, not of the file write, and one writer avoids the concurrent-edit
+class entirely. From Step 4 onward you apply the verdict. You may re-check a
+defect only where you are about to edit on it — to place the edit, not to
+re-litigate it. Where your re-check contradicts the verdict, the contradiction
+goes in the §6 report; do not silently overrule it. Keep the verdict: Step 5's
+stamp and §5.4 Step B's declaration are both built from it.
+
+**When no spawn is possible** — no `Agent` tool in this harness, or the spawn
+failed and a retry failed — do Steps 2 and 3 inline yourself and take the
+**self path** everywhere downstream: Step 5 writes `VETTED (self)` with
+`Independence: NONE`, and §5.4 Step B sends no declaration. Never write the
+unqualified stamp on a vet this session performed in its own context. An
+independence you could not obtain is UNKNOWN and renders as NONE, never as
+silence [policy: unknown-must-not-render-as-a-default].
+
+Wait for the verdict on a bounded timer, per the **Parallelize research** rule
+under Rules; never end a turn purely awaiting it.
+
 ### 2. Verify every concrete claim
+
+**The Step 1.5 subagent does this step, not you.** What follows is its rubric:
+hand it over verbatim. You apply the verdict it returns.
 
 For each claim in the plan, validate against the current codebase. Run these in parallel where possible:
 - **File / module exists** → `Glob` or `Read`
@@ -1349,7 +1591,8 @@ making review unforgeable. It raises the floor and makes decay observable.
 
 ### 3. Identify defects
 
-Categorize what you find:
+**The Step 1.5 subagent does this step too**, and returns each defect in the
+verdict shape named there; you apply it. Its categories:
 - **Wrong** — claim contradicts the code (path, signature, behavior)
 - **Redundant** — proposes new code that duplicates existing infrastructure
 - **Missing** — overlooks a concrete consumer, edge case, or coupled subsystem
@@ -1369,6 +1612,71 @@ retro-failed; under `--phase N` it applies to phase N only. This is THE
 enforcement point: plans reach the corpus by direct push, so no CI gate sees
 them, and the corpus measurement (check #75) only counts.
 
+**Audit `## Done when` — acceptance is a served claim** *(plan
+`2026-10-05-declared-intent-drives-autonomous-work-selection` Phase 2; the
+template and its three shapes are `/create-plan` §5)*. **Scope:** plans dated on
+or after 2026-10-07 — the same cutoff as the Arming rule above — where "dated"
+means the `YYYY-MM-DD` stem of the plan's filename, never a date in its body or
+status block; an older plan is not retro-failed, though a `## Done when` it does
+carry is audited all the same. Four checks, and
+the subagent returns each failure as a defect in the Step 1.5 verdict shape:
+
+1. **Section absent, or present with neither a claim bullet nor the escape
+   line → Missing, auto-fixable.** §4 writes it by PROPOSING the
+   claim: the served claim whose subject the plan's `## Why` names, read from the
+   domain spec it touches. Where no served claim observes it, propose an appended
+   probe block (check 3's grammar) on the spec the phases make observable; where
+   nothing could, write the escape line. Never propose a claim id you have not
+   just read in a served `domain_spec` `claims[]` array, nor one that already
+   reads `confirmed` there (check 2's **Stale**).
+2. **Each named `domain_spec/<name>#<claim_id>` resolves.** A citation on any
+   kind other than `domain_spec` is **Wrong**: coord's claim sweep probes
+   `domain_spec` alone (`PROBED_KINDS`, qontinui-coord
+   `crates/coord/src/prompt_document_claims.rs`), so such a claim is never
+   verdicted and can never read `confirmed` — fix it to the `domain_spec` claim
+   it meant, or propose one. `coord_get_prompt_document`
+   for `domain_spec` and that name; the id must appear in the served `claims[]`. A
+   document that does not resolve, an id absent from the array, or a read with
+   `claims_probed: 0` is **Wrong** (the citation names nothing coord observes).
+   An unreachable door is UNKNOWN, never a pass — say which door failed
+   [policy: silent-empty-is-unknown]. Record each claim's CURRENT `state` in the
+   report; a claim that already reads `confirmed` before any phase lands is
+   **Stale** — the plan cannot be what moves it, so it is not this plan's
+   acceptance. A STALE row (`detail.stale: true`) whose `detail.stored_state` is `confirmed`
+   counts as already confirmed (**Stale** too); a document whose `claims_state_source`
+   is not `table` is UNKNOWN — report it, never pass the citation on it.
+3. **Each appended probe parses under `parse_probe_blocks`' grammar**
+   (qontinui-coord `crates/coord/src/prompt_document_claims.rs`). In the plan the
+   block is a `text`-fenced TEMPLATE whose first line is `probe`; coord itself
+   recognises a block only when its opening fence line is
+   exactly a ```` ```probe ```` fence (`PROBE_FENCE`), so the `text` fence is
+   display-only and the phase that moves the block into the spec must change the `text` fence
+   to a ```` ```probe ```` fence and drop the leading `probe` line. After that
+   line, one `key: value` per line — `claim` (kebab-case, unique in the
+   target document — collide with a served id and it is **Wrong**), `anchor` (ONE
+   JSON object with a `type` the anchor registry serves; `none` must carry a
+   non-blank `reason`), `verified_at` (RFC 3339 UTC), `verified_against` — plus
+   the OPTIONAL `addressed_by: <plan-stem>#<phase>[, …]` (stem
+   `[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9-]+`, naming THIS plan when present; its
+   absence is not a defect). Coord's parser
+   ignores every other key, so a misspelled key is silently dropped: treat any
+   key outside those five as **Wrong**. Inside the plan the block must sit in a
+   `text` fence; a `probe` fence there is **Wrong** — it is parsed as a live claim
+   of whatever document the plan body is pasted into.
+4. **D5 — a source-only anchor on a goal-facing claim is flagged `source_only`.**
+   Goal-facing means the claim's document declares `serves:` (or, until that
+   frontmatter lands, is the domain spec for an initiative `in_scope` item). A
+   `content` or `blob` anchor there confirms that source exists, not that the
+   behaviour happens, so record `source_only: <claim id>` in the report and in
+   the plan's `## Done when` beside the bullet. It is a flag, not a defect: until
+   behaviour anchors exist it is often the best available claim — but it must
+   never be read as a demonstration.
+
+**The escape `Done when: no claim — <reason>` passes, and is COUNTED** — report it
+by name in §6 every time. A reason that only asserts difficulty ("hard to
+probe") rather than naming why no served anchor can observe the outcome is
+**Missing**: propose the claim instead.
+
 Don't flag style preferences or hypothetical concerns — only material defects.
 
 ### 4. Edit the plan in place
@@ -1377,6 +1685,10 @@ Don't flag style preferences or hypothetical concerns — only material defects.
 plan reserve returned `granted` / `claimed` / `renewed` (or took the documented
 no-machine-UUID skip). A foreign `held`, or a reserve that could not be answered,
 stops the run before any `Edit`.
+
+**You are applying the Step 1.5 verdict here, not forming a new one.** Every
+edit below traces to a defect or a resolved question the subagent returned (or,
+on the self path, to your own inline Steps 2–3).
 
 Use `Edit` (not `Write`) to surgically fix the plan, preserving the author's voice and structure. Specifically:
 - **Add a "Discovered prior art" section** near the top if the plan missed existing infrastructure. Include a small table with `Piece | Location | Notes`.
@@ -1396,6 +1708,11 @@ Use `Edit` (not `Write`) to surgically fix the plan, preserving the author's voi
   that changes no behaviour (docs, a plan edit) gets `Arming: none — <reason>`.
   Never invent an observation the phase does not already imply — when the
   phase's text supports none, that is itself the defect to surface.
+- **Write a missing `## Done when`** (the §3 Done-when Missing defect, same
+  scope rule): the claim §3 check 1 proposed, placed after `## Phases` and
+  before `## Risks`, in `/create-plan` §5's shape — appended probe blocks in a
+  `text` fence, never a `probe` fence. Fix a Wrong citation by replacing it with
+  the served id it meant, never by deleting it and leaving the section empty.
 - **Verify `Depends-On:` targets exist** — see [Depends-On verification](#depends-on-verification) below.
 - **Don't gut sections that are already correct** — the goal is targeted fixes, not a rewrite.
 
@@ -1403,34 +1720,57 @@ If the plan's overall direction is sound but an entire phase is wrong, rewrite t
 
 #### Depends-On verification
 
-A plan MAY declare upstream dependencies inline in its status blockquote
-using a `Depends-On:` suffix:
+A plan MAY declare upstream dependencies inline in its status block
+using a `Depends-On:` suffix — in any stamp shape (blockquoted, plain
+`**Status:** X`, or list-form `- **Depends-On**: <stem>`):
 
 ```markdown
 > **Status: VETTED 2026-05-21.** <summary>. Depends-On: 2026-05-20-default-tenant-propagation, 2026-05-19-some-other-plan.
 ```
 
-Parser rule (same as `/verify-plan-status` and `/implement-plan` — keep
-these three skills aligned):
+Read the stems through the stamp parse owner (`_status-writers.md`), the
+same reader `/verify-plan-status` and `/implement-plan` call:
 
-1. Look at the status blockquote (the first `> **Status:` block under the
-   H1) and find EVERY case-sensitive `Depends-On:` occurrence — a block
-   often carries one in the headline sentence and another in a trailing
-   `History:` / re-vet line.
+```bash
+stamp_reader=<workspace-root>/qontinui-claude-config/scripts/lint-plan-status.py
+if [ -r "$stamp_reader" ] && command -v python3 >/dev/null; then
+  python3 "$stamp_reader" --depends-on "<plan path>"   # one stem per line
+fi
+```
+
+Exit 0 prints the stems (none is the common case), exit 3 means the window
+holds no status stamp (UNKNOWN — report it, never read it as "no
+dependencies"). Any other exit is no answer; apply the fallback rule below
+by hand, as you do where the script or `python3` is absent.
+
+Fallback rule (what `--depends-on` implements):
+
+1. Locate the HEADER REGION: start at the first body status stamp (a
+   frontmatter `status:` key only when there is none) — any shape, within
+   the first 60 lines — and take every PHYSICAL line from it down to, not
+   including, the first `##`-level heading (or line 60, whichever comes
+   first). Strip `>` and `**` markers per line, and find EVERY
+   case-sensitive `Depends-On:` occurrence in that region — the headline
+   sentence, a trailing `History:` / re-vet line, or a
+   `- **Depends-On**: <stem>` metadata line below the stamp's own block.
+   A `Depends-On:` below the first `##` heading is body prose and is never
+   read.
 2. For each occurrence, consider only the remainder of that PHYSICAL line
    — never the following blockquote lines or paragraphs, which may name
    unrelated plans in prose.
 3. Within that line, keep only date-prefixed plan-stem-shaped tokens
    (`YYYY-MM-DD-<kebab-slug>`, e.g. `2026-06-02-some-plan`). Prose, bare
    dates (`2026-05-21.`), and trailing punctuation never produce tokens
-   — a stem requires at least one `-word` segment after the date. Each
-   token is a bare plan **stem** — no `.md` extension, no path.
+   — a stem requires at least one `-word` segment after the date. A token
+   joined to a word character or `-` on either side
+   (`2026-06-02-fix-API-thing`, `x2026-06-02-fix`) is no stem — reject it
+   whole, never truncate. Each token is a bare plan **stem** — no `.md`
+   extension, no path.
 4. Union the stems across all occurrences, deduped, order-preserving.
 
    (A naive first-occurrence + split-on-commas parse mis-handled real
    status blocks whose prose contained a second `Depends-On:` or commas —
-   it produced phantom missing-dep aborts. Fixed in the canonical resolver
-   2026-06-04; this inline fallback mirrors it.)
+   it produced phantom missing-dep aborts.)
 
 For each dep stem, resolve to a plan file using the lookup chain:
 
@@ -1471,7 +1811,48 @@ use, so the lifecycle reads cleanly:
 > and what survived the audit>. Defects found: <count>. Auto-fixed: <count>.
 > Surfaced for user: <count>. <Optional: pointer to follow-up plan if you
 > created one in the report.>
+> Vetted-by: subagent (fresh context: plan path + `origin/main` body + repos
+> + rubric only; no authoring context). Plan: <plans repo> `origin/main`
+> <short-sha>. Read: <repo>@<short-sha>, <repo>@<short-sha>, ….
+> Checks: <the verdict's one-line checks — never containing `Depends-On:`
+> or `**Area:`, which the plan adapter parses off any stamp line>. Served
+> policy <names>@<versions>.
+> Independence: context — the reviewer did not hold the author's reasoning.
 ```
+
+**The stamp records WHO vetted, and with what context** *(plan
+`2026-09-08-vetting-is-not-independent-and-nothing-records-that-it-was`)*. The
+policy's recording half — the independence claim is STORED with the artifact,
+beside what was verified and against what [policy:
+`independence-is-context-not-credential`] — has its human-readable home in
+this line. Build every field of it from the Step 1.5 prompt and verdict: the
+parenthetical names each input the prompt actually carried; `Plan:` is the
+sha item 2 recorded (or "working-tree body (not on origin/main)"); `Read:` is
+the verdict's **read list**, every `repo@sha`; `Checks:` is its **checks**
+line; `Served policy` is its **policies** field. The header's `against <repo>
+origin/main <sha>` names the repo the claims were resolved against and must
+be that repo's `Read:` entry — one read list, not a second "verified
+against". §5.4 Step B's `independence` object is built from these SAME
+fields, so the stamp and `metadata.attestations` cannot disagree, and the
+stamp alone is enough to rebuild the declaration later.
+
+**When Step 1.5 could not spawn, qualify the stamp — never omit the line.**
+`VETTED` stays the FIRST token after `Status:`, so every parser that reads the
+lifecycle still reads it:
+
+```markdown
+> **Status: VETTED (self) <YYYY-MM-DD>, against <repo> `origin/main` <short-sha>.**
+> <summary as above>.
+> Vetted-by: the invoking session (no subagent: <why the spawn was not made>).
+> Independence: NONE — vetted in the invoking session's context.
+```
+
+The test-equivalent, stated so it can be checked: **a vet run with the spawn
+suppressed must produce the `VETTED (self)` stamp with `Independence: NONE`,
+never an unqualified `VETTED`.** An independence this run could not obtain is
+UNKNOWN and renders as NONE, never as a missing line [policy:
+`unknown-must-not-render-as-a-default`] — an unqualified stamp is exactly the
+indistinguishable-from-a-real-review artifact this line exists to end.
 
 **The stamp names the TREE the vet read, not only the date** *(plan
 `2026-09-05-a-verification-report-never-states-the-tree-it-read`, Phase 4)*.
@@ -1480,11 +1861,13 @@ The evidence manifest below already pins each verified claim to a commit via
 and no sha — so the one artifact in this repo that already had real tree
 identity was split down the middle, machine-readable half pinned and
 human-readable half not. A date cannot answer *"has `main` moved since this was
-checked?"*; a sha answers it in one comparison. Read it AFTER the fetch the
-§2a evidence pass does, with `git -C <repo> rev-parse --short origin/main`, and
-name the repo — a bare sha names no checkout. When several repos were read,
-name the one the plan's claims were resolved against and leave the rest to the
-manifest.
+checked?"*; a sha answers it in one comparison. On the subagent path take it
+from the Step 1.5 verdict's **read list** — the subagent's own `git -C <repo>
+rev-parse --short origin/main` after its fetch, the same source §5.4 Step B's
+`against` uses. On the self path, read it yourself after your own §2a fetch,
+with that same command. Either way name the repo — a bare sha names no checkout. When several repos were read,
+name the one the plan's claims were resolved against in the header; every repo
+read, that one included, is listed in the `Read:` field below it.
 
 #### Single-stamp invariant — read before stamping
 
@@ -1514,7 +1897,8 @@ and the body. Before writing your stamp:
    `NOT STARTED` per a verify pass, or had earlier verifier findings
    in a separate `> **Edit:` block), include the salient info in
    **one trailing line inside your new block**, prefixed `History:` or
-   `Previously:`. Never as a sibling blockquote.
+   `Previously:`. Never as a sibling blockquote. A re-vet that lifts a hold
+   keeps its trail here (§5.4 step 6, "And the converse").
 
 When `/vet-plan` and `/verify-plan-status` disagree on what the status
 should be (the plan is both VETTED *and* NOT STARTED — a vetted plan
@@ -1531,12 +1915,14 @@ skills do NOT both stamp side-by-side.
 | VETTED | `/vet-plan` | claims audited; ready to implement |
 | IN PROGRESS | `/implement-plan` | implementation underway |
 | SHIPPED | `/implement-plan` or `/verify-plan-status` | all phases live in code |
+| SHIPPED — UNCONFIRMED (<claim ids>) | `/implement-plan` or `/verify-plan-status` | all phases live in code, and the `## Done when` claims named do NOT read `confirmed` (or the section is unparseable — `done-when-unparseable`) — landed, not yet shown to work. Normalises to `shipped` in coord (the qualifier is for the human reader) |
 | PARTIAL | `/verify-plan-status` | some phases live, some open |
 | NOT STARTED | `/verify-plan-status` | no implementation evidence |
 | SUPERSEDED / OBSOLETE | any | terminal states |
 
-`/vet-plan` writes only `VETTED`. If the existing block is `SHIPPED`,
-`SUPERSEDED`, or `OBSOLETE`, do NOT overwrite — surface to the user
+`/vet-plan` writes only `VETTED` (on the self path qualified as
+`VETTED (self)`, still `VETTED` first — §5). If the existing block is `SHIPPED`
+(qualified `UNCONFIRMED` or not), `SUPERSEDED`, or `OBSOLETE`, do NOT overwrite — surface to the user
 that they're vetting a closed plan and confirm they actually want this
 rewrite. (`PARTIAL` and `NOT STARTED` are fine to overwrite — your vet
 pass produces fresher information.)
@@ -1569,14 +1955,19 @@ inline.
 > and apply these five rules.
 >
 > 1. **An `IN PROGRESS` stamp is a conditional STOP, not a value to replace.**
->    It protects a live peer's in-flight work.
+>    It protects a live peer's in-flight work. Read the whole HEADLINE, not only
+>    its first token: after a non-terminal first token, an `IN PROGRESS` /
+>    `IN_PROGRESS` anywhere in the headline makes it one
+>    (`VETTED-WITH-CORRECTIONS 2026-10-04, IN PROGRESS.` is; the headline rule is
+>    `/vet-imp-sweep` Step 3 filter 3b's).
 > 2. **The discriminator is the SESSION MARKER, not the token.** A marker that
 >    IS your own current session id is a resume: refresh the date and keep the
 >    trail, never take over. A marker that is a different session id is a LIVE
 >    PEER unless you can positively verify that session died with zero work
 >    products — transcript tail shows death, its worktrees clean and 0 ahead of
->    `origin/main`, and no PRs and no branches for the plan. Verified dead, and
->    only then, adopt it and append your own marker.
+>    `origin/main`, and no PRs and no branches for the plan — **or that it
+>    delegated the plan to a hold gate whose continuation you are (the arm
+>    table's case 2b)**. Only then adopt it and append your own marker.
 > 3. **No marker, or one you cannot positively attribute, is the UNIDENTIFIED
 >    DEFAULT: STOP.** Not an overwrite, and not an adoption. Adoption is the
 >    earned branch; stopping is the fallback.
@@ -1618,16 +2009,116 @@ refusing a first-time vet.
 |---|---|---|---|
 | 0 | The marker **IS** your own current session id | a resume, or a Step 0.5 re-run | **Refresh**, never take over: update the date and keep the trail. |
 | 1 | Work has **landed** | delivery **arm 1** | **Refuse.** Do not overwrite; route to closeout. |
-| 2 | The stamping session is **dead with zero work products** | the marker is a session id ≠ yours, AND its transcript tail shows death, AND its worktrees are clean and 0 ahead of `origin/main`, AND no PRs and no branches exist for the plan | **Adopt.** Keep the fresh `VETTED` and record the takeover as the `History:` line **inside that one block** (never a second blockquote — see the single-stamp invariant), naming both session ids and the evidence. |
-| 3 | The stamping session is a **LIVE PEER** | the marker is a session id ≠ yours and case 2's checks do NOT all hold | **STOP.** Do not vet and do not implement. |
+| 2 | The stamping session is **dead with zero work products** | the marker is a session id ≠ yours, AND its transcript tail shows death (or, on the same device, its claim ledger's `.alert` records `OWNER_GONE … pid_dead`; a cleared `implement→ship safety net` gate alone is a reason to probe, not evidence, since it also clears on a lapse — `/implement-plan` Step 0.5) — **or, when that transcript is not on this box, one of the three positive signals below the table** — AND its worktrees are clean and 0 ahead of `origin/main`, AND no PRs and no branches exist for the plan | **Adopt.** Keep the fresh `VETTED` and record the takeover as the `History:` line **inside that one block** (never a second blockquote — see the single-stamp invariant), naming both session ids and the evidence. |
+| 2b | The stamping session **handed the rest to a hold gate, and you are that gate's continuation** (gate-delegated adoption) | the marker is a session id ≠ yours, AND `printenv QONTINUI_GATE_ID` (by NAME, never an `env` dump) names gate G, AND the **last** `Held behind gate` line in the captured block is literally `Held behind gate <full gate_id> (<predicate>; anchor <work_unit_id>)` with G's **full** id (written only at the owner's closeout — `/implement-plan` Step 6.5), AND a FRESH `coord_gate_inspect {gate_id: G}` reads `verdict: cleared`, `continuation.consumed_by` equal to `$QONTINUI_GATE_DEVICE_ID` **and** to this device (`$QONTINUI_MACHINE_ID`, else `device_id` in `~/.qontinui/machine.json`), and an `anchor.work_unit_id` equal to this plan's unit or to the line's `anchor <work_unit_id>`. The `anchor <work_unit_id>` token is the last thing before the line's closing `)` — parse it from the RIGHT, so a predicate containing `;` or `)` cannot break the match. Case 2's zero-work-products checks do **not** apply: the predecessor's PRs are the expected state | **Adopt**, as case 2: keep the fresh write, and in place of the `Held behind gate` line (never keep it) write `History: adopted from <prior session id> via consumed hold <G full id>` **inside that one block** — a spelling that can never satisfy case 2b again. |
+| 3 | The stamping session is a **LIVE PEER** | the marker is a session id ≠ yours and neither case 2's nor case 2b's checks all hold | **STOP.** Do not vet and do not implement. |
 | — | **Anything else** — the stamp carries **no** session marker, or one you cannot positively attribute | no evidence of death, and no evidence it is yours | **STOP**, exactly as case 3. |
+
+**Case 2b reads coord, never the environment alone.** `QONTINUI_GATE_ID` is
+injected by the runner into a gate continuation (`_gate-registration` →
+"`QONTINUI_GATE_ID` **and** `QONTINUI_GATE_DEVICE_ID`"), but it is a claim any
+shell can set; what proves this session IS G's continuation is coord's record
+that G's continuation was consumed by this device. The field is
+`continuation.consumed_by` on `coord_gate_inspect` (`continuation_consumed_by`
+on a `coord_gate_list` / `GET …/coord/agent-gates` row), confirmed on
+qontinui-coord `origin/main` 049d74d7e. Every conjunct is a read: an absent
+variable, a stamp that cites G only by a prefix, a gate read that fails or is
+masked, a `consumed_by` that is null or names another device, or an
+`anchor.work_unit_id` on an unrelated unit is **not case 2b** — fall to case 3 or the unidentified
+default and STOP. An unmarked stamp cannot reach case 2b either: the
+`History:` line must name the owner it takes over from. *(Plan
+`2026-10-12-vet-plan-lifecycle-guards-have-no-arm-for-a-handed-off-owner-or-an-already-delivered-plan`,
+Defect 1: a multi-phase plan's held phase was otherwise unreachable, since the
+owner's own PR fails case 2's no-PRs check.)*
+
+**Case 2 across machines needs a POSITIVE liveness verdict** *(plan
+`2026-09-17-a-sender-cannot-see-its-ack-and-recon-reads-answer-for-the-credentials-tenant`,
+D3)*. When the stamping session's transcript is not on this box, the death probe
+is **UNKNOWN**, and with it case 2 does not hold — the row is **STOP** unless one
+of these says dead-or-done. A signal stands in for the transcript-tail check
+ONLY; case 2's other three checks (worktrees clean and 0 ahead, no PRs, no
+branches) must still all hold beside it.
+
+**Stage the credentials ONCE, first, and use them for all three signals.**
+§0.25 has already deleted its own bearers, and signals 2 and 3 need one (the
+session's own MCP door cannot carry signal 3's HTTP GET). So, from the
+session's cwd, run
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/recon-tenant.sh --emit-bearer <owner/repo>...   # every one of the plan's Repo(s)
+```
+
+ONCE for the whole of case 2. `--emit-bearer` makes `MATCH` print one
+`bearer <tenant>=<path>` line too; `MULTI` prints one per tenant as always (the
+plan tenant first). `UNKNOWN`, or exit `2` with no verdict line (a usage
+error: fix the argument and re-run), makes signals 2 and 3 UNKNOWN. Signal 2's send,
+signal 1's ack read-back and signal 3's read all use THESE bearers — never a
+second recon run — and when case 2 is decided, delete them: `rm -rf` the
+directory the printed bearer paths sit in (recon-tenant.sh's own per-run
+directory).
+
+1. an `ack_response` of "abandoned" on a message you sent that session, read
+   with `coord_message_status {message_id}` (the `message_id` is in
+   `coord_send_message`'s receipt; once that tool is served, it returns
+   `delivered_at`, `read_at`, `acked_at` and `ack_response` to the SENDER only). Read it over the SAME door
+   and tenant the message was sent over — once served, a message sent under a
+   bearer is visible only under that bearer's tenant and device (the plan's D1
+   design), and a read anywhere else 404s. Until that tool is served —
+   absent from your tool list, or `GET /coord/session-messages/<message_id>`
+   answering 404 for a `message_id` your own receipt holds — the ack is UNKNOWN (one 404 also covers wrong device, wrong tenant and unknown id, so a 404 never says "no ack"), and `coord_inbox` cannot stand in for it:
+   it is recipient-scoped and never shows a sender its reply;
+2. `coord_send_message` to that session answering `queued: false` with
+   `refused_not_promptable`, which is coord observing it `finished` /
+   `waiting_human` / closed. **It counts ONLY when signal 3 corroborates it.**
+   `waiting_human` is ALIVE (it may hold uncommitted work), and the refusal does
+   not say which of the three states it saw: `refused_not_promptable` lists the
+   refused session ids only, and the `reason` beside it is one FIXED string
+   naming all three (`"every resolved target session is not promptable
+   (session_status waiting_human/finished, or closed) …"`, `qontinui-coord`
+   `crates/coord/src/mcp/tools.rs`, the `coord_send_message` handler). So the
+   words `finished` and `closed` in that text are present for a live
+   `waiting_human` peer too and are never evidence. Without signal 3 it is
+   UNKNOWN. Send it under the **plan's** tenant, over
+   `POST https://coord.qontinui.io/mcp` with the plan tenant's bearer from the
+   staging run above, and read signal 1 back over that same bearer, since a
+   send under the wrong tenant resolves no target at all;
+3. coord's session row for that session reading `finished` / `closed`. The door
+   is `GET https://coord.qontinui.io/coord/sessions/fleet?include_closed=true`
+   (`qontinui-coord` `crates/coord/src/session_fleet.rs`, `get_fleet_sessions`:
+   a device-JWT `FleetPrincipal` read whose tenant is the verified principal's,
+   so it answers for the bearer's tenant only; `include_closed` defaults to
+   `false`, which hides exactly the closed rows this signal needs). Read it
+   with `-H "@<path>"` under EACH bearer the staging run printed, passing
+   `nextCursor` back as `?cursor=` until it reads `null`,
+   and match the stamping session on `claudeCodeSessionId`. On the matching row
+   read `state` and `closedAt` (closed) and `sessionStatus` (`finished`), the
+   latter only when the response's `workAxisColumnsPresent` is `true` — `false`
+   degrades every `sessionStatus` to `null`, which is UNKNOWN, not unset; and
+   `sessionBridgeColumnPresent: false` degrades every `claudeCodeSessionId` to
+   `null`, so no row can match. A walk that stops before `nextCursor` is
+   `null`, a non-2xx, a degraded flag, or no matching row in any tenant is
+   **UNKNOWN, never dead**. Read EVERY bearer's walk before deciding: when
+   the same `claudeCodeSessionId` matches rows under more than one bearer,
+   the signal holds only if every bearer's walk completed AND every matched
+   row, under any bearer, reads `finished` / closed. Rows
+   that disagree (closed under one tenant, active or `working` under another)
+   are UNKNOWN, never dead. Stopping at the first `closed` row would adopt a
+   live peer.
+
+**Silence on the bus is never adoptable**, and an empty `coord_orient`
+`session_activity` is UNKNOWN by that tool's own contract (it lists live sessions
+only). Nor is a *clear* from the recon reads: even folded across every
+tenant `recon-tenant.sh` lists, a peer writing under a tenant this device is not
+bound to stays invisible to them, which is why adoption needs one of the positive
+signals above rather than the absence of a negative one. On 2026-09-17 a session adopted on exactly that silence and implemented a
+plan its live peer was mid-way through (coord finding `c376a90e`, as cited by plan `2026-09-17-a-sender-cannot-see-its-ack-and-recon-reads-answer-for-the-credentials-tenant`).
 
 Evaluate case 0 first — a run that positively identifies the marker as **its own
 current session id** is refreshing its own stamp, not taking one over.
 
 **The unidentified default is not a formality.** An unmarked `IN PROGRESS` stamp
 (hand-written, operator-written, or predating the marker convention) matches
-neither case 2 nor case 3, and without this row the reader falls back to the
+neither case 2, case 2b nor case 3, and without this row the reader falls back to the
 pre-change behaviour — overwrite — which is the regression this section opens by
 forbidding. It bites hardest in the motivating scenario: under delivery arm 2 or
 3 (UNKNOWN) with an unmarked stamp, no other row fires at all.
@@ -1635,8 +2126,8 @@ forbidding. It bites hardest in the motivating scenario: under delivery arm 2 or
 **Case 3 is invisible to the delivery read, by construction** — a peer
 mid-implementation has no merged PRs yet, so the unit returns
 `{shipped: false, evidence_complete: true, evidence_gaps: []}`, a clean
-non-degraded arm-5 reading. Only case 2's four checks separate case 2 from case
-3, and **the default when they fail is STOP, never adopt.** Adoption is the
+non-degraded arm-5 reading. Only case 2's four checks, or case 2b's gate read,
+separate adoption from case 3, and **the default when they fail is STOP, never adopt.** Adoption is the
 *earned* branch; stopping is the fallback.
 
 **Routing to closeout (cases 1 and 2's terminal half) has two halves, and one of
@@ -1784,7 +2275,10 @@ unreserve the plan mid-lifecycle. `"not_held"` is otherwise fine and idempotent.
 >
 > The consequence is specific to THIS section: a `unit_ready` gate is registered
 > against a status the adapter is about to undo, so the gate sits `Open` forever
-> and its continuation never dispatches. **Stamp the plan FILE and let the adapter
+> and the record of readiness goes stale. It carries no continuation (see the
+> gate rules in step 5), so nothing is suppressed: the dispatching
+> `continuation_spawn` rides the step-6 `time_elapsed` net gate, which does not
+> read the registry status. **Stamp the plan FILE and let the adapter
 > carry the status**; where you must transition directly, re-read the unit
 > afterwards and say in the report if it did not hold.
 >
@@ -1803,7 +2297,7 @@ tracks the plan as a generic **work unit**) so coord holds the ready plan as
 watched, dispatchable work instead of letting it rot until someone clicks. On
 **every** arm, standalone and `/vet-imp` alike, also register the safety-net gate
 (**step 6**, always, unless step 2 finds no
-`device_id` or step 6's hold-gate skip applies) whose queued continuation dispatches into a session the operator can
+`device_id`, §5.4's delivery skip, step 6's hold-gate skip, or — under `/vet-imp` only — step 6's no-withdraw-door skip applies) whose queued continuation dispatches into a session the operator can
 **see** if nobody picks the plan up — under `/vet-imp` that net is the ONLY gate
 this section writes. This **replaces** the old
 `operator_approval`-bootstrap gate that used to queue ready work: a work queue is
@@ -1821,7 +2315,11 @@ decisions only — see the predicate guidance in `_gate-registration`).
 >
 > On EVERY row, a plan that takes step 6's **hold-gate skip** registers
 > NEITHER gate: it is not ready work, so there is nothing to record as ready
-> and nothing for a 30-minute net to dispatch.
+> and nothing for a 30-minute net to dispatch. A plan that takes §5.4's
+> **delivery skip** (end of step 3) registers NEITHER gate on any row, and
+> makes no `→ vetted` transition: its work has landed. On the `/vet-imp` row
+> only, a session holding no withdraw door takes step 6's
+> **no-withdraw-door skip** and registers no net either.
 >
 > **Why the record gate is skipped under `/vet-imp`.** Its predicate can only be
 > satisfied while the unit is still at the vetted status AND no unmuted sibling
@@ -2081,9 +2579,9 @@ decisions only — see the predicate guidance in `_gate-registration`).
 >
 > **Attach a continuation only when the follow-up will outlive this session**
 > — "finish to zero" is intent, and intent cannot survive exogenous session death:
-> (1) the wait exceeds charter rule 10's monitor window (rule 10 keeps a session
-> alive and monitoring only for "an observable signal and a short expected wait
-> (≲2h: deploy, CI, merge train)"); (2) vetting **STANDALONE**, where no
+> (1) the follow-up can only run after the watched event (a session never stays
+> alive to wait — operator decision 2026-10-17 retired the ≲2h keep-alive arm of
+> `dependency-wait-and-resume` — so every such wait outlives it); (2) vetting **STANDALONE**, where no
 > implementation follows this session and the dispatch into a visible session is
 > the whole point — **or vetting under `/vet-imp`, per the exception above,
 > where the continuation is the net under a chain that may drop and
@@ -2091,8 +2589,8 @@ decisions only — see the predicate guidance in `_gate-registration`).
 > BOTH cases the continuation rides the step-6 `time_elapsed` net gate, never
 > the `unit_ready` record gate;
 > (3) `operator_approval` / genuine human-decision gates, which
-> are unbounded in time (except sensitive work — security/credential/billing/
-> strategy — which stays notify-only unconditionally); (4) cross-session
+> are unbounded in time (sensitive subject matter changes nothing here:
+> `_gate-registration` → "Sensitive-work rule"); (4) cross-session
 > dependency chains whose follow-up belongs to a different work unit or device.
 > **(3) and (4) do not arise in §5.4 by construction** — this section registers a
 > `unit_ready` record gate (and, at most, one `time_elapsed` net gate beside it) on
@@ -2110,13 +2608,18 @@ decisions only — see the predicate guidance in `_gate-registration`).
 > vetting session to predict its own death — and a session that could predict that
 > would not need the net. Case (2) already covers BOTH standalone vetting and
 > `/vet-imp`, which between them are every way `/vet-plan` is ever invoked. So the
-> net gate is **UNCONDITIONAL in §5.4**, with exactly two skips, and each is a
+> net gate is **UNCONDITIONAL in §5.4**, with named skips only, and each is a
 > fact you can READ rather than a future you must guess: **no `device_id`
-> resolves** (step 2), leaving a `continuation_spawn` with no target; or the plan
+> resolves** (step 2), leaving a `continuation_spawn` with no target; a fresh
+> delivery read after step 3 reads **arm 1** (the delivery skip),
+> so there is no work left to dispatch; or the plan
 > is **held behind an open, armed trigger gate** (step 6's hold-gate skip), so
-> the plan already has a net keyed on its real trigger. The
-> `unit_ready` record gate is registered either way and is continuation-less
-> either way.
+> the plan already has a net keyed on its real trigger; or — **under `/vet-imp`
+> only** — this session holds **no withdraw door** (step 6's
+> no-withdraw-door skip), so the net could never be retired and would be a
+> guaranteed redundant spawn. The
+> `unit_ready` record gate is registered either way on the standalone arm and
+> is continuation-less either way.
 >
 > *What the conditional actually cost, measured 2026-09-03.* Of the 7 `unit_ready`
 > record gates registered tenant-wide that day, **6 had no net gate beside them at
@@ -2197,12 +2700,25 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    leaves the stored object byte-identical (plan
    `2026-09-16-work-unit-upsert-without-metadata-wipes-the-phase-list`; before
    it, this very call erased `metadata.phases`). A `metadata` object you DO send
-   REPLACES the stored one whole — every key you left out is dropped except
-   `attestations`, which coord preserves, and `{}` clears the rest — so add no
+   REPLACES the stored one whole — every key you left out is dropped EXCEPT
+   `attestations`, which coord carries forward from the stored row when the
+   object you send omits that key (qontinui-coord#2574, `d9f525e92`, read as the
+   serving build 2026-10-09; an `attestations` key you DO send, `null` included,
+   still wins); `{}` clears the rest — so add no
    defensive read-merge-write here. If you must set a key (e.g. `area`), read
    the row and send the full object, `phases` included; the runner's plan
    adapter re-upserts scanned plans about every 68 s and can land between your
    read and your write.
+   To set one key without replacing the rest, send `metadata_patch` (the
+   non-clobbering write shape) instead of `metadata`. Separately, VERIFIED against
+   the serving build's source: an upsert that carries NO vet manifest and does
+   not TRANSITION the unit into `vetted` never retires the stored vet manifest
+   (coord `f1400f2d8`, an ancestor of serving build `601c2bda` as of 2026-10-07:
+   `is_vet_transition` / `vet_work_needed` key retirement on an actual
+   transition into `vetted`, so a manifest-less metadata-only or same-status
+   upsert keeps the live generation; a transition into `vetted`, or ANY
+   submitted manifest — including an explicit empty `[]`, on any status —
+   retires the prior generation).
    With the UUID in hand, record it where the WIP-custody Stop hook reads it —
    this is the only lifecycle step that holds a real one, so without this the
    custody record's `work_unit_id` stays `null` for every worktree:
@@ -2215,7 +2731,8 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    and parse `"device_id"` (fall back to `"machine_id"` if present).
    This step is **unconditional**, because step 6 is — see the correction in the
    exception blockquote above. If neither source yields a UUID, that is one of the
-   two cases where the net gate is skipped (the other is step 6's hold-gate
+   named cases where the net gate is skipped (the others are the delivery skip
+   at the end of step 3, step 6's hold-gate skip and step 6's no-withdraw-door
    skip): a `continuation_spawn` has no target without it. Then still register
    the `unit_ready` record gate (per step 5's conditions, which exclude a held
    plan), and **say in your report that the net was skipped because no `device_id`
@@ -2263,8 +2780,27 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    trigger carries an armed continuation BY DESIGN; it is the plan's real net.
    Withdrawing, cancelling or muting it here would leave the plan with no trigger, and a
    later re-read would then register a 30-minute net onto forbidden work.
+   **The delivery skip — evaluate it HERE, after this step's retirements and
+   before step 4.** RE-ISSUE `coord_work_unit_list_citations(<plan-stem>)` and
+   read `.delivery` through Step 0.25's arm table, in its order (4, 3, 2, 1, 5,
+   then 6) and with every arm-1 conjunct. The key is this FRESH read, never
+   Step 0.25's capture: a capture that read arm 1 STOPped the run at Step 0.25
+   and never reaches §5.4, so only a plan that landed (or became readable as
+   landed) after the capture can take this skip. If it now reads **arm 1**,
+   **skip steps 4, 5 and 6** — no `→ vetted` transition, no record gate, no net:
+   a vet→implement net would dispatch an implement session onto delivered work.
+   Like the hold-gate skip, withdraw any OPEN `unit_ready` record gate an
+   earlier standalone vet left on the unit (`coord_withdraw_gate`; it would
+   publish delivered work as ready) and report its `gate_id`; step 8 then
+   asserts ZERO open rows. Write `delivery skip: landed mid-vet (<PR
+   list>)` into the stamp's `Checks:` line and re-land it with §5's
+   `land-plan-stamp.sh`, message `docs: stamp <plan-stem> VETTED (delivery
+   skip)` (§5 already published the stamp), and report `NO NET (delivered: <PR
+   list>) — closeout owed`. Any other arm, UNKNOWN included, is not the skip:
+   continue to step 4. (`/vet-imp` Step 3's arm-1 STOP withdraws a net
+   registered before the plan landed.)
 4. **Set the work unit's registry status — UNCONDITIONALLY, on BOTH arms, and
-   under the hold-gate skip too.** A held plan still ATTEMPTS the vetted
+   under the hold-gate skip too** (only the delivery skip above skips it). A held plan still ATTEMPTS the vetted
    transition (a refusal leaves the status unchanged, exactly as for any plan): the runner's plan adapter re-derives the status from the file's
    `VETTED` stamp and would revert any other word, and the unit cannot derive
    `ready` while the hold gate is open (it is a counted gate, so
@@ -2284,7 +2820,8 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    `→ in_progress` transition, so it is not one of them.) A REFUSED attestation
    leaves the status unchanged BY DESIGN — that is the arm below, not a skipped
    step. What this warning forbids is never attempting the transition at all.
-   The attempt is unconditional; only step 5's gate is caller-scoped.
+   The attempt is unconditional — except under the delivery skip (end of step
+   3), which skips steps 4–6 together; only step 5's gate is caller-scoped.
 5. **Register the RECORD gate — STANDALONE VETS ONLY, and never under step 6's
    hold-gate skip** (a held plan is not ready work; a record gate would publish
    it as ready). **Under `/vet-imp`, SKIP
@@ -2360,7 +2897,7 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
      predicate held at the DOOR; the row is still born `open`, and step 6's net
      pins it back `Open` until the net clears or is withdrawn.* When an exception DOES apply
      (most often: vetting standalone, **vetting under `/vet-imp`** — see the
-     exception above — or a wait longer than rule 10's ≲2h window), the
+     exception above — or a follow-up that waits on an event), the
      continuation goes on the SEPARATE net gate in step 6, targeting the
      operator's device with a **visible** session —
      ```json
@@ -2421,10 +2958,13 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
      loophole. Full vocabulary and the "when to classify" rule: the `gate_class`
      bullet in the flagged-items section below, canonical
      `_gate-registration` → "`gate_class`".
-6. **Register the SAFETY-NET gate — a SECOND gate, ALWAYS** (two exceptions,
-   both facts you READ rather than futures you guess: step 2's — no `device_id`
-   resolved, so a `continuation_spawn` has no target — and the **hold-gate skip**
-   defined just below). This step is **not** conditional on which skill invoked
+6. **Register the SAFETY-NET gate — a SECOND gate, ALWAYS** (the exceptions are
+   facts you READ rather than futures you guess: step 2's — no `device_id`
+   resolved, so a `continuation_spawn` has no target — the **delivery skip**
+   (end of step 3; it skips this step together with steps 4 and 5), the
+   **hold-gate skip** defined just below, and — **under `/vet-imp` only** — the
+   **no-withdraw-door skip** defined after it). This step is **not** otherwise
+   conditional on which skill invoked
    the vet: `/vet-imp` and standalone vetting both take it, and between them that
    is every invocation. Same door and same transport cascade as step 5, same work
    unit, **different `phase_name`**.
@@ -2476,12 +3016,70 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    NOT use this skip to avoid a net on work you merely expect to defer; the
    trigger must already be a registered, armed gate. And the converse: when a re-vet
    (typically the one the hold gate's own continuation dispatched) concludes
-   PROCEED, rewrite the status block so it NO LONGER defers behind that gate —
+   PROCEED, rewrite the status block so it NO LONGER defers behind that gate,
+   and keep the lifted hold's trail in its `History:` line (`Held <date> behind
+   <trigger>; gate <id> cleared.`), as `/implement-plan` Step 0.5 does —
    a stamp that still says "do not implement until gate X clears" makes
    `/implement-plan` Step 0.45 stop on the chain's own implement half. Measured 2026-09-26 on
    `2026-08-07-web-memory-records-quota-incremental-counter` (DEFER behind
    `metric_threshold` gate `92009421`, `run_skill /vet-imp` armed) — coord
    finding `e0014717`.
+
+   **The no-withdraw-door skip — under `/vet-imp` only, a net this session could
+   never retire.** Under `/vet-imp` the net exists to be WITHDRAWN by this same
+   session at `/implement-plan` Step 0.5. A session that can register it but not
+   withdraw it arms a guaranteed redundant spawn: the net fires 30 minutes after
+   registration however quickly the chain reaches IN PROGRESS. Measured
+   2026-10-11, gate `59de8093`: a bootstrap-only session registered the net,
+   stamped IN PROGRESS 12 minutes later, held no withdraw door, and the net
+   dispatched a second session onto the plan on another device (plan
+   `2026-10-12-a-bootstrap-only-session-arms-a-vet-to-implement-net-it-cannot-withdraw`).
+   - **The withdraw doors are exactly `/gate`'s Withdraw cascade:** native
+     `coord_withdraw_gate`; a live proxy nonce over `/gate`'s loopback-proxy JSON-RPC rung
+     (including residual (a)'s in-process nonce mint); a device JWT, on
+     `$COORD_HTTP_URL/mcp` or the bare `POST /coord/gates/<id>/withdraw` (from
+     `$COORD_DEVICE_JWT`, the static file, or residual (b)'s runner mint).
+   - **Two rungs register but cannot withdraw:** `/gate`'s bootstrap-credential rung
+     ("ATTEST and WITHDRAW are not on this rung") and its
+     residual (c)'s acting bearer ("register-scoped and does NOT carry
+     withdraw"). Neither is a withdraw door.
+   - **ESTABLISH the door by a read — never by tool visibility.** A tool list is a
+     boot cache: in the incident the native coord tools were a service-token
+     proxy carrying no withdraw tool. Read the door that carried THIS run's own
+     earlier §5.4 writes (step 1's upsert, step 4's transition — `/gate` and
+     `/coord-revive` both name the transport that answered). A step 3
+     prior-net withdraw that came back `withdrawn` IS that read. If the
+     door was the bootstrap-credential rung, there is **no** withdraw door: it
+     is the cascade's last rung, so every withdraw-capable rung above it had
+     already failed. If it was residual (c) (the acting bearer), that does
+     NOT follow — `/gate`'s generic-remote-MCP rung, which comes after it,
+     reads two static device-JWT sources (`$COORD_DEVICE_JWT`,
+     `~/.qontinui/coord-device-jwt`) nothing earlier read — so probe those
+     with the device-JWT control read before concluding there is none.
+     Otherwise confirm with ONE read over that door —
+     `coord-revive.sh tools` listing `coord_withdraw_gate`, or the device-JWT
+     control read answering `200` (`/coord-revive` LIVE at L1, L2 or L4 — L4
+     being a device JWT or a minted proxy nonce — and NOT L3, which is the
+     acting bearer, nor L5 `PARTIAL_BOOTSTRAP`). A probe you could not make is UNKNOWN, and UNKNOWN
+     means **no net** [policy: `verification-and-evidence`
+     `unknown-must-not-render-as-a-default`].
+   - **With no withdraw door, register NO net** and report
+     `NO NET (no withdraw door: <the doors probed, and what each answered>)`.
+     Step 8 then asserts the net is absent. The record-gate rules are
+     unchanged (under `/vet-imp` there is none). The other withdrawals §5.4
+     makes will have failed for the same reason — step 3's prior-net
+     retirement and the hold skip's record-gate withdrawal, both of which
+     run before this step — so report each such `gate_id` as
+     **unretired**, never as retired.
+   - **What recovers a dropped chain then:** nothing coord dispatches. A chain
+     that dies after vetting leaves a `VETTED` stamp, and `/vet-imp-sweep`
+     (which reads the stamp) is what picks it up. That is the accepted trade: an
+     occasional stranded plan the sweep recovers beats a guaranteed wasted
+     session on every bootstrap-only run.
+   - **A standalone vet keeps the net whatever its doors.** Standalone, nothing
+     retires the net by design and its firing IS the intended dispatch, so the
+     withdraw door is irrelevant there. Never apply this skip outside
+     `/vet-imp`.
 
    **Copy these two literals verbatim — do not paraphrase either.** They are a
    wire contract with `/implement-plan`, not description:
@@ -2626,19 +3224,28 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    top of this section: **standalone `/vet-plan` asserts TWO when step 5
    registered the record gate (the attestation landed, or Step A found the unit
    already past you); ONE (the net) otherwise — §5.4 ended REFUSED, Step A's
-   status was UNKNOWN, or the vet ran under `/vet-imp`.** Under step 6's **hold-gate skip** every
+   status was UNKNOWN, or the vet ran under `/vet-imp`.** Under the
+   **delivery skip** (end of step 3) every count is ZERO on every arm: assert
+   no record or net row is open and un-withdrawn (a record gate the skip
+   withdrew reads `withdrawn`; one it could not withdraw for want of a door is
+   expected open — name its `gate_id` as unretired). Under step 6's
+   **no-withdraw-door skip** (`/vet-imp` only) the net count is ZERO: assert no
+   net row registered **by this run** is open; a prior-generation net step 6
+   reported unretired is expected open — name its `gate_id`. Under step 6's **hold-gate skip** every
    count is ZERO on every arm: assert both absent — no row that is open and
    neither muted nor withdrawn, since this `open_only: false` read also returns
    the rows step 3 retired — and assert every cited hold gate still `open` with
    `armed && will_dispatch`. An open `unit_ready` row under the hold is
-   remedied as in step 3: withdraw it and report its `gate_id`. Report each one's
+   remedied as in step 3: withdraw it and report its `gate_id` (a row it could
+   not withdraw for want of a door, record gate or prior-generation net, is
+   expected open — name its `gate_id` as unretired). Report each one's
    `gate_id` **in full**
    [policy: `coordination` `record-gate-ids-in-full`]:
 
    | expected row | how to recognise it | if it is MISSING |
    |---|---|---|
    | the **record** gate — **standalone only** | `predicate_kind: unit_ready`, continuation `armed: false` | standalone, attestation landed: step 5 did not land — re-issue it, and never report §5.4 done without it. **Under `/vet-imp` its absence is CORRECT** — assert it is absent, and do not re-issue it. **On the REFUSED arm its absence is CORRECT** — assert it absent, do not re-issue; quote coord's `attestation:vetted` gate id (none for `owner_unresolved` / `attester_unresolved`) |
-   | the **net** gate — **always, unless step 6's hold-gate skip applied** | `predicate_kind: time_elapsed` **and** continuation `armed: true` **and** `will_dispatch: true` | step 6 did not land — re-issue it; if it still will not register, report **NO NET** explicitly with the reason, per step 6's honesty rule. **Under the hold-gate skip its absence is CORRECT** — assert it is absent and that the hold gate you cited is still open and armed |
+   | the **net** gate — **always, unless the delivery skip, step 6's hold-gate skip or (`/vet-imp` only) its no-withdraw-door skip applied** | `predicate_kind: time_elapsed` **and** continuation `armed: true` **and** `will_dispatch: true` | step 6 did not land — re-issue it; if it still will not register, report **NO NET** explicitly with the reason, per step 6's honesty rule. **Under the hold-gate skip its absence is CORRECT** — assert it is absent and that the hold gate you cited is still open and armed. **Under the delivery skip its absence is CORRECT** (the record gate's too) — assert both absent and quote the arm-1 read's landed PRs. **Under the no-withdraw-door skip its absence is CORRECT** — assert it absent and quote the `NO NET (no withdraw door: …)` line |
 
    ⚠️ **Under `/vet-imp`, a `unit_ready` row PRESENT on this unit is the defect,
    not the success signal.** It means step 5 was run anyway; say so, and leave
@@ -2773,7 +3380,9 @@ The transition carries BOTH controls in the same request: the `independence`
 declaration, which is what authorizes an Attested `→ vetted` from the session
 that owns the unit, and the §2a manifest, which is the evidence coord stores in
 the same transaction as the status write. There is no second call and no
-fallback transition.
+fallback transition — with ONE named exception, `surface_unavailable` (below),
+where coord refused the whole call before any mutation and a manifest-free
+re-send is the only way the status write lands.
 
 ```json
 {"slug": "<plan stem>", "to_status": "vetted",
@@ -2786,6 +3395,23 @@ fallback transition.
  "vet_evidence": [ <the manifest you built in §2a, verbatim> ]}
 ```
 
+**On the subagent path (Step 1.5 spawned), build the declaration from the
+Step 1.5 verdict — the SAME facts as Step 5's `Vetted-by:` lines.** One source,
+two readers: the stamp is what a human reads, `metadata.attestations` is what a
+machine reads, and they cannot disagree if neither is composed separately.
+
+| Field | Built from |
+|---|---|
+| `verified` | the stamp's `Checks:` — the verdict's **checks** line |
+| `against` | the stamp's `Read:` list (every `repo@sha`) plus its `Plan:` field — the plan at `origin/main <sha>`, or "working-tree body (not on origin/main)" |
+| `context` | the stamp's `Vetted-by:` parenthetical — each input the Step 1.5 prompt carried, and that no authoring context was passed |
+
+**On the self path (`VETTED (self)`), send NO declaration.** This session held
+the context the control exists to exclude, so any declaration it sent would be
+the unearned, false witness statement the blockquote below forbids. Send the
+call without `independence`; a refusal then takes the REFUSED arm below,
+unchanged.
+
 > ⚠️ **The `independence` declaration — what it is, and what it is not.**
 > [policy: `independence-is-context-not-credential`] (verification-and-evidence
 > v9, operator-decided 2026-09-03) settles what "independent" means here, and it
@@ -2794,11 +3420,13 @@ fallback transition.
 > token shape. A SUBAGENT QUALIFIES … it needs no distinct session id."*
 >
 > When the declaration is present and well-formed it AUTHORIZES the Attested
-> transition and is stored on the unit at `metadata.attestations`. Do the
-> vetting in a fresh-context subagent (hand it the plan body and NOT your
-> reasoning), then send what it verified, what it verified that against, and how
-> it came by a context free of yours. Every field must be non-blank (zero-width
-> characters count as blank) and at most
+> transition and is stored on the unit at `metadata.attestations`. The
+> fresh-context review it declares is Step 1.5's, performed before a single
+> claim was checked, and the table above says how its verdict fills the three
+> fields. A subagent spawned only now, after this session has vetted, edited
+> and stamped the plan, is a spawn whose only purpose is satisfying an identity
+> check — the kind the clause refuses to require. Every field must be non-blank
+> (zero-width characters count as blank) and at most
 > `work_unit_registry::INDEPENDENCE_FIELD_MAX` bytes; a field that fails either
 > answers `422 independence_declaration_malformed`. Fix the field and re-send
 > ONCE; that 422 is a bug in what you sent, not a refusal of the witness.
@@ -2808,9 +3436,9 @@ fallback transition.
 > requiring it — which is exactly why it is STORED: the control is
 > auditability, not prevention. A declaration asserting an independence you
 > did not have is a false witness statement with your actor key next to it.
-> A vet this session performed in its own context has no honest declaration to
-> send: send the call WITHOUT `independence`, expect `self_attestation_forbidden`,
-> and take the REFUSED arm below.
+> A vet this session performed in its own context — the `VETTED (self)` path —
+> has no honest declaration to send: send the call WITHOUT `independence`,
+> expect `self_attestation_forbidden`, and take the REFUSED arm below.
 
 ⚠️ **The door is `coord_work_unit_transition` (or its HTTP twin) — NEVER
 `coord_work_unit_upsert`, for the attestation.** The upsert has no
@@ -2829,8 +3457,9 @@ where it is.**
    not what coord's `origin/main` says: a client caches `tools/list` at
    connect, so the schema you hold can predate the door.
 2. **Otherwise, the raw door over the same nonce:**
-   `bash <workspace-root>/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh call coord_work_unit_transition '<json>'`,
-   with the real workspace root substituted and the path spelled absolutely. It
+   `bash <session-workdir>/.claude/skills/coord-revive/coord-revive.sh call coord_work_unit_transition '<json>'`,
+   with `<session-workdir>` substituted by the directory the runner provisioned
+   this session's `.claude/` into, and the path spelled absolutely. It
    reads no cached schema, so it reaches the fields a stale client schema
    hides (coord finding `230b8af2`). `coord-revive.sh tools` shows what that
    door serves. A zero exit is not evidence the write landed: verify by read.
@@ -2854,6 +3483,13 @@ stale schema refuses it before it leaves the session. Both say the door you
 used does not carry the field. Go down to rung 2, which does. Re-sending
 without the field is not a degraded success: without `independence` the call
 cannot attest, and without `vet_evidence` there is nothing to store.
+**The one exception is `surface_unavailable`** (the table under the receipt
+warning below). That refusal is not about the door: the door carried the
+field, and coord answered that its evidence TABLE is absent, refusing the whole
+transition before any mutation. No rung changes that, and coord accepts a
+manifest-less transition there, so re-send with the `vet_evidence` KEY
+omitted — not `vet_evidence: []`, which coord still treats as a manifest and
+refuses again — and `independence` kept.
 
 > ⚠️ **Do not confirm by the `200`. Confirm by the RECEIPT.** When the running
 > coord carries the manifest surface, a write that touched it attaches a
@@ -2865,15 +3501,15 @@ cannot attest, and without `vet_evidence` there is nothing to store.
 > | `vet_generation` | the generation your rows landed as |
 > | `retired_prior_rows` | how many rows from the previous vet were retired |
 > | `admitted_on` | **which authz arm let the transition through** — see the table below |
-> | `vet_evidence_error` | present only when the evidence surface was unavailable |
+> | `vet_evidence_error` | present only on a transition that carried **no** manifest, when the evidence surface was absent: it says the prior generation could not be retired, never that a manifest was dropped (a manifest sent to an absent surface is refused outright — the `surface_unavailable` arm below) |
 >
 > On a coord carrying qontinui-coord's change for plan
 > `2026-09-20-the-vetted-unattested-fallback-is-still-writable-and-vet-plan-sends-the-manifest-down-a-door-that-cannot-authenticate`
 > (its Phase 3), every `→ vetted` returns a receipt, with `stored: 0` when no
 > manifest arrived. On an older coord the receipt appears only when the write
-> touched the evidence surface. Either way **a missing receipt, or `stored: 0`
-> after you sent entries, means your manifest was NOT stored**. Report it in §6
-> as *built but not stored*, with the arm's required detail (§6).
+> touched the evidence surface. Either way **any condition in the
+> *built but not stored* table below means your manifest was NOT stored**.
+> Report it in §6 as *built but not stored*, with the arm's required detail (§6).
 >
 > **State of the surface.** The manifest door is on `qontinui-coord`'s
 > `origin/main` as of `qontinui-coord#2207`: both HTTP doors
@@ -2887,6 +3523,85 @@ cannot attest, and without `vet_evidence` there is nothing to store.
 > **Key off the receipt and the read-back, not off a deploy date.** Until a
 > receipt or a read comes back carrying your entries, "submitted" is UNKNOWN,
 > not stored.
+>
+> **Built but not stored → post ONE finding, so N sessions converge on one
+> readable row.** Prose in §6 reaches one reader; N sessions hitting the same
+> serving build produce N transcripts and no row. So whenever the manifest ends
+> up *built but not stored*, which is any of these four:
+>
+> | Condition | How you saw it |
+> |---|---|
+> | `no_receipt` | the transition answered `200` with no `vet_evidence` object |
+> | `stored_short` | a receipt came back with `stored` below the count you sent (including `stored: 0`) |
+> | `field_rejected` | you walked the whole ladder above and NO rung carried `vet_evidence` — every rung you could reach refused the field by name, or was unreachable (say which, e.g. rung 3 with no device JWT). The ladder forbids dropping it on the first refusal; this is the end state after the last rung, and the transition stays unsent rather than going out without the field |
+> | `surface_unavailable` | HTTP `503` with `"error": "vet_evidence_surface_unavailable"`, or an MCP tool error beginning `vet_evidence_surface_unavailable:` — coord's evidence table is absent, and the whole call was refused **before any mutation**: on a transition the status was not written either; on the REFUSED arm's manifest-store upsert (below) nothing was stored |
+>
+> On `surface_unavailable`, re-send the transition with the `vet_evidence` key
+> **omitted** (not an empty array) and **with** `independence`, so the status
+> write still lands — the named exception to "change DOOR, never drop the
+> field" above. Coord's advice to retry once the migration has applied is not a
+> licence to retry the manifest here. The re-send's receipt may carry `vet_evidence_error`; that is
+> the manifest-less retirement note from the receipt table above, not a fourth
+> arm — a transition that carried a manifest never gets one.
+>
+> **also** post one coord finding under the FIXED resource key
+> `vet-evidence-door-absent`:
+>
+> ```
+> coord_post_finding(
+>   kind          = "caveat",
+>   topic         = "vet-evidence-manifest",
+>   dossier_slug  = "vet-evidence-never-stored",
+>   resource_keys = ["vet-evidence-door-absent", "<plan stem>"],
+>   title         = "vet_evidence manifest built but not stored (<condition>) on coord <build_sha|UNKNOWN> — <plan stem>",
+>   body          = (1) the condition from the table, with coord's error text
+>                   verbatim on `surface_unavailable`; the re-send's receipt
+>                   quoted verbatim if one came back (its `stored: 0` is
+>                   coord's default for a send with no manifest, not a count of
+>                   your entries), else `stored` ABSENT — never write a 0 coord
+>                   did not send; the entry count you sent;
+>                   the plan stem; the serving build — `build_sha` / `built_at`
+>                   from `GET $COORD_HTTP_URL/health` (unauthenticated,
+>                   per replica), or UNKNOWN when unreadable, never guessed;
+>                   (2) the door that carried the transition (MCP tool / HTTP
+>                   route) and the status it returned;
+>                   (3) "re-check after this build is replaced; a later build
+>                   answering with a receipt closes it")
+> )
+> ```
+>
+> Its HTTP twin is `POST $COORD_HTTP_URL/coord/agent-findings` with the same
+> fields and a device JWT — the transport cascade, and why a `-32601` from the
+> runner's proxy is not a missing door, are in `/unattended` **2b → Transport**;
+> follow it rather than a copy here. `dossier_slug` files the occurrence under the
+> existing `vet-evidence-never-stored` pattern; `topic` reuses the tag a peer
+> already filed this subsystem under.
+>
+> **Dedupe before posting.** Read
+> `coord_recent_findings(resource_keys=["vet-evidence-door-absent"], limit=100)`
+> (twin `GET $COORD_HTTP_URL/coord/agent-findings?resource_keys=vet-evidence-door-absent&limit=100`;
+> `limit` clamps at 100 and there is no cursor) — the fixed key **alone**: adding
+> a `topic` or your plan stem makes the read a union, not a narrowing. Read
+> `available` before `count`. Match on the title prefix
+> `vet_evidence manifest built but not stored (<condition>) on coord <build_sha>`
+> — condition and `build_sha` both inside it, the plan stem after it ignored. If
+> a live row matches, do not post a second — cite that row's `finding_id`
+> instead. Coord's own dedupe (`findings.rs`) folds an identical post only from
+> the **same device and the same session** with equal `(kind, topic, title,
+> body, dossier_slug)`, so it never merges a peer's post into yours — this read
+> is the only cross-session guard. An unreadable probe, a full window (`count`
+> 100) with no match, or a `build_sha` you could not read, is UNKNOWN — post.
+>
+> **At most one post per vet run.** A manifest-free re-send, or a second
+> transition in the same run, can meet the same condition again: if this run
+> already posted or deduped, cite that id and do not post again.
+>
+> ⚠️ **Scope guard: this is a REPORT, not a retry.** Do not add a fallback write
+> path for the manifest, do not re-send the transition to "get it stored" (the
+> manifest-free re-send above writes the STATUS and is not this), and
+> never make the manifest a blocking precondition of the vet. The post is
+> best-effort: a failed or refused post never changes the vet verdict or the
+> transition you already made — it is one more line in §6.
 
 **Confirm the declaration was STORED, not only that the transition landed.**
 `admitted_on: identity` cannot tell the actor-key arm from the declaration arm
@@ -2904,7 +3619,7 @@ is always present when a receipt is, because "which arm" has no sensible default
 
 | `admitted_on` | What actually happened |
 |---|---|
-| `identity` | ⚠️ **Two different things land here and coord does not distinguish them**: the ordinary actor-key comparison passed (you were a different actor from the owner), OR a well-formed `independence` declaration authorized it — both return `Authorized::Normal` (`policies::lifecycle_autonomy`), and there is no declaration tag. So `identity` is **NOT evidence that you were a different actor**. Say which you sent; the declaration itself is the distinguishing record, stored at `metadata.attestations`. **Your manifest did not carry this**, even if you sent one |
+| `identity` | ⚠️ **Two different things land here and coord does not distinguish them**: the ordinary actor-key comparison passed (you were on a different device from the owner), OR a well-formed `independence` declaration authorized it — both return `Authorized::Normal` (`policies::lifecycle_autonomy`), and there is no declaration tag. So `identity` is **NOT evidence that you were a different actor**. Say which you sent; the declaration itself is the distinguishing record, stored at `metadata.attestations`. **Your manifest did not carry this**, even if you sent one |
 | `graduation` | a graduated actor self-attested; the flywheel's track record carried it, not your evidence |
 | `no_transition` | the write stored a manifest without changing any status, so no authz question was asked at all — the REFUSED arm's manifest store below answers this |
 
@@ -2932,8 +3647,10 @@ exists to prevent.
 Three 403 codes can answer the call. None is a failure of the vet:
 
 - **`self_attestation_forbidden`** — `vetted` is an Attested status and, absent
-  a declaration, coord enforces separation of duties: the attester's actor key
-  must differ from the unit's recorded owner. Step 1's upsert made this session
+  a declaration, coord enforces separation of duties: the attester must be on a
+  different device from the unit's recorded owner (since qontinui-coord#2561 the
+  compare ignores the agent half, so a re-allocated or same-device agent JWT
+  does not help). Step 1's upsert made this session
   the owner, so this session is the one actor barred from writing it. **A
   declaration that ARRIVES never yields this code** — coord returns it only on
   the legacy arm. So if you sent one, it did not arrive: the door dropped the
@@ -2949,14 +3666,18 @@ Three 403 codes can answer the call. None is a failure of the vet:
   `a_declaration_attests_an_ownerless_unit_but_never_anonymously`). So, as with
   the code above, meeting it after sending a declaration means the declaration
   never arrived: change door.
-- **`attester_unresolved`** — YOUR token derives no actor key, i.e. it carries a
-  `tenant_id` but no `device_id`. This is the one you will hit on the acting-user
+- **`attester_unresolved`** — YOUR token derives no SoD actor key: coord derives
+  one only from a paired device JWT carrying `user_id`, or an agent JWT whose
+  mint coord authenticated or drove itself (`admits_as_sod_actor` /
+  `agent_class_admits`, qontinui-coord `crates/coord/src/jwt.rs`). A `tenant_id`
+  with no `device_id` is refused, and so is the `Bootstrap` agent token that an
+  anonymous or device-mismatched `POST /agents/allocate` mints. This is the one you will hit on the acting-user
   service token (transport tier 3 above) and on the `/agents/credential`
   bootstrap token. A declaration waives the owner comparison, not the witness,
-  so it does not help. Re-send over a rung that carries a device identity. When
+  so it does not help. Re-send over a rung that carries a token coord admits. When
   every rung answers this, say in your report that the attestation was not
   merely refused — it was **unattemptable from every door this session holds**,
-  and would need a device- or agent-identified caller even to be evaluated.
+  and would need a caller coord admits as an SoD actor even to be evaluated.
 
 Graduation relaxes exactly ONE of the three: `self_attestation_forbidden`. Both
 `owner_unresolved` and `attester_unresolved` are returned verbatim and are **not**
@@ -2967,8 +3688,9 @@ resolvable actor key there is nothing that could have been earned
 
 None of the three is a coord bug, and none is a reason to run `/coord-revive` or
 to report the vet as failed. The only re-sends are the ones above: a dropped
-declaration goes down the ladder, and `attester_unresolved` goes to a rung with
-a device identity. Two facts so you do not burn a cycle looking for a way
+declaration goes down the ladder, `attester_unresolved` goes to a rung whose
+token coord admits as an SoD actor, and `surface_unavailable` re-sends with the
+manifest key omitted (Step B). Two facts so you do not burn a cycle looking for a way
 around it:
 
 - **The check is the six-tier `non_author_allows_identities` ladder**
@@ -2976,9 +3698,11 @@ around it:
   predicate the gate side uses, not a flat actor-key string compare. Tier 1: an
   internal-producer caller refuses. Tier 2: either device absent refuses
   (indeterminate ⇒ author). **Tier 3: a different device is NON-author.** Tier 4:
-  same device with BOTH agent ids present is non-author iff they differ (an equal
-  pair refuses outright rather than falling through). **Tier 5: same device, no
-  agent pair, BOTH sessions proven — non-author iff the sessions differ.** Tier 6:
+  same device with BOTH agent ids present refuses outright on an equal pair and is
+  refuse-only since qontinui-coord#2561 — a differing pair falls through, because
+  every allocate rotates the agent id. **Tier 5: same device, not refused at
+  tier 4 (no agent pair, or a differing one), BOTH sessions proven — non-author
+  iff the sessions differ.** Tier 6:
   anything else refuses, the device floor deciding. So on a single machine **tier 5
   is what decides**: a *different session* carrying a proven session binding DOES
   qualify, and **tier 6** — same device with no proven session on one or both
@@ -2988,19 +3712,23 @@ around it:
   ⚠️ **Two corrections to the paragraph above, and the second one matters more.**
   (a) That six-tier ladder is the **GATE** side (`gates_authority.rs`). The
   WORK-UNIT attestation this step performs goes through
-  `work_unit_registry::authorize_target_transition`, which is a flat
-  `owner_actor_key != attester_key` compare **only when no `independence`
-  declaration is sent** — its own doc comment records the divergence between the
-  two and files closing it as a follow-up. Do not read the tier analysis as
+  `work_unit_registry::authorize_target_transition`, which compares the DEVICE
+  half of the owner and attester keys (`parse_actor_key`, since
+  qontinui-coord#2561, 2026-09-28) **only when no `independence` declaration is
+  sent**. It shares the ladder's device floor and, like it, never admits on a
+  differing agent id (it ignores the agent half entirely); it deliberately has
+  no session rung — its doc comment says so. Do not read the tier analysis as
   describing what refuses your `vetted` write.
   (b) *"A subagent you spawn does not qualify"* is true of the ACTOR-KEY test
   and is no longer the operative rule. Under [policy:
   `independence-is-context-not-credential`] a fresh-context subagent is
-  precisely what DOES qualify, and the `independence` declaration above is how
-  you say so. The identity ladder is not the property; shared context is. And note the
+  precisely what DOES qualify — Step 1.5's — and the `independence` declaration
+  above is how you say so. The identity ladder is not the property; shared context is. And note the
   path that TIGHTENED — the same operator holding BOTH token shapes no longer
-  passes on string inequality alone (`device:<d>` vs `device:<d>:agent:<a>`); with
-  no agent pair it falls to tier 5 and refuses absent a proven session pair.
+  passes on string inequality alone (`device:<d>` vs `device:<d>:agent:<a>`): on
+  the gate ladder it falls to tier 5 and refuses absent a proven session pair,
+  and on the work-unit check it refuses outright, because the compare reads the
+  device (qontinui-coord#2561).
 - **The operator route** (`POST /coord/work-units/:slug/operator-transition`,
   admin/operator bearer) deliberately skips the SoD check. That is the operator's
   lever, not yours: routing your own vet through it would defeat the control it
@@ -3008,7 +3736,16 @@ around it:
 
 **The REFUSED arm — the vet ends with the status UNCHANGED.** You are here on
 `self_attestation_forbidden` or `owner_unresolved` with no honest declaration to
-send, or on `attester_unresolved` from every rung. There is no fallback status. The old
+send, or on `attester_unresolved` from every rung. "No honest declaration" is the
+`VETTED (self)` path. On the Step 1.5 path you hold one, so you reach this arm
+on `attester_unresolved` from every rung; when no rung of the ladder carries
+`independence` at all (`400 unknown_body_field`, or `self_attestation_forbidden`
+from every rung because each dropped the field); or on a
+`422 independence_declaration_malformed` that survives its one re-send — never
+loop on it. Then also report the declaration as kept for the re-send. Its
+durable home is the stamp: a later re-send rebuilds all three fields from
+Step 5's `Vetted-by:` lines (`Checks:`, `Read:` + `Plan:`, the
+parenthetical), per the Step B table, not from this session's memory. There is no fallback status. The old
 Free fallback status is retired (a coord carrying the Phase 1 change of the plan
 named above refuses it `422 status_retired`), and even where it is still
 accepted, writing it parks the unit in a status coord does not recognise and
@@ -3025,7 +3762,11 @@ writes, then stop:
    the status Step A READ — the literal `""` on a row this session just created
    — and never invent one: a status you guessed is a transition, and a
    transition is exactly what this arm must not write. If Step A's status is
-   UNKNOWN, skip this write and say so.
+   UNKNOWN, skip this write and say so. If this upsert meets
+   `surface_unavailable` (same `503` / tool-error shape as on the transition,
+   `work_unit_registry::post_upsert`), there is nothing to store: skip it, post the
+   `vet-evidence-door-absent` finding (Step B), and report that no receipt came
+   back.
 2. **Report the attestation as OWED**, quoting the refusal code coord returned
    (and on `attester_unresolved`, every rung you tried). The plan file's VETTED
    stamp stands: `/implement-plan` gates on that stamp and never reads the
@@ -3034,14 +3775,20 @@ writes, then stop:
    step 5's record gate** on this arm (see step 5); report *record gate not registered — attestation OWED, see coord's auto-registered `attestation:vetted` gate <id> (none for `owner_unresolved` / `attester_unresolved`)*.
    Read the gate id back from coord's gates for this `work_unit_id`; on
    `owner_unresolved` and `attester_unresolved` coord registers none, by design.
+   On the Step 1.5 path, a `self_attestation_forbidden` from every rung DOES
+   get the gate, best-effort (coord registers it on that code whatever
+   dropped the field); a `400 unknown_body_field` or a surviving `422` gets
+   none. Read it back either way and quote what the read returned.
 
 A later session that DOES hold an honest declaration discharges the debt with
 Step B unchanged. The declaration arm ignores the recorded owner, so the session
 that was refused is not barred from the re-send once it has a fresh-context
-review to declare.
+review to declare — the kept Step 1.5 declaration, or a re-vet's own Step 1.5
+verdict; never a subagent spawned only to clear the refusal.
 
 **Submitting a manifest can never cause a refusal** that would not otherwise
-have happened, so there is no reason to withhold one. What it DOES do once
+have happened — except `surface_unavailable`, whose remedy is Step B's
+manifest-free re-send — so there is no reason to withhold one. What it DOES do once
 stored: coord re-resolves it on a timer, and a vet observed to have decayed
 (`vet_state` `moved`/`gone`) withholds the derived `ready` once the derive worker
 is armed. A manifest never makes `ready` or `shipped` directly settable, because
@@ -3057,10 +3804,27 @@ manifest**. Manifest submission needs a write door: the coord MCP tools, or the
 manifest into your report and hand it to a session that holds a write door — do
 not report the transition as made.
 
-The registry is directly writable — there is no longer a plan-ingest worker
-mirroring the plan directory — so this explicit transition is what marks the unit
-ready. The plan `.md` VETTED stamp + its commit/push remain the operator-private
-artifact record. (A repo that is NOT coord sole-authority lands its PRs via normal GitHub flow.)
+The registry is directly writable, and this explicit transition is what marks the
+unit ready **now**. The plan `.md` VETTED stamp + its commit/push remain the
+operator-private artifact record. (A repo that is NOT coord sole-authority lands
+its PRs via normal GitHub flow.)
+
+> ⚠️ **The transition marks it ready now; it does not keep it ready.** This
+> paragraph used to add "there is no longer a plan-ingest worker mirroring the
+> plan directory", which is false. The runner's plan/work-unit adapter
+> (`plan_workunit_adapter/`, actor `harness-markdown-adapter`) reconciles the
+> plans directory into the registry on a ~68 s cycle and overwrites the status
+> with whatever it reads from the plan `.md` **copy it walks** — including a stale
+> copy in another session's worktree. See `/implement-plan` Step 0.5 for the trace.
+>
+> **What a revert costs here.** The `unit_ready` record gate derives from the
+> registry status, so if the adapter reverts `vetted` → `draft` it sits Open and
+> never clears, and the dashboard shows stale state. It carries no continuation
+> (see the step-5 gate rules), so nothing is suppressed: the dispatching
+> `continuation_spawn` rides the step-6 `time_elapsed` net gate, which does not
+> read the registry status. Do not "fix" a revert by moving a continuation onto
+> `unit_ready`. Wait about one adapter cycle (~68 s) and read the status back
+> before reporting the unit ready; if it reverted, say so in your report.
 
 ### 5.5. Offer to register a coord gate for a flagged-but-not-fixed item
 
@@ -3119,10 +3883,12 @@ leave it in the report.
   charter rule 10 ("Finish to zero") this session finishes its own follow-ups, so
   a redundant continuation queues a duplicate, parallel run of the same work (the
   concurrent-WIP clobber the coordination layer exists to prevent). Attach one
-  only when the follow-up will **outlive** this session: a wait longer than rule
-  10's ≲2h monitor window; this session ending WITHOUT dispatching the follow-up
-  itself; an `operator_approval` / human-decision gate (unbounded in time — but
-  sensitive work stays notify-only unconditionally); or a cross-session chain
+  only when the follow-up will **outlive** this session: a follow-up that can
+  only run after the watched event (a session never stays alive to wait —
+  operator decision 2026-10-17 — so every such follow-up outlives it); this
+  session ending WITHOUT dispatching the follow-up
+  itself; an `operator_approval` / human-decision gate (unbounded in time;
+  sensitive subject matter changes nothing here); or a cross-session chain
   owned by a different work unit or device (**out-of-graph only** — a purely
   in-graph dependency on another work unit is a DAG edge + `metadata.dispatch`,
   not a gate). **And never arm one on a gate whose predicate is already satisfied
@@ -3154,8 +3920,10 @@ leave it in the report.
 - **`clearance_audience`:** set `agent` for agent-verifiable facts ("/vet-plan
   was run", "crate exists + tests green", "a dual run emitted evidence") so the
   session that completes the work can attest the gate itself; set `operator` for
-  business/judgment/strategy or on-page-human-verification gates. Default is
-  `operator` if omitted; the sensitive-work rule always forces `operator`.
+  a genuine closed-list decision (product/strategy, an item-2 resource) or
+  on-page human verification. Default is
+  `operator` if omitted. Sensitivity alone never forces `operator`
+  (`_gate-registration` → "Sensitive-work rule").
 - **`gate_class`:** classify the gate so coord's per-tenant `gate_clearance`
   matrix can resolve who may clear it. `security-surface` when the deferred work
   this gate guards would itself fire a `security-and-autonomy` glob or content
@@ -3167,18 +3935,18 @@ leave it in the report.
   omitting is safe and never a loophole, and a guessed class is worse than none.
   ⚠️ **The old "`agent_non_author` means nobody may attest — this is a ONE-DEVICE
   fleet" warning is SUPERSEDED (re-verified 2026-08-30).** Both premises changed:
-  the fleet has **four** device ids (`eb2155ed4152`, `c79a07d57e40`,
-  `84c0229232cb`, `3e7e4b0475de`), and `non_author_allows_identities` is now a
+  a tenant's fleet can have **several** device ids (this device's is in
+  `~/.qontinui/machine.json`), and `non_author_allows_identities` is now a
   six-tier ladder in which **tier 3 (different device)** and **tier 5 (same
   device, differing VERIFIED sessions)** both resolve to NON-author. It refuses
-  only in tier 6 — same device, no proven session on either side. So
+  only in tier 6 — same device, no proven session on one or both sides. So
   `agent_non_author` IS usable when the clearer is a different device or carries
   proven session identity. ⚠️ **The sentence that used to follow — "the work-unit
   attestation check now routes through this SAME ladder" — is FALSE and was
-  removed 2026-09-03.** Re-verified on qontinui-coord `origin/main` 2026-09-23 at
-  `037fc1a8f`: `work_unit_registry::authorize_target_transition` takes the two
+  removed 2026-09-03.** Re-verified on qontinui-coord `origin/main` 2026-10-03 at
+  `f32fb04ad`: `work_unit_registry::authorize_target_transition` takes the two
   actor keys **plus an optional `independence` declaration**
-  (`{verified, against, context}`), and does the flat `owner == attester`
+  (`{verified, against, context}`), and does the device-grain `owner == attester`
   compare **only when no declaration is sent** — a well-formed one authorizes an
   Attested transition without that compare, while still refusing
   `attester_unresolved` when the caller's token derives no actor key;
@@ -3212,8 +3980,12 @@ leave it in the report.
   `vetted`; never on the status a REFUSED transition left, which on a fresh unit
   is `""` and clears at once; on a refused transition register no `unit_ready`
   gate (§5.4 has the full procedure; canonical: `_gate-registration`). (**NOT** `operator_approval` — `operator_approval`
-  is for genuine human decisions, not a work queue); schema/alembic-at-head →
-  `migration_at_head` `{schema}`; infra drift cleared → `infra_drift_clear`; a repo
+  is for genuine human decisions, not a work queue); the whole alembic chain
+  applied → `migration_at_head` `{schema: "coord"}` (database-wide; born cleared
+  if registered before coord observes the new head — see `_gate-registration`,
+  What "born cleared" means);
+  one table/column existing on the serving DB → `schema_object_exists`
+  `{schema, object, column?}`; infra drift cleared → `infra_drift_clear`; a repo
   file/workflow existing → `file_exists` `{repo, path, on_ref?}` — **usable again;
   the 2026-08-05 fleet-wide 403 was FIXED by coord `e6f486b8` (2026-08-15) and that
   fix is deployed** (ancestor of the serving build, re-probed live 2026-08-31:
@@ -3222,9 +3994,11 @@ leave it in the report.
   a coord data count crossing a bound → `sql_count` `{query_id,op,n}` (whitelisted
   `query_id`, never raw SQL); an umbrella plan reaching a status → `unit_status`
   `{work_unit_id,status}`; another cross-anchor gate clearing → `gate_cleared`
-  `{gate_id}`; needs-human → `operator_approval`. Anything
-  **security / credential / billing / strategy-sensitive** → `operator_approval` +
-  notify, never an auto-resuming gate, never silently auto-registered.
+  `{gate_id}`; a genuine closed-list human decision → `operator_approval`
+  (prefer an observable predicate on the result of the operator's action).
+  Security / credential / billing subject matter is **not** a predicate choice:
+  gate on the observable, proceed, and notify
+  (`_gate-registration` → "Sensitive-work rule").
 - **Masked-tool honesty:** if `coord_register_gate` fails as unknown/
   method-not-found (per-agent MCP allow-set masking, coord `mcp/mod.rs`), report
   **"gate NOT registered — coord_register_gate not in this session's tool
@@ -3356,17 +4130,34 @@ Brief — under 150 words. State:
 - What you changed (referenced by section name, not full diff)
 - **If §5.4 step 6's hold-gate skip applied:** `HELD — net skipped, plan held
   behind gate <gate_id> (verdict <v>, will_dispatch <b>)`, one per cited gate
+- **If §5.4 step 6's no-withdraw-door skip applied (`/vet-imp` only):**
+  `NO NET (no withdraw door: <doors probed>)`, plus every `gate_id` §5.4
+  could not retire for the same reason, named as unretired
+- **If §5.4's delivery skip applied:** `NO NET (delivered: <PR list>) —
+  closeout owed` — the plan landed mid-vet; under `/vet-imp`, its Step 3 delivery read then
+  routes to closeout instead of implementing
 - The status stamp you added — `Status: VETTED <date>, against <repo>
   origin/main <short-sha>` — and **quote the sha**, not just the date. It is
   what lets the next reader tell a citation that has gone stale from one that
   was always wrong, without re-resolving every row
+- **The independence path taken** — `subagent` (Step 1.5 spawned: say whether
+  §5.4 Step B sent the `independence` declaration and whether
+  `metadata.attestations` shows it stored) or `self` (no spawn: name why, and
+  confirm the stamp reads `VETTED (self)` with `Independence: NONE` and that
+  no declaration was sent). Where your edit-time re-check contradicted the
+  subagent's verdict, say so
 - **The difficulty outcome** (§5 "Difficulty stamp"): `stamped <level>` with
   the computed level it overrode and the one-clause reason, `agreed <level>`
   (no write), or `UNKNOWN — <why>` (read failed, not captured, or unrated; no
   write). Never report UNKNOWN as agreement
-- **The evidence manifest** (§2a): quote `stored` from the transition's `vet_evidence` receipt — the count coord **kept**, never the count you sent — and `admitted_on`, the arm that actually carried the transition (`identity` / `graduation` / `no_transition`). **Read both; do not infer either.** ⚠️ Where you sent an `independence` declaration, SAY SO explicitly: `admitted_on` reads `identity` on that path too, so it cannot be quoted as evidence of an actor difference. **The *built but not stored* arm — no receipt, or `stored` below the count you sent — REQUIRES its evidence:** quote the refusal body coord returned (HTTP status, error code, message) and name the §5.4 ladder rung you reached (1 native MCP tool / 2 `coord-revive.sh call` / 3 HTTP twin with a device JWT). A *built but not stored* line without both is not a report of the arm, because the next occurrence must be diagnosable from the report alone. On the REFUSED arm, report the transition as **refused, status unchanged, attestation OWED**, say the record gate was **not registered** and quote coord's `attestation:vetted` gate id (none for `owner_unresolved` / `attester_unresolved`), name the refusal code (`self_attestation_forbidden` / `owner_unresolved` / `attester_unresolved`, with every rung tried on the last) — never the manifest, which admits nothing — and quote `stored` and `admitted_on: no_transition` from the manifest-store upsert's receipt
+- **The `## Done when` outcome** (§3): each named claim with its served `state`
+  now (`domain_spec/<name>#<id> unknown`, …), the appended-probe count and whether
+  each parsed, every `source_only` flag, and — by name, every time — `ESCAPE:
+  no claim — <reason>` when the plan took the escape. `UNKNOWN — <door that
+  failed>` when the claims read could not be made; never report that as resolved
+- **The evidence manifest** (§2a): quote `stored` from the transition's `vet_evidence` receipt — the count coord **kept**, never the count you sent — and `admitted_on`, the arm that actually carried the transition (`identity` / `graduation` / `no_transition`). **Read both; do not infer either.** ⚠️ Where you sent an `independence` declaration, SAY SO explicitly: `admitted_on` reads `identity` on that path too, so it cannot be quoted as evidence of an actor difference. **The *built but not stored* arm — any condition in §5.4 Step B's table (`no_receipt`, `stored_short`, `field_rejected`, `surface_unavailable`) — REQUIRES its evidence:** name the condition, quote the refusal body coord returned (HTTP status, error code, message) where there was one (`field_rejected`, `surface_unavailable`; for `no_receipt` / `stored_short` quote the response you got instead), and name the §5.4 ladder rung you reached (1 native MCP tool / 2 `coord-revive.sh call` / 3 HTTP twin with a device JWT). A *built but not stored* line without all three (condition, refusal body or response, rung) is not a report of the arm, because the next occurrence must be diagnosable from the report alone. On the REFUSED arm, report the transition as **refused, status unchanged, attestation OWED**, say the record gate was **not registered** and quote coord's `attestation:vetted` gate id (none for `owner_unresolved` / `attester_unresolved`), name the refusal code (`self_attestation_forbidden` / `owner_unresolved` / `attester_unresolved`, with every rung tried on the last) — never the manifest, which admits nothing — and quote `stored` and `admitted_on: no_transition` from the manifest-store upsert's receipt — or, where that upsert met `surface_unavailable`, say no receipt came back and name the finding. On any *built but not stored* arm, also name the `vet-evidence-door-absent` finding §5.4 Step B had you post: its `finding_id`, or the existing row's id you deduped against, or that the post failed and how. A failed post is reported, never a changed verdict
 - Open questions you **resolved using the Decision policy**, with the deciding priority in parentheses (e.g. "picked registry-backed lookup (scalability)")
-- Anything you flagged for the user that you did NOT auto-fix — limit this to product/scope/stakeholder calls the Decision policy can't decide; engineering trade-offs should already be resolved in the plan
+- Anything you flagged for the user that you did NOT auto-fix — exactly the verdict's **surfaced for user** set (Step 1.5): the Decision policy's two surfacing exceptions plus genuine product/scope calls on the `escalation-closed-list`; engineering trade-offs should already be resolved in the plan. Add the verdict's **report notes** (missed work, priority-set gaps) beneath it
 
 **One exception to the 150-word budget:** when the manifest was not stored — no
 `vet_evidence` receipt came back, the write door was unreachable, or you are in a
@@ -3400,4 +4191,4 @@ instruction fired and `/vet-imp`'s Steps 3-5 were never reached.
 - **Don't add new phases or scope.** If you find work the plan missed, note it in the report — adding a new phase is a decision for the user.
 - **Parallelize research.** Use Glob, Grep, and Read in parallel; spawn `Explore` for broad surveys. When you spawn agents, never end a turn purely "awaiting notification" on their results — completion notifications are an optimization, never a guarantee (the wake-up channel is at-most-once); re-check for finished results on a bounded timer and proceed on evidence. On any nudge / system-reminder wake, FIRST re-check whether the awaited research already finished (evidence over memory), collect it, and continue — never re-spawn completed research.
 - **No new files.** The plan file is the only thing you should be writing to.
-- **Decide; don't escalate.** Engineering trade-offs surfaced during vetting must be resolved in the plan using the Decision policy. Effort and backward compatibility are not factors. Only kick a question up to the user when it's genuinely a product/scope/stakeholder call.
+- **Decide; don't escalate.** Engineering trade-offs surfaced during vetting must be resolved in the plan using the Decision policy. Effort and backward compatibility are not factors. Only kick a question up to the user when it is in the verdict's **surfaced for user** set (Step 1.5): an operator-resource need, a plan too large for orchestration, or a genuine product/scope call on the `escalation-closed-list`.

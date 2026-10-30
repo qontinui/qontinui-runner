@@ -258,6 +258,7 @@ mod tests {
     /// `PoisonError`s in every sibling test. The lock only protects test
     /// sequencing, so resuming on poison is safe and keeps the FIRST failure
     /// the visible one.
+    // test-lock: standalone — module-private; its holders take no other test lock and never touch env
     fn guard() -> std::sync::MutexGuard<'static, ()> {
         TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner())
     }

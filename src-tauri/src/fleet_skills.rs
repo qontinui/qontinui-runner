@@ -53,6 +53,26 @@
 //! embedded tree is exempt because it is reviewed source in THIS repository
 //! rather than text a backend handed this device.
 //!
+//! ## Every written `SKILL.md` states its provenance
+//!
+//! Each skill's manifest is written with the same `qontinui-provenance:`
+//! frontmatter key a provisioned command body carries (one implementation,
+//! [`crate::provenance`]), naming
+//! `canonical=qontinui-claude-config:.claude/skills/<name>/SKILL.md` and the
+//! rung that supplied it. Only `SKILL.md` is stamped: a helper script has no
+//! frontmatter, and a key line in a `.sh` is a syntax error. See
+//! `write_provisioned_file`.
+//!
+//! ## The canonical rung sits between the account layer and this tree
+//!
+//! Per skill name the provisioner picks a [`SkillSource`]: an account skill
+//! (served, else disk cache) when the account supplies one, else the skill as
+//! `qontinui-claude-config@origin/main` holds it in the runner's mirror
+//! ([`crate::canonical_corpus`]), else this embedded tree. A canonical skill's
+//! helper modes come from git — `100755` lands `0o755`, anything else
+//! [`PROVISIONED_FILE_MODE`] — instead of the embedded tree's `.sh` heuristic,
+//! and its `SKILL.md` is stamped `source=canonical canonical_sha=<sha12>`.
+//!
 //! ## The account-override layer — it exists now
 //!
 //! This paragraph used to say skills had no fetch layer because "the
@@ -67,7 +87,9 @@
 //! reason no such layer existed before.
 //!
 //! So skills now resolve the same three rungs the commands do —
-//! `fresh fetch → disk cache → embedded default`, in [`crate::agent_skills`] —
+//! `fresh fetch → disk cache → embedded default`, in [`crate::agent_skills`]
+//! (with the canonical rung slotted in above the embedded default at
+//! provisioning time — see "The canonical rung" above) —
 //! and this embedded tree is the **offline floor** rather than the only copy a
 //! session can read. That is what ends the re-vendor treadmill: a drifted
 //! bundle degrades a served device to stale-by-one-fetch instead of being the
@@ -113,8 +135,10 @@ pub(crate) const PROVISIONED_FILE_MODE: u32 = 0o644;
 /// guessed at: the served half of this corpus is a `files` map of
 /// `path -> text`, so a non-text file has no representation in the layer this
 /// floor has to be interchangeable with. Nothing in the shipped bundle is
-/// non-UTF-8 today (measured 2026-09-14: 15 files, all `.md`/`.sh`), and
-/// [`tests::every_embedded_file_is_text`] is what keeps that true.
+/// non-UTF-8 — it is `.md`, `.sh` and `.py` text (the `.py` files are the
+/// `command-scripts` helpers and a `lib/` reader) — and
+/// [`tests::every_embedded_file_is_text`] is what keeps that true, so no file
+/// count is pinned here to go stale.
 pub(crate) fn embedded_skills() -> Vec<ResolvedSkill> {
     let mut out = Vec::new();
     for skill in FLEET_SKILLS.dirs() {
@@ -186,9 +210,10 @@ fn collect_text_files(
 /// propagate.
 ///
 /// Idempotent, and existing files are overwritten — EXCEPT where the
-/// destination is already tracked by the enclosing git repository, which is
-/// skipped (see [`provision_fleet_skills_into`] and
-/// [`crate::provision_guard`]). **A tracked file outranks a served override**:
+/// destination is already tracked by the enclosing git repository, or the
+/// tracked-file probe could not answer inside one (then a skill whose
+/// `SKILL.md` exists is kept whole); both are skipped (see
+/// [`provision_fleet_skills_into`] and [`crate::provision_guard`]). **A tracked file outranks a served override**:
 /// the account layer decides what this binary would write, not whether it may
 /// replace a repository's committed content.
 pub(crate) fn provision_fleet_skills_for_session(workdir: &str) {
@@ -209,7 +234,12 @@ pub(crate) fn provision_fleet_skills_for_session(workdir: &str) {
         )),
     );
 
-    match provision_fleet_skills_into(&skills_dir, &registry) {
+    let canonical = crate::canonical_corpus::latest();
+    match provision_fleet_skills_into(
+        &skills_dir,
+        &registry,
+        canonical.as_deref().map(|c| &c.skills),
+    ) {
         Ok(report) => crate::capability_manifest::record_provision(workdir, report),
         Err(e) => {
             // The destination directory itself could not be created, so no file
@@ -233,6 +263,27 @@ pub(crate) fn provision_fleet_skills_for_session(workdir: &str) {
             crate::capability_manifest::record_provision(workdir, report);
         }
     }
+}
+
+/// Whether the skill `name` is in the fleet corpus this runner SERVES into
+/// sessions: the embedded bundle. The canonical rung only refreshes the BODIES
+/// of skills the bundle already names (`canonical_corpus::bundled_skill_names`,
+/// `SkillSource::choose`), so the bundle alone decides which skills a session
+/// receives — and therefore which skills this runner may advertise.
+///
+/// A NEW fleet skill does not reach the bundle automatically:
+/// `scripts/fleet-bundle-sync.sh` in qontinui-claude-config only carries files
+/// the runner already bundles. Adding one is its own runner PR that vendors the
+/// skill directory byte-identical to qontinui-claude-config's copy (plan
+/// `2026-10-13-coord-expedited-land-lever-for-agents`, Phase 6).
+///
+/// NOT consulted: the account layer (`agent_skills` overrides), whose read is a
+/// network fetch — an account-supplied skill of this name is served but not
+/// advertised. That under-advertises (coord counts the review `unreviewed`),
+/// never over-advertises. Cheap — a directory lookup in the binary — because
+/// the heartbeat calls it every tick.
+pub(crate) fn skill_is_served(name: &str) -> bool {
+    FLEET_SKILLS.get_dir(name).is_some()
 }
 
 /// Number of embedded SKILLS — immediate subdirectories of [`FLEET_SKILLS`],
@@ -259,6 +310,85 @@ fn embedded_skill_file_count() -> usize {
         dir.files().count() + dir.dirs().map(count).sum::<usize>()
     }
     count(&FLEET_SKILLS)
+}
+
+/// Where one skill's files come from for this pass, chosen per skill name by
+/// the resolution precedence: account layer → canonical → embedded.
+#[derive(Debug, Clone, Copy)]
+enum SkillSource<'a> {
+    /// The registry's entry: an account skill, or the embedded default when
+    /// the canonical rung has no usable copy of it.
+    Resolved(&'a ResolvedSkill),
+    /// The skill as `qontinui-claude-config` holds it at `snapshot`.
+    Canonical {
+        skill: &'a crate::canonical_corpus::CanonicalSkill,
+        snapshot: &'a crate::canonical_corpus::CanonicalSnapshot,
+    },
+}
+
+impl<'a> SkillSource<'a> {
+    /// Pick the source for `skill`: an account skill always stands; an
+    /// embedded default is replaced by the canonical copy when there is one.
+    fn choose(
+        skill: &'a ResolvedSkill,
+        canonical: Option<&'a crate::canonical_corpus::CanonicalSkills>,
+    ) -> Self {
+        if skill.source.is_account_supplied() {
+            return SkillSource::Resolved(skill);
+        }
+        match canonical.and_then(|c| c.skills.get(&skill.name).map(|s| (s, &c.snapshot))) {
+            Some((skill, snapshot)) => SkillSource::Canonical { skill, snapshot },
+            None => SkillSource::Resolved(skill),
+        }
+    }
+
+    fn files(&self) -> &'a qontinui_types::agent_text_units::AgentTextUnitFiles {
+        match self {
+            SkillSource::Resolved(s) => &s.files,
+            SkillSource::Canonical { skill, .. } => &skill.files,
+        }
+    }
+
+    /// The `source=` wire string stamped into `SKILL.md`.
+    fn stamp_source(&self) -> &'static str {
+        match self {
+            SkillSource::Resolved(s) => s.source.as_str(),
+            SkillSource::Canonical { .. } => "canonical",
+        }
+    }
+
+    /// The `canonical_sha=` stamped into `SKILL.md`, canonical only.
+    fn canonical_sha(&self) -> Option<&'a str> {
+        match self {
+            SkillSource::Resolved(_) => None,
+            SkillSource::Canonical { snapshot, .. } => Some(snapshot.short()),
+        }
+    }
+
+    /// The Unix mode `rel_path` is written with. Embedded: `0o755` for a
+    /// `.sh` (the tree carries no permissions, so the extension is all there
+    /// is). Account layer: never executable. Canonical: exactly what git
+    /// recorded.
+    fn mode(&self, rel_path: &str) -> u32 {
+        match self {
+            SkillSource::Resolved(s) => {
+                let is_script =
+                    Path::new(rel_path).extension().and_then(|e| e.to_str()) == Some("sh");
+                if is_script && !s.source.is_account_supplied() {
+                    0o755
+                } else {
+                    PROVISIONED_FILE_MODE
+                }
+            }
+            SkillSource::Canonical { skill, .. } => {
+                if skill.is_executable(rel_path) {
+                    0o755
+                } else {
+                    PROVISIONED_FILE_MODE
+                }
+            }
+        }
+    }
 }
 
 /// Core of [`provision_fleet_skills_for_session`]: create `skills_dir` and write
@@ -305,13 +435,21 @@ fn embedded_skill_file_count() -> usize {
 /// **Fail-soft, and this is a hard requirement.** The tracked probe
 /// ([`crate::provision_guard::TrackedPaths::probe`]) resolves EVERY failure — an
 /// unreadable or absent git dir, no `git` binary, any non-zero exit, and a `git`
-/// that hangs — to "nothing tracked", i.e. to writing exactly as before. A
-/// skipped write must never become an aborted spawn, and a failed or slow probe
-/// must never become one either. The probe runs ONCE for the whole tree, not
+/// that hangs — to "nothing tracked", i.e. to writing exactly as before, with ONE
+/// narrowing: when that failure happens inside a repository (a `.git` at or
+/// above the dir), a skill whose `SKILL.md` already exists is kept WHOLE and every
+/// other skill is written whole, helpers included (see that module's "UNKNOWN inside a
+/// repository" section). A skipped write
+/// must never become an aborted spawn, and a failed or slow probe must never
+/// become one either. The probe runs ONCE for the whole tree, not
 /// once per file, so this costs one process spawn rather than ~15.
-fn provision_fleet_skills_into(
+/// `canonical` is the canonical rung's last loaded snapshot of the bundled
+/// skills (`None` before the first refresh, or in a test); each skill's files
+/// come from the [`SkillSource`] its name resolves to.
+pub(crate) fn provision_fleet_skills_into(
     skills_dir: &Path,
     registry: &AgentSkillRegistry,
+    canonical: Option<&crate::canonical_corpus::CanonicalSkills>,
 ) -> std::io::Result<ProvisionReport> {
     use qontinui_types::agent_text_units::{
         validate_agent_text_unit_file_path, validate_agent_text_unit_name,
@@ -320,24 +458,35 @@ fn provision_fleet_skills_into(
     std::fs::create_dir_all(skills_dir)?;
     let tracked = crate::provision_guard::TrackedPaths::probe(skills_dir);
     let resolved = registry.all();
+    let sources: Vec<SkillSource<'_>> = resolved
+        .iter()
+        .map(|skill| SkillSource::choose(skill, canonical))
+        .collect();
+    let canonical_skills = sources
+        .iter()
+        .filter(|s| matches!(s, SkillSource::Canonical { .. }))
+        .count();
     // The FILES are the embedded defaults unless an account skill replaced one;
     // the rung of the account layer itself is the separate
     // `agent_skills_registry` row, which the caller records. Same split as
     // `fleet_commands`.
     let mut out = ProvisionReport::new(
         "fleet_skills",
-        registry.resolved_file_count(),
+        sources.iter().map(|s| s.files().len()).sum(),
         capability_manifest::Rung::Embedded,
     )
     .with_destination(skills_dir.display().to_string())
     .with_detail(format!(
-        "{} skill(s) resolved — {} embedded default(s), {} account skill(s)",
+        "{} skill(s) resolved — {} embedded default(s), {} served from the canonical \
+         mirror, {} account skill(s)",
         resolved.len(),
         registry.builtin_count(),
+        canonical_skills,
         registry.override_count()
     ));
 
-    for skill in &resolved {
+    for (skill, source) in resolved.iter().zip(&sources) {
+        let files = source.files();
         // A whole-skill refusal is recorded as `<name>/*`, not as the bare
         // name: every OTHER entry in `skipped` is a file path, and a reader
         // grouping by `unit` must be able to tell "this skill" from "this file
@@ -353,8 +502,7 @@ fn provision_fleet_skills_into(
             );
             continue;
         }
-        if let Some(bad) = skill
-            .files
+        if let Some(bad) = files
             .keys()
             .find(|p| validate_agent_text_unit_file_path(p).is_err())
         {
@@ -376,7 +524,7 @@ fn provision_fleet_skills_into(
         // `a` lands as a file and `create_dir_all("a")` then fails, mid-bundle,
         // with half the skill on disk. Refused as a whole rather than
         // discovered at the write.
-        if let Some(why) = crate::agent_skills::unwritable_key_conflict(&skill.files) {
+        if let Some(why) = crate::agent_skills::unwritable_key_conflict(files) {
             warn!(
                 "fleet_skills: refusing to provision skill {:?} — {why}",
                 skill.name
@@ -388,24 +536,54 @@ fn provision_fleet_skills_into(
             continue;
         }
 
-        for (rel_path, text) in &skill.files {
+        // UNKNOWN inside a repository: keep an existing skill WHOLE. Per-file
+        // keeping would write only the files new in this build beside the old
+        // ones and hand the session a skill that disagrees with itself (an old
+        // SKILL.md naming helpers that changed). An absent skill is written.
+        // Keyed on the skill's own SKILL.md, not the bare directory: an empty
+        // or half-written directory (a parent created, then the write failed)
+        // holds no skill a session could be using, so it is provisioned.
+        if tracked.is_unknown_in_repo()
+            && skills_dir
+                .join(skill.dir_name())
+                .join(SKILL_MANIFEST)
+                .exists()
+        {
+            info!(
+                "fleet_skills: keeping skill {:?} as it is on disk — {}",
+                skill.name,
+                capability_manifest::SkipReason::ProbeUnknownInRepo.describe()
+            );
+            out.skip(
+                format!("{}/*", skill.name),
+                capability_manifest::SkipReason::ProbeUnknownInRepo,
+            );
+            continue;
+        }
+
+        for (rel_path, text) in files {
             // `include_dir` and the `files` map share one key space, relative to
             // the skills dir — which is exactly what `TrackedPaths` reports.
             let relative = Path::new(skill.dir_name()).join(rel_path);
             let dst = skills_dir.join(&relative);
             // Before `create_dir_all`: a skill whose every file is tracked must
             // not leave a new empty directory in the repository's working tree.
-            if tracked.should_skip(&dst, &relative) {
+            // A per-file ProbeUnknownInRepo keep is dropped HERE: the whole-skill
+            // decision above already chose to write this skill (its SKILL.md is
+            // absent), and keeping some of its files would mix builds — exactly
+            // what the whole-skill keep prevents. A GitTracked skip still holds.
+            let reason = match tracked.skip_reason(&dst, &relative) {
+                Some(capability_manifest::SkipReason::ProbeUnknownInRepo) => None,
+                other => other,
+            };
+            if let Some(reason) = reason {
                 info!(
-                    "fleet_skills: skipping {} — it is tracked by the enclosing git \
-                     repository, and overwriting it would silently replace that repo's \
-                     own content and dirty its tree",
-                    dst.display()
+                    "fleet_skills: skipping {} — {}; overwriting it could silently \
+                     replace the enclosing repo's own content and dirty its tree",
+                    dst.display(),
+                    reason.describe()
                 );
-                out.skip(
-                    relative.display().to_string(),
-                    capability_manifest::SkipReason::GitTracked,
-                );
+                out.skip(relative.display().to_string(), reason);
                 continue;
             }
             // Per-FILE IO failures are skips, never `?`. Propagating here would
@@ -413,7 +591,7 @@ fn provision_fleet_skills_into(
             // embedded floor first, so one unwritable file would cost a session
             // most of its corpus. The failure is recorded against the file that
             // caused it rather than against the destination directory.
-            if let Err(e) = write_provisioned_file(&dst, text, skill.source) {
+            if let Err(e) = write_provisioned_file(&dst, &skill.name, rel_path, text, source) {
                 warn!(
                     "fleet_skills: could not write {} ({e}) — continuing with the rest",
                     dst.display()
@@ -436,59 +614,82 @@ fn provision_fleet_skills_into(
     Ok(out)
 }
 
-/// Create `path`'s parent, write `text`, and set the mode for `source`.
+/// Create `path`'s parent, write `text`, and set the mode `source` gives it.
+///
+/// The skill's manifest — `rel_path == SKILL.md`, and only that file — is
+/// written through [`crate::provenance::with_provenance`], so it carries the
+/// same `qontinui-provenance:` frontmatter key every provisioned command body
+/// carries, with `canonical=qontinui-claude-config:.claude/skills/<name>/SKILL.md`
+/// (plus `canonical_sha=` when the canonical rung supplied it). Every other
+/// file is written byte-for-byte: a helper script or a nested reference file
+/// has no frontmatter to carry a key, and a key line in a `.sh` is a syntax
+/// error. Those files' provenance is the ledger row
+/// (`capability_manifest::ProvisionReport`) this pass records.
 ///
 /// One fallible unit so the caller can turn any of the three failures into a
 /// single per-file skip.
 fn write_provisioned_file(
     path: &Path,
+    skill_name: &str,
+    rel_path: &str,
     text: &str,
-    source: crate::agent_skills::AgentSkillSource,
+    source: &SkillSource<'_>,
 ) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, text)?;
-    apply_mode(path, source)
+    if rel_path == SKILL_MANIFEST {
+        std::fs::write(
+            path,
+            crate::provenance::with_provenance(
+                &crate::provenance::skill_canonical(skill_name),
+                text,
+                source.stamp_source(),
+                source.canonical_sha(),
+            ),
+        )?;
+    } else {
+        std::fs::write(path, text)?;
+    }
+    apply_mode(path, source.mode(rel_path))
 }
 
-/// Set the provisioned file's mode: `0o755` for a shell script THIS BINARY
-/// carries, [`PROVISIONED_FILE_MODE`] for anything the account layer supplied.
-///
-/// `include_dir` carries no permission bits, so without the first arm a helper
-/// script provisioned onto a Unix fleet device is non-executable and the skill
-/// fails when it shells out. The second arm is the security property: see the
-/// module docs.
+/// Set the provisioned file's Unix mode — see [`SkillSource::mode`] for which
+/// mode each source gives a file, and the module docs for why an account file
+/// is never executable.
 #[cfg(unix)]
-fn apply_mode(path: &Path, source: crate::agent_skills::AgentSkillSource) -> std::io::Result<()> {
+fn apply_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let is_script = path.extension().and_then(|e| e.to_str()) == Some("sh");
-    let mode = if is_script && !source.is_account_supplied() {
-        0o755
-    } else {
-        PROVISIONED_FILE_MODE
-    };
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
 /// Windows has no executable bit; `bash script.sh` runs regardless.
 #[cfg(not(unix))]
-fn apply_mode(_path: &Path, _source: crate::agent_skills::AgentSkillSource) -> std::io::Result<()> {
+fn apply_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::agent_skills::tests::{bundle, skill_unit};
     use crate::agent_skills::{AgentSkillSource, ResolvedSkill};
+
+    /// `skill_is_served` reads the real embedded bundle (plan
+    /// 2026-10-13-coord-expedited-land-lever-for-agents Phase 3b).
+    #[test]
+    fn skill_is_served_reads_the_embedded_bundle() {
+        assert!(skill_is_served("page-health"));
+        assert!(!skill_is_served("no-such-skill-for-this-test"));
+    }
 
     #[test]
     fn provisions_every_embedded_skill_into_dir() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let skills_dir = tmp.path().join(".claude").join("skills");
 
-        let out = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new())
+        let out = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new(), None)
             .expect("provision");
 
         // Every embedded file lands, byte-identically to what `include_dir`
@@ -508,22 +709,74 @@ mod tests {
         assert!(expected > 0, "the bundle should not be empty");
     }
 
+    /// Every embedded file landed at its relative path. A skill's top-level
+    /// `SKILL.md` carries the `qontinui-provenance:` key — stripping it with
+    /// the ONE shared strip rule gives the embedded bytes back, and the key
+    /// says `source=builtin` with the skill's canonical path. Every other file
+    /// is byte-identical, and on Unix an embedded `.sh` keeps `0o755`.
     fn check_dir(dir: &Dir<'_>, dst_root: &std::path::Path, count: &mut usize) {
         for file in dir.files() {
             let dst = dst_root.join(file.path());
             assert!(dst.exists(), "{} should exist", dst.display());
             let on_disk = std::fs::read(&dst).expect("read provisioned file");
-            assert_eq!(
-                on_disk,
-                file.contents(),
-                "{} should be byte-identical to the embedded copy",
-                dst.display()
-            );
+            let is_manifest = file.path().components().count() == 2
+                && file.path().file_name().and_then(|n| n.to_str()) == Some(SKILL_MANIFEST);
+            if is_manifest {
+                let skill = file
+                    .path()
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .expect("a manifest sits in a named skill dir");
+                let text = String::from_utf8(on_disk).expect("SKILL.md is UTF-8");
+                let (line, body) = crate::provenance::strip_provenance(&text)
+                    .unwrap_or_else(|| panic!("{} carries no provenance key", dst.display()));
+                assert_eq!(
+                    body.as_bytes(),
+                    file.contents(),
+                    "{} minus its provenance key must be the embedded copy",
+                    dst.display()
+                );
+                assert_eq!(line.source, "builtin");
+                assert_eq!(line.canonical, crate::provenance::skill_canonical(skill));
+                assert_eq!(line.runner_build, crate::provenance::RUNNER_BUILD);
+                assert!(
+                    crate::provenance::provenance_consistent(&text).is_ok(),
+                    "{} must be self-consistent",
+                    dst.display()
+                );
+            } else {
+                assert_eq!(
+                    on_disk,
+                    file.contents(),
+                    "{} should be byte-identical to the embedded copy",
+                    dst.display()
+                );
+                #[cfg(unix)]
+                if file.path().extension().and_then(|e| e.to_str()) == Some("sh") {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = std::fs::metadata(&dst).unwrap().permissions().mode();
+                    assert_eq!(
+                        mode & 0o777,
+                        0o755,
+                        "{} is an embedded script and must keep 0o755",
+                        dst.display()
+                    );
+                }
+            }
             *count += 1;
         }
         for sub in dir.dirs() {
             check_dir(sub, dst_root, count);
         }
+    }
+
+    /// A provisioned `SKILL.md`, read back with its provenance key removed.
+    fn manifest_body(path: &std::path::Path) -> String {
+        let text = std::fs::read_to_string(path).expect("read SKILL.md");
+        crate::provenance::strip_provenance(&text)
+            .unwrap_or_else(|| panic!("{} carries no provenance key", path.display()))
+            .1
     }
 
     #[test]
@@ -555,7 +808,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let skills_dir = tmp.path().join(".claude").join("skills");
 
-        let first = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new())
+        let first = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new(), None)
             .expect("first provision");
         assert!(first.skipped.is_empty(), "nothing here is git-tracked");
 
@@ -564,7 +817,7 @@ mod tests {
         let victim = skills_dir.join("coord-revive").join(SKILL_MANIFEST);
         std::fs::write(&victim, b"CLOBBERED").expect("clobber");
 
-        let second = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new())
+        let second = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new(), None)
             .expect("second provision");
         assert_eq!(
             (first.written, first.skipped.len()),
@@ -576,6 +829,86 @@ mod tests {
         assert_ne!(
             restored, b"CLOBBERED",
             "re-provisioning must overwrite a modified file, not leave it"
+        );
+    }
+
+    /// UNKNOWN inside a repository (a linked-worktree `.git` FILE pointing at a
+    /// gitdir that does not exist, so `git ls-files` fails): a skill whose
+    /// `SKILL.md` already exists is kept WHOLE — none of its files is written, so a session can
+    /// never get an old `SKILL.md` beside new helpers — while skills absent on
+    /// disk are still provisioned. Plan
+    /// `2026-10-04-shared-checkouts-pull-deterministically` Phase 2.
+    #[test]
+    fn an_unanswered_probe_inside_a_repo_keeps_an_existing_skill_whole() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        crate::provision_guard::test_support::assert_not_in_any_repo(tmp.path());
+        std::fs::write(
+            tmp.path().join(".git"),
+            b"gitdir: /nonexistent/qontinui-fleet-skills-test\n",
+        )
+        .unwrap();
+        let skills_dir = tmp.path().join(".claude").join("skills");
+        let kept_dir = skills_dir.join("coord-revive");
+        std::fs::create_dir_all(&kept_dir).unwrap();
+        let manifest = kept_dir.join(SKILL_MANIFEST);
+        std::fs::write(&manifest, b"# an older skill body\n").unwrap();
+
+        let out = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new(), None)
+            .expect("provision");
+
+        assert!(
+            out.skipped.iter().any(|s| s.unit == "coord-revive/*"
+                && s.reason == crate::capability_manifest::SkipReason::ProbeUnknownInRepo),
+            "the existing skill is kept whole, got {:?}",
+            out.skipped
+        );
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            "# an older skill body\n",
+            "an existing skill file must not be overwritten when git could not be asked"
+        );
+        assert_eq!(
+            std::fs::read_dir(&kept_dir).unwrap().count(),
+            1,
+            "no new file may be written into a kept skill"
+        );
+        assert!(out.written > 0, "absent skills are still provisioned");
+    }
+
+    /// The other half of the per-skill rule: with the probe UNKNOWN inside a
+    /// repository, a skill directory holding a helper but NO `SKILL.md` is not
+    /// kept — it is written whole, the stale helper overwritten, and no
+    /// `ProbeUnknownInRepo` skip is recorded for it.
+    #[test]
+    fn an_unanswered_probe_inside_a_repo_writes_a_skill_without_a_manifest_whole() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        crate::provision_guard::test_support::assert_not_in_any_repo(tmp.path());
+        std::fs::write(
+            tmp.path().join(".git"),
+            b"gitdir: /nonexistent/qontinui-fleet-skills-test\n",
+        )
+        .unwrap();
+        let skills_dir = tmp.path().join(".claude").join("skills");
+        let dir = skills_dir.join("coord-revive");
+        std::fs::create_dir_all(&dir).unwrap();
+        let helper = dir.join("coord-revive.sh");
+        std::fs::write(&helper, b"# stale helper\n").unwrap();
+
+        let out = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new(), None)
+            .expect("provision");
+
+        assert!(
+            !out.skipped
+                .iter()
+                .any(|s| s.unit.starts_with("coord-revive")),
+            "a skill with no SKILL.md is written whole, got {:?}",
+            out.skipped
+        );
+        assert!(dir.join(SKILL_MANIFEST).exists(), "its SKILL.md is written");
+        assert_ne!(
+            std::fs::read_to_string(&helper).unwrap(),
+            "# stale helper\n",
+            "the stale helper is overwritten so the skill is one build"
         );
     }
 
@@ -594,7 +927,7 @@ mod tests {
         std::fs::write(&tracked, b"# the repo's own skill\n").unwrap();
         crate::provision_guard::test_support::git_add(tmp.path(), &tracked);
 
-        let out = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new())
+        let out = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new(), None)
             .expect("provision");
 
         assert_eq!(out.skipped.len(), 1, "the tracked file should be skipped");
@@ -634,7 +967,7 @@ mod tests {
         std::fs::write(&dst, b"stale, untracked\n").unwrap();
         // Deliberately NOT `git add`ed.
 
-        let out = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new())
+        let out = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new(), None)
             .expect("provision");
 
         assert!(
@@ -645,7 +978,7 @@ mod tests {
             .get_file(std::path::Path::new("coord-revive").join(SKILL_MANIFEST))
             .expect("coord-revive/SKILL.md is embedded");
         assert_eq!(
-            std::fs::read(&dst).unwrap(),
+            manifest_body(&dst).as_bytes(),
             embedded.contents(),
             "an untracked destination is overwritten exactly as before"
         );
@@ -1105,12 +1438,12 @@ mod tests {
             "coord-revive",
             bundle(&[("SKILL.md", "# my own coord-revive\n")]),
         )]);
-        let out = provision_fleet_skills_into(&skills_dir, &registry).expect("provision");
+        let out = provision_fleet_skills_into(&skills_dir, &registry, None).expect("provision");
         assert!(out.skipped.is_empty(), "nothing here is git-tracked");
 
         let dir = skills_dir.join("coord-revive");
         assert_eq!(
-            std::fs::read_to_string(dir.join(SKILL_MANIFEST)).unwrap(),
+            manifest_body(&dir.join(SKILL_MANIFEST)),
             "# my own coord-revive\n",
             "the served body must win over the embedded default"
         );
@@ -1143,7 +1476,7 @@ mod tests {
         let skills_dir = tmp.path().join(".claude").join("skills");
 
         // Pass 1: the embedded floor, including `coord-revive/coord-revive.sh`.
-        provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new()).expect("pass 1");
+        provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new(), None).expect("pass 1");
         let helper = skills_dir.join("coord-revive").join("coord-revive.sh");
         assert!(
             helper.exists(),
@@ -1155,10 +1488,10 @@ mod tests {
             "coord-revive",
             bundle(&[("SKILL.md", "# my own coord-revive\n")]),
         )]);
-        provision_fleet_skills_into(&skills_dir, &registry).expect("pass 2");
+        provision_fleet_skills_into(&skills_dir, &registry, None).expect("pass 2");
 
         assert_eq!(
-            std::fs::read_to_string(skills_dir.join("coord-revive").join(SKILL_MANIFEST)).unwrap(),
+            manifest_body(&skills_dir.join("coord-revive").join(SKILL_MANIFEST)),
             "# my own coord-revive\n",
             "the override still replaces the file it names"
         );
@@ -1200,7 +1533,7 @@ mod tests {
             files,
             source: AgentSkillSource::Served,
         }]);
-        let out = provision_fleet_skills_into(&skills_dir, &registry).expect("provision");
+        let out = provision_fleet_skills_into(&skills_dir, &registry, None).expect("provision");
         assert_eq!(out.written, 0, "nothing of the skill may land");
         assert!(
             !skills_dir.join("probe").join(SKILL_MANIFEST).exists(),
@@ -1224,7 +1557,7 @@ mod tests {
         let blocked = skills_dir.join("coord-pr-label").join(SKILL_MANIFEST);
         std::fs::create_dir_all(&blocked).expect("occupy the destination with a directory");
 
-        let out = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new())
+        let out = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new(), None)
             .expect("the pass must not abort");
 
         assert_eq!(
@@ -1260,10 +1593,9 @@ mod tests {
             "account-only-skill",
             bundle(&[("SKILL.md", "# account only\n")]),
         )]);
-        provision_fleet_skills_into(&skills_dir, &registry).expect("provision");
+        provision_fleet_skills_into(&skills_dir, &registry, None).expect("provision");
         assert_eq!(
-            std::fs::read_to_string(skills_dir.join("account-only-skill").join(SKILL_MANIFEST))
-                .unwrap(),
+            manifest_body(&skills_dir.join("account-only-skill").join(SKILL_MANIFEST)),
             "# account only\n"
         );
     }
@@ -1281,12 +1613,183 @@ mod tests {
                 ("reference/verdicts.md", "# verdicts\n"),
             ]),
         )]);
-        provision_fleet_skills_into(&skills_dir, &registry).expect("provision");
+        provision_fleet_skills_into(&skills_dir, &registry, None).expect("provision");
         assert!(skills_dir
             .join("nested-probe")
             .join("reference")
             .join("verdicts.md")
             .exists());
+    }
+
+    /// `source=` on a `SKILL.md` names the layer that supplied it, and helper
+    /// files beside it are never stamped.
+    #[test]
+    fn a_served_manifest_is_stamped_served_and_its_helpers_are_not() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let skills_dir = tmp.path().join(".claude").join("skills");
+        let registry = registry_with(vec![skill_unit(
+            "coord-revive",
+            bundle(&[
+                ("SKILL.md", "---\nname: coord-revive\n---\n# served\n"),
+                ("coord-revive.sh", "#!/usr/bin/env bash\necho hi\n"),
+            ]),
+        )]);
+        provision_fleet_skills_into(&skills_dir, &registry, None).expect("provision");
+        let dir = skills_dir.join("coord-revive");
+        let text = std::fs::read_to_string(dir.join(SKILL_MANIFEST)).unwrap();
+        let line = crate::provenance::provenance_consistent(&text).expect("self-consistent");
+        assert_eq!(line.source, "served");
+        assert_eq!(
+            line.canonical,
+            "qontinui-claude-config:.claude/skills/coord-revive/SKILL.md"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("coord-revive.sh")).unwrap(),
+            "#!/usr/bin/env bash\necho hi\n",
+            "a helper script is written byte-for-byte"
+        );
+    }
+
+    // -- the canonical rung ----------------------------------------------------
+
+    /// A canonical snapshot of `coord-revive` with an extension-less helper
+    /// committed `100755` and a `.sh` committed `100644`.
+    fn canonical_coord_revive(root: &std::path::Path) -> crate::canonical_corpus::CanonicalSkills {
+        use crate::canonical_corpus::test_support::{chmod_x, mirror, remote_with};
+        let url = remote_with(
+            root,
+            &[
+                (
+                    ".claude/skills/coord-revive/SKILL.md",
+                    "---\nname: coord-revive\ndescription: canonical\n---\n# canonical coord-revive\n",
+                ),
+                (".claude/skills/coord-revive/probe", "#!/bin/sh\necho canonical\n"),
+                (".claude/skills/coord-revive/coord-revive.sh", "#!/usr/bin/env bash\necho canonical\n"),
+            ],
+        );
+        chmod_x(root, ".claude/skills/coord-revive/probe");
+        let m = mirror(root, &url);
+        let snapshot = m.refresh().expect("refresh");
+        let loaded = m
+            .load(&snapshot, &[], &["coord-revive"])
+            .expect("load")
+            .skills;
+        assert!(
+            loaded.skills.contains_key("coord-revive"),
+            "fixture must validate"
+        );
+        loaded
+    }
+
+    /// The canonical copy replaces the embedded default by name, stamps its
+    /// manifest `source=canonical` with the snapshot's sha, and leaves every
+    /// other embedded skill embedded.
+    #[test]
+    fn a_canonical_skill_replaces_the_embedded_default() {
+        let fixture = tempfile::tempdir().unwrap();
+        let canonical = canonical_coord_revive(fixture.path());
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().join(".claude").join("skills");
+        let out =
+            provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new(), Some(&canonical))
+                .expect("provision");
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+        assert!(out.is_complete());
+
+        let dir = skills_dir.join("coord-revive");
+        let text = std::fs::read_to_string(dir.join(SKILL_MANIFEST)).unwrap();
+        let line = crate::provenance::provenance_consistent(&text).expect("self-consistent");
+        assert_eq!(line.source, "canonical");
+        assert_eq!(
+            line.canonical_sha.as_deref(),
+            Some(canonical.snapshot.short())
+        );
+        assert!(manifest_body(&dir.join(SKILL_MANIFEST)).contains("# canonical coord-revive"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("probe")).unwrap(),
+            "#!/bin/sh\necho canonical\n"
+        );
+
+        // Another embedded skill is untouched by the canonical rung.
+        let other = crate::provenance::provenance_consistent(
+            &std::fs::read_to_string(skills_dir.join("preflight").join(SKILL_MANIFEST)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(other.source, "builtin");
+        assert_eq!(other.canonical_sha, None);
+    }
+
+    /// Git's mode decides executability for a canonical skill: the
+    /// extension-less helper committed `100755` is executable, and a `.sh`
+    /// committed `100644` is NOT — the extension heuristic does not apply.
+    #[cfg(unix)]
+    #[test]
+    fn a_canonical_skill_takes_its_modes_from_git() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let canonical = canonical_coord_revive(fixture.path());
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().join(".claude").join("skills");
+        provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new(), Some(&canonical))
+            .expect("provision");
+        let dir = skills_dir.join("coord-revive");
+        let mode = |rel: &str| {
+            std::fs::metadata(dir.join(rel))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(
+            mode("probe"),
+            0o755,
+            "an extension-less helper git records 100755"
+        );
+        assert_eq!(mode("coord-revive.sh"), 0o644, "a .sh git records 100644");
+        assert_eq!(mode(SKILL_MANIFEST), 0o644);
+    }
+
+    /// An account skill outranks the canonical copy.
+    #[test]
+    fn an_account_skill_outranks_the_canonical_copy() {
+        let fixture = tempfile::tempdir().unwrap();
+        let canonical = canonical_coord_revive(fixture.path());
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().join(".claude").join("skills");
+        let registry = registry_with(vec![skill_unit(
+            "coord-revive",
+            bundle(&[("SKILL.md", "# my own coord-revive\n")]),
+        )]);
+        provision_fleet_skills_into(&skills_dir, &registry, Some(&canonical)).expect("provision");
+        let dir = skills_dir.join("coord-revive");
+        let text = std::fs::read_to_string(dir.join(SKILL_MANIFEST)).unwrap();
+        assert_eq!(
+            crate::provenance::provenance_consistent(&text)
+                .unwrap()
+                .source,
+            "served"
+        );
+        assert_eq!(
+            manifest_body(&dir.join(SKILL_MANIFEST)),
+            "# my own coord-revive\n"
+        );
+        assert!(
+            !dir.join("probe").exists(),
+            "the canonical bundle was not written"
+        );
+    }
+
+    /// With no canonical snapshot (first spawn after boot, or every refresh
+    /// failed) the embedded floor is written exactly as before.
+    #[test]
+    fn no_canonical_snapshot_is_the_embedded_floor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().join(".claude").join("skills");
+        let out = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new(), None)
+            .expect("provision");
+        let mut expected = 0usize;
+        check_dir(&FLEET_SKILLS, &skills_dir, &mut expected);
+        assert_eq!(out.written, expected);
     }
 
     /// **A tracked file outranks a served override.** The account layer decides
@@ -1308,7 +1811,7 @@ mod tests {
             "coord-revive",
             bundle(&[("SKILL.md", "# the account's override\n")]),
         )]);
-        let out = provision_fleet_skills_into(&skills_dir, &registry).expect("provision");
+        let out = provision_fleet_skills_into(&skills_dir, &registry, None).expect("provision");
 
         assert_eq!(
             std::fs::read_to_string(&tracked).unwrap(),
@@ -1349,7 +1852,7 @@ mod tests {
                 source: AgentSkillSource::Served,
             }]);
 
-            let out = provision_fleet_skills_into(&skills_dir, &registry).expect("provision");
+            let out = provision_fleet_skills_into(&skills_dir, &registry, None).expect("provision");
             assert_eq!(
                 out.written, 0,
                 "{bad:?}: a skill with a traversal path must be skipped ENTIRELY, \
@@ -1390,7 +1893,7 @@ mod tests {
             files: bundle(&[("SKILL.md", "# evil\n")]),
             source: AgentSkillSource::Served,
         }]);
-        let out = provision_fleet_skills_into(&skills_dir, &registry).expect("provision");
+        let out = provision_fleet_skills_into(&skills_dir, &registry, None).expect("provision");
         assert_eq!(out.written, 0);
         assert!(!tmp.path().join("evil").exists());
     }
@@ -1443,7 +1946,8 @@ mod tests {
         let skills_dir = tmp.path().join(".claude").join("skills");
 
         // The embedded floor alone.
-        provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new()).expect("provision");
+        provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new(), None)
+            .expect("provision");
         let embedded_script = skills_dir.join("coord-revive").join("coord-revive.sh");
         let mode = std::fs::metadata(&embedded_script)
             .expect("the embedded helper script should be provisioned")
@@ -1465,7 +1969,7 @@ mod tests {
                 ("coord-revive.sh", "#!/usr/bin/env bash\necho hi\n"),
             ]),
         )]);
-        provision_fleet_skills_into(&served_dir, &registry).expect("provision");
+        provision_fleet_skills_into(&served_dir, &registry, None).expect("provision");
         for rel in [SKILL_MANIFEST, "coord-revive.sh"] {
             let path = served_dir.join("coord-revive").join(rel);
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();

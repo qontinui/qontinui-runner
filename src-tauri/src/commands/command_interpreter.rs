@@ -181,10 +181,19 @@ pub async fn command_interpret(
         tools_json, text
     );
 
-    let output = build_interpret_command(&prompt)
-        .output()
+    // `.output()` semantics (stdin null, stdout and stderr captured), but
+    // the spawn retries a transient launch failure (the CLI mid-reinstall by
+    // its own auto-updater) before reporting it.
+    let mut cmd = build_interpret_command(&prompt);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let output = crate::claude_cli_spawn::spawn_tokio_with_retry(&mut cmd, None)
         .await
-        .map_err(|e| format!("claude spawn failed: {e}"))?;
+        .map_err(|f| format!("claude spawn failed: {}", f.describe_error()))?
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("claude wait failed: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

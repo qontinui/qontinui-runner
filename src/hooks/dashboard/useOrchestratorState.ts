@@ -24,6 +24,7 @@ import {
 import { useWorkflowExecutionOptional } from "../../contexts/WorkflowExecutionContext";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { createLogger } from "@/lib/logger";
+import { describeThrown } from "@/lib/utils";
 
 const logger = createLogger("OrchestratorState");
 
@@ -148,7 +149,7 @@ export function useOrchestratorState(
       setState(data);
       setError(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Unknown error");
+      setError(describeThrown(e, "Unknown error"));
     }
   }, [taskId]);
 

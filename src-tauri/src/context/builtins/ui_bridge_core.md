@@ -7,18 +7,18 @@ UI Bridge enables AI-driven control of applications through a unified HTTP API. 
 ```python
 from ui_bridge import UIBridgeClient
 
-# Default connection (localhost:9876)
+# Default connection (127.0.0.1:9876)
 client = UIBridgeClient()
 
 # Custom connection
 client = UIBridgeClient(
-    base_url="http://localhost:9876",
+    base_url="http://127.0.0.1:9876",
     timeout=30.0,
     api_path="/ui-bridge"
 )
 
 # Common connection targets:
-# - Local runner:        http://localhost:9876
+# - Local runner:        http://127.0.0.1:9876
 # - Android emulator:    http://10.0.2.2:8087
 # - iOS simulator:       http://localhost:8087
 # - Physical device:     http://<device-ip>:8087
@@ -176,6 +176,10 @@ If not using the Python client:
 - `includeHidden` (bool, optional, **default true**): match elements regardless of visibility — preserves historical front-end behaviour (the registry contains hidden elements like collapsed-sidebar children). Pass `false` to opt into the visibility filter.
 
 `/ui-bridge/control/find` and `/ui-bridge/control/discover` take the **same** filter set (the SDK's `FindRequest`; `DiscoveryRequest` is a deprecated alias of it), and the runner now forwards it whole on both routes. Beyond the common filters (`types`, `element_type`, `text`, `exact_text`, `role`, `label`, `selector`, `root`, `interactiveOnly`, `includeHidden`, `limit`) that means `testId`, `contentRole`, `includeContent`, `contentOnly`, `skipSettle`, `settleTimeout` and the media filters (`includeMedia`, `mediaOnly`, `mediaType`, `brokenOnly`, `missingAltOnly`, `srcPattern`, `oversizeThreshold`) reach the SDK on **either** route. Both `interactive_only`/`interactiveOnly` and `include_hidden`/`includeHidden` spellings are accepted.
+
+`includeHidden` defaults to **true** on both routes: the runner seeds it beneath the caller's filters (the SDK executor itself treats an unset flag as false), so pass `false` to apply the visibility filter. An explicit `null` counts as unset on both routes; before the runner build containing that fix, `/control/find` forwarded the `null` and the SDK read it as false. Until the runner build containing that seed, `/control/discover` dropped every off-viewport and zero-rect element when the flag was unset, and its six-key payload never carried the extra filters listed above.
+
+`discover`/`find` and `/control/snapshot` are **different projections**, so their counts are not expected to match. `discover` is a live DOM scan (interactive selectors, plus registry content elements when `interactiveOnly` is false or `includeContent`/`contentOnly` is set, plus registry media when `includeMedia`/`mediaOnly` is set; `contentOnly` drops the selector scan), and it also returns **unregistered** nodes that `executeAction` can still resolve. `snapshot` is every registered element, with no visibility filter. The two also compute `state.visible` with different predicates: `discover` keeps `opacity:0` and marks off-viewport elements not visible, while `snapshot` marks `opacity:0` not visible and adds an occlusion hit-test. For the widest `discover`, send `{"interactive_only": false, "include_hidden": true, "includeMedia": true}`.
 
 ### Choosing a wait / nav / batch primitive
 

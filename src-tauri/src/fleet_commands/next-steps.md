@@ -87,10 +87,12 @@ gate; just list it.
   charter rule 10 ("Finish to zero") this session finishes its own follow-ups, so
   a redundant continuation queues a duplicate, parallel run of the same work (the
   concurrent-WIP clobber the coordination layer exists to prevent). Attach one
-  only when the follow-up will **outlive** this session: a wait longer than rule
-  10's ≲2h monitor window; this session ending WITHOUT dispatching the follow-up
-  itself; an `operator_approval` / human-decision gate (unbounded in time — but
-  sensitive work stays notify-only unconditionally); or a cross-session chain
+  only when the follow-up will **outlive** this session: a follow-up that can
+  only run after the watched event (a session never stays alive to wait —
+  operator decision 2026-10-17 — so every such follow-up outlives it); this
+  session ending WITHOUT dispatching the follow-up
+  itself; an `operator_approval` / human-decision gate (unbounded in time;
+  sensitive subject matter changes nothing here); or a cross-session chain
   owned by a different work unit or device (**out-of-graph only** — a purely
   in-graph dependency on another work unit is a DAG edge + `metadata.dispatch`,
   not a gate). Sessions also die exogenously (usage limit, crash, reboot) — if
@@ -127,8 +129,10 @@ gate; just list it.
 - **`clearance_audience`:** set `agent` for agent-verifiable facts ("/vet-plan
   was run", "crate exists + tests green", "a dual run emitted evidence") so the
   session that completes the work can attest the gate itself; set `operator` for
-  business/judgment/strategy or on-page-human-verification gates. Default is
-  `operator` if omitted; the sensitive-work rule always forces `operator`.
+  a genuine closed-list decision (product/strategy, an item-2 resource) or
+  on-page human verification. Default is
+  `operator` if omitted. Sensitivity alone never forces `operator`
+  (`_gate-registration` → "Sensitive-work rule").
 - **`gate_class`:** classify the gate so coord's per-tenant `gate_clearance`
   matrix can resolve who may clear it. `security-surface` when the deferred work
   this gate guards would itself fire a `security-and-autonomy` glob or content
@@ -144,14 +148,14 @@ gate; just list it.
   than assuming one), and `non_author_allows_identities` is now a
   six-tier ladder in which **tier 3 (different device)** and **tier 5 (same
   device, differing VERIFIED sessions)** both resolve to NON-author. It refuses
-  only in tier 6 — same device, no proven session on either side. So
+  only in tier 6 — same device, no proven session on one or both sides. So
   `agent_non_author` IS usable when the clearer is a different device or carries
   proven session identity. ⚠️ **The sentence that used to follow — "the work-unit
   attestation check now routes through this SAME ladder" — is FALSE and was
-  removed 2026-09-03.** Re-verified on qontinui-coord `origin/main` 2026-09-23 at
-  `037fc1a8f`: `work_unit_registry::authorize_target_transition` takes the two
+  removed 2026-09-03.** Re-verified on qontinui-coord `origin/main` 2026-10-03 at
+  `f32fb04ad`: `work_unit_registry::authorize_target_transition` takes the two
   actor keys **plus an optional `independence` declaration**
-  (`{verified, against, context}`), and does the flat `owner == attester`
+  (`{verified, against, context}`), and does the device-grain `owner == attester`
   compare **only when no declaration is sent** — a well-formed one authorizes an
   Attested transition without that compare, while still refusing
   `attester_unresolved` when the caller's token derives no actor key;
@@ -169,7 +173,7 @@ gate; just list it.
   the tool your session advertises, and verify by read — a zero exit is not
   evidence the write landed. ⚠️ **Never re-allocate to get past
   `self_attestation_forbidden`**: a re-allocate no longer changes the verdict by itself (qontinui-coord#2561 — the refusal now says in its own words that the compare reads the device, not the agent id). A different hole — in GATE clearance, not this refusal: the `agent_non_author` ladder's caller-mintable session rung — is tracked by plan `2026-09-26-gate-ladder-session-rung-is-caller-mintable-so-tier-5-proves-a-session-not-an-actor`. The re-allocate prohibition is that refusal's
-  alone — `attester_unresolved` wants a device- or agent-identified caller,
+  alone — `attester_unresolved` wants a caller coord admits as an SoD actor,
   which is a credential remedy rather than a route around a control. For the work-unit rule read policy live rather than restating it:
   `/policy get policy plan-discipline` and `verification-and-evidence`
   [policy: never-pin-a-mutable-policy-value]. (Canonical for gates:
@@ -187,8 +191,12 @@ gate; just list it.
   `vetted`; never on the status a REFUSED transition left, which on a fresh unit
   is `""` and clears at once; on a refused transition register no `unit_ready` gate (canonical: `_gate-registration`).
   (**NOT** `operator_approval` — `operator_approval`
-  is for genuine human decisions, not a work queue); schema/alembic-at-head →
-  `migration_at_head` `{schema}`; infra drift cleared → `infra_drift_clear`; a repo
+  is for genuine human decisions, not a work queue); the whole alembic chain
+  applied → `migration_at_head` `{schema: "coord"}` (database-wide; born cleared
+  if registered before coord observes the new head — see `_gate-registration`,
+  What "born cleared" means);
+  one table/column existing on the serving DB → `schema_object_exists`
+  `{schema, object, column?}`; infra drift cleared → `infra_drift_clear`; a repo
   file/workflow existing → `file_exists` `{repo, path, on_ref?}` — **usable again;
   the 2026-08-05 fleet-wide 403 was FIXED by coord `e6f486b8` (2026-08-15) and that
   fix is deployed** (ancestor of the serving build, re-probed live 2026-08-31:
@@ -197,9 +205,11 @@ gate; just list it.
   a coord data count crossing a bound → `sql_count` `{query_id,op,n}` (whitelisted
   `query_id`, never raw SQL); an umbrella plan reaching a status → `unit_status`
   `{work_unit_id,status}`; another cross-anchor gate clearing → `gate_cleared`
-  `{gate_id}`; needs-human → `operator_approval`. Anything
-  **security / credential / billing / strategy-sensitive** → `operator_approval` +
-  notify, never an auto-resuming gate, never silently auto-registered.
+  `{gate_id}`; a genuine closed-list human decision → `operator_approval`
+  (prefer an observable predicate on the result of the operator's action).
+  Security / credential / billing subject matter is **not** a predicate choice:
+  gate on the observable, proceed, and notify
+  (`_gate-registration` → "Sensitive-work rule").
 - **Masked-tool honesty:** if `coord_register_gate` fails as unknown/
   method-not-found (per-agent MCP allow-set masking, coord `mcp/mod.rs`), report
   **"gate NOT registered — coord_register_gate not in this session's tool
@@ -237,7 +247,12 @@ gate; just list it.
   PENDING continuation so the old queued runner-terminal spawn doesn't fire
   alongside the new one — `GET .../coord/agent-gates?work_unit_id=<id>` for rows
   carrying a `continuation_spawn` with `continuation_consumed_at == null ∧
-  continuation_cancelled_at == null`. **Do NOT also require
+  continuation_cancelled_at == null`.
+  **Never a hold gate** (`/vet-plan` §5.4 step 6's hold-gate skip): a gate holding a
+  vetted plan behind its live trigger carries an armed continuation by design and is
+  that plan's real net — retire only the prior gate you are re-registering or the
+  `vet→implement safety net` row (`_gate-registration` → "Never retire a HOLD gate").
+  **Do NOT also require
   `continuation_dispatched_at != null`**: `cancel_continuation` deliberately omits
   that guard (*"the pre-dispatch stamp is the whole point"*), so a
   dispatched-only filter drops exactly the rows the cancel was built to stamp —
@@ -283,7 +298,9 @@ until a human clicks it.
   `gate_id` — works from a device session since attest takes no upsert); fall back to
   the device loopback forwarder `POST http://127.0.0.1:{runner_port}/coord-mcp/gates/{gate_id}/attest`
   (header `X-Coord-Mcp-Proxy-Key`, or `Authorization: Bearer <nonce>` on configs
-  written after the Phase 2 header move — no body bearer; maskless fallback), then the
+  written after the Phase 2 header move, a `${QONTINUI_COORD_MCP_NONCE_<K>:-<nonce>}`
+  value expanded from your own environment first, with `${VAR:-default}` shell
+  semantics and never sent literally — no body bearer; maskless fallback), then the
   direct device-authed `POST $COORD_HTTP_URL/coord/gates/:gate_id/attest`. Tenant
   derives server-side — never pass it. Legal only on an OPEN `operator_approval`
   gate with `clearance_audience = 'agent'` in the caller's own tenant; coord flips

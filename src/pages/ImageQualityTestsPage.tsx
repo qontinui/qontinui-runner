@@ -23,6 +23,7 @@ import {
   Pencil,
   Check,
 } from "lucide-react";
+import { describeThrown } from "@/lib/utils";
 
 // ============================================================================
 // Types
@@ -121,7 +122,7 @@ function ImageCard({
         }
       } catch (err) {
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : "Failed to load");
+          setError(describeThrown(err, "Failed to load"));
         }
       } finally {
         if (!cancelled) {
@@ -441,7 +442,7 @@ function UploadPanel({ onUploadComplete }: { onUploadComplete: () => void }) {
         setElementType("");
         onUploadComplete();
       } catch (err) {
-        setUploadError(err instanceof Error ? err.message : "Upload failed");
+        setUploadError(describeThrown(err, "Upload failed"));
       } finally {
         setUploading(false);
       }
@@ -669,7 +670,7 @@ export function ImageQualityTestsPage() {
         throw new Error(data.error || "Unknown error");
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load manifest");
+      setError(describeThrown(err, "Failed to load manifest"));
     } finally {
       setLoading(false);
     }
@@ -700,7 +701,7 @@ export function ImageQualityTestsPage() {
         }
         loadManifest();
       } catch (err) {
-        alert(`Delete failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+        alert(`Delete failed: ${describeThrown(err, "Unknown error")}`);
       }
     },
     [loadManifest],
@@ -726,7 +727,7 @@ export function ImageQualityTestsPage() {
         }
         await loadManifest();
       } catch (err) {
-        alert(`Update failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+        alert(`Update failed: ${describeThrown(err, "Unknown error")}`);
         throw err; // Re-throw so ImageCard knows save failed
       }
     },

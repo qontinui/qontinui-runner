@@ -226,7 +226,7 @@ __resolve_fleet_script() {
   [ -n "$__FLEET_HERE_PHYS" ] && __rfs_try "$__FLEET_HERE_PHYS/_scripts/$__rfs_rel"
   # A SIBLING skill's render. `pr-status.sh` carries this block byte for byte
   # and resolves `coord-acting-bearer.sh` through it, so this rung is what
-  # spares the bundle a second copy of the same six files. `..` here is
+  # spares the bundle a second copy of the same rostered files. `..` here is
   # resolved by the kernel after any symlink, so it lands in the same
   # `skills/` directory the running copy was provisioned into.
   __rfs_try "$HERE/../coord-revive/_scripts/$__rfs_rel"
@@ -1029,6 +1029,29 @@ if [[ -z "$ROOT" ]]; then
 fi
 if [[ -z "$ROOT" || "$ROOT" == "." ]]; then ROOT="$PWD"; fi
 
+# `${NAME:-default}` expansion for the nonce each .mcp.json carries: the runner
+# writes `Bearer ${QONTINUI_COORD_MCP_NONCE_<K>:-<workdir nonce>}`, and this sweep
+# must expand it from ITS OWN environment exactly as Claude Code does, never
+# replay the literal reference. Same resolution and the same fail-closed stub as
+# coord-revive.sh: a literal nonce needs no helper, a reference without one is
+# refused, typed, and never sent. Plan
+# 2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages.
+__resolve_fleet_script "lib/mcp-env-ref.sh"; MCP_ENV_REF_LIB="$__RFS_PATH"
+if [[ -n "$MCP_ENV_REF_LIB" ]]; then
+  # shellcheck source=../../../scripts/lib/mcp-env-ref.sh
+  . "$MCP_ENV_REF_LIB"
+else
+  mcp_expand_env_ref_to() {
+    case "$2" in
+      *'${'*'}'*)
+        echo "UNEXPANDED_ENV_REF (helper absent): scripts/lib/mcp-env-ref.sh not found - refusing to send a \${...} reference literally (LOCAL fault)" >&2
+        printf -v "$1" '%s' ""; return 4 ;;
+    esac
+    printf -v "$1" '%s' "$2"
+  }
+  mcp_expand_env_ref_for_url() { mcp_expand_env_ref_to "$1" "$3"; }
+fi
+
 MAX_DOORS=10
 SEEN=""
 DOORS=0
@@ -1085,6 +1108,15 @@ print("Authorization" if authz else "X-Coord-Mcp-Proxy-Key")' < "$CFG" 2>/dev/nu
     [[ -n "$KEYHDR" ]] || KEYHDR="X-Coord-Mcp-Proxy-Key"
   fi
   case "$URL" in *"/coord-mcp"*) ;; *) continue ;; esac
+  [[ -n "$KEY" ]] || continue
+  # Expand BEFORE the (url, key) dedup below, so an env-ref config and its
+  # literal twin naming the same nonce are one door, not two. The _for_url form
+  # reads the environment only for a strictly-loopback $URL (else the default),
+  # so no environment value is sent off-box even ahead of the loopback check.
+  if ! mcp_expand_env_ref_for_url KEY "$URL" "$KEY" 2>"$CURLERR"; then
+    note_fail "$CFG: $(head -n 1 "$CURLERR" 2>/dev/null)"
+    continue
+  fi
   [[ -n "$KEY" ]] || continue
   # LOOPBACK ONLY. Before this sweep, door 1 was a hard-coded 127.0.0.1 URL;
   # honouring an arbitrary `url` from any .mcp.json under the workspace would
@@ -1163,6 +1195,7 @@ else
       0)   note_fail "MINT_EMPTY (coord-acting-bearer.sh exited 0 but printed no token)" ;;
       2)   note_fail "NO_TOKEN (\$COORD_AGENT_JWT unset/empty — it is the helper's only credential source)" ;;
       3)   note_fail "MINT_FAILED (coord rejected or never answered the acting-user mint — device unknown / no bound user / coord down)" ;;
+      4)   note_fail "PRESENTER_NOT_ADMITTED (coord refused to exchange \$COORD_AGENT_JWT — only a paired device JWT or an allocated-authenticated agent token may act for the operator)" ;;
       127) note_fail "HELPER_DEPS_MISSING (coord-acting-bearer.sh: curl missing, or no working JSON reader)" ;;
       *)   note_fail "HELPER_FAILED (coord-acting-bearer.sh exit $RC)" ;;
     esac

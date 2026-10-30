@@ -14,6 +14,7 @@ import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { Button } from "../ui/Button";
 import type { WizardApi } from "./ConnectionWizard";
 import type { DiscoveredDevice, Platform } from "./types";
+import { describeThrown } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
 // API shapes
@@ -101,7 +102,7 @@ function UsbBranch({ api }: { api: WizardApi }) {
 
       setDevices([...androidDevices, ...iosDevices]);
     } catch (e) {
-      api.setError(e instanceof Error ? e.message : String(e));
+      api.setError(describeThrown(e, "Device discovery failed"));
     } finally {
       setLoading(false);
     }

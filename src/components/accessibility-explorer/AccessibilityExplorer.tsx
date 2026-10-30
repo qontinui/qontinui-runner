@@ -32,6 +32,7 @@ import type {
   ActionResult,
   QueryResult,
 } from "./types";
+import { describeThrown } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
 // Main Component
@@ -89,7 +90,7 @@ export default function AccessibilityExplorer() {
         setSnapshot(snap);
       }
     } catch (err) {
-      setConnectionError(err instanceof Error ? err.message : String(err));
+      setConnectionError(describeThrown(err, "Failed to connect to accessibility tree"));
     } finally {
       setConnecting(false);
     }
@@ -120,7 +121,7 @@ export default function AccessibilityExplorer() {
       setSnapshot(snap);
       setSelectedNode(null);
     } catch (err) {
-      setConnectionError(err instanceof Error ? err.message : String(err));
+      setConnectionError(describeThrown(err, "Failed to refresh accessibility snapshot"));
     } finally {
       setLoading(false);
     }
@@ -138,7 +139,7 @@ export default function AccessibilityExplorer() {
         result.success ? "Action succeeded" : `Failed: ${result.message ?? "unknown"}`,
       );
     } catch (err) {
-      setActionMessage(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      setActionMessage(`Error: ${describeThrown(err, "action failed")}`);
     }
   }, []);
 
@@ -172,7 +173,7 @@ export default function AccessibilityExplorer() {
       });
       setQueryResults(result.elements);
     } catch (err) {
-      setConnectionError(err instanceof Error ? err.message : String(err));
+      setConnectionError(describeThrown(err, "Accessibility query failed"));
     } finally {
       setQueryLoading(false);
     }
@@ -187,7 +188,7 @@ export default function AccessibilityExplorer() {
       });
       setAiContext(result);
     } catch (err) {
-      setAiContext(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      setAiContext(`Error: ${describeThrown(err, "failed to load AI context")}`);
     } finally {
       setAiContextLoading(false);
     }

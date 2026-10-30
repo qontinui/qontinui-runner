@@ -142,6 +142,56 @@ impl PolicyEngine {
         })
     }
 
+    /// [`Self::resolve`] for a live execution, adjusted for the model gateway:
+    /// a valid gateway's host is allowed ([`Self::allow_model_gateway`]); while
+    /// any gateway is declared — valid, invalid or of unknown state — the vendor
+    /// host leaves the allow-list ([`Self::drop_vendor_host`]). Every production
+    /// caller resolves through this.
+    pub fn resolve_for_runtime(
+        workflow_policy: Option<&SecurityPolicy>,
+        settings: &SecuritySettings,
+    ) -> SecurityPolicy {
+        let mut policy = Self::resolve(workflow_policy, settings);
+        match crate::model_gateway::resolution() {
+            crate::model_gateway::Resolution::NoGateway => {}
+            crate::model_gateway::Resolution::Gateway(g) => {
+                Self::allow_model_gateway(&mut policy, g.host())
+            }
+            crate::model_gateway::Resolution::Unresolved(_) => {
+                Self::drop_vendor_host(&mut policy, None)
+            }
+        }
+        policy
+    }
+
+    /// Append the model gateway's host to `allowed_domains` unless the list
+    /// already matches it, and drop the vendor host (plan
+    /// `2026-10-09-spec-front-end-of-the-software-factory` Phase 9, decision
+    /// record `gateway-tenants-route-every-model-call-through-the-gateway`).
+    ///
+    /// Only the allow-list is touched, which is what an `AllowList` network
+    /// mode reads. A profile that disables the network outright, or that
+    /// names the host in `denied_domains`, is an explicit operator posture and
+    /// is left as it is.
+    pub fn allow_model_gateway(policy: &mut SecurityPolicy, host: &str) {
+        let host = host.trim().to_ascii_lowercase();
+        Self::drop_vendor_host(policy, Some(&host));
+        if host.is_empty() || domain_matches_list(&host, &policy.network.allowed_domains) {
+            return;
+        }
+        policy.network.allowed_domains.push(host);
+    }
+
+    /// Remove every allow-list entry that admits the vendor API host (review
+    /// L7), except one that also admits `keep_host` (the gateway itself).
+    pub fn drop_vendor_host(policy: &mut SecurityPolicy, keep_host: Option<&str>) {
+        policy.network.allowed_domains.retain(|pattern| {
+            let one = std::slice::from_ref(pattern);
+            !domain_matches_list(crate::model_gateway::VENDOR_API_HOST, one)
+                || keep_host.is_some_and(|h| domain_matches_list(h, one))
+        });
+    }
+
     /// Evaluate whether a command is allowed under the given policy.
     pub fn evaluate_command(policy: &SecurityPolicy, command: &str) -> Result<(), PolicyDenial> {
         let ap = &policy.actions;
@@ -396,8 +446,17 @@ fn is_metadata_endpoint(domain: &str) -> bool {
     metadata_addresses.contains(&domain)
 }
 
+/// The loopback spellings of ONE host. A policy entry naming any of them
+/// matches the others, so respelling a URL from `localhost` to `127.0.0.1`
+/// (plan 2026-10-25-runner-self-calls-dial-localhost-and-pay-a-doomed-ipv6-connect)
+/// neither escapes a deny list nor falls out of an allow list.
+fn is_loopback_name(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+}
+
 /// Check if a domain matches any pattern in a list.
-/// Supports exact match and wildcard prefix (e.g., `*.example.com`).
+/// Supports exact match, wildcard prefix (e.g., `*.example.com`), and treats
+/// the loopback spellings (`localhost`, `127.0.0.1`, `::1`) as one host.
 #[expect(
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
@@ -412,7 +471,8 @@ fn domain_matches_list(domain: &str, patterns: &[String]) -> bool {
             if domain_lower.ends_with(suffix) || domain_lower == pat[2..] {
                 return true;
             }
-        } else if domain_lower == pat {
+        } else if domain_lower == pat || (is_loopback_name(&domain_lower) && is_loopback_name(&pat))
+        {
             return true;
         }
     }
@@ -665,6 +725,65 @@ mod tests {
     }
 
     #[test]
+    fn model_gateway_host_is_allowed_by_a_restrictive_profile() {
+        let mut policy = SecurityPolicy {
+            network: NetworkPolicy {
+                mode: NetworkMode::AllowList,
+                allowed_domains: vec!["api.anthropic.com".to_string()],
+                ..Default::default()
+            },
+            ..SecurityPolicy::permissive()
+        };
+        assert!(PolicyEngine::evaluate_network(&policy, "llm-gw.example.com", "https").is_err());
+        PolicyEngine::allow_model_gateway(&mut policy, "LLM-GW.example.com");
+        assert!(PolicyEngine::evaluate_network(&policy, "llm-gw.example.com", "https").is_ok());
+        // Idempotent: a second call (or a host already matched by a wildcard)
+        // adds nothing.
+        PolicyEngine::allow_model_gateway(&mut policy, "llm-gw.example.com");
+        assert_eq!(
+            policy.network.allowed_domains,
+            vec!["llm-gw.example.com".to_string()]
+        );
+        policy.network.allowed_domains = vec!["*.example.com".to_string()];
+        PolicyEngine::allow_model_gateway(&mut policy, "llm-gw.example.com");
+        assert_eq!(
+            policy.network.allowed_domains,
+            vec!["*.example.com".to_string()]
+        );
+    }
+
+    /// Review L7: while a gateway is declared the vendor host leaves the
+    /// allow-list, so a restrictive profile cannot reach it around the gateway.
+    #[test]
+    fn model_gateway_drops_the_vendor_host_from_the_allow_list() {
+        let mut policy = SecurityPolicy {
+            network: NetworkPolicy {
+                mode: NetworkMode::AllowList,
+                allowed_domains: vec!["api.anthropic.com".to_string(), "github.com".to_string()],
+                ..Default::default()
+            },
+            ..SecurityPolicy::permissive()
+        };
+        PolicyEngine::allow_model_gateway(&mut policy, "llm-gw.example.com");
+        assert!(PolicyEngine::evaluate_network(&policy, "api.anthropic.com", "https").is_err());
+        assert!(PolicyEngine::evaluate_network(&policy, "github.com", "https").is_ok());
+        assert!(PolicyEngine::evaluate_network(&policy, "llm-gw.example.com", "https").is_ok());
+    }
+
+    #[test]
+    fn model_gateway_does_not_override_a_disabled_network() {
+        let mut policy = SecurityPolicy {
+            network: NetworkPolicy {
+                mode: NetworkMode::Disabled,
+                ..Default::default()
+            },
+            ..SecurityPolicy::permissive()
+        };
+        PolicyEngine::allow_model_gateway(&mut policy, "llm-gw.example.com");
+        assert!(PolicyEngine::evaluate_network(&policy, "llm-gw.example.com", "https").is_err());
+    }
+
+    #[test]
     fn test_evaluate_network_denylist() {
         let policy = SecurityPolicy {
             network: NetworkPolicy {
@@ -764,6 +883,18 @@ mod tests {
             "evil.anthropic.com",
             &["api.anthropic.com".to_string()]
         ));
+    }
+
+    #[test]
+    fn test_loopback_spellings_match_each_other() {
+        let localhost = ["localhost".to_string()];
+        let ipv4 = ["127.0.0.1".to_string()];
+        assert!(domain_matches_list("127.0.0.1", &localhost));
+        assert!(domain_matches_list("LOCALHOST", &ipv4));
+        assert!(domain_matches_list("::1", &localhost));
+        assert!(!domain_matches_list("127.0.0.2", &localhost));
+        assert!(!domain_matches_list("localhost.example.com", &localhost));
+        assert!(!domain_matches_list("example.com", &ipv4));
     }
 
     #[test]

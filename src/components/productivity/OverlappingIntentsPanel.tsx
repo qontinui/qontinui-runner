@@ -33,11 +33,8 @@ import {
   CoordConnectionRequired,
   coordDisabledCopy,
 } from "@/components/shared/CoordConnectionRequired";
-import {
-  describeThrown,
-  listOverlappingIntents,
-  type OverlappingIntentPair,
-} from "./overlappingIntentsApi";
+import { describeThrown } from "@/lib/utils";
+import { listOverlappingIntents, type OverlappingIntentPair } from "./overlappingIntentsApi";
 
 /** Operator-facing name of this surface, shared by the isolated notice and
  *  the disabled control's tooltip so both read from one `coordDisabledCopy`. */

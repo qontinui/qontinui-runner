@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, type ReactNode } from "react";
 import { ChevronDown, Pin, Filter, ArrowDownToLine, Zap, MessageSquare } from "lucide-react";
 import { useUIElement } from "@qontinui/ui-bridge";
 import type { TerminalTab } from "../useTerminalManager";
@@ -9,34 +9,60 @@ import { TenantBadge } from "../TenantBadge";
 import { RemoteTabControls } from "../RemoteTabControls";
 import { useTerminalWindowActions } from "../useTerminalWindowActions";
 import { SessionInfoDropdown } from "../SessionInfoDropdown";
+import { TabTitle, useDisplayTitle } from "../displayTitle";
+import { ZONE_HEADER_HOVER_RESERVE_CLASS } from "./headerReserve";
+import { formatTotalOutput } from "./outputSize";
 
 /**
  * UI Bridge registration spec for a zone header (boot-restore remediation
  * item 8): session/zone identity was previously only observable through a
- * debug DOM text node — `ai/find "<session title>"` resolved nothing. The
- * header element registers with the session title as its label and carries
+ * debug DOM text node — `ai/find "<session name>"` resolved nothing. The
+ * header element registers with the session name as its label and carries
  * the binding as data attributes (`data-claude-session-id`,
  * `data-zone-index`, `data-resume-failed`) so UI Bridge clients can verify
  * session↔zone placement without scraping internals.
  *
+ * The name is the RESOLVED display title (`resolveDisplayTitle`: live Claude
+ * Code registry name -> immutable spawn name -> non-path `tab.title` ->
+ * `Terminal`), never the raw `tab.title`, which for a PTY-launched Claude
+ * session is the shell cwd. The cwd stays in `SessionInfoDropdown`.
+ *
  * When the tab is bound to a Claude session, the label carries a short
- * session-id suffix (`(<first 8 chars>)`): PTY-launched Claude sessions all
- * share the raw shell path as their title, so without the suffix every zone
- * registers an identical label and `ai/find` by label can't tell them apart.
- * The suffix makes each label unique per bound session.
+ * session-id suffix (`(<first 8 chars>)`): sessions may still share a name
+ * (spawn names are not unique by construction), so without the suffix two
+ * zones could register an identical label and `ai/find` by label couldn't
+ * tell them apart. The suffix makes each label unique per bound session.
  *
  * Pure + exported for unit tests (the hook call itself needs a DOM).
  */
 export function zoneHeaderElementSpec(
   zoneIndex: number,
-  title: string,
+  displayName: string,
   claudeSessionId?: string,
 ): { id: string; label: string } {
-  const base = `Zone ${zoneIndex + 1}: ${title}`;
+  const base = `Zone ${zoneIndex + 1}: ${displayName}`;
   return {
     id: `terminal-zone-header-${zoneIndex}`,
     label: claudeSessionId ? `${base} (${claudeSessionId.slice(0, 8)})` : base,
   };
+}
+
+/**
+ * The header's output figure: the session's total output, labelled as total
+ * output (`formatTotalOutput`). Renders nothing while no total is known.
+ */
+export function TotalOutputLabel({ totalBytes }: { totalBytes: number | undefined }) {
+  const text = formatTotalOutput(totalBytes);
+  if (text === null || totalBytes === undefined) return null;
+  return (
+    <span
+      className="text-[9px] text-[#565f89] font-mono ml-1 shrink-0"
+      title={`Total output this session has produced: ${totalBytes} bytes`}
+      data-zone-total-output
+    >
+      {text}
+    </span>
+  );
 }
 
 export function ZoneLabel({
@@ -52,12 +78,13 @@ export function ZoneLabel({
   zoneLabel,
   onSetZoneLabel,
   onScrollToBottom,
-  outputLineCount,
-  outputByteSize,
+  totalOutputBytes,
   onToggleFilter,
   filterActive,
   onTogglePrompts,
   promptsVisible,
+  reviewSlot,
+  position,
 }: {
   tab: TerminalTab;
   state: SessionState;
@@ -71,13 +98,21 @@ export function ZoneLabel({
   zoneLabel?: string;
   onSetZoneLabel?: (label: string) => void;
   onScrollToBottom?: () => void;
-  outputLineCount?: number;
-  outputByteSize?: number;
+  /** Total bytes the session has produced; `undefined` = not observed. */
+  totalOutputBytes?: number;
   onToggleFilter?: () => void;
   filterActive?: boolean;
   /** Omitted when the tab has no Claude session — there are no prompts to show. */
   onTogglePrompts?: () => void;
   promptsVisible?: boolean;
+  /** The review toggle + unread badge (`SessionReviewToggle`), beside the prompts toggle. */
+  reviewSlot?: ReactNode;
+  /**
+   * tmux work mode: this session's 1-based place among the live sessions and
+   * their count, shown as `k / n` beside the name. Omitted in grid mode, where
+   * the zone itself is the position.
+   */
+  position?: { index: number; count: number };
 }) {
   const [showSelector, setShowSelector] = useState(false);
   const [editingLabel, setEditingLabel] = useState(false);
@@ -88,7 +123,8 @@ export function ZoneLabel({
   // Item 8: expose session/zone identity to UI Bridge clients. The label is
   // the session title so `ai/find` by title resolves to this header; the
   // session binding rides as data attributes on the registered node.
-  const headerSpec = zoneHeaderElementSpec(zoneIndex, tab.title, tab.claudeSessionId);
+  const displayTitle = useDisplayTitle(tab);
+  const headerSpec = zoneHeaderElementSpec(zoneIndex, displayTitle, tab.claudeSessionId);
   const { ref: headerRef } = useUIElement({
     id: headerSpec.id,
     type: "generic",
@@ -112,7 +148,7 @@ export function ZoneLabel({
       data-claude-session-id={tab.claudeSessionId ?? undefined}
       data-zone-index={zoneIndex}
       data-resume-failed={tab.resumeFailed ? "true" : undefined}
-      className="absolute top-0 left-0 right-0 flex items-center gap-1.5 px-2 bg-[#13141f]/80 backdrop-blur-sm z-10 cursor-grab active:cursor-grabbing"
+      className={`absolute top-0 left-0 right-0 flex items-center gap-1.5 px-2 ${ZONE_HEADER_HOVER_RESERVE_CLASS} bg-[#13141f]/80 backdrop-blur-sm z-10 cursor-grab active:cursor-grabbing`}
       style={{ height: `${ZONE_HEADER_HEIGHT_PX}px` }}
       draggable
       onDragStart={(e) => {
@@ -144,7 +180,19 @@ export function ZoneLabel({
         }`}
         style={{ backgroundColor: STATE_BORDER_COLORS[state] }}
       />
-      <span className="text-[10px] text-[#a9b1d6] truncate font-medium">{tab.title}</span>
+      {/* `title` keeps the full name reachable when the header truncates it. */}
+      <span className="text-[10px] text-[#a9b1d6] truncate font-medium" title={displayTitle}>
+        {displayTitle}
+      </span>
+      {position && (
+        <span
+          className="text-[9px] text-[#565f89] font-mono shrink-0"
+          title={`${displayTitle} — session ${position.index} of ${position.count}`}
+          data-tmux-position={`${position.index}/${position.count}`}
+        >
+          {position.index} / {position.count}
+        </span>
+      )}
 
       {/* Honesty label (Phase 5): interactive PTY shells are non-durable — a
           runner restart ends them. Mirrors the compact-card marker so the
@@ -175,21 +223,7 @@ export function ZoneLabel({
           "this session opened no PRs" (G5). */}
       <SessionInfoDropdown claudeSessionId={tab.claudeSessionId} zoneIndex={zoneIndex} />
 
-      {outputLineCount !== undefined && outputLineCount > 0 && (
-        <span className="text-[9px] text-[#565f89] font-mono ml-1 shrink-0">
-          {outputLineCount > 999 ? `${(outputLineCount / 1000).toFixed(1)}k` : outputLineCount}{" "}
-          lines
-          {outputByteSize !== undefined && outputByteSize > 1024 && (
-            <span className="ml-1">
-              (
-              {outputByteSize > 1048576
-                ? `${(outputByteSize / 1048576).toFixed(1)}MB`
-                : `${(outputByteSize / 1024).toFixed(0)}KB`}
-              )
-            </span>
-          )}
-        </span>
-      )}
+      <TotalOutputLabel totalBytes={totalOutputBytes} />
 
       {onSetZoneLabel &&
         (editingLabel ? (
@@ -282,7 +316,9 @@ export function ZoneLabel({
                         className={`w-1.5 h-1.5 rounded-full shrink-0 ${tabState === "needs-input" ? "animate-pulse" : ""}`}
                         style={{ backgroundColor: STATE_BORDER_COLORS[tabState] }}
                       />
-                      <span className="text-[10px] truncate flex-1">{t.title}</span>
+                      <span className="text-[10px] truncate flex-1">
+                        <TabTitle tab={t} />
+                      </span>
                       {assignedZone && !isCurrent && (
                         <span className="text-[8px] text-[#565f89]">
                           Z{Number(assignedZone[0]) + 1}
@@ -358,6 +394,8 @@ export function ZoneLabel({
         </button>
       )}
 
+      {reviewSlot}
+
       {onScrollToBottom && (
         <button
           onClick={(e) => {
@@ -372,8 +410,17 @@ export function ZoneLabel({
         </button>
       )}
 
+      {/* Right end of the row. The header reserves the hover cluster's width
+          on hover (`ZONE_HEADER_HOVER_RESERVE_CLASS`), so this label moves
+          left of the cluster instead of sitting under it; `title` keeps the
+          full path reachable when the basename truncates (which is why it
+          takes pointer events now). */}
       {tab.workingDir && (
-        <span className="text-[9px] text-[#565f89] truncate ml-auto pointer-events-none">
+        <span
+          className="text-[9px] text-[#565f89] truncate ml-auto"
+          title={tab.workingDir}
+          data-zone-cwd-label
+        >
           {tab.workingDir.split(/[/\\]/).pop()}
         </span>
       )}

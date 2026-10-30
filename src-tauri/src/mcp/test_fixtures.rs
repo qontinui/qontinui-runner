@@ -1908,6 +1908,7 @@ fn record_from_seed(
         // age without knowing the wall clock. Absent means absent; these are
         // no longer hardcoded to `None`.
         restore_pending_at: seed.restore_pending_at.map(|off| now_ms + off),
+        awaiting_account_since: None,
         confirmed_at: seed.confirmed_at.map(|off| now_ms + off),
         handle: None,
         account_label: None,
@@ -1925,6 +1926,8 @@ fn record_from_seed(
         finish_reason: None,
         finish_synced: false,
         spawn_device_default: None,
+        adopted_from: None,
+        last_session_start_at: None,
     })
 }
 
@@ -2390,7 +2393,7 @@ async fn agent_token_view_handler(
 //
 // [`crate::terminal::transcript::read_user_prompts`] builds
 // `<config_dir>/projects/<encoded(project_path)>/<session_id>.jsonl`, where the
-// encoding is `encode_project_path` — a PRIVATE fn. The public handle onto the
+// encoding is `encode_project_path` (crate-private). The public handle onto the
 // same construction is [`crate::terminal::transcript::session_transcript_path`],
 // which this route calls. Nothing here reimplements the encoding, so a change
 // to it cannot silently split the writer from the reader.
@@ -3109,21 +3112,38 @@ mod tests {
         );
     }
 
-    /// The `routes()` merge in `mcp_api.rs` must carry the matching cfg
-    /// attribute on the line immediately above it.
+    /// The `routes()` merge in the `mcp_api` module (whichever of its files
+    /// holds it — [`crate::mcp_api::mcp_api_source_files`]) must carry the
+    /// matching cfg attribute on the line immediately above it, IN THE SAME
+    /// FILE: the line above a file's first line is not "above" it, so the
+    /// files are searched one at a time and never as a concatenation.
+    /// Production text only ([`crate::mcp_api::production_files`]), so a test
+    /// quoting the call cannot stand in for it.
     #[test]
     fn mcp_api_routes_merge_is_cfg_gated() {
-        let src = include_str!("../mcp_api.rs");
-        let lines: Vec<&str> = src.lines().map(str::trim).collect();
-        let merge_idx = lines
-            .iter()
-            .position(|l| l.contains("crate::mcp::test_fixtures::routes()"))
-            .expect("mcp_api.rs must merge the test-fixtures routes");
+        let files = crate::mcp_api::production_files(&crate::mcp_api::mcp_api_source_files());
+        // (file, whether the line above it in THAT file is the gate)
+        let mut merges: Vec<(&str, bool)> = Vec::new();
+        for (rel, text) in &files {
+            let lines: Vec<&str> = text.lines().map(str::trim).collect();
+            for (i, line) in lines.iter().enumerate() {
+                if line.contains("crate::mcp::test_fixtures::routes()") {
+                    let gated = i > 0
+                        && lines[i - 1]
+                            == r#"#[cfg(any(debug_assertions, feature = "test-fixtures"))]"#;
+                    merges.push((rel.as_str(), gated));
+                }
+            }
+        }
         assert!(
-            merge_idx > 0
-                && lines[merge_idx - 1]
-                    == r#"#[cfg(any(debug_assertions, feature = "test-fixtures"))]"#,
-            "the test_fixtures::routes() merge in mcp_api.rs must be immediately preceded \
+            merges.len() == 1,
+            "the mcp_api module must merge the test-fixtures routes exactly once; found \
+             {merges:?}"
+        );
+        let (rel, gated) = merges[0];
+        assert!(
+            gated,
+            "the test_fixtures::routes() merge in {rel} must be immediately preceded \
              by the cfg gate — without it the debug routes mount in release builds",
         );
     }

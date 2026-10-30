@@ -112,6 +112,25 @@
 //! `2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one`,
 //! Phase 6.
 //!
+//! ## PTY-holder panes are counted, never invisible (2026-10-14)
+//!
+//! With `terminal.pty_holder` on — the Linux default since plan
+//! `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions` Phase 5
+//! (opt-in on Windows and macOS) — each new local pane's PTY lives in its own `qontinui-pty-holder` process.
+//! That process can leave this runner's subtree (a WMI-spawned holder; every
+//! holder adopted after a restart), and the census above walks the subtree, so
+//! without more a restart could read "safe" because the sessions became
+//! INVISIBLE (the plan's Risk 2). So every pass also takes the HOLDER CENSUS
+//! (`crate::terminal::holder_census`, over `qontinui_pty_holder::client::census`
+//! — the same classifier the Phase 3 boot sweep uses): one answered handshake
+//! per holder, concurrently, under one deadline. Its panes' trees join the
+//! live universe as a fifth partition class (`holder_sessions`), and a holder
+//! that holds its lock without answering (`unknown`) or speaks no common
+//! protocol version (`incompatible`, D15) blocks as a PANE
+//! (`live_claude.holder_unresolved_panes`) — counted, never zero. A census that
+//! cannot enumerate the pane directory is an UNKNOWN verdict. Like the rest,
+//! it is taken fresh on every request.
+//!
 //! ## Fresh, not cached (D5)
 //!
 //! The verdict calls [`crate::session::tracking_health::compute`] on demand.
@@ -176,16 +195,23 @@ use crate::mcp::session_work_status::{self, SessionStatusSource};
 use crate::mcp::types::ApiState;
 use crate::session::claude_activity::{self, ActivityCounts, LivePid, RecordReading};
 use crate::session::session_lifecycle_store::TerminalSessionRecord;
-use crate::session::tracking_health::{self, LiveClaudeProcess, TrackingHealthReport};
+use crate::session::tracking_health::{
+    self, HolderPane, HolderPaneState, LiveClaudeProcess, TrackingHealthReport,
+};
 use crate::session::wind_down_observer::{self, ObservedInputs, TerminalObservation};
 use qontinui_runner_lib::wind_down::{self, WindDownView};
 
 /// What the subtree cross-reference structurally cannot see. Emitted verbatim
 /// on every response so a reader is never invited to infer omniscience from a
 /// confident-looking count.
-pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree — each process, so a nested subagent counts alongside the agent that spawned it (`nestedUnderClaude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `hasLiveChildren` is a hint that a child process is attached right now, never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `sessionStatus` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a wind-down eligibility report — THIS ENDPOINT closes nothing, but since Phase 4 the wind-down executor acts on the same verdict WHILE COORD HOLDS THIS DEVICE DRAINED, so an `eligible` here is a session the runner will graceful-`/exit` on its next 30 s tick if the drain is on; they are computed whether or not the runner is drained, the executor's own extra gates (the drain itself, a wall-clock-jump quarantine, and a per-tick close budget) are NOT reflected here, so `eligible` is a candidacy and never a prediction; and a grid-idle window is only as old as the first observation that saw the pane idle with no grid change since; `live_claude.by_activity` classifies the same `total` processes as working / idle / stale / unknown from the pane observation where decisive, else Claude Code's internal `sessions/<pid>.json` record (a `busy`/`shell` status is `working` only with a transcript message in the last 30 min, else `stale`) — it is REPORT-ONLY, the verdict never reads it, an `idle` session still dies on a restart, and a missing, unparseable, ambiguous or unrecognised record is `unknown`, never `idle`";
+pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree and in every PTY holder pane's process tree (see `holder_sessions`) — each process, so a nested subagent counts alongside the agent that spawned it (`nestedUnderClaude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `hasLiveChildren` is a hint that a child process is attached right now, never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `sessionStatus` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; `sessionStatusSince` is when coord's row entered that `sessionStatus` (coord's `state_started_at`, served as `since`), in unix MILLISECONDS — for `finished` it is coord's finish time, which a later finish moves again ONLY on a coord build carrying plan `2026-10-23-coord-records-a-session-finished-but-not-when-so-a-revival-cannot-be-told-from-a-re-finish` Phase 2 (an older coord moves it only when the status actually changes, so after a re-finish of a row coord still reads `finished` it can lag the runner's `finishedAt`) — and it is null wherever `sessionStatus` is null and wherever coord served no `since`, null meaning UNKNOWN, never \"now\"; it is coord's time BESIDE the runner's own `finishedAt` marker, never a replacement for it; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a wind-down eligibility report — THIS ENDPOINT closes nothing, but since Phase 4 the wind-down executor acts on the same verdict WHILE COORD HOLDS THIS DEVICE DRAINED, so an `eligible` here is a session the runner will graceful-`/exit` on its next 30 s tick if the drain is on; they are computed whether or not the runner is drained, the executor's own extra gates (the drain itself, a wall-clock-jump quarantine, and a per-tick close budget) are NOT reflected here, so `eligible` is a candidacy and never a prediction; and a grid-idle window is only as old as the first observation that saw the pane idle with no grid change since; `live_claude.by_activity` classifies the same `total` processes as working / idle / stale / unknown from the pane observation where decisive, else Claude Code's internal `sessions/<pid>.json` record (a `busy`/`shell` status is `working` only with a transcript message in the last 30 min, else `stale`) — it is REPORT-ONLY, the verdict never reads it, an `idle` session still dies on a restart, and a missing, unparseable, ambiguous or unrecognised record is `unknown`, never `idle`; `holder_sessions` adds what the PTY-holder census sees — a pane's `claude` is counted even when its holder has left this runner's subtree, a holder that holds its lock but does not answer within the census deadline is `unknown` and one with no common protocol version is `incompatible`, and each such PANE blocks a restart whatever processes it shows (`live_claude.holder_unresolved_panes`); a holder pane is NOT treated as surviving a restart";
 
 /// `drain.covers` — the constant, honest scope of `POST /drain`.
+///
+/// Unchanged by the PTY-holder census (plan 2026-09-12 Phase 5): a pane whose
+/// PTY lives in an out-of-process holder is still a terminal-plane pane, and
+/// `POST /drain` acts on neither — `terminal_sessions` and `holder_sessions`
+/// both carry `drain_covers_these: false`.
 pub const DRAIN_COVERS: &str = "ai_sessions only";
 
 /// How many recent task runs to pull when resolving AI-plane `age_s`. One
@@ -240,7 +266,10 @@ pub struct TerminalPlane {
     /// honest analogue of "how many terminal-hosted sessions".
     pub root_count: usize,
     /// **Always `false`.** `drain()` operates on `active_claude_sessions()`,
-    /// a set the census explicitly exempts. See D3.
+    /// a set the census explicitly exempts. See D3. That holds whether a
+    /// pane's PTY is in-process or held by an out-of-process holder
+    /// (`terminal.pty_holder`): a holder-held pane a live tracked terminal
+    /// claims is counted HERE, and the drain no-ops on it all the same.
     pub drain_covers_these: bool,
     /// Open `SessionLifecycleStore` records at compute time.
     pub tracked_open_total: usize,
@@ -296,17 +325,78 @@ pub struct HeadlessPlane {
     pub processes: Vec<LiveClaudeProcess>,
 }
 
-/// The live-`claude` census total and its four-way split — emitted so that
+/// The **PTY-holder** plane (plan
+/// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`,
+/// Phase 5, D9): what the fresh holder census found, and the live `claude`
+/// in holder panes that no live tracked terminal claims.
+///
+/// A holder pane's process tree can leave the runner's subtree (a holder spawned
+/// through WMI; every holder adopted after a restart), so without this plane a
+/// restart could read "safe" because those sessions became INVISIBLE (Risk 2).
+///
+/// **Both of its counts block a restart.** `blocking_count` (processes) feeds
+/// `live_claude.blocking`; `unresolved_panes` — a holder that holds its lock
+/// but does not answer (`unknown`), or that speaks no common protocol version
+/// (`incompatible`, D15) — feeds `live_claude.holder_unresolved_panes` and
+/// blocks as a PANE, because nothing this runner can drive proves what it is
+/// running. A LIVE holder pane whose tree holds no `claude` (a plain shell)
+/// does not block, exactly as an in-process shell pane does not: this endpoint
+/// counts agent sessions, and a shell carries none. A holder pane is not
+/// treated as surviving a restart: that is the
+/// feature's goal, but the plan's acceptance run (kill the runner, reattach,
+/// same `claude` pid) is unrun, so the verdict stays fail-closed.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct HolderPlane {
+    /// Live `claude` PROCESSES in holder panes and claimed by no live tracked
+    /// terminal (one that IS claimed is in `terminal_sessions`).
+    pub count: usize,
+    /// Of `count`, the ones that block (every one; no work axis reaches them).
+    pub blocking_count: usize,
+    /// Of `count`, the top-level (non-nested) processes.
+    pub root_count: usize,
+    /// **Always `false`** — see D3 and [`DRAIN_COVERS`].
+    pub drain_covers_these: bool,
+    /// Every pane the census found, in every state.
+    pub panes_total: usize,
+    pub live_panes: usize,
+    pub unknown_panes: usize,
+    pub incompatible_panes: usize,
+    /// Panes whose holder is dead (lock free). A still-running recorded child
+    /// of one is counted in `count` if it is a `claude`; the pane itself does
+    /// not block.
+    pub dead_panes: usize,
+    /// `unknown_panes + incompatible_panes`. **Each blocks a restart.**
+    pub unresolved_panes: usize,
+    /// Per-pane detail: state, holder and child pid, build, versions, why.
+    pub panes: Vec<HolderPane>,
+    /// pid, age, cwd and the children hint for `count`.
+    pub processes: Vec<LiveClaudeProcess>,
+    /// The census could not enumerate the pane directory. Non-null forces an
+    /// UNKNOWN verdict: an unreadable census is never an empty one.
+    pub census_error: Option<String>,
+}
+
+/// The live-`claude` census total and its five-way split — emitted so that
 /// splitting `terminal_sessions.count` regresses no consumer: `total` is the
 /// exact number that field carried before 2026-09-07, and it is what
 /// `safe_to_restart` reads.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct LiveClaudeTotals {
-    /// Every live `claude` process in the runner's inclusive subtree.
+    /// Every live `claude` process in the runner's inclusive subtree, PLUS
+    /// every one in a PTY holder pane's tree (plan 2026-09-12 Phase 5) — the
+    /// sum of the five process classes. Unresolved holder PANES are not in
+    /// it: see `holder_unresolved_panes`.
     pub total: usize,
     pub terminal_hosted: usize,
+    /// Held by a PTY holder pane and claimed by no live tracked terminal.
+    pub holder_hosted: usize,
     pub ai_plane: usize,
     pub headless_exempt: usize,
+    /// Holder panes this runner cannot drive — `unknown` (lock held, no
+    /// answer) plus `incompatible` (no common protocol version). PANES, not
+    /// processes, and therefore NOT part of `total` or `blocking`: the verdict
+    /// reads this beside `blocking`, and any non-zero value is unsafe.
+    pub holder_unresolved_panes: usize,
     /// Claimed by nothing. Blocks a restart like any other live process —
     /// fail-closed: what the runner cannot explain, it does not wave through.
     pub unclassified: usize,
@@ -423,6 +513,10 @@ pub struct RestartReadiness {
     /// determined — never `0`. Resolves from the SAME `tracking_health` pass
     /// as `terminal_sessions`, so the two are `Some`/`None` together.
     pub headless_sessions: Option<HeadlessPlane>,
+    /// The PTY-holder plane (plan 2026-09-12 Phase 5). `null` when it could
+    /// not be determined — never `0`. Resolves from the same pass as
+    /// `terminal_sessions`.
+    pub holder_sessions: Option<HolderPlane>,
     /// `null` when the plane could not be determined — never `0`.
     pub ai_sessions: Option<AiPlane>,
     /// The census total and its split. `null` on the same unknown as the
@@ -545,7 +639,30 @@ pub fn headless_plane_from(report: &TrackingHealthReport) -> HeadlessPlane {
     }
 }
 
-/// The census total plus its four-way split, from the same pass.
+/// Shape the PTY-holder plane from the SAME pass — no second census: the
+/// holder census was taken inside that pass (`tracking_health::compute`).
+pub fn holder_plane_from(report: &TrackingHealthReport) -> HolderPlane {
+    let unknown = report.holder_pane_count(HolderPaneState::Unknown);
+    let incompatible = report.holder_pane_count(HolderPaneState::Incompatible);
+    HolderPlane {
+        count: report.holder_hosted.len(),
+        blocking_count: TrackingHealthReport::blocking_count(&report.holder_hosted),
+        root_count: TrackingHealthReport::root_count(&report.holder_hosted),
+        // D3: `POST /drain` covers `ai_sessions` only.
+        drain_covers_these: false,
+        panes_total: report.holder_panes.len(),
+        live_panes: report.holder_pane_count(HolderPaneState::Live),
+        unknown_panes: unknown,
+        incompatible_panes: incompatible,
+        dead_panes: report.holder_pane_count(HolderPaneState::Dead),
+        unresolved_panes: unknown + incompatible,
+        panes: report.holder_panes.clone(),
+        processes: report.holder_hosted.clone(),
+        census_error: report.holder_census_error.clone(),
+    }
+}
+
+/// The census total plus its five-way split, from the same pass.
 ///
 /// `total` is `live_claude_total` verbatim — the number `terminal_sessions.count`
 /// carried before the split, and the number the verdict reads. Emitting it keeps
@@ -564,48 +681,37 @@ pub fn live_claude_totals_observed(
     LiveClaudeTotals {
         total: report.live_claude_total,
         terminal_hosted: report.terminal_hosted.len(),
+        holder_hosted: report.holder_hosted.len(),
         ai_plane: report.ai_plane.len(),
         headless_exempt: report.headless_exempt.len(),
+        holder_unresolved_panes: report.holder_unresolved_count(),
         unclassified: report.live_untracked.len(),
         // Only the terminal-hosted plane can carry a work axis (it is the only
         // class with a `claude_session_id` coord can be asked about), but the
         // sum is taken over EVERY class so the arithmetic
         // `blocking + finished_discounted == total` holds unconditionally.
-        blocking: [
-            &report.terminal_hosted,
-            &report.ai_plane,
-            &report.headless_exempt,
-            &report.live_untracked,
-        ]
-        .iter()
-        .map(|l| TrackingHealthReport::blocking_count(l))
-        .sum(),
-        finished_discounted: [
-            &report.terminal_hosted,
-            &report.ai_plane,
-            &report.headless_exempt,
-            &report.live_untracked,
-        ]
-        .iter()
-        .map(|l| TrackingHealthReport::finished_count(l))
-        .sum(),
+        blocking: report
+            .classes()
+            .iter()
+            .map(|l| TrackingHealthReport::blocking_count(l))
+            .sum(),
+        finished_discounted: report
+            .classes()
+            .iter()
+            .map(|l| TrackingHealthReport::finished_count(l))
+            .sum(),
         by_activity: activity_counts(report, evidence),
     }
 }
 
-/// Classify every live process in all four census classes — the same
+/// Classify every live process in all five census classes — the same
 /// population `total` counts, so the four cells always sum to it.
 pub fn activity_counts(
     report: &TrackingHealthReport,
     evidence: &ActivityEvidence,
 ) -> ActivityCounts {
     let mut counts = ActivityCounts::default();
-    for list in [
-        &report.terminal_hosted,
-        &report.ai_plane,
-        &report.headless_exempt,
-        &report.live_untracked,
-    ] {
+    for list in report.classes() {
         for process in list {
             counts.add(claude_activity::classify(
                 evidence.pane_by_pid.get(&process.pid),
@@ -670,27 +776,25 @@ fn pids_needing_a_record(
     pane_by_pid: &HashMap<u32, TerminalObservation>,
     now_ms: i64,
 ) -> Vec<LivePid> {
-    [
-        &report.terminal_hosted,
-        &report.ai_plane,
-        &report.headless_exempt,
-        &report.live_untracked,
-    ]
-    .iter()
-    .flat_map(|l| l.iter())
-    .filter(|p| {
-        pane_by_pid
-            .get(&p.pid)
-            .and_then(|obs| claude_activity::classify_from_pane(obs, p.has_live_children, now_ms))
-            .is_none()
-    })
-    .map(|p| LivePid {
-        pid: p.pid,
-        // From the census's OWN snapshot time, not a later clock read: the
-        // age was measured at `checked_at_ms`.
-        process_started_ms: p.age_s.map(|age_s| report.checked_at_ms - age_s * 1000),
-    })
-    .collect()
+    report
+        .classes()
+        .into_iter()
+        .flat_map(|l| l.iter())
+        .filter(|p| {
+            pane_by_pid
+                .get(&p.pid)
+                .and_then(|obs| {
+                    claude_activity::classify_from_pane(obs, p.has_live_children, now_ms)
+                })
+                .is_none()
+        })
+        .map(|p| LivePid {
+            pid: p.pid,
+            // From the census's OWN snapshot time, not a later clock read: the
+            // age was measured at `checked_at_ms`.
+            process_started_ms: p.age_s.map(|age_s| report.checked_at_ms - age_s * 1000),
+        })
+        .collect()
 }
 
 /// Assemble the activity evidence for one pass: the pane observations the
@@ -856,6 +960,7 @@ pub fn census_info(latest: Option<&TrackingHealthReport>, now_ms: i64) -> Census
 pub fn build_verdict(
     terminal: Option<TerminalPlane>,
     headless: Option<HeadlessPlane>,
+    holder: Option<HolderPlane>,
     ai: Option<AiPlane>,
     totals: Option<LiveClaudeTotals>,
     unknowns: Vec<String>,
@@ -864,6 +969,20 @@ pub fn build_verdict(
     status_source: SessionStatusSource,
 ) -> RestartReadiness {
     let mut unknowns = unknowns;
+    // The holder plane comes from the same pass as the terminal plane; a
+    // missing one, or a census that could not enumerate the pane directory,
+    // is UNKNOWN — an unreadable holder census is never an empty one (D9).
+    match &holder {
+        None if !unknowns.iter().any(|u| u.contains("PTY-holder")) => {
+            unknowns.push("the PTY-holder plane could not be determined".to_string())
+        }
+        Some(h) => {
+            if let Some(e) = &h.census_error {
+                unknowns.push(format!("the PTY-holder census could not be taken: {e}"));
+            }
+        }
+        None => {}
+    }
     if terminal.is_none() && !unknowns.iter().any(|u| u.contains("terminal")) {
         unknowns.push("the terminal-session plane could not be determined".to_string());
     }
@@ -889,6 +1008,7 @@ pub fn build_verdict(
             reason: format!("UNKNOWN, so treated as unsafe: {}", unknowns.join("; ")),
             terminal_sessions: terminal,
             headless_sessions: headless,
+            holder_sessions: holder,
             ai_sessions: ai,
             live_claude: totals,
             drain,
@@ -902,6 +1022,7 @@ pub fn build_verdict(
     // Every plane resolved.
     let t = terminal.expect("checked above");
     let h = headless.expect("checked above");
+    let hp = holder.expect("checked above");
     let a = ai.expect("checked above");
     let totals = totals.expect("checked above");
 
@@ -961,6 +1082,25 @@ pub fn build_verdict(
             if h.count - h.root_count == 1 { "" } else { "s" },
         ));
     }
+    if hp.count > 0 {
+        parts.push(format!(
+            "{} live agent `claude` process{} {} held by out-of-process PTY holder{} and claimed by no live tracked terminal ({} top-level); counted as live work — a holder pane is not yet proven to survive a restart — see `holder_sessions.processes`",
+            hp.count,
+            if hp.count == 1 { "" } else { "es" },
+            if hp.count == 1 { "is" } else { "are" },
+            if hp.count == 1 { "" } else { "s" },
+            hp.root_count,
+        ));
+    }
+    if hp.unresolved_panes > 0 {
+        parts.push(format!(
+            "{} PTY holder pane{} cannot be driven by this runner ({} unknown: lock held, handshake unanswered; {} incompatible: no common protocol version) — counted as live work, never as zero — see `holder_sessions.panes`",
+            hp.unresolved_panes,
+            if hp.unresolved_panes == 1 { "" } else { "s" },
+            hp.unknown_panes,
+            hp.incompatible_panes,
+        ));
+    }
     if t.live_untracked_count > 0 {
         parts.push(format!(
             "{} live `claude` process{} match{} no live terminal, no AI session and no headless registration — unclassified, so counted as live work and named in `terminal_sessions.unclassified_processes`",
@@ -1015,7 +1155,10 @@ pub fn build_verdict(
     // in no other. `ai_sessions.count` is untouched: that plane is keyed by
     // `task_run_id`, not by `claude_code_session_id`, so the work axis says
     // nothing about it.
-    let safe = totals.blocking == 0 && a.count == 0;
+    // An unresolved holder pane (unknown / incompatible) is a PANE whose
+    // processes this runner cannot vouch for: it blocks on its own, beside
+    // `blocking`, and is never folded into a process count that could read 0.
+    let safe = totals.blocking == 0 && totals.holder_unresolved_panes == 0 && a.count == 0;
     let reason = if safe && totals.total == 0 {
         "no live agent sessions in any plane".to_string()
     } else if safe && parts.is_empty() {
@@ -1041,6 +1184,7 @@ pub fn build_verdict(
         reason,
         terminal_sessions: Some(t),
         headless_sessions: Some(h),
+        holder_sessions: Some(hp),
         ai_sessions: Some(a),
         live_claude: Some(totals),
         drain,
@@ -1249,6 +1393,7 @@ pub async fn restart_readiness_handler(
         .as_ref()
         .map(|p| terminal_plane_from(&p.report, &p.open_records, now_ms));
     let headless = pass.as_ref().map(|p| headless_plane_from(&p.report));
+    let holder = pass.as_ref().map(|p| holder_plane_from(&p.report));
     let totals = pass
         .as_ref()
         .map(|p| live_claude_totals_observed(&p.report, &activity_evidence));
@@ -1292,6 +1437,7 @@ pub async fn restart_readiness_handler(
     Json(build_verdict(
         terminal,
         headless,
+        holder,
         ai,
         totals,
         unknowns,
@@ -1351,6 +1497,7 @@ mod tests {
             provider: "claude".to_string(),
             origin: None,
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: None,
             handle: None,
             account_label: None,
@@ -1368,6 +1515,8 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
+            adopted_from: None,
+            last_session_start_at: None,
         }
     }
 
@@ -1420,6 +1569,9 @@ mod tests {
             headless_exempt: vec![],
             live_untracked: vec![],
             tracked_dead: vec![],
+            holder_hosted: vec![],
+            holder_panes: vec![],
+            holder_census_error: None,
         }
     }
 
@@ -1442,6 +1594,7 @@ mod tests {
         build_verdict(
             Some(terminal_plane_from(report, open_records, now_ms)),
             Some(headless_plane_from(report)),
+            Some(holder_plane_from(report)),
             ai,
             Some(live_claude_totals_from(report)),
             unknowns,
@@ -1523,6 +1676,7 @@ mod tests {
             &HashMap::new(),
             now_ms,
             now_ms,
+            &crate::session::tracking_health::HolderCensus::default(),
         );
         assert_eq!(report.live_claude_total, 2);
 
@@ -1597,6 +1751,7 @@ mod tests {
             &HashMap::new(),
             now_ms,
             now_ms,
+            &crate::session::tracking_health::HolderCensus::default(),
         );
         assert_eq!(report.live_claude_total, 0);
 
@@ -1633,6 +1788,7 @@ mod tests {
                      unreadable (snapshot_process_table_public returned an empty parent_map), so \
                      live `claude` processes cannot be enumerated";
         let v = build_verdict(
+            None,
             None,
             None,
             Some(ai_plane_from(&[], &[], now_ms)),
@@ -1710,6 +1866,7 @@ mod tests {
                 nested_under_claude: false,
                 session_id: None,
                 session_status: None,
+                session_status_since: None,
                 blocks_restart: true,
                 wind_down: None,
             }],
@@ -1718,6 +1875,9 @@ mod tests {
                 terminal_id: "t-ghost".to_string(),
                 title: None,
             }],
+            holder_hosted: vec![],
+            holder_panes: vec![],
+            holder_census_error: None,
         };
         let census = census_info(Some(&stale), now_ms);
         assert_eq!(census.periodic_task_healthy, Some(false));
@@ -1850,6 +2010,7 @@ mod tests {
             &HashMap::new(),
             now_ms,
             now_ms,
+            &crate::session::tracking_health::HolderCensus::default(),
         );
         let t = terminal_plane_from(&report, &records, now_ms);
 
@@ -1982,6 +2143,7 @@ mod tests {
             &HashMap::new(),
             now_ms,
             now_ms,
+            &crate::session::tracking_health::HolderCensus::default(),
         )
     }
 
@@ -2173,6 +2335,7 @@ mod tests {
             &HashMap::new(),
             now_ms,
             now_ms,
+            &crate::session::tracking_health::HolderCensus::default(),
         );
         let b = evaluate(
             &snap,
@@ -2185,6 +2348,7 @@ mod tests {
             &HashMap::new(),
             now_ms,
             now_ms,
+            &crate::session::tracking_health::HolderCensus::default(),
         );
         assert_eq!(a.live_claude_total, b.live_claude_total);
         assert_eq!(a.headless_exempt.len(), 3);
@@ -2238,6 +2402,7 @@ mod tests {
         let report = empty_report(now_ms);
         let v = build_verdict(
             Some(terminal_plane_from(&report, &[], now_ms)),
+            None,
             None,
             Some(ai_plane_from(&[], &[], now_ms)),
             Some(live_claude_totals_from(&report)),
@@ -2445,6 +2610,7 @@ mod tests {
             statuses,
             now_ms - 3_600_000,
             now_ms,
+            &crate::session::tracking_health::HolderCensus::default(),
         )
     }
 
@@ -2767,6 +2933,7 @@ mod tests {
             &map,
             now_ms - 3_600_000,
             now_ms,
+            &crate::session::tracking_health::HolderCensus::default(),
         );
         assert_eq!(report.live_claude_total, 4);
         assert_eq!(report.terminal_hosted.len(), 1);
@@ -2837,6 +3004,7 @@ mod tests {
         let v = build_verdict(
             Some(terminal_plane_from(&report, &records, now_ms)),
             Some(headless_plane_from(&report)),
+            Some(holder_plane_from(&report)),
             Some(ai_plane_from(&[], &[], now_ms)),
             Some(live_claude_totals_from(&report)),
             vec![],
@@ -2916,6 +3084,7 @@ mod tests {
     #[test]
     fn boundary_states_that_finishing_does_not_terminate_the_process() {
         assert!(BOUNDARY.contains("sessionStatus"));
+        assert!(BOUNDARY.contains("sessionStatusSince"));
         assert!(BOUNDARY.contains("PROCESS IS STILL RUNNING"));
         assert!(BOUNDARY.contains("NEVER \"not running\""));
         assert!(BOUNDARY.contains("ambiguous"));
@@ -2945,6 +3114,7 @@ mod tests {
             nested_under_claude: nested,
             session_id: session_id.map(str::to_string),
             session_status: status.map(str::to_string),
+            session_status_since: None,
             blocks_restart: status != Some("finished"),
             wind_down: None,
         }
@@ -3102,6 +3272,7 @@ mod tests {
         let v = build_verdict(
             None,
             None,
+            None,
             Some(ai_plane_from(&[], &[], now_ms)),
             None,
             vec!["the terminal-session plane could not be determined: test".to_string()],
@@ -3173,6 +3344,9 @@ mod tests {
                 wind_down_proc(9, None, None, false, false),
             ],
             tracked_dead: vec![],
+            holder_hosted: vec![],
+            holder_panes: vec![],
+            holder_census_error: None,
         }
     }
 
@@ -3291,6 +3465,7 @@ mod tests {
         let v = build_verdict(
             Some(terminal_plane_from(&one, &[], ACT_NOW)),
             Some(headless_plane_from(&one)),
+            Some(holder_plane_from(&one)),
             Some(ai_plane_from(&[], &[], ACT_NOW)),
             Some(totals),
             vec![],
@@ -3307,6 +3482,7 @@ mod tests {
         let v = build_verdict(
             Some(terminal_plane_from(&report, &[], ACT_NOW)),
             Some(headless_plane_from(&report)),
+            Some(holder_plane_from(&report)),
             Some(ai_plane_from(&[], &report.ai_plane, ACT_NOW)),
             Some(live_claude_totals_observed(&report, &activity_evidence())),
             vec![],
@@ -3697,5 +3873,181 @@ mod tests {
             "schema_ok: true must not gate the AI plane"
         );
         assert_eq!(v.ai_sessions.as_ref().unwrap().count, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // The PTY-holder census (plan 2026-09-12 Phase 5, D9)
+    // -----------------------------------------------------------------------
+
+    fn holder_census_pane(id: &str, state: HolderPaneState, holder_pid: Option<u32>) -> HolderPane {
+        HolderPane {
+            pane_id: id.to_string(),
+            state,
+            holder_pid,
+            child_pid: None,
+            holder_build: Some("b".into()),
+            negotiated_version: None,
+            holder_versions: vec![],
+            detail: None,
+            claude_pids: vec![],
+        }
+    }
+
+    /// Risk 2: holders outside the runner's subtree — one live pane running
+    /// claude (holder 100 → claude 101), one unknown and one incompatible pane
+    /// whose trees show nothing. The verdict is UNSAFE, names both, and no
+    /// count it emits reads zero for them.
+    #[test]
+    fn holder_panes_block_the_restart_and_none_reads_as_zero() {
+        let now_s = chrono::Utc::now().timestamp();
+        let now_ms = now_s * 1000;
+        let snap = snap_with(
+            &[(1, &[]), (100, &[101])],
+            &[(100, now_s), (101, now_s)],
+            &[(100, "qontinui-pty-holder"), (101, "claude")],
+        );
+        let census = crate::session::tracking_health::HolderCensus {
+            panes: vec![
+                holder_census_pane("live", HolderPaneState::Live, Some(100)),
+                holder_census_pane("wedged", HolderPaneState::Unknown, None),
+                holder_census_pane("foreign", HolderPaneState::Incompatible, None),
+            ],
+            error: None,
+            verified_terminal_pids: Default::default(),
+        };
+        let report = evaluate(
+            &snap,
+            1,
+            &[],
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            now_ms,
+            now_ms,
+            &census,
+        );
+        assert!(report.partition_covers_total());
+
+        let v = verdict_from(
+            &report,
+            &[],
+            Some(ai_plane_from(&[], &[], now_ms)),
+            vec![],
+            idle_drain(),
+            fresh_census(now_ms),
+            now_ms,
+        );
+        assert!(!v.safe_to_restart, "{}", v.reason);
+        let totals = v.live_claude.as_ref().unwrap();
+        assert_eq!(totals.total, 1);
+        assert_eq!(totals.holder_hosted, 1);
+        assert_eq!(totals.blocking, 1);
+        assert_eq!(totals.holder_unresolved_panes, 2);
+        assert_eq!(totals.by_activity.sum(), totals.total);
+        let h = v.holder_sessions.as_ref().unwrap();
+        assert_eq!((h.count, h.blocking_count, h.root_count), (1, 1, 1));
+        assert_eq!(h.panes_total, 3);
+        assert_eq!(
+            (h.live_panes, h.unknown_panes, h.incompatible_panes),
+            (1, 1, 1)
+        );
+        assert_eq!(h.unresolved_panes, 2);
+        assert!(
+            !h.drain_covers_these,
+            "D3: the drain covers ai_sessions only"
+        );
+        assert_eq!(DRAIN_COVERS, "ai_sessions only");
+        assert!(v.reason.contains("PTY holder"), "{}", v.reason);
+        assert!(v.reason.contains("1 unknown"), "{}", v.reason);
+        assert!(v.reason.contains("1 incompatible"), "{}", v.reason);
+
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["holder_sessions"]["unresolved_panes"], 2);
+        assert_eq!(json["live_claude"]["holder_unresolved_panes"], 2);
+    }
+
+    /// An unresolved holder pane blocks ON ITS OWN: no live `claude` anywhere
+    /// in the partition (`total == 0`), and still unsafe — never "no live
+    /// agent sessions in any plane".
+    #[test]
+    fn an_unanswering_holder_alone_makes_the_restart_unsafe() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        for state in [HolderPaneState::Unknown, HolderPaneState::Incompatible] {
+            let report = TrackingHealthReport {
+                holder_panes: vec![holder_census_pane("p", state, None)],
+                ..empty_report(now_ms)
+            };
+            assert!(report.partition_covers_total());
+            let v = verdict_from(
+                &report,
+                &[],
+                Some(ai_plane_from(&[], &[], now_ms)),
+                vec![],
+                idle_drain(),
+                fresh_census(now_ms),
+                now_ms,
+            );
+            assert!(!v.safe_to_restart, "{state:?}: {}", v.reason);
+            assert_eq!(v.live_claude.as_ref().unwrap().total, 0);
+            assert_eq!(v.live_claude.as_ref().unwrap().holder_unresolved_panes, 1);
+            assert!(!v.reason.contains("no live agent sessions"), "{}", v.reason);
+        }
+
+        // A live holder whose pane runs no claude (a plain shell) is not
+        // work, exactly as an in-process shell pane is not.
+        let shell = TrackingHealthReport {
+            holder_panes: vec![holder_census_pane("p", HolderPaneState::Live, Some(9))],
+            ..empty_report(now_ms)
+        };
+        let v = verdict_from(
+            &shell,
+            &[],
+            Some(ai_plane_from(&[], &[], now_ms)),
+            vec![],
+            idle_drain(),
+            fresh_census(now_ms),
+            now_ms,
+        );
+        assert!(v.safe_to_restart, "{}", v.reason);
+    }
+
+    /// A census that could not enumerate the pane directory is UNKNOWN —
+    /// never an empty census — and an absent holder plane is too.
+    #[test]
+    fn an_unreadable_holder_census_is_unknown_not_empty() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let report = TrackingHealthReport {
+            holder_census_error: Some("pane dir refused".into()),
+            ..empty_report(now_ms)
+        };
+        let v = verdict_from(
+            &report,
+            &[],
+            Some(ai_plane_from(&[], &[], now_ms)),
+            vec![],
+            idle_drain(),
+            fresh_census(now_ms),
+            now_ms,
+        );
+        assert!(!v.safe_to_restart);
+        assert!(v.reason.starts_with("UNKNOWN"), "{}", v.reason);
+        assert!(v.reason.contains("pane dir refused"), "{}", v.reason);
+
+        let empty = empty_report(now_ms);
+        let v = build_verdict(
+            Some(terminal_plane_from(&empty, &[], now_ms)),
+            Some(headless_plane_from(&empty)),
+            None,
+            Some(ai_plane_from(&[], &[], now_ms)),
+            Some(live_claude_totals_from(&empty)),
+            vec![],
+            idle_drain(),
+            fresh_census(now_ms),
+            clean_status_source(),
+        );
+        assert!(!v.safe_to_restart);
+        assert!(v.reason.contains("PTY-holder plane"), "{}", v.reason);
     }
 }

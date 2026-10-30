@@ -38,6 +38,7 @@ import type {
   RegistryListing,
   RegistryWrapperEntry,
 } from "./types";
+import { describeThrown } from "@/lib/utils";
 
 const REGISTRY_FALLBACK_URL =
   "https://raw.githubusercontent.com/qontinui/wrappers-registry/main/registry.json";
@@ -180,7 +181,7 @@ export async function dispatchAction<T = unknown>(
     const inner = await unwrapEnvelope<DispatchResult<T>>(res, `POST /wrappers/${id}/dispatch`);
     return inner ?? { error: "empty response" };
   } catch (e) {
-    return { error: e instanceof Error ? e.message : String(e) };
+    return { error: describeThrown(e, "dispatch failed") };
   }
 }
 

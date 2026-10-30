@@ -7,6 +7,17 @@
 //! covers all token cost. The subprocess inherits whatever auth the
 //! operator's `claude` install has.
 //!
+//! **Exception: an install that declares a model gateway.** The accepted
+//! decision record `gateway-tenants-route-every-model-call-through-the-gateway`
+//! (2026-10-10) supersedes the rule above for gateway tenants only. Their
+//! spawned `claude` children run under the runner-owned gateway
+//! `CLAUDE_CONFIG_DIR`, with `ANTHROPIC_BASE_URL` pointed at the gateway and the
+//! key supplied by the operator's `apiKeyHelper`. Subscription accounts and
+//! account rotation are off. The env is applied by the credential scrub this
+//! module's spawn seam already calls last (`finalize_headless_child_env`); the
+//! mechanism is [`crate::model_gateway`]. Every other install keeps the rule
+//! unchanged.
+//!
 //! ## Flow
 //!
 //! 1. `spawn_runtime()` connects this runner to coord's `/ws` and
@@ -226,6 +237,11 @@ pub struct GateContinuationPayload {
     /// The gate anchor that cleared (for logging / correlation).
     #[serde(default)]
     pub anchor_key: Option<String>,
+    /// Intent-derived display name coord stamps for this spawn (e.g.
+    /// `post-merge-runner#1863`). Becomes `claude --name`, the tab title and the
+    /// commit `Session-Name` trailer. Absent on a coord that predates it.
+    #[serde(default)]
+    pub session_name: Option<String>,
     /// The gate row's id. Used to (1) dedupe a continuation delivered by BOTH
     /// the WS fast-path and the poll backstop against the process-wide
     /// [`dispatched_gate_ids`] set, (2) POST the `continuation-consumed` ack so
@@ -300,6 +316,134 @@ pub struct GateContinuationPayload {
     /// not a reason to drop the whole continuation.
     #[serde(default, deserialize_with = "deserialize_lenient_brief")]
     pub brief: Option<ContinuationBrief>,
+    /// Coord's RE-DELIVERY annotation (plan
+    /// `2026-10-01-a-lost-gate-continuation-is-never-re-delivered`, D4): present
+    /// only when coord re-drove a continuation whose earlier attempt never
+    /// started or crashed without reporting. The human half of the same
+    /// annotation is a `[coord retry]` banner leading `brief.text`, which every
+    /// brief-capable runner already renders; this typed half is what the
+    /// in-process dedupe keys on ([`claim_gate_dispatch_attempt`]), so a
+    /// re-delivered attempt is not dropped as a duplicate of the attempt this
+    /// process already ran.
+    ///
+    /// Lenient like `brief`: an unreadable value is `None` and never fails the
+    /// frame.
+    #[serde(default, deserialize_with = "deserialize_lenient_retry")]
+    pub retry: Option<ContinuationRetry>,
+    /// The worktree allocation coord made for this continuation at dispatch
+    /// time (`gates.rs` `allocate_continuation_claims`): `{agent_id,
+    /// worktrees}`, attached when the continuation names repos. Only
+    /// `agent_id` is read.
+    ///
+    /// This runner still materializes its OWN worktree through
+    /// [`acquire_continuation_workdir`], so coord's rows are never used as a
+    /// cwd. They are coord's record of the dispatch, though, carrying
+    /// `dispatch_source = gate_continuation | unit_continuation`, and they were
+    /// written with no session. After a successful spawn this runner reports
+    /// the pinned Claude session against that `agent_id`
+    /// ([`report_session_launched`]), so coord can bind those rows too (plan
+    /// `2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state`
+    /// Phase 4).
+    ///
+    /// Lenient like `brief`: a shape this build cannot read degrades to `None`
+    /// and never fails the frame.
+    #[serde(default, deserialize_with = "deserialize_lenient_allocation")]
+    pub allocation: Option<ContinuationAllocation>,
+}
+
+/// The typed half of coord's re-delivery annotation. See
+/// [`GateContinuationPayload::retry`].
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+pub struct ContinuationRetry {
+    /// 1-based re-delivery number (the first delivery carries no `retry`).
+    /// Read leniently (a number or a numeric string); an unreadable value drops
+    /// the whole annotation with a `warn!`, never silently.
+    #[serde(default, deserialize_with = "deserialize_lenient_u32")]
+    pub attempt: u32,
+    /// Coord's class token (`never_started`, `work_crashed`, …) — logged.
+    #[serde(default)]
+    pub class: String,
+    /// The budget coord bounds this family by.
+    #[serde(default)]
+    pub max_attempts: u32,
+    /// The consume outcome the previous attempt ended with.
+    #[serde(default)]
+    pub prior_outcome: String,
+    /// `spawn` (never ran) or `work` (ran and crashed).
+    #[serde(default)]
+    pub family: String,
+}
+
+fn deserialize_lenient_u32<'de, D>(d: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value = serde_json::Value::deserialize(d)?;
+    let n = match &value {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(t) => t.trim().parse::<u64>().ok(),
+        _ => None,
+    };
+    n.and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| D::Error::custom(format!("unreadable attempt {value}")))
+}
+
+fn deserialize_lenient_retry<'de, D>(d: D) -> Result<Option<ContinuationRetry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    match serde_json::from_value::<ContinuationRetry>(value) {
+        Ok(r) => Ok(Some(r)),
+        Err(e) => {
+            tracing::warn!(
+                "gate continuation: `retry` key is unreadable ({e}) — treating the frame as a \
+                 first delivery; on a device that already ran this gate the re-delivery will \
+                 be dropped as a duplicate"
+            );
+            Ok(None)
+        }
+    }
+}
+
+impl GateContinuationPayload {
+    /// The re-delivery attempt this frame is (0 = a first delivery).
+    fn retry_attempt(&self) -> u32 {
+        self.retry.as_ref().map_or(0, |r| r.attempt)
+    }
+}
+
+/// The part of coord's dispatch-time continuation `allocation` this runner
+/// reads. See [`GateContinuationPayload::allocation`].
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ContinuationAllocation {
+    pub agent_id: uuid::Uuid,
+}
+
+/// Parse `allocation` without ever failing the whole continuation frame: an
+/// absent, null or unreadable value is `None`.
+fn deserialize_lenient_allocation<'de, D>(d: D) -> Result<Option<ContinuationAllocation>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    match serde_json::from_value::<ContinuationAllocation>(value) {
+        Ok(a) => Ok(Some(a)),
+        Err(e) => {
+            tracing::warn!(
+                "gate continuation: `allocation` key is not a shape this runner reads ({e}) — \
+                 coord's dispatch rows for it will not learn their session"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Coord's assembled continuation brief, as published on the spawn frame.
@@ -453,6 +597,27 @@ pub(crate) fn compose_continuation_system_prompt(
     append_continuation_brief(runner_context, brief)
 }
 
+/// Append coord's allocation notes (build siblings it could not expand) to a
+/// continuation's system prompt or prompt, after a blank line. No notes ⇒ `base`
+/// unchanged. The lines are already bounded single lines
+/// (`agent_worktree::sibling_note_log_line`), and are labelled as coord's
+/// report so the agent reads them as a fact about its checkout, not an order.
+pub(crate) fn append_sibling_notes(base: String, notes: &[String]) -> String {
+    if notes.is_empty() {
+        return base;
+    }
+    let mut out = base;
+    out.push_str(
+        "\n\nAllocation notes from coord: it could not add these declared build siblings \
+         to your worktree, so a build that needs them will fail on a missing checkout:",
+    );
+    for note in notes {
+        out.push_str("\n- ");
+        out.push_str(note);
+    }
+    out
+}
+
 /// The HEADLESS half of the same seam.
 ///
 /// `Presentation::Headless` reaches `run_continuation_headless` ->
@@ -565,6 +730,11 @@ pub struct ConditionCheckPayload {
     /// this field wins with no further change here.
     #[serde(default)]
     pub report_token: Option<String>,
+    /// Human name of the condition being checked, when coord supplies one.
+    /// Drives the spawn name `check-<name>`; absent ⇒ the `Condition check <id8>`
+    /// label and no `--name`.
+    #[serde(default)]
+    pub condition_name: Option<String>,
 }
 
 /// Redacting `Debug`, deliberately not derived.
@@ -885,6 +1055,31 @@ pub(crate) fn claude_bin_path() -> String {
     std::env::var("QONTINUI_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
 }
 
+/// `resolved` when it is launchable, else the bare [`claude_bin_path`].
+///
+/// [`resolve_claude_bin`] accepts any regular file on unix and does not check
+/// the execute bit. A bare name goes through `execvp`, which skips a
+/// non-executable PATH entry and keeps searching. Pinning an absolute path to
+/// such a file would trade that for an `EACCES` on every attempt. On
+/// Windows, and for anything that is not an absolute path, `resolved` is
+/// returned as is.
+fn launchable_or_bare(resolved: String) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let p = Path::new(&resolved);
+        if p.is_absolute() {
+            let executable = std::fs::metadata(p)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false);
+            if !executable {
+                return claude_bin_path();
+            }
+        }
+    }
+    resolved
+}
+
 /// Resolve `claude` to an absolute, directly-launchable executable path for
 /// PTY-spawned continuation terminals (condition-check, gate-continuation).
 ///
@@ -991,7 +1186,7 @@ pub fn spawn_runtime() {
     info!("agent_runtime: starting for device_id={}", device_id);
     // Periodic backstop poll (always armed): drains a pending continuation /
     // unit dispatch even when every push-shaped trigger is missed — a lost WS
-    // frame while connected, a deferred (AtCap) continuation whose terminal
+    // frame while connected, a load-deferred continuation whose terminal
     // exit-hook trigger never fired, a slot freed between WS connects.
     // Spawned independently of the WS pump so it survives subscription flaps.
     spawn_continuation_backstop_poll(device_id);
@@ -1572,28 +1767,26 @@ fn register_launch_stop(agent_id: uuid::Uuid) -> Option<LaunchStop> {
 /// agent_id can register, so this teardown can never strip a newer run's
 /// token, nonces or daemons.
 ///
-/// Holds the three maps it tears down by reference so the drop runs through
-/// [`teardown_in`], which a test can drive over poisoned LOCAL maps.
-/// Production builds it with [`AgentRunTeardown::global`].
+/// Holds the two registries and the daemon map it tears down by reference so
+/// the drop runs through [`teardown_in`], which a test can drive over poisoned
+/// LOCAL instances. Production builds it with [`AgentRunTeardown::global`].
 #[allow(clippy::type_complexity)]
 struct AgentRunTeardown<'a> {
     agent_id: uuid::Uuid,
-    tokens: &'a std::sync::Mutex<
-        std::collections::HashMap<uuid::Uuid, crate::agent_token::SharedToken>,
-    >,
-    nonces: &'a std::sync::Mutex<std::collections::HashMap<String, crate::coord_mcp::NonceBinding>>,
+    tokens: &'a crate::coord_mcp::AgentTokenRegistry,
+    nonces: &'a crate::coord_mcp::NonceRegistry,
     daemons: &'a std::sync::Mutex<
         std::collections::HashMap<uuid::Uuid, crate::agent_daemons::AgentDaemons>,
     >,
 }
 
 impl AgentRunTeardown<'static> {
-    /// The production teardown, over the process-global maps.
+    /// The production teardown, over the process-global registries.
     fn global(agent_id: uuid::Uuid) -> Self {
         AgentRunTeardown {
             agent_id,
-            tokens: crate::coord_mcp::agent_tokens(),
-            nonces: crate::coord_mcp::proxy_nonces(),
+            tokens: crate::coord_mcp::AgentTokenRegistry::global(),
+            nonces: crate::coord_mcp::NonceRegistry::global(),
             daemons: crate::agent_daemons::registry(),
         }
     }
@@ -1605,21 +1798,20 @@ impl Drop for AgentRunTeardown<'_> {
     }
 }
 
-/// The per-agent teardown over explicit maps: live-token removal, proxy-nonce
-/// revoke, daemon stop. Every lock it takes recovers a poisoned mutex.
+/// The per-agent teardown over explicit registries: live-token removal,
+/// proxy-nonce revoke, daemon stop. Every lock it takes recovers a poisoned
+/// mutex.
 #[allow(clippy::type_complexity)]
 fn teardown_in(
-    tokens: &std::sync::Mutex<
-        std::collections::HashMap<uuid::Uuid, crate::agent_token::SharedToken>,
-    >,
-    nonces: &std::sync::Mutex<std::collections::HashMap<String, crate::coord_mcp::NonceBinding>>,
+    tokens: &crate::coord_mcp::AgentTokenRegistry,
+    nonces: &crate::coord_mcp::NonceRegistry,
     daemons: &std::sync::Mutex<
         std::collections::HashMap<uuid::Uuid, crate::agent_daemons::AgentDaemons>,
     >,
     agent_id: uuid::Uuid,
 ) {
-    crate::coord_mcp::remove_agent_token_in(tokens, agent_id);
-    crate::coord_mcp::revoke_agent_proxy_nonces_in(nonces, agent_id);
+    tokens.remove(agent_id);
+    nonces.revoke_agent_proxy_nonces(agent_id);
     crate::agent_daemons::stop_for_agent_in(daemons, agent_id);
 }
 
@@ -1775,12 +1967,15 @@ fn spawn_run_task(payload: LaunchPayload) {
         }
         // Machine-load backstop (plan
         // `2026-09-12-pr-fixer-spawns-default-on-bounded-and-coordinated-with-the-author`
-        // Phase 1c): the SAME thread-pressure + live-session-cap guard the
-        // gate-continuation path applies (`evaluate_load_guard`), so a flood of
-        // coord launches cannot start more unattended sessions than the box can
-        // carry. Evaluated BEFORE `run_agent_subprocess`, which is where the
-        // path rewrite, account resolution and worktree materialization all
-        // happen — so a refused launch leaves no worktree, no daemon and no
+        // Phase 1c): the SAME memory + thread guard the gate-continuation path
+        // applies (`AdmissionReading::live`: the lanes `probe_for_spawn`
+        // composes, charged with the continuations admitted and not yet
+        // running), deferring on any tripped lane. A launch takes no
+        // projected-cost unit of its own (see `admit_launch`), so a burst of
+        // LAUNCHES alone is bounded by the readings only. Evaluated BEFORE
+        // `run_agent_subprocess`, which is where the path rewrite, account
+        // resolution and worktree materialization all happen — so a refused
+        // launch leaves no worktree, no daemon and no
         // proxy nonce behind; only the stop-token entry exists, released when
         // its guard drops.
         //
@@ -1790,26 +1985,18 @@ fn spawn_run_task(payload: LaunchPayload) {
         // reason beginning `deferred_load:`, which coord treats as RE-OFFERABLE:
         // it abandons the allocation and retires the dispatch dedup marker, so
         // the work is offered again on a later pass rather than latched failed.
-        //
-        // The admitted slot is an RAII guard: it is released when this task
-        // ends by ANY route, including a panic unwinding the future — a leaked
-        // slot would permanently shrink both the launch and continuation caps.
-        let slot = match admit_launch(
-            agent_id,
+        if let Err(reason) = admit_launch(
             &live_terminal_predicate(),
-            &crate::resource_guard::thread_pressure,
+            &crate::resource_guard::AdmissionReading::live,
         ) {
-            Ok(slot) => slot,
-            Err(reason) => {
-                info!(
-                    "agent_runtime: coord spawn-request agent_id={agent_id} deferred under \
-                     machine load, NOT launched — {reason}"
-                );
-                drop(stop_registration);
-                report_launch_deferral(agent_id, &reason).await;
-                return;
-            }
-        };
+            info!(
+                "agent_runtime: coord spawn-request agent_id={agent_id} deferred under \
+                 machine load, NOT launched — {reason}"
+            );
+            drop(stop_registration);
+            report_launch_deferral(agent_id, &reason).await;
+            return;
+        }
         // Armed from admission on: `run_agent_subprocess` may register a proxy
         // nonce, a live agent token and daemons, and a panic inside it must not
         // leak them. See [`AgentRunTeardown`].
@@ -1817,16 +2004,13 @@ fn spawn_run_task(payload: LaunchPayload) {
         if let Err(e) = run_agent_subprocess(payload, stop).await {
             error!("agent_runtime: run_agent_subprocess failed: {e:#}");
         }
-        // The run task is fully done: per-agent teardown FIRST, then the slot,
-        // then the stop entry LAST — reverse declaration order, the order a
-        // panic drops them in too. The teardown is keyed by agent_id alone, so
-        // it must run while the stop entry still bars a re-delivery of this
-        // agent_id from registering; otherwise it could strip a newer run's
-        // token, nonces and daemons. Releasing the slot before the stop entry
-        // keeps `admit_launch`'s one-live-launch-per-agent_id debug_assert
-        // true: a re-delivery registers only once this run holds no slot.
+        // The run task is fully done: per-agent teardown FIRST, then the stop
+        // entry LAST — reverse declaration order, the order a panic drops them
+        // in too. The teardown is keyed by agent_id alone, so it must run while
+        // the stop entry still bars a re-delivery of this agent_id from
+        // registering; otherwise it could strip a newer run's token, nonces and
+        // daemons.
         drop(teardown);
-        drop(slot);
         drop(stop_registration);
     });
 }
@@ -1952,9 +2136,17 @@ enum OutcomeAck {
 ///   attempt resolves (`spawned` / `spawn_failed`) or after the spawned
 ///   session's PTY exits without reporting (`work_unreported`).
 ///
-/// `outcome`/`detail` are `skip_serializing_if = Option::is_none` so the claim
-/// post serializes to exactly `{device_id}` (byte-identical to the pre-restructure
-/// body coord already accepts as the claim).
+/// `outcome`/`detail`/`claude_code_session_id` are
+/// `skip_serializing_if = Option::is_none` so the claim post serializes to
+/// exactly `{device_id}` (byte-identical to the pre-restructure body coord
+/// already accepts as the claim).
+///
+/// `claude_code_session_id` is the Claude Code session uuid this runner PINNED
+/// for the spawned continuation (`--session-id <uuid>`). It rides the `spawned`
+/// OUTCOME post — never the claim — and coord stamps it onto the continuation's
+/// placeholder `coord.sessions` row (plan
+/// `2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state`
+/// Phase 1). A coord that predates the field ignores it (serde default).
 #[derive(Debug, Clone, Serialize)]
 struct ContinuationConsumedBody {
     device_id: uuid::Uuid,
@@ -1962,6 +2154,8 @@ struct ContinuationConsumedBody {
     outcome: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claude_code_session_id: Option<String>,
 }
 
 impl ContinuationConsumedBody {
@@ -1971,21 +2165,28 @@ impl ContinuationConsumedBody {
             device_id,
             outcome: None,
             detail: None,
+            claude_code_session_id: None,
         }
     }
 
     /// The OUTCOME body — one [`ContinuationOutcome`] token plus an optional
     /// first-line detail. Posted after the spawn attempt resolves, or after the
     /// spawned session's PTY exits without having reported.
+    ///
+    /// `claude_code_session_id` is the pinned Claude session uuid; callers pass
+    /// `Some` only on the [`ContinuationOutcome::Spawned`] post (the one moment
+    /// it is both known and meaningful), `None` everywhere else.
     fn outcome(
         device_id: uuid::Uuid,
         outcome: ContinuationOutcome,
         detail: Option<String>,
+        claude_code_session_id: Option<String>,
     ) -> Self {
         Self {
             device_id,
             outcome: Some(outcome.wire()),
             detail,
+            claude_code_session_id,
         }
     }
 }
@@ -2036,7 +2237,7 @@ enum SpawnDecision {
     SpawnDespiteClaimError { cause: String },
     /// A [`SpawnDecision::SpawnDespiteClaimError`] while autonomous spawns are
     /// paused by coord's device drain (drained, or drain state unknown): do NOT
-    /// spawn; leave the row pending for the backstop poll, like `AtCap`.
+    /// spawn; leave the row pending for the backstop poll, like a load deferral.
     /// Produced only by [`apply_drain_to_claim`].
     DeferClaimErrorByDrain {
         cause: String,
@@ -2102,7 +2303,7 @@ fn continuation_drain_admission_for(
     consume_target: ConsumeTarget,
 ) -> crate::agent_authorization::DrainAdmission {
     match consume_target {
-        ConsumeTarget::Gate(g) => continuation_drain_admission(Some(g), None),
+        ConsumeTarget::Gate(g, _) => continuation_drain_admission(Some(g), None),
         ConsumeTarget::Dispatch(d) => continuation_drain_admission(None, Some(d)),
         ConsumeTarget::None => continuation_drain_admission(None, None),
     }
@@ -2214,34 +2415,115 @@ fn lock_recover<'a, T>(
 /// Continuations WITHOUT a `gate_id` (legacy coord) can't be deduped by id and
 /// always dispatch — accepted, because legacy coord also never re-lists them via
 /// the (new) poll surface, so the only delivery path is the single WS frame.
-fn dispatched_gate_ids() -> &'static std::sync::Mutex<std::collections::HashSet<uuid::Uuid>> {
+///
+/// **Keyed on the gate id, valued by the highest re-delivery attempt claimed.**
+/// Coord re-drives a continuation whose earlier attempt never started or
+/// crashed (plan `2026-10-01-a-lost-gate-continuation-is-never-re-delivered`)
+/// by resetting the SAME gate row, and a gate whose session ran stays claimed
+/// here for the life of the process — so a set of bare ids would drop every
+/// re-delivery to this device forever. A strictly LARGER attempt therefore
+/// claims afresh, while a duplicate of the same attempt (WS + poll) or a stale
+/// older one is still dropped. This is the ONLY guard against a same-device
+/// duplicate: coord's consume route answers `consumed` to a re-claim of an
+/// already-consumed row rather than refusing it.
+///
+/// Each entry is `(attempt, state)`, and a release only TOMBSTONES the entry
+/// for the attempt that holds it — it never removes it. An attempt whose claim
+/// coord ACCEPTED is [`GateClaimState::Sealed`]: coord has consumed that row, so
+/// nothing may re-open the attempt locally (a later error release is a no-op),
+/// and the only way back in is a newer re-delivery attempt (review round 2 #1). Removing would let an
+/// older attempt's release wipe a newer attempt's claim (a re-delivery that
+/// arrived while the older task was still posting its outcome), after which
+/// the newer attempt's second copy — or a stale older frame — would claim and
+/// spawn again on the same device (review round 1 #1).
+fn dispatched_gate_ids(
+) -> &'static std::sync::Mutex<std::collections::HashMap<uuid::Uuid, (u32, GateClaimState)>> {
     static DISPATCHED: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>,
+        std::sync::Mutex<std::collections::HashMap<uuid::Uuid, (u32, GateClaimState)>>,
     > = std::sync::OnceLock::new();
-    DISPATCHED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+    DISPATCHED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Atomically claim a `gate_id` for dispatch. Returns `true` if THIS call was
-/// the first to claim it (caller should dispatch); `false` if it was already
-/// claimed (caller must skip — a duplicate delivery). Insert-and-test under one
+/// Atomically claim a `gate_id` at re-delivery `attempt` (0 = first delivery)
+/// for dispatch. Returns `true` if THIS call won the claim (caller should
+/// dispatch); `false` if it must skip as a duplicate. Insert-and-test under one
 /// lock so two concurrent deliveries can't both win.
-fn claim_gate_dispatch(gate_id: uuid::Uuid) -> bool {
-    lock_recover(dispatched_gate_ids(), "dispatched_gate_ids").insert(gate_id)
+///
+/// Wins iff nothing is held for this gate, the held attempt is EARLIER, or the
+/// held attempt is THIS one and was released (a local skip that left the row
+/// pending on coord, so its re-listing must dispatch). Monotone: a frame of an
+/// older attempt never claims again, released or not.
+fn claim_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) -> bool {
+    let mut held = lock_recover(dispatched_gate_ids(), "dispatched_gate_ids");
+    let wins = match held.get(&gate_id) {
+        None => true,
+        Some(&(prev, state)) => {
+            attempt > prev || (attempt == prev && state == GateClaimState::Released)
+        }
+    };
+    if wins {
+        held.insert(gate_id, (attempt, GateClaimState::Held));
+    }
+    wins
 }
 
-/// Release an in-process gate-dispatch claim ([`claim_gate_dispatch`]).
+/// Test shim: [`claim_gate_dispatch_attempt`] at attempt 0 (a first delivery).
+#[cfg(test)]
+fn claim_gate_dispatch(gate_id: uuid::Uuid) -> bool {
+    claim_gate_dispatch_attempt(gate_id, 0)
+}
+
+/// Test shim: [`release_gate_dispatch_attempt`] at attempt 0.
+#[cfg(test)]
+fn release_gate_dispatch(gate_id: uuid::Uuid) {
+    release_gate_dispatch_attempt(gate_id, 0);
+}
+
+/// The in-process state of one gate's highest claimed attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateClaimState {
+    /// Claimed and in flight.
+    Held,
+    /// Released by a local skip that left coord's row pending: the same
+    /// attempt may claim again when it is re-listed.
+    Released,
+    /// Coord ACCEPTED this attempt's consume claim: the row is consumed there,
+    /// so no copy of this attempt may ever spawn again in this process.
+    Sealed,
+}
+
+/// Seal the claim `attempt` holds once coord accepted it (see
+/// [`GateClaimState::Sealed`]). No-op for any other attempt.
+fn seal_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) {
+    let mut held = lock_recover(dispatched_gate_ids(), "dispatched_gate_ids");
+    if let Some(entry) = held.get_mut(&gate_id) {
+        if entry.0 == attempt {
+            entry.1 = GateClaimState::Sealed;
+        }
+    }
+}
+
+/// Release the in-process gate-dispatch claim `attempt` holds
+/// ([`claim_gate_dispatch_attempt`]) — a TOMBSTONE, and a no-op when a
+/// different (newer) attempt holds the gate or this attempt is already
+/// [`GateClaimState::Sealed`]. See [`dispatched_gate_ids`].
 ///
 /// **The load-bearing half of the delivery-stall fix.** The dedupe set's ONLY
 /// purpose is the WS+poll double-delivery race: an id must stay claimed only
 /// while a dispatch is IN-FLIGHT or after the continuation was actually
 /// CONSUMED on coord (the consume claim POSTed). Every LOCAL skip that leaves
-/// the row pending on coord (AtCap, DuplicateAnchor, device-mismatch, an `Err`
+/// the row pending on coord (LoadPressure, DuplicateAnchor, device-mismatch, an `Err`
 /// before/around the consume claim) must release, or the skip is permanent for
 /// the process lifetime: the backstop poll re-lists the row every tick and the
 /// dispatcher drops it at the dedupe check forever — the exact mechanism that
 /// stranded 51 continuations pending-with-null-outcomes over 2 days.
-fn release_gate_dispatch(gate_id: uuid::Uuid) {
-    lock_recover(dispatched_gate_ids(), "dispatched_gate_ids").remove(&gate_id);
+fn release_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) {
+    let mut held = lock_recover(dispatched_gate_ids(), "dispatched_gate_ids");
+    if let Some(entry) = held.get_mut(&gate_id) {
+        if entry.0 == attempt && entry.1 == GateClaimState::Held {
+            entry.1 = GateClaimState::Released;
+        }
+    }
 }
 
 /// Process-wide set of work-unit `dispatch_id`s whose continuation we have
@@ -2262,13 +2544,13 @@ fn dispatched_dispatch_ids() -> &'static std::sync::Mutex<std::collections::Hash
 /// Atomically claim a `dispatch_id` for dispatch. Returns `true` if THIS call was
 /// the first to claim it (caller should dispatch); `false` if it was already
 /// claimed (a duplicate delivery — caller must skip). Insert-and-test under one
-/// lock, exactly like [`claim_gate_dispatch`].
+/// lock, exactly like [`claim_gate_dispatch_attempt`].
 fn claim_dispatch_dispatch(dispatch_id: uuid::Uuid) -> bool {
     lock_recover(dispatched_dispatch_ids(), "dispatched_dispatch_ids").insert(dispatch_id)
 }
 
 /// Release an in-process unit-dispatch claim ([`claim_dispatch_dispatch`]) —
-/// the sibling of [`release_gate_dispatch`] for the work-unit path. Load
+/// the sibling of [`release_gate_dispatch_attempt`] for the work-unit path. Load
 /// bearing for the unit contract's at-least-once promise: a failed spawn is
 /// deliberately left un-consumed so coord re-lists it, but WITHOUT this
 /// release the re-listed row would be dropped at the in-process dedupe check
@@ -2280,11 +2562,11 @@ fn release_dispatch_dispatch(dispatch_id: uuid::Uuid) {
 /// Release whichever in-process dedupe claim the dispatcher took for this
 /// continuation, per its [`ConsumeTarget`]. Called from every LOCAL-skip exit
 /// of [`run_gate_continuation_inner`] that leaves the row pending on coord
-/// (see [`release_gate_dispatch`] for the invariant). [`ConsumeTarget::None`]
+/// (see [`release_gate_dispatch_attempt`] for the invariant). [`ConsumeTarget::None`]
 /// (legacy, no id) never claimed, so there is nothing to release.
 fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
     match consume_target {
-        ConsumeTarget::Gate(gate_id) => release_gate_dispatch(gate_id),
+        ConsumeTarget::Gate(gate_id, attempt) => release_gate_dispatch_attempt(gate_id, attempt),
         ConsumeTarget::Dispatch(dispatch_id) => release_dispatch_dispatch(dispatch_id),
         ConsumeTarget::None => {}
     }
@@ -2304,7 +2586,7 @@ fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
 ///   superseded_by:<winner>` and left it pending and re-listed, so the loser
 ///   proceeds on a later claim if the winner is released (spawn_failed /
 ///   work_abandoned / work_unreported). Keeping the id claimed would strand it
-///   for the process lifetime (see [`release_gate_dispatch`]).
+///   for the process lifetime (see [`release_gate_dispatch_attempt`]).
 /// * [`SpawnDecision::SkipRerouted`] → **true**, a deliberate choice. The row
 ///   IS still pending on coord, but targeted at another device — coord's
 ///   reroute is one OF RECORD (`REROUTE_OF_RECORD_SQL` rewrites the persisted
@@ -2314,7 +2596,7 @@ fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
 ///   is kept for the uncommon one: a later reroute (or the offline re-target)
 ///   can pick THIS device again, and a kept claim would then drop that
 ///   re-delivery at the dedupe check for the process lifetime — the exact
-///   stranding [`release_gate_dispatch`] exists to prevent. The cost of
+///   stranding [`release_gate_dispatch_attempt`] exists to prevent. The cost of
 ///   releasing is at most one more consume claim on a stale duplicate
 ///   delivery, which coord refuses again with the same 409 — while coord is
 ///   reachable. If that later claim instead FAILS (timeout, 5xx), it lands in
@@ -2356,7 +2638,7 @@ enum ClaimOutcome {
     /// coord could not answer the claim AND autonomous spawns are paused by
     /// the device drain (drained, or the drain state unknown, which is what a
     /// coord outage becomes). The row is left PENDING for the backstop poll —
-    /// the `AtCap` shape, not a spawn and not a terminal skip. The log is
+    /// the load-deferral shape, not a spawn and not a terminal skip. The log is
     /// written here; the caller awaits `defer_continuation_unclaimed`, which
     /// posts the deferred stamp and releases the local claim, so this arm
     /// deliberately does NOT settle it. Carries the drain's OWN deferral class
@@ -2375,7 +2657,7 @@ enum ClaimOutcome {
 /// in the `SkipSuperseded` match arm, deleting **the call** — not the body of
 /// [`settle_skipped_claim`], which a test did cover — left every test green
 /// and stranded the superseded loser's gate id in
-/// [`release_gate_dispatch`]'s claim set for the process lifetime, so coord's
+/// [`release_gate_dispatch_attempt`]'s claim set for the process lifetime, so coord's
 /// re-listed row could never be re-claimed. The call site was the untested
 /// half. Here there is no such statement to delete: the log, the settle and
 /// the skip/spawn decision are one unit, and
@@ -2405,7 +2687,16 @@ fn settle_claim_decision(
     gate_id: uuid::Uuid,
 ) -> ClaimOutcome {
     match decision {
-        SpawnDecision::Spawn => ClaimOutcome::Spawn,
+        SpawnDecision::Spawn => {
+            // Coord accepted the claim: the row is consumed there. Seal the
+            // attempt so a later error-path release cannot re-open it to a
+            // late duplicate frame (which coord would answer `consumed` and the
+            // runner would spawn a second time).
+            if let ConsumeTarget::Gate(g, attempt) = consume_target {
+                seal_gate_dispatch_attempt(g, attempt);
+            }
+            ClaimOutcome::Spawn
+        }
         SpawnDecision::SpawnDespiteClaimError { cause } => {
             warn!(
                 "agent_runtime: continuation claim error (proceeding, in-process dedupe \
@@ -2433,7 +2724,7 @@ fn settle_claim_decision(
             // Availability-over-consistency is suspended while autonomous
             // spawns are not allowed: a claim error during a drain (or an
             // unknown drain state, which is what a coord outage becomes) is a
-            // leave-pending deferral, the `AtCap` shape, not a spawn.
+            // leave-pending deferral, the load-deferral shape, not a spawn.
             warn!(
                 "agent_runtime: continuation claim error while autonomous spawns are \
                  paused — deferring, row left pending: {cause}; {reason} (gate_id={gate_id})"
@@ -2479,86 +2770,41 @@ fn settle_claim_decision(
 }
 
 // =============================================================================
-// Continuation-session registry (P3 anchor_key dedup + P4 concurrency cap)
+// Continuation-session registry (P3 anchor_key dedup) and unattended admission
 // =============================================================================
 
-/// Default cap on concurrently-live *continuation-spawned* terminal sessions.
+/// The env override that USED to set a fixed count cap on unattended sessions.
 ///
-/// **64.** Finite since Phase 1 of
-/// `2026-08-30-load-aware-spawn-admission-control`; it was `usize::MAX` until
-/// the 2026-08-29 wedge, and the reasoning behind that default is the thing the
-/// incident actually falsified.
+/// **Retired 2026-10-03** (plan
+/// `2026-10-03-retire-the-continuation-session-cap-and-let-the-queue-pre-check-read-both-resource-lanes`).
+/// Operator direction, verbatim: *"there shouldn't be a fixed session cap. the
+/// cap should have to do with the box's resources"*, and *"in the runner, spawns
+/// are blocked when the memory or threads are low so a cap may not be needed at
+/// all."* Admission of an unattended continuation or coord launch is decided by
+/// the two MEASURED lanes the PTY seam already enforces —
+/// [`crate::resource_guard::probe_for_spawn`]: free memory (commit on Windows,
+/// `MemAvailable` elsewhere) and the runner's thread count — and by nothing
+/// else. See [`evaluate_continuation_guard`] for why no count replaces it.
 ///
-/// ## Why the old `usize::MAX` was wrong
-///
-/// The retired doc argued the cap on the **UI-display** axis: "the Terminal UI
-/// scales to unlimited sessions via a 9-zone grid × many page tabs". That is
-/// true, and it is not the axis a spawn cap protects. A grid that can *render*
-/// 130 tabs says nothing about whether the box can *carry* 130 concurrent
-/// `CreateProcess` calls, and on 2026-08-29 it could not: ~130 continuation
-/// spawns landed on an already-loaded primary, the process reached **540 OS
-/// threads** against tokio's 512-slot blocking pool with 119 of them parked
-/// mid-`CreateProcess`, and the runner wedged. The one guard purpose-built to
-/// sit in that exact path was this cap, and it was infinite. A default reasoned
-/// on the wrong axis is indistinguishable from no guard at all.
-///
-/// ## Why 64, and why it is deliberately the WEAKER of the two limits
-///
-/// The wedge's own arithmetic gives the conversion: 540 threads at ~130 sessions
-/// against a 150-151-thread idle baseline is roughly **3 OS threads per
-/// continuation session**. So the shipped thread ceilings
-/// ([`crate::settings::SessionGuardSettings::warn_thread_count`] 256 /
-/// `critical_thread_count` 400) correspond to about **35** and **83** concurrent
-/// sessions. 64 sits between them — which means that in ordinary conditions the
-/// thread lane trips FIRST and this count never binds.
-///
-/// That is intended, not an oversight. The two limits are measuring different
-/// things and the honest one is the thread count: it is a live reading of the
-/// resource that actually ran out. This cap is the **backstop for the case the
-/// thread count cannot see** — sessions that are cheap in threads but expensive
-/// in something else the process does not spend a thread on: Postgres
-/// connections, coord-mcp JWT-mint round trips, and the per-`CreateProcess`
-/// kernel/csrss overhead that a parked thread understates. In that regime the
-/// thread lane reads calm while the machine is not, and a finite count is the
-/// only thing left holding the line.
-///
-/// It is therefore sized as a *ceiling on absurdity*, not as a tuned capacity
-/// number: at ~3 threads apiece, 64 sessions is ~192 threads of continuation
-/// load on top of the idle 150 — over the 256 warn ceiling, under the 400
-/// critical one. Nothing on this fleet has ever legitimately wanted more than 64
-/// concurrent continuations; the observed peak that broke the box was twice it.
-///
-/// ## It is a steady-state bound, NOT a semaphore
-///
-/// [`evaluate_continuation_guard`] reads `registry.live.len()`, but
-/// [`register_continuation_session`] only runs after the coord consume-claim,
-/// the worktree acquire and `create_terminal_session_backend` have all
-/// completed — so every task dispatched in one `poll_pending_continuations`
-/// iteration observes the PRE-BURST registry. In the 130-concurrent shape this
-/// number was chosen against, all 130 see `live.len() == 0` and this cap binds on
-/// none of them. It holds the line across successive polls, once the earlier
-/// dispatches have registered; it cannot hold it *within* one.
-///
-/// That is the same check-to-register window
-/// [`crate::settings::SessionGuardSettings::critical_thread_count`]'s doc
-/// already sizes 400 around ("a burst of concurrent admissions can each pass the
-/// ceiling and only then create their threads"), stated here too because a
-/// number documented as a concurrency limit and enforced as a steady-state one
-/// is exactly the kind of misreading that sent the 2026-08-29 investigation to
-/// the wrong constant. Closing the window would mean a real permit held from the
-/// guard through the spawn — a design change, and not this cap's job.
-///
-/// **The ANCHOR half of that permit has since shipped** as
-/// [`AnchorReservation`], taken inside this guard's own critical section, so a
-/// same-anchor twin can no longer pass within one burst. It deliberately does
-/// NOT count toward this cap: the COUNT stays the steady-state bound described
-/// above, while the ANCHOR is now held check-to-register. The paragraph above
-/// still describes the count.
-///
-/// `QONTINUI_CONTINUATION_SESSION_CAP` remains the operator override, unchanged
-/// and in both directions (a bigger number is as settable as a smaller one).
-/// Operator-opened sessions are never counted — they are never registered here.
-const DEFAULT_CONTINUATION_SESSION_CAP: usize = 64;
+/// The variable is still READ, once, so a box that sets it (spaceship set 9)
+/// says in its log that the override is dead instead of letting the operator
+/// believe it still holds. [`warn_if_retired_cap_env_set`].
+const RETIRED_CONTINUATION_SESSION_CAP_ENV: &str = "QONTINUI_CONTINUATION_SESSION_CAP";
+
+/// Log ONE `warn!` per process when the retired count-cap override is set.
+fn warn_if_retired_cap_env_set() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        if let Ok(value) = std::env::var(RETIRED_CONTINUATION_SESSION_CAP_ENV) {
+            warn!(
+                "agent_runtime: {RETIRED_CONTINUATION_SESSION_CAP_ENV}={value} is set but RETIRED \
+                 and ignored — there is no fixed continuation session cap any more; unattended \
+                 spawns are admitted by the memory and thread lanes \
+                 (resource_guard::probe_for_spawn). Remove the variable."
+            );
+        }
+    });
+}
 
 /// One registered continuation-spawned session.
 #[derive(Debug, Clone)]
@@ -2584,6 +2830,9 @@ struct ContinuationSession {
     /// a `dispatch_id` and has no gate row) and for a legacy frame carrying no
     /// id at all. See [`reportable_gate_id`].
     gate_id: Option<uuid::Uuid>,
+    /// When this entry was registered — the session's lifetime for the
+    /// `work_unreported` detail's `after=` field is measured from here.
+    registered_at: std::time::Instant,
 }
 
 /// The value behind [`continuation_sessions`]: the LIVE continuation sessions
@@ -2594,7 +2843,7 @@ struct ContinuationSession {
 /// scan and its "then it is mine" reservation must be a single critical
 /// section, or two dispatches for one anchor can both scan an empty registry,
 /// both drop the lock, and both spawn — the burst window
-/// [`DEFAULT_CONTINUATION_SESSION_CAP`]'s doc describes. A second mutex for the
+/// [`evaluate_continuation_guard`]'s doc describes. A second mutex for the
 /// reservations would reintroduce exactly that gap between the two reads.
 #[derive(Debug, Default)]
 struct ContinuationRegistry {
@@ -2608,8 +2857,10 @@ struct ContinuationRegistry {
     /// [`Self::take_live_reserving_anchor`] (the migration lift) — and removed
     /// only by that entry's owner: its drop on every non-spawn
     /// exit, or [`AnchorReservation::handed_to_registry`] when the live entry
-    /// replaces it. Never counted toward P4 — the cap bounds RUNNING sessions,
-    /// and a reservation is not one.
+    /// replaces it. A reservation is not a running session, so it costs the
+    /// machine nothing the load lanes can READ yet — which is exactly why a
+    /// dispatch's permit is also charged as projected cost
+    /// ([`Self::reserved_spawns`]).
     ///
     /// **The account-migration hop holds its anchor here for the whole
     /// respawn.** The hop lifts a continuation off its terminal
@@ -2637,6 +2888,43 @@ struct ContinuationRegistry {
     /// the other route. Carrying the token makes every removal a no-op unless
     /// the remover holds the entry it names.
     pending_anchors: std::collections::HashMap<String, AnchorReservationToken>,
+    /// How many continuations have passed [`evaluate_continuation_guard`] with
+    /// `Proceed` and are not yet registered (or given up): each is charged
+    /// against the resource lanes as a PROJECTED cost
+    /// ([`crate::resource_guard::AdmissionReading::projected`]) until its
+    /// [`AnchorReservation`] settles — [`AnchorReservation::handed_to_registry`]
+    /// (terminal), [`AnchorReservation::release`] (headless), or its drop on any
+    /// other exit.
+    ///
+    /// **Why it exists.** Neither lane can see a continuation whose `claude`
+    /// has not started, and the stretch from the guard to the PTY crosses the
+    /// coord consume claim, the worktree acquire and the trust warm-up. A replay
+    /// of N pending rows used to read the same pre-burst headroom N times and
+    /// admit all N (2026-10-27 on spaceship: 20 passed the guard at once, as
+    /// measured in the Why of plan
+    /// `2026-10-28-gate-continuation-cap-is-a-real-permit`). The
+    /// count is read and incremented under THIS lock in the same critical
+    /// section, so concurrent guard passes are serialized: headroom for K admits
+    /// at most K. It is a PROJECTION over the box's readings, never a fixed cap
+    /// (the count cap stays retired; plan
+    /// `2026-10-28-finished-gate-continuations-never-free-a-slot-so-the-box-deadlocks-at-the-continuation-cap`
+    /// D2).
+    ///
+    /// Counted for anchor-less continuations too (their permit holds no anchor
+    /// but is still counted), which a count of `pending_anchors` could not do.
+    /// The account-migration hop's permit is NOT counted: that session's
+    /// `claude` is already running and already in the readings.
+    ///
+    /// **Residual, stated.** The unit settles when the session REGISTERS
+    /// (its transcript exists), not when the readings have caught up with its
+    /// memory and threads: a freshly started `claude` is well under
+    /// [`crate::resource_guard::PER_SESSION_RSS_BYTES`], and the thread reading
+    /// is memoized for [`crate::health_monitor::THREAD_READING_TTL`]. So the
+    /// single-instant burst (one replay pass) is bounded; staggered waves a few
+    /// seconds apart are bounded only partly. In the other direction a
+    /// never-started retry holds its unit across its retries, which only
+    /// over-charges.
+    reserved_spawns: usize,
 }
 
 impl ContinuationRegistry {
@@ -2656,6 +2944,7 @@ impl ContinuationRegistry {
                 terminal_id,
                 anchor_key,
                 gate_id,
+                registered_at: std::time::Instant::now(),
             },
         );
     }
@@ -2698,7 +2987,7 @@ impl ContinuationRegistry {
     /// of the respawn. Two paths do that: the permit's `Drop` on any non-spawn
     /// exit, and [`AnchorReservation::release`], the headless arm, which frees
     /// the anchor deliberately *after* a successful spawn because headless
-    /// sessions are outside P3/P4. What does NOT do it is a stranger settling
+    /// sessions are outside the P3 live registry. What does NOT do it is a stranger settling
     /// through [`AnchorReservation::handed_to_registry`]: that inserts a
     /// LIVE row for the anchor under the same lock that frees the pending
     /// entry, so P3's live scan still answers `DuplicateAnchor(Live)` and no
@@ -2803,22 +3092,12 @@ fn next_anchor_reservation_token() -> AnchorReservationToken {
 /// Process-wide registry of continuation-spawned terminal sessions, keyed by
 /// `terminal_id`. Distinct from [`dispatched_gate_ids`] (which dedupes a single
 /// `gate_id` delivered twice): this tracks LIVE sessions so a re-cleared gate
-/// (new `gate_id`, same `anchor_key`) is deduped (P3) and the live count is
-/// capped (P4) — and, beside them, the anchors reserved by dispatches still
+/// (new `gate_id`, same `anchor_key`) is deduped (P3) — and, beside them, the anchors reserved by dispatches still
 /// between the guard and the spawn (see [`ContinuationRegistry`]).
 fn continuation_sessions() -> &'static std::sync::Mutex<ContinuationRegistry> {
     static SESSIONS: std::sync::OnceLock<std::sync::Mutex<ContinuationRegistry>> =
         std::sync::OnceLock::new();
     SESSIONS.get_or_init(|| std::sync::Mutex::new(ContinuationRegistry::default()))
-}
-
-/// The configured continuation-session cap (env override, else the default).
-/// A non-numeric / empty env value falls back to the default.
-fn continuation_session_cap() -> usize {
-    std::env::var("QONTINUI_CONTINUATION_SESSION_CAP")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_CONTINUATION_SESSION_CAP)
 }
 
 /// The `coord.gates` row this continuation may report a work outcome to, or
@@ -2923,7 +3202,19 @@ fn prune_dead_continuations(is_live: &dyn Fn(&str) -> bool) {
         return;
     };
     for session in &reaped {
-        spawn_work_unreported_fallback(&handle, session.gate_id, device_id, &session.terminal_id);
+        let snapshot = pane_exit_facts(&session.terminal_id);
+        let detail = work_unreported_detail(
+            snapshot.map(|(f, _)| f),
+            session_lifetime(session.registered_at, snapshot.map(|(_, at)| at)),
+            &session.terminal_id,
+        );
+        spawn_work_unreported_fallback(
+            &handle,
+            session.gate_id,
+            device_id,
+            &session.terminal_id,
+            detail,
+        );
     }
 }
 
@@ -2950,83 +3241,128 @@ enum AnchorHolder {
     Reserved,
 }
 
-/// Outcome of the pre-spawn continuation guard (P3 + thread pressure + P4).
+/// Outcome of the pre-spawn continuation guard (P3 dedup + machine load).
 #[derive(Debug, PartialEq, Eq)]
 enum ContinuationGuard {
-    /// Clear to spawn — no live duplicate, machine not under thread pressure,
-    /// under cap.
+    /// Clear to spawn — no live duplicate, and neither resource lane tripped.
     Proceed,
     /// This `anchor_key` is already taken (P3): skip the spawn (re-cleared gate
     /// / duplicate). Carries WHO holds it — a live session, or a permit holder
     /// (a dispatch still between the guard and its spawn, or a session
     /// mid-account-migration; see [`AnchorHolder::Reserved`]).
     DuplicateAnchor(AnchorHolder),
-    /// The machine is out of THREADS, not out of slots: the spawn gate's thread
-    /// lane ([`crate::resource_guard::thread_pressure`]) returned something
-    /// other than `Proceed`. Defer the spawn.
+    /// The machine is short of a measured resource: the spawn seam's own
+    /// composed verdict ([`crate::resource_guard::probe_for_spawn`] — the free
+    /// memory lane and the thread lane, heavier wins) returned something other
+    /// than `Proceed`. Defer the spawn.
     ///
     /// Carries the severity word (`"warn"` / `"critical"`) beside the
-    /// observation that produced it, so the log and the coord stamp can name the
-    /// REAL numbers — the thread count that was read and the ceiling it crossed.
-    ///
-    /// Deliberately NOT folded into [`ContinuationGuard::AtCap`]. A deferral
-    /// reported as "cap reached" when the cap was never reached is a lie in the
-    /// runner log, and the log is exactly what the next incident's forensics
-    /// reads: the 2026-08-29 investigation spent its time on the cap because the
-    /// cap is what the log talks about.
-    ThreadPressure {
-        /// `"warn"` or `"critical"` — which ceiling the reading crossed. Comes
+    /// observation that produced it, so the log and the coord stamp name the
+    /// REAL numbers — the reading, the limit it crossed, and (through the
+    /// observation's metric) WHICH lane: `thread_pressure:` for threads,
+    /// `commit_pressure:` for memory ([`load_pressure_stamp_reason`]).
+    LoadPressure {
+        /// `"warn"` or `"critical"` — which limit the reading crossed. Comes
         /// from [`crate::resource_guard::SpawnGate::tripped`], never re-derived
         /// here, so the word and the number can never disagree.
         severity: &'static str,
         observation: crate::resource_guard::GateObservation,
     },
-    /// At the concurrency cap (P4): skip the spawn. Carries the cap for the log.
-    AtCap(usize),
 }
 
-/// Pre-spawn guard: prune dead sessions, then enforce P3 (anchor_key dedup),
-/// machine thread pressure, and P4 (concurrency cap). Pure over (`anchor_key`,
-/// `is_live`, the injected thread verdict, env cap) so it is unit-testable
-/// without a live `TerminalManager` and without a live thread reading.
+/// Pre-spawn guard: prune dead sessions, then enforce P3 (anchor_key dedup) and
+/// machine load. Pure over (`anchor_key`, `is_live`, the injected load verdict)
+/// so it is unit-testable without a live `TerminalManager` and without a live
+/// reading.
 ///
-/// Order matters, and it is now three-deep:
+/// Order matters:
 ///
 /// 1. **Dedup first.** A duplicate of an already-running anchor is reported as a
-///    dedup (the honest reason) rather than "capped" or "loaded" — and it is
-///    also the one verdict that is true regardless of machine state: spawning it
-///    would be wrong on an idle box too.
+///    dedup (the honest reason) rather than "loaded" — and it is also the one
+///    verdict that is true regardless of machine state: spawning it would be
+///    wrong on an idle box too.
 ///
-///    **First in COST as well as in verdict**, which is why the thread verdict
+///    **First in COST as well as in verdict**, which is why the load verdict
 ///    arrives as a closure rather than as a value. `poll_pending_continuations`
 ///    `tokio::spawn`s one task per row coord returns — a route coord serves with
 ///    no `LIMIT` — so a batch of rows stranded on `duplicate_anchor` runs this
-///    guard concurrently, once per row. Passing `thread_pressure()` as an
+///    guard concurrently, once per row. Passing `probe_for_spawn()` as an
 ///    *argument expression* would evaluate every one of those readings before
 ///    this arm discarded them: on Windows that is a system-wide
 ///    `CreateToolhelp32Snapshot` per row (plus a `settings.json` stat/parse and
-///    an accounts load), landing at the exact instant the machine is
-///    thread-starved. The measured shape is 51 rows stranded for two days on
-///    2026-08-29, against a burst this plan sizes at ~130 — i.e. the guard
-///    amplifying the burst it exists to damp. Taken lazily, a deduped row pays
-///    nothing.
-/// 2. **Thread pressure next.** It goes AHEAD of the count cap because it is the
-///    real signal — a live reading of the resource that actually ran out on
-///    2026-08-29 — and because it is the earlier, cheaper catch: on this fleet
-///    it binds at roughly 35 concurrent sessions (warn) where the count cap
-///    binds at 64, so on the path to a wedge it is what fires. Reporting a
-///    thread-starved machine as "capped" would send the next investigation to
-///    the wrong constant, which is precisely what happened last time.
-/// 3. **The count cap last**, as the backstop for load the thread count cannot
-///    see (see [`DEFAULT_CONTINUATION_SESSION_CAP`]).
+///    a `GlobalMemoryStatusEx`), landing at the exact instant the machine is
+///    starved. Taken lazily, a deduped row pays nothing.
+/// 2. **Machine load next** — the heavier of the memory and thread lanes, the
+///    same composed verdict the PTY seam enforces. The pre-check used to read
+///    the thread lane only, so a CRITICAL memory reading was first seen AFTER
+///    coord's consume claim, at the PTY seam, where it is a terminal
+///    `spawn_failed` that nothing re-delivers. Reading both lanes here makes
+///    memory pressure a deferral, like thread pressure always was.
 ///
-/// Operator sessions never enter the registry, so they never count.
+///    **Deferring at memory WARN is NEW, and deliberate.** The seam only refuses
+///    at CRITICAL, so a memory WARN reading used to spawn (with a toast). It now
+///    defers an unattended spawn, by operator direction (an unattended spawn
+///    defers at WARN, an operator's own spawn refuses only at CRITICAL — the same
+///    asymmetry the thread lane has always had). The cost, stated so it is
+///    watched rather than discovered: a box whose IDLE free memory sits under the
+///    warn floor defers every unattended spawn until memory frees; the memory
+///    lane has no at-rest re-basing like the thread lane's. That state is visible
+///    on `/health` `spawnAdmission.memory` and on coord as `commit_pressure:warn`
+///    deferral stamps.
+///
+/// Operator sessions never enter the registry and never reach this guard.
+///
+/// ## There is no count cap, by decision
+///
+/// A fixed count (`DEFAULT_CONTINUATION_SESSION_CAP` = 64, overridable by
+/// `QONTINUI_CONTINUATION_SESSION_CAP`) used to sit after the load lanes. It was
+/// retired on 2026-10-03 by operator direction (see
+/// [`RETIRED_CONTINUATION_SESSION_CAP_ENV`]): a number that says nothing about
+/// the box decided admission, and on spaceship (`=9`) it deferred gate `e46eb573`'s
+/// continuation five times between 16:10Z and 20:14Z on 2026-10-02 while the
+/// operator saw seven sessions (measured; dossier
+/// `gate-continuation-work-never-happens`).
+/// Its doc justified it as a backstop for costs the thread lane cannot see; each
+/// is bounded elsewhere, measured against `origin/main` when it was removed:
+///
+/// - **Postgres connections.** A continuation is an external `claude` process;
+///   it reaches Postgres only through runner HTTP handlers, which check out of
+///   the runner's pool, fixed at `max_size(8)` with 5 s timeouts
+///   (`database/pg/mod.rs`). More sessions queue on the pool; they open no
+///   connections.
+/// - **coord-mcp JWT mints.** Sessions do not mint. The loopback proxy forwards
+///   each request with the device credential from the shared refresher slot,
+///   re-minted per DEVICE on `REFRESH_CHECK_INTERVAL` (300 s,
+///   `mcp/device_jwt_refresher.rs`); a session's own nonce is local randomness.
+/// - **Each session's own `claude` process.** Its memory is what the memory lane
+///   reads (commit charge on Windows, `MemAvailable` elsewhere). The THREAD lane
+///   does not see it: it counts the RUNNER's own threads only (the Windows walk
+///   is system-wide in cost but filtered to this PID, `health_monitor`), so it
+///   sees a session's terminal reader/waiter threads, not the child's.
+/// - **Per-`CreateProcess` kernel / csrss overhead, and the OS task ceiling.**
+///   Bounded by NOTHING in steady state — not by the count either, which never
+///   measured them. A Linux runner's children also share its systemd unit's
+///   `pids.max` and `kernel.threads-max`, which no lane reads; the burst RATE is
+///   owned by plan
+///   `2026-10-01-runner-spawn-bursts-are-unregulated-coord-must-admit-spawns-per-machine`,
+///   and a task-ceiling lane, if one is needed, by the resource-guard follow-ups.
+///   The count was never a semaphore either: every task of one poll read the
+///   same pre-burst count.
+///
+/// The ANCHOR half of a check-to-register permit does exist ([`AnchorReservation`],
+/// taken inside this guard's critical section), so a same-anchor twin cannot
+/// pass within one burst. So does the COST half: a `Proceed` charges one
+/// projected session ([`ContinuationRegistry::reserved_spawns`]) against the
+/// readings until the permit settles, decided and recorded under one lock, so
+/// a burst of N rows with headroom for K admits at most K. That is a
+/// projection over the box's readings, not a count: with calm readings it
+/// admits everything, as the operator direction requires.
 ///
 /// ## Any non-`Proceed` verdict defers — deliberately more eager than `admit_spawn`
 ///
 /// [`crate::resource_guard::admit_spawn`] refuses an operator's own spawn only
 /// at [`crate::resource_guard::SpawnGate::Critical`]. This guard defers at
-/// `Warn` as well, and the asymmetry is the whole reason `thread_pressure()`
+/// `Warn` as well, and the asymmetry is the whole reason `probe_for_spawn()`
 /// hands back the verdict instead of a bool.
 ///
 /// The two callers pay completely different prices for being wrong. A gate
@@ -3044,9 +3380,10 @@ enum ContinuationGuard {
 fn evaluate_continuation_guard(
     anchor_key: Option<&str>,
     is_live: &dyn Fn(&str) -> bool,
-    thread_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
+    load_reading: &dyn Fn() -> crate::resource_guard::AdmissionReading,
 ) -> (ContinuationGuard, AnchorReservation) {
-    // Prune runs `is_live` OUTSIDE the registry lock (see its doc); the P3/P4
+    warn_if_retired_cap_env_set();
+    // Prune runs `is_live` OUTSIDE the registry lock (see its doc); the P3
     // scan below then runs under a freshly-acquired lock.
     prune_dead_continuations(is_live);
     // The permit this evaluation takes, if it takes one, RETURNED OUT of the
@@ -3068,10 +3405,10 @@ fn evaluate_continuation_guard(
     //
     // Handed back to the caller only with a `Proceed`; every other exit drops
     // it — outside the lock — and dropping is what gives the anchor back.
-    let (live_count, reservation) = {
+    let reservation = {
         let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
 
-        let reservation = if let Some(anchor) = anchor_key {
+        if let Some(anchor) = anchor_key {
             // P3: a LIVE session already exists for this anchor_key → dedup.
             if let Some(existing) = registry
                 .live
@@ -3089,10 +3426,8 @@ fn evaluate_continuation_guard(
             // earlier and has not yet registered holds the anchor too.
             // Otherwise it is ours from here on — the reservation is taken
             // BEFORE the lock drops, so a second evaluation racing this one
-            // cannot also read the anchor as free. This is the "real permit
-            // held from the guard through the spawn" that
-            // `DEFAULT_CONTINUATION_SESSION_CAP`'s doc names as the fix for the
-            // burst window; `AnchorReservation` carries it from here.
+            // cannot also read the anchor as free. `AnchorReservation` carries
+            // it from here.
             match registry.pending_anchors.entry(anchor.to_string()) {
                 std::collections::hash_map::Entry::Occupied(_) => {
                     return (
@@ -3115,150 +3450,66 @@ fn evaluate_continuation_guard(
             // nothing — a permit over no anchor, whose drop is a no-op
             // wherever it happens.
             AnchorReservation::none()
-        };
-        // `live` only: the reservation just taken (and any other) is not a
-        // running session and does not count toward the cap. Moved out with
-        // the count, so the guard below drops on an empty local.
-        (registry.live.len(), reservation)
+        }
     };
-    // The registry lock is RELEASED before the thread reading is taken. The
-    // reading is a synchronous OS-table read (and, in the live wrapper, a
-    // settings load), and holding a process-global mutex across it would park
+    // The registry lock is RELEASED before the load reading is taken. The
+    // reading is a synchronous OS read (and, in the live wrapper, a settings
+    // load), and holding a process-global mutex across it would park
     // `register_continuation_session` and every other guard behind one syscall.
-    // The count is read out above instead: it is a snapshot either way — see
-    // `DEFAULT_CONTINUATION_SESSION_CAP` on why this check is not a semaphore
-    // and holding the lock longer would not make it one. The ANCHOR is no
-    // longer a snapshot, though: it is reserved above, so the load verdicts
-    // below must give it back when they refuse.
+    // The ANCHOR is reserved above, so the load verdict below must give it back
+    // when it refuses.
     //
-    // Admitted coord LAUNCHES count toward the same cap: both populations are
-    // unattended coord-dispatched sessions spending the same machine, and a cap
-    // that one of them can walk past is not a bound on the box. So do terminal
-    // continuations still inside their start window: they register only once
-    // their session has started (`run_continuation_terminal`), up to
-    // CONTINUATION_START_WINDOW per attempt after this guard said Proceed.
-    let live_count = live_count + admitted_launch_count() + starting_continuation_count();
-
-    // Thread pressure next, then the count cap — shared with the launch path
-    // through `evaluate_load_guard`. Evaluated HERE, after the dedup arm has had
-    // its chance to return, so a deduped row never pays for a thread snapshot.
-    let verdict = match evaluate_load_guard(live_count, thread_pressure) {
-        LoadGuard::Proceed => ContinuationGuard::Proceed,
-        LoadGuard::ThreadPressure {
-            severity,
-            observation,
-        } => ContinuationGuard::ThreadPressure {
-            severity,
-            observation,
-        },
-        LoadGuard::AtCap { cap, .. } => ContinuationGuard::AtCap(cap),
+    // ANY tripped verdict defers (see the asymmetry argument above). An
+    // unreadable sensor produces `Proceed` inside `resource_guard` — UNKNOWN ⇒
+    // spawn, the fail-open doctrine this subsystem is built on — so a missing
+    // reading can never wedge the queue shut.
+    let reading = load_reading();
+    // PROJECTED COST, decided and recorded in ONE critical section. The reading
+    // above cannot see a continuation that passed this guard and has not yet
+    // started its `claude`, so every such admission is charged against it
+    // ([`ContinuationRegistry::reserved_spawns`]). Reading the count and
+    // incrementing it under the same lock is what serializes CONCURRENT guard
+    // passes: of N tasks evaluating one pre-burst reading at once, only as many
+    // as the projected headroom allows read `Proceed`. The projection is pure
+    // arithmetic over the reading taken above — no OS read and no log write
+    // under the lock (the shadowed-lane line is written after it is released).
+    let (verdict, pending, shadowed) = {
+        let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
+        let pending = registry.reserved_spawns;
+        let (projected, shadowed) = reading.projected(pending);
+        let verdict = match projected.tripped() {
+            Some((severity, observation)) => ContinuationGuard::LoadPressure {
+                severity,
+                observation: observation.clone(),
+            },
+            None => ContinuationGuard::Proceed,
+        };
+        if verdict == ContinuationGuard::Proceed {
+            registry.reserved_spawns += 1;
+        }
+        (verdict, pending, shadowed)
     };
+    crate::resource_guard::note_admission_shadowed_lane(shadowed.as_ref());
     // A load deferral leaves the row pending for re-delivery; the re-delivery
     // must find the anchor free, not reserved by this refused evaluation. Only
     // a `Proceed` leaves the reservation behind, for the caller to carry.
     if verdict != ContinuationGuard::Proceed {
+        if pending > 0 {
+            info!(
+                "agent_runtime: continuation admission charged {pending} admitted, \
+                 not-yet-registered spawn(s) as projected cost before deferring"
+            );
+        }
         // RAII rather than a release call: dropping the permit this evaluation
         // minted gives that anchor back, and it can give back nothing else.
+        // Dropped OUTSIDE the lock — its drop takes the same mutex.
         drop(reservation);
         return (verdict, AnchorReservation::none());
     }
+    // The count was taken above; the permit now owns giving it back.
+    let mut reservation = reservation;
+    reservation.counted = true;
     (verdict, reservation)
-}
-
-/// Outcome of the machine-load half of the pre-spawn guard: thread pressure,
-/// then the live-session count cap. Shared by the gate-continuation guard
-/// ([`evaluate_continuation_guard`], which runs its anchor dedup first) and the
-/// coord launch guard ([`admit_launch`]), so the two paths can never
-/// disagree about when the machine is too loaded to take another unattended
-/// session.
-#[derive(Debug, PartialEq, Eq)]
-enum LoadGuard {
-    /// Clear to spawn.
-    Proceed,
-    /// The thread lane tripped (warn or critical). See
-    /// [`ContinuationGuard::ThreadPressure`].
-    ThreadPressure {
-        severity: &'static str,
-        observation: crate::resource_guard::GateObservation,
-    },
-    /// The live-session count is at or over the cap.
-    AtCap {
-        /// The configured cap ([`continuation_session_cap`]).
-        cap: usize,
-        /// The live count that was compared against it.
-        live: usize,
-    },
-}
-
-/// The load guard proper: thread pressure first, then the count cap. Pure over
-/// (`live_count`, the injected thread verdict, env cap).
-///
-/// Thread pressure: ANY verdict that is not `Proceed` defers (see the asymmetry
-/// argument on [`evaluate_continuation_guard`]). An unreadable thread sensor
-/// produces `Proceed` inside `evaluate_threads` — UNKNOWN ⇒ spawn, the fail-open
-/// doctrine this whole subsystem is built on — so a missing reading can never
-/// wedge the queue shut. The verdict is a closure so a caller that returns
-/// earlier (the continuation dedup arm) never pays for the reading.
-///
-/// A steady-state bound, not a semaphore — see
-/// [`DEFAULT_CONTINUATION_SESSION_CAP`].
-fn evaluate_load_guard(
-    live_count: usize,
-    thread_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
-) -> LoadGuard {
-    let verdict = thread_pressure();
-    if let Some((severity, observation)) = verdict.tripped() {
-        return LoadGuard::ThreadPressure {
-            severity,
-            observation: observation.clone(),
-        };
-    }
-
-    // P4: at the cap → refuse.
-    let cap = continuation_session_cap();
-    if live_count >= cap {
-        return LoadGuard::AtCap {
-            cap,
-            live: live_count,
-        };
-    }
-
-    LoadGuard::Proceed
-}
-
-/// Process-wide registry of coord LAUNCHES (`spawn_requested` payloads) that
-/// passed [`admit_launch`] and whose run task has not finished, keyed by
-/// `agent_id` and valued by the admitting slot's unique token. Distinct from
-/// [`agent_stops`], which is populated synchronously in the WS pump BEFORE the
-/// guard runs: counting that map would make every launch of a burst see the
-/// whole burst and refuse all of it. Only ADMITTED launches count.
-///
-/// The token is what makes a release exact: an [`AdmittedLaunchSlot`] removes
-/// the entry only while it still carries ITS token, so a release can never
-/// free a slot another run holds under the same `agent_id`.
-fn admitted_launches() -> &'static std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u64>> {
-    static LAUNCHES: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u64>>,
-    > = std::sync::OnceLock::new();
-    LAUNCHES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-/// Source of [`AdmittedLaunchSlot`] tokens; unique for the process lifetime.
-static NEXT_ADMITTED_LAUNCH_TOKEN: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
-
-/// Count of admitted launches.
-fn admitted_launch_count() -> usize {
-    lock_recover(admitted_launches(), "admitted_launches").len()
-}
-
-/// Release the admitted slot `token` holds for `agent_id` — a no-op when the
-/// entry is absent or carries a different token (it is not this slot's).
-fn release_admitted_launch(agent_id: uuid::Uuid, token: u64) {
-    let mut launches = lock_recover(admitted_launches(), "admitted_launches");
-    if launches.get(&agent_id) == Some(&token) {
-        launches.remove(&agent_id);
-    }
 }
 
 /// Prefix of the `spawn-failed` reason a load-deferred coord launch reports.
@@ -3279,84 +3530,58 @@ const DEFERRED_LOAD_REASON_PREFIX: &str = "deferred_load:";
 /// `<class>:<detail>` grammar this file's stamps follow (class = text before the
 /// first colon) still holds after coord strips the prefix:
 /// `deferred_load:thread_pressure:warn:300_over_256`,
-/// `deferred_load:at_cap:64_of_64` (`<live>_of_<cap>`).
-fn launch_deferral_reason(verdict: &LoadGuard) -> Option<String> {
-    let detail = match verdict {
-        LoadGuard::Proceed => return None,
-        LoadGuard::ThreadPressure {
-            severity,
-            observation,
-        } => thread_pressure_stamp_reason(severity, observation),
-        LoadGuard::AtCap { cap, live } => format!("at_cap:{live}_of_{cap}"),
-    };
-    Some(format!("{DEFERRED_LOAD_REASON_PREFIX}{detail}"))
-}
-
-/// RAII hold on an admitted launch's slot in [`admitted_launches`]. Dropping it
-/// releases the slot exactly once on every exit route, a panic unwinding the
-/// run task included — and only its OWN entry (matched by `token`).
-#[derive(Debug)]
-struct AdmittedLaunchSlot {
-    agent_id: uuid::Uuid,
-    token: u64,
-}
-
-impl Drop for AdmittedLaunchSlot {
-    fn drop(&mut self) {
-        release_admitted_launch(self.agent_id, self.token);
-    }
+/// `deferred_load:commit_pressure:warn:<free>_under_<floor>`.
+fn launch_deferral_reason(verdict: &crate::resource_guard::SpawnGate) -> Option<String> {
+    let (severity, observation) = verdict.tripped()?;
+    Some(format!(
+        "{DEFERRED_LOAD_REASON_PREFIX}{}",
+        load_pressure_stamp_reason(severity, observation)
+    ))
 }
 
 /// The launch admission decision `spawn_run_task` takes before
-/// `run_agent_subprocess`: prune dead continuations and take the thread reading
-/// FIRST, with no lock held — the reading is an OS-table read on a tokio
-/// worker, and taking it under a blocking std mutex would park every other
-/// admission and the continuation guard's count read behind it during exactly
-/// the burst this guard exists for. Then, under ONE hold of the
-/// [`admitted_launches`] lock: count every live unattended session
-/// (continuations plus admitted launches), apply the shared
-/// [`evaluate_load_guard`] over that count and the reading, and on `Proceed`
-/// insert this launch's slot. Count, cap and insert share the hold, so two
-/// launches racing for the last slot cannot both be admitted.
+/// `run_agent_subprocess`: prune dead continuations (the reaper is also the
+/// `work_unreported` reporter for a dead continuation, so every admission is a
+/// chance to report one promptly), then defer on ANY tripped verdict of the
+/// composed memory + thread probe — the same rule
+/// [`evaluate_continuation_guard`] applies, so the two unattended paths can
+/// never disagree about when the machine is too loaded.
 ///
-/// Lock order is `admitted_launches` then `continuation_sessions`; the
-/// continuation guard releases its registry lock before reading the launch
-/// count, so the two never invert.
+/// No count and no slot: an admitted launch is judged by what the machine has
+/// left, exactly as a continuation is (see [`evaluate_continuation_guard`] on
+/// why the count cap was retired). No duplicate arm: [`register_launch_stop`]
+/// is the launch path's duplicate gate. No anchor dedup: a launch payload has no
+/// anchor key.
 ///
-/// No duplicate arm: [`register_launch_stop`] is the launch path's duplicate
-/// gate, and its entry outlives this slot, so an agent_id reaching here never
-/// already holds one. No anchor dedup: a launch payload has no anchor key.
-///
-/// `Ok(slot)` admits (held until dropped); `Err(reason)` refuses with the
-/// `deferred_load:` reason to report, holding no slot.
+/// `Ok(())` admits; `Err(reason)` refuses with the `deferred_load:` reason to
+/// report.
 fn admit_launch(
-    agent_id: uuid::Uuid,
     is_live: &dyn Fn(&str) -> bool,
-    thread_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
-) -> Result<AdmittedLaunchSlot, String> {
+    load_reading: &dyn Fn() -> crate::resource_guard::AdmissionReading,
+) -> Result<(), String> {
+    warn_if_retired_cap_env_set();
     prune_dead_continuations(is_live);
-    let reading = thread_pressure();
-    let mut launches = lock_recover(admitted_launches(), "admitted_launches");
-    debug_assert!(
-        !launches.contains_key(&agent_id),
-        "register_launch_stop admits one live launch per agent_id"
-    );
-    // `live` only: a pending anchor reservation is not a running session and
-    // never counts toward the cap (see `ContinuationRegistry`).
-    let continuations = lock_recover(continuation_sessions(), "continuation_sessions")
-        .live
-        .len();
-    let verdict = evaluate_load_guard(continuations + launches.len(), &|| reading.clone());
-    if let Some(reason) = launch_deferral_reason(&verdict) {
-        return Err(reason);
+    let reading = load_reading();
+    // Charged with the continuations admitted and not yet running, exactly as
+    // the continuation guard charges them, so a continuation burst in flight
+    // also bounds launches. A launch takes no projected-cost unit itself: its
+    // run task spans the whole agent run, so a unit held there would charge a
+    // RUNNING session twice (once in the readings, once here). Residual,
+    // stated: a burst of LAUNCHES alone is bounded only by the readings.
+    let pending = lock_recover(continuation_sessions(), "continuation_sessions").reserved_spawns;
+    let (projected, shadowed) = reading.projected(pending);
+    crate::resource_guard::note_admission_shadowed_lane(shadowed.as_ref());
+    match launch_deferral_reason(&projected) {
+        Some(reason) => Err(reason),
+        None => Ok(()),
     }
-    let token = NEXT_ADMITTED_LAUNCH_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    launches.insert(agent_id, token);
-    Ok(AdmittedLaunchSlot { agent_id, token })
 }
 
-/// [`evaluate_continuation_guard`] with the thread verdict taken LIVE from
-/// [`crate::resource_guard::thread_pressure`].
+/// [`evaluate_continuation_guard`] with the load reading taken LIVE through
+/// [`crate::resource_guard::AdmissionReading::live`] — both lanes' readings
+/// from [`crate::resource_guard::lane_verdicts`] (the same read the spawn
+/// seam's [`crate::resource_guard::probe_for_spawn`] composes) plus the
+/// projected per-session cost.
 ///
 /// The split exists so the guard itself stays pure over its inputs (the property
 /// its own doc claims and its unit tests rely on): a test injects a closure
@@ -3364,22 +3589,123 @@ fn admit_launch(
 /// call site — [`run_gate_continuation_inner`]'s step 1 — takes this wrapper and
 /// pays the reading.
 ///
-/// The function itself is passed, NOT called: `&crate::resource_guard::thread_pressure`
-/// coerces the `fn` item to the guard's `&dyn Fn() -> SpawnGate` parameter, so
-/// the reading happens inside the guard, after the dedup arm — the whole point
-/// of the lazy parameter. Writing `&thread_pressure()` here would restore the
-/// eager evaluation and nothing would fail to compile.
+/// The function itself is passed, NOT called: `&AdmissionReading::live`
+/// coerces the `fn` item to the guard's `&dyn Fn() -> AdmissionReading`
+/// parameter, so the reading happens inside the guard, after the dedup arm —
+/// the whole point of the lazy parameter.
 ///
-/// `thread_pressure()` short-circuits on a disabled session guard before touching
-/// the sensor, and the reading behind it is memoized for
-/// [`crate::health_monitor::THREAD_READING_TTL`] — so a machine owner who turned
-/// the guard off pays nothing here, and a burst that reaches the sensor pays for
-/// one snapshot between them.
+/// `lane_verdicts()` short-circuits on a disabled session guard before touching
+/// either sensor, and the thread reading behind it is memoized for
+/// [`crate::health_monitor::THREAD_READING_TTL`].
 fn evaluate_continuation_guard_live(
     anchor_key: Option<&str>,
     is_live: &dyn Fn(&str) -> bool,
 ) -> (ContinuationGuard, AnchorReservation) {
-    evaluate_continuation_guard(anchor_key, is_live, &crate::resource_guard::thread_pressure)
+    evaluate_continuation_guard(
+        anchor_key,
+        is_live,
+        &crate::resource_guard::AdmissionReading::live,
+    )
+}
+
+/// The `/health` `spawnAdmission` block: what unattended admission would decide
+/// RIGHT NOW, and from which readings — so "why was this continuation
+/// deferred?" is answerable from data on the box, not only from the stamp a
+/// deferral left on coord.
+///
+/// Read through [`crate::resource_guard::lane_verdicts`], the SAME read
+/// [`crate::resource_guard::probe_for_spawn`] gates on, so the route and the gate
+/// cannot compute different verdicts. It writes no shadowed-lane log, so a
+/// polled route costs nothing beyond the (memoized) readings.
+pub(crate) fn spawn_admission_health_json() -> serde_json::Value {
+    let lanes = crate::resource_guard::lane_verdicts();
+    let (live, reserved) = {
+        let registry = lock_recover(continuation_sessions(), "continuation_sessions");
+        (registry.live.len(), registry.reserved_spawns)
+    };
+    spawn_admission_json(
+        lanes.as_ref(),
+        live,
+        reserved,
+        crate::resource_guard::ProjectedSpawnCost::live(),
+    )
+}
+
+/// The severity word of a lane verdict, `"proceed"` when nothing tripped.
+fn verdict_word(gate: &crate::resource_guard::SpawnGate) -> &'static str {
+    gate.tripped()
+        .map(|(severity, _)| severity)
+        .unwrap_or("proceed")
+}
+
+/// PURE builder behind [`spawn_admission_health_json`].
+///
+/// `lanes: None` is a DISABLED session guard: no reading was taken, so every
+/// reading renders `null` and `enabled` says why — never a confident `0`
+/// [policy: `unknown-must-not-render-as-a-default`]. An unreadable sensor inside
+/// an enabled guard is `null` on its own field and `proceed` on its verdict,
+/// which is exactly the fail-open verdict the gate applies.
+///
+/// `verdict` / `deferStamp` are the PROJECTED composed verdict — the readings
+/// with `reserved_spawns` admitted, not-yet-running continuations charged at
+/// `cost` — so the route says what the next admission would decide, exactly as
+/// [`evaluate_continuation_guard`] would. The per-lane `verdict`s stay the
+/// raw readings' own.
+fn spawn_admission_json(
+    lanes: Option<&crate::resource_guard::LaneVerdicts>,
+    live_continuations: usize,
+    reserved_spawns: usize,
+    cost: crate::resource_guard::ProjectedSpawnCost,
+) -> serde_json::Value {
+    let Some(lanes) = lanes else {
+        return serde_json::json!({
+            "enabled": false,
+            "verdict": "proceed",
+            "deferStamp": null,
+            "memory": null,
+            "threads": null,
+            "liveContinuations": live_continuations,
+            "reservedSpawns": reserved_spawns,
+            "countCap": "retired",
+        });
+    };
+    let composed = crate::resource_guard::projected_verdict(Some(lanes), reserved_spawns, cost);
+    let defer_stamp = composed
+        .tripped()
+        .map(|(severity, observation)| load_pressure_stamp_reason(severity, observation));
+    serde_json::json!({
+        "enabled": true,
+        "verdict": verdict_word(&composed),
+        // The `continuation-deferred` reason the pre-check would stamp now.
+        "deferStamp": defer_stamp,
+        "memory": {
+            "lane": lanes.memory_lane,
+            "metric": crate::resource_guard::LaneMetric::FreeCommitBytes.wire_name(),
+            "freeCommitBytes": lanes.free_commit_bytes,
+            "freePhysBytes": lanes.free_phys_bytes,
+            "warnFloorBytes": lanes.warn_free_commit_bytes,
+            "criticalFloorBytes": lanes.critical_free_commit_bytes,
+            "verdict": verdict_word(&lanes.memory),
+        },
+        // The GRADED reading (raw minus the idle blocking pool) the lane
+        // judged, `null` only when the OS thread table could not be read —
+        // UNKNOWN, which fails open to `proceed` exactly as the gate does. The
+        // raw census is `threadCensus` on this same route.
+        "threads": {
+            "metric": crate::resource_guard::LaneMetric::ThreadCount.wire_name(),
+            "gradedThreads": lanes.threads.graded,
+            "warnCeiling": lanes.threads.warn_ceiling,
+            "criticalCeiling": lanes.threads.critical_ceiling,
+            "verdict": verdict_word(&lanes.threads.verdict),
+        },
+        // Registered continuation sessions (P3's population) — reported, never
+        // an admission input since the count cap was retired.
+        "liveContinuations": live_continuations,
+        // Admitted, not-yet-registered continuations, charged against the
+        // readings as projected cost (`verdict` above already includes them).
+        "reservedSpawns": reserved_spawns,
+        "countCap": "retired",
+    })
 }
 
 /// Insert a live continuation row for a caller that holds NO reservation. The
@@ -3463,7 +3789,7 @@ fn release_anchor_reservation(held: Option<(&str, AnchorReservationToken)>) {
 /// give the permit back under ONE lock acquisition, so the anchor is never
 /// held by neither) and [`Self::release`] (the headless arm spawned; that path
 /// never registers, so the anchor goes back the moment the child exists —
-/// headless sessions are outside P3/P4).
+/// headless sessions are outside the P3 live registry).
 ///
 /// **`pub(crate)` for one reason only: to be CARRIED.** The account-migration
 /// hop takes a permit in [`take_continuation_registration`] and hands it to
@@ -3480,12 +3806,20 @@ pub(crate) struct AnchorReservation {
     /// ownership. `None` holds nothing: an anchor-less continuation, or an
     /// evaluation that took no permit.
     held: Option<(String, AnchorReservationToken)>,
+    /// Whether this permit holds one [`ContinuationRegistry::reserved_spawns`]
+    /// unit, given back exactly once when the permit settles. Set only by
+    /// [`evaluate_continuation_guard`] on `Proceed`, in the critical section
+    /// that increments the count.
+    counted: bool,
 }
 
 impl AnchorReservation {
     /// A permit over nothing — holds no anchor, releases nothing on drop.
     fn none() -> Self {
-        Self { held: None }
+        Self {
+            held: None,
+            counted: false,
+        }
     }
 
     /// Take custody of the `pending_anchors` entry the caller just inserted
@@ -3496,6 +3830,7 @@ impl AnchorReservation {
     fn owning(anchor_key: String, token: AnchorReservationToken) -> Self {
         Self {
             held: Some((anchor_key, token)),
+            counted: false,
         }
     }
 
@@ -3514,6 +3849,7 @@ impl AnchorReservation {
         // Taken out of `self` so this fn settles the entry and the drop below
         // is a no-op: one removal, not two.
         let held = self.held.take();
+        let counted = std::mem::take(&mut self.counted);
         let anchor_key = held.as_ref().map(|(anchor, _)| anchor.clone());
         let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
         registry.insert_live(terminal_id, anchor_key, gate_id);
@@ -3523,11 +3859,31 @@ impl AnchorReservation {
             // this path cannot drift away from the drop path.
             registry.release_owned(&anchor, token);
         }
+        // The projected cost becomes a live row in the SAME acquisition, so no
+        // concurrent guard sees the unit and the row both, or neither (what
+        // the readings show of the new session is another matter — see
+        // `ContinuationRegistry::reserved_spawns`'s residual).
+        if counted {
+            registry.reserved_spawns = registry.reserved_spawns.saturating_sub(1);
+        }
     }
 }
 
 impl Drop for AnchorReservation {
     fn drop(&mut self) {
+        if std::mem::take(&mut self.counted) {
+            // One acquisition for both halves; `release_anchor_reservation`
+            // would lock a second time, so the anchor is settled here directly.
+            // Saturating, and deliberately not asserted: a Drop must not panic
+            // on this path, and a registry reset under a live permit (the
+            // tests' `clear_continuation_registry`) is legitimate.
+            let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
+            registry.reserved_spawns = registry.reserved_spawns.saturating_sub(1);
+            if let Some((anchor, token)) = self.held.as_ref() {
+                registry.release_owned(anchor, *token);
+            }
+            return;
+        }
         release_anchor_reservation(
             self.held
                 .as_ref()
@@ -3546,7 +3902,7 @@ impl Drop for AnchorReservation {
 ///
 /// Drops the exited terminal from the live continuation registry and — only if
 /// it WAS a registered continuation session — kicks an immediate
-/// [`poll_pending_continuations`] so a previously-deferred (`AtCap`) continuation
+/// [`poll_pending_continuations`] so a previously-deferred (load-pressure) continuation
 /// drains promptly into the freed slot instead of waiting for an unrelated WS
 /// reconnect.
 ///
@@ -3567,13 +3923,30 @@ impl Drop for AnchorReservation {
 /// so a direct `tokio::spawn` here would panic ("there is no reactor running").
 /// `None` (no runtime was current at install — headless/unit-test) → the poll is
 /// skipped and the periodic backstop / WS-reconnect catch-up covers it.
+///
+/// `exit` is what the PTY waiter saw ([`crate::terminal::session::PaneExitFacts`]);
+/// `None` (a caller without it) falls back to the live `TerminalManager`'s
+/// record of the pane, and to `exit=unknown` when the pane is gone.
 pub(crate) fn notify_continuation_terminal_exit(
     terminal_id: &str,
     rt_handle: Option<&tokio::runtime::Handle>,
+    exit: Option<crate::terminal::session::PaneExitFacts>,
 ) {
     let Some(session) = deregister_exited_continuation(terminal_id) else {
         return;
     };
+    let (exit, exited_at) = match exit {
+        Some(f) => (Some(f), None),
+        None => match pane_exit_facts(terminal_id) {
+            Some((f, at)) => (Some(f), Some(at)),
+            None => (None, None),
+        },
+    };
+    let detail = work_unreported_detail(
+        exit,
+        session_lifetime(session.registered_at, exited_at),
+        terminal_id,
+    );
     let Some(device_id) = load_local_device_id() else {
         return;
     };
@@ -3589,10 +3962,10 @@ pub(crate) fn notify_continuation_terminal_exit(
          kicking capacity-freed pending-continuations poll"
     );
     // Two independent tasks, deliberately. The capacity-freed re-poll exists to
-    // drain a deferred (`AtCap`) continuation PROMPTLY; putting a 5s-timeout
+    // drain a load-deferred continuation PROMPTLY; putting a 5s-timeout
     // network POST in front of it would tax that latency for an unrelated
     // concern, and an aborted outcome task would take the polls with it.
-    spawn_work_unreported_fallback(handle, session.gate_id, device_id, terminal_id);
+    spawn_work_unreported_fallback(handle, session.gate_id, device_id, terminal_id, detail);
     handle.spawn(async move {
         poll_pending_continuations(device_id).await;
         poll_pending_unit_dispatches(device_id).await;
@@ -3612,14 +3985,122 @@ fn spawn_work_unreported_fallback(
     gate_id: Option<uuid::Uuid>,
     device_id: uuid::Uuid,
     terminal_id: &str,
+    detail: String,
 ) {
     let Some(gate_id) = gate_id else {
         return;
     };
     let terminal_id = terminal_id.to_string();
     handle.spawn(async move {
-        post_work_unreported_fallback(gate_id, device_id, &terminal_id).await;
+        post_work_unreported_fallback(gate_id, device_id, &terminal_id, detail).await;
     });
+}
+
+/// How a continuation session that STARTED ended — the `exit=` class of the
+/// `work_unreported` detail coord classifies (plan
+/// `2026-10-01-a-lost-gate-continuation-is-never-re-delivered`, D2). Coord
+/// re-delivers ONLY [`WorkExit::Crashed`]; the wire tokens are a contract with
+/// `continuation_spawn_retry::classify_work_exit` and must not be renamed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkExit {
+    /// The process ended on its own with a failing code.
+    Crashed,
+    /// The process ended on its own with code 0 (`/exit`, including the
+    /// drained runner's graceful exit of a `finished` session).
+    Clean,
+    /// A killing teardown was requested first: an operator close, a shutdown.
+    Closed,
+    /// Nothing is known: no exit facts, or no recorded code.
+    Unknown,
+}
+
+impl WorkExit {
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Crashed => "crashed",
+            Self::Clean => "clean",
+            Self::Closed => "closed",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Classify the waiter's facts. A requested close wins over the code — a
+    /// killed child exits non-zero, and reading that as a crash would re-deliver
+    /// work its operator (or its runner's shutdown and durable restore) ended
+    /// on purpose. The close verdict is the waiter's own
+    /// (`mark_exited_was_runner_initiated`). `pane_io` reports the process's
+    /// real exit status (a signal death reads as 1 on unix, with no signal
+    /// attribution), so exit 130 — the conventional interrupted-by-user status
+    /// — is read as a deliberate end. A misread costs a retry, never a double.
+    fn classify(exit: Option<crate::terminal::session::PaneExitFacts>) -> Self {
+        match exit {
+            None => Self::Unknown,
+            Some(f) if f.close_requested => Self::Closed,
+            Some(f) => match f.code {
+                Some(0) => Self::Clean,
+                Some(130) => Self::Closed,
+                Some(_) => Self::Crashed,
+                None => Self::Unknown,
+            },
+        }
+    }
+}
+
+/// The one-line `work_unreported` detail:
+/// `exit=<class> code=<n|none> after=<secs>s terminal=<id>`. Single-line and
+/// short by construction (coord keeps the first line, cut at 200 chars), with
+/// the class FIRST because coord's classifier reads only the leading token.
+fn work_unreported_detail(
+    exit: Option<crate::terminal::session::PaneExitFacts>,
+    lifetime: std::time::Duration,
+    terminal_id: &str,
+) -> String {
+    let code = exit
+        .and_then(|f| f.code)
+        .map_or_else(|| "none".to_string(), |c| c.to_string());
+    format!(
+        "exit={} code={code} after={}s terminal={terminal_id}",
+        WorkExit::classify(exit).wire(),
+        lifetime.as_secs()
+    )
+}
+
+/// The live `TerminalManager`'s exit facts for `terminal_id`, or `None` when
+/// there is no manager (headless / unit tests) or the pane is gone. The
+/// reaper's evidence: it can deregister a session BEFORE that session's own
+/// exit hook runs (the waiter clears `is_alive` first), and coord admits only
+/// ONE `spawned → work_*` write, so the reaper must classify from the same
+/// facts the hook would have rather than post `unknown` over a crash.
+///
+/// Returns the waiter's FROZEN snapshot (facts + exit instant), so a tab the
+/// operator closed after the crash still reads as the crash it was. A pane the
+/// manager no longer holds reads `None` → `exit=unknown`, which is never
+/// re-delivered: the conservative direction, reachable only when the session
+/// had no exit hook (its coord registration failed) AND its tab was closed
+/// before the reaper ran.
+fn pane_exit_facts(
+    terminal_id: &str,
+) -> Option<(crate::terminal::session::PaneExitFacts, std::time::Instant)> {
+    use std::sync::Arc;
+    let app = crate::tauri_app_handle::current()?;
+    let manager = tauri::Manager::try_state::<Arc<crate::terminal::TerminalManager>>(&app)?
+        .inner()
+        .clone();
+    manager
+        .get(terminal_id)
+        .and_then(|sess| sess.exit_snapshot())
+}
+
+/// The session's lifetime: registration to the recorded exit instant when
+/// there is one (the reaper can run hours after the exit — review round 1 #6),
+/// else registration to now (the hook runs at the exit).
+fn session_lifetime(
+    registered_at: std::time::Instant,
+    exited_at: Option<std::time::Instant>,
+) -> std::time::Duration {
+    exited_at
+        .map(|at| at.saturating_duration_since(registered_at))
+        .unwrap_or_else(|| registered_at.elapsed())
 }
 
 /// The runner-side FALLBACK producer: the continuation's PTY exited and nothing
@@ -3637,14 +4118,16 @@ async fn post_work_unreported_fallback(
     gate_id: uuid::Uuid,
     device_id: uuid::Uuid,
     terminal_id: &str,
+    detail: String,
 ) {
-    // Bare marker, no detail: the persisted value is what the
-    // `consumed_continuation_no_work` smell reads, and "the session said
-    // nothing" has nothing to add.
+    // The detail is [`work_unreported_detail`]'s one line — HOW the session
+    // ended, which is what lets coord re-deliver a crash and leave a deliberate
+    // end alone. Coord persists `work_unreported: <detail>`.
     match post_continuation_outcome(
         gate_id,
         device_id,
         ContinuationOutcome::WorkUnreported,
+        Some(detail),
         None,
     )
     .await
@@ -3908,9 +4391,9 @@ fn continuation_backstop_poll_secs() -> u64 {
 /// polls coord for pending continuations and unit dispatches
 /// **unconditionally**.
 ///
-/// It used to poll only after at least one `AtCap` deferral this process
+/// It used to poll only after at least one load deferral this process
 /// lifetime (the deleted `at_cap_deferral_happened` arming flag) — but that
-/// gate meant a WS frame lost while connected, with no AtCap deferral and no
+/// gate meant a WS frame lost while connected, with no load deferral and no
 /// terminal exit, stranded a continuation until the next reconnect. The tick
 /// is two cheap authenticated GETs against coord; paying them every interval
 /// buys at-least-once delivery for the whole class.
@@ -4042,7 +4525,10 @@ fn focus_existing_continuation(terminal_id: &str) {
 /// - [`ConsumeTarget::None`] — legacy coord (neither id): spawn once, no ack.
 #[derive(Debug, Clone, Copy)]
 enum ConsumeTarget {
-    Gate(uuid::Uuid),
+    /// A gate continuation: the gate id and the re-delivery attempt this run
+    /// claimed (0 = first delivery), so its release tombstones only its own
+    /// claim.
+    Gate(uuid::Uuid, u32),
     Dispatch(uuid::Uuid),
     None,
 }
@@ -4053,7 +4539,7 @@ enum ConsumeTarget {
 /// payload carrying a `gate_id` the whole dispatch is one async task that:
 ///
 /// 1. **Agent-registry authorization** (`agent-spawn-authorization`), then
-///    **fast-path dedupe**: [`claim_gate_dispatch`]
+///    **fast-path dedupe**: [`claim_gate_dispatch_attempt`]
 ///    against the in-process set — a duplicate delivery (same `gate_id`) is
 ///    dropped here so a continuation delivered by both transports never even
 ///    starts a second task. This is the in-process guard; the network claim
@@ -4138,7 +4624,7 @@ async fn dispatch_gate_continuation(
             reason
         );
         // Stamp a NON-CONSUMING reason so coord can see WHY the row is sitting
-        // pending, exactly as the `at_cap` / `duplicate_anchor` guards do. The
+        // pending, exactly as the load-pressure / `duplicate_anchor` guards do. The
         // row stays pending and re-listable (no consume claim is taken), but
         // without this stamp coord sees a pending row with a null reason — the
         // shape that stranded 51 continuations for two days.
@@ -4166,26 +4652,54 @@ async fn dispatch_gate_continuation(
         // Fast-path dedupe: drop an in-process duplicate before any claim.
         // (The agent-registry check above is the one I/O that precedes it — it
         // must, so a refused dispatch never claims anything.)
-        if !claim_gate_dispatch(gate_id) {
+        let attempt = payload.retry_attempt();
+        if payload.retry.is_some() && attempt == 0 {
+            warn!(
+                "agent_runtime: gate-continuation gate_id={gate_id} carries a coord `retry` \
+                 annotation with no readable attempt — treated as attempt 0; on a device that \
+                 already ran this gate the re-delivery will be dropped as a duplicate"
+            );
+        }
+        if !claim_gate_dispatch_attempt(gate_id, attempt) {
+            if attempt > 0 {
+                info!(
+                    "agent_runtime: gate-continuation gate_id={gate_id} re-delivery attempt \
+                     {attempt} already dispatched in this process; skipping duplicate"
+                );
+            }
             debug!(
-                "agent_runtime: gate-continuation gate_id={gate_id} already dispatched; \
-                 skipping duplicate"
+                "agent_runtime: gate-continuation gate_id={gate_id} attempt={attempt} already \
+                 dispatched; skipping duplicate"
             );
             return DispatchOutcome::AlreadyDispatched;
+        }
+        if let Some(retry) = payload.retry.as_ref() {
+            info!(
+                "agent_runtime: gate-continuation gate_id={gate_id} is coord RE-DELIVERY attempt \
+                 {}/{} ({} family, class {}); prior outcome {:?}",
+                retry.attempt, retry.max_attempts, retry.family, retry.class, retry.prior_outcome
+            );
         }
         // One task owns the whole claim → spawn → outcome handshake. The #469
         // local guards run FIRST inside `run_gate_continuation_inner`, then the
         // consume-CLAIM is awaited (contract item 4: claim only after the local
         // cap passes), then spawn-or-skip, then the outcome POST.
         tokio::spawn(async move {
-            if let Err(e) =
-                run_gate_continuation_inner(payload, device_id, ConsumeTarget::Gate(gate_id)).await
+            if let Err(e) = run_gate_continuation_inner(
+                payload,
+                device_id,
+                ConsumeTarget::Gate(gate_id, attempt),
+            )
+            .await
             {
                 error!("agent_runtime: run_gate_continuation (gate_id={gate_id}) failed: {e:#}");
-                // An errored run is no longer in-flight and posted no successful
-                // consume outcome path we can rely on — release the in-process
-                // claim so a re-listed row can retry (see release_gate_dispatch).
-                release_gate_dispatch(gate_id);
+                // An errored run is no longer in-flight. Release its in-process
+                // claim: this re-opens the attempt ONLY when coord never
+                // accepted the claim (`SpawnDespiteClaimError` — the row may
+                // still be pending and re-listed). A run whose claim coord
+                // accepted was SEALED in `settle_claim_decision`, so this is a
+                // no-op for it; coord's re-drive arrives as a newer attempt.
+                release_gate_dispatch_attempt(gate_id, attempt);
             }
         });
         DispatchOutcome::Dispatched
@@ -4648,6 +5162,7 @@ async fn post_continuation_outcome(
     device_id: uuid::Uuid,
     outcome: ContinuationOutcome,
     detail: Option<String>,
+    claude_code_session_id: Option<String>,
 ) -> OutcomeAck {
     let Some(base) = connected_coord_base() else {
         return OutcomeAck::NoVerdict;
@@ -4658,8 +5173,9 @@ async fn post_continuation_outcome(
         return OutcomeAck::NoVerdict;
     };
     let token = outcome.wire();
-    let body = ContinuationConsumedBody::outcome(device_id, outcome, detail);
-    // coord-tenant-scope(device): ContinuationConsumedBody::outcome(device_id, ..) (:2438); same device-keyed route, no session id anywhere in scope.
+    let body =
+        ContinuationConsumedBody::outcome(device_id, outcome, detail, claude_code_session_id);
+    // coord-tenant-scope(device): ContinuationConsumedBody::outcome(device_id, ..); same device-keyed route — coord resolves the gate row from the path gate_id plus the verified claiming device, and the optional claude_code_session_id is a value it STAMPS onto that row, never a key it scopes or looks up by.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
@@ -4673,6 +5189,27 @@ async fn post_continuation_outcome(
                 "agent_runtime: continuation-outcome posted gate_id={gate_id} \
                  outcome={token} ack={ack:?}"
             );
+            if let Some(sent) = body.claude_code_session_id.as_deref() {
+                match classify_session_binding(&text) {
+                    SessionBinding::Bound(verdict) => debug!(
+                        "agent_runtime: continuation-outcome gate_id={gate_id} \
+                         claude_code_session_id={sent} binding={verdict}"
+                    ),
+                    SessionBinding::NotBound(verdict) => warn!(
+                        "agent_runtime: continuation-outcome gate_id={gate_id} \
+                         claude_code_session_id={sent} NOT bound by coord: \
+                         claude_code_session_binding={verdict:?}"
+                    ),
+                    // `info`, not `warn`: until coord's binding field ships
+                    // (coord #2743) every post lands here, and that is expected.
+                    SessionBinding::Unreported => info!(
+                        "agent_runtime: continuation-outcome gate_id={gate_id} \
+                         claude_code_session_id={sent} — coord's 200 carried no \
+                         claude_code_session_binding; binding UNKNOWN (a coord predating \
+                         the field ignores it)"
+                    ),
+                }
+            }
             ack
         }
         Ok(resp) => {
@@ -4690,6 +5227,34 @@ async fn post_continuation_outcome(
             );
             OutcomeAck::NoVerdict
         }
+    }
+}
+
+/// What coord said it did with a `claude_code_session_id` the runner sent on an
+/// outcome post — its `claude_code_session_binding` response field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionBinding {
+    /// `bound` / `already_bound`: the placeholder row carries the id.
+    Bound(String),
+    /// Any other verdict coord named (`no_placeholder`, `device_mismatch`,
+    /// `claim_arm`, …) — the id did NOT land.
+    NotBound(String),
+    /// No such field (or not a string): coord did not say. UNKNOWN, never bound.
+    Unreported,
+}
+
+/// Pure over coord's 200 body so every arm is unit-testable without coord.
+fn classify_session_binding(body: &str) -> SessionBinding {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return SessionBinding::Unreported;
+    };
+    match v
+        .get("claude_code_session_binding")
+        .and_then(|b| b.as_str())
+    {
+        Some(b @ ("bound" | "already_bound")) => SessionBinding::Bound(b.to_string()),
+        Some(other) => SessionBinding::NotBound(other.to_string()),
+        None => SessionBinding::Unreported,
     }
 }
 
@@ -4733,9 +5298,11 @@ async fn post_spawn_outcome(
     device_id: uuid::Uuid,
     outcome: ContinuationOutcome,
     detail: Option<String>,
+    // The pinned Claude session uuid — `Some` only on a `Spawned` outcome.
+    claude_code_session_id: Option<String>,
 ) {
     if let OutcomeAck::Superseded(standing) =
-        post_continuation_outcome(gate_id, device_id, outcome, detail).await
+        post_continuation_outcome(gate_id, device_id, outcome, detail, claude_code_session_id).await
     {
         warn!(
             "agent_runtime: continuation-outcome gate_id={gate_id} REFUSED — posted {} but \
@@ -4747,7 +5314,7 @@ async fn post_spawn_outcome(
 
 /// Minimum interval between deferred-stamp posts for the SAME gate id. The
 /// backstop re-lists a deferred row every ~300s; without this limit a 2-day
-/// AtCap stall would post ~576 stamps per gate.
+/// load stall would post ~576 stamps per gate.
 const CONTINUATION_DEFERRED_STAMP_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// Per-gate last-posted times for the deferred stamp (in-process rate limit).
@@ -4823,6 +5390,39 @@ fn thread_pressure_stamp_reason(
         "thread_pressure:{severity}:{}_over_{}",
         observation.observed, observation.limit
     )
+}
+
+/// The `reason` a memory-pressure deferral stamps:
+/// `commit_pressure:<severity>:<observed>_under_<limit>`, both in BYTES of free
+/// commit (`MemAvailable` off Windows). `_under_` rather than the thread stamp's
+/// `_over_`: free memory trips by falling BELOW its floor, and the stamp reads in
+/// the direction of the comparison.
+fn commit_pressure_stamp_reason(
+    severity: &str,
+    observation: &crate::resource_guard::GateObservation,
+) -> String {
+    format!(
+        "commit_pressure:{severity}:{}_under_{}",
+        observation.observed, observation.limit
+    )
+}
+
+/// The stamp for a load deferral, lane-correct: the thread lane keeps
+/// [`thread_pressure_stamp_reason`] (a wire class coord and the web already
+/// group on), the memory lane stamps [`commit_pressure_stamp_reason`]. The lane
+/// is read off the observation's METRIC, never re-derived from the severity.
+fn load_pressure_stamp_reason(
+    severity: &str,
+    observation: &crate::resource_guard::GateObservation,
+) -> String {
+    match observation.metric {
+        crate::resource_guard::LaneMetric::ThreadCount => {
+            thread_pressure_stamp_reason(severity, observation)
+        }
+        crate::resource_guard::LaneMetric::FreeCommitBytes => {
+            commit_pressure_stamp_reason(severity, observation)
+        }
+    }
 }
 
 /// When [`spawn_runtime`] started — the earliest instant a continuation can be
@@ -4958,11 +5558,6 @@ fn spawn_runtime_ready_catch_up(device_id: uuid::Uuid) {
     });
 }
 
-/// The `reason` a concurrency-cap deferral stamps.
-fn at_cap_stamp_reason(cap: usize) -> String {
-    format!("at_cap:{cap}")
-}
-
 /// The `reason` a coord-device-drain deferral stamps: `device_drain:drained` or
 /// `device_drain:unknown` (the `<class>:<detail>` grammar), so coord can tell a
 /// drained runner's pending rows from a registry refusal or a full cap.
@@ -5007,13 +5602,20 @@ fn spawn_authorization_stamp_reason(label: &str) -> String {
 /// |---|---|---|
 /// | `duplicate_anchor:<terminal_id>` \| `duplicate_anchor:reserved` | a live session already owns the anchor \| a permit holder has reserved it (an in-flight dispatch, or a session mid-account-migration) | [`duplicate_anchor_stamp_reason`] |
 /// | `thread_pressure:<severity>:<observed>_over_<limit>` | the machine is out of OS threads (`severity` = `warn` \| `critical`) | [`thread_pressure_stamp_reason`] |
-/// | `at_cap:<cap>` | the continuation concurrency cap | [`at_cap_stamp_reason`] |
+/// | `commit_pressure:<severity>:<observed>_under_<limit>` | the machine is short of free memory (bytes of free commit; `MemAvailable` off Windows) | [`commit_pressure_stamp_reason`] |
+/// | `device_drain:<class>` | coord holds this device drained | [`drain_stamp_reason`] |
 /// | `spawn_authorization_<label>` | the agent registry refused the spawn | [`spawn_authorization_stamp_reason`] |
 ///
-/// The first three follow `<class>:<detail>`; the fourth is delimited by `_` and
-/// predates the grammar — see [`spawn_authorization_stamp_reason`].
+/// All but the last follow `<class>:<detail>`; `spawn_authorization_` is
+/// delimited by `_` and predates the grammar — see
+/// [`spawn_authorization_stamp_reason`].
 ///
-/// This replaces the AtCap arm's old `report_spawn_failed` lifecycle post,
+/// **Retired:** `at_cap:<cap>`, the fixed count cap's stamp, is no longer
+/// written by this build (see [`RETIRED_CONTINUATION_SESSION_CAP_ENV`]). Older
+/// runner builds still write it until rebuilt, and historical rows carry it, so
+/// consumers keep reading it.
+///
+/// This replaces the old cap arm's `report_spawn_failed` lifecycle post,
 /// which polluted the agent-lifecycle channel with fake spawn failures for
 /// rows that were merely deferred. The stamp leaves the gate's continuation
 /// lifecycle untouched (still pending, still re-deliverable) — it only gives
@@ -5161,18 +5763,19 @@ fn first_line(msg: &str) -> String {
 /// It applies verbatim to the thread-pressure deferral, which is why that arm
 /// routes through here rather than growing its own tail.
 ///
-/// `reason` is the machine-matchable stamp string, built by one of the four
-/// constructors above [`post_continuation_deferred`] — never spelled inline.
-/// Three follow `<class>:<detail>` (`duplicate_anchor:<tid>`,
-/// `thread_pressure:<severity>:<observed>_over_<limit>`, `at_cap:<cap>`) and one
-/// predates it (`spawn_authorization_<label>`). Callers log their own
+/// `reason` is the machine-matchable stamp string, built by one of the
+/// constructors in [`post_continuation_deferred`]'s table — never spelled
+/// inline. All follow `<class>:<detail>` (`duplicate_anchor:<tid>`,
+/// `thread_pressure:<severity>:<observed>_over_<limit>`,
+/// `commit_pressure:<severity>:<observed>_under_<limit>`, `device_drain:<class>`)
+/// except `spawn_authorization_<label>`, which predates the grammar. Callers log their own
 /// human-readable line first, at the severity their verdict deserves.
 async fn defer_continuation_unclaimed(
     consume_target: ConsumeTarget,
     device_id: uuid::Uuid,
     reason: String,
 ) {
-    if let ConsumeTarget::Gate(gate_id) = consume_target {
+    if let ConsumeTarget::Gate(gate_id, _) = consume_target {
         if should_post_deferred_stamp(gate_id, std::time::Instant::now()) {
             post_continuation_deferred(gate_id, device_id, reason).await;
         }
@@ -5208,10 +5811,10 @@ fn spawn_gate_continuation_task(payload: GateContinuationPayload, device_id: uui
 /// coord ack handshake selected by `consume_target`:
 ///
 /// 0. `target_device_id` sanity check.
-/// 1. Local guards (anchor_key dedup, machine thread pressure, concurrency cap)
+/// 1. Local guards (anchor_key dedup, then the memory and thread load lanes)
 ///    — run FIRST so a locally-rejected dispatch never burns a coord-side claim
-///    (contract item 4), and so a machine already out of threads never pays a
-///    `git worktree add` before being told to wait.
+///    (contract item 4), and so a machine already short of memory or threads
+///    never pays a `git worktree add` before being told to wait.
 /// 2. **CLAIM** ([`ConsumeTarget::Gate`] only): POST the consume CLAIM and AWAIT
 ///    it. `409 cancelled` → log INFO + SKIP the spawn entirely; network/other
 ///    error → WARN + PROCEED. The work-unit path has no claim-before-spawn (the
@@ -5270,7 +5873,7 @@ async fn run_gate_continuation_inner(
         // Log-only, deliberately NO `continuation-deferred` stamp: that stamp is
         // rate-limited to one per gate per hour (`should_post_deferred_stamp`),
         // so a boot-minute stamp would mask the next real reason (a
-        // `thread_pressure:` or `at_cap:` deferral) for an hour. This condition
+        // `thread_pressure:` or `commit_pressure:` deferral) for an hour. This condition
         // clears in seconds and re-delivers itself. The legacy no-`gate_id`
         // path (`ConsumeTarget::None`) is excluded above: it has no re-delivery,
         // so a deferral there would be a silent drop.
@@ -5285,8 +5888,8 @@ async fn run_gate_continuation_inner(
         return Ok(());
     }
 
-    // Step 1: the local guards (P3 anchor_key dedup + thread pressure + P4
-    // concurrency cap) BEFORE any coord claim or worktree acquire — a dispatch a
+    // Step 1: the local guards (P3 anchor_key dedup + the memory and thread
+    // load lanes) BEFORE any coord claim or worktree acquire — a dispatch a
     // local guard would reject must NOT burn a coord-side claim (contract item
     // 4), and must not leave a directory behind either: `resource_guard`'s
     // `precheck_spawn` gives the same argument for the same placement, since a
@@ -5297,13 +5900,12 @@ async fn run_gate_continuation_inner(
     // `gate_id` dedup (#450, the `dispatched_gate_ids` set, already applied in
     // the dispatcher) collapses a SAME gate delivered twice; this catches the
     // residual cases it can't — a re-cleared gate (new `gate_id`, same
-    // `anchor_key`), a machine out of OS threads, and the count cap. The first
-    // and last are evaluated against sessions that are STILL running; liveness
-    // is tested against the `TerminalManager`, and with no Tauri runtime the
-    // registry is empty so those two lanes are a no-op (the unit-test /
-    // headless-only context). The thread lane needs no registry at all — it
-    // reads the process — so it is the one guard here that still has an opinion
-    // in a headless context.
+    // `anchor_key`), and a machine short of memory or OS threads. The dedup is
+    // evaluated against sessions that are STILL running; liveness is tested
+    // against the `TerminalManager`, and with no Tauri runtime the registry is
+    // empty so that lane is a no-op (the unit-test / headless-only context). The
+    // load lanes need no registry at all — they read the machine and the
+    // process — so they still have an opinion in a headless context.
     //
     // A `Proceed` leaves the anchor RESERVED in the registry (Phase 4 of plan
     // `2026-09-13-one-landed-pr-dispatches-its-follow-up-to-two-sessions-through-two-gate-anchors`):
@@ -5362,17 +5964,21 @@ async fn run_gate_continuation_inner(
             .await;
             return Ok(());
         }
-        ContinuationGuard::ThreadPressure {
+        ContinuationGuard::LoadPressure {
             severity,
             observation,
         } => {
-            // The machine is out of THREADS, not out of slots. The deferred
+            // The machine is short of memory or threads. The deferred
             // continuation stays pending on coord and the periodic backstop poll
             // (`spawn_continuation_backstop_poll`, always armed) re-fetches it
             // within one interval — plus the capacity-freed exit hook fires the
             // moment a live continuation's PTY exits, which is also the moment
-            // its ~3 threads go back to the pool. So this deferral self-heals on
-            // exactly the event that relieves the pressure.
+            // its memory and threads go back. So this deferral self-heals on
+            // exactly the event that relieves the pressure. A deferral caused
+            // only by PROJECTED cost (admitted continuations not yet running,
+            // `ContinuationRegistry::reserved_spawns`) has no such event: the
+            // units settle when those sessions register, which triggers no
+            // re-poll, so it waits for the backstop interval.
             //
             // Both the WARN and the CRITICAL verdict land here, unlike
             // `resource_guard::admit_spawn`, which refuses only at CRITICAL —
@@ -5380,35 +5986,20 @@ async fn run_gate_continuation_inner(
             // gets back-pressured a band earlier than a human's own terminal.
             warn!(
                 "agent_runtime: gate-continuation deferred under machine load: {} \
-                 — re-delivered when threads free up (anchor_key={:?})",
+                 — re-delivered by the next poll (anchor_key={:?})",
                 observation.clause(severity),
                 payload.anchor_key
             );
-            // The stamp reason names the REAL numbers, in the same
-            // `<class>:<detail>` shape as `at_cap:` / `duplicate_anchor:` so
-            // coord-side grouping still works:
-            // `thread_pressure:warn:300_over_256` (256/400 are the shipped
-            // ceilings, so a warn stamp can only ever name 256; a reading past
-            // 400 stamps `critical` and names 400).
+            // The stamp reason names the lane and the REAL numbers, in the
+            // `<class>:<detail>` shape coord-side grouping keys on:
+            // `thread_pressure:warn:300_over_256` or
+            // `commit_pressure:warn:<free>_under_<floor>`.
             defer_continuation_unclaimed(
                 consume_target,
                 device_id,
-                thread_pressure_stamp_reason(severity, &observation),
+                load_pressure_stamp_reason(severity, &observation),
             )
             .await;
-            return Ok(());
-        }
-        ContinuationGuard::AtCap(cap) => {
-            // The deferred continuation stays pending on coord; the periodic
-            // backstop poll (`spawn_continuation_backstop_poll`, always armed)
-            // re-fetches it within one interval even if the capacity-freed
-            // exit-hook trigger is missed — no per-process arming flag needed.
-            warn!(
-                "agent_runtime: gate-continuation refused: deferred: continuation cap ({cap}) \
-                 reached — re-delivered when a slot frees (anchor_key={:?})",
-                payload.anchor_key
-            );
-            defer_continuation_unclaimed(consume_target, device_id, at_cap_stamp_reason(cap)).await;
             return Ok(());
         }
     }
@@ -5427,7 +6018,7 @@ async fn run_gate_continuation_inner(
     // Both read the same TTL cache, so the second check costs no round-trip.
     // On refusal: release the in-process claim and post NO lifecycle
     // spawn-failure — an authorization refusal is a standing decision, not a
-    // spawn fault, and the `at_cap` precedent above is explicit that fake
+    // spawn fault, and the load-deferral precedent above is explicit that fake
     // spawn failures pollute the lifecycle channel.
     let authz = crate::agent_authorization::authorize_spawn(
         None,
@@ -5437,7 +6028,7 @@ async fn run_gate_continuation_inner(
     .await;
     if let Some(class) = authz.drain_class() {
         // Coord's device drain (plan `2026-09-13-drained-runner-never-reaches-idle`):
-        // the same leave-pending deferral as `AtCap` — the backstop poll
+        // the same leave-pending deferral as a load deferral — the backstop poll
         // re-delivers the row once the drain lifts.
         warn!(
             "agent_runtime: gate-continuation deferred: {} (anchor_key={:?})",
@@ -5465,7 +6056,7 @@ async fn run_gate_continuation_inner(
     // AFTER the #469 guards pass and AWAITED — its result decides whether to
     // spawn. This closes the poll→cancel→spawn race: if a cancel landed between
     // the poll and now, coord returns 409 cancelled and we skip the spawn.
-    if let ConsumeTarget::Gate(gate_id) = consume_target {
+    if let ConsumeTarget::Gate(gate_id, _) = consume_target {
         // ONE wiring statement. Every per-decision behaviour — which skip
         // releases the local claim, which decision proceeds, and what each
         // logs — lives in `settle_claim_decision`, which the unit test drives
@@ -5505,22 +6096,46 @@ async fn run_gate_continuation_inner(
         .map(|a| format!("gate-continuation:{a}"))
         .unwrap_or_else(|| "gate-continuation".to_string());
 
-    // Phase 1b (plan 2026-06-06-session-scoped-multi-repo-workspace-coordination):
-    // thread a stable per-session UUID discriminator so the worktree claims
-    // are session-keyed in the owner token (machine:session). The
-    // gate-continuation wire payload carries NO Claude session uuid (only
-    // `LaunchPayload` does); the next-best stable id is one DETERMINISTICALLY
-    // derived from the continuation's identity so a retry of the SAME gate
-    // continuation reuses the same owner token (a re-acquire renews rather
-    // than collides). We derive it from `(target_device_id, anchor_key)` via
-    // a UUIDv5 in the URL namespace; when `anchor_key` is absent we fall back
-    // to a fresh v4 (a one-shot continuation with no stable anchor).
-    let continuation_session_id = continuation_session_id(&payload);
+    // The Claude session id this continuation will run under, minted HERE —
+    // after the consume claim and before the worktree allocate — and pinned on
+    // both presentations (`--session-id`). Plan
+    // `2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state`
+    // Phase 4.
+    //
+    // It is also the allocate's `agent_session_id`, which keys the worktree
+    // claims' owner token (`machine:session`, plan
+    // 2026-06-06-session-scoped-multi-repo-workspace-coordination Phase 1b) AND
+    // binds the allocated `agent_worktrees` rows to the session that actually
+    // works in them. This replaced a UUIDv5 synthesized from
+    // `(device, anchor_key)`. That id was stable across retries so a re-acquire
+    // could renew its claim, but it named no session: coord stamped it on the
+    // rows and minted an `agent_sessions` row for it, an attribution that joined
+    // nothing. The renewal it bought is moot. Every allocate mints a fresh
+    // agent_id, the per-directory worktree claim is keyed on that agent's own
+    // path, and the anchor guard above never lets two same-anchor continuations
+    // run at once.
+    //
+    // Minted after the claim on purpose: a skipped or deferred claim mints
+    // nothing, and an acquire failure binds nothing. Accepted gap: a spawn
+    // failure (or a headless child that does not exit cleanly) AFTER a
+    // successful acquire leaves the runner's own allocation naming an id that
+    // never ran a session — the allocate already carried it. The outcome post
+    // and the dispatch-allocation report below do NOT bind it in that case.
+    // The same holds for a terminal start that needed a local never-started
+    // retry: the retry runs under a fresh id (see [`run_continuation_terminal`]),
+    // which the outcome and the report bind, while the runner's own allocation
+    // keeps naming the first attempt's id.
+    //
+    // One fresh id per dispatch, because the CLI refuses to reuse one. That
+    // also gives a coord RE-DELIVERY (`retry.attempt > 0`) its own claim
+    // discriminator, so closing the crashed attempt's still-open tab cannot
+    // release a claim the re-delivered session holds.
+    let pinned_session_id = uuid::Uuid::new_v4();
 
     let (workdir, ctx, agent_id) = match acquire_continuation_workdir(
         &payload.repos,
         &intent,
-        continuation_session_id,
+        Some(pinned_session_id),
     )
     .await
     {
@@ -5531,7 +6146,7 @@ async fn run_gate_continuation_inner(
             // outcome so coord doesn't show a perpetually-pending continuation.
             // The work-unit path does NOT ack on failure — leaving the dispatch
             // un-consumed re-lists it on the next reconnect (at-least-once).
-            if let ConsumeTarget::Gate(gate_id) = consume_target {
+            if let ConsumeTarget::Gate(gate_id, _) = consume_target {
                 post_spawn_outcome(
                     gate_id,
                     device_id,
@@ -5539,6 +6154,7 @@ async fn run_gate_continuation_inner(
                     Some(first_line(&continuation_acquire_failure_detail(
                         &e.to_string(),
                     ))),
+                    None,
                 )
                 .await;
             }
@@ -5548,13 +6164,36 @@ async fn run_gate_continuation_inner(
 
     // Step 3 (dispatch) + Step 4 (outcome): dispatch on presentation, then POST
     // the honest outcome sourced from the REAL spawn result. The presentation
-    // fns return `Ok(())` once the terminal/subprocess is actually created and
+    // fns return `Ok(_)` once the terminal/subprocess is actually created and
     // running (`spawned`) and `Err(_)` on a spawn failure (`spawn_failed`).
-    let result = match payload.presentation {
+    // `result` carries, on `Ok`, the session id worth BINDING on coord's
+    // placeholder row: `Some(<the id that started>)` for a live session — the
+    // pinned id, or a terminal never-started retry's fresh id — `None` for
+    // a headless child that did not exit cleanly (not bound). The mapping is
+    // the pure [`presentation_bindable_session`].
+    //
+    // `exited_terminal` is the terminal arm's other `Ok` fact: a session that
+    // STARTED and had already exited by its start verdict, whose exit path is
+    // fired below only after `spawned` is posted.
+    let mut exited_terminal: Option<String> = None;
+    let result: anyhow::Result<Option<uuid::Uuid>> = match payload.presentation {
         Presentation::Terminal => {
             info!("agent_runtime: gate-continuation presentation=terminal agent_id={agent_id}");
-            run_continuation_terminal(agent_id, &workdir, &payload, device_id, ctx, reservation)
-                .await
+            let res = run_continuation_terminal(
+                agent_id,
+                &workdir,
+                &payload,
+                device_id,
+                ctx,
+                reservation,
+                pinned_session_id,
+            )
+            .await;
+            let res = res.map(|start| {
+                exited_terminal = start.exited_terminal;
+                start.session_id
+            });
+            presentation_bindable_session(PresentationResult::Terminal(res), pinned_session_id)
         }
         Presentation::Headless => {
             info!("agent_runtime: gate-continuation presentation=headless agent_id={agent_id}");
@@ -5567,33 +6206,55 @@ async fn run_gate_continuation_inner(
             // rides on the PROMPT — byte-for-byte how coord itself delivers a
             // registrant's `hint` (appended to `initial_prompt` after a blank
             // line), so the two halves of one brief arrive the same way.
-            let headless_prompt = compose_continuation_headless_prompt(
-                &payload.initial_prompt,
-                payload.brief.as_ref(),
+            let headless_prompt = append_sibling_notes(
+                compose_continuation_headless_prompt(
+                    &payload.initial_prompt,
+                    payload.brief.as_ref(),
+                ),
+                ctx.as_ref().map_or(&[][..], |c| c.sibling_notes.as_slice()),
             );
-            let res =
-                run_continuation_headless(agent_id, &workdir, &headless_prompt, reservation).await;
+            // Known lag, accepted: the headless fn returns only after the child
+            // EXITS, so on this presentation the `spawned` outcome — and the
+            // session id with it — reaches coord at exit rather than at spawn.
+            // Headless continuations are rare and the binding is still correct,
+            // just late; when `spawned` is posted is deliberately unchanged.
+            let res = run_continuation_headless(
+                agent_id,
+                &workdir,
+                &headless_prompt,
+                reservation,
+                pinned_session_id,
+            )
+            .await;
             drop(ctx);
-            res.map(|()| None)
+            presentation_bindable_session(PresentationResult::Headless(res), pinned_session_id)
         }
     };
 
+    // coord's own dispatch-time allocation for this continuation (its
+    // `dispatch_source` rows) learns the session too. The runner's allocation
+    // above was already bound at allocate time. Same rule as the outcome's
+    // id binding: only a BINDABLE session is reported — a headless child that
+    // did not exit cleanly is not bound.
+    if let Some(session) = bindable_session(&result) {
+        if let Some(dispatch_agent) = continuation_dispatch_allocation(&payload, agent_id) {
+            tokio::spawn(report_session_launched(dispatch_agent, session));
+        }
+    }
+
     // Step 4: ack (best-effort) from the actual result, per consume target.
     match consume_target {
-        ConsumeTarget::Gate(gate_id) => match &result {
-            Ok(_) => {
-                post_spawn_outcome(gate_id, device_id, ContinuationOutcome::Spawned, None).await
-            }
-            Err(e) => {
-                post_spawn_outcome(
-                    gate_id,
-                    device_id,
-                    ContinuationOutcome::SpawnFailed,
-                    Some(first_line(&e.to_string())),
-                )
-                .await
-            }
-        },
+        ConsumeTarget::Gate(gate_id, _) => {
+            let resolution = spawn_resolution_outcome(&result);
+            post_spawn_outcome(
+                gate_id,
+                device_id,
+                resolution.outcome,
+                resolution.detail,
+                resolution.claude_code_session_id,
+            )
+            .await
+        }
         // Work-unit dispatch: a single idempotent consume ack, ONLY on success.
         // A failed spawn is deliberately left un-consumed so coord re-lists the
         // dispatch on the next reconnect (at-least-once).
@@ -5615,13 +6276,92 @@ async fn run_gate_continuation_inner(
     // coord takes `spawned → work_unreported` but refuses `spawned` over a
     // `work_unreported` that raced ahead of it. The exit path deregisters the
     // entry and posts the fallback, which a session's own report outranks.
-    if let Ok(Some(exited_terminal_id)) = &result {
+    if let Some(exited_terminal_id) = &exited_terminal {
         notify_continuation_terminal_exit(
             exited_terminal_id,
             tokio::runtime::Handle::try_current().ok().as_ref(),
+            None,
         );
     }
-    result.map(|_| ())
+    result.map(|_bindable_session| ())
+}
+
+/// The Step-4 outcome post a presentation result maps to: which token, which
+/// detail, and which pinned Claude session id rides along.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpawnResolution {
+    outcome: ContinuationOutcome,
+    detail: Option<String>,
+    claude_code_session_id: Option<String>,
+}
+
+/// Pure map from the presentation result to the Step-4 outcome post. `Ok` is
+/// `spawned` carrying the bindable session id (if any); `Err` is `spawn_failed`
+/// with the first error line and never an id.
+fn spawn_resolution_outcome(result: &anyhow::Result<Option<uuid::Uuid>>) -> SpawnResolution {
+    match result {
+        Ok(_) => SpawnResolution {
+            outcome: ContinuationOutcome::Spawned,
+            detail: None,
+            claude_code_session_id: bindable_session(result).map(|id| id.to_string()),
+        },
+        Err(e) => SpawnResolution {
+            outcome: ContinuationOutcome::SpawnFailed,
+            detail: Some(first_line(&e.to_string())),
+            claude_code_session_id: None,
+        },
+    }
+}
+
+/// What a presentation fn returned, before it is reduced to a bindable id.
+enum PresentationResult {
+    /// `Ok` carries the session id the terminal STARTED under (see
+    /// [`TerminalStart::session_id`]).
+    Terminal(anyhow::Result<uuid::Uuid>),
+    Headless(anyhow::Result<HeadlessExit>),
+}
+
+/// Step 3's pure reduction: a presentation result plus the id pinned for it
+/// (the same id the worktree allocate carried) → the session id coord may
+/// bind. Terminal `Ok` binds the id that STARTED (the pinned id unless a
+/// never-started retry minted a fresh one); headless binds the pinned id only
+/// on a clean exit; any `Err` passes through as a spawn failure.
+fn presentation_bindable_session(
+    result: PresentationResult,
+    pinned_session_id: uuid::Uuid,
+) -> anyhow::Result<Option<uuid::Uuid>> {
+    match result {
+        PresentationResult::Terminal(r) => r.map(Some),
+        PresentationResult::Headless(r) => {
+            r.map(|exit| headless_bindable_session(exit, pinned_session_id))
+        }
+    }
+}
+
+/// The session id a presentation result lets coord BIND (both the `spawned`
+/// outcome's `claude_code_session_id` and the dispatch-allocation session
+/// report): `Some` only for a live/clean session, never for a failed spawn or a
+/// headless child that exited non-zero.
+fn bindable_session(result: &anyhow::Result<Option<uuid::Uuid>>) -> Option<uuid::Uuid> {
+    result.as_ref().ok().copied().flatten()
+}
+
+/// How a headless continuation child ended, as far as binding its session goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadlessExit {
+    /// Exit code 0 — a session that ran; its pinned id is bindable.
+    Clean,
+    /// A non-zero exit — the child did not exit cleanly; it still counts as
+    /// `spawned`, but its id is NOT bound on coord.
+    NonZero,
+}
+
+/// The session id the `spawned` outcome may bind for a headless child.
+fn headless_bindable_session(exit: HeadlessExit, pinned: uuid::Uuid) -> Option<uuid::Uuid> {
+    match exit {
+        HeadlessExit::Clean => Some(pinned),
+        HeadlessExit::NonZero => None,
+    }
 }
 
 /// Zone ceiling for a continuation page before it is considered "full".
@@ -5695,6 +6435,9 @@ pub(crate) fn pick_continuation_page(
 pub(crate) fn build_continuation_claude_command(
     claude_bin: String,
     pinned_session_id: &str,
+    // The display name for `claude --name` (the same string the tab is titled
+    // with). `None` ⇒ no `--name`, today's argv. Sanitised by the launch seam.
+    session_name: Option<&str>,
     add_dir_args: Vec<String>,
     prompt: String,
     // The system-prompt carrier: the composed `--append-system-prompt-file`
@@ -5758,6 +6501,7 @@ pub(crate) fn build_continuation_claude_command(
     let spec = LaunchSpec {
         permission: PermissionMode::DangerouslySkip,
         session_id: Some(pinned_session_id.to_string()),
+        name: session_name.map(str::to_string),
         extra_required,
         ..Default::default()
     };
@@ -5784,13 +6528,11 @@ pub(crate) fn build_continuation_claude_command(
 /// [`await_continuation_start`] — a created PTY is not a started session);
 /// `spawn-failed` on ANY failure along the way (no Tauri app handle, missing
 /// managed state, window/session creation error, or a session that never
-/// started in [`CONTINUATION_START_MAX_ATTEMPTS`] attempts). `Ok(())` therefore
-/// means "started", which is what the caller's `spawned` outcome claims.
-///
-/// `Ok(Some(terminal_id))` is a session that started and had ALREADY exited by
-/// its verdict: the caller fires the exit path for it once `spawned` is posted
-/// (see the tail of [`run_gate_continuation_inner`]). `Ok(None)` is a session
-/// still running and registered.
+/// started in [`CONTINUATION_START_MAX_ATTEMPTS`] attempts). `Ok(_)` therefore
+/// means "started", which is what the caller's `spawned` outcome claims; the
+/// [`TerminalStart`] names the session id that started and, when it had
+/// ALREADY exited by its verdict, the terminal whose exit path the caller fires
+/// once `spawned` is posted (see the tail of [`run_gate_continuation_inner`]).
 async fn run_continuation_terminal(
     agent_id: uuid::Uuid,
     workdir: &str,
@@ -5806,7 +6548,12 @@ async fn run_continuation_terminal(
     // drops it, which releases the anchor; the `Ok` arm hands it to the
     // registry once the live entry exists.
     reservation: AnchorReservation,
-) -> anyhow::Result<Option<String>> {
+    // The Claude session id to pin on the FIRST start attempt, minted by the
+    // caller before the worktree allocate so the allocation is bound to it (see
+    // `run_gate_continuation_inner`). A never-started retry pins a fresh id
+    // instead; the id that actually started is returned.
+    pinned_session_id: uuid::Uuid,
+) -> anyhow::Result<TerminalStart> {
     use std::sync::Arc;
 
     // The one place the overloaded `gate_id` slot is disambiguated for this
@@ -5863,10 +6610,16 @@ async fn run_continuation_terminal(
     // to the operator and would otherwise require a reassignment step.
 
     // Title: prefer the anchor_key, else a generic gate-continuation label.
-    let title = payload
-        .anchor_key
-        .clone()
-        .unwrap_or_else(|| "Gate continuation".to_string());
+    let spawn_name = payload
+        .session_name
+        .as_deref()
+        .and_then(crate::claude_session::launch_spec::sanitize_session_name);
+    let title = spawn_name.clone().unwrap_or_else(|| {
+        payload
+            .anchor_key
+            .clone()
+            .unwrap_or_else(|| "Gate continuation".to_string())
+    });
 
     // Resolve `claude` to an ABSOLUTE launchable path, same as the
     // condition-check terminal and for the same reason: this spawns via the
@@ -5956,17 +6709,15 @@ async fn run_continuation_terminal(
     // once.
     let mut ctx = ctx;
     let mut attempt: u32 = 1;
-    // Count this continuation toward the P4 cap for the whole start window:
-    // it is not in the live registry until its verdict, and a burst of
-    // dispatches must not all read the same low live count while theirs are
-    // still starting. Released when this fn returns (a started session is by
-    // then registered, so the overlap only ever over-counts).
-    let _starting = StartingContinuationSlot::acquire();
     loop {
         // Pre-pin the Claude session id (#548 Phase 1): the registry records
         // synchronously at spawn instead of mtime-guessing from transcripts.
-        // Fresh uuid per spawn attempt — never reused (CLI fails loudly on reuse).
-        let pinned_session_id = uuid::Uuid::new_v4().to_string();
+        // Attempt 1 runs under the caller's id — the one the worktree allocate
+        // carried. A never-started retry gets a fresh id: the dead pane stays
+        // visible under the old one and its coord session row was just closed,
+        // so the id is never reused (the CLI also refuses a reused id).
+        let attempt_session_id = continuation_attempt_session_id(attempt, pinned_session_id);
+        let pinned_session_id = attempt_session_id.to_string();
 
         // Durable lifecycle capture: this backend path never fires the frontend
         // `terminal_session_record_open`, so without a hint a restart loses the
@@ -5997,6 +6748,7 @@ async fn run_continuation_terminal(
             config_dir: selected_config_dir.clone(),
             working_dir: workdir.to_string(),
             title: title.clone(),
+            spawn_name: spawn_name.clone(),
             page_id: Some(target_page.clone()),
             // Matches the `--session-id` in the spawn argv → synchronous record.
             claude_session_id: Some(pinned_session_id.clone()),
@@ -6044,6 +6796,9 @@ async fn run_continuation_terminal(
             .map(|s| crate::mcp::types::runner_api_port(s.inner()));
         let coord_mcp =
             crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
+        // What `<workdir>/.claude/` serves, for the briefing's `[served-corpus: …]`
+        // header line. Bounded, off the runtime worker, fail-soft to UNKNOWN.
+        let served = crate::served_corpus::probe_async(workdir).await;
 
         // The argv, built HERE rather than beside `launch_cfg` above: the briefing
         // it carries gates its memory clause on `coord_mcp`, which the call
@@ -6061,9 +6816,16 @@ async fn run_continuation_terminal(
         // `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`), and
         // stays inline otherwise.
         let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
-            compose_continuation_system_prompt(
-                crate::terminal::runner_context(crate::terminal::spawn_seam_api_port(), coord_mcp),
-                payload.brief.as_ref(),
+            append_sibling_notes(
+                compose_continuation_system_prompt(
+                    crate::terminal::runner_context(
+                        crate::terminal::spawn_seam_api_port(),
+                        coord_mcp,
+                        &served,
+                    ),
+                    payload.brief.as_ref(),
+                ),
+                ctx.as_ref().map_or(&[][..], |c| c.sibling_notes.as_slice()),
             ),
         ));
         // The marker the policy hook's route trusts as proof of delivery — taken
@@ -6072,6 +6834,7 @@ async fn run_continuation_terminal(
         let argv = build_continuation_claude_command(
             claude_bin.clone(),
             &pinned_session_id,
+            spawn_name.as_deref(),
             add_dir_args.clone(),
             payload.initial_prompt.clone(),
             prompt_carrier,
@@ -6216,7 +6979,7 @@ async fn run_continuation_terminal(
             }
             ContinuationStart::Started { pty_alive } => {
                 // Register in the live continuation-session registry so P3 (dedup by
-                // anchor_key) and P4 (concurrency cap) see this session as live until
+                // anchor_key) sees this session as live until
                 // its PTY exits (reaped lazily by the guard's liveness prune).
                 // `reportable_gate` (not `payload.gate_id`) so the PTY-exit fallback
                 // never posts an outcome against a work-unit `dispatch_id`.
@@ -6253,39 +7016,37 @@ async fn run_continuation_terminal(
                 emit_terminal_focus_request(&app, &terminal_id);
                 report_spawn_complete(agent_id, None, Some("gate continuation (terminal)"), None)
                     .await;
-                return Ok(exited.then_some(terminal_id));
+                return Ok(TerminalStart {
+                    session_id: attempt_session_id,
+                    exited_terminal: exited.then_some(terminal_id),
+                });
             }
         }
     }
 }
 
-/// Process-wide count of terminal continuations inside their start window —
-/// counted toward the P4 cap beside the live registry (see
-/// [`StartingContinuationSlot`]).
-static STARTING_CONTINUATIONS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Number of terminal continuations currently inside their start window.
-fn starting_continuation_count() -> usize {
-    STARTING_CONTINUATIONS.load(std::sync::atomic::Ordering::SeqCst)
-}
-
-/// RAII hold on one [`STARTING_CONTINUATIONS`] slot: taken before the first
-/// PTY of a continuation is created, released on every return of
-/// [`run_continuation_terminal`] (and on panic, by drop).
-struct StartingContinuationSlot;
-
-impl StartingContinuationSlot {
-    fn acquire() -> Self {
-        STARTING_CONTINUATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self
+/// The Claude session id a terminal continuation's start `attempt` (1-based)
+/// runs under: the caller's pinned id on attempt 1, a fresh one on every
+/// never-started retry.
+fn continuation_attempt_session_id(attempt: u32, pinned: uuid::Uuid) -> uuid::Uuid {
+    if attempt <= 1 {
+        pinned
+    } else {
+        uuid::Uuid::new_v4()
     }
 }
 
-impl Drop for StartingContinuationSlot {
-    fn drop(&mut self) {
-        STARTING_CONTINUATIONS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
+/// What a terminal continuation that STARTED reports back to its caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalStart {
+    /// The Claude session id the started attempt runs under: the caller's
+    /// pinned id when the first attempt started, a fresh one after a
+    /// never-started retry. This is the id coord may bind.
+    session_id: uuid::Uuid,
+    /// `Some(terminal_id)` for a session that started and had ALREADY exited by
+    /// its verdict: the caller fires the exit path for it once `spawned` is
+    /// posted. `None` is a session still running and registered.
+    exited_terminal: Option<String>,
 }
 
 /// How many times a gate-continuation terminal is created before a session that
@@ -6479,6 +7240,25 @@ fn never_started_detail(evidence: &NeverStartedEvidence) -> String {
     }
 }
 
+/// The condition-check reading of a start verdict: `None` when the session
+/// started (it owns its own report from here), else the `spawn_failed` reason.
+///
+/// Both non-start arms are reported, unlike the gate path's retry: a closed
+/// pane with no transcript is also a session that will never post the run's
+/// report, so leaving the row `running` would be the same silence.
+fn condition_check_never_started_reason(start: &ContinuationStart) -> Option<String> {
+    match start {
+        ContinuationStart::Started { .. } => None,
+        ContinuationStart::Closed => {
+            Some("condition-check pane was closed before the session started".to_string())
+        }
+        ContinuationStart::NeverStarted(evidence) => Some(format!(
+            "condition-check never started: {}",
+            never_started_detail(evidence)
+        )),
+    }
+}
+
 /// The PTY-seam twin of [`classify_spawn_error`]: the terminal spawn surfaces
 /// hand back a `String`, so the trust gate's refusal is recognised by its
 /// [`crate::claude_session::trust_gate::SPAWN_BLOCKED_REFUSAL_PREFIX`] rather
@@ -6654,7 +7434,9 @@ fn is_simple_uuid_char(c: &char) -> bool {
 /// The token is SINGLE-SHOT — coord clears it on this UPDATE. That is safe here
 /// and only here: every call site is a path on which the session definitively
 /// did not spawn, so there is no agent left that could have wanted to report.
-/// Never call this after a successful `create_tracked_terminal_session_backend`.
+/// Never call this after a successful `create_tracked_terminal_session_backend`
+/// UNLESS the start verdict ([`await_continuation_start`]) ruled the session
+/// never started — then, too, no agent is left that could report.
 async fn report_condition_run_failed(payload: &ConditionCheckPayload, summary: String) {
     let Some(base) = connected_coord_base() else {
         return;
@@ -6943,7 +7725,13 @@ async fn run_condition_check_terminal(
 
     // Title from a short run-id prefix: "Condition check <8 chars>".
     let run_id_short: String = payload.run_id.chars().take(8).collect();
-    let title = format!("Condition check {run_id_short}");
+    // `check-<condition name>` when coord supplies one, else the run-id label.
+    let spawn_name = payload.condition_name.as_deref().and_then(|n| {
+        crate::claude_session::launch_spec::sanitize_session_name(&format!("check-{n}"))
+    });
+    let title = spawn_name
+        .clone()
+        .unwrap_or_else(|| format!("Condition check {run_id_short}"));
 
     // A condition check does not edit code, so no worktree isolation — run from
     // QONTINUI_ROOT. We intentionally do NOT provision `.mcp.json`/fleet commands
@@ -6999,6 +7787,7 @@ async fn run_condition_check_terminal(
         crate::terminal::runner_context(
             crate::terminal::spawn_seam_api_port(),
             crate::coord_mcp::CoordMcpDelivery::Unknown,
+            &crate::served_corpus::probe_async(workdir.as_str()).await,
         ),
     ));
     // Carried to the child env by the capture hint below; from the SAME
@@ -7007,6 +7796,7 @@ async fn run_condition_check_terminal(
     let argv = build_continuation_claude_command(
         claude_bin,
         &pinned_session_id,
+        spawn_name.as_deref(),
         Vec::new(),
         payload.initial_prompt.clone(),
         prompt_carrier,
@@ -7046,10 +7836,15 @@ async fn run_condition_check_terminal(
         uuid::Uuid::new_v4().to_string()
     });
 
+    // Kept for the start verdict below: the transcript probe looks in the
+    // selected account's config dir first.
+    let transcript_paths =
+        continuation_transcript_paths(selected_config_dir.as_deref(), &workdir, &pinned_session_id);
     let capture_hint = crate::commands::terminal::SessionCaptureHint {
         config_dir: selected_config_dir,
         working_dir: workdir.clone(),
         title: title.clone(),
+        spawn_name: spawn_name.clone(),
         page_id: Some(target_page.clone()),
         // Matches the `--session-id` in the spawn argv → synchronous record.
         claude_session_id: Some(pinned_session_id.clone()),
@@ -7102,7 +7897,40 @@ async fn run_condition_check_terminal(
             // Surface it: switch the main view to the Terminal panel + select the
             // tab (scoped to the MAIN window, same as the gate path).
             emit_terminal_focus_request(&app, &terminal_id);
-            Ok(())
+            // A CREATED pty is not a STARTED session (the 2026-10-01 incident the
+            // gate path's start verdict exists for: `exec: claude: not found`,
+            // pty gone in 73 ms). A condition check that never started has no
+            // agent that could ever post its report, so without this its
+            // `coord.condition_runs` row stays `running`. Same verdict as the
+            // gate path; no local retry — a terminal `error` row is what lets
+            // coord's scheduler dispatch the group again on its next pass.
+            let started =
+                await_continuation_start(&terminal_manager, &terminal_id, &transcript_paths).await;
+            match condition_check_never_started_reason(&started) {
+                None => Ok(()),
+                Some(reason) => {
+                    // A pane that died within ~100 ms can exit before its coord
+                    // session id was set, so its exit hook never closed the
+                    // coord row. Close it here (idempotent if the hook did).
+                    if let Some(coord_id) = coord_session_id {
+                        if let Err(e) = session_registry.close_by_id(coord_id) {
+                            debug!(
+                                "agent_runtime: never-started condition-check coord session \
+                                 {coord_id} close: {e}"
+                            );
+                        }
+                    }
+                    warn!(
+                        "agent_runtime: condition-check run_id={} terminal_id={terminal_id}: \
+                         {reason}",
+                        payload.run_id
+                    );
+                    // Safe to spend the single-shot report token: no session
+                    // started, so nothing is left that could have wanted it.
+                    report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
+                    Err(anyhow::anyhow!(reason))
+                }
+            }
         }
         Err(e) => {
             // Same classification as the gate-continuation terminal: a
@@ -7127,39 +7955,10 @@ async fn run_condition_check_terminal(
 ///   coord-allocated agent_id (parsed to a UUID; a fresh UUID if coord returned
 ///   a non-UUID id, used only for lifecycle correlation).
 /// - Worktree mode OFF / acquire declined / `repos` empty → the cwd
-///   [`continuation_fallback_workdir`] picks (the workspace root when the
-///   repo's verified checkout is under it, else that checkout), `None`
-///   context, and a fresh correlation UUID; `Err` with a
-///   `workdir_not_a_checkout` detail when the repo has no verified checkout on
-///   this device.
-/// Derive a stable per-session UUID discriminator for a gate continuation's
-/// worktree claims (Phase 1b, plan
-/// 2026-06-06-session-scoped-multi-repo-workspace-coordination).
-///
-/// The gate-continuation wire payload ([`GateContinuationPayload`]) carries
-/// NO Claude session uuid (unlike [`LaunchPayload::agent_session_id`]), so
-/// there is no upstream id to thread. We synthesize one that is STABLE
-/// across retries of the same continuation: a UUIDv5 over
-/// `"<target_device_id>:<anchor_key>"` in the URL namespace. Two spawns of
-/// the same gate continuation (same device, same anchor) therefore produce
-/// the same owner-token discriminator, so a re-acquire RENEWS the existing
-/// worktree claim instead of colliding with it. When `anchor_key` is absent
-/// (a one-shot continuation with no stable anchor) we fall back to a fresh
-/// v4 — distinctness is preserved, only cross-retry renewal is lost, which
-/// is acceptable for an anchor-less one-shot.
-fn continuation_session_id(payload: &GateContinuationPayload) -> Option<uuid::Uuid> {
-    match payload.anchor_key.as_deref() {
-        Some(anchor) if !anchor.is_empty() => {
-            let name = format!("{}:{anchor}", payload.target_device_id);
-            Some(uuid::Uuid::new_v5(
-                &uuid::Uuid::NAMESPACE_URL,
-                name.as_bytes(),
-            ))
-        }
-        _ => Some(uuid::Uuid::new_v4()),
-    }
-}
-
+///   [`continuation_fallback_workdir`] picks (see its doc for the per-owner
+///   order and its `workdir_not_a_checkout` / `no_isolated_worktree`
+///   refusals), `None` context, and a fresh correlation UUID.
+/// - `Err` also when acquire succeeds but returns no worktrees.
 async fn acquire_continuation_workdir(
     repos: &[String],
     intent: &str,
@@ -7180,13 +7979,19 @@ async fn acquire_continuation_workdir(
             declared_overlap_paths: None,
             plan_id: None,
             phase: None,
-            // Phase 1b: session-keyed worktree claims for the continuation —
-            // see `continuation_session_id` for how this stable id is derived.
+            // Phase 1b: session-keyed worktree claims for the continuation. The
+            // id is the continuation's pinned Claude session (see
+            // `run_gate_continuation_inner`), so the rows coord writes name it.
             agent_session_id,
             // A gate continuation is coord-spawned: no spawn picker chose a
             // tenant, and its session id resolves its own.
             spawn_tenant: None,
             shared_branch: crate::agent_worktree::SharedBranchPolicy::Honor,
+            // A coord gate continuation's payload carries no edit siblings yet
+            // (plan 2026-10-10-a-session-cannot-declare-the-sibling-it-will-edit-so-the-store-override-hides-its-edits,
+            // "Not done here"); such a session uses the mid-session
+            // `POST /agent-worktrees/edit-sibling` door.
+            edit_siblings: &[],
         })
         .await;
         let ctx = match settle_continuation_acquire(acquired) {
@@ -7414,15 +8219,21 @@ fn headless_continuation_bound_port(resolve: impl FnOnce() -> Option<u16>) -> Op
 /// subprocess flow), posting `spawn-complete` on first successful spawn and
 /// `spawn-failed` on a non-zero / failed exit. Mirrors the agent-spawn path's
 /// lifecycle posts so a continuation is observable on coord the same way.
+///
+/// `Ok` says how the child ended ([`HeadlessExit`]) so the caller binds the
+/// pinned session id on coord only for a child that exited cleanly.
 async fn run_continuation_headless(
     agent_id: uuid::Uuid,
     workdir: &str,
     initial_prompt: &str,
     // The anchor reservation the guard left behind. This path never registers
-    // in the continuation registry (headless sessions are outside P3/P4), so
+    // in the continuation registry (headless sessions are outside the P3 live registry), so
     // it is released the moment the child exists; a spawn `Err` drops it.
     reservation: AnchorReservation,
-) -> anyhow::Result<()> {
+    // The Claude session id to pin (`--session-id`), minted by the caller
+    // before the worktree allocate. See `run_gate_continuation_inner`.
+    pinned_session_id: uuid::Uuid,
+) -> anyhow::Result<HeadlessExit> {
     let log_path = agent_log_path(agent_id);
     // Select the most-available account once before spawning (pins the resolved
     // config dir that `spawn_claude_child` reads). spawn_blocking: the selector
@@ -7447,12 +8258,22 @@ async fn run_continuation_headless(
     let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
     // No per-spawn pin here: a gate continuation carries no account field —
     // the `pick_best_account` call above is the whole selection.
-    match spawn_claude_child(workdir, initial_prompt, None, coord_mcp, &[], false).await {
+    let session_args = pinned_session_args(pinned_session_id);
+    match spawn_claude_child(
+        workdir,
+        initial_prompt,
+        None,
+        coord_mcp,
+        &session_args,
+        false,
+    )
+    .await
+    {
         Ok((mut child, preconditions)) => {
             // The child exists and nothing will register it: give the anchor
             // back now rather than when the subprocess exits, or every later
             // same-anchor dispatch would read `DuplicateAnchor` for its whole
-            // lifetime (headless sessions are not P3/P4 population).
+            // lifetime (headless sessions are not P3 live-registry population).
             reservation.release();
             let pid = child.id().map(|p| p as i64);
             // Exempt this headless child from the session-tracking health
@@ -7479,7 +8300,7 @@ async fn run_continuation_headless(
                         "agent_runtime: gate-continuation agent_id={agent_id} exited cleanly \
                          (code=0)"
                     );
-                    Ok(())
+                    Ok(HeadlessExit::Clean)
                 }
                 Ok(code) => {
                     report_spawn_failed(
@@ -7490,7 +8311,7 @@ async fn run_continuation_headless(
                         None,
                     )
                     .await;
-                    Ok(())
+                    Ok(HeadlessExit::NonZero)
                 }
                 Err(e) => {
                     report_spawn_failed(agent_id, &format!("pump failure: {e}"), None, 0, None)
@@ -7920,6 +8741,7 @@ fn payload_to_allocate_result(
         token_jti: credential.jti, // bookkeeping only; maybe_refresh sends the bearer, not the jti
         token_exp: credential.exp,
         active_claims: Vec::new(), // unread by either daemon
+        sibling_notes: Vec::new(), // coord-delivered payloads carry none
     }
 }
 
@@ -8265,7 +9087,7 @@ async fn run_agent_subprocess(
         };
 
         // Wire the per-agent durability (agent_pusher) + observability (dirty_poller)
-        // daemons onto the SAME refreshing token slot registered in AGENT_TOKENS, so
+        // daemons onto the SAME refreshing token slot in AgentTokenRegistry, so
         // the proxy, heartbeat, pusher, and poller all read one slot (single-slot
         // invariant — agent_token/mod.rs:1). A credential is guaranteed here —
         // Step 0b refused the launch otherwise — so the daemons spawn iff a coord
@@ -8286,25 +9108,7 @@ async fn run_agent_subprocess(
     // headless `claude` can resolve subagents the spawn prompt references
     // (merge-specialist, repo-auditor, ...). Fail-soft: a copy error here must
     // not abort an otherwise-launchable spawn — the agent just lacks subagents.
-    match provision_agent_definitions(&primary_wt) {
-        Ok(report) => capability_manifest::record_provision(&primary_wt, report),
-        Err(e) => {
-            warn!("agent_runtime: agent-def provisioning errored (continuing spawn): {e:#}");
-            // Still a ROW: an errored pass that leaves no record is exactly the
-            // invisible degradation this ledger exists to end.
-            let mut report = ProvisionReport::new(
-                "agent_definitions",
-                0,
-                capability_manifest::Rung::Unresolved,
-            )
-            .with_destination(primary_wt.clone());
-            report.skip(
-                primary_wt.clone(),
-                capability_manifest::SkipReason::WriteFailed(format!("{e:#}")),
-            );
-            capability_manifest::record_provision(&primary_wt, report);
-        }
-    }
+    provision_agent_definitions_recorded(&primary_wt);
     // Bundle /vet-plan and /implement-plan into the spawned worktree cwd so they
     // resolve as project slash commands regardless of the device's ~/.claude.
     crate::fleet_commands::provision_fleet_commands_for_session(&primary_wt);
@@ -8321,6 +9125,11 @@ async fn run_agent_subprocess(
 
     // Step 3: subprocess + restart loop.
     let mut restarts = 0u32;
+    // Which Claude session each attempt runs under, and whether the dispatch's
+    // session has been reported yet (plan
+    // `2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state`
+    // Phase 4).
+    let mut session_pins = SpawnSessionPins::default();
     let mut final_exit_code: Option<i64> = None;
     let mut final_reason: Option<String> = None;
     // The lifecycle phase the terminal `spawn-failed` post reports. `Exited` for
@@ -8348,12 +9157,16 @@ async fn run_agent_subprocess(
             final_reason = Some("stopped by operator before (re)spawn".to_string());
             break;
         }
+        // Pin this attempt's Claude session id so coord can be told which
+        // session the dispatch launched. Minted INSIDE the loop, fresh per
+        // attempt: a restart is a new session, and the CLI refuses a reused id.
+        let session_args = session_pins.next_attempt();
         match spawn_claude_child(
             &primary_wt,
             &payload.initial_prompt,
             pinned_config_dir.as_deref(),
             coord_mcp,
-            &[],
+            &session_args,
             false,
         )
         .await
@@ -8368,6 +9181,14 @@ async fn run_agent_subprocess(
                     crate::session::tracking_health::register_headless_claude_pid(p);
                 }
                 // First successful spawn = post spawn-complete with pid.
+                // The FIRST SUCCESSFUL spawn's session is the dispatch's session,
+                // even when earlier attempts failed to start. coord binds the
+                // earliest report and never rebinds, so later restarts are not
+                // reported. Sent off the spawn path, so the child's stdout pump
+                // is never held behind a coord round trip.
+                if let Some(session) = session_pins.take_first_success() {
+                    tokio::spawn(report_session_launched(payload.agent_id, session));
+                }
                 if restarts == 0 {
                     report_spawn_complete(payload.agent_id, pid, None, primary_push_ref.as_deref())
                         .await;
@@ -8640,6 +9461,51 @@ fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<ProvisionRe
     provision_agent_definitions_from_root(&root, worktree_cwd)
 }
 
+/// Provision the named-subagent defs into `workdir` and RECORD both layers'
+/// session-ledger rows — [`provision_agent_definitions`]'s `agent_definitions`
+/// report here, and the embedded `fleet_agents` floor from inside
+/// [`provision_agent_definitions_from_root`].
+///
+/// Extracted from the spawn path so the capability-manifest provision probe
+/// (`POST /capability-manifest/provision-probe`, plan
+/// `2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports`
+/// Phase 5, Fork B) drives the SAME function the real spawn drives rather than
+/// a copy of it. A second call path that can drift from the real one is the
+/// cost Fork B accepted only on that condition — so there is exactly one body,
+/// and both callers are one line.
+///
+/// Fail-soft, unchanged from the spawn path it came from: an errored pass still
+/// leaves a ROW, because an errored pass that leaves no record is the invisible
+/// degradation the ledger exists to end.
+///
+/// Returns the `agent_definitions` report it recorded -- ONE entry. The embedded
+/// `fleet_agents` floor is recorded from inside
+/// [`provision_agent_definitions_from_root`], which does not hand it back, so it
+/// is observable on the next manifest read rather than in this value. The spawn
+/// path ignores the return entirely.
+pub(crate) fn provision_agent_definitions_recorded(workdir: &str) -> Vec<ProvisionReport> {
+    let report = match provision_agent_definitions(workdir) {
+        Ok(report) => report,
+        Err(e) => {
+            warn!("agent_runtime: agent-def provisioning errored (continuing): {e:#}");
+            let mut report = ProvisionReport::new(
+                "agent_definitions",
+                0,
+                capability_manifest::Rung::Unresolved,
+            )
+            .with_destination(workdir.to_string());
+            report.skip(
+                workdir.to_string(),
+                capability_manifest::SkipReason::WriteFailed(format!("{e:#}")),
+            );
+            report
+        }
+    };
+    let echo = report.clone();
+    capability_manifest::record_provision(workdir, report);
+    vec![echo]
+}
+
 /// Core of [`provision_agent_definitions`] with the qontinui-root passed in
 /// explicitly (so tests can drive it deterministically without mutating the
 /// process-global `QONTINUI_ROOT` env). See that wrapper for full rationale.
@@ -8658,6 +9524,31 @@ fn provision_agent_definitions_from_root(
         .join("agents");
     let dst_dir = Path::new(worktree_cwd).join(".claude").join("agents");
 
+    // TRACKED DESTINATIONS ARE KEPT, in both layers below. Decided ONCE, before
+    // either writes, so the UNKNOWN arm keys on what was on disk before this
+    // pass (see `provision_guard::KeepDecisions`). In a qontinui-claude-config
+    // worktree `.claude/agents/*.md` is tracked content: the floor wrote this
+    // binary's render over it and the overlay wrote the PRIMARY checkout's copy
+    // (a different commit) over it, which left every such worktree dirty and fed
+    // the wip-custody snapshots a stream of junk refs. Same guard, same probe, as
+    // `fleet_commands` and `fleet_skills`.
+    let tracked = crate::provision_guard::TrackedPaths::probe(&dst_dir);
+    let mut candidates = crate::fleet_agents::embedded_agent_names();
+    if let Ok(entries) = std::fs::read_dir(&src_dir) {
+        candidates.extend(
+            entries
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
+                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
+        );
+    }
+    let keep = crate::provision_guard::KeepDecisions::decide(
+        &tracked,
+        &dst_dir,
+        candidates.iter().map(String::as_str),
+    );
+
     // FLOOR FIRST: write the defs bundled into this binary, so a device with no
     // qontinui-claude-config checkout gets a working subagent set instead of
     // none. This is the fleet-portability follow-up this function's docstring
@@ -8666,7 +9557,7 @@ fn provision_agent_definitions_from_root(
     // Deliberately NOT fatal: if the embedded write fails we warn and continue
     // to the checkout overlay, because a checkout present on this device is a
     // complete answer on its own.
-    let embedded_report = match crate::fleet_agents::provision_fleet_agents_into(&dst_dir) {
+    let embedded_report = match crate::fleet_agents::provision_fleet_agents_into(&dst_dir, &keep) {
         Ok(report) => report,
         Err(e) => {
             warn!(
@@ -8749,6 +9640,16 @@ fn provision_agent_definitions_from_root(
         };
         let dst = dst_dir.join(name);
         report.expected += 1;
+        let unit = name.to_string_lossy().into_owned();
+        if let Some(reason) = keep.reason(&unit) {
+            info!(
+                "agent_runtime: keeping {} as it is on disk — {}",
+                dst.display(),
+                reason.describe()
+            );
+            report.skip(unit, reason.clone());
+            continue;
+        }
         // Idempotent: overwrite is fine (std::fs::copy truncates the target).
         if let Err(e) = std::fs::copy(&path, &dst) {
             warn!(
@@ -8953,6 +9854,9 @@ fn pick_autonomous_git_identity(
 pub(crate) fn finalize_headless_child_env(
     cmd: &mut tokio::process::Command,
     coord_mcp: crate::coord_mcp::CoordMcpDelivery,
+    // What the child's `<workdir>/.claude/` serves — measured by the caller,
+    // for the same reason `coord_mcp` is: it needs I/O `runner_context` forbids.
+    served: &crate::served_corpus::ServedCorpus,
 ) {
     // The coord-mcp outcome is the OPPOSITE case to the port below, and both
     // rules point the same way: ship the value only the right frame knows. The
@@ -8974,7 +9878,7 @@ pub(crate) fn finalize_headless_child_env(
     let runner_api_port = crate::terminal::spawn_seam_api_port();
     cmd.env(
         "QONTINUI_RUNNER_CONTEXT",
-        crate::terminal::runner_context(runner_api_port, coord_mcp),
+        crate::terminal::runner_context(runner_api_port, coord_mcp, served),
     );
     cmd.env("QONTINUI_RUNNER_API_PORT", runner_api_port.to_string());
 
@@ -9028,7 +9932,19 @@ pub(crate) async fn spawn_claude_child(
     // signal delivery.
     own_process_group: bool,
 ) -> anyhow::Result<(Child, SpawnPreconditions)> {
-    let bin = claude_bin_path();
+    // A model gateway that cannot be resolved (invalid, or its state unknown)
+    // refuses the spawn outright rather than starting a session that can only
+    // fail — or worse, reach a vendor (`crate::model_gateway`, review H2).
+    if let Some(refusal) = crate::model_gateway::spawn_refusal() {
+        anyhow::bail!(refusal);
+    }
+    // Resolved to an absolute path through the same PATH walk the PTY seams
+    // use, so a failure names the real file. Falls back to the bare name when
+    // nothing resolves; the spawn below retries either way (plan
+    // `2026-10-03-runner-claude-spawn-fails-enoent-during-cli-auto-update`).
+    let bin = spawn_blocking_tracked(|| launchable_or_bare(resolve_claude_bin()))
+        .await
+        .unwrap_or_else(|_| claude_bin_path());
 
     // ONE account resolution, feeding all three consumers below: the
     // precondition verdict, the trust pre-accept, and the `CLAUDE_CONFIG_DIR`
@@ -9153,13 +10069,19 @@ pub(crate) async fn spawn_claude_child(
     // Runner-context marker + API port, then the credential scrub — the LAST
     // env mutations before the spawn. Extracted so the production call site is
     // unit-testable; see the function's doc comment.
-    finalize_headless_child_env(&mut cmd, coord_mcp);
+    let served = crate::served_corpus::probe_async(workdir).await;
+    finalize_headless_child_env(&mut cmd, coord_mcp, &served);
     // `-p` / `--print` means "single-shot prompt mode" for Claude Code
     // CLI; not all versions support stdin-as-prompt cleanly, so we send
     // the prompt over stdin AND close stdin after.
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("spawn `{bin}` in {workdir}: {e}"))?;
+    // A transient launch failure (the CLI mid-reinstall by its own npm
+    // auto-updater) is retried with a bounded back-off before it is reported.
+    // Every headless caller gets that here: the scheduler, the agent loop and
+    // the headless continuation.
+    let mut child =
+        crate::claude_cli_spawn::spawn_tokio_with_retry(&mut cmd, Some(Path::new(workdir)))
+            .await
+            .map_err(|f| anyhow::anyhow!("{}", f.describe(&bin, workdir)))?;
     if let Some(mut stdin) = child.stdin.take() {
         let prompt = initial_prompt.to_string();
         tokio::spawn(async move {
@@ -9352,7 +10274,7 @@ async fn run_heartbeat_loop(payload: LaunchPayload) {
             );
         }
         // Proactively refresh the agent's coord-mcp proxy token (OQ4). The 30s
-        // tick ≪ the 30-min refresh margin, so the per-agent JWT in AGENT_TOKENS
+        // tick ≪ the 30-min refresh margin, so the per-agent registry JWT
         // is renewed well before its 4h TTL — independent of coord-mcp call
         // activity. Coord's /agents/:id/refresh-token rejects an ALREADY-expired
         // token, so a live agent must never let it lapse; the request-path
@@ -9402,6 +10324,120 @@ async fn heartbeat_once(payload: &LaunchPayload) -> anyhow::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The `claude` CLI flags that pin a HEADLESS child's session id, so the
+/// runner knows the id before the child writes anything. The terminal seam
+/// pins the same flag through `build_continuation_claude_command`; this is
+/// the headless twin, passed as `spawn_claude_child`'s `extra_args`. The id
+/// must be fresh for each spawn attempt, because the CLI refuses to reuse one.
+fn pinned_session_args(session_id: uuid::Uuid) -> Vec<String> {
+    vec!["--session-id".to_string(), session_id.to_string()]
+}
+
+/// The Claude session ids of one launch's spawn attempts.
+///
+/// [`Self::next_attempt`] mints a FRESH id for every attempt, because a restart
+/// is a new session and the CLI refuses to reuse an id.
+/// [`Self::take_first_success`] hands back the id of the first attempt that
+/// actually spawned, exactly once. That is the session coord binds the
+/// dispatch to, whether or not earlier attempts failed to start.
+#[derive(Debug, Default)]
+struct SpawnSessionPins {
+    current: Option<uuid::Uuid>,
+    reported: bool,
+}
+
+impl SpawnSessionPins {
+    /// Mint the next attempt's session id and return its `claude` flags.
+    fn next_attempt(&mut self) -> Vec<String> {
+        let id = uuid::Uuid::new_v4();
+        self.current = Some(id);
+        pinned_session_args(id)
+    }
+
+    /// The current attempt's id, the first time a spawn succeeds; `None` after.
+    fn take_first_success(&mut self) -> Option<uuid::Uuid> {
+        if self.reported {
+            return None;
+        }
+        let id = self.current?;
+        self.reported = true;
+        Some(id)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionReportBody {
+    claude_session_id: uuid::Uuid,
+}
+
+/// Tell coord which Claude session this runner launched for `agent_id`.
+///
+/// Plan `2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state`
+/// Phase 4. A coord-dispatched allocation is made before its session exists,
+/// so its `agent_worktrees` rows carry no session. The runner pins the session
+/// id at spawn (`--session-id`) and is the only party that knows it. coord
+/// verifies that the credential speaks for the allocation, records the report,
+/// and binds the rows once the session's own `agent_sessions` row exists on
+/// this device. Nothing is bound on the report alone.
+///
+/// Best-effort, like every lifecycle POST here: the spawn has already
+/// happened, and an undelivered report costs attribution, never work. A
+/// `404`/`405` from a coord that predates the route is debug-level.
+async fn report_session_launched(agent_id: uuid::Uuid, claude_session_id: uuid::Uuid) {
+    let Some(base) = connected_coord_base() else {
+        return;
+    };
+    let Some(client) = crate::coord_http::coord_client() else {
+        return;
+    };
+    let url = format!("{base}/agents/{agent_id}/session");
+    // coord-tenant-scope(session-noop): agent_id is a parameter and sits in the
+    // path; coord resolves the tenant from the allocation's own rows and
+    // verifies the DEFAULT binding's device JWT speaks for that allocation
+    // (`spawn_admission::reporter_owns_allocation`). Like spawn-complete, there
+    // is no tenant for a credential choice to move. Terminal.
+    match crate::auth::attach_device_auth(client.post(&url))
+        .timeout(Duration::from_secs(5))
+        .json(&SessionReportBody { claude_session_id })
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            debug!(
+                "agent_runtime: session report posted agent_id={agent_id} \
+                 claude_session_id={claude_session_id}"
+            );
+        }
+        Ok(resp) if resp.status() == 404 || resp.status() == 405 => {
+            debug!(
+                "agent_runtime: coord has no session-report route yet ({}) for \
+                 agent_id={agent_id}",
+                resp.status()
+            );
+        }
+        Ok(resp) => warn!(
+            "agent_runtime: session report agent_id={agent_id} \
+             claude_session_id={claude_session_id} returned {}",
+            resp.status()
+        ),
+        Err(e) => warn!("agent_runtime: session report agent_id={agent_id} failed: {e:#}"),
+    }
+}
+
+/// The coord-side dispatch allocation a continuation's session should be
+/// reported against: coord's `allocation.agent_id`, unless it is the very
+/// allocation this runner already bound at allocate time (`own_agent_id`).
+fn continuation_dispatch_allocation(
+    payload: &GateContinuationPayload,
+    own_agent_id: uuid::Uuid,
+) -> Option<uuid::Uuid> {
+    payload
+        .allocation
+        .as_ref()
+        .map(|a| a.agent_id)
+        .filter(|id| *id != own_agent_id)
 }
 
 async fn report_spawn_complete(
@@ -9484,6 +10520,12 @@ async fn report_spawn_stalled(
         config_dir_source = %body.preconditions.config_dir_source,
         trust = body.preconditions.trust.label(),
         trust_detail = ?body.preconditions.trust,
+        explicit_trust = body
+            .preconditions
+            .explicit_trust
+            .as_ref()
+            .map_or("<not a linked worktree>", |e| e.verdict.label()),
+        explicit_trust_detail = ?body.preconditions.explicit_trust,
         credential = ?body.preconditions.credential,
         "agent_runtime: spawn_stalled — the child has produced no output; reported only, \
          the child is untouched"
@@ -9794,6 +10836,23 @@ async fn report_launch_deferral(agent_id: uuid::Uuid, reason: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn append_sibling_notes_lists_each_note_and_leaves_empty_alone() {
+        assert_eq!(super::append_sibling_notes("CTX".to_string(), &[]), "CTX");
+        let out = super::append_sibling_notes(
+            "CTX".to_string(),
+            &["qontinui/x: coord could not read .qontinui/ci.toml".to_string()],
+        );
+        assert!(
+            out.starts_with("CTX\n\nAllocation notes from coord:"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with("\n- qontinui/x: coord could not read .qontinui/ci.toml"),
+            "{out}"
+        );
+    }
+
     use super::*;
 
     // ── presentation boot readiness (plan 2026-09-17-a-gate-continuation-
@@ -10040,6 +11099,7 @@ mod tests {
             presentation: Presentation::Terminal,
             source: CONDITION_CHECK_SOURCE.to_string(),
             report_token: report_token.map(|s| s.to_string()),
+            condition_name: None,
         }
     }
 
@@ -10324,7 +11384,11 @@ mod tests {
             cmd.env(name, "hunter2");
         }
 
-        finalize_headless_child_env(&mut cmd, crate::coord_mcp::CoordMcpDelivery::Unprovisioned);
+        finalize_headless_child_env(
+            &mut cmd,
+            crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+            &crate::served_corpus::ServedCorpus::unknown("test"),
+        );
 
         crate::terminal::assert_credentials_scrubbed_tokio(&cmd, "finalize_headless_child_env");
 
@@ -10357,6 +11421,15 @@ mod tests {
                 .any(|(k, v)| k == "QONTINUI_RUNNER_CONTEXT" && v.is_some()),
             "the runner-context briefing must still be exported"
         );
+        // The served-corpus header line the caller measured must reach the
+        // exported briefing verbatim — the headless seam is one of the two
+        // env seams that make it readable by `/whereami`.
+        assert!(
+            envs.iter().any(|(k, v)| k == "QONTINUI_RUNNER_CONTEXT"
+                && v.as_deref()
+                    .is_some_and(|b| b.lines().any(|l| l == "[served-corpus: UNKNOWN (test)]"))),
+            "the exported briefing must carry the served-corpus header line"
+        );
     }
 
     /// The non-interactive git credential posture, asserted from the ONE shared
@@ -10370,7 +11443,11 @@ mod tests {
         // shape of coord finding 0056361d.
         cmd.env("GIT_ASKPASS", "/some/gui/askpass");
 
-        finalize_headless_child_env(&mut cmd, crate::coord_mcp::CoordMcpDelivery::Unprovisioned);
+        finalize_headless_child_env(
+            &mut cmd,
+            crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+            &crate::served_corpus::ServedCorpus::unknown("test"),
+        );
 
         crate::credential_helper::assert_non_interactive_git_posture_tokio(
             &cmd,
@@ -10403,9 +11480,12 @@ mod tests {
         // same reason, as `runner_context_briefing_is_appended_to_the_argv` and
         // `terminal::the_api_port_reaches_the_rendered_briefing`.
         //
-        // Order is env_lock → pin, deliberately and consistently: nothing in the
-        // crate takes them the other way round, so there is one global ordering
-        // and no deadlock to introduce later.
+        // Either order is safe: the pin takes `env_lock` itself before its own
+        // mutex (a child of `env_lock` in the test-lock hierarchy), so here it
+        // nests on the env lock already held above. An earlier comment here
+        // claimed "env_lock → pin, nothing takes them the other way round" while
+        // `plan_library`'s tests took exactly the other way round — a live
+        // AB/BA deadlock until the hierarchy replaced per-site ordering.
         let _pin = crate::mcp::fleet_policy_poller::pin_plan_capture_level_for_test("off");
         let _env = crate::test_env::EnvVarRestore::capture(&["QONTINUI_PORT"]);
         let _bound = BoundPortRestore::capture();
@@ -10414,7 +11494,11 @@ mod tests {
         set_bound_port(41_238);
 
         let mut cmd = tokio::process::Command::new("dummy");
-        finalize_headless_child_env(&mut cmd, crate::coord_mcp::CoordMcpDelivery::Unprovisioned);
+        finalize_headless_child_env(
+            &mut cmd,
+            crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+            &crate::served_corpus::ServedCorpus::unknown("test"),
+        );
 
         let envs: std::collections::HashMap<String, String> = cmd
             .as_std()
@@ -10687,10 +11771,39 @@ mod tests {
     /// the `--` terminator and the trailing positional prompt, with
     /// attached-form `--add-dir=` siblings preserved in between.
     #[test]
+    fn continuation_command_name_precedes_terminator_and_is_one_token() {
+        let build = |name: Option<&str>| {
+            build_continuation_claude_command(
+                "claude".to_string(),
+                "abc-123",
+                name,
+                vec![],
+                "-p do \"it\"".to_string(),
+                None,
+                Vec::new(),
+                &crate::claude_session::launch_spec::LaunchConfig::default(),
+            )
+        };
+        let without = build(None);
+        assert!(!without.iter().any(|a| a == "--name"));
+        let with = build(Some("check-login page"));
+        let n = with.iter().position(|a| a == "--name").unwrap();
+        assert_eq!(with[n + 1], "check-login page");
+        let dd = with.iter().position(|a| a == "--").unwrap();
+        assert!(n < dd);
+        assert_eq!(with.last().unwrap(), "-p do \"it\"");
+        // Dropping the name returns today's argv exactly.
+        let mut stripped = with.clone();
+        stripped.drain(n..n + 2);
+        assert_eq!(stripped, without);
+    }
+
+    #[test]
     fn continuation_command_pins_session_id_before_positional_prompt() {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec!["--add-dir=D:/wt/sibling".to_string()],
             "do the thing".to_string(),
             None,
@@ -10714,6 +11827,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec![
                 "--add-dir=D:/wt/coord".to_string(),
                 "--add-dir=D:/wt/web".to_string(),
@@ -10746,6 +11860,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec![],
             "-prompt with dash".to_string(),
             None,
@@ -10768,6 +11883,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec!["--add-dir=D:/wt/coord".to_string()],
             "do the thing".to_string(),
             Some(crate::session::spawn_prompt::SystemPromptCarrier::Inline(
@@ -10818,10 +11934,12 @@ mod tests {
         let briefing = crate::terminal::runner_context(
             9876,
             crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+            &crate::served_corpus::ServedCorpus::unknown("test"),
         );
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec![],
             "do the thing".to_string(),
             Some(crate::session::spawn_prompt::SystemPromptCarrier::Inline(
@@ -10858,6 +11976,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec!["--add-dir=D:/wt/coord".to_string()],
             "do the thing".to_string(),
             Some(crate::session::spawn_prompt::SystemPromptCarrier::Inline(
@@ -10894,6 +12013,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec![],
             "do the thing".to_string(),
             None,
@@ -10916,6 +12036,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec!["--add-dir=D:/wt/coord".to_string()],
             "do the thing".to_string(),
             Some(crate::session::spawn_prompt::SystemPromptCarrier::Inline(
@@ -10948,6 +12069,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             vec!["--add-dir=D:/wt/coord".to_string()],
             "do the thing".to_string(),
             Some(carrier),
@@ -10982,6 +12104,7 @@ mod tests {
             build_continuation_claude_command(
                 "claude".to_string(),
                 "abc-123",
+                None,
                 vec![],
                 "do the thing".to_string(),
                 Some(carrier.clone()),
@@ -10989,6 +12112,7 @@ mod tests {
                 &crate::claude_session::launch_spec::LaunchConfig {
                     default_template: template.map(str::to_string),
                     account_command: None,
+                    ..Default::default()
                 },
             )
         };
@@ -11026,6 +12150,7 @@ mod tests {
             let cmd = build_continuation_claude_command(
                 "claude".to_string(),
                 "abc-123",
+                None,
                 vec![],
                 "do the thing".to_string(),
                 carrier.clone(),
@@ -12244,6 +13369,7 @@ mod tests {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
+            None,
             Vec::new(),
             "run /babysit-prs".to_string(),
             Some(crate::session::spawn_prompt::SystemPromptCarrier::Inline(
@@ -12398,6 +13524,139 @@ mod tests {
         assert!(dst.join("merge-specialist.md").is_file());
     }
 
+    /// The measured clobber: a session worktree of qontinui-claude-config,
+    /// where `.claude/agents/*.md` is TRACKED, had its definitions overwritten on
+    /// every spawn — by the embedded floor (this binary's render) and then by the
+    /// PRIMARY checkout's copy, which sits at a different commit. A tracked,
+    /// existing definition must be kept by BOTH layers and reported as such; an
+    /// untracked one is still refreshed from the checkout.
+    #[test]
+    fn provision_agent_defs_keep_tracked_definitions_in_both_layers() {
+        use crate::provision_guard::test_support::{git_add, git_init};
+
+        // The operator's primary checkout: the overlay's source.
+        let root = tempfile::tempdir().unwrap();
+        let src = root
+            .path()
+            .join("qontinui-claude-config")
+            .join(".claude")
+            .join("agents");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("merge-specialist.md"), "# PRIMARY copy").unwrap();
+        std::fs::write(src.join("loose.md"), "# PRIMARY loose").unwrap();
+
+        // The session worktree: a repo tracking its own definitions.
+        let wt = tempfile::tempdir().unwrap();
+        git_init(wt.path());
+        let dst = wt.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dst).unwrap();
+        let tracked_overlay = dst.join("merge-specialist.md");
+        let tracked_floor = dst.join("code-reviewer.md");
+        std::fs::write(&tracked_overlay, "# WORKTREE's own").unwrap();
+        std::fs::write(&tracked_floor, "# WORKTREE's own reviewer").unwrap();
+        git_add(wt.path(), &tracked_overlay);
+        git_add(wt.path(), &tracked_floor);
+        // Present but untracked: still the checkout's to refresh.
+        std::fs::write(dst.join("loose.md"), "# stale loose").unwrap();
+        assert!(
+            crate::fleet_agents::embedded_agent_names()
+                .iter()
+                .any(|n| n == "code-reviewer.md"),
+            "fixture: code-reviewer.md must be an embedded definition, or the floor half of this test pins nothing"
+        );
+
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&tracked_overlay).unwrap(),
+            "# WORKTREE's own",
+            "the checkout overlay must not overwrite a tracked definition"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&tracked_floor).unwrap(),
+            "# WORKTREE's own reviewer",
+            "the embedded floor must not overwrite a tracked definition"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("loose.md")).unwrap(),
+            "# PRIMARY loose",
+            "an untracked definition is still refreshed from the checkout"
+        );
+        let kept: Vec<_> = report
+            .skipped
+            .iter()
+            .map(|s| (s.unit.as_str(), s.reason.wire()))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![("merge-specialist.md", "git_tracked")],
+            "the overlay reports exactly the tracked definition it kept"
+        );
+        assert_eq!(report.written, 1, "only loose.md is overlaid");
+    }
+
+    /// The probe-UNKNOWN arm inside a repository: existing definitions are
+    /// kept, and the decision is taken BEFORE the embedded floor writes. An
+    /// absent embedded+checkout definition (`merge-specialist.md`) is first
+    /// written by the floor; deciding per layer would then see it EXISTING and
+    /// keep the floor's render, so the session would never get the checkout's
+    /// copy. Deciding once keeps only what was on disk before the pass.
+    #[test]
+    fn provision_agent_defs_unknown_probe_keeps_existing_and_lets_the_overlay_win() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root
+            .path()
+            .join("qontinui-claude-config")
+            .join(".claude")
+            .join("agents");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("merge-specialist.md"), "# PRIMARY copy").unwrap();
+        std::fs::write(src.join("code-reviewer.md"), "# PRIMARY reviewer").unwrap();
+        assert!(
+            crate::fleet_agents::embedded_agent_names()
+                .iter()
+                .any(|n| n == "merge-specialist.md"),
+            "fixture: merge-specialist.md must also be embedded, or the floor never writes it first and this pins nothing"
+        );
+
+        // A linked-worktree `.git` FILE whose gitdir is gone: the probe cannot
+        // answer, and the workdir is inside a repository.
+        let wt = tempfile::tempdir().unwrap();
+        std::fs::write(
+            wt.path().join(".git"),
+            b"gitdir: /nonexistent/qontinui-agent-defs-unknown-probe-test\n",
+        )
+        .unwrap();
+        let dst = wt.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(dst.join("code-reviewer.md"), "# WORKTREE's own reviewer").unwrap();
+
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dst.join("code-reviewer.md")).unwrap(),
+            "# WORKTREE's own reviewer",
+            "an existing definition is kept when the probe cannot answer in a repo"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("merge-specialist.md")).unwrap(),
+            "# PRIMARY copy",
+            "an absent definition is written, and the checkout overlay wins over the floor"
+        );
+        let kept: Vec<_> = report
+            .skipped
+            .iter()
+            .map(|s| (s.unit.as_str(), s.reason.wire()))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![("code-reviewer.md", "probe_unknown_in_repo")],
+            "the overlay keeps only what was on disk before the pass"
+        );
+    }
+
     #[test]
     fn provision_agent_defs_missing_source_falls_back_to_the_embedded_floor() {
         // qontinui-root exists but has no qontinui-claude-config/.claude/agents —
@@ -12495,6 +13754,76 @@ mod tests {
                 s
             );
         }
+    }
+
+    /// The spawn seam resolves `claude` to the absolute file a PATH walk finds
+    /// (plan `2026-10-03-runner-claude-spawn-fails-enoent-during-cli-auto-update`).
+    #[cfg(unix)]
+    #[test]
+    fn resolve_claude_bin_finds_the_binary_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env_lock = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("empty");
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let bin = bin_dir.join("claude");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Restored on drop, so a panicking assertion cannot leave the
+        // process PATH changed for the rest of the test binary.
+        struct Restore(Option<String>, Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("QONTINUI_CLAUDE_BIN", v),
+                    None => std::env::remove_var("QONTINUI_CLAUDE_BIN"),
+                }
+                match self.1.take() {
+                    Some(v) => std::env::set_var("PATH", v),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+        let prev_path = std::env::var_os("PATH");
+        let _restore = Restore(std::env::var("QONTINUI_CLAUDE_BIN").ok(), prev_path.clone());
+        std::env::remove_var("QONTINUI_CLAUDE_BIN");
+        // PREPEND, never replace: parallel tests outside the env lock still
+        // spawn `git`/`sh` by bare name and must keep finding them.
+        let mut dirs = vec![empty.clone(), bin_dir.clone()];
+        if let Some(p) = &prev_path {
+            dirs.extend(std::env::split_paths(p));
+        }
+        std::env::set_var("PATH", std::env::join_paths(dirs).unwrap());
+        let found = resolve_claude_bin();
+        assert_eq!(found, bin.to_string_lossy());
+    }
+
+    /// A resolved path to a NON-executable file is not pinned: the bare name
+    /// lets `execvp` skip it and keep searching PATH.
+    #[cfg(unix)]
+    #[test]
+    fn launchable_or_bare_falls_back_for_a_non_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env_lock = env_lock();
+        let prev_bin = std::env::var("QONTINUI_CLAUDE_BIN").ok();
+        std::env::remove_var("QONTINUI_CLAUDE_BIN");
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("claude");
+        std::fs::write(&f, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let non_exec = launchable_or_bare(f.to_string_lossy().into_owned());
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let exec = launchable_or_bare(f.to_string_lossy().into_owned());
+        let missing = launchable_or_bare(tmp.path().join("gone").to_string_lossy().into_owned());
+        if let Some(v) = prev_bin {
+            std::env::set_var("QONTINUI_CLAUDE_BIN", v);
+        }
+        assert_eq!(non_exec, "claude");
+        assert_eq!(exec, f.to_string_lossy());
+        assert_eq!(missing, "claude");
     }
 
     #[test]
@@ -12844,46 +14173,122 @@ mod tests {
         );
     }
 
+    fn continuation_payload_with(allocation: serde_json::Value) -> GateContinuationPayload {
+        serde_json::from_value(serde_json::json!({
+            "target_device_id": "55555555-5555-5555-5555-555555555555",
+            "initial_prompt": "p",
+            "source": GATE_CONTINUATION_SOURCE,
+            "allocation": allocation,
+        }))
+        .expect("a continuation frame never fails on its allocation key")
+    }
+
+    /// coord's dispatch-time `allocation` is read for its `agent_id` only, and
+    /// an absent, null or unreadable value degrades to `None` instead of
+    /// failing the frame (plan
+    /// 2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state
+    /// Phase 4).
     #[test]
-    fn continuation_session_id_is_stable_for_same_anchor_and_device() {
-        // Phase 1b: the synthesized owner-token discriminator must be STABLE
-        // across retries of the same continuation (same device + anchor) so a
-        // re-acquire renews rather than collides, and DISTINCT across anchors.
-        let device = uuid::Uuid::parse_str("55555555-5555-5555-5555-555555555555").unwrap();
-        let mk = |anchor: Option<&str>| GateContinuationPayload {
-            target_device_id: device,
-            initial_prompt: "p".to_string(),
-            repos: vec![],
-            presentation: Presentation::Headless,
-            source: GATE_CONTINUATION_SOURCE.to_string(),
-            anchor_key: anchor.map(|s| s.to_string()),
-            gate_id: None,
-            dispatch_id: None,
-            target_instance_name: None,
-            brief: None,
+    fn continuation_allocation_is_read_leniently() {
+        let agent = uuid::Uuid::parse_str("77777777-7777-7777-7777-777777777777").unwrap();
+        let full = continuation_payload_with(serde_json::json!({
+            "agent_id": agent,
+            "worktrees": [{"repo": "qontinui/qontinui-coord", "branch": "agent/x"}],
+        }));
+        assert_eq!(
+            full.allocation,
+            Some(ContinuationAllocation { agent_id: agent })
+        );
+        assert_eq!(
+            continuation_payload_with(serde_json::Value::Null).allocation,
+            None
+        );
+        assert_eq!(
+            continuation_payload_with(serde_json::json!({"agent_id": "not-a-uuid"})).allocation,
+            None
+        );
+        assert_eq!(
+            continuation_payload_with(serde_json::json!("garbage")).allocation,
+            None
+        );
+        let absent: GateContinuationPayload = serde_json::from_value(serde_json::json!({
+            "target_device_id": "55555555-5555-5555-5555-555555555555",
+            "initial_prompt": "p",
+        }))
+        .expect("parse");
+        assert_eq!(absent.allocation, None);
+    }
+
+    /// The session is reported against coord's dispatch allocation, never
+    /// against the runner's own allocation (already bound at allocate time),
+    /// and not at all when coord attached none.
+    #[test]
+    fn the_session_is_reported_against_coords_dispatch_allocation_only() {
+        let coords = uuid::Uuid::parse_str("77777777-7777-7777-7777-777777777777").unwrap();
+        let own = uuid::Uuid::parse_str("88888888-8888-8888-8888-888888888888").unwrap();
+        let with = continuation_payload_with(serde_json::json!({"agent_id": coords}));
+        assert_eq!(continuation_dispatch_allocation(&with, own), Some(coords));
+        assert_eq!(continuation_dispatch_allocation(&with, coords), None);
+        let without = continuation_payload_with(serde_json::Value::Null);
+        assert_eq!(continuation_dispatch_allocation(&without, own), None);
+    }
+
+    /// The headless pin is exactly the CLI's `--session-id <uuid>` pair, the
+    /// same flag the terminal seam pins, so the id the runner reports is the
+    /// id the child runs under.
+    #[test]
+    fn pinned_session_args_are_the_cli_session_id_pair() {
+        let id = uuid::Uuid::parse_str("99999999-9999-4999-8999-999999999999").unwrap();
+        assert_eq!(
+            pinned_session_args(id),
+            vec![
+                "--session-id".to_string(),
+                "99999999-9999-4999-8999-999999999999".to_string()
+            ]
+        );
+    }
+
+    /// Every spawn attempt runs under a FRESH session id, and the session
+    /// reported is the first one that actually spawned: here attempt 1 fails to
+    /// start, attempt 2 spawns (reported), and attempt 3's restart is not.
+    #[test]
+    fn each_spawn_attempt_pins_a_fresh_session_and_the_first_success_is_reported() {
+        let id_of = |args: &[String]| {
+            assert_eq!(args[0], "--session-id");
+            uuid::Uuid::parse_str(&args[1]).expect("a uuid")
         };
+        let mut pins = SpawnSessionPins::default();
+        assert_eq!(pins.take_first_success(), None, "nothing spawned yet");
+        let first = id_of(&pins.next_attempt());
+        // attempt 1 failed to spawn: nothing taken
+        let second = id_of(&pins.next_attempt());
+        assert_ne!(first, second, "a retry never reuses an id");
+        assert_eq!(
+            pins.take_first_success(),
+            Some(second),
+            "first SUCCESS, not attempt 1"
+        );
+        let third = id_of(&pins.next_attempt());
+        assert_ne!(second, third);
+        assert_eq!(
+            pins.take_first_success(),
+            None,
+            "a restart is never reported"
+        );
+    }
 
-        let a1 = continuation_session_id(&mk(Some("gate-7f2358d5")));
-        let a2 = continuation_session_id(&mk(Some("gate-7f2358d5")));
-        assert_eq!(a1, a2, "same (device, anchor) → same stable id");
-        assert!(a1.is_some());
-
-        let b = continuation_session_id(&mk(Some("gate-other")));
-        assert_ne!(a1, b, "different anchor → different id");
-
-        // A different device with the same anchor is also distinct.
-        let other_device = GateContinuationPayload {
-            target_device_id: uuid::Uuid::parse_str("66666666-6666-6666-6666-666666666666")
-                .unwrap(),
-            ..mk(Some("gate-7f2358d5"))
-        };
-        assert_ne!(a1, continuation_session_id(&other_device));
-
-        // Anchor-less → a fresh v4 each call (Some, but non-equal).
-        let n1 = continuation_session_id(&mk(None));
-        let n2 = continuation_session_id(&mk(None));
-        assert!(n1.is_some() && n2.is_some());
-        assert_ne!(n1, n2, "anchor-less continuations get a fresh id each time");
+    /// The session-report body is the one key coord's `SessionReportRequest`
+    /// reads.
+    #[test]
+    fn session_report_body_wire_shape() {
+        let id = uuid::Uuid::parse_str("99999999-9999-4999-8999-999999999999").unwrap();
+        assert_eq!(
+            serde_json::to_value(SessionReportBody {
+                claude_session_id: id
+            })
+            .unwrap(),
+            serde_json::json!({"claude_session_id": "99999999-9999-4999-8999-999999999999"})
+        );
     }
 
     /// In a non-Tauri (unit-test) context there is no process-global AppHandle,
@@ -12902,10 +14307,13 @@ mod tests {
             presentation: Presentation::Terminal,
             source: GATE_CONTINUATION_SOURCE.to_string(),
             anchor_key: Some("anchor-z".to_string()),
+            session_name: None,
             gate_id: None,
             dispatch_id: None,
             target_instance_name: None,
             brief: None,
+            retry: None,
+            allocation: None,
         };
         let workdir = std::env::temp_dir().to_string_lossy().to_string();
         let res = run_continuation_terminal(
@@ -12915,6 +14323,7 @@ mod tests {
             uuid::Uuid::now_v7(),
             None,
             AnchorReservation::none(),
+            uuid::Uuid::new_v4(),
         )
         .await;
         assert!(
@@ -12976,7 +14385,8 @@ mod tests {
     /// Drives the gate-continuation HEADLESS dispatch through the REAL
     /// `spawn_claude_child` + `pump_subprocess` path with a fake `claude` bin
     /// (a portable shell that prints + exits 0). Proves the arm spawns a child
-    /// and returns `Ok(())` end-to-end. The coord lifecycle POSTs
+    /// with `--session-id <the pinned id>` and returns `Ok(HeadlessExit::Clean)`
+    /// end-to-end. The coord lifecycle POSTs
     /// (`spawn-complete`/`spawn-failed`) no-op gracefully here because no
     /// `coord_url` profile is configured in the test env (`connected_coord_base()`
     /// returns `None`), so this asserts the SPAWN path, not the HTTP posts.
@@ -12991,15 +14401,33 @@ mod tests {
             return;
         }
         // Use a portable shell as the fake `claude`: prints a line, exits 0.
+        // The headless arm passes `--session-id <uuid>`, which a bare `sh`
+        // rejects as an illegal option, so on Unix the fake is a tiny script
+        // that RECORDS its argv (one arg per line) and runs stdin through `sh`.
         let prev = std::env::var("QONTINUI_CLAUDE_BIN").ok();
-        std::env::set_var(
-            "QONTINUI_CLAUDE_BIN",
-            if cfg!(target_os = "windows") {
-                "cmd"
-            } else {
-                "sh"
-            },
-        );
+        let fake_dir = tempfile::tempdir().expect("tempdir for fake claude");
+        let argv_file = fake_dir.path().join("argv");
+        let fake_bin = if cfg!(target_os = "windows") {
+            "cmd".to_string()
+        } else {
+            let path = fake_dir.path().join("fake-claude");
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexec sh\n",
+                    argv_file.display()
+                ),
+            )
+            .expect("write fake claude");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod fake claude");
+            }
+            path.to_string_lossy().to_string()
+        };
+        std::env::set_var("QONTINUI_CLAUDE_BIN", &fake_bin);
         // On Windows the bin is `cmd`; spawn_claude_child passes the prompt on
         // stdin and closes it — `cmd` with no args reads stdin then exits. On
         // Unix, `sh` reads stdin commands then exits. Either way the child
@@ -13014,11 +14442,13 @@ mod tests {
         let prev_tier = std::env::var("QONTINUI_TRUST_GATE_TIER").ok();
         std::env::set_var("QONTINUI_TRUST_GATE_TIER", "proceed");
         let agent_id = uuid::Uuid::now_v7();
+        let pinned = uuid::Uuid::new_v4();
         let res = run_continuation_headless(
             agent_id,
             &workdir,
             "echo gate-continuation-proof",
             AnchorReservation::none(),
+            pinned,
         )
         .await;
         match prev_tier {
@@ -13029,6 +14459,21 @@ mod tests {
             res.is_ok(),
             "gate-continuation headless dispatch must spawn + return Ok: {res:?}"
         );
+        assert_eq!(res.unwrap(), HeadlessExit::Clean);
+        if cfg!(unix) {
+            let argv = std::fs::read_to_string(&argv_file).expect("fake claude recorded argv");
+            let args: Vec<&str> = argv.lines().collect();
+            let at = args
+                .iter()
+                .position(|a| *a == "--session-id")
+                .unwrap_or_else(|| panic!("child argv carries --session-id: {args:?}"));
+            let pinned_text = pinned.to_string();
+            assert_eq!(
+                args.get(at + 1).copied(),
+                Some(pinned_text.as_str()),
+                "the child runs under the pinned id the spawned outcome binds"
+            );
+        }
 
         match prev {
             Some(v) => std::env::set_var("QONTINUI_CLAUDE_BIN", v),
@@ -13179,6 +14624,188 @@ mod tests {
     /// (`false`). This is what makes a continuation delivered by BOTH the WS
     /// fast-path and the poll backstop spawn exactly once. Distinct ids never
     /// collide.
+    /// Plan `2026-10-01-a-lost-gate-continuation-is-never-re-delivered`: coord
+    /// re-drives a lost continuation by resetting the SAME gate row, so the
+    /// dedupe must let a strictly LATER attempt through while still dropping a
+    /// same-attempt duplicate and a stale older frame.
+    #[test]
+    fn a_later_redelivery_attempt_claims_afresh_and_is_monotone() {
+        let gate = uuid::Uuid::now_v7();
+        assert!(claim_gate_dispatch(gate), "first delivery (attempt 0) wins");
+        assert!(
+            !claim_gate_dispatch(gate),
+            "WS+poll duplicate of attempt 0 dropped"
+        );
+        assert!(
+            claim_gate_dispatch_attempt(gate, 1),
+            "re-delivery attempt 1 of a gate this process already ran is NOT a duplicate"
+        );
+        assert!(
+            !claim_gate_dispatch_attempt(gate, 1),
+            "duplicate of attempt 1 dropped"
+        );
+        assert!(
+            !claim_gate_dispatch_attempt(gate, 0),
+            "a stale attempt-0 frame arriving late can never re-run"
+        );
+        assert!(claim_gate_dispatch_attempt(gate, 2));
+        // An OLDER attempt's release (its task still posting its outcome when
+        // the re-delivery arrived) must not wipe attempt 2's claim.
+        release_gate_dispatch_attempt(gate, 1);
+        release_gate_dispatch(gate);
+        assert!(
+            !claim_gate_dispatch_attempt(gate, 2),
+            "attempt 2 is still held after older attempts released"
+        );
+        assert!(
+            !claim_gate_dispatch_attempt(gate, 0),
+            "and stale frames stay dropped"
+        );
+        release_gate_dispatch_attempt(gate, 2);
+        assert!(
+            claim_gate_dispatch_attempt(gate, 2),
+            "a release of the HOLDING attempt (local skip) lets it re-list"
+        );
+        assert!(
+            !claim_gate_dispatch_attempt(gate, 1),
+            "a release never lets an OLDER attempt back in"
+        );
+        release_gate_dispatch_attempt(gate, 2);
+
+        // An attempt whose claim coord ACCEPTED is sealed: the dispatcher's
+        // error-path release afterwards must not re-open it (review round 2).
+        let sealed = uuid::Uuid::now_v7();
+        assert!(claim_gate_dispatch(sealed));
+        assert_eq!(
+            settle_claim_decision(
+                &SpawnDecision::Spawn,
+                ConsumeTarget::Gate(sealed, 0),
+                sealed
+            ),
+            ClaimOutcome::Spawn
+        );
+        release_gate_dispatch_attempt(sealed, 0);
+        assert!(
+            !claim_gate_dispatch(sealed),
+            "a consumed attempt can never spawn again in this process"
+        );
+        assert!(
+            claim_gate_dispatch_attempt(sealed, 1),
+            "only a re-delivery gets back in"
+        );
+    }
+
+    /// The `retry` key parses into the typed annotation, is absent on a first
+    /// delivery, and an unreadable value never fails the frame.
+    #[test]
+    fn retry_annotation_parses_leniently() {
+        let base = serde_json::json!({
+            "target_device_id": "11111111-1111-1111-1111-111111111111",
+            "initial_prompt": "/babysit-prs 1",
+            "source": "gate_continuation",
+            "gate_id": "22222222-2222-2222-2222-222222222222",
+        });
+        let first: GateContinuationPayload =
+            serde_json::from_value(base.clone()).expect("first delivery parses");
+        assert_eq!(first.retry, None);
+        assert_eq!(first.retry_attempt(), 0);
+
+        let mut redelivered = base.clone();
+        redelivered["retry"] = serde_json::json!({
+            "attempt": 2, "max_attempts": 2, "family": "work", "class": "work_crashed",
+            "prior_outcome": "work_unreported: exit=crashed code=1 after=5s terminal=t",
+        });
+        let p: GateContinuationPayload =
+            serde_json::from_value(redelivered).expect("annotated frame parses");
+        assert_eq!(p.retry_attempt(), 2);
+        assert_eq!(p.retry.as_ref().unwrap().family, "work");
+
+        let mut stringly = base.clone();
+        stringly["retry"] = serde_json::json!({"attempt": "1", "family": "spawn"});
+        let st: GateContinuationPayload = serde_json::from_value(stringly).expect("parses");
+        assert_eq!(st.retry_attempt(), 1, "a numeric string attempt is read");
+
+        let mut bad_attempt = base.clone();
+        bad_attempt["retry"] = serde_json::json!({"attempt": -3});
+        let b: GateContinuationPayload = serde_json::from_value(bad_attempt).expect("parses");
+        assert_eq!(
+            b.retry, None,
+            "an unreadable attempt drops the annotation, frame survives"
+        );
+
+        let mut garbled = base;
+        garbled["retry"] = serde_json::json!("not an object");
+        let g: GateContinuationPayload =
+            serde_json::from_value(garbled).expect("a garbled retry never fails the frame");
+        assert_eq!(g.retry_attempt(), 0);
+    }
+
+    /// The lifetime runs to the recorded EXIT, not to whenever the reaper got
+    /// round to it.
+    #[test]
+    fn session_lifetime_stops_at_the_recorded_exit() {
+        let registered = std::time::Instant::now();
+        let exited = registered + std::time::Duration::from_secs(90);
+        assert_eq!(
+            session_lifetime(registered, Some(exited)),
+            std::time::Duration::from_secs(90)
+        );
+        assert!(session_lifetime(registered, None) < std::time::Duration::from_secs(5));
+        assert_eq!(
+            session_lifetime(exited, Some(registered)),
+            std::time::Duration::ZERO,
+            "never negative"
+        );
+    }
+
+    /// The D2 exit grammar: a requested close wins over the code, code 0 is
+    /// clean, any other recorded code a crash, and no facts / no code unknown.
+    /// The detail is single-line, class-first and well under coord's 200-char
+    /// cut with a real terminal id.
+    #[test]
+    fn work_unreported_detail_classifies_how_the_session_ended() {
+        use crate::terminal::session::PaneExitFacts;
+        let f = |code: Option<i32>, close_requested: bool| {
+            Some(PaneExitFacts {
+                code,
+                close_requested,
+            })
+        };
+        assert_eq!(WorkExit::classify(f(Some(1), false)), WorkExit::Crashed);
+        assert_eq!(WorkExit::classify(f(Some(0), false)), WorkExit::Clean);
+        assert_eq!(WorkExit::classify(f(Some(1), true)), WorkExit::Closed);
+        assert_eq!(WorkExit::classify(f(Some(0), true)), WorkExit::Closed);
+        assert_eq!(WorkExit::classify(f(None, false)), WorkExit::Unknown);
+        assert_eq!(
+            WorkExit::classify(f(Some(130), false)),
+            WorkExit::Closed,
+            "an operator's Ctrl-C is deliberate"
+        );
+        assert_eq!(
+            WorkExit::classify(f(Some(137), false)),
+            WorkExit::Crashed,
+            "an OOM kill is a crash"
+        );
+        assert_eq!(WorkExit::classify(None), WorkExit::Unknown);
+
+        let tid = "2f0ab50e-b265-44f4-a1b4-b738a79b9c66";
+        let d = work_unreported_detail(f(Some(1), false), std::time::Duration::from_secs(412), tid);
+        assert_eq!(d, format!("exit=crashed code=1 after=412s terminal={tid}"));
+        assert!(
+            d.starts_with("exit=crashed "),
+            "coord reads the leading token: {d}"
+        );
+        assert!(!d.contains('\n') && d.chars().count() < 200, "{d}");
+        assert_eq!(
+            work_unreported_detail(None, std::time::Duration::from_millis(900), tid),
+            format!("exit=unknown code=none after=0s terminal={tid}")
+        );
+        // What coord persists still matches the runner's own marker test.
+        assert!(
+            ContinuationOutcome::WorkUnreported.matches_recorded(&format!("work_unreported: {d}"))
+        );
+    }
+
     #[test]
     fn claim_gate_dispatch_is_once_per_gate_id() {
         let gate = uuid::Uuid::now_v7();
@@ -13241,7 +14868,7 @@ mod tests {
 
     /// THE delivery-stall regression: claim → release → claim must succeed
     /// again. Before `release_gate_dispatch` existed, nothing ever removed an
-    /// id from the dedupe set, so a locally-skipped (AtCap/DuplicateAnchor)
+    /// id from the dedupe set, so a locally-skipped (LoadPressure/DuplicateAnchor)
     /// continuation was dropped at the dedupe check on EVERY subsequent
     /// re-delivery for the process lifetime.
     #[test]
@@ -13284,7 +14911,7 @@ mod tests {
         let d = uuid::Uuid::now_v7();
         assert!(claim_gate_dispatch(g));
         assert!(claim_dispatch_dispatch(d));
-        release_local_dispatch_claim(ConsumeTarget::Gate(g));
+        release_local_dispatch_claim(ConsumeTarget::Gate(g, 0));
         release_local_dispatch_claim(ConsumeTarget::Dispatch(d));
         release_local_dispatch_claim(ConsumeTarget::None); // no-op, must not panic
         assert!(claim_gate_dispatch(g), "gate id was released");
@@ -13340,7 +14967,7 @@ mod tests {
         // …and the production settle, which is the only release on this path.
         let kept = uuid::Uuid::now_v7();
         assert!(claim_gate_dispatch(kept), "delivery 1 claims the id");
-        settle_skipped_claim(&cancelled, ConsumeTarget::Gate(kept));
+        settle_skipped_claim(&cancelled, ConsumeTarget::Gate(kept, 0));
         assert!(
             !claim_gate_dispatch(kept),
             "a cancelled skip must KEEP the claim so a duplicate delivery is absorbed"
@@ -13349,7 +14976,7 @@ mod tests {
 
         let relisted = uuid::Uuid::now_v7();
         assert!(claim_gate_dispatch(relisted), "delivery 1 claims the id");
-        settle_skipped_claim(&superseded, ConsumeTarget::Gate(relisted));
+        settle_skipped_claim(&superseded, ConsumeTarget::Gate(relisted, 0));
         assert!(
             claim_gate_dispatch(relisted),
             "after a superseded skip, the re-listed gate id claims again"
@@ -13366,7 +14993,7 @@ mod tests {
         let funnel_relisted = uuid::Uuid::now_v7();
         assert!(claim_gate_dispatch(funnel_relisted));
         assert_eq!(
-            settle_claim_decision(&superseded, ConsumeTarget::Gate(funnel_relisted), gate),
+            settle_claim_decision(&superseded, ConsumeTarget::Gate(funnel_relisted, 0), gate),
             ClaimOutcome::Skip,
             "a superseded claim refusal must not spawn"
         );
@@ -13380,7 +15007,7 @@ mod tests {
         let funnel_kept = uuid::Uuid::now_v7();
         assert!(claim_gate_dispatch(funnel_kept));
         assert_eq!(
-            settle_claim_decision(&cancelled, ConsumeTarget::Gate(funnel_kept), gate),
+            settle_claim_decision(&cancelled, ConsumeTarget::Gate(funnel_kept, 0), gate),
             ClaimOutcome::Skip,
             "a cancelled claim refusal must not spawn"
         );
@@ -13417,7 +15044,7 @@ mod tests {
         let funnel_rerouted = uuid::Uuid::now_v7();
         assert!(claim_gate_dispatch(funnel_rerouted));
         assert_eq!(
-            settle_claim_decision(&rerouted, ConsumeTarget::Gate(funnel_rerouted), gate),
+            settle_claim_decision(&rerouted, ConsumeTarget::Gate(funnel_rerouted, 0), gate),
             ClaimOutcome::Skip,
             "a rerouted claim refusal must not spawn and must not defer"
         );
@@ -13439,7 +15066,7 @@ mod tests {
             let claimed = uuid::Uuid::now_v7();
             assert!(claim_gate_dispatch(claimed));
             assert_eq!(
-                settle_claim_decision(&proceeding, ConsumeTarget::Gate(claimed), gate),
+                settle_claim_decision(&proceeding, ConsumeTarget::Gate(claimed, 0), gate),
                 ClaimOutcome::Spawn,
                 "{proceeding:?} must reach the spawn"
             );
@@ -13463,7 +15090,7 @@ mod tests {
         let funnel_deferred = uuid::Uuid::now_v7();
         assert!(claim_gate_dispatch(funnel_deferred));
         assert_eq!(
-            settle_claim_decision(&deferred, ConsumeTarget::Gate(funnel_deferred), gate),
+            settle_claim_decision(&deferred, ConsumeTarget::Gate(funnel_deferred, 0), gate),
             ClaimOutcome::DeferUnclaimed(crate::coord_drain_state::DeferClass::Drained),
             "a claim error under the drain must defer, not spawn and not skip, and must \
              carry the drain's own class into the stamp"
@@ -13477,45 +15104,43 @@ mod tests {
     }
 
     /// End-to-end sequencing of the incident fix at the unit level: a gate id
-    /// claimed by the dispatcher, then rejected AtCap by the guard, is
-    /// RELEASED — so when a slot frees, the next delivery of the SAME gate id
-    /// passes both the dedupe claim and the guard. (Before the fix, step 4's
-    /// claim returned false forever: the primary's 9 boot-drained slots +
-    /// `QONTINUI_CONTINUATION_SESSION_CAP=9` stranded 51 continuations.)
+    /// claimed by the dispatcher, then deferred under load by the guard, is
+    /// RELEASED — so when the pressure clears, the next delivery of the SAME
+    /// gate id passes both the dedupe claim and the guard. (Before the release
+    /// existed, the claim returned false forever: the primary's 9 boot-drained
+    /// slots plus the since-retired count cap of 9 stranded 51 continuations.)
     #[test]
-    fn atcap_release_lets_same_gate_redispatch_after_slot_frees() {
+    fn load_deferral_release_lets_same_gate_redispatch_when_pressure_clears() {
         let _env_lock = env_lock();
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "1");
         let gate = uuid::Uuid::now_v7();
-
-        // Delivery 1: dispatcher claims the id, guard says AtCap (cap full).
-        register_continuation_session("busy-slot".into(), Some("other-anchor".into()), None);
         let live_all = |_id: &str| true;
+
+        // Delivery 1: dispatcher claims the id, guard defers under memory load.
         assert!(claim_gate_dispatch(gate), "delivery 1 claims the id");
-        assert_eq!(
-            guard_verdict(Some("new-anchor"), &live_all, &calm),
-            ContinuationGuard::AtCap(1)
-        );
-        // …the AtCap arm releases the in-process claim (the critical fix).
+        assert!(matches!(
+            guard_verdict(Some("new-anchor"), &live_all, &|| commit_reading(
+                WARN_BAND_FREE
+            )),
+            ContinuationGuard::LoadPressure { .. }
+        ));
+        // …the load arm releases the in-process claim (the critical fix).
         release_gate_dispatch(gate);
 
-        // A slot frees (the busy session exits) and the backstop re-lists the
-        // row: the SAME gate id must now claim AND pass the guard.
-        let busy_dead = |id: &str| id != "busy-slot";
+        // Memory frees and the backstop re-lists the row: the SAME gate id must
+        // now claim AND pass the guard.
         assert!(
             claim_gate_dispatch(gate),
             "re-delivery after the release claims the id again"
         );
         assert_eq!(
-            guard_verdict(Some("new-anchor"), &busy_dead, &calm),
+            guard_verdict(Some("new-anchor"), &live_all, &calm_reading),
             ContinuationGuard::Proceed,
-            "freed slot → the deferred continuation finally dispatches"
+            "pressure cleared → the deferred continuation finally dispatches"
         );
 
         release_gate_dispatch(gate);
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
         clear_continuation_registry();
     }
 
@@ -13710,7 +15335,7 @@ mod tests {
     }
 
     // =========================================================================
-    // P3 (anchor_key dedup) + P4 (concurrency cap): continuation guard
+    // P3 (anchor_key dedup) + machine load: continuation and launch guards
     // =========================================================================
 
     /// Reset the process-wide continuation registry between guard tests (it is a
@@ -13725,14 +15350,9 @@ mod tests {
         *continuation_sessions()
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = ContinuationRegistry::default();
-        // Admitted launches share the cap, so they are part of the same reset.
-        admitted_launches()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clear();
     }
 
-    const CAP_ENV_KEYS: &[&str] = &["QONTINUI_CONTINUATION_SESSION_CAP"];
+    const CAP_ENV_KEYS: &[&str] = &[RETIRED_CONTINUATION_SESSION_CAP_ENV];
 
     /// Phase 1c: a coord launch under thread pressure is REFUSED, not admitted,
     /// and its `spawn-failed` reason carries the re-offerable `deferred_load:`
@@ -13740,14 +15360,11 @@ mod tests {
     #[test]
     fn launch_guard_defers_under_thread_pressure_with_deferred_load_reason() {
         let _env_lock = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
-        let agent = uuid::Uuid::now_v7();
 
-        let reason = match admit_launch(agent, &live_all, &|| thread_verdict(Some(300))) {
+        let reason = match admit_launch(&live_all, &|| thread_reading(Some(300))) {
             Err(reason) => reason,
             other => panic!("300 threads must defer a launch, got {other:?}"),
         };
@@ -13757,47 +15374,34 @@ mod tests {
             !reason.contains(char::is_whitespace),
             "the wire reason carries no whitespace"
         );
-        assert_eq!(
-            admitted_launch_count(),
-            0,
-            "a refused launch must not hold a slot"
-        );
     }
 
-    /// Phase 1c: `admit_launch` — the decision `spawn_run_task` takes before
-    /// `run_agent_subprocess` — refuses with the `deferred_load:` reason and
-    /// holds no slot, and an admitted slot is released when dropped, a panic
-    /// unwinding past it included.
+    /// `admit_launch` — the decision `spawn_run_task` takes before
+    /// `run_agent_subprocess` — defers on the MEMORY lane exactly as on the
+    /// thread lane, with a lane-correct `deferred_load:` reason, and admits a
+    /// calm machine. Before 2026-10-03 the launch pre-check read threads only, so
+    /// a memory WARN reading launched and a CRITICAL one was refused later, at
+    /// the spawn seam, instead of being re-offered.
     #[test]
-    fn admit_launch_refusal_holds_no_slot_and_admitted_slot_releases_on_panic() {
+    fn admit_launch_defers_on_the_memory_lane_and_admits_a_calm_machine() {
         let _env_lock = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
 
-        let refused = admit_launch(uuid::Uuid::now_v7(), &live_all, &|| {
-            thread_verdict(Some(540))
-        });
         assert_eq!(
-            refused.err(),
+            admit_launch(&live_all, &|| thread_reading(Some(540))).err(),
             Some("deferred_load:thread_pressure:critical:540_over_400".to_string())
         );
-        assert_eq!(admitted_launch_count(), 0);
-
-        let agent = uuid::Uuid::now_v7();
-        let result = std::panic::catch_unwind(|| {
-            let _slot = admit_launch(agent, &live_all, &calm).expect("calm machine admits");
-            assert_eq!(admitted_launch_count(), 1, "the admitted slot is held");
-            panic!("simulated run-task panic");
-        });
-        assert!(result.is_err());
+        let warn_floor = crate::settings::SessionGuardSettings::default().warn_free_commit_bytes;
         assert_eq!(
-            admitted_launch_count(),
-            0,
-            "a panic must not leak the admitted slot"
+            admit_launch(&live_all, &|| commit_reading(WARN_BAND_FREE)).err(),
+            Some(format!(
+                "deferred_load:commit_pressure:warn:{WARN_BAND_FREE}_under_{warn_floor}"
+            )),
+            "a memory-starved machine defers a launch, naming the lane, reading and floor"
         );
+        assert_eq!(admit_launch(&live_all, &calm_reading), Ok(()));
     }
 
     /// The deferral report retries only undelivered attempts, boundedly.
@@ -13820,43 +15424,37 @@ mod tests {
         );
     }
 
-    /// Phase 1c: the count lane binds launches — continuations and admitted
-    /// launches both count, and a released slot re-admits.
+    /// The fixed count cap is GONE (operator direction 2026-10-03): with
+    /// hundreds of live continuations registered and calm lanes, a new
+    /// continuation and a coord launch are both admitted — and the retired
+    /// `QONTINUI_CONTINUATION_SESSION_CAP` override, set to 1, changes nothing.
+    /// Restore a count anywhere in the admission path and this fails.
     #[test]
-    fn launch_guard_at_cap_counts_continuations_and_admitted_launches() {
+    fn no_count_cap_binds_unattended_admission() {
         let _env_lock = env_lock();
         let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "2");
+        std::env::set_var(RETIRED_CONTINUATION_SESSION_CAP_ENV, "1");
         let live_all = |_id: &str| true;
 
-        register_continuation_session("cont-1".into(), Some("anchor-1".into()), None);
-        let first = uuid::Uuid::now_v7();
-        let first_slot = admit_launch(first, &live_all, &calm).expect("1 live of cap 2 admits");
-        assert_eq!(launch_deferral_reason(&LoadGuard::Proceed), None);
-
-        let second = uuid::Uuid::now_v7();
+        for i in 0..500 {
+            register_continuation_session(format!("t{i}"), Some(format!("a{i}")), None);
+        }
         assert_eq!(
-            admit_launch(second, &live_all, &calm).err(),
-            Some("deferred_load:at_cap:2_of_2".to_string())
+            guard_verdict(Some("a-new"), &live_all, &calm_reading),
+            ContinuationGuard::Proceed,
+            "500 live continuations on a calm machine must not defer on count"
         );
         assert_eq!(
-            launch_deferral_reason(&LoadGuard::AtCap { cap: 2, live: 2 }).as_deref(),
-            Some("deferred_load:at_cap:2_of_2")
+            admit_launch(&live_all, &calm_reading),
+            Ok(()),
+            "nor may a coord launch"
         );
-
-        // The admitted launch also binds the CONTINUATION guard (shared cap).
         assert_eq!(
-            guard_verdict(Some("anchor-2"), &live_all, &calm),
-            ContinuationGuard::AtCap(2)
+            launch_deferral_reason(&crate::resource_guard::SpawnGate::Proceed),
+            None
         );
-
-        drop(first_slot);
-        let second_slot = admit_launch(second, &live_all, &calm)
-            .expect("a released slot re-admits the deferred launch");
-        drop(second_slot);
-        assert_eq!(admitted_launch_count(), 0);
         clear_continuation_registry();
     }
 
@@ -13924,12 +15522,12 @@ mod tests {
     }
 
     /// Round-5 review: an `AgentRunTeardown` built over POISONED maps, dropped
-    /// while a panic unwinds, neither aborts nor leaks. All three maps are LOCAL
-    /// copies (poisoning the process-global ones would break parallel tests that
-    /// `expect` on them), each holding an entry for the agent and each poisoned
-    /// before the drop. A panic from any helper inside a drop during unwinding
-    /// aborts the test binary, so this test fails if any teardown helper goes
-    /// back to `expect` on its lock.
+    /// while a panic unwinds, neither aborts nor leaks. The two registries and
+    /// the daemon map are LOCAL instances (poisoning the process-global ones
+    /// would leak into parallel tests that read them), each holding an entry
+    /// for the agent and each poisoned before the drop. A panic from any helper
+    /// inside a drop during unwinding aborts the test binary, so this test fails
+    /// if any teardown helper goes back to `expect` on its lock.
     ///
     /// Global side effects: the revoke's census records the LOCAL map's result
     /// in the process-global last-census record, so the test holds a
@@ -13937,9 +15535,8 @@ mod tests {
     /// a failed assertion included. Not reversible: when a forensics test has
     /// switched the shared rotation log on, the revoke appends one `revoke`
     /// line (this test's unique `teardown-test-<agent>` workdir) and at most one
-    /// `agent_binding_census` line to that file. The revoke also records a
-    /// tombstone for the nonce in the process-global tombstone map; the test
-    /// asserts it and then removes it.
+    /// `agent_binding_census` line to that file. The revoke's tombstone lands
+    /// in the LOCAL registry, where the test asserts it.
     #[test]
     fn agent_run_teardown_over_poisoned_maps_drops_during_a_panic_unwind_and_removes_entries() {
         use std::collections::HashMap;
@@ -13947,9 +15544,8 @@ mod tests {
         let _census_restore = crate::coord_mcp::teardown_poison_tests::census_record_guard();
         let agent = uuid::Uuid::now_v7();
 
-        let tokens: Mutex<HashMap<uuid::Uuid, crate::agent_token::SharedToken>> =
-            Mutex::new(HashMap::new());
-        tokens.lock().unwrap_or_else(|p| p.into_inner()).insert(
+        let tokens = crate::coord_mcp::AgentTokenRegistry::new();
+        tokens.register(
             agent,
             std::sync::Arc::new(tokio::sync::RwLock::new(crate::agent_token::TokenSlot {
                 token: "teardown-test-token".into(),
@@ -13958,10 +15554,9 @@ mod tests {
                 health: Default::default(),
             })),
         );
-        let nonces: Mutex<HashMap<String, crate::coord_mcp::NonceBinding>> =
-            Mutex::new(HashMap::new());
+        let nonces = crate::coord_mcp::NonceRegistry::new();
         let nonce = format!("teardown-test-nonce-{agent}");
-        nonces.lock().unwrap_or_else(|p| p.into_inner()).insert(
+        nonces.test_live().insert(
             nonce.clone(),
             crate::coord_mcp::teardown_poison_tests::agent_nonce_binding(agent),
         );
@@ -13972,8 +15567,8 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner())
             .insert(agent, Default::default());
 
-        crate::coord_mcp::teardown_poison_tests::poison(&tokens);
-        crate::coord_mcp::teardown_poison_tests::poison(&nonces);
+        crate::coord_mcp::teardown_poison_tests::poison(tokens.test_mutex());
+        crate::coord_mcp::teardown_poison_tests::poison(nonces.test_mutex());
         crate::coord_mcp::teardown_poison_tests::poison(&daemons);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -13991,23 +15586,16 @@ mod tests {
         );
 
         assert!(
-            !tokens
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains_key(&agent),
+            tokens.lookup(agent).is_none(),
             "the live-token entry is removed"
         );
         assert!(
-            !nonces
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains_key(&nonce),
+            !nonces.test_snapshot().live_contains(&nonce),
             "the agent's proxy nonce is revoked"
         );
-        // The nonce was never in the GLOBAL registry, so this attribution can
-        // only come from the tombstone the teardown recorded.
-        let attribution = crate::coord_mcp::reject_attribution_for_nonce(&nonce).attribution;
-        crate::coord_mcp::teardown_poison_tests::remove_global_tombstone(&nonce);
+        // The nonce is no longer live, so this attribution can only come from
+        // the tombstone the teardown recorded in the same registry.
+        let attribution = nonces.reject_attribution(&nonce).attribution;
         assert_eq!(
             attribution,
             crate::coord_mcp::RejectAttribution::REVOKED,
@@ -14022,42 +15610,6 @@ mod tests {
         );
     }
 
-    /// Round-2 review: a slot's release removes only its OWN entry — a stale
-    /// slot for the same `agent_id` cannot free a newer run's slot — and the
-    /// count returns to 0.
-    #[test]
-    fn admitted_launch_releases_stay_balanced_and_token_exact() {
-        let _env_lock = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
-        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
-        let live_all = |_id: &str| true;
-        let agent = uuid::Uuid::now_v7();
-
-        let slot = admit_launch(agent, &live_all, &calm).expect("admits");
-        assert_eq!(admitted_launch_count(), 1);
-        let stale_token = slot.token;
-        drop(slot);
-        assert_eq!(admitted_launch_count(), 0);
-
-        // A later run under the same id is not freed by a stale release.
-        let newer = admit_launch(agent, &live_all, &calm).expect("re-admits");
-        assert_ne!(newer.token, stale_token);
-        drop(AdmittedLaunchSlot {
-            agent_id: agent,
-            token: stale_token,
-        });
-        assert_eq!(
-            admitted_launch_count(),
-            1,
-            "a stale slot's release must not remove the newer run's entry"
-        );
-        drop(newer);
-        assert_eq!(admitted_launch_count(), 0);
-        clear_continuation_registry();
-    }
-
     /// The prefix is a wire value coord matches on; pin its exact spelling.
     #[test]
     fn deferred_load_prefix_is_the_coord_wire_value() {
@@ -14068,9 +15620,9 @@ mod tests {
     /// `env_lock()`: a panicking guard test must not cascade-poison the rest.
     static CONT_GUARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// A thread verdict that says nothing: the machine has headroom, or the
+    /// A load verdict that says nothing: the machine has headroom, or the
     /// sensor had no opinion. The default for every guard test that is about the
-    /// dedup / cap lanes rather than about load — passing it keeps those tests
+    /// dedup lane rather than about load — passing it keeps those tests
     /// measuring exactly what they measured before the thread lane existed.
     ///
     /// Passed as `&calm`, not `&calm()`: the guard takes the verdict as a
@@ -14088,9 +15640,9 @@ mod tests {
     fn guard_verdict(
         anchor_key: Option<&str>,
         is_live: &dyn Fn(&str) -> bool,
-        thread_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
+        load_reading: &dyn Fn() -> crate::resource_guard::AdmissionReading,
     ) -> ContinuationGuard {
-        evaluate_continuation_guard(anchor_key, is_live, thread_pressure).0
+        evaluate_continuation_guard(anchor_key, is_live, load_reading).0
     }
 
     /// The REAL thread verdict for an injected reading, folded through the same
@@ -14104,14 +15656,93 @@ mod tests {
     /// means these tests also fail if the ceilings are moved out from under
     /// them, which is the coupling worth having.
     ///
+    /// Judged against the shipped 256 / 400 pair — the calibration box's
+    /// ceilings, which is what a machine with no measured inputs enforces.
+    ///
     /// `None` is the UNKNOWN reading — what
     /// [`crate::health_monitor::thread_count_reading`] returns when the OS
     /// thread table cannot be read.
     fn thread_verdict(reading: Option<usize>) -> crate::resource_guard::SpawnGate {
         crate::resource_guard::evaluate_threads(
             reading,
+            true,
+            crate::resource_guard::ThreadCeilings::SHIPPED,
+        )
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// Free commit inside the shipped WARN band (under the 3 GiB warn floor,
+    /// above the 1.5 GiB critical one).
+    const WARN_BAND_FREE: u64 = 2 * GIB;
+
+    /// The REAL memory-lane verdict for an injected free-commit reading, folded
+    /// through the pure evaluator the live path uses
+    /// ([`crate::resource_guard::evaluate`]) against the SHIPPED floors
+    /// (3 GiB warn / 1.5 GiB critical) — the memory twin of [`thread_verdict`].
+    fn commit_verdict(free_commit_bytes: u64) -> crate::resource_guard::SpawnGate {
+        crate::resource_guard::evaluate(
+            "host",
+            Some(free_commit_bytes),
             &crate::settings::SessionGuardSettings::default(),
         )
+    }
+
+    /// A fixed projected per-session cost for the guard tests, so they never
+    /// depend on the process-global measured threads-per-session.
+    const TEST_SPAWN_COST: crate::resource_guard::ProjectedSpawnCost =
+        crate::resource_guard::ProjectedSpawnCost {
+            commit_bytes: crate::resource_guard::PER_SESSION_RSS_BYTES,
+            threads: 10,
+        };
+
+    /// An [`crate::resource_guard::AdmissionReading`] over injected readings,
+    /// each lane's verdict folded through the REAL evaluators against the
+    /// SHIPPED floors / ceilings (the same pair [`thread_verdict`] and
+    /// [`commit_verdict`] use). `None` is an UNKNOWN reading.
+    fn reading_with(
+        free_commit_bytes: Option<u64>,
+        graded_threads: Option<usize>,
+    ) -> crate::resource_guard::AdmissionReading {
+        let floors = crate::settings::SessionGuardSettings::default();
+        let ceilings = crate::resource_guard::ThreadCeilings::SHIPPED;
+        crate::resource_guard::AdmissionReading {
+            lanes: Some(crate::resource_guard::LaneVerdicts {
+                memory_lane: "host",
+                free_commit_bytes,
+                free_phys_bytes: None,
+                warn_free_commit_bytes: floors.warn_free_commit_bytes,
+                critical_free_commit_bytes: floors.critical_free_commit_bytes,
+                memory: crate::resource_guard::evaluate("host", free_commit_bytes, &floors),
+                threads: crate::resource_guard::ThreadLane {
+                    graded: graded_threads,
+                    warn_ceiling: ceilings.warn,
+                    critical_ceiling: ceilings.critical,
+                    verdict: crate::resource_guard::evaluate_threads(
+                        graded_threads,
+                        true,
+                        ceilings,
+                    ),
+                },
+            }),
+            cost: TEST_SPAWN_COST,
+        }
+    }
+
+    /// Both sensors UNKNOWN: no opinion, and no projection can give one — the
+    /// reading every dedup-lane test passes (the old `calm` verdict).
+    fn calm_reading() -> crate::resource_guard::AdmissionReading {
+        reading_with(None, None)
+    }
+
+    /// A thread-lane reading only (memory UNKNOWN).
+    fn thread_reading(graded: Option<usize>) -> crate::resource_guard::AdmissionReading {
+        reading_with(None, graded)
+    }
+
+    /// A memory-lane reading only (threads UNKNOWN).
+    fn commit_reading(free_commit_bytes: u64) -> crate::resource_guard::AdmissionReading {
+        reading_with(Some(free_commit_bytes), None)
     }
 
     /// REGRESSION (P3 must not regress #450): a SAME gate_id delivered twice is
@@ -14139,12 +15770,11 @@ mod tests {
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
         // Raise the cap out of the way so this test isolates the dedup path.
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
 
         // No session yet → proceed, then register it as live.
         let live_all = |_id: &str| true;
         assert_eq!(
-            guard_verdict(Some("plan:foo:phase:1"), &live_all, &calm),
+            guard_verdict(Some("plan:foo:phase:1"), &live_all, &calm_reading),
             ContinuationGuard::Proceed
         );
         register_continuation_session(
@@ -14155,12 +15785,12 @@ mod tests {
 
         // Same anchor, still live → DuplicateAnchor (carries the existing tid).
         assert_eq!(
-            guard_verdict(Some("plan:foo:phase:1"), &live_all, &calm),
+            guard_verdict(Some("plan:foo:phase:1"), &live_all, &calm_reading),
             ContinuationGuard::DuplicateAnchor(AnchorHolder::Live("term-tid-1".to_string()))
         );
         // A different anchor is unaffected.
         assert_eq!(
-            guard_verdict(Some("plan:foo:phase:2"), &live_all, &calm),
+            guard_verdict(Some("plan:foo:phase:2"), &live_all, &calm_reading),
             ContinuationGuard::Proceed
         );
 
@@ -14168,7 +15798,7 @@ mod tests {
         // free to spawn again (the legitimate re-run after completion).
         let dead_first = |id: &str| id != "term-tid-1";
         assert_eq!(
-            guard_verdict(Some("plan:foo:phase:1"), &dead_first, &calm),
+            guard_verdict(Some("plan:foo:phase:1"), &dead_first, &calm_reading),
             ContinuationGuard::Proceed
         );
         // The registry no longer holds the dead session.
@@ -14178,7 +15808,6 @@ mod tests {
             .live
             .contains_key("term-tid-1"));
 
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
         clear_continuation_registry();
     }
 
@@ -14220,11 +15849,10 @@ mod tests {
         let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
 
         let (verdict, _held) =
-            evaluate_continuation_guard(Some("unit:u1:phase-2"), &live_all, &calm);
+            evaluate_continuation_guard(Some("unit:u1:phase-2"), &live_all, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         assert!(
             anchor_is_reserved("unit:u1:phase-2"),
@@ -14232,13 +15860,13 @@ mod tests {
         );
         // The twin, evaluated before the first has registered anything.
         assert_eq!(
-            guard_verdict(Some("unit:u1:phase-2"), &live_all, &calm),
+            guard_verdict(Some("unit:u1:phase-2"), &live_all, &calm_reading),
             ContinuationGuard::DuplicateAnchor(AnchorHolder::Reserved),
             "the second evaluation for a reserved anchor must dedup, not proceed"
         );
         // A different anchor is unaffected by the reservation.
         assert_eq!(
-            guard_verdict(Some("unit:u1:phase-3"), &live_all, &calm),
+            guard_verdict(Some("unit:u1:phase-3"), &live_all, &calm_reading),
             ContinuationGuard::Proceed
         );
 
@@ -14261,20 +15889,20 @@ mod tests {
         let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
         let anchor = "claim:pr:qontinui/x#1";
 
         // 1. Proceed reserves; the twin is deduped; the dispatch gives up
         //    (worktree failure, claim refused, …) → its reservation drops.
-        let (verdict, reservation) = evaluate_continuation_guard(Some(anchor), &live_all, &calm);
+        let (verdict, reservation) =
+            evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         assert!(
             anchor_is_reserved(anchor),
             "a Proceed hands back a permit that holds the anchor"
         );
         assert_eq!(
-            guard_verdict(Some(anchor), &live_all, &calm),
+            guard_verdict(Some(anchor), &live_all, &calm_reading),
             ContinuationGuard::DuplicateAnchor(AnchorHolder::Reserved)
         );
         drop(reservation);
@@ -14284,7 +15912,8 @@ mod tests {
         );
 
         // 2. The third evaluation — a re-delivery — proceeds again.
-        let (verdict, reservation) = evaluate_continuation_guard(Some(anchor), &live_all, &calm);
+        let (verdict, reservation) =
+            evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
         assert_eq!(
             verdict,
             ContinuationGuard::Proceed,
@@ -14299,7 +15928,7 @@ mod tests {
             "the hand-over must give back the reservation it replaces"
         );
         assert_eq!(
-            guard_verdict(Some(anchor), &live_all, &calm),
+            guard_verdict(Some(anchor), &live_all, &calm_reading),
             ContinuationGuard::DuplicateAnchor(AnchorHolder::Live("term-x1".to_string())),
             "after the hand-over the holder is the live session, not a reservation"
         );
@@ -14310,7 +15939,7 @@ mod tests {
         //    remove this entry anyway — see
         //    `stale_reservation_drop_cannot_steal_a_foreign_reservation`).
         let x1_dead = |id: &str| id != "term-x1";
-        let (verdict, later) = evaluate_continuation_guard(Some(anchor), &x1_dead, &calm);
+        let (verdict, later) = evaluate_continuation_guard(Some(anchor), &x1_dead, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         assert!(
             anchor_is_reserved(anchor),
@@ -14341,13 +15970,13 @@ mod tests {
         let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
         let anchor = "claim:pr:qontinui/x#7";
         let gate = uuid::Uuid::now_v7();
 
         // A continuation is live on the anchor — the session about to migrate.
-        let (verdict, reservation) = evaluate_continuation_guard(Some(anchor), &live_all, &calm);
+        let (verdict, reservation) =
+            evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         reservation.handed_to_registry("term-old".to_string(), Some(gate));
 
@@ -14362,10 +15991,10 @@ mod tests {
 
         // A same-anchor dispatch arrives inside the window. It no longer finds
         // the anchor free: specifically `Reserved`, not merely "not Proceed"
-        // (AtCap and ThreadPressure are refusals too and would prove nothing
+        // (LoadPressure verdicts are refusals too and would prove nothing
         // about the anchor).
         assert_eq!(
-            guard_verdict(Some(anchor), &live_all, &calm),
+            guard_verdict(Some(anchor), &live_all, &calm_reading),
             ContinuationGuard::DuplicateAnchor(AnchorHolder::Reserved),
             "a same-anchor dispatch inside the migration window must be deferred, not admitted"
         );
@@ -14442,7 +16071,6 @@ mod tests {
         let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
         let anchor = "claim:pr:qontinui/x#19";
         let gate = uuid::Uuid::now_v7();
@@ -14466,11 +16094,11 @@ mod tests {
         assert_eq!(carried.gate_id, Some(gate));
 
         // 2. A same-anchor continuation dispatched inside the window is
-        //    REFUSED — specifically `Reserved`. `AtCap` / `ThreadPressure` are
+        //    REFUSED — specifically `Reserved`. `LoadPressure` verdicts are
         //    refusals too and would satisfy a weaker assertion while proving
         //    nothing about the anchor.
         assert_eq!(
-            guard_verdict(Some(anchor), &live_all, &calm),
+            guard_verdict(Some(anchor), &live_all, &calm_reading),
             ContinuationGuard::DuplicateAnchor(AnchorHolder::Reserved),
             "a same-anchor dispatch inside the migration window must be deferred"
         );
@@ -14489,7 +16117,7 @@ mod tests {
         );
         // …and the anchor now reads as held by the LIVE session, not free.
         assert_eq!(
-            guard_verdict(Some(anchor), &live_all, &calm),
+            guard_verdict(Some(anchor), &live_all, &calm_reading),
             ContinuationGuard::DuplicateAnchor(AnchorHolder::Live("term-new".to_string()))
         );
 
@@ -14506,7 +16134,6 @@ mod tests {
         let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
         let anchor = "unit:u19:phase-err";
         let gate = uuid::Uuid::now_v7();
@@ -14519,7 +16146,7 @@ mod tests {
             "the anchor is held across the attempt, whether or not the respawn succeeds"
         );
         assert_eq!(
-            guard_verdict(Some(anchor), &live_all, &calm),
+            guard_verdict(Some(anchor), &live_all, &calm_reading),
             ContinuationGuard::DuplicateAnchor(AnchorHolder::Reserved)
         );
 
@@ -14562,7 +16189,6 @@ mod tests {
         let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let anchor = "claim:pr:qontinui/x#20";
         let gate = uuid::Uuid::now_v7();
 
@@ -14621,11 +16247,10 @@ mod tests {
         let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
         let anchor = "unit:u9:phase-1";
 
-        let (verdict, stale) = evaluate_continuation_guard(Some(anchor), &live_all, &calm);
+        let (verdict, stale) = evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
 
         // Force the state the token exists for: this anchor's entry now belongs
@@ -14647,7 +16272,7 @@ mod tests {
             "a stale reservation must not remove an entry it does not own"
         );
         assert_eq!(
-            guard_verdict(Some(anchor), &live_all, &calm),
+            guard_verdict(Some(anchor), &live_all, &calm_reading),
             ContinuationGuard::DuplicateAnchor(AnchorHolder::Reserved),
             "the foreign holder still owns the anchor"
         );
@@ -14655,95 +16280,44 @@ mod tests {
         clear_continuation_registry();
     }
 
-    /// A load verdict (`ThreadPressure` / `AtCap`) leaves NO reservation
-    /// behind: the row is deferred for re-delivery, and the re-delivery must
-    /// read the load verdict again — not `DuplicateAnchor` against a refused
-    /// evaluation's own leftover.
+    /// A load verdict (either lane) leaves NO reservation behind: the row is
+    /// deferred for re-delivery, and the re-delivery must read the load verdict
+    /// again — not `DuplicateAnchor` against a refused evaluation's own
+    /// leftover.
     #[test]
     fn load_verdicts_leave_no_reservation_behind() {
         let _env_lock = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
         let live_all = |_id: &str| true;
 
-        // AtCap: cap 1, one live session, a new anchor twice.
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "1");
-        register_continuation_session("t-busy".into(), Some("a-busy".into()), None);
-        // The permit is BOUND, never taken through `guard_verdict`. That
-        // wrapper is `evaluate_continuation_guard(..).0`, so the tuple
-        // temporary's `.1` is dropped at the end of the wrapper's own tail
-        // expression — the WRAPPER releases the anchor before this test can
-        // look at it, and the assertion below would then pass even with the
-        // production release deleted. Bound here, the registry is read with the
-        // permit still alive, which is exactly the state
-        // `run_gate_continuation_inner`'s AtCap arm is in while it awaits
-        // `defer_continuation_unclaimed`'s network POST.
-        let (verdict, held) = evaluate_continuation_guard(Some("a-capped"), &live_all, &calm);
-        assert_eq!(verdict, ContinuationGuard::AtCap(1));
-        assert!(
-            !anchor_is_reserved("a-capped"),
-            "an AtCap verdict must remove the reservation it took under the lock"
-        );
-        drop(held);
-        let (verdict, held) = evaluate_continuation_guard(Some("a-capped"), &live_all, &calm);
-        assert_eq!(
-            verdict,
-            ContinuationGuard::AtCap(1),
-            "the re-delivery must see the cap again, not its own leftover reservation"
-        );
-        drop(held);
-
-        // ThreadPressure: cap out of the way, a loaded reading twice.
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
-        for _ in 0..2 {
-            // Bound for the same reason as the AtCap half above.
-            let (verdict, held) = evaluate_continuation_guard(Some("a-loaded"), &live_all, &|| {
-                thread_verdict(Some(540))
-            });
-            assert!(
-                matches!(verdict, ContinuationGuard::ThreadPressure { .. }),
-                "a loaded machine must defer on every evaluation, got {verdict:?}"
-            );
-            assert!(
-                !anchor_is_reserved("a-loaded"),
-                "a ThreadPressure verdict must remove the reservation it took under the lock"
-            );
-            drop(held);
+        let thread_loaded = || thread_reading(Some(540));
+        let memory_loaded = || commit_reading(WARN_BAND_FREE);
+        let lanes: [(&str, &dyn Fn() -> crate::resource_guard::AdmissionReading); 2] =
+            [("a-threads", &thread_loaded), ("a-memory", &memory_loaded)];
+        for (anchor, loaded) in lanes {
+            for _ in 0..2 {
+                // The permit is BOUND, never taken through `guard_verdict`. That
+                // wrapper is `evaluate_continuation_guard(..).0`, so the tuple
+                // temporary's `.1` is dropped at the end of the wrapper's own
+                // tail expression — the WRAPPER releases the anchor before this
+                // test can look at it, and the assertion below would then pass
+                // even with the production release deleted. Bound here, the
+                // registry is read with the permit still alive, which is exactly
+                // the state `run_gate_continuation_inner`'s load arm is in while
+                // it awaits `defer_continuation_unclaimed`'s network POST.
+                let (verdict, held) = evaluate_continuation_guard(Some(anchor), &live_all, loaded);
+                assert!(
+                    matches!(verdict, ContinuationGuard::LoadPressure { .. }),
+                    "a loaded machine must defer on every evaluation, got {verdict:?}"
+                );
+                assert!(
+                    !anchor_is_reserved(anchor),
+                    "a LoadPressure verdict must remove the reservation it took under the lock"
+                );
+                drop(held);
+            }
         }
-
-        clear_continuation_registry();
-    }
-
-    /// The reservation is not a running session and must not count toward P4
-    /// — for the continuation guard's `live_count` and for the launch guard
-    /// that shares the cap. With cap 2, one live session and one reservation,
-    /// a second anchor and a coord launch both still proceed.
-    #[test]
-    fn anchor_reservation_does_not_count_toward_the_cap() {
-        let _env_lock = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
-        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "2");
-        let live_all = |_id: &str| true;
-
-        register_continuation_session("t-live".into(), Some("a-live".into()), None);
-        // Bound, not dropped: this test is about what a HELD reservation costs.
-        let (verdict, _held) = evaluate_continuation_guard(Some("a-reserved"), &live_all, &calm);
-        assert_eq!(verdict, ContinuationGuard::Proceed);
-        assert!(anchor_is_reserved("a-reserved"));
-        // 1 live + 1 reserved, cap 2: if the reservation counted this would be
-        // AtCap(2).
-        assert_eq!(
-            guard_verdict(Some("a-next"), &live_all, &calm),
-            ContinuationGuard::Proceed,
-            "a reservation must not consume a cap slot"
-        );
-        assert!(
-            admit_launch(uuid::Uuid::now_v7(), &live_all, &calm).is_ok(),
-            "the launch guard shares the cap and must not count reservations either"
-        );
 
         clear_continuation_registry();
     }
@@ -14755,169 +16329,16 @@ mod tests {
         let _env_lock = env_lock();
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
 
         register_continuation_session("tid-a".into(), None, None);
         // Another anchor-less dispatch must NOT be deduped against the existing
         // anchor-less session (we can't correlate them).
         assert_eq!(
-            guard_verdict(None, &live_all, &calm),
+            guard_verdict(None, &live_all, &calm_reading),
             ContinuationGuard::Proceed
         );
 
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
-        clear_continuation_registry();
-    }
-
-    /// P4: at the configured cap, a fresh dispatch is refused (`AtCap`). Below
-    /// the cap it proceeds. Dead sessions are pruned before counting, so they
-    /// don't consume cap slots. Env override is honored.
-    #[test]
-    fn continuation_cap_refuses_at_limit() {
-        let _env_lock = env_lock();
-        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "2");
-        let live_all = |_id: &str| true;
-
-        // 0 live, cap 2 → proceed.
-        assert_eq!(
-            guard_verdict(Some("a1"), &live_all, &calm),
-            ContinuationGuard::Proceed
-        );
-        register_continuation_session("t1".into(), Some("a1".into()), None);
-        register_continuation_session("t2".into(), Some("a2".into()), None);
-
-        // 2 live, cap 2 → AtCap (a NEW anchor, so not a dedup).
-        assert_eq!(
-            guard_verdict(Some("a3"), &live_all, &calm),
-            ContinuationGuard::AtCap(2)
-        );
-
-        // One session dies → pruned → back under cap → proceed.
-        let t1_dead = |id: &str| id != "t1";
-        assert_eq!(
-            guard_verdict(Some("a3"), &t1_dead, &calm),
-            ContinuationGuard::Proceed
-        );
-
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
-        clear_continuation_registry();
-    }
-
-    /// P3 before P4: a duplicate of an already-LIVE anchor is reported as a
-    /// dedup even when the registry is at the cap — the honest reason is "this
-    /// is already running", not "capped".
-    #[test]
-    fn dedup_takes_precedence_over_cap() {
-        let _env_lock = env_lock();
-        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "1");
-        let live_all = |_id: &str| true;
-
-        register_continuation_session("t1".into(), Some("anchor-dup".into()), None);
-        // At cap (1) AND the anchor matches a live session → dedup wins.
-        assert_eq!(
-            guard_verdict(Some("anchor-dup"), &live_all, &calm),
-            ContinuationGuard::DuplicateAnchor(AnchorHolder::Live("t1".to_string()))
-        );
-
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
-        clear_continuation_registry();
-    }
-
-    /// The cap reads `QONTINUI_CONTINUATION_SESSION_CAP`, falling back to the
-    /// default for an unset / non-numeric value — and the operator override wins
-    /// in BOTH directions over a default that is now finite.
-    ///
-    /// The two default assertions here used to compare `continuation_session_cap()`
-    /// against `DEFAULT_CONTINUATION_SESSION_CAP`, which is a tautology: it
-    /// passed identically when the default was `usize::MAX` and it would pass if
-    /// the default were 0. They now pin the two properties that actually matter
-    /// — the default is FINITE (the whole point of Phase 1 of
-    /// `2026-08-30-load-aware-spawn-admission-control`), and an explicit env
-    /// value displaces it in either direction.
-    #[test]
-    fn continuation_session_cap_env_parsing() {
-        let _env_lock = env_lock();
-        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let prev = std::env::var("QONTINUI_CONTINUATION_SESSION_CAP").ok();
-
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
-        let default_cap = continuation_session_cap();
-        assert_eq!(default_cap, DEFAULT_CONTINUATION_SESSION_CAP);
-        assert!(
-            default_cap < usize::MAX,
-            "the unset default must be FINITE — an infinite cap is the guard that \
-             failed to fire on 2026-08-29"
-        );
-        assert_eq!(
-            default_cap, 64,
-            "the shipped default is 64; see DEFAULT_CONTINUATION_SESSION_CAP for why"
-        );
-
-        // Override DOWN (an operator throttling a small box)…
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "7");
-        assert_eq!(continuation_session_cap(), 7);
-        // …and UP, past the default: the override is not a ceiling-only knob.
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "200");
-        assert_eq!(continuation_session_cap(), 200);
-
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "not-a-number");
-        assert_eq!(
-            continuation_session_cap(),
-            DEFAULT_CONTINUATION_SESSION_CAP,
-            "garbage falls back to the default, not to unbounded"
-        );
-
-        match prev {
-            Some(v) => std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", v),
-            None => std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP"),
-        }
-    }
-
-    /// REGRESSION (the 2026-08-29 wedge, count lane): the DEFAULT cap — no env
-    /// override at all — refuses. This test is the inverse of the one it
-    /// replaces (`unbounded_default_cap_never_refuses_on_count`, which asserted
-    /// `continuation_session_cap() == usize::MAX` and that 50 live sessions
-    /// still proceed); that assertion encoded the very default the incident
-    /// falsified, so it is deleted rather than adjusted.
-    ///
-    /// Fill the registry to exactly the default cap and confirm the NEXT
-    /// dispatch is `AtCap` with the default in the payload. Deleting the finite
-    /// default fails this test.
-    #[test]
-    fn default_cap_is_finite_and_refuses_at_the_limit() {
-        let _env_lock = env_lock();
-        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        clear_continuation_registry();
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
-        let cap = continuation_session_cap();
-        assert!(cap < usize::MAX, "the default cap must be finite");
-
-        let live_all = |_id: &str| true;
-        // One under the cap → still Proceed: the cap must not fire early.
-        for i in 0..cap - 1 {
-            register_continuation_session(format!("t{i}"), Some(format!("a{i}")), None);
-        }
-        assert_eq!(
-            guard_verdict(Some("a-new"), &live_all, &calm),
-            ContinuationGuard::Proceed,
-            "cap-1 live sessions is under the cap"
-        );
-
-        // At the cap → the next one is refused, naming the default. One anchor
-        // per evaluation, so this test does not depend on `guard_verdict`
-        // dropping the permit it never binds (see its doc).
-        register_continuation_session(format!("t{}", cap - 1), Some("a-last".into()), None);
-        assert_eq!(
-            guard_verdict(Some("a-new-2"), &live_all, &calm),
-            ContinuationGuard::AtCap(cap),
-            "at {cap} live sessions the {n}th continuation is refused on count alone",
-            n = cap + 1
-        );
         clear_continuation_registry();
     }
 
@@ -14938,7 +16359,6 @@ mod tests {
         let _env_lock = env_lock();
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
 
         // One anchor per evaluation, so this test does not depend on
@@ -14948,7 +16368,7 @@ mod tests {
         // A live idle runner (151 threads) is BELOW the 256 warn ceiling →
         // nothing to say, spawn.
         assert_eq!(
-            guard_verdict(Some("a1"), &live_all, &|| thread_verdict(Some(151))),
+            guard_verdict(Some("a1"), &live_all, &|| thread_reading(Some(151))),
             ContinuationGuard::Proceed,
             "an idle machine must not defer — a guard that fires at rest is a \
              permanently-closed queue, not a guard"
@@ -14956,14 +16376,14 @@ mod tests {
         // Exactly ON the warn ceiling is AT it, not over it (the lane's
         // boundaries are strictly-above).
         assert_eq!(
-            guard_verdict(Some("a2"), &live_all, &|| thread_verdict(Some(256))),
+            guard_verdict(Some("a2"), &live_all, &|| thread_reading(Some(256))),
             ContinuationGuard::Proceed,
             "256 is the ceiling, not a crossing of it"
         );
 
         // WARN band (257..=400): defer, naming the warn ceiling.
-        match guard_verdict(Some("a3"), &live_all, &|| thread_verdict(Some(300))) {
-            ContinuationGuard::ThreadPressure {
+        match guard_verdict(Some("a3"), &live_all, &|| thread_reading(Some(300))) {
+            ContinuationGuard::LoadPressure {
                 severity,
                 observation,
             } => {
@@ -14980,8 +16400,8 @@ mod tests {
         // CRITICAL band (>400): still a deferral, now naming the critical
         // ceiling. The guard does not escalate past deferral — there is nothing
         // heavier for a queued row than leaving it queued.
-        match guard_verdict(Some("a4"), &live_all, &|| thread_verdict(Some(540))) {
-            ContinuationGuard::ThreadPressure {
+        match guard_verdict(Some("a4"), &live_all, &|| thread_reading(Some(540))) {
+            ContinuationGuard::LoadPressure {
                 severity,
                 observation,
             } => {
@@ -14992,7 +16412,6 @@ mod tests {
             other => panic!("540 threads must defer at critical severity, got {other:?}"),
         }
 
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
         clear_continuation_registry();
     }
 
@@ -15016,14 +16435,13 @@ mod tests {
         clear_continuation_registry();
         // Cap and dedup both deliberately out of the way: nothing but the thread
         // reading can produce a non-Proceed verdict here.
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
 
         let loaded = guard_verdict(Some("wedge-anchor"), &live_all, &|| {
-            thread_verdict(Some(540))
+            thread_reading(Some(540))
         });
         assert!(
-            matches!(loaded, ContinuationGuard::ThreadPressure { .. }),
+            matches!(loaded, ContinuationGuard::LoadPressure { .. }),
             "a 540-thread machine must NOT admit another continuation; got {loaded:?}"
         );
         assert_ne!(
@@ -15035,14 +16453,13 @@ mod tests {
         // Sessions exit, threads go back to the pool, the same anchor is
         // re-delivered by the backstop poll → it dispatches.
         assert_eq!(
-            guard_verdict(Some("wedge-anchor"), &live_all, &|| thread_verdict(Some(
+            guard_verdict(Some("wedge-anchor"), &live_all, &|| thread_reading(Some(
                 151
             ))),
             ContinuationGuard::Proceed,
             "the deferral self-heals on the reading alone — no arming flag, no reset"
         );
 
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
         clear_continuation_registry();
     }
 
@@ -15057,17 +16474,15 @@ mod tests {
         let _env_lock = env_lock();
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
 
         register_continuation_session("t-live".into(), Some("anchor-dup".into()), None);
         assert_eq!(
-            guard_verdict(Some("anchor-dup"), &live_all, &|| thread_verdict(Some(540))),
+            guard_verdict(Some("anchor-dup"), &live_all, &|| thread_reading(Some(540))),
             ContinuationGuard::DuplicateAnchor(AnchorHolder::Live("t-live".to_string())),
             "a live duplicate is a dedup, not a load deferral"
         );
 
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
         clear_continuation_registry();
     }
 
@@ -15077,9 +16492,9 @@ mod tests {
     /// The sibling test above (`dedup_takes_precedence_over_thread_pressure`)
     /// pins which verdict wins; this one pins what a deduped row PAYS. They are
     /// different properties and only one of them is about the incident: on the
-    /// live path the closure is `resource_guard::thread_pressure`, whose body is
-    /// a `settings.json` stat + parse, a `claude_accounts` load and — on Windows
-    /// — a system-wide `CreateToolhelp32Snapshot`. `poll_pending_continuations`
+    /// live path the closure is `resource_guard::probe_for_spawn`, whose body is
+    /// a `settings.json` stat + parse, a `claude_accounts` load, a memory read
+    /// and — on Windows — a system-wide `CreateToolhelp32Snapshot`. `poll_pending_continuations`
     /// spawns one task per row coord returns, on a route coord serves with no
     /// `LIMIT`, so with the verdict passed as an argument expression a batch of
     /// N duplicate-anchor rows took N system-wide thread snapshots on a machine
@@ -15095,7 +16510,6 @@ mod tests {
         let _env_lock = env_lock();
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
 
         let readings = std::sync::atomic::AtomicUsize::new(0);
@@ -15103,7 +16517,7 @@ mod tests {
             readings.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             // A verdict that WOULD defer, so the test cannot pass merely because
             // the reading happened to be calm.
-            thread_verdict(Some(540))
+            thread_reading(Some(540))
         };
 
         register_continuation_session("t-live".into(), Some("anchor-dup".into()), None);
@@ -15123,7 +16537,7 @@ mod tests {
         // or the assertion above would pass on a guard that never reads threads.
         assert!(matches!(
             guard_verdict(Some("some-other-anchor"), &live_all, &counted),
-            ContinuationGuard::ThreadPressure { .. }
+            ContinuationGuard::LoadPressure { .. }
         ));
         assert_eq!(
             readings.load(std::sync::atomic::Ordering::SeqCst),
@@ -15131,47 +16545,6 @@ mod tests {
             "a row that reaches the thread lane takes exactly one reading"
         );
 
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
-        clear_continuation_registry();
-    }
-
-    /// Ordering, step 2 before step 3: when BOTH the thread lane and the count
-    /// cap would fire, the verdict names THREADS.
-    ///
-    /// Thread count is the live reading of the resource that actually ran out;
-    /// the count cap is a static backstop. Reporting a thread-starved machine as
-    /// `AtCap` would send the next investigation to the wrong constant — which
-    /// is precisely what happened on 2026-08-29, when the cap was the thing
-    /// everyone looked at and threads were the thing that broke.
-    #[test]
-    fn thread_pressure_trips_ahead_of_the_count_cap() {
-        let _env_lock = env_lock();
-        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        clear_continuation_registry();
-        // Cap 1 with 1 live session: the count lane WOULD say AtCap(1).
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "1");
-        register_continuation_session("t1".into(), Some("other-anchor".into()), None);
-        let live_all = |_id: &str| true;
-
-        // Sanity: with no thread pressure this is unambiguously AtCap.
-        assert_eq!(
-            guard_verdict(Some("a-new"), &live_all, &calm),
-            ContinuationGuard::AtCap(1)
-        );
-
-        // Add thread pressure and the honest, earlier signal wins.
-        match guard_verdict(Some("a-new"), &live_all, &|| thread_verdict(Some(300))) {
-            ContinuationGuard::ThreadPressure {
-                severity,
-                observation,
-            } => {
-                assert_eq!(severity, "warn");
-                assert_eq!(observation.observed, 300);
-            }
-            other => panic!("threads must outrank the count cap, got {other:?}"),
-        }
-
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
         clear_continuation_registry();
     }
 
@@ -15190,7 +16563,6 @@ mod tests {
         let _env_lock = env_lock();
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
 
         assert_eq!(
@@ -15199,12 +16571,251 @@ mod tests {
             "an unreadable sensor has no opinion"
         );
         assert_eq!(
-            guard_verdict(Some("a1"), &live_all, &|| thread_verdict(None)),
+            guard_verdict(Some("a1"), &live_all, &|| thread_reading(None)),
             ContinuationGuard::Proceed,
             "UNKNOWN must never defer — fail open"
         );
 
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
+        clear_continuation_registry();
+    }
+
+    // =========================================================================
+    // Projected cost: admitted, not-yet-registered continuations count against
+    // the resource lanes (plan 2026-10-28-finished-gate-continuations-… Phase 4,
+    // the insight of plan 2026-10-28-gate-continuation-cap-is-a-real-permit)
+    // =========================================================================
+
+    /// Free commit leaving room for exactly `k` admissions at
+    /// [`TEST_SPAWN_COST`]: the k-th admission (k-1 already pending) still
+    /// projects above the warn floor; the (k+1)-th projects under it.
+    fn free_with_headroom_for(k: u64) -> u64 {
+        let floors = crate::settings::SessionGuardSettings::default();
+        let cost = TEST_SPAWN_COST.commit_bytes;
+        floors.warn_free_commit_bytes + (k - 1) * cost + cost / 2
+    }
+
+    fn reserved_spawns_now() -> usize {
+        continuation_sessions()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .reserved_spawns
+    }
+
+    /// SEQUENTIAL burst, every permit held (the replay's shape): 20 distinct
+    /// anchors against ONE calm-at-the-start reading with headroom for 3 admit
+    /// exactly 3; the other 17 defer on the memory lane, naming the projected
+    /// reading — never an `at_cap:` count.
+    #[test]
+    fn burst_of_pending_rows_admits_only_the_projected_headroom() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let live_all = |_id: &str| true;
+        let reading = || commit_reading(free_with_headroom_for(3));
+        assert_eq!(
+            reading().projected(0).0,
+            crate::resource_guard::SpawnGate::Proceed,
+            "the reading alone is calm — only the projection can bound the burst"
+        );
+
+        let mut held = Vec::new();
+        let mut deferred = 0;
+        for i in 0..20 {
+            let anchor = format!("burst-{i}");
+            let (verdict, permit) = evaluate_continuation_guard(Some(&anchor), &live_all, &reading);
+            match verdict {
+                ContinuationGuard::Proceed => held.push(permit),
+                ContinuationGuard::LoadPressure { observation, .. } => {
+                    assert_eq!(
+                        observation.metric,
+                        crate::resource_guard::LaneMetric::FreeCommitBytes
+                    );
+                    deferred += 1;
+                }
+                other => panic!("unexpected verdict {other:?}"),
+            }
+        }
+        assert_eq!(held.len(), 3, "headroom for 3 admits exactly 3");
+        assert_eq!(deferred, 17);
+        assert_eq!(
+            reserved_spawns_now(),
+            3,
+            "each admitted permit holds one unit"
+        );
+        drop(held);
+        assert_eq!(
+            reserved_spawns_now(),
+            0,
+            "dropping the permits gives every unit back"
+        );
+        clear_continuation_registry();
+    }
+
+    /// The same burst with ANCHOR-LESS continuations — the population a count of
+    /// `pending_anchors` could never see.
+    #[test]
+    fn anchorless_burst_is_bounded_by_the_projection_too() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let live_all = |_id: &str| true;
+        let reading = || thread_reading(Some(200));
+        // 200 graded threads, 256 warn ceiling, 10 threads per projected
+        // session: pending 0..=5 project <= 250; pending 6 projects 260 > 256.
+        let held: Vec<_> = (0..20)
+            .map(|_| evaluate_continuation_guard(None, &live_all, &reading))
+            .filter(|(v, _)| *v == ContinuationGuard::Proceed)
+            .map(|(_, permit)| permit)
+            .collect();
+        assert_eq!(held.len(), 6);
+        assert_eq!(reserved_spawns_now(), 6);
+        drop(held);
+        assert_eq!(reserved_spawns_now(), 0);
+        clear_continuation_registry();
+    }
+
+    /// CONCURRENT guard passes — the 2026-10-27 incident shape (cap 9, 20
+    /// passed the guard at once): 20 threads released together through a
+    /// barrier, every one reading the SAME pre-burst headroom for 3, admit at
+    /// most 3 (exactly 3, since the count serializes them).
+    #[test]
+    fn concurrent_guard_passes_admit_at_most_the_projected_headroom() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        const N: usize = 20;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let live_all = |_id: &str| true;
+                    let reading = || commit_reading(free_with_headroom_for(3));
+                    barrier.wait();
+                    let anchor = format!("concurrent-{i}");
+                    evaluate_continuation_guard(Some(&anchor), &live_all, &reading)
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("guard thread"))
+            .collect();
+        let admitted = results
+            .iter()
+            .filter(|(v, _)| *v == ContinuationGuard::Proceed)
+            .count();
+        assert_eq!(
+            admitted, 3,
+            "20 concurrent passes with headroom for 3 admit exactly 3"
+        );
+        assert_eq!(reserved_spawns_now(), 3);
+        drop(results);
+        assert_eq!(reserved_spawns_now(), 0);
+        clear_continuation_registry();
+    }
+
+    /// A held permit's unit settles exactly once on every exit: hand-over moves
+    /// it into the live registry (reserved −1, live +1 in one acquisition), drop
+    /// and the headless `release` give it back, and a REFUSED evaluation never
+    /// takes one.
+    #[test]
+    fn projected_units_settle_on_handover_release_and_drop() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let live_all = |_id: &str| true;
+
+        let (v1, terminal) =
+            evaluate_continuation_guard(Some("settle-a"), &live_all, &calm_reading);
+        let (v2, headless) = evaluate_continuation_guard(None, &live_all, &calm_reading);
+        let (v3, dropped) = evaluate_continuation_guard(Some("settle-c"), &live_all, &calm_reading);
+        assert_eq!(
+            (v1, v2, v3),
+            (
+                ContinuationGuard::Proceed,
+                ContinuationGuard::Proceed,
+                ContinuationGuard::Proceed
+            )
+        );
+        assert_eq!(reserved_spawns_now(), 3);
+
+        terminal.handed_to_registry("t-settle-a".into(), None);
+        assert_eq!(reserved_spawns_now(), 2, "hand-over gives the unit back");
+        assert_eq!(
+            continuation_sessions()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .live
+                .len(),
+            1,
+            "…because the session is now a live row the readings will see"
+        );
+        headless.release();
+        assert_eq!(
+            reserved_spawns_now(),
+            1,
+            "the headless release gives the unit back"
+        );
+        drop(dropped);
+        assert_eq!(
+            reserved_spawns_now(),
+            0,
+            "a give-up drop gives the unit back"
+        );
+
+        let (refused, permit) =
+            evaluate_continuation_guard(Some("settle-d"), &live_all, &|| commit_reading(GIB));
+        assert!(matches!(refused, ContinuationGuard::LoadPressure { .. }));
+        assert_eq!(
+            reserved_spawns_now(),
+            0,
+            "a refused evaluation takes no unit"
+        );
+        drop(permit);
+        assert_eq!(
+            reserved_spawns_now(),
+            0,
+            "and its empty permit gives none back"
+        );
+        clear_continuation_registry();
+    }
+
+    /// Launch admission is charged with the continuations admitted and not yet
+    /// running: with the headroom used up by held permits, a launch on the same
+    /// reading defers with a `deferred_load:` reason; once they settle it admits.
+    #[test]
+    fn launch_admission_counts_reserved_continuations() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let live_all = |_id: &str| true;
+        let reading = || commit_reading(free_with_headroom_for(2));
+
+        assert_eq!(
+            admit_launch(&live_all, &reading),
+            Ok(()),
+            "nothing pending: admitted"
+        );
+        let held: Vec<_> = (0..2)
+            .map(|i| {
+                evaluate_continuation_guard(Some(&format!("launch-{i}")), &live_all, &reading).1
+            })
+            .collect();
+        assert_eq!(reserved_spawns_now(), 2);
+        let reason =
+            admit_launch(&live_all, &reading).expect_err("headroom spent by pending continuations");
+        assert!(
+            reason.starts_with("deferred_load:commit_pressure:"),
+            "{reason}"
+        );
+        assert_eq!(
+            reserved_spawns_now(),
+            2,
+            "a launch takes no unit of its own"
+        );
+        drop(held);
+        assert_eq!(admit_launch(&live_all, &reading), Ok(()));
         clear_continuation_registry();
     }
 
@@ -15301,6 +16912,225 @@ mod tests {
         assert_eq!(p.target_device_id, device);
     }
 
+    /// The `spawned` OUTCOME carries the pinned Claude session uuid under the
+    /// exact wire name coord's `ConsumeContinuationRequest` reads,
+    /// `claude_code_session_id` — and nothing else changes shape.
+    #[test]
+    fn continuation_spawned_outcome_carries_claude_code_session_id() {
+        let device = uuid::Uuid::now_v7();
+        let pinned = uuid::Uuid::new_v4().to_string();
+        let v = serde_json::to_value(ContinuationConsumedBody::outcome(
+            device,
+            ContinuationOutcome::Spawned,
+            None,
+            Some(pinned.clone()),
+        ))
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "device_id": device,
+                "outcome": "spawned",
+                "claude_code_session_id": pinned,
+            })
+        );
+    }
+
+    /// `None` OMITS the key entirely (not `null`): an outcome with no pinned id
+    /// must be byte-identical to the pre-field body.
+    #[test]
+    fn continuation_outcome_without_session_id_omits_the_key() {
+        let device = uuid::Uuid::now_v7();
+        let text = serde_json::to_string(&ContinuationConsumedBody::outcome(
+            device,
+            ContinuationOutcome::Spawned,
+            None,
+            None,
+        ))
+        .unwrap();
+        assert!(
+            !text.contains("claude_code_session_id"),
+            "None must omit the key, got {text}"
+        );
+        assert_eq!(
+            text,
+            format!(r#"{{"device_id":"{device}","outcome":"spawned"}}"#)
+        );
+    }
+
+    /// The CLAIM stays byte-identical `{"device_id":"<uuid>"}` on the wire —
+    /// asserted on the serialized STRING, so a new `null`-serialized field (or a
+    /// session id leaking onto the claim) fails here, not just at coord.
+    #[test]
+    fn continuation_claim_body_is_byte_identical_device_id_only() {
+        let device = uuid::Uuid::now_v7();
+        let text = serde_json::to_string(&ContinuationConsumedBody::claim(device)).unwrap();
+        assert_eq!(text, format!(r#"{{"device_id":"{device}"}}"#));
+    }
+
+    /// Step 4's outcome post: `Ok(Some(id))` is `spawned` CARRYING the id;
+    /// `Ok(None)` (a headless child that did not exit cleanly) is `spawned` with
+    /// no id; `Err` is `spawn_failed` with the first error line and never an id.
+    #[test]
+    fn spawn_resolution_outcome_threads_the_pinned_id_onto_spawned_only() {
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(
+            spawn_resolution_outcome(&Ok(Some(id))),
+            SpawnResolution {
+                outcome: ContinuationOutcome::Spawned,
+                detail: None,
+                claude_code_session_id: Some(id.to_string()),
+            }
+        );
+        assert_eq!(
+            spawn_resolution_outcome(&Ok(None)),
+            SpawnResolution {
+                outcome: ContinuationOutcome::Spawned,
+                detail: None,
+                claude_code_session_id: None,
+            }
+        );
+        assert_eq!(
+            spawn_resolution_outcome(&Err(anyhow::anyhow!("pty create failed\nmore"))),
+            SpawnResolution {
+                outcome: ContinuationOutcome::SpawnFailed,
+                detail: Some("pty create failed".to_string()),
+                claude_code_session_id: None,
+            }
+        );
+    }
+
+    /// When the first attempt starts, one pinned id flows unchanged from the
+    /// allocate through the presentation to the outcome post and the
+    /// dispatch-allocation report, on both arms; a headless non-clean exit or
+    /// any spawn error binds nothing anywhere. The terminal retry case is
+    /// `a_retried_terminal_start_binds_the_id_that_started`.
+    #[test]
+    fn pinned_id_is_the_same_across_allocation_presentation_and_outcome() {
+        let pinned = uuid::Uuid::new_v4();
+        // The id the allocate is handed in run_gate_continuation_inner.
+        let allocated = Some(pinned);
+        for presented in [
+            presentation_bindable_session(PresentationResult::Terminal(Ok(pinned)), pinned),
+            presentation_bindable_session(
+                PresentationResult::Headless(Ok(HeadlessExit::Clean)),
+                pinned,
+            ),
+        ] {
+            let reported = bindable_session(&presented);
+            let outcome = spawn_resolution_outcome(&presented);
+            assert_eq!(reported, allocated, "report binds the allocated id");
+            assert_eq!(outcome.outcome, ContinuationOutcome::Spawned);
+            assert_eq!(
+                outcome.claude_code_session_id,
+                allocated.map(|id| id.to_string()),
+                "outcome carries the allocated id"
+            );
+        }
+        let dead = presentation_bindable_session(
+            PresentationResult::Headless(Ok(HeadlessExit::NonZero)),
+            pinned,
+        );
+        assert_eq!(bindable_session(&dead), None);
+        assert_eq!(spawn_resolution_outcome(&dead).claude_code_session_id, None);
+        for failed in [
+            presentation_bindable_session(
+                PresentationResult::Terminal(Err(anyhow::anyhow!("pty"))),
+                pinned,
+            ),
+            presentation_bindable_session(
+                PresentationResult::Headless(Err(anyhow::anyhow!("spawn"))),
+                pinned,
+            ),
+        ] {
+            assert_eq!(bindable_session(&failed), None);
+            let o = spawn_resolution_outcome(&failed);
+            assert_eq!(o.outcome, ContinuationOutcome::SpawnFailed);
+            assert_eq!(o.claude_code_session_id, None);
+        }
+    }
+
+    /// A terminal start that needed a local never-started retry runs under a
+    /// FRESH id, and that started id — not the allocated one — is what the
+    /// outcome and the dispatch-allocation report bind.
+    #[test]
+    fn a_retried_terminal_start_binds_the_id_that_started() {
+        let pinned = uuid::Uuid::new_v4();
+        let retried = uuid::Uuid::new_v4();
+        let presented =
+            presentation_bindable_session(PresentationResult::Terminal(Ok(retried)), pinned);
+        assert_eq!(bindable_session(&presented), Some(retried));
+        assert_eq!(
+            spawn_resolution_outcome(&presented).claude_code_session_id,
+            Some(retried.to_string())
+        );
+        // The loop's per-attempt mint: attempt 1 keeps the allocated id, a
+        // retry never reuses it.
+        assert_eq!(continuation_attempt_session_id(1, pinned), pinned);
+        let second = continuation_attempt_session_id(2, pinned);
+        assert_ne!(second, pinned);
+        assert_ne!(continuation_attempt_session_id(3, pinned), second);
+    }
+
+    /// The dispatch-allocation session report and the outcome's id binding share
+    /// one rule: report only a bindable session — never a dead headless child
+    /// (`Ok(None)`) or a failed spawn.
+    #[test]
+    fn bindable_session_gates_the_session_report() {
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(bindable_session(&Ok(Some(id))), Some(id));
+        assert_eq!(bindable_session(&Ok(None)), None);
+        assert_eq!(bindable_session(&Err(anyhow::anyhow!("boom"))), None);
+        assert_eq!(
+            bindable_session(&Ok(headless_bindable_session(HeadlessExit::NonZero, id))),
+            None
+        );
+    }
+
+    /// A headless child that exited cleanly binds its pinned id; one that exited
+    /// non-zero (died) binds nothing.
+    #[test]
+    fn headless_bindable_session_only_for_a_clean_exit() {
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(headless_bindable_session(HeadlessExit::Clean, id), Some(id));
+        assert_eq!(headless_bindable_session(HeadlessExit::NonZero, id), None);
+    }
+
+    /// coord's `claude_code_session_binding` verdicts: `bound`/`already_bound`
+    /// are bound; any other named verdict is NOT bound; a missing or non-string
+    /// field (or an unparseable body) is UNKNOWN, never bound.
+    #[test]
+    fn classify_session_binding_arms() {
+        assert_eq!(
+            classify_session_binding(r#"{"claude_code_session_binding":"bound"}"#),
+            SessionBinding::Bound("bound".to_string())
+        );
+        assert_eq!(
+            classify_session_binding(r#"{"claude_code_session_binding":"already_bound"}"#),
+            SessionBinding::Bound("already_bound".to_string())
+        );
+        assert_eq!(
+            classify_session_binding(r#"{"claude_code_session_binding":"no_placeholder"}"#),
+            SessionBinding::NotBound("no_placeholder".to_string())
+        );
+        assert_eq!(
+            classify_session_binding(r#"{"claude_code_session_binding":"device_mismatch"}"#),
+            SessionBinding::NotBound("device_mismatch".to_string())
+        );
+        assert_eq!(
+            classify_session_binding(r#"{"outcome_recorded":"spawned"}"#),
+            SessionBinding::Unreported
+        );
+        assert_eq!(
+            classify_session_binding(r#"{"claude_code_session_binding":null}"#),
+            SessionBinding::Unreported
+        );
+        assert_eq!(
+            classify_session_binding("not json"),
+            SessionBinding::Unreported
+        );
+    }
+
     /// The CLAIM body serializes to the FIXED wire contract coord accepts as a
     /// claim: EXACTLY `{"device_id": "<uuid>"}` (no `outcome`/`detail` keys —
     /// `skip_serializing_if` must elide them so the claim is byte-identical to
@@ -15324,6 +17154,7 @@ mod tests {
             device,
             ContinuationOutcome::Spawned,
             None,
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -15335,6 +17166,7 @@ mod tests {
             device,
             ContinuationOutcome::SpawnFailed,
             Some("terminal session create failed".to_string()),
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -15351,6 +17183,7 @@ mod tests {
         let unreported = serde_json::to_value(ContinuationConsumedBody::outcome(
             device,
             ContinuationOutcome::WorkUnreported,
+            None,
             None,
         ))
         .unwrap();
@@ -15572,21 +17405,37 @@ mod tests {
         assert_eq!(last_output_line("\r\n  \n"), None);
     }
 
-    /// A continuation inside its start window counts toward the P4 cap until
-    /// its run returns, however it returns.
+    /// A condition check reads the same start verdict: a started session owns
+    /// its report; a never-started or closed-before-start pane is reported as
+    /// `spawn_failed`, since no agent is left to drive the run row terminal.
     #[test]
-    fn starting_continuation_slot_counts_while_held() {
-        // The slots feed the P4 cap count every guard test reads, so hold the
-        // same lock they do or a parallel cap test sees +2.
-        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let before = starting_continuation_count();
-        let a = StartingContinuationSlot::acquire();
-        let b = StartingContinuationSlot::acquire();
-        assert!(starting_continuation_count() >= before + 2);
-        drop(a);
-        drop(b);
-        // Other tests never take a slot, so the count is back where it was.
-        assert_eq!(starting_continuation_count(), before);
+    fn condition_check_never_started_reason_reports_every_non_start() {
+        assert_eq!(
+            condition_check_never_started_reason(&ContinuationStart::Started { pty_alive: true }),
+            None
+        );
+        assert_eq!(
+            condition_check_never_started_reason(&ContinuationStart::Started { pty_alive: false }),
+            None
+        );
+        let closed = condition_check_never_started_reason(&ContinuationStart::Closed).unwrap();
+        assert!(
+            closed.contains("closed before the session started"),
+            "{closed}"
+        );
+        let never = condition_check_never_started_reason(&ContinuationStart::NeverStarted(
+            NeverStartedEvidence {
+                exit_code: Some(1),
+                lifetime_ms: 73,
+                last_output: Some("exec: claude: not found".to_string()),
+            },
+        ))
+        .unwrap();
+        assert!(
+            never.starts_with("condition-check never started: exec: claude: not found"),
+            "{never}"
+        );
+        assert!(!never.contains('\n'), "{never}");
     }
 
     /// The overloaded `gate_id` slot: a work-unit DAG dispatch reuses it for a
@@ -15606,12 +17455,15 @@ mod tests {
                 presentation: Presentation::Terminal,
                 source: GATE_CONTINUATION_SOURCE.to_string(),
                 anchor_key: Some("unit:00000000-0000-0000-0000-000000000000:phase-1".to_string()),
+                session_name: None,
                 gate_id,
                 dispatch_id,
                 target_instance_name: None,
                 // Upstream's dispatch-time continuation brief: irrelevant to
                 // the gate-id discrimination this test pins.
                 brief: None,
+                retry: None,
+                allocation: None,
             }
         }
         let gate = uuid::Uuid::now_v7();
@@ -15926,7 +17778,7 @@ mod tests {
 
         register_continuation_session("term-cont-2".to_string(), None, None);
         // No runtime handle (None) — must not panic on the missing reactor.
-        notify_continuation_terminal_exit("term-cont-2", None);
+        notify_continuation_terminal_exit("term-cont-2", None, None);
         assert!(
             !continuation_sessions()
                 .lock()
@@ -15946,7 +17798,7 @@ mod tests {
     ///
     /// (Replaces `at_cap_deferral_arms_backstop_flag`: the AtCap arming
     /// predicate was deleted with the gate — a WS frame lost while connected,
-    /// with no AtCap deferral this process lifetime and no terminal exit,
+    /// with no load deferral this process lifetime and no terminal exit,
     /// stranded a continuation until the next reconnect. The loop body now
     /// polls unconditionally on every tick; there is no arming state left to
     /// test.)
@@ -15981,7 +17833,195 @@ mod tests {
         );
     }
 
-    /// The deferred-stamp `reason` vocabulary, on the four constructors that
+    /// The two LIVE unattended pre-checks read both lanes through
+    /// `resource_guard::AdmissionReading::live` (the `lane_verdicts` read
+    /// `probe_for_spawn` composes, plus the projected per-session cost), never
+    /// the thread lane alone. The unit
+    /// tests above inject the verdict, so they cannot see which function the
+    /// production wiring passes; this pins that wiring. Before 2026-10-03 both
+    /// sites passed `thread_pressure`, so memory pressure reached no pre-check: a
+    /// WARN reading spawned anyway, and a CRITICAL one surfaced only as a
+    /// terminal `spawn_failed` at the PTY seam.
+    #[test]
+    fn the_live_pre_checks_read_both_resource_lanes() {
+        let source = include_str!("agent_runtime.rs");
+        let (prod, _) = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("the test module marker");
+        let body_of = |signature: &str| -> &str {
+            let (_, rest) = prod
+                .split_once(signature)
+                .unwrap_or_else(|| panic!("{signature} exists"));
+            rest.split_once("\n}\n").map_or(rest, |(body, _)| body)
+        };
+        for (site, body) in [
+            (
+                "evaluate_continuation_guard_live",
+                body_of("fn evaluate_continuation_guard_live("),
+            ),
+            ("spawn_run_task", body_of("fn spawn_run_task(")),
+        ] {
+            assert!(
+                body.contains("crate::resource_guard::AdmissionReading::live"),
+                "{site} must pass the live two-lane admission reading (with its projected cost)"
+            );
+            assert!(
+                !body.contains("crate::resource_guard::thread_pressure"),
+                "{site} must not fall back to the thread lane alone"
+            );
+        }
+    }
+
+    /// `/health` `spawnAdmission`: each lane's verdict, reading and limit, the
+    /// composed verdict, and the stamp the pre-check would write — built from
+    /// the same `LaneVerdicts` the gate composes. A disabled guard renders its
+    /// readings `null`, never `0`.
+    #[test]
+    fn spawn_admission_json_names_each_lane_and_the_stamp_it_would_write() {
+        let floors = crate::settings::SessionGuardSettings::default();
+        let lanes = |memory, graded: usize, threads| crate::resource_guard::LaneVerdicts {
+            memory_lane: "host",
+            free_commit_bytes: Some(WARN_BAND_FREE),
+            free_phys_bytes: None,
+            warn_free_commit_bytes: floors.warn_free_commit_bytes,
+            critical_free_commit_bytes: floors.critical_free_commit_bytes,
+            memory,
+            threads: crate::resource_guard::ThreadLane {
+                graded: Some(graded),
+                warn_ceiling: 256,
+                critical_ceiling: 400,
+                verdict: threads,
+            },
+        };
+
+        // Memory tripped, threads calm: the composed verdict and the stamp are
+        // the memory lane's.
+        let v = spawn_admission_json(
+            Some(&lanes(commit_verdict(WARN_BAND_FREE), 200, calm())),
+            7,
+            0,
+            TEST_SPAWN_COST,
+        );
+        assert_eq!(v["enabled"], true);
+        assert_eq!(v["verdict"], "warn");
+        assert_eq!(
+            v["deferStamp"],
+            format!(
+                "commit_pressure:warn:{WARN_BAND_FREE}_under_{}",
+                floors.warn_free_commit_bytes
+            )
+        );
+        assert_eq!(v["memory"]["freeCommitBytes"], WARN_BAND_FREE);
+        assert_eq!(v["memory"]["freePhysBytes"], serde_json::Value::Null);
+        assert_eq!(v["memory"]["warnFloorBytes"], floors.warn_free_commit_bytes);
+        assert_eq!(v["memory"]["verdict"], "warn");
+        assert_eq!(v["threads"]["verdict"], "proceed");
+        // The graded reading is reported whether or not the lane tripped.
+        assert_eq!(v["threads"]["gradedThreads"], 200);
+        assert_eq!(v["threads"]["warnCeiling"], 256);
+        assert_eq!(v["threads"]["criticalCeiling"], 400);
+        assert_eq!(v["liveContinuations"], 7);
+        assert_eq!(v["countCap"], "retired");
+
+        // Threads critical outranks memory warn — the heavier lane is reported,
+        // exactly as `probe_for_spawn` composes it.
+        let v = spawn_admission_json(
+            Some(&lanes(
+                commit_verdict(WARN_BAND_FREE),
+                540,
+                thread_verdict(Some(540)),
+            )),
+            0,
+            0,
+            TEST_SPAWN_COST,
+        );
+        assert_eq!(v["verdict"], "critical");
+        assert_eq!(v["deferStamp"], "thread_pressure:critical:540_over_400");
+        assert_eq!(v["threads"]["verdict"], "critical");
+        assert_eq!(v["threads"]["gradedThreads"], 540);
+
+        // Calm: no stamp.
+        let v = spawn_admission_json(Some(&lanes(calm(), 200, calm())), 0, 0, TEST_SPAWN_COST);
+        assert_eq!(v["verdict"], "proceed");
+        assert_eq!(v["deferStamp"], serde_json::Value::Null);
+        assert_eq!(v["reservedSpawns"], 0);
+
+        // Pending admissions are charged: 200 graded threads + 6 reserved × 10
+        // = 260 > 256, so the route reports what the next admission would
+        // decide, while the raw thread lane still reads `proceed`.
+        let threads_only = crate::resource_guard::ProjectedSpawnCost {
+            commit_bytes: 0,
+            threads: 10,
+        };
+        // Memory UNKNOWN here, so only the thread lane can move.
+        let threads_200 = thread_reading(Some(200)).lanes.expect("an enabled reading");
+        let v = spawn_admission_json(Some(&threads_200), 0, 6, threads_only);
+        assert_eq!(v["verdict"], "warn");
+        assert_eq!(v["deferStamp"], "thread_pressure:warn:260_over_256");
+        assert_eq!(v["threads"]["verdict"], "proceed");
+        assert_eq!(v["reservedSpawns"], 6);
+
+        // Disabled guard: nothing was read, so nothing is reported as a number.
+        let v = spawn_admission_json(None, 3, 2, TEST_SPAWN_COST);
+        assert_eq!(v["enabled"], false);
+        assert_eq!(v["memory"], serde_json::Value::Null);
+        assert_eq!(v["threads"], serde_json::Value::Null);
+        assert_eq!(v["liveContinuations"], 3);
+        assert_eq!(v["reservedSpawns"], 2);
+    }
+
+    /// A continuation offered while free memory is under its WARN floor — or its
+    /// CRITICAL floor — is DEFERRED by the pre-check, naming the memory lane.
+    /// Before 2026-10-03 the pre-check read threads only: the WARN row spawned
+    /// (the seam admits WARN), and the CRITICAL row was claimed and then died
+    /// `spawn_failed` at the PTY seam on the same memory reading.
+    #[test]
+    fn memory_pressure_defers_a_continuation_at_the_pre_check() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let live_all = |_id: &str| true;
+        let floors = crate::settings::SessionGuardSettings::default();
+
+        match guard_verdict(Some("a-mem"), &live_all, &|| commit_reading(WARN_BAND_FREE)) {
+            ContinuationGuard::LoadPressure {
+                severity,
+                observation,
+            } => {
+                assert_eq!(severity, "warn");
+                assert_eq!(observation.observed, WARN_BAND_FREE);
+                assert_eq!(observation.limit, floors.warn_free_commit_bytes);
+                assert_eq!(
+                    load_pressure_stamp_reason(severity, &observation),
+                    format!(
+                        "commit_pressure:warn:{WARN_BAND_FREE}_under_{}",
+                        floors.warn_free_commit_bytes
+                    )
+                );
+            }
+            other => panic!("2 GiB free must defer at warn, got {other:?}"),
+        }
+        // CRITICAL band (under 1.5 GiB): still a deferral, naming the critical
+        // floor — the reading that used to die `spawn_failed` after the claim.
+        match guard_verdict(Some("a-mem"), &live_all, &|| commit_reading(GIB)) {
+            ContinuationGuard::LoadPressure {
+                severity,
+                observation,
+            } => {
+                assert_eq!(severity, "critical");
+                assert_eq!(observation.limit, floors.critical_free_commit_bytes);
+            }
+            other => panic!("1 GiB free must defer at critical, got {other:?}"),
+        }
+        // Plenty of memory: proceeds.
+        assert_eq!(
+            guard_verdict(Some("a-mem"), &live_all, &|| commit_reading(64 * GIB)),
+            ContinuationGuard::Proceed
+        );
+        clear_continuation_registry();
+    }
+
+    /// The deferred-stamp `reason` vocabulary, on the constructors that
     /// actually produce it.
     ///
     /// ## What this replaced, and why
@@ -16027,7 +18067,8 @@ mod tests {
         //    412 is over the critical ceiling. Corrected there too.)
         let verdict = crate::resource_guard::evaluate_threads(
             Some(300),
-            &crate::settings::SessionGuardSettings::default(),
+            true,
+            crate::resource_guard::ThreadCeilings::SHIPPED,
         );
         let (severity, observation) = verdict
             .tripped()
@@ -16041,7 +18082,8 @@ mod tests {
         // word and the limit can never come from different verdicts.
         let wedge = crate::resource_guard::evaluate_threads(
             Some(540),
-            &crate::settings::SessionGuardSettings::default(),
+            true,
+            crate::resource_guard::ThreadCeilings::SHIPPED,
         );
         let (wedge_severity, wedge_observation) = wedge
             .tripped()
@@ -16051,10 +18093,31 @@ mod tests {
             "thread_pressure:critical:540_over_400"
         );
 
-        // 3. The concurrency cap — the successor to the deleted test's subject.
-        //    It names the cap, which is what the operator has to act on.
-        assert_eq!(at_cap_stamp_reason(64), "at_cap:64");
-        assert_eq!(at_cap_stamp_reason(4), "at_cap:4");
+        // 3. Memory pressure: class, severity, and the REAL numbers in bytes,
+        //    `_under_` because free memory trips by falling BELOW its floor.
+        //    Built from a real `evaluate` verdict against the shipped floors.
+        let floors = crate::settings::SessionGuardSettings::default();
+        let memory = commit_verdict(WARN_BAND_FREE);
+        let (mem_severity, mem_observation) = memory
+            .tripped()
+            .expect("2 GiB free is in the warn band (3 GiB warn, 1.5 GiB critical)");
+        assert_eq!(
+            commit_pressure_stamp_reason(mem_severity, mem_observation),
+            format!(
+                "commit_pressure:warn:{WARN_BAND_FREE}_under_{}",
+                floors.warn_free_commit_bytes
+            )
+        );
+        // `load_pressure_stamp_reason` routes on the METRIC, so each lane keeps
+        // its own class — the thread stamp is byte-identical to before.
+        assert_eq!(
+            load_pressure_stamp_reason(severity, observation),
+            thread_pressure_stamp_reason(severity, observation)
+        );
+        assert_eq!(
+            load_pressure_stamp_reason(mem_severity, mem_observation),
+            commit_pressure_stamp_reason(mem_severity, mem_observation)
+        );
 
         // 4. The registry refusal — the ONE class delimited by `_`, pinned as it
         //    is so that "fixing" it to a colon is a failing test rather than a
@@ -16075,7 +18138,7 @@ mod tests {
             duplicate_anchor_stamp_reason(&AnchorHolder::Live("t1".to_string())),
             duplicate_anchor_stamp_reason(&AnchorHolder::Reserved),
             thread_pressure_stamp_reason(severity, observation),
-            at_cap_stamp_reason(64),
+            commit_pressure_stamp_reason(mem_severity, mem_observation),
         ] {
             let (class, detail) = reason
                 .split_once(':')
@@ -16254,7 +18317,7 @@ mod drain_claim_tests {
             DrainAdmission::work(SpawnOrigin::UnitContinuation, format!("dispatch:{d}"))
         );
         assert_eq!(
-            continuation_drain_admission_for(ConsumeTarget::Gate(g)),
+            continuation_drain_admission_for(ConsumeTarget::Gate(g, 0)),
             DrainAdmission::work(SpawnOrigin::GateContinuation, format!("gate:{g}"))
         );
         assert_eq!(
@@ -16349,5 +18412,40 @@ mod launch_hold_tests {
         )
         .await;
         assert_eq!(out, LaunchHold::Refused(refusal));
+    }
+}
+
+/// Review N1/H2 wiring: `spawn_claude_child` refuses while the model gateway is
+/// unresolved (a reset settings file with the sticky marker present). Goes red
+/// if the `spawn_refusal` check is removed from the spawn path.
+#[cfg(test)]
+mod gateway_spawn_refusal_tests {
+    #[tokio::test]
+    async fn spawn_claude_child_refuses_an_unresolved_gateway() {
+        let _amb = crate::test_env::isolated_ambient();
+        let g = crate::model_gateway::ModelGatewaySettings {
+            base_url: Some("https://wiring-gw.example.com".to_string()),
+            api_key_helper: Some("echo wiring-key".to_string()),
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap()
+        .unwrap();
+        crate::model_gateway::write_marker_at(&crate::model_gateway::gateway_dir().unwrap(), &g)
+            .unwrap();
+        let workdir = std::env::temp_dir();
+        let outcome = super::spawn_claude_child(
+            &workdir.to_string_lossy(),
+            "hi",
+            None,
+            crate::coord_mcp::CoordMcpDelivery::Provisioned,
+            &[],
+            false,
+        )
+        .await;
+        match outcome {
+            Ok(_) => panic!("an unresolved gateway must refuse the spawn"),
+            Err(err) => assert!(format!("{err:#}").contains("model gateway"), "{err:#}"),
+        }
     }
 }

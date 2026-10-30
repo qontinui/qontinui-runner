@@ -30,6 +30,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { describeThrown } from "@/lib/utils";
 
 /** Snake-case ClaimKind discriminator on the wire (matches coord). */
 type ClaimKind =
@@ -96,14 +97,11 @@ export function ConflictModal() {
     let unlisten: UnlistenFn | undefined;
     (async () => {
       try {
-        unlisten = await listen<ConflictEvent>(
-          "agent-claim-conflict",
-          (event) => {
-            setConflict(event.payload);
-            setOpenError(null);
-            setOpening(false);
-          }
-        );
+        unlisten = await listen<ConflictEvent>("agent-claim-conflict", (event) => {
+          setConflict(event.payload);
+          setOpenError(null);
+          setOpening(false);
+        });
       } catch (e) {
         console.error("ConflictModal toast: listen failed", e);
       }
@@ -128,7 +126,7 @@ export function ConflictModal() {
       // Auto-dismiss once we hand off to the dashboard.
       setConflict(null);
     } catch (e) {
-      setOpenError(e instanceof Error ? e.message : String(e));
+      setOpenError(describeThrown(e, "Failed to open dashboard"));
     } finally {
       setOpening(false);
     }
@@ -136,9 +134,7 @@ export function ConflictModal() {
 
   if (!conflict) return null;
 
-  const holderHost = conflict.currentHolder
-    ? conflict.currentHolder.slice(0, 8)
-    : "unknown";
+  const holderHost = conflict.currentHolder ? conflict.currentHolder.slice(0, 8) : "unknown";
   const purpose = conflict.sessionMetadata?.purpose ?? conflict.intent ?? null;
 
   return (
@@ -157,9 +153,7 @@ export function ConflictModal() {
           </h4>
           <p className="text-sm text-muted-foreground">
             Machine{" "}
-            <code className="font-mono text-xs bg-muted px-1.5 py-0.5 rounded">
-              {holderHost}
-            </code>{" "}
+            <code className="font-mono text-xs bg-muted px-1.5 py-0.5 rounded">{holderHost}</code>{" "}
             holds{" "}
             <code className="font-mono text-xs bg-muted px-1.5 py-0.5 rounded break-all">
               {conflict.kind}:{conflict.resourceKey}
@@ -183,10 +177,7 @@ export function ConflictModal() {
             </p>
           )}
           {openError && (
-            <p
-              className="text-xs text-red-500"
-              data-ui-bridge-id="conflict-toast.error"
-            >
+            <p className="text-xs text-red-500" data-ui-bridge-id="conflict-toast.error">
               Could not open dashboard: {openError}
             </p>
           )}

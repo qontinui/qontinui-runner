@@ -56,11 +56,11 @@ pub const AUTONOMY_CREDENTIAL_DARK_EVENT: &str = "autonomy-credential-dark";
 /// log + back off).
 ///
 /// CRITICAL INVARIANT (Phase 5.2): a non-2xx coord response MUST map to
-/// [`RefreshOutcome::KeptExisting`], NEVER to a code path that clears the
-/// JWT. A 401 from coord means "this runner_token is stale"; if we
-/// cleared the access_token slot in response, the relay would lose its
-/// valid (just-not-yet-expired) device-JWT and the next user-flow would
-/// be forced into a fresh browser-pair. The refresher's job is to
+/// [`RefreshOutcome::KeptExisting`] or [`RefreshOutcome::BearerRejected`],
+/// NEVER to a code path that clears the JWT. A 401 from coord means "this
+/// runner_token is stale"; if we cleared the access_token slot in response,
+/// the relay would lose its valid (just-not-yet-expired) device-JWT and the
+/// next user-flow would be forced into a fresh browser-pair. The refresher's job is to
 /// REPLACE, not REVOKE.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RefreshOutcome {
@@ -68,11 +68,21 @@ pub(crate) enum RefreshOutcome {
     /// access_token slot. Carries the new JWT so the runtime loop can
     /// log its jti/exp without re-reading from disk.
     Replaced { new_jwt: String },
-    /// Coord returned a non-2xx (401, 503, anything else), OR the
-    /// network call failed, OR the spawn_blocking handle joined with
-    /// an error. The existing JWT in the access_token slot is left
-    /// untouched.
+    /// Coord returned a non-2xx that is NOT a verdict on the bearer (5xx,
+    /// 404, 429, anything else), OR the network call failed, OR the
+    /// spawn_blocking handle joined with an error. The existing JWT in the
+    /// access_token slot is left untouched. This is the TRANSIENT outcome: a
+    /// retry can help.
     KeptExisting,
+    /// pair-cli answered 401/403 — a verdict on the USER bearer we presented
+    /// (a revoked Cognito token, or a device JWT that cannot authorise a
+    /// user-scoped route at all). Not transient: re-presenting the same bearer
+    /// gets the same answer, so only a sign-in recovers it. The existing JWT is
+    /// left untouched exactly as for [`RefreshOutcome::KeptExisting`] —
+    /// REPLACE-not-REVOKE still holds; what changes is the classification the
+    /// posture and the banner read (plan
+    /// `2026-10-07-runner-credential-banner-offers-retry-when-only-sign-in-can-recover` D2).
+    BearerRejected { status: u16 },
     /// Coord returned a fresh JWT but persistence to AuthManager
     /// failed. The existing JWT in the access_token slot is left
     /// untouched (store_tokens is atomic; a failure aborts before
@@ -284,14 +294,17 @@ pub(crate) const DARK_SOURCE_POSTURE: &str = "posture";
 
 /// Emit the widened credential-dark / recovered notification to the frontend.
 ///
-/// Payload (DD3 of the coord-credential-posture plan, plus M5's `source`):
-/// `{source, dark, cause, message, cta, since}`. ONE event and ONE banner for
+/// Payload (DD3 of the coord-credential-posture plan, plus M5's `source`, plus
+/// `tenant_id` — plan `2026-09-14-credential-posture-third-residuals` Phase 3):
+/// `{source, dark, cause, message, cta, since, tenant_id}` — see
+/// [`credential_dark_payload`]. ONE event and ONE banner for
 /// every terminal credential cause — a second banner component would be the
 /// "wrong layer, two authorities" shape — but the two authorities are now
 /// distinguishable within it.
 ///
 /// Best-effort: an emit failure only `warn!`s — telemetry must never break the
 /// loop.
+#[allow(clippy::too_many_arguments)]
 fn emit_credential_dark_event(
     app: &tauri::AppHandle,
     source: &str,
@@ -300,18 +313,53 @@ fn emit_credential_dark_event(
     message: &str,
     cta: Option<&str>,
     since: Option<i64>,
+    tenant_id: Option<&str>,
+    pinned_tenant: bool,
 ) {
-    let payload = serde_json::json!({
+    let payload = credential_dark_payload(
+        source,
+        dark,
+        cause,
+        message,
+        cta,
+        since,
+        tenant_id,
+        pinned_tenant,
+    );
+    if let Err(e) = app.emit(AUTONOMY_CREDENTIAL_DARK_EVENT, &payload) {
+        warn!("device_jwt_refresher: failed to emit {AUTONOMY_CREDENTIAL_DARK_EVENT}: {e}");
+    }
+}
+
+/// Pure: the `autonomy-credential-dark` event payload.
+///
+/// `tenant_id` is the tenant the posture is about — the same value `/health`
+/// serves as `coordCredential.tenantId` — so the banner can name it and offer
+/// the tenant switch for a pinned tenant without a second read. `null` for the
+/// Cognito arm and for a posture that names no tenant. `pinned_tenant` is
+/// [`CoordCredentialStatus::pinned_tenant`]: the banner offers the tenant
+/// switch on it, never on `tenant_id` alone.
+#[allow(clippy::too_many_arguments)]
+fn credential_dark_payload(
+    source: &str,
+    dark: bool,
+    cause: &str,
+    message: &str,
+    cta: Option<&str>,
+    since: Option<i64>,
+    tenant_id: Option<&str>,
+    pinned_tenant: bool,
+) -> serde_json::Value {
+    serde_json::json!({
         "source": source,
         "dark": dark,
         "cause": cause,
         "message": message,
         "cta": cta,
         "since": since,
-    });
-    if let Err(e) = app.emit(AUTONOMY_CREDENTIAL_DARK_EVENT, &payload) {
-        warn!("device_jwt_refresher: failed to emit {AUTONOMY_CREDENTIAL_DARK_EVENT}: {e}");
-    }
+        "tenant_id": tenant_id,
+        "pinned_tenant": pinned_tenant,
+    })
 }
 
 /// The HARD-Cognito arm, unchanged in meaning and now one CAUSE among several
@@ -328,6 +376,8 @@ fn emit_credential_dark(app: &tauri::AppHandle, dark: bool) {
             "Autonomous sessions paused — sign in again to resume.",
             Some("sign_in"),
             None,
+            None,
+            false,
         );
     } else {
         emit_credential_dark_event(
@@ -338,6 +388,8 @@ fn emit_credential_dark(app: &tauri::AppHandle, dark: bool) {
             "Autonomous sessions resumed — credentials refreshed.",
             None,
             None,
+            None,
+            false,
         );
     }
 }
@@ -352,18 +404,32 @@ fn emit_credential_dark(app: &tauri::AppHandle, dark: bool) {
 /// `app: None` (hermetic tests, headless callers) derives and publishes the
 /// posture but shows nothing — the state is still readable on `/health`.
 fn notify_posture_transition(app: Option<&tauri::AppHandle>, transition: PostureTransition) {
-    if !should_notify_posture(transition.from, transition.to) {
+    if !transition_notifies(transition) {
         return;
     }
-    let since = coord_credential_posture().map(|s| s.since);
+    // The status the publisher just wrote: its `since`, and the sentence and
+    // tenant the banner shows — the pinned arm's composed reason names T and
+    // the selector's cause, which `transition.to.message()` cannot.
+    let status = coord_credential_posture();
+    let since = status.as_ref().map(|s| s.since);
+    let reason = status
+        .as_ref()
+        .map(CoordCredentialStatus::reason)
+        .unwrap_or_else(|| transition.to.message().to_string());
+    let tenant_id = status.as_ref().and_then(|s| s.tenant_id.clone());
+    let pinned_tenant = status.as_ref().is_some_and(|s| s.pinned_tenant);
     let from = transition
         .from
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| "unknown".to_string());
     warn!(
-        "device_jwt_refresher: coord-credential posture {from} -> {} ({})",
+        "device_jwt_refresher: coord-credential posture {from} -> {}{} ({reason})",
         transition.to.as_str(),
-        transition.to.message()
+        transition
+            .to
+            .cause()
+            .map(|c| format!("({c})"))
+            .unwrap_or_default(),
     );
     let Some(app) = app else { return };
     if transition.to.can_answer() {
@@ -375,6 +441,8 @@ fn notify_posture_transition(app: Option<&tauri::AppHandle>, transition: Posture
             "Coord access restored — this runner's credential is live again.",
             None,
             since,
+            None,
+            false,
         );
     } else {
         emit_credential_dark_event(
@@ -385,9 +453,11 @@ fn notify_posture_transition(app: Option<&tauri::AppHandle>, transition: Posture
                 .to
                 .cause()
                 .unwrap_or_else(|| transition.to.as_str()),
-            transition.to.message(),
+            &reason,
             transition.to.cta(),
             since,
+            tenant_id.as_deref(),
+            pinned_tenant,
         );
     }
 }
@@ -457,6 +527,13 @@ pub(crate) enum PairProgress {
     /// credential-dark even though it tried. Degraded, not gate-blocking-by-
     /// config: the tenant resolved, the mint just failed.
     BailRefreshFailedExpired,
+    /// The slot JWT is expired/opaque and NO usable user bearer exists to
+    /// re-mint it: either there was none to present (no Cognito session, so
+    /// pair-cli was SKIPPED rather than handed the dead device JWT —
+    /// `rejected_status: None`), or pair-cli refused the one presented
+    /// (`Some(401|403)`). Only a sign-in recovers this; the device-machine-key
+    /// exchange is still tried, because it needs no user at all.
+    BailNeedsSignIn { rejected_status: Option<u16> },
     /// `try_refresh_once` returned [`RefreshOutcome::TenantMismatch`]: coord
     /// minted a JWT for a DIFFERENT tenant than the one requested, and it was
     /// refused rather than persisted. Terminal for the tick — D3 of plan
@@ -468,6 +545,16 @@ pub(crate) enum PairProgress {
         expected: uuid::Uuid,
         returned: Option<uuid::Uuid>,
     },
+    /// `Decision::Pair` reached, `paired_user.json` names no user — but a
+    /// usable per-tenant device-JWT slot EXISTS and the tick's self-heal
+    /// refused to point a default binding at it. Distinct from
+    /// [`PairProgress::BailNoBearer`] ("no credential at all"): the fix is a
+    /// re-pair that writes the binding, and the refusal says which guard
+    /// stopped the automatic one. Built by [`unpaired_bail_progress`].
+    BailNoDefaultBinding {
+        usable_tenants: Vec<uuid::Uuid>,
+        refusal: String,
+    },
     /// The `Pair` arm completed with a usable JWT — either a fresh `Replaced`
     /// or a `KeptExisting`/`PersistFailed` whose existing JWT is still valid.
     Healthy,
@@ -476,7 +563,7 @@ pub(crate) enum PairProgress {
 /// Compact coord-credential health the runner stamps into its
 /// `coord.device_status.details` on every heartbeat (plan 2026-06-13 Phase 1b).
 /// Coord's `fleet_health::evaluate()` reads this to derive the device-scoped
-/// `coord_credentials_missing` alert; the runner itself never touches coord's
+/// `runner_coord_credentials_missing` alert; the runner itself never touches coord's
 /// alert machinery.
 ///
 /// Wire shape (under `details.coord_credential`):
@@ -529,6 +616,23 @@ pub(crate) fn coord_credential_health(
             Some(PairProgress::BailNoBearer) => CoordCredentialHealth::bad(
                 "no Cognito session and access_token slot empty — user must sign in",
             ),
+            Some(PairProgress::BailNoDefaultBinding {
+                usable_tenants,
+                refusal,
+            }) => {
+                let held = if usable_tenants.is_empty() {
+                    "a valid coord credential is held (the legacy access_token slot)".to_string()
+                } else {
+                    format!(
+                        "a valid per-tenant coord credential is held (tenant(s) \
+                         {usable_tenants:?})"
+                    )
+                };
+                CoordCredentialHealth::bad(format!(
+                    "{held} but paired_user.json names no default binding and the self-heal \
+                     refused: {refusal} — sign in to re-pair"
+                ))
+            }
             Some(PairProgress::BailNoTenant) => CoordCredentialHealth::bad(
                 "no resolvable tenant_id (OAuth claim, outgoing device-JWT, or \
                  machine.json::active_tenant_id all absent)",
@@ -537,6 +641,18 @@ pub(crate) fn coord_credential_health(
                 "device-JWT re-mint failed (coord non-2xx or persist error) and the \
                  existing JWT is expired — runner is credential-dark",
             ),
+            Some(PairProgress::BailNeedsSignIn {
+                rejected_status: None,
+            }) => CoordCredentialHealth::bad(
+                "device-JWT is expired and there is no Cognito session to re-mint it — \
+                 user must sign in",
+            ),
+            Some(PairProgress::BailNeedsSignIn {
+                rejected_status: Some(status),
+            }) => CoordCredentialHealth::bad(format!(
+                "device-JWT is expired and pair-cli rejected the user bearer (HTTP {status}) \
+                 — user must sign in"
+            )),
             Some(PairProgress::BailTenantMismatch { expected, returned }) => {
                 CoordCredentialHealth::bad(format!(
                     "device-JWT re-mint returned tenant {returned:?} but {expected} was \
@@ -578,9 +694,17 @@ pub(crate) struct CoordCredentialBag {
     pub reason: Option<String>,
     /// `live | expiring | expired | absent | unrefreshable | dark | unknown`.
     pub posture: String,
+    /// The `dark` cause (`upstream_401 | no_default_binding`), `null`
+    /// otherwise — so the fleet can tell "coord refuses the credential" from
+    /// "a credential is held but no default binding points at it" without
+    /// parsing `reason`. Additive: the key is new, `posture` is unchanged.
+    pub cause: Option<String>,
     /// ISO-8601 UTC instant the runner ENTERED this posture.
     pub since: String,
     pub tenant_id: Option<String>,
+    /// `true` only for the unserved-pin arm — see
+    /// [`CoordCredentialStatus::pinned_tenant`].
+    pub pinned_tenant: bool,
     /// Decoded `exp` of the credential the posture is about, unix seconds.
     pub exp: Option<i64>,
     /// How old this report may get before a reader must stop trusting it:
@@ -626,10 +750,12 @@ pub(crate) fn coord_credential_bag(
     match posture {
         Some(p) => CoordCredentialBag {
             ok: p.posture.can_answer(),
-            reason: (!p.posture.can_answer()).then(|| p.posture.message().to_string()),
+            reason: (!p.posture.can_answer()).then(|| p.reason()),
             posture: p.posture.as_str().to_string(),
+            cause: p.posture.cause().map(str::to_string),
             since: iso8601(p.since),
             tenant_id: p.tenant_id.clone(),
+            pinned_tenant: p.pinned_tenant,
             exp: p.exp,
             stale_after_secs: coord_credential_stale_after_secs(),
         },
@@ -637,8 +763,10 @@ pub(crate) fn coord_credential_bag(
             ok: fallback.ok,
             reason: fallback.reason.clone(),
             posture: "unknown".to_string(),
+            cause: None,
             since: iso8601(chrono::Utc::now().timestamp()),
             tenant_id: None,
+            pinned_tenant: false,
             exp: None,
             stale_after_secs: coord_credential_stale_after_secs(),
         },
@@ -793,10 +921,65 @@ impl RefresherState {
 
     /// Kick the refresher: interrupt any in-progress sleep so the next
     /// iteration runs immediately, re-reading settings + tokens.
-    pub fn kick(&self) {
-        let current = *self.kick_tx.borrow();
-        let _ = self.kick_tx.send(current.wrapping_add(1));
+    ///
+    /// Returns this kick's sequence number: the first pass that STARTS after
+    /// it reports that number (or a later one) when it concludes — see
+    /// [`commands::kick_device_jwt_refresher_and_wait`].
+    pub fn kick(&self) -> u64 {
+        let seq = KICK_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let _ = self.kick_tx.send(seq);
+        seq
     }
+}
+
+/// Every kick ever issued in this process, numbered. Process-global (not per
+/// [`RefresherState`]) so a refresher respawn cannot reset it under a waiter.
+static KICK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The kick sequence number the pass now running STARTED on — read at the top
+/// of each `refresher_loop` iteration, so every kick at or below it happened
+/// before the pass read any state.
+static PASS_IN_FLIGHT_KICK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The pass-concluded signal (plan
+/// `2026-10-07-runner-credential-banner-offers-retry-when-only-sign-in-can-recover`
+/// D5): the highest kick sequence number a CONCLUDED pass started on. A waiter
+/// that kicked with sequence `n` knows the pass it asked for has finished —
+/// and published its posture — once this reaches `n`.
+fn pass_concluded_cell() -> &'static watch::Sender<u64> {
+    static CELL: std::sync::OnceLock<watch::Sender<u64>> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| watch::channel(0u64).0)
+}
+
+/// Mark the start of a pass: every kick numbered at or below the returned
+/// sequence was issued before this pass read any state, so this pass answers
+/// it. Called at the top of each `refresher_loop` iteration.
+fn begin_pass() -> u64 {
+    let seq = KICK_SEQ.load(std::sync::atomic::Ordering::SeqCst);
+    PASS_IN_FLIGHT_KICK_SEQ.store(seq, std::sync::atomic::Ordering::SeqCst);
+    seq
+}
+
+/// Mark the pass now running as concluded. Called wherever a pass ends: every
+/// iteration of `refresher_loop` ends in a wait, so the wait is where it goes.
+fn note_pass_concluded() {
+    let seq = PASS_IN_FLIGHT_KICK_SEQ.load(std::sync::atomic::Ordering::SeqCst);
+    pass_concluded_cell().send_if_modified(|v| {
+        if seq > *v {
+            *v = seq;
+            true
+        } else {
+            false
+        }
+    });
+}
+
+/// Wait until a pass that started on kick `seq` (or later) has concluded.
+/// Returns `false` on timeout — UNKNOWN, never success.
+async fn wait_for_pass_concluded(seq: u64, timeout: Duration) -> bool {
+    let mut rx = pass_concluded_cell().subscribe();
+    let waited = tokio::time::timeout(timeout, rx.wait_for(|v| *v >= seq)).await;
+    matches!(waited, Ok(Ok(_)))
 }
 
 /// Spawn the refresher task. Returns the state handle so the caller can
@@ -913,10 +1096,10 @@ pub(crate) fn resolve_pair_tenant_id(
 /// device-JWT claim → machine.json) — see that function + the call site for
 /// the prod-breakage rationale.
 ///
-/// Invariant: a non-2xx HTTP response, a network error, or a
-/// spawn_blocking join failure all collapse to
-/// [`RefreshOutcome::KeptExisting`]. The caller MUST NOT clear the JWT
-/// in response to that variant — see the doc-comment on
+/// Invariant: a 401/403 maps to [`RefreshOutcome::BearerRejected`]; any other
+/// non-2xx HTTP response, a network error, or a spawn_blocking join failure
+/// collapses to [`RefreshOutcome::KeptExisting`]. The caller MUST NOT clear the
+/// JWT in response to either variant — see the doc-comment on
 /// [`RefreshOutcome`].
 pub(crate) async fn try_refresh_once(
     auth_manager: &crate::auth::AuthManager,
@@ -976,7 +1159,7 @@ pub(crate) async fn try_refresh_once(
     // pair_with_auth_token_with_ids is reqwest::blocking — must run via
     // spawn_blocking or it stalls the tokio runtime.
     let pair_join = spawn_blocking_tracked(move || {
-        qontinui_runner_lib::pair::pair_with_auth_token_with_ids(
+        qontinui_runner_lib::pair::pair_with_auth_token_with_ids_typed(
             &base, &token, &did, &uid, tenant_id, &origin,
         )
     })
@@ -1010,7 +1193,15 @@ pub(crate) async fn try_refresh_once(
                     crate::util::egress_context::EgressClient::DeviceJwtRefresher
                 )
             );
-            return RefreshOutcome::KeptExisting;
+            // D2: the status is typed (`PairCliError::status`), never parsed
+            // out of the message. The predicate is the slot pass's own narrow
+            // 401/403 gate, so the two paths agree on what "rejected" means.
+            return match e.status {
+                Some(status) if slot_refresh_is_credential_rejection(status) => {
+                    RefreshOutcome::BearerRejected { status }
+                }
+                _ => RefreshOutcome::KeptExisting,
+            };
         }
     };
 
@@ -1018,7 +1209,12 @@ pub(crate) async fn try_refresh_once(
     // slot. The refresh-token slot stays empty (device-JWT lifecycle is
     // owned by coord, not by an OAuth refresh chain). Guarded by the
     // tenant we just asked pair-cli to mint for — see `RefreshOutcome::TenantMismatch`.
-    match auth_manager.store_tokens_expecting(&resp.token, "", Some(tenant_id)) {
+    let token_for_store = resp.token.clone();
+    match store_write_off_runtime(auth_manager, move |m| {
+        m.store_tokens_expecting(&token_for_store, "", Some(tenant_id))
+    })
+    .await
+    {
         Ok(()) => {
             // M1: a NEW credential is in the slot — and, via the mirror, in
             // its tenant's slot — so every rejection coord recorded against
@@ -1042,6 +1238,288 @@ pub(crate) async fn try_refresh_once(
                 RefreshOutcome::PersistFailed(e.to_string())
             }
         }
+    }
+}
+
+/// Which bearer the `Pair` arm may present to pair-cli this tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PairBearer {
+    /// A bearer worth presenting: the Cognito access token, or — on a legacy
+    /// install with no Cognito session — the slot value, when it is NOT a
+    /// device JWT whose `exp` has passed (a legacy opaque `qontinui_runner_*`
+    /// user token is still presented: it is the migration path pair-cli heals).
+    Present(String),
+    /// No Cognito bearer, and the slot holds a device JWT whose decoded `exp`
+    /// is in the past. D1: it is NEVER presented to pair-cli — pair-cli
+    /// authenticates a user, and a dead device JWT can only ever earn a 401.
+    /// Carried only as the tenant-resolution hint for the dmk exchange.
+    DeadSlot(String),
+    /// No Cognito bearer and nothing in the slot.
+    Nothing,
+}
+
+/// Pure bearer choice for the `Pair` arm (D1). `slot` is the raw
+/// `access_token` slot value; `now` is unix seconds.
+pub(crate) fn pair_bearer_for(
+    cognito: Option<String>,
+    slot: Option<String>,
+    now: i64,
+) -> PairBearer {
+    if let Some(t) = cognito
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+    {
+        return PairBearer::Present(t);
+    }
+    match slot.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+        None => PairBearer::Nothing,
+        Some(t) => match crate::auth::decode_jwt_exp(&t) {
+            Some(exp) if now >= exp => PairBearer::DeadSlot(t),
+            _ => PairBearer::Present(t),
+        },
+    }
+}
+
+/// Latch for D1's once-per-entry warning — see the `Pair` arm.
+static DEAD_SLOT_SKIP_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The inputs to one [`attempt_pair_mint`], resolved by the `Pair` arm.
+pub(crate) struct PairMintRequest<'a> {
+    pub pair_base: &'a str,
+    pub pair_base_arm: Option<crate::api_config::ApiBaseUrlArm>,
+    pub bearer: &'a PairBearer,
+    pub refresh_class: RefreshClass,
+    pub device_id: &'a str,
+    pub user_id: &'a str,
+    pub machine_tenant: Option<uuid::Uuid>,
+    /// Device id for the device-machine-key fallback; `None` disables it.
+    pub dmk_device_id: Option<&'a str>,
+}
+
+/// What one `Pair`-arm mint attempt concluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PairMintAttempt {
+    /// `None` = pair-cli was NOT called (D1: no bearer worth presenting).
+    pub outcome: Option<RefreshOutcome>,
+    /// How far the arm got, for the heartbeat's `coord_credential` health.
+    pub progress: PairProgress,
+    /// `Some` = the device-machine-key exchange recovered the slot; the new
+    /// JWT is already persisted.
+    pub dmk_jwt: Option<String>,
+}
+
+impl PairMintAttempt {
+    /// The default slot's concluded recovery verdict (D3) — what the posture
+    /// reads to decide between `expired` (a retry can help) and
+    /// `unrefreshable` (only a sign-in can).
+    pub(crate) fn verdict(&self) -> DefaultSlotRecovery {
+        if self.dmk_jwt.is_some() || matches!(self.outcome, Some(RefreshOutcome::Replaced { .. })) {
+            return DefaultSlotRecovery::Refreshed;
+        }
+        match (&self.progress, &self.outcome) {
+            (
+                PairProgress::BailNeedsSignIn {
+                    rejected_status: None,
+                },
+                _,
+            ) => DefaultSlotRecovery::NeedsSignIn,
+            (PairProgress::BailNeedsSignIn { .. }, _)
+            | (_, Some(RefreshOutcome::BearerRejected { .. })) => {
+                DefaultSlotRecovery::BearerRejected
+            }
+            // Neither is fixed by re-running the same pass: no tenant resolves
+            // from any source, or coord keeps minting for the wrong one. Both
+            // need the account re-paired.
+            (PairProgress::BailNoTenant, _) => DefaultSlotRecovery::NoTenant,
+            (PairProgress::BailTenantMismatch { .. }, _) => DefaultSlotRecovery::TenantMismatch,
+            _ => DefaultSlotRecovery::KeptExisting,
+        }
+    }
+}
+
+/// The `Pair` arm's mint attempt, after 4a self-refresh declined: pair-cli
+/// with the user bearer (or, D1, no pair-cli at all when the only bearer is an
+/// expired device JWT), then — when that did not advance the slot — the
+/// Phase 4b device-machine-key exchange.
+///
+/// Factored out of `refresher_loop` so the D1 skip and the fallback ordering
+/// are testable against an in-process mock backend; the loop keeps the
+/// logging, the relay kick, the publishes and the wait.
+pub(crate) async fn attempt_pair_mint(
+    auth_manager: &crate::auth::AuthManager,
+    req: PairMintRequest<'_>,
+) -> PairMintAttempt {
+    // Phase 1b: resolve the tenant ONCE up front so the post-outcome health
+    // mapping can distinguish "no tenant resolved" (gate-blocking config) from
+    // "tenant fine, the mint just failed" (degraded). `try_refresh_once`
+    // re-resolves internally; the two resolutions agree because both call the
+    // same OAuth/outgoing-JWT/machine.json fallback chain.
+    let hint = match req.bearer {
+        PairBearer::Present(t) | PairBearer::DeadSlot(t) => t.as_str(),
+        PairBearer::Nothing => "",
+    };
+    let outgoing_jwt = auth_manager.get_access_token().ok();
+    let resolved_tenant = resolve_pair_tenant_id(hint, outgoing_jwt.as_deref(), req.machine_tenant);
+    let tenant_resolved = resolved_tenant.is_some();
+
+    // Phase 5.2: try_refresh_once encapsulates the pair-cli HTTP call + JWT
+    // persistence. It preserves the existing JWT on any non-2xx outcome.
+    let outcome = match req.bearer {
+        PairBearer::Present(t) => Some(
+            try_refresh_once(
+                auth_manager,
+                req.pair_base,
+                t,
+                req.device_id,
+                req.user_id,
+                req.machine_tenant,
+                req.pair_base_arm,
+            )
+            .await,
+        ),
+        PairBearer::DeadSlot(_) | PairBearer::Nothing => None,
+    };
+    let progress = match &outcome {
+        // D1: pair-cli skipped. A transient Cognito blip may still hand us a
+        // bearer next tick, so that case stays the retryable bail; otherwise
+        // only a sign-in (or the dmk exchange below) can recover.
+        None if req.refresh_class == RefreshClass::Transient => {
+            PairProgress::BailRefreshFailedExpired
+        }
+        None => PairProgress::BailNeedsSignIn {
+            rejected_status: None,
+        },
+        Some(RefreshOutcome::Replaced { .. }) => PairProgress::Healthy,
+        Some(RefreshOutcome::KeptExisting) | Some(RefreshOutcome::PersistFailed(_)) => {
+            if let Some(RefreshOutcome::PersistFailed(e)) = &outcome {
+                warn!("device_jwt_refresher: persist new JWT failed: {e}");
+            }
+            // The mint did NOT advance the slot. Classify why:
+            //   - no tenant resolvable → gate-blocking config red,
+            //   - tenant fine but the slot JWT is now expired/absent
+            //     → degraded "credential-dark" red,
+            //   - tenant fine and the slot JWT is still valid →
+            //     healthy (a transient coord 5xx we'll retry).
+            if !tenant_resolved {
+                PairProgress::BailNoTenant
+            } else if slot_jwt_is_expired_or_absent(auth_manager) {
+                PairProgress::BailRefreshFailedExpired
+            } else {
+                PairProgress::Healthy
+            }
+        }
+        // D2: the bearer was refused. Dark only once the slot itself is dead;
+        // while it is still valid the runner is healthy for now, and the
+        // recorded verdict says what the next expiry will need.
+        Some(RefreshOutcome::BearerRejected { status }) => {
+            if slot_jwt_is_expired_or_absent(auth_manager) {
+                PairProgress::BailNeedsSignIn {
+                    rejected_status: Some(*status),
+                }
+            } else {
+                PairProgress::Healthy
+            }
+        }
+        // D3: terminal for the tick — see `PairProgress::BailTenantMismatch`.
+        // Deliberately NOT `PersistFailed`'s arm: that path still falls
+        // through to the dmk-exchange fallback below, which this must not.
+        Some(RefreshOutcome::TenantMismatch { expected, returned }) => {
+            warn_tenant_mismatch_once(*expected, *returned);
+            PairProgress::BailTenantMismatch {
+                expected: *expected,
+                returned: *returned,
+            }
+        }
+    };
+
+    // Phase 4b: FINAL cold-start fallback. Self-refresh (4a) AND the Cognito
+    // pair-cli path have BOTH failed to advance the slot this tick. If a
+    // device machine key (`dmk_`) is stored, exchange it with web for a fresh
+    // device JWT — this recovers a runner offline past both the device-JWT TTL
+    // and the Cognito refresh-token window (>30d) with no user session.
+    // REPLACE-not-REVOKE: a miss never clears the existing JWT.
+    //
+    // D3: gated on the SPECIFIC bail reasons this fallback answers — NOT a
+    // blanket "anything but Healthy". `BailTenantMismatch` is deliberately
+    // excluded: coord already minted for the wrong tenant once this tick, and
+    // a dmk exchange mints from the SAME `coord.devices.tenant_id` column that
+    // wrong mint may have just overwritten, so falling through here would
+    // repeat the incident rather than recover from it. `BailNeedsSignIn` is
+    // included: the exchange needs no user, which is exactly the case it is.
+    let mut dmk_jwt = None;
+    if matches!(
+        progress,
+        PairProgress::BailNoTenant
+            | PairProgress::BailRefreshFailedExpired
+            | PairProgress::BailNeedsSignIn { .. }
+    ) {
+        if let Some(did) = req.dmk_device_id {
+            dmk_jwt = try_device_machine_key_exchange(
+                auth_manager,
+                req.pair_base,
+                did,
+                resolved_tenant.map(|(t, _)| t),
+            )
+            .await;
+        }
+    }
+    PairMintAttempt {
+        outcome,
+        progress,
+        dmk_jwt,
+    }
+}
+
+/// Where a pass publishes its posture — the loop's per-pass inputs.
+pub(crate) struct PassPosture<'a> {
+    /// No per-tenant slot exists, so the legacy default slot IS this runner's
+    /// coord credential and its posture is re-published from the verdict.
+    pub publish_legacy: bool,
+    pub pins: PosturePinInputs,
+    pub app: Option<&'a tauri::AppHandle>,
+}
+
+/// One `Pair`-arm mint tick, from the attempt to the pass being CONCLUDED:
+/// [`attempt_pair_mint`] → record the default slot's verdict → re-publish the
+/// legacy posture from it → [`note_pass_concluded`].
+///
+/// The ORDER is the contract a kick-and-wait caller relies on (D5): the pass
+/// must be marked concluded only AFTER the posture it produced is published,
+/// or "Retry refresh now" reads the previous pass's posture. Kept in one
+/// function so the order is testable rather than spread across the loop. The
+/// loop's later `wait_with_signals` marks the same pass concluded again,
+/// which is a no-op.
+pub(crate) async fn run_pair_tick(
+    auth_manager: &crate::auth::AuthManager,
+    req: PairMintRequest<'_>,
+    posture: PassPosture<'_>,
+) -> PairMintAttempt {
+    let attempt = attempt_pair_mint(auth_manager, req).await;
+    conclude_default_slot_recovery(
+        auth_manager,
+        attempt.verdict(),
+        posture.publish_legacy,
+        posture.pins,
+        posture.app,
+    );
+    note_pass_concluded();
+    attempt
+}
+
+/// Record how the `Pair` arm's recovery of the default slot concluded, and —
+/// on a runner whose coord credential IS that slot (`publish_legacy`, i.e. no
+/// per-tenant slot exists) — re-publish the posture from it.
+fn conclude_default_slot_recovery(
+    auth_manager: &crate::auth::AuthManager,
+    verdict: DefaultSlotRecovery,
+    publish_legacy: bool,
+    pins: PosturePinInputs,
+    app: Option<&tauri::AppHandle>,
+) {
+    record_default_slot_recovery(verdict, auth_manager.get_access_token().ok().as_deref());
+    if publish_legacy {
+        derive_and_publish_legacy_posture(auth_manager, pins, app);
     }
 }
 
@@ -1176,7 +1654,12 @@ pub(crate) async fn try_device_self_refresh(
     // request against `current`, so a re-mint for any other tenant is a coord
     // bug or a stale slot, never a legitimate answer to THIS request.
     let expected_tenant = crate::auth::jwt_tenant_claim(&current);
-    match auth_manager.store_tokens_expecting(&body.token, "", expected_tenant) {
+    let token_for_store = body.token.clone();
+    match store_write_off_runtime(auth_manager, move |m| {
+        m.store_tokens_expecting(&token_for_store, "", expected_tenant)
+    })
+    .await
+    {
         Ok(()) => {
             // M1: the old credential's rejections are spent evidence — for the
             // default bucket and for the tenant slot the mirror just wrote.
@@ -1501,6 +1984,25 @@ pub enum DarkCause {
     /// bound to another tenant. `exp` alone reads this as `live`, which is
     /// exactly the silent case the posture exists to catch.
     UpstreamRejected,
+    /// A coord credential IS present — at least one per-tenant
+    /// `device_jwt:<tenant>` slot holds a usable JWT — but `paired_user.json`
+    /// names no DEFAULT binding pointing at it (vanished, blanked or
+    /// unreadable), and the self-heal
+    /// ([`qontinui_runner_lib::pair::heal_vanished_paired_user`]) REFUSED to
+    /// rebuild it. The 2026-09-28 shape, which the banner used to render as
+    /// "this runner has no coord credential" (plan
+    /// `2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential`
+    /// Phase 3).
+    ///
+    /// A `DarkCause`, not a seventh posture, because it is exactly this enum's
+    /// contract — a credential that looks alive locally while the calls that
+    /// need it do not reach coord with it — and because the posture token
+    /// (`dark`) and its refusal code (`runner_credential_dark`) are a
+    /// cross-repo wire contract the fleet's readers match verbatim
+    /// (`coord_mcp::runner_credential_refusal_code`). A new posture would mint
+    /// a fifth token nothing downstream knows; a new cause rides the existing
+    /// `dark` handling everywhere and is still told apart by `cause`.
+    NoDefaultBinding,
 }
 
 impl DarkCause {
@@ -1509,6 +2011,7 @@ impl DarkCause {
     pub fn as_str(self) -> &'static str {
         match self {
             DarkCause::UpstreamRejected => "upstream_401",
+            DarkCause::NoDefaultBinding => "no_default_binding",
         }
     }
 }
@@ -1532,7 +2035,9 @@ pub enum CoordCredentialPosture {
     /// The runner held a dead credential, the automatic exit RAN
     /// (clear + device-machine-key re-derive), and it did not put a working
     /// credential back. This is the terminal state the operator must act on —
-    /// no further automatic rung exists.
+    /// no further automatic rung exists. For the LEGACY default slot (which no
+    /// slot pass clears) it is a dead credential whose `Pair`-arm recovery
+    /// concluded needing a sign-in — see [`DefaultSlotRecovery`].
     Unrefreshable,
     /// The credential looks alive locally but coord will not accept it.
     Dark(DarkCause),
@@ -1577,6 +2082,13 @@ impl CoordCredentialPosture {
     /// needs an operator wins the one value `/health` and the banner carry.
     /// `Unrefreshable` outranks `Dark` because its automatic recovery has
     /// already been tried and refused.
+    ///
+    /// `Dark(NoDefaultBinding)` ranks with the other `dark` cause, for the
+    /// same two reasons: its automatic rung (the `paired_user.json` heal) has
+    /// already run and refused, and its remedy is the same re-pair. So it
+    /// outranks `Expired` (whose automatic re-derive is still pending) and
+    /// `Absent` — the latter deliberately: an unserved-pin `absent` beside a
+    /// usable slot is the very misreport this cause exists to replace.
     fn severity(self) -> u8 {
         match self {
             CoordCredentialPosture::Unrefreshable => 5,
@@ -1613,6 +2125,13 @@ impl CoordCredentialPosture {
                 "coord is REJECTING this runner's credential even though it has not expired \
                  locally. Sessions spawned now have no coord access."
             }
+            CoordCredentialPosture::Dark(DarkCause::NoDefaultBinding) => {
+                "a coord credential IS present (a valid per-tenant slot), but no default \
+                 binding points at it: paired_user.json is missing or unreadable, the \
+                 runner's self-heal refused to rebuild it, and the legacy access_token slot \
+                 holds no usable token either. Sessions spawned now have no default-scope \
+                 coord access; a session pinned to a tenant with a live slot still works."
+            }
         }
     }
 
@@ -1626,6 +2145,11 @@ impl CoordCredentialPosture {
             // now rather than up to 5 minutes from now.
             CoordCredentialPosture::Expired => Some("retry_refresh"),
             // These three have already exhausted the automatic rungs.
+            // `Dark(NoDefaultBinding)` included: its rung is the
+            // `paired_user.json` heal, which re-runs every tick and has
+            // refused, so `retry_refresh` would re-run a refusal. The re-pair
+            // CTA's sign-in runs `pair::persist_pairing`, which WRITES the
+            // default binding — the one thing missing.
             CoordCredentialPosture::Absent
             | CoordCredentialPosture::Unrefreshable
             | CoordCredentialPosture::Dark(_) => Some("re_pair"),
@@ -1649,6 +2173,12 @@ pub(crate) struct SlotObservation {
     /// What the pass then DID with it. `None` = the pass has not concluded for
     /// this slot — which is the BOOT observation (DD2, below).
     pub outcome: Option<TenantSlotOutcome>,
+    /// The LEGACY default slot only: the most recent CONCLUDED automatic
+    /// recovery verdict for the credential this slot holds (the `Pair` arm's,
+    /// see [`DefaultSlotRecovery`]). `None` = no recovery has concluded for it
+    /// yet — the boot case — or this is a per-tenant slot, whose recovery is
+    /// already carried by [`Self::outcome`].
+    pub recovery: Option<DefaultSlotRecovery>,
 }
 
 impl SlotObservation {
@@ -1661,6 +2191,7 @@ impl SlotObservation {
                 present: true,
                 unknown: false,
                 outcome: None,
+                recovery: None,
             },
             None => Self {
                 tenant_id,
@@ -1668,6 +2199,7 @@ impl SlotObservation {
                 present: false,
                 unknown: false,
                 outcome: None,
+                recovery: None,
             },
         }
     }
@@ -1680,7 +2212,149 @@ impl SlotObservation {
             present: false,
             unknown: true,
             outcome: None,
+            recovery: None,
         }
+    }
+}
+
+/// How the `Pair` arm's automatic recovery of the LEGACY default
+/// (`access_token`) slot CONCLUDED — the default-slot twin of the per-tenant
+/// pass's [`TenantSlotOutcome`].
+///
+/// It exists because the default slot's posture was derived from `exp` alone:
+/// a present-but-dead credential read `expired` (CTA "Retry refresh now")
+/// however many times recovery had already failed in a way no retry can fix.
+/// On 2026-10-07 that offered the operator a button that could never work —
+/// there was no Cognito session, so every pass presented the dead device JWT to
+/// pair-cli and got a 401 — while hiding the one that could (sign in). Plan
+/// `2026-10-07-runner-credential-banner-offers-retry-when-only-sign-in-can-recover`
+/// D3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DefaultSlotRecovery {
+    /// A mint put a working credential in the slot (self-refresh, pair-cli,
+    /// or the device-machine-key exchange).
+    Refreshed,
+    /// The mint failed in a way that says nothing about the bearer — a 5xx,
+    /// a transport fault, a transient Cognito refresh, a persist error — or
+    /// did not fail at all while the slot is still valid. A retry can help.
+    KeptExisting,
+    /// No usable user bearer existed, so pair-cli was skipped (D1), and the
+    /// device-machine-key exchange did not recover the slot either.
+    NeedsSignIn,
+    /// pair-cli refused the presented user bearer (401/403, D2), and the
+    /// device-machine-key exchange did not recover the slot either.
+    BearerRejected,
+    /// No tenant resolved from any source (OAuth claim, outgoing device JWT,
+    /// `machine.json`), and the device-machine-key exchange did not recover
+    /// the slot either. Configuration, not a transient fault: a retry re-runs
+    /// the same resolution.
+    NoTenant,
+    /// Coord minted for a DIFFERENT tenant than requested and the mint was
+    /// refused ([`PairProgress::BailTenantMismatch`]). Re-running the pass
+    /// asks the same coord row the same question; re-pairing fixes it.
+    TenantMismatch,
+}
+
+/// The two outcome tokens the per-tenant pass and the default slot share — ONE
+/// spelling, so `/health` `lastRefreshOutcome` cannot mean two things.
+const OUTCOME_TOKEN_REFRESHED: &str = "refreshed";
+const OUTCOME_TOKEN_KEPT_EXISTING: &str = "kept-existing";
+
+impl DefaultSlotRecovery {
+    /// Did every automatic rung fail in a way only a sign-in (re-pair) can
+    /// fix — i.e. would "Retry refresh now" re-run a pass that cannot help?
+    pub(crate) fn needs_sign_in(self) -> bool {
+        !matches!(
+            self,
+            DefaultSlotRecovery::Refreshed | DefaultSlotRecovery::KeptExisting
+        )
+    }
+
+    /// Stable token for `/health` `lastRefreshOutcome`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            DefaultSlotRecovery::Refreshed => OUTCOME_TOKEN_REFRESHED,
+            DefaultSlotRecovery::KeptExisting => OUTCOME_TOKEN_KEPT_EXISTING,
+            DefaultSlotRecovery::NeedsSignIn => "needs-sign-in",
+            DefaultSlotRecovery::BearerRejected => "bearer-rejected",
+            DefaultSlotRecovery::NoTenant => "no-tenant",
+            DefaultSlotRecovery::TenantMismatch => "tenant-mismatch",
+        }
+    }
+}
+
+/// The last concluded default-slot verdict, and WHICH credential it judged —
+/// a fingerprint of the token the slot held when the verdict was recorded. A
+/// verdict describes one credential: once the slot holds a different one (a
+/// sign-in, a pair-code redeem) the old verdict must not colour it, so a lookup
+/// only answers for a matching fingerprint.
+///
+/// A fingerprint rather than the decoded `exp`: every opaque token and an empty
+/// slot all decode to `exp: None`, so an `exp` key would let a verdict recorded
+/// against an empty slot colour a later, unrelated opaque token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DefaultSlotRecoveryRecord {
+    verdict: DefaultSlotRecovery,
+    judged: Option<SlotFingerprint>,
+}
+
+/// The first 8 bytes of the token's SHA-256 — enough to tell two credentials
+/// apart, and never the credential itself (the record is process memory, but
+/// a debug print of it must not leak a bearer).
+type SlotFingerprint = [u8; 8];
+
+/// Fingerprint of a slot value; `None` for an absent/blank slot.
+fn slot_fingerprint(token: Option<&str>) -> Option<SlotFingerprint> {
+    use sha2::{Digest, Sha256};
+    let t = token.map(str::trim).filter(|t| !t.is_empty())?;
+    let digest = Sha256::digest(t.as_bytes());
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&digest[..8]);
+    Some(out)
+}
+
+static DEFAULT_SLOT_RECOVERY: std::sync::Mutex<Option<DefaultSlotRecoveryRecord>> =
+    std::sync::Mutex::new(None);
+
+/// Record how the `Pair` arm's recovery of the default slot concluded.
+/// `slot_token` is what the slot holds NOW, after the attempt — the new
+/// credential on success, the unchanged dead one otherwise.
+pub(crate) fn record_default_slot_recovery(verdict: DefaultSlotRecovery, slot_token: Option<&str>) {
+    *DEFAULT_SLOT_RECOVERY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(DefaultSlotRecoveryRecord {
+        verdict,
+        judged: slot_fingerprint(slot_token),
+    });
+}
+
+/// The recorded verdict, if it was about `slot_token`. `None` = no recovery
+/// has concluded for this credential.
+pub(crate) fn default_slot_recovery_for(slot_token: Option<&str>) -> Option<DefaultSlotRecovery> {
+    let judged = slot_fingerprint(slot_token);
+    DEFAULT_SLOT_RECOVERY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .filter(|r| r.judged == judged)
+        .map(|r| r.verdict)
+}
+
+/// The LEGACY default slot's observation, from the tri-state store probe,
+/// carrying the last concluded recovery verdict for the credential it holds.
+pub(crate) fn legacy_slot_observation(
+    read: crate::secure_storage::StoredTokenRead,
+) -> SlotObservation {
+    use crate::secure_storage::StoredTokenRead;
+    match read {
+        StoredTokenRead::Present(t) => {
+            let mut obs = SlotObservation::observed(None, Some(t.as_str()));
+            if obs.present {
+                obs.recovery = default_slot_recovery_for(Some(t.as_str()));
+            }
+            obs
+        }
+        StoredTokenRead::Absent => SlotObservation::observed(None, None),
+        StoredTokenRead::Unreadable(_) => SlotObservation::unreadable(None),
     }
 }
 
@@ -2910,55 +3584,110 @@ struct SweepInputs {
     /// signed-in gate [`binding_gap_asks_permitted`]. Read in this blocking
     /// hop with the rest.
     legacy_slot_present: bool,
+    /// The coord-mcp forwarder's OWN verdict for the pinned tenant — see
+    /// [`PosturePinInputs::pin_served`] and [`pin_served_by_selector`].
+    pin_served: Option<Result<(), crate::auth::NoCredential>>,
 }
 
 /// Blocking: reads the slot store, `paired_user.json`, `machine.json` and the
-/// heartbeat's `coord_bound_tenants.json` sidecar.
+/// heartbeat's `coord_bound_tenants.json` sidecar — and, when `machine.json`
+/// pins a tenant, asks the credential SELECTOR whether it would serve it.
 fn read_sweep_inputs(auth_manager: &crate::auth::AuthManager) -> SweepInputs {
+    let default_binding = crate::auth::default_binding_tenant_probe();
+    let machine_pin = crate::session::tenant_pin::resolve_tenant_pin();
     SweepInputs {
         tenant_slots: auth_manager.try_list_tenant_device_jwt_tenants(),
-        default_binding: crate::auth::default_binding_tenant_probe(),
-        machine_pin: crate::session::tenant_pin::resolve_tenant_pin(),
+        default_binding,
+        machine_pin,
         coord_bound_tenants: qontinui_runner_lib::pair::coord_bound_tenants(),
         coord_bound_tenants_for_ask: qontinui_runner_lib::pair::coord_bound_tenants_for_ask(),
         legacy_slot_present: auth_manager
             .get_access_token()
             .map(|t| !t.trim().is_empty())
             .unwrap_or(false),
+        pin_served: pin_served_by_selector(
+            auth_manager,
+            machine_pin,
+            collapse_default_binding(default_binding),
+            crate::auth::measured_device_binding_count(),
+        ),
     }
 }
 
+/// `default_binding_tenant()`'s collapse, applied to the probe this hop
+/// already took rather than to a second read of `paired_user.json`: `Bound(t)`
+/// is `Some(t)`, and `Unbound` and `Unknown` are both `None`. That is exactly
+/// what the forwarder's [`crate::auth::device_bearer_for`] hands the selector,
+/// so an UNREADABLE binding serves nobody from the legacy slot here either.
+fn collapse_default_binding(binding: crate::auth::BindingTenantRead) -> Option<uuid::Uuid> {
+    match binding {
+        crate::auth::BindingTenantRead::Bound(t) => Some(t),
+        crate::auth::BindingTenantRead::Unbound | crate::auth::BindingTenantRead::Unknown => None,
+    }
+}
+
+/// Blocking: would the coord-mcp forwarder present a credential for the
+/// tenant `machine.json` pins? `None` when nothing is pinned (`Unpinned`,
+/// `Unresolvable`) — no tenant, so no question to ask.
+///
+/// It CALLS the selector — [`crate::auth::select_device_bearer_result_with`],
+/// the one implementation behind the forwarder's `device_bearer_for` — rather
+/// than re-deriving any of its branches (plan
+/// `2026-09-14-credential-posture-third-residuals` D1). Three hand-copied
+/// branches (an unreadable binding, an unreadable pinned slot, the legacy
+/// fallback) were each already a partial copy: none of them knew the selector
+/// also refuses a `Usable` legacy token whose claim names another tenant.
+///
+/// The token is DROPPED here: the posture needs the verdict and its cause,
+/// never the credential. Side effect, accepted: the selector's once-per-process
+/// `warn_once_per_tenant_*` lines can now fire from the pass rather than from
+/// the first request.
+fn pin_served_by_selector(
+    auth_manager: &crate::auth::AuthManager,
+    machine_pin: crate::session::tenant_pin::TenantPin,
+    default_tenant: Option<uuid::Uuid>,
+    binding_count: crate::auth::MeasuredBindingCount,
+) -> Option<Result<(), crate::auth::NoCredential>> {
+    let crate::session::tenant_pin::TenantPin::Pinned(pinned) = machine_pin else {
+        return None;
+    };
+    Some(
+        crate::auth::select_device_bearer_result_with(
+            auth_manager,
+            Some(&pinned),
+            default_tenant,
+            binding_count,
+        )
+        .map(|_token| ()),
+    )
+}
+
 impl SweepInputs {
-    /// The half of these inputs the POSTURE reads, too — or
-    /// [`PosturePinInputs::UNPINNED`] when the slot store could not be read.
+    /// The half of these inputs the POSTURE reads, too.
     ///
-    /// An unreadable store takes the LEGACY arm (the branch choice collapses
-    /// `Err` to "no slots"), whose only observation is the `access_token` slot
-    /// with `tenant_id: None`. That observation can never name the pinned
-    /// tenant, so feeding the real pin through would call a pin `unserved` on a
-    /// multi-tenant box whose `device_jwt:<pin>` slot may be perfectly healthy —
-    /// one failed read publishes `absent(T)`, and the next good read fires
-    /// *"Coord access restored"*. An unreadable input is not evidence, so the
-    /// posture is derived from the observations alone, exactly as if no pin
-    /// existed. `UNPINNED` rather than a doctored `Unresolvable` pin because the
-    /// pin itself WAS read; what is missing is any measurement of whether a slot
-    /// serves it. A readable but EMPTY store (`Ok(vec![])`, a legacy-only
-    /// install) is a measured absence and keeps the real pins.
+    /// An UNREADABLE slot store is no longer special-cased (plan
+    /// `2026-09-14-credential-posture-third-residuals` D3). It used to return
+    /// `UNPINNED`, deriving the posture from the legacy observation alone — so
+    /// a box pinned to T published `live` off the legacy slot while the
+    /// forwarder, whose own read of T's slot hit the same unreadable store,
+    /// refused every T-pinned session. The selector read in
+    /// [`read_sweep_inputs`] reads that store too, and says so in
+    /// [`Self::pin_served`]; the posture follows it. The cost is a flap — one
+    /// failed read publishes `absent(T)` and the next good read fires
+    /// *"Coord access restored"* — which is a TRUE report of what the forwarder
+    /// did in that window, where the abstention was a false `live`.
     fn posture_pin_inputs(&self) -> PosturePinInputs {
-        if self.tenant_slots.is_err() {
-            return PosturePinInputs::UNPINNED;
-        }
         PosturePinInputs {
             machine_pin: self.machine_pin,
-            default_binding: self.default_binding,
+            pin_served: self.pin_served,
         }
     }
 }
 
 /// What the posture needs to know about the tenant this machine ASKS for,
-/// beyond the slots a pass observed: `machine.json`'s pin and
-/// `paired_user.json`'s default binding, already read by
-/// [`read_sweep_inputs`] and passed in rather than re-read.
+/// beyond the slots a pass observed: `machine.json`'s pin, and the credential
+/// selector's verdict for it — both already read by [`read_sweep_inputs`] and
+/// passed in rather than re-read.
 ///
 /// Without it, a pinned tenant whose slot was cleared BEFORE any rejection
 /// streak formed was observed by nothing and remembered by no bucket, so a
@@ -2968,7 +3697,12 @@ impl SweepInputs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PosturePinInputs {
     pub machine_pin: crate::session::tenant_pin::TenantPin,
-    pub default_binding: crate::auth::BindingTenantRead,
+    /// Would the coord-mcp forwarder present a credential for the pinned
+    /// tenant? `Some(Ok(()))` = yes; `Some(Err(cause))` = no, and why — the
+    /// selector's own [`crate::auth::NoCredential`], kept so the published
+    /// reason can say *"slot unreadable"* rather than implying the credential
+    /// is gone. `None` when nothing is pinned.
+    pub pin_served: Option<Result<(), crate::auth::NoCredential>>,
 }
 
 impl PosturePinInputs {
@@ -2977,33 +3711,41 @@ impl PosturePinInputs {
     /// `machine.json` to speak of.
     pub(crate) const UNPINNED: Self = Self {
         machine_pin: crate::session::tenant_pin::TenantPin::Unpinned,
-        default_binding: crate::auth::BindingTenantRead::Unknown,
+        pin_served: None,
     };
 
-    /// The tenant `machine.json` pins, iff that pin is POSITIVELY unserved by
-    /// this pass: no observation — an unreadable one included — names it, and
-    /// the default binding is MEASURED to be something else.
+    /// The tenant `machine.json` pins, and why no credential serves it, iff the
+    /// pin is UNSERVED this pass: the selector the forwarder runs refused it
+    /// (`pin_served == Some(Err(_))`), and no MEASURED observation names it.
     ///
-    /// Every unmeasured input abstains. `Unpinned`/`Unresolvable` name no
-    /// tenant; an unreadable binding might be the pin itself (a legacy-only
-    /// install serves its pinned default from the `access_token` slot, which no
-    /// tenant observation names); an unreadable slot might hold a working
-    /// credential. An unmeasured input is not evidence, and the unclaimed-bucket
-    /// rung still covers a pin with a streak.
-    fn unserved_pin(self, observations: &[SlotObservation]) -> Option<uuid::Uuid> {
+    /// - `Unpinned`/`Unresolvable` name no tenant, so there is nothing to say.
+    /// - A selector `Ok` means T-pinned sessions get a credential — from T's
+    ///   slot, or from the legacy slot when T is the default binding and the
+    ///   token's claim is T's. Nothing is synthesized.
+    /// - A MEASURED observation of T's slot (`!o.unknown`) wins: the per-slot
+    ///   ladder speaks for T with more detail (`expired`, `unrefreshable`, …).
+    /// - An UNREADABLE observation of T's slot does NOT count as naming it. The
+    ///   selector treats that read as a miss (fail-closed, correctly — it
+    ///   cannot present what it cannot read), so T-pinned sessions ARE refused,
+    ///   and the posture says so rather than publishing a sibling's `live`.
+    ///
+    /// The unclaimed-bucket rung still covers a T bucket with a streak whose
+    /// pin is served.
+    fn unserved_pin(
+        self,
+        observations: &[SlotObservation],
+    ) -> Option<(uuid::Uuid, crate::auth::NoCredential)> {
         let crate::session::tenant_pin::TenantPin::Pinned(pinned) = self.machine_pin else {
             return None;
         };
-        let binding_is_elsewhere = match self.default_binding {
-            crate::auth::BindingTenantRead::Bound(b) => b != pinned,
-            crate::auth::BindingTenantRead::Unbound => true,
-            crate::auth::BindingTenantRead::Unknown => false,
+        let Some(Err(cause)) = self.pin_served else {
+            return None;
         };
         let key = pinned.to_string();
-        let observed = observations
+        let measured = observations
             .iter()
-            .any(|o| o.tenant_id.as_deref() == Some(key.as_str()));
-        (binding_is_elsewhere && !observed).then_some(pinned)
+            .any(|o| !o.unknown && o.tenant_id.as_deref() == Some(key.as_str()));
+        (!measured).then_some((pinned, cause))
     }
 }
 
@@ -3280,10 +4022,20 @@ fn upstream_signal_for_observation(tenant_id: Option<&str>, fold_default: bool) 
 ///    `unrefreshable`. The slot is empty and the one recovery rung that needs
 ///    no user session has already refused.
 /// 3. **The runner HOLDS a dead credential** (decoded `exp` in the past, or an
-///    opaque value) → `expired`. This is the boot case: the observation is
-///    published before the pass's recovery concludes, so a runner that
-///    restored a dead credential says so immediately rather than one recovery
-///    round-trip later (DD2 — *"Boot is a transition"*).
+///    opaque value):
+///    - whose last CONCLUDED automatic recovery ended needing a sign-in
+///      ([`DefaultSlotRecovery::needs_sign_in`]: no user bearer to present, a
+///      rejected bearer, no resolvable tenant or a tenant mismatch — each with
+///      no device-machine-key recovery) →
+///      `unrefreshable`. Every automatic rung has failed in a way a retry
+///      cannot fix, so the CTA must be the sign-in, not "Retry refresh now" —
+///      and a later pass that finds the same dead credential still present
+///      must NOT regress this to `expired` (the 2026-10-07 incident);
+///    - otherwise → `expired`. This is the boot case: the observation is
+///      published before the pass's recovery concludes, so a runner that
+///      restored a dead credential says so immediately rather than one
+///      recovery round-trip later (DD2 — *"Boot is a transition"*). It is also
+///      the transient case (a 5xx, a transport fault), where a retry can help.
 /// 4. **Nothing held at all** → `absent`.
 /// 5. **Coord keeps refusing a locally-valid credential**
 ///    (`>= UPSTREAM_DARK_THRESHOLD` consecutive credential-attributed
@@ -3320,6 +4072,9 @@ pub(crate) fn derive_coord_credential_posture(
             Some(e) => now >= e, // already expired
         };
         if dead {
+            if obs.recovery.is_some_and(DefaultSlotRecovery::needs_sign_in) {
+                return CoordCredentialPosture::Unrefreshable;
+            }
             return CoordCredentialPosture::Expired;
         }
     } else {
@@ -3376,9 +4131,59 @@ pub struct CoordCredentialStatus {
     /// session whose own credential works. `true` on every slot-derived
     /// publish, `false` only on the orphan arm.
     pub attributable: bool,
+    /// The operator-facing sentence, when the arm that published this posture
+    /// composed its own — today only the UNSERVED-PIN arm, whose sentence names
+    /// the pinned tenant and the selector's [`crate::auth::NoCredential`]
+    /// cause (see [`pinned_tenant_reason`]). `None` = the posture's generic
+    /// [`CoordCredentialPosture::message`]. Read it through [`Self::reason`].
+    pub composed_reason: Option<String>,
+    /// Is this the UNSERVED-PIN arm — a posture about the tenant `machine.json`
+    /// pins, which the credential selector refuses? Set ONLY by that arm's
+    /// candidate ([`PinArm`]). It is what lets the banner offer "Switch active
+    /// tenant": re-pinning can resolve a pinned tenant with no credential, and
+    /// cannot help a measured sibling slot that happens to name a tenant.
+    pub pinned_tenant: bool,
+    /// The state-specific WHY the sentence ([`Self::composed_reason`] or the
+    /// posture's fixed [`CoordCredentialPosture::message`]) cannot carry, or
+    /// `None`. Set in two shapes: on `Dark(NoDefaultBinding)`, the heal's
+    /// refusal reason, which names the guard that refused — so a state that
+    /// outlives one tick says which guard, as the plan asks; and on an
+    /// ANSWERING posture, the note that no default binding exists while the
+    /// legacy slot still serves unpinned sessions (review finding 3).
+    pub detail: Option<String>,
+}
+
+/// The unserved-pin arm's extra publish payload. Only
+/// [`derive_and_publish_posture`]'s unserved-pin candidate builds one, so
+/// [`CoordCredentialStatus::pinned_tenant`] cannot be set by any other arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PinArm {
+    /// [`pinned_tenant_reason`] for this pin and cause.
+    pub reason: String,
 }
 
 impl CoordCredentialStatus {
+    /// The operator-facing sentence for this status: the publishing arm's
+    /// composed sentence when it wrote one, else the posture's generic
+    /// [`CoordCredentialPosture::message`] — then the state-specific
+    /// [`Self::detail`] when there is one. This — never `posture.message()`
+    /// directly — is what `/health` `reason`, the heartbeat bag and the banner
+    /// carry, so the pinned arm's tenant and cause, and the heal's refusal,
+    /// reach every reader.
+    pub fn reason(&self) -> String {
+        let sentence = self
+            .composed_reason
+            .clone()
+            .unwrap_or_else(|| self.posture.message().to_string());
+        match self.detail.as_deref() {
+            Some(d) if !d.trim().is_empty() && self.posture.can_answer() => {
+                format!("{sentence} Note: {d}")
+            }
+            Some(d) if !d.trim().is_empty() => format!("{sentence} Why: {d}"),
+            _ => sentence,
+        }
+    }
+
     /// The `/health` `coordCredential` wire shape.
     ///
     /// The key is `posture` — the same name the heartbeat bag carries
@@ -3391,7 +4196,9 @@ impl CoordCredentialStatus {
             "state": self.posture.as_str(),
             "cause": self.posture.cause(),
             "canAnswer": self.posture.can_answer(),
-            "reason": self.posture.message(),
+            "reason": self.reason(),
+            // The WHY alone, for a reader that wants it without the sentence.
+            "detail": self.detail,
             "cta": self.posture.cta(),
             "tenantId": self.tenant_id,
             "exp": self.exp,
@@ -3403,16 +4210,39 @@ impl CoordCredentialStatus {
             // `false` = "we could not say WHICH slot", not "no tenant". A
             // reader joining `tenantId` to a slot must check this first.
             "attributable": self.attributable,
+            // `true` only for the unserved-pin arm — the banner's gate for the
+            // tenant switch.
+            "pinnedTenant": self.pinned_tenant,
         })
     }
 }
 
 /// A posture CHANGE, as seen by the publisher. `from: None` is the boot
 /// publish — the first observation this process made.
+///
+/// `detail_changed` is the second kind of change the banner must hear about:
+/// the posture VALUE stayed the same non-answering one, but WHAT it is about
+/// moved — its tenant, its composed reason (the selector's cause), whether
+/// it is the pinned-tenant arm, or its [`CoordCredentialStatus::detail`] (for
+/// `dark(no_default_binding)`, which guard the heal refused on). `absent(T)` → `absent(T2)` after the operator
+/// switches the pin, or `absent(T, slot unreadable)` → `absent(T, slot
+/// absent)`, would otherwise leave the banner naming the old tenant and cause.
+/// It is never set on an answering posture, so it can never read as a
+/// recovery; `from == Some(to)` whenever it is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PostureTransition {
     pub from: Option<CoordCredentialPosture>,
     pub to: CoordCredentialPosture,
+    pub detail_changed: bool,
+}
+
+/// Does a reported transition reach the banner? A same-posture DETAIL change
+/// always does — it is a dark re-announcement naming the new tenant or cause
+/// (see [`PostureTransition::detail_changed`]); a value change follows
+/// [`should_notify_posture`]'s dedup rule, which is the only path that can
+/// announce a recovery.
+pub(crate) fn transition_notifies(transition: PostureTransition) -> bool {
+    transition.detail_changed || should_notify_posture(transition.from, transition.to)
 }
 
 /// Should this transition fire the credential banner?
@@ -3498,10 +4328,15 @@ pub fn coord_credential_posture() -> Option<CoordCredentialStatus> {
 ///
 /// Poisoning is recovered rather than propagated: one failing test must not
 /// convert every sibling into a panic-on-lock and hide the real failure.
+///
+/// A CHILD of `env_lock` in the test-lock hierarchy (`hierarchy_lock` takes the
+/// env lock first and holds it beneath this one): `terminal`'s briefing tests
+/// hold this AND `isolated_ambient()` AND the plan-capture pin, so as a sibling
+/// it would be one inverted call site away from an AB/BA deadlock.
 #[cfg(test)]
-pub(crate) fn posture_test_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn posture_test_lock() -> crate::test_env::TestLockGuard {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    crate::test_env::hierarchy_lock(&LOCK)
 }
 
 #[cfg(test)]
@@ -3511,6 +4346,12 @@ pub(crate) fn reset_coord_credential_posture_for_test() {
         .unwrap_or_else(|e| e.into_inner()) = None;
     with_upstream_signals(|m| m.clear());
     with_orphan_warned(|s| s.clear());
+    *DEFAULT_BINDING_VERDICT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+    *DEFAULT_SLOT_RECOVERY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
     POSTURE_TRANSITIONS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -3541,6 +4382,8 @@ pub(crate) fn publish_coord_credential_posture(
         last_refresh_outcome,
         signal,
         true,
+        None,
+        None,
     )
 }
 
@@ -3550,6 +4393,10 @@ pub(crate) fn publish_coord_credential_posture(
 /// the default slot's bucket ([`upstream_signal_for_observation`]) and a
 /// re-read of the tenant bucket alone would publish a null `last401At` beside
 /// a `dark` posture.
+///
+/// `pin_arm` is `Some` ONLY from the unserved-pin arm; it sets
+/// [`CoordCredentialStatus::composed_reason`] and
+/// [`CoordCredentialStatus::pinned_tenant`].
 fn publish_coord_credential_posture_with(
     posture: CoordCredentialPosture,
     tenant_id: Option<String>,
@@ -3557,6 +4404,8 @@ fn publish_coord_credential_posture_with(
     last_refresh_outcome: Option<String>,
     signal: UpstreamSignal,
     attributable: bool,
+    pin_arm: Option<PinArm>,
+    detail: Option<String>,
 ) -> Option<PostureTransition> {
     let now = chrono::Utc::now().timestamp();
     // L1: a poisoned mutex must not turn `/health` — the endpoint whose job is
@@ -3566,6 +4415,18 @@ fn publish_coord_credential_posture_with(
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let previous = cell.as_ref().map(|s| s.posture);
+    let pinned_tenant = pin_arm.is_some();
+    let composed_reason = pin_arm.map(|a| a.reason);
+    // Same non-answering posture, different subject: tenant, cause sentence,
+    // arm, or the refusal it carries. See [`PostureTransition::detail_changed`].
+    let detail_changed = cell.as_ref().is_some_and(|prev| {
+        prev.posture == posture
+            && !posture.can_answer()
+            && (prev.tenant_id != tenant_id
+                || prev.composed_reason != composed_reason
+                || prev.pinned_tenant != pinned_tenant
+                || prev.detail != detail)
+    });
     let since = match previous {
         Some(p) if p == posture => cell.as_ref().map(|s| s.since).unwrap_or(now),
         _ => now,
@@ -3580,13 +4441,19 @@ fn publish_coord_credential_posture_with(
         since,
         observed_at_unix: now,
         attributable,
+        composed_reason,
+        pinned_tenant,
+        detail,
     });
-    let transition = (previous != Some(posture)).then_some(PostureTransition {
+    let transition = (previous != Some(posture) || detail_changed).then_some(PostureTransition {
         from: previous,
         to: posture,
+        detail_changed,
     });
+    // The test record keeps meaning "posture VALUE changes", which is what
+    // every reader of it asserts on.
     #[cfg(test)]
-    if let Some(t) = transition {
+    if let Some(t) = transition.filter(|t| !t.detail_changed) {
         POSTURE_TRANSITIONS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3602,9 +4469,12 @@ fn publish_coord_credential_posture_with(
 /// carried, because that is the slot an operator has to fix.
 ///
 /// Observations marked [`SlotObservation::unknown`] are DROPPED first. If that
-/// leaves nothing — every slot unreadable — nothing is published and the
-/// previous posture stands: an unreadable store is UNKNOWN, and publishing
-/// `absent` off it would manufacture a fault out of a missing measurement.
+/// leaves nothing — every slot unreadable — and no pin is unserved, nothing is
+/// published and the previous posture stands: an unreadable store is UNKNOWN,
+/// and publishing `absent` off it would manufacture a fault out of a missing
+/// measurement. An unserved pin is not that case: its verdict is the
+/// SELECTOR's, which already treated the unreadable read as a miss and refuses
+/// every T-pinned session, so it is published (below).
 ///
 /// # The UNATTRIBUTABLE arm (N1)
 ///
@@ -3634,12 +4504,16 @@ fn publish_coord_credential_posture_with(
 ///
 /// # The UNSERVED-PIN arm
 ///
-/// `machine.json` pins tenant T, the pass observes no slot for T, and the
-/// default binding is measured to be another tenant (see
+/// `machine.json` pins tenant T, the pass MEASURED no slot for T, and the
+/// credential selector the coord-mcp forwarder runs refused T this pass (see
 /// [`PosturePinInputs::unserved_pin`]). Every T-pinned session is then refused,
 /// whatever the other slots hold — so T enters the `worst` fold itself, under
 /// its own name, rather than only when a rejection streak happens to exist for
-/// the unclaimed-bucket rung to find. A slot cleared on a LOCAL expiry or a
+/// the unclaimed-bucket rung to find. The posture asks the selector rather than
+/// re-deriving it (plan `2026-09-14-credential-posture-third-residuals` D1): an
+/// unreadable binding, an unreadable T slot, a dead legacy fallback and a
+/// legacy token claiming another tenant are all refusals there, so all of them
+/// are unserved pins here. A slot cleared on a LOCAL expiry or a
 /// refresh-token 401 records no streak at all, and without this arm a healthy
 /// sibling slot published `live` and *"Coord access restored"* over it.
 ///
@@ -3650,12 +4524,50 @@ fn publish_coord_credential_posture_with(
 /// It is NOT a synthetic observation fed through the ladder: rung 4 answers
 /// `absent` before rung 5 reads the streak, which would downgrade a dark pin.
 ///
+/// Its published REASON is composed ([`pinned_tenant_reason`]): it names T and
+/// carries the selector's cause, so an unreadable slot reads as *unreadable*
+/// rather than as a credential that is gone (D4), and an operator whose
+/// sign-in landed in another tenant can see why the banner did not clear.
+///
 /// The fold's `fold_default` is still computed from the REAL observations
 /// only: an extra entry would change which credential the default-slot bucket
 /// is folded onto.
+///
+/// # The NO-DEFAULT-BINDING arm
+///
+/// The refresher tick's `paired_user.json` heal leaves its verdict in
+/// [`default_binding_verdict`]'s cell. When that verdict is
+/// [`DefaultBindingVerdict::SlotWithoutBinding`] — a usable slot, no default
+/// binding, heal refused — AND the legacy `access_token` slot holds nothing
+/// usable, `dark(no_default_binding)` enters the fold FIRST (so a real slot at
+/// the same severity still wins a tie), carrying the heal's refusal as
+/// [`CoordCredentialStatus::detail`].
+///
+/// While the legacy slot IS usable, unpinned sessions still reach coord with
+/// it, so no dark candidate is published: `dark` would set `/health`
+/// `canAnswer: false`, send the heartbeat bag `ok: false` (coord's
+/// `runner_coord_credentials_missing` alert) and tell the operator the
+/// default scope has no access — an outage that does not exist (review
+/// finding 3). The missing binding is still surfaced, as the `detail` of the
+/// answering posture that wins. It is derived HERE, on every
+/// pass, rather than published once from the refresher's bail: a publish from
+/// the bail alone would be overwritten by the slot pass's `live` on the next
+/// tick and flap `live` / `dark` — a "Coord access restored" banner every five
+/// minutes over a state that never healed.
 pub(crate) fn derive_and_publish_posture(
     observations: &[SlotObservation],
     pins: PosturePinInputs,
+    now: i64,
+) -> Option<PostureTransition> {
+    derive_and_publish_posture_with(observations, pins, &default_binding_verdict(), now)
+}
+
+/// [`derive_and_publish_posture`] with the default-binding verdict supplied
+/// rather than read from its cell — the testable core.
+pub(crate) fn derive_and_publish_posture_with(
+    observations: &[SlotObservation],
+    pins: PosturePinInputs,
+    default_binding: &DefaultBindingVerdict,
     now: i64,
 ) -> Option<PostureTransition> {
     /// One entry in the `worst` fold, carrying everything the publish needs.
@@ -3664,14 +4576,60 @@ pub(crate) fn derive_and_publish_posture(
         tenant_id: Option<String>,
         exp: Option<i64>,
         outcome: Option<TenantSlotOutcome>,
+        recovery: Option<DefaultSlotRecovery>,
         signal: UpstreamSignal,
+        /// The unserved pin only — see [`PinArm`].
+        pin_arm: Option<PinArm>,
+        detail: Option<String>,
     }
+
+    // The no-default-binding candidate: it describes the DEFAULT scope — the
+    // legacy slot an unpinned session presents — so `tenant_id: None`, and it
+    // is published only while that legacy slot holds nothing usable. With a
+    // usable legacy slot an unpinned session's call still carries a working
+    // credential, so the fact becomes a NOTE on the answering posture instead
+    // (review finding 3).
+    let (no_default_binding, binding_note) = match default_binding {
+        DefaultBindingVerdict::SlotWithoutBinding {
+            refusal,
+            legacy_slot_usable: false,
+            ..
+        } => (
+            Some(Candidate {
+                posture: CoordCredentialPosture::Dark(DarkCause::NoDefaultBinding),
+                tenant_id: None,
+                exp: None,
+                outcome: None,
+                recovery: None,
+                signal: upstream_signal_for(None),
+                pin_arm: None,
+                detail: Some(refusal.clone()),
+            }),
+            None,
+        ),
+        DefaultBindingVerdict::SlotWithoutBinding {
+            refusal,
+            legacy_slot_usable: true,
+            ..
+        } => (
+            None,
+            Some(format!(
+                "paired_user.json names no default binding and the self-heal refused \
+                 ({refusal}); unpinned sessions are still served by the legacy access_token \
+                 slot, so coord access is not interrupted — sign in to re-pair before it \
+                 expires"
+            )),
+        ),
+        _ => (None, None),
+    };
 
     // One usable slot means the default-slot bucket describes the same
     // credential — see [`upstream_signal_for_observation`].
     let fold_default = observations.iter().filter(|o| !o.unknown).count() == 1;
-    let unserved_pin_key = pins.unserved_pin(observations).map(|t| t.to_string());
-    let unserved_pin = unserved_pin_key.clone().map(|key| {
+    let unserved = pins.unserved_pin(observations);
+    let unserved_pin_key = unserved.map(|(t, _)| t.to_string());
+    let unserved_pin = unserved.map(|(pinned, cause)| {
+        let key = pinned.to_string();
         let signal = upstream_signal_for(Some(&key));
         let posture = if signal.consecutive_rejections >= UPSTREAM_DARK_THRESHOLD
             && upstream_rejection_is_fresh(&signal, now)
@@ -3685,14 +4643,21 @@ pub(crate) fn derive_and_publish_posture(
             tenant_id: Some(key),
             exp: None,
             outcome: None,
+            recovery: None,
             signal,
+            pin_arm: Some(PinArm {
+                reason: pinned_tenant_reason(&pinned, &cause),
+            }),
+            detail: None,
         }
     });
-    // The unserved pin goes FIRST: `max_by_key` keeps the last of equal
-    // maxima, so a real slot at the same severity still wins the tie, exactly
-    // as it did before the pin was an input.
-    let worst = unserved_pin
+    // The no-default-binding candidate, then the unserved pin, go FIRST:
+    // `max_by_key` keeps the last of equal maxima, so a real slot at the same
+    // severity still wins the tie, exactly as it did before either was an
+    // input.
+    let worst = no_default_binding
         .into_iter()
+        .chain(unserved_pin)
         .chain(observations.iter().filter(|o| !o.unknown).map(|o| {
             let signal = upstream_signal_for_observation(o.tenant_id.as_deref(), fold_default);
             Candidate {
@@ -3700,10 +4665,22 @@ pub(crate) fn derive_and_publish_posture(
                 tenant_id: o.tenant_id.clone(),
                 exp: o.exp,
                 outcome: o.outcome,
+                recovery: o.recovery,
                 signal,
+                pin_arm: None,
+                detail: None,
             }
         }))
-        .max_by_key(|c| c.posture.severity());
+        .max_by_key(|c| c.posture.severity())
+        .map(|mut c| {
+            // The missing-binding note rides the ANSWERING posture only: on a
+            // non-answering one its "Why:" would misattribute that posture's
+            // cause.
+            if c.detail.is_none() && c.posture.can_answer() {
+                c.detail = binding_note.clone();
+            }
+            c
+        });
 
     // N1 — the unattributable arm, as a MAP DIFF rather than a special case
     // for the default key. See [`unclaimed_upstream_verdict`] for the class
@@ -3757,6 +4734,8 @@ pub(crate) fn derive_and_publish_posture(
                     // every unpinned session on a box where some OTHER,
                     // unreadable slot is the one coord is refusing.
                     false,
+                    None,
+                    None,
                 );
             }
             UnclaimedVerdict::StaleEvidence(orphan_key) => {
@@ -3785,27 +4764,97 @@ pub(crate) fn derive_and_publish_posture(
         worst.posture,
         worst.tenant_id,
         worst.exp,
-        worst.outcome.map(tenant_slot_outcome_token),
+        // The per-tenant pass's outcome, or — for the legacy default slot,
+        // which no slot pass walks — the `Pair` arm's concluded verdict (D4).
+        worst
+            .outcome
+            .map(tenant_slot_outcome_token)
+            .or_else(|| worst.recovery.map(|r| r.as_str().to_string())),
         worst.signal,
         // ATTRIBUTABLE: `worst` is a real slot candidate (or the unserved
         // pin), so `tenant_id` names the slot this posture is about —
         // including when it is `None`, which is the LEGACY default slot and
-        // is exactly the credential an unpinned session presents.
+        // is exactly the credential an unpinned session presents — and the
+        // no-default-binding candidate is only ever built while that legacy
+        // slot holds nothing usable, so it too describes that credential.
         true,
+        worst.pin_arm,
+        worst.detail,
     )
+}
+
+/// The published sentence for the UNSERVED-PIN arm: which tenant, why no
+/// credential serves it (the selector's own [`crate::auth::NoCredential`]),
+/// what that means for sessions, and the two things that can fix it.
+///
+/// The generic [`CoordCredentialPosture::message`] for `absent` reads *"this
+/// runner holds NO coord credential"* — false on a box pinned to T that holds a
+/// live slot for Y, and silent about the one fact that explains why signing in
+/// to Y does not clear it. Signing in does NOT re-pin (plan
+/// `2026-09-14-credential-posture-third-residuals` D5), so the sentence names
+/// the switch as the other remedy.
+pub(crate) fn pinned_tenant_reason(
+    pinned: &uuid::Uuid,
+    cause: &crate::auth::NoCredential,
+) -> String {
+    format!(
+        "this runner is pinned to tenant {pinned} and holds no usable coord credential for it \
+         ({cause}). Sessions pinned to it have no coord access. Sign in with an account in \
+         {pinned}, or switch this runner's active tenant."
+    )
+}
+
+/// Derive and publish the posture of a runner with NO per-tenant slot — whose
+/// coord credential is therefore the LEGACY `access_token` slot — and notify
+/// the banner on a change.
+///
+/// Called at the top of every pass that finds no tenant slot, AND again when
+/// the `Pair` arm concludes its recovery of that slot, so the published posture
+/// carries the verdict of the pass that just ran rather than the one before
+/// it. Without the second call a kicked "Retry refresh now" pass would conclude
+/// with the banner still showing what the PREVIOUS pass knew.
+///
+/// Read through the TRI-STATE probe, not `get_access_token`: that returns
+/// `Err` both for a never-paired runner and for a present-but-undecryptable
+/// store, and collapsing the two would fire a "you have no coord credential"
+/// banner at a paired runner whose store merely failed to decrypt this tick.
+fn derive_and_publish_legacy_posture(
+    auth_manager: &crate::auth::AuthManager,
+    pins: PosturePinInputs,
+    app: Option<&tauri::AppHandle>,
+) {
+    let obs = legacy_slot_observation(auth_manager.probe_access_token());
+    if let Some(transition) =
+        derive_and_publish_posture(&[obs], pins, chrono::Utc::now().timestamp())
+    {
+        notify_posture_transition(app, transition);
+    }
 }
 
 /// Stable token for a slot outcome, shared by the health row and the posture's
 /// `last_refresh_outcome` so the two can never drift into different spellings.
 pub(crate) fn tenant_slot_outcome_token(outcome: TenantSlotOutcome) -> String {
     match outcome {
-        TenantSlotOutcome::Refreshed => "refreshed",
+        TenantSlotOutcome::Refreshed => OUTCOME_TOKEN_REFRESHED,
         TenantSlotOutcome::SkippedFresh => "skipped-fresh",
         TenantSlotOutcome::SkippedNoToken => "skipped-no-token",
         TenantSlotOutcome::Cleared { .. } => "cleared",
-        TenantSlotOutcome::KeptExisting => "kept-existing",
+        TenantSlotOutcome::KeptExisting => OUTCOME_TOKEN_KEPT_EXISTING,
     }
     .to_string()
+}
+
+/// Run one blocking credential-store write OFF the async worker: every store
+/// mutation takes the cross-process store lock, which may wait up to 10 s under
+/// contention (plan `2026-09-30-runner-says-connected-…` D4).
+async fn store_write_off_runtime<R: Send + 'static>(
+    auth_manager: &crate::auth::AuthManager,
+    write: impl FnOnce(&crate::auth::AuthManager) -> anyhow::Result<R> + Send + 'static,
+) -> anyhow::Result<R> {
+    let mgr = auth_manager.clone();
+    spawn_blocking_tracked(move || write(&mgr))
+        .await
+        .map_err(|e| anyhow::anyhow!("credential-store write task failed: {e}"))?
 }
 
 /// Clear one dead per-tenant slot and try to re-derive a working credential
@@ -3849,7 +4898,10 @@ async fn clear_and_rederive_tenant_slot(
     evidence: &str,
 ) -> TenantSlotOutcome {
     use std::sync::atomic::Ordering;
-    if let Err(e) = auth_manager.clear_tenant_device_jwt(tenant) {
+    let t = *tenant;
+    if let Err(e) =
+        store_write_off_runtime(auth_manager, move |m| m.clear_tenant_device_jwt(&t)).await
+    {
         warn!(
             "device_jwt_refresher: tenant {tenant} slot clear FAILED ({e}) — slot left \
              as-is ({evidence})"
@@ -3868,8 +4920,10 @@ async fn clear_and_rederive_tenant_slot(
     crate::coord_mcp::log_device_jwt_slot_clear(tenant, cause.as_str(), evidence);
     warn!(
         "device_jwt_refresher: CLEARED tenant {tenant} device-JWT slot \
-         (cause={}, evidence: {evidence}) — attempting device-machine-key re-derive",
-        cause.as_str()
+         (cause={}, evidence: {evidence}, caller=refresher::clear_and_rederive_tenant_slot {}) \
+         — attempting device-machine-key re-derive",
+        cause.as_str(),
+        crate::secure_storage::process_attribution()
     );
 
     if web_base.trim().is_empty() {
@@ -3893,12 +4947,13 @@ async fn clear_and_rederive_tenant_slot(
             rederived: false,
         };
     };
-    match auth_manager.store_tenant_device_jwt(tenant, &jwt) {
+    let jwt_len = jwt.len();
+    match store_write_off_runtime(auth_manager, move |m| m.store_tenant_device_jwt(&t, &jwt)).await
+    {
         Ok(()) => {
             info!(
                 "device_jwt_refresher: tenant {tenant} device-JWT slot RE-DERIVED via \
-                 device-machine-key exchange (len={})",
-                jwt.len()
+                 device-machine-key exchange (len={jwt_len})"
             );
             // M1 — see [`reset_upstream_rejections_for`]. This is the arm that
             // LATCHED: re-derive succeeds, rung 1 says `live`, and the next
@@ -4164,7 +5219,10 @@ pub(crate) async fn refresh_tenant_slots(
             outcomes.push((tenant, o));
             continue;
         }
-        match auth_manager.store_tenant_device_jwt(&tenant, &body.token) {
+        let (t, token) = (tenant, body.token.clone());
+        match store_write_off_runtime(auth_manager, move |m| m.store_tenant_device_jwt(&t, &token))
+            .await
+        {
             Ok(()) => {
                 info!(
                     "device_jwt_refresher: tenant {tenant} device-JWT slot refreshed (len={})",
@@ -4257,6 +5315,7 @@ pub(crate) async fn refresh_tenant_slots(
                 present,
                 unknown: *unknown,
                 outcome: Some(*o),
+                recovery: None,
             }
         })
         .collect();
@@ -4368,7 +5427,12 @@ pub(crate) async fn try_device_machine_key_exchange(
     // device-JWT lifecycle is coord-owned). Guarded by `expected_tenant`: see
     // the doc comment above for why a mismatch here is exactly the incident
     // this exchange path was found to bypass.
-    match auth_manager.store_tokens_expecting(&body.token, "", expected_tenant) {
+    let token_for_store = body.token.clone();
+    match store_write_off_runtime(auth_manager, move |m| {
+        m.store_tokens_expecting(&token_for_store, "", expected_tenant)
+    })
+    .await
+    {
         Ok(()) => {
             // M1: the old credential's rejections are spent evidence — for the
             // default bucket and for the tenant slot the mirror just wrote.
@@ -4554,6 +5618,168 @@ fn pair_base_origin(
     }
 }
 
+/// What this tick's `paired_user.json` heal leaves the rest of the tick — the
+/// posture derivation and the Pair arm's "not paired" bail — to act on. Plan
+/// `2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential`
+/// Phase 3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DefaultBindingVerdict {
+    /// `paired_user.json` names a binding — it was fine, or the heal just
+    /// rebuilt it. Nothing to report.
+    Bound,
+    /// (a) The file names no binding and NO usable per-tenant slot exists:
+    /// this runner genuinely holds no coord credential a binding could point
+    /// at. Today's `absent` / [`PairProgress::BailNoBearer`] reading is true.
+    NoCredential,
+    /// (b) The file names no binding, at least one credential (a per-tenant
+    /// slot or the legacy slot) holds a USABLE JWT, and the heal refused — the
+    /// 2026-09-28 shape. Published as `dark(no_default_binding)` (never as
+    /// `absent`) while the legacy slot holds nothing usable; with a usable
+    /// legacy slot unpinned sessions still reach coord, so it is only a
+    /// `detail` note on the answering posture (review finding 3).
+    SlotWithoutBinding {
+        /// The tenants whose slots are usable (ascending).
+        usable_tenants: Vec<uuid::Uuid>,
+        /// Whether the legacy `access_token` slot — what an unpinned session
+        /// presents — still holds a usable token.
+        legacy_slot_usable: bool,
+        /// The heal's refusal, naming the guard.
+        refusal: String,
+    },
+    /// Nothing was established: the heal task did not complete, or the slot
+    /// store could not be enumerated. Never read as either (a) or (b).
+    Unknown(String),
+}
+
+/// Pure: the heal's outcome plus the credential census → the verdict.
+///
+/// `census` is `None` when it was not taken — it is only read after a
+/// refusal, the one outcome whose meaning depends on it.
+pub(crate) fn classify_default_binding(
+    heal: &qontinui_runner_lib::pair::PairedUserHeal,
+    census: Option<&Result<qontinui_runner_lib::pair::HeldCredentialCensus, String>>,
+) -> DefaultBindingVerdict {
+    use qontinui_runner_lib::pair::PairedUserHeal as H;
+    match heal {
+        H::NotNeeded | H::Healed { .. } => DefaultBindingVerdict::Bound,
+        H::NothingToHealFrom => DefaultBindingVerdict::NoCredential,
+        // The binding-store lock was busy: nothing was looked at, so nothing
+        // is known — and an `Unknown` never overwrites a measured verdict.
+        H::Deferred(why) => DefaultBindingVerdict::Unknown(why.clone()),
+        H::Refused(why) => match census {
+            Some(Ok(c)) if !c.usable_tenant_slots.is_empty() || c.legacy_slot_usable => {
+                DefaultBindingVerdict::SlotWithoutBinding {
+                    usable_tenants: c.usable_tenant_slots.clone(),
+                    legacy_slot_usable: c.legacy_slot_usable,
+                    refusal: why.clone(),
+                }
+            }
+            // Slots exist but none is usable (every one expired, mis-keyed or
+            // unreadable) and neither is the legacy slot: there is no live
+            // credential for a binding to point at, so "no coord credential"
+            // is the honest reading.
+            Some(Ok(_)) => DefaultBindingVerdict::NoCredential,
+            Some(Err(e)) => DefaultBindingVerdict::Unknown(e.clone()),
+            None => DefaultBindingVerdict::Unknown(
+                "the heal refused but the credential census was not taken".to_string(),
+            ),
+        },
+    }
+}
+
+/// The Pair arm's "paired_user.json missing" bail decision, as the refresher
+/// loop makes it: from the published verdict CELL
+/// ([`default_binding_verdict`]), never from one tick's raw verdict — an
+/// Unknown tick (a deferred heal, a failed join) never overwrites a measured
+/// one there, so it cannot turn "credential held, no default binding" into
+/// "no coord credential".
+pub(crate) fn unpaired_bail_progress_from_cell() -> PairProgress {
+    unpaired_bail_progress(&default_binding_verdict())
+}
+
+/// Pure: which [`PairProgress`] the Pair arm's "paired_user.json missing"
+/// bail publishes. Only a MEASURED (b) changes today's answer; (a) and every
+/// unmeasured verdict keep [`PairProgress::BailNoBearer`].
+pub(crate) fn unpaired_bail_progress(verdict: &DefaultBindingVerdict) -> PairProgress {
+    match verdict {
+        DefaultBindingVerdict::SlotWithoutBinding {
+            usable_tenants,
+            refusal,
+            ..
+        } => PairProgress::BailNoDefaultBinding {
+            usable_tenants: usable_tenants.clone(),
+            refusal: refusal.clone(),
+        },
+        DefaultBindingVerdict::Bound
+        | DefaultBindingVerdict::NoCredential
+        | DefaultBindingVerdict::Unknown(_) => PairProgress::BailNoBearer,
+    }
+}
+
+static DEFAULT_BINDING_VERDICT: std::sync::Mutex<Option<DefaultBindingVerdict>> =
+    std::sync::Mutex::new(None);
+
+/// The most recent MEASURED verdict, or `Unknown` before any tick measured one.
+/// Read by [`derive_and_publish_posture`].
+pub(crate) fn default_binding_verdict() -> DefaultBindingVerdict {
+    DEFAULT_BINDING_VERDICT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_else(|| {
+            DefaultBindingVerdict::Unknown(
+                "no refresher tick has run the paired_user.json heal yet in this process"
+                    .to_string(),
+            )
+        })
+}
+
+/// Record this tick's verdict. An `Unknown` never overwrites a measured one:
+/// a tick that could not look has not found the state gone, and clearing a
+/// `dark(no_default_binding)` on it would publish `live` and "Coord access
+/// restored" over a state that never healed.
+pub(crate) fn publish_default_binding_verdict(verdict: DefaultBindingVerdict) {
+    let mut cell = DEFAULT_BINDING_VERDICT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if matches!(verdict, DefaultBindingVerdict::Unknown(_)) && cell.is_some() {
+        return;
+    }
+    *cell = Some(verdict);
+}
+
+/// One refresher-tick hook for plan
+/// `2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential`
+/// Phase 1: [`qontinui_runner_lib::pair::heal_vanished_paired_user`] on the
+/// blocking pool (it may read the credential store). The heal logs its own
+/// outcome; a join failure only defers it to the next tick.
+///
+/// Phase 3: records the tick's [`DefaultBindingVerdict`] in its cell
+/// ([`publish_default_binding_verdict`]), which both the posture derivation
+/// and the Pair arm's bail read ([`default_binding_verdict`]) — so a tick that
+/// measured nothing (a deferred heal, a failed join) keeps the last MEASURED
+/// verdict for both, instead of the bail publishing "no credential" over a
+/// measured "credential, no default binding".
+async fn heal_vanished_binding_store() {
+    let verdict = match spawn_blocking_tracked(|| {
+        let heal = qontinui_runner_lib::pair::heal_vanished_paired_user();
+        let census = matches!(heal, qontinui_runner_lib::pair::PairedUserHeal::Refused(_))
+            .then(qontinui_runner_lib::pair::held_credential_census);
+        classify_default_binding(&heal, census.as_ref())
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            debug!(
+                "device_jwt_refresher: paired_user.json heal task failed ({e}) — next tick retries"
+            );
+            DefaultBindingVerdict::Unknown(format!("the heal task did not complete ({e})"))
+        }
+    };
+    publish_default_binding_verdict(verdict);
+}
+
 async fn refresher_loop(
     api_state: Arc<ApiState>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -4577,6 +5803,15 @@ async fn refresher_loop(
             info!("Device-JWT refresher shutting down");
             return;
         }
+        // D5: every kick numbered at or below this was issued before this pass
+        // read any state, so this pass answers it.
+        begin_pass();
+
+        // Heal a vanished `paired_user.json` from valid per-tenant slots
+        // BEFORE anything below reads it, so the tier (`device_is_paired`),
+        // the sweep inputs and the Pair arm's `user_id` read all see the
+        // rewritten file instead of idling "not paired yet".
+        heal_vanished_binding_store().await;
 
         // Snapshot settings + needs-refresh decision once per iteration.
         let settings_snapshot = settings::load_settings();
@@ -4607,9 +5842,10 @@ async fn refresher_loop(
         // tenant slots (never paired post-8a) skip in one storage read.
         // Every input the eviction sweep needs — the slot store,
         // `paired_user.json` and `machine.json` — is read in ONE blocking-pool
-        // hop, then composed on this side. The pin and the default binding
-        // also feed the POSTURE (see [`PosturePinInputs`]): a pinned tenant
-        // with no slot must be published under its own name, never skipped.
+        // hop, then composed on this side. The pin, and the credential
+        // selector's verdict for it (read in the same hop), also feed the
+        // POSTURE (see [`PosturePinInputs`]): a pinned tenant the forwarder
+        // would refuse must be published under its own name, never skipped.
         //
         // The slot read is the UN-COLLAPSED one, because the sweep below is
         // destructive: an unreadable store must not read as "no tenant slots"
@@ -4736,32 +5972,19 @@ async fn refresher_loop(
             // LEGACY `access_token` slot, and a runner holding a dead one (or
             // none at all) is exactly the silent case this posture exists to
             // end — a never-paired runner must read `absent`, not UNKNOWN
-            // forever. Derived from the same pure ladder; no pass outcome
-            // exists, so the derivation sees `None` and speaks from `exp`.
+            // forever. Derived from the same pure ladder; no slot-pass outcome
+            // exists, so the derivation speaks from `exp` (read through the
+            // tri-state probe — see `derive_and_publish_legacy_posture`).
             //
-            // Read through the TRI-STATE probe, not `get_access_token`: that
-            // returns `Err` both for a never-paired runner and for a
-            // present-but-undecryptable store, and collapsing the two would
-            // fire a "you have no coord credential" banner at a paired runner
-            // whose store merely failed to decrypt this tick.
-            let obs = match auth_manager.probe_access_token() {
-                crate::secure_storage::StoredTokenRead::Present(t) => {
-                    SlotObservation::observed(None, Some(t.as_str()))
-                }
-                crate::secure_storage::StoredTokenRead::Absent => {
-                    SlotObservation::observed(None, None)
-                }
-                crate::secure_storage::StoredTokenRead::Unreadable(_) => {
-                    SlotObservation::unreadable(None)
-                }
-            };
-            if let Some(transition) = derive_and_publish_posture(
-                &[obs],
+            // The observation carries the `Pair` arm's last CONCLUDED verdict
+            // for the credential it holds (D3), so a dead slot whose recovery
+            // already ended needing a sign-in stays `unrefreshable` here rather
+            // than regressing to `expired` on every pass.
+            derive_and_publish_legacy_posture(
+                &auth_manager,
                 sweep_inputs.posture_pin_inputs(),
-                chrono::Utc::now().timestamp(),
-            ) {
-                notify_posture_transition(Some(&api_state.app_handle), transition);
-            }
+                Some(&api_state.app_handle),
+            );
         }
 
         match decision {
@@ -4789,6 +6012,7 @@ async fn refresher_loop(
                 }
                 // Nothing to do until tier changes. Block on shutdown or
                 // kick (set_runner_tier kicks us on every transition).
+                note_pass_concluded();
                 tokio::select! {
                     _ = shutdown_rx.changed() => {
                         info!("Device-JWT refresher shutting down (was idle on non-Tier2)");
@@ -4843,6 +6067,13 @@ async fn refresher_loop(
                         // wake the relay so it reconnects with the new JWT, publish
                         // healthy, reset backoff, and fall to the steady cadence.
                         crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+                        conclude_default_slot_recovery(
+                            &auth_manager,
+                            DefaultSlotRecovery::Refreshed,
+                            !has_tenant_slots,
+                            sweep_inputs.posture_pin_inputs(),
+                            Some(&api_state.app_handle),
+                        );
                         publish_coord_credential_status(
                             &auth_manager,
                             &coord_credential_health(decision, Some(PairProgress::Healthy)),
@@ -4868,48 +6099,58 @@ async fn refresher_loop(
                 // refreshed first if it's stale (so the re-bind presents a
                 // valid user token). For legacy/local-login installs there's
                 // no Cognito session, so we fall back to the device-JWT slot
-                // bearer (the historical Phase-2 source).
+                // bearer (the historical Phase-2 source) — unless that slot
+                // holds a device JWT whose `exp` has passed, which can never
+                // authorise pair-cli (D1, see [`pair_bearer_for`]).
                 // Phase 2: classify the Cognito refresh so we can back off on a
                 // transient blip and fire the credential-dark notification on a
                 // dead refresh token (`invalid_grant`) instead of silently
                 // stalling. `refresh_class` drives the wait + notification at
                 // each exit below.
                 let (cognito_bearer, refresh_class) = refresh_cognito_bearer(&auth_manager).await;
-                let bearer_token = match cognito_bearer {
-                    Some(t) if !t.trim().is_empty() => t.trim().to_string(),
-                    _ => match auth_manager.get_access_token() {
-                        Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
-                        _ => {
-                            warn!(
-                                "device_jwt_refresher: no Cognito session and access_token slot \
-                                 empty — user must sign in to Qontinui before the refresher can pair"
-                            );
-                            // Phase 1b: credential-dark (not signed in).
-                            publish_coord_credential_status(
-                                &auth_manager,
-                                &coord_credential_health(
-                                    decision,
-                                    Some(PairProgress::BailNoBearer),
-                                ),
-                            )
-                            .await;
-                            // Phase 2: if the refresh token is dead
-                            // (`invalid_grant`) and we also have no device-JWT
-                            // bearer, fire the credential-dark notification +
-                            // back off per classification; otherwise (no session)
-                            // fall to the steady cadence.
-                            let action = plan_refresh_wait(&mut backoff, refresh_class);
-                            if action.notify_dark {
-                                emit_credential_dark(&api_state.app_handle, true);
-                            }
-                            if wait_with_signals(action.wait, &mut shutdown_rx, &mut kick_rx).await
-                            {
-                                return;
-                            }
-                            continue;
-                        }
-                    },
-                };
+                let bearer = pair_bearer_for(
+                    cognito_bearer,
+                    auth_manager.get_access_token().ok(),
+                    chrono::Utc::now().timestamp(),
+                );
+                if bearer == PairBearer::Nothing {
+                    warn!(
+                        "device_jwt_refresher: no Cognito session and access_token slot \
+                         empty — user must sign in to Qontinui before the refresher can pair"
+                    );
+                    // Phase 1b: credential-dark (not signed in).
+                    publish_coord_credential_status(
+                        &auth_manager,
+                        &coord_credential_health(decision, Some(PairProgress::BailNoBearer)),
+                    )
+                    .await;
+                    // D3/D4: this pass concluded with nothing to present. A
+                    // transient Cognito blip is still worth retrying.
+                    conclude_default_slot_recovery(
+                        &auth_manager,
+                        if refresh_class == RefreshClass::Transient {
+                            DefaultSlotRecovery::KeptExisting
+                        } else {
+                            DefaultSlotRecovery::NeedsSignIn
+                        },
+                        !has_tenant_slots,
+                        sweep_inputs.posture_pin_inputs(),
+                        Some(&api_state.app_handle),
+                    );
+                    // Phase 2: if the refresh token is dead
+                    // (`invalid_grant`) and we also have no device-JWT
+                    // bearer, fire the credential-dark notification +
+                    // back off per classification; otherwise (no session)
+                    // fall to the steady cadence.
+                    let action = plan_refresh_wait(&mut backoff, refresh_class);
+                    if action.notify_dark {
+                        emit_credential_dark(&api_state.app_handle, true);
+                    }
+                    if wait_with_signals(action.wait, &mut shutdown_rx, &mut kick_rx).await {
+                        return;
+                    }
+                    continue;
+                }
                 // The base a device JWT is MINTED against must be the base the
                 // relay DIALS, or the runner presents a credential to a backend
                 // that never issued it.
@@ -4960,20 +6201,44 @@ async fn refresher_loop(
                 let user_id = match qontinui_runner_lib::pair::read_paired_user_id_from_disk() {
                     Some(u) => u,
                     None => {
-                        // No paired-user record yet — this runner hasn't
-                        // completed a pairing (Cognito sign-in or pair-code),
-                        // so there's nothing to re-mint. Log + back off; the
-                        // next pairing writes the file and a kick wakes us.
-                        warn!(
-                            "device_jwt_refresher: paired_user.json missing — \
-                             runner not paired yet (refresher idling until kick)"
-                        );
-                        // Phase 1b: not paired → credential-dark (not signed in).
+                        // No paired-user record — and this tick's heal did
+                        // not rebuild one. Two different states reach here
+                        // (plan 2026-09-29-…-no-coord-credential Phase 3):
+                        // (a) no usable credential at all — a runner that has
+                        // not completed a pairing, the historical meaning;
+                        // (b) a usable per-tenant slot that the heal refused
+                        // to point a default binding at. Reporting (b) as (a)
+                        // was the 2026-09-28 "no coord credential" misreport.
+                        let progress = unpaired_bail_progress_from_cell();
+                        match &progress {
+                            PairProgress::BailNoDefaultBinding {
+                                usable_tenants,
+                                refusal,
+                            } => warn!(
+                                "device_jwt_refresher: paired_user.json names no default \
+                                 binding, but valid per-tenant coord credential(s) exist for \
+                                 {usable_tenants:?} — the self-heal refused ({refusal}); \
+                                 sign in to re-pair (refresher idling until kick)"
+                            ),
+                            _ => warn!(
+                                "device_jwt_refresher: paired_user.json missing — \
+                                 runner not paired yet (refresher idling until kick)"
+                            ),
+                        }
+                        // Phase 1b: not paired → credential-dark.
                         publish_coord_credential_status(
                             &auth_manager,
-                            &coord_credential_health(decision, Some(PairProgress::BailNoBearer)),
+                            &coord_credential_health(decision, Some(progress)),
                         )
                         .await;
+                        // D3/D4: nothing to re-mint until a pairing — a sign-in.
+                        conclude_default_slot_recovery(
+                            &auth_manager,
+                            DefaultSlotRecovery::NeedsSignIn,
+                            !has_tenant_slots,
+                            sweep_inputs.posture_pin_inputs(),
+                            Some(&api_state.app_handle),
+                        );
                         if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx)
                             .await
                         {
@@ -4983,131 +6248,84 @@ async fn refresher_loop(
                     }
                 };
 
-                // Phase 1b: resolve the tenant ONCE up front so the post-outcome
-                // health mapping can distinguish "no tenant resolved" (gate-
-                // blocking config) from "tenant fine, the mint just failed"
-                // (degraded). `try_refresh_once` re-resolves internally; the two
-                // resolutions agree because both call `resolve_active_tenant_id`
-                // + the same OAuth/outgoing-JWT fallback chain.
-                let machine_tenant = crate::session::dual_write::resolve_active_tenant_id();
-                let outgoing_jwt = auth_manager.get_access_token().ok();
-                let resolved_tenant =
-                    resolve_pair_tenant_id(&bearer_token, outgoing_jwt.as_deref(), machine_tenant);
-                let tenant_resolved = resolved_tenant.is_some();
+                // D1: an expired device JWT is never a pair-cli bearer. Said
+                // ONCE per entry into this state, not every tick — on
+                // 2026-10-07 the old path logged a pair-cli 401 181 times in a
+                // day, which read as a backend fault rather than "sign in".
+                if matches!(bearer, PairBearer::DeadSlot(_)) {
+                    if !DEAD_SLOT_SKIP_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        warn!(
+                            "device_jwt_refresher: no Cognito session and the device-JWT slot \
+                             holds an EXPIRED token — skipping pair-cli (an expired device JWT \
+                             cannot authorise it); only the device-machine-key exchange or a \
+                             sign-in can recover this runner's coord credential"
+                        );
+                    }
+                } else {
+                    DEAD_SLOT_SKIP_WARNED.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
 
-                // Phase 5.2: try_refresh_once encapsulates the
-                // pair-cli HTTP call + JWT persistence. It preserves
-                // the existing JWT on any non-2xx outcome.
-                let outcome = try_refresh_once(
+                let machine_tenant = crate::session::dual_write::resolve_active_tenant_id();
+                let dmk_device_id = std::env::var("QONTINUI_MACHINE_ID")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.trim().to_string())
+                    .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
+                // D3/D4/D5: attempt, record how this pass's recovery concluded,
+                // (on a legacy-slot runner) re-publish the posture from it NOW,
+                // and mark the pass concluded — so a kicked retry concludes with
+                // the banner showing ITS verdict. One function, so the order is
+                // pinned by `default_slot_recovery_tests`.
+                let attempt = run_pair_tick(
                     &auth_manager,
-                    &pair_base,
-                    &bearer_token,
-                    &device_id,
-                    &user_id,
-                    machine_tenant,
-                    pair_base_arm,
+                    PairMintRequest {
+                        pair_base: &pair_base,
+                        pair_base_arm,
+                        bearer: &bearer,
+                        refresh_class,
+                        device_id: &device_id,
+                        user_id: &user_id,
+                        machine_tenant,
+                        dmk_device_id: dmk_device_id.as_deref(),
+                    },
+                    PassPosture {
+                        publish_legacy: !has_tenant_slots,
+                        pins: sweep_inputs.posture_pin_inputs(),
+                        app: Some(&api_state.app_handle),
+                    },
                 )
                 .await;
-                let progress = match &outcome {
-                    RefreshOutcome::Replaced { new_jwt } => {
-                        info!(
-                            "device_jwt_refresher: device-JWT refreshed (len={})",
-                            new_jwt.len()
-                        );
-                        // Wake the relay so it reconnects with the new JWT.
-                        crate::mcp::backend_relay::commands::kick_cloud_relay().await;
-                        PairProgress::Healthy
-                    }
-                    RefreshOutcome::KeptExisting | RefreshOutcome::PersistFailed(_) => {
-                        if let RefreshOutcome::PersistFailed(e) = &outcome {
-                            warn!("device_jwt_refresher: persist new JWT failed: {e}");
-                        }
-                        // The mint did NOT advance the slot. Classify why:
-                        //   - no tenant resolvable → gate-blocking config red,
-                        //   - tenant fine but the slot JWT is now expired/absent
-                        //     → degraded "credential-dark" red,
-                        //   - tenant fine and the slot JWT is still valid →
-                        //     healthy (a transient coord 5xx we'll retry).
-                        if !tenant_resolved {
-                            PairProgress::BailNoTenant
-                        } else if slot_jwt_is_expired_or_absent(&auth_manager) {
-                            PairProgress::BailRefreshFailedExpired
-                        } else {
-                            PairProgress::Healthy
-                        }
-                    }
-                    // D3: terminal for the tick — see `PairProgress::BailTenantMismatch`.
-                    // Deliberately NOT `PersistFailed`'s arm: that path still falls
-                    // through to the dmk-exchange fallback below, which this must not.
-                    RefreshOutcome::TenantMismatch { expected, returned } => {
-                        warn_tenant_mismatch_once(*expected, *returned);
-                        PairProgress::BailTenantMismatch {
-                            expected: *expected,
-                            returned: *returned,
-                        }
-                    }
-                };
-
-                // Phase 4b: FINAL cold-start fallback. Self-refresh (4a) AND the
-                // Cognito pair-cli path have BOTH failed to advance the slot this
-                // tick. If a device machine key (`dmk_`) is stored, exchange it
-                // with web for a fresh device JWT — this recovers a runner offline
-                // past both the device-JWT TTL and the Cognito refresh-token window
-                // (>30d) with no user session. On success: same healthy-tick
-                // handling as the other re-mints (kick relay, publish healthy,
-                // reset backoff, emit "resumed" if we were dark, continue). On
-                // None: fall through to the existing bail.
-                // REPLACE-not-REVOKE: a miss never clears the existing JWT.
-                //
-                // D3: gated on the SPECIFIC bail reasons this fallback answers —
-                // NOT a blanket "anything but Healthy". `BailTenantMismatch` is
-                // deliberately excluded: coord already minted for the wrong
-                // tenant once this tick, and a dmk exchange mints from the SAME
-                // `coord.devices.tenant_id` column that wrong mint may have just
-                // overwritten, so falling through here would repeat the incident
-                // this plan closes rather than recover from it.
-                if matches!(
-                    progress,
-                    PairProgress::BailNoTenant | PairProgress::BailRefreshFailedExpired
-                ) {
-                    let dmk_device_id = std::env::var("QONTINUI_MACHINE_ID")
-                        .ok()
-                        .filter(|s| !s.trim().is_empty())
-                        .map(|s| s.trim().to_string())
-                        .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
-                    if let Some(did) = dmk_device_id {
-                        if let Some(new_jwt) = try_device_machine_key_exchange(
-                            &auth_manager,
-                            &pair_base,
-                            &did,
-                            resolved_tenant.map(|(t, _)| t),
-                        )
-                        .await
-                        {
-                            info!(
-                                "device_jwt_refresher: device JWT recovered via \
-                                 device-machine-key exchange (len={}) — self-refresh + \
-                                 Cognito both failed this tick",
-                                new_jwt.len()
-                            );
-                            crate::mcp::backend_relay::commands::kick_cloud_relay().await;
-                            publish_coord_credential_status(
-                                &auth_manager,
-                                &coord_credential_health(decision, Some(PairProgress::Healthy)),
-                            )
-                            .await;
-                            let action = plan_refresh_wait(&mut backoff, RefreshClass::Ok);
-                            if action.notify_recovered {
-                                emit_credential_dark(&api_state.app_handle, false);
-                            }
-                            if wait_with_signals(action.wait, &mut shutdown_rx, &mut kick_rx).await
-                            {
-                                return;
-                            }
-                            continue;
-                        }
-                    }
+                if let Some(RefreshOutcome::Replaced { new_jwt }) = &attempt.outcome {
+                    info!(
+                        "device_jwt_refresher: device-JWT refreshed (len={})",
+                        new_jwt.len()
+                    );
+                    // Wake the relay so it reconnects with the new JWT.
+                    crate::mcp::backend_relay::commands::kick_cloud_relay().await;
                 }
+                if let Some(new_jwt) = &attempt.dmk_jwt {
+                    info!(
+                        "device_jwt_refresher: device JWT recovered via \
+                         device-machine-key exchange (len={}) — self-refresh + \
+                         Cognito both failed this tick",
+                        new_jwt.len()
+                    );
+                    crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+                    publish_coord_credential_status(
+                        &auth_manager,
+                        &coord_credential_health(decision, Some(PairProgress::Healthy)),
+                    )
+                    .await;
+                    let action = plan_refresh_wait(&mut backoff, RefreshClass::Ok);
+                    if action.notify_recovered {
+                        emit_credential_dark(&api_state.app_handle, false);
+                    }
+                    if wait_with_signals(action.wait, &mut shutdown_rx, &mut kick_rx).await {
+                        return;
+                    }
+                    continue;
+                }
+                let progress = attempt.progress;
 
                 publish_coord_credential_status(
                     &auth_manager,
@@ -5138,11 +6356,15 @@ async fn refresher_loop(
 
 /// Sleep `dur`, but wake early on shutdown or kick. Returns `true` iff
 /// the loop should `return` (shutdown received).
+///
+/// Every pass of `refresher_loop` ends here, so this is also where the pass is
+/// marked CONCLUDED for a kick-and-wait caller ([`note_pass_concluded`]).
 async fn wait_with_signals(
     dur: Duration,
     shutdown_rx: &mut watch::Receiver<bool>,
     kick_rx: &mut watch::Receiver<u64>,
 ) -> bool {
+    note_pass_concluded();
     tokio::select! {
         _ = shutdown_rx.changed() => true,
         _ = kick_rx.changed() => false,
@@ -5196,6 +6418,49 @@ pub mod commands {
         let guard = get_holder().lock().await;
         if let Some(ref state) = *guard {
             state.kick();
+        }
+    }
+
+    /// Kick the refresher and wait — at most `timeout` — for the pass it
+    /// triggers to CONCLUDE, then return the posture that pass left behind.
+    ///
+    /// D5: "Retry refresh now" used to return `Ok(())` whatever happened, so
+    /// a retry that could never work looked exactly like one that had not
+    /// finished yet. `concluded: false` means the pass is still running (or no
+    /// refresher is registered): the posture returned is whatever was last
+    /// published, and the caller must read it as UNKNOWN, never as success.
+    pub async fn kick_device_jwt_refresher_and_wait(timeout: Duration) -> KickOutcome {
+        let seq = {
+            let guard = get_holder().lock().await;
+            guard.as_ref().map(|state| state.kick())
+        };
+        let concluded = match seq {
+            Some(seq) => wait_for_pass_concluded(seq, timeout).await,
+            None => false,
+        };
+        KickOutcome {
+            concluded,
+            posture: coord_credential_posture(),
+        }
+    }
+
+    /// What [`kick_device_jwt_refresher_and_wait`] observed.
+    #[derive(Debug, Clone)]
+    pub struct KickOutcome {
+        /// Did the kicked pass conclude inside the bound?
+        pub concluded: bool,
+        /// The posture as published when the wait ended (`None` = UNKNOWN).
+        pub posture: Option<CoordCredentialStatus>,
+    }
+
+    impl KickOutcome {
+        /// The command's wire shape: `{ concluded, posture }`, where `posture`
+        /// is the same object `get_coord_credential_posture` returns.
+        pub fn to_json(&self) -> serde_json::Value {
+            serde_json::json!({
+                "concluded": self.concluded,
+                "posture": self.posture.as_ref().map(CoordCredentialStatus::to_json),
+            })
         }
     }
 }
@@ -5654,7 +6919,7 @@ mod try_refresh_once_tests {
     /// Per-test isolated AuthManager. Each test name maps to its own
     /// `.enc` file under the OS temp dir.
     fn test_auth_manager(name: &str) -> crate::auth::AuthManager {
-        let dir = std::env::temp_dir().join("qontinui_test_refresher");
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_refresher");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(format!("{name}.enc"));
         let _ = std::fs::remove_file(&path);
@@ -5775,7 +7040,10 @@ mod try_refresh_once_tests {
         // Setup: AuthManager holds a valid-shape (not-yet-expired) JWT.
         // Run: mock web backend returns 401 on pair-cli.
         // Assert: access_token slot STILL holds the original JWT (not
-        // cleared) AND the outcome is KeptExisting.
+        // cleared) AND the outcome is BearerRejected — a 401 is a verdict on
+        // the bearer, not a transient fault (plan
+        // 2026-10-07-runner-credential-banner-offers-retry-when-only-sign-in-can-recover
+        // D2), but REPLACE-not-REVOKE still holds.
         let mgr = test_auth_manager("handles_coord_401_without_clearing");
         let existing_jwt = synth_jwt(chrono::Utc::now().timestamp() + 30 * 60);
         mgr.store_tokens(&existing_jwt, "").expect("store");
@@ -5788,8 +7056,8 @@ mod try_refresh_once_tests {
         let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID, None, None).await;
         assert_eq!(
             outcome,
-            RefreshOutcome::KeptExisting,
-            "401 must yield KeptExisting (not Replaced, not PersistFailed)"
+            RefreshOutcome::BearerRejected { status: 401 },
+            "401 must yield BearerRejected (not KeptExisting, not Replaced)"
         );
         assert_eq!(
             *cap.hits.lock().unwrap(),
@@ -6127,7 +7395,7 @@ mod device_self_refresh_tests {
     }
 
     fn test_auth_manager(name: &str) -> crate::auth::AuthManager {
-        let dir = std::env::temp_dir().join("qontinui_test_self_refresh");
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_self_refresh");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(format!("{name}.enc"));
         let _ = std::fs::remove_file(&path);
@@ -6403,7 +7671,7 @@ mod tenant_slot_refresh_tests {
     }
 
     fn test_auth_manager(name: &str) -> crate::auth::AuthManager {
-        let dir = std::env::temp_dir().join("qontinui_test_tenant_slots");
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_tenant_slots");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(format!("{name}.enc"));
         let _ = std::fs::remove_file(&path);
@@ -6541,7 +7809,7 @@ mod tenant_slot_refresh_tests {
     ///
     /// Poisoning is recovered rather than propagated: one failing test must not
     /// convert every sibling into a panic-on-lock and hide the real failure.
-    fn health_lock() -> std::sync::MutexGuard<'static, ()> {
+    fn health_lock() -> crate::test_env::TestLockGuard {
         // THE crate-wide lock — the `mcp_api` forwarder-wiring tests take the
         // same one, so the two suites serialise against each other and not
         // merely within themselves.
@@ -7033,6 +8301,7 @@ mod tenant_slot_refresh_tests {
             PostureTransition {
                 from: None,
                 to: CoordCredentialPosture::Expired,
+                detail_changed: false,
             },
             "the FIRST thing a runner holding a dead restored credential says \
              must be `expired`, not silence: {transitions:?}"
@@ -7052,6 +8321,157 @@ mod tenant_slot_refresh_tests {
         assert!(!concluded.posture.can_answer());
     }
 
+    // ---- Phase 0 of plan 2026-09-25-runner-loses-its-relay-and-announces-it-
+    // under-a-false-cause-or-not-at-all: pin what the posture authority ALREADY
+    // reports for a legacy (slot-less) runner booting into a dead credential.
+    // These describe CURRENT behaviour; if one fails, the plan says fix the
+    // posture authority before its Phase 1 — never bend the test.
+
+    /// The LEGACY branch's observation, built through the SAME constructor
+    /// `refresher_loop` uses when no tenant slot exists
+    /// (`SlotObservation::observed(None, …)`), and derived through the same
+    /// `derive_and_publish_posture` call.
+    fn legacy_boot_publish(token: Option<&str>, now: i64) -> Option<PostureTransition> {
+        let obs = SlotObservation::observed(None, token);
+        assert_eq!(obs.tenant_id, None, "the legacy branch names no tenant");
+        assert_eq!(obs.outcome, None, "no pass outcome on the legacy branch");
+        derive_and_publish_posture(std::slice::from_ref(&obs), PosturePinInputs::UNPINNED, now)
+    }
+
+    /// (a) A slot-less runner booting on an EXPIRED legacy credential: the
+    /// first publish is a recorded `None -> Expired` transition, and it fires
+    /// the banner — boot is not exempt (DD2).
+    #[test]
+    fn posture_fires_on_legacy_dead_slot_boot_with_an_expired_jwt() {
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let dead = synth_jwt(now - 600, "legacy-restored-dead");
+
+        let transition = legacy_boot_publish(Some(dead.as_str()), now);
+        let expected = PostureTransition {
+            from: None,
+            to: CoordCredentialPosture::Expired,
+            detail_changed: false,
+        };
+        assert_eq!(transition, Some(expected));
+        assert_eq!(recorded_posture_transitions(), vec![expected]);
+        assert!(!expected.to.can_answer());
+        assert!(
+            should_notify_posture(expected.from, expected.to) && transition_notifies(expected),
+            "a legacy boot into an expired credential must fire the banner"
+        );
+        let published = coord_credential_posture().expect("the boot pass publishes");
+        assert_eq!(published.posture, CoordCredentialPosture::Expired);
+        assert_eq!(published.tenant_id, None);
+        reset_posture();
+    }
+
+    /// (a) The same boot with NO legacy credential at all reads `absent` and
+    /// fires — a never-paired runner is not silent.
+    #[test]
+    fn posture_fires_on_legacy_dead_slot_boot_with_no_token() {
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+
+        let transition = legacy_boot_publish(None, now);
+        let expected = PostureTransition {
+            from: None,
+            to: CoordCredentialPosture::Absent,
+            detail_changed: false,
+        };
+        assert_eq!(transition, Some(expected));
+        assert_eq!(recorded_posture_transitions(), vec![expected]);
+        assert!(!expected.to.can_answer());
+        assert!(should_notify_posture(expected.from, expected.to) && transition_notifies(expected));
+        reset_posture();
+    }
+
+    /// (b) Every refresher tick re-derives the legacy posture. Re-deriving the
+    /// SAME dead posture must not be a second transition, and even if it were
+    /// offered to the notifier it must not fire again — once per transition.
+    #[test]
+    fn posture_legacy_dead_slot_rederived_does_not_notify_twice() {
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let dead = synth_jwt(now - 600, "legacy-restored-dead");
+
+        for (token, dead_posture) in [
+            (Some(dead.as_str()), CoordCredentialPosture::Expired),
+            (None, CoordCredentialPosture::Absent),
+        ] {
+            reset_posture();
+            let first = legacy_boot_publish(token, now);
+            assert_eq!(first.map(|t| t.to), Some(dead_posture));
+            let second = legacy_boot_publish(token, now + 60);
+            assert_eq!(
+                second, None,
+                "an unchanged posture is not a transition: {second:?}"
+            );
+            assert_eq!(
+                recorded_posture_transitions().len(),
+                1,
+                "exactly one recorded transition for one dark episode"
+            );
+            assert!(
+                !should_notify_posture(Some(dead_posture), dead_posture),
+                "the same dark posture must not re-notify"
+            );
+            // Still dark and still published — dedup is not recovery.
+            let published = coord_credential_posture().expect("published");
+            assert_eq!(published.posture, dead_posture);
+        }
+        reset_posture();
+    }
+
+    /// (c) A Cognito refresh that recovers after a HARD failure yields
+    /// `notify_recovered` from `plan_refresh_wait`, and — the part this test
+    /// actually pins — the posture it runs beside keeps its dark value.
+    ///
+    /// Scope, stated so the name is not over-read: `plan_refresh_wait` is pure
+    /// over `RefreshBackoff`, so the posture assertions below pin the
+    /// SEPARATION of the two authorities' state, not the emitted event. That a
+    /// Cognito `dark:false` cannot clear a posture-sourced banner rests on
+    /// `emit_credential_dark` sending `source: "cognito"` and on the frontend
+    /// reducer (`src/components/web-integration-banner-logic.ts`, M5) clearing
+    /// only the sending source's entry. The reducer half is covered by its own
+    /// tests (`WebIntegrationAuthBanner.test.ts`); the Rust half — the emitted
+    /// `source` value — is NOT tested anywhere, because emitting needs an
+    /// `AppHandle`.
+    #[test]
+    fn cognito_recovery_after_hard_notifies_recovered_and_leaves_the_posture_state_alone() {
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let dead = synth_jwt(now - 600, "legacy-restored-dead");
+        let boot = legacy_boot_publish(Some(dead.as_str()), now);
+        assert_eq!(boot.map(|t| t.to), Some(CoordCredentialPosture::Expired));
+        let transitions_before = recorded_posture_transitions();
+
+        let mut backoff = RefreshBackoff::default();
+        let hard = plan_refresh_wait(&mut backoff, RefreshClass::Hard);
+        assert!(hard.notify_dark && !hard.notify_recovered);
+        let ok = plan_refresh_wait(&mut backoff, RefreshClass::Ok);
+        assert!(
+            ok.notify_recovered && !ok.notify_dark,
+            "Ok after Hard is the Cognito recovery: {ok:?}"
+        );
+
+        assert_eq!(
+            recorded_posture_transitions(),
+            transitions_before,
+            "a Cognito recovery must not publish a posture transition"
+        );
+        let published = coord_credential_posture().expect("published");
+        assert_eq!(published.posture, CoordCredentialPosture::Expired);
+        assert!(!published.posture.can_answer());
+        assert_eq!(DARK_SOURCE_COGNITO, "cognito");
+        assert_ne!(DARK_SOURCE_COGNITO, DARK_SOURCE_POSTURE);
+        reset_posture();
+    }
+
     /// A token whose own `exp` is comfortably in the FUTURE, that coord keeps
     /// refusing. `exp` alone calls this `live` — which is the silent case the
     /// upstream input exists to catch.
@@ -7064,6 +8484,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
         // No upstream evidence: `exp` says live, and live is what we report.
         assert_eq!(
@@ -7101,6 +8522,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
         let posture = || derive_coord_credential_posture(&live_slot, upstream_signal(), now);
 
@@ -7223,6 +8645,7 @@ mod tenant_slot_refresh_tests {
             vec![PostureTransition {
                 from: None,
                 to: CoordCredentialPosture::Expiring,
+                detail_changed: false,
             }],
             "a timeout may not produce a SECOND transition — the posture the \
              boot observation established still stands: {transitions:?}"
@@ -7346,6 +8769,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(outcome),
+            recovery: None,
         };
         assert_eq!(
             derive_coord_credential_posture(
@@ -7436,6 +8860,9 @@ mod tenant_slot_refresh_tests {
             since: 7,
             observed_at_unix: 9,
             attributable: true,
+            composed_reason: None,
+            pinned_tenant: false,
+            detail: None,
         };
         let v = status.to_json();
         assert_eq!(v["state"], "dark");
@@ -7580,6 +9007,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
         assert_eq!(
             derive_coord_credential_posture(&obs, upstream_signal_for(Some(&t.to_string())), now),
@@ -7638,6 +9066,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
         assert_eq!(
             derive_and_publish_posture(
@@ -7709,6 +9138,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
         assert_eq!(
             derive_and_publish_posture(
@@ -7782,6 +9212,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
 
         // Interleaved exactly as a live box would produce them: A refused, B
@@ -7860,6 +9291,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
         for _ in 0..UPSTREAM_DARK_THRESHOLD {
             note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_expired"}"#);
@@ -7933,6 +9365,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
         let slots = [healthy_slot(tenant(0)), healthy_slot(tenant(1))];
 
@@ -8096,6 +9529,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
         let slots = [healthy(tenant(1)), healthy(tenant(2))];
         for _ in 0..UPSTREAM_DARK_THRESHOLD {
@@ -8261,6 +9695,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
         let slots = [healthy(y), healthy(z)];
 
@@ -8368,6 +9803,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
         let slots = [slot(a), slot(b)];
         for _ in 0..5 {
@@ -8506,6 +9942,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         }];
         for _ in 0..UPSTREAM_DARK_THRESHOLD {
             note_coord_upstream_verdict(Some(pinned), true, 401, br#"{"code":"token_revoked"}"#);
@@ -8538,12 +9975,18 @@ mod tenant_slot_refresh_tests {
         // downgrading it to `absent` — and now names the tenant to re-pair.
         let pins = PosturePinInputs {
             machine_pin: TenantPin::Pinned(pinned),
-            default_binding: crate::auth::BindingTenantRead::Unbound,
+            pin_served: slot_absent(),
         };
+        // Still dark, so never a recovery — but the banner's subject moved from
+        // "no tenant" to T, which is a DETAIL transition that re-announces it.
         assert_eq!(
             derive_and_publish_posture(&slots, pins, now),
-            None,
-            "still dark, so no transition — and never a recovery"
+            Some(PostureTransition {
+                from: Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)),
+                to: CoordCredentialPosture::Dark(DarkCause::UpstreamRejected),
+                detail_changed: true,
+            }),
+            "still dark — never a recovery — and now naming T"
         );
         let published = coord_credential_posture().expect("published");
         assert_eq!(
@@ -8572,6 +10015,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         }
     }
 
@@ -8597,7 +10041,7 @@ mod tenant_slot_refresh_tests {
         );
         let pins = PosturePinInputs {
             machine_pin: TenantPin::Pinned(pinned),
-            default_binding: crate::auth::BindingTenantRead::Bound(other_slot),
+            pin_served: slot_absent(),
         };
 
         let transition = derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now);
@@ -8618,12 +10062,69 @@ mod tenant_slot_refresh_tests {
         reset_posture();
     }
 
-    /// Plan 2026-09-14 Phase 1: a pin the DEFAULT binding serves is not
-    /// unserved — the legacy `access_token` slot answers for it (the
-    /// legacy-only install), so no tenant observation naming it proves
-    /// nothing. The posture is exactly what the observations alone derive.
+    /// What the credential selector answers for a pinned tenant with no slot
+    /// that is NOT the default binding: a plain miss. The common shape of an
+    /// unserved pin, so most posture tests inject it directly.
+    fn slot_absent() -> Option<Result<(), crate::auth::NoCredential>> {
+        Some(Err(crate::auth::NoCredential::Slot(
+            crate::auth::SlotState::Absent,
+        )))
+    }
+
+    /// Assert the published posture is the UNSERVED-PIN arm for `pinned`:
+    /// non-answering, naming `pinned`, with a reason that names it and carries
+    /// the selector's cause — on `/health` (`to_json`) and the heartbeat bag
+    /// alike (plan 2026-09-14-credential-posture-third-residuals, Phase 3).
+    fn assert_pin_arm_published(pinned: uuid::Uuid, cause: crate::auth::NoCredential, label: &str) {
+        let published = coord_credential_posture().expect("published");
+        assert!(
+            !published.posture.can_answer(),
+            "{label}: the pin arm is non-answering, got {:?}",
+            published.posture
+        );
+        assert_eq!(
+            published.tenant_id.as_deref(),
+            Some(pinned.to_string().as_str()),
+            "{label}: the posture names the pinned tenant"
+        );
+        assert!(
+            published.pinned_tenant,
+            "{label}: marked as the pinned-tenant arm"
+        );
+        assert_eq!(
+            published.to_json()["pinnedTenant"].as_bool(),
+            Some(true),
+            "{label}: /health carries the pinned-tenant marker"
+        );
+        let expected = pinned_tenant_reason(&pinned, &cause);
+        assert_eq!(published.reason(), expected, "{label}: the composed reason");
+        assert!(
+            expected.contains(&pinned.to_string()) && expected.contains(&cause.to_string()),
+            "{label}: the reason names T and the selector's cause: {expected}"
+        );
+        assert_eq!(
+            published.to_json()["reason"].as_str(),
+            Some(expected.as_str()),
+            "{label}: /health carries the composed reason"
+        );
+        let bag = coord_credential_bag(&CoordCredentialHealth::ok(), Some(&published));
+        assert_eq!(
+            bag.reason.as_deref(),
+            Some(expected.as_str()),
+            "{label}: the heartbeat bag carries it too"
+        );
+        assert!(bag.pinned_tenant, "{label}: and the marker");
+    }
+
+    /// Plan 2026-09-14-credential-posture-third-residuals, Phase 1 exit (d) —
+    /// the rewrite of `a_pin_served_by_the_default_binding_synthesizes_nothing`.
+    /// A pin the SELECTOR serves (`pin_served: Some(Ok)`) is not unserved,
+    /// whatever serves it — T's own slot, or the legacy slot for a default T
+    /// whose token claims T. The posture is exactly what the observations alone
+    /// derive. The real-selector shape of the legacy case is the counterfactual
+    /// half of `a_pin_the_default_binding_cannot_actually_serve_is_non_answering`.
     #[test]
-    fn a_pin_served_by_the_default_binding_synthesizes_nothing() {
+    fn a_pin_the_selector_serves_synthesizes_nothing() {
         use crate::session::tenant_pin::TenantPin;
         let _serialised = health_lock();
         reset_posture();
@@ -8636,30 +10137,33 @@ mod tenant_slot_refresh_tests {
 
         let pins = PosturePinInputs {
             machine_pin: TenantPin::Pinned(pinned),
-            default_binding: crate::auth::BindingTenantRead::Bound(pinned),
+            pin_served: Some(Ok(())),
         };
         assert_eq!(
             derive_and_publish_posture(&slots, pins, now).map(|t| t.to),
             Some(today)
         );
+        let published = coord_credential_posture().expect("published");
         assert_eq!(
-            coord_credential_posture()
-                .expect("published")
-                .tenant_id
-                .as_deref(),
+            published.tenant_id.as_deref(),
             Some(other_slot.to_string().as_str())
         );
+        assert_eq!(published.composed_reason, None, "no pin sentence either");
         reset_posture();
     }
 
-    /// Plan 2026-09-14 Phase 1: every UNMEASURED pin input abstains — an
-    /// unresolvable `machine.json`, no pin at all, an unreadable default
-    /// binding, and a pinned tenant whose slot this pass could not read (it
-    /// may hold a working credential). None of them is evidence the pin is
-    /// unserved, so each publishes exactly what the observations derive.
+    /// Phase 1 exit (e) — the rewrite of
+    /// `an_unresolvable_pin_or_an_unmeasured_input_synthesizes_nothing`, case by
+    /// case. What SURVIVES: a pin that names no tenant (`Unresolvable`,
+    /// `Unpinned`) synthesizes nothing, and a MEASURED observation of the pinned
+    /// slot speaks for it through the per-slot ladder even when the selector
+    /// refused it. What MOVED: the unreadable-binding case is now exit (a)
+    /// (`an_unreadable_default_binding_does_not_resolve_the_pin_to_live`) and
+    /// the unreadable-pinned-slot case is exit (b)
+    /// (`an_unreadable_pinned_slot_beside_a_live_sibling_is_non_answering`) —
+    /// both now publish the pin, because the forwarder refuses T in both.
     #[test]
-    fn an_unresolvable_pin_or_an_unmeasured_input_synthesizes_nothing() {
-        use crate::auth::BindingTenantRead;
+    fn a_pin_that_names_no_tenant_or_is_measured_synthesizes_nothing() {
         use crate::session::tenant_pin::TenantPin;
         let _serialised = health_lock();
         let now = chrono::Utc::now().timestamp();
@@ -8667,41 +10171,20 @@ mod tenant_slot_refresh_tests {
         let other_slot = tenant(4);
         let live = live_slot(other_slot, now);
         let today = derive_coord_credential_posture(&live, UpstreamSignal::default(), now);
-        let unreadable_pin_slot = SlotObservation::unreadable(Some(pinned.to_string()));
 
-        for (label, machine_pin, default_binding, slots) in [
-            (
-                "unresolvable pin",
-                TenantPin::Unresolvable,
-                BindingTenantRead::Unbound,
-                vec![live.clone()],
-            ),
-            (
-                "no pin",
-                TenantPin::Unpinned,
-                BindingTenantRead::Unbound,
-                vec![live.clone()],
-            ),
-            (
-                "unreadable binding",
-                TenantPin::Pinned(pinned),
-                BindingTenantRead::Unknown,
-                vec![live.clone()],
-            ),
-            (
-                "the pinned slot is unreadable",
-                TenantPin::Pinned(pinned),
-                BindingTenantRead::Unbound,
-                vec![live.clone(), unreadable_pin_slot.clone()],
-            ),
+        for (label, machine_pin) in [
+            ("unresolvable pin", TenantPin::Unresolvable),
+            ("no pin", TenantPin::Unpinned),
         ] {
             reset_posture();
             let pins = PosturePinInputs {
                 machine_pin,
-                default_binding,
+                // What `pin_served_by_selector` answers for both: no tenant,
+                // so no question asked.
+                pin_served: None,
             };
             assert_eq!(
-                derive_and_publish_posture(&slots, pins, now).map(|t| t.to),
+                derive_and_publish_posture(std::slice::from_ref(&live), pins, now).map(|t| t.to),
                 Some(today),
                 "{label}: no synthesis"
             );
@@ -8714,6 +10197,198 @@ mod tenant_slot_refresh_tests {
                 "{label}: the published tenant is the observed one"
             );
         }
+
+        // A MEASURED T observation wins over the selector's refusal: the ladder
+        // says more (here `expired`) than the pin arm's `absent` would.
+        reset_posture();
+        let expired_pin_slot = SlotObservation {
+            tenant_id: Some(pinned.to_string()),
+            exp: Some(now - 60),
+            present: true,
+            unknown: false,
+            outcome: Some(TenantSlotOutcome::KeptExisting),
+            recovery: None,
+        };
+        let pins = PosturePinInputs {
+            machine_pin: TenantPin::Pinned(pinned),
+            pin_served: Some(Err(crate::auth::NoCredential::Slot(
+                crate::auth::SlotState::PresentButDead,
+            ))),
+        };
+        assert_eq!(
+            derive_and_publish_posture(&[live.clone(), expired_pin_slot], pins, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Expired),
+            "the measured pinned slot speaks through the ladder"
+        );
+        let published = coord_credential_posture().expect("published");
+        assert_eq!(
+            published.tenant_id.as_deref(),
+            Some(pinned.to_string().as_str())
+        );
+        assert_eq!(
+            published.composed_reason, None,
+            "a measured slot's posture keeps the generic sentence"
+        );
+        assert!(
+            !published.pinned_tenant,
+            "a measured slot is not the pinned-tenant arm, even when it IS T's"
+        );
+        reset_posture();
+    }
+
+    /// Phase 1 exit (b) — review finding 1b. T's slot reads `unknown` (the
+    /// store read failed for it), Y is live, the default binding is elsewhere.
+    /// The selector treats the unreadable read as a MISS — fail-closed, and
+    /// correct — so every T-pinned session is refused. The unreadable T
+    /// observation used to count as "naming T", so the pass published Y's
+    /// `live`.
+    #[test]
+    fn an_unreadable_pinned_slot_beside_a_live_sibling_is_non_answering() {
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let pinned = tenant(3);
+        let other_slot = tenant(4);
+        let cause = crate::auth::NoCredential::Slot(crate::auth::SlotState::Unreadable);
+        let pins = PosturePinInputs {
+            machine_pin: TenantPin::Pinned(pinned),
+            pin_served: Some(Err(cause)),
+        };
+        let slots = [
+            live_slot(other_slot, now),
+            SlotObservation::unreadable(Some(pinned.to_string())),
+        ];
+        assert_eq!(
+            derive_and_publish_posture(&slots, pins, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Absent),
+            "never Y's `live` while the forwarder refuses T"
+        );
+        assert_pin_arm_published(pinned, cause, "unreadable pinned slot");
+        assert!(
+            coord_credential_posture()
+                .expect("published")
+                .reason()
+                .contains("slot unreadable"),
+            "D4: the banner says UNREADABLE, not that the credential is gone"
+        );
+        reset_posture();
+    }
+
+    /// Phase 1 exit (a) — review finding 1a, through the PRODUCTION reads.
+    /// `paired_user.json` is malformed (`BindingTenantRead::Unknown`),
+    /// `machine.json` pins T, T has no slot, Y's slot is live. The forwarder
+    /// collapses the unreadable binding to `None`, so the selector serves
+    /// NOBODY from the legacy slot and refuses T. The old abstention ("an
+    /// unreadable binding might be the pin itself") published Y's `live`.
+    #[test]
+    fn an_unreadable_default_binding_does_not_resolve_the_pin_to_live() {
+        use crate::session::tenant_pin::TenantPin;
+        let pinned = tenant(3);
+        let other_slot = tenant(4);
+        let now = chrono::Utc::now().timestamp();
+        // The ambient fixture is released before the posture lock is taken, so
+        // this test never holds the env lock and the posture lock together.
+        let inputs = {
+            let amb = crate::test_env::isolated_ambient();
+            std::fs::write(amb.dir().join("paired_user.json"), b"{ not json")
+                .expect("write a malformed paired_user.json");
+            amb.write_active_tenant_id(pinned);
+            let am = crate::auth::AuthManager::new();
+            am.store_tenant_device_jwt(&other_slot, &synth_jwt(now + 3 * 60 * 60, "y"))
+                .expect("store Y's live slot");
+            read_sweep_inputs(&am)
+        };
+        assert_eq!(
+            inputs.default_binding,
+            crate::auth::BindingTenantRead::Unknown,
+            "precondition: the binding is unreadable"
+        );
+        assert_eq!(inputs.machine_pin, TenantPin::Pinned(pinned));
+        let cause = crate::auth::NoCredential::Slot(crate::auth::SlotState::Absent);
+        assert_eq!(
+            inputs.pin_served,
+            Some(Err(cause)),
+            "the selector, given the forwarder's collapse of an unreadable binding, refuses T"
+        );
+
+        let _serialised = health_lock();
+        reset_posture();
+        assert_eq!(
+            derive_and_publish_posture(
+                &[live_slot(other_slot, now)],
+                inputs.posture_pin_inputs(),
+                now
+            )
+            .map(|t| t.to),
+            Some(CoordCredentialPosture::Absent)
+        );
+        assert_pin_arm_published(pinned, cause, "unreadable binding");
+        reset_posture();
+    }
+
+    /// The legacy arm's observation: the `access_token` slot, holding a
+    /// credential with a future `exp` — what `SlotObservation::observed(None,
+    /// Some(jwt))` yields for a live token.
+    fn live_legacy_observation(now: i64) -> SlotObservation {
+        SlotObservation {
+            tenant_id: None,
+            exp: Some(now + 3 * 60 * 60),
+            present: true,
+            unknown: false,
+            outcome: None,
+            recovery: None,
+        }
+    }
+
+    /// Phase 1 exit (c) — the rewrite of
+    /// `an_unreadable_slot_store_synthesizes_no_pin_posture_on_the_legacy_arm`
+    /// (D3). An UNREADABLE slot store collapses to the legacy arm, whose one
+    /// observation (`tenant_id: None`) can never name the pin. That used to make
+    /// the pin inputs abstain (`UNPINNED`) and publish the legacy slot's `live`
+    /// — while the selector, reading T's slot from the SAME unreadable store,
+    /// refused every T-pinned session. The pin now carries the selector's
+    /// verdict through, and the posture follows it.
+    #[test]
+    fn an_unreadable_slot_store_publishes_the_pin_the_forwarder_refuses_on_the_legacy_arm() {
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let pinned = tenant(3);
+        let bound = tenant(4);
+        let cause = crate::auth::NoCredential::Slot(crate::auth::SlotState::Unreadable);
+        let inputs = SweepInputs {
+            tenant_slots: Err(anyhow::anyhow!("undecryptable store")),
+            default_binding: crate::auth::BindingTenantRead::Bound(bound),
+            machine_pin: TenantPin::Pinned(pinned),
+            coord_bound_tenants: unread_sidecar(),
+            coord_bound_tenants_for_ask: unread_sidecar(),
+            legacy_slot_present: false,
+            // What the selector answers when T's slot read hits that store.
+            pin_served: Some(Err(cause)),
+        };
+        let pins = inputs.posture_pin_inputs();
+        assert_eq!(
+            pins,
+            PosturePinInputs {
+                machine_pin: TenantPin::Pinned(pinned),
+                pin_served: Some(Err(cause)),
+            },
+            "an unreadable store no longer erases the pin"
+        );
+
+        let legacy = live_legacy_observation(now);
+        assert!(
+            derive_coord_credential_posture(&legacy, UpstreamSignal::default(), now).can_answer(),
+            "precondition: the legacy slot alone answers"
+        );
+        assert_eq!(
+            derive_and_publish_posture(&[legacy], pins, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Absent),
+            "never the legacy slot's `live` while T-pinned sessions are refused"
+        );
+        assert_pin_arm_published(pinned, cause, "unreadable store");
         reset_posture();
     }
 
@@ -8734,7 +10409,7 @@ mod tenant_slot_refresh_tests {
         }
         let pins = PosturePinInputs {
             machine_pin: TenantPin::Pinned(pinned),
-            default_binding: crate::auth::BindingTenantRead::Unbound,
+            pin_served: slot_absent(),
         };
         assert_eq!(
             derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now).map(|t| t.to),
@@ -8751,64 +10426,493 @@ mod tenant_slot_refresh_tests {
         reset_posture();
     }
 
-    /// The legacy arm's observation: the `access_token` slot, holding a
-    /// credential with a future `exp` — what `SlotObservation::observed(None,
-    /// Some(jwt))` yields for a live token.
-    fn live_legacy_observation(now: i64) -> SlotObservation {
-        SlotObservation {
-            tenant_id: None,
-            exp: Some(now + 3 * 60 * 60),
-            present: true,
-            unknown: false,
-            outcome: None,
+    /// A device JWT carrying the `tenant_id` claim coord stamps into every
+    /// token it issues — what the selector's legacy-fallback claim check reads.
+    fn jwt_with_tenant_claim(t: uuid::Uuid, exp: i64) -> String {
+        let header = b64url(b"{\"alg\":\"EdDSA\",\"typ\":\"JWT\"}");
+        let payload = b64url(format!("{{\"exp\":{exp},\"tenant_id\":\"{t}\"}}").as_bytes());
+        format!("{header}.{payload}.{}", b64url(b"fake-sig"))
+    }
+
+    /// Put `jwt` in the LEGACY `access_token` slot ONLY: the write mirrors into
+    /// `device_jwt:<claim>`, and `clear_claim_slot` removes that mirror so the
+    /// legacy fallback is what a lookup of the claimed tenant actually reaches.
+    fn store_legacy(
+        mgr: &crate::auth::AuthManager,
+        jwt: &str,
+        clear_claim_slot: Option<uuid::Uuid>,
+    ) {
+        mgr.store_tokens(jwt, "").expect("store the legacy slot");
+        if let Some(t) = clear_claim_slot {
+            mgr.clear_tenant_device_jwt(&t)
+                .expect("clear the mirrored slot");
         }
     }
 
-    /// Review round 1, B-1. An UNREADABLE slot store collapses to the legacy
-    /// arm, whose one observation (`tenant_id: None`) can never name the pin.
-    /// Feeding the real pin through published `absent(T)` on a multi-tenant box
-    /// pinned to T and bound to B — off one failed read — and the next good
-    /// read fired "Coord access restored". The pins built from those inputs
-    /// abstain, so the posture is what the observation alone derives.
+    /// Plan 2026-09-14-credential-posture-third-residuals, Phase 2 — review
+    /// finding 2, through the REAL selector. Pin T == the default binding, T's
+    /// tenant slot is gone (cleared, re-derive failed), sibling Y is live. The
+    /// old input treated `Bound(T) == pinned` as served, on the theory that the
+    /// legacy `access_token` slot answers for the default tenant — and nothing
+    /// on the multi-tenant branch measured that slot.
+    ///
+    /// (a) The legacy slot holds the SAME expired token → the selector refuses
+    ///     (`DefaultBindingFallback`) → non-answering, naming T.
+    /// (b) The case the draft missed: the legacy slot holds a LIVE token whose
+    ///     claim names Y → `DefaultBindingClaimMismatch` → non-answering,
+    ///     naming T. A presence-and-`exp` probe would have called it served.
+    /// Counterfactual, same harness: a live legacy token claiming T IS served,
+    ///     so the posture is Y's `live` (Phase 1 exit (d)'s real-selector half).
     #[test]
-    fn an_unreadable_slot_store_synthesizes_no_pin_posture_on_the_legacy_arm() {
+    fn a_pin_the_default_binding_cannot_actually_serve_is_non_answering() {
+        use crate::auth::{MeasuredBindingCount, NoCredential, SlotState};
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        let now = chrono::Utc::now().timestamp();
+        let pinned = tenant(3);
+        let other_slot = tenant(4);
+        let two_bindings = MeasuredBindingCount::Measured(2);
+
+        // (a) expired legacy token, T's own claim.
+        let mgr = test_auth_manager("p2a_expired_legacy_for_default_pin");
+        mgr.store_tenant_device_jwt(&other_slot, &synth_jwt(now + 3 * 60 * 60, "y"))
+            .expect("store Y");
+        store_legacy(&mgr, &jwt_with_tenant_claim(pinned, now - 60), Some(pinned));
+        let served =
+            pin_served_by_selector(&mgr, TenantPin::Pinned(pinned), Some(pinned), two_bindings);
+        let cause = NoCredential::DefaultBindingFallback {
+            own: SlotState::Absent,
+            legacy: SlotState::PresentButDead,
+        };
+        assert_eq!(served, Some(Err(cause)), "(a) the selector refuses T");
+        reset_posture();
+        let pins = PosturePinInputs {
+            machine_pin: TenantPin::Pinned(pinned),
+            pin_served: served,
+        };
+        assert_eq!(
+            derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Absent),
+            "(a) never Y's `live`"
+        );
+        assert_pin_arm_published(pinned, cause, "(a) expired legacy");
+
+        // (b) live legacy token claiming Y.
+        let mgr = test_auth_manager("p2b_claim_mismatch_for_default_pin");
+        mgr.store_tenant_device_jwt(&other_slot, &synth_jwt(now + 3 * 60 * 60, "y"))
+            .expect("store Y");
+        store_legacy(
+            &mgr,
+            &jwt_with_tenant_claim(other_slot, now + 3 * 60 * 60),
+            None,
+        );
+        let served =
+            pin_served_by_selector(&mgr, TenantPin::Pinned(pinned), Some(pinned), two_bindings);
+        let cause = NoCredential::DefaultBindingClaimMismatch {
+            own: SlotState::Absent,
+            claimed: Some(other_slot),
+        };
+        assert_eq!(
+            served,
+            Some(Err(cause)),
+            "(b) a Y-claiming token is not T's"
+        );
+        reset_posture();
+        let pins = PosturePinInputs {
+            machine_pin: TenantPin::Pinned(pinned),
+            pin_served: served,
+        };
+        assert_eq!(
+            derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Absent),
+            "(b) never Y's `live`"
+        );
+        assert_pin_arm_published(pinned, cause, "(b) claim mismatch");
+
+        // Counterfactual: a live legacy token claiming T serves the pin.
+        let mgr = test_auth_manager("p2_counterfactual_live_legacy_for_default_pin");
+        mgr.store_tenant_device_jwt(&other_slot, &synth_jwt(now + 3 * 60 * 60, "y"))
+            .expect("store Y");
+        store_legacy(
+            &mgr,
+            &jwt_with_tenant_claim(pinned, now + 3 * 60 * 60),
+            Some(pinned),
+        );
+        let served =
+            pin_served_by_selector(&mgr, TenantPin::Pinned(pinned), Some(pinned), two_bindings);
+        assert_eq!(
+            served,
+            Some(Ok(())),
+            "counterfactual: the legacy slot serves T"
+        );
+        reset_posture();
+        let pins = PosturePinInputs {
+            machine_pin: TenantPin::Pinned(pinned),
+            pin_served: served,
+        };
+        assert_eq!(
+            derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Live),
+            "counterfactual: a served pin synthesizes nothing"
+        );
+        reset_posture();
+    }
+
+    /// THE control for D1 (`a-control-must-test-the-property-it-names`): for
+    /// every [`crate::auth::NoCredential`] the selector can return for a pinned
+    /// tenant, produced by the REAL selector against a real store rather than
+    /// hand-built, the pin arm is non-answering, names T and carries that
+    /// cause — and the one `Ok` shape is answering. A future selector branch
+    /// that refuses T is covered by construction, because the posture reads the
+    /// verdict rather than re-deriving it; this test pins that it keeps doing
+    /// so. `UnresolvedOnMultiBound` is not in the table: it is built only by the
+    /// scope-lazy selector, which never runs for a NAMED tenant.
+    #[test]
+    fn every_selector_refusal_of_the_pin_is_a_non_answering_pin_posture() {
+        use crate::auth::{MeasuredBindingCount, NoCredential, SlotState};
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        let now = chrono::Utc::now().timestamp();
+        let pinned = tenant(3);
+        let other_slot = tenant(4);
+        let live_y = synth_jwt(now + 3 * 60 * 60, "y");
+        let count = MeasuredBindingCount::Measured(2);
+
+        type Setup = fn(&crate::auth::AuthManager, uuid::Uuid, uuid::Uuid, i64);
+        let cases: [(&str, Setup, Option<uuid::Uuid>, NoCredential); 6] = [
+            (
+                "no T slot, T not the default",
+                |_, _, _, _| {},
+                None,
+                NoCredential::Slot(SlotState::Absent),
+            ),
+            (
+                "dead T slot, T not the default",
+                |m, t, _, now| {
+                    m.store_tenant_device_jwt(&t, &jwt_with_tenant_claim(t, now - 60))
+                        .unwrap();
+                },
+                None,
+                NoCredential::Slot(SlotState::PresentButDead),
+            ),
+            (
+                "no T slot, T the default, no legacy slot",
+                |_, _, _, _| {},
+                Some(tenant(3)),
+                NoCredential::DefaultBindingFallback {
+                    own: SlotState::Absent,
+                    legacy: SlotState::Absent,
+                },
+            ),
+            (
+                "dead T slot, T the default, dead legacy slot",
+                |m, t, _, now| {
+                    store_legacy(m, &jwt_with_tenant_claim(t, now - 60), None);
+                },
+                Some(tenant(3)),
+                NoCredential::DefaultBindingFallback {
+                    own: SlotState::PresentButDead,
+                    legacy: SlotState::PresentButDead,
+                },
+            ),
+            (
+                "no T slot, T the default, legacy claims Y",
+                |m, _, y, now| {
+                    store_legacy(m, &jwt_with_tenant_claim(y, now + 3 * 60 * 60), None);
+                },
+                Some(tenant(3)),
+                NoCredential::DefaultBindingClaimMismatch {
+                    own: SlotState::Absent,
+                    claimed: Some(tenant(4)),
+                },
+            ),
+            (
+                "no T slot, T the default, claimless legacy on a two-binding device",
+                |m, _, _, now| {
+                    store_legacy(m, &synth_jwt(now + 3 * 60 * 60, "claimless"), None);
+                },
+                Some(tenant(3)),
+                NoCredential::DefaultBindingClaimMismatch {
+                    own: SlotState::Absent,
+                    claimed: None,
+                },
+            ),
+        ];
+        for (i, (label, setup, default_tenant, expected)) in cases.into_iter().enumerate() {
+            let mgr = test_auth_manager(&format!("selector_parity_{i}"));
+            mgr.store_tenant_device_jwt(&other_slot, &live_y).unwrap();
+            setup(&mgr, pinned, other_slot, now);
+            let served =
+                pin_served_by_selector(&mgr, TenantPin::Pinned(pinned), default_tenant, count);
+            assert_eq!(
+                served,
+                Some(Err(expected)),
+                "{label}: the selector's own verdict"
+            );
+            reset_posture();
+            let pins = PosturePinInputs {
+                machine_pin: TenantPin::Pinned(pinned),
+                pin_served: served,
+            };
+            let _ = derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now);
+            assert_pin_arm_published(pinned, expected, label);
+        }
+
+        // The `Ok` shape: T's own live slot. The posture is answering (and a
+        // MEASURED T observation would speak for it anyway).
+        let mgr = test_auth_manager("selector_parity_ok");
+        mgr.store_tenant_device_jwt(&pinned, &jwt_with_tenant_claim(pinned, now + 3 * 60 * 60))
+            .unwrap();
+        let served = pin_served_by_selector(&mgr, TenantPin::Pinned(pinned), None, count);
+        assert_eq!(served, Some(Ok(())));
+        reset_posture();
+        let pins = PosturePinInputs {
+            machine_pin: TenantPin::Pinned(pinned),
+            pin_served: served,
+        };
+        assert_eq!(
+            derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Live)
+        );
+        // And nothing is asked when nothing is pinned.
+        for pin in [TenantPin::Unpinned, TenantPin::Unresolvable] {
+            assert_eq!(pin_served_by_selector(&mgr, pin, None, count), None);
+        }
+        reset_posture();
+    }
+
+    /// Phase 3, D5 — sign-in does NOT re-pin, and the pinned arm survives it.
+    /// `machine.json` pins T; a sign-in lands in tenant B (coord chooses), so
+    /// `paired_user.json` names B as the default and B's slot appears. The
+    /// pairing half (`persist_pairing` never writes `machine.json`) is pinned
+    /// in `pair.rs` by `a_pairing_for_another_tenant_never_rewrites_the_machine_pin`;
+    /// this is the posture half: the NEXT pass, through the production reads,
+    /// still publishes the pinned arm naming T rather than B's `live`.
+    #[test]
+    fn a_sign_in_to_another_tenant_leaves_the_pinned_arm_naming_the_pin() {
+        use crate::session::tenant_pin::TenantPin;
+        let pinned = tenant(3);
+        let signed_in = tenant(4);
+        let now = chrono::Utc::now().timestamp();
+        let inputs = {
+            let amb = crate::test_env::isolated_ambient();
+            amb.write_active_tenant_id(pinned);
+            // The v2 shape `persist_pairing` writes for a first pairing into B.
+            std::fs::write(
+                amb.dir().join("paired_user.json"),
+                format!(
+                    r#"{{"user_id":"u","tenant_id":"{signed_in}","default_tenant_id":"{signed_in}","bindings":[{{"tenant_id":"{signed_in}","user_id":"u"}}]}}"#
+                ),
+            )
+            .expect("write paired_user.json");
+            let am = crate::auth::AuthManager::new();
+            am.store_tenant_device_jwt(
+                &signed_in,
+                &jwt_with_tenant_claim(signed_in, now + 3 * 60 * 60),
+            )
+            .expect("B's fresh slot");
+            read_sweep_inputs(&am)
+        };
+        assert_eq!(
+            inputs.machine_pin,
+            TenantPin::Pinned(pinned),
+            "still pinned to T"
+        );
+        assert_eq!(
+            inputs.default_binding,
+            crate::auth::BindingTenantRead::Bound(signed_in)
+        );
+        let cause = crate::auth::NoCredential::Slot(crate::auth::SlotState::Absent);
+        assert_eq!(inputs.pin_served, Some(Err(cause)));
+
+        let _serialised = health_lock();
+        reset_posture();
+        assert_eq!(
+            derive_and_publish_posture(
+                &[live_slot(signed_in, now)],
+                inputs.posture_pin_inputs(),
+                now
+            )
+            .map(|t| t.to),
+            Some(CoordCredentialPosture::Absent),
+            "B's fresh slot does not clear the pinned arm"
+        );
+        assert_pin_arm_published(pinned, cause, "after a sign-in to B");
+        reset_posture();
+    }
+
+    /// Phase 3: the banner payload carries the posture's tenant so the banner
+    /// can name it and gate the tenant switch on it; `null` means "names no
+    /// tenant", which keeps today's copy and no switch action.
+    #[test]
+    fn the_credential_dark_payload_carries_the_tenant() {
+        let t = tenant(3).to_string();
+        let with = credential_dark_payload(
+            DARK_SOURCE_POSTURE,
+            true,
+            "absent",
+            "m",
+            Some("re_pair"),
+            Some(1),
+            Some(&t),
+            true,
+        );
+        assert_eq!(with["tenant_id"].as_str(), Some(t.as_str()));
+        assert_eq!(with["pinned_tenant"].as_bool(), Some(true));
+        let without = credential_dark_payload(
+            DARK_SOURCE_COGNITO,
+            true,
+            "cognito_hard",
+            "m",
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(without["tenant_id"].is_null());
+        assert_eq!(without["pinned_tenant"].as_bool(), Some(false));
+        assert!(
+            without
+                .as_object()
+                .expect("object")
+                .contains_key("tenant_id"),
+            "the key is always present"
+        );
+    }
+
+    /// Review of the third-residuals PR, item 1. A transition used to be
+    /// reported only when the posture VALUE changed, so `absent(T)` →
+    /// `absent(T2)` (the operator used "Switch active tenant" and T2 is
+    /// unserved too) or `absent(T, slot unreadable)` → `absent(T, slot absent)`
+    /// fired nothing, and the banner kept the old tenant and cause. Each is now
+    /// a DETAIL transition that notifies; an identical republish is none; and
+    /// an ANSWERING posture whose tenant moves is none too — a detail change can
+    /// never be dressed up as a recovery.
+    #[test]
+    fn a_same_posture_change_of_tenant_or_cause_notifies_and_an_identical_republish_does_not() {
+        use crate::auth::{NoCredential, SlotState};
         use crate::session::tenant_pin::TenantPin;
         let _serialised = health_lock();
         reset_posture();
         let now = chrono::Utc::now().timestamp();
-        let pinned = tenant(3);
-        let bound = tenant(4);
-        let inputs = SweepInputs {
-            tenant_slots: Err(anyhow::anyhow!("undecryptable store")),
-            default_binding: crate::auth::BindingTenantRead::Bound(bound),
-            machine_pin: TenantPin::Pinned(pinned),
-            coord_bound_tenants: unread_sidecar(),
-            coord_bound_tenants_for_ask: unread_sidecar(),
-            legacy_slot_present: false,
+        let (t, t2, y) = (tenant(3), tenant(5), tenant(4));
+        let pins = |p: uuid::Uuid, c: SlotState| PosturePinInputs {
+            machine_pin: TenantPin::Pinned(p),
+            pin_served: Some(Err(NoCredential::Slot(c))),
         };
-        let pins = inputs.posture_pin_inputs();
+        let slots = [live_slot(y, now)];
+
+        let first = derive_and_publish_posture(&slots, pins(t, SlotState::Absent), now)
+            .expect("the first publish is a transition");
+        assert!(!first.detail_changed);
         assert_eq!(
-            pins,
-            PosturePinInputs::UNPINNED,
-            "an unreadable input abstains"
+            derive_and_publish_posture(&slots, pins(t, SlotState::Absent), now),
+            None,
+            "an identical republish reports nothing"
         );
 
-        let legacy = live_legacy_observation(now);
-        let without_a_pin =
-            derive_coord_credential_posture(&legacy, UpstreamSignal::default(), now);
+        let switched = derive_and_publish_posture(&slots, pins(t2, SlotState::Absent), now);
+        assert_eq!(
+            switched,
+            Some(PostureTransition {
+                from: Some(CoordCredentialPosture::Absent),
+                to: CoordCredentialPosture::Absent,
+                detail_changed: true,
+            }),
+            "same posture, new tenant"
+        );
+        assert!(transition_notifies(switched.unwrap()));
+        assert_pin_arm_published(
+            t2,
+            NoCredential::Slot(SlotState::Absent),
+            "after the switch",
+        );
+
+        let recaused = derive_and_publish_posture(&slots, pins(t2, SlotState::Unreadable), now);
         assert!(
-            without_a_pin.can_answer(),
-            "precondition: the legacy slot answers"
+            recaused.is_some_and(|x| x.detail_changed && transition_notifies(x)),
+            "same posture and tenant, new cause: {recaused:?}"
+        );
+        assert_pin_arm_published(
+            t2,
+            NoCredential::Slot(SlotState::Unreadable),
+            "after the cause moved",
         );
         assert_eq!(
-            derive_and_publish_posture(&[legacy], pins, now).map(|t| t.to),
-            Some(without_a_pin),
-            "no `absent(T)` off a store this pass could not read"
-        );
-        assert_eq!(
-            coord_credential_posture().expect("published").tenant_id,
+            derive_and_publish_posture(&slots, pins(t2, SlotState::Unreadable), now),
             None,
-            "the published posture is the legacy observation's, not the pin's"
+            "identical again: nothing"
+        );
+        assert_eq!(
+            recorded_posture_transitions().len(),
+            1,
+            "the value-change record is unaffected by detail changes"
+        );
+
+        // Answering → answering with a different tenant is not a transition:
+        // there is no banner to update, and a report here could only read as
+        // a recovery.
+        reset_posture();
+        let _ = derive_and_publish_posture(&[live_slot(y, now)], PosturePinInputs::UNPINNED, now);
+        assert_eq!(
+            derive_and_publish_posture(&[live_slot(t, now)], PosturePinInputs::UNPINNED, now),
+            None
+        );
+        reset_posture();
+    }
+
+    /// Review item 2. A MEASURED sibling slot that coord keeps rejecting
+    /// publishes `dark` naming ITS tenant — but it is not the pinned-tenant
+    /// arm, and re-pinning cannot help it, so it carries no marker and the
+    /// banner offers no switch. The pinned arm's marker is asserted by
+    /// `assert_pin_arm_published` in every pin test.
+    #[test]
+    fn a_sibling_slot_dark_with_a_tenant_is_not_the_pinned_tenant_arm() {
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let (y, z) = (tenant(4), tenant(2));
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(Some(y), true, 401, br#"{"code":"token_revoked"}"#);
+        }
+        assert_eq!(
+            derive_and_publish_posture(
+                &[live_slot(y, now), live_slot(z, now)],
+                PosturePinInputs::UNPINNED,
+                now
+            )
+            .map(|x| x.to),
+            Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected))
+        );
+        let published = coord_credential_posture().expect("published");
+        assert_eq!(published.tenant_id.as_deref(), Some(y.to_string().as_str()));
+        assert!(!published.pinned_tenant);
+        assert_eq!(published.to_json()["pinnedTenant"].as_bool(), Some(false));
+        let bag = coord_credential_bag(&CoordCredentialHealth::ok(), Some(&published));
+        assert!(!bag.pinned_tenant);
+        reset_posture();
+    }
+
+    /// Phase 3 counterfactual: a posture no arm composed a sentence for keeps
+    /// the generic `message()` on every wire.
+    #[test]
+    fn a_posture_without_a_composed_reason_keeps_the_generic_message() {
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let absent_legacy = SlotObservation::observed(None, None);
+        assert_eq!(
+            derive_and_publish_posture(&[absent_legacy], PosturePinInputs::UNPINNED, now)
+                .map(|t| t.to),
+            Some(CoordCredentialPosture::Absent)
+        );
+        let published = coord_credential_posture().expect("published");
+        assert_eq!(published.tenant_id, None);
+        assert_eq!(published.composed_reason, None);
+        assert_eq!(published.reason(), CoordCredentialPosture::Absent.message());
+        assert_eq!(
+            published.to_json()["reason"].as_str(),
+            Some(CoordCredentialPosture::Absent.message())
         );
         reset_posture();
     }
@@ -8832,6 +10936,9 @@ mod tenant_slot_refresh_tests {
             coord_bound_tenants: unread_sidecar(),
             coord_bound_tenants_for_ask: unread_sidecar(),
             legacy_slot_present: false,
+            // What the selector answers for a slotless T that is not the
+            // default binding.
+            pin_served: slot_absent(),
         };
         assert_eq!(
             derive_and_publish_posture(
@@ -8870,7 +10977,7 @@ mod tenant_slot_refresh_tests {
         }
         let pins = PosturePinInputs {
             machine_pin: TenantPin::Pinned(pinned),
-            default_binding: crate::auth::BindingTenantRead::Bound(other_slot),
+            pin_served: slot_absent(),
         };
         assert_eq!(
             derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now).map(|t| t.to),
@@ -8909,7 +11016,7 @@ mod tenant_slot_refresh_tests {
         }
         let pins = PosturePinInputs {
             machine_pin: TenantPin::Pinned(pinned),
-            default_binding: crate::auth::BindingTenantRead::Bound(other_slot),
+            pin_served: slot_absent(),
         };
         assert_eq!(
             derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now).map(|t| t.to),
@@ -8942,7 +11049,7 @@ mod tenant_slot_refresh_tests {
         let other_slot = tenant(4);
         let pins = PosturePinInputs {
             machine_pin: TenantPin::Pinned(pinned),
-            default_binding: crate::auth::BindingTenantRead::Bound(other_slot),
+            pin_served: slot_absent(),
         };
         for (label, streak, stale, expected) in [
             (
@@ -9153,6 +11260,7 @@ mod tenant_slot_refresh_tests {
             coord_bound_tenants: unread_sidecar(),
             coord_bound_tenants_for_ask: unread_sidecar(),
             legacy_slot_present: false,
+            pin_served: None,
         };
         assert!(matches!(
             writable_slot_keys_from(&unreadable),
@@ -9165,6 +11273,7 @@ mod tenant_slot_refresh_tests {
             coord_bound_tenants: unread_sidecar(),
             coord_bound_tenants_for_ask: unread_sidecar(),
             legacy_slot_present: false,
+            pin_served: None,
         };
         assert_eq!(
             writable_slot_keys_from(&readable),
@@ -9258,6 +11367,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         }];
         for _ in 0..UPSTREAM_DARK_THRESHOLD {
             note_coord_upstream_verdict(Some(t), true, 401, br#"{"code":"token_revoked"}"#);
@@ -9384,6 +11494,7 @@ mod tenant_slot_refresh_tests {
             present: true,
             unknown: false,
             outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
         };
         let slots = [healthy(tenant(4)), healthy(tenant(5))];
         for _ in 0..UPSTREAM_DARK_THRESHOLD {
@@ -9493,6 +11604,9 @@ mod tenant_slot_refresh_tests {
                 since: 1_700_000_000,
                 observed_at_unix: 1_700_000_050,
                 attributable: true,
+                composed_reason: None,
+                pinned_tenant: false,
+                detail: None,
             };
             let bag = coord_credential_bag(&fallback, Some(&status));
             assert_eq!(
@@ -9732,7 +11846,7 @@ mod tenant_slot_refresh_tests {
     /// phase makes, not an accident of an unconfigured box
     /// (`try_device_machine_key_exchange` returns early with no `dmk_`).
     fn test_auth_manager_with_dmk(name: &str, dmk: &str) -> crate::auth::AuthManager {
-        let dir = std::env::temp_dir().join("qontinui_test_tenant_slots");
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_tenant_slots");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(format!("{name}.enc"));
         let _ = std::fs::remove_file(&path);
@@ -9744,8 +11858,7 @@ mod tenant_slot_refresh_tests {
     }
 
     fn sidecar_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir()
-            .join("qontinui_test_binding_gaps")
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_binding_gaps")
             .join(format!("{name}_{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir
@@ -9973,6 +12086,7 @@ mod tenant_slot_refresh_tests {
             coord_bound_tenants: CoordBoundTenantsRead::Known(vec![held, bound_only]),
             coord_bound_tenants_for_ask: CoordBoundTenantsRead::Known(vec![held, bound_only]),
             legacy_slot_present: false,
+            pin_served: Some(Ok(())),
         };
         assert_eq!(
             binding_gaps_from(&inputs),
@@ -10052,8 +12166,7 @@ mod tenant_slot_refresh_tests {
     /// `binding_gap_ask_path()` — these tests must not touch the operator's
     /// box.
     fn gap_state_path(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir()
-            .join("qontinui_test_gap_asks")
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_gap_asks")
             .join(format!("{name}_{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir.join("binding_gap_asks.json")
@@ -10130,7 +12243,10 @@ mod tenant_slot_refresh_tests {
             calls[0].starts_with(concat!(
                 "qontinui_runner_lib::pair::",
                 "pair_with_auth",
-                "_token_with_ids("
+                // The typed variant: same request, the failure's HTTP status
+                // kept as data (plan 2026-10-07-runner-credential-banner-…
+                // D2). Still the one call, still try_refresh_once's.
+                "_token_with_ids_typed("
             )),
             "the one call is try_refresh_once's: {calls:?}"
         );
@@ -10700,6 +12816,442 @@ mod tenant_slot_refresh_tests {
             "an unparseable entry is dropped, never guessed at"
         );
     }
+
+    // ---- "slot present, no default binding" (plan
+    // 2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential,
+    // Phase 3) ----
+
+    const HEAL_REFUSAL: &str = "paired_user.json is absent, but coord's bound-tenant set is \
+                                UNKNOWN (test) — healing nothing";
+
+    fn slot_without_binding(legacy_slot_usable: bool) -> DefaultBindingVerdict {
+        DefaultBindingVerdict::SlotWithoutBinding {
+            usable_tenants: vec![tenant(0)],
+            legacy_slot_usable,
+            refusal: HEAL_REFUSAL.to_string(),
+        }
+    }
+
+    fn census(
+        usable: &[uuid::Uuid],
+        legacy: bool,
+    ) -> Result<qontinui_runner_lib::pair::HeldCredentialCensus, String> {
+        Ok(qontinui_runner_lib::pair::HeldCredentialCensus {
+            usable_tenant_slots: usable.to_vec(),
+            legacy_slot_usable: legacy,
+        })
+    }
+
+    fn fresh_slot(t: uuid::Uuid, now: i64) -> SlotObservation {
+        SlotObservation {
+            tenant_id: Some(t.to_string()),
+            exp: Some(now + 3 * 60 * 60),
+            present: true,
+            unknown: false,
+            outcome: Some(TenantSlotOutcome::SkippedFresh),
+            recovery: None,
+        }
+    }
+
+    #[test]
+    fn no_default_binding_posture_speaks_its_own_state() {
+        let p = CoordCredentialPosture::Dark(DarkCause::NoDefaultBinding);
+        // Rides the existing `dark` token; told apart by its cause.
+        assert_eq!(p.as_str(), "dark");
+        assert_eq!(p.cause(), Some("no_default_binding"));
+        assert!(!p.can_answer(), "default-scope sessions cannot reach coord");
+        // The heal already ran and refused: retrying it is not the fix, the
+        // sign-in that writes the binding is.
+        assert_eq!(p.cta(), Some("re_pair"));
+        let m = p.message();
+        assert!(m.contains("IS present"), "{m}");
+        assert!(m.contains("paired_user.json"), "{m}");
+        assert!(m.contains("self-heal refused"), "{m}");
+        assert!(m.contains("default-scope coord access"), "{m}");
+        assert!(
+            !m.contains("NO coord credential"),
+            "it must not read as `absent`: {m}"
+        );
+    }
+
+    /// Every cause the runner can put on the `autonomy-credential-dark` event
+    /// (`notify_posture_transition`: a non-answering posture's `cause()`, else
+    /// its `as_str()`, plus the Cognito cause) must be a member of the banner's
+    /// `CredentialDarkCause` union — the TS `Record` then makes a missing title
+    /// a compile error. The union is hand-maintained; this pins it to the Rust
+    /// source of truth. The `match` makes a new posture or `DarkCause` a
+    /// compile error here until it is listed (review finding 11).
+    #[test]
+    fn the_banner_union_names_every_cause_the_runner_emits() {
+        use CoordCredentialPosture as P;
+        let all = [
+            P::Live,
+            P::Expiring,
+            P::Expired,
+            P::Absent,
+            P::Unrefreshable,
+            P::Dark(DarkCause::UpstreamRejected),
+            P::Dark(DarkCause::NoDefaultBinding),
+        ];
+        for p in all {
+            match p {
+                P::Live
+                | P::Expiring
+                | P::Expired
+                | P::Absent
+                | P::Unrefreshable
+                | P::Dark(DarkCause::UpstreamRejected)
+                | P::Dark(DarkCause::NoDefaultBinding) => {}
+            }
+        }
+        let ts_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../src/components/web-integration-banner-logic.ts");
+        let ts = std::fs::read_to_string(&ts_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", ts_path.display()));
+        let start = ts
+            .find("export type CredentialDarkCause =")
+            .expect("the CredentialDarkCause union");
+        // `str::get`, not `&ts[a..b]`: both bounds come from `find` on `ts`
+        // itself, so they sit on char boundaries, but `clippy::string_slice`
+        // cannot see that (denied in Cargo.toml; seen by any `--all-targets` clippy).
+        let rest = ts.get(start..).expect("start is a find() offset into ts");
+        let union = rest
+            .get(..rest.find(';').expect("union terminator"))
+            .expect("the terminator is a find() offset into rest");
+        let emitted = all
+            .iter()
+            .filter(|p| !p.can_answer())
+            .map(|p| p.cause().unwrap_or_else(|| p.as_str()))
+            .chain(["cognito_hard"]);
+        for wire in emitted {
+            assert!(
+                union.contains(&format!("\"{wire}\"")),
+                "CredentialDarkCause in {} is missing \"{wire}\" — add it (and its title)",
+                ts_path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn no_default_binding_severity_ranks_with_the_other_dark_cause() {
+        use CoordCredentialPosture as P;
+        let ndb = P::Dark(DarkCause::NoDefaultBinding).severity();
+        assert_eq!(ndb, P::Dark(DarkCause::UpstreamRejected).severity());
+        assert!(ndb < P::Unrefreshable.severity());
+        assert!(ndb > P::Expired.severity());
+        assert!(ndb > P::Absent.severity());
+        assert!(ndb > P::Expiring.severity());
+        assert!(ndb > P::Live.severity());
+        // The ladder stays a total order over the postures it always had.
+        let ranks: Vec<u8> = [
+            P::Live,
+            P::Expiring,
+            P::Absent,
+            P::Expired,
+            P::Dark(DarkCause::UpstreamRejected),
+            P::Unrefreshable,
+        ]
+        .iter()
+        .map(|p| p.severity())
+        .collect();
+        assert!(ranks.windows(2).all(|w| w[0] < w[1]), "{ranks:?}");
+    }
+
+    #[test]
+    fn classify_default_binding_tells_no_credential_from_slot_without_binding() {
+        use qontinui_runner_lib::pair::PairedUserHeal as H;
+        let refused = H::Refused(HEAL_REFUSAL.to_string());
+        assert_eq!(
+            classify_default_binding(&H::NotNeeded, None),
+            DefaultBindingVerdict::Bound
+        );
+        assert_eq!(
+            classify_default_binding(
+                &H::Healed {
+                    cause: "absent",
+                    tenants: vec![tenant(0)],
+                    default_tenant: tenant(0),
+                },
+                None
+            ),
+            DefaultBindingVerdict::Bound
+        );
+        // (a) no slot at all.
+        assert_eq!(
+            classify_default_binding(&H::NothingToHealFrom, None),
+            DefaultBindingVerdict::NoCredential
+        );
+        // (a) slots exist, none usable, legacy slot unusable too.
+        assert_eq!(
+            classify_default_binding(&refused, Some(&census(&[], false))),
+            DefaultBindingVerdict::NoCredential
+        );
+        // (b) a usable slot, the heal refused.
+        assert_eq!(
+            classify_default_binding(&refused, Some(&census(&[tenant(0)], false))),
+            slot_without_binding(false)
+        );
+        // (b) only the legacy slot is usable: a credential IS held.
+        assert_eq!(
+            classify_default_binding(&refused, Some(&census(&[], true))),
+            DefaultBindingVerdict::SlotWithoutBinding {
+                usable_tenants: vec![],
+                legacy_slot_usable: true,
+                refusal: HEAL_REFUSAL.to_string(),
+            }
+        );
+        // Unmeasured is UNKNOWN — never (a), never (b).
+        assert!(matches!(
+            classify_default_binding(&refused, Some(&Err("store locked".into()))),
+            DefaultBindingVerdict::Unknown(_)
+        ));
+        assert!(matches!(
+            classify_default_binding(&refused, None),
+            DefaultBindingVerdict::Unknown(_)
+        ));
+        // A heal that could not take the binding-store lock measured nothing.
+        assert!(matches!(
+            classify_default_binding(&H::Deferred("lock busy".into()), None),
+            DefaultBindingVerdict::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn the_unpaired_bail_publishes_absent_only_when_no_credential_is_held() {
+        // (a) and every unmeasured verdict keep today's BailNoBearer.
+        for v in [
+            DefaultBindingVerdict::Bound,
+            DefaultBindingVerdict::NoCredential,
+            DefaultBindingVerdict::Unknown("x".into()),
+        ] {
+            assert_eq!(
+                unpaired_bail_progress(&v),
+                PairProgress::BailNoBearer,
+                "{v:?}"
+            );
+        }
+        // (b) names the held slot and the refusal.
+        let progress = unpaired_bail_progress(&slot_without_binding(false));
+        assert_eq!(
+            progress,
+            PairProgress::BailNoDefaultBinding {
+                usable_tenants: vec![tenant(0)],
+                refusal: HEAL_REFUSAL.to_string(),
+            }
+        );
+        let h = coord_credential_health(Decision::Pair, Some(progress));
+        assert!(!h.ok);
+        let reason = h.reason.expect("a bail carries a reason");
+        assert!(
+            reason.contains("valid per-tenant coord credential is held"),
+            "{reason}"
+        );
+        assert!(reason.contains(&tenant(0).to_string()), "{reason}");
+        assert!(reason.contains(HEAL_REFUSAL), "{reason}");
+        assert!(
+            !reason.contains("user must sign in"),
+            "not the no-bearer text: {reason}"
+        );
+    }
+
+    /// The 09-28 shape: a FRESH slot beside a vanished default binding. The
+    /// slot alone derives `live`; the pass must publish
+    /// `dark(no_default_binding)` with the refusal as its detail — never
+    /// `live`, and never `absent` even when an unserved pin is also present.
+    #[test]
+    fn a_usable_slot_with_no_default_binding_publishes_dark_not_live_or_absent() {
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let obs = [fresh_slot(tenant(0), now)];
+        let pinned_elsewhere = PosturePinInputs {
+            machine_pin: crate::session::tenant_pin::TenantPin::Pinned(tenant(5)),
+            pin_served: Some(Err(crate::auth::NoCredential::Slot(
+                crate::auth::SlotState::Absent,
+            ))),
+        };
+
+        // Control: without the verdict the same inputs read `absent` (the
+        // unserved pin) — the misreport.
+        derive_and_publish_posture_with(
+            &obs,
+            pinned_elsewhere,
+            &DefaultBindingVerdict::NoCredential,
+            now,
+        );
+        assert_eq!(
+            coord_credential_posture().map(|s| s.posture),
+            Some(CoordCredentialPosture::Absent)
+        );
+
+        let t = derive_and_publish_posture_with(
+            &obs,
+            pinned_elsewhere,
+            &slot_without_binding(false),
+            now,
+        )
+        .expect("a posture change");
+        assert_eq!(
+            t.to,
+            CoordCredentialPosture::Dark(DarkCause::NoDefaultBinding)
+        );
+        let status = coord_credential_posture().expect("published");
+        assert_eq!(status.tenant_id, None, "it describes the DEFAULT scope");
+        assert!(
+            status.attributable,
+            "no usable legacy slot: unpinned sessions are dark"
+        );
+        assert_eq!(status.detail.as_deref(), Some(HEAL_REFUSAL));
+        assert!(status.reason().contains(HEAL_REFUSAL));
+        let json = status.to_json();
+        assert_eq!(json["posture"], "dark");
+        assert_eq!(json["cause"], "no_default_binding");
+        assert_eq!(json["cta"], "re_pair");
+        assert_eq!(json["detail"], HEAL_REFUSAL);
+        assert!(json["reason"].as_str().unwrap().contains(HEAL_REFUSAL));
+        // Heartbeat-visible: the bag says dark, names the cause and the why.
+        let bag = coord_credential_bag(
+            &coord_credential_health(Decision::Idle, None),
+            Some(&status),
+        );
+        assert!(!bag.ok, "coord's dark scan must select this device");
+        assert_eq!(bag.posture, "dark");
+        assert_eq!(bag.cause.as_deref(), Some("no_default_binding"));
+        assert!(bag.reason.as_deref().unwrap().contains(HEAL_REFUSAL));
+
+        // Steady state: the next pass re-derives the SAME posture — no flap
+        // back to `live`, no second banner.
+        assert_eq!(
+            derive_and_publish_posture_with(
+                &obs,
+                PosturePinInputs::UNPINNED,
+                &slot_without_binding(false),
+                now
+            ),
+            None
+        );
+
+        // A still-usable legacy slot serves unpinned sessions: NOT dark —
+        // `/health` still answers, the heartbeat bag stays `ok`, and the
+        // missing binding rides the answering posture as a note (review
+        // finding 3).
+        let t = derive_and_publish_posture_with(
+            &obs,
+            PosturePinInputs::UNPINNED,
+            &slot_without_binding(true),
+            now,
+        )
+        .expect("dark -> live is a transition");
+        assert_eq!(t.to, CoordCredentialPosture::Live);
+        let status = coord_credential_posture().expect("published");
+        assert_eq!(status.posture, CoordCredentialPosture::Live);
+        assert!(status.posture.can_answer());
+        let note = status
+            .detail
+            .clone()
+            .expect("the missing binding is surfaced");
+        assert!(note.contains(HEAL_REFUSAL), "{note}");
+        assert!(note.contains("still served by the legacy"), "{note}");
+        assert!(status.reason().contains("Note:"), "{}", status.reason());
+        assert_eq!(status.to_json()["canAnswer"], true);
+        assert_eq!(status.to_json()["detail"], serde_json::json!(note));
+        let bag = coord_credential_bag(
+            &coord_credential_health(Decision::Idle, None),
+            Some(&status),
+        );
+        assert!(
+            bag.ok,
+            "no runner_coord_credentials_missing alert for a working default"
+        );
+        assert_eq!(bag.cause, None);
+
+        // Healed: the verdict turns Bound — still `live`, and the note is gone.
+        derive_and_publish_posture_with(
+            &obs,
+            PosturePinInputs::UNPINNED,
+            &DefaultBindingVerdict::Bound,
+            now,
+        );
+        let status = coord_credential_posture().expect("published");
+        assert_eq!(status.posture, CoordCredentialPosture::Live);
+        assert_eq!(status.detail, None);
+
+        // From dark, a heal is a recovery transition.
+        derive_and_publish_posture_with(
+            &obs,
+            PosturePinInputs::UNPINNED,
+            &slot_without_binding(false),
+            now,
+        );
+        let t = derive_and_publish_posture_with(
+            &obs,
+            PosturePinInputs::UNPINNED,
+            &DefaultBindingVerdict::Bound,
+            now,
+        )
+        .expect("recovery is a transition");
+        assert_eq!(t.to, CoordCredentialPosture::Live);
+    }
+
+    /// A real slot that is itself non-answering at the same severity still
+    /// wins the tie: it names a slot an operator can fix.
+    #[test]
+    fn a_dark_slot_outranks_the_no_default_binding_candidate_on_a_tie() {
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let a = tenant(0);
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(Some(a), true, 401, br#"{"code":"token_revoked"}"#);
+        }
+        derive_and_publish_posture_with(
+            &[fresh_slot(a, now), fresh_slot(tenant(1), now)],
+            PosturePinInputs::UNPINNED,
+            &slot_without_binding(false),
+            now,
+        );
+        let status = coord_credential_posture().expect("published");
+        assert_eq!(
+            status.posture,
+            CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)
+        );
+        assert_eq!(status.tenant_id.as_deref(), Some(a.to_string().as_str()));
+        reset_posture();
+    }
+
+    #[test]
+    fn an_unknown_verdict_never_overwrites_a_measured_one() {
+        let _serialised = health_lock();
+        reset_posture();
+        assert!(matches!(
+            default_binding_verdict(),
+            DefaultBindingVerdict::Unknown(_)
+        ));
+        publish_default_binding_verdict(slot_without_binding(false));
+        publish_default_binding_verdict(DefaultBindingVerdict::Unknown("join failed".into()));
+        assert_eq!(default_binding_verdict(), slot_without_binding(false));
+        // A heal that could not take the binding-store lock is Unknown too, and
+        // the loop's bail decision (`unpaired_bail_progress_from_cell`, the
+        // function `refresher_loop` calls) reads the CELL, so it still says
+        // "credential held, no default binding" rather than "no coord
+        // credential".
+        use qontinui_runner_lib::pair::PairedUserHeal as H;
+        publish_default_binding_verdict(classify_default_binding(
+            &H::Deferred("lock busy".into()),
+            None,
+        ));
+        assert!(matches!(
+            unpaired_bail_progress_from_cell(),
+            PairProgress::BailNoDefaultBinding { .. }
+        ));
+        publish_default_binding_verdict(DefaultBindingVerdict::Bound);
+        assert_eq!(default_binding_verdict(), DefaultBindingVerdict::Bound);
+        reset_posture();
+        assert!(matches!(
+            default_binding_verdict(),
+            DefaultBindingVerdict::Unknown(_)
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -10761,7 +13313,7 @@ mod device_machine_key_exchange_tests {
         dmk: Option<&str>,
         existing_jwt: Option<&str>,
     ) -> crate::auth::AuthManager {
-        let dir = std::env::temp_dir().join("qontinui_test_dmk_exchange");
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_dmk_exchange");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(format!("{name}.enc"));
         let _ = std::fs::remove_file(&path);
@@ -10992,6 +13544,636 @@ mod device_machine_key_exchange_tests {
             mgr.get_tenant_device_jwt(&foreign).unwrap(),
             None,
             "the foreign tenant's slot must not be seeded either"
+        );
+    }
+}
+
+#[cfg(test)]
+mod default_slot_recovery_tests {
+    //! Plan `2026-10-07-runner-credential-banner-offers-retry-when-only-sign-in-can-recover`.
+    //!
+    //! The incident: no Cognito session, an expired device JWT in the default
+    //! slot. Every pass handed that dead JWT to pair-cli (181 HTTP 401s in a
+    //! day), classified the 401 as "kept existing — transient", and the posture
+    //! read `expired` with a "Retry refresh now" button that could never work.
+    //!
+    //! - D1: an expired device JWT is never presented to pair-cli; the
+    //!   device-machine-key exchange is still tried.
+    //! - D2: a pair-cli 401/403 is `BearerRejected`, not `KeptExisting`.
+    //! - D3/D4: a present-dead default slot whose last concluded recovery
+    //!   needs a sign-in is `unrefreshable` (CTA `re_pair`), does not regress
+    //!   to `expired` on a later pass, and names its `lastRefreshOutcome`.
+    //! - D5: the pass-concluded signal a kick-and-wait reads.
+    //!
+    //! Every test that can reach a mint takes [`posture_test_lock`]: a
+    //! persisted mint retires the PROCESS-GLOBAL upstream rejection streaks
+    //! (`retire_rejection_streaks_after_legacy_mint`), and unserialised it
+    //! erased evidence a concurrently running posture test asserts on.
+
+    use super::*;
+    use crate::secure_storage::StoredTokenRead;
+    use axum::{
+        extract::{Path, State},
+        http::StatusCode,
+        routing::post,
+        Router,
+    };
+    use std::sync::{Arc, Mutex};
+
+    const DID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const UID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const TENANT: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+
+    fn b64url(b: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+    }
+
+    /// A device-JWT-shaped token with `exp` and the fixture tenant.
+    fn device_jwt(exp: i64) -> String {
+        let header = b64url(br#"{"alg":"EdDSA","typ":"JWT"}"#);
+        let payload = b64url(format!(r#"{{"exp":{exp},"tenant_id":"{TENANT}"}}"#).as_bytes());
+        format!("{header}.{payload}.{}", b64url(b"fake-sig"))
+    }
+
+    /// A Cognito-shaped user bearer carrying the fixture tenant.
+    fn user_bearer() -> String {
+        let header = b64url(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = b64url(format!(r#"{{"sub":"runner","tenant_id":"{TENANT}"}}"#).as_bytes());
+        format!("{header}.{payload}.test-signature")
+    }
+
+    fn setup(name: &str, slot: Option<&str>, dmk: Option<&str>) -> crate::auth::AuthManager {
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_default_slot_recovery");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{name}.enc"));
+        let _ = std::fs::remove_file(&path);
+        let seed = crate::secure_storage::SecureStorage::with_path(path.clone()).expect("seed");
+        if let Some(t) = slot {
+            seed.store_tokens(t, "").expect("seed slot");
+        }
+        if let Some(k) = dmk {
+            seed.store_device_machine_key(k).expect("seed dmk");
+        }
+        let storage = crate::secure_storage::SecureStorage::with_path(path).expect("storage");
+        crate::auth::AuthManager::with_storage(storage)
+    }
+
+    #[derive(Clone)]
+    struct Mock {
+        pair_status: StatusCode,
+        pair_body: String,
+        dmk_status: StatusCode,
+        dmk_body: String,
+        pair_hits: Arc<Mutex<u32>>,
+        dmk_hits: Arc<Mutex<u32>>,
+    }
+
+    async fn pair_cli(State(m): State<Mock>) -> (StatusCode, String) {
+        *m.pair_hits.lock().unwrap() += 1;
+        (m.pair_status, m.pair_body.clone())
+    }
+
+    async fn dmk_exchange(State(m): State<Mock>, Path(_d): Path<String>) -> (StatusCode, String) {
+        *m.dmk_hits.lock().unwrap() += 1;
+        (m.dmk_status, m.dmk_body.clone())
+    }
+
+    /// One in-process web backend serving BOTH routes the `Pair` arm can
+    /// reach, so a test can assert which of them a tick actually hit.
+    fn spawn_web(
+        pair: (StatusCode, String),
+        dmk: (StatusCode, String),
+    ) -> (String, Mock, tokio::sync::oneshot::Sender<()>) {
+        let mock = Mock {
+            pair_status: pair.0,
+            pair_body: pair.1,
+            dmk_status: dmk.0,
+            dmk_body: dmk.1,
+            pair_hits: Arc::new(Mutex::new(0)),
+            dmk_hits: Arc::new(Mutex::new(0)),
+        };
+        let state = mock.clone();
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = std_listener.local_addr().expect("addr").port();
+        std_listener.set_nonblocking(true).expect("nb");
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt");
+            rt.block_on(async move {
+                let app: Router = Router::new()
+                    .route("/api/v1/devices/pair-cli", post(pair_cli))
+                    .route(
+                        "/api/v1/devices/{device_id}/machine-credential/exchange",
+                        post(dmk_exchange),
+                    )
+                    .with_state(state);
+                let listener =
+                    tokio::net::TcpListener::from_std(std_listener).expect("tokio listener");
+                let _ = axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = rx.await;
+                    })
+                    .await;
+            });
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        (format!("http://127.0.0.1:{port}"), mock, tx)
+    }
+
+    fn token_body(jwt: &str) -> String {
+        serde_json::json!({ "token": jwt, "user_id": UID }).to_string()
+    }
+
+    async fn attempt(
+        mgr: &crate::auth::AuthManager,
+        base: &str,
+        bearer: &PairBearer,
+        refresh_class: RefreshClass,
+    ) -> PairMintAttempt {
+        attempt_pair_mint(
+            mgr,
+            PairMintRequest {
+                pair_base: base,
+                pair_base_arm: None,
+                bearer,
+                refresh_class,
+                device_id: DID,
+                user_id: UID,
+                machine_tenant: None,
+                dmk_device_id: Some(DID),
+            },
+        )
+        .await
+    }
+
+    // ---- D1: the bearer choice --------------------------------------------
+
+    #[test]
+    fn an_expired_device_jwt_is_never_a_pair_cli_bearer() {
+        let now = 1_800_000_000;
+        let dead = device_jwt(now - 60);
+        assert_eq!(
+            pair_bearer_for(None, Some(dead.clone()), now),
+            PairBearer::DeadSlot(dead),
+            "no Cognito session + an expired device JWT must NOT be presented to pair-cli"
+        );
+        // A Cognito bearer always wins, whatever the slot holds.
+        assert_eq!(
+            pair_bearer_for(Some("cog".into()), Some(device_jwt(now - 60)), now),
+            PairBearer::Present("cog".into())
+        );
+        // A still-valid slot value is presented (the historical Phase-2 path).
+        let live = device_jwt(now + 600);
+        assert_eq!(
+            pair_bearer_for(None, Some(live.clone()), now),
+            PairBearer::Present(live)
+        );
+        // A legacy opaque `qontinui_runner_*` user token is the migration path
+        // pair-cli heals — it is NOT a dead device JWT and is still presented.
+        assert_eq!(
+            pair_bearer_for(None, Some("qontinui_runner_legacy_abc".into()), now),
+            PairBearer::Present("qontinui_runner_legacy_abc".into())
+        );
+        assert_eq!(
+            pair_bearer_for(None, Some("  ".into()), now),
+            PairBearer::Nothing
+        );
+        assert_eq!(
+            pair_bearer_for(Some(" ".into()), None, now),
+            PairBearer::Nothing
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_slot_without_cognito_sends_no_pair_cli_and_tries_the_dmk_exchange() {
+        // Serialised: see the module doc (a mint retires global streaks).
+        let _g = posture_test_lock();
+        let now = chrono::Utc::now().timestamp();
+        let dead = device_jwt(now - 60);
+        let mgr = setup("d1_dmk_recovers", Some(&dead), Some("dmk_unit_fixture"));
+        let fresh = device_jwt(now + 4 * 60 * 60);
+        let (base, mock, _stop) = spawn_web(
+            (StatusCode::OK, token_body(&device_jwt(now + 60))),
+            (StatusCode::OK, token_body(&fresh)),
+        );
+
+        let bearer = pair_bearer_for(None, mgr.get_access_token().ok(), now);
+        let got = attempt(&mgr, &base, &bearer, RefreshClass::NoSession).await;
+
+        assert_eq!(
+            *mock.pair_hits.lock().unwrap(),
+            0,
+            "D1: zero pair-cli requests"
+        );
+        assert_eq!(
+            *mock.dmk_hits.lock().unwrap(),
+            1,
+            "the dmk exchange is still attempted"
+        );
+        assert_eq!(got.outcome, None, "pair-cli was not called at all");
+        assert_eq!(got.dmk_jwt.as_deref(), Some(fresh.as_str()));
+        assert_eq!(got.verdict(), DefaultSlotRecovery::Refreshed);
+        assert_eq!(mgr.get_access_token().unwrap(), fresh);
+    }
+
+    #[tokio::test]
+    async fn expired_slot_without_cognito_or_dmk_concludes_needs_sign_in() {
+        // Serialised: see the module doc (a mint retires global streaks).
+        let _g = posture_test_lock();
+        let now = chrono::Utc::now().timestamp();
+        let dead = device_jwt(now - 60);
+        let mgr = setup("d1_needs_sign_in", Some(&dead), None);
+        let (base, mock, _stop) = spawn_web(
+            (StatusCode::UNAUTHORIZED, "{}".into()),
+            (StatusCode::OK, token_body(&device_jwt(now + 600))),
+        );
+
+        let bearer = pair_bearer_for(None, mgr.get_access_token().ok(), now);
+        let got = attempt(&mgr, &base, &bearer, RefreshClass::NoSession).await;
+
+        assert_eq!(
+            *mock.pair_hits.lock().unwrap(),
+            0,
+            "D1: zero pair-cli requests"
+        );
+        assert_eq!(
+            *mock.dmk_hits.lock().unwrap(),
+            0,
+            "no dmk_ stored → no exchange call"
+        );
+        assert_eq!(
+            got.progress,
+            PairProgress::BailNeedsSignIn {
+                rejected_status: None
+            }
+        );
+        assert_eq!(got.verdict(), DefaultSlotRecovery::NeedsSignIn);
+        assert_eq!(mgr.get_access_token().unwrap(), dead, "REPLACE-not-REVOKE");
+    }
+
+    #[tokio::test]
+    async fn a_transient_cognito_blip_with_a_dead_slot_stays_retryable() {
+        // Serialised: see the module doc (a mint retires global streaks).
+        let _g = posture_test_lock();
+        let now = chrono::Utc::now().timestamp();
+        let mgr = setup("d1_transient", Some(&device_jwt(now - 60)), None);
+        let (base, _mock, _stop) =
+            spawn_web((StatusCode::OK, "{}".into()), (StatusCode::OK, "{}".into()));
+        let bearer = pair_bearer_for(None, mgr.get_access_token().ok(), now);
+        let got = attempt(&mgr, &base, &bearer, RefreshClass::Transient).await;
+        assert_eq!(got.progress, PairProgress::BailRefreshFailedExpired);
+        assert_eq!(got.verdict(), DefaultSlotRecovery::KeptExisting);
+    }
+
+    // ---- D2: a 401/403 is a rejection, 5xx stays transient -----------------
+
+    #[tokio::test]
+    async fn pair_cli_401_with_a_dead_slot_is_bearer_rejected_and_still_tries_dmk() {
+        // Serialised: see the module doc (a mint retires global streaks).
+        let _g = posture_test_lock();
+        let now = chrono::Utc::now().timestamp();
+        let dead = device_jwt(now - 60);
+        let mgr = setup("d2_401", Some(&dead), Some("dmk_unit_fixture"));
+        let (base, mock, _stop) = spawn_web(
+            (
+                StatusCode::UNAUTHORIZED,
+                r#"{"error":"UNAUTHORIZED"}"#.into(),
+            ),
+            (StatusCode::FORBIDDEN, r#"{"error":"revoked"}"#.into()),
+        );
+
+        let bearer = PairBearer::Present(user_bearer());
+        let got = attempt(&mgr, &base, &bearer, RefreshClass::Ok).await;
+
+        assert_eq!(*mock.pair_hits.lock().unwrap(), 1);
+        assert_eq!(
+            *mock.dmk_hits.lock().unwrap(),
+            1,
+            "the dmk exchange needs no user"
+        );
+        assert_eq!(
+            got.outcome,
+            Some(RefreshOutcome::BearerRejected { status: 401 })
+        );
+        assert_eq!(
+            got.progress,
+            PairProgress::BailNeedsSignIn {
+                rejected_status: Some(401)
+            }
+        );
+        assert_eq!(got.verdict(), DefaultSlotRecovery::BearerRejected);
+        assert_eq!(mgr.get_access_token().unwrap(), dead, "REPLACE-not-REVOKE");
+    }
+
+    #[tokio::test]
+    async fn pair_cli_403_is_bearer_rejected_too() {
+        // Serialised: see the module doc (a mint retires global streaks).
+        let _g = posture_test_lock();
+        let now = chrono::Utc::now().timestamp();
+        let mgr = setup("d2_403", Some(&device_jwt(now + 30 * 60)), None);
+        let (base, _mock, _stop) = spawn_web(
+            (StatusCode::FORBIDDEN, "{}".into()),
+            (StatusCode::OK, "{}".into()),
+        );
+        let outcome = try_refresh_once(&mgr, &base, &user_bearer(), DID, UID, None, None).await;
+        assert_eq!(outcome, RefreshOutcome::BearerRejected { status: 403 });
+    }
+
+    #[tokio::test]
+    async fn pair_cli_503_stays_kept_existing_and_the_pin_is_unchanged() {
+        // Serialised: see the module doc (a mint retires global streaks).
+        let _g = posture_test_lock();
+        let now = chrono::Utc::now().timestamp();
+        let dead = device_jwt(now - 60);
+        let mgr = setup("d2_503", Some(&dead), None);
+        let (base, _mock, _stop) = spawn_web(
+            (StatusCode::SERVICE_UNAVAILABLE, "{}".into()),
+            (StatusCode::OK, "{}".into()),
+        );
+        let bearer = PairBearer::Present(user_bearer());
+        let got = attempt(&mgr, &base, &bearer, RefreshClass::Ok).await;
+        assert_eq!(got.outcome, Some(RefreshOutcome::KeptExisting));
+        assert_eq!(got.progress, PairProgress::BailRefreshFailedExpired);
+        assert_eq!(
+            got.verdict(),
+            DefaultSlotRecovery::KeptExisting,
+            "a 5xx says nothing about the bearer — a retry can help"
+        );
+        assert_eq!(mgr.get_access_token().unwrap(), dead);
+    }
+
+    #[test]
+    fn needs_sign_in_health_names_the_remedy() {
+        let skipped = coord_credential_health(
+            Decision::Pair,
+            Some(PairProgress::BailNeedsSignIn {
+                rejected_status: None,
+            }),
+        );
+        assert!(!skipped.ok);
+        assert!(skipped.reason.unwrap().contains("must sign in"));
+        let rejected = coord_credential_health(
+            Decision::Pair,
+            Some(PairProgress::BailNeedsSignIn {
+                rejected_status: Some(401),
+            }),
+        );
+        assert!(!rejected.ok);
+        assert!(rejected.reason.unwrap().contains("HTTP 401"));
+    }
+
+    // ---- D3/D4: the posture ------------------------------------------------
+
+    fn legacy(token: &str) -> SlotObservation {
+        legacy_slot_observation(StoredTokenRead::Present(token.to_string()))
+    }
+
+    fn publish(obs: SlotObservation, now: i64) -> CoordCredentialStatus {
+        let _ = derive_and_publish_posture(&[obs], PosturePinInputs::UNPINNED, now);
+        coord_credential_posture().expect("a posture was published")
+    }
+
+    /// The 2026-10-07 incident, pass by pass, on the default slot.
+    #[test]
+    fn the_incident_sequence_reads_unrefreshable_and_never_regresses_to_expired() {
+        let _g = posture_test_lock();
+        reset_coord_credential_posture_for_test();
+        let now = chrono::Utc::now().timestamp();
+        let dead_exp = now - 60;
+        let dead = device_jwt(dead_exp);
+
+        // Boot: a dead slot, no recovery concluded yet → `expired`.
+        let boot = publish(legacy(&dead), now);
+        assert_eq!(boot.posture, CoordCredentialPosture::Expired);
+        assert_eq!(boot.posture.cta(), Some("retry_refresh"));
+        assert_eq!(
+            boot.last_refresh_outcome, None,
+            "boot: no pass has concluded"
+        );
+
+        // The pass concludes: no bearer, no dmk recovery → `unrefreshable`.
+        record_default_slot_recovery(DefaultSlotRecovery::NeedsSignIn, Some(&dead));
+        let concluded = publish(legacy(&dead), now);
+        assert_eq!(concluded.posture, CoordCredentialPosture::Unrefreshable);
+        assert_eq!(concluded.posture.cta(), Some("re_pair"));
+        assert_eq!(
+            concluded.last_refresh_outcome.as_deref(),
+            Some("needs-sign-in")
+        );
+
+        // A LATER pass finds the same dead token still present: it must NOT
+        // regress to `expired` (the 03:57 regression).
+        let later = publish(legacy(&dead), now + 300);
+        assert_eq!(later.posture, CoordCredentialPosture::Unrefreshable);
+        assert_eq!(later.last_refresh_outcome.as_deref(), Some("needs-sign-in"));
+        assert_eq!(
+            later.since, concluded.since,
+            "an unchanged posture keeps its `since`"
+        );
+
+        // pair-cli rejecting the bearer is the same verdict class.
+        record_default_slot_recovery(DefaultSlotRecovery::BearerRejected, Some(&dead));
+        let rejected = publish(legacy(&dead), now + 600);
+        assert_eq!(rejected.posture, CoordCredentialPosture::Unrefreshable);
+        assert_eq!(
+            rejected.last_refresh_outcome.as_deref(),
+            Some("bearer-rejected")
+        );
+
+        // A transient failure → `expired` again: a retry CAN help there.
+        record_default_slot_recovery(DefaultSlotRecovery::KeptExisting, Some(&dead));
+        let transient = publish(legacy(&dead), now + 900);
+        assert_eq!(transient.posture, CoordCredentialPosture::Expired);
+        assert_eq!(transient.posture.cta(), Some("retry_refresh"));
+        assert_eq!(
+            transient.last_refresh_outcome.as_deref(),
+            Some("kept-existing")
+        );
+
+        // A successful mint → `live`, naming the outcome.
+        let fresh = device_jwt(now + 4 * 60 * 60);
+        record_default_slot_recovery(DefaultSlotRecovery::Refreshed, Some(&fresh));
+        let healed = publish(legacy(&fresh), now + 1200);
+        assert_eq!(healed.posture, CoordCredentialPosture::Live);
+        assert_eq!(healed.last_refresh_outcome.as_deref(), Some("refreshed"));
+        assert_eq!(
+            healed.to_json()["lastRefreshOutcome"],
+            serde_json::json!("refreshed"),
+            "`/health` carries the outcome"
+        );
+    }
+
+    #[test]
+    fn a_verdict_about_one_credential_does_not_colour_another() {
+        let _g = posture_test_lock();
+        reset_coord_credential_posture_for_test();
+        let now = chrono::Utc::now().timestamp();
+        let judged = device_jwt(now - 600);
+        record_default_slot_recovery(DefaultSlotRecovery::NeedsSignIn, Some(&judged));
+        // A DIFFERENT dead credential has no concluded recovery.
+        let other_token = device_jwt(now - 60);
+        let other = publish(legacy(&other_token), now);
+        assert_eq!(other.posture, CoordCredentialPosture::Expired);
+        assert_eq!(other.last_refresh_outcome, None);
+        assert_eq!(default_slot_recovery_for(Some(&other_token)), None);
+        assert_eq!(
+            default_slot_recovery_for(Some(&judged)),
+            Some(DefaultSlotRecovery::NeedsSignIn)
+        );
+    }
+
+    /// Opaque values and an empty slot all decode to `exp: None`; keyed on
+    /// `exp`, a verdict recorded against an EMPTY slot coloured any later
+    /// opaque token. Keyed on the token's fingerprint, it does not.
+    #[test]
+    fn a_verdict_recorded_on_an_empty_slot_does_not_colour_an_opaque_token() {
+        let _g = posture_test_lock();
+        reset_coord_credential_posture_for_test();
+        let now = chrono::Utc::now().timestamp();
+        record_default_slot_recovery(DefaultSlotRecovery::NeedsSignIn, None);
+        let opaque = publish(legacy("qontinui_runner_legacy_abc"), now);
+        assert_eq!(opaque.posture, CoordCredentialPosture::Expired);
+        assert_eq!(opaque.last_refresh_outcome, None);
+        // Two different opaque values are two different credentials too.
+        record_default_slot_recovery(DefaultSlotRecovery::BearerRejected, Some("opaque-a"));
+        assert_eq!(default_slot_recovery_for(Some("opaque-b")), None);
+        assert_eq!(
+            default_slot_recovery_for(Some("opaque-a")),
+            Some(DefaultSlotRecovery::BearerRejected)
+        );
+    }
+
+    #[test]
+    fn a_tenant_fault_is_not_offered_a_retry() {
+        let attempt = |progress| PairMintAttempt {
+            outcome: Some(RefreshOutcome::KeptExisting),
+            progress,
+            dmk_jwt: None,
+        };
+        let no_tenant = attempt(PairProgress::BailNoTenant).verdict();
+        assert_eq!(no_tenant, DefaultSlotRecovery::NoTenant);
+        assert!(no_tenant.needs_sign_in());
+        let mismatch = attempt(PairProgress::BailTenantMismatch {
+            expected: uuid::Uuid::nil(),
+            returned: None,
+        })
+        .verdict();
+        assert_eq!(mismatch, DefaultSlotRecovery::TenantMismatch);
+        assert!(mismatch.needs_sign_in());
+        // A transient failure keeps the retry.
+        let transient = attempt(PairProgress::BailRefreshFailedExpired).verdict();
+        assert_eq!(transient, DefaultSlotRecovery::KeptExisting);
+        assert!(!transient.needs_sign_in());
+    }
+
+    #[test]
+    fn a_needs_sign_in_verdict_never_darkens_a_live_credential() {
+        let _g = posture_test_lock();
+        reset_coord_credential_posture_for_test();
+        let now = chrono::Utc::now().timestamp();
+        let live_token = device_jwt(now + 4 * 60 * 60);
+        // D2's healthy-for-now case: pair-cli rejected the bearer while the slot
+        // was still valid. The ladder only consults the verdict for a DEAD slot.
+        record_default_slot_recovery(DefaultSlotRecovery::BearerRejected, Some(&live_token));
+        let live = publish(legacy(&live_token), now);
+        assert_eq!(live.posture, CoordCredentialPosture::Live);
+    }
+
+    // ---- D5: the pass-concluded signal -------------------------------------
+
+    #[tokio::test]
+    async fn a_kick_waiter_wakes_only_when_its_pass_concludes() {
+        use std::sync::atomic::Ordering;
+        // The kick/pass counters are process-global; the tick test moves them.
+        let _g = posture_test_lock();
+        let seq = KICK_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+        // Not concluded yet → the bounded wait reports UNKNOWN, not success.
+        assert!(
+            !wait_for_pass_concluded(seq, Duration::from_millis(50)).await,
+            "a pass that has not concluded must not read as concluded"
+        );
+        // The pass that started on this kick concludes.
+        PASS_IN_FLIGHT_KICK_SEQ.store(seq, Ordering::SeqCst);
+        let waiter = tokio::spawn(wait_for_pass_concluded(seq, Duration::from_secs(5)));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        note_pass_concluded();
+        assert!(waiter.await.unwrap(), "the waiter wakes on its own pass");
+        // A later kick is not answered by an earlier pass.
+        assert!(!wait_for_pass_concluded(seq + 1_000_000, Duration::from_millis(50)).await);
+    }
+
+    /// The `Pair`-arm tick the loop runs, end to end on the incident's shape:
+    /// a dead default slot, no Cognito session, no device machine key. Pins
+    /// the WIRING the unit tests above cannot see — the top-of-pass publish,
+    /// the verdict recorded, the posture re-published from it, and the pass
+    /// marked concluded for the kick-and-wait caller.
+    #[tokio::test]
+    async fn a_pair_tick_on_the_incident_shape_concludes_unrefreshable() {
+        use std::sync::atomic::Ordering;
+        let _g = posture_test_lock();
+        reset_coord_credential_posture_for_test();
+        let now = chrono::Utc::now().timestamp();
+        let dead = device_jwt(now - 60);
+        let mgr = setup("tick_incident", Some(&dead), None);
+        let (base, mock, _stop) = spawn_web(
+            (StatusCode::UNAUTHORIZED, "{}".into()),
+            (StatusCode::OK, "{}".into()),
+        );
+
+        // A "Retry refresh now" kick, then the pass that answers it.
+        let seq = KICK_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(
+            begin_pass() >= seq,
+            "the pass started after the kick answers it"
+        );
+        assert!(
+            !wait_for_pass_concluded(seq, Duration::from_millis(20)).await,
+            "not concluded before the tick runs"
+        );
+        // Top of pass: the legacy branch publishes from the dead slot.
+        derive_and_publish_legacy_posture(&mgr, PosturePinInputs::UNPINNED, None);
+        assert_eq!(
+            coord_credential_posture().unwrap().posture,
+            CoordCredentialPosture::Expired
+        );
+
+        let bearer = pair_bearer_for(None, mgr.get_access_token().ok(), now);
+        let attempt = run_pair_tick(
+            &mgr,
+            PairMintRequest {
+                pair_base: &base,
+                pair_base_arm: None,
+                bearer: &bearer,
+                refresh_class: RefreshClass::NoSession,
+                device_id: DID,
+                user_id: UID,
+                machine_tenant: None,
+                dmk_device_id: Some(DID),
+            },
+            PassPosture {
+                publish_legacy: true,
+                pins: PosturePinInputs::UNPINNED,
+                app: None,
+            },
+        )
+        .await;
+
+        assert_eq!(*mock.pair_hits.lock().unwrap(), 0, "zero pair-cli requests");
+        assert_eq!(attempt.verdict(), DefaultSlotRecovery::NeedsSignIn);
+        // The pass is concluded, and what a waiter then reads is THIS pass's
+        // posture — not the top-of-pass `expired`.
+        assert!(wait_for_pass_concluded(seq, Duration::from_millis(20)).await);
+        let after = coord_credential_posture().expect("published");
+        assert_eq!(after.posture, CoordCredentialPosture::Unrefreshable);
+        assert_eq!(after.posture.cta(), Some("re_pair"));
+        assert_eq!(after.last_refresh_outcome.as_deref(), Some("needs-sign-in"));
+        assert_eq!(
+            after.to_json()["lastRefreshOutcome"],
+            serde_json::json!("needs-sign-in")
         );
     }
 }

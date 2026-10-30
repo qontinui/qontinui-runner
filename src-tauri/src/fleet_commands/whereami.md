@@ -16,12 +16,12 @@ never share a line:
 | **REACHABILITY (now)** | What answers me at this instant? | True only at probe time |
 
 **The identity predicate is `$QONTINUI_RUNNER_CONTEXT` being non-empty — iff.**
-The runner injects it at spawn
-(`qontinui-runner/src-tauri/src/terminal/session.rs:753`) from the single source
-of truth `terminal::runner_context()` (`terminal/mod.rs:338`), and its first line
+The runner injects it at spawn, in `TerminalSession::spawn`
+(`qontinui-runner/src-tauri/src/terminal/session.rs`), from the single source
+of truth `terminal::runner_context()` (`terminal/mod.rs`), and its first line
 is the attributable marker
 `[source: qontinui-runner/runner_context@<version>+<git-sha>]`
-(`RUNNER_CONTEXT_SOURCE_MARKER`, `terminal/mod.rs:211`). It is fixed for the
+(`RUNNER_CONTEXT_SOURCE_MARKER`, `terminal/mod.rs`). It is fixed for the
 session's lifetime and survives a runner restart.
 
 **Line 2, where present, is the PROVENANCE line** — a sequence of
@@ -280,7 +280,7 @@ Tokens, in the runner's order (full contract in `runner-development.md` →
 |---|---|
 | `served-corpus` | canonical path of `<workdir>/.claude` (symlinks resolved) |
 | `checkout` | the git checkout holding it: branch@sha, `upstream=` (the LOCAL remote-tracking ref measured against), `behind`/`ahead` of it, `as-of` (the newer of that ref's last `FETCH_HEAD` and its newest reflog entry), and `dirty-claude` (tracked entries only); `none (not a git work tree)` is a stated non-checkout |
-| `bundle` | `<N>/<M> identical-to-build <gitSha> stamped=<k> stamped-tracked=<t> dirty-bundle=<d> served: canonical@<sha12> <c> fetched <rfc3339>, builtin <b>, account <a>, unstamped <u>; identical-to-source <i>/<v> unverifiable=<x>`: how many of the M files the spawning binary carries match the disk copy; how many disk copies carry a `qontinui-provenance:` stamp; how many of those stamped files git tracks (`stamped-tracked`); how many bundle-roster paths have tracked changes (`dirty-bundle`); then the `served:` breakdown below. `stamped-tracked` and `dirty-bundle` read `n/a` outside a git work tree and `UNKNOWN(<code>)` — no space, a lowercase-hyphen code — when the count could not be measured, never 0. Codes on both counts (always identical): `no-served-corpus` (no `.claude/`; see `served-corpus`), `checkout-unknown` (git could not locate the checkout; see `checkout`), `outside-work-tree` (the corpus path resolves outside the toplevel git reported). `dirty-bundle` only: `status-unknown` (the checkout's git status was unreadable; see `dirty-claude` in `checkout`). `stamped-tracked` only: `ls-files-failed`, `deadline` (probe budget already spent; git not run), `timed-out` (this `ls-files` run was killed at the budget), `git-unavailable` (git could not be spawned), `output-incomplete` (git exited but its output could not be read in full). A bare `UNKNOWN` is an intermediate build that rendered no reason. Every OTHER token keeps `UNKNOWN (<reason>)` with a space |
+| `bundle` | `<N>/<M> identical-to-build <gitSha> stamped=<k> stamped-tracked=<t> dirty-bundle=<d> served: canonical@<sha12> <c> fetched <rfc3339>, builtin <b>, account <a>, unstamped <u>; identical-to-source <i>/<v> unverifiable=<x>`: how many of the M files the spawning binary carries match the disk copy; how many disk copies carry a `qontinui-provenance:` stamp; how many of those stamped files git tracks (`stamped-tracked`); how many bundle-roster paths have tracked changes (`dirty-bundle`); then the `served:` breakdown below. `stamped-tracked` and `dirty-bundle` read `n/a` outside a git work tree and `UNKNOWN(<code>)` — no space, a lowercase-hyphen code — when the count could not be measured, never 0. Codes on both counts (always identical): `no-served-corpus` (no `.claude/`; see `served-corpus`), `checkout-unknown` (git could not locate the checkout; see `checkout`), `outside-work-tree` (the corpus path resolves outside the toplevel git reported). `dirty-bundle` only: `status-unknown` (the checkout's git status was unreadable; see `dirty-claude` in `checkout`). `stamped-tracked` only: `ls-files-failed`, `deadline` (probe budget already spent; git not run), `timed-out` (this `ls-files` run was killed at the probe budget, or abandoned before it could start because process creation ate the budget), `git-unavailable` (git could not be spawned), `output-incomplete` (git exited but its output could not be read in full). A bare `UNKNOWN` is an intermediate build that rendered no reason. Every OTHER token keeps `UNKNOWN (<reason>)` with a space |
 | `bundle` → `served:` | The stamped files split by the rung their stamp names, and how many of them still match their SOURCE. `canonical@<sha12> <c>` files are verified only against the canonical snapshot the runner has loaded (`canonical@unloaded <c>`, with no `fetched`, when none is loaded); `builtin <b>` files against this build's bundle; `account <a>` (`served`/`disk_cache`) are never compared; `unstamped <u>` carry no key. `identical-to-source <i>/<v>` is how many of the `<v>` verifiable files match that source, and `unverifiable=<x>` counts files stamped by a different snapshot or build, which this spawn cannot check. A reader cuts the value at `identical-to-build`, ` stamped=` and ` served: `, never by position |
 | `provisioned` | `commands written=<w>/<e> skipped-<reason>=<n>… as-of=<ts>; skills written=<w>/<e> skipped-<reason>=<n>… as-of=<ts>`: each provisioner's latest pass for this workdir, units written of units expected and one `skipped-<reason>=<n>` per reason (`git-tracked`, `write-failed`, `unresolved`, `rejected`, `repo-authored`); `UNKNOWN (no provision recorded for this workdir)` when the runner's ledger holds no pass |
 | `cwd` | the same checkout probe on the workdir itself, or `same checkout` |
@@ -369,7 +369,7 @@ why_not_counted() {
         status-unknown)    WHY="the checkout's git status was unreadable - see dirty-claude in the checkout row above" ;;
         ls-files-failed)   WHY="git ls-files exited non-zero" ;;
         deadline)          WHY="the git probe budget was already spent; git ls-files was not run" ;;
-        timed-out)         WHY="this git ls-files run was killed at the probe budget" ;;
+        timed-out)         WHY="this git ls-files run was killed at the probe budget, or abandoned before it could start because process creation ate the budget" ;;
         git-unavailable)   WHY="git could not be spawned" ;;
         output-incomplete) WHY="git exited but its output could not be read in full" ;;
         *)                 WHY="reason code '$CODE' is not one this reader knows" ;;
@@ -583,6 +583,17 @@ else
   exit 1
 fi
 
+# ENV REFERENCES: the runner writes the nonce as
+# `Bearer ${QONTINUI_COORD_MCP_NONCE_<K>:-<workdir nonce>}` (plan
+# 2026-09-22-one-coord-mcp-nonce-per-terminal-so-the-terminal-leg-engages). Expand
+# it from THIS shell's environment exactly as Claude Code does, through the one
+# bash owner - never stage the literal reference as a bearer. The _for_url form
+# reads the environment only for a strictly-loopback $url (else the default), so
+# a sibling .mcp.json naming another host never receives an environment value.
+# Without the helper a key carrying a reference is skipped; a literal key still works.
+MCP_ENV_REF_LIB="$ROOT/qontinui-claude-config/scripts/lib/mcp-env-ref.sh"
+if [ -r "$MCP_ENV_REF_LIB" ]; then . "$MCP_ENV_REF_LIB"; else MCP_ENV_REF_LIB=""; fi
+
 RPC='{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 for f in "${CANDIDATES[@]}"; do
   [ -r "$f" ] || continue
@@ -590,6 +601,11 @@ for f in "${CANDIDATES[@]}"; do
   url="$(mcp_url)"; key="$(mcp_key)"
   case "$url" in *"/coord-mcp"*) ;; *) continue ;; esac
   [ -n "$key" ] || { printf '%-70s no nonce\n' "$f"; continue; }
+  if [ -n "$MCP_ENV_REF_LIB" ]; then
+    mcp_expand_env_ref_for_url key "$url" "$key" || continue   # names UNEXPANDED_ENV_REF <NAME>
+  else
+    case "$key" in *'${'*'}'*) echo "skip: $f -> its nonce is a \${...} reference and mcp-env-ref.sh is not reachable" >&2; continue ;; esac
+  fi
   # Fingerprint, never the nonce itself.
   fp="$(printf '%s' "$key" | sha256sum 2>/dev/null | cut -c1-8)"
   { printf '%s: %s\n' "$(mcp_keyhdr)" "$key" > "$HDR"; } 2>/dev/null
@@ -1106,7 +1122,7 @@ $notCountedCodes = @{
   'status-unknown'    = "the checkout's git status was unreadable - see dirty-claude in the checkout row above"
   'ls-files-failed'   = 'git ls-files exited non-zero'
   'deadline'          = 'the git probe budget was already spent; git ls-files was not run'
-  'timed-out'         = 'this git ls-files run was killed at the probe budget'
+  'timed-out'         = 'this git ls-files run was killed at the probe budget, or abandoned before it could start because process creation ate the budget'
   'git-unavailable'   = 'git could not be spawned'
   'output-incomplete' = 'git exited but its output could not be read in full'
 }

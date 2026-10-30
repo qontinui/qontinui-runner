@@ -8,7 +8,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { createLogger } from "@/lib/logger";
-import { getErrorMessage } from "@/lib/utils";
+import { describeThrown } from "@/lib/utils";
 import {
   configurationParser,
   ParsedConfig,
@@ -196,7 +196,7 @@ export class ConfigurationLoaderService {
 
       return { success: true, source: "file", config: parsed };
     } catch (error) {
-      const errorMsg = getErrorMessage(error);
+      const errorMsg = describeThrown(error, "Failed to load config from file");
       this.log("file", "Exception loading config:", errorMsg);
       return { success: false, source: "file", error: errorMsg };
     }
@@ -239,7 +239,7 @@ export class ConfigurationLoaderService {
 
       return { ...loadResult, source: "auto_load" };
     } catch (error) {
-      const errorMsg = getErrorMessage(error);
+      const errorMsg = describeThrown(error, "Auto-load failed");
       this.log("auto_load", "Exception during auto-load:", errorMsg);
       return { success: false, source: "auto_load", error: errorMsg };
     }
@@ -268,7 +268,7 @@ export class ConfigurationLoaderService {
       const loadResult = await this.loadFromPath(selected);
       return { ...loadResult, source: "dialog" };
     } catch (error) {
-      const errorMsg = getErrorMessage(error);
+      const errorMsg = describeThrown(error, "File dialog failed");
       this.log("dialog", "Exception in file dialog:", errorMsg);
       return { success: false, source: "dialog", error: errorMsg };
     }
@@ -307,7 +307,7 @@ export class ConfigurationLoaderService {
 
       return { ...loadResult, source: "last_config" };
     } catch (error) {
-      const errorMsg = getErrorMessage(error);
+      const errorMsg = describeThrown(error, "Failed to load last config");
       this.log("last_config", "Exception loading last config:", errorMsg);
       return { success: false, source: "last_config", error: errorMsg };
     }

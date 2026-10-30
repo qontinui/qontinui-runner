@@ -22,6 +22,7 @@ import type {
   ErrorSeverity,
   ErrorStatus,
 } from "../types/errorMonitor";
+import { describeThrown } from "@/lib/utils";
 
 // =============================================================================
 // Error Events Hook
@@ -113,12 +114,7 @@ export function useErrorEvents(options: UseErrorEventsOptions = {}): UseErrorEve
       const result = await errorMonitorService.queryErrorEvents(query);
       setErrors(result);
     } catch (err) {
-      const errorMessage =
-        typeof err === "string"
-          ? err
-          : err instanceof Error
-            ? err.message
-            : "Failed to fetch errors";
+      const errorMessage = describeThrown(err, "Failed to fetch errors");
       console.error("[useErrorMonitor] fetchErrors failed:", err);
       setError(errorMessage);
     } finally {
@@ -228,12 +224,7 @@ export function useErrorSummary(options: UseErrorSummaryOptions = {}): UseErrorS
       const result = await errorMonitorService.getErrorSummary(optionsRef.current.taskRunId);
       setSummary(result);
     } catch (err) {
-      const errorMessage =
-        typeof err === "string"
-          ? err
-          : err instanceof Error
-            ? err.message
-            : "Failed to fetch summary";
+      const errorMessage = describeThrown(err, "Failed to fetch summary");
       console.error("[useErrorMonitor] fetchSummary failed:", err);
       setError(errorMessage);
     } finally {
@@ -318,12 +309,7 @@ export function useDebugContext(options: UseDebugContextOptions = {}): UseDebugC
       );
       setContext(result);
     } catch (err) {
-      const errorMessage =
-        typeof err === "string"
-          ? err
-          : err instanceof Error
-            ? err.message
-            : "Failed to fetch debug context";
+      const errorMessage = describeThrown(err, "Failed to fetch debug context");
       console.error("[useErrorMonitor] fetchContext failed:", err);
       setError(errorMessage);
     } finally {
@@ -380,7 +366,7 @@ export function useFixWorkflow(): UseFixWorkflowReturn {
       setSummary(result);
       return result;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Failed to check fixable errors";
+      const msg = describeThrown(err, "Failed to check fixable errors");
       setError(msg);
       throw new Error(msg, { cause: err });
     } finally {
@@ -396,7 +382,7 @@ export function useFixWorkflow(): UseFixWorkflowReturn {
       const result = await errorMonitorService.generateErrorFixWorkflow(config);
       return result.workflowJson;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Failed to generate workflow";
+      const msg = describeThrown(err, "Failed to generate workflow");
       setError(msg);
       throw new Error(msg, { cause: err });
     } finally {
@@ -411,7 +397,7 @@ export function useFixWorkflow(): UseFixWorkflowReturn {
       const result = await errorMonitorService.generateSingleErrorFixWorkflow(errorId);
       return result.workflowJson;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Failed to generate workflow";
+      const msg = describeThrown(err, "Failed to generate workflow");
       setError(msg);
       throw new Error(msg, { cause: err });
     } finally {

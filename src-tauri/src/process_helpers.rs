@@ -21,6 +21,12 @@ pub fn no_window<S: AsRef<std::ffi::OsStr>>(program: S) -> std::process::Command
         for (k, v) in qontinui_runner_lib::git_posture::prompt_proof_git_env() {
             cmd.env(k, v);
         }
+        // Repository-local env (`GIT_DIR`, `GIT_INDEX_FILE`, …) inherited from
+        // whoever launched the runner — a git hook, a shell that exported them —
+        // would point THIS git at the launcher's repo, whatever `-C` /
+        // `current_dir` says. Scrubbed here, at the one chokepoint, so no call
+        // site has to remember.
+        qontinui_runner_lib::git_posture::scrub_repo_local_git_env(&mut cmd);
     }
     cmd
 }
@@ -40,7 +46,30 @@ pub fn tokio_no_window<S: AsRef<std::ffi::OsStr>>(program: S) -> tokio::process:
         for (k, v) in qontinui_runner_lib::git_posture::prompt_proof_git_env() {
             cmd.env(k, v);
         }
+        // The same repository-local scrub as [`no_window`], through the same
+        // function, so the two constructors cannot drift.
+        qontinui_runner_lib::git_posture::scrub_repo_local_git_env(cmd.as_std_mut());
     }
+    cmd
+}
+
+/// A git command that can only ever address the repository its caller names
+/// and whose messages are the untranslated C-locale text.
+///
+/// The caller's whole repository-local environment
+/// ([`qontinui_runner_lib::git_posture::REPO_LOCAL_GIT_ENV`] — `GIT_DIR`,
+/// `GIT_WORK_TREE`, `GIT_INDEX_FILE`, the object-store variables and the rest)
+/// is removed through the ONE scrub, so an inherited value can never redirect a
+/// read or a fetch at some other repository — or borrow its object store —
+/// and `LC_ALL` / `LANGUAGE` are `C`, so a stderr match is never defeated by a
+/// translation. [`no_window`] also applies the prompt-proof git posture, so a
+/// credential prompt fails instead of blocking.
+pub fn scrubbed_git(program: &std::ffi::OsStr) -> std::process::Command {
+    let mut cmd = no_window(program);
+    // Unconditional (no_window scrubs only when `program` is git): the same
+    // single list, so this constructor cannot drift from it.
+    qontinui_runner_lib::git_posture::scrub_repo_local_git_env(&mut cmd);
+    cmd.env("LC_ALL", "C").env("LANGUAGE", "C");
     cmd
 }
 
@@ -1046,8 +1075,71 @@ pub fn run_with_timeout(
 /// INCOMPLETE. That is reported in [`TimedRun::truncation`] rather than
 /// silently folded into a successful `Output` — see [`Truncation`].
 pub fn run_with_timeout_detailed(
+    cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<TimedRun> {
+    run_bounded(cmd, timeout, None)
+}
+
+/// [`run_with_timeout_detailed`] for a child that reads a FIXED input on stdin
+/// — `git cat-file --batch`, which takes its object list there and nowhere
+/// else.
+///
+/// Every guarantee of [`run_with_timeout_detailed`] holds, with one change:
+/// stdin is a pipe that a detached writer thread fills with `input` and then
+/// CLOSES, so the child sees EOF exactly where a `/dev/null` stdin would have
+/// given it one, and can no more block waiting for input than before.
+///
+/// That writer adds one row to the resource table of
+/// [`run_with_timeout_detailed`]:
+///
+/// | Resource | Worst case |
+/// |---|---|
+/// | Stdin writer OS thread | 1, until the write completes or the pipe's READ end closes |
+///
+/// It is never joined. It ends when the write completes or fails, and the
+/// write fails with `EPIPE` (Rust ignores `SIGPIPE`) once every holder of the
+/// pipe's read end is gone — so its life is bounded by the read end's, not by
+/// this call. The holders are the child and any descendant that inherited its
+/// stdin. On the timeout path the tree reaper kills those; on the success path
+/// the tree is disarmed, so a descendant of a child that exited 0 WITHOUT
+/// consuming its input — and that neither reads nor closes the inherited
+/// stdin — keeps the writer blocked for as long as it lives. A child that
+/// reads its whole input (`git cat-file --batch` does) leaves no such case.
+///
+/// When the writer thread cannot be started at all (the process is at its
+/// thread ceiling), the child is killed and reaped and the spawn error is
+/// returned — it is never left waiting on input that will not come.
+pub fn run_with_timeout_input(
+    cmd: std::process::Command,
+    timeout: std::time::Duration,
+    input: Vec<u8>,
+) -> std::io::Result<TimedRun> {
+    run_bounded(cmd, timeout, Some((input, spawn_stdin_writer)))
+}
+
+/// Starts the detached thread that fills a child's stdin and then closes it.
+/// A seam so a test can stand in for the thread ceiling.
+type StdinWriter = fn(std::process::ChildStdin, Vec<u8>) -> std::io::Result<()>;
+
+/// The production [`StdinWriter`]: a named, never-joined thread that writes
+/// `input` and drops `stdin` — the drop is the EOF the child waits for. Built
+/// with [`std::thread::Builder`] so a process at its thread ceiling gets an
+/// `Err` back instead of a panic on the caller's thread.
+fn spawn_stdin_writer(mut stdin: std::process::ChildStdin, input: Vec<u8>) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("stdin-feed".to_string())
+        .spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&input);
+        })
+        .map(drop)
+}
+
+fn run_bounded(
     mut cmd: std::process::Command,
     timeout: std::time::Duration,
+    input: Option<(Vec<u8>, StdinWriter)>,
 ) -> std::io::Result<TimedRun> {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
@@ -1056,9 +1148,13 @@ pub fn run_with_timeout_detailed(
     // sweep that keeps [`start_detached`] thread-free.
     reap_detached_children();
 
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
 
     // Pre-spawn half of the tree reaper (Unix process group; no-op on Windows).
     ChildTreeGuard::arm(&mut cmd);
@@ -1079,6 +1175,26 @@ pub fn run_with_timeout_detailed(
     qontinui_runner_lib::util::resource_exhaustion::note_spawn_succeeded();
     let pid = child.id();
     let tree = ChildTreeGuard::attach_armed(&child);
+
+    if let (Some((input, writer)), Some(stdin)) = (input, child.stdin.take()) {
+        // Detached, never joined — see `run_with_timeout_input`. A writer that
+        // cannot start leaves a child that would wait on stdin until the
+        // deadline for input that never comes: kill and reap it (and fire the
+        // tree reaper) now, and hand the spawn error to the caller. No reader
+        // thread exists yet, so nothing else is left behind.
+        if let Err(e) = writer(stdin, input) {
+            let _ = child.kill();
+            let _ = child.wait();
+            drop(tree);
+            tracing::warn!(
+                child_pid = pid,
+                program = %program_label(&cmd),
+                error = %e,
+                "could not start the stdin writer thread; the child was killed"
+            );
+            return Err(e);
+        }
+    }
 
     let stdout_reader = PipeDrain::spawn(child.stdout.take());
     let stderr_reader = PipeDrain::spawn(child.stderr.take());
@@ -1343,7 +1459,7 @@ pub enum ProbeOutcome {
 /// nothing derived from a token or a URL.
 ///
 /// Use [`run_probe_quiet`] where a non-zero exit is an EXPECTED, routine answer
-/// (`lsof` on an unowned port, `taskkill` on an already-dead pid) — WARNing on
+/// (`lsof` on an unowned port, `netstat | findstr` on a closed one) — WARNing on
 /// those buries the timeout WARN that actually matters.
 pub fn run_probe(
     cmd: std::process::Command,
@@ -1358,9 +1474,8 @@ pub fn run_probe(
 ///
 /// For probes whose negative answer is ordinary and frequent: `lsof -t -i:<port>`
 /// exits 1 whenever nothing owns the port, `ss -ltnp` is simply absent on macOS
-/// and on minimal images, `netstat | findstr` exits 1 when not listening, and
-/// `taskkill /F /T /PID` exits 128 for a pid that already went away. All four
-/// leave the caller's verdict unchanged, and all four fire on a per-process
+/// and on minimal images, and `netstat | findstr` exits 1 when not listening.
+/// All three leave the caller's verdict unchanged, and all three fire on a per-process
 /// timer — so WARNing on them is pure log volume that hides the one line this
 /// PR exists to add.
 ///
@@ -1484,6 +1599,77 @@ fn run_probe_inner(
 mod timeout_tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// The input reaches the child's stdin in full and is followed by EOF.
+    #[cfg(unix)]
+    #[test]
+    fn run_with_timeout_input_feeds_stdin_then_closes_it() {
+        let input: Vec<u8> = (0..300_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let run = run_with_timeout_input(
+            std::process::Command::new("cat"),
+            Duration::from_secs(10),
+            input.clone(),
+        )
+        .expect("spawn cat");
+        assert!(run.truncation.is_none());
+        match run.outcome {
+            TimedOutput::Completed(out) => {
+                assert!(out.status.success());
+                assert_eq!(out.stdout, input, "every byte, then EOF");
+            }
+            TimedOutput::TimedOut { .. } => panic!("cat must see EOF and exit"),
+        }
+    }
+
+    /// A child that never reads its stdin neither blocks the call nor is
+    /// blocked by it: the writer's pipe fills, the child exits, the write
+    /// fails, and the call returns promptly.
+    #[cfg(unix)]
+    #[test]
+    fn run_with_timeout_input_survives_a_child_that_ignores_stdin() {
+        let started = Instant::now();
+        let run = run_with_timeout_input(
+            std::process::Command::new("true"),
+            Duration::from_secs(10),
+            vec![b'x'; 1024 * 1024],
+        )
+        .expect("spawn true");
+        assert!(matches!(run.outcome, TimedOutput::Completed(ref o) if o.status.success()));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A stdin writer that cannot start — the thread ceiling — is an `Err`,
+    /// not a panic, and the child it would have fed is killed at once rather
+    /// than left waiting on stdin until the deadline.
+    #[cfg(unix)]
+    #[test]
+    fn a_stdin_writer_that_cannot_start_kills_the_child_and_is_an_error() {
+        fn at_the_ceiling(_: std::process::ChildStdin, _: Vec<u8>) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "no thread to spare",
+            ))
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("survived");
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("sleep 0.5; touch '{}'", marker.display()));
+        let started = Instant::now();
+        let err = run_bounded(
+            cmd,
+            Duration::from_secs(30),
+            Some((vec![b'x'], at_the_ceiling)),
+        )
+        .expect_err("a writer that cannot start is an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "returned at once, not at the deadline"
+        );
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(!marker.exists(), "the child was killed, not left running");
+    }
 
     /// A command that blocks for far longer than any budget we hand it.
     fn sleeper() -> std::process::Command {
@@ -2634,28 +2820,34 @@ mod timeout_tests {
 // release builds are users.
 //
 // So the rule needs a test rather than a reviewer.
+//
+// Two scans, one for each of the two common ways to ship a console:
+// 1. a `Command::new(` that never gets `CREATE_NO_WINDOW`, and
+// 2. a `creation_flags(..)` call that hands a command `CREATE_NEW_CONSOLE`,
+//    wherever the command came from. `creation_flags` REPLACES the flags, so
+//    a command built through `no_window(..)` and then given
+//    `CREATE_NEW_CONSOLE` opens a window, and scan 1 never looks at it: no
+//    `Command::new(` is written there. (Scan 1 also counts ANY nearby
+//    `creation_flags` as suppression, so a raw `Command::new` given
+//    `CREATE_NEW_CONSOLE` passed it too.) `mcp/shared.rs`'s
+//    `spawn_python_with_console` was exactly that shape until 2026-10-28.
+// NOT caught by either: a `creation_flags(..)` that drops `CREATE_NO_WINDOW`
+// without naming `CREATE_NEW_CONSOLE` (`no_window("x")` then
+// `.creation_flags(CREATE_NEW_PROCESS_GROUP)` also opens a window, because the
+// call replaces the flags). Scan 1 never sees the `no_window(..)` form, and on
+// a raw `Command::new` it reads a nearby `creation_flags` as suppression; scan 2
+// looks only for the `CREATE_NEW_CONSOLE` bit.
 
+/// Source-scanning helpers shared by the guards below: the `.rs` walk and
+/// the ONE test-code skipper. Every guard in this file reads production text
+/// through [`source_scan::production_lines`]; a guard with a skipper of its
+/// own is how the console guard came to stop reading a file at its first
+/// `#[cfg(test)]` while the git guard read on.
 #[cfg(test)]
-mod console_window_guard {
+mod source_scan {
     use std::path::{Path, PathBuf};
 
-    /// How far below a `Command::new(` line a suppression (`creation_flags`,
-    /// or a `no_window(&mut cmd)`-style call) still counts as covering that
-    /// spawn. Generous on purpose: the builders in this crate set the flag
-    /// after a run of `.arg()` calls.
-    const FLAG_WINDOW: usize = 25;
-
-    /// Files the rule does not apply to.
-    ///
-    /// `src/bin/` holds standalone CONSOLE-subsystem binaries (`qontinui_cli`,
-    /// `qontinui_shim`). They already own a console, their children inherit it,
-    /// and nothing flashes — the defect is specific to the GUI binary.
-    fn exempt(rel: &Path) -> bool {
-        let s = rel.to_string_lossy().replace('\\', "/");
-        s.starts_with("bin/") || s == "process_helpers.rs"
-    }
-
-    fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    pub(super) fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
@@ -2669,11 +2861,535 @@ mod console_window_guard {
         }
     }
 
+    /// Is `line` a column-0 attribute that compiles the next item ONLY under
+    /// test? `#[cfg(test)]`, or an `all(..)` with a top-level `test` term
+    /// (`all(test, unix)`, `all(feature = "e2e", test)`). The whole line must
+    /// be the attribute. `any(test, ..)` and `not(test)` are not test-only,
+    /// and an indented attribute is not column 0: those are scanned as
+    /// production, which can only fail loudly, never hide a site.
+    pub(super) fn is_test_only_cfg(line: &str) -> bool {
+        if !line.starts_with("#[cfg(") {
+            return false;
+        }
+        let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        let Some(pred) = compact
+            .strip_prefix("#[cfg(")
+            .and_then(|rest| rest.strip_suffix(")]"))
+        else {
+            return false;
+        };
+        if pred == "test" {
+            return true;
+        }
+        let Some(terms) = pred
+            .strip_prefix("all(")
+            .and_then(|rest| rest.strip_suffix(')'))
+        else {
+            return false;
+        };
+        let mut depth = 0_i32;
+        let mut term = String::new();
+        let mut has_test = false;
+        for c in terms.chars().chain(std::iter::once(',')) {
+            if c == ',' && depth == 0 {
+                has_test |= term == "test";
+                term.clear();
+                continue;
+            }
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            term.push(c);
+        }
+        has_test
+    }
+
+    /// The production lines of `src`, as `(1-based line number, line)`.
+    ///
+    /// Skips the item each column-0 test-only cfg ([`is_test_only_cfg`])
+    /// applies to — a `mod` of any visibility, a helper fn, a `use` — then
+    /// keeps scanning, so a test module in the middle of a file does not hide
+    /// the production code before or after it. The item is the first
+    /// non-attribute line after the cfg: one ending in `;`, or opening and
+    /// closing its braces on that line, is the whole item; otherwise it runs
+    /// to the next line that is exactly `}` or `};`, the way rustfmt closes a
+    /// top-level item. A head line with no brace (a multi-line `static`,
+    /// `use a::{..};`) ends at its first `;` line, and a multi-line attribute
+    /// is skipped by bracket depth.
+    ///
+    /// It is a line heuristic, not a parser, and it can miss in both
+    /// directions:
+    /// - EARLY, which is loud: a column-0 `}` inside a multi-line string
+    ///   literal ends the item there, so the rest of that test module is read
+    ///   as production (`fleet.rs`'s test module is one such case).
+    /// - LATE, which is silent and hides production code. For example: a
+    ///   test-only item that closes on `});` instead of `}` / `};`; a
+    ///   braceless head whose body has a line opening `{` (an array of struct
+    ///   literals closing on `];`); a `{` inside a string on the head line; an
+    ///   attribute whose string holds an unbalanced `[`. Each carries the skip
+    ///   past the item's end. None existed at qontinui-runner `ee693ff49`
+    ///   (measured by emulation over every `.rs` file; plan
+    ///   `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`
+    ///   Phase 6). A `syn`-based skipper would remove both kinds of miss.
+    pub(super) fn production_lines(src: &str) -> Vec<(usize, &str)> {
+        let mut out = Vec::new();
+        let mut lines = src.lines().enumerate();
+        while let Some((i, line)) = lines.next() {
+            if !is_test_only_cfg(line) {
+                out.push((i + 1, line));
+                continue;
+            }
+            // `attr_depth` > 0 while inside a multi-line attribute; `braced`
+            // once the item's head line opened a brace (it then ends at the
+            // next column-0 `}` / `};`), else the item ends at its first
+            // line ending in `;` (a multi-line `static`, `use a::{..};`).
+            let mut attr_depth: i64 = 0;
+            let mut head_seen = false;
+            let mut braced = false;
+            for (_, item) in lines.by_ref() {
+                let t = item.trim();
+                if !head_seen {
+                    if attr_depth > 0 || t.starts_with("#[") {
+                        attr_depth += t.matches('[').count() as i64;
+                        attr_depth -= t.matches(']').count() as i64;
+                        continue;
+                    }
+                    if t.is_empty() {
+                        continue;
+                    }
+                    head_seen = true;
+                    let opens = t.matches('{').count();
+                    let closes = t.matches('}').count();
+                    if opens == 0 {
+                        if t.ends_with(';') {
+                            break;
+                        }
+                        continue;
+                    }
+                    if opens == closes {
+                        break;
+                    }
+                    braced = true;
+                    continue;
+                }
+                if braced {
+                    if item == "}" || item == "};" {
+                        break;
+                    }
+                } else if t.contains('{')
+                    && !(t.ends_with(';') && t.matches('{').count() == t.matches('}').count())
+                {
+                    // A head that spans lines (a multi-line fn signature)
+                    // opens its body here — unless this line is a balanced,
+                    // `;`-terminated initializer, which ends the item below.
+                    braced = true;
+                } else if t.ends_with(';') {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// The skip triggers on exactly the test-only cfgs. A cfg that can be
+    /// production must not start a skip, or it would hide a shipped site.
+    #[test]
+    fn only_a_test_only_cfg_starts_a_skip() {
+        for test_only in [
+            "#[cfg(test)]",
+            "#[cfg(all(test, unix))]",
+            "#[cfg(all(test, windows))]",
+            "#[cfg(all(feature = \"e2e\", test))]",
+            "#[cfg(all(test, not(windows)))]",
+        ] {
+            assert!(is_test_only_cfg(test_only), "{test_only} is test-only");
+        }
+        for production in [
+            "#[cfg(not(test))]",
+            "#[cfg(any(test, debug_assertions))]",
+            "#[cfg(any(windows, test))]",
+            "#[cfg(all(not(test), unix))]",
+            "#[cfg(all(testing, unix))]",
+            "#[cfg(target_os = \"windows\")]",
+            "    #[cfg(test)]",
+            "#[cfg(test)] mod tests;",
+        ] {
+            assert!(
+                !is_test_only_cfg(production),
+                "{production} can be production"
+            );
+        }
+        // The production code after an `all(test, ..)` module is scanned,
+        // and the module itself is not.
+        let src = "fn a() {}\n#[cfg(all(test, unix))]\nmod t {\n    fn g() {}\n}\nfn b() {}\n";
+        assert_eq!(
+            production_lines(src),
+            vec![(1, "fn a() {}"), (6, "fn b() {}")]
+        );
+    }
+}
+
+#[cfg(test)]
+mod console_window_guard {
+    use super::source_scan::{production_lines, rs_files};
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    /// How far below a `Command::new(` line a suppression (`creation_flags`,
+    /// or a `no_window(&mut cmd)`-style call) still counts as covering that
+    /// spawn. Generous on purpose: the builders in this crate set the flag
+    /// after a run of `.arg()` calls.
+    const FLAG_WINDOW: usize = 25;
+
+    /// How far above a site a `console-ok:` marker still covers it.
+    const MARKER_WINDOW: usize = 3;
+
+    /// How many lines below a `creation_flags(` line its argument may run.
+    const ARG_WINDOW: usize = 10;
+
+    /// `CREATE_NEW_CONSOLE`.
+    const CREATE_NEW_CONSOLE_BIT: u64 = 0x0000_0010;
+
+    /// Files scan 1 (`Command::new(`) does not apply to.
+    ///
+    /// `src/bin/` holds standalone CONSOLE-subsystem binaries (`qontinui_cli`,
+    /// `qontinui_shim`). They already own a console, their children inherit it,
+    /// and nothing flashes — the defect is specific to the GUI binary.
+    /// `process_helpers.rs` is where `no_window` itself calls `Command::new`.
+    ///
+    /// Scan 2 (`CREATE_NEW_CONSOLE`) applies to every file: that flag opens a
+    /// new window for a console binary's child as surely as for the GUI's.
+    fn exempt_from_command_new_scan(rel: &str) -> bool {
+        rel.starts_with("bin/") || rel == "process_helpers.rs"
+    }
+
+    /// A `console-ok:` marker on line `idx` or up to [`MARKER_WINDOW`] lines
+    /// above it.
+    fn marked(lines: &[(usize, &str)], idx: usize) -> bool {
+        let start = idx.saturating_sub(MARKER_WINDOW);
+        lines[start..=idx]
+            .iter()
+            .any(|(_, l)| l.contains("console-ok:"))
+    }
+
+    fn strip_line_comment(line: &str) -> &str {
+        line.split_once("//").map_or(line, |(code, _)| code)
+    }
+
+    /// Scan 1: the indices of `Command::new(` lines with no suppression in
+    /// the next [`FLAG_WINDOW`] lines and no marker.
+    fn unsuppressed_command_new(lines: &[(usize, &str)]) -> Vec<usize> {
+        (0..lines.len())
+            .filter(|&i| {
+                let line = lines[i].1;
+                // Prose, not code.
+                if !line.contains("Command::new(") || line.trim_start().starts_with("//") {
+                    return false;
+                }
+                // Suppressed inline, a few lines down — either the raw flag
+                // or a helper that sets it on an already-built command
+                // (`pm_detect::no_window(&mut cmd)`).
+                let end = (i + FLAG_WINDOW).min(lines.len());
+                let suppressed = lines[i..end]
+                    .iter()
+                    .any(|(_, l)| l.contains("creation_flags") || l.contains("no_window("));
+                !suppressed && !marked(lines, i)
+            })
+            .collect()
+    }
+
+    /// The value of an integer literal token (`0x10`, `0x0000_0010`, `16u32`),
+    /// or `None` when `tok` is not one.
+    fn integer_literal(tok: &str) -> Option<u64> {
+        if !tok.starts_with(|c: char| c.is_ascii_digit()) {
+            return None;
+        }
+        let tok = tok.replace('_', "");
+        let (digits, radix) = match tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X")) {
+            Some(hex) => (hex, 16),
+            None => (tok.as_str(), 10),
+        };
+        // Drop a type suffix (`u32`): the digits are the leading run.
+        let run: String = digits.chars().take_while(|c| c.is_digit(radix)).collect();
+        u64::from_str_radix(&run, radix).ok()
+    }
+
+    /// Does `expr` name the console flag — an identifier in `names`, or an
+    /// integer literal with the `CREATE_NEW_CONSOLE` bit set?
+    fn names_new_console(expr: &str, names: &HashSet<String>) -> bool {
+        expr.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|tok| !tok.is_empty())
+            .any(|tok| {
+                names.contains(tok)
+                    || integer_literal(tok).is_some_and(|v| v & CREATE_NEW_CONSOLE_BIT != 0)
+            })
+    }
+
+    /// A one-line binding — `const NAME: T = EXPR;`, `let [mut] NAME = EXPR;`,
+    /// or `NAME |= EXPR;` — as `(NAME, EXPR)`.
+    fn binding(line: &str) -> Option<(&str, &str)> {
+        let body = strip_line_comment(line).trim().strip_suffix(';')?;
+        if let Some((name, expr)) = body.split_once("|=") {
+            return Some((name.trim(), expr));
+        }
+        let decl = [
+            "pub(crate) const ",
+            "pub(super) const ",
+            "pub const ",
+            "const ",
+            "static ",
+            "let mut ",
+            "let ",
+        ]
+        .iter()
+        .find_map(|prefix| body.strip_prefix(prefix))?;
+        let (lhs, expr) = decl.split_once('=')?;
+        Some((lhs.split(':').next()?.trim(), expr))
+    }
+
+    /// `CREATE_NEW_CONSOLE` plus every file-local binding whose value names
+    /// it, followed through aliases of aliases. File-local and scope-blind on
+    /// purpose, so the alias resolution itself only over-reports. The scan as
+    /// a whole can still miss. These are not followed: a flag value imported
+    /// from another module, a plain reassignment (`flags = CREATE_NEW_CONSOLE;`),
+    /// a `pub static`, a value passed in as a parameter, a field target
+    /// (`opts.flags |= ..`) and a `0b`/`0o` literal. A call line whose string
+    /// literal holds `//` is missed too, because the line is cut there.
+    fn console_flag_names(lines: &[(usize, &str)]) -> HashSet<String> {
+        let bindings: Vec<(&str, &str)> = lines.iter().filter_map(|(_, l)| binding(l)).collect();
+        let mut names = HashSet::from(["CREATE_NEW_CONSOLE".to_string()]);
+        loop {
+            let before = names.len();
+            for (name, expr) in &bindings {
+                if !names.contains(*name) && names_new_console(expr, &names) {
+                    names.insert((*name).to_string());
+                }
+            }
+            if names.len() == before {
+                return names;
+            }
+        }
+    }
+
+    /// The argument text of each `creation_flags(` call that starts on line
+    /// `idx`, read across the following lines until its parentheses balance,
+    /// with `//` comments dropped.
+    fn creation_flags_args(lines: &[(usize, &str)], idx: usize) -> Vec<String> {
+        const NEEDLE: &str = "creation_flags(";
+        let line = strip_line_comment(lines[idx].1);
+        let mut args = Vec::new();
+        for (pos, _) in line.match_indices(NEEDLE) {
+            let first = line.get(pos + NEEDLE.len()..).unwrap_or("");
+            let rest = lines
+                .iter()
+                .skip(idx + 1)
+                .take(ARG_WINDOW)
+                .map(|(_, l)| strip_line_comment(l));
+            let mut arg = String::new();
+            let mut depth = 1_usize;
+            'call: for text in std::iter::once(first).chain(rest) {
+                for c in text.chars() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break 'call;
+                            }
+                        }
+                        _ => {}
+                    }
+                    arg.push(c);
+                }
+                arg.push('\n');
+            }
+            args.push(arg);
+        }
+        args
+    }
+
+    /// Scan 2: the indices of `creation_flags(` lines whose argument names
+    /// `CREATE_NEW_CONSOLE` (by name, by a file-local alias, or as a literal
+    /// with its bit set) and carry no marker — whatever built the command.
+    fn new_console_overrides(lines: &[(usize, &str)]) -> Vec<usize> {
+        let names = console_flag_names(lines);
+        (0..lines.len())
+            .filter(|&idx| {
+                creation_flags_args(lines, idx)
+                    .iter()
+                    .any(|arg| names_new_console(arg, &names))
+                    && !marked(lines, idx)
+            })
+            .collect()
+    }
+
+    /// The unsuppressed, unmarked console spawn sites in one file's
+    /// PRODUCTION text, as `rel:line: code`. Production text only: a spawn
+    /// written inside a test item is not shipped, so it cannot flash anything
+    /// on a user's machine.
+    fn file_violations(rel: &str, src: &str) -> Vec<String> {
+        let lines = production_lines(src);
+        let mut hits = new_console_overrides(&lines);
+        if !exempt_from_command_new_scan(rel) {
+            hits.extend(unsuppressed_command_new(&lines));
+        }
+        hits.sort_unstable();
+        hits.dedup();
+        hits.into_iter()
+            .map(|idx| {
+                let (n, line) = lines[idx];
+                format!("{rel}:{n}: {}", line.trim_start())
+            })
+            .collect()
+    }
+
+    /// The `spawn_python_with_console` shape (`mcp/shared.rs`; the override was
+    /// deleted in the change that added this test, and the function renamed
+    /// `spawn_python_script`): a command built through
+    /// `no_window(..)` and then handed `CREATE_NEW_CONSOLE`, which REPLACES
+    /// the `CREATE_NO_WINDOW` the helper set. The `Command::new(` scan never
+    /// looked at it, so the override shipped a visible console window.
+    #[test]
+    fn a_new_console_override_is_a_violation_unless_marked() {
+        let overridden = "fn spawn() -> std::io::Result<std::process::Child> {\n\
+                          \x20   let mut cmd = crate::process_helpers::no_window(\"python\");\n\
+                          \x20   #[cfg(target_os = \"windows\")]\n\
+                          \x20   {\n\
+                          \x20       cmd.creation_flags(CREATE_NEW_CONSOLE);\n\
+                          \x20   }\n\
+                          \x20   cmd.spawn()\n\
+                          }\n";
+        assert_eq!(
+            file_violations("mcp/shared.rs", overridden),
+            vec!["mcp/shared.rs:5: cmd.creation_flags(CREATE_NEW_CONSOLE);".to_string()],
+            "a no_window(..) command overridden with CREATE_NEW_CONSOLE went unseen"
+        );
+
+        // A raw `Command::new(` whose own suppression check is satisfied by
+        // the very call that opens the console.
+        let raw = "fn f() {\n    let mut c = std::process::Command::new(\"x\");\n    \
+                   c.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NEW_CONSOLE);\n}\n";
+        assert_eq!(file_violations("a.rs", raw).len(), 1, "{raw}");
+
+        // Every spelling of the flag: the literal in any width, combined
+        // into a mask, behind a file-local const, and an argument that
+        // spans lines (reported at the `creation_flags(` line).
+        for (case, src) in [
+            ("hex 0x10", "fn f(c: &mut C) { c.creation_flags(0x10); }\n"),
+            (
+                "hex 0x00000010",
+                "fn f(c: &mut C) { c.creation_flags(0x00000010); }\n",
+            ),
+            (
+                "underscored 0x0000_0010",
+                "fn f(c: &mut C) { c.creation_flags(0x0000_0010); }\n",
+            ),
+            (
+                "masked 0x0800_0010",
+                "fn f(c: &mut C) { c.creation_flags(0x0800_0010); }\n",
+            ),
+            ("decimal 16", "fn f(c: &mut C) { c.creation_flags(16u32); }\n"),
+            (
+                "path-qualified const",
+                "fn f(c: &mut C) { c.creation_flags(Threading::CREATE_NEW_CONSOLE.0); }\n",
+            ),
+            (
+                "file-local alias const",
+                "const VISIBLE: u32 = 0x0000_0010;\nfn f(c: &mut C) { c.creation_flags(VISIBLE); }\n",
+            ),
+            (
+                "multi-line argument",
+                "fn f(c: &mut C) {\n    c.creation_flags(\n        CREATE_NEW_PROCESS_GROUP\n            \
+                 | CREATE_NEW_CONSOLE,\n    );\n}\n",
+            ),
+        ] {
+            assert_eq!(file_violations("a.rs", src).len(), 1, "{case}: {src}");
+        }
+
+        // Not the console flag: CREATE_NO_WINDOW, a process group, wider
+        // literals that merely START with `0x10`, and a const named like
+        // it but distinct as a token.
+        for (case, src) in [
+            (
+                "CREATE_NO_WINDOW",
+                "fn f(c: &mut C) { c.creation_flags(0x0800_0000); }\n",
+            ),
+            (
+                "process group",
+                "fn f(c: &mut C) { c.creation_flags(0x0000_0200 | CREATE_NO_WINDOW); }\n",
+            ),
+            ("0x100", "fn f(c: &mut C) { c.creation_flags(0x100); }\n"),
+            ("0x1000", "fn f(c: &mut C) { c.creation_flags(0x1000); }\n"),
+            (
+                "decimal 512",
+                "fn f(c: &mut C) { c.creation_flags(512); }\n",
+            ),
+            (
+                "trailing comment",
+                "fn f(c: &mut C) { c.creation_flags(0x0800_0000); } // not CREATE_NEW_CONSOLE\n",
+            ),
+            (
+                "longer identifier",
+                "fn f(c: &mut C) { c.creation_flags(NOT_CREATE_NEW_CONSOLE_X); }\n",
+            ),
+        ] {
+            assert_eq!(
+                file_violations("a.rs", src),
+                Vec::<String>::new(),
+                "{case}: {src}"
+            );
+        }
+
+        // A deliberate console says so, and is then allowed.
+        let marked =
+            "fn f(c: &mut C) {\n    // console-ok: the operator asked for this window.\n    \
+                      c.creation_flags(CREATE_NEW_CONSOLE);\n}\n";
+        assert_eq!(file_violations("a.rs", marked), Vec::<String>::new());
+        // Prose and test code are not production.
+        let prose = "fn f() {\n    // was: c.creation_flags(CREATE_NEW_CONSOLE);\n}\n";
+        assert_eq!(file_violations("a.rs", prose), Vec::<String>::new());
+        let in_test = "fn f() {}\n#[cfg(test)]\nmod t {\n    fn g(c: &mut C) {\n        \
+                       c.creation_flags(CREATE_NEW_CONSOLE);\n    }\n}\n";
+        assert_eq!(file_violations("a.rs", in_test), Vec::<String>::new());
+    }
+
+    /// A test item in the middle of a file must hide neither the production
+    /// code before it nor the code after it. The `split_once` skipper this
+    /// guard used until this test was added threw away everything after the
+    /// FIRST column-0 `#[cfg(test)]`, so a `#[cfg(test)]` helper fn halfway
+    /// down `ai_provider/oauth_refresh.rs` hid the raw spawn below it.
+    #[test]
+    fn a_spawn_after_a_mid_file_test_item_is_still_scanned() {
+        let src = "fn a() {}\n\
+                   #[cfg(test)]\n\
+                   fn helper() { let _ = std::process::Command::new(\"t\"); }\n\
+                   fn prod() { let _ = std::process::Command::new(\"x\"); }\n\
+                   #[cfg(all(test, unix))]\n\
+                   mod unix_tests {\n\
+                   \x20   fn g() { let _ = std::process::Command::new(\"u\"); }\n\
+                   }\n\
+                   fn prod_after() { let _ = std::process::Command::new(\"y\"); }\n";
+        assert_eq!(
+            file_violations("a.rs", src),
+            vec![
+                "a.rs:4: fn prod() { let _ = std::process::Command::new(\"x\"); }".to_string(),
+                "a.rs:9: fn prod_after() { let _ = std::process::Command::new(\"y\"); }"
+                    .to_string(),
+            ],
+            "only the two production spawns are sites; the test helper and the \
+             all(test, unix) module are not"
+        );
+    }
+
     /// Every `Command::new(` in production code must either be suppressed
     /// (`process_helpers::{no_window, tokio_no_window, …}`, or an inline
     /// `creation_flags`) or carry a `console-ok:` marker saying why a console
     /// there is fine — a non-Windows-only arm, a deliberately visible terminal,
-    /// or a builder that is never spawned.
+    /// or a builder that is never spawned. And no production
+    /// `creation_flags(..)` may hand a command `CREATE_NEW_CONSOLE` without
+    /// the same marker, however the command was built.
     #[test]
     fn every_spawn_site_is_suppressed_or_marked_console_ok() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -2689,52 +3405,15 @@ mod console_window_guard {
         let mut violations: Vec<String> = Vec::new();
 
         for file in files {
-            let rel = file.strip_prefix(&root).unwrap_or(&file).to_path_buf();
-            if exempt(&rel) {
-                continue;
-            }
             let Ok(src) = std::fs::read_to_string(&file) else {
                 continue;
             };
-            // Production text only: a spawn written inside a test module is
-            // not shipped, so it cannot flash anything on a user's machine.
-            let prod = src
-                .split_once("\n#[cfg(test)]")
-                .map(|(before, _)| before)
-                .unwrap_or(&src);
-            let lines: Vec<&str> = prod.lines().collect();
-
-            for (i, line) in lines.iter().enumerate() {
-                if !line.contains("Command::new(") {
-                    continue;
-                }
-                let trimmed = line.trim_start();
-                // Prose, not code.
-                if trimmed.starts_with("//") {
-                    continue;
-                }
-                // Suppressed inline, a few lines down — either the raw flag
-                // or a helper that sets it on an already-built command
-                // (`pm_detect::no_window(&mut cmd)`).
-                let end = (i + FLAG_WINDOW).min(lines.len());
-                if lines[i..end]
-                    .iter()
-                    .any(|l| l.contains("creation_flags") || l.contains("no_window("))
-                {
-                    continue;
-                }
-                // Explicitly marked, on the line or just above it.
-                let start = i.saturating_sub(3);
-                if lines[start..=i].iter().any(|l| l.contains("console-ok:")) {
-                    continue;
-                }
-                violations.push(format!(
-                    "{}:{}: {}",
-                    rel.to_string_lossy().replace('\\', "/"),
-                    i + 1,
-                    trimmed
-                ));
-            }
+            let rel = file
+                .strip_prefix(&root)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            violations.extend(file_violations(&rel, &src));
         }
 
         assert!(
@@ -2742,12 +3421,189 @@ mod console_window_guard {
             "un-suppressed console spawn site(s) — on Windows each of these pops a \
              console window on every call in a release build.\n\n{}\n\nFix: build the \
              command with `crate::process_helpers::no_window(..)` / `tokio_no_window(..)` \
-             instead of `Command::new(..)`. If a console there is CORRECT (a \
-             non-Windows-only arm, a deliberately visible terminal, a builder that is \
-             never spawned), say so with a `// console-ok: <reason>` comment on the line \
-             or just above it.",
+             instead of `Command::new(..)`, and do not override its flags with \
+             `CREATE_NEW_CONSOLE`. If a console there is CORRECT (a non-Windows-only \
+             arm, a deliberately visible terminal, a builder that is never spawned), say \
+             so with a `// console-ok: <reason>` comment on the line or just above it.",
             violations.join("\n")
         );
+    }
+}
+
+/// Every production git spawn goes through [`no_window`] / [`tokio_no_window`],
+/// because that is where BOTH git postures are applied: the prompt-closing env
+/// and the repository-local scrub. A raw `Command::new("git")` skips both — it
+/// can hang on a credential prompt, and under a `GIT_DIR` inherited from the
+/// runner's launcher it reads and WRITES the launcher's repo instead of the one
+/// `-C` names (`git reset --hard`, `worktree remove`, `git config --local`).
+///
+/// A deliberate exception carries a `git-env-ok: <reason>` marker on the line
+/// or just above it. Today there is exactly one: `bin/qontinui_cli.rs`, a
+/// console tool that acts on the user's OWN shell repo, where the inherited
+/// environment is what the user means.
+#[cfg(test)]
+mod raw_git_guard {
+    use super::source_scan::{production_lines, rs_files};
+    use std::path::PathBuf;
+
+    /// How far above a raw spawn a `git-env-ok:` marker still covers it — a
+    /// marker comment may run to several lines.
+    const MARKER_WINDOW: usize = 6;
+
+    /// Is this line a raw git spawn? Whitespace is removed first, so
+    /// `Command::new( "git" )`, `Command::new(r"git")`, `"git.exe"` and
+    /// `"git".to_string()` all count.
+    fn is_raw_git_spawn(line: &str) -> bool {
+        let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        [
+            "Command::new(\"git",
+            "Command::new(r\"git",
+            "Command::new(r#\"git",
+        ]
+        .iter()
+        .any(|needle| {
+            compact.match_indices(needle).any(|(i, _)| {
+                let rest = compact.get(i + needle.len()..).unwrap_or("");
+                rest.starts_with('"')
+                    || rest.starts_with(".exe\"")
+                    || rest.starts_with("\"#")
+                    || rest.starts_with(".exe\"#")
+            })
+        })
+    }
+
+    /// Returns `(unmarked, marked)`: the 1-based lines of raw git spawns in
+    /// `src`'s production text without a `git-env-ok:` marker, and the count
+    /// of those that carry one.
+    pub(super) fn raw_git_spawns(src: &str) -> (Vec<usize>, usize) {
+        let lines = production_lines(src);
+        let mut unmarked = Vec::new();
+        let mut marked = 0;
+        for (idx, (n, line)) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("//") || !is_raw_git_spawn(line) {
+                continue;
+            }
+            let start = idx.saturating_sub(MARKER_WINDOW);
+            if lines[start..=idx]
+                .iter()
+                .any(|(_, l)| l.contains("git-env-ok:"))
+            {
+                marked += 1;
+            } else {
+                unmarked.push(*n);
+            }
+        }
+        (unmarked, marked)
+    }
+
+    #[test]
+    fn no_production_git_spawn_bypasses_the_chokepoint() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rs_files(&root, &mut files);
+        assert!(
+            files.len() > 100,
+            "walked only {} files under {} — the guard scanned nothing",
+            files.len(),
+            root.display()
+        );
+        let mut violations = Vec::new();
+        let mut marked_cli = 0;
+        for file in files {
+            let rel = file
+                .strip_prefix(&root)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let Ok(src) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let (unmarked, marked) = raw_git_spawns(&src);
+            if rel == "bin/qontinui_cli.rs" {
+                marked_cli = marked;
+            } else if marked > 0 {
+                violations.push(format!(
+                    "{rel}: {marked} git-env-ok exception(s) outside the one allowlisted file"
+                ));
+            }
+            for n in unmarked {
+                violations.push(format!("{rel}:{n}"));
+            }
+        }
+        assert_eq!(
+            marked_cli, 1,
+            "bin/qontinui_cli.rs must carry exactly one marked raw git spawn (git_stdout) — \
+             if it moved, went away or gained a sibling, update this guard's allowlist note"
+        );
+        assert!(
+            violations.is_empty(),
+            "raw git spawn(s) that bypass process_helpers::no_window / tokio_no_window \
+             (the prompt posture AND the repository-local scrub):\n{}\n\nBuild them with \
+             `crate::process_helpers::no_window(\"git\")` instead. A deliberate exception \
+             carries a `// git-env-ok: <reason>` comment on the line or just above it.",
+            violations.join("\n")
+        );
+    }
+
+    /// The detector itself: a raw spawn is caught, a marked one and a test-only
+    /// one are not. Without this the guard could pass by matching nothing.
+    #[test]
+    fn the_detector_catches_a_raw_spawn_and_honours_the_marker() {
+        let raw = "fn f() {\n    let c = std::process::Command::new(\"git\");\n}\n";
+        assert_eq!(raw_git_spawns(raw), (vec![2], 0));
+        let marked = "fn f() {\n    // git-env-ok: user's own repo,\n    // a second line,\n    \
+                      // and a third.\n    let c = Command::new(\"git\");\n}\n";
+        assert_eq!(raw_git_spawns(marked), (vec![], 1));
+        let test_mod = "fn f() {}\n#[cfg(test)]\nmod t { fn g() { Command::new(\"git\"); } }\n";
+        assert_eq!(raw_git_spawns(test_mod), (vec![], 0));
+        // A test-only helper ITEM does not hide the production code after it.
+        let after_helper = "#[cfg(test)]\nfn helper() {}\nfn prod() { Command::new(\"git\"); }\n";
+        assert_eq!(raw_git_spawns(after_helper), (vec![3], 0));
+        // Neither does a test module in the middle of a file, of any
+        // visibility — while its own raw spawns stay out of the scan.
+        let mid_file = "#[cfg(test)]\npub(crate) mod support {\n    fn g() {\n        \
+                        Command::new(\"git\");\n    }\n}\nfn prod() { Command::new(\"git\"); }\n";
+        assert_eq!(raw_git_spawns(mid_file), (vec![7], 0));
+        // A test-only `use` ends at its `;`, and an attribute between the
+        // cfg and the item does not end the skip.
+        let use_then_prod =
+            "#[cfg(test)]\n#[allow(unused)]\nuse std::fmt;\nfn prod() { Command::new(\"git\"); }\n";
+        assert_eq!(raw_git_spawns(use_then_prod), (vec![4], 0));
+        // A multi-line test-only `static` ends at its `;` — the production
+        // code after it is scanned.
+        let static_then_prod = "#[cfg(test)]\nstatic S: Vec<u8> =\n    Vec::new();\nfn prod() { Command::new(\"git\"); }\n";
+        assert_eq!(raw_git_spawns(static_then_prod), (vec![4], 0));
+        // A multi-line attribute is not mistaken for the item's head.
+        let multi_attr = "#[cfg(test)]\n#[expect(\n    clippy::x,\n    reason = \"r\"\n)]\nstatic S: u8 =\n    0;\nfn prod() { Command::new(\"git\"); }\n";
+        assert_eq!(raw_git_spawns(multi_attr), (vec![8], 0));
+        // A test-only fn whose signature spans lines ends at its closing
+        // `}`, not at the first `;` in its body.
+        let multi_sig = "#[cfg(test)]\nfn f(\n    a: u8,\n) {\n    let x = 1;\n    Command::new(\"git\");\n}\nfn prod() { Command::new(\"git\"); }\n";
+        assert_eq!(raw_git_spawns(multi_sig), (vec![8], 0));
+        // A braceless head whose initializer line carries balanced braces
+        // and ends in `;` ends there.
+        let struct_init = "#[cfg(test)]\nstatic S: Foo =\n    Foo { a: 1 };\nfn prod() { Command::new(\"git\"); }\n";
+        assert_eq!(raw_git_spawns(struct_init), (vec![4], 0));
+        for spelling in [
+            "tokio::process::Command::new(\"git\")",
+            "Command::new( \"git\" )",
+            "Command::new(\"git.exe\")",
+            "Command::new(r\"git\")",
+            "Command::new(\"git\".to_string())",
+        ] {
+            assert_eq!(
+                raw_git_spawns(&format!("fn f() {{ {spelling}; }}\n")),
+                (vec![1], 0),
+                "{spelling} must be caught"
+            );
+        }
+        for not_git in ["Command::new(\"gitk\")", "Command::new(\"git-lfs\")"] {
+            assert_eq!(
+                raw_git_spawns(&format!("fn f() {{ {not_git}; }}\n")),
+                (vec![], 0),
+                "{not_git} is not git"
+            );
+        }
     }
 }
 
@@ -2840,6 +3696,74 @@ mod prompt_proof_tests {
                 "{program} must not receive the git posture"
             );
         }
+    }
+
+    /// The same chokepoint scrubs the REPOSITORY-LOCAL git environment: every
+    /// `REPO_LOCAL_GIT_ENV` name is REMOVED on the command (`get_envs` reports a
+    /// removal as `None`), so a `GIT_DIR` inherited from whoever launched the
+    /// runner never reaches a git child — while command-scope config
+    /// (`GIT_CONFIG_PARAMETERS` / `GIT_CONFIG_COUNT`) is left alone, because an
+    /// env-injected `safe.directory` or credential helper rides on it.
+    fn assert_repo_local_scrubbed(envs: &[(String, Option<String>)], what: &str) {
+        for var in qontinui_runner_lib::git_posture::REPO_LOCAL_GIT_ENV {
+            assert!(
+                envs.iter().any(|(k, v)| k == var && v.is_none()),
+                "{what}: {var} must be removed so an inherited value never reaches git; envs: {envs:?}"
+            );
+        }
+        for var in qontinui_runner_lib::git_posture::COMMAND_SCOPE_GIT_CONFIG_ENV {
+            assert!(
+                !envs.iter().any(|(k, _)| k == var),
+                "{what}: {var} is command-scope config and must not be touched; envs: {envs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_window_git_scrubs_the_repo_local_env() {
+        for program in [
+            "git",
+            "/usr/bin/git",
+            r"C:\Program Files\Git\cmd\git.exe",
+            "GIT.EXE",
+        ] {
+            assert_repo_local_scrubbed(&env_of(&no_window(program)), program);
+        }
+    }
+
+    #[test]
+    fn tokio_no_window_git_scrubs_the_repo_local_env() {
+        let cmd = tokio_no_window("git");
+        assert_repo_local_scrubbed(&env_of(cmd.as_std()), "tokio_no_window(git)");
+    }
+
+    /// Scoped like the prompt posture: a non-git child keeps whatever
+    /// repository env it inherited (a `claude` session the runner launches is
+    /// a different question, out of this chokepoint's scope).
+    #[test]
+    fn no_window_does_not_scrub_non_git_programs() {
+        for program in ["cmd.exe", "claude", "git-lfs", "node"] {
+            assert!(
+                !env_of(&no_window(program))
+                    .iter()
+                    .any(|(k, _)| k == "GIT_DIR"),
+                "{program} must not have GIT_DIR touched"
+            );
+        }
+    }
+
+    /// A caller that DELIBERATELY points git elsewhere still can: an explicit
+    /// `.env` after construction wins over the construction-time removal.
+    #[test]
+    fn an_explicit_env_after_construction_wins_over_the_scrub() {
+        let mut cmd = no_window("git");
+        cmd.env("GIT_INDEX_FILE", "/tmp/alt-index");
+        assert!(
+            env_of(&cmd)
+                .iter()
+                .any(|(k, v)| k == "GIT_INDEX_FILE" && v.as_deref() == Some("/tmp/alt-index")),
+            "a later explicit GIT_INDEX_FILE must survive"
+        );
     }
 
     /// The prompt-proof subset is DERIVED from the one posture, never restated:

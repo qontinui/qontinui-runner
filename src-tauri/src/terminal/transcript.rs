@@ -10,7 +10,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
-use tracing::debug;
+use tracing::{debug, trace};
+
+mod project_index;
+pub use project_index::{select_pairs, PairSelection, ProjectsIndex};
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -185,13 +188,18 @@ fn cache_evict_orphans(project_dir: &Path, seen: &HashSet<PathBuf>) {
 /// Test seam: called once per transcript file DURING the walk, so a test can
 /// observe — from another thread, at that exact moment — whether the walking
 /// thread is holding `SESSION_CACHE`. Compiles to nothing outside `cfg(test)`.
+///
+/// Thread-local, so only the walk on the thread that armed it is probed: a
+/// process-global seam also fired for every OTHER test's concurrent walk and
+/// made the probe count nondeterministic.
 #[cfg(test)]
-static WALK_PROBE: Mutex<Option<fn()>> = Mutex::new(None);
+thread_local! {
+    static WALK_PROBE: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
+}
 
 #[cfg(test)]
 fn walk_probe() {
-    let f = *WALK_PROBE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(f) = f {
+    if let Some(f) = WALK_PROBE.with(std::cell::Cell::get) {
         f();
     }
 }
@@ -234,39 +242,250 @@ pub fn find_claude_config_dirs() -> Vec<PathBuf> {
     .collect()
 }
 
-/// Encode a project path to the directory name format used by Claude Code.
-///
-/// Example: `C:/Users/jspin/Documents/qontinui_parent` → `C--Users-jspin-Documents-qontinui-parent`
-fn encode_project_path(project_path: &str) -> String {
-    // Normalize to forward slashes, then apply Claude Code's encoding:
-    // - Replace `:` with empty string (drive letter colon)
-    // - Replace `/` with `-`
-    // - Replace `\` with `-`
-    let normalized = project_path
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_string();
+/// Claude Code's cap on a sanitized project-dir name. A longer name is cut to
+/// its first `MAX_PROJECT_DIR_NAME` characters and suffixed with `-<hash>`, and
+/// that hash is not reproducible from Rust — see [`project_dir`].
+const MAX_PROJECT_DIR_NAME: usize = 200;
 
-    // Claude Code encoding: :/ → --, then all :, /, \, _ → -
-    // C:/Users/jspin/Documents/qontinui_parent → C--Users-jspin-Documents-qontinui-parent
-    normalized
-        .replace(":/", "--")
-        .replace([':', '/', '\\', '_'], "-")
+/// Encode a project path (a session's cwd) to the directory name Claude Code
+/// stores its transcripts under: `<config_dir>/projects/<encoded>/`.
+///
+/// The rule is Claude Code's own: every UTF-16 code unit of the cwd that is not
+/// ASCII `[A-Za-z0-9]` becomes `-`. It is ASCII-only and per UTF-16 unit because
+/// the producer is a JS regex (`/[^a-zA-Z0-9]/g`), so `é` is one `-` and a
+/// non-BMP char such as `😀` (a surrogate pair) is two. `char::is_alphanumeric`
+/// would keep Unicode letters and disagree with the producer.
+///
+/// A trailing `/` or `\` is dropped first (a cwd never carries one, except a
+/// bare root), so a settings value spelled `.../proj/` still lands on `proj`'s
+/// dir.
+///
+/// Measured 2026-10-07 across 17 `~/.claude*/projects` dirs: this rule matched
+/// 826 of 827 `(projects dir, first-record cwd)` pairs (the one miss changed cwd
+/// after its first record). The encoder it replaced did not map `.`, and matched
+/// 0 of the 32 dotted cwds — so every session under `~/.qontinui/…` or a
+/// `.claude-*` scratch dir silently had no transcript.
+///
+/// Examples: `/home/u/.qontinui/x_y` → `-home-u--qontinui-x-y`,
+/// `C:\Users\x\proj` → `C--Users-x-proj`.
+///
+/// A result longer than [`MAX_PROJECT_DIR_NAME`] is NOT the on-disk name; use
+/// [`session_transcript_path`] / [`project_dir`], which resolve that case.
+pub(crate) fn encode_project_path(project_path: &str) -> String {
+    let trimmed = project_path.trim_end_matches(['/', '\\']);
+    // Keep a bare root (`/`, `C:\`) as given: trimming it would erase the dir.
+    let path = if trimmed.is_empty() || trimmed.ends_with(':') {
+        project_path
+    } else {
+        trimmed
+    };
+    path.encode_utf16()
+        .map(|unit| match u8::try_from(unit) {
+            Ok(b) if b.is_ascii_alphanumeric() => char::from(b),
+            _ => '-',
+        })
+        .collect()
+}
+
+/// The `<config_dir>/projects/<dir>` Claude Code uses for `project_path`.
+///
+/// For an encoded name of at most [`MAX_PROJECT_DIR_NAME`] chars this is pure
+/// path arithmetic. Past that, Claude Code's on-disk name is
+/// `<first 200 chars>-<hash>` with a hash we cannot compute, so this scans
+/// `projects/` for a dir named `<first 200 chars>-…`:
+///
+/// - with `session_id`, the candidate holding `<session_id>.jsonl` wins;
+/// - without one, the candidate whose transcripts record `project_path` as
+///   their `cwd` — never a lone candidate on its own, which may be a sibling
+///   cwd sharing the 200-char prefix.
+///
+/// When nothing matches, the untruncated encoded path is returned (it does not
+/// exist), so callers' existence checks behave as before.
+pub(crate) fn project_dir(
+    config_dir: &Path,
+    project_path: &str,
+    session_id: Option<&str>,
+) -> PathBuf {
+    let projects = config_dir.join("projects");
+    let encoded = encode_project_path(project_path);
+    if encoded.len() <= MAX_PROJECT_DIR_NAME {
+        return projects.join(encoded);
+    }
+    // `encoded` is pure ASCII, so a byte slice is a char slice.
+    let prefix = format!(
+        "{}-",
+        encoded.get(..MAX_PROJECT_DIR_NAME).unwrap_or(&encoded)
+    );
+    let mut candidates: Vec<PathBuf> = fs::read_dir(&projects)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(&prefix))
+        })
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    candidates.sort();
+    let found = match session_id {
+        Some(sid) => {
+            let file = format!("{sid}.jsonl");
+            candidates.into_iter().find(|d| d.join(&file).is_file())
+        }
+        None => candidates
+            .into_iter()
+            .find(|d| dir_records_cwd(d, project_path)),
+    };
+    found.unwrap_or_else(|| projects.join(encoded))
+}
+
+/// Whether any transcript directly in `dir` records `cwd` as a session cwd —
+/// the tiebreak between long-name dirs that share a 200-char prefix.
+fn dir_records_cwd(dir: &Path, cwd: &str) -> bool {
+    use std::io::{BufRead, BufReader};
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+            return false;
+        }
+        let Ok(file) = fs::File::open(&path) else {
+            return false;
+        };
+        BufReader::new(file)
+            .lines()
+            .take(20)
+            .map_while(Result::ok)
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
+            .any(|v| {
+                v.get("cwd")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| same_cwd(c, cwd))
+            })
+    })
+}
+
+/// Two cwd spellings name the same dir: trailing separators ignored, `\\` and
+/// `/` equal, and on Windows (case-insensitive paths) case ignored.
+fn same_cwd(a: &str, b: &str) -> bool {
+    fn norm(p: &str) -> String {
+        let p = p.trim_end_matches(['/', '\\']).replace('\\', "/");
+        if cfg!(windows) {
+            p.to_lowercase()
+        } else {
+            p
+        }
+    }
+    norm(a) == norm(b)
+}
+
+/// Every `projects/<dir>/<session_id>.jsonl` under `config_dir`.
+fn transcript_copies_in(config_dir: &Path, session_id: &str) -> Vec<PathBuf> {
+    let file = format!("{session_id}.jsonl");
+    fs::read_dir(config_dir.join("projects"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path().join(&file))
+        .filter(|path| path.is_file())
+        .collect()
+}
+
+fn modified(path: &Path) -> Option<std::time::SystemTime> {
+    fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// The most recently written of `copies`. One session id can exist in several
+/// places: the runner copies a transcript between accounts
+/// (`account_migration`, `respawn`) and never touches the source, so the
+/// source is a FROZEN copy and the newest file is the live one.
+fn newest(copies: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    copies.into_iter().max_by_key(|p| modified(p))
+}
+
+/// Locate the on-disk transcript for `session_id` WITHOUT knowing its project
+/// path, by sweeping every Claude config dir on this machine
+/// ([`find_claude_config_dirs`] is MACHINE-scoped), plus `also_in` when the
+/// caller recorded one, for `projects/*/<session_id>.jsonl`. Session ids are
+/// unique, but a migrated session leaves frozen copies behind, so the NEWEST
+/// copy wins rather than the first one found.
+///
+/// The one by-id resolver: the turn-ending shadow uses it when it holds only a
+/// session id, and the by-path resolvers fall back to it when the computed
+/// path misses (a cwd that changed after the first record, an encoding drift).
+pub(crate) fn find_transcript_by_session_id(
+    also_in: Option<&Path>,
+    session_id: &str,
+) -> Option<PathBuf> {
+    let mut dirs = find_claude_config_dirs();
+    if let Some(dir) = also_in {
+        dirs.push(dir.to_path_buf());
+    }
+    newest_copy_among(&dirs, session_id)
+}
+
+/// The newest `<session_id>.jsonl` under any of `config_dirs`.
+fn newest_copy_among(config_dirs: &[PathBuf], session_id: &str) -> Option<PathBuf> {
+    let mut seen = HashSet::new();
+    newest(
+        config_dirs
+            .iter()
+            .filter(|d| seen.insert(d.as_path()))
+            .flat_map(|config_dir| transcript_copies_in(config_dir, session_id)),
+    )
+}
+
+/// The transcript a reader of one known session should open: the NEWEST copy
+/// of `<session_id>.jsonl` under `config_dir` or any other Claude config dir on
+/// this machine, else [`session_transcript_path`] (which does not exist, so the
+/// caller's existence check fails as before).
+///
+/// Newest rather than "the exact path in `config_dir`": a migrated session's
+/// frozen copy sits at the SAME encoded path in its old config dir
+/// (`session_carry::copy_transcript` keeps the project dir), so callers
+/// that loop over config dirs would otherwise read the frozen copy whenever its
+/// dir came first. The exact path in each config dir is checked first (a few
+/// `stat`s); the full `projects/*` sweep runs only when none exists.
+fn existing_session_transcript(config_dir: &Path, project_path: &str, session_id: &str) -> PathBuf {
+    let mut dirs = vec![config_dir.to_path_buf()];
+    dirs.extend(find_claude_config_dirs());
+    let mut seen = HashSet::new();
+    dirs.retain(|d| seen.insert(d.clone()));
+    newest(
+        dirs.iter()
+            .map(|d| session_transcript_path(d, project_path, session_id))
+            .filter(|p| p.is_file()),
+    )
+    .or_else(|| newest_copy_among(&dirs, session_id))
+    .unwrap_or_else(|| session_transcript_path(config_dir, project_path, session_id))
+}
+
+/// The transcript of `session_id` held by `config_dir` ITSELF: the exact
+/// encoded path, else the newest copy under another `projects/<dir>/` of the
+/// same config dir. For a per-account view (one listed session = one copy),
+/// where reading another account's copy would mislabel it.
+fn session_transcript_in(config_dir: &Path, project_path: &str, session_id: &str) -> PathBuf {
+    let path = session_transcript_path(config_dir, project_path, session_id);
+    if path.is_file() {
+        return path;
+    }
+    newest(transcript_copies_in(config_dir, session_id)).unwrap_or(path)
 }
 
 /// Absolute path to the on-disk JSONL transcript for a `(config_dir,
 /// project_path, session_id)` triple, whether or not it exists.
 ///
-/// Mirrors the path construction used by [`read_session`] / [`session_digest`]
-/// (`<config_dir>/projects/<encoded(project_path)>/<session_id>.jsonl`).
-/// Exposed so the chat-resume path (Phase 3, restart resilience) can probe
-/// whether a lossless `--resume` is possible before deciding to fall back to a
-/// lossy output_log summary.
+/// `<config_dir>/projects/<encoded(project_path)>/<session_id>.jsonl`, with the
+/// over-200-char project dir resolved by [`project_dir`]. Exposed so the
+/// chat-resume path (Phase 3, restart resilience) can probe whether a lossless
+/// `--resume` is possible before deciding to fall back to a lossy output_log
+/// summary.
 pub fn session_transcript_path(config_dir: &Path, project_path: &str, session_id: &str) -> PathBuf {
-    config_dir
-        .join("projects")
-        .join(encode_project_path(project_path))
-        .join(format!("{}.jsonl", session_id))
+    project_dir(config_dir, project_path, Some(session_id)).join(format!("{}.jsonl", session_id))
 }
 
 // ── Resume-name extraction (previous-sessions listing) ───────────────────────
@@ -510,13 +729,21 @@ pub fn list_sessions(
     config_dir: &Path,
     project_path: &str,
 ) -> Result<Vec<TranscriptSession>, String> {
-    let encoded = encode_project_path(project_path);
-    let project_dir = config_dir.join("projects").join(&encoded);
+    let project_dir = project_dir(config_dir, project_path, None);
 
     if !project_dir.exists() {
-        debug!(
+        // TRACE, not DEBUG: periodic callers (the session reconciler, the
+        // latest-session fallback) still reach this per probed pair, and at a
+        // DEBUG filter one line per miss flooded the runner log (measured
+        // 2026-10-18 at 9-11 GB/day, plan
+        // `2026-10-19-runner-transcript-scan-stats-and-logs-every-missing-project-dir`).
+        // The all-projects listing no longer probes absent pairs at
+        // all (`ProjectsIndex` / `select_pairs`); it logs one aggregate line
+        // per scan instead.
+        trace!(
             "No project directory found at {:?} (encoded from '{}')",
-            project_dir, project_path
+            project_dir,
+            project_path
         );
         return Ok(Vec::new());
     }
@@ -666,11 +893,7 @@ pub fn read_session(
     project_path: &str,
     session_id: &str,
 ) -> Result<Vec<TranscriptMessage>, String> {
-    let encoded = encode_project_path(project_path);
-    let file_path = config_dir
-        .join("projects")
-        .join(&encoded)
-        .join(format!("{}.jsonl", session_id));
+    let file_path = existing_session_transcript(config_dir, project_path, session_id);
 
     if !file_path.exists() {
         return Err(format!("Session file not found: {:?}", file_path));
@@ -744,11 +967,7 @@ pub fn read_user_prompts(
     session_id: &str,
     since_mtime_ms: Option<u64>,
 ) -> Result<UserPromptsResult, String> {
-    let encoded = encode_project_path(project_path);
-    let file_path = config_dir
-        .join("projects")
-        .join(&encoded)
-        .join(format!("{}.jsonl", session_id));
+    let file_path = existing_session_transcript(config_dir, project_path, session_id);
 
     let meta = fs::metadata(&file_path)
         .map_err(|e| format!("Session file not readable {:?}: {}", file_path, e))?;
@@ -782,16 +1001,7 @@ pub fn read_user_prompts(
             Ok(v) => v,
             Err(_) => continue, // Skip malformed lines
         };
-        if record.get("type").and_then(|t| t.as_str()) != Some("user") {
-            continue;
-        }
-        if is_machine_authored_user_record(&record) {
-            continue;
-        }
-        // Reuse the shared extractor so this view and the transcript panel
-        // agree on what a record's text IS — they differ only in which
-        // records they keep.
-        if let Some(msg) = parse_user_record(&record) {
+        if let Some(msg) = operator_prompt_record(&record) {
             prompts.push(UserPromptRecord {
                 uuid: msg.uuid,
                 timestamp: msg.timestamp,
@@ -805,6 +1015,31 @@ pub fn read_user_prompts(
         unchanged: false,
         prompts,
     })
+}
+
+/// The operator's own prompt in `record`, or `None` for anything else: a
+/// non-`user` record, a machine-authored `user` record
+/// ([`is_machine_authored_user_record`]), or one carrying no text (a bare
+/// `tool_result`). Reuses the shared extractor so the prompts view and the
+/// transcript panel agree on what a record's text IS — they differ only in
+/// which records they keep.
+fn operator_prompt_record(record: &serde_json::Value) -> Option<TranscriptMessage> {
+    if record.get("type").and_then(|t| t.as_str()) != Some("user") {
+        return None;
+    }
+    if is_machine_authored_user_record(record) {
+        return None;
+    }
+    parse_user_record(record)
+}
+
+/// [`operator_prompt_record`]'s text for ONE raw transcript line, as a live
+/// tail sees it. The review-note confirmation (`mcp::session_review`) reads
+/// prompts this way so it agrees with [`read_user_prompts`] — the read the
+/// Terminal page's prompts panel shows — about which lines are prompts.
+pub(crate) fn operator_prompt_text_of_line(line: &str) -> Option<String> {
+    let record: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    operator_prompt_record(&record).map(|msg| msg.text)
 }
 
 /// True when a `user` record was written by the harness rather than typed by
@@ -1275,11 +1510,7 @@ pub fn get_latest_session_id(
             if let Some(session_id) = json.get("lastSessionId").and_then(|v| v.as_str()) {
                 debug!("Found lastSessionId from .claude.json: {}", session_id);
                 // Verify the session file exists
-                let encoded = encode_project_path(project_path);
-                let session_file = config_dir
-                    .join("projects")
-                    .join(&encoded)
-                    .join(format!("{}.jsonl", session_id));
+                let session_file = session_transcript_path(config_dir, project_path, session_id);
                 if session_file.exists() {
                     let metadata = fs::metadata(&session_file).ok();
                     let last_modified = metadata
@@ -1617,11 +1848,7 @@ pub fn session_digest(
     session_id: &str,
     first_preview: &Option<String>,
 ) -> Result<SessionDigest, String> {
-    let encoded = encode_project_path(project_path);
-    let file_path = config_dir
-        .join("projects")
-        .join(&encoded)
-        .join(format!("{}.jsonl", session_id));
+    let file_path = session_transcript_in(config_dir, project_path, session_id);
 
     if !file_path.exists() {
         return Err(format!("Session file not found: {:?}", file_path));
@@ -2121,15 +2348,232 @@ mod tests {
         );
     }
 
+    /// Claude Code's rule: every UTF-16 unit that is not ASCII `[A-Za-z0-9]`
+    /// becomes `-`. Rows are real on-disk shapes (dotted home dirs, `.claude-*`
+    /// scratch dirs, underscores, spaces, a Windows drive, non-ASCII).
     #[test]
     fn test_encode_project_path() {
+        let cases = [
+            // The arming case: `.` maps (the old encoder kept it).
+            ("/home/u/.qontinui/x_y", "-home-u--qontinui-x-y"),
+            (
+                "/home/spinak/.qontinui/scratch/.claude-erik/claude-1000/scratchpad",
+                "-home-spinak--qontinui-scratch--claude-erik-claude-1000-scratchpad",
+            ),
+            ("/home/u/qontinui_parent", "-home-u-qontinui-parent"),
+            ("/home/u/my proj", "-home-u-my-proj"),
+            (r"C:\Users\x\proj", "C--Users-x-proj"),
+            (
+                "C:/Users/jspin/Documents/qontinui_parent",
+                "C--Users-jspin-Documents-qontinui-parent",
+            ),
+            (
+                r"C:\Users\jspin\Documents\qontinui_parent",
+                "C--Users-jspin-Documents-qontinui-parent",
+            ),
+            // One BMP non-ASCII char is one unit → one `-`.
+            ("/home/u/café", "-home-u-caf-"),
+            // A non-BMP char is a surrogate pair → two `-`.
+            ("/home/u/😀", "-home-u---"),
+            // Trailing separators are dropped; a bare root is kept.
+            ("/home/u/proj/", "-home-u-proj"),
+            (r"C:\Users\x\proj\", "C--Users-x-proj"),
+            ("/", "-"),
+            (r"C:\", "C--"),
+        ];
+        for (cwd, want) in cases {
+            assert_eq!(encode_project_path(cwd), want, "cwd {cwd:?}");
+        }
+    }
+
+    /// Over 200 sanitized chars, Claude Code writes `<first 200>-<hash>`; the
+    /// hash is not ours to compute, so the resolver finds the dir by prefix
+    /// and (with a session id) by the transcript it holds.
+    #[test]
+    fn long_project_path_resolves_by_prefix_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let cwd = format!("/home/u/{}", "a".repeat(250));
+        let encoded = encode_project_path(&cwd);
+        assert!(encoded.len() > MAX_PROJECT_DIR_NAME);
+        let prefix = encoded.get(..MAX_PROJECT_DIR_NAME).unwrap();
+
+        // A sibling sharing the prefix but holding a different session.
+        let other = config_dir
+            .join("projects")
+            .join(format!("{prefix}-1111aaaa"));
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("other.jsonl"), minimal_user_jsonl()).unwrap();
+        let real = config_dir
+            .join("projects")
+            .join(format!("{prefix}-2222bbbb"));
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("sess.jsonl"), minimal_user_jsonl()).unwrap();
+
         assert_eq!(
-            encode_project_path("C:/Users/jspin/Documents/qontinui_parent"),
-            "C--Users-jspin-Documents-qontinui-parent"
+            session_transcript_path(&config_dir, &cwd, "sess"),
+            real.join("sess.jsonl")
         );
         assert_eq!(
-            encode_project_path("C:\\Users\\jspin\\Documents\\qontinui_parent"),
-            "C--Users-jspin-Documents-qontinui-parent"
+            session_transcript_path(&config_dir, &cwd, "other"),
+            other.join("other.jsonl")
+        );
+        // Unknown session: the untruncated (non-existent) path, as before.
+        assert!(!session_transcript_path(&config_dir, &cwd, "nope").exists());
+        assert_eq!(read_session(&config_dir, &cwd, "sess").unwrap().len(), 1);
+    }
+
+    /// Without a session id, a single prefix match is the dir; among several,
+    /// the one whose transcripts record this cwd wins.
+    #[test]
+    fn long_project_path_lists_the_dir_recording_its_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let base = format!("/home/u/{}", "b".repeat(250));
+        let cwd = format!("{base}/one");
+        let sibling_cwd = format!("{base}/two");
+        let prefix = encode_project_path(&cwd)
+            .get(..MAX_PROJECT_DIR_NAME)
+            .unwrap()
+            .to_string();
+        for (hash, c, sid) in [("aaaa", &sibling_cwd, "s2"), ("bbbb", &cwd, "s1")] {
+            let dir = config_dir.join("projects").join(format!("{prefix}-{hash}"));
+            fs::create_dir_all(&dir).unwrap();
+            let rec = serde_json::json!({
+                "type": "user", "uuid": "u1", "cwd": c,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": {"role": "user", "content": "hello"},
+            });
+            fs::write(dir.join(format!("{sid}.jsonl")), rec.to_string()).unwrap();
+        }
+        let ids: Vec<String> = list_sessions(&config_dir, &cwd)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.session_id)
+            .collect();
+        assert_eq!(ids, vec!["s1".to_string()]);
+    }
+
+    /// Regression: a session whose cwd has a `.` (`~/.qontinui/…`) is read from
+    /// the dir Claude Code actually wrote, not one the encoder invented.
+    #[test]
+    fn read_session_finds_a_dotted_cwd_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join(".claude-erik");
+        let cwd = "/home/u/.qontinui/scratch/x_y";
+        let dir = config_dir
+            .join("projects")
+            .join("-home-u--qontinui-scratch-x-y");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("sess.jsonl"), minimal_user_jsonl()).unwrap();
+
+        let msgs = read_session(&config_dir, cwd, "sess").unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(
+            read_user_prompts(&config_dir, cwd, "sess", None)
+                .unwrap()
+                .prompts
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn same_cwd_ignores_trailing_and_mixed_separators() {
+        assert!(same_cwd("/home/u/proj", "/home/u/proj/"));
+        assert!(same_cwd(r"C:\Users\x\proj", "C:/Users/x/proj"));
+        assert!(!same_cwd("/home/u/proj", "/home/u/proj2"));
+    }
+
+    /// A long-name dir sharing the 200-char prefix but recording a DIFFERENT
+    /// cwd is not this project's dir, even when it is the only candidate.
+    #[test]
+    fn long_project_path_ignores_a_lone_sibling_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let base = format!("/home/u/{}", "c".repeat(250));
+        let cwd = format!("{base}/one");
+        let prefix = encode_project_path(&cwd)
+            .get(..MAX_PROJECT_DIR_NAME)
+            .unwrap()
+            .to_string();
+        let dir = config_dir.join("projects").join(format!("{prefix}-aaaa"));
+        fs::create_dir_all(&dir).unwrap();
+        let rec = serde_json::json!({
+            "type": "user", "uuid": "u1", "cwd": format!("{base}/two"),
+            "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"role": "user", "content": "hello"},
+        });
+        fs::write(dir.join("s2.jsonl"), rec.to_string()).unwrap();
+        let listed = list_sessions(&config_dir, &cwd).unwrap_or_default();
+        assert!(
+            listed.is_empty(),
+            "listed a sibling cwd's sessions: {listed:?}"
+        );
+    }
+
+    /// A migrated session leaves a frozen copy at the SAME encoded path in its
+    /// old config dir. The newest copy wins across config dirs, whichever dir
+    /// a caller's loop reaches first.
+    #[test]
+    fn newest_copy_wins_over_a_frozen_copy_in_another_config_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_cfg = temp.path().join("old");
+        let new_cfg = temp.path().join("new");
+        let stale = old_cfg.join("projects").join("-proj");
+        let live = new_cfg.join("projects").join("-proj");
+        fs::create_dir_all(&stale).unwrap();
+        fs::create_dir_all(&live).unwrap();
+        fs::write(stale.join("sess.jsonl"), minimal_user_jsonl()).unwrap();
+        let older = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(stale.join("sess.jsonl"))
+            .unwrap()
+            .set_modified(older)
+            .unwrap();
+        fs::write(live.join("sess.jsonl"), minimal_user_jsonl()).unwrap();
+
+        for order in [
+            [old_cfg.clone(), new_cfg.clone()],
+            [new_cfg.clone(), old_cfg.clone()],
+        ] {
+            assert_eq!(
+                newest_copy_among(&order, "sess"),
+                Some(live.join("sess.jsonl"))
+            );
+        }
+        // A listed dir appearing twice is swept once and changes nothing.
+        assert_eq!(
+            newest_copy_among(&[old_cfg.clone(), old_cfg.clone()], "sess"),
+            Some(stale.join("sess.jsonl"))
+        );
+        assert_eq!(newest_copy_among(&[old_cfg], "absent"), None);
+    }
+
+    /// When the computed dir misses but the session id is known, the readers
+    /// fall back to the by-id sweep of the config dir.
+    #[test]
+    fn read_session_falls_back_to_by_id_sweep() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let dir = config_dir.join("projects").join("-somewhere-else");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("sess.jsonl"), minimal_user_jsonl()).unwrap();
+
+        assert_eq!(
+            newest_copy_among(std::slice::from_ref(&config_dir), "sess"),
+            Some(dir.join("sess.jsonl"))
+        );
+        assert_eq!(
+            newest_copy_among(std::slice::from_ref(&config_dir), "nope"),
+            None
+        );
+        assert_eq!(
+            read_session(&config_dir, "/moved/cwd", "sess")
+                .unwrap()
+                .len(),
+            1
         );
     }
 
@@ -2673,13 +3117,13 @@ mod tests {
     /// One JSONL record with a single user message — enough for `list_sessions`
     /// to consider the session non-empty (`message_count == 1`) and produce a
     /// real `TranscriptSession`. Workflow-marker free.
-    fn minimal_user_jsonl() -> &'static str {
+    pub(super) fn minimal_user_jsonl() -> &'static str {
         r#"{"type":"user","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"hello"}}"#
     }
 
     /// Write a synthetic JSONL session at `<config_dir>/projects/<encoded>/<id>.jsonl`
     /// and force its mtime via `filetime::set_file_mtime`. Returns the file path.
-    fn write_session_with_mtime(
+    pub(super) fn write_session_with_mtime(
         config_dir: &Path,
         project_path: &str,
         session_id: &str,
@@ -2704,7 +3148,7 @@ mod tests {
     /// it; if a stale entry lingers under our tempdir's prefix, `list_sessions`
     /// can return a cached `TranscriptSession` whose `last_modified` doesn't
     /// match the freshly-set fixture mtime.
-    fn clear_cache_under(prefix: &Path) {
+    pub(super) fn clear_cache_under(prefix: &Path) {
         let mut cache = SESSION_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         cache.retain(|p, _| !p.starts_with(prefix));
     }
@@ -2724,9 +3168,23 @@ mod tests {
         PROBE_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
         // A different thread, so this is a real cross-thread acquisition and
         // not same-thread reentrancy.
-        let got = std::thread::spawn(|| SESSION_CACHE.try_lock().is_ok())
-            .join()
-            .unwrap_or(false);
+        //
+        // Retried briefly: other tests in this binary take the lock for
+        // microseconds (cache get/put) and can collide with a single attempt.
+        // The walk thread is blocked on this `join`, so a lock held ACROSS the
+        // walk is never released and every retry still fails — the property
+        // stays deterministic.
+        let got = std::thread::spawn(|| {
+            (0..50).any(|_| {
+                let ok = SESSION_CACHE.try_lock().is_ok();
+                if !ok {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                ok
+            })
+        })
+        .join()
+        .unwrap_or(false);
         if got {
             PROBE_ACQUIRED.fetch_add(1, Ordering::SeqCst);
         }
@@ -2750,11 +3208,11 @@ mod tests {
 
         PROBE_ATTEMPTS.store(0, Ordering::SeqCst);
         PROBE_ACQUIRED.store(0, Ordering::SeqCst);
-        *WALK_PROBE.lock().unwrap_or_else(|e| e.into_inner()) = Some(try_lock_from_another_thread);
+        WALK_PROBE.with(|p| p.set(Some(try_lock_from_another_thread)));
 
         let sessions = list_sessions(&config_dir, &project_path).expect("walk succeeded");
 
-        *WALK_PROBE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        WALK_PROBE.with(|p| p.set(None));
 
         assert_eq!(
             sessions.len(),

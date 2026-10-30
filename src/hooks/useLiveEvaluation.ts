@@ -8,6 +8,7 @@
 import { useState, useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
+import { describeThrown } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -67,7 +68,7 @@ export function useLiveEvaluation() {
       setResults(res);
       return res;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Live evaluation failed");
       setError(msg);
       return null;
     } finally {

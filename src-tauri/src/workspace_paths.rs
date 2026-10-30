@@ -95,8 +95,8 @@ const RUNNER_REPO_DIR: &str = "qontinui-runner";
 ///
 /// Returns the full [`WorkspaceRoot`] so each caller picks its own disposition:
 /// discovery surfaces take [`WorkspaceRoot::into_root`] and degrade, surfaces
-/// that write or execute take [`WorkspaceRoot::require`] and fail closed with an
-/// error naming `$QONTINUI_ROOT`.
+/// that write or execute take [`WorkspaceRoot::require`] and fail closed with the
+/// typed `WorkspaceRootUnresolved` refusal.
 ///
 /// **Not memoized** — see the module header for why that is a decision rather
 /// than an omission.
@@ -122,6 +122,7 @@ pub fn runner_workspace_root() -> WorkspaceRoot {
         let root = qontinui_runner_lib::ambient::deflected_workspace_root();
         return qontinui_types::paths::resolve_workspace_root(
             Some(&root.to_string_lossy()),
+            None,
             None,
             None,
             None,
@@ -158,7 +159,12 @@ pub fn runner_workspace_root() -> WorkspaceRoot {
 /// difference is who supplies the setting.
 pub fn runner_workspace_root_from(configured: Option<&str>) -> WorkspaceRoot {
     let exe = std::env::current_exe().ok();
-    qontinui_workspace_root(configured, exe_anchor(exe.as_deref()))
+    // `session_repo: None` — this is the PROCESS-wide resolver, shared by every
+    // surface and every session the runner hosts, so it has no single session
+    // repository to offer. Passing one session's checkout here would make the
+    // whole runner's root a function of whichever session asked first. The
+    // `SessionRepoParent` rung is for a caller scoped to one session.
+    qontinui_workspace_root(configured, exe_anchor(exe.as_deref()), None)
 }
 
 /// The workspace root for a **discovery** surface: the census sweep, the fleet
@@ -293,12 +299,34 @@ pub fn workspace_root_observation() -> CapabilityObservation {
 /// a wrong answer materialises a worktree at a fabricated location or runs a
 /// script from one.
 ///
-/// The error names the input actually at fault, lists every probe tried, and
-/// names `$QONTINUI_ROOT`. That is the product-code counterpart of the plan's
-/// "ask rather than guess": a resolver running inside a background poller has
-/// no operator to ask, so it refuses loudly instead of guessing.
+/// The error is the shared `WorkspaceRootUnresolved` sentence, rendered: it
+/// names the next action (the Workspace root setting) and, when the operator
+/// set an input that was at fault, which one. That is the product-code
+/// counterpart of the plan's "ask rather than guess": a resolver running inside
+/// a background poller has no operator to ask, so it refuses loudly instead of
+/// guessing.
 pub fn require_workspace_root() -> Result<PathBuf, String> {
-    runner_workspace_root().require()
+    require_rendered(runner_workspace_root())
+}
+
+/// [`WorkspaceRoot::require`], with its typed `WorkspaceRootUnresolved` rendered
+/// through its `Display` — the one operator sentence `qontinui_types::paths`
+/// defines for this case — for the `String`-error callers of
+/// [`require_workspace_root`]. Split out so the rendering is testable against
+/// injected inputs.
+///
+/// The sentence deliberately omits the full probe order (it would name
+/// variables an operator may never have heard of); that diagnostic is
+/// `WorkspaceRootUnresolved::detail`, which a `String` caller has nowhere to
+/// show, so it is logged here instead of being dropped.
+fn require_rendered(resolved: WorkspaceRoot) -> Result<PathBuf, String> {
+    resolved.require().map_err(|e| {
+        warn!(
+            "workspace_paths: workspace root unresolved — {}",
+            e.detail()
+        );
+        e.to_string()
+    })
 }
 
 /// The runner's contribution to the resolution: this executable's path, tagged
@@ -353,7 +381,7 @@ fn migration_write(existing: Option<&str>, resolved: Option<&Path>) -> Option<St
 /// `update_settings` refuses to write over a non-authoritative base, so a
 /// corrupt `settings.json` yields `Err` here rather than being clobbered.
 pub fn persist_resolved_workspace_root() -> Result<(), String> {
-    if crate::instance::is_secondary() {
+    if crate::instance::shares_primary_settings() {
         return Ok(());
     }
 
@@ -458,7 +486,7 @@ mod tests {
         let f = fixture();
         let exe = dev_install_exe(&f.root);
 
-        let got = resolve_workspace_root(None, None, None, exe_anchor(Some(&exe)), None);
+        let got = resolve_workspace_root(None, None, None, exe_anchor(Some(&exe)), None, None);
 
         assert_eq!(
             got.root.as_deref(),
@@ -482,6 +510,7 @@ mod tests {
             None,
             f.root.to_str(),
             exe_anchor(Some(&installed_exe)),
+            None,
             None,
         );
 
@@ -538,26 +567,36 @@ mod tests {
     // Phase 2 — the two dispositions the collapsed resolvers call.
     // -----------------------------------------------------------------
 
-    /// The fail-closed door must name the input at fault, every probe tried, and
-    /// the variable to set. A surface that creates worktrees or runs scripts
-    /// under the root gets a loud, actionable error instead of a fabricated
-    /// path — the product-code counterpart of "ask rather than guess".
+    /// The fail-closed door must name the input at fault and the setting to
+    /// fix. A surface that creates worktrees or runs scripts under the root gets
+    /// a loud, actionable error instead of a fabricated path — the product-code
+    /// counterpart of "ask rather than guess".
+    ///
+    /// It must NOT name an environment variable the operator never set: the
+    /// shared sentence keeps the full probe order out of the display, and this
+    /// door renders that sentence rather than re-deriving one.
     ///
     /// Driven through the pure resolver with injected inputs, so the assertion
     /// does not depend on how the machine running the suite is configured.
     #[test]
     fn the_fail_closed_disposition_reports_an_actionable_error() {
-        let err = resolve_workspace_root(None, None, Some("relative/path"), None, None)
-            .require()
-            .expect_err("a relative configured root must not resolve");
+        let err = require_rendered(resolve_workspace_root(
+            None,
+            None,
+            Some("relative/path"),
+            None,
+            None,
+            None,
+        ))
+        .expect_err("a relative configured root must not resolve");
 
         assert!(
-            err.contains("configured workspace-root setting"),
+            err.contains("Workspace root setting is not an absolute path"),
             "must blame the setting the operator actually set: {err}"
         );
         assert!(
-            err.contains("QONTINUI_ROOT"),
-            "must name the variable: {err}"
+            !err.contains("QONTINUI_ROOT"),
+            "must not name a variable the operator never set: {err}"
         );
     }
 
@@ -572,7 +611,7 @@ mod tests {
             std::process::id()
         ));
 
-        let got = resolve_workspace_root(None, None, None, None, Some(&nowhere));
+        let got = resolve_workspace_root(None, None, None, None, None, Some(&nowhere));
 
         assert_eq!(got.root, None, "nothing resolves, so discovery gets None");
         assert!(
@@ -598,6 +637,7 @@ mod tests {
             None,
             f.root.to_str(),
             exe_anchor(Some(&installed_exe)),
+            None,
             None,
         );
 
@@ -672,7 +712,7 @@ mod tests {
         );
         assert_eq!(
             obs.rejected.as_deref(),
-            Some("the configured workspace-root setting is not an existing directory")
+            Some("the Workspace root setting is not an existing directory")
         );
         assert_eq!(
             obs.detail.as_deref(),
@@ -706,6 +746,29 @@ mod tests {
         assert!(
             obs.rejected.is_some(),
             "an unresolved root always names a reason — the miss is never silent"
+        );
+    }
+
+    /// Plan `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`,
+    /// through the real entry point: a nameless subject under an instance root
+    /// persists `paths.workspace_root` into ITS OWN `<root>/config/settings.json`
+    /// — the guard reads `shares_primary_settings()`, not `is_secondary()`.
+    #[test]
+    fn a_rooted_subject_persists_its_workspace_root_into_its_own_config() {
+        let amb = crate::test_env::isolated_ambient();
+        let root = crate::instance::enter_rooted_subject_for_test(&amb);
+        let expected = workspace_root().expect("the fixture's QONTINUI_ROOT must resolve");
+
+        persist_resolved_workspace_root().expect("a subject may write its own settings");
+
+        let file = root.join("config").join("settings.json");
+        let doc: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&file).expect("settings.json written in the root"),
+        )
+        .unwrap();
+        assert_eq!(
+            doc["paths"]["workspace_root"].as_str().map(PathBuf::from),
+            Some(expected)
         );
     }
 }

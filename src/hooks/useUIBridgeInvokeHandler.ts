@@ -35,7 +35,6 @@ import { useEffect } from "react";
 import { emit, type Event } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { createLogger } from "@/lib/logger";
-import { getErrorMessage } from "@/lib/utils";
 import { acquireSingletonListener } from "./ui-bridge-events/singleton-listener";
 import { invokeRequestDedupe } from "./ui-bridge-events/request-dedupe";
 
@@ -55,10 +54,10 @@ function serializeInvokeError(err: unknown): string {
     try {
       return JSON.stringify(err);
     } catch {
-      // Fall through to getErrorMessage for circular refs etc.
+      // Fall through to String() for circular refs etc.
     }
   }
-  return getErrorMessage(err);
+  return String(err);
 }
 
 const log = createLogger("UIBridgeInvokeHandler");

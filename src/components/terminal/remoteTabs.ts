@@ -1,4 +1,5 @@
 import type { FleetSession } from "./useFleetSessions";
+import { describeThrown } from "@/lib/utils";
 
 /**
  * Remote session tabs — the frontend half of plan
@@ -23,6 +24,14 @@ export interface RemoteTabIdentity {
   remoteTerminalId: string;
   /** True when the target still holds output OLDER than the attach seed. */
   historyAvailable: boolean;
+  /**
+   * The tenant whose credential minted this tab's grant, whenever the resolved
+   * scope named one — a tenant the opener stated, or the machine's pin when it
+   * stated none; `null`/absent for the device slot, and on every tab saved by a
+   * build that predates the field. A reattach sends it back so the fresh grant
+   * is minted in the tenant the session lives in.
+   */
+  tenant?: string | null;
 }
 
 /** Runner-local `TerminalInfo` + `remote`, as `terminal_attach_remote` returns. */
@@ -109,9 +118,11 @@ export function attachButtonState(
  * needs first, the detail is kept because it names the machine or grant.
  */
 export function attachErrorMessage(err: unknown): string {
-  const raw = err instanceof Error ? err.message : typeof err === "string" ? err : String(err);
-  const m = /^remote_attach:([a-z_]+)(?::([a-z_]+))?:\s*(.*)$/s.exec(raw.trim());
-  if (!m) return raw.trim() || "attach failed (no reason given)";
+  // describeThrown trims every shape and falls back on a blank cause, so `raw`
+  // is never empty and never carries leading whitespace.
+  const raw = describeThrown(err, "attach failed (no reason given)");
+  const m = /^remote_attach:([a-z_]+)(?::([a-z_]+))?:\s*(.*)$/s.exec(raw);
+  if (!m) return raw;
   const code = m[2] ? `${m[1]} (${m[2]})` : m[1];
   const detail = m[3]?.trim();
   return detail ? `${code} — ${detail}` : code;
@@ -477,4 +488,40 @@ export function remoteInteractivityFooter(
     noteKind = "warning";
   }
   return { summary: `${read} · ${write}`, note, noteKind };
+}
+
+// ---------------------------------------------------------------------------
+// Ending a remote session (plan
+// `2026-09-30-close-remote-sessions-from-the-local-runner`, Phase 3)
+// ---------------------------------------------------------------------------
+
+/**
+ * What ending a remote session came to — the wire vocabulary of the target's
+ * `terminal_ended`. `unknown` covers a timeout and a transport failure: it is
+ * NEVER to be rendered as ended.
+ */
+export type RemoteSessionEndOutcome =
+  | "ended"
+  | "refused"
+  | "still_running"
+  | "unknown"
+  | "not_found";
+
+/** Where the grant the end was sent under came from. */
+export type RemoteSessionEndGrantSource = "open_tab" | "minted" | "none";
+
+/**
+ * What `remote_session_end` returns (Rust `RemoteSessionEndResult`, serde
+ * camelCase). `via` says how an `ended` ended (`graceful` | `no_live_claude` |
+ * `force`); `reason` says why anything else did not.
+ */
+export interface RemoteSessionEndResult {
+  outcome: RemoteSessionEndOutcome;
+  deviceId: string;
+  sessionId: string;
+  /** The TARGET's terminal id, when the target reported one. */
+  terminalId: string | null;
+  via: string | null;
+  reason: string | null;
+  grantSource: RemoteSessionEndGrantSource;
 }

@@ -17,11 +17,51 @@ use super::{ipc_handler_get, ipc_handler_post};
 ipc_handler_get!(ui_bridge_get_intents_handler, "get_intents");
 ipc_handler_post!(ui_bridge_register_intent_handler, "register_intent");
 ipc_handler_post!(ui_bridge_find_intent_handler, "find_intent");
-ipc_handler_post!(ui_bridge_execute_intent_handler, "execute_intent");
+ipc_handler_post!(ui_bridge_execute_intent_handler_dispatch, "execute_intent");
+
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/ai/intents/execute`, `/control/intents/execute` are ONE `batch_action` (`intent:<id>`, the registered intent id).
+pub async fn ui_bridge_execute_intent_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::batch_kind(
+        &format!(
+            "intent:{}",
+            body.get("intentId")
+                .or_else(|| body.get("id"))
+                .or_else(|| body.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+        ),
+        None,
+    );
+    let result =
+        ui_bridge_execute_intent_handler_dispatch(State(Arc::clone(&state)), Json(body)).await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
 ipc_handler_post!(
-    ui_bridge_execute_intent_from_query_handler,
+    ui_bridge_execute_intent_from_query_handler_dispatch,
     "execute_intent_from_query"
 );
+
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `intents/execute-from-query` is ONE `batch_action` (`intent_query`); the query text is never recorded.
+pub async fn ui_bridge_execute_intent_from_query_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::batch_kind("intent_query", None);
+    let result =
+        ui_bridge_execute_intent_from_query_handler_dispatch(State(Arc::clone(&state)), Json(body))
+            .await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
 
 /// `DELETE /ui-bridge/control/intent/{name}` — delete a registered intent by
 /// name. SDK contract: `relayCommand('deleteIntent', { name })` returning
@@ -38,6 +78,26 @@ pub async fn ui_bridge_delete_intent_handler(
     super::request::wrap_ipc_result(ui_bridge_request_sync(&state, "delete_intent", payload).await)
 }
 
+/// Journey ledger choke point (plan
+/// 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time, M3):
+/// `/control/intent/{name}/execute` is ONE `batch_action` (`intent:<name>`,
+/// an app-registered intent name).
+pub async fn ui_bridge_execute_intent_by_name_handler(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let action = crate::journey::cursor::ActionSpec::batch_kind(&format!("intent:{name}"), None);
+    let result = ui_bridge_execute_intent_by_name_handler_dispatch(
+        State(Arc::clone(&state)),
+        axum::extract::Path(name),
+        Json(body),
+    )
+    .await;
+    crate::journey::capture::record_control_result(&state, &result, action);
+    result
+}
+
 /// `POST /ui-bridge/control/intent/{name}/execute` — execute a registered
 /// intent addressed by name in the URL. SDK contract:
 /// `POST /control/intent/:name/execute` (`types.ts`, handler `executeIntent`).
@@ -46,7 +106,7 @@ pub async fn ui_bridge_delete_intent_handler(
 /// the JSON body; this thin handler injects the `{name}` path segment into the
 /// body and dispatches the same `execute_intent` IPC, so both shapes honor the
 /// SDK contract without duplicating intent logic in the webview.
-pub async fn ui_bridge_execute_intent_by_name_handler(
+async fn ui_bridge_execute_intent_by_name_handler_dispatch(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
     Json(body): Json<serde_json::Value>,

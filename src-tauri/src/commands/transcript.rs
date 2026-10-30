@@ -44,30 +44,126 @@ fn collect_workspace_project_paths() -> Vec<String> {
 }
 
 /// Collect all transcript sessions across all project paths and config dirs, deduplicated.
+///
+/// Reads each config dir's `projects/` ONCE ([`transcript::ProjectsIndex`])
+/// and probes only the `(project, config dir)` pairs the index cannot rule out
+/// ([`transcript::select_pairs`]), instead of stat-ing every pair — measured
+/// 2026-10-18 at 744 x 18 = 13,392 pairs per scan on the operator box, nearly
+/// all misses (plan `2026-10-19-runner-transcript-scan-stats-and-logs-every-missing-project-dir`).
+/// Logs exactly one aggregate `transcript scan:` line per scan.
 fn collect_all_sessions(
     project_paths: &[String],
     config_dirs: &[std::path::PathBuf],
 ) -> Vec<transcript::TranscriptSession> {
+    let started = Instant::now();
+    let indexes: Vec<transcript::ProjectsIndex> = config_dirs
+        .iter()
+        .map(|dir| transcript::ProjectsIndex::read(dir))
+        .collect();
+    for (dir, index) in config_dirs.iter().zip(&indexes) {
+        if let transcript::ProjectsIndex::Unreadable(err) = index {
+            warn_unreadable_projects_once(dir, err);
+        }
+    }
+    let selection = transcript::select_pairs(project_paths, &indexes);
+
     let mut all_sessions = Vec::new();
     let mut seen_ids = std::collections::HashSet::new();
 
-    for project in project_paths {
-        for dir in config_dirs {
-            match transcript::list_sessions(dir, project) {
-                Ok(sessions) => {
-                    for session in sessions {
-                        if seen_ids.insert(session.session_id.clone()) {
-                            all_sessions.push(session);
-                        }
+    // `select_pairs` emits project-major, config-dir-minor — the order the
+    // exhaustive loop used — so dedup still keeps the same first copy.
+    for &(path_idx, dir_idx) in &selection.pairs {
+        let (project, dir) = (&project_paths[path_idx], &config_dirs[dir_idx]);
+        match transcript::list_sessions(dir, project) {
+            Ok(sessions) => {
+                for session in sessions {
+                    if seen_ids.insert(session.session_id.clone()) {
+                        all_sessions.push(session);
                     }
                 }
-                Err(e) => warn!("Failed to list sessions in {:?}: {}", dir, e),
             }
+            Err(e) => warn!("Failed to list sessions in {:?}: {}", dir, e),
         }
     }
 
     all_sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+
+    let absent = indexes
+        .iter()
+        .filter(|i| matches!(i, transcript::ProjectsIndex::Absent))
+        .count();
+    let unreadable = indexes
+        .iter()
+        .filter(|i| matches!(i, transcript::ProjectsIndex::Unreadable(_)))
+        .count();
+    debug!(
+        "{}",
+        scan_summary_line(
+            project_paths.len(),
+            config_dirs.len(),
+            absent,
+            unreadable,
+            &selection,
+            all_sessions.len(),
+            started.elapsed(),
+        )
+    );
     all_sessions
+}
+
+/// The one aggregate line a transcript scan logs. Pure, so its wording is
+/// pinned by a test.
+fn scan_summary_line(
+    project_paths: usize,
+    config_dirs: usize,
+    absent: usize,
+    unreadable: usize,
+    selection: &transcript::PairSelection,
+    sessions: usize,
+    elapsed: Duration,
+) -> String {
+    format!(
+        "transcript scan: {project_paths} project paths x {config_dirs} config dirs \
+         ({absent} without projects/, {unreadable} unreadable) — probed {} pairs \
+         ({} unreadable-dir, {} long-name), skipped {}, {sessions} sessions, {} ms",
+        selection.pairs.len(),
+        selection.probed_unreadable,
+        selection.probed_long_name,
+        selection.skipped_absent,
+        elapsed.as_millis(),
+    )
+}
+
+/// Warn about an unreadable `projects/` the FIRST time a given config dir is
+/// seen that way in this process. A persistently unreadable dir is probed in
+/// full on every scan (its contents are UNKNOWN), but must not become a new
+/// per-scan log flood.
+fn warn_unreadable_projects_once(config_dir: &std::path::Path, err: &str) {
+    static WARNED: OnceLock<StdMutex<std::collections::HashSet<std::path::PathBuf>>> =
+        OnceLock::new();
+    let first = first_sighting(
+        &mut WARNED
+            .get_or_init(|| StdMutex::new(std::collections::HashSet::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        config_dir,
+    );
+    if first {
+        warn!(
+            "transcript scan: {:?}/projects is unreadable ({}); probing every project path under it",
+            config_dir, err
+        );
+    }
+}
+
+/// `true` only the first time `config_dir` is seen in `seen` — the pure half
+/// of [`warn_unreadable_projects_once`], so the once-guard is testable without
+/// the process-global set.
+fn first_sighting(
+    seen: &mut std::collections::HashSet<std::path::PathBuf>,
+    config_dir: &std::path::Path,
+) -> bool {
+    seen.insert(config_dir.to_path_buf())
 }
 
 // ── Scan cache (last-known-good + off-runtime refresh) ───────────────────────
@@ -1536,6 +1632,7 @@ mod tests {
     /// each other's entry. Every test that touches the cache takes this first.
     static CACHE_TESTS_ARE_SERIAL: StdMutex<()> = StdMutex::new(());
 
+    // test-lock: standalone — module-private; its holders take no other test lock and never touch env
     fn cache_test_guard() -> std::sync::MutexGuard<'static, ()> {
         CACHE_TESTS_ARE_SERIAL
             .lock()
@@ -2110,5 +2207,205 @@ mod tests {
             !production.contains("tokio::time::sleep("),
             "tokio::time::sleep is back on the scan path — same defect class"
         );
+    }
+
+    // ── Plan 2026-10-19-runner-transcript-scan-stats-and-logs-every-missing-project-dir ──
+
+    /// Run `f` under a THREAD-LOCAL fmt subscriber at `level` and return what
+    /// it logged. Never a global subscriber: the harness runs tests in
+    /// parallel and a global one can only be set once per process.
+    fn capture_at<R>(level: tracing::Level, f: impl FnOnce() -> R) -> (R, String) {
+        use std::io::Write;
+
+        #[derive(Clone, Default)]
+        struct Sink(Arc<StdMutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let sink = Sink::default();
+        let buf = sink.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink)
+            .with_ansi(false)
+            .with_max_level(level)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let text =
+            String::from_utf8_lossy(&buf.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
+        (out, text)
+    }
+
+    /// Three config dirs: A holds the project dirs of `present` paths (EMPTY —
+    /// no `.jsonl`, so the walk never fires the walk probe and no session
+    /// cache entry is touched), B has an empty `projects/`, C has none.
+    fn scan_fixture(
+        root: &std::path::Path,
+        n_paths: usize,
+        present: &[usize],
+    ) -> (Vec<String>, Vec<std::path::PathBuf>) {
+        let dirs: Vec<std::path::PathBuf> = ["cfg-a", "cfg-b", "cfg-c"]
+            .iter()
+            .map(|d| root.join(d))
+            .collect();
+        std::fs::create_dir_all(dirs[1].join("projects")).unwrap();
+        std::fs::create_dir_all(&dirs[2]).unwrap();
+        let paths: Vec<String> = (0..n_paths)
+            .map(|i| {
+                root.join(format!("proj-{i:03}"))
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        for &i in present {
+            // The project dir through the production encoder (never a copy of
+            // it): the parent of where its transcripts would live.
+            let file = transcript::session_transcript_path(&dirs[0], &paths[i], "unused");
+            std::fs::create_dir_all(file.parent().expect("a project dir")).unwrap();
+        }
+        (paths, dirs)
+    }
+
+    /// The scan's log volume is O(1) per scan, independent of how many
+    /// project paths it covers. Captured at TRACE, so the demoted per-miss
+    /// line would still be visible if the exhaustive loop came back.
+    ///
+    /// Mutation: restore the exhaustive `for project { for dir { list_sessions } }`
+    /// loop and the N = 500 run captures 1,498 `No project directory found`
+    /// trace lines (500 paths x 3 dirs, minus the 2 present pairs) — red.
+    #[test]
+    fn a_transcript_scan_logs_o1_lines_regardless_of_project_count() {
+        let mut counts = Vec::new();
+        for n in [10usize, 500] {
+            let temp = tempfile::tempdir().unwrap();
+            let (paths, dirs) = scan_fixture(temp.path(), n, &[3, 7]);
+            let (sessions, logged) = capture_at(tracing::Level::TRACE, || {
+                collect_all_sessions(&paths, &dirs)
+            });
+            assert!(sessions.is_empty(), "the fixture holds no transcripts");
+
+            let ours: Vec<&str> = logged
+                .lines()
+                .filter(|l| {
+                    l.contains("qontinui_runner::terminal::transcript")
+                        || l.contains("qontinui_runner::commands::transcript")
+                })
+                .collect();
+            assert!(
+                ours.len() <= 3,
+                "N={n}: the scan logged {} lines, expected O(1):\n{}",
+                ours.len(),
+                ours.join("\n")
+            );
+            let summaries: Vec<&&str> = ours
+                .iter()
+                .filter(|l| l.contains("transcript scan:"))
+                .collect();
+            assert_eq!(
+                summaries.len(),
+                1,
+                "N={n}: exactly one aggregate line per scan:\n{logged}"
+            );
+            assert!(
+                summaries[0].contains("probed 2 pairs"),
+                "N={n}: the aggregate line must report the 2 present pairs: {}",
+                summaries[0]
+            );
+            assert!(
+                summaries[0].contains(&format!(
+                    "{n} project paths x 3 config dirs (1 without projects/, 0 unreadable)"
+                )),
+                "N={n}: {}",
+                summaries[0]
+            );
+            counts.push(ours.len());
+        }
+        assert_eq!(
+            counts[0], counts[1],
+            "log volume must not grow with project count"
+        );
+    }
+
+    /// Entered through `get_latest_session_id` — a periodic caller that still
+    /// reaches `list_sessions`' miss branch (its no-`.claude.json` fallback),
+    /// so this observes the demotion where that population enters.
+    ///
+    /// Mutation: change the miss line in `list_sessions` back to `debug!`
+    /// and this captures one line — red.
+    #[test]
+    fn a_missing_project_dir_logs_nothing_at_debug() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("projects")).unwrap();
+        let missing = temp
+            .path()
+            .join("never-opened")
+            .to_string_lossy()
+            .to_string();
+        let (latest, logged) = capture_at(tracing::Level::DEBUG, || {
+            transcript::get_latest_session_id(temp.path(), &missing, None)
+        });
+        assert!(latest.is_none(), "an absent project has no latest session");
+        assert_eq!(
+            logged, "",
+            "a miss must log nothing at DEBUG, got:\n{logged}"
+        );
+    }
+
+    /// The aggregate line's wording is the observable the plan's arming check
+    /// greps the runner log for, so it is pinned literally.
+    #[test]
+    fn the_scan_summary_line_names_inputs_and_outcome() {
+        let selection = transcript::PairSelection {
+            pairs: vec![(0, 0), (4, 2)],
+            skipped_absent: 13_390,
+            probed_unreadable: 0,
+            probed_long_name: 0,
+        };
+        assert_eq!(
+            scan_summary_line(744, 18, 3, 0, &selection, 57, Duration::from_millis(42)),
+            "transcript scan: 744 project paths x 18 config dirs (3 without projects/, 0 unreadable) \
+             — probed 2 pairs (0 unreadable-dir, 0 long-name), skipped 13390, 57 sessions, 42 ms"
+        );
+        let with_reasons = transcript::PairSelection {
+            pairs: vec![(0, 0), (1, 1), (2, 1)],
+            skipped_absent: 5,
+            probed_unreadable: 2,
+            probed_long_name: 1,
+        };
+        assert_eq!(
+            scan_summary_line(3, 2, 0, 1, &with_reasons, 0, Duration::from_millis(7)),
+            "transcript scan: 3 project paths x 2 config dirs (0 without projects/, 1 unreadable) \
+             — probed 3 pairs (2 unreadable-dir, 1 long-name), skipped 5, 0 sessions, 7 ms"
+        );
+    }
+
+    /// The warn-once guard: a persistently unreadable `projects/` warns on the
+    /// first scan only, per config dir.
+    ///
+    /// Mutation: make `first_sighting` return `true` unconditionally and the
+    /// second assert goes red.
+    #[test]
+    fn an_unreadable_projects_dir_is_reported_once_per_config_dir() {
+        let mut seen = std::collections::HashSet::new();
+        let a = std::path::Path::new("cfg-a");
+        let b = std::path::Path::new("cfg-b");
+        assert!(first_sighting(&mut seen, a));
+        assert!(!first_sighting(&mut seen, a));
+        assert!(first_sighting(&mut seen, b));
     }
 }

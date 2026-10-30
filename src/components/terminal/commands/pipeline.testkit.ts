@@ -54,6 +54,7 @@ import { resolve } from "./resolve";
 import type { CommandAction } from "./types";
 import { callRegistry } from "./uibridge";
 import { renderCommandStatus, type RenderedStatus } from "./verdict";
+import { describeThrown } from "@/lib/utils";
 
 /** Which resolver route Enter would actually take. */
 export type Route =
@@ -312,7 +313,7 @@ export async function runViaRegistryRoute(
       status: renderCommandStatus(action.slash, value),
     };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    const message = describeThrown(err, "command threw");
     return {
       ...base,
       verdict: "threw",

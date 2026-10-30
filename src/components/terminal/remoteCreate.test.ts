@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 import {
   createButtonState,
   describeRemoteCreateFailure,
+  EMPTY_CREATE_NO_TENANT_REASON,
+  emptyCreateTargets,
   fleetDeviceCreateId,
   type RemoteCreateErrorWire,
 } from "./remoteCreate";
@@ -196,6 +198,43 @@ describe("describeRemoteCreateFailure", () => {
     expect(unknownCode.explanation).toBe("who knows");
   });
 
+  /**
+   * The target's coord device drain refuses before either create dial is
+   * consulted, so the panel must not send the operator to a dial — and must
+   * keep "drained" apart from "could not tell".
+   */
+  it("names a drained target without blaming the create dial", () => {
+    const r = describeRemoteCreateFailure({
+      stage: "create",
+      code: "device_drained",
+      message:
+        "coord has drained this device (rebuild) — this remote terminal create was refused, not queued; nothing was spawned",
+    });
+    expect(r.headline).toMatch(/drained/);
+    expect(r.explanation).toMatch(/^coord has drained this device \(rebuild\)/);
+    const remedy = r.remedy.join("\n");
+    expect(remedy).toMatch(/Nothing was spawned/);
+    expect(remedy).toMatch(/not the create dial/);
+    expect(remedy).not.toContain("settings.json");
+    expect(r.strandedTerminalId).toBeNull();
+  });
+
+  it("keeps an unreadable drain state apart from a drained one", () => {
+    const r = describeRemoteCreateFailure({
+      stage: "create",
+      code: "drain_unreadable",
+      message:
+        "coord drain state unknown (coord drain state not read yet) — this remote terminal create was refused, not queued; nothing was spawned",
+    });
+    expect(r.headline).toMatch(/cannot read its own drain state/);
+    expect(r.headline).not.toMatch(/drained/);
+    const remedy = r.remedy.join("\n");
+    expect(remedy).toMatch(/fails closed/);
+    expect(remedy).toMatch(/Nothing was spawned/);
+    expect(remedy).not.toContain("settings.json");
+    expect(r.strandedTerminalId).toBeNull();
+  });
+
   /** A relay-side failure says the grant is spent and a terminal may exist. */
   it("says a timed-out create may still have spawned something", () => {
     const r = describeRemoteCreateFailure({
@@ -230,5 +269,56 @@ describe("createButtonState", () => {
 describe("fleetDeviceCreateId", () => {
   it("is per-device so two groups are not one control", () => {
     expect(fleetDeviceCreateId("a")).not.toBe(fleetDeviceCreateId("b"));
+  });
+});
+
+describe("emptyCreateTargets — a merged empty state never creates under an unchosen tenant", () => {
+  const A = "aaaaaaaa-0000-4000-8000-00000000000a";
+  const B = "bbbbbbbb-0000-4000-8000-00000000000b";
+  const short = (t: string) => t.slice(0, 8);
+
+  it("offers ONE create under the tenant a single-tenant read presented, as before", () => {
+    expect(
+      emptyCreateTargets({
+        merged: false,
+        singleTenant: A,
+        answeredTenants: [A],
+        shortTenant: short,
+      }),
+    ).toEqual({ targets: [{ tenant: A, tenantLabel: null }], disabledReason: null });
+    expect(
+      emptyCreateTargets({
+        merged: false,
+        singleTenant: null,
+        answeredTenants: [],
+        shortTenant: short,
+      }).targets,
+    ).toEqual([{ tenant: null, tenantLabel: null }]);
+  });
+
+  it("offers one create PER answered tenant in a merged read, each naming its tenant", () => {
+    const out = emptyCreateTargets({
+      merged: true,
+      singleTenant: A,
+      answeredTenants: [A, B, A],
+      shortTenant: short,
+    });
+    expect(out.targets).toEqual([
+      { tenant: A, tenantLabel: "aaaaaaaa" },
+      { tenant: B, tenantLabel: "bbbbbbbb" },
+    ]);
+    expect(out.disabledReason).toBeNull();
+  });
+
+  it("never sends null in a merged read — an unnamed or absent tenant is skipped, then disabled with a reason", () => {
+    const out = emptyCreateTargets({
+      merged: true,
+      singleTenant: null,
+      answeredTenants: [null, "  "],
+      shortTenant: short,
+    });
+    expect(out.targets).toEqual([]);
+    expect(out.disabledReason).toBe(EMPTY_CREATE_NO_TENANT_REASON);
+    expect(out.disabledReason).toMatch(/^choose a tenant to create in/);
   });
 });

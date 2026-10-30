@@ -21,6 +21,27 @@
 # inheritance (the User-env value was not inherited by all contexts).
 SCCACHE_SERVER_PORT = { value = "4230", force = false }
 
+# The PostgreSQL release that `postgresql_embedded`'s `bundled` build script
+# embeds in the binary. Unset, the build script resolves "*", meaning the newest
+# theseus-rs/postgresql-binaries release at build time, so a fresh build ships
+# whatever upstream published last. On 2026-10-18 21:15Z upstream published
+# 18.6.1. Its Linux binaries need GLIBC 2.36, and ubuntu-22.04 has 2.35 (so does
+# any user on an older glibc). Every embedded_pg test on the ubuntu-22.04 CI leg
+# then failed at initdb (coord finding ed52d2f3).
+#
+# The value is an EXACT requirement, so a version bump is a deliberate edit here.
+# `embedded_pg::tests::bundled_postgres_is_the_pinned_release` reads this line
+# and fails when the binary embeds anything else, and
+# scripts/ci/purge-stale-bundled-postgres.mjs reads it to drop cached build units
+# that embed another release. Keep the `NAME = "=X.Y.Z"` shape, which both of
+# them parse. A MAJOR bump also needs an upgrade path for users' existing
+# cluster data dirs. An explicit POSTGRESQL_VERSION in the environment still
+# wins (`[env]` does not force by default). Cargo reads this file only for runs
+# started under src-tauri/ (every runner build today). A root-level cargo
+# command that compiles postgresql_embedded would float again, so move the pin
+# into a root .cargo/config.toml if one is ever added.
+POSTGRESQL_VERSION = "=18.6.0"
+
 # Increase linker stack size to prevent STATUS_STACK_BUFFER_OVERRUN
 # when linking the large test binary on Windows. Default MSVC stack is
 # 1 MB; this binary needs more due to deep async-graphql type expansion
@@ -73,7 +94,8 @@ SCCACHE_SERVER_PORT = { value = "4230", force = false }
 # See plans/2026-05-14-fleet-topology-and-build-pool-design.md §3.5 +
 # Row 2 Phase 3.
 # /STACK is ALSO emitted by src-tauri/build.rs (cargo:rustc-link-arg-bins), so
-# a cargo run that misses this file still gets it -- keep the two values equal.
+# a cargo run that misses this file still gets it -- keep the two values equal
+# (build.rs `stack_reserve_tests` fails `cargo test` when they drift).
 [target.x86_64-pc-windows-msvc]
 rustflags = [
     "-C", "link-args=/STACK:8388608 /Brepro",

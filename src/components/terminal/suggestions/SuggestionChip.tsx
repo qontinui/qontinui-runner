@@ -16,6 +16,7 @@ import { X } from "lucide-react";
 
 import { callRegistry } from "../commands";
 import { useSuggestionForZone } from "./useSuggestions";
+import { describeThrown } from "@/lib/utils";
 
 interface Props {
   zoneIdx: number;
@@ -36,7 +37,7 @@ export function SuggestionChip({ zoneIdx }: Props) {
       // even if the underlying state hasn't yet flipped.
       dismiss();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "Suggestion action failed");
       setError(msg);
       // Auto-clear the error after 3s so the chip returns to its
       // normal copy.

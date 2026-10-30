@@ -1,15 +1,18 @@
-//! Degraded-boot PostgreSQL guard (D2).
+//! PostgreSQL availability guard.
 //!
-//! When the runner boots degraded -- either a configured external PG was
-//! unreachable and `QONTINUI_ALLOW_NO_DB=1` opted into degrading instead of
-//! panicking, or the BUNDLED cluster failed to start or connect -- and PG is
-//! unreachable (`main.rs` degraded path), [`crate::database::pg::pg_available`]
-//! is `false`. This middleware then short-circuits requests to DB-backed routes
-//! with a clean `503 {success:false, code:"DATABASE_UNAVAILABLE"}` envelope
-//! instead of letting them reach a handler that would hit a pool with no live
-//! backend. Once the background reconnect probe (`PgDb::spawn_reconnect_probe`)
-//! re-establishes PG, `pg_available()` flips back to true and the guard becomes
-//! a no-op again.
+//! [`crate::database::pg::pg_available`] is `false` while the global pool's
+//! circuit breaker is not Closed (plan
+//! `2026-10-19-runner-pg-unreachable-costs-every-caller-a-pool-timeout`): on a
+//! DEGRADED BOOT -- a configured external PG was unreachable and
+//! `QONTINUI_ALLOW_NO_DB=1` opted into degrading instead of panicking, or the
+//! BUNDLED cluster failed to start or connect -- AND at RUNTIME, from the first
+//! connect-class failure until the breaker's background prober reconnects.
+//! This middleware then short-circuits requests to DB-backed routes with a
+//! `503 {success:false, code:"DATABASE_UNAVAILABLE"}` envelope that names the
+//! breaker's own facts (`cause`, `causeClass`, `since`, `retryAfterMs`,
+//! `lastError`, plus a `Retry-After` header) instead of letting them reach a
+//! handler. Once the prober reconnects, `pg_available()` flips back to true and
+//! the guard is a no-op again.
 //!
 //! ## Comprehensive, but fail-safe
 //!
@@ -20,11 +23,14 @@
 //! but `/sessions/*/message` is not). [`DB_EXEMPT`] lists the few DB-FREE routes
 //! that live UNDER a DB prefix (e.g. `/findings/summary`) so they keep working.
 //!
-//! Errs toward NOT 503-ing: a route we fail to list still fails safely (its
-//! handler returns its own error when the pool can't connect — connection-
-//! refused is immediate on a dead `localhost:5432`, no hang), so a miss is a raw
-//! 500, never a hang or a broken DB-free route. The control surface, vision
-//! capture, health, and the route manifest are never matched.
+//! Errs toward NOT 503-ing: a route we fail to list still fails safely, so a
+//! miss is a raw 500, never a hang or a broken DB-free route. Its handler gets
+//! the pool's own immediate `DATABASE_UNAVAILABLE` error while the breaker is
+//! open. (This used to read "connection-refused is immediate on a dead
+//! `localhost:5432`, no hang". That is false on Windows, where a connect to a
+//! closed loopback port costs ~2 s of SYN retries per resolved address; the
+//! breaker, not the OS, is what makes the miss cheap.) The control surface,
+//! vision capture, health, and the route manifest are never matched.
 //!
 //! ## Cost
 //!
@@ -35,6 +41,7 @@
 use axum::{extract::Request, http::StatusCode, middleware::Next, response::Response, Json};
 
 use crate::mcp::types::ApiResponse;
+use qontinui_runner_lib::pg_circuit::DbUnavailable;
 
 /// Route families that are ENTIRELY DB-backed — every route at or under the
 /// prefix requires PG. Matched segment-wise (so `/workers` matches `/workers`
@@ -112,7 +119,7 @@ const DB_BACKED_PREFIXES: &[&str] = &[
     "/state-discovery",
     "/co-occurrence",
     "/spec-check",
-    "/apps", // spec_api (exempt: /apps/*/spec/health, /apps/*/spec/subscribe)
+    "/apps", // spec_api + journey (exempt: /apps/*/spec/health, /apps/*/spec/subscribe, /apps/*/journey/health)
     "/hitl",
     "/restate/awakeables",
     "/trace", // trace_api (exempt: /trace/health)
@@ -196,6 +203,7 @@ const DB_EXEMPT: &[&str] = &[
     "/trace/health",               // under /trace
     "/apps/*/spec/health",         // under /apps
     "/apps/*/spec/subscribe",      // under /apps
+    "/apps/*/journey/health",      // under /apps; answers from in-process counters
 ];
 
 /// Segment-wise match. `pattern` and `path` are split on `/` (leading/trailing
@@ -239,33 +247,69 @@ pub fn route_requires_db(path: &str) -> bool {
     DB_BACKED_EXACT.iter().any(|e| seg_match(e, path, false))
 }
 
-/// The canonical `503 database unavailable` JSON envelope.
-fn db_unavailable_response(path: &str) -> Response {
+/// The human-readable reason, worded by what the breaker actually knows: a
+/// degraded boot, a refused connect, or a connect that merely TIMED OUT (which
+/// is not evidence the database is down, so it never says "unreachable").
+fn unavailable_message(path: &str, facts: Option<&DbUnavailable>) -> String {
+    let reason = facts
+        .map(DbUnavailable::reason)
+        .unwrap_or_else(|| "PostgreSQL is not available".to_string());
+    format!("database unavailable — {reason}; route {path} requires the database")
+}
+
+/// The canonical `503 database unavailable` JSON envelope: the ApiResponse
+/// error shape plus the breaker's facts, and a `Retry-After` header (whole
+/// seconds, rounded up) when the next reconnect attempt is scheduled.
+fn db_unavailable_response(path: &str, facts: Option<DbUnavailable>) -> Response {
     use axum::response::IntoResponse;
 
     let body = ApiResponse::<()>::error_with_code(
-        format!(
-            "database unavailable — this runner booted degraded (a configured \
-             PostgreSQL was unreachable, or the bundled cluster did not start); \
-             route {path} requires the database"
-        ),
+        unavailable_message(path, facts.as_ref()),
         "DATABASE_UNAVAILABLE",
     );
-    (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+    let mut json = serde_json::to_value(&body).unwrap_or_else(|_| serde_json::json!({}));
+    let retry_after = facts.as_ref().and_then(|f| f.retry_after);
+    if let (Some(obj), Some(f)) = (json.as_object_mut(), facts.as_ref()) {
+        obj.insert("cause".into(), serde_json::json!(f.cause));
+        obj.insert(
+            "causeClass".into(),
+            serde_json::json!(f.cause_class.as_str()),
+        );
+        obj.insert(
+            "since".into(),
+            serde_json::json!(f.since.map(qontinui_runner_lib::pg_circuit::rfc3339)),
+        );
+        obj.insert(
+            "retryAfterMs".into(),
+            serde_json::json!(f.retry_after.map(|d| d.as_millis() as u64)),
+        );
+        obj.insert("lastError".into(), serde_json::json!(f.last_error));
+    }
+    let mut response = (StatusCode::SERVICE_UNAVAILABLE, Json(json)).into_response();
+    if let Some(d) = retry_after {
+        let secs = d.as_millis().div_ceil(1000).max(1) as u64;
+        if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, v);
+        }
+    }
+    response
 }
 
 /// `axum::middleware::from_fn` guard. See module docs.
 pub async fn pg_degraded_guard_middleware(req: Request, next: Next) -> Response {
-    // Fast path: PG is available — straight through, one atomic load.
+    // Fast path: the breaker is Closed — straight through, one atomic load.
     if crate::database::pg::pg_available() {
         return next.run(req).await;
     }
 
-    // Degraded boot: 503 the DB-backed routes; pass everything else
+    // Breaker open (degraded boot or a runtime outage): 503 the DB-backed
+    // routes; pass everything else
     // (health, control surface, vision capture, route manifest, ...).
     let path = req.uri().path();
     if route_requires_db(path) {
-        return db_unavailable_response(path);
+        return db_unavailable_response(path, crate::database::pg::pg_unavailable_facts());
     }
     next.run(req).await
 }
@@ -362,12 +406,90 @@ mod tests {
             "/trace/health",
             "/apps/myapp/spec/health",
             "/apps/myapp/spec/subscribe",
+            "/apps/myapp/journey/health",
             // Segment-boundary lookalikes must NOT match.
             "/task-runs-archive",
             "/reviewsx",
         ] {
             assert!(!route_requires_db(p), "expected DB-free: {p}");
         }
+    }
+
+    async fn body_json(r: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn facts(cause: &str, class: qontinui_runner_lib::pg_circuit::CauseClass) -> DbUnavailable {
+        DbUnavailable {
+            since: Some(std::time::SystemTime::UNIX_EPOCH),
+            cause: cause.to_string(),
+            cause_class: class,
+            last_error: Some("error connecting to server".to_string()),
+            retry_after: Some(std::time::Duration::from_millis(1500)),
+            connect_timeout: Some(std::time::Duration::from_secs(5)),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_503_body_carries_the_breakers_facts_and_a_retry_after_header() {
+        use qontinui_runner_lib::pg_circuit::{CauseClass, CAUSE_RUNTIME};
+        let r = db_unavailable_response(
+            "/task-runs",
+            Some(facts(CAUSE_RUNTIME, CauseClass::ConnectRefused)),
+        );
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            r.headers().get(axum::http::header::RETRY_AFTER).unwrap(),
+            "2",
+            "1500 ms rounds up to 2 s"
+        );
+        let j = body_json(r).await;
+        assert_eq!(j["code"], "DATABASE_UNAVAILABLE");
+        assert_eq!(j["success"], false);
+        assert_eq!(j["cause"], "runtime");
+        assert_eq!(j["causeClass"], "connect_refused");
+        assert_eq!(j["since"], "1970-01-01T00:00:00Z");
+        assert_eq!(j["retryAfterMs"], 1500);
+        assert_eq!(j["lastError"], "error connecting to server");
+        let msg = j["error"].as_str().unwrap();
+        assert!(msg.contains("unreachable"), "{msg}");
+        assert!(
+            !msg.contains("booted"),
+            "a runtime outage is not a degraded boot: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_cause_is_worded_by_what_the_breaker_knows() {
+        use qontinui_runner_lib::pg_circuit::{CauseClass, CAUSE_BOOT, CAUSE_RUNTIME};
+        let boot = body_json(db_unavailable_response(
+            "/x",
+            Some(facts(CAUSE_BOOT, CauseClass::Unknown)),
+        ))
+        .await;
+        assert!(boot["error"]
+            .as_str()
+            .unwrap()
+            .contains("booted without its database"));
+        assert_eq!(boot["cause"], "boot");
+        let timeout = body_json(db_unavailable_response(
+            "/x",
+            Some(facts(CAUSE_RUNTIME, CauseClass::ConnectTimeout)),
+        ))
+        .await;
+        let msg = timeout["error"].as_str().unwrap();
+        assert!(msg.contains("did not answer within 5000 ms"), "{msg}");
+        assert!(
+            !msg.contains("unreachable"),
+            "a timeout is not unreachability: {msg}"
+        );
+        assert_eq!(timeout["causeClass"], "connect_timeout");
+        // No facts (no global PgDb): the envelope still answers, with no header.
+        let r = db_unavailable_response("/x", None);
+        assert!(r.headers().get(axum::http::header::RETRY_AFTER).is_none());
+        let none = body_json(r).await;
+        assert_eq!(none["code"], "DATABASE_UNAVAILABLE");
     }
 
     #[test]

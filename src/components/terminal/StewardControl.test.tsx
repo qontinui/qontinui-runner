@@ -10,12 +10,12 @@
 
 import { describe, it, expect } from "vitest";
 import type { StewardStatus } from "./StewardControl";
+import { describeThrown } from "@/lib/utils";
 import {
   buildStewardUrl,
   buildStewardsUrl,
   formatRunningSummary,
   formatUptime,
-  invokeErrorDetail,
   readErrorDetail,
 } from "./StewardControl";
 
@@ -174,16 +174,24 @@ describe("formatRunningSummary", () => {
   });
 });
 
-describe("invokeErrorDetail", () => {
+// The action's catch site reports `describeThrown(e, "request failed")`: a
+// Tauri command's `Err(String)` rejects with the bare string (the
+// `steward_start` refusals), `fetch` with an `Error`, and an object rejection
+// must surface its own reason instead of collapsing to the fallback.
+describe('describeThrown(e, "request failed") at the steward action catch site', () => {
   it("surfaces a Tauri command's refusal string verbatim (steward_start)", () => {
-    expect(invokeErrorDetail("409: coord has drained this device")).toBe(
+    expect(describeThrown("409: coord has drained this device", "request failed")).toBe(
       "409: coord has drained this device",
     );
   });
 
-  it("uses an Error's message and falls back for anything else", () => {
-    expect(invokeErrorDetail(new Error("network down"))).toBe("network down");
-    expect(invokeErrorDetail(undefined)).toBe("request failed");
-    expect(invokeErrorDetail("")).toBe("request failed");
+  it("uses an Error's message and falls back for an empty cause", () => {
+    expect(describeThrown(new Error("network down"), "request failed")).toBe("network down");
+    expect(describeThrown(undefined, "request failed")).toBe("request failed");
+    expect(describeThrown("", "request failed")).toBe("request failed");
+  });
+
+  it("surfaces an object rejection's reason instead of dropping it", () => {
+    expect(describeThrown({ error: "coord drained" }, "request failed")).toBe("coord drained");
   });
 });

@@ -21,6 +21,7 @@ import {
   disconnectAiClient,
   listAiClients,
 } from "@/lib/wrappers/clients-api";
+import { describeThrown } from "@/lib/utils";
 
 const MCP_KEY = "qontinui-wrappers";
 
@@ -51,7 +52,7 @@ export function AiClientsTab() {
       setLoadError(null);
     } catch (err) {
       if (!mountedRef.current) return;
-      setLoadError(err instanceof Error ? err.message : String(err));
+      setLoadError(describeThrown(err, "Failed to load AI clients"));
     } finally {
       if (mountedRef.current) setLoading(false);
     }
@@ -94,7 +95,7 @@ export function AiClientsTab() {
         if (!mountedRef.current) return;
         setActionError((prev) => ({
           ...prev,
-          [info.id]: err instanceof Error ? err.message : String(err),
+          [info.id]: describeThrown(err, "Failed to connect AI client"),
         }));
       } finally {
         if (mountedRef.current) setBusyFor(info.id, false);
@@ -116,7 +117,7 @@ export function AiClientsTab() {
         if (!mountedRef.current) return;
         setActionError((prev) => ({
           ...prev,
-          [info.id]: err instanceof Error ? err.message : String(err),
+          [info.id]: describeThrown(err, "Failed to disconnect AI client"),
         }));
       } finally {
         if (mountedRef.current) setBusyFor(info.id, false);
@@ -366,8 +367,7 @@ function DetailsPanel({ info }: { info: ClientInfo }) {
   const driftedCommand =
     info.connection.kind === "Drifted" ? info.connection.current_command : null;
   const driftedPort = info.connection.kind === "Drifted" ? info.connection.current_port : null;
-  const parseErrorPath =
-    info.connection.kind === "ConfigParseError" ? info.connection.path : null;
+  const parseErrorPath = info.connection.kind === "ConfigParseError" ? info.connection.path : null;
 
   return (
     <div className="rounded-md border border-border bg-background/40 p-3 text-xs space-y-3">

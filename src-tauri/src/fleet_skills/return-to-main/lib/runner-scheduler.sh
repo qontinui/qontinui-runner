@@ -35,6 +35,9 @@
 #   task              {"task_type":"RemoteAgent", prompt, working_directory,
 #                     max_turns, timeout_seconds}. The runner's own defaults
 #                     (50 turns, 600 s) apply only when these are unset.
+#                     With RS_COMMAND set (see CONTRACT) it is instead
+#                     {"task_type":"Script", command, working_directory,
+#                     timeout_seconds}.
 #   working_directory <workspace-root>, in the native (`cygpath -w`, backslash)
 #                     spelling on Windows, because the runner hands it to a
 #                     native process.
@@ -55,6 +58,15 @@
 #   SCRIPT_DIR        the caller's own directory (root resolution starts there)
 #   prompt_mode()     a function mapping an UNESCAPED prompt to the mode word
 #                     the reports print (`act` / `shadow`, `write` / `report`)
+#   RS_ABSENT_NOTE    OPTIONAL: one extra line --check prints (indented) when the
+#                     task is ABSENT, before the fix -- a machine-greppable state
+#                     line such as `lane: not_installed` (schedule-reverify-
+#                     shipped.sh). Unset prints nothing extra.
+#   RS_PRESENT_NOTE   OPTIONAL: the same, printed when the task is PRESENT.
+#   RS_EMPTY_NOTE     OPTIONAL: printed INSTEAD of RS_ABSENT_NOTE when the list
+#                     was EMPTY -- the runner answers an empty list when its own
+#                     database read fails too, so absent there is not proven
+#                     (e.g. `lane: unknown`). Unset falls back to RS_ABSENT_NOTE.
 # After parsing it sets AT (HH:MM) -- or RS_CRON, a whole 5-field cron that
 # overrides AT for a cadence that is not once a day --, ROOT_ARG, DISABLED, PROMPT, MAX_TURNS,
 # TIMEOUT_SECONDS and DESC. Two optional overrides, for a schedule that is not
@@ -78,6 +90,14 @@
 #                     and exit with its own code (return-to-main uses it to
 #                     refuse a probe-gated task on a runner that no longer
 #                     enforces the probe).
+#   RS_COMMAND        a shell command: the task becomes a `Script` task the
+#                     runner runs in-binary (no Claude session), recording
+#                     success = exit code 0. PROMPT then stays only the
+#                     prompt_mode() source and is not sent; MAX_TURNS is
+#                     unused. Unset (every caller but
+#                     schedule-fleet-bundle-sync.sh), nothing changes. Set it
+#                     AFTER sourcing this file, which unsets it, so an
+#                     exported value from the environment is never honoured.
 # Then it calls:
 #   rs_resolve_workdir  -> ROOT, WORKDIR (skipped for --uninstall)
 #   rs_build_bodies     -> CRON, WANT_ENABLED, CREATE_BODY, UPDATE_BODY
@@ -130,6 +150,10 @@ BASE="${BASE%/}"
 # The runner's /health has been sampled at 10 s on a loaded box; a scheduler
 # read also goes through its Postgres. Sized against that tail.
 TIMEOUT=20
+# RS_COMMAND switches the task to a Script (see CONTRACT). It is reset here,
+# at source time, so a value exported in the operator's shell can never turn a
+# RemoteAgent helper into a Script task; a Script caller sets it AFTER sourcing.
+unset RS_COMMAND
 
 say() { printf '%s: %s\n' "$RS_SCRIPT" "$*"; }
 usage() { sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; }
@@ -216,7 +240,16 @@ rs_build_bodies() {
         SCHEDULE_JSON="{\"type\":\"Cron\",\"value\":\"$CRON\"}"
     fi
     if [ "${DISABLED:-0}" = 1 ]; then WANT_ENABLED=false; else WANT_ENABLED=true; fi
-    TASK_JSON="{\"task_type\":\"RemoteAgent\",\"prompt\":\"$(jesc "$PROMPT")\",\"working_directory\":\"$(jesc "${WORKDIR:-}")\",\"max_turns\":$MAX_TURNS,\"timeout_seconds\":$TIMEOUT_SECONDS}"
+    if [ -n "${RS_COMMAND:-}" ]; then
+        # Script task (plan 2026-09-28-ccfg-bundle-parity-bound-outruns-runner-
+        # train-latency, Phase 4): the runner runs COMMAND in-binary, no Claude
+        # session, and records success = exit code 0 (a timeout is a failure).
+        # PROMPT is the caller's mode-word source for prompt_mode; it is not
+        # sent. max_turns does not exist on this shape.
+        TASK_JSON="{\"task_type\":\"Script\",\"command\":\"$(jesc "$RS_COMMAND")\",\"working_directory\":\"$(jesc "${WORKDIR:-}")\",\"timeout_seconds\":$TIMEOUT_SECONDS}"
+    else
+        TASK_JSON="{\"task_type\":\"RemoteAgent\",\"prompt\":\"$(jesc "$PROMPT")\",\"working_directory\":\"$(jesc "${WORKDIR:-}")\",\"max_turns\":$MAX_TURNS,\"timeout_seconds\":$TIMEOUT_SECONDS}"
+    fi
     COMMON_JSON="\"schedule\":$SCHEDULE_JSON,\"task\":$TASK_JSON,\"skipIfCompleted\":false,\"autoFixOnFailure\":false,\"catchUpPolicy\":\"run_once\"${RS_CONDITIONS_JSON:+,\"conditions\":$RS_CONDITIONS_JSON}"
     CREATE_BODY="{\"name\":\"$TASK_NAME\",\"description\":\"$(jesc "$DESC")\",$COMMON_JSON}"
     UPDATE_BODY="{\"name\":\"$TASK_NAME\",\"description\":\"$(jesc "$DESC")\",\"enabled\":$WANT_ENABLED,$COMMON_JSON}"
@@ -249,19 +282,28 @@ api() {
 }
 
 # ---- reading the runner's JSON without a JSON parser ------------------------
-# bash + curl only, so the helpers run where neither jq nor python does. Two
-# properties of serde_json's compact output make this exact rather than
-# heuristic:
-#   * `{"` cannot occur inside a string (every `"` in a string is escaped), so
-#     splitting the list on `{"id":"` yields one line per TOP-LEVEL task --
-#     ScheduledTask serializes `id` first and no nested object starts with it.
-#   * `[[ =~ ]]` returns the LEFTMOST match, and a task's own `enabled`,
-#     `description` and `name` precede every nested object that could carry the
-#     same key (conditions.requireIdle.enabled comes later).
+# bash + curl + awk only, so the helpers run where neither jq nor python does.
+# The readers below take the LEFTMOST match (`[[ =~ ]]`), so they are exact only
+# when a task's own keys precede every nested object that could carry the same
+# key (conditions.requireIdle.enabled, say). The runner does NOT guarantee that
+# order: since the 2026-10-02 scheduler rework (qontinui-runner f18c6229b and its
+# round) both GET /scheduler/tasks and GET /scheduler/tasks/{id} build each task
+# through serde_json::Value (mcp/scheduler.rs stored_task_json), which sorts
+# keys -- `autoFixOnFailure` first, `conditions` before `enabled`, `id` and
+# `name` mid-object. A split on a leading `{"id":"` then found NO task, so every
+# --check said ABSENT and every --install would have created a duplicate.
+# So nothing here reads the runner's order: rs_tasks re-emits each task with
+# its top-level members re-ordered (RS_LEAD_KEYS first, the rest as sent), one
+# task per line, by walking the JSON with string and depth tracking -- exact
+# for any valid JSON at the task-finding level, since `"`, `{`, `[` inside a
+# string are inside a string. Each top-level member is re-emitted compact --
+# no whitespace around it or around its key's `:` -- so RE_HEAD matches
+# whatever spacing the runner sends at that level. Member VALUES are emitted
+# as sent: a nested object (schedule, conditions, task) is compared in the
+# compact form and key order serde emits, which is what compute_drift reads.
 RE_STR='"(([^"\\]|\\.)*)"'
 RE_HEAD='^\{"id":"([^"]*)","name":"(([^"\\]|\\.)*)"'
 RE_SCHED='"schedule":\{"type":"([^"]*)","value":"(([^"\\]|\\.)*)"\}'
-RE_CREATED='"data":\{"id":"([^"]*)"'
 jstr() { # <json> <key> -> the raw (still escaped) value of the FIRST "key":"..."
     local re="\"$2\":$RE_STR"
     [[ $1 =~ $re ]] || return 1
@@ -272,10 +314,71 @@ jscalar() { # <json> <key> -> the FIRST "key":<number|true|false|null>
     [[ $1 =~ $re ]] || return 1
     printf '%s' "${BASH_REMATCH[1]}"
 }
-split_tasks() {
-    local marker='{"id":"' b="$1"
-    b="${b//"$marker"/$'\n'"$marker"}"
-    printf '%s\n' "$b" | grep '^{"id":"'
+# The members a reader looks up by leftmost match, emitted first and in this
+# order -- the order ScheduledTask itself declares them in.
+RS_LEAD_KEYS="id name description enabled schedule task"
+# rs_tasks <response body> -> one line per task under the top-level "data" key
+# (each element when it is an array, the object itself when it is an object),
+# each with its RS_LEAD_KEYS members first. Prints nothing for an empty list.
+rs_tasks() {
+    printf '%s' "$1" | LC_ALL=C awk -v lead="$RS_LEAD_KEYS" '
+    # members(obj): split one object into its top-level members M[1..n], each
+    # `"key":value` raw, and their keys K[1..n].
+    function members(obj,   n, i, c, d, ins, esc, st) {
+        n = 0; d = 0; ins = 0; esc = 0; st = 2
+        for (i = 2; i < length(obj); i++) {
+            c = substr(obj, i, 1)
+            if (ins) { if (esc) esc = 0; else if (c == "\\") esc = 1; else if (c == "\"") ins = 0; continue }
+            if (c == "\"") ins = 1
+            else if (c == "{" || c == "[") d++
+            else if (c == "}" || c == "]") d--
+            else if (c == "," && d == 0) { M[++n] = substr(obj, st, i - st); st = i + 1 }
+        }
+        if (length(obj) - st > 0) M[++n] = substr(obj, st, length(obj) - st)
+        for (i = 1; i <= n; i++) {
+            sub(/^[ \t\r\n]+/, "", M[i]); sub(/[ \t\r\n]+$/, "", M[i])
+            if (match(M[i], /^"([^"\\]|\\.)*"[ \t\r\n]*:[ \t\r\n]*/)) {
+                K[i] = substr(M[i], 1, RLENGTH); sub(/"[ \t\r\n]*:[ \t\r\n]*$/, "", K[i])
+                M[i] = K[i] "\":" substr(M[i], RLENGTH + 1); K[i] = substr(K[i], 2)
+            } else K[i] = ""
+        }
+        return n
+    }
+    function emit(obj,   n, i, j, nl, out, used) {
+        n = members(obj); out = ""; split("", used)
+        nl = split(lead, L, " ")
+        for (j = 1; j <= nl; j++) for (i = 1; i <= n; i++)
+            if (!(i in used) && K[i] == L[j]) { out = out (out == "" ? "" : ",") M[i]; used[i] = 1; break }
+        for (i = 1; i <= n; i++) if (!(i in used)) out = out (out == "" ? "" : ",") M[i]
+        print "{" out "}"
+    }
+    { body = body (NR > 1 ? "\n" : "") $0 }
+    END {
+        d = 0; ins = 0; esc = 0; key = ""; str = ""; s0 = 0; tdepth = 0; inData = 0
+        for (i = 1; i <= length(body); i++) {
+            c = substr(body, i, 1)
+            if (ins) {
+                if (esc) esc = 0; else if (c == "\\") esc = 1; else if (c == "\"") { ins = 0; str = substr(body, s0 + 1, i - s0 - 1) }
+                continue
+            }
+            if (c == "\"") { ins = 1; s0 = i; continue }
+            if (c == ":" && d == 1) { key = str; continue }
+            if (c == "," && d == 1) { key = ""; inData = 0; continue }
+            if (c == "{" || c == "[") {
+                d++
+                if (d == 2 && key == "data") {
+                    inData = 1
+                    if (c == "{") { tdepth = 2; ts = i } else tdepth = 3
+                } else if (inData && tdepth == 3 && d == 3 && c == "{") ts = i
+                continue
+            }
+            if (c == "}" || c == "]") {
+                if (inData && d == tdepth && c == "}") emit(substr(body, ts, i - ts + 1))
+                d--
+                if (d == 1) inData = 0
+            }
+        }
+    }'
 }
 task_id() { [[ $1 =~ $RE_HEAD ]] && printf '%s' "${BASH_REMATCH[1]}"; }
 
@@ -296,7 +399,7 @@ list_named() {
         [[ $line =~ $RE_HEAD ]] || continue
         ALL_COUNT=$((ALL_COUNT + 1))
         [ "${BASH_REMATCH[2]}" = "$TASK_NAME" ] && TASKS+=("$line")
-    done < <(split_tasks "$API_BODY")
+    done < <(rs_tasks "$API_BODY")
 }
 
 # ---- drift: a found task against the intended body --------------------------
@@ -309,6 +412,11 @@ compute_drift() { # <task json>
     [ "$v" = "$WANT_ENABLED" ] || drift_add "enabled is $v, intended $WANT_ENABLED"
     v="$(jstr "$c" description)" || v="<absent>"
     [ "$v" = "$(jesc "$DESC")" ] || drift_add "description differs"
+    # RS_SCHEDULE_JSON / RS_CONDITIONS_JSON are matched as SUBSTRINGS, so they
+    # must be spelled compact and in the runner's nested key order (sorted,
+    # since it serializes through serde_json::Value); a caller whose object has
+    # more than one key out of that order drifts on every read. A caller with
+    # such an object supplies rs_conditions_drift instead, as return-to-main does.
     if [ -n "${RS_SCHEDULE_JSON:-}" ]; then
         case "$c" in
             *"\"schedule\":$RS_SCHEDULE_JSON"*) ;;
@@ -333,18 +441,32 @@ compute_drift() { # <task json>
         fi
     fi
     v="$(jstr "$c" task_type)" || v="<absent>"
-    [ "$v" = RemoteAgent ] || drift_add "task_type is $v, intended RemoteAgent"
-    v="$(jstr "$c" prompt)" || v="<absent>"
-    [ "$v" = "$(jesc "$PROMPT")" ] || drift_add "prompt is '$(junesc "$v")', intended '$PROMPT'"
+    if [ -n "${RS_COMMAND:-}" ]; then
+        [ "$v" = Script ] || drift_add "task_type is $v, intended Script"
+        v="$(jstr "$c" command)" || v="<absent>"
+        [ "$v" = "$(jesc "$RS_COMMAND")" ] || drift_add "command is '$(junesc "$v")', intended '$RS_COMMAND'"
+    else
+        [ "$v" = RemoteAgent ] || drift_add "task_type is $v, intended RemoteAgent"
+        v="$(jstr "$c" prompt)" || v="<absent>"
+        [ "$v" = "$(jesc "$PROMPT")" ] || drift_add "prompt is '$(junesc "$v")', intended '$PROMPT'"
+    fi
     v="$(jstr "$c" working_directory)" || v="<absent>"
     [ "$v" = "$(jesc "$WORKDIR")" ] || drift_add "working_directory is '$(junesc "$v")', intended '$WORKDIR'"
-    v="$(jscalar "$c" max_turns)" || v="<absent>"
-    [ "$v" = "$MAX_TURNS" ] || drift_add "max_turns is $v, intended $MAX_TURNS"
+    if [ -z "${RS_COMMAND:-}" ]; then
+        v="$(jscalar "$c" max_turns)" || v="<absent>"
+        [ "$v" = "$MAX_TURNS" ] || drift_add "max_turns is $v, intended $MAX_TURNS"
+    fi
     v="$(jscalar "$c" timeout_seconds)" || v="<absent>"
     [ "$v" = "$TIMEOUT_SECONDS" ] || drift_add "timeout_seconds is $v, intended $TIMEOUT_SECONDS"
-    for want in model allowed_tools mcp_connections; do
-        case "$c" in *"\"$want\":"*) drift_add "task carries $want, which the intended body leaves unset" ;; esac
-    done
+    if [ -n "${RS_COMMAND:-}" ]; then
+        for want in prompt max_turns model allowed_tools mcp_connections; do
+            case "$c" in *"\"$want\":"*) drift_add "task carries $want, which a Script task never has" ;; esac
+        done
+    else
+        for want in model allowed_tools mcp_connections; do
+            case "$c" in *"\"$want\":"*) drift_add "task carries $want, which the intended body leaves unset" ;; esac
+        done
+    fi
     v="$(jscalar "$c" skipIfCompleted)" || v="<absent>"
     [ "$v" = false ] || drift_add "skipIfCompleted is $v, intended false"
     v="$(jscalar "$c" autoFixOnFailure)" || v="<absent>"
@@ -395,7 +517,11 @@ report_task() {
     local c="$1" id en prompt cron wd mt ts cp next lhm chm tz
     id="$(task_id "$c")" || id="$(jstr "$c" id)" || id="?"
     en="$(jscalar "$c" enabled)" || en="UNREADABLE"
-    prompt="$(jstr "$c" prompt)" && prompt="$(junesc "$prompt")" || prompt="<absent>"
+    if [ -n "${RS_COMMAND:-}" ]; then
+        prompt="$(jstr "$c" command)" && prompt="$(junesc "$prompt")" || prompt="<absent>"
+    else
+        prompt="$(jstr "$c" prompt)" && prompt="$(junesc "$prompt")" || prompt="<absent>"
+    fi
     cron=""
     [[ $c =~ $RE_SCHED ]] && cron="$(junesc "${BASH_REMATCH[2]}")"
     wd="$(jstr "$c" working_directory)" && wd="$(junesc "$wd")" || wd="<absent>"
@@ -406,10 +532,15 @@ report_task() {
     printf '  id:                %s\n' "$id"
     printf '  enabled:           %s\n' "$en"
     printf '  mode:              %s\n' "$(prompt_mode "$prompt")"
-    printf '  prompt:            %s\n' "$prompt"
+    printf '  %s           %s\n' "$([ -n "${RS_COMMAND:-}" ] && printf 'command:' || printf 'prompt: ')" "$prompt"
     printf '  cron:              %s\n' "${cron:-<not a Cron schedule: $(rs_sched_of "$c")>}"
     printf '  working_directory: %s\n' "$wd"
-    printf '  max_turns:         %s   timeout_seconds: %s   catch_up_policy: %s\n' "$mt" "$ts" "$cp"
+    if [ -n "${RS_COMMAND:-}" ]; then
+        # A Script task has no turn cap, so max_turns is not reported for one.
+        printf '  timeout_seconds:   %s   catch_up_policy: %s\n' "$ts" "$cp"
+    else
+        printf '  max_turns:         %s   timeout_seconds: %s   catch_up_policy: %s\n' "$mt" "$ts" "$cp"
+    fi
     chm="$(cron_hhmm "$cron")"
     if [ -z "$next" ]; then
         printf '  next_run:          <none reported>%s\n' "$([ "$en" = false ] && printf ' (a disabled task carries no nextRun)')"
@@ -454,7 +585,10 @@ refuse_duplicates() {
 verify_by_id() {
     api GET "/scheduler/tasks/$1" || die_unknown "wrote task $1, then GET /scheduler/tasks/$1 got no answer (curl exit $API_RC) -- the write is UNVERIFIED"
     [ "$API_CODE" = 200 ] || die_unknown "wrote task $1, then GET /scheduler/tasks/$1 answered HTTP $API_CODE -- the write is UNVERIFIED: $(snip "$API_BODY")"
-    compute_drift "$API_BODY"
+    local c
+    c="$(rs_tasks "$API_BODY")"
+    [ -n "$c" ] || die_unknown "wrote task $1, then GET /scheduler/tasks/$1 answered 200 with no task object under \"data\" -- the write is UNVERIFIED: $(snip "$API_BODY")"
+    compute_drift "$c"
     [ -z "$DRIFT" ] || die_conflict "MISMATCH -- task $1 was written but reads back differently: $DRIFT"
 }
 
@@ -466,8 +600,7 @@ do_install() {
     if [ "$n" -eq 0 ]; then
         api POST /scheduler/tasks "$CREATE_BODY" || die_unknown "POST $BASE/scheduler/tasks got no answer (curl exit $API_RC) -- whether the task was created is UNKNOWN; run --check"
         case "$API_CODE" in 200|201) ;; *) die_unknown "POST $BASE/scheduler/tasks answered HTTP $API_CODE: $(snip "$API_BODY")" ;; esac
-        [[ $API_BODY =~ $RE_CREATED ]] || die_unknown "POST answered $API_CODE but no task id could be read from it: $(snip "$API_BODY")"
-        id="${BASH_REMATCH[1]}"
+        id="$(c="$(rs_tasks "$API_BODY")"; task_id "$c" || jstr "$c" id)" || die_unknown "POST answered $API_CODE but no task id could be read from it: $(snip "$API_BODY")"
         if [ "${DISABLED:-0}" = 1 ]; then
             api PUT "/scheduler/tasks/$id" '{"enabled":false}' || die_unknown "created task $id, then PUT {\"enabled\":false} got no answer -- it may be ENABLED; run --check"
             case "$API_CODE" in 200|201|204) ;; *) die_unknown "created task $id, then PUT {\"enabled\":false} answered HTTP $API_CODE -- it may be ENABLED: $(snip "$API_BODY")" ;; esac
@@ -505,12 +638,18 @@ do_check() {
     n=${#TASKS[@]}
     if [ "$n" -eq 0 ]; then
         say "ABSENT -- no runner scheduler task named $TASK_NAME at $BASE ($ALL_COUNT task(s) with other names)"
-        [ "$LIST_EMPTY" = 1 ] && printf '  note: the list was EMPTY, and the runner answers an empty list when its own database read fails too (mcp/scheduler.rs list_scheduled_tasks), so this is as good as that read\n'
+        if [ "$LIST_EMPTY" = 1 ] && [ -n "${RS_EMPTY_NOTE:-}" ]; then
+            printf '  %s\n' "$RS_EMPTY_NOTE"
+        elif [ -n "${RS_ABSENT_NOTE:-}" ]; then
+            printf '  %s\n' "$RS_ABSENT_NOTE"
+        fi
+        [ "$LIST_EMPTY" = 1 ] && printf '  note: the list was EMPTY, and a runner built before qontinui-runner#1865 answers an empty list when its own database read fails too (mcp/scheduler.rs list_scheduled_tasks; #1865 makes it a 500), so on such a runner this is as good as that read\n'
         printf '  fix: %s\n' "$FIX_HINT"
         exit 1
     fi
     if [ "$n" -gt 1 ]; then refuse_duplicates; fi  # refuse-duplicates
     say "PRESENT -- runner scheduler task $TASK_NAME at $BASE"
+    [ -n "${RS_PRESENT_NOTE:-}" ] && printf '  %s\n' "$RS_PRESENT_NOTE"
     report_task "${TASKS[0]}"
     compute_drift "${TASKS[0]}"
     if [ -z "$DRIFT" ]; then
