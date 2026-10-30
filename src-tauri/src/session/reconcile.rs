@@ -928,11 +928,12 @@ pub trait ProviderSessionIndex {
 ///
 /// ## Why this file and not the transcript
 ///
-/// An in-Claude `/rename` sets the session's name, and no terminal title
-/// escape carries it: the OSC-0/2 title a current CLI emits is its current
-/// ACTIVITY (e.g. the last subagent's description), which since plan
+/// An in-Claude `/rename` sets the session's name. The OSC-0/2 title a current
+/// CLI emits has been observed to carry its current ACTIVITY (e.g. the last
+/// subagent's description) rather than that name — and whatever a title escape
+/// carries, since plan
 /// `2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity`
-/// D3 lands on `TerminalSession::activity_title` and never reaches the record.
+/// D3 it lands on `TerminalSession::activity_title` and never reaches the record.
 /// So the record's rename sink
 /// ([`SessionLifecycleStore::update_title_by_terminal`]) has no writer for the
 /// name but [`refresh_titles`] — without it the registry would keep the

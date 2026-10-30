@@ -2196,9 +2196,15 @@ pub async fn terminal_claude_session_list_live(
     // restore path respawn — fork — every session.
     let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
     let live_pids = crate::session::claude_session_registry::live_pids_from_snapshot(&snapshot)?;
+    // An unreadable registry file counts against completeness only when a live
+    // CLAUDE that started before its last write holds its pid — judged against
+    // the same snapshot, so a recycled pid on a stale file is not an UNKNOWN.
+    let claude_starts =
+        crate::session::claude_session_registry::live_claude_starts_from_snapshot(&snapshot);
     let read = crate::session::claude_session_registry::read_live_sessions_reporting(
         &config_dirs,
         &live_pids,
+        &claude_starts,
     );
 
     let sessions = match &census {

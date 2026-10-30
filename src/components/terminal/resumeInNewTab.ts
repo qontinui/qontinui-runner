@@ -29,7 +29,7 @@ import { loadDefaultConfigHome, resolveAccountDir, typedConfigDir } from "./defa
 import { rememberSessionId } from "./lastKnownSessionIds";
 import { fetchLiveClaudeSessionIds } from "./liveClaudeSessions";
 import { providerDescriptorFor } from "./providerAdapter";
-import { withForkSession } from "./resumeGate";
+import { runClaimedRestoreResume, withForkSession } from "./resumeGate";
 import {
   buildPickerAnswer,
   getResumeSummaryPolicy,
@@ -44,7 +44,7 @@ import {
   type OpenRecordTab,
   type SessionOpenArgs,
 } from "./sessionRecordArgs";
-import { buildResumeCmd, runVerifiedResume } from "./useTerminalInitialization";
+import { buildResumeCmd, decideColdResume, runVerifiedResume } from "./useTerminalInitialization";
 import type { PastSession } from "./usePastSessions";
 import type { TerminalRefsMap } from "./writeWhenReady";
 
@@ -199,9 +199,12 @@ async function resumeAccountDirs(
  *
  * This read cannot see a resume that is still STARTING: two calls for one id
  * can both read it free before either new claude writes its registry file.
- * Every operator door therefore holds the id's in-flight claim
- * (`resumeGate.claimResume`) across this call — the click funnel
- * (`runClickResume`) and the "Since restart" queue (`runClaimedResume`).
+ * Every door that types `--resume` therefore holds the id's in-flight claim
+ * (`resumeGate.claimResume`) — the click funnel (`runClickResume`), the
+ * restore-failed Retry (`runGatedRetry`), the "Since restart" queue
+ * (`runClaimedResume`), and the two automatic restores, the boot drain
+ * (`drainColdResume`) and the zone-profile restore ({@link resumeProfileBatch}),
+ * through `runClaimedRestoreResume`.
  */
 export async function resumeInNewTab(
   deps: ResumeInNewTabDeps,
@@ -385,6 +388,46 @@ export async function forkInNewTab(
     failure: outcome === "unavailable" ? "fork-unavailable" : "fork-not-verified",
     tabId,
   };
+}
+
+/** Why the zone-profile restore typed no resume for one session. */
+export type ProfileResumeSkip = "in-flight" | "skip-alive" | "skip-unknown";
+
+/**
+ * The zone-profile restore's typed resumes: one per item, each under the id's
+ * in-flight claim (`resumeGate.runClaimedRestoreResume`), so a click in the
+ * seconds before the restored claude registers cannot start a second writer.
+ *
+ * ONE registry read covers the batch (`decideColdResume` over it, read lazily
+ * by the first item that holds its claim): the loop types back to back within
+ * milliseconds, so that read IS "immediately before typing" for all of them.
+ * An id whose claim is already held is skipped as alive (`in-flight`), like a
+ * live one; an unreadable registry skips every item (`skip-unknown`).
+ * `resumeOne` is started, not awaited, and the claim stays held until it
+ * settles plus the grace.
+ */
+export async function resumeProfileBatch<T extends { claudeSessionId: string }>(
+  items: readonly T[],
+  deps: {
+    readLiveIds: () => Promise<ReadonlySet<string> | null>;
+    resumeOne: (item: T) => Promise<unknown>;
+    onSkip?: (item: T, why: ProfileResumeSkip) => void;
+  },
+): Promise<void> {
+  let liveIds: Promise<ReadonlySet<string> | null> | undefined;
+  const readOnce = () => (liveIds ??= deps.readLiveIds());
+  for (const item of items) {
+    const result = await runClaimedRestoreResume(
+      item.claudeSessionId,
+      async () => decideColdResume(await readOnce(), item.claudeSessionId),
+      () => deps.resumeOne(item),
+    );
+    if (result.kind === "typing") continue;
+    deps.onSkip?.(
+      item,
+      result.kind === "skip-alive" && result.inFlight ? "in-flight" : result.kind,
+    );
+  }
 }
 
 export interface ResumeProfileSessionDeps {

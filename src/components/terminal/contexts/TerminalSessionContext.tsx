@@ -80,9 +80,8 @@ import { type TerminalInstanceHandle } from "../TerminalInstance";
 import { TerminalBridgeProxies } from "../TerminalBridgeProxies";
 import { type ZoneSessionInfo } from "../zoneProfileStorage";
 import { fetchLiveClaudeSessionIds } from "../liveClaudeSessions";
-import { decideColdResume } from "../useTerminalInitialization";
 import { buildSessionOpenArgs } from "../sessionRecordArgs";
-import { resumeProfileSession } from "../resumeInNewTab";
+import { resumeProfileBatch, resumeProfileSession } from "../resumeInNewTab";
 import { createLogger } from "@/lib/logger";
 
 import { useSessionStateTracking } from "../useSessionStateTracking";
@@ -93,7 +92,7 @@ import { useFileConflicts } from "../useFileConflicts";
 import { useFileLockTracking } from "../useFileLockTracking";
 import { useSessionPersistence } from "../useSessionPersistence";
 
-import { useShellIntegration } from "../useShellIntegration";
+import { useShellIntegration, withdrawNoticeUpdate } from "../useShellIntegration";
 import { useWorkflowGeneration } from "../useWorkflowGeneration";
 import { useAnalysis } from "../useAnalysis";
 import { useFindingsActions } from "../useFindingsActions";
@@ -386,89 +385,91 @@ const PageSessionScope = memo(function PageSessionScope({
     pendingProfileSessionsRef.current = remaining.length > 0 ? remaining : null;
     if (toResume.length === 0) return;
 
-    void (async () => {
-      // P1 restore idempotence: a zone profile can name sessions that are
-      // ALREADY alive elsewhere (another page, another window, a process
-      // outside the runner) — typing `--resume <id>` for one forks it: two
-      // live processes on one transcript. Gate every typed resume on the same
-      // liveness oracle the cold-restore drain uses (fetchLiveClaudeSessionIds
-      // + decideColdResume). One fetch covers the batch — unlike the drain's
-      // ~500 ms-spaced typing, this loop types back-to-back within
-      // milliseconds, so the read IS "immediately before typing" for all of
-      // them. `null` (registry unreadable) fails CLOSED: skip the whole
-      // batch. Skipped sessions are dropped, not re-parked — the profile's
-      // layout/tabs are untouched, and the operator can still resume any of
-      // them by hand. A hand resume is gated too, by the CLICK gate
-      // (`resumeGate.ts` `runClickResume`, entered through
-      // `useShellIntegration`'s `handleResumeSession` / `resumeClick`): a live
-      // id opens the resume-live dialog (go to the pane, fork, or resume
-      // anyway) and an unreadable registry opens its UNKNOWN form, so a click
-      // is no longer taken as intent to fork a conversation the operator could
-      // not find.
-      const liveIds = await fetchLiveClaudeSessionIds();
-      for (const { s, tabId } of toResume) {
-        const decision = decideColdResume(liveIds, s.claudeSessionId);
-        if (decision !== "respawn") {
+    // P1 restore idempotence: a zone profile can name sessions that are
+    // ALREADY alive elsewhere (another page, another window, a process outside
+    // the runner) — typing `--resume <id>` for one forks it: two live
+    // processes on one transcript. Every typed resume is gated on the same
+    // liveness oracle the cold-restore drain uses (fetchLiveClaudeSessionIds +
+    // decideColdResume, one read for the batch) AND held under the id's
+    // in-flight claim, so a click in the seconds before the restored claude
+    // registers reads the id as in flight rather than free
+    // (`resumeProfileBatch`). `null` (registry unreadable) fails CLOSED: skip
+    // the whole batch. Skipped sessions are dropped, not re-parked — the
+    // profile's layout/tabs are untouched, and the operator can still resume
+    // any of them by hand. A hand resume is gated too, by the CLICK gate
+    // (`resumeGate.ts` `runClickResume`, entered through
+    // `useShellIntegration`'s `handleResumeSession` / `resumeClick`): a live id
+    // opens the resume-live dialog (go to the pane, fork, or resume anyway) and
+    // an unreadable registry opens its UNKNOWN form, so a click is no longer
+    // taken as intent to fork a conversation the operator could not find.
+    void resumeProfileBatch(
+      toResume.map(({ s, tabId }) => ({ s, tabId, claudeSessionId: s.claudeSessionId })),
+      {
+        readLiveIds: fetchLiveClaudeSessionIds,
+        onSkip: ({ s }, why) =>
           console.warn(
             `[TerminalSession] profile resume SKIPPED for session ${s.claudeSessionId}: ` +
-              (decision === "skip-alive"
-                ? "a live Claude process already hosts this id (typing --resume would fork it)"
-                : "live-session registry unreadable — failing closed toward not-respawning"),
-          );
-          continue;
-        }
-        // The open record for the VERIFIED branch.
-        //
-        // Built by `buildSessionOpenArgs` rather than by hand, so this writer
-        // cannot drift from the command's signature the way it once did:
-        // `origin`, NOT the retired `bindOrigin` (a hand-built literal let the
-        // dead key survive migration, and the row landed `origin: None`, which
-        // reads as "reconciled" and keeps it off the auto-resume track). A
-        // profile resume types the exact id in `--resume`, so it is the most
-        // authoritative bind there is.
-        //
-        // The builder resolves `workingDir`/`title` off the live tab list and
-        // the zone by reverse lookup over `zoneLayout.assignments` — which
-        // yields `s.zoneIndex` here by construction, since `tabId` came from
-        // `zoneLayout.assignments[s.zoneIndex]` a few lines up.
-        const recordOpen = buildSessionOpenArgs({
-          assignments: zoneLayout.assignments,
-          tabs,
-          tabId,
-          claudeSessionId: s.claudeSessionId,
-          configDir: s.claudeConfigDir,
-          pageId,
-          origin: "authoritative",
-        });
-        // THE resume choke point, shared with the boot restore and every
-        // one-click resume: the account rule (`resolveAccountDir` — the
-        // default home is never typed, an unsafe dir is refused), the typed
-        // command (`runVerifiedResume`), a verified handshake, and the open
-        // record written only once it verified. Fire-and-forget per tab, like
-        // the boot drain: a failed verification parks the tab in its Retry.
-        void resumeProfileSession(
-          {
-            terminalRefs: terminalRefs.current,
-            updateTab,
-            notify: (message) => notificationSetterRef.current({ message, type: "error" }),
-          },
-          {
+              (why === "in-flight"
+                ? "a resume of this id is already in flight in this window"
+                : why === "skip-alive"
+                  ? "a live Claude process already hosts this id (typing --resume would fork it)"
+                  : "live-session registry unreadable — failing closed toward not-respawning"),
+          ),
+        resumeOne: ({ s, tabId }) => {
+          // The open record for the VERIFIED branch.
+          //
+          // Built by `buildSessionOpenArgs` rather than by hand, so this writer
+          // cannot drift from the command's signature the way it once did:
+          // `origin`, NOT the retired `bindOrigin` (a hand-built literal let
+          // the dead key survive migration, and the row landed `origin: None`,
+          // which reads as "reconciled" and keeps it off the auto-resume
+          // track). A profile resume types the exact id in `--resume`, so it
+          // is the most authoritative bind there is.
+          //
+          // The builder resolves `workingDir`/`title` off the live tab list and
+          // the zone by reverse lookup over `zoneLayout.assignments` — which
+          // yields `s.zoneIndex` here by construction, since `tabId` came from
+          // `zoneLayout.assignments[s.zoneIndex]` a few lines up.
+          const recordOpen = buildSessionOpenArgs({
+            assignments: zoneLayout.assignments,
+            tabs,
             tabId,
             claudeSessionId: s.claudeSessionId,
             configDir: s.claudeConfigDir,
-            recordOpen,
-          },
-        )
-          .then((attempt) =>
-            recordOpenLogger.debug(
-              `profile resume ${s.claudeSessionId} → ${tabId}: ${
-                attempt.kind === "verified" ? "verified" : attempt.failure
-              }`,
-            ),
+            pageId,
+            origin: "authoritative",
+          });
+          // THE resume choke point, shared with the boot restore and every
+          // one-click resume: the account rule (`resolveAccountDir` — the
+          // default home is never typed, an unsafe dir is refused), the typed
+          // command (`runVerifiedResume`), a verified handshake, and the open
+          // record written only once it verified. Not awaited by the batch,
+          // like the boot drain: a failed verification parks the tab in its
+          // Retry, and the claim is held until this settles.
+          return resumeProfileSession(
+            {
+              terminalRefs: terminalRefs.current,
+              updateTab,
+              notify: (message) => notificationSetterRef.current({ message, type: "error" }),
+            },
+            {
+              tabId,
+              claudeSessionId: s.claudeSessionId,
+              configDir: s.claudeConfigDir,
+              recordOpen,
+            },
           )
-          .catch((err) => console.warn(`[TerminalSession] profile resume threw:`, err));
-      }
-    })();
+            .then((attempt) =>
+              recordOpenLogger.debug(
+                `profile resume ${s.claudeSessionId} → ${tabId}: ${
+                  attempt.kind === "verified" ? "verified" : attempt.failure
+                }`,
+              ),
+            )
+            .catch((err) => console.warn(`[TerminalSession] profile resume threw:`, err));
+        },
+      },
+    ).catch((err) => console.warn(`[TerminalSession] profile restore threw:`, err));
   }, [zoneLayout.assignments, updateTab, tabs, pageId]);
 
   // Transcripts are read up here (rather than in the AiFeatures block below)
@@ -734,6 +735,12 @@ const PageSessionScope = memo(function PageSessionScope({
       notificationSetterRef.current({ message, type }),
     [],
   );
+  // ...and withdraws its "checking…" acknowledgement once the check is done,
+  // leaving any newer notice in place.
+  const withdrawResumeNotice = useCallback(
+    (message: string) => notificationSetterRef.current(withdrawNoticeUpdate(message)),
+    [],
+  );
   // The bulk "resume selected" summary (resumed / already live / unknown).
   const notifyBulkResume = useCallback(
     (n: { message: string; type: "success" | "error" }) => notificationSetterRef.current(n),
@@ -753,6 +760,7 @@ const PageSessionScope = memo(function PageSessionScope({
     // A session the operator resumes is shown (tmux `new-window`; no-op in grid).
     onResumedTab: zoneLayout.showSpawnedTab,
     notify: notifyResume,
+    withdrawNotice: withdrawResumeNotice,
   });
 
   const getScrollback = useCallback(

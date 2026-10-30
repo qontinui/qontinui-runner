@@ -190,9 +190,10 @@ function escapeRegExp(s: string): string {
 /**
  * Turn the backend-rendered resume command (`build_ai_resume_command`:
  * `[env…] claude <permission> --resume <id>`, plus the trailing `\r`) into
- * its fork: `… --resume <id> --fork-session`. Claude Code ≥ 2.1.312 documents
- * the flag as "When resuming, create a new session ID instead of reusing the
- * original (use with --resume or --continue)".
+ * its fork: `… --resume <id> --fork-session`. Claude Code documents the flag
+ * (help text checked in 2.1.310–2.1.312) as "When resuming, create a new
+ * session ID instead of reusing the original (use with --resume or
+ * --continue)".
  *
  * `null` when the command does not END with `--resume <id>` (bare or quoted):
  * then appending a flag would not land on the claude argv, so nothing is
@@ -295,10 +296,120 @@ export async function runClaimedResume(
 }
 
 // ---------------------------------------------------------------------------
+// Automatic restores (the boot drain, the zone-profile restore)
+// ---------------------------------------------------------------------------
+
+/** The cold-restore liveness verdict (`useTerminalInitialization.decideColdResume`). */
+export type RestoreDecision = "respawn" | "skip-alive" | "skip-unknown";
+
+/** What one automatic restore resume came to under the in-flight claim. */
+export type ClaimedRestoreResult =
+  /** Typing started. `settled` resolves (never rejects) once it is done. */
+  | { kind: "typing"; settled: Promise<void> }
+  /**
+   * Not typed: a live process holds the id, or (`inFlight`) another resume of
+   * it — a click, a Retry, the queue, another restore — is in flight in this
+   * window.
+   */
+  | { kind: "skip-alive"; inFlight: boolean }
+  /** Not typed: the registry could not be read. */
+  | { kind: "skip-unknown" };
+
+/**
+ * Type one AUTOMATIC restore resume — the boot cold-restore drain and the
+ * zone-profile restore — under the same in-flight claim a click takes
+ * ({@link claimResume}). Without it, a click in the seconds after a restore
+ * typed `--resume`, before the restored claude has written its registry file,
+ * reads the id as free and starts a second writer.
+ *
+ * - The id is already claimed: `skip-alive` (`inFlight: true`). Nothing is
+ *   read or typed — another resume of it is under way in this window.
+ * - Otherwise `decide()` reads liveness right before typing. A `skip-*`
+ *   verdict releases the claim at once: nothing was typed.
+ * - `respawn`: `type()` starts and is NOT awaited (one verification can take
+ *   ~30 s, and the drain must not serialize on it). The claim is held until
+ *   it settles, then for {@link RESUME_IN_FLIGHT_GRACE_MS}: the restore's tab
+ *   already exists, and its claude registers only once it is up. A `type()`
+ *   that throws is logged, and keeps the grace — nobody knows what it typed.
+ */
+export async function runClaimedRestoreResume(
+  claudeSessionId: string,
+  decide: () => Promise<RestoreDecision>,
+  type: () => Promise<unknown>,
+): Promise<ClaimedRestoreResult> {
+  const claim = claimResume(claudeSessionId);
+  if (claim === null) return { kind: "skip-alive", inFlight: true };
+  let decision: RestoreDecision;
+  try {
+    decision = await decide();
+  } catch (err: unknown) {
+    claim.release();
+    throw err;
+  }
+  if (decision === "skip-alive") {
+    claim.release();
+    return { kind: "skip-alive", inFlight: false };
+  }
+  if (decision === "skip-unknown") {
+    claim.release();
+    return { kind: "skip-unknown" };
+  }
+  const settled = (async () => {
+    try {
+      await type();
+    } catch (err: unknown) {
+      console.warn(`[resumeGate] restore resume of ${claudeSessionId} threw:`, err);
+    } finally {
+      claim.release(RESUME_IN_FLIGHT_GRACE_MS);
+    }
+  })();
+  return { kind: "typing", settled };
+}
+
+// ---------------------------------------------------------------------------
 // The click funnel
 // ---------------------------------------------------------------------------
 
 type FailedAttempt = Extract<ResumeAttempt, { kind: "failed" }>;
+
+/**
+ * How long the gate waits for its liveness read. The id's in-flight claim is
+ * held across the read, so a read that never answers would lock the id until
+ * the window reloads.
+ */
+export const GATE_LIVENESS_READ_TIMEOUT_MS = 15_000;
+
+/**
+ * The gate's liveness read, bounded by {@link GATE_LIVENESS_READ_TIMEOUT_MS}.
+ * A read that does not answer in time, or that throws, is `null`: liveness
+ * UNKNOWN (D2), which asks an interactive click and skips a bulk item — never
+ * a resume.
+ */
+export async function readLiveWithin(
+  read: () => Promise<LiveClaudeSession[] | null>,
+  timeoutMs: number = GATE_LIVENESS_READ_TIMEOUT_MS,
+): Promise<LiveClaudeSession[] | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<null>((resolve) => {
+    timer = setTimeout(() => {
+      console.warn(`[resumeGate] liveness read gave no answer in ${timeoutMs} ms: UNKNOWN`);
+      resolve(null);
+    }, timeoutMs);
+  });
+  const answered = (async () => {
+    try {
+      return await read();
+    } catch (err: unknown) {
+      console.warn("[resumeGate] liveness read threw: UNKNOWN", err);
+      return null;
+    }
+  })();
+  try {
+    return await Promise.race([answered, timedOut]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export interface ClickResumeDeps {
   /** The liveness oracle (`fetchLiveClaudeHolders`): rows, or `null` when unreadable. */
@@ -316,6 +427,12 @@ export interface ClickResumeDeps {
    * read. Called before the first read, so a slow read is never a dead click.
    */
   onChecking?: (target: ResumeTarget) => void;
+  /**
+   * The liveness read of an interactive click returned (or timed out): what
+   * {@link onChecking} said is no longer true, so its notice can be withdrawn.
+   * Called before the dialog opens or the resume starts.
+   */
+  onChecked?: (target: ResumeTarget) => void;
   /** The click was refused because a resume of the same id is already in flight. */
   onInFlight?: (target: ResumeTarget) => void;
 }
@@ -381,7 +498,10 @@ async function attempt(
  * The id is claimed ({@link claimResume}) BEFORE the first liveness read and
  * held until the resume resolves, plus {@link RESUME_IN_FLIGHT_GRACE_MS} when
  * it opened a tab. A second request for an id in flight starts nothing and
- * reports `skipped-live` (`onInFlight` says why).
+ * reports `skipped-live` (`onInFlight` says why). The read is bounded
+ * ({@link readLiveWithin}), and the dialog is answered `cancel` when its page
+ * stops showing it (`ResumeGateHost`) or its page unmounts
+ * (`useShellIntegration`), so neither can hold the claim forever.
  */
 export async function runClickResume(
   deps: ClickResumeDeps,
@@ -402,7 +522,9 @@ export async function runClickResume(
   };
   try {
     if (interactive) deps.onChecking?.(target);
-    const decision = decideClickResume(await deps.readLive(), target.claudeSessionId);
+    const rows = await readLiveWithin(deps.readLive);
+    if (interactive) deps.onChecked?.(target);
+    const decision = decideClickResume(rows, target.claudeSessionId);
     if (decision.kind === "free") return await run({ fork: false, allowLive: false });
     if (!interactive) return decision.kind === "live" ? "skipped-live" : "skipped-unknown";
 
@@ -480,7 +602,7 @@ export async function runGatedRetry(
     return (await deps.retry()) === "verified" ? "resumed" : "failed";
   };
   try {
-    const rows = await deps.readLive();
+    const rows = await readLiveWithin(deps.readLive);
     const others = rows === null ? null : rows.filter((r) => r?.terminalId !== args.tabId);
     const decision = decideClickResume(others, args.claudeSessionId);
     if (decision.kind === "free") return await run();

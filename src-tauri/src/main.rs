@@ -5235,16 +5235,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             emit_session_bound(&poll_app_handle, &actions);
                         }
 
-                        // Title convergence (phantom-id plan B6). No terminal
-                        // title escape carries an in-Claude `/rename`: the OSC
-                        // title is the CLI's current ACTIVITY, which since plan
-                        // 2026-10-27-click-resume-forks-a-live-conversation-and-
-                        // pane-titles-hide-its-identity D3 never reaches the
-                        // record. So this pass is the record title's only
-                        // automatic writer — without it the registry keeps the
-                        // spawn-time name forever (a restore then reopens the
-                        // pane mislabelled). It adopts the provider's own
-                        // session name from its live-session index.
+                        // Title convergence (phantom-id plan B6). The OSC title
+                        // has been observed to carry the CLI's current ACTIVITY,
+                        // not an in-Claude `/rename` — and whatever it carries,
+                        // since plan 2026-10-27-click-resume-forks-a-live-
+                        // conversation-and-pane-titles-hide-its-identity D3 it
+                        // never reaches the record. So this pass is the record
+                        // title's only automatic writer — without it the
+                        // registry keeps the spawn-time name forever (a restore
+                        // then reopens the pane mislabelled). It adopts the
+                        // provider's own session name from its live-session
+                        // index.
                         //
                         // Deliberately OUTSIDE the `needs_reconcile` guard: that
                         // guard is false precisely when every live PTY is bound
