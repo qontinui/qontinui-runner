@@ -466,15 +466,24 @@ fn a_self_hosted_leg_refuses_a_host_that_is_not_isolated_right_after_checkout() 
             "job `{name}`: checks for a live runner"
         );
         assert!(run.contains(HOST_NOT_ISOLATED_TITLE), "job `{name}`");
-        assert!(!run.contains(CI_CAPACITY_TITLE), "job `{name}`: not a capacity red");
-        assert!(run.contains("exit 1") && run.contains("USERPROFILE"), "job `{name}`");
+        assert!(
+            !run.contains(CI_CAPACITY_TITLE),
+            "job `{name}`: not a capacity red"
+        );
+        assert!(
+            run.contains("exit 1") && run.contains("USERPROFILE"),
+            "job `{name}`"
+        );
     }
 }
 
 #[test]
 fn a_self_hosted_leg_sandboxes_the_config_dirs_before_the_rust_build() {
     let doc = ci_workflow();
-    for (name, build) in [("test", "Build Rust tests"), ("clippy-windows", "Clippy check")] {
+    for (name, build) in [
+        ("test", "Build Rust tests"),
+        ("clippy-windows", "Clippy check"),
+    ] {
         let s = steps(job(&doc, name));
         let pos = |k: &str| {
             s.iter()
