@@ -23,10 +23,16 @@
 //!
 //! ## Trust
 //!
-//! Same as the snapshot relay: on `origin_guard::TRUSTED_ROUTES`, so the
-//! runner's own webview (FirstParty), non-browser callers and Trusted origins
-//! reach it, and a Foreign page does not. It is ON whenever a page relays —
-//! there is no flag — and its state is `passiveCapture` on
+//! The route reads no principal: the origin guard decides. The runner's own
+//! webview (FirstParty), non-browser callers and Trusted origins
+//! (`origin_guard::TRUSTED_ROUTES`) reach it. A Foreign page and an extension
+//! page are refused 403 under EVERY route policy
+//! (`origin_guard::LEDGER_WRITE_ROUTES`), so no page can forge an edge — and a
+//! closing edge retires a frontier row. That is also why the body's content
+//! type is not checked: the `text/plain` POST a page can send without a
+//! preflight never gets here. Only the guard's kill switch
+//! (`QONTINUI_RUNNER_ORIGIN_GUARD=0`) lifts this. Capture is ON whenever a page
+//! relays — there is no flag — and its state is `passiveCapture` on
 //! `/journey/health`.
 
 use std::collections::HashMap;
@@ -314,6 +320,8 @@ fn refuse(status: StatusCode, app_id: Option<&str>, reason: &'static str) -> Res
 /// `POST /apps/{app_id}/journey/observe`.
 ///
 /// - 202: recorded;
+/// - 403 (the origin guard, before this handler): a Foreign or Extension
+///   origin, under every route policy (see the module's Trust section);
 /// - 400: the body is not JSON at all (as `POST …/journey/explore`, and as
 ///   axum's `Json` extractor answers on the runner's other JSON routes);
 /// - 422: the app id is not an identifier or names the runner's own app
@@ -640,8 +648,10 @@ mod tests {
     }
 
     #[test]
-    fn the_observe_route_has_the_snapshot_relays_trust() {
-        use crate::mcp::origin_guard::TRUSTED_ROUTES;
-        assert!(TRUSTED_ROUTES.contains(&("POST", "/apps/{app_id}/journey/observe")));
+    fn the_observe_route_admits_trusted_origins_and_refuses_page_origins() {
+        use crate::mcp::origin_guard::{LEDGER_WRITE_ROUTES, TRUSTED_ROUTES};
+        let route = ("POST", "/apps/{app_id}/journey/observe");
+        assert!(TRUSTED_ROUTES.contains(&route));
+        assert!(LEDGER_WRITE_ROUTES.contains(&route));
     }
 }

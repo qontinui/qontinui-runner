@@ -2741,8 +2741,8 @@ async fn pre_register_rejections_close_cleanly() {
 /// whether the registrant's origin may relay to the journey observe route, by
 /// the guard's own decision under the CURRENT route policy. Behind the real
 /// guard at the default policy (`enforce-doors`): a Trusted origin is
-/// admitted, a Foreign one is not (the guard would only shadow-admit it and
-/// count a would-be refusal), and the field is on every success answer.
+/// admitted, a Foreign one is not (the guard refuses it the route under every
+/// policy), and the field is on every success answer.
 #[tokio::test]
 async fn the_registration_answer_says_whether_its_origin_may_relay_to_observe() {
     for policy in [None, Some("enforce"), Some("shadow")] {
