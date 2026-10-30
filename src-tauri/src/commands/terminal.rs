@@ -335,6 +335,20 @@ pub async fn terminal_create(
     // (`poll_and_verify_pinned_session`).
     let registry = session_registry.inner().clone();
     let persisted = pane_store.get(&pane_key);
+    // Key the row by the harness session id the identity seam pinned this PTY
+    // child to (inside `create` above — the seam runs before this block on
+    // every spawn path). Without it the registry falls back to the RUNNER's
+    // own ambient id, which no child ever runs under, so coord's scoped
+    // `coord_report_status` could never resolve the row
+    // (`session_not_owned_by_caller`) and sessions fell through to the
+    // unscoped call that writes a PEER's row. Both arms pass it: a fresh row is
+    // registered under it, and a RESUMED row is re-keyed to it (plan
+    // 2026-10-23-a-hookless-resume-in-a-runner-pane-leaves-the-session-with-no-active-coord-row,
+    // Phase 2) instead of keeping the first-ever pin it was registered under.
+    // `None` only when the terminal vanished between spawn and here.
+    let pinned_session_id = terminal_manager
+        .get(&info.id)
+        .map(|session| session.pinned_session_id().to_string());
     // Phase 0 instrumentation: the coord-registration segment of spawn
     // latency. `register_external` is synchronous and does no HTTP (it queues
     // an outbox row, contending on the process-global outbox `write_lock` +
@@ -344,7 +358,7 @@ pub async fn terminal_create(
         Some(prior_id) => {
             use tracing::Instrument;
             registry
-                .resume_external(prior_id, intent)
+                .resume_external(prior_id, intent, pinned_session_id)
                 .instrument(tracing::debug_span!(
                     "terminal_spawn.coord_register",
                     terminal_id = %info.id,
@@ -359,17 +373,6 @@ pub async fn terminal_create(
                 resume = false
             )
             .entered();
-            // Key the row by the harness session id the identity seam pinned
-            // this PTY child to (inside `create` above — the seam runs before
-            // this block on every spawn path). Without it the registry falls
-            // back to the RUNNER's own ambient id, which no child ever runs
-            // under, so coord's scoped `coord_report_status` could never
-            // resolve the row (`session_not_owned_by_caller`) and sessions
-            // fell through to the unscoped call that writes a PEER's row.
-            // `None` only when the terminal vanished between spawn and here.
-            let pinned_session_id = terminal_manager
-                .get(&info.id)
-                .map(|session| session.pinned_session_id().to_string());
             registry.register_external_with_lineage(intent, None, pinned_session_id)
         }
     };

@@ -263,6 +263,13 @@ struct CoordSyncInner {
     /// session to `PendingResolution`. Entries live only as long as a
     /// [`DrainHold`] guard.
     held: Mutex<HashSet<Uuid>>,
+    /// coord's answers to harness-id re-keys (plan
+    /// `2026-10-23-a-hookless-resume-in-a-runner-pane-leaves-the-session-with-no-active-coord-row`
+    /// Phase 1a): the drain writes `landed` on a 2xx and `refused` on a
+    /// `409 harness_session_already_bound`; the seam
+    /// ([`super::coord_identity`]) reads it to restore a refused re-key. A
+    /// shared read, never a callback from the drain into the registry.
+    rekeys: Arc<super::coord_identity::RekeyLedger>,
 }
 
 /// Boxed `finished`-ACK callback (see `CoordSyncInner::finished_ack_observer`).
@@ -325,6 +332,7 @@ impl CoordSync {
                     crate::coord_outside_observer::CoordOutsideObserver::new(),
                 )),
                 held: Mutex::new(HashSet::new()),
+                rekeys: Arc::default(),
             }),
         }
     }
@@ -360,6 +368,7 @@ impl CoordSync {
                 // probe the REAL upstream from a unit test.
                 outside_observer: None,
                 held: Mutex::new(HashSet::new()),
+                rekeys: Arc::default(),
             }),
         }
     }
@@ -373,6 +382,19 @@ impl CoordSync {
             .expect("call before the facade is shared")
             .dual_write = DualWriteGate::new_for_test(None, interval);
         self
+    }
+
+    /// coord's answers to harness-id re-keys — see `CoordSyncInner::rekeys`.
+    pub fn rekeys(&self) -> &super::coord_identity::RekeyLedger {
+        &self.inner.rekeys
+    }
+
+    /// Test-only: run ONE drain tick against the configured coord, exactly as
+    /// the drain loop would, and return once it has finished.
+    #[cfg(test)]
+    pub(crate) async fn drain_once_for_test(&self) {
+        let mut state = DrainState::default();
+        let _ = drain_tick(&self.inner, &mut state).await;
     }
 
     /// Borrow the local outbox. Phase 2 surface — unchanged.
@@ -551,6 +573,13 @@ impl CoordSync {
                     detail: snippet(&msg),
                 }
             }
+            // A `started` row is never a re-key, so coord cannot answer this
+            // here; mapped for exhaustiveness as the conflict it would be.
+            Ok(PushOutcome::Refused(msg)) => CoordRegistrationFailure {
+                kind: "conflict",
+                status: Some(409),
+                detail: snippet(&msg),
+            },
             Err(_elapsed) => CoordRegistrationFailure {
                 kind: "timeout",
                 status: None,
@@ -1343,6 +1372,21 @@ async fn push_chain(
                 out.succeeded.push((rec.session_id, rec.seq));
                 handle_conflict(&inner, &rec, row).await;
             }
+            PushOutcome::Refused(reason) => {
+                // Coord answered (so it is serving), and the row leaves the
+                // queue — but as a refusal, never a delivery: no finished-ACK
+                // notification, and the re-key ledger already counted it.
+                out.acked_by_coord = true;
+                out.succeeded.push((rec.session_id, rec.seq));
+                out.cleared.push((rec.session_id, rec.seq));
+                tracing::warn!(
+                    session = %rec.session_id,
+                    seq = rec.seq,
+                    body = %reason,
+                    "coord_sync: coord REFUSED the harness-id re-key (another active row holds \
+                     the id) — ACK-dropping it as refused; the seam restores and re-queues"
+                );
+            }
             PushOutcome::Transport(e) => {
                 let (fail_kind, fail_status) = classify_push_failure(&e, false);
                 note_outbox_failure(fail_kind, fail_status);
@@ -1948,6 +1992,35 @@ enum PushOutcome {
     /// 4xx (other than 409) — coord refuses this payload permanently.
     /// ACK locally so the queue moves forward.
     PermanentFailure(String),
+    /// coord answered `409 harness_session_already_bound` to a re-key
+    /// `state_change` — another ACTIVE row on the device holds the id. The row
+    /// is ACK-dropped (left queued it would block the session forever) but it
+    /// is NOT a success: the refusal is recorded in the re-key ledger, from
+    /// which the seam restores the local record and a later tick re-queues.
+    Refused(String),
+}
+
+/// coord's `SessionError` code for a PATCH re-key onto a harness id another
+/// ACTIVE row on the device and tenant holds (qontinui-coord `sessions.rs`).
+const HARNESS_SESSION_ALREADY_BOUND: &str = "harness_session_already_bound";
+
+/// The harness id a re-key `state_change` carries, if this row is one.
+fn rekey_id(rec: &OutboxRecord) -> Option<&str> {
+    if rec.event_kind != SessionEventKind::StateChange.as_str() {
+        return None;
+    }
+    rec.payload
+        .get("claude_code_session_id")
+        .and_then(JsonValue::as_str)
+}
+
+/// coord's `{error, detail}` refusal body → its `error` code.
+fn refusal_error_code(body: &str) -> Option<String> {
+    serde_json::from_str::<JsonValue>(body)
+        .ok()?
+        .get("error")?
+        .as_str()
+        .map(str::to_string)
 }
 
 async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOutcome {
@@ -2311,6 +2384,14 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 return PushOutcome::Transport(format!("{status}: {detail}"));
             }
             if status.is_success() {
+                // `landed` moves ONLY here — coord accepted the id.
+                if let Some(id) = rekey_id(rec) {
+                    if let Some(source) =
+                        super::coord_identity::RekeySource::from_payload(&rec.payload)
+                    {
+                        inner.rekeys.note_landed(rec.session_id, id, source);
+                    }
+                }
                 return PushOutcome::Acked;
             }
             if is_lifecycle_kind(kind) && status == StatusCode::TOO_MANY_REQUESTS {
@@ -2427,6 +2508,28 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 if kind == "started" {
                     let row = resp.json::<JsonValue>().await.ok();
                     return PushOutcome::Conflict { row };
+                }
+                // Except a re-key coord REFUSED because another active row
+                // holds the id: acking that as success voided the re-key
+                // silently while the local record claimed it. A plain-state
+                // 409 keeps the idempotent ack.
+                if let Some(id) = rekey_id(rec) {
+                    let body = resp.text().await.unwrap_or_default();
+                    if refusal_error_code(&body).as_deref() == Some(HARNESS_SESSION_ALREADY_BOUND) {
+                        if let Some(source) =
+                            super::coord_identity::RekeySource::from_payload(&rec.payload)
+                        {
+                            let previous = rec
+                                .payload
+                                .get("rekey_previous")
+                                .and_then(JsonValue::as_str)
+                                .map(str::to_string);
+                            inner
+                                .rekeys
+                                .note_refused(rec.session_id, id, previous, source);
+                        }
+                        return PushOutcome::Refused(format!("{status}: {}", snippet(&body)));
+                    }
                 }
                 return PushOutcome::Acked;
             }
@@ -4213,6 +4316,10 @@ mod tests {
         /// The `Authorization` header each ACCEPTED `PATCH /sessions/:id`
         /// carried, index-aligned with `patches` (`None` = unauthenticated).
         patch_auth: Vec<Option<String>>,
+        /// A `PATCH /sessions/:id` re-keying the row onto any of these harness
+        /// ids answers coord's `409 harness_session_already_bound` (another
+        /// ACTIVE row on the device holds it), recording the attempt.
+        rekey_conflict_ids: Vec<String>,
         /// When true, every PATCH returns 404 (simulates a GC'd / missing
         /// coord row — drives the R2 resume 404-fallback path).
         patch_returns_404: bool,
@@ -4389,6 +4496,20 @@ mod tests {
                                 .into_response();
                         }
                         g.patches.push((id, body.clone()));
+                        if body
+                            .get("claude_code_session_id")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|c| g.rekey_conflict_ids.iter().any(|x| x == c))
+                        {
+                            return (
+                                AxumStatus::CONFLICT,
+                                Json(json!({
+                                    "error": "harness_session_already_bound",
+                                    "detail": "another active session on this device holds it",
+                                })),
+                            )
+                                .into_response();
+                        }
                         g.patch_auth.push(
                             headers
                                 .get("authorization")
@@ -8670,7 +8791,7 @@ mod tests {
             let registry = build_registry(coord.clone());
             let persisted = Uuid::new_v4();
             let resumed = registry
-                .resume_external(persisted, make_test_intent())
+                .resume_external(persisted, make_test_intent(), None)
                 .await
                 .unwrap();
             assert_eq!(resumed, persisted, "a refusal does not change resumption");
@@ -8757,7 +8878,7 @@ mod tests {
         let registry = build_registry(coord);
         let persisted = Uuid::new_v4();
         let resumed = registry
-            .resume_external(persisted, make_test_intent())
+            .resume_external(persisted, make_test_intent(), None)
             .await
             .unwrap();
         assert_eq!(resumed, persisted);
@@ -8790,7 +8911,7 @@ mod tests {
         let registry = build_registry(coord.clone());
         let persisted = Uuid::new_v4();
         registry
-            .resume_external(persisted, make_test_intent())
+            .resume_external(persisted, make_test_intent(), None)
             .await
             .unwrap();
         assert_eq!(
@@ -8804,7 +8925,7 @@ mod tests {
         rec.lock().await.patch_returns_404 = true;
         let gone = Uuid::new_v4();
         let replacement = registry
-            .resume_external(gone, make_test_intent())
+            .resume_external(gone, make_test_intent(), None)
             .await
             .unwrap();
         assert_ne!(replacement, gone);
@@ -8824,7 +8945,7 @@ mod tests {
         let registry2 = build_registry(down);
         let optimistic = Uuid::new_v4();
         registry2
-            .resume_external(optimistic, make_test_intent())
+            .resume_external(optimistic, make_test_intent(), None)
             .await
             .unwrap();
         assert_eq!(
@@ -8851,7 +8972,7 @@ mod tests {
 
         let persisted = Uuid::new_v4();
         let resumed = registry
-            .resume_external(persisted, make_test_intent())
+            .resume_external(persisted, make_test_intent(), None)
             .await
             .unwrap();
         assert_eq!(resumed, persisted, "resume must reuse the persisted id");
@@ -8890,7 +9011,7 @@ mod tests {
 
         let persisted = Uuid::new_v4();
         let fresh = registry
-            .resume_external(persisted, make_test_intent())
+            .resume_external(persisted, make_test_intent(), None)
             .await
             .unwrap();
         assert_ne!(fresh, persisted, "404 fallback mints a NEW id");
@@ -8924,7 +9045,7 @@ mod tests {
 
         let persisted = Uuid::new_v4();
         let resumed = registry
-            .resume_external(persisted, make_test_intent())
+            .resume_external(persisted, make_test_intent(), None)
             .await
             .unwrap();
         assert_eq!(resumed, persisted);
@@ -8954,7 +9075,7 @@ mod tests {
         let mut intent = make_test_intent();
         intent.purpose = "x".into();
         let err = registry
-            .resume_external(Uuid::new_v4(), intent)
+            .resume_external(Uuid::new_v4(), intent, None)
             .await
             .unwrap_err();
         assert!(matches!(err, crate::session::SessionError::Intent(_)));
@@ -10558,6 +10679,358 @@ mod tests {
             "the fetch must not log a refusal itself — only the loop can tell a standing \
              refusal from a first one, and a per-call warn is the defect. Body was:\n{body}"
         );
+    }
+
+    // ── Plan 2026-10-23-a-hookless-resume-…: the re-key seam against coord ──
+
+    mod coord_rekeys {
+        use super::*;
+        use crate::session::coord_identity::{
+            apply_reconcile_tick, confirm_for_session, rekey_rung2_binds, settle_refusals,
+            RekeyOutcome, RekeySource, SourceCounts,
+        };
+        use crate::session::reconcile::{
+            run_reconcile, BindOrigin, LivePty, PrescannedTranscriptIndex, ReconcileAction,
+        };
+        use crate::session::session_lifecycle_store::SessionLifecycleStore;
+
+        const PIN: &str = "2711c738-0000-4000-8000-000000000001";
+        const LIVE: &str = "44348633-0000-4000-8000-000000000002";
+        const PREV_BOOT: &str = "3c37caf2-0000-4000-8000-000000000003";
+
+        fn rung2(terminal: &str, id: &str) -> Vec<ReconcileAction> {
+            vec![ReconcileAction::Bind {
+                terminal_id: terminal.into(),
+                session_id: id.into(),
+                config_dir: String::new(),
+                origin: BindOrigin::Authoritative,
+                confirmed: false,
+            }]
+        }
+
+        fn rekey_rows(outbox: &OutboxWriter, session: Uuid) -> Vec<JsonValue> {
+            outbox
+                .pending()
+                .unwrap()
+                .into_iter()
+                .filter(|r| {
+                    r.session_id == session
+                        && r.event_kind == "state_change"
+                        && r.payload.get("claude_code_session_id").is_some()
+                })
+                .map(|r| r.payload)
+                .collect()
+        }
+
+        fn local_id(reg: &SessionRegistry, id: Uuid) -> Option<String> {
+            reg.describe_by_id(id).unwrap().claude_code_session_id
+        }
+
+        async fn harness() -> (
+            Arc<SessionRegistry>,
+            CoordSync,
+            Arc<OutboxWriter>,
+            Arc<TokMutex<CoordRecorder>>,
+            tempfile::TempDir,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let outbox = build_outbox(dir.path());
+            let (base, rec) = spawn_fake_coord().await;
+            let coord = CoordSync::new_for_test(
+                outbox.clone(),
+                base,
+                Duration::from_secs(3600),
+                Duration::from_secs(3600),
+            );
+            let reg = build_registry(coord.clone());
+            (reg, coord, outbox, rec, dir)
+        }
+
+        /// 409 `harness_session_already_bound` → `refused` +1 (never `landed`),
+        /// the row leaves the queue, the next tick restores the local id and
+        /// re-queues; once the competing row lapses a 2xx gives `landed` +1 and
+        /// the tick after that queues nothing.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refused_rekey_is_counted_restored_and_requeued_until_it_lands() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, outbox, rec, _dir) = harness().await;
+            rec.lock().await.rekey_conflict_ids = vec![LIVE.to_string()];
+            let row = reg
+                .register_external_with_lineage(make_test_intent(), None, Some(PIN.into()))
+                .unwrap();
+            let lookup = |t: &str| (t == "t1").then_some(row);
+
+            let tick1 = apply_reconcile_tick(&reg, &rung2("t1", LIVE), lookup);
+            assert_eq!(tick1, vec![("t1".to_string(), RekeyOutcome::Queued)]);
+            coord.drain_once_for_test().await;
+
+            let ledger = coord.rekeys();
+            assert_eq!(
+                ledger.counts(RekeySource::Rung2),
+                SourceCounts {
+                    queued: 1,
+                    landed: 0,
+                    refused: 1
+                }
+            );
+            assert!(
+                outbox.pending().unwrap().is_empty(),
+                "a refusal is never left queued"
+            );
+            assert_eq!(ledger.last_landed(row), None);
+
+            // Next tick: restored to what coord holds, then re-queued by rung 2.
+            settle_refusals(&reg);
+            assert_eq!(
+                local_id(&reg, row).as_deref(),
+                Some(PIN),
+                "local id restored"
+            );
+            let tick2 = rekey_rung2_binds(&reg, &rung2("t1", LIVE), lookup, |_| false);
+            assert_eq!(tick2, vec![("t1".to_string(), RekeyOutcome::Queued)]);
+            assert_eq!(rekey_rows(&outbox, row).len(), 1);
+
+            // The competing row lapses: coord accepts.
+            rec.lock().await.rekey_conflict_ids.clear();
+            coord.drain_once_for_test().await;
+            assert_eq!(
+                ledger.counts(RekeySource::Rung2),
+                SourceCounts {
+                    queued: 2,
+                    landed: 1,
+                    refused: 1
+                }
+            );
+            assert_eq!(ledger.last_landed(row).as_deref(), Some(LIVE));
+
+            let tick3 = apply_reconcile_tick(&reg, &rung2("t1", LIVE), lookup);
+            assert_eq!(
+                tick3,
+                vec![("t1".to_string(), RekeyOutcome::AlreadyCurrent)]
+            );
+            assert!(rekey_rows(&outbox, row).is_empty());
+        }
+
+        /// A refused HOOK re-key has no per-tick evidence to re-supply it, so
+        /// the settle step re-queues the refused id itself.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refused_hook_rekey_is_requeued_by_the_settle_step() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, outbox, rec, _dir) = harness().await;
+            rec.lock().await.rekey_conflict_ids = vec![LIVE.to_string()];
+            let row = reg
+                .register_external_with_lineage(make_test_intent(), None, Some(PIN.into()))
+                .unwrap();
+            assert_eq!(
+                confirm_for_session(&reg, row, LIVE, RekeySource::Hook),
+                RekeyOutcome::Queued
+            );
+            coord.drain_once_for_test().await;
+            assert_eq!(coord.rekeys().counts(RekeySource::Hook).refused, 1);
+
+            apply_reconcile_tick(&reg, &[], |_| None);
+            let rows = rekey_rows(&outbox, row);
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0]["claude_code_session_id"], json!(LIVE));
+            assert_eq!(rows[0]["rekey_source"], json!("hook"));
+            assert_eq!(rows[0]["rekey_previous"], json!(PIN));
+            assert_eq!(local_id(&reg, row).as_deref(), Some(LIVE));
+        }
+
+        /// A plain-state 409 (row gone / already in target state) stays the
+        /// idempotent `Acked`; so does a re-key 409 carrying any OTHER code.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_plain_state_409_stays_acked() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (_reg, coord, outbox, rec, _dir) = harness().await;
+            rec.lock().await.patch_status = Some(409);
+            let s = Uuid::new_v4();
+            let plain = outbox
+                .record(
+                    Uuid::new_v4(),
+                    s,
+                    SessionEventKind::StateChange,
+                    json!({"id": s, "state": "active"}),
+                )
+                .unwrap();
+            assert!(matches!(
+                push_record(&coord.inner, &plain).await,
+                PushOutcome::Acked
+            ));
+            let other_code = outbox
+                .record(
+                    Uuid::new_v4(),
+                    s,
+                    SessionEventKind::StateChange,
+                    json!({"id": s, "claude_code_session_id": LIVE, "rekey_source": "rung2"}),
+                )
+                .unwrap();
+            assert!(matches!(
+                push_record(&coord.inner, &other_code).await,
+                PushOutcome::Acked
+            ));
+            assert_eq!(
+                coord.rekeys().counts(RekeySource::Rung2),
+                SourceCounts::default()
+            );
+        }
+
+        /// Phase 2: a `Found` resume of a persisted row last keyed X queues the
+        /// re-activation and THEN its own re-key to the pane's pin P; the probe
+        /// body stays `{state, heartbeat}`; the re-key lands on drain.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_found_resume_rekeys_the_row_to_the_panes_pin() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, outbox, rec, _dir) = harness().await;
+            let persisted = Uuid::new_v4();
+            let resumed = reg
+                .resume_external(persisted, make_test_intent(), Some(LIVE.into()))
+                .await
+                .unwrap();
+            assert_eq!(resumed, persisted);
+
+            {
+                let g = rec.lock().await;
+                assert_eq!(g.patches.len(), 1, "only the probe so far");
+                assert_eq!(
+                    g.patches[0].1,
+                    json!({"state": "active", "heartbeat": true})
+                );
+            }
+            let pending: Vec<JsonValue> = outbox
+                .pending()
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.session_id == persisted)
+                .map(|r| r.payload)
+                .collect();
+            assert_eq!(pending.len(), 2, "{pending:?}");
+            assert_eq!(pending[0]["state"], json!("active"));
+            assert!(pending[0].get("claude_code_session_id").is_none());
+            assert_eq!(pending[1]["claude_code_session_id"], json!(LIVE));
+            assert_eq!(pending[1]["rekey_source"], json!("r2_resume"));
+            assert_eq!(coord.rekeys().counts(RekeySource::R2Resume).queued, 1);
+            assert_eq!(local_id(&reg, persisted).as_deref(), Some(LIVE));
+
+            coord.drain_once_for_test().await;
+            let g = rec.lock().await;
+            assert_eq!(
+                g.patches.last().unwrap().1,
+                json!({"claude_code_session_id": LIVE, "heartbeat": true})
+            );
+            drop(g);
+            assert_eq!(coord.rekeys().counts(RekeySource::R2Resume).landed, 1);
+        }
+
+        /// Phase 2: the 404 fallback's fresh `Started` row carries the pin, so
+        /// no second re-key is queued.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_not_found_resume_registers_fresh_with_the_pin() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, outbox, rec, _dir) = harness().await;
+            rec.lock().await.patch_returns_404 = true;
+            let gone = Uuid::new_v4();
+            let fresh = reg
+                .resume_external(gone, make_test_intent(), Some(PREV_BOOT.into()))
+                .await
+                .unwrap();
+            assert_ne!(fresh, gone);
+            let pending = outbox.pending().unwrap();
+            let started = pending
+                .iter()
+                .find(|r| r.session_id == fresh && r.event_kind == "started")
+                .expect("started row");
+            assert_eq!(started.payload["claude_code_session_id"], json!(PREV_BOOT));
+            assert!(rekey_rows(&outbox, fresh).is_empty());
+            assert_eq!(coord.rekeys().counts(RekeySource::R2Resume).queued, 0);
+        }
+
+        /// Phase 2: a probe coord REFUSED (401/403) resumes optimistically and
+        /// still queues the `r2_resume` re-key.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refused_resume_probe_still_queues_the_rekey() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, outbox, rec, _dir) = harness().await;
+            rec.lock().await.patch_status = Some(401);
+            let persisted = Uuid::new_v4();
+            reg.resume_external(persisted, make_test_intent(), Some(LIVE.into()))
+                .await
+                .unwrap();
+            let rows = rekey_rows(&outbox, persisted);
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0]["rekey_source"], json!("r2_resume"));
+            assert_eq!(coord.rekeys().counts(RekeySource::R2Resume).queued, 1);
+        }
+
+        /// ARMING: drive the tick composition end to end — a live PTY whose
+        /// claude argv names LIVE (rung 2), its pane row registered under the
+        /// stale pin — and assert on the PATCH coord received and on the
+        /// counted outcome, not on the seam's return value.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn arming_the_tick_composition_lands_a_rung2_rekey_in_coord() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, _outbox, rec, dir) = harness().await;
+            let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+            let row = reg
+                .register_external_with_lineage(make_test_intent(), None, Some(PIN.into()))
+                .unwrap();
+            let live = vec![LivePty {
+                terminal_id: "pane-1".into(),
+                pid: Some(1),
+                working_dir: "/repo".into(),
+                page_id: "p".into(),
+                title: "t".into(),
+                ai_pid: Some(31524),
+                ai_start_unix: Some(1_000),
+            }];
+            let cmdlines: HashMap<u32, String> = [(31524u32, LIVE.to_string())].into();
+            let actions = run_reconcile(
+                &store,
+                &live,
+                &crate::process_capture::process_tree::ProcessSnapshot::default(),
+                &PrescannedTranscriptIndex::default(),
+                &cmdlines,
+            );
+            apply_reconcile_tick(&reg, &actions, |t| (t == "pane-1").then_some(row));
+            coord.drain_once_for_test().await;
+
+            {
+                let g = rec.lock().await;
+                let rekeys: Vec<&JsonValue> = g
+                    .patches
+                    .iter()
+                    .filter(|(id, b)| *id == row && b.get("claude_code_session_id").is_some())
+                    .map(|(_, b)| b)
+                    .collect();
+                assert_eq!(
+                    rekeys,
+                    vec![&json!({"claude_code_session_id": LIVE, "heartbeat": true})],
+                    "coord must receive exactly one re-key PATCH, with no runner-only fields"
+                );
+            }
+            assert_eq!(coord.rekeys().counts(RekeySource::Rung2).landed, 1);
+            assert_eq!(coord.rekeys().last_landed(row).as_deref(), Some(LIVE));
+
+            // The next tick (the lifecycle record is still unconfirmed, so the
+            // pass re-emits the rung-2 bind) sends nothing more.
+            let again = run_reconcile(
+                &store,
+                &live,
+                &crate::process_capture::process_tree::ProcessSnapshot::default(),
+                &PrescannedTranscriptIndex::default(),
+                &cmdlines,
+            );
+            apply_reconcile_tick(&reg, &again, |t| (t == "pane-1").then_some(row));
+            coord.drain_once_for_test().await;
+            let n = rec
+                .lock()
+                .await
+                .patches
+                .iter()
+                .filter(|(id, b)| *id == row && b.get("claude_code_session_id").is_some())
+                .count();
+            assert_eq!(n, 1, "no second re-key PATCH");
+        }
     }
 }
 

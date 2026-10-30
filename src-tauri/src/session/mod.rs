@@ -61,6 +61,7 @@ pub mod claude_activity; // The ACTIVITY axis of a live `claude` (working/idle/s
 pub mod claude_hook;
 pub mod claude_session_registry;
 pub mod closeout_spool; // Producer for the two closeout outbox kinds — the loopback coord-write forwarders spool here when coord is UNREACHABLE (plan 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline, Phase 3)
+pub mod coord_identity; // THE seam that re-keys a pane's coord row to the harness id pid-exact evidence names — hook, rung 2, R2 resume (plan 2026-10-23-a-hookless-resume-in-a-runner-pane-leaves-the-session-with-no-active-coord-row, D1)
 pub mod coord_sync;
 pub mod coord_transport_rung; // WHICH transport rung carried a coord call — the producer for `coord-transport-rung` session events (plan 2026-09-07-no-per-session-record-of-which-transport-rung-carried-a-coord-read, Phase 1)
 pub mod create; // Remote-CREATE grants: the `create_request` directive arm + device-bound catch-up poll — the attach twin, so the target verifies a create grant itself instead of trusting the relay (plan 2026-09-11-headless-runner-parity-from-a-headed-runner, Phase 3b)
@@ -1358,10 +1359,17 @@ impl SessionRegistry {
     /// including the `heartbeat` this event also carries. Refusing locally
     /// keeps a provider that reports a non-UUID id (none does today) from
     /// costing the session its liveness stamp.
+    ///
+    /// Callers go through [`coord_identity`]'s seam, which labels the evidence
+    /// (`source`) and counts coord's answer. The label and the record's previous
+    /// id ride the outbox row (`rekey_source` / `rekey_previous`) so the drain
+    /// can report a refusal back without calling into this registry;
+    /// `state_change_body` forwards neither to coord.
     pub fn confirm_claude_code_session_id(
         &self,
         id: Uuid,
         confirmed: &str,
+        source: coord_identity::RekeySource,
     ) -> Result<bool, SessionError> {
         let confirmed = confirmed.trim();
         if Uuid::parse_str(confirmed).is_err() {
@@ -1370,16 +1378,18 @@ impl SessionRegistry {
             ));
         }
 
-        let changed = self.with_record(id, |rec| {
+        let previous = self.with_record(id, |rec| {
             if rec.claude_code_session_id.as_deref() == Some(confirmed) {
-                return false;
+                return None;
             }
-            rec.claude_code_session_id = Some(confirmed.to_string());
-            true
+            Some(std::mem::replace(
+                &mut rec.claude_code_session_id,
+                Some(confirmed.to_string()),
+            ))
         })?;
-        if !changed {
+        let Some(previous) = previous else {
             return Ok(false);
-        }
+        };
 
         // Its OWN `state_change`, carrying only the corrected id (plus the
         // heartbeat every state change carries). Coord refuses the whole PATCH
@@ -1389,12 +1399,43 @@ impl SessionRegistry {
         let payload = json!({
             "id": id,
             "claude_code_session_id": confirmed,
+            "rekey_source": source.as_str(),
+            "rekey_previous": previous,
         });
-        self.coord_sync
-            .outbox()
-            .record(self.machine_id, id, SessionEventKind::StateChange, payload)
-            .map_err(|e| SessionError::Outbox(e.to_string()))?;
+        if let Err(e) = self.coord_sync.outbox().record(
+            self.machine_id,
+            id,
+            SessionEventKind::StateChange,
+            payload,
+        ) {
+            // Nothing was queued, so the record must not claim the id either —
+            // otherwise every later confirmation of it would read "already
+            // current" and the row would never be re-keyed.
+            let _ = self.restore_claude_code_session_id(id, confirmed, previous);
+            return Err(SessionError::Outbox(e.to_string()));
+        }
         Ok(true)
+    }
+
+    /// Move a record's `claude_code_session_id` from `expected` back to
+    /// `restore_to` — only when it still holds `expected` (a newer re-key has
+    /// otherwise superseded it). `Ok(true)` when it moved. Used by
+    /// [`coord_identity`] to undo a re-key coord REFUSED, since
+    /// [`Self::confirm_claude_code_session_id`] moves the record before coord
+    /// answers. Emits nothing: the row in coord never moved.
+    pub fn restore_claude_code_session_id(
+        &self,
+        id: Uuid,
+        expected: &str,
+        restore_to: Option<String>,
+    ) -> Result<bool, SessionError> {
+        self.with_record(id, |rec| {
+            if rec.claude_code_session_id.as_deref() != Some(expected) {
+                return false;
+            }
+            rec.claude_code_session_id = restore_to;
+            true
+        })
     }
 
     /// R2 (session-lifecycle-cleanup) — RESUME a previously-registered
@@ -1448,10 +1489,27 @@ impl SessionRegistry {
     ///
     /// Returns the coord session id the pane should now persist (either the
     /// resumed `persisted_id` or the fresh fallback id).
+    ///
+    /// ## The pane's current pin (Phase 2 of plan
+    /// `2026-10-23-a-hookless-resume-in-a-runner-pane-leaves-the-session-with-no-active-coord-row`)
+    ///
+    /// `pinned` is the harness id the identity seam pinned THIS spawn's PTY
+    /// child to — the same value the fresh-register arm keys a new row by.
+    /// Without it a resumed row kept the first-ever pin it was registered
+    /// under, through every restart, while nothing ran under it. After
+    /// `Found`, `Unreachable` or `Refused` the row is re-keyed to `pinned`
+    /// through [`coord_identity::confirm_for_session`] (`source=r2_resume`),
+    /// which queues its OWN `state_change` behind the re-activation row, so a
+    /// coord `harness_session_already_bound` refusal cannot cost the
+    /// re-activation. `insert_resumed_record` deliberately does NOT pre-stamp
+    /// the pin: the confirm would then compare it with itself and queue
+    /// nothing. `NotFound` registers fresh WITH the pin, so its `Started` row
+    /// already carries it.
     pub async fn resume_external(
         self: &Arc<Self>,
         persisted_id: Uuid,
         intent: Intent,
+        pinned: Option<String>,
     ) -> Result<Uuid, SessionError> {
         intent.validate()?;
         // Stamp before the probe, for the same reason `start_inner` and
@@ -1497,6 +1555,7 @@ impl SessionRegistry {
                     row_tenant_observed = row_tenant.is_some(),
                     "session: resumed existing coord session (PATCH 2xx)"
                 );
+                self.rekey_resumed_to_pin(persisted_id, pinned.as_deref());
                 Ok(persisted_id)
             }
             ResumeProbe::NotFound => {
@@ -1504,7 +1563,7 @@ impl SessionRegistry {
                     session = %persisted_id,
                     "session: persisted coord session gone (404) — registering fresh"
                 );
-                self.register_external(intent)
+                self.register_external_with_lineage(intent, None, pinned)
             }
             ResumeProbe::Unreachable => {
                 // Optimistic resume — coord is down, not the row. Re-use the
@@ -1514,6 +1573,7 @@ impl SessionRegistry {
                     session = %persisted_id,
                     "session: coord unreachable during resume — resuming optimistically, drain loop will retry"
                 );
+                self.rekey_resumed_to_pin(persisted_id, pinned.as_deref());
                 Ok(persisted_id)
             }
             ResumeProbe::Refused(status) => {
@@ -1529,8 +1589,23 @@ impl SessionRegistry {
                     "session: coord REFUSED the resume probe's credential — resuming optimistically; \
                      the row's existence and tenant are unconfirmed"
                 );
+                self.rekey_resumed_to_pin(persisted_id, pinned.as_deref());
                 Ok(persisted_id)
             }
+        }
+    }
+
+    /// Re-key a just-resumed row to the pane's current pin through the seam
+    /// (`source=r2_resume`). `None` (the terminal vanished before its pin was
+    /// read) re-keys nothing.
+    fn rekey_resumed_to_pin(&self, persisted_id: Uuid, pinned: Option<&str>) {
+        if let Some(pin) = pinned {
+            coord_identity::confirm_for_session(
+                self,
+                persisted_id,
+                pin,
+                coord_identity::RekeySource::R2Resume,
+            );
         }
     }
 
@@ -2710,7 +2785,9 @@ mod tests {
             "registration emits `started`, never a state change"
         );
 
-        assert!(reg.confirm_claude_code_session_id(id, confirmed).unwrap());
+        assert!(reg
+            .confirm_claude_code_session_id(id, confirmed, coord_identity::RekeySource::Hook)
+            .unwrap());
         assert_eq!(
             reg.describe(id).unwrap().claude_code_session_id.as_deref(),
             Some(confirmed),
@@ -2719,6 +2796,7 @@ mod tests {
         let emitted = state_changes(&reg);
         assert_eq!(emitted.len(), 1, "exactly one confirmation event");
         assert_eq!(emitted[0]["claude_code_session_id"], confirmed);
+        assert_eq!(emitted[0]["rekey_source"], "hook");
         assert!(
             emitted[0].get("state").is_none(),
             "the confirmation rides alone — coord refuses the WHOLE patch when \
@@ -2726,17 +2804,23 @@ mod tests {
         );
 
         // Idempotent: the hook can fire again for the same session.
-        assert!(!reg.confirm_claude_code_session_id(id, confirmed).unwrap());
+        assert!(!reg
+            .confirm_claude_code_session_id(id, confirmed, coord_identity::RekeySource::Hook)
+            .unwrap());
         assert_eq!(state_changes(&reg).len(), 1, "no second event");
 
         // Whitespace is trimmed, so a padded re-send is still the same value.
         assert!(!reg
-            .confirm_claude_code_session_id(id, &format!("  {confirmed}  "))
+            .confirm_claude_code_session_id(
+                id,
+                &format!("  {confirmed}  "),
+                coord_identity::RekeySource::Hook
+            )
             .unwrap());
 
         // A non-uuid never reaches the outbox, and never moves the record.
         assert!(matches!(
-            reg.confirm_claude_code_session_id(id, "not-a-uuid"),
+            reg.confirm_claude_code_session_id(id, "not-a-uuid", coord_identity::RekeySource::Hook),
             Err(SessionError::InvalidClaudeCodeSessionId(_))
         ));
         assert_eq!(
@@ -2747,7 +2831,11 @@ mod tests {
 
         // An unknown session is NotFound, not a silent success.
         assert!(matches!(
-            reg.confirm_claude_code_session_id(Uuid::new_v4(), confirmed),
+            reg.confirm_claude_code_session_id(
+                Uuid::new_v4(),
+                confirmed,
+                coord_identity::RekeySource::Hook
+            ),
             Err(SessionError::NotFound(_))
         ));
     }
