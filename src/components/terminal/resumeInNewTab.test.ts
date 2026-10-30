@@ -6,7 +6,7 @@
  * share it.
  */
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => ({})) }));
 const stored = new Map<string, unknown>();
@@ -27,12 +27,19 @@ import {
   pastSessionResumeTarget,
   resumeFailureNotice,
   resumeInNewTab,
+  resumeProfileBatch,
   resumeProfileSession,
   resumeThrownNotice,
   retryResumeArgs,
   runVerifiedFork,
   type ResumeInNewTabDeps,
 } from "./resumeInNewTab";
+import {
+  claimResume,
+  clearResumesInFlight,
+  isResumeInFlight,
+  RESUME_IN_FLIGHT_GRACE_MS,
+} from "./resumeGate";
 import type { SessionOpenArgs } from "./sessionRecordArgs";
 
 const HOME = "/home/u/.claude";
@@ -360,6 +367,78 @@ describe("the default account's explicit path stays out of tabs and profiles", (
     );
     expect(verify).not.toHaveBeenCalled();
     warn.mockRestore();
+  });
+});
+
+/**
+ * The zone-profile restore holds each typed id's in-flight claim (review r2
+ * finding 3): in the seconds after it types `--resume`, before the restored
+ * claude writes its registry file, a click would otherwise read the id as free.
+ */
+describe("resumeProfileBatch — the zone-profile restore under the in-flight claim", () => {
+  beforeEach(() => clearResumesInFlight());
+  afterEach(() => vi.useRealTimers());
+
+  it("a held claim skips that record as in flight; the others type, after ONE registry read", async () => {
+    const held = claimResume("held-id")!;
+    const readLiveIds = vi.fn(async (): Promise<ReadonlySet<string> | null> => new Set<string>());
+    const resumeOne = vi.fn(async (_item: { claudeSessionId: string }) => {});
+    const onSkip = vi.fn();
+    await resumeProfileBatch([{ claudeSessionId: "held-id" }, { claudeSessionId: "free-id" }], {
+      readLiveIds,
+      resumeOne,
+      onSkip,
+    });
+    expect(resumeOne.mock.calls).toEqual([[{ claudeSessionId: "free-id" }]]);
+    expect(onSkip.mock.calls).toEqual([[{ claudeSessionId: "held-id" }, "in-flight"]]);
+    expect(readLiveIds).toHaveBeenCalledTimes(1);
+    held.release();
+  });
+
+  it("holds a typed id's claim until its resume settles plus the grace, then releases it", async () => {
+    vi.useFakeTimers();
+    let finish!: () => void;
+    const resumeOne = vi.fn(() => new Promise<void>((r) => (finish = r)));
+    await resumeProfileBatch([{ claudeSessionId: "a" }], {
+      readLiveIds: async () => new Set<string>(),
+      resumeOne,
+    });
+    expect(resumeOne).toHaveBeenCalledTimes(1);
+    // A click while the restored claude starts finds the id in flight.
+    expect(claimResume("a")).toBeNull();
+
+    finish();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(RESUME_IN_FLIGHT_GRACE_MS - 1);
+    expect(isResumeInFlight("a")).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(isResumeInFlight("a")).toBe(false);
+  });
+
+  it("a live id, and every id under an unreadable registry, is skipped with its claim released at once", async () => {
+    const resumeOne = vi.fn(async (_item: { claudeSessionId: string }) => {});
+    const onSkip = vi.fn();
+    await resumeProfileBatch([{ claudeSessionId: "live" }, { claudeSessionId: "free" }], {
+      readLiveIds: async () => new Set(["live"]),
+      resumeOne,
+      onSkip,
+    });
+    expect(onSkip.mock.calls).toEqual([[{ claudeSessionId: "live" }, "skip-alive"]]);
+    expect(resumeOne.mock.calls).toEqual([[{ claudeSessionId: "free" }]]);
+    expect(isResumeInFlight("live")).toBe(false);
+
+    clearResumesInFlight();
+    onSkip.mockClear();
+    resumeOne.mockClear();
+    await resumeProfileBatch([{ claudeSessionId: "x" }, { claudeSessionId: "y" }], {
+      readLiveIds: async () => null,
+      resumeOne,
+      onSkip,
+    });
+    expect(resumeOne).not.toHaveBeenCalled();
+    expect(onSkip.mock.calls.map(([, why]) => why)).toEqual(["skip-unknown", "skip-unknown"]);
+    expect(isResumeInFlight("x")).toBe(false);
+    expect(isResumeInFlight("y")).toBe(false);
   });
 });
 

@@ -47,12 +47,19 @@ import {
   reconnectedTabFor,
   decideDrainSkipDisposition,
   applyDrainSkip,
+  drainColdResume,
   holdNeedsAccountIfNotLive,
   applyNeedsAccountNote,
   type NeedsAccountRecord,
 } from "./useTerminalInitialization";
 import type { TerminalSessionRecord } from "./types";
 import type { SessionOpenArgs } from "./sessionRecordArgs";
+import {
+  claimResume,
+  clearResumesInFlight,
+  isResumeInFlight,
+  RESUME_IN_FLIGHT_GRACE_MS,
+} from "./resumeGate";
 
 /** The default Claude home the account rule is judged against. */
 const HOME = "/home/u/.claude";
@@ -1107,6 +1114,91 @@ describe("applyDrainSkip (item 1 — the wiring, not just the decision)", () => 
       },
     });
     expect(seen).toContain("terminal_session_clear_restore_pending");
+  });
+});
+
+/**
+ * The boot drain's typed resume holds the id's in-flight claim (review r2
+ * finding 3): in the seconds after the drain types `--resume`, before the
+ * restored claude writes its registry file, a click would otherwise read the id
+ * as free and start a second writer.
+ */
+describe("drainColdResume — the drain's typed resume under the in-flight claim", () => {
+  const SID = "sess-drain-1";
+
+  beforeEach(() => clearResumesInFlight());
+  afterEach(() => vi.useRealTimers());
+
+  function drain(over: Partial<Parameters<typeof drainColdResume>[0]> = {}) {
+    const updateTab = vi.fn();
+    const invokeFn = vi.fn(async (_cmd: string, _args?: Record<string, unknown>) => undefined);
+    const type = vi.fn(async (): Promise<unknown> => "verified");
+    const readLiveIds = vi.fn(async (): Promise<ReadonlySet<string> | null> => new Set<string>());
+    const params = {
+      tabId: "tab-restored",
+      claudeSessionId: SID,
+      zoneIndex: 2,
+      readLiveIds,
+      updateTab,
+      type,
+      invokeFn,
+      ...over,
+    };
+    return { params, updateTab, invokeFn, type, readLiveIds };
+  }
+
+  it("a held claim skips the record as alive: no read, no type, the skip-alive disposition", async () => {
+    const held = claimResume(SID)!;
+    const { params, updateTab, invokeFn, type, readLiveIds } = drain();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    await expect(drainColdResume(params)).resolves.toBe("skip-alive");
+    expect(readLiveIds).not.toHaveBeenCalled();
+    expect(type).not.toHaveBeenCalled();
+    expect(updateTab).toHaveBeenCalledWith("tab-restored", {
+      isReconnecting: false,
+      restoreTerminalOnly: true,
+    });
+    expect(invokeFn.mock.calls.map(([cmd]) => cmd)).toEqual([
+      "terminal_session_rebind_terminal",
+      "terminal_session_clear_restore_pending",
+    ]);
+    held.release();
+    vi.mocked(console.warn).mockRestore();
+  });
+
+  it("respawn types once, holding the claim while typing and for the grace after, then releases it", async () => {
+    vi.useFakeTimers();
+    let finish!: () => void;
+    const type = vi.fn(() => new Promise<unknown>((r) => (finish = () => r("verified"))));
+    const { params, updateTab, readLiveIds } = drain({ type });
+    await expect(drainColdResume(params)).resolves.toBe("respawn");
+    expect(readLiveIds).toHaveBeenCalledTimes(1);
+    expect(type).toHaveBeenCalledTimes(1);
+    expect(updateTab).not.toHaveBeenCalled();
+    // A click while the restored claude starts finds the id in flight.
+    expect(claimResume(SID)).toBeNull();
+
+    finish();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(RESUME_IN_FLIGHT_GRACE_MS - 1);
+    expect(isResumeInFlight(SID)).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(isResumeInFlight(SID)).toBe(false);
+  });
+
+  it("a live or unreadable registry at drain time skips, and releases the claim at once", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const cases: Array<[ReadonlySet<string> | null, "skip-alive" | "skip-unknown"]> = [
+      [new Set([SID]), "skip-alive"],
+      [null, "skip-unknown"],
+    ];
+    for (const [ids, expected] of cases) {
+      const { params, type } = drain({ readLiveIds: async () => ids });
+      await expect(drainColdResume(params)).resolves.toBe(expected);
+      expect(type).not.toHaveBeenCalled();
+      expect(isResumeInFlight(SID)).toBe(false);
+    }
+    vi.mocked(console.warn).mockRestore();
   });
 });
 

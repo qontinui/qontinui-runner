@@ -24,6 +24,7 @@ import { rememberSessionId } from "./lastKnownSessionIds";
 import { loadKnownPageIds, readPinnedPageId } from "./useTerminalPages";
 import { getPageBindings, type PageBindings } from "@/lib/pageBindings";
 import { fetchLiveClaudeSessionIds } from "./liveClaudeSessions";
+import { runClaimedRestoreResume } from "./resumeGate";
 import type { ResourceGuardSource } from "@/lib/resourceGuard";
 import {
   loadDefaultConfigHome,
@@ -1071,6 +1072,62 @@ export async function applyDrainSkip(params: {
     }
   }
   return disposition;
+}
+
+/**
+ * The boot drain's typed resume for ONE cold-created tab: the drain-time
+ * liveness re-check and the typed resume, under the id's in-flight claim
+ * (`resumeGate.runClaimedRestoreResume`).
+ *
+ * The claim is what a liveness read cannot give: in the seconds after the
+ * drain types `--resume`, before the restored claude writes its registry file,
+ * a click reads the id as free. Holding the claim across the type, and for the
+ * grace after it, makes that click see the resume in flight instead. An id
+ * already claimed in this window (a click, the Retry, another restore) is
+ * skipped as alive — no read, no type — and gets the same skip disposition
+ * ({@link applyDrainSkip}) as a drain-time `skip-alive`.
+ *
+ * Re-read the registry immediately before typing EACH resume, with the
+ * classify-time polarity: the classify-time snapshot is up to ~25 s stale by
+ * the time the drain reaches a tab on a large page. `type` is started and not
+ * awaited, so one slow verification does not serialize the drain.
+ *
+ * Returns the decision it acted on (`respawn` when typing started).
+ */
+export async function drainColdResume(params: {
+  tabId: string;
+  claudeSessionId: string;
+  zoneIndex: number;
+  readLiveIds: () => Promise<ReadonlySet<string> | null>;
+  updateTab: Parameters<typeof applyDrainSkip>[0]["updateTab"];
+  /** Type the resume and verify it (`runVerifiedResume`). */
+  type: () => Promise<unknown>;
+  invokeFn?: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
+}): Promise<ColdResumeDecision> {
+  const { tabId, claudeSessionId } = params;
+  const result = await runClaimedRestoreResume(
+    claudeSessionId,
+    async () => decideColdResume(await params.readLiveIds(), claudeSessionId),
+    params.type,
+  );
+  if (result.kind === "typing") return "respawn";
+  console.warn(
+    `[TerminalPage] drain-time skip for session ${claudeSessionId}: ` +
+      (result.kind === "skip-alive"
+        ? result.inFlight
+          ? "a resume of this id is already in flight in this window"
+          : "a live Claude process now hosts this id (typing --resume would fork it)"
+        : "live-session registry unreadable at drain time — failing closed toward not-respawning"),
+  );
+  await applyDrainSkip({
+    decision: result.kind,
+    tabId,
+    claudeSessionId,
+    zoneIndex: params.zoneIndex,
+    updateTab: params.updateTab,
+    invokeFn: params.invokeFn,
+  });
+  return result.kind;
 }
 
 /** Validate session IDs before interpolating into shell commands. */
@@ -2227,43 +2284,36 @@ export function useTerminalInitialization({
                   // branch, which an unmatched record cannot reach). See
                   // `decideDrainSkipDisposition` for the full mechanism; the
                   // skip now rebinds, clears the marker, and surfaces an
-                  // honest banner. The decision (`decideColdResume`) and the
-                  // disposition + its IPC wiring (`applyDrainSkip`) are both
-                  // covered by pure tests; only this timer closure is not.
-                  const liveNow = await fetchLiveClaudeSessionIds();
-                  const drainDecision = decideColdResume(liveNow, restore.claudeSessionId);
-                  if (drainDecision !== "respawn") {
-                    console.warn(
-                      `[TerminalPage] drain-time skip for session ${restore.claudeSessionId}: ` +
-                        (drainDecision === "skip-alive"
-                          ? "a live Claude process now hosts this id (typing --resume would fork it)"
-                          : "live-session registry unreadable at drain time — failing closed toward not-respawning"),
-                    );
-                    await applyDrainSkip({
-                      decision: drainDecision,
-                      tabId: restore.tabId,
-                      claudeSessionId: restore.claudeSessionId,
-                      zoneIndex: restore.recordOpen?.zoneIndex ?? -1,
-                      updateTab,
-                    });
-                    continue;
-                  }
-                  // Type the resume and VERIFY the handshake (retry once on
-                  // failure). Fire-and-forget per tab so one slow/failed
-                  // verification (up to ~30s) doesn't serialize the drain;
-                  // `runVerifiedResume` owns clearing `isReconnecting` /
-                  // setting `resumeFailed` and never throws.
-                  void runVerifiedResume({
-                    terminalRefs: terminalRefs.current,
+                  // honest banner. The decision (`decideColdResume`), the
+                  // claim, the disposition and its IPC wiring all live in
+                  // `drainColdResume`, which is covered by pure tests; only
+                  // this timer closure is not.
+                  //
+                  // The type itself: VERIFY the handshake (retry once on
+                  // failure). `drainColdResume` starts it without awaiting it,
+                  // so one slow/failed verification (up to ~30s) doesn't
+                  // serialize the drain; `runVerifiedResume` owns clearing
+                  // `isReconnecting` / setting `resumeFailed` and never throws.
+                  const claudeSessionId = restore.claudeSessionId;
+                  await drainColdResume({
                     tabId: restore.tabId,
-                    claudeSessionId: restore.claudeSessionId,
-                    configDir: restore.claudeConfigDir,
-                    provider: restore.provider,
+                    claudeSessionId,
+                    zoneIndex: restore.recordOpen?.zoneIndex ?? -1,
+                    readLiveIds: fetchLiveClaudeSessionIds,
                     updateTab,
-                    recordOpen: restore.recordOpen,
-                    // The pane was created as a plain shell just above, so no
-                    // claude can be in it before the first type.
-                    verifyOptions: { skipFirstProbe: true },
+                    type: () =>
+                      runVerifiedResume({
+                        terminalRefs: terminalRefs.current,
+                        tabId: restore.tabId,
+                        claudeSessionId,
+                        configDir: restore.claudeConfigDir,
+                        provider: restore.provider,
+                        updateTab,
+                        recordOpen: restore.recordOpen,
+                        // The pane was created as a plain shell just above, so
+                        // no claude can be in it before the first type.
+                        verifyOptions: { skipFirstProbe: true },
+                      }),
                   });
                 }
               }

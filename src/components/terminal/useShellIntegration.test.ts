@@ -23,6 +23,9 @@ vi.mock("react", () => ({
   useCallback: <T>(fn: T) => fn,
   useRef: <T>(initial: T) => ({ current: initial }),
   useState: <T>(initial: T) => [initial, () => {}],
+  // No renderer, so no mount or unmount: effects never run here. The unmount
+  // cleanup is pinned with a real renderer in `useShellIntegration.unmount.test.tsx`.
+  useEffect: () => {},
 }));
 
 const live = vi.hoisted(() => ({ response: null as unknown }));
@@ -55,7 +58,11 @@ vi.mock("./useTerminalInitialization", async (importOriginal) => ({
   runVerifiedResume,
 }));
 
-import { useShellIntegration } from "./useShellIntegration";
+import {
+  resumeCheckingNotice,
+  useShellIntegration,
+  withdrawNoticeUpdate,
+} from "./useShellIntegration";
 import { clearResumesInFlight } from "./resumeGate";
 import type { TranscriptSession } from "./useTranscriptSessions";
 import type { LiveClaudeSession } from "./liveClaudeSessions";
@@ -336,6 +343,55 @@ describe("useShellIntegration handleResumeSession — two quick clicks (review M
     ]);
     answer([]);
     await expect(outcome).resolves.toBe("refused");
+  });
+
+  it("withdraws its 'checking…' notice once the read returns, and not before (review r2 finding 4)", async () => {
+    let answer!: (rows: LiveClaudeSession[]) => void;
+    const order: string[] = [];
+    const notify = vi.fn((message: string) => order.push(`notify ${message}`));
+    const withdrawNotice = vi.fn((message: string) => order.push(`withdraw ${message}`));
+    const hook = useShellIntegration({
+      tabs: [],
+      updateTab: vi.fn(),
+      renameTab: vi.fn(),
+      createTerminal: vi.fn(async () => null) as never,
+      setSessionStates: vi.fn() as never,
+      terminalRefs: { current: new Map() },
+      setRightPanelMode: vi.fn() as never,
+      setSelectedTranscriptSessionId: vi.fn() as never,
+      pageId: "default",
+      notify,
+      withdrawNotice,
+      readLiveSessions: (() => {
+        let calls = 0;
+        return () =>
+          calls++ === 0
+            ? new Promise<LiveClaudeSession[]>((r) => (answer = r))
+            : Promise.resolve([]);
+      })(),
+    });
+    const checking = resumeCheckingNotice("maxim");
+    const outcome = hook.handleResumeSession(transcript("maxim"));
+    await flush();
+    expect(order).toEqual([`notify ${checking}`]);
+    expect(withdrawNotice).not.toHaveBeenCalled();
+
+    answer([]);
+    await expect(outcome).resolves.toBe("refused");
+    // Withdrawn once, by the very text it posted, before the failure notice
+    // (no tab) took its place.
+    expect(withdrawNotice.mock.calls).toEqual([[checking]]);
+    expect(order[1]).toBe(`withdraw ${checking}`);
+    expect(order[2]).toMatch(/^notify Could not resume "maxim": no terminal/);
+  });
+
+  it("withdrawNoticeUpdate clears only the notice it names, so a newer one survives", () => {
+    const checking = { message: resumeCheckingNotice("maxim"), type: "success" as const };
+    const newer = { message: 'Could not resume "maxim": no terminal', type: "error" as const };
+    const withdraw = withdrawNoticeUpdate(checking.message);
+    expect(withdraw(checking)).toBeNull();
+    expect(withdraw(newer)).toBe(newer);
+    expect(withdraw(null)).toBeNull();
   });
 
   it("the 'Since restart' queue's resume is held under the same claim", async () => {
