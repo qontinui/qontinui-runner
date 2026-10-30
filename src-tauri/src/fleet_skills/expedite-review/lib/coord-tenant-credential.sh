@@ -361,7 +361,7 @@ _ctc_runner_coord_ok() { local u; u="$(_ctc_url)"; [ "${u,,}" = "https://coord.q
 # or timeout) is recorded once for the whole CTC_TMP in ctc.runner.unreachable,
 # so a dead or wedged runner costs one timeout per run, not one per tenant.
 _ctc_runner_rung() {
-  local want="$1" slot="$2" code r f port
+  local want="$1" slot="$2" code r f port fexp fclaim
   if [ -r "$slot.runner.jwt" ]; then
     f="$(tr -d '[:space:]' < "$slot.runner.jwt")"
     _ctc_usable_for "$f" "$want" && { printf 'OK runner(cached) %s' "$f"; return 0; }
@@ -384,7 +384,17 @@ _ctc_runner_rung() {
         ( umask 077; printf '%s\n' "$f" > "$slot.runner.jwt" )
         printf 'OK runner %s' "$f"; return 0
       fi
-      r="the local runner's token (127.0.0.1:$port) is stale, claims another tenant, or carries no tenant claim (a legacy token)" ;;
+      # A runner build predating the typed DEVICE_TOKEN_EXPIRED answer hands an
+      # EXPIRED token (past the runner's 30 s post-expiry grace, EXPIRY_LEEWAY_SECS:
+      # exp <= now - 30, the runner's own jwt_is_expired) for this very
+      # tenant back as a success: name that as the
+      # runner's expired credential, not as a stale/foreign token.
+      fexp="$(_ctc_facts "$f")"; fclaim="${fexp#* }"; fexp="${fexp%% *}"
+      if [[ "$fexp" =~ ^[0-9]+$ ]] && (( fexp <= $(date +%s) - 30 )) && [ -n "$fclaim" ] && [ "${fclaim,,}" = "${want,,}" ]; then
+        r="RUNNER_MINT_EXPIRED: the runner's coord credential has expired - sign in to the runner (127.0.0.1:$port is an older build that returned the expired token as a success; not used, not retried)"
+      else
+        r="the local runner's token (127.0.0.1:$port) is stale, claims another tenant, or carries no tenant claim (a legacy token)"
+      fi ;;
     *)
       r="${r#ERR }"
       if [ "$code" = 000 ]; then
@@ -392,7 +402,16 @@ _ctc_runner_rung() {
         printf '%s' "$r" > "$CTC_TMP/ctc.runner.unreachable"
         printf 'ERR %s' "$r"; return 0
       fi
-      r="the local runner (127.0.0.1:$port) answered HTTP $code${r:+: $(ctc_sanitize "$r")}" ;;
+      case "$r" in
+        # The runner's typed 401: its OWN coord credential has expired (plan
+        # 2026-10-09-runner-credential-expires-when-coord-is-down-across-its-
+        # only-refresh-window). Never "no credential for this tenant": the
+        # device is still paired. Cached as a rejection, so the runner is not
+        # asked again this run, and the cascade moves on to the mint.
+        *"DEVICE_TOKEN_EXPIRED:"*)
+          r="RUNNER_MINT_EXPIRED: the runner's coord credential has expired - sign in to the runner (127.0.0.1:$port answered HTTP $code: $(ctc_sanitize "$r"))" ;;
+        *) r="the local runner (127.0.0.1:$port) answered HTTP $code${r:+: $(ctc_sanitize "$r")}" ;;
+      esac ;;
   esac
   printf '%s' "$r" > "$slot.runner.rejected"
   printf 'ERR %s' "$r"
