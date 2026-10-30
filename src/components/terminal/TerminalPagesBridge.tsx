@@ -4,9 +4,9 @@
  * `list-pages` answers every persisted terminal page's name — the same names
  * the tab bar shows — so an agent (e.g. `/triage-sessions`) can address pages
  * by name without reading the WebView DOM. It is fed `allPages`, not
- * `pages` / `visiblePages`: those drop pages detached into a pop-out and the
- * empty "default" page, and a roster missing them would make a caller report a
- * real page as absent.
+ * `pages` / `visiblePages`: `pages` drops pages detached into a pop-out, and
+ * `visiblePages` also hides the internal `default` page while it is empty. A
+ * roster missing either would make a caller report a real page as absent.
  *
  * Mounted by `App` in the MAIN window only (never in a page-pinned pop-out),
  * so a pop-out — which knows only its own page — never serves a one-page
@@ -14,9 +14,8 @@
  */
 
 import { useUIComponent } from "@qontinui/ui-bridge";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
-import { MAIN_WINDOW_LABEL } from "./contexts/WindowAssignmentsContext";
+import { MAIN_WINDOW_LABEL, readWindowLabel } from "./contexts/WindowAssignmentsContext";
 import type { TerminalPageConfig } from "./useTerminalPages";
 
 /** `list-pages` takes no argument; an undeclared key is refused by the guard. */
@@ -51,14 +50,9 @@ export function buildPageRoster(
 /**
  * True in the runner's main window. A pop-out (page-pinned or not) has its own
  * label; outside Tauri (tests) there is only the one window, so it reads main.
+ * `readWindowLabel` is the one place that decides what "main" means.
  */
-export function isMainWindow(): boolean {
-  try {
-    return (getCurrentWindow().label || MAIN_WINDOW_LABEL) === MAIN_WINDOW_LABEL;
-  } catch {
-    return true;
-  }
-}
+export const isMainWindow = (): boolean => readWindowLabel() === MAIN_WINDOW_LABEL;
 
 export interface TerminalPagesBridgeProps {
   allPages: readonly TerminalPageConfig[];
@@ -76,7 +70,8 @@ export function TerminalPagesBridge({
     name: "Terminal Pages",
     description:
       "The terminal page roster. 'list-pages' returns every persisted page, including " +
-      "pages detached into a pop-out window and the empty default page.",
+      "pages detached into a pop-out window and the internal `default` page when it " +
+      "exists (even while empty).",
     actions: [
       {
         id: "list-pages",

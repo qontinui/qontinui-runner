@@ -11,7 +11,10 @@
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-const { registrations } = vi.hoisted(() => ({
+const { registrations, currentWindow } = vi.hoisted(() => ({
+  // What the mocked `getCurrentWindow()` does: answer this label, or throw
+  // (a non-Tauri environment) when it is null.
+  currentWindow: { label: "main" as string | null },
   registrations: [] as Array<{
     id: string;
     actions: Array<{ id: string; effect: string; handler: (params?: unknown) => unknown }>;
@@ -25,10 +28,13 @@ vi.mock("@qontinui/ui-bridge", () => ({
 }));
 
 vi.mock("@tauri-apps/api/window", () => ({
-  getCurrentWindow: () => ({ label: "main" }),
+  getCurrentWindow: () => {
+    if (currentWindow.label === null) throw new Error("not running under Tauri");
+    return { label: currentWindow.label };
+  },
 }));
 
-const { TerminalPagesBridge } = await import("./TerminalPagesBridge");
+const { TerminalPagesBridge, isMainWindow } = await import("./TerminalPagesBridge");
 
 function listPages(props: Parameters<typeof TerminalPagesBridge>[0], params?: unknown): unknown {
   registrations.length = 0;
@@ -90,5 +96,26 @@ describe("TerminalPagesBridge list-pages", () => {
         { zzz: "x" },
       ),
     ).toThrow(/ACTION_PARAMS_INVALID/);
+  });
+});
+
+describe("isMainWindow (gates where list-pages is registered)", () => {
+  beforeEach(() => {
+    currentWindow.label = "main";
+  });
+
+  it('is true in the window labelled "main"', () => {
+    currentWindow.label = "main";
+    expect(isMainWindow()).toBe(true);
+  });
+
+  it("is false in a pop-out window", () => {
+    currentWindow.label = "terminal-popout-3";
+    expect(isMainWindow()).toBe(false);
+  });
+
+  it("is true when getCurrentWindow throws (no Tauri: the one window is main)", () => {
+    currentWindow.label = null;
+    expect(isMainWindow()).toBe(true);
   });
 });
