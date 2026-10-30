@@ -1147,17 +1147,24 @@ describe("drainColdResume — the drain's typed resume under the in-flight claim
     return { params, updateTab, invokeFn, type, readLiveIds };
   }
 
-  it("a held claim skips the record as alive: no read, no type, the skip-alive disposition", async () => {
+  it("a held claim is not proof of life: no read, no type, the retryable skip-unknown disposition", async () => {
+    // The other resume holding the claim may still be waiting on a dialog the
+    // operator cancels, so the drain must leave a Retry — never skip-alive's
+    // permanent "fresh conversation" (restoreTerminalOnly) rebind.
     const held = claimResume(SID)!;
     const { params, updateTab, invokeFn, type, readLiveIds } = drain();
     vi.spyOn(console, "warn").mockImplementation(() => {});
-    await expect(drainColdResume(params)).resolves.toBe("skip-alive");
+    await expect(drainColdResume(params)).resolves.toBe("skip-unknown");
     expect(readLiveIds).not.toHaveBeenCalled();
     expect(type).not.toHaveBeenCalled();
     expect(updateTab).toHaveBeenCalledWith("tab-restored", {
       isReconnecting: false,
-      restoreTerminalOnly: true,
+      resumeFailed: true,
     });
+    expect(updateTab).not.toHaveBeenCalledWith(
+      "tab-restored",
+      expect.objectContaining({ restoreTerminalOnly: true }),
+    );
     expect(invokeFn.mock.calls.map(([cmd]) => cmd)).toEqual([
       "terminal_session_rebind_terminal",
       "terminal_session_clear_restore_pending",

@@ -1062,8 +1062,9 @@ mod tests {
 
     /// A read that catches Claude Code mid-write is re-read once, and a file
     /// that parses the second time is an ordinary row — not an UNKNOWN. The
-    /// wait runs only when a file is reportable, so a clean read and the
-    /// display reader never pay it.
+    /// wait runs only when a file is reportable, so a clean read never pays
+    /// it; every caller of the reporting reader pays it while such a file
+    /// persists, which is why the command runs the scan on the blocking pool.
     #[test]
     fn a_live_file_that_parses_on_the_re_read_is_a_row_not_an_unknown() {
         let root = tmpdir("reread");

@@ -110,6 +110,14 @@ interface UseShellIntegrationParams {
    * (`fetchLiveClaudeHolders`, rows with their holding panes).
    */
   readLiveSessions?: () => Promise<LiveClaudeSession[] | null>;
+  /**
+   * Whether this page is the one the operator is viewing. Every page's scope
+   * stays mounted, so a click's liveness read can finish after the operator
+   * switched away and open its dialog on a page nobody sees. While `false`,
+   * any open prompt is answered "cancel" — whichever came first, the switch or
+   * the dialog. Defaults to `true`.
+   */
+  isActive?: boolean;
 }
 
 /** Options of an operator resume through the click gate. */
@@ -166,6 +174,7 @@ export function useShellIntegration({
   notify,
   withdrawNotice,
   readLiveSessions,
+  isActive = true,
 }: UseShellIntegrationParams): UseShellIntegrationResult {
   // Shell integration: structured command history per tab
   const [commandHistories, setCommandHistories] = useState<Record<string, CommandHistoryEntry[]>>(
@@ -299,6 +308,13 @@ export function useShellIntegration({
   // it waits. Answer it "cancel". `ResumeGateHost` does the same for a dialog
   // it stops showing on a page switch.
   useEffect(() => () => answerResumeGate("cancel"), [answerResumeGate]);
+  // A prompt on a page that is not being viewed can never be answered either —
+  // and it may open AFTER the switch (the read outlives it), which the host's
+  // hide-time cleanup cannot see. Cancel it whenever this page is inactive.
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- one-shot cancel of a prompt no one can see; it resolves a waiting click and releases its in-flight claim
+    if (!isActive && resumeGatePrompt) answerResumeGate("cancel");
+  }, [isActive, resumeGatePrompt, answerResumeGate]);
 
   const gatedResume = useCallback(
     (

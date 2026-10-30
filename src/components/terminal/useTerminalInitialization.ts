@@ -1111,23 +1111,29 @@ export async function drainColdResume(params: {
     params.type,
   );
   if (result.kind === "typing") return "respawn";
+  // A claim held by another resume of this id is NOT proof the conversation is
+  // live: that resume may still be waiting on a dialog the operator cancels.
+  // So it takes the skip-unknown disposition (resume-failed banner + the gated
+  // Retry), never skip-alive's permanent "fresh conversation" rebind.
+  const decision: ColdResumeDecision =
+    result.kind === "skip-alive" && result.inFlight ? "skip-unknown" : result.kind;
   console.warn(
     `[TerminalPage] drain-time skip for session ${claudeSessionId}: ` +
       (result.kind === "skip-alive"
         ? result.inFlight
-          ? "a resume of this id is already in flight in this window"
+          ? "a resume of this id is already in flight in this window — offering Retry"
           : "a live Claude process now hosts this id (typing --resume would fork it)"
         : "live-session registry unreadable at drain time — failing closed toward not-respawning"),
   );
   await applyDrainSkip({
-    decision: result.kind,
+    decision,
     tabId,
     claudeSessionId,
     zoneIndex: params.zoneIndex,
     updateTab: params.updateTab,
     invokeFn: params.invokeFn,
   });
-  return result.kind;
+  return decision;
 }
 
 /** Validate session IDs before interpolating into shell commands. */

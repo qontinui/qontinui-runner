@@ -225,6 +225,8 @@ interface PageSessionScopeProps {
   register: (pageId: string, value: TerminalSessionContextValue | null) => void;
   onNavigateToBuilder?: () => void;
   onNavigateToActive?: () => void;
+  /** Whether this page is the one being viewed (resume dialogs cancel while not). */
+  isActive: boolean;
 }
 
 /**
@@ -259,6 +261,7 @@ const PageSessionScope = memo(function PageSessionScope({
   register,
   onNavigateToBuilder,
   onNavigateToActive,
+  isActive,
 }: PageSessionScopeProps) {
   // Phase 1 (pop-out windows): render only the tabs THIS window owns. With a
   // single ("main") window and no assignments every tab is owned by "main", so
@@ -761,6 +764,7 @@ const PageSessionScope = memo(function PageSessionScope({
     onResumedTab: zoneLayout.showSpawnedTab,
     notify: notifyResume,
     withdrawNotice: withdrawResumeNotice,
+    isActive,
   });
 
   const getScrollback = useCallback(
@@ -1086,6 +1090,7 @@ export function TerminalSessionProvider({
           register={register}
           onNavigateToBuilder={onNavigateToBuilder}
           onNavigateToActive={onNavigateToActive}
+          isActive={p.id === activePageId}
         />
       ))}
       {/* Gate the page tree on the active page's value. A freshly-mounted

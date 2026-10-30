@@ -61,7 +61,15 @@ const reportHook = (h: UseShellIntegrationResult) => {
 };
 
 /** One page's scope, reduced to the hook; it reports each committed value. */
-function PageScope({ onHook }: { onHook: (h: UseShellIntegrationResult) => void }) {
+function PageScope({
+  onHook,
+  isActive = true,
+  readLive = async () => [holder],
+}: {
+  onHook: (h: UseShellIntegrationResult) => void;
+  isActive?: boolean;
+  readLive?: () => Promise<LiveClaudeSession[] | null>;
+}) {
   const h = useShellIntegration({
     tabs: [],
     updateTab: () => {},
@@ -72,8 +80,9 @@ function PageScope({ onHook }: { onHook: (h: UseShellIntegrationResult) => void 
     setRightPanelMode: () => {},
     setSelectedTranscriptSessionId: () => {},
     pageId: "page-1",
-    // A live holder, so the click opens the dialog and waits on it.
-    readLiveSessions: async () => [holder],
+    // A live holder by default, so the click opens the dialog and waits on it.
+    readLiveSessions: readLive,
+    isActive,
   });
   useEffect(() => onHook(h));
   return null;
@@ -138,6 +147,45 @@ describe("useShellIntegration — a dialog left open when its page unmounts", ()
 
     act(() => hook!.answerResumeGate("cancel"));
     await expect(outcome).resolves.toBe("cancelled");
+    expect(isResumeInFlight(ID)).toBe(false);
+  });
+});
+
+describe("useShellIntegration — a dialog on a page the operator is not viewing (review r3 finding 1)", () => {
+  it("an open dialog is cancelled when its page becomes inactive", async () => {
+    act(() => root.render(createElement(PageScope, { onHook: reportHook, isActive: true })));
+    const { outcome } = await clickIntoDialog();
+    expect(hook!.resumeGatePrompt?.claudeSessionId).toBe(ID);
+
+    act(() => root.render(createElement(PageScope, { onHook: reportHook, isActive: false })));
+    await expect(within(outcome, 1_000)).resolves.toBe("cancelled");
+    expect(isResumeInFlight(ID)).toBe(false);
+  });
+
+  it("a dialog that opens AFTER the page went inactive is cancelled too (the read outlived the switch)", async () => {
+    let finishRead!: (rows: LiveClaudeSession[]) => void;
+    const readLive = () => new Promise<LiveClaudeSession[] | null>((r) => (finishRead = r));
+    act(() =>
+      root.render(createElement(PageScope, { onHook: reportHook, isActive: true, readLive })),
+    );
+    // Click while the page is active; the liveness read is still running.
+    let outcome!: Promise<ResumeOutcome>;
+    await act(async () => {
+      outcome = hook!.handleResumeSession(transcript);
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(hook!.resumeGatePrompt, "no dialog yet: the read has not returned").toBeNull();
+
+    // The operator switches page; THEN the read returns and the gate asks.
+    act(() =>
+      root.render(createElement(PageScope, { onHook: reportHook, isActive: false, readLive })),
+    );
+    await act(async () => {
+      finishRead([holder]);
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    await expect(within(outcome, 1_000)).resolves.toBe("cancelled");
+    expect(hook!.resumeGatePrompt).toBeNull();
     expect(isResumeInFlight(ID)).toBe(false);
   });
 });

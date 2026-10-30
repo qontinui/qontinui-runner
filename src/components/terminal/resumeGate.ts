@@ -191,7 +191,7 @@ function escapeRegExp(s: string): string {
  * Turn the backend-rendered resume command (`build_ai_resume_command`:
  * `[env…] claude <permission> --resume <id>`, plus the trailing `\r`) into
  * its fork: `… --resume <id> --fork-session`. Claude Code documents the flag
- * (help text checked in 2.1.310–2.1.312) as "When resuming, create a new
+ * (help text checked in 2.1.311 and 2.1.312) as "When resuming, create a new
  * session ID instead of reusing the original (use with --resume or
  * --continue)".
  *

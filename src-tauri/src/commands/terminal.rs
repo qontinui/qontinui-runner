@@ -2201,11 +2201,18 @@ pub async fn terminal_claude_session_list_live(
     // the same snapshot, so a recycled pid on a stale file is not an UNKNOWN.
     let claude_starts =
         crate::session::claude_session_registry::live_claude_starts_from_snapshot(&snapshot);
-    let read = crate::session::claude_session_registry::read_live_sessions_reporting(
-        &config_dirs,
-        &live_pids,
-        &claude_starts,
-    );
+    // The registry scan does blocking file reads, and a reportable file adds a
+    // 50 ms settle re-read — both off the async runtime, which also serves the
+    // runner's HTTP API.
+    let read = spawn_blocking_tracked(move || {
+        crate::session::claude_session_registry::read_live_sessions_reporting(
+            &config_dirs,
+            &live_pids,
+            &claude_starts,
+        )
+    })
+    .await
+    .map_err(|e| format!("live-session registry read failed: {e}"))?;
 
     let sessions = match &census {
         Some(census) => {
