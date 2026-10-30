@@ -232,6 +232,7 @@ pub mod recap; // Session recap overview
 pub mod regression; // UI Bridge regression suite + run + diagnosis + per-assertion exercise log persistence (Section 11 Phase A2)
 pub mod remote_attach; // Remote session tabs: accept_remote_attach preference + terminal_attach_remote (plan 2026-08-31-remote-session-tabs-in-runner-terminal, Phase 3c)
 pub mod remote_create; // Remote terminal CREATION: the accept_remote_create preference and the coord mirror that reconciles the runner-local dial with coord.devices.accept_remote_create (plan 2026-09-11-headless-runner-parity-from-a-headed-runner, Phase 3b)
+pub mod remote_end; // END a session on another device under an attach grant: `remote_session_end` (plan 2026-09-30-close-remote-sessions-from-the-local-runner, Phase 3)
 pub mod remote_interactivity_probe; // The remote-interactivity probe sweep + its scheduler (plan 2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold, A3)
 pub mod resource_guard_settings; // Settings > Resource Guard: session-protection floors + the ci_node floors (plan 2026-08-07-runner-resource-guard-and-session-protection Part B)
 pub mod saved_projects; // User-curated project registry (wizard-populated, consumed by UI Bridge panel)
@@ -247,6 +248,7 @@ pub mod session_identity; // Plan 2026-07-17-universal-coord-device-identity §6
 pub mod session_info; // One-shot session-identity projection (durable record ⨝ live registry ⨝ PR ledger) for the zone-header session-info dropdown
 pub mod session_info_list; // Batched session-info listing (`session_info_list` + `GET /control/sessions/info`) with per-working-dir branch, plan 2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search Phase 4
 pub mod session_org; // Session Manager organization store commands: session_org_get / session_org_apply (plan 2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search, Phase 2)
+pub mod session_tenant_display; // The ONE derived "which tenant is this session?" answer the session-info surfaces render
 pub mod setup_discovery; // Native (pure-Rust) setup-wizard discovery — no Python interpreter needed
 pub mod setup_wizard; // First-launch setup wizard commands
 pub mod shell_commands; // Shell command management and execution
@@ -390,7 +392,8 @@ pub struct AppState {
     /// Last frontend pong timestamp (epoch ms), or 0 if no UI has ever
     /// checked in.
     ///
-    /// Rust emits `ui-bridge-ping` unconditionally every 3s and the frontend
+    /// Rust emits `ui-bridge-ping` unconditionally every 3s (from its own OS
+    /// thread, `ui_ping.rs`, so a starved tokio runtime cannot stop it) and the frontend
     /// answers `ui-bridge-pong`, so this advances on its own whenever a UI is
     /// alive — no external driver required. That makes it the one signal that
     /// stays correct when the WebView2 host dies underneath a healthy Rust

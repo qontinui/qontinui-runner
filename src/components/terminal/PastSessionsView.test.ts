@@ -51,6 +51,7 @@ function makeSession(claudeSessionId: string, cohortId: number, lastSeenAt: numb
     claudeSessionId,
     resumeName: `session ${claudeSessionId}`,
     resumeCommand: `clg --resume ${claudeSessionId}`,
+    resumeAccount: { known: true, configDir: "C:/claude/.claude-gmail" },
     account: { label: "gmail", wrapper: "clg" },
     pageId: "page-1",
     zoneIndex: 0,
@@ -62,6 +63,7 @@ function makeSession(claudeSessionId: string, cohortId: number, lastSeenAt: numb
     transcriptExists: true,
     restorable: true,
     cohortId,
+    resumeDir: null,
   };
 }
 
@@ -87,6 +89,7 @@ function makeLiveRow(
     updatedAt: 1784770342016,
     resumeCommand: `clg --resume ${claudeSessionId}`,
     runnerManaged: true,
+    resumeAccount: { known: true, configDir: "C:/claude/.claude-gmail" },
   };
 }
 

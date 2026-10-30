@@ -48,9 +48,9 @@ interface SessionManagerPanelProps {
   sessionLockStates?: Map<string, LockState>;
   /**
    * Resume a past (historical) session by id. Wired in `TerminalPage` to the
-   * real terminal resume path (`shellIntegration.handleResumeSession`) — it
-   * creates a tab and queues `claude --resume <id>` with the session's config
-   * dir. Consumed only by the "Previous" view; undefined ⇒ Resume falls back to
+   * one resume path (`shellIntegration.resumeTarget` → `resumeInNewTab`): a new
+   * tab with a verified `--resume` under the session's resolved account.
+   * Consumed only by the "Previous" view; undefined ⇒ Resume falls back to
    * copying the command.
    */
   onResumePastSession?: (session: PastSession) => void;
@@ -66,7 +66,16 @@ interface SessionManagerPanelProps {
   currentPageId?: string;
   /** Spawn an AI session for "New session in group"; absent = not offered. */
   onNewSessionInGroup?: (request: NewSessionInGroupRequest) => void;
+  /**
+   * Which view shows. Owned by `TerminalPage`, so the "Since restart" strip's
+   * Review can open "Previous" — and the choice survives the sidebar closing.
+   */
+  view: SessionPanelView;
+  onViewChange: (view: SessionPanelView) => void;
 }
+
+/** The panel's three views. */
+export type SessionPanelView = "live" | "previous" | "fleet";
 
 /** UI-Bridge ids for the panel's own controls. */
 export const SESSION_MANAGER_PANEL_IDS = {
@@ -84,8 +93,9 @@ export function SessionManagerPanel({
   pages = [],
   currentPageId = "default",
   onNewSessionInGroup,
+  view,
+  onViewChange: setView,
 }: SessionManagerPanelProps) {
-  const [view, setView] = useState<"live" | "previous" | "fleet">("live");
   const {
     sessions,
     loading,
@@ -397,7 +407,8 @@ export function SessionManagerPanel({
         page. With these stamps a driver can switch the panel deterministically
         — `POST /ui-bridge/control/element/terminal.session-manager-view-previous/action
         {"action":"click"}` — which is the only way to reach the
-        `past-sessions-view` surface, since the panel always mounts on "live".
+        `past-sessions-view` surface by hand (the "Since restart" strip's Review
+        also opens it).
 
         This row sits ABOVE the `view === "previous" ? … : <>…</>` conditional
         so it renders in both views; see `SessionManagerPanel.test.ts` for the

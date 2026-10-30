@@ -54,6 +54,10 @@ pub mod pty_holder;
 // a second bin cannot import from the runner bin's module tree. One module ⇒
 // one schema ⇒ writer and reader cannot drift. See the module doc.
 pub mod profiles;
+// Journey query answer values (plan 2026-09-20-ui-bridge-represents-the-
+// users-path-and-the-passage-of-time): registered by `schema_export`, built by
+// the bin's `journey::routes`.
+pub mod journey_wire;
 pub mod relay_envelopes;
 pub mod runner_breadcrumb;
 pub mod schema_export;
@@ -127,6 +131,14 @@ pub mod mcp_spill;
 // dependencies, so the move is mechanical.
 pub mod embedded_pg;
 pub mod env_agent;
+
+// The runner's one circuit-breaker state machine, and the PostgreSQL checkout
+// point built on it (plan
+// `2026-10-19-runner-pg-unreachable-costs-every-caller-a-pool-timeout`). Lib,
+// not bin, because `env_agent` above holds a clone of the boot pool: a
+// bin-side breaker could not cover it.
+pub mod circuit;
+pub mod pg_circuit;
 
 // THE `source()`-chain renderer, shared by the lib and the bin.
 //

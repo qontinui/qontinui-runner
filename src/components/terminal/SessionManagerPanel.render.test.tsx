@@ -171,6 +171,9 @@ function cardStatuses(): Record<string, [string | null, string | null]> {
   return out;
 }
 
+/** The panel's view is owned by `TerminalPage`; these tests pin the Live view. */
+const noopView = (): void => {};
+
 describe("SessionManagerPanel — two-axis status on every card", () => {
   it("a hidden running session reads 'Hidden here', the shown one 'On screen'", () => {
     const rows = [
@@ -181,6 +184,8 @@ describe("SessionManagerPanel — two-axis status on every card", () => {
       return SessionManagerPanel({
         manager: managerOver(rows),
         selectedSessionId: null,
+        view: "live",
+        onViewChange: noopView,
         onScreenTabId: "tab-shown",
       });
     }
@@ -205,7 +210,12 @@ describe("SessionManagerPanel — two-axis status on every card", () => {
       runningTabRow("tab-b", "b-shell", "hidden-here", "idle-at-prompt"),
     ];
     function Page() {
-      return SessionManagerPanel({ manager: managerOver(rows), selectedSessionId: null });
+      return SessionManagerPanel({
+        manager: managerOver(rows),
+        selectedSessionId: null,
+        view: "live",
+        onViewChange: noopView,
+      });
     }
     act(() => root.render(createElement(Page)));
     const text = container.textContent ?? "";
@@ -219,6 +229,8 @@ describe("SessionManagerPanel — two-axis status on every card", () => {
       return SessionManagerPanel({
         manager: managerOver(rows, {}, { unidentifiedCount: n }),
         selectedSessionId: null,
+        view: "live",
+        onViewChange: noopView,
       });
     }
     act(() => root.render(createElement(Page, { n: 3 })));
@@ -245,6 +257,8 @@ describe("SessionManagerPanel — closing a session from its row", () => {
           closeSessions,
         }),
         selectedSessionId: null,
+        view: "live",
+        onViewChange: noopView,
         onScreenTabId: "tab-b",
       });
     }

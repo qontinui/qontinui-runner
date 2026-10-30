@@ -13,14 +13,14 @@
 //!
 //! ## Where `expected` comes from — and why not the shutdown marker
 //!
-//! [`crate::session::shutdown_marker::ShutdownMarker`] is `{clean, at}`: a
+//! [`crate::session::shutdown_marker::ShutdownMarker`] is `{clean, at, teardown_complete}`: a
 //! BOUNDARY, carrying no session census. It cannot supply `expected`, and R3
 //! forbids the only other available source — the POST-restart registry, which
 //! would make the census self-referential ("everything that came back was
 //! expected", verdict always `match`).
 //!
 //! So `expected` is LATCHED ONCE AT BOOT ([`latch_expected`]), from
-//! `store.restorable_records(now, prior_marker_at, boot_was_clean, booted_at_ms)` — already
+//! `store.restorable_records(prior_marker_at, boot_was_clean)` — already
 //! the exact set the boot-restore path consumes — read BEFORE any restore,
 //! reconcile pass or liveness tick can mutate a record, and held in a
 //! process-wide `OnceLock` for the life of the process. That is the
@@ -100,7 +100,10 @@ pub const UNEXPECTED_DUPLICATE: &str = "duplicate";
 #[serde(rename_all = "camelCase")]
 pub struct CensusExpected {
     pub claude_session_id: String,
-    pub terminal_id: String,
+    /// The row's terminal; omitted for an UNBOUND row (blank id — e.g. one held
+    /// for an account choice), as in `past_sessions` ([`bound_terminal_id`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
     pub page_id: String,
     pub zone_index: i32,
     pub account_label: Option<String>,
@@ -117,7 +120,9 @@ pub struct CensusExpected {
 #[serde(rename_all = "camelCase")]
 pub struct CensusRestored {
     pub claude_session_id: String,
-    pub terminal_id: String,
+    /// Omitted for an unbound row ([`bound_terminal_id`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
     pub zone_index: i32,
     /// `"resumed"` | `"terminal-only"`. A `"failed"` tier is NOT a restore —
     /// it lands in `missing` with [`MISSING_RESUME_FAILED`].
@@ -206,7 +211,32 @@ pub struct BootCensus {
     pub expected: Vec<CensusExpected>,
 }
 
+impl BootCensus {
+    /// Does `rec` still await the boot restore that latched it? True when it
+    /// is in the latched `expected` set, which is the restorable set, and has
+    /// not been FINISHED since (a finished session is never restored). The
+    /// liveness poll holds such a row open rather than closing it `no-terminal`
+    /// before its page is opened (plan
+    /// `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
+    /// Phase 4; see
+    /// [`crate::session::session_lifecycle_store::withheld_boot_restore_candidate`]).
+    pub fn awaits_restore(&self, rec: &TerminalSessionRecord) -> bool {
+        rec.finished_at.is_none()
+            && self
+                .expected
+                .iter()
+                .any(|e| e.claude_session_id == rec.claude_session_id)
+    }
+}
+
 static BOOT_CENSUS: OnceLock<BootCensus> = OnceLock::new();
+
+/// A row's terminal id as the census emits it: `None` for a blank id (an
+/// unbound row has no terminal), the id otherwise — the same rule
+/// `past_sessions` applies.
+fn bound_terminal_id(terminal_id: &str) -> Option<String> {
+    Some(terminal_id.to_string()).filter(|t| !t.trim().is_empty())
+}
 
 /// Project restorable records into the latched `expected` rows. Pure over its
 /// inputs (the probe is injected), so it tests without a disk.
@@ -222,7 +252,7 @@ pub fn expected_rows(
                 probe.transcript_exists(&rec.claude_session_id, rec.working_dir.as_deref());
             CensusExpected {
                 claude_session_id: rec.claude_session_id,
-                terminal_id: rec.terminal_id,
+                terminal_id: bound_terminal_id(&rec.terminal_id),
                 page_id: rec.page_id,
                 zone_index: rec.zone_index,
                 account_label: rec.account_label,
@@ -254,15 +284,10 @@ pub fn latch_expected(
     now_ms: i64,
     boot: Option<BootClassification>,
 ) {
-    let prior_marker_at = boot.and_then(|c| c.prior_marker_at);
     let boot_was_clean = boot.map(|c| !c.crash_recovery).unwrap_or(false);
-    let booted_at_ms = boot.map(|c| c.booted_at_ms);
-    // Exactly the four arguments `terminal_session_list_open` passes, so the
-    // latched set IS the set the restore path will consume.
-    let records = store.restorable_records(now_ms, prior_marker_at, boot_was_clean, booted_at_ms);
     let census = BootCensus {
         boot_at_ms: now_ms,
-        expected: expected_rows(records, probe),
+        expected: boot_expected(store, probe, boot),
     };
     let expected_count = census.expected.len();
     if BOOT_CENSUS.set(census).is_err() {
@@ -272,8 +297,27 @@ pub fn latch_expected(
     info!(
         expected = expected_count,
         clean_shutdown = boot_was_clean,
+        teardown_complete = boot.is_some_and(|c| c.teardown_complete),
         "restore_census: latched the pre-restore expected set"
     );
+}
+
+/// The `expected` set [`latch_expected`] latches — the pure half, without the
+/// process-wide latch, so it is testable.
+pub(crate) fn boot_expected(
+    store: &SessionLifecycleStore,
+    probe: &dyn TranscriptProbe,
+    boot: Option<BootClassification>,
+) -> Vec<CensusExpected> {
+    let prior_marker_at = boot.and_then(|c| c.prior_marker_at);
+    let boot_was_clean = boot.map(|c| !c.crash_recovery).unwrap_or(false);
+    // Exactly the two arguments `terminal_session_list_open` passes (the boot
+    // line is the store's own), so the latched set IS the set the restore path
+    // will consume.
+    expected_rows(
+        store.restorable_records(prior_marker_at, boot_was_clean),
+        probe,
+    )
 }
 
 /// The latched pre-restart census, if [`latch_expected`] has run. `None` means
@@ -345,7 +389,7 @@ pub fn diff_census(
         }
         restored.push(CensusRestored {
             claude_session_id: obs.claude_session_id.clone(),
-            terminal_id: obs.terminal_id.clone(),
+            terminal_id: bound_terminal_id(&obs.terminal_id),
             zone_index: obs.zone_index,
             restore_tier: obs.restore_tier.clone(),
             restored_from_boot_at: obs.restored_from_boot_at,
@@ -500,7 +544,7 @@ mod tests {
     fn expected(id: &str, restorable: bool) -> CensusExpected {
         CensusExpected {
             claude_session_id: id.to_string(),
-            terminal_id: format!("term-{id}"),
+            terminal_id: Some(format!("term-{id}")),
             page_id: "default".to_string(),
             zone_index: 0,
             account_label: Some("paktis".to_string()),
@@ -675,6 +719,7 @@ mod tests {
             provider: "claude".to_string(),
             origin: None,
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: confirmed.then_some(3),
             handle: None,
             account_label: Some("paktis".to_string()),
@@ -716,5 +761,102 @@ mod tests {
         assert!(!rows[2].restorable, "unconfirmed ⇒ not restorable");
         assert_eq!(rows[0].account_label.as_deref(), Some("paktis"));
         assert_eq!(rows[0].zone_index, 2);
+    }
+
+    /// The census half of plan
+    /// `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`:
+    /// a cohort whose liveness touches starved (rows spread T..T+39m, never
+    /// touched after T) and a clean marker at T+77m. The boot census must
+    /// expect all five, not zero — it reads the same admission the restore
+    /// read does — with the observation epoch the boot attaches first.
+    #[test]
+    fn boot_expected_sees_a_snapshot_starved_cohort() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        let ids = [
+            "starved-0000",
+            "starved-0010",
+            "starved-0020",
+            "starved-0030",
+            "starved-0039",
+        ];
+        let mut map = std::collections::HashMap::new();
+        for (m, id) in [0_i64, 10, 20, 30, 39].iter().zip(ids) {
+            let mut r = record(id, true);
+            r.last_seen_at = t + m * 60_000;
+            r.opened_at = r.last_seen_at - 1_000;
+            map.insert(id.to_string(), r);
+        }
+        std::fs::write(&path, serde_json::to_vec_pretty(&map).unwrap()).unwrap();
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let boot_at = t + 3 * 3_600_000;
+        store.set_boot_ms_for_test(boot_at);
+        // The prior process last SAW the process table at T (its snapshots
+        // failed afterwards); main.rs attaches the epoch before the latch.
+        let epoch_path = dir
+            .path()
+            .join(crate::session::observation_epoch::EPOCH_FILE_NAME);
+        crate::session::observation_epoch::ObservationEpoch::open(&epoch_path, t - 3_600_000)
+            .record_ok(t);
+        store.attach_observation_epoch(std::sync::Arc::new(
+            crate::session::observation_epoch::ObservationEpoch::open(&epoch_path, boot_at),
+        ));
+        // ...and the teardown bit from the same classification the latch
+        // reads: admission takes it from the store, not from the argument.
+        store.attach_prior_teardown_complete(false);
+
+        let rows = boot_expected(
+            &store,
+            &FakeProbe {
+                with_transcripts: vec![],
+            },
+            Some(BootClassification {
+                crash_recovery: false,
+                prior_marker_at: Some(t + 77 * 60_000),
+                booted_at_ms: boot_at,
+                // The incident's marker: stamped clean, teardown cut short.
+                teardown_complete: false,
+            }),
+        );
+        let got: Vec<&str> = rows.iter().map(|r| r.claude_session_id.as_str()).collect();
+        assert_eq!(
+            got,
+            ids.to_vec(),
+            "the census expects the whole starved cohort"
+        );
+    }
+
+    /// Review fixes 6, item 5: an unbound row (blank terminal id) emits NO
+    /// `terminalId` — in `expected` and in `restored` — consistent with
+    /// `past_sessions`; a bound row still carries it.
+    #[test]
+    fn a_blank_terminal_id_is_omitted_from_the_census() {
+        let probe = FakeProbe {
+            with_transcripts: vec![],
+        };
+        let mut held = record("held", true);
+        held.terminal_id = String::new();
+        let rows = expected_rows(vec![held, record("bound", true)], &probe);
+        assert_eq!(rows[0].terminal_id.as_deref(), Some("term-bound"));
+        assert_eq!(rows[1].terminal_id, None);
+        let json = serde_json::to_value(&rows[1]).unwrap();
+        assert!(
+            json.get("terminalId").is_none(),
+            "omitted, not \"\": {json}"
+        );
+        assert_eq!(
+            serde_json::to_value(&rows[0]).unwrap()["terminalId"],
+            "term-bound"
+        );
+
+        let exp = [expected("a", true)];
+        let mut obs = observed("a", RESTORE_TIER_RESUMED);
+        obs.terminal_id = "  ".to_string();
+        let d = diff_census(&exp, &[obs], Some(true));
+        assert_eq!(d.restored.len(), 1);
+        assert_eq!(d.restored[0].terminal_id, None);
+        let json = serde_json::to_value(&d.restored[0]).unwrap();
+        assert!(json.get("terminalId").is_none(), "omitted: {json}");
     }
 }
