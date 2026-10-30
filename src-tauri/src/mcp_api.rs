@@ -1939,6 +1939,23 @@ fn active_tenant_health_fields(
 /// `/ui-bridge/status` — all three share this handler).
 /// Includes `uiBridge` metadata so the app discovery scanner can detect the runner.
 /// Returns rich diagnostics: frontend responsiveness, uptime, circuit breaker state.
+/// `/health` `sessionTracking`, with `coordRekeys` — coord's answers to the
+/// harness-id re-keys the session registry queued (plan
+/// `2026-10-23-a-hookless-resume-in-a-runner-pane-leaves-the-session-with-no-active-coord-row`
+/// Phase 1a). `coordRekeys: null` = no registry in state (UNKNOWN, not zero).
+fn session_tracking_with_rekeys(app: &tauri::AppHandle) -> serde_json::Value {
+    use tauri::Manager;
+    let mut tracking = crate::session::tracking_health::health_json();
+    let rekeys = app
+        .try_state::<Arc<crate::session::SessionRegistry>>()
+        .map(|r| r.coord_sync().rekeys().health_json())
+        .unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = tracking.as_object_mut() {
+        obj.insert("coordRekeys".into(), rekeys);
+    }
+    tracking
+}
+
 async fn health(
     axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
     requester: Option<axum::Extension<crate::mcp::origin_guard::RequesterPrincipal>>,
@@ -2658,7 +2675,7 @@ async fn health(
         // Session-tracking health (see `crate::session::tracking_health`):
         // last cross-reference timestamp, live-but-untracked / tracked-but-
         // dead counts + detail, and the untracked-backend-spawn counter.
-        "sessionTracking": crate::session::tracking_health::health_json(),
+        "sessionTracking": session_tracking_with_rekeys(&state.app_handle),
         // Automation-stack capabilities (see `crate::automation_stack`): can
         // this box drive a GUI at all, and if not, which named capability is
         // missing. A headless box used to fail one UI action at a time with a

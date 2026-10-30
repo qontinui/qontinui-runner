@@ -441,62 +441,18 @@ fn spawn_phantom_turn_watch(
 /// `PATCH /sessions/:id`, which retries on reconnect. Coord owns the ownership
 /// and uniqueness rules (`session_not_owned_by_caller`,
 /// `harness_session_already_bound`), so nothing here second-guesses them.
+///
+/// The body is the shared seam [`crate::session::coord_identity`] (plan
+/// `2026-10-23-a-hookless-resume-in-a-runner-pane-leaves-the-session-with-no-active-coord-row`
+/// D1), which the reconcile tick's rung-2 binds and the R2 resume also call;
+/// this route is its `hook` source.
 fn confirm_coord_harness_session_id(state: &ApiState, req: &SessionOpenRequest) {
-    use crate::session::SessionRegistry;
-    use crate::terminal::TerminalManager;
-    use tauri::Manager;
-
-    let (Some(terminals), Some(registry)) = (
-        state
-            .app_handle
-            .try_state::<Arc<TerminalManager>>()
-            .map(|s| s.inner().clone()),
-        state
-            .app_handle
-            .try_state::<Arc<SessionRegistry>>()
-            .map(|s| s.inner().clone()),
-    ) else {
-        warn!(
-            terminal_id = %req.terminal_id,
-            session_id = %req.session_id,
-            "control/session-open: terminal manager or session registry not in Tauri state —              coord harness-id confirmation skipped (best-effort)"
-        );
-        return;
-    };
-
-    let Some(coord_session_id) = terminals
-        .get(&req.terminal_id)
-        .and_then(|s| s.coord_session_id())
-    else {
-        // Normal and transient: the coord mirror is registered after the pane
-        // exists. Not a warn.
-        info!(
-            terminal_id = %req.terminal_id,
-            session_id = %req.session_id,
-            "control/session-open: no coord session bound to this terminal yet —              harness-id confirmation skipped"
-        );
-        return;
-    };
-
-    match registry.confirm_claude_code_session_id(coord_session_id, &req.session_id) {
-        Ok(true) => info!(
-            terminal_id = %req.terminal_id,
-            session_id = %req.session_id,
-            coord_session_id = %coord_session_id,
-            "control/session-open: coord row re-keyed to the CONFIRMED harness session id"
-        ),
-        Ok(false) => info!(
-            terminal_id = %req.terminal_id,
-            coord_session_id = %coord_session_id,
-            "control/session-open: coord row already carries the confirmed harness session id"
-        ),
-        Err(e) => warn!(
-            terminal_id = %req.terminal_id,
-            session_id = %req.session_id,
-            coord_session_id = %coord_session_id,
-            "control/session-open: harness-id confirmation not queued: {e}"
-        ),
-    }
+    crate::session::coord_identity::confirm_for_terminal_in_app(
+        &state.app_handle,
+        &req.terminal_id,
+        &req.session_id,
+        crate::session::coord_identity::RekeySource::Hook,
+    );
 }
 
 /// Emit the `session-bound` tab-stamp event for a `/control/session-open`.
