@@ -478,8 +478,10 @@ fn holder_of(procs: &[(u32, String)], id: &str) -> Option<u32> {
 /// live session is a second process writing one transcript.
 async fn live_holder(id: &str) -> Result<Option<u32>, String> {
     use crate::process_capture::process_tree as pt;
-    let snap = pt::snapshot_process_table_public().await;
-    if snap.names.is_empty() {
+    // A read begun now, never the memo: a `claude` started moments ago is the
+    // very holder this guard exists to see.
+    let snap = pt::snapshot_process_table_fresh().await;
+    if snap.stale || snap.names.is_empty() {
         return Err("process_table_unreadable".to_string());
     }
     let pids: Vec<u32> = snap
@@ -488,7 +490,20 @@ async fn live_holder(id: &str) -> Result<Option<u32>, String> {
         .copied()
         .filter(|p| pt::is_countable_claude(*p, &snap))
         .collect();
-    let cmdlines = pt::command_lines_for_pids(&pids).await;
+    holder_from_command_lines(pt::command_lines_for_pids(&pids).await, id)
+}
+
+/// Pure: the holder of session `id` from the claude processes' command lines.
+/// `Err` when the command-line read is UNKNOWN (`None`: the read failed and no
+/// fallback answered) — an empty map there would read as "nobody holds it",
+/// and the resume it lets through would fork a live session.
+fn holder_from_command_lines(
+    cmdlines: Option<std::collections::HashMap<u32, String>>,
+    id: &str,
+) -> Result<Option<u32>, String> {
+    let Some(cmdlines) = cmdlines else {
+        return Err("process_table_unreadable".to_string());
+    };
     let procs: Vec<(u32, String)> = cmdlines.into_iter().collect();
     Ok(holder_of(&procs, id))
 }
@@ -497,16 +512,26 @@ async fn live_holder(id: &str) -> Result<Option<u32>, String> {
 // I/O: the spawn site
 // ---------------------------------------------------------------------------
 
-/// Read the claude processes under `terminal_id`'s pane.
+/// Read the claude processes under `terminal_id`'s pane. `None` when the pane
+/// is gone or the process table is UNKNOWN (a failed or stale read): an empty
+/// list from it would read as "the resumed claude is not there". A read begun
+/// now (never the memo), since [`verify`] can disprove a resume from it.
 async fn read_claude_procs(
     tm: &Arc<TerminalManager>,
     terminal_id: &str,
 ) -> Option<Vec<ClaudeProc>> {
     use crate::process_capture::process_tree as pt;
     let root = tm.get(terminal_id)?.child_pid()?;
-    let snap = pt::snapshot_process_table_public().await;
+    let snap = pt::snapshot_process_table_fresh().await;
+    if snap.is_unknown() {
+        return None;
+    }
     let pids = pt::claude_pids_in_inclusive_subtree(root, &snap);
-    let cmdlines = pt::command_lines_for_pids(&pids).await;
+    // An UNKNOWN command-line read skips this poll (`None`), exactly as an
+    // UNKNOWN table does: a list built from it would drop every process (each
+    // `ClaudeProc` needs its cmdline) and read as "the resumed claude is not
+    // there". The caller polls again.
+    let cmdlines = pt::command_lines_for_pids(&pids).await?;
     let cwds = pt::working_directories_for_pids(&pids).await;
     Some(
         pids.into_iter()
@@ -528,12 +553,44 @@ async fn verify(
     cand: &Candidate,
     terminal_id: &str,
 ) -> Result<ProcessEvidence, String> {
-    let deadline = tokio::time::Instant::now() + VERIFY_DEADLINE;
+    verify_with(
+        cand,
+        terminal_id,
+        VERIFY_DEADLINE,
+        VERIFY_POLL,
+        || tm.get(terminal_id).is_some(),
+        || read_claude_procs(tm, terminal_id),
+    )
+    .await
+}
+
+/// The poll loop behind [`verify`], over an injected pane check and process
+/// read (`None` = that poll's table was UNKNOWN). At the deadline it reports
+/// `no_claude_resume_process_observed` only when at least one poll actually
+/// READ the table; when every poll was UNKNOWN it reports
+/// `process_table_unreadable` — "could not look" is not "looked and found
+/// nothing".
+async fn verify_with<A, R, Fut>(
+    cand: &Candidate,
+    terminal_id: &str,
+    deadline: Duration,
+    poll: Duration,
+    mut pane_alive: A,
+    mut read: R,
+) -> Result<ProcessEvidence, String>
+where
+    A: FnMut() -> bool,
+    R: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<Vec<ClaudeProc>>>,
+{
+    let deadline = tokio::time::Instant::now() + deadline;
+    let mut any_poll_readable = false;
     loop {
-        if tm.get(terminal_id).is_none() {
+        if !pane_alive() {
             return Err("pane_vanished_before_claude_appeared".to_string());
         }
-        if let Some(procs) = read_claude_procs(tm, terminal_id).await {
+        if let Some(procs) = read().await {
+            any_poll_readable = true;
             match judge(&procs, cand, terminal_id) {
                 Ok(ev) => return Ok(ev),
                 Err(Some(reason)) => return Err(reason),
@@ -541,9 +598,14 @@ async fn verify(
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err("no_claude_resume_process_observed".to_string());
+            return Err(if any_poll_readable {
+                "no_claude_resume_process_observed"
+            } else {
+                "process_table_unreadable"
+            }
+            .to_string());
         }
-        tokio::time::sleep(VERIFY_POLL).await;
+        tokio::time::sleep(poll).await;
     }
 }
 
@@ -1009,6 +1071,26 @@ mod tests {
         assert_eq!(holder_of(&[], ID), None);
     }
 
+    /// W-A: the fork guard (`live_holder`) REFUSES when the command-line read
+    /// is UNKNOWN — it must not read "could not read the command lines" as
+    /// "nobody holds this session" and let a second `claude --resume` in. A
+    /// read that answered decides as before, including an empty answer.
+    #[test]
+    fn resume_door_live_holder_refuses_when_command_lines_are_unreadable() {
+        assert_eq!(
+            holder_from_command_lines(None, ID),
+            Err("process_table_unreadable".to_string()),
+            "an UNKNOWN command-line read refuses"
+        );
+        let read = std::collections::HashMap::from([(9, format!("/bin/claude --resume {ID}"))]);
+        assert_eq!(holder_from_command_lines(Some(read), ID), Ok(Some(9)));
+        assert_eq!(
+            holder_from_command_lines(Some(std::collections::HashMap::new()), ID),
+            Ok(None),
+            "a read that answered with no holder lets the resume through"
+        );
+    }
+
     #[test]
     fn path_case_folds_only_where_the_filesystem_does() {
         assert!(same_path_with("/Work/Proj", "/work/proj", true));
@@ -1060,6 +1142,67 @@ mod tests {
             cwd: cwd.map(String::from),
             config_dir: cfg.map(String::from),
         }
+    }
+
+    /// Nit 2: when EVERY poll's table is UNKNOWN, `verify` says it could not
+    /// look (`process_table_unreadable`), not that it looked and found nothing.
+    /// One readable poll is enough to have looked.
+    #[tokio::test]
+    async fn resume_door_verify_reports_an_unreadable_table_not_an_absent_process() {
+        let c = cand();
+        let window = Duration::from_millis(40);
+        let poll = Duration::from_millis(5);
+
+        let every_poll_unknown =
+            verify_with(&c, "t", window, poll, || true, || std::future::ready(None)).await;
+        assert_eq!(
+            every_poll_unknown,
+            Err("process_table_unreadable".to_string())
+        );
+
+        let read_and_empty = verify_with(
+            &c,
+            "t",
+            window,
+            poll,
+            || true,
+            || std::future::ready(Some(Vec::new())),
+        )
+        .await;
+        assert_eq!(
+            read_and_empty,
+            Err("no_claude_resume_process_observed".to_string())
+        );
+
+        let mut polls = 0;
+        let one_readable = verify_with(
+            &c,
+            "t",
+            window,
+            poll,
+            || true,
+            || {
+                polls += 1;
+                std::future::ready((polls == 2).then(Vec::new))
+            },
+        )
+        .await;
+        assert_eq!(
+            one_readable,
+            Err("no_claude_resume_process_observed".to_string())
+        );
+
+        let good = format!("/bin/claude --resume {ID}");
+        let found = verify_with(
+            &c,
+            "t",
+            window,
+            poll,
+            || true,
+            || std::future::ready(Some(vec![proc(&good, None, None)])),
+        )
+        .await;
+        assert_eq!(found.map(|ev| ev.pid), Ok(Some(42)));
     }
 
     #[test]

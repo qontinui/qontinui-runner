@@ -1125,8 +1125,8 @@ pub async fn compute(
     // the process snapshot so every pid it names is judged against a snapshot
     // at least as new as the answer.
     let mut holders = crate::terminal::holder_census::take(terminal_manager).await;
-    let snap = crate::process_capture::process_tree::snapshot_process_table_public().await;
-    if snap.parent_map.is_empty() {
+    let snap = crate::process_capture::process_tree::snapshot_process_table_fresh().await;
+    if snap.is_unknown() {
         return None;
     }
     // Review F2: a pane that began spawning after the census walked the pane

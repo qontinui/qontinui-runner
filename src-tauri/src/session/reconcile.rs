@@ -1090,8 +1090,18 @@ fn parse_iso_to_unix_secs(s: &str) -> Option<i64> {
 /// otherwise qualify); the shell pid's start is only a fallback for a found
 /// claude whose own start is unknown. A PTY whose subtree hosts no claude image
 /// keeps `ai_pid: None`, and [`run_reconcile`] never binds it.
+///
+/// An UNKNOWN snapshot ([`ProcessSnapshot::is_unknown`]: a failed read, or the
+/// last good table served `stale`) anchors NOTHING: its processes may have
+/// exited minutes ago, and an anchor resolved from one could bind a pane to a
+/// session it no longer hosts — whose `--resume` the next restore would type.
+/// Every unresolved `ai_pid` stays `None`, so no pane is bound this pass;
+/// pruning and the rest of the pass still run.
 fn anchor_live_ptys(live: &[LivePty], snapshot: &ProcessSnapshot) -> Vec<LivePty> {
     let mut out = live.to_vec();
+    if snapshot.is_unknown() {
+        return out;
+    }
     for pty in out.iter_mut() {
         if pty.ai_pid.is_some() {
             continue; // the caller already resolved it
@@ -1162,8 +1172,14 @@ pub async fn run_reconcile_pass(
     let cmdline_ids: HashMap<u32, String> = if anchor_pids.is_empty() {
         HashMap::new()
     } else {
+        // An UNKNOWN read (`None`) is treated as an empty map here, and only
+        // here because it is safe: rung 2 is positive evidence only, so no
+        // cmdline id just sends every terminal to the rung-3 transcript anchor,
+        // exactly as a read that found no ids does. Nothing is bound BECAUSE an
+        // id is absent.
         crate::process_capture::process_tree::command_lines_for_pids(&anchor_pids)
             .await
+            .unwrap_or_default()
             .iter()
             .filter_map(|(pid, cl)| {
                 crate::process_capture::process_tree::parse_session_id_from_cmdline(cl)
@@ -2404,6 +2420,68 @@ mod tests {
         assert!(
             store.find_open_by_terminal("shell-term").is_none(),
             "no row written for the shell pane"
+        );
+    }
+
+    /// B1: a STALE table that still has rows anchors nothing, so nothing is
+    /// bound from it. The same table read fresh anchors the claude under the
+    /// pane and binds — the refusal is the `stale` flag, not the data.
+    #[test]
+    fn reconcile_a_stale_table_anchors_nothing_and_binds_nothing() {
+        // Shell 4242 -> claude 5151 (started 1_000); one same-cwd transcript
+        // that started after claude did.
+        let table = |stale: bool| {
+            let mut s = ProcessSnapshot::default();
+            s.parent_map.insert(4242, vec![5151]);
+            s.creation_times.insert(4242, 900);
+            s.creation_times.insert(5151, 1_000);
+            s.names.insert(4242, "bash".to_string());
+            s.names.insert(5151, "claude".to_string());
+            s.stale = stale;
+            s
+        };
+        let index = || {
+            let mut by_wd = HashMap::new();
+            by_wd.insert(
+                "C:/repo".to_string(),
+                vec![cand("real-sess", "C:/cfg", Some(1_500))],
+            );
+            FakeIndex {
+                by_wd,
+                existing_ids: ["real-sess".to_string()].into_iter().collect(),
+            }
+        };
+        let live = vec![pty("claude-term", Some(4242), "C:/repo")];
+
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let stale = table(true);
+        let anchored = anchor_live_ptys(&live, &stale);
+        assert_eq!(anchored[0].ai_pid, None, "a stale table anchors nothing");
+        let actions = run_reconcile(&store, &anchored, &stale, &index(), &no_cmdlines());
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, ReconcileAction::Bind { .. })),
+            "no bind from a stale table, got {actions:?}"
+        );
+        assert!(store.get("real-sess").is_none(), "no row written");
+
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let fresh = table(false);
+        let anchored = anchor_live_ptys(&live, &fresh);
+        assert_eq!(
+            anchored[0].ai_pid,
+            Some(5151),
+            "a fresh table anchors claude"
+        );
+        let actions = run_reconcile(&store, &anchored, &fresh, &index(), &no_cmdlines());
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ReconcileAction::Bind { session_id, .. } if session_id == "real-sess")),
+            "the fresh table binds, got {actions:?}"
         );
     }
 
