@@ -78,4 +78,17 @@ regexes = [
   # secret, so an unanchored entry would also excuse any longer token that
   # merely contains this one (a real JWT whose signature began with "sig").
   '''^eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiIxIn0\.sig$''',
+  # Two synthetic fixtures in the bundled expedite-review skill's own suite
+  # (src-tauri/src/fleet_skills/expedite-review/post-verdict-selftest.sh): its
+  # redaction cases feed post-verdict.sh a reason carrying a credential shape and
+  # assert the shape is REDACTED before the verdict is posted. Neither is a
+  # credential: the PEM body is the base64 of the literal "open", and the
+  # password is filler the test plants in a fake SELFTEST_DB_PASSWORD. The file
+  # is a byte-for-byte carry of qontinui-claude-config's
+  # `.claude/skills/expedite-review/` (the fleet-skills parity check compares
+  # them), so the fixtures cannot be respelled here without forking the bundle.
+  # Exact ANCHORED literals, as above; the PEM's `\n` is the two source
+  # characters backslash-n, not a newline.
+  '''^-----BEGIN OPENSSH PRIVATE KEY-----\\nb3Blbg==\\n-----END OPENSSH PRIVATE KEY-----$''',
+  '''^hunter2-selftest-pw-0123$''',
 ]
