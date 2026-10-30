@@ -10,9 +10,18 @@
 //!
 //! - [`pane_claude_pids`] is the walk: every `claude` in the inclusive
 //!   subtrees of a pane's roots, over one process snapshot. The tracking-health
-//!   census (`session::tracking_health::evaluate` / `compute`) uses it for its
-//!   holder panes, so the census and this attribution cannot disagree about
-//!   which `claude` a pane holds.
+//!   census (`session::tracking_health::evaluate` / `compute`) shares this one
+//!   walk for its holder panes. Sharing the walk is not sharing the answer:
+//!   the two feed it different ROOTS, so a pid the census counts in a holder
+//!   pane can be unattributed here. What differs:
+//!   - the census walks every holder-census pane (`[holder_pid, child_pid]`,
+//!     unguarded), including a DEAD holder's surviving child and a pane the
+//!     terminal manager has no tab for, because it counts every live `claude`;
+//!   - this attribution walks only panes the terminal manager lists as ALIVE
+//!     ([`pane_roots`]), and admits a child pid — the manager's or the
+//!     census's — only through the PID-reuse guard ([`ReuseGuard`]);
+//!   - a pid under two panes is counted by the census in both, and attributed
+//!     here to none.
 //! - [`root_is_recycled`] is the PID-reuse guard
 //!   (`process_tree::claude_present_in_inclusive_subtree`'s first half, keyed
 //!   by `tracking_health::pid_reuse_reference`), usable on its own so a caller
@@ -42,16 +51,16 @@ use crate::process_capture::process_tree::{
     claude_pids_in_inclusive_subtree, ProcessSnapshot, PID_REUSE_SKEW_MS,
 };
 use crate::session::claude_session_registry::LiveClaudeSession;
-use crate::session::reconcile::LivePty;
 use crate::session::tracking_health::{pid_reuse_reference, HolderCensus};
+use crate::terminal::types::TerminalInfo;
 
 /// One runner pane's process roots, as [`attribute_holders`] walks them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneRoots {
     /// Stable runner terminal id.
     pub terminal_id: String,
-    /// Grid page the pane is on (from [`LivePty::page_id`]). `None` when the
-    /// page is not known — the attribution still names the pane.
+    /// Grid page the pane is on (from [`TerminalInfo::page_id`]). `None` when
+    /// the page is not known — the attribution still names the pane.
     pub page_id: Option<String>,
     /// The pane's PTY child pid as the terminal manager reports it. Subject to
     /// the PID-reuse guard ([`ReuseGuard`]): a pid that predates this runner's
@@ -63,7 +72,11 @@ pub struct PaneRoots {
     /// a lock record whose start token matches), so it is not re-guarded.
     pub holder_pid: Option<u32>,
     /// The child pid the holder census names, when it differs from
-    /// [`Self::child_pid`]. Trusted on the same grounds as `holder_pid`.
+    /// [`Self::child_pid`]. Guarded like `child_pid` ([`ReuseGuard`]): a DEAD
+    /// holder's census keeps its recorded child while that child "cannot be
+    /// proven not to be the same process", so the pid may since have been
+    /// recycled. Only a pid in [`ReuseGuard::verified`] skips the boot
+    /// comparison.
     pub census_child_pid: Option<u32>,
 }
 
@@ -147,17 +160,17 @@ pub fn pane_claude_pids(
 
 /// The roots one pane is walked from, after the reuse guard. Holder-census
 /// roots first, matching the census's own `[holder_pid, child_pid]` order.
+/// The holder pid is trusted (its identity is the census's proof); every child
+/// pid — the census's and the manager's — must pass the guard.
 fn admitted_roots(pane: &PaneRoots, snapshot: &ProcessSnapshot, guard: &ReuseGuard) -> Vec<u32> {
     let mut roots: Vec<u32> = Vec::new();
-    for trusted in [pane.holder_pid, pane.census_child_pid]
+    if let Some(holder) = pane.holder_pid {
+        roots.push(holder);
+    }
+    for child in [pane.census_child_pid, pane.child_pid]
         .into_iter()
         .flatten()
     {
-        if !roots.contains(&trusted) {
-            roots.push(trusted);
-        }
-    }
-    if let Some(child) = pane.child_pid {
         if !roots.contains(&child) && guard.admits(child, snapshot) {
             roots.push(child);
         }
@@ -220,22 +233,33 @@ pub fn attribute_holders(
         .collect()
 }
 
-/// Join the terminal manager's live panes with the holder census into the
-/// roots [`attribute_holders`] walks. Only panes the terminal manager lists
-/// are returned: a pane the runner has no tab for cannot be "gone to". A
-/// census row for that pane contributes its holder (and, when different, its
-/// child) as trusted roots.
-pub fn pane_roots(live: &[LivePty], census: &HolderCensus) -> Vec<PaneRoots> {
-    live.iter()
-        .map(|pty| {
-            let row = census.panes.iter().find(|p| p.pane_id == pty.terminal_id);
-            let child_pid = pty.pid.filter(|&p| p > 0);
+/// Join the terminal manager's panes with the holder census into the roots
+/// [`attribute_holders`] walks.
+///
+/// Only panes the terminal manager lists AND reports alive are returned:
+/// - a pane the runner has no tab for cannot be "gone to";
+/// - an EXITED pane holds no live conversation, and its `pid` still names the
+///   dead child. That pid may since have been reused by an unrelated process
+///   started after this runner booted, which the boot comparison in
+///   [`ReuseGuard`] cannot tell from the pane's own child. Walking it would
+///   name the exited tab as the holder of whatever `claude` now runs under the
+///   recycled pid.
+///
+/// A census row for a returned pane contributes its holder as a trusted root
+/// and, when it differs from the manager's, its child as a guarded one.
+pub fn pane_roots(panes: &[TerminalInfo], census: &HolderCensus) -> Vec<PaneRoots> {
+    panes
+        .iter()
+        .filter(|info| info.is_alive)
+        .map(|info| {
+            let row = census.panes.iter().find(|p| p.pane_id == info.id);
+            let child_pid = info.pid.filter(|&p| p > 0);
             let census_child_pid = row
                 .and_then(|r| r.child_pid)
                 .filter(|&c| Some(c) != child_pid);
             PaneRoots {
-                terminal_id: pty.terminal_id.clone(),
-                page_id: Some(pty.page_id.clone()).filter(|p| !p.is_empty()),
+                terminal_id: info.id.clone(),
+                page_id: Some(info.page_id.clone()).filter(|p| !p.is_empty()),
                 child_pid,
                 holder_pid: row.and_then(|r| r.holder_pid),
                 census_child_pid,
@@ -282,6 +306,20 @@ pub fn with_holding_panes(
                 terminal_id,
                 page_id,
             }
+        })
+        .collect()
+}
+
+/// The rows WITHOUT pane attribution: what `terminal_claude_session_list_live`
+/// answers when the caller did not ask for holders (`withHolders` false). The
+/// pane keys are omitted, which reads as "pane unknown" — never "not live".
+pub fn without_holding_panes(sessions: Vec<LiveClaudeSession>) -> Vec<LiveSessionRow> {
+    sessions
+        .into_iter()
+        .map(|session| LiveSessionRow {
+            session,
+            terminal_id: None,
+            page_id: None,
         })
         .collect()
 }
@@ -566,16 +604,24 @@ mod tests {
         }
     }
 
-    fn pty(id: &str, pid: Option<u32>, page: &str) -> LivePty {
-        LivePty {
-            terminal_id: id.to_string(),
-            pid,
-            working_dir: "D:/work".to_string(),
-            page_id: page.to_string(),
+    fn info(id: &str, pid: Option<u32>, page: &str, is_alive: bool) -> TerminalInfo {
+        TerminalInfo {
+            id: id.to_string(),
             title: String::new(),
-            ai_pid: None,
-            ai_start_unix: None,
+            pid,
+            cols: 80,
+            rows: 24,
+            working_dir: "D:/work".to_string(),
+            is_alive,
+            exit_code: (!is_alive).then_some(0),
+            created_at: 0,
+            total_bytes_produced: 0,
+            page_id: page.to_string(),
         }
+    }
+
+    fn alive(id: &str, pid: Option<u32>, page: &str) -> TerminalInfo {
+        info(id, pid, page, true)
     }
 
     #[test]
@@ -585,14 +631,16 @@ mod tests {
                 holder_pane("t-held", Some(50), Some(51)),
                 holder_pane("t-moved", Some(80), Some(82)),
                 holder_pane("t-no-tab", Some(90), Some(91)),
+                holder_pane("t-exited", Some(95), Some(96)),
             ],
             ..HolderCensus::default()
         };
         let live = vec![
-            pty("t-plain", Some(10), "page-1"),
-            pty("t-held", Some(51), "page-2"),
-            pty("t-moved", Some(81), ""),
-            pty("t-nopid", Some(0), "page-3"),
+            alive("t-plain", Some(10), "page-1"),
+            alive("t-held", Some(51), "page-2"),
+            alive("t-moved", Some(81), ""),
+            alive("t-nopid", Some(0), "page-3"),
+            info("t-exited", Some(96), "page-4", false),
         ];
         let roots = pane_roots(&live, &census);
         assert_eq!(
@@ -627,8 +675,88 @@ mod tests {
                     census_child_pid: None,
                 },
             ],
-            "a census row with no manager tab (t-no-tab) is not a pane to go to"
+            "a census row with no manager tab (t-no-tab) is not a pane to go to, and an \
+             exited pane (t-exited) is no pane at all"
         );
+    }
+
+    /// Review M1: an EXITED pane keeps its dead child's pid in
+    /// `TerminalInfo.pid`. When that pid is reused by a process started AFTER
+    /// this runner booted, the boot comparison admits it — so the only thing
+    /// that stops the exited tab from being named holder of the claude now
+    /// running under the recycled pid is skipping the dead pane.
+    #[test]
+    fn an_exited_pane_whose_old_pid_now_roots_an_outside_claude_maps_to_none() {
+        // Pane t-dead's shell (pid 60) exited; pid 60 now names a fresh
+        // terminal (started after boot, so the reuse guard admits it) whose
+        // claude 61 runs outside every runner pane.
+        let s = snap(
+            &[(60, &[61])],
+            &[
+                (60, "WindowsTerminal.exe", NEW_S),
+                (61, "claude.exe", NEW_S),
+            ],
+        );
+        let verified = HashSet::new();
+        let census = HolderCensus::default();
+
+        let exited = vec![info("t-dead", Some(60), "page-1", false)];
+        let panes = pane_roots(&exited, &census);
+        assert!(panes.is_empty(), "an exited pane is no root: {panes:?}");
+        let out = attribute_holders(&[61], &panes, &s, RUNNER, &guard(&verified));
+        assert_eq!(out, vec![(0, None)], "the outside claude names no pane");
+
+        // The same pane reported ALIVE is walked — the skip is the dead
+        // pane's, not the pid's.
+        let running = vec![alive("t-dead", Some(60), "page-1")];
+        let panes = pane_roots(&running, &census);
+        let out = attribute_holders(&[61], &panes, &s, RUNNER, &guard(&verified));
+        assert_eq!(out, vec![(0, held("t-dead", "page-1"))]);
+    }
+
+    /// Review M1: a DEAD holder's census row keeps its recorded child pid
+    /// while the child "cannot be proven not to be the same process". That pid
+    /// is guarded like the manager's: a pre-boot process under it that is not
+    /// a PROVEN holder child is a recycled pid, and is not walked.
+    #[test]
+    fn a_dead_holder_census_child_is_rejected_by_the_guard() {
+        // Holder 70 is dead (no holder pid); its recorded child 71 is now an
+        // unrelated process started long before this boot, holding claude 72.
+        let s = snap(
+            &[(71, &[72])],
+            &[(71, "explorer.exe", OLD_S), (72, "claude.exe", NEW_S)],
+        );
+        let mut dead = holder_pane("t-h", None, Some(71));
+        dead.state = HolderPaneState::Dead;
+        let census = HolderCensus {
+            panes: vec![dead],
+            ..HolderCensus::default()
+        };
+        // The manager reports no usable child pid for the pane.
+        let live = vec![alive("t-h", None, "page-h")];
+        let panes = pane_roots(&live, &census);
+        assert_eq!(panes[0].census_child_pid, Some(71));
+
+        let unverified = HashSet::new();
+        let out = attribute_holders(&[72], &panes, &s, RUNNER, &guard(&unverified));
+        assert_eq!(
+            out,
+            vec![(0, None)],
+            "a recycled census child names no pane"
+        );
+
+        // Boot unknown: an unverified census child is not walked either.
+        let unknown_boot = ReuseGuard {
+            verified: &unverified,
+            boot_unix_millis: None,
+        };
+        let out = attribute_holders(&[72], &panes, &s, RUNNER, &unknown_boot);
+        assert_eq!(out, vec![(0, None)]);
+
+        // A census child PROVEN to be the holder's recorded child is walked.
+        let proven: HashSet<u32> = [71].into_iter().collect();
+        let out = attribute_holders(&[72], &panes, &s, RUNNER, &guard(&proven));
+        assert_eq!(out, vec![(0, held("t-h", "page-h"))]);
     }
 
     fn session(id: &str, pid: u32) -> LiveClaudeSession {
@@ -646,7 +774,7 @@ mod tests {
             kind: "interactive".into(),
             started_at: 1,
             updated_at: 2,
-            resume_command: format!("cd 'D:/work' && cla --resume {id}"),
+            resume_command: Some(format!("cd 'D:/work' && cla --resume {id}")),
         }
     }
 
@@ -674,6 +802,22 @@ mod tests {
         assert_eq!(second["sessionId"], "outside");
         assert!(!second.contains_key("terminalId"), "omitted, not null");
         assert!(!second.contains_key("pageId"), "omitted, not null");
+    }
+
+    /// Review W10: a read without holders keeps every row and its registry
+    /// fields, and omits the pane keys — pane unknown, never "not live".
+    #[test]
+    fn rows_without_holders_keep_every_row_and_omit_the_pane_keys() {
+        let rows = without_holding_panes(vec![session("in-pane", 11), session("outside", 30)]);
+        let json = serde_json::to_value(&rows).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        for (row, id) in arr.iter().zip(["in-pane", "outside"]) {
+            let obj = row.as_object().unwrap();
+            assert_eq!(obj["sessionId"], id);
+            assert!(!obj.contains_key("terminalId"), "omitted, not null");
+            assert!(!obj.contains_key("pageId"), "omitted, not null");
+        }
     }
 
     #[test]

@@ -9,11 +9,13 @@ import {
   DERIVED_NAME_SOURCE,
   extractLiveSessions,
   extractLiveSessionsStrict,
+  fetchLiveClaudeHolders,
   fetchLiveClaudeSessionIds,
   fetchLiveClaudeSessions,
   isOperatorNamed,
   liveSessionIdSet,
   registryNamesBySessionId,
+  unreadableRegistryEntries,
   type LiveClaudeSession,
 } from "./liveClaudeSessions";
 
@@ -246,6 +248,46 @@ describe("extractLiveSessionsStrict (liveness polarity)", () => {
     expect(extractLiveSessionsStrict({ session: [mk()] })).toBeNull(); // renamed key
     expect(extractLiveSessionsStrict({ sessions: "not-an-array" })).toBeNull();
   });
+
+  // Review M2: one unreadable registry file of a LIVE process must not read
+  // as "not live" — the rows may be missing exactly the gated conversation.
+  it("an incomplete read (non-empty `unreadable`) is null (UNKNOWN), never the partial rows", () => {
+    const partial = {
+      sessions: [mk({ sessionId: "readable" })],
+      unreadable: [{ pid: 9999, configDir: "C:/claude/.claude-paktis" }],
+    };
+    expect(extractLiveSessionsStrict(partial)).toBeNull();
+    // An unlistable sessions directory (no pid) is just as unknown.
+    expect(
+      extractLiveSessionsStrict({
+        sessions: [],
+        unreadable: [{ pid: null, configDir: "C:/claude/.claude-gmail" }],
+      }),
+    ).toBeNull();
+    expect(unreadableRegistryEntries(partial)).toEqual(partial.unreadable);
+  });
+
+  it("a complete read (`unreadable: []`) and a pre-key runner (no `unreadable`) are rows", () => {
+    expect(extractLiveSessionsStrict({ sessions: [mk()], unreadable: [] })).toHaveLength(1);
+    expect(extractLiveSessionsStrict({ sessions: [mk()] })).toHaveLength(1);
+    expect(unreadableRegistryEntries({ sessions: [mk()] })).toEqual([]);
+  });
+
+  it("a present but non-array `unreadable` is a shape not understood (null)", () => {
+    expect(extractLiveSessionsStrict({ sessions: [mk()], unreadable: {} })).toBeNull();
+    expect(extractLiveSessionsStrict({ sessions: [mk()], unreadable: null })).toBeNull();
+  });
+
+  it("the DISPLAY extractor still shows the rows the runner did read", () => {
+    // Every tolerant caller (the names poller) keeps its names when one file
+    // is unreadable — only liveness decisions read the incomplete read as UNKNOWN.
+    const partial = {
+      sessions: [mk({ sessionId: "readable" })],
+      unreadable: [{ pid: 9999, configDir: "C:/claude/.claude-paktis" }],
+    };
+    expect(extractLiveSessions(partial).map((s) => s.sessionId)).toEqual(["readable"]);
+    expect(extractLiveSessions({ sessions: [mk()], unreadable: "bad" })).toEqual([]);
+  });
 });
 
 describe("fetchLiveClaudeSessionIds (P1 restore-idempotence liveness source)", () => {
@@ -268,7 +310,10 @@ describe("fetchLiveClaudeSessionIds (P1 restore-idempotence liveness source)", (
       },
     });
     const ids = await fetchLiveClaudeSessionIds();
-    expect(mockInvoke).toHaveBeenCalledWith("terminal_claude_session_list_live");
+    // Liveness only: the id projection skips the holder census (review W10).
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_claude_session_list_live", {
+      withHolders: false,
+    });
     expect(ids).not.toBeNull();
     expect([...ids!].sort()).toEqual(["dup", "solo"]);
   });
@@ -326,6 +371,21 @@ describe("fetchLiveClaudeSessionIds (P1 restore-idempotence liveness source)", (
     expect(await fetchLiveClaudeSessionIds()).toBeNull();
   });
 
+  it("returns null (indeterminate) when a live registry file could not be read (review M2)", async () => {
+    // The profile restore and the cold-restore drain gate on this set: a live
+    // process whose file the runner could not read must skip-unknown, never
+    // read as "not live" and respawn a second writer.
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      message: null,
+      data: {
+        sessions: [mk({ sessionId: "readable" })],
+        unreadable: [{ pid: 9999, configDir: "C:/claude/.claude-paktis" }],
+      },
+    });
+    expect(await fetchLiveClaudeSessionIds()).toBeNull();
+  });
+
   it("ignores rows without a usable sessionId instead of throwing", async () => {
     mockInvoke.mockResolvedValueOnce({
       success: true,
@@ -348,22 +408,43 @@ describe("fetchLiveClaudeSessions (the rows the click gate reads)", () => {
       mk({ sessionId: "dup", pid: 11 }),
     ];
     mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { sessions: rows } });
-    expect(await fetchLiveClaudeSessions()).toEqual(rows);
+    expect(await fetchLiveClaudeHolders()).toEqual(rows);
+    // The gate's read is the one that asks for the holder census (review W10).
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_claude_session_list_live", {
+      withHolders: true,
+    });
+  });
+
+  it("passes withHolders through as given", async () => {
+    mockInvoke.mockResolvedValue({ success: true, message: null, data: { sessions: [] } });
+    await fetchLiveClaudeSessions({ withHolders: false });
+    await fetchLiveClaudeSessions({ withHolders: true });
+    expect(mockInvoke.mock.calls.map((c) => c[1])).toEqual([
+      { withHolders: false },
+      { withHolders: true },
+    ]);
   });
 
   it("returns [] for a readable empty registry and null for an unreadable one", async () => {
     mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { sessions: [] } });
-    expect(await fetchLiveClaudeSessions()).toEqual([]);
+    expect(await fetchLiveClaudeHolders()).toEqual([]);
     mockInvoke.mockRejectedValueOnce(new Error("ipc down"));
-    expect(await fetchLiveClaudeSessions()).toBeNull();
+    expect(await fetchLiveClaudeHolders()).toBeNull();
     mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: {} });
-    expect(await fetchLiveClaudeSessions()).toBeNull();
+    expect(await fetchLiveClaudeHolders()).toBeNull();
+    // Review M2: a live registry file the runner could not read.
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      message: null,
+      data: { sessions: [], unreadable: [{ pid: 9999, configDir: "C:/claude/.claude-hotmail" }] },
+    });
+    expect(await fetchLiveClaudeHolders()).toBeNull();
   });
 
   it("the id set is exactly the ids projection of the rows (one oracle)", async () => {
     const rows = [mk({ sessionId: "a" }), mk({ sessionId: "b" }), mk({ sessionId: "a" })];
     mockInvoke.mockResolvedValue({ success: true, message: null, data: { sessions: rows } });
-    const fromRows = liveSessionIdSet((await fetchLiveClaudeSessions())!);
+    const fromRows = liveSessionIdSet((await fetchLiveClaudeHolders())!);
     const ids = await fetchLiveClaudeSessionIds();
     expect([...ids!].sort()).toEqual([...fromRows].sort());
     expect([...fromRows].sort()).toEqual(["a", "b"]);

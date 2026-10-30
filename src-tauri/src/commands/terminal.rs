@@ -2151,24 +2151,40 @@ pub fn terminal_report_bridge_registration_failure(
 /// same `sessionId` (22 of 80 did), each with its own name; collapsing that is
 /// the caller's decision.
 ///
-/// Each row also names the runner pane that holds it — `terminalId` /
-/// `pageId` — attributed by `session::live_holders::attribute_holders` over
-/// the SAME process snapshot the liveness check uses (plan
+/// With `withHolders: true`, each row also names the runner pane that holds
+/// it — `terminalId` / `pageId` — attributed by
+/// `session::live_holders::attribute_holders` over the SAME process snapshot
+/// the liveness check uses (plan
 /// 2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity,
 /// Phase 2). Both keys are OMITTED when the pane is unknown: a process outside
 /// every runner pane, one under two panes, or one whose pane root failed the
 /// PID-reuse guard. An omitted pane never means "not live".
+///
+/// Pane attribution is OPT-IN because it costs a holder census (bounded at
+/// `holder_census::CENSUS_TIMEOUT`) on top of the snapshot. Only the
+/// click-resume gate needs it, to offer "go to the existing pane"; the names
+/// poller and the restore paths need liveness alone and omit the argument.
+///
+/// `unreadable` lists every registry entry that may hide a LIVE session but
+/// could not be read (`claude_session_registry::read_live_sessions_reporting`).
+/// Non-empty means `sessions` may be incomplete, so a liveness gate must read
+/// the whole answer as UNKNOWN (D2); a display caller may still show the rows.
 #[tauri::command]
 pub async fn terminal_claude_session_list_live(
     terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    with_holders: Option<bool>,
 ) -> Result<CommandResponse, String> {
     let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
+    let terminal_manager: Arc<TerminalManager> = terminal_manager.inner().clone();
     // The holder census BEFORE the snapshot (as `tracking_health::compute`
     // takes it): every holder pid it names is then judged against a snapshot
     // at least as new as the answer. Never fails — an unreadable pane
     // directory only leaves holder-backed panes rooted at their child pid.
-    let terminal_manager: Arc<TerminalManager> = terminal_manager.inner().clone();
-    let census = crate::terminal::holder_census::take(&terminal_manager).await;
+    let census = if with_holders.unwrap_or(false) {
+        Some(crate::terminal::holder_census::take(&terminal_manager).await)
+    } else {
+        None
+    };
     // Re-check liveness: a crashed process cannot remove its own registry file,
     // so PID presence is the guard against reporting a dead session as open.
     //
@@ -2180,39 +2196,44 @@ pub async fn terminal_claude_session_list_live(
     // restore path respawn — fork — every session.
     let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
     let live_pids = crate::session::claude_session_registry::live_pids_from_snapshot(&snapshot)?;
-    let sessions =
-        crate::session::claude_session_registry::read_live_sessions(&config_dirs, &live_pids);
-
-    let live_ptys: Vec<crate::session::reconcile::LivePty> = terminal_manager
-        .list()
-        .into_iter()
-        .map(|i| crate::session::reconcile::LivePty {
-            terminal_id: i.id,
-            pid: i.pid,
-            working_dir: i.working_dir,
-            page_id: i.page_id,
-            title: i.title,
-            ai_pid: None,
-            ai_start_unix: None,
-        })
-        .collect();
-    let panes = crate::session::live_holders::pane_roots(&live_ptys, &census);
-    let guard = crate::session::live_holders::ReuseGuard {
-        verified: &census.verified_terminal_pids,
-        boot_unix_millis: crate::session::tracking_health::primary_boot_unix_millis(),
-    };
-    let sessions = crate::session::live_holders::with_holding_panes(
-        sessions,
-        &panes,
-        &snapshot,
-        std::process::id(),
-        &guard,
+    let read = crate::session::claude_session_registry::read_live_sessions_reporting(
+        &config_dirs,
+        &live_pids,
     );
+
+    let sessions = match &census {
+        Some(census) => {
+            let panes = crate::session::live_holders::pane_roots(&terminal_manager.list(), census);
+            let guard = crate::session::live_holders::ReuseGuard {
+                verified: &census.verified_terminal_pids,
+                boot_unix_millis: crate::session::tracking_health::primary_boot_unix_millis(),
+            };
+            crate::session::live_holders::with_holding_panes(
+                read.sessions,
+                &panes,
+                &snapshot,
+                std::process::id(),
+                &guard,
+            )
+        }
+        None => crate::session::live_holders::without_holding_panes(read.sessions),
+    };
     Ok(CommandResponse {
         success: true,
         message: None,
-        data: Some(serde_json::json!({ "sessions": sessions })),
+        data: Some(live_session_list_payload(&sessions, &read.unreadable)),
     })
+}
+
+/// The `data` payload of [`terminal_claude_session_list_live`]:
+/// `{ sessions: [...], unreadable: [{pid, configDir}] }`. `unreadable` is
+/// always present (`[]` on a complete read), so a reader can tell a complete
+/// read from a runner build that predates the key.
+fn live_session_list_payload(
+    sessions: &[crate::session::live_holders::LiveSessionRow],
+    unreadable: &[crate::session::claude_session_registry::UnreadableRegistryEntry],
+) -> serde_json::Value {
+    serde_json::json!({ "sessions": sessions, "unreadable": unreadable })
 }
 
 /// Manually migrate a Claude terminal session to a different configured
@@ -3180,6 +3201,59 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    /// Review M2: the live list's payload carries `unreadable` beside
+    /// `sessions`, ALWAYS — `[]` on a complete read — so the frontend's strict
+    /// extractor can tell "complete, nothing unreadable" from an incomplete
+    /// read, and from a runner build that predates the key.
+    #[test]
+    fn terminal_claude_session_list_live_payload_carries_unreadable_beside_sessions() {
+        use crate::session::claude_session_registry::{LiveClaudeSession, UnreadableRegistryEntry};
+        use crate::session::past_sessions::PastSessionAccount;
+        let row = LiveClaudeSession {
+            session_id: "9b40e22d".into(),
+            name: "maxim".into(),
+            name_source: None,
+            pid: 49448,
+            account: PastSessionAccount {
+                label: "hotmail".into(),
+                wrapper: "clh".into(),
+            },
+            working_dir: "D:/qontinui-root".into(),
+            status: "busy".into(),
+            kind: "interactive".into(),
+            started_at: 1,
+            updated_at: 2,
+            resume_command: None,
+        };
+        let rows = crate::session::live_holders::without_holding_panes(vec![row]);
+
+        let complete = live_session_list_payload(&rows, &[]);
+        assert_eq!(complete["sessions"][0]["sessionId"], "9b40e22d");
+        assert_eq!(complete["unreadable"], serde_json::json!([]));
+
+        let incomplete = live_session_list_payload(
+            &rows,
+            &[
+                UnreadableRegistryEntry {
+                    pid: Some(9999),
+                    config_dir: "C:/claude/.claude-hotmail".into(),
+                },
+                UnreadableRegistryEntry {
+                    pid: None,
+                    config_dir: "C:/claude/.claude-gmail".into(),
+                },
+            ],
+        );
+        assert_eq!(
+            incomplete["unreadable"],
+            serde_json::json!([
+                {"pid": 9999, "configDir": "C:/claude/.claude-hotmail"},
+                {"pid": null, "configDir": "C:/claude/.claude-gmail"},
+            ])
+        );
+        assert_eq!(incomplete["sessions"].as_array().unwrap().len(), 1);
+    }
 
     /// The close envelope carries the outcome as a TYPED value in `data`, never
     /// as prose in `message` — `message` is for humans, `data` is for callers.

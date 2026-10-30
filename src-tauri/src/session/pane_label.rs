@@ -84,6 +84,18 @@ pub struct ConversationIdentity {
 }
 
 /// The conversation identity of the pane whose open record is `rec`.
+///
+/// **Known residual: legacy records keep a stale activity title as their
+/// name.** Records written BEFORE D3 (2026-10-27) may carry the old OSC
+/// activity title in `title`, because the relay mirrored every OSC string
+/// there until then. For an UNNAMED conversation (no `session_name`) this
+/// function falls back to that `title`, so such a pane reads e.g.
+/// `Fix Phase 5b round 11 · <id8>` — an activity, labelled as the
+/// conversation's name. Nothing migrates it, deliberately: the stale value
+/// clears only when `reconcile::refresh_titles` sees a provider name for the
+/// pane's claude (which overwrites `title`) or the operator renames the
+/// conversation. A record written after D3 never acquires one, so the
+/// residual shrinks as old records close.
 pub fn identity_of_record(rec: Option<&TerminalSessionRecord>) -> ConversationIdentity {
     let claude_session_id = rec
         .and_then(|r| clean(Some(r.claude_session_id.as_str())))

@@ -843,9 +843,12 @@ pub fn evaluate(
     // Its `claude` joins the live universe even when it is no descendant of
     // the runner — the case the holder exists for.
     //
-    // The walk is `live_holders::pane_claude_pids` — the same one the
-    // click-resume liveness rows are attributed with — so this census and that
-    // attribution cannot disagree about which `claude` a pane holds.
+    // The walk is `live_holders::pane_claude_pids`, which the click-resume
+    // liveness rows are attributed with too: one walk, not one answer. This
+    // census roots every holder-census pane (dead holders and tab-less panes
+    // included) at its unguarded `[holder_pid, child_pid]`, because it counts
+    // every live `claude`; the attribution roots only alive manager panes and
+    // guards their child pids (see the `live_holders` module doc).
     let mut holder_panes: Vec<HolderPane> = holders.panes.clone();
     let mut holder_claimed: HashSet<u32> = HashSet::new();
     for pane in &mut holder_panes {

@@ -712,6 +712,34 @@ const PageSessionScope = memo(function PageSessionScope({
     () => {},
   );
 
+  // Stable identities for the callbacks the resume funnel closes over: each
+  // forwards through a ref, so none needs to change between renders, and an
+  // inline arrow here would hand `gatedResume`, `handleResumeSession`,
+  // `resumeClick` and the bulk `bulkResume` a new identity every render.
+  const setRightPanelModeViaRef = useCallback(
+    (
+      v: React.SetStateAction<
+        "transcript" | "workflow" | "analysis" | "findings" | "file-ownership" | null
+      >,
+    ) => rightPanelModeSetterRef.current(v),
+    [],
+  );
+  const setSelectedTranscriptSessionIdViaRef = useCallback(
+    (v: React.SetStateAction<string | null>) => selectedSessionSetterRef.current(v),
+    [],
+  );
+  // A click-resume that did not come back says so on the page's notice.
+  const notifyResume = useCallback(
+    (message: string, type: "success" | "error") =>
+      notificationSetterRef.current({ message, type }),
+    [],
+  );
+  // The bulk "resume selected" summary (resumed / already live / unknown).
+  const notifyBulkResume = useCallback(
+    (n: { message: string; type: "success" | "error" }) => notificationSetterRef.current(n),
+    [],
+  );
+
   const shellIntegration = useShellIntegration({
     tabs,
     updateTab,
@@ -719,13 +747,12 @@ const PageSessionScope = memo(function PageSessionScope({
     createTerminal,
     setSessionStates: stateTracking.setSessionStates,
     terminalRefs,
-    setRightPanelMode: (v) => rightPanelModeSetterRef.current(v as never),
-    setSelectedTranscriptSessionId: (v) => selectedSessionSetterRef.current(v as never),
+    setRightPanelMode: setRightPanelModeViaRef,
+    setSelectedTranscriptSessionId: setSelectedTranscriptSessionIdViaRef,
     pageId,
     // A session the operator resumes is shown (tmux `new-window`; no-op in grid).
     onResumedTab: zoneLayout.showSpawnedTab,
-    // A click-resume that did not come back says so on the page's notice.
-    notify: (message, type) => notificationSetterRef.current({ message, type }),
+    notify: notifyResume,
   });
 
   const getScrollback = useCallback(
@@ -791,8 +818,7 @@ const PageSessionScope = memo(function PageSessionScope({
       rightPanelModeSetterRef.current((mode) => rightPanelModeAfterRowSelect(source, mode));
     },
     onCloseSessionTab: terminalManager.closeTerminal,
-    // The bulk "resume selected" summary (resumed / already live / unknown).
-    onNotify: (n) => notificationSetterRef.current(n),
+    onNotify: notifyBulkResume,
   });
 
   const workflowGen = useWorkflowGeneration({

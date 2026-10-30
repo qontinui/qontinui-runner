@@ -13,7 +13,9 @@
  *   `2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity`,
  *   Phase 3): a click on a LIVE id, or with an unreadable registry, opens the
  *   resume-live dialog and creates no tab, types nothing and records nothing
- *   (`terminal_session_record_open`) until the operator chooses.
+ *   (`terminal_session_record_open`) until the operator chooses;
+ * - the in-flight claim (review M3): two quick clicks on one free conversation
+ *   start ONE writer, and a click acknowledges itself before its liveness read.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -54,14 +56,16 @@ vi.mock("./useTerminalInitialization", async (importOriginal) => ({
 }));
 
 import { useShellIntegration } from "./useShellIntegration";
+import { clearResumesInFlight } from "./resumeGate";
 import type { TranscriptSession } from "./useTranscriptSessions";
 import type { LiveClaudeSession } from "./liveClaudeSessions";
 
 const SESSION_ID = "9b40e22d-deec-415c-9379-5f85ae994ad8";
+const OTHER_ID = "3da13dea-0000-4000-8000-000000000000";
 
-function transcript(resumeName: string | null): TranscriptSession {
+function transcript(resumeName: string | null, sessionId = SESSION_ID): TranscriptSession {
   return {
-    session_id: SESSION_ID,
+    session_id: sessionId,
     project_path: "/repo",
     // A named (non-default) account: the default home is unreadable under the
     // mocked `invoke`, and a resume under it would be refused as needs-account.
@@ -122,6 +126,8 @@ const recordOpens = () =>
 beforeEach(() => {
   invoke.mockClear();
   runVerifiedResume.mockClear();
+  // The in-flight registry is module state; each test starts with none held.
+  clearResumesInFlight();
   vi.stubGlobal("navigator", { platform: "Linux x86_64" } as Navigator);
   return () => vi.unstubAllGlobals();
 });
@@ -134,15 +140,18 @@ describe("useShellIntegration handleResumeSession — a free id", () => {
     const newTab = vi.fn(async () => null);
     const { hook, notify } = useShellIntegrationWith(newTab);
 
+    // No tab was opened, so the attempt was REFUSED (bulk waits no spacing).
     await expect(hook.handleResumeSession(transcript("  my-renamed-session  "))).resolves.toBe(
-      "failed",
+      "refused",
     );
-
     expect(newTab).toHaveBeenCalledTimes(1);
     expect(newTab.mock.calls[0][0]).toBe("my-renamed-session");
     expect(newTab.mock.calls[0][1]).toBe("/repo");
-    // The failed click is said, not silent.
-    expect(notify.mock.calls[0][0]).toMatch(/Could not resume "my-renamed-session": no terminal/);
+    // The click acknowledged itself first, then said why it did not come back.
+    expect(notify.mock.calls[0][0]).toMatch(/Resuming "my-renamed-session" — checking/);
+    expect(notify.mock.calls.at(-1)![0]).toMatch(
+      /Could not resume "my-renamed-session": no terminal/,
+    );
   });
 
   it("resumes, records the open on verify, and reports `resumed`", async () => {
@@ -196,7 +205,7 @@ describe("useShellIntegration handleResumeSession — the click gate", () => {
     const outcome = hook.handleResumeSession(transcript(null));
     await flush();
     hook.answerResumeGate("fork");
-    await expect(outcome).resolves.toBe("failed"); // the stub created no tab
+    await expect(outcome).resolves.toBe("refused"); // the stub created no tab
     // The holder's registry name wins over the (absent) transcript name.
     expect(newTab.mock.calls[0][0]).toBe("fork of maxim · 9b40e22d");
     expect(runVerifiedResume).not.toHaveBeenCalled();
@@ -228,16 +237,30 @@ describe("useShellIntegration handleResumeSession — the click gate", () => {
     expect(recordOpens()).toBe(0);
   });
 
-  it("a newer prompt cancels the older one instead of leaving it awaiting", async () => {
-    registry([holder()]);
+  it("a newer prompt (another conversation) cancels the older one instead of leaving it awaiting", async () => {
+    registry([holder(), holder({ sessionId: OTHER_ID, pid: 50000, terminalId: "other-pane" })]);
     const { hook } = useShellIntegrationWith(vi.fn(async () => "t-new"));
     const first = hook.handleResumeSession(transcript("maxim"));
     await flush();
-    const second = hook.handleResumeSession(transcript("maxim"));
+    const second = hook.handleResumeSession(transcript("other", OTHER_ID));
     await flush();
     await expect(first).resolves.toBe("cancelled");
     hook.answerResumeGate("cancel");
     await expect(second).resolves.toBe("cancelled");
+  });
+
+  it("a second click on a conversation whose dialog is open opens no second dialog (in flight)", async () => {
+    registry([holder()]);
+    const newTab = vi.fn(async () => "t-new");
+    const { hook, notify } = useShellIntegrationWith(newTab);
+    const first = hook.handleResumeSession(transcript("maxim"));
+    await flush();
+    await expect(hook.handleResumeSession(transcript("maxim"))).resolves.toBe("skipped-live");
+    expect(notify.mock.calls.at(-1)![0]).toMatch(/"maxim" is already being resumed/);
+    // The first click's dialog is still the one open, and still answerable.
+    hook.answerResumeGate("cancel");
+    await expect(first).resolves.toBe("cancelled");
+    expect(newTab).not.toHaveBeenCalled();
   });
 
   it("non-interactive (bulk): a live id is skipped-live, an unreadable registry skipped-unknown — no dialog, no tab", async () => {
@@ -254,5 +277,83 @@ describe("useShellIntegration handleResumeSession — the click gate", () => {
     ).resolves.toBe("skipped-unknown");
     expect(newTab).not.toHaveBeenCalled();
     expect(notify).not.toHaveBeenCalled();
+  });
+});
+
+describe("useShellIntegration handleResumeSession — two quick clicks (review M3)", () => {
+  it("two concurrent clicks on one FREE conversation create exactly one tab", async () => {
+    // Both clicks would read the registry as free: the new claude has not
+    // written its registry file yet. Only the in-flight claim tells them apart.
+    registry([]);
+    const newTab = vi.fn(async () => "t-new");
+    const { hook, notify } = useShellIntegrationWith(newTab);
+
+    const outcomes = await Promise.all([
+      hook.handleResumeSession(transcript("maxim")),
+      hook.handleResumeSession(transcript("maxim")),
+    ]);
+    expect([...outcomes].sort()).toEqual(["resumed", "skipped-live"]);
+    expect(newTab).toHaveBeenCalledTimes(1);
+    expect(recordOpens()).toBe(1);
+    expect(notify.mock.calls.some(([m]) => /already being resumed/.test(m as string))).toBe(true);
+
+    // Inside the grace after a resume that opened a tab, a third click is
+    // still refused: the registry may not show the new holder yet.
+    await expect(hook.handleResumeSession(transcript("maxim"))).resolves.toBe("skipped-live");
+    expect(newTab).toHaveBeenCalledTimes(1);
+  });
+
+  it("a click acknowledges itself BEFORE its liveness read resolves", async () => {
+    let answer!: (rows: LiveClaudeSession[]) => void;
+    const notify = vi.fn();
+    const hook = useShellIntegration({
+      tabs: [],
+      updateTab: vi.fn(),
+      renameTab: vi.fn(),
+      createTerminal: vi.fn(async () => null) as never,
+      setSessionStates: vi.fn() as never,
+      terminalRefs: { current: new Map() },
+      setRightPanelMode: vi.fn() as never,
+      setSelectedTranscriptSessionId: vi.fn() as never,
+      pageId: "default",
+      notify,
+      // The gate's read waits for the test; the pre-type re-read (the same
+      // injected oracle) answers at once.
+      readLiveSessions: (() => {
+        let calls = 0;
+        return () =>
+          calls++ === 0
+            ? new Promise<LiveClaudeSession[]>((r) => (answer = r))
+            : Promise.resolve([]);
+      })(),
+    });
+    const outcome = hook.handleResumeSession(transcript("maxim"));
+    await flush();
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0]).toEqual([
+      'Resuming "maxim" — checking whether it is already open…',
+      "success",
+    ]);
+    answer([]);
+    await expect(outcome).resolves.toBe("refused");
+  });
+
+  it("the 'Since restart' queue's resume is held under the same claim", async () => {
+    registry([]);
+    const newTab = vi.fn(async () => "t-new");
+    const { hook } = useShellIntegrationWith(newTab);
+    const target = {
+      claudeSessionId: SESSION_ID,
+      displayName: "maxim",
+      workingDir: "/repo",
+      configDir: "/home/u/.claude-work",
+    };
+    const [click, queued] = await Promise.all([
+      hook.handleResumeSession(transcript("maxim")),
+      hook.resumeTarget(target),
+    ]);
+    expect(click).toBe("resumed");
+    expect(queued).toEqual({ kind: "failed", failure: "in-flight", tabId: null });
+    expect(newTab).toHaveBeenCalledTimes(1);
   });
 });

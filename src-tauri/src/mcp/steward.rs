@@ -715,14 +715,18 @@ async fn reap_emptied_panes(
 ///
 /// Keyed on terminal **id** via [`steward_meta_store`], NOT on `title`.
 /// Manual testing (2026-07-19, temp-runner UI Bridge verification) found
-/// that `title` cannot serve as a durable single-instance marker on this
+/// that `title` could not serve as a durable single-instance marker on this
 /// runner: PowerShell (and other shells) emit OSC 0/2 title-change escape
-/// sequences, and xterm.js relays those back to the runner via
-/// `TerminalSession::set_title` — "Phase 2 of bi-directional title sync"
-/// (`terminal/session.rs:1541-1555`) — silently overwriting our title
-/// sentinel moments after the shell starts. The skill name is still set at
-/// creation as the terminal's initial cosmetic label, but only the
-/// metadata-store id membership is authoritative for "running".
+/// sequences, and xterm.js relayed those back into the terminal's title,
+/// silently overwriting our title sentinel moments after the shell started.
+/// Since plan
+/// `2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity`
+/// D3 the relay (`terminal_set_title` → `TerminalManager::set_title`) writes
+/// the OSC string to `TerminalSession::activity_title` instead and leaves the
+/// display title alone — but a title is still a label, not an identity, so
+/// the id stays the key. The skill name is still set at creation as the
+/// terminal's initial cosmetic label, but only the metadata-store id
+/// membership is authoritative for "running".
 ///
 /// Takes a process snapshot ONLY when this kind has a tracked pane to judge,
 /// so the common "not running" answer stays free.
