@@ -8,7 +8,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 
 | class | rows | hits | unreviewed | fallback_correct | dev_only_surface | defect |
 |---|---:|---:|---:|---:|---:|---:|
-| `repo_layout` | 79 | 93 | 73 | 6 | 0 | 0 |
+| `repo_layout` | 79 | 93 | 69 | 10 | 0 | 0 |
 | `dev_ports` | 27 | 27 | 26 | 0 | 1 | 0 |
 | `supervisor_dependency` | 57 | 57 | 0 | 47 | 4 | 6 |
 | `tenant_literal` | 0 | 0 | 0 | 0 | 0 | 0 |
@@ -23,9 +23,10 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | file | symbol | excerpt | n | disposition | capability |
 |---|---|---|---:|---|---|
 | `src/agent_runtime.rs` | `continuation_fallback_workdir` | `.ok_or_else(\|\| "no QONTINUI_ROOT or canonical checkout resolved".to_string());` | 2 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/agent_runtime.rs` | `provision_agent_definitions` | `"agent_runtime: no qontinui-root resolved; skipping .claude/agents \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/agent_runtime.rs` | `provision_agent_definitions` | `"no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/agent_runtime.rs` | `provision_agent_definitions_from_root` | `.join("qontinui-claude-config")` | 1 | unreviewed | `agent_definitions` |
+| `src/agent_runtime.rs` | `provision_agent_definitions` | `"agent_runtime: no qontinui-root resolved; skipping the .claude/agents \` | 1 | fallback_correct — The no-root arm: a published install resolves no workspace root, writes the embedded subagent floor anyway, and records an unresolved checkout-overlay row. The two strings are the log line and the ledger reason naming that, never a path resolved on disk. | — (no CAPABILITY_SPECS row) |
+| `src/agent_runtime.rs` | `provision_agent_definitions` | `"no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \` | 1 | fallback_correct — The no-root arm: a published install resolves no workspace root, writes the embedded subagent floor anyway, and records an unresolved checkout-overlay row. The two strings are the log line and the ledger reason naming that, never a path resolved on disk. | — (no CAPABILITY_SPECS row) |
+| `src/agent_runtime.rs` | `provision_agent_definitions_from_root` | `"agent_runtime: {} IS the qontinui-claude-config agents dir; serving the live \` | 1 | fallback_correct — The checkout overlay is reached only when a workspace root resolved, and is skipped (embedded floor stands in) when that checkout has no agents dir; the log line names the in-place arm, where the cwd already reads the checkout's own definitions. | `agent_definitions` |
+| `src/agent_runtime.rs` | `provision_agent_definitions_from_root` | `.join("qontinui-claude-config")` | 1 | fallback_correct — The checkout overlay is reached only when a workspace root resolved, and is skipped (embedded floor stands in) when that checkout has no agents dir; the log line names the in-place arm, where the cwd already reads the checkout's own definitions. | `agent_definitions` |
 | `src/agent_runtime.rs` | `run_condition_check_terminal` | `let reason = "no QONTINUI_ROOT resolved — nowhere to run the check from";` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/agent_skills/self_path.rs` | `self_path_hit` | `"reaches its own tree through a 'qontinui-claude-config' checkout".to_string(),` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/agent_skills/self_path.rs` | `static CONFIG_REPO_CLAUDE_RE` | `Lazy::new(\|\| Regex::new(r"qontinui-claude-config[/\\]+\.claude\b").expect("arm A regex"));` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
@@ -46,7 +47,6 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/capability_manifest.rs` | `Rung::describe` | `'qontinui-claude-config') — answers only where that repo exists"` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/capability_manifest.rs` | `Rung::from_command_source` | `qontinui-claude-config origin/main), not an account-layer arm",` | 1 | fallback_correct — A caveat string attached to the Canonical rung explaining it is the runner's per-body git mirror rather than an account-layer arm — descriptive text in the capability manifest, never a path resolved on disk. | — (no CAPABILITY_SPECS row) |
 | `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `'<workspace-root>/qontinui-claude-config/.claude/agents/*.md' off \` | 2 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `copy is a no-op that logs \"no qontinui-root resolved; skipping \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/capability_manifest.rs` | `const CAPABILITY_SPECS` | `description: "Import of '<workspace-root>/qontinui-claude-config/.claude/commands/*.md' \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/check_executor/command_builder.rs` | `build_devtools_command` | `Ok(("qontinui-devtools".to_string(), args))` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/ci_node/admission.rs` | `start_build` | `"QONTINUI_ROOT not resolvable on this device".to_string(),` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
