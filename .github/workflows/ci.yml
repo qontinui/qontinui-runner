@@ -186,6 +186,20 @@ jobs:
   # runner, which is free on this PUBLIC repo; so this job runs on the cheapest
   # standard hosted runner. Move it with the dependants' default, never apart.
   #
+  # Known deviation (route review M4): ci_hosted_guard cancels a hosted job
+  # when the tenant's hosted CI is OFF, and this job is hosted. With hosted
+  # off the dependants' hosted static default is cancelled too, so nothing is
+  # lost -- but coord's `self_hosted` answer is then unreachable here. It is
+  # reachable only from a route job on the repo's own self-hosted pool, and
+  # this repo has none: a self-hosted route job would queue with no runner and
+  # hold every required check behind it. Coord's NOT_SERVED says the same.
+  #
+  # The ubuntu leg of `test` also waits on this job (one `needs:` for the
+  # matrix): a few seconds, accepted (review N5).
+  #
+  # ROUTE_HOSTED_PAGEFILE_MB is what each job's own `Configure pagefile` step
+  # sets (32 GB) -- coord forms the hosted class's commit limit from it.
+  #
   # Composes with plan 2026-09-29-ci-lanes-routing-and-merge-train-speed: Lane
   # B (ci_node) is authoritative for no job today, so this answers every event;
   # where Lane B comes to own `test (windows-latest)` on candidate refs, that
@@ -215,6 +229,7 @@ jobs:
         env:
           ROUTE_JOB: test (windows-latest)
           ROUTE_DEFAULT: windows-latest
+          ROUTE_HOSTED_PAGEFILE_MB: "32768"
           ROUTE_OUTPUT_PREFIX: test_windows_
         run: python3 -B .github/scripts/route_ci_job.py || true
 
@@ -225,6 +240,7 @@ jobs:
         env:
           ROUTE_JOB: Clippy (windows)
           ROUTE_DEFAULT: windows-latest
+          ROUTE_HOSTED_PAGEFILE_MB: "32768"
           ROUTE_OUTPUT_PREFIX: clippy_windows_
         run: python3 -B .github/scripts/route_ci_job.py || true
 
@@ -407,11 +423,26 @@ jobs:
       # rustfmt/clippy components must be installed for 1.95.0 specifically —
       # otherwise `cargo fmt`/`cargo clippy` auto-switch to a component-less
       # 1.95.0 and fail with "'cargo-fmt' is not installed".
+      # Hosted only: the action also runs `rustup default`, which on a
+      # self-hosted host would change the machine's own default toolchain.
       - name: Setup Rust
+        if: runner.environment == 'github-hosted'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
           components: rustfmt, clippy
+
+      # A rerouted self-hosted leg (the `route` job): install the pinned
+      # toolchain into the host's rustup WITHOUT touching its default --
+      # rust-toolchain.toml selects 1.95.0 for every cargo call in this repo.
+      # Additive: an already-installed toolchain is a no-op.
+      - name: Setup Rust (self-hosted, default untouched)
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v rustup >/dev/null 2>&1 || { echo "::error::rustup is not on this self-hosted runner's PATH"; exit 1; }
+          rustup toolchain install 1.95.0 --profile minimal -c rustfmt -c clippy
 
       # Cargo.lock must match the PINNED qontinui-schemas tree (plan
       # 2026-08-31-schemas-releases-strand-consumer-cargo-locks §7.4 Phase 3).
@@ -581,7 +612,10 @@ jobs:
       # saves from merge-candidate/* refs are invisible to sibling
       # candidates. The cache that matters is the one saved by `main` runs
       # (every land), which all candidates and PRs can restore.
+      # Hosted only: the action's post step prunes CARGO_HOME, which on a
+      # self-hosted host is the machine's own registry and git cache.
       - name: Cache Rust dependencies
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           # Workspace root is the repo root: ./Cargo.toml -> ./target
@@ -732,9 +766,23 @@ jobs:
       # the PR body when an existing job's surface moves — which includes adding
       # or removing a STEP, and editing a shell comment inside a `run:` block.
       # A deleted job takes `Gate-Removal:` instead. Then re-run the job.
+      #
+      # HOSTED ONLY (route review H1). On a rerouted self-hosted leg the home
+      # is a fleet machine's real one, holding its real machine.json and device
+      # JWT: this step would overwrite them and `Unpoison` would delete them.
+      # `dirs::home_dir()` ignores $HOME/$USERPROFILE on Windows, so the poison
+      # cannot be pointed at $RUNNER_TEMP instead; a self-hosted leg runs the
+      # tests unpoisoned (the ubuntu and hosted windows legs keep the canary)
+      # with its config dirs sandboxed by the step after this one. And even on
+      # a hosted runner a target FILE that already exists is a refusal, never
+      # an overwrite: only files this step created are recorded, and only those
+      # are removed by `Unpoison`.
       - name: Poison ambient state
+        if: runner.environment == 'github-hosted'
         run: |
           set -euo pipefail
+          CREATED="$RUNNER_TEMP/poison-created-files"
+          : > "$CREATED"
 
           # A v4-shaped UUID: `uuidgen` on ubuntu (util-linux), python where bash
           # ships none (Git Bash on windows), and 16 bytes of /dev/urandom laid
@@ -766,11 +814,24 @@ jobs:
 
           for h in "${homes[@]}"; do
             q="$h/.qontinui"
+            case "$q" in
+              "$RUNNER_TEMP"/*) ;;
+              *)
+                for f in machine.json profiles.json coord-device-jwt; do
+                  if [ -e "$q/$f" ]; then
+                    echo "::error::$q/$f already exists: refusing to overwrite a real machine's state (this runner's home is not the clean one this step assumes)"
+                    ls -la "$q"
+                    exit 1
+                  fi
+                done
+                ;;
+            esac
             if [ -e "$q" ]; then
-              echo "::warning::$q already exists before poisoning — this runner's home is not the clean one this step assumes:"
+              echo "::warning::$q already exists (without the three poison targets) before poisoning:"
               ls -la "$q"
             fi
             mkdir -p "$q"
+            printf '%s\n' "$q/machine.json" "$q/profiles.json" "$q/coord-device-jwt" >> "$CREATED"
             # `DeviceFile` (bin/qontinui_profile.rs): device_id + hostname; the
             # tenant pin (`tenant_pin.rs`) reads the sibling `active_tenant_id`.
             cat > "$q/machine.json" <<EOF
@@ -820,6 +881,25 @@ jobs:
           echo "QONTINUI_RUNNER_TIER=local"
           echo "device_id=$DEVICE_ID active_tenant_id=$TENANT_ID"
         shell: bash
+
+      # A rerouted self-hosted leg (route review H1): the runner's tests resolve
+      # the operator's config and secure-storage dirs, and a test binary once
+      # overwrote a real settings.json from defaults (qontinui-runner#1769).
+      # Point both at this job's $RUNNER_TEMP for every later step, as
+      # cargo-guard.sh does for a local test run.
+      - name: Sandbox the runner config dirs (self-hosted)
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SANDBOX="$RUNNER_TEMP/qontinui-config-sandbox"
+          mkdir -p "$SANDBOX/config" "$SANDBOX/secure"
+          {
+            echo "QONTINUI_CONFIG_DIR=$SANDBOX/config"
+            echo "QONTINUI_SECURE_STORAGE_DIR=$SANDBOX/secure"
+            if [ "$RUNNER_OS" != "Windows" ]; then echo "XDG_CONFIG_HOME=$SANDBOX/xdg"; fi
+          } >> "$GITHUB_ENV"
+          echo "config dirs sandboxed under $SANDBOX"
 
       # ── BUILD half of the old single `Run Rust tests` step ─────────────
       #
@@ -963,11 +1043,7 @@ jobs:
           #     on purpose. The legs are throttled for different reasons, and
           #     ci_rust_test_steps_split.rs pins that each stays separately
           #     tunable.
-          #     The windows arm is read per RUNNER as well (route Phase 7): a
-          #     hosted windows leg is the one the ladder above sized, and a
-          #     rerouted self-hosted leg is placed only where it Fits. Both are
-          #     '1' until #2408's revert is earned on a class that fits at 2.
-          CARGO_BUILD_JOBS: ${{ (matrix.platform == 'windows-latest' && runner.environment == 'github-hosted') && '1' || '1' }}
+          CARGO_BUILD_JOBS: ${{ matrix.platform == 'windows-latest' && '1' || '1' }}
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             echo "=== free / df before cargo test ==="
@@ -1271,8 +1347,11 @@ jobs:
       # `matrix.platform == 'windows-latest'` rather than `runner.os` — every
       # other Windows gate in this file spells it that way (see `Configure
       # pagefile`), and one idiom is one grep.
+      # Hosted only: on a self-hosted host the pagefile counters are the
+      # machine's, shared with whatever else it runs, so a peak there is not
+      # attributable to this job (route review L2).
       - name: Windows memory peak after the Rust test steps
-        if: always() && matrix.platform == 'windows-latest'
+        if: always() && matrix.platform == 'windows-latest' && runner.environment == 'github-hosted'
         continue-on-error: true
         shell: bash
         run: |
@@ -1448,22 +1527,26 @@ jobs:
       # one of the four readers treats an EMPTY value as unset
       # (`resolve_coord_base_with_source` trims and skips; `server_mode` matches
       # "1"/"true" only; `parse_tier_value` finds no tier in ""; the workspace
-      # root resolver trims and skips). The three files are removed by name, not
-      # `rm -rf ~/.qontinui`, so a home that was NOT clean (the poison step warns
-      # when it sees one) keeps whatever else it held.
+      # root resolver trims and skips). Only the files the poison step recorded
+      # creating are removed, by name, never `rm -rf ~/.qontinui`, so a home
+      # that was NOT clean keeps whatever else it held.
+      # Hosted only, like the poison, and `always()` so a red test step still
+      # cleans up. It removes only the files `Poison ambient state` recorded
+      # creating -- never a file it found already there.
       - name: Unpoison ambient state
+        if: always() && runner.environment == 'github-hosted'
         run: |
           set -u
-          homes=("$HOME")
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            homes+=("$(cygpath -u "$USERPROFILE")")
+          CREATED="$RUNNER_TEMP/poison-created-files"
+          if [ -f "$CREATED" ]; then
+            while IFS= read -r f; do
+              [ -n "$f" ] && rm -f "$f"
+            done < "$CREATED"
+            while IFS= read -r f; do
+              [ -n "$f" ] && rmdir "$(dirname "$f")" 2>/dev/null || true
+            done < "$CREATED"
+            rm -f "$CREATED"
           fi
-          for h in "${homes[@]}"; do
-            for f in machine.json profiles.json coord-device-jwt; do
-              rm -f "$h/.qontinui/$f"
-            done
-            rmdir "$h/.qontinui" 2>/dev/null || true
-          done
           {
             echo "COORD_HTTP_URL="
             echo "QONTINUI_ROOT="
@@ -1687,11 +1770,26 @@ jobs:
           cache: "pnpm"
           cache-dependency-path: pnpm-lock.yaml
 
+      # Hosted only: the action also runs `rustup default`, which on a
+      # self-hosted host would change the machine's own default toolchain.
       - name: Setup Rust
+        if: runner.environment == 'github-hosted'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
           components: rustfmt, clippy
+
+      # A rerouted self-hosted leg (the `route` job): install the pinned
+      # toolchain into the host's rustup WITHOUT touching its default --
+      # rust-toolchain.toml selects 1.95.0 for every cargo call in this repo.
+      # Additive: an already-installed toolchain is a no-op.
+      - name: Setup Rust (self-hosted, default untouched)
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v rustup >/dev/null 2>&1 || { echo "::error::rustup is not on this self-hosted runner's PATH"; exit 1; }
+          rustup toolchain install 1.95.0 --profile minimal -c rustfmt -c clippy
 
       # Hosted runners ONLY (`runner.environment`, never the route `lane`: the
       # lane is empty when the route job did not run, and this job then runs on
@@ -1707,7 +1805,9 @@ jobs:
           maximum-size: 32GB
           disk-root: "D:"
 
+      # Hosted only, as in the `test` job: the post step prunes CARGO_HOME.
       - name: Cache Rust dependencies
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"

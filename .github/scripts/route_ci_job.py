@@ -2,6 +2,9 @@
 # VENDORED COPY -- the source is qontinui-coord/.github/scripts/route_ci_job.py
 # (tests: qontinui-coord/.github/scripts/test_route_ci_job.py). Edit there and
 # re-copy byte for byte below this header; never edit this copy alone.
+# body-sha256: 1d6af6f30f250409a2697167a75e4d9e7369f5b47feb20fb2947cc8f6ec991e5
+#   (sha256 of everything below this header == `tail -n +2` of the source;
+#   src-tauri/tests/ci_route_gates_hosted_only_steps.rs recomputes it)
 """Ask coord where ONE heavy CI job should run, and hand the answer to `runs-on`.
 
 Plan `2026-10-27-coord-routes-ci-jobs-by-runner-capability`, Phase 7 (D5). The
@@ -34,11 +37,20 @@ THE ANSWER (coord's four lanes, D5):
                minutes in.
   static       anything coord does not know: the static default.
 
+Where hosted is not offered (a private repo, or the tenant's hosted CI off),
+coord answers static/fail_fast with `runs_on: null` -- it never names a hosted
+label there -- and this script then uses ROUTE_DEFAULT. A private repo's
+workflow must therefore set ROUTE_DEFAULT to its own self-hosted pool.
+
 THIS SCRIPT'S OWN LOGIC (what it does without coord, and what it refuses from
 coord). Any HTTP error, timeout, unparseable body, unknown lane or malformed
 label set -> `static` with the default. It also refuses a `self_hosted` answer
-for a pull_request whose head is a fork, read from this run's own event payload:
-coord never sends one, and this is the second lock on that door. Gate a
+unless the event is a trusted one (push, workflow_dispatch, schedule,
+merge_group) or a pull_request whose head this run's own event payload shows is
+NOT a fork (an unreadable fork-ness is refused, and pull_request_target /
+issue_comment / workflow_run always are): coord never sends one there, and this
+is the second lock on that door. A missing or malformed ROUTE_DEFAULT emits an
+EMPTY runs_on, so the dependant's own `|| '"<label>"'` default applies. Gate a
 hosted-only step on `runner.environment == 'github-hosted'`, never on `lane`:
 `lane` is empty when this job did not run, and a step gated on `lane == 'hosted'`
 would then skip on the hosted runner the static default chose.
@@ -47,6 +59,10 @@ INPUTS (env):
   ROUTE_JOB            REQUIRED: the check-run name exactly as GitHub shows it
                        (a matrix leg is `test (windows-latest)`).
   ROUTE_DEFAULT        the job's static runs-on: a label, or a JSON label array.
+                       Pass the dependant's own default explicitly.
+  ROUTE_HOSTED_PAGEFILE_MB  the pagefile (MiB) the job's own pagefile step
+                       configures on a hosted runner; coord forms the hosted
+                       commit limit from it (RAM + pagefile).
   ROUTE_OUTPUT_PREFIX  prefix for every output name (several jobs, one route job).
   ROUTE_COORD_URL      default https://coord.qontinui.io
   ROUTE_DISABLED       `1` answers static without asking.
@@ -54,9 +70,9 @@ INPUTS (env):
                        GITHUB_EVENT_NAME, and the fork-ness read from
                        GITHUB_EVENT_PATH.
 
-OUTPUTS (to $GITHUB_OUTPUT, each under ROUTE_OUTPUT_PREFIX): runs_on (always
-valid JSON: a quoted label or a label array), lane, reason (one line), source
-(coord | fallback). A summary goes to $GITHUB_STEP_SUMMARY.
+OUTPUTS (to $GITHUB_OUTPUT, each under ROUTE_OUTPUT_PREFIX): runs_on (valid
+JSON -- a quoted label or a label array -- or EMPTY when there is no usable
+default), lane, reason (one line), source (coord | fallback). A summary goes to $GITHUB_STEP_SUMMARY.
 
 VENDORED COPIES carry a header naming this file as their source; edit here and
 re-copy. Stdlib only. Tests: .github/scripts/test_route_ci_job.py (hermetic).
@@ -83,6 +99,11 @@ REQUEST_TIMEOUT_SECS = 10
 TOTAL_DEADLINE_SECS = 25
 MAX_BODY_BYTES = 256 * 1024
 MAX_LABELS = 20
+MAX_HOSTED_PAGEFILE_MB = 262144
+# Events whose code is the repo's own: the only ones besides a non-fork
+# pull_request this script lets run self-hosted (decision_record
+# self-hosted-runners-on-public-repos).
+TRUSTED_EVENTS = ("push", "workflow_dispatch", "schedule", "merge_group")
 
 
 class RouteError(Exception):
@@ -91,7 +112,7 @@ class RouteError(Exception):
 
 @dataclass
 class Decision:
-    runs_on: object  # str label or list of labels
+    runs_on: object  # str label, list of labels, or None (emit empty: the dependant's default)
     lane: str
     reason: str
     source: str
@@ -149,12 +170,45 @@ def fork_from_event(event_name: str, event_path: str | None) -> bool | None:
         return None
 
 
-def query_url(base: str, repo: str, job: str, event: str, fork: bool | None, default: object | None) -> str:
+def parse_pagefile(raw: str | None) -> int | None:
+    """ROUTE_HOSTED_PAGEFILE_MB: an integer MiB in range, else None."""
+    try:
+        v = int((raw or "").strip())
+    except ValueError:
+        return None
+    return v if 0 <= v <= MAX_HOSTED_PAGEFILE_MB else None
+
+
+def self_hosted_allowed(event: str, fork: bool | None) -> str | None:
+    """None when this event may take a self-hosted label; else why not. PURE."""
+    e = (event or "").strip().lower()
+    if e in TRUSTED_EVENTS:
+        return None
+    if e == "pull_request":
+        if fork is False:
+            return None
+        if fork is True:
+            return "this pull_request's head is a fork"
+        return "this pull_request's fork-ness could not be read"
+    return f"event {one_line(e)[:40]!r} never takes a self-hosted label here"
+
+
+def query_url(
+    base: str,
+    repo: str,
+    job: str,
+    event: str,
+    fork: bool | None,
+    default: object | None,
+    hosted_pagefile_mb: int | None = None,
+) -> str:
     params = {"repo": repo, "job": job, "event": event}
     if fork is not None:
         params["fork"] = "true" if fork else "false"
     if isinstance(default, str):
         params["default"] = default
+    if hosted_pagefile_mb is not None:
+        params["hosted_pagefile_mb"] = str(hosted_pagefile_mb)
     return f"{base.rstrip('/')}/coord/ci/route?{urllib.parse.urlencode(params)}"
 
 
@@ -186,11 +240,23 @@ def ask(url: str, deadline: float) -> dict:
     raise RouteError(f"coord unreachable ({last})")
 
 
-def decide(answer: dict | None, error: str | None, default: object | None, fork: bool | None) -> Decision:
-    """coord's answer, checked; the static default on anything else. PURE."""
-    fallback_runs_on = default if default is not None else "ubuntu-latest"
+def decide(
+    answer: dict | None,
+    error: str | None,
+    default: object | None,
+    fork: bool | None,
+    event: str,
+) -> Decision:
+    """coord's answer, checked; the static default on anything else. PURE.
+
+    With no usable default the runs_on is None (an EMPTY output), so the
+    dependant's own `||` default applies -- never a label this script made up.
+    """
+    fallback_runs_on = default
 
     def static(why: str) -> Decision:
+        if default is None:
+            why = f"{why} (ROUTE_DEFAULT missing or malformed: the job's own default applies)"
         return Decision(fallback_runs_on, "static", one_line(why), "fallback")
 
     if error is not None or answer is None:
@@ -206,8 +272,9 @@ def decide(answer: dict | None, error: str | None, default: object | None, fork:
     if runs_on is None:
         return static(f"UNKNOWN: coord's runs_on {one_line(json.dumps(raw))[:200]} is not a label set; the static default")
     if lane == "self_hosted":
-        if fork is True:
-            return static("refused coord's self_hosted answer: this pull_request's head is a fork")
+        refused = self_hosted_allowed(event, fork)
+        if refused is not None:
+            return static(f"refused coord's self_hosted answer: {refused}")
         labels = [runs_on] if isinstance(runs_on, str) else runs_on
         if "self-hosted" not in [label.lower() for label in labels]:
             return static("refused coord's self_hosted answer: its label set does not name self-hosted")
@@ -217,8 +284,13 @@ def decide(answer: dict | None, error: str | None, default: object | None, fork:
     return Decision(runs_on, lane, reason, "coord")
 
 
+def cell(text: object) -> str:
+    """A markdown table cell: a `|` would split the row."""
+    return str(text).replace("|", "\\|")
+
+
 def emit(d: Decision, prefix: str, job: str) -> None:
-    runs_on_json = json.dumps(d.runs_on, separators=(",", ":"))
+    runs_on_json = "" if d.runs_on is None else json.dumps(d.runs_on, separators=(",", ":"))
     out = os.environ.get("GITHUB_OUTPUT")
     if out:
         with open(out, "a", encoding="utf-8") as fh:
@@ -232,13 +304,13 @@ def emit(d: Decision, prefix: str, job: str) -> None:
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         lines = [
-            f"### `{job}` routing",
+            f"### `{cell(job)}` routing",
             "",
             "| | |",
             "|---|---|",
             f"| lane | **{d.lane}** ({d.source}) |",
-            f"| runs-on | `{runs_on_json}` |",
-            f"| reason | {d.reason} |",
+            f"| runs-on | `{cell(runs_on_json or '(the job default)')}` |",
+            f"| reason | {cell(d.reason)} |",
             "",
         ]
         with open(summary, "a", encoding="utf-8") as fh:
@@ -272,7 +344,13 @@ def main() -> int:
             error = "ROUTE_REPO / GITHUB_REPOSITORY unset"
         else:
             url = query_url(
-                os.environ.get("ROUTE_COORD_URL") or DEFAULT_COORD_URL, repo, job, event, fork, default
+                os.environ.get("ROUTE_COORD_URL") or DEFAULT_COORD_URL,
+                repo,
+                job,
+                event,
+                fork,
+                default,
+                parse_pagefile(os.environ.get("ROUTE_HOSTED_PAGEFILE_MB")),
             )
             try:
                 answer = ask(url, time.monotonic() + TOTAL_DEADLINE_SECS)
@@ -280,7 +358,7 @@ def main() -> int:
                 error = str(exc)
             except Exception as exc:  # noqa: BLE001 -- any fault is UNKNOWN, and UNKNOWN is static
                 error = f"{type(exc).__name__}: {exc}"
-    emit(decide(answer, error, default, fork), prefix, job or "<unnamed job>")
+    emit(decide(answer, error, default, fork, event), prefix, job or "<unnamed job>")
     return 0
 
 

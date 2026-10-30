@@ -13,7 +13,13 @@
 //!    dependants run on `!cancelled()` and fall back to the static
 //!    `windows-latest` for an empty output.
 //! 3. The route job cannot fail: every route step is `continue-on-error` and
-//!    `|| true`, and the script it runs is the vendored copy naming its source.
+//!    `|| true`, and the script it runs is the vendored copy naming its source,
+//!    its body byte-identical to the hash its header records.
+//! 4. Every step a rerouted self-hosted leg can run is either gated to hosted
+//!    runners or listed in [`SELF_HOSTED_SAFE`] with the reason it writes
+//!    nothing outside the workspace, the runner's own work/tool dirs and
+//!    `$RUNNER_TEMP`, and touches no system setting. A new step fails this
+//!    test until someone decides which it is (route review H1/L2).
 
 use std::path::PathBuf;
 
@@ -49,7 +55,85 @@ fn str_of<'a>(v: &'a serde_yaml::Value, key: &str) -> &'a str {
 }
 
 const HOSTED_ONLY: &str = "runner.environment == 'github-hosted'";
+const SELF_HOSTED_ONLY: &str = "runner.environment == 'self-hosted'";
 const ROUTED: [&str; 2] = ["test", "clippy-windows"];
+
+/// Steps that MUST be gated to hosted runners: each writes the machine
+/// outside the workspace (paging setup, the home's `.qontinui`, the default
+/// toolchain, the cargo registry), boots a second runner on the host, or
+/// reads machine-wide counters it would misattribute to the job.
+const MUST_BE_HOSTED: &[(&str, &str)] = &[
+    ("test", "Setup Rust"),
+    ("test", "Configure pagefile (Windows — guard against link-time OOM)"),
+    ("test", "Cache Rust dependencies"),
+    ("test", "Poison ambient state"),
+    ("test", "Windows memory peak after the Rust test steps"),
+    ("test", "Unpoison ambient state"),
+    ("test", "SDK↔runner contract smoke (direct-exe)"),
+    ("clippy-windows", "Setup Rust"),
+    ("clippy-windows", "Configure pagefile (Windows — guard against link-time OOM)"),
+    ("clippy-windows", "Cache Rust dependencies"),
+];
+
+/// Steps a rerouted self-hosted leg runs ungated, each with why that is safe
+/// on a fleet machine. `(job, step name or uses, reason)`.
+const SELF_HOSTED_SAFE: &[(&str, &str, &str)] = &[
+    ("test", "CI capacity (route said fail_fast)", "prints the reason and exits"),
+    ("test", "actions/checkout@v5", "the workspace only"),
+    ("test", "Check out sibling qontinui-schemas", "the workspace's parent: the runner's own _work dir"),
+    ("test", "Check out sibling qontinui-web", "the workspace's parent: the runner's own _work dir"),
+    ("test", "Check out sibling ui-bridge", "the workspace's parent: the runner's own _work dir"),
+    ("test", "Setup pnpm", "installs pinned pnpm into its own dir, PATH for this job only"),
+    ("test", "Setup Node.js", "the runner's own tool cache, PATH for this job only"),
+    ("test", "Run CI-tooling unit tests (ci-flake-analyze, ci-test-results-ingest, ci-expiry-phase-summary)", "node tests over workspace files"),
+    ("test", "Setup Rust (self-hosted, default untouched)", "adds the pinned toolchain; never runs `rustup default`"),
+    ("test", "Cargo.lock is in sync with the pinned qontinui-schemas", "resolve-only; adds to the cargo registry cache"),
+    ("test", "Purge cached bundled-PostgreSQL units that do not match the pin", "the workspace target dir"),
+    ("test", "Install frontend dependencies", "workspace node_modules; adds to the content-addressed pnpm store"),
+    ("test", "Lint frontend code", "reads the workspace"),
+    ("test", "Verify component-action effect fixture", "reads the workspace"),
+    ("test", "Contract-smoke effect-probe verdict (PS 5.1)", "a pure script over a fixture"),
+    ("test", "Typecheck frontend code", "reads the workspace"),
+    ("test", "Run frontend unit tests", "workspace tests"),
+    ("test", "Build frontend", "the workspace dist dir"),
+    ("test", "Format Rust code check", "reads the workspace"),
+    ("test", "Sandbox the runner config dirs (self-hosted)", "$RUNNER_TEMP and this job's env"),
+    ("test", "Build Rust tests", "the workspace target dir"),
+    ("test", "Run Rust tests", "config dirs sandboxed under $RUNNER_TEMP by the step before the build"),
+    ("test", "Explain which Rust test phase the bound expired in", "reads this job's logs"),
+    ("test", "Report test results to coord (best-effort)", "posts a summary; writes nothing"),
+    ("test", "Build Tauri app (development)", "the workspace target dir, --no-bundle"),
+    ("test", "Contract-smoke summary invariants (PS 5.1)", "a pure script over a fixture"),
+    ("clippy-windows", "CI capacity (route said fail_fast)", "prints the reason and exits"),
+    ("clippy-windows", "actions/checkout@v5", "the workspace only"),
+    ("clippy-windows", "Check out sibling qontinui-schemas", "the workspace's parent: the runner's own _work dir"),
+    ("clippy-windows", "Check out sibling qontinui-web", "the workspace's parent: the runner's own _work dir"),
+    ("clippy-windows", "Check out sibling ui-bridge", "the workspace's parent: the runner's own _work dir"),
+    ("clippy-windows", "Setup pnpm", "installs pinned pnpm into its own dir, PATH for this job only"),
+    ("clippy-windows", "Setup Node.js", "the runner's own tool cache, PATH for this job only"),
+    ("clippy-windows", "Setup Rust (self-hosted, default untouched)", "adds the pinned toolchain; never runs `rustup default`"),
+    ("clippy-windows", "Install frontend dependencies", "workspace node_modules; adds to the content-addressed pnpm store"),
+    ("clippy-windows", "Build frontend", "the workspace dist dir"),
+    ("clippy-windows", "Clippy check", "the workspace target dir"),
+];
+
+fn step_key(step: &serde_yaml::Value) -> String {
+    let name = str_of(step, "name");
+    if name.is_empty() {
+        str_of(step, "uses").to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// The steps of `job` that a windows (routable) leg runs: in `test`, every
+/// step not gated to the ubuntu leg.
+fn windows_leg_steps(doc: &serde_yaml::Value, job_name: &str) -> Vec<serde_yaml::Value> {
+    steps(job(doc, job_name))
+        .into_iter()
+        .filter(|s| !str_of(s, "if").contains("matrix.platform == 'ubuntu-22.04'"))
+        .collect()
+}
 
 #[test]
 fn every_pagefile_step_runs_only_on_a_hosted_runner() {
@@ -114,8 +198,9 @@ fn a_routed_job_cannot_be_skipped_by_its_route_job() {
                 .as_sequence()
                 .is_some_and(|s| s.iter().any(|n| n.as_str() == Some("route")));
         assert!(needs_route, "job `{name}` must `needs: route`");
-        assert!(
-            str_of(j, "if").contains("!cancelled()"),
+        assert_eq!(
+            str_of(j, "if"),
+            "${{ !cancelled() }}",
             "job `{name}` must run on `!cancelled()`: a failed `needs:` job otherwise SKIPS \
              it, and a skipped required check reads as a pass"
         );
@@ -189,4 +274,102 @@ fn the_route_job_cannot_fail() {
         "the vendored route script must name its source"
     );
     assert!(text.contains("THIS JOB MUST NOT FAIL"));
+
+    // The body below the header is byte-identical to the coord source whose
+    // `tail -n +2` hash the header records (route review L7).
+    let recorded = text
+        .lines()
+        .find_map(|l| l.strip_prefix("# body-sha256: "))
+        .expect("the vendored header records `# body-sha256: <hex>`")
+        .trim()
+        .to_string();
+    let marker = "src-tauri/tests/ci_route_gates_hosted_only_steps.rs recomputes it)\n";
+    let at = text
+        .find(marker)
+        .expect("the header's last line names this test")
+        + marker.len();
+    use sha2::{Digest, Sha256};
+    let actual: String = Sha256::digest(text[at..].as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        actual, recorded,
+        "the vendored route script's body was edited here: edit qontinui-coord's copy and \
+         re-vendor it (header hash = `tail -n +2 route_ci_job.py | sha256sum`)"
+    );
+}
+
+#[test]
+fn every_step_a_self_hosted_leg_runs_is_gated_or_allowlisted() {
+    let doc = ci_workflow();
+    let mut used: Vec<(&str, String)> = Vec::new();
+    for name in ROUTED {
+        for step in windows_leg_steps(&doc, name) {
+            let key = step_key(&step);
+            let cond = str_of(&step, "if");
+            if cond.contains(HOSTED_ONLY) {
+                continue;
+            }
+            assert!(
+                SELF_HOSTED_SAFE.iter().any(|(j, k, _)| *j == name && *k == key),
+                "job `{name}` step `{key}` runs on a rerouted self-hosted leg (`if: {cond}`) \
+                 but is neither gated on `{HOSTED_ONLY}` nor listed in SELF_HOSTED_SAFE with \
+                 why it leaves the machine alone"
+            );
+            used.push((name, key));
+        }
+    }
+    for (j, k, reason) in SELF_HOSTED_SAFE {
+        assert!(!reason.is_empty());
+        assert!(
+            used.iter().any(|(uj, uk)| uj == j && uk == k),
+            "SELF_HOSTED_SAFE lists `{j}` / `{k}`, which is no longer an ungated windows-leg \
+             step: drop the stale entry"
+        );
+    }
+    for (j, k) in MUST_BE_HOSTED {
+        let step = windows_leg_steps(&doc, j)
+            .into_iter()
+            .find(|s| step_key(s) == *k)
+            .unwrap_or_else(|| panic!("job `{j}` has no step `{k}`"));
+        let cond = str_of(&step, "if");
+        assert!(
+            cond.contains(HOSTED_ONLY),
+            "job `{j}` step `{k}` writes the machine and must be gated on `{HOSTED_ONLY}`, \
+             got `if: {cond}`"
+        );
+    }
+}
+
+#[test]
+fn the_unpoison_step_always_runs_and_removes_only_what_the_poison_created() {
+    let doc = ci_workflow();
+    let s = steps(job(&doc, "test"));
+    let poison = s.iter().find(|x| step_key(x) == "Poison ambient state").unwrap();
+    let unpoison = s.iter().find(|x| step_key(x) == "Unpoison ambient state").unwrap();
+    assert!(str_of(unpoison, "if").contains("always()"));
+    let p = str_of(poison, "run");
+    assert!(p.contains("poison-created-files") && p.contains("refusing to overwrite"));
+    let u = str_of(unpoison, "run");
+    assert!(u.contains("poison-created-files"));
+    assert!(!u.contains("rm -rf"), "unpoison removes recorded files by name only");
+}
+
+#[test]
+fn a_self_hosted_leg_sandboxes_the_config_dirs_before_the_rust_build() {
+    let doc = ci_workflow();
+    let s = steps(job(&doc, "test"));
+    let pos = |k: &str| {
+        s.iter()
+            .position(|x| step_key(x) == k)
+            .unwrap_or_else(|| panic!("no step `{k}`"))
+    };
+    let sandbox = &s[pos("Sandbox the runner config dirs (self-hosted)")];
+    assert!(str_of(sandbox, "if").contains(SELF_HOSTED_ONLY));
+    let run = str_of(sandbox, "run");
+    for var in ["QONTINUI_CONFIG_DIR", "QONTINUI_SECURE_STORAGE_DIR", "RUNNER_TEMP", "GITHUB_ENV"] {
+        assert!(run.contains(var), "{var}");
+    }
+    assert!(pos("Sandbox the runner config dirs (self-hosted)") < pos("Build Rust tests"));
 }
