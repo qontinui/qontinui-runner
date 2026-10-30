@@ -9,19 +9,38 @@
  * truncating, changes the counts and fails here — so the collapse width in
  * `headerReserve.ts` cannot silently fall behind the header.
  *
- * `TenantBadge` (multi-tenant devices) and `RemoteTabControls` (remote tabs)
- * are stubbed to nothing: `headerControlsMinPx` does not budget them.
+ * A remote tab's row adds `RemoteTabControls`' items, budgeted by
+ * `HEADER_REMOTE_FLOORS_PX`. `TenantBadge` (multi-tenant devices) is stubbed to
+ * nothing: `headerControlsMinPx` does not budget it.
  */
 
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(() => new Promise(() => {})) }));
+vi.mock("@tauri-apps/api/core", () => ({
+  // The remote "earlier output" action fails, which leaves its inline note up;
+  // every other read stays pending.
+  invoke: vi.fn((cmd: string) =>
+    cmd === "terminal_remote_history_load"
+      ? Promise.resolve({ success: false, message: "no earlier output" })
+      : new Promise(() => {}),
+  ),
+}));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 vi.mock("@qontinui/ui-bridge", () => ({ useUIElement: () => ({ ref: { current: null } }) }));
 vi.mock("../TenantBadge", () => ({ TenantBadge: () => null }));
-vi.mock("../RemoteTabControls", () => ({ RemoteTabControls: () => null }));
+vi.mock("../contexts/TerminalSessionContext", () => ({ useTerminalSession: () => ({}) }));
+vi.mock("../useRemoteAttachWaiting", () => ({ useRemoteAttachWaiting: () => ({}) }));
+vi.mock("../useRemoteInteractivity", () => ({ useRemoteInteractivity: () => [{}, 0] }));
+vi.mock("../remoteTabs", async (orig) => ({
+  ...(await orig<typeof import("../remoteTabs")>()),
+  remoteInteractivityFooter: () => ({
+    summary: "last output received 2s ago · keystrokes sent, none acknowledged yet",
+    note: "input not acknowledged",
+    noteKind: "warning",
+  }),
+}));
 vi.mock("../useTerminalWindowActions", () => ({
   useTerminalWindowActions: () => ({ popOutTab: () => Promise.resolve() }),
 }));
@@ -38,6 +57,7 @@ import { ZoneLabel } from "./ZoneLabel";
 import { SessionReviewToggle } from "../SessionReviewPanel";
 import {
   HEADER_FIXED_ITEMS_PX,
+  HEADER_REMOTE_FLOORS_PX,
   HEADER_TRUNCATING_FLOORS_PX,
   headerControlsMinPx,
 } from "../ZoneHoverActions";
@@ -53,12 +73,22 @@ const tab = {
   claudeSessionId: "abcdef12-0000-0000-0000-000000000000",
 } as unknown as TerminalTab;
 const other = { ...tab, id: "t2", claudeSessionId: undefined } as unknown as TerminalTab;
+const remoteTab = {
+  ...tab,
+  isAlive: true,
+  remote: {
+    deviceId: "dev-1234-5678",
+    deviceLabel: "far box",
+    sessionId: "s1",
+    historyAvailable: true,
+  },
+} as unknown as TerminalTab;
 
-function renderRow(zoneLabel?: string): HTMLElement {
+function renderRow(zoneLabel?: string, shown: TerminalTab = tab): HTMLElement {
   act(() => {
     root.render(
       createElement(ZoneLabel, {
-        tab,
+        tab: shown,
         state: "working",
         zoneIndex: 0,
         allTabs: [tab, other],
@@ -96,7 +126,7 @@ function renderRow(zoneLabel?: string): HTMLElement {
 const classes = (el: Element) => (el.getAttribute("class") ?? "").split(/\s+/);
 const holdsWidth = (el: Element) => classes(el).includes("shrink-0");
 const truncates = (el: Element) =>
-  classes(el).some((c) => c === "truncate" || c === "min-w-0" || /^min-w-\d/.test(c));
+  classes(el).some((c) => c === "truncate" || /^min-w-(\d|\[)/.test(c));
 
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -123,7 +153,42 @@ describe("zone header row against headerControlsMinPx", () => {
     expect(children).toHaveLength(
       Object.keys(HEADER_FIXED_ITEMS_PX).length + Object.keys(HEADER_TRUNCATING_FLOORS_PX).length,
     );
-    expect(headerControlsMinPx()).toBe(250);
+    expect(headerControlsMinPx()).toBe(256);
+  });
+
+  it("a remote tab's row adds only truncating items, each budgeted", async () => {
+    let row = renderRow(undefined, remoteTab);
+    // Fail the "earlier output" action so its inline note shows too.
+    const earlier = row.querySelector<HTMLButtonElement>(
+      '[data-ui-bridge-id="terminal.remote-history.t1"]',
+    )!;
+    await act(async () => {
+      earlier.click();
+      await Promise.resolve();
+    });
+    row = container.querySelector<HTMLElement>('[data-zone-index="0"]')!;
+    const children = Array.from(row.children);
+    expect(children.filter(holdsWidth)).toHaveLength(Object.keys(HEADER_FIXED_ITEMS_PX).length);
+    const rest = children.filter((el) => !holdsWidth(el));
+    for (const el of rest) expect(truncates(el), el.outerHTML.slice(0, 120)).toBe(true);
+    expect(rest).toHaveLength(
+      Object.keys(HEADER_TRUNCATING_FLOORS_PX).length + Object.keys(HEADER_REMOTE_FLOORS_PX).length,
+    );
+    // The device badge and the action keep their full text in their title.
+    const badge = row.querySelector('[data-ui-bridge-id="terminal.remote-badge.t1"]')!;
+    expect(badge.getAttribute("title")).toContain("dev-1234-5678");
+    expect(classes(earlier)).toContain("min-w-[18px]");
+    expect(earlier.getAttribute("title")).toBeTruthy();
+    expect(row.querySelector('[data-ui-bridge-id="terminal.remote-note.t1"]')?.textContent).toBe(
+      "no earlier output",
+    );
+    expect(headerControlsMinPx(true)).toBe(312);
+  });
+
+  it("the session-info count is capped so its budget holds", () => {
+    const row = renderRow();
+    const count = row.querySelector("[data-session-info-summary] span")!;
+    expect(classes(count)).toEqual(expect.arrayContaining(["max-w-[2ch]", "truncate"]));
   });
 
   it("the row keeps the gap and padding the table and reserve assume", () => {

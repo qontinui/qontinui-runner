@@ -95,8 +95,8 @@ export function hoverActionsSpanPx(buttons: number): number {
  * width in CSS px, from its classes:
  * - `stateDot`: `w-1.5`.
  * - `sessionInfo`: the `SessionInfoDropdown` trigger — `p-0.5` (4) + `w-2.5`
- *   icon (10) + `gap-0.5` (2) + a one-character `text-[9px]` mono count (~6) +
- *   `gap-0.5` (2) + `w-2` chevron (8).
+ *   icon (10) + `gap-0.5` (2) + the `text-[9px]` mono count, capped at
+ *   `max-w-[2ch]` (~11, budgeted 12) + `gap-0.5` (2) + `w-2` chevron (8).
  * - `labelSlot`: the "+" add-label chip (~6, `shrink-0`); the label chip that
  *   replaces it truncates down to its `px-1` (8), and the edit input to its
  *   `min-w-6` (24) — the slot is budgeted at the widest floor.
@@ -104,7 +104,7 @@ export function hoverActionsSpanPx(buttons: number): number {
  */
 export const HEADER_FIXED_ITEMS_PX = {
   stateDot: 6,
-  sessionInfo: 32,
+  sessionInfo: 38,
   labelSlot: 24,
   switchSession: 14,
   pin: 14,
@@ -128,6 +128,21 @@ export const HEADER_TRUNCATING_FLOORS_PX = {
   cwd: 0,
 } as const;
 
+/**
+ * What a REMOTE tab adds to the row (`RemoteTabControls`), every item
+ * truncating: the device badge (`px-1`, 8); the "earlier output" / "reattach"
+ * action — one at a time, live vs ended — which keeps its icon (`min-w-[18px]`);
+ * and the three status lines (interactivity summary, input note, action note),
+ * which truncate to nothing. Each still takes a row gap.
+ */
+export const HEADER_REMOTE_FLOORS_PX = {
+  remoteBadge: 8,
+  remoteAction: 18,
+  remoteStatus: 0,
+  remoteInputNote: 0,
+  remoteNote: 0,
+} as const;
+
 /** `ZoneLabel`'s row gap, `gap-1.5`. */
 export const HEADER_ROW_GAP_PX = 6;
 
@@ -138,13 +153,16 @@ export const HEADER_ROW_GAP_PX = 6;
  * hover reserve; `headerReserve.ts` adds those to get the width below which the
  * hover cluster collapses.
  *
- * Not budgeted: `TenantBadge` (multi-tenant devices only) and
- * `RemoteTabControls` (remote tabs only), whose widths follow unbounded text.
+ * `remote` adds a remote tab's `RemoteTabControls` items.
+ *
+ * Not budgeted: `TenantBadge` (multi-tenant devices only), whose width follows
+ * unbounded text.
  */
-export function headerControlsMinPx(): number {
+export function headerControlsMinPx(remote = false): number {
   const widths: number[] = [
     ...Object.values(HEADER_FIXED_ITEMS_PX),
     ...Object.values(HEADER_TRUNCATING_FLOORS_PX),
+    ...(remote ? Object.values(HEADER_REMOTE_FLOORS_PX) : []),
   ];
   const total = widths.reduce((sum, w) => sum + w, 0);
   return total + Math.max(0, widths.length - 1) * HEADER_ROW_GAP_PX;
@@ -723,7 +741,6 @@ export function ZoneHoverActions({
                 role="menuitem"
                 onClick={toggleMenuExpand("export", !!onExportZone)}
                 aria-disabled={!onExportZone}
-                aria-haspopup="true"
                 aria-expanded={menuExpand === "export"}
                 className={OVERFLOW_ITEM_CLASS}
                 title={onExportZone ? undefined : "Export not available"}
@@ -751,7 +768,6 @@ export function ZoneHoverActions({
                 role="menuitem"
                 onClick={toggleMenuExpand("window", hasTab)}
                 aria-disabled={!hasTab}
-                aria-haspopup="true"
                 aria-expanded={menuExpand === "window"}
                 className={OVERFLOW_ITEM_CLASS}
                 title="Or drag the zone's header out of the window"
