@@ -34,6 +34,21 @@ use super::node::{component_action_fingerprint, unknown_node, AffordanceIndex};
 /// action led.
 pub(crate) const PENDING_TTL: Duration = Duration::from_secs(120);
 
+/// A cursor no action or snapshot has touched for this long is dropped by the
+/// retention tick's sweep. Its next action then opens from the unknown node,
+/// which is what an hour-old position is worth.
+pub(crate) const CURSOR_IDLE_TTL: Duration = Duration::from_secs(3600);
+
+// A cursor reaching its idle TTL has had its pending edge closed by the same
+// sweep, so dropping it never loses an edge.
+const _: () = assert!(PENDING_TTL.as_secs() < CURSOR_IDLE_TTL.as_secs());
+
+/// Most cursors kept. Scopes are caller-supplied (a relay's `tabId`), so past
+/// this the least recently touched cursor is evicted
+/// ([`Cursors::evict_over_cap`]) and its pending edge closes unobserved. As
+/// `observe::MAX_TRACKED_CURSORS`, which bounds the same callers' generations.
+pub(crate) const MAX_CURSORS: usize = 512;
+
 /// One pending-edge slot per app, runner instance and scope.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CursorKey {
@@ -48,7 +63,8 @@ pub(crate) struct CursorKey {
     /// `tabId`), so neither can displace the explorer's pending edge, nor the
     /// explorer theirs. A flag rather than a scope string: no relay tab id can
     /// collide with it. One per app — [`super::explorer`] runs one exploration
-    /// per app at a time — so the cursor map stays bounded by the apps.
+    /// per app at a time. Never evicted: a run reads its snapshot count back, so
+    /// losing it mid-run would read as a dropped snapshot.
     pub explorer: bool,
 }
 
@@ -436,6 +452,8 @@ struct Cursor {
     /// compares it across its own snapshot: no increase means that snapshot
     /// never reached the worker (a dropped event), so the node is unknown.
     snapshots: u64,
+    /// The last action or snapshot on this cursor (what eviction ranks by).
+    touched: Option<Instant>,
 }
 
 /// Per-cursor journey state: the last node resolved, its affordances, and at
@@ -477,6 +495,7 @@ impl Cursors {
         now: Instant,
     ) -> Option<EdgeDraft> {
         let cursor = self.map.entry(key.clone()).or_default();
+        cursor.touched = Some(now);
         let displaced = cursor.pending.take().map(|p| p.close(key, None));
         cursor.pending = Some(PendingEdge {
             from_node: cursor
@@ -506,6 +525,7 @@ impl Cursors {
         now: Instant,
     ) -> Option<EdgeDraft> {
         let cursor = self.map.entry(key.clone()).or_default();
+        cursor.touched = Some(now);
         let closed = cursor.pending.take().map(|p| {
             if p.is_stale(now) {
                 p.close(key, None)
@@ -531,7 +551,8 @@ impl Cursors {
         cursor.pending.take().map(|p| p.close(key, None))
     }
 
-    /// Close every pending edge older than [`PENDING_TTL`] as unobserved.
+    /// Close every pending edge older than [`PENDING_TTL`] as unobserved, and
+    /// drop every cursor idle past [`CURSOR_IDLE_TTL`] (never the explorer's).
     pub(crate) fn sweep(&mut self, now: Instant) -> Vec<EdgeDraft> {
         let mut drafts = Vec::new();
         for (key, cursor) in &mut self.map {
@@ -539,6 +560,34 @@ impl Cursors {
                 if let Some(p) = cursor.pending.take() {
                     drafts.push(p.close(key, None));
                 }
+            }
+        }
+        self.map.retain(|key, cursor| {
+            key.explorer
+                || cursor
+                    .touched
+                    .is_some_and(|t| now.saturating_duration_since(t) < CURSOR_IDLE_TTL)
+        });
+        drafts
+    }
+
+    /// Evict the least recently touched cursors (never the explorer's) until
+    /// at most [`MAX_CURSORS`] remain; a pending edge on one closes as
+    /// unobserved, as the TTL sweep closes it.
+    pub(crate) fn evict_over_cap(&mut self) -> Vec<EdgeDraft> {
+        let mut drafts = Vec::new();
+        while self.map.len() > MAX_CURSORS {
+            let Some(oldest) = self
+                .map
+                .iter()
+                .filter(|(key, _)| !key.explorer)
+                .min_by_key(|(_, cursor)| cursor.touched)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(p) = self.map.remove(&oldest).and_then(|c| c.pending) {
+                drafts.push(p.close(&oldest, None));
             }
         }
         drafts
@@ -624,6 +673,107 @@ mod tests {
 
     fn t0() -> Instant {
         Instant::now()
+    }
+
+    fn tab(i: usize) -> CursorKey {
+        CursorKey {
+            scope: Some(format!("tab-{i}")),
+            ..key()
+        }
+    }
+
+    #[test]
+    fn past_the_cap_the_least_recent_cursor_goes_and_its_pending_edge_closes_unobserved() {
+        let now = t0();
+        let at = |i: usize| now + Duration::from_millis(i as u64);
+        let mut c = Cursors::default();
+        c.observe(
+            &tab(0),
+            seen("home", &["idle"], "d"),
+            AffordanceIndex::default(),
+            at(0),
+        );
+        c.open(&tab(0), &click("x"), Provenance::default(), None, at(0));
+        for i in 1..MAX_CURSORS {
+            c.observe(
+                &tab(i),
+                seen("home", &["idle"], "d"),
+                AffordanceIndex::default(),
+                at(i),
+            );
+        }
+        assert!(c.evict_over_cap().is_empty(), "at the cap: nothing goes");
+
+        let newest = tab(MAX_CURSORS);
+        c.observe(
+            &newest,
+            seen("home", &["idle"], "d"),
+            AffordanceIndex::default(),
+            at(MAX_CURSORS),
+        );
+        let closed = c.evict_over_cap();
+        assert_eq!(c.map.len(), MAX_CURSORS, "bounded");
+        assert_eq!(closed.len(), 1, "its pending edge is not dropped");
+        assert_eq!(closed[0].key, tab(0));
+        assert_eq!(closed[0].outcome, EdgeOutcome::ToNodeUnobserved);
+        assert_eq!(closed[0].to_node, None);
+        assert_eq!(c.last_node(&tab(0)), None, "the oldest went");
+        assert!(c.last_node(&newest).is_some(), "the newest stays");
+    }
+
+    #[test]
+    fn the_explorers_cursor_is_never_evicted() {
+        let now = t0();
+        let at = |i: usize| now + Duration::from_millis(i as u64);
+        let explorer = CursorKey::for_explorer("qontinui-web");
+        let mut c = Cursors::default();
+        c.observe(
+            &explorer,
+            seen("home", &["idle"], "d"),
+            AffordanceIndex::default(),
+            at(0),
+        );
+        for i in 1..=MAX_CURSORS + 8 {
+            c.observe(
+                &tab(i),
+                seen("home", &["idle"], "d"),
+                AffordanceIndex::default(),
+                at(i),
+            );
+        }
+        c.evict_over_cap();
+        assert_eq!(c.map.len(), MAX_CURSORS);
+        assert_eq!(c.snapshots_seen(&explorer), 1, "the oldest, and it stayed");
+        c.sweep(now + CURSOR_IDLE_TTL * 2);
+        assert_eq!(c.snapshots_seen(&explorer), 1, "idle, and it stayed");
+        assert_eq!(c.map.len(), 1, "every other idle cursor went");
+    }
+
+    #[test]
+    fn an_idle_cursor_is_swept_with_its_pending_edge_closed_and_a_recent_one_stays() {
+        let now = t0();
+        let (idle, recent) = (tab(1), tab(2));
+        let mut c = Cursors::default();
+        c.observe(
+            &idle,
+            seen("home", &["idle"], "d"),
+            AffordanceIndex::default(),
+            now,
+        );
+        c.open(&idle, &click("x"), Provenance::default(), None, now);
+        c.observe(
+            &recent,
+            seen("home", &["idle"], "d"),
+            AffordanceIndex::default(),
+            now + CURSOR_IDLE_TTL,
+        );
+        let closed = c.sweep(now + CURSOR_IDLE_TTL);
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].key, idle);
+        assert_eq!(closed[0].outcome, EdgeOutcome::ToNodeUnobserved);
+        assert_eq!(c.last_node(&idle), None, "dropped");
+        assert!(c.last_node(&recent).is_some());
+        assert_eq!(c.map.len(), 1);
     }
 
     #[test]
