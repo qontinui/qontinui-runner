@@ -9557,11 +9557,44 @@ fn agent_keep_decisions(
 /// Write this binary's embedded subagent defs into `<worktree_cwd>/.claude/agents`
 /// (keeping what `keep` says to keep) and record the `fleet_agents` ledger row.
 /// Returns how many landed. Fail-soft: an errored write is recorded, never fatal.
+///
+/// Writes NOTHING when `<worktree_cwd>/.claude` resolves outside `worktree_cwd`
+/// (a symlink into some other tree, typically an operator's config checkout):
+/// the floor would land as untracked files in that tree. `KeepDecisions` only
+/// protects files the tree already tracks.
 fn provision_embedded_agent_floor(
     worktree_cwd: &str,
     keep: &crate::provision_guard::KeepDecisions,
 ) -> usize {
-    let dst_dir = Path::new(worktree_cwd).join(".claude").join("agents");
+    let cwd = Path::new(worktree_cwd);
+    let dst_dir = cwd.join(".claude").join("agents");
+    if let (Ok(real_cwd), Ok(real_claude)) =
+        (cwd.canonicalize(), cwd.join(".claude").canonicalize())
+    {
+        if !real_claude.starts_with(&real_cwd) {
+            warn!(
+                "agent_runtime: {} resolves outside {worktree_cwd} (to {}); not writing the \
+                 embedded agent floor through it",
+                cwd.join(".claude").display(),
+                real_claude.display()
+            );
+            let mut report = ProvisionReport::new(
+                "fleet_agents",
+                crate::fleet_agents::embedded_agent_count(),
+                capability_manifest::Rung::Unresolved,
+            )
+            .with_destination(dst_dir.display().to_string());
+            report.skip(
+                dst_dir.display().to_string(),
+                capability_manifest::SkipReason::Unresolved(format!(
+                    ".claude resolves outside the session cwd, to {}",
+                    real_claude.display()
+                )),
+            );
+            capability_manifest::record_provision(worktree_cwd, report);
+            return 0;
+        }
+    }
     let report = match crate::fleet_agents::provision_fleet_agents_into(&dst_dir, keep) {
         Ok(report) => report,
         Err(e) => {
@@ -9612,7 +9645,20 @@ fn provision_agent_definitions_from_root(
         if s == d {
             // Served IN PLACE: the session reads the operator checkout's live
             // definitions directly, so this is the checkout rung answering, not
-            // an unresolved one. Nothing is written.
+            // an unresolved one. Nothing is written — so a bundled def the
+            // checkout lacks (an older checkout) is absent here; name it.
+            let missing: Vec<String> = crate::fleet_agents::embedded_agent_names()
+                .into_iter()
+                .filter(|n| !src_dir.join(n).is_file())
+                .collect();
+            if !missing.is_empty() {
+                warn!(
+                    "agent_runtime: serving {} in place; it lacks bundled def(s) {} \
+                     (subagents of those names will not resolve in this session)",
+                    src_dir.display(),
+                    missing.join(", ")
+                );
+            }
             info!(
                 "agent_runtime: {} IS the qontinui-claude-config agents dir; serving the live \
                  definitions in place, nothing written",
@@ -18561,6 +18607,23 @@ mod continuation_agent_provisioning_tests {
         );
     }
 
+    /// SAFETY: with no workspace root, a cwd whose `.claude` links OUTSIDE the
+    /// cwd gets no floor written through the link (it would land untracked in
+    /// another tree).
+    #[cfg(unix)]
+    #[test]
+    fn the_floor_is_not_written_through_a_claude_link_out_of_the_cwd() {
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let cwd = tempfile::tempdir().expect("cwd");
+        std::os::unix::fs::symlink(elsewhere.path(), cwd.path().join(".claude")).expect("symlink");
+        let written = provision_embedded_agent_floor(
+            &cwd.path().to_string_lossy(),
+            &crate::provision_guard::KeepDecisions::default(),
+        );
+        assert_eq!(written, 0);
+        assert!(!elsewhere.path().join("agents").exists());
+    }
+
     /// Both gate-continuation spawn paths provision the subagent defs, so a
     /// dispatched skill that spawns one (`/expedite-review`) can resolve it.
     #[test]
@@ -18579,7 +18642,15 @@ mod continuation_agent_provisioning_tests {
                 .and_then(|rest| rest.find("\n}\n"))
                 .map(|i| start + fn_name.len() + i)
                 .expect("end of fn");
-            let body = src.get(start..body_end).expect("body");
+            // Code lines only: a call that survives only in a comment must not
+            // satisfy the check.
+            let body: String = src
+                .get(start..body_end)
+                .expect("body")
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
             assert!(
                 body.contains("provision_agent_definitions_recorded(workdir)"),
                 "{fn_name} must provision .claude/agents"
