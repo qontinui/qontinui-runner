@@ -618,6 +618,11 @@ if [ "$ATTRIBUTION_STATE" = "pre-existing" ] && [ "$STRICT" != "1" ]; then
     else
         log "(markdown included this time: $ATTRIBUTION_EXCLUDES_DROPPED_REASON)"
     fi
+    if [ -z "$ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON" ]; then
+        log "(and src-tauri/src/fleet_skills .sh/.py files aside, under their own premise guard)"
+    else
+        log "(fleet_skills .sh/.py included this time: $ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON)"
+    fi
     log "differs between HEAD and $ATTRIBUTION_BASE_REF (merge-base ${ATTRIBUTION_BASE_SHA:0:12}),"
     log "and the working tree adds nothing either. The inputs behind the diff"
     log "below are therefore already upstream: the shared checkout's artifact is"
