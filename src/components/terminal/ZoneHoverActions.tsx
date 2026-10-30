@@ -6,6 +6,11 @@
  * mouse-pass-through). Buttons: maximize/restore, restart, label,
  * export, close.
  *
+ * In a zone narrower than `ZONE_HOVER_COLLAPSE_BELOW_PX` (a container query on
+ * the cell, `@container/zone`) the six collapse behind ONE overflow button whose
+ * menu holds each of them, so the header toggles beside the cluster stay
+ * clickable — see `headerReserve.ts` for the arithmetic.
+ *
  * Wired DIRECTLY to context handlers (`zoneLayout.toggleMaximize`,
  * `transitionEffects.handleRestartInZone`, `labelsAndTags.setZoneLabel`,
  * `closeTerminal`) rather than through `callRegistry`. The registry's
@@ -29,13 +34,26 @@
  * the per-tab badge cluster will tighten this layout further.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import { AppWindow, Download, Maximize2, Minimize2, RefreshCw, Tag, X } from "lucide-react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
+import {
+  AppWindow,
+  Download,
+  Maximize2,
+  Minimize2,
+  MoreHorizontal,
+  RefreshCw,
+  Tag,
+  X,
+} from "lucide-react";
 
 import { useTerminalSession, useTransitionEffects, useZoneMetadata } from "./contexts";
 import { useWindowAssignments } from "./contexts/WindowAssignmentsContext";
 import { useTerminalWindowActions, type RunnerWindowRecord } from "./useTerminalWindowActions";
 import { RemoteTabEndAction } from "./RemoteSessionEndFlow";
+import {
+  ZONE_HOVER_COLLAPSED_ONLY_CLASS,
+  ZONE_HOVER_FULL_ONLY_CLASS,
+} from "./zone-grid/headerReserve";
 
 interface ZoneHoverActionsProps {
   zoneIdx: number;
@@ -67,7 +85,35 @@ export function hoverActionsSpanPx(buttons: number): number {
   return 4 + 2 + 8 + buttons * 20 + Math.max(0, buttons - 1) * 2;
 }
 
+/** `ZoneLabel`'s icon toggles: switch-session chevron, pin, filter, prompts, review, scroll-to-bottom. */
+export const HEADER_ICON_TOGGLES_MAX = 6;
+/** `ZoneLabel`'s truncating text items: name, tmux position, total output, cwd. */
+export const HEADER_TRUNCATABLES_MAX = 4;
+
+/**
+ * Least width, in CSS px, `ZoneLabel`'s row content needs once every text item
+ * has truncated to nothing — what the controls that cannot shrink occupy. From
+ * the header's classes: the state dot (`w-1.5`, 6), the label chip (`+` at
+ * `text-[9px]`, ~6), each icon toggle (`p-0.5` + a `w-2.5` icon, 14), and a
+ * `gap-1.5` (6) between every pair of items — a truncated item still takes its
+ * gap. Excludes the row's `px-2` (16) and the hover reserve; `headerReserve.ts`
+ * adds those to get the width below which the hover cluster collapses. Keep it
+ * in step with `ZoneLabel`'s classes.
+ */
+export function headerControlsMinPx(
+  iconToggles: number = HEADER_ICON_TOGGLES_MAX,
+  truncatables: number = HEADER_TRUNCATABLES_MAX,
+): number {
+  const items = 2 + iconToggles + truncatables;
+  return 6 + 6 + iconToggles * 14 + Math.max(0, items - 1) * 6;
+}
+
 const EXPORT_FORMATS = ["text", "markdown", "json"] as const;
+
+const OVERFLOW_ITEM_CLASS =
+  "flex w-full items-center gap-1.5 text-left px-2 py-1 text-[10px] text-[#a9b1d6] hover:bg-[#2a2d3d] hover:text-[#c0caf5] focus:bg-[#2a2d3d] focus:outline-hidden transition-colors disabled:opacity-50 disabled:cursor-not-allowed";
+const OVERFLOW_SUBITEM_CLASS =
+  "block w-full text-left pl-6 pr-2 py-1 text-[10px] text-[#a9b1d6] hover:bg-[#2a2d3d] hover:text-[#c0caf5] focus:bg-[#2a2d3d] focus:outline-hidden transition-colors";
 type ExportFormat = (typeof EXPORT_FORMATS)[number];
 
 export function ZoneHoverActions({
@@ -110,18 +156,36 @@ export function ZoneHoverActions({
   }
   const [showWindowMenu, setShowWindowMenu] = useState(false);
   const [windowList, setWindowList] = useState<RunnerWindowRecord[]>([]);
+  // Narrow zones (below `ZONE_HOVER_COLLAPSE_BELOW_PX`, by container query) show
+  // ONE overflow button instead of the six actions; this is its menu.
+  const [showOverflowMenu, setShowOverflowMenu] = useState(false);
+  const overflowMenuId = useId();
+  // The overlay collapses in a narrow zone; the maximized header's inline
+  // cluster never does (it is not in a zone-sized container).
+  const collapsible = !inline;
+  const fullOnly = collapsible ? ` ${ZONE_HOVER_FULL_ONLY_CLASS}` : "";
 
   const exportRef = useRef<HTMLDivElement>(null);
   const labelPopoverRef = useRef<HTMLDivElement>(null);
   const labelInputRef = useRef<HTMLInputElement>(null);
   const windowMenuRef = useRef<HTMLDivElement>(null);
+  const overflowRef = useRef<HTMLDivElement>(null);
+  const overflowButtonRef = useRef<HTMLButtonElement>(null);
+  const overflowMenuRef = useRef<HTMLDivElement>(null);
 
-  // Outside-click close for both popovers.
+  // Outside-click close for the popovers. The overflow menu hosts its own copy
+  // of the export and window lists, so a click inside it is not "outside" them.
   useEffect(() => {
-    if (!showExportMenu && !showLabelInput && !showWindowMenu) return;
+    if (!showExportMenu && !showLabelInput && !showWindowMenu && !showOverflowMenu) return;
     const handler = (e: MouseEvent) => {
       const target = e.target as Node;
-      if (showExportMenu && exportRef.current && !exportRef.current.contains(target)) {
+      const inOverflow = !!overflowRef.current?.contains(target);
+      if (
+        showExportMenu &&
+        exportRef.current &&
+        !exportRef.current.contains(target) &&
+        !inOverflow
+      ) {
         setShowExportMenu(false);
       }
       if (showLabelInput && labelPopoverRef.current && !labelPopoverRef.current.contains(target)) {
@@ -130,13 +194,40 @@ export function ZoneHoverActions({
         if (labelZone !== null) labelsAndTags.setZoneLabel(labelZone, labelDraft.trim());
         setShowLabelInput(false);
       }
-      if (showWindowMenu && windowMenuRef.current && !windowMenuRef.current.contains(target)) {
+      if (
+        showWindowMenu &&
+        windowMenuRef.current &&
+        !windowMenuRef.current.contains(target) &&
+        !inOverflow
+      ) {
         setShowWindowMenu(false);
+      }
+      if (showOverflowMenu && !inOverflow) {
+        setShowOverflowMenu(false);
       }
     };
     document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
-  }, [showExportMenu, showLabelInput, showWindowMenu, labelDraft, labelsAndTags, labelZone]);
+  }, [
+    showExportMenu,
+    showLabelInput,
+    showWindowMenu,
+    showOverflowMenu,
+    labelDraft,
+    labelsAndTags,
+    labelZone,
+  ]);
+
+  // Opening the overflow menu moves focus to its first item, so the keyboard
+  // lands in the menu it just opened.
+  useEffect(() => {
+    if (!showOverflowMenu) return;
+    queueMicrotask(() =>
+      overflowMenuRef.current
+        ?.querySelector<HTMLButtonElement>('[role="menuitem"]:not([disabled])')
+        ?.focus(),
+    );
+  }, [showOverflowMenu]);
 
   useEffect(() => {
     if (showLabelInput) {
@@ -250,6 +341,47 @@ export function ZoneHoverActions({
     [tabId, moveTabToWindow],
   );
 
+  const toggleOverflowMenu = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    setShowExportMenu(false);
+    setShowWindowMenu(false);
+    setShowOverflowMenu((prev) => !prev);
+  }, []);
+
+  /** Runs a menu action, then closes the overflow menu. */
+  const fromOverflow =
+    (action: (e: React.MouseEvent) => void) =>
+    (e: React.MouseEvent): void => {
+      action(e);
+      setShowOverflowMenu(false);
+    };
+
+  // Escape closes the menu and returns focus to its button; Up/Down move
+  // between the enabled items.
+  const handleOverflowKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (e.key === "Escape") {
+      e.stopPropagation();
+      e.preventDefault();
+      setShowOverflowMenu(false);
+      setShowExportMenu(false);
+      setShowWindowMenu(false);
+      overflowButtonRef.current?.focus();
+      return;
+    }
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    const items = Array.from(
+      overflowMenuRef.current?.querySelectorAll<HTMLButtonElement>(
+        '[role="menuitem"]:not([disabled])',
+      ) ?? [],
+    );
+    if (items.length === 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const at = items.indexOf(document.activeElement as HTMLButtonElement);
+    const step = e.key === "ArrowDown" ? 1 : -1;
+    items[(at + step + items.length) % items.length]?.focus();
+  }, []);
+
   return (
     <div
       // group-hover from the cell parent (`ZoneGrid`'s outer cell div
@@ -277,7 +409,7 @@ export function ZoneHoverActions({
           <button
             type="button"
             onClick={handleMaximize}
-            className="p-1 rounded text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d]/60 transition-colors"
+            className={`p-1 rounded text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d]/60 transition-colors${fullOnly}`}
             title={isMaximized ? "Restore zone (Ctrl+Shift+F)" : "Maximize zone (Ctrl+Shift+F)"}
             aria-label={isMaximized ? "Restore zone" : "Maximize zone"}
           >
@@ -294,7 +426,7 @@ export function ZoneHoverActions({
             canRestart
               ? "text-[#565f89] hover:text-[#7dcfff] hover:bg-[#7dcfff]/10"
               : "text-[#414868] cursor-not-allowed"
-          }`}
+          }${fullOnly}`}
           title={
             canRestart
               ? "Restart session (Ctrl+Shift+R)"
@@ -315,7 +447,7 @@ export function ZoneHoverActions({
               showLabelInput
                 ? "text-[#bb9af7] bg-[#bb9af7]/10"
                 : "text-[#565f89] hover:text-[#bb9af7] hover:bg-[#bb9af7]/10"
-            }`}
+            }${fullOnly}`}
             title="Edit zone label"
             aria-label="Edit zone label"
             aria-expanded={showLabelInput}
@@ -325,7 +457,7 @@ export function ZoneHoverActions({
         )}
 
         {/* Export */}
-        <div className="relative" ref={exportRef}>
+        <div className={`relative${fullOnly}`} ref={exportRef}>
           <button
             type="button"
             onClick={openExportMenu}
@@ -358,7 +490,7 @@ export function ZoneHoverActions({
         </div>
 
         {/* Send to window (pop out to a new window / move to an existing one) */}
-        <div className="relative" ref={windowMenuRef}>
+        <div className={`relative${fullOnly}`} ref={windowMenuRef}>
           <button
             type="button"
             onClick={openWindowMenu}
@@ -412,12 +544,176 @@ export function ZoneHoverActions({
           onClick={handleClose}
           disabled={!hasTab}
           {...(hasTab && tabId ? { "data-ui-bridge-id": `terminal.close-session-${tabId}` } : {})}
-          className="p-1 rounded text-[#565f89] hover:text-[#f7768e] hover:bg-[#f7768e]/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          className={`p-1 rounded text-[#565f89] hover:text-[#f7768e] hover:bg-[#f7768e]/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed${fullOnly}`}
           title="Close session (Ctrl+Shift+W)"
           aria-label="Close session"
         >
           <X className="w-3 h-3" />
         </button>
+
+        {/* Narrow zone: the six actions above are hidden by container query
+            and this one button stands in for them. Its menu carries each
+            action under the same accessible name. */}
+        {collapsible && (
+          <div
+            className={`relative ${ZONE_HOVER_COLLAPSED_ONLY_CLASS}`}
+            ref={overflowRef}
+            onKeyDown={handleOverflowKeyDown}
+            data-zone-hover-overflow
+          >
+            <button
+              ref={overflowButtonRef}
+              type="button"
+              onClick={toggleOverflowMenu}
+              className={`p-1 rounded transition-colors ${
+                showOverflowMenu
+                  ? "text-[#c0caf5] bg-[#2a2d3d]/60"
+                  : "text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d]/60"
+              }`}
+              title="Zone actions"
+              aria-label="Zone actions"
+              aria-haspopup="menu"
+              aria-expanded={showOverflowMenu}
+              aria-controls={overflowMenuId}
+            >
+              <MoreHorizontal className="w-3 h-3" />
+            </button>
+            <div
+              ref={overflowMenuRef}
+              id={overflowMenuId}
+              role="menu"
+              aria-label="Zone actions"
+              hidden={!showOverflowMenu}
+              className="absolute top-full right-0 mt-1 w-44 bg-[#1a1b26] border border-[#2a2d3d] rounded shadow-xl z-50 overflow-hidden py-0.5"
+            >
+              {canMaximize && (
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={fromOverflow(handleMaximize)}
+                  className={OVERFLOW_ITEM_CLASS}
+                  title={
+                    isMaximized ? "Restore zone (Ctrl+Shift+F)" : "Maximize zone (Ctrl+Shift+F)"
+                  }
+                  aria-label={isMaximized ? "Restore zone" : "Maximize zone"}
+                >
+                  {isMaximized ? (
+                    <Minimize2 className="w-3 h-3" />
+                  ) : (
+                    <Maximize2 className="w-3 h-3" />
+                  )}
+                  {isMaximized ? "Restore" : "Maximize"}
+                </button>
+              )}
+              <button
+                type="button"
+                role="menuitem"
+                onClick={fromOverflow(handleRestart)}
+                disabled={!canRestart}
+                className={OVERFLOW_ITEM_CLASS}
+                title={
+                  canRestart
+                    ? "Restart session (Ctrl+Shift+R)"
+                    : `Restart available only when session is completed or errored (currently: ${state})`
+                }
+                aria-label="Restart session"
+                aria-disabled={!canRestart}
+              >
+                <RefreshCw className="w-3 h-3" />
+                Restart
+              </button>
+              {labelZone !== null && (
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={fromOverflow(openLabel)}
+                  className={OVERFLOW_ITEM_CLASS}
+                  title="Edit zone label"
+                  aria-label="Edit zone label"
+                >
+                  <Tag className="w-3 h-3" />
+                  Label
+                </button>
+              )}
+              <button
+                type="button"
+                role="menuitem"
+                onClick={openExportMenu}
+                disabled={!onExportZone}
+                className={OVERFLOW_ITEM_CLASS}
+                title={onExportZone ? "Export zone output" : "Export not available"}
+                aria-label="Export zone output"
+                aria-expanded={showExportMenu}
+              >
+                <Download className="w-3 h-3" />
+                Export
+              </button>
+              {showExportMenu &&
+                onExportZone &&
+                EXPORT_FORMATS.map((format) => (
+                  <button
+                    key={format}
+                    type="button"
+                    role="menuitem"
+                    onClick={fromOverflow((e) => handleExport(e, format))}
+                    className={OVERFLOW_SUBITEM_CLASS}
+                  >
+                    {format}
+                  </button>
+                ))}
+              <button
+                type="button"
+                role="menuitem"
+                onClick={openWindowMenu}
+                disabled={!hasTab}
+                className={OVERFLOW_ITEM_CLASS}
+                title="Send this terminal to a window (or drag its header out)"
+                aria-label="Send terminal to a window"
+                aria-expanded={showWindowMenu}
+              >
+                <AppWindow className="w-3 h-3" />
+                Send to window
+              </button>
+              {showWindowMenu && (
+                <>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={fromOverflow(handlePopOutNew)}
+                    className={OVERFLOW_SUBITEM_CLASS}
+                  >
+                    New window
+                  </button>
+                  {windowList
+                    .filter((w) => w.label !== ownerOf(tabId ?? ""))
+                    .map((w) => (
+                      <button
+                        key={w.label}
+                        type="button"
+                        role="menuitem"
+                        onClick={fromOverflow((e) => handleMoveTo(e, w.label))}
+                        className={OVERFLOW_SUBITEM_CLASS}
+                      >
+                        {w.label === "main" ? "Main window" : w.label}
+                      </button>
+                    ))}
+                </>
+              )}
+              <button
+                type="button"
+                role="menuitem"
+                onClick={fromOverflow(handleClose)}
+                disabled={!hasTab}
+                className={OVERFLOW_ITEM_CLASS}
+                title="Close session (Ctrl+Shift+W)"
+                aria-label="Close session"
+              >
+                <X className="w-3 h-3" />
+                Close
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Label edit popover */}

@@ -50,13 +50,17 @@ export function zoneHeaderElementSpec(
 /**
  * The header's output figure: the session's total output, labelled as total
  * output (`formatTotalOutput`). Renders nothing while no total is known.
+ *
+ * It truncates (`min-w-0 truncate`) rather than holding its width, so in a
+ * narrow zone it gives way before the toggles do; `title` keeps the full figure
+ * reachable.
  */
 export function TotalOutputLabel({ totalBytes }: { totalBytes: number | undefined }) {
   const text = formatTotalOutput(totalBytes);
   if (text === null || totalBytes === undefined) return null;
   return (
     <span
-      className="text-[9px] text-[#565f89] font-mono ml-1 shrink-0"
+      className="text-[9px] text-[#565f89] font-mono ml-1 min-w-0 truncate"
       title={`Total output this session has produced: ${totalBytes} bytes`}
       data-zone-total-output
     >
@@ -184,9 +188,11 @@ export function ZoneLabel({
       <span className="text-[10px] text-[#a9b1d6] truncate font-medium" title={displayTitle}>
         {displayTitle}
       </span>
+      {/* Truncates like the name (its `title` carries the full position), so a
+          narrow zone keeps its toggles out from under the hover cluster. */}
       {position && (
         <span
-          className="text-[9px] text-[#565f89] font-mono shrink-0"
+          className="text-[9px] text-[#565f89] font-mono min-w-0 truncate"
           title={`${displayTitle} — session ${position.index} of ${position.count}`}
           data-tmux-position={`${position.index}/${position.count}`}
         >
