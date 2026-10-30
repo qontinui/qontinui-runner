@@ -2334,7 +2334,7 @@ mod tests {
         }))
         .unwrap();
         store.record_open(rec);
-        store.mark_restore_pending(csid);
+        store.mark_restore_pending(csid, true);
 
         let req = SessionOpenRequest {
             source: Some("resume".to_string()),

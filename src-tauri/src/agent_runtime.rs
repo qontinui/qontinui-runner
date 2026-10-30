@@ -17016,7 +17016,7 @@ mod tests {
         );
         assert_eq!(reserved_spawns_now(), 3);
 
-        terminal.handed_to_registry("t-settle-a".into(), None);
+        terminal.handed_to_registry("t-settle-a".into(), None, None);
         assert_eq!(reserved_spawns_now(), 2, "hand-over gives the unit back");
         assert_eq!(
             continuation_sessions()
@@ -17950,7 +17950,7 @@ mod tests {
         .unwrap();
         store.record_open(rec);
         // This boot's restore pass marks the record before typing the resume.
-        store.mark_restore_pending(csid);
+        store.mark_restore_pending(csid, true);
         // The restore's re-record: the resumed session now lives on a new
         // terminal, written by a gate-less writer.
         let mut reasserted = store.get(csid).unwrap();

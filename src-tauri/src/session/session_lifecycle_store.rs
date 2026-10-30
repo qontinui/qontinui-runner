@@ -13369,7 +13369,7 @@ mod gate_continuation_tests {
         assert_eq!(s.adopt_restored_gate(&csid, 200), None);
         assert_eq!(s.get(&csid).unwrap().gate_bound_boot_ms, Some(100));
         // This boot's restore pass marks it.
-        s.mark_restore_pending(&csid);
+        s.mark_restore_pending(&csid, true);
         let adopted = s
             .adopt_restored_gate(&csid, 200)
             .expect("prior generation adopts");
@@ -13383,7 +13383,7 @@ mod gate_continuation_tests {
         let mut plain = old_row();
         plain.claude_session_id = "plain".to_string();
         s.record_open(plain);
-        s.mark_restore_pending("plain");
+        s.mark_restore_pending("plain", true);
         assert_eq!(s.adopt_restored_gate("plain", 200), None);
         // Closed → nothing.
         s.record_close(&csid, "no-terminal");
@@ -13401,7 +13401,7 @@ mod gate_continuation_tests {
         let csid = old_row().claude_session_id;
         // A prior-generation gate (bound at boot 100; this boot is 200).
         s.record_open(gate_row(100));
-        s.mark_restore_pending(&csid);
+        s.mark_restore_pending(&csid, true);
         // Open: a live continuation keeps its gate.
         assert!(!s.release_gate_identity(&csid, 200));
         // Closed non-restorably: D2 reported it, so it is released.
@@ -13484,7 +13484,7 @@ mod gate_continuation_tests {
         let (_dir, s) = store();
         let csid = old_row().claude_session_id;
         s.record_open(gate_row(100));
-        s.mark_restore_pending(&csid);
+        s.mark_restore_pending(&csid, true);
         assert_eq!(
             s.get(&csid).unwrap().restore_tier.as_deref(),
             Some(RESTORE_TIER_FAILED)
