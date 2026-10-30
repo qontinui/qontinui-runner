@@ -409,7 +409,9 @@ pub enum SessionEventKind {
     #[serde(rename = "operator_touch")]
     OperatorTouch,
     /// A gate continuation's consume OUTCOME (`spawned` / `spawn_failed` /
-    /// `work_unreported`) whose direct post to coord failed in transport (plan
+    /// `work_unreported`), written to the outbox AHEAD of every durable
+    /// outcome post and ACKed by that post's direct answer or by the drain
+    /// (plan
     /// `2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume`,
     /// Phase 2). Producer and drain arm:
     /// [`continuation_outcome_outbox`]. Payload

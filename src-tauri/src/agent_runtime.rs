@@ -4204,17 +4204,30 @@ async fn post_work_unreported_fallback(
     // Durable (a real outcome on a consumed row), on the same per-gate lane
     // as `spawned`, so a queued `spawned` stays ahead of it. Names the episode
     // the session was claimed under, when the poll told us.
-    match post_continuation_outcome(
+    //
+    // PEEKED, not taken: the fallback can run twice for one gate (the exit
+    // hook and the reaper), and a take here made the second post omit
+    // `dispatched_at`. The second post now names the same episode, so the
+    // store dedupes it against the first. The entry is forgotten only once
+    // coord ANSWERED (Recorded / Superseded). On NoVerdict the queued row
+    // carries the episode in its own payload, so the entry is no longer
+    // needed for delivery; it is left for a repeat post to dedupe against and
+    // is bounded by the book's oldest-first eviction.
+    let episode = crate::session::continuation_outcome_outbox::peek_episode(gate_id);
+    let ack = post_continuation_outcome(
         gate_id,
         device_id,
         ContinuationOutcome::WorkUnreported,
         Some(detail),
         None,
-        crate::session::continuation_outcome_outbox::take_episode(gate_id),
+        episode.clone(),
         true,
     )
-    .await
-    {
+    .await;
+    if let (Some(at), OutcomeAck::Recorded | OutcomeAck::Superseded(_)) = (&episode, &ack) {
+        crate::session::continuation_outcome_outbox::forget_episode(gate_id, at);
+    }
+    match ack {
         OutcomeAck::Recorded => {
             info!(
                 "agent_runtime: continuation terminal_id={terminal_id} gate_id={gate_id} exited \
@@ -5324,6 +5337,9 @@ async fn post_continuation_outcome_via(
 ) -> OutcomeAck {
     use crate::session::continuation_outcome_outbox as outbox;
     let token = outcome.wire();
+    // Capped once, so the direct body and the queued row carry the same text
+    // (a `spawn_failed` detail is an error chain; the row is trim-exempt).
+    let detail = detail.map(outbox::bound_detail);
     let record = outbox::ContinuationOutcomeRecord {
         gate_id,
         device_id,
@@ -5333,7 +5349,9 @@ async fn post_continuation_outcome_via(
         dispatched_at: dispatched_at.clone(),
     };
     // Write-ahead: on disk (or in the pre-install buffer) before the network.
-    let written = door.installer.write_ahead(&record, durable);
+    // `_hold` keeps the drain off this gate's lane until the direct attempt
+    // below is settled (dropped at return), so the row is posted once at a time.
+    let (written, _hold) = door.installer.write_ahead_held(&record, durable);
     if !written.posts_directly() {
         // Behind a pending record for this gate, or already pending: the
         // drain posts the lane in order.
@@ -18837,5 +18855,46 @@ mod outcome_wiring_tests {
             "no client: left for the drain"
         );
         assert!(script.lock().await.answered(lone).is_empty());
+    }
+
+    /// A long `spawn_failed` detail is capped at 300 characters, the same text
+    /// on the wire and in the queued row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_long_spawn_failed_detail_is_capped_on_the_wire_and_in_the_row() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, script) = fake_coord::spawn().await;
+        let r = rig(base);
+        let gate = uuid::Uuid::new_v4();
+        script
+            .lock()
+            .await
+            .replies
+            .insert(gate, VecDeque::from([Reply::Drop]));
+        post_spawn_outcome_via(
+            &r.door(),
+            gate,
+            uuid::Uuid::from_u128(0xeb21_55ed),
+            ContinuationOutcome::SpawnFailed,
+            Some("e".repeat(5000)),
+            None,
+            Some(SERVED_AT.to_string()),
+            true,
+        )
+        .await;
+        let queued = r.pending_for(gate);
+        assert_eq!(queued.len(), 1);
+        let row_detail = queued[0]["detail"].as_str().unwrap().to_string();
+        assert_eq!(
+            row_detail.chars().count(),
+            301,
+            "300 chars plus the ellipsis"
+        );
+        let s = script.lock().await;
+        let (_, body, _) = s.seen.iter().find(|(g, _, _)| *g == gate).unwrap();
+        assert_eq!(
+            body["detail"],
+            json!(row_detail),
+            "the wire carries the same text"
+        );
     }
 }

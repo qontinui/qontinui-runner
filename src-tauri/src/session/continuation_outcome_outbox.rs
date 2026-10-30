@@ -140,6 +140,13 @@ impl ContinuationOutcomeRecord {
         body
     }
 
+    /// The dedupe rule, the same in the pre-install buffer as in the store:
+    /// one gate, one `(outcome, dispatched_at)`. A differing `detail` or
+    /// session id does not make a second record.
+    fn same_pending_record(&self, other: &Self) -> bool {
+        self.gate_id == other.gate_id && self.key() == other.key()
+    }
+
     fn key(&self) -> PendingKey {
         PendingKey {
             outcome: self.outcome.clone(),
@@ -155,6 +162,73 @@ pub fn lane(gate_id: Uuid) -> Uuid {
         &Uuid::NAMESPACE_URL,
         format!("continuation-outcome:{gate_id}").as_bytes(),
     )
+}
+
+/// Most characters of an outcome's `detail` that are posted or queued — the
+/// same 300 as [`bounded`]. A `spawn_failed` detail is an error chain, and a
+/// trim-exempt row must stay small (see [`EXEMPT_PENDING_CEILING`]).
+const DETAIL_CAP: usize = 300;
+
+/// Bound an outcome's `detail` to [`DETAIL_CAP`] characters (plus `…`).
+pub fn bound_detail(detail: String) -> String {
+    if detail.chars().count() <= DETAIL_CAP {
+        detail
+    } else {
+        bounded(&detail)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Direct-attempt hold — the lane is the direct post's while it is in flight
+// ---------------------------------------------------------------------------
+
+/// Lanes whose head record is being posted DIRECTLY right now. The drain skips
+/// them ([`lane_held_by_direct_post`]), so a tick cannot re-post the same row
+/// during the 5 s direct attempt — which would double the load in a brownout
+/// and could put a later outcome for the gate on the wire ahead of it.
+fn direct_holds() -> MutexGuard<'static, std::collections::HashSet<Uuid>> {
+    static HOLDS: OnceLock<Mutex<std::collections::HashSet<Uuid>>> = OnceLock::new();
+    HOLDS
+        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// Whether `lane` (an outbox `session_id`) is held by a direct post. The
+/// drain checks this AFTER reading its pending snapshot: a hold is taken
+/// before its row is appended ([`Installer::write_ahead_held`]), so a row the
+/// snapshot holds is either still held or its direct attempt is over.
+pub fn lane_held_by_direct_post(lane: Uuid) -> bool {
+    direct_holds().contains(&lane)
+}
+
+/// RAII hold on one gate's lane for the duration of a direct post. Releases on
+/// drop, so a cancelled or panicking post cannot strand the lane.
+#[must_use = "the hold is released when this is dropped"]
+pub struct DirectHold(Option<Uuid>);
+
+impl DirectHold {
+    fn take(lane: Uuid) -> Self {
+        direct_holds().insert(lane);
+        Self(Some(lane))
+    }
+
+    fn none() -> Self {
+        Self(None)
+    }
+
+    /// Whether this hold is holding a lane.
+    pub fn is_held(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+impl Drop for DirectHold {
+    fn drop(&mut self) {
+        if let Some(lane) = self.0.take() {
+            direct_holds().remove(&lane);
+        }
+    }
 }
 
 /// Whether an outcome post earns durable delivery at all.
@@ -300,11 +374,26 @@ pub struct ContinuationOutcomeOutbox {
     outbox: Arc<OutboxWriter>,
     machine_id: Uuid,
     book: Mutex<Book>,
+    /// [`EXEMPT_PENDING_CEILING`], or a test's own.
+    ceiling: usize,
 }
+
+/// Pending outcome rows past which an ERROR is logged (once per crossing) and
+/// [`ContinuationOutcomeOutbox::over_ceiling`] reads true. The rows are exempt
+/// from the outbox's cap trim, so nothing else bounds them; they are NEVER
+/// dropped for crossing it. At a few hundred bytes a row (the detail is capped
+/// at [`DETAIL_CAP`]), 10 000 rows is a few MiB, well inside the 64 MiB cap.
+pub const EXEMPT_PENDING_CEILING: usize = 10_000;
 
 impl ContinuationOutcomeOutbox {
     /// Build over `outbox`, seeding the pending book from its un-ACKed rows.
     pub fn new(outbox: Arc<OutboxWriter>, machine_id: Uuid) -> Self {
+        Self::with_ceiling(outbox, machine_id, EXEMPT_PENDING_CEILING)
+    }
+
+    /// [`Self::new`] with a pending-row ceiling other than
+    /// [`EXEMPT_PENDING_CEILING`].
+    pub fn with_ceiling(outbox: Arc<OutboxWriter>, machine_id: Uuid, ceiling: usize) -> Self {
         let by_gate = match scan_pending(&outbox) {
             Ok(by_gate) => by_gate,
             Err(e) => {
@@ -324,6 +413,7 @@ impl ContinuationOutcomeOutbox {
                 by_gate,
                 seen_dropped,
             }),
+            ceiling,
         }
     }
 
@@ -343,6 +433,17 @@ impl ContinuationOutcomeOutbox {
     /// Durably enqueue `rec` on its gate's lane, unless an identical record is
     /// already pending (see the module's "Dedupe").
     pub fn enqueue(&self, rec: &ContinuationOutcomeRecord) -> std::io::Result<Enqueued> {
+        self.enqueue_inner(rec, false).map(|(enqueued, _)| enqueued)
+    }
+
+    /// [`Self::enqueue`], and when `hold_for_direct` and the record is the
+    /// head of its lane, take the lane's [`DirectHold`] BEFORE the row is
+    /// appended, so no drain snapshot can ever hold the row un-held.
+    fn enqueue_inner(
+        &self,
+        rec: &ContinuationOutcomeRecord,
+        hold_for_direct: bool,
+    ) -> std::io::Result<(Enqueued, DirectHold)> {
         let lane = lane(rec.gate_id);
         // The book lock is held across the append, so two concurrent enqueues
         // of one record cannot both miss the other. Lock order is always
@@ -366,7 +467,7 @@ impl ContinuationOutcomeOutbox {
             // written again, not reported as a duplicate.
             self.reconcile_locked(&mut book, false);
             if listed(&book) {
-                return Ok(Enqueued::Duplicate { lane });
+                return Ok((Enqueued::Duplicate { lane }, DirectHold::none()));
             }
         }
         let behind = book
@@ -374,6 +475,12 @@ impl ContinuationOutcomeOutbox {
             .get(&rec.gate_id)
             .is_some_and(|keys| !keys.is_empty());
         let payload = serde_json::to_value(rec).map_err(std::io::Error::other)?;
+        // Taken before the append; an append error drops (releases) it.
+        let hold = if hold_for_direct && !behind {
+            DirectHold::take(lane)
+        } else {
+            DirectHold::none()
+        };
         let row = self.outbox.record(
             self.machine_id,
             lane,
@@ -384,11 +491,38 @@ impl ContinuationOutcomeOutbox {
             .entry(rec.gate_id)
             .or_default()
             .push((key, row.seq));
-        Ok(Enqueued::Queued {
-            lane,
-            seq: row.seq,
-            behind,
-        })
+        let pending: usize = book.by_gate.values().map(Vec::len).sum();
+        if pending > self.ceiling && pending - 1 <= self.ceiling {
+            // Crossing the ceiling, said once per crossing. Nothing is dropped:
+            // these rows are trim-exempt because each may be the only record
+            // of a consume. The count is what is wrong, and someone has to look.
+            tracing::error!(
+                "continuation-outcome: {pending} outcome rows are pending in the session \
+                 outbox, past the ceiling of {} — every one is KEPT (they are exempt from the \
+                 cap trim), but this many unanswered consumes means coord has not taken them \
+                 for a long time: check coord reachability and the device credential",
+                self.ceiling,
+            );
+        }
+        Ok((
+            Enqueued::Queued {
+                lane,
+                seq: row.seq,
+                behind,
+            },
+            hold,
+        ))
+    }
+
+    /// Pending outcome rows, across every gate.
+    pub fn pending_rows(&self) -> usize {
+        self.lock().by_gate.values().map(Vec::len).sum()
+    }
+
+    /// Whether the pending outcome rows are past [`EXEMPT_PENDING_CEILING`]
+    /// (the health half of the ceiling's ERROR).
+    pub fn over_ceiling(&self) -> bool {
+        self.pending_rows() > self.ceiling
     }
 
     /// ACK the pending row for `rec` — a direct post reached a terminal
@@ -412,11 +546,20 @@ impl ContinuationOutcomeOutbox {
         true
     }
 
-    /// Forget one pending `rec` — the drain reached a terminal verdict on it
-    /// and ACKs the row itself.
-    fn settle(&self, rec: &ContinuationOutcomeRecord) {
+    /// Forget the pending row `(rec, seq)` — the drain reached a terminal
+    /// verdict on THAT row and ACKs it itself. By seq, not key alone: a
+    /// same-key row written after an earlier one whose ACK had not landed is a
+    /// different pending row, and forgetting it would let a later outcome for
+    /// the gate post directly ahead of it.
+    fn settle(&self, rec: &ContinuationOutcomeRecord, seq: i64) {
         let mut book = self.lock();
-        remove_key(&mut book, rec.gate_id, &rec.key());
+        let key = rec.key();
+        if let Some(keys) = book.by_gate.get_mut(&rec.gate_id) {
+            keys.retain(|(k, s)| *k != key || *s != seq);
+            if keys.is_empty() {
+                book.by_gate.remove(&rec.gate_id);
+            }
+        }
     }
 
     /// Rebuild the book from the outbox. With `after_trim`, every record the
@@ -552,17 +695,30 @@ impl Installer {
     }
 
     /// Write a durable outcome down BEFORE its direct post (see the module's
-    /// "Write-ahead"). Never blocks on the network.
+    /// "Write-ahead"). Never blocks on the network. The lane hold is released
+    /// at once; a caller that posts directly uses [`Self::write_ahead_held`].
     pub fn write_ahead(&self, rec: &ContinuationOutcomeRecord, durable: bool) -> WriteAhead {
+        self.write_ahead_held(rec, durable).0
+    }
+
+    /// [`Self::write_ahead`], plus the lane's [`DirectHold`] when the outcome
+    /// is the [`WriteAhead::Head`] of its gate. Keep the hold alive until the
+    /// direct attempt is settled: while it lives the drain does not post the
+    /// lane, so the same row is never on the wire twice at once.
+    pub fn write_ahead_held(
+        &self,
+        rec: &ContinuationOutcomeRecord,
+        durable: bool,
+    ) -> (WriteAhead, DirectHold) {
         if !durable {
-            return WriteAhead::NotDurable;
+            return (WriteAhead::NotDurable, DirectHold::none());
         }
         let mut buf = self.lock_buffer();
         if let Some(store) = self.store.get().cloned() {
             drop(buf);
-            return match store.enqueue(rec) {
-                Ok(Enqueued::Queued { behind: false, .. }) => WriteAhead::Head,
-                Ok(Enqueued::Queued { behind: true, .. }) => {
+            return match store.enqueue_inner(rec, true) {
+                Ok((Enqueued::Queued { behind: false, .. }, hold)) => (WriteAhead::Head, hold),
+                Ok((Enqueued::Queued { behind: true, .. }, _)) => {
                     tracing::warn!(
                         "continuation-outcome queued for retry gate_id={} outcome={} \
                          device_id={} cause=behind_a_record_already_queued_for_this_gate",
@@ -570,9 +726,9 @@ impl Installer {
                         rec.outcome,
                         rec.device_id,
                     );
-                    WriteAhead::Behind
+                    (WriteAhead::Behind, DirectHold::none())
                 }
-                Ok(Enqueued::Duplicate { .. }) => WriteAhead::Duplicate,
+                Ok((Enqueued::Duplicate { .. }, _)) => (WriteAhead::Duplicate, DirectHold::none()),
                 Err(e) => {
                     tracing::error!(
                         "continuation-outcome gate_id={} outcome={} could not be written to the \
@@ -580,25 +736,33 @@ impl Installer {
                         rec.gate_id,
                         rec.outcome,
                     );
-                    WriteAhead::WriteFailed(e.to_string())
+                    (WriteAhead::WriteFailed(e.to_string()), DirectHold::none())
                 }
             };
         }
-        if buf.iter().any(|r| r == rec) {
-            return WriteAhead::Duplicate;
+        if buf.iter().any(|r| r.same_pending_record(rec)) {
+            return (WriteAhead::Duplicate, DirectHold::none());
         }
         let behind = buf.iter().any(|r| r.gate_id == rec.gate_id);
         if buf.len() >= PRE_INSTALL_CAP {
             if let Some(lost) = buf.pop_front() {
                 tracing::error!(
                     "continuation-outcome gate_id={} outcome={} device_id={} was held before the \
-                     outbox existed and the {PRE_INSTALL_CAP}-record buffer is full — LOST",
+                     outbox existed and the {PRE_INSTALL_CAP}-record buffer is full — evicted; \
+                     LOST unless its direct post succeeded",
                     lost.gate_id,
                     lost.outcome,
                     lost.device_id,
                 );
             }
         }
+        // Held from here: `install` may flush this record into the outbox
+        // while its direct attempt is still in flight.
+        let hold = if behind {
+            DirectHold::none()
+        } else {
+            DirectHold::take(lane(rec.gate_id))
+        };
         buf.push_back(rec.clone());
         tracing::warn!(
             "continuation-outcome gate_id={} outcome={} posted before the session outbox \
@@ -607,9 +771,9 @@ impl Installer {
             rec.outcome,
         );
         if behind {
-            WriteAhead::Behind
+            (WriteAhead::Behind, hold)
         } else {
-            WriteAhead::Head
+            (WriteAhead::Head, hold)
         }
     }
 
@@ -617,7 +781,7 @@ impl Installer {
     /// copy (from the buffer, or ACK its outbox row) so nothing replays it.
     pub fn complete(&self, rec: &ContinuationOutcomeRecord) {
         let mut buf = self.lock_buffer();
-        if let Some(i) = buf.iter().position(|r| r == rec) {
+        if let Some(i) = buf.iter().position(|r| r.same_pending_record(rec)) {
             buf.remove(i);
             return;
         }
@@ -802,6 +966,22 @@ impl EpisodeBook {
     fn take(&mut self, gate_id: Uuid) -> Option<String> {
         self.entries.remove(&gate_id).map(|(_, at)| at)
     }
+
+    fn peek(&self, gate_id: Uuid) -> Option<String> {
+        self.entries.get(&gate_id).map(|(_, at)| at.clone())
+    }
+
+    /// Forget `gate_id`'s entry only if it still names `at` — a re-clearance
+    /// may have remembered a NEWER episode for the gate meanwhile.
+    fn forget_if(&mut self, gate_id: Uuid, at: &str) {
+        if self
+            .entries
+            .get(&gate_id)
+            .is_some_and(|(_, held)| held == at)
+        {
+            self.entries.remove(&gate_id);
+        }
+    }
 }
 
 fn episode_book() -> MutexGuard<'static, EpisodeBook> {
@@ -823,6 +1003,19 @@ pub fn remember_episode(gate_id: Uuid, dispatched_at: Option<&str>) {
 /// a path that will never post `work_unreported` forgets it.
 pub fn take_episode(gate_id: Uuid) -> Option<String> {
     episode_book().take(gate_id)
+}
+
+/// Read the remembered episode for `gate_id` without forgetting it — for the
+/// `work_unreported` fallback, which may run twice (the exit hook and the
+/// reaper): the second post must name the same episode, not omit it.
+pub fn peek_episode(gate_id: Uuid) -> Option<String> {
+    episode_book().peek(gate_id)
+}
+
+/// Forget `gate_id`'s episode once its fallback outcome is answered, unless a
+/// newer episode has replaced it.
+pub fn forget_episode(gate_id: Uuid, at: &str) {
+    episode_book().forget_if(gate_id, at);
 }
 
 // ---------------------------------------------------------------------------
@@ -1027,7 +1220,7 @@ pub(crate) async fn push(http: &reqwest::Client, base: &str, row: &OutboxRecord)
     log_replay(&rec, status, &answer, &verdict, is_error, &body);
     if !matches!(verdict, ReplayVerdict::Retry(_)) {
         if let Some(store) = global() {
-            store.settle(&rec);
+            store.settle(&rec, row.seq);
         }
     }
     verdict
@@ -1635,9 +1828,48 @@ mod tests {
         assert_eq!(rows[1].payload["outcome"], json!("work_unreported"));
         // Settling the head leaves the second still pending.
         let s = inst.store().unwrap();
-        s.settle(&record(g, "spawned", None));
+        s.settle(&record(g, "spawned", None), rows[0].seq);
         assert!(s.has_pending(g));
-        s.settle(&record(g, "work_unreported", None));
+        s.settle(&record(g, "work_unreported", None), rows[1].seq);
+        assert!(!s.has_pending(g));
+    }
+
+    /// `settle` forgets the exact `(key, seq)` row the drain answered, not
+    /// every row with that key: a same-key row written after an earlier one
+    /// whose ACK had not landed is still pending, and must keep the gate's
+    /// later outcomes behind it.
+    #[test]
+    fn settle_forgets_only_the_row_it_answered() {
+        let (s, _d) = store();
+        let g = Uuid::new_v4();
+        let rec = record(g, "spawned", Some("2026-10-22T18:48:46.123456+00:00"));
+        let Enqueued::Queued { seq: first, .. } = s.enqueue(&rec).unwrap() else {
+            panic!("queued");
+        };
+        // The direct answer completed the first row in the book, but its
+        // outbox ACK did not land; the same record is then written again.
+        s.lock().by_gate.remove(&g);
+        let Enqueued::Queued { seq: second, .. } = s.enqueue(&rec).unwrap() else {
+            panic!("a record gone from the book is written again");
+        };
+        assert_ne!(first, second);
+        // The drain answers the FIRST row.
+        s.settle(&rec, first);
+        assert!(
+            s.has_pending(g),
+            "the second same-key row is still pending and must stay in the book"
+        );
+        let next = record(g, "work_unreported", None);
+        assert!(
+            matches!(
+                s.enqueue(&next).unwrap(),
+                Enqueued::Queued { behind: true, .. }
+            ),
+            "a later outcome stays behind the still-pending row"
+        );
+        s.settle(&rec, second);
+        let next_seq = s.lock().by_gate[&g][0].1;
+        s.settle(&next, next_seq);
         assert!(!s.has_pending(g));
     }
 
@@ -1818,5 +2050,108 @@ mod tests {
         // Re-remembering a present gate at the cap evicts nothing.
         book.remember(gates[2], "again", 1);
         assert_eq!(book.take(gates[2]).as_deref(), Some("again"));
+    }
+
+    /// The fallback's episode is peeked (a repeat post names it too) and
+    /// forgotten only when it still names the same episode.
+    #[test]
+    fn a_peeked_episode_survives_and_is_forgotten_only_if_unchanged() {
+        let g = Uuid::new_v4();
+        remember_episode(g, Some("e1"));
+        assert_eq!(peek_episode(g).as_deref(), Some("e1"));
+        assert_eq!(peek_episode(g).as_deref(), Some("e1"), "a peek keeps it");
+        remember_episode(g, Some("e2"));
+        forget_episode(g, "e1");
+        assert_eq!(
+            peek_episode(g).as_deref(),
+            Some("e2"),
+            "a newer episode stays"
+        );
+        forget_episode(g, "e2");
+        assert_eq!(peek_episode(g), None);
+    }
+
+    /// Past the pending ceiling every row is KEPT and the store reports it;
+    /// below it, it does not.
+    #[test]
+    fn the_pending_ceiling_is_reported_and_never_drops_a_row() {
+        let dir = tempdir().unwrap();
+        let outbox = Arc::new(OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap());
+        let s = ContinuationOutcomeOutbox::with_ceiling(outbox.clone(), Uuid::new_v4(), 2);
+        for _ in 0..2 {
+            s.enqueue(&record(Uuid::new_v4(), "spawned", None)).unwrap();
+        }
+        assert!(!s.over_ceiling(), "at the ceiling is not past it");
+        for _ in 0..3 {
+            s.enqueue(&record(Uuid::new_v4(), "spawned", None)).unwrap();
+        }
+        assert!(s.over_ceiling());
+        assert_eq!(s.pending_rows(), 5);
+        assert_eq!(outbox.pending().unwrap().len(), 5, "nothing dropped");
+        assert_eq!(EXEMPT_PENDING_CEILING, 10_000);
+    }
+
+    /// A detail is capped at 300 characters (plus the ellipsis); a short one
+    /// passes untouched.
+    #[test]
+    fn an_outcome_detail_is_capped_at_300_chars() {
+        assert_eq!(bound_detail("spawn failed".into()), "spawn failed");
+        let long = "x".repeat(1000);
+        let capped = bound_detail(long);
+        assert_eq!(capped.chars().count(), DETAIL_CAP + 1);
+        assert!(capped.ends_with('…'));
+        assert_eq!(
+            bound_detail("y".repeat(DETAIL_CAP)).chars().count(),
+            DETAIL_CAP
+        );
+    }
+
+    /// The head of a lane is held for its direct post — from the store and
+    /// from the pre-install buffer — and released on drop; a record written
+    /// behind it is not held.
+    #[test]
+    fn a_head_write_holds_its_lane_until_the_hold_drops() {
+        let (inst, _outbox, _d) = installed();
+        let g = Uuid::new_v4();
+        let (w, hold) = inst.write_ahead_held(&record(g, "spawned", None), true);
+        assert_eq!(w, WriteAhead::Head);
+        assert!(hold.is_held());
+        assert!(lane_held_by_direct_post(lane(g)));
+        let (w2, hold2) = inst.write_ahead_held(&record(g, "work_unreported", None), true);
+        assert_eq!(w2, WriteAhead::Behind);
+        assert!(!hold2.is_held());
+        drop(hold);
+        assert!(!lane_held_by_direct_post(lane(g)), "released on drop");
+
+        let pre = Installer::new();
+        let g2 = Uuid::new_v4();
+        let (w3, hold3) = pre.write_ahead_held(&record(g2, "spawned", None), true);
+        assert_eq!(w3, WriteAhead::Head);
+        assert!(
+            lane_held_by_direct_post(lane(g2)),
+            "a buffered head is held too"
+        );
+        drop(hold3);
+        assert!(!lane_held_by_direct_post(lane(g2)));
+    }
+
+    /// The pre-install buffer dedupes by the store's rule — one gate, one
+    /// `(outcome, dispatched_at)` — not by the whole record.
+    #[test]
+    fn the_buffer_dedupes_by_the_same_rule_as_the_store() {
+        let pre = Installer::new();
+        let g = Uuid::new_v4();
+        let first = record(g, "spawned", Some("e1"));
+        let mut other_detail = first.clone();
+        other_detail.detail = Some("a different detail".into());
+        assert_eq!(pre.write_ahead(&first, true), WriteAhead::Head);
+        assert_eq!(pre.write_ahead(&other_detail, true), WriteAhead::Duplicate);
+        assert_eq!(pre.buffered(), 1);
+        let (s, _d) = store();
+        s.enqueue(&first).unwrap();
+        assert!(matches!(
+            s.enqueue(&other_detail).unwrap(),
+            Enqueued::Duplicate { .. }
+        ));
     }
 }

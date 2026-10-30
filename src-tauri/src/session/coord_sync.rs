@@ -1227,11 +1227,23 @@ fn is_best_effort_kind(kind: &str) -> bool {
 /// Phase 2). A partial brownout — 500 on the consume route while coord serves
 /// session rows — is exactly the 2026-10-22 shape, and quarantining the lane
 /// there would turn a durable consume record back into a fire-few one. Each
-/// lane is ONE gate, so a lane that keeps failing blocks only that gate, and
-/// its 4xx answers still terminate it (ACK or ACK-drop), so a row coord truly
-/// refuses cannot retry forever.
+/// lane is ONE gate, so a lane that keeps failing blocks only that gate.
+///
+/// Only a confirmed 2xx or a content refusal (400/404/409/422) ends such a
+/// row. A request-level 4xx (401, 403, 408, any other 4xx but 429) is retried
+/// and logged at ERROR, bounded only by the lane's 60 s backoff ceiling — so a
+/// broken credential keeps such a row retrying until someone fixes it, by
+/// design, rather than dropping the only record of a consume.
 fn is_quarantine_exempt_kind(kind: &str) -> bool {
     kind == SessionEventKind::GateContinuationOutcome.as_str()
+}
+
+/// A retried request-level 4xx (anything 4xx but 429) on an
+/// [`is_quarantine_exempt_kind`] row. Its retry is about the request — the
+/// device credential, a proxy — not about whether coord is serving, so it must
+/// not trip the tick-wide abort that puts the whole drain on outage backoff.
+fn is_exempt_request_refusal(kind: &str, status: Option<u16>) -> bool {
+    is_quarantine_exempt_kind(kind) && status.is_some_and(|s| (400..500).contains(&s) && s != 429)
 }
 
 /// How many per-session push chains run at once (plan
@@ -1373,7 +1385,12 @@ async fn push_chain(
                 out.blocked_quarantine_exempt = is_quarantine_exempt_kind(&rec.event_kind);
                 // Stop THIS chain — preserves (session, seq) order on retry.
                 // The unACKed tail stays in the file for a later tick.
-                if trip_abort {
+                //
+                // A request-level 4xx (401/403/408/…) on a quarantine-exempt
+                // row is retried, but it is about the credential, not about
+                // coord being up — so it never trips the tick-wide abort, and
+                // never puts the whole drain on the outage backoff.
+                if trip_abort && !is_exempt_request_refusal(&rec.event_kind, fail_status) {
                     abort.store(true, Ordering::Relaxed);
                 }
                 break;
@@ -1563,6 +1580,14 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
     let mut to_quarantine: Vec<OutboxRecord> = Vec::new();
     for rec in pending {
         if held.contains(&rec.session_id) {
+            continue;
+        }
+        // A gate continuation's consume outcome being posted DIRECTLY right
+        // now (plan 2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume,
+        // Phase 2): its lane sits this tick out, so the same row is never on
+        // the wire twice. Checked after the snapshot; the hold is taken before
+        // the row is appended, so a row in the snapshot is still held or done.
+        if super::continuation_outcome_outbox::lane_held_by_direct_post(rec.session_id) {
             continue;
         }
         if state.quarantined.contains(&rec.session_id) {
@@ -2008,10 +2033,10 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 .await
         }
         "gate_continuation_outcome" => {
-            // A gate continuation's consume OUTCOME whose direct post failed in
-            // transport (plan
+            // A gate continuation's consume OUTCOME (plan
             // 2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume,
-            // Phase 2). POST /coord/gates/{gate_id}/continuation-consumed with
+            // Phase 2). The row is written AHEAD of every durable outcome post
+            // and ACKed by that post's direct answer or, failing that, here. POST /coord/gates/{gate_id}/continuation-consumed with
             // the OUTCOME-shape body, under the DEVICE credential (the lane is
             // synthetic, so `scope` above is `Unresolved` and is not used).
             //
@@ -10123,5 +10148,84 @@ mod continuation_outcome_drain_tests {
         drain_tick(&coord.inner, &mut state).await;
         assert_eq!(pending_for(&outbox, gate), 0);
         assert_eq!(script.lock().await.answered(gate), vec![200]);
+    }
+
+    /// While a direct post holds its gate's lane, the drain does not post
+    /// that lane at all — the same row is never on the wire twice — and it
+    /// takes the row as soon as the hold drops.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_drain_skips_a_lane_held_by_a_direct_post() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, script) = fake_coord::spawn().await;
+        let r = rig(base);
+        let gate = Uuid::new_v4();
+        let (written, hold) = r
+            .installer
+            .write_ahead_held(&outcome_record(gate, "spawned"), true);
+        assert_eq!(written, WriteAhead::Head);
+        assert!(hold.is_held());
+
+        let mut state = DrainState::default();
+        drain_tick(&r.coord.inner, &mut state).await;
+        assert!(
+            script.lock().await.answered(gate).is_empty(),
+            "the drain posted a lane a direct attempt was holding"
+        );
+        assert_eq!(pending_for(&r.outbox, gate), 1, "still queued");
+
+        drop(hold);
+        drain_tick(&r.coord.inner, &mut state).await;
+        assert_eq!(script.lock().await.answered(gate), vec![200]);
+        assert_eq!(pending_for(&r.outbox, gate), 0);
+    }
+
+    /// A request-level 4xx (401) on an outcome row is retried, but it does NOT
+    /// trip the tick-wide abort: a tick whose only failure is that 401 is not
+    /// an outage. A transport failure on the same kind still is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_401_on_an_outcome_row_is_not_an_outage() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, script) = fake_coord::spawn().await;
+        let r = rig(base);
+        let refused = Uuid::new_v4();
+        let dropped = Uuid::new_v4();
+        {
+            let mut s = script.lock().await;
+            s.replies.insert(
+                refused,
+                VecDeque::from([Reply::Status(401, json!({"error": "unauthorized"}))]),
+            );
+            s.replies.insert(dropped, VecDeque::from([Reply::Drop]));
+        }
+        r.store()
+            .enqueue(&outcome_record(refused, "spawned"))
+            .unwrap();
+        let mut state = DrainState::default();
+        let tick = drain_tick(&r.coord.inner, &mut state).await;
+        assert_eq!(script.lock().await.answered(refused), vec![401]);
+        assert_eq!(pending_for(&r.outbox, refused), 1, "retried, not dropped");
+        assert!(
+            !tick.outage,
+            "a credential 4xx put the whole drain on outage backoff"
+        );
+        assert!(is_exempt_request_refusal(
+            SessionEventKind::GateContinuationOutcome.as_str(),
+            Some(403)
+        ));
+        assert!(!is_exempt_request_refusal(
+            SessionEventKind::GateContinuationOutcome.as_str(),
+            Some(429)
+        ));
+        assert!(!is_exempt_request_refusal("started", Some(401)));
+
+        // Control: a transport failure on the same kind is still an outage.
+        let r2 = rig(r.coord.inner.coord_url.clone());
+        r2.store()
+            .enqueue(&outcome_record(dropped, "spawned"))
+            .unwrap();
+        let mut state2 = DrainState::default();
+        let tick2 = drain_tick(&r2.coord.inner, &mut state2).await;
+        assert_eq!(script.lock().await.answered(dropped), vec![0]);
+        assert!(tick2.outage, "a transport failure is still an outage");
     }
 }
