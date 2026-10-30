@@ -1399,7 +1399,12 @@ mod tests {
             "nothing ran while the arm held it"
         );
         drop(arm);
-        call.await.expect("forwarded once the arm is done");
+        let forwarded = call.await.expect("forwarded once the arm is done");
+        assert_eq!(
+            forwarded.0.data,
+            Some(json!({"success": true, "hidden": false})),
+            "the webview's reply, forwarded once the arm let go"
+        );
         let kinds: Vec<&str> = log.lock().unwrap().iter().map(|(k, _)| *k).collect();
         assert_eq!(kinds, ["<bump>", REQUEST_TYPE, "<bump>"]);
     }
