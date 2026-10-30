@@ -80,6 +80,7 @@ import { LogSourcePicker } from "./components/LogSourcePicker";
 import { Sidebar } from "./components/navigation";
 import { TerminalPage } from "./components/terminal";
 import { TerminalPageTabBar } from "./components/terminal/TerminalPageTabBar";
+import { TerminalPagesBridge, isMainWindow } from "./components/terminal/TerminalPagesBridge";
 import { SessionRecoveryBanner } from "./components/terminal/SessionRecoveryBanner";
 import { AdvisoryStackProvider } from "./components/terminal/AdvisoryStack";
 import { RunnerDrainBanner } from "./components/terminal/RunnerDrainBanner";
@@ -860,6 +861,19 @@ function AppContent() {
                         );
                       }}
                     />
+                    {/*
+                  `list-pages` UI Bridge read over the FULL persisted page roster
+                  (pop-out pages and the empty default included). Main window
+                  only: a pop-out knows one page and must not serve that as the
+                  roster under the same component id.
+                */}
+                    {!terminalPages.isPinned && isMainWindow() && (
+                      <TerminalPagesBridge
+                        allPages={terminalPages.allPages}
+                        boundPages={terminalPages.boundPages}
+                        activePageId={terminalPages.activePageId}
+                      />
+                    )}
                     {/*
                   Phase 4 — startup session-recovery banner. Subscribes to the
                   one-shot `session-recovery-summary` event emitted after
