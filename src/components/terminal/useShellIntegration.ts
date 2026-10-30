@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ShellIntegrationEvent } from "./TerminalInstance";
 import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { TranscriptSession } from "./useTranscriptSessions";
@@ -33,6 +33,22 @@ export interface CommandHistoryEntry {
   command: string;
   exitCode: number;
   timestamp: number;
+}
+
+/** The notice an interactive click posts while its liveness read runs. */
+export function resumeCheckingNotice(displayName: string): string {
+  return `Resuming "${displayName}" — checking whether it is already open…`;
+}
+
+/** A page notification, as `useWorkflowGeneration().notification` holds it. */
+export type PageNotice = { message: string; type: "success" | "error" } | null;
+
+/**
+ * The state update that withdraws `message` if it is still the page's notice,
+ * and leaves any newer notice (another click's, a failure's) in place.
+ */
+export function withdrawNoticeUpdate(message: string): (prev: PageNotice) => PageNotice {
+  return (prev) => (prev !== null && prev.message === message ? null : prev);
 }
 
 interface UseShellIntegrationParams {
@@ -83,6 +99,12 @@ interface UseShellIntegrationParams {
    * (refused, no tab, unverified, or threw), so a click is never silent.
    */
   notify?: (message: string, type: "success" | "error") => void;
+  /**
+   * Withdraw a notice `notify` posted, if it is still the one showing (see
+   * {@link withdrawNoticeUpdate}). The click's "checking…" acknowledgement is
+   * withdrawn once its liveness read returns, so it never outlives the check.
+   */
+  withdrawNotice?: (message: string) => void;
   /**
    * Injectable for tests: the liveness oracle — the gate's read
    * (`fetchLiveClaudeHolders`, rows with their holding panes).
@@ -142,6 +164,7 @@ export function useShellIntegration({
   pageId,
   onResumedTab,
   notify,
+  withdrawNotice,
   readLiveSessions,
 }: UseShellIntegrationParams): UseShellIntegrationResult {
   // Shell integration: structured command history per tab
@@ -271,6 +294,11 @@ export function useShellIntegration({
     setResumeGatePrompt(null);
     resolve?.(choice);
   }, []);
+  // A dialog left open when this page's scope unmounts (the page was closed)
+  // can never be answered, and its click holds the id's in-flight claim while
+  // it waits. Answer it "cancel". `ResumeGateHost` does the same for a dialog
+  // it stops showing on a page switch.
+  useEffect(() => () => answerResumeGate("cancel"), [answerResumeGate]);
 
   const gatedResume = useCallback(
     (
@@ -296,8 +324,10 @@ export function useShellIntegration({
           // The click acknowledges itself at once: the liveness read can take
           // a couple of seconds (a holder census), and a click that shows
           // nothing invites the second click the in-flight claim refuses.
-          onChecking: (t) =>
-            say?.(`Resuming "${t.displayName}" — checking whether it is already open…`, "success"),
+          onChecking: (t) => say?.(resumeCheckingNotice(t.displayName), "success"),
+          // ...and withdraws that acknowledgement once the read returns: the
+          // dialog, the new tab or a failure notice is the answer from then on.
+          onChecked: (t) => withdrawNotice?.(resumeCheckingNotice(t.displayName)),
           onInFlight: (t) =>
             say?.(
               `"${t.displayName}" is already being resumed in this window — wait for it, or finish its dialog`,
@@ -308,7 +338,7 @@ export function useShellIntegration({
         opts,
       );
     },
-    [notify, readLiveSessions, startResume, askResumeGate],
+    [notify, withdrawNotice, readLiveSessions, startResume, askResumeGate],
   );
 
   const resumeClick = useCallback(

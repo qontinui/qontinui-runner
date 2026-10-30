@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useEffect } from "react";
 
 import { usePageSessionGetter, useTerminalSession, useTransitionEffects } from "./contexts";
 import { TERMINAL_OPEN_PAGE_EVENT } from "./commands/orchestrateCommand";
@@ -18,6 +18,11 @@ import type { LiveClaudeSession } from "./liveClaudeSessions";
  * the page's own zone layout reveals and focuses the pane
  * (`revealTabInLayout`), and `flashTab` flashes it so the move is visible. A
  * pane that is not in this window is said, never silently not shown.
+ *
+ * A prompt this host stops showing is answered "cancel": the host shows only
+ * the ACTIVE page's prompt, so a page switch hides the old page's dialog, and
+ * its click would otherwise wait — holding the id's in-flight claim — until
+ * the operator happened back to that page.
  */
 export function ResumeGateHost() {
   const { shellIntegration, pageId, workflowGen } = useTerminalSession();
@@ -26,8 +31,16 @@ export function ResumeGateHost() {
   const { resumeGatePrompt: prompt, answerResumeGate } = shellIntegration;
   const { setNotification } = workflowGen;
 
+  // `answerResumeGate` is one stable callback per page, so this cleanup runs
+  // exactly when the host stops showing that page: on a page switch, and when
+  // the host unmounts. With no dialog open it does nothing.
+  useEffect(() => () => answerResumeGate("cancel"), [answerResumeGate]);
+
   const onGoToPane = useCallback(
     (holder: LiveClaudeSession) => {
+      // Answer first, so the page switch below cannot land the cleanup's
+      // "cancel" on this dialog before its own answer does.
+      answerResumeGate("go-to-pane");
       const result = goToHolderPane(
         {
           currentPageId: pageId,
@@ -50,7 +63,6 @@ export function ResumeGateHost() {
           type: "error",
         });
       }
-      answerResumeGate("go-to-pane");
     },
     [pageId, getPageSession, flashTab, prompt, setNotification, answerResumeGate],
   );

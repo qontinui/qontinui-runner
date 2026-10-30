@@ -47,12 +47,15 @@
 //!   itself, so an entry whose PID is absent from the live process table is
 //!   dropped rather than reported as open.
 
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use super::past_sessions::{account_from_config_dir, PastSessionAccount};
+use crate::process_capture::process_tree::{
+    is_countable_claude, ProcessSnapshot, PID_REUSE_SKEW_MS,
+};
 
 /// Raw on-disk shape of `<config_dir>/sessions/<pid>.json`.
 ///
@@ -229,6 +232,29 @@ pub fn live_pids_from_snapshot(
     Ok(snapshot.names.keys().copied().collect())
 }
 
+/// Start time of every live CLAUDE process in a process-table snapshot, as
+/// `pid -> epoch seconds` (`0` when the snapshot could not resolve it).
+///
+/// What [`read_live_sessions_reporting`] judges an unreadable registry file
+/// against. The live-PID set is every process on the machine, so judged by it
+/// a stale `<pid>.json` — a crashed claude's leftover, like the 0-byte
+/// `58008.json` dated 2026-08-31 in one account's `sessions/` on the
+/// operator's box — reads as a live session's file the moment ANY process is
+/// given that pid, and every liveness gate reading the registry goes UNKNOWN.
+/// Only a claude writes a registry file, so only claude pids are kept, each
+/// with its start time for the writer check. "Claude" is
+/// [`is_countable_claude`], the predicate every runner liveness verdict uses:
+/// a qontinui shim named `claude.exe` is not the process that writes the file.
+pub fn live_claude_starts_from_snapshot(snapshot: &ProcessSnapshot) -> HashMap<u32, i64> {
+    snapshot
+        .names
+        .keys()
+        .copied()
+        .filter(|&pid| is_countable_claude(pid, snapshot))
+        .map(|pid| (pid, snapshot.creation_times.get(&pid).copied().unwrap_or(0)))
+        .collect()
+}
+
 /// Read every `<config_dir>/sessions/*.json`, keeping only entries whose PID is
 /// in `live_pids`.
 ///
@@ -246,7 +272,9 @@ pub fn read_live_sessions(
     config_dirs: &[std::path::PathBuf],
     live_pids: &HashSet<u32>,
 ) -> Vec<LiveClaudeSession> {
-    read_live_sessions_reporting(config_dirs, live_pids).sessions
+    // No claude start times, so no file is a suspect: one pass, no re-read and
+    // no wait — the rows this reader has always returned.
+    scan_registry(config_dirs, live_pids, &HashMap::new(), &|| {}).sessions
 }
 
 /// A registry entry [`read_live_sessions_reporting`] could not read, in a place
@@ -254,9 +282,10 @@ pub fn read_live_sessions(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UnreadableRegistryEntry {
-    /// The pid the file's stem names (`<pid>.json`), which IS live. `None`
-    /// when what failed was the `sessions` directory itself (or one of its
-    /// entries), so no pid is known.
+    /// The pid the file's stem names (`<pid>.json`): a live claude process
+    /// that started no later than the file's last write, so it may be the
+    /// file's writer. `None` when what failed was the `sessions` directory
+    /// itself (or one of its entries), so no pid is known.
     pub pid: Option<u32>,
     /// The account config dir the entry lives under.
     pub config_dir: String,
@@ -266,7 +295,9 @@ pub struct UnreadableRegistryEntry {
 /// live session.
 #[derive(Debug, Clone, Default)]
 pub struct LiveRegistryRead {
-    /// Exactly what [`read_live_sessions`] returns.
+    /// What [`read_live_sessions`] returns, plus any file that failed the first
+    /// read and parsed on the re-read (a read that caught Claude Code
+    /// mid-write).
     pub sessions: Vec<LiveClaudeSession>,
     /// Non-empty means the read is INCOMPLETE: a live session may exist that
     /// `sessions` does not list. A liveness gate must read that as UNKNOWN —
@@ -281,56 +312,141 @@ fn stem_pid(path: &Path) -> Option<u32> {
     path.file_stem()?.to_str()?.parse().ok()
 }
 
+/// How long [`read_live_sessions_reporting`] waits before re-reading the files
+/// it could not read, so that a read which landed while Claude Code was
+/// rewriting its file (and saw it truncated or half-written) gets a second
+/// chance. The wait happens at most once per call, and only when a file may
+/// hide a live session.
+const UNREADABLE_REREAD_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// [`read_live_sessions`], reporting what it could not read.
 ///
 /// Reported as [`UnreadableRegistryEntry`]:
-/// - a `<pid>.json` whose stem pid IS in `live_pids` but whose bytes could not
-///   be read, or did not parse into a session (malformed JSON, no
-///   `sessionId`): a live process whose conversation is unknown;
+/// - a `<pid>.json` that could not be read, or did not parse into a session
+///   (malformed JSON, no `sessionId`), on the first read AND the re-read,
+///   whose stem pid is a live CLAUDE process in `claude_starts` (from
+///   [`live_claude_starts_from_snapshot`]) that started no later than the
+///   file's last write, allowing [`PID_REUSE_SKEW_MS`]: a live claude that may
+///   have written the file, holding a conversation nobody can name;
 /// - a `sessions` directory that exists but could not be listed (any
 ///   `read_dir` error other than `NotFound`), or an entry of it that could not
 ///   be enumerated: any number of live sessions may be behind it.
 ///
 /// NOT reported: a missing `sessions` directory (an account that never ran an
-/// interactive session), a non-`.json` file, and a bad file whose stem pid is
-/// not live (a stale file a crashed process left behind) — none can hide a
-/// live session.
+/// interactive session), a non-`.json` file, and a bad file no live claude can
+/// have written — its stem pid is not live, is held by a process that is not
+/// claude (a recycled pid), or is held by a claude that started AFTER the file
+/// was last written. None of those can hide a live session. An unknown start
+/// time or an unknown modification time cannot rule the writer out, so such a
+/// file IS reported.
+///
+/// When any file is reportable, the reader waits [`UNREADABLE_REREAD_DELAY`]
+/// once and re-reads each one. A file that parses on the re-read is a row like
+/// any other, so a read that caught Claude Code mid-write is not an UNKNOWN.
 pub fn read_live_sessions_reporting(
     config_dirs: &[std::path::PathBuf],
     live_pids: &HashSet<u32>,
+    claude_starts: &HashMap<u32, i64>,
+) -> LiveRegistryRead {
+    scan_registry(config_dirs, live_pids, claude_starts, &|| {
+        std::thread::sleep(UNREADABLE_REREAD_DELAY);
+    })
+}
+
+/// Read and parse one registry file. `None` when it cannot be read or does not
+/// parse into a session.
+fn read_registry_file(path: &Path, config_dir: &Path) -> Option<LiveClaudeSession> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|bytes| parse_registry_file(&bytes, config_dir))
+}
+
+/// A file's last-modified instant as epoch millis, when the platform reports it.
+fn modified_unix_millis(path: &Path) -> Option<i64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    i64::try_from(since_epoch.as_millis()).ok()
+}
+
+/// True iff an unreadable `<pid>.json`, last written at `last_write_millis`,
+/// may hide a LIVE session: a live claude holds `pid` (`claude_starts`) and
+/// did not start after the file's last write. A process that started after
+/// the last write did not write the file.
+///
+/// Fails closed on what it cannot know: a start time of `0` (the snapshot
+/// could not resolve it) or no modification time cannot rule the claude out
+/// as the writer, so both answer true. The comparison allows
+/// [`PID_REUSE_SKEW_MS`], because start times are whole seconds.
+fn may_hide_a_live_session(
+    pid: u32,
+    last_write_millis: Option<i64>,
+    claude_starts: &HashMap<u32, i64>,
+) -> bool {
+    let Some(&started_secs) = claude_starts.get(&pid) else {
+        return false;
+    };
+    match last_write_millis {
+        Some(last_write) if started_secs > 0 => {
+            started_secs.saturating_mul(1000) <= last_write.saturating_add(PID_REUSE_SKEW_MS)
+        }
+        _ => true,
+    }
+}
+
+/// A config dir as [`UnreadableRegistryEntry::config_dir`] spells it.
+fn config_dir_label(dir: &Path) -> String {
+    dir.to_string_lossy().replace('\\', "/")
+}
+
+/// The one registry scan behind both readers.
+///
+/// `claude_starts` decides which unreadable files are reportable (see
+/// [`may_hide_a_live_session`]); an empty map reports none, which is
+/// [`read_live_sessions`]. `settle` runs once before the reportable files are
+/// re-read, and only when there is one: the wait in production, and the seam
+/// where a test rewrites a file between the two reads.
+fn scan_registry(
+    config_dirs: &[PathBuf],
+    live_pids: &HashSet<u32>,
+    claude_starts: &HashMap<u32, i64>,
+    settle: &dyn Fn(),
 ) -> LiveRegistryRead {
     let mut out = LiveRegistryRead::default();
+    // Files a live claude may have written that did not read: (file, config
+    // dir, stem pid). Each gets one re-read after `settle`.
+    let mut suspects: Vec<(PathBuf, &Path, u32)> = Vec::new();
     for dir in config_dirs {
-        let config_dir = dir.to_string_lossy().replace('\\', "/");
-        let unreadable = |pid: Option<u32>| UnreadableRegistryEntry {
-            pid,
-            config_dir: config_dir.clone(),
-        };
         let sessions_dir = dir.join("sessions");
         let entries = match std::fs::read_dir(&sessions_dir) {
             Ok(entries) => entries,
             // No sessions dir on this account — normal.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => {
-                out.unreadable.push(unreadable(None));
+                out.unreadable.push(UnreadableRegistryEntry {
+                    pid: None,
+                    config_dir: config_dir_label(dir),
+                });
                 continue;
             }
         };
         for entry in entries {
             let Ok(entry) = entry else {
-                out.unreadable.push(unreadable(None));
+                out.unreadable.push(UnreadableRegistryEntry {
+                    pid: None,
+                    config_dir: config_dir_label(dir),
+                });
                 continue;
             };
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let parsed = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|bytes| parse_registry_file(&bytes, dir));
-            let Some(session) = parsed else {
-                if let Some(pid) = stem_pid(&path).filter(|p| live_pids.contains(p)) {
-                    out.unreadable.push(unreadable(Some(pid)));
+            let Some(session) = read_registry_file(&path, dir) else {
+                let suspect = stem_pid(&path).filter(|&pid| {
+                    may_hide_a_live_session(pid, modified_unix_millis(&path), claude_starts)
+                });
+                if let Some(pid) = suspect {
+                    suspects.push((path, dir.as_path(), pid));
                 }
                 continue;
             };
@@ -338,6 +454,20 @@ pub fn read_live_sessions_reporting(
                 continue; // stale file left by a crashed process
             }
             out.sessions.push(session);
+        }
+    }
+    if !suspects.is_empty() {
+        settle();
+        for (path, dir, pid) in suspects {
+            match read_registry_file(&path, dir) {
+                Some(session) if live_pids.contains(&session.pid) => out.sessions.push(session),
+                // Parsed this time, but names a pid that is not live.
+                Some(_) => {}
+                None => out.unreadable.push(UnreadableRegistryEntry {
+                    pid: Some(pid),
+                    config_dir: config_dir_label(dir),
+                }),
+            }
         }
     }
     out.sessions.sort_by(|a, b| {
@@ -715,11 +845,29 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// Epoch seconds now, for start times relative to a file just written.
+    fn now_secs() -> i64 {
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        i64::try_from(since.as_secs()).unwrap()
+    }
+
+    /// A snapshot whose processes are `(pid, image, start secs)`.
+    fn snapshot_of(procs: &[(u32, &str, i64)]) -> ProcessSnapshot {
+        let mut snap = ProcessSnapshot::default();
+        for (pid, image, started) in procs {
+            snap.names.insert(*pid, (*image).to_string());
+            snap.creation_times.insert(*pid, *started);
+        }
+        snap
+    }
+
     /// Review M2: the gate's reader keeps `read_live_sessions`' rows AND names
-    /// every file it skipped that may hide a live session — a live stem whose
-    /// bytes are malformed, carry no `sessionId`, or cannot be read at all.
-    /// A bad file whose stem pid is NOT live is a crashed process's leftover,
-    /// and is not reported.
+    /// every file it skipped that may hide a live session — a live claude's
+    /// stem whose bytes are malformed, carry no `sessionId`, or cannot be read
+    /// at all. A bad file whose stem pid is NOT live is a crashed process's
+    /// leftover, and is not reported.
     #[test]
     fn the_reporting_reader_names_a_live_pid_it_could_not_read() {
         let root = tmpdir("reporting");
@@ -733,8 +881,18 @@ mod tests {
         fs::write(sdir.join("notes.txt"), "{{{").unwrap(); // not a registry file
         fs::write(sdir.join("garbage.json"), "{{{").unwrap(); // stem names no pid
 
-        let live: HashSet<u32> = [2804, 9999, 7777, 6666].into_iter().collect();
-        let read = read_live_sessions_reporting(&[acct.clone()], &live);
+        // Every live pid is a claude that started an hour before the files
+        // were written, so each may be its file's writer.
+        let before = now_secs() - 3600;
+        let snap = snapshot_of(&[
+            (2804, "claude.exe", before),
+            (9999, "claude.exe", before),
+            (7777, "claude", before),
+            (6666, "claude.exe", before),
+        ]);
+        let live = live_pids_from_snapshot(&snap).unwrap();
+        let claude_starts = live_claude_starts_from_snapshot(&snap);
+        let read = read_live_sessions_reporting(&[acct.clone()], &live, &claude_starts);
         assert_eq!(read.sessions.len(), 1);
         assert_eq!(read.sessions[0].pid, 2804);
         let mut pids: Vec<Option<u32>> = read.unreadable.iter().map(|u| u.pid).collect();
@@ -765,7 +923,9 @@ mod tests {
         fs::create_dir_all(&bare).unwrap();
 
         let live: HashSet<u32> = [1].into_iter().collect();
-        let read = read_live_sessions_reporting(&[blocked.clone(), bare], &live);
+        // No claude is live: a directory failure is reported regardless,
+        // because no pid is known to judge it by.
+        let read = read_live_sessions_reporting(&[blocked.clone(), bare], &live, &HashMap::new());
         assert!(read.sessions.is_empty());
         assert_eq!(
             read.unreadable,
@@ -777,6 +937,176 @@ mod tests {
         let json = serde_json::to_value(&read.unreadable).unwrap();
         assert_eq!(json[0]["pid"], serde_json::Value::Null);
         assert!(json[0]["configDir"].is_string(), "camelCase on the wire");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Review r2 finding 1: a stale broken `<pid>.json` (the operator's box
+    /// held a 0-byte `58008.json` from 2026-08-31) must not turn every
+    /// liveness read UNKNOWN just because some process now has that pid.
+    /// Through the snapshot, end to end: a pid held by a process that is not
+    /// claude is never reported; the same file under a claude that started
+    /// before its last write is.
+    #[test]
+    fn a_stale_broken_file_whose_pid_a_non_claude_now_holds_is_not_reported() {
+        let root = tmpdir("reused-by-explorer");
+        let acct = root.join(".claude-paktis");
+        fs::write(acct.join("sessions").join("58008.json"), "").unwrap();
+        let before = now_secs() - 3600;
+
+        let reused = snapshot_of(&[
+            (58008, "explorer.exe", before),
+            (2804, "claude.exe", before),
+        ]);
+        let live = live_pids_from_snapshot(&reused).unwrap();
+        assert!(live.contains(&58008), "the pid IS live, just not a claude");
+        let read = read_live_sessions_reporting(
+            &[acct.clone()],
+            &live,
+            &live_claude_starts_from_snapshot(&reused),
+        );
+        assert!(read.sessions.is_empty());
+        assert!(
+            read.unreadable.is_empty(),
+            "a non-claude process cannot have written a registry file: {:?}",
+            read.unreadable
+        );
+
+        // Control: the same file under a live claude that predates it IS a
+        // live session nobody can name.
+        let held = snapshot_of(&[(58008, "claude.exe", before)]);
+        let read = read_live_sessions_reporting(
+            &[acct.clone()],
+            &live_pids_from_snapshot(&held).unwrap(),
+            &live_claude_starts_from_snapshot(&held),
+        );
+        assert_eq!(
+            read.unreadable.iter().map(|u| u.pid).collect::<Vec<_>>(),
+            vec![Some(58008)]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Review r2 finding 1: a claude that started AFTER a broken file's last
+    /// write did not write it — the file is a dead process's leftover on a
+    /// recycled pid — so it is not reported. One that started before (or
+    /// within the skew allowance) may have written it, and is.
+    #[test]
+    fn a_broken_file_is_reported_only_under_a_claude_that_started_before_its_last_write() {
+        let root = tmpdir("writer-check");
+        let acct = root.join(".claude-paktis");
+        let file = acct.join("sessions").join("58008.json");
+        fs::write(&file, "").unwrap();
+        let written_secs = modified_unix_millis(&file).expect("the fs reports an mtime") / 1000;
+        let reported = |started_secs: i64| {
+            let snap = snapshot_of(&[(58008, "claude.exe", started_secs)]);
+            let live = live_pids_from_snapshot(&snap).unwrap();
+            let starts = live_claude_starts_from_snapshot(&snap);
+            let read = read_live_sessions_reporting(&[acct.clone()], &live, &starts);
+            read.unreadable.iter().map(|u| u.pid).collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            reported(written_secs + 3600),
+            Vec::<Option<u32>>::new(),
+            "started after"
+        );
+        assert_eq!(
+            reported(written_secs - 3600),
+            vec![Some(58008)],
+            "started before"
+        );
+        assert_eq!(reported(written_secs), vec![Some(58008)], "same second");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The writer check's edges, pure: no live claude on the pid → false; an
+    /// unknown start time or an unknown modification time cannot rule the
+    /// claude out → true; the skew allowance is inclusive.
+    #[test]
+    fn may_hide_a_live_session_fails_closed_on_what_it_cannot_know() {
+        let starts: HashMap<u32, i64> = [(1, 100), (2, 0)].into_iter().collect();
+        let last_write = 100_000 - PID_REUSE_SKEW_MS; // start (100 s) at the skew's edge
+        assert!(
+            !may_hide_a_live_session(3, Some(last_write), &starts),
+            "no claude"
+        );
+        assert!(
+            may_hide_a_live_session(2, Some(last_write), &starts),
+            "start unknown"
+        );
+        assert!(may_hide_a_live_session(1, None, &starts), "mtime unknown");
+        assert!(
+            may_hide_a_live_session(1, Some(last_write), &starts),
+            "within the skew"
+        );
+        assert!(
+            !may_hide_a_live_session(1, Some(last_write - 1), &starts),
+            "after the write"
+        );
+    }
+
+    /// Only countable claude images enter the writer check, each with its
+    /// snapshot start time (`0` when the snapshot has none).
+    #[test]
+    fn live_claude_starts_keeps_only_claude_processes() {
+        let mut snap = snapshot_of(&[
+            (10, "claude.exe", 5),
+            (11, "explorer.exe", 6),
+            (12, "claude", 7),
+        ]);
+        snap.names.insert(13, "claude.exe".to_string()); // no creation time
+        let starts = live_claude_starts_from_snapshot(&snap);
+        let expected: HashMap<u32, i64> = [(10, 5), (12, 7), (13, 0)].into_iter().collect();
+        assert_eq!(starts, expected);
+    }
+
+    /// A read that catches Claude Code mid-write is re-read once, and a file
+    /// that parses the second time is an ordinary row — not an UNKNOWN. The
+    /// wait runs only when a file is reportable, so a clean read and the
+    /// display reader never pay it.
+    #[test]
+    fn a_live_file_that_parses_on_the_re_read_is_a_row_not_an_unknown() {
+        let root = tmpdir("reread");
+        let acct = root.join(".claude-paktis");
+        let file = acct.join("sessions").join("2804.json");
+        fs::write(&file, "").unwrap(); // caught between truncate and write
+        let snap = snapshot_of(&[(2804, "claude.exe", now_secs() - 3600)]);
+        let live = live_pids_from_snapshot(&snap).unwrap();
+        let starts = live_claude_starts_from_snapshot(&snap);
+
+        let settles = std::cell::Cell::new(0);
+        let read = scan_registry(&[acct.clone()], &live, &starts, &|| {
+            settles.set(settles.get() + 1);
+            fs::write(&file, SAMPLE).unwrap(); // the write lands
+        });
+        assert_eq!(settles.get(), 1);
+        assert!(read.unreadable.is_empty(), "{:?}", read.unreadable);
+        assert_eq!(read.sessions.len(), 1);
+        assert_eq!(read.sessions[0].pid, 2804);
+
+        // Still broken on the re-read: reported.
+        fs::write(&file, "").unwrap();
+        let read = scan_registry(&[acct.clone()], &live, &starts, &|| {
+            settles.set(settles.get() + 1)
+        });
+        assert_eq!(settles.get(), 2);
+        assert_eq!(
+            read.unreadable.iter().map(|u| u.pid).collect::<Vec<_>>(),
+            vec![Some(2804)]
+        );
+
+        // Nothing reportable: no wait. A clean read, then the display reader's
+        // empty start map over the broken file.
+        fs::write(&file, SAMPLE).unwrap();
+        scan_registry(&[acct.clone()], &live, &starts, &|| {
+            settles.set(settles.get() + 1)
+        });
+        fs::write(&file, "").unwrap();
+        let read = scan_registry(&[acct], &live, &HashMap::new(), &|| {
+            settles.set(settles.get() + 1)
+        });
+        assert_eq!(settles.get(), 2, "no reportable file, no wait");
+        assert!(read.unreadable.is_empty());
         let _ = fs::remove_dir_all(&root);
     }
 

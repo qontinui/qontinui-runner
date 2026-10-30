@@ -30,12 +30,15 @@ import {
   decideClickResume,
   describeHolder,
   forkTabTitle,
+  GATE_LIVENESS_READ_TIMEOUT_MS,
   goToHolderPane,
   isResumeInFlight,
   outcomeOfFailedAttempt,
   paneHolderOf,
+  readLiveWithin,
   RESUME_IN_FLIGHT_GRACE_MS,
   runBulkResume,
+  runClaimedRestoreResume,
   runClaimedResume,
   runClickResume,
   runGatedRetry,
@@ -44,6 +47,7 @@ import {
   type ResumeGateChoice,
   type ResumeGatePrompt,
   type ResumeOutcome,
+  type RestoreDecision,
 } from "./resumeGate";
 import type { ResumeAttempt, ResumeTarget } from "./resumeInNewTab";
 import type { RevealableZoneLayout } from "./tabReveal";
@@ -732,6 +736,183 @@ describe("resumes in flight (review M3)", () => {
     );
     await runClaimedResume(target, refused);
     expect(isResumeInFlight(ID), "no tab: released at once").toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+/** A liveness read that never answers. */
+const hungRead = (): Promise<LiveClaudeSession[] | null> => new Promise(() => {});
+
+describe("a liveness read that never answers (review r2 finding 2)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("readLiveWithin: an answer passes through; a throw, and no answer in time, are UNKNOWN (null)", async () => {
+    vi.useFakeTimers();
+    await expect(readLiveWithin(async () => [row()])).resolves.toEqual([row()]);
+    await expect(readLiveWithin(async () => null)).resolves.toBeNull();
+    await expect(
+      readLiveWithin(async () => {
+        throw new Error("ipc");
+      }),
+    ).resolves.toBeNull();
+
+    let settled: LiveClaudeSession[] | null | "pending" = "pending";
+    void readLiveWithin(hungRead).then((v) => (settled = v));
+    await vi.advanceTimersByTimeAsync(GATE_LIVENESS_READ_TIMEOUT_MS - 1);
+    expect(settled).toBe("pending");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(settled).toBeNull();
+  });
+
+  it("a bulk item whose read hangs is skipped-unknown, and its claim released", async () => {
+    vi.useFakeTimers();
+    const d = clickDeps([], { readLive: hungRead });
+    const outcome = runClickResume(d, target, { interactive: false });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(isResumeInFlight(ID)).toBe(true);
+    await vi.advanceTimersByTimeAsync(GATE_LIVENESS_READ_TIMEOUT_MS);
+    await expect(outcome).resolves.toBe("skipped-unknown");
+    expect(d.start).not.toHaveBeenCalled();
+    expect(isResumeInFlight(ID)).toBe(false);
+  });
+
+  it("a click whose read hangs opens the UNKNOWN dialog (D2), and its answer releases the claim", async () => {
+    vi.useFakeTimers();
+    const d = clickDeps([], { readLive: hungRead });
+    const outcome = runClickResume(d, target);
+    await vi.advanceTimersByTimeAsync(GATE_LIVENESS_READ_TIMEOUT_MS);
+    expect(d.ask).toHaveBeenCalledTimes(1);
+    expect(d.ask.mock.calls[0][0]).toMatchObject({ kind: "unknown", holders: [] });
+    await expect(outcome).resolves.toBe("cancelled");
+    expect(d.start).not.toHaveBeenCalled();
+    expect(isResumeInFlight(ID)).toBe(false);
+  });
+
+  it("the restore-failed Retry's read is bounded the same way", async () => {
+    vi.useFakeTimers();
+    const ask = vi.fn(async (): Promise<ResumeGateChoice> => "cancel");
+    const retry = vi.fn(async (): Promise<"verified" | "failed"> => "verified");
+    const outcome = runGatedRetry(
+      { readLive: hungRead, ask, retry },
+      { tabId: "t", claudeSessionId: ID },
+    );
+    await vi.advanceTimersByTimeAsync(GATE_LIVENESS_READ_TIMEOUT_MS);
+    await expect(outcome).resolves.toBe("cancelled");
+    expect(ask.mock.calls[0][0]).toMatchObject({ kind: "unknown" });
+    expect(retry).not.toHaveBeenCalled();
+    expect(isResumeInFlight(ID)).toBe(false);
+  });
+});
+
+describe("the click's 'checking…' acknowledgement ends with the check (review r2 finding 4)", () => {
+  it("onChecked runs after the read and before the resume or the dialog — never for a bulk item", async () => {
+    const order: string[] = [];
+    const deps = (rows: LiveClaudeSession[] | null): ClickResumeDeps => ({
+      readLive: async () => {
+        order.push("read");
+        return rows;
+      },
+      start: async (): Promise<ResumeAttempt> => {
+        order.push("start");
+        return { kind: "verified", tabId: "t" };
+      },
+      ask: async (): Promise<ResumeGateChoice> => {
+        order.push("ask");
+        return "cancel";
+      },
+      onChecking: () => order.push("checking"),
+      onChecked: () => order.push("checked"),
+    });
+    await runClickResume(deps([]), target);
+    expect(order).toEqual(["checking", "read", "checked", "start"]);
+
+    clearResumesInFlight();
+    order.length = 0;
+    await runClickResume(deps([row()]), target);
+    expect(order).toEqual(["checking", "read", "checked", "ask"]);
+
+    clearResumesInFlight();
+    order.length = 0;
+    await runClickResume(deps([]), target, { interactive: false });
+    expect(order).toEqual(["read", "start"]);
+  });
+});
+
+describe("runClaimedRestoreResume — the automatic restores take the claim (review r2 finding 3)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("a held claim skips the record as alive (in flight): nothing is read or typed", async () => {
+    const held = claimResume(ID)!;
+    const decide = vi.fn(async (): Promise<RestoreDecision> => "respawn");
+    const type = vi.fn(async () => {});
+    await expect(runClaimedRestoreResume(ID, decide, type)).resolves.toEqual({
+      kind: "skip-alive",
+      inFlight: true,
+    });
+    expect(decide).not.toHaveBeenCalled();
+    expect(type).not.toHaveBeenCalled();
+    held.release();
+  });
+
+  it("respawn: the claim is held while typing and for the grace after, then released", async () => {
+    vi.useFakeTimers();
+    const typed = deferred<void>();
+    const result = await runClaimedRestoreResume(
+      ID,
+      async () => "respawn",
+      () => typed.promise,
+    );
+    expect(result.kind).toBe("typing");
+    // A click now finds the id in flight instead of reading it free.
+    expect(claimResume(ID)).toBeNull();
+    typed.resolve();
+    if (result.kind === "typing") await result.settled;
+    expect(isResumeInFlight(ID), "the grace").toBe(true);
+    await vi.advanceTimersByTimeAsync(RESUME_IN_FLIGHT_GRACE_MS);
+    expect(isResumeInFlight(ID)).toBe(false);
+  });
+
+  it("a skip verdict releases at once; a type that throws keeps the grace and never rejects", async () => {
+    vi.useFakeTimers();
+    for (const verdict of ["skip-alive", "skip-unknown"] as const) {
+      const type = vi.fn(async () => {});
+      const r = await runClaimedRestoreResume(ID, async () => verdict, type);
+      expect(r.kind).toBe(verdict);
+      expect(type).not.toHaveBeenCalled();
+      expect(isResumeInFlight(ID)).toBe(false);
+    }
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const r = await runClaimedRestoreResume(
+      ID,
+      async () => "respawn",
+      async () => {
+        throw new Error("ipc");
+      },
+    );
+    expect(r.kind).toBe("typing");
+    if (r.kind === "typing") await expect(r.settled).resolves.toBeUndefined();
+    expect(isResumeInFlight(ID)).toBe(true);
+    await vi.advanceTimersByTimeAsync(RESUME_IN_FLIGHT_GRACE_MS);
+    expect(isResumeInFlight(ID)).toBe(false);
+    warn.mockRestore();
+  });
+
+  it("a liveness read that throws releases the claim and rethrows", async () => {
+    await expect(
+      runClaimedRestoreResume(
+        ID,
+        async () => {
+          throw new Error("read");
+        },
+        async () => {},
+      ),
+    ).rejects.toThrow("read");
+    expect(isResumeInFlight(ID)).toBe(false);
   });
 });
 
