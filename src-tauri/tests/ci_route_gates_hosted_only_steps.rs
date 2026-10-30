@@ -64,14 +64,20 @@ const ROUTED: [&str; 2] = ["test", "clippy-windows"];
 /// reads machine-wide counters it would misattribute to the job.
 const MUST_BE_HOSTED: &[(&str, &str)] = &[
     ("test", "Setup Rust"),
-    ("test", "Configure pagefile (Windows — guard against link-time OOM)"),
+    (
+        "test",
+        "Configure pagefile (Windows — guard against link-time OOM)",
+    ),
     ("test", "Cache Rust dependencies"),
     ("test", "Poison ambient state"),
     ("test", "Windows memory peak after the Rust test steps"),
     ("test", "Unpoison ambient state"),
     ("test", "SDK↔runner contract smoke (direct-exe)"),
     ("clippy-windows", "Setup Rust"),
-    ("clippy-windows", "Configure pagefile (Windows — guard against link-time OOM)"),
+    (
+        "clippy-windows",
+        "Configure pagefile (Windows — guard against link-time OOM)",
+    ),
     ("clippy-windows", "Cache Rust dependencies"),
 ];
 
@@ -312,7 +318,9 @@ fn every_step_a_self_hosted_leg_runs_is_gated_or_allowlisted() {
                 continue;
             }
             assert!(
-                SELF_HOSTED_SAFE.iter().any(|(j, k, _)| *j == name && *k == key),
+                SELF_HOSTED_SAFE
+                    .iter()
+                    .any(|(j, k, _)| *j == name && *k == key),
                 "job `{name}` step `{key}` runs on a rerouted self-hosted leg (`if: {cond}`) \
                  but is neither gated on `{HOSTED_ONLY}` nor listed in SELF_HOSTED_SAFE with \
                  why it leaves the machine alone"
@@ -346,14 +354,23 @@ fn every_step_a_self_hosted_leg_runs_is_gated_or_allowlisted() {
 fn the_unpoison_step_always_runs_and_removes_only_what_the_poison_created() {
     let doc = ci_workflow();
     let s = steps(job(&doc, "test"));
-    let poison = s.iter().find(|x| step_key(x) == "Poison ambient state").unwrap();
-    let unpoison = s.iter().find(|x| step_key(x) == "Unpoison ambient state").unwrap();
+    let poison = s
+        .iter()
+        .find(|x| step_key(x) == "Poison ambient state")
+        .unwrap();
+    let unpoison = s
+        .iter()
+        .find(|x| step_key(x) == "Unpoison ambient state")
+        .unwrap();
     assert!(str_of(unpoison, "if").contains("always()"));
     let p = str_of(poison, "run");
     assert!(p.contains("poison-created-files") && p.contains("refusing to overwrite"));
     let u = str_of(unpoison, "run");
     assert!(u.contains("poison-created-files"));
-    assert!(!u.contains("rm -rf"), "unpoison removes recorded files by name only");
+    assert!(
+        !u.contains("rm -rf"),
+        "unpoison removes recorded files by name only"
+    );
 }
 
 #[test]
@@ -368,7 +385,12 @@ fn a_self_hosted_leg_sandboxes_the_config_dirs_before_the_rust_build() {
     let sandbox = &s[pos("Sandbox the runner config dirs (self-hosted)")];
     assert!(str_of(sandbox, "if").contains(SELF_HOSTED_ONLY));
     let run = str_of(sandbox, "run");
-    for var in ["QONTINUI_CONFIG_DIR", "QONTINUI_SECURE_STORAGE_DIR", "RUNNER_TEMP", "GITHUB_ENV"] {
+    for var in [
+        "QONTINUI_CONFIG_DIR",
+        "QONTINUI_SECURE_STORAGE_DIR",
+        "RUNNER_TEMP",
+        "GITHUB_ENV",
+    ] {
         assert!(run.contains(var), "{var}");
     }
     assert!(pos("Sandbox the runner config dirs (self-hosted)") < pos("Build Rust tests"));
