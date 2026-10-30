@@ -192,6 +192,12 @@ pub enum RespawnError {
     /// coord row stays pending and the next push/catch-up retries it.
     #[error("deferred by the coord device drain: {0}")]
     DeferredByDrain(String),
+    /// The unattended spawn gate deferred this respawn (the machine reads WARN
+    /// or CRITICAL, or another unattended spawn holds the pace slot). Not a
+    /// failure: the durable coord row stays pending and the next catch-up
+    /// retries it.
+    #[error("deferred by the unattended spawn gate: {0}")]
+    DeferredByMachineLoad(String),
     #[error(transparent)]
     Coord(#[from] HandoffError),
 }
@@ -345,6 +351,16 @@ async fn materialize_logged(
                 source = %respawn.source_session_id,
                 terminal = %terminal_id,
                 "session respawn: resumed session is live"
+            );
+        }
+        // A deferral by the unattended spawn gate is not a refusal: the machine
+        // is loaded (or busy) and the pending row replays on the next catch-up.
+        Err(e @ RespawnError::DeferredByMachineLoad(_)) => {
+            tracing::info!(
+                source = %respawn.source_session_id,
+                error = %e,
+                "session respawn deferred by the unattended spawn gate — nothing was launched; \
+                 the durable coord row replays on the next catch-up"
             );
         }
         Err(e) => {
@@ -686,6 +702,17 @@ async fn materialize(
     {
         return Err(RespawnError::DeferredByDrain(reason));
     }
+    //    The unattended spawn gate's load-only pre-check (plan 2026-10-28-runner-
+    //    spawn-bursts-overwhelm-the-box, D1): on a loaded machine the gate below
+    //    would only defer, so defer now — before the coord fetch and the transcript
+    //    copy, and claiming no slot. The pending row replays on the next catch-up.
+    if let Err(loaded) = crate::unattended_spawn_gate::load_precheck(
+        crate::coord_drain_state::SpawnOrigin::Respawn,
+        "respawned session",
+        &format!("respawn:{}", respawn.source_session_id),
+    ) {
+        return Err(RespawnError::DeferredByMachineLoad(loaded.reason));
+    }
 
     // 1. The id being resumed. An explicit null is UNKNOWN — refuse.
     let claude_session_id = respawn
@@ -750,8 +777,36 @@ async fn materialize(
     //    attempt that refuses at step 1–4 would let three failed reconnects
     //    lock a legitimate respawn out for 24 hours. Only a respawn that
     //    actually launches spends the budget.
+    //
+    //    The unattended spawn gate (plan 2026-10-28-runner-spawn-bursts-overwhelm-
+    //    the-box, D1) comes first, so a deferral spends no budget slot. This runs
+    //    INLINE on the handoff receiver's `/ws` read loop, so it never HOLDS — a
+    //    hold would stop the socket being read. It waits inline at most one pace
+    //    slot (bounded, and what lets several pending respawns in one catch-up pass
+    //    drain at one per spacing) and otherwise defers, as the drain arm above
+    //    does: the pending row replays on the next catch-up tick, and the key keeps
+    //    its place in the gate's queue for that retry.
+    //
+    //    The drain is NOT read again after the gate. A respawn carries a lineage
+    //    coord already admitted (its durable respawn row), and such work runs
+    //    through coord's drain (round-3 review B1): the drain arm at the top is
+    //    this door's dispatch filter, and the gate waits at most one pace slot.
+    let released = match crate::unattended_spawn_gate::admit_or_defer(
+        crate::coord_drain_state::SpawnOrigin::Respawn,
+        "respawned session",
+        &format!("respawn:{}", respawn.source_session_id),
+        crate::unattended_spawn_gate::UNATTENDED_SPAWN_SPACING,
+    )
+    .await
+    {
+        Ok(released) => released,
+        Err(loaded) => return Err(RespawnError::DeferredByMachineLoad(loaded.reason)),
+    };
     let now_ms = chrono::Utc::now().timestamp_millis();
     if !crate::terminal::account_migration::migration_cap_permits(&claude_session_id, now_ms) {
+        // Refused after the gate released: give the slot back, so the next
+        // unattended spawn is not paced behind a PTY that never opened.
+        released.refund();
         return Err(RespawnError::CapReached {
             session: claude_session_id,
             cap: crate::terminal::account_migration::MIGRATION_CAP,
@@ -810,7 +865,12 @@ async fn materialize(
             gate_identity: None,
         },
     )
-    .map_err(RespawnError::Spawn)?;
+    .map_err(|e| {
+        // No pane opened (the seam's CRITICAL refusal after a `hold_deadline`
+        // release among the causes): give the gate's slot back.
+        released.refund();
+        RespawnError::Spawn(e)
+    })?;
 
     // 7. Re-acquire held claims under this device — idempotent by
     //    resource_key, best-effort, exactly as the handoff receiver does.

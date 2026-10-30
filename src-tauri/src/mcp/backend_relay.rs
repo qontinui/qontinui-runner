@@ -5548,22 +5548,38 @@ fn relay_create_drain_message(reason: &str) -> String {
     format!("{state} — this remote terminal create was refused, not queued; nothing was spawned")
 }
 
+/// Who a relay terminal create comes from, for the unattended spawn gate. A
+/// frame with no `remote` block is the operator-web / mobile path — a person at
+/// the app, which the gate never paces or holds; one carrying a block is a
+/// REMOTE create on another machine's behalf, whose reason this runner cannot
+/// name (`Unknown`, autonomous). The predicate is the one the grant gate uses
+/// (`remote_terminal::granted_create_edit_sibling_refusal`). The device drain
+/// keeps its own, stricter reading: every relay create is deferred there.
+fn relay_create_origin(data: &Value) -> crate::coord_drain_state::SpawnOrigin {
+    if data.get("remote").is_some_and(|block| !block.is_null()) {
+        crate::coord_drain_state::SpawnOrigin::Unknown
+    } else {
+        crate::coord_drain_state::SpawnOrigin::OperatorTerminal
+    }
+}
+
 async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
     // Coord device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
     // D3): a relay create — web, mobile or a remote runner — is a remote
     // dispatch, not an operator sitting at this runner, so it is deferred while
     // the device is drained or its drain state is unknown. Refused BEFORE the
     // grant gate below, so a deferral spends no create grant.
+    // Caller-supplied request id — BOUNDED (review N4).
+    let work_key = crate::coord_drain_state::bounded_work_key(
+        "relay_terminal",
+        data.get("request_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-"),
+    );
     if let crate::coord_drain_state::DrainGate::Defer { reason, class } =
         crate::coord_drain_state::drain_gate_for_work(
             crate::coord_drain_state::SpawnOrigin::Unknown,
-            // Caller-supplied request id — BOUNDED (review N4).
-            &crate::coord_drain_state::bounded_work_key(
-                "relay_terminal",
-                data.get("request_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("-"),
-            ),
+            &work_key,
         )
     {
         return Some(serde_json::json!({
@@ -5575,6 +5591,34 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             "request_id": data.get("request_id"),
         }));
     }
+    // Unattended spawn gate (plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box,
+    // D1). A request/reply door on the relay's bounded reply lane: decided ONCE,
+    // never held, and answered as the drain arm above answers — an error frame —
+    // with the code `machine_loaded` and `retry_after_ms`. Refused BEFORE the grant
+    // gate below, so a loaded machine spends no create grant either. A frame with
+    // no `remote` block is a person at the web or mobile app and passes untouched
+    // ([`relay_create_origin`]). The slot is committed immediately before the PTY
+    // create; a grant or edit-sibling refusal in between drops it, which refunds it.
+    let unattended_slot = match crate::unattended_spawn_gate::check_request(
+        relay_create_origin(data),
+        "remote terminal create",
+        &work_key,
+    ) {
+        Ok(slot) => slot,
+        Err(loaded) => {
+            return Some(serde_json::json!({
+                "type": "error",
+                "code": loaded.code(),
+                "message": format!(
+                    "{} — this remote terminal create was refused, not queued; nothing was \
+                     spawned",
+                    loaded.reason
+                ),
+                "retry_after_ms": loaded.retry_after_ms,
+                "request_id": data.get("request_id"),
+            }));
+        }
+    };
     // D2 — the TARGET chooses. A frame with no `remote` block is the
     // operator-web / mobile path and keeps its caller-chosen `working_dir`;
     // one carrying a block is a REMOTE create, and `admitted` holds the
@@ -5856,6 +5900,8 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
         let registration_dir = working_dir.clone();
         let registration_repo = effective_intent_repo.clone();
 
+        // The PTY opens next: keep the unattended gate's slot (paced to this moment).
+        unattended_slot.commit().await;
         match tm.create(
             title,
             working_dir,

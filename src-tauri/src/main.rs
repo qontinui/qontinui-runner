@@ -320,6 +320,7 @@ mod ui_bridge_plugin;
 mod ui_error;
 mod ui_ping;
 mod ui_thread_probe;
+mod unattended_spawn_gate; // Plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box Phase 2 — pace + hold unattended PTY spawns
 mod unified_ai_session;
 mod unified_workflow_executor;
 mod unified_workflows;

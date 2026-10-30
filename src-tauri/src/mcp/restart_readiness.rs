@@ -204,7 +204,7 @@ use qontinui_runner_lib::wind_down::{self, WindDownView};
 /// What the subtree cross-reference structurally cannot see. Emitted verbatim
 /// on every response so a reader is never invited to infer omniscience from a
 /// confident-looking count.
-pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree and in every PTY holder pane's process tree (see `holder_sessions`) — each process, so a nested subagent counts alongside the agent that spawned it (`nestedUnderClaude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `hasLiveChildren` is a hint that a child process is attached right now, never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `sessionStatus` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; `sessionStatusSince` is when coord's row entered that `sessionStatus` (coord's `state_started_at`, served as `since`), in unix MILLISECONDS — for `finished` it is coord's finish time, which a later finish moves again ONLY on a coord build carrying plan `2026-10-23-coord-records-a-session-finished-but-not-when-so-a-revival-cannot-be-told-from-a-re-finish` Phase 2 (an older coord moves it only when the status actually changes, so after a re-finish of a row coord still reads `finished` it can lag the runner's `finishedAt`) — and it is null wherever `sessionStatus` is null and wherever coord served no `since`, null meaning UNKNOWN, never \"now\"; it is coord's time BESIDE the runner's own `finishedAt` marker, never a replacement for it; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a wind-down eligibility report — THIS ENDPOINT closes nothing, but since Phase 4 the wind-down executor acts on the same verdict WHILE COORD HOLDS THIS DEVICE DRAINED, so an `eligible` here is a session the runner will graceful-`/exit` on its next 30 s tick if the drain is on; they are computed whether or not the runner is drained, the executor's own extra gates (the drain itself, a wall-clock-jump quarantine, and a per-tick close budget) are NOT reflected here, so `eligible` is a candidacy and never a prediction; and a grid-idle window is only as old as the first observation that saw the pane idle with no grid change since; `live_claude.by_activity` classifies the same `total` processes as working / idle / stale / unknown from the pane observation where decisive, else Claude Code's internal `sessions/<pid>.json` record (a `busy`/`shell` status is `working` only with a transcript message in the last 30 min, else `stale`) — it is REPORT-ONLY, the verdict never reads it, an `idle` session still dies on a restart, and a missing, unparseable, ambiguous or unrecognised record is `unknown`, never `idle`; `holder_sessions` adds what the PTY-holder census sees — a pane's `claude` is counted even when its holder has left this runner's subtree, a holder that holds its lock but does not answer within the census deadline is `unknown` and one with no common protocol version is `incompatible`, and each such PANE blocks a restart whatever processes it shows (`live_claude.holder_unresolved_panes`); a holder pane is NOT treated as surviving a restart";
+pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree and in every PTY holder pane's process tree (see `holder_sessions`) — each process, so a nested subagent counts alongside the agent that spawned it (`nestedUnderClaude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `hasLiveChildren` is a hint that a child process is attached right now, never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `sessionStatus` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; `sessionStatusSince` is when coord's row entered that `sessionStatus` (coord's `state_started_at`, served as `since`), in unix MILLISECONDS — for `finished` it is coord's finish time, which a later finish moves again ONLY on a coord build carrying plan `2026-10-23-coord-records-a-session-finished-but-not-when-so-a-revival-cannot-be-told-from-a-re-finish` Phase 2 (an older coord moves it only when the status actually changes, so after a re-finish of a row coord still reads `finished` it can lag the runner's `finishedAt`) — and it is null wherever `sessionStatus` is null and wherever coord served no `since`, null meaning UNKNOWN, never \"now\"; it is coord's time BESIDE the runner's own `finishedAt` marker, never a replacement for it; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a wind-down eligibility report — THIS ENDPOINT closes nothing, but since Phase 4 the wind-down executor acts on the same verdict WHILE COORD HOLDS THIS DEVICE DRAINED, so an `eligible` here is a session the runner will graceful-`/exit` on its next 30 s tick if the drain is on; they are computed whether or not the runner is drained, the executor's own extra gates (the drain itself, a wall-clock-jump quarantine, and a per-tick close budget) are NOT reflected here, so `eligible` is a candidacy and never a prediction; and a grid-idle window is only as old as the first observation that saw the pane idle with no grid change since; `live_claude.by_activity` classifies the same `total` processes as working / idle / stale / unknown from the pane observation where decisive, else Claude Code's internal `sessions/<pid>.json` record (a `busy`/`shell` status is `working` only with a transcript message in the last 30 min, else `stale`) — it is REPORT-ONLY, the verdict never reads it, an `idle` session still dies on a restart, and a missing, unparseable, ambiguous or unrecognised record is `unknown`, never `idle`; `holder_sessions` adds what the PTY-holder census sees — a pane's `claude` is counted even when its holder has left this runner's subtree, a holder that holds its lock but does not answer within the census deadline is `unknown` and one with no common protocol version is `incompatible`, and each such PANE blocks a restart whatever processes it shows (`live_claude.holder_unresolved_panes`); a holder pane is NOT treated as surviving a restart; `unattendedGateHeld` counts unattended spawns waiting inside the unattended spawn gate right now, held for load or for their pace slot (nothing waits there for coord's drain: every site reads the drain before the gate, and work coord already dispatched runs through a drain that arms while it waits) — work waiting to spawn (a continuation already holds its coord claim and often a worktree) that is not a session yet and so appears in no plane above — and blocks a restart while it is above 0";
 
 /// `drain.covers` — the constant, honest scope of `POST /drain`.
 ///
@@ -547,6 +547,17 @@ pub struct RestartReadiness {
     /// `0`.
     #[serde(rename = "windDownCandidates")]
     pub wind_down_candidates: Option<usize>,
+    /// Unattended spawns waiting inside the unattended spawn gate right now
+    /// (plan `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`,
+    /// Phase 2): held for load or for their pace slot — never for coord's drain,
+    /// which every site reads before the gate and which dispatched work runs
+    /// through.
+    /// Each is work waiting to spawn (a continuation already holds its coord
+    /// claim and often a worktree) that is not a session yet, so no plane above
+    /// counts it, and a restart drops it before it spawns. Blocks the verdict
+    /// while above 0 ([`fold_unattended_gate`]).
+    #[serde(rename = "unattendedGateHeld")]
+    pub unattended_gate_held: usize,
     pub boundary: &'static str,
 }
 
@@ -1015,6 +1026,7 @@ pub fn build_verdict(
             census,
             session_status_source: status_source,
             wind_down_candidates,
+            unattended_gate_held: 0,
             boundary: BOUNDARY,
         };
     }
@@ -1191,8 +1203,36 @@ pub fn build_verdict(
         census,
         session_status_source: status_source,
         wind_down_candidates,
+        unattended_gate_held: 0,
         boundary: BOUNDARY,
     }
+}
+
+/// Fold the unattended spawn gate's held work into a verdict: `held` spawns
+/// waiting inside the gate are live work no plane counts (see
+/// [`RestartReadiness::unattended_gate_held`]), so any of them makes the
+/// verdict unsafe, named in `reason`. PURE; `held == 0` changes nothing but the
+/// reported count.
+pub fn fold_unattended_gate(mut readiness: RestartReadiness, held: usize) -> RestartReadiness {
+    readiness.unattended_gate_held = held;
+    if held == 0 {
+        return readiness;
+    }
+    let clause = format!(
+        "{held} unattended spawn{} {} waiting in the unattended spawn gate (held for load or \
+         its pace slot) — work waiting to spawn (a continuation already holds its coord claim \
+         and often a worktree) that is not a session yet, so a restart drops it before it \
+         spawns; see `unattendedGateHeld`",
+        if held == 1 { "" } else { "s" },
+        if held == 1 { "is" } else { "are" },
+    );
+    readiness.reason = if readiness.safe_to_restart {
+        clause
+    } else {
+        format!("{}; {clause}", readiness.reason)
+    };
+    readiness.safe_to_restart = false;
+    readiness
 }
 
 /// Whether the AI/task-run plane may be reported this request, given
@@ -1434,16 +1474,19 @@ pub async fn restart_readiness_handler(
 
     let census = census_info(tracking_health::latest().as_ref(), now_ms);
 
-    Json(build_verdict(
-        terminal,
-        headless,
-        holder,
-        ai,
-        totals,
-        unknowns,
-        drain,
-        census,
-        status_source,
+    Json(fold_unattended_gate(
+        build_verdict(
+            terminal,
+            headless,
+            holder,
+            ai,
+            totals,
+            unknowns,
+            drain,
+            census,
+            status_source,
+        ),
+        crate::unattended_spawn_gate::held_now(),
     ))
 }
 
@@ -1773,6 +1816,163 @@ mod tests {
             None
         );
         assert_eq!(v.ai_sessions.as_ref().unwrap().count, 0);
+    }
+
+    /// Round-3 review B1 (with round-4 W1): under an armed coord drain nothing
+    /// waits in the unattended spawn gate FOR the drain. Every site reads the
+    /// drain before its gate call, so drain-deferred work never enters the gate,
+    /// and work coord already dispatched — a continuation, a condition check —
+    /// runs through a drain that arms while it waits. A remembered deferral is
+    /// not waiting either. So once the only gate entries left were deferred, the
+    /// verdict is safe; parking dispatched work in the queue for the drain would
+    /// keep it unsafe until the drain lifted.
+    #[tokio::test(start_paused = true)]
+    async fn readiness_is_safe_once_the_only_gate_entries_left_were_drain_deferred() {
+        use crate::coord_drain_state::{CoordDrainState, SpawnOrigin};
+        use crate::resource_guard::SpawnGate;
+        use crate::unattended_spawn_gate::{
+            admit_or_defer_with, admit_with, GateConfig, GateState,
+        };
+        use std::sync::Arc;
+
+        let gate = Arc::new(GateState::new());
+        // A respawn deferred earlier for load: remembered, not waiting.
+        let respawn = admit_or_defer_with(
+            SpawnOrigin::Respawn,
+            "respawned session",
+            "respawn:1",
+            std::time::Duration::ZERO,
+            &GateConfig::DEFAULT,
+            || {
+                SpawnGate::Warn(crate::resource_guard::GateObservation {
+                    lane: "threads".to_string(),
+                    metric: crate::resource_guard::LaneMetric::ThreadCount,
+                    observed: 262,
+                    limit: 256,
+                })
+            },
+            &gate,
+        )
+        .await;
+        assert!(respawn.is_err(), "fixture: the respawn deferred");
+        // A continuation and a condition check, admitted while the drain reads
+        // deferring.
+        let admitted: Vec<_> = [
+            (SpawnOrigin::GateContinuation, "gate:1"),
+            (SpawnOrigin::CoordDispatch, "condition_run:1"),
+        ]
+        .into_iter()
+        .map(|(origin, key)| {
+            let gate = gate.clone();
+            tokio::spawn(async move {
+                admit_with(
+                    origin,
+                    "unattended terminal",
+                    key,
+                    &GateConfig::DEFAULT,
+                    || SpawnGate::Proceed,
+                    || Some("coord has drained this device".to_string()),
+                    &gate,
+                )
+                .await
+            })
+        })
+        .collect();
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let held = gate.held();
+        for task in admitted {
+            task.abort();
+        }
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let drain = DrainInfo {
+            coord_drain: crate::coord_drain_state::snapshot_fixture(&CoordDrainState::Drained {
+                until: None,
+                reason: Some("rebuild".into()),
+            }),
+            ..idle_drain()
+        };
+        let v = fold_unattended_gate(
+            verdict_from(
+                &empty_report(now_ms),
+                &[],
+                Some(ai_plane_from(&[], &[], now_ms)),
+                vec![],
+                drain,
+                fresh_census(now_ms),
+                now_ms,
+            ),
+            held,
+        );
+        assert_eq!(v.unattended_gate_held, 0, "nothing waits for the drain");
+        assert!(v.safe_to_restart, "{}", v.reason);
+    }
+
+    /// Round-3 N1: a continuation waiting inside the unattended spawn gate holds
+    /// a coord claim (often a worktree) and is not a session yet, so no plane
+    /// sees it. An otherwise idle runner with work held in the gate is UNSAFE,
+    /// with the count reported and named; an empty gate leaves the verdict alone.
+    #[test]
+    fn work_held_in_the_unattended_spawn_gate_blocks_a_restart() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let idle = || {
+            verdict_from(
+                &empty_report(now_ms),
+                &[],
+                Some(ai_plane_from(&[], &[], now_ms)),
+                vec![],
+                idle_drain(),
+                fresh_census(now_ms),
+                now_ms,
+            )
+        };
+        assert!(
+            idle().safe_to_restart,
+            "fixture: the runner is otherwise idle"
+        );
+
+        let held = fold_unattended_gate(idle(), 2);
+        assert!(!held.safe_to_restart, "{held:?}");
+        assert_eq!(held.unattended_gate_held, 2);
+        assert!(
+            held.reason
+                .starts_with("2 unattended spawns are waiting in the unattended spawn gate"),
+            "{}",
+            held.reason
+        );
+        let json = serde_json::to_value(&held).expect("serializes");
+        assert_eq!(json["unattendedGateHeld"], 2);
+        assert_eq!(json["safe_to_restart"], false);
+
+        // An already-unsafe verdict keeps its own reason and gains the clause.
+        let unknown = build_verdict(
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec!["the terminal-session plane could not be determined".to_string()],
+            idle_drain(),
+            fresh_census(now_ms),
+            clean_status_source(),
+        );
+        let both = fold_unattended_gate(unknown, 1);
+        assert!(
+            both.reason.starts_with("UNKNOWN, so treated as unsafe"),
+            "{}",
+            both.reason
+        );
+        assert!(
+            both.reason.contains("; 1 unattended spawn is waiting"),
+            "{}",
+            both.reason
+        );
+
+        // Nothing held: the verdict is untouched apart from the reported 0.
+        let empty = fold_unattended_gate(idle(), 0);
+        assert!(empty.safe_to_restart);
+        assert_eq!(empty.reason, "no live agent sessions in any plane");
+        assert_eq!(empty.unattended_gate_held, 0);
     }
 
     /// Fail-closed: an unreadable process table (empty `parent_map`) is the

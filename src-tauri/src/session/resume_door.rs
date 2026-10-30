@@ -134,6 +134,10 @@ pub struct ResumeRow {
     /// What the process read observed (only on `resumed`, or on a `failed`
     /// that got far enough to observe something).
     pub evidence: Option<ProcessEvidence>,
+    /// On a `skipped(machine_loaded: …)` row only: when to retry, from the
+    /// unattended spawn gate (its next pace slot or its re-probe interval).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
 }
 
 impl ResumeRow {
@@ -144,6 +148,7 @@ impl ResumeRow {
             reason: None,
             verdict: "resumed".to_string(),
             evidence: Some(evidence),
+            retry_after_ms: None,
         }
     }
     fn failed(id: &str, reason: impl Into<String>, evidence: Option<ProcessEvidence>) -> Self {
@@ -154,6 +159,7 @@ impl ResumeRow {
             verdict: format!("failed({reason})"),
             reason: Some(reason),
             evidence,
+            retry_after_ms: None,
         }
     }
     fn skipped(id: &str, reason: impl Into<String>) -> Self {
@@ -164,6 +170,14 @@ impl ResumeRow {
             verdict: format!("skipped({reason})"),
             reason: Some(reason),
             evidence: None,
+            retry_after_ms: None,
+        }
+    }
+    /// A `skipped(machine_loaded: …)` row carrying the gate's retry hint.
+    fn deferred(id: &str, loaded: &crate::unattended_spawn_gate::MachineLoaded) -> Self {
+        Self {
+            retry_after_ms: Some(loaded.retry_after_ms),
+            ..Self::skipped(id, format!("machine_loaded: {}", loaded.reason))
         }
     }
 }
@@ -587,6 +601,10 @@ async fn resume_one(
     if !Path::new(&cand.working_dir).is_dir() {
         return ResumeRow::skipped(&cand.id, "working_dir_missing");
     }
+    // The drain gate is read BEFORE the unattended spawn gate: it is this door's
+    // dispatch filter, so a drained id never enters the gate. It is not read again
+    // after the gate: its drain is read before the gate, which waits at most one
+    // spacing, so nothing waits in the gate for a drain (round-3 review B1).
     let gate = match crate::coord_drain_state::drain_gate_for_work(
         SpawnOrigin::Respawn,
         &format!("resume:{}", cand.id),
@@ -594,10 +612,39 @@ async fn resume_one(
         DrainGate::Allow => DrainGate::Allow,
         deferred => deferred,
     };
+    // Unattended spawn gate (plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box,
+    // D1), for an id the drain allows. The HTTP request awaits this batch, which
+    // resumes its ids one at a time, so the gate must not HOLD here — a held id
+    // would hold every id after it and the request with them. It waits inline at
+    // most one pace slot (so a batch drains at one id per spacing) and otherwise
+    // defers: the id is `skipped(machine_loaded: …)`, which the caller retries,
+    // keeping its place in the gate's queue. Placed BEFORE the hop budget, which
+    // consumes a slot, so nothing but synchronous checks stands between the
+    // release and the PTY. Same origin as the drain gate above.
+    let released = if gate.allows() {
+        match crate::unattended_spawn_gate::admit_or_defer(
+            SpawnOrigin::Respawn,
+            "resumed session",
+            &format!("resume:{}", cand.id),
+            crate::unattended_spawn_gate::UNATTENDED_SPAWN_SPACING,
+        )
+        .await
+        {
+            Ok(released) => Some(released),
+            Err(loaded) => return ResumeRow::deferred(&cand.id, &loaded),
+        }
+    } else {
+        None
+    };
     let now_ms = chrono::Utc::now().timestamp_millis();
     if let Err(why) = admit(gate, || {
         crate::terminal::account_migration::migration_cap_permits(&cand.id, now_ms)
     }) {
+        // A budget refusal after the gate released gives the slot back, so the
+        // next unattended spawn is not paced behind a PTY that never opened.
+        if let Some(released) = released {
+            released.refund();
+        }
         return ResumeRow::skipped(&cand.id, why);
     }
 
@@ -641,8 +688,20 @@ async fn resume_one(
     };
     let terminal_id = match spawn {
         Ok(Ok((terminal_id, _coord_id))) => terminal_id,
-        Ok(Err(e)) => return ResumeRow::failed(&cand.id, format!("spawn: {e}"), None),
-        Err(e) => return ResumeRow::failed(&cand.id, format!("spawn_task: {e}"), None),
+        // No pane opened (the seam's CRITICAL refusal after a `hold_deadline`
+        // release among the causes): give the gate's slot back.
+        Ok(Err(e)) => {
+            if let Some(released) = released {
+                released.refund();
+            }
+            return ResumeRow::failed(&cand.id, format!("spawn: {e}"), None);
+        }
+        Err(e) => {
+            if let Some(released) = released {
+                released.refund();
+            }
+            return ResumeRow::failed(&cand.id, format!("spawn_task: {e}"), None);
+        }
     };
     match verify(tm, &cand, &terminal_id).await {
         Ok(ev) => ResumeRow::resumed(&cand.id, ev),

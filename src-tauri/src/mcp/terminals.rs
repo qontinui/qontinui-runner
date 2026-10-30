@@ -289,14 +289,15 @@ pub async fn create_terminal_handler(
     // while the device is drained (or its drain state is unknown) the door
     // answers 409 before allocating anything. The runner UI's own "new
     // terminal" is the `terminal_create` Tauri command, which is never deferred.
+    // Caller-supplied title — BOUNDED (review N4).
+    let work_key = crate::coord_drain_state::bounded_work_key(
+        "http_terminal",
+        request.title.as_deref().unwrap_or("untitled"),
+    );
     if let crate::coord_drain_state::DrainGate::Defer { reason, class } =
         crate::coord_drain_state::drain_gate_for_work(
             crate::coord_drain_state::SpawnOrigin::Unknown,
-            // Caller-supplied title — BOUNDED (review N4).
-            &crate::coord_drain_state::bounded_work_key(
-                "http_terminal",
-                request.title.as_deref().unwrap_or("untitled"),
-            ),
+            &work_key,
         )
     {
         warn!("HTTP: refusing terminal create — {reason}");
@@ -305,6 +306,27 @@ pub async fn create_terminal_handler(
             Json(crate::coord_drain_state::api_refusal(&reason, class)),
         ));
     }
+
+    // Unattended spawn gate (plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box,
+    // D1). A request door: decided ONCE, never held — a held HTTP request is a
+    // timed-out request — and answered as the drain arm above answers, 409 with
+    // the code `machine_loaded` and `hint.retry_after_ms`. Beside the drain arm,
+    // before the worktree allocation below, which a refusal would otherwise leak
+    // (`IsolatedEditContext::Drop` releases the claim but leaves the directory).
+    // The slot is committed immediately before the PTY create; every refusal in
+    // between (workingDir, tenant, edit siblings, account) drops it, which
+    // refunds it.
+    let unattended_slot = match crate::unattended_spawn_gate::check_request(
+        crate::coord_drain_state::SpawnOrigin::Unknown,
+        "HTTP terminal",
+        &work_key,
+    ) {
+        Ok(slot) => slot,
+        Err(loaded) => {
+            warn!("HTTP: refusing terminal create — {}", loaded.reason);
+            return Err((StatusCode::CONFLICT, Json(loaded.api_refusal())));
+        }
+    };
 
     // The other half of D6: a `workingDir` the runner cannot use must come
     // back as a refusal naming the path, not as a 200 whose `workingDir` is
@@ -401,6 +423,8 @@ pub async fn create_terminal_handler(
         Some(extra_env_vec)
     };
 
+    // The PTY opens next: keep the unattended gate's slot (paced to this moment).
+    unattended_slot.commit().await;
     match terminal_manager.create(
         request.title,
         working_dir,
