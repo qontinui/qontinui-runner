@@ -9123,9 +9123,8 @@ async fn run_agent_subprocess(
     // Bundle /vet-plan and /implement-plan into the spawned worktree cwd so they
     // resolve as project slash commands regardless of the device's ~/.claude.
     crate::fleet_commands::provision_fleet_commands_for_session(&primary_wt);
-    // Same for the fleet SKILLS. Note provision_agent_definitions above still
-    // COPIES .claude/agents from a claude-config checkout, so agents remain
-    // absent on a device without one; skills no longer do.
+    // Same for the fleet SKILLS. (provision_agent_definitions above writes the
+    // embedded agent floor even on a device with no claude-config checkout.)
     crate::fleet_skills::provision_fleet_skills_for_session(&primary_wt);
 
     let log_path = agent_log_path(payload.agent_id);
@@ -9609,13 +9608,20 @@ fn provision_agent_definitions_from_root(
     // TRUNCATES it — would damage the operator's checkout. Write nothing.
     if let (Ok(s), Ok(d)) = (src_dir.canonicalize(), dst_dir.canonicalize()) {
         if s == d {
-            return Ok(ProvisionReport::unresolved(
+            // Served IN PLACE: the session reads the operator checkout's live
+            // definitions directly, so this is the checkout rung answering, not
+            // an unresolved one. Nothing is written.
+            info!(
+                "agent_runtime: {} IS the qontinui-claude-config agents dir; serving the live \
+                 definitions in place, nothing written",
+                dst_dir.display()
+            );
+            return Ok(ProvisionReport::new(
                 "agent_definitions",
                 0,
-                dst_dir.display().to_string(),
-                "the destination resolves to the qontinui-claude-config agents dir itself \
-                 (the session already reads the live definitions); nothing written",
-            ));
+                capability_manifest::Rung::OperatorCheckout,
+            )
+            .with_destination(dst_dir.display().to_string()));
         }
     }
 
