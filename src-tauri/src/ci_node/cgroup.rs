@@ -189,9 +189,8 @@ impl CgroupDispatch {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 // A leftover from a crashed runner: usable only if empty (rmdir
                 // refuses otherwise, which is the safe answer).
-                fs::remove_dir(&dir).map_err(|e2| {
-                    format!("{}: stale and not removable: {e2}", dir.display())
-                })?;
+                fs::remove_dir(&dir)
+                    .map_err(|e2| format!("{}: stale and not removable: {e2}", dir.display()))?;
                 fs::create_dir(&dir).map_err(|e2| format!("{}: mkdir: {e2}", dir.display()))?;
             }
             Err(e) => return Err(format!("{}: mkdir: {e}", dir.display())),
@@ -299,7 +298,10 @@ impl CgroupDispatch {
     /// fails: an un-adopted child runs uncontained rather than not at all.
     pub(crate) fn adopt(&self, child: &tokio::process::Child) {
         let Some(pid) = child.id() else { return };
-        let want = self.dir.file_name().map(|n| n.to_string_lossy().into_owned());
+        let want = self
+            .dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
         let already = fs::read_to_string(format!("/proc/{pid}/cgroup"))
             .ok()
             .and_then(|b| parse_unified_cgroup(&b))
@@ -336,7 +338,10 @@ impl CgroupDispatch {
             }
             std::thread::yield_now();
         }
-        warn!("ci_node: cgroup {} still has processes after kill", self.dir.display());
+        warn!(
+            "ci_node: cgroup {} still has processes after kill",
+            self.dir.display()
+        );
         KillPath::Incomplete
     }
 
@@ -537,7 +542,10 @@ mod tests {
         assert_eq!(c.dir(), p.path().join(dispatch_dir_name("d1")));
         let written = fs::read_to_string(c.dir().join("memory.max")).unwrap();
         assert_eq!(written, (32u64 * 1024 * 1024 * 1024).to_string());
-        assert_eq!(fs::read_to_string(c.dir().join("memory.oom.group")).unwrap(), "1");
+        assert_eq!(
+            fs::read_to_string(c.dir().join("memory.oom.group")).unwrap(),
+            "1"
+        );
         // Fixture dirs hold plain files, so Drop's rmdir cannot succeed; the
         // TempDir owns the cleanup.
     }
@@ -547,7 +555,10 @@ mod tests {
         let p = fixture_parent("cpu pids", "");
         let e = CgroupDispatch::create_in(p.path(), "d2", 1 << 20).unwrap_err();
         assert!(e.contains("memory controller is not available"), "{e}");
-        assert!(!p.path().join(dispatch_dir_name("d2")).exists(), "nothing left behind");
+        assert!(
+            !p.path().join(dispatch_dir_name("d2")).exists(),
+            "nothing left behind"
+        );
     }
 
     #[test]
@@ -573,7 +584,10 @@ mod tests {
         let c = CgroupDispatch::create_in(p.path(), "d5", 1 << 20).unwrap();
         // Writable cgroup.kill: the atomic path.
         assert_eq!(c.kill(), KillPath::CgroupKill);
-        assert_eq!(fs::read_to_string(c.dir().join("cgroup.kill")).unwrap(), "1");
+        assert_eq!(
+            fs::read_to_string(c.dir().join("cgroup.kill")).unwrap(),
+            "1"
+        );
         // cgroup.kill not writable (kernel < 5.14): a directory there makes
         // the write fail; an empty cgroup.procs ends the loop at once.
         fs::remove_file(c.dir().join("cgroup.kill")).unwrap();
@@ -586,12 +600,19 @@ mod tests {
     fn oom_note_reports_each_kill_once() {
         let p = fixture_parent("memory", "memory");
         let c = CgroupDispatch::create_in(p.path(), "d6", 4096).unwrap();
-        assert_eq!(c.take_oom_note(), None, "no memory.events yet is not a kill");
+        assert_eq!(
+            c.take_oom_note(),
+            None,
+            "no memory.events yet is not a kill"
+        );
         fs::write(c.dir().join("memory.events"), "max 5\noom_kill 0\n").unwrap();
         assert_eq!(c.take_oom_note(), None);
         fs::write(c.dir().join("memory.events"), "max 9\noom_kill 1\n").unwrap();
         let note = c.take_oom_note().expect("a new oom_kill is reported");
-        assert!(note.contains("memory limit") && note.contains("4096"), "{note}");
+        assert!(
+            note.contains("memory limit") && note.contains("4096"),
+            "{note}"
+        );
         assert_eq!(c.take_oom_note(), None, "reported once");
     }
 
@@ -613,7 +634,11 @@ mod tests {
         let c = Containment::create("d7", 1 << 20);
         drop(_restore);
         assert!(matches!(c, Containment::Cgroup(_)));
-        assert!(c.describe().contains("memory.max=1048576"), "{}", c.describe());
+        assert!(
+            c.describe().contains("memory.max=1048576"),
+            "{}",
+            c.describe()
+        );
         let u = Containment::Uncontained("no delegation".into());
         assert!(u.describe().contains("UNCONTAINED"));
         assert!(u.describe().contains("no delegation"));
@@ -670,9 +695,19 @@ mod tests {
             .await
             .expect("an over-limit dispatch must be killed, not hang")
             .expect("wait");
-        assert!(!status.success(), "over-limit dispatch must not succeed: {status:?}");
-        assert_eq!(status.signal(), Some(9), "killed by SIGKILL (OOM): {status:?}");
-        assert!(cg.take_oom_note().is_some(), "memory.events should record the oom_kill");
+        assert!(
+            !status.success(),
+            "over-limit dispatch must not succeed: {status:?}"
+        );
+        assert_eq!(
+            status.signal(),
+            Some(9),
+            "killed by SIGKILL (OOM): {status:?}"
+        );
+        assert!(
+            cg.take_oom_note().is_some(),
+            "memory.events should record the oom_kill"
+        );
         // Drop kills strays and rmdirs; verify the directory is gone.
         let dir = cg.dir().to_path_buf();
         drop(cg);
