@@ -269,15 +269,19 @@ $SKIP_ROUTES = @{
 # Routes the PINNED SDK declares whose runner handlers are on an open PR, not
 # on main -- the SDK is ahead of the runner. Keyed by "<METHOD> <PATH>" exactly
 # as it appears in UI_BRIDGE_ROUTES. Unlike $SKIP_ROUTES, an entry here EXPIRES
-# on its own: an UNREGISTERED answer for one of these routes is a SKIP carrying
-# its reason, and ANY other answer is a FAIL, because it means the handlers have
-# landed and the entry is stale -- delete it. "Unregistered" is the router
-# fallback's own signature, never the shape of a 404: `not_found_handler` in
-# src-tauri/src/mcp_api.rs answers every unmatched route with a 404 whose error
-# starts "No route for " (`not_found_message`), so that 404 -- or an empty-body
-# one -- is a SKIP, and a 404 a landed handler answers itself is a FAIL. This is
-# the twin of `sdk_only_baseline` in src-tauri/src/mcp/ui_bridge/mod.rs, which
-# fails the same way when its entry goes stale. An entry that could never
+# on its own: only the router fallback's answer for one of these routes is a
+# SKIP carrying its reason, and ANY other answer is a FAIL. The fallback is
+# recognised by its own signature, never by the bare fact of a 404:
+# `not_found_handler` in src-tauri/src/mcp_api.rs answers every unmatched route
+# with a JSON 404 whose error is "No route for <METHOD> <path>"
+# (`not_found_message`), so a 404 carrying that error for the request the probe
+# sent is a SKIP. A 404 a landed handler answers itself is a FAIL: the entry is
+# stale -- delete it. So is a 404 with no readable body. This runner never sends
+# one (`envelope_rewrite_middleware` in src-tauri/src/mcp/envelope.rs gives every
+# bodiless 4xx/5xx a JSON envelope), so an empty body means the probe lost it,
+# and an unknown verdict must not keep an entry alive. This is the twin of
+# `sdk_only_baseline` in src-tauri/src/mcp/ui_bridge/mod.rs, which fails the
+# same way when its entry goes stale. An entry that could never
 # expire -- one also in $SKIP_ROUTES (checked first), or one the pinned SDK no
 # longer declares -- is refused before any probe, -DryRun included.
 # ---------------------------------------------------------------------------
@@ -962,7 +966,7 @@ if ($DryRun) {
         Write-Host ("  {0,-6}  {1}{2}{3}{4}" -f $r.Method, $r.Path, $bodyNote, $skipNote, $aheadNote)
     }
     Write-Host ""
-    Write-Host ("Total: {0} routes, {1} skip, {2} SDK-ahead (skip while unregistered, fail once registered)" -f $routes.Count, $SKIP_ROUTES.Count, $aheadMatched)
+    Write-Host ("Total: {0} routes, {1} skip, {2} SDK-ahead (skip on the router fallback, fail on any other answer)" -f $routes.Count, $SKIP_ROUTES.Count, $aheadMatched)
     exit 0
 }
 
@@ -1112,33 +1116,45 @@ try {
             $exitCode = 1
         } elseif ($SDK_AHEAD_ROUTES.ContainsKey($r.Key)) {
             # Decided on the router fallback's own signature (see the
-            # $SDK_AHEAD_ROUTES header), never on the 404's shape: an empty-body
-            # 404, or the fallback's "No route for " envelope, is unregistered.
-            # Matched on the ASCII prefix only -- the message goes on with a
-            # non-ASCII dash that Windows PowerShell 5.1 may not decode intact.
-            $unregistered = $false
-            if ($status -eq 404) {
-                $aheadRaw = [string]$res[1]
-                if ($aheadRaw.Trim().Length -eq 0) {
-                    $unregistered = $true
-                } else {
-                    try {
-                        $aheadBody = $aheadRaw | ConvertFrom-Json
-                        if ($null -ne $aheadBody -and
-                            ($aheadBody.PSObject.Properties.Name -contains 'error') -and
-                            ($aheadBody.error -is [string]) -and
-                            $aheadBody.error.StartsWith("No route for ")) {
-                            $unregistered = $true
-                        }
-                    } catch {
-                        $unregistered = $false
+            # $SDK_AHEAD_ROUTES header), never on the bare fact of a 404. The
+            # fallback's error is "No route for <METHOD> <path>", and for a
+            # /ui-bridge/ path it goes on with a space, a dash and a discovery
+            # hint. Only that head is matched, built for THIS request: the
+            # method as sent (Invoke-WebRequest sends it upper-case) and the
+            # path as sent (the Uri's AbsolutePath, so the /ui-bridge prefix is
+            # in it and any :param is substituted). The head is ASCII. What
+            # follows it is a hint for a person, not part of the verdict, so it
+            # is not matched; it also carries a non-ASCII dash, which Windows
+            # PowerShell 5.1 can decode wrongly.
+            $aheadRaw = [string]$res[1]
+            $aheadError = $null
+            if ($aheadRaw.Trim().Length -gt 0) {
+                try {
+                    $aheadBody = $aheadRaw | ConvertFrom-Json
+                    if ($null -ne $aheadBody -and
+                        ($aheadBody.PSObject.Properties.Name -contains 'error') -and
+                        ($aheadBody.error -is [string])) {
+                        $aheadError = [string]$aheadBody.error
                     }
+                } catch {
+                    $aheadError = $null
                 }
             }
-            if ($unregistered) {
-                Record "SKIP" $r.Method $r.Path "404, SDK ahead of runner: $($SDK_AHEAD_ROUTES[$r.Key])"
+            $aheadHead = "No route for " + $r.Method.ToUpperInvariant() + " " + ([System.Uri]$url).AbsolutePath
+            $aheadIsFallback = (($null -ne $aheadError) -and
+                ([string]::Equals($aheadError, $aheadHead, [System.StringComparison]::Ordinal) -or
+                 $aheadError.StartsWith($aheadHead + " ", [System.StringComparison]::Ordinal)))
+            if ($status -eq 404 -and $aheadRaw.Trim().Length -eq 0) {
+                Record "FAIL" $r.Method $r.Path "404 with no readable body -- cannot tell the router fallback from a handler"
+                $exitCode = 1
+            } elseif ($status -eq 404 -and $aheadIsFallback) {
+                Record "SKIP" $r.Method $r.Path "404 (router fallback: no route), SDK ahead of runner: $($SDK_AHEAD_ROUTES[$r.Key])"
+            } elseif ($status -eq 404 -and $null -ne $aheadError -and
+                      $aheadError.StartsWith("No route for ", [System.StringComparison]::Ordinal)) {
+                Record "FAIL" $r.Method $r.Path "404 from the router fallback, but not for this request (expected `"$aheadHead`")"
+                $exitCode = 1
             } else {
-                Record "FAIL" $r.Method $r.Path "stale SDK-ahead entry: the runner answers this route ($status); delete it from `$SDK_AHEAD_ROUTES"
+                Record "FAIL" $r.Method $r.Path "stale SDK-ahead entry: the runner answers this route ($status), not the router fallback; delete it from `$SDK_AHEAD_ROUTES"
                 $exitCode = 1
             }
         } elseif ($status -eq 404) {
