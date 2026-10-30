@@ -134,7 +134,8 @@ export function RemoteTabControls({
 
   // Every control here truncates (its `title` carries the full text) so a
   // narrow zone header keeps its toggles clear of the hover cluster; an action
-  // button keeps its icon. Budgeted in `HEADER_REMOTE_FLOORS_PX`.
+  // button and the device badge keep their icons (`min-w-[18px]`). Budgeted in
+  // `HEADER_REMOTE_FLOORS_PX`.
   const btn =
     "flex items-center gap-0.5 min-w-[18px] overflow-hidden text-[8px] px-1 py-0 rounded transition-colors disabled:opacity-50 " +
     "text-[#7aa2f7] bg-[#7aa2f7]/10 hover:bg-[#7aa2f7]/25";
@@ -143,7 +144,7 @@ export function RemoteTabControls({
     <>
       <span
         data-ui-bridge-id={`terminal.remote-badge.${tab.id}`}
-        className={`flex items-center gap-0.5 min-w-0 overflow-hidden text-[8px] text-[#7aa2f7] bg-[#7aa2f7]/15 px-1 py-0 ${
+        className={`flex items-center gap-0.5 min-w-[18px] overflow-hidden text-[8px] text-[#7aa2f7] bg-[#7aa2f7]/15 px-1 py-0 ${
           compact ? "rounded-full py-0.5" : "rounded"
         }`}
         title={badge.title}
