@@ -2145,11 +2145,9 @@ pub(crate) fn stop_detail_bind(
 /// answer), never sent where it might be refused; a migration that adds one
 /// must revisit this predicate, or the withholding never ends.
 ///
-/// Run against a real database: the probe SQL was executed on an ephemeral
-/// PostgreSQL 16.15 (`ephemeral-db.sh start pgvector`, 2026-10-29) with the
-/// web alembic chain at `journey_02` (`false, false`), `journey_03`
-/// (`true, true`), `journey_04` (`true, false`) and downgraded back to
-/// `journey_03` (`true, true`). No runner test drives a database.
+/// The runner's tests hold this Rust predicate against CHECK renderings given
+/// as strings, and the probe SQL's text against the clauses it must carry; no
+/// runner test executes the probe against a database.
 pub(crate) fn check_restricts_stop_detail(definition: &str) -> bool {
     definition.contains("stop_detail") && definition.contains("frontier_unsettled")
 }
