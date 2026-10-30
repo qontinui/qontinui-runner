@@ -33,8 +33,8 @@ use tracing::{debug, warn};
 
 use qontinui_runner_lib::looping_agent::desired_state::CoordDesiredState;
 use qontinui_runner_lib::looping_agent::lease::{
-    parse_acquire_result, parse_heartbeat_result, AcquireOutcome, HeartbeatOutcome,
-    LEASE_CLAIM_KIND, LEASE_TTL_SECS,
+    parse_acquire_body, parse_heartbeat_body, AcquireOutcome, HeartbeatOutcome, LEASE_CLAIM_KIND,
+    LEASE_TTL_SECS,
 };
 
 /// How often the desired state is refreshed. 45s matches
@@ -250,15 +250,9 @@ pub async fn acquire_slot(
         Ok(v) => v,
         Err(e) => return AcquireOutcome::Unavailable(format!("decode: {e}")),
     };
-    match v.get("result").and_then(|r| r.as_str()) {
-        Some(result) => parse_acquire_result(
-            result,
-            v.get("current_holder")
-                .and_then(|s| s.as_str())
-                .map(str::to_string),
-        ),
-        None => AcquireOutcome::Unavailable("body missing `result` discriminator".to_string()),
-    }
+    // The body is the semantic-reserve shape on today's wire (`granted`/`held`
+    // + `holder`), the plain shape tolerated — the pure parse handles both.
+    parse_acquire_body(&v)
 }
 
 /// `POST /claims/heartbeat` on a lease we believe we hold.
@@ -291,10 +285,7 @@ pub async fn heartbeat_slot(
         Ok(v) => v,
         Err(e) => return HeartbeatOutcome::Unavailable(format!("decode: {e}")),
     };
-    match v.get("result").and_then(|r| r.as_str()) {
-        Some(result) => parse_heartbeat_result(result),
-        None => HeartbeatOutcome::Unavailable("body missing `result` discriminator".to_string()),
-    }
+    parse_heartbeat_body(&v)
 }
 
 /// `POST /claims/release` — best-effort. Frees the slot IMMEDIATELY on a clean

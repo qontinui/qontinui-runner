@@ -1562,10 +1562,11 @@ async fn reconcile_slot_lease(
                 );
                 true
             }
-            lease::AcquireOutcome::Held { .. } => {
+            lease::AcquireOutcome::Held { holder } => {
                 debug!(
                     agent = %agent_id,
                     %resource_key,
+                    holder = holder.as_ref().map(|h| h.machine_id.as_str()).unwrap_or("unknown"),
                     "looping_agent_supervisor: slot held by another runner — trying the next"
                 );
                 false
