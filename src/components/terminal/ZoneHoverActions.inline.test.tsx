@@ -42,14 +42,43 @@ vi.mock("./useTerminalWindowActions", () => ({
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { ZoneHoverActions, hoverActionsSpanPx } from "./ZoneHoverActions";
 import {
+  ZoneHoverActions,
+  HEADER_ICON_TOGGLES_MAX,
+  HEADER_TRUNCATABLES_MAX,
+  headerControlsMinPx,
+  hoverActionsSpanPx,
+} from "./ZoneHoverActions";
+import {
+  ZONE_CELL_CONTAINER_CLASS,
+  ZONE_HEADER_COLLAPSED_RESERVE_PX,
   ZONE_HEADER_HOVER_RESERVE_CLASS,
   ZONE_HEADER_HOVER_RESERVE_PX,
+  ZONE_HOVER_COLLAPSE_BELOW_PX,
+  ZONE_HOVER_COLLAPSED_ONLY_CLASS,
+  ZONE_HOVER_FULL_ONLY_CLASS,
 } from "./zone-grid/headerReserve";
 
 const render = (props: { zoneIdx: number; inline?: boolean }) =>
   renderToStaticMarkup(<ZoneHoverActions labelZone={props.zoneIdx} {...props} />);
+
+const SIX_ACTIONS = [
+  "Maximize zone",
+  "Restart session",
+  "Edit zone label",
+  "Export zone output",
+  "Send terminal to a window",
+  "Close session",
+] as const;
+
+/** The overlay's full cluster: everything before the narrow-zone overflow wrapper. */
+const fullCluster = (html: string) => {
+  const at = html.indexOf("data-zone-hover-overflow");
+  return at < 0 ? html : html.slice(0, html.lastIndexOf("<div", at));
+};
+
+const readSource = (rel: string) =>
+  readFileSync(fileURLToPath(new URL(rel, import.meta.url)), "utf8");
 
 describe("ZoneHoverActions", () => {
   it("default mode is the hover-revealed overlay", () => {
@@ -117,7 +146,9 @@ describe("header reserve for the hover overlay", () => {
   it("covers the widest overlay this component renders", () => {
     // Zone 0, not maximized, a labelable zone: every button is offered.
     state.maximizedZone = null;
-    const html = render({ zoneIdx: 0 });
+    // The narrow-zone overflow button and its menu follow the six; they are
+    // display:none at this width and covered by the collapsed reserve below.
+    const html = fullCluster(render({ zoneIdx: 0 }));
     const buttons = (html.match(/<button/g) ?? []).length;
     expect(buttons).toBe(6);
     // The classes `hoverActionsSpanPx` is derived from. Widening a button or
@@ -154,5 +185,119 @@ describe("header reserve for the hover overlay", () => {
   it("the overlay is anchored where the reserve assumes", () => {
     state.maximizedZone = null;
     expect(render({ zoneIdx: 0 })).toContain("absolute top-1 right-1");
+  });
+});
+
+/**
+ * Plan `2026-10-22-runner-zone-header-total-output-seed-and-narrow-zone-chips`
+ * Phase 2: in a narrow zone the header's non-truncating controls must not sit
+ * under the revealed cluster. Below `ZONE_HOVER_COLLAPSE_BELOW_PX` (a container
+ * query on the cell) the cluster collapses to one overflow button and the
+ * reserve shrinks to it; the text chips truncate instead of holding width.
+ */
+describe("narrow zones collapse the hover cluster", () => {
+  it("the collapse width is the header's minimum plus padding plus the full reserve", () => {
+    expect(HEADER_ICON_TOGGLES_MAX).toBe(6);
+    expect(HEADER_TRUNCATABLES_MAX).toBe(4);
+    expect(headerControlsMinPx()).toBe(162);
+    expect(ZONE_HOVER_COLLAPSE_BELOW_PX).toBe(
+      headerControlsMinPx() + 16 + ZONE_HEADER_HOVER_RESERVE_PX,
+    );
+    expect(headerControlsMinPx() + 16 + ZONE_HEADER_HOVER_RESERVE_PX).toBeLessThanOrEqual(
+      ZONE_HOVER_COLLAPSE_BELOW_PX,
+    );
+  });
+
+  it("a 250 px zone fits every header control beside the collapsed cluster", () => {
+    expect(ZONE_HEADER_COLLAPSED_RESERVE_PX).toBe(hoverActionsSpanPx(1) + 4);
+    expect(headerControlsMinPx() + 16 + ZONE_HEADER_COLLAPSED_RESERVE_PX).toBeLessThanOrEqual(250);
+  });
+
+  it("the classes carry the same numbers against the named zone container", () => {
+    const t = ZONE_HOVER_COLLAPSE_BELOW_PX;
+    expect(ZONE_CELL_CONTAINER_CLASS).toBe("@container/zone");
+    expect(ZONE_HEADER_HOVER_RESERVE_CLASS.split(" ")).toContain(
+      `@max-[${t}px]/zone:group-hover:pr-[${ZONE_HEADER_COLLAPSED_RESERVE_PX}px]`,
+    );
+    expect(ZONE_HOVER_FULL_ONLY_CLASS).toBe(`@max-[${t}px]/zone:hidden`);
+    expect(ZONE_HOVER_COLLAPSED_ONLY_CLASS.split(" ")).toEqual([
+      "hidden",
+      `@max-[${t}px]/zone:flex`,
+    ]);
+  });
+
+  it("the zone cell is the named container", () => {
+    const cell = readSource("./zone-grid/ZoneCell.tsx");
+    expect(cell).toMatch(/className=\{`group \$\{ZONE_CELL_CONTAINER_CLASS\} relative/);
+  });
+
+  it("the header classes headerControlsMinPx is derived from", () => {
+    const label = readSource("./zone-grid/ZoneLabel.tsx");
+    // Row gap and padding, the state dot, and the icon toggles' size.
+    expect(label).toContain("flex items-center gap-1.5 px-2 ${ZONE_HEADER_HOVER_RESERVE_CLASS}");
+    expect(label).toContain("className={`w-1.5 h-1.5 rounded-full shrink-0");
+    const toggleIcons =
+      label.match(
+        /<(ChevronDown|Pin|Filter|MessageSquare|ArrowDownToLine) className="w-2\.5 h-2\.5" \/>/g,
+      ) ?? [];
+    expect(toggleIcons.length).toBe(HEADER_ICON_TOGGLES_MAX - 1); // + the review toggle
+  });
+
+  it("the total-output label and the position chip truncate instead of holding width", () => {
+    const label = readSource("./zone-grid/ZoneLabel.tsx");
+    const total = label.slice(
+      label.indexOf("export function TotalOutputLabel"),
+      label.indexOf("data-zone-total-output"),
+    );
+    expect(total).toContain(
+      'className="text-[9px] text-[#565f89] font-mono ml-1 min-w-0 truncate"',
+    );
+    expect(total).not.toContain("shrink-0");
+    expect(total).toContain("title={");
+    const posAt = label.indexOf("data-tmux-position");
+    const position = label.slice(label.lastIndexOf("<span", posAt), posAt);
+    expect(position).toContain("min-w-0 truncate");
+    expect(position).not.toContain("shrink-0");
+    expect(position).toContain("title={");
+  });
+
+  it("the overlay hides each of the six below the collapse width", () => {
+    state.maximizedZone = null;
+    const full = fullCluster(render({ zoneIdx: 0 }));
+    for (const label of SIX_ACTIONS) {
+      const at = full.indexOf(`aria-label="${label}"`);
+      expect(at).toBeGreaterThan(-1);
+      // The class sits on the button, or on the wrapper of a button with a dropdown.
+      const opener = full.lastIndexOf("<button", at);
+      const scope = full.slice(Math.max(0, full.lastIndexOf("<div", opener)), at);
+      expect(scope).toContain(ZONE_HOVER_FULL_ONLY_CLASS);
+    }
+  });
+
+  it("collapses to exactly one overflow button whose menu holds all six", () => {
+    state.maximizedZone = null;
+    const html = render({ zoneIdx: 0 });
+    const at = html.indexOf("data-zone-hover-overflow");
+    expect(at).toBeGreaterThan(-1);
+    const collapsed = html.slice(html.lastIndexOf("<div", at));
+    expect(collapsed).toContain(ZONE_HOVER_COLLAPSED_ONLY_CLASS);
+    expect((collapsed.match(/aria-haspopup="menu"/g) ?? []).length).toBe(1);
+    expect((html.match(/aria-haspopup="menu"/g) ?? []).length).toBe(1);
+    expect(collapsed).toMatch(
+      /aria-label="Zone actions" aria-haspopup="menu" aria-expanded="false"/,
+    );
+    const menu = collapsed.slice(collapsed.indexOf('role="menu"'));
+    expect(menu.slice(0, menu.indexOf(">"))).toContain('hidden=""'); // closed until opened
+    for (const label of SIX_ACTIONS) {
+      expect(menu).toContain(`aria-label="${label}"`);
+    }
+    expect((menu.match(/role="menuitem"/g) ?? []).length).toBe(SIX_ACTIONS.length);
+  });
+
+  it("the maximized header's inline cluster never collapses", () => {
+    state.maximizedZone = 0;
+    const html = render({ zoneIdx: 0, inline: true });
+    expect(html).not.toContain("data-zone-hover-overflow");
+    expect(html).not.toContain(ZONE_HOVER_FULL_ONLY_CLASS);
   });
 });
