@@ -25,6 +25,10 @@
 //!   resource key (`role:<tenant>:<role>:<slot>`), the acquire/heartbeat
 //!   outcome folds, and the gate that makes a lease-less spawn structurally
 //!   impossible. The #1025 spawn-storm lesson, encoded.
+//! - [`holder`] — who holds a slot this runner could not take: the
+//!   TTL-bounded `/coord/claims/by-resource` fallback decision, its strict body
+//!   parse, and the operator-facing holder view. Informational only — never an
+//!   input to the spawn gate.
 //! - [`idle`] — the rendered-VT-grid idle / context-low predicates. Grid
 //!   scanning (not raw-byte scanning) is the fleet's proven approach: Claude
 //!   Code paints whole frames as synchronized-output updates that hide text
@@ -46,6 +50,7 @@
 //! `run_continuation_terminal` spawn recipe.
 
 pub mod desired_state;
+pub mod holder;
 pub mod idle;
 pub mod lease;
 pub mod playbook;
