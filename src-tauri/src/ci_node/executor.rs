@@ -99,10 +99,7 @@ impl CiJob {
         #[cfg(target_os = "linux")]
         {
             Self {
-                cgroup: super::cgroup::Containment::create(
-                    dispatch_id,
-                    CI_JOB_MEMORY_LIMIT_BYTES,
-                ),
+                cgroup: super::cgroup::Containment::create(dispatch_id, CI_JOB_MEMORY_LIMIT_BYTES),
             }
         }
         #[cfg(not(any(windows, target_os = "linux")))]
