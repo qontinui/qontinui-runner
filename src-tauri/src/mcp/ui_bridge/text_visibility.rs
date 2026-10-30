@@ -2437,7 +2437,12 @@ mod tests {
     /// The cancel is timed from the hide's reply, not from the call: the arm
     /// first waits on the process-wide [`pair_lock`], which a test running in
     /// parallel may hold, and on a paused clock a timeout around that wait can
-    /// fire before the arm has hidden anything.
+    /// fire before the arm has hidden anything. The wait before the hide is
+    /// therefore unbounded on purpose: a deadlock there hangs this test rather
+    /// than failing it, which is the price of removing the race.
+    ///
+    /// The hide answers a second after it is sent, so the instant the guard
+    /// hands over is checked to be the reply's, not the send's or the cancel's.
     #[tokio::test(start_paused = true)]
     async fn a_cancel_during_the_ttl_hold_keeps_the_permits_until_the_ttl() {
         use std::sync::atomic::Ordering::SeqCst;
@@ -2450,14 +2455,21 @@ mod tests {
             Err("UI Bridge request timed out".into()),
         ]);
         let hide_answered = Arc::new(tokio::sync::Notify::new());
+        let replied_at: Arc<Mutex<Option<tokio::time::Instant>>> = Default::default();
         let answered_tx = Arc::clone(&hide_answered);
+        let replied_tx = Arc::clone(&replied_at);
         let send = move |kind: &'static str, body: Value| {
             let is_hide = body == arm_hide_body();
             let reply = webview_send(kind, body);
             let answered = Arc::clone(&answered_tx);
+            let replied = Arc::clone(&replied_tx);
             async move {
                 let reply = reply.await;
                 if is_hide {
+                    // The arm holds the pair lock by now, so this wait is
+                    // the hide's own latency and nothing else's.
+                    tokio::time::sleep(ms(1_000)).await;
+                    *replied.lock().unwrap() = Some(tokio::time::Instant::now());
                     answered.notify_one();
                 }
                 reply
@@ -2510,8 +2522,13 @@ mod tests {
         );
         drop(arm);
         let times = handed.lock().unwrap().take().expect("the guard fired");
-        let answered = times.answered.expect("the hide had answered");
-        assert!(times.sent <= answered);
+        let answered = replied_at.lock().unwrap().expect("the hide was answered");
+        assert_eq!(
+            times.answered,
+            Some(answered),
+            "the guard hands over the hide's reply instant"
+        );
+        assert_eq!(answered, times.sent + ms(1_000), "a second after the send");
         let ttl_fired = answered + ms(CAPTURE_TTL_MS + TTL_BUMP_MARGIN_MS);
         tokio::time::sleep_until(ttl_fired - ms(1)).await;
         assert_eq!(
