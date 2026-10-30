@@ -2162,6 +2162,7 @@ mod tests {
                 finish_synced: false,
                 spawn_device_default: None,
                 adopted_from: None,
+                last_session_start_at: None,
             },
         );
         assert!(store.get("s1").unwrap().wind_down_outcome.is_none());

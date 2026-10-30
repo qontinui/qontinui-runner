@@ -2460,6 +2460,7 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
         }
     }
 
@@ -2979,6 +2980,7 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
         });
 
         // The confirming hook fires with bash-flavored context.
@@ -3182,6 +3184,7 @@ mod tests {
                     finish_synced: false,
                     spawn_device_default: None,
                     adopted_from: None,
+                    last_session_start_at: None,
                 });
             };
             let hook = |id: &str, source: &str| {
@@ -3278,6 +3281,7 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
         });
 
         // The provider reports a DIFFERENT id about itself, from bash.
@@ -3365,6 +3369,7 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
         });
 
         let req = SessionOpenRequest {

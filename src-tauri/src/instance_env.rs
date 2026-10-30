@@ -1520,19 +1520,13 @@ mod tests {
 
     // -- through the real entry points (process env, isolated fixture) ----
 
-    /// The fixture points these at its own dir — OUTSIDE a subject root — so a
-    /// subject test clears them and lets the root defaults fill them.
-    const FIXTURE_DIR_KEYS: [&str; 3] = [
-        "QONTINUI_HOME",
-        "QONTINUI_CONFIG_DIR",
-        "QONTINUI_SECURE_STORAGE_DIR",
-    ];
-
     /// Enter a subject launch: fixture env (which has already removed every
     /// other root-confined key, and captures them all for restore), a root at
-    /// `<fixture>/subject`, and the fixture's own dir keys cleared.
+    /// `<fixture>/subject`, and the root-confined keys the fixture points at its
+    /// own dir (OUTSIDE a subject root) cleared, which the root defaults then
+    /// fill.
     fn subject_env(amb: &crate::test_env::IsolatedAmbient) -> PathBuf {
-        for key in FIXTURE_DIR_KEYS {
+        for key in crate::test_env::root_confined_keys_set_to_dir() {
             std::env::remove_var(key);
         }
         let root = amb.dir().join("subject");
