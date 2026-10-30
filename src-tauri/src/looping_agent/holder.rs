@@ -152,6 +152,92 @@ pub fn parse_by_resource_body(v: &serde_json::Value) -> Result<Option<SlotHolder
     }))
 }
 
+impl HolderSource {
+    /// The stable wire/log word for this source.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HolderSource::Acquire => "acquire",
+            HolderSource::ByResource => "by_resource",
+            HolderSource::LookupFailed(_) => "lookup_failed",
+            HolderSource::NotHeldAtLookup => "not_held_at_lookup",
+        }
+    }
+}
+
+/// The operator-facing view of who holds a slot this runner could not take:
+/// the supervisor's edge-triggered INFO line and `LoopingAgentStatus.slotHolder`.
+///
+/// `machine_id: None` is an UNKNOWN holder, and `source` (plus `lookup_error`
+/// for a failed read) says why — never a fabricated id.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlotHolderView {
+    pub resource_key: String,
+    pub machine_id: Option<String>,
+    pub session: Option<String>,
+    /// [`HolderSource::as_str`] of the observation this view was built from.
+    pub source: &'static str,
+    /// The holder's machine id is THIS runner's: a session-scoped token on this
+    /// box holds the slot (our own token is bare-machine, so our own
+    /// re-acquire answers `renewed`, never `held`).
+    pub is_this_machine: bool,
+    /// The [`HolderSource::LookupFailed`] detail `source` cannot carry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lookup_error: Option<String>,
+}
+
+impl SlotHolderView {
+    /// Build the view of one observation. `own_machine_id` is this runner's
+    /// `SessionRegistry::machine_id()`.
+    pub fn from_observation(
+        resource_key: &str,
+        obs: &HolderObservation,
+        own_machine_id: &str,
+    ) -> Self {
+        let machine_id = obs.holder.as_ref().map(|h| h.machine_id.clone());
+        let is_this_machine = machine_id
+            .as_deref()
+            .is_some_and(|m| m.eq_ignore_ascii_case(own_machine_id));
+        let lookup_error = match &obs.source {
+            HolderSource::LookupFailed(e) => Some(e.clone()),
+            _ => None,
+        };
+        Self {
+            resource_key: resource_key.to_string(),
+            machine_id,
+            session: obs.holder.as_ref().and_then(|h| h.session.clone()),
+            source: obs.source.as_str(),
+            is_this_machine,
+            lookup_error,
+        }
+    }
+
+    /// The `holder` field of the per-tick debug line: the machine id, or
+    /// `unknown(<source>)` — e.g. `unknown(lookup_failed: coord status 503)` —
+    /// so an unknown names why.
+    pub fn holder_label(&self) -> String {
+        match (&self.machine_id, &self.lookup_error) {
+            (Some(m), _) => m.clone(),
+            (None, Some(e)) => format!("unknown({}: {e})", self.source),
+            (None, None) => format!("unknown({})", self.source),
+        }
+    }
+}
+
+/// Is `next` a different holder from `prev`? Compares on
+/// `(resource_key, machine_id, session)` only: `source` and `lookup_error` are
+/// left out, so re-observing the same holder through a different door (or a
+/// second failed read) is not a change and does not re-log at INFO.
+pub fn holder_changed(prev: Option<&SlotHolderView>, next: &SlotHolderView) -> bool {
+    match prev {
+        None => true,
+        Some(p) => {
+            (&p.resource_key, &p.machine_id, &p.session)
+                != (&next.resource_key, &next.machine_id, &next.session)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,6 +412,144 @@ mod tests {
         assert_eq!(
             by_resource_url("http://127.0.0.1:8080/"),
             "http://127.0.0.1:8080/coord/claims/by-resource"
+        );
+    }
+
+    // -- SlotHolderView / holder_changed (Phase 3) ---------------------------
+
+    const KEY: &str = "role:c231d9da-0ca8-4fe4-bd81-0e3d6c20339a:merge_shepherd:0";
+    const OWN: &str = "c79a07d5-0000-4000-8000-000000000001";
+    const PEER: &str = "3e7e4b04-75de-4efb-b718-c8ce8fcf7b17";
+
+    fn view_of(holder: Option<SlotHolder>, source: HolderSource) -> SlotHolderView {
+        let obs = HolderObservation {
+            holder,
+            source,
+            observed_at: Instant::now(),
+        };
+        SlotHolderView::from_observation(KEY, &obs, OWN)
+    }
+
+    fn with_session(machine_id: &str, session: &str) -> SlotHolder {
+        SlotHolder {
+            machine_id: machine_id.to_string(),
+            session: Some(session.to_string()),
+        }
+    }
+
+    /// A mutation making `holder_changed` always true turns this red.
+    #[test]
+    fn the_same_holder_twice_is_not_a_change() {
+        let a = view_of(Some(h(PEER)), HolderSource::Acquire);
+        let b = view_of(Some(h(PEER)), HolderSource::Acquire);
+        assert!(!holder_changed(Some(&a), &b));
+        // Re-observed through the other door: still the same holder.
+        let c = view_of(Some(h(PEER)), HolderSource::ByResource);
+        assert!(!holder_changed(Some(&a), &c));
+    }
+
+    #[test]
+    fn a_first_observation_is_a_change() {
+        assert!(holder_changed(
+            None,
+            &view_of(Some(h(PEER)), HolderSource::Acquire)
+        ));
+    }
+
+    #[test]
+    fn a_different_machine_is_a_change() {
+        let a = view_of(Some(h(PEER)), HolderSource::Acquire);
+        let b = view_of(Some(h("another-machine")), HolderSource::Acquire);
+        assert!(holder_changed(Some(&a), &b));
+    }
+
+    #[test]
+    fn the_same_machine_with_a_different_session_is_a_change() {
+        let a = view_of(Some(with_session(PEER, "s-1")), HolderSource::Acquire);
+        let b = view_of(Some(with_session(PEER, "s-2")), HolderSource::Acquire);
+        assert!(holder_changed(Some(&a), &b));
+        let c = view_of(Some(h(PEER)), HolderSource::Acquire);
+        assert!(holder_changed(Some(&a), &c));
+    }
+
+    #[test]
+    fn unknown_to_known_is_a_change() {
+        let a = view_of(None, HolderSource::LookupFailed("coord status 503".into()));
+        let b = view_of(Some(h(PEER)), HolderSource::ByResource);
+        assert!(holder_changed(Some(&a), &b));
+        assert!(holder_changed(Some(&b), &a), "known to unknown too");
+    }
+
+    #[test]
+    fn the_same_unknown_source_twice_is_not_a_change() {
+        let a = view_of(None, HolderSource::LookupFailed("coord status 503".into()));
+        let b = view_of(None, HolderSource::LookupFailed("coord status 503".into()));
+        assert!(!holder_changed(Some(&a), &b));
+        let a = view_of(None, HolderSource::NotHeldAtLookup);
+        let b = view_of(None, HolderSource::NotHeldAtLookup);
+        assert!(!holder_changed(Some(&a), &b));
+    }
+
+    #[test]
+    fn a_different_resource_key_is_a_change() {
+        let a = view_of(Some(h(PEER)), HolderSource::Acquire);
+        let mut b = a.clone();
+        b.resource_key = "role:t:merge_shepherd:1".into();
+        assert!(holder_changed(Some(&a), &b));
+    }
+
+    #[test]
+    fn holder_label_names_the_machine_or_why_it_is_unknown() {
+        assert_eq!(
+            view_of(Some(h(PEER)), HolderSource::Acquire).holder_label(),
+            PEER
+        );
+        assert_eq!(
+            view_of(None, HolderSource::LookupFailed("coord status 503".into())).holder_label(),
+            "unknown(lookup_failed: coord status 503)"
+        );
+        assert_eq!(
+            view_of(None, HolderSource::NotHeldAtLookup).holder_label(),
+            "unknown(not_held_at_lookup)"
+        );
+    }
+
+    #[test]
+    fn is_this_machine_flags_a_hold_by_our_own_machine_id() {
+        assert!(!view_of(Some(h(PEER)), HolderSource::Acquire).is_this_machine);
+        assert!(view_of(Some(with_session(OWN, "s-other")), HolderSource::Acquire).is_this_machine);
+        assert!(
+            !view_of(None, HolderSource::NotHeldAtLookup).is_this_machine,
+            "an unknown holder is never claimed as this machine"
+        );
+    }
+
+    /// `LoopingAgentStatus.slotHolder` serializes this view as-is; the keys are
+    /// the operator-facing contract.
+    #[test]
+    fn slot_holder_view_serializes_camel_case() {
+        let known = view_of(Some(with_session(PEER, "s-1")), HolderSource::Acquire);
+        assert_eq!(
+            serde_json::to_value(&known).unwrap(),
+            serde_json::json!({
+                "resourceKey": "role:c231d9da-0ca8-4fe4-bd81-0e3d6c20339a:merge_shepherd:0",
+                "machineId": "3e7e4b04-75de-4efb-b718-c8ce8fcf7b17",
+                "session": "s-1",
+                "source": "acquire",
+                "isThisMachine": false
+            })
+        );
+        let failed = view_of(None, HolderSource::LookupFailed("coord status 503".into()));
+        assert_eq!(
+            serde_json::to_value(&failed).unwrap(),
+            serde_json::json!({
+                "resourceKey": "role:c231d9da-0ca8-4fe4-bd81-0e3d6c20339a:merge_shepherd:0",
+                "machineId": null,
+                "session": null,
+                "source": "lookup_failed",
+                "isThisMachine": false,
+                "lookupError": "coord status 503"
+            })
         );
     }
 }
