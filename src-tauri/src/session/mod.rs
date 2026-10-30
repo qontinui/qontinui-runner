@@ -547,6 +547,20 @@ pub enum RowTenant {
 }
 
 impl SessionRecord {
+    /// Move `claude_code_session_id` from `expected` to `restore_to`, only when
+    /// it still holds `expected`. `true` when it moved.
+    fn restore_claude_code_session_id(
+        &mut self,
+        expected: &str,
+        restore_to: Option<String>,
+    ) -> bool {
+        if self.claude_code_session_id.as_deref() != Some(expected) {
+            return false;
+        }
+        self.claude_code_session_id = restore_to;
+        true
+    }
+
     fn describe(&self) -> SessionDescription {
         SessionDescription {
             id: self.id,
@@ -1379,14 +1393,14 @@ impl SessionRegistry {
             ));
         }
 
+        // Held across the move AND the append, so coord's last queued row and
+        // the record cannot name different ids.
+        let _record_move = self.coord_sync.rekeys().record_move_guard();
         let previous = self.with_record(id, |rec| {
             if rec.claude_code_session_id.as_deref() == Some(confirmed) {
                 return None;
             }
-            Some(std::mem::replace(
-                &mut rec.claude_code_session_id,
-                Some(confirmed.to_string()),
-            ))
+            Some(rec.claude_code_session_id.replace(confirmed.to_string()))
         })?;
         let Some(previous) = previous else {
             return Ok(false);
@@ -1412,7 +1426,9 @@ impl SessionRegistry {
             // Nothing was queued, so the record must not claim the id either —
             // otherwise every later confirmation of it would read "already
             // current" and the row would never be re-keyed.
-            let _ = self.restore_claude_code_session_id(id, confirmed, previous);
+            let _ = self.with_record(id, |rec| {
+                rec.restore_claude_code_session_id(confirmed, previous)
+            });
             return Err(SessionError::Outbox(e.to_string()));
         }
         Ok(true)
@@ -1430,12 +1446,9 @@ impl SessionRegistry {
         expected: &str,
         restore_to: Option<String>,
     ) -> Result<bool, SessionError> {
+        let _record_move = self.coord_sync.rekeys().record_move_guard();
         self.with_record(id, |rec| {
-            if rec.claude_code_session_id.as_deref() != Some(expected) {
-                return false;
-            }
-            rec.claude_code_session_id = restore_to;
-            true
+            rec.restore_claude_code_session_id(expected, restore_to)
         })
     }
 

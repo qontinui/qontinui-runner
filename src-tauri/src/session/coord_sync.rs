@@ -2014,6 +2014,35 @@ fn rekey_id(rec: &OutboxRecord) -> Option<&str> {
         .and_then(JsonValue::as_str)
 }
 
+/// Report a re-key coord declined to the ledger, which the seam reads to restore
+/// the local record.
+fn note_rekey_declined(
+    inner: &CoordSyncInner,
+    rec: &OutboxRecord,
+    id: &str,
+    kind: super::coord_identity::DeclineKind,
+) {
+    use super::coord_identity::{DeclineKind, RekeySource};
+    let Some(source) = RekeySource::from_payload(&rec.payload) else {
+        return;
+    };
+    let previous = rec
+        .payload
+        .get("rekey_previous")
+        .and_then(JsonValue::as_str)
+        .map(str::to_string);
+    match kind {
+        DeclineKind::AlreadyBound => {
+            inner
+                .rekeys
+                .note_refused(rec.session_id, id, previous, source)
+        }
+        DeclineKind::Rejected => inner
+            .rekeys
+            .note_rejected(rec.session_id, id, previous, source),
+    }
+}
+
 /// coord's `{error, detail}` refusal body → its `error` code.
 fn refusal_error_code(body: &str) -> Option<String> {
     serde_json::from_str::<JsonValue>(body)
@@ -2509,33 +2538,52 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                     let row = resp.json::<JsonValue>().await.ok();
                     return PushOutcome::Conflict { row };
                 }
-                // Except a re-key coord REFUSED because another active row
-                // holds the id: acking that as success voided the re-key
-                // silently while the local record claimed it. A plain-state
-                // 409 keeps the idempotent ack.
+                // Except a re-key: acking a 409 as success voided the re-key
+                // silently while the local record claimed it. coord's refusal
+                // that another active row holds the id is its own outcome; any
+                // other 409 on a re-key still did not apply it, so the ledger
+                // hears about it and the row keeps the idempotent ack. A
+                // plain-state 409 is unaffected. An unreadable body says nothing
+                // about what coord refused, so that row is retried.
                 if let Some(id) = rekey_id(rec) {
-                    let body = resp.text().await.unwrap_or_default();
+                    let body = match resp.text().await {
+                        Ok(body) => body,
+                        Err(e) => return PushOutcome::Transport(transport_error(&e)),
+                    };
                     if refusal_error_code(&body).as_deref() == Some(HARNESS_SESSION_ALREADY_BOUND) {
-                        if let Some(source) =
-                            super::coord_identity::RekeySource::from_payload(&rec.payload)
-                        {
-                            let previous = rec
-                                .payload
-                                .get("rekey_previous")
-                                .and_then(JsonValue::as_str)
-                                .map(str::to_string);
-                            inner
-                                .rekeys
-                                .note_refused(rec.session_id, id, previous, source);
-                        }
+                        note_rekey_declined(
+                            inner,
+                            rec,
+                            id,
+                            super::coord_identity::DeclineKind::AlreadyBound,
+                        );
                         return PushOutcome::Refused(format!("{status}: {}", snippet(&body)));
                     }
+                    note_rekey_declined(
+                        inner,
+                        rec,
+                        id,
+                        super::coord_identity::DeclineKind::Rejected,
+                    );
                 }
                 return PushOutcome::Acked;
             }
             let detail = resp.text().await.unwrap_or_default();
             // 4xx → Ack-drop; 5xx → transient. Shared classifier.
             let outcome = write_failure_outcome(status, format!("{status}: {detail}"));
+            // The drain ACK-drops a permanent failure. For a re-key that leaves
+            // the local record claiming an id coord never took, and every later
+            // confirmation of it would read "already current".
+            if matches!(outcome, PushOutcome::PermanentFailure(_)) {
+                if let Some(id) = rekey_id(rec) {
+                    note_rekey_declined(
+                        inner,
+                        rec,
+                        id,
+                        super::coord_identity::DeclineKind::Rejected,
+                    );
+                }
+            }
             if kind == "coord-transport-rung" && matches!(outcome, PushOutcome::PermanentFailure(_))
             {
                 // The third drain-drop arm for this mirror (404 and 405 are
@@ -10686,11 +10734,12 @@ mod tests {
     mod coord_rekeys {
         use super::*;
         use crate::session::coord_identity::{
-            apply_reconcile_tick, confirm_for_session, rekey_rung2_binds, settle_refusals,
-            RekeyOutcome, RekeySource, SourceCounts,
+            apply_reconcile_tick, confirm_for_session, rekey_rung2_binds, RekeyOutcome,
+            RekeySource, SourceCounts,
         };
         use crate::session::reconcile::{
             run_reconcile, BindOrigin, LivePty, PrescannedTranscriptIndex, ReconcileAction,
+            TranscriptCandidate, TranscriptIndex,
         };
         use crate::session::session_lifecycle_store::SessionLifecycleStore;
 
@@ -10746,6 +10795,41 @@ mod tests {
             (reg, coord, outbox, rec, dir)
         }
 
+        /// A transcript for `id` on disk, which is what makes a rung-2 bind
+        /// CONFIRMED, and so one-shot: the next pass answers `LeaveAlone`.
+        struct TranscriptOnDisk(&'static str);
+        impl TranscriptIndex for TranscriptOnDisk {
+            fn candidates_for(&self, _working_dir: &str) -> Vec<TranscriptCandidate> {
+                vec![TranscriptCandidate {
+                    session_id: self.0.to_string(),
+                    config_dir: "/config".into(),
+                    started_at_unix: Some(1_000),
+                }]
+            }
+            fn transcript_exists(&self, _session_id: &str, _working_dir: Option<&str>) -> bool {
+                true
+            }
+        }
+
+        fn live_pane() -> Vec<LivePty> {
+            vec![LivePty {
+                terminal_id: "pane-1".into(),
+                pid: Some(1),
+                working_dir: "/repo".into(),
+                page_id: "p".into(),
+                title: "t".into(),
+                ai_pid: Some(31524),
+                ai_start_unix: Some(1_000),
+            }]
+        }
+
+        fn coord_rekey_patches(g: &CoordRecorder, row: Uuid) -> usize {
+            g.patches
+                .iter()
+                .filter(|(id, b)| *id == row && b.get("claude_code_session_id").is_some())
+                .count()
+        }
+
         /// 409 `harness_session_already_bound` → `refused` +1 (never `landed`),
         /// the row leaves the queue, the next tick restores the local id and
         /// re-queues; once the competing row lapses a 2xx gives `landed` +1 and
@@ -10769,8 +10853,8 @@ mod tests {
                 ledger.counts(RekeySource::Rung2),
                 SourceCounts {
                     queued: 1,
-                    landed: 0,
-                    refused: 1
+                    refused: 1,
+                    ..SourceCounts::default()
                 }
             );
             assert!(
@@ -10780,15 +10864,15 @@ mod tests {
             assert_eq!(ledger.last_landed(row), None);
 
             // Next tick: restored to what coord holds, then re-queued by rung 2.
-            settle_refusals(&reg);
-            assert_eq!(
-                local_id(&reg, row).as_deref(),
-                Some(PIN),
-                "local id restored"
-            );
-            let tick2 = rekey_rung2_binds(&reg, &rung2("t1", LIVE), lookup, |_| false);
+            let tick2 = apply_reconcile_tick(&reg, &rung2("t1", LIVE), lookup);
             assert_eq!(tick2, vec![("t1".to_string(), RekeyOutcome::Queued)]);
-            assert_eq!(rekey_rows(&outbox, row).len(), 1);
+            let rows = rekey_rows(&outbox, row);
+            assert_eq!(rows.len(), 1, "one re-key per tick: {rows:?}");
+            assert_eq!(
+                rows[0]["rekey_previous"],
+                json!(PIN),
+                "local id restored before the re-queue"
+            );
 
             // The competing row lapses: coord accepts.
             rec.lock().await.rekey_conflict_ids.clear();
@@ -10798,7 +10882,8 @@ mod tests {
                 SourceCounts {
                     queued: 2,
                     landed: 1,
-                    refused: 1
+                    refused: 1,
+                    rejected: 0,
                 }
             );
             assert_eq!(ledger.last_landed(row).as_deref(), Some(LIVE));
@@ -10838,7 +10923,8 @@ mod tests {
         }
 
         /// A plain-state 409 (row gone / already in target state) stays the
-        /// idempotent `Acked`; so does a re-key 409 carrying any OTHER code.
+        /// idempotent `Acked`. A re-key 409 carrying any OTHER code keeps the ack
+        /// too, but coord did not apply it, so the ledger hears `rejected`.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_plain_state_409_stays_acked() {
             let _amb = crate::test_env::isolated_ambient();
@@ -10871,8 +10957,145 @@ mod tests {
             ));
             assert_eq!(
                 coord.rekeys().counts(RekeySource::Rung2),
-                SourceCounts::default()
+                SourceCounts {
+                    rejected: 1,
+                    ..SourceCounts::default()
+                }
             );
+        }
+
+        /// Any other 4xx voids a re-key without a 409: `rejected` +1 (never
+        /// `landed`), the record goes back to what coord holds, and the next tick
+        /// re-queues it, so the id does not read "already current" for good.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_rejected_rekey_is_restored_and_requeued_until_it_lands() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, outbox, rec, _dir) = harness().await;
+            rec.lock().await.patch_status = Some(403);
+            let row = reg
+                .register_external_with_lineage(make_test_intent(), None, Some(PIN.into()))
+                .unwrap();
+            assert_eq!(
+                confirm_for_session(&reg, row, LIVE, RekeySource::Hook),
+                RekeyOutcome::Queued
+            );
+            coord.drain_once_for_test().await;
+            assert_eq!(
+                coord.rekeys().counts(RekeySource::Hook),
+                SourceCounts {
+                    queued: 1,
+                    rejected: 1,
+                    ..SourceCounts::default()
+                }
+            );
+            assert!(outbox.pending().unwrap().is_empty());
+
+            apply_reconcile_tick(&reg, &[], |_| None);
+            let rows = rekey_rows(&outbox, row);
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0]["rekey_previous"], json!(PIN));
+
+            rec.lock().await.patch_status = None;
+            coord.drain_once_for_test().await;
+            assert_eq!(coord.rekeys().counts(RekeySource::Hook).landed, 1);
+            assert_eq!(coord.rekeys().last_landed(row).as_deref(), Some(LIVE));
+        }
+
+        /// Through the seam and the tick: once coord has rejected an id
+        /// `REJECTED_RETRY_LIMIT` times, a tick during the cooldown queues
+        /// nothing (the evidence is deferred), and the first tick after the
+        /// cooldown re-queues the deferred evidence, which then lands.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_rejected_rekey_waits_out_its_cooldown_then_lands() {
+            use crate::session::coord_identity::REJECTED_RETRY_LIMIT;
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, outbox, rec, _dir) = harness().await;
+            rec.lock().await.patch_status = Some(403);
+            let row = reg
+                .register_external_with_lineage(make_test_intent(), None, Some(PIN.into()))
+                .unwrap();
+            assert_eq!(
+                confirm_for_session(&reg, row, LIVE, RekeySource::Hook),
+                RekeyOutcome::Queued
+            );
+            coord.drain_once_for_test().await;
+            for _ in 1..REJECTED_RETRY_LIMIT {
+                apply_reconcile_tick(&reg, &[], |_| None);
+                assert_eq!(rekey_rows(&outbox, row).len(), 1);
+                coord.drain_once_for_test().await;
+            }
+            assert_eq!(
+                coord.rekeys().counts(RekeySource::Hook).rejected,
+                u64::from(REJECTED_RETRY_LIMIT)
+            );
+
+            // In the cooldown: the tick's retry is deferred and queues nothing.
+            apply_reconcile_tick(&reg, &[], |_| None);
+            assert!(rekey_rows(&outbox, row).is_empty());
+            assert_eq!(local_id(&reg, row).as_deref(), Some(PIN));
+            assert_eq!(
+                confirm_for_session(&reg, row, LIVE, RekeySource::Hook),
+                RekeyOutcome::CoolingDown
+            );
+            apply_reconcile_tick(&reg, &[], |_| None);
+            assert!(rekey_rows(&outbox, row).is_empty());
+            assert_eq!(
+                coord.rekeys().counts(RekeySource::Hook).queued,
+                u64::from(REJECTED_RETRY_LIMIT)
+            );
+
+            // The cooldown ends: the deferred evidence is the only retry left.
+            coord.rekeys().end_cooldowns_for_test();
+            rec.lock().await.patch_status = None;
+            apply_reconcile_tick(&reg, &[], |_| None);
+            let rows = rekey_rows(&outbox, row);
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0]["claude_code_session_id"], json!(LIVE));
+            coord.drain_once_for_test().await;
+            assert_eq!(coord.rekeys().counts(RekeySource::Hook).landed, 1);
+            assert_eq!(coord.rekeys().last_landed(row).as_deref(), Some(LIVE));
+        }
+
+        /// A refusal on a session that has since closed restores the record and
+        /// queues nothing: there is no re-key to chase behind a `closed` row.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refused_rekey_is_not_retried_on_a_closed_session() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, outbox, rec, _dir) = harness().await;
+            rec.lock().await.rekey_conflict_ids = vec![LIVE.to_string()];
+            let row = reg
+                .register_external_with_lineage(make_test_intent(), None, Some(PIN.into()))
+                .unwrap();
+            confirm_for_session(&reg, row, LIVE, RekeySource::Hook);
+            coord.drain_once_for_test().await;
+            assert_eq!(coord.rekeys().counts(RekeySource::Hook).refused, 1);
+
+            reg.close_by_id(row).unwrap();
+            apply_reconcile_tick(&reg, &[], |_| None);
+            assert!(rekey_rows(&outbox, row).is_empty());
+            assert_eq!(local_id(&reg, row).as_deref(), Some(PIN));
+        }
+
+        /// A tick that has both a refusal to retry and newer evidence for the
+        /// same row sends only the newer evidence.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_tick_queues_one_rekey_per_row_and_newer_evidence_wins() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, outbox, rec, _dir) = harness().await;
+            rec.lock().await.rekey_conflict_ids = vec![LIVE.to_string()];
+            let row = reg
+                .register_external_with_lineage(make_test_intent(), None, Some(PIN.into()))
+                .unwrap();
+            confirm_for_session(&reg, row, LIVE, RekeySource::Hook);
+            coord.drain_once_for_test().await;
+
+            let tick = apply_reconcile_tick(&reg, &rung2("t1", PREV_BOOT), |t| {
+                (t == "t1").then_some(row)
+            });
+            assert_eq!(tick, vec![("t1".to_string(), RekeyOutcome::Queued)]);
+            let rows = rekey_rows(&outbox, row);
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0]["claude_code_session_id"], json!(PREV_BOOT));
         }
 
         /// Phase 2: a `Found` resume of a persisted row last keyed X queues the
@@ -10943,6 +11166,33 @@ mod tests {
             assert_eq!(started.payload["claude_code_session_id"], json!(PREV_BOOT));
             assert!(rekey_rows(&outbox, fresh).is_empty());
             assert_eq!(coord.rekeys().counts(RekeySource::R2Resume).queued, 0);
+        }
+
+        /// Phase 2: with coord unreachable the resume is optimistic and still
+        /// queues the `r2_resume` re-key.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_unreachable_resume_probe_still_queues_the_rekey() {
+            let _amb = crate::test_env::isolated_ambient();
+            let dir = tempfile::tempdir().unwrap();
+            let outbox = build_outbox(dir.path());
+            let coord = CoordSync::new_for_test(
+                outbox.clone(),
+                "http://127.0.0.1:1".to_string(),
+                Duration::from_millis(50),
+                Duration::from_secs(10),
+            );
+            let reg = build_registry(coord.clone());
+            let persisted = Uuid::new_v4();
+            let resumed = reg
+                .resume_external(persisted, make_test_intent(), Some(LIVE.into()))
+                .await
+                .unwrap();
+            assert_eq!(resumed, persisted);
+            let rows = rekey_rows(&outbox, persisted);
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0]["rekey_source"], json!("r2_resume"));
+            assert_eq!(coord.rekeys().counts(RekeySource::R2Resume).queued, 1);
+            assert_eq!(local_id(&reg, persisted).as_deref(), Some(LIVE));
         }
 
         /// Phase 2: a probe coord REFUSED (401/403) resumes optimistically and
@@ -11030,6 +11280,108 @@ mod tests {
                 .filter(|(id, b)| *id == row && b.get("claude_code_session_id").is_some())
                 .count();
             assert_eq!(n, 1, "no second re-key PATCH");
+        }
+
+        /// ARMING, the CONFIRMED arm: a transcript for the argv's id is on disk,
+        /// so the first pass binds confirmed and every later pass answers
+        /// `LeaveAlone`. No bind will ever re-supply the id, so a refusal has to
+        /// be retried by the tick itself, or the row stays stale for the
+        /// runner's life. Asserted on what coord received.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn arming_a_confirmed_rung2_rekey_refused_once_lands_when_the_conflict_clears() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, _outbox, rec, dir) = harness().await;
+            rec.lock().await.rekey_conflict_ids = vec![LIVE.to_string()];
+            let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+            let row = reg
+                .register_external_with_lineage(make_test_intent(), None, Some(PIN.into()))
+                .unwrap();
+            let live = live_pane();
+            let cmdlines: HashMap<u32, String> = [(31524u32, LIVE.to_string())].into();
+            let index = TranscriptOnDisk(LIVE);
+            let snapshot = crate::process_capture::process_tree::ProcessSnapshot::default();
+            let lookup = |t: &str| (t == "pane-1").then_some(row);
+
+            let first = run_reconcile(&store, &live, &snapshot, &index, &cmdlines);
+            assert!(
+                first.iter().any(|a| matches!(
+                    a,
+                    ReconcileAction::Bind {
+                        confirmed: true,
+                        ..
+                    }
+                )),
+                "{first:?}"
+            );
+            apply_reconcile_tick(&reg, &first, lookup);
+            coord.drain_once_for_test().await;
+            assert_eq!(coord.rekeys().counts(RekeySource::Rung2).refused, 1);
+            assert_eq!(coord_rekey_patches(&*rec.lock().await, row), 1);
+
+            let second = run_reconcile(&store, &live, &snapshot, &index, &cmdlines);
+            assert!(
+                second
+                    .iter()
+                    .all(|a| matches!(a, ReconcileAction::LeaveAlone { .. })),
+                "a confirmed record is never re-bound: {second:?}"
+            );
+            apply_reconcile_tick(&reg, &second, lookup);
+            coord.drain_once_for_test().await;
+            assert_eq!(coord.rekeys().counts(RekeySource::Rung2).refused, 2);
+            assert_eq!(coord_rekey_patches(&*rec.lock().await, row), 2);
+
+            rec.lock().await.rekey_conflict_ids.clear();
+            apply_reconcile_tick(&reg, &second, lookup);
+            coord.drain_once_for_test().await;
+            assert_eq!(coord.rekeys().counts(RekeySource::Rung2).landed, 1);
+            assert_eq!(coord.rekeys().last_landed(row).as_deref(), Some(LIVE));
+            assert_eq!(
+                rec.lock()
+                    .await
+                    .patches
+                    .iter()
+                    .rfind(|(id, b)| *id == row && b.get("claude_code_session_id").is_some())
+                    .map(|(_, b)| b.clone()),
+                Some(json!({"claude_code_session_id": LIVE, "heartbeat": true}))
+            );
+
+            apply_reconcile_tick(&reg, &second, lookup);
+            coord.drain_once_for_test().await;
+            assert_eq!(
+                coord_rekey_patches(&*rec.lock().await, row),
+                3,
+                "nothing more once it landed"
+            );
+        }
+
+        /// ARMING, the confirmed bind that arrives before the pane has a coord
+        /// row (the boot pass, or the `resume_external` probe's window): it is
+        /// spent on that tick, so the tick has to remember it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn arming_a_confirmed_rung2_bind_before_the_row_exists_lands_once_it_does() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, _outbox, rec, dir) = harness().await;
+            let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+            let row = reg
+                .register_external_with_lineage(make_test_intent(), None, Some(PIN.into()))
+                .unwrap();
+            let live = live_pane();
+            let cmdlines: HashMap<u32, String> = [(31524u32, LIVE.to_string())].into();
+            let index = TranscriptOnDisk(LIVE);
+            let snapshot = crate::process_capture::process_tree::ProcessSnapshot::default();
+
+            let first = run_reconcile(&store, &live, &snapshot, &index, &cmdlines);
+            let outcome = apply_reconcile_tick(&reg, &first, |_| None);
+            assert_eq!(
+                outcome,
+                vec![("pane-1".to_string(), RekeyOutcome::NoCoordRow)]
+            );
+
+            let second = run_reconcile(&store, &live, &snapshot, &index, &cmdlines);
+            apply_reconcile_tick(&reg, &second, |t| (t == "pane-1").then_some(row));
+            coord.drain_once_for_test().await;
+            assert_eq!(coord.rekeys().counts(RekeySource::Rung2).landed, 1);
+            assert_eq!(coord_rekey_patches(&*rec.lock().await, row), 1);
         }
     }
 }
