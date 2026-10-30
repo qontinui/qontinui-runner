@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import { getApiPort } from "@/lib/runner-api";
+import { getApiBase } from "@/lib/runner-api";
 import type { UIBridgeRequestPayload, UIBridgeEventContext, PageEventTypes } from "./types";
 import { createLogger } from "@/lib/logger";
 import {
@@ -227,7 +227,7 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
             });
 
             try {
-              fetch(`http://localhost:${getApiPort()}/ui-bridge/control/render-log`, {
+              fetch(`${getApiBase()}/ui-bridge/control/render-log`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({

@@ -4839,6 +4839,13 @@ impl TerminalSession {
         self.exit_snapshot.lock().ok().and_then(|s| *s)
     }
 
+    /// Test seam: flip the liveness flag of a PTY-less fixture. Set it back to
+    /// `false` before the session drops, or `Drop` runs `close()`.
+    #[cfg(test)]
+    pub(crate) fn set_alive_for_test(&self, alive: bool) {
+        self.is_alive.store(alive, Ordering::Relaxed);
+    }
+
     /// The shell process's exit code, once the waiter thread has recorded one.
     ///
     /// `None` means either "still running" or "exited but the wait itself
@@ -5091,10 +5098,12 @@ fn on_exit_hook_code(code: Option<i32>, runner_initiated: bool) -> Option<i32> {
 /// Default per-thread join cap on the interactive close path.
 const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Default cap on the shutdown `taskkill` subprocess.
+/// Default cap on the pane-tree kill. On Windows that is an in-process walk
+/// (`qontinui_runner_win32::process_tree`), not a `taskkill` subprocess; the
+/// constant's name predates that change.
 const TASKKILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Floor under the `taskkill` cap. Every other step may be squeezed to nothing
+/// Floor under the kill cap. Every other step may be squeezed to nothing
 /// by an exhausted shutdown budget; the kill may not, because skipping it leaks
 /// a process tree that outlives the runner.
 const KILL_FLOOR: std::time::Duration = std::time::Duration::from_millis(500);
@@ -5305,6 +5314,13 @@ pub(crate) mod tests {
     /// `Environment` read).
     #[test]
     fn pty_finalize_child_env_scrubs_credential_values() {
+        // The scrub applies the LIVE model-gateway plan, which reads the
+        // runner config dir. A sibling test's `IsolatedAmbient` rewrites the
+        // process env (on Windows, `USERPROFILE` too, which can make the
+        // platform config dir unresolvable mid-test); an unresolvable dir is
+        // an unresolved gateway that pins `CLAUDE_CONFIG_DIR` away. Hold the
+        // fixture so this test reads a known, gateway-free config dir.
+        let _amb = crate::test_env::isolated_ambient();
         let mut cmd = CommandBuilder::new("dummy");
         for name in crate::terminal::CREDENTIAL_VALUE_ENV_VARS {
             cmd.env(name, "hunter2");
@@ -5349,6 +5365,13 @@ pub(crate) mod tests {
     /// running the same tail `spawn` runs.
     #[test]
     fn pty_finalize_child_env_scrub_beats_a_caller_supplied_credential() {
+        // The scrub applies the LIVE model-gateway plan, which reads the
+        // runner config dir. A sibling test's `IsolatedAmbient` rewrites the
+        // process env (on Windows, `USERPROFILE` too, which can make the
+        // platform config dir unresolvable mid-test); an unresolvable dir is
+        // an unresolved gateway that pins `CLAUDE_CONFIG_DIR` away. Hold the
+        // fixture so this test reads a known, gateway-free config dir.
+        let _amb = crate::test_env::isolated_ambient();
         let mut cmd = CommandBuilder::new("dummy");
         // As if `extra_env` had carried both a legitimate pin and a credential.
         cmd.env("CLAUDE_CONFIG_DIR", "/caller/pinned");

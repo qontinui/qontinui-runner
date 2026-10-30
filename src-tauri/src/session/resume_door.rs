@@ -317,6 +317,23 @@ fn admit(gate: DrainGate, cap_permits: impl FnOnce() -> bool) -> Result<(), Stri
     Ok(())
 }
 
+/// The skip reason for a resume while a model gateway is declared (or its
+/// state is unknown), `None` otherwise. PURE over `gateway_declared`.
+fn gateway_refusal(gateway_declared: bool) -> Option<String> {
+    gateway_declared.then(|| {
+        format!(
+            "model_gateway: {}; a resumed pane would run under the gateway's \
+             CLAUDE_CONFIG_DIR, where this session's transcript does not exist",
+            crate::model_gateway::SUBSCRIPTION_OFF_REASON
+        )
+    })
+}
+
+/// [`gateway_refusal`] over the live gateway state.
+fn live_gateway_refusal() -> Option<String> {
+    gateway_refusal(crate::model_gateway::gateway_declared())
+}
+
 /// One live `claude` process as read from the process table.
 #[derive(Debug, Clone)]
 struct ClaudeProc {
@@ -543,6 +560,13 @@ async fn resume_one(
     let Some(_in_flight) = InFlight::claim(&cand.id) else {
         return ResumeRow::skipped(&cand.id, "in_flight");
     };
+    // Under a model gateway the resumed pane runs with the gateway's
+    // CLAUDE_CONFIG_DIR (finalize_child_env pins it), where this session's
+    // transcript does not exist, so `--resume` would find nothing. Refuse the
+    // same way account migration does.
+    if let Some(why) = live_gateway_refusal() {
+        return ResumeRow::skipped(&cand.id, why);
+    }
     // A live claude already running this id: resuming would be a second
     // process on one transcript.
     match live_holder(&cand.id).await {
@@ -812,6 +836,7 @@ mod tests {
             provider: super::super::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
             origin: None,
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: None,
             handle: None,
             account_label: None,
@@ -830,11 +855,39 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
         }
     }
 
     fn reason(r: Result<Candidate, String>) -> String {
         r.expect_err("must be skipped")
+    }
+
+    #[test]
+    fn a_declared_gateway_refuses_the_resume_with_a_reason() {
+        assert_eq!(gateway_refusal(false), None);
+        let why = gateway_refusal(true).expect("refused");
+        assert!(why.starts_with("model_gateway: "), "{why}");
+        assert!(why.contains("transcript does not exist"), "{why}");
+    }
+
+    /// Wiring: the live reader follows the gateway state (a recorded gateway
+    /// with no declaration reads UNKNOWN, which also refuses).
+    #[test]
+    fn the_live_gateway_state_reaches_the_resume_refusal() {
+        let _amb = crate::test_env::isolated_ambient();
+        assert_eq!(live_gateway_refusal(), None);
+        let g = crate::model_gateway::ModelGatewaySettings {
+            base_url: Some("https://resume-gw.example.com".to_string()),
+            api_key_helper: Some("echo resume-key".to_string()),
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap()
+        .unwrap();
+        crate::model_gateway::write_marker_at(&crate::model_gateway::gateway_dir().unwrap(), &g)
+            .unwrap();
+        assert!(live_gateway_refusal().is_some());
     }
 
     #[test]

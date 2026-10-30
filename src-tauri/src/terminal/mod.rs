@@ -33,6 +33,7 @@ pub mod remote_pane_io;
 mod scan_gate;
 pub mod scan_interval;
 pub mod session;
+pub mod session_carry;
 pub mod transcript;
 pub mod transcript_watcher;
 #[cfg(test)]
@@ -200,6 +201,18 @@ pub(crate) fn scrub_credential_env_pty(cmd: &mut portable_pty::CommandBuilder) {
     for name in CREDENTIAL_VALUE_ENV_VARS {
         cmd.env_remove(name);
     }
+    apply_model_gateway_env_pty(cmd);
+}
+
+/// Twin of [`apply_model_gateway_env_std`] for this seam's `Command` type.
+fn apply_model_gateway_env_pty(cmd: &mut portable_pty::CommandBuilder) {
+    let plan = crate::model_gateway::live_child_env_plan();
+    for name in &plan.remove {
+        cmd.env_remove(name);
+    }
+    for (k, v) in &plan.set {
+        cmd.env(k, v);
+    }
 }
 
 /// Strip [`CREDENTIAL_VALUE_ENV_VARS`] from a tokio child's environment.
@@ -210,6 +223,18 @@ pub(crate) fn scrub_credential_env_pty(cmd: &mut portable_pty::CommandBuilder) {
 pub(crate) fn scrub_credential_env_tokio(cmd: &mut tokio::process::Command) {
     for name in CREDENTIAL_VALUE_ENV_VARS {
         cmd.env_remove(name);
+    }
+    apply_model_gateway_env_tokio(cmd);
+}
+
+/// Twin of [`apply_model_gateway_env_std`] for this seam's `Command` type.
+fn apply_model_gateway_env_tokio(cmd: &mut tokio::process::Command) {
+    let plan = crate::model_gateway::live_child_env_plan();
+    for name in &plan.remove {
+        cmd.env_remove(name);
+    }
+    for (k, v) in &plan.set {
+        cmd.env(k, v);
     }
 }
 
@@ -231,6 +256,24 @@ pub(crate) fn scrub_credential_env_tokio(cmd: &mut tokio::process::Command) {
 pub(crate) fn scrub_credential_env_std(cmd: &mut std::process::Command) {
     for name in CREDENTIAL_VALUE_ENV_VARS {
         cmd.env_remove(name);
+    }
+    apply_model_gateway_env_std(cmd);
+}
+
+/// The model-gateway half of the child env posture
+/// ([`crate::model_gateway::live_child_env_plan`]): on an install that declares
+/// a gateway, the child runs under the gateway config dir with
+/// `ANTHROPIC_BASE_URL` set and env-borne vendor credentials removed. It runs
+/// inside the scrub, which every seam calls LAST, so it overrides any
+/// subscription-account `CLAUDE_CONFIG_DIR` pin set earlier in the seam. A
+/// no-op without a gateway.
+fn apply_model_gateway_env_std(cmd: &mut std::process::Command) {
+    let plan = crate::model_gateway::live_child_env_plan();
+    for name in &plan.remove {
+        cmd.env_remove(name);
+    }
+    for (k, v) in &plan.set {
+        cmd.env(k, v);
     }
 }
 

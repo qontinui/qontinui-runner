@@ -1452,12 +1452,14 @@ fn workspace_root() -> qontinui_types::paths::WorkspaceRoot {
     // Standalone `qontinui_profile env capture`: no bin crate booted, so no
     // door. This arm provably CANNOT read `paths.workspace_root` (the setting
     // lives behind the bin-crate settings facade), which is why it passes
-    // `configured: None` rather than pretending to have looked.
+    // `configured: None` rather than pretending to have looked. It is a
+    // process-level capture with no agent session, so `session_repo` is `None`.
     let exe = std::env::current_exe().ok();
     qontinui_types::paths::qontinui_workspace_root(
         None,
         exe.as_deref()
             .map(|e| qontinui_types::paths::WorkspaceAnchor::new(e, RUNNER_REPO_DIR)),
+        None,
     )
 }
 
@@ -3343,7 +3345,7 @@ fn collect_claude_accounts_from(
     let mut config_dirs: Vec<String> = Vec::new();
     // Mirrors `AccountSelectionMode::default()` (settings.rs) — the mode a
     // roster/settings file with no explicit field resolves to.
-    let mut local_selection_mode = String::from("highest_expected_usage");
+    let mut local_selection_mode = String::from("alternating_handoff");
     let mut launch_commands: HashMap<String, String> = HashMap::new();
     let mut accounts_file_found = false;
 

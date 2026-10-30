@@ -80,6 +80,7 @@ mcp/unified_workflows.rs | run_composed_workflow | autonomous | run_composed_wor
 mcp/unified_workflows.rs | run_unified_workflow | autonomous | run_unified_workflow
 meta_optimizer/trigger.rs | launch_optimizer_internal | autonomous | launch_optimizer_internal
 orchestration_loop/ai_session_executor.rs | dispatch_subtask | autonomous | dispatch_subtask
+orchestration_loop/fix_agent.rs | build_fix_agent_command_with | helper | build_fix_agent_command_with(
 orchestration_loop/fix_agent.rs | build_fix_agent_command | helper | build_fix_agent_command(
 orchestration_loop/fix_agent.rs | run_fix_agent | exempt | the fix step of an orchestration loop ALREADY running — carries DrainAdmission::Exempt; the loop's own fan-out is the new work the drain defers
 reflection/trigger.rs | launch_project_reflection | autonomous | launch_project_reflection
@@ -96,6 +97,7 @@ session/transport/pty.rs | start | helper | transport.start(
 step_executor/handlers/mod.rs | execute_with_tools | exempt | a step of a workflow run that is already running; every workflow START is a gated row here
 terminal/account_migration.rs | handle_usage_limit_hint | exempt | moves a live session that hit its usage limit onto another account — the work is already running
 terminal/account_migration.rs | migrate_session | helper | migrate_session(
+terminal/account_migration.rs | migrate_session_off_runtime | helper | migrate_session_off_runtime(
 terminal/account_migration.rs | spawn_resumed_pane | helper | spawn_resumed_pane(
 trigger_system/executor.rs | execute_triggered_workflow | autonomous | execute_triggered_workflow
 unified_ai_session.rs | execute | exempt | a phase of a unified-workflow run that is already running; every workflow START is a gated row here

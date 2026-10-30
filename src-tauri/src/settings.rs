@@ -99,14 +99,41 @@ pub enum CliExecutionMode {
     Native,        // Native *nix execution
 }
 
-/// Account selection strategy for multi-account Claude CLI setups
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+/// Account selection strategy for multi-account Claude CLI setups.
+///
+/// Deserialization is tolerant: a spelling this build does not know (a mode
+/// added by a newer runner, written into the machine-wide
+/// `claude-accounts.json` every runner on the box reads) decodes to the
+/// default with a warning instead of failing the whole document.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountSelectionMode {
-    Manual,     // Use the explicitly configured config_dir
+    Manual,               // Use the explicitly configured config_dir
     LeastUsage, // Auto-select the account with lowest utilization relative to expected pace.
+    HighestExpectedUsage, // Auto-select, among accounts under their expected pace, the one with the highest expected usage.
+    /// Among accounts under their expected pace, pick at random, weighted by
+    /// `expected * (expected - actual)`.
+    WeightedRandom,
+    /// Among accounts under their expected pace, ranked by expected usage
+    /// (highest first), alternate handoffs between the first account and each
+    /// of the others in turn (1,2,1,3,1,4,1,2,...), from the handoffs of the
+    /// last 3 hours. Spawn-time selection takes the first account. No-op when
+    /// fewer than two config dirs are configured, so safe as the default.
     #[default]
-    HighestExpectedUsage, // Auto-select, among accounts under their expected pace, the one with the highest expected usage. No-op when fewer than two config dirs are configured, so safe as the default.
+    AlternatingHandoff,
+}
+
+impl<'de> Deserialize<'de> for AccountSelectionMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Ok(AccountSelectionMode::from_wire(&raw).unwrap_or_else(|| {
+            tracing::warn!(
+                mode = %raw,
+                "unknown account_selection_mode — using the default; a newer runner may have written it"
+            );
+            AccountSelectionMode::default()
+        }))
+    }
 }
 
 impl AccountSelectionMode {
@@ -123,7 +150,26 @@ impl AccountSelectionMode {
             AccountSelectionMode::Manual => "manual",
             AccountSelectionMode::LeastUsage => "least_usage",
             AccountSelectionMode::HighestExpectedUsage => "highest_expected_usage",
+            AccountSelectionMode::WeightedRandom => "weighted_random",
+            AccountSelectionMode::AlternatingHandoff => "alternating_handoff",
         }
+    }
+
+    /// Every mode, in declaration order — the one list wire-spelling parsers
+    /// walk, so a new variant cannot be missed by one of them.
+    pub const ALL: [AccountSelectionMode; 5] = [
+        AccountSelectionMode::Manual,
+        AccountSelectionMode::LeastUsage,
+        AccountSelectionMode::HighestExpectedUsage,
+        AccountSelectionMode::WeightedRandom,
+        AccountSelectionMode::AlternatingHandoff,
+    ];
+
+    /// Parse a wire spelling (trimmed, case-insensitive); `None` when it names
+    /// no mode.
+    pub fn from_wire(raw: &str) -> Option<AccountSelectionMode> {
+        let level = raw.trim().to_ascii_lowercase();
+        Self::ALL.into_iter().find(|mode| mode.as_str() == level)
     }
 }
 
@@ -152,9 +198,9 @@ pub struct ClaudeCliSettings {
     /// Automatically migrate a terminal Claude session to another configured
     /// account when its account runs out of tokens: a usage-limit message in
     /// the PTY output, confirmed by a fresh usage probe, triggers a
-    /// transcript copy + `claude --resume` respawn under the account whose
-    /// spare weekly capacity is closest to expiring — unused capacity does not
-    /// roll over past the reset (see `terminal::account_migration`).
+    /// transcript copy + `claude --resume` respawn under the account the
+    /// selection mode's handoff strategy picks (see
+    /// `terminal::account_migration` and `ai_provider::account_usage`).
     /// No-op when fewer than two accounts are configured.
     #[serde(default = "default_auto_migrate_on_token_exhaustion")]
     pub auto_migrate_on_token_exhaustion: bool,
@@ -181,7 +227,7 @@ impl Default for ClaudeCliSettings {
             custom_path: None,
             timeout_seconds: 600,
             config_dir: None,
-            account_selection_mode: AccountSelectionMode::HighestExpectedUsage,
+            account_selection_mode: AccountSelectionMode::default(),
             account_selection_pinned: false,
             auto_migrate_on_token_exhaustion: default_auto_migrate_on_token_exhaustion(),
             auto_continue_after_migration: default_auto_continue_after_migration(),
@@ -3227,7 +3273,7 @@ fn default_session_guard_critical_free_commit_bytes() -> u64 {
 /// Both shipped ceilings are fractions of the one resource they protect:
 /// tokio's blocking pool, whose default `max_blocking_threads` is **512**.
 /// 256 is half of it — half the pool consumed is the point where back-pressure
-/// starts being worth its cost, and it is the number `thread_pressure`'s WARN
+/// starts being worth its cost, and it is the number the thread lane's WARN
 /// band hands to a gate continuation deciding whether to wait. The headroom it
 /// leaves above the calibration box's idle floor (256 − 151 = 105) is what
 /// `resource_guard` keeps CONSTANT on every machine as the blocking-pool arm of
@@ -3811,6 +3857,26 @@ pub struct Settings {
     /// since plan 2026-09-12 Phase 5).
     #[serde(default)]
     pub terminal: TerminalSettings,
+    /// Model gateway declaration (plan
+    /// `2026-10-09-spec-front-end-of-the-software-factory` Phase 9, D12). An
+    /// empty `base_url` (the default) means no gateway: every behavior is
+    /// unchanged. See [`crate::model_gateway`].
+    #[serde(default)]
+    pub model_gateway: crate::model_gateway::ModelGatewaySettings,
+    /// Permission posture for runner-spawned `claude` sessions (plan
+    /// `2026-10-09-spec-front-end-of-the-software-factory` Phase 9, D7). The
+    /// default keeps each spawn site's bypass flag. `allow_list` replaces it
+    /// with a pre-approved tool list, for machines whose IT-managed Claude Code
+    /// settings disable bypass mode. Read per spawn: into
+    /// [`crate::claude_session::launch_spec::LaunchConfig::from_settings`] (every
+    /// `LaunchSpec` spawn site, the typed resume renderer
+    /// `commands::config::build_ai_resume_command`, and the provider-adapter
+    /// launch spec), by the scheduler's RemoteAgent launch (intersected with the
+    /// task's tools), and by the orchestration fix agent. Settings layers the
+    /// runner does not own (a repository's `.claude/settings.json`, managed
+    /// settings) can still pre-approve more tools.
+    #[serde(default)]
+    pub claude_session_permission: crate::claude_session::launch_spec::SessionPermissionSetting,
 }
 
 /// `terminal.*` — how a LOCAL terminal pane is backed.
@@ -6565,6 +6631,46 @@ pub fn save_remote_create_preference(pref: AcceptRemoteCreate) -> Result<(), Str
     update_settings(|settings| settings.remote_create.accept_remote_create = pref)
 }
 
+/// Get the model gateway declaration. See [`crate::model_gateway`].
+pub fn get_model_gateway() -> crate::model_gateway::ModelGatewaySettings {
+    crate::model_gateway::current_settings()
+}
+
+/// Validate, normalize and persist the model gateway declaration. An invalid
+/// declaration is refused and nothing is written. Returns what was stored.
+pub fn save_model_gateway(
+    value: crate::model_gateway::ModelGatewaySettings,
+) -> Result<crate::model_gateway::ModelGatewaySettings, String> {
+    let normalized = value.normalized();
+    normalized.validate()?;
+    let stored = normalized.clone();
+    update_settings(move |settings| settings.model_gateway = normalized)?;
+    // The sticky marker (written for a gateway, deleted for an explicit clear)
+    // is what lets a later settings reset read as UNKNOWN rather than "no
+    // gateway" — see `model_gateway` "Fail closed".
+    crate::model_gateway::record_saved_declaration(&stored)?;
+    Ok(stored)
+}
+
+/// Get the session permission posture. See [`Settings::claude_session_permission`].
+///
+/// Read-only loader: consulted per spawn by `LaunchConfig::from_settings`.
+pub fn get_claude_session_permission(
+) -> crate::claude_session::launch_spec::SessionPermissionSetting {
+    read_settings_from_disk().settings.claude_session_permission
+}
+
+/// Validate, normalize and persist the session permission posture. Returns what
+/// was stored.
+pub fn save_claude_session_permission(
+    value: crate::claude_session::launch_spec::SessionPermissionSetting,
+) -> Result<crate::claude_session::launch_spec::SessionPermissionSetting, String> {
+    let normalized = value.normalized()?;
+    let stored = normalized.clone();
+    update_settings(move |settings| settings.claude_session_permission = normalized)?;
+    Ok(stored)
+}
+
 /// Get the cloud memory link-expansion arm flag. Default false — see
 /// [`Settings::memory_link_expansion_enabled`].
 pub fn get_memory_link_expansion_enabled() -> bool {
@@ -7132,14 +7238,30 @@ mod account_selection_mode_tests {
     /// silently seeing an unknown mode.
     #[test]
     fn selection_mode_str_matches_serde() {
-        for mode in [
-            AccountSelectionMode::Manual,
-            AccountSelectionMode::LeastUsage,
-            AccountSelectionMode::HighestExpectedUsage,
-        ] {
+        for mode in AccountSelectionMode::ALL {
             let serde_spelling = serde_json::to_value(mode).expect("serializes");
             assert_eq!(serde_spelling, serde_json::json!(mode.as_str()));
+            let back: AccountSelectionMode =
+                serde_json::from_value(serde_spelling).expect("round-trips");
+            assert_eq!(back, mode);
         }
+        // A spelling this build does not know decodes to the default rather
+        // than failing the document it sits in.
+        let unknown: AccountSelectionMode =
+            serde_json::from_value(serde_json::json!("from_a_newer_runner")).unwrap();
+        assert_eq!(unknown, AccountSelectionMode::default());
+        assert_eq!(
+            AccountSelectionMode::default(),
+            AccountSelectionMode::AlternatingHandoff
+        );
+        assert_eq!(
+            AccountSelectionMode::WeightedRandom.as_str(),
+            "weighted_random"
+        );
+        assert_eq!(
+            AccountSelectionMode::AlternatingHandoff.as_str(),
+            "alternating_handoff"
+        );
         // Pin the literals too: the coord half codes against these strings.
         assert_eq!(AccountSelectionMode::Manual.as_str(), "manual");
         assert_eq!(AccountSelectionMode::LeastUsage.as_str(), "least_usage");

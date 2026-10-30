@@ -23,6 +23,7 @@ vi.mock("./contexts", () => ({
     },
     closeTerminal: () => {},
     sessionStates: { "tab-0": "completed", "tab-1": "working" },
+    tabs: [],
   }),
   useTransitionEffects: () => ({ handleRestartInZone: () => {} }),
   useZoneMetadata: () => ({ labelsAndTags: { zoneLabels: {}, setZoneLabel: () => {} } }),
@@ -38,10 +39,17 @@ vi.mock("./useTerminalWindowActions", () => ({
   }),
 }));
 
-import { ZoneHoverActions } from "./ZoneHoverActions";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+import { ZoneHoverActions, hoverActionsSpanPx } from "./ZoneHoverActions";
+import {
+  ZONE_HEADER_HOVER_RESERVE_CLASS,
+  ZONE_HEADER_HOVER_RESERVE_PX,
+} from "./zone-grid/headerReserve";
 
 const render = (props: { zoneIdx: number; inline?: boolean }) =>
-  renderToStaticMarkup(<ZoneHoverActions {...props} />);
+  renderToStaticMarkup(<ZoneHoverActions labelZone={props.zoneIdx} {...props} />);
 
 describe("ZoneHoverActions", () => {
   it("default mode is the hover-revealed overlay", () => {
@@ -95,5 +103,56 @@ describe("ZoneHoverActions", () => {
     expect(render({ zoneIdx: 0, inline: true })).toContain('aria-disabled="false"');
     // tab-1 is `working`: restart is disabled.
     expect(render({ zoneIdx: 1, inline: true })).toContain('aria-disabled="true"');
+  });
+});
+
+/**
+ * Plan `2026-10-22-runner-terminal-overlays-cover-zone-content-and-controls`
+ * Phase 2 / F3: the revealed overlay must not cover the zone header's cwd
+ * label. The header pads its right end by `ZONE_HEADER_HOVER_RESERVE_PX` while
+ * the cell is hovered; these tests tie that number to the cluster as rendered,
+ * so adding a button (or widening one) without growing the reserve fails here.
+ */
+describe("header reserve for the hover overlay", () => {
+  it("covers the widest overlay this component renders", () => {
+    // Zone 0, not maximized, a labelable zone: every button is offered.
+    state.maximizedZone = null;
+    const html = render({ zoneIdx: 0 });
+    const buttons = (html.match(/<button/g) ?? []).length;
+    expect(buttons).toBe(6);
+    // The classes `hoverActionsSpanPx` is derived from. Widening a button or
+    // the cluster's padding changes one of these and fails here.
+    expect(html).toContain("absolute top-1 right-1");
+    expect(html).toContain("flex items-center gap-0.5 px-1 py-0.5 bg-[#13141f]/90 border ");
+    expect((html.match(/class="p-1 rounded/g) ?? []).length).toBe(buttons);
+    expect((html.match(/ w-3 h-3"/g) ?? []).length).toBe(buttons);
+    expect(hoverActionsSpanPx(buttons)).toBe(144);
+    expect(hoverActionsSpanPx(buttons)).toBeLessThanOrEqual(ZONE_HEADER_HOVER_RESERVE_PX);
+  });
+
+  it("the class carries the same number and applies on group hover", () => {
+    expect(ZONE_HEADER_HOVER_RESERVE_CLASS.split(" ")).toContain(
+      `group-hover:pr-[${ZONE_HEADER_HOVER_RESERVE_PX}px]`,
+    );
+  });
+
+  it("the zone header applies the reserve and keeps the cwd label reachable", () => {
+    const label = readFileSync(
+      fileURLToPath(new URL("./zone-grid/ZoneLabel.tsx", import.meta.url)),
+      "utf8",
+    );
+    expect(label).toContain("${ZONE_HEADER_HOVER_RESERVE_CLASS}");
+    // The cwd span carries the full path as its title and takes pointer
+    // events, or the title could never show.
+    const marker = label.indexOf("data-zone-cwd-label");
+    expect(marker).toBeGreaterThan(200);
+    const cwd = label.slice(marker - 200, marker);
+    expect(cwd).toContain("title={tab.workingDir}");
+    expect(cwd).not.toContain("pointer-events-none");
+  });
+
+  it("the overlay is anchored where the reserve assumes", () => {
+    state.maximizedZone = null;
+    expect(render({ zoneIdx: 0 })).toContain("absolute top-1 right-1");
   });
 });

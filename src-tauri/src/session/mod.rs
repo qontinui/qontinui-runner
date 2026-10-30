@@ -68,6 +68,7 @@ pub mod dual_write;
 pub mod handoff;
 pub mod intent;
 pub mod local_store;
+pub mod observation_epoch; // The last instant the liveness poll could SEE the process table — bounds open-row restore admission (plan 2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set, Phase 2)
 pub mod operator_touch; // Operator-touch idempotency-key + payload builder, shared by every B2 trigger (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)
 pub mod output_pipe;
 pub mod pane_store;
@@ -308,8 +309,9 @@ pub enum SessionEventKind {
     FindingPosted,
     /// Session FINISHED marker (plan
     /// `2026-09-01-session-finished-marker-and-unfinished-resume`, Phase 2).
-    /// Drained to `PATCH /sessions/:id {progress:{session_status:"finished"}}`
-    /// — the same door `Progress` uses, so the target is the URL path and the
+    /// Drained to `PATCH /sessions/:id {progress:{session_status:"finished",
+    /// last_progress_at}}` (the payload's `finished_at`, so coord dates the
+    /// finish at the mark rather than at the drain) — the same door `Progress` uses, so the target is the URL path and the
     /// peer-clobber trap in `coord_report_status` (which resolves an omitted
     /// `claude_code_session_id` to the device's most-recently-started session)
     /// does not apply to this rung.
@@ -512,6 +514,34 @@ struct SessionRecord {
     /// for the session's lifetime; aborted on close. `None` for the
     /// default (non-shared) session — zero overhead off the opt-in path.
     output_pipe: Option<tokio::task::JoinHandle<()>>,
+    /// What this process knows about the tenant coord's row for this record
+    /// carries — see [`RowTenant`]. Read by [`session_row_tenant`].
+    row_tenant: RowTenant,
+}
+
+/// What this process knows about the tenant of a session's coord row, as
+/// distinct from `intent.tenant_id` (the CURRENT stamp the data plane writes
+/// under, which [`session_tenant_scope`] reports).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowTenant {
+    /// The row was created FRESH from this record (`start_inner` /
+    /// `write_external_started`): this process AUTHORED the `Started` create
+    /// body, which names `intent.tenant_id`. That is what was SENT, not a coord
+    /// confirmation — nothing read the row back — so it says only that the
+    /// stamp and the create body are the same value.
+    Authored,
+    /// The record was RESUMED ([`SessionRegistry::resume_external`]) and coord's
+    /// 2xx answer to the resume probe's `PATCH /sessions/:id` — the row itself
+    /// (`SessionRow`) — named this `tenant_id`. Coord never updates a row's
+    /// tenant on a PATCH, so this is the tenant the row was created under. It
+    /// need not equal `intent.tenant_id`, which a resume re-stamps from the
+    /// CURRENT resolution.
+    Observed(Uuid),
+    /// The record was RESUMED and nothing observed the row's tenant: the probe
+    /// was unreachable or refused, or its 2xx body carried no parseable
+    /// `tenant_id`. The stamp is today's resolution; the row was created under
+    /// whatever resolved at its first registration.
+    Unobserved,
 }
 
 impl SessionRecord {
@@ -619,6 +649,200 @@ pub(crate) fn resolve_new_session_tenant() -> Option<Uuid> {
     tenant_for_new_session(tenant_pin::resolve_tenant_pin())
 }
 
+/// What [`resolve_new_session_tenant_in`] decided for a new session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewSessionTenant {
+    /// This tenant owns the session.
+    Stated(Uuid),
+    /// The machine states no tenant (unresolvable or unpaired) — today's
+    /// `None`, which downstream consumers may still fill from their own
+    /// device-level sources.
+    Unstated,
+    /// The workspace or the repo's ownership stated something this device
+    /// cannot act on: a tenant it holds no credential for, a declaration it
+    /// cannot read as a tenant, or several owning tenants none of which is the
+    /// default. A STANDING answer, recorded for the session's life. **Nothing
+    /// may fill this with the device default**: that would file the session
+    /// under another project.
+    Refused,
+    /// Whether this device may act as the named tenant could not be
+    /// established NOW (its credential store could not be read, or the
+    /// decision did not complete). Treated like [`Self::Refused`] — no tenant
+    /// stamped, never the default — but it is NOT a standing answer, so it is
+    /// not recorded: a later reader (the session's federation at spawn) asks
+    /// again.
+    Undetermined,
+}
+
+impl NewSessionTenant {
+    /// Whether this is a standing decision worth recording for the session's
+    /// life — everything but [`Self::Undetermined`].
+    pub(crate) fn is_standing(self) -> bool {
+        self != NewSessionTenant::Undetermined
+    }
+
+    /// The tenant to stamp, if any.
+    pub(crate) fn tenant(self) -> Option<Uuid> {
+        match self {
+            NewSessionTenant::Stated(t) => Some(t),
+            NewSessionTenant::Unstated
+            | NewSessionTenant::Refused
+            | NewSessionTenant::Undetermined => None,
+        }
+    }
+
+    fn from_machine(tenant: Option<Uuid>) -> Self {
+        tenant.map_or(NewSessionTenant::Unstated, NewSessionTenant::Stated)
+    }
+}
+
+/// [`resolve_new_session_tenant`] for a session whose spawn directory is
+/// known: the SAME authority order the coord-mcp proxy applies to a session
+/// nobody named a tenant for ([`crate::coord_mcp::decide_session_tenant`]) —
+/// the workspace's
+/// declaration (rows 1a-1c), then the tenant owning the repo in `workdir`
+/// (row 1d), then the machine rows — so an AI session spawned into a repo
+/// owned by tenant B is recorded and federated as B even while the machine's
+/// default is A (plan
+/// `2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant`
+/// Phase 5, the federation half #2029 deferred).
+///
+/// `workdir: None` is today's answer exactly. Note tier 1a reads the RUNNER
+/// process's `$QONTINUI_TENANT_ID`, exactly as the proxy does.
+///
+/// **One deliberate difference from the proxy:** a repo answer that has not
+/// SETTLED (a transient unknown — coord slow, a worktree not readable yet)
+/// falls through to the machine rows here, where the proxy refuses retryably
+/// on a multi-bound device. The proxy can afford that because its client asks
+/// again; this decision is made once and recorded for the session's life, so
+/// refusing on a transient would leave the session unregistered and
+/// unfederated for good. The machine rows are exactly the pre-repo-tier
+/// answer, and the warning below says so.
+///
+/// The repo read is bounded by `repo_tenant::CWD_TENANT_BUDGET`; callers pay
+/// it once per session, before the spawn.
+pub(crate) async fn resolve_new_session_tenant_in(
+    workdir: Option<&std::path::Path>,
+) -> NewSessionTenant {
+    let Some(workdir) = workdir else {
+        return NewSessionTenant::from_machine(resolve_new_session_tenant());
+    };
+    let repo = qontinui_runner_lib::repo_tenant::cwd_tenant_for_path(workdir).await;
+    if repo.is_transient() {
+        tracing::warn!(
+            "new-session tenant: the repo in {} has not settled ({repo:?}); this session is \
+             decided from the machine rows, as before the repo tier existed",
+            workdir.display()
+        );
+    }
+    let workdir = workdir.to_string_lossy().into_owned();
+    // The declaration and admission reads are filesystem I/O.
+    let decided = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+        let decision = decide_new_session_tenant(
+            workspace_tenant::read_workspace_declaration(Some(&workdir)),
+            repo,
+            tenant_pin::resolve_tenant_pin(),
+            crate::auth::default_binding_tenant,
+            crate::coord_mcp::validate_spawn_tenant,
+        );
+        (workdir, decision)
+    })
+    .await;
+    match decided {
+        Ok((workdir, decision)) => new_session_tenant_from_decision(
+            &workdir,
+            decision,
+            crate::auth::default_binding_tenant,
+        ),
+        // An executor failure is not evidence for the default — nor a standing
+        // answer.
+        Err(e) => {
+            tracing::warn!(
+                "new-session tenant: the tenant decision did not complete ({e}); stating no \
+                 tenant rather than the device default"
+            );
+            NewSessionTenant::Undetermined
+        }
+    }
+}
+
+/// The authority order for a NEW session, every input injected: a session
+/// with no binding of its own (so no row-1 pin) whose workspace declared
+/// `declaration` and whose repo resolved to `repo`, on a machine whose pin
+/// reads `live_pin`. `default_binding` is the default slot's tenant as
+/// [`tenant_for_new_session`] reads it; an `Unresolvable` machine states none
+/// (fail-closed, as there).
+fn decide_new_session_tenant(
+    declaration: workspace_tenant::WorkspaceDeclaration,
+    repo: qontinui_runner_lib::repo_tenant::CwdTenant,
+    live_pin: tenant_pin::TenantPin,
+    default_binding: impl FnOnce() -> Option<Uuid>,
+    admit: impl FnOnce(Uuid) -> Result<(), crate::coord_mcp::SpawnTenantRefusal>,
+) -> crate::coord_mcp::SessionTenantDecision {
+    crate::coord_mcp::decide_session_tenant(
+        // A new session has no binding of its own yet.
+        tenant_pin::TenantPin::Unpinned,
+        crate::coord_mcp::PinOrigin::MachineSampled,
+        || declaration,
+        || Some(repo),
+        live_pin,
+        move || {
+            (live_pin != tenant_pin::TenantPin::Unresolvable)
+                .then(default_binding)
+                .flatten()
+        },
+        admit,
+    )
+}
+
+/// The recorded tenant for one [`crate::coord_mcp::SessionTenantDecision`]
+/// (see [`resolve_new_session_tenant_in`]). Pure apart from `default_binding`,
+/// which is read only on the default-slot arm.
+fn new_session_tenant_from_decision(
+    workdir: &str,
+    decision: crate::coord_mcp::SessionTenantDecision,
+    default_binding: impl FnOnce() -> Option<Uuid>,
+) -> NewSessionTenant {
+    use crate::coord_mcp::SessionTenantDecision as D;
+    match decision {
+        D::BindingPin { tenant, .. }
+        | D::Declared { tenant, .. }
+        | D::RepoDerived { tenant, .. }
+        | D::LivePin(tenant)
+        | D::JwtClaim(tenant) => NewSessionTenant::Stated(tenant),
+        D::DefaultSlot => NewSessionTenant::from_machine(default_binding()),
+        D::Unresolvable => NewSessionTenant::Unstated,
+        // Admission could not be READ (the credential store was unreadable),
+        // or the repo has not settled: UNKNOWN now, not a standing refusal.
+        unknown @ (D::DeclaredTenantUnbound {
+            refusal: crate::coord_mcp::SpawnTenantRefusal::CredentialStoreUnreadable { .. },
+            ..
+        }
+        | D::RepoTenantUnbound {
+            refusal: crate::coord_mcp::SpawnTenantRefusal::CredentialStoreUnreadable { .. },
+            ..
+        }
+        | D::RepoUnsettled { .. }) => {
+            tracing::warn!(
+                "new-session tenant: whether a session spawned in {workdir} may act as its \
+                 tenant could not be established ({unknown:?}); stating no tenant rather than \
+                 the device default"
+            );
+            NewSessionTenant::Undetermined
+        }
+        refused @ (D::DeclaredTenantUnbound { .. }
+        | D::DeclaredTenantUnusable { .. }
+        | D::RepoTenantUnbound { .. }
+        | D::RepoTenantAmbiguous { .. }) => {
+            tracing::warn!(
+                "new-session tenant: no tenant can be stated for a session spawned in {workdir} \
+                 ({refused:?}); refusing rather than recording the device default"
+            );
+            NewSessionTenant::Refused
+        }
+    }
+}
+
 fn stamp_session_tenant(mut intent: Intent) -> Intent {
     if intent.tenant_id.is_none() {
         intent.tenant_id = resolve_new_session_tenant();
@@ -681,6 +905,21 @@ pub fn session_tenant_scope(session_id: Option<Uuid>) -> TenantScope {
         return TenantScope::Unresolved;
     };
     registry.tenant_scope_of(id)
+}
+
+/// What this process knows about the tenant of `session_id`'s coord row
+/// ([`RowTenant`]; [`TenantScope::Owned`] from [`session_tenant_scope`] is the
+/// CURRENT stamp, which for a resumed record need not be the row's). `None`
+/// when the registry is unreachable or does not hold the id. In-process only.
+///
+/// **Never call this while holding `SessionRegistry::sessions`** — same
+/// constraint as [`session_tenant_scope`].
+pub fn session_row_tenant(session_id: Option<Uuid>) -> Option<RowTenant> {
+    use tauri::Manager;
+    let id = session_id?;
+    let app = crate::tauri_app_handle::current()?;
+    let registry = app.try_state::<Arc<SessionRegistry>>()?;
+    registry.row_tenant_of(id)
 }
 
 impl SessionRegistry {
@@ -780,6 +1019,8 @@ impl SessionRegistry {
             transport: transport.clone(),
             transport_handle,
             output_pipe,
+            // A fresh `Started` row: this process authored its create body.
+            row_tenant: RowTenant::Authored,
         };
 
         // Outbox row first (durability before in-memory commit so a crash
@@ -1050,6 +1291,9 @@ impl SessionRegistry {
             // through this primitive). Phase 8 streaming only attaches to
             // sessions started via `start`/`start_with_parent`.
             output_pipe: None,
+            // A fresh `Started` row: this process authored its create body,
+            // which carries this tenant. Not a coord confirmation.
+            row_tenant: RowTenant::Authored,
         };
 
         let payload = json!({
@@ -1190,6 +1434,17 @@ impl SessionRegistry {
     ///   simply won't show it until the operator re-launches). A fresh POST
     ///   here would fail identically while coord is down, so re-using the
     ///   persisted id is the strictly-better choice (idempotent reconnect).
+    /// - **401 / 403** (coord refused the probe's credential) ->
+    ///   [`ResumeProbe::Refused`]: resumed exactly as the transient arm, but
+    ///   logged as a refusal, never as an outage.
+    ///
+    /// The resumed record's `intent.tenant_id` is re-stamped from the CURRENT
+    /// resolution and is NOT re-stamped from the row (that would change which
+    /// credential its writes use). What coord's row carries is recorded
+    /// separately (`SessionRecord::row_tenant`): [`RowTenant::Observed`] when
+    /// the 2xx answer — the row itself — named a `tenant_id`, else
+    /// [`RowTenant::Unobserved`]. The 404 fallback's fresh row is
+    /// [`RowTenant::Authored`].
     ///
     /// Returns the coord session id the pane should now persist (either the
     /// resumed `persisted_id` or the fresh fallback id).
@@ -1218,10 +1473,28 @@ impl SessionRegistry {
             .await;
 
         match probe {
-            ResumeProbe::Found => {
-                self.insert_resumed_record(persisted_id, intent);
+            ResumeProbe::Found(row_tenant) => {
+                match (row_tenant, intent.tenant_id) {
+                    (Some(row), Some(stamp)) if stamp != row => tracing::warn!(
+                        session = %persisted_id,
+                        row_tenant = %row,
+                        stamp = %stamp,
+                        "session: resumed coord row was created under a different tenant than \
+                         today's stamp — writes keep the stamp; session info shows the row's"
+                    ),
+                    (Some(row), None) => tracing::warn!(
+                        session = %persisted_id,
+                        row_tenant = %row,
+                        "session: resumed coord row names its tenant but today's stamp is \
+                         unresolved — session info shows the row's"
+                    ),
+                    _ => {}
+                }
+                let observed = row_tenant.map_or(RowTenant::Unobserved, RowTenant::Observed);
+                self.insert_resumed_record(persisted_id, intent, observed);
                 tracing::info!(
                     session = %persisted_id,
+                    row_tenant_observed = row_tenant.is_some(),
                     "session: resumed existing coord session (PATCH 2xx)"
                 );
                 Ok(persisted_id)
@@ -1236,10 +1509,25 @@ impl SessionRegistry {
             ResumeProbe::Unreachable => {
                 // Optimistic resume — coord is down, not the row. Re-use the
                 // persisted id so reconnect is idempotent.
-                self.insert_resumed_record(persisted_id, intent);
+                self.insert_resumed_record(persisted_id, intent, RowTenant::Unobserved);
                 tracing::warn!(
                     session = %persisted_id,
                     "session: coord unreachable during resume — resuming optimistically, drain loop will retry"
+                );
+                Ok(persisted_id)
+            }
+            ResumeProbe::Refused(status) => {
+                // Coord answered but refused the probe's credential (401/403).
+                // Resumption is unchanged — the same optimistic re-insert as
+                // `Unreachable`, so the pane keeps its row — but this is NOT a
+                // transient outage and is logged as what it is: nothing about
+                // the row, its existence or its tenant, was observed.
+                self.insert_resumed_record(persisted_id, intent, RowTenant::Unobserved);
+                tracing::warn!(
+                    session = %persisted_id,
+                    status,
+                    "session: coord REFUSED the resume probe's credential — resuming optimistically; \
+                     the row's existence and tenant are unconfirmed"
                 );
                 Ok(persisted_id)
             }
@@ -1251,7 +1539,12 @@ impl SessionRegistry {
     /// the drain loop reconciles coord. Mirrors [`Self::register_external`]'s
     /// record shape but reuses `persisted_id` and emits `StateChange`
     /// instead of `Started`.
-    fn insert_resumed_record(self: &Arc<Self>, persisted_id: Uuid, intent: Intent) {
+    fn insert_resumed_record(
+        self: &Arc<Self>,
+        persisted_id: Uuid,
+        intent: Intent,
+        row_tenant: RowTenant,
+    ) {
         let now = chrono::Utc::now();
         let claude_code_session_id = ambient_claude_code_session_id();
         let transport: DynTransport = Arc::new(transport::ExternalTransport);
@@ -1269,6 +1562,10 @@ impl SessionRegistry {
             transport,
             transport_handle: TransportHandle::External,
             output_pipe: None,
+            // A resumed row was created under whatever tenant resolved when it
+            // was FIRST registered; `intent.tenant_id` is today's resolution.
+            // Only coord's probe answer can name the row's (passed in).
+            row_tenant,
         };
 
         // Emit a state_change → PATCH so the drain loop re-activates the row
@@ -1502,6 +1799,17 @@ impl SessionRegistry {
         }
     }
 
+    /// What this process knows about the tenant of `id`'s coord row — see
+    /// [`RowTenant`]. `None` for an id the registry does not hold. The
+    /// hermetically testable half of [`session_row_tenant`].
+    pub fn row_tenant_of(&self, id: Uuid) -> Option<RowTenant> {
+        self.sessions
+            .lock()
+            .expect("session registry poisoned")
+            .get(&id)
+            .map(|r| r.row_tenant)
+    }
+
     /// Close-by-id — same idempotent semantics as
     /// [`SessionHandle::close`].
     pub fn close_by_id(&self, id: Uuid) -> Result<(), SessionError> {
@@ -1680,6 +1988,231 @@ mod tests {
         assert!(wire
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'));
+    }
+
+    // ── A new session's tenant follows its workspace and repo (plan
+    //    2026-09-20 Phase 5, the federation half) ──────────────────────────
+
+    const MACHINE_A: Uuid = Uuid::from_u128(0xa0a0_0000_0000_4000_8000_0000000000a1);
+    const REPO_B: Uuid = Uuid::from_u128(0xb0b0_0000_0000_4000_8000_0000000000b2);
+    const OTHER_C: Uuid = Uuid::from_u128(0xc0c0_0000_0000_4000_8000_0000000000c3);
+
+    fn resolved(tenant_id: Uuid) -> qontinui_runner_lib::repo_tenant::CwdTenant {
+        qontinui_runner_lib::repo_tenant::CwdTenant::Resolved {
+            tenant_id,
+            repo: "acme/widgets".into(),
+            source: "test".into(),
+            observed_at: "2026-10-14T00:00:00Z".into(),
+        }
+    }
+
+    /// The whole new-session path with every input injected: decision, then
+    /// the recorded tenant.
+    fn new_session_tenant(
+        repo: qontinui_runner_lib::repo_tenant::CwdTenant,
+        live_pin: tenant_pin::TenantPin,
+        default_binding: Option<Uuid>,
+        admitted: &[Uuid],
+    ) -> Option<Uuid> {
+        new_session_decision(repo, live_pin, default_binding, admitted).tenant()
+    }
+
+    fn new_session_decision(
+        repo: qontinui_runner_lib::repo_tenant::CwdTenant,
+        live_pin: tenant_pin::TenantPin,
+        default_binding: Option<Uuid>,
+        admitted: &[Uuid],
+    ) -> NewSessionTenant {
+        let decision = decide_new_session_tenant(
+            workspace_tenant::WorkspaceDeclaration::Absent,
+            repo,
+            live_pin,
+            || default_binding,
+            |t| {
+                if admitted.contains(&t) {
+                    Ok(())
+                } else {
+                    Err(crate::coord_mcp::SpawnTenantRefusal::NotPaired { tenant: t })
+                }
+            },
+        );
+        new_session_tenant_from_decision("/w", decision, || default_binding)
+    }
+
+    #[test]
+    fn a_new_session_in_a_repo_owned_by_another_paired_tenant_is_that_tenant() {
+        // Machine pinned to A, the repo owned by B (paired): B — the
+        // divergence the plan closes for AI/federation sessions.
+        assert_eq!(
+            new_session_tenant(
+                resolved(REPO_B),
+                tenant_pin::TenantPin::Pinned(MACHINE_A),
+                Some(MACHINE_A),
+                &[MACHINE_A, REPO_B],
+            ),
+            Some(REPO_B)
+        );
+        // Unpinned machine: the repo still outranks the paired default.
+        assert_eq!(
+            new_session_tenant(
+                resolved(REPO_B),
+                tenant_pin::TenantPin::Unpinned,
+                Some(MACHINE_A),
+                &[MACHINE_A, REPO_B],
+            ),
+            Some(REPO_B)
+        );
+    }
+
+    #[test]
+    fn a_new_session_whose_repo_tenant_is_not_paired_records_no_tenant() {
+        // Refusal, never the machine default: that would file the session's
+        // records under another project.
+        assert_eq!(
+            new_session_decision(
+                resolved(REPO_B),
+                tenant_pin::TenantPin::Pinned(MACHINE_A),
+                Some(MACHINE_A),
+                &[MACHINE_A],
+            ),
+            NewSessionTenant::Refused
+        );
+    }
+
+    #[test]
+    fn several_owners_keep_the_default_only_when_it_is_one_of_them() {
+        let several = |ids: Vec<Uuid>| qontinui_runner_lib::repo_tenant::CwdTenant::Several {
+            repo: "acme/widgets".into(),
+            tenant_ids: ids,
+        };
+        // Pinned machine among the owners.
+        assert_eq!(
+            new_session_tenant(
+                several(vec![MACHINE_A, REPO_B]),
+                tenant_pin::TenantPin::Pinned(MACHINE_A),
+                Some(MACHINE_A),
+                &[MACHINE_A, REPO_B],
+            ),
+            Some(MACHINE_A)
+        );
+        // Unpinned machine: the default slot's tenant is the paired default,
+        // and it is among the owners.
+        assert_eq!(
+            new_session_tenant(
+                several(vec![MACHINE_A, REPO_B]),
+                tenant_pin::TenantPin::Unpinned,
+                Some(MACHINE_A),
+                &[MACHINE_A, REPO_B],
+            ),
+            Some(MACHINE_A)
+        );
+        // The default is not among them: no tenant can be stated.
+        assert_eq!(
+            new_session_decision(
+                several(vec![REPO_B, OTHER_C]),
+                tenant_pin::TenantPin::Pinned(MACHINE_A),
+                Some(MACHINE_A),
+                &[MACHINE_A, REPO_B, OTHER_C],
+            ),
+            NewSessionTenant::Refused
+        );
+    }
+
+    #[test]
+    fn a_repo_that_names_no_owner_keeps_todays_answer() {
+        use qontinui_runner_lib::repo_tenant::CwdTenant;
+        for repo in [
+            CwdTenant::NoRepo,
+            CwdTenant::RepoUnregistered {
+                repo: "acme/widgets".into(),
+            },
+            CwdTenant::unknown("coord unreachable"),
+        ] {
+            // Exactly `tenant_for_new_session`: the pin, else the paired
+            // default, and nothing for an unresolvable machine.
+            assert_eq!(
+                new_session_tenant(
+                    repo.clone(),
+                    tenant_pin::TenantPin::Pinned(MACHINE_A),
+                    Some(OTHER_C),
+                    &[],
+                ),
+                Some(MACHINE_A)
+            );
+            assert_eq!(
+                new_session_tenant(
+                    repo.clone(),
+                    tenant_pin::TenantPin::Unpinned,
+                    Some(OTHER_C),
+                    &[]
+                ),
+                Some(OTHER_C)
+            );
+            // `Unstated`, not `Refused`: nothing was named, so device-level
+            // fallbacks downstream keep today's behaviour.
+            assert_eq!(
+                new_session_decision(
+                    repo,
+                    tenant_pin::TenantPin::Unresolvable,
+                    Some(OTHER_C),
+                    &[],
+                ),
+                NewSessionTenant::Unstated
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_credential_store_is_undetermined_not_a_standing_refusal() {
+        // The store may be mid-write; a session decided ONCE must not be
+        // frozen out of its tenant by that. Nor may it take the default.
+        let decision = decide_new_session_tenant(
+            workspace_tenant::WorkspaceDeclaration::Absent,
+            resolved(REPO_B),
+            tenant_pin::TenantPin::Pinned(MACHINE_A),
+            || Some(MACHINE_A),
+            |t| {
+                Err(
+                    crate::coord_mcp::SpawnTenantRefusal::CredentialStoreUnreadable {
+                        tenant: t,
+                        error: "slot store mid-write".into(),
+                    },
+                )
+            },
+        );
+        let answer = new_session_tenant_from_decision("/w", decision, || Some(MACHINE_A));
+        assert_eq!(answer, NewSessionTenant::Undetermined);
+        assert_eq!(answer.tenant(), None);
+        assert!(!answer.is_standing());
+        assert!(NewSessionTenant::Refused.is_standing());
+    }
+
+    #[test]
+    fn an_unsettled_repo_is_decided_from_the_machine_rows_never_refused() {
+        // A transient unknown would settle later, but this decision is made
+        // ONCE and recorded for the session's life: refusing would leave the
+        // session unregistered and unfederated for good. The machine rows —
+        // the pre-repo-tier answer — decide it instead.
+        let unsettled =
+            || qontinui_runner_lib::repo_tenant::CwdTenant::unknown_transient("coord timed out");
+        assert_eq!(
+            new_session_decision(
+                unsettled(),
+                tenant_pin::TenantPin::Pinned(MACHINE_A),
+                Some(MACHINE_A),
+                &[MACHINE_A, REPO_B],
+            ),
+            NewSessionTenant::Stated(MACHINE_A)
+        );
+        assert_eq!(
+            new_session_decision(
+                unsettled(),
+                tenant_pin::TenantPin::Unpinned,
+                Some(OTHER_C),
+                &[OTHER_C, REPO_B],
+            ),
+            NewSessionTenant::Stated(OTHER_C)
+        );
     }
 
     /// In-memory transport that records every call for test inspection.
