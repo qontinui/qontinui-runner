@@ -1217,6 +1217,9 @@ async fn process_event(pg: &PgDb, cursors: &mut Cursors, event: JourneyEvent) {
             });
         }
     }
+    for draft in cursors.evict_over_cap() {
+        write_edge(pg, draft).await;
+    }
 }
 
 /// One-shot gate for the spec-lookup warning (a configuration fact that would
@@ -2059,6 +2062,42 @@ mod tests {
         assert!(edge.timeline.is_none());
         let binds = edge_insert(&finalize(edge), None).unwrap();
         assert!(binds.timeline.is_none(), "SQL NULL, never a JSON null");
+    }
+
+    /// The worker enforces the cursor cap itself, whatever the event: a stream
+    /// of made-up `tabId`s cannot grow its map for the life of the process.
+    #[tokio::test]
+    async fn the_worker_holds_the_cursor_map_to_its_cap() {
+        use crate::journey::cursor::{Cursors, Observed, MAX_CURSORS};
+        let pg = crate::database::pg::PgDb::new_noop_for_test();
+        let mut cursors = Cursors::default();
+        let now = std::time::Instant::now();
+        let tab = |i: usize| CursorKey::new("worker-cap-app", Some(&format!("tab-{i}")));
+        for i in 0..=MAX_CURSORS {
+            cursors.observe(
+                &tab(i),
+                Observed {
+                    node: crate::journey::test_fixtures::node("home"),
+                    digest: "d".into(),
+                },
+                crate::journey::node::AffordanceIndex::default(),
+                now + std::time::Duration::from_millis(i as u64),
+            );
+        }
+        assert!(cursors.last_node(&tab(0)).is_some(), "one over the cap");
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        process_event(
+            &pg,
+            &mut cursors,
+            JourneyEvent::Barrier {
+                key: tab(MAX_CURSORS),
+                reply,
+            },
+        )
+        .await;
+        rx.await.expect("the Barrier arm answers");
+        assert!(cursors.last_node(&tab(0)).is_none(), "the oldest went");
+        assert!(cursors.last_node(&tab(1)).is_some());
     }
 
     /// The worker's REAL Forget and Barrier arms: after a Forget, a Barrier

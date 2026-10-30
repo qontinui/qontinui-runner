@@ -180,7 +180,8 @@ pub(crate) const PASSIVE_SETTLE: Duration = Duration::from_millis(500);
 
 /// Most cursors the generation map tracks. Past it the least recently
 /// touched cursor is evicted — at worst its pending snapshot task then skips
-/// (it is no longer "latest"), and that edge closes `to_node_unobserved`.
+/// (it is no longer "latest"), and that edge closes `to_node_unobserved`. The
+/// worker's own cursors have their cap: [`super::cursor::MAX_CURSORS`].
 pub(crate) const MAX_TRACKED_CURSORS: usize = 512;
 
 /// Latest interaction per cursor: `(generation, last touched)`. A snapshot
