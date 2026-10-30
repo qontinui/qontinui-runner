@@ -32,6 +32,7 @@ pub mod manager;
 pub mod orphan_state;
 pub mod primary_proxy;
 pub(crate) mod process;
+pub mod process_table;
 pub mod process_tree;
 pub mod stream_parser;
 pub mod types;

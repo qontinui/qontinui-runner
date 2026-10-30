@@ -2094,7 +2094,56 @@ pub enum ExternalClaudeScan {
 
 /// Enumerate external Claude processes, keeping "could not tell" distinct
 /// from "none found".
+///
+/// Reads the runner's shared in-process process table
+/// ([`crate::process_capture::process_table::node_claude_processes`]) — no
+/// child process. The PowerShell/WMI (Windows) or `ps aux` (Unix)
+/// enumeration in [`scan_external_claude_processes_via_probe`] runs only when
+/// that read fails, and only while the provider's fallback circuit is closed.
 pub fn scan_external_claude_processes(exclude_pids: &[u32]) -> ExternalClaudeScan {
+    use crate::process_capture::process_table::{self, FallbackRun};
+
+    let why = match process_table::node_claude_processes() {
+        Ok(found) => {
+            return ExternalClaudeScan::Complete(
+                found
+                    .into_iter()
+                    .filter(|(pid, _)| !exclude_pids.contains(pid))
+                    .map(|(pid, cmdline)| ExternalClaudeProcess {
+                        pid,
+                        working_directory: extract_workdir_from_cmdline(&cmdline),
+                    })
+                    .collect(),
+            )
+        }
+        Err(why) => why,
+    };
+    match process_table::run_fallback_blocking(
+        "external claude scan",
+        || scan_external_claude_processes_via_probe(exclude_pids),
+        |scan| matches!(scan, ExternalClaudeScan::Complete(_)),
+    ) {
+        FallbackRun::Ran(scan) => scan,
+        FallbackRun::Skipped {
+            reopens: Some(until),
+        } => ExternalClaudeScan::Degraded {
+            reason: format!(
+                "the in-process read failed ({why}) and the enumeration fallback is skipped \
+                 after a failed attempt, until {until}"
+            ),
+        },
+        FallbackRun::Skipped { reopens: None } => ExternalClaudeScan::Degraded {
+            reason: format!(
+                "the in-process read failed ({why}) and the enumeration fallback was not run: \
+                 another fallback attempt is in flight"
+            ),
+        },
+    }
+}
+
+/// The external-process enumeration by subprocess — the fallback for
+/// [`scan_external_claude_processes`].
+fn scan_external_claude_processes_via_probe(exclude_pids: &[u32]) -> ExternalClaudeScan {
     let exclude_set: std::collections::HashSet<u32> = exclude_pids.iter().copied().collect();
     let mut results = Vec::new();
 
@@ -2193,6 +2242,24 @@ pub fn scan_external_claude_processes(exclude_pids: &[u32]) -> ExternalClaudeSca
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The external-claude scan is answered by the shared in-process process
+    /// table (plan 2026-10-28-…-continuation-cap, Phase 5) — the read the
+    /// scan uses succeeds here, so the subprocess enumeration is not needed —
+    /// and its answer is authoritative (`Complete`), never `Degraded`.
+    #[test]
+    fn transcript_external_claude_scan_is_answered_in_process() {
+        let read = crate::process_capture::process_table::node_claude_processes();
+        assert!(read.is_ok(), "the in-process read failed: {read:?}");
+        let excluded: Vec<u32> = read.unwrap().into_iter().map(|(pid, _)| pid).collect();
+        match scan_external_claude_processes(&excluded) {
+            ExternalClaudeScan::Complete(found) => assert!(
+                found.iter().all(|p| !excluded.contains(&p.pid)),
+                "excluded pids must not be reported: {found:?}"
+            ),
+            ExternalClaudeScan::Degraded { reason } => panic!("degraded: {reason}"),
+        }
+    }
 
     /// Transcript-sourced titles can carry raw SGR/OSC escapes (a `/rename`
     /// pasted from colored output, or a summary derived from one). Nothing

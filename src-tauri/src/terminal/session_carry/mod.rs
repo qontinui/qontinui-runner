@@ -2156,8 +2156,9 @@ pub(crate) enum WriterProbe {
 /// ([`crate::terminal::graceful_exit::alive_in`]: pid plus start time, so a
 /// reused pid is not mistaken for it).
 async fn probe_writer(writer: ProcIdentity) -> WriterProbe {
-    let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
-    if snapshot.parent_map.is_empty() {
+    // Never the memo: consecutive "gone" looks must be distinct observations.
+    let snapshot = crate::process_capture::process_tree::snapshot_process_table_fresh().await;
+    if snapshot.is_unknown() {
         return WriterProbe::Unreadable;
     }
     if crate::terminal::graceful_exit::alive_in(&snapshot, writer) {

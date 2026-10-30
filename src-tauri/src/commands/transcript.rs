@@ -1062,13 +1062,21 @@ pub async fn transcript_find_external_processes(
         .map_err(|e| format!("Failed to lock ai_pid_tracker: {e}"))?
         .clone();
 
-    Ok(external_processes_response(
-        &crate::resource_guard::background_work_verdict(),
-        &managed_pids,
-        &EXTERNAL_SCAN_CACHE,
-        &EXTERNAL_SCAN_SHED_LOG,
-        transcript::scan_external_claude_processes,
-    ))
+    // On the blocking pool: the scan reads the shared process table
+    // synchronously (and its subprocess fallback is synchronous too), so it
+    // must not hold a tokio worker while it waits.
+    let verdict = crate::resource_guard::background_work_verdict();
+    spawn_blocking_tracked(move || {
+        external_processes_response(
+            &verdict,
+            &managed_pids,
+            &EXTERNAL_SCAN_CACHE,
+            &EXTERNAL_SCAN_SHED_LOG,
+            transcript::scan_external_claude_processes,
+        )
+    })
+    .await
+    .map_err(|e| format!("external-process scan did not join: {e}"))
 }
 
 /// The decision behind [`transcript_find_external_processes`], over an
@@ -1077,11 +1085,14 @@ pub async fn transcript_find_external_processes(
 ///
 /// ## Shedding (plan `2026-09-23-resource-guard-floors-are-constants-and-the-runners-own-git-spawns-are-ungated`, Phase 3)
 ///
-/// The enumeration is a `powershell` → `Get-CimInstance Win32_Process` spawn,
-/// polled every 30 s by the frontend (`useSessionManager.ts`) — not a runner
-/// timer, so it is gated here, at the command. It is also the call whose
-/// failure produced the fabricated missing-assembly line in the runner log while
-/// the box was out of commit. At a THROTTLE or SKIP verdict it is not run:
+/// The enumeration reads the runner's shared in-process process table
+/// (`process_capture::process_table`); a `powershell` → `Get-CimInstance
+/// Win32_Process` spawn (Windows) or `ps aux` (Unix) runs only as its
+/// circuit-protected fallback. It is polled every 30 s by the frontend
+/// (`useSessionManager.ts`) — not a runner timer, so it is gated here, at the
+/// command. The subprocess form is also the call whose failure produced the
+/// fabricated missing-assembly line in the runner log while the box was out of
+/// commit. At a THROTTLE or SKIP verdict it is not run:
 ///
 /// - With a previous COMPLETE result cached, that result is returned with
 ///   `stale: true` and the time it was observed. The previous answer, labelled,
@@ -1162,11 +1173,12 @@ fn external_processes_response(
         };
     }
 
-    // A degraded enumeration must NOT render as "found 0". The underlying
-    // scan is the same `Get-CimInstance Win32_Process` call that wedged the
-    // runner, so a hang here is expected rather than exotic — and an empty
-    // list reported as `success: true` is indistinguishable from a genuine
-    // "no external processes", which is the one answer a caller acts on.
+    // A degraded enumeration must NOT render as "found 0". The scan degrades
+    // when the in-process table is stale and its subprocess fallback (the
+    // same `Get-CimInstance Win32_Process` call that wedged the runner) fails
+    // or is skipped by the circuit — and an empty list reported as
+    // `success: true` is indistinguishable from a genuine "no external
+    // processes", which is the one answer a caller acts on.
     match scan(managed_pids) {
         transcript::ExternalClaudeScan::Complete(external) => {
             let observed_at_ms = chrono::Utc::now().timestamp_millis();
