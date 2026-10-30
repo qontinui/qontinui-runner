@@ -54,6 +54,19 @@ export function buildPageRoster(
  */
 export const isMainWindow = (): boolean => readWindowLabel() === MAIN_WINDOW_LABEL;
 
+/**
+ * Whether THIS window mounts `TerminalPagesBridge` (serves `list-pages`): only
+ * the main window, never a pop-out. `isPinned` is belt-and-braces — a pinned
+ * window is always a pop-out — and the label is the real gate. Both are fixed
+ * for a window's lifetime, so `App` evaluates this once.
+ */
+export function shouldServePageRoster(
+  isPinned: boolean,
+  label: string = readWindowLabel(),
+): boolean {
+  return !isPinned && label === MAIN_WINDOW_LABEL;
+}
+
 export interface TerminalPagesBridgeProps {
   allPages: readonly TerminalPageConfig[];
   boundPages: Readonly<Record<string, string>>;

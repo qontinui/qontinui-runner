@@ -80,7 +80,10 @@ import { LogSourcePicker } from "./components/LogSourcePicker";
 import { Sidebar } from "./components/navigation";
 import { TerminalPage } from "./components/terminal";
 import { TerminalPageTabBar } from "./components/terminal/TerminalPageTabBar";
-import { TerminalPagesBridge, isMainWindow } from "./components/terminal/TerminalPagesBridge";
+import {
+  TerminalPagesBridge,
+  shouldServePageRoster,
+} from "./components/terminal/TerminalPagesBridge";
 import { SessionRecoveryBanner } from "./components/terminal/SessionRecoveryBanner";
 import { AdvisoryStackProvider } from "./components/terminal/AdvisoryStack";
 import { RunnerDrainBanner } from "./components/terminal/RunnerDrainBanner";
@@ -288,6 +291,9 @@ function AppContent() {
   } = useAppNavigation();
 
   const terminalPages = useTerminalPages();
+  // Main window only, decided once: both inputs are fixed for the window's
+  // lifetime (same `useState` initializer pattern as WindowAssignmentsProvider).
+  const [servePageRoster] = useState(() => shouldServePageRoster(terminalPages.isPinned));
   // Projects-dashboard §7.2 steps 1–3: bind an activated project to its
   // Terminal page, pin that page's cwd to the project root, and reinstate its
   // zone profile. Mounted HERE — not in the Projects tab — because the page
@@ -867,8 +873,7 @@ function AppContent() {
                   only: a pop-out knows one page and must not serve that as the
                   roster under the same component id.
                 */}
-                    {/* `isPinned` is belt-and-braces: a pinned window is always a pop-out. */}
-                    {!terminalPages.isPinned && isMainWindow() && (
+                    {servePageRoster && (
                       <TerminalPagesBridge
                         allPages={terminalPages.allPages}
                         boundPages={terminalPages.boundPages}
