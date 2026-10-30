@@ -81,6 +81,17 @@
 //! that ANSWERED with a failure, or whose answer could not be read, is never
 //! `app_unreachable`: mid-run that, too, is `frontier_unsettled`.
 //!
+//! ## Settling
+//!
+//! An action's answer says the app took it, not that the page has become the
+//! result, and the look after it closes its edge: a route change still waiting
+//! on the network would record `no_change` and retire its frontier row. So the
+//! look that closes an edge first waits out [`ACTION_SETTLE`], within that
+//! look's one deadline. When the time budget cuts the wait short the run stops
+//! `budget_time` rather than looking early, and the closing look waits out the
+//! rest. It is a fixed wait, not a proof of quiet: a route change slower than
+//! [`ACTION_SETTLE`] still reads `no_change`.
+//!
 //! ## Auth wall
 //!
 //! The explorer drives whatever session the connected app already has; it
@@ -1055,6 +1066,9 @@ pub(crate) trait ExploreDriver: Send {
         -> Result<ActResult, DriveFailure>;
     /// Navigate to `url` through the page-navigate route.
     async fn navigate(&mut self, url: &str) -> Result<ActResult, DriveFailure>;
+    /// Give the app `wait` to become the result of the last action, before the
+    /// look that closes its edge.
+    async fn settle(&mut self, wait: Duration);
     /// Wait (at most `deadline`, capped at [`BARRIER_TIMEOUT`]) for the
     /// producer to process everything so far; what it last resolved for the
     /// explorer's cursor on this app, or why it could not be asked.
@@ -1081,6 +1095,13 @@ pub(crate) trait ExploreDriver: Send {
 /// one ledger read) may take, in total — whatever stopped the run, the time
 /// budget included.
 pub(crate) const POST_STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// How long after an action or navigation the look that closes its edge waits
+/// (see the module's Settling section).
+pub(crate) const ACTION_SETTLE: Duration = Duration::from_secs(1);
+
+// The closing look must be able to wait out a whole settle within its grace.
+const _: () = assert!(ACTION_SETTLE.as_millis() < POST_STOP_GRACE.as_millis());
 
 /// What a finished loop reports.
 #[derive(Debug, Clone, PartialEq)]
@@ -1156,6 +1177,9 @@ struct Run<'a, D: ExploreDriver> {
     budget_left: BTreeSet<EntryKey>,
     /// [`ExploreDriver::ledger_write_failures`] when the run started.
     write_failures_at_start: u64,
+    /// What the next look must still wait of the last action's
+    /// [`ACTION_SETTLE`]; zero when no edge awaits one.
+    settle_owed: Duration,
 }
 
 enum Halt {
@@ -1327,10 +1351,28 @@ impl<D: ExploreDriver> Run<'_, D> {
         )
     }
 
-    /// Snapshot, then learn the node the producer resolved for it. An auth
-    /// refusal or a login page stops the run here. Every wait shares the one
-    /// deadline `dl`.
+    /// Wait what is owed of the last action's settle, within what is left of
+    /// `dl`. A wait `dl` cut short keeps the rest owed and refuses the look:
+    /// looking early would close the edge on a page that had not settled.
+    async fn settle_within(&mut self, dl: LookDeadline) -> Result<(), Halt> {
+        if self.settle_owed.is_zero() {
+            return Ok(());
+        }
+        let wait = self.settle_owed.min(dl.left());
+        self.d.settle(wait).await;
+        self.settle_owed -= wait;
+        if self.settle_owed.is_zero() {
+            Ok(())
+        } else {
+            Err(self.wait_ran_out(dl, "the wait for the last action to settle"))
+        }
+    }
+
+    /// Settle, snapshot, then learn the node the producer resolved for it. An
+    /// auth refusal or a login page stops the run here. Every wait shares the
+    /// one deadline `dl`.
     async fn look_within(&mut self, dl: LookDeadline) -> Result<JourneyNode, Halt> {
+        self.settle_within(dl).await?;
         if self.snapshots_seen.is_none() {
             // Baseline, so the first look can tell a fresh node from a stale one.
             self.snapshots_seen = Some(self.reading(dl).await?.snapshots);
@@ -1395,7 +1437,9 @@ impl<D: ExploreDriver> Run<'_, D> {
     /// the one in-flight action, as the table allows); only waits are bounded.
     async fn act(&mut self, element_id: &str, action: &str) -> Result<ActResult, Halt> {
         self.spend();
-        match self.d.activate(element_id, action).await {
+        let answered = self.d.activate(element_id, action).await;
+        self.settle_owed = ACTION_SETTLE;
+        match answered {
             Ok(r) => Ok(r),
             Err(f) => Err(self.drive_failed(f)),
         }
@@ -1448,7 +1492,9 @@ impl<D: ExploreDriver> Run<'_, D> {
     async fn go_to_start_url(&mut self, url: &str, first: bool) -> Result<JourneyNode, Halt> {
         self.check_time()?;
         self.spend();
-        let answered = match self.d.navigate(url).await {
+        let answered = self.d.navigate(url).await;
+        self.settle_owed = ACTION_SETTLE;
+        let answered = match answered {
             Ok(r) => r,
             // Nothing explored yet and the outcome unknown: no stop word is
             // true — no row (502).
@@ -1503,6 +1549,7 @@ pub(crate) async fn explore<D: ExploreDriver>(
         unsettled: Unsettled::default(),
         budget_left: BTreeSet::new(),
         write_failures_at_start: 0,
+        settle_owed: Duration::ZERO,
     };
     run.write_failures_at_start = run.d.ledger_write_failures();
     // The explorer's cursor outlives a run: its last node is the previous
@@ -2523,6 +2570,10 @@ impl ExploreDriver for LiveDriver {
         .await
         .0;
         classify_answer(answer)
+    }
+
+    async fn settle(&mut self, wait: Duration) {
+        tokio::time::sleep(wait).await;
     }
 
     async fn forget_position(&mut self) -> Result<(), BarrierMiss> {

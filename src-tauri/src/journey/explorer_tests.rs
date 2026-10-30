@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use qontinui_types::journey::{
-    FrontierEntry, FrontierReason, JourneyEdgeObservation, JourneyNode, JourneyTrigger,
+    EdgeOutcome, FrontierEntry, FrontierReason, JourneyEdgeObservation, JourneyNode, JourneyTrigger,
 };
 use serde_json::{json, Value};
 
@@ -181,6 +181,13 @@ struct SimApp {
     /// every frontier row it exposed there, since [`run`] last cleared them.
     stood_on: BTreeSet<String>,
     exposed: BTreeSet<EntryKey>,
+    /// A click's navigation lands only after this much [`ExploreDriver::settle`]
+    /// time (the route change waits on the network); zero = at once.
+    transition_delay: Duration,
+    /// The navigation still on its way: `(page, settle time it still needs)`.
+    transition_in_flight: Option<(String, Duration)>,
+    /// Every settle the run asked for, in order.
+    settles: Vec<Duration>,
 }
 
 fn page_node(spec: &str) -> JourneyNode {
@@ -261,6 +268,9 @@ impl SimApp {
             unobserved_closes: 0,
             stood_on: BTreeSet::new(),
             exposed: BTreeSet::new(),
+            transition_delay: Duration::ZERO,
+            transition_in_flight: None,
+            settles: Vec::new(),
         }
     }
 
@@ -547,7 +557,11 @@ impl ExploreDriver for SimApp {
         }
         self.activations.push((element_id.into(), action.into()));
         if let Some(to) = self.transitions.get(&(page, element_id.to_string())) {
-            self.current = Some(to.clone());
+            if self.transition_delay.is_zero() {
+                self.current = Some(to.clone());
+            } else {
+                self.transition_in_flight = Some((to.clone(), self.transition_delay));
+            }
         }
         Ok(ActResult::Acted)
     }
@@ -578,6 +592,22 @@ impl ExploreDriver for SimApp {
         });
         self.current = Some(to);
         Ok(ActResult::Acted)
+    }
+
+    /// No real wait unless the run's elapsed time counts tokio time (those
+    /// tests run on a paused clock), so the suite stays fast.
+    async fn settle(&mut self, wait: Duration) {
+        self.settles.push(wait);
+        if let Some((to, needs)) = self.transition_in_flight.take() {
+            if wait >= needs {
+                self.current = Some(to);
+            } else {
+                self.transition_in_flight = Some((to, needs - wait));
+            }
+        }
+        if self.tokio_clock.is_some() {
+            tokio::time::sleep(wait).await;
+        }
     }
 
     async fn current_node(&mut self, deadline: Duration) -> Result<NodeReading, BarrierMiss> {
@@ -2055,8 +2085,9 @@ async fn an_undriven_safe_component_action_is_never_exhausted() {
 #[tokio::test(start_paused = true)]
 async fn a_barrier_the_time_budget_cut_short_is_budget_time_and_a_look_shares_one_deadline() {
     // 6 s of budget; the producer takes 4 s per barrier. The first look's
-    // baseline barrier takes 4 s, leaving 2 s of the look's ONE deadline for
-    // the barrier after the snapshot — which times out at the budget's end.
+    // settle and baseline barrier leave less than 4 s of the look's ONE
+    // deadline for the barrier after the snapshot — which times out at the
+    // budget's end.
     let mut app = SimApp::site();
     app.on_tokio_clock();
     app.barrier_delay = Duration::from_secs(4);
@@ -2676,6 +2707,9 @@ async fn a_runner_side_failure_is_no_row_never_app_unreachable() {
         async fn navigate(&mut self, url: &str) -> Result<ActResult, DriveFailure> {
             self.0.navigate(url).await
         }
+        async fn settle(&mut self, wait: Duration) {
+            self.0.settle(wait).await
+        }
         async fn current_node(&mut self, d: Duration) -> Result<NodeReading, BarrierMiss> {
             self.0.current_node(d).await
         }
@@ -3178,6 +3212,9 @@ async fn a_runner_rejected_action_ends_the_run_without_a_row_never_app_unreachab
         async fn navigate(&mut self, url: &str) -> Result<ActResult, DriveFailure> {
             self.0.navigate(url).await
         }
+        async fn settle(&mut self, wait: Duration) {
+            self.0.settle(wait).await
+        }
         async fn current_node(&mut self, d: Duration) -> Result<NodeReading, BarrierMiss> {
             self.0.current_node(d).await
         }
@@ -3203,4 +3240,68 @@ async fn a_runner_rejected_action_ends_the_run_without_a_row_never_app_unreachab
         .expect_err("a runner rejection says nothing about the app");
     assert_eq!(no_row.kind, NoRowKind::Internal);
     assert!(no_row.detail.contains("rejected"), "{}", no_row.detail);
+}
+
+// ---------------------------------------------------------------------------
+// The settle before the look that closes an edge
+// ---------------------------------------------------------------------------
+
+/// The app answers a click at once and its route change lands
+/// [`ACTION_SETTLE`] later. A look with no settle sees the old page: `no_change`
+/// retires the row, the new page is never reached, and the run can claim an
+/// exhausted frontier it never explored.
+#[tokio::test]
+async fn a_click_whose_navigation_lands_after_its_answer_closes_changed_never_no_change() {
+    let mut prompt = SimApp::site();
+    let expected = run(&mut prompt, &request(home(), 60, 5, 60)).await;
+
+    let mut app = SimApp::site();
+    app.transition_delay = ACTION_SETTLE;
+    let o = run(&mut app, &request(home(), 60, 5, 60)).await;
+    assert_eq!(
+        o.stopped_because, expected.stopped_because,
+        "{}",
+        o.stop_explanation
+    );
+    assert_eq!(activated_ids(&app), activated_ids(&prompt));
+    assert!(
+        app.edges.iter().all(|e| e.outcome != EdgeOutcome::NoChange),
+        "a click that navigates never reads no_change"
+    );
+    let a = page_node("A").key();
+    assert!(
+        app.edges
+            .iter()
+            .any(|e| e.to_node.as_ref().is_some_and(|n| n.key() == a)),
+        "the page behind the delayed navigation was reached"
+    );
+    // One whole settle per action and navigation, and none for a look that
+    // closes no edge (the confirming look after the frontier ran out).
+    assert_eq!(app.settles.len(), app.navigations + app.activations.len());
+    assert!(app.settles.iter().all(|w| *w == ACTION_SETTLE));
+    nothing_vanishes(&o, &app);
+}
+
+/// The settle gets only what the time budget has left. Cut short, the run stops
+/// `budget_time` without looking early, and the closing look waits out the rest
+/// before it closes the edge.
+#[tokio::test(start_paused = true)]
+async fn a_settle_never_overruns_the_time_budget_and_the_closing_look_waits_out_the_rest() {
+    let mut app = SimApp::site();
+    let left = Duration::from_millis(200);
+    // The start navigation spends all but `left` of the one-second budget.
+    app.tick = Duration::from_secs(1) - left;
+    app.on_tokio_clock();
+    let started = tokio::time::Instant::now();
+    let o = run(&mut app, &request(home(), 60, 5, 1)).await;
+    assert_eq!(
+        o.stopped_because,
+        StopReason::BudgetTime,
+        "{}",
+        o.stop_explanation
+    );
+    assert_eq!(app.settles, vec![left, ACTION_SETTLE - left]);
+    assert_eq!(app.snapshots, 1, "only the closing look looked");
+    assert_eq!(o.unsettled.closing_look_failed, Some(false));
+    assert_eq!(started.elapsed(), ACTION_SETTLE);
 }
