@@ -527,6 +527,10 @@ async fn run_script(
             (None, true)
         }
     };
+    #[cfg(target_os = "linux")]
+    let cg_active = cg.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let cg_active = false;
     // Whatever the exit path, nothing the script started may outlive its task:
     // kill the cgroup and the process group BEFORE joining the readers, so a
     // daemon holding the pipes cannot stall them.
@@ -534,9 +538,16 @@ async fn run_script(
     if let Some(dir) = &cg {
         cgroup::kill_all(dir);
     }
-    // (No group kill here: the leader is already reaped, so its pid may have
-    // been recycled. On Linux the cgroup kill above is what covers a daemon that
-    // outlived a normally-exiting script.)
+    // Without a cgroup the process group is the only containment, so a script
+    // that backgrounded a daemon and exited 0 is still reaped here. The kernel
+    // does not recycle a pid while it is the id of a live process group; if the
+    // group is empty this is an ESRCH no-op. (The timeout path already killed it.)
+    if !timed_out && !cg_active {
+        if let Some(pg) = pgid {
+            // SAFETY: kill(2) on the task's own process group.
+            unsafe { libc::kill(-pg, libc::SIGKILL) };
+        }
+    }
     for mut r in readers {
         if tokio::time::timeout(Duration::from_secs(5), &mut r)
             .await
