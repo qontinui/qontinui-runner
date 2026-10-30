@@ -788,8 +788,13 @@ pub async fn terminal_probe_claude(
             let session_ids: Vec<String> = if pids.is_empty() {
                 Vec::new()
             } else {
+                // An UNKNOWN command-line read (`None`) reports no session ids,
+                // as a read that found none does: this probe is a report, the
+                // pane's liveness comes from `claudePids` above, and nothing is
+                // decided here from an id being absent.
                 crate::process_capture::process_tree::command_lines_for_pids(&pids)
                     .await
+                    .unwrap_or_default()
                     .values()
                     .filter_map(|cl| {
                         crate::process_capture::process_tree::parse_session_id_from_cmdline(cl)
@@ -2160,7 +2165,8 @@ pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, Stri
     // (`fetchLiveClaudeSessionIds`) → skip-unknown; returning success + `[]`
     // instead would read as "definitively no live sessions" and let the
     // restore path respawn — fork — every session.
-    let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
+    // A read begun now (never the memo): a session absent here is respawned.
+    let snapshot = crate::process_capture::process_tree::snapshot_process_table_fresh().await;
     let live_pids = crate::session::claude_session_registry::live_pids_from_snapshot(&snapshot)?;
     let sessions =
         crate::session::claude_session_registry::read_live_sessions(&config_dirs, &live_pids);

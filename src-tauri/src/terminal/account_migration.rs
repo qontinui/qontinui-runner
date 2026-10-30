@@ -1224,6 +1224,9 @@ async fn old_pane_claude(app: &tauri::AppHandle, terminal_id: &str) -> Option<Pr
         .clone();
     let root = manager.get(terminal_id)?.pane_root_pid()?;
     let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
+    if snapshot.is_unknown() {
+        return None;
+    }
     let (pid, started_at) =
         crate::process_capture::process_tree::claude_anchor_in_subtree(root, &snapshot)?;
     Some(ProcIdentity { pid, started_at })
