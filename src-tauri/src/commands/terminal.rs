@@ -3963,7 +3963,7 @@ mod tests {
         store.record_open(prior);
         // This boot's restore marks the record, types the resume, and the
         // handshake never verifies: the record stays `failed`, unadopted.
-        store.mark_restore_pending(csid);
+        store.mark_restore_pending(csid, true);
         let failed = store.get(csid).unwrap();
         assert_eq!(failed.restore_tier.as_deref(), Some(RESTORE_TIER_FAILED));
         assert_eq!(

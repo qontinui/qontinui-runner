@@ -13987,7 +13987,7 @@ mod gate_continuation_tests {
     fn failed_restore(s: &SessionLifecycleStore, generation: &str) -> i64 {
         s.record_open(gate_row(generation));
         let csid = old_row().claude_session_id;
-        s.mark_restore_pending(&csid);
+        s.mark_restore_pending(&csid, true);
         let rec = s.get(&csid).unwrap();
         assert_eq!(rec.restore_tier.as_deref(), Some(RESTORE_TIER_FAILED));
         rec.restore_pending_at.expect("marker stamped")
