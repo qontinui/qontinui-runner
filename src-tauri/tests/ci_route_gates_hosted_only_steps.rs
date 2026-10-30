@@ -396,10 +396,19 @@ fn the_unpoison_steps_always_run_and_remove_only_what_the_poison_created() {
 
     // The env half runs on every leg, poison and unpoison alike (M2).
     assert_eq!(str_of(env, "if"), "", "the env poison runs on every leg");
-    assert_eq!(str_of(unenv, "if"), "always()", "the env unpoison runs on every leg, always");
+    assert_eq!(
+        str_of(unenv, "if"),
+        "always()",
+        "the env unpoison runs on every leg, always"
+    );
     let e = str_of(env, "run");
     assert!(e.contains("COORD_HTTP_URL=http://poison.invalid") && e.contains("GITHUB_ENV"));
-    for var in ["COORD_HTTP_URL=", "QONTINUI_ROOT=", "QONTINUI_SERVER_MODE=", "QONTINUI_RUNNER_TIER="] {
+    for var in [
+        "COORD_HTTP_URL=",
+        "QONTINUI_ROOT=",
+        "QONTINUI_SERVER_MODE=",
+        "QONTINUI_RUNNER_TIER=",
+    ] {
         assert!(str_of(unenv, "run").contains(var), "{var}");
     }
 
@@ -430,7 +439,10 @@ fn a_self_hosted_leg_refuses_a_home_holding_a_device_credential() {
     assert_eq!(str_of(step, "if"), SELF_HOSTED_ONLY);
     let run = str_of(step, "run");
     assert!(run.contains(".qontinui/coord-device-jwt") && run.contains("exit 1"));
-    assert!(run.contains("USERPROFILE"), "Windows reads the profile dir, not $HOME");
+    assert!(
+        run.contains("USERPROFILE"),
+        "Windows reads the profile dir, not $HOME"
+    );
     assert!(refuse < pos("Build Rust tests"));
 }
 
