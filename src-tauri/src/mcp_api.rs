@@ -2466,6 +2466,26 @@ async fn health(
         // with a serving emitter used to be diagnosable only by log grep on
         // the emitting box.
         "transportRung": transport_rung_health_snapshot(),
+        // Session run ledger rows (plan 2026-10-23-session-duration-by-work-
+        // type-and-per-device-session-load, Phase 4) the outbox drain
+        // ACK-dropped because the serving coord answered 404/405 for
+        // `POST /coord/session-runs` — a coord build predating the route.
+        // Non-zero means the run ledger is under-counting on this box.
+        "sessionRuns": {
+            "drainDropped": {
+                "noRoute": crate::session::coord_sync::SESSION_RUN_DROPPED_NO_ROUTE
+                    .load(Ordering::Relaxed),
+                // 409s from coord's upsert (ACKed, counted, logged).
+                "conflict": crate::session::coord_sync::SESSION_RUN_CONFLICTS
+                    .load(Ordering::Relaxed),
+                // 401s with NO credential presented (nothing to wait for).
+                "noCredential": crate::session::coord_sync::SESSION_RUN_DROPPED_NO_CREDENTIAL
+                    .load(Ordering::Relaxed),
+                // 401 credential waits past their 24 h cap.
+                "credentialWaitExpired": crate::session::coord_sync::SESSION_RUN_DROPPED_CREDENTIAL_WAIT
+                    .load(Ordering::Relaxed),
+            },
+        },
         // The coord session outbox drain (qontinui-runner manual-test-loop
         // 2026-09-23): `pending` rows and the `oldestUnackedAt` among them as
         // of the drain's last tick (`observedAt`; `pending: null` = no tick
@@ -5741,6 +5761,13 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     // anyway so the lane's full tool set is visible in one place and survives a
     // future narrowing of that prefix. coord's `agent_tool_access::DEVICE_DEFAULT_TOOLS`
     // is the grant authority; this list only forwards.
+    // Plan 2026-10-23-session-duration-by-work-type-and-per-device-session-load
+    // Phase 4: the session-load read (stats / concurrency / growth over
+    // `coord.session_runs`). Also covered by the `coord_query_` read-family
+    // prefix; named so the run ledger's agent door survives a narrowing of that
+    // prefix. coord's `TWIN_READ_TOOLS` grant is the authority; this list only
+    // forwards.
+    "coord_query_session_load",
     "coord_query_verification_metrics",
     "coord_recent_errors",
     "coord_recent_findings",
@@ -15438,6 +15465,8 @@ mod self_id_chain_tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            spawn: None,
+            run: Default::default(),
         }
     }
 
@@ -17643,6 +17672,35 @@ mod coord_mcp_body_gate_tests {
                 parsed.allowed
             );
         }
+    }
+
+    /// Plan `2026-10-23-session-duration-by-work-type-and-per-device-session-load`
+    /// Phase 4: the session-load read is forwarded BY NAME (not only through the
+    /// `coord_query_` prefix), sits in sorted position, is not a deliberate
+    /// exclusion, and the source-text parser reads it back exactly once.
+    #[test]
+    fn session_load_read_is_allowed_by_name_and_parses_from_source() {
+        let tool = "coord_query_session_load";
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        assert!(
+            COORD_MCP_ALLOWED_TOOLS.binary_search(&tool).is_ok(),
+            "{tool} must be named in sorted position in COORD_MCP_ALLOWED_TOOLS"
+        );
+        assert!(coord_mcp_tool_is_allowed(tool));
+        assert!(!coord_mcp_withholding_is_deliberate(tool));
+        assert!(gate(serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":tool,"arguments":{}}
+        }))
+        .is_ok());
+        assert_eq!(
+            parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+            1,
+            "the parser must read {tool} exactly once: {:?}",
+            parsed.allowed
+        );
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
     }
 
     /// Plan `2026-09-17-a-sender-cannot-see-its-ack-and-recon-reads-answer-for-the-credentials-tenant`

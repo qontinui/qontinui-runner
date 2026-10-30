@@ -767,6 +767,10 @@ pub async fn dispatch_subtask(
                 finish_synced: false,
                 spawn_device_default: None,
                 adopted_from: None,
+                // Run ledger: the worker's launch facts ride its record too, so
+                // a later confirmation (and the store's own run) carries them.
+                spawn: Some(worker_spawn_facts()),
+                run: Default::default(),
             },
         );
         info!(
@@ -795,6 +799,9 @@ pub async fn dispatch_subtask(
                 &format!("orchestration worker {} (run {})", subtask.task_id, run_id),
                 subtask.repo.clone(),
                 Some(std::path::Path::new(&working_dir)),
+                // Run ledger facts (plan 2026-10-23-session-duration-…,
+                // Phase 4): orchestration-loop fan-out.
+                Some(worker_spawn_facts()),
             )
             .await;
     } else {
@@ -831,6 +838,16 @@ pub async fn dispatch_subtask(
     // returns above, or a panic) releases it the same way, via `Drop`.
     drop(fanout_slot);
     Ok(task_run_id)
+}
+
+/// The run-ledger spawn facts every orchestration worker carries (plan
+/// `2026-10-23-session-duration-by-work-type-and-per-device-session-load`,
+/// Phase 4): orchestration-loop fan-out.
+fn worker_spawn_facts() -> crate::session::run_record_emitter::SpawnFacts {
+    crate::session::run_record_emitter::SpawnFacts::new(
+        crate::coord_drain_state::SpawnOrigin::Orchestration,
+    )
+    .spawn_kind("orchestration_worker")
 }
 
 /// Tear down a worker that is LIVE but never got bound to its subtask row —

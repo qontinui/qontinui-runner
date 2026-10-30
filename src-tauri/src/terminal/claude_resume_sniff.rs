@@ -168,6 +168,8 @@ pub(crate) fn apply_typed_resume_effects(
                 finish_synced: false,
                 spawn_device_default: None,
                 adopted_from: None,
+                spawn: None,
+                run: Default::default(),
             });
             info!(
                 terminal_id = %terminal_id,

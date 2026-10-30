@@ -775,6 +775,9 @@ async fn materialize(
         &working_dir,
         &claude_session_id,
     );
+    // Run ledger (plan 2026-10-23-session-duration-by-work-type-and-per-device-
+    // session-load, Phase 4): the instant before the pane exists.
+    let spawn_since = crate::session::run_record_emitter::spawn_clock_ms();
     let (terminal_id, _coord_id) = crate::terminal::account_migration::spawn_resumed_pane(
         &app,
         &terminal_manager,
@@ -811,6 +814,17 @@ async fn materialize(
         },
     )
     .map_err(RespawnError::Spawn)?;
+
+    // Run ledger: a coord respawn materialized on this device — a new run of
+    // the resumed session id.
+    crate::session::run_record_emitter::stamp_spawn_facts(
+        &app,
+        &terminal_id,
+        crate::session::run_record_emitter::SpawnFacts::new(
+            crate::coord_drain_state::SpawnOrigin::Respawn,
+        ),
+        spawn_since,
+    );
 
     // 7. Re-acquire held claims under this device — idempotent by
     //    resource_key, best-effort, exactly as the handoff receiver does.
@@ -926,6 +940,8 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            spawn: None,
+            run: Default::default(),
         }
     }
 

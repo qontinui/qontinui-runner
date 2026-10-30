@@ -1188,6 +1188,9 @@ async fn spawn_looping_agent_terminal(
     // first spawn after a runner start is not decided by a cold cache.
     crate::claude_session::trust_gate::warm_dial().await;
 
+    // Run ledger (plan 2026-10-23-session-duration-by-work-type-and-per-device-
+    // session-load, Phase 4): the instant before the terminal exists.
+    let spawn_since = crate::session::run_record_emitter::spawn_clock_ms();
     let (terminal_id, _coord_session) =
         crate::commands::terminal::create_tracked_terminal_session_backend(
             &terminal_manager,
@@ -1217,6 +1220,19 @@ async fn spawn_looping_agent_terminal(
             // the exact shape of the 2026-08-06→07 incident.
             false,
         )?;
+    // Run ledger: a looping agent's (re)launch; the agent's name is its kind.
+    crate::session::run_record_emitter::stamp_spawn_facts(
+        app,
+        &terminal_id,
+        crate::session::run_record_emitter::SpawnFacts::new(
+            crate::coord_drain_state::SpawnOrigin::LoopingAgent,
+        )
+        .spawn_kind("looping_agent")
+        .skill(crate::session::run_record_emitter::valid_first_command(
+            &def.name,
+        )),
+        spawn_since,
+    );
     Ok((terminal_id, pinned_session_id))
 }
 

@@ -1054,6 +1054,50 @@ pub(crate) static TRANSPORT_RUNG_DROPPED_404: AtomicU64 = AtomicU64::new(0);
 /// hoisting it out of the function changed nothing about the log cadence.
 pub(crate) static TRANSPORT_RUNG_DROPPED_405: AtomicU64 = AtomicU64::new(0);
 
+/// `session_run` rows ACK-dropped because the serving coord answered 404/405
+/// for `POST /coord/session-runs` (a build predating the route) since this
+/// process booted. Read by `GET /health` `sessionRuns.drainDropped`, so the
+/// under-count is visible without a log grep.
+pub(crate) static SESSION_RUN_DROPPED_NO_ROUTE: AtomicU64 = AtomicU64::new(0);
+
+/// `session_run` rows coord answered 409 for (its upsert holds a row this event
+/// contradicts) since this process booted — ACKed, but counted and logged, so a
+/// conflict is never a silent drop. `GET /health` `sessionRuns.drainDropped.conflict`.
+pub(crate) static SESSION_RUN_CONFLICTS: AtomicU64 = AtomicU64::new(0);
+
+/// `session_run` rows ACK-dropped on a 401 sent with NO bearer because the
+/// owning tenant is unresolved on a multi-bound device — the one no-bearer
+/// cause that cannot change. `GET /health` `sessionRuns.drainDropped.noCredential`.
+pub(crate) static SESSION_RUN_DROPPED_NO_CREDENTIAL: AtomicU64 = AtomicU64::new(0);
+
+/// `session_run` rows ACK-dropped after a 401 credential wait outlived
+/// [`SESSION_RUN_CREDENTIAL_WAIT_MAX_MS`]. `GET /health`
+/// `sessionRuns.drainDropped.credentialWaitExpired`.
+pub(crate) static SESSION_RUN_DROPPED_CREDENTIAL_WAIT: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a `session_run` row's missing bearer is PERMANENT: the drain's
+/// resolver refused an unresolved owning tenant on a multi-bound device, which
+/// no credential refresh can change. Re-asks the same cause-carrying resolver
+/// the request path used (`auth::presented_tenant`); called only on a 401 sent
+/// with no bearer, so its slot reads are off the hot path.
+fn session_run_credential_can_never_resolve(scope: crate::auth::TenantScope) -> bool {
+    matches!(
+        crate::auth::presented_tenant(scope),
+        crate::auth::PresentedTenant::Anonymous(
+            crate::auth::NoCredential::UnresolvedOnMultiBound { .. }
+        )
+    )
+}
+
+/// The longest a `session_run` row waits on a 401 credential before it is
+/// dropped (its age, from the outbox's `recorded_at`).
+const SESSION_RUN_CREDENTIAL_WAIT_MAX_MS: i64 = 24 * 3600 * 1000;
+
+/// Marks a retried failure that waits on this device's CREDENTIAL (a 401 on a
+/// `session_run` row) — kept and retried on the lane's backoff, and never
+/// counted toward quarantine.
+const CREDENTIAL_WAIT_MARK: &str = "[credential-wait]";
+
 /// Rows Ack-dropped on any OTHER 4xx — a status the shared classifier
 /// ([`write_failure_outcome`]) maps to `PermanentFailure`, including a 429,
 /// which this kind does not special-case the way `output_chunk` does. The
@@ -1637,7 +1681,11 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         // / `finished`) is coord pacing this runner, not
         // refusing the row — it never counts toward quarantine.
         let rate_limited = classify_push_failure(&err, false).0 == "rate_limited";
-        if serving && !rate_limited {
+        // Nor does a run row waiting on a credential (a 401 `session_run`
+        // keeps its row): that is this device's JWT state, not coord refusing
+        // the row, and quarantining it would stop the retry it exists for.
+        let credential_wait = err.contains(CREDENTIAL_WAIT_MARK);
+        if serving && !rate_limited && !credential_wait {
             entry.serving_failures += 1;
         }
         entry.next_attempt_at = now + SessionRetry::backoff(entry.failures);
@@ -1807,6 +1855,9 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
         }
     }
 
+    // Whether the `session_run` arm's request carried a bearer — a 401 is a
+    // credential WAIT only when one was presented (W1).
+    let mut session_run_authed = false;
     let result = match kind {
         "started" => {
             // POST /sessions with the full create body. The runner
@@ -2068,6 +2119,36 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 .send()
                 .await
         }
+        "session_run" => {
+            // Session RUN ledger (plan
+            // 2026-10-23-session-duration-by-work-type-and-per-device-session-load,
+            // Phase 4). POST /coord/session-runs with `payload.body` forwarded
+            // verbatim — NOT the session-events ingest. Coord upserts on
+            // (tenant, claude_code_session_id, run_seq), so the outbox may
+            // replay freely. `payload.tenant_id` selected `scope` above and is
+            // not part of the body.
+            //
+            // ⚠️ THIS ARM IS LOAD-BEARING, same hazard as
+            // "coord-transport-rung": without it the kind falls to the `other`
+            // catch-all below, which ACKs and DROPS at debug level, and the
+            // run ledger would read a clean, wrong zero. See
+            // `every_session_outbox_kind_has_a_dispatch_arm` and
+            // `session_run_posts_its_body_to_the_session_runs_route`.
+            let url = format!(
+                "{base}{}",
+                crate::session::run_record_emitter::SESSION_RUNS_ROUTE
+            );
+            let body = rec.payload.get("body").cloned().unwrap_or(JsonValue::Null);
+            match crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
+                .build()
+            {
+                Ok(req) => {
+                    session_run_authed = req.headers().contains_key(reqwest::header::AUTHORIZATION);
+                    inner.http.execute(req).await
+                }
+                Err(e) => Err(e),
+            }
+        }
         other => {
             // HandoffRequest is Phase 7 — defined now for wire shape, not
             // pushed yet. Quietly ACK so the file doesn't grow.
@@ -2152,6 +2233,92 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 // counts it.
                 let detail = resp.text().await.unwrap_or_default();
                 return PushOutcome::Transport(format!("{status}: {detail}"));
+            }
+            if kind == "session_run"
+                && matches!(
+                    status,
+                    StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+                )
+            {
+                // A coord build that predates `/coord/session-runs` — the
+                // restore-record precedent: best-effort observability, so
+                // ACK-drop rather than error-spam the PermanentFailure path.
+                // A route-wide fact (every row 404s until coord ships it), so
+                // logged on the first drop and every 1000th, with the total;
+                // `GET /health` `sessionRuns.drainDropped` carries the count.
+                let n = SESSION_RUN_DROPPED_NO_ROUTE.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == 1 || n % 1000 == 0 {
+                    tracing::info!(
+                        dropped_total = n,
+                        status = %status,
+                        "coord_sync: coord has no /coord/session-runs route — \
+                         dropping session run rows (the run ledger under-counts \
+                         until coord ships it)"
+                    );
+                }
+                return PushOutcome::Acked;
+            }
+            if kind == "session_run" && status == StatusCode::CONFLICT {
+                // Coord's upsert answered 409 — a row it holds for this
+                // (device, session, run_seq) disagrees with this event (e.g.
+                // an end older than the one it has: "an end never moves
+                // backwards"). Retrying cannot change coord's answer, so the
+                // row is ACKed — but never silently: counted for `/health`
+                // (`sessionRuns.drainDropped.conflict`) and logged with the body.
+                SESSION_RUN_CONFLICTS.fetch_add(1, Ordering::Relaxed);
+                let detail = resp.text().await.unwrap_or_default();
+                tracing::warn!(
+                    session = %rec.session_id,
+                    seq = rec.seq,
+                    body = %snippet(&detail),
+                    "coord_sync: coord refused a session run row as conflicting (409) — dropped, counted"
+                );
+                return PushOutcome::Acked;
+            }
+            if kind == "session_run"
+                && status == StatusCode::UNAUTHORIZED
+                && !session_run_authed
+                && session_run_credential_can_never_resolve(scope)
+            {
+                // No bearer was presented, and for the ONE cause that cannot
+                // change: an unresolved owning tenant on a multi-bound device
+                // (the resolver refuses before reading any slot). Every other
+                // no-bearer cause — an expired or not-yet-minted device JWT, a
+                // slot miss on an unpaired device — can recover, so it takes
+                // the bounded credential wait below instead.
+                SESSION_RUN_DROPPED_NO_CREDENTIAL.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    session = %rec.session_id,
+                    seq = rec.seq,
+                    "coord_sync: session run row refused 401 with NO credential presented — dropped, counted"
+                );
+                return PushOutcome::Acked;
+            }
+            if kind == "session_run"
+                && status == StatusCode::UNAUTHORIZED
+                && chrono::Utc::now().signed_duration_since(rec.recorded_at)
+                    > chrono::Duration::milliseconds(SESSION_RUN_CREDENTIAL_WAIT_MAX_MS)
+            {
+                // A credential that has not recovered in a day will not: cap
+                // the wait, drop, count.
+                SESSION_RUN_DROPPED_CREDENTIAL_WAIT.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    session = %rec.session_id,
+                    seq = rec.seq,
+                    "coord_sync: session run row still refused 401 after the credential-wait cap — dropped, counted"
+                );
+                return PushOutcome::Acked;
+            }
+            if kind == "session_run" && status == StatusCode::UNAUTHORIZED {
+                // A 401 is a CREDENTIAL state (an expired or not-yet-minted
+                // device JWT), not coord refusing the row's content: keep the
+                // row and retry on this lane's backoff, as a lifecycle 429 is
+                // — the drain's quarantine accounting never counts it, and the
+                // run lane holds only run rows, so nothing else waits on it.
+                let detail = resp.text().await.unwrap_or_default();
+                return PushOutcome::Transport(format!(
+                    "{status} {CREDENTIAL_WAIT_MARK}: {detail}"
+                ));
             }
             if matches!(kind, "restore-record" | "coord-transport-rung")
                 && matches!(
@@ -3837,6 +4004,7 @@ mod tests {
             SessionEventKind::CoordTransportRung,
             SessionEventKind::AgentNotification,
             SessionEventKind::OperatorTouch,
+            SessionEventKind::SessionRun,
         ] {
             let arm = format!("\"{}\" =>", kind.as_str());
             assert!(
@@ -4042,6 +4210,16 @@ mod tests {
         events_status: Option<u16>,
         /// Bodies accepted by `POST /coord/sessions/operator-touch`.
         operator_touches: Vec<JsonValue>,
+        /// Bodies POSTed to `/coord/session-runs` (run ledger, Phase 4).
+        session_runs: Vec<JsonValue>,
+        /// When set, `/coord/session-runs` answers this status instead of
+        /// 200 — a coord build that predates the route (404/405).
+        session_runs_status: Option<u16>,
+        /// Answered (front first) before `session_runs_status` applies — a
+        /// scripted sequence, e.g. two 5xx then success.
+        session_runs_script: std::collections::VecDeque<u16>,
+        /// The `Authorization` header each `/coord/session-runs` POST carried.
+        session_run_auth: Vec<Option<String>>,
         /// The `Authorization` header each `GET /tenant-policy` carried, in
         /// order. `None` = the request went out UNAUTHENTICATED, which is
         /// the fail-closed slot-miss posture and an observable in its own
@@ -4432,6 +4610,28 @@ mod tests {
                             })),
                         )
                             .into_response()
+                    },
+                ),
+            )
+            .route(
+                "/coord/session-runs",
+                post(
+                    |AxumState(state): AxumState<Arc<TokMutex<CoordRecorder>>>,
+                     headers: axum::http::HeaderMap,
+                     Json(body): Json<JsonValue>| async move {
+                        let mut g = state.lock().await;
+                        g.session_runs.push(body.clone());
+                        g.session_run_auth.push(
+                            headers
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_string),
+                        );
+                        let code = g.session_runs_script.pop_front().or(g.session_runs_status);
+                        let status = code
+                            .and_then(|c| AxumStatus::from_u16(c).ok())
+                            .unwrap_or(AxumStatus::OK);
+                        (status, Json(json!({ "ok": status.is_success() }))).into_response()
                     },
                 ),
             )
@@ -4830,6 +5030,345 @@ mod tests {
             outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
         })
         .await;
+    }
+
+    /// Drain one `session_run` row into a fake coord whose
+    /// `/coord/session-runs` answers `status`; returns the POSTed bodies once
+    /// the row is ACKed (removed from the outbox).
+    async fn drain_one_session_run(status: Option<u16>) -> Vec<JsonValue> {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.session_runs_status = status;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+        let ccsid = "0b0e8d2c-7a51-4b8e-9c9a-3f1f6a5e2d10";
+        outbox
+            .record(
+                Uuid::new_v4(),
+                crate::session::run_record_emitter::run_lane(ccsid),
+                SessionEventKind::SessionRun,
+                json!({
+                    "tenant_id": "4f8c1c1e-1111-4222-8333-444455556666",
+                    "body": {
+                        "claude_code_session_id": ccsid,
+                        "run_seq": 1,
+                        "event": "end",
+                        "started_at": "2026-10-26T00:00:00.000Z",
+                        "ended_at": "2026-10-26T01:00:00.000Z",
+                        "close_reason": "pty-exit",
+                        "facts": {"spawn_origin": "gate_continuation"},
+                    },
+                }),
+            )
+            .unwrap();
+        let _drain = coord.start_drain_task();
+        wait_until(Duration::from_secs(5), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "the row must be ACKed (delivered or dropped), never retried forever"
+        );
+        let g = rec.lock().await;
+        assert!(
+            g.events.is_empty(),
+            "session_run must NOT ride /sessions/:id/events"
+        );
+        g.session_runs.clone()
+    }
+
+    /// The `session_run` arm POSTs `payload.body` VERBATIM to
+    /// `/coord/session-runs` — the envelope's `tenant_id` only picks the
+    /// credential slot and never reaches the body. An empty recording means
+    /// push_record lost its arm and the catch-all ACK-dropped the row.
+    #[tokio::test]
+    async fn session_run_posts_its_body_to_the_session_runs_route() {
+        let posted = drain_one_session_run(None).await;
+        assert_eq!(posted.len(), 1, "exactly one POST /coord/session-runs");
+        let body = &posted[0];
+        assert_eq!(body["event"], json!("end"));
+        assert_eq!(body["run_seq"], json!(1));
+        assert_eq!(body["close_reason"], json!("pty-exit"));
+        assert_eq!(body["facts"]["spawn_origin"], json!("gate_continuation"));
+        assert!(
+            body.get("tenant_id").is_none(),
+            "the envelope is not the body"
+        );
+        assert!(body.get("body").is_none(), "the body is unwrapped");
+    }
+
+    /// A coord that predates the route (404 / 405) ACK-drops the row — the
+    /// restore-record precedent — and counts it for `/health`.
+    #[tokio::test]
+    async fn session_run_on_a_coord_without_the_route_is_ack_dropped() {
+        for status in [404u16, 405] {
+            let before = SESSION_RUN_DROPPED_NO_ROUTE.load(Ordering::Relaxed);
+            let posted = drain_one_session_run(Some(status)).await;
+            assert_eq!(posted.len(), 1, "{status}: attempted once, not retried");
+            assert!(
+                SESSION_RUN_DROPPED_NO_ROUTE.load(Ordering::Relaxed) > before,
+                "{status}: the drop is counted"
+            );
+        }
+    }
+
+    /// Record `rows` `session_run` rows on ONE run lane and start the drain
+    /// against a fake coord scripted with `script` then `status`.
+    async fn start_session_run_drain(
+        rows: usize,
+        script: &[u16],
+        status: Option<u16>,
+    ) -> (
+        Arc<OutboxWriter>,
+        Arc<TokMutex<CoordRecorder>>,
+        CoordSync,
+        tempfile::TempDir,
+    ) {
+        start_session_run_drain_for(rows, script, status, None).await
+    }
+
+    /// [`start_session_run_drain`] for rows owned by `tenant` (whose bearer
+    /// the drain then presents, when the test installed one).
+    async fn start_session_run_drain_for(
+        rows: usize,
+        script: &[u16],
+        status: Option<u16>,
+        tenant: Option<Uuid>,
+    ) -> (
+        Arc<OutboxWriter>,
+        Arc<TokMutex<CoordRecorder>>,
+        CoordSync,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        {
+            let mut g = rec.lock().await;
+            g.session_runs_status = status;
+            g.session_runs_script = script.iter().copied().collect();
+        }
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let ccsid = "0b0e8d2c-7a51-4b8e-9c9a-3f1f6a5e2d10";
+        let machine = Uuid::new_v4();
+        for n in 0..rows {
+            let mut payload = json!({"body": {
+                "claude_code_session_id": ccsid,
+                "run_seq": n + 1,
+                "event": "start",
+                "started_at": "2026-10-26T00:00:00.000Z",
+                "facts": {},
+            }});
+            if let Some(t) = tenant {
+                payload["tenant_id"] = json!(t);
+            }
+            outbox
+                .record(
+                    machine,
+                    crate::session::run_record_emitter::run_lane(ccsid),
+                    SessionEventKind::SessionRun,
+                    payload,
+                )
+                .unwrap();
+        }
+        (outbox, rec, coord, dir)
+    }
+
+    /// Give the device ONE binding with a stored device JWT, so the drain
+    /// presents a bearer for rows owned by the returned tenant.
+    fn install_one_tenant_bearer(amb: &crate::test_env::IsolatedAmbient) -> Uuid {
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        amb.write_machine_json("{\"device_id\":\"fixture-device\"}");
+        let storage = std::path::PathBuf::from(
+            std::env::var("QONTINUI_SECURE_STORAGE_DIR")
+                .expect("the ambient fixture pins the secure-storage dir"),
+        );
+        std::fs::create_dir_all(&storage).unwrap();
+        let t = Uuid::now_v7();
+        std::fs::write(
+            storage.join("paired_user.json"),
+            json!({"default_tenant_id": t, "bindings": [{ "tenant_id": t }]}).to_string(),
+        )
+        .unwrap();
+        crate::auth::AuthManager::new()
+            .store_tenant_device_jwt(&t, &device_jwt_for(&t))
+            .expect("T's credential slot");
+        t
+    }
+
+    /// A 401 is this device's CREDENTIAL state, not coord refusing the row: the
+    /// row is KEPT and retried on the lane's backoff — not dropped, and not a
+    /// hot loop (a handful of attempts in seconds, not hundreds).
+    #[tokio::test]
+    async fn session_run_refused_401_does_not_loop() {
+        let amb = crate::test_env::isolated_ambient();
+        let t = install_one_tenant_bearer(&amb);
+        let (outbox, rec, coord, _dir) =
+            start_session_run_drain_for(1, &[], Some(401), Some(t)).await;
+        let _registry = build_registry(coord.clone());
+        let _drain = coord.start_drain_task();
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let attempts = rec.lock().await.session_runs.len();
+        assert!(attempts >= 1, "the drain attempted the row");
+        assert!(
+            attempts <= 5,
+            "backed off between attempts, not a hot loop: {attempts} in 4s"
+        );
+        assert_eq!(
+            outbox.pending().unwrap().len(),
+            1,
+            "a 401 keeps the row for retry"
+        );
+        assert!(
+            rec.lock()
+                .await
+                .session_run_auth
+                .iter()
+                .all(|a| a.is_some()),
+            "the retried requests carried a bearer"
+        );
+    }
+
+    /// A row that can NEVER succeed — its owning tenant is unresolved on a
+    /// MULTI-bound device, so the resolver refuses to present any credential —
+    /// is ACK-dropped and counted on its 401, never retried.
+    #[tokio::test]
+    async fn session_run_401_unresolved_on_a_multi_bound_device_is_dropped_and_counted() {
+        let amb = crate::test_env::isolated_ambient();
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        amb.write_machine_json("{\"device_id\":\"fixture-device\"}");
+        let storage = std::path::PathBuf::from(
+            std::env::var("QONTINUI_SECURE_STORAGE_DIR")
+                .expect("the ambient fixture pins the secure-storage dir"),
+        );
+        std::fs::create_dir_all(&storage).unwrap();
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        std::fs::write(
+            storage.join("paired_user.json"),
+            json!({"default_tenant_id": a, "bindings": [{ "tenant_id": a }, { "tenant_id": b }]})
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(crate::auth::device_binding_count(), 2);
+        let before = SESSION_RUN_DROPPED_NO_CREDENTIAL.load(Ordering::Relaxed);
+        // No `tenant_id` on the row: the scope is Unresolved.
+        let (outbox, rec, coord, _dir) = start_session_run_drain(1, &[], Some(401)).await;
+        let _registry = build_registry(coord.clone());
+        let _drain = coord.start_drain_task();
+        wait_until(Duration::from_secs(5), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        assert!(outbox.pending().unwrap().is_empty(), "dropped");
+        let g = rec.lock().await;
+        assert_eq!(g.session_runs.len(), 1, "one attempt, then dropped");
+        assert!(
+            g.session_run_auth.iter().all(|a| a.is_none()),
+            "sent unauthenticated"
+        );
+        assert!(SESSION_RUN_DROPPED_NO_CREDENTIAL.load(Ordering::Relaxed) > before);
+    }
+
+    /// An EXPIRED device JWT also sends no bearer — but it recovers when the
+    /// refresher re-mints, so the row is RETAINED on the bounded credential
+    /// wait, not dropped.
+    #[tokio::test]
+    async fn session_run_401_with_an_expired_slot_is_retained() {
+        let amb = crate::test_env::isolated_ambient();
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        amb.write_machine_json("{\"device_id\":\"fixture-device\"}");
+        let storage = std::path::PathBuf::from(
+            std::env::var("QONTINUI_SECURE_STORAGE_DIR")
+                .expect("the ambient fixture pins the secure-storage dir"),
+        );
+        std::fs::create_dir_all(&storage).unwrap();
+        let t = Uuid::now_v7();
+        std::fs::write(
+            storage.join("paired_user.json"),
+            json!({"default_tenant_id": t, "bindings": [{ "tenant_id": t }]}).to_string(),
+        )
+        .unwrap();
+        let expired = {
+            use base64::Engine as _;
+            let enc = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+            let exp = chrono::Utc::now().timestamp() - 3600;
+            format!(
+                "{}.{}.sig",
+                enc(br#"{"alg":"none","typ":"JWT"}"#),
+                enc(format!(r#"{{"tenant_id":"{t}","exp":{exp}}}"#).as_bytes())
+            )
+        };
+        crate::auth::AuthManager::new()
+            .store_tenant_device_jwt(&t, &expired)
+            .expect("T's (expired) credential slot");
+        let before = SESSION_RUN_DROPPED_NO_CREDENTIAL.load(Ordering::Relaxed);
+        let (outbox, rec, coord, _dir) =
+            start_session_run_drain_for(1, &[], Some(401), Some(t)).await;
+        let _registry = build_registry(coord.clone());
+        let _drain = coord.start_drain_task();
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let g = rec.lock().await;
+        assert!(!g.session_runs.is_empty(), "attempted");
+        assert!(
+            g.session_run_auth.iter().all(|a| a.is_none()),
+            "an expired slot presents nothing"
+        );
+        drop(g);
+        assert_eq!(
+            outbox.pending().unwrap().len(),
+            1,
+            "retained for the credential wait"
+        );
+        assert_eq!(
+            SESSION_RUN_DROPPED_NO_CREDENTIAL.load(Ordering::Relaxed),
+            before,
+            "not counted as a permanent drop"
+        );
+    }
+
+    /// A 5xx keeps the row and retries it, and the lane's rows still arrive IN
+    /// ORDER once coord recovers — nothing dropped, nothing reordered.
+    #[tokio::test]
+    async fn session_run_5xx_is_kept_and_retried_in_order() {
+        let (outbox, rec, coord, _dir) = start_session_run_drain(2, &[503, 500], None).await;
+        let _registry = build_registry(coord.clone());
+        let _drain = coord.start_drain_task();
+        wait_until(Duration::from_secs(15), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        assert!(outbox.pending().unwrap().is_empty(), "both rows delivered");
+        let posted = rec.lock().await.session_runs.clone();
+        let seqs: Vec<u64> = posted
+            .iter()
+            .map(|b| b["run_seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            seqs,
+            vec![1, 1, 1, 2],
+            "row 1 retried twice, then row 2 — in order"
+        );
+    }
+
+    /// A 409 from coord's upsert is ACKed but COUNTED (never a silent drop).
+    #[tokio::test]
+    async fn session_run_conflict_is_counted_not_silent() {
+        let before = SESSION_RUN_CONFLICTS.load(Ordering::Relaxed);
+        let posted = drain_one_session_run(Some(409)).await;
+        assert_eq!(posted.len(), 1);
+        assert!(SESSION_RUN_CONFLICTS.load(Ordering::Relaxed) > before);
     }
 
     /// The three drop counters are process-wide and each test below asserts

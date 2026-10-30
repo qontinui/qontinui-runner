@@ -542,7 +542,17 @@ pub async fn create_ai_session(
     // (plan 2026-09-20 Phase 5).
     let spawn_cwd = std::env::current_dir().ok();
     let coord_session_id = ai_coord_registrar
-        .register_session_in(&task_run_id, &name, None, spawn_cwd.as_deref())
+        .register_session_in(
+            &task_run_id,
+            &name,
+            None,
+            spawn_cwd.as_deref(),
+            // Run ledger facts (plan 2026-10-23-session-duration-…, Phase 4):
+            // the runner UI's own "new chat".
+            Some(crate::session::run_record_emitter::SpawnFacts::new(
+                crate::coord_drain_state::SpawnOrigin::OperatorChat,
+            )),
+        )
         .await;
 
     // Phase 1b/1c — build the interactive-agent log emitter when the
@@ -2007,6 +2017,11 @@ pub async fn resume_ai_sessions(
                     &task_name,
                     None,
                     Some(std::path::Path::new(&working_dir_for_spawn)),
+                    // Run ledger facts: a boot-time resume of an AI session —
+                    // a new run of the same session id.
+                    Some(crate::session::run_record_emitter::SpawnFacts::new(
+                        crate::coord_drain_state::SpawnOrigin::BootResume,
+                    )),
                 )
                 .await
             }

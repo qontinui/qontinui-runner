@@ -83,6 +83,9 @@ const GATE_DEFEATERS: &[&str] = &[
 struct Row {
     class: String,
     detail: String,
+    /// The run-ledger facts column — see `runner_spawn_sites.txt` and
+    /// [`sites_missing_run_facts`]. `Some` exactly on autonomous / operator rows.
+    facts: Option<String>,
 }
 
 type Sources = BTreeMap<String, String>;
@@ -483,6 +486,149 @@ fn autonomous_sites_bypassing_the_gate(sources: &Sources, rows: &Rows) -> Vec<St
     out
 }
 
+/// The call that carries a route's facts. `stamp` / `agentic` are checked in
+/// the SITE's body; `record` in the facts fn's.
+fn run_facts_route_tokens(route: &str) -> Option<&'static [&'static str]> {
+    match route {
+        "stamp" => Some(&["stamp_spawn_facts("]),
+        "agentic" => Some(&["register_session_in(", "agentic_headless_start("]),
+        "record" => Some(&["spawn: Some("]),
+        _ => None,
+    }
+}
+
+/// Autonomous / operator rows whose `facts` column does not hold against the
+/// source (plan `2026-10-23-session-duration-by-work-type-and-per-device-session-load`,
+/// Phase 4). PURE over the sources. A row says how the session it launches
+/// reaches the run ledger: `<route> <origins> [@ hops]`, or `none: <reason>`.
+fn sites_missing_run_facts(sources: &Sources, rows: &Rows) -> Vec<String> {
+    let mut out = Vec::new();
+    let wire_to_variant: BTreeMap<&str, String> = crate::coord_drain_state::SpawnOrigin::ALL
+        .iter()
+        .map(|o| (o.as_wire(), format!("{o:?}")))
+        .collect();
+    for ((file, func), row) in rows
+        .iter()
+        .filter(|(_, r)| r.class == "autonomous" || r.class == "operator")
+    {
+        let site = format!("{file}:{func}");
+        let Some(facts) = row
+            .facts
+            .as_deref()
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+        else {
+            out.push(format!("{site} (no facts column)"));
+            continue;
+        };
+        if let Some(reason) = facts.strip_prefix("none:") {
+            if reason.trim().len() < 20 {
+                out.push(format!("{site} (`none:` must say why — got {reason:?})"));
+            }
+            continue;
+        }
+        let (head, hops) = match facts.split_once('@') {
+            Some((h, chain)) => (
+                h.trim(),
+                chain.split('>').map(str::trim).collect::<Vec<_>>(),
+            ),
+            None => (facts, Vec::new()),
+        };
+        let Some((route, origins)) = head.split_once(char::is_whitespace) else {
+            out.push(format!(
+                "{site} (facts {facts:?} is not `<route> <origins>`)"
+            ));
+            continue;
+        };
+        let Some(route_tokens) = run_facts_route_tokens(route) else {
+            out.push(format!("{site} (unknown facts route {route:?})"));
+            continue;
+        };
+        let Some(site_body) = sources.get(file).and_then(|s| fn_body(s, func)) else {
+            out.push(format!("{site} (site fn not found)"));
+            continue;
+        };
+        if hops.iter().any(|h| h.is_empty()) {
+            out.push(format!("{site} (empty hop in {facts:?})"));
+            continue;
+        }
+        let body_of = |(f, name): (&str, &str)| sources.get(f).and_then(|s| fn_body(s, name));
+        // The facts fn: the last hop, else the site itself.
+        let facts_body = match hops.last().map(|h| resolve_hop(h, file)) {
+            Some(hop) => match body_of(hop) {
+                Some(b) => b,
+                None => {
+                    out.push(format!("{site} (facts fn {}:{} not found)", hop.0, hop.1));
+                    continue;
+                }
+            },
+            None => site_body.clone(),
+        };
+        // The hops are a real chain, connected to the site.
+        if !hops.is_empty() {
+            let chain: Vec<(&str, &str)> = hops.iter().map(|h| resolve_hop(h, file)).collect();
+            let broken = chain.windows(2).find_map(|pair| {
+                let calls = body_of(pair[0])
+                    .is_some_and(|b| token_re(&format!("{}(", pair[1].1)).is_match(&b));
+                (!calls).then(|| format!("{} does not call {}", pair[0].1, pair[1].1))
+            });
+            if let Some(why) = broken {
+                out.push(format!("{site} (facts chain broken: {why})"));
+                continue;
+            }
+            let site_calls_first = token_re(&format!("{}(", chain[0].1)).is_match(&site_body);
+            let a_hop_calls_site = chain
+                .iter()
+                .any(|&h| body_of(h).is_some_and(|b| token_re(&format!("{func}(")).is_match(&b)));
+            if !site_calls_first && !a_hop_calls_site {
+                out.push(format!(
+                    "{site} (facts chain is not connected to the site: neither calls the other)"
+                ));
+                continue;
+            }
+        }
+        // The route's carrying call.
+        let route_body = if route == "record" {
+            &facts_body
+        } else {
+            &site_body
+        };
+        if !route_tokens.iter().any(|t| route_body.contains(t)) {
+            out.push(format!(
+                "{site} (route `{route}` needs one of {route_tokens:?} — the facts never reach the run ledger)"
+            ));
+            continue;
+        }
+        // The facts themselves, with every declared origin.
+        if !facts_body.contains("SpawnFacts::new(") {
+            out.push(format!("{site} (no `SpawnFacts::new(` in the facts fn)"));
+            continue;
+        }
+        for origin in origins.split('+').map(str::trim) {
+            if origin == "caller" {
+                if !facts_body.contains("SpawnFacts::new(origin") {
+                    out.push(format!(
+                        "{site} (origin `caller` needs `SpawnFacts::new(origin` in the facts fn)"
+                    ));
+                }
+                continue;
+            }
+            let Some(variant) = wire_to_variant.get(origin) else {
+                out.push(format!(
+                    "{site} ({origin:?} is not a SpawnOrigin wire name)"
+                ));
+                continue;
+            };
+            if !facts_body.contains(&format!("SpawnOrigin::{variant}")) {
+                out.push(format!(
+                    "{site} (declares origin {origin} but the facts fn never names SpawnOrigin::{variant})"
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// Operator rows that are not a `#[tauri::command]`.
 fn operator_sites_not_tauri_commands(sources: &Sources, rows: &Rows) -> Vec<String> {
     let decl = fn_decl_re();
@@ -555,11 +701,10 @@ fn parse_sites(text: &str) -> Rows {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let cells: Vec<&str> = line.splitn(4, '|').map(str::trim).collect();
-        assert_eq!(
-            cells.len(),
-            4,
-            "runner_spawn_sites.txt:{}: expected `file | fn | class | detail`, got {line:?}",
+        let cells: Vec<&str> = line.splitn(5, '|').map(str::trim).collect();
+        assert!(
+            cells.len() == 4 || cells.len() == 5,
+            "runner_spawn_sites.txt:{}: expected `file | fn | class | detail [| facts]`, got {line:?}",
             n + 1
         );
         assert!(
@@ -572,6 +717,21 @@ fn parse_sites(text: &str) -> Rows {
             !cells[3].is_empty(),
             "runner_spawn_sites.txt:{}: empty detail",
             n + 1
+        );
+        // The run-ledger facts column: stated on every row that LAUNCHES a
+        // session (autonomous / operator), and on no other.
+        let launches = cells[2] == "autonomous" || cells[2] == "operator";
+        assert_eq!(
+            cells.get(4).is_some_and(|f| !f.is_empty()),
+            launches,
+            "runner_spawn_sites.txt:{}: a {} row {} the `facts` column",
+            n + 1,
+            cells[2],
+            if launches {
+                "must state"
+            } else {
+                "must not carry"
+            }
         );
         if cells[2] == "exempt" || cells[2] == "helper" {
             assert_ne!(
@@ -592,6 +752,7 @@ fn parse_sites(text: &str) -> Rows {
             Row {
                 class: cells[2].to_string(),
                 detail: cells[3].to_string(),
+                facts: cells.get(4).map(|f| f.to_string()),
             },
         );
         assert!(
@@ -662,6 +823,116 @@ fn every_autonomous_site_passes_the_drain_gate() {
     );
 }
 
+/// Every row that launches a session states how that session reaches the run
+/// ledger with its spawn facts, and the statement holds against the source
+/// (plan `2026-10-23-session-duration-by-work-type-and-per-device-session-load`,
+/// Phase 4).
+#[test]
+fn every_launching_site_states_its_run_facts() {
+    let rows = load_rows();
+    let launching = rows
+        .values()
+        .filter(|r| r.class == "autonomous" || r.class == "operator")
+        .count();
+    let covered = rows
+        .values()
+        .filter(|r| r.facts.as_deref().is_some_and(|f| !f.starts_with("none:")))
+        .count();
+    assert!(
+        launching >= 25 && covered >= 15,
+        "too few launching rows ({launching}) or covered ones ({covered}) — vacuous"
+    );
+    let violations = sites_missing_run_facts(&load_sources(), &rows);
+    assert!(
+        violations.is_empty(),
+        "launch sites whose run-ledger facts do not hold: {violations:#?}"
+    );
+}
+
+/// Mutation twin: remove the facts stamp from the operator's "new terminal"
+/// and the guard goes red on exactly that row.
+#[test]
+fn removing_the_facts_stamp_from_terminal_create_fails_the_guard() {
+    let mut sources = load_sources();
+    let rows = load_rows();
+    let file = "commands/terminal.rs".to_string();
+    let src = sources.get(&file).expect("commands/terminal.rs").clone();
+    let fn_at = src
+        .find("pub async fn terminal_create(")
+        .expect("terminal_create exists");
+    let marker = "stamp_spawn_facts(";
+    let at = src
+        .get(fn_at..)
+        .and_then(|rest| rest.find(marker))
+        .map(|m| fn_at + m)
+        .expect("terminal_create stamps its run facts");
+    let mutated = format!(
+        "{}removed_stamp({}",
+        src.get(..at).expect("prefix"),
+        src.get(at + marker.len()..).expect("suffix")
+    );
+    sources.insert(file, mutated);
+    let violations = sites_missing_run_facts(&sources, &rows);
+    assert_eq!(
+        violations.len(),
+        1,
+        "exactly the mutated row: {violations:#?}"
+    );
+    assert!(
+        violations[0].starts_with("commands/terminal.rs:terminal_create (route `stamp`"),
+        "{violations:#?}"
+    );
+}
+
+/// The checker's other arms, on synthetic rows: a wrong origin, an unconnected
+/// hop, a reasonless `none:`, a missing fn, and the `caller` form passing.
+#[test]
+fn a_wrong_origin_a_broken_hop_or_a_bare_none_fails_the_run_facts_guard() {
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "x.rs".to_string(),
+        "fn good() {\n    stamp_spawn_facts(a, t, SpawnFacts::new(SpawnOrigin::Steward), s);\n}\n\
+         fn wrong_origin() {\n    stamp_spawn_facts(a, t, SpawnFacts::new(SpawnOrigin::Steward), s);\n}\n\
+         fn via_hop() {\n    stamp_spawn_facts(a, t, facts_of(), s);\n}\n\
+         fn facts_of() -> F {\n    SpawnFacts::new(SpawnOrigin::Respawn)\n}\n\
+         fn unconnected() {\n    stamp_spawn_facts(a, t, f, s);\n}\n\
+         fn by_caller(origin: O) {\n    stamp_spawn_facts(a, t, SpawnFacts::new(origin), s);\n}\n"
+            .to_string(),
+    );
+    let row = |facts: &str| Row {
+        class: "autonomous".into(),
+        detail: "-".into(),
+        facts: Some(facts.into()),
+    };
+    let mut rows = BTreeMap::new();
+    rows.insert(("x.rs".into(), "good".into()), row("stamp steward"));
+    rows.insert(("x.rs".into(), "wrong_origin".into()), row("stamp respawn"));
+    rows.insert(
+        ("x.rs".into(), "via_hop".into()),
+        row("stamp respawn @ facts_of"),
+    );
+    rows.insert(
+        ("x.rs".into(), "unconnected".into()),
+        row("stamp respawn @ facts_of"),
+    );
+    rows.insert(("x.rs".into(), "by_caller".into()), row("stamp caller"));
+    rows.insert(("x.rs".into(), "bare_none".into()), row("none: x"));
+    rows.insert(("x.rs".into(), "bad_name".into()), row("stamp steward"));
+    let mut got = sites_missing_run_facts(&sources, &rows);
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            "x.rs:bad_name (site fn not found)".to_string(),
+            "x.rs:bare_none (`none:` must say why — got \" x\")".to_string(),
+            "x.rs:unconnected (facts chain is not connected to the site: neither calls the other)"
+                .to_string(),
+            "x.rs:wrong_origin (declares origin respawn but the facts fn never names SpawnOrigin::Respawn)"
+                .to_string(),
+        ]
+    );
+}
+
 #[test]
 fn every_operator_site_is_a_tauri_command() {
     let rows = load_rows();
@@ -707,6 +978,7 @@ fn an_allowlisted_operator_row_is_caught() {
         Row {
             class: "operator".to_string(),
             detail: "-".to_string(),
+            facts: None,
         },
     );
     assert_eq!(
@@ -731,6 +1003,7 @@ fn an_allowlisted_operator_row_is_caught() {
         Row {
             class: "operator".to_string(),
             detail: "-".to_string(),
+            facts: None,
         },
     );
     assert!(operator_sites_reachable_by_an_automation(&clean).is_empty());
@@ -779,6 +1052,7 @@ fn a_new_primitive_caller_and_a_helper_caller_are_found_but_test_modules_are_not
         Row {
             class: "helper".into(),
             detail: "recipe(".into(),
+            facts: None,
         },
     );
     let found: Vec<_> = scan_sites(&sources, &rows).into_iter().collect();
@@ -808,6 +1082,7 @@ fn a_broken_chain_an_exempt_admission_or_an_operator_origin_fails_the_guard() {
     let row = |detail: &str| Row {
         class: "autonomous".into(),
         detail: detail.into(),
+        facts: None,
     };
     let mut rows = BTreeMap::new();
     rows.insert(
@@ -844,6 +1119,7 @@ fn an_operator_row_must_be_a_tauri_command() {
             Row {
                 class: "operator".into(),
                 detail: "-".into(),
+                facts: None,
             },
         );
     }
@@ -880,6 +1156,7 @@ fn a_bare_gate_call_whose_result_is_discarded_fails_the_guard() {
             Row {
                 class: "autonomous".into(),
                 detail: f.into(),
+                facts: None,
             },
         );
     }

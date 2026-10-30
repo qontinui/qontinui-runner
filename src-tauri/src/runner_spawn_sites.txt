@@ -22,7 +22,7 @@
 # prove it can fail), and
 #     runner_spawn_sites::every_operator_site_is_a_tauri_command
 #
-# Columns:  file (relative to src/) | fn | class | detail
+# Columns:  file (relative to src/) | fn | class | detail [| facts]
 #
 # class / detail:
 #   autonomous  a spawn the runner makes without an operator at THIS runner asking for
@@ -39,59 +39,79 @@
 #               callers use; every caller of that token is itself a site and needs a row.
 #   exempt      not new work: continues or replaces a session that is already running,
 #               or launches nothing. detail = why (non-empty).
+#
+# facts — REQUIRED on autonomous / operator rows, ABSENT on helper / exempt rows (plan
+# 2026-10-23-session-duration-by-work-type-and-per-device-session-load, Phase 4). How the
+# session this site launches reaches the run ledger (coord.session_runs) with its spawn facts:
+#   <route> <origins> [@ <hop> > <hop> …]
+#     route    stamp    the site calls `stamp_spawn_facts(` (the terminal plane: the facts land
+#                       on the lifecycle record the spawn opened)
+#              agentic  the site calls `register_session_in(` or `agentic_headless_start(`
+#                       (the agentic ledger: a session with no confirmed lifecycle record)
+#              record   the facts fn writes `spawn: Some(` onto a lifecycle record literal
+#     origins  `+`-joined SpawnOrigin wire names; the facts fn must contain `SpawnFacts::new(`
+#              and `SpawnOrigin::<Variant>` for each — or `caller`, which requires
+#              `SpawnFacts::new(origin` (an origin-parameterised door passing its caller's)
+#     @ hops   the facts fn, when it is not the site: each hop calls the next, and the site
+#              either calls the first hop or is called by one of them
+#   none: <reason>   the session reaches NEITHER plane — say why; it is a recorded
+#                    undercount of the run ledger, not an oversight
+# Pinned by runner_spawn_sites::every_launching_site_states_its_run_facts, whose mutation twin
+# runner_spawn_sites::removing_the_facts_stamp_from_terminal_create_fails_the_guard proves it can
+# fail.
 
-agent_runtime.rs | run_agent_subprocess | autonomous | spawn_run_task > run_agent_subprocess
-agent_runtime.rs | run_condition_check_terminal | autonomous | run_condition_check_terminal
-agent_runtime.rs | run_continuation_headless | autonomous | run_gate_continuation_inner > run_continuation_headless
-agent_runtime.rs | run_continuation_terminal | autonomous | run_gate_continuation_inner
+agent_runtime.rs | run_agent_subprocess | autonomous | spawn_run_task > run_agent_subprocess | agentic coord_dispatch
+agent_runtime.rs | run_condition_check_terminal | autonomous | run_condition_check_terminal | stamp coord_dispatch
+agent_runtime.rs | run_continuation_headless | autonomous | run_gate_continuation_inner > run_continuation_headless | agentic gate_continuation+unit_continuation @ run_gate_continuation_inner > continuation_run_facts
+agent_runtime.rs | run_continuation_terminal | autonomous | run_gate_continuation_inner | stamp gate_continuation+unit_continuation @ continuation_run_facts
 claude_session/runner.rs | run_claude_session_interactive | helper | run_claude_session_interactive(
 claude_session/runner.rs | run_claude_session_interactive_with_retry | helper | run_claude_session_interactive_with_retry(
-commands/ai_session.rs | create_ai_session | operator | -
-commands/ai_session.rs | resume_ai_sessions | autonomous | resume_ai_sessions
+commands/ai_session.rs | create_ai_session | operator | - | agentic operator_chat
+commands/ai_session.rs | resume_ai_sessions | autonomous | resume_ai_sessions | agentic boot_resume
 commands/config.rs | get_workspace_paths_impl | exempt | only resolves the spawn script's path for display; launches nothing
-commands/session.rs | session_start | operator | -
+commands/session.rs | session_start | operator | - | stamp operator_terminal
 commands/terminal.rs | create_terminal_session_backend | helper | create_terminal_session_backend(
 commands/terminal.rs | create_tracked_terminal_session_backend | helper | create_tracked_terminal_session_backend(
-commands/terminal.rs | terminal_create | operator | -
-commands/terminal.rs | terminal_migrate_session_account | operator | -
+commands/terminal.rs | terminal_create | operator | - | stamp operator_terminal
+commands/terminal.rs | terminal_migrate_session_account | operator | - | none: an account migration moves a LIVE session onto a new PTY - the run continues on its record, which keeps the facts of the launch that started it
 config_report_cmd.rs | seam_reports | exempt | builds the fix-agent command ONLY to report its environment (the seam table); never spawns it
-fixer/trigger.rs | launch_fixer | autonomous | launch_fixer
-follow_up/trigger.rs | launch_follow_up | autonomous | launch_follow_up
-looping_agent_supervisor.rs | spawn_looping_agent_terminal | autonomous | spawn_looping_agent_terminal
-mcp/ai_session.rs | run_prompt | autonomous | run_prompt
-mcp/backend_relay.rs | handle_chat_create | autonomous | handle_chat_create
-mcp/backend_relay.rs | handle_terminal_create | autonomous | handle_terminal_create
-mcp/sessions.rs | spawn_session | autonomous | spawn_session
-mcp/steward.rs | start_steward | autonomous | start_steward
-mcp/task_run_workflow_state.rs | resume_task_run | autonomous | resume_task_run
-mcp/task_runs.rs | create_ai_session | autonomous | create_ai_session
-mcp/task_runs.rs | resume_task_run | autonomous | resume_task_run
+fixer/trigger.rs | launch_fixer | autonomous | launch_fixer | none: a workflow run - its AI phases run under CLI-generated Claude session ids the runner never learns, so no run row has a key; the loop controller's umbrella registration is deliberately not a run
+follow_up/trigger.rs | launch_follow_up | autonomous | launch_follow_up | none: a workflow run - its AI phases run under CLI-generated Claude session ids the runner never learns, so no run row has a key; the loop controller's umbrella registration is deliberately not a run
+looping_agent_supervisor.rs | spawn_looping_agent_terminal | autonomous | spawn_looping_agent_terminal | stamp looping_agent
+mcp/ai_session.rs | run_prompt | autonomous | run_prompt | none: launches through the external spawn-independent-claude.py script, which picks the child's Claude session id - the runner never learns it, so no run row has a key
+mcp/backend_relay.rs | handle_chat_create | autonomous | handle_chat_create | none: a relay chat ClaudeSession spawned with no cli_session_ctx - the CLI generates its own session id, which the runner never learns
+mcp/backend_relay.rs | handle_terminal_create | autonomous | handle_terminal_create | stamp unknown
+mcp/sessions.rs | spawn_session | autonomous | spawn_session | none: a ClaudeSession spawned with no cli_session_ctx - the CLI generates its own session id, which the runner never learns
+mcp/steward.rs | start_steward | autonomous | start_steward | stamp caller
+mcp/task_run_workflow_state.rs | resume_task_run | autonomous | resume_task_run | none: a workflow run - its AI phases run under CLI-generated Claude session ids the runner never learns, so no run row has a key; the loop controller's umbrella registration is deliberately not a run
+mcp/task_runs.rs | create_ai_session | autonomous | create_ai_session | none: a ClaudeSession spawned with no cli_session_ctx - the CLI generates its own session id, which the runner never learns
+mcp/task_runs.rs | resume_task_run | autonomous | resume_task_run | none: a workflow run - its AI phases run under CLI-generated Claude session ids the runner never learns, so no run row has a key; the loop controller's umbrella registration is deliberately not a run
 # The scheduler's RemoteAgent launch (plan 2026-09-13-nightly-return-to-main-sweep, Phase 5b)
 # reaches spawn_claude_child directly instead of POSTing /prompts/run. All three of the
 # scheduler's entry points gate on the device drain before execute_task (tick's
 # partition_for_drain, reconcile_task's drain_gate_for_work, run_task_now's drain_gate);
 # the chain below names the periodic one.
-scheduler_remote_agent.rs | launch | autonomous | scheduler_service.rs::tick_pass > scheduler_service.rs::execute_task > scheduler_service.rs::execute_task_with_context > scheduler_service.rs::launch_and_await_remote_agent > launch
-mcp/tauri_proxy.rs | dispatch | autonomous | dispatch
-mcp/terminals.rs | create_terminal_handler | autonomous | create_terminal_handler
-mcp/unified_workflows.rs | execute_inline_workflow | autonomous | execute_inline_workflow
-mcp/unified_workflows.rs | generate_unified_workflow_async | autonomous | generate_unified_workflow_async
-mcp/unified_workflows.rs | run_composed_workflow | autonomous | run_composed_workflow
-mcp/unified_workflows.rs | run_unified_workflow | autonomous | run_unified_workflow
-meta_optimizer/trigger.rs | launch_optimizer_internal | autonomous | launch_optimizer_internal
-orchestration_loop/ai_session_executor.rs | dispatch_subtask | autonomous | dispatch_subtask
+scheduler_remote_agent.rs | launch | autonomous | scheduler_service.rs::tick_pass > scheduler_service.rs::execute_task > scheduler_service.rs::execute_task_with_context > scheduler_service.rs::launch_and_await_remote_agent > launch | agentic scheduler
+mcp/tauri_proxy.rs | dispatch | autonomous | dispatch | stamp unknown
+mcp/terminals.rs | create_terminal_handler | autonomous | create_terminal_handler | stamp unknown
+mcp/unified_workflows.rs | execute_inline_workflow | autonomous | execute_inline_workflow | none: a workflow run - its AI phases run under CLI-generated Claude session ids the runner never learns, so no run row has a key; the loop controller's umbrella registration is deliberately not a run
+mcp/unified_workflows.rs | generate_unified_workflow_async | autonomous | generate_unified_workflow_async | none: a workflow run - its AI phases run under CLI-generated Claude session ids the runner never learns, so no run row has a key; the loop controller's umbrella registration is deliberately not a run
+mcp/unified_workflows.rs | run_composed_workflow | autonomous | run_composed_workflow | none: a workflow run - its AI phases run under CLI-generated Claude session ids the runner never learns, so no run row has a key; the loop controller's umbrella registration is deliberately not a run
+mcp/unified_workflows.rs | run_unified_workflow | autonomous | run_unified_workflow | none: a workflow run - its AI phases run under CLI-generated Claude session ids the runner never learns, so no run row has a key; the loop controller's umbrella registration is deliberately not a run
+meta_optimizer/trigger.rs | launch_optimizer_internal | autonomous | launch_optimizer_internal | none: a workflow run - its AI phases run under CLI-generated Claude session ids the runner never learns, so no run row has a key; the loop controller's umbrella registration is deliberately not a run
+orchestration_loop/ai_session_executor.rs | dispatch_subtask | autonomous | dispatch_subtask | agentic orchestration @ worker_spawn_facts
 orchestration_loop/fix_agent.rs | build_fix_agent_command_with | helper | build_fix_agent_command_with(
 orchestration_loop/fix_agent.rs | build_fix_agent_command | helper | build_fix_agent_command(
 orchestration_loop/fix_agent.rs | run_fix_agent | exempt | the fix step of an orchestration loop ALREADY running — carries DrainAdmission::Exempt; the loop's own fan-out is the new work the drain defers
-reflection/trigger.rs | launch_project_reflection | autonomous | launch_project_reflection
-reflection/trigger.rs | launch_reflection | autonomous | launch_reflection
-reflection/trigger.rs | launch_ui_bridge_reflection | autonomous | launch_ui_bridge_reflection
-session/handoff.rs | materialize | autonomous | materialize
+reflection/trigger.rs | launch_project_reflection | autonomous | launch_project_reflection | none: a workflow run - its AI phases run under CLI-generated Claude session ids the runner never learns, so no run row has a key; the loop controller's umbrella registration is deliberately not a run
+reflection/trigger.rs | launch_reflection | autonomous | launch_reflection | none: a workflow run - its AI phases run under CLI-generated Claude session ids the runner never learns, so no run row has a key; the loop controller's umbrella registration is deliberately not a run
+reflection/trigger.rs | launch_ui_bridge_reflection | autonomous | launch_ui_bridge_reflection | none: a workflow run - its AI phases run under CLI-generated Claude session ids the runner never learns, so no run row has a key; the loop controller's umbrella registration is deliberately not a run
+session/handoff.rs | materialize | autonomous | materialize | record coord_dispatch @ materialize_restore_registry > registry_record_from_restore_payload
 session/mod.rs | start | helper | .start(intent)
 session/mod.rs | start_inner | helper | .start_inner(
 session/mod.rs | start_with_parent | helper | .start_with_parent(
-session/respawn.rs | materialize | autonomous | materialize
-session/resume_door.rs | resume_one | autonomous | resume_one
+session/respawn.rs | materialize | autonomous | materialize | stamp respawn
+session/resume_door.rs | resume_one | autonomous | resume_one | stamp respawn
 session/transport/claude_cli.rs | start | helper | transport.start(
 session/transport/pty.rs | start | helper | transport.start(
 step_executor/handlers/mod.rs | execute_with_tools | exempt | a step of a workflow run that is already running; every workflow START is a gated row here
@@ -99,8 +119,8 @@ terminal/account_migration.rs | handle_usage_limit_hint | exempt | moves a live 
 terminal/account_migration.rs | migrate_session | helper | migrate_session(
 terminal/account_migration.rs | migrate_session_off_runtime | helper | migrate_session_off_runtime(
 terminal/account_migration.rs | spawn_resumed_pane | helper | spawn_resumed_pane(
-trigger_system/executor.rs | execute_triggered_workflow | autonomous | execute_triggered_workflow
+trigger_system/executor.rs | execute_triggered_workflow | autonomous | execute_triggered_workflow | none: a workflow run - its AI phases run under CLI-generated Claude session ids the runner never learns, so no run row has a key; the loop controller's umbrella registration is deliberately not a run
 unified_ai_session.rs | execute | exempt | a phase of a unified-workflow run that is already running; every workflow START is a gated row here
-unified_workflow_executor/auto_run.rs | launch_workflow_by_id | autonomous | launch_workflow_by_id
-unified_workflow_executor/review_subtask.rs | execute_review_subtask | autonomous | execute_review_subtask
-unified_workflow_executor/startup_resume.rs | resume_interrupted_workflows | autonomous | resume_interrupted_workflows
+unified_workflow_executor/auto_run.rs | launch_workflow_by_id | autonomous | launch_workflow_by_id | none: a workflow run - its AI phases run under CLI-generated Claude session ids the runner never learns, so no run row has a key; the loop controller's umbrella registration is deliberately not a run
+unified_workflow_executor/review_subtask.rs | execute_review_subtask | autonomous | execute_review_subtask | none: a workflow run - its AI phases run under CLI-generated Claude session ids the runner never learns, so no run row has a key; the loop controller's umbrella registration is deliberately not a run
+unified_workflow_executor/startup_resume.rs | resume_interrupted_workflows | autonomous | resume_interrupted_workflows | none: a workflow run - its AI phases run under CLI-generated Claude session ids the runner never learns, so no run row has a key; the loop controller's umbrella registration is deliberately not a run

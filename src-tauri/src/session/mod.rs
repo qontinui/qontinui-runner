@@ -80,6 +80,7 @@ pub mod respawn;
 pub mod restore_census; // Pre/post-restart session census — the G6 outcome check behind GET /control/sessions/restore-census
 pub mod restore_record_emitter;
 pub mod resume_door; // POST /control/sessions/resume — local resume of closed unfinished sessions (plan 2026-10-06-closed-sessions-whose-work-is-unfinished, Phase 4)
+pub mod run_record_emitter; // Session RUN records -> coord.session_runs (plan 2026-10-23-session-duration-by-work-type-and-per-device-session-load, Phase 4)
 pub mod session_id; // The ONE Rust answer to "is this a usable provider session id?" — mirrors the frontend isValidSessionId (plan 2026-08-23-single-source-derived-facts, item 1 step 1)
 pub mod session_ledger; // Rebuild-safe, DISK-persisted open-session ledger — the post-rebuild "what did not come back" report (plan 2026-08-22-wip-custody, Phase 4)
 pub mod session_lifecycle_store;
@@ -408,6 +409,24 @@ pub enum SessionEventKind {
     /// `every_session_outbox_kind_has_a_dispatch_arm` fails if it is missed.
     #[serde(rename = "operator_touch")]
     OperatorTouch,
+    /// One session RUN event — start, merge or end of one open→close interval
+    /// of one lifecycle-store record, or of one agentic-plane registration
+    /// (plan `2026-10-23-session-duration-by-work-type-and-per-device-session-load`,
+    /// Phase 4; producer [`run_record_emitter::RunRecordEmitter`]).
+    ///
+    /// Drained to `POST /coord/session-runs` — NOT to the session-events
+    /// ingest — with `payload.body` forwarded verbatim; `payload.tenant_id`
+    /// only selects the device-JWT slot. Rides a dedicated per-session lane
+    /// ([`run_record_emitter::run_lane`]), so a failing run row can hold back
+    /// only that session's other run rows. A coord that predates the route
+    /// (404/405) ACK-drops the row, as the restore-record mirror does.
+    ///
+    /// ⚠️ Like [`Self::CoordTransportRung`], a kind with no [`coord_sync`]
+    /// `push_record` arm is ACK-DROPPED silently by that function's catch-all.
+    /// This kind HAS an arm; `every_session_outbox_kind_has_a_dispatch_arm`
+    /// fails if it is removed.
+    #[serde(rename = "session_run")]
+    SessionRun,
 }
 
 impl SessionEventKind {
@@ -432,6 +451,7 @@ impl SessionEventKind {
             SessionEventKind::CoordTransportRung => "coord-transport-rung",
             SessionEventKind::AgentNotification => "agent_notification",
             SessionEventKind::OperatorTouch => "operator_touch",
+            SessionEventKind::SessionRun => "session_run",
         }
     }
 }

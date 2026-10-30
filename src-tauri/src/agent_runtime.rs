@@ -2277,6 +2277,31 @@ fn apply_drain_to_claim(
     }
 }
 
+/// The run-ledger spawn facts of a delivered continuation (plan
+/// `2026-10-23-session-duration-by-work-type-and-per-device-session-load`,
+/// Phase 4), for BOTH presentations. A work-unit dispatch carries
+/// `dispatch_id`; a gate continuation does not — the discrimination
+/// [`continuation_drain_admission`] makes. `gate_id` only when it names a real
+/// gate ([`reportable_gate_id`]); the skill is the launch prompt's leading slash
+/// command, name only (coord enriches the rest from the gate row).
+fn continuation_run_facts(
+    payload: &GateContinuationPayload,
+    agent_id: uuid::Uuid,
+) -> crate::session::run_record_emitter::SpawnFacts {
+    use crate::coord_drain_state::SpawnOrigin;
+    let origin = if payload.dispatch_id.is_some() {
+        SpawnOrigin::UnitContinuation
+    } else {
+        SpawnOrigin::GateContinuation
+    };
+    crate::session::run_record_emitter::SpawnFacts::new(origin)
+        .gate_id(reportable_gate_id(payload).map(|g| g.to_string()))
+        .agent_id(Some(agent_id.to_string()))
+        .skill(crate::session::run_record_emitter::skill_of_prompt(
+            &payload.initial_prompt,
+        ))
+}
+
 /// The drain admission for a delivered continuation: a work-unit dispatch when
 /// it carries a `dispatch_id`, otherwise a gate continuation, keyed by its id.
 fn continuation_drain_admission(
@@ -6224,6 +6249,7 @@ async fn run_gate_continuation_inner(
                 &headless_prompt,
                 reservation,
                 pinned_session_id,
+                continuation_run_facts(&payload, agent_id),
             )
             .await;
             drop(ctx);
@@ -6864,6 +6890,10 @@ async fn run_continuation_terminal(
         // and leave an unattended, interactive `claude` facing the trust dialog).
         crate::claude_session::trust_gate::warm_dial().await;
 
+        // Run ledger (plan 2026-10-23-session-duration-by-work-type-and-per-
+        // device-session-load, Phase 4): the instant before the terminal
+        // exists, so the facts land only on the record THIS spawn opens.
+        let spawn_since = crate::session::run_record_emitter::spawn_clock_ms();
         let result = crate::commands::terminal::create_tracked_terminal_session_backend(
             &terminal_manager,
             &session_registry,
@@ -6905,6 +6935,15 @@ async fn run_continuation_terminal(
                 return Err(anyhow::anyhow!(e));
             }
         };
+
+        // Run ledger: WHY this session exists, stamped on the record the
+        // spawn opened.
+        crate::session::run_record_emitter::stamp_spawn_facts(
+            &app,
+            &terminal_id,
+            continuation_run_facts(payload, agent_id),
+            spawn_since,
+        );
 
         // Withhold the verdict until the session has demonstrably started (its
         // pinned transcript exists), has outlived the start window, or has died
@@ -7865,6 +7904,8 @@ async fn run_condition_check_terminal(
     // sync trust gate decides on the tenant's word, not a cold cache.
     crate::claude_session::trust_gate::warm_dial().await;
 
+    // Run ledger (plan 2026-10-23-session-duration-…, Phase 4).
+    let spawn_since = crate::session::run_record_emitter::spawn_clock_ms();
     let result = crate::commands::terminal::create_tracked_terminal_session_backend(
         &terminal_manager,
         &session_registry,
@@ -7893,6 +7934,16 @@ async fn run_condition_check_terminal(
                 "agent_runtime: condition-check terminal session created terminal_id={terminal_id} \
                  coord_session={coord_session_id:?} run_id={}",
                 payload.run_id
+            );
+            // Run ledger: a coord-dispatched condition check.
+            crate::session::run_record_emitter::stamp_spawn_facts(
+                &app,
+                &terminal_id,
+                crate::session::run_record_emitter::SpawnFacts::new(
+                    crate::coord_drain_state::SpawnOrigin::CoordDispatch,
+                )
+                .spawn_kind("condition_check"),
+                spawn_since,
             );
             // Surface it: switch the main view to the Terminal panel + select the
             // tab (scoped to the MAIN window, same as the gate path).
@@ -8233,6 +8284,10 @@ async fn run_continuation_headless(
     // The Claude session id to pin (`--session-id`), minted by the caller
     // before the worktree allocate. See `run_gate_continuation_inner`.
     pinned_session_id: uuid::Uuid,
+    // The run ledger's spawn facts ([`continuation_run_facts`]). A headless
+    // child has no lifecycle record, so its run rides the agentic plane:
+    // started once the child exists, ended when it exits.
+    run_facts: crate::session::run_record_emitter::SpawnFacts,
 ) -> anyhow::Result<HeadlessExit> {
     let log_path = agent_log_path(agent_id);
     // Select the most-available account once before spawning (pins the resolved
@@ -8284,6 +8339,12 @@ async fn run_continuation_headless(
                 crate::session::tracking_health::register_headless_claude_pid(p);
             }
             report_spawn_complete(agent_id, pid, Some("gate continuation"), None).await;
+            // Run ledger: the pinned session runs from here to its exit.
+            let run_key = pinned_session_id.to_string();
+            let run_tenant = crate::session::run_record_emitter::headless_run_tenant(workdir).await;
+            crate::session::run_record_emitter::agentic_headless_start(
+                &run_key, run_facts, run_tenant,
+            );
             let exit = pump_subprocess(
                 agent_id,
                 &mut child,
@@ -8291,6 +8352,7 @@ async fn run_continuation_headless(
                 Some(&preconditions),
             )
             .await;
+            crate::session::run_record_emitter::agentic_process_exited(&run_key);
             if let Some(p) = health_pid {
                 crate::session::tracking_health::unregister_headless_claude_pid(p);
             }
@@ -9198,6 +9260,31 @@ async fn run_agent_subprocess(
                         payload.agent_id
                     );
                 }
+                // Run ledger (plan 2026-10-23-session-duration-by-work-type-
+                // and-per-device-session-load, Phase 4): each attempt is its own
+                // pinned session — a headless child with no lifecycle record,
+                // so its run rides the agentic ledger from here to its exit.
+                let run_key = session_pins.current().map(|id| id.to_string());
+                // The tenant the worktree is owned by, as the registrar would
+                // resolve it — the run rows present that tenant's credential.
+                let run_tenant =
+                    crate::session::run_record_emitter::headless_run_tenant(&primary_wt).await;
+                if let Some(key) = run_key.as_deref() {
+                    crate::session::run_record_emitter::agentic_headless_start(
+                        key,
+                        crate::session::run_record_emitter::SpawnFacts::new(
+                            crate::coord_drain_state::SpawnOrigin::CoordDispatch,
+                        )
+                        .agent_id(Some(payload.agent_id.to_string()))
+                        .spawn_kind("agent_spawn")
+                        .skill(
+                            crate::session::run_record_emitter::skill_of_prompt(
+                                &payload.initial_prompt,
+                            ),
+                        ),
+                        run_tenant.clone(),
+                    );
+                }
                 // Race the subprocess pump against an operator stop. On stop we
                 // let the pump future drop (releasing &mut child), then kill the
                 // child and break WITHOUT restarting.
@@ -9213,6 +9300,9 @@ async fn run_agent_subprocess(
                     ) => {
                         pump_exit = Some(e);
                     }
+                }
+                if let Some(key) = run_key.as_deref() {
+                    crate::session::run_record_emitter::agentic_process_exited(key);
                 }
                 let exit = match pump_exit {
                     Some(e) => e,
@@ -10354,6 +10444,11 @@ impl SpawnSessionPins {
         let id = uuid::Uuid::new_v4();
         self.current = Some(id);
         pinned_session_args(id)
+    }
+
+    /// The current attempt's pinned id, if an attempt was minted.
+    fn current(&self) -> Option<uuid::Uuid> {
+        self.current
     }
 
     /// The current attempt's id, the first time a spawn succeeds; `None` after.
@@ -14449,6 +14544,9 @@ mod tests {
             "echo gate-continuation-proof",
             AnchorReservation::none(),
             pinned,
+            crate::session::run_record_emitter::SpawnFacts::new(
+                crate::coord_drain_state::SpawnOrigin::GateContinuation,
+            ),
         )
         .await;
         match prev_tier {
