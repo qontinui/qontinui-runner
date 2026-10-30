@@ -49,7 +49,7 @@ use tracing::{debug, info, warn};
 use qontinui_runner_lib::looping_agent::desired_state::{
     self, CoordDesiredState, DesiredSource, EffectiveDesired,
 };
-use qontinui_runner_lib::looping_agent::holder::{self, HolderObservation};
+use qontinui_runner_lib::looping_agent::holder::{self, HolderObservation, SlotHolderView};
 use qontinui_runner_lib::looping_agent::idle::{snapshot_context_low, snapshot_looks_idle};
 use qontinui_runner_lib::looping_agent::lease::{self, HeldSlot, SlotHolder};
 use qontinui_runner_lib::looping_agent::playbook;
@@ -174,6 +174,47 @@ async fn observe_slot_holder(
     let obs = HolderObservation::from_lookup(result, now);
     set_slot_holder_obs(resource_key, obs.clone());
     obs
+}
+
+/// The last slot-holder view per agent: `agent_id -> SlotHolderView`. Drives
+/// the edge-triggered INFO line (one line per holder CHANGE, not per 5 s tick)
+/// and `LoopingAgentStatus.slotHolder`.
+///
+/// Cleared when the agent acquires a slot and on a clean stop, so the status
+/// field is `None` whenever this runner holds the slot (or has not yet seen a
+/// Held), and the next Held logs again at INFO. With more than one slot it records the
+/// LAST slot walked this tick.
+static LAST_SLOT_HOLDER: Mutex<Option<HashMap<String, SlotHolderView>>> = Mutex::new(None);
+
+fn last_slot_holder_for(agent_id: &str) -> Option<SlotHolderView> {
+    let guard = LAST_SLOT_HOLDER.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().and_then(|m| m.get(agent_id)).cloned()
+}
+
+fn clear_last_slot_holder(agent_id: &str) {
+    let mut guard = LAST_SLOT_HOLDER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = guard.as_mut() {
+        map.remove(agent_id);
+    }
+}
+
+/// Record the agent's current slot-holder view, emitting ONE INFO line when
+/// the holder changed (`holder::holder_changed`).
+fn note_slot_holder(agent_id: &str, view: SlotHolderView) {
+    let mut guard = LAST_SLOT_HOLDER.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    if holder::holder_changed(map.get(agent_id), &view) {
+        info!(
+            agent = %agent_id,
+            resource_key = %view.resource_key,
+            holder_machine = %view.holder_label(),
+            holder_session = view.session.as_deref().unwrap_or("none"),
+            source = view.source,
+            this_machine = view.is_this_machine,
+            "looping_agent_supervisor: slot held by another runner (holder changed)"
+        );
+    }
+    map.insert(agent_id.to_string(), view);
 }
 
 /// Last-logged effective posture per agent, so the posture line is
@@ -787,6 +828,8 @@ async fn reconcile_slot_lease(
 
     // -- Clean stop: release what we hold. --
     if !effective.running {
+        // A stopped agent observes no holder; the next Held logs at INFO again.
+        clear_last_slot_holder(agent_id);
         if let Some(slot) = clear_held_slot(agent_id) {
             info!(
                 agent = %agent_id,
@@ -814,9 +857,19 @@ async fn reconcile_slot_lease(
         // Stolen: another supervisor owns this slot now. Drop our memo and fall
         // through to the acquire path — if a slot is genuinely free we take it,
         // otherwise we do nothing this tick.
+        let (holder, holder_session) = match &outcome {
+            lease::HeartbeatOutcome::Stolen { holder: Some(h) } => (
+                h.machine_id.clone(),
+                h.session.clone().unwrap_or_else(|| "none".to_string()),
+            ),
+            lease::HeartbeatOutcome::NotHeld => ("none (expired)".to_string(), "none".to_string()),
+            _ => ("unknown".to_string(), "unknown".to_string()),
+        };
         warn!(
             agent = %agent_id,
             resource_key = %slot.resource_key,
+            %holder,
+            %holder_session,
             "looping_agent_supervisor: slot lease lost (stolen/expired) — another runner owns \
              this slot now"
         );
@@ -854,6 +907,7 @@ async fn reconcile_slot_lease(
                     "looping_agent_supervisor: acquired slot lease — spawn permitted"
                 );
                 set_held_slot(agent_id, HeldSlot { slot, resource_key });
+                clear_last_slot_holder(agent_id);
                 return true;
             }
             lease::AcquireOutcome::Held { holder } => {
@@ -864,13 +918,15 @@ async fn reconcile_slot_lease(
                 // through to "try the next slot" whatever the lookup says
                 // (named, not-held-at-lookup, or failed).
                 let obs = observe_slot_holder(&resource_key, holder.as_ref()).await;
+                let view =
+                    SlotHolderView::from_observation(&resource_key, &obs, &machine_id.to_string());
                 debug!(
                     agent = %agent_id,
                     %resource_key,
-                    holder = obs.holder.as_ref().map(|h| h.machine_id.as_str()).unwrap_or("unknown"),
-                    holder_source = ?obs.source,
+                    holder = %view.holder_label(),
                     "looping_agent_supervisor: slot held by another runner — trying the next"
                 );
+                note_slot_holder(agent_id, view);
             }
             lease::AcquireOutcome::Unavailable(e) => {
                 // Coord unreachable is NOT a free slot. Stop walking (the rest
@@ -1299,6 +1355,10 @@ pub(crate) struct LoopingAgentStatus {
     /// Rendered-grid idle read (`None` when there is no live tab). Single
     /// read, no quiescence debounce — status is observational.
     pub idle: Option<bool>,
+    /// Who holds the slot this runner last found held (`slotHolder`). `None`
+    /// whenever this runner holds the slot or has not yet observed a Held.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot_holder: Option<SlotHolderView>,
 }
 
 /// Assemble the live status for one record.
@@ -1315,6 +1375,7 @@ pub(crate) fn status_snapshot(
         record: rec.clone(),
         tab_alive: liveness != Liveness::Dead,
         idle,
+        slot_holder: last_slot_holder_for(&rec.def.id),
     }
 }
 
@@ -1350,5 +1411,65 @@ mod drain_rewrite_tests {
         for action in ACTIONS {
             assert_eq!(drain_rewrite(action, &DrainGate::Allow), action);
         }
+    }
+}
+
+/// Plan `2026-10-30-looping-agent-slot-holder-is-never-named`, Phase 3: the
+/// status payload's `slotHolder` key, as the Tauri commands serve it.
+#[cfg(test)]
+mod slot_holder_status_tests {
+    use super::*;
+    use qontinui_runner_lib::looping_agent::holder::HolderSource;
+    use qontinui_runner_lib::looping_agent::registry::{
+        builtin_merge_shepherd, LoopingAgentRuntime,
+    };
+
+    fn record() -> LoopingAgentRecord {
+        LoopingAgentRecord {
+            def: builtin_merge_shepherd("journal.jsonl".to_string()),
+            runtime: LoopingAgentRuntime::default(),
+        }
+    }
+
+    #[test]
+    fn status_serializes_slot_holder_camel_case_and_omits_it_when_none() {
+        let obs = HolderObservation {
+            holder: Some(SlotHolder {
+                machine_id: "3e7e4b04-75de-4efb-b718-c8ce8fcf7b17".to_string(),
+                session: None,
+            }),
+            source: HolderSource::Acquire,
+            observed_at: std::time::Instant::now(),
+        };
+        let view = SlotHolderView::from_observation("role:t:merge_shepherd:0", &obs, "own-machine");
+        let status = LoopingAgentStatus {
+            record: record(),
+            tab_alive: false,
+            idle: None,
+            slot_holder: Some(view),
+        };
+        let v = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            v["slotHolder"],
+            serde_json::json!({
+                "resourceKey": "role:t:merge_shepherd:0",
+                "machineId": "3e7e4b04-75de-4efb-b718-c8ce8fcf7b17",
+                "session": null,
+                "source": "acquire",
+                "isThisMachine": false
+            })
+        );
+
+        let none = LoopingAgentStatus {
+            record: record(),
+            tab_alive: false,
+            idle: None,
+            slot_holder: None,
+        };
+        let v = serde_json::to_value(&none).unwrap();
+        assert!(
+            v.get("slotHolder").is_none(),
+            "no observed holder must omit the key, not serialize null"
+        );
     }
 }
