@@ -2791,8 +2791,12 @@ pub(crate) fn explore_app_id(app_id: &str) -> Result<String, Refusal> {
 ///   write path, so a run would add nothing), the runner itself failed
 ///   mid-run (no row is written: none of the seven stop reasons is true), or
 ///   the node start check could not reach the app or ask the producer;
+/// - 500: the run's task panicked, so whether its row was written is unknown;
 /// - 200: the run's answer, with `persistence` saying whether its row was
 ///   written.
+///
+/// The run is not tied to this request ([`run_detached`]): a client that
+/// disconnects does not stop it, and its row is still written.
 pub async fn post_explore(
     State(state): State<Arc<ApiState>>,
     Path(app_id): Path<String>,
@@ -2821,7 +2825,7 @@ pub async fn post_explore(
         )
             .into_response();
     }
-    let Some(_guard) = RunGuard::claim(&app_id) else {
+    let Some(guard) = RunGuard::claim(&app_id) else {
         return Refusal(
             StatusCode::CONFLICT,
             format!("an exploration of {app_id} is already running"),
@@ -2829,6 +2833,47 @@ pub async fn post_explore(
         .into_response();
     };
     let run_id = uuid::Uuid::new_v4().to_string();
+    let run = run_and_persist(state, app_id, request, run_id.clone());
+    run_detached(guard, run_id, run).await
+}
+
+/// Run `run` on its own task, holding `guard` until it ends, and answer with
+/// what it answers. Dropping the returned future (a client that disconnected)
+/// leaves the task running, so a run never ends without its row while its edges
+/// keep a `run_id` nothing names, and the app stays claimed until it is done. A
+/// task that panicked answers a 500 and has released the claim.
+pub(crate) async fn run_detached<F>(guard: RunGuard, run_id: String, run: F) -> Response
+where
+    F: std::future::Future<Output = Response> + Send + 'static,
+{
+    let task = tokio::spawn(async move {
+        let _guard = guard;
+        run.await
+    });
+    match task.await {
+        Ok(answer) => answer,
+        Err(e) => {
+            tracing::error!(run_id = %run_id, error = %e, "journey exploration task failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "the exploration's task failed before it answered, so whether its \
+                              row was written is unknown",
+                    "runId": run_id,
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// One exploration, start to its answer, with its row persisted.
+async fn run_and_persist(
+    state: Arc<ApiState>,
+    app_id: String,
+    request: ExploreRequest,
+    run_id: String,
+) -> Response {
     let started_at = chrono::Utc::now();
     let mut driver = LiveDriver {
         state: Arc::clone(&state),
