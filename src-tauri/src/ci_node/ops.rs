@@ -401,7 +401,7 @@ async fn run_script(
     let _ = id;
 
     let build = |with_cg: bool| {
-        let mut cmd = tokio::process::Command::new("bash");
+        let mut cmd = crate::process_helpers::tokio_no_window("bash");
         cmd.arg(script)
             .current_dir(repo_dir)
             .env_clear()
