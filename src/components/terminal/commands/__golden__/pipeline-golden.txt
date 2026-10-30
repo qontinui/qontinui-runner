@@ -467,7 +467,7 @@
 /filter-tag 3 best --tenant	literal	terminal.tag-toggle	[["tag","3 best --tenant"]]	error:unknown-tag	error /tag: "3 best --tenant" is not a zone tag (have: alpha)
 /filter-tag gmail	pattern	terminal.tag-toggle	[["tag","gmail"]]	error:unknown-tag	error /tag: "gmail" is not a zone tag (have: alpha)
 /filter-tag gmail --tenant	literal	terminal.tag-toggle	[["tag","gmail --tenant"]]	error:unknown-tag	error /tag: "gmail --tenant" is not a zone tag (have: alpha)
-/find session	pattern	terminal.sessions-find	[]	error:no-palette	error /sessions.find: The session search palette is not mounted on this page — open the Session Manager first.
+/find session	pattern	terminal.sessions-find	[]	error:no-palette	error /sessions.find: The session search palette is not mounted — open the Terminal view first.
 /find session "1 gmail fix the bug"	none	-	null	none	-
 /find session "1 gmail fix the bug" --tenant	none	-	null	none	-
 /find session "3 best"	none	-	null	none	-
@@ -477,7 +477,7 @@
 /find session 1 gmail fix the bug --tenant	none	-	null	none	-
 /find session 3 best	none	-	null	none	-
 /find session 3 best --tenant	none	-	null	none	-
-/find-session	literal	terminal.sessions-find	[]	error:no-palette	error /sessions.find: The session search palette is not mounted on this page — open the Session Manager first.
+/find-session	literal	terminal.sessions-find	[]	error:no-palette	error /sessions.find: The session search palette is not mounted — open the Terminal view first.
 /find-session "1 gmail fix the bug"	literal	terminal.sessions-find	[]	unbound	-
 /find-session "1 gmail fix the bug" --tenant	literal	terminal.sessions-find	[]	unbound	-
 /find-session "3 best"	literal	terminal.sessions-find	[]	unbound	-
@@ -953,7 +953,7 @@
 /save-workflow 1 gmail fix the bug --tenant	literal	terminal.save-workflow	[]	unbound	-
 /save-workflow 3 best	literal	terminal.save-workflow	[]	unbound	-
 /save-workflow 3 best --tenant	literal	terminal.save-workflow	[]	unbound	-
-/search sessions	pattern	terminal.sessions-find	[]	error:no-palette	error /sessions.find: The session search palette is not mounted on this page — open the Session Manager first.
+/search sessions	pattern	terminal.sessions-find	[]	error:no-palette	error /sessions.find: The session search palette is not mounted — open the Terminal view first.
 /search sessions "1 gmail fix the bug"	none	-	null	none	-
 /search sessions "1 gmail fix the bug" --tenant	none	-	null	none	-
 /search sessions "3 best"	none	-	null	none	-
@@ -1055,7 +1055,7 @@
 /sessions 1 gmail fix the bug --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound	-
 /sessions 3 best	literal	terminal.toggle-sessions-sidebar	[]	unbound	-
 /sessions 3 best --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound	-
-/sessions.find	literal	terminal.sessions-find	[]	error:no-palette	error /sessions.find: The session search palette is not mounted on this page — open the Session Manager first.
+/sessions.find	literal	terminal.sessions-find	[]	error:no-palette	error /sessions.find: The session search palette is not mounted — open the Terminal view first.
 /sessions.find "1 gmail fix the bug"	literal	terminal.sessions-find	[]	unbound	-
 /sessions.find "1 gmail fix the bug" --tenant	literal	terminal.sessions-find	[]	unbound	-
 /sessions.find "3 best"	literal	terminal.sessions-find	[]	unbound	-
@@ -1917,7 +1917,7 @@ filter-tag 3 best	literal	terminal.tag-toggle	[["tag","3 best"]]	error:unknown-t
 filter-tag 3 best --tenant	literal	terminal.tag-toggle	[["tag","3 best --tenant"]]	error:unknown-tag	error /tag: "3 best --tenant" is not a zone tag (have: alpha)
 filter-tag gmail	pattern	terminal.tag-toggle	[["tag","gmail"]]	error:unknown-tag	error /tag: "gmail" is not a zone tag (have: alpha)
 filter-tag gmail --tenant	literal	terminal.tag-toggle	[["tag","gmail --tenant"]]	error:unknown-tag	error /tag: "gmail --tenant" is not a zone tag (have: alpha)
-find session	pattern	terminal.sessions-find	[]	error:no-palette	error /sessions.find: The session search palette is not mounted on this page — open the Session Manager first.
+find session	pattern	terminal.sessions-find	[]	error:no-palette	error /sessions.find: The session search palette is not mounted — open the Terminal view first.
 find session "1 gmail fix the bug"	none	-	null	none	-
 find session "1 gmail fix the bug" --tenant	none	-	null	none	-
 find session "3 best"	none	-	null	none	-
@@ -1927,7 +1927,7 @@ find session 1 gmail fix the bug	none	-	null	none	-
 find session 1 gmail fix the bug --tenant	none	-	null	none	-
 find session 3 best	none	-	null	none	-
 find session 3 best --tenant	none	-	null	none	-
-find-session	literal	terminal.sessions-find	[]	error:no-palette	error /sessions.find: The session search palette is not mounted on this page — open the Session Manager first.
+find-session	literal	terminal.sessions-find	[]	error:no-palette	error /sessions.find: The session search palette is not mounted — open the Terminal view first.
 find-session "1 gmail fix the bug"	literal	terminal.sessions-find	[]	unbound	-
 find-session "1 gmail fix the bug" --tenant	literal	terminal.sessions-find	[]	unbound	-
 find-session "3 best"	literal	terminal.sessions-find	[]	unbound	-
@@ -2403,7 +2403,7 @@ save-workflow 1 gmail fix the bug	literal	terminal.save-workflow	[]	unbound	-
 save-workflow 1 gmail fix the bug --tenant	literal	terminal.save-workflow	[]	unbound	-
 save-workflow 3 best	literal	terminal.save-workflow	[]	unbound	-
 save-workflow 3 best --tenant	literal	terminal.save-workflow	[]	unbound	-
-search sessions	pattern	terminal.sessions-find	[]	error:no-palette	error /sessions.find: The session search palette is not mounted on this page — open the Session Manager first.
+search sessions	pattern	terminal.sessions-find	[]	error:no-palette	error /sessions.find: The session search palette is not mounted — open the Terminal view first.
 search sessions "1 gmail fix the bug"	none	-	null	none	-
 search sessions "1 gmail fix the bug" --tenant	none	-	null	none	-
 search sessions "3 best"	none	-	null	none	-
@@ -2505,7 +2505,7 @@ sessions 1 gmail fix the bug	literal	terminal.toggle-sessions-sidebar	[]	unbound
 sessions 1 gmail fix the bug --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound	-
 sessions 3 best	literal	terminal.toggle-sessions-sidebar	[]	unbound	-
 sessions 3 best --tenant	literal	terminal.toggle-sessions-sidebar	[]	unbound	-
-sessions.find	literal	terminal.sessions-find	[]	error:no-palette	error /sessions.find: The session search palette is not mounted on this page — open the Session Manager first.
+sessions.find	literal	terminal.sessions-find	[]	error:no-palette	error /sessions.find: The session search palette is not mounted — open the Terminal view first.
 sessions.find "1 gmail fix the bug"	literal	terminal.sessions-find	[]	unbound	-
 sessions.find "1 gmail fix the bug" --tenant	literal	terminal.sessions-find	[]	unbound	-
 sessions.find "3 best"	literal	terminal.sessions-find	[]	unbound	-
@@ -3035,8 +3035,8 @@ yes all 3 best --tenant	none	-	null	none	-
 «ai» terminal.select-by-state [valid] do the thing	ai	terminal.select-by-state	[["state","idle"]]	ok	ok /select-by-state ✓ selected 1 zone — idle
 «ai» terminal.sessions-find [alien] do the thing	ai	terminal.sessions-find	[["nonsense","x"]]	refused	error /sessions.find: takes no arguments (got "nonsense")
 «ai» terminal.sessions-find [bool] do the thing	ai	terminal.sessions-find	[]	refused	error /sessions.find: "count" must be text or a number (got true/false)
-«ai» terminal.sessions-find [empty] do the thing	ai	terminal.sessions-find	[]	error:no-palette	error /sessions.find: The session search palette is not mounted on this page — open the Session Manager first.
-«ai» terminal.sessions-find [valid] do the thing	ai	terminal.sessions-find	[]	error:no-palette	error /sessions.find: The session search palette is not mounted on this page — open the Session Manager first.
+«ai» terminal.sessions-find [empty] do the thing	ai	terminal.sessions-find	[]	error:no-palette	error /sessions.find: The session search palette is not mounted — open the Terminal view first.
+«ai» terminal.sessions-find [valid] do the thing	ai	terminal.sessions-find	[]	error:no-palette	error /sessions.find: The session search palette is not mounted — open the Terminal view first.
 «ai» terminal.show-shortcuts [alien] do the thing	ai	terminal.show-shortcuts	[["nonsense","x"]]	refused	error /shortcuts: takes no arguments (got "nonsense")
 «ai» terminal.show-shortcuts [bool] do the thing	ai	terminal.show-shortcuts	[]	refused	error /shortcuts: "count" must be text or a number (got true/false)
 «ai» terminal.show-shortcuts [empty] do the thing	ai	terminal.show-shortcuts	[]	ok	ok /shortcuts ✓ opened the shortcuts overlay
@@ -3207,8 +3207,8 @@ yes all 3 best --tenant	none	-	null	none	-
 «direct» terminal.select-by-state [valid]	direct	terminal.select-by-state	[["state","idle"]]	ok	ok /select-by-state ✓ selected 1 zone — idle
 «direct» terminal.sessions-find [alien]	direct	terminal.sessions-find	[["nonsense","x"]]	threw	error /sessions.find: takes no arguments (got "nonsense")
 «direct» terminal.sessions-find [bool]	direct	terminal.sessions-find	[["count",true]]	threw	error /sessions.find: "count" must be text or a number (got true/false)
-«direct» terminal.sessions-find [empty]	direct	terminal.sessions-find	[]	threw	error /sessions.find: The session search palette is not mounted on this page — open the Session Manager first.
-«direct» terminal.sessions-find [valid]	direct	terminal.sessions-find	[]	threw	error /sessions.find: The session search palette is not mounted on this page — open the Session Manager first.
+«direct» terminal.sessions-find [empty]	direct	terminal.sessions-find	[]	threw	error /sessions.find: The session search palette is not mounted — open the Terminal view first.
+«direct» terminal.sessions-find [valid]	direct	terminal.sessions-find	[]	threw	error /sessions.find: The session search palette is not mounted — open the Terminal view first.
 «direct» terminal.show-shortcuts [alien]	direct	terminal.show-shortcuts	[["nonsense","x"]]	threw	error /shortcuts: takes no arguments (got "nonsense")
 «direct» terminal.show-shortcuts [bool]	direct	terminal.show-shortcuts	[["count",true]]	threw	error /shortcuts: "count" must be text or a number (got true/false)
 «direct» terminal.show-shortcuts [empty]	direct	terminal.show-shortcuts	[]	ok	ok /shortcuts ✓ opened the shortcuts overlay

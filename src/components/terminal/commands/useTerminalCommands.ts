@@ -1514,7 +1514,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       if (!requestSessionSearchOpen()) {
         return fail(
           "no-palette",
-          "The session search palette is not mounted on this page — open the Session Manager first.",
+          "The session search palette is not mounted — open the Terminal view first.",
         );
       }
       return ok(stateEffect("opened", "the session search palette", !wasOpen));
