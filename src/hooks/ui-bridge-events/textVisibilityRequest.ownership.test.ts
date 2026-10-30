@@ -167,7 +167,13 @@ describe("text visibility ownership (clock-free)", () => {
       expect(bodies).toEqual([]);
       expect(reply).toEqual({
         success: true,
-        data: { success: true, query: true, hidden: h, paintFence: "not_needed" },
+        data: {
+          success: true,
+          query: true,
+          hidden: h,
+          paintFence: "not_needed",
+          devControls: false,
+        },
       });
     },
   );

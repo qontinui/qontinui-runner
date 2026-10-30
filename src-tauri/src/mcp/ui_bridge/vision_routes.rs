@@ -2178,13 +2178,17 @@ const TEXT_HIDDEN_FRAME_MAX_ALLOC: u64 = 512 * 1024 * 1024;
 /// captured or hidden. `reads_frame_b` says whether the analysis asked for
 /// reads frame B at all (the `image` analyzer, or a `text_over_image_contrast`
 /// assertion): hiding the runner's text for a frame nothing reads alters the
-/// page for nothing, so `captureTextHidden` is refused without one.
+/// page for nothing, so `captureTextHidden` is refused without one. The same
+/// goes for a request with no `snapshot` (`has_snapshot`): both readers find
+/// the text elements in the snapshot, so without one vision-core can only
+/// answer unknown, and the hide would alter the page for nothing.
 fn check_text_hidden_request(
     supplied: Option<&TextHiddenFrameRequest>,
     ids: Option<&[String]>,
     capture: bool,
     target: Option<&str>,
     reads_frame_b: bool,
+    has_snapshot: bool,
 ) -> Result<(), String> {
     if ids.is_some() && supplied.is_none() {
         return Err(if capture {
@@ -2217,6 +2221,14 @@ fn check_text_hidden_request(
                 "captureTextHidden hides the page's text for frame B, and nothing in this \
                  request reads frame B: use the `image` analyzer or a \
                  `text_over_image_contrast` assertion"
+                    .into(),
+            );
+        }
+        if !has_snapshot {
+            return Err(
+                "captureTextHidden needs a `snapshot`: frame B is read only where the \
+                 snapshot places text, so without one every text-over-image check answers \
+                 unknown and the hide would alter the page for nothing"
                     .into(),
             );
         }
@@ -2483,15 +2495,19 @@ pub(crate) const VISION_CAPTURE_PERMITS: u32 = 2;
 /// The runner arm (`captureTextHidden`): frame A and frame B of the runner's
 /// own window around a hide of its webview's text, under one lock and EVERY
 /// capture permit ([`super::text_visibility::capture_text_hidden_pair`]), so no
-/// other runner-window capture lands while the text is hidden. A DOM read
-/// (snapshot, discover) during the hide is not covered by the permits.
+/// other VISION capture (each takes a permit in [`capture_runner_window`])
+/// lands while the text is hidden. Captures that take no permit are not held
+/// off and can see the hidden page: `screenshots::capture_runner_window_base64`
+/// (called from `elements.rs`, `errors.rs` and `mcp_api.rs`), exploration's
+/// and streaming's window grabs, and a monitor capture. A DOM read (snapshot,
+/// discover) during the hide is not covered either.
 ///
-/// The lock and the permits are held until the restore attempt has returned —
-/// on a cancel, until the guard's spawned restore has landed and bumped. If
-/// that restore FAILS (the webview unreachable, say), the page may stay
-/// text-hidden until the arm's TTL ([`super::text_visibility::CAPTURE_TTL_MS`])
-/// restores it; the scheduled TTL bump then retires any capture cached in
-/// between.
+/// The lock and the permits are held until the restore has answered; when it
+/// FAILED (the webview unreachable, say), until the arm's TTL
+/// ([`super::text_visibility::CAPTURE_TTL_MS`]) has restored the page. On a
+/// cancel they go with the guard's spawned restore, and are released once it
+/// has answered and bumped; if THAT restore fails or is not verified, it is
+/// logged, and a TTL bump retires any capture cached before the TTL restore.
 async fn capture_text_hidden_arm(
     state: &Arc<ApiState>,
 ) -> (Option<Frame>, Option<String>, TextHidden) {
@@ -2510,17 +2526,35 @@ async fn capture_text_hidden_arm(
     };
     let abort_state = Arc::clone(state);
     // Spawned holding the arm's lock AND its permits, released only after the
-    // restore and the bump: no other arm starts, and no other capture sees the
-    // text-hidden page, until the restore has landed.
+    // restore and the bump: no other arm starts, and no other vision capture
+    // sees the text-hidden page, until the restore has answered.
     let abort_restore = move |lock: PairLockGuard, permits: tokio::sync::OwnedSemaphorePermit| {
         let restore = async move {
-            let _ = super::request::ui_bridge_request_sync(
+            let reply = super::request::ui_bridge_request_sync(
                 &abort_state,
                 REQUEST_TYPE,
                 serde_json::json!({"hidden": false}),
             )
             .await;
             bump_mutation_id(&abort_state);
+            // Not confirmed: the page may stay text-hidden until the arm's TTL
+            // restores it, with no request this runner sees — so that restore
+            // gets its bump, counted from now (past the hide's reply).
+            let verified = reply
+                .as_ref()
+                .is_ok_and(super::text_visibility::restore_verified);
+            if !verified {
+                warn!(
+                    "vision: the cancelled runner arm's text restore was not verified \
+                     ({reply:?}); the {} ms TTL restores the page",
+                    super::text_visibility::CAPTURE_TTL_MS
+                );
+                schedule_mutation_bump(
+                    &abort_state,
+                    super::text_visibility::CAPTURE_TTL_MS
+                        + super::text_visibility::TTL_BUMP_MARGIN_MS,
+                );
+            }
             drop(permits);
             drop(lock);
         };
@@ -2675,7 +2709,8 @@ pub struct AnalyzeRequest {
     /// what the page answered and whether it ended restored. Only for the
     /// runner's own window (`target` absent), exclusive with
     /// `textHiddenFrame`, and only when something in the request reads frame
-    /// B. The hide is a dev control: it works only where the webview opted
+    /// B and a `snapshot` places the text it is read at. The hide is a dev
+    /// control: it works only where the webview opted
     /// into dev controls (a Vite dev runner, after qontinui-runner#2311), and
     /// everywhere else — every exe-mode runner — answers
     /// `capability_unavailable_in_build`, reported in `textHiddenFrameError`.
@@ -2692,7 +2727,7 @@ impl RequestHints for AnalyzeRequest {
              `textHiddenFrame` ({pngBase64} or {sha256}: frame B, text hidden, a PNG of the \
              frame's size; bodies up to 32 MiB) with an optional `textHiddenIds`, or \
              `captureTextHidden: true` (the runner hides its own webview's text for frame B; \
-             only with the `image` analyzer)."
+             only with the `image` analyzer and a `snapshot`)."
                 .to_string(),
             "Use `vision/assert` for targeted pass/fail checks; \
              use `vision/analyze` for broad findings across a frame."
@@ -3052,7 +3087,8 @@ pub struct AssertRequest {
     /// what the page answered and whether it ended restored. Only for the
     /// runner's own window (`target` absent), exclusive with
     /// `textHiddenFrame`, and only when something in the request reads frame
-    /// B. The hide is a dev control: it works only where the webview opted
+    /// B and a `snapshot` places the text it is read at. The hide is a dev
+    /// control: it works only where the webview opted
     /// into dev controls (a Vite dev runner, after qontinui-runner#2311), and
     /// everywhere else — every exe-mode runner — answers
     /// `capability_unavailable_in_build`, reported in `textHiddenFrameError`.
@@ -3083,7 +3119,8 @@ impl RequestHints for AssertRequest {
              `textHiddenFrame` ({pngBase64} or {sha256}: frame B, text hidden, a PNG of the \
              frame's size; bodies up to 32 MiB) with an optional `textHiddenIds`, or \
              `captureTextHidden: true` (the runner hides its own webview's text for frame B; \
-             only with a text_over_image_contrast assertion, which reads it)."
+             only with a text_over_image_contrast assertion, which reads it, and a \
+             `snapshot`)."
                 .to_string(),
         ])
     }
@@ -3460,6 +3497,7 @@ async fn vision_analyze_handler(
         req.target.as_deref(),
         // Only the `image` analyzer reads frame B (each image's `textContrast`).
         req.analyzer == qontinui_vision_core::Analyzer::Image,
+        req.snapshot.is_some(),
     )
     .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
     // Frame A, then frame B: the runner arm hides text only once frame A,
@@ -3572,6 +3610,7 @@ async fn vision_assert_handler(
                 qontinui_vision_core::Assertion::TextOverImageContrast { .. }
             )
         }),
+        req.snapshot.is_some(),
     )
     .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
     // Frame A, then frame B (see the analyze handler).
@@ -5475,11 +5514,27 @@ mod text_hidden_tests {
             sha256: None,
         };
         let ids = vec!["heading".to_string()];
-        assert!(check_text_hidden_request(None, None, false, None, false).is_ok());
+        assert!(check_text_hidden_request(None, None, false, None, false, true).is_ok());
+        assert!(check_text_hidden_request(
+            Some(&png),
+            Some(&ids),
+            false,
+            Some("phone"),
+            true,
+            true
+        )
+        .is_ok());
+        assert!(check_text_hidden_request(None, None, true, None, true, true).is_ok());
+        // Without a snapshot, frame B has no text to be read at: captureTextHidden
+        // is refused before anything is hidden. A supplied frame B alters nothing
+        // and is still accepted.
+        let err = check_text_hidden_request(None, None, true, None, true, false)
+            .expect_err("captureTextHidden without a snapshot");
         assert!(
-            check_text_hidden_request(Some(&png), Some(&ids), false, Some("phone"), true).is_ok()
+            err.contains("captureTextHidden needs a `snapshot`"),
+            "{err}"
         );
-        assert!(check_text_hidden_request(None, None, true, None, true).is_ok());
+        assert!(check_text_hidden_request(Some(&png), None, false, None, true, false).is_ok());
         let cases = [
             (Some(&png), None, true, None, true, "exclusive"),
             (None, None, true, Some("phone"), true, "OWN webview only"),
@@ -5517,8 +5572,8 @@ mod text_hidden_tests {
             ),
         ];
         for (supplied, ids, capture, target, reads, needle) in cases {
-            let err =
-                check_text_hidden_request(supplied, ids, capture, target, reads).expect_err(needle);
+            let err = check_text_hidden_request(supplied, ids, capture, target, reads, true)
+                .expect_err(needle);
             assert!(err.contains(needle), "{err} lacks {needle}");
         }
         for (b64, sha, needle) in [
@@ -5530,7 +5585,8 @@ mod text_hidden_tests {
                 png_base64: b64.map(str::to_string),
                 sha256: sha.map(str::to_string),
             };
-            let err = check_text_hidden_request(Some(&f), None, false, None, true).unwrap_err();
+            let err =
+                check_text_hidden_request(Some(&f), None, false, None, true, true).unwrap_err();
             assert!(err.contains(needle), "{err} lacks {needle}");
         }
         // Unknown keys are refused at the shape, not ignored.
