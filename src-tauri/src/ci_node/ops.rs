@@ -516,6 +516,12 @@ async fn run_script(
         Ok(Ok(status)) => (status.code(), false),
         Ok(Err(_)) => (None, false),
         Err(_) => {
+            // Kill the whole group while the leader is still unreaped (its pid
+            // cannot have been recycled yet), then reap it.
+            if let Some(pg) = pgid {
+                // SAFETY: kill(2) on the task's own, still-live process group.
+                unsafe { libc::kill(-pg, libc::SIGKILL) };
+            }
             let _ = child.start_kill();
             let _ = child.wait().await;
             (None, true)
@@ -528,12 +534,17 @@ async fn run_script(
     if let Some(dir) = &cg {
         cgroup::kill_all(dir);
     }
-    if let Some(pg) = pgid {
-        // SAFETY: kill(2) on the task's own process group (ESRCH if it is gone).
-        unsafe { libc::kill(-pg, libc::SIGKILL) };
-    }
-    for r in readers {
-        let _ = tokio::time::timeout(Duration::from_secs(5), r).await;
+    // (No group kill here: the leader is already reaped, so its pid may have
+    // been recycled. On Linux the cgroup kill above is what covers a daemon that
+    // outlived a normally-exiting script.)
+    for mut r in readers {
+        if tokio::time::timeout(Duration::from_secs(5), &mut r)
+            .await
+            .is_err()
+        {
+            // A daemon still holds the pipe: stop reading rather than leak the task.
+            r.abort();
+        }
     }
     #[cfg(target_os = "linux")]
     if let Some(dir) = &cg {
@@ -721,7 +732,7 @@ async fn execute(p: OpsTaskPayload) {
     let id = p.ops_task_id.clone();
     let permit = ONE_AT_A_TIME.acquire().await;
     WAITING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    let Ok(_permit) = permit else { return };
+    let Ok(permit_guard) = permit else { return };
     // The wait behind a running task can outlast the task's own expiry.
     if p.expires_at.as_deref().is_some_and(|e| {
         chrono::DateTime::parse_from_rfc3339(e)
@@ -794,6 +805,8 @@ async fn execute(p: OpsTaskPayload) {
         ),
         (c, false) => ("failed", format!("\n# exit {c:?}\n")),
     };
+    // The script is done: free the slot before the (possibly retrying) post.
+    drop(permit_guard);
     post_result(
         &id,
         state,
@@ -982,7 +995,7 @@ default = "install"
             "ok.sh",
             &env,
             Duration::from_secs(20),
-            "test-ok",
+            &format!("test-ok-{}", uuid::Uuid::now_v7()),
         )
         .await;
         assert_eq!(out.exit_code, Some(0));
@@ -1000,7 +1013,7 @@ default = "install"
             "slow.sh",
             &BTreeMap::new(),
             Duration::from_millis(500),
-            "test-slow",
+            &format!("test-slow-{}", uuid::Uuid::now_v7()),
         )
         .await;
         assert!(out.timed_out);
