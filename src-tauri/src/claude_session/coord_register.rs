@@ -1334,10 +1334,13 @@ impl AiCoordRegistrar {
     }
 
     /// R3 — emit a coord heartbeat for the AI session backing `task_run_id`,
-    /// driven by **operator interaction** (called from `send_user_message`).
-    /// This is the ONLY heartbeat these sessions ever get, so an idle session
-    /// ages to `stale` at coord's threshold. No-op (silently) if the session
-    /// was never registered or the gate is off.
+    /// driven by **operator interaction** (called from `send_user_message`)
+    /// and by **transcript activity** (`SessionTranscriptTailer::admit`, at
+    /// most once a minute per key, for a terminal-hosted pane that never
+    /// reaches `send_user_message`). These are the ONLY heartbeats these
+    /// sessions ever get, so an idle session ages to `stale` at coord's
+    /// threshold. No-op (silently) if the session was never registered or the
+    /// gate is off.
     pub fn heartbeat_on_interaction(&self, task_run_id: &str) {
         let Some(session_id) = self.session_id_for(task_run_id) else {
             return;
