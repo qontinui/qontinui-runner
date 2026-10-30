@@ -700,7 +700,9 @@ export function ZoneHoverActions({
                   role="menuitem"
                   onClick={fromOverflow(handleMaximize)}
                   className={OVERFLOW_ITEM_CLASS}
-                  title="Ctrl+Shift+F"
+                  title={
+                    isMaximized ? "Restore zone (Ctrl+Shift+F)" : "Maximize zone (Ctrl+Shift+F)"
+                  }
                 >
                   {isMaximized ? (
                     <Minimize2 className="w-3 h-3 shrink-0" aria-hidden />
@@ -718,7 +720,7 @@ export function ZoneHoverActions({
                 className={OVERFLOW_ITEM_CLASS}
                 title={
                   canRestart
-                    ? "Ctrl+Shift+R"
+                    ? "Restart session (Ctrl+Shift+R)"
                     : `Available only when the session is completed or errored (currently: ${state})`
                 }
               >
