@@ -9554,6 +9554,19 @@ fn agent_keep_decisions(
     )
 }
 
+/// `Some(resolved path)` when `<cwd>/.claude` or `<cwd>/.claude/agents` (each
+/// checked only if it exists) resolves OUTSIDE `cwd` — a symlink into another
+/// tree, where anything this pass writes would land untracked. `None` when both
+/// stay inside, or nothing can be resolved.
+fn agents_dir_escapes_cwd(cwd: &Path) -> Option<PathBuf> {
+    let real_cwd = cwd.canonicalize().ok()?;
+    let claude = cwd.join(".claude");
+    [claude.clone(), claude.join("agents")]
+        .into_iter()
+        .filter_map(|p| p.canonicalize().ok())
+        .find(|real| !real.starts_with(&real_cwd))
+}
+
 /// Write this binary's embedded subagent defs into `<worktree_cwd>/.claude/agents`
 /// (keeping what `keep` says to keep) and record the `fleet_agents` ledger row.
 /// Returns how many landed. Fail-soft: an errored write is recorded, never fatal.
@@ -9568,32 +9581,28 @@ fn provision_embedded_agent_floor(
 ) -> usize {
     let cwd = Path::new(worktree_cwd);
     let dst_dir = cwd.join(".claude").join("agents");
-    if let (Ok(real_cwd), Ok(real_claude)) =
-        (cwd.canonicalize(), cwd.join(".claude").canonicalize())
-    {
-        if !real_claude.starts_with(&real_cwd) {
-            warn!(
-                "agent_runtime: {} resolves outside {worktree_cwd} (to {}); not writing the \
-                 embedded agent floor through it",
-                cwd.join(".claude").display(),
+    if let Some(real_claude) = agents_dir_escapes_cwd(cwd) {
+        warn!(
+            "agent_runtime: {} resolves outside {worktree_cwd} (to {}); not writing the \
+             embedded agent floor through it",
+            dst_dir.display(),
+            real_claude.display()
+        );
+        let mut report = ProvisionReport::new(
+            "fleet_agents",
+            crate::fleet_agents::embedded_agent_count(),
+            capability_manifest::Rung::Unresolved,
+        )
+        .with_destination(dst_dir.display().to_string());
+        report.skip(
+            dst_dir.display().to_string(),
+            capability_manifest::SkipReason::Unresolved(format!(
+                ".claude/agents resolves outside the session cwd, to {}",
                 real_claude.display()
-            );
-            let mut report = ProvisionReport::new(
-                "fleet_agents",
-                crate::fleet_agents::embedded_agent_count(),
-                capability_manifest::Rung::Unresolved,
-            )
-            .with_destination(dst_dir.display().to_string());
-            report.skip(
-                dst_dir.display().to_string(),
-                capability_manifest::SkipReason::Unresolved(format!(
-                    ".claude resolves outside the session cwd, to {}",
-                    real_claude.display()
-                )),
-            );
-            capability_manifest::record_provision(worktree_cwd, report);
-            return 0;
-        }
+            )),
+        );
+        capability_manifest::record_provision(worktree_cwd, report);
+        return 0;
     }
     let report = match crate::fleet_agents::provision_fleet_agents_into(&dst_dir, keep) {
         Ok(report) => report,
@@ -9671,6 +9680,23 @@ fn provision_agent_definitions_from_root(
             )
             .with_destination(dst_dir.display().to_string()));
         }
+    }
+
+    // A `.claude` (or `.claude/agents`) that links OUT of the cwd, and is not
+    // the checkout itself (handled above): neither layer writes through it. The
+    // floor records its own refusal; the overlay is skipped here.
+    if let Some(real) = agents_dir_escapes_cwd(Path::new(worktree_cwd)) {
+        provision_embedded_agent_floor(worktree_cwd, &Default::default());
+        return Ok(ProvisionReport::unresolved(
+            "agent_definitions",
+            0,
+            dst_dir.display().to_string(),
+            format!(
+                "{} resolves outside the session cwd, to {}; nothing written through it",
+                dst_dir.display(),
+                real.display()
+            ),
+        ));
     }
 
     let keep = agent_keep_decisions(&dst_dir, Some(&src_dir));
@@ -18622,6 +18648,54 @@ mod continuation_agent_provisioning_tests {
         );
         assert_eq!(written, 0);
         assert!(!elsewhere.path().join("agents").exists());
+    }
+
+    /// SAFETY: with a workspace root, a cwd whose `.claude` links to a THIRD
+    /// tree (not the checkout) gets neither the floor nor the overlay written
+    /// through the link.
+    #[cfg(unix)]
+    #[test]
+    fn neither_layer_writes_through_a_claude_link_to_a_third_tree() {
+        let root = tempfile::tempdir().expect("root");
+        let src = root
+            .path()
+            .join("qontinui-claude-config")
+            .join(".claude")
+            .join("agents");
+        std::fs::create_dir_all(&src).expect("src");
+        std::fs::write(src.join("code-reviewer.md"), "checkout copy\n").expect("src def");
+        let third = tempfile::tempdir().expect("third");
+        let cwd = tempfile::tempdir().expect("cwd");
+        std::os::unix::fs::symlink(third.path(), cwd.path().join(".claude")).expect("symlink");
+        let report =
+            provision_agent_definitions_from_root(root.path(), &cwd.path().to_string_lossy())
+                .expect("report");
+        assert_eq!(report.written, 0);
+        assert!(
+            !third.path().join("agents").exists(),
+            "nothing lands in the third tree"
+        );
+    }
+
+    /// SAFETY: a real `.claude` whose `agents` entry links out of the cwd is
+    /// caught too, not only a linked `.claude`.
+    #[cfg(unix)]
+    #[test]
+    fn the_floor_is_not_written_through_an_agents_link_out_of_the_cwd() {
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let cwd = tempfile::tempdir().expect("cwd");
+        std::fs::create_dir_all(cwd.path().join(".claude")).expect(".claude");
+        std::os::unix::fs::symlink(elsewhere.path(), cwd.path().join(".claude").join("agents"))
+            .expect("symlink");
+        let written = provision_embedded_agent_floor(
+            &cwd.path().to_string_lossy(),
+            &crate::provision_guard::KeepDecisions::default(),
+        );
+        assert_eq!(written, 0);
+        assert_eq!(
+            std::fs::read_dir(elsewhere.path()).expect("read").count(),
+            0
+        );
     }
 
     /// Both gate-continuation spawn paths provision the subagent defs, so a
