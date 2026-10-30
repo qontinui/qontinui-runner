@@ -181,12 +181,11 @@ pub struct JourneyObserveAdmission {
     /// that route ([`crate::mcp::origin_guard::OriginGuard::would_admit`]):
     /// its classification of this request's `Origin`, its route tables and
     /// its current route policy, never a second copy of the trust list. A
-    /// relay the guard would only SHADOW-admit (logged and counted as a
-    /// would-be refusal under `enforce-doors` / `shadow`) reads `false`, so
-    /// an SDK that relays only on `true` adds nothing to the guard's
-    /// would-refuse readings. `null`: no origin guard admitted this
-    /// registration (a router built without one), so it is unknown — never
-    /// guessed; an SDK treats it as not admitted.
+    /// Foreign or Extension origin reads `false` under every route policy
+    /// ([`crate::mcp::origin_guard::LEDGER_WRITE_ROUTES`]), so an SDK that
+    /// relays only on `true` never relays from one. `null`: no origin guard
+    /// admitted this registration (a router built without one), so it is
+    /// unknown — never guessed; an SDK treats it as not admitted.
     pub admitted: Option<bool>,
 }
 

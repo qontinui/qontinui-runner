@@ -30,6 +30,12 @@
 //! `frontier_exhausted` is the only stop reason under which a later
 //! `not_reachable` could be claimed for the explored component.
 //!
+//! ## Trust
+//!
+//! The route reads no principal: it is on `origin_guard::CREDENTIAL_DOORS`, so
+//! only non-browser callers and the runner's own webview reach it. Every other
+//! browser origin, Trusted included, is refused 403 under every route policy.
+//!
 //! ## D4, restated (not `isNavigationElement`)
 //!
 //! A declared `write` / `destructive` effect is never activated; a declared
@@ -2716,6 +2722,8 @@ pub(crate) fn explore_app_id(app_id: &str) -> Result<String, Refusal> {
 
 /// `POST /apps/{app_id}/journey/explore`.
 ///
+/// - 403 (the origin guard, before this handler): any browser origin but the
+///   runner's own webview (a credential door);
 /// - 400: not JSON — a body serde cannot parse as JSON at all (a syntax
 ///   error or a truncated body), the same status axum's `Json` extractor
 ///   answers on the runner's other JSON routes and the observe route
