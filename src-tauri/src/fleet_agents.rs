@@ -318,6 +318,10 @@ mod tests {
             .map(str::trim)
             .filter(|l| l.starts_with("tools:"))
             .collect();
-        assert_eq!(tools, ["tools: Read"], "the expedite reviewer must be Read-only");
+        assert_eq!(
+            tools,
+            ["tools: Read"],
+            "the expedite reviewer must be Read-only"
+        );
     }
 }

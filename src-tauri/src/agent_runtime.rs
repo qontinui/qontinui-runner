@@ -18551,8 +18551,14 @@ mod continuation_agent_provisioning_tests {
         let cwd = root.path().to_string_lossy().into_owned();
         let report = provision_agent_definitions_from_root(root.path(), &cwd).expect("report");
         assert_eq!(report.written, 0);
-        assert_eq!(std::fs::read_to_string(&def).expect("read"), "operator's live definition\n");
-        assert!(!cfg.join("agents").join("expedite-reviewer.md").exists(), "no floor written into the checkout");
+        assert_eq!(
+            std::fs::read_to_string(&def).expect("read"),
+            "operator's live definition\n"
+        );
+        assert!(
+            !cfg.join("agents").join("expedite-reviewer.md").exists(),
+            "no floor written into the checkout"
+        );
     }
 
     /// Both gate-continuation spawn paths provision the subagent defs, so a
@@ -18560,8 +18566,13 @@ mod continuation_agent_provisioning_tests {
     #[test]
     fn both_continuation_paths_provision_agent_definitions() {
         let src = include_str!("agent_runtime.rs");
-        for fn_name in ["async fn run_continuation_terminal(", "async fn run_continuation_headless("] {
-            let start = src.find(fn_name).unwrap_or_else(|| panic!("{fn_name} moved"));
+        for fn_name in [
+            "async fn run_continuation_terminal(",
+            "async fn run_continuation_headless(",
+        ] {
+            let start = src
+                .find(fn_name)
+                .unwrap_or_else(|| panic!("{fn_name} moved"));
             let body_end = src
                 .get(start + fn_name.len()..)
                 // The fn's own closing brace: the first `}` at column 0.
