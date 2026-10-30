@@ -50,6 +50,7 @@ pub mod state_machine;
 pub mod stubs;
 pub mod tauri_audit;
 pub mod terminals;
+pub mod text_visibility;
 pub mod toasts;
 pub mod types;
 pub mod vision_ai;
@@ -376,6 +377,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(stubs::route_entries());
         all.extend_from_slice(tauri_audit::route_entries());
         all.extend_from_slice(terminals::route_entries());
+        all.extend_from_slice(text_visibility::route_entries());
         all.extend_from_slice(toasts::route_entries());
         all.extend_from_slice(vision_routes::route_entries());
         all
@@ -459,6 +461,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .merge(stubs::routes())
         .merge(tauri_audit::routes())
         .merge(terminals::routes())
+        .merge(text_visibility::routes())
         .merge(toasts::routes())
         .merge(vision_routes::routes())
         // Tier 2.1 — safelisted Tauri command proxy
@@ -488,6 +491,48 @@ mod manifest_drift_tests {
     use super::route_manifest;
     use std::collections::HashSet;
     use std::path::PathBuf;
+
+    /// Every family module that defines `routes()` is MOUNTED here, not only
+    /// listed. [`manifest_matches_route_calls`] scans `.route(...)` text across
+    /// every file, so a family whose routes were written and listed in
+    /// `route_manifest()` but never `.merge`d into [`routes`] passed it — and
+    /// the SDK parity test, which reads the manifest, passed too — while every
+    /// request 404'd. axum cannot list a router's routes, so this pins the
+    /// composition by source: each `<family>.rs` with `pub fn routes()` must
+    /// be `.merge(<family>::routes())`d AND contribute `<family>::route_entries()`.
+    #[test]
+    fn every_family_router_is_merged_and_listed() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/mcp/ui_bridge");
+        let mod_rs = std::fs::read_to_string(dir.join("mod.rs")).expect("read mod.rs");
+        let mut families = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("read_dir").flatten() {
+            let path = entry.path();
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if stem == "mod" || path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("read family");
+            if src.contains("\npub fn routes()") {
+                families.push(stem.to_string());
+            }
+        }
+        assert!(
+            families.len() > 20,
+            "found only {families:?}: the scan is broken"
+        );
+        let mut problems = Vec::new();
+        for f in &families {
+            if !mod_rs.contains(&format!(".merge({f}::routes())")) {
+                problems.push(format!("{f}::routes() is never merged into routes()"));
+            }
+            if !mod_rs.contains(&format!("extend_from_slice({f}::route_entries())")) {
+                problems.push(format!("{f}::route_entries() is not in route_manifest()"));
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
 
     /// Verify `route_manifest()` matches the actual `.route(...)` calls in
     /// this file. Catches the common drift bug where someone adds a new
@@ -993,6 +1038,15 @@ mod manifest_drift_tests {
             // Real subsystem (CLI subprocess orchestration), not a handler;
             // tracked separately.
             ("POST", "/ui-bridge/control/sdk/spawn-headless"),
+            // In-situ media override (SDK 835aa75, ui-bridge v0.35.0) — a dev
+            // control the pinned SDK declares and whose runner handlers are
+            // qontinui-runner#2311 (image plan Phase 18), not yet on main. The
+            // ui-bridge pin moved past 835aa75 to reach POST
+            // /control/text-visibility (ui-bridge#265). Delete these three
+            // lines when #2311 lands.
+            ("DELETE", "/ui-bridge/control/media/override"),
+            ("GET", "/ui-bridge/control/media/override"),
+            ("POST", "/ui-bridge/control/media/override"),
         ]
         .into_iter()
         .collect();
