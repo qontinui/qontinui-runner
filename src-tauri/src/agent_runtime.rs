@@ -4205,28 +4205,22 @@ async fn post_work_unreported_fallback(
     // as `spawned`, so a queued `spawned` stays ahead of it. Names the episode
     // the session was claimed under, when the poll told us.
     //
-    // PEEKED, not taken: the fallback can run twice for one gate (the exit
-    // hook and the reaper), and a take here made the second post omit
-    // `dispatched_at`. The second post now names the same episode, so the
-    // store dedupes it against the first. The entry is forgotten only once
-    // coord ANSWERED (Recorded / Superseded). On NoVerdict the queued row
-    // carries the episode in its own payload, so the entry is no longer
-    // needed for delivery; it is left for a repeat post to dedupe against and
-    // is bounded by the book's oldest-first eviction.
-    let episode = crate::session::continuation_outcome_outbox::peek_episode(gate_id);
+    // TAKEN, whatever coord answers: this runs at most once per registration.
+    // The exit hook and the reaper both remove the registration from `live`
+    // under the same lock before calling here, so only one of them can. On
+    // NoVerdict the queued row carries the episode in its own payload, so the
+    // entry has no further use either way.
+    let episode = crate::session::continuation_outcome_outbox::take_episode(gate_id);
     let ack = post_continuation_outcome(
         gate_id,
         device_id,
         ContinuationOutcome::WorkUnreported,
         Some(detail),
         None,
-        episode.clone(),
+        episode,
         true,
     )
     .await;
-    if let (Some(at), OutcomeAck::Recorded | OutcomeAck::Superseded(_)) = (&episode, &ack) {
-        crate::session::continuation_outcome_outbox::forget_episode(gate_id, at);
-    }
     match ack {
         OutcomeAck::Recorded => {
             info!(
@@ -6315,7 +6309,9 @@ async fn run_gate_continuation_inner(
         match settle_claim_decision(&decision, consume_target, gate_id) {
             ClaimOutcome::Spawn => {
                 // The PTY exit fallback knows only the gate id; let it name
-                // the same dispatch episode this run was claimed under.
+                // the same dispatch episode this run was claimed under. A
+                // poll that named none FORGETS an earlier claim's episode, so
+                // this run's fallback cannot post under a stale one.
                 crate::session::continuation_outcome_outbox::remember_episode(
                     gate_id,
                     payload.dispatched_at.as_deref(),
@@ -18697,6 +18693,28 @@ mod outcome_wiring_tests {
             true,
         )
         .await
+    }
+
+    /// The fallback forgets the gate's remembered episode whatever coord
+    /// answers — here no verdict at all (no coord configured) — so the book
+    /// does not keep an entry nothing will ever take.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_fallback_forgets_its_episode_even_on_no_verdict() {
+        let _amb = crate::test_env::isolated_ambient();
+        let gate = uuid::Uuid::new_v4();
+        crate::session::continuation_outcome_outbox::remember_episode(gate, Some(SERVED_AT));
+        post_work_unreported_fallback(
+            gate,
+            uuid::Uuid::from_u128(0xeb21_55ed),
+            "t-fallback",
+            "exit=unknown".into(),
+        )
+        .await;
+        assert_eq!(
+            crate::session::continuation_outcome_outbox::take_episode(gate),
+            None,
+            "a NoVerdict fallback leaves no episode behind"
+        );
     }
 
     /// A direct post whose connection drops leaves the written-ahead record

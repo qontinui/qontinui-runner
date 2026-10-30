@@ -182,14 +182,20 @@ pub fn bound_detail(detail: String) -> String {
 // Direct-attempt hold — the lane is the direct post's while it is in flight
 // ---------------------------------------------------------------------------
 
-/// Lanes whose head record is being posted DIRECTLY right now. The drain skips
-/// them ([`lane_held_by_direct_post`]), so a tick cannot re-post the same row
-/// during the 5 s direct attempt — which would double the load in a brownout
-/// and could put a later outcome for the gate on the wire ahead of it.
-fn direct_holds() -> MutexGuard<'static, std::collections::HashSet<Uuid>> {
-    static HOLDS: OnceLock<Mutex<std::collections::HashSet<Uuid>>> = OnceLock::new();
+/// Lanes whose head record is being posted DIRECTLY right now, with how many
+/// holds each has. The drain skips a lane with any ([`lane_held_by_direct_post`]),
+/// so a tick cannot re-post the same row during the 5 s direct attempt — which
+/// would double the load in a brownout and could put a later outcome for the
+/// gate on the wire ahead of it.
+///
+/// A COUNT, not a set: two direct attempts can hold one lane at once (a head
+/// buffered before install and a head written after it, or a head whose row
+/// was ACKed while another attempt was starting), and the first to finish must
+/// not release the other's hold.
+fn direct_holds() -> MutexGuard<'static, HashMap<Uuid, usize>> {
+    static HOLDS: OnceLock<Mutex<HashMap<Uuid, usize>>> = OnceLock::new();
     HOLDS
-        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|p| p.into_inner())
 }
@@ -199,7 +205,7 @@ fn direct_holds() -> MutexGuard<'static, std::collections::HashSet<Uuid>> {
 /// before its row is appended ([`Installer::write_ahead_held`]), so a row the
 /// snapshot holds is either still held or its direct attempt is over.
 pub fn lane_held_by_direct_post(lane: Uuid) -> bool {
-    direct_holds().contains(&lane)
+    direct_holds().get(&lane).is_some_and(|n| *n > 0)
 }
 
 /// RAII hold on one gate's lane for the duration of a direct post. Releases on
@@ -208,12 +214,12 @@ pub fn lane_held_by_direct_post(lane: Uuid) -> bool {
 pub struct DirectHold(Option<Uuid>);
 
 impl DirectHold {
-    fn take(lane: Uuid) -> Self {
-        direct_holds().insert(lane);
+    fn acquire(lane: Uuid) -> Self {
+        *direct_holds().entry(lane).or_insert(0) += 1;
         Self(Some(lane))
     }
 
-    fn none() -> Self {
+    fn unheld() -> Self {
         Self(None)
     }
 
@@ -226,7 +232,13 @@ impl DirectHold {
 impl Drop for DirectHold {
     fn drop(&mut self) {
         if let Some(lane) = self.0.take() {
-            direct_holds().remove(&lane);
+            let mut holds = direct_holds();
+            if let Some(n) = holds.get_mut(&lane) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    holds.remove(&lane);
+                }
+            }
         }
     }
 }
@@ -406,6 +418,12 @@ impl ContinuationOutcomeOutbox {
             }
         };
         let seen_dropped = outbox.dropped_unacked();
+        let seeded: usize = by_gate.values().map(Vec::len).sum();
+        if seeded > ceiling {
+            // Seeded PAST the ceiling (a restart mid-outage): the per-enqueue
+            // crossing below would never fire, so say it here.
+            log_over_ceiling(seeded, ceiling);
+        }
         Self {
             outbox,
             machine_id,
@@ -467,7 +485,7 @@ impl ContinuationOutcomeOutbox {
             // written again, not reported as a duplicate.
             self.reconcile_locked(&mut book, false);
             if listed(&book) {
-                return Ok((Enqueued::Duplicate { lane }, DirectHold::none()));
+                return Ok((Enqueued::Duplicate { lane }, DirectHold::unheld()));
             }
         }
         let behind = book
@@ -477,9 +495,9 @@ impl ContinuationOutcomeOutbox {
         let payload = serde_json::to_value(rec).map_err(std::io::Error::other)?;
         // Taken before the append; an append error drops (releases) it.
         let hold = if hold_for_direct && !behind {
-            DirectHold::take(lane)
+            DirectHold::acquire(lane)
         } else {
-            DirectHold::none()
+            DirectHold::unheld()
         };
         let row = self.outbox.record(
             self.machine_id,
@@ -493,16 +511,8 @@ impl ContinuationOutcomeOutbox {
             .push((key, row.seq));
         let pending: usize = book.by_gate.values().map(Vec::len).sum();
         if pending > self.ceiling && pending - 1 <= self.ceiling {
-            // Crossing the ceiling, said once per crossing. Nothing is dropped:
-            // these rows are trim-exempt because each may be the only record
-            // of a consume. The count is what is wrong, and someone has to look.
-            tracing::error!(
-                "continuation-outcome: {pending} outcome rows are pending in the session \
-                 outbox, past the ceiling of {} — every one is KEPT (they are exempt from the \
-                 cap trim), but this many unanswered consumes means coord has not taken them \
-                 for a long time: check coord reachability and the device credential",
-                self.ceiling,
-            );
+            // Crossing the ceiling, said once per crossing.
+            log_over_ceiling(pending, self.ceiling);
         }
         Ok((
             Enqueued::Queued {
@@ -520,9 +530,21 @@ impl ContinuationOutcomeOutbox {
     }
 
     /// Whether the pending outcome rows are past [`EXEMPT_PENDING_CEILING`]
-    /// (the health half of the ceiling's ERROR).
+    /// (`GET /health` `sessionOutbox.continuationOutcomes.overCeiling`, the
+    /// health half of the ceiling's ERROR).
     pub fn over_ceiling(&self) -> bool {
         self.pending_rows() > self.ceiling
+    }
+
+    /// The `/health` view of this store: pending rows, the ceiling, and
+    /// whether the rows are past it.
+    pub fn health_json(&self) -> JsonValue {
+        let pending = self.pending_rows();
+        json!({
+            "pending": pending,
+            "ceiling": self.ceiling,
+            "overCeiling": pending > self.ceiling,
+        })
     }
 
     /// ACK the pending row for `rec` — a direct post reached a terminal
@@ -631,6 +653,25 @@ fn scan_pending(outbox: &OutboxWriter) -> std::io::Result<HashMap<Uuid, Vec<(Pen
     Ok(by_gate)
 }
 
+/// The ceiling's ERROR. Nothing is dropped: these rows are trim-exempt because
+/// each may be the only record of a consume. The count is what is wrong, and
+/// someone has to look.
+fn log_over_ceiling(pending: usize, ceiling: usize) {
+    tracing::error!(
+        "continuation-outcome: {pending} outcome rows are pending in the session outbox, past \
+         the ceiling of {ceiling} — every one is KEPT (they are exempt from the cap trim), but \
+         this many unanswered consumes means coord has not taken them for a long time: check \
+         coord reachability and the device credential"
+    );
+}
+
+/// `GET /health` `sessionOutbox.continuationOutcomes`: the installed store's
+/// [`ContinuationOutcomeOutbox::health_json`], or `null` before `main.rs`
+/// installs it — UNKNOWN, never zero.
+pub fn health_json(store: Option<&ContinuationOutcomeOutbox>) -> JsonValue {
+    store.map_or(JsonValue::Null, ContinuationOutcomeOutbox::health_json)
+}
+
 /// Most records held before the outbox exists. Far above any real boot-window
 /// count (one per continuation outcome posted in the first seconds); when it
 /// is exceeded the OLDEST is dropped with an ERROR naming it.
@@ -711,7 +752,7 @@ impl Installer {
         durable: bool,
     ) -> (WriteAhead, DirectHold) {
         if !durable {
-            return (WriteAhead::NotDurable, DirectHold::none());
+            return (WriteAhead::NotDurable, DirectHold::unheld());
         }
         let mut buf = self.lock_buffer();
         if let Some(store) = self.store.get().cloned() {
@@ -726,9 +767,11 @@ impl Installer {
                         rec.outcome,
                         rec.device_id,
                     );
-                    (WriteAhead::Behind, DirectHold::none())
+                    (WriteAhead::Behind, DirectHold::unheld())
                 }
-                Ok((Enqueued::Duplicate { .. }, _)) => (WriteAhead::Duplicate, DirectHold::none()),
+                Ok((Enqueued::Duplicate { .. }, _)) => {
+                    (WriteAhead::Duplicate, DirectHold::unheld())
+                }
                 Err(e) => {
                     tracing::error!(
                         "continuation-outcome gate_id={} outcome={} could not be written to the \
@@ -736,12 +779,12 @@ impl Installer {
                         rec.gate_id,
                         rec.outcome,
                     );
-                    (WriteAhead::WriteFailed(e.to_string()), DirectHold::none())
+                    (WriteAhead::WriteFailed(e.to_string()), DirectHold::unheld())
                 }
             };
         }
         if buf.iter().any(|r| r.same_pending_record(rec)) {
-            return (WriteAhead::Duplicate, DirectHold::none());
+            return (WriteAhead::Duplicate, DirectHold::unheld());
         }
         let behind = buf.iter().any(|r| r.gate_id == rec.gate_id);
         if buf.len() >= PRE_INSTALL_CAP {
@@ -759,9 +802,9 @@ impl Installer {
         // Held from here: `install` may flush this record into the outbox
         // while its direct attempt is still in flight.
         let hold = if behind {
-            DirectHold::none()
+            DirectHold::unheld()
         } else {
-            DirectHold::take(lane(rec.gate_id))
+            DirectHold::acquire(lane(rec.gate_id))
         };
         buf.push_back(rec.clone());
         tracing::warn!(
@@ -966,22 +1009,6 @@ impl EpisodeBook {
     fn take(&mut self, gate_id: Uuid) -> Option<String> {
         self.entries.remove(&gate_id).map(|(_, at)| at)
     }
-
-    fn peek(&self, gate_id: Uuid) -> Option<String> {
-        self.entries.get(&gate_id).map(|(_, at)| at.clone())
-    }
-
-    /// Forget `gate_id`'s entry only if it still names `at` — a re-clearance
-    /// may have remembered a NEWER episode for the gate meanwhile.
-    fn forget_if(&mut self, gate_id: Uuid, at: &str) {
-        if self
-            .entries
-            .get(&gate_id)
-            .is_some_and(|(_, held)| held == at)
-        {
-            self.entries.remove(&gate_id);
-        }
-    }
 }
 
 fn episode_book() -> MutexGuard<'static, EpisodeBook> {
@@ -993,9 +1020,17 @@ fn episode_book() -> MutexGuard<'static, EpisodeBook> {
 
 /// Remember the `dispatched_at` gate `gate_id` was claimed under, so the PTY
 /// exit fallback (which knows only the gate id) can name the same episode.
+///
+/// `None` (a claim whose poll named no episode) FORGETS any entry an earlier
+/// claim of the gate left, so this run's fallback cannot name that stale
+/// episode as its own.
 pub fn remember_episode(gate_id: Uuid, dispatched_at: Option<&str>) {
-    if let Some(at) = dispatched_at {
-        episode_book().remember(gate_id, at, EPISODE_BOOK_CAP);
+    let mut book = episode_book();
+    match dispatched_at {
+        Some(at) => book.remember(gate_id, at, EPISODE_BOOK_CAP),
+        None => {
+            book.take(gate_id);
+        }
     }
 }
 
@@ -1003,19 +1038,6 @@ pub fn remember_episode(gate_id: Uuid, dispatched_at: Option<&str>) {
 /// a path that will never post `work_unreported` forgets it.
 pub fn take_episode(gate_id: Uuid) -> Option<String> {
     episode_book().take(gate_id)
-}
-
-/// Read the remembered episode for `gate_id` without forgetting it — for the
-/// `work_unreported` fallback, which may run twice (the exit hook and the
-/// reaper): the second post must name the same episode, not omit it.
-pub fn peek_episode(gate_id: Uuid) -> Option<String> {
-    episode_book().peek(gate_id)
-}
-
-/// Forget `gate_id`'s episode once its fallback outcome is answered, unless a
-/// newer episode has replaced it.
-pub fn forget_episode(gate_id: Uuid, at: &str) {
-    episode_book().forget_if(gate_id, at);
 }
 
 // ---------------------------------------------------------------------------
@@ -2052,23 +2074,17 @@ mod tests {
         assert_eq!(book.take(gates[2]).as_deref(), Some("again"));
     }
 
-    /// The fallback's episode is peeked (a repeat post names it too) and
-    /// forgotten only when it still names the same episode.
+    /// A later claim of the same gate whose poll named NO episode forgets the
+    /// earlier claim's, so its fallback cannot post under a stale episode.
     #[test]
-    fn a_peeked_episode_survives_and_is_forgotten_only_if_unchanged() {
+    fn a_claim_with_no_episode_forgets_the_previous_claims() {
         let g = Uuid::new_v4();
         remember_episode(g, Some("e1"));
-        assert_eq!(peek_episode(g).as_deref(), Some("e1"));
-        assert_eq!(peek_episode(g).as_deref(), Some("e1"), "a peek keeps it");
+        remember_episode(g, None);
+        assert_eq!(take_episode(g), None, "the stale e1 is gone");
+        remember_episode(g, Some("e1"));
         remember_episode(g, Some("e2"));
-        forget_episode(g, "e1");
-        assert_eq!(
-            peek_episode(g).as_deref(),
-            Some("e2"),
-            "a newer episode stays"
-        );
-        forget_episode(g, "e2");
-        assert_eq!(peek_episode(g), None);
+        assert_eq!(take_episode(g).as_deref(), Some("e2"), "the newer one wins");
     }
 
     /// Past the pending ceiling every row is KEPT and the store reports it;
@@ -2089,6 +2105,23 @@ mod tests {
         assert_eq!(s.pending_rows(), 5);
         assert_eq!(outbox.pending().unwrap().len(), 5, "nothing dropped");
         assert_eq!(EXEMPT_PENDING_CEILING, 10_000);
+        assert_eq!(
+            health_json(Some(&s)),
+            json!({"pending": 5, "ceiling": 2, "overCeiling": true}),
+        );
+        assert_eq!(health_json(None), JsonValue::Null, "uninstalled is UNKNOWN");
+
+        // A store seeded past the ceiling (a restart mid-outage) reports it
+        // from the first read, with no enqueue needed to cross it.
+        let (reseeded, logs) = crate::resource_guard::capture_logs(|| {
+            ContinuationOutcomeOutbox::with_ceiling(outbox, Uuid::new_v4(), 2)
+        });
+        assert_eq!(reseeded.pending_rows(), 5);
+        assert!(reseeded.over_ceiling());
+        assert!(
+            logs.contains("past the ceiling of 2"),
+            "a store seeded past the ceiling says so at once: {logs}"
+        );
     }
 
     /// A detail is capped at 300 characters (plus the ellipsis); a short one
@@ -2133,6 +2166,23 @@ mod tests {
         );
         drop(hold3);
         assert!(!lane_held_by_direct_post(lane(g2)));
+    }
+
+    /// Two holds on one lane are counted: dropping one leaves the lane held
+    /// for the other, and only the last drop releases it.
+    #[test]
+    fn a_lane_stays_held_until_its_last_hold_drops() {
+        let l = lane(Uuid::new_v4());
+        let first = DirectHold::acquire(l);
+        let second = DirectHold::acquire(l);
+        drop(first);
+        assert!(
+            lane_held_by_direct_post(l),
+            "one hold dropped, the other still holds the lane"
+        );
+        drop(second);
+        assert!(!lane_held_by_direct_post(l), "the last drop releases it");
+        assert!(!direct_holds().contains_key(&l), "a zero count is removed");
     }
 
     /// The pre-install buffer dedupes by the store's rule — one gate, one

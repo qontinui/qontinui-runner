@@ -865,7 +865,19 @@ pub(crate) fn session_outbox_health_json() -> JsonValue {
         .lock()
         .map(|h| h.clone())
         .unwrap_or_default();
-    render_session_outbox_health(&snapshot)
+    let mut block = render_session_outbox_health(&snapshot);
+    // The gate-continuation outcome rows' own count and ceiling, read live
+    // from the store: they are exempt from the cap trim, so nothing else
+    // bounds them (plan
+    // 2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume).
+    if let Some(obj) = block.as_object_mut() {
+        let store = super::continuation_outcome_outbox::global();
+        obj.insert(
+            "continuationOutcomes".into(),
+            super::continuation_outcome_outbox::health_json(store.as_deref()),
+        );
+    }
+    block
 }
 
 /// Render one `sessionOutbox` block from an explicit snapshot (so a test can
