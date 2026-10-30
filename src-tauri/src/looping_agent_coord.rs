@@ -10,7 +10,8 @@
 //!    poll-into-process-global-cache shape (45s; NOT ETag — coord serves no
 //!    validators on this route).
 //! 2. **Slot leases** — `POST /claims/{acquire,heartbeat,release}`, the
-//!    claim-first primitive (D3).
+//!    claim-first primitive (D3), plus the informational
+//!    `GET /coord/claims/by-resource` holder lookup.
 //! 3. **Playbook** — `GET /coord/agent-playbook/:name`, so coord's versioned
 //!    document is the shepherd's source of truth and the runner-bundled copy is
 //!    only the offline fallback.
@@ -32,9 +33,10 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 use qontinui_runner_lib::looping_agent::desired_state::CoordDesiredState;
+use qontinui_runner_lib::looping_agent::holder::{by_resource_url, parse_by_resource_body};
 use qontinui_runner_lib::looping_agent::lease::{
-    parse_acquire_body, parse_heartbeat_body, AcquireOutcome, HeartbeatOutcome, LEASE_CLAIM_KIND,
-    LEASE_TTL_SECS,
+    parse_acquire_body, parse_heartbeat_body, AcquireOutcome, HeartbeatOutcome, SlotHolder,
+    LEASE_CLAIM_KIND, LEASE_TTL_SECS,
 };
 
 /// How often the desired state is refreshed. 45s matches
@@ -309,6 +311,37 @@ pub async fn release_slot(resource_key: &str, machine_id: &uuid::Uuid, agent_id:
         ),
         Err(e) => warn!("looping_agent_coord: release {resource_key} failed (best-effort): {e}"),
     }
+}
+
+/// `GET /coord/claims/by-resource?kind=semantic_resource&key=<resource_key>` —
+/// who holds this slot, when the acquire reply did not say.
+///
+/// INFORMATIONAL ONLY. The answer names a holder for a log line and the status
+/// surface; it is never permission and never consulted by the spawn gate. The
+/// caller bounds it to one read per lease TTL per key
+/// (`looping_agent::holder::holder_lookup_due`). `Ok(None)` = nothing holds the
+/// key now; `Err` = we could not tell (transport, non-2xx, unparseable body).
+pub async fn lookup_slot_holder(resource_key: &str) -> Result<Option<SlotHolder>, String> {
+    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
+    let client = http_client()?;
+    let url = by_resource_url(&base);
+
+    // coord-tenant-scope(device): read-only lookup of the same per-machine slot lease; only base and resource_key are in scope, and coord lifts the tenant from the device JWT so a device reads only its own tenant's claims.
+    let resp = crate::auth::attach_device_auth(
+        client
+            .get(&url)
+            .query(&[("kind", LEASE_CLAIM_KIND), ("key", resource_key)]),
+    )
+    .send()
+    .await
+    .map_err(|e| format!("GET {url}: {e}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("coord status {}", status.as_u16()));
+    }
+    let v: serde_json::Value = resp.json().await.map_err(|e| format!("decode: {e}"))?;
+    parse_by_resource_body(&v)
 }
 
 // ===========================================================================
