@@ -1898,8 +1898,8 @@ fn build_device_capabilities(
 /// actually be delivered:
 /// * the `expedite-review` skill is in the corpus this runner serves
 ///   ([`crate::fleet_skills::skill_is_served`]) and can run here
-///   (`expedite_review_runnable`: its reviewer agent is bundled, and `python3`,
-///   `gh` and `curl` resolve); and
+///   (`expedite_review_runnable`: its reviewer agent is bundled, and `bash`,
+///   `python3`, `gh` and `curl` resolve); and
 /// * the runner holds a LIVE device JWT for the heartbeat's own bearer scope,
 ///   because the skill posts its verdict to a device-JWT coord route.
 ///
@@ -1917,7 +1917,10 @@ pub const EXPEDITE_REVIEWER_AGENT: &str = "expedite-reviewer";
 /// Whether this device can actually RUN the expedite-review skill, beyond it
 /// being served: its reviewer agent is bundled, and the tools its scripts call
 /// (`bash`, `python3`, `gh`, `curl`) resolve on PATH. A Windows device with only
-/// `python` (no `python3`) is under-advertised, deliberately. A device lacking any of them would
+/// `python` (no `python3`) is under-advertised, deliberately. Known residual: on
+/// Windows `bash` may resolve to the WSL launcher, whose distro can lack `gh`
+/// credentials — that over-advertises; the review then posts nothing and coord
+/// counts the item `unreviewed`. A device lacking any of them would
 /// claim review gates and post nothing; not advertising under-states, which
 /// coord counts `unreviewed`, never over-states.
 fn expedite_review_runnable() -> bool {

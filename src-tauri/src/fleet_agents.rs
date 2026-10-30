@@ -17,8 +17,9 @@
 //! > `qontinui-claude-config` checkout still get them; this copy-from-checkout
 //! > path unblocks the current operator fleet.*
 //!
-//! Without a checkout the copy is a no-op that `warn!`s and returns `Ok`, so a
-//! spawned agent silently has no subagents: `claude` cannot resolve the named
+//! Before the embedded floor below, a spawn without a checkout got no subagents
+//! at all (the floor is now written on that arm too), so a spawned agent
+//! silently had none: `claude` cannot resolve the named
 //! subagent, the review never runs, and coord eventually ages the PR out as
 //! `specialist_timeout`. That is a failure with no error at the point of cause.
 //!
