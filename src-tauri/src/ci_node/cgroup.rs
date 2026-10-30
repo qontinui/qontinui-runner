@@ -447,11 +447,6 @@ impl Containment {
 mod tests {
     use super::*;
 
-    /// Serializes the tests that read or set `QONTINUI_CI_CGROUP_ROOT`: the
-    /// real-kernel test must never observe a fixture override (it would then
-    /// run its memory hog uncontained).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// A fixture parent that behaves like a delegated cgroup for the file
     /// reads/writes `create_in` does (plain files stand in for cgroupfs).
     fn fixture_parent(controllers: &str, subtree: &str) -> tempfile::TempDir {
@@ -618,10 +613,10 @@ mod tests {
 
     #[test]
     fn the_env_override_is_honoured_and_describe_names_the_state() {
-        // Fixture root via the override. Serialized against the other
-        // cgroup test that reads the variable; the executor tests never
-        // dispatch for real, so they do not read it.
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Fixture root via the override. The shared env lock excludes every
+        // other env-touching test, including the real-kernel cgroup test that
+        // reads the variable.
+        let _g = crate::test_env::env_lock();
         struct Restore;
         impl Drop for Restore {
             fn drop(&mut self) {
@@ -655,7 +650,7 @@ mod tests {
         let limit: u64 = 64 * 1024 * 1024;
         // The lock covers only the env read inside discovery (never an await).
         let cg = {
-            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _g = crate::test_env::env_lock();
             match CgroupDispatch::discover_and_create(
                 &format!("memtest-{}", std::process::id()),
                 limit,
