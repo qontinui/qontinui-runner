@@ -596,3 +596,39 @@ note = "A caveat string attached to the Canonical rung explaining it is the runn
 reviewed = [
     "qontinui-claude-config origin/main), not an account-layer arm\",",
 ]
+
+# Plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap
+# Phase 5: the PowerShell/WMI process-table reads became the FALLBACK behind the
+# in-process provider (src/process_capture/process_table.rs), whose platform
+# halves give every caller a non-Windows path. The fallback bodies themselves
+# are PowerShell by definition and only ever reached on Windows.
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/process_capture/process_tree.rs"
+symbol = "powershell_snapshot"
+disposition = "fallback_correct"
+note = "The Windows-only PowerShell/WMI snapshot, reached only through process_table's circuit when the in-process sysinfo walk fails. Unix reads /proc in-process and has no external snapshot fallback."
+reviewed = [
+    "cfg(windows)-only fn `powershell_snapshot` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/process_capture/process_tree.rs"
+symbol = "command_lines_for_pids_powershell"
+disposition = "fallback_correct"
+note = "The Windows-only WMI command-line query, reached only through process_table's circuit when the in-process sysinfo cmd() read fails. Unix reads /proc/<pid>/cmdline in-process."
+reviewed = [
+    "cfg(windows)-only fn `command_lines_for_pids_powershell` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/process_capture/process_tree.rs"
+symbol = "port_owner_pid_powershell"
+disposition = "fallback_correct"
+note = "The Windows-only Get-NetTCPConnection query, reached only through process_table's circuit when the in-process GetExtendedTcpTable listener read fails. Unix keeps its own lsof port_owner_pid."
+reviewed = [
+    "cfg(windows)-only fn `port_owner_pid_powershell` has no cfg(not(windows)) sibling in this file",
+]

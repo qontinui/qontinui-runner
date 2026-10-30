@@ -4749,11 +4749,24 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // stays the only per-record syscall. The claude-present
                         // signal needs image names and the PID-reuse guard needs
                         // creation times — both carried on the snapshot.
-                        let snap_captured_at_ms = chrono::Utc::now().timestamp_millis();
+                        let asked_at_ms = chrono::Utc::now().timestamp_millis();
                         let snap = crate::process_capture::process_tree::snapshot_process_table_public().await;
+                        // The table may be up to the provider's memo TTL older
+                        // than this call, so stamp the epoch with when ITS read
+                        // began — a lower bound on every row's observation —
+                        // not with the time it was asked for. A table no read
+                        // produced (observed_at_ms 0) is UNKNOWN and records
+                        // nothing (`tick_snapshot_ok` below).
+                        let snap_captured_at_ms = if snap.observed_at_ms > 0 {
+                            snap.observed_at_ms.min(asked_at_ms)
+                        } else {
+                            asked_at_ms
+                        };
                         // A totally-empty system parent_map means the snapshot
-                        // helper failed → classify Skips every matched record.
-                        let tick_snapshot_ok = !snap.parent_map.is_empty();
+                        // helper failed, and a `stale` one is the last good
+                        // table, not this tick's → classify Skips every
+                        // matched record.
+                        let tick_snapshot_ok = !snap.is_unknown();
 
                         // D1 identity refresh. Claude Code's per-process
                         // registry is the ONLY source for the account + name an

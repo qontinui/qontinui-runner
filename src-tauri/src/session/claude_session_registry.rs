@@ -226,6 +226,13 @@ pub fn live_pids_from_snapshot(
                 .to_string(),
         );
     }
+    if snapshot.stale {
+        return Err(
+            "process-table snapshot is stale (the last good table, served after a failed read) \
+             — session liveness is indeterminate"
+                .to_string(),
+        );
+    }
     Ok(snapshot.names.keys().copied().collect())
 }
 
@@ -575,6 +582,10 @@ mod tests {
 
         let mut ok = ProcessSnapshot::default();
         ok.names.insert(1234, "claude.exe".to_string());
+        // Built from `Default`, it is still stale: a full but stale table is
+        // the last good one, not a live read.
+        assert!(live_pids_from_snapshot(&ok).is_err());
+        ok.stale = false;
         let pids = live_pids_from_snapshot(&ok).unwrap();
         assert!(pids.contains(&1234));
         assert_eq!(pids.len(), 1);

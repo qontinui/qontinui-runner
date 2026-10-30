@@ -79,9 +79,11 @@ pub const CLEAR_INPUT_LINE: &[u8] = b"\x15";
 /// How long to wait for `claude` to leave before reporting `ExitStuck`.
 pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
 
-/// Spacing between process-table probes while waiting. One probe snapshots the
-/// whole table: cheap `/proc` reads on Unix, but a PowerShell/CIM subprocess on
-/// Windows, so Windows probes at most once a second.
+/// Spacing between process-table probes while waiting. Each probe is a fresh
+/// in-process walk of the whole table (`process_table::snapshot_fresh` — never
+/// the memo, so two consecutive "gone" probes are two observations); on
+/// Windows that walk opens every process, so Windows probes at most once a
+/// second.
 #[cfg(windows)]
 pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Spacing between process-table probes while waiting (see the Windows twin).
@@ -367,6 +369,12 @@ pub fn probe_from_snapshot(
             "the process table is unreadable (empty parent map)".to_string(),
         );
     }
+    if snapshot.stale {
+        return ClaudeProbe::Unreadable(
+            "the process table is stale (the last good table, served after a failed read)"
+                .to_string(),
+        );
+    }
     let pids = claude_pids_in_inclusive_subtree(root_pid, snapshot);
     let subtree_claude: Vec<ProcIdentity> = pids
         .iter()
@@ -402,7 +410,8 @@ pub async fn probe_claude_under(root_pid: Option<u32>, tracked: Vec<ProcIdentity
                 .to_string(),
         );
     };
-    let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
+    // Never the memo: two consecutive "gone" probes must be two observations.
+    let snapshot = crate::process_capture::process_tree::snapshot_process_table_fresh().await;
     probe_from_snapshot(root, &snapshot, &tracked)
 }
 
@@ -904,6 +913,7 @@ mod tests {
     /// root 100 (shell) -> 200 (claude) ; unrelated 300 ; optional extras.
     fn snapshot(entries: &[(u32, u32, &str, i64)]) -> ProcessSnapshot {
         let mut snap = ProcessSnapshot::default();
+        snap.stale = false; // a live read
         for &(pid, ppid, name, started) in entries {
             snap.parent_map.entry(ppid).or_default().push(pid);
             snap.creation_times.insert(pid, started);
@@ -928,6 +938,18 @@ mod tests {
     fn an_empty_process_table_is_unreadable() {
         assert!(matches!(
             probe_from_snapshot(100, &ProcessSnapshot::default(), &[id(200, 5)]),
+            ClaudeProbe::Unreadable(_)
+        ));
+    }
+
+    /// A stale table (the last good one, after a failed read) is not evidence
+    /// that `claude` is gone: closing the tab on it could end a live session.
+    #[test]
+    fn a_stale_process_table_is_unreadable() {
+        let mut stale = snapshot(&[(100, 1, "bash", 10)]);
+        stale.stale = true;
+        assert!(matches!(
+            probe_from_snapshot(100, &stale, &[id(200, 20)]),
             ClaudeProbe::Unreadable(_)
         ));
     }

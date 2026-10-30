@@ -2715,6 +2715,13 @@ async fn health(
         // R9-unkeyed from exactly these counters, so they are served here
         // rather than only to the test harness. The tuples carry no origin.
         "uiBridgeBinding": state.relay_binding.health_json(),
+        // The shared in-process process table (plan 2026-10-28-runner-spawn-
+        // bursts-overwhelm-the-box-beyond-the-continuation-cap, Phase 5):
+        // snapshot reads, how many the memo or a walk in flight answered,
+        // external-probe fallback attempts (expected 0 — on Windows each one
+        // is a PowerShell process creation), and when an open fallback
+        // circuit closes.
+        "processTable": crate::process_capture::process_table::health_json(),
         "storage": {
             "apiPort": api_port,
             "namespaceSuffix": storage_namespace_suffix,

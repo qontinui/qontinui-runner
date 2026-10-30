@@ -4682,8 +4682,9 @@ fn classify_agent_binding_liveness(
     // An empty parent map means "could not read the process table", not "no
     // processes" — the same posture as the tracking-health tick and
     // `live_pids_from_snapshot`, both of which refuse to answer rather than
-    // answer zero.
-    if snapshot.parent_map.is_empty() {
+    // answer zero. A `stale` table (the last good one) is not a live read
+    // either.
+    if snapshot.is_unknown() {
         return AgentLivenessTally::all_unknown(n, "process_table_unavailable");
     }
     // The rows must account for the count the line declared. A partially
@@ -22415,6 +22416,7 @@ mod agent_binding_census_tests {
         created: &[(u32, i64)],
     ) -> crate::process_capture::process_tree::ProcessSnapshot {
         let mut snap = crate::process_capture::process_tree::ProcessSnapshot::default();
+        snap.stale = false; // a live read
         for (parent, child) in edges {
             snap.parent_map.entry(*parent).or_default().push(*child);
         }

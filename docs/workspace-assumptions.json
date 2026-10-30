@@ -734,6 +734,15 @@
     {
       "class": "os_bound_tooling",
       "file": "src/process_capture/process_tree.rs",
+      "symbol": "command_lines_for_pids_powershell",
+      "excerpt": "cfg(windows)-only fn `command_lines_for_pids_powershell` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "The Windows-only WMI command-line query, reached only through process_table's circuit when the in-process sysinfo cmd() read fails. Unix reads /proc/<pid>/cmdline in-process."
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/process_capture/process_tree.rs",
       "symbol": "parse_command_lines_json",
       "excerpt": "cfg(windows)-only fn `parse_command_lines_json` has no cfg(not(windows)) sibling in this file",
       "count": 1,
@@ -754,6 +763,24 @@
       "excerpt": "cfg(windows)-only fn `parse_wmi_creation_date` has no cfg(not(windows)) sibling in this file",
       "count": 1,
       "disposition": "unreviewed"
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/process_capture/process_tree.rs",
+      "symbol": "port_owner_pid_powershell",
+      "excerpt": "cfg(windows)-only fn `port_owner_pid_powershell` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "The Windows-only Get-NetTCPConnection query, reached only through process_table's circuit when the in-process GetExtendedTcpTable listener read fails. Unix keeps its own lsof port_owner_pid."
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/process_capture/process_tree.rs",
+      "symbol": "powershell_snapshot",
+      "excerpt": "cfg(windows)-only fn `powershell_snapshot` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "The Windows-only PowerShell/WMI snapshot, reached only through process_table's circuit when the in-process sysinfo walk fails. Unix reads /proc in-process and has no external snapshot fallback."
     },
     {
       "class": "os_bound_tooling",

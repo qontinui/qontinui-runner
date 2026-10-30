@@ -9,12 +9,13 @@
 //! process is doing its job. Phase 1 populates `ProcessRuntime.descendant_pids`
 //! / `service_pid`; Phase 2 reads `service_pid` to detect inner-worker death.
 //!
-//! Windows uses `Get-CimInstance Win32_Process` via PowerShell to snapshot
-//! `(ProcessId, ParentProcessId, CreationDate, Name)` for every running
-//! process, then BFS in Rust. Unix reads `/proc/<pid>/stat` for the parent and
-//! start time and `/proc/<pid>/comm` for the image name. The `Name`/`comm`
-//! image powers [`claude_present_in_inclusive_subtree`], the session-liveness
-//! signal.
+//! The table itself comes from [`super::process_table`], the runner's one
+//! shared, in-process provider: `sysinfo` on Windows (with
+//! `Get-CimInstance Win32_Process` via PowerShell kept only as its
+//! circuit-protected fallback), and on Unix `/proc/<pid>/stat` for the parent
+//! and start time and `/proc/<pid>/comm` for the image name. BFS runs in Rust.
+//! The image name powers [`claude_present_in_inclusive_subtree`], the
+//! session-liveness signal.
 
 use std::collections::HashMap;
 
@@ -30,6 +31,35 @@ pub struct PidWithSpawnedAt {
     /// Process creation time as Unix epoch seconds. `0` if the platform
     /// helper failed to resolve it (e.g. permission-denied on `/proc/<pid>/stat`).
     pub spawned_at_unix: i64,
+    /// The exact creation time (Windows FILETIME, 100 ns) when the table that
+    /// produced this record carried one ([`ProcessSnapshot::creation_filetimes`]).
+    /// A kill compares it EXACTLY against the live process's own; a record
+    /// without it (the WMI fallback, a non-Windows walk, or a file persisted
+    /// before this field) falls back to the second-granular window
+    /// (`health::is_same_process`). `serde(default)`: older persisted state
+    /// loads as `None`.
+    ///
+    /// Only an EXACT source may fill this: the in-process walk's
+    /// `GetProcessTimes` value. Open PR #2417 also fills `creation_filetimes`
+    /// from the CIM fallback, whose values are microsecond-truncated and can be
+    /// an hour off in the DST fall-back hour; the exact compare would refuse
+    /// every such record — fail safe, but the reap would silently stop. A
+    /// fallback-sourced time belongs in `spawned_at_unix` (the window), not here.
+    #[serde(default)]
+    pub spawned_at_ft: Option<u64>,
+}
+
+impl PidWithSpawnedAt {
+    /// `pid`'s record as `snapshot` saw it: its creation time in Unix seconds
+    /// (`0` when absent or unreadable) and its exact FILETIME when the
+    /// snapshot carries one.
+    pub fn from_snapshot(pid: u32, snapshot: &ProcessSnapshot) -> Self {
+        PidWithSpawnedAt {
+            pid,
+            spawned_at_unix: snapshot.creation_times.get(&pid).copied().unwrap_or(0),
+            spawned_at_ft: snapshot.creation_filetimes.get(&pid).copied(),
+        }
+    }
 }
 
 /// Snapshot of the process table relevant to one discovery pass.
@@ -41,8 +71,19 @@ pub struct PidWithSpawnedAt {
 /// (e.g. `claude.exe` on Windows, `comm` on Unix) so the session liveness
 /// poll can ask "is a live Claude process present in this subtree?" — the
 /// signal [`claude_present_in_inclusive_subtree`] reads.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 pub struct ProcessSnapshot {
+    /// `true` when this is NOT a fresh read: the last good snapshot served
+    /// after a failed one, or (with none) an empty table. `Default` sets it,
+    /// so a degrade arm can never present a fabricated table as fresh; only a
+    /// read that succeeded clears it ([`super::process_table`]). A kill or an
+    /// absence decision must treat it as UNKNOWN ([`Self::is_unknown`]).
+    pub stale: bool,
+    /// Wall-clock epoch millis at which the read that produced this table
+    /// BEGAN — a lower bound on when every row was observed. A memoized or
+    /// stale answer carries its original read's time, not the time it was
+    /// served. `0` when no read produced it (`Default`).
+    pub observed_at_ms: i64,
     pub parent_map: HashMap<u32, Vec<u32>>,
     pub creation_times: HashMap<u32, i64>,
     pub names: HashMap<u32, String>,
@@ -54,6 +95,17 @@ pub struct ProcessSnapshot {
     /// absent here (access denied, protected process) is treated as a real
     /// image — never as a shim.
     pub exe_paths: HashMap<u32, String>,
+    /// `creation_filetimes[pid] -> Windows FILETIME` — 100-ns ticks since
+    /// 1601-01-01 UTC, the kernel's own creation time (`GetProcessTimes`), the
+    /// same domain Claude Code writes as `procStart` in
+    /// `<config_dir>/sessions/<pid>.json`. Filled by the in-process walk
+    /// ([`super::process_table`]) for every row whose creation time it could
+    /// read and did not withhold as a pid reused mid-walk.
+    ///
+    /// Populated on Windows only. Empty elsewhere, and absent for a pid whose
+    /// creation time could not be read — which a consumer must read as
+    /// UNKNOWN, never as a match and never as a mismatch.
+    pub creation_filetimes: HashMap<u32, u64>,
 }
 
 /// Skew tolerance (millis) for the PID-reuse creation-time vs the reference
@@ -61,6 +113,31 @@ pub struct ProcessSnapshot {
 /// times come from WMI at second granularity, so a beat of rounding slack is
 /// always allowed before treating a tracked PID as reused.
 pub(crate) const PID_REUSE_SKEW_MS: i64 = 5_000;
+
+impl Default for ProcessSnapshot {
+    /// An empty table flagged `stale`: absence of a read is UNKNOWN.
+    fn default() -> Self {
+        ProcessSnapshot {
+            stale: true,
+            observed_at_ms: 0,
+            parent_map: HashMap::new(),
+            creation_times: HashMap::new(),
+            names: HashMap::new(),
+            exe_paths: HashMap::new(),
+            creation_filetimes: HashMap::new(),
+        }
+    }
+}
+
+impl ProcessSnapshot {
+    /// True when nothing may be concluded from this snapshot's absences: it is
+    /// `stale`, or its table is empty (the runner itself is always live, so an
+    /// empty table is a failed read). A caller that kills, closes, or respawns
+    /// because a process is NOT listed must not act when this is true.
+    pub fn is_unknown(&self) -> bool {
+        self.stale || self.parent_map.is_empty()
+    }
+}
 
 /// True iff a live Claude process is present in the **inclusive** subtree
 /// rooted at `root_pid` — i.e. `root_pid`'s own image is `claude*`, OR any
@@ -363,30 +440,113 @@ fn normalize_dir(p: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Discover every descendant of `root_pid` (NOT including the root itself).
-///
-/// Returns `(descendants, parent_map)`. The parent map is restricted to the
-/// system-wide snapshot — `identify_service_pid` only walks the descendant
-/// subset, but the full map is useful for §3.5 sibling-tree reasoning.
-///
-/// Returns empty vectors on platform helper failure (logged at `warn!`).
-pub async fn discover_descendants_with_parent_map(
-    root_pid: u32,
-) -> (Vec<PidWithSpawnedAt>, HashMap<u32, Vec<u32>>) {
-    let snapshot = snapshot_process_table().await;
-    let descendants = collect_descendants_from_snapshot(root_pid, &snapshot);
-    (descendants, snapshot.parent_map)
+/// One fresh descendant-discovery pass ([`discover_descendants_with_parent_map`]).
+#[derive(Debug, Clone)]
+pub struct DescendantDiscovery {
+    /// The root's OWN record — its creation time as the same table saw it, so
+    /// the orphan reclaim's pid-reuse guard compares against when the root
+    /// was created, not when it was discovered.
+    pub root: PidWithSpawnedAt,
+    /// Every descendant (NOT the root), each with its exact FILETIME when the
+    /// table carries one.
+    pub descendants: Vec<PidWithSpawnedAt>,
+    /// The fresh table the pass read: its parent map for service
+    /// identification, and its creation times for [`merge_tracked`].
+    pub snapshot: ProcessSnapshot,
 }
 
-/// Take a fresh process-table snapshot — exposed for `orphan_state` so the
-/// startup reclaim pass can do its PID-reuse check without re-querying.
+/// The tracked set after a discovery pass: every descendant the walk found
+/// (`walked`), plus each PREVIOUSLY tracked entry the walk did not find that
+/// is still the same process in the SAME fresh `snapshot`
+/// (`health::is_same_process`: the exact FILETIME when both sides carry one,
+/// the 2 s window otherwise). An entry the table no longer lists, or whose
+/// pid now names another process, is dropped.
+///
+/// Why not replace: a walk from the root cannot reach a worker whose parent
+/// (a reloader) exited, yet that orphan may hold the health port; replacing
+/// the set would forget it, and `stop()` reaps only what is tracked.
+pub fn merge_tracked(
+    previous: &[PidWithSpawnedAt],
+    walked: Vec<PidWithSpawnedAt>,
+    snapshot: &ProcessSnapshot,
+) -> Vec<PidWithSpawnedAt> {
+    let mut merged = walked;
+    for prev in previous {
+        if merged.iter().any(|w| w.pid == prev.pid) {
+            continue;
+        }
+        let Some(&live_unix) = snapshot.creation_times.get(&prev.pid) else {
+            continue;
+        };
+        let live_ft = snapshot.creation_filetimes.get(&prev.pid).copied();
+        if super::health::is_same_process(*prev, live_unix, live_ft) {
+            merged.push(*prev);
+        }
+    }
+    merged
+}
+
+/// Discover every descendant of `root_pid` (NOT including the root itself).
+///
+/// Returns the root's own record, the descendants and the parent map. The
+/// parent map is restricted to the system-wide snapshot —
+/// `identify_service_pid` only walks the descendant subset, but the full map
+/// is useful for §3.5 sibling-tree reasoning.
+///
+/// Reads a table whose walk began after this call (never the memo): the
+/// caller runs once, seconds after a spawn, and a memoized table could predate
+/// the service process it is looking for — `identify_service_pid` would then
+/// settle on an intermediate wrapper for the life of the spawn.
+///
+/// `None` when the table is UNKNOWN ([`ProcessSnapshot::is_unknown`]: the read
+/// failed, or only a `stale` table describing the tree as it WAS is
+/// available) — distinct from a `Some` with no descendants, a read that found
+/// none.
+pub async fn discover_descendants_with_parent_map(root_pid: u32) -> Option<DescendantDiscovery> {
+    let snapshot = snapshot_process_table_fresh().await;
+    if snapshot.is_unknown() {
+        return None;
+    }
+    let root = PidWithSpawnedAt::from_snapshot(root_pid, &snapshot);
+    let descendants = collect_descendants_from_snapshot(root_pid, &snapshot);
+    Some(DescendantDiscovery {
+        root,
+        descendants,
+        snapshot,
+    })
+}
+
+/// A process-table snapshot, at most [`super::process_table::MEMO_TTL`] old,
+/// from the shared in-process provider. Check [`ProcessSnapshot::is_unknown`]
+/// before acting on an absence.
 pub async fn snapshot_process_table_public() -> ProcessSnapshot {
     snapshot_process_table().await
 }
 
-/// Convenience wrapper: discover descendants only.
-pub async fn discover_descendants(root_pid: u32) -> Vec<PidWithSpawnedAt> {
-    discover_descendants_with_parent_map(root_pid).await.0
+/// A process-table snapshot whose read began after this call (never the
+/// memo) — for a caller that closes, kills or respawns because a process is
+/// absent.
+pub async fn snapshot_process_table_fresh() -> ProcessSnapshot {
+    super::process_table::snapshot_fresh().await
+}
+
+/// Every snapshot in this module comes from the shared provider.
+async fn snapshot_process_table() -> ProcessSnapshot {
+    super::process_table::snapshot().await
+}
+
+/// TARGETED command-line lookup for EXACTLY the given pids — never a
+/// table-wide fetch. Read in-process by the shared provider
+/// ([`super::process_table::command_lines_for`]: `sysinfo` on Windows, with the
+/// WMI query as its fallback; `/proc/<pid>/cmdline` on Unix). Empty `pids` ⇒
+/// `Some(empty)`. A process missing from a `Some` map (dead, access-denied, no
+/// command-line) is simply absent.
+///
+/// `None` = UNKNOWN: the read failed and no fallback answered. A caller that
+/// decides from ABSENCE (nobody holds this session) must not read `None` as
+/// an empty map.
+pub async fn command_lines_for_pids(pids: &[u32]) -> Option<HashMap<u32, String>> {
+    super::process_table::command_lines_for(pids).await
 }
 
 /// Identify which descendant is "the service" — port owner → leaf →
@@ -505,6 +665,7 @@ fn bfs_descendants_from(
         out.push(PidWithSpawnedAt {
             pid,
             spawned_at_unix: creation_times.get(&pid).copied().unwrap_or(0),
+            spawned_at_ft: None,
         });
         if let Some(kids) = parent_map.get(&pid) {
             for k in kids {
@@ -515,11 +676,16 @@ fn bfs_descendants_from(
     out
 }
 
+/// Every descendant of `root` in `snapshot`, each with the exact FILETIME the
+/// snapshot carries for it (W2: a later kill compares it exactly).
 fn collect_descendants_from_snapshot(
     root: u32,
     snapshot: &ProcessSnapshot,
 ) -> Vec<PidWithSpawnedAt> {
     bfs_descendants_from(root, &snapshot.parent_map, &snapshot.creation_times)
+        .into_iter()
+        .map(|d| PidWithSpawnedAt::from_snapshot(d.pid, snapshot))
+        .collect()
 }
 
 // ============================================================================
@@ -539,8 +705,11 @@ fn collect_descendants_from_snapshot(
 /// overlap to matter. 8s clears the slowest healthy query with room to spare
 /// while keeping a degraded-WMI machine's steady-state hold at well under one
 /// blocking-pool thread per caller.
-#[cfg(windows)]
-const WMI_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+///
+/// Not `cfg(windows)`: `process_table::JOIN_WAIT_MAX` is defined from it on
+/// every platform, so a caller never gives up on a fallback snapshot that is
+/// still inside its own budget.
+pub(super) const WMI_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Budget for the per-PID `Win32_Process -Filter ProcessId=...` command-line
 /// query. Same WMI subsystem and the same degradation mode as
@@ -564,7 +733,7 @@ const PORT_OWNER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5
 // this file is `#[cfg]`-gated, so routing them all through one un-gated helper
 // is what makes the bounded-execution behaviour testable on every platform CI
 // runs on (see `bounded_probe_tests`) rather than only on Windows. See
-// `snapshot_process_table` for the incident this closes.
+// `powershell_snapshot` for the incident this closes.
 use crate::process_helpers::{run_probe as bounded_probe, ProbeOutcome};
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
@@ -597,10 +766,15 @@ use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 ///
 /// Routing through [`bounded_probe`] makes the worst case "this pass returns an
 /// empty snapshot and the thread goes back to the pool" instead of "one thread
-/// is gone forever". Degrading to [`ProcessSnapshot::default`] is the behaviour
-/// every other failure arm here already had.
+/// is gone forever". Degrading to [`ProcessSnapshot::default`] (empty, and
+/// `stale`) is the behaviour every other failure arm here already had.
+///
+/// **Since plan `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`
+/// Phase 5 this is the FALLBACK**, reached only through
+/// [`super::process_table`] when its in-process read fails, and skipped by its
+/// circuit after a failure. The eight callers above read the shared provider.
 #[cfg(windows)]
-async fn snapshot_process_table() -> ProcessSnapshot {
+pub(super) async fn powershell_snapshot() -> ProcessSnapshot {
     // ConvertTo-Json on a single row drops the array; force an array with @().
     const SCRIPT: &str = "$ErrorActionPreference='SilentlyContinue'; \
         @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,Name,ExecutablePath) | \
@@ -729,16 +903,17 @@ pub async fn working_directories_for_pids(_pids: &[u32]) -> HashMap<u32, String>
     HashMap::new()
 }
 
-/// TARGETED command-line lookup for EXACTLY the given pids — never a
-/// table-wide fetch. Windows issues one WMI call filtered to the requested
-/// ProcessIds (`ProcessId=A or ProcessId=B ...`) selecting only
-/// `ProcessId,CommandLine`. Empty `pids` ⇒ empty map with NO PowerShell spawn.
-/// Fail-open: any process not in the result (dead, access-denied, no
-/// command-line) is simply absent from the map.
+/// The WMI fallback for [`command_lines_for_pids`]: one call filtered to the
+/// requested ProcessIds (`ProcessId=A or ProcessId=B ...`) selecting only
+/// `ProcessId,CommandLine`. `None` when the query degraded (join error,
+/// spawn failure, non-zero exit, timeout); empty `pids` ⇒ `Some(empty)` with
+/// NO PowerShell spawn.
 #[cfg(windows)]
-pub async fn command_lines_for_pids(pids: &[u32]) -> HashMap<u32, String> {
+pub(super) async fn command_lines_for_pids_powershell(
+    pids: &[u32],
+) -> Option<HashMap<u32, String>> {
     if pids.is_empty() {
-        return HashMap::new();
+        return Some(HashMap::new());
     }
     let filter = pids
         .iter()
@@ -752,7 +927,7 @@ pub async fn command_lines_for_pids(pids: &[u32]) -> HashMap<u32, String> {
         ConvertTo-Json -Compress -Depth 3"
     );
 
-    // Bounded for the same reason as `snapshot_process_table`: this is the same
+    // Bounded for the same reason as `powershell_snapshot`: this is the same
     // WMI subsystem, reached from the periodic session-reconcile pass, and an
     // untimed `.output()` inside `spawn_blocking` is exactly the leak that
     // wedged the runner.
@@ -766,15 +941,15 @@ pub async fn command_lines_for_pids(pids: &[u32]) -> HashMap<u32, String> {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!("process_tree: command-line query join error: {e}");
-            return HashMap::new();
+            return None;
         }
     };
 
     let ProbeOutcome::Captured(stdout) = probe else {
-        return HashMap::new();
+        return None;
     };
 
-    parse_command_lines_json(&String::from_utf8_lossy(&stdout))
+    Some(parse_command_lines_json(&String::from_utf8_lossy(&stdout)))
 }
 
 #[cfg(windows)]
@@ -808,8 +983,19 @@ fn parse_command_lines_json(json: &str) -> HashMap<u32, String> {
     out
 }
 
+/// The pid owning the listening socket on local TCP `port`, read in-process
+/// from the listener table ([`super::process_table::port_owner`]); the
+/// `Get-NetTCPConnection` query below is its circuit-protected fallback.
 #[cfg(windows)]
 pub fn port_owner_pid(port: u16) -> Option<u32> {
+    super::process_table::port_owner(port)
+}
+
+/// The PowerShell fallback for [`port_owner_pid`]. The outer `None` means
+/// the query degraded (spawn failure, non-zero exit, timeout); `Some(None)`
+/// that it answered with no owner.
+#[cfg(windows)]
+pub(super) fn port_owner_pid_powershell(port: u16) -> Option<Option<u32>> {
     let script = format!(
         "$ErrorActionPreference='SilentlyContinue'; \
         $c = Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue | \
@@ -830,26 +1016,22 @@ pub fn port_owner_pid(port: u16) -> Option<u32> {
         return None;
     };
     let s = String::from_utf8_lossy(&stdout);
-    s.trim().lines().next().and_then(|l| l.trim().parse().ok())
+    Some(s.trim().lines().next().and_then(|l| l.trim().parse().ok()))
 }
 
 // ============================================================================
 // Unix implementation
 // ============================================================================
 
-#[cfg(unix)]
-async fn snapshot_process_table() -> ProcessSnapshot {
-    spawn_blocking_tracked(snapshot_process_table_sync)
-        .await
-        .unwrap_or_default()
-}
-
+/// The `/proc` walk — the Unix in-process read behind
+/// [`super::process_table`], which validates it (an unreadable `/proc` yields
+/// an empty table, which the provider treats as a failed read).
 #[cfg(unix)]
 #[expect(
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
-fn snapshot_process_table_sync() -> ProcessSnapshot {
+pub(super) fn snapshot_process_table_sync() -> ProcessSnapshot {
     let mut snap = ProcessSnapshot::default();
 
     let btime = read_btime().unwrap_or(0);
@@ -924,8 +1106,33 @@ fn snapshot_process_table_sync() -> ProcessSnapshot {
     snap
 }
 
+/// A `/proc/<pid>/stat` line's state (field 3) and start time in Unix
+/// seconds (field 22, clock ticks since boot, plus `btime`): the start time
+/// [`snapshot_process_table_sync`] records. `None` when a field does not
+/// parse or a time is not positive. Pure, so it is tested on every OS.
+pub(super) fn parse_proc_stat(stat: &str, btime: i64, ticks_per_sec: i64) -> Option<(char, i64)> {
+    // comm may hold spaces and parens; the fields follow its LAST ')'.
+    let (_, tail) = stat.rsplit_once(')')?;
+    let mut fields = tail.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    // The state was field 0 of the tail; the start time is field 19.
+    let ticks: i64 = fields.nth(18)?.parse().ok()?;
+    (btime > 0 && ticks > 0 && ticks_per_sec > 0).then(|| (state, btime + ticks / ticks_per_sec))
+}
+
+/// `pid`'s state and start time ([`parse_proc_stat`]) from
+/// `/proc/<pid>/stat`, against a `btime` the caller read once for the whole
+/// tick ([`read_btime`]). `None` when the pid is gone or `/proc` is absent.
 #[cfg(unix)]
-fn read_btime() -> Option<i64> {
+pub(super) fn proc_stat(pid: u32, btime: i64) -> Option<(char, i64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as i64;
+    parse_proc_stat(&stat, btime, per_sec)
+}
+
+/// The boot time (`btime`, Unix seconds) from `/proc/stat`.
+#[cfg(unix)]
+pub(super) fn read_btime() -> Option<i64> {
     let s = std::fs::read_to_string("/proc/stat").ok()?;
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("btime ") {
@@ -970,37 +1177,29 @@ pub async fn working_directories_for_pids(pids: &[u32]) -> HashMap<u32, String> 
     .unwrap_or_default()
 }
 
-/// TARGETED command-line lookup for EXACTLY the given pids — never a
-/// table-wide fetch. Unix reads `/proc/<pid>/cmdline` per pid (NUL-separated
-/// args → single space-joined string). Empty `pids` ⇒ empty map. Fail-open:
-/// an unreadable pid (dead, permission-denied) is simply absent from the map.
+/// `/proc/<pid>/cmdline` for exactly `pids` (NUL-separated args → one
+/// space-joined string) — the Unix in-process command-line read behind
+/// [`command_lines_for_pids`]. An unreadable pid (dead, permission-denied) is
+/// simply absent from the map.
 #[cfg(unix)]
-pub async fn command_lines_for_pids(pids: &[u32]) -> HashMap<u32, String> {
-    if pids.is_empty() {
-        return HashMap::new();
-    }
-    let pids = pids.to_vec();
-    spawn_blocking_tracked(move || {
-        let mut out = HashMap::new();
-        for pid in pids {
-            let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
-                continue;
-            };
-            let joined = bytes
-                .split(|b| *b == 0)
-                .filter(|part| !part.is_empty())
-                .map(|part| String::from_utf8_lossy(part).into_owned())
-                .collect::<Vec<_>>()
-                .join(" ");
-            let joined = joined.trim().to_string();
-            if !joined.is_empty() {
-                out.insert(pid, joined);
-            }
+pub(super) fn proc_command_lines(pids: &[u32]) -> HashMap<u32, String> {
+    let mut out = HashMap::new();
+    for &pid in pids {
+        let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let joined = bytes
+            .split(|b| *b == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let joined = joined.trim().to_string();
+        if !joined.is_empty() {
+            out.insert(pid, joined);
         }
-        out
-    })
-    .await
-    .unwrap_or_default()
+    }
+    out
 }
 
 #[cfg(unix)]
@@ -1217,8 +1416,116 @@ mod tests {
             .map(|(p, t)| PidWithSpawnedAt {
                 pid: *p,
                 spawned_at_unix: *t,
+                spawned_at_ft: None,
             })
             .collect()
+    }
+
+    /// A record taken from a snapshot carries the pid's CREATION time and,
+    /// when the table has it, the exact FILETIME (W2) — for the discovered
+    /// root as for every descendant (N7: the root used to be recorded with
+    /// the discovery instant). A pid the table does not list records `0` and
+    /// no FILETIME, which the reclaim and the kill treat as unknown.
+    #[test]
+    fn records_from_a_snapshot_carry_creation_time_and_filetime() {
+        let mut snap = ProcessSnapshot {
+            stale: false,
+            ..ProcessSnapshot::default()
+        };
+        snap.parent_map.insert(7, vec![8]);
+        snap.creation_times.insert(7, 1_715_911_000);
+        snap.creation_times.insert(8, 1_715_911_001);
+        snap.creation_filetimes.insert(7, 133_000_000_000_000_007);
+        assert_eq!(
+            PidWithSpawnedAt::from_snapshot(7, &snap),
+            PidWithSpawnedAt {
+                pid: 7,
+                spawned_at_unix: 1_715_911_000,
+                spawned_at_ft: Some(133_000_000_000_000_007),
+            }
+        );
+        assert_eq!(
+            PidWithSpawnedAt::from_snapshot(9, &snap),
+            PidWithSpawnedAt {
+                pid: 9,
+                spawned_at_unix: 0,
+                spawned_at_ft: None,
+            }
+        );
+        assert_eq!(
+            collect_descendants_from_snapshot(7, &snap),
+            vec![PidWithSpawnedAt {
+                pid: 8,
+                spawned_at_unix: 1_715_911_001,
+                spawned_at_ft: None,
+            }]
+        );
+        snap.creation_filetimes.insert(8, 133_000_000_000_000_018);
+        assert_eq!(
+            collect_descendants_from_snapshot(7, &snap)[0].spawned_at_ft,
+            Some(133_000_000_000_000_018)
+        );
+    }
+
+    /// B1: rediscovery merges instead of replacing. A tracked orphan the new
+    /// walk cannot reach (its parent exited) is kept while it is still the
+    /// same process; a tracked entry the table no longer lists is dropped,
+    /// and so is one whose pid now names another process (exact FILETIME,
+    /// or the 2 s window without one). The walk's own record wins on a pid
+    /// it found.
+    #[test]
+    fn merge_tracked_keeps_a_live_orphan_and_drops_the_dead_and_the_reused() {
+        let rec = |pid, unix, ft| PidWithSpawnedAt {
+            pid,
+            spawned_at_unix: unix,
+            spawned_at_ft: ft,
+        };
+        let mut snap = ProcessSnapshot {
+            stale: false,
+            ..ProcessSnapshot::default()
+        };
+        // 11: the walk's worker; 21: the orphan, same process; 23: reused
+        // (window arm); 24: reused (exact arm, same second); 22: gone.
+        for (pid, unix) in [(11, 1_000), (21, 1_005), (23, 1_100), (24, 1_006)] {
+            snap.parent_map.entry(0).or_default().push(pid);
+            snap.creation_times.insert(pid, unix);
+        }
+        snap.creation_filetimes.insert(21, 210);
+        snap.creation_filetimes.insert(24, 241);
+        let previous = [
+            rec(11, 999, None),
+            rec(21, 1_005, Some(210)),
+            rec(22, 1_004, None),
+            rec(23, 1_000, None),
+            rec(24, 1_006, Some(240)),
+        ];
+        let walked = vec![rec(11, 1_000, None)];
+        assert_eq!(
+            merge_tracked(&previous, walked, &snap),
+            vec![rec(11, 1_000, None), rec(21, 1_005, Some(210))]
+        );
+    }
+
+    /// The stat parser takes the state and start time from after comm's
+    /// LAST ')' (comm may hold both), and reports a zombie's `Z`.
+    #[test]
+    fn proc_stat_parser_reads_state_and_start_time_after_the_last_paren() {
+        let tail = "1 1234 1234 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 5000 0 0";
+        let zombie = format!("1234 (my (odd) proc) Z {tail}");
+        assert_eq!(
+            parse_proc_stat(&zombie, 1_700_000_000, 100),
+            Some(('Z', 1_700_000_050))
+        );
+        let running = format!("1234 (svc) S {tail}");
+        assert_eq!(
+            parse_proc_stat(&running, 1_700_000_000, 100),
+            Some(('S', 1_700_000_050))
+        );
+        assert_eq!(
+            parse_proc_stat("1234 (svc) S 1 2", 1_700_000_000, 100),
+            None
+        );
+        assert_eq!(parse_proc_stat(&running, 0, 100), None, "no boot time");
     }
 
     #[test]
@@ -1235,6 +1542,26 @@ mod tests {
         let mut got: Vec<u32> = out.iter().map(|p| p.pid).collect();
         got.sort();
         assert_eq!(got, vec![2, 3, 4, 5]);
+    }
+
+    /// `Default` is UNKNOWN (stale and empty); a read that succeeded clears
+    /// `stale`, and only then do its absences count; a stale table is unknown
+    /// however full it is.
+    #[test]
+    fn process_tree_snapshot_default_is_stale_and_unknown() {
+        let d = ProcessSnapshot::default();
+        assert!(d.stale);
+        assert!(d.is_unknown());
+        let mut fresh = ProcessSnapshot::default();
+        fresh.parent_map.insert(1, vec![2]);
+        assert!(fresh.is_unknown(), "built from Default: still stale");
+        fresh.stale = false;
+        assert!(!fresh.is_unknown());
+        let empty_fresh = ProcessSnapshot {
+            stale: false,
+            ..ProcessSnapshot::default()
+        };
+        assert!(empty_fresh.is_unknown(), "an empty table is a failed read");
     }
 
     #[test]

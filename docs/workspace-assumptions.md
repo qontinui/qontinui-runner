@@ -16,7 +16,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `fleet_host_name` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `fleet_device_uuid` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
-| `os_bound_tooling` | 96 | 97 | 96 | 0 | 0 | 0 |
+| `os_bound_tooling` | 99 | 100 | 96 | 3 | 0 | 0 |
 
 ## `repo_layout` (79 rows)
 
@@ -257,7 +257,7 @@ _No hits._
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `let existing = get_setting::<PathSettings>().plans_dir;` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `update_setting::<PathSettings, _>(\|paths\| paths.plans_dir = Some(value.clone()))?;` | 1 | unreviewed |
 
-## `os_bound_tooling` (96 rows)
+## `os_bound_tooling` (99 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -319,9 +319,12 @@ _No hits._
 | `src/playwright/executor.rs` | `run_script_inline` | `"Running inline Playwright via cmd.exe in dir {}: {}",` | 1 | unreviewed |
 | `src/playwright/executor.rs` | `run_script_inline` | `.map_err(\|e\| format!("Failed to execute playwright via cmd.exe: {}", e))?` | 1 | unreviewed |
 | `src/process_capture/manager.rs` | `expected_node_bin` | `.or_else(\|\| after.strip_suffix(".ps1"))` | 1 | unreviewed |
+| `src/process_capture/process_tree.rs` | `command_lines_for_pids_powershell` | `cfg(windows)-only fn 'command_lines_for_pids_powershell' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — The Windows-only WMI command-line query, reached only through process_table's circuit when the in-process sysinfo cmd() read fails. Unix reads /proc/<pid>/cmdline in-process. |
 | `src/process_capture/process_tree.rs` | `parse_command_lines_json` | `cfg(windows)-only fn 'parse_command_lines_json' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/process_capture/process_tree.rs` | `parse_powershell_snapshot` | `cfg(windows)-only fn 'parse_powershell_snapshot' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/process_capture/process_tree.rs` | `parse_wmi_creation_date` | `cfg(windows)-only fn 'parse_wmi_creation_date' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/process_capture/process_tree.rs` | `port_owner_pid_powershell` | `cfg(windows)-only fn 'port_owner_pid_powershell' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — The Windows-only Get-NetTCPConnection query, reached only through process_table's circuit when the in-process GetExtendedTcpTable listener read fails. Unix keeps its own lsof port_owner_pid. |
+| `src/process_capture/process_tree.rs` | `powershell_snapshot` | `cfg(windows)-only fn 'powershell_snapshot' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — The Windows-only PowerShell/WMI snapshot, reached only through process_table's circuit when the in-process sysinfo walk fails. Unix reads /proc in-process and has no external snapshot fallback. |
 | `src/process_helpers.rs` | `ChildTreeGuard::attach_raw` | `cfg(windows)-only fn 'attach_raw' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/process_helpers.rs` | `cmd_no_window` | `no_window("cmd.exe")` | 1 | unreviewed |
 | `src/process_helpers.rs` | `tokio_cmd_no_window` | `tokio_no_window("cmd.exe")` | 1 | unreviewed |
