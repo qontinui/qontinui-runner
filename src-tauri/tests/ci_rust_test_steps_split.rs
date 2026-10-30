@@ -779,10 +779,9 @@ fn an_out_of_memory_rust_test_step_is_annotated_as_capacity() {
     // build-killed (write-skipped on main, hiding a possible real assertion).
     const BUILD_BRANCH: &str =
         "if [ \"${{ steps.build_rust_tests.outcome }}\" = \"failure\" ]; then";
-    let branch_at = body
-        .find(BUILD_BRANCH)
+    let (_, after_branch) = body
+        .split_once(BUILD_BRANCH)
         .unwrap_or_else(|| panic!("`{EMITTER}` must branch on `{BUILD_BRANCH}`; body:\n{body}"));
-    let after_branch = &body[branch_at + BUILD_BRANCH.len()..];
     let lines: Vec<&str> = after_branch.lines().map(str::trim).collect();
     let else_at = lines
         .iter()
