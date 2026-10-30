@@ -14,6 +14,7 @@ const MAX_SESSION_OUTPUT_LINES: u32 = 50_000;
 
 use super::health;
 use super::process::{EarlyExitInfo, ManagedProcess, ProcessMessage};
+use super::process_tree::PidWithSpawnedAt;
 use super::types::*;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
@@ -497,19 +498,23 @@ impl ProcessCaptureManager {
     /// Restart a process: stop → wait for port free → start.
     ///
     /// Phase 5: when `QONTINUI_REAP_RESTART=1` is set, also walks the
-    /// previously-tracked descendant tree and force-kills each PID. This
-    /// catches the case where `stop()` (an in-process tree kill on Windows)
-    /// fails to take down a late-forked uvicorn worker — without the
+    /// previously-tracked descendant tree and force-kills each PID that is
+    /// still the process it was recorded as (its creation time, checked by
+    /// `health::kill_descendant_tree` on Windows). This catches the case
+    /// where `stop()` (an in-process tree kill on Windows) fails to take down
+    /// a late-forked uvicorn worker — without the
     /// explicit reap, the next `start_process` fights the orphan for the
     /// health port and lands in the `Bound`-not-`Listen` half-bound state
     /// that triggered this whole plan.
     pub async fn restart_process(&self, id: &str) -> Result<(), String> {
-        // Snapshot the descendant tree BEFORE `stop()` clears it.
-        let descendant_pids: Vec<u32> = {
+        // Snapshot the descendant tree BEFORE `stop()` clears it, with each
+        // pid's recorded creation time: the reap below kills a pid only while
+        // it still names that process.
+        let descendant_pids = {
             let processes = self.processes.read().await;
             processes
                 .get(id)
-                .map(|p| p.runtime.descendant_pids.iter().map(|d| d.pid).collect())
+                .map(|p| p.runtime.descendant_pids.clone())
                 .unwrap_or_default()
         };
 
@@ -543,7 +548,7 @@ impl ProcessCaptureManager {
                 descendant_pids
                     .iter()
                     .copied()
-                    .map(|pid| async move { health::kill_descendant_tree(pid).await }),
+                    .map(|root| async move { health::kill_descendant_tree(root).await }),
             )
             .await
             .into_iter()
@@ -1009,13 +1014,16 @@ impl ProcessCaptureManager {
         let mut health_restart_attempts: u32 = 0;
         // Latch so the "cap reached" error is logged once, not every 3 seconds.
         let mut health_restart_cap_logged = false;
+        // Rediscovery memory (see "Re-discover descendants" below). Its
+        // in-flight guard is the process's own `discovery_gate`.
+        let mut rediscovery = RediscoveryState::default();
 
         loop {
             tokio::time::sleep(POLL_INTERVAL).await;
             tick_count = tick_count.wrapping_add(1);
 
             // ── Snapshot current state + service PID under read lock ──────────
-            let (current_state, service_pid, tracked_pid, auto_start, uptime) = {
+            let (current_state, service_pid, tracked_pid, auto_start, uptime, tracked, discovery) = {
                 let procs = processes.read().await;
                 let Some(p) = procs.get(&process_id) else {
                     // Process was removed from the map — exit cleanly.
@@ -1027,8 +1035,14 @@ impl ProcessCaptureManager {
                     p.runtime.pid,
                     p.config.auto_start,
                     p.runtime.started_at.map(|t| t.elapsed()),
+                    p.runtime.descendant_pids.clone(),
+                    (
+                        p.runtime.discovery_gate.clone(),
+                        p.runtime.last_discovery.clone(),
+                    ),
                 )
             };
+            let (discovery_gate, last_pass) = discovery;
 
             // Skip transient lifecycle states where reconciliation is harmful.
             // Starting/Building/Stopping are managed by start_process/stop;
@@ -1041,6 +1055,9 @@ impl ProcessCaptureManager {
                 // A (re)start or a deliberate stop is in flight: the unhealthy
                 // run so far says nothing about the generation about to exist.
                 consecutive_unhealthy_ticks = 0;
+                // Nor does its rediscovery memory: the new generation's start
+                // runs its own discovery.
+                rediscovery = RediscoveryState::default();
                 continue;
             }
 
@@ -1063,6 +1080,120 @@ impl ProcessCaptureManager {
                 },
                 None => false,
             };
+
+            // ── Re-discover descendants when the listener changes hands ───────
+            // `stop()` frees a held port by reaping the TRACKED descendants, so
+            // a worker that took over the port must be tracked. Three
+            // triggers, all only while a Running/Healthy process's port is in
+            // use ([`rediscovery_trigger`]):
+            // - the listener OWNER changed: a restart that opens a NEW socket
+            //   (nodemon style). Windows only — an in-process read with no
+            //   fallback (`listener_pid_in_process`), so it never creates a
+            //   process; off Windows the probe is skipped outright;
+            // - a TRACKED DESCENDANT died: a reloader respawning its worker on
+            //   an INHERITED socket. The listener table keeps naming the
+            //   socket's creator (measured 2026-10-30) and the service pid is
+            //   that creator, the reloader, so neither changes; the old worker's
+            //   death does, and rediscovery from the root then finds the new
+            //   worker while the reloader, its parent, still lives — before a
+            //   reloader death could orphan it;
+            // - the SERVICE pid died: re-tracks whatever the root's tree still
+            //   holds. It cannot reach a worker the dead service orphaned,
+            //   which is why the descendant trigger fires earlier, at the
+            //   worker's death.
+            // "Dead" is identity, not liveness (`is_tracked_alive`): a reused
+            // pid reads as dead. Rediscovery MERGES into the tracked set, so
+            // an orphan the walk cannot reach stays tracked. At most one
+            // rediscovery is in flight per process, the two death triggers at
+            // most once per back-off window: REDISCOVERY_MIN_INTERVAL,
+            // doubling with each death-started pass up to
+            // REDISCOVERY_MAX_INTERVAL, back to the minimum only when an entry
+            // a pass first found is still alive as itself at the next tick, or
+            // a pass changed the service pid (so churn keeps backing off); the
+            // memory advances only when one starts, so a rejected or
+            // rate-limited trigger fires once allowed. Passes serialize on
+            // the process's `discovery_gate`.
+            if port_in_use && matches!(current_state, ProcessState::Running | ProcessState::Healthy)
+            {
+                let owner = if cfg!(windows) {
+                    spawn_blocking_tracked(move || health::listener_pid_in_process(port))
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+                // `pid_alive` probed the service pid when one is tracked.
+                let dead_service = service_pid.filter(|_| !pid_alive);
+                // Forget handled deaths of pids no longer tracked, so the
+                // memory stays bounded by the tracked set.
+                rediscovery.retain_tracked(&tracked, service_pid);
+                // Alive AS ITSELF: a reused pid reads as dead.
+                let dead_descendants = if tracked.is_empty() {
+                    Vec::new()
+                } else {
+                    let probe = tracked.clone();
+                    spawn_blocking_tracked(move || {
+                        // `/proc/stat` is read once for the tick, not per pid.
+                        let btime = health::proc_boot_time();
+                        probe
+                            .into_iter()
+                            .filter(|d| !health::is_tracked_alive(*d, btime))
+                            .collect::<Vec<_>>()
+                    })
+                    .await
+                    .unwrap_or_default()
+                };
+                // The last pass's outcome, read once: its new entries still
+                // alive as themselves, or a service change, reset the back-off.
+                rediscovery.note_pass(&last_pass, &tracked, &dead_descendants);
+                let now = Instant::now();
+                let trigger = rediscovery.trigger(owner, dead_service, &dead_descendants, now);
+                let started = match trigger {
+                    Some(trigger) => {
+                        let process_name = {
+                            let procs = processes.read().await;
+                            procs.get(&process_id).map(|p| p.config.name.clone())
+                        };
+                        // A pass in flight (post-spawn or a rediscovery)
+                        // holds the gate: retry next tick rather than queue
+                        // passes behind it. The spawned pass takes the gate
+                        // itself, waiting if a pass started in between.
+                        let in_flight = discovery_gate.try_lock().is_err();
+                        match process_name {
+                            Some(process_name) if !in_flight => {
+                                tracing::info!(
+                                    "'{process_name}' port {port}: {trigger:?}; re-running \
+                                     descendant discovery"
+                                );
+                                let (id, procs, app) =
+                                    (process_id.clone(), processes.clone(), app_handle.clone());
+                                tokio::spawn(async move {
+                                    Self::descendant_discovery_once(
+                                        id,
+                                        process_name,
+                                        Some(port),
+                                        procs,
+                                        app,
+                                    )
+                                    .await;
+                                });
+                                true
+                            }
+                            Some(_) => {
+                                tracing::debug!(
+                                    "port {port}: {trigger:?}; a rediscovery is already in \
+                                     flight, retried next tick"
+                                );
+                                false
+                            }
+                            None => false,
+                        }
+                    }
+                    None => false,
+                };
+                rediscovery.observe(owner, trigger, started, now);
+            }
 
             // adoption_enabled: gate ExternallyOwned adoption on dev-mode AND the
             // `process_management.external_adoption_in_dev` setting. Loading
@@ -1412,6 +1543,19 @@ impl ProcessCaptureManager {
     ) {
         use super::process_tree;
 
+        // Serialize with every other discovery pass for this process: hold the
+        // gate from reading the tracked set to writing the merged one, so a
+        // pass never overwrites another's result. A held gate is waited for
+        // (its holder's pass is itself bounded), never skipped.
+        let gate = {
+            let procs = processes.read().await;
+            match procs.get(&process_id) {
+                Some(p) => p.runtime.discovery_gate.clone(),
+                None => return,
+            }
+        };
+        let _pass = gate.lock_owned().await;
+
         // One bounded retry: a first look that is UNKNOWN (the table could
         // not be read fresh) or that finds no descendant yet (the wrapper has
         // not forked its chain, so the service pid would fall back to the
@@ -1419,13 +1563,13 @@ impl ProcessCaptureManager {
         // that: an UNKNOWN pass writes nothing; an empty one records what it saw.
         const DISCOVERY_ATTEMPTS: u32 = 2;
         let mut attempt = 0;
-        let (spawned_pid, descendants, parent_map) = loop {
+        let (spawned_pid, root_entry, descendants, parent_map) = loop {
             attempt += 1;
             tokio::time::sleep(Duration::from_secs(3)).await;
 
-            // Capture the spawned PID under a brief read lock; bail if state
-            // moved on.
-            let spawned_pid = {
+            // Capture the spawned PID, and the set tracked so far, under a
+            // brief read lock; bail if state moved on.
+            let (spawned_pid, previous) = {
                 let procs = processes.read().await;
                 let Some(p) = procs.get(&process_id) else {
                     return;
@@ -1437,16 +1581,19 @@ impl ProcessCaptureManager {
                     return;
                 }
                 match p.runtime.pid {
-                    Some(pid) => pid,
+                    Some(pid) => (pid, p.runtime.descendant_pids.clone()),
                     None => return,
                 }
             };
 
             match process_tree::discover_descendants_with_parent_map(spawned_pid).await {
-                Some((descendants, parent_map))
-                    if !descendants.is_empty() || attempt >= DISCOVERY_ATTEMPTS =>
-                {
-                    break (spawned_pid, descendants, parent_map);
+                Some(found) if !found.descendants.is_empty() || attempt >= DISCOVERY_ATTEMPTS => {
+                    // MERGE, never replace: a tracked orphan the walk cannot
+                    // reach (its reloader parent exited) may hold the port,
+                    // and `stop()` reaps only what is tracked.
+                    let merged =
+                        process_tree::merge_tracked(&previous, found.descendants, &found.snapshot);
+                    break (spawned_pid, found.root, merged, found.snapshot.parent_map);
                 }
                 Some(_) => tracing::debug!(
                     "Descendant discovery for '{process_name}' found no descendant yet; retrying once"
@@ -1482,10 +1629,21 @@ impl ProcessCaptureManager {
             ) {
                 return;
             }
-            let changed = p.runtime.service_pid != service_pid
-                || p.runtime.descendant_pids.len() != descendants.len();
+            let new_entries: Vec<PidWithSpawnedAt> = descendants
+                .iter()
+                .filter(|d| !p.runtime.descendant_pids.contains(d))
+                .copied()
+                .collect();
+            let service_changed = p.runtime.service_pid != service_pid;
+            let changed =
+                service_changed || !same_tracked_set(&p.runtime.descendant_pids, &descendants);
             p.runtime.descendant_pids = descendants.clone();
             p.runtime.service_pid = service_pid;
+            p.runtime.last_discovery = DiscoveryPass {
+                seq: p.runtime.last_discovery.seq.wrapping_add(1),
+                new_entries,
+                service_changed,
+            };
             if changed {
                 Some(p.status())
             } else {
@@ -1503,11 +1661,11 @@ impl ProcessCaptureManager {
 
         // Persist for §3.5 startup orphan-reclaim. Phase 4 — record the
         // tracked root PID so a crashed-without-shutdown runner can find
-        // and reap its prior generation's orphan trees on next boot.
-        let root_entry = super::process_tree::PidWithSpawnedAt {
-            pid: spawned_pid,
-            spawned_at_unix: chrono::Utc::now().timestamp(),
-        };
+        // and reap its prior generation's orphan trees on next boot. The
+        // root's record carries its CREATION time from the same table read
+        // (it used to carry the discovery instant, seconds after the spawn,
+        // which the reclaim's pid-reuse guard then never matched); a root
+        // the read did not list records `0` and is skipped, fail-closed.
         let mut to_persist = Vec::with_capacity(descendants.len() + 1);
         to_persist.push(root_entry);
         to_persist.extend(descendants.iter().copied());
@@ -1951,6 +2109,196 @@ fn expected_node_bin(config: &ProcessConfig) -> Option<String> {
 // ============================================================================
 // Phase B2: pure decision helper for start_process adoption gate
 // ============================================================================
+
+/// Why the reconcile loop re-runs descendant discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rediscovery {
+    /// The health port's listener owner changed: a new socket.
+    OwnerChanged,
+    /// A tracked descendant is no longer alive as itself while the port
+    /// stayed in use: a worker respawned on an inherited socket.
+    DescendantDied(PidWithSpawnedAt),
+    /// The tracked service pid died while the port stayed in use.
+    ServiceDied(u32),
+}
+
+/// The back-off window after the first death-started rediscovery
+/// ([`Rediscovery::DescendantDied`], [`Rediscovery::ServiceDied`]), per
+/// process; each further one doubles it up to [`REDISCOVERY_MAX_INTERVAL`],
+/// so children that churn cannot drive rediscovery continuously. An owner
+/// change is not limited.
+pub(crate) const REDISCOVERY_MIN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The longest back-off window (30 s, 60 s, 120 s, 240 s, then 5 min).
+pub(crate) const REDISCOVERY_MAX_INTERVAL: Duration = Duration::from_secs(300);
+
+/// The back-off window after `steps` death-started rediscoveries since the
+/// last reset: [`REDISCOVERY_MIN_INTERVAL`] doubled `steps` times, capped at
+/// [`REDISCOVERY_MAX_INTERVAL`].
+pub(crate) fn rediscovery_backoff(steps: u32) -> Duration {
+    REDISCOVERY_MIN_INTERVAL
+        .saturating_mul(1u32 << steps.min(16))
+        .min(REDISCOVERY_MAX_INTERVAL)
+}
+
+/// A handled death's identity: the pid with the creation time it was tracked
+/// with, so a reused pid that dies later fires again. A service pid carries
+/// no record and is keyed by its pid alone.
+type DeathKey = (u32, i64, Option<u64>);
+
+fn death_key(record: &PidWithSpawnedAt) -> DeathKey {
+    (record.pid, record.spawned_at_unix, record.spawned_at_ft)
+}
+
+fn service_key(pid: u32) -> DeathKey {
+    (pid, 0, None)
+}
+
+/// Whether to re-run descendant discovery this tick, for a Running/Healthy
+/// process whose port is in use: the listener owner changed (both sightings
+/// known and different; a first sighting or an unreadable tick is not a
+/// change); or the service pid is dead (`dead_service`); or a tracked
+/// descendant is no longer alive as itself (`dead_descendants`). A death
+/// fires once: not when its key is in `handled_dead`. No rate limit here
+/// ([`RediscoveryState::trigger`] applies it).
+pub(crate) fn rediscovery_trigger(
+    last_owner: Option<u32>,
+    owner: Option<u32>,
+    dead_service: Option<u32>,
+    dead_descendants: &[PidWithSpawnedAt],
+    handled_dead: &std::collections::HashSet<DeathKey>,
+) -> Option<Rediscovery> {
+    if matches!((last_owner, owner), (Some(a), Some(b)) if a != b) {
+        return Some(Rediscovery::OwnerChanged);
+    }
+    if let Some(pid) = dead_service.filter(|pid| !handled_dead.contains(&service_key(*pid))) {
+        return Some(Rediscovery::ServiceDied(pid));
+    }
+    dead_descendants
+        .iter()
+        .copied()
+        .find(|d| !handled_dead.contains(&death_key(d)))
+        .map(Rediscovery::DescendantDied)
+}
+
+/// The reconcile loop's rediscovery memory: the listener owner as last
+/// seen, the deaths a rediscovery already started for, the back-off (the
+/// last death-started rediscovery and its window, and how many have started
+/// since the last reset), and the last discovery pass already read. It
+/// advances only when a rediscovery STARTS, so a trigger the in-flight guard
+/// rejected, or the back-off held, fires once allowed.
+#[derive(Debug, Default)]
+pub(crate) struct RediscoveryState {
+    last_owner: Option<u32>,
+    handled_dead: std::collections::HashSet<DeathKey>,
+    death_window: Option<(Instant, Duration)>,
+    backoff_steps: u32,
+    seen_pass: u64,
+}
+
+impl RediscoveryState {
+    /// This tick's trigger ([`rediscovery_trigger`]), with a death held back
+    /// while it falls inside the back-off window of the last death-started
+    /// rediscovery. The limit is always on; only its length changes
+    /// ([`Self::note_pass`]). Remembers nothing.
+    pub(crate) fn trigger(
+        &self,
+        owner: Option<u32>,
+        dead_service: Option<u32>,
+        dead_descendants: &[PidWithSpawnedAt],
+        now: Instant,
+    ) -> Option<Rediscovery> {
+        let trigger = rediscovery_trigger(
+            self.last_owner,
+            owner,
+            dead_service,
+            dead_descendants,
+            &self.handled_dead,
+        )?;
+        let limited = self
+            .death_window
+            .is_some_and(|(at, window)| now.saturating_duration_since(at) < window);
+        if limited && trigger != Rediscovery::OwnerChanged {
+            return None;
+        }
+        Some(trigger)
+    }
+
+    /// Record a tick. With no trigger, only the owner baseline moves (to a
+    /// read owner). A trigger whose rediscovery `started` moves the baseline
+    /// and marks its death handled; a death-started one also opens a window
+    /// of [`rediscovery_backoff`] at `now` and lengthens the next. A rejected
+    /// trigger records nothing.
+    pub(crate) fn observe(
+        &mut self,
+        owner: Option<u32>,
+        trigger: Option<Rediscovery>,
+        started: bool,
+        now: Instant,
+    ) {
+        if trigger.is_some() && !started {
+            return;
+        }
+        if owner.is_some() {
+            self.last_owner = owner;
+        }
+        let death = match trigger {
+            Some(Rediscovery::ServiceDied(pid)) => {
+                self.handled_dead.insert(service_key(pid));
+                true
+            }
+            Some(Rediscovery::DescendantDied(record)) => {
+                self.handled_dead.insert(death_key(&record));
+                true
+            }
+            Some(Rediscovery::OwnerChanged) | None => false,
+        };
+        if started && death {
+            self.death_window = Some((now, rediscovery_backoff(self.backoff_steps)));
+            self.backoff_steps = self.backoff_steps.saturating_add(1);
+        }
+    }
+
+    /// Read a completed discovery pass ONCE, at the first tick after it:
+    /// reset the back-off to [`REDISCOVERY_MIN_INTERVAL`] when the pass
+    /// changed the service pid, or when an entry it first found is still
+    /// tracked and alive as itself now (not in `dead`). A churning tree's
+    /// new entries are transient and dead by then, so it keeps backing off.
+    pub(crate) fn note_pass(
+        &mut self,
+        pass: &DiscoveryPass,
+        tracked: &[PidWithSpawnedAt],
+        dead: &[PidWithSpawnedAt],
+    ) {
+        if pass.seq == self.seen_pass {
+            return;
+        }
+        self.seen_pass = pass.seq;
+        let survivor = pass
+            .new_entries
+            .iter()
+            .any(|n| tracked.contains(n) && !dead.contains(n));
+        if pass.service_changed || survivor {
+            self.backoff_steps = 0;
+            if let Some((at, _)) = self.death_window {
+                self.death_window = Some((at, REDISCOVERY_MIN_INTERVAL));
+            }
+        }
+    }
+
+    /// Forget handled deaths that are no longer tracked (a merge dropped
+    /// them), keeping the memory bounded by the tracked set and the service.
+    pub(crate) fn retain_tracked(&mut self, tracked: &[PidWithSpawnedAt], service: Option<u32>) {
+        self.handled_dead.retain(|key| {
+            tracked.iter().any(|d| death_key(d) == *key) || service.map(service_key) == Some(*key)
+        });
+    }
+}
+
+/// Whether two tracked sets hold the same records, in any order.
+pub(crate) fn same_tracked_set(a: &[PidWithSpawnedAt], b: &[PidWithSpawnedAt]) -> bool {
+    a.len() == b.len() && a.iter().all(|x| b.contains(x)) && b.iter().all(|x| a.contains(x))
+}
 
 /// Pure, testable decision: given the adoption policy and whether a port is
 /// currently externally-bound, should `start_process` **adopt** (refuse to
@@ -3333,6 +3681,376 @@ mod health_restart_tests {
             s.health_restart_grace_secs < s.health_restart_after_secs,
             "the grace window must be shorter than the threshold, or the \
              threshold could never be reached from a fresh start"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rediscovery_trigger_tests {
+    use super::{
+        death_key, rediscovery_backoff, rediscovery_trigger, same_tracked_set, Rediscovery,
+        RediscoveryState, REDISCOVERY_MAX_INTERVAL, REDISCOVERY_MIN_INTERVAL,
+    };
+    use crate::process_capture::process_tree::PidWithSpawnedAt;
+    use crate::process_capture::types::DiscoveryPass;
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+
+    fn rec(pid: u32, unix: i64) -> PidWithSpawnedAt {
+        PidWithSpawnedAt {
+            pid,
+            spawned_at_unix: unix,
+            spawned_at_ft: None,
+        }
+    }
+
+    fn none() -> HashSet<(u32, i64, Option<u64>)> {
+        HashSet::new()
+    }
+
+    /// A new socket: two sightings of the listener owner that differ. A first
+    /// sighting or an unreadable tick is not a change.
+    #[test]
+    fn rediscovery_fires_on_a_listener_owner_change() {
+        assert_eq!(
+            rediscovery_trigger(Some(10), Some(11), None, &[], &none()),
+            Some(Rediscovery::OwnerChanged)
+        );
+        assert_eq!(
+            rediscovery_trigger(Some(10), Some(10), None, &[], &none()),
+            None
+        );
+        assert_eq!(
+            rediscovery_trigger(None, Some(10), None, &[], &none()),
+            None,
+            "a first sighting"
+        );
+        assert_eq!(
+            rediscovery_trigger(Some(10), None, None, &[], &none()),
+            None,
+            "an unreadable tick"
+        );
+    }
+
+    /// The inherited-socket handoff while the reloader lives: the owner and
+    /// the service pid (the reloader) are unchanged, a tracked worker died.
+    /// That fires once per death — and again for a REUSED pid that dies
+    /// later, since a death is keyed by pid and creation time.
+    #[test]
+    fn rediscovery_fires_once_when_a_tracked_descendant_dies() {
+        let w1 = rec(12, 1_000);
+        assert_eq!(
+            rediscovery_trigger(Some(10), Some(10), None, &[w1], &none()),
+            Some(Rediscovery::DescendantDied(w1))
+        );
+        let handled = HashSet::from([death_key(&w1)]);
+        assert_eq!(
+            rediscovery_trigger(Some(10), Some(10), None, &[w1], &handled),
+            None,
+            "already rediscovered for this death"
+        );
+        let other = rec(13, 1_001);
+        assert_eq!(
+            rediscovery_trigger(Some(10), Some(10), None, &[w1, other], &handled),
+            Some(Rediscovery::DescendantDied(other)),
+            "a second worker that died too"
+        );
+        let w2 = rec(12, 1_050);
+        assert_eq!(
+            rediscovery_trigger(Some(10), Some(10), None, &[w2], &handled),
+            Some(Rediscovery::DescendantDied(w2)),
+            "pid 12 reused by a later worker that died: a new death"
+        );
+    }
+
+    /// The service pid died: fires once per dead pid, also with no owner read
+    /// at all (off Windows).
+    #[test]
+    fn rediscovery_fires_once_when_the_service_dies() {
+        assert_eq!(
+            rediscovery_trigger(Some(10), Some(10), Some(11), &[], &none()),
+            Some(Rediscovery::ServiceDied(11))
+        );
+        assert_eq!(
+            rediscovery_trigger(
+                Some(10),
+                Some(10),
+                Some(11),
+                &[],
+                &HashSet::from([(11, 0, None)])
+            ),
+            None
+        );
+        assert_eq!(
+            rediscovery_trigger(None, None, Some(11), &[], &none()),
+            Some(Rediscovery::ServiceDied(11))
+        );
+    }
+
+    /// A trigger the in-flight guard rejected is not consumed: it fires on
+    /// the next tick, and stops firing only once its rediscovery started.
+    #[test]
+    fn rediscovery_memory_advances_only_when_a_rediscovery_starts() {
+        let t0 = Instant::now();
+        let mut state = RediscoveryState::default();
+        // Baseline: a first sighting records the owner and fires nothing.
+        assert_eq!(state.trigger(Some(10), None, &[], t0), None);
+        state.observe(Some(10), None, false, t0);
+
+        let owner_change = state.trigger(Some(11), None, &[], t0);
+        assert_eq!(owner_change, Some(Rediscovery::OwnerChanged));
+        state.observe(Some(11), owner_change, false, t0);
+        assert_eq!(
+            state.trigger(Some(11), None, &[], t0),
+            Some(Rediscovery::OwnerChanged),
+            "rejected: fires again next tick"
+        );
+        state.observe(Some(11), owner_change, true, t0);
+        assert_eq!(
+            state.trigger(Some(11), None, &[], t0),
+            None,
+            "started: consumed"
+        );
+
+        // An owner change opens no back-off window, so only the guard matters.
+        let w = rec(12, 1_000);
+        let died = state.trigger(Some(11), None, &[w], t0);
+        assert_eq!(died, Some(Rediscovery::DescendantDied(w)));
+        state.observe(Some(11), died, false, t0);
+        assert_eq!(
+            state.trigger(Some(11), None, &[w], t0),
+            died,
+            "rejected: fires again"
+        );
+        state.observe(Some(11), died, true, t0);
+        assert_eq!(
+            state.trigger(Some(11), None, &[w], t0),
+            None,
+            "started: consumed"
+        );
+    }
+
+    /// A death inside the back-off window is held, not consumed, and fires
+    /// once the window opens; an owner change is never held.
+    #[test]
+    fn rediscovery_deaths_are_rate_limited_and_stay_pending() {
+        let t0 = Instant::now();
+        let mut state = RediscoveryState::default();
+        state.observe(Some(10), None, false, t0);
+        let first = rec(12, 1_000);
+        let fired = state.trigger(Some(10), None, &[first], t0);
+        assert_eq!(fired, Some(Rediscovery::DescendantDied(first)));
+        state.observe(Some(10), fired, true, t0);
+
+        let second = rec(13, 1_001);
+        let soon = t0 + Duration::from_secs(5);
+        assert_eq!(
+            state.trigger(Some(10), Some(14), &[second], soon),
+            None,
+            "deaths are held inside the window"
+        );
+        state.observe(Some(10), None, false, soon);
+        assert_eq!(
+            state.trigger(Some(15), None, &[second], soon),
+            Some(Rediscovery::OwnerChanged),
+            "an owner change is not limited"
+        );
+        let open = t0 + REDISCOVERY_MIN_INTERVAL;
+        assert_eq!(
+            state.trigger(Some(10), Some(14), &[second], open),
+            Some(Rediscovery::ServiceDied(14)),
+            "held, not consumed: fires once the window opens"
+        );
+    }
+
+    /// The window doubles with each death-started rediscovery, 30 s to 5 min.
+    /// A churning tree's passes each find a new but transient entry, dead by
+    /// the next tick, so none resets it: churn keeps backing off.
+    #[test]
+    fn rediscovery_backoff_doubles_under_churn_up_to_the_cap() {
+        assert_eq!(rediscovery_backoff(0), REDISCOVERY_MIN_INTERVAL);
+        assert_eq!(rediscovery_backoff(1), Duration::from_secs(60));
+        assert_eq!(rediscovery_backoff(2), Duration::from_secs(120));
+        assert_eq!(rediscovery_backoff(3), Duration::from_secs(240));
+        assert_eq!(rediscovery_backoff(4), REDISCOVERY_MAX_INTERVAL);
+        assert_eq!(rediscovery_backoff(40), REDISCOVERY_MAX_INTERVAL);
+
+        let mut state = RediscoveryState::default();
+        let mut at = Instant::now();
+        for (round, window) in [30u64, 60, 120, 240, 300, 300].into_iter().enumerate() {
+            let pid = 100 + round as u32;
+            let dying = rec(pid, 1_000 + round as i64);
+            let fired = state.trigger(None, None, &[dying], at);
+            assert_eq!(
+                fired,
+                Some(Rediscovery::DescendantDied(dying)),
+                "round {round}"
+            );
+            state.observe(None, fired, true, at);
+            // The pass found a transient entry; at the next tick it is dead.
+            let transient = rec(pid + 50, 2_000 + round as i64);
+            let pass = DiscoveryPass {
+                seq: round as u64 + 1,
+                new_entries: vec![transient],
+                service_changed: false,
+            };
+            state.note_pass(&pass, &[transient], &[transient]);
+            let next = rec(pid + 1, 3_000 + round as i64);
+            assert_eq!(
+                state.trigger(None, None, &[next], at + Duration::from_secs(window - 1)),
+                None,
+                "round {round}: held for {window} s"
+            );
+            at += Duration::from_secs(window);
+        }
+    }
+
+    /// The back-off resets to the minimum when an entry a pass first found
+    /// is still alive as itself at the next tick, or when a pass changed the
+    /// service pid; each pass is read once.
+    #[test]
+    fn rediscovery_backoff_resets_when_a_new_entry_survives_or_the_service_changes() {
+        for survives in [true, false] {
+            let t0 = Instant::now();
+            let mut state = RediscoveryState::default();
+            // Two death-started passes: the window is now 60 s.
+            let d1 = rec(12, 1_000);
+            let f1 = state.trigger(None, None, &[d1], t0);
+            state.observe(None, f1, true, t0);
+            let t1 = t0 + REDISCOVERY_MIN_INTERVAL;
+            let d2 = rec(13, 1_001);
+            let f2 = state.trigger(None, None, &[d2], t1);
+            assert_eq!(f2, Some(Rediscovery::DescendantDied(d2)));
+            state.observe(None, f2, true, t1);
+
+            let worker = rec(14, 1_002);
+            let pass = if survives {
+                DiscoveryPass {
+                    seq: 2,
+                    new_entries: vec![worker],
+                    service_changed: false,
+                }
+            } else {
+                DiscoveryPass {
+                    seq: 2,
+                    new_entries: Vec::new(),
+                    service_changed: true,
+                }
+            };
+            state.note_pass(&pass, &[worker], &[]);
+            let d3 = rec(15, 1_003);
+            assert_eq!(
+                state.trigger(None, None, &[d3], t1 + REDISCOVERY_MIN_INTERVAL),
+                Some(Rediscovery::DescendantDied(d3)),
+                "reset (survivor: {survives}): back to {REDISCOVERY_MIN_INTERVAL:?}"
+            );
+        }
+    }
+
+    /// Handled deaths are forgotten once no longer tracked, so the memory is
+    /// bounded by the tracked set.
+    #[test]
+    fn rediscovery_memory_forgets_deaths_that_are_no_longer_tracked() {
+        let t0 = Instant::now();
+        let mut state = RediscoveryState::default();
+        let w = rec(12, 1_000);
+        let died = state.trigger(None, None, &[w], t0);
+        state.observe(None, died, true, t0);
+        let later = t0 + REDISCOVERY_MIN_INTERVAL;
+        assert_eq!(state.trigger(None, None, &[w], later), None);
+        state.retain_tracked(&[], None);
+        assert_eq!(
+            state.trigger(None, None, &[w], later),
+            Some(Rediscovery::DescendantDied(w)),
+            "no longer tracked, so no longer remembered"
+        );
+    }
+
+    /// The gate's contract: a second pass WAITS for the first (it does not
+    /// skip), and runs once the first finishes.
+    #[tokio::test]
+    async fn discovery_gate_makes_a_second_pass_wait() {
+        let gate: std::sync::Arc<tokio::sync::Mutex<()>> = std::sync::Arc::default();
+        let first = gate.clone().lock_owned().await;
+        assert!(gate.try_lock().is_err(), "a pass in flight holds the gate");
+        let waiter = tokio::spawn({
+            let gate = gate.clone();
+            async move {
+                let _pass = gate.lock_owned().await;
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "the second pass waits, it does not skip"
+        );
+        drop(first);
+        waiter
+            .await
+            .expect("the second pass ran once the first finished");
+    }
+
+    /// The production pass takes the gate BEFORE it reads the tracked set
+    /// and before it writes the merged one, and KEEPS it: the guard is bound
+    /// to a named variable (`_pass`), never to `_`, which would drop it at
+    /// once. Read from this file's source.
+    #[test]
+    fn discovery_pass_takes_the_gate_before_reading_and_writing_the_tracked_set() {
+        const SRC: &str = include_str!("manager.rs");
+        let mut body: Vec<&str> = Vec::new();
+        for line in SRC.lines() {
+            if body.is_empty() {
+                if line == "    async fn descendant_discovery_once(" {
+                    body.push(line);
+                }
+                continue;
+            }
+            body.push(line);
+            if line == "    }" {
+                break;
+            }
+        }
+        assert_eq!(
+            body.last(),
+            Some(&"    }"),
+            "no complete `descendant_discovery_once` in manager.rs"
+        );
+        let pos = |needle: &str| {
+            body.iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`{needle}` not in descendant_discovery_once:\n{}",
+                        body.join("\n")
+                    )
+                })
+        };
+        // `let _ = …lock_owned().await` drops the guard at once: refused.
+        assert!(
+            !body
+                .iter()
+                .any(|l| l.contains("lock_owned") && l.contains("let _ =")),
+            "the discovery gate's guard is bound to `_`, which releases it at once"
+        );
+        let gate = pos("let _pass = gate.lock_owned().await;");
+        let read = pos("p.runtime.descendant_pids.clone()");
+        let write = pos("p.runtime.descendant_pids = descendants.clone()");
+        assert!(
+            gate < read && read < write,
+            "the gate must be held before the read and the write \
+             (gate {gate}, read {read}, write {write})"
+        );
+    }
+
+    /// The tracked set's change check ignores order.
+    #[test]
+    fn tracked_sets_compare_as_sets() {
+        let (a, b) = (rec(12, 1_000), rec(13, 1_001));
+        assert!(same_tracked_set(&[a, b], &[b, a]));
+        assert!(!same_tracked_set(&[a, b], &[a]));
+        assert!(
+            !same_tracked_set(&[a], &[rec(12, 1_050)]),
+            "a reused pid is a change"
         );
     }
 }

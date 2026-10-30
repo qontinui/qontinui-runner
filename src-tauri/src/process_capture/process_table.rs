@@ -47,8 +47,11 @@
 //! **Kill switch (Windows only).** [`ENV_IN_PROCESS`]`=0` disables the
 //! in-process read on Windows — the snapshot, the command-line read and the
 //! port-owner read — so each takes the circuit-protected PowerShell/WMI path
-//! again. It is ignored elsewhere: off Windows the in-process read is the only
-//! read there is. Read once per process.
+//! again. The port KILL (`health::kill_port_process`) has no such path: its
+//! listener read ([`port_listener_in_process`]) is in-process only, because
+//! the kill path creates no process, so with the switch set every port kill
+//! refuses (and says so). It is ignored elsewhere: off Windows the in-process
+//! read is the only read there is. Read once per process.
 //!
 //! `/health` serves the counters as `processTable` ([`health_json`]).
 
@@ -61,6 +64,7 @@ use std::time::{Duration, Instant};
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 use super::process_tree::ProcessSnapshot;
+pub(crate) use qontinui_runner_lib::peer_user_guard::decode::ListenerOwner;
 
 /// How long one walk's result serves later callers. Two seconds: long enough
 /// that a burst of callers costs one walk, short against every periodic
@@ -89,7 +93,9 @@ const JOIN_WAIT_MARGIN: Duration = Duration::from_secs(4);
 pub(crate) const JOIN_WAIT_MAX: Duration =
     super::process_tree::WMI_SNAPSHOT_TIMEOUT.saturating_add(JOIN_WAIT_MARGIN);
 
-/// `0` disables the in-process read on Windows (see the module docs).
+/// `0` disables the in-process read on Windows (see the module docs): reads
+/// take the circuit-protected external fallback, and port kills refuse (no
+/// spawn on the kill path).
 pub(crate) const ENV_IN_PROCESS: &str = "QONTINUI_PROCESS_TABLE_IN_PROCESS";
 
 /// The provider's tunables. Production uses [`Config::default`]; tests pass
@@ -766,6 +772,26 @@ pub(crate) fn port_owner(port: u16) -> Option<u32> {
     }
 }
 
+/// The LISTENING socket on local TCP `port` with its owner AND the socket's
+/// own creation time (Windows: the owner-MODULE listener class of the same
+/// `GetExtendedTcpTable` binding), read in-process ALONE: there is no
+/// external fallback. `Err` when the table cannot be read, or the
+/// [`ENV_IN_PROCESS`] kill switch disables the in-process read: UNKNOWN, as
+/// distinct from `Ok(None)`, nothing listens. The port kill
+/// (`health::kill_port_process`) reads this and refuses on `Err`: the kill
+/// path creates no process, and a kill is not decided from a spawned probe's
+/// answer. Off Windows there is no such read (`Err`).
+pub(crate) fn port_listener_in_process(port: u16) -> Result<Option<ListenerOwner>, String> {
+    if in_process_disabled() {
+        return Err(format!("{ENV_IN_PROCESS}=0 disables the in-process read"));
+    }
+    platform::listening_port_listener(port).map_err(|why| {
+        let why = format!("port {port}: {why}");
+        provider().note_read_failure("port-listener", &why);
+        why
+    })
+}
+
 /// Whether `name` is a node runtime image (the external-claude scan's filter).
 fn is_node_image(name: &str) -> bool {
     if cfg!(windows) {
@@ -834,13 +860,14 @@ const FILETIME_UNIX_EPOCH_SECS: u64 = 11_644_473_600;
 const FILETIME_TICKS_PER_SEC: u64 = 10_000_000;
 
 /// Unix seconds as the FILETIME at the start of that second.
-fn unix_secs_to_filetime(secs: u64) -> u64 {
+pub(super) fn unix_secs_to_filetime(secs: u64) -> u64 {
     secs.saturating_add(FILETIME_UNIX_EPOCH_SECS)
         .saturating_mul(FILETIME_TICKS_PER_SEC)
 }
 
-/// A FILETIME as Unix seconds, truncated.
-fn filetime_to_unix_secs(ft: u64) -> i64 {
+/// A FILETIME as Unix seconds, truncated. Also the unit `health`'s tree kill
+/// compares a held handle's creation time in against a recorded one.
+pub(super) fn filetime_to_unix_secs(ft: u64) -> i64 {
     i64::try_from(ft / FILETIME_TICKS_PER_SEC).unwrap_or(i64::MAX) - FILETIME_UNIX_EPOCH_SECS as i64
 }
 
@@ -1013,6 +1040,15 @@ mod platform {
             .map_err(|e| e.as_str().to_string())
     }
 
+    /// The owner-MODULE listener read of the same binding (owner + the
+    /// socket's creation time).
+    pub(super) fn listening_port_listener(
+        port: u16,
+    ) -> Result<Option<super::ListenerOwner>, String> {
+        qontinui_runner_lib::peer_user_guard::windows::listening_port_owner_bind(port)
+            .map_err(|e| e.as_str().to_string())
+    }
+
     /// The PowerShell/WMI snapshot. An empty table is a failed fallback.
     pub(super) async fn fallback_snapshot() -> Option<ProcessSnapshot> {
         let began_ms = chrono::Utc::now().timestamp_millis();
@@ -1055,6 +1091,13 @@ mod platform {
 
     /// No in-process listener table here (Unix callers use `lsof`).
     pub(super) fn listening_port_owner(_port: u16) -> Result<Option<u32>, String> {
+        Err("no in-process listener-table read on this platform".to_string())
+    }
+
+    /// No in-process listener table here.
+    pub(super) fn listening_port_listener(
+        _port: u16,
+    ) -> Result<Option<super::ListenerOwner>, String> {
         Err("no in-process listener-table read on this platform".to_string())
     }
 
@@ -1629,6 +1672,7 @@ mod tests {
             vec![crate::process_capture::process_tree::PidWithSpawnedAt {
                 pid: 77,
                 spawned_at_unix: 1_000,
+                spawned_at_ft: None,
             }],
         );
         assert!(crate::process_capture::orphan_state::reclaim_targets(&state, &s).is_err());
@@ -1780,6 +1824,70 @@ mod tests {
         ];
         assert_eq!(listener_owner_pid(rows.clone(), 8000), Some(902));
         assert_eq!(listener_owner_pid(rows, 8002), None);
+    }
+
+    /// The real owner-MODULE read, through a socket this test process
+    /// listens on: the owner is this process, and the socket's creation time
+    /// lies between this process's own creation and now — the ordering the
+    /// port kill's owner proof (`created <= bind_ft`) relies on.
+    #[cfg(windows)]
+    #[test]
+    fn process_table_listener_read_names_this_process_and_a_socket_time_after_its_creation() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let me = std::process::id();
+        let created = platform::precise_creation_filetime(me).expect("own creation time");
+        let found = port_listener_in_process(port)
+            .expect("a readable listener table")
+            .expect("this test's own listener");
+        let now = qontinui_runner_win32::holder_spawn::filetime_now();
+        assert_eq!(found.pid, me);
+        assert!(
+            created <= found.bind_ft && found.bind_ft <= now,
+            "creation {created} <= socket {} <= now {now}",
+            found.bind_ft
+        );
+    }
+
+    /// The owner-MODULE decoder selects the same row and keeps the socket's
+    /// creation time; a negative timestamp reads as `0` (not reported), which
+    /// the port kill refuses.
+    #[test]
+    fn process_table_module_listener_decoder_keeps_the_socket_creation_time() {
+        use qontinui_runner_lib::peer_user_guard::decode::{listener_owner, ListenerOwner, WinRow};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let at = |port| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let row = |port, state, pid, created: i64| {
+            (
+                WinRow {
+                    local: at(port),
+                    remote: at(0),
+                    state,
+                    pid,
+                },
+                created,
+            )
+        };
+        let rows = vec![
+            row(8000, 5, 900, 11), // ESTABLISHED on the port: not the owner
+            row(8000, 2, 0, 12),   // LISTEN with no pid: skipped
+            row(8000, 2, 902, 134_378_302_137_147_198),
+        ];
+        assert_eq!(
+            listener_owner(rows.clone(), 8000),
+            Some(ListenerOwner {
+                pid: 902,
+                bind_ft: 134_378_302_137_147_198
+            })
+        );
+        assert_eq!(listener_owner(rows, 8001), None);
+        assert_eq!(
+            listener_owner(vec![row(8000, 2, 903, -1)], 8000),
+            Some(ListenerOwner {
+                pid: 903,
+                bind_ft: 0
+            })
+        );
     }
 
     /// The real walk lists this test process with its true parent and, on

@@ -25,7 +25,9 @@ use windows_sys::Win32::Foundation::{
     HANDLE, NO_ERROR,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCPROW_OWNER_PID, TCP_TABLE_CLASS,
+    GetExtendedTcpTable, MIB_TCP6ROW_OWNER_MODULE, MIB_TCP6ROW_OWNER_PID,
+    MIB_TCP6TABLE_OWNER_MODULE, MIB_TCPROW_OWNER_MODULE, MIB_TCPROW_OWNER_PID,
+    MIB_TCPTABLE_OWNER_MODULE, TCP_TABLE_CLASS, TCP_TABLE_OWNER_MODULE_LISTENER,
     TCP_TABLE_OWNER_PID_CONNECTIONS, TCP_TABLE_OWNER_PID_LISTENER,
 };
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
@@ -36,7 +38,8 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use super::decode::{
-    filetime_to_system_time, listener_owner_pid, owner_pid, win_ipv4, win_port, WinRow,
+    filetime_to_system_time, listener_owner, listener_owner_pid, owner_pid, win_ipv4, win_port,
+    ListenerOwner, WinRow,
 };
 use super::{LocalUser, OwnerResolver, Resolution, Unresolved};
 
@@ -65,8 +68,12 @@ static V6_SIZE_HINT: AtomicU32 = AtomicU32::new(0);
 /// The same for the listener-class tables, which are far smaller.
 static V4_LISTENER_SIZE_HINT: AtomicU32 = AtomicU32::new(0);
 static V6_LISTENER_SIZE_HINT: AtomicU32 = AtomicU32::new(0);
+/// And for the owner-MODULE listener tables (the port kill's read).
+static V4_LISTENER_MODULE_SIZE_HINT: AtomicU32 = AtomicU32::new(0);
+static V6_LISTENER_MODULE_SIZE_HINT: AtomicU32 = AtomicU32::new(0);
 
-/// Read one family's owner-PID table of `class` into raw bytes.
+/// Read one family's TCP table of `class` (owner-PID or owner-MODULE) into
+/// raw bytes.
 fn read_table(
     family: u32,
     class: TCP_TABLE_CLASS,
@@ -115,6 +122,102 @@ pub fn listening_port_owner(port: u16) -> Result<Option<u32>, Unresolved> {
     }
     let v6 = rows_v6_of(TCP_TABLE_OWNER_PID_LISTENER, &V6_LISTENER_SIZE_HINT)?;
     Ok(listener_owner_pid(v6, port))
+}
+
+/// The LISTENING socket on local TCP `port` (IPv4 first, then IPv6): its
+/// owning pid AND the socket's own creation time (`liCreateTimestamp`), from
+/// the owner-MODULE listener class of the same `GetExtendedTcpTable` binding.
+/// The runner's port kill reads this: a process created after the socket
+/// cannot be the one that created it, so the time proves whether the owner
+/// pid still names the socket's owner. The table keeps naming an owner that
+/// has exited while a child it handed the socket to still listens (measured
+/// 2026-10-30; plan
+/// `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`).
+/// `Ok(None)` when nothing listens there; `Err` when a table is unreadable.
+/// The guard's own reads are untouched.
+pub fn listening_port_owner_bind(port: u16) -> Result<Option<ListenerOwner>, Unresolved> {
+    let v4 = module_listener_rows_v4()?;
+    if let Some(owner) = listener_owner(v4, port) {
+        return Ok(Some(owner));
+    }
+    let v6 = module_listener_rows_v6()?;
+    Ok(listener_owner(v6, port))
+}
+
+fn module_listener_rows_v4() -> Result<Vec<(WinRow, i64)>, Unresolved> {
+    let buf = read_table(
+        AF_INET,
+        TCP_TABLE_OWNER_MODULE_LISTENER,
+        &V4_LISTENER_MODULE_SIZE_HINT,
+    )?;
+    let base = buf.as_ptr().cast::<u8>();
+    // The rows hold an i64 and so start 8-aligned, not at byte 4 as the
+    // owner-PID rows do: take the offset from the table type itself.
+    let offset = std::mem::offset_of!(MIB_TCPTABLE_OWNER_MODULE, table);
+    // SAFETY: a successful call wrote a MIB_TCPTABLE_OWNER_MODULE: a u32 count
+    // followed, at `offset`, by `count` rows, all inside `buf` (at least 8
+    // bytes, so `base + offset` is at most one past its end).
+    let count = unsafe { base.cast::<u32>().read_unaligned() } as usize;
+    let first = unsafe { base.add(offset) }.cast::<MIB_TCPROW_OWNER_MODULE>();
+    let max =
+        (buf.len() * 8).saturating_sub(offset) / std::mem::size_of::<MIB_TCPROW_OWNER_MODULE>();
+    Ok((0..count.min(max))
+        .map(|i| {
+            // SAFETY: `i < count` and the row lies inside `buf` (bounded by `max`).
+            let r = unsafe { first.add(i).read_unaligned() };
+            (
+                WinRow {
+                    local: SocketAddr::new(
+                        IpAddr::V4(win_ipv4(r.dwLocalAddr)),
+                        win_port(r.dwLocalPort),
+                    ),
+                    remote: SocketAddr::new(
+                        IpAddr::V4(win_ipv4(r.dwRemoteAddr)),
+                        win_port(r.dwRemotePort),
+                    ),
+                    state: r.dwState,
+                    pid: r.dwOwningPid,
+                },
+                r.liCreateTimestamp,
+            )
+        })
+        .collect())
+}
+
+fn module_listener_rows_v6() -> Result<Vec<(WinRow, i64)>, Unresolved> {
+    let buf = read_table(
+        AF_INET6,
+        TCP_TABLE_OWNER_MODULE_LISTENER,
+        &V6_LISTENER_MODULE_SIZE_HINT,
+    )?;
+    let base = buf.as_ptr().cast::<u8>();
+    let offset = std::mem::offset_of!(MIB_TCP6TABLE_OWNER_MODULE, table);
+    // SAFETY: as in module_listener_rows_v4, for MIB_TCP6TABLE_OWNER_MODULE.
+    let count = unsafe { base.cast::<u32>().read_unaligned() } as usize;
+    let first = unsafe { base.add(offset) }.cast::<MIB_TCP6ROW_OWNER_MODULE>();
+    let max =
+        (buf.len() * 8).saturating_sub(offset) / std::mem::size_of::<MIB_TCP6ROW_OWNER_MODULE>();
+    Ok((0..count.min(max))
+        .map(|i| {
+            // SAFETY: bounded by `count` and `max`.
+            let r = unsafe { first.add(i).read_unaligned() };
+            (
+                WinRow {
+                    local: SocketAddr::new(
+                        IpAddr::V6(Ipv6Addr::from(r.ucLocalAddr)),
+                        win_port(r.dwLocalPort),
+                    ),
+                    remote: SocketAddr::new(
+                        IpAddr::V6(Ipv6Addr::from(r.ucRemoteAddr)),
+                        win_port(r.dwRemotePort),
+                    ),
+                    state: r.dwState,
+                    pid: r.dwOwningPid,
+                },
+                r.liCreateTimestamp,
+            )
+        })
+        .collect())
 }
 
 fn rows_v4_of(class: TCP_TABLE_CLASS, hint: &AtomicU32) -> Result<Vec<WinRow>, Unresolved> {
