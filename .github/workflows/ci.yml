@@ -163,6 +163,71 @@ env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
+  # Where the two heavy Windows jobs run (plan
+  # 2026-10-27-coord-routes-ci-jobs-by-runner-capability, Phase 7). coord's
+  # anonymous `GET /coord/ci/route` compares each job's measured requirement
+  # with every runner class it may run on and answers one of four lanes:
+  # `hosted` (it fits on windows-latest), `self_hosted` (it does not, and a
+  # self-hosted Windows host registered here does -- never for a fork
+  # pull_request), `fail_fast` (it fits nowhere: the job fails in seconds with
+  # a `ci-capacity` message instead of OOMing 40 minutes in), or `static`
+  # (anything coord does not know). The script is a vendored copy of
+  # qontinui-coord's `.github/scripts/route_ci_job.py`; its header is the
+  # contract.
+  #
+  # THIS JOB MUST NOT FAIL. A failed `needs:` job SKIPS its dependant, and a
+  # skipped required check reads as a pass. So the script always exits 0 with
+  # outputs written, and each dependant additionally runs on `!cancelled()`
+  # with its static default for an empty output.
+  #
+  # A route job on a hosted runner is refused by the spending cap, and its
+  # dependant then gets an EMPTY output -- so it must run where the dependants'
+  # static default runs. That default is `windows-latest`, a standard hosted
+  # runner, which is free on this PUBLIC repo; so this job runs on the cheapest
+  # standard hosted runner. Move it with the dependants' default, never apart.
+  #
+  # Composes with plan 2026-09-29-ci-lanes-routing-and-merge-train-speed: Lane
+  # B (ci_node) is authoritative for no job today, so this answers every event;
+  # where Lane B comes to own `test (windows-latest)` on candidate refs, that
+  # plan skips the GitHub twin there and this answer is simply not read.
+  route:
+    name: Route heavy jobs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      test_windows_runs_on: ${{ steps.test_windows.outputs.test_windows_runs_on }}
+      test_windows_lane: ${{ steps.test_windows.outputs.test_windows_lane }}
+      test_windows_reason: ${{ steps.test_windows.outputs.test_windows_reason }}
+      clippy_windows_runs_on: ${{ steps.clippy_windows.outputs.clippy_windows_runs_on }}
+      clippy_windows_lane: ${{ steps.clippy_windows.outputs.clippy_windows_lane }}
+      clippy_windows_reason: ${{ steps.clippy_windows.outputs.clippy_windows_reason }}
+    steps:
+      # Only the script (cone mode: the root files plus .github/scripts): a
+      # full checkout would be most of this job's cost.
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Route test (windows-latest)
+        id: test_windows
+        continue-on-error: true
+        shell: bash
+        env:
+          ROUTE_JOB: test (windows-latest)
+          ROUTE_DEFAULT: windows-latest
+          ROUTE_OUTPUT_PREFIX: test_windows_
+        run: python3 -B .github/scripts/route_ci_job.py || true
+
+      - name: Route Clippy (windows)
+        id: clippy_windows
+        continue-on-error: true
+        shell: bash
+        env:
+          ROUTE_JOB: Clippy (windows)
+          ROUTE_DEFAULT: windows-latest
+          ROUTE_OUTPUT_PREFIX: clippy_windows_
+        run: python3 -B .github/scripts/route_ci_job.py || true
+
   test:
     strategy:
       # Surface platform-specific failures independently. Default fail-fast
@@ -177,7 +242,13 @@ jobs:
         # when cross-platform demos / mac users matter.
         platform: [ubuntu-22.04, windows-latest]
 
-    runs-on: ${{ matrix.platform }}
+    # The windows leg runs where the `route` job says (its header above); the
+    # ubuntu leg is not routed. An empty route output (the route job did not
+    # run) falls back to the static `windows-latest`. `!cancelled()` so a
+    # failed route job cannot SKIP this required check.
+    needs: route
+    if: ${{ !cancelled() }}
+    runs-on: ${{ matrix.platform == 'windows-latest' && fromJSON(needs.route.outputs.test_windows_runs_on || '"windows-latest"') || matrix.platform }}
 
     # Backstop cap for any step in this job that is not individually bounded.
     # This job previously had NO job-level timeout, so the 4h24m apt hang above
@@ -223,6 +294,19 @@ jobs:
     timeout-minutes: 180
 
     steps:
+      # coord's `fail_fast` lane: the windows leg's requirement is Incapable
+      # on every runner class it may run on, so it fails here in seconds with
+      # the shortfall named rather than OOMing 40 minutes into the build. The
+      # reason travels through env, never interpolated into the script.
+      - name: CI capacity (route said fail_fast)
+        if: matrix.platform == 'windows-latest' && needs.route.outputs.test_windows_lane == 'fail_fast'
+        shell: bash
+        env:
+          ROUTE_REASON: ${{ needs.route.outputs.test_windows_reason }}
+        run: |
+          echo "::error title=ci-capacity (not a verdict on this PR)::${ROUTE_REASON}"
+          exit 1
+
       # Full history, blobless: workspace_assumptions_are_enumerated.rs takes its
       # swap-rule base from `merge-base HEAD origin/main`, which a depth-1 clone
       # cannot compute (it would print SWAP RULE UNKNOWN and enforce nothing).
@@ -456,8 +540,14 @@ jobs:
       # revert the test step to JOBS=1 and keep this pagefile. (That happened
       # on 2026-10-27, run 40449994591; the test step is now JOBS=1 on every
       # leg.)
+      # Hosted runners ONLY (`runner.environment`, never the route `lane`: the
+      # lane is empty when the route job did not run, and this leg then runs on
+      # the hosted default that needs the pagefile). The action resizes the
+      # Windows pagefile on the hosted image's `D:` scratch disk; on a
+      # self-hosted host it would rewrite the machine's own paging setup, and a
+      # host is routed here only because its own commit limit already fits.
       - name: Configure pagefile (Windows — guard against link-time OOM)
-        if: matrix.platform == 'windows-latest'
+        if: matrix.platform == 'windows-latest' && runner.environment == 'github-hosted'
         uses: al-cheb/configure-pagefile-action@v1.4
         with:
           minimum-size: 32GB
@@ -873,7 +963,11 @@ jobs:
           #     on purpose. The legs are throttled for different reasons, and
           #     ci_rust_test_steps_split.rs pins that each stays separately
           #     tunable.
-          CARGO_BUILD_JOBS: ${{ matrix.platform == 'windows-latest' && '1' || '1' }}
+          #     The windows arm is read per RUNNER as well (route Phase 7): a
+          #     hosted windows leg is the one the ladder above sized, and a
+          #     rerouted self-hosted leg is placed only where it Fits. Both are
+          #     '1' until #2408's revert is earned on a class that fits at 2.
+          CARGO_BUILD_JOBS: ${{ (matrix.platform == 'windows-latest' && runner.environment == 'github-hosted') && '1' || '1' }}
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             echo "=== free / df before cargo test ==="
@@ -1507,8 +1601,12 @@ jobs:
           python3 scripts/tests/ci-integrity/test-surface.py
         shell: bash
 
+      # Hosted runners ONLY: it boots a second runner exe on the host (ports
+      # from 9877, the CI account's config dir). A disposable hosted VM is the
+      # only host where that is free of side effects; a rerouted self-hosted
+      # leg skips it, and the hosted legs keep the gate.
       - name: SDK↔runner contract smoke (direct-exe)
-        if: matrix.platform == 'windows-latest'
+        if: matrix.platform == 'windows-latest' && runner.environment == 'github-hosted'
         env:
           QONTINUI_ALLOW_NO_DB: "1"
         run: powershell -File scripts/contract-smoke.ps1 -DirectExe target/debug/qontinui-runner.exe -Profile ci -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts
@@ -1535,12 +1633,26 @@ jobs:
   # GB saves against the 10 GB repo cache cap.
   clippy-windows:
     name: Clippy (windows)
-    runs-on: windows-latest
+    # Routed like the `test` windows leg (see the `route` job): an empty
+    # output falls back to the static `windows-latest`, and `!cancelled()`
+    # keeps a failed route job from skipping this check.
+    needs: route
+    if: ${{ !cancelled() }}
+    runs-on: ${{ fromJSON(needs.route.outputs.clippy_windows_runs_on || '"windows-latest"') }}
     # 88 successful runs, 2026-08-08..08-20: p50 14.7m, p90 16.5m, max 19.4m.
     # 45 min = p90 + ~28 min headroom (2.3x the worst observed success).
     # Previously unbounded, i.e. GitHub's 360-minute default.
     timeout-minutes: 45
     steps:
+      - name: CI capacity (route said fail_fast)
+        if: needs.route.outputs.clippy_windows_lane == 'fail_fast'
+        shell: bash
+        env:
+          ROUTE_REASON: ${{ needs.route.outputs.clippy_windows_reason }}
+        run: |
+          echo "::error title=ci-capacity (not a verdict on this PR)::${ROUTE_REASON}"
+          exit 1
+
       - uses: actions/checkout@v5
 
       # Rust path-dep on ../../qontinui-schemas/rust + the SDK↔runner manifest
@@ -1581,7 +1693,14 @@ jobs:
           toolchain: "1.95.0"
           components: rustfmt, clippy
 
+      # Hosted runners ONLY (`runner.environment`, never the route `lane`: the
+      # lane is empty when the route job did not run, and this job then runs on
+      # the hosted default that needs the pagefile). The action resizes the
+      # Windows pagefile on the hosted image's `D:` scratch disk; on a
+      # self-hosted host it would rewrite the machine's own paging setup, and a
+      # host is routed here only because its own commit limit already fits.
       - name: Configure pagefile (Windows — guard against link-time OOM)
+        if: runner.environment == 'github-hosted'
         uses: al-cheb/configure-pagefile-action@v1.4
         with:
           minimum-size: 32GB
