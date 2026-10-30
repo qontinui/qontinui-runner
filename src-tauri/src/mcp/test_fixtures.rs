@@ -1908,6 +1908,7 @@ fn record_from_seed(
         // age without knowing the wall clock. Absent means absent; these are
         // no longer hardcoded to `None`.
         restore_pending_at: seed.restore_pending_at.map(|off| now_ms + off),
+        awaiting_account_since: None,
         confirmed_at: seed.confirmed_at.map(|off| now_ms + off),
         handle: None,
         account_label: None,
@@ -2391,7 +2392,7 @@ async fn agent_token_view_handler(
 //
 // [`crate::terminal::transcript::read_user_prompts`] builds
 // `<config_dir>/projects/<encoded(project_path)>/<session_id>.jsonl`, where the
-// encoding is `encode_project_path` — a PRIVATE fn. The public handle onto the
+// encoding is `encode_project_path` (crate-private). The public handle onto the
 // same construction is [`crate::terminal::transcript::session_transcript_path`],
 // which this route calls. Nothing here reimplements the encoding, so a change
 // to it cannot silently split the writer from the reader.

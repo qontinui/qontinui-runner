@@ -35,6 +35,7 @@ import { AppWindow, Download, Maximize2, Minimize2, RefreshCw, Tag, X } from "lu
 import { useTerminalSession, useTransitionEffects, useZoneMetadata } from "./contexts";
 import { useWindowAssignments } from "./contexts/WindowAssignmentsContext";
 import { useTerminalWindowActions, type RunnerWindowRecord } from "./useTerminalWindowActions";
+import { RemoteTabEndAction } from "./RemoteSessionEndFlow";
 
 interface ZoneHoverActionsProps {
   zoneIdx: number;
@@ -76,7 +77,7 @@ export function ZoneHoverActions({
   inline,
 }: ZoneHoverActionsProps) {
   const session = useTerminalSession();
-  const { zoneLayout, closeTerminal, sessionStates } = session;
+  const { zoneLayout, closeTerminal, sessionStates, tabs } = session;
   const transitionEffects = useTransitionEffects();
   const { labelsAndTags } = useZoneMetadata();
   const { ownerOf } = useWindowAssignments();
@@ -90,6 +91,9 @@ export function ZoneHoverActions({
   const state = tabId ? (sessionStates[tabId] ?? "idle") : "idle";
   const canRestart = !!tabId && (state === "completed" || state === "error");
   const hasTab = !!tabId;
+  // Set only for a tab mirroring a session on ANOTHER device — it gets the
+  // "End on remote session" action beside close.
+  const remoteTab = tabId ? tabs.find((t) => t.id === tabId && !!t.remote) : undefined;
 
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [showLabelInput, setShowLabelInput] = useState(false);
@@ -394,6 +398,11 @@ export function ZoneHoverActions({
             </div>
           )}
         </div>
+
+        {/* End on remote — remote tabs only. Close keeps meaning DETACH (plan
+            `2026-09-30-close-remote-sessions-from-the-local-runner` D1); this
+            is the separate, named, confirmed action that ENDS the session. */}
+        {remoteTab && <RemoteTabEndAction tab={remoteTab} />}
 
         {/* Close — also the addressable dismiss for an in-zone exited
             tombstone. Stamped per-tab so automation can dismiss a specific

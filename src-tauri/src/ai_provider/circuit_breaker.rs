@@ -13,11 +13,24 @@
 //! The global `PROVIDER_CIRCUIT_BREAKERS` registry tracks per-provider state.
 //! Call `record_success`/`record_failure` after each AI call, and check
 //! `is_available` before dispatching.
+//!
+//! # One state machine
+//!
+//! [`CircuitBreaker`] is a thin adapter over the runner's shared breaker core,
+//! `qontinui_runner_lib::circuit` (plan
+//! `2026-10-19-runner-pg-unreachable-costs-every-caller-a-pool-timeout` D8,
+//! Phase 7), in its caller-permit configuration: the first caller after the
+//! open timeout is admitted as the probe. The PostgreSQL breaker runs the same
+//! core in its background-prober configuration. This file keeps only what is
+//! AI-specific: the provider registry, the state-change broadcast, and the
+//! failover-switch dedup.
 
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use qontinui_runner_lib::circuit::{
+    Admission, Backoff, Circuit, CircuitConfig, CircuitState as CoreState, Outcome, ProbeMode,
+};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
@@ -90,6 +103,24 @@ impl Default for CircuitBreakerConfig {
     }
 }
 
+impl CircuitBreakerConfig {
+    /// The shared core's configuration: a FIXED open timeout (backoff factor
+    /// 1) and caller-permit probing.
+    fn core(&self) -> CircuitConfig {
+        CircuitConfig {
+            failure_threshold: self.failure_threshold,
+            success_threshold: self.success_threshold,
+            backoff: Backoff {
+                initial: self.open_timeout,
+                factor: 1,
+                cap: self.open_timeout,
+            },
+            half_open_max_probes: self.half_open_max_probes,
+            probe_mode: ProbeMode::CallerPermit,
+        }
+    }
+}
+
 // ============================================================================
 // Circuit State
 // ============================================================================
@@ -103,6 +134,16 @@ pub enum CircuitState {
     Open,
     /// Testing recovery — limited probe requests allowed.
     HalfOpen,
+}
+
+impl From<CoreState> for CircuitState {
+    fn from(s: CoreState) -> Self {
+        match s {
+            CoreState::Closed => CircuitState::Closed,
+            CoreState::Open => CircuitState::Open,
+            CoreState::HalfOpen => CircuitState::HalfOpen,
+        }
+    }
 }
 
 impl std::fmt::Display for CircuitState {
@@ -119,20 +160,13 @@ impl std::fmt::Display for CircuitState {
 // Circuit Breaker
 // ============================================================================
 
-/// Circuit breaker for a single AI provider.
+/// Circuit breaker for a single AI provider: the shared core plus the
+/// provider's name for logging and state-change events.
 pub struct CircuitBreaker {
-    /// Current state of the circuit.
-    state: std::sync::RwLock<CircuitState>,
-    /// Number of consecutive failures (in Closed state).
-    consecutive_failures: AtomicU32,
-    /// Number of consecutive successes (in HalfOpen state).
-    consecutive_successes: AtomicU32,
-    /// Number of active probe requests (in HalfOpen state).
-    active_probes: AtomicU32,
-    /// When the circuit transitioned to Open state.
-    opened_at: std::sync::RwLock<Option<Instant>>,
-    /// Configuration.
-    config: CircuitBreakerConfig,
+    core: Circuit,
+    /// Serialises each check-transition-emit sequence, so a state change is
+    /// broadcast exactly once even when two threads race it.
+    transition_lock: Mutex<()>,
     /// Provider identifier (for logging).
     provider_name: String,
 }
@@ -141,120 +175,73 @@ impl CircuitBreaker {
     /// Create a new circuit breaker for the given provider.
     pub fn new(provider_name: String, config: CircuitBreakerConfig) -> Self {
         Self {
-            state: std::sync::RwLock::new(CircuitState::Closed),
-            consecutive_failures: AtomicU32::new(0),
-            consecutive_successes: AtomicU32::new(0),
-            active_probes: AtomicU32::new(0),
-            opened_at: std::sync::RwLock::new(None),
-            config,
+            core: Circuit::new(config.core()),
+            transition_lock: Mutex::new(()),
             provider_name,
         }
+    }
+
+    /// Run one core operation and broadcast the transition it caused, if any.
+    fn transition<T>(&self, op: impl FnOnce(&Circuit) -> T) -> T {
+        let _g = self
+            .transition_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let before = self.state();
+        let out = op(&self.core);
+        let after = self.state();
+        if before != after {
+            match after {
+                CircuitState::Open => warn!(
+                    "Circuit breaker OPEN for '{}' (was {before}). Last error: {}",
+                    self.provider_name,
+                    self.core.snapshot().last_error.unwrap_or_default()
+                ),
+                CircuitState::HalfOpen => info!(
+                    "Circuit breaker HALF-OPEN for '{}': timeout elapsed, allowing probe",
+                    self.provider_name
+                ),
+                CircuitState::Closed => info!(
+                    "Circuit breaker CLOSED for '{}' (was {before})",
+                    self.provider_name
+                ),
+            }
+            emit_state_change(&self.provider_name, after);
+        }
+        out
     }
 
     /// Check if the provider is available for requests.
     ///
     /// Returns `true` if the circuit is Closed or if a HalfOpen probe is allowed.
     /// Returns `false` if the circuit is Open (fail fast).
-    ///
-    /// Holds the write lock for the entire check-transition-probe sequence to
-    /// prevent TOCTOU races where multiple threads could simultaneously
-    /// transition from Open to HalfOpen.
     pub fn is_available(&self) -> bool {
-        let mut state = self.state.write().unwrap();
-        match *state {
-            CircuitState::Closed => true,
-            CircuitState::Open => {
-                // Check if the open timeout has elapsed
-                if self.should_transition_to_half_open_inner() {
-                    info!(
-                        "Circuit breaker HALF-OPEN for '{}': timeout elapsed, allowing probe",
-                        self.provider_name
-                    );
-                    *state = CircuitState::HalfOpen;
-                    self.consecutive_successes.store(0, Ordering::Relaxed);
-                    self.active_probes.store(0, Ordering::Relaxed);
-                    emit_state_change(&self.provider_name, CircuitState::HalfOpen);
-                    // Allow one probe
-                    self.try_acquire_probe()
-                } else {
-                    false
-                }
-            }
-            CircuitState::HalfOpen => self.try_acquire_probe(),
+        if self.core.is_closed() {
+            return true;
         }
+        self.transition(|c| !matches!(c.allow(), Admission::Reject(_)))
     }
 
     /// Get the current circuit state.
     pub fn state(&self) -> CircuitState {
-        *self.state.read().unwrap()
+        self.core.state().into()
     }
 
     /// Record a successful request. Transitions HalfOpen → Closed if enough
     /// consecutive successes are recorded.
     pub fn record_success(&self) {
-        let mut state = self.state.write().unwrap();
-        match *state {
-            CircuitState::Closed => {
-                // Reset failure counter on success
-                self.consecutive_failures.store(0, Ordering::Relaxed);
-            }
-            CircuitState::HalfOpen => {
-                self.release_probe();
-                let successes = self.consecutive_successes.fetch_add(1, Ordering::SeqCst) + 1;
-                if successes >= self.config.success_threshold {
-                    info!(
-                        "Circuit breaker CLOSED for '{}': {} consecutive successes in HalfOpen",
-                        self.provider_name, self.config.success_threshold
-                    );
-                    *state = CircuitState::Closed;
-                    self.consecutive_failures.store(0, Ordering::Relaxed);
-                    self.consecutive_successes.store(0, Ordering::Relaxed);
-                    self.active_probes.store(0, Ordering::Relaxed);
-                    *self.opened_at.write().unwrap() = None;
-                    emit_state_change(&self.provider_name, CircuitState::Closed);
-                }
-            }
-            CircuitState::Open => {}
-        }
+        self.transition(|c| c.record(Outcome::Success));
     }
 
     /// Record a failed request. May transition Closed → Open or HalfOpen → Open.
     pub fn record_failure(&self, error_msg: &str) {
-        let mut state = self.state.write().unwrap();
-        match *state {
-            CircuitState::Closed => {
-                let failures = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
-                if failures >= self.config.failure_threshold {
-                    warn!(
-                        "Circuit breaker OPENING for '{}': {} consecutive failures (threshold: {}). Last error: {}",
-                        self.provider_name, failures, self.config.failure_threshold, error_msg
-                    );
-                    *state = CircuitState::Open;
-                    *self.opened_at.write().unwrap() = Some(Instant::now());
-                    self.consecutive_successes.store(0, Ordering::Relaxed);
-                    self.active_probes.store(0, Ordering::Relaxed);
-                    emit_state_change(&self.provider_name, CircuitState::Open);
-                } else {
-                    debug!(
-                        "Circuit breaker '{}': failure {}/{} — {}",
-                        self.provider_name, failures, self.config.failure_threshold, error_msg
-                    );
-                }
-            }
-            CircuitState::HalfOpen => {
-                self.release_probe();
-                warn!(
-                    "Circuit breaker RE-OPENING for '{}': probe failed in HalfOpen — {}",
-                    self.provider_name, error_msg
-                );
-                *state = CircuitState::Open;
-                *self.opened_at.write().unwrap() = Some(Instant::now());
-                self.consecutive_successes.store(0, Ordering::Relaxed);
-                self.active_probes.store(0, Ordering::Relaxed);
-                emit_state_change(&self.provider_name, CircuitState::Open);
-            }
-            CircuitState::Open => {}
+        if self.core.is_closed() {
+            debug!(
+                "Circuit breaker '{}': failure recorded — {}",
+                self.provider_name, error_msg
+            );
         }
+        self.transition(|c| c.record(Outcome::TripFailure(error_msg.to_string())));
     }
 
     /// Manually reset the circuit to Closed state.
@@ -263,49 +250,12 @@ impl CircuitBreaker {
             "Circuit breaker RESET for '{}': manually closed",
             self.provider_name
         );
-        let mut state = self.state.write().unwrap();
-        *state = CircuitState::Closed;
-        self.consecutive_failures.store(0, Ordering::Relaxed);
-        self.consecutive_successes.store(0, Ordering::Relaxed);
-        self.active_probes.store(0, Ordering::Relaxed);
-        *self.opened_at.write().unwrap() = None;
+        let _g = self
+            .transition_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        self.core.reset();
         emit_state_change(&self.provider_name, CircuitState::Closed);
-    }
-
-    // --- Private helpers ---
-
-    /// Check if the open timeout has elapsed. Safe to call while holding
-    /// the state write lock (only acquires `opened_at` read lock).
-    fn should_transition_to_half_open_inner(&self) -> bool {
-        if let Some(opened) = *self.opened_at.read().unwrap() {
-            opened.elapsed() >= self.config.open_timeout
-        } else {
-            false
-        }
-    }
-
-    fn try_acquire_probe(&self) -> bool {
-        let current = self.active_probes.load(Ordering::SeqCst);
-        if current >= self.config.half_open_max_probes {
-            return false;
-        }
-        // CAS to avoid over-acquiring
-        self.active_probes
-            .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::Relaxed)
-            .is_ok()
-    }
-
-    fn release_probe(&self) {
-        // Use fetch_update to avoid atomic underflow wrapping to u32::MAX
-        let _ = self
-            .active_probes
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                if current > 0 {
-                    Some(current - 1)
-                } else {
-                    None // Don't decrement below zero
-                }
-            });
     }
 }
 
@@ -629,19 +579,33 @@ mod tests {
 
     // ---- Probe mechanics ----
 
+    /// Rewritten for the shared core (plan
+    /// `2026-10-19-runner-pg-unreachable-costs-every-caller-a-pool-timeout`
+    /// Phase 7): this used to poke the private `active_probes` field, which
+    /// the core now owns. It pins the same property through the public API —
+    /// releasing a probe slot that is not held (a success recorded with no
+    /// probe outstanding) never wraps the counter, so exactly one probe is
+    /// still admitted afterwards.
     #[test]
     fn test_release_probe_handles_underflow() {
-        let cb = make_breaker(2, 1);
-        // active_probes starts at 0 — releasing should not panic or wrap
-        cb.release_probe();
-        assert_eq!(cb.active_probes.load(Ordering::SeqCst), 0);
-
-        // Double release after a single acquire should also be safe
-        cb.active_probes.store(1, Ordering::SeqCst);
-        cb.release_probe();
-        assert_eq!(cb.active_probes.load(Ordering::SeqCst), 0);
-        cb.release_probe();
-        assert_eq!(cb.active_probes.load(Ordering::SeqCst), 0);
+        let cb = CircuitBreaker::new(
+            "test_underflow".to_string(),
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                success_threshold: 3,
+                open_timeout: Duration::from_millis(50),
+                half_open_max_probes: 1,
+            },
+        );
+        cb.record_failure("boom");
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(cb.is_available(), "the first probe is admitted");
+        cb.record_success(); // releases the probe (1 of 3)
+        cb.record_success(); // a release with NO probe outstanding (2 of 3)
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        // A wrapped counter would refuse every probe from here on.
+        assert!(cb.is_available(), "exactly one probe is admitted again");
+        assert!(!cb.is_available(), "and only one (max 1)");
     }
 
     #[test]

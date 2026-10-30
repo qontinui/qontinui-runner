@@ -50,7 +50,7 @@ Two shapes:
    is reported as one, never as "coord unreachable"); if the transport is fine
    and coord declined the call, it says so and stops rather than retrying.
    The acting-bearer half reports the same typed causes `/coord-revive` does —
-   `HELPER_NOT_FOUND` / `NO_TOKEN` / `MINT_FAILED` / `HELPER_DEPS_MISSING` — so
+   `HELPER_NOT_FOUND` / `NO_TOKEN` / `MINT_FAILED` / `PRESENTER_NOT_ADMITTED` / `HELPER_DEPS_MISSING` — so
    "the helper is missing" and "coord refused the mint" are never both reported
    as `$COORD_AGENT_JWT` being unset. A sweep that found **no** door says so
    too, rather than letting the bearer note stand for the whole cascade.
