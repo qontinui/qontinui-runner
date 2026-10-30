@@ -4082,7 +4082,7 @@ mod tests {
                 kind: "interactive".to_string(),
                 started_at: 1,
                 updated_at: 2,
-                resume_command: "cd '/w' && clg --resume s-1".to_string(),
+                resume_command: Some("cd '/w' && clg --resume s-1".to_string()),
             },
             runner_managed: false,
         };
