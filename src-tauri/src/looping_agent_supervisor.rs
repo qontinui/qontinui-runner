@@ -802,11 +802,11 @@ async fn reconcile_slot_lease(
                 set_held_slot(agent_id, HeldSlot { slot, resource_key });
                 return true;
             }
-            lease::AcquireOutcome::Held { current_holder } => {
+            lease::AcquireOutcome::Held { holder } => {
                 debug!(
                     agent = %agent_id,
                     %resource_key,
-                    holder = current_holder.as_deref().unwrap_or("unknown"),
+                    holder = holder.as_ref().map(|h| h.machine_id.as_str()).unwrap_or("unknown"),
                     "looping_agent_supervisor: slot held by another runner — trying the next"
                 );
             }
