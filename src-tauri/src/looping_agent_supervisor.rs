@@ -62,6 +62,8 @@ use qontinui_runner_lib::looping_agent::registry::{
 };
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
+use crate::claude_session::spawn_preconditions::SpawnStalledBody;
+
 /// Supervisor tick interval. Overridable via
 /// `QONTINUI_LOOPING_AGENT_TICK_MS` (floored at 500ms). 5s is well under any
 /// sane cadence while costing one grid snapshot per enabled agent per tick.
@@ -282,6 +284,22 @@ const STUCK_IDLE_WARN_EVERY_MS: i64 = 10 * 60 * 1000;
 /// log-only-on-transition discipline `fleet_policy_poller` uses).
 #[allow(clippy::type_complexity)]
 static LAST_POSTURE: Mutex<Option<HashMap<String, (bool, u32, DesiredSource)>>> = Mutex::new(None);
+
+/// Launch observation memos (plan
+/// `2026-10-28-merge-shepherd-slot-is-won-by-any-runner-regardless-of-role-or-load`
+/// D6): `agent_id -> unix millis of the last transcript probe`, so a hung
+/// launch is swept for its transcript at most once per
+/// [`TRANSCRIPT_PROBE_INTERVAL_MS`] instead of on every 5 s tick.
+static LAST_TRANSCRIPT_PROBE: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
+
+/// `agent_id -> claude_session_id` whose stalled launch has already been
+/// warned about, so the warning fires once per spawn, not once per tick.
+static STALL_WARNED: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+
+/// How often a launch with no transcript yet is re-checked for one. The probe
+/// sweeps every Claude config dir on the machine, so it runs off the tick path
+/// and no more often than this.
+const TRANSCRIPT_PROBE_INTERVAL_MS: i64 = 30_000;
 
 /// Registry file path, port-namespaced like the session lifecycle store so a
 /// temp/secondary runner (9877+) never adopts — or double-spawns — the
@@ -795,6 +813,10 @@ async fn supervise_one(
     let displaced =
         update_displacement(&rec.def.id, lease_tick.walk, &lease_obs, effective.running);
 
+    // D6: has this spawn actually started? Read from the transcript, never from
+    // our own bookkeeping, so a hung launch reports `spawn_stalled`.
+    let started_this_tick = observe_launch(app, registry, rec, live.is_some(), now_ms);
+
     // Observe idle/context-low on the live grid (on a closed lane this tick's
     // probe was already taken above). See [`probe_tab`].
     let GridProbe {
@@ -1038,6 +1060,20 @@ async fn supervise_one(
             }
         }
         Action::Spawn(reason) => {
+            if reason == SpawnReason::DeathRespawn
+                && !started_this_tick
+                && hold_respawn_of_unstarted_launch(rec, now_ms)
+            {
+                // `rec` is the tick-start snapshot: a sighting `observe_launch`
+                // applied THIS tick is not in it, so that launch did start.
+                warn!(
+                    agent = %rec.def.id,
+                    claude_session = rec.runtime.claude_session_id.as_deref().unwrap_or("<none>"),
+                    "looping_agent_supervisor: the tab died before its first transcript turn — \
+                     charged to the spawn backoff; respawning when it elapses"
+                );
+                return;
+            }
             // A registered tab whose process EXITED (coord finding `9089767f`):
             // close the frozen pane first so the respawn does not leave a dead
             // tab behind it, then decide whether the exit was a broken spawn.
@@ -1118,7 +1154,12 @@ async fn supervise_one(
                         "looping_agent_supervisor: nudged next cycle"
                     );
                     registry.update_runtime(&rec.def.id, |rt| {
-                        rt.cycles_since_relaunch = rt.cycles_since_relaunch.saturating_add(1);
+                        // No cycle is counted before the spawn's first
+                        // transcript turn (D6); `observe_launch` counts the
+                        // spawn's own cycle when that turn appears.
+                        if rt.first_turn_seen_at_ms.is_some() {
+                            rt.cycles_since_relaunch = rt.cycles_since_relaunch.saturating_add(1);
+                        }
                         rt.last_cycle_started_at_ms = Some(now_ms);
                     });
                 }
@@ -1776,11 +1817,227 @@ fn clear_spawn_failures(agent_id: &str) {
     }
 }
 
+/// The transcript probe's last answer per agent: `agent_id -> (claude_session_id,
+/// probe started at, transcript found)`. Written by the off-tick probe ONLY;
+/// read and applied on the tick thread, which is the one writer of the
+/// registry (its persist is not serialized against a second writer).
+type ProbeResults = HashMap<String, (String, i64, bool)>;
+static TRANSCRIPT_PROBE_RESULT: Mutex<Option<ProbeResults>> = Mutex::new(None);
+
+/// `agent_id -> claude_session_id` whose death before its first transcript turn
+/// has already been charged to the spawn-failure backoff (see
+/// [`hold_respawn_of_unstarted_launch`]).
+static DEATH_NOTED: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+
+/// Observe whether the current spawn has written its first transcript turn,
+/// and report it `spawn_stalled` once when it has not within the grace window
+/// (plan `2026-10-28-merge-shepherd-slot-is-won-by-any-runner-regardless-of-role-or-load`
+/// D6).
+///
+/// Runs on the tick thread. It first APPLIES the last probe's answer: a
+/// sighting is recorded durably (`first_turn_seen_at_ms`), counts the spawn's
+/// own cycle, and clears the spawn-failure streak, because only a session that
+/// actually started proves the spawn healthy. A miss is reported
+/// `spawn_stalled` only when the probe itself started after the grace window
+/// had passed, so a transcript that appears late in the window is not
+/// misreported. It then starts the next probe, off the tick path, at most once
+/// per [`TRANSCRIPT_PROBE_INTERVAL_MS`], and only while a live tab exists and
+/// the turn has not been seen.
+///
+/// Returns `true` when it applied a sighting THIS tick, which the tick-start
+/// snapshot the caller still holds does not reflect.
+fn observe_launch(
+    app: &tauri::AppHandle,
+    registry: &Arc<LoopingAgentRegistry>,
+    rec: &LoopingAgentRecord,
+    tab_live: bool,
+    now_ms: i64,
+) -> bool {
+    let rt = &rec.runtime;
+    let Some(csid) = rt.claude_session_id.clone() else {
+        return false;
+    };
+    if rt.last_spawn_at_ms.is_none() || rt.first_turn_seen_at_ms.is_some() {
+        return false;
+    }
+
+    let answer = {
+        let mut guard = TRANSCRIPT_PROBE_RESULT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard
+            .get_or_insert_with(HashMap::new)
+            .remove(&rec.def.id)
+            .filter(|(probed, _, _)| *probed == csid)
+    };
+    if let Some((_, probe_started_ms, found)) = answer {
+        if found {
+            registry.update_runtime(&rec.def.id, |rt| {
+                // Only for the spawn that was probed: a relaunch has a new id.
+                if rt.claude_session_id.as_deref() == Some(csid.as_str())
+                    && rt.first_turn_seen_at_ms.is_none()
+                {
+                    rt.first_turn_seen_at_ms = Some(now_ms);
+                    // The spawn prompt's own cycle, counted now that it ran.
+                    // `max`, not `+1`: an agent spawned by a build that still
+                    // counted it at spawn already holds it.
+                    rt.cycles_since_relaunch = rt.cycles_since_relaunch.max(1);
+                }
+            });
+            clear_spawn_failures(&rec.def.id);
+            info!(
+                agent = %rec.def.id,
+                claude_session = %csid,
+                "looping_agent_supervisor: first transcript turn observed — launch started"
+            );
+            return true;
+        }
+        // A launch whose tab is gone is dead, not stalled; the sighting above is
+        // still applied first, so a launch that started and then died is not
+        // charged as one that never started.
+        if !tab_live {
+            return false;
+        }
+        if policy::spawn_stalled(
+            probe_started_ms,
+            rt.last_spawn_at_ms,
+            rec.def.lifecycle_policy.spawn_grace_secs,
+            false,
+        ) {
+            let first_report = {
+                let mut guard = STALL_WARNED.lock().unwrap_or_else(|e| e.into_inner());
+                let warned = guard.get_or_insert_with(HashMap::new);
+                warned.insert(rec.def.id.clone(), csid.clone()).as_deref() != Some(csid.as_str())
+            };
+            if first_report {
+                report_spawn_stalled(app, rec, &csid, now_ms);
+            }
+        }
+    }
+
+    if !tab_live {
+        return false;
+    }
+    {
+        let mut guard = LAST_TRANSCRIPT_PROBE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let last = guard.get_or_insert_with(HashMap::new);
+        if let Some(t) = last.get(&rec.def.id) {
+            if now_ms.saturating_sub(*t) < TRANSCRIPT_PROBE_INTERVAL_MS {
+                return false;
+            }
+        }
+        last.insert(rec.def.id.clone(), now_ms);
+    }
+
+    // Also look in the config dir the session was pinned to, in case it is
+    // not one the machine-wide sweep finds — otherwise the sighting, and with
+    // it the backoff reset, would never come.
+    let also_in = app
+        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+        .and_then(|s| s.inner().get(&csid))
+        .and_then(|l| l.config_dir)
+        .map(std::path::PathBuf::from);
+    let agent_id = rec.def.id.clone();
+    spawn_blocking_tracked(move || {
+        let found =
+            crate::terminal::transcript::find_transcript_by_session_id(also_in.as_deref(), &csid)
+                .is_some();
+        let mut guard = TRANSCRIPT_PROBE_RESULT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard
+            .get_or_insert_with(HashMap::new)
+            .insert(agent_id, (csid, now_ms, found));
+    });
+    false
+}
+
+/// Report a looping-agent launch that has written no transcript turn inside
+/// its grace window, as the runner's existing `spawn_stalled` body. The
+/// `warn!` is the deliverable: a local structured line that answers "why did
+/// this launch hang?" on any box, with the trust precondition beside it.
+fn report_spawn_stalled(
+    app: &tauri::AppHandle,
+    rec: &LoopingAgentRecord,
+    claude_session_id: &str,
+    now_ms: i64,
+) {
+    let home = agent_home_dir(&rec.def.id);
+    // The lifecycle record carries the config dir the session was pinned to;
+    // `evaluate`'s `account` is a config-dir pin, so the record's display
+    // label is NOT passed as one.
+    let config_dir = app
+        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+        .and_then(|s| s.inner().get(claude_session_id))
+        .and_then(|l| l.config_dir);
+    let pre = crate::claude_session::spawn_preconditions::SpawnPreconditions::evaluate(
+        &home.to_string_lossy(),
+        None,
+        config_dir.as_deref(),
+        "looping_agent_lifecycle_record",
+    );
+    let silent = std::time::Duration::from_millis(
+        u64::try_from(now_ms.saturating_sub(rec.runtime.last_spawn_at_ms.unwrap_or(now_ms)))
+            .unwrap_or(0),
+    );
+    let body = SpawnStalledBody::new(&pre, silent, None);
+    warn!(
+        agent = %rec.def.id,
+        claude_session = %claude_session_id,
+        phase = body.phase,
+        silent_secs = body.silent_secs,
+        cwd = %body.preconditions.cwd,
+        project_key = body.preconditions.project_key.as_deref().unwrap_or("<underivable>"),
+        account_config_dir = body.preconditions.account_config_dir.as_deref().unwrap_or("<ambient>"),
+        config_dir_source = %body.preconditions.config_dir_source,
+        trust = body.preconditions.trust.label(),
+        trust_detail = ?body.preconditions.trust,
+        "looping_agent_supervisor: spawn_stalled — no transcript turn within the spawn grace \
+         window; no cycle is counted until one appears (the tab may be waiting on a Claude \
+         Code dialog). Reported only."
+    );
+}
+
+/// Whether a death respawn must WAIT one backoff step first (D6).
+///
+/// A launch that died before its first transcript turn never started a
+/// session, so it is a spawn failure in all but name. Without this, an exited
+/// tab resolving `Dead` would be respawned on every 5 s tick by a `claude`
+/// that keeps dying at startup. The first time such a death is seen it is
+/// charged to the spawn-failure backoff (30 s doubling to 900 s) and the
+/// respawn is held; once the backoff lets the policy decide `DeathRespawn`
+/// again, the same death is not charged twice and the respawn proceeds. A
+/// launch that did start (`first_turn_seen_at_ms` set) respawns at once, as
+/// before.
+fn hold_respawn_of_unstarted_launch(rec: &LoopingAgentRecord, now_ms: i64) -> bool {
+    if rec.runtime.first_turn_seen_at_ms.is_some() {
+        return false;
+    }
+    let Some(csid) = rec.runtime.claude_session_id.as_deref() else {
+        return false;
+    };
+    let newly_noted = {
+        let mut guard = DEATH_NOTED.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .get_or_insert_with(HashMap::new)
+            .insert(rec.def.id.clone(), csid.to_string())
+            .as_deref()
+            != Some(csid)
+    };
+    if newly_noted {
+        note_spawn_failure(&rec.def.id, now_ms);
+    }
+    newly_noted
+}
+
 /// Spawn the agent's visible docked tab — a thin composition of the
 /// `run_continuation_terminal` recipe (see the module doc). On success,
 /// records the fresh terminal + pinned claude-session ids and resets the
-/// cycle counter (the spawn prompt runs cycle 1); on failure, notes the
-/// failure for the escalating backoff.
+/// cycle counter to 0 (the spawn's own cycle is counted at its first
+/// transcript turn, `observe_launch`); on failure, notes the failure for the
+/// escalating backoff.
 async fn do_spawn(
     app: &tauri::AppHandle,
     registry: &Arc<LoopingAgentRegistry>,
@@ -1830,14 +2087,19 @@ async fn do_spawn(
                 claude_session = %claude_session_id,
                 "looping_agent_supervisor: spawned visible looping-agent tab"
             );
-            // The failure streak is NOT cleared here: a spawn that returns Ok
-            // has not yet proven the `claude` stays up. `supervise_one` clears
-            // it once the tab is still running past its spawn grace.
+            // The failure streak is NOT cleared here: a PTY that started is not
+            // a session that started. `observe_launch` clears it at the first
+            // transcript turn (D6), so a `claude` that dies at startup keeps
+            // backing off instead of respawning every tick.
             registry.update_runtime(&def.id, |rt| {
                 rt.terminal_id = Some(terminal_id.clone());
                 rt.claude_session_id = Some(claude_session_id.clone());
-                // The spawn prompt itself starts cycle 1.
-                rt.cycles_since_relaunch = 1;
+                // No cycle is counted until the session's first transcript turn
+                // is observed (D6): a launch that hangs (on the trust prompt,
+                // say) must never read as progress. `observe_launch` counts it
+                // to 1 when that turn appears.
+                rt.cycles_since_relaunch = 0;
+                rt.first_turn_seen_at_ms = None;
                 rt.last_spawn_at_ms = Some(now_ms);
                 rt.last_cycle_started_at_ms = Some(now_ms);
                 if is_relaunch {
@@ -2202,6 +2464,10 @@ pub(crate) struct LoopingAgentStatus {
     /// when every slot is held by another runner: says WHY a live tab stopped
     /// being nudged. `None` when not displaced.
     pub displaced: Option<&'static str>,
+    /// The current spawn is past its grace window with no transcript turn —
+    /// the runner's `spawn_stalled` (D6). A hung launch reads this, never as
+    /// cycles.
+    pub spawn_stalled: bool,
 }
 
 /// Assemble the live status for one record.
@@ -2225,6 +2491,12 @@ pub(crate) fn status_snapshot(
         displaced: last_displaced_for(&rec.def.id)
             .filter(|d| *d != lease::Displaced::NotDisplaced)
             .map(lease::Displaced::label),
+        spawn_stalled: policy::spawn_stalled(
+            chrono::Utc::now().timestamp_millis(),
+            rec.runtime.last_spawn_at_ms,
+            rec.def.lifecycle_policy.spawn_grace_secs,
+            rec.runtime.first_turn_seen_at_ms.is_some(),
+        ),
     }
 }
 
@@ -2863,5 +3135,57 @@ mod drain_rewrite_tests {
         for action in ACTIONS {
             assert_eq!(drain_rewrite(action, &DrainGate::Allow), action);
         }
+    }
+}
+
+/// Plan `2026-10-28-merge-shepherd-slot-is-won-by-any-runner-regardless-of-role-or-load`
+/// D6: a launch that never started is a spawn failure.
+#[cfg(test)]
+mod liveness_glue_tests {
+    use super::*;
+    use qontinui_runner_lib::looping_agent::registry::{
+        builtin_merge_shepherd, LoopingAgentRuntime,
+    };
+
+    fn record_on(terminal_id: &str) -> LoopingAgentRecord {
+        LoopingAgentRecord {
+            def: builtin_merge_shepherd("/tmp/merge-shepherd-journal.jsonl".to_string()),
+            runtime: LoopingAgentRuntime {
+                terminal_id: Some(terminal_id.to_string()),
+                claude_session_id: Some("00000000-0000-0000-0000-000000000001".to_string()),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn a_launch_that_died_before_its_first_turn_takes_one_backoff_step_before_respawning() {
+        // B2: an exited tab now resolves Dead, so a `claude` that dies at
+        // startup must not be respawned on every 5 s tick.
+        let agent = "test-unstarted-launch-backoff";
+        let mut rec = record_on("term-x");
+        rec.def.id = agent.to_string();
+        let now = 1_000_000;
+
+        assert!(
+            hold_respawn_of_unstarted_launch(&rec, now),
+            "the first sighting of an unstarted launch's death is held"
+        );
+        assert!(
+            !spawn_backoff_elapsed(agent, now + 1_000),
+            "and charged to the spawn backoff"
+        );
+        assert!(
+            !hold_respawn_of_unstarted_launch(&rec, now + 60_000),
+            "the same death is charged once: after the backoff the respawn proceeds"
+        );
+
+        // A launch that DID start respawns at once, and is never charged.
+        let mut started = record_on("term-y");
+        started.def.id = "test-started-launch-respawns".to_string();
+        started.runtime.first_turn_seen_at_ms = Some(now);
+        assert!(!hold_respawn_of_unstarted_launch(&started, now));
+        assert!(spawn_backoff_elapsed("test-started-launch-respawns", now));
+        clear_spawn_failures(agent);
     }
 }

@@ -89,7 +89,8 @@ pub struct TickInput {
     pub context_low: bool,
     /// `cadence_secs` have passed since the last cycle START.
     pub cadence_elapsed: bool,
-    /// Cycles run since the last fresh spawn (spawn counts as cycle 1).
+    /// Cycles run since the last fresh spawn (the spawn's own cycle counts
+    /// from its first transcript turn).
     pub cycles_since_relaunch: u32,
     /// `lifecycle_policy.relaunch_every_cycles` (a 0 is clamped to 1).
     pub relaunch_every_cycles: u32,
@@ -174,6 +175,34 @@ pub fn spawn_grace_elapsed(now_ms: i64, last_spawn_at_ms: Option<i64>, grace_sec
         None => true,
         Some(t) => now_ms.saturating_sub(t) >= (grace_secs as i64).saturating_mul(1000),
     }
+}
+
+/// Whether the current spawn is `spawn_stalled`: spawned, past its grace window,
+/// and still without a single transcript turn.
+///
+/// `spawn_stalled` is the runner's existing name for a spawn that produced
+/// nothing (`claude_session::spawn_preconditions`, `SpawnStalledBody`, wired for
+/// headless gate continuations); a looping agent's launch reuses it rather than
+/// coining a second state. Plan
+/// `2026-10-28-merge-shepherd-slot-is-won-by-any-runner-regardless-of-role-or-load`
+/// D6: a launch that hung on Claude Code's trust prompt still read as 2 cycles,
+/// because the supervisor counted its own spawn and nudges as cycles while the
+/// turn-ending observer logged `transcript_missing`. Cycles are now counted only
+/// from the first transcript turn, and a launch with none after
+/// `spawn_grace_secs` is reported stalled.
+///
+/// `first_turn_seen` is whether the current spawn's transcript has been
+/// observed; the glue records the first sighting durably and clears it on every
+/// spawn/relaunch.
+pub fn spawn_stalled(
+    now_ms: i64,
+    last_spawn_at_ms: Option<i64>,
+    spawn_grace_secs: u64,
+    first_turn_seen: bool,
+) -> bool {
+    last_spawn_at_ms.is_some()
+        && !first_turn_seen
+        && spawn_grace_elapsed(now_ms, last_spawn_at_ms, spawn_grace_secs)
 }
 
 /// How the glue's liveness resolution reads for one agent this tick.
@@ -552,5 +581,25 @@ mod tests {
             ..base()
         };
         assert_eq!(decide(&i), Action::Spawn(SpawnReason::DeathRespawn));
+    }
+
+    #[test]
+    fn a_launch_with_no_transcript_after_the_grace_window_is_spawn_stalled() {
+        // D6: spawned at t=0 with a 90 s grace and no transcript yet.
+        assert!(
+            !spawn_stalled(0, None, 90, false),
+            "nothing spawned, nothing stalled"
+        );
+        assert!(
+            !spawn_stalled(89_999, Some(0), 90, false),
+            "still inside the grace window"
+        );
+        assert!(
+            spawn_stalled(90_000, Some(0), 90, false),
+            "no transcript once the grace window has passed is a hung launch, not progress"
+        );
+        // The first transcript turn ends the question either way.
+        assert!(!spawn_stalled(10_000, Some(0), 90, true));
+        assert!(!spawn_stalled(9_000_000, Some(0), 90, true));
     }
 }
