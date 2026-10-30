@@ -47,6 +47,7 @@ use qontinui_types::journey::{ChokePoint, NavigationTriggerKind};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::mcp::app_registry::AppRegistry;
 use crate::mcp::types::ApiState;
 
 use super::capture;
@@ -317,6 +318,38 @@ fn refuse(status: StatusCode, app_id: Option<&str>, reason: &'static str) -> Res
     (status, Json(json!({ "error": reason }))).into_response()
 }
 
+/// Claim `app_id`'s passive-capture counter slot, if a registration holds the
+/// id: slots are never evicted, so an id nothing registered must not take one.
+///
+/// The registry's row is read INCLUDING its reservation, because this asks
+/// whether the id is held, not whether a dispatch would reach the app. A human's
+/// click can legitimately outrun the row: a throttled tab that missed its
+/// heartbeat, or a last click relayed after the `beforeunload` release. Its edge
+/// closes `to_node_unobserved` if the snapshot cannot reach the app. A relay
+/// BEFORE any registration is refused: the SDK relays only on the registration
+/// answer's `journeyObserve.admitted`, so the row exists by then; after a runner
+/// restart a relay is refused until the app's next registration.
+pub(crate) async fn claim_slot_if_registered(
+    registry: &AppRegistry,
+    app_id: &str,
+) -> Result<(), BodyRefusal> {
+    if registry.get_including_reservations(app_id).await.is_none() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "no app with this id is registered; POST /ui-bridge/apps/register first",
+        ));
+    }
+    // CLAIMED under one lock, before the event is queued: another app cannot
+    // take the last slot between this check and the receipt.
+    if !health::claim_passive_slot(app_id) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "passive capture tracks no more apps in this process",
+        ));
+    }
+    Ok(())
+}
+
 /// `POST /apps/{app_id}/journey/observe`.
 ///
 /// - 202: recorded;
@@ -327,6 +360,7 @@ fn refuse(status: StatusCode, app_id: Option<&str>, reason: &'static str) -> Res
 /// - 422: the app id is not an identifier or names the runner's own app
 ///   ([`observe_app_id`]) — checked exactly as given, untrimmed, as the
 ///   explore route checks it —, or the JSON body is not the closed shape;
+/// - 404: no registration holds this app id ([`claim_slot_if_registered`]);
 /// - 429: no room — the journey queue is down to the slots passive capture
 ///   leaves to agents and the explorer (`capture::PASSIVE_QUEUE_RESERVE`), or
 ///   the per-app counter map is full (`health::MAX_PASSIVE_APPS`);
@@ -347,21 +381,15 @@ pub async fn post_observe(
     }
     // A refusal never creates an accepted-relay counter slot
     // (`record_passive_refused` counts it in the app's slot, else in the
-    // separately capped refused-only map): only an accepted body takes one,
-    // so a stream of junk ids cannot fill that map and lock real apps out.
+    // separately capped refused-only map): only an accepted body from a
+    // registered app takes one, so a stream of junk ids cannot fill that map
+    // and lock real apps out.
     let (interaction, action) = match parse_interaction(&body) {
         Ok(p) => p,
         Err((status, reason)) => return refuse(status, Some(&app_id), reason),
     };
-    // The app's counter slot is CLAIMED here, under one lock, before the
-    // event is queued: another app cannot take the last slot between this
-    // check and the receipt below.
-    if !health::claim_passive_slot(&app_id) {
-        return refuse(
-            StatusCode::TOO_MANY_REQUESTS,
-            Some(&app_id),
-            "passive capture tracks no more apps in this process",
-        );
+    if let Err((status, reason)) = claim_slot_if_registered(&state.app_registry, &app_id).await {
+        return refuse(status, Some(&app_id), reason);
     }
     let key = CursorKey::new(app_id.clone(), interaction.tab_id.as_deref());
     let queued = capture::record_passive(
@@ -607,6 +635,88 @@ mod tests {
             None,
             "not an identifier: unattributed"
         );
+    }
+
+    fn registered_app(app_id: &str) -> crate::mcp::app_discovery::DiscoveredApp {
+        crate::mcp::app_discovery::DiscoveredApp {
+            app_id: app_id.to_string(),
+            app_name: "x".to_string(),
+            app_type: "web".to_string(),
+            framework: None,
+            url: "http://127.0.0.1:3000".to_string(),
+            port: 3000,
+            base_path: String::new(),
+            version: None,
+            capabilities: vec![],
+            element_count: None,
+            component_count: None,
+            discovered_at: 0,
+        }
+    }
+
+    async fn register(registry: &AppRegistry, app_id: &str) {
+        registry
+            .upsert(
+                registered_app(app_id),
+                None,
+                crate::mcp::app_registry::AppTransport::Http,
+                None,
+                None,
+            )
+            .await;
+    }
+
+    /// More made-up ids than there are slots: none takes one, so a real app
+    /// that registers afterwards still can.
+    #[tokio::test]
+    async fn made_up_ids_take_no_slot_and_a_registered_app_still_gets_one() {
+        let registry = AppRegistry::new();
+        for i in 0..=health::MAX_PASSIVE_APPS {
+            let id = format!("observe-made-up-{i}");
+            let (status, _) = claim_slot_if_registered(&registry, &id)
+                .await
+                .expect_err("an id nothing registered");
+            assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+            assert!(!health::passive_slot_held(&id), "{id}");
+        }
+        register(&registry, "observe-registered").await;
+        assert_eq!(
+            claim_slot_if_registered(&registry, "observe-registered").await,
+            Ok(())
+        );
+        assert!(health::passive_slot_held("observe-registered"));
+    }
+
+    /// A relay that outruns its row is kept while the id is still reserved: a
+    /// missed heartbeat, an explicit release. Once the reservation lapses the id
+    /// is nobody's, and it is refused again.
+    #[tokio::test]
+    async fn a_relay_outrunning_its_registration_is_kept_until_the_reservation_lapses() {
+        use crate::mcp::app_registry::REGISTRATION_TTL_MS;
+        use crate::mcp::relay_binding::BINDING_TOMBSTONE_MS;
+        let registry = AppRegistry::new();
+        let expired = "observe-missed-heartbeat";
+        register(&registry, expired).await;
+        registry
+            .test_age_entry(expired, REGISTRATION_TTL_MS + 1)
+            .await;
+        assert!(registry.get_live(expired).await.is_none());
+        assert_eq!(claim_slot_if_registered(&registry, expired).await, Ok(()));
+
+        let released = "observe-released";
+        register(&registry, released).await;
+        assert!(registry.remove(released).await);
+        assert!(registry.get_live(released).await.is_none());
+        assert_eq!(claim_slot_if_registered(&registry, released).await, Ok(()));
+
+        registry
+            .test_age_entry(expired, BINDING_TOMBSTONE_MS + 1)
+            .await;
+        registry.sweep().await;
+        let (status, _) = claim_slot_if_registered(&registry, expired)
+            .await
+            .expect_err("the reservation lapsed");
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[test]
