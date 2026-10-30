@@ -23,6 +23,7 @@ vi.mock("./contexts", () => ({
     },
     closeTerminal: () => {},
     sessionStates: { "tab-0": "completed", "tab-1": "working" },
+    tabs: [],
   }),
   useTransitionEffects: () => ({ handleRestartInZone: () => {} }),
   useZoneMetadata: () => ({ labelsAndTags: { zoneLabels: {}, setZoneLabel: () => {} } }),

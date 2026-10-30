@@ -6,6 +6,7 @@ import { DeveloperDependencyGraph } from "./DeveloperDependencyGraph";
 import { DeveloperTechMap } from "./DeveloperTechMap";
 import { DeveloperExplorerPanel } from "./DeveloperExplorerPanel";
 import { DeveloperAgenticPanel } from "./DeveloperAgenticPanel";
+import { getApiBase } from "@/lib/runner-api";
 
 type ViewId = "overview" | "dependencies" | "tech-map" | "explorer" | "agentic";
 
@@ -37,7 +38,7 @@ export function DeveloperArchitecturePanel({
   const [specPageIds, setSpecPageIds] = useState<Set<string>>(new Set());
   const loadSpecPageIds = useCallback(async (signal: AbortSignal) => {
     try {
-      const resp = await fetch("http://localhost:9876/specs", { signal });
+      const resp = await fetch(`${getApiBase()}/specs`, { signal });
       const json = await resp.json();
       if (!signal.aborted && json.data) {
         const ids = new Set<string>();
