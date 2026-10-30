@@ -675,6 +675,21 @@ print_remedy() {
     "$say" " share that checkout. This hook itself never writes there.)"
 }
 
+# The regeneration remedy rewrites the WHOLE generated directory, so it would
+# also DELETE the bindings that are ahead of the runner: those registered on
+# neither side, usually pending registrations (coord finding 19f8a714).
+# Printed after the remedy in every arm that lists such bindings. $1 is the
+# emitter, as for `print_remedy`.
+print_ahead_caveat() {
+    local say="${1:-fail}"
+    [ "${FILE_ATTRIBUTION_AHEAD:-0}" -gt 0 ] || return 0
+    "$say" "BUT: that regeneration would also DELETE the $FILE_ATTRIBUTION_AHEAD binding(s) listed above as"
+    "$say" "ahead of the runner. They are usually pending registrations"
+    "$say" "(qontinui-schemas codegen/pending-registration.toml names the runner PR that"
+    "$say" "registers each, and landing that PR is what clears them). Commit only the"
+    "$say" "other files from the regenerated tree, and keep those."
+}
+
 # Whether the shared checkout is ALSO dirty in the compared path — a second,
 # independent reason part of the diff may not be the pusher's. Now actually
 # reported in every arm, as this comment always claimed: the pre-existing arm
@@ -744,29 +759,19 @@ if [ "$ATTRIBUTION_STATE" = "mine" ] && [ "$FILE_ATTRIBUTION_STATE" = "pre-exist
     echo
     log "PRE-EXISTING DRIFT — not caused by this $STAGE."
     log "The bindings on disk at $BASELINE_DIR do not match what this repo's"
-    log "Rust generates. This $STAGE does change codegen inputs, measured against"
-    log "$ATTRIBUTION_BASE_REF (merge-base ${ATTRIBUTION_BASE_SHA:0:12}), but none that can move these files:"
+    log "Rust generates. Codegen inputs did change here, measured against"
+    log "$ATTRIBUTION_BASE_REF (merge-base ${ATTRIBUTION_BASE_SHA:0:12}):"
+    gen_events_render_inputs "    " | sed 's/^/[gen-events-drift] /'
+    log "but none of them can move these files:"
     gen_events_render_file_list pre "    " | sed 's/^/[gen-events-drift] /'
     log "(per-file rules: lib/gen-events-file-attribution.sh)"
     echo
     git --no-pager diff --no-index --stat -- "$BASELINE_DIR" "$SCRATCH_DIR" || true
     print_dirty_checkout_note log
     echo
-    if [ "${FILE_ATTRIBUTION_AHEAD:-0}" -gt 0 ]; then
-        # The usual regeneration remedy would DELETE these from qontinui-schemas
-        # (coord finding 19f8a714). A binding ahead of the runner is normally a
-        # pending registration, and what clears it is the runner PR that
-        # registers it.
-        log "Nothing to do for this $STAGE. $FILE_ATTRIBUTION_AHEAD binding(s) above are AHEAD of the"
-        log "runner: registered on neither side. That is usually a pending registration."
-        log "qontinui-schemas codegen/pending-registration.toml names the runner PR that"
-        log "registers each one, and landing that PR is what clears them. Do NOT regenerate"
-        log "over them: generate_types.sh would delete them from qontinui-schemas."
-        log "For anything else listed, the usual remedy is:"
-    else
-        log "Nothing to do for this $STAGE. To clear it for everyone:"
-    fi
+    log "Nothing to do for this $STAGE. To clear it for everyone:"
     print_remedy log
+    print_ahead_caveat log
     log "Set QONTINUI_GEN_EVENTS_DRIFT_STRICT=1 to block on pre-existing drift too."
     echo
     exit 0
@@ -777,18 +782,21 @@ fail "ERROR: Generated Tauri event bindings are stale."
 if [ "$ATTRIBUTION_STATE" = "mine" ] && [ "$FILE_ATTRIBUTION_STATE" = "mine" ]; then
     # Per file: name what this push can move, and keep what it cannot apart,
     # so a pusher fixes their own drift and is not sent after someone else's.
-    fail "This $STAGE changes inputs that move these drifted files, measured against"
+    # Worded by WHERE each input changed, not "this push changes": an input
+    # may be only a dirty working-tree file the push does not carry, and each
+    # reason names its input with that label.
+    fail "Inputs that changed here move these drifted files, measured against"
     fail "$ATTRIBUTION_BASE_REF (merge-base ${ATTRIBUTION_BASE_SHA:0:12}):"
     gen_events_render_file_list mine "    " | sed 's/^/[gen-events-drift] /' >&2
     if [ -n "$FILE_ATTRIBUTION_PRE" ]; then
-        fail "These were already drifted before it, and are not held against it:"
+        fail "These were already drifted at the merge-base, and are not held against this $STAGE:"
         gen_events_render_file_list pre "    " | sed 's/^/[gen-events-drift] /' >&2
     fi
-    fail "The inputs this $STAGE touches:"
+    fail "The codegen inputs that changed, and whether this $STAGE carries them:"
     gen_events_render_mine --inputs-only | sed 's/^/[gen-events-drift] /' >&2
 elif [ "$ATTRIBUTION_STATE" = "mine" ] && [ "$FILE_ATTRIBUTION_STATE" = "pre-existing" ]; then
     # Only reachable under STRICT.
-    fail "This drift is PRE-EXISTING — none of the inputs this $STAGE changes can move"
+    fail "This drift is PRE-EXISTING — none of the inputs that changed here can move"
     fail "these files — but QONTINUI_GEN_EVENTS_DRIFT_STRICT=1 blocks on it:"
     gen_events_render_file_list pre "    " | sed 's/^/[gen-events-drift] /' >&2
 elif [ "$ATTRIBUTION_STATE" = "mine" ]; then
@@ -824,14 +832,7 @@ git --no-pager diff --no-index --stat -- "$BASELINE_DIR" "$SCRATCH_DIR" >&2 || t
 echo >&2
 fail "Refresh the shared bindings by regenerating and committing them there:"
 print_remedy
-if [ "${FILE_ATTRIBUTION_AHEAD:-0}" -gt 0 ]; then
-    # The regeneration above rewrites the whole directory, so it would also
-    # DELETE the bindings that are ahead of the runner (coord finding 19f8a714).
-    fail "BUT: $FILE_ATTRIBUTION_AHEAD binding(s) listed above as AHEAD of the runner would be deleted"
-    fail "by that regeneration. They are usually pending registrations"
-    fail "(qontinui-schemas codegen/pending-registration.toml). Commit only this"
-    fail "$STAGE's own files from the regenerated tree, and keep those."
-fi
+print_ahead_caveat
 print_dirty_checkout_note
 
 echo >&2

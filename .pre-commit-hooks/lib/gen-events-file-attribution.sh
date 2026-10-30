@@ -32,9 +32,8 @@
 #             read at the merge-base and in the working tree, by
 #             `lib/gen-events-registry.mjs`, and the two sets are compared. A
 #             registry-ADJACENT input also counts (the exporter binary,
-#             `generate_types.sh`, a `schema_export/` directory, or a `lib.rs`
-#             that stops declaring `pub mod schema_export;` plainly), since it
-#             can change the set without an `add!` line changing.
+#             `generate_types.sh`, a `schema_export/` directory), since it can
+#             change the set without an `add!` line changing.
 #   barrel    `index.ts`: one export line per registered name, so the same rule
 #             applies line by line. Any other line changing counts as
 #             registry-adjacent.
@@ -51,6 +50,8 @@
 # Every doubt falls back to the WHOLE-PUSH verdict that the hook gave before
 # this file existed. The doubts are:
 #   - the registry cannot be read (see the premises in the parser's header);
+#   - `lib.rs` does not declare `pub mod schema_export;` plainly, in the
+#     working tree or (when this change touches it) at the merge-base;
 #   - the parsed working-tree names differ from the set of files the
 #     regeneration actually emitted;
 #   - the registry changed in this push and its merge-base version cannot be
@@ -138,10 +139,12 @@ gen_events_registry_parse() {
     return 0
 }
 
-# Does `lib.rs` (content on stdin) declare the registry module plainly?
-# A `#[path]` anywhere in it fails the check. That is deliberately coarse:
-# `#[path]` could point `schema_export` at a different file, and
-# telling which module an attribute belongs to is not worth the risk.
+# Does `lib.rs` (content on stdin) declare the registry module plainly? It must
+# hold `pub mod schema_export;` and no `path = ...` anywhere. That covers
+# `#[path = "x.rs"]`, `#[cfg_attr(.., path = "x.rs")]` and its rustfmt-wrapped
+# form, any of which could point `schema_export` at a file the registry reader
+# never sees. The check is deliberately coarse: a `path =` in a comment or in
+# unrelated code also fails it, and failing only costs the per-file rule.
 #
 # `grep >/dev/null`, never `grep -q`: the caller runs under pipefail, and a
 # `-q` that exits on its first match can SIGPIPE the writer and turn a match
@@ -150,10 +153,42 @@ _gen_events_lib_rs_premise() {
     local content
     content="$(cat)" || return 1
     printf '%s\n' "$content" | grep -E '^[[:space:]]*pub[[:space:]]+mod[[:space:]]+schema_export[[:space:]]*;' >/dev/null || return 1
-    if printf '%s\n' "$content" | grep -E '#[[:space:]]*!?[[:space:]]*\[[[:space:]]*path\b' >/dev/null; then
+    if printf '%s\n' "$content" | grep -E '(^|[^A-Za-z0-9_])path[[:space:]]*=' >/dev/null; then
         return 1
     fi
     return 0
+}
+
+# The display label of one attribution source, worded for the stage. These
+# are the labels `gen_events_render_mine` prints beside each input.
+_gen_events_source_label() {
+    case "$1:$2" in
+        push:committed)      echo "committed in this push" ;;
+        push:staged)         echo "staged, not committed — not part of this push" ;;
+        push:unstaged)       echo "uncommitted changes — not part of this push" ;;
+        push:untracked)      echo "untracked — not part of this push" ;;
+        push:staged-later)   echo "staged for a later commit — not part of this push" ;;
+        commit:committed)    echo "already committed on this branch" ;;
+        commit:staged)       echo "staged for this commit" ;;
+        commit:unstaged)     echo "unstaged — not in this commit" ;;
+        commit:untracked)    echo "untracked — not in this commit" ;;
+        commit:staged-later) echo "staged for a later commit — not in this commit" ;;
+        *)                   echo "source unknown: '$2'" ;;
+    esac
+}
+
+# `<path> (<label>[; <label>])` for an input path $1, from
+# ATTRIBUTION_TOUCHED_DETAIL. A reason names the input with its label, so the
+# reader can see whether the change is in what is being pushed or only in the
+# working tree. Saying "this push changes it" about a dirty file the push does
+# not carry is the false claim #1667 met.
+_gen_events_input_with_label() {
+    local want="$1" stage="$2" p src labels=""
+    while IFS=$'\t' read -r p src; do
+        [ "$p" = "$want" ] || continue
+        labels+="${labels:+; }$(_gen_events_source_label "$stage" "$src")"
+    done <<< "${ATTRIBUTION_TOUCHED_DETAIL:-}"
+    printf '%s (%s)' "$want" "${labels:-source unknown}"
 }
 
 # A touched input that can reach the export ONLY through a type defined in
@@ -287,17 +322,20 @@ gen_events_file_attribution() {
         _gen_events_is_source_only_input "$p" || shape+="$p"$'\n'
     done <<< "$ATTRIBUTION_TOUCHED"
 
-    # lib.rs is a plain source file while it keeps declaring the registry
-    # module plainly, on both sides. Otherwise it is registry-adjacent.
-    if [ "$lib_touched" = "1" ]; then
-        local lib_ok=1
-        _gen_events_lib_rs_premise < "$repo/src-tauri/src/lib.rs" 2>/dev/null || lib_ok=0
-        git -C "$repo" show "$ATTRIBUTION_BASE_SHA:src-tauri/src/lib.rs" 2>/dev/null \
-            | _gen_events_lib_rs_premise || lib_ok=0
-        if [ "$lib_ok" = "0" ]; then
-            adjacent+="src-tauri/src/lib.rs"$'\n'
-            shape+="src-tauri/src/lib.rs"$'\n'
-        fi
+    # The registry reader trusts that `schema_export` IS schema_export.rs.
+    # lib.rs is checked in the working tree on every decision, because a
+    # `#[path]` already on main would redirect it with lib.rs untouched. When
+    # this change touches lib.rs, the merge-base copy is checked too. Either
+    # failing means the registry the reader parses may not be the one that
+    # compiled, and nothing per-file can be concluded.
+    if ! _gen_events_lib_rs_premise 2>/dev/null < "$repo/src-tauri/src/lib.rs"; then
+        FILE_ATTRIBUTION_REASON="src-tauri/src/lib.rs does not declare \`pub mod schema_export;\` plainly (or carries a path attribute), so the registry file may not be the one that compiled"
+        return 0
+    fi
+    if [ "$lib_touched" = "1" ] && ! git -C "$repo" show "$ATTRIBUTION_BASE_SHA:src-tauri/src/lib.rs" 2>/dev/null \
+            | _gen_events_lib_rs_premise; then
+        FILE_ATTRIBUTION_REASON="src-tauri/src/lib.rs at the merge-base ${ATTRIBUTION_BASE_SHA:0:12} does not declare \`pub mod schema_export;\` plainly, so the registries are not comparable"
+        return 0
     fi
     adjacent="$(printf '%s' "$adjacent" | LC_ALL=C sort -u | sed '/^$/d')"
     shape="$(printf '%s' "$shape" | LC_ALL=C sort -u | sed '/^$/d')"
@@ -352,7 +390,7 @@ gen_events_file_attribution() {
         fi
         rm -f "$base_file"
         if [ "$GEN_EVENTS_REGISTRY_MACRO" != "$wt_macro" ]; then
-            FILE_ATTRIBUTION_REASON="this $stage changes the add! macro itself, so names at the merge-base are not comparable"
+            FILE_ATTRIBUTION_REASON="the add! macro differs from the merge-base's, so names there are not comparable"
             return 0
         fi
         local base_names
@@ -367,6 +405,10 @@ gen_events_file_attribution() {
     fi
 
     local first_adjacent="${adjacent%%$'\n'*}" first_shape="${shape%%$'\n'*}"
+    local registry_label="" adjacent_label="" shape_label=""
+    [ "$registry_touched" = "1" ] && registry_label="$(_gen_events_input_with_label "$GEN_EVENTS_REGISTRY_FILE" "$stage")"
+    [ -n "$first_adjacent" ] && adjacent_label="$(_gen_events_input_with_label "$first_adjacent" "$stage")"
+    [ -n "$first_shape" ] && shape_label="$(_gen_events_input_with_label "$first_shape" "$stage")"
 
     # ── decide each drifted file ───────────────────────────────────────────
     local f name status class why mine_lines="" pre_lines=""
@@ -385,13 +427,13 @@ gen_events_file_attribution() {
                 _gen_events_name_in "$name" "$changed" && hit+="${hit:+, }$name"
             done <<< "$moved"
             if [ -n "$first_adjacent" ]; then
-                mine_lines+="$f"$'\t'"a registry-adjacent input changed ($first_adjacent)"$'\n'
+                mine_lines+="$f"$'\t'"a registry-adjacent input changed: $adjacent_label"$'\n'
             elif [ -n "$hit" ]; then
-                mine_lines+="$f"$'\t'"export lines for names this $stage registers or unregisters: $hit"$'\n'
+                mine_lines+="$f"$'\t'"export lines for names whose registration changed here: $hit; $registry_label"$'\n'
             elif [ "$rest_same" = "0" ]; then
                 pre_lines+="$f"$'\t'"lines other than exports differ, and no input that writes them changed"$'\n'
             else
-                pre_lines+="$f"$'\t'"$(printf '%s\n' "$moved" | _gen_events_count_lines) export line(s) whose registration this $stage does not change"$'\n'
+                pre_lines+="$f"$'\t'"$(printf '%s\n' "$moved" | _gen_events_count_lines) export line(s) whose registration did not change here"$'\n'
             fi
             continue
         fi
@@ -405,12 +447,12 @@ gen_events_file_attribution() {
         case "$status" in
             A|D)
                 if [ -n "$first_adjacent" ]; then
-                    mine_lines+="$f"$'\t'"a registry-adjacent input changed ($first_adjacent)"$'\n'
+                    mine_lines+="$f"$'\t'"a registry-adjacent input changed: $adjacent_label"$'\n'
                 elif _gen_events_name_in "$name" "$changed"; then
                     if [ "$status" = "A" ]; then
-                        why="this $stage registers $name, and the bindings do not carry it"
+                        why="$name is registered here but not at the merge-base, and the bindings do not carry it: $registry_label"
                     else
-                        why="this $stage unregisters $name, and the bindings still carry it"
+                        why="$name is registered at the merge-base but not here, and the bindings still carry it: $registry_label"
                     fi
                     mine_lines+="$f"$'\t'"$why"$'\n'
                 elif [ "$status" = "A" ]; then
@@ -421,13 +463,20 @@ gen_events_file_attribution() {
                 fi
                 ;;
             M)
-                class="$(printf '%s\n' "$wt_rows" | awk -F'\t' -v n="$name" '$1 == n { print $2; exit }')"
+                # Pattern matching on the rows, not a pipe into a reader:
+                # under the hook's pipefail, a reader that stops early can
+                # SIGPIPE the writer on a large registry and end the hook with
+                # no verdict. The parser emits one row per name.
+                case $'\n'"$wt_rows"$'\n' in
+                    *$'\n'"$name"$'\t'external$'\n'*) class=external ;;
+                    *)                                  class=local ;;
+                esac
                 if [ -n "$first_shape" ]; then
-                    mine_lines+="$f"$'\t'"this $stage changes an input that shapes every binding ($first_shape)"$'\n'
+                    mine_lines+="$f"$'\t'"an input that shapes every binding changed: $shape_label"$'\n'
                 elif [ "$class" != "external" ]; then
-                    mine_lines+="$f"$'\t'"$name is defined in this repo, and this $stage changes its sources"$'\n'
+                    mine_lines+="$f"$'\t'"$name is defined in this repo, and runner sources changed here (inputs listed below)"$'\n'
                 else
-                    pre_lines+="$f"$'\t'"$name is defined in the qontinui-schemas crates, and this $stage changes no manifest, lockfile, toolchain, build script or registry file"$'\n'
+                    pre_lines+="$f"$'\t'"$name is defined in the qontinui-schemas crates, and no manifest, lockfile, toolchain, build script or registry file changed here"$'\n'
                 fi
                 ;;
         esac
@@ -443,6 +492,18 @@ gen_events_file_attribution() {
         FILE_ATTRIBUTION_REASON="the two trees do not differ, so there is nothing to attribute"
     fi
     return 0
+}
+
+# The codegen inputs that changed, each with its label, one per line. The
+# pre-existing arm prints these. The failing arm uses gen_events_render_mine,
+# whose notes about local state apply only there.
+gen_events_render_inputs() {
+    local indent="${1:-    }" stage p src
+    stage="$(gen_events_stage)"
+    while IFS=$'\t' read -r p src; do
+        [ -n "$p" ] || continue
+        printf '%s%s  (%s)\n' "$indent" "$p" "$(_gen_events_source_label "$stage" "$src")"
+    done <<< "${ATTRIBUTION_TOUCHED_DETAIL:-}"
 }
 
 # The per-file verdict for the hook to print, one message line per stdout

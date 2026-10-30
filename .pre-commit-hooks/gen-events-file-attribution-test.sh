@@ -337,23 +337,37 @@ commit_change "src-tauri/src/lib.rs" "pub mod another;"
 decide_files
 check "a lib.rs that still declares pub mod schema_export; is a plain source" "pre-existing" "$FILE_ATTRIBUTION_STATE"
 
-fixture
-mk_tree "$BTREE" $REGISTERED Pending
-mk_tree "$RTREE" $REGISTERED
-printf '// lib\npub mod other;\n#[path = "elsewhere.rs"]\npub mod schema_export;\n' > "$WORK/src-tauri/src/lib.rs"
-git -C "$WORK" add -A >/dev/null
-git -C "$WORK" commit --quiet -m "route the registry"
-decide_files
-check "a lib.rs with #[path] is registry-adjacent: MINE" "mine" "$FILE_ATTRIBUTION_STATE"
+# A lib.rs that could point `schema_export` at another file means the
+# registry the reader parses may not be the one that compiled: fall back.
+for routed in \
+    '#[path = "elsewhere.rs"]\npub mod schema_export;' \
+    '#[cfg_attr(all(), path = "elsewhere.rs")]\npub mod schema_export;' \
+    '#[cfg_attr(\n    all(),\n    path = "elsewhere.rs"\n)]\npub mod schema_export;' \
+    '// no module declared'
+do
+    fixture
+    mk_tree "$BTREE" $REGISTERED Pending
+    mk_tree "$RTREE" $REGISTERED
+    printf "// lib\npub mod other;\n$routed\n" > "$WORK/src-tauri/src/lib.rs"
+    git -C "$WORK" add -A >/dev/null
+    git -C "$WORK" commit --quiet -m "route the registry"
+    decide_files
+    check "lib.rs '$(printf '%s' "$routed" | head -c 40 | tr '\n' ' ')' falls back to the whole push" "whole-push" "$FILE_ATTRIBUTION_STATE"
+done
 
+# A `#[path]` that is ALREADY on main redirects the registry with lib.rs
+# untouched by the push: the working-tree check catches it all the same.
 fixture
+printf '// lib\npub mod other;\n#[path = "elsewhere.rs"]\npub mod schema_export;\n' > "$UPSTREAM/src-tauri/src/lib.rs"
+git -C "$UPSTREAM" add -A >/dev/null
+git -C "$UPSTREAM" commit --quiet -m "base: route the registry"
+git -C "$WORK" fetch --quiet origin
+git -C "$WORK" reset --hard --quiet origin/main
 mk_tree "$BTREE" $REGISTERED Pending
 mk_tree "$RTREE" $REGISTERED
-printf '// lib\npub mod other;\n' > "$WORK/src-tauri/src/lib.rs"
-git -C "$WORK" add -A >/dev/null
-git -C "$WORK" commit --quiet -m "drop the module"
+commit_change "src-tauri/src/other.rs" "// a runner change"
 decide_files
-check "a lib.rs that stops declaring the module is registry-adjacent: MINE" "mine" "$FILE_ATTRIBUTION_STATE"
+check "a #[path] already on main, lib.rs untouched, still falls back" "whole-push" "$FILE_ATTRIBUTION_STATE"
 
 echo "  -- content: where the type is defined decides which inputs can move it --"
 
@@ -392,6 +406,25 @@ for shape_input in Cargo.lock Cargo.toml src-tauri/build.rs vendor/x/lib.rs crat
     decide_files
     check "$shape_input shapes every binding: external content drift is MINE" "mine" "$FILE_ATTRIBUTION_STATE"
 done
+
+# A shape input that is only DIRTY, not committed: at push stage the reason
+# must say the push does not carry it, never "this push changes it".
+fixture
+TREE_CONTENT_Alpha='// Alpha schemas-side' mk_tree "$BTREE" $REGISTERED
+mk_tree "$RTREE" $REGISTERED
+commit_change "src/app.ts" "// ui only, committed"
+printf '# dirty\n' >> "$WORK/Cargo.lock"
+(
+    GEN_EVENTS_STAGE_HINT=push
+    decide_files
+    printf '%s\n' "$FILE_ATTRIBUTION_STATE" > "$WORK/.st"
+    printf '%s\n' "$FILE_ATTRIBUTION_MINE" > "$WORK/.mine"
+)
+check "a dirty Cargo.lock still holds external content drift (the regen read it)" "mine" "$(cat "$WORK/.st")"
+check "  and the reason says the push does not carry it" yes \
+    "$(grep -F 'Alpha.d.ts' "$WORK/.mine" | grep -qF 'Cargo.lock (uncommitted changes — not part of this push)' && echo yes || echo no)"
+check "  never 'this push changes'" no \
+    "$(grep -qF 'this push changes' "$WORK/.mine" && echo yes || echo no)"
 
 echo "  -- the barrel --"
 
@@ -484,6 +517,29 @@ decide_files
 check "a push that touches no codegen input never reaches the per-file rule" "whole-push" "$FILE_ATTRIBUTION_STATE"
 check "  (the whole-push attribution already cleared it)" "pre-existing" "$ATTRIBUTION_STATE"
 
+echo "  -- the hook's errexit context survives a large registry --"
+
+# The hook runs under `set -euo pipefail`. A pipe whose reader exits early
+# can SIGPIPE its writer there and end the hook with no verdict. Run one
+# whole decision that way, over 6000 registrations: about 100 KB of registry
+# rows, well past a 64 KB pipe buffer, with the drifted type (Alpha) sorting
+# first so an early-exiting reader would leave most of them unwritten.
+fixture
+BIG_EXTRA="$(for i in $(seq 1 6000); do printf '    add!("Big%04d", qa::Big%04d);\n' "$i" "$i"; done)"
+registry_text "$BIG_EXTRA" > "$UPSTREAM/src-tauri/src/schema_export.rs"
+git -C "$UPSTREAM" add -A >/dev/null
+git -C "$UPSTREAM" commit --quiet -m "base: a large registry"
+git -C "$WORK" fetch --quiet origin
+git -C "$WORK" reset --hard --quiet origin/main
+BIG_NAMES="$REGISTERED $(seq -f 'Big%04g' 1 6000 | tr '\n' ' ')"
+# shellcheck disable=SC2086
+TREE_CONTENT_Alpha='// Alpha schemas-side' mk_tree "$BTREE" $BIG_NAMES Pending
+# shellcheck disable=SC2086
+mk_tree "$RTREE" $BIG_NAMES
+commit_change "src-tauri/src/other.rs" "// a runner change"
+BIG_STATE="$(set -euo pipefail; decide_files >/dev/null 2>&1; printf '%s' "$FILE_ATTRIBUTION_STATE")" || BIG_STATE="aborted (exit $?)"
+check "a 6000-entry decision completes under set -euo pipefail" "pre-existing" "$BIG_STATE"
+
 echo "  -- the registry reader, directly --"
 
 PARSER="$SCRIPT_DIR/lib/gen-events-registry.mjs"
@@ -531,6 +587,24 @@ out="$(registry_text '    add!("Ref", &qa::Ref);' | parse_text)"
 check "a type that is not a plain path is local" "local" \
     "$(printf '%s\n' "$out" | awk -F'\t' '$1=="Ref"{print $2}')"
 
+out="$(registry_text | sed 's/\$name\.to_string()/format!("Q{}", $name)/' | parse_text)"; rc=$?
+check "a macro that builds its key from a literal is refused" 1 "$rc"
+
+out="$( { registry_text; printf '#[path = "x.rs"]\nmod elsewhere;\n'; } | parse_text)"; rc=$?
+check "a path attribute at file level is refused" 1 "$rc"
+check "  naming it" yes "$(case "$out" in *"path attribute"*) echo yes ;; *) echo no ;; esac)"
+
+out="$(registry_text '    if crate::flags::on() { add!("Gated", qa::Gated); }' | parse_text)"; rc=$?
+check "an add! under a runtime condition is refused" 1 "$rc"
+
+out="$( { registry_text '    {
+        use qontinui_vision_core::observation as qob2;
+        add!("InBlock", qob2::InBlock);
+    }
+    add!("Shadowed", qob2::Shadowed);'; printf 'mod qob2 { pub struct Shadowed; }\n'; } | parse_text)"; rc=$?
+check "a file-level mod makes a same-named block alias local" "local" \
+    "$(printf '%s\n' "$out" | awk -F'\t' '$1=="Shadowed"{print $2}')"
+
 for bad in \
     'include!("more.rs");' \
     'mod inner { }' \
@@ -557,7 +631,9 @@ if [ -f "$REAL" ]; then
         "$(printf '%s\n' "$out" | awk -F'\t' '$1=="RunnerFinding"{print $2}')"
     check "  and qontinui_types types (WorkerOutput is external)" "external" \
         "$(printf '%s\n' "$out" | awk -F'\t' '$1=="WorkerOutput"{print $2}')"
-    if git -C "$SCRIPT_DIR/.." show HEAD:src-tauri/src/lib.rs 2>/dev/null | _gen_events_lib_rs_premise; then
+    # The WORKING TREE copy, as the decision reads it: a commit that adds a
+    # path attribute must fail here at that commit, not one commit later.
+    if _gen_events_lib_rs_premise < "$SCRIPT_DIR/../src-tauri/src/lib.rs" 2>/dev/null; then
         check "the real lib.rs declares pub mod schema_export; plainly" yes yes
     else
         check "the real lib.rs declares pub mod schema_export; plainly" yes no
