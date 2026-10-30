@@ -5,7 +5,9 @@
 //! The acquire reply names the holder on every live `held` once
 //! [`super::lease::parse_acquire_body`] reads the reserve door's `holder` key.
 //! This module is the bounded guard for the shapes that parse cannot name: a
-//! coord build that stops emitting the holder, or the empty-string vanish race.
+//! coord build that stops emitting the holder, or the empty-string vanish race
+//! (where an earlier acquire reply's name is NOT re-served: the holder reads
+//! UNKNOWN, `acquire_unnamed`, until the next read is due).
 //! It decides WHEN a `GET /coord/claims/by-resource` fallback read is due (at
 //! most once per [`LEASE_TTL_SECS`] per resource key, failures included, so a
 //! down coord costs one retry per TTL rather than one per 5 s tick) and parses
@@ -36,9 +38,10 @@ pub fn by_resource_url(base: &str) -> String {
     format!("{}{BY_RESOURCE_PATH}", base.trim_end_matches('/'))
 }
 
-/// How long one holder observation stays fresh: the lease TTL. A holder cannot
-/// change more often than its lease turns over, so re-reading inside one TTL
-/// buys nothing.
+/// How long one holder observation is reused before the next by-resource read:
+/// the lease TTL. This is a RATE bound, not a freshness guarantee — a release
+/// frees a slot at once, so a cached name can be up to one TTL stale. The
+/// status view carries `observedAtUnixMs`; the log lines do not show the age.
 pub fn holder_observation_ttl() -> Duration {
     Duration::from_secs(LEASE_TTL_SECS.unsigned_abs())
 }
@@ -54,8 +57,14 @@ pub enum HolderSource {
     /// The holder is UNKNOWN — never a fabricated id.
     LookupFailed(String),
     /// The fallback read answered `null`: nothing held the key by the time we
-    /// looked (the lease turned over between the acquire and the read).
+    /// looked (the lease turned over between the acquire and the read). Coord
+    /// also answers `null` for a holder its read scope hides, so this is "not
+    /// visible to this runner", not proof the slot is free.
     NotHeldAtLookup,
+    /// The acquire reply named no holder, and the name we last had came from
+    /// an EARLIER acquire reply, so the holder may have turned over since.
+    /// UNKNOWN until the next by-resource read is due — never the earlier name.
+    AcquireUnnamed,
 }
 
 /// One observation of a slot's holder, keyed by resource key in the
@@ -73,6 +82,18 @@ impl HolderObservation {
         Self {
             holder: Some(holder),
             source: HolderSource::Acquire,
+            observed_at: now,
+        }
+    }
+
+    /// The acquire reply named nobody and the name we had came from an earlier
+    /// acquire reply: an UNKNOWN holder, observed `now`. It is served, never
+    /// stored (see [`plan_observation`]), so the cached prior keeps the
+    /// one-read-per-TTL clock.
+    pub fn unnamed_after_acquire(now: Instant) -> Self {
+        Self {
+            holder: None,
+            source: HolderSource::AcquireUnnamed,
             observed_at: now,
         }
     }
@@ -112,6 +133,49 @@ pub fn holder_lookup_due(
     match prior {
         None => true,
         Some(p) => now.saturating_duration_since(p.observed_at) >= ttl,
+    }
+}
+
+/// What the supervisor does with one `Held` acquire reply. Pure — the decision
+/// is here so it is testable; the supervisor keeps only the I/O.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObservationPlan {
+    /// Record this observation in the per-key cache, then serve it (the reply
+    /// named the holder).
+    Record(HolderObservation),
+    /// Serve this observation and leave the cache as it is.
+    Serve(HolderObservation),
+    /// A `GET /coord/claims/by-resource` read is due; record its result.
+    Lookup,
+}
+
+/// Decide how to observe a slot's holder on the `Held` arm.
+///
+/// * The reply named the holder → `Record` it.
+/// * Else a read is due ([`holder_lookup_due`]: no prior, or the prior is at
+///   least `ttl` old) → `Lookup`.
+/// * Else the prior name came from an EARLIER acquire reply → `Serve` an
+///   UNKNOWN (`acquire_unnamed`), never that earlier name: the holder may have
+///   turned over. Nothing is recorded, so no extra read happens.
+/// * Else → `Serve` the prior (a by-resource answer, or a failed read).
+pub fn plan_observation(
+    acquire_holder: Option<&SlotHolder>,
+    prior: Option<&HolderObservation>,
+    now: Instant,
+    ttl: Duration,
+) -> ObservationPlan {
+    if let Some(h) = acquire_holder {
+        return ObservationPlan::Record(HolderObservation::from_acquire(h.clone(), now));
+    }
+    match prior {
+        Some(p) if !holder_lookup_due(None, Some(p), now, ttl) => {
+            if p.source == HolderSource::Acquire {
+                ObservationPlan::Serve(HolderObservation::unnamed_after_acquire(now))
+            } else {
+                ObservationPlan::Serve(p.clone())
+            }
+        }
+        _ => ObservationPlan::Lookup,
     }
 }
 
@@ -161,6 +225,7 @@ impl HolderSource {
             HolderSource::ByResource => "by_resource",
             HolderSource::LookupFailed(_) => "lookup_failed",
             HolderSource::NotHeldAtLookup => "not_held_at_lookup",
+            HolderSource::AcquireUnnamed => "acquire_unnamed",
         }
     }
 }
@@ -180,8 +245,9 @@ pub struct SlotHolderView {
     pub source: &'static str,
     /// The holder's machine id is THIS runner's: a session-scoped token on this
     /// box holds the slot (our own token is bare-machine, so our own
-    /// re-acquire answers `renewed`, never `held`).
-    pub is_this_machine: bool,
+    /// re-acquire answers `renewed`, never `held`). `None` when the holder is
+    /// UNKNOWN — whose machine it is cannot be said either way.
+    pub is_this_machine: Option<bool>,
     /// The [`HolderSource::LookupFailed`] detail `source` cannot carry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lookup_error: Option<String>,
@@ -203,7 +269,7 @@ impl SlotHolderView {
         let machine_id = obs.holder.as_ref().map(|h| h.machine_id.clone());
         let is_this_machine = machine_id
             .as_deref()
-            .is_some_and(|m| m.eq_ignore_ascii_case(own_machine_id));
+            .map(|m| m.eq_ignore_ascii_case(own_machine_id));
         let lookup_error = match &obs.source {
             HolderSource::LookupFailed(e) => Some(e.clone()),
             _ => None,
@@ -345,7 +411,11 @@ mod tests {
 
     #[test]
     fn observation_ttl_is_the_lease_ttl() {
-        assert_eq!(holder_observation_ttl(), Duration::from_secs(120));
+        assert_eq!(
+            holder_observation_ttl(),
+            Duration::from_secs(LEASE_TTL_SECS.unsigned_abs()),
+            "one by-resource read per LEASE TTL — derived, never a second constant"
+        );
     }
 
     #[test]
@@ -538,11 +608,75 @@ mod tests {
 
     #[test]
     fn is_this_machine_flags_a_hold_by_our_own_machine_id() {
-        assert!(!view_of(Some(h(PEER)), HolderSource::Acquire).is_this_machine);
-        assert!(view_of(Some(with_session(OWN, "s-other")), HolderSource::Acquire).is_this_machine);
-        assert!(
-            !view_of(None, HolderSource::NotHeldAtLookup).is_this_machine,
-            "an unknown holder is never claimed as this machine"
+        assert_eq!(
+            view_of(Some(h(PEER)), HolderSource::Acquire).is_this_machine,
+            Some(false)
+        );
+        assert_eq!(
+            view_of(Some(with_session(OWN, "s-other")), HolderSource::Acquire).is_this_machine,
+            Some(true)
+        );
+        assert_eq!(
+            view_of(None, HolderSource::NotHeldAtLookup).is_this_machine,
+            None,
+            "an unknown holder is neither this machine nor another"
+        );
+        assert_eq!(
+            view_of(None, HolderSource::AcquireUnnamed).is_this_machine,
+            None
+        );
+    }
+
+    /// The vanish race: an acquire reply naming nobody after an earlier acquire
+    /// named someone serves UNKNOWN — never the earlier name — records nothing
+    /// (so the cached prior keeps the one-read-per-TTL clock), and costs no read.
+    #[test]
+    fn an_unnamed_acquire_after_a_named_one_serves_unknown_not_the_old_name() {
+        let t0 = Instant::now();
+        let named = HolderObservation::from_acquire(h(PEER), t0);
+        let later = t0 + Duration::from_secs(5);
+        assert_eq!(
+            plan_observation(None, Some(&named), later, TTL),
+            ObservationPlan::Serve(HolderObservation::unnamed_after_acquire(later))
+        );
+        let v = view_of(None, HolderSource::AcquireUnnamed);
+        assert_eq!(v.holder_label(), "unknown(acquire_unnamed)");
+        // Past the TTL the read is due again, as for any prior.
+        assert_eq!(
+            plan_observation(None, Some(&named), t0 + TTL, TTL),
+            ObservationPlan::Lookup
+        );
+    }
+
+    #[test]
+    fn plan_observation_records_a_named_reply_and_looks_up_or_reuses_otherwise() {
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(5);
+        // A named reply is recorded whatever the prior says.
+        let looked = HolderObservation::from_lookup(Ok(Some(h("m"))), t0);
+        assert_eq!(
+            plan_observation(Some(&h(PEER)), Some(&looked), later, TTL),
+            ObservationPlan::Record(HolderObservation::from_acquire(h(PEER), later))
+        );
+        // No prior: a read is due.
+        assert_eq!(
+            plan_observation(None, None, t0, TTL),
+            ObservationPlan::Lookup
+        );
+        // A by-resource answer or a failed read inside the TTL is reused as is.
+        assert_eq!(
+            plan_observation(None, Some(&looked), later, TTL),
+            ObservationPlan::Serve(looked.clone())
+        );
+        let failed = HolderObservation::from_lookup(Err("coord status 503".into()), t0);
+        assert_eq!(
+            plan_observation(None, Some(&failed), later, TTL),
+            ObservationPlan::Serve(failed.clone())
+        );
+        // Past the TTL each is due again.
+        assert_eq!(
+            plan_observation(None, Some(&failed), t0 + TTL, TTL),
+            ObservationPlan::Lookup
         );
     }
 
@@ -570,7 +704,7 @@ mod tests {
                 "machineId": null,
                 "session": null,
                 "source": "lookup_failed",
-                "isThisMachine": false,
+                "isThisMachine": null,
                 "lookupError": "coord status 503",
                 "observedAtUnixMs": 1_793_000_000_000_i64
             })
