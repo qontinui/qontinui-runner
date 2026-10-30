@@ -50,7 +50,7 @@ use qontinui_runner_lib::looping_agent::desired_state::{
     self, CoordDesiredState, DesiredSource, EffectiveDesired,
 };
 use qontinui_runner_lib::looping_agent::holder::{
-    self, HolderObservation, HolderViewsByKey, SlotHolderView,
+    self, HolderObservation, HolderViewsByKey, ObservationPlan, SlotHolderView,
 };
 use qontinui_runner_lib::looping_agent::idle::{snapshot_context_low, snapshot_looks_idle};
 use qontinui_runner_lib::looping_agent::lease::{self, HeldSlot, SlotHolder};
@@ -147,33 +147,43 @@ fn set_slot_holder_obs(resource_key: &str, obs: HolderObservation) {
         .insert(resource_key.to_string(), obs);
 }
 
+/// Drop a slot's cached observation when this runner takes or loses the slot:
+/// a holder observed before that is not evidence about the slot after it.
+fn forget_slot_holder_obs(resource_key: &str) {
+    let mut guard = SLOT_HOLDER_OBS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = guard.as_mut() {
+        map.remove(resource_key);
+    }
+}
+
 /// Observe who holds `resource_key` on the `Held` arm.
 ///
 /// * The acquire reply named the holder → record it (`source = Acquire`).
 /// * Else, a fallback read is due (no observation yet, or the last one is at
 ///   least one lease TTL old) → `GET /coord/claims/by-resource` and record
 ///   `ByResource`, `NotHeldAtLookup` or `LookupFailed`.
+/// * Else, the reply named nobody and the prior name came from an EARLIER
+///   acquire reply → UNKNOWN (`acquire_unnamed`), never that earlier name: the
+///   holder may have turned over. No extra read, so the bound holds.
 /// * Else → reuse the prior observation.
 ///
 /// The result is informational: it feeds a log line and the status surface,
-/// never the spawn decision.
+/// never the spawn decision. `tenant_id` is the tenant the key is built from.
 async fn observe_slot_holder(
     resource_key: &str,
     acquire_holder: Option<&SlotHolder>,
+    tenant_id: uuid::Uuid,
 ) -> HolderObservation {
     let now = std::time::Instant::now();
     let ttl = holder::holder_observation_ttl();
     let prior = slot_holder_obs_for(resource_key);
-    // `holder_lookup_due` is the single decision: never due when the acquire
-    // reply named the holder, otherwise due only past one TTL.
-    let due = holder::holder_lookup_due(acquire_holder, prior.as_ref(), now, ttl);
-    let obs = match (due, acquire_holder, prior) {
-        (false, Some(h), _) => HolderObservation::from_acquire(h.clone(), now),
-        (false, None, Some(p)) => return p,
-        // Due — or the impossible (not due, no acquire holder, no prior),
-        // which degrades to a lookup rather than a panic.
-        _ => HolderObservation::from_lookup(
-            crate::looping_agent_coord::lookup_slot_holder(resource_key).await,
+    // The decision is `holder::plan_observation` (pure, tested there); this
+    // function keeps only the cache and the read.
+    let obs = match holder::plan_observation(acquire_holder, prior.as_ref(), now, ttl) {
+        ObservationPlan::Serve(o) => return o,
+        ObservationPlan::Record(o) => o,
+        ObservationPlan::Lookup => HolderObservation::from_lookup(
+            crate::looping_agent_coord::lookup_slot_holder(resource_key, tenant_id).await,
             now,
         ),
     };
@@ -235,9 +245,17 @@ fn note_slot_holder(agent_id: &str, view: SlotHolderView) {
     };
     if changed {
         let holder_machine = view.holder_label();
-        let holder_session = view.session.as_deref().unwrap_or("none");
-        if view.is_this_machine {
-            info!(
+        // No machine id means the holder is UNKNOWN, so its session is too.
+        let holder_session = view
+            .session
+            .as_deref()
+            .unwrap_or(if view.machine_id.is_some() {
+                "none"
+            } else {
+                "unknown"
+            });
+        match view.is_this_machine {
+            Some(true) => info!(
                 agent = %agent_id,
                 resource_key = %view.resource_key,
                 %holder_machine,
@@ -245,9 +263,8 @@ fn note_slot_holder(agent_id: &str, view: SlotHolderView) {
                 source = view.source,
                 this_machine = true,
                 "looping_agent_supervisor: slot held by another session on this machine (holder changed)"
-            );
-        } else {
-            info!(
+            ),
+            Some(false) => info!(
                 agent = %agent_id,
                 resource_key = %view.resource_key,
                 %holder_machine,
@@ -255,7 +272,15 @@ fn note_slot_holder(agent_id: &str, view: SlotHolderView) {
                 source = view.source,
                 this_machine = false,
                 "looping_agent_supervisor: slot held by another runner (holder changed)"
-            );
+            ),
+            None => info!(
+                agent = %agent_id,
+                resource_key = %view.resource_key,
+                %holder_machine,
+                holder_session,
+                source = view.source,
+                "looping_agent_supervisor: slot held by an unidentified holder (holder changed)"
+            ),
         }
     }
     let mut guard = LAST_SLOT_HOLDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -907,22 +932,31 @@ async fn reconcile_slot_lease(
         // Stolen: another supervisor owns this slot now. Drop our memo and fall
         // through to the acquire path — if a slot is genuinely free we take it,
         // otherwise we do nothing this tick.
-        let (holder, holder_session) = match &outcome {
+        let (holder, holder_session, what) = match &outcome {
             lease::HeartbeatOutcome::Stolen { holder: Some(h) } => (
                 h.machine_id.clone(),
                 h.session.clone().unwrap_or_else(|| "none".to_string()),
+                "slot lease lost (stolen) — another runner owns this slot now",
             ),
-            lease::HeartbeatOutcome::NotHeld => ("none (expired)".to_string(), "none".to_string()),
-            _ => ("unknown".to_string(), "unknown".to_string()),
+            lease::HeartbeatOutcome::NotHeld => (
+                "none (expired)".to_string(),
+                "none".to_string(),
+                "slot lease lost (expired) — no runner holds it now",
+            ),
+            _ => (
+                "unknown".to_string(),
+                "unknown".to_string(),
+                "slot lease lost — its new holder is unknown",
+            ),
         };
         warn!(
             agent = %agent_id,
             resource_key = %slot.resource_key,
             %holder,
             %holder_session,
-            "looping_agent_supervisor: slot lease lost (stolen/expired) — another runner owns \
-             this slot now"
+            "looping_agent_supervisor: {what}"
         );
+        forget_slot_holder_obs(&slot.resource_key);
         clear_held_slot(agent_id);
     }
 
@@ -957,6 +991,7 @@ async fn reconcile_slot_lease(
                     %resource_key,
                     "looping_agent_supervisor: acquired slot lease — spawn permitted"
                 );
+                forget_slot_holder_obs(&resource_key);
                 set_held_slot(agent_id, HeldSlot { slot, resource_key });
                 forget_slot_holder(agent_id);
                 return true;
@@ -968,7 +1003,7 @@ async fn reconcile_slot_lease(
                 // this arm's control flow — a Held slot stays held and we fall
                 // through to "try the next slot" whatever the lookup says
                 // (named, not-held-at-lookup, or failed).
-                let obs = observe_slot_holder(&resource_key, holder.as_ref()).await;
+                let obs = observe_slot_holder(&resource_key, holder.as_ref(), tenant_id).await;
                 let age_ms =
                     i64::try_from(obs.observed_at.elapsed().as_millis()).unwrap_or(i64::MAX);
                 let observed_at_unix_ms =
@@ -979,20 +1014,25 @@ async fn reconcile_slot_lease(
                     &machine_id.to_string(),
                     observed_at_unix_ms,
                 );
-                if view.is_this_machine {
-                    debug!(
+                match view.is_this_machine {
+                    Some(true) => debug!(
                         agent = %agent_id,
                         %resource_key,
                         holder = %view.holder_label(),
                         "looping_agent_supervisor: slot held by another session on this machine — trying the next"
-                    );
-                } else {
-                    debug!(
+                    ),
+                    Some(false) => debug!(
                         agent = %agent_id,
                         %resource_key,
                         holder = %view.holder_label(),
                         "looping_agent_supervisor: slot held by another runner — trying the next"
-                    );
+                    ),
+                    None => debug!(
+                        agent = %agent_id,
+                        %resource_key,
+                        holder = %view.holder_label(),
+                        "looping_agent_supervisor: slot held by an unidentified holder — trying the next"
+                    ),
                 }
                 note_slot_holder(agent_id, view);
             }

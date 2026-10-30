@@ -79,9 +79,8 @@ pub const LEASE_TTL_SECS: i64 = 120;
 
 /// Who holds a slot lease that is not ours, as coord named it.
 ///
-/// `machine_id` is the holder's runner machine id — the key coord stores the
-/// claim under, and the stable identifier fleet views (`coord_query_workers`)
-/// use. `session` is the holder's `agent_session_id` when the holding token is
+/// `machine_id` is the holder's runner machine id, as coord parses it from the
+/// claim's stored owner token. `session` is the holder's `agent_session_id` when the holding token is
 /// session-scoped (`machine:session`); our own token is bare-machine, so a
 /// `Some` session on our own machine id means a DIFFERENT session on this box.
 #[derive(Debug, Clone, PartialEq, Eq)]

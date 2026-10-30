@@ -136,7 +136,7 @@ async fn fetch_desired_state() -> Result<Vec<CoordDesiredState>, String> {
     let url = format!("{base}/coord/agent-desired-state");
     let client = http_client()?;
 
-    // coord-tenant-scope(device): fleet-wide supervisor poll -- only base is in scope (:133); coord lifts the tenant from the JWT so a device reads only its own fleet's desired state.
+    // coord-tenant-scope(device): fleet-wide supervisor poll -- only the coord base (from coord_base_with_source) is in scope; coord lifts the tenant from the JWT so a device reads only its own fleet's desired state.
     let resp = crate::auth::attach_device_auth(client.get(&url))
         .send()
         .await
@@ -233,7 +233,7 @@ pub async fn acquire_slot(
     let url = format!("{base}/claims/acquire");
     let body = claim_body(resource_key, machine_id, agent_id, claude_session_id);
 
-    // coord-tenant-scope(device): the Tier-0 per-machine slot lease: claim_body sets agent_session_id: Value::Null explicitly (:206) and no tenant_id -- sending nothing is correct.
+    // coord-tenant-scope(device): the Tier-0 per-machine slot lease: claim_body sets agent_session_id: Value::Null explicitly and no tenant_id -- sending nothing is correct.
     let resp = match crate::auth::attach_device_auth(client.post(&url).json(&body))
         .send()
         .await
@@ -300,7 +300,7 @@ pub async fn release_slot(resource_key: &str, machine_id: &uuid::Uuid, agent_id:
     };
     let url = format!("{base}/claims/release");
     let body = claim_body(resource_key, machine_id, agent_id, None);
-    // coord-tenant-scope(device): same per-machine slot lease, release verb; claude_session_id is passed None at :306.
+    // coord-tenant-scope(device): same per-machine slot lease, release verb; claude_session_id is passed None by release_slot.
     match crate::auth::attach_device_auth(client.post(&url).json(&body))
         .send()
         .await
@@ -319,18 +319,28 @@ pub async fn release_slot(resource_key: &str, machine_id: &uuid::Uuid, agent_id:
 /// INFORMATIONAL ONLY. The answer names a holder for a log line and the status
 /// surface; it is never permission and never consulted by the spawn gate. The
 /// caller bounds it to one read per lease TTL per key
-/// (`looping_agent::holder::holder_lookup_due`). `Ok(None)` = nothing holds the
-/// key now; `Err` = we could not tell (transport, non-2xx, unparseable body).
-pub async fn lookup_slot_holder(resource_key: &str) -> Result<Option<SlotHolder>, String> {
+/// (`looping_agent::holder::holder_lookup_due`). `Ok(None)` = nothing visible
+/// holds the key now (coord also answers `null` for a holder its read scope
+/// hides); `Err` = we could not tell (transport, non-2xx, unparseable body).
+///
+/// `tenant_id` is the tenant the slot key is built from, and the bearer is
+/// that tenant's (`TenantScope::Owned`): coord reads this route unscoped
+/// while `COORD_CLAIMS_READ_AUTH_REQUIRED` is dark, and scopes it to the
+/// bearer's tenant once armed, so stating the key's tenant keeps the read
+/// right in both postures.
+pub async fn lookup_slot_holder(
+    resource_key: &str,
+    tenant_id: uuid::Uuid,
+) -> Result<Option<SlotHolder>, String> {
     let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     let client = http_client()?;
     let url = by_resource_url(&base);
 
-    // coord-tenant-scope(device): read-only lookup of the same per-machine slot lease; only base and resource_key are in scope, and coord lifts the tenant from the device JWT so a device reads only its own tenant's claims.
-    let resp = crate::auth::attach_device_auth(
+    let resp = crate::auth::attach_device_auth_for(
         client
             .get(&url)
             .query(&[("kind", LEASE_CLAIM_KIND), ("key", resource_key)]),
+        crate::auth::TenantScope::Owned(tenant_id),
     )
     .send()
     .await
@@ -359,7 +369,7 @@ pub async fn fetch_playbook(name: &str) -> Option<String> {
     let client = http_client().ok()?;
     let url = format!("{base}/coord/agent-playbook/{name}");
 
-    // coord-tenant-scope(device): only name and base are in scope (:330-332); the fleet playbook is a per-tenant document and the device default IS the fleet this runner belongs to.
+    // coord-tenant-scope(device): only name and the coord base (from coord_base_with_source) are in scope; the fleet playbook is a per-tenant document and the device default IS the fleet this runner belongs to.
     let resp = crate::auth::attach_device_auth(client.get(&url))
         .send()
         .await
