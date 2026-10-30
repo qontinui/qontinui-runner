@@ -19,6 +19,7 @@
 //! whatever the holder read says. Naming the holder changes a log line and a
 //! status field, never a spawn decision.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::lease::{SlotHolder, LEASE_TTL_SECS};
@@ -184,15 +185,20 @@ pub struct SlotHolderView {
     /// The [`HolderSource::LookupFailed`] detail `source` cannot carry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lookup_error: Option<String>,
+    /// Wall-clock time (Unix ms) of the observation this view was built from,
+    /// so an operator can see its age. Not part of [`holder_changed`]'s key.
+    pub observed_at_unix_ms: i64,
 }
 
 impl SlotHolderView {
     /// Build the view of one observation. `own_machine_id` is this runner's
-    /// `SessionRegistry::machine_id()`.
+    /// `SessionRegistry::machine_id()`; `observed_at_unix_ms` is the wall-clock
+    /// equivalent of `obs.observed_at` (the caller owns the clock).
     pub fn from_observation(
         resource_key: &str,
         obs: &HolderObservation,
         own_machine_id: &str,
+        observed_at_unix_ms: i64,
     ) -> Self {
         let machine_id = obs.holder.as_ref().map(|h| h.machine_id.clone());
         let is_this_machine = machine_id
@@ -209,6 +215,7 @@ impl SlotHolderView {
             source: obs.source.as_str(),
             is_this_machine,
             lookup_error,
+            observed_at_unix_ms,
         }
     }
 
@@ -225,8 +232,8 @@ impl SlotHolderView {
 }
 
 /// Is `next` a different holder from `prev`? Compares on
-/// `(resource_key, machine_id, session)` only: `source` and `lookup_error` are
-/// left out, so re-observing the same holder through a different door (or a
+/// `(resource_key, machine_id, session)` only: `source`, `lookup_error` and
+/// `observed_at_unix_ms` are left out, so re-observing the same holder through a different door (or a
 /// second failed read) is not a change and does not re-log at INFO.
 pub fn holder_changed(prev: Option<&SlotHolderView>, next: &SlotHolderView) -> bool {
     match prev {
@@ -236,6 +243,21 @@ pub fn holder_changed(prev: Option<&SlotHolderView>, next: &SlotHolderView) -> b
                 != (&next.resource_key, &next.machine_id, &next.session)
         }
     }
+}
+
+/// The last-logged holder view per slot resource key, for ONE agent.
+pub type HolderViewsByKey = HashMap<String, SlotHolderView>;
+
+/// Record `view` as the last-logged holder of its resource key and return
+/// whether it is a CHANGE for that key (the INFO edge).
+///
+/// Keyed per resource key, not per agent: an agent walking several held slots
+/// in one tick must not compare slot 1's holder against slot 0's and log a
+/// "change" on every tick.
+pub fn record_holder_view(last_by_key: &mut HolderViewsByKey, view: &SlotHolderView) -> bool {
+    let changed = holder_changed(last_by_key.get(&view.resource_key), view);
+    last_by_key.insert(view.resource_key.clone(), view.clone());
+    changed
 }
 
 #[cfg(test)]
@@ -407,7 +429,6 @@ mod tests {
     fn lookup_url_uses_the_coord_prefixed_read_path() {
         let url = by_resource_url("https://coord.example.com");
         assert_eq!(url, "https://coord.example.com/coord/claims/by-resource");
-        assert!(url.ends_with("/coord/claims/by-resource"));
         // A trailing slash on the base does not produce `//coord`.
         assert_eq!(
             by_resource_url("http://127.0.0.1:8080/"),
@@ -420,6 +441,7 @@ mod tests {
     const KEY: &str = "role:c231d9da-0ca8-4fe4-bd81-0e3d6c20339a:merge_shepherd:0";
     const OWN: &str = "c79a07d5-0000-4000-8000-000000000001";
     const PEER: &str = "3e7e4b04-75de-4efb-b718-c8ce8fcf7b17";
+    const OBSERVED_MS: i64 = 1_793_000_000_000;
 
     fn view_of(holder: Option<SlotHolder>, source: HolderSource) -> SlotHolderView {
         let obs = HolderObservation {
@@ -427,7 +449,7 @@ mod tests {
             source,
             observed_at: Instant::now(),
         };
-        SlotHolderView::from_observation(KEY, &obs, OWN)
+        SlotHolderView::from_observation(KEY, &obs, OWN, OBSERVED_MS)
     }
 
     fn with_session(machine_id: &str, session: &str) -> SlotHolder {
@@ -536,7 +558,8 @@ mod tests {
                 "machineId": "3e7e4b04-75de-4efb-b718-c8ce8fcf7b17",
                 "session": "s-1",
                 "source": "acquire",
-                "isThisMachine": false
+                "isThisMachine": false,
+                "observedAtUnixMs": 1_793_000_000_000_i64
             })
         );
         let failed = view_of(None, HolderSource::LookupFailed("coord status 503".into()));
@@ -548,8 +571,43 @@ mod tests {
                 "session": null,
                 "source": "lookup_failed",
                 "isThisMachine": false,
-                "lookupError": "coord status 503"
+                "lookupError": "coord status 503",
+                "observedAtUnixMs": 1_793_000_000_000_i64
             })
         );
+    }
+
+    #[test]
+    fn observation_time_is_not_part_of_the_change_key() {
+        let a = view_of(Some(h(PEER)), HolderSource::Acquire);
+        let mut b = a.clone();
+        b.observed_at_unix_ms += 120_000;
+        assert!(!holder_changed(Some(&a), &b));
+    }
+
+    /// Review round 1, MAJOR: with several held slots, the per-agent memo used
+    /// to compare slot 1's holder against slot 0's and log a "change" every
+    /// tick. Per-key edge detection: two held keys walked on two ticks log
+    /// exactly one change each, on the first tick only.
+    #[test]
+    fn alternating_held_keys_across_ticks_change_only_once_per_key() {
+        let key0 = "role:t:merge_shepherd:0";
+        let key1 = "role:t:merge_shepherd:1";
+        let view = |key: &str, machine: &str| {
+            let obs = HolderObservation::from_acquire(h(machine), Instant::now());
+            SlotHolderView::from_observation(key, &obs, OWN, OBSERVED_MS)
+        };
+        let mut last = HolderViewsByKey::new();
+        // Tick 1: both keys are first observations.
+        assert!(record_holder_view(&mut last, &view(key0, "machine-a")));
+        assert!(record_holder_view(&mut last, &view(key1, "machine-b")));
+        // Tick 2 (and 3): same holders, same walk order → no change, no INFO.
+        for _ in 0..2 {
+            assert!(!record_holder_view(&mut last, &view(key0, "machine-a")));
+            assert!(!record_holder_view(&mut last, &view(key1, "machine-b")));
+        }
+        // A real change on one key is still an edge, and only for that key.
+        assert!(record_holder_view(&mut last, &view(key1, "machine-c")));
+        assert!(!record_holder_view(&mut last, &view(key0, "machine-a")));
     }
 }
