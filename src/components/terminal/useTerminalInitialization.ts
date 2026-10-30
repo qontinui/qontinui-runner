@@ -982,7 +982,8 @@ export function reconnectedTabFor(
  *   honest surface is the informational "terminal restored — fresh
  *   conversation" note, and the marker is CLEARED because no resume is or will
  *   be pending.
- * - `skip-unknown` — the live registry was unreadable, so we failed closed and
+ * - `skip-unknown` — the live registry was unreadable, or ({@link drainColdResume})
+ *   another resume of the id held its in-flight claim, so we failed closed and
  *   did not resume. The conversation may well still be resumable, so this gets
  *   the actionable `resumeFailed` banner whose Retry re-runs
  *   {@link runVerifiedResume}. The marker is cleared here too: leaving it set
@@ -1084,8 +1085,10 @@ export async function applyDrainSkip(params: {
  * a click reads the id as free. Holding the claim across the type, and for the
  * grace after it, makes that click see the resume in flight instead. An id
  * already claimed in this window (a click, the Retry, another restore) is
- * skipped as alive — no read, no type — and gets the same skip disposition
- * ({@link applyDrainSkip}) as a drain-time `skip-alive`.
+ * skipped — no read, no type — with the `skip-unknown` disposition
+ * ({@link applyDrainSkip}: resume-failed banner + gated Retry), not
+ * skip-alive's: the claim holder may be a dialog the operator then cancels, so
+ * the claim is no proof the conversation is live.
  *
  * Re-read the registry immediately before typing EACH resume, with the
  * classify-time polarity: the classify-time snapshot is up to ~25 s stale by
