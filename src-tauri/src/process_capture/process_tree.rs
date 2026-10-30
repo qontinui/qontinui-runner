@@ -31,6 +31,35 @@ pub struct PidWithSpawnedAt {
     /// Process creation time as Unix epoch seconds. `0` if the platform
     /// helper failed to resolve it (e.g. permission-denied on `/proc/<pid>/stat`).
     pub spawned_at_unix: i64,
+    /// The exact creation time (Windows FILETIME, 100 ns) when the table that
+    /// produced this record carried one ([`ProcessSnapshot::creation_filetimes`]).
+    /// A kill compares it EXACTLY against the live process's own; a record
+    /// without it (the WMI fallback, a non-Windows walk, or a file persisted
+    /// before this field) falls back to the second-granular window
+    /// (`health::is_same_process`). `serde(default)`: older persisted state
+    /// loads as `None`.
+    ///
+    /// Only an EXACT source may fill this: the in-process walk's
+    /// `GetProcessTimes` value. Open PR #2417 also fills `creation_filetimes`
+    /// from the CIM fallback, whose values are microsecond-truncated and can be
+    /// an hour off in the DST fall-back hour; the exact compare would refuse
+    /// every such record — fail safe, but the reap would silently stop. A
+    /// fallback-sourced time belongs in `spawned_at_unix` (the window), not here.
+    #[serde(default)]
+    pub spawned_at_ft: Option<u64>,
+}
+
+impl PidWithSpawnedAt {
+    /// `pid`'s record as `snapshot` saw it: its creation time in Unix seconds
+    /// (`0` when absent or unreadable) and its exact FILETIME when the
+    /// snapshot carries one.
+    pub fn from_snapshot(pid: u32, snapshot: &ProcessSnapshot) -> Self {
+        PidWithSpawnedAt {
+            pid,
+            spawned_at_unix: snapshot.creation_times.get(&pid).copied().unwrap_or(0),
+            spawned_at_ft: snapshot.creation_filetimes.get(&pid).copied(),
+        }
+    }
 }
 
 /// Snapshot of the process table relevant to one discovery pass.
@@ -411,11 +440,58 @@ fn normalize_dir(p: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// One fresh descendant-discovery pass ([`discover_descendants_with_parent_map`]).
+#[derive(Debug, Clone)]
+pub struct DescendantDiscovery {
+    /// The root's OWN record — its creation time as the same table saw it, so
+    /// the orphan reclaim's pid-reuse guard compares against when the root
+    /// was created, not when it was discovered.
+    pub root: PidWithSpawnedAt,
+    /// Every descendant (NOT the root), each with its exact FILETIME when the
+    /// table carries one.
+    pub descendants: Vec<PidWithSpawnedAt>,
+    /// The fresh table the pass read: its parent map for service
+    /// identification, and its creation times for [`merge_tracked`].
+    pub snapshot: ProcessSnapshot,
+}
+
+/// The tracked set after a discovery pass: every descendant the walk found
+/// (`walked`), plus each PREVIOUSLY tracked entry the walk did not find that
+/// is still the same process in the SAME fresh `snapshot`
+/// (`health::is_same_process`: the exact FILETIME when both sides carry one,
+/// the 2 s window otherwise). An entry the table no longer lists, or whose
+/// pid now names another process, is dropped.
+///
+/// Why not replace: a walk from the root cannot reach a worker whose parent
+/// (a reloader) exited, yet that orphan may hold the health port; replacing
+/// the set would forget it, and `stop()` reaps only what is tracked.
+pub fn merge_tracked(
+    previous: &[PidWithSpawnedAt],
+    walked: Vec<PidWithSpawnedAt>,
+    snapshot: &ProcessSnapshot,
+) -> Vec<PidWithSpawnedAt> {
+    let mut merged = walked;
+    for prev in previous {
+        if merged.iter().any(|w| w.pid == prev.pid) {
+            continue;
+        }
+        let Some(&live_unix) = snapshot.creation_times.get(&prev.pid) else {
+            continue;
+        };
+        let live_ft = snapshot.creation_filetimes.get(&prev.pid).copied();
+        if super::health::is_same_process(*prev, live_unix, live_ft) {
+            merged.push(*prev);
+        }
+    }
+    merged
+}
+
 /// Discover every descendant of `root_pid` (NOT including the root itself).
 ///
-/// Returns `(descendants, parent_map)`. The parent map is restricted to the
-/// system-wide snapshot — `identify_service_pid` only walks the descendant
-/// subset, but the full map is useful for §3.5 sibling-tree reasoning.
+/// Returns the root's own record, the descendants and the parent map. The
+/// parent map is restricted to the system-wide snapshot —
+/// `identify_service_pid` only walks the descendant subset, but the full map
+/// is useful for §3.5 sibling-tree reasoning.
 ///
 /// Reads a table whose walk began after this call (never the memo): the
 /// caller runs once, seconds after a spawn, and a memoized table could predate
@@ -424,17 +500,20 @@ fn normalize_dir(p: &str) -> String {
 ///
 /// `None` when the table is UNKNOWN ([`ProcessSnapshot::is_unknown`]: the read
 /// failed, or only a `stale` table describing the tree as it WAS is
-/// available) — distinct from `Some((vec![], _))`, a read that found no
-/// descendants.
-pub async fn discover_descendants_with_parent_map(
-    root_pid: u32,
-) -> Option<(Vec<PidWithSpawnedAt>, HashMap<u32, Vec<u32>>)> {
+/// available) — distinct from a `Some` with no descendants, a read that found
+/// none.
+pub async fn discover_descendants_with_parent_map(root_pid: u32) -> Option<DescendantDiscovery> {
     let snapshot = snapshot_process_table_fresh().await;
     if snapshot.is_unknown() {
         return None;
     }
+    let root = PidWithSpawnedAt::from_snapshot(root_pid, &snapshot);
     let descendants = collect_descendants_from_snapshot(root_pid, &snapshot);
-    Some((descendants, snapshot.parent_map))
+    Some(DescendantDiscovery {
+        root,
+        descendants,
+        snapshot,
+    })
 }
 
 /// A process-table snapshot, at most [`super::process_table::MEMO_TTL`] old,
@@ -586,6 +665,7 @@ fn bfs_descendants_from(
         out.push(PidWithSpawnedAt {
             pid,
             spawned_at_unix: creation_times.get(&pid).copied().unwrap_or(0),
+            spawned_at_ft: None,
         });
         if let Some(kids) = parent_map.get(&pid) {
             for k in kids {
@@ -596,11 +676,16 @@ fn bfs_descendants_from(
     out
 }
 
+/// Every descendant of `root` in `snapshot`, each with the exact FILETIME the
+/// snapshot carries for it (W2: a later kill compares it exactly).
 fn collect_descendants_from_snapshot(
     root: u32,
     snapshot: &ProcessSnapshot,
 ) -> Vec<PidWithSpawnedAt> {
     bfs_descendants_from(root, &snapshot.parent_map, &snapshot.creation_times)
+        .into_iter()
+        .map(|d| PidWithSpawnedAt::from_snapshot(d.pid, snapshot))
+        .collect()
 }
 
 // ============================================================================
@@ -1021,8 +1106,33 @@ pub(super) fn snapshot_process_table_sync() -> ProcessSnapshot {
     snap
 }
 
+/// A `/proc/<pid>/stat` line's state (field 3) and start time in Unix
+/// seconds (field 22, clock ticks since boot, plus `btime`): the start time
+/// [`snapshot_process_table_sync`] records. `None` when a field does not
+/// parse or a time is not positive. Pure, so it is tested on every OS.
+pub(super) fn parse_proc_stat(stat: &str, btime: i64, ticks_per_sec: i64) -> Option<(char, i64)> {
+    // comm may hold spaces and parens; the fields follow its LAST ')'.
+    let (_, tail) = stat.rsplit_once(')')?;
+    let mut fields = tail.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    // The state was field 0 of the tail; the start time is field 19.
+    let ticks: i64 = fields.nth(18)?.parse().ok()?;
+    (btime > 0 && ticks > 0 && ticks_per_sec > 0).then(|| (state, btime + ticks / ticks_per_sec))
+}
+
+/// `pid`'s state and start time ([`parse_proc_stat`]) from
+/// `/proc/<pid>/stat`, against a `btime` the caller read once for the whole
+/// tick ([`read_btime`]). `None` when the pid is gone or `/proc` is absent.
 #[cfg(unix)]
-fn read_btime() -> Option<i64> {
+pub(super) fn proc_stat(pid: u32, btime: i64) -> Option<(char, i64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as i64;
+    parse_proc_stat(&stat, btime, per_sec)
+}
+
+/// The boot time (`btime`, Unix seconds) from `/proc/stat`.
+#[cfg(unix)]
+pub(super) fn read_btime() -> Option<i64> {
     let s = std::fs::read_to_string("/proc/stat").ok()?;
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("btime ") {
@@ -1306,8 +1416,116 @@ mod tests {
             .map(|(p, t)| PidWithSpawnedAt {
                 pid: *p,
                 spawned_at_unix: *t,
+                spawned_at_ft: None,
             })
             .collect()
+    }
+
+    /// A record taken from a snapshot carries the pid's CREATION time and,
+    /// when the table has it, the exact FILETIME (W2) — for the discovered
+    /// root as for every descendant (N7: the root used to be recorded with
+    /// the discovery instant). A pid the table does not list records `0` and
+    /// no FILETIME, which the reclaim and the kill treat as unknown.
+    #[test]
+    fn records_from_a_snapshot_carry_creation_time_and_filetime() {
+        let mut snap = ProcessSnapshot {
+            stale: false,
+            ..ProcessSnapshot::default()
+        };
+        snap.parent_map.insert(7, vec![8]);
+        snap.creation_times.insert(7, 1_715_911_000);
+        snap.creation_times.insert(8, 1_715_911_001);
+        snap.creation_filetimes.insert(7, 133_000_000_000_000_007);
+        assert_eq!(
+            PidWithSpawnedAt::from_snapshot(7, &snap),
+            PidWithSpawnedAt {
+                pid: 7,
+                spawned_at_unix: 1_715_911_000,
+                spawned_at_ft: Some(133_000_000_000_000_007),
+            }
+        );
+        assert_eq!(
+            PidWithSpawnedAt::from_snapshot(9, &snap),
+            PidWithSpawnedAt {
+                pid: 9,
+                spawned_at_unix: 0,
+                spawned_at_ft: None,
+            }
+        );
+        assert_eq!(
+            collect_descendants_from_snapshot(7, &snap),
+            vec![PidWithSpawnedAt {
+                pid: 8,
+                spawned_at_unix: 1_715_911_001,
+                spawned_at_ft: None,
+            }]
+        );
+        snap.creation_filetimes.insert(8, 133_000_000_000_000_018);
+        assert_eq!(
+            collect_descendants_from_snapshot(7, &snap)[0].spawned_at_ft,
+            Some(133_000_000_000_000_018)
+        );
+    }
+
+    /// B1: rediscovery merges instead of replacing. A tracked orphan the new
+    /// walk cannot reach (its parent exited) is kept while it is still the
+    /// same process; a tracked entry the table no longer lists is dropped,
+    /// and so is one whose pid now names another process (exact FILETIME,
+    /// or the 2 s window without one). The walk's own record wins on a pid
+    /// it found.
+    #[test]
+    fn merge_tracked_keeps_a_live_orphan_and_drops_the_dead_and_the_reused() {
+        let rec = |pid, unix, ft| PidWithSpawnedAt {
+            pid,
+            spawned_at_unix: unix,
+            spawned_at_ft: ft,
+        };
+        let mut snap = ProcessSnapshot {
+            stale: false,
+            ..ProcessSnapshot::default()
+        };
+        // 11: the walk's worker; 21: the orphan, same process; 23: reused
+        // (window arm); 24: reused (exact arm, same second); 22: gone.
+        for (pid, unix) in [(11, 1_000), (21, 1_005), (23, 1_100), (24, 1_006)] {
+            snap.parent_map.entry(0).or_default().push(pid);
+            snap.creation_times.insert(pid, unix);
+        }
+        snap.creation_filetimes.insert(21, 210);
+        snap.creation_filetimes.insert(24, 241);
+        let previous = [
+            rec(11, 999, None),
+            rec(21, 1_005, Some(210)),
+            rec(22, 1_004, None),
+            rec(23, 1_000, None),
+            rec(24, 1_006, Some(240)),
+        ];
+        let walked = vec![rec(11, 1_000, None)];
+        assert_eq!(
+            merge_tracked(&previous, walked, &snap),
+            vec![rec(11, 1_000, None), rec(21, 1_005, Some(210))]
+        );
+    }
+
+    /// The stat parser takes the state and start time from after comm's
+    /// LAST ')' (comm may hold both), and reports a zombie's `Z`.
+    #[test]
+    fn proc_stat_parser_reads_state_and_start_time_after_the_last_paren() {
+        let tail = "1 1234 1234 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 5000 0 0";
+        let zombie = format!("1234 (my (odd) proc) Z {tail}");
+        assert_eq!(
+            parse_proc_stat(&zombie, 1_700_000_000, 100),
+            Some(('Z', 1_700_000_050))
+        );
+        let running = format!("1234 (svc) S {tail}");
+        assert_eq!(
+            parse_proc_stat(&running, 1_700_000_000, 100),
+            Some(('S', 1_700_000_050))
+        );
+        assert_eq!(
+            parse_proc_stat("1234 (svc) S 1 2", 1_700_000_000, 100),
+            None
+        );
+        assert_eq!(parse_proc_stat(&running, 0, 100), None, "no boot time");
     }
 
     #[test]
