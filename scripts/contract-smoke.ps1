@@ -273,13 +273,16 @@ $SKIP_ROUTES = @{
 # SKIP carrying its reason, and ANY other answer is a FAIL. The fallback is
 # recognised by its own signature, never by the bare fact of a 404:
 # `not_found_handler` in src-tauri/src/mcp_api.rs answers every unmatched route
-# with a JSON 404 whose error is "No route for <METHOD> <path>"
+# with a JSON 404 whose error starts with "No route for <METHOD> <path>"
 # (`not_found_message`), so a 404 carrying that error for the request the probe
 # sent is a SKIP. A 404 a landed handler answers itself is a FAIL: the entry is
-# stale -- delete it. So is a 404 with no readable body. This runner never sends
-# one (`envelope_rewrite_middleware` in src-tauri/src/mcp/envelope.rs gives every
-# bodiless 4xx/5xx a JSON envelope), so an empty body means the probe lost it,
-# and an unknown verdict must not keep an entry alive. This is the twin of
+# stale -- delete it. A 404 with no readable body, or with a body that is not a
+# JSON envelope with a string error, is a FAIL too, because it is never the
+# fallback's: `envelope_rewrite_middleware` in src-tauri/src/mcp/envelope.rs
+# gives every 4xx/5xx with an empty, missing or text/plain Content-Type a JSON
+# envelope, and the fallback always answers JSON. Such a body means either the
+# probe lost it or a handler sent it, and an unknown verdict must not keep an
+# entry alive. This is the twin of
 # `sdk_only_baseline` in src-tauri/src/mcp/ui_bridge/mod.rs, which fails the
 # same way when its entry goes stale. An entry that could never
 # expire -- one also in $SKIP_ROUTES (checked first), or one the pinned SDK no
@@ -1152,6 +1155,9 @@ try {
             } elseif ($status -eq 404 -and $null -ne $aheadError -and
                       $aheadError.StartsWith("No route for ", [System.StringComparison]::Ordinal)) {
                 Record "FAIL" $r.Method $r.Path "404 from the router fallback, but not for this request (expected `"$aheadHead`")"
+                $exitCode = 1
+            } elseif ($status -eq 404 -and $null -eq $aheadError) {
+                Record "FAIL" $r.Method $r.Path "404 body is not a JSON envelope with a string error -- cannot tell the router fallback from a handler"
                 $exitCode = 1
             } else {
                 Record "FAIL" $r.Method $r.Path "stale SDK-ahead entry: the runner answers this route ($status), not the router fallback; delete it from `$SDK_AHEAD_ROUTES"
