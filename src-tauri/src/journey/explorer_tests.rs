@@ -3305,3 +3305,61 @@ async fn a_settle_never_overruns_the_time_budget_and_the_closing_look_waits_out_
     assert_eq!(o.unsettled.closing_look_failed, Some(false));
     assert_eq!(started.elapsed(), ACTION_SETTLE);
 }
+
+// ---------------------------------------------------------------------------
+// The run outlives its request
+// ---------------------------------------------------------------------------
+
+/// A disconnect drops the handler's future. The run carries on, the app stays
+/// claimed until it ends, and it ends: that is where its row is written.
+#[tokio::test]
+async fn a_client_that_disconnects_does_not_stop_the_run_and_the_claim_lasts_until_it_ends() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let app = "explore-run-detached-disconnect";
+    let release = Arc::new(tokio::sync::Notify::new());
+    let finished = Arc::new(AtomicBool::new(false));
+    let (run_release, run_finished) = (Arc::clone(&release), Arc::clone(&finished));
+    let mut request = Box::pin(run_detached(
+        RunGuard::claim(app).expect("nothing holds this app"),
+        "run".into(),
+        async move {
+            run_release.notified().await;
+            run_finished.store(true, Ordering::SeqCst);
+            StatusCode::OK.into_response()
+        },
+    ));
+    // Polled once, which spawns the run, then dropped as a disconnect drops it.
+    assert!(tokio::time::timeout(Duration::ZERO, &mut request)
+        .await
+        .is_err());
+    drop(request);
+    assert!(RunGuard::claim(app).is_none(), "the run still holds the app");
+
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while RunGuard::claim(app).is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the claim is released when the run ends");
+    assert!(finished.load(Ordering::SeqCst), "the run ran to its end");
+}
+
+/// A panicking run answers an error rather than hanging, and frees the app.
+#[tokio::test]
+async fn a_panicking_run_answers_a_500_and_releases_its_claim() {
+    fn panicking_run() -> Response {
+        panic!("a run that panics")
+    }
+    let app = "explore-run-detached-panic";
+    let guard = RunGuard::claim(app).expect("nothing holds this app");
+    let answer = run_detached(guard, "the-run-id".into(), async { panicking_run() }).await;
+    assert_eq!(answer.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let bytes = axum::body::to_bytes(answer.into_body(), 1 << 16)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["runId"], "the-run-id");
+    assert!(RunGuard::claim(app).is_some(), "the claim was released");
+}
