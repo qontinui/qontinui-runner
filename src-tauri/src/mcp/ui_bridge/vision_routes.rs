@@ -5585,9 +5585,10 @@ mod text_hidden_tests {
         // Its arguments run to the paren that closes the call: the send closure
         // inside them ends statements with `);` of its own, so no terminator
         // string marks the end. Parens inside a comment or a literal in those
-        // arguments are counted too: a balanced pair moves nothing, and an
-        // unbalanced one moves the cut, which turns this pin red rather than
-        // passing a wrong wiring.
+        // arguments are counted too. An unbalanced `(` carries the cut past the
+        // call's own paren, which fails the `expect` or the `runtime.spawn`
+        // check below; an unbalanced `)` cuts the arguments short, which can
+        // only lose a pinned argument, never pass a wrong one.
         let close = args
             .char_indices()
             .scan(1i32, |depth, (i, c)| {

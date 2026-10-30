@@ -2481,7 +2481,18 @@ mod tests {
                 .await
                 .map_err(|e| format!("acquire: {e}"))
         };
-        let capture = || std::future::ready(Ok::<&'static str, String>("frame"));
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let capture = move || {
+            let frame_b = captures.fetch_add(1, SeqCst) > 0;
+            async move {
+                if frame_b {
+                    // Frame B takes a moment, so a reply instant stamped after
+                    // it would not be the hide's.
+                    tokio::time::sleep(ms(10)).await;
+                }
+                Ok::<&'static str, String>("frame")
+            }
+        };
         let (guard_send_count, guard_send) =
             slow_webview(vec![Err("UI Bridge request timed out".into())], ms(0));
         let h = handed.clone();
