@@ -867,6 +867,7 @@ function AppContent() {
                   only: a pop-out knows one page and must not serve that as the
                   roster under the same component id.
                 */}
+                    {/* `isPinned` is belt-and-braces: a pinned window is always a pop-out. */}
                     {!terminalPages.isPinned && isMainWindow() && (
                       <TerminalPagesBridge
                         allPages={terminalPages.allPages}
