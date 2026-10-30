@@ -1917,12 +1917,14 @@ pub const EXPEDITE_REVIEWER_AGENT: &str = "expedite-reviewer";
 /// Whether this device can actually RUN the expedite-review skill, beyond it
 /// being served: its reviewer agent is bundled, and the tools its scripts call
 /// (`bash`, `python3`, `gh`, `curl`) resolve on PATH. A Windows device with only
-/// `python` (no `python3`) is under-advertised, deliberately. Known residuals,
-/// both over-advertising on Windows: `python3` may be the Microsoft Store alias
-/// stub, and `bash` may be the WSL launcher whose distro lacks `gh` credentials.
-/// The review then posts nothing and coord counts the item `unreviewed`. A device lacking any of them would
-/// claim review gates and post nothing; not advertising under-states, which
-/// coord counts `unreviewed`.
+/// `python` (no `python3`) is under-advertised, deliberately: under-advertising
+/// is safe (coord counts the item `unreviewed`), while over-advertising claims
+/// review gates and posts nothing. Known over-advertising residuals: on Windows
+/// `python3` may be the Microsoft Store alias stub, and `bash` may be the WSL
+/// launcher whose distro lacks `gh` credentials; and a session whose cwd serves
+/// an operator checkout's agents dir IN PLACE (the workspace root) gets that
+/// checkout's definitions, not this bundle's, so a checkout predating the
+/// reviewer cannot run it there.
 fn expedite_review_runnable() -> bool {
     crate::fleet_agents::agent_is_served(EXPEDITE_REVIEWER_AGENT)
         && binary_on_path("bash")
@@ -1941,10 +1943,18 @@ fn skill_capabilities(expedite_review_served: bool, device_jwt_live: bool) -> Ve
 }
 
 /// The heartbeat's skill-capability tokens: asks `served` about EXACTLY the
-/// skill the token stands for. Split out so a test pins the name the heartbeat
-/// looks up, not just the AND.
-fn skill_capability_tokens(served: impl Fn(&str) -> bool, device_jwt_live: bool) -> Vec<String> {
-    skill_capabilities(served(EXPEDITE_REVIEW_SKILL), device_jwt_live)
+/// skill the token stands for, and requires `expedite_runnable` (this device can
+/// run that skill: [`expedite_review_runnable`]). Split out so a test pins the
+/// name the heartbeat looks up, not just the AND.
+fn skill_capability_tokens(
+    served: impl Fn(&str) -> bool,
+    expedite_runnable: bool,
+    device_jwt_live: bool,
+) -> Vec<String> {
+    skill_capabilities(
+        served(EXPEDITE_REVIEW_SKILL) && expedite_runnable,
+        device_jwt_live,
+    )
 }
 
 /// True when a PowerShell interpreter resolves on PATH — `pwsh` (PowerShell 7,
@@ -3128,7 +3138,8 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
     let device_jwt_live = crate::auth::device_bearer_scoped(bearer_scope)
         .is_some_and(|t| crate::auth::slot_jwt_is_usable(&t));
     capabilities.extend(skill_capability_tokens(
-        |name| crate::fleet_skills::skill_is_served(name) && expedite_review_runnable(),
+        crate::fleet_skills::skill_is_served,
+        expedite_review_runnable(),
         device_jwt_live,
     ));
     let ci_runner_labels = if ci.enabled {
@@ -8616,11 +8627,13 @@ mod tests {",
             name == "expedite-review"
         };
         assert_eq!(
-            skill_capability_tokens(served, true),
+            skill_capability_tokens(served, true, true),
             vec![EXPEDITE_REVIEW_CAPABILITY.to_string()]
         );
         assert_eq!(asked.borrow().as_slice(), ["expedite-review".to_string()]);
-        assert!(skill_capability_tokens(|_| false, true).is_empty());
+        assert!(skill_capability_tokens(|_| false, true, true).is_empty());
+        // Served but not runnable here (reviewer or a tool missing): no token.
+        assert!(skill_capability_tokens(|_| true, false, true).is_empty());
     }
 
     /// The populated wire shape: every advertised token appears verbatim, in

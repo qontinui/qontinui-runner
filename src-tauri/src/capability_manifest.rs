@@ -756,8 +756,8 @@ pub const CAPABILITY_SPECS: &[CapabilitySpec] = &[
                       that has that sibling repo this row — not `fleet_agents` — decides \
                       what a session actually gets. Two sources for one asset, with \
                       nothing asserting they agree; when the root does not resolve the \
-                      copy is a no-op that logs \"no qontinui-root resolved; skipping \
-                      .claude/agents\" and continues.",
+                      checkout overlay is skipped (an unresolved row) while the embedded \
+                      floor is still written, and the session continues.",
         expected_rungs: &[Rung::OperatorCheckout, Rung::Unresolved],
         anchor: "agent_runtime::provision_agent_definitions_from_root",
     },

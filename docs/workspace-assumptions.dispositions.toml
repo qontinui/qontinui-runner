@@ -27,7 +27,11 @@
 # Phase 4): the nine unreviewed `os_bound_tooling` taskkill rows in
 # mcp/ai_session.rs, mcp/headless_browser.rs and mcp/task_runs.rs are gone with
 # the taskkill spawns they named. A fall, held.
-unreviewed_ceiling = 229
+# 229 -> 225 (plan 2026-10-13-coord-expedited-land-lever-for-agents Phase 6):
+# the three agent-def provisioning rows in agent_runtime.rs are reviewed
+# (fallback_correct, below), and the agent_definitions capability spec no longer
+# quotes the old no-root log line. A fall, held.
+unreviewed_ceiling = 225
 
 # First triage pass (plan 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports Phase 4):
 # every supervisor_dependency, tenant_literal and machine_path key. The
@@ -595,4 +599,26 @@ disposition = "fallback_correct"
 note = "A caveat string attached to the Canonical rung explaining it is the runner's per-body git mirror rather than an account-layer arm — descriptive text in the capability manifest, never a path resolved on disk."
 reviewed = [
     "qontinui-claude-config origin/main), not an account-layer arm\",",
+]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/agent_runtime.rs"
+symbol = "provision_agent_definitions"
+disposition = "fallback_correct"
+note = "The no-root arm: a published install resolves no workspace root, writes the embedded subagent floor anyway, and records an unresolved checkout-overlay row. The two strings are the log line and the ledger reason naming that, never a path resolved on disk."
+reviewed = [
+    "\"agent_runtime: no qontinui-root resolved; skipping the .claude/agents \\",
+    "\"no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \\",
+]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/agent_runtime.rs"
+symbol = "provision_agent_definitions_from_root"
+disposition = "fallback_correct"
+note = "The checkout overlay is reached only when a workspace root resolved, and is skipped (embedded floor stands in) when that checkout has no agents dir; the log line names the in-place arm, where the cwd already reads the checkout's own definitions."
+reviewed = [
+    ".join(\"qontinui-claude-config\")",
+    "\"agent_runtime: {} IS the qontinui-claude-config agents dir; serving the live \\",
 ]
