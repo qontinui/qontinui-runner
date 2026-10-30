@@ -269,11 +269,17 @@ $SKIP_ROUTES = @{
 # Routes the PINNED SDK declares whose runner handlers are on an open PR, not
 # on main -- the SDK is ahead of the runner. Keyed by "<METHOD> <PATH>" exactly
 # as it appears in UI_BRIDGE_ROUTES. Unlike $SKIP_ROUTES, an entry here EXPIRES
-# on its own: a "404 (route not registered)" for one of these routes is a SKIP
-# carrying its reason, but ANY other answer is a FAIL, because it means the
-# handlers have landed and the entry is stale -- delete it. This is the twin of
-# `sdk_only_baseline` in src-tauri/src/mcp/ui_bridge/mod.rs, which fails the
-# same way when its entry goes stale.
+# on its own: an UNREGISTERED answer for one of these routes is a SKIP carrying
+# its reason, and ANY other answer is a FAIL, because it means the handlers have
+# landed and the entry is stale -- delete it. "Unregistered" is the router
+# fallback's own signature, never the shape of a 404: `not_found_handler` in
+# src-tauri/src/mcp_api.rs answers every unmatched route with a 404 whose error
+# starts "No route for " (`not_found_message`), so that 404 -- or an empty-body
+# one -- is a SKIP, and a 404 a landed handler answers itself is a FAIL. This is
+# the twin of `sdk_only_baseline` in src-tauri/src/mcp/ui_bridge/mod.rs, which
+# fails the same way when its entry goes stale. An entry that could never
+# expire -- one also in $SKIP_ROUTES (checked first), or one the pinned SDK no
+# longer declares -- is refused before any probe, -DryRun included.
 # ---------------------------------------------------------------------------
 $SDK_AHEAD_ROUTES = @{
     # In-situ media override (SDK 835aa75, ui-bridge 0.35.0): handlers are
@@ -925,6 +931,29 @@ Write-Host "Parsing UI_BRIDGE_ROUTES from $SdkTypesPath ..."
 $routes = Parse-UiBridgeRoutes -Path $SdkTypesPath
 Write-Host ("Parsed {0} routes." -f $routes.Count)
 
+# An SDK-ahead entry expires only by being probed, so refuse one that never
+# would be: a key $SKIP_ROUTES also holds (the CI-profile keys are merged in
+# above) is skipped before it is classified, and a key the pinned SDK no longer
+# declares is never probed at all.
+$routeKeys = @{}
+foreach ($r in $routes) { $routeKeys[$r.Key] = $true }
+$aheadProblems = @()
+foreach ($k in $SDK_AHEAD_ROUTES.Keys) {
+    if ($SKIP_ROUTES.ContainsKey($k)) {
+        $aheadProblems += "'$k' is also in `$SKIP_ROUTES, which is checked first, so this entry could never expire"
+    }
+    if (-not $routeKeys.ContainsKey($k)) {
+        $aheadProblems += "'$k' is not a route the pinned SDK declares ($SdkTypesPath), so this entry could never expire"
+    }
+}
+if ($aheadProblems.Count -gt 0) {
+    Write-Host "ERROR: `$SDK_AHEAD_ROUTES has entries that can never expire:" -ForegroundColor Red
+    foreach ($m in $aheadProblems) { Write-Host "       $m" -ForegroundColor Red }
+    Write-Host "       Delete the entry from `$SDK_AHEAD_ROUTES (or the key from `$SKIP_ROUTES)." -ForegroundColor Red
+    exit 1
+}
+$aheadMatched = @($routes | Where-Object { $SDK_AHEAD_ROUTES.ContainsKey($_.Key) }).Count
+
 if ($DryRun) {
     foreach ($r in $routes) {
         $skipNote = if ($SKIP_ROUTES.ContainsKey($r.Key)) { " [SKIP: $($SKIP_ROUTES[$r.Key])]" } else { "" }
@@ -933,7 +962,7 @@ if ($DryRun) {
         Write-Host ("  {0,-6}  {1}{2}{3}{4}" -f $r.Method, $r.Path, $bodyNote, $skipNote, $aheadNote)
     }
     Write-Host ""
-    Write-Host ("Total: {0} routes, {1} skip, {2} SDK-ahead (skip while 404, fail once registered)" -f $routes.Count, $SKIP_ROUTES.Count, $SDK_AHEAD_ROUTES.Count)
+    Write-Host ("Total: {0} routes, {1} skip, {2} SDK-ahead (skip while unregistered, fail once registered)" -f $routes.Count, $SKIP_ROUTES.Count, $aheadMatched)
     exit 0
 }
 
@@ -1081,6 +1110,37 @@ try {
         if ($status -eq 0) {
             Record "FAIL" $r.Method $r.Path "connection error: $($res[1])"
             $exitCode = 1
+        } elseif ($SDK_AHEAD_ROUTES.ContainsKey($r.Key)) {
+            # Decided on the router fallback's own signature (see the
+            # $SDK_AHEAD_ROUTES header), never on the 404's shape: an empty-body
+            # 404, or the fallback's "No route for " envelope, is unregistered.
+            # Matched on the ASCII prefix only -- the message goes on with a
+            # non-ASCII dash that Windows PowerShell 5.1 may not decode intact.
+            $unregistered = $false
+            if ($status -eq 404) {
+                $aheadRaw = [string]$res[1]
+                if ($aheadRaw.Trim().Length -eq 0) {
+                    $unregistered = $true
+                } else {
+                    try {
+                        $aheadBody = $aheadRaw | ConvertFrom-Json
+                        if ($null -ne $aheadBody -and
+                            ($aheadBody.PSObject.Properties.Name -contains 'error') -and
+                            ($aheadBody.error -is [string]) -and
+                            $aheadBody.error.StartsWith("No route for ")) {
+                            $unregistered = $true
+                        }
+                    } catch {
+                        $unregistered = $false
+                    }
+                }
+            }
+            if ($unregistered) {
+                Record "SKIP" $r.Method $r.Path "404, SDK ahead of runner: $($SDK_AHEAD_ROUTES[$r.Key])"
+            } else {
+                Record "FAIL" $r.Method $r.Path "stale SDK-ahead entry: the runner answers this route ($status); delete it from `$SDK_AHEAD_ROUTES"
+                $exitCode = 1
+            }
         } elseif ($status -eq 404) {
             # Body-aware 404 classifier: a route with a :param segment that
             # returns a structured JSON error envelope (success:false / any
@@ -1102,21 +1162,12 @@ try {
                     $isStructuredErr = $false
                 }
             }
-            if ($isStructuredErr -and $SDK_AHEAD_ROUTES.ContainsKey($r.Key)) {
-                Record "FAIL" $r.Method $r.Path "404 unknown-id (route reachable): stale SDK-ahead entry, the runner registers this route; delete it from `$SDK_AHEAD_ROUTES"
-                $exitCode = 1
-            } elseif ($isStructuredErr) {
+            if ($isStructuredErr) {
                 Record "PASS" $r.Method $r.Path "404 unknown-id (route reachable)"
-            } elseif ($SDK_AHEAD_ROUTES.ContainsKey($r.Key)) {
-                Record "SKIP" $r.Method $r.Path "404, SDK ahead of runner: $($SDK_AHEAD_ROUTES[$r.Key])"
             } else {
                 Record "FAIL" $r.Method $r.Path "404 (route not registered)"
                 $exitCode = 1
             }
-        } elseif ($SDK_AHEAD_ROUTES.ContainsKey($r.Key)) {
-            # Any answer but an unregistered 404 means the handlers landed.
-            Record "FAIL" $r.Method $r.Path "stale SDK-ahead entry: the runner registers this route ($status); delete it from `$SDK_AHEAD_ROUTES"
-            $exitCode = 1
         } else {
             # Accept only statuses in the route's expected set. Anything else --
             # every 5xx, 401/403, and any other unlisted code -- is a FAIL.
