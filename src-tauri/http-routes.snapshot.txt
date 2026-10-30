@@ -1005,6 +1005,7 @@ MERGE terminals::routes
 MERGE terminals::routes
 MERGE test_fixtures::routes
 MERGE testing::routes
+MERGE text_visibility::routes
 MERGE toasts::routes
 MERGE token_analytics::routes
 MERGE triggers::routes
@@ -1499,6 +1500,7 @@ POST /ui-bridge/control/state/{id}/deactivate ui_bridge_deactivate_state_handler
 POST /ui-bridge/control/states/find-path ui_bridge_find_state_path_handler
 POST /ui-bridge/control/states/navigate ui_bridge_navigate_to_state_handler
 POST /ui-bridge/control/tab/activate ui_bridge_tab_activate_handler
+POST /ui-bridge/control/text-visibility ui_bridge_text_visibility_handler
 POST /ui-bridge/control/transition/{id}/execute ui_bridge_execute_transition_handler
 POST /ui-bridge/control/undo ui_bridge_undo_handler
 POST /ui-bridge/control/view/open ui_bridge_view_open_handler
@@ -1631,6 +1633,7 @@ POST /ui-bridge/sdk/control/state/{id}/activate handle_activate_state
 POST /ui-bridge/sdk/control/state/{id}/deactivate handle_deactivate_state
 POST /ui-bridge/sdk/control/states/find-path handle_find_path
 POST /ui-bridge/sdk/control/states/navigate handle_navigate_to
+POST /ui-bridge/sdk/control/text-visibility handle_text_visibility
 POST /ui-bridge/sdk/control/transition/{id}/execute handle_execute_transition
 POST /ui-bridge/sdk/control/undo handle_undo
 POST /ui-bridge/sdk/control/viewport handle_set_viewport_constraints
