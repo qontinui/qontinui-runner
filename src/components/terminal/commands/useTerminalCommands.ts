@@ -41,6 +41,7 @@ import { instanceStorage } from "@/lib/instance-storage";
 import { writeClipboard } from "@/lib/clipboard";
 
 import {
+  usePageSessionGetter,
   useTerminalSession,
   useTransitionEffects,
   useUIStateCx,
@@ -51,7 +52,12 @@ import { compareByUsageHeadroom } from "../../settings/types";
 import type { ResultCardSpec, ResultCardSection } from "../result-card";
 import { buildMetricsCardSpec, buildHistoryCardSpec } from "../result-card";
 import { displayNameOf, getSessionLedgerReport, type LedgerEntry } from "@/lib/session-ledger";
-import { computeAutoGrowLayoutId, FLOW_GRID_ID, LAYOUT_PRESETS } from "../useZoneLayout";
+import {
+  computeAutoGrowLayoutId,
+  FLOW_GRID_ID,
+  LAYOUT_PRESETS,
+  resolveLayoutArg,
+} from "../useZoneLayout";
 import type { CommandAction, CommandResult, ResolverContext } from "./types";
 import { readTextArg, textArg } from "./parse";
 import { useCommandAction } from "./useCommandAction";
@@ -229,7 +235,12 @@ const SCHEMA = {
     zone: "number (1-based zone index)",
     tabId: "string (explicit tab id; takes precedence over zone)",
   },
-  layout: { preset: `string — one of ${LAYOUT_IDS.join(", ")}` },
+  layout: {
+    preset: `string — one of ${LAYOUT_IDS.join(", ")}, or a window count (number >= 1)`,
+    // Declared as a FLAG so it never shifts `preset`. Absent → the page the
+    // operator is viewing; present → that page, which need not be on screen.
+    "--page": "string (optional terminal page id; defaults to the active page)",
+  },
   mode: { mode: `string (optional) — one of ${WORK_MODE_NAMES.join(", ")}; omitted toggles` },
   restart: { zone: "number (1-based; defaults to the currently focused zone)" },
   swap: { a: "number (1-based zone index)", b: "number (1-based zone index)" },
@@ -665,6 +676,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     findingsActions,
     analysis,
   } = session;
+  const getPageSession = usePageSessionGetter();
   const transitionEffects = useTransitionEffects();
   // `state` is read, not just dispatched into: several handlers below derive
   // their verdict by comparing the store's CURRENT value against the value
@@ -1015,24 +1027,46 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     id: "terminal.layout",
     slash: "/layout",
     label: "Change layout preset",
-    description: `Set the zone-grid layout preset. Accepts ${LAYOUT_IDS.join(", ")}.`,
+    description:
+      `Set the zone-grid layout preset. Accepts ${LAYOUT_IDS.join(", ")}, or a window count: ` +
+      "1 single, 2 split, 3 triptych, 4 quad, 5-6 six-pack, 7-9 full-grid, 10+ flow-grid.",
     paramSchema: SCHEMA.layout,
     // Named-group form so the preset is bound to `args.preset` for both
     // pattern and slash-form invocations.
     patterns: [
-      /^layout\s+(?<preset>single|split|quad|six-?pack|full-?grid)$/i,
+      /^layout\s+(?<preset>single|split|quad|six-?pack|full-?grid|[1-9]\d?)$/i,
       /^(?<preset>single|split|quad|six-?pack|full-?grid)\s+layout$/i,
     ],
     handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
-      const preset = textArg(args, "preset").toLowerCase();
-      // Normalize "six-pack" / "sixpack" → "six-pack"; same for full-grid.
-      const normalized = preset.replace(/sixpack/, "six-pack").replace(/fullgrid/, "full-grid");
+      // ONE resolver with the `select-layout` bridge action: preset ids, their
+      // unhyphenated spellings, and a window count (`4` → quad).
       // `setLayoutId` drops an unknown id silently, so an unvalidated
       // preset here reads as success while nothing moved. Same shape as
       // /select-by-state: name the accepted set in the error.
-      if (!LAYOUT_IDS.includes(normalized)) {
-        return fail("invalid-preset", `preset must be one of: ${LAYOUT_IDS.join(", ")}`);
+      const normalized = resolveLayoutArg(textArg(args, "preset"));
+      if (normalized === null) {
+        return fail(
+          "invalid-preset",
+          `preset must be one of: ${LAYOUT_IDS.join(", ")}, or a window count of 1 or more`,
+        );
       }
+      // `--page` targets a page other than the one on screen. Every page keeps
+      // a mounted scope, so its own `zoneLayout` and `tabs` are live; an id
+      // with no scope is refused rather than falling back to the active page,
+      // which would re-grid the page the operator is looking at instead.
+      const pageArg = readTextArg(args, "page");
+      if (pageArg.kind === "invalid") return fail("no-page", "--page needs a page id");
+      const target =
+        pageArg.kind === "text" && pageArg.text !== pageId
+          ? getPageSession(pageArg.text)
+          : { zoneLayout, tabs };
+      if (target === null) {
+        return fail(
+          "no-page",
+          `no terminal page with id ${pageArg.kind === "text" ? pageArg.text : ""}`,
+        );
+      }
+      const { zoneLayout: targetLayout, tabs: targetTabs } = target;
       // Observed pre-state, read off `layoutId` (the STATE `setLayoutId`
       // writes) rather than `layout.id` (derived, and synthesized for the
       // past-9 flow grid).
@@ -1060,10 +1094,10 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       // mode is itself a change, so it never reports the noop arm, and the
       // detail says the mode was left rather than letting the swap to a grid
       // pass as a plain preset change.
-      const leftTmux = zoneLayout.workMode === "tmux";
-      const grown = computeAutoGrowLayoutId(normalized, tabs.length, "grid");
+      const leftTmux = targetLayout.workMode === "tmux";
+      const grown = computeAutoGrowLayoutId(normalized, targetTabs.length, "grid");
       const effective = grown ?? normalized;
-      const wasAlready = !leftTmux && zoneLayout.layoutId === effective;
+      const wasAlready = !leftTmux && targetLayout.layoutId === effective;
       // The call is UNCONDITIONAL, and deliberately so. `setLayoutId`
       // delegates to `applyLayout`, which does three things besides writing
       // the id: it clears the maximized zone, re-flows unassigned tabs into
@@ -1075,10 +1109,10 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       // for `ZoneLayoutPicker`, which routes its clicks through this handler.
       // What was dishonest was never the call; it was reporting the same `✓`
       // whether or not the PRESET moved.
-      zoneLayout.setLayoutId(normalized, { source: "operator" });
+      targetLayout.setLayoutId(normalized, { source: "operator" });
       const layoutDetail =
         grown !== null
-          ? `grew to ${grown} — ${tabs.length} sessions do not fit ${normalized}`
+          ? `grew to ${grown} — ${targetTabs.length} sessions do not fit ${normalized}`
           : wasAlready
             ? `already ${normalized}; re-applied`
             : normalized;

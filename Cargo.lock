@@ -6852,7 +6852,7 @@ dependencies = [
 
 [[package]]
 name = "qontinui-types"
-version = "4.7.0"
+version = "5.0.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",

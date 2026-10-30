@@ -25,7 +25,23 @@
 //! with no `task_run_id`, anchored on `claude_code_session_id`. And
 //! `AiCoordRegistrar::session_id_for` is keyed on `claude_session_id` for BOTH
 //! planes. So `emit(<claude_code_session_id>, …)` resolves through the
-//! existing R4 index and this module adds no registrar work whatsoever.
+//! existing R4 index and this module adds no registrar LINKAGE work. Its one
+//! registrar call is the liveness heartbeat below.
+//!
+//! ## Transcript activity is liveness
+//!
+//! A registrar-bound row (sniffed, `transcript-bind`, or auto-bind) gets a
+//! coord heartbeat only from [`AiCoordRegistrar::heartbeat_on_interaction`],
+//! whose two callers until then (`send_user_message`, `drain.rs`) a
+//! terminal-hosted session never reaches — so its row went `stale` at 10 min and `closed` at
+//! 30 min while its transcript kept growing (plan
+//! `2026-10-11-a-live-runner-sessions-coord-row-once-reaped-stays-closed-under-its-own-heartbeats`
+//! Phase 3). [`SessionTranscriptTailer::admit`] therefore heartbeats every
+//! BOUND key on a non-empty append, at most once per
+//! [`TRANSCRIPT_HEARTBEAT_INTERVAL`] per key, **whatever Gate 1 says**: a
+//! liveness heartbeat carries no transcript content, so transcript consent does
+//! not govern it. An idle transcript does not grow, so an idle session still
+//! ages to `stale` as before.
 //!
 //! ## Coverage is the thing to watch, not liveness
 //!
@@ -145,7 +161,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, TryLockError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -180,6 +196,17 @@ const OWNERSHIP_SCAN_LINES: usize = 200;
 /// covered by several samples.
 const COVERAGE_REPORT_INTERVAL: Duration = Duration::from_secs(60);
 
+/// At most one transcript-activity heartbeat per bound session key per this
+/// interval (module header, "Transcript activity is liveness"). Coord's stale
+/// threshold is 10 min, so a minute is ample — and it bounds a chatty
+/// transcript to one outbox row a minute rather than one per append.
+pub(crate) const TRANSCRIPT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Past this many keys the heartbeat throttle map drops every entry whose
+/// window has already elapsed (an expired entry carries no information), so
+/// it stays bounded by the sessions active within one interval.
+const HEARTBEAT_THROTTLE_PRUNE_AT: usize = 256;
+
 /// Cap on unbound session ids named in one summary line. A coverage hole is
 /// actionable from a handful of ids; the count carries the magnitude.
 const MAX_REPORTED_UNBOUND: usize = 16;
@@ -204,6 +231,9 @@ pub struct SessionTranscriptTailer {
     identities: Mutex<HashMap<PathBuf, String>>,
     /// [`PREFIX_REPLAY_CAP_BYTES`]; a field so tests can shrink it.
     prefix_cap: u64,
+    /// Session key → when [`Self::admit`] last heartbeated it. Bounded: see
+    /// [`HEARTBEAT_THROTTLE_PRUNE_AT`].
+    heartbeat_at: Mutex<HashMap<String, Instant>>,
 }
 
 /// [`SessionTranscriptTailer::admit`]'s verdict on one batch.
@@ -671,6 +701,7 @@ impl SessionTranscriptTailer {
             marks,
             identities: Mutex::new(HashMap::new()),
             prefix_cap: PREFIX_REPLAY_CAP_BYTES,
+            heartbeat_at: Mutex::new(HashMap::new()),
         }
     }
 
@@ -747,22 +778,43 @@ impl SessionTranscriptTailer {
     /// than inside the emitter because the coverage summary needs its value —
     /// "off" and "on but reaching nobody" are different diagnoses. The emit
     /// path then calls `emit_inner`, which by contract does NOT re-check it.
+    ///
+    /// A non-empty append on a BOUND key also heartbeats its coord row (at most
+    /// once per [`TRANSCRIPT_HEARTBEAT_INTERVAL`]), before and regardless of
+    /// Gate 1 — module header, "Transcript activity is liveness".
     pub fn admit(&self, session_key: &str, len: usize, transcript_sync_permitted: bool) -> Admit {
+        self.admit_at(session_key, len, transcript_sync_permitted, Instant::now())
+    }
+
+    /// [`Self::admit`] with the clock supplied, so tests can step the
+    /// heartbeat throttle window without sleeping.
+    pub(crate) fn admit_at(
+        &self,
+        session_key: &str,
+        len: usize,
+        transcript_sync_permitted: bool,
+        now: Instant,
+    ) -> Admit {
         if len == 0 {
             return Admit::Drop;
         }
+
+        // Resolve the binding HERE as well as inside the emitter. The
+        // duplicate lookup is the price of coverage: the emitter's own skip is
+        // a once-per-session debug line, which cannot answer "is every live
+        // pane being tailed right now". Resolved BEFORE Gate 1 because the
+        // liveness heartbeat does not depend on transcript consent.
+        let bound = self.registrar.session_id_for(session_key).is_some();
+        if bound && self.heartbeat_due(session_key, now) {
+            self.registrar.heartbeat_on_interaction(session_key);
+        }
+
         if !transcript_sync_permitted {
             let mut cov = self.lock_coverage();
             cov.transcript_sync_permitted = Some(false);
             cov.appends_skipped_gate_off += 1;
             return Admit::Withheld;
         }
-
-        // Resolve the binding HERE as well as inside the emitter. The
-        // duplicate lookup is the price of coverage: the emitter's own skip is
-        // a once-per-session debug line, which cannot answer "is every live
-        // pane being tailed right now".
-        let bound = self.registrar.session_id_for(session_key).is_some();
 
         let mut cov = self.lock_coverage();
         cov.transcript_sync_permitted = Some(true);
@@ -780,6 +832,28 @@ impl SessionTranscriptTailer {
         } else {
             Admit::Drop
         }
+    }
+
+    /// Claim the heartbeat slot for `session_key` at `now`: `true` (and the
+    /// slot is stamped) when no heartbeat went out for it within
+    /// [`TRANSCRIPT_HEARTBEAT_INTERVAL`].
+    fn heartbeat_due(&self, session_key: &str, now: Instant) -> bool {
+        let mut map = self
+            .heartbeat_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.get(session_key).is_some_and(|last| {
+            now.saturating_duration_since(*last) < TRANSCRIPT_HEARTBEAT_INTERVAL
+        }) {
+            return false;
+        }
+        if map.len() >= HEARTBEAT_THROTTLE_PRUNE_AT {
+            map.retain(|_, last| {
+                now.saturating_duration_since(*last) < TRANSCRIPT_HEARTBEAT_INTERVAL
+            });
+        }
+        map.insert(session_key.to_string(), now);
+        true
     }
 
     /// A batch appended while Gate 1 was OFF: consent was withheld for these
@@ -1758,6 +1832,147 @@ mod tests {
         assert_eq!(r.appends_skipped_unbound, 0);
         assert_eq!(r.sessions_tailed, 0);
         assert_eq!(r.sessions_unbound, 0);
+    }
+
+    /// Heartbeat outbox rows written for coord session `coord`.
+    fn heartbeats_for(outbox: &OutboxWriter, coord: Uuid) -> usize {
+        outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| {
+                r.event_kind == SessionEventKind::Heartbeat.as_str() && r.session_id == coord
+            })
+            .count()
+    }
+
+    fn all_heartbeats(outbox: &OutboxWriter) -> usize {
+        outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::Heartbeat.as_str())
+            .count()
+    }
+
+    /// Phase 3 of plan
+    /// `2026-10-11-a-live-runner-sessions-coord-row-once-reaped-stays-closed-under-its-own-heartbeats`:
+    /// a bound session's growing transcript heartbeats its coord row — once per
+    /// throttle window however many appends land in it, and again in the next.
+    #[test]
+    fn transcript_activity_heartbeats_a_bound_row_once_per_window() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let coord = sniff_register(&registrar, &csid);
+        let before = heartbeats_for(&outbox, coord);
+
+        let t0 = Instant::now();
+        for i in 0..10u64 {
+            let at = t0 + Duration::from_secs(i * 5);
+            assert_eq!(t.admit_at(&csid, 8, true, at), Admit::Emit);
+        }
+        assert_eq!(
+            heartbeats_for(&outbox, coord) - before,
+            1,
+            "N appends inside one window must record exactly one Heartbeat row"
+        );
+
+        // A second burst after the window records another.
+        let later = t0 + TRANSCRIPT_HEARTBEAT_INTERVAL + Duration::from_secs(1);
+        for i in 0..5u64 {
+            t.admit_at(&csid, 8, true, later + Duration::from_secs(i));
+        }
+        assert_eq!(heartbeats_for(&outbox, coord) - before, 2);
+
+        // An empty append is not activity.
+        let much_later = later + TRANSCRIPT_HEARTBEAT_INTERVAL * 2;
+        assert_eq!(t.admit_at(&csid, 0, true, much_later), Admit::Drop);
+        assert_eq!(heartbeats_for(&outbox, coord) - before, 2);
+    }
+
+    /// An unbound session has no row to heartbeat — and must not get one. Nor
+    /// may its unbound appends spend the throttle window: the first append
+    /// after the key is bound heartbeats at once, not up to 60 s later.
+    #[test]
+    fn transcript_activity_on_an_unbound_key_heartbeats_nothing() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let t0 = Instant::now();
+        for i in 0..3u64 {
+            assert_eq!(
+                t.admit_at(&csid, 8, true, t0 + Duration::from_secs(i)),
+                Admit::Drop
+            );
+        }
+        assert_eq!(t.admit_at(&csid, 8, false, t0), Admit::Withheld);
+        assert_eq!(all_heartbeats(&outbox), 0);
+
+        // Bound inside what would have been the throttle window.
+        let coord = sniff_register(&registrar, &csid);
+        let before = heartbeats_for(&outbox, coord);
+        t.admit_at(&csid, 8, false, t0 + Duration::from_secs(5));
+        assert_eq!(
+            heartbeats_for(&outbox, coord) - before,
+            1,
+            "the unbound appends did not claim the throttle slot"
+        );
+    }
+
+    /// Gate 1 governs transcript CONTENT, not liveness: with consent off a
+    /// bound session still heartbeats (once per window), and no chunk leaves.
+    #[test]
+    fn transcript_activity_heartbeats_even_with_gate_1_off() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let coord = sniff_register(&registrar, &csid);
+        let before = heartbeats_for(&outbox, coord);
+
+        let t0 = Instant::now();
+        for i in 0..4u64 {
+            assert_eq!(
+                t.admit_at(&csid, 8, false, t0 + Duration::from_secs(i)),
+                Admit::Withheld
+            );
+        }
+        assert_eq!(heartbeats_for(&outbox, coord) - before, 1);
+        assert!(transcript_offsets(&outbox).is_empty(), "no content left");
+    }
+
+    /// The entry the transcript watcher calls (`admit`, on the wall clock)
+    /// heartbeats a bound row too — whatever the sync gate says — and throttles
+    /// a burst to one row.
+    #[test]
+    fn the_watcher_entry_heartbeats_a_bound_row_with_sync_withheld() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let coord = sniff_register(&registrar, &csid);
+        let before = heartbeats_for(&outbox, coord);
+
+        for _ in 0..3 {
+            assert_eq!(t.admit(&csid, 8, false), Admit::Withheld);
+        }
+        assert_eq!(heartbeats_for(&outbox, coord) - before, 1);
+    }
+
+    /// The throttle map is bounded: once it reaches the prune threshold, keys
+    /// whose window has elapsed are forgotten.
+    #[test]
+    fn the_heartbeat_throttle_map_prunes_expired_keys() {
+        let dir = tempdir().unwrap();
+        let (t, _registrar, _outbox) = tailer(dir.path());
+        let t0 = Instant::now();
+        for i in 0..HEARTBEAT_THROTTLE_PRUNE_AT {
+            assert!(t.heartbeat_due(&format!("k{i}"), t0));
+        }
+        let later = t0 + TRANSCRIPT_HEARTBEAT_INTERVAL;
+        assert!(t.heartbeat_due("fresh", later));
+        let map = t.heartbeat_at.lock().unwrap();
+        assert_eq!(map.len(), 1, "every expired key was pruned");
+        assert!(map.contains_key("fresh"));
     }
 
     /// A bound pane's appends land as transcript chunks with the emitter's

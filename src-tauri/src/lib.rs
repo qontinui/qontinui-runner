@@ -54,6 +54,10 @@ pub mod pty_holder;
 // a second bin cannot import from the runner bin's module tree. One module ⇒
 // one schema ⇒ writer and reader cannot drift. See the module doc.
 pub mod profiles;
+// Journey query answer values (plan 2026-09-20-ui-bridge-represents-the-
+// users-path-and-the-passage-of-time): registered by `schema_export`, built by
+// the bin's `journey::routes`.
+pub mod journey_wire;
 pub mod relay_envelopes;
 pub mod runner_breadcrumb;
 pub mod schema_export;

@@ -580,14 +580,26 @@ jobs:
         # job (below) so it no longer sits on the windows `test` critical path
         # (~12 min saved there). cfg(windows) lint coverage is preserved in that
         # job — see plan 2026-07-22-runner-ci-sccache-workspace-crate-caching.md
-        # Phase 2. This ubuntu leg stays the in-job blocking full-workspace
-        # clippy (clippy-tiers.yml is diff-scoped/advisory, not a substitute).
+        # Phase 2. This ubuntu leg stays the in-job blocking clippy over the
+        # src-tauri package's default targets (`cd src-tauri` selects that one
+        # package; the holder crates get their own job). clippy-tiers.yml is
+        # diff-scoped/advisory, not a substitute.
         if: matrix.platform == 'ubuntu-22.04'
         # Plain `cargo clippy` (no `-D warnings`): lint levels come solely from
         # src-tauri/Cargo.toml [lints.clippy]. T1 correctness/suspicious groups
         # are `deny` there, so a correctness lint still exits non-zero and fails
         # this required check; T3 style/complexity/perf stay `warn` (emitted,
         # non-blocking). See plan 2026-07-05-lint-tiers-and-diff-scoped-gates.
+        # DEFAULT TARGET ON PURPOSE. `--all-targets` here was measured on
+        # qontinui-runner#2392 (2026-10-25, run 40209973488): 5.5 min into
+        # the step, at cargo's default parallelism and with the 12 GB swapfile
+        # on, the hosted runner got a shutdown signal (exit 143). That is the
+        # Ubuntu OOM shape the test step's CARGO_BUILD_JOBS note records. At
+        # CARGO_BUILD_JOBS=1 the nightly's all-targets step takes 14-29 min,
+        # which would land on this required job. So test code is linted per PR
+        # by the parallel `clippy-windows` job below (`--all-targets`, off the
+        # critical path); Linux-only (cfg(unix)) test code is linted only by
+        # the nightly clippy-tiers.yml job.
         run: |
           cd src-tauri
           cargo clippy
@@ -1536,10 +1548,18 @@ jobs:
   clippy-windows:
     name: Clippy (windows)
     runs-on: windows-latest
-    # 88 successful runs, 2026-08-08..08-20: p50 14.7m, p90 16.5m, max 19.4m.
-    # 45 min = p90 + ~28 min headroom (2.3x the worst observed success).
+    # Default-target clippy, 23 successful runs 2026-10-22..10-25 on commits now
+    # on main (push and pull_request events; GraphQL check-run timings): job p50
+    # 14.9m, p90 17.2m, max 17.8m (Clippy check step p50 11.9m, max 14.0m).
+    # `--all-targets` roughly doubles the step: the one measured run
+    # (qontinui-runner#2030, 2026-10-06, PR cache from a default-target main)
+    # took 24.8m for the step and 28.3m for the job; qontinui-runner#2392
+    # (2026-10-25) took 23.9m for the job. 60 min is ~2.1x the slower run
+    # and ~1.8x the ~33m job the 14.0m step max projects to. Hosted minutes
+    # are free on this public repo, but the longer job holds a windows slot
+    # against the org's shared hosted-job concurrency cap for ~13 min more.
     # Previously unbounded, i.e. GitHub's 360-minute default.
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
@@ -1609,12 +1629,19 @@ jobs:
         run: pnpm run build
 
       - name: Clippy check
-        # Same invocation as the `test` job's ubuntu clippy — lint levels come
-        # from src-tauri/Cargo.toml [lints.clippy]; T1 groups are `deny` so a
-        # correctness lint fails this check.
+        # Lint levels come from src-tauri/Cargo.toml [lints.clippy]; T1 groups
+        # are `deny` so a correctness lint fails this check. Unlike the `test`
+        # job's ubuntu clippy, this one runs `--all-targets`: it is the per-PR
+        # pass over #[cfg(test)] code, so a deny-tier lint in a test fails the
+        # PR that adds it instead of surfacing in the nightly clippy-tiers.yml
+        # job, where the baseline rotted unnoticed (14 errors by 2026-10-06, 3
+        # more by 2026-10-24). It runs here, not on ubuntu, because this job is
+        # parallel and off the critical path, with a 32 GB pagefile; see the
+        # ubuntu step's note. The local pre-push hook
+        # (.pre-commit-hooks/cargo-prepush.sh) runs the default target only.
         run: |
           cd src-tauri
-          cargo clippy
+          cargo clippy --all-targets
 
   # Tests + clippy for the standalone workspace crates that the `test` job
   # never reaches.
