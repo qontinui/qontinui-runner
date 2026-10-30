@@ -84,8 +84,7 @@ pub const LEASE_TTL_SECS: i64 = 120;
 /// use. `session` is the holder's `agent_session_id` when the holding token is
 /// session-scoped (`machine:session`); our own token is bare-machine, so a
 /// `Some` session on our own machine id means a DIFFERENT session on this box.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotHolder {
     pub machine_id: String,
     pub session: Option<String>,
