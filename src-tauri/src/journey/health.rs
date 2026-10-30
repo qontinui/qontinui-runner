@@ -63,8 +63,9 @@ struct Recent {
     last_prune_skipped: Option<String>,
     last_timeline_error: Option<String>,
     /// Passive capture, PER APP (plan Phase 3), at most [`MAX_PASSIVE_APPS`].
-    /// A slot is created only for a relay whose BODY was accepted, claimed
-    /// under one lock before its event is queued ([`claim_passive_slot`]).
+    /// A slot is created only for a relay from a REGISTERED app whose BODY was
+    /// accepted (`observe::claim_slot_if_registered`), claimed under one lock
+    /// before its event is queued ([`claim_passive_slot`]).
     passive: std::collections::BTreeMap<String, PassiveStats>,
     /// Counts for an app with no slot above — its refusals, and any receipt
     /// that found no slot — kept apart and capped at [`MAX_UNSLOTTED_APPS`]
@@ -234,6 +235,16 @@ pub(crate) fn claim_passive_slot(app_id: &str) -> bool {
     claim_in(&mut r, app_id)
 }
 
+/// Does `app_id` hold a counter slot?
+#[cfg(test)]
+pub(crate) fn passive_slot_held(app_id: &str) -> bool {
+    recent()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .passive
+        .contains_key(app_id)
+}
+
 fn claim_in(r: &mut Recent, app_id: &str) -> bool {
     if r.passive.contains_key(app_id) {
         return true;
@@ -324,13 +335,13 @@ fn unslotted_entry<'a>(r: &'a mut Recent, app_id: &str) -> &'a mut Unslotted {
 
 /// `POST /apps/{app_id}/journey/observe` refused a relay (malformed, an
 /// unknown field — a `value` or `text` key included — an unknown action
-/// type, a bad id, or no queue room). Counted, so a page relaying a shape the
+/// type, a bad id, an unregistered app, or no queue room). Counted, so a page relaying a shape the
 /// route refuses reads as "refused", not as "never received". `None` = the
 /// path's app id itself was refused.
 ///
 /// A refusal never creates a slot in the accepted-relay map (only
-/// [`claim_passive_slot`] does, for an accepted body), so ids that never sent an acceptable
-/// body cannot fill [`MAX_PASSIVE_APPS`] and lock real apps out. It is
+/// [`claim_passive_slot`] does, for a registered app's accepted body), so ids
+/// that nothing registered or that never sent an acceptable body cannot fill [`MAX_PASSIVE_APPS`] and lock real apps out. It is
 /// counted in the app's slot when it has one, else in the separately capped
 /// unslotted map ([`MAX_UNSLOTTED_APPS`], least recently refused
 /// evicted first); `None` (an app id that is not an identifier) is
