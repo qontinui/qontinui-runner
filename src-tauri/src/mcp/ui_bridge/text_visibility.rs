@@ -1851,7 +1851,7 @@ mod tests {
                 capture,
                 || {},
                 |_| {},
-                |_, _| {},
+                |_, _, _| {},
             )
             .await;
             if kept {
@@ -2433,17 +2433,36 @@ mod tests {
     /// and reply times, and the permits stay held until the TTL has fired,
     /// counted from the hide's reply — when the main path's hold would have
     /// ended too.
+    ///
+    /// The cancel is timed from the hide's reply, not from the call: the arm
+    /// first waits on the process-wide [`pair_lock`], which a test running in
+    /// parallel may hold, and on a paused clock a timeout around that wait can
+    /// fire before the arm has hidden anything.
     #[tokio::test(start_paused = true)]
     async fn a_cancel_during_the_ttl_hold_keeps_the_permits_until_the_ttl() {
         use std::sync::atomic::Ordering::SeqCst;
         let ms = std::time::Duration::from_millis;
         let sem = Arc::new(tokio::sync::Semaphore::new(2));
         let handed: Arc<Mutex<Option<HideTimes>>> = Default::default();
-        let (_, send) = webview(vec![
+        let (_, webview_send) = webview(vec![
             Ok(visible()),
             Ok(hid()),
             Err("UI Bridge request timed out".into()),
         ]);
+        let hide_answered = Arc::new(tokio::sync::Notify::new());
+        let answered_tx = Arc::clone(&hide_answered);
+        let send = move |kind: &'static str, body: Value| {
+            let is_hide = body == arm_hide_body();
+            let reply = webview_send(kind, body);
+            let answered = Arc::clone(&answered_tx);
+            async move {
+                let reply = reply.await;
+                if is_hide {
+                    answered.notify_one();
+                }
+                reply
+            }
+        };
         let s = Arc::clone(&sem);
         let acquire = move || async move {
             s.acquire_many_owned(2)
@@ -2467,13 +2486,29 @@ mod tests {
                 times,
             ));
         };
-        let arm = capture_text_hidden_pair(send, acquire, capture, || {}, |_| {}, abort);
+        let mut arm = Box::pin(capture_text_hidden_pair(
+            send,
+            acquire,
+            capture,
+            || {},
+            |_| {},
+            abort,
+        ));
+        tokio::select! {
+            _ = &mut arm => panic!("the arm finished before its hide was answered"),
+            _ = hide_answered.notified() => {}
+        }
         assert!(
-            tokio::time::timeout(ms(CAPTURE_TTL_MS / 2), arm)
+            tokio::time::timeout(ms(CAPTURE_TTL_MS / 2), &mut arm)
                 .await
                 .is_err(),
             "the arm was still in its TTL hold"
         );
+        assert!(
+            handed.lock().unwrap().is_none(),
+            "the guard fires only on the cancel"
+        );
+        drop(arm);
         let times = handed.lock().unwrap().take().expect("the guard fired");
         let answered = times.answered.expect("the hide had answered");
         assert!(times.sent <= answered);
@@ -2575,7 +2610,7 @@ mod tests {
                     capture,
                     || {},
                     |_| {},
-                    |_, _| {},
+                    |_, _, _| {},
                 )
                 .await
             }
