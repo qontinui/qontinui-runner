@@ -5219,19 +5219,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // errors, so a failure degrades to "bound nothing this
                         // tick", never a panic that would break the liveness loop.
                         if needs_reconcile {
+                            // run_reconcile_pass resolves the claude anchor
+                            // from the snapshot it is handed.
                             let live_ptys: Vec<session::reconcile::LivePty> = live
                                 .iter()
-                                .map(|i| session::reconcile::LivePty {
-                                    terminal_id: i.id.clone(),
-                                    pid: i.pid,
-                                    working_dir: i.working_dir.clone(),
-                                    page_id: i.page_id.clone(),
-                                    title: i.title.clone(),
-                                    // run_reconcile_pass resolves the claude
-                                    // anchor from the snapshot it is handed.
-                                    ai_pid: None,
-                                    ai_start_unix: None,
-                                })
+                                .map(session::reconcile::LivePty::from_info)
                                 .collect();
                             let actions = session::reconcile::run_reconcile_pass(
                                 &poll_lifecycle_store,
@@ -5243,11 +5235,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             emit_session_bound(&poll_app_handle, &actions);
                         }
 
-                        // Title convergence (phantom-id plan B6). An in-Claude
-                        // `/rename` emits NO OSC-0 title, so the runner's rename
-                        // sink never fires for it and the registry keeps the
+                        // Title convergence (phantom-id plan B6). No terminal
+                        // title escape carries an in-Claude `/rename`: the OSC
+                        // title is the CLI's current ACTIVITY, which since plan
+                        // 2026-10-27-click-resume-forks-a-live-conversation-and-
+                        // pane-titles-hide-its-identity D3 never reaches the
+                        // record. So this pass is the record title's only
+                        // automatic writer — without it the registry keeps the
                         // spawn-time name forever (a restore then reopens the
-                        // pane mislabelled). This adopts the provider's own
+                        // pane mislabelled). It adopts the provider's own
                         // session name from its live-session index.
                         //
                         // Deliberately OUTSIDE the `needs_reconcile` guard: that
@@ -5257,15 +5253,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // ran. Reuses this tick's `snap`; fail-open.
                         let live_for_titles: Vec<session::reconcile::LivePty> = live
                             .iter()
-                            .map(|i| session::reconcile::LivePty {
-                                terminal_id: i.id.clone(),
-                                pid: i.pid,
-                                working_dir: i.working_dir.clone(),
-                                page_id: i.page_id.clone(),
-                                title: i.title.clone(),
-                                ai_pid: None,
-                                ai_start_unix: None,
-                            })
+                            .map(session::reconcile::LivePty::from_info)
                             .collect();
                         session::reconcile::refresh_titles_pass(
                             &poll_lifecycle_store,
@@ -5295,20 +5283,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let reconcile_app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    // run_at_boot enriches the claude anchor itself from its
+                    // own fresh snapshot.
                     let live: Vec<session::reconcile::LivePty> = reconcile_tm
                         .list()
-                        .into_iter()
-                        .map(|i| session::reconcile::LivePty {
-                            terminal_id: i.id,
-                            pid: i.pid,
-                            working_dir: i.working_dir,
-                            page_id: i.page_id,
-                            title: i.title,
-                            // run_at_boot enriches the claude anchor itself from
-                            // its own fresh snapshot.
-                            ai_pid: None,
-                            ai_start_unix: None,
-                        })
+                        .iter()
+                        .map(session::reconcile::LivePty::from_info)
                         .collect();
                     let actions =
                         session::reconcile::run_at_boot(&reconcile_lifecycle_store, live).await;

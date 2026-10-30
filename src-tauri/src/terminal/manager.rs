@@ -801,8 +801,8 @@ impl TerminalManager {
 
     /// The pure half of [`Self::set_title`]: store the activity title on the
     /// session and build the `terminal-title-changed` payload. Touches no
-    /// lifecycle record — the property D3 rests on, pinned by
-    /// `osc_title_churn_never_changes_the_record_title`.
+    /// lifecycle record — the property D3 rests on, pinned on the source by
+    /// `osc_title_relay_never_writes_the_lifecycle_record`.
     fn record_activity_title(
         session: &TerminalSession,
         id: &str,
@@ -1209,48 +1209,31 @@ mod tests {
     // ── D3 (plan 2026-10-27-click-resume-forks-a-live-conversation-and-
     //    pane-titles-hide-its-identity, Phase 4): the OSC title is activity ──
 
-    /// The body of `TerminalManager::set_title`, sliced out of this file.
-    fn set_title_body() -> &'static str {
+    /// The body of the `manager.rs` function whose signature starts with
+    /// `signature`, sliced out of this file up to its closing brace.
+    fn fn_body(signature: &str) -> &'static str {
         const SRC: &str = include_str!("manager.rs");
         let start = SRC
-            .find("pub fn set_title(&self, id: &str")
-            .expect("set_title is in manager.rs");
+            .find(signature)
+            .unwrap_or_else(|| panic!("`{signature}` is in manager.rs"));
         let rest = &SRC[start..];
-        let end = rest.find("\n    }").expect("set_title has a closing brace");
+        let end = rest
+            .find("\n    }")
+            .unwrap_or_else(|| panic!("`{signature}` has a closing brace"));
         &rest[..end]
     }
 
-    /// OSC title churn never changes the lifecycle record's `title`.
+    /// OSC title churn lands on the session's `activity_title` and in the
+    /// `terminal-title-changed` payload — as `activityTitle`, never as
+    /// `title`, so no listener can mistake activity for identity.
     ///
-    /// A provider session emits a new OSC title per activity (e.g. one per
-    /// subagent launched). Each lands on the session's `activity_title` and in
-    /// the event payload; the record keeps the conversation's name. Then the
-    /// provider-name refresh still runs, and it is a no-op because the name
-    /// was never overwritten.
+    /// That the churn never reaches the lifecycle RECORD is pinned on the
+    /// source by `osc_title_relay_never_writes_the_lifecycle_record`: neither
+    /// half of the relay takes a store, so no store assertion here could fail.
     #[test]
-    fn osc_title_churn_never_changes_the_record_title() {
-        use crate::session::reconcile::{
-            refresh_titles, LivePty, ProviderSessionIndex, ProviderSessionMeta,
-        };
-        use crate::session::session_lifecycle_store::SessionLifecycleStore;
+    fn osc_title_churn_lands_on_the_activity_title_and_the_event_only() {
         use crate::terminal::session::tests::make_test_session;
         use std::sync::{Arc, Mutex};
-
-        let dir = tempfile::tempdir().unwrap();
-        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
-        let rec: crate::session::session_lifecycle_store::TerminalSessionRecord =
-            serde_json::from_value(serde_json::json!({
-                "claudeSessionId": "9b40e22d-deec-415c-9379-5f85ae994ad8",
-                "pageId": "default",
-                "zoneIndex": 0,
-                "title": "maxim",
-                "terminalId": "term-1",
-                "openedAt": 0,
-                "lastSeenAt": 0,
-                "state": "open",
-            }))
-            .unwrap();
-        store.record_open(rec);
 
         let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
         for osc in [
@@ -1268,39 +1251,6 @@ mod tests {
             );
             assert_eq!(session.activity_title().as_deref(), Some(osc));
         }
-        assert_eq!(
-            store
-                .find_open_by_terminal("term-1")
-                .unwrap()
-                .title
-                .as_deref(),
-            Some("maxim"),
-            "OSC churn left the record's conversation name alone"
-        );
-
-        // The provider-name refresh is still the record title's writer.
-        struct Index;
-        impl ProviderSessionIndex for Index {
-            fn meta_for_pid(&self, _pid: u32) -> Option<ProviderSessionMeta> {
-                Some(ProviderSessionMeta {
-                    session_id: "9b40e22d-deec-415c-9379-5f85ae994ad8".into(),
-                    name: Some("maxim".into()),
-                })
-            }
-        }
-        let live = vec![LivePty {
-            terminal_id: "term-1".into(),
-            pid: Some(4241),
-            working_dir: "C:/repo".into(),
-            page_id: "default".into(),
-            title: "maxim".into(),
-            ai_pid: Some(4242),
-            ai_start_unix: None,
-        }];
-        assert!(
-            refresh_titles(&store, &live, &Index).is_empty(),
-            "the name was never overwritten, so there is nothing to re-adopt"
-        );
     }
 
     /// The relay must not reach for the lifecycle store at all. Before D3,
@@ -1308,16 +1258,31 @@ mod tests {
     /// `update_title_by_terminal` (plan 2026-07-03 Phase 3 item 4), which is
     /// how a subagent description replaced the lead session's name on
     /// 2026-10-27. Pinned on the source because `set_title` needs a live
-    /// `AppHandle`, which no unit test can build.
+    /// `AppHandle`, which no unit test can build — and on BOTH halves of the
+    /// relay, so moving the old write into `record_activity_title` fails too.
+    /// The old body reached the store as
+    /// `app_handle.try_state::<Arc<SessionLifecycleStore>>()` and then
+    /// `store.update_title_by_terminal(id, &title)`; every one of those
+    /// spellings is forbidden.
     #[test]
     fn osc_title_relay_never_writes_the_lifecycle_record() {
-        let body = set_title_body();
-        assert!(body.contains("record_activity_title"), "{body}");
-        for forbidden in ["update_title_by_terminal", "SessionLifecycleStore"] {
-            assert!(
-                !body.contains(forbidden),
-                "set_title must not write the record title (found `{forbidden}`)"
-            );
+        let relay = fn_body("pub fn set_title(&self, id: &str");
+        assert!(relay.contains("record_activity_title"), "{relay}");
+        let pure = fn_body("fn record_activity_title(");
+        assert!(pure.contains("set_activity_title"), "{pure}");
+        for (name, body) in [("set_title", relay), ("record_activity_title", pure)] {
+            for forbidden in [
+                "update_title_by_terminal",
+                "SessionLifecycleStore",
+                "session_lifecycle_store",
+                "try_state",
+                ".state::<",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "{name} must not write the record title (found `{forbidden}`)"
+                );
+            }
         }
     }
 

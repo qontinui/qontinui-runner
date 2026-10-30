@@ -72,10 +72,12 @@ export interface TerminalTab {
   id: string;
   title: string;
   /**
-   * Immutable spawn-time session name (D3). Unlike `title` — which OSC 0/2
-   * rewrites to the shell cwd via `renameTab` — this is set once from the
-   * backend terminal info and never touched by rename/title changes. Display
-   * goes through `resolveDisplayTitle` (`displayTitle.tsx`).
+   * Immutable spawn-time session name (D3). Unlike `title` — which
+   * `renameTab` rewrites (an operator rename, auto-naming from the first
+   * input or the cwd; no longer the OSC 0/2 title, which is
+   * {@link activityTitle}) — this is set once from the backend terminal info
+   * and never touched by rename/title changes. Display goes through
+   * `resolveDisplayTitle` (`displayTitle.tsx`).
    */
   spawnName?: string;
   /**

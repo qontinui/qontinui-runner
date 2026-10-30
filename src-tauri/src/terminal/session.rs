@@ -1444,11 +1444,11 @@ impl PaneExitFacts {
 pub struct TerminalSession {
     /// Unique identifier for this terminal.
     id: TerminalId,
-    /// Display title: the spawn-time name. Mutated post-spawn only by
-    /// [`Self::set_title`]. The OSC-0/2 title the child emits does NOT land
-    /// here — it is [`Self::activity_title`] (plan
+    /// Display title: the spawn-time name, immutable after spawn. The OSC-0/2
+    /// title the child emits does NOT land here — it is
+    /// [`Self::activity_title`] (plan
     /// `2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity`, D3).
-    title: Arc<Mutex<String>>,
+    title: String,
     /// The child's current-activity title: the latest OSC-0/2 string the
     /// frontend's xterm.js `onTitleChange` relayed through
     /// `terminal_set_title` (e.g. Claude Code's "Fix Phase 5b round 11").
@@ -2509,7 +2509,7 @@ impl TerminalSession {
 
         Ok(Self {
             id,
-            title: Arc::new(Mutex::new(title)),
+            title,
             activity_title: Arc::new(Mutex::new(None)),
             working_dir: cwd,
             page_id: Arc::new(Mutex::new(page_id)),
@@ -3738,11 +3738,7 @@ impl TerminalSession {
         };
         for line in completed {
             if let Some(parsed) = super::claude_resume_sniff::parse_typed_claude_resume(&line) {
-                let title = self
-                    .title
-                    .lock()
-                    .map(|g| g.clone())
-                    .unwrap_or_else(|e| e.into_inner().clone());
+                let title = self.title.clone();
                 super::claude_resume_sniff::spawn_register_typed_resume(
                     app_handle.clone(),
                     self.id.clone(),
@@ -4266,17 +4262,9 @@ impl TerminalSession {
 
     /// Get terminal info for the frontend.
     pub fn info(&self) -> TerminalInfo {
-        // Phase 2: title is now `Arc<Mutex<String>>`. Clone under the lock
-        // so the returned snapshot doesn't observe a torn write from a
-        // concurrent `set_title`.
-        let title = self
-            .title
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_else(|e| e.into_inner().clone());
         TerminalInfo {
             id: self.id.clone(),
-            title,
+            title: self.title.clone(),
             pid: self.child_pid,
             cols: self.cols.load(Ordering::Relaxed),
             rows: self.rows.load(Ordering::Relaxed),
@@ -4289,26 +4277,12 @@ impl TerminalSession {
         }
     }
 
-    /// Update the session's display (spawn-time) title. NOT the OSC relay's
-    /// target since plan
-    /// `2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity`
-    /// D3: the OSC-0/2 title goes to [`Self::set_activity_title`].
-    #[cfg(test)]
-    pub fn set_title(&self, title: String) {
-        match self.title.lock() {
-            Ok(mut g) => *g = title,
-            // Poisoned: recover and overwrite. Title is a pure-text field
-            // with no invariants to preserve, so this is safe.
-            Err(e) => *e.into_inner() = title,
-        }
-    }
-
     /// Move this session onto a different terminal page. The
     /// `POST /terminals/{id}/move` surface routes through
     /// `TerminalManager::set_page` to here; subsequent `info()` calls (and
     /// `GET /terminals` / `GET /terminal-pages`) see the new value, and the
     /// manager emits a `terminal-page-changed` event so the grid re-mounts
-    /// the tab under its new page. Mirrors [`Self::set_title`] exactly.
+    /// the tab under its new page.
     pub fn set_page(&self, page_id: String) {
         match self.page_id.lock() {
             Ok(mut g) => *g = page_id,
@@ -4530,7 +4504,7 @@ impl TerminalSession {
     }
 
     /// The child's current-activity title, `None` until one was relayed.
-    /// Poison-tolerant, like [`Self::title`].
+    /// Poison-tolerant, like [`Self::page_id`].
     pub fn activity_title(&self) -> Option<String> {
         self.activity_title
             .lock()
@@ -4538,13 +4512,9 @@ impl TerminalSession {
             .unwrap_or_else(|e| e.into_inner().clone())
     }
 
-    /// Read the session's current display title (see [`Self::set_title`]).
-    /// Poison-tolerant: title is pure text with no invariants to preserve.
+    /// The session's display title: the spawn-time name (see the field doc).
     pub fn title(&self) -> String {
-        self.title
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_else(|e| e.into_inner().clone())
+        self.title.clone()
     }
 
     /// R1 — install the on-exit hook the waiter thread fires the instant
@@ -5687,7 +5657,7 @@ pub(crate) mod tests {
         let (output_tx, _) = broadcast::channel::<String>(1);
         TerminalSession {
             id: "test".to_string(),
-            title: Arc::new(Mutex::new("test".to_string())),
+            title: "test".to_string(),
             activity_title: Arc::new(Mutex::new(None)),
             working_dir: ".".to_string(),
             page_id: Arc::new(Mutex::new("default".to_string())),
@@ -8364,20 +8334,6 @@ pub(crate) mod tests {
         );
         session.set_activity_title(Some("   ".to_string()));
         assert_eq!(session.activity_title(), None, "a blank title clears it");
-    }
-
-    #[test]
-    fn set_title_updates_info() {
-        // Phase 2: bi-directional title sync. set_title must be visible
-        // via info() so subsequent /terminals reads see the new value.
-        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let session = make_test_session(buf);
-        assert_eq!(session.info().title, "test");
-        session.set_title("✳ Claude Code".to_string());
-        assert_eq!(session.info().title, "✳ Claude Code");
-        // Idempotent overwrite.
-        session.set_title("Worker 1".to_string());
-        assert_eq!(session.info().title, "Worker 1");
     }
 
     // --- typed-input observer: line assembly + the write() funnel ----------

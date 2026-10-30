@@ -236,34 +236,111 @@ pub fn live_pids_from_snapshot(
 /// failing the whole listing — one corrupt file must not hide 118 good ones.
 /// Results are sorted by account then name so the output is stable between
 /// calls (PID iteration order is not).
+///
+/// The skipped files are dropped silently, which is right for a DISPLAY
+/// caller and wrong for a liveness GATE: a gate that cannot read a live
+/// process's file does not know which conversation it holds. A gate reads
+/// [`read_live_sessions_reporting`] instead, which keeps the same rows and
+/// also names what it could not read.
 pub fn read_live_sessions(
     config_dirs: &[std::path::PathBuf],
     live_pids: &HashSet<u32>,
 ) -> Vec<LiveClaudeSession> {
-    let mut out = Vec::new();
+    read_live_sessions_reporting(config_dirs, live_pids).sessions
+}
+
+/// A registry entry [`read_live_sessions_reporting`] could not read, in a place
+/// that may hold a LIVE session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnreadableRegistryEntry {
+    /// The pid the file's stem names (`<pid>.json`), which IS live. `None`
+    /// when what failed was the `sessions` directory itself (or one of its
+    /// entries), so no pid is known.
+    pub pid: Option<u32>,
+    /// The account config dir the entry lives under.
+    pub config_dir: String,
+}
+
+/// [`read_live_sessions`]' rows, plus every entry it skipped that may hide a
+/// live session.
+#[derive(Debug, Clone, Default)]
+pub struct LiveRegistryRead {
+    /// Exactly what [`read_live_sessions`] returns.
+    pub sessions: Vec<LiveClaudeSession>,
+    /// Non-empty means the read is INCOMPLETE: a live session may exist that
+    /// `sessions` does not list. A liveness gate must read that as UNKNOWN —
+    /// never as "not live" (plan
+    /// `2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity`
+    /// D2) — while a display caller may still show `sessions`.
+    pub unreadable: Vec<UnreadableRegistryEntry>,
+}
+
+/// The pid a registry file's stem names (`<pid>.json`), when it parses.
+fn stem_pid(path: &Path) -> Option<u32> {
+    path.file_stem()?.to_str()?.parse().ok()
+}
+
+/// [`read_live_sessions`], reporting what it could not read.
+///
+/// Reported as [`UnreadableRegistryEntry`]:
+/// - a `<pid>.json` whose stem pid IS in `live_pids` but whose bytes could not
+///   be read, or did not parse into a session (malformed JSON, no
+///   `sessionId`): a live process whose conversation is unknown;
+/// - a `sessions` directory that exists but could not be listed (any
+///   `read_dir` error other than `NotFound`), or an entry of it that could not
+///   be enumerated: any number of live sessions may be behind it.
+///
+/// NOT reported: a missing `sessions` directory (an account that never ran an
+/// interactive session), a non-`.json` file, and a bad file whose stem pid is
+/// not live (a stale file a crashed process left behind) — none can hide a
+/// live session.
+pub fn read_live_sessions_reporting(
+    config_dirs: &[std::path::PathBuf],
+    live_pids: &HashSet<u32>,
+) -> LiveRegistryRead {
+    let mut out = LiveRegistryRead::default();
     for dir in config_dirs {
-        let sessions_dir = dir.join("sessions");
-        let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
-            continue; // no sessions dir on this account — normal
+        let config_dir = dir.to_string_lossy().replace('\\', "/");
+        let unreadable = |pid: Option<u32>| UnreadableRegistryEntry {
+            pid,
+            config_dir: config_dir.clone(),
         };
-        for entry in entries.flatten() {
+        let sessions_dir = dir.join("sessions");
+        let entries = match std::fs::read_dir(&sessions_dir) {
+            Ok(entries) => entries,
+            // No sessions dir on this account — normal.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                out.unreadable.push(unreadable(None));
+                continue;
+            }
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                out.unreadable.push(unreadable(None));
+                continue;
+            };
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(bytes) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let Some(session) = parse_registry_file(&bytes, dir) else {
+            let parsed = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|bytes| parse_registry_file(&bytes, dir));
+            let Some(session) = parsed else {
+                if let Some(pid) = stem_pid(&path).filter(|p| live_pids.contains(p)) {
+                    out.unreadable.push(unreadable(Some(pid)));
+                }
                 continue;
             };
             if !live_pids.contains(&session.pid) {
                 continue; // stale file left by a crashed process
             }
-            out.push(session);
+            out.sessions.push(session);
         }
     }
-    out.sort_by(|a, b| {
+    out.sessions.sort_by(|a, b| {
         a.account
             .label
             .cmp(&b.account.label)
@@ -635,6 +712,71 @@ mod tests {
         let got = read_live_sessions(&[acct], &live);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "per-agent coord-mcp proxy");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Review M2: the gate's reader keeps `read_live_sessions`' rows AND names
+    /// every file it skipped that may hide a live session — a live stem whose
+    /// bytes are malformed, carry no `sessionId`, or cannot be read at all.
+    /// A bad file whose stem pid is NOT live is a crashed process's leftover,
+    /// and is not reported.
+    #[test]
+    fn the_reporting_reader_names_a_live_pid_it_could_not_read() {
+        let root = tmpdir("reporting");
+        let acct = root.join(".claude-paktis");
+        let sdir = acct.join("sessions");
+        fs::write(sdir.join("2804.json"), SAMPLE).unwrap();
+        fs::write(sdir.join("9999.json"), "{{{ truncated").unwrap(); // live, malformed
+        fs::write(sdir.join("7777.json"), r#"{"pid":7777,"sessionId":""}"#).unwrap(); // live, no id
+        fs::create_dir_all(sdir.join("6666.json")).unwrap(); // live, unreadable as a file
+        fs::write(sdir.join("5555.json"), "{{{ stale").unwrap(); // NOT live
+        fs::write(sdir.join("notes.txt"), "{{{").unwrap(); // not a registry file
+        fs::write(sdir.join("garbage.json"), "{{{").unwrap(); // stem names no pid
+
+        let live: HashSet<u32> = [2804, 9999, 7777, 6666].into_iter().collect();
+        let read = read_live_sessions_reporting(&[acct.clone()], &live);
+        assert_eq!(read.sessions.len(), 1);
+        assert_eq!(read.sessions[0].pid, 2804);
+        let mut pids: Vec<Option<u32>> = read.unreadable.iter().map(|u| u.pid).collect();
+        pids.sort();
+        assert_eq!(pids, vec![Some(6666), Some(7777), Some(9999)]);
+        let config_dir = acct.to_string_lossy().replace('\\', "/");
+        assert!(read.unreadable.iter().all(|u| u.config_dir == config_dir));
+
+        // The display reader's behaviour is unchanged: the same rows, no error.
+        let rows = read_live_sessions(&[acct], &live);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pid, 2804);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Review M2: a `sessions` directory that exists but cannot be listed may
+    /// hide any number of live sessions, so it is reported (with no pid); a
+    /// MISSING one is an account that never ran a session, and is not.
+    #[test]
+    fn the_reporting_reader_names_an_unlistable_sessions_dir_but_not_a_missing_one() {
+        let root = tmpdir("reporting-dir");
+        // `sessions` is a FILE here, so listing it fails with an error that is
+        // not NotFound.
+        let blocked = root.join(".claude-blocked");
+        fs::create_dir_all(&blocked).unwrap();
+        fs::write(blocked.join("sessions"), "not a directory").unwrap();
+        let bare = root.join(".claude-hotmail");
+        fs::create_dir_all(&bare).unwrap();
+
+        let live: HashSet<u32> = [1].into_iter().collect();
+        let read = read_live_sessions_reporting(&[blocked.clone(), bare], &live);
+        assert!(read.sessions.is_empty());
+        assert_eq!(
+            read.unreadable,
+            vec![UnreadableRegistryEntry {
+                pid: None,
+                config_dir: blocked.to_string_lossy().replace('\\', "/"),
+            }]
+        );
+        let json = serde_json::to_value(&read.unreadable).unwrap();
+        assert_eq!(json[0]["pid"], serde_json::Value::Null);
+        assert!(json[0]["configDir"].is_string(), "camelCase on the wire");
         let _ = fs::remove_dir_all(&root);
     }
 

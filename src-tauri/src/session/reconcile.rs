@@ -111,6 +111,24 @@ pub struct LivePty {
     pub ai_start_unix: Option<i64>,
 }
 
+impl LivePty {
+    /// Project one terminal-manager row into the reconcile's view — the ONE
+    /// `TerminalInfo` → `LivePty` mapping. The claude anchor (`ai_pid` /
+    /// `ai_start_unix`) is left `None`: [`run_reconcile_pass`] and
+    /// [`run_at_boot`] resolve it from the snapshot they are handed.
+    pub fn from_info(info: &crate::terminal::types::TerminalInfo) -> Self {
+        LivePty {
+            terminal_id: info.id.clone(),
+            pid: info.pid,
+            working_dir: info.working_dir.clone(),
+            page_id: info.page_id.clone(),
+            title: info.title.clone(),
+            ai_pid: None,
+            ai_start_unix: None,
+        }
+    }
+}
+
 /// A transcript candidate discovered on disk for a `(config_dir, project_path)`.
 /// Mirrors the subset of [`crate::terminal::transcript::TranscriptSession`] the
 /// correlation needs.
@@ -910,10 +928,14 @@ pub trait ProviderSessionIndex {
 ///
 /// ## Why this file and not the transcript
 ///
-/// An in-Claude `/rename` sets the session's name but emits NO OSC-0 title, so
-/// the runner's existing rename sink
-/// ([`SessionLifecycleStore::update_title_by_terminal`]) — which is driven by
-/// terminal title escapes — is never called for it, and the registry keeps the
+/// An in-Claude `/rename` sets the session's name, and no terminal title
+/// escape carries it: the OSC-0/2 title a current CLI emits is its current
+/// ACTIVITY (e.g. the last subagent's description), which since plan
+/// `2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity`
+/// D3 lands on `TerminalSession::activity_title` and never reaches the record.
+/// So the record's rename sink
+/// ([`SessionLifecycleStore::update_title_by_terminal`]) has no writer for the
+/// name but [`refresh_titles`] — without it the registry would keep the
 /// spawn-time title forever. The obvious alternative source, a `summary` record
 /// in the transcript JSONL, **does not exist**: a sweep of every transcript
 /// under every config root found zero `{"type":"summary"}` records, and
@@ -1008,7 +1030,7 @@ pub struct TitleRefresh {
 }
 
 /// Refresh each live PTY's registry title from the provider's own session name,
-/// routing through the EXISTING rename sink
+/// routing through the record's rename sink
 /// ([`SessionLifecycleStore::update_title_by_terminal`]) rather than adding a
 /// parallel title writer — so an in-Claude `/rename` converges on the registry
 /// within one reconcile tick.
@@ -1731,6 +1753,58 @@ mod tests {
         assert!(
             refresh_titles(&store, &live, &index).is_empty(),
             "a converged title does not re-write every tick"
+        );
+    }
+
+    /// Review W8: the poll tick builds its rows with `LivePty::from_info` (the
+    /// one `TerminalInfo` projection), leaves the claude anchor to the
+    /// snapshot, and `refresh_titles` still adopts a provider rename on them.
+    #[test]
+    fn refresh_titles_adopts_a_rename_on_rows_projected_by_from_info() {
+        let info = crate::terminal::types::TerminalInfo {
+            id: "term-1".into(),
+            title: "Terminal 1".into(),
+            pid: Some(4241),
+            cols: 80,
+            rows: 24,
+            working_dir: "C:/repo".into(),
+            is_alive: true,
+            exit_code: None,
+            created_at: 0,
+            total_bytes_produced: 0,
+            page_id: "page-1".into(),
+        };
+        let pty = LivePty::from_info(&info);
+        assert_eq!(pty.terminal_id, "term-1");
+        assert_eq!(pty.pid, Some(4241));
+        assert_eq!(pty.working_dir, "C:/repo");
+        assert_eq!(pty.page_id, "page-1");
+        assert_eq!(pty.title, "Terminal 1");
+        assert_eq!((pty.ai_pid, pty.ai_start_unix), (None, None));
+
+        let mut snap = ProcessSnapshot::default();
+        snap.parent_map.insert(4241, vec![4242]);
+        snap.names.insert(4241, "pwsh.exe".into());
+        snap.names.insert(4242, "claude.exe".into());
+        snap.creation_times.insert(4241, 1_000);
+        snap.creation_times.insert(4242, 1_001);
+        let anchored = anchor_live_ptys(&[pty], &snap);
+        assert_eq!(anchored[0].ai_pid, Some(4242));
+
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(title_rec("sess-1", "term-1", Some("maxim")));
+        let index = FakeProviderIndex(
+            [(4242, meta("sess-1", Some("maxim renamed")))]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(
+            refresh_titles(&store, &anchored, &index),
+            vec![TitleRefresh {
+                terminal_id: "term-1".into(),
+                title: "maxim renamed".into(),
+            }]
         );
     }
 
