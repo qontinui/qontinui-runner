@@ -266,6 +266,27 @@ $SKIP_ROUTES = @{
 }
 
 # ---------------------------------------------------------------------------
+# Routes the PINNED SDK declares whose runner handlers are on an open PR, not
+# on main -- the SDK is ahead of the runner. Keyed by "<METHOD> <PATH>" exactly
+# as it appears in UI_BRIDGE_ROUTES. Unlike $SKIP_ROUTES, an entry here EXPIRES
+# on its own: a "404 (route not registered)" for one of these routes is a SKIP
+# carrying its reason, but ANY other answer is a FAIL, because it means the
+# handlers have landed and the entry is stale -- delete it. This is the twin of
+# `sdk_only_baseline` in src-tauri/src/mcp/ui_bridge/mod.rs, which fails the
+# same way when its entry goes stale.
+# ---------------------------------------------------------------------------
+$SDK_AHEAD_ROUTES = @{
+    # In-situ media override (SDK 835aa75, ui-bridge 0.35.0): handlers are
+    # qontinui-runner#2311 (image plan Phase 18), not on main. The ui-bridge pin
+    # moved past 835aa75 to reach POST /control/text-visibility (ui-bridge#265).
+    # #2311 deletes these three entries, and the three sdk_only_baseline lines
+    # in mod.rs, when it lands.
+    "GET /control/media/override"    = "handlers are qontinui-runner#2311, not on main"
+    "POST /control/media/override"   = "handlers are qontinui-runner#2311, not on main"
+    "DELETE /control/media/override" = "handlers are qontinui-runner#2311, not on main"
+}
+
+# ---------------------------------------------------------------------------
 # Routes whose handler can legitimately exceed the default 10s probe timeout.
 # vision/extract (PaddleOCR) and vision/describe (VLM) load a cold model via
 # llama-swap on first request -- and llama-swap UNLOADS one model to load the
@@ -907,11 +928,12 @@ Write-Host ("Parsed {0} routes." -f $routes.Count)
 if ($DryRun) {
     foreach ($r in $routes) {
         $skipNote = if ($SKIP_ROUTES.ContainsKey($r.Key)) { " [SKIP: $($SKIP_ROUTES[$r.Key])]" } else { "" }
+        $aheadNote = if ($SDK_AHEAD_ROUTES.ContainsKey($r.Key)) { " [SDK-AHEAD: $($SDK_AHEAD_ROUTES[$r.Key])]" } else { "" }
         $bodyNote = if ($r.BodyRequired) { " (body)" } else { "" }
-        Write-Host ("  {0,-6}  {1}{2}{3}" -f $r.Method, $r.Path, $bodyNote, $skipNote)
+        Write-Host ("  {0,-6}  {1}{2}{3}{4}" -f $r.Method, $r.Path, $bodyNote, $skipNote, $aheadNote)
     }
     Write-Host ""
-    Write-Host ("Total: {0} routes, {1} skip" -f $routes.Count, $SKIP_ROUTES.Count)
+    Write-Host ("Total: {0} routes, {1} skip, {2} SDK-ahead (skip while 404, fail once registered)" -f $routes.Count, $SKIP_ROUTES.Count, $SDK_AHEAD_ROUTES.Count)
     exit 0
 }
 
@@ -1080,12 +1102,21 @@ try {
                     $isStructuredErr = $false
                 }
             }
-            if ($isStructuredErr) {
+            if ($isStructuredErr -and $SDK_AHEAD_ROUTES.ContainsKey($r.Key)) {
+                Record "FAIL" $r.Method $r.Path "404 unknown-id (route reachable): stale SDK-ahead entry, the runner registers this route; delete it from `$SDK_AHEAD_ROUTES"
+                $exitCode = 1
+            } elseif ($isStructuredErr) {
                 Record "PASS" $r.Method $r.Path "404 unknown-id (route reachable)"
+            } elseif ($SDK_AHEAD_ROUTES.ContainsKey($r.Key)) {
+                Record "SKIP" $r.Method $r.Path "404, SDK ahead of runner: $($SDK_AHEAD_ROUTES[$r.Key])"
             } else {
                 Record "FAIL" $r.Method $r.Path "404 (route not registered)"
                 $exitCode = 1
             }
+        } elseif ($SDK_AHEAD_ROUTES.ContainsKey($r.Key)) {
+            # Any answer but an unregistered 404 means the handlers landed.
+            Record "FAIL" $r.Method $r.Path "stale SDK-ahead entry: the runner registers this route ($status); delete it from `$SDK_AHEAD_ROUTES"
+            $exitCode = 1
         } else {
             # Accept only statuses in the route's expected set. Anything else --
             # every 5xx, 401/403, and any other unlisted code -- is a FAIL.
