@@ -34,7 +34,8 @@ vi.mock("@tauri-apps/api/window", () => ({
   },
 }));
 
-const { TerminalPagesBridge, isMainWindow } = await import("./TerminalPagesBridge");
+const { TerminalPagesBridge, isMainWindow, shouldServePageRoster } =
+  await import("./TerminalPagesBridge");
 
 function listPages(props: Parameters<typeof TerminalPagesBridge>[0], params?: unknown): unknown {
   registrations.length = 0;
@@ -117,5 +118,26 @@ describe("isMainWindow (gates where list-pages is registered)", () => {
   it("is true when getCurrentWindow throws (no Tauri: the one window is main)", () => {
     currentWindow.label = null;
     expect(isMainWindow()).toBe(true);
+  });
+});
+
+describe("shouldServePageRoster (the App mount gate for list-pages)", () => {
+  it("serves in the unpinned main window", () => {
+    expect(shouldServePageRoster(false, "main")).toBe(true);
+  });
+
+  it("does not serve in a pop-out window", () => {
+    expect(shouldServePageRoster(false, "terminal-popout-3")).toBe(false);
+  });
+
+  it("does not serve in a pinned window", () => {
+    expect(shouldServePageRoster(true, "main")).toBe(false);
+  });
+
+  it("reads this window's label when none is passed", () => {
+    currentWindow.label = "terminal-popout-3";
+    expect(shouldServePageRoster(false)).toBe(false);
+    currentWindow.label = "main";
+    expect(shouldServePageRoster(false)).toBe(true);
   });
 });

@@ -12,8 +12,8 @@
 #   builtin: 15
 #   fixture: 33
 
-src/App.tsx:219	literal	component	complete	schema=no	arity=0	effect=write
-src/App.tsx:235	guarded	component	go-to-step	schema=yes	arity=-	effect=read
+src/App.tsx:222	literal	component	complete	schema=no	arity=0	effect=write
+src/App.tsx:238	guarded	component	go-to-step	schema=yes	arity=-	effect=read
 src/components/active-dashboard/ActiveDashboardPage.tsx:89	literal	component	start-run	schema=no	arity=0	effect=read
 src/components/active-dashboard/ActiveDashboardPage.tsx:109	literal	component	stop-run	schema=no	arity=0	effect=destructive
 src/components/active-dashboard/ActiveDashboardPage.tsx:120	literal	component	refresh	schema=no	arity=0	effect=read
@@ -92,7 +92,7 @@ src/components/terminal/TerminalPage.tsx:534	literal	component	get-terminal-work
 src/components/terminal/TerminalPage.tsx:547	literal	component	list-runner-windows	schema=no	arity=0	effect=read
 src/components/terminal/TerminalPage.tsx:559	literal	component	close-empty-terminal-windows	schema=no	arity=0	effect=destructive
 src/components/terminal/TerminalPage.tsx:633	delegated	component	buildTerminalLaunchMenuActions	schema=no	arity=-	effect=-
-src/components/terminal/TerminalPagesBridge.tsx:76	guarded	component	list-pages	schema=yes	arity=-	effect=read
+src/components/terminal/TerminalPagesBridge.tsx:89	guarded	component	list-pages	schema=yes	arity=-	effect=read
 src/components/terminal/ZoneLayoutPicker.tsx:115	guarded	component	select-layout	schema=yes	arity=-	effect=write
 src/components/terminal/ZoneLayoutPicker.tsx:170	guarded	component	get-page-layout	schema=yes	arity=-	effect=read
 src/components/terminal/ZoneLayoutPicker.tsx:192	literal	component	list-layouts	schema=no	arity=0	effect=read
