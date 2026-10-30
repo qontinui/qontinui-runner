@@ -3052,6 +3052,12 @@ mod console_window_guard {
     /// `CREATE_NEW_CONSOLE`.
     const CREATE_NEW_CONSOLE_BIT: u64 = 0x0000_0010;
 
+    /// `CREATE_NO_WINDOW`.
+    const CREATE_NO_WINDOW_BIT: u64 = 0x0800_0000;
+
+    /// `DETACHED_PROCESS`: the child has no console at all.
+    const DETACHED_PROCESS_BIT: u64 = 0x0000_0008;
+
     /// Files scan 1 (`Command::new(`) does not apply to.
     ///
     /// `src/bin/` holds standalone CONSOLE-subsystem binaries (`qontinui_cli`,
@@ -3225,6 +3231,35 @@ mod console_window_guard {
             .collect()
     }
 
+    /// Does `expr` keep the child off a console — `CREATE_NO_WINDOW` or
+    /// `DETACHED_PROCESS` by name, or an integer literal with either bit set?
+    fn names_no_console(expr: &str) -> bool {
+        expr.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|tok| !tok.is_empty())
+            .any(|tok| {
+                tok == "CREATE_NO_WINDOW"
+                    || tok == "DETACHED_PROCESS"
+                    || integer_literal(tok)
+                        .is_some_and(|v| v & (CREATE_NO_WINDOW_BIT | DETACHED_PROCESS_BIT) != 0)
+            })
+    }
+
+    /// Scan 3: the indices of `creation_flags(` lines whose argument keeps
+    /// neither `CREATE_NO_WINDOW` nor `DETACHED_PROCESS` and carry no marker.
+    /// `creation_flags` REPLACES the command's flags, so
+    /// `no_window("x")` then `.creation_flags(CREATE_NEW_PROCESS_GROUP)` opens
+    /// a window without ever naming `CREATE_NEW_CONSOLE`.
+    fn flags_dropping_no_window(lines: &[(usize, &str)]) -> Vec<usize> {
+        (0..lines.len())
+            .filter(|&idx| {
+                creation_flags_args(lines, idx)
+                    .iter()
+                    .any(|arg| !names_no_console(arg))
+                    && !marked(lines, idx)
+            })
+            .collect()
+    }
+
     /// The unsuppressed, unmarked console spawn sites in one file's
     /// PRODUCTION text, as `rel:line: code`. Production text only: a spawn
     /// written inside a test item is not shipped, so it cannot flash anything
@@ -3232,6 +3267,7 @@ mod console_window_guard {
     fn file_violations(rel: &str, src: &str) -> Vec<String> {
         let lines = production_lines(src);
         let mut hits = new_console_overrides(&lines);
+        hits.extend(flags_dropping_no_window(&lines));
         if !exempt_from_command_new_scan(rel) {
             hits.extend(unsuppressed_command_new(&lines));
         }
@@ -3381,6 +3417,38 @@ mod console_window_guard {
             "only the two production spawns are sites; the test helper and the \
              all(test, unix) module are not"
         );
+    }
+
+    /// A `creation_flags(..)` that replaces `CREATE_NO_WINDOW` without naming
+    /// `CREATE_NEW_CONSOLE` is caught by scan 3; one keeping either no-console
+    /// bit, by name or literal, is not.
+    #[test]
+    fn a_creation_flags_that_drops_no_window_is_a_site() {
+        let bad = "fn f(c: &mut C) {
+    c.creation_flags(CREATE_NEW_PROCESS_GROUP);
+}
+";
+        assert_eq!(
+            file_violations("a.rs", bad),
+            vec!["a.rs:2: c.creation_flags(CREATE_NEW_PROCESS_GROUP);".to_string()]
+        );
+        for ok in [
+            "fn f(c: &mut C) { c.creation_flags(CREATE_NO_WINDOW); }
+",
+            "fn f(c: &mut C) { c.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW); }
+",
+            "fn f(c: &mut C) { c.creation_flags(0x0800_0000); }
+",
+            "fn f(c: &mut C) { c.creation_flags(DETACHED_PROCESS); }
+",
+            "fn f(c: &mut C) {
+    // console-ok: test
+    c.creation_flags(CREATE_NEW_PROCESS_GROUP);
+}
+",
+        ] {
+            assert!(file_violations("a.rs", ok).is_empty(), "{ok}");
+        }
     }
 
     /// Every `Command::new(` in production code must either be suppressed
