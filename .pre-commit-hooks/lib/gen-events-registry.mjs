@@ -36,10 +36,15 @@
 //       - exactly one `let mut <map> = Map::new();`, and that map is named
 //         exactly three times: the `let`, ONE `.insert(` inside the macro, and
 //         the final `Object(<map>)`. Nothing else can put an entry in it;
+//       - the macro body is exactly `<map>.insert($name.to_string(),
+//         serde_json::to_value(schema_for!($ty)).unwrap())`, so the map key
+//         is the literal name;
 //       - no `cfg` anywhere, so the set of names cannot depend on features,
 //         the target or build-script cfgs;
-//       - no `include!`, no `mod` item and no `#[path]`, so no code is spliced
-//         in from another file;
+//       - no control flow (`if`, `match`, loops, closures, nested fns,
+//         early returns), so every `add!` runs whenever the function does;
+//       - no `mod` item inside it, and no `include!` or path attribute
+//         anywhere in the file, so no code is spliced in from another file;
 //       - every `add!(` invocation parses as `add!("Name", <type>)`.
 //
 // The caller adds the one premise only a regeneration can check: the parsed
@@ -54,7 +59,10 @@
 //   - prelude names such as `String`;
 //   - an alias declared twice with different targets;
 //   - any type that is not a plain path with generic arguments.
-// When any glob import is in scope, every type is `local`.
+// When any glob import is in scope, every type is `local`. A `mod` declared in
+// the file binds its name as local. Scoping is otherwise flattened: a `use`
+// in a nested block counts for the whole function, and an alias bound twice,
+// differently, is `local`.
 
 import { readFileSync } from 'node:fs';
 
@@ -329,9 +337,14 @@ function parseRegistry(src) {
 
   // Nothing may make the set of names conditional, or splice code in.
   if (/\bcfg\b/.test(body)) violation('a cfg inside export_all_schemas');
-  if (/\binclude\s*!/.test(body)) violation('an include! inside export_all_schemas');
+  if (/\binclude\s*!/.test(code)) violation('an include! in the registry file');
   if (/\bmod\s+[A-Za-z_]/.test(body)) violation('a mod item inside export_all_schemas');
-  if (/#\s*!?\s*\[\s*path\b/.test(body)) violation('a #[path] inside export_all_schemas');
+  if (/#\s*!?\s*\[[^\]]*\bpath\s*=/.test(code)) violation('a path attribute in the registry file');
+  // Every add! must run whenever the function runs: no control flow and no
+  // closure or nested fn that could skip or repeat one. A runtime condition
+  // would make "registered" depend on something other than the add! lines.
+  const control = /\b(if|else|match|for|while|loop|fn|return|break|continue|async|await|move|unsafe|impl)\b|\|/.exec(body);
+  if (control) violation(`control flow inside export_all_schemas ('${control[0]}')`);
 
   // Exactly one macro, `add`.
   const macros = [...body.matchAll(/\bmacro_rules\s*!\s*([A-Za-z_][A-Za-z0-9_]*)\s*\{/g)];
@@ -341,6 +354,15 @@ function parseRegistry(src) {
   const mOpen = macros[0].index + macros[0][0].length - 1;
   const mClose = matching(body, mOpen, '{', '}');
   const macroBody = body.slice(mOpen + 1, mClose);
+  // The macro must key the map by the literal name and nothing else. Its body
+  // is checked against the one shape that does, whitespace aside. A string
+  // literal is masked to "S<n>" by the lexer, so a key built with one (a
+  // prefix in a format!) could otherwise read as unchanged between two
+  // revisions. Any other shape is refused rather than reasoned about.
+  const MACRO_SHAPE =
+    /^\(\$name:literal,\$ty:ty\)=>\{([A-Za-z_][A-Za-z0-9_]*)\.insert\(\$name\.to_string\(\),serde_json::to_value\(schema_for!\(\$ty\)\)\.unwrap\(\),?\);?\};?$/;
+  const shape = MACRO_SHAPE.exec(macroBody.replace(/\s+/g, ''));
+  if (!shape) violation('the add! macro is not `m.insert($name.to_string(), serde_json::to_value(schema_for!($ty)).unwrap())`');
 
   // The map, and every mention of it.
   const lets = [
@@ -353,6 +375,7 @@ function parseRegistry(src) {
   const mentions = count(body, new RegExp(`\\b${mapVar}\\b`, 'g'));
   const inserts = count(macroBody, new RegExp(`\\b${mapVar}\\s*\\.\\s*insert\\s*\\(`, 'g'));
   const returns = new RegExp(`\\bObject\\s*\\(\\s*${mapVar}\\s*\\)\\s*$`).test(body.trim());
+  if (shape[1] !== mapVar) violation(`the add! macro inserts into \`${shape[1]}\`, not the map \`${mapVar}\``);
   if (mentions !== 3 || inserts !== 1 || !returns) {
     violation(
       `the map \`${mapVar}\` is used outside the let / add!-insert / final Object(${mapVar}) ` +
@@ -386,18 +409,24 @@ function parseRegistry(src) {
 
   // Aliases in scope: the function body's and the file's own top level (minus
   // nested modules such as the unit tests).
-  const outside = stripModules(code.slice(0, fns[0].index) + ' ' + code.slice(close + 1));
+  const fileLevel = code.slice(0, fns[0].index) + ' ' + code.slice(close + 1);
+  const outside = stripModules(fileLevel);
   const uses = [collectUses(body), collectUses(outside)];
   const aliases = new Map();
   let anyGlob = false;
+  const bind = (name, target) => {
+    const set = aliases.get(name) || new Set();
+    set.add(target);
+    aliases.set(name, set);
+  };
   for (const u of uses) {
     anyGlob = anyGlob || u.glob;
-    for (const b of u.bindings) {
-      const set = aliases.get(b.name) || new Set();
-      set.add(b.target.join('::'));
-      aliases.set(b.name, set);
-    }
+    for (const b of u.bindings) bind(b.name, b.target.join('::'));
   }
+  // A module declared in this file is a name in scope too, and it is local.
+  // Bound beside any `use` of the same name, it makes that name ambiguous,
+  // so a block-scoped alias cannot pass a file-level module off as external.
+  for (const m of fileLevel.matchAll(/\bmod\s+([A-Za-z_][A-Za-z0-9_]*)\b/g)) bind(m[1], `crate::${m[1]}`);
 
   const lines = [];
   for (const name of [...names.keys()].sort()) {
