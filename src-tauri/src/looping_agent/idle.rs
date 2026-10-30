@@ -52,6 +52,101 @@ pub const SPINNER_GLYPHS: &[char] = &['✻', '✶', '✳', '✽', '✢', '·', '
 /// input box shows this caret.
 pub const PROMPT_MARKER: char = '❯';
 
+/// Footer hints that only appear under a Claude Code modal dialog — the
+/// workspace-trust prompt above all. Lowercased before match, and only looked
+/// for BELOW the selection row (see [`snapshot_shows_dialog`]). A dialog is not
+/// the input line: anything typed into it answers the dialog.
+///
+/// Measured 2026-10-28 (plan
+/// `2026-10-28-merge-shepherd-slot-is-won-by-any-runner-regardless-of-role-or-load`
+/// D6): a Merge Shepherd tab launched in an untrusted directory sat on the trust
+/// prompt; five minutes later the supervisor's cycle nudge typed its text plus
+/// Enter into it, which answered the dialog with "No, exit", and Claude Code
+/// exited. The prompt's selection cursor is the same `❯` glyph as the input
+/// marker, which is how the dialog passed for an idle input line.
+pub const DIALOG_INDICATORS: &[&str] = &["enter to confirm"];
+
+/// How many rows BELOW the selected option a dialog's footer hint
+/// ([`DIALOG_INDICATORS`]) may sit. Below the last `❯` row an idle screen shows
+/// only the input box's status lines, never transcript output, so matching
+/// there cannot be tripped by an agent quoting the hint in its own output.
+const DIALOG_FOOTER_ROWS: usize = 8;
+
+/// How many rows above the anchor a dialog's selected choice may sit when the
+/// input line is parked below it. Also `terminal::graceful_exit`'s dialog scan
+/// depth (`DIALOG_SCAN_ROWS` is defined as this), so the two scans cannot drift.
+pub const DIALOG_MENU_ROWS: usize = 8;
+
+/// Whether the rendered screen shows a Claude Code selection dialog rather
+/// than the input line.
+///
+/// Anchored on the LAST row carrying [`PROMPT_MARKER`], the row nearest the
+/// input area. The screen is a dialog when a numbered menu option
+/// (`❯ 1. Yes, proceed`, with or without a box border before it) sits ON the
+/// anchor, or ABOVE it when the cursor is parked on a plain `❯` row under the
+/// choices. That second region starts at the input box's TOP edge
+/// ([`is_box_top_edge`]) when one sits within 2 rows above the anchor, so
+/// nothing above an idle input box is
+/// read and an agent's own output can quote a dialog without latching the
+/// screen. With no box edge, the region is [`DIALOG_MENU_ROWS`] rows. This is
+/// the same region rule as `terminal::graceful_exit`'s `option_first`. A
+/// [`DIALOG_INDICATORS`] footer hint within [`DIALOG_FOOTER_ROWS`] rows below
+/// the anchor is a dialog too: below the input line an idle screen shows only
+/// status lines, never transcript output (the slash menu, too, opens above
+/// the input box).
+pub fn snapshot_shows_dialog(lines: &[String]) -> bool {
+    let Some(anchor) = lines.iter().rposition(|l| l.contains(PROMPT_MARKER)) else {
+        return false;
+    };
+    let box_edge = (anchor.saturating_sub(2)..anchor)
+        .rev()
+        .find(|&r| lines.get(r).is_some_and(|l| is_box_top_edge(l)));
+    let first = box_edge.unwrap_or_else(|| anchor.saturating_sub(DIALOG_MENU_ROWS));
+    if lines
+        .iter()
+        .skip(first)
+        .take(anchor + 1 - first)
+        .any(|l| is_menu_cursor_row(l))
+    {
+        return true;
+    }
+    lines
+        .iter()
+        .skip(anchor)
+        .take(DIALOG_FOOTER_ROWS + 1)
+        .any(|line| {
+            let lower = line.to_ascii_lowercase();
+            DIALOG_INDICATORS.iter().any(|ind| lower.contains(ind))
+        })
+}
+
+/// A row drawn only of box-drawing characters — an input box's top or bottom
+/// edge. The one copy: `terminal::graceful_exit` uses it too.
+pub fn is_box_edge(line: &str) -> bool {
+    let t = line.trim();
+    !t.is_empty() && t.chars().all(|c| "─━╭╮╰╯┌┐└┘│".contains(c))
+}
+
+/// A box edge that can only be a box's TOP: it carries a top corner (`╭`/`┌`)
+/// or is a plain horizontal rule. A bottom border (`╰…╯`) under a dialog is not
+/// the input box's top edge, so it must not cut the dialog's menu out of the
+/// region [`snapshot_shows_dialog`] scans.
+fn is_box_top_edge(line: &str) -> bool {
+    let t = line.trim();
+    is_box_edge(line)
+        && (t.contains('╭') || t.contains('┌') || t.chars().all(|c| c == '─' || c == '━'))
+}
+
+/// `❯` followed by optional spaces, one or more ASCII digits and a `.` — the
+/// cursor on a numbered menu option.
+fn is_menu_cursor_row(line: &str) -> bool {
+    line.match_indices(PROMPT_MARKER).any(|(idx, marker)| {
+        let rest = line.get(idx + marker.len()..).unwrap_or("").trim_start();
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        digits > 0 && rest.get(digits..).is_some_and(|tail| tail.starts_with('.'))
+    })
+}
+
 /// Decide whether a single rendered grid snapshot looks IDLE / ready for
 /// input. Pure over the snapshot. CONSERVATIVE: returns `false` (NOT idle)
 /// on any ambiguity. Idle requires ALL of:
@@ -62,7 +157,14 @@ pub const PROMPT_MARKER: char = '❯';
 /// 3. A prompt row containing [`PROMPT_MARKER`] (`❯`) is visible.
 /// 4. The cursor sits AT OR BELOW the prompt row (in the input area), not up
 ///    in streaming output.
+/// 5. NO modal dialog on screen ([`snapshot_shows_dialog`]): a dialog's menu
+///    cursor is a `❯` too, and typing into it answers the dialog.
 pub fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
+    // (5) a dialog is never the input line, whatever else the screen shows.
+    if snapshot_shows_dialog(lines) {
+        return false;
+    }
+
     // (1) any processing-indicator text ⇒ busy.
     for line in lines {
         let lower = line.to_ascii_lowercase();
@@ -303,5 +405,130 @@ mod tests {
         assert_eq!(parse_leading_percentage("soon"), None);
         assert_eq!(parse_leading_percentage("8 percent"), None);
         assert_eq!(parse_leading_percentage(""), None);
+    }
+
+    /// The workspace-trust prompt as Claude Code renders it: a bordered box, a
+    /// numbered menu whose cursor is the same `❯` glyph as the input marker,
+    /// and the cursor parked on the menu row.
+    fn trust_dialog() -> Vec<String> {
+        lines(&[
+            "╭──────────────────────────────────────────────────────────╮",
+            "│ Do you trust the files in this folder?                   │",
+            "│                                                          │",
+            "│ /home/u/.qontinui/runner/looping-agents/merge-shepherd   │",
+            "│                                                          │",
+            "│ ❯ 1. Yes, proceed                                        │",
+            "│   2. No, exit                                            │",
+            "│                                                          │",
+            "│ Enter to confirm · Esc to exit                           │",
+            "╰──────────────────────────────────────────────────────────╯",
+        ])
+    }
+
+    #[test]
+    fn the_trust_dialog_is_never_idle_even_with_the_cursor_on_its_menu() {
+        let grid = trust_dialog();
+        assert!(snapshot_shows_dialog(&grid));
+        for cursor_row in 0..grid.len() as u16 {
+            assert!(
+                !snapshot_looks_idle(&grid, cursor_row),
+                "a dialog must never read as an idle input line (cursor row {cursor_row})"
+            );
+        }
+    }
+
+    #[test]
+    fn the_newer_trust_prompt_wording_is_a_dialog_too() {
+        let grid = lines(&[
+            " Is this a project you created or one you trust?",
+            " ❯ 1. Yes, I trust this folder",
+            "   2. No, exit",
+        ]);
+        assert!(snapshot_shows_dialog(&grid));
+        assert!(!snapshot_looks_idle(&grid, 1));
+    }
+
+    #[test]
+    fn a_bare_numbered_menu_cursor_is_a_dialog_without_any_known_phrase() {
+        // Any `❯ <n>.` selection row — not only the trust prompt.
+        let grid = lines(&["Pick one", "❯2. Continue", "  3. Stop"]);
+        assert!(snapshot_shows_dialog(&grid));
+        assert!(!snapshot_looks_idle(&grid, 1));
+    }
+
+    #[test]
+    fn the_ordinary_input_line_is_not_a_dialog() {
+        // The idle input box: `❯` with nothing (or free text) after it.
+        for row in [
+            "❯ ",
+            "│ ❯                    │",
+            "❯ run your next cycle",
+            "❯ 12 PRs open",
+        ] {
+            let grid = lines(&["done.", row]);
+            assert!(
+                !snapshot_shows_dialog(&grid),
+                "{row:?} is the input line, not a menu"
+            );
+        }
+        assert!(snapshot_looks_idle(&lines(&["done.", "❯ "]), 1));
+    }
+
+    #[test]
+    fn a_finished_turn_that_quotes_a_dialog_above_the_input_line_stays_idle() {
+        // R2: an idle screen does not repaint, so a dialog phrase or a quoted
+        // `❯ 1.` row in the agent's own output above the input box must not
+        // latch the screen as a dialog (it would never be nudged again).
+        let grid = lines(&[
+            "The Shepherd saw this on spaceship's tab:",
+            "  Do you trust the files in this folder?",
+            "  ❯ 1. Yes, proceed",
+            "    2. No, exit",
+            "  Enter to confirm · Esc to exit",
+            "Cycle summary: 3 PRs checked, 0 actions.",
+            "╭──────────────────────────────╮",
+            "│ ❯                            │",
+            "╰──────────────────────────────╯",
+            "  ? for shortcuts",
+        ]);
+        assert!(
+            !snapshot_shows_dialog(&grid),
+            "quoted text above the input line is not a dialog"
+        );
+        assert!(snapshot_looks_idle(&grid, 7), "the input line is idle");
+    }
+
+    #[test]
+    fn a_dialog_with_the_cursor_parked_on_a_plain_prompt_row_below_it_is_a_dialog() {
+        // R2a: graceful_exit's own `parked` shape — the permission dialog with
+        // a plain `❯` row pushed below its choices and the cursor parked there.
+        let grid = lines(&[
+            " Bash command",
+            "   rm -rf build",
+            " Do you want to proceed?",
+            " ❯ 1. Yes",
+            "   2. Yes, and don't ask again for rm commands in this project",
+            "   3. No, and tell Claude what to do differently (esc)",
+            "❯ ",
+        ]);
+        assert!(snapshot_shows_dialog(&grid));
+        assert!(
+            !snapshot_looks_idle(&grid, 6),
+            "never nudge into a parked dialog"
+        );
+    }
+
+    #[test]
+    fn a_bordered_dialog_with_a_plain_prompt_row_under_its_bottom_border_is_a_dialog() {
+        // R2b: the bottom border is not the input box's top edge, so the menu
+        // above it must still be scanned.
+        let mut grid = trust_dialog();
+        grid.push("❯ ".to_string());
+        let cursor = (grid.len() - 1) as u16;
+        assert!(snapshot_shows_dialog(&grid));
+        assert!(
+            !snapshot_looks_idle(&grid, cursor),
+            "never nudge into a parked dialog"
+        );
     }
 }

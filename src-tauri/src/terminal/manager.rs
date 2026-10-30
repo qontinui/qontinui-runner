@@ -985,7 +985,8 @@ impl TerminalManager {
     }
 
     /// [`Self::close`], but through `TerminalSession::close_after_graceful_exit`
-    /// — reachable only from [`Self::graceful_exit`]'s gone arm.
+    /// — reachable from [`Self::graceful_exit`]'s gone arm and from
+    /// [`Self::close_exited`].
     fn close_after_graceful_exit(&self, id: &str) -> Result<(), String> {
         let session = {
             let mut sessions = self
@@ -1013,6 +1014,26 @@ impl TerminalManager {
             }
             None => Err(format!("Terminal session not found: {}", id)),
         }
+    }
+
+    /// Remove and close a terminal whose child has already EXITED, without
+    /// signalling it. [`Self::close`] always kills, and an exited child's pid is
+    /// already reaped, so that kill could only land on whatever process reused
+    /// the pid. This is the same kill-only-if-alive close the graceful-exit
+    /// gone arm uses. The looping-agent death respawn closes the dead tab it
+    /// replaces through this (plan
+    /// `2026-10-28-merge-shepherd-slot-is-won-by-any-runner-regardless-of-role-or-load`
+    /// D6).
+    ///
+    /// Refuses a pane whose child is still alive, so the name is a guarantee:
+    /// this never kills.
+    pub(crate) fn close_exited(&self, id: &str) -> Result<(), String> {
+        if self.get(id).is_some_and(|s| s.is_alive()) {
+            return Err(format!(
+                "terminal {id} is still alive; close_exited closes only an exited pane"
+            ));
+        }
+        self.close_after_graceful_exit(id)
     }
 
     /// List all terminal sessions with their info, sorted by creation time.

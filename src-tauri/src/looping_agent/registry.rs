@@ -122,8 +122,9 @@ pub struct LoopingAgentRuntime {
     /// The pinned `--session-id` of the current (or last) spawn — the key
     /// into the session lifecycle store for restart re-attach.
     pub claude_session_id: Option<String>,
-    /// Cycles run since the last FRESH spawn (spawn itself counts as cycle 1;
-    /// each nudge increments). Compared against
+    /// Cycles run since the last FRESH spawn: the spawn's own cycle counts once
+    /// its first transcript turn is observed (`first_turn_seen_at_ms`), and
+    /// each nudge increments. Compared against
     /// [`LifecyclePolicy::relaunch_every_cycles`].
     pub cycles_since_relaunch: u32,
     /// Unix millis of the last fresh spawn/relaunch.
@@ -132,6 +133,13 @@ pub struct LoopingAgentRuntime {
     pub last_cycle_started_at_ms: Option<i64>,
     /// Total fresh relaunches over this agent's lifetime (observability).
     pub relaunch_count: u32,
+    /// Unix millis when the CURRENT spawn's transcript was first observed —
+    /// the first turn Claude Code actually ran. `None` until then, and cleared
+    /// on every spawn/relaunch. No cycle is counted before it, so a launch that
+    /// hangs (on the trust prompt, say) never reads as progress (plan
+    /// `2026-10-28-merge-shepherd-slot-is-won-by-any-runner-regardless-of-role-or-load`
+    /// D6).
+    pub first_turn_seen_at_ms: Option<i64>,
 }
 
 /// One persisted registry row.
@@ -473,6 +481,7 @@ mod tests {
                 last_spawn_at_ms: Some(1),
                 last_cycle_started_at_ms: Some(2),
                 relaunch_count: 1,
+                first_turn_seen_at_ms: Some(3),
             },
         };
         let json = serde_json::to_string(&rec).unwrap();
