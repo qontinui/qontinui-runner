@@ -290,7 +290,7 @@ fn tail_str(s: &str, max: usize) -> String {
     while !s.is_char_boundary(start) {
         start += 1;
     }
-    s[start..].to_string()
+    s.get(start..).unwrap_or("").to_string()
 }
 
 // ---------------------------------------------------------------------------
