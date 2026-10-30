@@ -750,6 +750,18 @@ jobs:
       # step's), so only a RISE over this baseline says a kill happened during
       # the step. Linux only (no cgroup elsewhere); best-effort — an unreadable
       # count writes an empty output, which the matcher reads as NO evidence.
+      #
+      # Phase 2 reuses this step rather than adding one: it also starts the
+      # detached anonymous-memory sampler (`resource-report.sh
+      # --start-anon-sampler`), which polls the cgroup's `memory.stat` `anon`
+      # every 2 s into $RUNNER_TEMP/qontinui-resource-report until
+      # `Report this job's resources` stops it and reports the peak as
+      # `peak_rss_mb`. Anonymous memory, NOT `memory.peak`: that is the
+      # cgroup's whole charge, page cache included, which a cargo build's
+      # target/ writes fill up to the cgroup's own memory limit. The
+      # sampler's first reading is the baseline a self-hosted runner's peak
+      # must rise past.
+      # Every failure is swallowed: no sampler means no `peak_rss_mb`.
       - name: Record the cgroup oom_kill count before the build half
         id: oom_kill_before_build
         if: runner.os == 'Linux'
@@ -760,6 +772,8 @@ jobs:
           count="$(awk '$1 == "oom_kill" { print $2; exit }' "/sys/fs/cgroup${cgroup}/memory.events" 2>/dev/null || true)"
           echo "oom_kill count before Build Rust tests: ${count:-<unreadable>}"
           echo "count=$count" >>"$GITHUB_OUTPUT" || true
+          bash scripts/ci/resource-report.sh --start-anon-sampler \
+            --state-dir "$RUNNER_TEMP/qontinui-resource-report" || true
 
       # ── BUILD half of the old single `Run Rust tests` step ─────────────
       #
@@ -1225,6 +1239,14 @@ jobs:
       # `matrix.platform == 'windows-latest'` rather than `runner.os` — every
       # other Windows gate in this file spells it that way (see `Configure
       # pagefile`), and one idiom is one grep.
+      #
+      # Generalised (plan 2026-10-27-coord-routes-ci-jobs-by-runner-capability,
+      # Phase 2) by `Report this job's resources` below, which carries the same
+      # pagefile peak — plus RAM, commit limit and commit peak — on BOTH legs
+      # as one machine-readable annotation coord reads. This step and its
+      # `MEMPEAK` lines are kept only because the CARGO_BUILD_JOBS soak of plan
+      # 2026-09-17 Phase 3 step 2 (still open) greps them out of job logs;
+      # delete this step once that soak reads the report instead.
       - name: Windows memory peak after the Rust test steps
         if: always() && matrix.platform == 'windows-latest'
         continue-on-error: true
@@ -1535,6 +1557,7 @@ jobs:
         continue-on-error: true
 
       - name: Build Tauri app (development)
+        id: tauri_build
         # @tauri-apps/cli 2.11 changes that affect this step:
         #   1. Args after `--` are forwarded straight to `cargo build`, which
         #      rejects `--debug` (cargo's default profile, not a flag). So
@@ -1610,6 +1633,46 @@ jobs:
           QONTINUI_ALLOW_NO_DB: "1"
         run: powershell -File scripts/contract-smoke.ps1 -DirectExe target/debug/qontinui-runner.exe -Profile ci -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts
         shell: bash
+
+      # Plan 2026-10-27-coord-routes-ci-jobs-by-runner-capability, Phase 2:
+      # ONE `::notice title=qontinui-resource-report::{json}` per job saying
+      # what this runner HAD (RAM, commit limit, pagefile/swap) and what the
+      # job USED (commit peak on Windows, the job cgroup's anonymous-memory
+      # peak and oom_kills on Linux, disk free after the heavy steps). Coord
+      # reads it back through the check-run annotations API (Phase 3) to
+      # learn each runner class's capability and this job's requirement from
+      # measurement. Quantities
+      # the leg cannot measure are OMITTED, never zeroed — see the header of
+      # scripts/ci/resource-report.sh (fixtures:
+      # scripts/tests/test_resource_report.sh).
+      #
+      # Both legs (no platform gate). `if: always()` for the same reason as
+      # the MEMPEAK step: the expired and OOM'd runs are the ones whose
+      # numbers matter. The oom_kill baseline and the anon sampler are the
+      # ones the pre-build step above records/starts (absent on Windows,
+      # which the script reads as "nothing measured"). `build_outcome` is the
+      # outcome of the job's heavy compile+test work, so BOTH Rust halves AND
+      # the Tauri debug build (a third full compile+link on both legs) are
+      # passed and the script combines them (any failure wins).
+      #
+      # It is the LAST step of the job, deliberately: the anon sampler keeps
+      # running until this step stops it, so the peak covers every heavy step
+      # (the Tauri build included), and disk free is read when target/ is at
+      # its largest. Keep any new heavy step ABOVE it.
+      # `continue-on-error` and no `timeout-minutes`: a report must never
+      # become a way to fail the job.
+      - name: Report this job's resources
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          bash scripts/ci/resource-report.sh \
+            --build-outcome "${{ steps.build_rust_tests.outcome }}" \
+            --build-outcome "${{ steps.run_rust_tests.outcome }}" \
+            --build-outcome "${{ steps.tauri_build.outcome }}" \
+            --oom-kill-baseline "${{ steps.oom_kill_before_build.outputs.count }}" \
+            --anon-state-dir "$RUNNER_TEMP/qontinui-resource-report" \
+            --disk-path "$GITHUB_WORKSPACE"
 
   # Windows clippy, split OUT of the matrix `test` job so it no longer sits on
   # the windows `test` critical path (~12 min saved there — clippy was the 3rd
@@ -1714,6 +1777,7 @@ jobs:
         run: pnpm run build
 
       - name: Clippy check
+        id: clippy
         # Lint levels come from src-tauri/Cargo.toml [lints.clippy]; T1 groups
         # are `deny` so a correctness lint fails this check. Unlike the `test`
         # job's ubuntu clippy, this one runs `--all-targets`: it is the per-PR
@@ -1727,6 +1791,21 @@ jobs:
         run: |
           cd src-tauri
           cargo clippy --all-targets
+
+      # Plan 2026-10-27-coord-routes-ci-jobs-by-runner-capability, Phase 2:
+      # the same per-job resource report as the `test` job's (see
+      # `Report this job's resources` there). This job compiles the whole
+      # runner crate on a hosted Windows runner — the other heavy Windows
+      # Rust compile — so its commit peak is a requirement sample too.
+      # `build_outcome` is the clippy step's: this job's heavy work.
+      - name: Report this job's resources
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          bash scripts/ci/resource-report.sh \
+            --build-outcome "${{ steps.clippy.outcome }}" \
+            --disk-path "$GITHUB_WORKSPACE"
 
   # Tests + clippy for the standalone workspace crates that the `test` job
   # never reaches.

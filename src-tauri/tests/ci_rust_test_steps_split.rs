@@ -889,3 +889,170 @@ fn an_out_of_memory_rust_test_step_is_annotated_as_capacity() {
         "`{EMITTER}` must not read a MEMPEAK/pagefile reading as an OOM signature"
     );
 }
+
+/// Plan `2026-10-27-coord-routes-ci-jobs-by-runner-capability` Phase 2: every
+/// heavy Rust job emits ONE `qontinui-resource-report` annotation. The
+/// emitter's content is fixture-tested by `scripts/tests/test_resource_report.sh`;
+/// this pins the WIRING, whose failure modes are all silent — a report gated
+/// to one leg, skipped on the failed/expired runs that matter most, fed a
+/// baseline output nothing writes (GitHub expands an unknown output to ""),
+/// placed above a heavy step whose peak and disk floor it then misses, or
+/// able to fail the job.
+#[test]
+fn every_heavy_rust_job_emits_one_resource_report() {
+    const REPORT: &str = "Report this job's resources";
+    const EMITTER: &str = "bash scripts/ci/resource-report.sh";
+    let doc = ci_workflow();
+
+    // (job, the step whose outcome is `build_outcome`, that step's id)
+    for (job, build_step, build_id) in [
+        ("test", BUILD, "build_rust_tests"),
+        ("clippy-windows", "Clippy check", "clippy"),
+    ] {
+        let steps = job_steps(&doc, job);
+        let report = find_step(&steps, REPORT);
+
+        // Exactly one emitter per job: two reports would make the job's
+        // requirement ambiguous for coord's reader. A call that only STARTS
+        // the anon sampler (`--start-anon-sampler`) prints no report line.
+        let emitting: Vec<String> = steps
+            .iter()
+            .filter(|s| s.get("run").is_some())
+            .filter(|s| {
+                let label = step_name(s).unwrap_or("<unnamed>");
+                command_lines(s, label)
+                    .split(EMITTER)
+                    .skip(1)
+                    .any(|rest| !rest.trim_start().starts_with("--start-anon-sampler"))
+            })
+            .map(|s| step_name(s).unwrap_or("<unnamed>").to_string())
+            .collect();
+        assert_eq!(
+            emitting,
+            vec![REPORT.to_string()],
+            "job `{job}` must call `{EMITTER}` from exactly one step, `{REPORT}`"
+        );
+
+        // `always()` and NOTHING ELSE: a platform gate drops a whole leg's
+        // capability, and a default `success()` drops the failed and expired
+        // runs — the ones whose requirement is the point.
+        assert_eq!(
+            report.get("if").and_then(|v| v.as_str()),
+            Some("always()"),
+            "`{REPORT}` in job `{job}` must carry exactly `if: always()`"
+        );
+        assert_eq!(
+            report.get("continue-on-error").and_then(|v| v.as_bool()),
+            Some(true),
+            "`{REPORT}` in job `{job}` must carry `continue-on-error: true`"
+        );
+        assert!(
+            report.get("timeout-minutes").is_none(),
+            "`{REPORT}` in job `{job}` must NOT carry a step-level `timeout-minutes` \
+             (paired with `continue-on-error` a trip cancels the whole JOB)"
+        );
+        assert_eq!(
+            report.get("shell").and_then(|v| v.as_str()),
+            Some("bash"),
+            "`{REPORT}` in job `{job}` must run under bash (Git Bash on Windows; \
+             the default there is pwsh, which cannot run the script)"
+        );
+        assert!(
+            position(&steps, build_step) < position(&steps, REPORT),
+            "`{REPORT}` in job `{job}` must run after `{build_step}`, whose peak it reports"
+        );
+        // The LAST step: the anon sampler runs until this step stops it, and
+        // disk free is read now, so any heavy step after it (the `test` job's
+        // Tauri debug build once was) is missing from the peak and the floor.
+        assert_eq!(
+            steps.last().and_then(step_name),
+            Some(REPORT),
+            "`{REPORT}` must be the LAST step of job `{job}` so it covers every heavy step"
+        );
+        assert_eq!(
+            find_step(&steps, build_step)
+                .get("id")
+                .and_then(|v| v.as_str()),
+            Some(build_id),
+            "`{build_step}` in job `{job}` must carry `id: {build_id}`"
+        );
+        let body = command_lines(report, REPORT);
+        assert!(
+            body.contains(&format!(
+                "--build-outcome \"${{{{ steps.{build_id}.outcome }}}}\""
+            )),
+            "`{REPORT}` in job `{job}` must pass `--build-outcome` from `steps.{build_id}`: {body}"
+        );
+    }
+
+    // The `test` job reuses Phase 1's pre-build step rather than adding one:
+    // it writes the oom_kill baseline and starts the anon sampler, and the
+    // report must read exactly what that step writes (an unwritten output, or
+    // a different state dir, silently loses the reading).
+    let steps = job_steps(&doc, "test");
+    let body = command_lines(find_step(&steps, REPORT), REPORT);
+    let (baseline_at, baseline) = steps
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.get("id").and_then(|v| v.as_str()) == Some("oom_kill_before_build"))
+        .expect("no step carries `id: oom_kill_before_build`");
+    let baseline_body = command_lines(baseline, "oom_kill_before_build");
+    assert!(
+        body.contains(
+            "--oom-kill-baseline \"${{ steps.oom_kill_before_build.outputs.count }}\""
+        ),
+        "`{REPORT}` must pass `--oom-kill-baseline` from `oom_kill_before_build` output `count`: {body}"
+    );
+    assert!(
+        baseline_body.contains("echo \"count=$") && baseline_body.contains("GITHUB_OUTPUT"),
+        "`oom_kill_before_build` must write output `count`: {baseline_body}"
+    );
+    // build_outcome is the outcome of the job's heavy compile+test work, so
+    // the `test` job passes BOTH Rust halves (a run-half failure is a failed
+    // job even when the build half succeeded).
+    assert!(
+        body.contains("--build-outcome \"${{ steps.run_rust_tests.outcome }}\""),
+        "`{REPORT}` in job `test` must also pass the run half's outcome: {body}"
+    );
+    // ... and the Tauri debug build, a third full compile+link on both legs.
+    const TAURI_BUILD: &str = "Build Tauri app (development)";
+    assert_eq!(
+        find_step(&steps, TAURI_BUILD)
+            .get("id")
+            .and_then(|v| v.as_str()),
+        Some("tauri_build"),
+        "`{TAURI_BUILD}` must carry `id: tauri_build`"
+    );
+    assert!(
+        body.contains("--build-outcome \"${{ steps.tauri_build.outcome }}\""),
+        "`{REPORT}` in job `test` must also pass the Tauri build's outcome: {body}"
+    );
+    // peak_rss_mb is anonymous memory from the sampler the pre-build step
+    // starts; the report must stop/read the SAME state dir.
+    const STATE_DIR: &str = "\"$RUNNER_TEMP/qontinui-resource-report\"";
+    assert!(
+        baseline_body.contains("scripts/ci/resource-report.sh --start-anon-sampler")
+            && baseline_body.contains(&format!("--state-dir {STATE_DIR}")),
+        "`oom_kill_before_build` must start the anon sampler into {STATE_DIR}: {baseline_body}"
+    );
+    assert!(
+        body.contains(&format!("--anon-state-dir {STATE_DIR}")),
+        "`{REPORT}` must read the anon sampler's state from {STATE_DIR}: {body}"
+    );
+    // memory.peak is the cgroup's whole charge, page cache included: it must
+    // not be what either step hands the report.
+    assert!(
+        !body.contains("memory.peak") && !baseline_body.contains("memory.peak"),
+        "neither step may read `memory.peak` for the report (it carries page cache)"
+    );
+    assert!(
+        baseline_at < position(&steps, BUILD),
+        "the baselines the report reads must be taken BEFORE `{BUILD}`"
+    );
+    // MEMPEAK stays for the 2026-09-17 CARGO_BUILD_JOBS soak, but the report
+    // must not depend on it: it reads the pagefile itself.
+    assert!(
+        !body.contains("MEMPEAK"),
+        "`{REPORT}` must not parse the MEMPEAK lines; it reads the pagefile itself"
+    );
+}
