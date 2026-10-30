@@ -440,6 +440,7 @@ async function build(): Promise<RealRegistryHarness> {
   // (`result-card/builders.test.tsx` already does exactly that), so the
   // handlers now build real specs from the `cards` arm's data.
   vi.doMock("../contexts", () => ({
+    usePageSessionGetter: () => () => null,
     useTerminalSession: () => ({
       tabs: [{ id: "tab-a" }, { id: "tab-b" }],
       activeId: "tab-a",
