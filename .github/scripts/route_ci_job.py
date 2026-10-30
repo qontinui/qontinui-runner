@@ -2,7 +2,7 @@
 # VENDORED COPY -- the source is qontinui-coord/.github/scripts/route_ci_job.py
 # (tests: qontinui-coord/.github/scripts/test_route_ci_job.py). Edit there and
 # re-copy byte for byte below this header; never edit this copy alone.
-# body-sha256: 58e9c4366fe5c9a3de504874d3b19d0ad4b49ff98de409c37ea3a50cae16e831
+# body-sha256: a02b4050fb570b786502d58851d7a60ded6054afb480750485d3aae7c024c45d
 #   (sha256 of everything below this header == `tail -n +2` of the source;
 #   src-tauri/tests/ci_route_gates_hosted_only_steps.rs recomputes it)
 """Ask coord where ONE heavy CI job should run, and hand the answer to `runs-on`.
@@ -37,10 +37,13 @@ THE ANSWER (coord's four lanes, D5):
                minutes in.
   static       anything coord does not know: the static default.
 
-Where hosted is not offered (a private repo, or the tenant's hosted CI off),
-coord answers static/fail_fast with `runs_on: null` -- it never names a hosted
-label there -- and this script then uses ROUTE_DEFAULT. A private repo's
-workflow must therefore set ROUTE_DEFAULT to its own self-hosted pool.
+A repo coord does not know to be PUBLIC (private, visibility unknown, or
+owned by no tenant) is not routed: coord answers one opaque `static` with
+`runs_on: null` whatever it knows, and this script then uses ROUTE_DEFAULT.
+A private repo's workflow must therefore set ROUTE_DEFAULT to its own
+self-hosted pool. Where coord decided hosted is not offered on a public repo
+(the tenant's hosted CI off), it answers static/fail_fast with
+`runs_on: null` too -- it never names a hosted label there.
 
 THIS SCRIPT'S OWN LOGIC (what it does without coord, and what it refuses from
 coord). Any HTTP error, timeout, unparseable body, unknown lane or malformed
@@ -50,10 +53,12 @@ merge_group) or a pull_request whose head this run's own event payload shows is
 NOT a fork (an unreadable fork-ness is refused, and pull_request_target /
 issue_comment / workflow_run always are): coord never sends one there, and this
 is the second lock on that door. It refuses, as coord's own exclusivity check
-does, a self_hosted label set that is GitHub's default labels only (runners
-outside coord's roster carry those too) or that lacks `qontinui-ci-isolated`,
-a host's opt-in that it keeps no operator credential where a job can read it. A missing or malformed ROUTE_DEFAULT emits an
-EMPTY runs_on, so the dependant's own `|| '"<label>"'` default applies. Gate a
+does, a self_hosted label set that lacks `qontinui-ci-isolated` (a host's
+opt-in that it keeps no operator credential where a job can read it); a set
+of GitHub's default labels only is refused first, with its own reason,
+though the isolated-label check alone would refuse it too. A missing or
+malformed ROUTE_DEFAULT emits an EMPTY runs_on, so the dependant's own
+`|| '"<label>"'` default applies. Gate a
 hosted-only step on `runner.environment == 'github-hosted'`, never on `lane`:
 `lane` is empty when this job did not run, and a step gated on `lane == 'hosted'`
 would then skip on the hosted runner the static default chose.
@@ -75,7 +80,8 @@ INPUTS (env):
 
 OUTPUTS (to $GITHUB_OUTPUT, each under ROUTE_OUTPUT_PREFIX): runs_on (valid
 JSON -- a quoted label or a label array -- or EMPTY when there is no usable
-default), lane, reason (one line), source (coord | fallback). A summary goes to $GITHUB_STEP_SUMMARY.
+default), lane, reason (one line), source (coord | fallback). A summary goes
+to $GITHUB_STEP_SUMMARY.
 
 VENDORED COPIES carry a header naming this file as their source; edit here and
 re-copy. Stdlib only. Tests: .github/scripts/test_route_ci_job.py (hermetic).
@@ -284,6 +290,8 @@ def decide(
         labels = [label.lower() for label in ([runs_on] if isinstance(runs_on, str) else runs_on)]
         if "self-hosted" not in labels:
             return static("refused coord's self_hosted answer: its label set does not name self-hosted")
+        # Implied by the ISOLATED_LABEL check below (not a default label);
+        # first only so the reason names the larger mistake.
         if all(label in GITHUB_DEFAULT_LABELS for label in labels):
             return static("refused coord's self_hosted answer: its label set is GitHub's defaults only")
         if ISOLATED_LABEL not in labels:

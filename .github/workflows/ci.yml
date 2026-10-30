@@ -316,8 +316,10 @@ jobs:
       # the shortfall named rather than OOMing 40 minutes into the build. The
       # reason travels through env, never interpolated into the script. The
       # annotation title is coord's `CI_CAPACITY_ANNOTATION_MARKER` verbatim
-      # (pr_merge/author_feedback.rs): coord reads it as "no verdict", so a
-      # capacity failure on main is never a red baseline. Both sides pin it.
+      # (pr_merge/author_feedback.rs). coord write-skips a main run whose every
+      # failing job carries it (or was build-killed or runner-lost), once its
+      # own trace shows it answered fail_fast for that check; any other red,
+      # or an unread annotation, keeps main red. Both sides pin the title.
       - name: CI capacity (route said fail_fast)
         if: matrix.platform == 'windows-latest' && needs.route.outputs.test_windows_lane == 'fail_fast'
         shell: bash
@@ -337,6 +339,69 @@ jobs:
         with:
           fetch-depth: 0
           filter: blob:none
+
+      # SELF-HOSTED ONLY, and directly after the checkout, before any step that
+      # runs code from the PR (pnpm lifecycle scripts, build.rs, proc macros,
+      # tests). A rerouted leg runs in a fleet machine's real home with no
+      # file poison (`dirs::home_dir()` ignores $HOME on Windows, so it cannot
+      # be pointed away), and `qontinui-ci-isolated`, the label coord requires
+      # before it routes a job here, is the host's declaration that the home
+      # holds nothing a job could use against coord. This step checks exactly
+      # four things, under $HOME and (Windows) $USERPROFILE:
+      #   1-3. `.qontinui/coord-device-jwt`, `.qontinui/machine.json` and
+      #        `.qontinui/profiles.json` do not exist;
+      #   4.   nothing answers `http://127.0.0.1:9876/health` within 2 s (a
+      #        live runner there mints device JWTs on demand, with no file).
+      # It does not check other ports, a credential under another account or
+      # path, or environment the runner service passes in -- coord's
+      # ci_route NOT_SERVED lists those. The title carries coord's generic
+      # no-verdict marker (author_feedback NOT_A_VERDICT_ANNOTATION_MARKER):
+      # a misconfigured host is kept red and re-run, never read as a verdict
+      # on the code and never write-skipped.
+      - name: Refuse a host that is not isolated (self-hosted)
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -uo pipefail
+          refuse() {
+            echo "::error title=HOST NOT ISOLATED (not a verdict on this PR)::$1 Run the CI runner as a user with no coord credential and no local runner, or remove the qontinui-ci-isolated label."
+            exit 1
+          }
+          homes=("$HOME")
+          if [ "$RUNNER_OS" = "Windows" ] && [ -n "${USERPROFILE:-}" ]; then
+            homes+=("$(cygpath -u "$USERPROFILE")")
+          fi
+          for h in "${homes[@]}"; do
+            for f in coord-device-jwt machine.json profiles.json; do
+              if [ -e "$h/.qontinui/$f" ]; then
+                refuse "$h/.qontinui/$f exists on this runner; a job could read it."
+              fi
+            done
+          done
+          command -v curl >/dev/null 2>&1 || refuse "curl is absent, so whether a runner answers on 127.0.0.1:9876 is UNKNOWN."
+          if curl -s -o /dev/null --max-time 2 http://127.0.0.1:9876/health; then
+            refuse "a runner answers on 127.0.0.1:9876; a job could mint a device JWT from it."
+          fi
+          echo "isolated: no coord-device-jwt, machine.json or profiles.json under ${homes[*]}, and nothing on 127.0.0.1:9876"
+
+      # A rerouted self-hosted leg (route review H1): the runner's build and
+      # tests resolve the operator's config and secure-storage dirs, and a test
+      # binary once overwrote a real settings.json from defaults
+      # (qontinui-runner#1769). Point both at this job's $RUNNER_TEMP for every
+      # later step, as cargo-guard.sh does for a local test run.
+      - name: Sandbox the runner config dirs (self-hosted)
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SANDBOX="$RUNNER_TEMP/qontinui-config-sandbox"
+          mkdir -p "$SANDBOX/config" "$SANDBOX/secure"
+          {
+            echo "QONTINUI_CONFIG_DIR=$SANDBOX/config"
+            echo "QONTINUI_SECURE_STORAGE_DIR=$SANDBOX/secure"
+            if [ "$RUNNER_OS" != "Windows" ]; then echo "XDG_CONFIG_HOME=$SANDBOX/xdg"; fi
+          } >> "$GITHUB_ENV"
+          echo "config dirs sandboxed under $SANDBOX"
 
       # qontinui-runner's frontend cross-repo deps now resolve via npm
       # (see package.json: @qontinui/* moved from link: to ^x.y.z ranges).
@@ -777,8 +842,9 @@ jobs:
       # `dirs::home_dir()` ignores $HOME/$USERPROFILE on Windows, so the poison
       # cannot be pointed at $RUNNER_TEMP instead; a self-hosted leg runs the
       # tests with the env poison only (the ubuntu and hosted windows legs keep
-      # the file canary too), in a home the refusal step below checks holds no
-      # device credential, with its config dirs sandboxed. And even on
+      # the file canary too), in a home that `Refuse a host that is not
+      # isolated (self-hosted)` checked right after the checkout, with its
+      # config dirs sandboxed. And even on
       # a hosted runner a target FILE that already exists is a refusal, never
       # an overwrite: only files this step created are recorded, and only those
       # are removed by `Unpoison`.
@@ -815,12 +881,10 @@ jobs:
             profile_dir="$(cygpath -u "$USERPROFILE")"
             echo "HOME=$HOME"
             echo "USERPROFILE=$USERPROFILE (bash: $profile_dir)"
-            # Compare PHYSICAL paths (route review L3): two spellings of one
-            # directory -- a trailing slash, a symlink, an 8.3 name -- would
-            # otherwise poison it twice and record each file twice.
-            home_phys="$(cd "$HOME" && pwd -P)"
-            profile_phys="$( (cd "$profile_dir" && pwd -P) 2>/dev/null || echo "$profile_dir")"
-            if [ "$profile_phys" != "$home_phys" ]; then
+            # Compare the directories, not their spellings (route review L3):
+            # `-ef` is true when both name one directory (same device and
+            # inode), so a trailing slash or a symlink cannot poison it twice.
+            if ! [ "$HOME" -ef "$profile_dir" ]; then
               echo "::warning::HOME and USERPROFILE name different directories — poisoning both"
               homes+=("$profile_dir")
             fi
@@ -828,12 +892,6 @@ jobs:
 
           for h in "${homes[@]}"; do
             q="$h/.qontinui"
-            # A home already poisoned under another spelling: its files are
-            # recorded once and never refused as "already exists".
-            if grep -qxF "$q/machine.json" "$CREATED"; then
-              echo "$q already poisoned under another spelling; skipping"
-              continue
-            fi
             case "$q" in
               "$RUNNER_TEMP"/*) ;;
               *)
@@ -908,48 +966,6 @@ jobs:
           echo "QONTINUI_SERVER_MODE=1"
           echo "QONTINUI_RUNNER_TIER=local"
         shell: bash
-
-      # A self-hosted leg runs the tests with no file poison, so the home it
-      # runs in must hold no device credential a test could read and send
-      # (`dirs::home_dir()` ignores $HOME on Windows, so it cannot be pointed
-      # away). `qontinui-ci-isolated`, the label coord requires before it
-      # routes a job here, is the host's declaration that it keeps none; this
-      # step checks it rather than trusting it (route review round 2, M2).
-      - name: Refuse a home holding a device credential (self-hosted)
-        if: runner.environment == 'self-hosted'
-        shell: bash
-        run: |
-          set -euo pipefail
-          homes=("$HOME")
-          if [ "$RUNNER_OS" = "Windows" ] && [ -n "${USERPROFILE:-}" ]; then
-            homes+=("$(cygpath -u "$USERPROFILE")")
-          fi
-          for h in "${homes[@]}"; do
-            if [ -e "$h/.qontinui/coord-device-jwt" ]; then
-              echo "::error title=Self-hosted home holds a device credential::$h/.qontinui/coord-device-jwt exists on this runner; a test could read and send it. Run the CI runner as a user with no coord credential, or remove the qontinui-ci-isolated label."
-              exit 1
-            fi
-          done
-          echo "no coord-device-jwt under ${homes[*]}"
-
-      # A rerouted self-hosted leg (route review H1): the runner's tests resolve
-      # the operator's config and secure-storage dirs, and a test binary once
-      # overwrote a real settings.json from defaults (qontinui-runner#1769).
-      # Point both at this job's $RUNNER_TEMP for every later step, as
-      # cargo-guard.sh does for a local test run.
-      - name: Sandbox the runner config dirs (self-hosted)
-        if: runner.environment == 'self-hosted'
-        shell: bash
-        run: |
-          set -euo pipefail
-          SANDBOX="$RUNNER_TEMP/qontinui-config-sandbox"
-          mkdir -p "$SANDBOX/config" "$SANDBOX/secure"
-          {
-            echo "QONTINUI_CONFIG_DIR=$SANDBOX/config"
-            echo "QONTINUI_SECURE_STORAGE_DIR=$SANDBOX/secure"
-            if [ "$RUNNER_OS" != "Windows" ]; then echo "XDG_CONFIG_HOME=$SANDBOX/xdg"; fi
-          } >> "$GITHUB_ENV"
-          echo "config dirs sandboxed under $SANDBOX"
 
       # ── BUILD half of the old single `Run Rust tests` step ─────────────
       #
@@ -1794,6 +1810,69 @@ jobs:
           exit 1
 
       - uses: actions/checkout@v5
+
+      # SELF-HOSTED ONLY, and directly after the checkout, before any step that
+      # runs code from the PR (pnpm lifecycle scripts, build.rs, proc macros,
+      # tests). A rerouted leg runs in a fleet machine's real home with no
+      # file poison (`dirs::home_dir()` ignores $HOME on Windows, so it cannot
+      # be pointed away), and `qontinui-ci-isolated`, the label coord requires
+      # before it routes a job here, is the host's declaration that the home
+      # holds nothing a job could use against coord. This step checks exactly
+      # four things, under $HOME and (Windows) $USERPROFILE:
+      #   1-3. `.qontinui/coord-device-jwt`, `.qontinui/machine.json` and
+      #        `.qontinui/profiles.json` do not exist;
+      #   4.   nothing answers `http://127.0.0.1:9876/health` within 2 s (a
+      #        live runner there mints device JWTs on demand, with no file).
+      # It does not check other ports, a credential under another account or
+      # path, or environment the runner service passes in -- coord's
+      # ci_route NOT_SERVED lists those. The title carries coord's generic
+      # no-verdict marker (author_feedback NOT_A_VERDICT_ANNOTATION_MARKER):
+      # a misconfigured host is kept red and re-run, never read as a verdict
+      # on the code and never write-skipped.
+      - name: Refuse a host that is not isolated (self-hosted)
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -uo pipefail
+          refuse() {
+            echo "::error title=HOST NOT ISOLATED (not a verdict on this PR)::$1 Run the CI runner as a user with no coord credential and no local runner, or remove the qontinui-ci-isolated label."
+            exit 1
+          }
+          homes=("$HOME")
+          if [ "$RUNNER_OS" = "Windows" ] && [ -n "${USERPROFILE:-}" ]; then
+            homes+=("$(cygpath -u "$USERPROFILE")")
+          fi
+          for h in "${homes[@]}"; do
+            for f in coord-device-jwt machine.json profiles.json; do
+              if [ -e "$h/.qontinui/$f" ]; then
+                refuse "$h/.qontinui/$f exists on this runner; a job could read it."
+              fi
+            done
+          done
+          command -v curl >/dev/null 2>&1 || refuse "curl is absent, so whether a runner answers on 127.0.0.1:9876 is UNKNOWN."
+          if curl -s -o /dev/null --max-time 2 http://127.0.0.1:9876/health; then
+            refuse "a runner answers on 127.0.0.1:9876; a job could mint a device JWT from it."
+          fi
+          echo "isolated: no coord-device-jwt, machine.json or profiles.json under ${homes[*]}, and nothing on 127.0.0.1:9876"
+
+      # A rerouted self-hosted leg (route review H1): the runner's build and
+      # tests resolve the operator's config and secure-storage dirs, and a test
+      # binary once overwrote a real settings.json from defaults
+      # (qontinui-runner#1769). Point both at this job's $RUNNER_TEMP for every
+      # later step, as cargo-guard.sh does for a local test run.
+      - name: Sandbox the runner config dirs (self-hosted)
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SANDBOX="$RUNNER_TEMP/qontinui-config-sandbox"
+          mkdir -p "$SANDBOX/config" "$SANDBOX/secure"
+          {
+            echo "QONTINUI_CONFIG_DIR=$SANDBOX/config"
+            echo "QONTINUI_SECURE_STORAGE_DIR=$SANDBOX/secure"
+            if [ "$RUNNER_OS" != "Windows" ]; then echo "XDG_CONFIG_HOME=$SANDBOX/xdg"; fi
+          } >> "$GITHUB_ENV"
+          echo "config dirs sandboxed under $SANDBOX"
 
       # Rust path-dep on ../../qontinui-schemas/rust + the SDK↔runner manifest
       # diff test read; same rationale as the `test` job's sibling checkout,

@@ -61,6 +61,13 @@ const ROUTED: [&str; 2] = ["test", "clippy-windows"];
 /// `pr_merge/author_feedback.rs`), which coord reads as "no verdict". Both
 /// sides pin the literal.
 const CI_CAPACITY_TITLE: &str = "title=CI CAPACITY (not a verdict on this PR)::";
+/// The isolation refusal's title: a host misconfiguration, so coord's generic
+/// no-verdict marker (kept red and re-run, never write-skipped). Pinned in
+/// qontinui-coord `main_baseline_no_verdict.rs`
+/// (`a_host_misconfiguration_refusal_is_kept_red_and_re_run`).
+const HOST_NOT_ISOLATED_TITLE: &str = "title=HOST NOT ISOLATED (not a verdict on this PR)::";
+const REFUSE_STEP: &str = "Refuse a host that is not isolated (self-hosted)";
+const SANDBOX_STEP: &str = "Sandbox the runner config dirs (self-hosted)";
 
 /// True when `cond` confines the step to hosted runners: the gate alone, or
 /// conjoined LAST with no `||` anywhere (route review L4). A substring check
@@ -102,6 +109,7 @@ const MUST_BE_HOSTED: &[(&str, &str)] = &[
 const SELF_HOSTED_SAFE: &[(&str, &str, &str)] = &[
     ("test", "CI capacity (route said fail_fast)", "prints the reason and exits"),
     ("test", "actions/checkout@v5", "the workspace only"),
+    ("test", "Refuse a host that is not isolated (self-hosted)", "reads the home and 127.0.0.1:9876; writes nothing"),
     ("test", "Check out sibling qontinui-schemas", "the workspace's parent: the runner's own _work dir"),
     ("test", "Check out sibling qontinui-web", "the workspace's parent: the runner's own _work dir"),
     ("test", "Check out sibling ui-bridge", "the workspace's parent: the runner's own _work dir"),
@@ -120,10 +128,9 @@ const SELF_HOSTED_SAFE: &[(&str, &str, &str)] = &[
     ("test", "Build frontend", "the workspace dist dir"),
     ("test", "Format Rust code check", "reads the workspace"),
     ("test", "Poison ambient state (env)", "this job's $GITHUB_ENV only"),
-    ("test", "Refuse a home holding a device credential (self-hosted)", "reads the home; writes nothing"),
     ("test", "Sandbox the runner config dirs (self-hosted)", "$RUNNER_TEMP and this job's env"),
     ("test", "Build Rust tests", "the workspace target dir"),
-    ("test", "Run Rust tests", "config dirs sandboxed under $RUNNER_TEMP by the step before the build"),
+    ("test", "Run Rust tests", "config dirs sandboxed under $RUNNER_TEMP by the step after the checkout"),
     ("test", "Explain which Rust test phase the bound expired in", "reads this job's logs"),
     ("test", "Report test results to coord (best-effort)", "posts a summary; writes nothing"),
     ("test", "Unpoison ambient state (env)", "this job's $GITHUB_ENV only"),
@@ -131,6 +138,8 @@ const SELF_HOSTED_SAFE: &[(&str, &str, &str)] = &[
     ("test", "Contract-smoke summary invariants (PS 5.1)", "a pure script over a fixture"),
     ("clippy-windows", "CI capacity (route said fail_fast)", "prints the reason and exits"),
     ("clippy-windows", "actions/checkout@v5", "the workspace only"),
+    ("clippy-windows", "Refuse a host that is not isolated (self-hosted)", "reads the home and 127.0.0.1:9876; writes nothing"),
+    ("clippy-windows", "Sandbox the runner config dirs (self-hosted)", "$RUNNER_TEMP and this job's env"),
     ("clippy-windows", "Check out sibling qontinui-schemas", "the workspace's parent: the runner's own _work dir"),
     ("clippy-windows", "Check out sibling qontinui-web", "the workspace's parent: the runner's own _work dir"),
     ("clippy-windows", "Check out sibling ui-bridge", "the workspace's parent: the runner's own _work dir"),
@@ -416,7 +425,10 @@ fn the_unpoison_steps_always_run_and_remove_only_what_the_poison_created() {
     assert!(str_of(unfiles, "if").contains("always()") && gated_to_hosted(str_of(unfiles, "if")));
     let p = str_of(files, "run");
     assert!(p.contains("poison-created-files") && p.contains("refusing to overwrite"));
-    assert!(p.contains("pwd -P"), "homes are compared physically (L3)");
+    assert!(
+        p.contains(r#"[ "$HOME" -ef "$profile_dir" ]"#),
+        "homes are compared as directories, not spellings (L3)"
+    );
     let u = str_of(unfiles, "run");
     assert!(u.contains("poison-created-files"));
     assert!(
@@ -426,36 +438,58 @@ fn the_unpoison_steps_always_run_and_remove_only_what_the_poison_created() {
 }
 
 #[test]
-fn a_self_hosted_leg_refuses_a_home_holding_a_device_credential() {
+fn a_self_hosted_leg_refuses_a_host_that_is_not_isolated_right_after_checkout() {
     let doc = ci_workflow();
-    let s = steps(job(&doc, "test"));
-    let pos = |k: &str| {
-        s.iter()
-            .position(|x| step_key(x) == k)
-            .unwrap_or_else(|| panic!("no step `{k}`"))
-    };
-    let refuse = pos("Refuse a home holding a device credential (self-hosted)");
-    let step = &s[refuse];
-    assert_eq!(str_of(step, "if"), SELF_HOSTED_ONLY);
-    let run = str_of(step, "run");
-    assert!(run.contains(".qontinui/coord-device-jwt") && run.contains("exit 1"));
-    assert!(
-        run.contains("USERPROFILE"),
-        "Windows reads the profile dir, not $HOME"
-    );
-    assert!(refuse < pos("Build Rust tests"));
+    for name in ROUTED {
+        let s = steps(job(&doc, name));
+        let pos = |k: &str| {
+            s.iter()
+                .position(|x| step_key(x) == k)
+                .unwrap_or_else(|| panic!("job `{name}` has no step `{k}`"))
+        };
+        let checkout = pos("actions/checkout@v5");
+        let refuse = pos(REFUSE_STEP);
+        assert_eq!(
+            refuse,
+            checkout + 1,
+            "job `{name}`: the refusal runs directly after the checkout, before any PR code"
+        );
+        assert_eq!(pos(SANDBOX_STEP), refuse + 1, "job `{name}`");
+        let step = &s[refuse];
+        assert_eq!(str_of(step, "if"), SELF_HOSTED_ONLY, "job `{name}`");
+        let run = str_of(step, "run");
+        for f in ["coord-device-jwt", "machine.json", "profiles.json"] {
+            assert!(run.contains(f), "job `{name}`: checks {f}");
+        }
+        assert!(
+            run.contains("http://127.0.0.1:9876/health") && run.contains("--max-time 2"),
+            "job `{name}`: checks for a live runner"
+        );
+        assert!(run.contains(HOST_NOT_ISOLATED_TITLE), "job `{name}`");
+        assert!(!run.contains(CI_CAPACITY_TITLE), "job `{name}`: not a capacity red");
+        assert!(run.contains("exit 1") && run.contains("USERPROFILE"), "job `{name}`");
+    }
 }
 
 #[test]
 fn a_self_hosted_leg_sandboxes_the_config_dirs_before_the_rust_build() {
     let doc = ci_workflow();
+    for (name, build) in [("test", "Build Rust tests"), ("clippy-windows", "Clippy check")] {
+        let s = steps(job(&doc, name));
+        let pos = |k: &str| {
+            s.iter()
+                .position(|x| step_key(x) == k)
+                .unwrap_or_else(|| panic!("job `{name}` has no step `{k}`"))
+        };
+        assert!(pos(SANDBOX_STEP) < pos(build), "job `{name}`");
+    }
     let s = steps(job(&doc, "test"));
     let pos = |k: &str| {
         s.iter()
             .position(|x| step_key(x) == k)
             .unwrap_or_else(|| panic!("no step `{k}`"))
     };
-    let sandbox = &s[pos("Sandbox the runner config dirs (self-hosted)")];
+    let sandbox = &s[pos(SANDBOX_STEP)];
     assert!(str_of(sandbox, "if").contains(SELF_HOSTED_ONLY));
     let run = str_of(sandbox, "run");
     for var in [
