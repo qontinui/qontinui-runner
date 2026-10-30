@@ -1,10 +1,7 @@
 import { useEffect, useMemo, useState, useCallback, type ReactNode } from "react";
 import { TerminalSquare, Copy, Check, RefreshCw, Layers, AlertTriangle } from "lucide-react";
 import { usePastSessions, type PastSession } from "./usePastSessions";
-import {
-  refreshLiveClaudeSessions,
-  useLiveClaudeSessions,
-} from "./useLiveClaudeSessions";
+import { refreshLiveClaudeSessions, useLiveClaudeSessions } from "./useLiveClaudeSessions";
 import { instanceStorage } from "@/lib/instance-storage";
 import { SinceRestartSection } from "./SinceRestartSection";
 import { useSinceRestart } from "./SinceRestartContext";
