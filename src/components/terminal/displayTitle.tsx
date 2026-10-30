@@ -86,7 +86,9 @@ export function resolveDisplayTitle({
 /**
  * The name a conversation pane's label leads with: the live registry name,
  * else the immutable spawn name, else a non-path `tab.title` (which, since D3,
- * the OSC relay no longer writes). `undefined` when none is known; the label
+ * the OSC relay no longer writes; a tab persisted before D3 may still carry an
+ * old activity string here until the live registry name arrives, one tick).
+ * `undefined` when none is known; the label
  * then reads `(unnamed) · <id8>`. Never the activity title, and never the
  * `Terminal` fallback, which names no conversation.
  */
