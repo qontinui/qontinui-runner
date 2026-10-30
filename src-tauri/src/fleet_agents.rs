@@ -17,8 +17,9 @@
 //! > `qontinui-claude-config` checkout still get them; this copy-from-checkout
 //! > path unblocks the current operator fleet.*
 //!
-//! Without a checkout the copy is a no-op that `warn!`s and returns `Ok`, so a
-//! spawned agent silently has no subagents: `claude` cannot resolve the named
+//! Before the embedded floor below, a spawn without a checkout got no subagents
+//! at all (the floor is now written on that arm too), so a spawned agent
+//! silently had none: `claude` cannot resolve the named
 //! subagent, the review never runs, and coord eventually ages the PR out as
 //! `specialist_timeout`. That is a failure with no error at the point of cause.
 //!
@@ -142,6 +143,14 @@ pub(crate) fn embedded_agent_names() -> Vec<String> {
         .filter_map(|f| f.path().file_name())
         .map(|n| n.to_string_lossy().into_owned())
         .collect()
+}
+
+/// Whether the subagent definition `<name>.md` is in this binary's embedded
+/// bundle — the floor every spawned session that provisions agents receives.
+/// The `skill:expedite-review` capability is advertised only when the reviewer
+/// agent that skill requires is here (`crate::fleet`).
+pub(crate) fn agent_is_served(name: &str) -> bool {
+    FLEET_AGENTS.get_file(format!("{name}.md")).is_some()
 }
 
 /// Number of embedded subagent definitions, for log lines that want to say how
@@ -287,6 +296,32 @@ mod tests {
             "code-reviewer.md is not bundled — the fleet's pre-PR-review policy names \
              this subagent specifically, so dropping it from the bundle silently makes \
              that policy unsatisfiable on a checkout-less device"
+        );
+    }
+
+    /// The `/expedite-review` skill spawns its reviewer as this read-only type
+    /// and posts nothing when the harness has no such type (plan
+    /// 2026-10-13-coord-expedited-land-lever-for-agents Phase 6), so a runner
+    /// that serves the skill must serve the agent too.
+    #[test]
+    fn the_expedite_reviewer_is_bundled_and_read_only() {
+        assert!(agent_is_served(crate::fleet::EXPEDITE_REVIEWER_AGENT));
+        assert!(!agent_is_served("no-such-agent-for-this-test"));
+        let def = FLEET_AGENTS
+            .get_file("expedite-reviewer.md")
+            .and_then(|f| f.contents_utf8())
+            .expect("expedite-reviewer.md is not bundled");
+        // The FRONTMATTER's tool line, exactly one, and only Read.
+        let front = def.split("---").nth(1).expect("frontmatter");
+        let tools: Vec<&str> = front
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("tools:"))
+            .collect();
+        assert_eq!(
+            tools,
+            ["tools: Read"],
+            "the expedite reviewer must be Read-only"
         );
     }
 }
