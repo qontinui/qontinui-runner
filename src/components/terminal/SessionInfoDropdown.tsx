@@ -360,7 +360,9 @@ export function SessionInfoDropdown({
         data-session-info-tone={trigger.tone}
       >
         <Info className="w-2.5 h-2.5" />
-        <span className="text-[9px] font-mono leading-none">{trigger.countText}</span>
+        <span className="text-[9px] font-mono leading-none max-w-[2ch] truncate">
+          {trigger.countText}
+        </span>
         <ChevronDown className="w-2 h-2" />
       </button>
 

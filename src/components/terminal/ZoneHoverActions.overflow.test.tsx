@@ -202,7 +202,8 @@ describe("ZoneHoverActions overflow menu", () => {
     mount();
     click(button());
     const exp = item("Export zone output");
-    expect(exp.getAttribute("aria-haspopup")).toBe("true");
+    // It expands an inline group, not a submenu: no aria-haspopup.
+    expect(exp.hasAttribute("aria-haspopup")).toBe(false);
     expect(exp.getAttribute("aria-expanded")).toBe("false");
     click(exp);
     expect(exp.getAttribute("aria-expanded")).toBe("true");
@@ -229,6 +230,16 @@ describe("ZoneHoverActions overflow menu", () => {
     click(item("term-2"));
     expect(h.moveTabToWindow).toHaveBeenCalledWith("a", "term-2");
     expect(isOpen()).toBe(false);
+  });
+
+  it("opening it closes a label popover opened from the full cluster", () => {
+    mount();
+    const fullLabel = container.querySelector<HTMLButtonElement>('[aria-label="Edit zone label"]')!;
+    click(fullLabel);
+    expect(container.querySelector("input[placeholder^='zone label']")).not.toBeNull();
+    click(button());
+    expect(isOpen()).toBe(true);
+    expect(container.querySelector("input[placeholder^='zone label']")).toBeNull();
   });
 
   it("opening it closes a full-cluster dropdown, and opening one closes it", () => {
