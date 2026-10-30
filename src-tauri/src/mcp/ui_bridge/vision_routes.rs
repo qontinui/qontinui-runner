@@ -5582,7 +5582,23 @@ mod text_hidden_tests {
         let (_, args) = abort
             .split_once("let restore = restore_after_cancel(")
             .expect("the shared cancel restore");
-        let (args, spawn) = args.split_once(");").expect("its arguments end");
+        // Its arguments run to the paren that closes the call: the send closure
+        // inside them ends statements with `);` of its own, so no terminator
+        // string marks the end.
+        let close = args
+            .char_indices()
+            .scan(1i32, |depth, (i, c)| {
+                match c {
+                    '(' => *depth += 1,
+                    ')' => *depth -= 1,
+                    _ => {}
+                }
+                Some((i, *depth))
+            })
+            .find(|&(_, depth)| depth == 0)
+            .map(|(i, _)| i)
+            .expect("the call to restore_after_cancel closes");
+        let (args, spawn) = args.split_at(close);
         let mut at = 0;
         for arg in [
             "super::request::ui_bridge_request_sync(&state, kind, body)",
