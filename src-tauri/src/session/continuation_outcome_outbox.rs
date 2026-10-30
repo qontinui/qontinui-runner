@@ -360,12 +360,12 @@ impl ContinuationOutcomeOutbox {
                 .get(&rec.gate_id)
                 .is_some_and(|keys| keys.iter().any(|(k, _)| *k == key))
         };
-        if listed(&*book) {
+        if listed(&book) {
             // Confirm against the outbox before trusting the book: a record
             // that left the file without the book hearing of it must be
             // written again, not reported as a duplicate.
             self.reconcile_locked(&mut book, false);
-            if listed(&*book) {
+            if listed(&book) {
                 return Ok(Enqueued::Duplicate { lane });
             }
         }
