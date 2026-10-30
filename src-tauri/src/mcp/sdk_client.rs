@@ -3476,10 +3476,7 @@ pub(crate) async fn sdk_text_visibility(
     if let Err(e) = text_visibility::validate_text_visibility_body(&body) {
         return serde_json::json!({ "success": false, "code": "INVALID_REQUEST", "error": e });
     }
-    // The app's TTL restores its page with no request this runner sees.
-    if let Some(delay_ms) = text_visibility::ttl_bump_delay_ms(&body) {
-        bump_after_ttl(delay_ms);
-    }
+    let ttl_bump = text_visibility::ttl_bump_delay_ms(&body);
     // The app's rendered pixels change between these two bumps, so a vision
     // capture cached on either side of the change is not reused across it.
     bump();
@@ -3497,6 +3494,12 @@ pub(crate) async fn sdk_text_visibility(
         Err(e) => serde_json::json!({ "success": false, "error": dispatch_err_to_string(e) }),
     };
     bump();
+    // The app's TTL restores its page with no request this runner sees: the
+    // bump is counted from the reply, by which time the app's timer runs
+    // (`text_visibility::TTL_BUMP_MARGIN_MS`).
+    if let Some(delay_ms) = ttl_bump {
+        bump_after_ttl(delay_ms);
+    }
     out
 }
 

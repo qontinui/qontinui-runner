@@ -67,11 +67,25 @@ pub(crate) const DEFAULT_TTL_MS: u64 = 30_000;
 /// so a bump a little later keeps the capture cache from serving a frame
 /// cached while the text was hidden. Unconditional — a bump after a restore
 /// that already happened costs one cache miss and nothing else.
+///
+/// The delay is counted from when the hide's REPLY arrived, never from when it
+/// was sent: the SDK arms its timer while handling the hide, so by the time the
+/// reply is here the timer is running, and reply + TTL + margin is past the
+/// moment an on-time timer fires. A webview timer can fire LATE (a hidden
+/// page's timers are aligned to coarse wake-ups, a busy event loop runs a due
+/// timer only once it frees), which is what [`TTL_BUMP_LATE_EXTRA_MS`] covers.
 pub(crate) const TTL_BUMP_MARGIN_MS: u64 = 1_000;
 
-/// When a body that HIDES text should have its TTL-restore bump scheduled:
-/// the TTL it names (or the SDK default) plus [`TTL_BUMP_MARGIN_MS`]. `None`
-/// for a restore, which has no TTL.
+/// The second scheduled bump, this long after the first: it retires a capture
+/// cached under the first bump's id when the SDK's TTL restore ran late (see
+/// [`TTL_BUMP_MARGIN_MS`]). A restore later still — a webview whose timers are
+/// paused outright — is not covered: a capture made before it is served under
+/// the second bump's id until the next mutation.
+pub(crate) const TTL_BUMP_LATE_EXTRA_MS: u64 = 4_000;
+
+/// When a body that HIDES text should have its TTL-restore bump scheduled,
+/// counted from the hide's reply: the TTL it names (or the SDK default) plus
+/// [`TTL_BUMP_MARGIN_MS`]. `None` for a restore, which has no TTL.
 pub(crate) fn ttl_bump_delay_ms(body: &Value) -> Option<u64> {
     if body.get("hidden").and_then(Value::as_bool) != Some(true) {
         return None;
@@ -83,12 +97,15 @@ pub(crate) fn ttl_bump_delay_ms(body: &Value) -> Option<u64> {
     Some(ttl + TTL_BUMP_MARGIN_MS)
 }
 
-/// Bump `state`'s vision mutation id after `delay_ms`: the TTL-restore bump
-/// [`ttl_bump_delay_ms`] times.
+/// Bump `state`'s vision mutation id after `delay_ms`, and again
+/// [`TTL_BUMP_LATE_EXTRA_MS`] later: the TTL-restore bumps
+/// [`ttl_bump_delay_ms`] times. One task for both.
 pub(crate) fn schedule_mutation_bump(state: &Arc<ApiState>, delay_ms: u64) {
     let state = Arc::clone(state);
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        super::vision_routes::bump_mutation_id(&state);
+        tokio::time::sleep(std::time::Duration::from_millis(TTL_BUMP_LATE_EXTRA_MS)).await;
         super::vision_routes::bump_mutation_id(&state);
     });
 }
@@ -108,6 +125,19 @@ pub(crate) const SDK_PATH: &str = "/control/text-visibility";
 /// leaves the page altered for seconds, not the SDK's default half minute.
 pub(crate) const CAPTURE_TTL_MS: u64 = 15_000;
 const _: () = assert!(CAPTURE_TTL_MS >= MIN_TTL_MS && CAPTURE_TTL_MS <= MAX_TTL_MS);
+
+/// Frame B is kept only when it FINISHED at least this long before the
+/// earliest moment the SDK's TTL can restore the page: the hide's send plus
+/// [`CAPTURE_TTL_MS`]. Slack for the webview's and the runner's clocks
+/// measuring the same interval differently.
+pub(crate) const TTL_FRAME_B_MARGIN_MS: u64 = 1_000;
+const _: () = assert!(TTL_FRAME_B_MARGIN_MS < CAPTURE_TTL_MS);
+
+/// The pause between two attempts at a restore that never left the runner
+/// ([`hide_never_sent`]: the circuit breaker open, the UI Bridge concurrency
+/// gate full, …). Retried while the next attempt can still land before the
+/// arm's TTL would restore the page anyway.
+pub(crate) const RESTORE_RETRY_DELAY_MS: u64 = 250;
 
 /// A JSON number the SDK's `Number.isInteger` accepts, as a `u64`: `5000` and
 /// `5000.0` alike. A fraction, a negative or a non-number is `None`.
@@ -203,15 +233,18 @@ where
         "UI Bridge API: text visibility hidden={}",
         body["hidden"].as_bool().unwrap_or_default()
     );
-    // A hide's TTL restores the page with no request this runner sees.
-    if let Some(delay_ms) = ttl_bump_delay_ms(&body) {
-        bump_after_ttl(delay_ms);
-    }
+    let ttl_bump = ttl_bump_delay_ms(&body);
     // Rendered pixels change between these two bumps; a capture keyed on the
     // mutation id from either side of them is not reused across the change.
     bump();
     let result = send(REQUEST_TYPE, body).await;
     bump();
+    // A hide's TTL restores the page with no request this runner sees: its
+    // bump is counted from the reply, by which time the SDK's timer runs
+    // (see `TTL_BUMP_MARGIN_MS`).
+    if let Some(delay_ms) = ttl_bump {
+        bump_after_ttl(delay_ms);
+    }
     // The SDK's own failure code (`capability_unavailable_in_build`,
     // `HIDE_FAILED`, …) is a verdict field the envelope does not forward when
     // the runner has no typed code by that name, so it is put back into
@@ -279,7 +312,9 @@ pub struct TextVisibilityRun {
     /// refusal (`{success: false, code, reason, error}` —
     /// `capability_unavailable_in_build` wherever the webview has not opted
     /// into dev controls), or `{success: false, error}` when the request never
-    /// reached the SDK.
+    /// reached the SDK. When the probe already answered `devControls: false`,
+    /// no hide is sent at all: this is then the runner's own record of that
+    /// refusal ([`dev_controls_off_refusal`], `hideSent: false`).
     pub hide: Value,
     /// What the webview answered to the restore, the SDK's `{hidden: false,
     /// changed, restore: {verified, …}}`. `None` when no restore was sent: the
@@ -293,10 +328,13 @@ pub struct TextVisibilityRun {
     /// failed; `None` when none was sent (see `restore`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page_restored: Option<bool>,
-    /// Something the caller should know that does not by itself void frame B:
-    /// the hide answered after its paint fence TIMED OUT, so frame B may have
-    /// been composited before the glyphs went transparent (vision-core then
-    /// reads the glyphs as still painted and answers unknown, never a pass).
+    /// Something the caller should know beyond frame B's own verdict: the hide
+    /// answered after its paint fence TIMED OUT, so frame B may have been
+    /// composited before the glyphs went transparent (vision-core then reads
+    /// the glyphs as still painted and answers unknown, never a pass); or a
+    /// hide that threw part-way could not be rolled back (`HIDE_FAILED` with
+    /// `rolledBack: null`), so the page may be left partly text-hidden — the
+    /// SDK cleared its state, so no restore can reach what is left.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
 }
@@ -312,6 +350,68 @@ pub struct TextHiddenPair<Fr> {
 
 fn is_true(v: &Value, key: &str) -> bool {
     v.get(key).and_then(Value::as_bool) == Some(true)
+}
+
+/// Whether a restore reply shows the SDK restored the page and verified it:
+/// `{success: true, hidden: false, restore: {verified: true}}`. The arm's and
+/// the cancel path's one reading of a restore.
+pub(crate) fn restore_verified(restore: &Value) -> bool {
+    is_true(restore, "success")
+        && restore.get("hidden").and_then(Value::as_bool) == Some(false)
+        && restore
+            .get("restore")
+            .is_some_and(|r| is_true(r, "verified"))
+}
+
+/// Whether a `success: false` hide reply is a TYPED refusal — one the hook or
+/// the SDK answered on purpose, carrying a `code` or the hook's boolean
+/// `wasHidden` — so that what it says about the page can be believed. A
+/// `success: false` with neither is the hook's own catch-all (it threw: its
+/// reply is the bare `{success: false, error}` envelope) and says nothing
+/// about the page: whether a hide landed is UNKNOWN, so it is restored.
+fn is_typed_refusal(hide: &Value) -> bool {
+    hide.get("success").and_then(Value::as_bool) == Some(false)
+        && (hide.get("code").and_then(Value::as_str).is_some()
+            || hide.get("wasHidden").and_then(Value::as_bool).is_some())
+}
+
+/// A `HIDE_FAILED` whose rollback threw too (`rolledBack: null`): the SDK says
+/// the page may then be partly hidden, and it cleared its state either way,
+/// so a restore cannot reach what is left. `None` for every other refusal.
+fn partial_hide_warning(hide: &Value) -> Option<String> {
+    let rollback_threw = hide.get("code").and_then(Value::as_str) == Some("HIDE_FAILED")
+        && hide.get("rolledBack").is_some_and(Value::is_null);
+    rollback_threw.then(|| {
+        "the hide threw part-way and its rollback threw too (HIDE_FAILED, rolledBack: \
+         null): the page may be left partly text-hidden, and the SDK cleared its state, so \
+         no restore can reach what is left"
+            .to_string()
+    })
+}
+
+/// Whether the probe says this webview has not opted into dev controls
+/// (`devControls: false`, which only the hook's dev-controls-off arm sends):
+/// nothing can be hidden there, so the arm sends no hide at all. An older hook
+/// sends no such field, and the arm then learns it from the hide's refusal.
+fn probe_says_dev_controls_off(probe: Option<&Value>) -> bool {
+    probe
+        .and_then(|v| v.get("devControls"))
+        .and_then(Value::as_bool)
+        == Some(false)
+}
+
+/// The run record's `hide` when the probe found dev controls off and no hide
+/// was sent: the dev-controls refusal, in the SDK's vocabulary, marked
+/// `hideSent: false` so it is not read as the webview's answer to a hide.
+pub(crate) fn dev_controls_off_refusal() -> Value {
+    serde_json::json!({
+        "success": false,
+        "code": "capability_unavailable_in_build",
+        "reason": "dev_controls_disabled",
+        "error": "the runner webview has not opted into dev controls (its probe answered \
+                  devControls: false), so no hide was sent",
+        "hideSent": false,
+    })
 }
 
 /// Whether a REFUSED hide still leaves frame A proven: the hook read
@@ -368,8 +468,10 @@ pub(crate) type PairLockGuard = tokio::sync::OwnedMutexGuard<()>;
 /// ARMED, restores the page if dropped: the arm's future cancelled (the HTTP
 /// client went away) or a panic unwinding through it. The restore callback is
 /// handed both, so the restore it spawns releases them only once it has
-/// landed and bumped: until then no other arm can start and no other capture
-/// can see the text-hidden page (and cache it under the post-hide mutation id).
+/// landed and bumped: until then no other arm can start and no other VISION
+/// capture can see the text-hidden page (and cache it under the post-hide
+/// mutation id). Captures that take no permit are not held off — see
+/// [`capture_text_hidden_pair`]'s `acquire`.
 struct ArmGuard<P, R: FnOnce(PairLockGuard, P)> {
     restore: Option<R>,
     held: Option<(PairLockGuard, P)>,
@@ -470,6 +572,9 @@ pub(crate) fn arm_hide_body() -> Value {
 /// Nothing was hidden, so nothing is restored. Any other error (a timeout after the send
 /// above all) leaves it unknown whether the hide landed, and is restored.
 ///
+/// The arm reads a failed RESTORE the same way: one that never left the runner
+/// changed nothing, so it is safe to send again, and is retried.
+///
 /// Matched on the messages `request.rs` and `circuit_breaker.rs` produce; a
 /// test pins that each one still exists there, so a reworded message fails the
 /// build's tests rather than silently turning into "unknown".
@@ -496,16 +601,24 @@ pub(crate) const BEFORE_SEND: [&str; 6] = [
 /// - `send` is the request to the webview (`ui_bridge_request_sync`): the
 ///   probe, the hide and the restore.
 /// - `acquire` takes the capture permits BEFORE the probe — ALL of them in
-///   production, so no other runner-window capture can see the page while its
-///   text is hidden. They are held until the restore attempt has returned (or,
-///   on a cancel, until the guard's restore has landed). A DOM read — a
-///   snapshot, a discover — during the hide is not covered: it reads the DOM,
-///   not pixels, and the hide changes only paint properties, but its computed
-///   colours would read transparent.
+///   production, so no other vision capture (the `vision/*` routes, which take
+///   a permit in `vision_routes::capture_runner_window`) can see the page while
+///   its text is hidden. They are held until the restore has answered (or, on
+///   a cancel, until the guard's restore has landed), and past that until the
+///   TTL when the restore could not be confirmed. NOT covered, because they
+///   take no permit: `screenshots::capture_runner_window_base64` (the snapshot
+///   and error fallbacks in `elements.rs`, `errors.rs` and `mcp_api.rs`),
+///   exploration's and streaming's xcap window grabs, and a monitor capture
+///   through the screen HAL — any of them can capture the text-hidden page. A
+///   DOM read — a snapshot, a discover — during the hide is not covered
+///   either: it reads the DOM, not pixels, and the hide changes only paint
+///   properties, but its computed colours would read transparent.
 /// - `capture` takes one frame of the runner window, the permits already held:
 ///   frame A, and — only after the webview confirmed THIS call's hide — frame B.
 /// - `bump` bumps the vision mutation id: before the hide and after the restore.
-/// - `bump_after_ttl` schedules the bump for the SDK's own TTL restore.
+/// - `bump_after_ttl` schedules the bump for the SDK's own TTL restore, once
+///   the hide's reply has arrived (or its request failed after it may have
+///   been sent): counted from then, it cannot fire before an on-time SDK timer.
 /// - `abort_restore` restores the page if this future is cancelled or unwinds
 ///   while armed. It is handed the lock and the permits and must spawn the
 ///   restore holding both, release them only after the restore and its bump,
@@ -517,35 +630,55 @@ pub(crate) const BEFORE_SEND: [&str; 6] = [
 /// ([`probe_fence_unproven`]): hidden, a timed-out or missing fence, or no
 /// usable answer refuses at once — no frame A, no hide, nothing to restore.
 /// The probe is one more webview round trip, and it runs with every capture
-/// permit held: on a stalled webview, other runner-window captures wait for it
-/// up to the UI Bridge request timeout.
+/// permit held: on a stalled webview, other vision captures wait for it up to
+/// the UI Bridge request timeout. A probe answering `devControls: false` (the
+/// webview never opted in, so nothing can be hidden in it) gets frame A and
+/// nothing else: no hide, no mutation bumps, no TTL bump, frame B refused with
+/// `capability_unavailable_in_build` ([`dev_controls_off_refusal`]).
 ///
 /// The hide ([`arm_hide_body`]) then says whose hide it is ([`hide_is_ours`]):
 /// - THIS call's: frame B is taken and the page restored, whether or not frame
-///   B was captured. A restore that fails or is not verified is reported in
-///   [`TextVisibilityRun::page_restored`] and frame B is kept: what it shows
-///   was fixed when it was taken. A restore answering `changed: false` means
-///   the SDK's TTL had already restored the page, at an unknown moment that may
-///   precede frame B, so frame B is discarded.
+///   B was captured. A restore that never left the runner ([`hide_never_sent`])
+///   is retried until the TTL would beat it. A restore that fails or is not
+///   verified is reported in [`TextVisibilityRun::page_restored`] and frame B
+///   is kept: what it shows was fixed when it was taken. One that FAILED (no
+///   `success: true` reply at all) may have left the page hidden, so the lock
+///   and the permits are then held until the TTL has restored it, and the id
+///   bumped. Frame B is discarded when the SDK's TTL may have restored the page
+///   before it was taken: the restore answered `changed: false` (the TTL got
+///   there first), or frame B finished within [`TTL_FRAME_B_MARGIN_MS`] of the
+///   earliest moment the TTL can fire — counted from when the hide was SENT,
+///   which no SDK timer can precede. The time check catches what the reply
+///   cannot: a restore that errored, or one answering `changed: true` because a
+///   direct-route hide re-hid the page after the TTL restore.
 /// - Another caller's (`wasHidden: true`): it appeared after the probe, so it
 ///   may have covered frame A. Frame A is refused, no frame B is taken, and the
 ///   hide — which the hook did not touch — is not restored.
 /// - UNKNOWN — the hide request errored or timed out after it may have been
-///   sent, the call was cancelled before the hide reply, or the reply carries
-///   no `wasHidden`: the page is RESTORED (holding the lock and permits), then
-///   the id bumped, and no frame B is returned. Frame A is refused too: the
-///   lost `wasHidden` is the only thing that could have shown another caller's
-///   hide landing after the probe, during frame A. The arm's TTL is short, and
-///   a page left text-hidden poisons every capture until it fires; the one hide
-///   this can wrongly undo is a concurrent dev-only direct-route
+///   sent, the call was cancelled before the hide reply, the reply carries no
+///   `wasHidden`, or it is neither a hide nor a typed refusal (a `success:
+///   false` with no `code` and no `wasHidden`: the hook's own catch-all, which
+///   says nothing about the page — [`is_typed_refusal`]): the page is RESTORED
+///   (holding the lock and permits), then the id bumped, and no frame B is
+///   returned. A restore is idempotent, so restoring a hide that never landed
+///   costs one request. Frame A is refused too: the lost `wasHidden` is the
+///   only thing that could have shown another caller's hide landing after the
+///   probe, during frame A. The arm's TTL is short, and a page left
+///   text-hidden poisons every capture until it fires; the one hide this can
+///   wrongly undo is a concurrent dev-only direct-route
 ///   (`control/text-visibility`) hide.
-/// - A refused hide (`success: false`), or a request that provably never left
-///   the runner ([`hide_never_sent`]): nothing was hidden, nothing restored, and
-///   the permits are released at once. Frame A is refused here too unless the
-///   hook's answer proves it ([`refusal_keeps_frame_a`]): a never-sent hide has
-///   no answer at all, and a refusal must carry `wasHidden: false` or be the
-///   dev-controls refusal — otherwise nothing checked whether another caller
-///   hid the page after the probe (the UNKNOWN case's reason).
+/// - A TYPED refusal (`success: false` with a `code` or a boolean
+///   `wasHidden`), or a request that provably never left the runner
+///   ([`hide_never_sent`]): nothing is restored, and the permits are released
+///   at once. A typed refusal hid nothing — except `HIDE_FAILED` with
+///   `rolledBack: null`, where the SDK's own rollback threw and the page may be
+///   left PARTLY hidden; the SDK cleared its state, so a restore cannot reach
+///   it, and the run record carries a warning ([`partial_hide_warning`]).
+///   Frame A is refused here too unless the hook's answer proves it
+///   ([`refusal_keeps_frame_a`]): a never-sent hide has no answer at all, and a
+///   refusal must carry `wasHidden: false` or be the dev-controls refusal —
+///   otherwise nothing checked whether another caller hid the page after the
+///   probe (the UNKNOWN case's reason).
 ///
 /// Accepted remainder — frame A may show a text-hidden page, unseen, when:
 /// - a hide by another caller appears after the probe AND is gone again before
@@ -559,10 +692,15 @@ pub(crate) const BEFORE_SEND: [&str; 6] = [
 ///   the window.
 ///
 /// Only the dev-only direct route can hide this webview's text besides this
-/// arm, and the arm's lock keeps two arms apart. `captureTextHidden` therefore
-/// works on a minimized or occluded dev runner too: the probe waits on a paint
-/// only right after a restore, where a timed-out fence still refuses.
-#[allow(clippy::too_many_arguments)]
+/// arm, and the arm's lock keeps two arms apart.
+///
+/// A minimized or occluded dev runner does not get a usable pair: its webview
+/// paints no frames, so the HIDE's paint fence times out (reported in
+/// [`TextVisibilityRun::warning`]; vision-core then reads frame B as still
+/// painting its glyphs and answers unknown), and a probe right after a restore
+/// refuses on its own timed-out fence. What such a runner does get is frame A
+/// when no restore is recent: the probe then answers `not_needed` without
+/// waiting on a paint.
 pub(crate) async fn capture_text_hidden_pair<S, F, A, AF, P, C, CF, Fr, B, T, R>(
     send: S,
     acquire: A,
@@ -629,6 +767,10 @@ where
         };
     }
 
+    // Read before frame A, used after it: the probe already said whether this
+    // webview can hide anything at all.
+    let dev_controls_off = probe_says_dev_controls_off(probe.as_ref().ok());
+
     let mut frame_a = capture().await;
     if frame_a.is_err() {
         // Altering the page for a frame B nothing can be paired with buys nothing.
@@ -639,10 +781,26 @@ where
         };
     }
 
-    let hide_body = arm_hide_body();
-    if let Some(delay_ms) = ttl_bump_delay_ms(&hide_body) {
-        bump_after_ttl(delay_ms);
+    if dev_controls_off {
+        // Nothing can be hidden in a realm that never opted in (the gate is
+        // one-way), so frame A stands and no hide is sent: nothing changes on
+        // the page, so there is nothing to bump and no TTL to wait out. The
+        // guard is not armed yet; dropping it releases the lock and permits.
+        let hide = dev_controls_off_refusal();
+        return TextHiddenPair {
+            frame_a,
+            frame_b: Err(hide_failure_message(&hide)),
+            run: Some(TextVisibilityRun {
+                hide,
+                restore: None,
+                page_restored: None,
+                warning: None,
+            }),
+        };
     }
+
+    let hide_body = arm_hide_body();
+    let ttl_bump = ttl_bump_delay_ms(&hide_body);
     // Armed BEFORE the send: whether the hide landed is unknown until its reply,
     // and an unknown hide is restored (see the doc above) — on a cancel, by the
     // guard, still holding the lock and the permits. That restore may undo a
@@ -650,7 +808,12 @@ where
     // the page text-hidden for the arm's TTL.
     guard.arm(abort_restore);
     bump();
+    // No SDK timer for this hide can start before this instant, so its TTL
+    // cannot restore the page before `hide_sent_at + CAPTURE_TTL_MS`.
+    let hide_sent_at = tokio::time::Instant::now();
     let hide_reply = send(REQUEST_TYPE, hide_body).await;
+    // ...and by this one an SDK timer that handled the hide is running.
+    let hide_answered_at = tokio::time::Instant::now();
     let (hide, landed, never_sent) = match hide_reply {
         Ok(v) => (v, true, false),
         Err(e) => {
@@ -662,15 +825,24 @@ where
             )
         }
     };
-    if never_sent || (landed && !(is_true(&hide, "success") && is_true(&hide, "hidden"))) {
-        // Nothing was hidden — the request never left the runner, or the
-        // webview answered and refused — so nothing is restored, and the lock
-        // and permits go at once.
+    let hid = landed && is_true(&hide, "success") && is_true(&hide, "hidden");
+    let refused = landed && !hid && is_typed_refusal(&hide);
+    if never_sent || refused {
+        // The request never left the runner, or the webview answered with a
+        // typed refusal: nothing a restore could undo was hidden, so nothing is
+        // restored, and the lock and permits go at once. (A HIDE_FAILED whose
+        // rollback threw may have left the page partly hidden; the SDK cleared
+        // its state, so a restore cannot reach it — reported as a warning.)
         guard.disarm();
         let error = if never_sent {
             never_sent_message(&hide)
         } else {
             hide_failure_message(&hide)
+        };
+        let warning = if never_sent {
+            None
+        } else {
+            partial_hide_warning(&hide)
         };
         // Unsent: no hook answer, so nothing checked whether another caller hid
         // the page after the probe, during frame A — the same unknown as a lost
@@ -697,11 +869,16 @@ where
                 hide,
                 restore: None,
                 page_restored: None,
-                warning: None,
+                warning,
             }),
         };
     }
-    let ours = if landed { hide_is_ours(&hide) } else { None };
+    // The page may now be text-hidden — by this hide, or by one whose fate is
+    // unknown — so the SDK's TTL restore gets its bump, counted from the reply.
+    if let Some(delay_ms) = ttl_bump {
+        bump_after_ttl(delay_ms);
+    }
+    let ours = if hid { hide_is_ours(&hide) } else { None };
     if ours == Some(false) {
         // Another caller hid the text after the probe: left to that caller
         // untouched, and frame A — possibly taken under it — is refused.
@@ -731,16 +908,19 @@ where
     // Unknown: a hide by another caller may have landed after the probe and
     // covered frame A (its `wasHidden: true` would have said so), so frame A
     // is not kept either.
+    let unknown_why = if !landed {
+        "the hide request failed, so whether it landed is unknown"
+    } else if hid {
+        "whose hide it is is unknown (the reply carries no wasHidden)"
+    } else {
+        "the hide's reply is neither a hide nor a typed refusal (a refusal names a code or \
+         wasHidden), so whether it landed is unknown"
+    };
     if ours.is_none() {
-        frame_a = Err(if landed {
-            "frame A was not kept: whose hide it is is unknown (the reply carries no \
-             wasHidden), so another caller's hide may have covered frame A"
-                .to_string()
-        } else {
-            "frame A was not kept: the hide request failed, so whether another caller's hide \
-             covered frame A is unknown"
-                .to_string()
-        });
+        frame_a = Err(format!(
+            "frame A was not kept: {unknown_why}, so another caller's hide may have covered \
+             frame A"
+        ));
     }
 
     // Ours: frame B. Unknown: none — restore only.
@@ -748,27 +928,65 @@ where
         Some(true) => capture()
             .await
             .map_err(|e| format!("frame B (text hidden) capture failed: {e}")),
-        _ => not_taken(if landed {
-            "whose hide it is is unknown (the reply carries no wasHidden); the page was \
-             restored"
-        } else {
-            "the hide request failed, so whether it landed is unknown; the page was restored"
-        }),
+        _ => not_taken(&format!(
+            "{unknown_why}; a restore was sent (see pageRestored)"
+        )),
     };
+    // Frame B must be done before the SDK's TTL could have restored the page:
+    // the restore's reply cannot always say (it errored, or a re-hide after the
+    // TTL restore makes it answer `changed: true`), the clock can.
+    if frame_b.is_ok() {
+        let finished = hide_sent_at.elapsed();
+        if finished >= std::time::Duration::from_millis(CAPTURE_TTL_MS - TTL_FRAME_B_MARGIN_MS) {
+            frame_b = Err(format!(
+                "frame B discarded: it finished {} ms after the hide was sent, within \
+                 {TTL_FRAME_B_MARGIN_MS} ms of (or past) the {CAPTURE_TTL_MS} ms TTL, so the \
+                 SDK's own restore may have come before it",
+                finished.as_millis()
+            ));
+        }
+    }
 
-    // The permits are still held: until this attempt returns, no other capture
-    // can see the page. If it fails, the page may stay hidden until the TTL.
-    let restore = match send(REQUEST_TYPE, serde_json::json!({"hidden": false})).await {
-        Ok(v) => v,
-        Err(e) => serde_json::json!({"success": false, "error": e}),
+    // The permits are still held, and the guard still armed. A restore that
+    // never left the runner changed nothing and is sent again, for as long as
+    // the next attempt can still land before the TTL would restore the page.
+    let retry_delay = std::time::Duration::from_millis(RESTORE_RETRY_DELAY_MS);
+    let retry_until = hide_sent_at + std::time::Duration::from_millis(CAPTURE_TTL_MS);
+    let mut attempts: u32 = 0;
+    let restore = loop {
+        attempts += 1;
+        match send(REQUEST_TYPE, serde_json::json!({"hidden": false})).await {
+            Ok(v) => break v,
+            Err(e)
+                if hide_never_sent(&e)
+                    && tokio::time::Instant::now() + retry_delay < retry_until =>
+            {
+                warn!(
+                    "vision: the runner webview's text restore never left the runner \
+                     (attempt {attempts}): {e}; retrying"
+                );
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(e) => break serde_json::json!({"success": false, "error": e, "attempts": attempts}),
+        }
     };
+    if !is_true(&restore, "success") {
+        // No restore is known to have landed, so the page may stay text-hidden
+        // until the TTL: the lock and the permits stay held until it has fired,
+        // so no other vision capture sees (or caches) the hidden page.
+        warn!(
+            "vision: the runner webview's text restore failed ({restore}); holding the \
+             capture permits until the {CAPTURE_TTL_MS} ms TTL has restored the page"
+        );
+        tokio::time::sleep_until(
+            hide_answered_at
+                + std::time::Duration::from_millis(CAPTURE_TTL_MS + TTL_BUMP_MARGIN_MS),
+        )
+        .await;
+    }
     guard.disarm();
     bump();
-    let verified = is_true(&restore, "success")
-        && restore.get("hidden").and_then(Value::as_bool) == Some(false)
-        && restore
-            .get("restore")
-            .is_some_and(|r| is_true(r, "verified"));
+    let verified = restore_verified(&restore);
     if !verified {
         warn!("vision: the runner webview's text restore was not verified: {restore}");
     }
@@ -947,12 +1165,35 @@ mod tests {
         assert_eq!(data["reason"], json!("dev_controls_disabled"));
     }
 
+    /// `route_entries()` against what `routes()` really mounts, read from this
+    /// file's source (axum 0.8 has no router introspection; the same stop-gap
+    /// as `mod.rs`'s manifest test): every `.route(` call's path and method,
+    /// in order, must be exactly the listed entries.
     #[test]
     fn route_entries_match_the_router() {
-        assert_eq!(
-            route_entries(),
-            &[("POST", "/ui-bridge/control/text-visibility")]
-        );
+        let src = include_str!("text_visibility.rs");
+        let (_, rest) = src.split_once("\npub fn routes() ").expect("routes()");
+        let (body, _) = rest.split_once("\n}\n").expect("routes() ends");
+        let mounted: Vec<(String, String)> = body
+            .split(".route(")
+            .skip(1)
+            .map(|call| {
+                let path = call.split('"').nth(1).expect("a path literal");
+                let method = ["post(", "get(", "put(", "patch(", "delete("]
+                    .iter()
+                    .filter_map(|m| call.find(m).map(|at| (at, m)))
+                    .min()
+                    .map(|(_, m)| m.trim_end_matches('(').to_uppercase())
+                    .expect("a method router");
+                (method, path.to_string())
+            })
+            .collect();
+        let listed: Vec<(String, String)> = route_entries()
+            .iter()
+            .map(|(m, p)| (m.to_string(), p.to_string()))
+            .collect();
+        assert!(!mounted.is_empty(), "the scan found no .route( call");
+        assert_eq!(mounted, listed);
     }
 
     #[tokio::test]
@@ -1185,16 +1426,16 @@ mod tests {
                 "permits".to_string(),
                 "probe".into(),
                 "capture".into(),
-                ttl_bump(),
                 "bump".into(),
                 "hide".into(),
+                ttl_bump(),
                 "capture".into(),
                 "show".into(),
                 "bump".into(),
             ],
-            "the permits, then the probe, before frame A; a TTL bump scheduled with the \
-             hide, which asks onlyIfVisible; a bump before the hide and after the restore; \
-             no guard restore once restored"
+            "the permits, then the probe, before frame A; the hide asks onlyIfVisible, and \
+             its TTL bump is scheduled once its reply is in; a bump before the hide and \
+             after the restore; no guard restore once restored"
         );
         let run = out.run.expect("a hide was sent");
         assert_eq!(run.page_restored, Some(true));
@@ -1223,6 +1464,10 @@ mod tests {
         assert!(err.contains("capability_unavailable_in_build"), "{err}");
         assert!(!has(&events, "show"), "the webview hid nothing: {events:?}");
         assert!(!has(&events, "abort-restore"), "{events:?}");
+        assert!(
+            !has(&events, &ttl_bump()),
+            "nothing hidden, no TTL: {events:?}"
+        );
         assert_eq!(events.iter().filter(|e| *e == "capture").count(), 1);
         assert_eq!(
             out.frame_a,
@@ -1256,6 +1501,142 @@ mod tests {
             assert!(out.frame_b.is_err(), "{was:?}");
             assert!(!has(&events, "show"), "{was:?}: {events:?}");
             assert!(!has(&events, "abort-restore"), "{was:?}: {events:?}");
+        }
+    }
+
+    /// The hook's catch-all reply — it threw, and answered the bare envelope
+    /// `{success: false, error}` — carries no code and no `wasHidden`: it says
+    /// nothing about the page, so it is UNKNOWN and restored, never read as
+    /// "refused, nothing hidden". Likewise a reply that is neither a hide nor
+    /// a refusal at all.
+    #[tokio::test]
+    async fn a_failure_reply_with_no_code_and_no_was_hidden_is_restored() {
+        for reply in [
+            json!({"requestId": "r", "type": REQUEST_TYPE, "success": false,
+                   "error": "Text visibility failed: boom", "timestamp": 1}),
+            json!({"success": true, "hidden": false}),
+        ] {
+            let (out, events) = run(
+                vec![ok(reply.clone()), ok(restored(true))],
+                vec![ok("frame-a"), ok("frame-b")],
+            )
+            .await;
+            assert!(has(&events, "show"), "{reply}: {events:?}");
+            assert!(has(&events, &ttl_bump()), "{reply}: {events:?}");
+            assert_eq!(events.last().map(String::as_str), Some("bump"), "{reply}");
+            assert_eq!(events.iter().filter(|e| *e == "capture").count(), 1);
+            let err = out.frame_b.expect_err("no frame B for an unknown hide");
+            assert!(
+                err.contains("neither a hide nor a typed refusal"),
+                "{reply}: {err}"
+            );
+            let err = out.frame_a.expect_err("frame A is not proven");
+            assert!(err.contains("frame A was not kept"), "{reply}: {err}");
+            assert_eq!(out.run.unwrap().page_restored, Some(true), "{reply}");
+        }
+    }
+
+    /// A HIDE_FAILED whose rollback threw too may have left the page partly
+    /// hidden; the SDK cleared its state, so no restore is sent (it could not
+    /// reach what is left) and the run record says so. A rolled-back
+    /// HIDE_FAILED hid nothing, and carries no warning.
+    #[tokio::test]
+    async fn a_hide_failed_whose_rollback_threw_warns_the_page_may_be_partly_hidden() {
+        let failed = |rolled_back: Value| {
+            json!({"success": false, "code": "HIDE_FAILED", "error": "threw",
+                   "rolledBack": rolled_back, "wasHidden": false})
+        };
+        let (out, events) = run(vec![ok(failed(Value::Null))], vec![ok("frame-a")]).await;
+        assert!(!has(&events, "show"), "{events:?}");
+        assert_eq!(out.frame_a, Ok("frame-a"));
+        let warning = out.run.unwrap().warning.expect("a warning");
+        assert!(warning.contains("partly text-hidden"), "{warning}");
+
+        let (out, _) = run(
+            vec![ok(failed(json!({"trigger": "rollback", "verified": true})))],
+            vec![ok("frame-a")],
+        )
+        .await;
+        assert_eq!(out.run.unwrap().warning, None);
+    }
+
+    /// The probe answered `devControls: false`: nothing can be hidden in that
+    /// webview, so the arm takes frame A and stops — no hide, no mutation
+    /// bump, no scheduled TTL bump — and reports the refusal as its own record.
+    #[tokio::test]
+    async fn dev_controls_off_takes_frame_a_and_sends_no_hide() {
+        let probe = json!({"success": true, "query": true, "hidden": false,
+                           "paintFence": "not_needed", "devControls": false});
+        let (out, events) = run_with_probe(ok(probe), vec![], vec![ok("frame-a")]).await;
+        assert_eq!(out.frame_a, Ok("frame-a"));
+        let err = out.frame_b.expect_err("nothing can be hidden there");
+        assert!(err.contains("capability_unavailable_in_build"), "{err}");
+        assert_eq!(events, ["permits", "probe", "capture"]);
+        let record = out.run.expect("the refusal is reported");
+        assert_eq!(record.hide, dev_controls_off_refusal());
+        assert_eq!(record.hide["hideSent"], json!(false));
+        assert_eq!(record.restore, None);
+    }
+
+    /// Frame B must be done before the SDK's TTL could have restored the page,
+    /// counted from the hide's send — whatever the restore answers: it may have
+    /// errored, or a re-hide after the TTL restore makes it answer `changed:
+    /// true`.
+    #[tokio::test(start_paused = true)]
+    async fn a_frame_b_that_ran_into_the_ttl_is_discarded_whatever_the_restore_says() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let limit = CAPTURE_TTL_MS - TTL_FRAME_B_MARGIN_MS;
+        for (frame_b_ms, restore, kept) in [
+            (limit - 1, Ok(restored(true)), true),
+            (limit, Ok(restored(true)), false),
+            (CAPTURE_TTL_MS + 2_000, Ok(restored(true)), false),
+            (
+                CAPTURE_TTL_MS + 2_000,
+                Err("UI Bridge request timed out".to_string()),
+                false,
+            ),
+        ] {
+            let replies = Mutex::new(vec![Ok(visible()), Ok(hid()), restore.clone()].into_iter());
+            let send = move |_kind: &'static str, _body: Value| {
+                let reply = replies
+                    .lock()
+                    .unwrap()
+                    .next()
+                    .unwrap_or_else(|| Err("no more replies scripted".into()));
+                std::future::ready(reply)
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let capture = move || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        return Ok::<_, String>("frame-a");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(frame_b_ms)).await;
+                    Ok("frame-b")
+                }
+            };
+            let out = capture_text_hidden_pair(
+                send,
+                || std::future::ready(Ok::<(), String>(())),
+                capture,
+                || {},
+                |_| {},
+                |_, _| {},
+            )
+            .await;
+            if kept {
+                assert_eq!(out.frame_b, Ok("frame-b"), "{frame_b_ms} ms, {restore:?}");
+            } else {
+                let err = out
+                    .frame_b
+                    .expect_err("frame B may postdate the TTL restore");
+                assert!(
+                    err.contains("frame B discarded") && err.contains("TTL"),
+                    "{frame_b_ms} ms, {restore:?}: {err}"
+                );
+            }
+            assert_eq!(out.frame_a, Ok("frame-a"));
         }
     }
 
@@ -1299,7 +1680,8 @@ mod tests {
         assert_eq!(out.run.unwrap().page_restored, Some(true));
     }
 
-    #[tokio::test]
+    // Paused clock: a failed restore holds the permits until the TTL.
+    #[tokio::test(start_paused = true)]
     async fn an_unverified_or_failed_restore_is_reported_and_frame_b_kept() {
         for reply in [
             ok(restored(false)),
@@ -1314,6 +1696,88 @@ mod tests {
             assert_eq!(out.frame_b, Ok("frame-b"), "{reply:?}");
             assert_eq!(out.run.unwrap().page_restored, Some(false), "{reply:?}");
         }
+    }
+
+    /// A restore that FAILED (no `success: true` reply) may have left the page
+    /// text-hidden: the arm keeps the lock and the permits until the TTL has
+    /// restored it, and bumps only then. One that answered — verified or not —
+    /// is not held: the SDK did its restore, and the TTL would change nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_restore_holds_the_permits_until_the_ttl_has_restored_the_page() {
+        let ttl_passed = std::time::Duration::from_millis(CAPTURE_TTL_MS + TTL_BUMP_MARGIN_MS);
+        for (reply, held) in [
+            (fails("UI Bridge request timed out"), true),
+            (ok(json!({"success": false, "error": "x"})), true),
+            (ok(restored(false)), false),
+            (ok(restored(true)), false),
+        ] {
+            let started = tokio::time::Instant::now();
+            let (out, events) = run(
+                vec![ok(hid()), reply.clone()],
+                vec![ok("frame-a"), ok("frame-b")],
+            )
+            .await;
+            let took = started.elapsed();
+            assert_eq!(took >= ttl_passed, held, "{reply:?}: took {took:?}");
+            assert_eq!(events.last().map(String::as_str), Some("bump"), "{reply:?}");
+            assert_eq!(out.frame_b, Ok("frame-b"), "{reply:?}");
+        }
+    }
+
+    /// A restore that provably never left the runner changed nothing: it is
+    /// sent again, and a later attempt that lands verifies the page.
+    #[tokio::test(start_paused = true)]
+    async fn a_restore_that_never_left_the_runner_is_retried() {
+        let busy = "UI Bridge concurrency limit reached (timeout acquiring permit)";
+        let (out, events) = run(
+            vec![ok(hid()), fails(busy), fails(busy), ok(restored(true))],
+            vec![ok("frame-a"), ok("frame-b")],
+        )
+        .await;
+        assert_eq!(
+            events.iter().filter(|e| *e == "show").count(),
+            3,
+            "{events:?}"
+        );
+        assert_eq!(out.run.unwrap().page_restored, Some(true));
+        assert_eq!(out.frame_b, Ok("frame-b"));
+
+        // A restore that fails AFTER it may have been sent is not retried: it
+        // is not known to have changed nothing.
+        let (_, events) = run(
+            vec![
+                ok(hid()),
+                fails("UI Bridge request timed out"),
+                ok(restored(true)),
+            ],
+            vec![ok("frame-a"), ok("frame-b")],
+        )
+        .await;
+        assert_eq!(
+            events.iter().filter(|e| *e == "show").count(),
+            1,
+            "{events:?}"
+        );
+    }
+
+    /// The retries stop once another attempt could not land before the TTL
+    /// restores the page anyway; the arm then holds until the TTL.
+    #[tokio::test(start_paused = true)]
+    async fn the_restore_retries_stop_at_the_ttl() {
+        let busy = "UI Bridge temporarily unavailable (circuit breaker open)";
+        let mut replies = vec![ok(hid())];
+        replies.extend(std::iter::repeat_with(|| fails(busy)).take(200));
+        let (out, events) = run(replies, vec![ok("frame-a"), ok("frame-b")]).await;
+        let shows = events.iter().filter(|e| *e == "show").count() as u64;
+        assert!(
+            shows <= CAPTURE_TTL_MS / RESTORE_RETRY_DELAY_MS,
+            "retried past the TTL: {shows}"
+        );
+        assert!(shows > 1, "{events:?}");
+        let record = out.run.unwrap();
+        assert_eq!(record.page_restored, Some(false));
+        let restore = record.restore.unwrap();
+        assert_eq!(restore["attempts"], json!(shows), "{restore}");
     }
 
     #[tokio::test]

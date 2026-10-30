@@ -135,8 +135,9 @@ function restoreMayBeUnpainted(): boolean {
  *   runner, whose paused frames would time every fence out, still gets its
  *   frame A. Where dev controls are off nothing can ever have been hidden in
  *   this realm (the gate is one-way), so the answer is likewise
- *   `"not_needed"`. Not seen: another caller's hide AND its restore, both
- *   made inside the fence's own wait.
+ *   `"not_needed"`, and it carries `devControls: false` so the arm sends no
+ *   hide at all (it would only be refused). Not seen: another caller's hide
+ *   AND its restore, both made inside the fence's own wait.
  * - `onlyIfVisible: true` — hide only when text is not already hidden. When it
  *   is, answer `{hidden: true, changed: false, wasHidden: true}` WITHOUT
  *   calling the SDK, so another caller's hide is neither re-armed nor touched.
@@ -163,7 +164,13 @@ export async function runTextVisibilityRequest(
     if (!devControlsEnabled()) {
       return {
         success: true,
-        data: { success: true, query: true, hidden: textHidden(), paintFence: "not_needed" },
+        data: {
+          success: true,
+          query: true,
+          hidden: textHidden(),
+          paintFence: "not_needed",
+          devControls: false,
+        },
       };
     }
     const before = textHidden();
