@@ -1796,7 +1796,8 @@ export function useTerminalInitialization({
           if (adoptOrphans) didClaimOrphanAdoption.current = false;
           console.warn(
             `[TerminalPage] restore for page "${initPageId}" deferred by the coord device ` +
-              `drain: ${restoreSet.deferredByDrain} — it re-runs when the drain lifts.`,
+              `drain or dispatch role: ${restoreSet.deferredByDrain} — it re-runs when ` +
+              `autonomous spawns are allowed again.`,
           );
           return;
         }

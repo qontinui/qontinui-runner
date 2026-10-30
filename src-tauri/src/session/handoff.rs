@@ -481,7 +481,8 @@ async fn connect_and_pump(
     // A row the drain deferred is not pushed a second time, so without this arm
     // it would wait for the next reconnect or tick.
     let mut drain_rx = crate::coord_drain_state::subscribe();
-    let mut autonomous_allowed = crate::coord_drain_state::current().allows_autonomous_spawns();
+    // Drain AND dispatch role: a role reopening the agent lane is a resume too.
+    let mut autonomous_allowed = crate::coord_drain_state::autonomous_spawns_allowed_now();
     let mut drain_rx_open = true;
 
     loop {
@@ -496,7 +497,8 @@ async fn connect_and_pump(
                     drain_rx_open = false;
                     continue;
                 }
-                let now_allowed = drain_rx.borrow_and_update().allows_autonomous_spawns();
+                drain_rx.borrow_and_update();
+                let now_allowed = crate::coord_drain_state::autonomous_spawns_allowed_now();
                 if resumed_after_drain(autonomous_allowed, now_allowed) {
                     tracing::info!(
                         "session handoff: autonomous spawns allowed again — replaying pending \

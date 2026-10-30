@@ -1105,9 +1105,13 @@ pub(crate) async fn restart_after_drain(
         // answered `running: true` forever and landed HERE, which dropped the
         // kind from the stopped-by-drain set and left the steward down.
         Err((StatusCode::CONFLICT, Json(err))) => {
+            // A dispatch role closing the agent lane is a deferral too: the
+            // kind stays owed, and the wind-down executor holds its undrain
+            // until the role reopens the lane (`hold_undrain_for_role`).
             let deferred = err.code.as_deref().is_some_and(|code| {
                 code == crate::coord_drain_state::DeferClass::Drained.code()
                     || code == crate::coord_drain_state::DeferClass::Unknown.code()
+                    || code == crate::coord_drain_state::DeferClass::RoleClosed.code()
             });
             let reason = err
                 .error

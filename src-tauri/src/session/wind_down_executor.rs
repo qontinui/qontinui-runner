@@ -197,6 +197,27 @@ pub fn decide_tick(state: &CoordDrainState, owes_undrain: bool, now: DateTime<Ut
     }
 }
 
+/// PURE: hold an `Undrain` while the dispatch role closes the agent lane.
+///
+/// The undrain's only job is to restart the stewards a drain stopped, and every
+/// one of those restarts is an autonomous spawn the role defers. Running it
+/// anyway would retry (and log) every tick for as long as the role holds. Held,
+/// the obligation is kept (`was_drained` stays true and the stopped-by-drain set
+/// is untouched), and the first tick after the role reopens the lane undrains.
+pub fn hold_undrain_for_role(
+    action: TickAction,
+    role: Option<crate::coord_drain_state::DispatchRole>,
+) -> TickAction {
+    match action {
+        TickAction::Undrain
+            if role.is_some_and(crate::coord_drain_state::DispatchRole::closes_agent_lane) =>
+        {
+            TickAction::Nothing
+        }
+        other => other,
+    }
+}
+
 /// Wall-clock jump detector (hazard 1). Monotonic time is the reference;
 /// wall-clock time is the thing under suspicion.
 #[derive(Debug, Default)]
@@ -472,7 +493,11 @@ async fn tick_once(state: &mut ExecutorState) {
         );
     }
 
-    match decide_tick(&drain, state.was_drained, Utc::now()) {
+    let action = hold_undrain_for_role(
+        decide_tick(&drain, state.was_drained, Utc::now()),
+        crate::coord_drain_state::current_dispatch_role(),
+    );
+    match action {
         TickAction::Nothing => {}
         TickAction::Undrain => {
             // `undrain` reports what it could not restart, so a kind the drain
@@ -1095,6 +1120,35 @@ mod tests {
             since: DateTime::<Utc>::UNIX_EPOCH,
             cause: "three missed heartbeats".to_string(),
         }
+    }
+
+    /// Review S1: an undrain under a closing dispatch role would retry every
+    /// tick, because each steward restart it makes is deferred by the role. It
+    /// is held instead, and every other action passes through untouched.
+    #[test]
+    fn an_undrain_is_held_while_the_dispatch_role_closes_the_agent_lane() {
+        use crate::coord_drain_state::DispatchRole;
+        for role in [DispatchRole::CiNode, DispatchRole::Bench] {
+            assert_eq!(
+                hold_undrain_for_role(TickAction::Undrain, Some(role)),
+                TickAction::Nothing
+            );
+            // A role never stops a wind-down: that is the drain's alone.
+            assert_eq!(
+                hold_undrain_for_role(TickAction::WindDown, Some(role)),
+                TickAction::WindDown
+            );
+        }
+        for role in [None, Some(DispatchRole::Workhorse)] {
+            assert_eq!(
+                hold_undrain_for_role(TickAction::Undrain, role),
+                TickAction::Undrain
+            );
+        }
+        assert_eq!(
+            hold_undrain_for_role(TickAction::Nothing, Some(DispatchRole::CiNode)),
+            TickAction::Nothing
+        );
     }
 
     // ── Invariant 1: no kill path from this module ───────────────────────
