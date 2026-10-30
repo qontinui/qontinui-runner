@@ -114,7 +114,33 @@ repos:
         # output only when it fails, and a passing run should still say which
         # arms it exercised (it reports skips, which a bare "Passed" would hide).
         verbose: true
-        files: '^\.pre-commit-hooks/(lib/gen-events-attribution\.sh|gen-events-drift-attribution-test\.sh|gen-events-drift\.sh|gen-events-path-deps-check\.sh)$'
+        # `lib/push-range.sh` is here because the decision's base ref
+        # (`push_default_base_ref`) lives there.
+        files: '^\.pre-commit-hooks/(lib/(gen-events-attribution|push-range)\.sh|gen-events-drift-attribution-test\.sh|gen-events-drift\.sh|gen-events-path-deps-check\.sh)$'
+        pass_filenames: false
+
+      # The per-file refinement of that decision (`lib/gen-events-file-attribution.sh`
+      # and the registry reader `lib/gen-events-registry.mjs`): which drifted
+      # FILES a push that touches codegen inputs could actually have moved.
+      # Toolchain-free like the suite above, except that it needs `node`, which
+      # the drift hook needs too; without it every case reports SKIPPED.
+      #
+      # Also triggered by `schema_export.rs` and `lib.rs`. The suite checks
+      # that THIS tree's registry still satisfies the reader's premises: one
+      # `add!` macro, no cfg, no second way into the map, and a plain
+      # `pub mod schema_export;`. A refactor that breaks one quietly turns every
+      # push back into a whole-push verdict, so it should fail at the commit
+      # that makes it.
+      #
+      # `stages: [pre-commit]`, for push-range-test's reason below: it gates the
+      # edit, and the pre-push stage set stays what the direct shim mirrors.
+      - id: gen-events-file-attribution-test
+        name: gen-events drift per-file attribution — tests
+        entry: bash .pre-commit-hooks/gen-events-file-attribution-test.sh
+        language: system
+        stages: [pre-commit]
+        verbose: true
+        files: '^(\.pre-commit-hooks/(lib/(gen-events-file-attribution\.sh|gen-events-registry\.mjs|gen-events-attribution\.sh|push-range\.sh)|gen-events-file-attribution-test\.sh|gen-events-drift\.sh)|src-tauri/src/(schema_export|lib)\.rs)$'
         pass_filenames: false
 
       # How the drift hook finds the repo root. The commit-sourced pre-push shim

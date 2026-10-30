@@ -70,6 +70,17 @@
 #                   Fails closed: today's hard failure, plus a line saying
 #                   attribution could not run.
 #
+# A pusher-caused verdict is then refined FILE BY FILE
+# (`lib/gen-events-file-attribution.sh`). Touching a codegen input is not the
+# same as moving every drifted binding. Take a push that edits one runner
+# module while qontinui-schemas carries 14 bindings the runner has not yet
+# registered (runner main on 2026-10-30). It cannot have moved any of those
+# 14, yet four pushes in one week were refused for exactly that drift and went
+# out with SKIP=. So each drifted file is held against the push only when the
+# push touched an input that can move THAT file. If none can, the verdict is
+# pre-existing. If the per-file rule cannot run, the whole-push verdict
+# stands, as before.
+#
 # The check itself is unchanged — the same regeneration, the same comparison,
 # the same full diffstat in every arm. Only the blame moved.
 #
@@ -160,6 +171,18 @@ if [ ! -f "$ATTRIBUTION_LIB" ]; then
 fi
 # shellcheck source=lib/gen-events-attribution.sh
 . "$ATTRIBUTION_LIB"
+
+# The per-file refinement. Same guarded-source shape. A missing copy of this
+# library cannot clear anyone: without it the whole-push verdict stands.
+FILE_ATTRIBUTION_LIB="$SCRIPT_DIR/lib/gen-events-file-attribution.sh"
+if [ ! -f "$FILE_ATTRIBUTION_LIB" ]; then
+    fail "ERROR: missing $FILE_ATTRIBUTION_LIB"
+    fail "Restore the file (it ships with this repo) or bypass this push with:"
+    fail "    SKIP=gen-events-drift git push"
+    exit 1
+fi
+# shellcheck source=lib/gen-events-file-attribution.sh
+. "$FILE_ATTRIBUTION_LIB"
 
 # Which stage this is, for every line below that would otherwise say "push":
 # this hook also runs at pre-commit, where "this push" is false. Under the
@@ -624,6 +647,16 @@ fi
 
 gen_events_attribution "$RUNNER_DIR"
 
+# A whole-push MINE is refined file by file: is each drifted file one this
+# push's touched inputs can move? `whole-push` means the refinement could not
+# run, and then the MINE verdict stands exactly as before. Never run for the
+# other two states: `pre-existing` already clears, and `unavailable` must not
+# be argued out of failing closed.
+FILE_ATTRIBUTION_STATE=""
+if [ "$ATTRIBUTION_STATE" = "mine" ]; then
+    gen_events_file_attribution "$RUNNER_DIR" "$BASELINE_DIR" "$SCRATCH_DIR"
+fi
+
 # The regeneration commands and the shared-checkout caveat: the same remedy in
 # every arm — only the urgency differs — so each arm supplies its own
 # lead-in line and calls this for the body. It really is printed from one
@@ -702,9 +735,68 @@ if [ "$ATTRIBUTION_STATE" = "pre-existing" ] && [ "$STRICT" != "1" ]; then
     exit 0
 fi
 
+if [ "$ATTRIBUTION_STATE" = "mine" ] && [ "$FILE_ATTRIBUTION_STATE" = "pre-existing" ] \
+   && [ "$STRICT" != "1" ]; then
+    # The push DOES touch codegen inputs — but none that can move any file in
+    # this diff. Same non-blocking verdict as the arm above, with the reason
+    # given per file, because "this push changes nothing that feeds them" is
+    # not true here and must not be printed.
+    echo
+    log "PRE-EXISTING DRIFT — not caused by this $STAGE."
+    log "The bindings on disk at $BASELINE_DIR do not match what this repo's"
+    log "Rust generates. This $STAGE does change codegen inputs, measured against"
+    log "$ATTRIBUTION_BASE_REF (merge-base ${ATTRIBUTION_BASE_SHA:0:12}), but none that can move these files:"
+    gen_events_render_file_list pre "    " | sed 's/^/[gen-events-drift] /'
+    log "(per-file rules: lib/gen-events-file-attribution.sh)"
+    echo
+    git --no-pager diff --no-index --stat -- "$BASELINE_DIR" "$SCRATCH_DIR" || true
+    print_dirty_checkout_note log
+    echo
+    if [ "${FILE_ATTRIBUTION_AHEAD:-0}" -gt 0 ]; then
+        # The usual regeneration remedy would DELETE these from qontinui-schemas
+        # (coord finding 19f8a714). A binding ahead of the runner is normally a
+        # pending registration, and what clears it is the runner PR that
+        # registers it.
+        log "Nothing to do for this $STAGE. $FILE_ATTRIBUTION_AHEAD binding(s) above are AHEAD of the"
+        log "runner: registered on neither side. That is usually a pending registration."
+        log "qontinui-schemas codegen/pending-registration.toml names the runner PR that"
+        log "registers each one, and landing that PR is what clears them. Do NOT regenerate"
+        log "over them: generate_types.sh would delete them from qontinui-schemas."
+        log "For anything else listed, the usual remedy is:"
+    else
+        log "Nothing to do for this $STAGE. To clear it for everyone:"
+    fi
+    print_remedy log
+    log "Set QONTINUI_GEN_EVENTS_DRIFT_STRICT=1 to block on pre-existing drift too."
+    echo
+    exit 0
+fi
+
 echo
 fail "ERROR: Generated Tauri event bindings are stale."
-if [ "$ATTRIBUTION_STATE" = "mine" ]; then
+if [ "$ATTRIBUTION_STATE" = "mine" ] && [ "$FILE_ATTRIBUTION_STATE" = "mine" ]; then
+    # Per file: name what this push can move, and keep what it cannot apart,
+    # so a pusher fixes their own drift and is not sent after someone else's.
+    fail "This $STAGE changes inputs that move these drifted files, measured against"
+    fail "$ATTRIBUTION_BASE_REF (merge-base ${ATTRIBUTION_BASE_SHA:0:12}):"
+    gen_events_render_file_list mine "    " | sed 's/^/[gen-events-drift] /' >&2
+    if [ -n "$FILE_ATTRIBUTION_PRE" ]; then
+        fail "These were already drifted before it, and are not held against it:"
+        gen_events_render_file_list pre "    " | sed 's/^/[gen-events-drift] /' >&2
+    fi
+    fail "The inputs this $STAGE touches:"
+    gen_events_render_mine --inputs-only | sed 's/^/[gen-events-drift] /' >&2
+elif [ "$ATTRIBUTION_STATE" = "mine" ] && [ "$FILE_ATTRIBUTION_STATE" = "pre-existing" ]; then
+    # Only reachable under STRICT.
+    fail "This drift is PRE-EXISTING — none of the inputs this $STAGE changes can move"
+    fail "these files — but QONTINUI_GEN_EVENTS_DRIFT_STRICT=1 blocks on it:"
+    gen_events_render_file_list pre "    " | sed 's/^/[gen-events-drift] /' >&2
+elif [ "$ATTRIBUTION_STATE" = "mine" ]; then
+    # Per-file attribution could not run, so the whole push answers for the
+    # whole diff, as it did before per-file attribution existed. Say why, so
+    # a pusher who sees a familiar refusal knows which premise stopped it.
+    fail "Per-file attribution could not run: ${FILE_ATTRIBUTION_REASON:-no reason recorded}."
+    fail "So the whole $STAGE is held to the whole diff."
     # The whole explanation — lead line, per-file source labels, and the note
     # on inputs that are not in the push — is rendered by the library, where
     # the attribution self-test pins it. Here it only gets the prefix and
@@ -732,6 +824,14 @@ git --no-pager diff --no-index --stat -- "$BASELINE_DIR" "$SCRATCH_DIR" >&2 || t
 echo >&2
 fail "Refresh the shared bindings by regenerating and committing them there:"
 print_remedy
+if [ "${FILE_ATTRIBUTION_AHEAD:-0}" -gt 0 ]; then
+    # The regeneration above rewrites the whole directory, so it would also
+    # DELETE the bindings that are ahead of the runner (coord finding 19f8a714).
+    fail "BUT: $FILE_ATTRIBUTION_AHEAD binding(s) listed above as AHEAD of the runner would be deleted"
+    fail "by that regeneration. They are usually pending registrations"
+    fail "(qontinui-schemas codegen/pending-registration.toml). Commit only this"
+    fail "$STAGE's own files from the regenerated tree, and keep those."
+fi
 print_dirty_checkout_note
 
 echo >&2
