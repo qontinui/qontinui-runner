@@ -200,14 +200,12 @@ pub struct CensusDiff {
     pub verdict: String,
 }
 
-/// The once-per-process latch: the pre-restore `expected` set plus the instant
-/// it was taken.
+/// The once-per-process latch: the pre-restore `expected` set. (A restore
+/// stamp from THIS boot is told from a sticky one left by a PREVIOUS boot by
+/// the process generation — see [`observe_restored`] — not by the latch's
+/// instant.)
 #[derive(Debug, Clone)]
 pub struct BootCensus {
-    /// Unix millis when the latch ran — i.e. this process's boot. Used to
-    /// discriminate a restore stamp from THIS boot against a sticky stamp left
-    /// by a PREVIOUS one (`restored_from_boot_at` survives restarts by design).
-    pub boot_at_ms: i64,
     pub expected: Vec<CensusExpected>,
 }
 
@@ -281,12 +279,14 @@ pub fn expected_rows(
 pub fn latch_expected(
     store: &SessionLifecycleStore,
     probe: &dyn TranscriptProbe,
-    now_ms: i64,
+    // No longer read: the latch carried it as the boot instant that told a
+    // this-boot restore stamp from a sticky one, and the process generation
+    // does that now (see [`observe_restored`]).
+    _now_ms: i64,
     boot: Option<BootClassification>,
 ) {
     let boot_was_clean = boot.map(|c| !c.crash_recovery).unwrap_or(false);
     let census = BootCensus {
-        boot_at_ms: now_ms,
         expected: boot_expected(store, probe, boot),
     };
     let expected_count = census.expected.len();
@@ -456,24 +456,28 @@ fn unknown_reason(clean_shutdown: Option<bool>) -> &'static str {
     }
 }
 
-/// Observations of every record carrying a boot-restore stamp from THIS boot.
+/// Observations of every record carrying a boot-restore stamp from THIS
+/// process generation.
 ///
-/// The `boot_at_ms` gate is load-bearing: `restored_from_boot_at` is STICKY
-/// across restarts by design (a record must not forget it was once restored),
-/// so a stamp older than this process's own latch belongs to a PREVIOUS boot
-/// and must not count as evidence for this one.
+/// The generation gate is load-bearing: the restore markers are STICKY across
+/// restarts by design (a record must not forget it was once restored), so a
+/// stamp from any other generation belongs to a PREVIOUS boot and must not
+/// count as evidence for this one. It is an equality test on
+/// `restored_in_generation`, never an order on `restored_from_boot_at` — a
+/// wall clock stepped backwards across the reboot would otherwise hide every
+/// restore (plan `2026-10-07-a-resumed-gate-continuation-…` D1).
 ///
 /// Reads ALL records, open and closed alike: a session that came back and was
 /// then closed by the operator did in fact come back, and dropping it would
 /// report a `missing` the restore is not guilty of.
 pub fn observe_restored(
     store: &SessionLifecycleStore,
-    boot_at_ms: i64,
+    generation: &str,
 ) -> Vec<RestoredObservation> {
     let mut out: Vec<RestoredObservation> = store
         .all_records()
         .into_iter()
-        .filter(|r| r.restored_from_boot_at.is_some_and(|at| at >= boot_at_ms))
+        .filter(|r| r.restored_in_generation.as_deref() == Some(generation))
         .map(|r| RestoredObservation {
             claude_session_id: r.claude_session_id,
             terminal_id: r.terminal_id,
@@ -516,7 +520,7 @@ pub fn build_census(
             verdict: RESTORE_VERDICT_UNKNOWN.to_string(),
         };
     };
-    let observed = observe_restored(store, census.boot_at_ms);
+    let observed = observe_restored(store, crate::session::tracking_health::process_generation());
     let diff = diff_census(&census.expected, &observed, clean_shutdown);
     let reason = (diff.verdict == RESTORE_VERDICT_UNKNOWN)
         .then(|| unknown_reason(clean_shutdown).to_string());
@@ -741,7 +745,9 @@ mod tests {
             last_session_start_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
-            gate_bound_boot_ms: None,
+            gate_bound_generation: None,
+            restored_in_generation: None,
+            gate_reported_generation: None,
         }
     }
 
@@ -862,5 +868,47 @@ mod tests {
         assert_eq!(d.restored[0].terminal_id, None);
         let json = serde_json::to_value(&d.restored[0]).unwrap();
         assert!(json.get("terminalId").is_none(), "omitted: {json}");
+    }
+
+    /// Plan 2026-10-07 D1 test (d2): "restored THIS boot" is the generation,
+    /// not the timestamp. A record restored in this generation counts even
+    /// when its display timestamp reads as ancient (a backwards clock step),
+    /// closed or open; one restored in a PRIOR generation never counts, even
+    /// when its timestamp reads as the far future.
+    #[test]
+    fn observe_restored_keys_on_the_generation_not_the_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let this_gen = "gen-this";
+        let mut now_closed = record("this-gen-closed", true);
+        now_closed.restored_from_boot_at = Some(0);
+        now_closed.restored_in_generation = Some(this_gen.to_string());
+        store.record_open(now_closed);
+        store.record_close("this-gen-closed", "pty-exit");
+        let mut prior = record("prior-gen", true);
+        prior.restored_from_boot_at = Some(i64::MAX);
+        prior.restored_in_generation = Some("gen-prior".to_string());
+        store.record_open(prior);
+        let mut legacy = record("legacy-no-generation", true);
+        legacy.restored_from_boot_at = Some(i64::MAX);
+        store.record_open(legacy);
+
+        let ids: Vec<String> = observe_restored(&store, this_gen)
+            .into_iter()
+            .map(|o| o.claude_session_id)
+            .collect();
+        assert_eq!(ids, vec!["this-gen-closed".to_string()]);
+
+        // The production writer stamps the production generation.
+        store.record_open(record("marked-now", true));
+        store.mark_restore_pending("marked-now", true);
+        let ids: Vec<String> = observe_restored(
+            &store,
+            crate::session::tracking_health::process_generation(),
+        )
+        .into_iter()
+        .map(|o| o.claude_session_id)
+        .collect();
+        assert_eq!(ids, vec!["marked-now".to_string()]);
     }
 }

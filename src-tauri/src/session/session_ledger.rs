@@ -1234,9 +1234,10 @@ fn classify(
     }
 
     // An input we could not read must not be laundered into a confident miss
-    // count. `observed_back` skips the sticky-restore-stamp arm when this boot
-    // never latched a census, so a session that came back and was then closed
-    // lands in `missing` — through no fault of the rebuild.
+    // count. A caller that cannot read an input `back` rests on (the live
+    // terminal view) passes `restore_stamps_available = false`, and then a
+    // session that came back may land in `missing` — through no fault of the
+    // rebuild.
     //
     // An empty prior (or one whose every session is finished) is a real
     // `match` — only stateable because a ledger EXISTS saying so, which is the
@@ -1484,18 +1485,21 @@ pub fn report(
 
     let index = DiskTranscriptIndex::discover();
     let current = capture(store, &index, "read", now, boot);
-    // "Came back" = open now, UNION anything stamped restored by THIS boot —
-    // a session that returned and was then closed did in fact return.
-    // `None` when the boot census never latched — see `observed_back`: an
-    // absent boot instant SKIPS the sticky-restore-stamp arm rather than
-    // admitting it with a `0` floor, and that is reported (verdict `unknown`
-    // on any miss), not laundered into a miss count.
-    let boot_at = crate::session::restore_census::latched().map(|c| c.boot_at_ms);
-    let back = observed_back(store, boot_at, live_terminal_ids);
+    // "Came back" = bound to a live terminal now, UNION anything stamped
+    // restored by THIS process generation — a session that returned and was
+    // then closed did in fact return. The generation is always known (minted
+    // on first read, compared for equality), so the sticky-restore-stamp arm is
+    // always readable — unlike the boot instant it replaced, which needed the
+    // census latch and was skipped without it.
+    let back = observed_back(
+        store,
+        crate::session::tracking_health::process_generation(),
+        live_terminal_ids,
+    );
     let now_state = registry_now(store);
     // Both inputs `back` rests on must be readable for a miss count to be a
     // claim rather than an upper bound.
-    let observable = boot_at.is_some() && live_terminal_ids.is_some();
+    let observable = live_terminal_ids.is_some();
     let mut report = diff(prior, &back, &now_state, current, observable);
     report.generations = generation_reports(
         &stored,
@@ -1595,28 +1599,28 @@ pub fn capture_now(store: &SessionLifecycleStore, reason: &str) -> LedgerCapture
 /// previous process `open`, so "open" counted the whole cohort back and hid
 /// exactly the rows the boot restore did NOT bring back — a `needs-account`
 /// row waiting for its account, a skipped one, one on a page not opened yet.
-/// Only a live terminal binding (`live_terminal_ids`) or this boot's restore
-/// stamp is evidence that it returned.
+/// Only a live terminal binding (`live_terminal_ids`) or this process
+/// generation's restore stamp is evidence that it returned.
 pub fn observed_back(
     store: &SessionLifecycleStore,
-    boot_at_ms: Option<i64>,
+    generation: &str,
     live_terminal_ids: Option<&HashSet<String>>,
 ) -> Vec<String> {
-    // `restored_from_boot_at` is STICKY across restarts by design, so a stamp
-    // older than THIS boot belongs to a previous one. Without a boot instant
-    // to compare against, the stamp arm is SKIPPED entirely rather than
-    // admitted with a `0` floor — a `0` would count every historical restore
-    // stamp as "came back", which is the wrong-in-the-operator's-favour
-    // direction and exactly the vacuous-`match` failure the census's R3 names.
+    // The restore markers are STICKY across restarts by design, so a stamp
+    // from any other generation belongs to a previous boot. Equality on
+    // `restored_in_generation`, never an order on the `restored_from_boot_at`
+    // display timestamp: a backwards wall-clock step across the reboot would
+    // otherwise drop every closed restored session into `missing` (plan
+    // `2026-10-07-a-resumed-gate-continuation-…` D1). The generation is always
+    // known (minted on first read), so this arm is never skipped.
     let mut ids: Vec<String> = store
         .all_records()
         .into_iter()
         .filter(|r| {
             let live_bound = r.state == "open"
                 && live_terminal_ids.is_some_and(|live| live.contains(&r.terminal_id));
-            let restored_this_boot =
-                boot_at_ms.is_some_and(|boot| r.restored_from_boot_at.is_some_and(|at| at >= boot));
-            live_bound || restored_this_boot
+            let restored_this_generation = r.restored_in_generation.as_deref() == Some(generation);
+            live_bound || restored_this_generation
         })
         .map(|r| r.claude_session_id)
         .collect();
@@ -2658,7 +2662,7 @@ mod tests {
     }
 
     /// A crash leaves every row `open`. An open row is back only when it is
-    /// bound to a terminal alive NOW or carries this boot's restore stamp — a
+    /// bound to a terminal alive NOW or carries this process generation's restore stamp — a
     /// `needs-account` row the restore left for the operator is not.
     #[test]
     fn an_open_row_is_back_only_with_a_live_terminal_or_this_boots_stamp() {
@@ -2668,19 +2672,20 @@ mod tests {
             store.record_open(store_rec(id));
         }
         store.mark_restored_from_boot("restored", "resumed");
-        let boot = chrono::Utc::now().timestamp_millis() - 60_000;
         let mut old = store_rec("old-stamp");
-        old.restored_from_boot_at = Some(boot - 1);
+        old.restored_from_boot_at = Some(i64::MAX);
+        old.restored_in_generation = Some("gen-prior".to_string());
         store.record_open(old);
+        let generation = crate::session::tracking_health::process_generation();
         let live: HashSet<String> = ["term-live".to_string()].into_iter().collect();
 
         assert_eq!(
-            observed_back(&store, Some(boot), Some(&live)),
+            observed_back(&store, generation, Some(&live)),
             vec!["live".to_string(), "restored".to_string()]
         );
-        // No live view: only this boot's stamps.
+        // No live view: only this generation's stamps.
         assert_eq!(
-            observed_back(&store, Some(boot), None),
+            observed_back(&store, generation, None),
             vec!["restored".to_string()]
         );
     }
@@ -2885,5 +2890,44 @@ mod tests {
             "another boot's file is not this process's save"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// Plan 2026-10-07 D1 test (d2), ledger half: a closed record counts as
+    /// "came back" only when it was restored in THIS generation — whatever
+    /// its `restored_from_boot_at` display timestamp says.
+    #[test]
+    fn observed_back_keys_on_the_generation_not_the_timestamp() {
+        use crate::session::session_lifecycle_store::{
+            SessionLifecycleStore, TerminalSessionRecord,
+        };
+        let rec = |id: &str, at: Option<i64>, generation: Option<&str>| -> TerminalSessionRecord {
+            let mut r: TerminalSessionRecord = serde_json::from_value(serde_json::json!({
+                "claudeSessionId": id,
+                "pageId": "default",
+                "zoneIndex": 0,
+                "terminalId": format!("term-{id}"),
+                "openedAt": 0,
+                "lastSeenAt": 0,
+                "state": "open",
+            }))
+            .unwrap();
+            r.restored_from_boot_at = at;
+            r.restored_in_generation = generation.map(str::to_string);
+            r
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        store.record_open(rec("this-gen", Some(0), Some("gen-this")));
+        store.record_open(rec("prior-gen", Some(i64::MAX), Some("gen-prior")));
+        store.record_open(rec("pre-field", Some(i64::MAX), None));
+        store.record_open(rec("still-open", None, None));
+        for id in ["this-gen", "prior-gen", "pre-field"] {
+            store.record_close(id, "pty-exit");
+        }
+        // `still-open` is back by its live terminal binding, not by being open.
+        let live: HashSet<String> = ["term-still-open".to_string()].into_iter().collect();
+        assert_eq!(
+            observed_back(&store, "gen-this", Some(&live)),
+            vec!["still-open".to_string(), "this-gen".to_string()]
+        );
     }
 }

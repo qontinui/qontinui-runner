@@ -83,6 +83,7 @@ import { fetchLiveClaudeSessionIds } from "../liveClaudeSessions";
 import { decideColdResume } from "../useTerminalInitialization";
 import { buildSessionOpenArgs } from "../sessionRecordArgs";
 import { resumeProfileSession } from "../resumeInNewTab";
+import { fetchRecordsByClaudeSessionId, gateFromRecord } from "../resumeRecordLookup";
 import { createLogger } from "@/lib/logger";
 
 import { useSessionStateTracking } from "../useSessionStateTracking";
@@ -400,7 +401,14 @@ const PageSessionScope = memo(function PageSessionScope({
       // layout/tabs are untouched, and the operator can still resume any of
       // them by hand (single-id operator-clicked resume paths stay ungated
       // by design: the click is the intent).
-      const liveIds = await fetchLiveClaudeSessionIds();
+      //
+      // The same batch reads the durable records once (plan 2026-10-07 D2):
+      // `ZoneSessionInfo` carries no gate identity, so a gate continuation's
+      // `QONTINUI_GATE_*` env comes from its record, as the drain's does.
+      const [liveIds, records] = await Promise.all([
+        fetchLiveClaudeSessionIds(),
+        fetchRecordsByClaudeSessionId(),
+      ]);
       for (const { s, tabId } of toResume) {
         const decision = decideColdResume(liveIds, s.claudeSessionId);
         if (decision !== "respawn") {
@@ -452,6 +460,9 @@ const PageSessionScope = memo(function PageSessionScope({
             claudeSessionId: s.claudeSessionId,
             configDir: s.claudeConfigDir,
             recordOpen,
+            // The record's gate identity rides the typed resume (plan
+            // 2026-10-07 D2).
+            gate: gateFromRecord(records.get(s.claudeSessionId)),
           },
         )
           .then((attempt) =>

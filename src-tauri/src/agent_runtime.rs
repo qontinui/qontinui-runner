@@ -17957,12 +17957,15 @@ mod tests {
         reasserted.terminal_id = "term-restored".to_string();
         reasserted.gate_id = None;
         reasserted.gate_consuming_device_id = None;
-        reasserted.gate_bound_boot_ms = None;
+        reasserted.gate_bound_generation = None;
+        reasserted.restored_in_generation = None;
         store.record_open(reasserted);
 
-        let this_boot = 2_000;
+        // `mark_restore_pending` stamped THIS process's generation, so the
+        // adoption runs against it.
+        let this_gen = crate::session::tracking_health::process_generation();
         let adopted =
-            crate::commands::terminal::adopt_restored_continuation_at(&store, csid, this_boot);
+            crate::commands::terminal::adopt_restored_continuation_at(&store, csid, this_gen);
         assert_eq!(
             adopted,
             Some(("term-restored".to_string(), gate, Some(device)))
@@ -17973,13 +17976,16 @@ mod tests {
             "the resumed terminal must be a live continuation carrying its gate AND \
              its stored consuming device"
         );
-        assert_eq!(store.get(csid).unwrap().gate_bound_boot_ms, Some(this_boot));
+        assert_eq!(
+            store.get(csid).unwrap().gate_bound_generation.as_deref(),
+            Some(this_gen)
+        );
 
         // Now its death is this generation's: a later non-restorable close is
         // NOT reported by the close observer (the exit hook / reaper own it).
         store.record_close(csid, "no-terminal");
         assert_eq!(
-            runner_restart_unreported_report(&store.get(csid).unwrap(), this_boot),
+            runner_restart_unreported_report(&store.get(csid).unwrap(), this_gen),
             None
         );
         clear_continuation_registry();
@@ -18013,18 +18019,24 @@ mod tests {
         }))
         .unwrap();
         store.record_open(rec);
+        let this_gen = "gen-current";
         assert_eq!(
-            crate::commands::terminal::adopt_restored_continuation_at(&store, csid, 2_000),
+            crate::commands::terminal::adopt_restored_continuation_at(&store, csid, this_gen),
             None
         );
         assert_eq!(registered_continuation_gate("term-manual"), None);
-        assert_eq!(store.get(csid).unwrap().gate_bound_boot_ms, Some(1_000));
-        // A restore marker from an EARLIER boot does not count either.
+        assert_eq!(
+            store.get(csid).unwrap().gate_bound_generation.as_deref(),
+            Some("legacy-boot-ms:1000")
+        );
+        // A restore marker from an EARLIER generation does not count either —
+        // however late its display timestamp reads (a clock step).
         let mut stale = store.get(csid).unwrap();
-        stale.restored_from_boot_at = Some(1_500);
+        stale.restored_from_boot_at = Some(i64::MAX);
+        stale.restored_in_generation = Some("gen-prior".to_string());
         store.record_open(stale);
         assert_eq!(
-            crate::commands::terminal::adopt_restored_continuation_at(&store, csid, 2_000),
+            crate::commands::terminal::adopt_restored_continuation_at(&store, csid, this_gen),
             None
         );
     }

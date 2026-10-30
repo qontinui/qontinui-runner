@@ -1378,7 +1378,9 @@ pub fn terminal_session_record_open(
         last_session_start_at: None,
         gate_id: None,
         gate_consuming_device_id: None,
-        gate_bound_boot_ms: None,
+        gate_bound_generation: None,
+        restored_in_generation: None,
+        gate_reported_generation: None,
     };
     let session_id = record.claude_session_id.clone();
     store.record_open(record);
@@ -2928,7 +2930,7 @@ async fn poll_and_record_session<F>(
 ) where
     F: Fn() -> Option<String>,
 {
-    let (gate_id, gate_consuming_device_id, gate_bound_boot_ms) = gate_record_fields(gate);
+    let (gate_id, gate_consuming_device_id, gate_bound_generation) = gate_record_fields(gate);
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if let Some(claude_session_id) = resolve() {
@@ -2975,7 +2977,9 @@ async fn poll_and_record_session<F>(
                 last_session_start_at: None,
                 gate_id: gate_id.clone(),
                 gate_consuming_device_id: gate_consuming_device_id.clone(),
-                gate_bound_boot_ms,
+                gate_bound_generation,
+                restored_in_generation: None,
+                gate_reported_generation: None,
             };
             store.record_open(record);
             info!(
@@ -3014,7 +3018,7 @@ pub(crate) fn record_pinned_session_open(
     provider: String,
     gate: Option<GateIdentity>,
 ) {
-    let (gate_id, gate_consuming_device_id, gate_bound_boot_ms) = gate_record_fields(gate);
+    let (gate_id, gate_consuming_device_id, gate_bound_generation) = gate_record_fields(gate);
     // D1 account stamp at spawn. The runner genuinely knows the ACCOUNT here —
     // it just placed `config_dir` into the PTY env — so derive the label +
     // wrapper from it rather than waiting on the live registry. It does NOT
@@ -3075,7 +3079,9 @@ pub(crate) fn record_pinned_session_open(
         last_session_start_at: None,
         gate_id,
         gate_consuming_device_id,
-        gate_bound_boot_ms,
+        gate_bound_generation,
+        restored_in_generation: None,
+        gate_reported_generation: None,
     });
     info!(
         terminal_id = %terminal_id,
@@ -3092,15 +3098,18 @@ pub(crate) fn record_pinned_session_open(
 
 /// The three durable gate fields for a record written by THIS process (plan
 /// `2026-10-03-a-runner-crash-leaves-its-continuations-spawned-forever-…` D1):
-/// the gate id, the CONSUMING device id, and this process's boot instant as
-/// the generation that bound them. All `None` for a non-gate spawn — which the
-/// sticky merge reads as "keep whatever is stored".
-fn gate_record_fields(gate: Option<GateIdentity>) -> (Option<String>, Option<String>, Option<i64>) {
+/// the gate id, the CONSUMING device id, and this process's
+/// [`crate::session::tracking_health::process_generation`] as the generation
+/// that bound them. All `None` for a non-gate spawn — which the sticky merge
+/// reads as "keep whatever is stored".
+fn gate_record_fields(
+    gate: Option<GateIdentity>,
+) -> (Option<String>, Option<String>, Option<String>) {
     match gate {
         Some(g) => (
             Some(g.gate_id.to_string()),
             Some(g.consuming_device_id.to_string()),
-            Some(crate::session::tracking_health::primary_boot_unix_millis_or_init()),
+            Some(crate::session::tracking_health::process_generation().to_string()),
         ),
         None => (None, None, None),
     }
@@ -3127,18 +3136,19 @@ pub(crate) fn adopt_restored_continuation(
     adopt_restored_continuation_at(
         store,
         claude_session_id,
-        crate::session::tracking_health::primary_boot_unix_millis_or_init(),
+        crate::session::tracking_health::process_generation(),
     )
 }
 
-/// [`adopt_restored_continuation`] against an explicit boot instant (tests).
+/// [`adopt_restored_continuation`] against an explicit process generation
+/// (tests).
 pub(crate) fn adopt_restored_continuation_at(
     store: &SessionLifecycleStore,
     claude_session_id: &str,
-    current_boot_ms: i64,
+    current_generation: &str,
 ) -> Option<(String, uuid::Uuid, Option<uuid::Uuid>)> {
     let (terminal_id, gate_id, consuming_device_id) =
-        store.adopt_restored_gate(claude_session_id, current_boot_ms)?;
+        store.adopt_restored_gate(claude_session_id, current_generation)?;
     crate::agent_runtime::register_restored_continuation(
         terminal_id.clone(),
         gate_id,
@@ -3386,7 +3396,9 @@ mod tests {
             last_session_start_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
-            gate_bound_boot_ms: None,
+            gate_bound_generation: None,
+            restored_in_generation: None,
+            gate_reported_generation: None,
         }
     }
 
@@ -3803,8 +3815,8 @@ mod tests {
             Some(gate.consuming_device_id.to_string())
         );
         assert_eq!(
-            rec.gate_bound_boot_ms,
-            Some(crate::session::tracking_health::primary_boot_unix_millis_or_init())
+            rec.gate_bound_generation.as_deref(),
+            Some(crate::session::tracking_health::process_generation())
         );
     }
 
@@ -3866,7 +3878,7 @@ mod tests {
 
     /// Plan `2026-10-03-…` D1: the continuation spawn's gate identity reaches
     /// the durable record (it used to be dropped at the hint destructure), with
-    /// this process's boot instant as its generation — and the session-open
+    /// this process's generation id as its generation — and the session-open
     /// hook's later gate-less re-record of the same csid does not blank it.
     #[test]
     fn pinned_record_carries_the_gate_and_a_gateless_hook_rewrite_keeps_it() {
@@ -3892,7 +3904,7 @@ mod tests {
             )
         };
         record(Some(gate));
-        let boot = crate::session::tracking_health::primary_boot_unix_millis_or_init();
+        let generation = crate::session::tracking_health::process_generation();
         let check = |what: &str| {
             let rec = store.get(csid).unwrap();
             assert_eq!(rec.gate_id, Some(gate.gate_id.to_string()), "{what}");
@@ -3901,11 +3913,106 @@ mod tests {
                 Some(gate.consuming_device_id.to_string()),
                 "{what}"
             );
-            assert_eq!(rec.gate_bound_boot_ms, Some(boot), "{what}");
+            assert_eq!(
+                rec.gate_bound_generation.as_deref(),
+                Some(generation),
+                "{what}"
+            );
         };
         check("spawn record");
         record(None); // the session-open hook's write
         check("after the gate-less hook re-record");
+    }
+
+    /// Plan `2026-10-07-a-resumed-gate-continuation-…` Phase 3 test (k): an
+    /// operator's VERIFIED "Retry resume" of a prior-generation gate record
+    /// whose boot-restore resume FAILED is adopted into this generation exactly
+    /// once, through the verified branch's re-assert
+    /// ([`terminal_session_record_open`]: `record_open` of the gate-less
+    /// payload the frontend sends, then [`adopt_restored_continuation`]).
+    ///
+    /// The command takes a `tauri::State`, which this crate cannot build in a
+    /// unit test (tauri's `test` feature is off), so the test drives the
+    /// command's two store calls in its order with the payload shape it builds.
+    #[test]
+    fn verified_retry_of_a_failed_restore_is_adopted_exactly_once() {
+        use crate::session::session_lifecycle_store::{TerminalSessionRecord, RESTORE_TIER_FAILED};
+        let _g = crate::agent_runtime::CONTINUATION_REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let gate = uuid::Uuid::now_v7();
+        let device = uuid::Uuid::now_v7();
+        let csid = "6b2d4f1a-3c5e-4a7b-9d8c-1e2f3a4b5c6d";
+        let tab = "term-retry-k";
+        let prior: TerminalSessionRecord = serde_json::from_value(serde_json::json!({
+            "claudeSessionId": csid,
+            "pageId": "default",
+            "zoneIndex": 0,
+            "terminalId": tab,
+            "openedAt": 0,
+            "lastSeenAt": 0,
+            "state": "open",
+            "origin": "authoritative",
+            "gateId": gate.to_string(),
+            "gateConsumingDeviceId": device.to_string(),
+            "gateBoundGeneration": "gen-before-the-crash",
+        }))
+        .unwrap();
+        store.record_open(prior);
+        // This boot's restore marks the record, types the resume, and the
+        // handshake never verifies: the record stays `failed`, unadopted.
+        store.mark_restore_pending(csid, true);
+        let failed = store.get(csid).unwrap();
+        assert_eq!(failed.restore_tier.as_deref(), Some(RESTORE_TIER_FAILED));
+        assert_eq!(
+            crate::agent_runtime::registered_continuation_gate(tab),
+            None,
+            "a failed resume is not a live continuation"
+        );
+
+        // The frontend's verified-branch payload (`buildSessionOpenArgs`, no
+        // origin, no provider), shaped as `terminal_session_record_open` builds
+        // its record: no gate fields, no generation, no tier.
+        let retry_reassert = || {
+            let incoming: TerminalSessionRecord = serde_json::from_value(serde_json::json!({
+                "claudeSessionId": csid,
+                "pageId": "default",
+                "zoneIndex": 0,
+                "terminalId": tab,
+                "openedAt": 0,
+                "lastSeenAt": 0,
+                "state": "open",
+                "provider": crate::session::session_lifecycle_store::DEFAULT_PROVIDER,
+            }))
+            .unwrap();
+            store.record_open(incoming);
+            adopt_restored_continuation(&store, csid)
+        };
+
+        assert_eq!(
+            retry_reassert(),
+            Some((tab.to_string(), gate, Some(device))),
+            "the verified retry adopts the failed-tier continuation"
+        );
+        assert_eq!(
+            crate::agent_runtime::registered_continuation_gate(tab),
+            Some((Some(gate), Some(device)))
+        );
+        let generation = crate::session::tracking_health::process_generation();
+        let after = store.get(csid).unwrap();
+        assert_eq!(after.gate_bound_generation.as_deref(), Some(generation));
+        assert_eq!(after.gate_id, Some(gate.to_string()), "gate kept (sticky)");
+
+        // A second verified retry (or the session-open hook's re-record) finds
+        // it already this generation's: nothing is adopted twice.
+        assert_eq!(retry_reassert(), None, "adopted exactly once");
+        assert_eq!(
+            store.get(csid).unwrap().gate_bound_generation.as_deref(),
+            Some(generation)
+        );
+        crate::agent_runtime::deregister_continuation_for_test(tab);
     }
 
     /// Regression for the 2026-06-12 mis-bind incident: two transcripts in
