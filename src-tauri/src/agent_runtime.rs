@@ -14603,7 +14603,11 @@ mod tests {
             brief: None,
             retry: None,
             allocation: None,
-            dispatched_at: None,
+            ..serde_json::from_value(serde_json::json!({
+                "target_device_id": uuid::Uuid::nil(),
+                "initial_prompt": "",
+            }))
+            .unwrap()
         };
         let workdir = std::env::temp_dir().to_string_lossy().to_string();
         let res = run_continuation_terminal(
@@ -17781,7 +17785,11 @@ mod tests {
                 brief: None,
                 retry: None,
                 allocation: None,
-                dispatched_at: None,
+                ..serde_json::from_value(serde_json::json!({
+                    "target_device_id": uuid::Uuid::nil(),
+                    "initial_prompt": "",
+                }))
+                .unwrap()
             }
         }
         let gate = uuid::Uuid::now_v7();
@@ -18618,10 +18626,10 @@ mod gateway_spawn_refusal_tests {
     }
 }
 
-/// The `agent_runtime` half of plan
-/// `2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume`
-/// Phase 2: the outcome post's wiring to the durable store, driven through the
-/// [`OutcomeDoor`] seam against the shared raw-TCP fake coord.
+// The `agent_runtime` half of plan
+// `2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume`
+// Phase 2: the outcome post's wiring to the durable store, driven through the
+// [`OutcomeDoor`] seam against the shared raw-TCP fake coord.
 #[cfg(test)]
 mod outcome_wiring_tests {
     use super::*;
@@ -18644,24 +18652,22 @@ mod outcome_wiring_tests {
         base: String,
     }
 
-    impl Rig {
-        fn door(&self) -> OutcomeDoor<'_> {
-            OutcomeDoor {
-                base: self.base.clone(),
-                client: Some(&self.client),
-                installer: &self.installer,
-            }
+    fn door(rig: &Rig) -> OutcomeDoor<'_> {
+        OutcomeDoor {
+            base: rig.base.clone(),
+            client: Some(&rig.client),
+            installer: &rig.installer,
         }
+    }
 
-        fn pending_for(&self, gate: uuid::Uuid) -> Vec<serde_json::Value> {
-            self.outbox
-                .pending()
-                .unwrap()
-                .into_iter()
-                .filter(|r| r.session_id == lane(gate))
-                .map(|r| r.payload)
-                .collect()
-        }
+    fn pending_for(rig: &Rig, gate: uuid::Uuid) -> Vec<serde_json::Value> {
+        rig.outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.session_id == lane(gate))
+            .map(|r| r.payload)
+            .collect()
     }
 
     fn rig(base: String) -> Rig {
@@ -18683,7 +18689,7 @@ mod outcome_wiring_tests {
 
     async fn post(rig: &Rig, gate: uuid::Uuid, outcome: ContinuationOutcome) -> OutcomeAck {
         post_continuation_outcome_via(
-            &rig.door(),
+            &door(&rig),
             gate,
             uuid::Uuid::from_u128(0xeb21_55ed),
             outcome,
@@ -18735,7 +18741,7 @@ mod outcome_wiring_tests {
             OutcomeAck::NoVerdict
         );
         assert_eq!(script.lock().await.answered(gate), vec![0]);
-        let queued = r.pending_for(gate);
+        let queued = pending_for(&r, gate);
         assert_eq!(queued.len(), 1, "the dropped post is durably queued");
         assert_eq!(queued[0]["outcome"], json!("spawned"));
         assert_eq!(queued[0]["dispatched_at"], json!(SERVED_AT));
@@ -18757,7 +18763,7 @@ mod outcome_wiring_tests {
             OutcomeAck::NoVerdict
         );
         assert_eq!(script.lock().await.answered(gate), vec![409]);
-        assert!(r.pending_for(gate).is_empty(), "a 409 is not queued");
+        assert!(pending_for(&r, gate).is_empty(), "a 409 is not queued");
     }
 
     /// A confirmed direct post carries the episode verbatim, is `Recorded`,
@@ -18781,7 +18787,7 @@ mod outcome_wiring_tests {
             "at_episode carried"
         );
         assert_eq!(body["outcome"], json!("spawned"));
-        assert!(r.pending_for(gate).is_empty());
+        assert!(pending_for(&r, gate).is_empty());
     }
 
     /// `spawn_failed` after an UNCONFIRMED claim is never queued; after a
@@ -18800,7 +18806,7 @@ mod outcome_wiring_tests {
         }
         for (gate, claim_confirmed) in [(unconfirmed, false), (confirmed, true)] {
             post_spawn_outcome_via(
-                &r.door(),
+                &door(&r),
                 gate,
                 uuid::Uuid::from_u128(0xeb21_55ed),
                 ContinuationOutcome::SpawnFailed,
@@ -18812,10 +18818,10 @@ mod outcome_wiring_tests {
             .await;
         }
         assert!(
-            r.pending_for(unconfirmed).is_empty(),
+            pending_for(&r, unconfirmed).is_empty(),
             "spawn_failed on an unconfirmed claim is left for the replay backstop"
         );
-        assert_eq!(r.pending_for(confirmed).len(), 1);
+        assert_eq!(pending_for(&r, confirmed).len(), 1);
         let s = script.lock().await;
         assert_eq!(s.answered(unconfirmed), vec![0], "still posted directly");
         assert_eq!(s.answered(confirmed), vec![0]);
@@ -18846,7 +18852,7 @@ mod outcome_wiring_tests {
             script.lock().await.answered(gate).is_empty(),
             "nothing overtakes the queued spawned"
         );
-        let queued = r.pending_for(gate);
+        let queued = pending_for(&r, gate);
         assert_eq!(queued.len(), 2);
         assert_eq!(queued[1]["outcome"], json!("work_unreported"));
 
@@ -18868,7 +18874,7 @@ mod outcome_wiring_tests {
         )
         .await;
         assert_eq!(
-            r.pending_for(lone).len(),
+            pending_for(&r, lone).len(),
             1,
             "no client: left for the drain"
         );
@@ -18889,7 +18895,7 @@ mod outcome_wiring_tests {
             .replies
             .insert(gate, VecDeque::from([Reply::Drop]));
         post_spawn_outcome_via(
-            &r.door(),
+            &door(&r),
             gate,
             uuid::Uuid::from_u128(0xeb21_55ed),
             ContinuationOutcome::SpawnFailed,
@@ -18899,7 +18905,7 @@ mod outcome_wiring_tests {
             true,
         )
         .await;
-        let queued = r.pending_for(gate);
+        let queued = pending_for(&r, gate);
         assert_eq!(queued.len(), 1);
         let row_detail = queued[0]["detail"].as_str().unwrap().to_string();
         assert_eq!(
@@ -18913,6 +18919,129 @@ mod outcome_wiring_tests {
             body["detail"],
             json!(row_detail),
             "the wire carries the same text"
+        );
+    }
+}
+
+// Arming tests for plan
+// 2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume,
+// Phase 2. Each enters where the population enters — the claim post a
+// delivered continuation makes, and the work-outcome fallback an ended
+// continuation fires — against a raw-TCP coord configured the way production
+// finds one (`COORD_HTTP_URL`). Written so they compile against the pre-change
+// runtime too.
+#[cfg(test)]
+mod continuation_consume_arming {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // A coord that counts the requests whose request line names a
+    // continuation-consumed route, then answers `reply` — or, with `None`,
+    // drops the connection unanswered (a transport failure).
+    async fn counting_coord(reply: Option<(u16, &'static str)>) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let request = read_request(&mut sock).await;
+                    let line = request.lines().next().unwrap_or_default().to_string();
+                    if line.contains("/continuation-consumed") {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let Some((status, body)) = reply else {
+                        return;
+                    };
+                    let answer = format!(
+                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(answer.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    // Read one HTTP/1.1 request: headers, then `content-length` body bytes.
+    async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
+        let mut got: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            got.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&got).to_string();
+            if let Some(end) = text.find("\r\n\r\n") {
+                let want = text[..end]
+                    .lines()
+                    .filter_map(|l| l.split_once(':'))
+                    .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if got.len() >= end + 4 + want {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&got).to_string()
+    }
+
+    // coord's TTL-expired refusal, answered to a non-target device, is a
+    // refusal: the continuation is NOT spawned (before, it fell into the
+    // "any other 409" branch and spawned an unrecorded run).
+    #[tokio::test]
+    async fn a_claim_refused_as_expired_is_not_spawned() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, hits) = counting_coord(Some((
+            409,
+            r#"{"error":"expired","expired_reason":"ttl_7d_elapsed","target_device_id":null}"#,
+        )))
+        .await;
+        std::env::set_var("COORD_HTTP_URL", &base);
+        let decision = post_continuation_claim(uuid::Uuid::new_v4(), uuid::Uuid::new_v4()).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the claim reached coord");
+        assert!(
+            !matches!(
+                decision,
+                SpawnDecision::Spawn
+                    | SpawnDecision::SpawnDespiteClaimError { .. }
+                    | SpawnDecision::DeferClaimErrorByDrain { .. }
+            ),
+            "an expired refusal must not spawn: {decision:?}"
+        );
+        assert!(
+            format!("{decision:?}").starts_with("SkipExpired"),
+            "{decision:?}"
+        );
+    }
+
+    // A work outcome whose post coord never answered is HELD for the drain:
+    // the gate's next identical outcome waits behind it rather than going on
+    // the wire again (before, every post was a fresh fire-and-forget attempt).
+    #[tokio::test]
+    async fn an_unanswered_work_outcome_is_held_rather_than_reposted() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, hits) = counting_coord(None).await;
+        std::env::set_var("COORD_HTTP_URL", &base);
+        let gate = uuid::Uuid::new_v4();
+        let device = uuid::Uuid::new_v4();
+        for terminal in ["t-arming-1", "t-arming-2"] {
+            post_work_unreported_fallback(gate, device, terminal, "exit=crashed".into()).await;
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the unanswered outcome is held once, not posted twice"
         );
     }
 }

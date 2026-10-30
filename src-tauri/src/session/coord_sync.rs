@@ -3927,7 +3927,6 @@ mod tests {
             SessionEventKind::CoordTransportRung,
             SessionEventKind::AgentNotification,
             SessionEventKind::OperatorTouch,
-            SessionEventKind::GateContinuationOutcome,
         ] {
             let arm = format!("\"{}\" =>", kind.as_str());
             assert!(
@@ -3938,6 +3937,11 @@ mod tests {
                 kind.as_str()
             );
         }
+        // `SessionEventKind::GateContinuationOutcome`, by its wire name.
+        assert!(
+            dispatch.contains("\"gate_continuation_outcome\" =>"),
+            "gate_continuation_outcome has NO dispatch arm — the catch-all would ACK and              DROP the only record of a consume"
+        );
     }
 
     /// The finished marker must ride `PATCH /sessions/:id`, where the target is
@@ -8583,23 +8587,11 @@ mod tests {
             SessionEventKind::Closed,
             SessionEventKind::StateChange,
             SessionEventKind::OutputChunk,
-            // The one record of a claim-error consume: never budget-dropped.
-            SessionEventKind::GateContinuationOutcome,
         ] {
             assert!(!is_best_effort_kind(kind.as_str()), "{kind:?}");
         }
-        // ...and the only kind the serving-failure quarantine exempts.
-        assert!(is_quarantine_exempt_kind(
-            SessionEventKind::GateContinuationOutcome.as_str()
-        ));
-        for kind in [
-            SessionEventKind::Started,
-            SessionEventKind::Heartbeat,
-            SessionEventKind::GateRegistration,
-            SessionEventKind::OutputChunk,
-        ] {
-            assert!(!is_quarantine_exempt_kind(kind.as_str()), "{kind:?}");
-        }
+        // The one record of a claim-error consume: never budget-dropped.
+        assert!(!is_best_effort_kind("gate_continuation_outcome"));
     }
 
     // ========================================================================
@@ -9757,16 +9749,16 @@ pub(crate) mod egress_tests {
     }
 }
 
-/// The drain half of plan
-/// `2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume`
-/// Phase 2: a `gate_continuation_outcome` row is retried through transport
-/// failures, 5xx and request-level 4xx — past the best-effort budget and past
-/// the serving-failure quarantine — and terminated exactly once by coord's
-/// answer.
-///
-/// The fake coord is the shared raw-TCP one
-/// (`continuation_outcome_outbox::fake_coord`), because the first test needs a
-/// TRANSPORT failure (a connection closed with no response).
+// The drain half of plan
+// `2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume`
+// Phase 2: a `gate_continuation_outcome` row is retried through transport
+// failures, 5xx and request-level 4xx — past the best-effort budget and past
+// the serving-failure quarantine — and terminated exactly once by coord's
+// answer.
+//
+// The fake coord is the shared raw-TCP one
+// (`continuation_outcome_outbox::fake_coord`), because the first test needs a
+// TRANSPORT failure (a connection closed with no response).
 #[cfg(test)]
 mod continuation_outcome_drain_tests {
     use super::*;
@@ -9798,9 +9790,24 @@ mod continuation_outcome_drain_tests {
         installer: Installer,
     }
 
-    impl Rig {
-        fn store(&self) -> Arc<ContinuationOutcomeOutbox> {
-            self.installer.store().expect("installed")
+    fn store_of(rig: &Rig) -> Arc<ContinuationOutcomeOutbox> {
+        rig.installer.store().expect("installed")
+    }
+
+    /// The outcome kind is the only one the serving-failure quarantine
+    /// exempts.
+    #[test]
+    fn only_the_outcome_kind_is_quarantine_exempt() {
+        assert!(is_quarantine_exempt_kind(
+            SessionEventKind::GateContinuationOutcome.as_str()
+        ));
+        for kind in [
+            SessionEventKind::Started,
+            SessionEventKind::Heartbeat,
+            SessionEventKind::GateRegistration,
+            SessionEventKind::OutputChunk,
+        ] {
+            assert!(!is_quarantine_exempt_kind(kind.as_str()), "{kind:?}");
         }
     }
 
@@ -9922,7 +9929,9 @@ mod continuation_outcome_drain_tests {
                 .map(|_| Reply::Status(500, json!({"error": "db_error"})))
                 .collect(),
         );
-        r.store().enqueue(&outcome_record(gate, "spawned")).unwrap();
+        store_of(&r)
+            .enqueue(&outcome_record(gate, "spawned"))
+            .unwrap();
 
         let mut state = DrainState::default();
         for i in 0..failures {
@@ -9961,7 +9970,9 @@ mod continuation_outcome_drain_tests {
                 Reply::Status(200, json!({"gate_id": gate})),
             ]),
         );
-        r.store().enqueue(&outcome_record(gate, "spawned")).unwrap();
+        store_of(&r)
+            .enqueue(&outcome_record(gate, "spawned"))
+            .unwrap();
         let mut state = DrainState::default();
         for _ in 0..4 {
             make_due(&mut state);
@@ -9994,14 +10005,14 @@ mod continuation_outcome_drain_tests {
                 .map(|_| Reply::Status(500, json!({"error": "db_error"})))
                 .collect(),
         );
-        r.store()
+        store_of(&r)
             .enqueue(&outcome_record(stuck, "spawned"))
             .unwrap();
 
         let mut state = DrainState::default();
         for _ in 0..ticks {
             // A healthy gate's record ACKs in the same tick: coord is serving.
-            r.store()
+            store_of(&r)
                 .enqueue(&outcome_record(Uuid::new_v4(), "spawned"))
                 .unwrap();
             make_due(&mut state);
@@ -10046,8 +10057,10 @@ mod continuation_outcome_drain_tests {
                 Reply::Status(503, json!({})),
             ]),
         );
-        r.store().enqueue(&outcome_record(gate, "spawned")).unwrap();
-        r.store()
+        store_of(&r)
+            .enqueue(&outcome_record(gate, "spawned"))
+            .unwrap();
+        store_of(&r)
             .enqueue(&outcome_record(gate, "work_unreported"))
             .unwrap();
         let mut state = DrainState::default();
@@ -10087,7 +10100,9 @@ mod continuation_outcome_drain_tests {
             .await
             .replies
             .insert(gate, VecDeque::from([reply.clone()]));
-        r.store().enqueue(&outcome_record(gate, "spawned")).unwrap();
+        store_of(&r)
+            .enqueue(&outcome_record(gate, "spawned"))
+            .unwrap();
         let mut state = DrainState::default();
         for _ in 0..3 {
             make_due(&mut state);
@@ -10209,7 +10224,7 @@ mod continuation_outcome_drain_tests {
             );
             s.replies.insert(dropped, VecDeque::from([Reply::Drop]));
         }
-        r.store()
+        store_of(&r)
             .enqueue(&outcome_record(refused, "spawned"))
             .unwrap();
         let mut state = DrainState::default();
@@ -10232,12 +10247,127 @@ mod continuation_outcome_drain_tests {
 
         // Control: a transport failure on the same kind is still an outage.
         let r2 = rig(r.coord.inner.coord_url.clone());
-        r2.store()
+        store_of(&r2)
             .enqueue(&outcome_record(dropped, "spawned"))
             .unwrap();
         let mut state2 = DrainState::default();
         let tick2 = drain_tick(&r2.coord.inner, &mut state2).await;
         assert_eq!(script.lock().await.answered(dropped), vec![0]);
         assert!(tick2.outage, "a transport failure is still an outage");
+    }
+}
+
+// Arming test for plan
+// 2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume,
+// Phase 2: a queued `gate_continuation_outcome` row is DELIVERED by the drain
+// (POSTed to the gate's continuation-consumed route), not ACK-dropped by the
+// catch-all arm. It enters where every queued row enters, `drain_tick`, over a
+// row planted as raw JSON so it compiles against the pre-change drain too.
+#[cfg(test)]
+mod outcome_row_drain_arming {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // A coord that answers every request 200 `{"consumed":true,
+    // "outcome_recorded":"spawned"}` and counts the requests whose request
+    // line names a continuation-consumed route.
+    async fn counting_coord() -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let request = read_request(&mut sock).await;
+                    let line = request.lines().next().unwrap_or_default().to_string();
+                    if line.contains("/continuation-consumed") {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let body = r#"{"consumed":true,"outcome_recorded":"spawned"}"#;
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    // Read one HTTP/1.1 request: headers, then `content-length` body bytes.
+    async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
+        let mut got: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            got.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&got).to_string();
+            if let Some(end) = text.find("\r\n\r\n") {
+                let want = text[..end]
+                    .lines()
+                    .filter_map(|l| l.split_once(':'))
+                    .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if got.len() >= end + 4 + want {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&got).to_string()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_queued_outcome_row_is_posted_to_coord_by_the_drain() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, hits) = counting_coord().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.jsonl");
+        let gate = Uuid::new_v4();
+        let row = json!({
+            "machine_id": Uuid::new_v4(),
+            "session_id": Uuid::new_v4(),
+            "seq": 1,
+            "event_kind": "gate_continuation_outcome",
+            "payload": {
+                "gate_id": gate,
+                "device_id": Uuid::new_v4(),
+                "outcome": "spawned",
+                "detail": null,
+                "claude_code_session_id": null,
+                "dispatched_at": null,
+            },
+            "recorded_at": "2026-10-30T00:00:00Z",
+            "acked_at": null,
+        });
+        std::fs::write(&path, format!("{row}\n")).unwrap();
+        let writer = Arc::new(OutboxWriter::open(&path).unwrap());
+        let coord = CoordSync::new_for_test(
+            writer.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let mut state = DrainState::default();
+        drain_tick(&coord.inner, &mut state).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the queued consume outcome must reach coord's continuation-consumed route \
+             exactly once, not be ACKed and dropped unsent"
+        );
+        assert!(
+            writer.pending().unwrap().is_empty(),
+            "coord's recorded answer settles the row"
+        );
     }
 }

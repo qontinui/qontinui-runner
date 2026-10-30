@@ -2148,3 +2148,58 @@ mod tests {
         assert!(reopened.pending().unwrap().is_empty());
     }
 }
+
+// Arming test for plan
+// 2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume,
+// Phase 2: a gate continuation's consume-outcome row survives the cap trim
+// that drops the OLDEST unacked rows. It enters where every outbox row
+// enters, `OutboxWriter::record`, and reads the file back. Written so it
+// compiles against the pre-change outbox too (the row is planted as raw JSON).
+#[cfg(test)]
+mod outcome_row_trim_arming {
+    use super::*;
+
+    #[test]
+    fn an_outcome_row_outlives_the_trim_that_drops_older_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.jsonl");
+        let machine = Uuid::new_v4();
+        let consume_lane = Uuid::new_v4();
+        // The oldest unacked row on disk: the trim's first victim.
+        let row = serde_json::json!({
+            "machine_id": machine,
+            "session_id": consume_lane,
+            "seq": 1,
+            "event_kind": "gate_continuation_outcome",
+            "payload": {"gate_id": Uuid::new_v4(), "outcome": "spawned"},
+            "recorded_at": "2026-10-30T00:00:00Z",
+            "acked_at": null,
+        });
+        std::fs::write(&path, format!("{row}\n")).unwrap();
+        let writer = OutboxWriter::open_with_max_bytes(&path, 4096).unwrap();
+        let chunk = "x".repeat(1500);
+        let session = Uuid::new_v4();
+        for _ in 0..8 {
+            writer
+                .record(
+                    machine,
+                    session,
+                    SessionEventKind::OutputChunk,
+                    serde_json::json!({ "text": chunk }),
+                )
+                .unwrap();
+        }
+        assert!(
+            writer.dropped_unacked() > 0,
+            "the cap trim ran and dropped rows"
+        );
+        let left = writer.pending().unwrap();
+        assert!(
+            left.iter().any(
+                |r| r.session_id == consume_lane && r.event_kind == "gate_continuation_outcome"
+            ),
+            "the consume-outcome row was dropped by the cap trim: it is the only record \
+             of a consume and must outlive it"
+        );
+    }
+}
