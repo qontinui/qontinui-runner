@@ -61,26 +61,32 @@ use super::manifest::{CiManifest, CiStep};
 use super::reporting::{self, LinePusher, ProgressSink, StepSummary};
 use super::CiDispatchPayload;
 
-/// Job-wide committed-memory ceiling for one dispatch's process tree
-/// (Windows). Deliberately generous — rustc at `CARGO_BUILD_JOBS=1` on this
-/// workspace legitimately commits >10 GiB — because this is a runaway
-/// backstop, not a tuning knob; the real throttle is the jobs cap.
-#[cfg(windows)]
-const CI_JOB_MEMORY_LIMIT_BYTES: usize = 32 * 1024 * 1024 * 1024;
+/// Job-wide memory ceiling for one dispatch's process tree. Deliberately
+/// generous — rustc at `CARGO_BUILD_JOBS=1` on this workspace legitimately
+/// commits >10 GiB — because this is a runaway backstop, not a tuning knob;
+/// the real throttle is the jobs cap. Windows enforces it with a Job Object,
+/// Linux with a cgroup v2 `memory.max` ([`super::cgroup`]): one number, both
+/// arms.
+#[cfg_attr(not(any(windows, target_os = "linux", test)), allow(dead_code))]
+pub(crate) const CI_JOB_MEMORY_LIMIT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 
-/// Per-dispatch Job Object carrying the memory backstop. A no-op unit on
-/// non-Windows so call sites stay platform-uniform.
+/// Per-dispatch containment carrying the memory backstop: a Job Object on
+/// Windows, a cgroup v2 child on Linux (degrading explicitly, see
+/// [`super::cgroup`]), a no-op elsewhere so call sites stay platform-uniform.
 struct CiJob {
     #[cfg(windows)]
     inner: Option<qontinui_runner_win32::ScopedKillOnCloseJob>,
+    #[cfg(target_os = "linux")]
+    cgroup: super::cgroup::Containment,
 }
 
 impl CiJob {
-    fn create() -> Self {
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    fn create(dispatch_id: &str) -> Self {
         #[cfg(windows)]
         {
             let inner = qontinui_runner_win32::ScopedKillOnCloseJob::create(Some(
-                CI_JOB_MEMORY_LIMIT_BYTES,
+                CI_JOB_MEMORY_LIMIT_BYTES as usize,
             ));
             if inner.is_none() {
                 warn!(
@@ -90,21 +96,77 @@ impl CiJob {
             }
             Self { inner }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            Self {
+                cgroup: super::cgroup::Containment::create(
+                    dispatch_id,
+                    CI_JOB_MEMORY_LIMIT_BYTES,
+                ),
+            }
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             Self {}
         }
     }
 
+    /// One line naming the containment state for the dispatch log (Linux
+    /// only; the Windows arm already warns when its job is unavailable).
+    fn describe(&self) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        {
+            Some(self.cgroup.describe())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
+    /// Make the step command start inside the dispatch containment (before
+    /// spawn, so no descendant can run outside it).
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    fn prepare(&self, cmd: &mut tokio::process::Command) {
+        #[cfg(target_os = "linux")]
+        if let super::cgroup::Containment::Cgroup(c) = &self.cgroup {
+            c.prepare(cmd);
+        }
+    }
+
     /// Assign a spawned step child to the dispatch job (in addition to the
     /// global job the caller already assigned it to).
-    #[cfg_attr(not(windows), allow(unused_variables))]
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(unused_variables))]
     fn assign(&self, child: &tokio::process::Child) {
         #[cfg(windows)]
         if let (Some(job), Some(raw)) = (self.inner.as_ref(), child.raw_handle()) {
             // SAFETY: `raw` came from the live `child` the caller still owns.
             unsafe { job.assign(raw as windows_sys::Win32::Foundation::HANDLE) };
         }
+        #[cfg(target_os = "linux")]
+        if let super::cgroup::Containment::Cgroup(c) = &self.cgroup {
+            c.adopt(child);
+        }
+    }
+
+    /// Kill every process of the dispatch (cancel / lease loss / timeout).
+    /// Windows kills the tree by pid elsewhere; this is the Linux subtree kill.
+    fn kill_all(&self) {
+        #[cfg(target_os = "linux")]
+        if let super::cgroup::Containment::Cgroup(c) = &self.cgroup {
+            let path = c.kill();
+            tracing::debug!("ci_node: dispatch cgroup killed via {path:?}");
+        }
+    }
+
+    /// A log line when the kernel OOM-killed part of the dispatch since the
+    /// last call, so a memory kill reads as one rather than as a bare signal.
+    fn memory_kill_note(&self) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        if let super::cgroup::Containment::Cgroup(c) = &self.cgroup {
+            return c.take_oom_note();
+        }
+        None
     }
 }
 
@@ -460,7 +522,10 @@ pub(crate) async fn run_dispatch(
 
     // Per-dispatch memory-backstop job (held across all steps; dropping it
     // at dispatch end kill-on-closes any stray build processes).
-    let ci_job = CiJob::create();
+    let ci_job = CiJob::create(&payload.dispatch_id);
+    if let Some(line) = ci_job.describe() {
+        sink.push(&line);
+    }
 
     // ── Steps (sequential; first failure short-circuits) ──
     let mut overall = StepOutcome::Success;
@@ -671,6 +736,7 @@ fn spawn_step_child(
     step: &CiStep,
     cwd: &Path,
     envs: &[(String, String)],
+    ci_job: &CiJob,
 ) -> Result<tokio::process::Child, String> {
     let apply = |cmd: &mut tokio::process::Command| {
         cmd.current_dir(cwd)
@@ -680,6 +746,7 @@ fn spawn_step_child(
         for (k, v) in envs {
             cmd.env(k, v);
         }
+        ci_job.prepare(cmd);
     };
     let mut direct = build_step_command(&step.command[0], &step.command[1..]);
     apply(&mut direct);
@@ -701,7 +768,10 @@ fn spawn_step_child(
 /// whole tree (killing only the direct child would orphan cargo/node under a
 /// `cmd.exe` shim until Job-Object close) without spawning a process;
 /// elsewhere `start_kill` suffices.
-async fn kill_step_tree(child: &mut tokio::process::Child) {
+async fn kill_step_tree(child: &mut tokio::process::Child, ci_job: &CiJob) {
+    // Linux: the whole dispatch cgroup, which also takes daemonised
+    // grandchildren a pid-tree walk would miss.
+    ci_job.kill_all();
     #[cfg(target_os = "windows")]
     {
         if let Some(pid) = child.id() {
@@ -816,7 +886,7 @@ async fn run_step(
         .collect();
     envs.extend(dispatch_env.exports.iter().cloned());
 
-    let mut child = match spawn_step_child(step, &cwd, &envs) {
+    let mut child = match spawn_step_child(step, &cwd, &envs, ci_job) {
         Ok(c) => c,
         Err(e) => {
             sink.push(&format!("[ci-node] step {}: {e}", step.name));
@@ -870,7 +940,7 @@ async fn run_step(
                 step.name,
                 timeout.as_secs()
             ));
-            kill_step_tree(&mut child).await;
+            kill_step_tree(&mut child, ci_job).await;
             StepOutcome::Timeout
         }
         _ = cancel.cancelled() => {
@@ -878,10 +948,14 @@ async fn run_step(
                 "[ci-node] step {} cancelled — killing process tree",
                 step.name
             ));
-            kill_step_tree(&mut child).await;
+            kill_step_tree(&mut child, ci_job).await;
             StepOutcome::Cancelled
         }
     };
+
+    if let Some(note) = ci_job.memory_kill_note() {
+        sink.push(&note);
+    }
 
     // The pumps end when the pipes close (child exit or kill).
     if let Some(t) = out_task {
