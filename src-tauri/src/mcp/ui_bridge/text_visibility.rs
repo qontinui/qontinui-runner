@@ -78,9 +78,18 @@ pub(crate) const TTL_BUMP_MARGIN_MS: u64 = 1_000;
 
 /// The second scheduled bump, this long after the first: it retires a capture
 /// cached under the first bump's id when the SDK's TTL restore ran late (see
-/// [`TTL_BUMP_MARGIN_MS`]). A restore later still — a webview whose timers are
-/// paused outright — is not covered: a capture made before it is served under
-/// the second bump's id until the next mutation.
+/// [`TTL_BUMP_MARGIN_MS`]). Not covered, and for the same reason — the page
+/// changes after both bumps, with no request this runner sees:
+/// - a restore later still: a webview whose timers are paused outright;
+/// - a HIDE the webview runs late: a stalled webview whose hide request timed
+///   out here (the runner's UI Bridge timeout) and whose restores then never
+///   left (the circuit breaker opened), so the arm held the lock and the
+///   permits until its reply time + TTL + margin and released them — and the
+///   webview later runs the queued hide, which hides the page for a full TTL
+///   after both bumps.
+///
+/// A capture made in either window is served under the second bump's id until
+/// the next mutation.
 pub(crate) const TTL_BUMP_LATE_EXTRA_MS: u64 = 4_000;
 
 /// When a body that HIDES text should have its TTL-restore bump scheduled,
@@ -97,17 +106,23 @@ pub(crate) fn ttl_bump_delay_ms(body: &Value) -> Option<u64> {
     Some(ttl + TTL_BUMP_MARGIN_MS)
 }
 
+/// Run `bump` after `delay_ms`, and again [`TTL_BUMP_LATE_EXTRA_MS`] later:
+/// the TTL-restore bumps [`ttl_bump_delay_ms`] times, as one future.
+/// [`schedule_mutation_bump`] spawns it over the real mutation id.
+pub(crate) async fn ttl_bumps(delay_ms: u64, bump: impl Fn()) {
+    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    bump();
+    tokio::time::sleep(std::time::Duration::from_millis(TTL_BUMP_LATE_EXTRA_MS)).await;
+    bump();
+}
+
 /// Bump `state`'s vision mutation id after `delay_ms`, and again
-/// [`TTL_BUMP_LATE_EXTRA_MS`] later: the TTL-restore bumps
-/// [`ttl_bump_delay_ms`] times. One task for both.
+/// [`TTL_BUMP_LATE_EXTRA_MS`] later ([`ttl_bumps`]), in one spawned task.
 pub(crate) fn schedule_mutation_bump(state: &Arc<ApiState>, delay_ms: u64) {
     let state = Arc::clone(state);
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-        super::vision_routes::bump_mutation_id(&state);
-        tokio::time::sleep(std::time::Duration::from_millis(TTL_BUMP_LATE_EXTRA_MS)).await;
-        super::vision_routes::bump_mutation_id(&state);
-    });
+    tokio::spawn(ttl_bumps(delay_ms, move || {
+        super::vision_routes::bump_mutation_id(&state)
+    }));
 }
 
 /// The IPC request type the frontend hook answers.
@@ -216,6 +231,13 @@ fn bad_request(msg: String) -> (StatusCode, Json<ApiResponse<Value>>) {
 /// (`ui_bridge_request_sync` in the axum handler, a recording closure in a
 /// test). Validation runs HERE, before `send`, so a test entering through this
 /// function observes it.
+///
+/// A valid body then takes the runner arm's lock ([`pair_lock`]) and holds it
+/// for the whole change, bumps and send included: a direct hide or restore
+/// waits for a running `captureTextHidden` arm (up to its TTL hold, when the
+/// arm's restore failed) and never lands between that arm's hide and its
+/// restore, where a restore-then-re-hide would make the arm's frame B show
+/// text and its restore answer `changed: true`.
 pub(crate) async fn direct_set<S, F, B, T>(
     body: Value,
     send: S,
@@ -229,6 +251,7 @@ where
     T: FnOnce(u64),
 {
     validate_text_visibility_body(&body).map_err(bad_request)?;
+    let _arm_lock = pair_lock().lock_owned().await;
     info!(
         "UI Bridge API: text visibility hidden={}",
         body["hidden"].as_bool().unwrap_or_default()
@@ -311,16 +334,24 @@ pub struct TextVisibilityRun {
     /// (`{success, hidden, changed, coverage, ttlMs, paintFence, …}`) or its
     /// refusal (`{success: false, code, reason, error}` —
     /// `capability_unavailable_in_build` wherever the webview has not opted
-    /// into dev controls), or `{success: false, error}` when the request never
-    /// reached the SDK. When the probe already answered `devControls: false`,
-    /// no hide is sent at all: this is then the runner's own record of that
-    /// refusal ([`dev_controls_off_refusal`], `hideSent: false`).
+    /// into dev controls), or `{success: false, error}` when the request
+    /// failed here: it never left the runner ([`hide_never_sent`]), or it
+    /// errored or timed out after it may have reached the SDK — then whether
+    /// it hid anything is unknown, and the page was restored (see `restore`).
+    /// When the probe already answered `devControls: false`, no hide is sent
+    /// at all: this is then the runner's own record of that refusal
+    /// ([`dev_controls_off_refusal`], `hideSent: false`).
     pub hide: Value,
     /// What the webview answered to the restore, the SDK's `{hidden: false,
-    /// changed, restore: {verified, …}}`. `None` when no restore was sent: the
-    /// hide failed, or the text was already hidden by another caller
-    /// (`wasHidden: true`) — then the hook did not touch that hide at all (not
-    /// even its TTL), and it is left to its caller.
+    /// changed, restore: {verified, …}}`, or `{success: false, error,
+    /// attempts}` when no attempt got an answer. `None` only when no restore
+    /// was sent: the hide was a typed refusal (`success: false` with a `code`
+    /// or a boolean `wasHidden`), its request never left the runner, or the
+    /// text was already hidden by another caller (`wasHidden: true`) — then
+    /// the hook did not touch that hide at all (not even its TTL), and it is
+    /// left to its caller. A hide whose fate is unknown — its request failed
+    /// after it may have been sent, or its reply is neither a hide nor a typed
+    /// refusal — IS restored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restore: Option<Value>,
     /// True only when a restore was sent and the SDK verified it
@@ -332,9 +363,10 @@ pub struct TextVisibilityRun {
     /// answered after its paint fence TIMED OUT, so frame B may have been
     /// composited before the glyphs went transparent (vision-core then reads
     /// the glyphs as still painted and answers unknown, never a pass); or a
-    /// hide that threw part-way could not be rolled back (`HIDE_FAILED` with
-    /// `rolledBack: null`), so the page may be left partly text-hidden — the
-    /// SDK cleared its state, so no restore can reach what is left.
+    /// hide that threw part-way was not provably rolled back (`HIDE_FAILED`
+    /// with `rolledBack: null`, or a `rolledBack` that is not `verified`), so
+    /// the page may be left partly text-hidden — the SDK cleared its state, so
+    /// no restore can reach what is left.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
 }
@@ -375,18 +407,27 @@ fn is_typed_refusal(hide: &Value) -> bool {
             || hide.get("wasHidden").and_then(Value::as_bool).is_some())
 }
 
-/// A `HIDE_FAILED` whose rollback threw too (`rolledBack: null`): the SDK says
-/// the page may then be partly hidden, and it cleared its state either way,
-/// so a restore cannot reach what is left. `None` for every other refusal.
+/// A `HIDE_FAILED` whose rollback did not prove the page restored: the
+/// rollback threw too (`rolledBack: null`, where the SDK says the page may be
+/// partly hidden), or it ran and did not verify (`rolledBack.verified` not
+/// `true`: a read-back mismatch, a leftover sheet, markers it could not vouch
+/// for or restore), or the reply carries no rollback at all. The SDK cleared
+/// its state either way, so a restore cannot reach what is left. `None` for
+/// every other refusal, and for a rollback that verified.
 fn partial_hide_warning(hide: &Value) -> Option<String> {
-    let rollback_threw = hide.get("code").and_then(Value::as_str) == Some("HIDE_FAILED")
-        && hide.get("rolledBack").is_some_and(Value::is_null);
-    rollback_threw.then(|| {
-        "the hide threw part-way and its rollback threw too (HIDE_FAILED, rolledBack: \
-         null): the page may be left partly text-hidden, and the SDK cleared its state, so \
-         no restore can reach what is left"
-            .to_string()
-    })
+    if hide.get("code").and_then(Value::as_str) != Some("HIDE_FAILED") {
+        return None;
+    }
+    let why = match hide.get("rolledBack") {
+        Some(Value::Null) => "its rollback threw too (rolledBack: null)",
+        Some(r @ Value::Object(_)) if is_true(r, "verified") => return None,
+        Some(Value::Object(_)) => "its rollback did not verify (rolledBack.verified is not true)",
+        _ => "its reply carries no rollback record",
+    };
+    Some(format!(
+        "the hide threw part-way (HIDE_FAILED) and {why}: the page may be left partly \
+         text-hidden, and the SDK cleared its state, so no restore can reach what is left"
+    ))
 }
 
 /// Whether the probe says this webview has not opted into dev controls
@@ -453,9 +494,11 @@ fn hide_failure_message(hide: &Value) -> String {
 /// Serializes the runner arm: one webview, one hide state. Two concurrent
 /// `captureTextHidden` calls would otherwise interleave — the second's frame A
 /// taken during the first's hide, or the first's restore landing before the
-/// second's frame B — and both would measure the wrong pixels. An `Arc`'d
-/// mutex so the drop guard's spawned restore can carry the lock with it: the
-/// next arm then cannot take its frame A until that restore has landed.
+/// second's frame B — and both would measure the wrong pixels. The direct
+/// route ([`direct_set`]) takes it too, so a direct change never lands inside
+/// an arm. An `Arc`'d mutex so the drop guard's spawned restore can carry the
+/// lock with it: the next arm then cannot take its frame A until that restore
+/// has landed.
 fn pair_lock() -> Arc<tokio::sync::Mutex<()>> {
     static LOCK: std::sync::OnceLock<Arc<tokio::sync::Mutex<()>>> = std::sync::OnceLock::new();
     Arc::clone(LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(()))))
@@ -464,20 +507,36 @@ fn pair_lock() -> Arc<tokio::sync::Mutex<()>> {
 /// The lock the arm holds, as handed to its restore-on-drop callback.
 pub(crate) type PairLockGuard = tokio::sync::OwnedMutexGuard<()>;
 
+/// When the arm's hide was sent and when its reply came: what the restore
+/// path counts from ([`restore_until_known`]). `sent` is taken before the hide
+/// is sent, so no SDK timer for it can start earlier; `answered` is `None`
+/// while the reply is not in — a cancel during the hide's request — and the
+/// TTL hold is then counted from the restore's own start (the cancel), the
+/// latest instant this runner has for "an SDK timer that handled the hide is
+/// running by now" (a webview that runs the hide later still is the remainder
+/// [`TTL_BUMP_LATE_EXTRA_MS`] names).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HideTimes {
+    pub sent: tokio::time::Instant,
+    pub answered: Option<tokio::time::Instant>,
+}
+
 /// Holds the arm's lock AND its capture permits for the whole call and, while
 /// ARMED, restores the page if dropped: the arm's future cancelled (the HTTP
 /// client went away) or a panic unwinding through it. The restore callback is
-/// handed both, so the restore it spawns releases them only once it has
-/// landed and bumped: until then no other arm can start and no other VISION
-/// capture can see the text-hidden page (and cache it under the post-hide
-/// mutation id). Captures that take no permit are not held off — see
-/// [`capture_text_hidden_pair`]'s `acquire`.
-struct ArmGuard<P, R: FnOnce(PairLockGuard, P)> {
-    restore: Option<R>,
+/// handed both, with the hide's [`HideTimes`], so the restore it spawns
+/// ([`restore_after_cancel`]) releases them only once the page is known
+/// restored — or the TTL has had time to restore it — and the id is bumped:
+/// until then no other arm can start and no other VISION capture can see the
+/// text-hidden page (and cache it under the post-hide mutation id). Captures
+/// that take no permit are not held off — see [`capture_text_hidden_pair`]'s
+/// `acquire`.
+struct ArmGuard<P, R: FnOnce(PairLockGuard, P, HideTimes)> {
+    restore: Option<(R, HideTimes)>,
     held: Option<(PairLockGuard, P)>,
 }
 
-impl<P, R: FnOnce(PairLockGuard, P)> ArmGuard<P, R> {
+impl<P, R: FnOnce(PairLockGuard, P, HideTimes)> ArmGuard<P, R> {
     fn new(lock: PairLockGuard, permits: P) -> Self {
         Self {
             restore: None,
@@ -485,8 +544,23 @@ impl<P, R: FnOnce(PairLockGuard, P)> ArmGuard<P, R> {
         }
     }
 
-    fn arm(&mut self, restore: R) {
-        self.restore = Some(restore);
+    /// Armed from just before the hide is sent, at `sent`.
+    fn arm(&mut self, restore: R, sent: tokio::time::Instant) {
+        self.restore = Some((
+            restore,
+            HideTimes {
+                sent,
+                answered: None,
+            },
+        ));
+    }
+
+    /// The hide's reply came at `at`: a cancel from here on holds counting
+    /// from it.
+    fn answered(&mut self, at: tokio::time::Instant) {
+        if let Some((_, times)) = self.restore.as_mut() {
+            times.answered = Some(at);
+        }
     }
 
     fn disarm(&mut self) {
@@ -494,13 +568,109 @@ impl<P, R: FnOnce(PairLockGuard, P)> ArmGuard<P, R> {
     }
 }
 
-impl<P, R: FnOnce(PairLockGuard, P)> Drop for ArmGuard<P, R> {
+impl<P, R: FnOnce(PairLockGuard, P, HideTimes)> Drop for ArmGuard<P, R> {
     fn drop(&mut self) {
-        if let (Some(restore), Some((lock, permits))) = (self.restore.take(), self.held.take()) {
+        if let (Some((restore, times)), Some((lock, permits))) =
+            (self.restore.take(), self.held.take())
+        {
             warn!("vision: the runner arm ended before its restore; restoring the webview's text");
-            restore(lock, permits);
+            restore(lock, permits, times);
         }
     }
+}
+
+/// The arm's restore, on the main path and on a cancel alike: `{hidden:
+/// false}` is sent, and one that never left the runner ([`hide_never_sent`]:
+/// it changed nothing, so it is safe to send again) is retried every
+/// [`RESTORE_RETRY_DELAY_MS`] for as long as the next attempt can still land
+/// before the TTL would restore the page anyway (`times.sent` +
+/// [`CAPTURE_TTL_MS`]). When no attempt got a `success: true` reply, the page
+/// may stay text-hidden until the TTL, so this then waits until the TTL has
+/// fired — `times.answered` (or, with no reply, this call's start) +
+/// [`CAPTURE_TTL_MS`] + [`TTL_BUMP_MARGIN_MS`] — before returning: a caller
+/// holding the lock and the permits holds them that long, and no other vision
+/// capture sees (or caches) the hidden page. Returns the last reply, or
+/// `{success: false, error, attempts}`.
+pub(crate) async fn restore_until_known<S, F>(send: &S, times: HideTimes) -> Value
+where
+    S: Fn(&'static str, Value) -> F,
+    F: Future<Output = Result<Value, String>>,
+{
+    let start = tokio::time::Instant::now();
+    let ttl = std::time::Duration::from_millis(CAPTURE_TTL_MS);
+    let retry_delay = std::time::Duration::from_millis(RESTORE_RETRY_DELAY_MS);
+    let retry_until = times.sent + ttl;
+    let mut attempts: u32 = 0;
+    let restore = loop {
+        attempts += 1;
+        match send(REQUEST_TYPE, serde_json::json!({"hidden": false})).await {
+            Ok(v) => break v,
+            Err(e)
+                if hide_never_sent(&e)
+                    && tokio::time::Instant::now() + retry_delay < retry_until =>
+            {
+                warn!(
+                    "vision: the runner webview's text restore never left the runner \
+                     (attempt {attempts}): {e}; retrying"
+                );
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(e) => break serde_json::json!({"success": false, "error": e, "attempts": attempts}),
+        }
+    };
+    if !is_true(&restore, "success") {
+        warn!(
+            "vision: the runner webview's text restore failed ({restore}); holding the \
+             capture permits until the {CAPTURE_TTL_MS} ms TTL has restored the page"
+        );
+        tokio::time::sleep_until(
+            times.answered.unwrap_or(start)
+                + ttl
+                + std::time::Duration::from_millis(TTL_BUMP_MARGIN_MS),
+        )
+        .await;
+    }
+    restore
+}
+
+/// What the arm's drop guard spawns on a cancel (see [`ArmGuard`]): the same
+/// [`restore_until_known`] as the main path — retrying a restore that never
+/// left, and holding until the TTL when none answered — then `bump`, and only
+/// then are `permits` and `lock` released. A restore that was not verified is
+/// logged, and `bump_after_ttl` is handed the time left until the TTL has
+/// fired (counted as the hold counts it; zero once the hold has waited it out)
+/// so the TTL-restore bumps ([`ttl_bumps`]) retire a capture cached before a
+/// late TTL restore. Returns the restore's reply.
+pub(crate) async fn restore_after_cancel<S, F, B, T, P>(
+    send: S,
+    bump: B,
+    bump_after_ttl: T,
+    lock: PairLockGuard,
+    permits: P,
+    times: HideTimes,
+) -> Value
+where
+    S: Fn(&'static str, Value) -> F,
+    F: Future<Output = Result<Value, String>>,
+    B: FnOnce(),
+    T: FnOnce(u64),
+{
+    let start = tokio::time::Instant::now();
+    let restore = restore_until_known(&send, times).await;
+    bump();
+    if !restore_verified(&restore) {
+        warn!(
+            "vision: the cancelled runner arm's text restore was not verified ({restore}); \
+             the {CAPTURE_TTL_MS} ms TTL restores the page"
+        );
+        let ttl_fired = times.answered.unwrap_or(start)
+            + std::time::Duration::from_millis(CAPTURE_TTL_MS + TTL_BUMP_MARGIN_MS);
+        let left = ttl_fired.saturating_duration_since(tokio::time::Instant::now());
+        bump_after_ttl(u64::try_from(left.as_millis()).unwrap_or(u64::MAX));
+    }
+    drop(permits);
+    drop(lock);
+    restore
 }
 
 /// Whose hide the reply shows — with no clock at all. The hook reads the SDK's
@@ -603,9 +773,12 @@ pub(crate) const BEFORE_SEND: [&str; 6] = [
 /// - `acquire` takes the capture permits BEFORE the probe — ALL of them in
 ///   production, so no other vision capture (the `vision/*` routes, which take
 ///   a permit in `vision_routes::capture_runner_window`) can see the page while
-///   its text is hidden. They are held until the restore has answered (or, on
-///   a cancel, until the guard's restore has landed), and past that until the
-///   TTL when the restore could not be confirmed. NOT covered, because they
+///   its text is hidden. They are held until the restore has answered, and
+///   past that until the TTL when no restore answered `success: true`
+///   ([`restore_until_known`]) — on a cancel too: the guard's spawned restore
+///   ([`restore_after_cancel`]) runs the same retry and hold before it
+///   releases them, counting the hold from the hide's reply or, when the
+///   cancel came before it, from the cancel. NOT covered, because they
 ///   take no permit: `screenshots::capture_runner_window_base64` (the snapshot
 ///   and error fallbacks in `elements.rs`, `errors.rs` and `mcp_api.rs`),
 ///   exploration's and streaming's xcap window grabs, and a monitor capture
@@ -620,9 +793,11 @@ pub(crate) const BEFORE_SEND: [&str; 6] = [
 ///   the hide's reply has arrived (or its request failed after it may have
 ///   been sent): counted from then, it cannot fire before an on-time SDK timer.
 /// - `abort_restore` restores the page if this future is cancelled or unwinds
-///   while armed. It is handed the lock and the permits and must spawn the
-///   restore holding both, release them only after the restore and its bump,
-///   and not block.
+///   while armed. It is handed the lock, the permits and the hide's
+///   [`HideTimes`] (`answered: None` when the cancel came before the hide's
+///   reply), and must spawn [`restore_after_cancel`] holding both — which
+///   releases them only after the retry, the hold and the bump — and not
+///   block.
 ///
 /// Before frame A the webview is asked whether its text is already hidden
 /// ([`probe_body`]). Only `hidden: false` behind a painted fence, or with
@@ -650,7 +825,7 @@ pub(crate) const BEFORE_SEND: [&str; 6] = [
 ///   earliest moment the TTL can fire — counted from when the hide was SENT,
 ///   which no SDK timer can precede. The time check catches what the reply
 ///   cannot: a restore that errored, or one answering `changed: true` because a
-///   direct-route hide re-hid the page after the TTL restore.
+///   hide from outside the runner re-hid the page after the TTL restore.
 /// - Another caller's (`wasHidden: true`): it appeared after the probe, so it
 ///   may have covered frame A. Frame A is refused, no frame B is taken, and the
 ///   hide — which the hook did not touch — is not restored.
@@ -665,15 +840,17 @@ pub(crate) const BEFORE_SEND: [&str; 6] = [
 ///   only thing that could have shown another caller's hide landing after the
 ///   probe, during frame A. The arm's TTL is short, and a page left
 ///   text-hidden poisons every capture until it fires; the one hide this can
-///   wrongly undo is a concurrent dev-only direct-route
-///   (`control/text-visibility`) hide.
+///   wrongly undo is one made in the webview by a door outside the runner
+///   (devtools, page script) — a direct-route (`control/text-visibility`)
+///   hide waits on the arm's lock and cannot be concurrent.
 /// - A TYPED refusal (`success: false` with a `code` or a boolean
 ///   `wasHidden`), or a request that provably never left the runner
 ///   ([`hide_never_sent`]): nothing is restored, and the permits are released
-///   at once. A typed refusal hid nothing — except `HIDE_FAILED` with
-///   `rolledBack: null`, where the SDK's own rollback threw and the page may be
-///   left PARTLY hidden; the SDK cleared its state, so a restore cannot reach
-///   it, and the run record carries a warning ([`partial_hide_warning`]).
+///   at once. A typed refusal hid nothing — except a `HIDE_FAILED` whose
+///   rollback is not proven (`rolledBack: null`, where the SDK's own rollback
+///   threw, or a `rolledBack` that is not `verified`): the page may be left
+///   PARTLY hidden; the SDK cleared its state, so a restore cannot reach it,
+///   and the run record carries a warning ([`partial_hide_warning`]).
 ///   Frame A is refused here too unless the hook's answer proves it
 ///   ([`refusal_keeps_frame_a`]): a never-sent hide has no answer at all, and a
 ///   refusal must carry `wasHidden: false` or be the dev-controls refusal —
@@ -692,7 +869,13 @@ pub(crate) const BEFORE_SEND: [&str; 6] = [
 ///   the window.
 ///
 /// Only the dev-only direct route can hide this webview's text besides this
-/// arm, and the arm's lock keeps two arms apart.
+/// arm, and the arm's lock keeps two arms apart — and keeps the direct route
+/// out of an arm: [`direct_set`] takes the same lock, so a direct restore and
+/// re-hide cannot land between this arm's hide and its restore (which would
+/// leave frame B showing text with the restore answering `changed: true`). A
+/// caller hiding the page through the webview's SDK by some other door
+/// (devtools, page script) is not serialized; vision-core's still-painted and
+/// not-hidden checks then read such a frame B as unknown, not as a pass.
 ///
 /// A minimized or occluded dev runner does not get a usable pair: its webview
 /// paints no frames, so the HIDE's paint fence times out (reported in
@@ -718,7 +901,7 @@ where
     CF: Future<Output = Result<Fr, String>>,
     B: Fn(),
     T: FnOnce(u64),
-    R: FnOnce(PairLockGuard, P),
+    R: FnOnce(PairLockGuard, P, HideTimes),
 {
     let lock = pair_lock().lock_owned().await;
     let not_taken = |why: &str| Err(format!("frame B was not taken: {why}"));
@@ -804,16 +987,19 @@ where
     // Armed BEFORE the send: whether the hide landed is unknown until its reply,
     // and an unknown hide is restored (see the doc above) — on a cancel, by the
     // guard, still holding the lock and the permits. That restore may undo a
-    // concurrent dev-only direct-route hide; it is the price of never leaving
-    // the page text-hidden for the arm's TTL.
-    guard.arm(abort_restore);
-    bump();
+    // hide made in the webview by a door outside the runner; it is the price
+    // of never leaving the page text-hidden for the arm's TTL.
+    //
     // No SDK timer for this hide can start before this instant, so its TTL
     // cannot restore the page before `hide_sent_at + CAPTURE_TTL_MS`.
     let hide_sent_at = tokio::time::Instant::now();
+    guard.arm(abort_restore, hide_sent_at);
+    bump();
     let hide_reply = send(REQUEST_TYPE, hide_body).await;
-    // ...and by this one an SDK timer that handled the hide is running.
+    // ...and by this one an SDK timer that handled the hide is running: a
+    // cancel from here on counts its TTL hold from it.
     let hide_answered_at = tokio::time::Instant::now();
+    guard.answered(hide_answered_at);
     let (hide, landed, never_sent) = match hide_reply {
         Ok(v) => (v, true, false),
         Err(e) => {
@@ -831,8 +1017,9 @@ where
         // The request never left the runner, or the webview answered with a
         // typed refusal: nothing a restore could undo was hidden, so nothing is
         // restored, and the lock and permits go at once. (A HIDE_FAILED whose
-        // rollback threw may have left the page partly hidden; the SDK cleared
-        // its state, so a restore cannot reach it — reported as a warning.)
+        // rollback threw or did not verify may have left the page partly
+        // hidden; the SDK cleared its state, so a restore cannot reach it —
+        // reported as a warning.)
         guard.disarm();
         let error = if never_sent {
             never_sent_message(&hide)
@@ -947,43 +1134,17 @@ where
         }
     }
 
-    // The permits are still held, and the guard still armed. A restore that
-    // never left the runner changed nothing and is sent again, for as long as
-    // the next attempt can still land before the TTL would restore the page.
-    let retry_delay = std::time::Duration::from_millis(RESTORE_RETRY_DELAY_MS);
-    let retry_until = hide_sent_at + std::time::Duration::from_millis(CAPTURE_TTL_MS);
-    let mut attempts: u32 = 0;
-    let restore = loop {
-        attempts += 1;
-        match send(REQUEST_TYPE, serde_json::json!({"hidden": false})).await {
-            Ok(v) => break v,
-            Err(e)
-                if hide_never_sent(&e)
-                    && tokio::time::Instant::now() + retry_delay < retry_until =>
-            {
-                warn!(
-                    "vision: the runner webview's text restore never left the runner \
-                     (attempt {attempts}): {e}; retrying"
-                );
-                tokio::time::sleep(retry_delay).await;
-            }
-            Err(e) => break serde_json::json!({"success": false, "error": e, "attempts": attempts}),
-        }
-    };
-    if !is_true(&restore, "success") {
-        // No restore is known to have landed, so the page may stay text-hidden
-        // until the TTL: the lock and the permits stay held until it has fired,
-        // so no other vision capture sees (or caches) the hidden page.
-        warn!(
-            "vision: the runner webview's text restore failed ({restore}); holding the \
-             capture permits until the {CAPTURE_TTL_MS} ms TTL has restored the page"
-        );
-        tokio::time::sleep_until(
-            hide_answered_at
-                + std::time::Duration::from_millis(CAPTURE_TTL_MS + TTL_BUMP_MARGIN_MS),
-        )
-        .await;
-    }
+    // The permits are still held, and the guard still armed: a cancel during
+    // the restore, its retries or its TTL hold hands the guard's restore the
+    // same times, and it runs the same retry and hold before releasing them.
+    let restore = restore_until_known(
+        &send,
+        HideTimes {
+            sent: hide_sent_at,
+            answered: Some(hide_answered_at),
+        },
+    )
+    .await;
     guard.disarm();
     bump();
     let verified = restore_verified(&restore);
@@ -1212,6 +1373,37 @@ mod tests {
         assert_eq!(kinds, ["<bump>", REQUEST_TYPE, "<bump>"]);
     }
 
+    /// The direct route takes the runner arm's lock for the whole change: while
+    /// an arm holds it, a direct hide or restore waits — nothing reaches the
+    /// webview, nothing is bumped — and runs once the arm is done.
+    #[tokio::test(start_paused = true)]
+    async fn the_direct_route_waits_for_a_running_arm() {
+        let arm = pair_lock().lock_owned().await;
+        let log: Sent = Default::default();
+        let (l1, l2) = (log.clone(), log.clone());
+        let send = move |kind: &'static str, body: Value| {
+            l1.lock().unwrap().push((kind, body));
+            std::future::ready(Ok(json!({"success": true, "hidden": false})))
+        };
+        let bump = move || l2.lock().unwrap().push(("<bump>", Value::Null));
+        let call = direct_set(json!({"hidden": false}), send, bump, |_| {});
+        tokio::pin!(call);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(60), &mut call)
+                .await
+                .is_err(),
+            "the direct route must wait for the arm's lock"
+        );
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "nothing ran while the arm held it"
+        );
+        drop(arm);
+        call.await.expect("forwarded once the arm is done");
+        let kinds: Vec<&str> = log.lock().unwrap().iter().map(|(k, _)| *k).collect();
+        assert_eq!(kinds, ["<bump>", REQUEST_TYPE, "<bump>"]);
+    }
+
     /// The SDK's TTL restores the page with no request the runner sees: a hide
     /// schedules a bump past its TTL; a restore schedules none.
     #[tokio::test]
@@ -1354,8 +1546,13 @@ mod tests {
         };
         let bump = move || e4.lock().unwrap().push("bump".into());
         let ttl = move |ms: u64| e5.lock().unwrap().push(format!("ttl-bump {ms}"));
-        let abort = move |_lock: PairLockGuard, _permits: ()| {
-            e6.lock().unwrap().push("abort-restore".into())
+        // Records whether the guard knew the hide's reply time when it fired.
+        let abort = move |_lock: PairLockGuard, _permits: (), times: HideTimes| {
+            let event = match times.answered {
+                Some(_) => "abort-restore answered",
+                None => "abort-restore unanswered",
+            };
+            e6.lock().unwrap().push(event.into())
         };
         Box::pin(capture_text_hidden_pair(
             send, acquire, capture, bump, ttl, abort,
@@ -1411,6 +1608,11 @@ mod tests {
         events.iter().any(|x| x == e)
     }
 
+    /// Whether the guard's restore ran, whatever times it was handed.
+    fn aborted(events: &[String]) -> bool {
+        events.iter().any(|x| x.starts_with("abort-restore"))
+    }
+
     #[tokio::test]
     async fn the_arm_takes_the_permits_then_probes_then_a_then_hides_then_b_then_restores() {
         let (out, events) = run(
@@ -1463,7 +1665,7 @@ mod tests {
         let err = out.frame_b.expect_err("no frame B without a hide");
         assert!(err.contains("capability_unavailable_in_build"), "{err}");
         assert!(!has(&events, "show"), "the webview hid nothing: {events:?}");
-        assert!(!has(&events, "abort-restore"), "{events:?}");
+        assert!(!aborted(&events), "{events:?}");
         assert!(
             !has(&events, &ttl_bump()),
             "nothing hidden, no TTL: {events:?}"
@@ -1500,7 +1702,7 @@ mod tests {
             assert!(err.contains("the hide was refused"), "{was:?}: {err}");
             assert!(out.frame_b.is_err(), "{was:?}");
             assert!(!has(&events, "show"), "{was:?}: {events:?}");
-            assert!(!has(&events, "abort-restore"), "{was:?}: {events:?}");
+            assert!(!aborted(&events), "{was:?}: {events:?}");
         }
     }
 
@@ -1558,6 +1760,33 @@ mod tests {
         )
         .await;
         assert_eq!(out.run.unwrap().warning, None);
+
+        // A rollback that ran but did not verify (a read-back mismatch, a
+        // leftover sheet, markers it could not restore) proves nothing either;
+        // nor does a HIDE_FAILED carrying no rollback at all.
+        for (rolled_back, why) in [
+            (
+                Some(json!({"trigger": "rollback", "verified": false})),
+                "did not verify",
+            ),
+            (Some(json!({"trigger": "rollback"})), "did not verify"),
+            (None, "no rollback record"),
+        ] {
+            let mut hide = failed(Value::Null);
+            match rolled_back.clone() {
+                Some(r) => hide["rolledBack"] = r,
+                None => {
+                    hide.as_object_mut().unwrap().remove("rolledBack");
+                }
+            }
+            let (out, events) = run(vec![ok(hide)], vec![ok("frame-a")]).await;
+            assert!(!has(&events, "show"), "{rolled_back:?}: {events:?}");
+            let warning = out.run.unwrap().warning.expect("a warning");
+            assert!(
+                warning.contains("partly text-hidden") && warning.contains(why),
+                "{rolled_back:?}: {warning}"
+            );
+        }
     }
 
     /// The probe answered `devControls: false`: nothing can be hidden in that
@@ -1898,7 +2127,7 @@ mod tests {
             "{err}"
         );
         assert!(!has(&events, "show"), "{events:?}");
-        assert!(!has(&events, "abort-restore"), "{events:?}");
+        assert!(!aborted(&events), "{events:?}");
         assert_eq!(events.iter().filter(|e| *e == "capture").count(), 1);
         let run = out.run.unwrap();
         assert_eq!(run.restore, None);
@@ -1965,14 +2194,21 @@ mod tests {
             vec![ok("frame-a"), None],
         )
         .await;
-        assert_eq!(events.last().map(String::as_str), Some("abort-restore"));
+        assert_eq!(
+            events.last().map(String::as_str),
+            Some("abort-restore answered")
+        );
         assert!(!has(&events, "show"), "{events:?}");
     }
 
     #[tokio::test]
     async fn a_cancel_while_the_hide_is_in_flight_still_restores() {
         let events = run_until_stalled_then_cancel(vec![None], vec![ok("frame-a")]).await;
-        assert_eq!(events.last().map(String::as_str), Some("abort-restore"));
+        // No reply yet: the guard's restore counts its TTL hold from the cancel.
+        assert_eq!(
+            events.last().map(String::as_str),
+            Some("abort-restore unanswered")
+        );
         assert!(has(&events, "hide"), "{events:?}");
     }
 
@@ -1983,7 +2219,7 @@ mod tests {
             vec![ok("frame-a"), ok("frame-b")],
         )
         .await;
-        assert!(!has(&events, "abort-restore"), "{events:?}");
+        assert!(!aborted(&events), "{events:?}");
     }
 
     /// The guard hands its restore the lock AND the capture permits, so the
@@ -1999,7 +2235,10 @@ mod tests {
         {
             let permits = Arc::clone(&sem).acquire_many_owned(2).await.unwrap();
             let mut guard = ArmGuard::new(Arc::clone(&lock).lock_owned().await, permits);
-            guard.arm(move |held, permits| *k.lock().unwrap() = Some((held, permits)));
+            guard.arm(
+                move |held, permits, _| *k.lock().unwrap() = Some((held, permits)),
+                tokio::time::Instant::now(),
+            );
         }
         assert!(
             lock.try_lock().is_err(),
@@ -2023,12 +2262,258 @@ mod tests {
         {
             let permits = Arc::clone(&sem).acquire_many_owned(2).await.unwrap();
             let mut guard = ArmGuard::new(Arc::clone(&lock).lock_owned().await, permits);
-            guard.arm(move |_, _| r.store(true, std::sync::atomic::Ordering::SeqCst));
+            guard.arm(
+                move |_, _, _| r.store(true, std::sync::atomic::Ordering::SeqCst),
+                tokio::time::Instant::now(),
+            );
             guard.disarm();
         }
         assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
         assert!(lock.try_lock().is_ok());
         assert_eq!(sem.available_permits(), 2);
+    }
+
+    /// A stand-in webview for the cancel path: answers each restore with the
+    /// next of `replies` after `latency`, counting the restores it was sent.
+    fn slow_webview(
+        replies: Vec<Result<Value, String>>,
+        latency: std::time::Duration,
+    ) -> (
+        Arc<std::sync::atomic::AtomicUsize>,
+        impl Fn(&'static str, Value) -> BoxFut<Result<Value, String>> + Send + Sync + 'static,
+    ) {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = count.clone();
+        let replies = Mutex::new(replies.into_iter());
+        let send = move |_kind: &'static str, body: Value| {
+            assert_eq!(
+                body,
+                json!({"hidden": false}),
+                "the cancel path only restores"
+            );
+            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let reply = replies
+                .lock()
+                .unwrap()
+                .next()
+                .unwrap_or_else(|| Err("no more replies scripted".into()));
+            let fut: BoxFut<Result<Value, String>> = Box::pin(async move {
+                tokio::time::sleep(latency).await;
+                reply
+            });
+            fut
+        };
+        (count, send)
+    }
+
+    /// The cancel path's restore — what the guard spawns, [`restore_after_cancel`]
+    /// — releases the permits and the lock only once the page is known
+    /// restored: after a verified reply; after retrying a restore that never
+    /// left the runner; and, when no restore answered `success: true`, only
+    /// once the TTL has had time to restore the page, counted from the hide's
+    /// reply, or from the cancel when no reply had come. A restore that was not
+    /// verified hands the TTL-restore bumps the time left until the TTL fires.
+    #[tokio::test(start_paused = true)]
+    async fn the_cancel_restore_releases_the_permits_only_once_the_page_is_known_restored() {
+        let ms = std::time::Duration::from_millis;
+        let latency = ms(300);
+        let busy = "UI Bridge temporarily unavailable (circuit breaker open)";
+        let timed_out = "UI Bridge request timed out";
+        let ttl_fired = CAPTURE_TTL_MS + TTL_BUMP_MARGIN_MS;
+        struct Case {
+            name: &'static str,
+            replies: Vec<Result<Value, String>>,
+            /// The hide's reply came 5 s before the cancel (else: not yet).
+            answered: bool,
+            /// Restores sent.
+            restores: usize,
+            /// Released this long after the cancel, in ms.
+            released: u64,
+            /// The delay handed to the TTL-restore bumps, if any.
+            ttl_left: Option<u64>,
+        }
+        let cases = [
+            Case {
+                name: "verified",
+                replies: vec![Ok(restored(true))],
+                answered: true,
+                restores: 1,
+                released: 300,
+                ttl_left: None,
+            },
+            Case {
+                name: "never left, then verified",
+                replies: vec![Err(busy.into()), Err(busy.into()), Ok(restored(true))],
+                answered: true,
+                restores: 3,
+                released: 3 * 300 + 2 * RESTORE_RETRY_DELAY_MS,
+                ttl_left: None,
+            },
+            Case {
+                name: "failed after it may have been sent",
+                replies: vec![Err(timed_out.into())],
+                answered: true,
+                restores: 1,
+                released: ttl_fired - 5_000,
+                ttl_left: Some(0),
+            },
+            Case {
+                name: "answered, not verified",
+                replies: vec![Ok(restored(false))],
+                answered: true,
+                restores: 1,
+                released: 300,
+                ttl_left: Some(ttl_fired - 5_000 - 300),
+            },
+            Case {
+                name: "failed, cancelled before the hide's reply",
+                replies: vec![Err(timed_out.into())],
+                answered: false,
+                restores: 1,
+                released: ttl_fired,
+                ttl_left: Some(0),
+            },
+        ];
+        for Case {
+            name,
+            replies,
+            answered,
+            restores,
+            released,
+            ttl_left,
+        } in cases
+        {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            let sem = Arc::new(tokio::sync::Semaphore::new(2));
+            let permits = Arc::clone(&sem).acquire_many_owned(2).await.unwrap();
+            let held = Arc::clone(&lock).lock_owned().await;
+            let (sent, send) = slow_webview(replies, latency);
+            let bumps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let ttl_bumps_at: Arc<Mutex<Vec<u64>>> = Default::default();
+            let (b, t) = (bumps.clone(), ttl_bumps_at.clone());
+            let cancel = tokio::time::Instant::now();
+            let times = HideTimes {
+                sent: cancel - ms(6_000),
+                answered: answered.then_some(cancel - ms(5_000)),
+            };
+            let task = tokio::spawn(restore_after_cancel(
+                send,
+                move || {
+                    b.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                },
+                move |delay| t.lock().unwrap().push(delay),
+                held,
+                permits,
+                times,
+            ));
+            tokio::time::sleep_until(cancel + ms(released - 1)).await;
+            assert_eq!(sem.available_permits(), 0, "{name}: released early");
+            assert!(lock.try_lock().is_err(), "{name}: lock released early");
+            assert_eq!(bumps.load(std::sync::atomic::Ordering::SeqCst), 0, "{name}");
+            tokio::time::sleep_until(cancel + ms(released + 1)).await;
+            assert_eq!(sem.available_permits(), 2, "{name}: not released");
+            assert!(lock.try_lock().is_ok(), "{name}: lock not released");
+            assert_eq!(bumps.load(std::sync::atomic::Ordering::SeqCst), 1, "{name}");
+            let restore = task.await.expect("the cancel restore panicked");
+            assert_eq!(
+                sent.load(std::sync::atomic::Ordering::SeqCst),
+                restores,
+                "{name}: {restore}"
+            );
+            assert_eq!(
+                ttl_bumps_at.lock().unwrap().clone(),
+                ttl_left.into_iter().collect::<Vec<_>>(),
+                "{name}"
+            );
+        }
+    }
+
+    /// A cancel during the main path's own TTL hold (its restore failed) does
+    /// not cut that hold short: the guard hands its restore the hide's sent
+    /// and reply times, and the permits stay held until the TTL has fired,
+    /// counted from the hide's reply — when the main path's hold would have
+    /// ended too.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_during_the_ttl_hold_keeps_the_permits_until_the_ttl() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let ms = std::time::Duration::from_millis;
+        let sem = Arc::new(tokio::sync::Semaphore::new(2));
+        let handed: Arc<Mutex<Option<HideTimes>>> = Default::default();
+        let (_, send) = webview(vec![
+            Ok(visible()),
+            Ok(hid()),
+            Err("UI Bridge request timed out".into()),
+        ]);
+        let s = Arc::clone(&sem);
+        let acquire = move || async move {
+            s.acquire_many_owned(2)
+                .await
+                .map_err(|e| format!("acquire: {e}"))
+        };
+        let capture = || std::future::ready(Ok::<&'static str, String>("frame"));
+        let (guard_send_count, guard_send) =
+            slow_webview(vec![Err("UI Bridge request timed out".into())], ms(0));
+        let h = handed.clone();
+        let abort = move |lock: PairLockGuard,
+                          permits: tokio::sync::OwnedSemaphorePermit,
+                          times: HideTimes| {
+            *h.lock().unwrap() = Some(times);
+            tokio::spawn(restore_after_cancel(
+                guard_send,
+                || {},
+                |_| {},
+                lock,
+                permits,
+                times,
+            ));
+        };
+        let arm = capture_text_hidden_pair(send, acquire, capture, || {}, |_| {}, abort);
+        assert!(
+            tokio::time::timeout(ms(CAPTURE_TTL_MS / 2), arm)
+                .await
+                .is_err(),
+            "the arm was still in its TTL hold"
+        );
+        let times = handed.lock().unwrap().take().expect("the guard fired");
+        let answered = times.answered.expect("the hide had answered");
+        assert!(times.sent <= answered);
+        let ttl_fired = answered + ms(CAPTURE_TTL_MS + TTL_BUMP_MARGIN_MS);
+        tokio::time::sleep_until(ttl_fired - ms(1)).await;
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "no capture may see the page before the TTL has fired"
+        );
+        tokio::time::sleep_until(ttl_fired + ms(1)).await;
+        assert_eq!(sem.available_permits(), 2);
+        assert_eq!(
+            guard_send_count.load(SeqCst),
+            1,
+            "the guard restored once more"
+        );
+    }
+
+    /// The TTL-restore bumps: one at the delay, and a second
+    /// [`TTL_BUMP_LATE_EXTRA_MS`] later for a TTL restore that ran late.
+    #[tokio::test(start_paused = true)]
+    async fn the_ttl_bumps_fire_at_the_delay_and_again_late() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        let t0 = tokio::time::Instant::now();
+        let task = tokio::spawn(ttl_bumps(1_000, move || {
+            c.fetch_add(1, SeqCst);
+        }));
+        let at = |ms: u64| tokio::time::sleep_until(t0 + std::time::Duration::from_millis(ms));
+        at(999).await;
+        assert_eq!(count.load(SeqCst), 0);
+        at(1_001).await;
+        assert_eq!(count.load(SeqCst), 1);
+        at(1_000 + TTL_BUMP_LATE_EXTRA_MS - 1).await;
+        assert_eq!(count.load(SeqCst), 1);
+        at(1_000 + TTL_BUMP_LATE_EXTRA_MS + 1).await;
+        assert_eq!(count.load(SeqCst), 2);
+        task.await.expect("the bump task ran to its end");
     }
 
     /// Two arms at once against one webview whose frames show whether its text
@@ -2125,7 +2610,7 @@ mod tests {
             let err = out.frame_b.expect_err(error);
             assert!(err.contains("never left the runner"), "{error}: {err}");
             assert!(!has(&events, "show"), "{error}: {events:?}");
-            assert!(!has(&events, "abort-restore"), "{error}: {events:?}");
+            assert!(!aborted(&events), "{error}: {events:?}");
             let err = out.frame_a.expect_err("no hook answer checked frame A");
             assert!(
                 err.contains("hide request never left the runner"),
@@ -2164,9 +2649,11 @@ mod tests {
         );
     }
 
-    /// The production call sites, pinned by source: the guard path is wired to
-    /// a real, lock- and permit-carrying restore, and the direct route's TTL
-    /// bump to the real scheduler.
+    /// The direct route's production call site, pinned by source: its TTL bump
+    /// goes to the real scheduler. (The guard path's wiring — the abort
+    /// closure spawning [`restore_after_cancel`] over the real request, bump
+    /// and scheduler — is pinned in `vision_routes`'
+    /// `the_arm_wiring_is_the_real_one`.)
     #[test]
     fn the_direct_route_wires_the_real_ttl_bump() {
         let src = include_str!("text_visibility.rs");

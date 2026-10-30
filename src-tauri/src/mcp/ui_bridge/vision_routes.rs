@@ -2156,7 +2156,8 @@ impl From<&BaselineRegistryEntry> for qontinui_vision_core::BaselineEntry {
 /// frame B is read at the scale factor of the frame this call captured, as
 /// `vision-audit --frame-text-hidden` reads it at `--frame`'s. A base64 frame
 /// rides in the request body, which these two routes accept up to
-/// [`VISION_FRAME_BODY_LIMIT`] (32 MiB); pass a larger one by `sha256`.
+/// [`VISION_FRAME_BODY_LIMIT`] (32 MiB) from the requesters that may send frame
+/// B at all; pass a larger one by `sha256`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TextHiddenFrameRequest {
@@ -2167,8 +2168,96 @@ pub struct TextHiddenFrameRequest {
 }
 
 /// The request-body ceiling of `vision/analyze` and `vision/assert`, raised
-/// from axum's 2 MiB `Json` default so a base64 frame B fits.
+/// from axum's 2 MiB `Json` default so a base64 frame B fits. It applies only
+/// to a NonBrowser or FirstParty requester — the only ones that may send frame
+/// B ([`refuse_untrusted_frame_b`]); every other one stays at
+/// [`UNTRUSTED_VISION_BODY_LIMIT`] ([`limit_untrusted_vision_body`]).
 pub(crate) const VISION_FRAME_BODY_LIMIT: usize = 32 * 1024 * 1024;
+
+/// The request-body ceiling of `vision/analyze` and `vision/assert` for any
+/// requester but a NonBrowser or FirstParty one: axum's own 2 MiB `Json`
+/// default, what these routes accepted before frame B. Those two routes are
+/// not credential doors, so a Foreign browser page the origin guard admits can
+/// POST them; it gets no more analyzer input than before, and a frame B it may
+/// not send is never buffered at 32 MiB to be refused.
+pub(crate) const UNTRUSTED_VISION_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
+/// Hold a requester that is not NonBrowser or FirstParty to
+/// [`UNTRUSTED_VISION_BODY_LIMIT`], BEFORE the `UiBridgeJson` extractor
+/// buffers and parses the body (it would map an over-limit body to a 400, and
+/// only after reading up to the route's [`VISION_FRAME_BODY_LIMIT`]). An absent
+/// principal is UNKNOWN, and limited too. A `Content-Length` over the limit is
+/// answered 413 without reading the body; any other body — chunked, with no
+/// length — is read only until it passes the limit, and then answered 413.
+/// What was read is handed on unchanged. A trusted requester passes untouched.
+/// Mounted on those two routes only.
+async fn limit_untrusted_vision_body(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    use crate::mcp::origin_guard::{OriginClass, RequesterPrincipal};
+    use futures::StreamExt;
+    let class = request
+        .extensions()
+        .get::<RequesterPrincipal>()
+        .map(|p| p.class);
+    if matches!(
+        class,
+        Some(OriginClass::NonBrowser | OriginClass::FirstParty)
+    ) {
+        return next.run(request).await;
+    }
+    let too_large = || {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ApiResponse::<()>::error_with_code(
+                format!(
+                    "Request body exceeds {UNTRUSTED_VISION_BODY_LIMIT} bytes, the limit for a \
+                     requester that may not send frame B (requester class: {}); only a \
+                     non-browser caller or the runner's own UI may send up to \
+                     {VISION_FRAME_BODY_LIMIT} bytes",
+                    class.map(OriginClass::as_str).unwrap_or("unknown")
+                ),
+                "PAYLOAD_TOO_LARGE",
+            )),
+        )
+            .into_response()
+    };
+    let declared = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|len| len > UNTRUSTED_VISION_BODY_LIMIT as u64) {
+        return too_large();
+    }
+    let (parts, body) = request.into_parts();
+    let mut stream = body.into_data_stream();
+    let mut read = bytes::BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) if read.len() + chunk.len() > UNTRUSTED_VISION_BODY_LIMIT => {
+                return too_large()
+            }
+            Ok(chunk) => read.extend_from_slice(&chunk),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse::<()>::error_with_code(
+                        format!("Failed to read the request body: {e}"),
+                        "BAD_REQUEST",
+                    )),
+                )
+                    .into_response()
+            }
+        }
+    }
+    next.run(axum::extract::Request::from_parts(
+        parts,
+        Body::from(read.freeze()),
+    ))
+    .await
+}
 
 /// The decode ceiling for a supplied frame B: its pixels as RGBA, with room
 /// for the decoder's own buffers. Frame A's size bounds it first.
@@ -2505,14 +2594,18 @@ pub(crate) const VISION_CAPTURE_PERMITS: u32 = 2;
 /// The lock and the permits are held until the restore has answered; when it
 /// FAILED (the webview unreachable, say), until the arm's TTL
 /// ([`super::text_visibility::CAPTURE_TTL_MS`]) has restored the page. On a
-/// cancel they go with the guard's spawned restore, and are released once it
-/// has answered and bumped; if THAT restore fails or is not verified, it is
-/// logged, and a TTL bump retires any capture cached before the TTL restore.
+/// cancel they go with the guard's spawned restore
+/// ([`super::text_visibility::restore_after_cancel`]), which runs the same
+/// retry and the same TTL hold — counted from the hide's reply, or from the
+/// cancel when it came before the reply — and releases them only after its
+/// bump; if THAT restore is not verified, it is logged, and the TTL-restore
+/// bumps retire any capture cached before the TTL restore.
 async fn capture_text_hidden_arm(
     state: &Arc<ApiState>,
 ) -> (Option<Frame>, Option<String>, TextHidden) {
     use super::text_visibility::{
-        capture_text_hidden_pair, schedule_mutation_bump, PairLockGuard, REQUEST_TYPE,
+        capture_text_hidden_pair, restore_after_cancel, schedule_mutation_bump, HideTimes,
+        PairLockGuard,
     };
     let send = |kind: &'static str, body: serde_json::Value| {
         let state = Arc::clone(state);
@@ -2525,52 +2618,38 @@ async fn capture_text_hidden_arm(
             .map_err(|e| format!("capture semaphore acquire: {e}"))
     };
     let abort_state = Arc::clone(state);
-    // Spawned holding the arm's lock AND its permits, released only after the
-    // restore and the bump: no other arm starts, and no other vision capture
-    // sees the text-hidden page, until the restore has answered.
-    let abort_restore = move |lock: PairLockGuard, permits: tokio::sync::OwnedSemaphorePermit| {
-        let restore = async move {
-            let reply = super::request::ui_bridge_request_sync(
-                &abort_state,
-                REQUEST_TYPE,
-                serde_json::json!({"hidden": false}),
-            )
-            .await;
-            bump_mutation_id(&abort_state);
-            // Not confirmed: the page may stay text-hidden until the arm's TTL
-            // restores it, with no request this runner sees — so that restore
-            // gets its bump, counted from now (past the hide's reply).
-            let verified = reply
-                .as_ref()
-                .is_ok_and(super::text_visibility::restore_verified);
-            if !verified {
-                warn!(
-                    "vision: the cancelled runner arm's text restore was not verified \
-                     ({reply:?}); the {} ms TTL restores the page",
-                    super::text_visibility::CAPTURE_TTL_MS
-                );
-                schedule_mutation_bump(
-                    &abort_state,
-                    super::text_visibility::CAPTURE_TTL_MS
-                        + super::text_visibility::TTL_BUMP_MARGIN_MS,
-                );
-            }
-            drop(permits);
-            drop(lock);
-        };
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => {
-                runtime.spawn(restore);
-            }
-            // No runtime to restore on (a shutdown): the arm's TTL restores the
-            // page instead.
-            Err(e) => warn!(
-                "vision: no tokio runtime to restore the webview's text on ({e}); the \
+    // Spawned holding the arm's lock AND its permits: `restore_after_cancel`
+    // runs the main path's own retry and TTL hold, bumps, and only then
+    // releases them — so no other arm starts, and no other vision capture sees
+    // the text-hidden page, until the page is known restored or the TTL has
+    // had time to restore it.
+    let abort_restore =
+        move |lock: PairLockGuard, permits: tokio::sync::OwnedSemaphorePermit, times: HideTimes| {
+            let (send_state, bump_state) = (Arc::clone(&abort_state), Arc::clone(&abort_state));
+            let restore = restore_after_cancel(
+                move |kind: &'static str, body: serde_json::Value| {
+                    let state = Arc::clone(&send_state);
+                    async move { super::request::ui_bridge_request_sync(&state, kind, body).await }
+                },
+                move || bump_mutation_id(&bump_state),
+                move |delay_ms| schedule_mutation_bump(&abort_state, delay_ms),
+                lock,
+                permits,
+                times,
+            );
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => {
+                    runtime.spawn(restore);
+                }
+                // No runtime to restore on (a shutdown): the arm's TTL restores the
+                // page instead.
+                Err(e) => warn!(
+                    "vision: no tokio runtime to restore the webview's text on ({e}); the \
                  {} ms TTL will restore it",
-                super::text_visibility::CAPTURE_TTL_MS
-            ),
-        }
-    };
+                    super::text_visibility::CAPTURE_TTL_MS
+                ),
+            }
+        };
     let out = capture_text_hidden_pair(
         send,
         acquire,
@@ -2725,7 +2804,8 @@ impl RequestHints for AnalyzeRequest {
              \"dynamic\", \"elements\", \"image\"). \
              Optional: `snapshot` (ElementSnapshot), `region`, `element`, `target`, \
              `textHiddenFrame` ({pngBase64} or {sha256}: frame B, text hidden, a PNG of the \
-             frame's size; bodies up to 32 MiB) with an optional `textHiddenIds`, or \
+             frame's size; bodies up to 32 MiB, from a non-browser caller or the runner's own \
+             UI only — 2 MiB from any other) with an optional `textHiddenIds`, or \
              `captureTextHidden: true` (the runner hides its own webview's text for frame B; \
              only with the `image` analyzer and a `snapshot`)."
                 .to_string(),
@@ -3117,7 +3197,8 @@ impl RequestHints for AssertRequest {
              about — `target` when sent, else the runner's own app — so a ref from \
              another app leaves them unknown), \
              `textHiddenFrame` ({pngBase64} or {sha256}: frame B, text hidden, a PNG of the \
-             frame's size; bodies up to 32 MiB) with an optional `textHiddenIds`, or \
+             frame's size; bodies up to 32 MiB, from a non-browser caller or the runner's own \
+             UI only — 2 MiB from any other) with an optional `textHiddenIds`, or \
              `captureTextHidden: true` (the runner hides its own webview's text for frame B; \
              only with a text_over_image_contrast assertion, which reads it, and a \
              `snapshot`)."
@@ -3882,14 +3963,20 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/vision/raw", post(vision_raw_handler))
         .route("/ui-bridge/vision/extract", post(vision_extract_handler))
         .route("/ui-bridge/vision/describe", post(vision_describe_handler))
-        // A base64 frame B rides in these two bodies: past axum's 2 MiB default.
+        // A base64 frame B rides in these two bodies: past axum's 2 MiB default,
+        // for the requesters that may send one — everyone else stays at 2 MiB,
+        // enforced before the body is buffered.
         .route(
             "/ui-bridge/vision/analyze",
-            post(vision_analyze_handler).layer(DefaultBodyLimit::max(VISION_FRAME_BODY_LIMIT)),
+            post(vision_analyze_handler)
+                .layer(DefaultBodyLimit::max(VISION_FRAME_BODY_LIMIT))
+                .layer(axum::middleware::from_fn(limit_untrusted_vision_body)),
         )
         .route(
             "/ui-bridge/vision/assert",
-            post(vision_assert_handler).layer(DefaultBodyLimit::max(VISION_FRAME_BODY_LIMIT)),
+            post(vision_assert_handler)
+                .layer(DefaultBodyLimit::max(VISION_FRAME_BODY_LIMIT))
+                .layer(axum::middleware::from_fn(limit_untrusted_vision_body)),
         )
         .route("/ui-bridge/vision/baseline", post(vision_baseline_handler))
         .route(
@@ -5463,9 +5550,11 @@ mod text_hidden_tests {
     }
 
     /// The arm takes EVERY capture permit, owned so the guard can hand them on,
-    /// and its abort restore carries the lock and the permits, releasing them
-    /// only after the restore request and the bump; the TTL bump is the real
-    /// scheduler.
+    /// and its abort restore hands the lock, the permits and the hide's times
+    /// to the shared cancel restore (`text_visibility::restore_after_cancel`,
+    /// whose retry, TTL hold and release order its paused-clock tests pin),
+    /// spawned over the real request, the real bump and the real TTL-bump
+    /// scheduler. A source pin because `ApiState` has no test constructor.
     #[test]
     fn the_arm_wiring_is_the_real_one() {
         let src = include_str!("vision_routes.rs");
@@ -5476,23 +5565,40 @@ mod text_hidden_tests {
         );
 
         let (_, abort) = body
-            .split_once("let abort_restore = move |lock: PairLockGuard, permits")
-            .expect("the abort restore takes the lock and the permits");
+            .split_once("let abort_restore =")
+            .expect("the abort restore");
         let (abort, call) = abort
             .split_once("let out = capture_text_hidden_pair(")
             .expect("abort restore precedes the call");
-        let request = pos(abort, "ui_bridge_request_sync(");
-        let bump = pos(abort, "bump_mutation_id(&abort_state);");
-        assert!(request < bump, "restore, then bump");
-        assert!(
-            bump < pos(abort, "drop(permits);"),
-            "permits released after the bump"
+        let params: String = abort
+            .split_once('{')
+            .map(|(head, _)| head.split_whitespace().collect())
+            .unwrap_or_default();
+        assert_eq!(
+            params,
+            "move|lock:PairLockGuard,permits:tokio::sync::OwnedSemaphorePermit,times:HideTimes|",
+            "it takes the lock, the permits and the hide's times"
         );
-        assert!(
-            bump < pos(abort, "drop(lock);"),
-            "lock released after the bump"
-        );
-        assert!(abort.contains("runtime.spawn(restore)"), "{abort}");
+        let (_, args) = abort
+            .split_once("let restore = restore_after_cancel(")
+            .expect("the shared cancel restore");
+        let (args, spawn) = args.split_once(");").expect("its arguments end");
+        let mut at = 0;
+        for arg in [
+            "super::request::ui_bridge_request_sync(&state, kind, body)",
+            "move || bump_mutation_id(&bump_state),",
+            "move |delay_ms| schedule_mutation_bump(&abort_state, delay_ms),",
+            "lock,",
+            "permits,",
+            "times,",
+        ] {
+            let found = args
+                .get(at..)
+                .and_then(|rest| rest.find(arg))
+                .unwrap_or_else(|| panic!("`{arg}` not in order in:\n{args}"));
+            at += found + arg.len();
+        }
+        assert!(spawn.contains("runtime.spawn(restore)"), "{spawn}");
 
         assert!(
             call.contains("capture_runner_window_frame_permitted(state)"),
@@ -5800,6 +5906,192 @@ mod text_hidden_tests {
             .unwrap_err()
             .contains("unknown"));
         assert!(refuse_untrusted_frame_b(Some(&p(OriginClass::Foreign)), false, false).is_ok());
+    }
+
+    /// How a body is sent through [`limit_untrusted_vision_body`].
+    enum Sent {
+        /// With a `Content-Length` of this many bytes, over a body that never
+        /// yields: answering at all proves it was not read.
+        DeclaredOnly(usize),
+        /// With a `Content-Length` and the body itself.
+        Declared(usize),
+        /// Chunked: no `Content-Length`, the body in 64 KiB chunks.
+        Chunked(usize),
+    }
+
+    /// One request through the untrusted body limit in front of a stand-in
+    /// handler mounted as `routes()` mounts the two vision routes (the
+    /// route's [`VISION_FRAME_BODY_LIMIT`] under the middleware): the status,
+    /// and the body length the handler received, if it ran. A stand-in because
+    /// the real handlers take an `ApiState` this crate's tests cannot build;
+    /// `both_vision_frame_routes_mount_the_untrusted_body_limit` pins the
+    /// mount.
+    async fn through_the_body_limit(
+        class: Option<crate::mcp::origin_guard::OriginClass>,
+        sent: Sent,
+    ) -> (StatusCode, Option<usize>) {
+        use tower::ServiceExt;
+        let reached: Arc<std::sync::Mutex<Option<usize>>> = Default::default();
+        let r = reached.clone();
+        let route = post(move |bytes: axum::body::Bytes| async move {
+            *r.lock().unwrap() = Some(bytes.len());
+            StatusCode::OK
+        })
+        .layer(DefaultBodyLimit::max(VISION_FRAME_BODY_LIMIT))
+        .layer(axum::middleware::from_fn(limit_untrusted_vision_body));
+        let mut app: Router = Router::new().route("/vision", route);
+        if let Some(class) = class {
+            app = app.layer(axum::Extension(
+                crate::mcp::origin_guard::RequesterPrincipal {
+                    class,
+                    origin: None,
+                },
+            ));
+        }
+        let chunks = |len: usize| {
+            let chunk = 64 * 1024;
+            let pieces: Vec<Result<axum::body::Bytes, std::io::Error>> = (0..len)
+                .step_by(chunk)
+                .map(|at| Ok(axum::body::Bytes::from(vec![b' '; chunk.min(len - at)])))
+                .collect();
+            Body::from_stream(futures::stream::iter(pieces))
+        };
+        let request = axum::http::Request::post("/vision");
+        let request = match sent {
+            Sent::DeclaredOnly(len) => {
+                request
+                    .header(header::CONTENT_LENGTH, len)
+                    .body(Body::from_stream(futures::stream::pending::<
+                        Result<axum::body::Bytes, std::io::Error>,
+                    >()))
+            }
+            Sent::Declared(len) => request
+                .header(header::CONTENT_LENGTH, len)
+                .body(Body::from(vec![b' '; len])),
+            Sent::Chunked(len) => request.body(chunks(len)),
+        }
+        .unwrap();
+        let response =
+            tokio::time::timeout(std::time::Duration::from_secs(30), app.oneshot(request))
+                .await
+                .expect("answered without waiting on a body it should not read")
+                .unwrap();
+        let status = response.status();
+        let reached = *reached.lock().unwrap();
+        (status, reached)
+    }
+
+    /// `vision/analyze` and `vision/assert` take up to 32 MiB only from the
+    /// requesters that may send frame B. Any other — every browser class but
+    /// the runner's own, and an absent principal (UNKNOWN) — is held to 2 MiB
+    /// BEFORE the extractor reads the body: a `Content-Length` over it is a
+    /// 413 without the body being read, a chunked body is a 413 once it passes
+    /// the limit, and in neither case does the handler run. A body within the
+    /// limit reaches the handler whole.
+    #[tokio::test]
+    async fn an_untrusted_requester_is_held_to_2_mib_before_the_body_is_read() {
+        use crate::mcp::origin_guard::OriginClass;
+        let limit = UNTRUSTED_VISION_BODY_LIMIT;
+        let big = 3 * 1024 * 1024;
+        for class in [
+            None,
+            Some(OriginClass::Foreign),
+            Some(OriginClass::Extension),
+            Some(OriginClass::Trusted),
+        ] {
+            for (sent, want) in [
+                (
+                    Sent::DeclaredOnly(limit + 1),
+                    (StatusCode::PAYLOAD_TOO_LARGE, None),
+                ),
+                (
+                    Sent::DeclaredOnly(big),
+                    (StatusCode::PAYLOAD_TOO_LARGE, None),
+                ),
+                (
+                    Sent::Chunked(limit + 1),
+                    (StatusCode::PAYLOAD_TOO_LARGE, None),
+                ),
+                (Sent::Chunked(big), (StatusCode::PAYLOAD_TOO_LARGE, None)),
+                (Sent::Chunked(limit), (StatusCode::OK, Some(limit))),
+                (Sent::Declared(limit), (StatusCode::OK, Some(limit))),
+                (Sent::Declared(1024), (StatusCode::OK, Some(1024))),
+            ] {
+                let label = match &sent {
+                    Sent::DeclaredOnly(n) => format!("declared-only {n}"),
+                    Sent::Declared(n) => format!("declared {n}"),
+                    Sent::Chunked(n) => format!("chunked {n}"),
+                };
+                assert_eq!(
+                    through_the_body_limit(class, sent).await,
+                    want,
+                    "{class:?}, {label}"
+                );
+            }
+        }
+    }
+
+    /// A NonBrowser or FirstParty requester passes the middleware untouched,
+    /// under the route's own 32 MiB limit.
+    #[tokio::test]
+    async fn a_trusted_requester_keeps_the_32_mib_limit() {
+        use crate::mcp::origin_guard::OriginClass;
+        let big = 3 * 1024 * 1024;
+        for class in [OriginClass::NonBrowser, OriginClass::FirstParty] {
+            assert_eq!(
+                through_the_body_limit(Some(class), Sent::Declared(big)).await,
+                (StatusCode::OK, Some(big)),
+                "{class:?}"
+            );
+            assert_eq!(
+                through_the_body_limit(Some(class), Sent::Chunked(big)).await,
+                (StatusCode::OK, Some(big)),
+                "{class:?}"
+            );
+            // Past the route's own limit, axum's extractor refuses it.
+            assert_eq!(
+                through_the_body_limit(Some(class), Sent::Declared(VISION_FRAME_BODY_LIMIT + 1))
+                    .await
+                    .1,
+                None,
+                "{class:?}"
+            );
+        }
+    }
+
+    /// Both frame-B routes mount the untrusted body limit, as the stand-in in
+    /// `through_the_body_limit` does — and no other vision route needs it,
+    /// since only these two raise the body limit.
+    #[test]
+    fn both_vision_frame_routes_mount_the_untrusted_body_limit() {
+        let src = include_str!("vision_routes.rs");
+        let routes = fn_body(src, "pub fn routes() -> Router<Arc<ApiState>> {");
+        for path in [
+            "\"/ui-bridge/vision/analyze\"",
+            "\"/ui-bridge/vision/assert\"",
+        ] {
+            let (_, rest) = routes.split_once(path).expect(path);
+            let (mount, _) = rest.split_once(".route(").unwrap_or((rest, ""));
+            let limit = pos(mount, "DefaultBodyLimit::max(VISION_FRAME_BODY_LIMIT)");
+            let guard = pos(
+                mount,
+                "axum::middleware::from_fn(limit_untrusted_vision_body)",
+            );
+            assert!(
+                limit < guard,
+                "{path}: the middleware wraps the route: {mount}"
+            );
+        }
+        assert_eq!(
+            routes.matches("DefaultBodyLimit::max(").count(),
+            2,
+            "a route that raises the body limit needs the untrusted limit too: {routes}"
+        );
+        assert_eq!(
+            routes.matches("limit_untrusted_vision_body").count(),
+            2,
+            "{routes}"
+        );
     }
 
     /// The vision capture cache keys on the mutation id: a capture cached on
