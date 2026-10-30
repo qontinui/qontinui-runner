@@ -135,6 +135,18 @@ pub struct WinRow {
 /// `MIB_TCP_STATE_TIME_WAIT`.
 pub const WIN_STATE_TIME_WAIT: u32 = 11;
 
+/// `MIB_TCP_STATE_LISTEN`.
+pub const WIN_STATE_LISTEN: u32 = 2;
+
+/// The PID owning a LISTENING socket on local `port` among `rows` (a
+/// listener-class table read), skipping rows with no owning process. Used by
+/// the runner's process table for a managed process's health-port owner.
+pub fn listener_owner_pid<I: IntoIterator<Item = WinRow>>(rows: I, port: u16) -> Option<u32> {
+    rows.into_iter()
+        .find(|r| r.state == WIN_STATE_LISTEN && r.local.port() == port && r.pid > 0)
+        .map(|r| r.pid)
+}
+
 /// The PID owning the peer end of `peer → local` among `rows`.
 pub fn owner_pid<I: IntoIterator<Item = WinRow>>(
     rows: I,

@@ -1392,11 +1392,12 @@ impl ProcessCaptureManager {
         }
     }
 
-    /// One-shot descendant-tree discovery 3s after spawn.
+    /// One-shot descendant-tree discovery 3s after spawn (retried once, 3 s
+    /// later, when that first look is UNKNOWN or finds no descendant yet).
     ///
     /// The spawned PID is the outer wrapper (`cmd.exe` on Windows). Within
     /// ~3s it has forked the full chain down to the service worker. We
-    /// snapshot the descendant tree once, identify the inner service PID,
+    /// snapshot the descendant tree (a fresh read), identify the inner service PID,
     /// and write both onto `ProcessRuntime` so Phase 2 can probe the
     /// service-PID directly and Phase 4 can persist the tracked set for
     /// orphan reclaim. If the process leaves `Running`/`Healthy` before the
@@ -1411,28 +1412,60 @@ impl ProcessCaptureManager {
     ) {
         use super::process_tree;
 
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        // One bounded retry: a first look that is UNKNOWN (the table could
+        // not be read fresh) or that finds no descendant yet (the wrapper has
+        // not forked its chain, so the service pid would fall back to the
+        // wrapper itself) is taken again once, 3 s later. Still nothing after
+        // that: an UNKNOWN pass writes nothing; an empty one records what it saw.
+        const DISCOVERY_ATTEMPTS: u32 = 2;
+        let mut attempt = 0;
+        let (spawned_pid, descendants, parent_map) = loop {
+            attempt += 1;
+            tokio::time::sleep(Duration::from_secs(3)).await;
 
-        // Capture the spawned PID under a brief read lock; bail if state moved on.
-        let spawned_pid = {
-            let procs = processes.read().await;
-            let Some(p) = procs.get(&process_id) else {
-                return;
+            // Capture the spawned PID under a brief read lock; bail if state
+            // moved on.
+            let spawned_pid = {
+                let procs = processes.read().await;
+                let Some(p) = procs.get(&process_id) else {
+                    return;
+                };
+                if !matches!(
+                    p.runtime.state,
+                    ProcessState::Running | ProcessState::Healthy
+                ) {
+                    return;
+                }
+                match p.runtime.pid {
+                    Some(pid) => pid,
+                    None => return,
+                }
             };
-            if !matches!(
-                p.runtime.state,
-                ProcessState::Running | ProcessState::Healthy
-            ) {
-                return;
-            }
-            match p.runtime.pid {
-                Some(pid) => pid,
-                None => return,
+
+            match process_tree::discover_descendants_with_parent_map(spawned_pid).await {
+                Some((descendants, parent_map))
+                    if !descendants.is_empty() || attempt >= DISCOVERY_ATTEMPTS =>
+                {
+                    break (spawned_pid, descendants, parent_map);
+                }
+                Some(_) => tracing::debug!(
+                    "Descendant discovery for '{process_name}' found no descendant yet; retrying once"
+                ),
+                // UNKNOWN on the last attempt: write nothing. The runtime's
+                // descendant set stays as the spawn left it (cleared), and the
+                // persisted orphan record is not overwritten with an empty or
+                // stale tree.
+                None if attempt >= DISCOVERY_ATTEMPTS => {
+                    tracing::debug!(
+                        "Descendant discovery for '{process_name}' skipped: process table unknown"
+                    );
+                    return;
+                }
+                None => tracing::debug!(
+                    "Descendant discovery for '{process_name}': process table unknown; retrying once"
+                ),
             }
         };
-
-        let (descendants, parent_map) =
-            process_tree::discover_descendants_with_parent_map(spawned_pid).await;
         let service_pid =
             process_tree::identify_service_pid(&descendants, &parent_map, health_port, spawned_pid);
 
@@ -1442,7 +1475,7 @@ impl ProcessCaptureManager {
                 return;
             };
             // Re-check state — discovery query is async; the process may
-            // have stopped/failed while we were waiting for PowerShell.
+            // have stopped/failed while we were waiting for the table read.
             if !matches!(
                 p.runtime.state,
                 ProcessState::Running | ProcessState::Healthy

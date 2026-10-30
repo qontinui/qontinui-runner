@@ -576,7 +576,7 @@ pub(crate) fn pane_child_count(
     root_pid: Option<u32>,
 ) -> Option<usize> {
     let root = root_pid?;
-    if snapshot.parent_map.is_empty() {
+    if snapshot.is_unknown() {
         return None;
     }
     Some(snapshot.parent_map.get(&root).map_or(0, Vec::len))
@@ -736,14 +736,16 @@ async fn find_running_steward(
 
 /// A process snapshot for judging one kind's panes — taken only when that kind
 /// has a tracked pane, and otherwise the empty default (see
-/// [`find_running_steward_in`]).
+/// [`find_running_steward_in`]). A read begun now, never the memo: the reaper
+/// closes a pane, and the single-instance guard admits a second steward,
+/// because of what is ABSENT from it.
 async fn snapshot_for_kind(kind: &str) -> crate::process_capture::process_tree::ProcessSnapshot {
     let has_tracked = steward_meta_store()
         .lock()
         .map(|guard| !tracked_ids_for_kind(&guard, kind).is_empty())
         .unwrap_or(false);
     if has_tracked {
-        crate::process_capture::process_tree::snapshot_process_table_public().await
+        crate::process_capture::process_tree::snapshot_process_table_fresh().await
     } else {
         Default::default()
     }
@@ -941,6 +943,10 @@ fn get_terminal_manager(state: &ApiState) -> Arc<TerminalManager> {
 
 /// [`steward_status_in`] taking its own process snapshot. One snapshot serves
 /// every kind, and it is skipped entirely when nothing is tracked.
+///
+/// The memoized snapshot, not a fresh walk: this serves only the `GET
+/// /stewards` roster a UI polls every couple of seconds, and closes, reaps and
+/// admits nothing. Those act on absence and read [`snapshot_for_kind`] (fresh).
 async fn steward_status_all(terminal_manager: &TerminalManager) -> Vec<StewardStatusResponse> {
     let any_tracked = steward_meta_store()
         .lock()
