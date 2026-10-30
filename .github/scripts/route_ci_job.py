@@ -2,7 +2,7 @@
 # VENDORED COPY -- the source is qontinui-coord/.github/scripts/route_ci_job.py
 # (tests: qontinui-coord/.github/scripts/test_route_ci_job.py). Edit there and
 # re-copy byte for byte below this header; never edit this copy alone.
-# body-sha256: 1d6af6f30f250409a2697167a75e4d9e7369f5b47feb20fb2947cc8f6ec991e5
+# body-sha256: 58e9c4366fe5c9a3de504874d3b19d0ad4b49ff98de409c37ea3a50cae16e831
 #   (sha256 of everything below this header == `tail -n +2` of the source;
 #   src-tauri/tests/ci_route_gates_hosted_only_steps.rs recomputes it)
 """Ask coord where ONE heavy CI job should run, and hand the answer to `runs-on`.
@@ -49,7 +49,10 @@ unless the event is a trusted one (push, workflow_dispatch, schedule,
 merge_group) or a pull_request whose head this run's own event payload shows is
 NOT a fork (an unreadable fork-ness is refused, and pull_request_target /
 issue_comment / workflow_run always are): coord never sends one there, and this
-is the second lock on that door. A missing or malformed ROUTE_DEFAULT emits an
+is the second lock on that door. It refuses, as coord's own exclusivity check
+does, a self_hosted label set that is GitHub's default labels only (runners
+outside coord's roster carry those too) or that lacks `qontinui-ci-isolated`,
+a host's opt-in that it keeps no operator credential where a job can read it. A missing or malformed ROUTE_DEFAULT emits an
 EMPTY runs_on, so the dependant's own `|| '"<label>"'` default applies. Gate a
 hosted-only step on `runner.environment == 'github-hosted'`, never on `lane`:
 `lane` is empty when this job did not run, and a step gated on `lane == 'hosted'`
@@ -104,6 +107,9 @@ MAX_HOSTED_PAGEFILE_MB = 262144
 # pull_request this script lets run self-hosted (decision_record
 # self-hosted-runners-on-public-repos).
 TRUSTED_EVENTS = ("push", "workflow_dispatch", "schedule", "merge_group")
+# Mirrors coord's ci_route::GITHUB_DEFAULT_LABELS and ci_route::ISOLATED_LABEL.
+GITHUB_DEFAULT_LABELS = ("self-hosted", "linux", "windows", "macos", "x64", "x86", "arm", "arm64")
+ISOLATED_LABEL = "qontinui-ci-isolated"
 
 
 class RouteError(Exception):
@@ -275,9 +281,13 @@ def decide(
         refused = self_hosted_allowed(event, fork)
         if refused is not None:
             return static(f"refused coord's self_hosted answer: {refused}")
-        labels = [runs_on] if isinstance(runs_on, str) else runs_on
-        if "self-hosted" not in [label.lower() for label in labels]:
+        labels = [label.lower() for label in ([runs_on] if isinstance(runs_on, str) else runs_on)]
+        if "self-hosted" not in labels:
             return static("refused coord's self_hosted answer: its label set does not name self-hosted")
+        if all(label in GITHUB_DEFAULT_LABELS for label in labels):
+            return static("refused coord's self_hosted answer: its label set is GitHub's defaults only")
+        if ISOLATED_LABEL not in labels:
+            return static(f"refused coord's self_hosted answer: its label set does not name {ISOLATED_LABEL}")
     if lane in ("static", "fail_fast"):
         # coord echoes the caller's own default; keep the caller's spelling.
         runs_on = fallback_runs_on

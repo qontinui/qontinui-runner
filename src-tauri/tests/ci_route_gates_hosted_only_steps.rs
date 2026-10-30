@@ -57,6 +57,22 @@ fn str_of<'a>(v: &'a serde_yaml::Value, key: &str) -> &'a str {
 const HOSTED_ONLY: &str = "runner.environment == 'github-hosted'";
 const SELF_HOSTED_ONLY: &str = "runner.environment == 'self-hosted'";
 const ROUTED: [&str; 2] = ["test", "clippy-windows"];
+/// coord's `CI_CAPACITY_ANNOTATION_MARKER` (qontinui-coord
+/// `pr_merge/author_feedback.rs`), which coord reads as "no verdict". Both
+/// sides pin the literal.
+const CI_CAPACITY_TITLE: &str = "title=CI CAPACITY (not a verdict on this PR)::";
+
+/// True when `cond` confines the step to hosted runners: the gate alone, or
+/// conjoined LAST with no `||` anywhere (route review L4). A substring check
+/// would accept `always() || runner.environment == 'github-hosted'`.
+fn gated_to_hosted(cond: &str) -> bool {
+    let c = cond.trim();
+    let c = c
+        .strip_prefix("${{")
+        .and_then(|x| x.strip_suffix("}}"))
+        .map_or(c, str::trim);
+    c == HOSTED_ONLY || (c.ends_with(&format!("&& {HOSTED_ONLY}")) && !c.contains("||"))
+}
 
 /// Steps that MUST be gated to hosted runners: each writes the machine
 /// outside the workspace (paging setup, the home's `.qontinui`, the default
@@ -69,9 +85,9 @@ const MUST_BE_HOSTED: &[(&str, &str)] = &[
         "Configure pagefile (Windows — guard against link-time OOM)",
     ),
     ("test", "Cache Rust dependencies"),
-    ("test", "Poison ambient state"),
+    ("test", "Poison ambient state (files)"),
     ("test", "Windows memory peak after the Rust test steps"),
-    ("test", "Unpoison ambient state"),
+    ("test", "Unpoison ambient state (files)"),
     ("test", "SDK↔runner contract smoke (direct-exe)"),
     ("clippy-windows", "Setup Rust"),
     (
@@ -103,11 +119,14 @@ const SELF_HOSTED_SAFE: &[(&str, &str, &str)] = &[
     ("test", "Run frontend unit tests", "workspace tests"),
     ("test", "Build frontend", "the workspace dist dir"),
     ("test", "Format Rust code check", "reads the workspace"),
+    ("test", "Poison ambient state (env)", "this job's $GITHUB_ENV only"),
+    ("test", "Refuse a home holding a device credential (self-hosted)", "reads the home; writes nothing"),
     ("test", "Sandbox the runner config dirs (self-hosted)", "$RUNNER_TEMP and this job's env"),
     ("test", "Build Rust tests", "the workspace target dir"),
     ("test", "Run Rust tests", "config dirs sandboxed under $RUNNER_TEMP by the step before the build"),
     ("test", "Explain which Rust test phase the bound expired in", "reads this job's logs"),
     ("test", "Report test results to coord (best-effort)", "posts a summary; writes nothing"),
+    ("test", "Unpoison ambient state (env)", "this job's $GITHUB_ENV only"),
     ("test", "Build Tauri app (development)", "the workspace target dir, --no-bundle"),
     ("test", "Contract-smoke summary invariants (PS 5.1)", "a pure script over a fixture"),
     ("clippy-windows", "CI capacity (route said fail_fast)", "prints the reason and exits"),
@@ -160,7 +179,7 @@ fn every_pagefile_step_runs_only_on_a_hosted_runner() {
             seen += 1;
             let cond = str_of(&step, "if");
             assert!(
-                cond.contains(HOSTED_ONLY),
+                gated_to_hosted(cond),
                 "job `{}`: the pagefile step must be gated on `{HOSTED_ONLY}` (a routed \
                  self-hosted host must not have its paging rewritten), got `if: {cond}`",
                 name.as_str().unwrap_or("?")
@@ -188,7 +207,7 @@ fn the_direct_exe_contract_smoke_runs_only_on_a_hosted_runner() {
         .expect("the direct-exe contract smoke step exists");
     let cond = str_of(&step, "if");
     assert!(
-        cond.contains("matrix.platform == 'windows-latest'") && cond.contains(HOSTED_ONLY),
+        cond.contains("matrix.platform == 'windows-latest'") && gated_to_hosted(cond),
         "the direct-exe smoke boots a second runner on the host; got `if: {cond}`"
     );
 }
@@ -239,8 +258,8 @@ fn a_fail_fast_answer_fails_the_job_first() {
         );
         let run = str_of(&first, "run");
         assert!(
-            run.contains("ci-capacity") && run.contains("exit 1"),
-            "job `{name}`"
+            run.contains(CI_CAPACITY_TITLE) && run.contains("exit 1"),
+            "job `{name}`: the annotation title must be coord's marker `{CI_CAPACITY_TITLE}`"
         );
         assert!(
             !run.contains("${{"),
@@ -290,12 +309,11 @@ fn the_route_job_cannot_fail() {
         .trim()
         .to_string();
     let marker = "src-tauri/tests/ci_route_gates_hosted_only_steps.rs recomputes it)\n";
-    let at = text
-        .find(marker)
-        .expect("the header's last line names this test")
-        + marker.len();
+    let (_, body) = text
+        .split_once(marker)
+        .expect("the header's last line names this test");
     use sha2::{Digest, Sha256};
-    let actual: String = Sha256::digest(text[at..].as_bytes())
+    let actual: String = Sha256::digest(body.as_bytes())
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
@@ -314,7 +332,7 @@ fn every_step_a_self_hosted_leg_runs_is_gated_or_allowlisted() {
         for step in windows_leg_steps(&doc, name) {
             let key = step_key(&step);
             let cond = str_of(&step, "if");
-            if cond.contains(HOSTED_ONLY) {
+            if gated_to_hosted(cond) {
                 continue;
             }
             assert!(
@@ -343,7 +361,7 @@ fn every_step_a_self_hosted_leg_runs_is_gated_or_allowlisted() {
             .unwrap_or_else(|| panic!("job `{j}` has no step `{k}`"));
         let cond = str_of(&step, "if");
         assert!(
-            cond.contains(HOSTED_ONLY),
+            gated_to_hosted(cond),
             "job `{j}` step `{k}` writes the machine and must be gated on `{HOSTED_ONLY}`, \
              got `if: {cond}`"
         );
@@ -351,26 +369,69 @@ fn every_step_a_self_hosted_leg_runs_is_gated_or_allowlisted() {
 }
 
 #[test]
-fn the_unpoison_step_always_runs_and_removes_only_what_the_poison_created() {
+fn the_gate_check_rejects_a_disjunction_and_a_non_final_conjunct() {
+    assert!(gated_to_hosted(HOSTED_ONLY));
+    assert!(gated_to_hosted(&format!("${{{{ {HOSTED_ONLY} }}}}")));
+    assert!(gated_to_hosted(&format!("always() && {HOSTED_ONLY}")));
+    assert!(!gated_to_hosted(&format!("always() || {HOSTED_ONLY}")));
+    assert!(!gated_to_hosted(&format!("a || b && {HOSTED_ONLY}")));
+    assert!(!gated_to_hosted(&format!("{HOSTED_ONLY} || always()")));
+    assert!(!gated_to_hosted(&format!("!({HOSTED_ONLY})")));
+    assert!(!gated_to_hosted(""));
+}
+
+#[test]
+fn the_unpoison_steps_always_run_and_remove_only_what_the_poison_created() {
     let doc = ci_workflow();
     let s = steps(job(&doc, "test"));
-    let poison = s
-        .iter()
-        .find(|x| step_key(x) == "Poison ambient state")
-        .unwrap();
-    let unpoison = s
-        .iter()
-        .find(|x| step_key(x) == "Unpoison ambient state")
-        .unwrap();
-    assert!(str_of(unpoison, "if").contains("always()"));
-    let p = str_of(poison, "run");
+    let find = |k: &str| {
+        s.iter()
+            .find(|x| step_key(x) == k)
+            .unwrap_or_else(|| panic!("no step `{k}`"))
+    };
+    let files = find("Poison ambient state (files)");
+    let env = find("Poison ambient state (env)");
+    let unfiles = find("Unpoison ambient state (files)");
+    let unenv = find("Unpoison ambient state (env)");
+
+    // The env half runs on every leg, poison and unpoison alike (M2).
+    assert_eq!(str_of(env, "if"), "", "the env poison runs on every leg");
+    assert_eq!(str_of(unenv, "if"), "always()", "the env unpoison runs on every leg, always");
+    let e = str_of(env, "run");
+    assert!(e.contains("COORD_HTTP_URL=http://poison.invalid") && e.contains("GITHUB_ENV"));
+    for var in ["COORD_HTTP_URL=", "QONTINUI_ROOT=", "QONTINUI_SERVER_MODE=", "QONTINUI_RUNNER_TIER="] {
+        assert!(str_of(unenv, "run").contains(var), "{var}");
+    }
+
+    // The file half is hosted only and removes only what it recorded.
+    assert!(str_of(unfiles, "if").contains("always()") && gated_to_hosted(str_of(unfiles, "if")));
+    let p = str_of(files, "run");
     assert!(p.contains("poison-created-files") && p.contains("refusing to overwrite"));
-    let u = str_of(unpoison, "run");
+    assert!(p.contains("pwd -P"), "homes are compared physically (L3)");
+    let u = str_of(unfiles, "run");
     assert!(u.contains("poison-created-files"));
     assert!(
         !u.contains("rm -rf"),
         "unpoison removes recorded files by name only"
     );
+}
+
+#[test]
+fn a_self_hosted_leg_refuses_a_home_holding_a_device_credential() {
+    let doc = ci_workflow();
+    let s = steps(job(&doc, "test"));
+    let pos = |k: &str| {
+        s.iter()
+            .position(|x| step_key(x) == k)
+            .unwrap_or_else(|| panic!("no step `{k}`"))
+    };
+    let refuse = pos("Refuse a home holding a device credential (self-hosted)");
+    let step = &s[refuse];
+    assert_eq!(str_of(step, "if"), SELF_HOSTED_ONLY);
+    let run = str_of(step, "run");
+    assert!(run.contains(".qontinui/coord-device-jwt") && run.contains("exit 1"));
+    assert!(run.contains("USERPROFILE"), "Windows reads the profile dir, not $HOME");
+    assert!(refuse < pos("Build Rust tests"));
 }
 
 #[test]

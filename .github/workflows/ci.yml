@@ -190,9 +190,10 @@ jobs:
   # when the tenant's hosted CI is OFF, and this job is hosted. With hosted
   # off the dependants' hosted static default is cancelled too, so nothing is
   # lost -- but coord's `self_hosted` answer is then unreachable here. It is
-  # reachable only from a route job on the repo's own self-hosted pool, and
-  # this repo has none: a self-hosted route job would queue with no runner and
-  # hold every required check behind it. Coord's NOT_SERVED says the same.
+  # reachable only from a route job on a self-hosted pool the repo's workflow
+  # names, and this workflow names none (no roster read here establishes one):
+  # a self-hosted route job with no runner would queue and hold every
+  # required check behind it. Coord's NOT_SERVED says the same.
   #
   # The ubuntu leg of `test` also waits on this job (one `needs:` for the
   # matrix): a few seconds, accepted (review N5).
@@ -313,14 +314,17 @@ jobs:
       # coord's `fail_fast` lane: the windows leg's requirement is Incapable
       # on every runner class it may run on, so it fails here in seconds with
       # the shortfall named rather than OOMing 40 minutes into the build. The
-      # reason travels through env, never interpolated into the script.
+      # reason travels through env, never interpolated into the script. The
+      # annotation title is coord's `CI_CAPACITY_ANNOTATION_MARKER` verbatim
+      # (pr_merge/author_feedback.rs): coord reads it as "no verdict", so a
+      # capacity failure on main is never a red baseline. Both sides pin it.
       - name: CI capacity (route said fail_fast)
         if: matrix.platform == 'windows-latest' && needs.route.outputs.test_windows_lane == 'fail_fast'
         shell: bash
         env:
           ROUTE_REASON: ${{ needs.route.outputs.test_windows_reason }}
         run: |
-          echo "::error title=ci-capacity (not a verdict on this PR)::${ROUTE_REASON}"
+          echo "::error title=CI CAPACITY (not a verdict on this PR)::${ROUTE_REASON}"
           exit 1
 
       # Full history, blobless: workspace_assumptions_are_enumerated.rs takes its
@@ -746,7 +750,7 @@ jobs:
       # prints both and poisons both when they are not.
       #
       # The env half goes through `$GITHUB_ENV` and is blanked again by the
-      # `Unpoison ambient state` step below, so the poison covers exactly the
+      # `Unpoison ambient state (env)` step below, so the poison covers exactly the
       # test step: `QONTINUI_SERVER_MODE=1` means "this runner has no webview
       # and must never be given one" (`webview_recovery::is_server_mode`), which
       # the windows contract smoke's exe boot must not inherit.
@@ -772,12 +776,17 @@ jobs:
       # JWT: this step would overwrite them and `Unpoison` would delete them.
       # `dirs::home_dir()` ignores $HOME/$USERPROFILE on Windows, so the poison
       # cannot be pointed at $RUNNER_TEMP instead; a self-hosted leg runs the
-      # tests unpoisoned (the ubuntu and hosted windows legs keep the canary)
-      # with its config dirs sandboxed by the step after this one. And even on
+      # tests with the env poison only (the ubuntu and hosted windows legs keep
+      # the file canary too), in a home the refusal step below checks holds no
+      # device credential, with its config dirs sandboxed. And even on
       # a hosted runner a target FILE that already exists is a refusal, never
       # an overwrite: only files this step created are recorded, and only those
       # are removed by `Unpoison`.
-      - name: Poison ambient state
+      #
+      # The ENV half is the step after this one and runs on EVERY leg: it
+      # writes only this job's `$GITHUB_ENV`, so a self-hosted leg keeps the
+      # env canary (route review round 2, M2).
+      - name: Poison ambient state (files)
         if: runner.environment == 'github-hosted'
         run: |
           set -euo pipefail
@@ -806,7 +815,12 @@ jobs:
             profile_dir="$(cygpath -u "$USERPROFILE")"
             echo "HOME=$HOME"
             echo "USERPROFILE=$USERPROFILE (bash: $profile_dir)"
-            if [ "${profile_dir%/}" != "${HOME%/}" ]; then
+            # Compare PHYSICAL paths (route review L3): two spellings of one
+            # directory -- a trailing slash, a symlink, an 8.3 name -- would
+            # otherwise poison it twice and record each file twice.
+            home_phys="$(cd "$HOME" && pwd -P)"
+            profile_phys="$( (cd "$profile_dir" && pwd -P) 2>/dev/null || echo "$profile_dir")"
+            if [ "$profile_phys" != "$home_phys" ]; then
               echo "::warning::HOME and USERPROFILE name different directories — poisoning both"
               homes+=("$profile_dir")
             fi
@@ -814,6 +828,12 @@ jobs:
 
           for h in "${homes[@]}"; do
             q="$h/.qontinui"
+            # A home already poisoned under another spelling: its files are
+            # recorded once and never refused as "already exists".
+            if grep -qxF "$q/machine.json" "$CREATED"; then
+              echo "$q already poisoned under another spelling; skipping"
+              continue
+            fi
             case "$q" in
               "$RUNNER_TEMP"/*) ;;
               *)
@@ -863,7 +883,15 @@ jobs:
             ls -la "$q"
             cat "$q/machine.json" "$q/profiles.json"
           done
+          echo "device_id=$DEVICE_ID active_tenant_id=$TENANT_ID"
+        shell: bash
 
+      # The env half of the poison, on every leg (hosted and self-hosted): it
+      # writes only this job's `$GITHUB_ENV`, which `Unpoison ambient state
+      # (env)` blanks again with `always()`.
+      - name: Poison ambient state (env)
+        run: |
+          set -euo pipefail
           # A workspace root that does not exist: `default_canonical_path` must
           # fail closed naming `$QONTINUI_ROOT`, never resolve.
           POISON_ROOT="$RUNNER_TEMP/qontinui-root-poison-does-not-exist"
@@ -879,8 +907,30 @@ jobs:
           echo "QONTINUI_ROOT=$POISON_ROOT"
           echo "QONTINUI_SERVER_MODE=1"
           echo "QONTINUI_RUNNER_TIER=local"
-          echo "device_id=$DEVICE_ID active_tenant_id=$TENANT_ID"
         shell: bash
+
+      # A self-hosted leg runs the tests with no file poison, so the home it
+      # runs in must hold no device credential a test could read and send
+      # (`dirs::home_dir()` ignores $HOME on Windows, so it cannot be pointed
+      # away). `qontinui-ci-isolated`, the label coord requires before it
+      # routes a job here, is the host's declaration that it keeps none; this
+      # step checks it rather than trusting it (route review round 2, M2).
+      - name: Refuse a home holding a device credential (self-hosted)
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          homes=("$HOME")
+          if [ "$RUNNER_OS" = "Windows" ] && [ -n "${USERPROFILE:-}" ]; then
+            homes+=("$(cygpath -u "$USERPROFILE")")
+          fi
+          for h in "${homes[@]}"; do
+            if [ -e "$h/.qontinui/coord-device-jwt" ]; then
+              echo "::error title=Self-hosted home holds a device credential::$h/.qontinui/coord-device-jwt exists on this runner; a test could read and send it. Run the CI runner as a user with no coord credential, or remove the qontinui-ci-isolated label."
+              exit 1
+            fi
+          done
+          echo "no coord-device-jwt under ${homes[*]}"
 
       # A rerouted self-hosted leg (route review H1): the runner's tests resolve
       # the operator's config and secure-storage dirs, and a test binary once
@@ -1487,19 +1537,18 @@ jobs:
         shell: bash
         env:
           COORD_INGEST_TOKEN: ${{ secrets.COORD_INGEST_TOKEN }}
-          # `Poison ambient state` sets COORD_HTTP_URL=http://poison.invalid via
-          # $GITHUB_ENV, and `Unpoison ambient state` — which blanks it — runs
+          # `Poison ambient state (env)` sets COORD_HTTP_URL=http://poison.invalid via
+          # $GITHUB_ENV, and `Unpoison ambient state (env)` — which blanks it — runs
           # AFTER this step. So without this override the ingest POSTs to the
           # poison host and records nothing: measured 2026-09-09 on job
           # 102391645194, `0/10603 row(s) recorded across 11 chunk(s)`, every
           # chunk FAILED, while the step still reported green because it is
           # `continue-on-error`.
           #
-          # Reordering does NOT fix it: `Unpoison` carries no `if: always()`, so
-          # a red suite skips it entirely — and a red suite is exactly the case
-          # this ingest exists to record. A step-level `env:` beats $GITHUB_ENV
-          # for this step only, so it is correct on both the green and red paths
-          # and independent of where the unpoison sits.
+          # The unpoison now runs `always()`, but it still runs AFTER this
+          # step. A step-level `env:` beats $GITHUB_ENV for this step only, so
+          # it is correct on both the green and red paths and independent of
+          # where the unpoison sits.
           #
           # Empty, not a literal host: the script reads
           # `process.env.COORD_HTTP_URL || DEFAULT_COORD_URL` (in `main()` of
@@ -1522,7 +1571,7 @@ jobs:
             --shard "${{ matrix.platform }}" \
             --gating-outcome "${{ steps.run_rust_tests.outcome }}"
 
-      # Undo `Poison ambient state` so the poison covers the test step and
+      # Undo the two `Poison ambient state` steps so the poison covers the test step and
       # nothing after it. `$GITHUB_ENV` cannot unset, only assign — but every
       # one of the four readers treats an EMPTY value as unset
       # (`resolve_coord_base_with_source` trims and skips; `server_mode` matches
@@ -1530,10 +1579,11 @@ jobs:
       # root resolver trims and skips). Only the files the poison step recorded
       # creating are removed, by name, never `rm -rf ~/.qontinui`, so a home
       # that was NOT clean keeps whatever else it held.
-      # Hosted only, like the poison, and `always()` so a red test step still
-      # cleans up. It removes only the files `Poison ambient state` recorded
-      # creating -- never a file it found already there.
-      - name: Unpoison ambient state
+      # Both halves run `always()`, so a red test step still cleans up. The
+      # env half runs on every leg, like its poison; the file half is hosted
+      # only and removes only the files `Poison ambient state (files)`
+      # recorded creating -- never a file it found already there.
+      - name: Unpoison ambient state (files)
         if: always() && runner.environment == 'github-hosted'
         run: |
           set -u
@@ -1547,6 +1597,13 @@ jobs:
             done < "$CREATED"
             rm -f "$CREATED"
           fi
+          echo "poison files removed"
+        shell: bash
+
+      - name: Unpoison ambient state (env)
+        if: always()
+        run: |
+          set -u
           {
             echo "COORD_HTTP_URL="
             echo "QONTINUI_ROOT="
@@ -1733,7 +1790,7 @@ jobs:
         env:
           ROUTE_REASON: ${{ needs.route.outputs.clippy_windows_reason }}
         run: |
-          echo "::error title=ci-capacity (not a verdict on this PR)::${ROUTE_REASON}"
+          echo "::error title=CI CAPACITY (not a verdict on this PR)::${ROUTE_REASON}"
           exit 1
 
       - uses: actions/checkout@v5
