@@ -64,6 +64,12 @@ pub(crate) mod resource_sample;
 /// is `None` rather than a row of zeroes.
 pub(crate) mod socket_census;
 
+/// Per-slice cgroup v2 memory and PSI telemetry (plan
+/// `2026-10-19-ci-nodes-run-the-tauri-runner-always-on-as-ci-node-role`,
+/// Phase 0b). Consumed by [`resource_sample`]'s host lane; off Linux it reports
+/// `not_supported` rather than zeroes.
+pub(crate) mod slice_telemetry;
+
 /// §3.2 declared role. Mirrors `qontinui-coord::fleet::MachineRole`.
 /// The runner publishes itself as `Agent`; the supervisor publishes
 /// as `Build`. Dev workstations collapse both onto one machine_id
