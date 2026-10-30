@@ -184,4 +184,17 @@ describe("ResumeLiveDialog — UNKNOWN (D2)", () => {
     click(RESUME_LIVE_FORK_ID);
     expect(h.onFork).toHaveBeenCalledTimes(1);
   });
+
+  // Review W7: the explanation names only options the dialog offers.
+  it("mentions forking only when Fork is offered", () => {
+    mount(unknown);
+    expect(el(RESUME_LIVE_DIALOG_ID)!.textContent).toContain("fork it into a new conversation");
+    expect(el(RESUME_LIVE_FORK_ID)).not.toBeNull();
+
+    mount({ ...unknown, canFork: false });
+    const text = el(RESUME_LIVE_DIALOG_ID)!.textContent ?? "";
+    expect(el(RESUME_LIVE_FORK_ID)).toBeNull();
+    expect(text).toContain("Cancel and look for it first.");
+    expect(text).not.toMatch(/fork/i);
+  });
 });

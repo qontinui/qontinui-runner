@@ -5,7 +5,7 @@ import type { TranscriptSession } from "./useTranscriptSessions";
 import type { SessionState } from "./useZoneLayout";
 import type { ResourceGuardSource } from "@/lib/resourceGuard";
 import {
-  fetchLiveClaudeSessions,
+  fetchLiveClaudeHolders,
   liveSessionIdSet,
   type LiveClaudeSession,
 } from "./liveClaudeSessions";
@@ -20,6 +20,7 @@ import {
 } from "./resumeInNewTab";
 import {
   forkTabTitle,
+  runClaimedResume,
   runClickResume,
   type ClickResumeOptions,
   type ResumeGateChoice,
@@ -82,7 +83,10 @@ interface UseShellIntegrationParams {
    * (refused, no tab, unverified, or threw), so a click is never silent.
    */
   notify?: (message: string, type: "success" | "error") => void;
-  /** Injectable for tests: the liveness oracle (`fetchLiveClaudeSessions`). */
+  /**
+   * Injectable for tests: the liveness oracle — the gate's read
+   * (`fetchLiveClaudeHolders`, rows with their holding panes).
+   */
   readLiveSessions?: () => Promise<LiveClaudeSession[] | null>;
 }
 
@@ -112,7 +116,9 @@ export interface UseShellIntegrationResult {
   /**
    * The "Since restart" queue's resume — `resumeInNewTab` with its own pre-type
    * liveness refusal (live → `already-running`, unreadable →
-   * `liveness-unknown`), and no dialog: the queue reports each item.
+   * `liveness-unknown`), and no dialog: the queue reports each item. Held under
+   * the same in-flight claim as a click (`runClaimedResume`): an id a click or
+   * an earlier item is still resuming is refused as `in-flight`.
    */
   resumeTarget: (target: ResumeTarget, spawnSource?: ResourceGuardSource) => Promise<ResumeAttempt>;
   /** The open resume-live dialog, or `null`. Rendered by `ResumeGateHost`. */
@@ -223,7 +229,7 @@ export function useShellIntegration({
 
   const resumeTarget = useCallback(
     (target: ResumeTarget, spawnSource?: ResourceGuardSource): Promise<ResumeAttempt> =>
-      resumeInNewTab(newTabDeps(), target, spawnSource),
+      runClaimedResume(target, () => resumeInNewTab(newTabDeps(), target, spawnSource)),
     [newTabDeps],
   );
 
@@ -276,7 +282,7 @@ export function useShellIntegration({
       const say = opts.interactive === false ? undefined : notify;
       return runClickResume(
         {
-          readLive: readLiveSessions ?? fetchLiveClaudeSessions,
+          readLive: readLiveSessions ?? fetchLiveClaudeHolders,
           start: (t, mode) => {
             beforeStart?.();
             return startResume(t, mode);
@@ -287,6 +293,16 @@ export function useShellIntegration({
             if (notice) say?.(notice, "error");
           },
           onError: (err, t) => say?.(resumeThrownNotice(err, t.displayName), "error"),
+          // The click acknowledges itself at once: the liveness read can take
+          // a couple of seconds (a holder census), and a click that shows
+          // nothing invites the second click the in-flight claim refuses.
+          onChecking: (t) =>
+            say?.(`Resuming "${t.displayName}" — checking whether it is already open…`, "success"),
+          onInFlight: (t) =>
+            say?.(
+              `"${t.displayName}" is already being resumed in this window — wait for it, or finish its dialog`,
+              "error",
+            ),
         },
         target,
         opts,

@@ -7,7 +7,7 @@
  * a choice), the bulk tally and summary, and "go to the existing pane".
  */
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => ({})) }));
 vi.mock("@/lib/instance-storage", () => ({
@@ -24,13 +24,19 @@ import { liveSessionIdSet, type LiveClaudeSession } from "./liveClaudeSessions";
 import {
   bulkResumeSummary,
   canForkTarget,
+  claimResume,
+  clearResumesInFlight,
   conversationNameOf,
   decideClickResume,
   describeHolder,
   forkTabTitle,
   goToHolderPane,
+  isResumeInFlight,
+  outcomeOfFailedAttempt,
   paneHolderOf,
+  RESUME_IN_FLIGHT_GRACE_MS,
   runBulkResume,
+  runClaimedResume,
   runClickResume,
   runGatedRetry,
   withForkSession,
@@ -76,6 +82,9 @@ function deferred<T>() {
 }
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
+
+// The in-flight registry is module state: every test starts with none held.
+beforeEach(() => clearResumesInFlight());
 
 // ---------------------------------------------------------------------------
 
@@ -237,7 +246,7 @@ describe("runClickResume — the funnel", () => {
     expect(d.ask).not.toHaveBeenCalled();
   });
 
-  it("free but the attempt fails or throws: reports failed and says so", async () => {
+  it("free but the attempt fails or throws: reports refused / failed and says so", async () => {
     const onFailed = vi.fn();
     const failing = clickDeps([], {
       start: vi.fn(async () => ({
@@ -247,8 +256,21 @@ describe("runClickResume — the funnel", () => {
       })),
       onFailed,
     });
-    await expect(runClickResume(failing, target)).resolves.toBe("failed");
+    // No tab was opened: a refusal, not a failed resume.
+    await expect(runClickResume(failing, target)).resolves.toBe("refused");
     expect(onFailed.mock.calls[0][0]).toMatchObject({ failure: "not-created" });
+
+    const unverified = clickDeps([], {
+      start: vi.fn(async () => ({
+        kind: "failed" as const,
+        failure: "not-verified" as const,
+        tabId: "t-left",
+      })),
+    });
+    await expect(runClickResume(unverified, target)).resolves.toBe("failed");
+    // That attempt left a tab, so its id keeps the in-flight grace; the next
+    // case is a fresh click.
+    clearResumesInFlight();
 
     const onError = vi.fn();
     const throwing = clickDeps([], {
@@ -518,6 +540,198 @@ describe("bulk 'resume selected'", () => {
     expect(bulkResumeSummary(tally)?.message).toBe(
       "Resume selected — 1 resumed, 2 failed: item-0, item-1",
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("refusals at the pre-type re-read (review W1)", () => {
+  it.each<[string, string | null, ResumeOutcome]>([
+    ["already-running", null, "skipped-live"],
+    ["liveness-unknown", null, "skipped-unknown"],
+    ["in-flight", null, "skipped-live"],
+    ["invalid-session-id", null, "refused"],
+    ["needs-account", null, "refused"],
+    ["not-created", null, "refused"],
+    ["not-verified", "t", "failed"],
+    ["fork-unavailable", "t", "failed"],
+    ["fork-not-verified", "t", "failed"],
+  ])("%s (tab %s) → %s", (failure, tabId, outcome) => {
+    expect(
+      outcomeOfFailedAttempt({ kind: "failed", failure, tabId } as Extract<
+        ResumeAttempt,
+        { kind: "failed" }
+      >),
+    ).toBe(outcome);
+  });
+
+  it("the funnel reports a late live/unknown read as the gate would, and still says why", async () => {
+    for (const [failure, expected] of [
+      ["already-running", "skipped-live"],
+      ["liveness-unknown", "skipped-unknown"],
+    ] as const) {
+      const onFailed = vi.fn();
+      const d = clickDeps([], {
+        start: vi.fn(async () => ({ kind: "failed" as const, failure, tabId: null })),
+        onFailed,
+      });
+      await expect(runClickResume(d, target)).resolves.toBe(expected);
+      expect(onFailed).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("bulk waits its spacing only after an item that opened a tab", async () => {
+    // a: refused at the pre-type re-read (live by then); b: refused before a
+    // tab; c: resumed; d: failed in its tab; e: resumed.
+    const attempts: Record<string, ResumeAttempt> = {
+      a: { kind: "failed", failure: "already-running", tabId: null },
+      b: { kind: "failed", failure: "not-created", tabId: null },
+      c: { kind: "verified", tabId: "t-c" },
+      d: { kind: "failed", failure: "not-verified", tabId: "t-d" },
+      e: { kind: "verified", tabId: "t-e" },
+    };
+    const order: string[] = [];
+    const sleep = vi.fn(async () => {
+      order.push("sleep");
+    });
+    const tally = await runBulkResume(
+      Object.keys(attempts),
+      (id) => id,
+      (id) =>
+        runClickResume(
+          {
+            readLive: async () => [],
+            start: async () => {
+              order.push(id);
+              return attempts[id];
+            },
+            ask: vi.fn() as never,
+          },
+          { ...target, claudeSessionId: id },
+          { interactive: false },
+        ),
+      { sleep },
+    );
+    // No sleep after a or b (no tab); one after c and one after d.
+    expect(order).toEqual(["a", "b", "c", "sleep", "d", "sleep", "e"]);
+    expect(tally).toEqual({
+      resumed: ["c", "e"],
+      live: ["a"],
+      unknown: [],
+      failed: ["b", "d"],
+      cancelled: [],
+    });
+  });
+});
+
+describe("resumes in flight (review M3)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("a claim is exclusive until released, and a grace keeps it for that long", () => {
+    vi.useFakeTimers();
+    const first = claimResume(ID);
+    expect(first).not.toBeNull();
+    expect(claimResume(ID)).toBeNull();
+    expect(claimResume("another-id")).not.toBeNull();
+    first!.release(RESUME_IN_FLIGHT_GRACE_MS);
+    expect(isResumeInFlight(ID)).toBe(true);
+    vi.advanceTimersByTime(RESUME_IN_FLIGHT_GRACE_MS - 1);
+    expect(claimResume(ID)).toBeNull();
+    vi.advanceTimersByTime(1);
+    expect(isResumeInFlight(ID)).toBe(false);
+    const next = claimResume(ID);
+    expect(next).not.toBeNull();
+    // A release with no grace frees at once, and a second release is a no-op.
+    next!.release();
+    next!.release(RESUME_IN_FLIGHT_GRACE_MS);
+    expect(isResumeInFlight(ID)).toBe(false);
+  });
+
+  it("a stale grace timer never frees a NEWER claim", () => {
+    vi.useFakeTimers();
+    claimResume(ID)!.release(RESUME_IN_FLIGHT_GRACE_MS);
+    clearResumesInFlight(); // e.g. a test reset while the old timer is pending
+    const newer = claimResume(ID);
+    expect(newer).not.toBeNull();
+    vi.advanceTimersByTime(RESUME_IN_FLIGHT_GRACE_MS);
+    expect(isResumeInFlight(ID)).toBe(true);
+  });
+
+  it("two concurrent clicks on one free id start exactly one resume", async () => {
+    const live = deferred<LiveClaudeSession[] | null>();
+    const onInFlight = vi.fn();
+    const d = clickDeps([], { readLive: vi.fn(() => live.promise), onInFlight });
+    const first = runClickResume(d, target);
+    const second = runClickResume(d, target);
+    await expect(second).resolves.toBe("skipped-live");
+    expect(onInFlight).toHaveBeenCalledWith(target);
+    // The claim was taken before the FIRST liveness read: only one read.
+    expect(d.readLive).toHaveBeenCalledTimes(1);
+    live.resolve([]);
+    await expect(first).resolves.toBe("resumed");
+    expect(d.start).toHaveBeenCalledTimes(1);
+  });
+
+  it("the claim is held across the dialog, then kept for the grace only when a tab was opened", async () => {
+    const choice = deferred<ResumeGateChoice>();
+    const d = clickDeps([row()], { ask: vi.fn(() => choice.promise) });
+    const outcome = runClickResume(d, target);
+    await flush();
+    expect(isResumeInFlight(ID)).toBe(true);
+    await expect(runClickResume(clickDeps([]), target)).resolves.toBe("skipped-live");
+    choice.resolve("cancel");
+    await expect(outcome).resolves.toBe("cancelled");
+    expect(isResumeInFlight(ID), "a cancel opened nothing: no grace").toBe(false);
+
+    await expect(runClickResume(clickDeps([]), target)).resolves.toBe("resumed");
+    expect(isResumeInFlight(ID), "a resume that opened a tab keeps its grace").toBe(true);
+  });
+
+  it("an interactive click acknowledges itself before its read; a bulk item does not", async () => {
+    const order: string[] = [];
+    const deps = (): ClickResumeDeps => ({
+      ...clickDeps([]),
+      readLive: async () => {
+        order.push("read");
+        return [];
+      },
+      onChecking: () => order.push("checking"),
+    });
+    await runClickResume(deps(), target);
+    expect(order).toEqual(["checking", "read"]);
+    order.length = 0;
+    clearResumesInFlight();
+    await runClickResume(deps(), target, { interactive: false });
+    expect(order).toEqual(["read"]);
+  });
+
+  it("runClaimedResume refuses an id in flight as `in-flight` and starts nothing", async () => {
+    const held = claimResume(ID)!;
+    const start = vi.fn(async (): Promise<ResumeAttempt> => ({ kind: "verified", tabId: "t" }));
+    await expect(runClaimedResume(target, start)).resolves.toEqual({
+      kind: "failed",
+      failure: "in-flight",
+      tabId: null,
+    });
+    expect(start).not.toHaveBeenCalled();
+    held.release();
+    await expect(runClaimedResume(target, start)).resolves.toEqual({
+      kind: "verified",
+      tabId: "t",
+    });
+    expect(isResumeInFlight(ID), "a tab was opened: grace").toBe(true);
+    clearResumesInFlight();
+    const refused = vi.fn(
+      async (): Promise<ResumeAttempt> => ({
+        kind: "failed",
+        failure: "needs-account",
+        tabId: null,
+      }),
+    );
+    await runClaimedResume(target, refused);
+    expect(isResumeInFlight(ID), "no tab: released at once").toBe(false);
   });
 });
 

@@ -74,6 +74,7 @@ export type ResumeFailure =
   | "needs-account"
   | "already-running"
   | "liveness-unknown"
+  | "in-flight"
   | "not-created"
   | "not-verified"
   | "fork-unavailable"
@@ -94,6 +95,8 @@ export function describeResumeFailure(failure: ResumeFailure): string {
       return "already running in another window — a second resume would fork it";
     case "liveness-unknown":
       return "could not read which conversations are live — not resumed, it may already be open elsewhere";
+    case "in-flight":
+      return "a resume of it is already in progress in this window — a second one would fork it";
     case "not-created":
       return "no terminal was created (the resource guard refused or the spawn failed)";
     case "not-verified":
@@ -193,6 +196,12 @@ async function resumeAccountDirs(
  * D2): a click must never fall through to a resume that may fork. The only way
  * past either refusal is the dialog's explicit "Resume anyway"
  * (`options.allowLive`).
+ *
+ * This read cannot see a resume that is still STARTING: two calls for one id
+ * can both read it free before either new claude writes its registry file.
+ * Every operator door therefore holds the id's in-flight claim
+ * (`resumeGate.claimResume`) across this call — the click funnel
+ * (`runClickResume`) and the "Since restart" queue (`runClaimedResume`).
  */
 export async function resumeInNewTab(
   deps: ResumeInNewTabDeps,

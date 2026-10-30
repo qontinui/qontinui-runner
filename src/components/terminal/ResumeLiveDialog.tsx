@@ -77,10 +77,14 @@ export function ResumeLiveDialog({
     ? `"${label}" is already live — a claude process is writing it right now.`
     : `Resume "${label}"? The live-session registry could not be read, so it may already ` +
       "be open in another pane or window.";
+  // The UNKNOWN form names Fork only when the dialog offers it (`canFork`):
+  // the Retry and a non-Claude session have no fork button to point at.
   const explanation = live
     ? "Resuming it again would start a second claude on the same transcript and worktree."
-    : "Cancel and look for it first, or fork it into a new conversation, which never shares " +
-      "a transcript.";
+    : prompt.canFork
+      ? "Cancel and look for it first, or fork it into a new conversation, which never " +
+        "shares a transcript."
+      : "Cancel and look for it first.";
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">

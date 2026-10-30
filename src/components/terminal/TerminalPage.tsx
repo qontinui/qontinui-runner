@@ -10,7 +10,7 @@ import { SinceRestartStrip } from "./SinceRestartStrip";
 import type { PastSession } from "./usePastSessions";
 import { pastSessionResumeTarget, retryResumeArgs } from "./resumeInNewTab";
 import { runGatedRetry } from "./resumeGate";
-import { fetchLiveClaudeSessions } from "./liveClaudeSessions";
+import { fetchLiveClaudeHolders } from "./liveClaudeSessions";
 import { ResumeGateHost } from "./ResumeGateHost";
 import { requestTerminalView } from "./sinceRestart";
 import { ZoneGrid } from "./ZoneGrid";
@@ -1089,8 +1089,13 @@ function TerminalPageInner({
       // unreadable registry its UNKNOWN form; nothing is typed before a choice.
       void runGatedRetry(
         {
-          readLive: fetchLiveClaudeSessions,
+          readLive: fetchLiveClaudeHolders,
           ask: askResumeGate,
+          onInFlight: () =>
+            setNotification({
+              message: `"${tab.title}" is already being resumed in this window — wait for it`,
+              type: "error",
+            }),
           retry: () => {
             updateTab(tabId, { resumeFailed: false, isReconnecting: true });
             return runVerifiedResume({
@@ -1105,7 +1110,7 @@ function TerminalPageInner({
       );
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [updateTab, pageId, askResumeGate],
+    [updateTab, pageId, askResumeGate, setNotification],
   );
 
   // Dismiss the informational "fresh conversation" (terminal-only) restore note

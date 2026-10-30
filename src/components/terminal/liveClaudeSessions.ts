@@ -70,7 +70,9 @@ export interface LiveClaudeSession {
    * NEVER "not live".** The row is live by the registry's own pid check; only
    * the pane is unknown. The runner omits the key for a process outside every
    * pane, for one under two panes, and for one whose pane root failed the
-   * PID-reuse guard — and a runner binary predating the field omits it always.
+   * PID-reuse guard; it omits it on every row of a read made without
+   * `withHolders` ({@link fetchLiveClaudeSessions}); and a runner binary
+   * predating the field omits it always.
    */
   terminalId?: string;
   /** The grid page of {@link terminalId}. Absent on the same terms. */
@@ -94,28 +96,76 @@ function normalizeHolderFields(row: LiveClaudeSession): LiveClaudeSession {
 }
 
 /**
- * STRICT payload extraction: the command's `data` must be a bare array or an
- * object whose `sessions` key is an array — anything else returns `null`
- * ("shape not understood"), never `[]`.
- *
- * The liveness oracle (`fetchLiveClaudeSessions`) depends on this polarity:
- * a misshapen payload (e.g. `{}` after a Rust-side rename) that degraded to
- * `[]` would read as "definitively no live sessions" and let the restore path
- * respawn — fork — every session. Display callers who want the tolerant
- * degrade use [`extractLiveSessions`].
- *
- * Each row carries its holding pane (`terminalId` / `pageId`) when the runner
- * sent one; a malformed pane key is dropped (pane unknown), the row is kept.
+ * A registry entry the runner could not read, in a place that may hold a LIVE
+ * session (Rust `claude_session_registry::UnreadableRegistryEntry`): a
+ * `<pid>.json` whose stem pid is live but whose bytes did not read or parse
+ * (`pid` set), or a `sessions` directory that could not be listed (`pid`
+ * null).
  */
-export function extractLiveSessionsStrict(data: unknown): LiveClaudeSession[] | null {
+export interface UnreadableRegistryEntry {
+  pid: number | null;
+  configDir: string;
+}
+
+/**
+ * The payload's rows and its `unreadable` list, or `null` when the shape is
+ * not understood. `unreadable` is `[]` for a bare-array payload and for a
+ * runner build that predates the key (which fails open per file, as it always
+ * did); a PRESENT `unreadable` that is not an array is a shape not understood.
+ */
+function parseLivePayload(
+  data: unknown,
+): { rows: LiveClaudeSession[]; unreadable: UnreadableRegistryEntry[] } | null {
   let rows: unknown[] | null = null;
+  let unreadable: unknown = [];
   if (Array.isArray(data)) rows = data;
   else if (data && typeof data === "object") {
     const inner = (data as { sessions?: unknown }).sessions;
     if (Array.isArray(inner)) rows = inner;
+    const bad = (data as { unreadable?: unknown }).unreadable;
+    if (bad !== undefined) unreadable = bad;
   }
-  if (rows === null) return null;
-  return (rows as LiveClaudeSession[]).map(normalizeHolderFields);
+  if (rows === null || !Array.isArray(unreadable)) return null;
+  return {
+    rows: (rows as LiveClaudeSession[]).map(normalizeHolderFields),
+    unreadable: unreadable as UnreadableRegistryEntry[],
+  };
+}
+
+/**
+ * The `unreadable` entries of a live-session payload — `[]` when there are
+ * none (or the shape is not understood; [`extractLiveSessionsStrict`] is the
+ * verdict on that).
+ */
+export function unreadableRegistryEntries(data: unknown): UnreadableRegistryEntry[] {
+  return parseLivePayload(data)?.unreadable ?? [];
+}
+
+/**
+ * STRICT payload extraction: the command's `data` must be a bare array or an
+ * object whose `sessions` key is an array, AND the runner must have read every
+ * registry entry that could hold a live session — anything else returns
+ * `null` (indeterminate), never `[]`.
+ *
+ * The liveness oracle (`fetchLiveClaudeSessions`) depends on this polarity:
+ * - a misshapen payload (e.g. `{}` after a Rust-side rename) that degraded to
+ *   `[]` would read as "definitively no live sessions" and let the restore
+ *   path respawn — fork — every session;
+ * - a non-empty `unreadable` means a LIVE process's registry file could not be
+ *   read, so the rows may be missing exactly the conversation being gated.
+ *   Reading the rest as complete would answer "not live" for it, and the click
+ *   would resume a second writer (plan
+ *   `2026-10-27-click-resume-forks-a-live-conversation-and-pane-titles-hide-its-identity`
+ *   D2).
+ *
+ * Display callers who want the tolerant degrade use [`extractLiveSessions`].
+ * Each row carries its holding pane (`terminalId` / `pageId`) when the runner
+ * sent one; a malformed pane key is dropped (pane unknown), the row is kept.
+ */
+export function extractLiveSessionsStrict(data: unknown): LiveClaudeSession[] | null {
+  const parsed = parseLivePayload(data);
+  if (parsed === null || parsed.unreadable.length > 0) return null;
+  return parsed.rows;
 }
 
 /**
@@ -124,12 +174,14 @@ export function extractLiveSessionsStrict(data: unknown): LiveClaudeSession[] | 
  * The command wraps its payload as `{ sessions: [...] }`; a bare array is
  * accepted too. Anything else degrades to `[]` — callers iterate this during
  * render, so a shape surprise must never throw. (Same contract, and the same
- * hard-won reason, as `usePastSessions.extractSessions`.) DISPLAY-only:
- * liveness decisions must use [`extractLiveSessionsStrict`], where an
- * unrecognized shape is indeterminate, not empty.
+ * hard-won reason, as `usePastSessions.extractSessions`.) DISPLAY-only: the
+ * rows the runner DID read are returned even when `unreadable` is non-empty,
+ * because one unreadable file must not blank every name. Liveness decisions
+ * must use [`extractLiveSessionsStrict`], where an unrecognized shape or an
+ * incomplete read is indeterminate, not empty.
  */
 export function extractLiveSessions(data: unknown): LiveClaudeSession[] {
-  return extractLiveSessionsStrict(data) ?? [];
+  return parseLivePayload(data)?.rows ?? [];
 }
 
 /**
@@ -243,27 +295,45 @@ export function liveSessionIdSet(sessions: readonly unknown[]): Set<string> {
   return ids;
 }
 
+/** How {@link fetchLiveClaudeSessions} reads the registry. */
+export interface LiveSessionReadOptions {
+  /**
+   * Ask the runner to attribute each row to the pane that holds it
+   * (`terminalId` / `pageId`). It costs a holder census (up to 2 s) on top of
+   * the process snapshot, so only the click gate passes `true` — it needs the
+   * pane for "go to the existing pane". Liveness alone (the id projection, the
+   * restore paths) passes `false`.
+   */
+  withHolders: boolean;
+}
+
 /**
  * Read every LIVE Claude Code registry row, via
  * `terminal_claude_session_list_live` (each entry is PID-verified against the
  * live process table on the Rust side —
- * `session::claude_session_registry::read_live_sessions` — and carries the
- * runner pane that holds it when there is one).
+ * `session::claude_session_registry::read_live_sessions_reporting` — and,
+ * with `withHolders`, carries the runner pane that holds it when there is
+ * one).
  *
  * THE liveness oracle. [`fetchLiveClaudeSessionIds`] is its id projection;
- * the click-resume gate (`resumeGate.ts`) reads the rows themselves, because
- * "go to the existing pane" needs the holder's `terminalId` / `pageId`.
+ * the click-resume gate (`resumeGate.ts`) reads the rows themselves through
+ * [`fetchLiveClaudeHolders`], because "go to the existing pane" needs the
+ * holder's `terminalId` / `pageId`.
  *
  * Returns `null` when the registry could not be read (invoke failed,
- * unsuccessful response, missing payload, or a payload shape not understood).
- * Callers MUST treat `null` as indeterminate — never as "nothing alive". A
- * missing tab is recoverable; a duplicate live session corrupts the
- * transcript.
+ * unsuccessful response, missing payload, a payload shape not understood, or
+ * a live process's registry file the runner could not read). Callers MUST
+ * treat `null` as indeterminate — never as "nothing alive". A missing tab is
+ * recoverable; a duplicate live session corrupts the transcript.
  */
-export async function fetchLiveClaudeSessions(): Promise<LiveClaudeSession[] | null> {
+export async function fetchLiveClaudeSessions(
+  opts: LiveSessionReadOptions,
+): Promise<LiveClaudeSession[] | null> {
   let resp: CommandResponse;
   try {
-    resp = await invoke<CommandResponse>("terminal_claude_session_list_live");
+    resp = await invoke<CommandResponse>("terminal_claude_session_list_live", {
+      withHolders: opts.withHolders,
+    });
   } catch (err) {
     console.warn("[liveClaudeSessions] terminal_claude_session_list_live failed:", err);
     return null;
@@ -271,14 +341,18 @@ export async function fetchLiveClaudeSessions(): Promise<LiveClaudeSession[] | n
   // `data` is always present on a successful response; its absence means we
   // did not understand the payload — indeterminate, not empty.
   if (!resp?.success || resp.data == null) return null;
-  // Strict shape check: a payload that is neither an array nor `{sessions:
-  // [...]}` (renamed key, `{}`, version skew) is INDETERMINATE — flowing it
-  // through the tolerant extractor would yield [] = "definitively empty" and
-  // green-light respawning everything.
+  // Strict check: a payload that is neither an array nor `{sessions: [...]}`
+  // (renamed key, `{}`, version skew), or one naming a live registry file the
+  // runner could not read, is INDETERMINATE — flowing it through the tolerant
+  // extractor would yield "definitively not live" and green-light a fork.
   const sessions = extractLiveSessionsStrict(resp.data);
   if (sessions === null) {
+    const unreadable = unreadableRegistryEntries(resp.data);
     console.warn(
-      "[liveClaudeSessions] terminal_claude_session_list_live returned an unrecognized payload shape — treating liveness as indeterminate",
+      unreadable.length > 0
+        ? `[liveClaudeSessions] terminal_claude_session_list_live could not read ${unreadable.length} registry entr${unreadable.length === 1 ? "y" : "ies"} that may hold a live session — treating liveness as indeterminate`
+        : "[liveClaudeSessions] terminal_claude_session_list_live returned an unrecognized payload shape — treating liveness as indeterminate",
+      unreadable,
     );
     return null;
   }
@@ -286,9 +360,17 @@ export async function fetchLiveClaudeSessions(): Promise<LiveClaudeSession[] | n
 }
 
 /**
+ * The click gate's read: every live row WITH the pane that holds it — the
+ * {@link fetchLiveClaudeSessions} oracle with `withHolders: true`.
+ */
+export function fetchLiveClaudeHolders(): Promise<LiveClaudeSession[] | null> {
+  return fetchLiveClaudeSessions({ withHolders: true });
+}
+
+/**
  * Read the set of session ids that some LIVE Claude Code process is already
  * hosting — the id projection of [`fetchLiveClaudeSessions`], so there is ONE
- * oracle.
+ * oracle. It needs liveness, not panes, so it skips the holder census.
  *
  * The restore path consults this BEFORE typing `claude --resume <id>` for a
  * cold-restored record: an id in this set is already alive, and resuming it
@@ -300,6 +382,6 @@ export async function fetchLiveClaudeSessions(): Promise<LiveClaudeSession[] | n
  * as "nothing alive".
  */
 export async function fetchLiveClaudeSessionIds(): Promise<ReadonlySet<string> | null> {
-  const sessions = await fetchLiveClaudeSessions();
+  const sessions = await fetchLiveClaudeSessions({ withHolders: false });
   return sessions === null ? null : liveSessionIdSet(sessions);
 }

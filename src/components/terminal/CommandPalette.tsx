@@ -6,6 +6,7 @@ import type { SessionState, ZoneAssignments } from "./useZoneLayout";
 import type { TerminalTab } from "./useTerminalManager";
 import { fuzzyScore } from "./commands/fuzzy";
 import { useDisplayTitleResolver } from "./displayTitle";
+import { zoneDirTag } from "./zoneDirTag";
 import {
   getAll as getRegistrySnapshot,
   getRegistryPaletteActions,
@@ -324,22 +325,10 @@ export function CommandPalette({
           const tab = tabs.find((t) => t.id === tabId);
           if (!tab) continue;
 
-          const title = tab.title;
-          let dir = title;
-
-          // Try to extract path and get last segment
-          const pathMatch = title.match(/[/\\]([^/\\]+)\s*$/);
-          if (pathMatch) {
-            dir = pathMatch[1];
-          } else {
-            // Try after colon
-            const colonMatch = title.match(/:\s*(.+)/);
-            if (colonMatch) {
-              const afterColon = colonMatch[1].trim();
-              const lastSeg = afterColon.match(/[/\\]([^/\\]+)\s*$/);
-              dir = lastSeg ? lastSeg[1] : afterColon;
-            }
-          }
+          // The tab's working directory, not its title: the title no longer
+          // follows the shell's cwd (see `zoneDirTag`).
+          const dir = zoneDirTag(tab);
+          if (!dir) continue;
 
           // Get current tags and add directory tag if not present
           const currentLabel = zoneLabels[cz] ?? "";

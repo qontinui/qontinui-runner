@@ -6,7 +6,7 @@
  * On 2026-10-27 a UI Resume click on a conversation that a live claude already
  * held in another pane typed `claude --resume <id>` into a new pane. Two
  * processes then wrote one transcript and edited one worktree. Every operator
- * resume now reads the liveness oracle (`fetchLiveClaudeSessions`) FIRST and
+ * resume now reads the liveness oracle (`fetchLiveClaudeHolders`) FIRST and
  * acts on one of three answers:
  *
  * - `free` — no live process holds the id: resume as before.
@@ -81,12 +81,26 @@ export function paneHolderOf(holders: readonly LiveClaudeSession[]): LiveClaudeS
  * - `skipped-unknown` — not resumed because liveness could not be read
  *   (non-interactive callers only; a click asks instead).
  * - `cancelled` — the operator cancelled the dialog.
- * - `failed` — a resume was attempted and did not come back (refused before a
- *   tab, no tab created, or the handshake did not verify). Not in the plan's
- *   four-value list: without it a failed attempt would have to be counted as
- *   `resumed`, and the bulk summary would claim a resume that did not happen.
+ * - `refused` — a resume was attempted and refused before any tab was opened
+ *   (an unsafe id, an account that cannot be typed, or no tab was created).
+ *   Nothing was typed.
+ * - `failed` — a resume opened a tab and did not come back (the handshake did
+ *   not verify, the fork could not be typed), or it threw.
+ *
+ * `refused` and `failed` are not in the plan's four-value list: without them
+ * a failed attempt would have to be counted as `resumed`, and the bulk summary
+ * would claim a resume that did not happen. They are told apart because only
+ * a `failed` attempt left a tab behind: bulk waits its spawn spacing after
+ * that, never after a refusal. A refusal of the pre-type liveness re-read is
+ * not either: it reports `skipped-live` / `skipped-unknown`, like the gate.
  */
-export type ResumeOutcome = "resumed" | "skipped-live" | "skipped-unknown" | "cancelled" | "failed";
+export type ResumeOutcome =
+  | "resumed"
+  | "skipped-live"
+  | "skipped-unknown"
+  | "cancelled"
+  | "refused"
+  | "failed";
 
 /** The operator's answer to the resume-live dialog. */
 export type ResumeGateChoice = "go-to-pane" | "fork" | "resume-anyway" | "cancel";
@@ -198,13 +212,96 @@ export function withForkSession(resumeCmd: string, claudeSessionId: string): str
 }
 
 // ---------------------------------------------------------------------------
+// Resumes in flight
+// ---------------------------------------------------------------------------
+
+/**
+ * How long a conversation stays "in flight" after a resume left a tab behind.
+ * Claude Code writes its registry file (`<config>/sessions/<pid>.json`) only
+ * once the new process is up, so for a few seconds after a verified resume the
+ * liveness oracle can still read the id as free — and a second click in that
+ * window would start a second writer.
+ */
+export const RESUME_IN_FLIGHT_GRACE_MS = 5_000;
+
+/**
+ * The conversations a resume is in flight for, in THIS window (module scope:
+ * one per webview). A resume claims its id BEFORE its first liveness read and
+ * holds it until it resolves, plus {@link RESUME_IN_FLIGHT_GRACE_MS} when it
+ * opened a tab. Two quick clicks on one free conversation would otherwise both
+ * read "free" and both type `--resume`.
+ */
+const resumesInFlight = new Map<string, object>();
+
+/** A held claim on one conversation id ({@link claimResume}). */
+export interface ResumeClaim {
+  /** Release the claim, after `graceMs` (default 0). Idempotent. */
+  release: (graceMs?: number) => void;
+}
+
+/**
+ * Claim `claudeSessionId` for one resume in this window, or `null` when a
+ * resume of it is already in flight (or inside its grace). A release only
+ * ever drops its OWN claim, so a late grace timer cannot free a newer one.
+ */
+export function claimResume(claudeSessionId: string): ResumeClaim | null {
+  if (resumesInFlight.has(claudeSessionId)) return null;
+  const token = {};
+  resumesInFlight.set(claudeSessionId, token);
+  const drop = () => {
+    if (resumesInFlight.get(claudeSessionId) === token) resumesInFlight.delete(claudeSessionId);
+  };
+  let released = false;
+  return {
+    release: (graceMs = 0) => {
+      if (released) return;
+      released = true;
+      if (graceMs > 0) setTimeout(drop, graceMs);
+      else drop();
+    },
+  };
+}
+
+/** Is a resume of `claudeSessionId` in flight (or in its grace) in this window? */
+export function isResumeInFlight(claudeSessionId: string): boolean {
+  return resumesInFlight.has(claudeSessionId);
+}
+
+/** Forget every claim. Tests only: the registry is module state. */
+export function clearResumesInFlight(): void {
+  resumesInFlight.clear();
+}
+
+/**
+ * Run one resume `start` under a claim on `target`'s id — the "Since restart"
+ * queue's door (`useShellIntegration().resumeTarget`), which types through
+ * `resumeInNewTab` without the click funnel. A second resume of an id already
+ * in flight is refused as `in-flight` and starts nothing.
+ */
+export async function runClaimedResume(
+  target: Pick<ResumeTarget, "claudeSessionId">,
+  start: () => Promise<ResumeAttempt>,
+): Promise<ResumeAttempt> {
+  const claim = claimResume(target.claudeSessionId);
+  if (claim === null) return { kind: "failed", failure: "in-flight", tabId: null };
+  let result: ResumeAttempt | undefined;
+  try {
+    result = await start();
+    return result;
+  } finally {
+    // A throw leaves it unknown whether a tab was opened: keep the grace.
+    claim.release(result !== undefined && result.tabId === null ? 0 : RESUME_IN_FLIGHT_GRACE_MS);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // The click funnel
 // ---------------------------------------------------------------------------
 
 type FailedAttempt = Extract<ResumeAttempt, { kind: "failed" }>;
 
 export interface ClickResumeDeps {
-  /** The liveness oracle (`fetchLiveClaudeSessions`): rows, or `null` when unreadable. */
+  /** The liveness oracle (`fetchLiveClaudeHolders`): rows, or `null` when unreadable. */
   readLive: () => Promise<LiveClaudeSession[] | null>;
   /** Open the tab and type the resume (`startResume` in `useShellIntegration`). */
   start: (target: ResumeTarget, mode: StartResumeMode) => Promise<ResumeAttempt>;
@@ -214,6 +311,13 @@ export interface ClickResumeDeps {
   onFailed?: (attempt: FailedAttempt, target: ResumeTarget) => void;
   /** An attempt that THREW. */
   onError?: (err: unknown, target: ResumeTarget) => void;
+  /**
+   * The immediate acknowledgement of an interactive click: liveness is being
+   * read. Called before the first read, so a slow read is never a dead click.
+   */
+  onChecking?: (target: ResumeTarget) => void;
+  /** The click was refused because a resume of the same id is already in flight. */
+  onInFlight?: (target: ResumeTarget) => void;
 }
 
 export interface ClickResumeOptions {
@@ -226,27 +330,58 @@ export interface ClickResumeOptions {
   conversationName?: string | null;
 }
 
+/**
+ * What a failed {@link ResumeAttempt} comes to. A refusal of the pre-type
+ * liveness re-read is the gate's own answer, read late (`already-running` →
+ * `skipped-live`, `liveness-unknown` → `skipped-unknown`), as is a resume of
+ * an id already in flight; any other failure is `refused` when no tab was
+ * opened and `failed` when one was.
+ */
+export function outcomeOfFailedAttempt(a: FailedAttempt): ResumeOutcome {
+  switch (a.failure) {
+    case "already-running":
+    case "in-flight":
+      return "skipped-live";
+    case "liveness-unknown":
+      return "skipped-unknown";
+    default:
+      return a.tabId === null ? "refused" : "failed";
+  }
+}
+
+/** One started attempt: its outcome, and whether it may have left a tab behind. */
+interface AttemptResult {
+  outcome: ResumeOutcome;
+  /** A tab was opened — or the start threw, and nobody knows. */
+  openedTab: boolean;
+}
+
 async function attempt(
   deps: Pick<ClickResumeDeps, "start" | "onFailed" | "onError">,
   target: ResumeTarget,
   mode: StartResumeMode,
-): Promise<ResumeOutcome> {
+): Promise<AttemptResult> {
   let result: ResumeAttempt;
   try {
     result = await deps.start(target, mode);
   } catch (err: unknown) {
     deps.onError?.(err, target);
-    return "failed";
+    return { outcome: "failed", openedTab: true };
   }
-  if (result.kind === "verified") return "resumed";
+  if (result.kind === "verified") return { outcome: "resumed", openedTab: true };
   deps.onFailed?.(result, target);
-  return "failed";
+  return { outcome: outcomeOfFailedAttempt(result), openedTab: result.tabId !== null };
 }
 
 /**
  * THE operator resume funnel: read liveness, then resume, ask, or skip. Every
  * click-resume (Session Manager, transcript panel, Previous Sessions, the
  * keyboard shortcut) and the bulk "resume selected" end here.
+ *
+ * The id is claimed ({@link claimResume}) BEFORE the first liveness read and
+ * held until the resume resolves, plus {@link RESUME_IN_FLIGHT_GRACE_MS} when
+ * it opened a tab. A second request for an id in flight starts nothing and
+ * reports `skipped-live` (`onInFlight` says why).
  */
 export async function runClickResume(
   deps: ClickResumeDeps,
@@ -254,39 +389,53 @@ export async function runClickResume(
   opts: ClickResumeOptions = {},
 ): Promise<ResumeOutcome> {
   const interactive = opts.interactive !== false;
-  const decision = decideClickResume(await deps.readLive(), target.claudeSessionId);
-  if (decision.kind === "free") {
-    return attempt(deps, target, { fork: false, allowLive: false });
+  const claim = claimResume(target.claudeSessionId);
+  if (claim === null) {
+    deps.onInFlight?.(target);
+    return "skipped-live";
   }
-  if (!interactive) return decision.kind === "live" ? "skipped-live" : "skipped-unknown";
+  const started: { openedTab: boolean } = { openedTab: false };
+  const run = async (mode: StartResumeMode): Promise<ResumeOutcome> => {
+    const r = await attempt(deps, target, mode);
+    started.openedTab = r.openedTab;
+    return r.outcome;
+  };
+  try {
+    if (interactive) deps.onChecking?.(target);
+    const decision = decideClickResume(await deps.readLive(), target.claudeSessionId);
+    if (decision.kind === "free") return await run({ fork: false, allowLive: false });
+    if (!interactive) return decision.kind === "live" ? "skipped-live" : "skipped-unknown";
 
-  const holders = decision.kind === "live" ? decision.holders : [];
-  const conversationName = conversationNameOf(holders, opts.conversationName);
-  const canFork = canForkTarget(target);
-  const choice = await deps.ask({
-    kind: decision.kind,
-    claudeSessionId: target.claudeSessionId,
-    conversationName,
-    holders,
-    canFork,
-  });
-  switch (choice) {
-    case "go-to-pane":
-      // The dialog host navigated to the holder. Nothing was resumed, because
-      // the conversation is already live there.
-      return decision.kind === "live" && paneHolderOf(holders) ? "skipped-live" : "cancelled";
-    case "fork":
-      if (!canFork) return "cancelled";
-      return attempt(deps, target, {
-        fork: true,
-        allowLive: true,
-        forkTitle: forkTabTitle(conversationName, target.claudeSessionId),
-      });
-    case "resume-anyway":
-      return attempt(deps, target, { fork: false, allowLive: true });
-    case "cancel":
-    default:
-      return "cancelled";
+    const holders = decision.kind === "live" ? decision.holders : [];
+    const conversationName = conversationNameOf(holders, opts.conversationName);
+    const canFork = canForkTarget(target);
+    const choice = await deps.ask({
+      kind: decision.kind,
+      claudeSessionId: target.claudeSessionId,
+      conversationName,
+      holders,
+      canFork,
+    });
+    switch (choice) {
+      case "go-to-pane":
+        // The dialog host navigated to the holder. Nothing was resumed,
+        // because the conversation is already live there.
+        return decision.kind === "live" && paneHolderOf(holders) ? "skipped-live" : "cancelled";
+      case "fork":
+        if (!canFork) return "cancelled";
+        return await run({
+          fork: true,
+          allowLive: true,
+          forkTitle: forkTabTitle(conversationName, target.claudeSessionId),
+        });
+      case "resume-anyway":
+        return await run({ fork: false, allowLive: true });
+      case "cancel":
+      default:
+        return "cancelled";
+    }
+  } finally {
+    claim.release(started.openedTab ? RESUME_IN_FLIGHT_GRACE_MS : 0);
   }
 }
 
@@ -295,10 +444,13 @@ export async function runClickResume(
 // ---------------------------------------------------------------------------
 
 export interface RetryGateDeps {
+  /** The gate's read WITH holding panes (`fetchLiveClaudeHolders`). */
   readLive: () => Promise<LiveClaudeSession[] | null>;
   ask: (prompt: ResumeGatePrompt) => Promise<ResumeGateChoice>;
   /** Re-run the verified type-and-check into the tab (`runVerifiedResume`). */
   retry: () => Promise<"verified" | "failed">;
+  /** The Retry was refused because a resume of the same id is already in flight. */
+  onInFlight?: () => void;
 }
 
 /**
@@ -308,30 +460,46 @@ export interface RetryGateDeps {
  * `runVerifiedResume`'s pane probe verifies it without typing — so it is left
  * out of the decision. Fork is not offered: the tab is bound to this id, and
  * its restore record waits on this id's handshake.
+ *
+ * Held under the same in-flight claim as a click ({@link claimResume}), so a
+ * Retry and a click on one conversation cannot both type `--resume` while its
+ * registry file is still being written.
  */
 export async function runGatedRetry(
   deps: RetryGateDeps,
   args: { tabId: string; claudeSessionId: string; conversationName?: string | null },
 ): Promise<ResumeOutcome> {
-  const rows = await deps.readLive();
-  const others = rows === null ? null : rows.filter((r) => r?.terminalId !== args.tabId);
-  const decision = decideClickResume(others, args.claudeSessionId);
-  const run = async (): Promise<ResumeOutcome> =>
-    (await deps.retry()) === "verified" ? "resumed" : "failed";
-  if (decision.kind === "free") return run();
-  const holders = decision.kind === "live" ? decision.holders : [];
-  const choice = await deps.ask({
-    kind: decision.kind,
-    claudeSessionId: args.claudeSessionId,
-    conversationName: conversationNameOf(holders, args.conversationName),
-    holders,
-    canFork: false,
-  });
-  if (choice === "resume-anyway") return run();
-  if (choice === "go-to-pane" && decision.kind === "live" && paneHolderOf(holders)) {
+  const claim = claimResume(args.claudeSessionId);
+  if (claim === null) {
+    deps.onInFlight?.();
     return "skipped-live";
   }
-  return "cancelled";
+  const typed: { into: boolean } = { into: false };
+  const run = async (): Promise<ResumeOutcome> => {
+    typed.into = true;
+    return (await deps.retry()) === "verified" ? "resumed" : "failed";
+  };
+  try {
+    const rows = await deps.readLive();
+    const others = rows === null ? null : rows.filter((r) => r?.terminalId !== args.tabId);
+    const decision = decideClickResume(others, args.claudeSessionId);
+    if (decision.kind === "free") return await run();
+    const holders = decision.kind === "live" ? decision.holders : [];
+    const choice = await deps.ask({
+      kind: decision.kind,
+      claudeSessionId: args.claudeSessionId,
+      conversationName: conversationNameOf(holders, args.conversationName),
+      holders,
+      canFork: false,
+    });
+    if (choice === "resume-anyway") return await run();
+    if (choice === "go-to-pane" && decision.kind === "live" && paneHolderOf(holders)) {
+      return "skipped-live";
+    }
+    return "cancelled";
+  } finally {
+    claim.release(typed.into ? RESUME_IN_FLIGHT_GRACE_MS : 0);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -354,7 +522,9 @@ export const BULK_RESUME_SPACING_MS = 500;
  * what each came to under its label. The funnel's per-item liveness read is
  * the pre-type re-read the spacing needs: an id that went live while an
  * earlier item was resuming is skipped, not forked. The spacing is waited only
- * after an item that tried to spawn.
+ * after an item that opened a tab (`resumed` / `failed`) — never after a skip
+ * or a refusal, which left no tab to initialize. A `refused` item is tallied
+ * under `failed`: both are resumes that did not happen.
  */
 export async function runBulkResume<T>(
   items: readonly T[],
@@ -389,11 +559,13 @@ export async function runBulkResume<T>(
       case "cancelled":
         tally.cancelled.push(label);
         break;
+      case "refused":
       case "failed":
       default:
         tally.failed.push(label);
         break;
     }
+    // Only an outcome that left a tab behind (a throw counts: it is `failed`).
     spawned = outcome === "resumed" || outcome === "failed";
   }
   return tally;
