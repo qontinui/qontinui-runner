@@ -46,8 +46,9 @@
 
 use super::parser::{parse_work_unit, slug_from_filename, ParsedWorkUnit, PlanConvention};
 use super::push::{
-    push_archive_metadata, push_work_unit, push_work_unit_with_remote,
-    push_work_unit_with_status_write, PushOutcomeKind, SetDepsOutcome, StatusWrite, WorkUnitSink,
+    push_archive_metadata, push_archive_metadata_without_claim, push_work_unit,
+    push_work_unit_with_remote, push_work_unit_with_status_write, PushOutcomeKind, SetDepsOutcome,
+    StatusWrite, WorkUnitSink,
 };
 use super::ref_scan::CycleRefPin;
 use crate::auth::TenantScope;
@@ -2096,10 +2097,11 @@ pub fn read_plans_for_cycle(
 /// The flag exists because an empty (or short) `units` is otherwise
 /// indistinguishable between *"the directory holds nothing"* and *"the
 /// directory could not be read"* — the `silent-empty-is-unknown` shape. Every
-/// consumer that reasons about ABSENCE (today: the disappeared-slug detector,
-/// [`newly_disappeared_slugs`]) must gate on `complete`; a consumer that only
-/// reasons about what it FOUND (the reconcile, the archive stamp) may ignore it,
-/// because a short scan pushes less rather than concluding more.
+/// consumer that reasons about ABSENCE (the disappeared-slug detector,
+/// [`newly_disappeared_slugs`], and the archive stamp's delivery claim,
+/// [`active_claim_holders`]) must gate on `complete`; a consumer that only
+/// reasons about what it FOUND (the reconcile) may ignore it, because a short
+/// scan pushes less rather than concluding more.
 ///
 /// Produced by BOTH scan sources: [`scan_plan_dir`] for a working tree, and
 /// [`read_plans_for_cycle`]'s ref arm, whose per-blob skip
@@ -3371,6 +3373,23 @@ pub struct ArchiveSummary {
     pub errors: u64,
 }
 
+/// The slugs whose delivery claim belongs to the active directory, or `None` when
+/// the active scan was incomplete and so cannot say which slugs those are. A
+/// dangling link counts: the plan is still there by name, and it was not read.
+fn active_claim_holders(
+    units: &[ParsedWorkUnit],
+    scan_complete: bool,
+    dangling_link_slugs: &[String],
+) -> Option<HashSet<String>> {
+    scan_complete.then(|| {
+        units
+            .iter()
+            .map(|u| u.slug.clone())
+            .chain(dangling_link_slugs.iter().cloned())
+            .collect()
+    })
+}
+
 /// Metadata-only reconcile of the **archive** directory (D4). For every plan
 /// found in the archive dir, stamp `metadata.archive_path` provenance via
 /// [`push_archive_metadata`] — **never** a status transition. Pure of IO beyond
@@ -3381,8 +3400,13 @@ pub struct ArchiveSummary {
 /// so re-stamping each cycle is harmless (and re-asserts provenance a coord
 /// restart might have missed). It records nothing into `last_applied`, so it can
 /// never influence the active-dir transition path.
+///
+/// `active_claims` is [`active_claim_holders`]: a slug it holds keeps the active
+/// copy's delivery claim, and `None` withholds every archived claim for this
+/// cycle, see [`push_archive_metadata_without_claim`].
 pub async fn reconcile_archive_once<S: WorkUnitSink + ?Sized>(
     archived_units: &[ParsedWorkUnit],
+    active_claims: Option<&HashSet<String>>,
     sink: &S,
     metrics: &AdapterMetrics,
     scope: TenantScope,
@@ -3392,7 +3416,12 @@ pub async fn reconcile_archive_once<S: WorkUnitSink + ?Sized>(
         ..Default::default()
     };
     for u in archived_units {
-        match push_archive_metadata(sink, u, scope).await {
+        let stamped = if active_claims.is_some_and(|slugs| !slugs.contains(&u.slug)) {
+            push_archive_metadata(sink, u, scope).await
+        } else {
+            push_archive_metadata_without_claim(sink, u, scope).await
+        };
+        match stamped {
             Ok(()) => {
                 summary.stamped += 1;
                 metrics
@@ -4360,7 +4389,16 @@ impl LoopState {
                 Some(a) => crate::repo_tenant::tenant_scope_for_path(a).await,
                 None => TenantScope::Unresolved,
             };
-            let asum = reconcile_archive_once(&archived, sink, metrics, archive_scope).await;
+            let active_claims =
+                active_claim_holders(&units, active_scan_complete, &active_dangling);
+            let asum = reconcile_archive_once(
+                &archived,
+                active_claims.as_ref(),
+                sink,
+                metrics,
+                archive_scope,
+            )
+            .await;
             tracing::info!(
                 scanned = asum.scanned,
                 stamped = asum.stamped,
@@ -10872,6 +10910,7 @@ Body.
             depends_on,
             area: None,
             area_rejected: None,
+            pr_refs: vec![],
             phases: vec![],
             source_path: format!("plans/{slug}.md"),
             content: String::new(),
@@ -13066,8 +13105,14 @@ Body.
 
         let sink = FakeSink::default();
         let metrics = AdapterMetrics::default();
-        let summary =
-            reconcile_archive_once(&scanned, &sink, &metrics, TenantScope::Unresolved).await;
+        let summary = reconcile_archive_once(
+            &scanned,
+            Some(&HashSet::new()),
+            &sink,
+            &metrics,
+            TenantScope::Unresolved,
+        )
+        .await;
 
         // ZERO transitions from ANY archive-scanned entry — the only D4 guard,
         // since coord will not reject either `shipped` or `archived` here.
@@ -13163,6 +13208,107 @@ Body.
         );
     }
 
+    /// The archive stamps a tick sent, by slug.
+    fn archive_patches(sink: &FakeSink) -> HashMap<String, serde_json::Value> {
+        sink.upserts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|u| {
+                let patch = u.metadata_patch.as_ref()?;
+                patch.get("archive_path")?;
+                Some((u.slug.clone(), patch.clone()))
+            })
+            .collect()
+    }
+
+    /// A slug in both directories keeps the ACTIVE copy's delivery claim: the
+    /// archive pass runs second, so a stale archived SHIPPED would otherwise
+    /// overwrite it every cycle. Provenance is still stamped, and an archive-only
+    /// slug still carries its claim. Mutation proof: pass `Some(&HashSet::new())`
+    /// at the tick's `reconcile_archive_once` and the `both` asserts fail.
+    #[tokio::test]
+    async fn a_tick_keeps_the_active_copys_claim_over_a_stale_archive_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("2026-01-01-both.md"),
+            "# Both\n\n> **Status: IN PROGRESS**\n\nBody.\n",
+        )
+        .unwrap();
+        let archive = tempfile::tempdir().unwrap();
+        std::fs::write(
+            archive.path().join("2026-01-01-both.md"),
+            "# Both\n\n> **Status: SHIPPED** qontinui-web#7\n\nBody.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            archive.path().join("2025-01-01-only.md"),
+            "# Only\n\n> **Status: SHIPPED** qontinui-web#8\n\nBody.\n",
+        )
+        .unwrap();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = PathInputs {
+            plans_archive_dir: Some(archive.path().to_string_lossy().to_string()),
+            ..plans_dir_input(dir.path())
+        };
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = tick_state(reader).with_binding_count(1, Some(1));
+        state.tick(&sink, &metrics).await;
+
+        let patches = archive_patches(&sink);
+        let both = &patches["2026-01-01-both"];
+        assert!(both.get("file_status").is_none(), "{both}");
+        assert!(both.get("file_pr_refs").is_none(), "{both}");
+        assert!(both["archive_path"].is_string(), "{both}");
+        let only = &patches["2025-01-01-only"];
+        assert_eq!(only["file_status"], serde_json::json!("shipped"));
+        assert_eq!(
+            only["file_pr_refs"],
+            serde_json::json!([{"repo": "qontinui-web", "pr_number": 8}])
+        );
+    }
+
+    /// An incomplete active scan cannot say an archived slug is archive-only: the
+    /// active copy may be the file it failed to read. So every archived claim is
+    /// withheld for that cycle. Mutation proof: pass `true` for `scan_complete` at
+    /// the tick and the `file_status` assert fails.
+    #[tokio::test]
+    async fn an_incomplete_active_scan_withholds_every_archived_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("2026-01-01-both.md"), [0xff, 0xfe, 0xfd]).unwrap();
+        let archive = tempfile::tempdir().unwrap();
+        std::fs::write(
+            archive.path().join("2026-01-01-both.md"),
+            "# Both\n\n> **Status: SHIPPED** qontinui-web#7\n\nBody.\n",
+        )
+        .unwrap();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = PathInputs {
+            plans_archive_dir: Some(archive.path().to_string_lossy().to_string()),
+            ..plans_dir_input(dir.path())
+        };
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = tick_state(reader).with_binding_count(1, Some(1));
+        state.tick(&sink, &metrics).await;
+
+        let patches = archive_patches(&sink);
+        let both = &patches["2026-01-01-both"];
+        assert!(both.get("file_status").is_none(), "{both}");
+        assert!(both.get("file_pr_refs").is_none(), "{both}");
+        assert!(both["archive_path"].is_string(), "{both}");
+    }
+
+    /// A dangling link is a plan still there by name, so its slug holds the claim.
+    #[test]
+    fn a_dangling_link_holds_the_active_claim() {
+        let holders =
+            active_claim_holders(&[unit("a", "draft")], true, &["b".to_string()]).unwrap();
+        assert!(holders.contains("a") && holders.contains("b"));
+        assert!(active_claim_holders(&[unit("a", "draft")], false, &[]).is_none());
+    }
+
     /// A missing/unset archive dir yields an empty scan (no writes) — the same
     /// unset semantics as the active dir.
     #[tokio::test]
@@ -13172,8 +13318,14 @@ Body.
         assert!(scanned.is_empty());
         let sink = FakeSink::default();
         let metrics = AdapterMetrics::default();
-        let summary =
-            reconcile_archive_once(&scanned, &sink, &metrics, TenantScope::Unresolved).await;
+        let summary = reconcile_archive_once(
+            &scanned,
+            Some(&HashSet::new()),
+            &sink,
+            &metrics,
+            TenantScope::Unresolved,
+        )
+        .await;
         assert_eq!(summary.scanned, 0);
         assert_eq!(summary.stamped, 0);
         assert!(sink.upserts.lock().unwrap().is_empty());
