@@ -851,6 +851,11 @@ impl TerminalManager {
 
     /// Remove and close a terminal session.
     pub fn close(&self, id: &str) -> Result<(), String> {
+        // The whole close the operator waits for: the tree kill (its own
+        // `terminal_close.kill` span, inside `PaneIo::kill`), the joins and the
+        // writer/master release (plan
+        // `2026-10-19-served-corpus-probe-budget-excludes-process-creation`).
+        let _span = tracing::debug_span!("terminal_close", terminal_id = %id).entered();
         let session = {
             let mut sessions = self
                 .sessions
@@ -1090,13 +1095,22 @@ impl TerminalManager {
     /// child process tree still dies (that is the part whose omission would
     /// leak processes), while the thread joins and the shim-dir sweep are
     /// skipped. The imminent `process::exit` reclaims the rest.
-    pub fn close_all(&self, deadline: std::time::Instant) {
+    ///
+    /// Returns whether the teardown was COMPLETE: `true` when every terminal
+    /// got its full close (none fell to the kill-only fallback), or there was
+    /// none to close; `false` when any was degraded, or the sessions lock was
+    /// poisoned and nothing was closed. `run_teardown` stamps the shutdown
+    /// marker `teardown_complete` only on `true` (plan
+    /// `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
+    /// Phase 3).
+    #[must_use = "the result says whether the teardown finished; the shutdown marker records it"]
+    pub fn close_all(&self, deadline: std::time::Instant) -> bool {
         let sessions: Vec<Arc<TerminalSession>> = {
             match self.sessions.lock() {
                 Ok(mut s) => s.drain().map(|(_, v)| v).collect(),
                 Err(e) => {
                     error!("Sessions lock poisoned during close_all: {}", e);
-                    return;
+                    return false;
                 }
             }
         };
@@ -1108,7 +1122,7 @@ impl TerminalManager {
         }
 
         if sessions.is_empty() {
-            return;
+            return true;
         }
 
         info!("Closing {} terminal session(s)", sessions.len());
@@ -1130,6 +1144,7 @@ impl TerminalManager {
             );
         }
         info!("All terminal sessions closed");
+        degraded == 0
     }
 
     /// Get a reference to the output interceptor (for adding hooks).
@@ -1292,6 +1307,7 @@ mod tests {
                     remote_terminal_id: "490212f5-aaaa-bbbb-cccc-dddddddddddd".into(),
                     grant_jti: "jti-1".into(),
                     history_available: false,
+                    tenant: None,
                 },
             );
             let sink: Arc<dyn RemoteFrameSink> = Arc::new(RecordingSink::default());
@@ -1334,9 +1350,49 @@ mod tests {
 
         let tm = TerminalManager::new();
         seed(&tm, "close-all-tab");
-        tm.close_all(std::time::Instant::now());
+        let _ = tm.close_all(std::time::Instant::now());
         assert!(tm.remote_identity("close-all-tab").is_none());
         assert!(tm.remote_pane("close-all-tab").is_none());
+    }
+
+    /// `close_all` reports whether the teardown FINISHED, which `run_teardown`
+    /// records as the shutdown marker's `teardown_complete` (plan
+    /// `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
+    /// Phase 3): no terminal → complete; every terminal closed before the
+    /// deadline → complete; one reached after it (kill-only) → NOT complete.
+    #[test]
+    fn close_all_reports_degraded_teardown() {
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        let session = || {
+            Arc::new(crate::terminal::session::tests::make_test_session(
+                Arc::new(Mutex::new(Vec::new())),
+            ))
+        };
+
+        let empty = TerminalManager::new();
+        assert!(
+            empty.close_all(Instant::now()),
+            "nothing to close is a complete teardown"
+        );
+
+        let in_budget = TerminalManager::new();
+        in_budget.insert_for_test("term-a", session());
+        in_budget.insert_for_test("term-b", session());
+        assert!(
+            in_budget.close_all(Instant::now() + Duration::from_secs(600)),
+            "every terminal closed inside the budget"
+        );
+        assert_eq!(in_budget.count_checked(), Some(0));
+
+        let exhausted = TerminalManager::new();
+        exhausted.insert_for_test("term-a", session());
+        exhausted.insert_for_test("term-b", session());
+        assert!(
+            !exhausted.close_all(Instant::now()),
+            "a kill-only fallback is a degraded teardown"
+        );
+        assert_eq!(exhausted.count_checked(), Some(0));
     }
 
     fn account_with(projects: serde_json::Value) -> tempfile::TempDir {

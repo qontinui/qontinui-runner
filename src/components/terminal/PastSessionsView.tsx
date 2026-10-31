@@ -1,4 +1,4 @@
-import { useMemo, useState, useCallback } from "react";
+import { useEffect, useMemo, useState, useCallback } from "react";
 import { TerminalSquare, Copy, Check, RefreshCw, Layers, AlertTriangle } from "lucide-react";
 import { usePastSessions, type PastSession } from "./usePastSessions";
 import {
@@ -6,6 +6,10 @@ import {
   useLiveClaudeSessionNames,
 } from "./useLiveClaudeSessionNames";
 import { instanceStorage } from "@/lib/instance-storage";
+import { SinceRestartSection } from "./SinceRestartSection";
+import { useSinceRestart } from "./SinceRestartContext";
+import { finishButtonModel, pastSessionFinishId, type FinishOp } from "./sinceRestart";
+import { useFinishOps } from "./useFinishOps";
 
 /**
  * Max cards rendered per cohort before a "Show N more" expander. A single crash
@@ -60,8 +64,7 @@ export const PAST_SESSIONS_SHOW_FINISHED_ID = "terminal.past-sessions-show-finis
  * make `element/<id>/action` ambiguous, which is the collision the hand-written
  * ids in this file exist to prevent.
  */
-export const PAST_SESSIONS_EMPTY_SHOW_FINISHED_ID =
-  "terminal.past-sessions-empty-show-finished";
+export const PAST_SESSIONS_EMPTY_SHOW_FINISHED_ID = "terminal.past-sessions-empty-show-finished";
 
 /**
  * `instanceStorage` key for the show-finished preference.
@@ -70,6 +73,11 @@ export const PAST_SESSIONS_EMPTY_SHOW_FINISHED_ID =
  * box must not share a view preference.
  */
 const SHOW_FINISHED_KEY = "terminal.past-sessions.show-finished";
+
+/** Why a card shows no resume line (`resumeCommand === null`). */
+const NO_RESUME_LINE_TITLE =
+  "No resume line: the session's account (or working directory) is unknown, " +
+  'and a resume under a guessed account fails as "No conversation found"';
 
 /** Stable control id for one card's "Copy command" button. */
 export function pastSessionCopyId(claudeSessionId: string): string {
@@ -142,11 +150,30 @@ export function pastSessionsCohortToggleId(cohortId: number): string {
   return `terminal.past-sessions-cohort-toggle-${cohortId}`;
 }
 
+/**
+ * Why a card's Resume is unavailable, or `null` when it can resume. A resume
+ * needs the conversation on disk, a KNOWN account (one under the default would
+ * fail as "No conversation found") and the directory it was launched in.
+ * Pure + exported for tests.
+ */
+export function pastSessionResumeBlocker(
+  session: Pick<PastSession, "transcriptExists" | "restorable" | "resumeAccount" | "resumeDir">,
+): string | null {
+  if (!session.transcriptExists || !session.restorable) {
+    return "Transcript no longer on disk — use Copy command instead";
+  }
+  if (!session.resumeAccount.known) {
+    return "Account unknown — a resume under the default account would fail as 'No conversation found'";
+  }
+  if (!session.resumeDir) return "No working directory was recorded for this session";
+  return null;
+}
+
 interface PastSessionsViewProps {
   /**
-   * Resume a past session by id — wired to the real terminal resume path in
-   * `TerminalPage` (creates a tab and queues `claude --resume <id>` with the
-   * session's config dir). Undefined ⇒ Resume falls back to copying the
+   * Resume a past session — wired in `TerminalPage` to THE resume path
+   * (`resumeInNewTab`: a new tab with a verified `--resume` under the
+   * session's resolved account). Undefined ⇒ Resume falls back to copying the
    * command.
    */
   onResumePastSession?: (session: PastSession) => void;
@@ -287,20 +314,31 @@ function PastSessionCard({
   session,
   registryNames,
   onResumePastSession,
+  finishOp,
+  onSetFinished,
 }: {
   session: PastSession;
   /** Live window names by session id — see {@link pastSessionDisplayName}. */
   registryNames: ReadonlyMap<string, string>;
   onResumePastSession?: (session: PastSession) => void;
+  /** This session's Finish/Unfinish in flight (or last failed), if any. */
+  finishOp: FinishOp | undefined;
+  onSetFinished: (claudeSessionId: string, finished: boolean) => void;
 }) {
   const [copied, setCopied] = useState(false);
-  const resumable = session.transcriptExists && session.restorable;
+  const resumeBlocker = pastSessionResumeBlocker(session);
+  const resumable = resumeBlocker === null;
+  const finishModel = finishButtonModel(session.finished === true, finishOp);
 
+  // `null` = the account (or the working dir) is unknown, so there is no line
+  // to copy — a guessed one would resume under the wrong account.
+  const resumeCommand = session.resumeCommand;
   const handleCopy = useCallback(() => {
-    navigator.clipboard.writeText(session.resumeCommand).catch(() => {});
+    if (resumeCommand === null) return;
+    navigator.clipboard.writeText(resumeCommand).catch(() => {});
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
-  }, [session.resumeCommand]);
+  }, [resumeCommand]);
 
   const handleResume = useCallback(() => {
     if (onResumePastSession && resumable) {
@@ -308,11 +346,9 @@ function PastSessionCard({
     } else {
       // No real resume path, or transcript gone: copy the command so the
       // operator can still resume it by hand.
-      navigator.clipboard.writeText(session.resumeCommand).catch(() => {});
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      handleCopy();
     }
-  }, [onResumePastSession, resumable, session]);
+  }, [onResumePastSession, resumable, session, handleCopy]);
 
   const closed = session.state === "closed";
   const displayName = pastSessionDisplayName(session, registryNames);
@@ -380,16 +416,22 @@ function PastSessionCard({
       {/* Row 3: resume command (mono, copyable reference) */}
       <div
         className="mt-1 ml-3.5 text-[10px] text-[#565f89] font-mono truncate leading-tight"
-        title={session.resumeCommand}
+        title={resumeCommand ?? NO_RESUME_LINE_TITLE}
       >
-        {session.resumeCommand}
+        {resumeCommand ?? "account unknown — no resume line"}
       </div>
 
-      {/* Row 4: transcript-gone honesty note */}
-      {!resumable && (
+      {/* Row 4: why Resume is unavailable — never silent */}
+      {resumeBlocker && (
         <div className="mt-0.5 ml-3.5 flex items-center gap-1 text-[9px] text-[#e0af68]/80">
           <AlertTriangle className="w-2.5 h-2.5 shrink-0" />
-          <span>transcript gone — copy only</span>
+          <span>
+            {session.transcriptExists && session.restorable
+              ? session.resumeAccount.known
+                ? "working directory unknown — copy only"
+                : "account unknown — resume refused"
+              : "transcript gone — copy only"}
+          </span>
         </div>
       )}
 
@@ -398,8 +440,17 @@ function PastSessionCard({
         <button
           data-ui-bridge-id={pastSessionCopyId(session.claudeSessionId)}
           onClick={handleCopy}
-          className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium bg-[#7aa2f7]/15 text-[#7aa2f7] hover:bg-[#7aa2f7]/25 transition-colors"
-          title="Copy the resume command to the clipboard"
+          disabled={resumeCommand === null}
+          className={`flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium transition-colors ${
+            resumeCommand === null
+              ? "bg-[#414868]/20 text-[#414868] cursor-not-allowed"
+              : "bg-[#7aa2f7]/15 text-[#7aa2f7] hover:bg-[#7aa2f7]/25"
+          }`}
+          title={
+            resumeCommand === null
+              ? NO_RESUME_LINE_TITLE
+              : "Copy the resume command to the clipboard"
+          }
         >
           {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
           {copied ? "Copied!" : "Copy command"}
@@ -413,14 +464,19 @@ function PastSessionCard({
               ? "bg-[#9ece6a]/15 text-[#9ece6a] hover:bg-[#9ece6a]/25"
               : "bg-[#414868]/20 text-[#414868] cursor-not-allowed"
           }`}
-          title={
-            resumable
-              ? "Resume this session in a new terminal tab"
-              : "Transcript no longer on disk — use Copy command instead"
-          }
+          title={resumeBlocker ?? "Resume this session in a new terminal tab"}
         >
           <TerminalSquare className="w-3 h-3" />
           Resume
+        </button>
+        <button
+          data-ui-bridge-id={pastSessionFinishId(session.claudeSessionId)}
+          onClick={() => onSetFinished(session.claudeSessionId, finishModel.target)}
+          disabled={finishModel.disabled}
+          className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium transition-colors bg-[#414868]/30 text-[#a9b1d6] hover:bg-[#414868]/50 disabled:opacity-50"
+          title={finishModel.title}
+        >
+          {finishModel.label}
         </button>
       </div>
     </div>
@@ -435,6 +491,20 @@ function PastSessionCard({
  */
 export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps) {
   const { sessions, loading, error, refresh: refreshSessions } = usePastSessions();
+  // The "Since restart" roster (null outside a `SinceRestartProvider`).
+  const roster = useSinceRestart();
+  const refreshRoster = roster?.refresh;
+  // Finish/Unfinish on a card re-reads both this list and the roster.
+  const onFinishSettled = useCallback(() => {
+    refreshSessions();
+    refreshRoster?.();
+  }, [refreshSessions, refreshRoster]);
+  const { ops: finishOps, setFinished } = useFinishOps(onFinishSettled);
+  // …and a Finish/Unfinish made in the roster section re-reads this list.
+  const finishEpoch = roster?.finishEpoch ?? 0;
+  useEffect(() => {
+    if (finishEpoch > 0) refreshSessions();
+  }, [finishEpoch, refreshSessions]);
   // Live window names, for the subset of these rows whose process is still
   // running. Closed rows are always a miss and keep their `resumeName`.
   const registryNames = useLiveClaudeSessionNames();
@@ -455,10 +525,7 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
     });
   }, []);
 
-  const finishedCount = useMemo(
-    () => sessions.filter((s) => s.finished).length,
-    [sessions],
-  );
+  const finishedCount = useMemo(() => sessions.filter((s) => s.finished).length, [sessions]);
   const visibleSessions = useMemo(
     () => (showFinished ? sessions : sessions.filter((s) => !s.finished)),
     [sessions, showFinished],
@@ -528,6 +595,9 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
 
       {/* Body */}
       <div className="flex-1 overflow-y-auto scrollbar-dark">
+        {/* "Before the last restart" / the pre-rebuild preview — first, so
+            the strip's Review lands on it. */}
+        <SinceRestartSection />
         {loading && sessions.length === 0 ? (
           <div className="flex items-center justify-center py-8 text-[#565f89] text-xs">
             <div className="w-3 h-3 border-2 border-[#565f89] border-t-transparent rounded-full animate-spin mr-2" />
@@ -598,6 +668,8 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
                     session={session}
                     registryNames={registryNames}
                     onResumePastSession={onResumePastSession}
+                    finishOp={finishOps.get(session.claudeSessionId)}
+                    onSetFinished={setFinished}
                   />
                 ))}
 
