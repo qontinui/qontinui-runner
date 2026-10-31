@@ -2907,6 +2907,9 @@ mod tests {
                 spawn_device_default: None,
                 adopted_from: None,
                 last_session_start_at: None,
+                gate_id: None,
+                gate_consuming_device_id: None,
+                gate_bound_boot_ms: None,
             },
         );
         assert!(store.get("s1").unwrap().wind_down_outcome.is_none());
