@@ -354,11 +354,12 @@ jobs:
       #   4.   nothing LISTENS on 127.0.0.1:9876 (a live runner there mints
       #        device JWTs on demand, with no file). Probed with a bash
       #        `/dev/tcp` connect, which needs no curl and no proxy and
-      #        cannot be fooled by a slow `/health`: a connect that succeeds,
-      #        or hangs past 5 s (a listener with a full backlog), refuses;
-      #        only "Connection refused" passes. Where `/dev/tcp` is
-      #        unavailable it falls back to curl with no proxy and refuses
-      #        unless curl exits 7 (could not connect).
+      #        cannot be fooled by a slow `/health`: a connect that succeeds
+      #        refuses, and "Connection refused" passes. Where `/dev/tcp` is
+      #        unavailable, or its connect runs past 5 s (a full backlog, or
+      #        a loaded Windows host retrying the SYN), it falls back to curl
+      #        with no proxy and refuses unless curl exits 7 (could not
+      #        connect). The success line names which probe decided.
       # It does not check other ports, a credential under another account or
       # path, or environment the runner service passes in -- coord's
       # ci_route NOT_SERVED lists those. The title carries coord's generic
@@ -394,21 +395,24 @@ jobs:
           # `shell: bash` runs with -e, so the rc is caught, never fatal.
           probe_rc=0
           probe_err="$("${probe[@]}" 2>&1)" || probe_rc=$?
+          # One line: a newline would end the ::error annotation early.
+          probe_err="${probe_err//$'\n'/ }"
           if [ "$probe_rc" -eq 0 ]; then
             refuse "something listens on 127.0.0.1:9876 (a local runner mints device JWTs there)."
-          elif [ "$probe_rc" -eq 124 ]; then
-            refuse "a connect to 127.0.0.1:9876 hung for 5 s: a listener with a full backlog holds the port."
-          elif printf '%s' "$probe_err" | grep -qi 'connection refused'; then
-            :
+          elif [ "$probe_rc" -ne 124 ] && printf '%s' "$probe_err" | grep -qi 'connection refused'; then
+            probe_by="dev-tcp"
           else
-            # No usable /dev/tcp here: curl, with no proxy, refusing unless it
-            # could not connect at all (exit 7).
-            command -v curl >/dev/null 2>&1 || refuse "neither /dev/tcp ($probe_err) nor curl is available, so whether anything listens on 127.0.0.1:9876 is UNKNOWN."
+            # No usable /dev/tcp here, or its connect ran past 5 s (a full
+            # backlog, or a loaded Windows host retrying a refused SYN):
+            # curl, with no proxy, refusing unless it could not connect at
+            # all (exit 7). A hung listener is exit 28, so it still refuses.
+            command -v curl >/dev/null 2>&1 || refuse "neither /dev/tcp (rc $probe_rc: $probe_err) nor curl is available, so whether anything listens on 127.0.0.1:9876 is UNKNOWN."
             curl_rc=0
             curl -s -o /dev/null --noproxy '*' --connect-timeout 2 --max-time 5 http://127.0.0.1:9876/health || curl_rc=$?
             [ "$curl_rc" -eq 7 ] || refuse "curl to 127.0.0.1:9876 exited $curl_rc (7 = nothing listening); a listener may be there."
+            probe_by="curl rc=7"
           fi
-          echo "isolated: no coord-device-jwt, machine.json or profiles.json under ${homes[*]}, and nothing listens on 127.0.0.1:9876"
+          echo "isolated: no coord-device-jwt, machine.json or profiles.json under ${homes[*]}, and nothing listens on 127.0.0.1:9876 (probe: $probe_by)"
 
       # A rerouted self-hosted leg (route review H1): the runner's build and
       # tests resolve the operator's config and secure-storage dirs, and a test
@@ -1850,11 +1854,12 @@ jobs:
       #   4.   nothing LISTENS on 127.0.0.1:9876 (a live runner there mints
       #        device JWTs on demand, with no file). Probed with a bash
       #        `/dev/tcp` connect, which needs no curl and no proxy and
-      #        cannot be fooled by a slow `/health`: a connect that succeeds,
-      #        or hangs past 5 s (a listener with a full backlog), refuses;
-      #        only "Connection refused" passes. Where `/dev/tcp` is
-      #        unavailable it falls back to curl with no proxy and refuses
-      #        unless curl exits 7 (could not connect).
+      #        cannot be fooled by a slow `/health`: a connect that succeeds
+      #        refuses, and "Connection refused" passes. Where `/dev/tcp` is
+      #        unavailable, or its connect runs past 5 s (a full backlog, or
+      #        a loaded Windows host retrying the SYN), it falls back to curl
+      #        with no proxy and refuses unless curl exits 7 (could not
+      #        connect). The success line names which probe decided.
       # It does not check other ports, a credential under another account or
       # path, or environment the runner service passes in -- coord's
       # ci_route NOT_SERVED lists those. The title carries coord's generic
@@ -1890,21 +1895,24 @@ jobs:
           # `shell: bash` runs with -e, so the rc is caught, never fatal.
           probe_rc=0
           probe_err="$("${probe[@]}" 2>&1)" || probe_rc=$?
+          # One line: a newline would end the ::error annotation early.
+          probe_err="${probe_err//$'\n'/ }"
           if [ "$probe_rc" -eq 0 ]; then
             refuse "something listens on 127.0.0.1:9876 (a local runner mints device JWTs there)."
-          elif [ "$probe_rc" -eq 124 ]; then
-            refuse "a connect to 127.0.0.1:9876 hung for 5 s: a listener with a full backlog holds the port."
-          elif printf '%s' "$probe_err" | grep -qi 'connection refused'; then
-            :
+          elif [ "$probe_rc" -ne 124 ] && printf '%s' "$probe_err" | grep -qi 'connection refused'; then
+            probe_by="dev-tcp"
           else
-            # No usable /dev/tcp here: curl, with no proxy, refusing unless it
-            # could not connect at all (exit 7).
-            command -v curl >/dev/null 2>&1 || refuse "neither /dev/tcp ($probe_err) nor curl is available, so whether anything listens on 127.0.0.1:9876 is UNKNOWN."
+            # No usable /dev/tcp here, or its connect ran past 5 s (a full
+            # backlog, or a loaded Windows host retrying a refused SYN):
+            # curl, with no proxy, refusing unless it could not connect at
+            # all (exit 7). A hung listener is exit 28, so it still refuses.
+            command -v curl >/dev/null 2>&1 || refuse "neither /dev/tcp (rc $probe_rc: $probe_err) nor curl is available, so whether anything listens on 127.0.0.1:9876 is UNKNOWN."
             curl_rc=0
             curl -s -o /dev/null --noproxy '*' --connect-timeout 2 --max-time 5 http://127.0.0.1:9876/health || curl_rc=$?
             [ "$curl_rc" -eq 7 ] || refuse "curl to 127.0.0.1:9876 exited $curl_rc (7 = nothing listening); a listener may be there."
+            probe_by="curl rc=7"
           fi
-          echo "isolated: no coord-device-jwt, machine.json or profiles.json under ${homes[*]}, and nothing listens on 127.0.0.1:9876"
+          echo "isolated: no coord-device-jwt, machine.json or profiles.json under ${homes[*]}, and nothing listens on 127.0.0.1:9876 (probe: $probe_by)"
 
       # A rerouted self-hosted leg (route review H1): the runner's build and
       # tests resolve the operator's config and secure-storage dirs, and a test

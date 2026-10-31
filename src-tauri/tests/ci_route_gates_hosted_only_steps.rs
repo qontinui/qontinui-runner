@@ -470,8 +470,13 @@ fn a_self_hosted_leg_refuses_a_host_that_is_not_isolated_right_after_checkout() 
             // isolated case) must not abort the step with no annotation.
             "probe_err=\"$(\"${probe[@]}\" 2>&1)\" || probe_rc=$?",
             "\"$probe_rc\" -eq 0",
-            "\"$probe_rc\" -eq 124",
+            // A connect that ran past 5 s falls through to curl (round 5,
+            // L1): only a prompt "Connection refused" passes on /dev/tcp.
+            "\"$probe_rc\" -ne 124 ] && printf",
             "connection refused",
+            // One-line annotation, and the success line names the probe.
+            "probe_err=\"${probe_err//$'\\n'/ }\"",
+            "(probe: $probe_by)",
             // The fallback: no proxy, and only exit 7 (nothing listening)
             // passes.
             "--noproxy '*' --connect-timeout 2 --max-time 5 http://127.0.0.1:9876/health",
@@ -531,4 +536,148 @@ fn a_self_hosted_leg_sandboxes_the_config_dirs_before_the_rust_build() {
         assert!(run.contains(var), "{var}");
     }
     assert!(pos("Sandbox the runner config dirs (self-hosted)") < pos("Build Rust tests"));
+}
+
+/// Run the refusal step's own `run:` block, as `shell: bash` does
+/// (`bash -eo pipefail`), with `:9876` swapped for `port`, a temporary HOME,
+/// and `fake_bash_dir` (if any) first on PATH so the probe's inner `bash`
+/// can be made to lack `/dev/tcp` or to hang. Returns (exit code, stdout).
+#[cfg(unix)]
+fn run_refusal(
+    script: &str,
+    port: u16,
+    home: &std::path::Path,
+    fake_bash_dir: Option<&std::path::Path>,
+) -> (i32, String) {
+    // The OUTER bash is resolved before PATH changes, so only the probe's
+    // inner `bash -c` meets the fake.
+    let real_path = std::env::var("PATH").unwrap_or_default();
+    let bash = std::env::split_paths(&real_path)
+        .map(|d| d.join("bash"))
+        .find(|b| b.is_file())
+        .expect("bash on PATH");
+    let path = match fake_bash_dir {
+        Some(d) => format!("{}:{real_path}", d.display()),
+        None => real_path,
+    };
+    let script = script.replace("9876", &port.to_string());
+    let out = std::process::Command::new(bash)
+        .args(["--noprofile", "--norc", "-eo", "pipefail", "-c", &script])
+        .env("HOME", home)
+        .env("RUNNER_OS", "Linux")
+        .env("PATH", path)
+        .env_remove("http_proxy")
+        .env_remove("HTTP_PROXY")
+        .output()
+        .expect("run the refusal step");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+#[cfg(unix)]
+fn on_path(tool: &str) -> bool {
+    let p = std::env::var("PATH").unwrap_or_default();
+    std::env::split_paths(&p).any(|d| d.join(tool).is_file())
+}
+
+#[cfg(unix)]
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .expect("bind an ephemeral port")
+}
+
+#[cfg(unix)]
+fn fake_bash(dir: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let f = dir.join("bash");
+    std::fs::write(&f, format!("#!/bin/sh\n{body}\n")).expect("write fake bash");
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+}
+
+/// The isolation probe EXECUTED, not just read (round 5, L3): every arm of
+/// the refusal step behaves as its comment says, under `shell: bash`'s -e.
+#[cfg(unix)]
+#[test]
+fn the_isolation_refusal_step_behaves_as_documented_when_run() {
+    let doc = ci_workflow();
+    let have_curl = on_path("curl");
+    let have_timeout = on_path("timeout");
+    for (i, name) in ROUTED.iter().enumerate() {
+        let s = steps(job(&doc, name));
+        let step = s
+            .iter()
+            .find(|x| step_key(x) == REFUSE_STEP)
+            .unwrap_or_else(|| panic!("job `{name}` has no refusal step"));
+        let script = str_of(step, "run");
+        let home = tempfile::tempdir().expect("temp HOME");
+
+        // 1. Nothing listens: passes on the /dev/tcp arm.
+        let port = free_port();
+        let (rc, out) = run_refusal(script, port, home.path(), None);
+        assert_eq!(rc, 0, "job `{name}`, nothing listening: {out}");
+        assert!(out.contains("(probe: dev-tcp)"), "job `{name}`: {out}");
+
+        // 2. A listener: refused, with the no-verdict title.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let lport = l.local_addr().expect("addr").port();
+        let (rc, out) = run_refusal(script, lport, home.path(), None);
+        assert_eq!(rc, 1, "job `{name}`, a listener: {out}");
+        assert!(out.contains(HOST_NOT_ISOLATED_TITLE), "job `{name}`: {out}");
+        assert!(out.contains("something listens"), "job `{name}`: {out}");
+
+        // 3. A credential file in HOME: refused.
+        let q = home.path().join(".qontinui");
+        std::fs::create_dir_all(&q).expect("mkdir");
+        std::fs::write(q.join("machine.json"), "{}").expect("write");
+        let (rc, out) = run_refusal(script, port, home.path(), None);
+        assert_eq!(rc, 1, "job `{name}`, machine.json present: {out}");
+        assert!(out.contains("machine.json exists"), "job `{name}`: {out}");
+        std::fs::remove_file(q.join("machine.json")).expect("rm");
+
+        // 4. No /dev/tcp (a bash built without net redirections): the curl
+        //    arm decides. Nothing listening passes on rc 7; a listener that
+        //    accepts and hangs up refuses.
+        if !have_curl {
+            eprintln!("SKIP job `{name}` curl arm: curl is not on PATH");
+            continue;
+        }
+        let fake = tempfile::tempdir().expect("fake bash dir");
+        fake_bash(
+            fake.path(),
+            "echo \"bash: /dev/tcp/127.0.0.1/x: No such file or directory\" >&2\necho second line >&2\nexit 1",
+        );
+        let (rc, out) = run_refusal(script, port, home.path(), Some(fake.path()));
+        assert_eq!(rc, 0, "job `{name}`, no /dev/tcp, nothing listening: {out}");
+        assert!(out.contains("(probe: curl rc=7)"), "job `{name}`: {out}");
+        let hangup = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let hport = hangup.local_addr().expect("addr").port();
+        let acceptor = std::thread::spawn(move || {
+            if let Ok((c, _)) = hangup.accept() {
+                drop(c);
+            }
+        });
+        let (rc, out) = run_refusal(script, hport, home.path(), Some(fake.path()));
+        assert_eq!(rc, 1, "job `{name}`, no /dev/tcp, a listener: {out}");
+        assert!(out.contains("curl to 127.0.0.1:"), "job `{name}`: {out}");
+        assert!(out.contains(HOST_NOT_ISOLATED_TITLE), "job `{name}`: {out}");
+        acceptor.join().expect("acceptor");
+
+        // 5. A /dev/tcp connect that runs past 5 s falls through to curl
+        //    rather than refusing (round 5, L1). Slow (5 s), so one job.
+        if i == 0 {
+            if have_timeout {
+                fake_bash(fake.path(), "exec sleep 30");
+                let (rc, out) = run_refusal(script, port, home.path(), Some(fake.path()));
+                assert_eq!(rc, 0, "job `{name}`, /dev/tcp hung: {out}");
+                assert!(out.contains("(probe: curl rc=7)"), "job `{name}`: {out}");
+            } else {
+                eprintln!("SKIP the hung-connect case: `timeout` is not on PATH");
+            }
+        }
+        drop(l);
+    }
 }
