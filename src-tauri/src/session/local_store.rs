@@ -2180,14 +2180,14 @@ mod outcome_row_trim_arming {
         let chunk = "x".repeat(1500);
         let session = Uuid::new_v4();
         for _ in 0..8 {
-            writer
-                .record(
-                    machine,
-                    session,
-                    SessionEventKind::OutputChunk,
-                    serde_json::json!({ "text": chunk }),
-                )
-                .unwrap();
+            OutboxWriter::record(
+                &writer,
+                machine,
+                session,
+                SessionEventKind::OutputChunk,
+                serde_json::json!({ "text": chunk }),
+            )
+            .unwrap();
         }
         assert!(
             writer.dropped_unacked() > 0,
