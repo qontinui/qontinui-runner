@@ -549,7 +549,23 @@ pub struct TerminalSessionRecord {
     pub opened_at: i64,
     /// Unix millis of the most recent liveness/touch.
     pub last_seen_at: i64,
-    /// `"open"` | `"closed"`.
+    /// `"open"` | `"closed"` — the TERMINAL-HOSTING lifecycle of this session,
+    /// not its work and not its liveness.
+    ///
+    /// `open` means the registry last saw the session bound to a runner
+    /// terminal; it flips to `closed` (with `closed_at` / `close_reason`) on a
+    /// PTY exit, an explicit close, or the liveness poll (`poll-dead`,
+    /// `no-terminal`, …), which runs about every 45 s and debounces over
+    /// several ticks. Two consequences a reader must not miss:
+    ///
+    /// - **It is independent of `finished_at`.** `POST /sessions/{id}/finish`
+    ///   records the WORK axis only and never touches the process, so a row
+    ///   reading `"state":"open"` beside a set `finishedAt` is the expected
+    ///   shape right after a finish: the work is done, the pane is still up.
+    /// - **It is not a liveness probe.** An `open` row can outlive its process
+    ///   until the poll closes it (minutes), and a row from a dead runner stays
+    ///   `open` on disk. To ask "is anything running here?" use
+    ///   `GET /restart-readiness`, the live census.
     pub state: String,
     /// Unix millis when this session was closed, if closed.
     pub closed_at: Option<i64>,
