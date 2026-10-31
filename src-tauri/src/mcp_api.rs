@@ -13719,6 +13719,7 @@ pub fn create_router(
         .merge(crate::mcp::auto_continue::routes())
         .merge(crate::mcp::backup_restore::routes())
         .merge(crate::mcp::playwright_collection::routes())
+        .merge(crate::mcp::model_gateway_read::routes())
         .merge(crate::mcp::models::routes())
         .merge(crate::mcp::monitors::routes())
         .merge(crate::mcp::orchestration_loop_api::routes())
