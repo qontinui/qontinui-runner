@@ -18,6 +18,14 @@
 //! anything into a pane and `DELETE /terminals/{id}` closes one with a kill —
 //! and it is strictly more conservative than either: it refuses unless the
 //! pane sits at an empty prompt, and it never kills a live `claude`.
+//!
+//! # Since R0a it closes no live session
+//!
+//! Plan `2026-10-28-one-session-lifecycle-authority`, Phase 14: the primitive
+//! now requires a close authority once it finds a live `claude`, and this door
+//! has none to present, because only the lifecycle Closer will mint one. On a
+//! pane holding a live `claude` it therefore answers `no_close_authority` with
+//! nothing typed. On a pane with none it answers `no_live_claude`, as before.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,8 +75,23 @@ pub async fn graceful_exit_handler(
                 Json(api_error("TerminalManager is not available")),
             )
         })?;
+    graceful_exit_door(&manager, &id, query.deadline_s).await
+}
+
+/// The door's body, once the handler holds the manager. It runs
+/// `TerminalManager::graceful_exit` on pane `id` with the resolved deadline,
+/// presenting NO close authority (see the module docs, "Since R0a"), and
+/// answers the outcome unchanged: a `no_close_authority` refusal is a 200 whose
+/// body says so, never an error. An unknown pane is a 404.
+///
+/// Split out so the refusal is testable without an `AppHandle`.
+pub(crate) async fn graceful_exit_door(
+    manager: &Arc<TerminalManager>,
+    id: &str,
+    deadline_s: Option<u64>,
+) -> Result<Json<ApiResponse<GracefulExitOutcome>>, HandlerError> {
     let outcome = manager
-        .graceful_exit(&id, resolve_deadline(query.deadline_s))
+        .graceful_exit(id, resolve_deadline(deadline_s), None)
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, Json(api_error(e))))?;
     Ok(Json(ApiResponse::success(outcome)))
@@ -91,5 +114,44 @@ mod tests {
         assert_eq!(resolve_deadline(Some(0)), Duration::from_secs(1));
         assert_eq!(resolve_deadline(Some(45)), Duration::from_secs(45));
         assert_eq!(resolve_deadline(Some(86_400)), MAX_DEADLINE);
+    }
+
+    /// R0a for the debug door, entered at the door's own body: a pane holding
+    /// ONE live `claude` with ZERO children, at an empty prompt that would
+    /// accept `/exit` (a coord-finished session left idle), is refused
+    /// `no_close_authority`. The door answers 200 with that outcome in its
+    /// body. Nothing is typed, nothing is killed, the pane stays registered.
+    #[tokio::test(start_paused = true)]
+    async fn the_debug_door_is_refused_no_close_authority_on_a_live_claude() {
+        let pane = crate::terminal::session::tests::live_claude_pane();
+        let tm = Arc::new(TerminalManager::new());
+        let id = "debug-door-r0a";
+        tm.insert_for_test(id, pane.session.clone());
+
+        let Json(reply) = graceful_exit_door(&tm, id, None)
+            .await
+            .expect("a refusal is an answer, not an error");
+
+        let body = serde_json::to_value(&reply).expect("serializes");
+        assert_eq!(body["data"]["outcome"], "no_close_authority", "{body}");
+        assert_eq!(
+            body["data"]["claude_pids"],
+            serde_json::json!(pane.claude_pids)
+        );
+        assert!(pane.typed().is_empty(), "typed into a live claude");
+        assert_eq!(pane.kills(), 0);
+        assert!(
+            tm.get(id).is_some(),
+            "a refused exit must leave the pane registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_pane_is_a_404() {
+        let tm = Arc::new(TerminalManager::new());
+        let err = graceful_exit_door(&tm, "no-such-pane", None)
+            .await
+            .expect_err("no pane");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 }
