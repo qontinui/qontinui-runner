@@ -64,6 +64,13 @@ pub(crate) mod resource_sample;
 /// is `None` rather than a row of zeroes.
 pub(crate) mod socket_census;
 
+/// Workload class census — which closed class of workload the CPU and memory
+/// on each lane is spent on (plan
+/// `2026-10-01-fleet-capacity-page-finds-the-bottleneck-and-the-idle-hardware`,
+/// Phase 2). Consumed by [`resource_sample`]'s host and `wsl` lanes; argv,
+/// environment and cwd are never read — see its module docs.
+pub(crate) mod workload_census;
+
 /// §3.2 declared role. Mirrors `qontinui-coord::fleet::MachineRole`.
 /// The runner publishes itself as `Agent`; the supervisor publishes
 /// as `Build`. Dev workstations collapse both onto one machine_id
