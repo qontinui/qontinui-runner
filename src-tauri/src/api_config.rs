@@ -32,55 +32,10 @@ pub const DEFAULT_BACKEND_PORT: u16 = 8000;
 /// `get_api_base_url` and `settings::default_web_integration_backend_url`.
 pub const PROD_API_BASE_URL: &str = "https://api.qontinui.io";
 
-/// Canonical Qontinui production web-frontend FQDN (the Next.js app on Vercel).
-///
-/// Production is a **split** deployment: `PROD_API_BASE_URL` (`api.qontinui.io`)
-/// serves only `/api/v1/*`, while user-facing pages like `/login` and
-/// `/connect-runner` are served by the web frontend at `qontinui.io`. The `api.`
-/// host has no login page, so any UI that sends the user "to log in" must target
-/// this origin, not the backend. See [`derive_web_base_url`].
-pub const PROD_WEB_BASE_URL: &str = "https://qontinui.io";
-
-/// Derive the user-facing web-frontend origin from an API `backend_url`.
-///
-/// Production splits the API (`https://api.qontinui.io`) from the web frontend
-/// (`https://qontinui.io`) — the only difference is the leading `api.` host
-/// label. When the backend host begins with `api.`, this strips that single
-/// label (preserving scheme and port) to yield the frontend origin. For any
-/// other host — localhost dev, a bare IP, or a unified deployment where one
-/// origin serves both — the backend URL is returned unchanged, so the
-/// long-standing "same origin serves the SPA" fallback and any explicit
-/// `web_base_url` override keep working.
-///
-/// The returned value has no trailing slash and no path.
-pub fn derive_web_base_url(backend_url: &str) -> String {
-    let trimmed = backend_url.trim().trim_end_matches('/');
-    // Canonical mapping: the production API host maps to the production web
-    // origin. The general `api.`-stripping below also yields this, but pinning
-    // it keeps the two constants coupled even if the web FQDN ever diverges
-    // from a simple label strip.
-    if trimmed == PROD_API_BASE_URL {
-        return PROD_WEB_BASE_URL.to_string();
-    }
-    let (scheme, rest) = match trimmed.split_once("://") {
-        Some(parts) => parts,
-        None => return trimmed.to_string(),
-    };
-    // Authority is everything up to the first '/'; a ':' splits off the port.
-    let authority = rest.split('/').next().unwrap_or(rest);
-    let (host, port) = match authority.split_once(':') {
-        Some((h, p)) => (h, Some(p)),
-        None => (authority, None),
-    };
-    match host.strip_prefix("api.") {
-        // Only rewrite when an `api.` label was actually present.
-        Some(frontend_host) => match port {
-            Some(p) => format!("{}://{}:{}", scheme, frontend_host, p),
-            None => format!("{}://{}", scheme, frontend_host),
-        },
-        None => trimmed.to_string(),
-    }
-}
+// The web-FRONTEND origin (`qontinui.io`, distinct from this API base) and
+// its derivation live in the lib crate so lib-crate bins like
+// `qontinui_profile` share the one copy. Re-exported for runner callers.
+pub use qontinui_runner_lib::web_origin::derive_web_base_url;
 
 /// Pure precedence resolver for [`get_api_base_url`] — no I/O so the ordering
 /// is unit-testable. Splitting the decision out matches the codebase's
@@ -874,34 +829,6 @@ mod tests {
     }
 
     #[test]
-    fn derive_web_base_url_strips_prod_api_label() {
-        // The headline case: api.qontinui.io (no login page) → qontinui.io.
-        assert_eq!(derive_web_base_url(PROD_API_BASE_URL), PROD_WEB_BASE_URL);
-        assert_eq!(
-            derive_web_base_url("https://api.qontinui.io/"),
-            "https://qontinui.io"
-        );
-    }
-
-    #[test]
-    fn derive_web_base_url_preserves_non_api_hosts() {
-        // Localhost dev + unified deployments have no `api.` label to strip,
-        // so the backend origin is returned unchanged (old fallback behavior).
-        assert_eq!(
-            derive_web_base_url("http://localhost:8000"),
-            "http://localhost:8000"
-        );
-        assert_eq!(
-            derive_web_base_url("http://127.0.0.1:8000/"),
-            "http://127.0.0.1:8000"
-        );
-        assert_eq!(
-            derive_web_base_url("https://qontinui.io"),
-            "https://qontinui.io"
-        );
-    }
-
-    #[test]
     fn resolve_api_base_url_precedence() {
         let web = || Some("https://web.example".to_string());
         let api = || Some("https://api.example".to_string());
@@ -1030,20 +957,6 @@ mod tests {
         assert_eq!(
             ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected.as_str(),
             "build_default:release:persisted_loopback_rejected"
-        );
-    }
-
-    #[test]
-    fn derive_web_base_url_preserves_scheme_and_port() {
-        assert_eq!(
-            derive_web_base_url("http://api.example.test:8080"),
-            "http://example.test:8080"
-        );
-        // A host that merely starts with the letters "api" but has no `api.`
-        // label must NOT be rewritten.
-        assert_eq!(
-            derive_web_base_url("https://apiserver.example.test"),
-            "https://apiserver.example.test"
         );
     }
 
