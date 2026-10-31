@@ -92,6 +92,11 @@ pub(crate) enum CiChannel {
     /// The owner reconfigured this device's CI lane from qontinui-web —
     /// see [`super::settings_directive`].
     SettingsRequested,
+    /// A coord-dispatched ops task (plan
+    /// `2026-10-19-ci-nodes-run-the-tauri-runner-always-on-as-ci-node-role`
+    /// Phase 4) - see [`super::ops`]. Honoured only when
+    /// `QONTINUI_OPS_TASKS_ENABLED` is on; otherwise the frame is dropped.
+    OpsTaskRequested,
 }
 
 /// Exact-match routing for an inbound frame's channel. `None` for anything
@@ -109,6 +114,8 @@ pub(crate) fn route_ci_channel(channel: &str, device_id: uuid::Uuid) -> Option<C
         Some(CiChannel::BuildCancelled)
     } else if channel == format!("events.ci.settings_requested.{device_id}") {
         Some(CiChannel::SettingsRequested)
+    } else if channel == format!("events.ops.task_requested.{device_id}") {
+        Some(CiChannel::OpsTaskRequested)
     } else {
         None
     }
@@ -244,6 +251,11 @@ fn handle_ci_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<()> {
     let Some(kind) = route_ci_channel(channel, device_id) else {
         return Ok(());
     };
+    // Dark by default: an ops frame is dropped before it is even parsed.
+    if kind == CiChannel::OpsTaskRequested && !super::ops::enabled() {
+        debug!("ci_node: ops task frame dropped (QONTINUI_OPS_TASKS_ENABLED is off)");
+        return Ok(());
+    }
     let Some(inner) = parse_envelope_json(&value) else {
         warn!("ci_node: envelope on {channel} had no parseable payload/body");
         return Ok(());
@@ -257,6 +269,7 @@ fn handle_ci_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<()> {
             Ok(cancel) => super::admission::cancel(&cancel.dispatch_id),
             Err(e) => warn!("ci_node: build_cancelled payload did not parse: {e}"),
         },
+        CiChannel::OpsTaskRequested => super::ops::handle(inner),
         CiChannel::SettingsRequested => {
             match serde_json::from_value::<super::settings_directive::CiSettingsDirective>(inner) {
                 Ok(directive) => super::settings_directive::apply(directive),
@@ -342,6 +355,15 @@ mod tests {
         assert_eq!(
             route_ci_channel(&format!("events.ci.settings_requested.{device}"), device),
             Some(CiChannel::SettingsRequested)
+        );
+        // Ops tasks route only on this device's exact channel.
+        assert_eq!(
+            route_ci_channel(&format!("events.ops.task_requested.{device}"), device),
+            Some(CiChannel::OpsTaskRequested)
+        );
+        assert_eq!(
+            route_ci_channel(&format!("events.ops.task_requested.{other}"), device),
+            None
         );
         // Another device's CI traffic: not ours.
         assert_eq!(
