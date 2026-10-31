@@ -481,7 +481,8 @@ pub async fn ensure_self_registered(pg: &PgDb) {
     // is never overwritten and an operator can correct it via `PATCH /apps/<id>`.
     // `127.0.0.1`, not `localhost`: the runner binds the IPv4 loopback only, and
     // Windows resolves `localhost` to `::1` first, paying a doomed connect.
-    let ui_bridge_url = format!("http://127.0.0.1:{}", crate::mcp::types::get_mcp_api_port());
+    let ui_bridge_url =
+        crate::mcp::types::runner_loopback_base(crate::mcp::types::get_mcp_api_port());
 
     // Same name `/health` already reports as `uiBridge.appName`.
     let req = RegisterAppRequest::new(
@@ -621,7 +622,9 @@ fn dev_app_registrations(qontinui_root: &Path, runner_root: &Path) -> Vec<Regist
         // this id, never a second literal.
         RUNNER_APP_ID,
         runner_root.to_string_lossy(),
-        "http://localhost:9876",
+        // The same expression `ensure_self_registered` writes, so the two
+        // writers of this one app row agree on the URL.
+        crate::mcp::types::runner_loopback_base(crate::mcp::types::get_mcp_api_port()),
         "Qontinui Runner (self)",
     )];
 
@@ -1180,6 +1183,9 @@ mod tests {
     /// checkout the caller has already canonicalized.
     #[test]
     fn dev_bootstrap_registers_the_runner_alone_when_no_siblings_exist() {
+        let _lock = crate::test_env::env_lock();
+        let _env = crate::test_env::EnvVarRestore::capture(&["QONTINUI_PORT"]);
+        std::env::remove_var("QONTINUI_PORT");
         let f = bootstrap_fixture(&[]);
         let runner_root = f.root.join("qontinui-runner").canonicalize().unwrap();
 
@@ -1187,6 +1193,8 @@ mod tests {
 
         assert_eq!(app_ids(&reqs), vec!["qontinui-runner"]);
         assert_eq!(reqs[0].repo_root, runner_root.to_string_lossy());
-        assert_eq!(reqs[0].ui_bridge_url, "http://localhost:9876");
+        // The same URL `ensure_self_registered` writes for this app id: the
+        // bound IPv4 loopback, never `localhost` (which dials `::1` first).
+        assert_eq!(reqs[0].ui_bridge_url, "http://127.0.0.1:9876");
     }
 }

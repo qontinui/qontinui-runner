@@ -82,10 +82,15 @@ function InfoRow({ row, zoneIndex }: { row: InfoRowSpec; zoneIndex: number }) {
       className="flex items-center gap-1.5 px-2 py-0.5"
     >
       <span className="text-[9px] text-[#565f89] w-[68px] shrink-0">{row.label}</span>
+      {/* Overflow is DECLARED, not clipped silently: the value truncates with an
+          ellipsis, and the full text — for the Tenant row, the full acting id,
+          every bound tenant and every conflict — stays reachable in `title`
+          (served policy `ux-priorities` `no-widget-may-hide-identifying-text`). */}
       <span
         className="text-[10px] font-mono truncate flex-1"
         style={{ color: known ? PANEL_TEXT : PANEL_MUTED, fontStyle: known ? undefined : "italic" }}
-        title={row.display}
+        title={row.title ?? row.display}
+        data-session-info-overflow="truncate"
       >
         {row.display}
       </span>
@@ -162,13 +167,15 @@ function SessionInfoPanelBody({
         <span className="text-[8px] text-[#565f89] shrink-0">name: {body.name.source}</span>
       </div>
 
-      {/* D4: the cap has to clear the WHOLE row set, not most of it. Fourteen
-          rows measure 266px, so the previous `max-h-64` (256px) put the last
-          row (`PRs landed`) permanently below the fold — present in the DOM,
-          absent from every `visibleOnly` read, which reads as a missing field
-          rather than a scrolled-away one. `max-h-80` (320px) leaves headroom
-          for a row or two more before the scrollbar is needed again. */}
-      <div className="max-h-80 overflow-y-auto scrollbar-dark py-0.5">
+      {/* D4: the cap has to clear the WHOLE row set, not most of it — a row
+          below the fold is present in the DOM but absent from every
+          `visibleOnly` read, which reads as a missing field rather than a
+          scrolled-away one. At ~19px a row, eighteen rows (the `Spawned for`
+          row joined the seventeen in plan
+          2026-10-17-session-info-tenant-row-renders-unknown-for-a-resolved-tenant)
+          measure ~342px, past the previous `max-h-80` (320px). `max-h-96`
+          (384px) clears them with two rows of headroom. */}
+      <div className="max-h-96 overflow-y-auto scrollbar-dark py-0.5">
         {rows.map((row) => (
           <InfoRow key={row.field} row={row} zoneIndex={zoneIndex} />
         ))}
@@ -353,7 +360,9 @@ export function SessionInfoDropdown({
         data-session-info-tone={trigger.tone}
       >
         <Info className="w-2.5 h-2.5" />
-        <span className="text-[9px] font-mono leading-none">{trigger.countText}</span>
+        <span className="text-[9px] font-mono leading-none max-w-[2ch] truncate">
+          {trigger.countText}
+        </span>
         <ChevronDown className="w-2 h-2" />
       </button>
 

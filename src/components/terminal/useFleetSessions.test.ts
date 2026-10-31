@@ -107,6 +107,33 @@ describe("degradedNotice — the banner names what was unreadable", () => {
 });
 
 describe("groupByDevice", () => {
+  it("carries the rows' MINT tenant on the group, not their served one", () => {
+    const B = "bbbbbbbb-0000-4000-8000-00000000000b";
+    const C = "cccccccc-0000-4000-8000-00000000000c";
+    // A read that named no tenant: served under B, but its create mints with
+    // no tenant, exactly as before the selector.
+    const [single] = groupByDevice([
+      session({ sessionId: "a", deviceId: "d1", servedTenantId: B, mintTenantId: null }),
+    ]);
+    expect(single.tenantId).toBe(B);
+    expect(single.mintTenantId).toBeNull();
+    // A merged read: each group mints under its own walk's tenant.
+    const merged = groupByDevice(
+      [
+        session({ sessionId: "a", deviceId: "d1", servedTenantId: B, mintTenantId: B }),
+        session({ sessionId: "b", deviceId: "d1", servedTenantId: C, mintTenantId: C }),
+      ],
+      { byTenant: true },
+    );
+    expect(merged.map((g) => [g.tenantId, g.mintTenantId])).toEqual(
+      expect.arrayContaining([
+        [B, B],
+        [C, C],
+      ]),
+    );
+    expect(merged).toHaveLength(2);
+  });
+
   it("puts the caller's own device first, then labels alphabetically", () => {
     const rows = [
       session({ sessionId: "s1", deviceId: "d-zeta", deviceHostname: "zeta" }),
