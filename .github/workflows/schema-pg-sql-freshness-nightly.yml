@@ -529,6 +529,21 @@ jobs:
           # re-readied once the new head's checks register. `UNKNOWN`
           # mergeability is NOT a conflict — GitHub computes it lazily — so an
           # unknown keeps the comment path: never force-push on an unknown.
+          #
+          # AND EXCEPT a ready PR whose own required `schema-fresh` went RED
+          # while its dump is older than this run's. It cannot land either:
+          # the check is red against the current web head, and nothing re-runs
+          # it green, because its dump is stale. Commenting on it is the
+          # livelock #2199 sat in for three nights (2026-10-15..17) while every
+          # PR touching atlas/ or src-tauri/queries/ was blocked behind it.
+          # coord never proposes a PR whose required check is red, so no
+          # in-flight proposal can sit under it, and it takes the same
+          # convert-and-rebuild path. Only a newest `schema-fresh` run that is
+          # `completed` + `failure` qualifies: pending, success, any other
+          # conclusion, or no run at all keeps the comment path (never
+          # force-push on an unknown). A red PR whose BODY already carries this
+          # run's marker holds the current dump, so its red is something else
+          # and a rebuild would not fix it: comment path too.
           if [ -n "$existing_num" ]; then
             if ! existing_draft="$(gh pr view "$existing_num" --repo "$REPO" --json isDraft --jq '.isDraft')"; then
               pr_op_failed "view #$existing_num (isDraft)"; exit 1
@@ -537,7 +552,15 @@ jobs:
               true|false) : ;;
               *) echo "::error::Could not read PR #$existing_num's draft state (got '$existing_draft'). Refusing to guess whether it may be force-pushed."; exit 1 ;;
             esac
+            # The PR body, read ONCE for a ready PR: it carries the marker of
+            # the dump the branch was last pushed with, which both the red
+            # carve-out below and the comment dedup read. Materialized to a
+            # file, never piped into grep (see the dedup note below).
+            pr_body_file="$RUNNER_TEMP/refresh-pr-body.txt"
             if [ "$existing_draft" = "false" ]; then
+              if ! gh api "repos/$REPO/pulls/$existing_num" --jq '.body // ""' > "$pr_body_file"; then
+                pr_op_failed "read body of #$existing_num"; exit 1
+              fi
               if ! merge_state="$(gh pr view "$existing_num" --repo "$REPO" --json mergeable,mergeStateStatus --jq '.mergeable + " " + .mergeStateStatus')"; then
                 pr_op_failed "view #$existing_num (mergeable)"; exit 1
               fi
@@ -546,8 +569,52 @@ jobs:
                 MERGEABLE|CONFLICTING|UNKNOWN) : ;;
                 *) echo "::error::Could not read PR #$existing_num's mergeability (got '$merge_state')."; exit 1 ;;
               esac
+              rebuild_ready=0
               if [ "$mergeable" = "CONFLICTING" ] || [ "${merge_status:-}" = "DIRTY" ]; then
                 echo "::warning::Refresh PR #$existing_num is ready but CONFLICTS with main ($mergeable/${merge_status:-}); it can never land. Converting it back to a draft and rebuilding '$BRANCH' from main."
+                rebuild_ready=1
+              else
+                # The head the check runs are read on comes from the PR itself,
+                # not from `git ls-remote`: it is the commit GitHub evaluates
+                # the required check against. A non-sha answer is a red, never
+                # read as "no runs".
+                if ! head_sha="$(gh pr view "$existing_num" --repo "$REPO" --json headRefOid --jq '.headRefOid')"; then
+                  pr_op_failed "view #$existing_num (headRefOid)"; exit 1
+                fi
+                if ! [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                  echo "::error::Could not read PR #$existing_num's head sha (got '$head_sha'). Refusing to guess its schema-fresh state."
+                  exit 1
+                fi
+                # Newest `schema-fresh` run from GitHub Actions on that head, as
+                # "<status> <conclusion>" (conclusion `none` while in flight), or
+                # `none` when the head carries no such run. `check_name` is an
+                # exact match, so `schema-fresh-verify` is not in the set; one
+                # page of 100 is far beyond the reruns one head ever gets.
+                # "Newest" is the highest `id`, NOT `started_at`: check-run ids
+                # only ever increase and a re-run always gets a new one, so the
+                # order needs no timestamp. Should a run ever report a null or
+                # skewed `started_at` (not observed; queued Actions runs measured
+                # 2026-10-17 all carried one), a timestamp sort could rank a
+                # pending re-run below the stale failure it replaces and rebuild
+                # under it.
+                if ! fresh_run="$(gh api "repos/$REPO/commits/$head_sha/check-runs?check_name=schema-fresh&filter=all&per_page=100" \
+                    --jq '[.check_runs[] | select(.app.slug == "github-actions")] | sort_by(.id) | last | if . == null then "none" else "\(.status) \(.conclusion // "none")" end')"; then
+                  pr_op_failed "read schema-fresh check runs of #$existing_num"; exit 1
+                fi
+                if ! [[ "$fresh_run" =~ ^(none|(queued|in_progress|waiting|requested|pending)\ none|completed\ [a-z_]+)$ ]]; then
+                  echo "::error::Could not read PR #$existing_num's schema-fresh state on $head_sha (got '$fresh_run'). Refusing to guess whether it may be rebuilt."
+                  exit 1
+                fi
+                if [ "$fresh_run" = "completed failure" ]; then
+                  if grep -qF "$drift_marker" "$pr_body_file"; then
+                    echo "::warning::Refresh PR #$existing_num's schema-fresh is RED on $head_sha, but its body already carries this run's dump ($dump_sha); a rebuild would push the same dump. Not rebuilding."
+                  else
+                    echo "::warning::Refresh PR #$existing_num is ready but its required schema-fresh is RED on $head_sha and it carries an older dump; it can never land. Converting it back to a draft and rebuilding '$BRANCH' with dump $dump_sha."
+                    rebuild_ready=1
+                  fi
+                fi
+              fi
+              if [ "$rebuild_ready" = "1" ]; then
                 if ! pr_node_id="$(gh pr view "$existing_num" --repo "$REPO" --json id --jq '.id')"; then
                   pr_op_failed "view #$existing_num (id)"; exit 1
                 fi
@@ -570,10 +637,10 @@ jobs:
               # the first hit, SIGPIPEs gh, and under pipefail a dedup HIT
               # becomes a failure. REST --paginate has no page cap, so the
               # marker cannot scroll out of view on a PR that sits for days.
+              # The body was already read above, before the carve-outs; reused
+              # rather than re-read so both decisions see the same body.
               seen="$RUNNER_TEMP/refresh-pr-seen.txt"
-              if ! gh api "repos/$REPO/pulls/$existing_num" --jq '.body // ""' > "$seen"; then
-                pr_op_failed "read body of #$existing_num"; exit 1
-              fi
+              cp "$pr_body_file" "$seen"
               if ! gh api --paginate "repos/$REPO/issues/$existing_num/comments" --jq '.[].body' >> "$seen"; then
                 pr_op_failed "read comments of #$existing_num"; exit 1
               fi
