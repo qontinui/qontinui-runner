@@ -24,14 +24,18 @@
 //! header says what each one means.
 //!
 //! An `operator` row claims that no automation can borrow that close. The
-//! claim is checked two ways (NC5-1):
+//! claim is checked three ways:
 //!
 //! * BY NAME against the `POST /ui-bridge/invoke/<name>` allowlist, whose
-//!   dispatch runs the named fn.
-//! * PER SITE against the `POST /ui-bridge/tauri/invoke` proxy, whose arms are
-//!   their own implementations. No production code in `mcp/tauri_proxy.rs` may
-//!   call an `operator` fn, and no fn of the proxy may itself be classed
+//!   dispatch runs the named fn (NC5-1).
+//! * No fn of the `POST /ui-bridge/tauri/invoke` proxy may itself be classed
 //!   `operator`.
+//! * The fn has NO production Rust caller anywhere in the crate. A check of the
+//!   proxy's own arms alone would be one hop deep, so a shared helper that a
+//!   proxy arm calls could still reach the operator fn. With no caller at all,
+//!   no arm, door or helper reaches it at any depth. Its legitimate callers are
+//!   outside Rust: the webview over IPC. Naming it in `tauri::generate_handler!`
+//!   registers it, which is not a call.
 //!
 //! A name check against the proxy's safelist would be wrong: its
 //! `terminal_close` arm never calls the Tauri command of that name.
@@ -42,19 +46,48 @@
 //! primitive requires before it types into a live `claude`. Only the lifecycle
 //! Closer may ever obtain one (Phase 93), and from Phase 16 also the relay's
 //! operator arm. [`AUTHORIZED_MINTERS`] and [`AUTHORIZED_CONSTRUCTORS`] are
-//! empty until then. The scan pins five things:
+//! empty until then. The scan is an ALLOWLIST. Each rule below is RED on
+//! production code:
 //!
-//! 1. the type's SHAPE: one definition, a private field, no constructing or
-//!    duplicating derive;
-//! 2. no trait impl for the type anywhere;
-//! 3. inherent impls only in its own module;
-//! 4. every fn that returns one is `#[cfg(test)]`, unless it is an authorized
-//!    constructor;
-//! 5. every production MINT SITE is authorized. A mint site is a struct literal,
-//!    or a call to an associated fn of the type.
+//! 1. SHAPE. There is one definition, in its own module, with at least one
+//!    field and every field private. Its derives are `Debug` and nothing else,
+//!    counting a `cfg_attr(…, derive(…))` as a derive.
+//! 2. No trait impl for the type anywhere.
+//! 3. No inherent impl outside its own module.
+//! 4. No fn that returns one, unless it is an authorized constructor.
+//! 5. No `const` or `static` of the type, an associated one included.
+//! 6. No `type` alias of it and no `use … as` rename of it. Every rule here
+//!    also reads such an alias, within the file that defines it, as the type.
+//! 7. No struct literal of it (`CloseAuthority {`, or `Self {` inside one of
+//!    its impls, attributed to the IMPL rather than to an enclosing fn, so an
+//!    associated const is caught), unless it is inside an authorized
+//!    constructor.
+//! 8. No MENTION of the type outside the allowlist. A mention is allowed only
+//!    inside `terminal/close_authority.rs` (which rules 1-7 police), on a `use`
+//!    line, as the `authority: Option<…CloseAuthority>` parameter of one of
+//!    [`AUTHORITY_PARAM_FNS`], or inside an authorized minter. A transmute or a
+//!    zeroed value that names the type is therefore red.
+//! 9. Every call of the primitive passes `None` as its authority. The only
+//!    exceptions are a primitive entry point forwarding its own `authority`
+//!    parameter, and an authorized minter. This catches a forged value that
+//!    never names the type, such as `Some(unsafe { std::mem::zeroed() })`
+//!    passed straight to `TerminalManager::graceful_exit`, because the only
+//!    use of an authority is to hand it to the primitive. Naming the primitive
+//!    without calling it (a fn value), or calling it with a turbofish, hides
+//!    the argument, so both are red as well.
 //!
-//! So a public constructor, a public field, a `Default`, or a production call
-//! of the test constructor is red in `cargo test` itself.
+//!    9b. Inside an entry point, `authority` is the caller's value: the
+//!    parameter is not `mut`, `ref` or a sub-pattern, and nothing in the body
+//!    binds the name again.
+//!
+//! So a public constructor, an associated const, an alias, a transmute, a
+//! zeroed value, a `cfg_attr` derive, or a production call of the test
+//! constructor is red in `cargo test` itself. Each route has its own mutation
+//! twin below.
+//!
+//! Rules 7, 8 and 9 read the source with every comment and every string and
+//! char literal blanked, so a type named in a log message or a trailing
+//! comment is not a mention.
 //!
 //! ## How sites are found — a source scan, not a type check
 //!
@@ -86,9 +119,19 @@
 //!   A `#[path = …]` on such a declaration is not followed, so a file it names
 //!   reads as production.
 //! * A `#[cfg(test)]` on a statement or expression inside a production fn is
-//!   not recognised, so the code it guards reads as production. A comment that
-//!   shares a line with code reads as code. All three err toward REPORTING a
-//!   site, never toward hiding one.
+//!   not recognised, so the code it guards reads as production. In the roster
+//!   scan, a comment that shares a line with code reads as code. All three err
+//!   toward REPORTING a site, never toward hiding one.
+//! * Rule 9 splits arguments on brackets and braces only, so a comma inside a
+//!   turbofish or a closure's parameter list splits an argument. That can only
+//!   make the last argument read as something other than `None`, which is red.
+//! * An alias is resolved within the file that defines it. It is red there
+//!   (rule 6), so a use of it elsewhere is never the only red.
+//! * Rule 9b reads bindings `syn` parses. A macro invoked inside an entry
+//!   point is not read for a binding of `authority`.
+//! * The operator check finds CALLS. A reference that is not a call, such as
+//!   a fn pointer kept in a table, is not a caller; `generate_handler!` and
+//!   `ipc_group!` register commands exactly that way.
 //! * A green scan claims "every close this scan RECOGNISES is classified", not
 //!   "every close path is classified".
 
@@ -168,25 +211,64 @@ const AUTHORIZED_CONSTRUCTORS: &[(&str, &str)] = &[];
 /// relay's `origin: user_session` stamp.
 const AUTHORIZED_MINTERS: &[(&str, &str)] = &[];
 
-/// Derives that would construct or duplicate a close authority.
-const FORBIDDEN_DERIVES: &[&str] = &["Default", "Clone", "Copy", "Deserialize"];
+/// The only derive a close authority may carry. Anything else may build or
+/// duplicate one (`Default`, `Clone`, `Copy`, `Deserialize`, …), so the list is
+/// an allowlist and not a list of known-bad derives.
+const ALLOWED_DERIVES: &[&str] = &["Debug"];
+
+/// The only attributes the definition may carry besides its derives. An
+/// attribute macro (a builder, a constructor generator) writes code that no
+/// source scan reads, so anything else is red.
+const ALLOWED_STRUCT_ATTRS: &[&str] = &["derive", "doc", "must_use", "allow", "expect"];
+
+/// The primitive's entry points, as `(file, impl self type, fn)`. Each one
+/// takes `authority: Option<CloseAuthority>`. That parameter is an allowed
+/// mention of the type (rule 8), and forwarding it is the one non-`None`
+/// authority a call may pass (rule 9).
+const AUTHORITY_PARAM_FNS: &[(&str, Option<&str>, &str)] = &[
+    ("terminal/graceful_exit.rs", None, "drive"),
+    (
+        "terminal/session.rs",
+        Some("TerminalSession"),
+        "graceful_exit_then",
+    ),
+    (
+        "terminal/session.rs",
+        Some("TerminalSession"),
+        "graceful_exit_driven",
+    ),
+    (
+        "terminal/manager.rs",
+        Some("TerminalManager"),
+        "graceful_exit",
+    ),
+];
 
 // ---------------------------------------------------------------------------
 // Structure, from `syn`
 // ---------------------------------------------------------------------------
 
-/// One fn: its name, the lines it spans (1-based, inclusive), the self type of
-/// the impl it sits in, whether it is test code, and the identifiers its return
-/// type names.
+/// One fn: its name, the lines it spans (1-based, inclusive), the line its body
+/// opens on (its signature is `start..=body_start`), the self type of the impl
+/// it sits in, whether it is test code, and the identifiers its return type
+/// names.
+///
+/// For a fn NAMED like one of [`AUTHORITY_PARAM_FNS`], rule 9b also needs two
+/// facts. The first is whether its `authority` parameter is declared `mut`,
+/// `ref` or with a sub-pattern (`None` when it has no such parameter). The
+/// second is the lines in its body that bind a pattern named `authority`.
 #[derive(Debug, Clone)]
 struct FnSpan {
     name: String,
     start: usize,
     end: usize,
+    body_start: usize,
     impl_self: Option<String>,
     in_test: bool,
     output_idents: Vec<String>,
     vis: Vis,
+    authority_param_rebindable: Option<bool>,
+    authority_rebinds: Vec<usize>,
 }
 
 /// A fn's visibility, as far as the scan needs it.
@@ -197,22 +279,61 @@ enum Vis {
     Other,
 }
 
-/// One impl block.
+/// One impl block, with the lines it spans.
 #[derive(Debug, Clone)]
 struct ImplBlock {
     trait_name: Option<String>,
     self_ty: Option<String>,
     in_test: bool,
+    start: usize,
+    end: usize,
 }
 
-/// One struct definition.
+/// One `const` or `static`, a free, associated or trait one, with the
+/// identifiers its type names, the self type of the impl it sits in, and the
+/// lines it spans.
+#[derive(Debug, Clone)]
+struct TypedItem {
+    kind: &'static str,
+    name: String,
+    ty_idents: Vec<String>,
+    impl_self: Option<String>,
+    in_test: bool,
+    start: usize,
+    end: usize,
+}
+
+/// One `type Name = …;` (free or associated), with the identifiers its target
+/// names.
+#[derive(Debug, Clone)]
+struct TypeAlias {
+    name: String,
+    ty_idents: Vec<String>,
+    in_test: bool,
+    line: usize,
+}
+
+/// One `use …::from as to;` rename.
+#[derive(Debug, Clone)]
+struct UseRename {
+    from: String,
+    to: String,
+    in_test: bool,
+    line: usize,
+}
+
+/// One struct definition: its fields, whether they are named (a braced
+/// struct), every derive it can carry, and the path of every other attribute
+/// on it, `cfg_attr` flattened.
 #[derive(Debug, Clone)]
 struct StructDef {
     name: String,
     in_test: bool,
     field_count: usize,
     public_fields: usize,
+    named: bool,
     derives: Vec<String>,
+    attrs: Vec<String>,
 }
 
 /// One out-of-line `mod name;` declaration, and whether it is test code (the
@@ -230,6 +351,11 @@ struct Structure {
     impls: Vec<ImplBlock>,
     structs: Vec<StructDef>,
     child_mods: Vec<ChildMod>,
+    typed_items: Vec<TypedItem>,
+    aliases: Vec<TypeAlias>,
+    renames: Vec<UseRename>,
+    /// The lines of every non-test `use` item.
+    use_spans: Vec<(usize, usize)>,
 }
 
 impl Structure {
@@ -241,10 +367,18 @@ impl Structure {
         self.impls.iter_mut().for_each(|i| i.in_test = true);
         self.structs.iter_mut().for_each(|s| s.in_test = true);
         self.child_mods.iter_mut().for_each(|m| m.test = true);
+        self.typed_items.iter_mut().for_each(|t| t.in_test = true);
+        self.aliases.iter_mut().for_each(|a| a.in_test = true);
+        self.renames.iter_mut().for_each(|r| r.in_test = true);
+        self.use_spans.clear();
     }
 
     fn in_test_span(&self, line: usize) -> bool {
         self.test_spans.iter().any(|&(s, e)| line >= s && line <= e)
+    }
+
+    fn in_use_span(&self, line: usize) -> bool {
+        self.use_spans.iter().any(|&(s, e)| line >= s && line <= e)
     }
 
     /// The innermost fn whose span holds `line`.
@@ -253,6 +387,14 @@ impl Structure {
             .iter()
             .filter(|f| line >= f.start && line <= f.end)
             .min_by_key(|f| f.end - f.start)
+    }
+
+    /// The innermost impl block whose span holds `line`.
+    fn innermost_impl(&self, line: usize) -> Option<&ImplBlock> {
+        self.impls
+            .iter()
+            .filter(|i| line >= i.start && line <= i.end)
+            .min_by_key(|i| i.end - i.start)
     }
 }
 
@@ -306,10 +448,23 @@ fn vis_of(vis: &syn::Visibility) -> Vis {
     }
 }
 
+/// Every derive `attrs` can apply: each plain `#[derive(…)]`, and each
+/// `derive(…)` inside a `#[cfg_attr(predicate, …)]` at any depth. A
+/// conditional derive applies in some build, so it counts the same.
 fn derives_of(attrs: &[syn::Attribute]) -> Vec<String> {
     let mut out = Vec::new();
-    for attr in attrs.iter().filter(|a| a.path().is_ident("derive")) {
-        if let Ok(paths) = attr.parse_args_with(
+    for attr in attrs {
+        collect_derives(&attr.meta, &mut out);
+    }
+    out
+}
+
+fn collect_derives(meta: &syn::Meta, out: &mut Vec<String>) {
+    let syn::Meta::List(list) = meta else {
+        return;
+    };
+    if list.path.is_ident("derive") {
+        if let Ok(paths) = list.parse_args_with(
             syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
         ) {
             out.extend(
@@ -318,8 +473,100 @@ fn derives_of(attrs: &[syn::Attribute]) -> Vec<String> {
                     .filter_map(|p| p.segments.last().map(|s| s.ident.to_string())),
             );
         }
+    } else if list.path.is_ident("cfg_attr") {
+        if let Ok(metas) = list.parse_args_with(
+            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+        ) {
+            // The first element is the predicate; the rest are attributes.
+            for nested in metas.iter().skip(1) {
+                collect_derives(nested, out);
+            }
+        }
+    }
+}
+
+/// Every identifier `ty` names.
+fn type_idents(ty: &syn::Type) -> Vec<String> {
+    let mut ids = Idents::default();
+    ids.visit_type(ty);
+    ids.0
+}
+
+/// The `(from, to)` of every `use … as …` rename in `tree`.
+fn collect_renames(tree: &syn::UseTree, out: &mut Vec<(String, String)>) {
+    match tree {
+        syn::UseTree::Path(p) => collect_renames(&p.tree, out),
+        syn::UseTree::Rename(r) => out.push((r.ident.to_string(), r.rename.to_string())),
+        syn::UseTree::Group(g) => g.items.iter().for_each(|t| collect_renames(t, out)),
+        syn::UseTree::Name(_) | syn::UseTree::Glob(_) => {}
+    }
+}
+
+/// The path of every attribute in `attrs`, as written (`doc`, `must_use`,
+/// `serde`, `bon::builder`). A `cfg_attr(predicate, …)` contributes the
+/// attributes it can apply, at any depth, rather than itself.
+fn attr_paths_of(attrs: &[syn::Attribute]) -> Vec<String> {
+    let mut out = Vec::new();
+    for attr in attrs {
+        collect_attr_paths(&attr.meta, &mut out);
     }
     out
+}
+
+fn collect_attr_paths(meta: &syn::Meta, out: &mut Vec<String>) {
+    let path = meta.path();
+    if path.is_ident("cfg_attr") {
+        if let syn::Meta::List(list) = meta {
+            if let Ok(metas) = list.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            ) {
+                for nested in metas.iter().skip(1) {
+                    collect_attr_paths(nested, out);
+                }
+            }
+        }
+        return;
+    }
+    out.push(
+        path.segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::"),
+    );
+}
+
+/// The parameter name rule 9b guards inside a primitive entry point.
+const AUTHORITY_PARAM: &str = "authority";
+
+/// The lines of every pattern binding named `authority` in a fn body: a
+/// `let`, a closure parameter, a match arm, a `for` or `if let` pattern, a
+/// nested fn's parameter.
+#[derive(Default)]
+struct AuthorityBinds(Vec<usize>);
+
+impl<'ast> Visit<'ast> for AuthorityBinds {
+    fn visit_pat_ident(&mut self, p: &'ast syn::PatIdent) {
+        if p.ident == AUTHORITY_PARAM {
+            self.0.push(p.ident.span().start().line);
+        }
+        syn::visit::visit_pat_ident(self, p);
+    }
+}
+
+/// Whether `sig`'s `authority` parameter could be anything but the value its
+/// caller passed: declared `mut` or `ref`, or with a sub-pattern. `None` when
+/// the fn has no `authority` parameter.
+fn authority_param_is_rebindable(sig: &syn::Signature) -> Option<bool> {
+    sig.inputs.iter().find_map(|arg| match arg {
+        syn::FnArg::Typed(typed) => match &*typed.pat {
+            syn::Pat::Ident(p) if p.ident == AUTHORITY_PARAM => {
+                Some(p.mutability.is_some() || p.by_ref.is_some() || p.subpat.is_some())
+            }
+            _ => None,
+        },
+        syn::FnArg::Receiver(_) => None,
+    })
 }
 
 #[derive(Default)]
@@ -352,19 +599,65 @@ impl StructureVisitor {
         sig: &syn::Signature,
         vis: Vis,
         node: &N,
+        body: Option<&syn::Block>,
         impl_self: Option<String>,
     ) {
         let (start, end) = lines_of(node);
+        let body_start = body.map_or(end, |b| b.brace_token.span.open().start().line);
         let mut output = Idents::default();
         output.visit_return_type(&sig.output);
+        let entry_point = AUTHORITY_PARAM_FNS
+            .iter()
+            .any(|&(_, _, name)| sig.ident == name);
+        let (authority_param_rebindable, authority_rebinds) = if entry_point {
+            let mut binds = AuthorityBinds::default();
+            if let Some(b) = body {
+                binds.visit_block(b);
+            }
+            (authority_param_is_rebindable(sig), binds.0)
+        } else {
+            (None, Vec::new())
+        };
         self.s.fns.push(FnSpan {
             name: sig.ident.to_string(),
             start,
             end,
+            body_start,
             impl_self,
             in_test: self.test_depth > 0,
             output_idents: output.0,
             vis,
+            authority_param_rebindable,
+            authority_rebinds,
+        });
+    }
+
+    fn record_typed<N: Spanned>(
+        &mut self,
+        kind: &'static str,
+        name: &proc_macro2::Ident,
+        ty: &syn::Type,
+        node: &N,
+        impl_self: Option<String>,
+    ) {
+        let (start, end) = lines_of(node);
+        self.s.typed_items.push(TypedItem {
+            kind,
+            name: name.to_string(),
+            ty_idents: type_idents(ty),
+            impl_self,
+            in_test: self.test_depth > 0,
+            start,
+            end,
+        });
+    }
+
+    fn record_alias<N: Spanned>(&mut self, name: &proc_macro2::Ident, ty: &syn::Type, node: &N) {
+        self.s.aliases.push(TypeAlias {
+            name: name.to_string(),
+            ty_idents: type_idents(ty),
+            in_test: self.test_depth > 0,
+            line: lines_of(node).0,
         });
     }
 }
@@ -383,7 +676,7 @@ impl<'ast> Visit<'ast> for StructureVisitor {
     }
     fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
         self.scoped(&f.attrs, f, |v| {
-            v.record_fn(&f.sig, vis_of(&f.vis), f, None);
+            v.record_fn(&f.sig, vis_of(&f.vis), f, Some(&f.block), None);
             // A fn nested in a method is not in the method's impl.
             v.impl_stack.push(None);
             syn::visit::visit_item_fn(v, f);
@@ -393,6 +686,7 @@ impl<'ast> Visit<'ast> for StructureVisitor {
     fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
         self.scoped(&i.attrs, i, |v| {
             let self_ty = last_ident_of_type(&i.self_ty);
+            let (start, end) = lines_of(i);
             v.s.impls.push(ImplBlock {
                 trait_name: i
                     .trait_
@@ -401,6 +695,8 @@ impl<'ast> Visit<'ast> for StructureVisitor {
                     .map(|s| s.ident.to_string()),
                 self_ty: self_ty.clone(),
                 in_test: v.test_depth > 0,
+                start,
+                end,
             });
             v.impl_stack.push(self_ty);
             syn::visit::visit_item_impl(v, i);
@@ -410,14 +706,39 @@ impl<'ast> Visit<'ast> for StructureVisitor {
     fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
         self.scoped(&f.attrs, f, |v| {
             let impl_self = v.impl_stack.last().cloned().flatten();
-            v.record_fn(&f.sig, vis_of(&f.vis), f, impl_self);
+            v.record_fn(&f.sig, vis_of(&f.vis), f, Some(&f.block), impl_self);
             syn::visit::visit_impl_item_fn(v, f);
         });
     }
     fn visit_trait_item_fn(&mut self, f: &'ast syn::TraitItemFn) {
         self.scoped(&f.attrs, f, |v| {
-            v.record_fn(&f.sig, Vis::Other, f, None);
+            v.record_fn(&f.sig, Vis::Other, f, f.default.as_ref(), None);
             syn::visit::visit_trait_item_fn(v, f);
+        });
+    }
+    fn visit_impl_item_const(&mut self, c: &'ast syn::ImplItemConst) {
+        self.scoped(&c.attrs, c, |v| {
+            let impl_self = v.impl_stack.last().cloned().flatten();
+            v.record_typed("const", &c.ident, &c.ty, c, impl_self);
+            syn::visit::visit_impl_item_const(v, c);
+        });
+    }
+    fn visit_trait_item_const(&mut self, c: &'ast syn::TraitItemConst) {
+        self.scoped(&c.attrs, c, |v| {
+            v.record_typed("const", &c.ident, &c.ty, c, None);
+            syn::visit::visit_trait_item_const(v, c);
+        });
+    }
+    fn visit_item_type(&mut self, t: &'ast syn::ItemType) {
+        self.scoped(&t.attrs, t, |v| {
+            v.record_alias(&t.ident, &t.ty, t);
+            syn::visit::visit_item_type(v, t);
+        });
+    }
+    fn visit_impl_item_type(&mut self, t: &'ast syn::ImplItemType) {
+        self.scoped(&t.attrs, t, |v| {
+            v.record_alias(&t.ident, &t.ty, t);
+            syn::visit::visit_impl_item_type(v, t);
         });
     }
     fn visit_item_struct(&mut self, s: &'ast syn::ItemStruct) {
@@ -444,19 +765,43 @@ impl<'ast> Visit<'ast> for StructureVisitor {
                 in_test: v.test_depth > 0,
                 field_count,
                 public_fields,
+                named: matches!(s.fields, syn::Fields::Named(_)),
                 derives: derives_of(&s.attrs),
+                attrs: attr_paths_of(&s.attrs),
             });
             syn::visit::visit_item_struct(v, s);
         });
     }
     fn visit_item_const(&mut self, c: &'ast syn::ItemConst) {
-        self.scoped(&c.attrs, c, |v| syn::visit::visit_item_const(v, c));
+        self.scoped(&c.attrs, c, |v| {
+            v.record_typed("const", &c.ident, &c.ty, c, None);
+            syn::visit::visit_item_const(v, c);
+        });
     }
     fn visit_item_static(&mut self, s: &'ast syn::ItemStatic) {
-        self.scoped(&s.attrs, s, |v| syn::visit::visit_item_static(v, s));
+        self.scoped(&s.attrs, s, |v| {
+            v.record_typed("static", &s.ident, &s.ty, s, None);
+            syn::visit::visit_item_static(v, s);
+        });
     }
     fn visit_item_use(&mut self, u: &'ast syn::ItemUse) {
-        self.scoped(&u.attrs, u, |v| syn::visit::visit_item_use(v, u));
+        self.scoped(&u.attrs, u, |v| {
+            let (start, end) = lines_of(u);
+            let in_test = v.test_depth > 0;
+            if !in_test {
+                v.s.use_spans.push((start, end));
+            }
+            let mut renames = Vec::new();
+            collect_renames(&u.tree, &mut renames);
+            v.s.renames
+                .extend(renames.into_iter().map(|(from, to)| UseRename {
+                    from,
+                    to,
+                    in_test,
+                    line: start,
+                }));
+            syn::visit::visit_item_use(v, u);
+        });
     }
     fn visit_item_enum(&mut self, e: &'ast syn::ItemEnum) {
         self.scoped(&e.attrs, e, |v| syn::visit::visit_item_enum(v, e));
@@ -482,10 +827,14 @@ fn structure_of(file: &str, src: &str) -> Structure {
 // ---------------------------------------------------------------------------
 
 /// One file, ready to scan: the source with comment lines and test spans
-/// blanked (line numbering kept), plus its structure.
+/// blanked (line numbering kept), plus its structure. `code_only` is the same
+/// text with every comment and every string and char literal's contents
+/// blanked too, byte for byte, so an offset or a line number means the same in
+/// both.
 struct Prepared {
     file: String,
     code: String,
+    code_only: String,
     line_starts: Vec<usize>,
     structure: Structure,
 }
@@ -507,26 +856,142 @@ fn prepare(file: &str, src: &str) -> Prepared {
 fn masked(file: &str, src: &str, structure: Structure) -> Prepared {
     let lines: Vec<&str> = src.lines().collect();
     let comments = comment_mask(&lines);
-    let masked: Vec<&str> = lines
-        .iter()
-        .enumerate()
-        .map(|(i, l)| {
-            if comments[i] || structure.in_test_span(i + 1) {
-                ""
-            } else {
-                *l
-            }
-        })
-        .collect();
-    let code = masked.join("\n");
+    let keep = |i: usize| comments.get(i) == Some(&false) && !structure.in_test_span(i + 1);
+    let mask = |text: &str| {
+        text.lines()
+            .enumerate()
+            .map(|(i, l)| if keep(i) { l } else { "" })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let code = mask(src);
+    let code_only = mask(&blank_literals_and_comments(src));
+    assert_eq!(
+        code_only.len(),
+        code.len(),
+        "{file}: blanking literals and comments moved a byte offset"
+    );
     let mut line_starts = vec![0usize];
     line_starts.extend(code.match_indices('\n').map(|(i, _)| i + 1));
     Prepared {
         file: file.to_string(),
         code,
+        code_only,
         line_starts,
         structure,
     }
+}
+
+/// `src` with every comment, and the contents of every string and char
+/// literal, overwritten with spaces byte for byte. Line breaks stay, so every
+/// byte offset and line number is unchanged. Rules 8 and 9 read this copy: a
+/// type named in a string, a log message or a trailing comment is not a
+/// mention, and a comma inside a string does not split an argument list.
+///
+/// It lexes line and nested block comments, plain, byte and C strings with
+/// their escapes, raw strings with any number of `#`, and char literals as
+/// distinct from lifetimes and labels.
+fn blank_literals_and_comments(src: &str) -> String {
+    let b = src.as_bytes();
+    let at = |i: usize| b.get(i).copied().unwrap_or(0);
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut out = b.to_vec();
+    let mut blank = |from: usize, to: usize| {
+        if let Some(range) = out.get_mut(from..to.min(b.len())) {
+            range
+                .iter_mut()
+                .filter(|c| **c != b'\n' && **c != b'\r')
+                .for_each(|c| *c = b' ');
+        }
+    };
+    let mut i = 0;
+    while i < b.len() {
+        match at(i) {
+            b'/' if at(i + 1) == b'/' => {
+                let end = b
+                    .get(i..)
+                    .unwrap_or_default()
+                    .iter()
+                    .position(|&c| c == b'\n')
+                    .map_or(b.len(), |n| i + n);
+                blank(i, end);
+                i = end;
+            }
+            b'/' if at(i + 1) == b'*' => {
+                let (mut depth, mut j) = (1usize, i + 2);
+                while j < b.len() && depth > 0 {
+                    if at(j) == b'/' && at(j + 1) == b'*' {
+                        depth += 1;
+                        j += 2;
+                    } else if at(j) == b'*' && at(j + 1) == b'/' {
+                        depth -= 1;
+                        j += 2;
+                    } else {
+                        j += 1;
+                    }
+                }
+                blank(i, j);
+                i = j;
+            }
+            b'"' => {
+                let mut j = i + 1;
+                while j < b.len() && at(j) != b'"' {
+                    j += if at(j) == b'\\' { 2 } else { 1 };
+                }
+                blank(i + 1, j);
+                i = j + 1;
+            }
+            b'r' | b'b' | b'c' if i == 0 || !is_ident(at(i - 1)) => {
+                // A raw string, `r"…"`, `r#"…"#`, `br"…"`, `cr#"…"#`, or the
+                // first letter of an identifier or of a byte / C string.
+                let r = if at(i) == b'r' { i } else { i + 1 };
+                let hashes = b
+                    .get(r + 1..)
+                    .unwrap_or_default()
+                    .iter()
+                    .take_while(|&&c| c == b'#')
+                    .count();
+                let open = r + 1 + hashes;
+                if at(r) == b'r' && at(open) == b'"' {
+                    let closes =
+                        |k: usize| at(k) == b'"' && (1..=hashes).all(|h| at(k + h) == b'#');
+                    let mut k = open + 1;
+                    while k < b.len() && !closes(k) {
+                        k += 1;
+                    }
+                    blank(open + 1, k);
+                    i = k + 1 + hashes;
+                } else {
+                    i += 1;
+                }
+            }
+            b'\'' => {
+                if at(i + 1) == b'\\' {
+                    // '\n', '\'', '\\', '\x7f', '\u{…}'.
+                    let mut j = i + 3;
+                    while j < b.len() && at(j) != b'\'' && at(j) != b'\n' {
+                        j += 1;
+                    }
+                    blank(i + 1, j);
+                    i = j + 1;
+                } else {
+                    let width = src
+                        .get(i + 1..)
+                        .and_then(|s| s.chars().next())
+                        .map_or(1, char::len_utf8);
+                    if at(i + 1) != b'\n' && at(i + 1 + width) == b'\'' {
+                        blank(i + 1, i + 1 + width);
+                        i += 2 + width;
+                    } else {
+                        // A lifetime or a label.
+                        i += 1;
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    String::from_utf8(out).expect("blanking writes ASCII spaces over whole characters")
 }
 
 fn prepare_all(sources: &Sources) -> Vec<Prepared> {
@@ -871,12 +1336,21 @@ fn roster_verdict(prepared: &[Prepared], rows: &Rows) -> RosterVerdict {
     }
 }
 
-/// `operator` rows an automation can borrow (NC5-1), each with the route.
+/// The `POST /ui-bridge/tauri/invoke` proxy.
+const PROXY_FILE: &str = "mcp/tauri_proxy.rs";
+
+/// `operator` rows an automation can borrow (NC5-1), each with the route. An
+/// operator fn is borrowable when it is on the `/ui-bridge/invoke/<name>`
+/// allowlist, when it is a fn of the Tauri proxy, or when ANY production Rust
+/// code calls it. The last test covers every depth at once: a proxy arm, a
+/// door, or a shared helper either of them calls. A bare name is not a call,
+/// so registering the fn in `tauri::generate_handler!` (or `ipc_group!`) is
+/// not one.
 fn borrowable_operator_rows(prepared: &[Prepared], rows: &Rows) -> Vec<String> {
-    let proxy = prepared
-        .iter()
-        .find(|p| p.file == "mcp/tauri_proxy.rs")
-        .expect("the UI Bridge Tauri proxy (mcp/tauri_proxy.rs) is part of the scan");
+    assert!(
+        prepared.iter().any(|p| p.file == PROXY_FILE),
+        "the UI Bridge Tauri proxy ({PROXY_FILE}) is part of the scan"
+    );
     let mut out = Vec::new();
     for ((file, func), _) in rows.iter().filter(|(_, r)| r.class == "operator") {
         if crate::ui_bridge_invoke::is_allowlisted(func) {
@@ -884,18 +1358,26 @@ fn borrowable_operator_rows(prepared: &[Prepared], rows: &Rows) -> Vec<String> {
                 "{file}:{func} is on the POST /ui-bridge/invoke/<name> allowlist"
             ));
         }
-        if file == "mcp/tauri_proxy.rs" {
+        if file == PROXY_FILE {
             out.push(format!(
                 "{file}:{func} is a fn of the POST /ui-bridge/tauri/invoke proxy itself"
             ));
-        } else if token_re(&format!("{func}("))
-            .find_iter(&proxy.code)
-            .any(|m| !is_declaration(&proxy.code, m.start()))
-        {
-            out.push(format!(
-                "{file}:{func} is called by the POST /ui-bridge/tauri/invoke proxy"
-            ));
         }
+        let call = token_re(&format!("{func}("));
+        let mut callers = BTreeSet::new();
+        for p in prepared {
+            for m in call.find_iter(&p.code_only) {
+                if !is_declaration(&p.code_only, m.start()) {
+                    callers.insert(format!("{}:{}", p.file, owner_of(p, p.line_of(m.start()))));
+                }
+            }
+        }
+        out.extend(callers.into_iter().map(|caller| {
+            format!(
+                "{file}:{func} has a production Rust caller, {caller} — an operator close is \
+                 reached only from the webview, over IPC"
+            )
+        }));
     }
     out
 }
@@ -904,11 +1386,71 @@ fn borrowable_operator_rows(prepared: &[Prepared], rows: &Rows) -> Vec<String> {
 // The close-authority scan
 // ---------------------------------------------------------------------------
 
-/// Everything wrong with how a close authority can be obtained.
-fn close_authority_violations(prepared: &[Prepared]) -> Vec<String> {
-    let mut out = Vec::new();
+/// What the close-authority scan found. The lists after `violations` are what
+/// it checked and let pass, so a test can prove the scan was not vacuous.
+#[derive(Debug, Default)]
+struct AuthorityScan {
+    violations: Vec<String>,
+    /// Rule 8's allowed `authority` parameter mentions, as `file:fn`.
+    param_mentions: Vec<String>,
+    /// Rule 9's primitive calls that pass `None`, as `file:fn`.
+    none_calls: Vec<String>,
+    /// Rule 9's primitive calls through which an entry point forwards its own
+    /// `authority`, as `file:fn` of that entry point.
+    forwarded_calls: Vec<String>,
+}
 
-    // (1) Shape: exactly one definition, in its own module, sealed.
+/// Everything wrong with how a close authority can be obtained: the type's
+/// shape (rule 1), then rules 2-9b over every file.
+fn close_authority_scan(prepared: &[Prepared]) -> AuthorityScan {
+    let mut scan = file_scan(prepared);
+    let mut violations = shape_violations(prepared);
+    violations.append(&mut scan.violations);
+    scan.violations = violations;
+    scan
+}
+
+fn close_authority_violations(prepared: &[Prepared]) -> Vec<String> {
+    close_authority_scan(prepared).violations
+}
+
+/// Rules 2-9b over every file, without rule 1's whole-tree shape check.
+fn file_scan(prepared: &[Prepared]) -> AuthorityScan {
+    let mut scan = AuthorityScan::default();
+    for p in prepared {
+        let names = authority_names(p);
+        scan.violations.extend(impl_violations(p, &names));
+        scan.violations.extend(constructor_violations(p, &names));
+        scan.violations.extend(typed_item_violations(p, &names));
+        scan.violations.extend(alias_violations(p, &names));
+        scan.violations.extend(literal_violations(p, &names));
+        mention_violations(p, &names, &mut scan);
+        primitive_call_violations(p, &mut scan);
+        scan.violations.extend(entry_point_violations(p));
+    }
+    scan
+}
+
+/// A regex compiled once per test process.
+fn once(cell: &'static std::sync::OnceLock<Regex>, re: &str) -> &'static Regex {
+    cell.get_or_init(|| Regex::new(re).unwrap_or_else(|e| panic!("regex {re:?}: {e}")))
+}
+
+/// A regex matching any of `names` as a whole word.
+fn any_name_re(names: &BTreeSet<String>, suffix: &str) -> Regex {
+    let alternation = names
+        .iter()
+        .map(|n| regex::escape(n))
+        .collect::<Vec<_>>()
+        .join("|");
+    Regex::new(&format!(r"\b(?:{alternation})\b{suffix}")).expect("name regex")
+}
+
+/// Rule 1: exactly one definition, in its own module, a braced struct with at
+/// least one field and every field private, deriving `Debug` and nothing else,
+/// and carrying no attribute outside [`ALLOWED_STRUCT_ATTRS`].
+fn shape_violations(prepared: &[Prepared]) -> Vec<String> {
+    let mut out = Vec::new();
     let defs: Vec<(&str, &StructDef)> = prepared
         .iter()
         .flat_map(|p| {
@@ -930,18 +1472,36 @@ fn close_authority_violations(prepared: &[Prepared]) -> Vec<String> {
                 out.push(format!(
                     "{AUTHORITY_TYPE} has no field, so any module can build one by naming it"
                 ));
+            } else if !def.named {
+                out.push(format!(
+                    "{AUTHORITY_TYPE} is a tuple struct, whose constructor is a call that the \
+                     struct-literal rule does not read — keep its fields named"
+                ));
             }
             if def.public_fields > 0 {
                 out.push(format!(
                     "{AUTHORITY_TYPE} has a non-private field, so another module can build one"
                 ));
             }
-            for d in &def.derives {
-                if FORBIDDEN_DERIVES.contains(&d.as_str()) {
-                    out.push(format!(
-                        "{AUTHORITY_TYPE} derives {d}, which builds or duplicates an authority"
-                    ));
-                }
+            for d in def
+                .derives
+                .iter()
+                .filter(|d| !ALLOWED_DERIVES.contains(&d.as_str()))
+            {
+                out.push(format!(
+                    "{AUTHORITY_TYPE} derives {d}, which may build or duplicate an authority — \
+                     it may derive only {ALLOWED_DERIVES:?}"
+                ));
+            }
+            for a in def
+                .attrs
+                .iter()
+                .filter(|a| !ALLOWED_STRUCT_ATTRS.contains(&a.as_str()))
+            {
+                out.push(format!(
+                    "{AUTHORITY_TYPE} carries #[{a}], which may generate code no source scan \
+                     reads — it may carry only {ALLOWED_STRUCT_ATTRS:?}"
+                ));
             }
         }
         [] => out.push(format!(
@@ -953,123 +1513,469 @@ fn close_authority_violations(prepared: &[Prepared]) -> Vec<String> {
             many.iter().map(|(f, _)| *f).collect::<Vec<_>>()
         )),
     }
-
-    for p in prepared {
-        // (2) No trait impl, and (3) inherent impls only in its own module.
-        for i in p.structure.impls.iter().filter(|i| !i.in_test) {
-            if i.self_ty.as_deref() != Some(AUTHORITY_TYPE) {
-                continue;
-            }
-            match &i.trait_name {
-                Some(t) => out.push(format!(
-                    "{}: impl {t} for {AUTHORITY_TYPE} — no trait may build, duplicate or convert into one",
-                    p.file
-                )),
-                None if p.file != AUTHORITY_FILE => out.push(format!(
-                    "{}: an inherent impl of {AUTHORITY_TYPE} outside {AUTHORITY_FILE}",
-                    p.file
-                )),
-                None => {}
-            }
-        }
-
-        // (4) Every production fn that returns one is an authorized constructor.
-        for f in p.structure.fns.iter().filter(|f| !f.in_test) {
-            let returns_one = f.output_idents.iter().any(|i| i == AUTHORITY_TYPE)
-                || (f.impl_self.as_deref() == Some(AUTHORITY_TYPE)
-                    && f.output_idents.iter().any(|i| i == "Self"));
-            let authorized = AUTHORIZED_CONSTRUCTORS
-                .iter()
-                .any(|&(file, func)| file == p.file && func == f.name);
-            if returns_one && !authorized {
-                out.push(format!(
-                    "{}:{} returns a {AUTHORITY_TYPE} outside #[cfg(test)] — only the lifecycle Closer may mint one",
-                    p.file, f.name
-                ));
-            }
-        }
-
-        // (5) Every production mint site is authorized.
-        out.extend(unauthorized_mint_sites(p));
-    }
     out
 }
 
-/// Production struct literals of the authority, and calls of its associated
-/// fns, that no authorized fn makes.
-fn unauthorized_mint_sites(p: &Prepared) -> Vec<String> {
-    let literal = Regex::new(&format!(r"\b{AUTHORITY_TYPE}\s*\{{")).expect("literal regex");
-    let self_literal = Regex::new(r"\bSelf\s*\{").expect("Self literal regex");
-    let call = Regex::new(&format!(
-        r"\b{AUTHORITY_TYPE}\s*::\s*[A-Za-z_][A-Za-z0-9_]*\s*\("
-    ))
-    .expect("call regex");
-    // `struct X {`, `impl X {`, `impl T for X {` and their path-qualified forms
-    // are declarations, not literals.
-    let declaration = Regex::new(&format!(
-        r"\b(?:struct|impl|for)\s+(?:[A-Za-z_][A-Za-z0-9_]*::)*{AUTHORITY_TYPE}\b"
-    ))
-    .expect("declaration regex");
-    type Allowed = &'static [(&'static str, &'static str)];
-    let mut sites: Vec<(usize, &'static str, Allowed)> = Vec::new();
-    // `-> CloseAuthority {` / `-> Self {` is a fn signature meeting its body,
-    // not a literal; check (4) judges such a fn as a constructor already.
-    let after_arrow = |offset: usize| {
-        p.code
-            .get(..offset)
-            .unwrap_or("")
-            .trim_end()
-            .ends_with("->")
-    };
-    for m in literal.find_iter(&p.code) {
-        let line_start = p.line_starts[p.line_of(m.start()) - 1];
-        let line_text = p.code.get(line_start..m.end()).unwrap_or("");
-        if !declaration.is_match(line_text) && !after_arrow(m.start()) {
-            sites.push((
-                m.start(),
-                "builds one with a struct literal",
-                AUTHORIZED_CONSTRUCTORS,
-            ));
+/// The names that denote the close authority in `p`: the type, plus every
+/// non-test `type` alias of it and `use … as` rename of it in this file, to a
+/// fixed point (an alias of an alias). An alias is red where it is defined
+/// (rule 6), so resolving it in its own file is enough for every other rule to
+/// read it as the type there.
+fn authority_names(p: &Prepared) -> BTreeSet<String> {
+    let mut names = BTreeSet::from([AUTHORITY_TYPE.to_string()]);
+    loop {
+        let found: Vec<String> = p
+            .structure
+            .aliases
+            .iter()
+            .filter(|a| !a.in_test && a.ty_idents.iter().any(|i| names.contains(i)))
+            .map(|a| a.name.clone())
+            .chain(
+                p.structure
+                    .renames
+                    .iter()
+                    .filter(|r| !r.in_test && r.to != "_" && names.contains(&r.from))
+                    .map(|r| r.to.clone()),
+            )
+            .collect();
+        let before = names.len();
+        names.extend(found);
+        if names.len() == before {
+            return names;
         }
     }
-    for m in self_literal.find_iter(&p.code) {
-        let f = p.structure.innermost_fn(p.line_of(m.start()));
-        if f.and_then(|f| f.impl_self.as_deref()) == Some(AUTHORITY_TYPE) && !after_arrow(m.start())
-        {
-            sites.push((
-                m.start(),
-                "builds one with `Self { .. }`",
-                AUTHORIZED_CONSTRUCTORS,
-            ));
-        }
+}
+
+/// `CloseAuthority`, or `T (a second name for CloseAuthority)`.
+fn described(name: &str) -> String {
+    if name == AUTHORITY_TYPE {
+        name.to_string()
+    } else {
+        format!("{name} (a second name for {AUTHORITY_TYPE})")
     }
-    for m in call.find_iter(&p.code) {
-        sites.push((
-            m.start(),
-            "calls one of its associated fns",
-            AUTHORIZED_MINTERS,
-        ));
-    }
+}
+
+/// What a line belongs to, for a message: the innermost fn, impl block or
+/// `const` / `static` that holds it.
+fn owner_of(p: &Prepared, line: usize) -> String {
+    let s = &p.structure;
+    let holds = |start: usize, end: usize| line >= start && line <= end;
+    s.fns
+        .iter()
+        .filter(|f| holds(f.start, f.end))
+        .map(|f| (f.end - f.start, f.name.clone()))
+        .chain(s.impls.iter().filter(|i| holds(i.start, i.end)).map(|i| {
+            (
+                i.end - i.start,
+                format!("impl {}", i.self_ty.as_deref().unwrap_or("_")),
+            )
+        }))
+        .chain(
+            s.typed_items
+                .iter()
+                .filter(|t| holds(t.start, t.end))
+                .map(|t| (t.end - t.start, format!("{} {}", t.kind, t.name))),
+        )
+        .min_by_key(|(len, _)| *len)
+        .map_or_else(|| "<file scope>".to_string(), |(_, name)| name)
+}
+
+/// The fn a construction at `line` is attributed to: the innermost fn that
+/// holds it, unless an impl block or a `const` / `static` within that fn's
+/// lines holds it too. Then the construction belongs to that item, so an
+/// associated const can never borrow an enclosing fn's authorization.
+fn constructing_fn(p: &Prepared, line: usize) -> Option<&FnSpan> {
+    let s = &p.structure;
+    let f = s.innermost_fn(line)?;
+    let nested = s
+        .impls
+        .iter()
+        .map(|i| (i.start, i.end))
+        .chain(s.typed_items.iter().map(|t| (t.start, t.end)))
+        .any(|(start, end)| line >= start && line <= end && start >= f.start && end <= f.end);
+    (!nested).then_some(f)
+}
+
+/// The text of `offset`'s line in `code_only`, up to `offset`.
+fn prefix_of(p: &Prepared, offset: usize) -> &str {
+    let start = p
+        .line_starts
+        .get(p.line_of(offset).saturating_sub(1))
+        .copied()
+        .unwrap_or(0);
+    p.code_only.get(start..offset).unwrap_or("")
+}
+
+fn is_entry_point(file: &str, f: &FnSpan) -> bool {
+    AUTHORITY_PARAM_FNS
+        .iter()
+        .any(|&(pf, ps, pn)| pf == file && pn == f.name && f.impl_self.as_deref() == ps)
+}
+
+fn is_authorized(list: &[(&str, &str)], file: &str, f: Option<&FnSpan>) -> bool {
+    f.is_some_and(|f| list.iter().any(|&(lf, lfn)| lf == file && lfn == f.name))
+}
+
+/// Rules 2 and 3: no trait impl for the type anywhere, and no inherent impl
+/// outside its own module.
+fn impl_violations(p: &Prepared, names: &BTreeSet<String>) -> Vec<String> {
+    p.structure
+        .impls
+        .iter()
+        .filter(|i| !i.in_test)
+        .filter_map(|i| {
+            let ty = i.self_ty.as_deref().filter(|t| names.contains(*t))?;
+            match &i.trait_name {
+                Some(t) => Some(format!(
+                    "{}:{} impl {t} for {} — no trait may build, duplicate or convert into one",
+                    p.file,
+                    i.start,
+                    described(ty)
+                )),
+                None if p.file != AUTHORITY_FILE => Some(format!(
+                    "{}:{} an inherent impl of {} outside {AUTHORITY_FILE}",
+                    p.file,
+                    i.start,
+                    described(ty)
+                )),
+                None => None,
+            }
+        })
+        .collect()
+}
+
+/// Rule 4: every production fn that returns one is an authorized constructor.
+fn constructor_violations(p: &Prepared, names: &BTreeSet<String>) -> Vec<String> {
+    p.structure
+        .fns
+        .iter()
+        .filter(|f| !f.in_test)
+        .filter(|f| {
+            f.output_idents.iter().any(|i| names.contains(i))
+                || (f.impl_self.as_ref().is_some_and(|s| names.contains(s))
+                    && f.output_idents.iter().any(|i| i == "Self"))
+        })
+        .filter(|f| !is_authorized(AUTHORIZED_CONSTRUCTORS, &p.file, Some(*f)))
+        .map(|f| {
+            format!(
+                "{}:{} returns a {AUTHORITY_TYPE} outside #[cfg(test)] — only the lifecycle \
+                 Closer may mint one",
+                p.file, f.name
+            )
+        })
+        .collect()
+}
+
+/// Rule 5: no `const` or `static` holds one, an associated one included.
+fn typed_item_violations(p: &Prepared, names: &BTreeSet<String>) -> Vec<String> {
+    p.structure
+        .typed_items
+        .iter()
+        .filter(|t| !t.in_test)
+        .filter(|t| {
+            t.ty_idents.iter().any(|i| names.contains(i))
+                || (t.impl_self.as_ref().is_some_and(|s| names.contains(s))
+                    && t.ty_idents.iter().any(|i| i == "Self"))
+        })
+        .map(|t| {
+            format!(
+                "{}:{} `{} {}` holds a {AUTHORITY_TYPE} — a stored authority outlives the one \
+                 close it was minted for",
+                p.file, t.start, t.kind, t.name
+            )
+        })
+        .collect()
+}
+
+/// Rule 6: no `type` alias of it and no `use … as` rename of it.
+fn alias_violations(p: &Prepared, names: &BTreeSet<String>) -> Vec<String> {
+    let aliases = p
+        .structure
+        .aliases
+        .iter()
+        .filter(|a| !a.in_test && a.ty_idents.iter().any(|i| names.contains(i)))
+        .map(|a| (a.line, format!("`type {}` aliases", a.name)));
+    let renames = p
+        .structure
+        .renames
+        .iter()
+        .filter(|r| !r.in_test && names.contains(&r.from))
+        .map(|r| (r.line, format!("`use … as {}` renames", r.to)));
+    aliases
+        .chain(renames)
+        .map(|(line, what)| {
+            format!(
+                "{}:{line} {what} {AUTHORITY_TYPE} — a second name for the authority, which \
+                 every rule here would have to follow",
+                p.file
+            )
+        })
+        .collect()
+}
+
+/// A prefix that makes the name after it a declaration or a signature, not an
+/// expression: `struct`, `enum`, `union`, `trait`, `type`, `mod`, `impl` (with
+/// its generics), `for` in an impl header, or `->`, each optionally followed
+/// by a path.
+fn declaration_prefix_re() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    once(
+        &RE,
+        r"(?:\b(?:struct|enum|union|trait|type|mod|impl|for)(?:\s*<[^>]*>)?|->)\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*$",
+    )
+}
+
+/// Rule 7: no struct literal of it outside an authorized constructor. A
+/// `Self { .. }` inside one of its impls counts, attributed to what holds it:
+/// the impl, an associated `const`, or the fn (see [`constructing_fn`]).
+fn literal_violations(p: &Prepared, names: &BTreeSet<String>) -> Vec<String> {
+    static SELF_LITERAL: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let decl = declaration_prefix_re();
+    let mut sites: Vec<(usize, &str)> = any_name_re(names, r"\s*\{")
+        .find_iter(&p.code_only)
+        .filter(|m| !decl.is_match(prefix_of(p, m.start())))
+        .map(|m| (m.start(), "builds one with a struct literal"))
+        .collect();
+    sites.extend(
+        once(&SELF_LITERAL, r"\bSelf\s*\{")
+            .find_iter(&p.code_only)
+            .filter(|m| {
+                let line = p.line_of(m.start());
+                p.structure.innermost_impl(line).is_some_and(|i| {
+                    !i.in_test && i.self_ty.as_ref().is_some_and(|t| names.contains(t))
+                }) && !decl.is_match(prefix_of(p, m.start()))
+            })
+            .map(|m| (m.start(), "builds one with `Self { .. }`")),
+    );
     sites
         .into_iter()
-        .filter_map(|(offset, what, allowed)| {
+        .filter_map(|(offset, what)| {
             let line = p.line_of(offset);
-            let name = p
-                .structure
-                .innermost_fn(line)
-                .map_or("<file scope>", |f| f.name.as_str());
-            let authorized = allowed
-                .iter()
-                .any(|&(file, func)| file == p.file && func == name);
-            (!authorized).then(|| {
+            let f = constructing_fn(p, line);
+            (!is_authorized(AUTHORIZED_CONSTRUCTORS, &p.file, f)).then(|| {
                 format!(
-                    "{}:{line} ({name}) {what} — only the lifecycle Closer may obtain a \
+                    "{}:{line} ({}) {what} — only the lifecycle Closer may mint a \
                      {AUTHORITY_TYPE}",
-                    p.file
+                    p.file,
+                    owner_of(p, line)
                 )
             })
         })
         .collect()
+}
+
+/// Rule 8: a mention of the type is allowed only inside its own module, on a
+/// `use` line, as the `authority: Option<…>` parameter of a primitive entry
+/// point, or inside an authorized minter. Everything else is red, so a new way
+/// of naming the type is red until someone decides it is safe.
+fn mention_violations(p: &Prepared, names: &BTreeSet<String>, scan: &mut AuthorityScan) {
+    static PARAM: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static ASSOC_CALL: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    if p.file == AUTHORITY_FILE {
+        return;
+    }
+    let param = once(
+        &PARAM,
+        r"\bauthority\s*:\s*Option\s*<\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*$",
+    );
+    let assoc_call = once(&ASSOC_CALL, r"^\s*::\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(");
+    for m in any_name_re(names, "").find_iter(&p.code_only) {
+        let line = p.line_of(m.start());
+        if p.structure.in_use_span(line) {
+            continue;
+        }
+        let f = p.structure.innermost_fn(line);
+        if is_authorized(AUTHORIZED_MINTERS, &p.file, f) {
+            continue;
+        }
+        let prefix = prefix_of(p, m.start());
+        if let Some(f) = f.filter(|f| is_entry_point(&p.file, f)) {
+            let in_signature =
+                line < f.body_start || (line == f.body_start && !prefix.contains('{'));
+            if in_signature && m.as_str() == AUTHORITY_TYPE && param.is_match(prefix) {
+                scan.param_mentions.push(format!("{}:{}", p.file, f.name));
+                continue;
+            }
+        }
+        let what = match assoc_call
+            .captures(p.code_only.get(m.end()..).unwrap_or(""))
+            .and_then(|c| c.get(1))
+        {
+            Some(assoc) => format!("calls `{}::{}`", m.as_str(), assoc.as_str()),
+            None => format!("names `{}`", m.as_str()),
+        };
+        scan.violations.push(format!(
+            "{}:{line} ({}) {what} — a mention is allowed only in {AUTHORITY_FILE}, on a `use` \
+             line, as the `authority` parameter of a primitive entry point, or in an authorized \
+             minter; only the lifecycle Closer may obtain a {AUTHORITY_TYPE}",
+            p.file,
+            owner_of(p, line)
+        ));
+    }
+}
+
+/// The top-level arguments of the call whose `(` is at `open` in `code`, each
+/// trimmed, with a trailing comma's empty one dropped. `None` when the
+/// parentheses never balance. Brackets and braces nest; `<…>` and closure bars
+/// do not, so a comma inside a turbofish or a closure's parameter list splits
+/// an argument. That can only make the LAST argument read as something other
+/// than `None`, which is red.
+fn call_args(code: &str, open: usize) -> Option<Vec<&str>> {
+    let mut depth = 0usize;
+    let mut start = open + 1;
+    let mut args = Vec::new();
+    for (n, &c) in code.as_bytes().get(open..)?.iter().enumerate() {
+        let k = open + n;
+        match c {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    args.push(code.get(start..k)?.trim());
+                    if args.last() == Some(&"") {
+                        args.pop();
+                    }
+                    return Some(args);
+                }
+            }
+            b',' if depth == 1 => {
+                args.push(code.get(start..k)?.trim());
+                start = k + 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The primitive's entry points, by the name a call uses.
+const PRIMITIVE_CALLS: &[&str] = &[
+    "graceful_exit",
+    "graceful_exit_then",
+    "graceful_exit_driven",
+];
+
+/// Rule 9: every call of the primitive passes `None` as its authority (its
+/// last argument). An entry point may forward its own `authority`, and an
+/// authorized minter may pass what it minted. `drive` counts under
+/// `terminal/` only, the one module that can call it (it is `pub(super)`).
+/// Naming the primitive without calling it (a fn value) or calling it with a
+/// turbofish hides the argument, so both are red too.
+fn primitive_call_violations(p: &Prepared, scan: &mut AuthorityScan) {
+    static IN_TERMINAL: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static ELSEWHERE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static MOD_DECL: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = if p.file.starts_with("terminal/") {
+        once(
+            &IN_TERMINAL,
+            &format!(r"\b(?:{}|drive)\b", PRIMITIVE_CALLS.join("|")),
+        )
+    } else {
+        once(
+            &ELSEWHERE,
+            &format!(r"\b(?:{})\b", PRIMITIVE_CALLS.join("|")),
+        )
+    };
+    let mod_decl = once(&MOD_DECL, r"\bmod\s*$");
+    let code = &p.code_only;
+    for m in re.find_iter(code) {
+        let line = p.line_of(m.start());
+        let prefix = prefix_of(p, m.start());
+        let name = m.as_str();
+        if is_declaration(code, m.start())
+            || p.structure.in_use_span(line)
+            || mod_decl.is_match(prefix)
+            || (name == "drive" && prefix.trim_end().ends_with('.'))
+        {
+            continue;
+        }
+        let f = p.structure.innermost_fn(line);
+        let minter = is_authorized(AUTHORIZED_MINTERS, &p.file, f);
+        let owner = owner_of(p, line);
+        let rest = code.get(m.end()..).unwrap_or("");
+        let after = rest.trim_start();
+        let refused = |why: String| {
+            format!(
+                "{}:{line} ({owner}) {why} — every call passes `None`; only a primitive entry \
+                 point may forward its own `authority`, and only an authorized minter may pass \
+                 one",
+                p.file
+            )
+        };
+        if let Some(path) = after.strip_prefix("::") {
+            // `graceful_exit::GracefulExitOutcome` is a module path; a
+            // turbofish is a call the argument parse does not read.
+            if path.trim_start().starts_with('<') && !minter {
+                scan.violations.push(refused(format!(
+                    "calls `{name}` with a turbofish, whose arguments the scan does not read"
+                )));
+            }
+            continue;
+        }
+        if !after.starts_with('(') {
+            if !minter {
+                scan.violations.push(refused(format!(
+                    "names `{name}` without calling it, so the authority it is handed cannot \
+                     be read"
+                )));
+            }
+            continue;
+        }
+        let open = m.end() + (rest.len() - after.len());
+        let Some(args) = call_args(code, open) else {
+            scan.violations.push(refused(format!(
+                "calls `{name}(` with arguments the scan cannot parse"
+            )));
+            continue;
+        };
+        let last = args.last().copied().unwrap_or("");
+        if last == "None" {
+            scan.none_calls.push(format!("{}:{owner}", p.file));
+        } else if last == AUTHORITY_PARAM && f.is_some_and(|f| is_entry_point(&p.file, f)) {
+            scan.forwarded_calls.push(format!("{}:{owner}", p.file));
+        } else if !minter {
+            let shown: String = last
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(80)
+                .collect();
+            scan.violations.push(refused(format!(
+                "passes `{shown}` as the authority of `{name}(`"
+            )));
+        }
+    }
+}
+
+/// Rule 9b: inside a primitive entry point, `authority` IS the caller's
+/// value. The parameter is not `mut`, `ref` or a sub-pattern, and nothing in
+/// the body binds the name again, so the `authority` rule 9 lets an entry point
+/// forward cannot be a value the entry point made.
+fn entry_point_violations(p: &Prepared) -> Vec<String> {
+    let mut out = Vec::new();
+    let unchanged = "a primitive entry point forwards the authority its caller passed, unchanged";
+    for f in p
+        .structure
+        .fns
+        .iter()
+        .filter(|f| !f.in_test && is_entry_point(&p.file, f))
+    {
+        if f.authority_param_rebindable == Some(true) {
+            out.push(format!(
+                "{}:{} declares its `authority` parameter `mut`, `ref` or with a sub-pattern — \
+                 {unchanged}",
+                p.file, f.name
+            ));
+        }
+        for line in &f.authority_rebinds {
+            out.push(format!(
+                "{}:{line} ({}) binds `authority` again — {unchanged}",
+                p.file, f.name
+            ));
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1211,10 +2117,11 @@ fn close_authority_has_no_constructor_outside_test_code() {
     );
 }
 
-/// The roster names the source scan's own subject. The mint scan above checks
-/// every module; this checks that it actually SAW the type and its test
-/// constructor, so an empty result is a real "nothing mints", not a scan that
-/// found nothing to look at.
+/// The check above finds nothing; this proves it LOOKED. It found the test
+/// constructor, and that it is test-only. It allowed exactly the four entry
+/// points' `authority` parameters. It saw the three forwards between them, and
+/// it saw the production callers pass `None`. A scan gone blind to the type
+/// or to the calls fails here instead of passing vacuously.
 #[test]
 fn no_module_but_the_closer_can_obtain_a_close_authority() {
     let prepared = real_tree();
@@ -1232,11 +2139,45 @@ fn no_module_but_the_closer_can_obtain_a_close_authority() {
         test_ctor.in_test,
         "CloseAuthority::for_test is not #[cfg(test)]"
     );
-    let mints: Vec<String> = prepared.iter().flat_map(unauthorized_mint_sites).collect();
-    assert!(
-        mints.is_empty(),
-        "production code obtains a CloseAuthority: {mints:#?}"
+    let scan = close_authority_scan(prepared);
+    let sorted = |v: &[String]| {
+        let mut v = v.to_vec();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        sorted(&scan.param_mentions),
+        vec![
+            "terminal/graceful_exit.rs:drive",
+            "terminal/manager.rs:graceful_exit",
+            "terminal/session.rs:graceful_exit_driven",
+            "terminal/session.rs:graceful_exit_then",
+        ],
+        "each primitive entry point takes `authority: Option<CloseAuthority>` exactly once — \
+         update AUTHORITY_PARAM_FNS if an entry point moved"
     );
+    assert_eq!(
+        sorted(&scan.forwarded_calls),
+        vec![
+            "terminal/manager.rs:graceful_exit",
+            "terminal/session.rs:graceful_exit_driven",
+            "terminal/session.rs:graceful_exit_then",
+        ],
+        "the entry points forward the caller's authority down to `drive`"
+    );
+    for caller in [
+        "mcp/backend_relay.rs:end_admitted_terminal",
+        "mcp/debug_graceful_exit.rs:graceful_exit_door",
+        "mcp/steward.rs:stop_at_boundary",
+        "session/wind_down_executor.rs:wind_down_exit",
+    ] {
+        assert!(
+            scan.none_calls.iter().any(|c| c == caller),
+            "rule 9 never saw {caller} call the primitive with `None` — the call scan has gone \
+             blind ({:?})",
+            scan.none_calls
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1337,10 +2278,7 @@ fn an_out_of_line_test_module_is_test_code() {
         vec![("mcp/door/real.rs".to_string(), "real_close".to_string())]
     );
     assert_eq!(
-        prepared
-            .iter()
-            .flat_map(unauthorized_mint_sites)
-            .collect::<Vec<_>>(),
+        file_scan(&prepared).violations,
         Vec::<String>::new(),
         "a test module's out-of-line body may mint"
     );
@@ -1451,13 +2389,15 @@ fn an_allowlisted_operator_close_row_is_caught() {
     );
 }
 
-/// The per-site half of NC5-1, on the REAL proxy source. An `operator` row
-/// for a fn a proxy arm calls is caught (`end_remote_session`, which the
+/// The per-site half of NC5-1, on the REAL tree. An `operator` row for a fn a
+/// proxy arm calls is caught (`end_remote_session`, which the
 /// `remote_session_end` arm calls). An `operator` row for the Tauri command
 /// `terminal_close` is NOT caught, although `terminal_close` is a safelisted
 /// proxy command NAME: the proxy's arm of that name calls `tm.close` and never
-/// the command. A name check would be red there, which is why the check is per
-/// site.
+/// the command, and the command's only other appearances are its registrations
+/// (`generate_handler!` in `main.rs`, `ipc_group!` in its module), which name it
+/// without calling it. A name check would be red there, which is why the check
+/// is per site.
 #[test]
 fn the_proxy_check_is_per_site_not_by_name() {
     assert!(
@@ -1471,24 +2411,82 @@ fn the_proxy_check_is_per_site_not_by_name() {
         "operator",
         "x",
     )]);
+    let violations = borrowable_operator_rows(prepared, &caught);
+    assert!(
+        violations.iter().any(|v| v
+            == "commands/remote_end.rs:end_remote_session has a production Rust caller, \
+                mcp/tauri_proxy.rs:dispatch — an operator close is reached only from the \
+                webview, over IPC"),
+        "{violations:#?}"
+    );
+    let by_name_only = rows_of(&[("commands/terminal.rs", "terminal_close", "operator", "x")]);
     assert_eq!(
-        borrowable_operator_rows(prepared, &caught),
+        borrowable_operator_rows(prepared, &by_name_only),
+        Vec::<String>::new(),
+        "the proxy's terminal_close arm never calls the Tauri command of that name, and a \
+         registration is not a call"
+    );
+    let the_proxy_itself = rows_of(&[("mcp/tauri_proxy.rs", "dispatch", "operator", "x")]);
+    assert!(
+        borrowable_operator_rows(prepared, &the_proxy_itself)
+            .iter()
+            .any(|v| v.ends_with("is a fn of the POST /ui-bridge/tauri/invoke proxy itself")),
+        "the proxy's own dispatch can never be an operator door"
+    );
+}
+
+/// The depth half of NC5-1 (finding 4). A check of the proxy's own arms is one
+/// hop deep. Here an arm calls a shared helper, and the helper calls the
+/// operator fn, so the operator fn has a production Rust caller and is red. The
+/// same tree with only the fn's `generate_handler!` registration left is
+/// green: naming a command there registers it, which is not a call.
+#[test]
+fn an_operator_fn_with_any_production_caller_is_red() {
+    const PROXY: (&str, &str) = (
+        "mcp/tauri_proxy.rs",
+        "pub(crate) async fn dispatch(cmd: &str) {\n    if cmd == \"x\" {\n        \
+         crate::commands::shared::shared_helper().await;\n    }\n}\n",
+    );
+    const OPERATOR: (&str, &str) = (
+        "commands/operator.rs",
+        "#[tauri::command]\npub async fn operator_close(id: &str) {\n    tm.close(id);\n}\n",
+    );
+    const REGISTRATION: (&str, &str) = (
+        "main.rs",
+        "fn run() {\n    let _h = tauri::generate_handler![commands::operator::operator_close, other];\n}\n",
+    );
+    let rows = rows_of(&[("commands/operator.rs", "operator_close", "operator", "x")]);
+    let through_a_helper = synthetic(&[
+        PROXY,
+        (
+            "commands/shared.rs",
+            "pub(crate) async fn shared_helper() {\n    \
+             crate::commands::operator::operator_close(\"t\").await;\n}\n",
+        ),
+        OPERATOR,
+        REGISTRATION,
+    ]);
+    assert_eq!(
+        borrowable_operator_rows(&through_a_helper, &rows),
         vec![
-            "commands/remote_end.rs:end_remote_session is called by the POST \
-             /ui-bridge/tauri/invoke proxy"
+            "commands/operator.rs:operator_close has a production Rust caller, \
+             commands/shared.rs:shared_helper — an operator close is reached only from the \
+             webview, over IPC"
                 .to_string()
         ]
     );
-    let by_name_only = rows_of(&[("commands/terminal.rs", "terminal_close", "operator", "x")]);
-    assert!(
-        borrowable_operator_rows(prepared, &by_name_only).is_empty(),
-        "the proxy's terminal_close arm never calls the Tauri command of that name"
-    );
-    let the_proxy_itself = rows_of(&[("mcp/tauri_proxy.rs", "dispatch", "operator", "x")]);
+    let registered_only = synthetic(&[
+        PROXY,
+        (
+            "commands/shared.rs",
+            "pub(crate) async fn shared_helper() {}\n",
+        ),
+        OPERATOR,
+        REGISTRATION,
+    ]);
     assert_eq!(
-        borrowable_operator_rows(prepared, &the_proxy_itself).len(),
-        1,
-        "the proxy's own dispatch can never be an operator door"
+        borrowable_operator_rows(&registered_only, &rows),
+        Vec::<String>::new()
     );
 }
 
@@ -1499,6 +2497,18 @@ fn authority_tree(authority_src: &str, others: &[(&str, &str)]) -> Vec<Prepared>
     let mut files = vec![(AUTHORITY_FILE, authority_src)];
     files.extend_from_slice(others);
     synthetic(&files)
+}
+
+/// The scan's violations over `prepared`, each `needle` asserted present.
+fn assert_red(prepared: &[Prepared], needles: &[&str]) -> Vec<String> {
+    let violations = close_authority_violations(prepared);
+    for needle in needles {
+        assert!(
+            violations.iter().any(|v| v.contains(needle)),
+            "expected a violation containing {needle:?}, got {violations:#?}"
+        );
+    }
+    violations
 }
 
 #[test]
@@ -1524,65 +2534,218 @@ fn a_public_constructor_is_red() {
     let violations = close_authority_violations(&authority_tree(&src, &[]));
     assert_eq!(violations.len(), 2, "{violations:#?}");
     assert!(violations[0].contains("terminal/close_authority.rs:new returns a CloseAuthority"));
-    assert!(violations[1].contains("builds one with `Self { .. }`"));
+    assert!(violations[1].contains("(new) builds one with `Self { .. }`"));
 }
 
 #[test]
-fn a_public_field_a_unit_type_or_a_duplicating_derive_is_red() {
+fn a_public_field_a_unit_or_tuple_type_or_a_duplicating_derive_is_red() {
     let public = SEALED.replace("    _sealed: (),", "    pub sealed: (),");
-    assert!(close_authority_violations(&authority_tree(&public, &[]))
-        .iter()
-        .any(|v| v.contains("non-private field")));
-
-    let unit = "pub struct CloseAuthority;\n";
-    assert!(close_authority_violations(&authority_tree(unit, &[]))
-        .iter()
-        .any(|v| v.contains("has no field")));
-
+    assert_red(&authority_tree(&public, &[]), &["non-private field"]);
+    assert_red(
+        &authority_tree("pub struct CloseAuthority;\n", &[]),
+        &["has no field"],
+    );
+    assert_red(
+        &authority_tree("pub struct CloseAuthority(());\n", &[]),
+        &["is a tuple struct"],
+    );
     for derive in ["Clone", "Default", "Copy", "serde::Deserialize"] {
         let derived = SEALED.replace("#[derive(Debug)]", &format!("#[derive(Debug, {derive})]"));
-        assert!(
-            close_authority_violations(&authority_tree(&derived, &[]))
-                .iter()
-                .any(|v| v.contains("derives")),
-            "derive({derive}) must be red"
+        let name = derive.rsplit("::").next().unwrap_or(derive);
+        assert_red(
+            &authority_tree(&derived, &[]),
+            &[&format!("derives {name}")],
         );
+    }
+}
+
+/// Finding 1, route 4: a derive behind `cfg_attr`, at any depth, is a derive,
+/// and an attribute macro on the definition is red.
+#[test]
+fn a_cfg_attr_derive_or_an_attribute_macro_is_red() {
+    for (attr, needle) in [
+        ("#[cfg_attr(not(test), derive(Clone))]", "derives Clone"),
+        (
+            "#[cfg_attr(unix, cfg_attr(not(test), derive(Default)))]",
+            "derives Default",
+        ),
+        ("#[bon::builder]", "carries #[bon::builder]"),
+        ("#[cfg_attr(not(test), serde(default))]", "carries #[serde]"),
+    ] {
+        let src = SEALED.replace("#[derive(Debug)]", &format!("#[derive(Debug)]\n{attr}"));
+        assert_red(&authority_tree(&src, &[]), &[needle]);
     }
 }
 
 #[test]
 fn a_trait_impl_or_a_foreign_inherent_impl_is_red() {
-    let violations = close_authority_violations(&authority_tree(
-        SEALED,
+    assert_red(
+        &authority_tree(
+            SEALED,
+            &[
+                (
+                    "mcp/sneaky.rs",
+                    "impl Default for CloseAuthority { fn default() -> Self { todo!() } }\n",
+                ),
+                (
+                    "mcp/other.rs",
+                    "impl crate::terminal::close_authority::CloseAuthority {\n    pub fn peek(&self) {}\n}\n",
+                ),
+            ],
+        ),
         &[
-            (
-                "mcp/sneaky.rs",
-                "impl Default for CloseAuthority { fn default() -> Self { todo!() } }\n",
-            ),
-            (
-                "mcp/other.rs",
-                "impl crate::terminal::close_authority::CloseAuthority {\n    pub fn peek(&self) {}\n}\n",
-            ),
+            "impl Default for CloseAuthority",
+            "an inherent impl of CloseAuthority outside",
         ],
-    ));
-    assert!(
-        violations
-            .iter()
-            .any(|v| v.contains("impl Default for CloseAuthority")),
-        "{violations:#?}"
-    );
-    assert!(
-        violations
-            .iter()
-            .any(|v| v.contains("an inherent impl of CloseAuthority outside")),
-        "{violations:#?}"
     );
 }
 
-/// A production caller of the TEST constructor compiles under `cargo test`
+/// Finding 1, route 1: an associated const builds one with `Self { .. }`
+/// inside no fn at all. The literal is attributed to what holds it (the
+/// const), never to an enclosing fn, and the const is red as a stored
+/// authority.
+#[test]
+fn an_associated_const_is_red() {
+    let src = SEALED.replace(
+        "impl CloseAuthority {",
+        "impl CloseAuthority {\n    pub const UNCHECKED: Self = Self { _sealed: () };",
+    );
+    let violations = close_authority_violations(&authority_tree(&src, &[]));
+    assert_eq!(violations.len(), 2, "{violations:#?}");
+    assert!(violations[0].contains(":6 `const UNCHECKED` holds a CloseAuthority"));
+    assert!(violations[1].contains(":6 (const UNCHECKED) builds one with `Self { .. }`"));
+}
+
+/// Rule 5: a free `const` in the type's own module and a `static` anywhere
+/// are red, however they are initialized.
+#[test]
+fn a_const_or_a_static_of_the_type_is_red() {
+    let src = format!(
+        "{SEALED}pub(crate) const FORGED: CloseAuthority = CloseAuthority {{ _sealed: () }};\n"
+    );
+    assert_red(
+        &authority_tree(
+            &src,
+            &[(
+                "mcp/stash.rs",
+                "use crate::terminal::close_authority::CloseAuthority;\n\
+                 static STASH: std::sync::Mutex<Option<CloseAuthority>> = std::sync::Mutex::new(None);\n",
+            )],
+        ),
+        &[
+            ":11 `const FORGED` holds a CloseAuthority",
+            ":11 (const FORGED) builds one with a struct literal",
+            "mcp/stash.rs:2 `static STASH` holds a CloseAuthority",
+            "mcp/stash.rs:2 (static STASH) names `CloseAuthority`",
+        ],
+    );
+}
+
+/// Finding 1, route 2a: a `type` alias is red where it is defined, and rule 7
+/// reads it as the type, so its struct literal is red too.
+#[test]
+fn an_alias_with_a_struct_literal_is_red() {
+    let literal = format!(
+        "{SEALED}type T = CloseAuthority;\npub(crate) fn forge() {{\n    let _a = T {{ _sealed: () }};\n}}\n"
+    );
+    assert_red(
+        &authority_tree(&literal, &[]),
+        &[
+            ":11 `type T` aliases CloseAuthority",
+            ":13 (forge) builds one with a struct literal",
+        ],
+    );
+}
+
+/// Finding 1, route 2b: `impl From<()>` for an alias is a trait impl for the
+/// type (rule 2), its `from` returns one (rule 4), and the alias itself is red.
+#[test]
+fn an_alias_with_a_from_impl_is_red() {
+    assert_red(
+        &authority_tree(
+            SEALED,
+            &[(
+                "mcp/convert.rs",
+                "use crate::terminal::close_authority::CloseAuthority;\ntype T = CloseAuthority;\n\
+                 impl From<()> for T {\n    fn from(_: ()) -> Self {\n        todo!()\n    }\n}\n",
+            )],
+        ),
+        &[
+            "mcp/convert.rs:2 `type T` aliases CloseAuthority",
+            "mcp/convert.rs:3 impl From for T (a second name for CloseAuthority)",
+            "mcp/convert.rs:from returns a CloseAuthority",
+            "mcp/convert.rs:2 (<file scope>) names `CloseAuthority`",
+        ],
+    );
+}
+
+/// Rule 6's other half: a `use … as` rename is red, and the new name is read
+/// as the type.
+#[test]
+fn a_use_rename_is_red_and_is_read_as_the_type() {
+    assert_red(
+        &authority_tree(
+            SEALED,
+            &[(
+                "mcp/renamed.rs",
+                "use crate::terminal::close_authority::CloseAuthority as Token;\n\
+                 pub(crate) fn hold(_t: Option<Token>) {}\n",
+            )],
+        ),
+        &[
+            "mcp/renamed.rs:1 `use … as Token` renames CloseAuthority",
+            "mcp/renamed.rs:2 (hold) names `Token`",
+        ],
+    );
+}
+
+/// Finding 1, route 3a: a transmute names the type, so it is a mention outside
+/// the allowlist (rule 8).
+#[test]
+fn a_transmute_is_red() {
+    let violations = assert_red(
+        &authority_tree(
+            SEALED,
+            &[(
+                "mcp/forge.rs",
+                "use crate::terminal::close_authority::CloseAuthority;\n\
+                 pub(crate) fn transmuted() {\n    let _a = unsafe { std::mem::transmute::<(), CloseAuthority>(()) };\n}\n",
+            )],
+        ),
+        &["mcp/forge.rs:3 (transmuted) names `CloseAuthority`"],
+    );
+    assert_eq!(violations.len(), 1, "{violations:#?}");
+}
+
+/// Finding 1, route 3b: a zeroed value. One that names the type is a mention
+/// (rule 8). One that never names it, passed straight to the primitive, is a
+/// non-`None` authority (rule 9).
+#[test]
+fn a_zeroed_value_is_red() {
+    let violations = assert_red(
+        &authority_tree(
+            SEALED,
+            &[(
+                "mcp/forge.rs",
+                "use crate::terminal::close_authority::CloseAuthority;\n\
+                 pub(crate) fn zeroed() {\n    let _a: CloseAuthority = unsafe { std::mem::zeroed() };\n}\n\
+                 pub(crate) async fn inferred(tm: &T) {\n    let _ = tm.graceful_exit(id, d, Some(unsafe { std::mem::zeroed() })).await;\n}\n",
+            )],
+        ),
+        &[
+            "mcp/forge.rs:3 (zeroed) names `CloseAuthority`",
+            "mcp/forge.rs:6 (inferred) passes `Some(unsafe { std::mem::zeroed() })` as the \
+             authority of `graceful_exit(`",
+        ],
+    );
+    assert_eq!(violations.len(), 2, "{violations:#?}");
+}
+
+/// A production call of the TEST constructor compiles under `cargo test`
 /// (where `cfg(test)` holds crate-wide), so the scan, not the compiler, must
-/// be what turns it red in the test run. This also covers a call made inside
-/// a macro body.
+/// turn it red in the test run. That holds inside a macro body too. Handing
+/// one to the primitive is red twice: as a mention and as a non-`None`
+/// authority.
 #[test]
 fn a_production_mint_outside_the_closer_is_red() {
     let violations = close_authority_violations(&authority_tree(
@@ -1593,7 +2756,208 @@ fn a_production_mint_outside_the_closer_is_red() {
              fn in_a_macro() { let v = vec![CloseAuthority::for_test()]; }\n",
         )],
     ));
+    assert_eq!(violations.len(), 3, "{violations:#?}");
+    assert!(violations[0].contains("(wind_down_exit) calls `CloseAuthority::for_test`"));
+    assert!(violations[1].contains("(in_a_macro) calls `CloseAuthority::for_test`"));
+    assert!(violations[2].contains(
+        "(wind_down_exit) passes `Some(CloseAuthority::for_test())` as the authority of \
+         `graceful_exit(`"
+    ));
+}
+
+/// Rule 8's one parameter position is `authority: Option<…CloseAuthority>`
+/// on one of the four entry points, in its own file and impl. There it is
+/// allowed, and the forwards between the entry points pass (positive
+/// control). The same parameter on any other fn, on a same-named fn of
+/// another impl, or a second mention anywhere in an entry point, is red.
+#[test]
+fn the_authority_parameter_is_allowed_only_on_the_four_entry_points() {
+    let scan = close_authority_scan(&authority_tree(
+        SEALED,
+        &[
+            (
+                "terminal/graceful_exit.rs",
+                "use crate::terminal::close_authority::CloseAuthority;\n\
+                 pub(super) async fn drive<W>(\n    write: W,\n    authority: Option<CloseAuthority>,\n) -> O {\n    \
+                 let Some(_authority) = authority else {\n        return O::Refused;\n    };\n    todo!()\n}\n",
+            ),
+            (
+                "terminal/session.rs",
+                "impl TerminalSession {\n    pub(super) async fn graceful_exit_then(&self, d: D, c: C, authority: Option<crate::terminal::close_authority::CloseAuthority>) -> O {\n        \
+                 self.graceful_exit_driven(t, p, c, authority).await\n    }\n    \
+                 async fn graceful_exit_driven(&self, t: T, p: P, c: C, authority: Option<crate::terminal::close_authority::CloseAuthority>) -> O {\n        \
+                 drive(|b| w(b, x), || s(), p, c, t, authority).await\n    }\n}\n",
+            ),
+            (
+                "terminal/manager.rs",
+                "impl TerminalManager {\n    pub async fn graceful_exit(\n        self: &Arc<Self>,\n        id: &str,\n        \
+                 authority: Option<crate::terminal::close_authority::CloseAuthority>,\n    ) -> R {\n        \
+                 Ok(s.graceful_exit_then(d, move || async move { close(id, 1) }, authority).await)\n    }\n}\n",
+            ),
+            (
+                "mcp/door.rs",
+                "pub(crate) async fn door(tm: &T) {\n    let _ = tm\n        .graceful_exit(\n            id,\n            \
+                 crate::terminal::graceful_exit::DEFAULT_DEADLINE,\n            None,\n        )\n        .await;\n}\n",
+            ),
+        ],
+    ));
+    let sorted = |v: &[String]| {
+        let mut v = v.to_vec();
+        v.sort();
+        v
+    };
+    assert_eq!(scan.violations, Vec::<String>::new());
+    assert_eq!(
+        sorted(&scan.param_mentions),
+        vec![
+            "terminal/graceful_exit.rs:drive",
+            "terminal/manager.rs:graceful_exit",
+            "terminal/session.rs:graceful_exit_driven",
+            "terminal/session.rs:graceful_exit_then",
+        ]
+    );
+    assert_eq!(
+        sorted(&scan.forwarded_calls),
+        vec![
+            "terminal/manager.rs:graceful_exit",
+            "terminal/session.rs:graceful_exit_driven",
+            "terminal/session.rs:graceful_exit_then",
+        ]
+    );
+    assert_eq!(scan.none_calls, vec!["mcp/door.rs:door"]);
+
+    assert_red(
+        &authority_tree(
+            SEALED,
+            &[
+                (
+                    "mcp/helper.rs",
+                    "use crate::terminal::close_authority::CloseAuthority;\n\
+                     pub(crate) fn pass(authority: Option<CloseAuthority>) {}\n",
+                ),
+                (
+                    "terminal/manager.rs",
+                    "impl Other {\n    pub async fn graceful_exit(&self, authority: Option<crate::terminal::close_authority::CloseAuthority>) {}\n}\n",
+                ),
+                (
+                    "terminal/graceful_exit.rs",
+                    "use crate::terminal::close_authority::CloseAuthority;\n\
+                     pub(super) async fn drive(authority: Option<CloseAuthority>) -> CloseAuthority {\n    \
+                     let _held: Option<CloseAuthority> = None;\n    todo!()\n}\n",
+                ),
+            ],
+        ),
+        &[
+            "mcp/helper.rs:2 (pass) names `CloseAuthority`",
+            "terminal/manager.rs:2 (graceful_exit) names `CloseAuthority`",
+            "terminal/graceful_exit.rs:2 (drive) names `CloseAuthority`",
+            "terminal/graceful_exit.rs:3 (drive) names `CloseAuthority`",
+        ],
+    );
+}
+
+/// Rule 9's other arms. A fn value or a turbofish hides the argument, so both
+/// are red. Only a primitive entry point may forward an `authority`, so a
+/// helper that takes one and passes it on is red even when it never names the
+/// type.
+#[test]
+fn hiding_or_relaying_the_authority_argument_is_red() {
+    assert_red(
+        &authority_tree(
+            SEALED,
+            &[
+                (
+                    "mcp/value.rs",
+                    "pub(crate) fn as_value() {\n    let _f = crate::terminal::TerminalManager::graceful_exit;\n}\n",
+                ),
+                (
+                    "mcp/relay.rs",
+                    "pub(crate) async fn relay<A>(tm: &T, authority: Option<A>) {\n    \
+                     let _ = tm.graceful_exit(id, d, authority).await;\n}\n",
+                ),
+                (
+                    "terminal/session.rs",
+                    "impl TerminalSession {\n    pub(super) async fn graceful_exit_then(&self, d: D, c: C, authority: Option<crate::terminal::close_authority::CloseAuthority>) -> O {\n        \
+                     self.graceful_exit_driven::<P, C>(t, p, c, authority).await\n    }\n}\n",
+                ),
+            ],
+        ),
+        &[
+            "mcp/value.rs:2 (as_value) names `graceful_exit` without calling it",
+            "mcp/relay.rs:2 (relay) passes `authority` as the authority of `graceful_exit(`",
+            "terminal/session.rs:3 (graceful_exit_then) calls `graceful_exit_driven` with a \
+             turbofish",
+        ],
+    );
+}
+
+/// Rule 9b: inside an entry point, `authority` must be the caller's value. A
+/// `mut` parameter could be reassigned and a `let` could shadow it, so both
+/// are red, while the forward that follows each still passes rule 9.
+#[test]
+fn an_entry_point_that_rebinds_its_authority_is_red() {
+    let violations = assert_red(
+        &authority_tree(
+            SEALED,
+            &[
+                (
+                    "terminal/manager.rs",
+                    "impl TerminalManager {\n    pub async fn graceful_exit(&self, id: &str, d: D, mut authority: Option<crate::terminal::close_authority::CloseAuthority>) -> R {\n        \
+                     authority = forge();\n        s.graceful_exit_then(d, c, authority).await\n    }\n}\n",
+                ),
+                (
+                    "terminal/session.rs",
+                    "impl TerminalSession {\n    async fn graceful_exit_driven(&self, t: T, p: P, c: C, authority: Option<crate::terminal::close_authority::CloseAuthority>) -> O {\n        \
+                     let authority = forge();\n        drive(w, s, p, c, t, authority).await\n    }\n}\n",
+                ),
+            ],
+        ),
+        &[
+            "terminal/manager.rs:graceful_exit declares its `authority` parameter `mut`",
+            "terminal/session.rs:3 (graceful_exit_driven) binds `authority` again",
+        ],
+    );
     assert_eq!(violations.len(), 2, "{violations:#?}");
-    assert!(violations[0].contains("(wind_down_exit) calls one of its associated fns"));
-    assert!(violations[1].contains("(in_a_macro) calls one of its associated fns"));
+}
+
+/// Rules 8 and 9 read code, not text. The type named in a string, a log
+/// message, a raw string or a trailing or block comment is no mention, and a
+/// comma inside a string does not split rule 9's arguments.
+#[test]
+fn a_mention_in_a_string_or_a_comment_is_not_a_mention() {
+    let violations = close_authority_violations(&authority_tree(
+        SEALED,
+        &[(
+            "mcp/talk.rs",
+            "pub(crate) async fn talk<'a>(tm: &'a T) {\n    \
+             warn!(\"no CloseAuthority can be presented, so nothing was typed\");\n    \
+             let _ = tm.graceful_exit(id, \"a, Some(x)\", None).await; // CloseAuthority\n    \
+             let _r = r#\"CloseAuthority { _sealed: () }\"#;\n    \
+             let _c = '\"'; /* CloseAuthority { _sealed: () } */\n}\n",
+        )],
+    ));
+    assert_eq!(violations, Vec::<String>::new());
+}
+
+/// The blanking every rule 8 and 9 read rests on: offsets unchanged, literals
+/// and comments (nested ones included) gone, lifetimes and code kept.
+#[test]
+fn blanking_keeps_every_offset_and_reads_lifetimes_as_code() {
+    let src = "fn f<'a>(x: &'a str) -> char { let s = \"Close\\\"Authority\"; \
+               let r = r#\"a \"b\"#; let c = '\\''; let d = 'é'; x.len(); 'q' } // tail\n\
+               /* outer /* inner */ still */ g();\n";
+    let blanked = blank_literals_and_comments(src);
+    assert_eq!(blanked.len(), src.len());
+    assert_eq!(blanked.lines().count(), src.lines().count());
+    assert!(
+        blanked.contains("fn f<'a>(x: &'a str) -> char"),
+        "{blanked}"
+    );
+    assert!(
+        blanked.contains("x.len();") && blanked.contains("g();"),
+        "{blanked}"
+    );
+    for gone in ["Authority", "\"b", "tail", "inner", "still", "é"] {
+        assert!(!blanked.contains(gone), "{gone:?} survived: {blanked}");
+    }
 }

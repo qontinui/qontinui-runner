@@ -434,10 +434,14 @@ impl ReapTarget for crate::terminal::TerminalManager {
 /// finds a bare shell. A live `claude`, or one the probe cannot rule out, is
 /// answered [`CloseOutcome::Held`] and never closed (m5-2, [`reap_verdict`]).
 ///
-/// A bare shell is closed on the blocking pool, through the same
-/// `TerminalManager::close` on the blocking pool that `deliver_create_reply`'s
-/// caller runs for an undeliverable reply. Killing the PTY child is what fires
-/// the terminal's exit hook, which closes its confirmed coord session.
+/// A bare shell is closed through the same `TerminalManager::close`, run on the
+/// blocking pool, that `deliver_create_reply`'s caller runs for an
+/// undeliverable reply. Killing the PTY child is what fires the terminal's exit
+/// hook, which closes its confirmed coord session.
+///
+/// This fn holds the probe, so it carries the close's `exempt` row in the
+/// close-site roster; `ReapTarget::close_terminal` is the `helper` it reaches
+/// the close through.
 ///
 /// The probe and the close are two steps. A `claude` started in the pane in
 /// the milliseconds between them would still be killed. The graceful-exit

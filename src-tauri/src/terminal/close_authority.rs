@@ -52,16 +52,20 @@
 //! Rust privacy cannot confine a constructor to one module that is not an
 //! ancestor of this one, so the Phase 93 minter will have to be `pub(crate)`.
 //! What confines its CALLERS is a source scan in `runner_close_sites.rs`
-//! (`no_module_but_the_closer_can_obtain_a_close_authority`), whose
-//! `AUTHORIZED_MINTERS` list is empty today. The same scan pins the type's shape:
+//! (`close_authority_has_no_constructor_outside_test_code`), whose
+//! `AUTHORIZED_MINTERS` list is empty today. The scan is an allowlist:
 //!
-//! * no public field;
-//! * no constructing or duplicating derive;
-//! * no trait impl;
-//! * no non-test fn that returns one.
+//! * The type is named only here, on a `use` line, or as the
+//!   `authority: Option<CloseAuthority>` parameter of the primitive's four
+//!   entry points.
+//! * Every call of the primitive passes `None`, except an entry point
+//!   forwarding its own parameter.
+//! * The type keeps this shape: one named private field, `Debug` as its only
+//!   derive, no trait impl, no `const`, `static`, alias or rename of it, and no
+//!   non-test fn or struct literal that builds one.
 //!
-//! So adding a public constructor is red in `cargo test` itself, not only in a
-//! non-test build.
+//! So adding a public constructor, an associated const or a forged value is
+//! red in `cargo test` itself, not only in a non-test build.
 //!
 //! ## Consumed by value
 //!
