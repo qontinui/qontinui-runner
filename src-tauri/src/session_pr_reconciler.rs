@@ -1695,9 +1695,8 @@ pub(crate) fn resolve_github_token_from_env() -> Option<(&'static str, String)> 
 ///
 /// # Why the dedicated variable leads
 ///
-/// The runner is a poller: it re-reads PR state every 30s, and as often as every
-/// 10s in the PR watcher — re-measured 2026-09-01 at **309 calls in 301s ≈
-/// 3,700/hr**. Falling through to `gh auth token` bills all of that to the
+/// The runner is a poller: it re-reads PR state every 30s — re-measured
+/// 2026-09-01 at **309 calls in 301s ≈ 3,700/hr**. Falling through to `gh auth token` bills all of that to the
 /// operator's own interactive user bucket, which is where the 2026-08-30
 /// oversubscription incident came from: a ~5,600 req/hr burn against a 5,000 cap
 /// was blamed on coord's merge train, when coord bills App *installation*

@@ -4,7 +4,7 @@
 //! `send_message_to_worker_via_handle` injects through the SDK queue
 //! (`ClaudeSession::send_user_message`, safe by construction when the session
 //! is `Processing`). Callers: the coord session-bus poller
-//! (`mcp::session_message_poller`) and the PR shepherd's author-notify. The
+//! (`mcp::session_message_poller`) and session review (`mcp::session_review`). The
 //! pty-backed `WorkerSession` fallthrough this module used to carry went with
 //! the worker plane in Phase 4.
 //!
@@ -22,14 +22,12 @@ use tracing::warn;
 
 /// Inject a message into a live session, given only an `AppHandle`. `send_user_message`
 /// only ever needs the `AppHandle` (to reach the `SessionManager` state), so
-/// callers that hold an `AppHandle` but no `Arc<ApiState>` — e.g. the PR
-/// shepherd's device-local author-notify (plan `2026-07-04-runner-pr-shepherd`
-/// Phase 4), which runs inside the PR watcher with only `PrWatcherDeps` —
-/// inject through here without constructing an `ApiState`.
+/// callers that hold an `AppHandle` but no `Arc<ApiState>` inject through here
+/// without constructing an `ApiState`.
 ///
 /// Returns whether the injection actually landed: failures are warn-logged AND
-/// surfaced as `Err`, because some callers (the PR shepherd's one-per-head
-/// notify claim) must not treat a swallowed failure as a delivered message.
+/// surfaced as `Err`, because a caller must not treat a swallowed failure as a
+/// delivered message.
 pub(crate) async fn send_message_to_worker_via_handle(
     app_handle: &tauri::AppHandle,
     session_id: &str,

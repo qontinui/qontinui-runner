@@ -55,7 +55,6 @@ pub mod orchestration;
 pub mod orchestration_loop;
 pub mod phase_results;
 pub mod pipeline_traces;
-pub mod pr_watch_ops;
 pub mod process_sessions;
 pub mod productivity_knowledge;
 pub mod prompt_evolution;
