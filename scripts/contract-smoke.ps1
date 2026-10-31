@@ -266,6 +266,40 @@ $SKIP_ROUTES = @{
 }
 
 # ---------------------------------------------------------------------------
+# Routes the PINNED SDK declares whose runner handlers are on an open PR, not
+# on main -- the SDK is ahead of the runner. Keyed by "<METHOD> <PATH>" exactly
+# as it appears in UI_BRIDGE_ROUTES. Unlike $SKIP_ROUTES, an entry here EXPIRES
+# on its own: only the router fallback's answer for one of these routes is a
+# SKIP carrying its reason, and ANY other answer is a FAIL. The fallback is
+# recognised by its own signature, never by the bare fact of a 404:
+# `not_found_handler` in src-tauri/src/mcp_api.rs answers every unmatched route
+# with a JSON 404 whose error starts with "No route for <METHOD> <path>"
+# (`not_found_message`), so a 404 carrying that error for the request the probe
+# sent is a SKIP. A 404 a landed handler answers itself is a FAIL: the entry is
+# stale -- delete it. A 404 with no readable body, or with a body that is not a
+# JSON envelope with a string error, is a FAIL too, because it is never the
+# fallback's: `envelope_rewrite_middleware` in src-tauri/src/mcp/envelope.rs
+# gives every 4xx/5xx with an empty, missing or text/plain Content-Type a JSON
+# envelope, and the fallback always answers JSON. Such a body means either the
+# probe lost it or a handler sent it, and an unknown verdict must not keep an
+# entry alive. This is the twin of
+# `sdk_only_baseline` in src-tauri/src/mcp/ui_bridge/mod.rs, which fails the
+# same way when its entry goes stale. An entry that could never
+# expire -- one also in $SKIP_ROUTES (checked first), or one the pinned SDK no
+# longer declares -- is refused before any probe, -DryRun included.
+# ---------------------------------------------------------------------------
+$SDK_AHEAD_ROUTES = @{
+    # In-situ media override (SDK 835aa75, ui-bridge 0.35.0): handlers are
+    # qontinui-runner#2311 (image plan Phase 18), not on main. The ui-bridge pin
+    # moved past 835aa75 to reach POST /control/text-visibility (ui-bridge#265).
+    # #2311 deletes these three entries, and the three sdk_only_baseline lines
+    # in mod.rs, when it lands.
+    "GET /control/media/override"    = "handlers are qontinui-runner#2311, not on main"
+    "POST /control/media/override"   = "handlers are qontinui-runner#2311, not on main"
+    "DELETE /control/media/override" = "handlers are qontinui-runner#2311, not on main"
+}
+
+# ---------------------------------------------------------------------------
 # Routes whose handler can legitimately exceed the default 10s probe timeout.
 # vision/extract (PaddleOCR) and vision/describe (VLM) load a cold model via
 # llama-swap on first request -- and llama-swap UNLOADS one model to load the
@@ -904,14 +938,38 @@ Write-Host "Parsing UI_BRIDGE_ROUTES from $SdkTypesPath ..."
 $routes = Parse-UiBridgeRoutes -Path $SdkTypesPath
 Write-Host ("Parsed {0} routes." -f $routes.Count)
 
+# An SDK-ahead entry expires only by being probed, so refuse one that never
+# would be: a key $SKIP_ROUTES also holds (the CI-profile keys are merged in
+# above) is skipped before it is classified, and a key the pinned SDK no longer
+# declares is never probed at all.
+$routeKeys = @{}
+foreach ($r in $routes) { $routeKeys[$r.Key] = $true }
+$aheadProblems = @()
+foreach ($k in $SDK_AHEAD_ROUTES.Keys) {
+    if ($SKIP_ROUTES.ContainsKey($k)) {
+        $aheadProblems += "'$k' is also in `$SKIP_ROUTES, which is checked first, so this entry could never expire"
+    }
+    if (-not $routeKeys.ContainsKey($k)) {
+        $aheadProblems += "'$k' is not a route the pinned SDK declares ($SdkTypesPath), so this entry could never expire"
+    }
+}
+if ($aheadProblems.Count -gt 0) {
+    Write-Host "ERROR: `$SDK_AHEAD_ROUTES has entries that can never expire:" -ForegroundColor Red
+    foreach ($m in $aheadProblems) { Write-Host "       $m" -ForegroundColor Red }
+    Write-Host "       Delete the entry from `$SDK_AHEAD_ROUTES (or the key from `$SKIP_ROUTES)." -ForegroundColor Red
+    exit 1
+}
+$aheadMatched = @($routes | Where-Object { $SDK_AHEAD_ROUTES.ContainsKey($_.Key) }).Count
+
 if ($DryRun) {
     foreach ($r in $routes) {
         $skipNote = if ($SKIP_ROUTES.ContainsKey($r.Key)) { " [SKIP: $($SKIP_ROUTES[$r.Key])]" } else { "" }
+        $aheadNote = if ($SDK_AHEAD_ROUTES.ContainsKey($r.Key)) { " [SDK-AHEAD: $($SDK_AHEAD_ROUTES[$r.Key])]" } else { "" }
         $bodyNote = if ($r.BodyRequired) { " (body)" } else { "" }
-        Write-Host ("  {0,-6}  {1}{2}{3}" -f $r.Method, $r.Path, $bodyNote, $skipNote)
+        Write-Host ("  {0,-6}  {1}{2}{3}{4}" -f $r.Method, $r.Path, $bodyNote, $skipNote, $aheadNote)
     }
     Write-Host ""
-    Write-Host ("Total: {0} routes, {1} skip" -f $routes.Count, $SKIP_ROUTES.Count)
+    Write-Host ("Total: {0} routes, {1} skip, {2} SDK-ahead (skip on the router fallback, fail on any other answer)" -f $routes.Count, $SKIP_ROUTES.Count, $aheadMatched)
     exit 0
 }
 
@@ -1059,6 +1117,52 @@ try {
         if ($status -eq 0) {
             Record "FAIL" $r.Method $r.Path "connection error: $($res[1])"
             $exitCode = 1
+        } elseif ($SDK_AHEAD_ROUTES.ContainsKey($r.Key)) {
+            # Decided on the router fallback's own signature (see the
+            # $SDK_AHEAD_ROUTES header), never on the bare fact of a 404. The
+            # fallback's error is "No route for <METHOD> <path>", and for a
+            # /ui-bridge/ path it goes on with a space, a dash and a discovery
+            # hint. Only that head is matched, built for THIS request: the
+            # method as sent (Invoke-WebRequest sends it upper-case) and the
+            # path as sent (the Uri's AbsolutePath, so the /ui-bridge prefix is
+            # in it and any :param is substituted). The head is ASCII. What
+            # follows it is a hint for a person, not part of the verdict, so it
+            # is not matched; it also carries a non-ASCII dash, which Windows
+            # PowerShell 5.1 can decode wrongly.
+            $aheadRaw = [string]$res[1]
+            $aheadError = $null
+            if ($aheadRaw.Trim().Length -gt 0) {
+                try {
+                    $aheadBody = $aheadRaw | ConvertFrom-Json
+                    if ($null -ne $aheadBody -and
+                        ($aheadBody.PSObject.Properties.Name -contains 'error') -and
+                        ($aheadBody.error -is [string])) {
+                        $aheadError = [string]$aheadBody.error
+                    }
+                } catch {
+                    $aheadError = $null
+                }
+            }
+            $aheadHead = "No route for " + $r.Method.ToUpperInvariant() + " " + ([System.Uri]$url).AbsolutePath
+            $aheadIsFallback = (($null -ne $aheadError) -and
+                ([string]::Equals($aheadError, $aheadHead, [System.StringComparison]::Ordinal) -or
+                 $aheadError.StartsWith($aheadHead + " ", [System.StringComparison]::Ordinal)))
+            if ($status -eq 404 -and $aheadRaw.Trim().Length -eq 0) {
+                Record "FAIL" $r.Method $r.Path "404 with no readable body -- cannot tell the router fallback from a handler"
+                $exitCode = 1
+            } elseif ($status -eq 404 -and $aheadIsFallback) {
+                Record "SKIP" $r.Method $r.Path "404 (router fallback: no route), SDK ahead of runner: $($SDK_AHEAD_ROUTES[$r.Key])"
+            } elseif ($status -eq 404 -and $null -ne $aheadError -and
+                      $aheadError.StartsWith("No route for ", [System.StringComparison]::Ordinal)) {
+                Record "FAIL" $r.Method $r.Path "404 from the router fallback, but not for this request (expected `"$aheadHead`")"
+                $exitCode = 1
+            } elseif ($status -eq 404 -and $null -eq $aheadError) {
+                Record "FAIL" $r.Method $r.Path "404 body is not a JSON envelope with a string error -- cannot tell the router fallback from a handler"
+                $exitCode = 1
+            } else {
+                Record "FAIL" $r.Method $r.Path "stale SDK-ahead entry: the runner answers this route ($status), not the router fallback; delete it from `$SDK_AHEAD_ROUTES"
+                $exitCode = 1
+            }
         } elseif ($status -eq 404) {
             # Body-aware 404 classifier: a route with a :param segment that
             # returns a structured JSON error envelope (success:false / any
