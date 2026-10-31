@@ -7245,9 +7245,12 @@ mod tests {",
             (
                 "agent_worktree/census.rs",
                 include_str!("agent_worktree/census.rs"),
-                2,
-                "the periodic walk spawn AND `ChunkPoster::resolve_dest`, the POST chokepoint \
-                 every walk trigger routes through",
+                1,
+                "`runs_machine_census`, the module's one spelling of the rule. Its call \
+                 sites — the periodic walk spawn, `ChunkPoster::resolve_dest` (the POST \
+                 chokepoint every walk trigger routes through) and the volume probe — are \
+                 pinned by census.rs's own `the_census_post_chokepoint_carries_the_guard` and \
+                 `the_walk_spawn_and_the_volume_probe_ask_runs_machine_census`",
             ),
             (
                 "agent_worktree/fs_backstop.rs",
