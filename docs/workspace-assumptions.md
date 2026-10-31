@@ -16,7 +16,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `fleet_host_name` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `fleet_device_uuid` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
-| `os_bound_tooling` | 105 | 106 | 105 | 0 | 0 | 0 |
+| `os_bound_tooling` | 98 | 99 | 96 | 2 | 0 | 0 |
 
 ## `repo_layout` (79 rows)
 
@@ -258,7 +258,7 @@ _No hits._
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `let existing = get_setting::<PathSettings>().plans_dir;` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `update_setting::<PathSettings, _>(\|paths\| paths.plans_dir = Some(value.clone()))?;` | 1 | unreviewed |
 
-## `os_bound_tooling` (105 rows)
+## `os_bound_tooling` (98 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -313,15 +313,6 @@ _No hits._
 | `src/install_effects_producer/intercept/shim_materializer.rs` | `exe_shadow_needed` | `cfg(windows)-only fn 'exe_shadow_needed' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/install_effects_producer/intercept/shim_materializer.rs` | `locate_stub_exe` | `cfg(windows)-only fn 'locate_stub_exe' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/mcp/ai_session.rs` | `const AI_SESSION_SUPERVISOR_RESTART_RECIPE` | `From Windows PowerShell spell it 'curl.exe' (bare 'curl' there is an alias of 'Invoke-WebRequest'), or use 'Invoke-RestMethod -Method Pos...` | 1 | unreviewed |
-| `src/mcp/ai_session.rs` | `kill_orphaned_ai_processes` | `Err(e) => error!("Shutdown: failed to taskkill PID {pid}: {e}"),` | 1 | unreviewed |
-| `src/mcp/ai_session.rs` | `kill_orphaned_ai_processes` | `Shutdown: taskkill for PID {pid} exceeded its {per_kill:?} timeout — \` | 1 | unreviewed |
-| `src/mcp/ai_session.rs` | `kill_orphaned_ai_processes` | `let mut cmd = crate::process_helpers::no_window("taskkill");` | 1 | unreviewed |
-| `src/mcp/ai_session.rs` | `stop_ai_analysis` | `"MCP API: taskkill for PID {} returned error: {}",` | 1 | unreviewed |
-| `src/mcp/ai_session.rs` | `stop_ai_analysis` | `error!("MCP API: Failed to execute taskkill for PID {}: {}", pid, e);` | 1 | unreviewed |
-| `src/mcp/ai_session.rs` | `stop_ai_analysis` | `let result = crate::process_helpers::no_window("taskkill")` | 1 | unreviewed |
-| `src/mcp/headless_browser.rs` | `spawn_headless` | `let _ = crate::process_helpers::no_window("taskkill")` | 1 | unreviewed |
-| `src/mcp/task_runs.rs` | `stop_task_run` | `error!("Failed to execute taskkill for PID {}: {}", pid, e);` | 1 | unreviewed |
-| `src/mcp/task_runs.rs` | `stop_task_run` | `let result = crate::process_helpers::no_window("taskkill")` | 1 | unreviewed |
 | `src/mcp/ui_bridge/screenshots.rs` | `capture_webview_contents` | `cfg(windows)-only fn 'capture_webview_contents' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/mcp/ui_bridge/screenshots.rs` | `read_capture_stream` | `cfg(windows)-only fn 'read_capture_stream' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/playwright/executor.rs` | `run_script` | `"Running Playwright via cmd.exe in dir {}: {}",` | 1 | unreviewed |
@@ -340,6 +331,8 @@ _No hits._
 | `src/profile_cli.rs` | `read_user_path` | `cfg(windows)-only fn 'read_user_path' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/profile_cli.rs` | `write_user_path` | `cfg(windows)-only fn 'write_user_path' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/screen/dpi.rs` | `set_windows_dpi_awareness` | `cfg(windows)-only fn 'set_windows_dpi_awareness' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/session/tracking_health.rs` | `const WORK_CHILD_IMAGES` | `"powershell",` | 1 | fallback_correct — Process-IMAGE names compared against a session's direct children on every OS, never launched or required: a pwsh/powershell direct child (a shell a tool runs under) counts as WORK. On a box without PowerShell nothing matches, and the rest of child_signals_work decides as before. |
+| `src/session/tracking_health.rs` | `const WORK_CHILD_IMAGES` | `"pwsh",` | 1 | fallback_correct — Process-IMAGE names compared against a session's direct children on every OS, never launched or required: a pwsh/powershell direct child (a shell a tool runs under) counts as WORK. On a box without PowerShell nothing matches, and the rest of child_signals_work decides as before. |
 | `src/step_executor/handlers/check.rs` | `CheckHandler::execute` | `let mut c = crate::process_helpers::tokio_no_window("powershell");` | 1 | unreviewed |
 | `src/step_executor/handlers/shell_command.rs` | `ShellCommandHandler::get_shell_type` | `"powershell"` | 1 | unreviewed |
 | `src/step_executor/handlers/shell_command.rs` | `ShellCommandHandler::run_command` | `let mut c = crate::process_helpers::tokio_no_window("powershell");` | 1 | unreviewed |

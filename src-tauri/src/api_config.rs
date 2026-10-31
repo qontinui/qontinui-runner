@@ -717,6 +717,7 @@ pub fn get_tauri_dev_server_url() -> Option<String> {
     }
     Some(
         std::env::var("TAURI_DEV_SERVER_URL")
+            // runner-localhost-ok: the Vite/Tauri dev server (debug only), not a runner port.
             .unwrap_or_else(|_| format!("http://localhost:{}", DEFAULT_TAURI_DEV_PORT)),
     )
 }
