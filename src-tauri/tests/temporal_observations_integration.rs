@@ -13,7 +13,7 @@ use reqwest::Client;
 use serde_json::json;
 use std::time::Duration;
 
-const BASE: &str = "http://localhost:9876";
+const BASE: &str = "http://127.0.0.1:9876";
 
 fn client() -> Client {
     Client::builder()

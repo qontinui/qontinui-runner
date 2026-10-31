@@ -54,6 +54,11 @@ const USAGE_LIMIT_PATTERNS: &[&str] = &[
     "5-hour limit reached",
     "weekly limit reached",
     "hit your usage limit",
+    // Claude Code's current banner: "You've hit your weekly limit · resets
+    // Oct 21, 10pm". None of the "… limit reached" spellings match it.
+    "hit your weekly limit",
+    "hit your 5-hour limit",
+    "hit your session limit",
     "out of extra usage",
     "session limit reached",
     // CLI 2.1.x phrasing: "You've hit your weekly limit · resets Oct 17, 10pm".
@@ -73,6 +78,7 @@ const USAGE_LIMIT_PATTERNS: &[&str] = &[
     // probe-confirmed no-op.
     "limit reached",
     "out of usage",
+    "hit your limit",
 ];
 
 /// Minimum gap between two hint firings for the same terminal. A limit message
@@ -250,6 +256,16 @@ mod tests {
         assert_eq!(
             window_indicates_usage_limit("Weekly limit reached — resets Thursday"),
             Some("weekly limit reached")
+        );
+        assert_eq!(
+            window_indicates_usage_limit(
+                "  ⎿  You've hit your weekly limit · resets Oct 21, 10pm (Europe/Berlin)"
+            ),
+            Some("hit your weekly limit")
+        );
+        assert_eq!(
+            window_indicates_usage_limit("You've hit your limit · resets 3am"),
+            Some("hit your limit")
         );
     }
 

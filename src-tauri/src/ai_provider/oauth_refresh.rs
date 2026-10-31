@@ -517,6 +517,7 @@ pub(crate) fn default_location_has_valid_credentials() -> bool {
 /// triggers a Keychain access-control prompt.
 #[cfg(target_os = "macos")]
 fn macos_keychain_has_claude_credentials() -> bool {
+    // console-ok: a macOS-only arm, so there is no Windows console to flash.
     std::process::Command::new("security")
         .args(["find-generic-password", "-s", "Claude Code-credentials"])
         .output()

@@ -191,7 +191,7 @@ pub(crate) fn start(app: &tauri::AppHandle) {
     if registry.seed_merge_shepherd(default_journal_path(MERGE_SHEPHERD_ID)) {
         info!(
             "looping_agent_supervisor: seeded built-in '{MERGE_SHEPHERD_ID}' \
-             (disabled — enable via looping_agent_set_enabled)"
+             (enabled — disable via looping_agent_set_enabled)"
         );
     }
     app.manage(registry);
