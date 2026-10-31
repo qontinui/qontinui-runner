@@ -30,10 +30,11 @@
 //!   never recurses), preferring `<name>.exe` then `<name>.cmd` then bare.
 //! - **Bounded resolve wait.** A real tool momentarily ABSENT from `PATH` (a
 //!   package manager mid-reinstall — npm's reify renames `bin/<tool>` aside for
-//!   ~2 s) is re-scanned for at most `QONTINUI_SHIM_RESOLVE_WAIT_SECS` (default
-//!   10 s for claude/gemini, 3 s for install tools) before the fail-open
-//!   fall-through, which then names the tool and the `PATH` searched on stderr.
-//!   A resolved tool never waits; see [`resolve_real_waiting`].
+//!   ~2 s), or still npm's placeholder stub, is re-scanned for at most
+//!   `QONTINUI_SHIM_RESOLVE_WAIT_SECS` (default 10 s for claude/gemini, 3 s for
+//!   install tools) before the fail-open fall-through, which then names the
+//!   tool and the `PATH` searched on stderr. A resolved tool never waits; see
+//!   [`resolve_real_waiting`].
 //!
 //! Registry creds: like the rest of interception, the stub injects NO registry
 //! secrets — the agent's shell already carries the operator's registry config.
@@ -62,6 +63,7 @@ use std::time::Duration;
 
 use qontinui_runner_lib::intercept_core::classify::{self, Classification, ShimTool};
 use qontinui_runner_lib::intercept_core::gate::{should_block, InterceptMode};
+use qontinui_runner_lib::intercept_core::npm_placeholder::is_npm_placeholder;
 use qontinui_runner_lib::intercept_core::types::PackageSpecInput;
 
 const GUARD_ENV: &str = "QONTINUI_INSTALL_INTERCEPT_GUARD";
@@ -283,9 +285,10 @@ pub fn detect_identity_tool(argv0: Option<&str>) -> Option<IdentityTool> {
 /// double-pin. Exact token match, case-insensitive, mirroring
 /// `identity_shim.cmd`; plus the `--session-id=…`/`--resume=…` inline forms the
 /// bash identity shim also honors. A merely-prefixed token
-/// (`--session-id-ish`) does NOT match.
+/// (`--session-id-ish`) does NOT match, and neither does anything after a `--`,
+/// which is positional.
 pub fn user_chose_session(args: &[String]) -> bool {
-    args.iter().any(|a| {
+    args.iter().take_while(|a| *a != "--").any(|a| {
         let t = a.to_ascii_lowercase();
         matches!(
             t.as_str(),
@@ -340,15 +343,18 @@ pub fn keeps_policy_delivered_sha(
     let Some(file) = delivered_file.filter(|f| !f.is_empty()) else {
         return false;
     };
-    let replacement = args
+    // Everything after a `--` is positional, so it delivers no prompt file and
+    // replaces no prompt.
+    let terminator = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let (flags, _) = args.split_at(terminator);
+    let replacement = flags
         .iter()
-        .take_while(|a| a.as_str() != "--")
         .map(|a| a.split_once('=').map_or(a.as_str(), |(name, _)| name))
         .any(|name| name == "--system-prompt" || name == "--system-prompt-file");
     tool == IdentityTool::Claude
         && !replacement
-        && args.iter().enumerate().any(|(i, a)| {
-            (a == FLAG && args.get(i + 1).is_some_and(|v| v == file))
+        && flags.iter().enumerate().any(|(i, a)| {
+            (a == FLAG && flags.get(i + 1).is_some_and(|v| v == file))
                 || a.strip_prefix(FLAG)
                     .and_then(|rest| rest.strip_prefix('='))
                     .is_some_and(|v| v == file)
@@ -542,8 +548,9 @@ fn write_temp_mcp_config(document: &str) -> Option<tempfile::TempPath> {
 /// `--mcp-config` pair (coord-mcp delivery), then `--session-id <pinned>` ONLY
 /// when the user did not choose a session and a pinned id exists. `--mcp-config`
 /// sits BEFORE `--session-id` on purpose: it is variadic, so a following
-/// `--`-flag must terminate it. Pure, so passthrough purity (incl. multi-line
-/// args) is unit-testable.
+/// `--`-flag must terminate it. All of ours go ahead of the first `--` in the
+/// original args, because after it they would be positional and deliver
+/// nothing. Pure, so passthrough purity (incl. multi-line args) is unit-testable.
 pub fn identity_argv(
     original: &[String],
     settings_args: &[String],
@@ -551,7 +558,12 @@ pub fn identity_argv(
     pinned: Option<&str>,
     user_chose: bool,
 ) -> Vec<String> {
-    let mut out: Vec<String> = original.to_vec();
+    let terminator = original
+        .iter()
+        .position(|a| a == "--")
+        .unwrap_or(original.len());
+    let (head, tail) = original.split_at(terminator);
+    let mut out: Vec<String> = head.to_vec();
     out.extend(settings_args.iter().cloned());
     out.extend(mcp_config_args.iter().cloned());
     if !user_chose {
@@ -562,6 +574,7 @@ pub fn identity_argv(
             }
         }
     }
+    out.extend_from_slice(tail);
     out
 }
 
@@ -1213,41 +1226,6 @@ fn scan_path_in(name: &str, own_dirs: &[PathBuf], path_var: &OsStr, want: Want) 
     None
 }
 
-/// The message npm's placeholder `bin/claude.exe` prints, matched in its first
-/// [`PLACEHOLDER_PROBE_BYTES`].
-const NPM_PLACEHOLDER_MARKER: &[u8] = b"native binary not installed";
-const PLACEHOLDER_PROBE_BYTES: u64 = 256;
-
-/// Is `path` npm's PLACEHOLDER stub rather than the real tool?
-///
-/// `@anthropic-ai/claude-code` ships `bin/claude.exe` as a ~500-byte shell
-/// script that only prints "claude native binary not installed" and exits 1;
-/// its postinstall then links the native binary over it. So a reinstall has a
-/// second window, after npm re-links `bin/claude` but before postinstall runs,
-/// in which the tool is PRESENT but is the stub — and execing it there failed a
-/// peer pane's launch on 2026-10-21. Treating the stub as a miss lets the
-/// bounded wait in [`resolve_real_waiting`] cover both windows. A native binary
-/// starts with its ELF/PE/Mach-O magic, so the marker never matches one; an
-/// unreadable file is NOT a placeholder (fail-open to the old behaviour).
-/// Scope: npm on Linux/macOS, where `bin/claude` links straight to the
-/// placeholder. On Windows npm's cmd-shim wrapper (`claude.cmd`) is what PATH
-/// resolves, so the stub behind it is not seen and that window stays open.
-fn is_npm_placeholder(path: &Path) -> bool {
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut head = Vec::with_capacity(PLACEHOLDER_PROBE_BYTES as usize);
-    if file
-        .take(PLACEHOLDER_PROBE_BYTES)
-        .read_to_end(&mut head)
-        .is_err()
-    {
-        return false;
-    }
-    head.windows(NPM_PLACEHOLDER_MARKER.len())
-        .any(|w| w == NPM_PLACEHOLDER_MARKER)
-}
-
 /// Candidate filenames to probe for the real tool, in resolution-preference
 /// order: `<name>.exe`, `<name>.cmd`, then bare `<name>` (Windows) / bare only
 /// (Unix).
@@ -1886,6 +1864,19 @@ mod tests {
             composed
         ));
 
+        // The composed file as a prompt word after `--`, either spelling, is
+        // not delivered: dropped.
+        for positional in [
+            strs(&["--", "--append-system-prompt-file", "/x/spawn-1.md"]),
+            strs(&["--", "--append-system-prompt-file=/x/spawn-1.md"]),
+        ] {
+            assert!(!keeps_policy_delivered_sha(
+                IdentityTool::Claude,
+                &positional,
+                composed
+            ));
+        }
+
         // A nested claude with its OWN file, either spelling: dropped.
         let own = strs(&["-p", "--append-system-prompt-file", "./eval.md"]);
         let own_attached = strs(&["--append-system-prompt-file=./eval.md"]);
@@ -2261,6 +2252,29 @@ mod tests {
         let mcp_pos = got.iter().position(|a| a == "--mcp-config").unwrap();
         let sid_pos = got.iter().position(|a| a == "--session-id").unwrap();
         assert!(mcp_pos < sid_pos, "--mcp-config must precede --session-id");
+
+        // A `--` in the original args keeps everything of ours ahead of it, and
+        // what follows it byte-exact, flag-shaped or not.
+        let with_terminator = strs(&["--verbose", "--", "the prompt", "--settings", "--"]);
+        assert_eq!(
+            identity_argv(&with_terminator, &settings, &mcp, Some("pin-123"), false),
+            strs(&[
+                "--verbose",
+                "--settings",
+                "C:\\hooks\\s.json",
+                "--mcp-config",
+                "C:\\cfg\\coord.json",
+                "--session-id",
+                "pin-123",
+                "--",
+                "the prompt",
+                "--settings",
+                "--",
+            ])
+        );
+        // ...and a session-looking prompt after `--` is not the user's choice.
+        assert!(!user_chose_session(&strs(&["--", "resume"])));
+        assert!(user_chose_session(&strs(&["resume", "--", "the prompt"])));
 
         // User chose ⇒ no pin appended, settings + mcp-config still delivered.
         assert_eq!(

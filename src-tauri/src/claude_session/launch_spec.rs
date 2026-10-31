@@ -1682,6 +1682,9 @@ mod tests {
     #[test]
     #[cfg(not(target_os = "windows"))]
     fn program_and_argv_execs_claude_directly_off_windows() {
+        // Resolves PATH twice below; a test mutating PATH between them would
+        // make the two answers differ.
+        let _env_lock = crate::test_env::env_lock();
         let (program, args) = render_program_and_argv(&spec(), &LaunchConfig::default());
 
         assert_ne!(program, "cmd.exe", "cmd.exe does not exist off Windows");
