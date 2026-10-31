@@ -359,7 +359,11 @@ jobs:
       #        unavailable, or its connect runs past 5 s (a full backlog, or
       #        a loaded Windows host retrying the SYN), it falls back to curl
       #        with no proxy and refuses unless curl exits 7 (could not
-      #        connect). The success line names which probe decided.
+      #        connect). curl's connect gets 10 s, longer than `/dev/tcp`
+      #        had, because a refused loopback connect on Windows comes back
+      #        only after ~2 s of SYN retries; a hung listener still runs
+      #        past it (exit 28) and refuses. The success line names which
+      #        probe decided.
       # It does not check other ports, a credential under another account or
       # path, or environment the runner service passes in -- coord's
       # ci_route NOT_SERVED lists those. The title carries coord's generic
@@ -405,10 +409,12 @@ jobs:
             # No usable /dev/tcp here, or its connect ran past 5 s (a full
             # backlog, or a loaded Windows host retrying a refused SYN):
             # curl, with no proxy, refusing unless it could not connect at
-            # all (exit 7). A hung listener is exit 28, so it still refuses.
+            # all (exit 7). The 10 s connect outlasts Windows' ~2 s of SYN
+            # retries on a refused loopback port; a hung listener runs past
+            # it (exit 28), so it still refuses.
             command -v curl >/dev/null 2>&1 || refuse "neither /dev/tcp (rc $probe_rc: $probe_err) nor curl is available, so whether anything listens on 127.0.0.1:9876 is UNKNOWN."
             curl_rc=0
-            curl -s -o /dev/null --noproxy '*' --connect-timeout 2 --max-time 5 http://127.0.0.1:9876/health || curl_rc=$?
+            curl -s -o /dev/null --noproxy '*' --connect-timeout 10 --max-time 12 http://127.0.0.1:9876/health || curl_rc=$?
             [ "$curl_rc" -eq 7 ] || refuse "curl to 127.0.0.1:9876 exited $curl_rc (7 = nothing listening); a listener may be there."
             probe_by="curl rc=7"
           fi
@@ -1859,7 +1865,11 @@ jobs:
       #        unavailable, or its connect runs past 5 s (a full backlog, or
       #        a loaded Windows host retrying the SYN), it falls back to curl
       #        with no proxy and refuses unless curl exits 7 (could not
-      #        connect). The success line names which probe decided.
+      #        connect). curl's connect gets 10 s, longer than `/dev/tcp`
+      #        had, because a refused loopback connect on Windows comes back
+      #        only after ~2 s of SYN retries; a hung listener still runs
+      #        past it (exit 28) and refuses. The success line names which
+      #        probe decided.
       # It does not check other ports, a credential under another account or
       # path, or environment the runner service passes in -- coord's
       # ci_route NOT_SERVED lists those. The title carries coord's generic
@@ -1905,10 +1915,12 @@ jobs:
             # No usable /dev/tcp here, or its connect ran past 5 s (a full
             # backlog, or a loaded Windows host retrying a refused SYN):
             # curl, with no proxy, refusing unless it could not connect at
-            # all (exit 7). A hung listener is exit 28, so it still refuses.
+            # all (exit 7). The 10 s connect outlasts Windows' ~2 s of SYN
+            # retries on a refused loopback port; a hung listener runs past
+            # it (exit 28), so it still refuses.
             command -v curl >/dev/null 2>&1 || refuse "neither /dev/tcp (rc $probe_rc: $probe_err) nor curl is available, so whether anything listens on 127.0.0.1:9876 is UNKNOWN."
             curl_rc=0
-            curl -s -o /dev/null --noproxy '*' --connect-timeout 2 --max-time 5 http://127.0.0.1:9876/health || curl_rc=$?
+            curl -s -o /dev/null --noproxy '*' --connect-timeout 10 --max-time 12 http://127.0.0.1:9876/health || curl_rc=$?
             [ "$curl_rc" -eq 7 ] || refuse "curl to 127.0.0.1:9876 exited $curl_rc (7 = nothing listening); a listener may be there."
             probe_by="curl rc=7"
           fi
