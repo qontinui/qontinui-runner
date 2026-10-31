@@ -20,7 +20,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
 
 import { ClaudeCliSection } from "./ClaudeCliSection";
 import { DEFAULT_AI_SETTINGS } from "./types";
-import type { AccountSelectionMode, AiSettings } from "../types";
+import type { AccountSelectionMode, AiSettings, ClaudeCliSettings } from "../types";
 
 const DIRS = ["/home/u/.claude-work", "/home/u/.claude-personal"];
 
@@ -28,6 +28,7 @@ function render(opts: {
   local: AccountSelectionMode;
   pinned: boolean;
   fleet: AccountSelectionMode | null;
+  cli?: Partial<ClaudeCliSettings>;
 }) {
   const settings: AiSettings = {
     ...DEFAULT_AI_SETTINGS,
@@ -36,6 +37,7 @@ function render(opts: {
       account_selection_mode: opts.local,
       account_selection_pinned: opts.pinned,
       config_dir: DIRS[0],
+      ...opts.cli,
     },
     fleet_account_selection_mode: opts.fleet,
     effective_account_selection_mode: opts.pinned ? opts.local : (opts.fleet ?? opts.local),
@@ -93,5 +95,22 @@ describe("ClaudeCliSection under a fleet account-selection policy", () => {
     expect(html).toContain('data-testid="auto-select-rule-caption"');
     expect(html).not.toContain('name="manual_account"');
     expect(html).not.toContain('id="claude-cli-custom-config-dir"');
+  });
+});
+
+describe("ClaudeCliSection selection thresholds", () => {
+  it("shows a stored override in percentage points and the defaults as placeholders", () => {
+    const html = render({
+      local: "alternating_handoff",
+      pinned: true,
+      fleet: null,
+      cli: { selection_min_shortfall: 0.035, handoff_load_estimate: 0 },
+    });
+    expect(html).toContain('data-testid="selection-thresholds"');
+    // 0.035 is shown as 3.5 points; an explicit 0 charge stays visible as 0.
+    expect(html).toMatch(/aria-label="Minimum shortfall"[^>]*value="3.5"/);
+    expect(html).toMatch(/aria-label="Handoff load charge"[^>]*value="0"/);
+    // No headroom override: empty, with the built-in 10 points as placeholder.
+    expect(html).toMatch(/aria-label="Minimum headroom"[^>]*placeholder="10"[^>]*value=""/);
   });
 });

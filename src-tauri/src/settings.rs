@@ -210,6 +210,25 @@ pub struct ClaudeCliSettings {
     /// of sitting idle at the input box. Manual migrations honor it too.
     #[serde(default = "default_auto_continue_after_migration")]
     pub auto_continue_after_migration: bool,
+    /// Override for `ai_provider::config::MIN_SHORTFALL`: how far under its
+    /// pace (`expected - effective_utilization`, utilization units) an account
+    /// must be to count as under pace for selection and handoffs. `None` uses
+    /// the built-in value; a set value is clamped to `0.01..=1.0`.
+    #[serde(default)]
+    pub selection_min_shortfall: Option<f64>,
+    /// Override for `ai_provider::config::MIN_HEADROOM`: the capacity an
+    /// account must have left before its reset (`1 - effective_utilization`)
+    /// to count as under pace; below it the account ranks after every other
+    /// usable account. `None` uses the built-in value; a set value is clamped
+    /// to `0.01..=1.0`.
+    #[serde(default)]
+    pub selection_min_headroom: Option<f64>,
+    /// Override for `ai_provider::config::HANDOFF_LOAD_ESTIMATE`: the load a
+    /// handoff charges its target account (utilization units), decaying to
+    /// zero over the 3-hour handoff window. `None` uses the built-in value; a
+    /// set value is clamped to `0.0..=1.0` (`0.0` disables the charge).
+    #[serde(default)]
+    pub handoff_load_estimate: Option<f64>,
 }
 
 fn default_auto_migrate_on_token_exhaustion() -> bool {
@@ -231,6 +250,9 @@ impl Default for ClaudeCliSettings {
             account_selection_pinned: false,
             auto_migrate_on_token_exhaustion: default_auto_migrate_on_token_exhaustion(),
             auto_continue_after_migration: default_auto_continue_after_migration(),
+            selection_min_shortfall: None,
+            selection_min_headroom: None,
+            handoff_load_estimate: None,
         }
     }
 }

@@ -128,6 +128,20 @@ export interface ClaudeCliSettings {
   /** After a migration respawn, nudge the resumed session to continue its
    * task once the CLI is idle. Runner default: true. */
   auto_continue_after_migration?: boolean;
+  /** Override for the runner's `MIN_SHORTFALL` ({@link MIN_SHORTFALL}): how
+   * far under its pace (`expected - utilization`) an account must be to count
+   * as under pace. `null`/absent = built-in value; clamped to `0.01..=1`. */
+  selection_min_shortfall?: number | null;
+  /** Override for the runner's `MIN_HEADROOM` ({@link MIN_HEADROOM}): the
+   * capacity an account must have left (`1 - utilization`) to count as under
+   * pace; below it the account ranks after every other usable one.
+   * `null`/absent = built-in value; clamped to `0.01..=1`. */
+  selection_min_headroom?: number | null;
+  /** Override for the runner's `HANDOFF_LOAD_ESTIMATE`
+   * ({@link HANDOFF_LOAD_ESTIMATE}): the utilization a handoff charges its
+   * target, decaying to zero over 3 hours. `null`/absent = built-in value;
+   * clamped to `0..=1` (`0` disables the charge). */
+  handoff_load_estimate?: number | null;
 }
 
 /** One per-model scoped weekly limit (e.g. the Fable-only cap). */
@@ -191,10 +205,69 @@ export function isAccountExhausted(a: {
   return s.includes("reject") || s.includes("block") || s.includes("exceed");
 }
 
+/** Mirrors the runner's `MIN_SHORTFALL` (`ai_provider/config.rs`): an account
+ * is under its pace only when `expected - utilization` is at least this. */
+export const MIN_SHORTFALL = 0.02;
+/** Mirrors the runner's `MIN_HEADROOM`: an account is under its pace only with
+ * at least this much left (`1 - utilization`), and below it ranks after every
+ * other usable account. */
+export const MIN_HEADROOM = 0.1;
+/** Mirrors the runner's `HANDOFF_LOAD_ESTIMATE` — shown as the default in the
+ * settings form. The charge itself lives in the runner's in-process handoff
+ * ledger and is not visible here, so the UI ranks on probed utilization. */
+export const HANDOFF_LOAD_ESTIMATE = 0.02;
+/** Mirrors the runner's `MIN_FLOOR_SETTING`: neither floor may be set below one
+ * whole percent, the probe's resolution. */
+export const MIN_FLOOR_SETTING = 0.01;
+/** Slack for the floor comparisons, as in the runner (`FLOOR_EPSILON`). */
+const FLOOR_EPSILON = 1e-9;
+
+/** The two floors the runner's `under_pace_shortfall` applies. */
+export interface HeadroomFloors {
+  min_shortfall: number;
+  min_headroom: number;
+}
+
+export const DEFAULT_HEADROOM_FLOORS: HeadroomFloors = {
+  min_shortfall: MIN_SHORTFALL,
+  min_headroom: MIN_HEADROOM,
+};
+
+/** The floors a `ClaudeCliSettings` asks for, clamped exactly like the
+ * runner's `HeadroomFloors::from_cli`: each override to `MIN_FLOOR_SETTING..=1`,
+ * an absent or non-finite one the built-in value. */
+export function headroomFloorsFromSettings(
+  cli?: Pick<ClaudeCliSettings, "selection_min_shortfall" | "selection_min_headroom">,
+): HeadroomFloors {
+  const floor = (v: number | null | undefined, fallback: number): number =>
+    v == null || !Number.isFinite(v) ? fallback : Math.min(1, Math.max(MIN_FLOOR_SETTING, v));
+  return {
+    min_shortfall: floor(cli?.selection_min_shortfall, MIN_SHORTFALL),
+    min_headroom: floor(cli?.selection_min_headroom, MIN_HEADROOM),
+  };
+}
+
+/** Less than `floors.min_headroom` left before the reset — the runner's
+ * `UsageRank::low_headroom`. */
+function hasLowHeadroom(a: { utilization: number }, floors: HeadroomFloors): boolean {
+  return 1 - (a.utilization ?? 0) + FLOOR_EPSILON < floors.min_headroom;
+}
+
+/** Under pace past BOTH floors — the runner's `under_pace_shortfall` predicate
+ * (with no handoff charge, which the UI cannot see). */
+function isUnderPaceWithHeadroom(
+  a: { utilization: number; usage_delta?: number | null; expected_utilization?: number | null },
+  floors: HeadroomFloors,
+): boolean {
+  if (a.usage_delta == null || a.expected_utilization == null) return false;
+  if (-a.usage_delta + FLOOR_EPSILON < floors.min_shortfall) return false;
+  return !hasLowHeadroom(a, floors);
+}
+
 /** The minimum shape `compareByUsageHeadroom` ranks on. Structural so both
  * `AccountUsageInfo` shapes (settings + the terminal subset in
  * `useSessionManager`) satisfy it. */
-type RankableAccount = {
+export type RankableAccount = {
   utilization: number;
   expected_utilization?: number | null;
   usage_delta?: number | null;
@@ -245,15 +318,17 @@ function overPaceRatio(utilization: number, expected: number): number {
   return utilization / expected;
 }
 
-/** Classify one account into its pace tier and compute that tier's key. */
-function paceRank(a: RankableAccount): PaceRank {
+/** Classify one account into its pace tier and compute that tier's key. An
+ * account under its pace by less than a floor allows is DEMOTED to the
+ * over-pace tier (ranked on its ratio), never dropped. */
+function paceRank(a: RankableAccount, floors: HeadroomFloors): PaceRank {
   const utilization = a.utilization ?? 0;
   const delta = a.usage_delta;
   const expected = a.expected_utilization;
   // No usable pace signal: it cannot be classified under- or over-pace, and
   // neither tier's key is computable. Fall back to raw utilization ascending.
   if (delta == null || expected == null) return { tier: "unknown", utilization };
-  if (delta < 0) return { tier: "under", expected };
+  if (isUnderPaceWithHeadroom(a, floors)) return { tier: "under", expected };
   return { tier: "over", ratio: overPaceRatio(utilization, expected) };
 }
 
@@ -275,16 +350,20 @@ function ascending(x: number, y: number): number {
  * which ranked "furthest under projected pace" first and therefore preferred
  * exactly the capacity that was in no danger of expiring.)
  *
- * Three levels, in order:
+ * Four levels, in order:
  *
  * 1. Exhausted accounts (out of tokens / rejected; see {@link
  *    isAccountExhausted}) always sort AFTER usable ones, no matter how
  *    favourable their pace key — a fully-used account whose window is nearly
  *    over still has nothing left to burn.
- * 2. The pace {@link PaceRank} **tier** ({@link PACE_TIER_INDEX}): under-pace
- *    (`usage_delta < 0`) before unknown (no usable pace signal) before
- *    over-pace (`usage_delta >= 0`).
- * 3. Only for two accounts in the *same* tier, that tier's own key in that
+ * 2. An account with less than `floors.min_headroom` ({@link MIN_HEADROOM})
+ *    left sorts after every other usable account, in every tier — but still
+ *    before every exhausted one.
+ * 3. The pace {@link PaceRank} **tier** ({@link PACE_TIER_INDEX}): under-pace
+ *    (under by at least `floors.min_shortfall`, {@link MIN_SHORTFALL}, with
+ *    the headroom floor met) before unknown (no usable pace signal) before
+ *    over-pace (at or over pace, or under it by less than a floor allows).
+ * 4. Only for two accounts in the *same* tier, that tier's own key in that
  *    tier's own direction:
  *    - **under-pace → `expected_utilization` DESCENDING.** The account
  *      furthest through its 7-day window wins, because its spare capacity is
@@ -307,14 +386,29 @@ function ascending(x: number, y: number): number {
  * implementations are documented mirrors and must change together.
  * Structurally typed so both `AccountUsageInfo` shapes (settings + the
  * terminal subset in `useSessionManager`) can use the one comparator.
+ * `floors` defaults to the built-in values, so it can be handed straight to
+ * `Array.prototype.sort`; pass {@link headroomFloorsFromSettings} to honour
+ * the runner's overrides. The terminal-side "best account" pickers
+ * (`TerminalPage` `spawnWithPromptText`, `useTerminalCommands`
+ * `resolveAccountConfigDir`, `LaunchMenu`) hold no `AiSettings` and so rank on
+ * the built-in floors: with an override set they can disagree with the
+ * runner's `pick_best_account` and the Settings page marker.
  */
-export function compareByUsageHeadroom(a: RankableAccount, b: RankableAccount): number {
+export function compareByUsageHeadroom(
+  a: RankableAccount,
+  b: RankableAccount,
+  floors: HeadroomFloors = DEFAULT_HEADROOM_FLOORS,
+): number {
   const ea = isAccountExhausted(a) ? 1 : 0;
   const eb = isAccountExhausted(b) ? 1 : 0;
   if (ea !== eb) return ea - eb;
 
-  const ra = paceRank(a);
-  const rb = paceRank(b);
+  const ha = hasLowHeadroom(a, floors) ? 1 : 0;
+  const hb = hasLowHeadroom(b, floors) ? 1 : 0;
+  if (ha !== hb) return ha - hb;
+
+  const ra = paceRank(a, floors);
+  const rb = paceRank(b, floors);
   const ta = PACE_TIER_INDEX[ra.tier];
   const tb = PACE_TIER_INDEX[rb.tier];
   if (ta !== tb) return ta - tb;
@@ -341,17 +435,20 @@ export function compareByUsageHeadroom(a: RankableAccount, b: RankableAccount): 
 }
 
 /**
- * Comparator for the `highest_expected_usage` selection mode. Three-level key
- * `(exhausted, !underPace, -expected_utilization)`, ascending — the best
- * account sorts first.
+ * Comparator for the `highest_expected_usage` selection mode. Four-level key
+ * `(exhausted, lowHeadroom, !underPace, -expected_utilization)`, ascending —
+ * the best account sorts first.
  *
  * 1. Exhausted accounts (see {@link isAccountExhausted}) always sort AFTER
  *    usable ones, exactly like {@link compareByUsageHeadroom}.
- * 2. An account currently UNDER its projected pace (`usage_delta < 0`, with
- *    both `usage_delta` and `expected_utilization` known) always sorts before
- *    one that is at or over pace — an at-or-over-pace account is never
+ * 2. An account with less than `floors.min_headroom` left sorts after every
+ *    other usable one, exactly like {@link compareByUsageHeadroom} (the
+ *    runner's fallback skips it while an account with headroom is available).
+ * 3. An account UNDER its projected pace past both floors (the runner's
+ *    `under_pace_shortfall`) always sorts before one that is at or over pace
+ *    or under it by less than a floor allows — such an account is never
  *    preferred by this mode.
- * 3. Within the under-pace tier, the HIGHEST `expected_utilization` wins
+ * 4. Within the under-pace tier, the HIGHEST `expected_utilization` wins
  *    (furthest along its billing window, so it is "spent down" before an
  *    account that still has most of its week ahead of it).
  *
@@ -373,13 +470,17 @@ export function compareByHighestExpectedUsage(
     status?: string | null;
     error?: string | null;
   },
+  floors: HeadroomFloors = DEFAULT_HEADROOM_FLOORS,
 ): number {
   const ea = isAccountExhausted(a) ? 1 : 0;
   const eb = isAccountExhausted(b) ? 1 : 0;
   if (ea !== eb) return ea - eb;
 
-  const underPace = (x: typeof a): boolean =>
-    x.usage_delta != null && x.usage_delta < 0 && x.expected_utilization != null;
+  const ha = hasLowHeadroom(a, floors) ? 1 : 0;
+  const hb = hasLowHeadroom(b, floors) ? 1 : 0;
+  if (ha !== hb) return ha - hb;
+
+  const underPace = (x: typeof a): boolean => isUnderPaceWithHeadroom(x, floors);
   const ua = underPace(a) ? 0 : 1;
   const ub = underPace(b) ? 0 : 1;
   if (ua !== ub) return ua - ub;
@@ -401,16 +502,19 @@ export function compareByHighestExpectedUsage(
  * an explicit "best account" regardless of the pinned one. */
 export function compareForAccountSelectionMode(
   mode: AccountSelectionMode | undefined,
-): typeof compareByUsageHeadroom {
+  floors: HeadroomFloors = DEFAULT_HEADROOM_FLOORS,
+): (a: RankableAccount, b: RankableAccount) => number {
   // `alternating_handoff` picks the highest-expected under-pace account at
   // spawn time (its "account 1"), so it shares that comparator. The ordering
   // it gives `weighted_random` is only a display order: that mode draws, so
   // it has no single best account (see `hasDeterministicPick`).
-  return mode === "highest_expected_usage" ||
+  const compare =
+    mode === "highest_expected_usage" ||
     mode === "alternating_handoff" ||
     mode === "weighted_random"
-    ? compareByHighestExpectedUsage
-    : compareByUsageHeadroom;
+      ? compareByHighestExpectedUsage
+      : compareByUsageHeadroom;
+  return (a, b) => compare(a, b, floors);
 }
 
 /** Whether a mode picks one predictable account, so the UI may mark it as the
