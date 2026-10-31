@@ -13,8 +13,10 @@
  * device at all (no drain can apply).
  */
 
-import { AlertTriangle, PauseCircle } from "lucide-react";
+import { useState } from "react";
+import { AlertTriangle, PauseCircle, X } from "lucide-react";
 import { StatusBanner } from "@/components/ui/StatusBanner";
+import { AdvisorySlot } from "./AdvisoryStack";
 import { useCoordDrainState, type CoordDrainSnapshot } from "@/hooks/useCoordDrainState";
 
 export interface DrainBannerModel {
@@ -29,6 +31,12 @@ export interface DrainBannerModel {
    * anything. Rendered verbatim.
    */
   restoreNote: string | null;
+  /**
+   * Identity of the drain episode this banner describes, for dismissal. Built
+   * from the fields that stay fixed for an episode — not from `detail`, whose
+   * unknown-state cause is rewritten on every read (failure count, read age).
+   */
+  episodeKey: string;
 }
 
 /** The copy the UNKNOWN state must carry, verbatim (plan Phase 3). */
@@ -71,6 +79,7 @@ export function drainBannerModel(s: CoordDrainSnapshot | null): DrainBannerModel
       detail: parts.length > 0 ? parts.join(" · ") : null,
       deferredLabel: deferredLabel(s.deferredCount, s.deferredCapped ?? false),
       restoreNote: RESTORE_NOTE,
+      episodeKey: `drained|${s.until ?? ""}|${s.reason ?? ""}`,
     };
   }
   // At boot the state is "not read yet" until the first drain read lands; that
@@ -83,6 +92,7 @@ export function drainBannerModel(s: CoordDrainSnapshot | null): DrainBannerModel
       detail: s.cause,
       deferredLabel: deferredLabel(s.deferredCount, s.deferredCapped ?? false),
       restoreNote: RESTORE_NOTE,
+      episodeKey: `unknown|${s.since ?? ""}`,
     };
   }
   return null;
@@ -90,15 +100,65 @@ export function drainBannerModel(s: CoordDrainSnapshot | null): DrainBannerModel
 
 export function RunnerDrainBanner() {
   const model = drainBannerModel(useCoordDrainState());
-  if (!model) return null;
+  // Dismissal is per drain episode (`episodeKey`): a new drain, a
+  // drained→unknown change, or the drain clearing and returning shows it again.
+  // Dismissing only collapses the notice to a small icon — spawns stay
+  // deferred, so the runner keeps saying so; clicking it brings the banner back.
+  const [dismissedKey, setDismissedKey] = useState<string | null>(null);
+  if (!model) {
+    if (dismissedKey !== null) setDismissedKey(null);
+    return null;
+  }
+  const key = model.episodeKey;
   const Icon = model.status === "error" ? AlertTriangle : PauseCircle;
+  const drainState = model.status === "error" ? "unknown" : "drained";
+  if (dismissedKey === key) {
+    // Rendered through the advisory stack, the single owner of the top-right
+    // corner (finding c91550f0), so it never sits over another advisory, the
+    // tab bar or a zone's hover actions. A solid base under the 10% status
+    // tint keeps it legible over the terminal grid. Classes are literal so
+    // Tailwind's source scan (which skips node_modules) always emits them.
+    const tone =
+      model.status === "error"
+        ? "border-red-500/40 bg-red-500/15 text-red-500"
+        : "border-yellow-500/40 bg-yellow-500/15 text-yellow-500";
+    return (
+      <AdvisorySlot>
+        <button
+          type="button"
+          aria-label={`${model.heading} — show details`}
+          aria-expanded={false}
+          title={`${model.heading} — click for details`}
+          onClick={() => setDismissedKey(null)}
+          className="rounded-full shadow-lg bg-[#16161e]"
+          data-ui-bridge-id="terminal.runner-drain-indicator"
+          data-drain-state={drainState}
+        >
+          <span className={`block rounded-full border p-1.5 ${tone}`}>
+            <Icon className="w-4 h-4" />
+          </span>
+        </button>
+      </AdvisorySlot>
+    );
+  }
   return (
     <div
-      className="absolute top-2 left-1/2 -translate-x-1/2 z-30 w-[440px] max-w-[90%] shadow-lg"
+      className="absolute top-2 left-1/2 -translate-x-1/2 z-30 w-max min-w-[min(440px,95%)] max-w-[95%] shadow-lg"
       data-ui-bridge-id="terminal.runner-drain-banner"
-      data-drain-state={model.status === "error" ? "unknown" : "drained"}
+      data-drain-state={drainState}
     >
       <StatusBanner status={model.status} icon={<Icon className="w-4 h-4" />}>
+        <button
+          type="button"
+          aria-label="Dismiss drain notice"
+          aria-expanded={true}
+          title="Dismiss"
+          onClick={() => setDismissedKey(key)}
+          className="float-right ml-2 -mt-0.5 opacity-70 hover:opacity-100"
+          data-ui-bridge-id="terminal.runner-drain-banner.dismiss"
+        >
+          <X className="w-4 h-4" />
+        </button>
         <div className="text-[12px] font-semibold leading-snug">{model.heading}</div>
         {model.detail && <div className="text-[11px] leading-snug mt-0.5">{model.detail}</div>}
         <div className="text-[11px] leading-snug mt-0.5 opacity-80">
