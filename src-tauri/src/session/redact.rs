@@ -36,8 +36,35 @@ static BEARER_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("bearer redaction regex is a valid literal")
 });
 
+/// JWT sweep: three dot-separated base64url segments whose first starts with
+/// `eyJ` (the base64 of `{"`), wherever they appear — not only after a
+/// `Bearer` keyword (plan
+/// `2026-10-14-permission-prompts-are-never-recorded-so-guard-rules-grow-on-anecdote`
+/// D6). The signature segment may be empty (an unsigned `alg: none` token).
+static JWT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*")
+        .expect("jwt redaction regex is a valid literal")
+});
+
+/// URL-userinfo sweep: `scheme://user:pass@host` (or `scheme://token@host`)
+/// becomes `scheme://***@host` (same plan, D6). Greedy to the LAST `@` in the
+/// authority, so a userinfo that itself holds an `@` (the Azure Database for
+/// PostgreSQL `user@server:password@host` shape) is masked whole. The
+/// authority ends at the first `/`, `?`, `#`, whitespace, `"`, `<`, `>`, `\`
+/// or `` ` `` — characters that delimit a URL in JSON, HTML and shell text —
+/// so an `@` in a path, a query, or a later field of compact JSON is not
+/// userinfo. Other RFC 3986-illegal characters (`{` `}` `|` `^` `[` `]`) are
+/// deliberately NOT excluded: a password may contain them unescaped.
+static URL_USERINFO_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"\b([A-Za-z][A-Za-z0-9+.\-]*://)[^/?#\s"<>\\`]*@"#)
+        .expect("url-userinfo redaction regex is a valid literal")
+});
+
 /// Mask substituted for a matched secret value.
 pub const MASK: &str = "***REDACTED***";
+
+/// Mask substituted for URL userinfo (`scheme://***@host`).
+pub const USERINFO_MASK: &str = "***";
 
 /// Apply the redaction sweep to a byte slice. Operates on the UTF-8 lossy
 /// view (session output is overwhelmingly UTF-8; non-UTF-8 bytes become the
@@ -52,6 +79,10 @@ pub fn redact_secrets(bytes: &[u8]) -> Vec<u8> {
     });
     let masked = BEARER_RE.replace_all(&masked, |caps: &regex::Captures| {
         format!("{}{}{}", &caps[1], &caps[2], MASK)
+    });
+    let masked = JWT_RE.replace_all(&masked, MASK);
+    let masked = URL_USERINFO_RE.replace_all(&masked, |caps: &regex::Captures| {
+        format!("{}{USERINFO_MASK}@", &caps[1])
     });
     masked.into_owned().into_bytes()
 }
@@ -162,6 +193,87 @@ mod tests {
         // length bound, so ordinary prose survives.
         let input = b"the bearer of this message";
         assert_eq!(redact_secrets(input), input);
+    }
+
+    // ---- JWT + URL-userinfo (plan 2026-10-14 permission-prompt capture, D6) -
+
+    #[test]
+    fn redacts_a_bare_jwt() {
+        // Assembled at runtime so source secret scanners see no literal JWT.
+        let jwt = format!(
+            "eyJ{}.eyJ{}.{}",
+            "hbGciOiJIUzI1NiJ9", "zdWIiOiJ4In0", "c2ln-bmF0_dXJl"
+        );
+        let input = format!("COORD_JWT_FILE contents: {jwt} end");
+        let out = String::from_utf8(redact_secrets(input.as_bytes())).unwrap();
+        assert!(!out.contains(&jwt), "jwt leaked: {out}");
+        assert_eq!(out, format!("COORD_JWT_FILE contents: {MASK} end"));
+        // An unsigned token (empty signature segment) is still a JWT.
+        let unsigned = format!("eyJ{}.eyJ{}.", "hbGciOiJub25lIn0", "zdWIiOiJ4In0");
+        let out = String::from_utf8(redact_secrets(unsigned.as_bytes())).unwrap();
+        assert_eq!(out, MASK);
+    }
+
+    #[test]
+    fn a_two_segment_or_short_eyj_word_is_not_a_jwt() {
+        let input = b"eyJhb.cd and eyJabcdef.ghijklm";
+        assert_eq!(redact_secrets(input), input);
+    }
+
+    #[test]
+    fn redacts_url_userinfo() {
+        let input = format!(
+            "git clone https://{}:{}@github.com/o/r.git && curl ftp://{}@h/x",
+            "alice", "hunter2", "tok123"
+        );
+        let out = String::from_utf8(redact_secrets(input.as_bytes())).unwrap();
+        assert!(
+            !out.contains("alice") && !out.contains("hunter2") && !out.contains("tok123"),
+            "{out}"
+        );
+        assert!(out.contains("https://***@github.com/o/r.git"), "{out}");
+        assert!(out.contains("ftp://***@h/x"), "{out}");
+    }
+
+    #[test]
+    fn an_at_sign_in_a_url_path_or_query_is_not_userinfo() {
+        let input = b"see https://example.com/users/@me and mail a@b.c";
+        assert_eq!(redact_secrets(input), input);
+        let input = b"open https://example.com?x=a@b now";
+        assert_eq!(redact_secrets(input), input);
+        let input = b"open https://example.com#frag@x now";
+        assert_eq!(redact_secrets(input), input);
+    }
+
+    #[test]
+    fn compact_json_with_an_email_after_a_url_is_left_alone() {
+        let input = br#"{"url":"https://api.x.io","user":"a@b.c"}"#;
+        assert_eq!(redact_secrets(input), input);
+        let input = br#"<a href="https://h.io">x</a> mail a@b.c"#;
+        assert_eq!(redact_secrets(input), input);
+    }
+
+    #[test]
+    fn a_password_with_unescaped_punctuation_stays_masked() {
+        let input = format!("psql postgres://u:{}@h/db", "p|w^x{y");
+        let out = String::from_utf8(redact_secrets(input.as_bytes())).unwrap();
+        assert_eq!(out, "psql postgres://***@h/db");
+    }
+
+    #[test]
+    fn a_userinfo_holding_an_at_sign_is_masked_whole() {
+        // The Azure Database for PostgreSQL shape: the user name itself
+        // carries `@server`. Assembled at runtime so scanners see no literal.
+        let input = format!(
+            "psql postgres://{}@mydemoserver:{}@srv.example.com:5432/db",
+            "myadmin", "mypassword"
+        );
+        let out = String::from_utf8(redact_secrets(input.as_bytes())).unwrap();
+        assert!(
+            !out.contains("mypassword") && !out.contains("myadmin"),
+            "{out}"
+        );
+        assert_eq!(out, "psql postgres://***@srv.example.com:5432/db");
     }
 
     #[test]
