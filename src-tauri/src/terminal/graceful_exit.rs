@@ -575,7 +575,12 @@ fn millis(d: Duration) -> u64 {
 /// there answers [`GracefulExitOutcome::NoCloseAuthority`] with nothing typed
 /// and nothing closed. A pane with no live `claude` answers `NoLiveClaude`, and
 /// an unreadable table answers `ProbeUnavailable`, whatever was presented.
-pub async fn drive<W, S, P, PF, C, CF>(
+///
+/// `pub(super)`: only `crate::terminal` may drive the protocol, and everything
+/// else goes through `TerminalManager::graceful_exit`. The close-authority scan
+/// (`runner_close_sites.rs`) checks the authority every caller passes, and it
+/// reads `drive(` calls under `terminal/` only, which this keeps complete.
+pub(super) async fn drive<W, S, P, PF, C, CF>(
     mut write: W,
     mut screen: S,
     mut probe: P,
@@ -760,8 +765,9 @@ pub(crate) mod fake_process_table {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Mutex, OnceLock, PoisonError};
 
-    /// First fake root pid. Above Linux's `pid_max` ceiling (2^22) and above any
-    /// pid Windows hands out in practice, so no real pane can collide with one.
+    /// First fake root pid, above Linux's `pid_max` ceiling (2^22). The table
+    /// answers only for a pid a test registered, so it can shadow a real
+    /// process only if a test also probes a real pane holding that same pid.
     const FAKE_PID_BASE: u32 = 4_000_000_000;
 
     static NEXT_PID: AtomicU32 = AtomicU32::new(FAKE_PID_BASE);
