@@ -2255,11 +2255,28 @@ fn apply_drain_to_claim(
     decision: SpawnDecision,
     drain: &crate::coord_drain_state::CoordDrainState,
 ) -> SpawnDecision {
+    apply_drain_to_claim_with_role(
+        decision,
+        drain,
+        crate::coord_drain_state::RoleReading::Known(None),
+    )
+}
+
+/// PURE: [`apply_drain_to_claim`] with the device's dispatch role, so the
+/// re-check after the claim's await also sees a role that closed the agent
+/// lane while it waited.
+fn apply_drain_to_claim_with_role(
+    decision: SpawnDecision,
+    drain: &crate::coord_drain_state::CoordDrainState,
+    role: impl Into<crate::coord_drain_state::RoleReading>,
+) -> SpawnDecision {
     match decision {
         SpawnDecision::SpawnDespiteClaimError { cause } => {
-            match crate::coord_drain_state::gate_for(
+            match crate::coord_drain_state::gate_with_role_at(
                 drain,
+                role,
                 crate::coord_drain_state::SpawnOrigin::GateContinuation,
+                chrono::Utc::now(),
             ) {
                 crate::coord_drain_state::DrainGate::Allow => {
                     SpawnDecision::SpawnDespiteClaimError { cause }
@@ -5102,10 +5119,9 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
 /// drained or its drain state is unknown the "spawn anyway" becomes
 /// [`SpawnDecision::DeferClaimErrorByDrain`], a leave-pending deferral.
 async fn post_continuation_claim(gate_id: uuid::Uuid, device_id: uuid::Uuid) -> SpawnDecision {
-    apply_drain_to_claim(
-        claim_before_spawn(gate_id, device_id).await,
-        &crate::coord_drain_state::current(),
-    )
+    let decision = claim_before_spawn(gate_id, device_id).await;
+    let (drain, role) = crate::coord_drain_state::current_with_role();
+    apply_drain_to_claim_with_role(decision, &drain, role)
 }
 
 /// The claim request itself, before the drain is applied.
@@ -18303,6 +18319,38 @@ mod drain_claim_tests {
                 "device_drain:unknown"
             };
             assert_eq!(drain_stamp_reason(class), expected);
+        }
+    }
+
+    /// The claim's "spawn anyway" re-check honours a dispatch role that closes
+    /// the agent lane, with the drain itself clear; an open or absent role
+    /// leaves it exactly as the drain alone decides.
+    #[test]
+    fn a_claim_error_spawn_is_deferred_by_a_closing_dispatch_role() {
+        use crate::coord_drain_state::{DeferClass, DispatchRole};
+        for role in [DispatchRole::CiNode, DispatchRole::Bench] {
+            match apply_drain_to_claim_with_role(
+                decide_spawn(503, ""),
+                &CoordDrainState::Clear,
+                Some(role),
+            ) {
+                SpawnDecision::DeferClaimErrorByDrain { class, .. } => {
+                    assert_eq!(class, DeferClass::RoleClosed, "{role:?}");
+                    assert_eq!(drain_stamp_reason(class), "device_drain:role_closed");
+                }
+                other => panic!("{role:?}: expected a deferral, got {other:?}"),
+            }
+        }
+        for role in [None, Some(DispatchRole::Workhorse)] {
+            assert_eq!(
+                apply_drain_to_claim_with_role(
+                    decide_spawn(503, ""),
+                    &CoordDrainState::Clear,
+                    role
+                ),
+                apply_drain_to_claim(decide_spawn(503, ""), &CoordDrainState::Clear),
+                "{role:?}"
+            );
         }
     }
 
