@@ -27,7 +27,7 @@ pub struct VerifyApiSpecRequest {
     pub app_id: String,
     /// Spec ID (filename without extension, e.g., "event-history")
     pub spec_id: String,
-    /// Override base URL (default: http://localhost:{self_port})
+    /// Override base URL (default: http://127.0.0.1:{self_port})
     pub base_url: Option<String>,
     /// Only run assertions with these IDs (if empty, run all)
     pub assertion_ids: Option<Vec<String>>,
@@ -334,7 +334,7 @@ pub async fn verify_api_spec(
     let port = super::types::get_mcp_api_port();
     let base_url = request
         .base_url
-        .unwrap_or_else(|| format!("http://localhost:{}", port));
+        .unwrap_or_else(|| super::types::runner_loopback_base(port));
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))

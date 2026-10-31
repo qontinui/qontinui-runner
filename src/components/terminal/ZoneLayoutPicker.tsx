@@ -1,13 +1,28 @@
 import { useState, useRef, useEffect } from "react";
 import { LayoutGrid } from "lucide-react";
-import { LAYOUT_PRESETS, type LayoutPreset } from "./useZoneLayout";
+import {
+  computeAutoGrowLayoutId,
+  FLOW_GRID_ID,
+  LAYOUT_PRESETS,
+  resolveLayoutArg,
+  type LayoutPreset,
+} from "./useZoneLayout";
 import { useUIComponent, UIBridgeComponentScope } from "@qontinui/ui-bridge";
 import { callRegistry, textArg } from "./commands";
 import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
+import { usePageSessionGetter, useTerminalSession } from "./contexts";
 
 /** Hoisted so the registration and its guarded handler read one declaration. */
 const SELECT_LAYOUT_SCHEMA = {
-  layoutId: "string (use list-layouts to enumerate valid IDs)",
+  layoutId:
+    'string — a preset id (use list-layouts to enumerate them), or a window count such as "4"',
+  pageId:
+    "string (optional terminal page id from GET /terminal-pages; defaults to the active page)",
+} as const;
+
+const GET_PAGE_LAYOUT_SCHEMA = {
+  pageId:
+    "string (optional terminal page id from GET /terminal-pages; defaults to the active page)",
 } as const;
 
 interface ZoneLayoutPickerProps {
@@ -66,6 +81,8 @@ export function ZoneLayoutPicker({
   tabCount,
 }: ZoneLayoutPickerProps) {
   const [open, setOpen] = useState(false);
+  const getPageSession = usePageSessionGetter();
+  const { pageId: activePageId } = useTerminalSession();
   const dropdownRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -98,7 +115,11 @@ export function ZoneLayoutPicker({
       {
         id: "select-layout",
         label: "Select Layout",
-        description: "Switch the terminal grid to a named layout preset.",
+        description:
+          "Switch a page's terminal grid to a layout preset, named or by window count " +
+          "(1 single, 2 split, 3 triptych, 4 quad, 5-6 six-pack, 7-9 full-grid, 10+ flow-grid). " +
+          "Returns the layout the grid settles at, which is larger than requested when the " +
+          "page holds more sessions than the preset has zones.",
         paramSchema: SELECT_LAYOUT_SCHEMA,
         // `write` — switches the grid preset and redistributes zone assignments. No
         // terminal is ended: `applyLayout` preserves in-range assignments and only
@@ -115,21 +136,57 @@ export function ZoneLayoutPicker({
           // Validate up-front so the existing "Valid options: …" error
           // message stays intact for automation parsers. The registry
           // would otherwise return `invalid-preset` with a thinner
-          // message.
-          const preset = LAYOUT_PRESETS.find((l) => l.id === layoutId);
-          if (!preset) {
+          // message. Same resolver as the registry, so the two accept
+          // one set: preset ids, `flow-grid`, and a window count.
+          const requested = resolveLayoutArg(layoutId);
+          if (requested === null) {
             throw new Error(
-              `Unknown layoutId: "${layoutId}". Valid options: ${LAYOUT_PRESETS.map((l) => l.id).join(", ")}`,
+              `Unknown layoutId: "${layoutId}". Valid options: ` +
+                `${[...LAYOUT_PRESETS.map((l) => l.id), FLOW_GRID_ID].join(", ")}, or a window count of 1 or more`,
             );
           }
+          const pageId = textArg(args, "pageId");
           // Phase 1c — delegates to registry `terminal.layout`. The
           // registry handler calls the same `zoneLayout.setLayoutId`
           // closure that `onSelectLayout` does (both source from
           // TerminalPage's session context), so behavior is identical
           // — but a future change to layout semantics now has one
-          // landing point instead of two.
-          await callRegistry("terminal.layout", { preset: layoutId });
+          // landing point instead of two. It refuses an unknown page.
+          await callRegistry(
+            "terminal.layout",
+            pageId ? { preset: layoutId, page: pageId } : { preset: layoutId },
+          );
           setOpen(false);
+          // The registry's verdict is prose; a caller trimming a grid needs
+          // the id the grid SETTLES at. Auto-grow keeps every live tab in a
+          // zone, so it is the same pure rule the registry reports with. A
+          // `/layout` request exits tmux mode, so the settle is predicted for
+          // grid mode, as `terminal.layout` does.
+          const tabs = pageId ? (getPageSession(pageId)?.tabs.length ?? tabCount) : tabCount;
+          const settled = computeAutoGrowLayoutId(requested, tabs, "grid") ?? requested;
+          return { requested, layoutId: settled, pageId: pageId || activePageId, tabCount: tabs };
+        }),
+      },
+      {
+        id: "get-page-layout",
+        label: "Get Page Layout",
+        description:
+          "Return {pageId, layoutId, zoneCount, tabCount, maximizedZone} for one terminal page, " +
+          "whether or not it is the page on screen; with no pageId, for the page on screen.",
+        paramSchema: GET_PAGE_LAYOUT_SCHEMA,
+        // `read` — reports one page's grid state; changes nothing.
+        effect: "read",
+        handler: guardedHandler("get-page-layout", GET_PAGE_LAYOUT_SCHEMA, (args) => {
+          const pageId = textArg(args, "pageId") || activePageId;
+          const page = getPageSession(pageId);
+          if (!page) throw new Error(`No terminal page with id "${pageId}"`);
+          return {
+            pageId,
+            layoutId: page.zoneLayout.layoutId,
+            zoneCount: page.zoneLayout.layout.zones.length,
+            tabCount: page.tabs.length,
+            maximizedZone: page.zoneLayout.maximizedZone,
+          };
         }),
       },
       {
