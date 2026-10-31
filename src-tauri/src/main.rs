@@ -5244,6 +5244,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             )
                             .await;
                             emit_session_bound(&poll_app_handle, &actions);
+                            // Rung-2 binds re-key the pane's coord row (plan
+                            // 2026-10-23-a-hookless-resume-…, Phase 1a).
+                            session::coord_identity::apply_reconcile_tick_in_app(
+                                &poll_app_handle,
+                                &actions,
+                            );
+                        } else {
+                            // No pass this tick, but a refused re-key still
+                            // has to be restored (and, for the hook / R2
+                            // sources, re-queued) on the tick cadence.
+                            session::coord_identity::apply_reconcile_tick_in_app(
+                                &poll_app_handle,
+                                &[],
+                            );
                         }
 
                         // Title convergence (phantom-id plan B6). An in-Claude
@@ -5316,6 +5330,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     let actions =
                         session::reconcile::run_at_boot(&reconcile_lifecycle_store, live).await;
                     emit_session_bound(&reconcile_app_handle, &actions);
+                    session::coord_identity::apply_reconcile_tick_in_app(
+                        &reconcile_app_handle,
+                        &actions,
+                    );
                 });
 
                 // Tier-0 looping-agent supervisor (plan merge-shepherd-fixer,

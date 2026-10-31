@@ -1935,6 +1935,17 @@ fn active_tenant_health_fields(
     }
 }
 
+/// `/health` `sessionTracking`, with `coordRekeys` (plan
+/// `2026-10-23-a-hookless-resume-in-a-runner-pane-leaves-the-session-with-no-active-coord-row`
+/// Phase 1a; see [`crate::session::coord_identity::session_tracking_json`]).
+fn session_tracking_with_rekeys(app: &tauri::AppHandle) -> serde_json::Value {
+    use tauri::Manager;
+    let registry = app.try_state::<Arc<crate::session::SessionRegistry>>();
+    crate::session::coord_identity::session_tracking_json(
+        registry.as_ref().map(|r| r.inner().as_ref()),
+    )
+}
+
 /// Health check endpoint (also served at `/ui-bridge/health` and
 /// `/ui-bridge/status` — all three share this handler).
 /// Includes `uiBridge` metadata so the app discovery scanner can detect the runner.
@@ -2658,7 +2669,7 @@ async fn health(
         // Session-tracking health (see `crate::session::tracking_health`):
         // last cross-reference timestamp, live-but-untracked / tracked-but-
         // dead counts + detail, and the untracked-backend-spawn counter.
-        "sessionTracking": crate::session::tracking_health::health_json(),
+        "sessionTracking": session_tracking_with_rekeys(&state.app_handle),
         // Automation-stack capabilities (see `crate::automation_stack`): can
         // this box drive a GUI at all, and if not, which named capability is
         // missing. A headless box used to fail one UI action at a time with a
