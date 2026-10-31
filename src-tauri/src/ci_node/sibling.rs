@@ -277,9 +277,12 @@ fn ambiguous(what: &str, sibling_repo: &str, numbers: &[u64]) -> String {
 /// the author's to resolve, never ours to guess. Ways to be ambiguous, all
 /// hard-failing alike:
 ///
-/// * two same-direction labels on the dispatched PR naming different siblings,
-/// * two sibling PRs declaring the same form at this one,
-/// * any two forms naming DIFFERENT sibling PRs,
+/// * two `downstream-of` labels on the dispatched PR naming different siblings,
+/// * two sibling PRs declaring `upstream-of` at this one,
+/// * a LEADING form and any other form naming DIFFERENT sibling PRs,
+/// * only when `accept_trailing_sibling` is set: the TRAILING forms naming
+///   different sibling PRs (with it unset they are all declined, so several
+///   of them are [`DeclaredTarget::TrailingSiblingDeclined`], not an error),
 /// * both merge ORDERS declared for the same pair — a cycle in coord's dep
 ///   graph, which holds BOTH pull requests forever. Compiling against the
 ///   right tree would hide that behind a green check, so it reds here.
