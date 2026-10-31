@@ -210,6 +210,21 @@ repos:
         files: '^\.pre-commit-hooks/(lib/scratch-cleanup\.sh|scratch-cleanup-test\.sh|gen-events-drift\.sh)$'
         pass_filenames: false
 
+      # `lib/pending-registration.sh` gives gen-events-drift the tolerance CI's
+      # check-generated-drift.sh already applies to bindings qontinui-schemas
+      # declares as waiting on an open runner PR (codegen/pending-registration.toml).
+      # Without it every runner push touching src-tauri/src/ was refused over
+      # drift CI does not count, and was skipped by name (findings 2fada332,
+      # 72b07886). Toolchain-free: a stub module stands in for the schemas one.
+      - id: pending-registration-test
+        name: gen-events drift — pending-registration absorption — tests
+        entry: bash .pre-commit-hooks/pending-registration-test.sh
+        language: system
+        stages: [pre-commit]
+        verbose: true
+        files: '^\.pre-commit-hooks/(lib/pending-registration\.sh|pending-registration-test\.sh|gen-events-drift\.sh)$'
+        pass_filenames: false
+
       # `lib/shared-target.sh` is what makes BOTH pre-push hooks build into the
       # shared cargo target instead of a cold per-worktree one. It also covers
       # `generate_types.sh`'s QONTINUI_SCHEMAS_JSON override, which is what keeps
