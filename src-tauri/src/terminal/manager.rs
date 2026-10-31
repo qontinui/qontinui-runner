@@ -89,7 +89,7 @@ impl Drop for InFlightClaim<'_> {
 type CoordBindObserver = Box<dyn Fn(&str, &str, uuid::Uuid) + Send + Sync>;
 
 /// Whether opening a terminal in `dir` should pre-accept Claude's workspace
-/// trust for it.
+/// trust for it, and under which scope rule — `None` means out of scope.
 ///
 /// Trust is what stops a directory's `.claude/settings.json` hooks and
 /// `.mcp.json` servers from auto-executing, so granting it is a real decision —
@@ -98,17 +98,50 @@ type CoordBindObserver = Box<dyn Fn(&str, &str, uuid::Uuid) + Send + Sync>;
 /// the machine would permanently mark that directory trusted in every account,
 /// including the operator's own later interactive sessions.
 ///
-/// The population this feature exists for is the fleet's own checkouts: the
-/// workspace root and everything beneath it, which is where every managed repo
-/// and every allocated agent worktree lives. Anything outside it keeps the
-/// dialog, which is the correct default for a directory nobody has vouched for.
-fn workspace_trust_is_in_scope(dir: &str) -> bool {
-    let Some(root) = crate::mcp::shared::current_project_path() else {
-        // No workspace root resolved: we cannot say the directory is ours, so
-        // we do not grant trust for it.
-        return false;
-    };
-    is_within(dir, &root)
+/// Two populations are in scope:
+///
+/// - the fleet's own checkouts: the workspace root and everything beneath it,
+///   which is where every managed repo and every allocated agent worktree
+///   lives;
+/// - the runner's OWN looping-agent home dirs
+///   (`qontinui_runner_lib::looping_agent::home_root()`), which the runner
+///   creates and provisions itself and which sit under the runner data dir,
+///   outside the workspace root. Leaving them out was coord finding
+///   `9089767f`: the Merge Shepherd's spawn skipped the trust gate silently,
+///   its interactive `claude` raised the trust dialog, and the supervisor's
+///   nudge answered it "No, exit".
+///
+/// Being in scope only means the trust ARM runs — on the pinned arm that is
+/// the trust gate, so the tenant's autonomy dial still decides whether trust
+/// is minted. Anything outside both keeps the dialog, which is the correct
+/// default for a directory nobody has vouched for.
+fn workspace_trust_scope(dir: &str) -> Option<&'static str> {
+    trust_scope_for(
+        dir,
+        crate::mcp::shared::current_project_path().as_deref(),
+        &qontinui_runner_lib::looping_agent::home_root(),
+    )
+}
+
+/// The pure rule behind [`workspace_trust_scope`], over injected roots.
+/// `workspace_root` is `None` when no workspace root resolved — then only the
+/// looping-agent root can bring a directory in scope.
+fn trust_scope_for(
+    dir: &str,
+    workspace_root: Option<&str>,
+    looping_agent_root: &std::path::Path,
+) -> Option<&'static str> {
+    if workspace_root.is_some_and(|root| is_within(dir, root)) {
+        return Some("workspace-root");
+    }
+    // A STRICT child only: the root itself holds every agent's home, and a
+    // trust grant on it would reach all of them through Claude's
+    // parent-directory inheritance.
+    let la_root = looping_agent_root.to_string_lossy();
+    if is_within(dir, &la_root) && !is_within(&la_root, dir) {
+        return Some("looping-agent-home");
+    }
+    None
 }
 
 /// How [`TerminalManager::create`] establishes Claude workspace trust for the
@@ -398,12 +431,38 @@ impl TerminalManager {
         // `spawn_blocked …` text, which the lifecycle-posting caller classifies
         // with `trust_gate::is_spawn_blocked_refusal` rather than reporting a
         // child that never existed as `exited`.
-        if workspace_trust_is_in_scope(&working_dir) {
-            apply_trust_arm(
-                &working_dir,
-                &trust,
-                TerminalSession::caller_pinned_config_dir(extra_env.as_deref()),
-            )?;
+        match workspace_trust_scope(&working_dir) {
+            Some(scope) => {
+                debug!(
+                    working_dir = %working_dir,
+                    scope,
+                    trust_arm = ?trust,
+                    "terminal: workspace trust in scope — applying the trust arm"
+                );
+                apply_trust_arm(
+                    &working_dir,
+                    &trust,
+                    TerminalSession::caller_pinned_config_dir(extra_env.as_deref()),
+                )?;
+            }
+            // Never silent: a skipped trust write on a backend spawn is an
+            // interactive `claude` that will raise the trust dialog with nobody
+            // to answer it (coord finding `9089767f`), so that arm logs at
+            // `info`. An operator shell anywhere on the box is routine, `debug`.
+            None => match &trust {
+                TrustArm::Pinned(account) => info!(
+                    working_dir = %working_dir,
+                    account = account.as_deref().unwrap_or("<ambient default>"),
+                    "terminal: workspace trust NOT pre-accepted — the directory is outside the \
+                     workspace root and the runner's looping-agent homes, so the trust gate did \
+                     not run; an interactive `claude` here may raise the workspace-trust dialog"
+                ),
+                TrustArm::AccountChosenLater => debug!(
+                    working_dir = %working_dir,
+                    "terminal: workspace trust NOT pre-accepted — the directory is outside the \
+                     trust scope"
+                ),
+            },
         }
 
         let page_id = page_id.unwrap_or_else(|| "default".to_string());
@@ -1547,7 +1606,7 @@ mod tests {
 
 #[cfg(test)]
 mod workspace_trust_scope_tests {
-    use super::is_within;
+    use super::{is_within, trust_scope_for};
 
     /// The workspace root itself, and anything beneath it, is in scope — this
     /// is the population the pre-trust exists for (managed repos and allocated
@@ -1607,5 +1666,71 @@ mod workspace_trust_scope_tests {
             &escape.to_string_lossy(),
             &root.to_string_lossy()
         ));
+    }
+}
+
+/// Coord finding `9089767f`: the runner's own looping-agent home dirs live
+/// under the runner data dir, OUTSIDE the workspace root, and the scope fence
+/// used to skip the trust gate for them silently.
+#[cfg(test)]
+mod looping_agent_home_scope_tests {
+    use super::trust_scope_for;
+
+    #[test]
+    fn a_looping_agent_home_outside_the_workspace_is_in_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let la_root = tmp.path().join("runner").join("looping-agents");
+        let home = la_root.join("merge-shepherd");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let ws = workspace.to_string_lossy().to_string();
+
+        assert_eq!(
+            trust_scope_for(&home.to_string_lossy(), Some(&ws), &la_root),
+            Some("looping-agent-home")
+        );
+        // Even with no workspace root resolved at all.
+        assert_eq!(
+            trust_scope_for(&home.to_string_lossy(), None, &la_root),
+            Some("looping-agent-home")
+        );
+        // The workspace itself keeps its own rule.
+        assert_eq!(
+            trust_scope_for(&ws, Some(&ws), &la_root),
+            Some("workspace-root")
+        );
+    }
+
+    #[test]
+    fn a_runner_dir_sibling_of_the_looping_agent_root_stays_out_of_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let runner = tmp.path().join("runner");
+        let la_root = runner.join("looping-agents");
+        let relay = runner.join("relay-chat").join("t1");
+        let evil = runner.join("looping-agents-evil");
+        for d in [&workspace, &la_root, &relay, &evil] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let ws = workspace.to_string_lossy().to_string();
+
+        assert_eq!(
+            trust_scope_for(&relay.to_string_lossy(), Some(&ws), &la_root),
+            None
+        );
+        assert_eq!(
+            trust_scope_for(&evil.to_string_lossy(), Some(&ws), &la_root),
+            None
+        );
+        assert_eq!(
+            trust_scope_for(&runner.to_string_lossy(), Some(&ws), &la_root),
+            None
+        );
+        // The looping-agents root itself is not an agent home.
+        assert_eq!(
+            trust_scope_for(&la_root.to_string_lossy(), Some(&ws), &la_root),
+            None
+        );
     }
 }
