@@ -10137,7 +10137,16 @@ mod relay_create_drain_message_tests {
             unknown.starts_with("coord drain state unknown (coord drain state not read yet) — "),
             "{unknown}"
         );
-        for message in [&drained, &unknown] {
+        let role = match crate::coord_drain_state::role_gate(
+            Some(crate::coord_drain_state::DispatchRole::CiNode),
+            SpawnOrigin::Unknown,
+        ) {
+            DrainGate::Defer { reason, .. } => relay_create_drain_message(&reason),
+            DrainGate::Allow => panic!("ci_node should defer a relay create"),
+        };
+        assert!(role.contains("ci_node"), "{role}");
+        assert!(!role.contains("runs only if"), "{role}");
+        for message in [&drained, &unknown, &role] {
             assert!(message.contains("refused, not queued"), "{message}");
             assert!(message.contains("nothing was spawned"), "{message}");
             assert!(!message.contains("runs once"), "{message}");
