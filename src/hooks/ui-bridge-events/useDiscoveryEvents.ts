@@ -66,6 +66,46 @@ export function readModalContext(bridge: unknown): unknown {
 }
 
 /**
+ * The `get_canvas_coverage` IPC answer: the bridge registry's canvas census
+ * (`{ canvases, attributed, unattributed }`), `null`, or a throw marker.
+ *
+ * The Rust `/control/visibility` twin (`visibility_canvas.rs`) reads:
+ * - `null` as coverage `unavailable` / `page-sdk-lacks-coverage`. That is every
+ *   shape where no census accessor exists: no bridge, no registry, or an SDK
+ *   that predates `getCanvasCoverage` (the `^0.31.0` pin does);
+ * - `{ state: "unavailable", reason: "accessor-threw" }` as that reason. That
+ *   is an accessor that threw OR answered `undefined` / `null`: the SDK's
+ *   `registry.getCanvasCoverage()` catches its own throw and returns
+ *   `undefined`, and the SDK's in-page handler (`inPageCanvasCoverage`,
+ *   server/handlers.ts) maps that to `accessor-threw`. A broken census is
+ *   told apart from a missing one, so a consumer can tell "upgrade the page
+ *   SDK" from "the census broke";
+ * - anything else as the census, passed through untouched.
+ *
+ * Every unavailable shape withholds a `clear` verdict (`unknown_canvas`), and
+ * none of them fails the request. The accessor is reached through a cast
+ * because the SDK types this runner pins do not declare it yet.
+ */
+export function readCanvasCoverage(bridge: unknown): unknown {
+  const accessorThrew = { state: "unavailable", reason: "accessor-threw" };
+  try {
+    const registry = (bridge as { registry?: unknown } | null | undefined)?.registry;
+    if (!registry) return null;
+    const fn = (registry as unknown as { getCanvasCoverage?: () => unknown }).getCanvasCoverage;
+    if (typeof fn !== "function") return null;
+    const census = fn.call(registry);
+    if (census === undefined || census === null) {
+      logger.warn("get_canvas_coverage: canvas census answered nothing; reporting accessor-threw");
+      return accessorThrew;
+    }
+    return census;
+  } catch (err) {
+    logger.warn("get_canvas_coverage: canvas census threw; reporting accessor-threw", err);
+    return accessorThrew;
+  }
+}
+
+/**
  * Build the `FindRequest` the `discover` arm hands to `bridge.discover()`.
  *
  * Options are read from nested `payload.options` or, failing that, the payload
@@ -115,7 +155,8 @@ export function toFindArmRequest(payload: object): Record<string, unknown> {
 }
 
 /**
- * Handles: discover, find, get_snapshot, get_modal_context, get_component_state,
+ * Handles: discover, find, get_snapshot, get_modal_context, get_canvas_coverage,
+ *          get_component_state,
  *          get_states, get_active_states, get_state_snapshot, get_state,
  *          activate_state, deactivate_state, get_state_groups,
  *          activate_state_group, deactivate_state_group, get_transitions,
@@ -255,6 +296,21 @@ export function useDiscoveryEvents(
             type,
             success: true,
             data: readModalContext(currentBridge),
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
+        case "get_canvas_coverage": {
+          // The canvas census ALONE, for the Rust `/control/visibility` twin
+          // (`visibility_canvas.rs`), which turns an unattributed canvas or an
+          // unavailable census into verdict `unknown_canvas`. The null/throw
+          // contract is on `readCanvasCoverage`.
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: readCanvasCoverage(currentBridge),
             timestamp: Date.now(),
           });
           return true;
