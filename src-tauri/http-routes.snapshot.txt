@@ -1049,6 +1049,8 @@ POST /api-surface/snapshot handle_save_snapshot
 POST /api/v1/streaming/focus post_focus
 POST /api/v1/streaming/pair post_pair
 POST /apps handle_register_app
+POST /apps/{app_id}/journey/explore post_explore
+POST /apps/{app_id}/journey/observe post_observe
 POST /apps/{app_id}/spec/author post_author
 POST /apps/{app_id}/spec/derive post_derive
 POST /apps/{app_id}/spec/proposals/scan post_scan

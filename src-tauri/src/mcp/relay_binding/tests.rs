@@ -2557,7 +2557,9 @@ async fn a_wrappers_failure_frame_answers_the_agent_at_once_with_its_code() {
 /// names its command, settles THAT command at once instead of being dropped
 /// while the agent sits out the relay timeout. It is not the app's own
 /// failure — what the app reported is unknown — so nothing lands in the
-/// app-code slot, the origin is `transport` and retryability is `null`.
+/// app-code slot, the origin is `unknown` (the app answered; what it did could
+/// not be read — never `transport`, which means "never delivered") and
+/// retryability is `null`.
 #[tokio::test]
 async fn an_unreadable_response_frame_answers_the_agent_at_once_not_as_the_apps_failure() {
     let (_s, mut wrapper, agent, command_id) = a_command_in_flight_to_a_wrapper().await;
@@ -2579,7 +2581,7 @@ async fn an_unreadable_response_frame_answers_the_agent_at_once_not_as_the_apps_
         None,
         "nothing lands in the app-code slot: {body}"
     );
-    assert_eq!(body["hint"]["failure_origin"], "transport", "{body}");
+    assert_eq!(body["hint"]["failure_origin"], "unknown", "{body}");
     assert_eq!(body["hint"]["retryable"], Value::Null, "{body}");
     assert!(
         body["error"]
@@ -2690,4 +2692,44 @@ async fn an_http_apps_object_error_answers_the_agent_with_its_code_and_retry_ver
             .is_some_and(|e| e.contains("The app is busy rendering")),
         "{body}"
     );
+}
+
+/// Item 9 of the journey explorer follow-ups: the registration answer says
+/// whether the registrant's origin may relay to the journey observe route, by
+/// the guard's own decision under the CURRENT route policy. Behind the real
+/// guard at the default policy (`enforce-doors`): a Trusted origin is
+/// admitted, a Foreign one is not (the guard refuses it the route under every
+/// policy), and the field is on every success answer.
+#[tokio::test]
+async fn the_registration_answer_says_whether_its_origin_may_relay_to_observe() {
+    for policy in [None, Some("enforce"), Some("shadow")] {
+        let s = spawn_with_policy(policy, BindingConfig::default()).await;
+        let cases: [(Caller<'_>, &str, &str, Option<bool>); 3] = [
+            (browser(WEB_DEV), "web-dev", WEB_DEV, Some(true)),
+            (browser(GOOD), "foreign", GOOD, Some(false)),
+            (agent(), "agent", "http://127.0.0.1:4555", Some(true)),
+        ];
+        for (from, app_id, base_url, want) in cases {
+            let mut payload = json!({ "appId": app_id, "appName": "x", "appType": "web",
+                                      "transport": "http", "baseUrl": base_url });
+            if let Some(o) = from.origin {
+                payload["origin"] = json!(o);
+            }
+            let (status, body) = s.post("/ui-bridge/apps/register", from, payload).await;
+            assert_eq!(status, 200, "{policy:?} {app_id}: {body}");
+            let observe = &body["data"]["journeyObserve"];
+            assert!(
+                observe.get("admitted").is_some(),
+                "{policy:?} {app_id}: the field is on every success answer: {body}"
+            );
+            assert_eq!(
+                observe["admitted"].as_bool(),
+                want,
+                "{policy:?} {app_id}: {body}"
+            );
+            // The registry entry's own fields are still at the top level.
+            assert_eq!(body["data"]["appId"], app_id, "{body}");
+            assert!(body["data"].get("principalClass").is_some(), "{body}");
+        }
+    }
 }

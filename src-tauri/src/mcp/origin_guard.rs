@@ -67,6 +67,10 @@
 //!      `Sec-Fetch-Site: none`) classifies as NonBrowser — a residual of
 //!      granting an extension host permissions, not something headers can
 //!      distinguish.
+//!    - [`LEDGER_WRITE_ROUTES`] (passive capture's relay) are refused to
+//!      `Foreign` and `Extension` in EVERY route policy: they write what a user
+//!      did into the journey ledger, so no shadowing policy may let a page forge
+//!      it. `Trusted` keeps them.
 //!    - Where the route policy enforces for their class, browser classes
 //!      additionally reach only [`FOREIGN_ROUTES`] (all browser classes) and
 //!      [`TRUSTED_ROUTES`] (Trusted) — a TOTAL allowlist, so a route added
@@ -357,6 +361,9 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "DELETE /wrappers/*",
     "POST /apps/{app_id}/spec/author",
     "POST /apps/{app_id}/spec/proposals/{id}/execute",
+    // Starts an hour-long run that drives the app and writes the journey
+    // ledger (`journey::explorer`). Its callers are agents and the webview.
+    "POST /apps/{app_id}/journey/explore",
     "POST /reflection/trigger/{task_run_id}",
     "POST /execute-action",
     "POST /gui-config/start-executor",
@@ -495,6 +502,14 @@ pub const ACTIVE_SELECTION_ROUTES: &[(&str, &str)] = &[
     ("POST", "/ui-bridge/sdk/disconnect"),
 ];
 
+/// Routes that write what a user did into the journey ledger. Refused to
+/// [`OriginClass::Foreign`] and [`OriginClass::Extension`] in EVERY route
+/// policy, the shadowing policies and `off` included: a closing `changed` /
+/// `no_change` edge retires a frontier row, so a forged relay from a page could
+/// later license a false `frontier_exhausted`. `Trusted` (the embedding app's
+/// page) keeps them: they are on [`TRUSTED_ROUTES`], which a tripwire test pins.
+pub const LEDGER_WRITE_ROUTES: &[(&str, &str)] = &[JOURNEY_OBSERVE_ROUTE];
+
 /// `(METHOD, MatchedPath pattern)` pairs reachable from ANY browser origin
 /// (Foreign, Extension and Trusted) under `enforce`. Derived from the Phase 0 caller
 /// census: the ui-bridge extension's content scripts (which send the visited
@@ -534,6 +549,11 @@ pub const TRUSTED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/ai/generate-test"),
     ("POST", "/ai/suggest-exploration-strategy"),
     ("POST", "/api-request/import-curl"),
+    // passive real-session capture: the embedding app's page relays each
+    // human interaction, with the snapshot relay's trust (plan
+    // 2026-09-20-ui-bridge-represents-the-users-path-and-the-passage-of-time,
+    // Phase 3). Foreign and Extension are refused it: LEDGER_WRITE_ROUTES.
+    ("POST", "/apps/{app_id}/journey/observe"),
     ("GET", "/apps/{app_id}/spec/list"),
     ("GET", "/awas/actions"),
     ("GET", "/check-groups"),
@@ -823,6 +843,30 @@ pub struct RequesterPrincipal {
     pub origin: Option<NormOrigin>,
 }
 
+/// The guard that admitted a request, inserted into its extensions beside
+/// [`RequesterPrincipal`], so a handler can ask that SAME guard — its own
+/// classification, route tables and mode, never a copy — whether it would
+/// admit this caller on another route ([`OriginGuard::would_admit`]).
+#[derive(Clone)]
+pub struct AdmittingGuard(pub Arc<OriginGuard>);
+
+/// The route passive real-session capture relays to (`journey::observe`),
+/// as the guard matches it.
+pub const JOURNEY_OBSERVE_ROUTE: (&str, &str) = ("POST", "/apps/{app_id}/journey/observe");
+
+/// Would a relay to `POST /apps/{app_id}/journey/observe` carrying these
+/// request headers be ADMITTED by `guard` now — [`OriginGuard::would_admit`]
+/// for [`JOURNEY_OBSERVE_ROUTE`]. `None` when no guard admitted the request
+/// these headers came from (a router with no guard): unknown, never a guess.
+pub fn journey_observe_admitted(
+    guard: Option<&AdmittingGuard>,
+    headers: &HeaderMap,
+) -> Option<bool> {
+    let (method, route) = JOURNEY_OBSERVE_ROUTE;
+    let method = Method::from_bytes(method.as_bytes()).ok()?;
+    guard.map(|g| g.0.would_admit(&method, headers, route))
+}
+
 /// What the CORS layer may grant this request. Set by the guard; the CORS
 /// layer sits inside it and reads this instead of re-classifying.
 #[derive(Debug, Clone, Copy)]
@@ -846,6 +890,8 @@ enum Verdict {
     RefuseExtensionOnly,
     /// An [`ACTIVE_SELECTION_ROUTES`] route from a Foreign or Extension origin.
     RefuseActiveSelection,
+    /// A [`LEDGER_WRITE_ROUTES`] route from a Foreign or Extension origin.
+    RefuseLedgerWrite,
     /// Not on the class's allowlist, and the policy enforces for the class.
     RefuseRoute,
 }
@@ -860,6 +906,7 @@ impl Verdict {
             Self::RefuseDoor => "refused_credential_door",
             Self::RefuseExtensionOnly => "refused_extension_only",
             Self::RefuseActiveSelection => "refused_active_selection",
+            Self::RefuseLedgerWrite => "refused_ledger_write",
             Self::RefuseRoute => "refused_route_policy",
         }
     }
@@ -1125,6 +1172,11 @@ impl OriginGuard {
         {
             return mk(Verdict::RefuseActiveSelection);
         }
+        if listed(LEDGER_WRITE_ROUTES, &method, route)
+            && matches!(class, OriginClass::Foreign | OriginClass::Extension)
+        {
+            return mk(Verdict::RefuseLedgerWrite);
+        }
         if is_credential_door(&method, route) {
             if class == OriginClass::Trusted
                 && self.route_policy == RoutePolicy::EnforceDoors
@@ -1151,6 +1203,20 @@ impl OriginGuard {
         } else {
             mk(Verdict::ShadowWouldRefuse)
         }
+    }
+
+    /// Would THIS guard admit a request with `headers` to `method route` —
+    /// its own [`Self::decide`] (same classification, route tables, door
+    /// rules and current [`RoutePolicy`]), with nothing recorded. `true` only
+    /// for a clean admission ([`Verdict::Admit`], or a door's
+    /// [`Verdict::GraceAdmitted`]); a [`Verdict::ShadowWouldRefuse`] is
+    /// `false`: the guard would let it through only because it shadows the
+    /// class, and would log and count it as a would-be refusal.
+    pub fn would_admit(&self, method: &Method, headers: &HeaderMap, route: &str) -> bool {
+        matches!(
+            self.decide(method, headers, Some(route)).verdict,
+            Verdict::Admit | Verdict::GraceAdmitted
+        )
     }
 
     fn record(&self, d: &Decision) {
@@ -1380,6 +1446,7 @@ async fn origin_guard_middleware(
                 class: d.class,
                 origin,
             });
+            req.extensions_mut().insert(AdmittingGuard(guard.clone()));
             next.run(req).await
         }
         Verdict::RefuseHost => {
@@ -1397,6 +1464,7 @@ async fn origin_guard_middleware(
         Verdict::RefuseDoor
         | Verdict::RefuseExtensionOnly
         | Verdict::RefuseActiveSelection
+        | Verdict::RefuseLedgerWrite
         | Verdict::RefuseRoute => {
             tracing::warn!(
                 origin = ?d.origin,
@@ -1410,6 +1478,7 @@ async fn origin_guard_middleware(
                 Verdict::RefuseDoor => "This route returns credentials, reads caller-named paths, makes caller-directed requests or executes code, and is not reachable from a browser origin other than the runner's own webview",
                 Verdict::RefuseExtensionOnly => "This route is reachable only from the runner's webview and the ui-bridge extension's own pages, not from a web page origin",
                 Verdict::RefuseActiveSelection => "This route chooses which app every untargeted UI Bridge call reaches and is not reachable from a web page or extension origin",
+                Verdict::RefuseLedgerWrite => "This route records what a user did into the journey ledger and is not reachable from an untrusted web page or extension origin",
                 _ => "This route is not on the allowlist for this origin class",
             };
             let echo = (d.class == OriginClass::Trusted)

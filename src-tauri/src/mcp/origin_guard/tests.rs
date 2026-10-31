@@ -2118,3 +2118,335 @@ async fn foreign_origin_cannot_create_or_update_a_task_with_a_probe() {
         StatusCode::OK
     );
 }
+
+/// Every refusal and shadow would-refuse the guard has counted.
+fn guard_tally(guard: &OriginGuard) -> u64 {
+    let v = guard.health_json(None);
+    let sum = |block: &Value| {
+        block
+            .as_object()
+            .map(|o| o.values().filter_map(Value::as_u64).sum::<u64>())
+            .unwrap_or(0)
+    };
+    sum(&v["refusals"]) + sum(&v["shadowWouldRefuse"])
+}
+
+/// `journeyObserve.admitted` is the guard's OWN decision for the observe
+/// route: for every route policy and every origin class, what the helper
+/// answers (through the guard the middleware hands a handler) is exactly
+/// whether a real request to `POST /apps/{app_id}/journey/observe` with the
+/// same headers is served cleanly — not refused, not counted as a would-be
+/// refusal. Since the observe route's admission comes from
+/// [`TRUSTED_ROUTES`], taking it off that list flips the Trusted answers.
+#[tokio::test]
+async fn journey_observe_admitted_is_the_guards_own_decision_for_the_observe_route() {
+    let (observe_method, observe_route) = JOURNEY_OBSERVE_ROUTE;
+    assert_eq!(observe_method, "POST");
+    assert!(
+        listed(TRUSTED_ROUTES, observe_method, observe_route),
+        "the observe route's pattern is the one TRUSTED_ROUTES admits"
+    );
+    for policy in [
+        "enforce",
+        "enforce-foreign",
+        "enforce-doors",
+        "shadow",
+        "off",
+    ] {
+        let h = harness(policy);
+        let calls = Calls::default();
+        let c = calls.clone();
+        let router = apply(
+            Router::new()
+                .route(
+                    "/ui-bridge/apps/register",
+                    post(
+                        |g: Option<axum::Extension<AdmittingGuard>>, headers: HeaderMap| async move {
+                            axum::Json(json!({
+                                "admitted": journey_observe_admitted(g.as_ref().map(|e| &e.0), &headers)
+                            }))
+                        },
+                    ),
+                )
+                .route(
+                    observe_route,
+                    post(move || {
+                        let c = c.clone();
+                        async move {
+                            c.hit("observe");
+                            "recorded"
+                        }
+                    }),
+                ),
+            h.guard.clone(),
+        );
+        let first_party = format!("http://127.0.0.1:{}", h.port.load(Ordering::Relaxed));
+        let callers: [(&str, Option<&str>); 5] = [
+            ("agent", None),
+            ("first_party", Some(first_party.as_str())),
+            ("trusted", Some(WEB)),
+            ("extension", Some("chrome-extension://abcdefghijklmnop")),
+            ("foreign", Some(EVIL)),
+        ];
+        for (label, origin) in callers {
+            let host = host(&h);
+            let mut headers: Vec<(&str, &str)> = vec![("host", host.as_str())];
+            if let Some(o) = origin {
+                headers.push(("origin", o));
+            }
+            let resp = router
+                .clone()
+                .oneshot(req("POST", "/ui-bridge/apps/register", &headers, ""))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{policy} {label}");
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+                .await
+                .unwrap();
+            let answer: Value = serde_json::from_slice(&bytes).unwrap();
+            let admitted = answer["admitted"]
+                .as_bool()
+                .unwrap_or_else(|| panic!("{policy} {label}: {answer}"));
+
+            let tally = guard_tally(&h.guard);
+            let hits = calls.get("observe");
+            let resp = router
+                .clone()
+                .oneshot(req(
+                    "POST",
+                    "/apps/qontinui-web/journey/observe",
+                    &headers,
+                    "",
+                ))
+                .await
+                .unwrap();
+            let served = resp.status() != StatusCode::FORBIDDEN && calls.get("observe") == hits + 1;
+            let clean = served && guard_tally(&h.guard) == tally;
+            assert_eq!(
+                admitted,
+                clean,
+                "{policy} {label}: the helper said {admitted}, the guard served={served} \
+                 counted={}",
+                guard_tally(&h.guard) - tally
+            );
+            // And it follows the allowlist the guard reads: a Trusted origin is
+            // admitted exactly because TRUSTED_ROUTES lists the route (`off`
+            // meters no allowlist, so it admits either way).
+            if label == "trusted" && policy != "off" {
+                assert_eq!(
+                    admitted,
+                    route_allowed(OriginClass::Trusted, observe_method, observe_route),
+                    "{policy}"
+                );
+            }
+            if matches!(label, "foreign" | "extension") {
+                assert!(!admitted, "{policy}: a {label} origin is never admitted");
+            }
+        }
+    }
+}
+
+#[test]
+fn journey_observe_admitted_is_unknown_without_a_guard() {
+    assert_eq!(journey_observe_admitted(None, &HeaderMap::new()), None);
+}
+
+const EVERY_POLICY: [&str; 5] = [
+    "enforce",
+    "enforce-foreign",
+    "enforce-doors",
+    "shadow",
+    "off",
+];
+const EXTENSION: &str = "chrome-extension://abcdefghijklmnop";
+const OBSERVE_PATH: &str = "/apps/qontinui-web/journey/observe";
+const EXPLORE_PATH: &str = "/apps/qontinui-web/journey/explore";
+
+/// The two journey POST routes at their real patterns, behind `h`'s guard.
+fn journey_post_router(h: &Harness, calls: &Calls) -> Router {
+    let (o, e) = (calls.clone(), calls.clone());
+    apply(
+        Router::new()
+            .route(
+                JOURNEY_OBSERVE_ROUTE.1,
+                post(move || {
+                    let o = o.clone();
+                    async move {
+                        o.hit("observe");
+                        "recorded"
+                    }
+                }),
+            )
+            .route(
+                "/apps/{app_id}/journey/explore",
+                post(move || {
+                    let e = e.clone();
+                    async move {
+                        e.hit("explore");
+                        "explored"
+                    }
+                }),
+            ),
+        h.guard.clone(),
+    )
+}
+
+/// POST `path` with `headers` added to a good `Host`; the status and the body.
+async fn journey_post(
+    router: &Router,
+    h: &Harness,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> (StatusCode, String) {
+    let host = host(h);
+    let mut all: Vec<(&str, &str)> = vec![("host", host.as_str())];
+    all.extend_from_slice(headers);
+    let resp = router
+        .clone()
+        .oneshot(req("POST", path, &all, ""))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
+/// A page cannot forge a passive edge under ANY route policy, shadowing ones
+/// included: the reviewer's no-cors `text/plain` POST, a cross-site request
+/// with no `Origin`, an opaque origin, an extension page, and a preflight.
+#[tokio::test]
+async fn journey_observe_is_refused_to_foreign_and_extension_under_every_policy() {
+    for policy in EVERY_POLICY {
+        let h = harness(policy);
+        let calls = Calls::default();
+        let router = journey_post_router(&h, &calls);
+        let cases: [(&str, &[(&str, &str)]); 4] = [
+            (
+                "foreign",
+                &[("origin", EVIL), ("content-type", "text/plain")],
+            ),
+            ("no origin", &[("sec-fetch-site", "cross-site")]),
+            ("opaque", &[("origin", "null")]),
+            (
+                "extension",
+                &[("origin", EXTENSION), ("content-type", "text/plain")],
+            ),
+        ];
+        for (label, headers) in cases {
+            let (status, body) = journey_post(&router, &h, OBSERVE_PATH, headers).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{policy} {label}: {body}");
+            let v: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["code"], CODE_CROSS_ORIGIN_REFUSED, "{policy} {label}");
+            assert_eq!(
+                v["context"]["reason"], "refused_ledger_write",
+                "{policy} {label}"
+            );
+            assert!(
+                v["error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("journey ledger")),
+                "{policy} {label}: {body}"
+            );
+        }
+        let host = host(&h);
+        let preflight = router
+            .clone()
+            .oneshot(req(
+                "OPTIONS",
+                OBSERVE_PATH,
+                &[
+                    ("host", host.as_str()),
+                    ("origin", EVIL),
+                    ("access-control-request-method", "POST"),
+                ],
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::FORBIDDEN, "{policy}");
+        assert_eq!(calls.get("observe"), 0, "{policy}: no handler ran");
+    }
+}
+
+/// The explore route is a door: Foreign, Extension and Trusted are all refused
+/// at it under every route policy, the dev frontend's grace included.
+#[tokio::test]
+async fn journey_explore_is_a_door_refused_to_foreign_and_trusted_under_every_policy() {
+    assert!(is_credential_door("POST", "/apps/{app_id}/journey/explore"));
+    assert!(
+        !listed(TRUSTED_DOOR_GRACE, "POST", "/apps/{app_id}/journey/explore"),
+        "no origin keeps it through the grace"
+    );
+    for policy in EVERY_POLICY {
+        let h = harness(policy);
+        let calls = Calls::default();
+        let router = journey_post_router(&h, &calls);
+        for origin in [EVIL, WEB, EXTENSION] {
+            let (status, body) =
+                journey_post(&router, &h, EXPLORE_PATH, &[("origin", origin)]).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{policy} {origin}: {body}");
+            let v: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                v["context"]["reason"], "refused_credential_door",
+                "{policy} {origin}"
+            );
+        }
+        assert_eq!(calls.get("explore"), 0, "{policy}: no handler ran");
+    }
+}
+
+/// Everything the two refusals above must leave alone: NonBrowser and
+/// FirstParty reach both routes, and Trusted still reaches observe, under
+/// every route policy.
+#[tokio::test]
+async fn journey_routes_admit_non_browser_and_first_party_and_observe_admits_trusted() {
+    for policy in EVERY_POLICY {
+        let h = harness(policy);
+        let calls = Calls::default();
+        let router = journey_post_router(&h, &calls);
+        let first_party = format!("http://127.0.0.1:{}", h.port.load(Ordering::Relaxed));
+        let callers: [&[(&str, &str)]; 2] = [&[], &[("origin", first_party.as_str())]];
+        for (i, headers) in callers.into_iter().enumerate() {
+            let (status, body) = journey_post(&router, &h, OBSERVE_PATH, headers).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{policy} observe {headers:?}: {body}"
+            );
+            let (status, body) = journey_post(&router, &h, EXPLORE_PATH, headers).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{policy} explore {headers:?}: {body}"
+            );
+            assert_eq!(calls.get("observe"), i + 1, "{policy}");
+            assert_eq!(calls.get("explore"), i + 1, "{policy}");
+        }
+        let (status, body) = journey_post(&router, &h, OBSERVE_PATH, &[("origin", WEB)]).await;
+        assert_eq!(status, StatusCode::OK, "{policy} trusted observe: {body}");
+    }
+}
+
+/// Tripwire, as for the active-selection list: every ledger-write route is
+/// registered and on `TRUSTED_ROUTES`, so the Foreign/Extension refusal is the
+/// only thing this list changes.
+#[test]
+fn ledger_write_routes_are_registered_and_trusted() {
+    let registered = crate::mcp::relay_path_policy::tests::registered_routes();
+    assert!(!LEDGER_WRITE_ROUTES.is_empty());
+    for (m, p) in LEDGER_WRITE_ROUTES {
+        assert!(
+            registered
+                .iter()
+                .any(|(rm, rp)| rp == p && (rm == m || rm == "ANY")),
+            "ledger-write entry not registered: {m} {p}"
+        );
+        assert!(
+            TRUSTED_ROUTES.contains(&(*m, *p)),
+            "ledger-write entry not on TRUSTED_ROUTES: {m} {p}"
+        );
+        assert!(!is_credential_door(m, p));
+    }
+}
