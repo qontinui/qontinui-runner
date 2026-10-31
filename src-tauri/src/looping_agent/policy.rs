@@ -183,29 +183,73 @@ pub enum Liveness {
     PendingRestore,
     /// Confidently no tab: spawn (subject to backoff).
     Dead,
+    /// A tab IS registered for the agent, but the process behind its PTY has
+    /// EXITED. The pane is a frozen last frame over a dead PTY: every write is
+    /// refused with `TERMINAL_EXITED`, so it can never be nudged again. It is
+    /// as dead as [`Liveness::Dead`] for the decision core — the glue closes
+    /// the stale tab and takes the death-respawn arm — and is a separate
+    /// variant only so the glue knows there is a stale tab to close.
+    ///
+    /// Before this variant existed an exited tab read [`Liveness::Live`]
+    /// (registration was the whole test), and the supervisor retried a nudge
+    /// into it every tick for hours instead of respawning (coord finding
+    /// `9089767f`: 3105 `TERMINAL_EXITED` nudge failures over 4.5 h).
+    Exited,
+}
+
+impl Liveness {
+    /// Whether a tab is hosting (or about to host) the agent — the
+    /// [`TickInput::tab_alive`] observation. `Dead` and `Exited` are not.
+    pub fn tab_alive(self) -> bool {
+        matches!(self, Liveness::Live | Liveness::PendingRestore)
+    }
+}
+
+/// What the glue saw for one candidate terminal id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabProbe {
+    /// `TerminalManager::get` missed: no tab is registered under that id.
+    Absent,
+    /// A tab is registered and its PTY process is still running.
+    Running,
+    /// A tab is registered but its PTY process has exited.
+    Exited,
 }
 
 /// Pure liveness resolution from the glue's three observations:
 ///
-/// - `terminal_registered`: `TerminalManager::get(runtime.terminal_id)` hit.
+/// - `direct`: the tab under `runtime.terminal_id`.
 /// - `lifecycle_open`: the lifecycle record for `runtime.claude_session_id`
 ///   exists and is `state == "open"`.
-/// - `lifecycle_terminal_registered`: that record's CURRENT `terminal_id`
-///   (which a boot-restore rewrites) resolves to a live terminal — the
-///   re-attach path after a runner restart.
+/// - `lifecycle_tab`: the tab under that record's CURRENT `terminal_id`
+///   (which a boot-restore rewrites) — the re-attach path after a runner
+///   restart. Only meaningful when `lifecycle_open`.
+///
+/// A RUNNING tab on either path is [`Liveness::Live`]. An open record whose
+/// tab is not registered yet is [`Liveness::PendingRestore`] — even when the
+/// direct id is an exited tab, because a record naming a DIFFERENT, not yet
+/// registered id is exactly a restore in flight, and spawning beside it would
+/// duplicate the agent (the lifecycle poll closes a record with no matching
+/// terminal within its debounce, so the wait is bounded). Otherwise a tab that
+/// is registered but EXITED — the direct one, or the one the open record names
+/// — is [`Liveness::Exited`]: positive evidence of death.
 pub fn resolve_liveness(
-    terminal_registered: bool,
+    direct: TabProbe,
     lifecycle_open: bool,
-    lifecycle_terminal_registered: bool,
+    lifecycle_tab: TabProbe,
 ) -> Liveness {
-    if terminal_registered {
+    if direct == TabProbe::Running {
         return Liveness::Live;
     }
     if lifecycle_open {
-        if lifecycle_terminal_registered {
-            return Liveness::Live;
+        match lifecycle_tab {
+            TabProbe::Running => return Liveness::Live,
+            TabProbe::Exited => return Liveness::Exited,
+            TabProbe::Absent => return Liveness::PendingRestore,
         }
-        return Liveness::PendingRestore;
+    }
+    if direct == TabProbe::Exited {
+        return Liveness::Exited;
     }
     Liveness::Dead
 }
@@ -425,19 +469,53 @@ mod tests {
 
     #[test]
     fn liveness_resolution_matrix() {
-        // Direct terminal hit wins.
-        assert_eq!(resolve_liveness(true, false, false), Liveness::Live);
-        assert_eq!(resolve_liveness(true, true, true), Liveness::Live);
+        use TabProbe::{Absent, Running};
+        // Direct running terminal wins.
+        assert_eq!(resolve_liveness(Running, false, Absent), Liveness::Live);
+        assert_eq!(resolve_liveness(Running, true, Running), Liveness::Live);
         // Re-attach via the lifecycle record's rewritten terminal id.
-        assert_eq!(resolve_liveness(false, true, true), Liveness::Live);
+        assert_eq!(resolve_liveness(Absent, true, Running), Liveness::Live);
         // Open record, terminal not (yet) registered: WAIT — a boot-restore
         // may be mid-flight; spawning now would duplicate the shepherd.
         assert_eq!(
-            resolve_liveness(false, true, false),
+            resolve_liveness(Absent, true, Absent),
             Liveness::PendingRestore
         );
         // No terminal, record closed/absent: confidently dead.
-        assert_eq!(resolve_liveness(false, false, false), Liveness::Dead);
-        assert_eq!(resolve_liveness(false, false, true), Liveness::Dead);
+        assert_eq!(resolve_liveness(Absent, false, Absent), Liveness::Dead);
+        assert_eq!(resolve_liveness(Absent, false, Running), Liveness::Dead);
+    }
+
+    /// Coord finding `9089767f`: a registered tab whose `claude` exited must
+    /// read as dead, never as live — on the direct path, on the lifecycle
+    /// path, and even while the lifecycle record still says `open` (the record
+    /// pointing at the same exited terminal is not a restore in flight).
+    #[test]
+    fn an_exited_tab_is_not_alive_and_takes_the_death_respawn_arm() {
+        use TabProbe::{Absent, Exited, Running};
+        assert_eq!(resolve_liveness(Exited, false, Absent), Liveness::Exited);
+        assert_eq!(resolve_liveness(Exited, true, Exited), Liveness::Exited);
+        assert_eq!(resolve_liveness(Absent, true, Exited), Liveness::Exited);
+        // The direct id is stale but the lifecycle record moved to a running
+        // tab (a boot-restore rewrote it): that is the live agent.
+        assert_eq!(resolve_liveness(Exited, true, Running), Liveness::Live);
+        // The direct tab exited but the open record names a DIFFERENT id that
+        // is not registered yet: a restore in flight — wait, never duplicate.
+        assert_eq!(
+            resolve_liveness(Exited, true, Absent),
+            Liveness::PendingRestore
+        );
+
+        assert!(!Liveness::Exited.tab_alive());
+        assert!(!Liveness::Dead.tab_alive());
+        assert!(Liveness::Live.tab_alive());
+        assert!(Liveness::PendingRestore.tab_alive());
+
+        // And the decision core respawns it rather than nudging.
+        let i = TickInput {
+            tab_alive: Liveness::Exited.tab_alive(),
+            ..base()
+        };
+        assert_eq!(decide(&i), Action::Spawn(SpawnReason::DeathRespawn));
     }
 }

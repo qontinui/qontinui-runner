@@ -20,6 +20,12 @@ vi.mock("./terminalHotStore", () => ({
   getTerminalHotStore: () => ({ getLastOutputLines: () => [] }),
 }));
 vi.mock("./approveAll", () => ({ writeToPaneOrReport: vi.fn(() => Promise.resolve()) }));
+// Resume is `resumeInNewTab`'s verified type-and-check; the handshake itself is
+// not what these tests pin, so it verifies at once.
+vi.mock("./useTerminalInitialization", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./useTerminalInitialization")>()),
+  runVerifiedResume: vi.fn(async () => "verified"),
+}));
 
 import { createShownTerminal } from "./terminalWorkModeControl";
 import { useFindingsActions } from "./useFindingsActions";
@@ -82,7 +88,9 @@ describe("session manager Resume", () => {
       await shell.handleResumeSession({
         session_id: "0123456789abcdef",
         project_path: "/repo",
-        config_dir: "/home/u/.claude",
+        // A named (non-default) account: the default home is unreadable under
+        // the mocked `invoke`, and a resume under it is refused as needs-account.
+        config_dir: "/home/u/.claude-work",
       } as TranscriptSession);
     } finally {
       vi.useRealTimers();
@@ -101,7 +109,6 @@ describe("Fix finding", () => {
         tabs: [],
         terminalRefs: { current: new Map() },
         createTerminal: async () => "t-fix",
-        pendingResumeRef: { current: null },
         runGeneration: async () => {},
         setRightPanelMode: noop,
         showSpawnedTab,

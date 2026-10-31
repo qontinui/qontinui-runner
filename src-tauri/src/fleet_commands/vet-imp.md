@@ -831,8 +831,11 @@ else
     # backslash and double quote (Step 5 passes the /name result through here
     # too), which would otherwise end the string early.
     title="$(printf '%s' "$slug" | tr -d '\000-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+    # 2>/dev/null goes BEFORE >>: redirections apply left to right, so a failed
+    # >> would print the shell's own open error (e.g. "Permission denied")
+    # before stderr was muted.
     if printf '{"type":"custom-title","customTitle":"%s","sessionId":"%s","uuid":"%s","timestamp":"%s"}\n' \
-         "$title" "$CLAUDE_CODE_SESSION_ID" "$uuid" "$ts" >> "$sf" 2>/dev/null; then
+         "$title" "$CLAUDE_CODE_SESSION_ID" "$uuid" "$ts" 2>/dev/null >> "$sf"; then
       echo "session labeled: $slug"
     else
       echo "label not written: append to $sf failed (searched $searched)"
@@ -1507,7 +1510,7 @@ coord-observed half in one document and can tell them apart by `source`.
 *(Plan `2026-09-20-a-landed-change-is-never-observed-to-run-on-the-population-it-was-written-for`
 Phase 3.)* `/implement-plan` Step 4.4b declared and proved, for each PR it
 opened, that the change is observed to reach the population it was written for,
-and wrote that to `~/.qontinui/arming/<session-id>.json` under the same
+and wrote that to `~/.qontinui/arming/<session-id>/<tree-key>.json` (one record per tree) under the same
 `AGENT_SESSION_ID`. Read it — do not re-run it:
 
 ```bash
@@ -1516,8 +1519,10 @@ bash <workspace-root>/qontinui-claude-config/scripts/arming-record.sh show
 
 **PRs opened and no arming record under that id ⇒ the chain is INCOMPLETE, and
 this command refuses to report it complete** — name the path looked for and the
-session id, exactly as for a missing review-arm artifact. The record holds the
-LAST head declared, so a multi-PR run reads each PR's own evidence from the
+session id, exactly as for a missing review-arm artifact. `show` with no
+`--root` lists ONE record per tree (each with its `arming_tree` line), and each
+holds the LAST head declared in that tree: match each PR's head against the
+listed records, and read each PR's own evidence from the
 `Coord-Arming-Head:` block in its body; a PR whose body carries none must say
 `arming UNKNOWN: <detail>` or `arming ABSENT` there, and the summary quotes it.
 Never report a PR as armed on the strength of a record whose head is not that

@@ -270,21 +270,18 @@ pub fn execute_review_subtask(
     tracing::info!("Review subtask '{}' spawned", review_id);
 }
 
-/// Process a completed review subtask: parse the AI output, post a GitHub review,
-/// and determine whether the parent should unblock.
+/// Process a completed review subtask: parse the AI output and decide whether
+/// the review completes or fails.
+///
+/// The verdict is not posted to GitHub: this step is not wired to a
+/// credential. The per-watch token it used to read was a plaintext slot, and
+/// the runner no longer reads it (coord finding e871ac27).
 ///
 /// Called from `mark_task_completed` BEFORE the status is written. Returns `true`
-/// if the task should complete normally (approved/inconclusive), `false` if the
-/// caller should redirect to `mark_task_failed` (changes requested).
-#[expect(
-    clippy::string_slice,
-    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-)]
-pub async fn process_review_outcome(
-    pg: &Arc<PgDb>,
-    review_task_run_id: &str,
-    parent_task_run_id: &str,
-) -> bool {
+/// if the task should complete normally, `false` if the caller should redirect
+/// to `mark_task_failed`. The parent advances either way, because
+/// `mark_task_failed` unblocks the parent of a failed blocking child.
+pub async fn process_review_outcome(pg: &Arc<PgDb>, review_task_run_id: &str) -> bool {
     // 1. Read the review's output
     let output = match pg.get_task_output(review_task_run_id).await {
         Ok(o) if !o.is_empty() => o,
@@ -327,96 +324,26 @@ pub async fn process_review_outcome(
         _ => (0, String::new()),
     };
 
-    // 4. Post GitHub review if we have PR context
-    let mut github_post_failed = false;
-    if pr_number > 0 && !repo_full_name.is_empty() {
-        if let Some((owner, repo)) = repo_full_name.split_once('/') {
-            // Get the GitHub token from the parent's PR watch
-            let token_result = pg.get_pr_watch_token_for_task(parent_task_run_id).await;
-            if let Ok(Some(token)) = token_result {
-                let client_result =
-                    crate::trigger_system::github_api::GitHubClient::new(&token, "review_subtask");
-                if let Ok(client) = client_result {
-                    let (event, body) = match &outcome {
-                        ReviewOutcome::Approved => (
-                            "APPROVE",
-                            "Automated review: no issues found. Approving.".to_string(),
-                        ),
-                        ReviewOutcome::ChangesRequested { feedback } => {
-                            // Truncate feedback to avoid GitHub API limits (64KB).
-                            // Use char_indices for UTF-8 safe truncation.
-                            let truncated = if feedback.len() > 60_000 {
-                                let mut end = 60_000;
-                                while !feedback.is_char_boundary(end) && end > 0 {
-                                    end -= 1;
-                                }
-                                format!("{}...\n\n(truncated)", &feedback[..end])
-                            } else {
-                                feedback.clone()
-                            };
-                            ("REQUEST_CHANGES", truncated)
-                        }
-                        ReviewOutcome::Inconclusive => (
-                            "COMMENT",
-                            "Automated review completed but could not determine a clear verdict. Please review manually.".to_string(),
-                        ),
-                    };
-
-                    if let Err(e) = client
-                        .submit_pr_review(owner, repo, pr_number, event, &body)
-                        .await
-                    {
-                        tracing::warn!(
-                            "Failed to post GitHub review for PR #{} in {}: {}",
-                            pr_number,
-                            repo_full_name,
-                            e
-                        );
-                        github_post_failed = true;
-                    } else {
-                        tracing::info!(
-                            "Posted {} review on PR #{} in {}",
-                            event,
-                            pr_number,
-                            repo_full_name
-                        );
-                    }
-                } else {
-                    tracing::warn!(
-                        "Failed to create GitHub client for review of PR #{}: {:?}",
-                        pr_number,
-                        client_result.err()
-                    );
-                    github_post_failed = true;
-                }
-            } else {
-                tracing::warn!(
-                    "No GitHub token found for parent task {} — cannot post review",
-                    parent_task_run_id
-                );
-                github_post_failed = true;
-            }
-        }
-    }
-
-    // 5. Determine whether parent should unblock.
+    // 4. Decide whether the review completes.
     // The caller (mark_task_completed) will redirect to mark_task_failed if false.
     match outcome {
         ReviewOutcome::Approved | ReviewOutcome::Inconclusive => true,
-        ReviewOutcome::ChangesRequested { .. } => {
-            // If we failed to post the review to GitHub, the PR author has no idea
-            // changes were requested. Don't permanently block the parent in that case.
-            if github_post_failed {
-                tracing::warn!(
-                    "Review {} requested changes but GitHub posting failed — \
-                     allowing parent to proceed to avoid permanent block",
-                    review_task_run_id
-                );
-                true
-            } else {
-                false
-            }
+        // A changes-requested review of a PR completes rather than fails.
+        // Nothing reads its verdict, and a failed review reopens the
+        // duplicate-review guard (`has_review_subtask_for_pr` skips failed
+        // reviews), so the watcher would spawn another review of the same PR
+        // each time its CI returned to green.
+        ReviewOutcome::ChangesRequested { .. } if pr_number > 0 && repo_full_name.contains('/') => {
+            tracing::info!(
+                "Review {} requested changes on PR #{} in {}; the verdict is not posted, \
+                 so the review completes",
+                review_task_run_id,
+                pr_number,
+                repo_full_name
+            );
+            true
         }
+        ReviewOutcome::ChangesRequested { .. } => false,
     }
 }
 

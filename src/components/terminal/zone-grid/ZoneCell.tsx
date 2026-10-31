@@ -54,6 +54,7 @@ import { writeToTerminalById } from "../writeToTerminalById";
 import { useTabHotSlice } from "../useTerminalHotStore";
 import { CompactZoneCard } from "./CompactZoneCard";
 import { ZoneLabel } from "./ZoneLabel";
+import { ZONE_CELL_CONTAINER_CLASS } from "./headerReserve";
 import { ZoneQuickActions } from "./ZoneQuickActions";
 import {
   STATE_BORDER_COLORS,
@@ -526,7 +527,7 @@ function ZoneCellInner({
   return (
     <div
       ref={cellRef}
-      className={`group relative overflow-hidden ${isFlashing ? "zone-flash" : ""} ${isParked ? "hidden" : ""}`}
+      className={`group ${ZONE_CELL_CONTAINER_CLASS} relative overflow-hidden ${isFlashing ? "zone-flash" : ""} ${isParked ? "hidden" : ""}`}
       // Ground truth for the tag filter, readable through the UI Bridge
       // without inferring anything from a computed opacity.
       data-zone-tag-filter={tagFilterActive ? (tagFilteredOut ? "hidden" : "shown") : undefined}
