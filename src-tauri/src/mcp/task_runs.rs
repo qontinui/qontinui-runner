@@ -227,27 +227,32 @@ pub async fn stop_task_run(
         pids_copy
     };
 
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut killed_count = 0;
     for pid in &pids_to_kill {
         info!("Killing AI process PID {} for task {}", pid, id);
-        let result = crate::process_helpers::no_window("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .output();
-
-        match result {
-            Ok(output) => {
-                if output.status.success() {
-                    info!("Successfully killed process tree for PID {}", pid);
-                    killed_count += 1;
-                } else {
-                    // Process may have already exited
-                    killed_count += 1;
-                }
+        // In-process tree kill: no `taskkill` is spawned to do it.
+        #[cfg(windows)]
+        match crate::tree_kill::kill_tree_by_pid_async(*pid, std::time::Duration::from_secs(5))
+            .await
+        {
+            Ok(_) => {
+                info!("Successfully killed process tree for PID {}", pid);
+                killed_count += 1;
             }
             Err(e) => {
-                error!("Failed to execute taskkill for PID {}: {}", pid, e);
+                // Process may have already exited.
+                info!("Tree kill for PID {}: {}", pid, e);
+                killed_count += 1;
             }
         }
+        // Unchanged off Windows: this path never killed anything there (it
+        // spawned `taskkill`, which does not exist). A separate defect.
+        #[cfg(not(windows))]
+        error!(
+            "No process-tree kill on this platform; PID {} was not signalled",
+            pid
+        );
     }
 
     // Mark as stopped in database

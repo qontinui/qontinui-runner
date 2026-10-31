@@ -117,6 +117,20 @@ repos:
         files: '^\.pre-commit-hooks/(lib/gen-events-attribution\.sh|gen-events-drift-attribution-test\.sh|gen-events-drift\.sh|gen-events-path-deps-check\.sh)$'
         pass_filenames: false
 
+      # How the drift hook finds the repo root. The commit-sourced pre-push shim
+      # may run it from an EXTRACTED copy of .pre-commit-hooks/, where
+      # "$SCRIPT_DIR/.." is a temp dir; a root derived from there makes the hook
+      # report CANNOT EVALUATE and check nothing. Cheap: throwaway dirs only.
+      - id: gen-events-drift-root-test
+        name: gen-events drift — repo-root resolution tests
+        entry: bash .pre-commit-hooks/gen-events-drift-root-test.sh
+        language: system
+        files: '^\.pre-commit-hooks/(gen-events-drift\.sh|gen-events-drift-root-test\.sh)$'
+        pass_filenames: false
+        # pre-commit only: adding a pre-push id would change the armed stage's id
+        # set, which install-repo-git-hooks.sh --check reports as DRIFT.
+        stages: [pre-commit]
+
       # Every in-repo path dependency of the export build must be an attribution
       # input, or an edit to that crate clears a guilty pusher (two crates were
       # once missing). What can break that is a MANIFEST edit, so this runs on

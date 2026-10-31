@@ -46,7 +46,8 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 # The RUNNER-side spawner (`spawn`) decides the holder's job-breakaway route
 # through runner-win32's `holder_spawn` (plan D4 as corrected 2026-09-27). The
-# holder binary itself never calls it, so it costs the per-pane process nothing.
+# holder binary itself uses only runner-win32's `process_tree` (the boot
+# sweep's tree reap and `proc_identity::creation_time`).
 qontinui-runner-win32 = { path = "../runner-win32" }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

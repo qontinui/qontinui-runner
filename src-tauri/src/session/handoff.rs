@@ -1336,6 +1336,7 @@ fn registry_record_from_restore_payload(
         provider,
         origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
         restore_pending_at: None,
+        awaiting_account_since: None,
         confirmed_at,
         handle: None,
         account_label: None,
@@ -1354,6 +1355,7 @@ fn registry_record_from_restore_payload(
         finish_synced: false,
         spawn_device_default: None,
         adopted_from: None,
+        last_session_start_at: None,
     }
 }
 
@@ -2172,8 +2174,7 @@ mod tests {
         );
         store.record_open(rec);
 
-        let restorable =
-            store.restorable_records(chrono::Utc::now().timestamp_millis(), None, true, None);
+        let restorable = store.restorable_records(None, true);
         assert_eq!(restorable.len(), 1, "materialized record is restorable");
         let r = &restorable[0];
         assert_eq!(r.claude_session_id, "sess-full-1");

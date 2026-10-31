@@ -2,7 +2,7 @@
 # land-evidence.sh — did this branch's "unlanded" work actually LAND?
 #
 # Plan 2026-09-13-nightly-return-to-main-sweep, Phase 3a. Finding a911a385:
-# qontinui-dev-notes sat on `followup/pr1260-landing-state-update` (eed39fc2)
+# a plans repository sat on `followup/pr1260-landing-state-update` (eed39fc2)
 # and the classifier said UNIQUE_WIP forever. The commit HAD landed — PR #511,
 # merged as c7df1d44 after a rebase WITH conflict resolution (patch-id changed)
 # and later upstream edits to the same lines (content arm failed too). Deciding
@@ -126,10 +126,13 @@
 # decidable for this fleet's own plan corpus, because `plan-discipline` gives
 # plan status a classified vocabulary. A path qualifies when it matches
 # `plans/*.md`, exists upstream, the two copies are BYTE-IDENTICAL once each
-# side's leading status blockquote (the `>` block before the first `## `) is
-# removed, and upstream's status is a STRICTLY later state in the lifecycle
-# (draft < vetted < in progress < shipped < superseded/obsolete). An unparseable
-# status on either side is UNKNOWN, never "later". Comparing the two bodies
+# side's status block is removed, and upstream's status is a STRICTLY later
+# state in the lifecycle (draft < vetted < in progress < shipped <
+# superseded/obsolete). The block and the word are read by the stamp parse
+# owner, lib/plan_stamp.py (every stamp shape: blockquote, plain, list, bare,
+# bold no-colon); with no Python the arm falls back to the leading `>` block
+# before the first `## ` and says so in its reason. An unparseable status on
+# either side is UNKNOWN, never "later". Comparing the two bodies
 # WHOLE is what lets this profile be exempt from the removed-lines refusal
 # above: a line dropped from the body shows up as a body difference, whereas a
 # test that only checked where each ADDED line landed would have missed it.
@@ -297,7 +300,7 @@ C_SHA=(); C_SUBJ=(); C_DATE=(); C_CT=(); C_VERDICT=()
 S_VERDICT=(); S_JSON=(); SUPER_FAILED=0
 MAX_SUPER_LINES="${LAND_EVIDENCE_SUPERSEDE_MAX_LINES:-200}"
 case "$MAX_SUPER_LINES" in ''|*[!0-9]*) MAX_SUPER_LINES=200 ;; esac
-# The longest leading `>` run --corpus plan-document will treat as a status
+# The longest status block --corpus plan-document will treat as a status
 # STAMP. Beyond it the block is a chapter, and the profile would be licensed to
 # ignore substance hidden inside the one region it does not compare.
 MAX_STATUS_BLOCK_LINES="${LAND_EVIDENCE_STATUS_BLOCK_MAX_LINES:-40}"
@@ -866,10 +869,59 @@ plan_status_rank() { # <status text> -> rank, or 1 when unparseable
     *) return 1 ;;
   esac
 }
-# The status word of the leading status blockquote, i.e. the `> **Status:` line
-# in the `>` block before the first `## ` heading. Anything after the first
-# comma, period or `**` is prose, and a trailing date is not the word.
+# THE STAMP IS READ BY THE PARSE OWNER, lib/plan_stamp.py -- the stdlib-only
+# stamp parse that check #34 re-exports, carried in this skill's lib/ as a
+# byte-identical twin of the shared copy (return-to-main-skill-test.sh I2).
+# The awk below this block is the FALLBACK for a device with no Python 3 (or no
+# readable module): it reads only a `> **Status:` blockquote, so a plain
+# (`**Status:** X`), list (`- **Status**: X`), bare (`Status: X`) or bold
+# no-colon stamp read as "no stamp", and a run-on word (`SHIPPED (code)`) read
+# as unparseable -- both UNKNOWN, so the arm abstained on 171 of 2674 plans at
+# corpus commit 07d9c897 (plan 2026-10-16-two-stamp-readers-still-bypass-the-parse-owner-land-evidence-and-depends-on
+# Phase 2). Every reason the arm gives under the fallback says so.
+#
+# plan_stamp_init decides the mode ONCE, in the calling shell: plan_status_of
+# and plan_status_bounds run inside `$(...)`, where a resolution would be lost.
+PLAN_STAMP_PY="$LIB_DIR/plan_stamp.py"
+PLAN_STAMP_MODE=""   # py | awk, set by plan_stamp_init
+PLAN_STAMP_FALLBACK_NOTE=""
+plan_stamp_init() {
+  [ -n "$PLAN_STAMP_MODE" ] && return 0
+  if [ ! -r "$PLAN_STAMP_PY" ]; then
+    PLAN_STAMP_MODE=awk; PLAN_STAMP_FALLBACK_NOTE=" (awk fallback: lib/plan_stamp.py is not readable)"
+  elif resolve_python; then
+    PLAN_STAMP_MODE=py
+  else
+    PLAN_STAMP_MODE=awk; PLAN_STAMP_FALLBACK_NOTE=" (awk fallback: no Python)"
+  fi
+}
+# A module exit other than 0 (answer) or 3 (no stamp) is a FAILED read, never
+# "no status block": it is recorded in $TMP/plan_stamp.rc (these run inside
+# `$(...)`, so a variable would be lost) and the arm names it in its reason.
+plan_stamp_py() { # <--token|--bounds> <file> -> the module's one line, or its exit code
+  local out rc
+  out="$("${PY[@]}" "$(np "$PLAN_STAMP_PY")" "$1" "$(np "$2")" 2>/dev/null)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    [ "$rc" -eq 3 ] || printf '%s\n' "$rc" >> "$TMP/plan_stamp.rc"
+    return "$rc"
+  fi
+  printf '%s' "$out" | tr -d '\r'   # Windows Python prints CRLF
+}
+plan_stamp_failure() { # -> " (stamp reader failed: exit N)" when a read failed, else nothing
+  [ -s "$TMP/plan_stamp.rc" ] || return 0
+  printf ' (stamp reader failed: exit %s)' "$(sort -u "$TMP/plan_stamp.rc" | tr '\n' ' ' | sed 's/ $//; s/ /,/g')"
+}
+# The status word: the module's TOKEN, lowercased (`shipped`, `in progress`;
+# `SHIPPED -- UNCONFIRMED` folds to `shipped`, which ranks later than VETTED,
+# correct for a supersession comparison). Fallback: the leading `> **Status:`
+# line before the first `## `; anything after the first comma, period or `**`
+# is prose, and a trailing date is not the word.
 plan_status_of() { # <file> -> the status word, or 1
+  if [ "$PLAN_STAMP_MODE" = py ]; then
+    local w; w="$(plan_stamp_py --token "$1")" || return 1
+    [ -n "$w" ] || return 1
+    printf '%s\n' "$w"; return 0
+  fi
   awk '
     /^## / { exit }
     /^> \*\*Status:/ {
@@ -884,9 +936,18 @@ plan_status_of() { # <file> -> the status word, or 1
     END { exit !found }
   ' "$1" 2>/dev/null
 }
-# "<first> <last>" of the leading, STRICTLY CONTIGUOUS `>` block before the
-# first `## ` heading -- the bounds branch-only lines must lie inside.
+# "<first> <last>" of the status block -- the bounds branch-only lines must lie
+# inside: the module's `--bounds` extent (a quoted stamp and every `>` line
+# under it; an unquoted stamp's line plus the `Key: value` lines directly under
+# it, so a design sentence below `**Status:** X` is compared, not ignored). Fallback: the
+# leading, STRICTLY CONTIGUOUS `>` block before the first `## ` heading.
 plan_status_bounds() { # <file> -> "<start> <end>", or 1
+  if [ "$PLAN_STAMP_MODE" = py ]; then
+    local b; b="$(plan_stamp_py --bounds "$1")" || return 1
+    case "$b" in [0-9]*' '[0-9]*) printf '%s\n' "$b"; return 0 ;; esac
+    printf 'malformed\n' >> "$TMP/plan_stamp.rc"
+    return 1
+  fi
   awk '
     /^## / { exit }
     /^>/ { if (!s) { s = NR; e = NR } else if (NR == e + 1) { e = NR } else exit; next }
@@ -953,7 +1014,7 @@ supersede_commit() { # <ci> -> sets S_VERDICT[ci] and S_JSON[ci]
   local _pd_reason _bounds _bs _be _outside _bst _ust _br _ur _urc
   local verdict=SUPERSEDED reason="" pjson="" pfirst=1
   local up_exists up_newest up_at up_n br_n pverdict preason bo_json bofirst off txt disp n_bo
-  local _ep _el _eu _rec _cum_bo=0 _pd_settled _pd_carry="" _ubounds _awo_rc _bodisp
+  local _ep _el _eu _rec _cum_bo=0 _pd_settled _pd_carry="" _pd_note="" _ubounds _awo_rc _bodisp
   l="${C_SHA[$ci]}"
   # max(%at, %ct), and an unreadable date is UNKNOWN. `${...:-0}` would make
   # EVERY upstream commit "later than" this one, turning a failed read into the
@@ -1058,22 +1119,26 @@ supersede_commit() { # <ci> -> sets S_VERDICT[ci] and S_JSON[ci]
     # does not recognise.
     _pd_settled=0
     if [ "$pverdict" = SUPERSEDED ] && [ "$CORPUS" = plan-document ]; then
-      _pd_reason=""
+      _pd_reason=""; _pd_note=""
       case "$path" in
         plans/*.md) ;;
         *) _pd_reason="'$path' is not plans/*.md" ;;
       esac
       if [ -z "$_pd_reason" ]; then
         # The confinement test compares the two files WHOLE with their leading
-        # status blockquotes removed. An earlier draft only checked that each
+        # status blocks removed. An earlier draft only checked that each
         # branch-only ADDED line fell inside the block, which said nothing about
         # lines the commit REMOVED from the body -- a plan edit that quietly
         # dropped a section would have passed. If the remainders are byte-equal,
         # then EVERY difference in either direction is inside the status block.
+        plan_stamp_init; _pd_note="$PLAN_STAMP_FALLBACK_NOTE"; rm -f "$TMP/plan_stamp.rc"
         _bounds="$(plan_status_bounds "$TMP/s.post")" || _bounds=""
         _ubounds="$(plan_status_bounds "$TMP/s.up")" || _ubounds=""
-        if [ -z "$_bounds" ] || [ -z "$_ubounds" ]; then
-          _pd_reason="a leading status blockquote is missing on $([ -z "$_bounds" ] && printf 'the branch'; [ -z "$_bounds" ] && [ -z "$_ubounds" ] && printf ' and '; [ -z "$_ubounds" ] && printf 'the upstream') side, so the change cannot be confined to one"
+        if [ -s "$TMP/plan_stamp.rc" ]; then
+          _pd_reason="the stamp reader could not read the status block, so it is UNKNOWN (never absent) and the change cannot be confined to it"
+          _pd_note="$_pd_note$(plan_stamp_failure)"
+        elif [ -z "$_bounds" ] || [ -z "$_ubounds" ]; then
+          _pd_reason="no status block is located on $([ -z "$_bounds" ] && printf 'the branch'; [ -z "$_bounds" ] && [ -z "$_ubounds" ] && printf ' and '; [ -z "$_ubounds" ] && printf 'the upstream') side, so the change cannot be confined to one"
         else
           _bs="${_bounds%% *}"; _be="${_bounds##* }"
           sed "${_bs},${_be}d" "$TMP/s.post" > "$TMP/s.post.body" 2>/dev/null || : > "$TMP/s.post.body"
@@ -1084,21 +1149,22 @@ supersede_commit() { # <ci> -> sets S_VERDICT[ci] and S_JSON[ci]
           # unique design lines against a one-line upstream would exit 5 on an
           # empty-vs-empty comparison. Refuse it.
           if [ ! -s "$TMP/s.post.body" ] || [ ! -s "$TMP/s.up.body" ]; then
-            _pd_reason="one of the two copies has NO body outside its leading status blockquote, so an identical-bodies comparison would be vacuous"
+            _pd_reason="one of the two copies has NO body outside its status block, so an identical-bodies comparison would be vacuous"
           # A status blockquote is a stamp, not a chapter. An unbounded leading
           # `>` run lets substance hide inside the very region the profile is
           # licensed to ignore, so cap it.
           elif [ "$((_be - _bs + 1))" -gt "$MAX_STATUS_BLOCK_LINES" ] \
             || [ "$(( ${_ubounds##* } - ${_ubounds%% *} + 1 ))" -gt "$MAX_STATUS_BLOCK_LINES" ]; then
-            _pd_reason="a leading status blockquote longer than $MAX_STATUS_BLOCK_LINES lines is not a status stamp; substance inside it would be ignored"
+            _pd_reason="a status block longer than $MAX_STATUS_BLOCK_LINES lines is not a status stamp; substance inside it would be ignored"
           elif ! cmp -s "$TMP/s.post.body" "$TMP/s.up.body"; then
-            _pd_reason="the two copies differ OUTSIDE the leading status blockquote: that is substance, not a superseded status stamp"
+            _pd_reason="the two copies differ OUTSIDE the status block: that is substance, not a superseded status stamp"
           fi
         fi
       fi
       if [ -z "$_pd_reason" ]; then
         _bst="$(plan_status_of "$TMP/s.post")" || _bst=""
         _ust="$(plan_status_of "$TMP/s.up")" || _ust=""
+        _pd_note="$_pd_note$(plan_stamp_failure)"
         _br="$(plan_status_rank "$_bst")" || _br=""
         _ur="$(plan_status_rank "$_ust")" || _ur=""
         if [ -z "$_br" ] || [ -z "$_ur" ]; then
@@ -1106,13 +1172,13 @@ supersede_commit() { # <ci> -> sets S_VERDICT[ci] and S_JSON[ci]
         elif [ "$_ur" -le "$_br" ]; then
           _pd_reason="upstream status '$_ust' is not STRICTLY later than the branch's '$_bst'"
         else
-          preason="plan-document: the two copies are identical outside the leading status blockquote (branch lines $_bs-$_be) and upstream is '$_ust' against the branch's '$_bst'"
+          preason="plan-document: the two copies are identical outside the status block (branch lines $_bs-$_be) and upstream is '$_ust' against the branch's '$_bst'$_pd_note"
           _pd_settled=1
         fi
       fi
       # NOT settled by the profile -> fall through to the general arm, carrying
       # the profile's reason only if the general arm cannot settle it either.
-      [ "$_pd_settled" = 1 ] || _pd_carry="$_pd_reason"
+      [ "$_pd_settled" = 1 ] || _pd_carry="$_pd_reason$_pd_note"
     fi
     # THE REMOVAL HOLE. This arm observes ADDED lines only: for each added line it
     # asks whether upstream later removed it. A commit that REMOVES content or
