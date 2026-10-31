@@ -60,8 +60,9 @@
 //!    reads it) and carries no `state <> 'closed'` filter, so a closed source
 //!    still resolves. cwd, intent and held claims come from here.
 //! 5. **The transcript, into the TARGET account's project dir**
-//!    (`<config-dir>/projects/<slug>/<sid>.jsonl`). Local copy first — reusing
-//!    [`crate::terminal::account_migration::copy_transcript`] verbatim — then
+//!    (`<config-dir>/projects/<slug>/<sid>.jsonl`, plus its `<sid>/` directory of
+//!    subagent transcripts, best-effort). Local copy first — reusing
+//!    [`crate::terminal::session_carry::carry_for_respawn`] — then
 //!    coord's warm→cold `?stream=transcript` tier for the cross-machine case.
 //!    Neither yielding bytes is a hard failure: `--resume` against a
 //!    non-existent transcript would start an EMPTY conversation wearing the
@@ -420,15 +421,48 @@ fn resolve_working_dir(
         })
 }
 
-/// Copy the transcript out of whichever LOCAL account dir holds it into the
-/// target account's project dir. Returns `Ok(true)` when a copy landed (or the
-/// target already had it), `Ok(false)` when no local dir holds it.
+/// Copy the transcript out of the LOCAL account dirs that hold it into the
+/// target account's project dir. Returns `Ok(true)` when the target holds it
+/// afterwards (copied now, or already there), `Ok(false)` when no local dir
+/// holds it.
 ///
-/// Reuses [`crate::terminal::account_migration::copy_transcript`] rather than
+/// Reuses [`crate::terminal::session_carry::carry_for_respawn`] rather than
 /// re-implementing the copy: same idempotent "skip when the destination is
-/// already at least as large" behaviour, same never-touch-the-source rule.
+/// already at least as large" behaviour, same never-touch-the-source rule, and
+/// the same best-effort carry of the session's `<sid>/` directory (subagent
+/// transcripts). Plan
+/// `2026-10-12-account-migration-leaves-subagent-transcripts-behind`.
 fn materialize_transcript_locally(
     config_dir: &str,
+    working_dir: &str,
+    claude_session_id: &str,
+) -> Result<bool, RespawnError> {
+    materialize_from(
+        config_dir,
+        &local_config_dirs(),
+        working_dir,
+        claude_session_id,
+    )
+}
+
+/// [`materialize_transcript_locally`] over an explicit candidate list, so the
+/// policy is testable without the machine's real account dirs.
+///
+/// Every holding dir is visited, not just the first: a session that ran on
+/// several accounts left part of its `<sid>/subagents/` on each, and the
+/// per-file rules make the union safe (an existing `.jsonl` is replaced only by
+/// a source it is a byte-prefix of, so a fork's own tail is never lost; an
+/// in-place sidecar follows whichever side ran the session last).
+///
+/// A target that already held `<sid>.jsonl` KEEPS it
+/// ([`RespawnCarry::KeepExisting`](crate::terminal::session_carry::RespawnCarry)),
+/// as before the side-car carry existed — that copy is the one this target
+/// resumes, even when a holder's is larger — but its `<sid>/` still gets the
+/// carry. One holder failing never ends the walk; the call fails only when the
+/// target ends up with no transcript and at least one holder failed.
+fn materialize_from(
+    config_dir: &str,
+    candidates: &[String],
     working_dir: &str,
     claude_session_id: &str,
 ) -> Result<bool, RespawnError> {
@@ -437,37 +471,59 @@ fn materialize_transcript_locally(
         working_dir,
         claude_session_id,
     );
-    if target_path.exists() {
-        return Ok(true);
-    }
-    for src in local_config_dirs() {
+    let mut found = target_path.exists();
+    let main = if found {
+        crate::terminal::session_carry::RespawnCarry::KeepExisting
+    } else {
+        crate::terminal::session_carry::RespawnCarry::ExtendPrefix
+    };
+    let mut last_error = None;
+    for src in candidates {
         if src == config_dir {
             continue;
         }
         let candidate = crate::terminal::transcript::session_transcript_path(
-            std::path::Path::new(&src),
+            std::path::Path::new(src),
             working_dir,
             claude_session_id,
         );
         if !candidate.exists() {
             continue;
         }
-        crate::terminal::account_migration::copy_transcript(
-            &src,
+        match crate::terminal::session_carry::carry_for_respawn(
+            src,
             config_dir,
             working_dir,
             claude_session_id,
-        )
-        .map_err(RespawnError::Transcript)?;
-        tracing::info!(
-            session = %claude_session_id,
-            from = %src,
-            to = %config_dir,
-            "session respawn: transcript copied from a local account dir"
-        );
-        return Ok(true);
+            main,
+        ) {
+            Ok(carried) => {
+                tracing::info!(
+                    session = %claude_session_id,
+                    from = %src,
+                    to = %config_dir,
+                    main = carried.main.event_name(),
+                    session_dir_copied = carried.session_dir.copied,
+                    session_dir_failed = carried.session_dir.failed,
+                    "session respawn: transcript carried from a local account dir"
+                );
+                found = true;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session = %claude_session_id,
+                    from = %src,
+                    error = %e,
+                    "session respawn: could not carry from a local account dir; trying the rest"
+                );
+                last_error = Some(e);
+            }
+        }
     }
-    Ok(false)
+    match (found, last_error) {
+        (false, Some(e)) => Err(RespawnError::Transcript(e)),
+        (found, _) => Ok(found),
+    }
 }
 
 /// Every Claude config dir this box knows about — the configured roster plus
@@ -652,8 +708,22 @@ async fn materialize(
         .ok_or(RespawnError::NoWorkingDir(respawn.source_session_id))?;
 
     // 4. The transcript, into the TARGET account's project dir.
-    let mut have_transcript =
-        materialize_transcript_locally(&config_dir, &working_dir, &claude_session_id)?;
+    // On the blocking pool: the copy can be a whole `<sid>/` tree from several
+    // account dirs, which for a long fan-out is many megabytes.
+    let mut have_transcript = {
+        let (config_dir, working_dir, claude_session_id) = (
+            config_dir.clone(),
+            working_dir.clone(),
+            claude_session_id.clone(),
+        );
+        qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+            materialize_transcript_locally(&config_dir, &working_dir, &claude_session_id)
+        })
+        .await
+        .map_err(|e| {
+            RespawnError::Transcript(format!("transcript copy task did not complete: {e}"))
+        })??
+    };
     if !have_transcript {
         have_transcript = materialize_transcript_from_coord(
             http,
@@ -837,6 +907,7 @@ mod tests {
             provider: super::super::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
             origin: None,
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: None,
             handle: None,
             account_label: None,
@@ -851,10 +922,12 @@ mod tests {
             finished_at: None,
             wind_down_outcome: None,
             wind_down_at: None,
+            wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
         }
     }
 
@@ -1333,6 +1406,172 @@ mod tests {
 
         assert!(
             materialize_transcript_locally(dst_cfg.to_str().unwrap(), working_dir, sid).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Lay out `<cfg>/projects/<slug>/<sid>.jsonl` (with `main` bytes) plus
+    /// `<sid>/` files given as `(relative path, bytes)`.
+    fn seed_holder(
+        cfg: &std::path::Path,
+        working_dir: &str,
+        sid: &str,
+        main: &[u8],
+        files: &[(&str, &[u8])],
+    ) {
+        let main_path = crate::terminal::transcript::session_transcript_path(cfg, working_dir, sid);
+        std::fs::create_dir_all(main_path.parent().unwrap()).unwrap();
+        std::fs::write(&main_path, main).unwrap();
+        for (rel, bytes) in files {
+            let path = main_path.parent().unwrap().join(sid).join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+    }
+
+    /// Two holders, each with part of `<sid>/subagents/`, plus a target that
+    /// already has the main transcript: the target ends with the UNION, i.e.
+    /// neither the early "target already has it" return nor a stop after the
+    /// first holder survives.
+    #[test]
+    fn local_materialization_carries_the_union_of_every_holder_even_into_a_present_target() {
+        let tmp = std::env::temp_dir().join(format!(
+            "qontinui-respawn-union-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let working_dir = "D:\\qontinui-root";
+        let sid = "33333333-4444-5555-6666-777777777777";
+        let (target, a, b) = (
+            tmp.join(".claude-t"),
+            tmp.join(".claude-a"),
+            tmp.join(".claude-b"),
+        );
+        seed_holder(&target, working_dir, sid, b"{}\n{}\n{}\n", &[]);
+        seed_holder(
+            &a,
+            working_dir,
+            sid,
+            b"{}\n",
+            &[("subagents/agent-a.jsonl", b"a\n")],
+        );
+        seed_holder(
+            &b,
+            working_dir,
+            sid,
+            b"{}\n{}\n",
+            &[("subagents/agent-b.jsonl", b"b\n")],
+        );
+        let candidates = [
+            a.to_str().unwrap().to_string(),
+            b.to_str().unwrap().to_string(),
+        ];
+
+        assert!(materialize_from(target.to_str().unwrap(), &candidates, working_dir, sid).unwrap());
+        let sub = crate::terminal::transcript::session_transcript_path(&target, working_dir, sid)
+            .parent()
+            .unwrap()
+            .join(sid)
+            .join("subagents");
+        assert!(
+            sub.join("agent-a.jsonl").exists(),
+            "first holder's subagents carried"
+        );
+        assert!(
+            sub.join("agent-b.jsonl").exists(),
+            "second holder's subagents carried"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A target that already holds `<sid>.jsonl` keeps it byte-for-byte even
+    /// when a holder's copy is a LARGER append-only extension of it (the
+    /// early-return rule), while that holder's `<sid>/` is still carried.
+    #[test]
+    fn local_materialization_keeps_a_present_target_transcript() {
+        let tmp = std::env::temp_dir().join(format!(
+            "qontinui-respawn-keep-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let working_dir = "D:\\qontinui-root";
+        let sid = "55555555-6666-7777-8888-999999999999";
+        let (target, holder) = (tmp.join(".claude-t"), tmp.join(".claude-h"));
+        seed_holder(&target, working_dir, sid, b"{}\n", &[]);
+        seed_holder(
+            &holder,
+            working_dir,
+            sid,
+            b"{}\n{\"more\":1}\n",
+            &[("subagents/agent-h.jsonl", b"h\n")],
+        );
+
+        assert!(materialize_from(
+            target.to_str().unwrap(),
+            &[holder.to_str().unwrap().to_string()],
+            working_dir,
+            sid
+        )
+        .unwrap());
+        let main = crate::terminal::transcript::session_transcript_path(&target, working_dir, sid);
+        assert_eq!(
+            std::fs::read(&main).unwrap(),
+            b"{}\n",
+            "the target's own transcript is kept, not replaced by a holder's"
+        );
+        assert!(
+            main.parent()
+                .unwrap()
+                .join(sid)
+                .join("subagents")
+                .join("agent-h.jsonl")
+                .is_file(),
+            "the side-car carry still runs into a present target"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A holder that cannot be copied (its `<sid>.jsonl` is a directory) does
+    /// not end the walk: the next holder still supplies the transcript. Only
+    /// when NO holder succeeds is it an error.
+    #[test]
+    fn local_materialization_tries_every_holder_before_failing() {
+        let tmp = std::env::temp_dir().join(format!(
+            "qontinui-respawn-badholder-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let working_dir = "D:\\qontinui-root";
+        let sid = "44444444-5555-6666-7777-888888888888";
+        let (target, bad, good) = (
+            tmp.join(".claude-t"),
+            tmp.join(".claude-bad"),
+            tmp.join(".claude-good"),
+        );
+        let bad_main = crate::terminal::transcript::session_transcript_path(&bad, working_dir, sid);
+        std::fs::create_dir_all(&bad_main).unwrap(); // a DIRECTORY named <sid>.jsonl
+        seed_holder(&good, working_dir, sid, b"{}\n", &[]);
+        let bad_s = bad.to_str().unwrap().to_string();
+
+        assert!(materialize_from(
+            target.to_str().unwrap(),
+            &[bad_s.clone(), good.to_str().unwrap().to_string()],
+            working_dir,
+            sid
+        )
+        .unwrap());
+        assert!(
+            crate::terminal::transcript::session_transcript_path(&target, working_dir, sid)
+                .is_file()
+        );
+
+        let lone_target = tmp.join(".claude-lone");
+        assert!(
+            matches!(
+                materialize_from(lone_target.to_str().unwrap(), &[bad_s], working_dir, sid),
+                Err(RespawnError::Transcript(_))
+            ),
+            "every holder failing is an error, never a silent absence"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }

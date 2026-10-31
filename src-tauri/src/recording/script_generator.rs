@@ -75,7 +75,7 @@ except ImportError:
     import requests
 
     class UIBridgeClient:
-        def __init__(self, base_url: str = "http://localhost:9876"):
+        def __init__(self, base_url: str = "http://127.0.0.1:9876"):
             self.base_url = base_url
             self.session = requests.Session()
 

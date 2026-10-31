@@ -19,6 +19,7 @@ import {
   recordRestoreMisses,
   type HiddenWorkerState,
 } from "./hiddenWorkerReducer";
+import { getTerminalHotStore, type TerminalHotStore } from "./terminalHotStore";
 
 const logger = createLogger("TerminalManager");
 
@@ -128,6 +129,14 @@ export interface TerminalTab {
   claudeSessionId?: string;
   /** Claude config dir for the session (set on resume). */
   claudeConfigDir?: string;
+  /**
+   * The account's EXPLICIT config dir for the registry record only — the
+   * default home's path included — set beside {@link claudeConfigDir} (the
+   * TYPED form, `undefined` for the default home) by every resume path. Never
+   * typed. A Retry records the session under it, so a verified Retry of a
+   * default-home session still names its account.
+   */
+  claudeRecordConfigDir?: string;
   /**
    * Orchestration `task_run_id`, copied from the `TerminalSessionRecord` of a
    * Conductor worker (`dispatch_subtask` in
@@ -596,6 +605,26 @@ export function backfillClaudeSessionIds(
     return t;
   });
   return changed ? next : tabs;
+}
+
+/**
+ * Seed each listed terminal's total output (`TerminalInfo.totalBytesProduced`)
+ * into the page's hot store, so a zone header shows its "total output" figure
+ * from the first `terminal_list` read instead of waiting on the first
+ * activity-digest event.
+ *
+ * Every `terminal_list` reader calls this (reconnect, re-sync, and the 30 s
+ * sweep): a seed from one reader alone can be lost to the tab-roster
+ * `retainTabs` prune on mount, and the sweep re-seeds. The store keeps a
+ * monotonic max (`noteTabTotalBytes`), so a stale or lower reading is harmless
+ * and a missing / non-finite value is skipped rather than recorded.
+ */
+export function seedTotalBytesFromList(store: TerminalHotStore, terminals: TerminalInfo[]): void {
+  for (const t of terminals) {
+    const total = (t as { totalBytesProduced?: unknown }).totalBytesProduced;
+    if (typeof total !== "number" || !Number.isFinite(total)) continue;
+    store.noteTabTotalBytes(t.id, total);
+  }
 }
 
 /**
@@ -1185,6 +1214,7 @@ export function useTerminalManager(
       // Only reconnect to alive sessions; silently close dead ones
       const dead = pageTerminals.filter((t) => !t.isAlive);
       const alive = pageTerminals.filter((t) => t.isAlive);
+      seedTotalBytesFromList(getTerminalHotStore(pageId), alive);
 
       for (const t of dead) {
         invoke("terminal_close", { terminalId: t.id }).catch(() => {});
@@ -1270,6 +1300,13 @@ export function useTerminalManager(
     try {
       const result = await invoke<CommandResponse>("terminal_list");
       if (!result.success || !result.data) return;
+      const listed = (result.data as { terminals?: TerminalInfo[] }).terminals;
+      if (Array.isArray(listed)) {
+        seedTotalBytesFromList(
+          getTerminalHotStore(pageId),
+          listed.filter((t) => (t.pageId || "default") === pageId),
+        );
+      }
       const map =
         (result.data as { sessionIdsByTerminal?: SessionIdsByTerminal }).sessionIdsByTerminal ?? {};
       const spawnNames = spawnNamesFrom(result.data);
@@ -1284,7 +1321,7 @@ export function useTerminalManager(
       // Best-effort backfill; the reconnect + transcript-poll writers still
       // cover the common cases if this sweep transiently fails.
     }
-  }, []);
+  }, [pageId]);
 
   useEffect(() => {
     const timer = setInterval(() => void reconcileClaudeSessionIds(), 30_000);
@@ -1321,6 +1358,7 @@ export function useTerminalManager(
     if (!Array.isArray(terminals)) return; // malformed — never read as "empty"
 
     const mine = terminals.filter((t) => (t.pageId || "default") === pageId);
+    seedTotalBytesFromList(getTerminalHotStore(pageId), mine);
     // Ids the runner has announced an exit for. They defeat the create grace
     // (see `reconcileTabsWithBackend`), and anything the backend still lists
     // is pruned back out so the set cannot grow without bound.
@@ -1608,6 +1646,7 @@ export function useTerminalManager(
           | "workingDir"
           | "claudeSessionId"
           | "claudeConfigDir"
+          | "claudeRecordConfigDir"
           | "isReconnecting"
           | "resumeFailed"
           | "restoreTerminalOnly"
