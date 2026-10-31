@@ -35,6 +35,7 @@ import { AppWindow, Download, Maximize2, Minimize2, RefreshCw, Tag, X } from "lu
 import { useTerminalSession, useTransitionEffects, useZoneMetadata } from "./contexts";
 import { useWindowAssignments } from "./contexts/WindowAssignmentsContext";
 import { useTerminalWindowActions, type RunnerWindowRecord } from "./useTerminalWindowActions";
+import { RemoteTabEndAction } from "./RemoteSessionEndFlow";
 
 interface ZoneHoverActionsProps {
   zoneIdx: number;
@@ -55,6 +56,17 @@ interface ZoneHoverActionsProps {
   inline?: boolean;
 }
 
+/**
+ * Width, in CSS px, the overlay cluster spans from the cell's right edge when it
+ * shows `buttons` buttons: `right-1` (4) + border (2) + `px-1` (8), and per
+ * button `p-1` + a `w-3` icon (20) with a `gap-0.5` (2) between neighbours.
+ * `ZoneLabel` reserves at least this much on hover so the cluster never covers
+ * the header's cwd label; keep it in step with the classes below.
+ */
+export function hoverActionsSpanPx(buttons: number): number {
+  return 4 + 2 + 8 + buttons * 20 + Math.max(0, buttons - 1) * 2;
+}
+
 const EXPORT_FORMATS = ["text", "markdown", "json"] as const;
 type ExportFormat = (typeof EXPORT_FORMATS)[number];
 
@@ -65,7 +77,7 @@ export function ZoneHoverActions({
   inline,
 }: ZoneHoverActionsProps) {
   const session = useTerminalSession();
-  const { zoneLayout, closeTerminal, sessionStates } = session;
+  const { zoneLayout, closeTerminal, sessionStates, tabs } = session;
   const transitionEffects = useTransitionEffects();
   const { labelsAndTags } = useZoneMetadata();
   const { ownerOf } = useWindowAssignments();
@@ -79,6 +91,9 @@ export function ZoneHoverActions({
   const state = tabId ? (sessionStates[tabId] ?? "idle") : "idle";
   const canRestart = !!tabId && (state === "completed" || state === "error");
   const hasTab = !!tabId;
+  // Set only for a tab mirroring a session on ANOTHER device — it gets the
+  // "End on remote session" action beside close.
+  const remoteTab = tabId ? tabs.find((t) => t.id === tabId && !!t.remote) : undefined;
 
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [showLabelInput, setShowLabelInput] = useState(false);
@@ -383,6 +398,11 @@ export function ZoneHoverActions({
             </div>
           )}
         </div>
+
+        {/* End on remote — remote tabs only. Close keeps meaning DETACH (plan
+            `2026-09-30-close-remote-sessions-from-the-local-runner` D1); this
+            is the separate, named, confirmed action that ENDS the session. */}
+        {remoteTab && <RemoteTabEndAction tab={remoteTab} />}
 
         {/* Close — also the addressable dismiss for an in-zone exited
             tombstone. Stamped per-tab so automation can dismiss a specific
