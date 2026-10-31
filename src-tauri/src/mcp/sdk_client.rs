@@ -8815,9 +8815,11 @@ mod tests {
     }
 
     /// The four Phase 4 request fields reach the SDK on BOTH transports: the
-    /// handler's own forward, through the real transport selection.
-    #[tokio::test]
-    async fn execute_with_diff_forwards_the_phase_4_request_fields_on_both_transports() {
+    /// handler's own forward, through the real per-arm body split (which arm
+    /// a registered app takes is `app_dispatch`'s
+    /// `dispatch_sends_each_arm_its_own_body`).
+    #[test]
+    fn execute_with_diff_forwards_the_phase_4_request_fields_on_both_transports() {
         let body = serde_json::json!({
             "elementAction": { "elementId": "save", "action": "click" },
             "timeline": false,
@@ -8825,32 +8827,16 @@ mod tests {
             "expectStates": ["saved-toast"],
             "withinMs": 2000,
         });
-        let registry = AppRegistry::new();
-        registry
-            .upsert(
-                sample_discovered("wapp"),
-                None,
-                AppTransport::Websocket,
-                Some(1),
-                None,
-            )
-            .await;
-        registry
-            .upsert(
-                sample_discovered("happ"),
-                None,
-                AppTransport::Http,
-                None,
-                None,
-            )
-            .await;
-        for app in ["wapp", "happ"] {
+        for transport in [AppTransport::Websocket, AppTransport::Http] {
             let (ws, http) = execute_with_diff_forward(&body);
-            let sent = select_app_payload(&registry, app, ws, Some(http)).await;
+            let sent = split_arm_payloads(ws, Some(http)).for_transport(transport);
             for field in ["timeline", "timelineInterval", "expectStates", "withinMs"] {
-                assert_eq!(sent[field], body[field], "{app}: {field} was not forwarded");
+                assert_eq!(
+                    sent[field], body[field],
+                    "{transport:?}: {field} was not forwarded"
+                );
             }
-            assert_eq!(sent, body, "{app}: the body is forwarded whole");
+            assert_eq!(sent, body, "{transport:?}: the body is forwarded whole");
         }
     }
 }
