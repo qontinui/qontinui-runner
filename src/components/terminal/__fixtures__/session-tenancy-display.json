@@ -1,0 +1,762 @@
+[
+  {
+    "name": "regression_2026_10_17",
+    "tenancy": {
+      "coordRow": {
+        "reason": "terminal_plane_row_is_the_data_plane_leg",
+        "source": null,
+        "status": "not_applicable",
+        "tenantId": null
+      },
+      "credential": {
+        "posture": {
+          "canAnswer": null,
+          "reason": "no_posture_published",
+          "status": "unknown",
+          "value": null
+        },
+        "reason": null,
+        "slot": "tenant",
+        "status": "resolved",
+        "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"
+      },
+      "dataPlane": {
+        "reason": null,
+        "status": "owned",
+        "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"
+      },
+      "display": {
+        "actingInBoundSet": true,
+        "bound": {
+          "reason": null,
+          "status": "measured",
+          "tenantIds": [
+            "11111111-1111-4111-8111-111111111111",
+            "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333"
+          ]
+        },
+        "conflictDetail": null,
+        "conflicts": [],
+        "multiBound": true,
+        "reason": null,
+        "source": "credential",
+        "status": "resolved",
+        "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "tenantSlug": "qontinui"
+      },
+      "diverged": false,
+      "divergence": "agree",
+      "repoExpected": {
+        "callerNamedSource": null,
+        "callerNamedTenantId": null,
+        "observedAt": null,
+        "reason": null,
+        "repo": null,
+        "source": null,
+        "status": "not_read",
+        "tenantId": null,
+        "tenantIds": [],
+        "tenantSlug": null,
+        "verdict": null,
+        "verdictAt": null,
+        "verdictDetail": null
+      },
+      "row": {
+        "currentDeviceDefaultTenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "spawnDeviceDefaultReason": null,
+        "spawnDeviceDefaultStatus": "recorded",
+        "spawnDeviceDefaultTenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "tenantId": null
+      }
+    }
+  },
+  {
+    "name": "adopted_terminal_row",
+    "tenancy": {
+      "coordRow": {
+        "reason": "terminal_plane_row_is_the_data_plane_leg",
+        "source": null,
+        "status": "not_applicable",
+        "tenantId": null
+      },
+      "credential": {
+        "posture": {
+          "canAnswer": null,
+          "reason": "no_posture_published",
+          "status": "unknown",
+          "value": null
+        },
+        "reason": null,
+        "slot": "tenant",
+        "status": "resolved",
+        "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"
+      },
+      "dataPlane": {
+        "reason": null,
+        "status": "owned",
+        "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"
+      },
+      "display": {
+        "actingInBoundSet": true,
+        "bound": {
+          "reason": null,
+          "status": "measured",
+          "tenantIds": [
+            "11111111-1111-4111-8111-111111111111",
+            "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333"
+          ]
+        },
+        "conflictDetail": null,
+        "conflicts": [],
+        "multiBound": true,
+        "reason": null,
+        "source": "credential",
+        "status": "resolved",
+        "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "tenantSlug": "qontinui"
+      },
+      "diverged": false,
+      "divergence": "agree",
+      "repoExpected": {
+        "callerNamedSource": null,
+        "callerNamedTenantId": null,
+        "observedAt": null,
+        "reason": null,
+        "repo": null,
+        "source": null,
+        "status": "not_read",
+        "tenantId": null,
+        "tenantIds": [],
+        "tenantSlug": null,
+        "verdict": null,
+        "verdictAt": null,
+        "verdictDetail": null
+      },
+      "row": {
+        "currentDeviceDefaultTenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "spawnDeviceDefaultReason": null,
+        "spawnDeviceDefaultStatus": "recorded",
+        "spawnDeviceDefaultTenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "tenantId": null
+      }
+    }
+  },
+  {
+    "name": "resumed_unconfirmed_terminal_row",
+    "tenancy": {
+      "coordRow": {
+        "reason": "terminal_row_resume_unconfirmed",
+        "source": null,
+        "status": "unknown",
+        "tenantId": null
+      },
+      "credential": {
+        "posture": {
+          "canAnswer": null,
+          "reason": "no_posture_published",
+          "status": "unknown",
+          "value": null
+        },
+        "reason": null,
+        "slot": "tenant",
+        "status": "resolved",
+        "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"
+      },
+      "dataPlane": {
+        "reason": null,
+        "status": "owned",
+        "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"
+      },
+      "display": {
+        "actingInBoundSet": true,
+        "bound": {
+          "reason": null,
+          "status": "measured",
+          "tenantIds": [
+            "11111111-1111-4111-8111-111111111111",
+            "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333"
+          ]
+        },
+        "conflictDetail": null,
+        "conflicts": [],
+        "multiBound": true,
+        "reason": null,
+        "source": "credential",
+        "status": "resolved",
+        "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "tenantSlug": "qontinui"
+      },
+      "diverged": false,
+      "divergence": "unknown",
+      "repoExpected": {
+        "callerNamedSource": null,
+        "callerNamedTenantId": null,
+        "observedAt": null,
+        "reason": null,
+        "repo": null,
+        "source": null,
+        "status": "not_read",
+        "tenantId": null,
+        "tenantIds": [],
+        "tenantSlug": null,
+        "verdict": null,
+        "verdictAt": null,
+        "verdictDetail": null
+      },
+      "row": {
+        "currentDeviceDefaultTenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "spawnDeviceDefaultReason": null,
+        "spawnDeviceDefaultStatus": "recorded",
+        "spawnDeviceDefaultTenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "tenantId": null
+      }
+    }
+  },
+  {
+    "name": "resumed_observed_same_terminal_row",
+    "tenancy": {
+      "coordRow": {
+        "reason": "terminal_plane_row_is_the_data_plane_leg",
+        "source": null,
+        "status": "not_applicable",
+        "tenantId": null
+      },
+      "credential": {
+        "posture": {
+          "canAnswer": null,
+          "reason": "no_posture_published",
+          "status": "unknown",
+          "value": null
+        },
+        "reason": null,
+        "slot": "tenant",
+        "status": "resolved",
+        "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"
+      },
+      "dataPlane": {
+        "reason": null,
+        "status": "owned",
+        "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"
+      },
+      "display": {
+        "actingInBoundSet": true,
+        "bound": {
+          "reason": null,
+          "status": "measured",
+          "tenantIds": [
+            "11111111-1111-4111-8111-111111111111",
+            "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333"
+          ]
+        },
+        "conflictDetail": null,
+        "conflicts": [],
+        "multiBound": true,
+        "reason": null,
+        "source": "credential",
+        "status": "resolved",
+        "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "tenantSlug": "qontinui"
+      },
+      "diverged": false,
+      "divergence": "agree",
+      "repoExpected": {
+        "callerNamedSource": null,
+        "callerNamedTenantId": null,
+        "observedAt": null,
+        "reason": null,
+        "repo": null,
+        "source": null,
+        "status": "not_read",
+        "tenantId": null,
+        "tenantIds": [],
+        "tenantSlug": null,
+        "verdict": null,
+        "verdictAt": null,
+        "verdictDetail": null
+      },
+      "row": {
+        "currentDeviceDefaultTenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "spawnDeviceDefaultReason": null,
+        "spawnDeviceDefaultStatus": "recorded",
+        "spawnDeviceDefaultTenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "tenantId": null
+      }
+    }
+  },
+  {
+    "name": "resumed_observed_other_terminal_row",
+    "tenancy": {
+      "coordRow": {
+        "reason": null,
+        "source": "resume_probe",
+        "status": "registered",
+        "tenantId": "33333333-3333-4333-8333-333333333333"
+      },
+      "credential": {
+        "posture": {
+          "canAnswer": null,
+          "reason": "no_posture_published",
+          "status": "unknown",
+          "value": null
+        },
+        "reason": null,
+        "slot": "tenant",
+        "status": "resolved",
+        "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"
+      },
+      "dataPlane": {
+        "reason": null,
+        "status": "owned",
+        "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"
+      },
+      "display": {
+        "actingInBoundSet": true,
+        "bound": {
+          "reason": null,
+          "status": "measured",
+          "tenantIds": [
+            "11111111-1111-4111-8111-111111111111",
+            "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333"
+          ]
+        },
+        "conflictDetail": null,
+        "conflicts": [
+          {
+            "leg": "credential",
+            "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"
+          },
+          {
+            "leg": "data_plane",
+            "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"
+          },
+          {
+            "leg": "coord_row",
+            "tenantId": "33333333-3333-4333-8333-333333333333"
+          }
+        ],
+        "multiBound": true,
+        "reason": null,
+        "source": "credential",
+        "status": "mismatch",
+        "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "tenantSlug": null
+      },
+      "diverged": true,
+      "divergence": "diverged",
+      "repoExpected": {
+        "callerNamedSource": null,
+        "callerNamedTenantId": null,
+        "observedAt": null,
+        "reason": null,
+        "repo": null,
+        "source": null,
+        "status": "not_read",
+        "tenantId": null,
+        "tenantIds": [],
+        "tenantSlug": null,
+        "verdict": null,
+        "verdictAt": null,
+        "verdictDetail": null
+      },
+      "row": {
+        "currentDeviceDefaultTenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "spawnDeviceDefaultReason": null,
+        "spawnDeviceDefaultStatus": "recorded",
+        "spawnDeviceDefaultTenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "tenantId": null
+      }
+    }
+  },
+  {
+    "name": "adopted_non_terminal_row",
+    "tenancy": {
+      "coordRow": {
+        "reason": "adopted_row_tenant_not_observed",
+        "source": null,
+        "status": "unknown",
+        "tenantId": null
+      },
+      "credential": {
+        "posture": {
+          "canAnswer": null,
+          "reason": "no_posture_published",
+          "status": "unknown",
+          "value": null
+        },
+        "reason": null,
+        "slot": "tenant",
+        "status": "resolved",
+        "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"
+      },
+      "dataPlane": {
+        "reason": null,
+        "status": "owned",
+        "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"
+      },
+      "display": {
+        "actingInBoundSet": true,
+        "bound": {
+          "reason": null,
+          "status": "measured",
+          "tenantIds": [
+            "11111111-1111-4111-8111-111111111111",
+            "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333"
+          ]
+        },
+        "conflictDetail": null,
+        "conflicts": [],
+        "multiBound": true,
+        "reason": null,
+        "source": "credential",
+        "status": "resolved",
+        "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "tenantSlug": null
+      },
+      "diverged": false,
+      "divergence": "unknown",
+      "repoExpected": {
+        "callerNamedSource": null,
+        "callerNamedTenantId": null,
+        "observedAt": null,
+        "reason": null,
+        "repo": null,
+        "source": null,
+        "status": "not_read",
+        "tenantId": null,
+        "tenantIds": [],
+        "tenantSlug": null,
+        "verdict": null,
+        "verdictAt": null,
+        "verdictDetail": null
+      },
+      "row": {
+        "currentDeviceDefaultTenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "spawnDeviceDefaultReason": null,
+        "spawnDeviceDefaultStatus": "recorded",
+        "spawnDeviceDefaultTenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "tenantId": null
+      }
+    }
+  },
+  {
+    "name": "coord_row_mismatch",
+    "tenancy": {
+      "coordRow": {
+        "reason": null,
+        "source": "registrar",
+        "status": "registered",
+        "tenantId": "33333333-3333-4333-8333-333333333333"
+      },
+      "credential": {
+        "posture": {
+          "canAnswer": null,
+          "reason": "no_posture_published",
+          "status": "unknown",
+          "value": null
+        },
+        "reason": null,
+        "slot": "tenant",
+        "status": "resolved",
+        "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"
+      },
+      "dataPlane": {
+        "reason": null,
+        "status": "owned",
+        "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"
+      },
+      "display": {
+        "actingInBoundSet": true,
+        "bound": {
+          "reason": null,
+          "status": "measured",
+          "tenantIds": [
+            "11111111-1111-4111-8111-111111111111",
+            "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333"
+          ]
+        },
+        "conflictDetail": null,
+        "conflicts": [
+          {
+            "leg": "credential",
+            "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"
+          },
+          {
+            "leg": "data_plane",
+            "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"
+          },
+          {
+            "leg": "coord_row",
+            "tenantId": "33333333-3333-4333-8333-333333333333"
+          }
+        ],
+        "multiBound": true,
+        "reason": null,
+        "source": "credential",
+        "status": "mismatch",
+        "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "tenantSlug": null
+      },
+      "diverged": true,
+      "divergence": "diverged",
+      "repoExpected": {
+        "callerNamedSource": null,
+        "callerNamedTenantId": null,
+        "observedAt": null,
+        "reason": null,
+        "repo": null,
+        "source": null,
+        "status": "not_read",
+        "tenantId": null,
+        "tenantIds": [],
+        "tenantSlug": null,
+        "verdict": null,
+        "verdictAt": null,
+        "verdictDetail": null
+      },
+      "row": {
+        "currentDeviceDefaultTenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "spawnDeviceDefaultReason": null,
+        "spawnDeviceDefaultStatus": "recorded",
+        "spawnDeviceDefaultTenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "tenantId": null
+      }
+    }
+  },
+  {
+    "name": "unknown_no_nonce",
+    "tenancy": {
+      "coordRow": {
+        "reason": "not_registered_by_this_process",
+        "source": null,
+        "status": "unknown",
+        "tenantId": null
+      },
+      "credential": {
+        "posture": {
+          "canAnswer": null,
+          "reason": "credential_tenant_unknown",
+          "status": "unknown",
+          "value": null
+        },
+        "reason": "no_session_nonce",
+        "slot": null,
+        "status": "unknown",
+        "tenantId": null
+      },
+      "dataPlane": {
+        "reason": null,
+        "status": "unresolved",
+        "tenantId": null
+      },
+      "display": {
+        "actingInBoundSet": null,
+        "bound": {
+          "reason": "paired_user_unreadable",
+          "status": "unknown",
+          "tenantIds": []
+        },
+        "conflictDetail": null,
+        "conflicts": [],
+        "multiBound": null,
+        "reason": "no_session_nonce",
+        "source": null,
+        "status": "unknown",
+        "tenantId": null,
+        "tenantSlug": null
+      },
+      "diverged": false,
+      "divergence": "unknown",
+      "repoExpected": {
+        "callerNamedSource": null,
+        "callerNamedTenantId": null,
+        "observedAt": null,
+        "reason": null,
+        "repo": null,
+        "source": null,
+        "status": "not_read",
+        "tenantId": null,
+        "tenantIds": [],
+        "tenantSlug": null,
+        "verdict": null,
+        "verdictAt": null,
+        "verdictDetail": null
+      },
+      "row": {
+        "currentDeviceDefaultTenantId": null,
+        "spawnDeviceDefaultReason": "not_recorded",
+        "spawnDeviceDefaultStatus": "unknown",
+        "spawnDeviceDefaultTenantId": null,
+        "tenantId": null
+      }
+    }
+  },
+  {
+    "name": "mismatch_no_acting_tenant",
+    "tenancy": {
+      "coordRow": {
+        "reason": null,
+        "source": "registrar",
+        "status": "registered",
+        "tenantId": "33333333-3333-4333-8333-333333333333"
+      },
+      "credential": {
+        "posture": {
+          "canAnswer": null,
+          "reason": "credential_tenant_unknown",
+          "status": "unknown",
+          "value": null
+        },
+        "reason": "no_session_nonce",
+        "slot": null,
+        "status": "unknown",
+        "tenantId": null
+      },
+      "dataPlane": {
+        "reason": null,
+        "status": "unresolved",
+        "tenantId": null
+      },
+      "display": {
+        "actingInBoundSet": null,
+        "bound": {
+          "reason": null,
+          "status": "measured",
+          "tenantIds": [
+            "11111111-1111-4111-8111-111111111111",
+            "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333"
+          ]
+        },
+        "conflictDetail": null,
+        "conflicts": [
+          {
+            "leg": "spawn_device_default",
+            "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"
+          },
+          {
+            "leg": "coord_row",
+            "tenantId": "33333333-3333-4333-8333-333333333333"
+          }
+        ],
+        "multiBound": true,
+        "reason": "no_session_nonce",
+        "source": null,
+        "status": "mismatch",
+        "tenantId": null,
+        "tenantSlug": null
+      },
+      "diverged": true,
+      "divergence": "diverged",
+      "repoExpected": {
+        "callerNamedSource": null,
+        "callerNamedTenantId": null,
+        "observedAt": null,
+        "reason": null,
+        "repo": null,
+        "source": null,
+        "status": "not_read",
+        "tenantId": null,
+        "tenantIds": [],
+        "tenantSlug": null,
+        "verdict": null,
+        "verdictAt": null,
+        "verdictDetail": null
+      },
+      "row": {
+        "currentDeviceDefaultTenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "spawnDeviceDefaultReason": null,
+        "spawnDeviceDefaultStatus": "recorded",
+        "spawnDeviceDefaultTenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "tenantId": null
+      }
+    }
+  },
+  {
+    "name": "data_plane_credential_unknown",
+    "tenancy": {
+      "coordRow": {
+        "reason": "terminal_plane_row_is_the_data_plane_leg",
+        "source": null,
+        "status": "not_applicable",
+        "tenantId": null
+      },
+      "credential": {
+        "posture": {
+          "canAnswer": null,
+          "reason": "credential_tenant_unknown",
+          "status": "unknown",
+          "value": null
+        },
+        "reason": "nonce_not_live",
+        "slot": null,
+        "status": "unknown",
+        "tenantId": null
+      },
+      "dataPlane": {
+        "reason": null,
+        "status": "owned",
+        "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"
+      },
+      "display": {
+        "actingInBoundSet": true,
+        "bound": {
+          "reason": null,
+          "status": "measured",
+          "tenantIds": [
+            "11111111-1111-4111-8111-111111111111",
+            "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333"
+          ]
+        },
+        "conflictDetail": null,
+        "conflicts": [],
+        "multiBound": true,
+        "reason": "nonce_not_live",
+        "source": "data_plane",
+        "status": "resolved",
+        "tenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "tenantSlug": null
+      },
+      "diverged": false,
+      "divergence": "unknown",
+      "repoExpected": {
+        "callerNamedSource": null,
+        "callerNamedTenantId": null,
+        "observedAt": null,
+        "reason": null,
+        "repo": null,
+        "source": null,
+        "status": "not_read",
+        "tenantId": null,
+        "tenantIds": [],
+        "tenantSlug": null,
+        "verdict": null,
+        "verdictAt": null,
+        "verdictDetail": null
+      },
+      "row": {
+        "currentDeviceDefaultTenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "spawnDeviceDefaultReason": null,
+        "spawnDeviceDefaultStatus": "recorded",
+        "spawnDeviceDefaultTenantId": "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a",
+        "tenantId": null
+      }
+    }
+  }
+]

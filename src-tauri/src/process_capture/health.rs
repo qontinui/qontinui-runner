@@ -8,7 +8,7 @@ use crate::process_helpers::{run_probe, run_probe_quiet, ProbeOutcome};
 // ── Bounded external-tool budgets ────────────────────────────────────────────
 //
 // Every helper below shells out to an OS tool (`powershell`, `netstat`, `ss`,
-// `lsof`, `taskkill`, `kill`) from the per-managed-process health loop, i.e.
+// `lsof`, `kill`) from the per-managed-process health loop, i.e.
 // repeatedly and on a timer. Before the 2026-08-30 fix these were bare
 // `Command::output()` calls: a `powershell`/`lsof` that never returned parked
 // the calling thread forever, and since the loop re-fires per process per tick
@@ -22,7 +22,7 @@ use crate::process_helpers::{run_probe, run_probe_quiet, ProbeOutcome};
 /// an unresponsive mount) do not resolve with more waiting.
 const TABLE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Budget for a kill command (`taskkill`, `kill`, `Stop-Process`). Killing is
+/// Budget for a kill (the in-process tree kill, `kill`, `Stop-Process`). Killing is
 /// fast when it works at all; a kill that has not returned in 10s is not going
 /// to, and the caller's fallback path is better than a parked thread.
 const KILL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -426,9 +426,9 @@ exit 0
         return true;
     }
 
-    // Fallback: original netstat + taskkill path. Keeps us functional if
-    // PowerShell isn't on PATH for some reason. Adds /T so direct children
-    // die with the parent.
+    // Fallback: netstat + an in-process tree kill. Keeps us functional if
+    // PowerShell isn't on PATH for some reason; the tree kill takes direct
+    // children down with the parent.
     let mut netstat_cmd = crate::process_helpers::cmd_no_window();
     netstat_cmd.args([
         "/C",
@@ -453,16 +453,10 @@ exit 0
         if let Some(pid_str) = parts.last() {
             if let Ok(pid) = pid_str.parse::<u32>() {
                 if pid > 0 && seen.insert(pid) {
-                    let mut kill_cmd = crate::process_helpers::no_window("taskkill");
-                    kill_cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
-                    // `run_probe_quiet`: `taskkill /F /T /PID` exits 128 for a
-                    // pid that already went away between the netstat read and
-                    // here — a race we WANT to lose, not one to WARN about.
-                    let _ = run_probe_quiet(
-                        kill_cmd,
-                        KILL_TIMEOUT,
-                        "process_capture::health: taskkill",
-                    );
+                    // In-process tree kill. An `Err` is usually a pid that
+                    // already went away between the netstat read and here —
+                    // a race we WANT to lose, not one to WARN about.
+                    let _ = crate::tree_kill::kill_tree_by_pid_async(pid, KILL_TIMEOUT).await;
                     killed_any = true;
                 }
             }
