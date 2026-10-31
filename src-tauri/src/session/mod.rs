@@ -68,6 +68,7 @@ pub mod dual_write;
 pub mod handoff;
 pub mod intent;
 pub mod local_store;
+pub mod observation_epoch; // The last instant the liveness poll could SEE the process table — bounds open-row restore admission (plan 2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set, Phase 2)
 pub mod operator_touch; // Operator-touch idempotency-key + payload builder, shared by every B2 trigger (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)
 pub mod output_pipe;
 pub mod pane_store;
@@ -90,11 +91,12 @@ pub mod spawn_prompt; // The spawn-time system-prompt carrier: ONE composed file
                       // can read the same pin the proxy does — see the lib declaration for why.
                       // Re-exported here so every `crate::session::tenant_pin::…` path is unchanged.
 pub use qontinui_runner_lib::tenant_pin;
+pub mod finished_close; // The wind-down executor's `finished_close` arm: switch, cadence, candidates, published custody (plan 2026-10-03-finished-runner-sessions-close-their-window-without-a-drain)
 pub mod tracking_health;
 pub mod transcript_autobind; // The watcher binds EVERY transcript it sees to a coord session (plan 2026-10-06-closed-sessions-whose-work-is-unfinished-are-found-fleet-wide-and-resumed, Phase 1)
 pub mod transcript_emitter;
 pub mod transport;
-pub mod wind_down_executor; // The wind-down TICK — the only place a drain closes a session (plan 2026-09-13-drained-runner-never-reaches-idle, Phase 4)
+pub mod wind_down_executor; // The wind-down TICK — the only place that closes a session for wind-down, drained (plan 2026-09-13-drained-runner-never-reaches-idle, Phase 4) or finished (plan 2026-10-03-finished-runner-sessions-close-their-window-without-a-drain)
 pub mod wind_down_observer; // Wind-down eligibility observation — the one entry point readiness and the drain wind-down tick share (plan 2026-09-13-drained-runner-never-reaches-idle)
 pub mod workspace_tenant; // The workspace's own tenant declaration — tiers 1-3 of coord_mcp's authority order (plan 2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin, D1/Phase 1)
 
@@ -308,8 +310,9 @@ pub enum SessionEventKind {
     FindingPosted,
     /// Session FINISHED marker (plan
     /// `2026-09-01-session-finished-marker-and-unfinished-resume`, Phase 2).
-    /// Drained to `PATCH /sessions/:id {progress:{session_status:"finished"}}`
-    /// — the same door `Progress` uses, so the target is the URL path and the
+    /// Drained to `PATCH /sessions/:id {progress:{session_status:"finished",
+    /// last_progress_at}}` (the payload's `finished_at`, so coord dates the
+    /// finish at the mark rather than at the drain) — the same door `Progress` uses, so the target is the URL path and the
     /// peer-clobber trap in `coord_report_status` (which resolves an omitted
     /// `claude_code_session_id` to the device's most-recently-started session)
     /// does not apply to this rung.
@@ -512,6 +515,34 @@ struct SessionRecord {
     /// for the session's lifetime; aborted on close. `None` for the
     /// default (non-shared) session — zero overhead off the opt-in path.
     output_pipe: Option<tokio::task::JoinHandle<()>>,
+    /// What this process knows about the tenant coord's row for this record
+    /// carries — see [`RowTenant`]. Read by [`session_row_tenant`].
+    row_tenant: RowTenant,
+}
+
+/// What this process knows about the tenant of a session's coord row, as
+/// distinct from `intent.tenant_id` (the CURRENT stamp the data plane writes
+/// under, which [`session_tenant_scope`] reports).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowTenant {
+    /// The row was created FRESH from this record (`start_inner` /
+    /// `write_external_started`): this process AUTHORED the `Started` create
+    /// body, which names `intent.tenant_id`. That is what was SENT, not a coord
+    /// confirmation — nothing read the row back — so it says only that the
+    /// stamp and the create body are the same value.
+    Authored,
+    /// The record was RESUMED ([`SessionRegistry::resume_external`]) and coord's
+    /// 2xx answer to the resume probe's `PATCH /sessions/:id` — the row itself
+    /// (`SessionRow`) — named this `tenant_id`. Coord never updates a row's
+    /// tenant on a PATCH, so this is the tenant the row was created under. It
+    /// need not equal `intent.tenant_id`, which a resume re-stamps from the
+    /// CURRENT resolution.
+    Observed(Uuid),
+    /// The record was RESUMED and nothing observed the row's tenant: the probe
+    /// was unreachable or refused, or its 2xx body carried no parseable
+    /// `tenant_id`. The stamp is today's resolution; the row was created under
+    /// whatever resolved at its first registration.
+    Unobserved,
 }
 
 impl SessionRecord {
@@ -877,6 +908,21 @@ pub fn session_tenant_scope(session_id: Option<Uuid>) -> TenantScope {
     registry.tenant_scope_of(id)
 }
 
+/// What this process knows about the tenant of `session_id`'s coord row
+/// ([`RowTenant`]; [`TenantScope::Owned`] from [`session_tenant_scope`] is the
+/// CURRENT stamp, which for a resumed record need not be the row's). `None`
+/// when the registry is unreachable or does not hold the id. In-process only.
+///
+/// **Never call this while holding `SessionRegistry::sessions`** — same
+/// constraint as [`session_tenant_scope`].
+pub fn session_row_tenant(session_id: Option<Uuid>) -> Option<RowTenant> {
+    use tauri::Manager;
+    let id = session_id?;
+    let app = crate::tauri_app_handle::current()?;
+    let registry = app.try_state::<Arc<SessionRegistry>>()?;
+    registry.row_tenant_of(id)
+}
+
 impl SessionRegistry {
     pub fn new(
         machine_id: Uuid,
@@ -974,6 +1020,8 @@ impl SessionRegistry {
             transport: transport.clone(),
             transport_handle,
             output_pipe,
+            // A fresh `Started` row: this process authored its create body.
+            row_tenant: RowTenant::Authored,
         };
 
         // Outbox row first (durability before in-memory commit so a crash
@@ -1244,6 +1292,9 @@ impl SessionRegistry {
             // through this primitive). Phase 8 streaming only attaches to
             // sessions started via `start`/`start_with_parent`.
             output_pipe: None,
+            // A fresh `Started` row: this process authored its create body,
+            // which carries this tenant. Not a coord confirmation.
+            row_tenant: RowTenant::Authored,
         };
 
         let payload = json!({
@@ -1384,6 +1435,17 @@ impl SessionRegistry {
     ///   simply won't show it until the operator re-launches). A fresh POST
     ///   here would fail identically while coord is down, so re-using the
     ///   persisted id is the strictly-better choice (idempotent reconnect).
+    /// - **401 / 403** (coord refused the probe's credential) ->
+    ///   [`ResumeProbe::Refused`]: resumed exactly as the transient arm, but
+    ///   logged as a refusal, never as an outage.
+    ///
+    /// The resumed record's `intent.tenant_id` is re-stamped from the CURRENT
+    /// resolution and is NOT re-stamped from the row (that would change which
+    /// credential its writes use). What coord's row carries is recorded
+    /// separately (`SessionRecord::row_tenant`): [`RowTenant::Observed`] when
+    /// the 2xx answer — the row itself — named a `tenant_id`, else
+    /// [`RowTenant::Unobserved`]. The 404 fallback's fresh row is
+    /// [`RowTenant::Authored`].
     ///
     /// Returns the coord session id the pane should now persist (either the
     /// resumed `persisted_id` or the fresh fallback id).
@@ -1412,10 +1474,28 @@ impl SessionRegistry {
             .await;
 
         match probe {
-            ResumeProbe::Found => {
-                self.insert_resumed_record(persisted_id, intent);
+            ResumeProbe::Found(row_tenant) => {
+                match (row_tenant, intent.tenant_id) {
+                    (Some(row), Some(stamp)) if stamp != row => tracing::warn!(
+                        session = %persisted_id,
+                        row_tenant = %row,
+                        stamp = %stamp,
+                        "session: resumed coord row was created under a different tenant than \
+                         today's stamp — writes keep the stamp; session info shows the row's"
+                    ),
+                    (Some(row), None) => tracing::warn!(
+                        session = %persisted_id,
+                        row_tenant = %row,
+                        "session: resumed coord row names its tenant but today's stamp is \
+                         unresolved — session info shows the row's"
+                    ),
+                    _ => {}
+                }
+                let observed = row_tenant.map_or(RowTenant::Unobserved, RowTenant::Observed);
+                self.insert_resumed_record(persisted_id, intent, observed);
                 tracing::info!(
                     session = %persisted_id,
+                    row_tenant_observed = row_tenant.is_some(),
                     "session: resumed existing coord session (PATCH 2xx)"
                 );
                 Ok(persisted_id)
@@ -1430,10 +1510,25 @@ impl SessionRegistry {
             ResumeProbe::Unreachable => {
                 // Optimistic resume — coord is down, not the row. Re-use the
                 // persisted id so reconnect is idempotent.
-                self.insert_resumed_record(persisted_id, intent);
+                self.insert_resumed_record(persisted_id, intent, RowTenant::Unobserved);
                 tracing::warn!(
                     session = %persisted_id,
                     "session: coord unreachable during resume — resuming optimistically, drain loop will retry"
+                );
+                Ok(persisted_id)
+            }
+            ResumeProbe::Refused(status) => {
+                // Coord answered but refused the probe's credential (401/403).
+                // Resumption is unchanged — the same optimistic re-insert as
+                // `Unreachable`, so the pane keeps its row — but this is NOT a
+                // transient outage and is logged as what it is: nothing about
+                // the row, its existence or its tenant, was observed.
+                self.insert_resumed_record(persisted_id, intent, RowTenant::Unobserved);
+                tracing::warn!(
+                    session = %persisted_id,
+                    status,
+                    "session: coord REFUSED the resume probe's credential — resuming optimistically; \
+                     the row's existence and tenant are unconfirmed"
                 );
                 Ok(persisted_id)
             }
@@ -1445,7 +1540,12 @@ impl SessionRegistry {
     /// the drain loop reconciles coord. Mirrors [`Self::register_external`]'s
     /// record shape but reuses `persisted_id` and emits `StateChange`
     /// instead of `Started`.
-    fn insert_resumed_record(self: &Arc<Self>, persisted_id: Uuid, intent: Intent) {
+    fn insert_resumed_record(
+        self: &Arc<Self>,
+        persisted_id: Uuid,
+        intent: Intent,
+        row_tenant: RowTenant,
+    ) {
         let now = chrono::Utc::now();
         let claude_code_session_id = ambient_claude_code_session_id();
         let transport: DynTransport = Arc::new(transport::ExternalTransport);
@@ -1463,6 +1563,10 @@ impl SessionRegistry {
             transport,
             transport_handle: TransportHandle::External,
             output_pipe: None,
+            // A resumed row was created under whatever tenant resolved when it
+            // was FIRST registered; `intent.tenant_id` is today's resolution.
+            // Only coord's probe answer can name the row's (passed in).
+            row_tenant,
         };
 
         // Emit a state_change → PATCH so the drain loop re-activates the row
@@ -1694,6 +1798,17 @@ impl SessionRegistry {
             Ok(d) => TenantScope::for_session(d.intent.tenant_id),
             Err(_) => TenantScope::Unresolved,
         }
+    }
+
+    /// What this process knows about the tenant of `id`'s coord row — see
+    /// [`RowTenant`]. `None` for an id the registry does not hold. The
+    /// hermetically testable half of [`session_row_tenant`].
+    pub fn row_tenant_of(&self, id: Uuid) -> Option<RowTenant> {
+        self.sessions
+            .lock()
+            .expect("session registry poisoned")
+            .get(&id)
+            .map(|r| r.row_tenant)
     }
 
     /// Close-by-id — same idempotent semantics as

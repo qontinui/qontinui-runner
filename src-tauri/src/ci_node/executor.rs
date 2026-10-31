@@ -697,17 +697,20 @@ fn spawn_step_child(
     }
 }
 
-/// Kill a step's process tree. On Windows `taskkill /T` takes the whole
-/// tree (killing only the direct child would orphan cargo/node under a
-/// `cmd.exe` shim until Job-Object close); elsewhere `start_kill` suffices.
+/// Kill a step's process tree. On Windows the in-process tree kill takes the
+/// whole tree (killing only the direct child would orphan cargo/node under a
+/// `cmd.exe` shim until Job-Object close) without spawning a process;
+/// elsewhere `start_kill` suffices.
 async fn kill_step_tree(child: &mut tokio::process::Child) {
     #[cfg(target_os = "windows")]
     {
         if let Some(pid) = child.id() {
-            let _ = crate::process_helpers::tokio_no_window("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .output()
-                .await;
+            if let Err(e) =
+                crate::tree_kill::kill_tree_by_pid_async(pid, std::time::Duration::from_secs(5))
+                    .await
+            {
+                tracing::debug!("ci step tree kill of pid {pid}: {e}");
+            }
         }
     }
     let _ = child.start_kill();

@@ -1715,32 +1715,24 @@ mod tests {
 
     // ── AssertRequestStub: allowedAssertionTypes in hint ─────────────────────
 
+    use crate::mcp::ui_bridge::vision_routes;
+
     #[derive(Debug, serde::Deserialize)]
     struct AssertRequestStub {
         #[allow(dead_code)]
         assertions: Vec<serde_json::Value>,
     }
 
+    /// DELEGATES to the real `AssertRequest` hint rather than copying it, so
+    /// the envelope carries exactly what the route advertises and a DSL
+    /// variant is typed in once (`vision_routes` pins that list itself). The
+    /// stub exists only for its trivially-deserializable shape.
     impl RequestHints for AssertRequestStub {
         fn shape_error_suggestions() -> Option<Vec<String>> {
-            Some(vec![
-                "Required field: `assertions` (array of Assertion objects).".to_string(),
-                "Assertion `type` values: no_overlap, element_above, contains_text, \
-                 text_fits_container, aligned_horizontally, aligned_vertically, \
-                 color_within, typography_consistent, no_layout_shift_since, \
-                 no_clipping, animation_settled, contrast_meets_wcag."
-                    .to_string(),
-            ])
+            <vision_routes::AssertRequest as RequestHints>::shape_error_suggestions()
         }
         fn shape_error_data() -> Option<serde_json::Value> {
-            Some(serde_json::json!({
-                "allowedAssertionTypes": [
-                    "no_overlap", "element_above", "contains_text", "text_fits_container",
-                    "aligned_horizontally", "aligned_vertically", "color_within",
-                    "typography_consistent", "no_layout_shift_since", "no_clipping",
-                    "animation_settled", "contrast_meets_wcag"
-                ]
-            }))
+            <vision_routes::AssertRequest as RequestHints>::shape_error_data()
         }
     }
 
@@ -1767,12 +1759,17 @@ mod tests {
                 .any(|t| t.as_str() == Some("contrast_meets_wcag")),
             "contrast_meets_wcag must be in allowed types"
         );
-        // This stub DUPLICATES `AssertRequest`'s hint rather than deriving
-        // from it, so a variant added to the DSL has to be typed in twice.
-        // Pinning the newest one is what makes the duplication survivable.
+        // The stub delegates to `AssertRequest`'s hint, so the newest DSL
+        // variants reach the envelope with no second copy to update.
         assert!(
             types.iter().any(|t| t.as_str() == Some("element_above")),
             "element_above must be in allowed types"
+        );
+        assert!(
+            types
+                .iter()
+                .any(|t| t.as_str() == Some("image_blockiness_within")),
+            "the L1 image assertions must reach the envelope hint"
         );
     }
 
@@ -1784,18 +1781,14 @@ mod tests {
         analyzer: String,
     }
 
+    /// DELEGATES to the real `AnalyzeRequest` hint, for the same reason as
+    /// `AssertRequestStub` above.
     impl RequestHints for AnalyzeRequestStub {
         fn shape_error_suggestions() -> Option<Vec<String>> {
-            Some(vec![
-                "Required field: `analyzer` (one of: \"layout\", \"typography\", \
-                 \"color\", \"dynamic\", \"elements\")."
-                    .to_string(),
-            ])
+            <vision_routes::AnalyzeRequest as RequestHints>::shape_error_suggestions()
         }
         fn shape_error_data() -> Option<serde_json::Value> {
-            Some(serde_json::json!({
-                "allowedAnalyzers": ["layout", "typography", "color", "dynamic", "elements"]
-            }))
+            <vision_routes::AnalyzeRequest as RequestHints>::shape_error_data()
         }
     }
 
@@ -1812,10 +1805,14 @@ mod tests {
         let analyzers = hint["allowedAnalyzers"]
             .as_array()
             .expect("allowedAnalyzers");
-        assert_eq!(analyzers.len(), 5, "should expose all 5 analyzers");
+        assert_eq!(analyzers.len(), 6, "should expose all 6 analyzers");
         assert!(
             analyzers.iter().any(|a| a.as_str() == Some("layout")),
             "layout must be listed"
+        );
+        assert!(
+            analyzers.iter().any(|a| a.as_str() == Some("image")),
+            "image must be listed"
         );
     }
 
