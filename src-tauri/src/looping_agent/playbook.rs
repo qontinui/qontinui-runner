@@ -124,6 +124,11 @@ mod tests {
         // Core contract lines the loop depends on.
         assert!(MERGE_SHEPHERD_PLAYBOOK.contains("stateless per iteration"));
         assert!(MERGE_SHEPHERD_PLAYBOOK.contains("No admin merges, ever"));
+        // The PR claim that keeps the Shepherd and coord's own fixers off the
+        // same PR (mirrors the served playbook's v6 section).
+        assert!(MERGE_SHEPHERD_PLAYBOOK.contains("coord_adopt_pr"));
+        assert!(MERGE_SHEPHERD_PLAYBOOK.contains("One claim per change"));
+        assert!(MERGE_SHEPHERD_PLAYBOOK.contains("dispatch no Fixer"));
         assert!(playbook_for("merge-shepherd") == Some(MERGE_SHEPHERD_PLAYBOOK));
         assert!(playbook_for("no-such-playbook").is_none());
     }
