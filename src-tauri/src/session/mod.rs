@@ -2001,6 +2001,14 @@ impl SessionHandle {
     }
 
     /// Tear the session down. Idempotent.
+    ///
+    /// Test-only (plan `2026-10-28-one-session-lifecycle-authority`, Phase 14).
+    /// For a PTY-hosted session this reaches `TerminalManager::close` through
+    /// the session transport. The close-site roster (`runner_close_sites.txt`)
+    /// tracks every production path into [`SessionRegistry::close`] through
+    /// `close_by_id`. A production `handle.close()` would be a path it cannot
+    /// see, so outside tests this does not exist. Close by id instead.
+    #[cfg(test)]
     pub fn close(self) -> Result<(), SessionError> {
         self.registry.close(self.id)
     }
