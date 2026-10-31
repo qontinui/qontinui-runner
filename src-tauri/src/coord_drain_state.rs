@@ -42,6 +42,31 @@
 //! Operator-initiated spawns (the runner UI's own Tauri commands) always pass,
 //! whatever the state (D3): an operator sitting at the runner must never find
 //! their own "new terminal" button dead. The UI shows a draining banner instead.
+//!
+//! ## The dispatch role (a second, standing reason to defer)
+//!
+//! Coord serves the device's operator-chosen dispatch role BESIDE the drain on
+//! both reads, as `dispatch_role` (`workhorse` | `bench` | `ci_node`; plan
+//! `2026-10-02-fleet-machine-roles-workhorse-bench-ci-node`). A `bench` or
+//! `ci_node` role closes the AGENT lane: coord sends that machine no sessions.
+//! Coord enforces that on its own dispatch paths, but the runner's LOCAL
+//! autonomous paths (boot tab restore, AI-session boot resume, steward
+//! restart-after-drain, workflow auto-resume, looping agents, the scheduler)
+//! never pass through coord, so the runner closes them itself: every autonomous
+//! origin is deferred with [`DeferClass::RoleClosed`] while the last read role
+//! closes the agent lane.
+//!
+//! The role is deliberately NOT folded into [`CoordDrainState`]. `state` stays
+//! the drain's answer, so a role never triggers the drained-runner wind-down
+//! (coord's `DeviceDrainWire` makes the same split: the sessions an operator
+//! started at the box's own terminal are never governed). Operator origins pass
+//! as they do under a drain. The CI lane is untouched: CI jobs are not
+//! [`SpawnOrigin`]s and never reach this gate.
+//!
+//! An ABSENT role (an older coord, or coord's role read failing) or a role
+//! spelling this build does not know keeps today's behaviour: the drain alone
+//! decides. A read that serves the key replaces the cached role; a read that
+//! omits it (coord's failed role read, or any failed drain read) keeps it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
@@ -152,6 +177,47 @@ impl std::fmt::Display for SpawnOrigin {
     }
 }
 
+/// The operator-chosen kind of work coord sends this machine: coord's
+/// `DispatchRole` (`qontinui-coord` `dispatch_role.rs`), as served in the
+/// `dispatch_role` key beside the drain. See the module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DispatchRole {
+    /// Every lane open.
+    Workhorse,
+    /// No lane open: coord sends no CI and no sessions.
+    Bench,
+    /// CI only: the agent lane is closed.
+    CiNode,
+}
+
+impl DispatchRole {
+    /// Parse coord's wire spelling. `None` for a spelling this build does not
+    /// know, which the caller treats exactly like an absent role.
+    pub fn parse(s: &str) -> Option<DispatchRole> {
+        match s {
+            "workhorse" => Some(DispatchRole::Workhorse),
+            "bench" => Some(DispatchRole::Bench),
+            "ci_node" => Some(DispatchRole::CiNode),
+            _ => None,
+        }
+    }
+
+    /// Coord's wire spelling.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            DispatchRole::Workhorse => "workhorse",
+            DispatchRole::Bench => "bench",
+            DispatchRole::CiNode => "ci_node",
+        }
+    }
+
+    /// Whether this role closes the AGENT lane: coord's
+    /// `lane_open(role, DrainLane::Agent) == false`.
+    pub fn closes_agent_lane(self) -> bool {
+        matches!(self, DispatchRole::Bench | DispatchRole::CiNode)
+    }
+}
+
 /// Why the drain deferred a spawn: coord said `drained`, or the state is
 /// unknown. Carried on the deferral itself so every surface reporting it (a
 /// 409 body, a continuation stamp) names the class the DECISION saw, never a
@@ -160,6 +226,8 @@ impl std::fmt::Display for SpawnOrigin {
 pub enum DeferClass {
     Drained,
     Unknown,
+    /// The device's dispatch role closes the agent lane (`bench` / `ci_node`).
+    RoleClosed,
 }
 
 impl DeferClass {
@@ -168,14 +236,19 @@ impl DeferClass {
         match self {
             DeferClass::Drained => "device_drained",
             DeferClass::Unknown => "drain_unreadable",
+            // Coord's own refusal code for the same condition
+            // (`dispatch_role::ROLE_CLOSES_AGENT_LANE`).
+            DeferClass::RoleClosed => "role_closes_agent_lane",
         }
     }
 
-    /// The [`CoordDrainState::label`] of the state that deferred.
+    /// The [`CoordDrainState::label`] of the state that deferred, or
+    /// `role_closed` when the dispatch role did.
     pub fn label(self) -> &'static str {
         match self {
             DeferClass::Drained => "drained",
             DeferClass::Unknown => "unknown",
+            DeferClass::RoleClosed => "role_closed",
         }
     }
 }
@@ -196,10 +269,11 @@ impl DrainGate {
     }
 }
 
-/// The gate for `origin` against the CURRENT cached state. Cheap and
-/// synchronous; never performs I/O.
+/// The gate for `origin` against the CURRENT cached state and dispatch role.
+/// Cheap and synchronous; never performs I/O.
 pub fn drain_gate(origin: SpawnOrigin) -> DrainGate {
-    gate_for(&current(), origin)
+    let (state, role) = current_with_role();
+    gate_with_role_at(&state, role, origin, Utc::now())
 }
 
 /// [`drain_gate`], also recording a deferral of `work_key` so the banner's
@@ -296,6 +370,41 @@ pub fn gate_for_at(state: &CoordDrainState, origin: SpawnOrigin, now: DateTime<U
     }
 }
 
+/// PURE: the dispatch role's half of the gate. Defers an autonomous `origin`
+/// when `role` closes the agent lane; allows otherwise, including an absent
+/// (`None`) role, which keeps today's behaviour.
+pub fn role_gate(role: Option<DispatchRole>, origin: SpawnOrigin) -> DrainGate {
+    match role {
+        Some(role) if origin.is_autonomous() && role.closes_agent_lane() => DrainGate::Defer {
+            // Same shape as the drain reasons: the state, then ONE " — " tail
+            // carrying the promise, which `relay_create_drain_message` strips.
+            reason: format!(
+                "coord's dispatch role for this device is `{}`, which closes the agent \
+                 lane — the autonomous {origin} spawn is deferred and runs only if the \
+                 role changes",
+                role.as_wire()
+            ),
+            class: DeferClass::RoleClosed,
+        },
+        _ => DrainGate::Allow,
+    }
+}
+
+/// PURE: the full gate: the dispatch role, then the drain. The role is checked
+/// first because it is the standing fact (coord reports a role over a drain
+/// when both close a lane, for the same reason).
+pub fn gate_with_role_at(
+    state: &CoordDrainState,
+    role: Option<DispatchRole>,
+    origin: SpawnOrigin,
+    now: DateTime<Utc>,
+) -> DrainGate {
+    match role_gate(role, origin) {
+        DrainGate::Allow => gate_for_at(state, origin, now),
+        defer => defer,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -385,6 +494,51 @@ fn observation_from_wire(value: &serde_json::Value) -> DrainObservation {
             detail: format!("drain object did not parse: {e}"),
         },
     }
+}
+
+/// What one drain read said about the dispatch role.
+///
+/// Two different absences, kept apart because coord gives them different
+/// meanings (`qontinui-coord` `dispatch_role::device_drain_wire_from`): when
+/// coord's ROLE read succeeds it ALWAYS serves a role (`workhorse` for a
+/// machine with no row), and it omits the key only when that read FAILED,
+/// while still serving a readable drain `state`. So a missing key is a failed
+/// read of the role, never "the role is gone": it keeps the cached role. An
+/// older coord never sends the key, so its cached role stays `None` and
+/// today's behaviour holds exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServedRole {
+    /// The key is absent (or not a string, or the body did not parse): the
+    /// role was not read. Keeps the cached role.
+    NotServed,
+    /// The key is present: `Some` for a spelling this build knows, `None` for
+    /// one it does not (which, like an absent role, keeps today's behaviour).
+    Served(Option<DispatchRole>),
+}
+
+/// PURE: the `dispatch_role` key of a drain object.
+fn role_from_wire(value: &serde_json::Value) -> ServedRole {
+    match value.get("dispatch_role").and_then(|v| v.as_str()) {
+        Some(s) => ServedRole::Served(DispatchRole::parse(s)),
+        None => ServedRole::NotServed,
+    }
+}
+
+/// PURE: the dispatch role out of a `POST /coord/devices/register` response
+/// body (the `dispatch_role` key of its `drain` object).
+pub fn parse_register_role(body: &str) -> ServedRole {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|json| json.get("drain").map(role_from_wire))
+        .unwrap_or(ServedRole::NotServed)
+}
+
+/// PURE: the dispatch role out of a `GET /coord/devices/me/drain` 200 body.
+pub fn parse_me_drain_role(body: &str) -> ServedRole {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .map(|json| role_from_wire(&json))
+        .unwrap_or(ServedRole::NotServed)
 }
 
 /// PURE: the `drain` object out of a `POST /coord/devices/register` response
@@ -587,6 +741,9 @@ struct Inner {
     last_emitted: Option<CoordDrainState>,
     /// Whether any read (or failed read) has been folded since boot.
     folded_once: bool,
+    /// The dispatch role the last SUCCESSFUL read served. `None` when it served
+    /// none (or one this build does not know). Kept across failed reads.
+    dispatch_role: Option<DispatchRole>,
 }
 
 struct Global {
@@ -611,6 +768,7 @@ fn global() -> &'static Global {
                 deferred_capped: false,
                 last_emitted: None,
                 folded_once: false,
+                dispatch_role: None,
             }),
             tx,
             boot_read_done: tokio::sync::Notify::new(),
@@ -653,27 +811,56 @@ fn current_locked(inner: &Inner) -> CoordDrainState {
     )
 }
 
+/// Whether autonomous spawns run under `state` and `role` together.
+fn autonomous_allowed(state: &CoordDrainState, role: Option<DispatchRole>) -> bool {
+    state.allows_autonomous_spawns() && !role.is_some_and(DispatchRole::closes_agent_lane)
+}
+
+/// Whether autonomous spawns run right now: the drain AND the dispatch role.
+/// The edge detectors that replay deferred work use this rather than
+/// [`CoordDrainState::allows_autonomous_spawns`], which sees the drain alone.
+pub fn autonomous_spawns_allowed_now() -> bool {
+    let (state, role) = current_with_role();
+    autonomous_allowed(&state, role)
+}
+
+/// The dispatch role the last successful coord read served. Cheap and
+/// synchronous.
+pub fn current_dispatch_role() -> Option<DispatchRole> {
+    lock_inner().dispatch_role
+}
+
 /// The current state. Cheap and synchronous: one mutex, no I/O.
 pub fn current() -> CoordDrainState {
-    let (state, emit) = {
+    current_with_role().0
+}
+
+/// [`current`] and the cached dispatch role, read under ONE lock. A live gate
+/// must use this rather than `current()` followed by
+/// [`current_dispatch_role`]: a fold landing between two separate reads could
+/// pair a state from before it with a role from after it, and allow a spawn
+/// that neither reading allows.
+pub fn current_with_role() -> (CoordDrainState, Option<DispatchRole>) {
+    let (state, role, emit) = {
         let mut inner = lock_inner();
         let state = current_locked(&inner);
+        let role = inner.dispatch_role;
         let emit = inner.last_emitted.as_ref() != Some(&state) && inner.last_emitted.is_some();
         if emit {
             inner.last_emitted = Some(state.clone());
-            if state.allows_autonomous_spawns() {
+            if autonomous_allowed(&state, inner.dispatch_role) {
                 inner.deferred.clear();
                 inner.deferred_capped = false;
             }
         }
-        (state, emit)
+        (state, role, emit)
     };
     if emit {
         // A staleness flip observed by a reader, not by a fold.
         global().tx.send_replace(state.clone());
         emit_snapshot();
     }
-    state
+    (state, role)
 }
 
 /// Everything the UI and `/restart-readiness` render.
@@ -682,8 +869,15 @@ pub fn current() -> CoordDrainState {
 pub struct CoordDrainSnapshot {
     /// `clear` | `drained` | `unknown` | `not_enrolled`.
     pub state: &'static str,
-    /// Whether autonomous spawns run right now.
+    /// Whether autonomous spawns run right now: the drain AND the dispatch role
+    /// both allow them.
     pub autonomous_spawns_allowed: bool,
+    /// The dispatch role the last successful read served (`workhorse` |
+    /// `bench` | `ci_node`); `None` when coord served none.
+    pub dispatch_role: Option<&'static str>,
+    /// `true` when that role closes the agent lane, which defers every
+    /// autonomous spawn whatever `state` says.
+    pub agent_lane_closed_by_role: bool,
     pub until: Option<DateTime<Utc>>,
     pub reason: Option<String>,
     /// For `unknown`: since when.
@@ -721,7 +915,11 @@ fn snapshot_of(state: &CoordDrainState, inner: &Inner) -> CoordDrainSnapshot {
     };
     CoordDrainSnapshot {
         state: state.label(),
-        autonomous_spawns_allowed: state.allows_autonomous_spawns(),
+        autonomous_spawns_allowed: autonomous_allowed(state, inner.dispatch_role),
+        dispatch_role: inner.dispatch_role.map(DispatchRole::as_wire),
+        agent_lane_closed_by_role: inner
+            .dispatch_role
+            .is_some_and(DispatchRole::closes_agent_lane),
         until,
         reason,
         since,
@@ -749,8 +947,33 @@ pub fn snapshot_fixture(state: &CoordDrainState) -> CoordDrainSnapshot {
         deferred_capped: false,
         last_emitted: None,
         folded_once: true,
+        dispatch_role: None,
     };
     snapshot_of(state, &inner)
+}
+
+/// Put the process-global cache back to its boot state: no read folded, no
+/// role, `Unknown` "not read yet". For a test that drives the REAL fold path
+/// (`note_heartbeat`) and must not leave its reading behind for the rest of
+/// the test binary.
+#[cfg(test)]
+pub(crate) fn reset_global_for_test() {
+    let now = Utc::now();
+    let mut inner = lock_inner();
+    *inner = Inner {
+        tracker: DrainTracker::new(now),
+        last_fold: Instant::now(),
+        last_fold_at: now,
+        deferred: BTreeSet::new(),
+        deferred_capped: false,
+        last_emitted: None,
+        folded_once: false,
+        dispatch_role: None,
+    };
+    let state = current_locked(&inner);
+    drop(inner);
+    // A subscriber must not keep reading the test's state after the reset.
+    global().tx.send_replace(state);
 }
 
 /// The current snapshot.
@@ -775,19 +998,68 @@ fn emit_snapshot() {
     }
 }
 
+/// What a fold does to the cached dispatch role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoleUpdate {
+    /// A failed read: keep the role the last successful read served.
+    Keep,
+    /// A successful read: replace the role with what it served (`None` when it
+    /// served none).
+    Set(Option<DispatchRole>),
+}
+
+/// PURE: the role update one read implies. Only a read that SERVED the key
+/// replaces the cached role. A missing key is coord's failed role read (see
+/// [`ServedRole`]) and keeps it, so a `ci_node` box whose role read fails once
+/// stays closed rather than reopening every autonomous door until the next
+/// good read. A read whose drain object was absent or did not parse, or that
+/// coord answered `unreadable`, is not a successful read either and keeps it
+/// too; the drain itself folds to `Unknown` and defers either way.
+fn role_update_for(obs: &DrainObservation, role: ServedRole) -> RoleUpdate {
+    match (obs, role) {
+        (DrainObservation::Absent { .. } | DrainObservation::Unreadable, _) => RoleUpdate::Keep,
+        (_, ServedRole::NotServed) => RoleUpdate::Keep,
+        (_, ServedRole::Served(r)) => RoleUpdate::Set(r),
+    }
+}
+
+/// PURE: the role after `update`, and whether it changed.
+fn apply_role_update(
+    current: Option<DispatchRole>,
+    update: RoleUpdate,
+) -> (Option<DispatchRole>, bool) {
+    match update {
+        RoleUpdate::Set(next) if next != current => (next, true),
+        _ => (current, false),
+    }
+}
+
 /// Fold under the lock, then publish and emit outside it.
 fn fold(f: impl FnOnce(&mut DrainTracker, DateTime<Utc>) -> Transition) -> Transition {
+    fold_with_role(RoleUpdate::Keep, f)
+}
+
+/// [`fold`], also applying a dispatch-role update. A role change is a change:
+/// it publishes and emits like a state change, so a waiter re-checks its gate
+/// and the frontend re-runs a deferred restore.
+fn fold_with_role(
+    role: RoleUpdate,
+    f: impl FnOnce(&mut DrainTracker, DateTime<Utc>) -> Transition,
+) -> Transition {
     let now = Utc::now();
-    let (transition, state) = {
+    let (transition, state, role_changed, state_changed) = {
         let mut inner = lock_inner();
         let before = current_locked(&inner);
         let transition = f(&mut inner.tracker, now);
         inner.folded_once = true;
         inner.last_fold = Instant::now();
         inner.last_fold_at = now;
+        let (next_role, role_changed) = apply_role_update(inner.dispatch_role, role);
+        inner.dispatch_role = next_role;
         let after = current_locked(&inner);
-        let changed = transition.changed || before != after;
-        if after.allows_autonomous_spawns() {
+        let state_changed = transition.changed || before != after;
+        let changed = state_changed || role_changed;
+        if autonomous_allowed(&after, inner.dispatch_role) {
             inner.deferred.clear();
             inner.deferred_capped = false;
         }
@@ -800,10 +1072,19 @@ fn fold(f: impl FnOnce(&mut DrainTracker, DateTime<Utc>) -> Transition) -> Trans
                 entered_drained: transition.entered_drained,
             },
             after,
+            role_changed.then_some(next_role),
+            state_changed,
         )
     };
+    if let Some(role) = role_changed {
+        log_role(role);
+    }
     if transition.changed {
-        log_transition(&state);
+        // A role-only change still publishes and emits (waiters re-check),
+        // but the drain line is logged only when the drain itself moved.
+        if state_changed {
+            log_transition(&state);
+        }
         global().tx.send_replace(state);
         emit_snapshot();
     }
@@ -828,6 +1109,20 @@ fn log_transition(state: &CoordDrainState) {
     }
 }
 
+fn log_role(role: Option<DispatchRole>) {
+    match role {
+        Some(r) if r.closes_agent_lane() => warn!(
+            dispatch_role = r.as_wire(),
+            "coord_drain_state: dispatch role closes the agent lane; autonomous spawns are deferred"
+        ),
+        Some(r) => info!(
+            dispatch_role = r.as_wire(),
+            "coord_drain_state: dispatch role opens the agent lane"
+        ),
+        None => info!("coord_drain_state: coord served no dispatch role; the drain alone decides"),
+    }
+}
+
 /// Record that the autonomous `origin` work `key` was deferred by the drain.
 /// Idempotent per `(origin, key)`; cleared when autonomous spawns resume.
 ///
@@ -848,7 +1143,7 @@ fn log_transition(state: &CoordDrainState) {
 pub fn record_deferral(origin: SpawnOrigin, key: &str) {
     let emit = {
         let mut inner = lock_inner();
-        if current_locked(&inner).allows_autonomous_spawns() {
+        if autonomous_allowed(&current_locked(&inner), inner.dispatch_role) {
             false
         } else if inner.deferred.len() >= MAX_DEFERRED_KEYS {
             // At the cap. Flip the flag ONCE (that transition is worth an
@@ -1001,8 +1296,12 @@ pub fn api_refusal(reason: &str, class: DeferClass) -> crate::mcp::types::ApiRes
 /// What the heartbeat tick learned, handed to [`note_heartbeat`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeartbeatOutcome {
-    /// Coord accepted the register POST; its body's `drain` object.
-    Registered { drain: DrainObservation },
+    /// Coord accepted the register POST; its body's `drain` object and the
+    /// `dispatch_role` served inside it.
+    Registered {
+        drain: DrainObservation,
+        dispatch_role: ServedRole,
+    },
     /// No register POST was sent although this runner IS a coord device: a
     /// secondary instance (the primary owns the machine payload), or a device
     /// with no tenant binding yet. It still reads `me/drain` on its device JWT;
@@ -1096,7 +1395,7 @@ fn enrollment() -> Enrollment {
 }
 
 /// `GET {base}/coord/devices/me/drain` → an observation, or the failure cause.
-async fn read_me_drain(base: &str) -> Result<DrainObservation, String> {
+async fn read_me_drain(base: &str) -> Result<(DrainObservation, ServedRole), String> {
     let url = format!("{}/coord/devices/me/drain", base.trim_end_matches('/'));
     // A per-read client, like the heartbeat's: the caller may run on the
     // heartbeat's dedicated current-thread runtime, and a pooled connection
@@ -1118,37 +1417,46 @@ async fn read_me_drain(base: &str) -> Result<DrainObservation, String> {
         let excerpt: String = body.chars().take(200).collect();
         return Err(format!("GET {url} returned {status}: {excerpt}"));
     }
-    Ok(parse_me_drain_response(&body))
+    Ok((parse_me_drain_response(&body), parse_me_drain_role(&body)))
 }
 
 /// Fold one heartbeat tick's result. Reads `me/drain` when the tick shows a
 /// transition into `drained` (for `reason`), and on a secondary instance.
 pub async fn note_heartbeat(outcome: HeartbeatOutcome) {
     match outcome {
-        HeartbeatOutcome::Registered { drain } => {
-            let t = fold(|tr, now| tr.observe(drain, now));
+        HeartbeatOutcome::Registered {
+            drain,
+            dispatch_role,
+        } => {
+            let update = role_update_for(&drain, dispatch_role);
+            let t = fold_with_role(update, |tr, now| tr.observe(drain, now));
             if t.entered_drained {
                 refresh_reason().await;
             }
         }
         HeartbeatOutcome::NotSent { why } => match enrollment() {
             Enrollment::Enrolled(base) => match read_me_drain(&base).await {
-                Ok(obs) => {
-                    fold(|tr, now| tr.observe(obs, now));
+                Ok((obs, role)) => {
+                    let update = role_update_for(&obs, role);
+                    fold_with_role(update, |tr, now| tr.observe(obs, now));
                 }
                 Err(e) => {
                     fold(|tr, now| tr.miss(&format!("{why}; me/drain: {e}"), now));
                 }
             },
             Enrollment::NotEnrolled(not) => {
-                fold(|tr, now| tr.observe(DrainObservation::NotEnrolled { why: not }, now));
+                fold_with_role(RoleUpdate::Set(None), |tr, now| {
+                    tr.observe(DrainObservation::NotEnrolled { why: not }, now)
+                });
             }
             Enrollment::Indeterminate(cause) => {
                 fold(|tr, now| tr.miss(&format!("{why}; {cause}"), now));
             }
         },
         HeartbeatOutcome::NotEnrolled { why } => {
-            fold(|tr, now| tr.observe(DrainObservation::NotEnrolled { why }, now));
+            fold_with_role(RoleUpdate::Set(None), |tr, now| {
+                tr.observe(DrainObservation::NotEnrolled { why }, now)
+            });
         }
     }
 }
@@ -1165,8 +1473,9 @@ async fn refresh_reason() {
         return;
     };
     match read_me_drain(&base).await {
-        Ok(obs @ (DrainObservation::Drained { .. } | DrainObservation::Clear)) => {
-            fold(|tr, now| tr.observe(obs, now));
+        Ok((obs @ (DrainObservation::Drained { .. } | DrainObservation::Clear), role)) => {
+            let update = role_update_for(&obs, role);
+            fold_with_role(update, |tr, now| tr.observe(obs, now));
         }
         Ok(other) => debug!("coord_drain_state: me/drain reason read answered {other:?}; kept the heartbeat's state"),
         Err(e) => debug!("coord_drain_state: me/drain reason read failed ({e}); kept the heartbeat's state"),
@@ -1184,8 +1493,9 @@ pub async fn boot_read() {
     }
     match enrollment() {
         Enrollment::Enrolled(base) => match read_me_drain(&base).await {
-            Ok(obs) => {
-                fold(|tr, now| tr.observe(obs, now));
+            Ok((obs, role)) => {
+                let update = role_update_for(&obs, role);
+                fold_with_role(update, |tr, now| tr.observe(obs, now));
             }
             Err(e) => {
                 fold(|tr, now| tr.miss(&format!("boot read: {e}"), now));
@@ -1195,7 +1505,9 @@ pub async fn boot_read() {
             fold(|tr, now| tr.miss(&format!("boot read: {cause}"), now));
         }
         Enrollment::NotEnrolled(why) => {
-            fold(|tr, now| tr.observe(DrainObservation::NotEnrolled { why }, now));
+            fold_with_role(RoleUpdate::Set(None), |tr, now| {
+                tr.observe(DrainObservation::NotEnrolled { why }, now)
+            });
         }
     }
     g.boot_read_finished
@@ -1609,6 +1921,7 @@ mod tests {
             deferred_capped: false,
             last_emitted: None,
             folded_once: true,
+            dispatch_role: None,
         };
         let snap = snapshot_of(
             &CoordDrainState::Drained {
@@ -1725,5 +2038,300 @@ mod tests {
         // A stale slot (already past) does not hold anything back.
         let later = t0 + Duration::from_secs(60);
         assert_eq!(next_release_slot(later, Some(t0), spacing, jitter), later);
+    }
+
+    // -- Dispatch role ------------------------------------------------------
+
+    #[test]
+    fn dispatch_role_parses_coords_three_spellings_and_nothing_else() {
+        assert_eq!(
+            DispatchRole::parse("workhorse"),
+            Some(DispatchRole::Workhorse)
+        );
+        assert_eq!(DispatchRole::parse("bench"), Some(DispatchRole::Bench));
+        assert_eq!(DispatchRole::parse("ci_node"), Some(DispatchRole::CiNode));
+        assert_eq!(DispatchRole::parse("CI_NODE"), None);
+        assert_eq!(DispatchRole::parse("mystery"), None);
+        for r in [
+            DispatchRole::Workhorse,
+            DispatchRole::Bench,
+            DispatchRole::CiNode,
+        ] {
+            assert_eq!(DispatchRole::parse(r.as_wire()), Some(r));
+        }
+        assert!(!DispatchRole::Workhorse.closes_agent_lane());
+        assert!(DispatchRole::Bench.closes_agent_lane());
+        assert!(DispatchRole::CiNode.closes_agent_lane());
+    }
+
+    #[test]
+    fn the_role_is_read_from_both_wires_and_absence_or_an_unknown_spelling_is_none() {
+        // The me/drain answer coord serves a ci_node device with a clear drain.
+        assert_eq!(
+            parse_me_drain_role(r#"{"state":"clear","dispatch_role":"ci_node"}"#),
+            ServedRole::Served(Some(DispatchRole::CiNode))
+        );
+        assert_eq!(
+            parse_register_role(r#"{"drain":{"state":"clear","dispatch_role":"bench"}}"#),
+            ServedRole::Served(Some(DispatchRole::Bench))
+        );
+        // A missing key is a role that was NOT read, never "no role".
+        assert_eq!(
+            parse_me_drain_role(r#"{"state":"clear"}"#),
+            ServedRole::NotServed
+        );
+        assert_eq!(
+            parse_register_role(r#"{"drain":{"state":"clear"}}"#),
+            ServedRole::NotServed
+        );
+        assert_eq!(
+            parse_register_role(r#"{"drain":{"state":"clear","dispatch_role":7}}"#),
+            ServedRole::NotServed
+        );
+        // A served spelling this build does not know is served-but-unknown.
+        assert_eq!(
+            parse_register_role(r#"{"drain":{"state":"clear","dispatch_role":"mystery"}}"#),
+            ServedRole::Served(None)
+        );
+        assert_eq!(
+            parse_register_role(r#"{"dispatch_role":"ci_node"}"#),
+            ServedRole::NotServed,
+            "only the drain object's key counts on the register wire"
+        );
+        assert_eq!(parse_me_drain_role("not json"), ServedRole::NotServed);
+        // The role never changes how the drain itself parses.
+        assert_eq!(
+            parse_me_drain_response(r#"{"state":"clear","dispatch_role":"ci_node"}"#),
+            DrainObservation::Clear
+        );
+    }
+
+    /// The defect this exists for: coord answers `clear` + `ci_node`, and the
+    /// runner used to read only `clear` and let every autonomous path run.
+    #[test]
+    fn a_role_that_closes_the_agent_lane_defers_every_autonomous_origin_while_the_drain_is_clear() {
+        for role in [DispatchRole::CiNode, DispatchRole::Bench] {
+            for state in [
+                CoordDrainState::Clear,
+                CoordDrainState::NotEnrolled { why: "x" },
+            ] {
+                for o in SpawnOrigin::ALL {
+                    let g = gate_with_role_at(&state, Some(role), o, t0());
+                    if o.is_autonomous() {
+                        match g {
+                            DrainGate::Defer { reason, class } => {
+                                assert_eq!(class, DeferClass::RoleClosed, "{role:?} {o:?}");
+                                assert!(reason.contains(role.as_wire()), "{reason}");
+                            }
+                            DrainGate::Allow => panic!("{role:?} {state:?} allowed {o:?}"),
+                        }
+                    } else {
+                        assert_eq!(
+                            g,
+                            DrainGate::Allow,
+                            "{role:?} must not touch the operator's {o:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_role_reason_carries_exactly_one_promise_tail_like_the_drain_reasons() {
+        match role_gate(Some(DispatchRole::CiNode), SpawnOrigin::Unknown) {
+            DrainGate::Defer { reason, .. } => {
+                let (head, tail) = reason.rsplit_once(" — ").expect("a \" — \" tail");
+                assert!(
+                    head.contains("ci_node") && head.contains("agent lane"),
+                    "{head}"
+                );
+                assert!(tail.contains("runs only if the role changes"), "{tail}");
+                assert_eq!(reason.matches(" — ").count(), 1, "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_read_whose_drain_object_did_not_parse_keeps_the_role() {
+        use ServedRole::{NotServed, Served};
+        let ci = Some(DispatchRole::CiNode);
+        let absent = DrainObservation::Absent { detail: "x".into() };
+        assert_eq!(role_update_for(&absent, NotServed), RoleUpdate::Keep);
+        assert_eq!(role_update_for(&absent, Served(ci)), RoleUpdate::Keep);
+        assert_eq!(
+            role_update_for(&DrainObservation::Unreadable, Served(ci)),
+            RoleUpdate::Keep
+        );
+        assert_eq!(
+            role_update_for(&DrainObservation::Clear, Served(ci)),
+            RoleUpdate::Set(ci)
+        );
+        // Served, but a spelling this build does not know: today's behaviour.
+        assert_eq!(
+            role_update_for(&DrainObservation::Clear, Served(None)),
+            RoleUpdate::Set(None)
+        );
+        assert_eq!(
+            role_update_for(
+                &DrainObservation::Drained {
+                    until: None,
+                    reason: None
+                },
+                Served(Some(DispatchRole::Bench))
+            ),
+            RoleUpdate::Set(Some(DispatchRole::Bench))
+        );
+    }
+
+    /// Review S1: coord omits `dispatch_role` exactly when its ROLE read
+    /// failed, and still serves a readable `clear`. That must not reopen the
+    /// agent lane on a `ci_node` box: the cached role is kept.
+    #[test]
+    fn a_readable_drain_that_omits_the_role_keeps_a_closing_role() {
+        let ci = Some(DispatchRole::CiNode);
+        let update = role_update_for(
+            &DrainObservation::Clear,
+            parse_me_drain_role(r#"{"state":"clear"}"#),
+        );
+        assert_eq!(update, RoleUpdate::Keep);
+        assert_eq!(apply_role_update(ci, update), (ci, false));
+        // The next read that serves the key does replace it.
+        let reopened = role_update_for(
+            &DrainObservation::Clear,
+            parse_me_drain_role(r#"{"state":"clear","dispatch_role":"workhorse"}"#),
+        );
+        assert_eq!(
+            apply_role_update(ci, reopened),
+            (Some(DispatchRole::Workhorse), true)
+        );
+    }
+
+    #[test]
+    fn an_absent_or_open_role_keeps_todays_behaviour_exactly() {
+        let drained = CoordDrainState::Drained {
+            until: None,
+            reason: Some("rebuild".into()),
+        };
+        let unknown = CoordDrainState::Unknown {
+            since: t0(),
+            cause: "x".into(),
+        };
+        for role in [None, Some(DispatchRole::Workhorse)] {
+            for state in [
+                CoordDrainState::Clear,
+                CoordDrainState::NotEnrolled { why: "x" },
+                drained.clone(),
+                unknown.clone(),
+            ] {
+                for o in SpawnOrigin::ALL {
+                    assert_eq!(
+                        gate_with_role_at(&state, role, o, t0()),
+                        gate_for_at(&state, o, t0()),
+                        "{role:?} {state:?} {o:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_role_is_reported_over_a_drain_when_both_close() {
+        let drained = CoordDrainState::Drained {
+            until: None,
+            reason: None,
+        };
+        match gate_with_role_at(
+            &drained,
+            Some(DispatchRole::CiNode),
+            SpawnOrigin::Steward,
+            t0(),
+        ) {
+            DrainGate::Defer { class, .. } => assert_eq!(class, DeferClass::RoleClosed),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(DeferClass::RoleClosed.code(), "role_closes_agent_lane");
+        assert_eq!(DeferClass::RoleClosed.label(), "role_closed");
+    }
+
+    #[test]
+    fn a_failed_read_keeps_the_role_and_a_successful_read_replaces_it() {
+        let ci = Some(DispatchRole::CiNode);
+        assert_eq!(apply_role_update(ci, RoleUpdate::Keep), (ci, false));
+        assert_eq!(apply_role_update(ci, RoleUpdate::Set(ci)), (ci, false));
+        assert_eq!(apply_role_update(None, RoleUpdate::Set(ci)), (ci, true));
+        // A served role this build does not know: today's behaviour.
+        assert_eq!(apply_role_update(ci, RoleUpdate::Set(None)), (None, true));
+    }
+
+    #[test]
+    fn the_snapshot_says_autonomous_spawns_are_off_under_a_closing_role() {
+        let mut inner = Inner {
+            tracker: DrainTracker::new(DateTime::<Utc>::UNIX_EPOCH),
+            last_fold: Instant::now(),
+            last_fold_at: DateTime::<Utc>::UNIX_EPOCH,
+            deferred: BTreeSet::new(),
+            deferred_capped: false,
+            last_emitted: None,
+            folded_once: true,
+            dispatch_role: Some(DispatchRole::CiNode),
+        };
+        let snap = snapshot_of(&CoordDrainState::Clear, &inner);
+        assert_eq!(
+            snap.state, "clear",
+            "the role never rewrites the drain state"
+        );
+        assert!(!snap.autonomous_spawns_allowed);
+        assert!(snap.agent_lane_closed_by_role);
+        assert_eq!(snap.dispatch_role, Some("ci_node"));
+
+        inner.dispatch_role = None;
+        let snap = snapshot_of(&CoordDrainState::Clear, &inner);
+        assert!(snap.autonomous_spawns_allowed);
+        assert!(!snap.agent_lane_closed_by_role);
+        assert_eq!(snap.dispatch_role, None);
+    }
+
+    /// The other half of what a `ci_node` box needs: the role closes the AGENT
+    /// lane only, so coord-dispatched CI builds keep running. They do because
+    /// the CI-node lane (`src/ci_node/`) never consults this gate or the spawn
+    /// authorization at all. A tripwire on DIRECT references only (a helper
+    /// elsewhere that gates internally would not trip it): a CI lane that
+    /// started asking the drain gate would be closed by `ci_node`, the very
+    /// role that exists to run it.
+    #[test]
+    fn the_ci_node_lane_never_consults_the_agent_lane_gate() {
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read ci_node dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ci_node");
+        let mut files = Vec::new();
+        rs_files(&root, &mut files);
+        assert!(files.len() >= 5, "found only {files:?} under {root:?}");
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("read ci_node source");
+            for needle in [
+                "coord_drain_state",
+                "agent_authorization",
+                "drain_gate",
+                "authorize_spawn",
+                "SpawnOrigin",
+            ] {
+                assert!(
+                    !text.contains(needle),
+                    "{} references `{needle}`: the CI-node lane must stay outside the \
+                     agent-lane gate, or a `ci_node` dispatch role closes CI too",
+                    file.display()
+                );
+            }
+        }
     }
 }
