@@ -41,10 +41,17 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
     GIT_REFLOG_ACTION
 # The resolution reads these; an exported one would decide the cases below
 # instead of the fixture.
-unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR QONTINUI_PREPUSH_CARGO_GUARD QONTINUI_ROOT
+unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR QONTINUI_PREPUSH_CARGO_GUARD QONTINUI_ROOT \
+    QONTINUI_PREPUSH_TREE_GUARD_LIB_DIR QONTINUI_PREPUSH_TREE_LOCK_MAX_WAIT \
+    CARGO_VERIFY_TREE_LOCK_HELD CARGO_VERIFY_TREE_LOCK_PROOF \
+    CARGO_VERIFY_TREE_LOCK_MAX_WAIT CARGO_VERIFY_TREE_LOCK_MODE
+# The guard's "taking the tree lock" notice goes to /dev/tty; keep it off the
+# developer's terminal.
+export QONTINUI_PREPUSH_NO_TTY=1
 
 PASS=0
 FAIL=0
+SKIP=0
 FIXTURE_ROOTS=()
 cleanup() {
     local root
@@ -90,6 +97,9 @@ wt_fixture() {
     git -C "$PRIMARY" config user.email t@example.com
     git -C "$PRIMARY" config user.name t
     git -C "$PRIMARY" config core.hooksPath "$PRIMARY/.git/no-hooks"
+    # The real-library arm measures tree identity with `git diff`; a global
+    # autocrlf would only add a line-ending warning to its output.
+    git -C "$PRIMARY" config core.autocrlf false
     printf '// base\n' > "$PRIMARY/lib.rs"
     git -C "$PRIMARY" add -A >/dev/null
     git -C "$PRIMARY" commit --quiet -m base
@@ -260,6 +270,149 @@ else
     fail_note "gen-events-drift.sh does not set QONTINUI_SCHEMAS_JSON — the shared target is a collision point"
 fi
 
+if grep -q 'guard_shared_target "\$RUNNER_DIR" "\[gen-events-drift\]"' "$HOOK"; then
+    pass_note "and builds under the tree lock (guard_shared_target for \$RUNNER_DIR)"
+else
+    fail_note "gen-events-drift.sh does not call guard_shared_target for \$RUNNER_DIR — its release build is unguarded"
+fi
+if grep -A3 '^cleanup() {' "$HOOK" | grep -q 'release_shared_target'; then
+    pass_note "and releases the lock from its EXIT cleanup"
+else
+    fail_note "gen-events-drift.sh's EXIT cleanup does not call release_shared_target — the lock outlives the hook"
+fi
+if grep -q 'generate_types.sh --ts-only .*9>&-' "$HOOK"; then
+    pass_note "and closes the lock's descriptor for the build child"
+else
+    fail_note "gen-events-drift.sh hands fd 9 (the tree lock) to the generate_types.sh child"
+fi
+if grep -A8 'guard_shared_target "\$RUNNER_DIR"' "$HOOK" | grep -q 'cannot_evaluate'; then
+    pass_note "and declines (cannot_evaluate) rather than building unguarded when the guard fails"
+else
+    fail_note "gen-events-drift.sh does not decline when the guard cannot be taken"
+fi
+
+echo "  -- the guard asks cargo which target it builds into --"
+
+# cargo's JSON escapes each backslash in target_directory. Where `cygpath`
+# exists (Git Bash) it would repair a doubled one by itself and hide a broken
+# un-escape, so this arm runs only where it does not, and says so otherwise.
+if command -v cygpath >/dev/null 2>&1; then
+    printf '  SKIP JSON un-escape arm: cygpath is on PATH and would mask a broken un-escape\n'
+    SKIP=$((SKIP + 1))
+else
+    # Every backslash is made by `printf '\134'` (octal 134 = one backslash),
+    # never typed, so no quoting layer can double- or half-count it: the JSON
+    # carries exactly TWO (an escaped one) and the answer must carry ONE.
+    BS="$(printf '\134')"
+    got="$(BS="$BS" bash -c '
+        . "$1"
+        cargo() { printf "{\"packages\":[],\"target_directory\":\"/t/a%s%sb\",\"version\":1}" "$BS" "$BS"; }
+        _shared_target_dir_of . && printf "%s" "$_SHARED_TARGET_DIR"
+    ' _ "$LIB")"
+    check "a JSON-escaped backslash in target_directory is un-escaped once" "/t/a${BS}b" "$got"
+fi
+got="$(bash -c '
+    . "$1"
+    cargo() { echo "warning: unused manifest key: x" >&2; echo "error: could not find Cargo.toml" >&2; return 101; }
+    _shared_target_dir_of . ; printf "rc=%s err=%s" "$?" "$_SHARED_TARGET_META_ERR"
+' _ "$LIB")"
+check "a cargo metadata failure returns 1 and keeps cargo's own first error line" \
+    "rc=1 err=error: could not find Cargo.toml" "$got"
+
+echo "  -- the REAL tree-lock library: W2 after W1 re-judges W2's tree --"
+
+# The stub-library arms in push-range-test.sh pin the hook's WIRING. This one
+# pins the CONTRACT the wiring relies on, against the real
+# qontinui-claude-config/scripts/lib/cargo-tree-freshness.sh: two checkouts of
+# one repo share a target; a guarded build from W1, then from W2, must leave
+# the ledger naming W2, W2's files touched (so cargo re-judges THIS tree rather
+# than replaying W1's units as Fresh), and no lock or holder behind. A library
+# whose return codes or ledger change meaning would turn this red.
+#
+# Found beside the checkout running this suite, the way the hooks find it. On a
+# machine without qontinui-claude-config this SKIPS and says so — never a pass.
+REAL_LIB=""
+if common="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+    cand="$(dirname "$(dirname "$common")")/qontinui-claude-config/scripts/lib"
+    if [ -r "$cand/cargo-tree-freshness.sh" ] && [ -r "$cand/tree-identity.sh" ]; then
+        REAL_LIB="$cand"
+    fi
+fi
+
+if [ -z "$REAL_LIB" ]; then
+    printf '  SKIP real-library arm: no qontinui-claude-config/scripts/lib/cargo-tree-freshness.sh beside this checkout\n'
+    SKIP=$((SKIP + 1))
+else
+    wt_fixture
+    W1="$WT"
+    W2="$(dirname "$WT")/wt2"
+    if ! git -C "$PRIMARY" worktree add --quiet -b wt2-branch "$W2" >/dev/null 2>&1 || [ ! -f "$W2/lib.rs" ]; then
+        printf '  FATAL could not create the second worktree %s for the real-library arm\n' "$W2" >&2
+        exit 1
+    fi
+    REAL_SHIM="$(dirname "$WT")/real-bin"
+    mkdir -p "$REAL_SHIM"
+    cat > "$REAL_SHIM/cargo" <<'SHIM'
+#!/usr/bin/env bash
+[ "${1:-}" = metadata ] && printf '{"packages":[],"target_directory":"%s","version":1}\n' "$CARGO_TARGET_DIR"
+exit 0
+SHIM
+    chmod +x "$REAL_SHIM/cargo"
+
+    # Under `set -euo pipefail`, as both hooks run — the libraries were written
+    # for a caller without `-e`, so this is part of what is under test.
+    guard_real() {
+        local root
+        root="$(git -C "$1" rev-parse --show-toplevel)"
+        ( cd "$1" && PATH="$REAL_SHIM:$PATH" CARGO_TARGET_DIR="$SHARED_TARGET" \
+            QONTINUI_PREPUSH_TREE_GUARD_LIB_DIR="$REAL_LIB" bash -c '
+                set -euo pipefail
+                . "$1"
+                rc=0
+                guard_shared_target "$2" "[t]" || rc=$?
+                echo "guard_rc=$rc"
+                release_shared_target
+            ' _ "$LIB" "$root" ) 2>&1
+    }
+
+    out1="$(guard_real "$W1")"
+    case "$out1" in
+        *"guard_rc=0"*) pass_note "real library: W1 is guarded (rc 0)" ;;
+        *) fail_note "real library: W1 expected rc 0, got: $out1" ;;
+    esac
+
+    SENTINEL="$(dirname "$WT")/sentinel"
+    : > "$SENTINEL"
+    sleep 1
+    out2="$(guard_real "$W2")"
+    case "$out2" in
+        *"guard_rc=0"*) pass_note "real library: W2 is guarded (rc 0)" ;;
+        *) fail_note "real library: W2 expected rc 0, got: $out2" ;;
+    esac
+    case "$out2" in
+        *"tree-freshness: this target was last built from"*"touched"*)
+            pass_note "real library: W2 after W1 TOUCHES W2's tree" ;;
+        *) fail_note "real library: expected a touch line for W2, got: $out2" ;;
+    esac
+    check "real library: the ledger now names W2" "root=$(cd "$W2" && pwd -P)" \
+        "$(head -1 "$SHARED_TARGET/.cargo-verify/last-tree" 2>/dev/null | sed 's/ head=.*//')"
+    check "real library: W2's tracked files are newer than the pre-guard sentinel" "yes" \
+        "$([ "$W2/lib.rs" -nt "$SENTINEL" ] && echo yes || echo no)"
+    check "real library: W1's files are NOT touched by W2's guard" "no" \
+        "$([ "$W1/lib.rs" -nt "$SENTINEL" ] && echo yes || echo no)"
+    check "real library: no holder record is left behind" "no" \
+        "$([ -e "$SHARED_TARGET/.cargo-verify/holder" ] && echo yes || echo no)"
+    check "real library: no mkdir lock is left behind" "no" \
+        "$([ -e "$SHARED_TARGET/.cargo-verify/tree.lockdir" ] && echo yes || echo no)"
+
+    out3="$(guard_real "$W2")"
+    case "$out3" in
+        *"guard_rc=0"*"same tree"*|*"same tree"*"guard_rc=0"*)
+            pass_note "real library: a second W2 build is the same tree — no touch" ;;
+        *) fail_note "real library: expected 'same tree' on W2's second build, got: $out3" ;;
+    esac
+fi
+
 echo
-printf '%d passed, %d failed\n' "$PASS" "$FAIL"
+printf '%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
 [ "$FAIL" -eq 0 ]

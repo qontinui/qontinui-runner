@@ -292,6 +292,46 @@ export function pickLayout(totalTabs: number): string {
 }
 
 /**
+ * The default layout for exactly `count` windows — what `/layout <n>` (and the
+ * `select-layout` UI Bridge action given a number) applies. It lets a caller
+ * that knows how many sessions a page holds trim the grid to fit them without
+ * knowing preset names, which is how the session-triage command shrinks a page
+ * after closing finished sessions.
+ *
+ * Mapping: 1→single, 2→split, 3→triptych, 4→quad, 5-6→six-pack,
+ * 7-9→full-grid, ≥10→flow-grid. It is {@link pickLayout} except at 3: a count
+ * names a window count, and `triptych` is the preset with exactly three, while
+ * the grow path wants the 2×2 so a fourth tab needs no re-flow. The other
+ * asymmetric presets (1-plus-4, command-center) are never a count's default.
+ */
+export function layoutForCount(count: number): string {
+  if (count === 3) return "triptych";
+  return pickLayout(count);
+}
+
+/**
+ * Resolve an operator- or agent-supplied layout argument to a layout id, or
+ * `null` when it names none. Accepts every preset id, the synthesized
+ * {@link FLOW_GRID_ID}, the unhyphenated spellings (`sixpack`, `fullgrid`,
+ * `flowgrid`), and a positive window count, which resolves through
+ * {@link layoutForCount}. ONE resolver for `/layout` and `select-layout`, so the
+ * command bar and the bridge cannot accept different sets.
+ */
+export function resolveLayoutArg(raw: string): string | null {
+  const arg = raw.trim().toLowerCase();
+  if (/^\d+$/.test(arg)) {
+    const count = Number(arg);
+    return count >= 1 ? layoutForCount(count) : null;
+  }
+  const id = arg
+    .replace(/^sixpack$/, "six-pack")
+    .replace(/^fullgrid$/, "full-grid")
+    .replace(/^flowgrid$/, "flow-grid");
+  if (id === FLOW_GRID_ID || LAYOUT_PRESETS.some((p) => p.id === id)) return id;
+  return null;
+}
+
+/**
  * Decide whether the layout must GROW to fit `tabCount` live tabs, returning the
  * target layout id or `null` when no change is needed. Pure reducer behind the
  * in-hook auto-grow effect.

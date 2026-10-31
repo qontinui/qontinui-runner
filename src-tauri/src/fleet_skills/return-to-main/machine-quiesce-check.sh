@@ -30,7 +30,10 @@
 #   supervisor_builds    GET 127.0.0.1:9875/builds; refused -> not_applicable
 #   cargo_guard_lock     <root>/*/.build-state/locks/cargo.lockdir mtime
 #                        (fresh = touched within $CARGO_GUARD_LOCK_STALE_AFTER,
-#                        default 120 s); none present -> not_applicable
+#                        default 120 s); none present -> not_applicable; a
+#                        STALE_AFTER cargo-guard.sh refuses (lock-config-
+#                        invalid: not digits, a leading zero, over 9
+#                        digits, or not above the heartbeat) -> unknown
 #   coord_sessions       coord GET /coord/sessions/fleet?device_id=<this device>
 #                        -- `active` rows other than this job's own
 #   custody              <repo>/.git/qontinui-custody.d/*.json `last_seen`
@@ -476,6 +479,14 @@ def cmd_proxy(mcp_json, hdr_out):
             lines.append("%s: %s\n" % (k, v))
     with open(hdr_out, "w") as fh:
         fh.write("".join(lines))
+        # The transport-rung declaration, set EXPLICITLY (check #89): this
+        # reader enumerates the whole headers block, and a runner that writes a
+        # declaration INTO that block (the http arm's `native_mcp`) must never
+        # have it ride along on a call this script makes over the loopback door.
+        # Only beside a credential: an EMPTY file is how a refused nonce falls
+        # through to the bootstrap, so a lone declaration must not fill it.
+        if lines:
+            fh.write("x-qontinui-transport: loopback_proxy\n")
     print(str(srv["url"]).rstrip("/"))
 
 
@@ -1066,11 +1077,26 @@ def cmd_final(work, census_path, census_rc, root, root_native, self_sid, device_
         probe("supervisor_builds", "unknown", "supervisor /builds: %s" % st)
 
     # ---- cargo-guard lock ---------------------------------------------------
-    stale_after = int(os.environ.get("CARGO_GUARD_LOCK_STALE_AFTER") or 120)
+    # Read the knobs by cargo-guard.sh's own rules (its LOCK_HEARTBEAT_INTERVAL
+    # case and acquire_build_lock's lock-config-invalid check): a heartbeat that
+    # is not 1-9999 falls back to 30; a STALE_AFTER that is not digits, has a
+    # leading zero, runs past 9 digits, or is not above the heartbeat is one
+    # cargo-guard refuses -- read here it would count a LIVE lock as stale
+    # (negative, or between two heartbeats) and discount it into quiet.
+    hb = os.environ.get("CARGO_GUARD_LOCK_HEARTBEAT_INTERVAL") or "30"
+    hb = int(hb) if re.fullmatch(r"[1-9][0-9]{0,3}", hb) else 30
+    stale_raw = os.environ.get("CARGO_GUARD_LOCK_STALE_AFTER") or "120"
+    stale_ok = re.fullmatch(r"[1-9][0-9]{0,8}", stale_raw) is not None and int(stale_raw) > hb
+    stale_after = int(stale_raw) if stale_ok else 0
     locks = sorted(set(glob.glob(os.path.join(root_native, "*", ".build-state", "locks", "cargo.lockdir")) +
                        glob.glob(os.path.join(root_native, "agent-worktrees", "*", "*", ".build-state", "locks", "cargo.lockdir"))))
     if not locks:
         probe("cargo_guard_lock", "not_applicable", "no cargo.lockdir under any checkout")
+    elif not stale_ok:
+        probe("cargo_guard_lock", "unknown",
+              "CARGO_GUARD_LOCK_STALE_AFTER=%r is not a whole number of seconds above the %ds heartbeat "
+              "(cargo-guard.sh refuses it: lock-config-invalid), so no lockdir's freshness can be read"
+              % (stale_raw, hb))
     else:
         fresh = 0
         for lk in locks:
