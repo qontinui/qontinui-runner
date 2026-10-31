@@ -785,15 +785,21 @@ pub struct FinishSessionRequest {
 ///   one). Nothing was read or written.
 /// - `200` otherwise, INCLUDING a re-run whose marker was already in the
 ///   requested state. The body ([`FinishOutcome::response_json`]) says what
-///   changed (`"marker"`, `"reason_only"`, `"none"`) and whether coord was
-///   told (`coord.queued`, `coord.coordSessionId`, `coord.reason`), beside the
+///   changed (`"marker"`, `"none"`) and whether coord was told
+///   (`coord.queued`, `coord.coordSessionId`, `coord.reason`), beside the
 ///   record's own `finishSynced`. A `200` is never by itself evidence coord
 ///   heard: `coord.queued: false` means the resume set is corrected and coord
-///   is NOT told. `changed: "none"` wrote nothing locally; on a mark coord
-///   has not ACKed it RE-OFFERS the owed coord write (the retry door) and
-///   reports that attempt's verdict, while on a synced mark it queues nothing
-///   (`reason: "not_requeued"`) — read `session.finishSynced` for the current
-///   verdict.
+///   is NOT told. A re-finish that carries a `reason` RESTAMPS an
+///   already-finished mark (`changed: "marker"`, a new `finishedAt`,
+///   `finishSynced: false`, the finish re-sent to coord with the new time).
+///   A caller that sends a `reason` on EVERY call (a poll, say) therefore
+///   restamps and re-queues on every call and keeps `finishSynced` false; a
+///   poll must send no reason.
+///   `changed: "none"` — a re-finish with no reason, i.e. the read-back —
+///   wrote nothing locally; on a mark coord has not ACKed it RE-OFFERS the
+///   owed coord write (the retry door) and reports that attempt's verdict,
+///   while on a synced mark it queues nothing (`reason: "not_requeued"`) —
+///   read `session.finishSynced` for the current verdict.
 ///
 /// Honest local-only cases: a session whose harness id changed inside the
 /// provider WITHOUT a SessionStart hook reporting `source: "clear"` — the
@@ -1880,26 +1886,50 @@ mod tests {
         );
     }
 
+    /// A revived session finished AGAIN (a re-finish carrying a reason, on a
+    /// mark coord already ACKed) restamps and re-sends; the protocol's
+    /// reason-less read-back then still observes the new mark's own ACK.
     #[test]
-    fn re_finishing_with_a_reason_on_a_synced_mark_says_coord_was_not_told() {
+    fn re_finishing_with_a_reason_on_a_synced_mark_restamps_and_re_sends() {
         let coord_id = uuid::Uuid::new_v4();
         let (store, _reg, _dir) = finish_fixture(Some(coord_id));
         let first = apply_finish(&store, "s", finish_req(Some("first"))).unwrap();
         assert_eq!(first["coord"]["queued"], true);
-        store.mark_finish_synced("s", first["session"]["finishedAt"].as_i64());
+        let first_at = first["session"]["finishedAt"].as_i64().unwrap();
+        store.mark_finish_synced("s", Some(first_at));
 
         let again = apply_finish(&store, "s", finish_req(Some("second"))).unwrap();
-        assert_eq!(again["changed"], "reason_only");
         assert_eq!(
-            again["session"]["finishReason"], "second",
-            "the local rewrite landed"
+            again["changed"], "marker",
+            "the mark was rewritten: {again}"
         );
+        assert_eq!(again["session"]["finishReason"], "second");
+        let again_at = again["session"]["finishedAt"].as_i64().unwrap();
+        assert_ne!(again_at, first_at, "restamped");
         assert_eq!(
-            again["coord"]["queued"], false,
-            "an ACKed mark is not re-queued, so coord never hears the new reason: {again}"
+            again["coord"]["queued"], true,
+            "the restamped finish is re-sent to coord: {again}"
         );
-        assert_eq!(again["coord"]["reason"], "not_requeued");
-        assert_eq!(again["session"]["finishSynced"], true);
+        assert_eq!(again["coord"]["coordSessionId"], coord_id.to_string());
+        assert_eq!(again["session"]["finishSynced"], false);
+
+        // The read-back (no reason): reads, re-offers the owed write, and does
+        // NOT restamp — so it can observe the new mark's ACK.
+        let read = apply_finish(&store, "s", finish_req(None)).unwrap();
+        assert_eq!(read["changed"], "none");
+        assert_eq!(read["session"]["finishedAt"], again_at);
+        assert_eq!(read["coord"]["queued"], true);
+        store.mark_finish_synced("s", Some(first_at)); // the OLD row's late ACK
+        assert_eq!(
+            apply_finish(&store, "s", finish_req(None)).unwrap()["session"]["finishSynced"],
+            false,
+            "a stale ACK does not sync the restamped mark"
+        );
+        store.mark_finish_synced("s", Some(again_at));
+        let read = apply_finish(&store, "s", finish_req(None)).unwrap();
+        assert_eq!(read["session"]["finishSynced"], true, "{read}");
+        assert_eq!(read["coord"]["reason"], "not_requeued");
+        assert_eq!(read["session"]["finishedAt"], again_at);
     }
 
     const GENERIC: &str = "You are an AI assistant in a session initiated from the Coordinator.";
