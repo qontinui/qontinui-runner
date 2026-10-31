@@ -206,7 +206,15 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     // POST arm, one of which executes — spelled as two builder calls rather
     // than `client.request(method, url)` precisely so this scan can still see
     // them.
-    ("mcp_api.rs", "forwarder", 5),
+    //
+    // 5 -> 6 with the PR-hold probe (plan
+    // `2026-10-04-coord-pr-hold-without-github-drafts`, Phase 5):
+    // `coord_serves_pr_hold` POSTs a JSON-RPC `tools/list` to coord's `/mcp`
+    // BEFORE a held PR create, on the caller's own bearer — the same principal
+    // the create that follows is forwarded under — so a coord that does not
+    // serve holds is refused before an UNHELD PR can be opened. A device-JWT
+    // read would answer for the wrong principal's allowlist.
+    ("mcp_api.rs", "forwarder", 6),
     ("memory/memory_synthesis.rs", "not-coord", 2),
     ("memory/tenant_sync.rs", "not-coord", 1),
     (

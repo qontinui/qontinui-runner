@@ -309,6 +309,10 @@ pub mod session_archive;
 /// lib crate because the plan adapter above is its principal consumer.
 pub mod repo_tenant;
 
+/// The coord PR-hold contract (hold echo + capability read), shared by the
+/// loopback PR forwarder and the `qontinui-pr` CLI so the two cannot drift.
+pub mod pr_hold_echo;
+
 // ============================================================================
 // Test-only: shared process-wide env lock
 // ============================================================================

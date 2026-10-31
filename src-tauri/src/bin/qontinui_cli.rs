@@ -101,7 +101,10 @@ OPTIONS (create):
   --title <text>        PR title (required; `--title -` reads the first line of stdin)
   --body <text>         PR body
   --body-file <path>    Read the PR body from a file
-  --draft               Open as a draft PR
+  --hold <reason>       Open the PR HELD: coord records a hold before it creates
+                        the PR, so the merge train never lands it until the hold
+                        is released (coord_set_pr_hold). Replaces the retired
+                        --draft, which private repos on GitHub Free cannot honour.
 
 OPTIONS (plan-library-backfill):
   --dry-run             Scan and report only — no backend is contacted
@@ -198,8 +201,17 @@ struct PrCreateArgs {
     title: Option<String>,
     body: Option<String>,
     body_file: Option<String>,
-    draft: bool,
+    /// `--hold <reason>`: forwarded as `hold: {reason}` so coord places the
+    /// hold BEFORE it creates the PR (no window in which a green PR is
+    /// eligible to land).
+    hold: Option<String>,
 }
+
+/// Error for the retired `--draft` flag. A loud refusal rather than an
+/// "unknown flag": a caller still passing `--draft` meant "do not land this",
+/// and must be told the flag that now means that.
+const DRAFT_RETIRED_ERR: &str = "--draft is retired: GitHub drafts do not exist on private repos \
+     under GitHub Free, so coord holds PRs instead — use --hold <reason>";
 
 fn parse_pr_create_args(args: &[String]) -> Result<PrCreateArgs, String> {
     let mut out = PrCreateArgs::default();
@@ -216,7 +228,7 @@ fn parse_pr_create_args(args: &[String]) -> Result<PrCreateArgs, String> {
         };
         // Take the flag's value: the inline `=value` if given, else the next
         // argv element — but a next element that LOOKS like a flag is an error
-        // (`--title --draft` must not yield a PR titled "--draft"); use
+        // (`--title --hold` must not yield a PR titled "--hold"); use
         // `--flag=value` for values that legitimately begin with `--`.
         let mut consumed = 1usize;
         let mut take_value = |slot: &mut Option<String>| -> Result<(), String> {
@@ -244,12 +256,13 @@ fn parse_pr_create_args(args: &[String]) -> Result<PrCreateArgs, String> {
             "--title" => take_value(&mut out.title)?,
             "--body" => take_value(&mut out.body)?,
             "--body-file" => take_value(&mut out.body_file)?,
-            "--draft" => {
-                if inline.is_some() {
-                    return Err("--draft does not take a value".to_string());
+            "--hold" => {
+                take_value(&mut out.hold)?;
+                if out.hold.as_deref().is_some_and(|r| r.trim().is_empty()) {
+                    return Err("--hold requires a non-empty reason".to_string());
                 }
-                out.draft = true;
             }
+            "--draft" => return Err(DRAFT_RETIRED_ERR.to_string()),
             other => return Err(format!("unknown flag {other:?}")),
         }
         i += consumed;
@@ -357,18 +370,14 @@ fn pr_create(args: &[String]) -> ExitCode {
         }
     };
 
-    let mut payload = serde_json::json!({
-        "repo": repo,
-        "head": head,
-        "base": base,
-        "title": title,
-    });
-    if let Some(b) = body {
-        payload["body"] = serde_json::json!(b);
-    }
-    if parsed.draft {
-        payload["draft"] = serde_json::json!(true);
-    }
+    let payload = pr_create_payload(
+        &repo,
+        &head,
+        &base,
+        &title,
+        body.as_deref(),
+        parsed.hold.as_deref(),
+    );
 
     let client = match reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -398,21 +407,111 @@ fn pr_create(args: &[String]) -> ExitCode {
 
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
-    if status.is_success() {
-        // On success print the PR URL (and nothing else) to stdout.
-        let pr_url = serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(String::from));
-        match pr_url {
-            Some(u) => println!("{u}"),
-            None => println!("{}", text.trim()),
+    match pr_create_outcome(parsed.hold.is_some(), status, &text) {
+        Ok(line) => {
+            if parsed.hold.is_some() {
+                if let Some(note) = joined_hold_note(&text) {
+                    eprintln!("qontinui-pr: {note}");
+                }
+            }
+            // On success print the PR URL (and nothing else) to stdout.
+            println!("{line}");
+            ExitCode::SUCCESS
         }
-        ExitCode::SUCCESS
-    } else {
-        // Coord's (or the runner proxy's) error body, verbatim, to stderr.
-        eprintln!("qontinui-pr: create failed ({status}): {}", text.trim());
-        ExitCode::from(1)
+        Err(msg) => {
+            eprintln!("qontinui-pr: {msg}");
+            ExitCode::from(1)
+        }
     }
+}
+
+/// The JSON body `qontinui-pr create` POSTs to the runner's
+/// `/vcs/pull-requests`. Pure, so its shape is testable: absent options are
+/// omitted, and `--hold <reason>` becomes `"hold": {"reason": ...}`.
+fn pr_create_payload(
+    repo: &str,
+    head: &str,
+    base: &str,
+    title: &str,
+    body: Option<&str>,
+    hold_reason: Option<&str>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "repo": repo,
+        "head": head,
+        "base": base,
+        "title": title,
+    });
+    if let Some(b) = body {
+        payload["body"] = serde_json::json!(b);
+    }
+    if let Some(reason) = hold_reason {
+        payload["hold"] = serde_json::json!({ "reason": reason });
+    }
+    payload
+}
+
+/// When coord's hold echo says `created: false`, the branch already carried a
+/// live hold and the PR JOINED it rather than placing a new one — the caller's
+/// `--hold` reason is not the one on record. Returns the stderr note naming
+/// the existing hold's `held_by` (still a success: the PR IS held).
+fn joined_hold_note(text: &str) -> Option<String> {
+    let v = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    let hold = v.get("hold")?.as_object()?;
+    if hold.get("created").and_then(|c| c.as_bool()) != Some(false) {
+        return None;
+    }
+    let held_by = hold
+        .get("held_by")
+        .and_then(|h| h.as_str())
+        .unwrap_or("<unknown>");
+    let reason = hold.get("reason").and_then(|r| r.as_str()).unwrap_or("");
+    Some(format!(
+        "note: this PR joined an EXISTING live hold held by {held_by} (reason: {reason:?}) \
+         — no new hold was placed, so your --hold reason is not the one on record"
+    ))
+}
+
+/// Interpret the runner's answer to a create. `Ok` is the stdout line (the PR
+/// URL); `Err` is the stderr message and means a non-zero exit. A HELD create
+/// whose 2xx body does not echo the hold is an `Err` naming the PR as UNHELD:
+/// the PR exists, nothing holds it, and reporting success would hide that.
+fn pr_create_outcome(
+    hold_requested: bool,
+    status: reqwest::StatusCode,
+    text: &str,
+) -> Result<String, String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(text).ok();
+    if !status.is_success() {
+        // The runner's own UNHELD verdict already names the PR — relay it as
+        // is rather than as a "create failed" (the PR WAS created).
+        if let Some(v) = &parsed {
+            if v.get("code").and_then(|c| c.as_str()) == Some("VCS_PR_PROXY_HOLD_UNCONFIRMED") {
+                let err = v.get("error").and_then(|e| e.as_str()).unwrap_or(text);
+                return Err(format!("{err} ({status})"));
+            }
+        }
+        // Coord's (or the runner proxy's) error body, verbatim.
+        return Err(format!("create failed ({status}): {}", text.trim()));
+    }
+    let pr_url = parsed
+        .as_ref()
+        .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(String::from));
+    if hold_requested
+        && !parsed
+            .as_ref()
+            .is_some_and(qontinui_runner_lib::pr_hold_echo::hold_echo_confirmed)
+    {
+        let shown = pr_url.as_deref().unwrap_or("<no url in the response>");
+        return Err(format!(
+            "PR {shown} was created UNHELD: the create answered {status} but did not confirm \
+             the requested hold (no `hold` echo with kind/reason/held_by — coord likely \
+             predates PR holds). The merge train may land it: close the PR now (a coord \
+             that serves coord_set_pr_hold could hold it instead). Response: {}",
+            text.trim()
+        ));
+    }
+    Ok(pr_url.unwrap_or_else(|| text.trim().to_string()))
 }
 
 // ===========================================================================
@@ -1749,7 +1848,8 @@ mod tests {
             "feat: x",
             "--body",
             "body text",
-            "--draft",
+            "--hold",
+            "waiting on the schema migration",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -1760,7 +1860,10 @@ mod tests {
         assert_eq!(parsed.base.as_deref(), Some("develop"));
         assert_eq!(parsed.title.as_deref(), Some("feat: x"));
         assert_eq!(parsed.body.as_deref(), Some("body text"));
-        assert!(parsed.draft);
+        assert_eq!(
+            parsed.hold.as_deref(),
+            Some("waiting on the schema migration")
+        );
     }
 
     #[test]
@@ -1773,8 +1876,8 @@ mod tests {
 
     #[test]
     fn parse_args_rejects_flag_like_value() {
-        // `--title --draft` must NOT yield a PR titled "--draft".
-        let args: Vec<String> = ["--title", "--draft"]
+        // `--title --hold` must NOT yield a PR titled "--hold".
+        let args: Vec<String> = ["--title", "--hold"]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -1797,22 +1900,138 @@ mod tests {
     #[test]
     fn parse_args_supports_flag_equals_value_form() {
         // Values that legitimately begin with `--` use the `=` form.
-        let args: Vec<String> = ["--title=--weird title", "--base=main", "--draft"]
+        let args: Vec<String> = ["--title=--weird title", "--base=main", "--hold=a=b reason"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         let parsed = parse_pr_create_args(&args).unwrap();
         assert_eq!(parsed.title.as_deref(), Some("--weird title"));
         assert_eq!(parsed.base.as_deref(), Some("main"));
-        assert!(parsed.draft);
+        assert_eq!(parsed.hold.as_deref(), Some("a=b reason"));
         // Value containing `=` splits only on the FIRST `=`.
         let args: Vec<String> = vec!["--body=a=b=c".to_string()];
         assert_eq!(
             parse_pr_create_args(&args).unwrap().body.as_deref(),
             Some("a=b=c")
         );
-        // --draft takes no value.
-        assert!(parse_pr_create_args(&["--draft=true".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parse_args_hold_requires_a_reason() {
+        // No value, a flag-like value, and a blank value are all refused —
+        // a hold without a reason is the silent-stall shape coord rejects.
+        assert!(parse_pr_create_args(&["--hold".to_string()]).is_err());
+        let flag_like: Vec<String> = ["--hold", "--title"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(parse_pr_create_args(&flag_like).is_err());
+        let blank = parse_pr_create_args(&["--hold=  ".to_string()]).unwrap_err();
+        assert!(blank.contains("non-empty reason"), "{blank}");
+        // Absent --hold leaves the PR unheld.
+        let none: Vec<String> = ["--title", "t"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse_pr_create_args(&none).unwrap().hold, None);
+    }
+
+    #[test]
+    fn pr_create_payload_shape() {
+        let held = pr_create_payload("o/r", "feat/x", "main", "t", Some("b"), Some("why"));
+        assert_eq!(
+            held,
+            serde_json::json!({
+                "repo": "o/r",
+                "head": "feat/x",
+                "base": "main",
+                "title": "t",
+                "body": "b",
+                "hold": {"reason": "why"},
+            })
+        );
+        let plain = pr_create_payload("o/r", "feat/x", "main", "t", None, None);
+        let obj = plain.as_object().unwrap();
+        assert!(!obj.contains_key("hold") && !obj.contains_key("body"));
+        assert!(!obj.contains_key("draft"), "draft is retired");
+    }
+
+    #[test]
+    fn pr_create_outcome_succeeds_when_the_hold_is_echoed() {
+        let body = r#"{"url":"https://github.com/o/r/pull/1","hold":{"kind":"create","reason":"why","held_by":"agent:a"}}"#;
+        assert_eq!(
+            pr_create_outcome(true, reqwest::StatusCode::CREATED, body),
+            Ok("https://github.com/o/r/pull/1".to_string())
+        );
+        // An unheld create needs no echo.
+        assert_eq!(
+            pr_create_outcome(
+                false,
+                reqwest::StatusCode::CREATED,
+                r#"{"url":"https://github.com/o/r/pull/2"}"#
+            ),
+            Ok("https://github.com/o/r/pull/2".to_string())
+        );
+    }
+
+    #[test]
+    fn a_joined_hold_is_noted_but_still_succeeds() {
+        let body = r#"{"url":"https://github.com/o/r/pull/5","hold":{"kind":"manual","reason":"older","held_by":"operator:jan","created":false}}"#;
+        // Still a success (the PR is held)…
+        assert_eq!(
+            pr_create_outcome(true, reqwest::StatusCode::CREATED, body),
+            Ok("https://github.com/o/r/pull/5".to_string())
+        );
+        // …with a note naming the existing hold's holder.
+        let note = joined_hold_note(body).expect("created:false must be noted");
+        assert!(note.contains("operator:jan"), "{note}");
+        assert!(note.contains("EXISTING live hold"), "{note}");
+        // A freshly placed hold (or an echo without the field) is not noted.
+        assert_eq!(
+            joined_hold_note(
+                r#"{"hold":{"kind":"create","reason":"r","held_by":"a","created":true}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            joined_hold_note(r#"{"hold":{"kind":"create","reason":"r","held_by":"a"}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn pr_create_outcome_reports_unheld_when_a_2xx_lacks_the_echo() {
+        for body in [
+            r#"{"url":"https://github.com/o/r/pull/3"}"#,
+            r#"{"url":"https://github.com/o/r/pull/3","hold":{"kind":"create","reason":"why"}}"#,
+        ] {
+            let err = pr_create_outcome(true, reqwest::StatusCode::CREATED, body).unwrap_err();
+            assert!(err.contains("https://github.com/o/r/pull/3"), "{err}");
+            assert!(err.contains("UNHELD"), "{err}");
+        }
+        // The runner's own UNHELD verdict is relayed as itself, not as
+        // "create failed".
+        let err = pr_create_outcome(
+            true,
+            reqwest::StatusCode::BAD_GATEWAY,
+            r#"{"code":"VCS_PR_PROXY_HOLD_UNCONFIRMED","error":"PR https://github.com/o/r/pull/4 was created UNHELD"}"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("PR https://github.com/o/r/pull/4 was created UNHELD"),
+            "{err}"
+        );
+        // A genuine failure stays a "create failed".
+        let err = pr_create_outcome(true, reqwest::StatusCode::FORBIDDEN, "nope").unwrap_err();
+        assert!(err.starts_with("create failed (403"), "{err}");
+    }
+
+    #[test]
+    fn parse_args_refuses_retired_draft_loudly() {
+        // `--draft` is not silently ignored (that would open an UNHELD PR the
+        // caller meant to keep from landing): it names its replacement.
+        for form in ["--draft", "--draft=true"] {
+            let err = parse_pr_create_args(&[form.to_string()]).unwrap_err();
+            assert!(err.contains("--hold <reason>"), "{form}: {err}");
+            assert!(err.contains("retired"), "{form}: {err}");
+        }
     }
 
     #[test]
