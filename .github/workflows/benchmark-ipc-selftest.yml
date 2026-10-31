@@ -56,7 +56,10 @@ jobs:
     # A checkout plus eleven unittest cases, about two seconds in all.
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # unittest reads the local tree only, so no token stays in .git/config.
+          persist-credentials: false
 
       - name: Test benchmark-ipc's primary-runner refusal (no runner, no network)
         shell: bash
