@@ -37,12 +37,29 @@ pub struct CreateBridgeRequest {
 /// Request body for running a workflow on a specific bridge
 #[derive(Debug, Deserialize)]
 pub struct BridgeWorkflowRequest {
-    /// Workflow name to run
-    workflow_name: Option<String>,
+    /// ID of the workflow to run. The executor's `start` looks workflows up by
+    /// id and refuses a start that names none.
+    workflow_id: String,
     /// Config path to load (optional if already loaded)
     config_path: Option<String>,
-    /// Workflow parameters
-    params: Option<serde_json::Value>,
+    /// Extra `start` parameters (`monitor_index`, `initial_state_ids`, ...),
+    /// merged into the top level of the command, which is where the executor
+    /// reads them.
+    params: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Build the executor `start` payload: caller params at the top level, with
+/// `workflow_id` set last so a params entry cannot override it.
+fn start_params(
+    workflow_id: String,
+    params: Option<serde_json::Map<String, serde_json::Value>>,
+) -> serde_json::Value {
+    let mut payload = params.unwrap_or_default();
+    payload.insert(
+        "workflow_id".to_string(),
+        serde_json::Value::String(workflow_id),
+    );
+    serde_json::Value::Object(payload)
 }
 
 /// List all active bridges
@@ -142,8 +159,8 @@ pub async fn run_bridge_workflow(
     Json(request): Json<BridgeWorkflowRequest>,
 ) -> Json<ApiResponse<serde_json::Value>> {
     info!(
-        "Running workflow on bridge {}: {:?}",
-        bridge_id, request.workflow_name
+        "Running workflow on bridge {}: {}",
+        bridge_id, request.workflow_id
     );
 
     let bridge_manager_guard = state.app_state.bridge_manager.lock().await;
@@ -169,19 +186,11 @@ pub async fn run_bridge_workflow(
             }
         }
 
-        // Build execution params
-        let params = if request.workflow_name.is_some() || request.params.is_some() {
-            Some(serde_json::json!({
-                "workflow_name": request.workflow_name,
-                "params": request.params,
-            }))
-        } else {
-            None
-        };
+        let params = start_params(request.workflow_id, request.params);
 
         // Start execution
         let start_result = bridge_manager.with_bridge(&bridge_id, |bridge| {
-            bridge.start_execution_with_params(params)
+            bridge.start_execution_with_params(Some(params))
         });
 
         match start_result {
@@ -295,5 +304,29 @@ pub async fn set_headless_only(
         Json(ApiResponse::<HeadlessOnlyResponse>::error(
             "Bridge manager not initialized",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_params_puts_workflow_id_and_params_at_top_level() {
+        let mut params = serde_json::Map::new();
+        params.insert("monitor_index".into(), serde_json::json!(1));
+        params.insert("workflow_id".into(), serde_json::json!("from-params"));
+        let payload = start_params("wf-1".into(), Some(params));
+        assert_eq!(
+            payload,
+            serde_json::json!({"workflow_id": "wf-1", "monitor_index": 1})
+        );
+    }
+
+    #[test]
+    fn request_without_workflow_id_is_rejected() {
+        let parsed: Result<BridgeWorkflowRequest, _> =
+            serde_json::from_value(serde_json::json!({"workflow_name": "x"}));
+        assert!(parsed.is_err());
     }
 }

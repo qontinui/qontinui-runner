@@ -441,7 +441,8 @@ fn recheck_orphans(pane_dir: &Path, deadline: Instant, report: &mut SweepReport)
                     (Some(r), false) => reap_orphans_of_dead_holder(r),
                     _ => ReapReport::default(),
                 };
-                let kept = !stale && !reap.unattributed.is_empty();
+                // An unreadable snapshot is UNKNOWN, not "no orphans": keep.
+                let kept = !stale && (!reap.unattributed.is_empty() || reap.snapshot_unreadable);
                 let mut error = None;
                 if !kept {
                     match std::fs::remove_file(&path) {
@@ -548,13 +549,16 @@ fn reap_dead_into(pane_dir: &Path, pane: &PaneId, errors: &mut Vec<String>) -> S
     // forgotten: the record moves to the orphan ledger, where every later
     // sweep re-checks it, instead of vanishing with the lock.
     let orphan_kept = match &record {
-        Some(r) if !reap.unattributed.is_empty() => match write_orphan(pane_dir, pane, r) {
-            Ok(()) => true,
-            Err(e) => {
-                errors.push(format!("{}: {e}", orphan_path(pane_dir, pane).display()));
-                false
+        // An unreadable snapshot is UNKNOWN, not "nothing left": keep it too.
+        Some(r) if !reap.unattributed.is_empty() || reap.snapshot_unreadable => {
+            match write_orphan(pane_dir, pane, r) {
+                Ok(()) => true,
+                Err(e) => {
+                    errors.push(format!("{}: {e}", orphan_path(pane_dir, pane).display()));
+                    false
+                }
             }
-        },
+        }
         _ => false,
     };
     let lock_removed = match lock.remove() {
