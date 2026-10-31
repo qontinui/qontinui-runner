@@ -25,8 +25,8 @@
 #     passthrough (a nested invocation, e.g. a subagent, must not re-pin).
 #   * DON'T DOUBLE-PIN: if the user already passed --session-id/--resume (or the
 #     resume subcommand), do NOT append our id — their explicit choice wins.
-#   * BOUNDED RESOLVE WAIT: a real tool that is momentarily ABSENT (mid-
-#     reinstall) is re-scanned for at most QONTINUI_SHIM_RESOLVE_WAIT_SECS
+#   * BOUNDED RESOLVE WAIT: a real tool that is momentarily ABSENT, or is
+#     npm's placeholder stub (mid-reinstall), is re-scanned for at most QONTINUI_SHIM_RESOLVE_WAIT_SECS
 #     (default 10) before the fail-open fall-through; a resolved tool never
 #     waits, and the only output added is on STDERR, on the miss path alone.
 #
@@ -40,9 +40,36 @@ TOOL="@@TOOL@@"
 SHIM_DIR="@@SHIM_DIR@@"
 
 # ---------------------------------------------------------------------------
-# Resolve the REAL provider: first match on PATH that is NOT inside SHIM_DIR.
+# npm's PLACEHOLDER stub. @anthropic-ai/claude-code ships `bin/claude.exe` as a
+# ~500-byte shell script that only prints "claude native binary not installed"
+# and exits 1; its postinstall then links the native binary over it. So a
+# reinstall has a SECOND window, after npm has re-linked `bin/claude` but
+# before postinstall has run, in which the tool is present but is the stub.
+# Execing it there failed a peer pane's launch on 2026-10-21. The stub is
+# matched by its message in its first bytes (a native binary starts with its
+# ELF/PE/Mach-O magic), so a stub reads as a MISS and the bounded wait below
+# covers both windows. Should the stub outlive the wait, the fall-through runs
+# it and its own message is what the user sees. Builtins only, so a hit forks
+# nothing extra. Scope: npm on Linux/macOS, where `bin/claude` links straight to
+# the placeholder; on Windows npm's cmd-shim wrapper sits in front of it and is
+# what this check sees, so that window stays open there.
 # ---------------------------------------------------------------------------
-resolve_real() {
+is_npm_placeholder() {
+  local head=''
+  IFS= read -r -d '' -n 256 head 2>/dev/null <"$1"
+  case "$head" in
+    *'native binary not installed'*) return 0 ;;
+  esac
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Scan PATH, skipping SHIM_DIR, for the first candidate of one kind:
+# `scan_path real` wants a tool that is NOT npm's placeholder stub,
+# `scan_path placeholder` wants the stub itself (only for the give-up message).
+# ---------------------------------------------------------------------------
+scan_path() {
+  local want="$1"
   local IFS=':'
   local dir cand
   for dir in $PATH; do
@@ -52,6 +79,13 @@ resolve_real() {
     esac
     for cand in "$dir/$TOOL" "$dir/$TOOL.cmd" "$dir/$TOOL.exe"; do
       if [ -x "$cand" ] || [ -f "$cand" ]; then
+        if is_npm_placeholder "$cand"; then
+          [ "$want" = placeholder ] || continue
+        else
+          # A real tool ahead of any stub: dispatch would reach it, so there
+          # is no stub to report.
+          [ "$want" = real ] || return 1
+        fi
         printf '%s' "$cand"
         return 0
       fi
@@ -59,6 +93,10 @@ resolve_real() {
   done
   return 1
 }
+
+# Resolve the REAL provider: first match on PATH that is NOT inside SHIM_DIR
+# and is not npm's placeholder stub.
+resolve_real() { scan_path real; }
 
 # ---------------------------------------------------------------------------
 # Bounded wait on a MISS. A package manager reinstalling the tool (Claude Code's
@@ -86,7 +124,7 @@ resolve_real_waiting() {
   if found="$(resolve_real)"; then printf '%s' "$found"; return 0; fi
   local wait_secs; wait_secs="$(resolve_wait_secs)"
   [ "$wait_secs" -gt 0 ] || return 1
-  printf 'qontinui shim: %s not found on PATH (excluding %s); waiting up to %ss for it to reappear (a package-manager reinstall briefly removes it)\n' \
+  printf 'qontinui shim: %s not found on PATH (excluding %s); waiting up to %ss for it to reappear (a package-manager reinstall briefly removes it, or leaves the npm placeholder stub in its place)\n' \
     "$TOOL" "$SHIM_DIR" "$wait_secs" >&2
   local deadline=$((SECONDS + wait_secs))
   while [ "$SECONDS" -lt "$deadline" ]; do
@@ -98,7 +136,15 @@ resolve_real_waiting() {
 
 # The last-resort fall-through is about to dispatch by NAME — say plainly what
 # was searched, so a `not found` that follows is diagnosable from the pane.
+# When what IS on PATH is npm's placeholder stub, say so: "not found" alone
+# would hide that the reinstall's postinstall never replaced it.
 report_unresolved() {
+  local stub
+  if stub="$(scan_path placeholder)"; then
+    printf 'qontinui shim: the real %s was not found on PATH after waiting %ss; only the npm placeholder stub is there (%s), which the reinstall has not replaced. Falling back to PATH dispatch, which runs the stub. PATH searched (excluding %s): %s\n' \
+      "$TOOL" "$(resolve_wait_secs)" "$stub" "$SHIM_DIR" "$PATH" >&2
+    return 0
+  fi
   printf 'qontinui shim: the real %s was not found on PATH after waiting %ss; falling back to PATH dispatch. PATH searched (excluding %s): %s\n' \
     "$TOOL" "$(resolve_wait_secs)" "$SHIM_DIR" "$PATH" >&2
 }
