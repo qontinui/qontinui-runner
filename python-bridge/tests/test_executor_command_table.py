@@ -150,8 +150,10 @@ def test_command_table_matches_snapshot():
     )
 
 
-def test_snapshot_has_118_commands():
-    assert len(SNAPSHOT.read_text(encoding="utf-8").splitlines()) == 118
+def test_snapshot_has_116_commands():
+    # 118 at the move; the two GUI element-capture commands were deleted after
+    # qontinui-runner#2242 removed the html2canvas capture they depended on.
+    assert len(SNAPSHOT.read_text(encoding="utf-8").splitlines()) == 116
 
 
 # 2 ---------------------------------------------------------------------------
@@ -411,7 +413,9 @@ def test_build_command_table_rejects_a_mixin_that_is_not_a_base():
 
 # ``_host.py`` declares ``ExecutorHost`` under ``if TYPE_CHECKING`` only (``object`` at
 # run time), so its method stubs are not runtime definitions and are not counted.
-PRE_MOVE_METHOD_COUNT = 165
+# 165 at the move, less the five GUI element-capture methods deleted after
+# qontinui-runner#2242 removed the html2canvas capture they depended on.
+PRE_MOVE_METHOD_COUNT = 160
 QONTINUI_EXECUTOR_MAX_LINES = 1700
 MIXIN_MAX_LINES = 1000
 
