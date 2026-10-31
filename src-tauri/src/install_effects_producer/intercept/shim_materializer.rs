@@ -2547,6 +2547,97 @@ mod resolve_wait_tests {
         );
     }
 
+    /// npm's placeholder `bin/claude.exe`, as the reinstall window leaves it.
+    const NPM_STUB: &str = "echo \"Error: claude native binary not installed.\" >&2\nexit 1\n";
+
+    /// The 2026-10-21 shape: npm has re-linked `bin/claude` but postinstall has
+    /// not yet replaced the placeholder stub. The shim must wait the stub out
+    /// rather than exec it.
+    ///
+    /// The swap is made by a fake `sleep` on PATH, which only the shim's wait
+    /// loop calls, so it happens strictly AFTER a scan has seen the stub and
+    /// rejected it. A timer thread could fire before the shim's first scan on a
+    /// loaded box, and the test would then pass without ever meeting the stub.
+    #[test]
+    fn identity_shim_waits_out_the_npm_placeholder_stub() {
+        if system_claude_present() {
+            return;
+        }
+        let Some(real_sleep) = ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+        else {
+            eprintln!("SKIP: no /bin/sleep or /usr/bin/sleep for the fake sleep to exec");
+            return;
+        };
+        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let marker = tmp.path().join("ran");
+        let real = real_dir.join("claude");
+        write_exe(&real, NPM_STUB);
+        // "postinstall": the real binary, staged beside the stub and renamed
+        // over it on the wait loop's first `sleep`.
+        let staged = tmp.path().join("claude.staged");
+        write_exe(&staged, &fake_claude_body(&marker));
+        write_exe(
+            &real_dir.join("sleep"),
+            &format!(
+                "#!/bin/sh\n[ -e '{staged}' ] && mv -f '{staged}' '{real}'\nexec {real_sleep} \"$@\"\n",
+                staged = staged.display(),
+                real = real.display(),
+            ),
+        );
+        let cmd = identity_cmd(&shim_dir, &real_dir, "10");
+
+        let out = crate::process_helpers::output_with_timeout(cmd, BUDGET).unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "shim failed: {stderr}");
+        assert!(
+            !staged.exists(),
+            "the wait loop never ran, so the stub was never treated as a miss: {stderr}"
+        );
+        assert!(marker.exists(), "the real claude never ran: {stderr}");
+        assert!(
+            !stderr.contains("native binary not installed"),
+            "the stub must not have run: {stderr}"
+        );
+    }
+
+    /// A stub that outlives the wait: the give-up line names the stub instead
+    /// of saying only "not found", and the fall-through runs it.
+    #[test]
+    fn identity_shim_names_the_npm_placeholder_stub_when_it_gives_up() {
+        if system_claude_present() {
+            return;
+        }
+        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let stub = real_dir.join("claude");
+        write_exe(&stub, NPM_STUB);
+        let out = crate::process_helpers::output_with_timeout(
+            identity_cmd(&shim_dir, &real_dir, "1"),
+            BUDGET,
+        )
+        .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "the stub exits 1: {stderr}");
+        assert!(
+            stderr.contains("after waiting 1s; only the npm placeholder stub is there")
+                && stderr.contains(&stub.display().to_string()),
+            "the give-up line must name the stub: {stderr}"
+        );
+        assert!(
+            stderr.contains("native binary not installed"),
+            "the fall-through runs the stub, whose own message the user sees: {stderr}"
+        );
+    }
+
     #[test]
     fn identity_shim_names_the_tool_and_path_when_it_gives_up() {
         if system_claude_present() {

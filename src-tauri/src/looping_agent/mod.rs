@@ -16,7 +16,7 @@
 //!
 //! - [`registry`] — the durable runner-local registry of looping-agent
 //!   definitions + runtime state (JSON store, atomic writes, tolerant load),
-//!   seeded with the built-in Merge Shepherd (DISABLED by default).
+//!   seeded with the built-in Merge Shepherd (ENABLED by default).
 //! - [`desired_state`] — (Phase 8) the pure fold of COORD's fleet-wide
 //!   declaration ("this tenant wants N merge shepherds, armed") over the local
 //!   registry flag. Fail-safe: a disarmed or unreachable coord falls back to

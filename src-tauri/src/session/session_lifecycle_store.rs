@@ -51,12 +51,14 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::session::observation_epoch::{ObservationEpoch, Observed};
 use crate::session::restore_record_emitter::RestoreRecordEmitter;
 use crate::session::snapshot_history::{SnapshotHistory, SnapshotSession, TranscriptProbe};
 
@@ -110,12 +112,18 @@ const CLOSED_RETENTION_MS: i64 = 86_400_000;
 const OPEN_STALE_MS: i64 = 604_800_000;
 /// A record closed with reason `"pty-exit"` (its PTY died — e.g. a graceful
 /// runner restart firing `handleExit` on every live PTY) is still restorable
-/// for this long after the close. Beyond the window, or for any other close
-/// reason (explicit user close), it is NOT restorable. 10 minutes in millis.
+/// when it closed within this long of the registry's LAST MOMENT OF LIFE (the
+/// restore anchor — see [`restore_admissible`]), NOT of wall-clock now: a
+/// graceful stop stamps every close at the shutdown instant, so a rebuild of
+/// any length still restores them. A close further back than the window, or
+/// any other close reason (explicit user close), is NOT restorable. 10 minutes
+/// in millis.
 const RESTORABLE_PTY_EXIT_MS: i64 = 600_000;
 /// A record closed with reason `"poll-dead"` (the liveness poll saw a live
 /// shell with zero descendants for several consecutive idle ticks) is still
-/// restorable for this long after the close. A `poll-dead` close is far less
+/// restorable when it closed within this long of the registry's LAST MOMENT OF
+/// LIFE (the restore anchor — see [`restore_admissible`]), not of wall-clock
+/// now. A `poll-dead` close is far less
 /// certain than a `pty-exit` (the shell pty is, by definition, still alive —
 /// the session was merely idle between tool calls), so an immediate restart
 /// should bring it back rather than silently drop it. Beyond the window it is
@@ -124,15 +132,23 @@ const RESTORABLE_PTY_EXIT_MS: i64 = 600_000;
 const RESTORABLE_POLL_DEAD_MS: i64 = 600_000;
 /// Anchored-recency grace for `state == "open"` rows in
 /// [`SessionLifecycleStore::restorable_records`]. An open row is restorable
-/// iff `anchor - last_seen_at <= grace`, where `anchor` is the registry's
-/// LAST MOMENT OF LIFE (max of every row's `last_seen_at` / `closed_at`,
-/// plus the prior shutdown marker's `at`). Recency relative to the anchor —
-/// not wall-clock now — survives arbitrary downtime: a crash followed by an
-/// hours-later boot still restores the rows that were fresh when the
-/// previous process died, while a multi-day ghost row stays excluded on
-/// EVERY boot kind. 10 minutes in millis (matches the close-grace windows;
-/// live sessions are touched every ~45s by the poll, so anything on screen
-/// at shutdown sits well inside it).
+/// iff `anchor - last_seen_at <= grace`, where `anchor` is the EARLIER of
+/// the registry's LAST MOMENT OF LIFE (max of every row's `last_seen_at` /
+/// `closed_at`, plus the prior shutdown marker's `at`) and the OBSERVATION
+/// EPOCH — the last poll tick whose process snapshot succeeded
+/// ([`crate::session::observation_epoch`]; see [`RestoreAnchors`]).
+///
+/// A row's `last_seen_at` only advances when a SUCCESSFUL poll tick touches
+/// it, so its staleness is evidence of death only while the poll could see.
+/// A stretch of failed snapshots freezes every stamp; measuring against the
+/// last observation keeps that unobservable stretch from reading as "dead"
+/// (the 2026-10-27 force-exit stranded 64 of 65 sessions that way: no touch
+/// landed for 77 minutes before the clean marker). Recency relative to the
+/// anchor — not wall-clock now — survives arbitrary downtime: a crash
+/// followed by an hours-later boot still restores the rows that were fresh
+/// when the previous process last looked, while a multi-day ghost row (one
+/// successful ticks kept NOT finding alive) stays excluded on EVERY boot
+/// kind. 10 minutes in millis (matches the close-grace windows).
 const RESTORABLE_OPEN_ANCHOR_GRACE_MS: i64 = 600_000;
 /// Number of consecutive claude-absent ticks a *live* shell (`Some(true)` with
 /// no Claude in its inclusive subtree) must accumulate before the poll closes
@@ -351,6 +367,11 @@ pub fn describe_restore_status(
 /// is already the value we would write, and `None` means no restore was ever
 /// recorded — a close must not invent one.
 fn reap_restore_marker_on_close(rec: &mut TerminalSessionRecord) {
+    // A close also ends any wait for an account choice. Cleared here, the one
+    // helper every close path calls (`record_close_checked`, both `record_open`
+    // supersede arms, the boot collision repair), so no close can leave a
+    // stamp behind for a later re-open to mistake for a running hold.
+    rec.awaiting_account_since = None;
     rec.restore_pending_at = None;
     if rec.restore_tier.as_deref() == Some(RESTORE_TIER_FAILED) {
         rec.restore_tier = Some(RESTORE_TIER_TERMINAL_ONLY.to_string());
@@ -397,6 +418,22 @@ pub fn durable_name_source(registry_value: Option<&str>) -> String {
 /// already normalizes away at the top of [`SessionLifecycleStore::record_open`]).
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|s| !s.trim().is_empty())
+}
+
+/// The `finished_at` a RESTAMP gets ([`SessionLifecycleStore::set_finished`]
+/// re-finishing an already-finished mark): `now`, unless that EQUALS the old
+/// stamp (two finishes inside one millisecond), in which case one past it.
+///
+/// The ACK matcher ([`SessionLifecycleStore::mark_finish_synced`]) needs the
+/// two stamps only to DIFFER, so a late ACK of the old row can never sync the
+/// new mark. Taking `now` otherwise — rather than `max(now, prev + 1)` — keeps
+/// a clock stepped backwards from dating the new finish in the future. Pure.
+fn restamp_at(prev: i64, now: i64) -> i64 {
+    if now == prev {
+        prev.saturating_add(1)
+    } else {
+        now
+    }
 }
 
 /// Best-effort identity overlay for an existing record — the D1 "who is this
@@ -544,6 +581,18 @@ pub struct TerminalSessionRecord {
     /// observes the session confidently alive (KeepAlive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_pending_at: Option<i64>,
+    /// The row's `last_seen_at` when it FIRST started waiting for an account
+    /// choice ([`SessionLifecycleStore::mark_awaiting_account`]) — its last
+    /// moment of genuine life. While set on an open, unfinished row and no
+    /// older than the open-row prune age ([`awaiting_account_hold`]), it IS the
+    /// hold: the row stays on the roster and in the restore set, and the poll
+    /// never closes it `no-terminal`. The hold never refreshes `last_seen_at`,
+    /// so a held row can never move the restore anchor. Durable, so the hold
+    /// survives any number of restarts without a re-mark. Cleared by
+    /// [`SessionLifecycleStore::record_open`] (a verified resume is new life),
+    /// a close, Finish, and the poll once the hold has expired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awaiting_account_since: Option<i64>,
     /// Unix millis when a provider's SessionStart hook CONFIRMED that a real
     /// session actually started in this terminal (session-restore-redesign
     /// Phase 2 coordinator refinement). `None`/unset = PROVISIONAL.
@@ -748,8 +797,10 @@ pub struct TerminalSessionRecord {
     /// operator's action.
     ///
     /// `false` on a finished record therefore means "coord write still owed".
-    /// The write is enqueued when the mark is made, again on any no-op
-    /// re-finish of the still-unsynced mark (`set_finished`'s retry door), AND
+    /// The write is enqueued when the mark is made, again when a re-finish
+    /// RESTAMPS it (`set_finished` with a reason, which clears this flag), again
+    /// on any no-op re-finish of the still-unsynced mark (`set_finished`'s retry
+    /// door), AND
     /// again when the session next gets a coord row in this process — a FRESH
     /// registration (`AiCoordRegistrar::register_inner`) or, for the terminal
     /// plane, its terminal being bound to its coord row
@@ -810,6 +861,14 @@ pub struct TerminalSessionRecord {
     /// field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adopted_from: Option<String>,
+    /// Unix millis of the most recent provider SessionStart hook that reported
+    /// this id ([`SessionLifecycleStore::note_session_start_hook`]) — when its
+    /// process last started (or resumed into) its terminal. The durable half of
+    /// [`SessionLifecycleStore::latest_open_on_terminal`]'s ranking, so a pane
+    /// whose operator ran `/resume` still resolves to the resumed session after
+    /// a restart. `None` = no hook seen, or the record predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_session_start_at: Option<i64>,
 }
 
 /// See [`TerminalSessionRecord::spawn_device_default`].
@@ -915,12 +974,14 @@ pub struct SessionLifecycleStore {
     /// and, per session id, the counter value of the most recent hook that
     /// reported it ([`Self::note_session_start_hook`]). It answers "which of the
     /// open sessions on this terminal STARTED most recently", which
-    /// [`Self::latest_open_on_terminal`] needs and no persisted field can say:
-    /// `confirmed_at` is monotonic (a typed `claude --resume X` of a session
-    /// confirmed earlier keeps X's OLD stamp) and `last_seen_at` is bumped by
-    /// every liveness touch of every open record. Process-local by design: a
-    /// runner restart re-spawns every PTY, and each restored provider fires its
-    /// hook again. LOCK ORDER — `map` then this, never the reverse.
+    /// [`Self::latest_open_on_terminal`] needs: `confirmed_at` is monotonic (a
+    /// typed `claude --resume X` of a session confirmed earlier keeps X's OLD
+    /// stamp) and `last_seen_at` is bumped by every liveness touch of every
+    /// open record. The durable twin is
+    /// [`TerminalSessionRecord::last_session_start_at`], which carries the
+    /// order across a restart — a holder-adopted pane fires no new hook. This
+    /// counter only breaks that stamp's ties and wall-clock steps.
+    /// LOCK ORDER — `map` then this, never the reverse.
     session_start_hooks: Mutex<(u64, HashMap<String, u64>)>,
     /// Optional write-only sink for the append-only snapshot HISTORY
     /// ([`crate::session::snapshot_history`], Phase 4 of the session-restore
@@ -930,6 +991,18 @@ pub struct SessionLifecycleStore {
     /// history is DERIVED from this store — never read back by it or by the
     /// restore path.
     snapshot_history: OnceLock<Arc<SnapshotHistory>>,
+    /// Optional observation epoch ([`crate::session::observation_epoch`]): the
+    /// last instant the liveness poll could see the process table, for the
+    /// prior process (latched at boot) and for this one. Restore admission
+    /// bounds the open-row anchor by it ([`RestoreAnchors`]). Unattached →
+    /// no prior epoch, and this process has never observed.
+    observation_epoch: OnceLock<Arc<ObservationEpoch>>,
+    /// Whether the prior shutdown marker attests a FINISHED teardown
+    /// ([`crate::session::shutdown_marker::BootClassification::teardown_complete`]),
+    /// attached at boot beside the epoch. It decides whether the marker may
+    /// anchor open rows ([`RestoreAnchors`]). Unattached → the marker the
+    /// caller passes is used as it always was.
+    prior_teardown_complete: OnceLock<bool>,
     /// Optional restore-registry → coord mirror (plan
     /// `2026-07-09-runner-session-history-cloud-sync` §3.4, Phase 4). When
     /// attached, every open-record write/refresh ([`record_open`](Self::record_open))
@@ -975,6 +1048,16 @@ pub struct SessionLifecycleStore {
     /// keeps an unmark from leaving coord saying `finished`. Unattached
     /// (tests, ephemeral fallbacks) → every change stays local-only.
     finish_observer: OnceLock<FinishObserver>,
+    /// Unix millis at which THIS runner process booted — the line between the
+    /// PRIOR process's rows and this one's own activity. The restore anchor
+    /// ([`RestoreAnchors`]) judges a row stamped before it against the prior
+    /// process's last moment of life, so a restore this process performs (a
+    /// `record_open` re-assert stamps `last_seen_at = now`) can never move the
+    /// window the rest of that cohort is measured against. Production:
+    /// [`crate::session::session_ledger::process_boot_ms`]. Tests:
+    /// `i64::MAX` (every fixture row is the prior life) unless a test sets it
+    /// with [`Self::set_boot_ms_for_test`].
+    boot_ms: AtomicI64,
     /// Serializes [`Self::set_finished`] END TO END — the map mutation AND the
     /// finish-observer hand-off — so the order coord's outbox receives
     /// finished / working rows in is the order the local marker changed in.
@@ -1028,8 +1111,8 @@ pub enum LocalOnlyReason {
     /// ephemeral stores), or the registrar it forwards to has been dropped.
     NoForwarder,
     /// The mark is already synced (coord ACKed it), so no coord write was
-    /// owed and none was queued: a no-op re-run on a synced mark, a no-op
-    /// unmark, or a reason-only rewrite on a synced mark.
+    /// owed and none was queued: a no-op re-run on a synced mark, or a no-op
+    /// unmark.
     NotRequeued,
 }
 
@@ -1048,12 +1131,13 @@ impl LocalOnlyReason {
 /// What a [`SessionLifecycleStore::set_finished`] call actually changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishChange {
-    /// The marker itself flipped (a fresh mark, or an unmark).
+    /// The marker itself was written: a fresh mark, a RESTAMP of an existing
+    /// one (a re-finish that carried a reason — `finished_at` moved to now and
+    /// coord is owed the write again), or an unmark.
     Marker,
-    /// The session was already finished; only `finish_reason` was rewritten.
-    ReasonOnly,
     /// Nothing was written — the marker was already in the requested state and
-    /// no reason was sent. The timestamp did not move.
+    /// no reason was sent (a read-back, or the retry door). The timestamp did
+    /// not move.
     None,
 }
 
@@ -1062,7 +1146,6 @@ impl FinishChange {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Marker => "marker",
-            Self::ReasonOnly => "reason_only",
             Self::None => "none",
         }
     }
@@ -1097,7 +1180,7 @@ impl FinishOutcome {
     ///
     /// ```json
     /// {"success": true, "session": <record>,
-    ///  "changed": "marker" | "reason_only" | "none",
+    ///  "changed": "marker" | "none",
     ///  "coord": {"queued": bool, "coordSessionId": <uuid|null>,
     ///            "reason": null | "no_coord_session" | "outbox_write_failed"
     ///                      | "no_forwarder" | "not_requeued"}}
@@ -1107,10 +1190,11 @@ impl FinishOutcome {
     /// the later verdict the drain's ACK stamps. A caller that must know coord
     /// APPLIED the mark re-reads `finishSynced`.
     ///
-    /// `queued: true` beside `changed: "reason_only"` re-queues the finished
-    /// MARKER, not the reason: the `Finished` row's payload carries no reason
-    /// text, so coord never receives the new reason — it lives in the local
-    /// record only.
+    /// `changed: "marker"` on an already-finished session is a RESTAMP: the
+    /// mark's `finishedAt` moved to now and `finishSynced` is `false` again
+    /// until coord ACKs the re-sent write. That write carries the new time
+    /// (as `last_progress_at`), never the reason text: the `Finished` row's
+    /// payload carries no reason, so a reason lives in the local record only.
     pub fn response_json(&self) -> serde_json::Value {
         let coord = match self.coord {
             FinishSync::Queued { coord_session_id } => serde_json::json!({
@@ -1172,6 +1256,9 @@ impl SessionLifecycleStore {
         let wal_path = wal_path_for(&path);
         let mut map = load_map(&path);
         let replay = replay_wal(&wal_path, &mut map);
+        // A held row is unbound by rule; a file written before the rule (or by
+        // hand) may still carry its old terminal id.
+        let detached = detach_held_rows(&mut map, Utc::now().timestamp_millis());
         let store = Self {
             path,
             wal_path,
@@ -1180,10 +1267,13 @@ impl SessionLifecycleStore {
             superseded_terminals: Mutex::new(HashSet::new()),
             session_start_hooks: Mutex::new((0, HashMap::new())),
             snapshot_history: OnceLock::new(),
+            observation_epoch: OnceLock::new(),
+            prior_teardown_complete: OnceLock::new(),
             restore_emitter: OnceLock::new(),
             transcript_probe: OnceLock::new(),
             close_observer: OnceLock::new(),
             finish_observer: OnceLock::new(),
+            boot_ms: AtomicI64::new(default_boot_ms()),
             finish_forward: Mutex::new(()),
         };
         if replay.applied > 0 || replay.damaged {
@@ -1193,6 +1283,14 @@ impl SessionLifecycleStore {
                 path = %store.wal_path.display(),
                 "session_lifecycle_store: replayed write-ahead log — folding into the snapshot"
             );
+        }
+        if detached > 0 {
+            info!(
+                detached,
+                "session_lifecycle_store: detached held rows from their old terminals at load"
+            );
+        }
+        if replay.applied > 0 || replay.damaged || detached > 0 {
             store.compact();
         }
         Ok(store)
@@ -1232,6 +1330,28 @@ impl SessionLifecycleStore {
     pub fn attach_snapshot_history(&self, history: Arc<SnapshotHistory>) {
         if self.snapshot_history.set(history).is_err() {
             warn!("session_lifecycle_store: snapshot history already attached — ignoring");
+        }
+    }
+
+    /// Attach the observation epoch (once, at startup, BEFORE the restore
+    /// census latches — it is an admission input).
+    pub fn attach_observation_epoch(&self, epoch: Arc<ObservationEpoch>) {
+        if self.observation_epoch.set(epoch).is_err() {
+            warn!("session_lifecycle_store: observation epoch already attached — ignoring");
+        }
+    }
+
+    /// The attached observation epoch — the liveness poll records its
+    /// successful ticks through it.
+    pub fn observation_epoch(&self) -> Option<&Arc<ObservationEpoch>> {
+        self.observation_epoch.get()
+    }
+
+    /// Attach whether the prior shutdown's teardown finished (once, at
+    /// startup, BEFORE the restore census latches — it is an admission input).
+    pub fn attach_prior_teardown_complete(&self, complete: bool) {
+        if self.prior_teardown_complete.set(complete).is_err() {
+            warn!("session_lifecycle_store: prior teardown bit already attached — ignoring");
         }
     }
 
@@ -1317,6 +1437,25 @@ impl SessionLifecycleStore {
         self.transcript_probe
             .get()
             .map(|p| p.transcript_exists(session_id, Some(working_dir)))
+    }
+
+    /// WHICH config dirs hold `session_id`'s transcript — the account
+    /// evidence the boot restore uses when a record carries no `config_dir`.
+    ///
+    /// Guarded exactly like [`Self::probe_transcript_exists`]: `None` (UNKNOWN)
+    /// for a missing/blank `working_dir`, for no attached probe, and for a
+    /// probe that answers existence only. `Some(vec![])` is a real "no dir
+    /// holds it". Shares that method's documented blind spots (the provider
+    /// cwd vs the PTY cwd, and a config-dir set snapshotted at startup).
+    pub fn probe_transcript_config_dirs(
+        &self,
+        session_id: &str,
+        working_dir: Option<&str>,
+    ) -> Option<Vec<std::path::PathBuf>> {
+        let working_dir = working_dir.filter(|s| !s.trim().is_empty())?;
+        self.transcript_probe
+            .get()?
+            .transcript_config_dirs(session_id, Some(working_dir))
     }
 
     /// Project the registry into snapshot entries, stamping restorability from
@@ -1572,6 +1711,14 @@ impl SessionLifecycleStore {
             entry.state = "open".to_string();
             entry.closed_at = None;
             entry.close_reason = None;
+            // A (re-)opened session BOUND to a terminal is no longer waiting
+            // for an account choice — the verified resume that re-asserts it
+            // ends the wait. A re-record that leaves the row unbound (a blank
+            // incoming terminal over a held, detached row) is not a bind, so
+            // the hold stays — the same rule as [`Self::rebind_terminal`].
+            if !entry.terminal_id.trim().is_empty() {
+                entry.awaiting_account_since = None;
+            }
             entry.last_seen_at = now;
             let merged = entry.clone();
 
@@ -1615,6 +1762,8 @@ impl SessionLifecycleStore {
             let mut superseded: Vec<TerminalSessionRecord> = Vec::new();
             if (new_is_authoritative || new_is_confirmed) && !new_terminal_id.is_empty() {
                 for other in m.values_mut() {
+                    // A row held for an account choice is never a sibling: the
+                    // hold detached its terminal, so it cannot share this one.
                     if other.claude_session_id == new_id
                         || other.terminal_id != new_terminal_id
                         || other.state != "open"
@@ -1775,7 +1924,7 @@ impl SessionLifecycleStore {
     ///   winner, and report [`CloseOutcome::RedirectedAmbiguous`] naming every
     ///   candidate. A nondeterministic close would be a worse failure than the
     ///   silent no-op it replaces, because it is not reproducible — which is
-    ///   why this must not be a single-match `find_open_by_terminal` call.
+    ///   why this must not be a first-match `.find()` over the map.
     /// * Nothing resolves — [`CloseOutcome::NotFound`], `warn!` with both ids,
     ///   and **no row is mutated and no observer fires**.
     ///
@@ -1829,7 +1978,6 @@ impl SessionLifecycleStore {
                 };
             }
         }
-
         let (outcome, closed_id, closed, closed_workdir, workdir_still_in_use) = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
@@ -1937,6 +2085,182 @@ impl SessionLifecycleStore {
         outcome
     }
 
+    /// Note that `claude_session_id` was NOT resumed because its account is
+    /// unknown, and is waiting for the operator to choose one: stamps
+    /// [`TerminalSessionRecord::awaiting_account_since`] (the row's current
+    /// `last_seen_at`) on the first mark, which starts the hold
+    /// ([`awaiting_account_hold`]). A re-mark while the hold is running keeps
+    /// the original stamp, so a restart cannot reset the hold's clock. A re-mark
+    /// after the hold EXPIRED is re-stamped from the current `last_seen_at`; the
+    /// hold never refreshes that, so a new hold starts only if the row was seen
+    /// since.
+    ///
+    /// A running hold DETACHES the row's terminal (`terminal_id` cleared): the
+    /// row has no pane by design, and its old terminal id may already host
+    /// another session — see [`awaiting_account_hold`]. `page_id` and
+    /// `zone_index` stay, for placement. Only a bind ends the hold and re-binds
+    /// the row ([`Self::record_open`] on a verified resume).
+    ///
+    /// No write when nothing changes. Absent, closed or finished record (none
+    /// of which the hold can hold) → no-op.
+    ///
+    /// Never holds a LIVE session: when the row is still bound to a terminal
+    /// that `terminal_is_live` reports as a live PTY of this process, the mark
+    /// is DECLINED (no stamp, no detach) — that pane is the session, and
+    /// detaching it would cut a running session off its own terminal. The
+    /// liveness is passed in so the store stays free of the `TerminalManager`;
+    /// the Tauri command supplies the manager's live set.
+    pub fn mark_awaiting_account(
+        &self,
+        claude_session_id: &str,
+        now_ms: i64,
+        terminal_is_live: &dyn Fn(&str) -> bool,
+    ) {
+        let changed = {
+            let mut m = match self.map.lock() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "session_lifecycle_store: lock poisoned on mark_awaiting_account");
+                    return;
+                }
+            };
+            let Some(rec) = m
+                .get_mut(claude_session_id)
+                .filter(|r| r.state == "open" && r.finished_at.is_none())
+            else {
+                debug!(
+                    claude_session_id,
+                    "session_lifecycle_store: no open, unfinished record — awaiting-account mark dropped"
+                );
+                return;
+            };
+            if !rec.terminal_id.trim().is_empty() && terminal_is_live(&rec.terminal_id) {
+                warn!(
+                    claude_session_id,
+                    terminal_id = %rec.terminal_id,
+                    "session_lifecycle_store: awaiting-account mark DECLINED — the row's \
+                     terminal is a live PTY (a live session is never held or detached)"
+                );
+                return;
+            }
+            let before = (rec.awaiting_account_since, rec.terminal_id.clone());
+            // A stamp past the prune age is an ENDED hold, not a running one:
+            // it is treated as absent, so the mark re-stamps.
+            if !awaiting_account_hold(rec, now_ms) {
+                rec.awaiting_account_since = Some(rec.last_seen_at);
+            }
+            if awaiting_account_hold(rec, now_ms) && !rec.terminal_id.is_empty() {
+                info!(
+                    claude_session_id,
+                    terminal_id = %rec.terminal_id,
+                    "session_lifecycle_store: held for an account choice — detached from its old terminal"
+                );
+                rec.terminal_id.clear();
+            }
+            if (rec.awaiting_account_since, rec.terminal_id.clone()) == before {
+                return; // already stamped and unbound — nothing to flush
+            }
+            let changed = rec.clone();
+            self.persist(
+                m,
+                &[LifecycleDelta::Upsert {
+                    rec: Box::new(changed.clone()),
+                }],
+            );
+            changed
+        };
+        self.snapshot_change(std::iter::once(changed));
+    }
+
+    /// The liveness poll's hold for a row waiting for an account choice:
+    /// `true` when [`awaiting_account_hold`] holds the row at `now_ms`, so the
+    /// poll must neither close it `no-terminal` nor count toward closing it.
+    /// `false` → classify the row as usual.
+    ///
+    /// The hold is read from the durable stamp alone and NEVER refreshes
+    /// `last_seen_at`: a refresh fed the restore anchor, so an intermediate
+    /// boot that held a row for one poll tick moved the next crash boot's
+    /// anchor to that tick and stranded every un-held open row of the cohort.
+    /// The row stays on the roster and in the restore set by the hold itself
+    /// ([`restore_admissible`]).
+    ///
+    /// Bounded: once the stamp is more than the open-row prune age
+    /// ([`OPEN_STALE_MS`], 7 days) old, the wait ends — the stamp is cleared
+    /// and the row is classified as usual (closed `no-terminal` like any
+    /// orphan).
+    pub fn poll_hold_awaiting_account(&self, claude_session_id: &str, now_ms: i64) -> bool {
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on poll_hold_awaiting_account");
+                return false;
+            }
+        };
+        let Some(rec) = m.get_mut(claude_session_id) else {
+            return false;
+        };
+        if awaiting_account_hold(rec, now_ms) {
+            return true;
+        }
+        if rec.state != "open" || rec.awaiting_account_since.is_none() {
+            return false;
+        }
+        info!(
+            claude_session_id,
+            "session_lifecycle_store: account choice unanswered past the open-row \
+             prune age — no longer held"
+        );
+        rec.awaiting_account_since = None;
+        let changed = rec.clone();
+        self.persist(
+            m,
+            &[LifecycleDelta::Upsert {
+                rec: Box::new(changed),
+            }],
+        );
+        false
+    }
+
+    /// Hold, at BOOT, every restore candidate the frontend's boot restore will
+    /// leave `needs-account` because its account cannot be named from evidence.
+    ///
+    /// Restore is lazy per page: the frontend marks a row only when ITS page
+    /// restores, and the poll closes an unmatched open row `no-terminal` after
+    /// ~3 minutes, so a page opened later would have found its needs-account
+    /// rows already gone.
+    ///
+    /// The predicate is [`boot_restore_needs_account`] — the frontend's
+    /// `classifyRestoreAction` gates (valid id, authoritative or observed
+    /// origin, confirmed, transcript not probed absent, a full-tier Claude
+    /// provider) followed by `resolveRestoreAccount`'s evidence half
+    /// ([`crate::session::session_ledger::resolve_config_dir`] over `probe`'s
+    /// transcript holders). A row the frontend would restore terminal-only or
+    /// skip is never held. The frontend's account rule also refuses a
+    /// resolvable dir that is shell-unsafe or may be an unreadable default
+    /// home — this set is narrower by exactly those rows, which the frontend
+    /// marks when their page opens. Returns the ids held.
+    pub fn hold_unresolved_account_candidates(
+        &self,
+        prior_marker_at: Option<i64>,
+        boot_was_clean: bool,
+        probe: &dyn TranscriptProbe,
+    ) -> Vec<String> {
+        let now_ms = Utc::now().timestamp_millis();
+        let held: Vec<String> = self
+            .restorable_records(prior_marker_at, boot_was_clean)
+            .into_iter()
+            .filter(|r| r.state == "open" && r.task_run_id.is_none())
+            .filter(|r| boot_restore_needs_account(r, probe))
+            .map(|r| r.claude_session_id)
+            .collect();
+        // At boot no PTY of THIS process exists yet, and terminal ids are
+        // per-process, so no held row's recorded terminal can be live here.
+        for id in &held {
+            self.mark_awaiting_account(id, now_ms, &|_| false);
+        }
+        held
+    }
+
     /// Bump `last_seen_at` on a present session. No-op (no write) if absent.
     pub fn touch(&self, claude_session_id: &str) {
         let now = Utc::now().timestamp_millis();
@@ -1970,9 +2294,9 @@ impl SessionLifecycleStore {
     /// `TerminalSession` title, so the durable registry stayed frozen at the
     /// spawn-time title and a restart restored the pane under a stale name.
     /// Keyed by terminal id because the rename call sites hold only that —
-    /// same resolution [`Self::find_open_by_terminal`] performs. No-op (no
-    /// write) if no open record references the terminal, or the title is
-    /// already current.
+    /// the same row [`Self::find_open_by_terminal`] resolves (the session
+    /// running there). No-op (no write) if no open record references the
+    /// terminal, or the title is already current.
     pub fn update_title_by_terminal(&self, terminal_id: &str, title: &str) {
         let changed = {
             let mut m = match self.map.lock() {
@@ -1982,11 +2306,11 @@ impl SessionLifecycleStore {
                     return;
                 }
             };
-            let Some(rec) = m
-                .values_mut()
-                .find(|r| r.state == "open" && r.terminal_id == terminal_id)
-            else {
+            let Some(id) = self.ranked_open_id(&m, terminal_id, |_| true) else {
                 return; // no open record hosts this terminal — nothing to flush
+            };
+            let Some(rec) = m.get_mut(&id) else {
+                return;
             };
             if rec.title.as_deref() == Some(title) {
                 return; // already current — nothing to flush
@@ -2061,6 +2385,12 @@ impl SessionLifecycleStore {
             }
             rec.terminal_id = terminal_id.to_string();
             rec.zone_index = zone_index;
+            // A row bound to a terminal is no longer held: a held row is
+            // unbound by rule ([`awaiting_account_hold`]), so a bind ends the
+            // hold rather than leaving a held row contesting a terminal.
+            if !rec.terminal_id.trim().is_empty() {
+                rec.awaiting_account_since = None;
+            }
             let changed = rec.clone();
             self.persist(
                 m,
@@ -2078,8 +2408,11 @@ impl SessionLifecycleStore {
     /// in-memory `TerminalSession.page_id`; without this flush the durable
     /// record stays frozen at the spawn-time page, so a restart would restore
     /// the pane on its original page rather than where the operator moved it.
-    /// Sibling of [`Self::update_title_by_terminal`]. No-op (no write) if no
-    /// open record references the terminal, or the page is already current.
+    /// Sibling of [`Self::update_title_by_terminal`], but applied to EVERY
+    /// open record on the terminal: the page is where the pane sits, not a
+    /// property of whichever session runs in it, and a terminal can carry
+    /// several open rows. No-op (no write) if no open record references the
+    /// terminal, or every page is already current.
     pub fn update_page_by_terminal(&self, terminal_id: &str, page_id: &str) {
         let changed = {
             let mut m = match self.map.lock() {
@@ -2089,26 +2422,27 @@ impl SessionLifecycleStore {
                     return;
                 }
             };
-            let Some(rec) = m
+            let changed: Vec<TerminalSessionRecord> = m
                 .values_mut()
-                .find(|r| r.state == "open" && r.terminal_id == terminal_id)
-            else {
-                return; // no open record hosts this terminal — nothing to flush
-            };
-            if rec.page_id == page_id {
-                return; // already current — nothing to flush
+                .filter(|r| open_on_terminal(r, terminal_id) && r.page_id != page_id)
+                .map(|rec| {
+                    rec.page_id = page_id.to_string();
+                    rec.clone()
+                })
+                .collect();
+            if changed.is_empty() {
+                return; // nothing hosts this terminal, or already current
             }
-            rec.page_id = page_id.to_string();
-            let changed = rec.clone();
-            self.persist(
-                m,
-                &[LifecycleDelta::Upsert {
-                    rec: Box::new(changed.clone()),
-                }],
-            );
+            let deltas: Vec<LifecycleDelta> = changed
+                .iter()
+                .map(|r| LifecycleDelta::Upsert {
+                    rec: Box::new(r.clone()),
+                })
+                .collect();
+            self.persist(m, &deltas);
             changed
         };
-        self.snapshot_change(std::iter::once(changed));
+        self.snapshot_change(changed);
     }
 
     /// Mark a present session as restore-pending (a boot-restore is about to
@@ -2131,7 +2465,18 @@ impl SessionLifecycleStore {
     /// the poll observes the session confidently alive). Stamping optimistically
     /// instead would let a restore that silently died report `resumed`, which is
     /// the one direction the census must never be wrong in.
-    pub fn mark_restore_pending(&self, claude_session_id: &str) {
+    ///
+    /// ## `boot = false`: an operator-initiated resume
+    ///
+    /// A zone-profile resume (`resumeProfileSession`) needs the poll guard but
+    /// is NOT a boot restore, so it sets `restore_pending_at` ONLY — stamping
+    /// the boot markers would count it in the restore census
+    /// (`restore_census::observe_restored`) and the ledger's came-back set. It
+    /// also skips a non-open row: an operator resume of a closed row has
+    /// nothing for the poll to guard, and a pending marker on it would never
+    /// be cleared. Clearing via [`Self::clear_restore_pending`] is unchanged —
+    /// it promotes the tier only on a row carrying `restored_from_boot_at`.
+    pub fn mark_restore_pending(&self, claude_session_id: &str, boot: bool) {
         let now = Utc::now().timestamp_millis();
         let mut m = match self.map.lock() {
             Ok(m) => m,
@@ -2141,13 +2486,17 @@ impl SessionLifecycleStore {
             }
         };
         let changed = match m.get_mut(claude_session_id) {
-            Some(rec) => {
+            Some(rec) if boot => {
                 rec.restore_pending_at = Some(now);
                 rec.restored_from_boot_at = Some(now);
                 rec.restore_tier = Some(RESTORE_TIER_FAILED.to_string());
                 rec.clone()
             }
-            None => return,
+            Some(rec) if rec.state == "open" => {
+                rec.restore_pending_at = Some(now);
+                rec.clone()
+            }
+            _ => return,
         };
         self.persist(
             m,
@@ -2175,23 +2524,53 @@ impl SessionLifecycleStore {
     /// running until it exits on its own.
     ///
     /// For a known session it returns a [`FinishOutcome`] naming what changed
-    /// — the marker, only the reason, or nothing — and whether coord was told
-    /// ([`FinishSync`]), so a caller can report what actually landed rather
-    /// than what it asked for, and a re-run can read the current sync verdict
-    /// instead of an error.
+    /// — the marker, or nothing — and whether coord was told ([`FinishSync`]),
+    /// so a caller can report what actually landed rather than what it asked
+    /// for, and a re-run can read the current sync verdict instead of an
+    /// error.
+    ///
+    /// **A re-finish that carries a reason RESTAMPS** (plan
+    /// `2026-10-23-coord-records-a-session-finished-but-not-when-so-a-revival-cannot-be-told-from-a-re-finish`,
+    /// Phase 3): `finished_at` moves to now (always a stamp DIFFERENT from the
+    /// old one — see `restamp_at`), `finish_synced` is cleared and the finish
+    /// is re-sent to coord carrying the new time as its write instant. So a
+    /// session revived after its first finish and finished again carries the
+    /// SECOND finish time locally, and coord is told it.
+    ///
+    /// Whether coord's own clock follows depends on the COORD build. A coord
+    /// carrying that plan's Phase 2 (in flight at this writing) moves its
+    /// transition clock (`state_started_at`, served as `since`) on every
+    /// finish, finished → finished included. An older coord moves it only when
+    /// the status actually CHANGES: a revival coord saw (the row moved off
+    /// `finished`) re-dates it on either build, but a re-finish of a row coord
+    /// still reads `finished` does not, so there `sessionStatusSince` can LAG
+    /// this `finished_at`. The re-sent row
+    /// carries the new stamp, so only coord's ACK of THAT write pairs with the
+    /// new mark ([`Self::mark_finish_synced`]); a late ACK of the old row is a
+    /// stale one and is ignored. Reported as [`FinishChange::Marker`], since
+    /// the mark — not only its reason — was rewritten.
+    ///
+    /// The REASON is the discriminator because it is the one the finish
+    /// protocol already draws: every declaring caller sends one
+    /// (`/finish-session`'s Step 1, `/unattended`, `/rewind-session`), while the
+    /// read-back after a finish is a reason-less re-POST whose whole job is to
+    /// read `finishSynced`. Restamping that read-back would clear the very flag
+    /// it reads, on every read, so it could never observe coord's ACK. A
+    /// reason equal to the stored one still restamps: it is a new declaration
+    /// that happens to give the same why.
     ///
     /// [`SetFinishedError::UnknownSession`] means the id is unknown, and
     /// nothing else; a poisoned registry lock is
     /// [`SetFinishedError::Unavailable`], so an unreadable registry can never
     /// read as "no such session".
     ///
-    /// A no-op re-finish on a mark coord has NOT ACKed (`finish_synced:
-    /// false`) is the retry door: nothing local is written (`changed:
-    /// None`), but the owed coord write is re-offered to the finish observer
-    /// and its verdict returned — so a mark that stayed local-only (no coord
-    /// row yet, an outbox write failure) can be pushed again by re-running the
-    /// same call. A duplicate enqueue is harmless (idempotent path-addressed
-    /// PATCH).
+    /// A re-finish with NO reason (or a blank one) is a no-op. On a mark coord
+    /// has NOT ACKed (`finish_synced: false`) it is the retry door: nothing
+    /// local is written (`changed: None`), but the owed coord write is
+    /// re-offered to the finish observer and its verdict returned — so a mark
+    /// that stayed local-only (no coord row yet, an outbox write failure) can
+    /// be pushed again by a reason-less re-run. A duplicate enqueue is harmless
+    /// (idempotent path-addressed PATCH).
     ///
     /// Each re-run while the mark stays unsynced appends one more `Finished`
     /// row, including while an earlier one is still pending: the outbox has
@@ -2227,14 +2606,15 @@ impl SessionLifecycleStore {
             .get_mut(claude_session_id)
             .ok_or(SetFinishedError::UnknownSession)?;
 
-        // A blank reason is no reason, and a reason equal to the stored one
-        // rewrites nothing — both are no-ops, never a `reason_only` change.
+        // A blank reason is no reason.
         let reason = non_empty(reason);
-        // Idempotent: re-finishing an already-finished session must not move
-        // its timestamp, or every repeat call would look like fresh work.
-        if finished == rec.finished_at.is_some()
-            && (!finished || reason.is_none() || reason == rec.finish_reason)
-        {
+        // A reason-less re-finish is a READ (the finish protocol's read-back,
+        // or the retry door) and must not move the timestamp: restamping it
+        // would clear `finish_synced` on every read-back, so the read-back
+        // could never see coord's ACK. A re-finish WITH a reason is a new
+        // declaration and falls through to the restamp below. A repeated
+        // unmark is a no-op whatever it carries.
+        if finished == rec.finished_at.is_some() && (!finished || reason.is_none()) {
             let current = rec.clone();
             // Release the map lock BEFORE the observer runs (it may read the
             // store, and it enqueues to the outbox). `finish_forward` stays
@@ -2253,24 +2633,22 @@ impl SessionLifecycleStore {
             });
         }
 
-        // Past the guard, an already-finished record can only be a reason
-        // rewrite (`finished` and a `reason` sent); anything else flips it.
-        let changed_kind = if finished && rec.finished_at.is_some() {
-            FinishChange::ReasonOnly
-        } else {
-            FinishChange::Marker
-        };
-
         if finished {
-            if rec.finished_at.is_none() {
-                rec.finished_at = Some(now);
-                // A fresh mark is unsynced by definition — the outbox owes coord
-                // a write, and the boot reconcile must not revert it meanwhile.
-                rec.finish_synced = false;
-            }
+            rec.finished_at = Some(match rec.finished_at {
+                None => now,
+                // A RESTAMP (a re-finish that carried a reason).
+                Some(prev) => restamp_at(prev, now),
+            });
+            // A fresh or restamped mark is unsynced by definition — the outbox
+            // owes coord a write, and the boot reconcile must not revert it
+            // meanwhile.
+            rec.finish_synced = false;
             if let Some(r) = reason {
                 rec.finish_reason = Some(r);
             }
+            // A session marked finished is not coming back — nothing to wait
+            // for ([`awaiting_account_hold`] also refuses a finished row).
+            rec.awaiting_account_since = None;
         } else {
             rec.finished_at = None;
             rec.finish_reason = None;
@@ -2285,19 +2663,14 @@ impl SessionLifecycleStore {
             }],
         );
         // Notify AFTER the durable local write and outside the map lock (the
-        // guard was consumed by `persist`). Fires for every write that owes
-        // coord a write — a fresh mark, a reason update on a mark coord has not
-        // ACKed yet, or an unmark (reaching here means it really changed). A
-        // duplicate enqueue is harmless: both coord writes are idempotent
-        // path-addressed PATCHes.
-        let coord = if changed.finished_at.is_none() || !changed.finish_synced {
-            self.forward_finish_change(&changed)
-        } else {
-            FinishSync::LocalOnly(LocalOnlyReason::NotRequeued)
-        };
+        // guard was consumed by `persist`). Every write that reaches here owes
+        // coord a write — a fresh mark, a restamp, or an unmark (reaching here
+        // means it really changed). A duplicate enqueue is harmless: both coord
+        // writes are idempotent path-addressed PATCHes.
+        let coord = self.forward_finish_change(&changed);
         Ok(FinishOutcome {
             record: changed,
-            changed: changed_kind,
+            changed: FinishChange::Marker,
             coord,
         })
     }
@@ -2320,9 +2693,9 @@ impl SessionLifecycleStore {
     /// the operator unmarked the session must not resurrect the marker.
     ///
     /// `acked_finished_at` is the `finished_at` the ACKed write carried. When
-    /// `Some`, only the SAME mark is stamped: after mark → unmark → re-mark, a
-    /// late ACK for the first mark must not report the second as synced
-    /// before its own write has drained. `None` stamps whatever mark is
+    /// `Some`, only the SAME mark is stamped: after mark → unmark → re-mark, or
+    /// a restamp, a late ACK for the first mark must not report the second as
+    /// synced before its own write has drained. `None` stamps whatever mark is
     /// current (a row written without the field).
     pub fn mark_finish_synced(&self, claude_session_id: &str, acked_finished_at: Option<i64>) {
         let mut m = match self.map.lock() {
@@ -2647,15 +3020,14 @@ impl SessionLifecycleStore {
                 return false;
             }
         };
-        // The FIRST open record on the terminal. That is the spawn's record
-        // because a terminal hosts at most ONE live provider session — the
-        // single-tenant-terminal invariant `record_open` enforces by superseding
-        // siblings. If that invariant ever loosened, this pick would become a
-        // guess and must be keyed by session id instead.
-        let Some(rec) = m
-            .values_mut()
-            .find(|r| r.state == "open" && r.terminal_id == terminal_id)
-        else {
+        // The open record ranked as the session running on the terminal. A
+        // terminal can carry several open rows (`record_open` supersedes only
+        // unconfirmed siblings), so this is the ranked pick, not a first match;
+        // the `opened_at` gate below still refuses a row older than the spawn.
+        let rec = self
+            .ranked_open_id(&m, terminal_id, |_| true)
+            .and_then(|id| m.get_mut(&id));
+        let Some(rec) = rec else {
             debug!(
                 terminal_id,
                 "session_lifecycle_store: no open record for terminal — spawn default dropped"
@@ -2825,20 +3197,20 @@ impl SessionLifecycleStore {
         );
     }
 
-    /// Clone of the open record currently hosted by `terminal_id`, if any.
-    /// Terminal ids are fresh per PTY spawn, so at most one OPEN record can
-    /// reference a given terminal at a time.
+    /// Clone of the open record whose session is RUNNING on `terminal_id`, if
+    /// any. A blank id resolves to nothing — it is how an unbound row (a held
+    /// one included) is represented.
+    ///
+    /// A terminal can carry several open rows at once — a pane whose operator
+    /// ran `/resume` (or typed `claude --resume X`) keeps the pane's original
+    /// confirmed row open beside the resumed one, because the hook bind evicts
+    /// only UNCONFIRMED siblings. So this is NOT a first match over the
+    /// `HashMap`: it picks the same row [`Self::latest_open_on_terminal`]
+    /// ranks highest. A first match once made the token-exhaustion migration
+    /// resume a 7-day-stale pane session and close the pane running the real
+    /// one (2026-10-29, terminal `5b27af82`).
     pub fn find_open_by_terminal(&self, terminal_id: &str) -> Option<TerminalSessionRecord> {
-        match self.map.lock() {
-            Ok(m) => m
-                .values()
-                .find(|r| r.state == "open" && r.terminal_id == terminal_id)
-                .cloned(),
-            Err(e) => {
-                warn!(error = %e, "session_lifecycle_store: lock poisoned on find_open_by_terminal");
-                None
-            }
-        }
+        self.ranked_open_on_terminal(terminal_id, |_| true)
     }
 
     /// Like [`Self::find_open_by_terminal`], but only returns a CONFIRMED
@@ -2867,24 +3239,49 @@ impl SessionLifecycleStore {
         &self,
         terminal_id: &str,
     ) -> Option<TerminalSessionRecord> {
-        self.find_open_by_terminal(terminal_id)
-            .filter(|r| r.confirmed_at.is_some())
+        self.ranked_open_on_terminal(terminal_id, |r| r.confirmed_at.is_some())
     }
 
     /// Record that a provider's SessionStart hook just reported
     /// `claude_session_id` — the process that hook came from is now the one
-    /// running in its terminal. Feeds [`Self::latest_open_on_terminal`].
+    /// running in its terminal. Feeds [`Self::latest_open_on_terminal`]: the
+    /// process-local order, and the durable
+    /// [`TerminalSessionRecord::last_session_start_at`] stamp that carries the
+    /// answer across a restart. Never creates a record.
     pub fn note_session_start_hook(&self, claude_session_id: &str) {
-        match self.session_start_hooks.lock() {
-            Ok(mut g) => {
-                g.0 += 1;
-                let seq = g.0;
-                g.1.insert(claude_session_id.to_string(), seq);
+        let now = Utc::now().timestamp_millis();
+        match self.map.lock() {
+            Ok(mut m) => {
+                if let Some(rec) = m.get_mut(claude_session_id) {
+                    rec.last_session_start_at = Some(now);
+                    let changed = rec.clone();
+                    // Not snapshotted or mirrored: the stamp is a ranking
+                    // input for terminal lookups, not layout or wire state.
+                    self.persist(
+                        m,
+                        &[LifecycleDelta::Upsert {
+                            rec: Box::new(changed),
+                        }],
+                    );
+                }
             }
             Err(e) => {
                 warn!(error = %e, "session_lifecycle_store: lock poisoned on note_session_start_hook");
             }
         }
+        let mut g = self.hook_order();
+        g.0 += 1;
+        let seq = g.0;
+        g.1.insert(claude_session_id.to_string(), seq);
+    }
+
+    /// The process-local hook order. A poisoned lock is recovered rather than
+    /// refused: the guarded data is a counter and a map with no invariant a
+    /// panic can break, and refusing would blank every terminal lookup.
+    fn hook_order(&self) -> std::sync::MutexGuard<'_, (u64, HashMap<String, u64>)> {
+        self.session_start_hooks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     /// The MOST RECENT open session on `terminal_id`, other than `exclude` —
@@ -2894,51 +3291,74 @@ impl SessionLifecycleStore {
     /// pinned to P whose operator then typed `claude --resume X`: the hook
     /// bind evicts only UNCONFIRMED siblings, confirming runs no supersede
     /// scan, and liveness keeps both alive while any provider runs in the
-    /// subtree), so [`Self::find_open_by_terminal`]'s first-match over the
-    /// `HashMap` would pick one by iteration order. This ranks instead, greatest
-    /// wins:
+    /// subtree), so a first match over the `HashMap` would pick one by
+    /// iteration order. This ranks instead, greatest wins:
     ///
     /// 1. the latest SessionStart hook seen for the id in this process
     ///    ([`Self::note_session_start_hook`]) — a row with one outranks a row
     ///    without;
-    /// 2. then `confirmed_at` (a confirmed row outranks an unconfirmed one);
-    /// 3. then `last_seen_at`, then `opened_at`;
-    /// 4. then `claude_session_id`, so the choice is deterministic even on a
+    /// 2. then the durable [`TerminalSessionRecord::last_session_start_at`] —
+    ///    the same fact, surviving a restart or a holder handoff, whose adopted
+    ///    panes fire no new hook;
+    /// 3. then `confirmed_at` (a confirmed row outranks an unconfirmed one);
+    /// 4. then `last_seen_at`, then `opened_at`;
+    /// 5. then `claude_session_id`, so the choice is deterministic even on a
     ///    full tie.
     ///
-    /// The hook order comes first because `confirmed_at` is monotonic: a typed
-    /// resume of a session confirmed BEFORE the pane's own session keeps the
-    /// older stamp and would lose to the pane on `confirmed_at` alone.
+    /// Hook order comes before `confirmed_at` because `confirmed_at` is
+    /// monotonic: a typed resume of a session confirmed BEFORE the pane's own
+    /// session keeps the older stamp and would lose to the pane on
+    /// `confirmed_at` alone. The process-local order leads the durable stamp
+    /// because it cannot be misordered by a wall-clock step.
     pub fn latest_open_on_terminal(
         &self,
         terminal_id: &str,
         exclude: &str,
     ) -> Option<TerminalSessionRecord> {
-        if terminal_id.trim().is_empty() {
-            return None;
-        }
+        self.ranked_open_on_terminal(terminal_id, |r| r.claude_session_id != exclude)
+    }
+
+    /// The open row on `terminal_id` that `admit` accepts and that ranks
+    /// highest by [`Self::latest_open_on_terminal`]'s order — the selector
+    /// behind the "which session is running on this terminal" reads and the
+    /// terminal-keyed writes. (Closing by terminal ranks differently, by
+    /// [`open_authority_key`]: it settles which row a dead PTY's exit closes.)
+    fn ranked_open_on_terminal(
+        &self,
+        terminal_id: &str,
+        admit: impl Fn(&TerminalSessionRecord) -> bool,
+    ) -> Option<TerminalSessionRecord> {
         let m = match self.map.lock() {
             Ok(m) => m,
             Err(e) => {
-                warn!(error = %e, "session_lifecycle_store: lock poisoned on latest_open_on_terminal");
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on ranked_open_on_terminal");
                 return None;
             }
         };
-        let hooks = match self.session_start_hooks.lock() {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(error = %e, "session_lifecycle_store: hook-order lock poisoned on latest_open_on_terminal");
-                return None;
-            }
-        };
+        let id = self.ranked_open_id(&m, terminal_id, admit)?;
+        m.get(&id).cloned()
+    }
+
+    /// Id of the row [`Self::ranked_open_on_terminal`] picks, for a caller
+    /// already holding `map`. Takes the hook-order lock, so it keeps the
+    /// store's LOCK ORDER — `map` then hooks.
+    fn ranked_open_id(
+        &self,
+        m: &HashMap<String, TerminalSessionRecord>,
+        terminal_id: &str,
+        admit: impl Fn(&TerminalSessionRecord) -> bool,
+    ) -> Option<String> {
+        if terminal_id.trim().is_empty() {
+            return None;
+        }
+        let hooks = self.hook_order();
         m.values()
-            .filter(|r| {
-                r.state == "open" && r.terminal_id == terminal_id && r.claude_session_id != exclude
-            })
+            .filter(|r| open_on_terminal(r, terminal_id) && admit(r))
             .max_by(|a, b| {
                 let key = |r: &TerminalSessionRecord| {
                     (
                         hooks.1.get(&r.claude_session_id).copied(),
+                        r.last_session_start_at,
                         r.confirmed_at,
                         r.last_seen_at,
                         r.opened_at,
@@ -2948,7 +3368,7 @@ impl SessionLifecycleStore {
                     .cmp(&key(b))
                     .then_with(|| a.claude_session_id.cmp(&b.claude_session_id))
             })
-            .cloned()
+            .map(|r| r.claude_session_id.clone())
     }
 
     /// Clone of the record for `claude_session_id`, open or closed.
@@ -3041,10 +3461,10 @@ impl SessionLifecycleStore {
     /// - every `state == "closed"` record whose `close_reason == "pty-exit"`
     ///   (its PTY died — the case a GRACEFUL restart produces by firing
     ///   `handleExit` on every live PTY) that closed within the
-    ///   [`RESTORABLE_PTY_EXIT_MS`] grace window, PLUS
+    ///   [`RESTORABLE_PTY_EXIT_MS`] grace window OF THE ANCHOR, PLUS
     /// - every `state == "closed"` record whose `close_reason == "poll-dead"`
     ///   (the liveness poll closed an idle-but-live shell) that closed within
-    ///   the [`RESTORABLE_POLL_DEAD_MS`] grace window — a poll-dead close is
+    ///   the [`RESTORABLE_POLL_DEAD_MS`] grace window of the anchor — a poll-dead close is
     ///   uncertain (the shell pty was still alive), so an immediate restart
     ///   should bring the session back rather than silently drop it.
     ///
@@ -3053,54 +3473,49 @@ impl SessionLifecycleStore {
     /// than their grace windows, are excluded — a user who closes a tab does
     /// not want it resurrected, and a long-dead close is stale.
     ///
-    /// ## Anchored recency (open rows)
+    /// The liveness arms live in [`restore_admissible`] (shared with the
+    /// ledger roster, [`Self::roster_records`]); this method adds only the
+    /// finished filter and the terminal dedupe.
+    ///
+    /// ## Anchored recency (open AND closed rows)
     ///
     /// An open row is admitted iff
-    /// `anchor - last_seen_at <= RESTORABLE_OPEN_ANCHOR_GRACE_MS`, where the
-    /// `anchor` is the registry's LAST moment of genuine session life — the max
-    /// of every row's `last_seen_at`/`closed_at`, NOT wall-clock now.
+    /// `anchor - last_seen_at <= RESTORABLE_OPEN_ANCHOR_GRACE_MS`, and a
+    /// `pty-exit` / `poll-dead` closed row iff `anchor - closed_at <= grace` —
+    /// the closed arms were wall-clock (`now - closed_at`) until plan
+    /// `2026-10-04-runner-session-roster-restore-picker` Phase 1, so a graceful
+    /// rebuild taking longer than 10 minutes restored nothing. The
+    /// anchor is the registry's LAST moment of genuine session life, NOT
+    /// wall-clock now — and a row from the PRIOR process (stamped before this
+    /// process booted) is measured against the prior process's last moment
+    /// only, never against this process's own restores and touches (see
+    /// [`RestoreAnchors`], which also covers the shutdown marker and the crash
+    /// boot's heartbeat).
     ///
     /// A wall-clock rule (`now - last_seen <= grace`) would restore NOTHING
     /// after any downtime longer than the grace (a crash, an hours-later boot);
     /// the row-relative anchor is downtime-proof — when the whole registry dies
     /// together the anchor equals the crash instant, so `anchor - last_seen ≈ 0`
-    /// and the cohort survives regardless of how long the runner was down.
+    /// and the cohort survives regardless of how long the runner was down. A
+    /// genuinely-newer prior row (one that really was alive later) legitimately
+    /// advances the anchor; a crash cohort more than `grace` older than that is
+    /// stale and excluded from boot restore. Nothing else re-offers it on
+    /// restore: `terminal_session_list_open` returns this set and nothing more.
+    /// Its row stays in the registry, so it remains resumable by hand from the
+    /// Past Sessions surface (`session::past_sessions`).
     ///
-    /// The anchor is derived ONLY from real session rows, never a boot marker.
-    /// `prior_marker_at` is the prior shutdown marker's `at` — the shutdown
-    /// instant on a clean exit, but the crashed process's OWN boot instant on a
-    /// crash (see [`crate::session::shutdown_marker`]). Worse, an INTERMEDIATE
-    /// boot/auto-restart during the downtime rewrites that marker to its own
-    /// later boot time. Feeding that later marker into the anchor is exactly
-    /// what pulled the 2026-07-19 anchor ~1h46m past the crash band and stranded
-    /// 81 confirmed sessions. So the marker contributes to the anchor ONLY on a
-    /// CLEAN boot (`boot_was_clean == true`), where it is an honest
-    /// last-moment-of-life signal that correctly excludes a stale lone ghost; on
-    /// an unclean (crash) boot it is dropped and the crash rows supply the
-    /// anchor themselves. A genuinely-newer session row (one that really was
-    /// alive later) legitimately advances the anchor; a crash cohort more than
-    /// `grace` older than that is stale and excluded from boot restore. Nothing
-    /// else re-offers it on restore: `terminal_session_list_open` returns this
-    /// set and nothing more. Its row stays in the registry, so it remains
-    /// resumable by hand from the Past Sessions surface
-    /// (`session::past_sessions`).
+    /// ## A late restore admits the same cohort (drain-deferred boot)
     ///
-    /// ## Boot-partitioned anchor (`boot_at_ms`)
-    ///
-    /// The single anchor above is only downtime-proof while THIS process has
-    /// written nothing: the restore normally runs seconds after boot. When it
-    /// is withheld — a coord device drain defers `BootResume` for hours — every
-    /// session this process hosts is touched each poll tick, the anchor walks
-    /// forward to "now", and the prior boot's crash cohort (last seen at the
-    /// crash instant) falls outside the grace window and is stranded (plan
-    /// `2026-10-01-drain-deferred-restore-is-swept-as-orphans`).
-    ///
-    /// So when the caller passes this process's boot instant, an open row last
-    /// seen BEFORE it is judged against the PRIOR-BOOT anchor — the same max,
-    /// restricted to timestamps `< boot_at_ms` (plus the clean-boot marker) —
-    /// which is exactly the anchor a restore at boot would have used. A row
-    /// last seen at or after the boot is judged against the full anchor, as
-    /// before. `None` reproduces the unpartitioned rule exactly.
+    /// The boot partition above is also what keeps a WITHHELD restore honest:
+    /// when a coord device drain defers `BootResume` for hours, every session
+    /// this process hosts is touched each poll tick, and a single anchor over
+    /// every row would walk forward to "now" and strand the prior boot's crash
+    /// cohort (plan `2026-10-01-drain-deferred-restore-is-swept-as-orphans`).
+    /// Because a row stamped before the boot is judged against the PRIOR anchor
+    /// only, a restore run hours late admits exactly the cohort a restore at
+    /// boot would have admitted. The boot line is the store's own (`boot_ms`,
+    /// the process-boot latch), so the restore set, the roster and the restore
+    /// census can never disagree about which side of it a row is on.
     ///
     /// ## One-live-session-per-terminal (open rows)
     ///
@@ -3113,110 +3528,113 @@ impl SessionLifecycleStore {
     /// the frontend's on-mount restore read, so the read is deduped here too:
     /// among admitted `open` rows sharing a non-empty `terminal_id` we keep the
     /// single most-authoritative one (CONFIRMED over unconfirmed, then newest
-    /// `last_seen_at`, then newest `opened_at`) and drop the rest. This is
+    /// `last_seen_at`, then newest `opened_at`) and drop the rest — a row held
+    /// for an account choice has no terminal, so it is kept but never contests
+    /// one (see [`dedupe_open_by_terminal`]). This is
     /// idempotent with the boot repair and immunizes the read regardless of when
     /// the repair persists.
     pub fn restorable_records(
         &self,
-        now_ms: i64,
         prior_marker_at: Option<i64>,
         boot_was_clean: bool,
-        boot_at_ms: Option<i64>,
     ) -> Vec<TerminalSessionRecord> {
+        self.admitted_records(prior_marker_at, boot_was_clean).0
+    }
+
+    /// The session ROSTER the rebuild-safe ledger captures
+    /// ([`crate::session::session_ledger::capture`]): EXACTLY the set
+    /// [`Self::restorable_records`] returns — the same [`restore_admissible`]
+    /// admission against the same anchors, and the same one-row-per-terminal
+    /// dedupe — followed by the admitted FINISHED rows (the ledger tags them),
+    /// so a mistaken Finish stays undoable from the roster.
+    ///
+    /// Why not [`Self::open_records`]: a graceful stop closes every PTY
+    /// `pty-exit`, so a poll tick between those exits and process exit would
+    /// otherwise write a shrunken (or empty) ledger while the next boot still
+    /// restores the closed rows. And why not `open ∪ admissible`: a stale
+    /// `open` ghost (or a second `open` row on one terminal) is in no restore
+    /// set, so listing it made the "will come back" preview overcount the next
+    /// boot's restore census. With this set the ledger's UNFINISHED entries ARE
+    /// the restore set (plan `2026-10-04-runner-session-roster-restore-picker`,
+    /// Phases 2 and 5).
+    pub fn roster_records(
+        &self,
+        prior_marker_at: Option<i64>,
+        boot_was_clean: bool,
+    ) -> Vec<TerminalSessionRecord> {
+        let (mut roster, finished) = self.admitted_records(prior_marker_at, boot_was_clean);
+        roster.extend(finished);
+        roster
+    }
+
+    /// Every row [`restore_admissible`] admits, split on the WORK axis:
+    /// `(unfinished — deduped to one open row per terminal, finished)`.
+    ///
+    /// FINISHED is terminal for restore and outranks every liveness arm: a
+    /// finished session is not restorable no matter how recently it was alive,
+    /// how it closed, or whether it is still `open`. That is the line that
+    /// makes "rebuild the runner, get only the UNFINISHED sessions back" true
+    /// (plan `2026-09-01-session-finished-marker-and-unfinished-resume`), and it
+    /// keeps a finished session out of the restore census's expected set, so it
+    /// is never counted as a strand. It is applied BEFORE the terminal dedupe,
+    /// so a finished row can never win a terminal from an unfinished one.
+    fn admitted_records(
+        &self,
+        prior_marker_at: Option<i64>,
+        boot_was_clean: bool,
+    ) -> (Vec<TerminalSessionRecord>, Vec<TerminalSessionRecord>) {
+        // Read before the map lock: the heartbeat is the history's own latch.
+        let prior_heartbeat_ms = self
+            .snapshot_history
+            .get()
+            .and_then(|h| h.prior_last_append_ms());
+        let observed = self
+            .observation_epoch
+            .get()
+            .map(|e| e.observed())
+            .unwrap_or_default();
+        let prior_held: HashSet<&str> = self
+            .observation_epoch
+            .get()
+            .map(|e| e.prior_held_unjudged().iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        let marker_teardown_complete = self.prior_teardown_complete.get().copied();
+        let boot_ms = self.boot_ms.load(Ordering::Relaxed);
         match self.map.lock() {
             Ok(m) => {
-                // The registry's last moment of genuine session life: the max
-                // over every row's last_seen_at and every closed row's
-                // closed_at, PLUS the prior shutdown marker ONLY on a clean
-                // boot. On an unclean (crash) boot the marker is a boot artifact
-                // (the crashed/intermediate process's boot instant), not session
-                // liveness, so it is excluded and the rows supply the anchor.
-                let anchor = m
+                let now_ms = Utc::now().timestamp_millis();
+                let held = |r: &TerminalSessionRecord| {
+                    awaiting_prior_boot_restore(r, &prior_held, boot_ms, now_ms)
+                };
+                let anchors = restore_anchors(
+                    m.values().filter(|r| !held(r)),
+                    prior_marker_at,
+                    boot_was_clean,
+                    marker_teardown_complete,
+                    prior_heartbeat_ms,
+                    observed,
+                    boot_ms,
+                    now_ms,
+                );
+                let (finished, unfinished): (Vec<_>, Vec<_>) = m
                     .values()
-                    .flat_map(|r| [Some(r.last_seen_at), r.closed_at])
-                    .chain(std::iter::once(if boot_was_clean {
-                        prior_marker_at
-                    } else {
-                        None
-                    }))
-                    .flatten()
-                    .max();
-                // The PRIOR boot's own last moment of life: the same max, over
-                // only the timestamps that predate THIS process's boot. A row
-                // last seen before the boot is judged against this anchor, not
-                // the global one — see "Boot-partitioned anchor" above.
-                let prior_boot_anchor = boot_at_ms.and_then(|boot_at| {
-                    m.values()
-                        .flat_map(|r| [Some(r.last_seen_at), r.closed_at])
-                        .flatten()
-                        .filter(|t| *t < boot_at)
-                        .chain(if boot_was_clean {
-                            prior_marker_at
-                        } else {
-                            None
-                        })
-                        .max()
-                });
-                let admitted: Vec<TerminalSessionRecord> = m
-                    .values()
-                    .filter(|r| {
-                        // FINISHED is terminal for restore, and it is checked
-                        // FIRST because it outranks every liveness arm below:
-                        // a finished session is not restorable no matter how
-                        // recently it was alive, how it closed, or whether it is
-                        // still `open`. This is the line that makes "rebuild the
-                        // runner, get only the UNFINISHED sessions back" true
-                        // (plan
-                        // `2026-09-01-session-finished-marker-and-unfinished-resume`).
-                        //
-                        // Note this is the WORK axis, not liveness — the arms
-                        // below decide *was it alive*, this decides *is there
-                        // anything left to do*. Exclusion here also keeps a
-                        // finished session out of the restore census's expected
-                        // set, so it is never counted as a strand.
-                        if r.finished_at.is_some() {
-                            return false;
-                        }
-                        if r.state == "open" {
-                            let row_anchor = match (boot_at_ms, prior_boot_anchor) {
-                                (Some(boot_at), Some(prior)) if r.last_seen_at < boot_at => {
-                                    Some(prior)
-                                }
-                                _ => anchor,
-                            };
-                            return match row_anchor {
-                                Some(anchor) => {
-                                    anchor - r.last_seen_at <= RESTORABLE_OPEN_ANCHOR_GRACE_MS
-                                }
-                                // Unreachable: an open row's own last_seen_at
-                                // feeds the anchor. Admit defensively.
-                                None => true,
-                            };
-                        }
-                        if r.state == "closed" {
-                            let grace = match r.close_reason.as_deref() {
-                                Some("pty-exit") => Some(RESTORABLE_PTY_EXIT_MS),
-                                Some("poll-dead") => Some(RESTORABLE_POLL_DEAD_MS),
-                                _ => None,
-                            };
-                            if let Some(grace_ms) = grace {
-                                return match r.closed_at {
-                                    Some(closed_at) => now_ms - closed_at <= grace_ms,
-                                    None => false,
-                                };
-                            }
-                        }
-                        false
-                    })
+                    .filter(|r| held(r) || restore_admissible(r, &anchors, now_ms))
                     .cloned()
-                    .collect();
-                dedupe_open_by_terminal(admitted)
+                    .partition(|r| r.finished_at.is_some());
+                (dedupe_open_by_terminal(unfinished), finished)
             }
             Err(e) => {
-                warn!(error = %e, "session_lifecycle_store: lock poisoned on restorable_records");
-                Vec::new()
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on admitted_records");
+                (Vec::new(), Vec::new())
             }
         }
+    }
+
+    /// Move this store's boot line (see the `boot_ms` field) — tests model "a
+    /// row this process wrote after it booted" with it.
+    #[cfg(test)]
+    pub(crate) fn set_boot_ms_for_test(&self, boot_ms: i64) {
+        self.boot_ms.store(boot_ms, Ordering::Relaxed);
     }
 
     /// Drop `closed` records closed > 24h ago and `open` records not seen
@@ -3391,7 +3809,11 @@ impl SessionLifecycleStore {
                 // violate it (a later zone-move / boot re-assert can give an
                 // unconfirmed phantom a marginally newer `last_seen_at` than the
                 // real confirmed session, so we'd keep the phantom and close
-                // the real one). Same key as the read-time dedupe in `restorable_records`.
+                // the real one). Same key, over the same contenders (open rows
+                // bound to a terminal), as the read-time dedupe in
+                // `restorable_records`. A row held for an account choice is in
+                // neither: the hold detached its terminal, so it never joins a
+                // group here and is never closed as a reuse loser.
                 let mut ranked = ids;
                 ranked.sort_by(|a, b| {
                     let ka = m.get(a.as_str()).map(open_authority_key).unwrap_or((
@@ -3550,6 +3972,9 @@ impl SessionLifecycleStore {
             .map_err(|_| std::io::Error::other("session lifecycle WAL lock poisoned"))?;
         let mut fresh = load_map(&self.path);
         let replay = replay_wal(&self.wal_path, &mut fresh);
+        // Same rule as `open`: a held row is unbound. The rewrite below
+        // persists it.
+        detach_held_rows(&mut fresh, Utc::now().timestamp_millis());
         if replay.applied > 0 || replay.damaged {
             // The WAL on disk belongs to the state we are replacing. Fold what
             // it had into the reload (so a concurrent append is not lost) and
@@ -3836,6 +4261,400 @@ fn open_authority_key(rec: &TerminalSessionRecord) -> (bool, i64, i64) {
     (rec.confirmed_at.is_some(), rec.last_seen_at, rec.opened_at)
 }
 
+/// This process's boot instant for a freshly opened store: the shared
+/// process-boot latch in production; `i64::MAX` under `cfg(test)`, so every
+/// fixture row reads as the PRIOR life (the boot those fixtures model) unless a
+/// test moves the line with [`SessionLifecycleStore::set_boot_ms_for_test`].
+fn default_boot_ms() -> i64 {
+    if cfg!(test) {
+        i64::MAX
+    } else {
+        crate::session::session_ledger::process_boot_ms()
+    }
+}
+
+/// The instants every restore-admission window is measured from (see
+/// [`SessionLifecycleStore::restorable_records`]).
+///
+/// ## Why two
+///
+/// `prior` is the PRIOR process's LAST MOMENT OF LIFE: the max over every row
+/// stamp (`last_seen_at`, `closed_at`) strictly EARLIER than this process's
+/// boot, plus the prior shutdown marker on a clean boot. A row whose own stamp
+/// predates the boot is judged against it — an `open` row against `prior`
+/// exactly, a closed row against `prior_closed`, which on a crash boot also
+/// takes the snapshot history's last heartbeat (see below).
+///
+/// The boot line is a WALL-CLOCK comparison: no monotonic stamp survives a
+/// process restart, so rows carry `Utc::now()` millis. A wall-clock step
+/// BACKWARDS inside this process (an NTP correction, a manual clock change)
+/// stamps this process's own re-asserts BEFORE `boot_ms`, where they read as
+/// prior-process rows and re-feed `prior` — the window a restore's own
+/// activity is supposed to be unable to move. Nothing here detects it; the
+/// exposure is one skew-sized window for the rest of the process's life.
+///
+/// It must exclude this process's own activity. A restore re-asserts the rows
+/// it brings back (`record_open` stamps `last_seen_at = now`), so an anchor over
+/// EVERY row moved with the restore itself: a second page restored 30 minutes
+/// into a rebuild measured its own `pty-exit` cohort (stamped at shutdown)
+/// against a re-assert 30 minutes later, restored nothing, and the ledger poll
+/// dropped that cohort from the roster.
+///
+/// `live` is the anchor over every row, this process's included — the old
+/// single anchor. A row stamped during THIS process's life is judged against
+/// it, so a tab closed `pty-exit` an hour ago while the runner kept running is
+/// stale, not restorable forever.
+///
+/// ## The marker and the heartbeat
+///
+/// `prior_marker_at` is the shutdown instant on a clean exit, but the crashed
+/// process's OWN boot instant on a crash (see
+/// [`crate::session::shutdown_marker`]), and an INTERMEDIATE boot during the
+/// downtime rewrites it to its own later boot time — the 2026-07-19 anchor that
+/// stranded 81 sessions. So it counts only on a CLEAN boot.
+///
+/// On a crash boot the rows alone can under-state the last moment of life: a
+/// SPARSE registry whose newest row is a session the operator exited hours
+/// before the crash would anchor at that exit and resurrect it. The snapshot
+/// history's heartbeat ([`SnapshotHistory::prior_last_append_ms`], appended at
+/// most ~5 minutes apart by the liveness poll, even for an empty registry)
+/// bounds the anchor from below on a crash boot — for the CLOSED arms
+/// (`pty-exit` / `poll-dead`) ONLY (`prior_closed`). It is a timestamp, never
+/// session content — the history is still not read as a restore source.
+///
+/// It must not bound the `open` arm. The heartbeat is the history file's last
+/// append by ANY process, so an intermediate short-lived boot during the
+/// downtime (one that crashed or was killed before restoring anything) stamps
+/// it with ITS liveness, not the cohort's: an open cohort last seen at T, an
+/// intermediate boot heartbeating at T+1h46m, then a crash boot would measure
+/// every open row against T+1h46m and strand the whole cohort — the shape of
+/// the 2026-07-19 81-session stranding. Open rows are therefore anchored by
+/// the prior process's row stamps (plus the clean-boot marker) alone
+/// (`prior`): a whole cohort dying together self-anchors at its own instant.
+/// The closed arms keep the heartbeat because an exit is a deliberate,
+/// already-observed end — resurrecting a long-exited session is the worse
+/// error there, and an intermediate boot can only make that arm stricter.
+///
+/// ## The observation epoch (open rows only)
+///
+/// An open row's `last_seen_at` advances only when a poll tick whose process
+/// snapshot SUCCEEDED touches it — nothing else refreshes a live session. So
+/// "stale relative to the anchor" is evidence of death only for the stretch
+/// the poll could actually see. When snapshots fail, every stamp freezes
+/// while later stamps (a spawn, the clean marker written before teardown)
+/// still move `prior` — the 2026-10-27 force-exit stranded 64 of 65 open
+/// sessions that way. The open arm is therefore bounded by the observation
+/// epoch ([`crate::session::observation_epoch`]):
+///
+/// - a PRIOR-process row is measured against `min(prior, prior_observed)`
+///   when the prior process left an epoch, else `prior` (the first boot after
+///   the upgrade — logged once at boot). The epoch was latched before this
+///   process wrote one, so nothing this process does moves it. A ghost stays
+///   excluded: successful ticks ran after it went stale, so the epoch is past
+///   it.
+/// - a row written by THIS process is measured against
+///   `min(live, current_observed)`, or `min(live, boot_ms)` when this process
+///   has never observed successfully — if it never looked, nothing it wrote
+///   is stale. This is what keeps the ledger roster (captured every poll tick)
+///   from shedding a starved cohort while the process is still running.
+///
+/// `min` only ever moves the open anchor EARLIER, so the epoch can admit more
+/// rows than `prior` alone, never fewer. The 2026-07-19 intermediate-boot
+/// strand is untouched: a short-lived intermediate boot that never observed
+/// writes no epoch, and one that did can only lower the bound.
+///
+/// ## The marker and the teardown (open rows only)
+///
+/// Both clean writers stamp the marker BEFORE the terminal teardown, so a
+/// clean marker says a shutdown STARTED, not that it finished. An interrupted
+/// teardown is the shape of the 2026-10-27 strand: a runner too loaded to
+/// finish closing its terminals had also stopped touching its rows, and its
+/// marker sat 38 minutes past every one of them. So the marker joins the open
+/// anchor `prior` only when the store's attached
+/// [`crate::session::shutdown_marker::BootClassification::teardown_complete`]
+/// says the teardown finished, or when the prior process left an observation
+/// epoch. With an epoch the open anchor is capped at it, so the marker can
+/// lift the anchor no further than the last successful observation, and an
+/// interrupted teardown does not weaken that evidence. Keeping the marker
+/// there is also what keeps out a lone ghost that the poll observed dead.
+/// With neither, an interrupted teardown's open rows are judged by their own
+/// stamps alone. A lone ghost then self-anchors and restores, accepted
+/// deliberately: a ghost pane can be closed, a dropped session cannot be
+/// rebuilt. Teardown evidence that was never attached keeps the marker.
+///
+/// The closed arms (`prior_closed`) keep the clean marker whatever its
+/// teardown bit. A close stamp is an observed end, not a poll touch, and the
+/// marker instant is still a moment the prior process was alive.
+///
+/// ## Held rows
+///
+/// A row held for an account choice ([`awaiting_account_hold`] at the same
+/// `now_ms` admission uses) feeds NO anchor: it is admitted by its hold, not by
+/// recency, so nothing a hold does to the row can move the window its un-held
+/// cohort is measured against. Only a LIVE hold is exempt: once the stamp has
+/// expired the row is an ordinary open row again — it is judged by recency, so
+/// its stamps feed the anchor like every other row's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RestoreAnchors {
+    boot_ms: i64,
+    /// Prior-process row stamps, plus the shutdown marker on a clean boot
+    /// when the marker may anchor open rows (see "The marker and the
+    /// teardown").
+    prior: Option<i64>,
+    /// Prior-process row stamps plus the clean-boot marker whatever its
+    /// teardown bit, plus the snapshot-history heartbeat on a crash boot.
+    prior_closed: Option<i64>,
+    live: Option<i64>,
+    /// The PRIOR process's observation epoch (before `boot_ms`), if it left one.
+    prior_observed: Option<i64>,
+    /// THIS process's last successful observation, if any.
+    current_observed: Option<i64>,
+}
+
+impl RestoreAnchors {
+    /// The anchor an `open` row last seen at `stamp` is measured against —
+    /// bounded by the observation epoch (see "The observation epoch" above).
+    fn for_open(&self, stamp: i64) -> Option<i64> {
+        if stamp < self.boot_ms {
+            self.prior
+                .map(|p| self.prior_observed.map_or(p, |o| p.min(o)))
+        } else {
+            self.live
+                .map(|l| l.min(self.current_observed.unwrap_or(self.boot_ms)))
+        }
+    }
+
+    /// The anchor a `pty-exit` / `poll-dead` row closed at `stamp` is
+    /// measured against.
+    fn for_closed(&self, stamp: i64) -> Option<i64> {
+        if stamp < self.boot_ms {
+            self.prior_closed
+        } else {
+            self.live
+        }
+    }
+}
+
+fn restore_anchors<'a>(
+    records: impl Iterator<Item = &'a TerminalSessionRecord> + Clone,
+    prior_marker_at: Option<i64>,
+    boot_was_clean: bool,
+    marker_teardown_complete: Option<bool>,
+    prior_heartbeat_ms: Option<i64>,
+    observed: Observed,
+    boot_ms: i64,
+    now_ms: i64,
+) -> RestoreAnchors {
+    let stamps = records
+        .filter(move |r| !awaiting_account_hold(r, now_ms))
+        .flat_map(|r| [Some(r.last_seen_at), r.closed_at])
+        .flatten();
+    let clean_marker = prior_marker_at
+        .filter(|_| boot_was_clean)
+        .filter(|at| *at < boot_ms);
+    // Like the marker, an epoch counts only when it predates this boot.
+    let prior_observed = observed.prior.filter(|at| *at < boot_ms);
+    // See "The marker and the teardown": the open anchor takes the marker
+    // only when the teardown finished, or an epoch caps the anchor anyway.
+    let open_marker = clean_marker
+        .filter(|_| marker_teardown_complete.unwrap_or(true) || prior_observed.is_some());
+    let crash_heartbeat = prior_heartbeat_ms
+        .filter(|_| !boot_was_clean)
+        .filter(|at| *at < boot_ms);
+    let prior_rows = stamps.clone().filter(|at| *at < boot_ms).max();
+    let prior = prior_rows.into_iter().chain(open_marker).max();
+    let prior_closed = prior_rows
+        .into_iter()
+        .chain(clean_marker)
+        .chain(crash_heartbeat)
+        .max();
+    let live = stamps.chain(prior_closed).max();
+    RestoreAnchors {
+        boot_ms,
+        prior,
+        prior_closed,
+        live,
+        prior_observed,
+        current_observed: observed.current,
+    }
+}
+
+/// Detach the terminal of every row [`awaiting_account_hold`] holds at
+/// `now_ms`, so a store opened from disk keeps the rule that a held row is
+/// unbound (see [`awaiting_account_hold`]). Returns how many rows changed.
+fn detach_held_rows(map: &mut HashMap<String, TerminalSessionRecord>, now_ms: i64) -> usize {
+    let mut detached = 0;
+    for rec in map.values_mut() {
+        if awaiting_account_hold(rec, now_ms) && !rec.terminal_id.is_empty() {
+            rec.terminal_id.clear();
+            detached += 1;
+        }
+    }
+    detached
+}
+
+/// Is `r` an open row bound to `terminal_id`? A blank id names no terminal, so
+/// it never resolves to an unbound row (a held one, or any uncorrelated row).
+fn open_on_terminal(r: &TerminalSessionRecord, terminal_id: &str) -> bool {
+    r.state == "open" && !terminal_id.trim().is_empty() && r.terminal_id == terminal_id
+}
+
+/// Is `r` held open for an account choice at `now_ms`? An `open`, unfinished
+/// row whose [`TerminalSessionRecord::awaiting_account_since`] is no more than
+/// the open-row prune age ([`OPEN_STALE_MS`]) old. The ONE predicate behind the
+/// poll's hold ([`SessionLifecycleStore::poll_hold_awaiting_account`]), the
+/// re-mark rule and the terminal detach
+/// ([`SessionLifecycleStore::mark_awaiting_account`], [`detach_held_rows`]),
+/// restore/roster admission ([`restore_admissible`]) and the anchor exclusion
+/// ([`restore_anchors`]).
+///
+/// A held row has no pane by design, so it holds no terminal: the hold
+/// detaches `terminal_id` (blank = unbound, as for any uncorrelated row) and
+/// only a bind ends it ([`SessionLifecycleStore::record_open`],
+/// [`SessionLifecycleStore::rebind_terminal`]). That one rule keeps it out of
+/// every terminal contest — the restore dedupe, the boot collision repair,
+/// `record_open`'s supersede arms, the poll's direct match and the frontend's
+/// reconnect — without an exemption in any of them.
+fn awaiting_account_hold(r: &TerminalSessionRecord, now_ms: i64) -> bool {
+    r.state == "open"
+        && r.finished_at.is_none()
+        && r.awaiting_account_since
+            .is_some_and(|since| now_ms - since <= OPEN_STALE_MS)
+}
+
+/// Was `r` held UNJUDGED by the prior process's liveness poll — a row of that
+/// process's boot-latched restorable set still waiting for its page's restore
+/// on the poll's last successful tick
+/// ([`crate::session::observation_epoch::ObservationEpoch::prior_held_unjudged`])?
+/// Such a row is admitted by that hold, like [`awaiting_account_hold`]: the
+/// prior process admitted it at its boot and never looked at it again, so its
+/// observation epoch is no evidence against it (plan
+/// `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
+/// Phase 4). It feeds no anchor, and the hold lasts while the row stays open,
+/// unfinished and untouched since before this boot, up to the open-row prune
+/// age ([`OPEN_STALE_MS`]) after its own stamp.
+fn awaiting_prior_boot_restore(
+    r: &TerminalSessionRecord,
+    prior_held: &HashSet<&str>,
+    boot_ms: i64,
+    now_ms: i64,
+) -> bool {
+    r.state == "open"
+        && r.finished_at.is_none()
+        && r.last_seen_at < boot_ms
+        && now_ms - r.last_seen_at <= OPEN_STALE_MS
+        && prior_held.contains(r.claude_session_id.as_str())
+}
+
+/// Will the frontend's boot restore leave `r` `needs-account` because no
+/// account can be named from evidence? Mirrors `classifyRestoreAction`'s gates
+/// (`useTerminalInitialization.ts`) and the evidence half of
+/// `resolveRestoreAccount` — NOT the whole frontend decision: the frontend
+/// also refuses a resolvable dir that is shell-unsafe or may be an unreadable
+/// default home, so this predicate is NARROWER by exactly those rows (the
+/// frontend marks them itself when their page opens). The mirrored gates:
+///
+/// 1. the id is a valid session id (else `skip-invalid`);
+/// 2. origin `authoritative` or `observed` (else `terminal-only`);
+/// 3. confirmed (else `terminal-only` — a phantom shell);
+/// 4. the transcript is not probed ABSENT — a missing/blank `working_dir` is
+///    unprobed, which never downgrades (`transcriptExists !== false`);
+/// 5. the provider resolves to the Claude adapter with a `full` restore tier
+///    ([`adapter_for`], the twin of `providerDescriptorFor`, which falls back
+///    to Claude for an unknown provider exactly as this does);
+/// 6. the account cannot be named from evidence: `resolveRestoreAccount`'s
+///    recorded-dir-then-unique-holder order
+///    ([`crate::session::session_ledger::resolve_config_dir`]), where an
+///    unprobed holder set is unknown.
+fn boot_restore_needs_account(r: &TerminalSessionRecord, probe: &dyn TranscriptProbe) -> bool {
+    use crate::session::provider_adapter::{adapter_for, RestoreTier};
+    if !crate::session::session_id::is_valid_session_id(&r.claude_session_id) {
+        return false;
+    }
+    if !matches!(r.origin.as_deref(), Some("authoritative" | "observed")) {
+        return false;
+    }
+    if r.confirmed_at.is_none() {
+        return false;
+    }
+    let working_dir = r.working_dir.as_deref().filter(|d| !d.trim().is_empty());
+    if working_dir.is_some_and(|wd| !probe.transcript_exists(&r.claude_session_id, Some(wd))) {
+        return false;
+    }
+    let adapter = adapter_for(&r.provider);
+    if adapter.provider() != DEFAULT_PROVIDER || adapter.restore_tier() != RestoreTier::Full {
+        return false;
+    }
+    let has_recorded = r
+        .config_dir
+        .as_deref()
+        .is_some_and(|d| !d.trim().is_empty());
+    let holders = if has_recorded {
+        None
+    } else {
+        working_dir.and_then(|wd| probe.transcript_config_dirs(&r.claude_session_id, Some(wd)))
+    };
+    crate::session::session_ledger::resolve_config_dir(r.config_dir.as_deref(), holders.as_deref())
+        .is_none()
+}
+
+/// The LIVENESS half of restore admission — *was this session alive at the
+/// last moment of life?* — with the finished (work-axis) filter deliberately
+/// NOT applied, so the ledger roster and the restore set share one predicate.
+///
+/// Every arm is measured against the anchor for the row's own stamp
+/// ([`RestoreAnchors`]), never wall-clock now, so the length of the downtime
+/// never matters:
+///
+/// - `open`: `anchor - last_seen_at <= RESTORABLE_OPEN_ANCHOR_GRACE_MS`, the
+///   anchor bounded by the observation epoch ([`RestoreAnchors::for_open`]);
+/// - closed `pty-exit`: `anchor - closed_at <= RESTORABLE_PTY_EXIT_MS` — a
+///   graceful stop stamps every PTY at the shutdown instant, which on a clean
+///   boot IS the prior anchor, so a rebuild of any length restores them while a
+///   close long before shutdown stays excluded;
+/// - closed `poll-dead`: `anchor - closed_at <= RESTORABLE_POLL_DEAD_MS`;
+/// - every other close reason (explicit user close, the poll's `no-terminal`
+///   orphan close): never.
+///
+/// A row held for an account choice ([`awaiting_account_hold`] at `now_ms`)
+/// is admitted by its hold rather than its recency: it was a restore
+/// candidate when it was held, and it stays one until the operator answers or
+/// the hold expires — at most the open-row prune age ([`OPEN_STALE_MS`]) after
+/// its stamp. The exemption from the recency arms lasts only that long: an
+/// expired stamp falls through to the recency arm like any other open row.
+/// The prior poll's unjudged holds ([`awaiting_prior_boot_restore`]) are
+/// admitted the same way, by the caller, before this predicate runs.
+fn restore_admissible(r: &TerminalSessionRecord, anchors: &RestoreAnchors, now_ms: i64) -> bool {
+    if awaiting_account_hold(r, now_ms) {
+        return true;
+    }
+    if r.state == "open" {
+        return match anchors.for_open(r.last_seen_at) {
+            Some(anchor) => anchor - r.last_seen_at <= RESTORABLE_OPEN_ANCHOR_GRACE_MS,
+            // Unreachable: every open row not held at `now_ms` feeds its own
+            // last_seen_at into this anchor (`restore_anchors` excludes
+            // exactly the rows `awaiting_account_hold` holds at the same
+            // `now_ms`, and those returned above). An expired stamp is not a
+            // hold, so it no longer reaches here. Admit defensively.
+            None => true,
+        };
+    }
+    if r.state == "closed" {
+        let grace = match r.close_reason.as_deref() {
+            Some("pty-exit") => RESTORABLE_PTY_EXIT_MS,
+            Some("poll-dead") => RESTORABLE_POLL_DEAD_MS,
+            _ => return false,
+        };
+        return match r.closed_at {
+            Some(closed_at) => anchors
+                .for_closed(closed_at)
+                .is_some_and(|anchor| anchor - closed_at <= grace),
+            None => false,
+        };
+    }
+    false
+}
+
 /// Collapse admitted `open` rows that share a non-empty `terminal_id` down to
 /// the single most-authoritative one (see [`open_authority_key`]). A PTY hosts
 /// at most one live session, so the restore read must never return N open rows
@@ -3843,13 +4662,18 @@ fn open_authority_key(rec: &TerminalSessionRecord) -> (bool, i64, i64) {
 /// at restore. This is the read-side guard that makes the restore immune to a
 /// registry collision REGARDLESS of whether the persistent boot repair has run
 /// yet (it is spawn-delayed and can race the frontend's on-mount read). Closed
-/// rows and open rows with an empty `terminal_id` (uncorrelatable) pass through
-/// untouched; input order is otherwise preserved.
+/// rows and open rows with an empty `terminal_id` pass through untouched and
+/// never win a terminal; input order is otherwise preserved. A row held for an
+/// account choice is one of the latter: holding it detaches its terminal
+/// ([`SessionLifecycleStore::mark_awaiting_account`]), so it is kept in the set
+/// without contesting one.
 fn dedupe_open_by_terminal(records: Vec<TerminalSessionRecord>) -> Vec<TerminalSessionRecord> {
+    let contests =
+        |r: &TerminalSessionRecord| r.state == "open" && !r.terminal_id.trim().is_empty();
     // Winner id per contested terminal_id.
     let mut winner: HashMap<&str, &TerminalSessionRecord> = HashMap::new();
     for r in &records {
-        if r.state != "open" || r.terminal_id.trim().is_empty() {
+        if !contests(r) {
             continue;
         }
         winner
@@ -3864,8 +4688,8 @@ fn dedupe_open_by_terminal(records: Vec<TerminalSessionRecord>) -> Vec<TerminalS
     records
         .iter()
         .filter(|r| {
-            if r.state != "open" || r.terminal_id.trim().is_empty() {
-                return true; // closed / uncorrelatable rows always pass
+            if !contests(r) {
+                return true; // closed / unbound rows always pass
             }
             // Keep only the winning open row for this terminal.
             winner
@@ -4096,9 +4920,17 @@ fn replay_wal(wal_path: &Path, map: &mut HashMap<String, TerminalSessionRecord>)
 /// Monotonic: `NotYetRun → Withheld → Ran`, or `NotYetRun → Ran`. Once the
 /// restore has run, normal orphan handling resumes for good; a later drain does
 /// not re-arm the hold. The restore runs per PAGE (the active one first), so
-/// records of pages not yet restored are then judged exactly as on an undrained
-/// boot — parity, not a full guarantee; that gap is the plan's recorded
-/// follow-up ("Non-active pages at an UNDRAINED boot").
+/// this latch alone cannot keep the rows of a page not yet opened. The
+/// boot-census arm of [`withheld_boot_restore_candidate`] closes that gap (the
+/// plan's recorded follow-up "Non-active pages at an UNDRAINED boot") for the
+/// life of THIS process: a row in the boot-latched restorable set is held in
+/// every phase (plan
+/// `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
+/// Phase 4). A held row is never touched, so across a further restart it is
+/// carried by the observation epoch instead: each successful tick records the
+/// ids it held unjudged, and the next boot admits those rows by that hold
+/// ([`awaiting_prior_boot_restore`]) rather than measuring them against an
+/// epoch that never looked at them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootRestorePhase {
     /// The restore path has not been asked yet (the frontend has not mounted)
@@ -4221,11 +5053,29 @@ pub(crate) fn reset_boot_restore_phase_for_test() {
 ///   (drained, or drain state unknown). This covers a poll tick that lands
 ///   before the frontend's first ask; when the gate allows, today's handling
 ///   applies (the restore is about to run, or there is no consumer for it).
+/// - `awaiting_boot_restore` ⇒ hold in EVERY phase, `Ran` included (plan
+///   `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
+///   Phase 4). The caller passes
+///   [`crate::session::restore_census::BootCensus::awaits_restore`]: the row is
+///   in the boot-latched restorable set and is not finished. Restore is lazy
+///   per PAGE, so after `Ran` a row on a page not opened yet still matches no
+///   terminal by design, and closing it `no-terminal` after
+///   `NO_TERMINAL_ORPHAN_TICKS` strands it for good. Its own restore makes the
+///   hold moot: the restore re-asserts the row (`record_open`) or re-points its
+///   terminal (a rebind), so the poll matches it to that live terminal — by
+///   id, or by the `(page_id, title, working_dir)` fallback, which this arm
+///   never disables ([`boot_restore_hold`]) — and judges it there, which the
+///   hold never overrides; its first touch moves it past the boot line. A
+///   close or a finish by the operator ends the hold, and so does the
+///   `OPEN_STALE_MS` prune. A row outside the latched set is a genuine orphan
+///   and closes as before. The poll records the rows this arm held so the
+///   hold survives a further restart (see [`BootRestorePhase`]).
 pub fn withheld_boot_restore_candidate(
     last_seen_at: i64,
     boot_at_ms: Option<i64>,
     phase: BootRestorePhase,
     drain_defers_boot_resume: bool,
+    awaiting_boot_restore: bool,
 ) -> bool {
     let Some(boot_at) = boot_at_ms else {
         return false;
@@ -4233,10 +5083,89 @@ pub fn withheld_boot_restore_candidate(
     if last_seen_at >= boot_at {
         return false;
     }
+    if awaiting_boot_restore {
+        return true;
+    }
     match phase {
         BootRestorePhase::Ran => false,
         BootRestorePhase::Withheld => true,
         BootRestorePhase::NotYetRun => drain_defers_boot_resume,
+    }
+}
+
+/// The two flags the liveness poll derives per row from
+/// [`withheld_boot_restore_candidate`]. They differ in one input, and on
+/// purpose:
+///
+/// - `id_match_only` — the drain/phase hold alone (no boot-census arm). It is
+///   what [`match_live_terminal`] takes: while the boot restore is withheld, a
+///   prior-boot row may match only its OWN terminal id, never another tab
+///   through the `(page_id, title, working_dir)` fallback.
+/// - `hold` — that hold OR the boot-census arm. It is what
+///   [`hold_for_withheld_boot_restore`] takes: a row it covers is never closed
+///   `no-terminal` this tick.
+///
+/// The census arm widens only `hold`. Before it existed, the `Ran` phase kept
+/// the triple fallback, and that is how an auto-resume row whose re-assert
+/// was lost still finds its live tab and is touched; narrowing the match for
+/// every latched row would leave such a row untouched until the next boot
+/// dropped it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootRestoreHold {
+    pub id_match_only: bool,
+    pub hold: bool,
+}
+
+/// Should the poll carry `rec`, which it holds this tick, into the observation
+/// epoch's `held_unjudged` set, so that the next boot admits it by that hold
+/// ([`awaiting_prior_boot_restore`])? Only a boot-census row
+/// (`awaiting_boot_restore`) whose restore this process has not attempted, or
+/// attempted less than [`RESTORE_PENDING_TTL_MS`] before `now_ms`. A
+/// `restore_pending_at` at or after this boot means the restore ran here:
+/// while it is inside the TTL the resume may still be verifying on a loaded
+/// box, so it is still carried; past the TTL it is a resume that did not
+/// verify, and carrying it would re-offer that failed resume on every
+/// restart (for example, after the operator closed the failed tab). Left
+/// uncarried, the next boot judges it by the epoch and does not re-offer it,
+/// which is what it did before the hold existed.
+pub fn carries_boot_restore_hold(
+    rec: &TerminalSessionRecord,
+    boot_at_ms: Option<i64>,
+    awaiting_boot_restore: bool,
+    now_ms: i64,
+) -> bool {
+    awaiting_boot_restore
+        && !rec
+            .restore_pending_at
+            .zip(boot_at_ms)
+            .is_some_and(|(pending_at, boot_at)| {
+                pending_at >= boot_at && now_ms - pending_at > RESTORE_PENDING_TTL_MS
+            })
+}
+
+/// See [`BootRestoreHold`].
+pub fn boot_restore_hold(
+    last_seen_at: i64,
+    boot_at_ms: Option<i64>,
+    phase: BootRestorePhase,
+    drain_defers_boot_resume: bool,
+    awaiting_boot_restore: bool,
+) -> BootRestoreHold {
+    BootRestoreHold {
+        id_match_only: withheld_boot_restore_candidate(
+            last_seen_at,
+            boot_at_ms,
+            phase,
+            drain_defers_boot_resume,
+            false,
+        ),
+        hold: withheld_boot_restore_candidate(
+            last_seen_at,
+            boot_at_ms,
+            phase,
+            drain_defers_boot_resume,
+            awaiting_boot_restore,
+        ),
     }
 }
 
@@ -4493,6 +5422,77 @@ pub fn classify(
     base
 }
 
+/// How the liveness poll matched an open row to a live terminal this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollTerminalMatch {
+    /// The row's own `terminal_id` is a live terminal.
+    Direct,
+    /// Matched only by the `(page_id, title, working_dir)` fallback — some
+    /// live terminal carries the row's page, title and directory, which does
+    /// not make it the row's terminal.
+    Fallback,
+    /// No live terminal matched.
+    Unmatched,
+}
+
+impl PollTerminalMatch {
+    /// How `rec` matched this tick: `Direct` when its own (non-blank)
+    /// `terminal_id` is live per `is_live_terminal`, else `Fallback` when the
+    /// `(page_id, title, working_dir)` lookup found a terminal, else
+    /// `Unmatched`. A held row is unbound
+    /// ([`SessionLifecycleStore::mark_awaiting_account`]), so it can never match
+    /// `Direct` — in particular not through its old terminal id once that id
+    /// hosts another session.
+    pub fn for_record(
+        rec: &TerminalSessionRecord,
+        is_live_terminal: impl Fn(&str) -> bool,
+        fallback_matched: bool,
+    ) -> Self {
+        if !rec.terminal_id.trim().is_empty() && is_live_terminal(&rec.terminal_id) {
+            Self::Direct
+        } else if fallback_matched {
+            Self::Fallback
+        } else {
+            Self::Unmatched
+        }
+    }
+}
+
+/// The liveness poll's awaiting-account branch, for one open row this tick:
+/// `true` = the poll must SKIP the row (no classification, no close).
+///
+/// A `needs-account` row the boot restore left for the operator has no
+/// terminal BY DESIGN. Closing it `no-terminal` would drop it from the roster
+/// and from the next boot's restore set while the operator is still being
+/// asked about it, so a row that is awaiting an account is held
+/// ([`SessionLifecycleStore::poll_hold_awaiting_account`] — never refreshed,
+/// bounded by the prune age) and its close-detection streaks are reset, so a later
+/// end of the hold starts counting from zero. Only a [`PollTerminalMatch::Direct`]
+/// match releases the hold — the row's own terminal is live, so it is classified
+/// as usual. A held row is unbound, so it reaches `Direct` only once a bind
+/// (a verified resume) has already ended the hold; never through its OLD
+/// terminal id, which may now host another session. A
+/// [`PollTerminalMatch::Fallback`] match does NOT release it: another tab on the
+/// same page, title and directory is not this row's resume, and classifying the
+/// row against it would let that tab's shell close the held row.
+pub fn poll_holds_unmatched_row(
+    store: &SessionLifecycleStore,
+    claude_session_id: &str,
+    terminal_match: PollTerminalMatch,
+    now_ms: i64,
+    consecutive_dead: &mut HashMap<String, u32>,
+    consecutive_no_match: &mut HashMap<String, u32>,
+) -> bool {
+    if terminal_match == PollTerminalMatch::Direct
+        || !store.poll_hold_awaiting_account(claude_session_id, now_ms)
+    {
+        return false;
+    }
+    consecutive_dead.remove(claude_session_id);
+    consecutive_no_match.remove(claude_session_id);
+    true
+}
+
 /// The `close_reason` a [`PollAction::Close`] verdict should actually be
 /// recorded under, given the record's last restore outcome.
 ///
@@ -4557,6 +5557,7 @@ pub(crate) fn test_open_record(id: &str) -> TerminalSessionRecord {
         provider: DEFAULT_PROVIDER.to_string(),
         origin: None,
         restore_pending_at: None,
+        awaiting_account_since: None,
         confirmed_at: None,
         handle: None,
         account_label: None,
@@ -4575,6 +5576,7 @@ pub(crate) fn test_open_record(id: &str) -> TerminalSessionRecord {
         finish_synced: false,
         spawn_device_default: None,
         adopted_from: None,
+        last_session_start_at: None,
     }
 }
 
@@ -4582,6 +5584,10 @@ pub(crate) fn test_open_record(id: &str) -> TerminalSessionRecord {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// Terminal liveness for [`SessionLifecycleStore::mark_awaiting_account`]
+    /// in tests where no PTY of the process is live.
+    const NONE_LIVE: fn(&str) -> bool = |_| false;
 
     /// Characterization of the WRITE side, which
     /// `2026-08-10-temp-runner-session-restore-isolation` Phase 4 did NOT change
@@ -4780,6 +5786,7 @@ mod tests {
             provider: DEFAULT_PROVIDER.to_string(),
             origin: None,
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: None,
             handle: None,
             account_label: None,
@@ -4798,6 +5805,7 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
         }
     }
 
@@ -5190,6 +6198,107 @@ mod tests {
                 .is_none(),
             "an unknown terminal id resolves to None"
         );
+    }
+
+    /// A pane pinned to P whose operator then ran `/resume X` keeps BOTH rows
+    /// open (the hook bind evicts only unconfirmed siblings), and the terminal
+    /// lookups must name X — the session actually running — every time, not
+    /// whichever row the `HashMap` yields first. Incident 2026-10-29: the
+    /// token-exhaustion migration resolved terminal `5b27af82` to its stale
+    /// pane session, resumed that, and closed the pane running the real one.
+    /// Driven through the same calls `POST /control/session-open` makes.
+    #[test]
+    fn terminal_lookups_name_the_resumed_session_not_the_stale_pane_row() {
+        for _ in 0..32 {
+            let dir = tempdir().unwrap();
+            let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+            for id in ["pane-p", "resumed-x"] {
+                store.record_open(auth_on(id, "term-r"));
+                store.confirm_session(id);
+                store.note_session_start_hook(id);
+            }
+            assert_eq!(
+                store.get("pane-p").unwrap().state,
+                "open",
+                "precondition: the stale pane row survives the resume"
+            );
+            // An unconfirmed row bound later must not displace X from the
+            // confirmed lookup.
+            let mut phantom = rec("phantom");
+            phantom.terminal_id = "term-r".to_string();
+            phantom.origin = Some(ORIGIN_OBSERVED.to_string());
+            store.record_open(phantom);
+
+            assert_eq!(
+                store
+                    .find_open_by_terminal("term-r")
+                    .unwrap()
+                    .claude_session_id,
+                "resumed-x"
+            );
+            assert_eq!(
+                store
+                    .find_confirmed_open_by_terminal("term-r")
+                    .unwrap()
+                    .claude_session_id,
+                "resumed-x"
+            );
+        }
+    }
+
+    /// The same answer after a restart: the process-local hook order is gone
+    /// (a holder-adopted pane fires no new hook), so the durable
+    /// `last_session_start_at` must carry it. The resumed session is given the
+    /// OLDER `confirmed_at` — it was confirmed in another pane before this one
+    /// — which is exactly the case `confirmed_at` alone gets wrong.
+    #[test]
+    fn resumed_session_still_wins_after_reload() {
+        for _ in 0..32 {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("s.json");
+            {
+                let store = SessionLifecycleStore::open(&path).unwrap();
+                let mut x = auth_on("resumed-x", "term-r");
+                x.confirmed_at = Some(1_000);
+                store.record_open(x);
+                store.record_open(auth_on("pane-p", "term-r"));
+                store.confirm_session("pane-p");
+                store.note_session_start_hook("pane-p");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                store.note_session_start_hook("resumed-x");
+                assert_eq!(store.get("pane-p").unwrap().state, "open");
+            }
+            let reloaded = SessionLifecycleStore::open(&path).unwrap();
+            assert!(reloaded
+                .get("resumed-x")
+                .unwrap()
+                .last_session_start_at
+                .is_some());
+            assert_eq!(
+                reloaded
+                    .find_open_by_terminal("term-r")
+                    .unwrap()
+                    .claude_session_id,
+                "resumed-x"
+            );
+        }
+    }
+
+    /// A page move relocates every open row on the pane, so the stale sibling
+    /// cannot be restored on the page the pane left.
+    #[test]
+    fn update_page_by_terminal_moves_every_open_row_on_the_pane() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        for id in ["pane-p", "resumed-x"] {
+            store.record_open(auth_on(id, "term-r"));
+            store.confirm_session(id);
+        }
+        store.record_open(auth_on("elsewhere", "term-other"));
+        store.update_page_by_terminal("term-r", "page-2");
+        assert_eq!(store.get("pane-p").unwrap().page_id, "page-2");
+        assert_eq!(store.get("resumed-x").unwrap().page_id, "page-2");
+        assert_eq!(store.get("elsewhere").unwrap().page_id, "default");
     }
 
     /// `confirm_session` flips provisional→confirmed monotonically, a
@@ -6191,9 +7300,7 @@ mod tests {
         let store = SessionLifecycleStore::open(&path).unwrap();
         assert!(store.get("phantom").is_none(), "stays removed after reload");
         assert!(
-            store
-                .restorable_records(Utc::now().timestamp_millis(), None, true, None)
-                .is_empty(),
+            store.restorable_records(None, true).is_empty(),
             "a removed phantom is never restorable"
         );
         // Absent id — no panic, no write.
@@ -6431,7 +7538,7 @@ mod tests {
     /// with `open_authority_key`, so a CONFIRMED row wins over a newer
     /// unconfirmed one, and every candidate is named.
     ///
-    /// A `find_open_by_terminal`-style single `.find()` over the `HashMap` would
+    /// A first-match `.find()` over the `HashMap` would
     /// close a nondeterministic row here — a worse failure than the silent
     /// no-op it replaces, because it is not reproducible.
     #[test]
@@ -6812,7 +7919,7 @@ mod tests {
         let store = SessionLifecycleStore::open(&path).unwrap();
 
         let mut ids: Vec<String> = store
-            .restorable_records(now, None, true, None)
+            .restorable_records(None, true)
             .into_iter()
             .map(|r| r.claude_session_id)
             .collect();
@@ -6852,9 +7959,8 @@ mod tests {
         let _ = store.set_finished("finished-open", true, Some("work landed".into()));
         let _ = store.set_finished("finished-pty-exit", true, None);
 
-        let now = Utc::now().timestamp_millis();
         let ids: Vec<String> = store
-            .restorable_records(now, None, true, None)
+            .restorable_records(None, true)
             .into_iter()
             .map(|r| r.claude_session_id)
             .collect();
@@ -6909,53 +8015,105 @@ mod tests {
         );
     }
 
-    /// Re-finishing must be idempotent: a repeat call must not move the
-    /// timestamp, or every retry would look like fresh work. Unmark must clear
-    /// the marker, the reason and the sync flag together.
+    /// A second finish that carries a reason is a new declaration: it
+    /// RESTAMPS the mark (always a DIFFERENT stamp), clears `finish_synced` and re-sends
+    /// the finish carrying the NEW stamp — so a revived session finished again
+    /// is dated by its second finish. A reason-less re-finish is the
+    /// read-back / retry door and moves nothing. Unmark must clear the marker,
+    /// the reason and the sync flag together.
     #[test]
-    fn set_finished_is_idempotent_and_unmark_leaves_no_residue() {
+    fn a_second_finish_restamps_and_re_sends_and_unmark_leaves_no_residue() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("terminal-sessions.json");
         let store = SessionLifecycleStore::open(&path).unwrap();
+        // The finished_at of every record the observer was handed — i.e. of
+        // every coord write that was (re-)sent.
+        let sent: std::sync::Arc<std::sync::Mutex<Vec<Option<i64>>>> = Default::default();
+        {
+            let sent = sent.clone();
+            store.attach_finish_observer(move |rec| {
+                sent.lock().unwrap().push(rec.finished_at);
+                FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession)
+            });
+        }
 
         store.record_open(rec("s"));
         let first = store.set_finished("s", true, Some("r1".into())).unwrap();
         assert_eq!(first.changed, FinishChange::Marker);
         let stamped = first.record.finished_at.unwrap();
+        assert_eq!(*sent.lock().unwrap(), vec![Some(stamped)]);
 
-        let again = store.set_finished("s", true, None).unwrap();
+        // The read-back: reason-less, so it reads and moves nothing.
+        let read = store.set_finished("s", true, None).unwrap();
         assert_eq!(
-            again.changed,
+            read.changed,
             FinishChange::None,
-            "re-finishing with no new reason is a no-op — no write, no restamp"
+            "a reason-less re-finish is a read — no write, no restamp"
+        );
+        assert_eq!(read.record.finished_at, Some(stamped));
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            2,
+            "on an UNSYNCED mark the read re-offers the owed write (the retry door)"
         );
         assert_eq!(
-            again.coord,
-            FinishSync::LocalOnly(LocalOnlyReason::NoForwarder),
-            "a no-op on an UNSYNCED mark re-offers the owed write; with no \
-             forwarder attached it stays local-only"
+            sent.lock().unwrap()[1],
+            Some(stamped),
+            "with the SAME stamp"
         );
-        let snap = store
-            .all_records()
-            .into_iter()
-            .find(|r| r.claude_session_id == "s")
-            .unwrap();
-        assert_eq!(snap.finished_at, Some(stamped), "timestamp must not move");
 
-        store.mark_finish_synced("s", None);
-        assert!(
-            store
-                .all_records()
-                .into_iter()
-                .find(|r| r.claude_session_id == "s")
-                .unwrap()
-                .finish_synced
-        );
+        store.mark_finish_synced("s", Some(stamped));
+        assert!(store.get("s").unwrap().finish_synced);
         assert_eq!(
             store.set_finished("s", true, None).unwrap().coord,
             FinishSync::LocalOnly(LocalOnlyReason::NotRequeued),
-            "a no-op on a SYNCED mark owes coord nothing"
+            "a reason-less read on a SYNCED mark owes coord nothing"
         );
+        assert_eq!(
+            store.get("s").unwrap().finished_at,
+            Some(stamped),
+            "and the read-back still sees the synced mark it is reading"
+        );
+        assert!(store.get("s").unwrap().finish_synced);
+        assert_eq!(sent.lock().unwrap().len(), 2);
+
+        // The session is revived and finishes AGAIN: a declaration, with a
+        // reason. Even the SAME reason restamps.
+        let again = store.set_finished("s", true, Some("r1".into())).unwrap();
+        assert_eq!(
+            again.changed,
+            FinishChange::Marker,
+            "a second declared finish rewrites the mark itself"
+        );
+        let restamped = again.record.finished_at.unwrap();
+        assert_ne!(
+            restamped, stamped,
+            "the second finish is dated by itself, never by the first"
+        );
+        assert!(
+            !again.record.finish_synced,
+            "a restamped mark is unsynced — coord is owed the new time"
+        );
+        assert_eq!(
+            again.coord,
+            FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession),
+            "the restamp was handed to the forwarder, not reported not_requeued"
+        );
+        assert_eq!(
+            sent.lock().unwrap().last(),
+            Some(&Some(restamped)),
+            "the re-sent write carries the NEW stamp"
+        );
+        let on_disk = SessionLifecycleStore::open(&path)
+            .unwrap()
+            .get("s")
+            .expect("persisted");
+        assert_eq!(
+            on_disk.finished_at,
+            Some(restamped),
+            "the restamp is durable"
+        );
+        assert!(!on_disk.finish_synced);
 
         let un = store.set_finished("s", false, None).unwrap();
         assert_eq!(un.changed, FinishChange::Marker);
@@ -7038,17 +8196,43 @@ mod tests {
         );
     }
 
-    /// Review (adoption) L1: a blank reason, or the reason already stored, on
-    /// an already-finished mark rewrites nothing, so it is `changed: none`.
+    /// A restamp only has to DIFFER from the old stamp (that is all the ACK
+    /// matcher needs): two finishes inside one millisecond still differ, and a
+    /// clock stepped backwards dates the new finish at `now` rather than
+    /// pushing it past the old one into the future.
     #[test]
-    fn a_blank_or_unchanged_reason_is_not_a_reason_only_rewrite() {
+    fn a_restamp_always_differs_and_never_runs_ahead_of_the_clock() {
+        assert_eq!(restamp_at(1_000, 1_000), 1_001, "equal-now still differs");
+        assert_eq!(
+            restamp_at(1_000, 5_000),
+            5_000,
+            "a later clock is taken as is"
+        );
+        assert_eq!(
+            restamp_at(1_000, 400),
+            400,
+            "a clock stepped back is not pushed into the future"
+        );
+        for (prev, now) in [(1_000, 1_000), (1_000, 5_000), (1_000, 400)] {
+            assert_ne!(restamp_at(prev, now), prev);
+        }
+    }
+
+    /// Review (adoption) L1, as amended by the restamp: a blank reason on an
+    /// already-finished mark is no reason — a read that rewrites nothing
+    /// (`changed: none`). Any real reason, the stored one included, is a new
+    /// declaration that restamps the mark (`changed: marker`).
+    #[test]
+    fn a_blank_reason_rewrites_nothing_and_any_reason_restamps() {
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
         store.record_open(rec("s"));
-        store
+        let stamped = store
             .set_finished("s", true, Some("done".into()))
-            .expect("fresh mark");
-        for r in ["", "   ", "done"] {
+            .expect("fresh mark")
+            .record
+            .finished_at;
+        for r in ["", "   "] {
             let out = store
                 .set_finished("s", true, Some(r.to_string()))
                 .expect("known id");
@@ -7058,18 +8242,25 @@ mod tests {
                 "reason {r:?} rewrote nothing"
             );
             assert_eq!(out.record.finish_reason.as_deref(), Some("done"));
+            assert_eq!(out.record.finished_at, stamped, "and moved nothing");
         }
-        let out = store
-            .set_finished("s", true, Some("other".into()))
-            .expect("known id");
-        assert_eq!(out.changed, FinishChange::ReasonOnly);
-        assert_eq!(out.record.finish_reason.as_deref(), Some("other"));
+        let mut last = stamped;
+        for r in ["done", "other"] {
+            let out = store
+                .set_finished("s", true, Some(r.to_string()))
+                .expect("known id");
+            assert_eq!(out.changed, FinishChange::Marker, "reason {r:?} restamps");
+            assert_eq!(out.record.finish_reason.as_deref(), Some(r));
+            assert_ne!(out.record.finished_at, last, "reason {r:?} moved the stamp");
+            last = out.record.finished_at;
+        }
     }
 
     /// The finish observer is the producer seam for coord's `Finished` outbox
     /// row: it must fire for a fresh mark and re-fire for a no-op repeat while
     /// the mark is UNSYNCED (the retry door), stay silent on a no-op unmark
-    /// and on an unknown id, and stop firing once coord has ACKed.
+    /// and on an unknown id, and — once coord has ACKed — stay silent on a
+    /// reason-less re-finish but fire for a reason-carrying one (a restamp).
     #[test]
     fn finish_observer_fires_only_while_a_coord_write_is_owed() {
         let dir = tempdir().unwrap();
@@ -7112,18 +8303,24 @@ mod tests {
         assert_eq!(
             seen.lock().unwrap().len(),
             3,
-            "a reason update on an UNSYNCED mark re-fires — coord still owes the write"
+            "a reason-carrying re-finish on an UNSYNCED mark restamps and re-fires"
         );
 
         store.mark_finish_synced("s", None);
-        let _ = store.set_finished("s", true, Some("later reason".into()));
         let _ = store.set_finished("s", true, None);
         assert_eq!(
             seen.lock().unwrap().len(),
             3,
-            "once coord has ACKed, neither a reason-only update nor a no-op owes \
-             coord anything"
+            "once coord has ACKed, a reason-less no-op owes coord nothing"
         );
+        let _ = store.set_finished("s", true, Some("later reason".into()));
+        assert_eq!(
+            *seen.lock().unwrap().last().unwrap(),
+            ("s".to_string(), true),
+            "but a reason-carrying re-finish on a SYNCED mark restamps, so coord \
+             is owed — and sent — the new finish"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 4);
 
         let _ = store.set_finished("s", false, None);
         assert_eq!(
@@ -7311,7 +8508,7 @@ mod tests {
         // an identical re-record (boot re-assert), and a snapshot-gated
         // heartbeat right after a change.
         store.touch("sess-1");
-        store.mark_restore_pending("sess-1");
+        store.mark_restore_pending("sess-1", true);
         store.clear_restore_pending("sess-1");
         store.record_open(rec("sess-1"));
         store.snapshot_heartbeat();
@@ -8253,9 +9450,8 @@ mod tests {
         store.record_open(rec("bare-shell"));
         store.record_close("bare-shell", "never-started");
 
-        let now = Utc::now().timestamp_millis();
         assert!(
-            store.restorable_records(now, None, true, None).is_empty(),
+            store.restorable_records(None, true).is_empty(),
             "a never-started (bare shell) record must never be a restore candidate"
         );
     }
@@ -8271,9 +9467,8 @@ mod tests {
         store.record_open(rec("orphan-sess"));
         store.record_close("orphan-sess", "no-terminal");
 
-        let now = Utc::now().timestamp_millis();
         assert!(
-            store.restorable_records(now, None, true, None).is_empty(),
+            store.restorable_records(None, true).is_empty(),
             "a no-terminal close (even seconds old) must not be restorable"
         );
     }
@@ -8286,7 +9481,7 @@ mod tests {
         store.record_open(rec("sess-1"));
         assert!(store.open_records()[0].restore_pending_at.is_none());
 
-        store.mark_restore_pending("sess-1");
+        store.mark_restore_pending("sess-1", true);
         assert!(store.open_records()[0].restore_pending_at.is_some());
 
         // Durable across a "restart" — the marker must survive a frontend /
@@ -8300,7 +9495,7 @@ mod tests {
         assert!(store.open_records()[0].restore_pending_at.is_none());
 
         // Absent ids are no-ops (no panic).
-        store.mark_restore_pending("ghost");
+        store.mark_restore_pending("ghost", true);
         store.clear_restore_pending("ghost");
         // Double-clear is a no-op.
         store.clear_restore_pending("sess-1");
@@ -8387,7 +9582,7 @@ mod tests {
         let path = dir.path().join("terminal-sessions.json");
         let store = SessionLifecycleStore::open(&path).unwrap();
         store.record_open(rec("sess-1"));
-        store.mark_restore_pending("sess-1");
+        store.mark_restore_pending("sess-1", true);
         assert_eq!(
             store.get("sess-1").unwrap().restore_tier.as_deref(),
             Some(RESTORE_TIER_FAILED),
@@ -8440,7 +9635,7 @@ mod tests {
 
         // A landed restore: mark → clear promotes `failed` → `resumed`.
         store.record_open(rec("landed"));
-        store.mark_restore_pending("landed");
+        store.mark_restore_pending("landed", true);
         store.clear_restore_pending("landed");
         assert_eq!(
             store.get("landed").unwrap().restore_tier.as_deref(),
@@ -8486,7 +9681,7 @@ mod tests {
 
         // An UNCONFIRMED phantom holding a restore-pending marker…
         store.record_open(rec("phantom"));
-        store.mark_restore_pending("phantom");
+        store.mark_restore_pending("phantom", true);
 
         // …evicted when a new AUTHORITATIVE session binds the same terminal.
         let mut incoming = rec("real");
@@ -8518,7 +9713,7 @@ mod tests {
         let mut prior = rec("prior");
         prior.confirmed_at = Some(1_000);
         store.record_open(prior);
-        store.mark_restore_pending("prior");
+        store.mark_restore_pending("prior", true);
 
         let mut next = rec("next");
         next.confirmed_at = Some(2_000);
@@ -8588,7 +9783,7 @@ mod tests {
         let path = dir.path().join("terminal-sessions.json");
         let store = SessionLifecycleStore::open(&path).unwrap();
         store.record_open(rec("sess-1"));
-        store.mark_restore_pending("sess-1");
+        store.mark_restore_pending("sess-1", true);
 
         let mut r2 = rec("sess-1");
         r2.terminal_id = "term-new".to_string();
@@ -8627,6 +9822,7 @@ mod tests {
             provider: DEFAULT_PROVIDER.to_string(),
             origin: None,
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: None,
             handle: None,
             account_label: None,
@@ -8645,6 +9841,7 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
         }
     }
 
@@ -8660,12 +9857,11 @@ mod tests {
 
     fn restorable_ids(
         store: &SessionLifecycleStore,
-        now: i64,
         prior_marker_at: Option<i64>,
         boot_was_clean: bool,
     ) -> Vec<String> {
         let mut ids: Vec<String> = store
-            .restorable_records(now, prior_marker_at, boot_was_clean, None)
+            .restorable_records(prior_marker_at, boot_was_clean)
             .into_iter()
             .map(|r| r.claude_session_id)
             .collect();
@@ -8683,7 +9879,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("terminal-sessions.json");
         let shutdown = 1_700_000_000_000_i64; // registry's last moment of life
-        let now = shutdown + 60_000; // restart one minute later
+                                              // restart one minute later — irrelevant: admission is anchor-relative.
         write_fixture(
             &path,
             vec![
@@ -8724,10 +9920,10 @@ mod tests {
             "fixture-onscreen-0002".to_string(),
         ];
         // With the clean-shutdown marker anchoring the registry…
-        assert_eq!(restorable_ids(&store, now, Some(shutdown), true), expected);
+        assert_eq!(restorable_ids(&store, Some(shutdown), true), expected);
         // …and even without it: the pty-exit closes already anchor the
         // registry at the shutdown instant, so the 72h ghost stays out.
-        assert_eq!(restorable_ids(&store, now, None, true), expected);
+        assert_eq!(restorable_ids(&store, None, true), expected);
     }
 
     /// Anchored recency is downtime-proof: open rows fresh AT THE CRASH
@@ -8739,7 +9935,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("terminal-sessions.json");
         let crash = 1_700_000_000_000_i64;
-        let now = crash + 6 * 3_600_000; // booted 6 hours later
+        // booted 6 hours later — irrelevant: admission is anchor-relative.
         write_fixture(
             &path,
             vec![
@@ -8756,10 +9952,695 @@ mod tests {
         // Unclean boot: the crashed process's own marker is excluded from the
         // anchor; the dense crash cohort supplies it.
         assert_eq!(
-            restorable_ids(&store, now, prior_marker_at, false),
+            restorable_ids(&store, prior_marker_at, false),
             vec!["fresh-a".to_string(), "fresh-b".to_string()],
             "fresh-at-crash open rows restore after multi-hour downtime; ghost excluded"
         );
+    }
+
+    /// Plan `2026-10-04-runner-session-roster-restore-picker`, Phase 1: the
+    /// CLOSED arms are anchor-relative too. A graceful stop stamps every PTY
+    /// `pty-exit` at the shutdown instant; a rebuild that boots 3 h later must
+    /// still restore all of them (a wall-clock `now - closed_at` rule restored
+    /// NOTHING past 10 minutes), while
+    /// (b) a `pty-exit` close 30 min BEFORE shutdown stays stale,
+    /// (c) a `user-close` / `no-terminal` close is still never restored, and
+    /// (d) a finished row is still excluded — on BOTH boot kinds.
+    #[test]
+    fn restorable_records_closed_rows_are_anchor_relative_across_long_rebuild() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let shutdown = 1_700_000_000_000_i64;
+        // (The boot happens 3 h after `shutdown`; nothing below reads a clock.)
+        let mut finished = fixture_rec(
+            "finished-at-shutdown",
+            "closed",
+            shutdown,
+            Some(shutdown),
+            Some("pty-exit"),
+        );
+        finished.finished_at = Some(shutdown - 60_000);
+        write_fixture(
+            &path,
+            vec![
+                // (a) the graceful-stop cohort.
+                fixture_rec(
+                    "graceful-a",
+                    "closed",
+                    shutdown,
+                    Some(shutdown),
+                    Some("pty-exit"),
+                ),
+                fixture_rec(
+                    "graceful-b",
+                    "closed",
+                    shutdown - 2_000,
+                    Some(shutdown - 1_000),
+                    Some("pty-exit"),
+                ),
+                // An idle-but-live shell the poll closed just before shutdown.
+                fixture_rec(
+                    "poll-dead-recent",
+                    "closed",
+                    shutdown - 120_000,
+                    Some(shutdown - 60_000),
+                    Some("poll-dead"),
+                ),
+                // (b) closed 30 min before shutdown — stale relative to the anchor.
+                fixture_rec(
+                    "pty-exit-30min-early",
+                    "closed",
+                    shutdown - 30 * 60_000,
+                    Some(shutdown - 30 * 60_000),
+                    Some("pty-exit"),
+                ),
+                fixture_rec(
+                    "poll-dead-30min-early",
+                    "closed",
+                    shutdown - 31 * 60_000,
+                    Some(shutdown - 30 * 60_000),
+                    Some("poll-dead"),
+                ),
+                // (c) deliberate closes, at the shutdown instant.
+                fixture_rec(
+                    "user-closed",
+                    "closed",
+                    shutdown,
+                    Some(shutdown),
+                    Some("user-close"),
+                ),
+                fixture_rec(
+                    "orphan",
+                    "closed",
+                    shutdown,
+                    Some(shutdown),
+                    Some("no-terminal"),
+                ),
+                // (d) finished.
+                finished,
+            ],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        let expected = vec![
+            "graceful-a".to_string(),
+            "graceful-b".to_string(),
+            "poll-dead-recent".to_string(),
+        ];
+        // Clean boot: the shutdown marker is the anchor.
+        assert_eq!(restorable_ids(&store, Some(shutdown), true), expected);
+        // Unclean boot (marker excluded): the rows' own stamps anchor at the
+        // same instant, so the answer is identical.
+        assert_eq!(
+            restorable_ids(&store, Some(shutdown - 86_400_000), false),
+            expected
+        );
+    }
+
+    /// The ledger roster ([`SessionLifecycleStore::roster_records`]) is the
+    /// restore set with FINISHED rows kept: a graceful-stop cohort (every row
+    /// closed `pty-exit`) is non-empty and a finished row stays in it (so
+    /// Finish is undoable from the roster), while a stale `open` ghost, a
+    /// deliberate close and the losing row of a terminal collision are left
+    /// out — exactly as the restore set leaves them out, so the "will come
+    /// back" preview matches the next boot's restore census.
+    #[test]
+    fn roster_records_is_the_restore_set_plus_finished_rows() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let shutdown = 1_700_000_000_000_i64;
+        let mut finished = fixture_rec(
+            "finished-pty-exit",
+            "closed",
+            shutdown,
+            Some(shutdown),
+            Some("pty-exit"),
+        );
+        finished.finished_at = Some(shutdown - 1_000);
+        // Two open rows on ONE terminal: only the newer survives the dedupe.
+        let mut collided_old = fixture_rec("collided-old", "open", shutdown - 5_000, None, None);
+        collided_old.terminal_id = "term-shared".to_string();
+        let mut collided_new = fixture_rec("collided-new", "open", shutdown - 1_000, None, None);
+        collided_new.terminal_id = "term-shared".to_string();
+        write_fixture(
+            &path,
+            vec![
+                fixture_rec(
+                    "graceful",
+                    "closed",
+                    shutdown,
+                    Some(shutdown),
+                    Some("pty-exit"),
+                ),
+                finished,
+                fixture_rec("stale-open", "open", shutdown - 72 * 3_600_000, None, None),
+                collided_old,
+                collided_new,
+                fixture_rec(
+                    "user-closed",
+                    "closed",
+                    shutdown,
+                    Some(shutdown),
+                    Some("user-close"),
+                ),
+                fixture_rec(
+                    "stale-pty-exit",
+                    "closed",
+                    shutdown - 3_600_000,
+                    Some(shutdown - 3_600_000),
+                    Some("pty-exit"),
+                ),
+            ],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let mut ids: Vec<String> = store
+            .roster_records(Some(shutdown), true)
+            .into_iter()
+            .map(|r| r.claude_session_id)
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "collided-new".to_string(),
+                "finished-pty-exit".to_string(),
+                "graceful".to_string(),
+            ]
+        );
+        // …and the restore set is exactly its unfinished part.
+        assert_eq!(
+            restorable_ids(&store, Some(shutdown), true),
+            vec!["collided-new".to_string(), "graceful".to_string()]
+        );
+    }
+
+    /// A restore re-asserts the rows it brings back (`record_open` stamps
+    /// `last_seen_at = now`). That must not move the window the REST of the
+    /// prior cohort is judged against: rows closed `pty-exit` at the shutdown
+    /// instant T stay admitted after a sibling was re-opened 30 minutes into
+    /// this process's life — otherwise a second page restored later in a long
+    /// rebuild restores nothing and the ledger poll drops that cohort.
+    #[test]
+    fn this_process_restoring_a_sibling_does_not_age_out_the_prior_cohort() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let shutdown = 1_700_000_000_000_i64;
+        let boot = shutdown + 3 * 3_600_000;
+        write_fixture(
+            &path,
+            ["page-a-sib", "page-b-1", "page-b-2"]
+                .iter()
+                .map(|id| fixture_rec(id, "closed", shutdown, Some(shutdown), Some("pty-exit")))
+                .collect(),
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(boot);
+
+        // Page A restores its sibling 30 minutes after boot (any instant after
+        // `boot` models it: `record_open` stamps the real clock).
+        let mut reopened = fixture_rec("page-a-sib", "open", boot + 30 * 60_000, None, None);
+        reopened.terminal_id = "term-new-a".to_string();
+        store.record_open(reopened);
+
+        let expected = vec![
+            "page-a-sib".to_string(),
+            "page-b-1".to_string(),
+            "page-b-2".to_string(),
+        ];
+        assert_eq!(restorable_ids(&store, Some(shutdown), true), expected);
+        // The roster (what the ledger poll captures) keeps the cohort too.
+        let mut roster: Vec<String> = store
+            .roster_records(Some(shutdown), true)
+            .into_iter()
+            .map(|r| r.claude_session_id)
+            .collect();
+        roster.sort();
+        assert_eq!(roster, expected);
+    }
+
+    /// A row stamped during THIS process's life is judged against this
+    /// process's own latest activity, not the prior anchor: a tab closed
+    /// `pty-exit` an hour ago while the runner kept running is stale.
+    #[test]
+    fn a_close_during_this_process_is_judged_against_this_process() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let boot = 1_700_000_000_000_i64;
+        write_fixture(
+            &path,
+            vec![
+                fixture_rec(
+                    "closed-an-hour-ago",
+                    "closed",
+                    boot + 3_600_000,
+                    Some(boot + 3_600_000),
+                    Some("pty-exit"),
+                ),
+                fixture_rec("live", "open", boot + 2 * 3_600_000, None, None),
+            ],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(boot);
+        assert_eq!(
+            restorable_ids(&store, Some(boot - 60_000), true),
+            vec!["live".to_string()]
+        );
+    }
+
+    /// Crash boot, SPARSE registry: the only row is a session the operator
+    /// exited (`pty-exit`) five hours before the crash. The rows alone anchor
+    /// at that exit and resurrect it; the snapshot history's liveness
+    /// heartbeat from just before the crash bounds the anchor and excludes it.
+    #[test]
+    fn crash_boot_heartbeat_keeps_a_long_exited_session_out() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let exited = 1_700_000_000_000_i64;
+        let last_heartbeat = exited + 5 * 3_600_000;
+        write_fixture(
+            &path,
+            vec![fixture_rec(
+                "exited-hours-before",
+                "closed",
+                exited,
+                Some(exited),
+                Some("pty-exit"),
+            )],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        // Without a history the rows are all there is (the documented
+        // degraded case) — the exit is its own anchor.
+        assert_eq!(
+            restorable_ids(&store, None, false),
+            vec!["exited-hours-before".to_string()]
+        );
+
+        let history_path = dir.path().join("session-snapshots.jsonl");
+        std::fs::write(
+            &history_path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "ts": last_heartbeat,
+                    "at": "2023-11-15T03:13:20Z",
+                    "reason": "heartbeat",
+                    "sessions": []
+                })
+            ),
+        )
+        .unwrap();
+        store.attach_snapshot_history(Arc::new(SnapshotHistory::open(&history_path).unwrap()));
+        assert!(restorable_ids(&store, None, false).is_empty());
+        // A clean boot is anchored by its marker, never the heartbeat.
+        assert_eq!(
+            restorable_ids(&store, Some(exited), true),
+            vec!["exited-hours-before".to_string()]
+        );
+    }
+
+    /// Crash boot after an INTERMEDIATE short-lived boot: an open cohort last
+    /// seen at T, and an intermediate boot that heartbeated the snapshot
+    /// history at T+1h46m before dying. The heartbeat bounds only the closed
+    /// arms, so the open cohort still restores (the 2026-07-19 stranding),
+    /// while the sparse-registry `pty-exit` row stays excluded.
+    #[test]
+    fn crash_boot_intermediate_heartbeat_does_not_strand_an_open_cohort() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        let intermediate_heartbeat = t + 3_600_000 + 46 * 60_000;
+        let exited = t - 5 * 3_600_000;
+        write_fixture(
+            &path,
+            vec![
+                fixture_rec("cohort-1", "open", t, None, None),
+                fixture_rec("cohort-2", "open", t - 60_000, None, None),
+                fixture_rec("exited", "closed", exited, Some(exited), Some("pty-exit")),
+            ],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let history_path = dir.path().join("session-snapshots.jsonl");
+        std::fs::write(
+            &history_path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "ts": intermediate_heartbeat,
+                    "at": "2023-11-14T23:59:20Z",
+                    "reason": "heartbeat",
+                    "sessions": []
+                })
+            ),
+        )
+        .unwrap();
+        store.attach_snapshot_history(Arc::new(SnapshotHistory::open(&history_path).unwrap()));
+        assert_eq!(
+            restorable_ids(&store, None, false),
+            vec!["cohort-1".to_string(), "cohort-2".to_string()],
+            "the open cohort is anchored by its own rows, never the heartbeat"
+        );
+    }
+
+    /// A `needs-account` row waiting for the operator is held by the poll
+    /// (never refreshed — the hold itself keeps it on the roster and in the
+    /// restore set) instead of being closed `no-terminal`, and the wait ends on
+    /// a verified re-open, a close, or Finish.
+    #[test]
+    fn an_awaiting_account_row_is_held_until_resumed_closed_or_finished() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let old = Utc::now().timestamp_millis() - 3_600_000;
+        write_fixture(
+            &path,
+            vec![
+                fixture_rec("needs-account", "open", old, None, None),
+                fixture_rec("finish-me", "open", old, None, None),
+                fixture_rec("close-me", "open", old, None, None),
+                fixture_rec("not-waiting", "open", old, None, None),
+            ],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        for id in ["needs-account", "finish-me", "close-me"] {
+            store.mark_awaiting_account(id, Utc::now().timestamp_millis(), &NONE_LIVE);
+        }
+        let now = Utc::now().timestamp_millis();
+        assert!(!store.poll_hold_awaiting_account("not-waiting", now));
+        assert!(store.poll_hold_awaiting_account("needs-account", now));
+        assert_eq!(
+            store.get("needs-account").unwrap().last_seen_at,
+            old,
+            "the hold never refreshes the row's last-seen"
+        );
+
+        store
+            .set_finished("finish-me", true, None)
+            .expect("a known session");
+        assert!(!store.poll_hold_awaiting_account("finish-me", now));
+        assert_eq!(store.get("finish-me").unwrap().awaiting_account_since, None);
+        store.record_close("close-me", "user-close");
+        assert!(!store.poll_hold_awaiting_account("close-me", now));
+        assert_eq!(store.get("close-me").unwrap().awaiting_account_since, None);
+        store.record_open(fixture_rec("needs-account", "open", old, None, None));
+        assert!(!store.poll_hold_awaiting_account("needs-account", now));
+        assert_eq!(
+            store.get("needs-account").unwrap().awaiting_account_since,
+            None,
+            "a verified resume is new life — the hold clock is cleared"
+        );
+        // A closed row cannot start waiting.
+        store.mark_awaiting_account("close-me", Utc::now().timestamp_millis(), &NONE_LIVE);
+        assert!(!store.poll_hold_awaiting_account("close-me", now));
+    }
+
+    /// The hold is capped at the open-row prune age measured from the row's
+    /// ORIGINAL last-seen; it survives a restart with no re-mark, and a re-mark
+    /// does not move the cap.
+    #[test]
+    fn the_awaiting_account_hold_ends_at_the_prune_age_from_the_original_last_seen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let original = Utc::now().timestamp_millis() - 3_600_000;
+        write_fixture(
+            &path,
+            vec![fixture_rec("waiting", "open", original, None, None)],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.mark_awaiting_account("waiting", Utc::now().timestamp_millis(), &NONE_LIVE);
+        assert!(store.poll_hold_awaiting_account("waiting", original + OPEN_STALE_MS));
+        assert_eq!(
+            store.get("waiting").unwrap().last_seen_at,
+            original,
+            "held, never refreshed"
+        );
+
+        // A restart: the durable stamp alone holds the row, and a re-mark
+        // keeps the ORIGINAL last-seen.
+        drop(store);
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        assert!(store.poll_hold_awaiting_account("waiting", original + OPEN_STALE_MS));
+        store.mark_awaiting_account("waiting", Utc::now().timestamp_millis(), &NONE_LIVE);
+        assert_eq!(
+            store.get("waiting").unwrap().awaiting_account_since,
+            Some(original)
+        );
+        assert!(
+            !store.poll_hold_awaiting_account("waiting", original + OPEN_STALE_MS + 1),
+            "past the prune age from the original last-seen, the wait ends"
+        );
+        assert_eq!(
+            store.get("waiting").unwrap().awaiting_account_since,
+            None,
+            "an expired hold clears its stamp"
+        );
+        assert!(
+            !store.poll_hold_awaiting_account("waiting", original),
+            "and stays ended until something marks it again"
+        );
+    }
+
+    /// The hold must never move the restore anchor (review MAJOR 1). An
+    /// intermediate boot B1 (crash at T, boot at T+2h) holds a needs-account
+    /// row for one poll tick and dies; the crash boot B2 must still restore
+    /// the un-held open cohort last seen at T, and keep the held row on the
+    /// roster as needs-account — with no re-mark.
+    #[test]
+    fn an_intermediate_boots_hold_never_strands_the_open_cohort() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let crash_at = Utc::now().timestamp_millis() - 2 * 3_600_000;
+        write_fixture(
+            &path,
+            vec![
+                fixture_rec("cohort-1", "open", crash_at, None, None),
+                fixture_rec("cohort-2", "open", crash_at - 60_000, None, None),
+                fixture_rec("held", "open", crash_at - 30_000, None, None),
+            ],
+        );
+
+        // B1: holds the row, one poll tick, dies.
+        let b1 = SessionLifecycleStore::open(&path).unwrap();
+        b1.mark_awaiting_account("held", Utc::now().timestamp_millis(), &NONE_LIVE);
+        let (mut dead, mut no_match) = (HashMap::new(), HashMap::new());
+        assert!(poll_holds_unmatched_row(
+            &b1,
+            "held",
+            PollTerminalMatch::Unmatched,
+            Utc::now().timestamp_millis(),
+            &mut dead,
+            &mut no_match
+        ));
+        drop(b1);
+
+        // B2: a crash boot (no clean marker).
+        let b2 = SessionLifecycleStore::open(&path).unwrap();
+        assert_eq!(
+            restorable_ids(&b2, None, false),
+            vec![
+                "cohort-1".to_string(),
+                "cohort-2".to_string(),
+                "held".to_string()
+            ],
+            "the un-held cohort is anchored at its own crash instant"
+        );
+        let roster: Vec<String> = b2
+            .roster_records(None, false)
+            .into_iter()
+            .filter(|r| r.awaiting_account_since.is_some())
+            .map(|r| r.claude_session_id)
+            .collect();
+        assert_eq!(roster, vec!["held".to_string()], "still needs-account");
+        assert!(
+            b2.poll_hold_awaiting_account("held", Utc::now().timestamp_millis()),
+            "held across the restart by its durable stamp alone"
+        );
+    }
+
+    /// A held row's stamps feed no anchor, even when something else refreshed
+    /// it: a held row last seen AFTER the cohort cannot strand the cohort.
+    #[test]
+    fn a_held_rows_stamp_feeds_no_restore_anchor() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let crash_at = Utc::now().timestamp_millis() - 3 * 3_600_000;
+        let mut held = fixture_rec("held", "open", crash_at + 2 * 3_600_000, None, None);
+        held.awaiting_account_since = Some(crash_at);
+        write_fixture(
+            &path,
+            vec![fixture_rec("cohort", "open", crash_at, None, None), held],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        assert_eq!(
+            restorable_ids(&store, None, false),
+            vec!["cohort".to_string(), "held".to_string()]
+        );
+    }
+
+    /// The poll's hold branch: an unmatched awaiting row is skipped and its
+    /// close-detection streaks reset; a matched one, or one not awaiting, is
+    /// classified as usual (streaks untouched).
+    #[test]
+    fn poll_holds_only_an_unmatched_awaiting_row_and_resets_its_streaks() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let seen = Utc::now().timestamp_millis();
+        write_fixture(
+            &path,
+            vec![
+                fixture_rec("waiting", "open", seen, None, None),
+                fixture_rec("plain", "open", seen, None, None),
+            ],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.mark_awaiting_account("waiting", Utc::now().timestamp_millis(), &NONE_LIVE);
+        let streaks = || -> HashMap<String, u32> {
+            [("waiting".to_string(), 2), ("plain".to_string(), 2)]
+                .into_iter()
+                .collect()
+        };
+        let (mut dead, mut no_match) = (streaks(), streaks());
+
+        assert!(!poll_holds_unmatched_row(
+            &store,
+            "waiting",
+            PollTerminalMatch::Direct,
+            seen,
+            &mut dead,
+            &mut no_match
+        ));
+        assert_eq!(
+            no_match.get("waiting"),
+            Some(&2),
+            "a matched row is not held"
+        );
+        assert!(!poll_holds_unmatched_row(
+            &store,
+            "plain",
+            PollTerminalMatch::Unmatched,
+            seen,
+            &mut dead,
+            &mut no_match
+        ));
+        assert_eq!(
+            no_match.get("plain"),
+            Some(&2),
+            "a row not awaiting is not held"
+        );
+
+        assert!(poll_holds_unmatched_row(
+            &store,
+            "waiting",
+            PollTerminalMatch::Unmatched,
+            seen,
+            &mut dead,
+            &mut no_match
+        ));
+        assert_eq!(dead.get("waiting"), None);
+        assert_eq!(no_match.get("waiting"), None);
+
+        // Past the cap the same branch lets the poll classify it again.
+        assert!(!poll_holds_unmatched_row(
+            &store,
+            "waiting",
+            PollTerminalMatch::Unmatched,
+            seen + OPEN_STALE_MS + 1,
+            &mut dead,
+            &mut no_match
+        ));
+    }
+
+    /// At boot, every restore candidate the frontend would call
+    /// `needs-account` is held, so a page opened later still finds it: the
+    /// classifier's gates first (an unconfirmed, phantom, reconciled,
+    /// origin-less or transcript-absent row restores terminal-only and is
+    /// never held), then the account — a recorded dir or a unique transcript
+    /// holder is not held.
+    #[test]
+    fn boot_holds_every_restore_candidate_whose_account_is_unknown() {
+        #[derive(Debug)]
+        struct Holders;
+        impl TranscriptProbe for Holders {
+            fn transcript_exists(&self, session_id: &str, _: Option<&str>) -> bool {
+                session_id != "no-transcript"
+            }
+            fn transcript_config_dirs(
+                &self,
+                session_id: &str,
+                _: Option<&str>,
+            ) -> Option<Vec<PathBuf>> {
+                Some(match session_id {
+                    "one-holder" => vec![PathBuf::from("/h/.claude-x")],
+                    "two-holders" => {
+                        vec![PathBuf::from("/h/.claude-x"), PathBuf::from("/h/.claude-y")]
+                    }
+                    _ => Vec::new(),
+                })
+            }
+        }
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let shutdown = 1_700_000_000_000_i64;
+        let unrecorded = |id: &str| {
+            let mut r = fixture_rec(id, "open", shutdown, None, None);
+            r.config_dir = None;
+            r.working_dir = Some("/w".to_string());
+            r.origin = Some("authoritative".to_string());
+            r.confirmed_at = Some(shutdown - 1_000);
+            r
+        };
+        let mut recorded = unrecorded("recorded");
+        recorded.config_dir = Some("/h/.claude-z".to_string());
+        let mut observed = unrecorded("observed");
+        observed.origin = Some("observed".to_string());
+        // Rows the frontend restores terminal-only — never needs-account.
+        let mut unconfirmed = unrecorded("unconfirmed");
+        unconfirmed.confirmed_at = None;
+        let mut phantom = unrecorded("phantom");
+        phantom.confirmed_at = None;
+        phantom.origin = Some("observed".to_string());
+        let mut reconciled = unrecorded("reconciled");
+        reconciled.origin = Some("reconciled".to_string());
+        let mut no_origin = unrecorded("no-origin");
+        no_origin.origin = None;
+        let no_transcript = unrecorded("no-transcript");
+        // Parity, not a gemini rule: no Gemini adapter ships, so the frontend's
+        // `providerDescriptorFor` (like `adapter_for` here) resolves `gemini`
+        // to the full-tier Claude descriptor and calls this row needs-account.
+        // When a Gemini adapter lands on both sides this row stops being held.
+        let mut gemini = unrecorded("gemini");
+        gemini.provider = "gemini".to_string();
+        write_fixture(
+            &path,
+            vec![
+                recorded,
+                observed,
+                unconfirmed,
+                phantom,
+                reconciled,
+                no_origin,
+                no_transcript,
+                gemini,
+                unrecorded("one-holder"),
+                unrecorded("two-holders"),
+                unrecorded("no-holder"),
+            ],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let mut held = store.hold_unresolved_account_candidates(Some(shutdown), true, &Holders);
+        held.sort();
+        assert_eq!(
+            held,
+            vec![
+                "gemini".to_string(),
+                "no-holder".to_string(),
+                "observed".to_string(),
+                "two-holders".to_string()
+            ]
+        );
+        // The poll's first tick after this boot holds them.
+        let now = shutdown + 60_000;
+        assert!(store.poll_hold_awaiting_account("two-holders", now));
+        assert!(store.poll_hold_awaiting_account("no-holder", now));
+        assert!(!store.poll_hold_awaiting_account("one-holder", now));
     }
 
     /// A real on-screen session whose `pty-exit` close never flushed during
@@ -8771,7 +10652,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("terminal-sessions.json");
         let shutdown = 1_700_000_000_000_i64;
-        let now = shutdown + 60_000;
         write_fixture(
             &path,
             vec![
@@ -8789,7 +10669,7 @@ mod tests {
         );
         let store = SessionLifecycleStore::open(&path).unwrap();
         assert_eq!(
-            restorable_ids(&store, now, Some(shutdown), true),
+            restorable_ids(&store, Some(shutdown), true),
             vec!["flushed".to_string(), "unflushed".to_string()],
             "an open row within grace of the anchor restores even on a clean boot"
         );
@@ -8803,7 +10683,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("terminal-sessions.json");
         let shutdown = 1_700_000_000_000_i64;
-        let now = shutdown + 60_000;
         let ghost_seen = shutdown - 72 * 3_600_000;
         write_fixture(
             &path,
@@ -8812,14 +10691,14 @@ mod tests {
         let store = SessionLifecycleStore::open(&path).unwrap();
 
         assert!(
-            restorable_ids(&store, now, Some(shutdown), true).is_empty(),
+            restorable_ids(&store, Some(shutdown), true).is_empty(),
             "the clean-boot marker anchor must exclude a lone stale ghost"
         );
         // Documented fallback: with no marker and no sibling rows the ghost
         // self-anchors and is admitted (defensive — better than losing a
         // real lone session on a registry with no other signal).
         assert_eq!(
-            restorable_ids(&store, now, None, true),
+            restorable_ids(&store, None, true),
             vec!["ghost".to_string()]
         );
     }
@@ -8852,7 +10731,7 @@ mod tests {
         let store = SessionLifecycleStore::open(&path).unwrap();
 
         let ids: Vec<String> = store
-            .restorable_records(now, None, true, None)
+            .restorable_records(None, true)
             .into_iter()
             .map(|r| r.claude_session_id)
             .collect();
@@ -8879,7 +10758,7 @@ mod tests {
         let path = dir.path().join("terminal-sessions.json");
         let t = 1_700_000_000_000_i64; // crash instant
         let ninety_min = 90 * 60_000_i64;
-        let now = t + 2 * 3_600_000; // restarted 2h later
+        // restarted 2h later — irrelevant: admission is anchor-relative.
 
         // Five open rows that stopped together at ~T (the crash cohort).
         write_fixture(
@@ -8897,7 +10776,7 @@ mod tests {
         // Unclean (crash) boot: the intermediate marker at T+90m is EXCLUDED
         // from the anchor, so the crash rows anchor themselves and all survive.
         let marker_at = Some(t + ninety_min);
-        let ids = restorable_ids(&store, now, marker_at, false);
+        let ids = restorable_ids(&store, marker_at, false);
         assert_eq!(
             ids,
             vec![
@@ -8913,7 +10792,7 @@ mod tests {
         // Control: on a CLEAN boot the same later marker IS an honest
         // last-moment-of-life signal and correctly evicts the now-stale cohort.
         assert!(
-            restorable_ids(&store, now, marker_at, true).is_empty(),
+            restorable_ids(&store, marker_at, true).is_empty(),
             "a clean-boot marker 90m newer than the cohort excludes it"
         );
     }
@@ -8926,7 +10805,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("terminal-sessions.json");
         let t = 1_700_000_000_000_i64;
-        let now = t + 3_600_000; // 1h later
+        // 1h later — irrelevant: admission is anchor-relative.
 
         write_fixture(
             &path,
@@ -8939,7 +10818,7 @@ mod tests {
         );
         let store = SessionLifecycleStore::open(&path).unwrap();
 
-        let ids = restorable_ids(&store, now, None, false);
+        let ids = restorable_ids(&store, None, false);
         assert_eq!(
             ids,
             vec![
@@ -8949,6 +10828,541 @@ mod tests {
             ],
             "the crash band restores; the 72h stale ghost stays excluded"
         );
+    }
+
+    /// The incident's measured shape (plan
+    /// `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`):
+    /// the liveness poll's process snapshots failed for the last stretch of
+    /// the prior process's life, so no row was TOUCHED after T, while sessions
+    /// kept being spawned up to T+39m. The clean marker was stamped at T+77m.
+    /// Boot at T+3h.
+    const STARVED_COHORT: [&str; 5] = [
+        "starved-0000",
+        "starved-0010",
+        "starved-0020",
+        "starved-0030",
+        "starved-0039",
+    ];
+
+    /// Five open rows spread from `t` to `t + 39m` (ids name their minute
+    /// offset) plus one ghost last seen 72h before `t`.
+    fn starved_cohort_fixture(t: i64) -> Vec<TerminalSessionRecord> {
+        let minute = 60_000_i64;
+        let mut recs: Vec<TerminalSessionRecord> = [0_i64, 10, 20, 30, 39]
+            .iter()
+            .zip(STARVED_COHORT)
+            .map(|(m, id)| fixture_rec(id, "open", t + m * minute, None, None))
+            .collect();
+        recs.push(fixture_rec(
+            "ghost-72h",
+            "open",
+            t - 72 * 3_600_000,
+            None,
+            None,
+        ));
+        recs
+    }
+
+    /// Attach an observation epoch to `store` as THIS process would at boot:
+    /// when `prior_observed_at` is set, a PRIOR process first records it into
+    /// the sidecar under `dir`.
+    fn attach_epoch(
+        store: &SessionLifecycleStore,
+        dir: &Path,
+        prior_observed_at: Option<i64>,
+    ) -> Arc<ObservationEpoch> {
+        let path = dir.join(crate::session::observation_epoch::EPOCH_FILE_NAME);
+        if let Some(at) = prior_observed_at {
+            assert!(ObservationEpoch::open(&path, at - 3_600_000).record_tick(true, at, &[]));
+        }
+        let epoch = Arc::new(ObservationEpoch::open(&path, i64::MAX - 1));
+        store.attach_observation_epoch(epoch.clone());
+        epoch
+    }
+
+    /// The prior process's last SUCCESSFUL observation was at T (no touch
+    /// landed after it), so the cohort is fresh relative to what the runner
+    /// could see; the 72h ghost — stale long before T — stays out.
+    #[test]
+    fn restorable_records_snapshot_starved_cohort_survives_early_clean_marker() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        let marker_at = t + 77 * 60_000;
+        write_fixture(&path, starved_cohort_fixture(t));
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(t + 3 * 3_600_000);
+        attach_epoch(&store, dir.path(), Some(t));
+
+        assert_eq!(
+            restorable_ids(&store, Some(marker_at), true),
+            STARVED_COHORT.map(str::to_string).to_vec(),
+            "every session on screen when the snapshots starved is restored; the 72h ghost is not"
+        );
+    }
+
+    /// The rows of [`starved_cohort_fixture`] within the open-row grace of the
+    /// cohort's own newest stamp (`t + 39m`): what self-anchoring admits.
+    const STARVED_COHORT_NEWEST_BAND: [&str; 2] = ["starved-0030", "starved-0039"];
+
+    /// The documented one-boot transition, as production runs it: NO epoch
+    /// (first boot after the upgrade, or a pre-fix prior process), and the
+    /// old marker carries no `teardown_complete` field, so it reads `false`
+    /// and boot attaches `false`. The open anchor is then the prior process's
+    /// row stamps alone: the rows within the grace of the cohort's newest
+    /// stamp restore and the older ones still strand. Pinned so the fallback
+    /// is a decision, not an accident.
+    #[test]
+    fn restorable_records_snapshot_starved_cohort_without_epoch_still_strands() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        write_fixture(&path, starved_cohort_fixture(t));
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(t + 3 * 3_600_000);
+        store.attach_prior_teardown_complete(false);
+        let epoch = attach_epoch(&store, dir.path(), None);
+        assert!(
+            epoch.boot_notice().is_some(),
+            "the absent epoch is announced"
+        );
+
+        assert_eq!(
+            restorable_ids(&store, Some(t + 77 * 60_000), true),
+            STARVED_COHORT_NEWEST_BAND.map(str::to_string).to_vec()
+        );
+    }
+
+    /// With no teardown evidence attached at all (the store used standalone),
+    /// the marker anchors open rows as it always did, so with no epoch the
+    /// whole starved cohort strands.
+    #[test]
+    fn restorable_records_without_epoch_or_teardown_evidence_keeps_the_marker() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        write_fixture(&path, starved_cohort_fixture(t));
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(t + 3 * 3_600_000);
+        attach_epoch(&store, dir.path(), None);
+
+        assert!(restorable_ids(&store, Some(t + 77 * 60_000), true).is_empty());
+    }
+
+    /// A corrupt sidecar reads as absent — the same fallback as no epoch, in
+    /// the production shape (the pre-field marker attaches `false`).
+    #[test]
+    fn restorable_records_corrupt_epoch_falls_back_to_prior() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        write_fixture(&path, starved_cohort_fixture(t));
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(t + 3 * 3_600_000);
+        store.attach_prior_teardown_complete(false);
+        std::fs::write(
+            dir.path()
+                .join(crate::session::observation_epoch::EPOCH_FILE_NAME),
+            b"{\"observedOkAt\": \"not a number\"}",
+        )
+        .unwrap();
+        attach_epoch(&store, dir.path(), None);
+
+        assert_eq!(
+            restorable_ids(&store, Some(t + 77 * 60_000), true),
+            STARVED_COHORT_NEWEST_BAND.map(str::to_string).to_vec()
+        );
+    }
+
+    /// An epoch OLDER than every row (the poll last saw the table an hour
+    /// before the cohort's earliest stamp) admits the whole cohort; the 72h
+    /// ghost is still 71h behind it.
+    #[test]
+    fn restorable_records_epoch_older_than_every_row_admits_the_cohort() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        write_fixture(&path, starved_cohort_fixture(t));
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(t + 3 * 3_600_000);
+        attach_epoch(&store, dir.path(), Some(t - 3_600_000));
+
+        assert_eq!(
+            restorable_ids(&store, Some(t + 77 * 60_000), true),
+            STARVED_COHORT.map(str::to_string).to_vec()
+        );
+    }
+
+    /// The grace boundary, both sides, measured from an epoch NEWER than the
+    /// rows: 9:59 behind it is admitted, 10:01 behind it is not.
+    #[test]
+    fn restorable_records_epoch_newer_than_rows_keeps_the_grace_boundary() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let epoch_at = 1_700_000_000_000_i64;
+        write_fixture(
+            &path,
+            vec![
+                fixture_rec("behind-0959", "open", epoch_at - 599_000, None, None),
+                fixture_rec("behind-1001", "open", epoch_at - 601_000, None, None),
+            ],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(epoch_at + 3 * 3_600_000);
+        attach_epoch(&store, dir.path(), Some(epoch_at));
+
+        assert_eq!(
+            restorable_ids(&store, Some(epoch_at + 3_600_000), true),
+            vec!["behind-0959".to_string()]
+        );
+    }
+
+    /// A CRASH boot (no clean marker counts) with an epoch: the rows alone
+    /// anchor at T+39m and strand the early cohort; the epoch at T admits it.
+    #[test]
+    fn restorable_records_crash_boot_with_epoch_admits_the_starved_cohort() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        write_fixture(&path, starved_cohort_fixture(t));
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(t + 3 * 3_600_000);
+        // Control: without the epoch the crash cohort anchors at its newest
+        // spawn and loses every row more than 10 minutes older.
+        assert_eq!(
+            restorable_ids(&store, Some(t - 3_600_000), false),
+            vec!["starved-0030".to_string(), "starved-0039".to_string()]
+        );
+        attach_epoch(&store, dir.path(), Some(t));
+        assert_eq!(
+            restorable_ids(&store, Some(t - 3_600_000), false),
+            STARVED_COHORT.map(str::to_string).to_vec()
+        );
+    }
+
+    /// An epoch THIS process writes never feeds the prior arm: its own ticks
+    /// (or a restore's re-asserts) cannot move the window the prior cohort
+    /// is judged against — in either direction.
+    #[test]
+    fn restorable_records_this_process_epoch_does_not_feed_prior() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        let boot = t + 3 * 3_600_000;
+        write_fixture(&path, starved_cohort_fixture(t));
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(boot);
+        // No prior epoch: this process observing early (t) must not rescue
+        // the prior cohort, and observing late must not age it further.
+        let epoch = attach_epoch(&store, dir.path(), None);
+        epoch.record_ok(t);
+        assert!(restorable_ids(&store, Some(t + 77 * 60_000), true).is_empty());
+
+        let dir2 = tempdir().unwrap();
+        let path2 = dir2.path().join("terminal-sessions.json");
+        write_fixture(&path2, starved_cohort_fixture(t));
+        let store2 = SessionLifecycleStore::open(&path2).unwrap();
+        store2.set_boot_ms_for_test(boot);
+        let epoch2 = attach_epoch(&store2, dir2.path(), Some(t));
+        epoch2.record_ok(boot + 5 * 3_600_000);
+        assert_eq!(
+            restorable_ids(&store2, Some(t + 77 * 60_000), true),
+            STARVED_COHORT.map(str::to_string).to_vec()
+        );
+    }
+
+    /// A second boot reads the epoch the first boot's poll wrote.
+    #[test]
+    fn restorable_records_second_boot_reads_the_first_boots_epoch() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        let epoch_path = dir
+            .path()
+            .join(crate::session::observation_epoch::EPOCH_FILE_NAME);
+        // First boot: a failed tick, then a successful one at T, then failures.
+        let first = ObservationEpoch::open(&epoch_path, t - 3_600_000);
+        assert!(!first.record_tick(false, t - 45_000, &[]));
+        assert!(first.record_tick(true, t, &[]));
+        assert!(!first.record_tick(false, t + 45_000, &[]));
+        drop(first);
+
+        write_fixture(&path, starved_cohort_fixture(t));
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(t + 3 * 3_600_000);
+        let second = Arc::new(ObservationEpoch::open(&epoch_path, t + 3 * 3_600_000));
+        assert_eq!(second.prior_observed(), Some(t));
+        store.attach_observation_epoch(second);
+        assert_eq!(
+            restorable_ids(&store, Some(t + 77 * 60_000), true),
+            STARVED_COHORT.map(str::to_string).to_vec()
+        );
+    }
+
+    /// The ghost guard rails hold with an epoch set AFTER the ghost went
+    /// stale: successful ticks kept not finding it alive.
+    #[test]
+    fn ghost_exclusions_hold_with_an_epoch_after_the_ghost() {
+        let shutdown = 1_700_000_000_000_i64;
+        // `restorable_records_marker_anchor_excludes_lone_ghost` shape.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        write_fixture(
+            &path,
+            vec![fixture_rec(
+                "ghost",
+                "open",
+                shutdown - 72 * 3_600_000,
+                None,
+                None,
+            )],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        attach_epoch(&store, dir.path(), Some(shutdown - 60_000));
+        assert!(restorable_ids(&store, Some(shutdown), true).is_empty());
+
+        // `restorable_records_exclude_stale_open_ghost_after_clean_restart` shape.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        write_fixture(
+            &path,
+            vec![
+                fixture_rec(
+                    "onscreen",
+                    "closed",
+                    shutdown,
+                    Some(shutdown),
+                    Some("pty-exit"),
+                ),
+                fixture_rec("ghost", "open", shutdown - 72 * 3_600_000, None, None),
+            ],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        attach_epoch(&store, dir.path(), Some(shutdown - 60_000));
+        assert_eq!(
+            restorable_ids(&store, Some(shutdown), true),
+            vec!["onscreen".to_string()]
+        );
+    }
+
+    /// The live arm still ages out a row this process OBSERVED dead: with a
+    /// successful observation 30 minutes after a row's last touch, that row
+    /// is stale — the epoch only stops UNOBSERVED stretches counting.
+    #[test]
+    fn live_arm_still_ages_out_a_row_this_process_observed_dead() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        write_fixture(
+            &path,
+            vec![
+                fixture_rec("touched-at-t", "open", t, None, None),
+                fixture_rec("touched-at-t30", "open", t + 30 * 60_000, None, None),
+            ],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(t - 60_000);
+        attach_epoch(&store, dir.path(), None).record_ok(t + 30 * 60_000);
+        let roster: Vec<String> = store
+            .roster_records(Some(t - 120_000), true)
+            .into_iter()
+            .map(|r| r.claude_session_id)
+            .collect();
+        assert_eq!(roster, vec!["touched-at-t30".to_string()]);
+    }
+
+    // Phase 3: the marker anchors open rows only after a FINISHED teardown.
+
+    const SELF_ANCHORED_COHORT: [&str; 3] = ["cohort-00", "cohort-05", "cohort-09"];
+
+    /// Three open rows within 10 minutes of each other, so they self-anchor:
+    /// only a marker can exclude them.
+    fn self_anchored_cohort(t: i64) -> Vec<TerminalSessionRecord> {
+        SELF_ANCHORED_COHORT
+            .iter()
+            .zip([0_i64, 5, 9])
+            .map(|(id, m)| fixture_rec(id, "open", t + m * 60_000, None, None))
+            .collect()
+    }
+
+    /// A store over `recs`, booted at `boot`, carrying the prior teardown bit.
+    fn store_with_teardown(
+        dir: &Path,
+        recs: Vec<TerminalSessionRecord>,
+        boot: i64,
+        teardown_complete: bool,
+    ) -> SessionLifecycleStore {
+        let path = dir.join("terminal-sessions.json");
+        write_fixture(&path, recs);
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(boot);
+        store.attach_prior_teardown_complete(teardown_complete);
+        store
+    }
+
+    /// No epoch: a clean marker 77 minutes past a self-anchored cohort does
+    /// not exclude it when its teardown was cut short. The finished-teardown
+    /// marker in the same place excludes all three, as it always did.
+    #[test]
+    fn restorable_records_incomplete_teardown_marker_does_not_exclude_the_cohort() {
+        let t = 1_700_000_000_000_i64;
+        let marker = Some(t + 77 * 60_000);
+        let cohort = SELF_ANCHORED_COHORT.map(str::to_string).to_vec();
+        for (complete, expected) in [(false, cohort), (true, Vec::new())] {
+            let dir = tempdir().unwrap();
+            let store = store_with_teardown(
+                dir.path(),
+                self_anchored_cohort(t),
+                t + 3 * 3_600_000,
+                complete,
+            );
+            assert_eq!(
+                restorable_ids(&store, marker, true),
+                expected,
+                "teardown_complete={complete}"
+            );
+        }
+    }
+
+    /// (i) With an observation epoch the teardown bit changes nothing: the
+    /// epoch caps the open anchor either way. The lone ghost the poll observed
+    /// dead is the shape that tells them apart if the gate ignored the epoch
+    /// (the incomplete marker would leave it to self-anchor), so it is pinned
+    /// beside the starved cohort.
+    #[test]
+    fn restorable_records_with_an_epoch_the_teardown_bit_changes_nothing() {
+        let t = 1_700_000_000_000_i64;
+        let shapes = [
+            (
+                "starved cohort",
+                starved_cohort_fixture(t),
+                t,
+                t + 77 * 60_000,
+                STARVED_COHORT.map(str::to_string).to_vec(),
+            ),
+            (
+                "lone ghost",
+                vec![fixture_rec("ghost", "open", t - 72 * 3_600_000, None, None)],
+                t - 60_000,
+                t,
+                Vec::new(),
+            ),
+        ];
+        for (shape, recs, epoch_at, marker_at, expected) in shapes {
+            for complete in [true, false] {
+                let dir = tempdir().unwrap();
+                let store =
+                    store_with_teardown(dir.path(), recs.clone(), t + 3 * 3_600_000, complete);
+                attach_epoch(&store, dir.path(), Some(epoch_at));
+                assert_eq!(
+                    restorable_ids(&store, Some(marker_at), true),
+                    expected,
+                    "{shape}, teardown_complete={complete}"
+                );
+            }
+        }
+    }
+
+    /// (ii) No epoch and an interrupted teardown: a lone ghost self-anchors
+    /// and RESTORES. Asserted so the trade is a decision, not an accident: a
+    /// ghost pane can be closed, a dropped session cannot be rebuilt. A
+    /// finished teardown's marker still excludes it (the
+    /// `restorable_records_marker_anchor_excludes_lone_ghost` shape).
+    #[test]
+    fn restorable_records_lone_ghost_restores_only_after_an_interrupted_teardown() {
+        let shutdown = 1_700_000_000_000_i64;
+        let ghost = || {
+            vec![fixture_rec(
+                "ghost",
+                "open",
+                shutdown - 72 * 3_600_000,
+                None,
+                None,
+            )]
+        };
+        for (complete, expected) in [(false, vec!["ghost".to_string()]), (true, Vec::new())] {
+            let dir = tempdir().unwrap();
+            let store = store_with_teardown(dir.path(), ghost(), shutdown + 3_600_000, complete);
+            assert_eq!(
+                restorable_ids(&store, Some(shutdown), true),
+                expected,
+                "teardown_complete={complete}"
+            );
+        }
+    }
+
+    /// The closed arms keep the marker whatever its teardown bit: a session
+    /// exited `pty-exit` an hour before an interrupted teardown is still an
+    /// old exit, not a restore candidate.
+    #[test]
+    fn restorable_records_interrupted_teardown_keeps_the_marker_for_closed_rows() {
+        let shutdown = 1_700_000_000_000_i64;
+        let exited = shutdown - 3_600_000;
+        let dir = tempdir().unwrap();
+        let store = store_with_teardown(
+            dir.path(),
+            vec![fixture_rec(
+                "old-exit",
+                "closed",
+                exited,
+                Some(exited),
+                Some("pty-exit"),
+            )],
+            shutdown + 3_600_000,
+            false,
+        );
+        assert!(restorable_ids(&store, Some(shutdown), true).is_empty());
+    }
+
+    /// The drain's own marker stamp, end to end through the boot classifier
+    /// into admission: a drain stamps `clean` but never a finished teardown,
+    /// so a self-anchored cohort its marker sits 77 minutes past is still
+    /// admitted on the next boot.
+    #[test]
+    fn restorable_records_admit_the_cohort_behind_a_drain_only_marker() {
+        let dir = tempdir().unwrap();
+        let marker_path = dir.path().join("last-shutdown.json");
+        crate::drain::stamp_drained_marker(&marker_path);
+        let boot = crate::session::shutdown_marker::read_classification(&marker_path, i64::MAX);
+        let marker_at = boot.prior_marker_at.expect("the drain wrote a marker");
+        let store = store_with_teardown(
+            dir.path(),
+            self_anchored_cohort(marker_at - 77 * 60_000),
+            marker_at + 3_600_000,
+            boot.teardown_complete,
+        );
+        assert_eq!(
+            restorable_ids(&store, boot.prior_marker_at, !boot.crash_recovery),
+            SELF_ANCHORED_COHORT.map(str::to_string).to_vec()
+        );
+    }
+
+    /// The in-process arm of the same strand: THIS process booted before the
+    /// cohort was spawned, its snapshots then failed, so nothing it wrote was
+    /// ever touched. The ledger roster (what the poll captures every tick) must
+    /// still hold every row, not only those within 10 minutes of the newest
+    /// spawn.
+    #[test]
+    fn live_roster_keeps_a_starved_cohort() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        let boot = t - 60_000;
+        let recs: Vec<TerminalSessionRecord> = starved_cohort_fixture(t)
+            .into_iter()
+            .filter(|r| r.claude_session_id != "ghost-72h")
+            .collect();
+        write_fixture(&path, recs);
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(boot);
+
+        let mut roster: Vec<String> = store
+            .roster_records(Some(boot - 60_000), true)
+            .into_iter()
+            .map(|r| r.claude_session_id)
+            .collect();
+        roster.sort();
+        assert_eq!(roster, STARVED_COHORT.map(str::to_string).to_vec());
     }
 
     /// A genuinely-newer band advances the anchor and a crash band more than
@@ -8964,7 +11378,6 @@ mod tests {
         let path = dir.path().join("terminal-sessions.json");
         let t = 1_700_000_000_000_i64;
         let thirty_min = 30 * 60_000_i64;
-        let now = t + 2 * 3_600_000;
 
         write_fixture(
             &path,
@@ -8982,7 +11395,7 @@ mod tests {
         );
         let store = SessionLifecycleStore::open(&path).unwrap();
 
-        let ids = restorable_ids(&store, now, None, false);
+        let ids = restorable_ids(&store, None, false);
         assert_eq!(
             ids,
             vec!["newer-0".to_string(), "newer-1".to_string()],
@@ -9000,7 +11413,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("terminal-sessions.json");
         let t = 1_700_000_000_000_i64;
-        let now = t + 60_000;
 
         let mk = |id: &str, terminal: &str, last_seen: i64, confirmed: Option<i64>| {
             let mut r = fixture_rec(id, "open", last_seen, None, None);
@@ -9021,7 +11433,7 @@ mod tests {
         );
         let store = SessionLifecycleStore::open(&path).unwrap();
 
-        let mut ids = restorable_ids(&store, now, None, false);
+        let mut ids = restorable_ids(&store, None, false);
         ids.sort();
         assert_eq!(
             ids,
@@ -9130,6 +11542,515 @@ mod tests {
         assert_eq!(after.state, "closed");
     }
 
+    /// Review fixes 4, item 1: an EXPIRED hold stamp is not a hold, so its open
+    /// row feeds the restore anchor again; a live hold still feeds none.
+    #[test]
+    fn an_expired_hold_stamp_feeds_the_restore_anchor_again() {
+        let now = Utc::now().timestamp_millis();
+        let mut cohort = fixture_rec("cohort", "open", now - 3 * 3_600_000, None, None);
+        cohort.awaiting_account_since = None;
+        let mut expired = fixture_rec("expired", "open", now - 3_600_000, None, None);
+        expired.awaiting_account_since = Some(now - OPEN_STALE_MS - 60_000);
+        let mut held = fixture_rec("held", "open", now - 60_000, None, None);
+        held.awaiting_account_since = Some(now - 86_400_000);
+        let rows = [cohort, expired, held];
+        let anchors = restore_anchors(
+            rows.iter(),
+            None,
+            false,
+            None,
+            None,
+            Observed::default(),
+            i64::MAX,
+            now,
+        );
+        assert_eq!(
+            anchors.prior,
+            Some(now - 3_600_000),
+            "the expired-stamp row feeds the anchor; the live hold does not"
+        );
+    }
+
+    /// Review fixes 4, item 1: a re-mark after the hold expired re-stamps from
+    /// the row's current last-seen and starts a new hold.
+    #[test]
+    fn a_re_mark_after_the_hold_expired_re_stamps() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let now = Utc::now().timestamp_millis();
+        let last_seen = now - 3_600_000;
+        let mut row = fixture_rec("waiting", "open", last_seen, None, None);
+        row.awaiting_account_since = Some(now - OPEN_STALE_MS - 60_000);
+        write_fixture(&path, vec![row]);
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.mark_awaiting_account("waiting", now, &NONE_LIVE);
+        assert_eq!(
+            store.get("waiting").unwrap().awaiting_account_since,
+            Some(last_seen),
+            "an expired stamp is treated as absent"
+        );
+        assert!(store.poll_hold_awaiting_account("waiting", now));
+    }
+
+    /// Review fixes 4, item 2: a profile resume's restore-pending mark sets the
+    /// pending marker only — it is not a boot restore, so the census never
+    /// counts it.
+    #[test]
+    fn a_profile_resume_pending_mark_is_not_a_boot_restore() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.record_open(rec("profile"));
+        store.mark_restore_pending("profile", false);
+        let got = store.get("profile").unwrap();
+        assert!(got.restore_pending_at.is_some(), "pending is still marked");
+        assert_eq!(got.restored_from_boot_at, None);
+        assert_eq!(got.restore_tier, None);
+        assert!(
+            crate::session::restore_census::observe_restored(&store, 0).is_empty(),
+            "a profile resume is not in the boot-restore census"
+        );
+    }
+
+    /// Review fixes 4, item 2: the profile path never marks a closed row.
+    #[test]
+    fn a_profile_resume_pending_mark_skips_a_closed_row() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.record_open(rec("gone"));
+        store.record_close("gone", "user-close");
+        store.mark_restore_pending("gone", false);
+        let got = store.get("gone").unwrap();
+        assert_eq!(got.restore_pending_at, None);
+        assert_eq!(got.restore_tier, None);
+    }
+
+    /// Review fixes 4, item 3: every close path clears the awaiting-account
+    /// stamp — the two `record_open` supersede arms and the boot collision
+    /// repair, not only `record_close`.
+    ///
+    /// The rows carry an EXPIRED stamp: a live hold detaches its terminal, so a
+    /// live-held row is never superseded at all (see
+    /// `a_held_row_is_out_of_terminal_contention_in_the_repair`). An expired
+    /// stamp is no hold, so its row contends like any other — and its close
+    /// must not leave the stale stamp behind.
+    #[test]
+    fn a_superseded_close_clears_the_awaiting_account_stamp() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let now = Utc::now().timestamp_millis();
+        let on = |id: &str, terminal: &str, seen: i64, confirmed: bool| {
+            let mut r = fixture_rec(id, "open", seen, None, None);
+            r.terminal_id = terminal.to_string();
+            r.confirmed_at = confirmed.then_some(seen);
+            r.awaiting_account_since = Some(now - OPEN_STALE_MS - 60_000);
+            r
+        };
+        write_fixture(
+            &path,
+            vec![
+                on("phantom", "term-a", now - 60_000, false),
+                on("prior-run", "term-b", now - 60_000, true),
+                on("repair-loser", "term-c", now - 120_000, true),
+                on("repair-winner", "term-c", now - 60_000, true),
+            ],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        let mut incoming = rec("new-a");
+        incoming.terminal_id = "term-a".to_string();
+        incoming.origin = Some("authoritative".to_string());
+        store.record_open(incoming);
+        let mut incoming = rec("new-b");
+        incoming.terminal_id = "term-b".to_string();
+        incoming.confirmed_at = Some(now);
+        store.record_open(incoming);
+        assert_eq!(store.repair_terminal_id_collisions(), 1);
+
+        for (id, reason) in [
+            ("phantom", "superseded"),
+            ("prior-run", "superseded-terminal-reuse"),
+            ("repair-loser", "superseded-terminal-reuse"),
+        ] {
+            let got = store.get(id).unwrap();
+            assert_eq!(got.state, "closed", "{id}");
+            assert_eq!(got.close_reason.as_deref(), Some(reason), "{id}");
+            assert_eq!(got.awaiting_account_since, None, "{id}: stamp cleared");
+        }
+    }
+
+    /// Review fixes 4, item 4: only a DIRECT terminal match releases a held
+    /// row; a match made by the (page_id, title, working_dir) fallback alone
+    /// keeps it held.
+    #[test]
+    fn a_fallback_only_terminal_match_never_releases_a_held_row() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let seen = Utc::now().timestamp_millis();
+        write_fixture(&path, vec![fixture_rec("held", "open", seen, None, None)]);
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.mark_awaiting_account("held", seen, &NONE_LIVE);
+        let (mut dead, mut no_match) = (HashMap::new(), HashMap::new());
+        assert!(
+            poll_holds_unmatched_row(
+                &store,
+                "held",
+                PollTerminalMatch::Fallback,
+                seen,
+                &mut dead,
+                &mut no_match
+            ),
+            "a fallback match is not the row's own terminal"
+        );
+        assert!(!poll_holds_unmatched_row(
+            &store,
+            "held",
+            PollTerminalMatch::Direct,
+            seen,
+            &mut dead,
+            &mut no_match
+        ));
+    }
+
+    /// Review fixes 4, item 5: a held row never wins a terminal from a row
+    /// admitted on recency — the fresh row's terminal is restored, and the
+    /// held row is still in the set, still needs-account.
+    #[test]
+    fn a_held_row_never_wins_a_terminal_from_a_row_admitted_on_recency() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let crash_at = Utc::now().timestamp_millis() - 3_600_000;
+        let mut held = fixture_rec("held", "open", crash_at, None, None);
+        held.terminal_id = "term-shared".to_string();
+        held.confirmed_at = Some(crash_at - 60_000);
+        held.awaiting_account_since = Some(crash_at);
+        let mut fresh = fixture_rec("fresh", "open", crash_at - 30_000, None, None);
+        fresh.terminal_id = "term-shared".to_string();
+        write_fixture(&path, vec![held, fresh]);
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let restored = store.restorable_records(None, false);
+        let on_terminal: Vec<&str> = restored
+            .iter()
+            .filter(|r| r.terminal_id == "term-shared" && r.awaiting_account_since.is_none())
+            .map(|r| r.claude_session_id.as_str())
+            .collect();
+        assert_eq!(
+            on_terminal,
+            vec!["fresh"],
+            "the fresh row restores the terminal"
+        );
+        assert!(
+            restored
+                .iter()
+                .any(|r| r.claude_session_id == "held" && r.awaiting_account_since.is_some()),
+            "the held row is still offered as needs-account"
+        );
+    }
+    /// Review fixes 5: the fix-4 fixture — a confirmed row held for an account
+    /// choice and a fresh unconfirmed row that now owns the held row's old
+    /// terminal id. The hold detaches the held row, so the boot collision
+    /// repair finds no collision: the fresh row stays open and the held row
+    /// stays held.
+    #[test]
+    fn a_held_row_is_out_of_terminal_contention_in_the_repair() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let crash_at = Utc::now().timestamp_millis() - 3_600_000;
+        let mut held = fixture_rec("held", "open", crash_at, None, None);
+        held.terminal_id = "term-shared".to_string();
+        held.confirmed_at = Some(crash_at - 60_000);
+        let mut fresh = fixture_rec("fresh", "open", crash_at - 30_000, None, None);
+        fresh.terminal_id = "term-shared".to_string();
+        write_fixture(&path, vec![held, fresh]);
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let now = Utc::now().timestamp_millis();
+        store.mark_awaiting_account("held", now, &NONE_LIVE);
+
+        assert_eq!(
+            store.repair_terminal_id_collisions(),
+            0,
+            "no collision left"
+        );
+        let fresh = store.get("fresh").unwrap();
+        assert_eq!(fresh.state, "open", "the fresh row keeps its terminal");
+        assert_eq!(fresh.terminal_id, "term-shared");
+        let held = store.get("held").unwrap();
+        assert_eq!(held.state, "open");
+        assert!(
+            awaiting_account_hold(&held, now),
+            "the held row is still held"
+        );
+        assert_eq!(held.terminal_id, "", "held = unbound");
+        assert_eq!(held.page_id, "default", "placement is kept");
+    }
+
+    /// Review fixes 5: a new confirmed session opening on a held row's old
+    /// terminal id does not supersede the held row — it no longer holds that
+    /// terminal.
+    #[test]
+    fn record_open_on_a_held_rows_old_terminal_does_not_close_it() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let seen = Utc::now().timestamp_millis() - 60_000;
+        let mut held = fixture_rec("held", "open", seen, None, None);
+        held.terminal_id = "term-old".to_string();
+        held.confirmed_at = Some(seen);
+        held.origin = Some("authoritative".to_string());
+        write_fixture(&path, vec![held]);
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let now = Utc::now().timestamp_millis();
+        store.mark_awaiting_account("held", now, &NONE_LIVE);
+
+        let mut incoming = rec("new-session");
+        incoming.terminal_id = "term-old".to_string();
+        incoming.origin = Some("authoritative".to_string());
+        incoming.confirmed_at = Some(now);
+        store.record_open(incoming);
+
+        let held = store.get("held").unwrap();
+        assert_eq!(held.state, "open", "not superseded");
+        assert_eq!(held.close_reason, None);
+        assert!(awaiting_account_hold(&held, now), "still held");
+        assert_eq!(
+            store
+                .find_open_by_terminal("term-old")
+                .unwrap()
+                .claude_session_id,
+            "new-session"
+        );
+    }
+
+    /// Review fixes 5: the poll never releases a hold through the held row's
+    /// OLD terminal id once that id hosts another session — the held row is
+    /// unbound, so the match is never `Direct`.
+    #[test]
+    fn the_poll_never_releases_a_hold_via_a_terminal_now_hosting_another_session() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let seen = Utc::now().timestamp_millis() - 60_000;
+        let mut held = fixture_rec("held", "open", seen, None, None);
+        held.terminal_id = "term-reused".to_string();
+        held.confirmed_at = Some(seen);
+        write_fixture(&path, vec![held]);
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let now = Utc::now().timestamp_millis();
+        store.mark_awaiting_account("held", now, &NONE_LIVE);
+        let mut other = rec("other");
+        other.terminal_id = "term-reused".to_string();
+        store.record_open(other);
+
+        let rec = store.get("held").unwrap();
+        let live = |t: &str| t == "term-reused";
+        let terminal_match = PollTerminalMatch::for_record(&rec, live, false);
+        assert_eq!(terminal_match, PollTerminalMatch::Unmatched);
+        let (mut dead, mut no_match) = (HashMap::new(), HashMap::new());
+        assert!(
+            poll_holds_unmatched_row(
+                &store,
+                "held",
+                terminal_match,
+                now,
+                &mut dead,
+                &mut no_match
+            ),
+            "still held"
+        );
+        assert!(awaiting_account_hold(&store.get("held").unwrap(), now));
+    }
+
+    /// Review fixes 5: a bind ends the hold — a verified resume's `record_open`
+    /// and a `rebind_terminal` both re-bind the row and clear the stamp, so a
+    /// bound row is never a held one.
+    #[test]
+    fn a_bind_ends_the_hold() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let seen = Utc::now().timestamp_millis() - 60_000;
+        let mut a = fixture_rec("resumed", "open", seen, None, None);
+        a.terminal_id = "term-a".to_string();
+        let mut b = fixture_rec("rebound", "open", seen, None, None);
+        b.terminal_id = "term-b".to_string();
+        write_fixture(&path, vec![a, b]);
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let now = Utc::now().timestamp_millis();
+        store.mark_awaiting_account("resumed", now, &NONE_LIVE);
+        store.mark_awaiting_account("rebound", now, &NONE_LIVE);
+
+        let mut resume = rec("resumed");
+        resume.terminal_id = "term-new-a".to_string();
+        store.record_open(resume);
+        store.rebind_terminal("rebound", "term-new-b", 3);
+        for (id, terminal) in [("resumed", "term-new-a"), ("rebound", "term-new-b")] {
+            let got = store.get(id).unwrap();
+            assert_eq!(got.terminal_id, terminal, "{id}");
+            assert_eq!(got.awaiting_account_since, None, "{id}: hold ended");
+        }
+    }
+
+    /// Review fixes 5: a held row persisted with its old terminal (a file
+    /// written before the rule) is detached on load; a row whose stamp has
+    /// expired is no hold and keeps its binding.
+    #[test]
+    fn a_held_row_loaded_from_disk_is_detached() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let now = Utc::now().timestamp_millis();
+        let mut held = fixture_rec("held", "open", now - 60_000, None, None);
+        held.terminal_id = "term-held".to_string();
+        held.awaiting_account_since = Some(now - 60_000);
+        let mut expired = fixture_rec("expired", "open", now - 60_000, None, None);
+        expired.terminal_id = "term-expired".to_string();
+        expired.awaiting_account_since = Some(now - OPEN_STALE_MS - 60_000);
+        write_fixture(&path, vec![held, expired]);
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        assert_eq!(store.get("held").unwrap().terminal_id, "");
+        assert_eq!(store.get("expired").unwrap().terminal_id, "term-expired");
+        drop(store);
+        // Read the RAW file, not a reopened store: a reopen detaches again at
+        // load, so it could not tell a persisted detach from a re-derived one.
+        let on_disk = load_map(&path);
+        assert_eq!(on_disk["held"].terminal_id, "", "the detach was persisted");
+        assert_eq!(on_disk["expired"].terminal_id, "term-expired");
+    }
+
+    /// Review fixes 6, item 2: a finished row is never held — the mark is a
+    /// no-op that stamps nothing and detaches nothing.
+    #[test]
+    fn mark_awaiting_account_is_a_no_op_on_a_finished_row() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let now = Utc::now().timestamp_millis();
+        let mut done = fixture_rec("done", "open", now - 60_000, None, None);
+        done.terminal_id = "term-done".to_string();
+        done.finished_at = Some(now - 30_000);
+        write_fixture(&path, vec![done]);
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let wal = wal_path_for(&path);
+        let wal_len = || std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        let before = wal_len();
+        store.mark_awaiting_account("done", now, &NONE_LIVE);
+        let got = store.get("done").unwrap();
+        assert_eq!(
+            got.awaiting_account_since, None,
+            "no hold on a finished row"
+        );
+        assert_eq!(got.terminal_id, "term-done", "nothing detached");
+        assert_eq!(wal_len(), before, "nothing written");
+    }
+
+    /// Review fixes 6, item 4: a `record_open` that leaves a held row unbound
+    /// (blank incoming terminal) is not a bind — the hold stays; one carrying a
+    /// terminal ends it.
+    #[test]
+    fn record_open_ends_the_hold_only_when_it_binds_a_terminal() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let now = Utc::now().timestamp_millis();
+        let mut held = fixture_rec("held", "open", now - 60_000, None, None);
+        held.terminal_id = "term-old".to_string();
+        write_fixture(&path, vec![held]);
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.mark_awaiting_account("held", now, &NONE_LIVE);
+
+        let mut unbound = rec("held");
+        unbound.terminal_id = String::new();
+        store.record_open(unbound);
+        let got = store.get("held").unwrap();
+        assert_eq!(got.terminal_id, "");
+        assert!(
+            got.awaiting_account_since.is_some(),
+            "a blank re-record keeps the hold"
+        );
+
+        let mut bound = rec("held");
+        bound.terminal_id = "term-new".to_string();
+        store.record_open(bound);
+        let got = store.get("held").unwrap();
+        assert_eq!(got.terminal_id, "term-new");
+        assert_eq!(got.awaiting_account_since, None, "a bind ends the hold");
+    }
+
+    /// Review fixes 6, item 2: a rebind to a BLANK terminal is not a bind —
+    /// the hold stays.
+    #[test]
+    fn rebind_to_a_blank_terminal_keeps_the_hold() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let now = Utc::now().timestamp_millis();
+        let mut held = fixture_rec("held", "open", now - 60_000, None, None);
+        held.terminal_id = "term-old".to_string();
+        write_fixture(&path, vec![held]);
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.mark_awaiting_account("held", now, &NONE_LIVE);
+        store.rebind_terminal("held", "", 2);
+        let got = store.get("held").unwrap();
+        assert!(awaiting_account_hold(&got, now), "the hold is kept");
+        assert_eq!(got.terminal_id, "", "still unbound");
+    }
+
+    /// Review fixes 6, item 1 (backend guard): the store declines to hold — and
+    /// so to detach — a row whose terminal is a live PTY of this process.
+    #[test]
+    fn mark_awaiting_account_declines_a_row_on_a_live_terminal() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let now = Utc::now().timestamp_millis();
+        let mut alive = fixture_rec("alive", "open", now - 60_000, None, None);
+        alive.terminal_id = "term-live".to_string();
+        let mut gone = fixture_rec("gone", "open", now - 60_000, None, None);
+        gone.terminal_id = "term-dead".to_string();
+        write_fixture(&path, vec![alive, gone]);
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let live = |t: &str| t == "term-live";
+        store.mark_awaiting_account("alive", now, &live);
+        store.mark_awaiting_account("gone", now, &live);
+        let alive = store.get("alive").unwrap();
+        assert_eq!(
+            alive.terminal_id, "term-live",
+            "a live session is never detached"
+        );
+        assert_eq!(alive.awaiting_account_since, None, "nor held");
+        let gone = store.get("gone").unwrap();
+        assert_eq!(
+            gone.terminal_id, "",
+            "a dead terminal's row is held and detached"
+        );
+        assert!(awaiting_account_hold(&gone, now));
+    }
+
+    /// Review fixes 5, NIT 1: a re-mark that changes nothing writes nothing —
+    /// a running hold on an unbound row, and an expired stamp re-stamped to the
+    /// same `last_seen_at` (the row was not seen since).
+    #[test]
+    fn a_re_mark_that_changes_nothing_does_not_persist() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let now = Utc::now().timestamp_millis();
+        let stale_seen = now - OPEN_STALE_MS - 60_000;
+        let mut stale = fixture_rec("stale", "open", stale_seen, None, None);
+        stale.terminal_id = "term-stale".to_string();
+        stale.awaiting_account_since = Some(stale_seen);
+        write_fixture(
+            &path,
+            vec![fixture_rec("held", "open", now - 60_000, None, None), stale],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.mark_awaiting_account("held", now, &NONE_LIVE);
+        let wal = wal_path_for(&path);
+        let wal_len = || std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        let before = wal_len();
+        store.mark_awaiting_account("held", now, &NONE_LIVE);
+        store.mark_awaiting_account("stale", now, &NONE_LIVE);
+        assert_eq!(wal_len(), before, "no delta appended");
+        let stale = store.get("stale").unwrap();
+        assert_eq!(stale.awaiting_account_since, Some(stale_seen));
+        assert_eq!(
+            stale.terminal_id, "term-stale",
+            "an expired hold detaches nothing"
+        );
+    }
+
     // --- withheld boot restore (plan 2026-10-01-drain-deferred-restore-is-swept-as-orphans)
 
     /// Drive the lifecycle poll's no-match path for `ticks` ticks exactly as
@@ -9143,6 +12064,26 @@ mod tests {
         phase: BootRestorePhase,
         drain_defers_boot_resume: bool,
     ) {
+        simulate_no_terminal_poll_ticks_with_census(
+            store,
+            ticks,
+            boot_at_ms,
+            phase,
+            drain_defers_boot_resume,
+            None,
+        );
+    }
+
+    /// [`simulate_no_terminal_poll_ticks`] with the boot census latched, as
+    /// `main.rs` reads it each tick ([`crate::session::restore_census::latched`]).
+    fn simulate_no_terminal_poll_ticks_with_census(
+        store: &SessionLifecycleStore,
+        ticks: u32,
+        boot_at_ms: Option<i64>,
+        phase: BootRestorePhase,
+        drain_defers_boot_resume: bool,
+        census: Option<&crate::session::restore_census::BootCensus>,
+    ) {
         let mut consecutive_no_match: HashMap<String, u32> = HashMap::new();
         for _ in 0..ticks {
             for rec in store.open_records() {
@@ -9150,12 +12091,14 @@ mod tests {
                     .get(&rec.claude_session_id)
                     .copied()
                     .unwrap_or(0);
-                let held = withheld_boot_restore_candidate(
+                let held = boot_restore_hold(
                     rec.last_seen_at,
                     boot_at_ms,
                     phase,
                     drain_defers_boot_resume,
-                );
+                    census.is_some_and(|c| c.awaits_restore(&rec)),
+                )
+                .hold;
                 let action = hold_for_withheld_boot_restore(
                     classify(
                         None,
@@ -9225,14 +12168,14 @@ mod tests {
         SessionLifecycleStore::open(&path).unwrap()
     }
 
-    fn sorted_restorable(
-        store: &SessionLifecycleStore,
-        now: i64,
-        boot_at_ms: Option<i64>,
-    ) -> Vec<String> {
+    /// `boot_at_ms: None` models the unpartitioned rule: every row reads as
+    /// the prior life (the test-default boot line, `i64::MAX`), so the prior
+    /// anchor is the max over every row.
+    fn sorted_restorable(store: &SessionLifecycleStore, boot_at_ms: Option<i64>) -> Vec<String> {
+        store.set_boot_ms_for_test(boot_at_ms.unwrap_or(i64::MAX));
         // A crash boot: the crashed process's marker never feeds the anchor.
         let mut ids: Vec<String> = store
-            .restorable_records(now, None, false, boot_at_ms)
+            .restorable_records(None, false)
             .into_iter()
             .map(|r| r.claude_session_id)
             .collect();
@@ -9268,7 +12211,7 @@ mod tests {
                 );
             }
             assert_eq!(
-                sorted_restorable(&store, boot + 60_000, Some(boot)),
+                sorted_restorable(&store, Some(boot)),
                 vec!["victim-a".to_string(), "victim-b".to_string()],
                 "{phase:?}: the crash cohort is still restorable (the ghost never was)"
             );
@@ -9295,7 +12238,7 @@ mod tests {
         let victim = store.get("victim-a").unwrap();
         assert_eq!(victim.state, "closed");
         assert_eq!(victim.close_reason.as_deref(), Some("no-terminal"));
-        assert!(sorted_restorable(&store, boot + 300_000, Some(boot)).is_empty());
+        assert!(sorted_restorable(&store, Some(boot)).is_empty());
     }
 
     /// (b) The drain lifts hours later, after this boot has kept a session
@@ -9326,7 +12269,7 @@ mod tests {
         });
         let store = SessionLifecycleStore::open(&path).unwrap();
 
-        let restore_set = sorted_restorable(&store, lift, Some(boot));
+        let restore_set = sorted_restorable(&store, Some(boot));
         assert_eq!(
             restore_set,
             vec![
@@ -9339,13 +12282,13 @@ mod tests {
         // Unpartitioned, the hours-later live row drags the anchor past the
         // cohort — the latent second strand this fix also closes.
         assert_eq!(
-            sorted_restorable(&store, lift, None),
+            sorted_restorable(&store, None),
             vec!["this-boot-live".to_string()],
         );
 
         // The frontend restores what it was handed.
-        store.mark_restore_pending("victim-a");
-        store.mark_restore_pending("victim-b");
+        store.mark_restore_pending("victim-a", true);
+        store.mark_restore_pending("victim-b", true);
         simulate_no_terminal_poll_ticks(
             &store,
             NO_TERMINAL_ORPHAN_TICKS + 2,
@@ -9401,20 +12344,312 @@ mod tests {
     fn withheld_boot_restore_candidate_truth_table() {
         let boot = Some(1_000);
         use BootRestorePhase::*;
-        // Prior-boot record.
-        assert!(withheld_boot_restore_candidate(999, boot, Withheld, false));
-        assert!(withheld_boot_restore_candidate(999, boot, Withheld, true));
-        assert!(withheld_boot_restore_candidate(999, boot, NotYetRun, true));
-        assert!(!withheld_boot_restore_candidate(
-            999, boot, NotYetRun, false
+        // Prior-boot record outside the boot-latched restorable set.
+        assert!(withheld_boot_restore_candidate(
+            999, boot, Withheld, false, false
         ));
-        assert!(!withheld_boot_restore_candidate(999, boot, Ran, true));
-        // This-boot record: never held.
+        assert!(withheld_boot_restore_candidate(
+            999, boot, Withheld, true, false
+        ));
+        assert!(withheld_boot_restore_candidate(
+            999, boot, NotYetRun, true, false
+        ));
         assert!(!withheld_boot_restore_candidate(
-            1_000, boot, Withheld, true
+            999, boot, NotYetRun, false, false
+        ));
+        assert!(!withheld_boot_restore_candidate(
+            999, boot, Ran, true, false
+        ));
+        // Plan 2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-
+        // restore-set, Phase 4: a prior-boot row still awaiting the boot
+        // restore that latched it is held in EVERY phase. The `Ran` row is the
+        // unopened page: the restore ran for the page on screen, not for this
+        // row's.
+        assert!(withheld_boot_restore_candidate(999, boot, Ran, false, true));
+        assert!(withheld_boot_restore_candidate(
+            999, boot, NotYetRun, false, true
+        ));
+        // This-boot record: never held, awaiting or not.
+        assert!(!withheld_boot_restore_candidate(
+            1_000, boot, Withheld, true, false
+        ));
+        assert!(!withheld_boot_restore_candidate(
+            1_000, boot, Ran, false, true
         ));
         // No boot instant: nothing is provably prior-boot.
-        assert!(!withheld_boot_restore_candidate(999, None, Withheld, true));
+        assert!(!withheld_boot_restore_candidate(
+            999, None, Withheld, true, false
+        ));
+        assert!(!withheld_boot_restore_candidate(
+            999, None, Ran, false, true
+        ));
+    }
+
+    /// Plan 2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-
+    /// restore-set, Phase 4: the boot-census arm widens the HOLD, never the
+    /// MATCH. After the restore ran, a latched row whose own terminal id is
+    /// stale still finds its live tab through the `(page_id, title,
+    /// working_dir)` fallback, as it did before the hold existed. The
+    /// drain/phase hold still narrows the match to the id.
+    #[test]
+    fn the_census_hold_never_narrows_the_live_terminal_match() {
+        use BootRestorePhase::*;
+        let boot = Some(1_000);
+
+        let waiting = boot_restore_hold(999, boot, Ran, false, true);
+        assert!(waiting.hold, "a latched prior-boot row is held after Ran");
+        assert!(
+            !waiting.id_match_only,
+            "the census arm must not disable the triple fallback"
+        );
+
+        let withheld = boot_restore_hold(999, boot, Withheld, false, false);
+        assert!(withheld.hold && withheld.id_match_only);
+
+        let neither = boot_restore_hold(999, boot, Ran, false, false);
+        assert!(!neither.hold && !neither.id_match_only);
+
+        let triple = ("page-1", "claude", "D:/work");
+        let live_tab = "live-tab";
+        let by_id: HashMap<&str, &str> = HashMap::new();
+        let by_triple: HashMap<(&str, &str, &str), &str> = HashMap::from([(triple, live_tab)]);
+        assert_eq!(
+            match_live_terminal(
+                "stale-term",
+                Some(triple),
+                &by_id,
+                &by_triple,
+                waiting.id_match_only
+            ),
+            Some(live_tab),
+            "a waiting row keeps its live tab"
+        );
+        assert_eq!(
+            match_live_terminal(
+                "stale-term",
+                Some(triple),
+                &by_id,
+                &by_triple,
+                withheld.id_match_only
+            ),
+            None,
+            "a withheld row matches its own id only"
+        );
+    }
+
+    /// Plan 2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-
+    /// restore-set, Phase 4: the boot restore has RUN (for the page on
+    /// screen), and the boot-latched cohort sits on a page never opened, so it
+    /// matches no terminal. The poll must hold it `open` past the orphan
+    /// debounce, while the ghost the latch left out (a genuine orphan) still
+    /// closes `no-terminal`. Finishing a held row releases the hold.
+    #[test]
+    fn a_latched_row_on_an_unopened_page_is_not_swept_as_an_orphan() {
+        let dir = tempdir().unwrap();
+        let crash = 1_700_000_000_000_i64;
+        let boot = crash + 30_000;
+        let store = crash_cohort_store(dir.path(), crash, None);
+        store.set_boot_ms_for_test(boot);
+        // The census latches the restorable set, exactly as main.rs does at
+        // boot (a crash boot: the crashed process's marker never anchors).
+        #[derive(Debug)]
+        struct NoTranscripts;
+        impl TranscriptProbe for NoTranscripts {
+            fn transcript_exists(&self, _id: &str, _wd: Option<&str>) -> bool {
+                false
+            }
+        }
+        let census = crate::session::restore_census::BootCensus {
+            boot_at_ms: boot,
+            expected: crate::session::restore_census::expected_rows(
+                store.restorable_records(None, false),
+                &NoTranscripts,
+            ),
+        };
+        let latched: Vec<&str> = census
+            .expected
+            .iter()
+            .map(|e| e.claude_session_id.as_str())
+            .collect();
+        assert_eq!(
+            latched,
+            vec!["victim-a", "victim-b"],
+            "the ghost is not latched"
+        );
+
+        simulate_no_terminal_poll_ticks_with_census(
+            &store,
+            NO_TERMINAL_ORPHAN_TICKS + 2,
+            Some(boot),
+            BootRestorePhase::Ran,
+            false,
+            Some(&census),
+        );
+        assert_eq!(store.get("victim-a").unwrap().state, "open");
+        assert_eq!(store.get("victim-b").unwrap().state, "open");
+        let ghost = store.get("ghost").unwrap();
+        assert_eq!(ghost.state, "closed", "a genuine orphan still closes");
+        assert_eq!(ghost.close_reason.as_deref(), Some("no-terminal"));
+        assert_eq!(
+            sorted_restorable(&store, Some(boot)),
+            vec!["victim-a".to_string(), "victim-b".to_string()],
+            "the held cohort is still restorable when its page opens"
+        );
+
+        // The operator finishes one: it no longer awaits a restore, so the
+        // ordinary orphan handling retires it.
+        store
+            .set_finished("victim-b", true, None)
+            .expect("a known session");
+        simulate_no_terminal_poll_ticks_with_census(
+            &store,
+            NO_TERMINAL_ORPHAN_TICKS + 2,
+            Some(boot),
+            BootRestorePhase::Ran,
+            false,
+            Some(&census),
+        );
+        assert_eq!(store.get("victim-a").unwrap().state, "open");
+        assert_eq!(store.get("victim-b").unwrap().state, "closed");
+    }
+
+    /// Same plan, Phase 4: the hold survives a SECOND restart before the page
+    /// opens. Process A held `held` unjudged on its last successful tick and
+    /// served another session that died at A's end, so A's epoch and every
+    /// anchor sit hours past `held`'s stamp. Boot B admits `held` by the
+    /// carried hold, while an open row A did not hold, with the same old
+    /// stamp, stays excluded. (Stamps are relative to now: the hold expires at
+    /// the open-row prune age, measured against wall-clock now.)
+    #[test]
+    fn a_held_row_survives_a_second_restart_before_its_page_opens() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let hour = 3_600_000_i64;
+        let now = Utc::now().timestamp_millis();
+        let (stamp, boot_a, a_end, boot_b) =
+            (now - 10 * hour, now - 9 * hour, now - 2 * hour, now - hour);
+        write_fixture(
+            &path,
+            vec![
+                fixture_rec("held", "open", stamp, None, None),
+                fixture_rec("not-held", "open", stamp, None, None),
+                fixture_rec("served", "closed", a_end, Some(a_end), Some("poll-dead")),
+            ],
+        );
+        let epoch_path = dir
+            .path()
+            .join(crate::session::observation_epoch::EPOCH_FILE_NAME);
+        assert!(ObservationEpoch::open(&epoch_path, boot_a).record_tick(
+            true,
+            a_end,
+            &["held".to_string()]
+        ));
+
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(boot_b);
+        store.attach_prior_teardown_complete(false);
+        store.attach_observation_epoch(Arc::new(ObservationEpoch::open(&epoch_path, boot_b)));
+
+        assert_eq!(
+            restorable_ids(&store, None, false),
+            vec!["held".to_string(), "served".to_string()],
+            "the carried hold admits `held`; the unheld row of the same age stays out"
+        );
+    }
+
+    /// Same plan, Phase 4: each release condition of the carried hold, alone.
+    #[test]
+    fn awaiting_prior_boot_restore_truth_table() {
+        let hour = 3_600_000_i64;
+        let (boot, now) = (100 * hour, 101 * hour);
+        let held: HashSet<&str> = HashSet::from(["r"]);
+        let row =
+            |state: &str, last_seen_at: i64| fixture_rec("r", state, last_seen_at, None, None);
+
+        assert!(awaiting_prior_boot_restore(
+            &row("open", boot - hour),
+            &held,
+            boot,
+            now
+        ));
+        // Not in the carried set.
+        assert!(!awaiting_prior_boot_restore(
+            &row("open", boot - hour),
+            &HashSet::new(),
+            boot,
+            now
+        ));
+        // Re-stamped at or after this boot (a restore re-asserted it): judged
+        // by recency again.
+        assert!(!awaiting_prior_boot_restore(
+            &row("open", boot),
+            &held,
+            boot,
+            now
+        ));
+        // Exactly at the open-row prune age: still held; past it: not.
+        assert!(awaiting_prior_boot_restore(
+            &row("open", now - OPEN_STALE_MS),
+            &held,
+            boot,
+            now
+        ));
+        assert!(!awaiting_prior_boot_restore(
+            &row("open", now - OPEN_STALE_MS - 1),
+            &held,
+            boot,
+            now
+        ));
+        // Closed or finished rows are never held.
+        assert!(!awaiting_prior_boot_restore(
+            &row("closed", boot - hour),
+            &held,
+            boot,
+            now
+        ));
+        let mut finished = row("open", boot - hour);
+        finished.finished_at = Some(boot - hour);
+        assert!(!awaiting_prior_boot_restore(&finished, &held, boot, now));
+    }
+
+    /// Same plan, Phase 4 (pre-PR review rounds 3-4): the poll carries a held
+    /// census row while its restore has not been attempted in this process,
+    /// or was attempted less than `RESTORE_PENDING_TTL_MS` ago (a resume may
+    /// still be verifying on a loaded box). Past the TTL (e.g. a failed resume
+    /// whose tab the operator closed) it is not re-offered on every restart.
+    #[test]
+    fn carries_boot_restore_hold_only_until_this_boots_attempt_expires() {
+        let boot = Some(1_000);
+        let ttl = RESTORE_PENDING_TTL_MS;
+        let now = 1_000 + 10 * ttl;
+        let mut r = fixture_rec("r", "open", 999, None, None);
+        assert!(carries_boot_restore_hold(&r, boot, true, now));
+        assert!(
+            !carries_boot_restore_hold(&r, boot, false, now),
+            "not a census row"
+        );
+        r.restore_pending_at = Some(500);
+        assert!(
+            carries_boot_restore_hold(&r, boot, true, now),
+            "a pending marker left by an earlier process still awaits THIS boot's restore"
+        );
+        r.restore_pending_at = Some(1_000);
+        assert!(
+            !carries_boot_restore_hold(&r, boot, true, now),
+            "attempted this boot, past the TTL: a resume that did not verify"
+        );
+        assert!(
+            carries_boot_restore_hold(&r, boot, true, 1_000 + ttl),
+            "attempted this boot, still inside the TTL: may still be verifying"
+        );
+        assert!(
+            !carries_boot_restore_hold(&r, boot, true, 1_000 + ttl + 1),
+            "one millisecond past the TTL"
+        );
+        assert!(
+            carries_boot_restore_hold(&r, None, true, now),
+            "no boot instant: no attempt is provably this boot's"
+        );
     }
 
     #[test]
@@ -9481,8 +12716,9 @@ mod tests {
         );
         let store = SessionLifecycleStore::open(&path).unwrap();
         let ids = |boot_at: Option<i64>| {
+            store.set_boot_ms_for_test(boot_at.unwrap_or(i64::MAX));
             let mut v: Vec<String> = store
-                .restorable_records(later, Some(shutdown), true, boot_at)
+                .restorable_records(Some(shutdown), true)
                 .into_iter()
                 .map(|r| r.claude_session_id)
                 .collect();
@@ -9616,9 +12852,9 @@ mod tests {
         let store = SessionLifecycleStore::open(&path).unwrap();
         let later = boot + 3 * 3_600_000;
         assert_eq!(
-            sorted_restorable(&store, later, Some(boot)),
+            sorted_restorable(&store, Some(boot)),
             vec!["victim".to_string()]
         );
-        assert!(sorted_restorable(&store, later, None).is_empty());
+        assert!(sorted_restorable(&store, None).is_empty());
     }
 }

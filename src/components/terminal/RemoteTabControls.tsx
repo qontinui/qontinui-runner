@@ -118,6 +118,8 @@ export function RemoteTabControls({
         sessionLabel: sessionLabelFromTitle(tab.title, remote.deviceLabel),
         workingDir: tab.workingDir ?? null,
         pageId: session.pageId !== "default" ? session.pageId : null,
+        // Re-mint in the tenant the tab was opened under, not the default.
+        tenant: remote.tenant ?? null,
       });
       // The new tab is already open (terminal-created + terminal-remote-identity);
       // retire the dead one it replaces.

@@ -11,7 +11,7 @@ Contributions are accepted under the **Developer Certificate of Origin (DCO) 1.1
 
     git commit -s -m "your message"
 
-which appends `Signed-off-by: Your Name <your@email>` from your `git config user.name` / `user.email`. Your contributions are licensed inbound under the same `AGPL-3.0-or-later` as the project (inbound = outbound); you retain copyright in your contributions. No relicensing rights are granted — this repository is one of the apps where Qontinui does not need the dual-/commercial-license lever (that lever is retained only on the embeddable `ui-bridge` library via its CLA).
+which appends `Signed-off-by: Your Name <your@email>` from your `git config user.name` / `user.email`. Your contributions are licensed inbound under the same `AGPL-3.0-or-later` as the project (inbound = outbound); you retain copyright in your contributions. No relicensing rights are granted — this repository is one of the apps where Qontinui does not need the dual-/commercial-license lever (the embeddable `ui-bridge` library, which used to keep that lever through a CLA, is now MIT-licensed and takes contributions under the DCO as well).
 
 The remainder of this document covers contribution mechanics specific to this repository.
 
