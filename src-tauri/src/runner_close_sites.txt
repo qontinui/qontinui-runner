@@ -86,7 +86,7 @@ terminal/account_migration.rs | migrate_session | exempt | the Migrator's close 
 # ── the session transports' teardown, and the registry close that drives it
 session/transport/pty.rs | close | helper | transport.close(
 session/transport/claude_cli.rs | close | helper | transport.close(
-session/mod.rs | close | helper | close_by_id(
+session/mod.rs | close_by_id | helper | close_by_id(
 agent_runtime.rs | run_continuation_terminal | exempt | a never-started gate-continuation pane: closes its coord registry row after the start verdict saw no session start; an External row (terminal panes register external), so it reaches no terminal
 agent_runtime.rs | run_condition_check_terminal | exempt | a never-started condition-check pane: closes its coord registry row after the start verdict saw no session start; External row — reaches no terminal
 commands/terminal.rs | terminal_create | exempt | the operator tab's on-exit hook closes its coord registry row once the PTY has exited; External row — reaches no terminal

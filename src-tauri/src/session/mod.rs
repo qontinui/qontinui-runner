@@ -1620,16 +1620,25 @@ impl SessionRegistry {
         sessions.values().map(SessionRecord::describe).collect()
     }
 
-    fn close(&self, id: Uuid) -> Result<(), SessionError> {
+    /// Close a session by id: tear down its git credential material and its
+    /// transport, and outbox the close. Idempotent: closing an already-closed
+    /// session succeeds.
+    ///
+    /// The registry's ONE close (plan `2026-10-28-one-session-lifecycle-authority`,
+    /// Phase 14). For a PTY-hosted session the transport close is
+    /// `TerminalManager::close`, so the close-site roster
+    /// (`runner_close_sites.txt`) classes every production caller of
+    /// `close_by_id(`, and no other path reaches the transport.
+    pub fn close_by_id(&self, id: Uuid) -> Result<(), SessionError> {
         // Phase 4 (2026-07-15-vscode-coord-git-credential-prompt) — tear
         // down the per-session git credential material (repo-local
         // credential.helper unset + token config file removal, which is
         // also the refresh loop's exit signal). This runs FIRST,
         // unconditionally: cleanup is idempotent and must happen even on a
-        // double-close or an already-removed session. `close` is the
-        // single narrowest funnel — every teardown path (terminal_close,
-        // the PTY exit watchers, session_close, SessionHandle::close)
-        // reaches it via close_by_id/close. The id here is the coord
+        // double-close or an already-removed session. This is the single
+        // narrowest funnel — every production teardown path (terminal_close,
+        // the PTY exit watchers, session_close) reaches it; the test-only
+        // `SessionHandle::close` does too. The id here is the coord
         // session UUID, the same value the install sites stringify
         // (`sid.to_string()` in commands/terminal.rs + productivity.rs),
         // so `id.to_string()` reproduces the exact registry key.
@@ -1811,12 +1820,6 @@ impl SessionRegistry {
             .map(|r| r.row_tenant)
     }
 
-    /// Close-by-id — same idempotent semantics as
-    /// [`SessionHandle::close`].
-    pub fn close_by_id(&self, id: Uuid) -> Result<(), SessionError> {
-        self.close(id)
-    }
-
     /// Focus-by-id surface for the Tauri command layer.
     pub fn focus_by_id(&self, id: Uuid) -> Result<(), SessionError> {
         self.focus(id)
@@ -1913,12 +1916,12 @@ impl SessionHandle {
     /// Test-only (plan `2026-10-28-one-session-lifecycle-authority`, Phase 14).
     /// For a PTY-hosted session this reaches `TerminalManager::close` through
     /// the session transport. The close-site roster (`runner_close_sites.txt`)
-    /// tracks every production path into [`SessionRegistry::close`] through
-    /// `close_by_id`. A production `handle.close()` would be a path it cannot
-    /// see, so outside tests this does not exist. Close by id instead.
+    /// classes every production caller of `SessionRegistry::close_by_id`. A
+    /// production `handle.close()` would be a path it cannot see, so outside
+    /// tests this does not exist. Close by id instead.
     #[cfg(test)]
     pub fn close(self) -> Result<(), SessionError> {
-        self.registry.close(self.id)
+        self.registry.close_by_id(self.id)
     }
 
     /// Phase 4 "Focus this session" command — heartbeats the session
@@ -2620,7 +2623,7 @@ mod tests {
         let id = handle.id();
         handle.clone().close().unwrap();
         // Second close — no panic, no error.
-        reg.close(id).unwrap();
+        reg.close_by_id(id).unwrap();
     }
 
     #[test]
