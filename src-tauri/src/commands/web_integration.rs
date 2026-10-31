@@ -603,6 +603,18 @@ pub async fn test_web_integration_connection(
     // happen before the JWT is even loaded, so an unbound URL cannot reach the
     // credential at all. See the security note on this function.
     if !is_bound_backend(&trimmed_backend) {
+        // A machine-local URL is refused as a persisted value in every build
+        // (`api_config::persisted_backend_url_refused`), and we only reach here
+        // when the ladder did NOT resolve to it — so "save and re-pair" would
+        // not bind it. Say what would.
+        let remedy = if crate::api_config::persisted_backend_url_refused(&trimmed_backend) {
+            "This is a MACHINE-LOCAL address: saved as web_integration.backend_url it is \
+             refused, so saving it will not bind this runner to it. To use a local backend, \
+             set `api_url` in the active profile in ~/.qontinui/profiles.json or export \
+             QONTINUI_WEB_BACKEND_URL, then re-pair."
+        } else {
+            "Save this URL and re-pair to bind to it."
+        };
         return Ok(TestConnectionResponse {
             reachable: true,
             paired: false,
@@ -615,7 +627,7 @@ pub async fn test_web_integration_connection(
                 "Backend reachable at {trimmed_backend}, but that is not the backend \
                  this runner is bound to ({}). Identity was NOT checked — this \
                  runner's device credential is only ever presented to its bound \
-                 backend. Save this URL and re-pair to bind to it.",
+                 backend. {remedy}",
                 crate::api_config::get_api_base_url()
             ),
         });
@@ -811,26 +823,37 @@ pub async fn redeem_pair_code(
     // Resolve the web base. Pair-code endpoints live on qontinui-web,
     // not coord. Precedence:
     //   1. An explicit `backend_url` passed from the Settings form. The
-    //      operator may have typed a new backend without hitting Save yet;
-    //      honoring the form value means "redeem against the URL I see in
-    //      the field" rather than a stale persisted one.
+    //      operator may have typed a new backend without hitting Save yet, so
+    //      a REMOTE form value is redeemed against as given. A MACHINE-LOCAL
+    //      form value (usually a stale one seeded from the raw persisted
+    //      field) is honoured only when a deliberate override selects it —
+    //      `QONTINUI_WEB_BASE` below, or the ladder's env/profile rungs — and
+    //      otherwise falls through to (2)/(3). See
+    //      `api_config::interactive_pair_base_with_override`.
     //   2. `QONTINUI_WEB_BASE` env override (split web/coord hosts).
-    //   3. `api_config::get_api_base_url()` — the canonical four-rung resolver
-    //      (env web/api vars, the persisted `web_integration.backend_url`, then
-    //      the build default). This replaced a coord_url derivation that was
-    //      never correct: in prod coord and the web backend are different
-    //      services, and in dev they share a host but not a port.
+    //   3. `api_config::get_api_base_url()` — the canonical five-rung resolver
+    //      (env web/api vars, profile `api_url`, the persisted
+    //      `web_integration.backend_url`, then the build default). This
+    //      replaced a coord_url derivation that was never correct: in prod
+    //      coord and the web backend are different services, and in dev they
+    //      share a host but not a port.
+    //
+    // Unlike the Cognito sign-in paths, this command does NOT persist the
+    // dialed base into `settings.json`.
+    let env_web_base = std::env::var("QONTINUI_WEB_BASE")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty());
     let web_base = match backend_url
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        Some(form_url) => trim_backend_url(form_url),
-        None => std::env::var("QONTINUI_WEB_BASE")
-            .ok()
-            .map(|v| v.trim().trim_end_matches('/').to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(crate::api_config::get_api_base_url),
+        Some(form_url) => crate::api_config::interactive_pair_base_with_override(
+            form_url,
+            env_web_base.as_deref().map(|v| ("QONTINUI_WEB_BASE", v)),
+        ),
+        None => env_web_base.unwrap_or_else(crate::api_config::get_api_base_url),
     };
 
     // Run the blocking HTTP call on a tokio blocking thread so we don't
