@@ -1158,8 +1158,6 @@ POST /graph/detect-patterns detect_patterns_handler
 POST /graph/invalidate-cache invalidate_graph_cache_handler
 POST /graphql graphql_handler
 POST /gui-config/build build_gui_config
-POST /gui-config/capture-elements capture_elements
-POST /gui-config/capture-multi-state capture_multi_state
 POST /gui-config/focus-window focus_window
 POST /gui-config/start-executor start_executor
 POST /hitl/{id}/respond respond_handler
