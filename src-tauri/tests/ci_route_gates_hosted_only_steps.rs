@@ -461,9 +461,30 @@ fn a_self_hosted_leg_refuses_a_host_that_is_not_isolated_right_after_checkout() 
         for f in ["coord-device-jwt", "machine.json", "profiles.json"] {
             assert!(run.contains(f), "job `{name}`: checks {f}");
         }
+        // A LISTENER on :9876 refuses, probed by connect, not by an HTTP
+        // answer a slow runner may not give in time (round 4, MEDIUM-2).
+        for needle in [
+            "exec 3<>/dev/tcp/127.0.0.1/9876",
+            "timeout -k 2 5 bash",
+            // Caught under `shell: bash`'s -e: a refused connect (the
+            // isolated case) must not abort the step with no annotation.
+            "probe_err=\"$(\"${probe[@]}\" 2>&1)\" || probe_rc=$?",
+            "\"$probe_rc\" -eq 0",
+            "\"$probe_rc\" -eq 124",
+            "connection refused",
+            // The fallback: no proxy, and only exit 7 (nothing listening)
+            // passes.
+            "--noproxy '*' --connect-timeout 2 --max-time 5 http://127.0.0.1:9876/health",
+            "[ \"$curl_rc\" -eq 7 ] || refuse",
+        ] {
+            assert!(
+                run.contains(needle),
+                "job `{name}`: the :9876 probe lacks `{needle}`"
+            );
+        }
         assert!(
-            run.contains("http://127.0.0.1:9876/health") && run.contains("--max-time 2"),
-            "job `{name}`: checks for a live runner"
+            !run.contains("--max-time 2 http"),
+            "job `{name}`: a 2 s HTTP answer is not the listener test"
         );
         assert!(run.contains(HOST_NOT_ISOLATED_TITLE), "job `{name}`");
         assert!(

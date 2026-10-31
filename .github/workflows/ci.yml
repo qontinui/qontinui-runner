@@ -317,7 +317,8 @@ jobs:
       # reason travels through env, never interpolated into the script. The
       # annotation title is coord's `CI_CAPACITY_ANNOTATION_MARKER` verbatim
       # (pr_merge/author_feedback.rs). coord write-skips a main run whose every
-      # failing job carries it (or was build-killed or runner-lost), once its
+      # non-passing job carries it (or was build-killed, runner-lost or
+      # cancelled), once its
       # own trace shows it answered fail_fast for that check; any other red,
       # or an unread annotation, keeps main red. Both sides pin the title.
       - name: CI capacity (route said fail_fast)
@@ -350,8 +351,14 @@ jobs:
       # four things, under $HOME and (Windows) $USERPROFILE:
       #   1-3. `.qontinui/coord-device-jwt`, `.qontinui/machine.json` and
       #        `.qontinui/profiles.json` do not exist;
-      #   4.   nothing answers `http://127.0.0.1:9876/health` within 2 s (a
-      #        live runner there mints device JWTs on demand, with no file).
+      #   4.   nothing LISTENS on 127.0.0.1:9876 (a live runner there mints
+      #        device JWTs on demand, with no file). Probed with a bash
+      #        `/dev/tcp` connect, which needs no curl and no proxy and
+      #        cannot be fooled by a slow `/health`: a connect that succeeds,
+      #        or hangs past 5 s (a listener with a full backlog), refuses;
+      #        only "Connection refused" passes. Where `/dev/tcp` is
+      #        unavailable it falls back to curl with no proxy and refuses
+      #        unless curl exits 7 (could not connect).
       # It does not check other ports, a credential under another account or
       # path, or environment the runner service passes in -- coord's
       # ci_route NOT_SERVED lists those. The title carries coord's generic
@@ -378,11 +385,30 @@ jobs:
               fi
             done
           done
-          command -v curl >/dev/null 2>&1 || refuse "curl is absent, so whether a runner answers on 127.0.0.1:9876 is UNKNOWN."
-          if curl -s -o /dev/null --max-time 2 http://127.0.0.1:9876/health; then
-            refuse "a runner answers on 127.0.0.1:9876; a job could mint a device JWT from it."
+          # A listener on 127.0.0.1:9876, by connect (bash /dev/tcp).
+          if command -v timeout >/dev/null 2>&1; then
+            probe=(timeout -k 2 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/9876')
+          else
+            probe=(bash -c 'exec 3<>/dev/tcp/127.0.0.1/9876')
           fi
-          echo "isolated: no coord-device-jwt, machine.json or profiles.json under ${homes[*]}, and nothing on 127.0.0.1:9876"
+          # `shell: bash` runs with -e, so the rc is caught, never fatal.
+          probe_rc=0
+          probe_err="$("${probe[@]}" 2>&1)" || probe_rc=$?
+          if [ "$probe_rc" -eq 0 ]; then
+            refuse "something listens on 127.0.0.1:9876 (a local runner mints device JWTs there)."
+          elif [ "$probe_rc" -eq 124 ]; then
+            refuse "a connect to 127.0.0.1:9876 hung for 5 s: a listener with a full backlog holds the port."
+          elif printf '%s' "$probe_err" | grep -qi 'connection refused'; then
+            :
+          else
+            # No usable /dev/tcp here: curl, with no proxy, refusing unless it
+            # could not connect at all (exit 7).
+            command -v curl >/dev/null 2>&1 || refuse "neither /dev/tcp ($probe_err) nor curl is available, so whether anything listens on 127.0.0.1:9876 is UNKNOWN."
+            curl_rc=0
+            curl -s -o /dev/null --noproxy '*' --connect-timeout 2 --max-time 5 http://127.0.0.1:9876/health || curl_rc=$?
+            [ "$curl_rc" -eq 7 ] || refuse "curl to 127.0.0.1:9876 exited $curl_rc (7 = nothing listening); a listener may be there."
+          fi
+          echo "isolated: no coord-device-jwt, machine.json or profiles.json under ${homes[*]}, and nothing listens on 127.0.0.1:9876"
 
       # A rerouted self-hosted leg (route review H1): the runner's build and
       # tests resolve the operator's config and secure-storage dirs, and a test
@@ -1821,8 +1847,14 @@ jobs:
       # four things, under $HOME and (Windows) $USERPROFILE:
       #   1-3. `.qontinui/coord-device-jwt`, `.qontinui/machine.json` and
       #        `.qontinui/profiles.json` do not exist;
-      #   4.   nothing answers `http://127.0.0.1:9876/health` within 2 s (a
-      #        live runner there mints device JWTs on demand, with no file).
+      #   4.   nothing LISTENS on 127.0.0.1:9876 (a live runner there mints
+      #        device JWTs on demand, with no file). Probed with a bash
+      #        `/dev/tcp` connect, which needs no curl and no proxy and
+      #        cannot be fooled by a slow `/health`: a connect that succeeds,
+      #        or hangs past 5 s (a listener with a full backlog), refuses;
+      #        only "Connection refused" passes. Where `/dev/tcp` is
+      #        unavailable it falls back to curl with no proxy and refuses
+      #        unless curl exits 7 (could not connect).
       # It does not check other ports, a credential under another account or
       # path, or environment the runner service passes in -- coord's
       # ci_route NOT_SERVED lists those. The title carries coord's generic
@@ -1849,11 +1881,30 @@ jobs:
               fi
             done
           done
-          command -v curl >/dev/null 2>&1 || refuse "curl is absent, so whether a runner answers on 127.0.0.1:9876 is UNKNOWN."
-          if curl -s -o /dev/null --max-time 2 http://127.0.0.1:9876/health; then
-            refuse "a runner answers on 127.0.0.1:9876; a job could mint a device JWT from it."
+          # A listener on 127.0.0.1:9876, by connect (bash /dev/tcp).
+          if command -v timeout >/dev/null 2>&1; then
+            probe=(timeout -k 2 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/9876')
+          else
+            probe=(bash -c 'exec 3<>/dev/tcp/127.0.0.1/9876')
           fi
-          echo "isolated: no coord-device-jwt, machine.json or profiles.json under ${homes[*]}, and nothing on 127.0.0.1:9876"
+          # `shell: bash` runs with -e, so the rc is caught, never fatal.
+          probe_rc=0
+          probe_err="$("${probe[@]}" 2>&1)" || probe_rc=$?
+          if [ "$probe_rc" -eq 0 ]; then
+            refuse "something listens on 127.0.0.1:9876 (a local runner mints device JWTs there)."
+          elif [ "$probe_rc" -eq 124 ]; then
+            refuse "a connect to 127.0.0.1:9876 hung for 5 s: a listener with a full backlog holds the port."
+          elif printf '%s' "$probe_err" | grep -qi 'connection refused'; then
+            :
+          else
+            # No usable /dev/tcp here: curl, with no proxy, refusing unless it
+            # could not connect at all (exit 7).
+            command -v curl >/dev/null 2>&1 || refuse "neither /dev/tcp ($probe_err) nor curl is available, so whether anything listens on 127.0.0.1:9876 is UNKNOWN."
+            curl_rc=0
+            curl -s -o /dev/null --noproxy '*' --connect-timeout 2 --max-time 5 http://127.0.0.1:9876/health || curl_rc=$?
+            [ "$curl_rc" -eq 7 ] || refuse "curl to 127.0.0.1:9876 exited $curl_rc (7 = nothing listening); a listener may be there."
+          fi
+          echo "isolated: no coord-device-jwt, machine.json or profiles.json under ${homes[*]}, and nothing listens on 127.0.0.1:9876"
 
       # A rerouted self-hosted leg (route review H1): the runner's build and
       # tests resolve the operator's config and secure-storage dirs, and a test
