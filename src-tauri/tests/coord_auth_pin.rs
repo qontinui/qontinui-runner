@@ -188,6 +188,12 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     // implementation off the native UI thread. Kind and count are unchanged,
     // so the coverage readout has no new hole.
     ("mcp/ai_session.rs", "not-coord", 1),
+    // The Phase 7 seed arm's POST to coord's per-binding door
+    // (`/coord/devices/{id}/tenant-token`, plan
+    // `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`):
+    // it mints the requested tenant's first credential, presenting another
+    // bound tenant's device JWT.
+    ("mcp/device_jwt_refresher.rs", "bootstrap", 1),
     ("mcp/device_jwt_refresher.rs", "not-coord", 1),
     ("mcp/device_jwt_refresher.rs", "self-refresh", 2),
     ("mcp/session_compliance.rs", "device-jwt-required", 1),

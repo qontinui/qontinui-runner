@@ -2932,8 +2932,11 @@ pub(crate) fn binding_gaps() -> BindingGapReport {
 //
 // The safe headless seed is a coord door that mints for an EXISTING binding
 // without touching either (the plan's Phase 6), consumed here by Phase 7.
-// Until then a measured gap is answered by ONE durable ask per tenant per
-// lapse. Coord finding `f2dce2cb-b7a8-473b-b1bf-f5631954427b` records the
+// Phase 7 consumes that door ([`seed_tenant_slot`]): ONCE per tenant per
+// lapse, attempt recorded BEFORE the call, falling back to ONE durable ask
+// per tenant per lapse when it does not put a slot there (and to NO ask when
+// coord answers `not_bound`). Coord finding
+// `f2dce2cb-b7a8-473b-b1bf-f5631954427b` records the
 // decision and how to reverse it — do not reverse it by calling `pair-cli`.
 //
 // ## The ask is the RECORD, not the event
@@ -2964,9 +2967,9 @@ pub const AUTONOMY_BINDING_GAP_EVENT: &str = "autonomy-binding-gap";
 
 /// Why the operator is asked rather than the runner seeding the slot itself.
 /// Stored on the record and shown verbatim.
-pub(crate) const BINDING_GAP_ASK_REASON: &str = "no headless path can seed this tenant's \
-     credential safely: coord's pairing door (pair-cli) also re-points this device's home \
-     tenant and re-creates the binding, so the runner will not run it unattended";
+pub(crate) const BINDING_GAP_ASK_REASON: &str = "this tenant's credential was not seeded \
+     automatically, and the runner never runs coord's pairing door (pair-cli) unattended: it \
+     also re-points this device's home tenant and re-creates the binding";
 
 /// What the heal command also does, stated on every ask. Pairing goes
 /// through coord's `record_pairing`, which makes the paired tenant this
@@ -2974,7 +2977,8 @@ pub(crate) const BINDING_GAP_ASK_REASON: &str = "no headless path can seed this 
 /// device's single machine key to it.
 pub(crate) const BINDING_GAP_PAIR_CAVEAT: &str = "pairing also makes this tenant the \
      device's home tenant in coord and rotates its machine key to it — that is how \
-     pairing works until coord offers a per-binding seed door";
+     pairing works; coord's per-binding seed door (tried first, once per lapse) is the \
+     path that does neither, and it did not put a credential in this slot";
 
 /// One tenant's state within the CURRENT lapse — the record that makes
 /// "exactly once" survive a restart, and the ask the UI reads back.
@@ -2998,6 +3002,23 @@ pub(crate) struct GapAskRecord {
     /// ask without re-deriving it.
     #[serde(default)]
     pub reason: String,
+    /// True once the Phase 7 seed attempt for this tenant in this lapse has
+    /// been RECORDED — written BEFORE the network call, so a crash mid-call
+    /// or a refusal can never produce a second attempt in the same lapse.
+    #[serde(default)]
+    pub seed_attempted: bool,
+    /// What the seed attempt came to, in operator words; empty until the
+    /// attempt concludes. Folded into the ask's `reason` when it falls back.
+    #[serde(default)]
+    pub seed_outcome: String,
+    /// True when coord's seed door answered `403 not_bound`: coord says this
+    /// device is no longer bound to the tenant, so the sidecar that named it
+    /// a gap is behind coord. No ask is opened for the rest of the lapse —
+    /// the ask's remedy (`pair --tenant-id`) would RE-CREATE a binding coord
+    /// removed, the same reason a too-stale sidecar asks nobody. The lapse
+    /// closes on its own once the sidecar stops naming the tenant.
+    #[serde(default)]
+    pub seed_not_bound: bool,
 }
 
 /// The on-disk lapse record, keyed by stringified tenant UUID.
@@ -3029,6 +3050,9 @@ impl GapAskState {
                 notified: false,
                 first_seen: now,
                 reason: String::new(),
+                seed_attempted: false,
+                seed_outcome: String::new(),
+                seed_not_bound: false,
             })
     }
 
@@ -3076,14 +3100,15 @@ pub(crate) fn load_gap_ask_state(path: &std::path::Path) -> GapAskState {
     }
 }
 
-/// Persist the lapse record. Best-effort: a write failure only costs a repeat
-/// ask after a restart, and must never fail the pass.
-pub(crate) fn save_gap_ask_state(path: &std::path::Path, state: &GapAskState) {
+/// Persist the lapse record. Never fails the pass: a failed ASK write only
+/// costs a repeat ask. Returns whether the record landed, because the Phase 7
+/// seed is a network mint and may only be made once its attempt is on disk.
+pub(crate) fn save_gap_ask_state(path: &std::path::Path, state: &GapAskState) -> bool {
     let body = match serde_json::to_vec_pretty(state) {
         Ok(b) => b,
         Err(e) => {
             warn!("device_jwt_refresher: serialize binding_gap_asks.json failed: {e}");
-            return;
+            return false;
         }
     };
     if let Some(parent) = path.parent() {
@@ -3092,7 +3117,7 @@ pub(crate) fn save_gap_ask_state(path: &std::path::Path, state: &GapAskState) {
                 "device_jwt_refresher: mkdir {} failed: {e}",
                 parent.display()
             );
-            return;
+            return false;
         }
     }
     // Its own tmp name — never the one `write_paired_user_file` or
@@ -3102,14 +3127,17 @@ pub(crate) fn save_gap_ask_state(path: &std::path::Path, state: &GapAskState) {
     let tmp = path.with_extension(format!("json.gap-ask.{}.tmp", std::process::id()));
     if let Err(e) = std::fs::write(&tmp, &body) {
         warn!("device_jwt_refresher: write {} failed: {e}", tmp.display());
-        return;
+        return false;
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
         warn!(
             "device_jwt_refresher: rename {} failed: {e}",
             path.display()
         );
+        let _ = std::fs::remove_file(&tmp);
+        return false;
     }
+    true
 }
 
 /// The MEASURED gap set, or `None` when the report established nothing.
@@ -3255,6 +3283,11 @@ pub(crate) enum GapAction {
     },
     /// Already asked in this lapse.
     Silent(uuid::Uuid),
+    /// Phase 7: the seed attempt for this tenant is due. The attempt is
+    /// already RECORDED (`seed_attempted`) by the time this is returned, and
+    /// no ask has been opened — the ask is the fallback, on the next pass,
+    /// if the attempt does not put a slot there.
+    SeedDue(uuid::Uuid),
     /// A MEASURED report stopped naming this tenant: the lapse closed and its
     /// record was cleared. `slot_now_held` says whether the reason is that a
     /// credential for it now exists (a human paired it) — in which case the
@@ -3281,6 +3314,23 @@ pub(crate) fn ask_bound_tenant_gaps_at(
     tenant_slots: Option<&[uuid::Uuid]>,
     account: Option<&str>,
     now: i64,
+) -> Vec<GapAction> {
+    plan_gap_actions_at(state_path, ask_report, tenant_slots, account, now, false)
+}
+
+/// [`ask_bound_tenant_gaps_at`] with the Phase 7 seed arm. With
+/// `seed_enabled`, a tenant whose lapse has not yet had a seed attempt gets
+/// [`GapAction::SeedDue`] (attempt recorded first, ask withheld); once the
+/// attempt is on record and the tenant is STILL a gap, the next pass opens
+/// the ask as before. With `seed_enabled == false` it is exactly the Phase 4
+/// ask pass. This function still makes no network call.
+pub(crate) fn plan_gap_actions_at(
+    state_path: &std::path::Path,
+    ask_report: &BindingGapReport,
+    tenant_slots: Option<&[uuid::Uuid]>,
+    account: Option<&str>,
+    now: i64,
+    seed_enabled: bool,
 ) -> Vec<GapAction> {
     // No signed-in, paired account (see [`binding_gap_ask_account`]): there is
     // nobody to ask on behalf of, and the record is left exactly as it is.
@@ -3312,28 +3362,90 @@ pub(crate) fn ask_bound_tenant_gaps_at(
         })
         .collect();
 
+    // Phase 7: the seed attempt comes first, once per tenant per lapse. The
+    // attempt is PERSISTED here, before any `SeedDue` is returned: a record
+    // that cannot be written would re-arm the seed on every pass (one coord
+    // mint per pass), so on a failed write no seed is due and the tenant goes
+    // straight to the ask, which is harmless to repeat.
+    //
+    // A lapse already ASKED with no seed on record (`notified` without
+    // `seed_attempted`) stays silent until it closes; the next lapse seeds.
+    // A pre-Phase-7 build writes that shape, and so does a pass whose seed
+    // write failed but whose ask write then landed: that lapse forgoes its
+    // seed, the conservative direction.
+    let due: Vec<uuid::Uuid> = if seed_enabled {
+        gaps.iter()
+            .copied()
+            .filter(|t| {
+                state
+                    .record(t)
+                    .is_none_or(|r| !r.notified && !r.seed_attempted)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let seeds_recorded = !due.is_empty() && {
+        for t in &due {
+            state.entry(t, now).seed_attempted = true;
+        }
+        let saved = save_gap_ask_state(state_path, &state) && {
+            let back = load_gap_ask_state(state_path);
+            due.iter()
+                .all(|t| back.record(t).is_some_and(|r| r.seed_attempted))
+        };
+        if !saved {
+            warn!(
+                "device_jwt_refresher: the binding-gap lapse record could not be written, so \
+                 no seed is attempted this pass (an unrecorded attempt would repeat every pass)"
+            );
+            for t in &due {
+                state.entry(t, now).seed_attempted = false;
+            }
+        }
+        saved
+    };
+
     for tenant in gaps {
         if state.record(&tenant).is_some_and(|r| r.notified) {
             actions.push(GapAction::Silent(tenant));
             continue;
         }
-        let first_seen = {
+        if seeds_recorded && due.contains(&tenant) {
+            actions.push(GapAction::SeedDue(tenant));
+            continue;
+        }
+        // Coord's door said the binding is gone: asking a human to pair would
+        // re-create it. Stay silent for the rest of this lapse.
+        if state.record(&tenant).is_some_and(|r| r.seed_not_bound) {
+            actions.push(GapAction::Silent(tenant));
+            continue;
+        }
+        let (first_seen, reason) = {
             let rec = state.entry(&tenant, now);
             rec.notified = true;
-            rec.reason = BINDING_GAP_ASK_REASON.to_string();
-            rec.first_seen
+            rec.reason = if rec.seed_outcome.is_empty() {
+                BINDING_GAP_ASK_REASON.to_string()
+            } else {
+                format!(
+                    "{BINDING_GAP_ASK_REASON}; automatic seed through coord's per-binding \
+                     door: {}",
+                    rec.seed_outcome
+                )
+            };
+            (rec.first_seen, rec.reason.clone())
         };
         warn!(
             "device_jwt_refresher: asking the operator ONCE to pair bound tenant {tenant} \
-             (detector: binding_gaps) — {BINDING_GAP_ASK_REASON}"
+             (detector: binding_gaps) — {reason}"
         );
         actions.push(GapAction::Notified {
             tenant,
-            payload: binding_gap_ask_payload(&tenant, BINDING_GAP_ASK_REASON, first_seen),
+            payload: binding_gap_ask_payload(&tenant, &reason, first_seen),
         });
     }
 
-    save_gap_ask_state(state_path, &state);
+    let _ = save_gap_ask_state(state_path, &state);
     actions
 }
 
@@ -3375,6 +3487,7 @@ pub(crate) fn ask_bound_tenant_gaps(
     tenant_slots: Option<&[uuid::Uuid]>,
     account: Option<&str>,
     now: i64,
+    seed_enabled: bool,
 ) -> Vec<GapAction> {
     if account.is_none() {
         return Vec::new();
@@ -3393,7 +3506,14 @@ pub(crate) fn ask_bound_tenant_gaps(
     if gaps.is_empty() && load_gap_ask_state(&state_path).tenants.is_empty() {
         return Vec::new();
     }
-    ask_bound_tenant_gaps_at(&state_path, ask_report, tenant_slots, account, now)
+    plan_gap_actions_at(
+        &state_path,
+        ask_report,
+        tenant_slots,
+        account,
+        now,
+        seed_enabled,
+    )
 }
 
 /// Apply a pass's side effects: reset the rejection streak of every tenant
@@ -3427,7 +3547,7 @@ fn settle_binding_gap_actions(
             let nudge = match action {
                 GapAction::Notified { tenant, .. } => Some((tenant, true)),
                 GapAction::LapseClosed { tenant, .. } => Some((tenant, false)),
-                GapAction::Silent(_) => None,
+                GapAction::Silent(_) | GapAction::SeedDue(_) => None,
             };
             if let Some((tenant, open)) = nudge {
                 let payload = serde_json::json!({"tenant_id": tenant.to_string(), "open": open});
@@ -3441,6 +3561,319 @@ fn settle_binding_gap_actions(
         }
     }
     reset
+}
+
+// ===========================================================================
+// Phase 7 — the seed arm: coord's per-binding door (plan
+// `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`).
+//
+// `POST {coord}/coord/devices/{device_id}/tenant-token` with `{tenant_id}`,
+// presenting a device JWT of a DIFFERENT tenant this device holds. Coord
+// (qontinui-coord `tenant_token_seed.rs`) mints for an EXISTING binding only
+// and writes neither `coord.devices.tenant_id` nor a binding, so this is the
+// seed Phase 4 removed `pair-cli` for being unable to do safely.
+//
+// Rules this arm keeps:
+//   * once per tenant per lapse — the attempt is persisted by
+//     [`plan_gap_actions_at`] BEFORE [`seed_tenant_slot`] is called;
+//   * every non-success is a fall-back to the ask, never a retry: coord's
+//     `403 not_bound` / `403 presenter_not_device_owner` / `403 …` /
+//     `400` same-tenant / `409 binding_has_no_pairing_user` / `503`, a
+//     transport failure and an unusable body all end in
+//     [`SeedOutcome::describe`] text on the ask record;
+//   * the write is per-tenant and refuses a cross-tenant claim
+//     ([`crate::auth::AuthManager::store_tenant_device_jwt_expecting`]);
+//   * no `pair-cli`, no `machine-credential/exchange`, no Cognito bearer.
+// ===========================================================================
+
+/// How one seed attempt ended. Anything but [`Seeded`](Self::Seeded) and
+/// [`SlotAlreadyHeld`](Self::SlotAlreadyHeld) leaves the slot empty and the
+/// ask to be opened on the next pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SeedOutcome {
+    /// A token for exactly this tenant is now in the tenant's slot.
+    Seeded,
+    /// A usable slot appeared between planning and the write (a human paired
+    /// it, or a peer pass seeded it): nothing was overwritten.
+    SlotAlreadyHeld,
+    /// No usable device JWT of another tenant to present.
+    NoPresenter,
+    /// Coord answered non-2xx. `code` is the body's `code`/`error` string.
+    Refused { status: u16, code: String },
+    /// The request never got an answer.
+    Transport(String),
+    /// A 2xx whose body was not a token.
+    BadResponse(String),
+    /// Coord's token named another tenant (or none); NOT persisted.
+    TenantMismatch { returned: Option<uuid::Uuid> },
+    /// The credential store refused the write.
+    PersistFailed(String),
+}
+
+impl SeedOutcome {
+    pub(crate) fn succeeded(&self) -> bool {
+        matches!(self, SeedOutcome::Seeded | SeedOutcome::SlotAlreadyHeld)
+    }
+
+    /// Coord answered `403 not_bound`: the device is not bound to the tenant.
+    pub(crate) fn is_not_bound(&self) -> bool {
+        matches!(self, SeedOutcome::Refused { status: 403, code } if code == "not_bound")
+    }
+
+    /// Operator-facing sentence recorded on the ask when the arm falls back.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            SeedOutcome::Seeded => "seeded".into(),
+            SeedOutcome::SlotAlreadyHeld => "a credential for this tenant already exists".into(),
+            SeedOutcome::NoPresenter => {
+                "no usable device credential for another tenant to present".into()
+            }
+            SeedOutcome::Refused { status, code } => {
+                let why = match (*status, code.as_str()) {
+                    (403, "not_bound") => {
+                        "coord reports this device is NOT bound to the tenant (the door never \
+                         creates a binding)"
+                    }
+                    (403, "presenter_not_device_owner") => {
+                        "the presenting credential's user is not this device's current owner"
+                    }
+                    (403, "binding_user_not_device_owner") => {
+                        "the user who paired this binding no longer owns the device"
+                    }
+                    (403, _) => "coord refused the presenter or the device",
+                    (400, "presenter_has_no_tenant") => "the presented credential names no tenant",
+                    (400, "requested_tenant_is_presenters") => {
+                        "the presented credential already is this tenant's"
+                    }
+                    (400, _) => "coord rejected the request",
+                    (409, _) => "the binding records no pairing user to mint for",
+                    (503, "tenant_token_state_unreadable") => {
+                        "coord could not read the device's bindings (fail-closed)"
+                    }
+                    (503, _) => "coord is temporarily unable to mint",
+                    _ => "coord refused",
+                };
+                format!("refused (HTTP {status}, {code}): {why}")
+            }
+            SeedOutcome::Transport(e) => format!("request failed: {e}"),
+            SeedOutcome::BadResponse(e) => format!("unusable response: {e}"),
+            SeedOutcome::TenantMismatch { returned } => {
+                format!("coord minted for tenant {returned:?}, not the requested one; refused")
+            }
+            SeedOutcome::PersistFailed(e) => format!("credential store write failed: {e}"),
+        }
+    }
+}
+
+/// Coord's `DeviceRefreshResponse`; only the token is used, and its own
+/// `tenant_id` claim — not this body's echo — is what the write checks.
+#[derive(Debug, serde::Deserialize)]
+struct TenantSeedResponse {
+    token: String,
+}
+
+/// The device JWT to present for a seed of `requested`: a usable one that
+/// claims a tenant OTHER than `requested`, preferring the default (legacy)
+/// slot, then the lowest-keyed tenant slot. Pure over its inputs.
+pub(crate) fn pick_seed_presenter(
+    legacy: Option<&str>,
+    slots: &[(uuid::Uuid, String)],
+    requested: &uuid::Uuid,
+) -> Option<String> {
+    let claims_other = |jwt: &str| {
+        crate::auth::slot_jwt_is_usable(jwt)
+            && crate::auth::jwt_tenant_claim(jwt).is_some_and(|t| t != *requested)
+    };
+    legacy
+        .filter(|j| claims_other(j))
+        .map(str::to_string)
+        .or_else(|| {
+            let mut sorted: Vec<&(uuid::Uuid, String)> = slots.iter().collect();
+            sorted.sort_by_key(|(t, _)| *t);
+            sorted
+                .into_iter()
+                // A slot must claim its own key, or it is not evidence of
+                // the binding it is filed under.
+                .filter(|(t, j)| crate::auth::jwt_tenant_claim(j) == Some(*t))
+                .find(|(_, j)| claims_other(j))
+                .map(|(_, j)| j.clone())
+        })
+}
+
+/// Pull `code` (or `error`) out of a refusal body, bounded.
+fn seed_refusal_code(body: &str) -> String {
+    let scan = crate::str_utils::truncate_str(body, UPSTREAM_BODY_SCAN_BYTES);
+    // `not_bound` must survive a body too long to parse: misreading it would
+    // open an ask whose remedy re-creates the binding coord removed.
+    let not_bound_fallback = || {
+        scan.contains("\"not_bound\"")
+            .then(|| "not_bound".to_string())
+    };
+    serde_json::from_str::<serde_json::Value>(scan)
+        .ok()
+        .and_then(|v| {
+            v.get("code")
+                .or_else(|| v.get("error"))
+                .and_then(|c| c.as_str().map(str::to_string))
+        })
+        .or_else(not_bound_fallback)
+        .unwrap_or_else(|| "unparsed".into())
+}
+
+/// One seed attempt for `tenant`. ONE request, no retry; the caller has
+/// already persisted the attempt. Never clears or overwrites a usable slot.
+pub(crate) async fn seed_tenant_slot(
+    auth_manager: &crate::auth::AuthManager,
+    coord_base: &str,
+    device_id: &str,
+    tenant: uuid::Uuid,
+) -> SeedOutcome {
+    // Read the presenter candidates off the async executor.
+    let presenter = match store_write_off_runtime(auth_manager, move |m| {
+        let legacy = m.get_access_token().ok();
+        let slots: Vec<(uuid::Uuid, String)> = m
+            .list_tenant_device_jwt_tenants()
+            .into_iter()
+            .filter_map(|t| m.get_tenant_device_jwt(&t).ok().flatten().map(|j| (t, j)))
+            .collect();
+        Ok(pick_seed_presenter(legacy.as_deref(), &slots, &tenant))
+    })
+    .await
+    {
+        Ok(Some(p)) => p,
+        Ok(None) => return SeedOutcome::NoPresenter,
+        Err(e) => return SeedOutcome::PersistFailed(format!("credential store read: {e}")),
+    };
+
+    let url = format!(
+        "{}/coord/devices/{}/tenant-token",
+        coord_base.trim_end_matches('/'),
+        device_id
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return SeedOutcome::Transport(crate::util::error_chain::error_chain(&e)),
+    };
+    let resp = {
+        let _in_flight = crate::util::egress_context::in_flight(
+            crate::util::egress_context::EgressClient::DeviceJwtRefresher,
+        );
+        // coord-auth-exempt(bootstrap): mints the requested tenant's FIRST
+        // credential, so requiring one for it would be circular. It presents a
+        // DIFFERENT tenant's device JWT on purpose — coord's per-binding door
+        // authenticates the presenter and mints for an EXISTING binding only;
+        // re-resolving through the bearer helper would select the very slot
+        // that is missing.
+        client
+            .post(&url)
+            .bearer_auth(presenter.trim())
+            .json(&serde_json::json!({ "tenant_id": tenant.to_string() }))
+            .send()
+            .await
+    };
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            crate::util::egress_context::record_failure(
+                crate::util::egress_context::EgressClient::DeviceJwtRefresher,
+            );
+            return SeedOutcome::Transport(crate::util::error_chain::error_chain(&e));
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return SeedOutcome::Refused {
+            status: status.as_u16(),
+            code: seed_refusal_code(&body),
+        };
+    }
+    let token = match resp.json::<TenantSeedResponse>().await {
+        Ok(b) if !b.token.trim().is_empty() => b.token,
+        Ok(_) => return SeedOutcome::BadResponse("empty token".into()),
+        Err(e) => return SeedOutcome::BadResponse(e.to_string()),
+    };
+
+    let written = store_write_off_runtime(auth_manager, move |m| {
+        // A usable slot that appeared meanwhile is a human's or a peer's
+        // work: leave it.
+        if m.get_tenant_device_jwt(&tenant)
+            .ok()
+            .flatten()
+            .is_some_and(|j| crate::auth::slot_jwt_is_usable(&j))
+        {
+            return Ok(SeedOutcome::SlotAlreadyHeld);
+        }
+        m.store_tenant_device_jwt_expecting(&tenant, &token)
+            .map(|()| SeedOutcome::Seeded)
+    })
+    .await;
+    match written {
+        Ok(outcome) => outcome,
+        Err(e) => match e.downcast_ref::<crate::auth::TenantMismatch>() {
+            Some(mismatch) => SeedOutcome::TenantMismatch {
+                returned: mismatch.returned,
+            },
+            None => SeedOutcome::PersistFailed(e.to_string()),
+        },
+    }
+}
+
+/// Persist what a seed attempt came to on the tenant's lapse record, so the
+/// fallback ask can say why. Best-effort; touches no other field.
+pub(crate) fn record_seed_outcome_at(
+    path: &std::path::Path,
+    tenant: &uuid::Uuid,
+    outcome: &SeedOutcome,
+) {
+    let mut state = load_gap_ask_state(path);
+    if let Some(rec) = state.tenants.get_mut(&tenant.to_string()) {
+        rec.seed_outcome = outcome.describe();
+        rec.seed_not_bound = outcome.is_not_bound();
+        let _ = save_gap_ask_state(path, &state);
+    }
+}
+
+/// Run every [`GapAction::SeedDue`] in `actions`, sequentially. On success the
+/// tenant's stale upstream-rejection streak is reset (the credential it was
+/// earned against is gone). Returns each attempt's outcome.
+async fn run_due_seeds(
+    auth_manager: &crate::auth::AuthManager,
+    coord_base: &str,
+    device_id: &str,
+    actions: &[GapAction],
+    state_path: Option<&std::path::Path>,
+) -> Vec<(uuid::Uuid, SeedOutcome)> {
+    let mut results = Vec::new();
+    for action in actions {
+        let GapAction::SeedDue(tenant) = action else {
+            continue;
+        };
+        let outcome = seed_tenant_slot(auth_manager, coord_base, device_id, *tenant).await;
+        if outcome.succeeded() {
+            reset_upstream_rejections_for(Some(*tenant));
+            info!(
+                "device_jwt_refresher: seeded bound tenant {tenant}'s slot through coord's \
+                 per-binding door ({})",
+                outcome.describe()
+            );
+        } else {
+            warn!(
+                "device_jwt_refresher: seeding bound tenant {tenant} through coord's \
+                 per-binding door did not succeed — {}; the operator ask follows on the \
+                 next pass (no retry this lapse)",
+                outcome.describe()
+            );
+        }
+        if let Some(path) = state_path {
+            record_seed_outcome_at(path, tenant, &outcome);
+        }
+        results.push((*tenant, outcome));
+    }
+    results
 }
 
 /// Compose the two reads into a writable-key set, ABORTING on any UNKNOWN.
@@ -5906,6 +6339,17 @@ async fn refresher_loop(
             .as_ref()
             .ok()
             .map(|v| v.as_slice());
+        let mt_device_id = std::env::var("QONTINUI_MACHINE_ID")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string())
+            .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
+        let (coord_base, _coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
+        // Phase 7: the seed arm needs a device id, a coord base and SOMETHING
+        // to present; the presenter's usability is re-checked at call time.
+        let seed_enabled = mt_device_id.is_some()
+            && !coord_base.is_empty()
+            && binding_gap_asks_permitted(sweep_inputs.legacy_slot_present, slots_now);
         let gap_actions = ask_bound_tenant_gaps(
             &ask_gaps_from(&sweep_inputs),
             slots_now,
@@ -5916,8 +6360,19 @@ async fn refresher_loop(
             )
             .as_deref(),
             chrono::Utc::now().timestamp(),
+            seed_enabled,
         );
         settle_binding_gap_actions(Some(&api_state.app_handle), &gap_actions);
+        if let Some(did) = mt_device_id.as_deref() {
+            run_due_seeds(
+                &auth_manager,
+                &coord_base,
+                did,
+                &gap_actions,
+                binding_gap_ask_path().as_deref(),
+            )
+            .await;
+        }
         // Retire every upstream-verdict bucket this runner can no longer write
         // (a re-pair or an unpair), BEFORE the posture is derived from what is
         // left. Runs in BOTH branches because a re-pair can happen from either
@@ -5925,15 +6380,8 @@ async fn refresher_loop(
         // evidence — the half that replaced a guessed clock.
         sweep_unwritable_upstream_buckets(writable);
         if has_tenant_slots {
-            let mt_device_id = std::env::var("QONTINUI_MACHINE_ID")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| s.trim().to_string())
-                .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
             match mt_device_id {
                 Some(did) => {
-                    let (coord_base, _coord_base_source) =
-                        crate::coord_mcp::coord_base_url_with_source();
                     // The web-backend base, resolved exactly as the Cognito
                     // pair path below resolves it — the device-machine-key
                     // exchange lives there, and Phase 2's re-derive needs it.
@@ -12778,9 +13226,10 @@ mod tenant_slot_refresh_tests {
                 notified: true,
                 first_seen: 1_800_000_000,
                 reason: "r".into(),
+                ..Default::default()
             },
         );
-        save_gap_ask_state(&path, &state);
+        assert!(save_gap_ask_state(&path, &state));
         assert_eq!(load_gap_ask_state(&path), state, "it round-trips on disk");
 
         std::fs::write(&path, b"{not json").expect("corrupt it");
@@ -14175,5 +14624,567 @@ mod default_slot_recovery_tests {
             after.to_json()["lastRefreshOutcome"],
             serde_json::json!("needs-sign-in")
         );
+    }
+}
+
+#[cfg(test)]
+mod tenant_seed_arm_tests {
+    //! Phase 7 of plan
+    //! `2026-09-20-per-tenant-coord-credentials-and-a-workspace-tenant-pin`:
+    //! the seed arm that calls coord's per-binding door
+    //! (`POST /coord/devices/{id}/tenant-token`), against an in-process mock
+    //! coord. Hermetic: injected tokens, per-test credential stores and lapse
+    //! records, no live coord, no `~/.qontinui`.
+
+    use super::*;
+    use axum::{
+        extract::{Path, State},
+        http::{HeaderMap, StatusCode},
+        routing::post,
+        Json, Router,
+    };
+    use std::sync::{Arc, Mutex};
+
+    const DID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const ACCT: &str = "acct-seed";
+
+    fn b64url(b: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+    }
+
+    fn jwt_for(t: Option<uuid::Uuid>, exp: i64, sub: &str) -> String {
+        let header = b64url(b"{\"alg\":\"EdDSA\",\"typ\":\"JWT\"}");
+        let payload = match t {
+            Some(t) => format!("{{\"exp\":{exp},\"sub\":\"{sub}\",\"tenant_id\":\"{t}\"}}"),
+            None => format!("{{\"exp\":{exp},\"sub\":\"{sub}\"}}"),
+        };
+        format!(
+            "{header}.{}.{}",
+            b64url(payload.as_bytes()),
+            b64url(b"fake-sig")
+        )
+    }
+
+    fn future() -> i64 {
+        chrono::Utc::now().timestamp() + 3600
+    }
+
+    fn tenant(n: u8) -> uuid::Uuid {
+        uuid::Uuid::parse_str(&format!(
+            "{c}{c}{c}{c}{c}{c}{c}{c}-{c}{c}{c}{c}-4{c}{c}{c}-8{c}{c}{c}-{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}",
+            c = (b'a' + n) as char
+        ))
+        .expect("valid uuid")
+    }
+
+    fn test_auth_manager(name: &str) -> crate::auth::AuthManager {
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_tenant_seed");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{name}_{}.enc", uuid::Uuid::now_v7()));
+        let storage = crate::secure_storage::SecureStorage::with_path(path).expect("storage");
+        crate::auth::AuthManager::with_storage(storage)
+    }
+
+    fn gap_state_path(name: &str) -> std::path::PathBuf {
+        let dir = crate::test_env::process_scratch_dir("qontinui_test_tenant_seed_asks")
+            .join(format!("{name}_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir.join("binding_gap_asks.json")
+    }
+
+    fn gaps(ids: &[uuid::Uuid]) -> BindingGapReport {
+        BindingGapReport::Gaps(ids.iter().map(|t| t.to_string()).collect())
+    }
+
+    fn notified(actions: &[GapAction]) -> Vec<&serde_json::Value> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                GapAction::Notified { payload, .. } => Some(payload),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// One request the mock saw: (path device id, bearer, body tenant_id).
+    type Seen = (String, String, String);
+
+    #[derive(Clone)]
+    struct Mock {
+        /// What the door answers: (status, body). `None` body = mint a token
+        /// for the requested tenant.
+        answer: Arc<(u16, Option<String>)>,
+        seen: Arc<Mutex<Vec<Seen>>>,
+    }
+
+    async fn door(
+        State(m): State<Mock>,
+        Path(device_id): Path<String>,
+        h: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> (StatusCode, String) {
+        let bearer = h
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or("")
+            .to_string();
+        let requested = body["tenant_id"].as_str().unwrap_or("").to_string();
+        m.seen
+            .lock()
+            .unwrap()
+            .push((device_id, bearer, requested.clone()));
+        let (status, ref canned) = *m.answer;
+        let body = canned.clone().unwrap_or_else(|| {
+            let t = uuid::Uuid::parse_str(&requested).ok();
+            serde_json::json!({ "token": jwt_for(t, future(), "minted"), "tenant_id": requested })
+                .to_string()
+        });
+        (StatusCode::from_u16(status).expect("status"), body)
+    }
+
+    fn spawn_mock(
+        status: u16,
+        body: Option<String>,
+    ) -> (
+        String,
+        Arc<Mutex<Vec<Seen>>>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_h = seen.clone();
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = std_listener.local_addr().expect("addr").port();
+        std_listener.set_nonblocking(true).expect("nb");
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt");
+            rt.block_on(async move {
+                let state = Mock {
+                    answer: Arc::new((status, body)),
+                    seen: seen_h,
+                };
+                let app: Router = Router::new()
+                    .route("/coord/devices/{device_id}/tenant-token", post(door))
+                    .with_state(state);
+                let listener =
+                    tokio::net::TcpListener::from_std(std_listener).expect("tokio listener");
+                let _ = axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = rx.await;
+                    })
+                    .await;
+            });
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        (format!("http://127.0.0.1:{port}"), seen, tx)
+    }
+
+    /// A store holding ONE per-tenant slot for `presenter_tenant` and nothing
+    /// for the tenant being seeded.
+    fn store_with_presenter(
+        name: &str,
+        presenter_tenant: uuid::Uuid,
+    ) -> (crate::auth::AuthManager, String) {
+        let mgr = test_auth_manager(name);
+        let presenter = jwt_for(Some(presenter_tenant), future(), "presenter");
+        mgr.store_tenant_device_jwt(&presenter_tenant, &presenter)
+            .expect("seed presenter slot");
+        (mgr, presenter)
+    }
+
+    #[test]
+    fn seed_is_due_once_per_lapse_and_recorded_before_the_call_then_the_ask_follows() {
+        let path = gap_state_path("once_per_lapse");
+        let t = tenant(2);
+        let now = 1_800_000_000;
+
+        let first = plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now, true);
+        assert_eq!(first, vec![GapAction::SeedDue(t)], "seed first, no ask yet");
+        let rec = load_gap_ask_state(&path).tenants[&t.to_string()].clone();
+        assert!(
+            rec.seed_attempted,
+            "the attempt is persisted before the call"
+        );
+        assert!(!rec.notified);
+
+        // The attempt failed (any non-not_bound refusal): the next pass asks,
+        // and the ask names what the seed came to.
+        record_seed_outcome_at(
+            &path,
+            &t,
+            &SeedOutcome::Refused {
+                status: 503,
+                code: "bindings_unreadable".into(),
+            },
+        );
+        let second = plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now + 60, true);
+        let asks = notified(&second);
+        assert_eq!(asks.len(), 1, "{second:?}");
+        let reason = asks[0]["reason"].as_str().unwrap_or_default();
+        assert!(reason.contains("per-binding door"), "{reason}");
+        assert!(reason.contains("HTTP 503"), "{reason}");
+
+        // And never a second seed or a second ask in the same lapse.
+        let third = plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now + 120, true);
+        assert_eq!(third, vec![GapAction::Silent(t)]);
+    }
+
+    #[test]
+    fn a_crash_mid_call_never_produces_a_second_attempt_in_the_lapse() {
+        let path = gap_state_path("crash_mid_call");
+        let t = tenant(3);
+        let now = 1_800_000_000;
+        assert_eq!(
+            plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now, true),
+            vec![GapAction::SeedDue(t)]
+        );
+        // No outcome recorded (the process died mid-call): the next pass asks
+        // rather than seeding again.
+        let next = plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now + 60, true);
+        assert_eq!(notified(&next).len(), 1, "{next:?}");
+        assert!(!next.contains(&GapAction::SeedDue(t)));
+    }
+
+    #[test]
+    fn not_bound_opens_no_ask_because_pairing_would_recreate_the_binding() {
+        let path = gap_state_path("not_bound");
+        let t = tenant(4);
+        let now = 1_800_000_000;
+        plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now, true);
+        record_seed_outcome_at(
+            &path,
+            &t,
+            &SeedOutcome::Refused {
+                status: 403,
+                code: "not_bound".into(),
+            },
+        );
+        for k in 1..4 {
+            let pass = plan_gap_actions_at(
+                &path,
+                &gaps(&[t]),
+                Some(&[]),
+                Some(ACCT),
+                now + 60 * k,
+                true,
+            );
+            assert_eq!(pass, vec![GapAction::Silent(t)], "pass {k}");
+        }
+        // The lapse closes once the sidecar stops naming the tenant.
+        let closed = plan_gap_actions_at(&path, &gaps(&[]), Some(&[]), Some(ACCT), now + 600, true);
+        assert_eq!(
+            closed,
+            vec![GapAction::LapseClosed {
+                tenant: t,
+                slot_now_held: false
+            }]
+        );
+    }
+
+    #[test]
+    fn seed_disabled_is_exactly_the_phase_4_ask_pass() {
+        let t = tenant(5);
+        let now = 1_800_000_000;
+        let a = gap_state_path("disabled_a");
+        let b = gap_state_path("disabled_b");
+        let with_flag = plan_gap_actions_at(&a, &gaps(&[t]), Some(&[]), Some(ACCT), now, false);
+        let phase4 = ask_bound_tenant_gaps_at(&b, &gaps(&[t]), Some(&[]), Some(ACCT), now);
+        assert_eq!(with_flag, phase4);
+        assert_eq!(notified(&with_flag).len(), 1);
+        assert!(!load_gap_ask_state(&a).tenants[&t.to_string()].seed_attempted);
+    }
+
+    #[test]
+    fn pick_seed_presenter_never_presents_the_requested_tenant_or_a_mislabelled_slot() {
+        let (a, b, c) = (tenant(0), tenant(1), tenant(2));
+        let ja = jwt_for(Some(a), future(), "a");
+        let jb = jwt_for(Some(b), future(), "b");
+        let expired_b = jwt_for(Some(b), chrono::Utc::now().timestamp() - 3600, "b-old");
+
+        // The legacy slot wins when it claims another tenant.
+        assert_eq!(
+            pick_seed_presenter(Some(&ja), &[(b, jb.clone())], &c).as_deref(),
+            Some(ja.as_str())
+        );
+        // A legacy token for the REQUESTED tenant is never presented.
+        assert_eq!(
+            pick_seed_presenter(Some(&ja), &[(b, jb.clone())], &a).as_deref(),
+            Some(jb.as_str())
+        );
+        // A slot filed under one key but claiming another is not evidence.
+        assert_eq!(pick_seed_presenter(None, &[(a, jb.clone())], &c), None);
+        // Expired and claimless tokens are not usable presenters.
+        assert_eq!(pick_seed_presenter(None, &[(b, expired_b)], &c), None);
+        assert_eq!(
+            pick_seed_presenter(Some(&jwt_for(None, future(), "x")), &[], &c),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_seed_writes_only_the_requested_tenants_slot() {
+        let (presenter_t, want) = (tenant(0), tenant(1));
+        let (mgr, presenter) = store_with_presenter("seed_ok", presenter_t);
+        let (base, seen, stop) = spawn_mock(200, None);
+
+        let outcome = seed_tenant_slot(&mgr, &base, DID, want).await;
+        let _ = stop.send(());
+        assert_eq!(outcome, SeedOutcome::Seeded);
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "exactly one request");
+        assert_eq!(
+            seen[0],
+            (DID.to_string(), presenter.clone(), want.to_string())
+        );
+
+        let stored = mgr
+            .get_tenant_device_jwt(&want)
+            .unwrap()
+            .expect("the requested slot is seeded");
+        assert_eq!(crate::auth::jwt_tenant_claim(&stored), Some(want));
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&presenter_t).unwrap().as_deref(),
+            Some(presenter.as_str()),
+            "the presenter's slot is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_for_another_tenant_is_refused_and_not_persisted() {
+        let (presenter_t, want, other) = (tenant(0), tenant(1), tenant(2));
+        let (mgr, _) = store_with_presenter("seed_mismatch", presenter_t);
+        let body =
+            serde_json::json!({ "token": jwt_for(Some(other), future(), "wrong") }).to_string();
+        let (base, _seen, stop) = spawn_mock(200, Some(body));
+
+        let outcome = seed_tenant_slot(&mgr, &base, DID, want).await;
+        let _ = stop.send(());
+        assert_eq!(
+            outcome,
+            SeedOutcome::TenantMismatch {
+                returned: Some(other)
+            }
+        );
+        assert_eq!(mgr.get_tenant_device_jwt(&want).unwrap(), None);
+        assert_eq!(mgr.get_tenant_device_jwt(&other).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_is_one_request_no_retry_and_writes_nothing() {
+        let (presenter_t, want) = (tenant(0), tenant(1));
+        let (mgr, _) = store_with_presenter("seed_refused", presenter_t);
+        let (base, seen, stop) = spawn_mock(
+            403,
+            Some(r#"{"code":"not_bound","error":"not bound"}"#.to_string()),
+        );
+
+        let outcome = seed_tenant_slot(&mgr, &base, DID, want).await;
+        let _ = stop.send(());
+        assert!(outcome.is_not_bound(), "{outcome:?}");
+        assert!(!outcome.succeeded());
+        assert_eq!(seen.lock().unwrap().len(), 1, "no retry");
+        assert_eq!(mgr.get_tenant_device_jwt(&want).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn with_nothing_to_present_no_request_is_made() {
+        let want = tenant(1);
+        let mgr = test_auth_manager("seed_no_presenter");
+        // Only the requested tenant's own (expired) token exists.
+        mgr.store_tenant_device_jwt(
+            &want,
+            &jwt_for(Some(want), chrono::Utc::now().timestamp() - 3600, "old"),
+        )
+        .expect("store");
+        let (base, seen, stop) = spawn_mock(200, None);
+
+        let outcome = seed_tenant_slot(&mgr, &base, DID, want).await;
+        let _ = stop.send(());
+        assert_eq!(outcome, SeedOutcome::NoPresenter);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_slot_that_appeared_meanwhile_is_never_overwritten() {
+        let (presenter_t, want) = (tenant(0), tenant(1));
+        let (mgr, _) = store_with_presenter("seed_race", presenter_t);
+        let human = jwt_for(Some(want), future(), "human-paired");
+        mgr.store_tenant_device_jwt(&want, &human).expect("store");
+        let (base, _seen, stop) = spawn_mock(200, None);
+
+        let outcome = seed_tenant_slot(&mgr, &base, DID, want).await;
+        let _ = stop.send(());
+        assert_eq!(outcome, SeedOutcome::SlotAlreadyHeld);
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&want).unwrap().as_deref(),
+            Some(human.as_str())
+        );
+    }
+
+    #[test]
+    fn an_unwritable_lapse_record_means_no_seed_only_the_ask() {
+        // The record's parent is a regular FILE, so no write can land.
+        let dir = gap_state_path("unwritable")
+            .parent()
+            .expect("dir")
+            .to_path_buf();
+        let blocker = dir.join("not-a-dir");
+        std::fs::write(&blocker, b"x").expect("blocker");
+        let path = blocker.join("binding_gap_asks.json");
+        let t = tenant(3);
+        for k in 0..3 {
+            let pass = plan_gap_actions_at(
+                &path,
+                &gaps(&[t]),
+                Some(&[]),
+                Some(ACCT),
+                1_800_000_000 + k,
+                true,
+            );
+            assert!(
+                !pass.contains(&GapAction::SeedDue(t)),
+                "pass {k}: an unrecorded attempt must never be made: {pass:?}"
+            );
+            assert_eq!(notified(&pass).len(), 1, "pass {k}: {pass:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn run_due_seeds_resets_the_streak_on_success_and_records_each_outcome() {
+        let _lock = super::posture_test_lock();
+        let presenter_t = tenant(0);
+        // Fresh ids: the upstream-signal map is process-global.
+        let ok_t = uuid::Uuid::now_v7();
+        let (mgr, _) = store_with_presenter("run_due_ok", presenter_t);
+        let path = gap_state_path("run_due_ok");
+        note_coord_upstream_verdict(
+            Some(ok_t),
+            true,
+            401,
+            br#"{"error":"x","code":"token_revoked"}"#,
+        );
+        assert!(upstream_signal_for(Some(&ok_t.to_string())).consecutive_rejections > 0);
+        let planned = plan_gap_actions_at(
+            &path,
+            &gaps(&[ok_t]),
+            Some(&[]),
+            Some(ACCT),
+            1_800_000_000,
+            true,
+        );
+        assert_eq!(planned, vec![GapAction::SeedDue(ok_t)]);
+
+        let (base, seen, stop) = spawn_mock(200, None);
+        let results = run_due_seeds(&mgr, &base, DID, &planned, Some(&path)).await;
+        let _ = stop.send(());
+        assert_eq!(results, vec![(ok_t, SeedOutcome::Seeded)]);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(
+            upstream_signal_for(Some(&ok_t.to_string())).consecutive_rejections,
+            0,
+            "a seeded slot spends the old streak"
+        );
+        let rec = load_gap_ask_state(&path).tenants[&ok_t.to_string()].clone();
+        assert_eq!(rec.seed_outcome, "seeded");
+        assert!(!rec.seed_not_bound);
+
+        // A not_bound refusal is recorded as such, and leaves the streak alone.
+        let nb_t = uuid::Uuid::now_v7();
+        note_coord_upstream_verdict(
+            Some(nb_t),
+            true,
+            401,
+            br#"{"error":"x","code":"token_revoked"}"#,
+        );
+        let planned = plan_gap_actions_at(
+            &path,
+            &gaps(&[nb_t]),
+            Some(&[]),
+            Some(ACCT),
+            1_800_000_100,
+            true,
+        );
+        let (base, _seen, stop) = spawn_mock(
+            403,
+            Some(r#"{"code":"not_bound","error":"not_bound"}"#.into()),
+        );
+        let results = run_due_seeds(&mgr, &base, DID, &planned, Some(&path)).await;
+        let _ = stop.send(());
+        assert!(results[0].1.is_not_bound(), "{results:?}");
+        assert!(upstream_signal_for(Some(&nb_t.to_string())).consecutive_rejections > 0);
+        assert!(load_gap_ask_state(&path).tenants[&nb_t.to_string()].seed_not_bound);
+        reset_upstream_rejections_for(Some(nb_t));
+
+        // Actions with no SeedDue make no request.
+        let (base, seen, stop) = spawn_mock(200, None);
+        let none = run_due_seeds(&mgr, &base, DID, &[GapAction::Silent(nb_t)], Some(&path)).await;
+        let _ = stop.send(());
+        assert!(none.is_empty());
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unusable_2xx_and_a_dead_door_are_fallbacks_not_writes() {
+        let (presenter_t, want) = (tenant(0), tenant(1));
+        let (mgr, _) = store_with_presenter("seed_bad_body", presenter_t);
+        let (base, _seen, stop) = spawn_mock(200, Some("not json".into()));
+        let outcome = seed_tenant_slot(&mgr, &base, DID, want).await;
+        let _ = stop.send(());
+        assert!(
+            matches!(outcome, SeedOutcome::BadResponse(_)),
+            "{outcome:?}"
+        );
+
+        // Port 1 is privileged and unused: the connection is refused at once.
+        let port = 1;
+        let outcome = seed_tenant_slot(&mgr, &format!("http://127.0.0.1:{port}"), DID, want).await;
+        assert!(matches!(outcome, SeedOutcome::Transport(_)), "{outcome:?}");
+        assert_eq!(mgr.get_tenant_device_jwt(&want).unwrap(), None);
+    }
+
+    #[test]
+    fn a_long_or_multibyte_refusal_body_still_yields_a_code() {
+        let long = format!(
+            r#"{{"code":"not_bound","pad":"{}"}}"#,
+            "é".repeat(UPSTREAM_BODY_SCAN_BYTES)
+        );
+        // Over the scan bound the JSON is cut and does not parse, the cut
+        // never panics on a char boundary, and `not_bound` is still read.
+        assert_eq!(seed_refusal_code(&long), "not_bound");
+        let other = format!(
+            r#"{{"code":"device_not_paired","pad":"{}"}}"#,
+            "é".repeat(UPSTREAM_BODY_SCAN_BYTES)
+        );
+        assert_eq!(seed_refusal_code(&other), "unparsed");
+        assert_eq!(seed_refusal_code(r#"{"code":"not_bound"}"#), "not_bound");
+        assert_eq!(seed_refusal_code(r#"{"error":"forced"}"#), "forced");
+    }
+
+    /// The arm must never reach for `pair-cli` (it re-points the device's home
+    /// tenant and re-creates bindings): its only request is to the seed door.
+    #[test]
+    fn the_seed_arm_calls_only_the_per_binding_door() {
+        let src = include_str!("device_jwt_refresher.rs");
+        let start = src
+            .find("pub(crate) async fn seed_tenant_slot(")
+            .expect("seed_tenant_slot");
+        let rest = src.get(start..).expect("tail");
+        let body = rest
+            .get(..rest.find("\n}\n").expect("end of seed_tenant_slot"))
+            .expect("body");
+        assert!(body.contains("/coord/devices/{}/tenant-token"));
+        for forbidden in [
+            concat!("pair", "-cli"),
+            concat!("pair_with", "_auth"),
+            concat!("machine-credential", "/exchange"),
+        ] {
+            assert!(!body.contains(forbidden), "seed arm names {forbidden}");
+        }
     }
 }
