@@ -362,6 +362,16 @@ pub struct TransitionBody {
 /// as `null` or `""`. coord's upsert replaces `metadata` wholesale, so for a
 /// plan-backed unit the plan file is the single author of its area: a plan
 /// that declares none sends none.
+///
+/// `file_status` and `file_pr_refs` carry the plan file's own delivery CLAIM —
+/// its parsed status word (verbatim, e.g. `"shipped"`) and the PR references
+/// its status blockquote names ([`super::parser::extract_pr_refs`]). Both keys
+/// are ALWAYS present (`file_pr_refs` may be `[]`). They are metadata, never a
+/// status: [`COORD_DERIVED_STATUSES`] still withholds a derived word from the
+/// status field. The plan's coord half (qontinui-coord #2680) is what reads them,
+/// as evidence to confirm rather than a verdict. Plan
+/// `2026-09-20-coord-reads-a-clean-not-delivered-for-work-that-landed-without-a-plan-trailer`
+/// Phase 4.
 pub fn build_metadata(u: &ParsedWorkUnit) -> serde_json::Value {
     let mut m = serde_json::json!({
         "depends_on": u.depends_on,
@@ -372,6 +382,7 @@ pub fn build_metadata(u: &ParsedWorkUnit) -> serde_json::Value {
             .collect::<Vec<_>>(),
         "source_path": u.source_path,
     });
+    insert_file_claim(&mut m, u);
     if let Some(area) = &u.area {
         m["area"] = serde_json::Value::String(area.clone());
     }
@@ -1100,6 +1111,13 @@ pub async fn push_work_unit_with_status_write<S: WorkUnitSink + ?Sized>(
     })
 }
 
+/// Add the plan file's own claim — `file_status` and `file_pr_refs` — to a
+/// metadata object. Shared by [`build_metadata`] and [`push_archive_metadata`].
+fn insert_file_claim(m: &mut serde_json::Value, u: &ParsedWorkUnit) {
+    m["file_status"] = serde_json::Value::String(u.status.clone());
+    m["file_pr_refs"] = serde_json::json!(u.pr_refs);
+}
+
 /// The archive stamp as an RFC 7396 `metadata_patch`: `archive_path`, plus the
 /// plan's `area` — `null` (delete) when its status block declares none, so the
 /// plan file stays the sole author of `area`. A patch, never a wholesale
@@ -1117,8 +1135,8 @@ fn archive_metadata_patch(u: &ParsedWorkUnit) -> serde_json::Value {
 ///
 /// This is the D4 guard expressed in code: the archive scan is a metadata-only
 /// writer. It records where a plan was archived to (`u.source_path`, the
-/// archived file's filesystem path) as provenance and does **nothing else**. In
-/// particular it never emits a status transition — not even when the archived
+/// archived file's filesystem path) as provenance, plus the plan's `area` and its
+/// own claim, all as metadata. It never emits a status transition — not even when the archived
 /// file's `> **Status:` line parses to `shipped` (coord-derived, not settable)
 /// or the non-vocabulary `archived` (which coord would silently classify `Free`
 /// and *accept*). Terminal state is owned by coord's derive engine; a second
@@ -1126,11 +1144,38 @@ fn archive_metadata_patch(u: &ParsedWorkUnit) -> serde_json::Value {
 ///
 /// A plan normally lives in exactly one directory (active *or* archive), so this
 /// does not contend with the full-metadata upsert the active-dir reconcile
-/// writes for the same slug.
+/// writes for the same slug. It also carries the plan file's own claim: an
+/// archived plan stamped SHIPPED is exactly the unit whose claim coord most
+/// needs to see. For a slug that IS in both directories, use
+/// [`push_archive_metadata_without_claim`].
 pub async fn push_archive_metadata<S: WorkUnitSink + ?Sized>(
     sink: &S,
     u: &ParsedWorkUnit,
     scope: TenantScope,
+) -> Result<()> {
+    let mut patch = archive_metadata_patch(u);
+    insert_file_claim(&mut patch, u);
+    upsert_archive_stamp(sink, u, scope, patch).await
+}
+
+/// [`push_archive_metadata`] for a slug whose claim the active directory owns, or
+/// might own. The archive pass runs after the active one, so a stale archive copy
+/// reading SHIPPED would otherwise overwrite the active copy's `in_progress` claim
+/// every cycle and make coord read a delivery claim the current plan file does not
+/// make. Omitting the keys leaves the stored claim in place (RFC 7396).
+pub async fn push_archive_metadata_without_claim<S: WorkUnitSink + ?Sized>(
+    sink: &S,
+    u: &ParsedWorkUnit,
+    scope: TenantScope,
+) -> Result<()> {
+    upsert_archive_stamp(sink, u, scope, archive_metadata_patch(u)).await
+}
+
+async fn upsert_archive_stamp<S: WorkUnitSink + ?Sized>(
+    sink: &S,
+    u: &ParsedWorkUnit,
+    scope: TenantScope,
+    patch: serde_json::Value,
 ) -> Result<()> {
     sink.upsert(
         &UpsertBody {
@@ -1139,7 +1184,7 @@ pub async fn push_archive_metadata<S: WorkUnitSink + ?Sized>(
             // NEVER a status write from the archive scan (D4).
             status: None,
             metadata: None,
-            metadata_patch: Some(archive_metadata_patch(u)),
+            metadata_patch: Some(patch),
             by_actor: Some(ADAPTER_ACTOR.to_string()),
             // Harmless under coord's COALESCE, and it means a plan that only ever
             // exists in the archive still gets dated.
@@ -1514,7 +1559,7 @@ impl WorkUnitSink for HttpWorkUnitSink {
 
 #[cfg(test)]
 mod tests {
-    use super::super::parser::{ParsedPhase, ParsedWorkUnit};
+    use super::super::parser::{ParsedPhase, ParsedWorkUnit, PrRef};
     use super::*;
     use std::sync::Mutex;
 
@@ -1526,6 +1571,7 @@ mod tests {
             depends_on: vec!["2026-01-01-dep".to_string()],
             area: None,
             area_rejected: None,
+            pr_refs: vec![],
             phases: vec![ParsedPhase {
                 index: 1,
                 name: "Phase 1 — x".to_string(),
@@ -1712,6 +1758,34 @@ mod tests {
         assert_eq!(m["depends_on"][0], "2026-01-01-dep");
         assert_eq!(m["phases"][0]["index"], 1);
         assert_eq!(m["source_path"], "plans/s.md");
+        // The file's own claim: both keys always present, `[]` when no refs.
+        assert_eq!(m["file_status"], serde_json::json!("vetted"));
+        assert_eq!(m["file_pr_refs"], serde_json::json!([]));
+
+        // A SHIPPED stamp naming PRs: the word rides as metadata verbatim —
+        // a claim, not a status — with the refs in wire shape and order.
+        let shipped = ParsedWorkUnit {
+            pr_refs: vec![
+                PrRef {
+                    repo: "qontinui-runner".to_string(),
+                    pr_number: 164,
+                },
+                PrRef {
+                    repo: "qontinui/qontinui-web".to_string(),
+                    pr_number: 706,
+                },
+            ],
+            ..unit("s", "shipped")
+        };
+        let m = build_metadata(&shipped);
+        assert_eq!(m["file_status"], serde_json::json!("shipped"));
+        assert_eq!(
+            m["file_pr_refs"],
+            serde_json::json!([
+                {"repo": "qontinui-runner", "pr_number": 164},
+                {"repo": "qontinui/qontinui-web", "pr_number": 706},
+            ])
+        );
     }
 
     /// `area` rides in `metadata` when the plan declares one, and the KEY is
@@ -1734,8 +1808,8 @@ mod tests {
         assert_eq!(m["source_path"], "plans/s.md");
     }
 
-    /// The archive stamp is a wholesale `metadata` replacement too, so it must
-    /// carry a declared area rather than erase it — and omit it when `None`.
+    /// The archive stamp must carry a declared area rather than erase it — and
+    /// send an explicit `null` when `None`.
     #[tokio::test]
     async fn archive_stamp_keeps_a_declared_area() {
         let sink = FakeSink::default();
@@ -1755,6 +1829,10 @@ mod tests {
         let first = ups[0].metadata_patch.as_ref().unwrap();
         assert_eq!(first["area"], serde_json::json!("ci-runners"));
         assert_eq!(first["archive_path"], serde_json::json!(u.source_path));
+        // The archive stamp carries the file's claim too — never a status.
+        assert_eq!(first["file_status"], serde_json::json!("shipped"));
+        assert_eq!(first["file_pr_refs"], serde_json::json!([]));
+        assert!(ups[0].status.is_none());
         // Undeclared area is an explicit null (RFC 7396 delete).
         let second = ups[1].metadata_patch.as_ref().unwrap();
         assert!(second["area"].is_null());

@@ -79,6 +79,24 @@ pub struct ParsedPhase {
     pub name: String,
 }
 
+/// One pull-request reference named in a plan's status blockquote.
+///
+/// Serialized verbatim into work-unit `metadata.file_pr_refs` as
+/// `{"repo": …, "pr_number": …}`. `repo` is exactly as the plan wrote it —
+/// `owner/name` from a GitHub URL or an `owner/name#n` ref, or a bare `name`
+/// from `name#n`. Resolving a bare name to its owner is coord's job
+/// (`repo_resolve::resolve_repo`), not the parser's: guessing an owner here
+/// would turn an unresolvable name into a confident wrong one. Plan
+/// `2026-09-20-coord-reads-a-clean-not-delivered-for-work-that-landed-without-a-plan-trailer`
+/// Phase 4.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PrRef {
+    /// `owner/name` or bare `name`, as written.
+    pub repo: String,
+    /// The PR number — always `> 0`.
+    pub pr_number: u32,
+}
+
 /// The pure result of parsing a plan markdown file. No IO, no clock, no env.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedWorkUnit {
@@ -100,6 +118,10 @@ pub struct ParsedWorkUnit {
     /// rather than logged here so the parse stays pure; the work-unit reconcile
     /// is the one place that warns about it.
     pub area_rejected: Option<AreaRejection>,
+    /// Pull-request references the status blockquote names — the plan file's
+    /// own delivery CLAIM, deduped and in document order. Pushed as work-unit
+    /// `metadata.file_pr_refs`; see [`extract_pr_refs`].
+    pub pr_refs: Vec<PrRef>,
     /// Phase structure -> sub-units, in document order, deduped by index.
     pub phases: Vec<ParsedPhase>,
     /// Provenance back-link: the source file path the caller supplied.
@@ -211,7 +233,12 @@ fn normalize_status(raw: &str) -> String {
 /// an unknown stamp — an unrecognized status flows through verbatim
 /// (normalized), unlike coord which gated against its fixed vocabulary.
 fn parse_status_value(stamp_remainder: &str, conv: &PlanConvention) -> String {
-    let mut s = stamp_remainder.trim().to_string();
+    // `**Status:** SHIPPED` closes the bold span before the value, not after it.
+    let mut s = stamp_remainder
+        .trim()
+        .trim_start_matches('*')
+        .trim_start()
+        .to_string();
     // Drop a trailing `**` if the stamp closes the bold span on this line.
     if let Some(stripped) = s.strip_suffix("**") {
         s = stripped.trim().to_string();
@@ -317,6 +344,132 @@ fn extract_depends_on(body: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// `github.com/<owner>/<repo>/pull/<n>` (host matched case-insensitively,
+/// `www.` allowed). The left boundary refuses another host that merely ends the
+/// same way (`notgithub.com`, `gist.github.com`). The trailing `\b` refuses a
+/// number glued to a word character (`/pull/706abc` is not PR 706); a following
+/// `/`, `#`, `)` or `.` is fine (`/pull/706/files`, `/pull/706#discussion_r1`).
+static PR_URL: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?:^|[^A-Za-z0-9.-])(?i:(?:www\.)?github\.com)/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pull/([0-9]+)\b",
+    )
+    .expect("valid regex")
+});
+
+/// `<repo>#<n>` where `<repo>` is `[A-Za-z0-9._-]+` that starts and ends with an
+/// alphanumeric, optionally `owner/` first (`[A-Za-z0-9-]+`, GitHub's own owner
+/// grammar, so a host like `example.com/page#12` is not an owner).
+///
+/// The `regex` crate has no look-behind, so the left boundary is a consumed
+/// group: start of line, or one character that cannot continue a path. `/` is
+/// deliberately NOT a boundary, so a URL's path tail (`https://host/page#12`)
+/// or a file path (`plans/x.md#phase-2`) does not start a ref mid-path; `#` is
+/// not one either, so `a#b#3` is not read as `b#3`; nor are `?` and `&`, so a
+/// URL's bare query (`?foo#12`) is not read as `foo#12`. `=` stays a boundary
+/// because `coord:downstream-of=qontinui/qontinui-web#388` is a real ref, so
+/// `?q=foo#12` does still yield one, and coord skips a repo it cannot resolve.
+/// The same consumed boundary means the second ref of a joined pair
+/// (`coord#787/runner#661`) is not read. The number must be all digits up to a
+/// word boundary, so a bare markdown anchor (`#section`) never yields one;
+/// [`continues_as_hyphenated_word`] covers `README#2-setup`.
+static PR_HASH_REF: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?:^|[^A-Za-z0-9._/#?&-])((?:[A-Za-z0-9-]+/)?[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)#([0-9]+)\b",
+    )
+    .expect("valid regex")
+});
+
+/// A number followed by `-<word>` (`README#2-setup`) is a heading anchor, not a
+/// PR. `\b` accepts the hyphen, and the `regex` crate has no look-ahead; consuming
+/// the next character in [`PR_HASH_REF`] would eat the left boundary of an
+/// adjacent ref, so this is checked on the text after the match instead.
+fn continues_as_hyphenated_word(after: &str) -> bool {
+    let mut chars = after.chars();
+    chars.next() == Some('-') && chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+}
+
+/// A `<repo>#<n>` whose repo is a markdown file (`notes.md#2`) is a heading
+/// anchor that happens to be numeric, not a PR.
+fn is_markdown_path(repo: &str) -> bool {
+    let lower = repo.to_ascii_lowercase();
+    lower.ends_with(".md") || lower.ends_with(".markdown")
+}
+
+/// Extract PR references from the status blockquote — the same block, and the
+/// same confinement, as [`extract_depends_on`]. A body-wide scan would read
+/// every PR a plan's prose merely DISCUSSES (prior art, incidents, the PR that
+/// introduced a bug) as a delivery claim.
+///
+/// Exactly three spellings count, and no others:
+///
+/// * `github.com/<owner>/<repo>/pull/<n>` → repo `owner/repo`;
+/// * `<repo>#<n>` → repo kept as written;
+/// * `<owner>/<repo>#<n>` → repo kept as written. The plan names only the first
+///   two, but about 900 status-block refs in the plan corpus use this one, and
+///   dropping them would lose exactly the unambiguous refs.
+///
+/// A spaced `<repo> #<n>` is not a ref: the plan excludes it.
+///
+/// A bare `#<n>` names no repo and is not a ref. A commit SHA is never a ref.
+/// `<n>` must be a positive integer that fits a `u32`; anything else is
+/// dropped. Deduped on `(repo, pr_number)`, in document order (line, then
+/// column). Pure: logs nothing.
+pub fn extract_pr_refs(body: &str) -> Vec<PrRef> {
+    let mut out: Vec<PrRef> = Vec::new();
+    for line in status_blockquote_lines(body) {
+        let mut found: Vec<(usize, PrRef)> = Vec::new();
+        for c in PR_URL.captures_iter(line) {
+            let (Some(whole), Some(owner), Some(repo), Some(n)) =
+                (c.get(0), c.get(1), c.get(2), c.get(3))
+            else {
+                continue;
+            };
+            if let Some(pr_number) = positive_u32(n.as_str()) {
+                found.push((
+                    whole.start(),
+                    PrRef {
+                        repo: format!("{}/{}", owner.as_str(), repo.as_str()),
+                        pr_number,
+                    },
+                ));
+            }
+        }
+        for c in PR_HASH_REF.captures_iter(line) {
+            let (Some(repo), Some(n)) = (c.get(1), c.get(2)) else {
+                continue;
+            };
+            if is_markdown_path(repo.as_str())
+                || line
+                    .get(n.end()..)
+                    .is_some_and(continues_as_hyphenated_word)
+            {
+                continue;
+            }
+            if let Some(pr_number) = positive_u32(n.as_str()) {
+                found.push((
+                    repo.start(),
+                    PrRef {
+                        repo: repo.as_str().to_string(),
+                        pr_number,
+                    },
+                ));
+            }
+        }
+        found.sort_by_key(|(pos, _)| *pos);
+        for (_, r) in found {
+            if !out.contains(&r) {
+                out.push(r);
+            }
+        }
+    }
+    out
+}
+
+/// `s` (all ASCII digits by construction) as a PR number: `> 0` and fits `u32`.
+fn positive_u32(s: &str) -> Option<u32> {
+    s.parse::<u32>().ok().filter(|n| *n > 0)
 }
 
 /// coord's own area grammar, `[a-z0-9]+(-[a-z0-9]+)*`: non-empty, lowercase
@@ -1142,6 +1295,7 @@ pub fn parse_work_unit(
         depends_on: extract_depends_on(body),
         area,
         area_rejected,
+        pr_refs: extract_pr_refs(body),
         phases: detect_phases(body),
         source_path: source_path.to_string(),
         content: body.to_string(),
@@ -1299,6 +1453,175 @@ mod tests {
         // A stem mentioned in the body (not the status block) is NOT a dep.
         let body = "# T\n\n> **Status: vetted**\n\nSee 2026-01-01-some-other-plan in the body.\n";
         assert!(parse(body).depends_on.is_empty());
+    }
+
+    // --- pr_refs ---------------------------------------------------------------
+
+    fn pr(repo: &str, pr_number: u32) -> PrRef {
+        PrRef {
+            repo: repo.to_string(),
+            pr_number,
+        }
+    }
+
+    /// The plan's Phase 4 fixture: a status block naming a bare `<repo>#<n>`
+    /// and a GitHub pull URL yields both, in document order.
+    #[test]
+    fn pr_refs_from_status_block_bare_ref_and_url() {
+        let body = "# T\n\n> **Status: SHIPPED 2026-09-01** — qontinui-runner#164, and\n> https://github.com/qontinui/qontinui-web/pull/706.\n\nBody.\n";
+        assert_eq!(
+            parse(body).pr_refs,
+            vec![pr("qontinui-runner", 164), pr("qontinui/qontinui-web", 706)]
+        );
+    }
+
+    /// The host is matched case-insensitively (`GitHub.com` in a pasted URL);
+    /// the owner/repo keep the case they were written in.
+    #[test]
+    fn pr_refs_url_host_is_case_insensitive() {
+        let body = "> **Status: SHIPPED** https://GitHub.com/qontinui/qontinui-web/pull/9\n";
+        assert_eq!(parse(body).pr_refs, vec![pr("qontinui/qontinui-web", 9)]);
+    }
+
+    /// The SAME strings below the blockquote are prose, not a claim. Mutation
+    /// proof: widening [`extract_pr_refs`] to scan `body.lines()` makes this
+    /// fail.
+    #[test]
+    fn pr_refs_ignore_the_same_strings_in_the_body() {
+        let body = "# T\n\n> **Status: SHIPPED 2026-09-01**\n> no refs here.\n\nqontinui-runner#164 and https://github.com/qontinui/qontinui-web/pull/706 are discussed.\n> a later quote: qontinui-coord#9\n";
+        assert!(parse(body).pr_refs.is_empty(), "{:?}", parse(body).pr_refs);
+    }
+
+    /// Two loops find the refs, so document order on one line comes from the
+    /// sort, not from the order of the loops. Mutation proof: dropping
+    /// `found.sort_by_key` puts the URL first and fails this.
+    #[test]
+    fn pr_refs_keep_document_order_within_a_line() {
+        let body = "> **Status: shipped** qontinui-web#7 https://github.com/o/r/pull/5 x#8\n";
+        assert_eq!(
+            parse(body).pr_refs,
+            vec![pr("qontinui-web", 7), pr("o/r", 5), pr("x", 8)]
+        );
+    }
+
+    /// `**Status:** SHIPPED` puts the closing `**` before the value. Mutation
+    /// proof: dropping the `trim_start_matches` makes the status empty.
+    #[test]
+    fn status_closed_before_its_value_parses() {
+        let parsed = parse("> **Status:** SHIPPED (2026-10-24) qontinui-web#1976\n");
+        assert_eq!(parsed.status, "shipped");
+        assert_eq!(parsed.pr_refs, vec![pr("qontinui-web", 1976)]);
+    }
+
+    /// A host that merely ends in `github.com` is not GitHub; `www.` is.
+    #[test]
+    fn pr_refs_url_host_has_a_left_boundary() {
+        for body in [
+            "> **Status: shipped** notgithub.com/o/r/pull/5\n",
+            "> **Status: shipped** https://gist.github.com/o/r/pull/5\n",
+        ] {
+            assert!(parse(body).pr_refs.is_empty(), "{body:?}");
+        }
+        let body = "> **Status: shipped** https://www.github.com/o/r/pull/5\n";
+        assert_eq!(parse(body).pr_refs, vec![pr("o/r", 5)]);
+    }
+
+    /// Mutation proof for each: dropping `continues_as_hyphenated_word`, adding
+    /// `.` to the owner class, restoring `?` as a boundary or letting the repo
+    /// end in punctuation makes the matching input yield a ref.
+    #[test]
+    fn pr_refs_reject_shapes_that_only_resemble_a_ref() {
+        for body in [
+            // a numbered heading anchor
+            "> **Status: shipped** README#2-setup\n",
+            // a long-form markdown file
+            "> **Status: shipped** notes.markdown#2\n",
+            // `_` neither starts a repo nor bounds one
+            "> **Status: shipped** _foo#1\n",
+            // a host is not an owner
+            "> **Status: shipped** example.com/page#12\n",
+            // a URL query is not a boundary
+            "> **Status: shipped** https://example.com/a?foo#12 and ?a&foo#13\n",
+            // punctuation is not a repo's first or last character
+            "> **Status: shipped** post-#277 and ...qontinui-web#5\n",
+        ] {
+            assert!(
+                parse(body).pr_refs.is_empty(),
+                "{body:?} -> {:?}",
+                parse(body).pr_refs
+            );
+        }
+    }
+
+    /// The right-hand check reads the text after the match, so two adjacent
+    /// refs still both count: a consumed right boundary would lose the second.
+    #[test]
+    fn pr_refs_adjacent_refs_both_count() {
+        let body = "> **Status: shipped** qontinui-web#7 qontinui-runner#8, a.b_c#9-\n";
+        assert_eq!(
+            parse(body).pr_refs,
+            vec![
+                pr("qontinui-web", 7),
+                pr("qontinui-runner", 8),
+                pr("a.b_c", 9)
+            ]
+        );
+    }
+
+    #[test]
+    fn pr_refs_owner_qualified_hash_ref_kept_as_written() {
+        let body = "> **Status: shipped** (qontinui/qontinui-coord#2309)\n";
+        assert_eq!(
+            parse(body).pr_refs,
+            vec![pr("qontinui/qontinui-coord", 2309)]
+        );
+    }
+
+    #[test]
+    fn pr_refs_reject_anchors_fragments_bare_hashes_and_shas() {
+        for body in [
+            // a markdown anchor into a plan file
+            "> **Status: shipped** see plans/x.md#phase-2\n",
+            // a numeric anchor on a markdown file
+            "> **Status: shipped** see notes.md#2\n",
+            // a bare `#<n>` names no repo
+            "> **Status: shipped** #12\n",
+            "> **Status: shipped** (#12)\n",
+            // a URL fragment, numeric or not
+            "> **Status: shipped** https://example.com/page#12 and https://example.com/a#top\n",
+            // a SHA is never a ref
+            "> **Status: shipped** in 5924b76fa\n",
+            // not a positive u32
+            "> **Status: shipped** qontinui-runner#0 qontinui-runner#99999999999\n",
+            // a number glued to a word character
+            "> **Status: shipped** qontinui-runner#12abc github.com/o/r/pull/7x\n",
+            // a `#` inside a token does not open a second ref
+            "> **Status: shipped** a#b#3\n",
+        ] {
+            assert!(
+                parse(body).pr_refs.is_empty(),
+                "{body:?} -> {:?}",
+                parse(body).pr_refs
+            );
+        }
+    }
+
+    #[test]
+    fn pr_refs_dedupe_and_preserve_document_order() {
+        let body = "> **Status: shipped** qontinui-coord#5, qontinui-runner#164\n> https://github.com/qontinui/qontinui-web/pull/706/files qontinui-runner#164 qontinui-coord#5\n";
+        assert_eq!(
+            parse(body).pr_refs,
+            vec![
+                pr("qontinui-coord", 5),
+                pr("qontinui-runner", 164),
+                pr("qontinui/qontinui-web", 706)
+            ]
+        );
+    }
+
+    #[test]
+    fn pr_refs_absent_without_a_status_block() {
+        assert!(parse("# T\n\nqontinui-runner#164\n").pr_refs.is_empty());
     }
 
     #[test]
