@@ -1075,8 +1075,13 @@ async fn the_action_budget_is_never_exceeded() {
 
 #[tokio::test]
 async fn the_wall_clock_budget_stops_the_run() {
+    // 900 ms per action and a two-second budget: the start URL leaves 1.1 s,
+    // enough for the look's ACTION_SETTLE, and the first activation leaves
+    // 0.2 s, which the next look's settle finds too little. (A tick of a whole
+    // second would leave exactly ACTION_SETTLE after the start URL, and the
+    // look's deadline, on real time, is always a hair under it.)
     let mut app = SimApp::site();
-    app.tick = Duration::from_secs(1);
+    app.tick = Duration::from_millis(900);
     let o = run(&mut app, &request(home(), 60, 5, 2)).await;
     assert_eq!(
         o.stopped_because,
@@ -2917,12 +2922,15 @@ fn a_failed_attempt_is_never_relabelled_budget_exhausted() {
 
 #[tokio::test]
 async fn an_attempt_the_time_budget_cuts_short_is_budget_exhausted() {
-    // One second per action and a three-second budget: the start URL, one
+    // 900 ms per action and a three-second budget: the start URL, one
     // activation, then the next entry's route back through the start URL —
-    // whose look finds the time spent. That entry was ATTEMPTED, but only the
-    // budget kept it from the run, so it reads budget_exhausted.
+    // whose look finds too little time left for its ACTION_SETTLE. That entry
+    // was ATTEMPTED, but only the budget kept it from the run, so it reads
+    // budget_exhausted. (The tick is under a second so each earlier look has
+    // more than ACTION_SETTLE left: its deadline runs on real time, so a
+    // remainder of exactly ACTION_SETTLE is always cut short.)
     let mut app = SimApp::site();
-    app.tick = Duration::from_secs(1);
+    app.tick = Duration::from_millis(900);
     let o = run(&mut app, &request(home(), 60, 5, 3)).await;
     assert_eq!(
         o.stopped_because,
@@ -3333,7 +3341,10 @@ async fn a_client_that_disconnects_does_not_stop_the_run_and_the_claim_lasts_unt
         .await
         .is_err());
     drop(request);
-    assert!(RunGuard::claim(app).is_none(), "the run still holds the app");
+    assert!(
+        RunGuard::claim(app).is_none(),
+        "the run still holds the app"
+    );
 
     release.notify_one();
     tokio::time::timeout(Duration::from_secs(5), async {
