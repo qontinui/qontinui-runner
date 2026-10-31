@@ -1,0 +1,94 @@
+# runner_close_sites.txt — every fn that reaches the close of a terminal pane, and its class
+# (plan 2026-10-28-one-session-lifecycle-authority, Phase 14 — architecture node R0a, §3.8,
+#  round items RV5-1, NC5-1, NC6-3; modelled on runner_spawn_sites.txt)
+#
+# A "close site" is a non-test fn that calls a close primitive —
+#   TerminalManager::close        `.close(<id>)` on a manager-shaped receiver, or `self.close(<id>)`
+#                                 inside an `impl … TerminalManager` (the exact receiver shapes are
+#                                 in runner_close_sites.rs, `close_families`)
+#   TerminalManager::close_all    `.close_all(`
+#   TerminalManager::graceful_exit   `.graceful_exit(` (and the session-level graceful_exit_then /
+#                                 graceful_exit_driven it drives)
+#   a session-level close         `.close_with_deadline(`, `.close_kill_only(`,
+#                                 `.close_after_graceful_exit(`, and `session.close()` / `self.close()`
+#                                 under terminal/ — every one `pub(super)`, so callable from
+#                                 crate::terminal only (NC6-3)
+#   a relay end                   the `"type": "remote_terminal_end"` frame a SOURCE sends
+# — or that calls a `helper` row's token below. The close primitives' own bodies are not sites
+# (PRIMITIVE_IMPLS in runner_close_sites.rs): their callers carry the class. Pinned by
+#     runner_close_sites::every_close_site_is_listed_and_no_row_is_a_ghost
+# (a new close site is RED until it is classified here; a row naming no current site is red too),
+#     runner_close_sites::no_operator_close_is_borrowable_through_either_ui_bridge_route
+# (whose twins an_allowlisted_operator_close_row_is_caught and
+#  the_proxy_check_is_per_site_not_by_name prove both of its halves can fail), and
+#     runner_close_sites::the_session_level_close_entry_points_are_terminal_only
+#
+# Columns:  file (relative to src/) | fn | class | detail
+#
+# class (architecture §3.8) / detail:
+#   product      the lifecycle's own close: the Closer (from Phase 93), and until then the wind-down
+#                executor's arms, which R0a REFUSES `no_close_authority` on any live claude.
+#                detail = what it is.
+#   operator     an operator twin (`operator_terminal_close`, `operator_remote_session_end`, R0b), or a
+#                target's arm for an end or close stamped `origin: user_session` (P6f-1). None exists
+#                yet. CHECKED: the fn is NOT on the POST /ui-bridge/invoke/<name> allowlist (by name),
+#                and NO code of the POST /ui-bridge/tauri/invoke proxy calls it (per site — the
+#                proxy's arms are their own implementations, NC5-1). detail = what it is.
+#   webview      a plain Tauri command the webview calls programmatically: never D3, since it cannot
+#                tell the operator's gesture from the webview's own close. detail = what it is.
+#   agent        a door any local process reaches: an HTTP route, the UI Bridge proxy, the steward
+#                stop. Never read as the operator's. detail = the door.
+#   relay        a target's close or end arriving over the relay without the user-session stamp:
+#                never D3. detail = the frame.
+#   runner_exit  a close at runner shutdown — the next boot's restore rule decides (§9.4).
+#                detail = what it is.
+#   exempt       a close that ends no session's work: no live claude in the pane, or a terminal never
+#                handed to a session. detail = WHY (and the probe it rests on, where there is one).
+#   helper       a shared close recipe, not a door. detail = the call token through which its callers
+#                reach it; every production caller of that token is itself a site and needs a row.
+
+# ── the graceful-exit primitive's callers — all refused `no_close_authority` on a live claude (R0a)
+session/wind_down_executor.rs | wind_down_exit | helper | wind_down_exit(
+session/wind_down_executor.rs | wind_down_one | product | the wind-down executor's ONE pane reach, for both arms — the drain arm and runner#2426's finished_close — through `TerminalManager::graceful_exit` with no CloseAuthority; refused on a live claude until the Closer (Phase 93)
+mcp/steward.rs | stop_at_boundary | helper | stop_at_boundary(
+mcp/steward.rs | steward_stop_handler | agent | POST /steward/{kind}/stop: the default arm is the `TerminalManager::close` kill; `?at=boundary` is the graceful exit (`stop_at_boundary`), refused `no_close_authority` on a live claude
+mcp/debug_graceful_exit.rs | graceful_exit_door | helper | graceful_exit_door(
+mcp/debug_graceful_exit.rs | graceful_exit_handler | agent | POST /__debug/terminals/{id}/graceful-exit (dev-profile builds): the graceful exit with no CloseAuthority, refused on a live claude
+mcp/backend_relay.rs | end_admitted_terminal | helper | end_admitted_terminal(
+mcp/backend_relay.rs | handle_terminal_end | relay | TARGET `terminal_end` from a source device under an attach grant (no user-session stamp): graceful → refused `no_close_authority` on a live claude, `NoLiveClaude` → the bare shell's close; `force` → `tm.close`
+
+# ── the relay's other closes
+mcp/backend_relay.rs | handle_terminal_close | relay | TARGET `terminal_close` from the relay — qontinui-web's user-session terminal path, which carries no `origin: user_session` stamp before P6f-1
+mcp/backend_relay.rs | handle_inbound | exempt | a terminal never handed to a session: a remote create whose `terminal_created` reply could not be delivered (`deliver_create_reply`), closed before any source learned its id
+mcp/backend_relay.rs | handle_terminal_create | exempt | a terminal never handed to a session: a remote create whose coord registration failed (`settle_remote_registration`), closed and the create refused before any reply
+mcp/remote_create_reaper.rs | close_terminal | exempt | a terminal never handed to a session: a remote create no source attached to within the deadline — reaped ONLY after `close_through`'s probe finds a bare shell; a live or unprovable claude is HELD, never closed (m5-2)
+mcp/backend_relay.rs | register_remote_created_session | exempt | the remote-create pane's on-exit hook closes its coord registry row once the PTY has exited; the row is External (`register_external_confirmed`), so `close_by_id` reaches no terminal
+mcp/backend_relay.rs | terminal_gone_after_confirm | exempt | closes the coord registry row of a remote-create terminal that already exited during confirmation; External row — reaches no terminal
+
+# ── the source side of a relay end (the `remote_terminal_end` frame)
+mcp/remote_terminal.rs | end | helper | client().end(
+commands/remote_end.rs | end_remote_session | helper | end_remote_session(
+commands/remote_end.rs | remote_session_end | webview | the plain `remote_session_end` Tauri command (the single-session end flow and the bulk "Close all finished"); its end is a device-socket product close at the target, refused there on a live claude
+mcp/tauri_proxy.rs | dispatch | agent | POST /ui-bridge/tauri/invoke, which any local process reaches: its `terminal_close` arm (`tm.close`) and its `remote_session_end` arm (`end_remote_session`, force passed through)
+
+# ── local closes
+commands/terminal.rs | terminal_close | webview | the plain `terminal_close` Tauri command — every webview close today, gestures included, until R0b-1's `operator_terminal_close` twin splits off the operator's
+commands/session.rs | session_close | webview | the `session_close` Tauri command (SessionContext `closeSession`): closes a registry session by id, which kills a PTY-hosted session's pane through its transport
+mcp/terminals.rs | close_terminal_handler | agent | DELETE /terminals/{id} — any local process; never the operator's tab close (N5-1)
+mcp/steward.rs | reap_emptied_panes | exempt | no live claude in the pane: a steward pane already emptied of its claude (`steward_pane_is_emptied` over the process table), reaped before its kind restarts
+mcp/steward.rs | start_steward | exempt | a terminal never handed to a session: the steward pane just created, closed when its metadata could not be recorded, before the detached launch task types `claude`
+looping_agent_supervisor.rs | supervise_one | exempt | the looping-agent supervisor's own pane: a tab whose process already EXITED (no live claude), and the supervisor's Relaunch at an idle cycle boundary, whose loop lives on in the fresh instance it spawns next (its state is the journal) — the launcher owns that relaunch (§3.2 D4); NOT behind a probe, and absent from the architecture's §3.8 inventory
+terminal/account_migration.rs | migrate_session | exempt | the Migrator's close of a migrated session's OLD instance once its replacement is up — the session lives on in the new instance (§4.6)
+
+# ── the session transports' teardown, and the registry close that drives it
+session/transport/pty.rs | close | helper | transport.close(
+session/transport/claude_cli.rs | close | helper | transport.close(
+session/mod.rs | close | helper | close_by_id(
+agent_runtime.rs | run_continuation_terminal | exempt | a never-started gate-continuation pane: closes its coord registry row after the start verdict saw no session start; an External row (terminal panes register external), so it reaches no terminal
+agent_runtime.rs | run_condition_check_terminal | exempt | a never-started condition-check pane: closes its coord registry row after the start verdict saw no session start; External row — reaches no terminal
+commands/terminal.rs | terminal_create | exempt | the operator tab's on-exit hook closes its coord registry row once the PTY has exited; External row — reaches no terminal
+commands/terminal.rs | create_terminal_session_backend | exempt | a backend-created pane's on-exit hook closes its coord registry row once the PTY has exited; External row — reaches no terminal
+
+# ── runner exit
+mcp/ai_session.rs | run_teardown | runner_exit | `TerminalManager::close_all` at shutdown, under the teardown budget (NC5-7)
+terminal/session.rs | drop | runner_exit | `Drop` of a still-live TerminalSession — it runs as the manager is torn down
