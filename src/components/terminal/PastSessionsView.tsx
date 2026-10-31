@@ -1,10 +1,7 @@
-import { useEffect, useMemo, useState, useCallback } from "react";
+import { useEffect, useMemo, useState, useCallback, type ReactNode } from "react";
 import { TerminalSquare, Copy, Check, RefreshCw, Layers, AlertTriangle } from "lucide-react";
 import { usePastSessions, type PastSession } from "./usePastSessions";
-import {
-  refreshLiveClaudeSessionNames,
-  useLiveClaudeSessionNames,
-} from "./useLiveClaudeSessionNames";
+import { refreshLiveClaudeSessions, useLiveClaudeSessions } from "./useLiveClaudeSessions";
 import { instanceStorage } from "@/lib/instance-storage";
 import { SinceRestartSection } from "./SinceRestartSection";
 import { useSinceRestart } from "./SinceRestartContext";
@@ -177,6 +174,11 @@ interface PastSessionsViewProps {
    * command.
    */
   onResumePastSession?: (session: PastSession) => void;
+  /**
+   * The Recently closed section (the Session Manager's own closes, from the
+   * organization store), rendered above the history. Absent = not shown.
+   */
+  recentlyClosed?: ReactNode;
 }
 
 /** A cohort: sessions sharing a `cohortId`, plus its derived header fields. */
@@ -257,7 +259,7 @@ export const UNNAMED_PAST_SESSION = "(unnamed session)";
  * Headline name for one past-session card.
  *
  * `registryNames` is the live `sessionId → window name` map from
- * {@link useLiveClaudeSessionNames}, and the precedence is deliberately
+ * {@link useLiveClaudeSessions}, and the precedence is deliberately
  * asymmetric between live and closed rows:
  *
  * - **Live, operator-named** → the registry name wins. `resumeName` is scraped
@@ -489,7 +491,7 @@ function PastSessionCard({
  * resume + copy-command action. Additive to the live SessionManager — fed by
  * its own `usePastSessions` hook.
  */
-export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps) {
+export function PastSessionsView({ onResumePastSession, recentlyClosed }: PastSessionsViewProps) {
   const { sessions, loading, error, refresh: refreshSessions } = usePastSessions();
   // The "Since restart" roster (null outside a `SinceRestartProvider`).
   const roster = useSinceRestart();
@@ -507,7 +509,7 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
   }, [finishEpoch, refreshSessions]);
   // Live window names, for the subset of these rows whose process is still
   // running. Closed rows are always a miss and keep their `resumeName`.
-  const registryNames = useLiveClaudeSessionNames();
+  const registryNames = useLiveClaudeSessions().names;
 
   // Hide FINISHED sessions by default — the whole point of the marker is that a
   // finished session is one nobody needs to look at again. The toggle keeps them
@@ -537,7 +539,7 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
   // clicks Refresh precisely because they just renamed something.
   const refresh = useCallback(() => {
     refreshSessions();
-    void refreshLiveClaudeSessionNames();
+    void refreshLiveClaudeSessions();
   }, [refreshSessions]);
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
 
@@ -598,6 +600,7 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
         {/* "Before the last restart" / the pre-rebuild preview — first, so
             the strip's Review lands on it. */}
         <SinceRestartSection />
+        {recentlyClosed}
         {loading && sessions.length === 0 ? (
           <div className="flex items-center justify-center py-8 text-[#565f89] text-xs">
             <div className="w-3 h-3 border-2 border-[#565f89] border-t-transparent rounded-full animate-spin mr-2" />

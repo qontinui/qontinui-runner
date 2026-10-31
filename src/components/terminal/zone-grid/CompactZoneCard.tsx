@@ -21,6 +21,7 @@ import { STATE_BORDER_COLORS, STATE_BG_COLORS, STATE_LABELS, TREND_ICONS } from 
 import { isActionableLine, isYesNoPrompt, computeOutputTrend } from "./utils";
 import { ActivitySparkline } from "./ActivitySparkline";
 import { HighlightedText } from "./HighlightedText";
+import { groupColorAt, groupColorTint } from "../sessionGroupColors";
 
 interface CompactCardState {
   commandText: string;
@@ -226,7 +227,7 @@ function CompactZoneCardInner({
     >
       <div
         className="h-[3px] w-full rounded-t shrink-0"
-        style={{ backgroundColor: tagColor ? `${tagColor}40` : "#2a2d3d20" }}
+        style={{ backgroundColor: tagColor ? groupColorTint(tagColor, 25) : "#2a2d3d20" }}
       />
       {lastLines.length > 0 && (
         <button
@@ -443,8 +444,8 @@ function CompactZoneCardInner({
             <span
               className="text-[9px] px-1.5 py-0.5 rounded cursor-pointer transition-colors"
               style={{
-                color: groupColor ?? "#bb9af7",
-                backgroundColor: `${groupColor ?? "#bb9af7"}15`,
+                color: groupColor ?? groupColorAt(0),
+                backgroundColor: groupColorTint(groupColor ?? groupColorAt(0), 8),
               }}
               onDoubleClick={(e) => {
                 e.stopPropagation();

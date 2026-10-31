@@ -62,6 +62,21 @@ export interface LiveClaudeSession {
    * carries no cwd — a resume from the wrong dir finds nothing.
    */
   resumeCommand: string | null;
+  /**
+   * This runner owns the process — it is in the runner's process subtree (a
+   * PTY tab's shell → `claude`) or in `ai_pid_tracker`. A live row with
+   * `runnerManaged: false` and no tab here is the Session Manager's
+   * `Outside runner` location.
+   */
+  runnerManaged: boolean;
+}
+
+/** What the Session Manager reads per live session id. */
+export interface LiveRegistryEntry {
+  pid: number;
+  /** Claude Code's self-reported status (`idle` / `busy` / `waiting` / …). */
+  status: string;
+  runnerManaged: boolean;
 }
 
 /**
@@ -181,6 +196,40 @@ export function registryNamesBySessionId(
   const byId = new Map<string, string>();
   for (const [sessionId, s] of bestById) {
     byId.set(sessionId, s.name.trim());
+  }
+  return byId;
+}
+
+/**
+ * Build the `sessionId → {pid, status, runnerManaged}` lookup the Session
+ * Manager's status classifier joins on — the per-session match that replaced
+ * guessing "external" from a COUNT of unmanaged processes.
+ *
+ * Several live processes may share one session id; the most recently updated
+ * row wins, the same tiebreak {@link registryNamesBySessionId} uses, so the
+ * name and the status a card shows describe the same window.
+ *
+ * Returns `null` — shape not understood, i.e. liveness UNKNOWN — when any row
+ * lacks a boolean `runnerManaged`: defaulting it either way would state a
+ * location (`Outside runner`, or in this runner) the payload never said.
+ */
+export function liveRegistryBySessionId(
+  sessions: readonly LiveClaudeSession[],
+): Map<string, LiveRegistryEntry> | null {
+  const bestById = new Map<string, LiveClaudeSession>();
+  for (const s of sessions) {
+    if (typeof s.runnerManaged !== "boolean") return null;
+    if (!s.sessionId) continue;
+    const held = bestById.get(s.sessionId);
+    if (held === undefined || recencyOf(s) > recencyOf(held)) bestById.set(s.sessionId, s);
+  }
+  const byId = new Map<string, LiveRegistryEntry>();
+  for (const [sessionId, s] of bestById) {
+    byId.set(sessionId, {
+      pid: s.pid,
+      status: typeof s.status === "string" ? s.status : "",
+      runnerManaged: s.runnerManaged,
+    });
   }
   return byId;
 }

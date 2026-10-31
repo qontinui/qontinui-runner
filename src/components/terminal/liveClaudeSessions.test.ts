@@ -11,6 +11,7 @@ import {
   extractLiveSessionsStrict,
   fetchLiveClaudeSessionIds,
   isOperatorNamed,
+  liveRegistryBySessionId,
   registryNamesBySessionId,
   type LiveClaudeSession,
 } from "./liveClaudeSessions";
@@ -27,6 +28,7 @@ function mk(over: Partial<LiveClaudeSession> = {}): LiveClaudeSession {
     startedAt: 1784712055852,
     updatedAt: 1784770342016,
     resumeCommand: "cd 'D:/qontinui-root' && clp --resume b770ae37-1ffa-4888-a5d1-89d058307adf",
+    runnerManaged: true,
     ...over,
   };
 }
@@ -272,5 +274,31 @@ describe("fetchLiveClaudeSessionIds (P1 restore-idempotence liveness source)", (
     });
     const ids = await fetchLiveClaudeSessionIds();
     expect([...ids!]).toEqual(["ok"]);
+  });
+});
+
+describe("liveRegistryBySessionId", () => {
+  it("keys each live session id to its pid, status and runnerManaged", () => {
+    const byId = liveRegistryBySessionId([
+      mk({ sessionId: "a", pid: 1, status: "busy", runnerManaged: false }),
+      mk({ sessionId: "b", pid: 2, status: "waiting", runnerManaged: true }),
+    ]);
+    expect(byId!.get("a")).toEqual({ pid: 1, status: "busy", runnerManaged: false });
+    expect(byId!.get("b")).toEqual({ pid: 2, status: "waiting", runnerManaged: true });
+  });
+
+  it("takes the most recently updated process when several share an id", () => {
+    const byId = liveRegistryBySessionId([
+      mk({ sessionId: "a", pid: 1, status: "idle", updatedAt: 10 }),
+      mk({ sessionId: "a", pid: 2, status: "busy", updatedAt: 20 }),
+    ]);
+    expect(byId!.get("a")?.pid).toBe(2);
+    expect(byId!.get("a")?.status).toBe("busy");
+  });
+
+  it("is null — liveness UNKNOWN — when a row lacks runnerManaged", () => {
+    const row = mk({ sessionId: "a" });
+    delete (row as { runnerManaged?: unknown }).runnerManaged;
+    expect(liveRegistryBySessionId([row])).toBeNull();
   });
 });

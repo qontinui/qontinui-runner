@@ -529,6 +529,7 @@ GET /task-runs/{id}/verification-results get_task_run_verification_results
 GET /task-runs/{id}/workflow-state get_workflow_state
 GET /tenant/active get_active_tenant
 GET /terminal-pages list_terminal_pages_handler
+GET /terminal/session-org get_session_org_handler
 GET /terminals list_terminals_handler
 GET /terminals/transport-stats get_transport_stats_handler
 GET /terminals/{id}/buffer get_buffer_handler
@@ -976,6 +977,7 @@ MERGE sdk_client::routes
 MERGE sdk_spec_sync::routes
 MERGE security_audit::routes
 MERGE session_briefing::routes
+MERGE session_org::routes
 MERGE session_recap::routes
 MERGE session_repository::routes
 MERGE session_review::routes
@@ -1334,6 +1336,7 @@ POST /task-runs/{id}/rename rename_task_run
 POST /task-runs/{id}/resume resume_task_run_http
 POST /task-runs/{id}/stop stop_task_run
 POST /task-runs/{id}/unpause unpause_task_run
+POST /terminal/session-org apply_session_org_handler
 POST /terminals create_terminal_handler
 POST /terminals/transport-stats reset_transport_stats_handler
 POST /terminals/{id}/move move_terminal_handler

@@ -6,8 +6,8 @@
 //! ## What this is for
 //!
 //! `SessionCard` and the surrounding "Promote to Worktree" / "Commit Progress"
-//! buttons only render for sessions whose `liveStatus` is one of
-//! `active-in-zone | needs-input | frozen`. Producing such a session via the
+//! buttons only render for sessions live in this runner (location `on-screen`
+//! or `hidden-here`, activity not exited). Producing such a session via the
 //! real path requires spawning a Claude CLI child process — slow, environment-
 //! dependent, and impractical for snapshot-driven UI tests that just want to
 //! verify the buttons register.
@@ -49,40 +49,47 @@
 //!
 //! ### The five buckets and how each is reached
 //!
-//! Every body below is COMPLETE and POSTs as-is. `task_run_id` and `name`
-//! are REQUIRED by [`InjectSessionRequest`] (no `#[serde(default)]`), so the
-//! abbreviated `{liveStatus:"…"}` forms this table used to show were not
-//! bodies at all — copy-pasting one produced a 422/400 on deserialize before
-//! any fixture logic ran, and the failure named a missing field rather than
-//! the doc that omitted it. Give each fake a distinct `task_run_id`; the
-//! runner uses it as the session id too.
+//! A session's status is two axes (plan
+//! `2026-10-13-session-manager-chrome-style-tab-organization-and-operator-search`,
+//! D2): `location` — where its process is — and `activity` — what it is doing.
+//! The inject body names both, in the frontend's kebab-case vocabulary
+//! (`sessionStatusModel.ts`).
 //!
-//! | StatusStrip bucket | `liveStatus` | mechanism | inject body |
-//! |--------------------|--------------|-----------|-------------|
-//! | working            | `active-in-zone` | short-circuit (`injected_live_status`) | `{"task_run_id":"fx-working","name":"fx working","liveStatus":"active-in-zone"}` |
-//! | needs-input        | `needs-input`    | short-circuit | `{"task_run_id":"fx-needs-input","name":"fx needs input","liveStatus":"needs-input"}` |
-//! | idle               | `frozen` (live tab) | **tab-backed**: a synthetic tab pre-aged past the 60s staleness sweep | `{"task_run_id":"fx-idle","name":"fx idle","liveStatus":"idle","tab_backed":true}` |
-//! | error              | `error`          | **tab-backed**: a dead synthetic tab, exit_code != 0 | `{"task_run_id":"fx-error","name":"fx error","liveStatus":"error","tab_backed":true}` |
-//! | completed          | `completed`      | **tab-backed**: a dead synthetic tab, exit_code 0 | `{"task_run_id":"fx-completed","name":"fx completed","liveStatus":"completed","tab_backed":true}` |
+//! Every body below is COMPLETE and POSTs as-is. `task_run_id`, `name`,
+//! `location` and `activity` are REQUIRED by [`InjectSessionRequest`] (no
+//! `#[serde(default)]`), so an abbreviated body is not a body at all — it
+//! fails to deserialize before any fixture logic runs, naming a missing field
+//! rather than the doc that omitted it. Give each fake a distinct
+//! `task_run_id`; the runner uses it as the session id too.
+//!
+//! | StatusStrip bucket | `activity` | mechanism | inject body |
+//! |--------------------|------------|-----------|-------------|
+//! | working            | `working`        | short-circuit (`injected_location` + `injected_activity`) | `{"task_run_id":"fx-working","name":"fx working","location":"hidden-here","activity":"working"}` |
+//! | needs-input        | `needs-you`      | short-circuit | `{"task_run_id":"fx-needs-input","name":"fx needs input","location":"hidden-here","activity":"needs-you"}` |
+//! | idle               | `idle-at-prompt` | short-circuit | `{"task_run_id":"fx-idle","name":"fx idle","location":"hidden-here","activity":"idle-at-prompt"}` |
+//! | error              | `exited-error`   | **tab-backed**: a dead synthetic tab, exit_code != 0 | `{"task_run_id":"fx-error","name":"fx error","location":"hidden-here","activity":"exited-error","tab_backed":true}` |
+//! | completed          | `exited`         | **tab-backed**: a dead synthetic tab, exit_code 0 | `{"task_run_id":"fx-completed","name":"fx completed","location":"hidden-here","activity":"exited","tab_backed":true}` |
 //!
 //! Two projection modes back these (see `project_test_session`):
-//!   - **short-circuit** — `working` / `needs-input` (and the orphan-demo
-//!     `frozen`, plus short-circuit `error` / `completed`): the fake carries an
-//!     `injected_live_status` string that `useSessionManager` consults INSTEAD
-//!     of correlating a tab. No synthetic tab is emitted.
-//!   - **tab-backed** — `idle` / `error` / `completed`: NO `injected_live_status`;
+//!   - **short-circuit** — the fake carries `injected_location` /
+//!     `injected_activity` strings that `useSessionManager` uses INSTEAD of
+//!     classifying. Any location × activity cell is reachable. No synthetic
+//!     tab is emitted.
+//!   - **tab-backed** — `exited` / `exited-error` / `unknown`: NO override;
 //!     instead an `injected_tab` spec is emitted, from which the frontend
 //!     (`syntheticTabs.ts`) derives a synthetic `TerminalTab` that flows through
-//!     the SAME `useSessionStateTracking` staleness sweep + dead-tab branch the
-//!     real PTY tabs use. This is the ONLY way to reach `idle` and tab-backed
-//!     `error`/`completed` — the short-circuit path cannot (`idle` is dropped
-//!     by the orphan filter; tab-backed exit-code semantics need a real tab).
+//!     the SAME classifier the real PTY tabs use. `exited` / `exited-error` are
+//!     a dead tab whose exit code the classifier reads; `unknown` is a live tab
+//!     pre-aged past the 60s staleness sweep whose fake transcript has no
+//!     digest — the production "no source could classify it" arm.
 //!
 //! Validation guards (enforced by `insert_session`):
-//!   - `liveStatus:"idle"` REQUIRES `tab_backed:true` (else 400) — a tab-less
-//!     injected `frozen` is forced orphaned and `computeStatusCounts` drops it.
-//!   - `tab_backed:true` is ONLY valid for `idle` / `error` / `completed`
-//!     (else 400) — the other statuses have no tab-backed mechanism.
+//!   - `tab_backed:true` is ONLY valid for `exited` / `exited-error` /
+//!     `unknown` (else 400) — no other activity has a tab-backed mechanism.
+//!   - `tab_backed:true` REQUIRES `location:"hidden-here"` (else 400): a
+//!     synthetic tab is in no zone, so the classifier computes `hidden-here`
+//!     for it, and a body claiming otherwise would describe a card it cannot
+//!     produce.
 //!
 //! ### Seed-then-POLL contract (do NOT single-read)
 //!
@@ -96,9 +103,9 @@
 //!      this is what makes seeding/clearing deterministic even when the
 //!      runner window is hidden (its 30s auto-refresh poll is
 //!      visibility-gated and never ticks in a backgrounded window).
-//!   2. For a tab-backed `idle` fake, the 60s **staleness sweep tick** must
+//!   2. For a tab-backed `unknown` fake, the 60s **staleness sweep tick** must
 //!      fire once more after the synthetic tab's pre-aged `lastOutput` seed is
-//!      installed before `frozen`→idle is counted. The pre-age guarantees the
+//!      installed before the silent tab reads `Unknown`. The pre-age guarantees the
 //!      tab is ALREADY past threshold, so this is one sweep tick (≤ ~2s in the
 //!      test cadence), not a 60s wait — but it is NOT zero.
 //!
@@ -170,48 +177,73 @@ use super::types::ApiState;
 // Test session storage
 // =============================================================================
 
-/// Live-status hints accepted by `/test/inject-session`.
-///
-/// Mirrors the subset of `SessionLiveStatus` enum values from
-/// `qontinui-runner/src/components/terminal/useSessionManager.ts` that the
-/// StatusStrip buckets care about. The first three drive the short-circuit
-/// path (`canPromote` / `canCommit` in `SessionCard.tsx` plus the
-/// `working` / `needs-input` strip buckets). `Idle`, `Error`, and
-/// `Completed` exist so a fake can be placed in EVERY StatusStrip bucket
-/// through the real production render path — see `project_test_session` for
-/// the per-status mechanism (short-circuit vs. tab-backed correlation).
+/// The location axis accepted by `/test/inject-session` — where the session's
+/// process is. Mirrors `SessionLocation` in
+/// `qontinui-runner/src/components/terminal/sessionStatusModel.ts`.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-pub enum TestLiveStatus {
-    ActiveInZone,
-    NeedsInput,
-    Frozen,
-    Idle,
-    Error,
-    Completed,
+pub enum TestLocation {
+    OnScreen,
+    HiddenHere,
+    OutsideRunner,
+    OtherDevice,
+    NotRunning,
+    Unknown,
 }
 
-impl TestLiveStatus {
-    /// Stringified form matching the frontend `SessionLiveStatus` literal,
-    /// used ONLY on the non-tab-backed short-circuit path
-    /// (`injected_live_status`).
-    ///
-    /// `Idle` deliberately has no short-circuit string: the frontend forces
-    /// an injected `frozen` to be orphaned (`isOrphaned = true`), which
-    /// `computeStatusCounts` then drops, so idle is unreachable via the
-    /// short-circuit. Idle is only reachable tab-backed (a synthetic stale
-    /// tab), and the handler rejects `Idle` without `tab_backed`. We return
-    /// `"frozen"` here purely as a never-exercised fallback; callers must not
-    /// route `Idle` through the short-circuit.
+impl TestLocation {
+    /// The frontend `SessionLocation` literal (`injected_location`).
     pub fn as_frontend_str(&self) -> &'static str {
         match self {
-            Self::ActiveInZone => "active-in-zone",
-            Self::NeedsInput => "needs-input",
-            Self::Frozen => "frozen",
-            Self::Idle => "frozen",
-            Self::Error => "error",
-            Self::Completed => "completed",
+            Self::OnScreen => "on-screen",
+            Self::HiddenHere => "hidden-here",
+            Self::OutsideRunner => "outside-runner",
+            Self::OtherDevice => "other-device",
+            Self::NotRunning => "not-running",
+            Self::Unknown => "unknown",
         }
+    }
+}
+
+/// The activity axis accepted by `/test/inject-session` — what the session is
+/// doing. Mirrors `SessionActivity` in `sessionStatusModel.ts`. Every value is
+/// reachable on the short-circuit path; `Unknown`, `Exited` and `ExitedError`
+/// are additionally reachable tab-backed, through the production classifier —
+/// see `project_test_session`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TestActivity {
+    NeedsYou,
+    WaitingOnLock,
+    Working,
+    IdleAtPrompt,
+    NoOutputMidTool,
+    Finished,
+    Exited,
+    ExitedError,
+    Unknown,
+}
+
+impl TestActivity {
+    /// The frontend `SessionActivity` literal (`injected_activity`).
+    pub fn as_frontend_str(&self) -> &'static str {
+        match self {
+            Self::NeedsYou => "needs-you",
+            Self::WaitingOnLock => "waiting-on-lock",
+            Self::Working => "working",
+            Self::IdleAtPrompt => "idle-at-prompt",
+            Self::NoOutputMidTool => "no-output-mid-tool",
+            Self::Finished => "finished",
+            Self::Exited => "exited",
+            Self::ExitedError => "exited-error",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Whether this activity has a tab-backed mechanism (a synthetic tab the
+    /// real classifier reads) — see `project_test_session`.
+    pub fn has_tab_backed_mechanism(&self) -> bool {
+        matches!(self, Self::Unknown | Self::Exited | Self::ExitedError)
     }
 }
 
@@ -238,7 +270,8 @@ pub struct TestSession {
     pub task_run_id: String,
     pub session_id: String,
     pub name: String,
-    pub live_status: TestLiveStatus,
+    pub location: TestLocation,
+    pub activity: TestActivity,
     pub worktree: Option<TestWorktreeInfo>,
     /// ISO 8601 timestamp written at injection time. Drives the
     /// `lastModified` / `startedAt` columns that `SessionCard` formats via
@@ -253,24 +286,24 @@ pub struct TestSession {
     /// `"C:\\claude\\.claude-test-fixture"` so `extractAccountLabel` in
     /// `useSessionManager.ts` produces the obvious label `test-fixture`.
     pub config_dir: String,
-    /// When true the fake is projected WITHOUT an `injected_live_status`
-    /// override so the frontend takes the REAL tab-correlation path; the
-    /// projection instead emits an `injected_tab` spec from which the
-    /// frontend derives a synthetic `TerminalTab`. This is how `idle`
-    /// (pre-aged stale tab) and tab-backed `error` / `completed`
-    /// (dead-tab exit-code) buckets are reached through production code.
+    /// When true the fake is projected WITHOUT the `injected_location` /
+    /// `injected_activity` overrides so the frontend classifies it for real;
+    /// the projection instead emits an `injected_tab` spec from which the
+    /// frontend derives a synthetic `TerminalTab`. This is how `exited` /
+    /// `exited-error` (dead-tab exit code) and `unknown` (a pre-aged silent
+    /// tab with no digest) are reached through production code.
     pub tab_backed: bool,
     /// Pre-age, in milliseconds, for the synthetic tab's `lastOutput`. Only
-    /// meaningful for a tab-backed `Idle` fake — the frontend seeds
+    /// meaningful for a tab-backed `unknown` fake — the frontend seeds
     /// `lastOutputTimeRef[tabId] = now - quiet_ms` so the existing 60s
-    /// staleness sweep marks the tab stale → `frozen` → counted as idle.
+    /// staleness sweep marks the tab silent.
     pub quiet_ms: Option<u64>,
 }
 
-/// Default pre-age (ms) for a tab-backed `Idle` fake's synthetic tab. The
+/// Default pre-age (ms) for a tab-backed `unknown` fake's synthetic tab. The
 /// staleness sweep marks a tab stale at `> 60000`ms of quiet, so the default
 /// (and the floor enforced in `project_test_session`) is just over 60s.
-const IDLE_DEFAULT_QUIET_MS: u64 = 61_000;
+const SILENT_TAB_DEFAULT_QUIET_MS: u64 = 61_000;
 
 /// Synthetic-tab spec emitted on the wire when a fake is `tab_backed`.
 ///
@@ -281,9 +314,9 @@ const IDLE_DEFAULT_QUIET_MS: u64 = 61_000;
 /// through the REAL `useSessionManager` tab-correlation path:
 ///
 /// - `is_alive: true` + `quiet_ms` → the staleness sweep marks the synthetic
-///   tab stale → `frozen` with a live tab → counted as `idle`.
-/// - `is_alive: false` + `exit_code` → the sweep's dead-tab branch sets
-///   `sessionStates[tab.id]` to `completed` (exit 0) or `error` (exit != 0).
+///   tab silent; with no transcript digest the classifier reads `unknown`.
+/// - `is_alive: false` + `exit_code` → the classifier reads `exited` (exit 0)
+///   or `exited-error` (exit != 0).
 pub use crate::terminal::transcript::InjectedTabSpec;
 
 /// Project a `TestSession` into the on-the-wire `TranscriptSession` shape
@@ -295,56 +328,47 @@ pub use crate::terminal::transcript::InjectedTabSpec;
 ///
 /// Two projection modes:
 ///
-/// - **non-tab-backed** (`tab_backed == false`): set `injected_live_status`
-///   to the kebab string. `useSessionManager` consults this override instead
-///   of computing live-status from tab correlation. Reaches `working`
-///   (`active-in-zone`), `needs-input`, and the orphan-demo `frozen` plus the
-///   short-circuit `error` / `completed` buckets.
-/// - **tab-backed** (`tab_backed == true`): leave `injected_live_status` as
-///   `None` so the frontend takes the REAL tab-correlation path, and emit an
-///   `injected_tab` spec from which the frontend derives a synthetic tab.
-///   Reaches `idle` (pre-aged stale tab) and tab-backed `error` / `completed`
-///   (dead-tab exit-code).
+/// - **non-tab-backed** (`tab_backed == false`): set `injected_location` /
+///   `injected_activity` to the kebab strings. `useSessionManager` uses them
+///   instead of classifying, so any location × activity cell is reachable.
+/// - **tab-backed** (`tab_backed == true`): leave both overrides `None` so the
+///   frontend classifies for real, and emit an `injected_tab` spec from which
+///   it derives a synthetic tab: dead with an exit code for `exited` /
+///   `exited-error`, live and pre-aged silent for `unknown`.
 pub fn project_test_session(
     session: &TestSession,
 ) -> crate::terminal::transcript::TranscriptSession {
-    let (injected_live_status, injected_tab) = if session.tab_backed {
-        let spec = match session.live_status {
-            TestLiveStatus::Idle => InjectedTabSpec {
+    let (injected_location, injected_activity, injected_tab) = if session.tab_backed {
+        let spec = match session.activity {
+            TestActivity::ExitedError => InjectedTabSpec {
+                is_alive: false,
+                exit_code: Some(1),
+                quiet_ms: None,
+            },
+            TestActivity::Exited => InjectedTabSpec {
+                is_alive: false,
+                exit_code: Some(0),
+                quiet_ms: None,
+            },
+            // `unknown`, and — unreachable, the handler rejects them first —
+            // every activity without a tab-backed mechanism: a live silent
+            // tab, kept total without an unreachable!() panic on the wire path.
+            _ => InjectedTabSpec {
                 is_alive: true,
                 exit_code: None,
                 quiet_ms: Some(
                     session
                         .quiet_ms
-                        .unwrap_or(IDLE_DEFAULT_QUIET_MS)
-                        .max(IDLE_DEFAULT_QUIET_MS),
+                        .unwrap_or(SILENT_TAB_DEFAULT_QUIET_MS)
+                        .max(SILENT_TAB_DEFAULT_QUIET_MS),
                 ),
             },
-            TestLiveStatus::Error => InjectedTabSpec {
-                is_alive: false,
-                exit_code: Some(1),
-                quiet_ms: None,
-            },
-            TestLiveStatus::Completed => InjectedTabSpec {
-                is_alive: false,
-                exit_code: Some(0),
-                quiet_ms: None,
-            },
-            // The handler rejects tab_backed for ActiveInZone / NeedsInput /
-            // Frozen before we ever get here; treat as a no-op spec to keep
-            // this total without an unreachable!() panic on the wire path.
-            TestLiveStatus::ActiveInZone | TestLiveStatus::NeedsInput | TestLiveStatus::Frozen => {
-                InjectedTabSpec {
-                    is_alive: true,
-                    exit_code: None,
-                    quiet_ms: None,
-                }
-            }
         };
-        (None, Some(spec))
+        (None, None, Some(spec))
     } else {
         (
-            Some(session.live_status.as_frontend_str().to_string()),
+            Some(session.location.as_frontend_str().to_string()),
+            Some(session.activity.as_frontend_str().to_string()),
             None,
         )
     };
@@ -361,7 +385,8 @@ pub fn project_test_session(
         first_message_preview: Some(session.name.clone()),
         has_plans: false,
         display_name: session.name.clone(),
-        injected_live_status,
+        injected_location,
+        injected_activity,
         injected_tab,
         resume_name: None,
     }
@@ -1063,39 +1088,36 @@ fn insert_session(
         ));
     }
 
-    // `idle` is only reachable tab-backed: the short-circuit path forces an
-    // injected `frozen` to be orphaned, which `computeStatusCounts` drops, so
-    // a tab-less idle can never land in the idle bucket.
-    if matches!(req.live_status, TestLiveStatus::Idle) && !req.tab_backed {
+    // tab-backed only has a defined mechanism for exited / exited-error (a
+    // dead synthetic tab) and unknown (a silent one with no digest).
+    if req.tab_backed && !req.activity.has_tab_backed_mechanism() {
         return Err((
             StatusCode::BAD_REQUEST,
             InjectSessionError {
                 success: false,
-                error: "liveStatus=idle requires tab_backed=true: the orphan filter \
-                        drops a tab-less injected frozen, so idle is only reachable via \
-                        a synthetic stale tab"
-                    .to_string(),
+                error: format!(
+                    "tab_backed=true is only valid for activity in {{exited, exited-error, \
+                     unknown}}; {} has no tab-backed mechanism and stays on the \
+                     short-circuit path",
+                    req.activity.as_frontend_str()
+                ),
             },
         ));
     }
 
-    // tab-backed only has a defined mechanism for idle / error / completed.
-    // working (active-in-zone) / needs-input / frozen stay on the legacy
-    // short-circuit (frozen is the orphan-demo path).
-    if req.tab_backed
-        && !matches!(
-            req.live_status,
-            TestLiveStatus::Idle | TestLiveStatus::Error | TestLiveStatus::Completed
-        )
-    {
+    // A synthetic tab is in no zone, so the real classifier computes
+    // `hidden-here` for it; any other location would describe a card the
+    // tab-backed path cannot produce.
+    if req.tab_backed && req.location != TestLocation::HiddenHere {
         return Err((
             StatusCode::BAD_REQUEST,
             InjectSessionError {
                 success: false,
-                error: "tab_backed=true is only valid for liveStatus in \
-                        {idle, error, completed}; active-in-zone / needs-input / frozen \
-                        have no tab-backed mechanism and stay on the short-circuit path"
-                    .to_string(),
+                error: format!(
+                    "tab_backed=true requires location=hidden-here (a synthetic tab sits in \
+                     no zone); got {}",
+                    req.location.as_frontend_str()
+                ),
             },
         ));
     }
@@ -1108,7 +1130,8 @@ fn insert_session(
         // downstream consumer that looks up by either key finds the fake.
         session_id: req.task_run_id.clone(),
         name: req.name.clone(),
-        live_status: req.live_status,
+        location: req.location,
+        activity: req.activity,
         worktree: req.worktree.clone(),
         injected_at: chrono::Utc::now().to_rfc3339(),
         project_path: req
@@ -1133,9 +1156,10 @@ fn insert_session(
     }
 
     info!(
-        "test_fixtures: injected session task_run_id={} liveStatus={} name=\"{}\"",
+        "test_fixtures: injected session task_run_id={} location={} activity={} name=\"{}\"",
         task_run_id,
-        req.live_status.as_frontend_str(),
+        req.location.as_frontend_str(),
+        req.activity.as_frontend_str(),
         req.name,
     );
 
@@ -1164,8 +1188,8 @@ fn clear_all_sessions() -> usize {
 pub struct InjectSessionRequest {
     pub task_run_id: String,
     pub name: String,
-    #[serde(rename = "liveStatus")]
-    pub live_status: TestLiveStatus,
+    pub location: TestLocation,
+    pub activity: TestActivity,
     #[serde(default)]
     pub worktree: Option<TestWorktreeInfo>,
     /// Optional masquerade-as project path. Falls back to `"<test-fixture>"`
@@ -1177,16 +1201,15 @@ pub struct InjectSessionRequest {
     /// what `extractAccountLabel` will produce in the UI.
     #[serde(default)]
     pub config_dir: Option<String>,
-    /// When true, project the fake WITHOUT an `injected_live_status` override
-    /// so the frontend takes the real tab-correlation path against a derived
-    /// synthetic tab. Required to reach the `idle` bucket and the tab-backed
-    /// `error` / `completed` buckets; rejected for `active-in-zone` /
-    /// `needs-input` / `frozen` (those have no tab-backed mechanism).
+    /// When true, project the fake WITHOUT the location/activity overrides so
+    /// the frontend classifies it for real against a derived synthetic tab.
+    /// Valid for `exited` / `exited-error` / `unknown` with
+    /// `location: hidden-here`; rejected otherwise.
     #[serde(default)]
     pub tab_backed: bool,
-    /// Pre-age (ms) for a tab-backed `idle` fake's synthetic tab. Ignored for
-    /// non-idle statuses. Defaults to (and is floored at) 61s so the existing
-    /// 60s staleness sweep classifies the synthetic tab stale.
+    /// Pre-age (ms) for a tab-backed `unknown` fake's synthetic tab. Ignored
+    /// otherwise. Defaults to (and is floored at) 61s so the existing 60s
+    /// staleness sweep marks the synthetic tab silent.
     #[serde(default)]
     pub quiet_ms: Option<u64>,
 }
@@ -1413,71 +1436,44 @@ pub struct SeedScenarioResponse {
     pub session_ids: Vec<String>,
 }
 
-/// Default quiet pre-age (ms) for a scenario-seeded `idle` fake. Matches the
-/// inject-session idle floor so the staleness sweep marks the synthetic tab
-/// stale.
-const SCENARIO_IDLE_QUIET_MS: u64 = 61_000;
-
 /// Build the `InjectSessionRequest` list for a counts-based scenario. Ids and
 /// names are deterministic (`scenario-<bucket>-<n>`) so a test can assert exact
 /// membership.
 fn requests_from_counts(counts: &ScenarioCounts) -> Vec<InjectSessionRequest> {
     let mut reqs = Vec::new();
 
-    let mut push = |bucket: &str,
-                    n: u32,
-                    live_status: TestLiveStatus,
-                    tab_backed: bool,
-                    quiet_ms: Option<u64>| {
+    let mut push = |bucket: &str, n: u32, activity: TestActivity, tab_backed: bool| {
         for i in 1..=n {
             let id = format!("scenario-{bucket}-{i}");
             reqs.push(InjectSessionRequest {
                 task_run_id: id.clone(),
                 name: format!("Scenario {bucket} {i}"),
-                live_status,
+                // A scenario fake is a session of this runner that is not the
+                // one on screen — the location a tab-backed fake is computed
+                // to have, so both mechanisms agree.
+                location: TestLocation::HiddenHere,
+                activity,
                 worktree: None,
                 project_path: None,
                 config_dir: None,
                 tab_backed,
-                quiet_ms,
+                quiet_ms: None,
             });
         }
     };
 
-    // working → active-in-zone short-circuit.
-    push(
-        "working",
-        counts.working,
-        TestLiveStatus::ActiveInZone,
-        false,
-        None,
-    );
-    // needs_input → needs-input short-circuit.
+    push("working", counts.working, TestActivity::Working, false);
     push(
         "needs-input",
         counts.needs_input,
-        TestLiveStatus::NeedsInput,
+        TestActivity::NeedsYou,
         false,
-        None,
     );
-    // idle → tab-backed Idle (pre-aged stale tab).
-    push(
-        "idle",
-        counts.idle,
-        TestLiveStatus::Idle,
-        true,
-        Some(SCENARIO_IDLE_QUIET_MS),
-    );
-    // error → tab-backed Error (dead tab, exit != 0).
-    push("error", counts.error, TestLiveStatus::Error, true, None);
-    // completed → tab-backed Completed (dead tab, exit 0).
-    push(
-        "completed",
-        counts.completed,
-        TestLiveStatus::Completed,
-        true,
-        None,
-    );
+    push("idle", counts.idle, TestActivity::IdleAtPrompt, false);
+    // error / completed → tab-backed dead tabs, so the strip's exit-code
+    // buckets are fed by the production classifier.
+    push("error", counts.error, TestActivity::ExitedError, true);
+    push("completed", counts.completed, TestActivity::Exited, true);
 
     reqs
 }
@@ -3009,8 +3005,8 @@ mod tests {
     static TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     /// F2: every inject body printed in this module's CONSUMER CONTRACT table
-    /// must actually POST. The table used to show `{liveStatus:"idle",
-    /// tab_backed:true}` — no `task_run_id`, no `name`, both REQUIRED — so a
+    /// must actually POST. The table once showed abbreviated bodies with no
+    /// `task_run_id` and no `name`, both REQUIRED — so a
     /// verification agent copying a documented body got a deserialize failure
     /// before any fixture logic ran.
     ///
@@ -3026,7 +3022,7 @@ mod tests {
         let src = include_str!("test_fixtures.rs");
         let bodies: Vec<&str> = src
             .lines()
-            .filter(|l| l.starts_with("//! |") && l.contains("liveStatus\":"))
+            .filter(|l| l.starts_with("//! |") && l.contains("\"activity\":"))
             .filter_map(|l| {
                 let start = l.find("`{")?;
                 let end = l.rfind("}`")?;
@@ -3689,7 +3685,8 @@ mod tests {
         let req = InjectSessionRequest {
             task_run_id: "fixture-roundtrip-1".to_string(),
             name: "Fixture roundtrip".to_string(),
-            live_status: TestLiveStatus::ActiveInZone,
+            location: TestLocation::HiddenHere,
+            activity: TestActivity::Working,
             worktree: Some(TestWorktreeInfo {
                 id: "wt-roundtrip-1".to_string(),
                 path: "C:/tmp/fixture-wt".to_string(),
@@ -3713,7 +3710,8 @@ mod tests {
             .iter()
             .find(|s| s.task_run_id == "fixture-roundtrip-1")
             .expect("entry should be visible after inject");
-        assert_eq!(entry.live_status, TestLiveStatus::ActiveInZone);
+        assert_eq!(entry.location, TestLocation::HiddenHere);
+        assert_eq!(entry.activity, TestActivity::Working);
         assert!(entry.worktree.is_some());
 
         let cleared = clear_sessions_handler().await;
@@ -3731,7 +3729,8 @@ mod tests {
         let req = InjectSessionRequest {
             task_run_id: "   ".to_string(),
             name: "still has a name".to_string(),
-            live_status: TestLiveStatus::Frozen,
+            location: TestLocation::HiddenHere,
+            activity: TestActivity::NoOutputMidTool,
             worktree: None,
             project_path: None,
             config_dir: None,
@@ -3760,7 +3759,8 @@ mod tests {
         let req = InjectSessionRequest {
             task_run_id: "fixture-merge-1".to_string(),
             name: "Merge target".to_string(),
-            live_status: TestLiveStatus::NeedsInput,
+            location: TestLocation::HiddenHere,
+            activity: TestActivity::NeedsYou,
             worktree: None,
             project_path: Some("D:/qontinui-root".to_string()),
             config_dir: None,
@@ -3782,7 +3782,8 @@ mod tests {
             first_message_preview: Some("hello".to_string()),
             has_plans: false,
             display_name: "Real one".to_string(),
-            injected_live_status: None,
+            injected_location: None,
+            injected_activity: None,
             injected_tab: None,
             resume_name: None,
         };
@@ -3791,7 +3792,8 @@ mod tests {
 
         // Real first.
         assert_eq!(merged[0].session_id, "real-session-abc");
-        assert!(merged[0].injected_live_status.is_none());
+        assert!(merged[0].injected_location.is_none());
+        assert!(merged[0].injected_activity.is_none());
 
         // Find the injected fake.
         let fake = merged
@@ -3806,9 +3808,14 @@ mod tests {
             "fake must pass message_count > 0 filter"
         );
         assert_eq!(
-            fake.injected_live_status.as_deref(),
-            Some("needs-input"),
-            "live-status override must reach the wire"
+            fake.injected_location.as_deref(),
+            Some("hidden-here"),
+            "location override must reach the wire"
+        );
+        assert_eq!(
+            fake.injected_activity.as_deref(),
+            Some("needs-you"),
+            "activity override must reach the wire"
         );
         assert_eq!(fake.display_name, "Merge target");
         assert_eq!(fake.project_path, "D:/qontinui-root");
@@ -3824,10 +3831,10 @@ mod tests {
     }
 
     /// Build a `TestSession` directly (bypassing the HTTP handler) so the
-    /// projection can be exercised per (status, tab_backed) combination
+    /// projection can be exercised per (activity, tab_backed) combination
     /// without touching the global registry.
     fn make_session(
-        live_status: TestLiveStatus,
+        activity: TestActivity,
         tab_backed: bool,
         quiet_ms: Option<u64>,
     ) -> TestSession {
@@ -3835,7 +3842,8 @@ mod tests {
             task_run_id: "proj-test".to_string(),
             session_id: "proj-test".to_string(),
             name: "Projection test".to_string(),
-            live_status,
+            location: TestLocation::HiddenHere,
+            activity,
             worktree: None,
             injected_at: "2026-06-05T00:00:00Z".to_string(),
             project_path: DEFAULT_TEST_PROJECT_PATH.to_string(),
@@ -3845,67 +3853,89 @@ mod tests {
         }
     }
 
-    /// Non-tab-backed working / needs-input / frozen project to the
-    /// short-circuit override with NO synthetic tab.
+    /// Every non-tab-backed activity projects to BOTH short-circuit overrides
+    /// (in the frontend's kebab vocabulary) with NO synthetic tab.
     #[test]
-    fn project_short_circuit_statuses_carry_override_no_tab() {
-        for (status, expected) in [
-            (TestLiveStatus::ActiveInZone, "active-in-zone"),
-            (TestLiveStatus::NeedsInput, "needs-input"),
-            (TestLiveStatus::Frozen, "frozen"),
-            (TestLiveStatus::Error, "error"),
-            (TestLiveStatus::Completed, "completed"),
+    fn project_short_circuit_carries_both_axes_no_tab() {
+        for (activity, expected) in [
+            (TestActivity::NeedsYou, "needs-you"),
+            (TestActivity::WaitingOnLock, "waiting-on-lock"),
+            (TestActivity::Working, "working"),
+            (TestActivity::IdleAtPrompt, "idle-at-prompt"),
+            (TestActivity::NoOutputMidTool, "no-output-mid-tool"),
+            (TestActivity::Finished, "finished"),
+            (TestActivity::Exited, "exited"),
+            (TestActivity::ExitedError, "exited-error"),
+            (TestActivity::Unknown, "unknown"),
         ] {
-            let projected = project_test_session(&make_session(status, false, None));
+            let projected = project_test_session(&make_session(activity, false, None));
             assert_eq!(
-                projected.injected_live_status.as_deref(),
+                projected.injected_activity.as_deref(),
                 Some(expected),
-                "non-tab-backed {status:?} must carry the short-circuit override",
+                "non-tab-backed {activity:?} must carry the activity override",
             );
+            assert_eq!(projected.injected_location.as_deref(), Some("hidden-here"));
             assert!(
                 projected.injected_tab.is_none(),
-                "non-tab-backed {status:?} must not emit a synthetic tab",
+                "non-tab-backed {activity:?} must not emit a synthetic tab",
             );
             assert!(projected.message_count > 0);
         }
     }
 
-    /// Tab-backed idle projects to NO override + a live synthetic tab pre-aged
-    /// past the 60s staleness floor.
+    /// The location override carries every `TestLocation` verbatim.
     #[test]
-    fn project_tab_backed_idle_emits_live_pre_aged_tab() {
-        let projected = project_test_session(&make_session(TestLiveStatus::Idle, true, None));
+    fn project_short_circuit_location_strings_match_frontend() {
+        for (location, expected) in [
+            (TestLocation::OnScreen, "on-screen"),
+            (TestLocation::HiddenHere, "hidden-here"),
+            (TestLocation::OutsideRunner, "outside-runner"),
+            (TestLocation::OtherDevice, "other-device"),
+            (TestLocation::NotRunning, "not-running"),
+            (TestLocation::Unknown, "unknown"),
+        ] {
+            let mut session = make_session(TestActivity::Working, false, None);
+            session.location = location;
+            assert_eq!(
+                project_test_session(&session).injected_location.as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    /// Tab-backed unknown projects to NO overrides + a live synthetic tab
+    /// pre-aged past the 60s staleness floor.
+    #[test]
+    fn project_tab_backed_unknown_emits_live_pre_aged_tab() {
+        let projected = project_test_session(&make_session(TestActivity::Unknown, true, None));
         assert!(
-            projected.injected_live_status.is_none(),
-            "tab-backed fake must take the real correlation path (no override)",
+            projected.injected_location.is_none() && projected.injected_activity.is_none(),
+            "tab-backed fake must take the real classification path (no override)",
         );
         let spec = projected
             .injected_tab
-            .expect("tab-backed idle must emit a synthetic tab");
-        assert!(
-            spec.is_alive,
-            "idle synthetic tab must be alive (gets swept stale)"
-        );
+            .expect("tab-backed unknown must emit a synthetic tab");
+        assert!(spec.is_alive, "the silent synthetic tab must be alive");
         assert_eq!(spec.exit_code, None);
         assert_eq!(
             spec.quiet_ms,
-            Some(IDLE_DEFAULT_QUIET_MS),
-            "idle default quiet must be the 61s floor",
+            Some(SILENT_TAB_DEFAULT_QUIET_MS),
+            "default quiet must be the 61s floor",
         );
     }
 
     /// A caller-supplied quiet below the floor is clamped up to 61s so the
     /// sweep still marks the tab stale; above the floor is honored.
     #[test]
-    fn project_tab_backed_idle_clamps_quiet_to_floor() {
+    fn project_tab_backed_unknown_clamps_quiet_to_floor() {
         let too_small =
-            project_test_session(&make_session(TestLiveStatus::Idle, true, Some(5_000)));
+            project_test_session(&make_session(TestActivity::Unknown, true, Some(5_000)));
         assert_eq!(
             too_small.injected_tab.unwrap().quiet_ms,
-            Some(IDLE_DEFAULT_QUIET_MS),
+            Some(SILENT_TAB_DEFAULT_QUIET_MS),
             "quiet below the 61s floor must be clamped up",
         );
-        let large = project_test_session(&make_session(TestLiveStatus::Idle, true, Some(120_000)));
+        let large = project_test_session(&make_session(TestActivity::Unknown, true, Some(120_000)));
         assert_eq!(
             large.injected_tab.unwrap().quiet_ms,
             Some(120_000),
@@ -3913,119 +3943,117 @@ mod tests {
         );
     }
 
-    /// Tab-backed error / completed project to NO override + a DEAD synthetic
-    /// tab carrying the exit code the dead-tab sweep branch maps.
+    /// Tab-backed exited / exited-error project to NO overrides + a DEAD
+    /// synthetic tab carrying the exit code the classifier reads.
     #[test]
-    fn project_tab_backed_error_and_completed_emit_dead_tab() {
-        let err = project_test_session(&make_session(TestLiveStatus::Error, true, None));
-        assert!(err.injected_live_status.is_none());
-        let err_spec = err.injected_tab.expect("error must emit a synthetic tab");
-        assert!(!err_spec.is_alive, "error synthetic tab must be dead");
-        assert_eq!(
-            err_spec.exit_code,
-            Some(1),
-            "error exit code must be non-zero"
+    fn project_tab_backed_exited_emit_dead_tab_with_exit_code() {
+        let err = project_test_session(&make_session(TestActivity::ExitedError, true, None));
+        assert!(err.injected_activity.is_none());
+        let err_spec = err
+            .injected_tab
+            .expect("exited-error must emit a synthetic tab");
+        assert!(
+            !err_spec.is_alive,
+            "exited-error synthetic tab must be dead"
         );
+        assert_eq!(err_spec.exit_code, Some(1), "exit code must be non-zero");
         assert_eq!(err_spec.quiet_ms, None);
 
-        let done = project_test_session(&make_session(TestLiveStatus::Completed, true, None));
-        assert!(done.injected_live_status.is_none());
-        let done_spec = done
-            .injected_tab
-            .expect("completed must emit a synthetic tab");
-        assert!(!done_spec.is_alive, "completed synthetic tab must be dead");
-        assert_eq!(
-            done_spec.exit_code,
-            Some(0),
-            "completed exit code must be zero"
-        );
+        let done = project_test_session(&make_session(TestActivity::Exited, true, None));
+        assert!(done.injected_activity.is_none());
+        let done_spec = done.injected_tab.expect("exited must emit a synthetic tab");
+        assert!(!done_spec.is_alive, "exited synthetic tab must be dead");
+        assert_eq!(done_spec.exit_code, Some(0), "exit code must be zero");
         assert_eq!(done_spec.quiet_ms, None);
     }
 
-    /// `idle` without `tab_backed` is a 400 — the orphan filter would drop it.
-    #[tokio::test]
-    async fn inject_rejects_idle_without_tab_backed() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let req = InjectSessionRequest {
-            task_run_id: "idle-no-tab".to_string(),
-            name: "idle no tab".to_string(),
-            live_status: TestLiveStatus::Idle,
+    fn tab_backed_request(location: TestLocation, activity: TestActivity) -> InjectSessionRequest {
+        InjectSessionRequest {
+            task_run_id: "tab-backed-bad".to_string(),
+            name: "tab backed bad".to_string(),
+            location,
+            activity,
             worktree: None,
             project_path: None,
             config_dir: None,
-            tab_backed: false,
+            tab_backed: true,
             quiet_ms: None,
-        };
-        let err = inject_session_handler(Json(req))
-            .await
-            .expect_err("idle without tab_backed should be rejected");
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert!(!err.1.success);
-        assert!(err.1.error.contains("idle"));
-    }
-
-    /// `tab_backed` for a status with no tab-backed mechanism is a 400.
-    #[tokio::test]
-    async fn inject_rejects_tab_backed_for_short_circuit_status() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        for status in [
-            TestLiveStatus::ActiveInZone,
-            TestLiveStatus::NeedsInput,
-            TestLiveStatus::Frozen,
-        ] {
-            let req = InjectSessionRequest {
-                task_run_id: "tab-backed-bad".to_string(),
-                name: "tab backed bad".to_string(),
-                live_status: status,
-                worktree: None,
-                project_path: None,
-                config_dir: None,
-                tab_backed: true,
-                quiet_ms: None,
-            };
-            let err = inject_session_handler(Json(req))
-                .await
-                .expect_err(&format!("tab_backed {status:?} should be rejected"));
-            assert_eq!(err.0, StatusCode::BAD_REQUEST);
-            assert!(!err.1.success);
         }
     }
 
-    /// Tab-backed idle / error / completed all round-trip through the handler
-    /// + registry and project to `injected_live_status: None`.
+    /// `tab_backed` for an activity with no tab-backed mechanism is a 400.
+    #[tokio::test]
+    async fn inject_rejects_tab_backed_for_short_circuit_activity() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        for activity in [
+            TestActivity::NeedsYou,
+            TestActivity::WaitingOnLock,
+            TestActivity::Working,
+            TestActivity::IdleAtPrompt,
+            TestActivity::NoOutputMidTool,
+            TestActivity::Finished,
+        ] {
+            let err = inject_session_handler(Json(tab_backed_request(
+                TestLocation::HiddenHere,
+                activity,
+            )))
+            .await
+            .expect_err(&format!("tab_backed {activity:?} should be rejected"));
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+            assert!(!err.1.success);
+            assert!(err.1.error.contains(activity.as_frontend_str()));
+        }
+    }
+
+    /// `tab_backed` with a location the synthetic tab cannot have is a 400:
+    /// the classifier computes `hidden-here` for a tab that sits in no zone.
+    #[tokio::test]
+    async fn inject_rejects_tab_backed_off_hidden_here() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        for location in [
+            TestLocation::OnScreen,
+            TestLocation::OutsideRunner,
+            TestLocation::OtherDevice,
+            TestLocation::NotRunning,
+            TestLocation::Unknown,
+        ] {
+            let err =
+                inject_session_handler(Json(tab_backed_request(location, TestActivity::Exited)))
+                    .await
+                    .expect_err(&format!("tab_backed at {location:?} should be rejected"));
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+            assert!(err.1.error.contains("hidden-here"));
+        }
+    }
+
+    /// Tab-backed unknown / exited-error / exited all round-trip through the
+    /// handler + registry and project with no override.
     #[tokio::test]
     async fn tab_backed_fakes_round_trip_with_no_override() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _ = clear_sessions_handler().await;
 
-        for (status, run_id) in [
-            (TestLiveStatus::Idle, "tb-idle"),
-            (TestLiveStatus::Error, "tb-error"),
-            (TestLiveStatus::Completed, "tb-completed"),
+        for (activity, run_id) in [
+            (TestActivity::Unknown, "tb-unknown"),
+            (TestActivity::ExitedError, "tb-exited-error"),
+            (TestActivity::Exited, "tb-exited"),
         ] {
-            let req = InjectSessionRequest {
-                task_run_id: run_id.to_string(),
-                name: format!("tab-backed {run_id}"),
-                live_status: status,
-                worktree: None,
-                project_path: None,
-                config_dir: None,
-                tab_backed: true,
-                quiet_ms: None,
-            };
+            let mut req = tab_backed_request(TestLocation::HiddenHere, activity);
+            req.task_run_id = run_id.to_string();
+            req.name = format!("tab-backed {run_id}");
             let _ = inject_session_handler(Json(req))
                 .await
                 .expect("tab-backed inject should succeed");
         }
 
         let merged = merge_with_injected(Vec::new(), injected_test_sessions());
-        for run_id in ["tb-idle", "tb-error", "tb-completed"] {
+        for run_id in ["tb-unknown", "tb-exited-error", "tb-exited"] {
             let fake = merged
                 .iter()
                 .find(|s| s.session_id == run_id)
                 .unwrap_or_else(|| panic!("{run_id} should be in merged list"));
             assert!(
-                fake.injected_live_status.is_none(),
+                fake.injected_location.is_none() && fake.injected_activity.is_none(),
                 "tab-backed {run_id} must carry no short-circuit override",
             );
             assert!(
@@ -4101,36 +4129,35 @@ mod tests {
                 .unwrap()
         };
 
-        // working / needs-input → short-circuit (not tab-backed).
-        assert!(!by_id("scenario-working-1").tab_backed);
-        assert_eq!(
-            by_id("scenario-working-1").live_status,
-            TestLiveStatus::ActiveInZone
-        );
-        assert!(!by_id("scenario-needs-input-1").tab_backed);
-        assert_eq!(
-            by_id("scenario-needs-input-1").live_status,
-            TestLiveStatus::NeedsInput
-        );
+        // working / needs-input / idle → short-circuit (not tab-backed).
+        for (id, activity) in [
+            ("scenario-working-1", TestActivity::Working),
+            ("scenario-needs-input-1", TestActivity::NeedsYou),
+            ("scenario-idle-1", TestActivity::IdleAtPrompt),
+        ] {
+            let fake = by_id(id);
+            assert!(!fake.tab_backed, "{id} must be short-circuit");
+            assert_eq!(fake.location, TestLocation::HiddenHere);
+            assert_eq!(fake.activity, activity);
+            let projected = project_test_session(&fake);
+            assert_eq!(
+                projected.injected_activity.as_deref(),
+                Some(activity.as_frontend_str())
+            );
+            assert!(projected.injected_tab.is_none());
+        }
 
-        // idle / error / completed → tab-backed.
-        let idle = by_id("scenario-idle-1");
-        assert!(idle.tab_backed);
-        assert_eq!(idle.live_status, TestLiveStatus::Idle);
-        assert_eq!(idle.quiet_ms, Some(SCENARIO_IDLE_QUIET_MS));
-        assert!(project_test_session(&idle).injected_tab.is_some());
-        assert!(project_test_session(&idle).injected_live_status.is_none());
-
+        // error / completed → tab-backed dead tabs.
         let error = by_id("scenario-error-1");
         assert!(error.tab_backed);
-        assert_eq!(error.live_status, TestLiveStatus::Error);
+        assert_eq!(error.activity, TestActivity::ExitedError);
         let err_spec = project_test_session(&error).injected_tab.unwrap();
         assert!(!err_spec.is_alive);
         assert_eq!(err_spec.exit_code, Some(1));
 
         let completed = by_id("scenario-completed-1");
         assert!(completed.tab_backed);
-        assert_eq!(completed.live_status, TestLiveStatus::Completed);
+        assert_eq!(completed.activity, TestActivity::Exited);
         let done_spec = project_test_session(&completed).injected_tab.unwrap();
         assert!(!done_spec.is_alive);
         assert_eq!(done_spec.exit_code, Some(0));
@@ -4152,7 +4179,8 @@ mod tests {
             sessions: Some(vec![InjectSessionRequest {
                 task_run_id: "explicit-1".to_string(),
                 name: "explicit".to_string(),
-                live_status: TestLiveStatus::ActiveInZone,
+                location: TestLocation::HiddenHere,
+                activity: TestActivity::Working,
                 worktree: None,
                 project_path: None,
                 config_dir: None,
@@ -4183,7 +4211,8 @@ mod tests {
                 InjectSessionRequest {
                     task_run_id: "explicit-a".to_string(),
                     name: "Explicit A".to_string(),
-                    live_status: TestLiveStatus::Frozen,
+                    location: TestLocation::HiddenHere,
+                    activity: TestActivity::NoOutputMidTool,
                     worktree: None,
                     project_path: None,
                     config_dir: None,
@@ -4193,7 +4222,8 @@ mod tests {
                 InjectSessionRequest {
                     task_run_id: "explicit-b".to_string(),
                     name: "Explicit B".to_string(),
-                    live_status: TestLiveStatus::Idle,
+                    location: TestLocation::HiddenHere,
+                    activity: TestActivity::Unknown,
                     worktree: None,
                     project_path: None,
                     config_dir: None,
@@ -4226,7 +4256,8 @@ mod tests {
         let _ = inject_session_handler(Json(InjectSessionRequest {
             task_run_id: "pre-existing-1".to_string(),
             name: "Pre-existing".to_string(),
-            live_status: TestLiveStatus::ActiveInZone,
+            location: TestLocation::HiddenHere,
+            activity: TestActivity::Working,
             worktree: None,
             project_path: None,
             config_dir: None,
@@ -4276,7 +4307,8 @@ mod tests {
             let _ = inject_session_handler(Json(InjectSessionRequest {
                 task_run_id: id.to_string(),
                 name: format!("clear-injected {id}"),
-                live_status: TestLiveStatus::ActiveInZone,
+                location: TestLocation::HiddenHere,
+                activity: TestActivity::Working,
                 worktree: None,
                 project_path: None,
                 config_dir: None,
@@ -4305,7 +4337,8 @@ mod tests {
         let _ = inject_session_handler(Json(InjectSessionRequest {
             task_run_id: "ttl-fresh".to_string(),
             name: "fresh".to_string(),
-            live_status: TestLiveStatus::ActiveInZone,
+            location: TestLocation::HiddenHere,
+            activity: TestActivity::Working,
             worktree: None,
             project_path: None,
             config_dir: None,
@@ -4326,7 +4359,8 @@ mod tests {
                     task_run_id: "ttl-stale".to_string(),
                     session_id: "ttl-stale".to_string(),
                     name: "stale".to_string(),
-                    live_status: TestLiveStatus::ActiveInZone,
+                    location: TestLocation::HiddenHere,
+                    activity: TestActivity::Working,
                     worktree: None,
                     injected_at: stale_at,
                     project_path: DEFAULT_TEST_PROJECT_PATH.to_string(),

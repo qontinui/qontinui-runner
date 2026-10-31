@@ -626,6 +626,69 @@ impl DiskTranscriptIndex {
             config_dirs: crate::terminal::transcript::find_claude_config_dirs(),
         }
     }
+
+    /// An index over exactly `config_dirs` — for a caller (and a test) that
+    /// names the dirs instead of discovering them.
+    pub fn with_config_dirs(config_dirs: Vec<PathBuf>) -> Self {
+        Self { config_dirs }
+    }
+
+    /// Every top-level session transcript under every known config dir:
+    /// `<config_dir>/projects/<encoded project>/<session id>.jsonl`, with the
+    /// stat a cache keys on. Subagent transcripts (nested one level deeper)
+    /// are not sessions and are not listed. An unreadable directory or file is
+    /// skipped — the caller reports how many it listed, never "none exist".
+    pub fn transcript_files(&self) -> Vec<TranscriptFile> {
+        let mut out = Vec::new();
+        for config_dir in &self.config_dirs {
+            let Ok(projects) = std::fs::read_dir(config_dir.join("projects")) else {
+                continue;
+            };
+            for project in projects.flatten() {
+                let Ok(files) = std::fs::read_dir(project.path()) else {
+                    continue;
+                };
+                for file in files.flatten() {
+                    let path = file.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    let Some(session_id) = path.file_stem().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    let Ok(meta) = file.metadata() else { continue };
+                    if !meta.is_file() {
+                        continue;
+                    }
+                    let mtime_ms = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    out.push(TranscriptFile {
+                        session_id: session_id.to_string(),
+                        config_dir: config_dir.clone(),
+                        path: path.clone(),
+                        mtime_ms,
+                        size: meta.len(),
+                    });
+                }
+            }
+        }
+        out
+    }
+}
+
+/// One transcript on disk, as [`DiskTranscriptIndex::transcript_files`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptFile {
+    pub session_id: String,
+    pub config_dir: PathBuf,
+    pub path: PathBuf,
+    /// Modification time, Unix millis (0 when the platform could not say).
+    pub mtime_ms: i64,
+    pub size: u64,
 }
 
 impl TranscriptIndex for DiskTranscriptIndex {

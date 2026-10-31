@@ -662,6 +662,14 @@ const SUPPORTED_ACTION_NAMES: &[&str] = &[
     "double",
     "right",
     "middle",
+    // The SDK's own names for the two button variants. Every interactive
+    // element advertises `rightClick` / `middleClick` (the SDK's
+    // `inferActions`), and the SDK executor dispatches exactly those
+    // spellings; `right` / `middle` above are never advertised, so the
+    // ACTION_NOT_SUPPORTED gate below refused every right-click there was —
+    // a context menu was unreachable over `/control/element/{id}/action`.
+    "rightClick",
+    "middleClick",
     "type",
     "sendKeys",
     "clear",
@@ -6453,6 +6461,32 @@ mod validate_action_name_tests {
             let got = validate_action_name(name)
                 .unwrap_or_else(|_| panic!("expected {name} to validate"));
             assert_eq!(got, *name, "validator must return the canonical name");
+        }
+    }
+
+    /// The spellings an element ADVERTISES must pass the name gate, or the
+    /// advertised-action gate after it can never be satisfied: an element
+    /// advertising `rightClick` was unreachable when only `right` validated.
+    #[test]
+    fn sdk_advertised_button_variants_are_accepted_and_advertised() {
+        let advertised = Some(
+            [
+                "focus",
+                "blur",
+                "hover",
+                "click",
+                "hoverClick",
+                "doubleClick",
+                "rightClick",
+                "middleClick",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+        );
+        for name in ["rightClick", "middleClick", "doubleClick"] {
+            assert_eq!(validate_action_name(name).unwrap(), name);
+            assert!(super::is_action_advertised(name, &advertised), "{name}");
         }
     }
 

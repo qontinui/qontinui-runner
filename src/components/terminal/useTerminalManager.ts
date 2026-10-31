@@ -9,6 +9,7 @@ import {
   type SessionCloseArgs,
 } from "./sessionRecordArgs";
 import { createLogger } from "@/lib/logger";
+import { describeThrown } from "@/lib/utils";
 import { spawnWithResourceGuard, type ResourceGuardSource } from "@/lib/resourceGuard";
 import { applyRemoteMark, type RemoteTabIdentity } from "./remoteTabs";
 import {
@@ -19,6 +20,7 @@ import {
   recordRestoreMisses,
   type HiddenWorkerState,
 } from "./hiddenWorkerReducer";
+import type { TerminalCloseOutcome } from "./sessionClose";
 
 const logger = createLogger("TerminalManager");
 
@@ -1497,8 +1499,14 @@ export function useTerminalManager(
     return id;
   }, []);
 
-  const closeTerminal = useCallback(
-    (id: string) => {
+  /**
+   * The page's close path, answering what it observed doing — the Session
+   * Manager's Force close reads it so it never claims a kill it did not see
+   * (`describeForceCloseOutcome` in `sessionClose.ts`). `closeTerminal` below
+   * is the same close with the answer discarded.
+   */
+  const closeTerminalReporting = useCallback(
+    (id: string): Promise<TerminalCloseOutcome> => {
       // Capture the closing tab's Claude session id (read-only) so we can record
       // an EXPLICIT durable close after the state update. We read it out of the
       // updater's `prev` without mutating inside the updater (StrictMode double-
@@ -1548,55 +1556,71 @@ export function useTerminalManager(
 
       // Only invoke Rust close for terminal tabs (plan tabs and worker views
       // have no PTY)
-      if (!id.startsWith("plan-") && !sessionBacked) {
-        // Whatever the last close left on screen, it does not describe THIS
-        // one. Clearing first means a stale warning can never be read as the
-        // outcome of the close the operator just performed — and a close that
-        // never answers (the `.catch` below) leaves no notice at all rather
-        // than the previous one.
-        setRemoteCloseNotice(null);
-        invoke<CommandResponse>("terminal_close", { terminalId: id })
-          .then((res) => {
-            // A REMOTE tab's close reports what it did about the relay binding
-            // (plan 2026-09-16-remote-tab-cannot-be-released-so-the-target-
-            // terminal-stays-claimed, Phase 1). Discarding it — which this
-            // handler did until now — made a failed detach look exactly like a
-            // clean one, since the tab vanishes either way.
-            //
-            // `success === false` is guarded even though today's Tauri command
-            // rejects instead: a door that ever answers a failed close WITH a
-            // report must not raise a notice about a close that did not happen.
-            if (res?.success === false) return;
-            const report = parseRemoteDetach(res?.data);
-            if (!report) return; // local tab: nothing extra happened
-            const message = res.message ?? `Remote close outcome: ${report.outcome}`;
-            if (isCleanRemoteClose(report)) {
-              // Logged, not shown: see `isCleanRemoteClose` on what this arm
-              // does and does not prove. The runner's hedge is kept verbatim.
-              logger.info(`Remote tab ${id} closed: ${message}`);
-              return;
-            }
-            logger.warn(`Remote tab ${id} closed without a confirmed detach: ${message}`);
-            setRemoteCloseNotice({ tabId: id, message, report });
-          })
-          .catch(() => {
-            // Terminal may already be gone (e.g. removed out-of-band by
-            // `DELETE /terminals/{id}`) — the re-sync below is what repairs the
-            // list either way. No notice: we have no answer to report, and an
-            // UNKNOWN must not render as a claim about the binding.
-          })
-          .finally(() => {
-            // Re-read the authoritative list AFTER the close settles. The
-            // optimistic local removal above is a UI-responsiveness shortcut, not
-            // a source of truth: without this, a close that raced an out-of-band
-            // delete (or that closed the last tab the frontend knew about) left
-            // the tab list permanently diverged from the backend and the grid
-            // rendered zero zones forever.
-            void resyncTabs();
-          });
-      }
+      if (sessionBacked) return Promise.resolve({ kind: "worker-view" });
+      if (id.startsWith("plan-")) return Promise.resolve({ kind: "no-process" });
+      // Whatever the last close left on screen, it does not describe THIS
+      // one. Clearing first means a stale warning can never be read as the
+      // outcome of the close the operator just performed — and a close that
+      // never answers (the `.catch` below) leaves no notice at all rather
+      // than the previous one.
+      setRemoteCloseNotice(null);
+      return invoke<CommandResponse>("terminal_close", { terminalId: id })
+        .then((res): TerminalCloseOutcome => {
+          // A REMOTE tab's close reports what it did about the relay binding
+          // (plan 2026-09-16-remote-tab-cannot-be-released-so-the-target-
+          // terminal-stays-claimed, Phase 1). Discarding it — which this
+          // handler did until now — made a failed detach look exactly like a
+          // clean one, since the tab vanishes either way.
+          //
+          // `success === false` is guarded even though today's Tauri command
+          // rejects instead: a door that ever answers a failed close WITH a
+          // report must not raise a notice about a close that did not happen.
+          if (res?.success === false) {
+            return {
+              kind: "unconfirmed",
+              detail: res.message ?? "terminal_close answered failure",
+            };
+          }
+          const killed: TerminalCloseOutcome = { kind: "killed" };
+          const report = parseRemoteDetach(res?.data);
+          if (!report) return killed; // local tab: nothing extra happened
+          const message = res.message ?? `Remote close outcome: ${report.outcome}`;
+          if (isCleanRemoteClose(report)) {
+            // Logged, not shown: see `isCleanRemoteClose` on what this arm
+            // does and does not prove. The runner's hedge is kept verbatim.
+            logger.info(`Remote tab ${id} closed: ${message}`);
+            return killed;
+          }
+          logger.warn(`Remote tab ${id} closed without a confirmed detach: ${message}`);
+          setRemoteCloseNotice({ tabId: id, message, report });
+          return killed;
+        })
+        .catch((e: unknown): TerminalCloseOutcome => {
+          // Terminal may already be gone (e.g. removed out-of-band by
+          // `DELETE /terminals/{id}`) — the re-sync below is what repairs the
+          // list either way. No notice: we have no answer to report, and an
+          // UNKNOWN must not render as a claim about the binding — nor as a
+          // kill (the Force close result reads this as unconfirmed).
+          return { kind: "unconfirmed", detail: describeThrown(e, "terminal_close failed") };
+        })
+        .finally(() => {
+          // Re-read the authoritative list AFTER the close settles. The
+          // optimistic local removal above is a UI-responsiveness shortcut, not
+          // a source of truth: without this, a close that raced an out-of-band
+          // delete (or that closed the last tab the frontend knew about) left
+          // the tab list permanently diverged from the backend and the grid
+          // rendered zero zones forever.
+          void resyncTabs();
+        });
     },
     [resyncTabs, applyHiddenWorkerState],
+  );
+
+  const closeTerminal = useCallback(
+    (id: string) => {
+      void closeTerminalReporting(id);
+    },
+    [closeTerminalReporting],
   );
 
   const dismissRemoteCloseNotice = useCallback(() => setRemoteCloseNotice(null), []);
@@ -1637,6 +1661,7 @@ export function useTerminalManager(
     createTerminal,
     createPlanTab,
     closeTerminal,
+    closeTerminalReporting,
     renameTab,
     updateTab,
     reconnectToExistingSessions,

@@ -1,4 +1,4 @@
-import { memo, useState, useEffect, useRef, useCallback } from "react";
+import { memo, useState, useEffect, useRef, useCallback, type DragEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useUIElement } from "@qontinui/ui-bridge";
 import {
@@ -8,7 +8,8 @@ import {
   AlertTriangle,
   FileWarning,
   Pin,
-  Tag,
+  BellOff,
+  Clock,
   GitBranch,
   GitCommit,
   Loader2,
@@ -24,8 +25,25 @@ import type { LockState } from "./useFileLockTracking";
 import type { CommandResponse } from "./types";
 import { isInjectedSession } from "./syntheticTabs";
 import { DURABLE_TOOLTIP } from "./sessionDurability";
+import { useNow1Hz } from "./useNow1Hz";
 import { describeThrown } from "@/lib/utils";
-import { sessionCardStatus, type SessionCardStatus } from "./sessionManagerLiveRows";
+import type { MemberOrg, SessionGroup, SessionOrgOp } from "./sessionOrgTypes";
+import { sessionOrgControlAttrs } from "./sessionOrgControls";
+import { SessionOrgMenuItems, type MenuPage } from "./SessionOrgMenus";
+import { sessionTopic, sessionTopicTitle } from "./sessionTopic";
+import { unseenAttr, type UnseenVerdict } from "./sessionUnseen";
+import type { SessionHoverCardController } from "./SessionHoverCard";
+import {
+  ACTIVITY_DOT,
+  activityText,
+  isLiveInThisRunner,
+  isPossiblyLive,
+  locationText,
+  SESSION_STATUS_LABELS,
+  type SessionActivity,
+  type SessionLocation,
+  type SessionStatus,
+} from "./sessionStatusModel";
 
 interface PromoteToWorktreeData {
   worktree_id: string;
@@ -49,8 +67,30 @@ interface SessionCardProps {
   isSelected: boolean;
   isChecked: boolean;
   selectionMode: boolean;
-  isPinned: boolean;
-  sessionLabel: string | null;
+  /**
+   * The row's organization (pin, tags, mute, snooze) from the runner's
+   * session-org store; `null` when it has none or the store is not known.
+   */
+  orgMember: MemberOrg | null;
+  /**
+   * The left bar's color: the session's GROUP color as a CSS value (D4 —
+   * status lives in the dot and its word). `null` = not in a group.
+   */
+  groupColor?: string | null;
+  /** The Pinned section's compact row: name and status words only. */
+  compact?: boolean;
+  /** The row's organization-store key — what the org menu's ops name. */
+  sessionKey?: string;
+  /**
+   * What the context menu's organization items need (group, pin, page,
+   * mute, snooze, tags). One object shared by every card, so the memo holds.
+   * Absent when the org is not known — the menu then offers none.
+   */
+  orgMenu?: SessionCardOrgMenu;
+  /** Native drag wiring, shared by every card (reorder, groups, page tabs). */
+  drag?: SessionCardDrag;
+  /** A drop here would land ABOVE this row — draw the insertion line. */
+  dropBefore?: boolean;
   /** Number of files this session shares with other sessions (0 = no conflicts) */
   fileConflictCount?: number;
   /**
@@ -65,8 +105,13 @@ interface SessionCardProps {
   onViewTranscript: (session: UnifiedSession) => void;
   onCopyId: (session: UnifiedSession) => void;
   onToggleSelect: (sessionId: string) => void;
-  onTogglePin: (sessionId: string) => void;
-  onSetLabel: (sessionId: string, label: string | null) => void;
+  /**
+   * The row click with its modifiers (Phase 5 multi-select): Ctrl/⌘ toggles,
+   * Shift selects a range, a plain click opens. Absent = a plain click opens.
+   */
+  onRowClick?: (session: UnifiedSession, mods: { toggle: boolean; range: boolean }) => void;
+  /** The session list's keyboard cursor is on this row. */
+  isCursor?: boolean;
   /** Optional: notify parent that the session list should refresh after a promotion. */
   onAfterPromote?: () => void;
   /**
@@ -84,48 +129,101 @@ interface SessionCardProps {
    */
   isOnScreen?: boolean;
   /**
-   * tmux work mode: this row's session is open in this window but not the one
-   * on screen. A running one reads "Active, off screen", not "Active in zone"
-   * — tmux zones only the shown session.
-   */
-  isOffScreen?: boolean;
-  /**
    * Close this row's terminal tab — the page's close path, the same one the
    * zone's close button takes. Absent when the row has no live tab in this
    * window (a transcript-only row has nothing to close), and the card then
    * offers no close.
    */
   onClose?: (session: UnifiedSession) => void;
+  /**
+   * The unseen-activity verdict (Phase 7): activity or output since the
+   * operator last focused this session. Absent = not tracked (no dot).
+   */
+  unseen?: UnseenVerdict;
+  /**
+   * The panel's hover-card binding (`useSessionHoverCard().bind`), shared by
+   * every card; hovering the row opens the card beside it. Absent = no card.
+   */
+  hoverCard?: SessionHoverCardController["bind"];
 }
 
-const STATUS_DOT: Record<SessionCardStatus, { color: string; pulse: boolean; label: string }> = {
-  "active-in-zone": { color: "#9ece6a", pulse: true, label: "Active in zone" },
-  "active-off-screen": { color: "#9ece6a", pulse: true, label: "Active, off screen" },
-  "active-external": { color: "#73daca", pulse: true, label: "Active externally" },
-  frozen: { color: "#f7768e", pulse: false, label: "Frozen" },
-  "needs-input": { color: "#e0af68", pulse: true, label: "Needs input" },
-  completed: { color: "#565f89", pulse: false, label: "Completed" },
-  error: { color: "#f7768e", pulse: false, label: "Error" },
-  dormant: { color: "#414868", pulse: false, label: "Dormant" },
-};
+/** The panel's drag handlers; each names the row it fires on. */
+export interface SessionCardDrag {
+  start: (session: UnifiedSession, e: DragEvent<HTMLDivElement>) => void;
+  end: () => void;
+  over: (session: UnifiedSession, e: DragEvent<HTMLDivElement>) => void;
+  drop: (session: UnifiedSession, e: DragEvent<HTMLDivElement>) => void;
+}
+
+/** The organization menu's shared inputs. */
+export interface SessionCardOrgMenu {
+  groups: readonly SessionGroup[];
+  /** Pages other than this one. */
+  pages: readonly MenuPage[];
+  apply: (ops: SessionOrgOp[]) => void;
+  moveToPage: (session: UnifiedSession, pageId: string) => void;
+}
+
+/** "Snoozed until 14:05" when `until` is still ahead of `now`; else null. */
+export function snoozeLabel(until: number | null, now: number = Date.now()): string | null {
+  if (until === null || until <= now) return null;
+  const d = new Date(until);
+  const sameDay = new Date(now).toDateString() === d.toDateString();
+  const time = d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  return sameDay
+    ? `Snoozed until ${time}`
+    : `Snoozed until ${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })} ${time}`;
+}
 
 /**
- * The status chip a card shows: its key (`data-session-status`), dot color,
- * pulse and label. `isOffScreen` is tmux mode's "open here, not on screen"
- * (`isRowOffScreen`), which turns "Active in zone" into "Active, off screen".
- * An orphaned "frozen" session has no live PTY in this window — it's simply
- * not running here, so its chip is relabelled away from the alarming "Frozen"
- * to a neutral, resumable read (color muted to match).
+ * The activity word. Only `No output 12m (mid-tool)` carries a duration that
+ * moves, so only that one subscribes to the shared 1 Hz tick — a list of
+ * hundreds of cards does not re-render every second.
  */
-export function sessionCardStatusInfo(
-  session: Pick<UnifiedSession, "liveStatus" | "isOrphaned">,
-  isOffScreen: boolean,
-): { status: SessionCardStatus; color: string; pulse: boolean; label: string } {
-  const status = sessionCardStatus(session.liveStatus, isOffScreen);
-  if (session.liveStatus === "frozen" && session.isOrphaned) {
-    return { status, color: "#565f89", pulse: false, label: "Not running" };
-  }
-  return { status, ...STATUS_DOT[status] };
+function ActivityWord({ status }: { status: SessionStatus }) {
+  return status.activity === "no-output-mid-tool" ? (
+    <TickingActivityWord status={status} />
+  ) : (
+    <>{activityText(status, 0)}</>
+  );
+}
+
+function TickingActivityWord({ status }: { status: SessionStatus }) {
+  return <>{activityText(status, useNow1Hz())}</>;
+}
+
+/** What a card shows for its status: two words, a dot, and why. */
+export interface SessionCardStatusDisplay {
+  location: SessionLocation;
+  activity: SessionActivity;
+  locationLabel: string;
+  activityLabel: string;
+  color: string;
+  pulse: boolean;
+  /** Which source decided each axis — the words' tooltip. */
+  reason: string;
+}
+
+/**
+ * The status a card shows: the activity word and the location word, each its
+ * own `data-session-*` attribute, plus the dot's color. The word is the
+ * signal; the color only repeats it (D2: never color alone).
+ *
+ * `activityLabel` carries an exit code but not the moving `No output` duration
+ * — the rendered word ticks that itself ({@link ActivityWord}).
+ */
+export function sessionCardStatusDisplay(status: SessionStatus): SessionCardStatusDisplay {
+  return {
+    location: status.location,
+    activity: status.activity,
+    locationLabel: locationText(status),
+    activityLabel:
+      status.activity === "no-output-mid-tool"
+        ? SESSION_STATUS_LABELS.activity["no-output-mid-tool"]
+        : activityText(status, 0),
+    ...ACTIVITY_DOT[status.activity],
+    reason: status.reason,
+  };
 }
 
 const ACCOUNT_BADGE_COLORS: Record<string, { bg: string; text: string }> = {
@@ -241,6 +339,42 @@ export function sessionCardTooltip(
   return base;
 }
 
+/** The card's second line: the topic, and its full value for the `title`. */
+export interface SessionCardTopicLine {
+  text: string;
+  /** The full topic and the field it came from — the line truncates. */
+  title: string;
+}
+
+/**
+ * The card's second line (Phase 7): the session's topic — the work summary,
+ * else the resume name, else the first prompt — skipping a candidate that
+ * repeats the headline. `null` when no field carries one (no line rendered).
+ */
+export function sessionCardTopicLine(
+  session: Pick<
+    UnifiedSession,
+    "registryName" | "resumeName" | "displayName" | "workSummaryHint" | "firstMessagePreview"
+  >,
+): SessionCardTopicLine | null {
+  const topic = sessionTopic(session, sessionCardName(session));
+  return topic ? { text: topic.text, title: sessionTopicTitle(topic) } : null;
+}
+
+/**
+ * The unseen dot's tooltip, or `null` when no dot is drawn. Only `unseen`
+ * draws one: an UNKNOWN verdict draws nothing (the card's
+ * `data-session-unseen="unknown"` states it), never a dot or a "seen".
+ */
+export function unseenDotTitle(verdict: UnseenVerdict | undefined): string | null {
+  if (verdict?.state !== "unseen") return null;
+  const at = new Date(verdict.since).toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  return `New activity since you last looked (at ${at}) — focus the session to clear`;
+}
+
 /** Which of a card's actions apply to its row. */
 export interface SessionCardActions {
   resume: boolean;
@@ -248,32 +382,27 @@ export interface SessionCardActions {
   copySessionId: boolean;
   promote: boolean;
   commit: boolean;
-  /** Selecting for bulk resume (checkbox + "Select for Bulk"). */
-  bulkSelect: boolean;
 }
 
 /**
  * The card's action set. A tab-sourced row (a plain shell, a session before its
  * first message, a remote session tab) has no transcript, so view transcript,
- * copy session id, resume and bulk select do not apply, and nothing backs
+ * copy session id and resume do not apply, and nothing backs
  * promote or commit (both key on a Claude session id the row does not carry).
- * Promote and commit additionally need a session that is live in this runner.
+ * Promote and commit additionally need a session that is live in this runner
+ * (`On screen` / `Hidden here`, not exited).
  */
 export function sessionCardActions(
-  session: Pick<UnifiedSession, "source" | "liveStatus">,
+  session: Pick<UnifiedSession, "source" | "status">,
 ): SessionCardActions {
   const transcript = session.source === "transcript";
-  const liveHere =
-    session.liveStatus === "active-in-zone" ||
-    session.liveStatus === "needs-input" ||
-    session.liveStatus === "frozen";
+  const liveHere = isLiveInThisRunner(session.status);
   return {
     resume: transcript,
     viewTranscript: transcript,
     copySessionId: transcript,
     promote: transcript && liveHere,
     commit: transcript && liveHere,
-    bulkSelect: transcript,
   };
 }
 
@@ -313,8 +442,13 @@ function SessionCardInner({
   isSelected,
   isChecked,
   selectionMode,
-  isPinned,
-  sessionLabel,
+  orgMember,
+  groupColor = null,
+  compact = false,
+  sessionKey,
+  orgMenu,
+  drag,
+  dropBefore = false,
   fileConflictCount = 0,
   lockState,
   onResume,
@@ -322,25 +456,33 @@ function SessionCardInner({
   onViewTranscript,
   onCopyId,
   onToggleSelect,
-  onTogglePin,
-  onSetLabel,
+  onRowClick,
+  isCursor = false,
   onAfterPromote,
   onOpenWorktrees,
   isOnScreen = false,
-  isOffScreen = false,
   onClose,
+  unseen,
+  hoverCard,
 }: SessionCardProps) {
   const actions = sessionCardActions(session);
-  const statusInfo = sessionCardStatusInfo(session, isOffScreen);
-  const cardStatus = statusInfo.status;
+  const statusInfo = sessionCardStatusDisplay(session.status);
+  // "Still running somewhere" for the live-only affordances below: a process
+  // that may be up (an UNKNOWN placement included) and has not exited.
+  const mayBeRunning =
+    isPossiblyLive(session.status.location) &&
+    session.status.activity !== "exited" &&
+    session.status.activity !== "exited-error";
   const accountBadge = ACCOUNT_BADGE_COLORS[session.accountLabel];
   const durationLabel = formatDuration(session.durationMs);
 
   // Context menu
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
-  const [labelInput, setLabelInput] = useState("");
-  const [showLabelInput, setShowLabelInput] = useState(false);
   const contextRef = useRef<HTMLDivElement>(null);
+  const closeMenu = useCallback(() => setContextMenu(null), []);
+  const isPinned = orgMember?.pinned ?? false;
+  const tags = orgMember?.tags ?? [];
+  const snoozed = snoozeLabel(orgMember?.snoozedUntil ?? null);
 
   // ── Promote to worktree state ────────────────────────────────────────────
   // The promote command takes a few seconds (kill the current PTY, create
@@ -356,8 +498,8 @@ function SessionCardInner({
   // Promotion is only meaningful for sessions that are actually live in this
   // runner — promote_session_to_worktree looks the session up in
   // SessionManager by task_run_id, which equals the claude session id for
-  // this runner's live PTYs. External / dormant / completed sessions can't
-  // be promoted from this UI (the backend would just 404).
+  // this runner's live PTYs. Outside-runner / not-running / exited sessions
+  // can't be promoted from this UI (the backend would just 404).
   const canPromote = actions.promote;
 
   // Hide the button entirely once the promotion has succeeded — the parent
@@ -495,7 +637,6 @@ function SessionCardInner({
     const handler = (e: MouseEvent) => {
       if (contextRef.current && !contextRef.current.contains(e.target as Node)) {
         setContextMenu(null);
-        setShowLabelInput(false);
       }
     };
     document.addEventListener("mousedown", handler);
@@ -503,6 +644,9 @@ function SessionCardInner({
   }, [contextMenu]);
 
   const cardName = sessionCardName(session);
+  const topicLine = sessionCardTopicLine(session);
+  const unseenTitle = unseenDotTitle(unseen);
+  const hoverHandlers = hoverCard?.(session.sessionId);
   // Registered on the card's main BUTTON, not the wrapper `<div>`: the button
   // is what actually acts on a click — it focuses the session's open terminal
   // tab when it has one, else opens the transcript (a click dispatched at the wrapper
@@ -529,23 +673,21 @@ function SessionCardInner({
   return (
     <div
       onContextMenu={handleContextMenu}
+      onMouseEnter={hoverHandlers?.onMouseEnter}
+      onMouseLeave={hoverHandlers?.onMouseLeave}
+      draggable={drag !== undefined}
+      onDragStart={drag ? (e) => drag.start(session, e) : undefined}
+      onDragEnd={drag?.end}
+      onDragOver={drag ? (e) => drag.over(session, e) : undefined}
+      onDrop={drag ? (e) => drag.drop(session, e) : undefined}
+      data-session-group-color={groupColor ?? "none"}
+      // The left bar is the session's GROUP color (D4); status is the dot and
+      // its word. Selection and on-screen keep their background tint.
+      style={{ borderLeftColor: groupColor ?? "transparent" }}
       className={`
-        group relative border-l-2 transition-colors
-        ${
-          isOnScreen
-            ? "border-l-brand-primary bg-brand-primary/10"
-            : isSelected
-              ? "border-l-[#7aa2f7] bg-[#7aa2f7]/5"
-              : session.liveStatus === "frozen"
-                ? "border-l-[#f7768e]/50 hover:bg-[#1a1b26]"
-                : session.liveStatus === "needs-input"
-                  ? "border-l-[#e0af68]/50 hover:bg-[#1a1b26]"
-                  : session.liveStatus === "active-in-zone"
-                    ? "border-l-[#9ece6a]/50 hover:bg-[#1a1b26]"
-                    : session.liveStatus === "active-external"
-                      ? "border-l-[#73daca]/50 hover:bg-[#1a1b26]"
-                      : "border-l-transparent hover:bg-[#1a1b26]"
-        }
+        group relative border-l-[3px] transition-colors
+        ${dropBefore ? "border-t-2 border-t-brand-primary" : ""}
+        ${isChecked ? "bg-[#7aa2f7]/15" : isOnScreen ? "bg-brand-primary/10" : isSelected ? "bg-[#7aa2f7]/5" : "hover:bg-[#1a1b26]"}
       `}
     >
       <button
@@ -556,22 +698,35 @@ function SessionCardInner({
         // its rendered text.
         data-session-id={session.sessionId}
         data-session-title={cardName}
-        data-session-status={cardStatus}
+        data-session-location={statusInfo.location}
+        data-session-activity={statusInfo.activity}
         data-session-account={session.accountLabel}
         data-session-source={session.source}
         data-session-on-screen={isOnScreen ? "true" : "false"}
+        data-session-checked={isChecked ? "true" : "false"}
+        data-session-cursor={isCursor ? "true" : "false"}
+        data-session-unseen={unseen ? unseenAttr(unseen) : "untracked"}
+        aria-selected={isChecked}
         aria-current={isOnScreen ? "true" : undefined}
         // `accessibleName` and `ai/find` resolve on this. `title` carries the
         // rich multi-line tooltip, which makes a poor name, so the headline is
         // stated separately here; the tooltip is unchanged visually.
         aria-label={cardName}
-        onClick={() => onOpen(session)}
-        className="w-full text-left px-3 py-2 pr-20"
+        onClick={(e) =>
+          onRowClick
+            ? onRowClick(session, { toggle: e.ctrlKey || e.metaKey, range: e.shiftKey })
+            : onOpen(session)
+        }
+        // The list owns keyboard focus (↑/↓/Enter/Space); rows are reached by it.
+        tabIndex={onRowClick ? -1 : undefined}
+        className={`w-full text-left px-3 pr-20 ${compact ? "py-1" : "py-2"} ${
+          isCursor ? "outline outline-1 -outline-offset-1 outline-brand-primary/60" : ""
+        }`}
         title={sessionCardTooltip(session)}
       >
         {/* Row 1: Status dot + Name + Account badge */}
         <div className="flex items-center gap-1.5 mb-0.5">
-          {selectionMode && actions.bulkSelect && (
+          {selectionMode && (
             <input
               type="checkbox"
               checked={isChecked}
@@ -586,9 +741,19 @@ function SessionCardInner({
           <span
             className={`w-2 h-2 rounded-full shrink-0 ${statusInfo.pulse ? "animate-pulse" : ""}`}
             style={{ backgroundColor: statusInfo.color }}
-            title={statusInfo.label}
+            title={`${statusInfo.activityLabel} · ${statusInfo.locationLabel}`}
           />
           <span className="text-xs text-[#a9b1d6] truncate flex-1">{sessionCardName(session)}</span>
+          {unseenTitle && (
+            <span
+              {...sessionOrgControlAttrs("unseenDot", session.sessionId)}
+              data-testid="session-card-unseen"
+              className="w-1.5 h-1.5 rounded-full shrink-0 bg-brand-primary"
+              title={unseenTitle}
+              aria-label={unseenTitle}
+              role="img"
+            />
+          )}
           {isOnScreen && (
             <span
               data-testid="session-card-on-screen"
@@ -637,67 +802,90 @@ function SessionCardInner({
               the deliberate counterpart to the "ephemeral" marker on
               non-durable interactive PTY tabs — which is why a tab-sourced
               row (a plain shell, nothing to resume) never carries it. */}
-          {actions.resume &&
-            session.liveStatus !== "dormant" &&
-            session.liveStatus !== "completed" && (
-              <span
-                className="shrink-0 inline-flex"
-                title={DURABLE_TOOLTIP}
-                aria-label={`Durable session: ${DURABLE_TOOLTIP}`}
-              >
-                <RotateCcw className="w-3 h-3 text-[#565f89]" />
-              </span>
-            )}
-          {isPinned && <Pin className="w-3 h-3 text-[#e0af68] shrink-0" />}
-          {sessionLabel && (
-            <span className="px-1 py-0 rounded text-[9px] font-medium shrink-0 bg-[#73daca]/10 text-[#73daca] truncate max-w-[60px]">
-              {sessionLabel}
+          {actions.resume && mayBeRunning && (
+            <span
+              className="shrink-0 inline-flex"
+              title={DURABLE_TOOLTIP}
+              aria-label={`Durable session: ${DURABLE_TOOLTIP}`}
+            >
+              <RotateCcw className="w-3 h-3 text-[#565f89]" />
+            </span>
+          )}
+          {isPinned && (
+            <span className="shrink-0 inline-flex" title="Pinned">
+              <Pin className="w-3 h-3 text-[#e0af68]" aria-label="Pinned" />
+            </span>
+          )}
+          {orgMember?.muted && (
+            <span className="shrink-0 inline-flex" title="Muted: no needs-input toast or sound">
+              <BellOff className="w-3 h-3 text-[#565f89]" aria-label="Muted" />
+            </span>
+          )}
+          {snoozed && (
+            <span className="shrink-0 inline-flex" title={snoozed}>
+              <Clock className="w-3 h-3 text-[#565f89]" aria-label={snoozed} />
+            </span>
+          )}
+          {tags.slice(0, 2).map((tag) => (
+            <span
+              key={tag}
+              data-session-tag={tag}
+              className="px-1 py-0 rounded text-[9px] font-medium shrink-0 bg-[#73daca]/10 text-[#73daca] truncate max-w-[60px]"
+              title={`Tag: ${tag}`}
+            >
+              {tag}
+            </span>
+          ))}
+          {tags.length > 2 && (
+            <span className="text-[9px] text-[#565f89] shrink-0" title={`Tags: ${tags.join(", ")}`}>
+              +{tags.length - 2}
             </span>
           )}
         </div>
 
-        {/* Row 2: Meta info */}
-        <div className="flex items-center gap-1 text-[10px] text-[#414868] ml-3.5">
-          <span>{formatTimeAgo(session.lastModified)}</span>
-          <span>&middot;</span>
-          {/* A tab-sourced row has no transcript, so no message count. */}
-          <span>{session.source === "tab" ? "terminal" : `${session.messageCount} msgs`}</span>
-          {durationLabel && (
-            <>
-              <span>&middot;</span>
-              <span title="Session duration">{durationLabel}</span>
-            </>
-          )}
-          <span>&middot;</span>
-          <span className="truncate">{session.projectLabel}</span>
+        {/* Row 2: the topic (not on a compact pinned row). Truncated, so the
+            full value and its source ride in the title. */}
+        {!compact && topicLine && (
+          <div
+            data-testid="session-card-topic"
+            className="ml-3.5 mb-0.5 text-[10px] text-[#565f89] truncate leading-tight"
+            title={topicLine.title}
+          >
+            {topicLine.text}
+          </div>
+        )}
+
+        {/* Row 3: Status words — activity, then location. Each carries the
+            source that decided it in its tooltip. */}
+        <div
+          data-testid="session-card-status"
+          className="flex items-center gap-1 text-[10px] ml-3.5 min-w-0"
+          title={statusInfo.reason}
+        >
+          <span className="shrink-0 font-medium" style={{ color: statusInfo.color }}>
+            <ActivityWord status={session.status} />
+          </span>
+          <span className="text-[#414868]">&middot;</span>
+          <span className="truncate text-[#565f89]">{statusInfo.locationLabel}</span>
         </div>
 
-        {/* Row 3: Work summary hint (only for frozen/needs-input/active) */}
-        {session.workSummaryHint &&
-          session.liveStatus !== "dormant" &&
-          session.liveStatus !== "completed" && (
-            <div className="mt-1 ml-3.5 text-[10px] text-[#565f89] truncate leading-tight">
-              {session.lastMessagePreview || session.workSummaryHint}
-            </div>
-          )}
-
-        {/* Frozen / orphaned badge.
-            - Orphaned (no live PTY in this window): the transcript just isn't
-              open anywhere — it's resumable, not failed. Neutral copy + color.
-            - Genuinely stuck live session (a stale in-zone tab): keep the
-              warning treatment. */}
-        {session.liveStatus === "frozen" &&
-          (session.isOrphaned ? (
-            <div className="mt-1 ml-3.5 flex items-center gap-1 text-[10px] text-[#565f89]">
-              <TerminalSquare className="w-3 h-3" />
-              <span>Not open in a window — click Resume to continue</span>
-            </div>
-          ) : (
-            <div className="mt-1 ml-3.5 flex items-center gap-1 text-[10px] text-[#f7768e]/80">
-              <AlertTriangle className="w-3 h-3" />
-              <span>Session appears stuck — may need resume</span>
-            </div>
-          ))}
+        {/* Row 4: Meta info (not on a compact pinned row) */}
+        {!compact && (
+          <div className="flex items-center gap-1 text-[10px] text-[#414868] ml-3.5">
+            <span>{formatTimeAgo(session.lastModified)}</span>
+            <span>&middot;</span>
+            {/* A tab-sourced row has no transcript, so no message count. */}
+            <span>{session.source === "tab" ? "terminal" : `${session.messageCount} msgs`}</span>
+            {durationLabel && (
+              <>
+                <span>&middot;</span>
+                <span title="Session duration">{durationLabel}</span>
+              </>
+            )}
+            <span>&middot;</span>
+            <span className="truncate">{session.projectLabel}</span>
+          </div>
+        )}
 
         {/* File-lock waiting subtitle — sourced from useFileLockTracking
             via `sessionLockStates`. Same orange color convention as the
@@ -900,144 +1088,117 @@ function SessionCardInner({
           className="fixed z-50 py-1 min-w-[160px] bg-[#1a1b26] border border-[#2a2d3d] rounded-md shadow-xl"
           style={{ left: contextMenu.x, top: contextMenu.y }}
         >
-          {showLabelInput ? (
-            <div className="px-2 py-1">
-              <input
-                autoFocus
-                value={labelInput}
-                onChange={(e) => setLabelInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    onSetLabel(session.sessionId, labelInput.trim() || null);
-                    setContextMenu(null);
-                    setShowLabelInput(false);
-                    setLabelInput("");
-                  } else if (e.key === "Escape") {
-                    setShowLabelInput(false);
-                    setLabelInput("");
-                  }
-                }}
-                placeholder="Enter label..."
-                className="w-full px-2 py-1 text-xs bg-[#13141f] border border-[#2a2d3d] rounded text-[#a9b1d6] placeholder-[#414868] focus:outline-none focus:border-[#7aa2f7]/50"
-              />
-            </div>
-          ) : (
-            <>
-              {actions.resume && (
-                <button
-                  onClick={() => {
-                    onResume(session);
-                    setContextMenu(null);
-                  }}
-                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
-                >
-                  <TerminalSquare className="w-3 h-3 text-[#9ece6a]" /> Resume
-                </button>
-              )}
-              {actions.viewTranscript && (
-                <button
-                  onClick={() => {
-                    onViewTranscript(session);
-                    setContextMenu(null);
-                  }}
-                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
-                >
-                  <Eye className="w-3 h-3 text-[#7aa2f7]" /> View Transcript
-                </button>
-              )}
-              {actions.copySessionId && (
-                <button
-                  onClick={() => {
-                    onCopyId(session);
-                    setContextMenu(null);
-                  }}
-                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
-                >
-                  <Copy className="w-3 h-3" /> Copy Session ID
-                </button>
-              )}
-              {canPromote && !promoted && (
-                <button
-                  onClick={(e) => {
-                    setContextMenu(null);
-                    void handlePromote(e);
-                  }}
-                  disabled={promoteState.kind === "loading"}
-                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors disabled:opacity-50"
-                >
-                  {promoteState.kind === "loading" ? (
-                    <Loader2 className="w-3 h-3 text-[#7aa2f7] animate-spin" />
-                  ) : (
-                    <GitBranch className="w-3 h-3 text-[#7aa2f7]" />
-                  )}
-                  Promote to Worktree
-                </button>
-              )}
-              {canCommit && (
-                <button
-                  onClick={(e) => {
-                    setContextMenu(null);
-                    void handleCommit(e);
-                  }}
-                  disabled={commitState.kind === "loading"}
-                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors disabled:opacity-50"
-                >
-                  {commitState.kind === "loading" ? (
-                    <Loader2 className="w-3 h-3 text-[#9ece6a] animate-spin" />
-                  ) : (
-                    <GitCommit className="w-3 h-3 text-[#9ece6a]" />
-                  )}
-                  Commit Progress
-                </button>
-              )}
-              {actions.resume && <div className="my-1 h-px bg-[#2a2d3d]" />}
+          <>
+            {actions.resume && (
               <button
                 onClick={() => {
-                  onTogglePin(session.sessionId);
+                  onResume(session);
                   setContextMenu(null);
                 }}
                 className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
               >
-                <Pin className={`w-3 h-3 ${isPinned ? "text-[#e0af68]" : ""}`} />
-                {isPinned ? "Unpin" : "Pin to Top"}
+                <TerminalSquare className="w-3 h-3 text-[#9ece6a]" /> Resume
               </button>
+            )}
+            {actions.viewTranscript && (
               <button
                 onClick={() => {
-                  setShowLabelInput(true);
-                  setLabelInput(sessionLabel ?? "");
+                  onViewTranscript(session);
+                  setContextMenu(null);
                 }}
                 className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
               >
-                <Tag className="w-3 h-3 text-[#73daca]" />
-                {sessionLabel ? "Edit Label" : "Add Label"}
+                <Eye className="w-3 h-3 text-[#7aa2f7]" /> View Transcript
               </button>
-              {!selectionMode && actions.bulkSelect && (
+            )}
+            {actions.copySessionId && (
+              <button
+                onClick={() => {
+                  onCopyId(session);
+                  setContextMenu(null);
+                }}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
+              >
+                <Copy className="w-3 h-3" /> Copy Session ID
+              </button>
+            )}
+            {canPromote && !promoted && (
+              <button
+                onClick={(e) => {
+                  setContextMenu(null);
+                  void handlePromote(e);
+                }}
+                disabled={promoteState.kind === "loading"}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors disabled:opacity-50"
+              >
+                {promoteState.kind === "loading" ? (
+                  <Loader2 className="w-3 h-3 text-[#7aa2f7] animate-spin" />
+                ) : (
+                  <GitBranch className="w-3 h-3 text-[#7aa2f7]" />
+                )}
+                Promote to Worktree
+              </button>
+            )}
+            {canCommit && (
+              <button
+                onClick={(e) => {
+                  setContextMenu(null);
+                  void handleCommit(e);
+                }}
+                disabled={commitState.kind === "loading"}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors disabled:opacity-50"
+              >
+                {commitState.kind === "loading" ? (
+                  <Loader2 className="w-3 h-3 text-[#9ece6a] animate-spin" />
+                ) : (
+                  <GitCommit className="w-3 h-3 text-[#9ece6a]" />
+                )}
+                Commit Progress
+              </button>
+            )}
+            {orgMenu && sessionKey && (
+              <>
+                <div className="my-1 h-px bg-[#2a2d3d]" />
+                <SessionOrgMenuItems
+                  sessionId={session.sessionId}
+                  sessionKey={sessionKey}
+                  member={orgMember}
+                  groups={orgMenu.groups}
+                  pages={orgMenu.pages}
+                  hasLiveTab={onClose !== undefined}
+                  onApply={orgMenu.apply}
+                  onMoveToPage={(pageId) => orgMenu.moveToPage(session, pageId)}
+                  close={closeMenu}
+                />
+              </>
+            )}
+            {!selectionMode && (
+              <button
+                onClick={() => {
+                  onToggleSelect(session.sessionId);
+                  setContextMenu(null);
+                }}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
+              >
+                <Copy className="w-3 h-3" /> Select (Ctrl-click)
+              </button>
+            )}
+            {onClose && (
+              <>
+                <div className="my-1 h-px bg-[#2a2d3d]" />
                 <button
+                  {...sessionOrgControlAttrs("sessionMenuClose", session.sessionId)}
                   onClick={() => {
-                    onToggleSelect(session.sessionId);
                     setContextMenu(null);
+                    onClose(session);
                   }}
-                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
+                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#f7768e] hover:bg-[#2a2d3d] transition-colors"
                 >
-                  <Copy className="w-3 h-3" /> Select for Bulk
+                  <X className="w-3 h-3" /> Close…
                 </button>
-              )}
-              {onClose && (
-                <>
-                  <div className="my-1 h-px bg-[#2a2d3d]" />
-                  <button
-                    onClick={() => {
-                      setContextMenu(null);
-                      onClose(session);
-                    }}
-                    className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#f7768e] hover:bg-[#2a2d3d] transition-colors"
-                  >
-                    <X className="w-3 h-3" /> Close Session
-                  </button>
-                </>
-              )}
-            </>
-          )}
+              </>
+            )}
+          </>
         </div>
       )}
     </div>
