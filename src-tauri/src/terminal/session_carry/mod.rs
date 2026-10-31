@@ -14,7 +14,7 @@
 //!   reach it: [`copy_transcript`] (the account migration's destructive
 //!   [`MainTranscript::LiveSourceWins`] carry, visible only inside
 //!   `crate::terminal`, whose one caller holds the migration's in-flight
-//!   guard — [`super::account_migration::migrate_session`]) and
+//!   guard — `super::account_migration::prepare_migration`) and
 //!   [`carry_for_respawn`] (the cross-machine respawn receiver,
 //!   `crate::session::respawn`, which can name only the two non-destructive
 //!   modes, [`RespawnCarry`]).
@@ -384,7 +384,7 @@ enum MainTranscript {
 /// [`carry_session`] with [`MainTranscript::LiveSourceWins`] — the account
 /// migration's carry, which moves a diverged destination aside and copies the
 /// live source over it. Visible only inside `crate::terminal`: its one caller
-/// ([`super::account_migration::migrate_session`]) holds the session's
+/// (`super::account_migration::prepare_migration`) holds the session's
 /// in-flight guard across it, and nothing outside this module tree can name
 /// [`MainTranscript`] to reach the same carry another way
 /// ([`carry_for_respawn`] takes [`RespawnCarry`], which has no destructive
@@ -809,8 +809,8 @@ where
     if let Err(error) = copy_via_partial(src, dst) {
         // Check-then-rename, not atomic. The migration's per-session
         // in-flight guard (`account_migration::begin_migration`), held across
-        // the whole carry, excludes only a CONCURRENT MIGRATION of this
-        // session; the resumed pane that will own the destination is not
+        // the whole carry, excludes only a CONCURRENT MOVER of this session
+        // (a migration, the resume door, the respawn receiver); the resumed pane that will own the destination is not
         // spawned yet. It does NOT exclude an earlier hop's detached step-4b
         // delta sync, which runs outside the guard by design (the
         // `account_migration` module doc's exception): after a fast hop back

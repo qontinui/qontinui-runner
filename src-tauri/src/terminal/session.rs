@@ -2754,6 +2754,13 @@ impl TerminalSession {
 
         Self::apply_session_temp_root(cmd, effective_claude_config_dir);
 
+        // Hand CLI updates to the runner-owned updater when it serves this box
+        // (`DISABLE_AUTOUPDATER=1`, or nothing). One shared helper for all three
+        // child-env seams; see `crate::claude_cli_update::child_env_pairs`.
+        crate::claude_cli_update::apply_child_env(|k, v| {
+            cmd.env(k, v);
+        });
+
         crate::terminal::scrub_credential_env_pty(cmd);
     }
 
@@ -5374,6 +5381,30 @@ pub(crate) mod tests {
             Some("/tmp/claude-config"),
             "the resolved account pin must still be applied"
         );
+    }
+
+    /// Phase 3 of plan
+    /// `2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn`:
+    /// the PTY seam carries `DISABLE_AUTOUPDATER=1` when the runner owns CLI
+    /// updates, and nothing on each of the three off arms. Deleting the
+    /// `apply_child_env` call from `finalize_child_env` reddens the ON half.
+    #[test]
+    fn pty_finalize_child_env_defers_cli_updates_to_the_runner() {
+        use crate::claude_cli_update::{test_gates, with_gate};
+        let build = || {
+            let mut cmd = CommandBuilder::new("dummy");
+            // `CommandBuilder::new` seeds the map from the process env; start
+            // from "absent" so the assertion reads only what the seam set.
+            cmd.env_remove("DISABLE_AUTOUPDATER");
+            TerminalSession::finalize_child_env(&mut cmd, Some("/tmp/claude-config"), false);
+            cmd.get_env("DISABLE_AUTOUPDATER")
+                .and_then(|v| v.to_str())
+                .map(str::to_string)
+        };
+        assert_eq!(with_gate(test_gates::ON, build).as_deref(), Some("1"));
+        for (arm, gate) in test_gates::OFF_ARMS {
+            assert_eq!(with_gate(gate, build), None, "off arm: {arm}");
+        }
     }
 
     /// The non-interactive git credential posture, asserted from the ONE shared

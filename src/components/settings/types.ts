@@ -128,6 +128,12 @@ export interface ClaudeCliSettings {
   /** After a migration respawn, nudge the resumed session to continue its
    * task once the CLI is idle. Runner default: true. */
   auto_continue_after_migration?: boolean;
+  /** Let the runner own Claude Code CLI updates on this machine: one
+   * runner-side updater installs a new release only when the installed version
+   * differs from the published one, and runner-spawned `claude` children get
+   * `DISABLE_AUTOUPDATER=1`. Off restores the CLI's own updater. Runner
+   * default: true. */
+  runner_manages_cli_updates?: boolean;
 }
 
 /** One per-model scoped weekly limit (e.g. the Fable-only cap). */
