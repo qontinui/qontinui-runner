@@ -24,6 +24,7 @@ vi.mock("./contexts", () => ({
     },
     closeTerminal: () => {},
     sessionStates: {},
+    tabs: [],
   }),
   useTransitionEffects: () => ({ handleRestartInZone: () => Promise.resolve() }),
   useZoneMetadata: () => ({

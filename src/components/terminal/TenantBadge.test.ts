@@ -9,7 +9,7 @@
 import { describe, expect, it } from "vitest";
 
 import { repoExpectedText, tenantBadgeLabel } from "./TenantBadge";
-import type { SessionTenancy, TenancyRepoExpected } from "./useSessionInfo";
+import type { SessionTenancy, TenancyRepoExpected, TenantDisplay } from "./useSessionInfo";
 import {
   explicitSpawnTenant,
   pickSpawnTenant,
@@ -62,6 +62,8 @@ function tenancy(overrides: {
   divergence?: SessionTenancy["divergence"];
   spawnDefault?: { status: string; tenantId?: string | null; reason?: string | null };
   repoExpected?: TenancyRepoExpected | null;
+  display?: TenantDisplay | null;
+  coordRow?: SessionTenancy["coordRow"];
 }): SessionTenancy {
   return {
     row: {
@@ -84,6 +86,8 @@ function tenancy(overrides: {
       posture: { status: "unknown", value: null, canAnswer: null, reason: "no_posture_published" },
     },
     repoExpected: overrides.repoExpected ?? null,
+    coordRow: overrides.coordRow ?? null,
+    display: overrides.display ?? null,
     diverged: overrides.diverged,
     divergence: overrides.divergence ?? (overrides.diverged ? "diverged" : "agree"),
   };
@@ -479,5 +483,184 @@ describe("spawnTenantPickerModel (the picker shows what it sends — re-review P
     expect(model.value).toBe(B);
     expect(model.published).toBe(B);
     expect(pickSpawnTenant({ spawnTenantId: model.published })).toBe(B);
+  });
+});
+
+/** A display block as the runner serves it (Rust `TenantDisplay`). */
+function shownAs(overrides: Partial<TenantDisplay> = {}): TenantDisplay {
+  return {
+    status: "resolved",
+    tenantId: A,
+    tenantSlug: null,
+    source: "credential",
+    reason: null,
+    conflicts: [],
+    conflictDetail: null,
+    bound: { status: "measured", tenantIds: [A, B], reason: null },
+    multiBound: true,
+    actingInBoundSet: true,
+    ...overrides,
+  };
+}
+
+describe("tenantBadgeLabel — the acting tenant when no tenant was stamped (plan 2026-10-17)", () => {
+  it("shows the ACTING tenant for a no-stamp session whose credential resolved", () => {
+    const label = tenantBadgeLabel(
+      undefined,
+      true,
+      tenancy({
+        credential: A,
+        dataPlane: A,
+        diverged: false,
+        display: shownAs({ tenantSlug: "acme" }),
+      }),
+    );
+    expect(label?.text).toBe("6b1f4b0e");
+    expect(label?.diverged).toBe(false);
+    expect(label?.title).toBe(
+      `This session acts as tenant ${A} (acme) via its coord credential. Its spawn chose no ` +
+        `tenant (device default). A session's tenant is fixed at spawn — switching the active ` +
+        `tenant only affects future sessions.`,
+    );
+  });
+
+  it("names a default-slot credential as the device default binding", () => {
+    const label = tenantBadgeLabel(
+      null,
+      true,
+      tenancy({
+        credential: A,
+        diverged: false,
+        display: shownAs({ source: "credential_default_slot" }),
+      }),
+    );
+    expect(label?.title).toContain("via its default-slot credential (the device default binding)");
+  });
+
+  it("still hides when nothing resolved and nothing is stamped", () => {
+    expect(
+      tenantBadgeLabel(
+        undefined,
+        true,
+        tenancy({
+          credentialStatus: "unknown",
+          credentialReason: "no_session_nonce",
+          diverged: false,
+          divergence: "unknown",
+          display: shownAs({
+            status: "unknown",
+            tenantId: null,
+            source: null,
+            reason: "no_session_nonce",
+          }),
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  it("still hides on a single-tenant device (D12)", () => {
+    expect(
+      tenantBadgeLabel(
+        undefined,
+        false,
+        tenancy({ credential: A, diverged: false, display: shownAs() }),
+      ),
+    ).toBeNull();
+  });
+
+  it("says an unknown comparison is unknown on the acting-tenant arm", () => {
+    const label = tenantBadgeLabel(
+      undefined,
+      true,
+      tenancy({ credential: A, diverged: false, divergence: "unknown", display: shownAs() }),
+    );
+    expect(label?.title).toContain("Whether every leg agrees could not be compared.");
+  });
+
+  it("names every conflicting tenant the runner listed, including coord's own row", () => {
+    const label = tenantBadgeLabel(
+      undefined,
+      true,
+      tenancy({
+        credential: A,
+        dataPlane: A,
+        diverged: true,
+        coordRow: { status: "registered", tenantId: B, source: "registrar", reason: null },
+        display: shownAs({
+          status: "mismatch",
+          conflicts: [
+            { leg: "credential", tenantId: A },
+            { leg: "data_plane", tenantId: A },
+            { leg: "coord_row", tenantId: B },
+          ],
+        }),
+      }),
+    );
+    expect(label?.text).toBe("6b1f4b0e≠91ffaa20");
+    expect(label?.diverged).toBe(true);
+    expect(label?.title).toContain(`Coord session row: ${B} (as registered by this runner)`);
+  });
+
+  it("flags a data-plane answer beside an UNKNOWN credential instead of a confident stem", () => {
+    for (const source of ["data_plane", "data_plane_device"]) {
+      const label = tenantBadgeLabel(
+        undefined,
+        true,
+        tenancy({
+          dataPlane: A,
+          credentialStatus: "unknown",
+          credentialReason: "nonce_not_live",
+          diverged: false,
+          divergence: "unknown",
+          display: shownAs({ source, reason: "nonce_not_live" }),
+        }),
+      );
+      expect(label?.text, source).toBe("6b1f4b0e?");
+      expect(label?.credentialUnknown, source).toBe(true);
+      expect(label?.diverged, source).toBe(false);
+      expect(label?.title, source).toContain(
+        "The tenant its coord-mcp writes go to is UNKNOWN (nonce_not_live).",
+      );
+    }
+  });
+
+  it("keeps the confident stem when the credential resolved", () => {
+    const label = tenantBadgeLabel(
+      undefined,
+      true,
+      tenancy({ credential: A, dataPlane: A, diverged: false, display: shownAs() }),
+    );
+    expect(label?.text).toBe("6b1f4b0e");
+    expect(label?.credentialUnknown).toBe(false);
+    expect(label?.title).not.toContain("UNKNOWN");
+  });
+
+  it("describes a not-applicable coord row (terminal-hosted) as such, not as unknown", () => {
+    const label = tenantBadgeLabel(
+      undefined,
+      true,
+      tenancy({
+        credential: A,
+        dataPlane: B,
+        diverged: true,
+        coordRow: {
+          status: "not_applicable",
+          tenantId: null,
+          source: null,
+          reason: "terminal_plane_row_is_the_data_plane_leg",
+        },
+        display: shownAs({
+          status: "mismatch",
+          conflicts: [
+            { leg: "credential", tenantId: A },
+            { leg: "data_plane", tenantId: B },
+          ],
+        }),
+      }),
+    );
+    expect(label?.title).toContain(
+      "Coord session row: terminal-hosted — its tenant is what the runner writes under (above)",
+    );
+    expect(label?.title).not.toContain("terminal_plane_row_is_the_data_plane_leg");
   });
 });
