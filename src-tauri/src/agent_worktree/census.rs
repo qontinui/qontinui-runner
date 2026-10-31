@@ -1064,6 +1064,12 @@ pub struct WorktreeCensus {
 
     /// RFC3339 mtime of the worktree dir itself, `None` if unreadable.
     pub last_access_mtime: Option<String>,
+    /// RFC3339 birth time of the worktree dir ([`super::reclaim::dir_birth_time`]:
+    /// mtime of the `.git` gitlink file, falling back to `created()`); `None`
+    /// if unreadable. Coord echoes it on a remove so the runner can refuse a
+    /// directory re-created at the same path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dir_created_at: Option<String>,
     /// Sum of the non-junction real bytes attributable to this worktree
     /// (`nm_bytes + target_bytes`). A junctioned dir contributes 0.
     pub attributable_bytes: u64,
@@ -1682,9 +1688,13 @@ fn build_slot_for(target_dir: &Path) -> Option<String> {
 ///
 /// **Scope caveat, deliberately disclosed:** tier 1 reads the CENSUS
 /// PROCESS's environment, not the environment of the shell that actually ran
-/// the build in that worktree — no such per-worktree record exists on disk
-/// (`cargo-guard.sh` sets `CARGO_TARGET_DIR` per invocation and leaves no
-/// trace). Tiers 2 and 3 are genuinely per-worktree. In the normal fleet
+/// the build in that worktree — no per-worktree record of the env var exists
+/// on disk (`cargo-guard.sh` sets `CARGO_TARGET_DIR` per invocation). It does
+/// leave a RUN record, `<git-dir>/cargo-verify-last.json` (`finished_at: null`
+/// while a run is in flight), which the reclaim executor reads as its
+/// shared-target G6 signal (`reclaim::shared_build_active_for`); that records
+/// that a run is live, not which target dir it used, so it does not feed this
+/// resolution. Tiers 2 and 3 are genuinely per-worktree. In the normal fleet
 /// configuration the runner is not launched with `CARGO_TARGET_DIR` set, so
 /// tier 1 is absent and the value is per-worktree throughout; if an operator
 /// DOES export it before launching the runner, every row on that device will
@@ -2455,6 +2465,8 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
         .and_then(|m| m.modified().ok())
         .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
 
+    let dir_created_at = super::reclaim::dir_birth_time(worktree).map(|t| t.to_rfc3339());
+
     let attributable_bytes = nm_bytes.saturating_add(target_bytes);
 
     // G2: ancestry/patch-id "landed in the repo's trunk" — local git only,
@@ -2497,6 +2509,7 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
         build_target_dir: build_target.dir,
         build_slot: build_target.slot,
         last_access_mtime,
+        dir_created_at,
         attributable_bytes,
         landed_in_main,
         building,
@@ -5188,6 +5201,7 @@ mod tests {",
             build_target_dir: None,
             build_slot: None,
             last_access_mtime: None,
+            dir_created_at: None,
             attributable_bytes: bytes,
             landed_in_main: None,
             building: None,
