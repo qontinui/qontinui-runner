@@ -42,8 +42,11 @@
 #                never D3. detail = the frame.
 #   runner_exit  a close at runner shutdown — the next boot's restore rule decides (§9.4).
 #                detail = what it is.
-#   exempt       a close that ends no session's work: no live claude in the pane, or a terminal never
-#                handed to a session. detail = WHY (and the probe it rests on, where there is one).
+#   exempt       a close that ends no session's work: no live claude in the pane, a terminal never
+#                handed to a session, or the old instance of a session that lives on in a replacement
+#                its closer spawns — the Migrator (§4.6) and the looping-agent relaunch, which the
+#                architecture leaves to its launcher ("a steward or looping pane, whose relaunch stays
+#                its launcher's"). detail = WHY (and the probe it rests on, where there is one).
 #   helper       a shared close recipe, not a door. detail = the call token through which its callers
 #                reach it; every production caller of that token is itself a site and needs a row.
 
