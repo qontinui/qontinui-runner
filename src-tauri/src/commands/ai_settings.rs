@@ -1542,8 +1542,10 @@ pub fn record_usage_snapshot(results: &[AccountUsageInfo]) {
 /// the periodic timer (see `main.rs`), so a runner whose Settings/Terminal UI is
 /// never opened (e.g. a headless or co-pilot-only runner) still has fresh
 /// weekly-usage pace data for `pick_best_account`. No-op when fewer than two
-/// accounts are configured (single-account runners have nothing to choose
-/// between).
+/// accounts are configured. This path sits in front of the startup pick and the
+/// migration decision, so a single-account runner must not pay a probe here.
+/// The periodic fleet report covers that runner instead (see
+/// [`plan_usage_refresh`]).
 ///
 /// Returns the fresh per-account results so callers that need more than the
 /// recorded snapshot (e.g. `account_migration`'s reset-time-aware cooldown)
@@ -1552,35 +1554,96 @@ pub fn record_usage_snapshot(results: &[AccountUsageInfo]) {
 /// network round-trip to the provider that the latency-sensitive migration
 /// path must not pay.
 pub async fn refresh_account_usage_snapshot() -> Vec<AccountUsageInfo> {
-    refresh_usage(false).await
+    refresh_usage(UsageRefreshCaller::SelectionSnapshot).await
 }
 
 /// The periodic fleet report: [`refresh_account_usage_snapshot`] PLUS the
 /// prepaid (pay-as-you-go) balances, mirrored to coord on the same body.
 ///
-/// Unlike the accounts half this reports on a runner with fewer than two
-/// Claude accounts too: a prepaid balance is money on the account whatever the
-/// Claude roster looks like, and gating it on the account count would leave
-/// every single-account runner's balance with no fleet copy — which is the
-/// whole defect of plan `2026-09-12-prepaid-balance-is-a-fleet-fact-with-no-ingest`.
+/// Both halves report on a runner with fewer than two Claude accounts. A
+/// prepaid balance is money on the account whatever the Claude roster looks
+/// like (plan `2026-09-12-prepaid-balance-is-a-fleet-fact-with-no-ingest`). A
+/// lone Claude account spends a usage window that coord's launch budget has to
+/// count (plan `2026-10-29-launch-budget-is-a-coord-answer-not-a-per-box-script`
+/// Phase 2). That includes a runner with NO configured account list, whose one
+/// account is its effective config dir. Before that plan, this half sent
+/// nothing for such a runner.
 pub async fn refresh_fleet_usage_report() -> Vec<AccountUsageInfo> {
-    refresh_usage(true).await
+    refresh_usage(UsageRefreshCaller::FleetReport).await
 }
 
-async fn refresh_usage(include_prepaid: bool) -> Vec<AccountUsageInfo> {
-    let config_dirs = crate::settings::get_claude_config_dirs();
-    let results = if config_dirs.len() < 2 {
-        Vec::new()
-    } else {
-        let futures: Vec<_> = config_dirs
-            .into_iter()
-            .map(|dir| async move { probe_account_usage(dir).await })
-            .collect();
-        let results = futures::future::join_all(futures).await;
+/// Which of the two refresh entry points is asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsageRefreshCaller {
+    /// Startup and `account_migration`: feeds the account picker.
+    SelectionSnapshot,
+    /// The 10-minute timer: the fleet report to coord.
+    FleetReport,
+}
+
+/// What one refresh does, decided from how many Claude config dirs the runner
+/// has configured and who is asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UsageRefreshPlan {
+    /// Probe the configured dirs.
+    probe_configured: bool,
+    /// With no configured list, probe the effective config dir instead (the
+    /// one account such a runner runs on).
+    probe_effective: bool,
+    /// Record the results into the account picker's snapshot.
+    record_snapshot: bool,
+}
+
+/// The picker's snapshot is recorded only from two configured accounts up,
+/// exactly as before plan `2026-10-29-launch-budget-…` Phase 2, so picker
+/// behaviour does not change. The fleet report probes whatever accounts the
+/// runner has, because coord's launch budget has to count each of them.
+fn plan_usage_refresh(dir_count: usize, caller: UsageRefreshCaller) -> UsageRefreshPlan {
+    let multi = dir_count >= 2;
+    match caller {
+        UsageRefreshCaller::SelectionSnapshot => UsageRefreshPlan {
+            probe_configured: multi,
+            probe_effective: false,
+            record_snapshot: multi,
+        },
+        UsageRefreshCaller::FleetReport => UsageRefreshPlan {
+            probe_configured: dir_count >= 1,
+            probe_effective: dir_count == 0,
+            record_snapshot: multi,
+        },
+    }
+}
+
+/// The effective config dir of a runner with no configured account list, when
+/// it names a real subscription account. A model-gateway dir is not one:
+/// subscription usage is switched off under a gateway, so a probe of it is an
+/// error row, not a reading.
+fn effective_account_dir() -> Option<String> {
+    let ai_settings = settings::get_ai_settings();
+    match crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli) {
+        (_, crate::ai_provider::ClaudeConfigDirSource::ModelGateway) => None,
+        (dir, _) => dir,
+    }
+}
+
+async fn refresh_usage(caller: UsageRefreshCaller) -> Vec<AccountUsageInfo> {
+    let mut config_dirs = crate::settings::get_claude_config_dirs();
+    let plan = plan_usage_refresh(config_dirs.len(), caller);
+    if !plan.probe_configured {
+        config_dirs.clear();
+    }
+    if plan.probe_effective {
+        config_dirs.extend(effective_account_dir());
+    }
+    let futures: Vec<_> = config_dirs
+        .into_iter()
+        .map(|dir| async move { probe_account_usage(dir).await })
+        .collect();
+    let results = futures::future::join_all(futures).await;
+    if plan.record_snapshot {
         record_usage_snapshot(&results);
-        results
-    };
-    let prepaid = if include_prepaid {
+    }
+    let prepaid = if caller == UsageRefreshCaller::FleetReport {
         crate::ai_provider::prepaid_balance::get_prepaid_balances().await
     } else {
         Vec::new()
@@ -2691,6 +2754,45 @@ mod save_selection_mode_tests {
             resolve_saved_selection_mode(Some("bogus"), stored),
             AccountSelectionMode::default()
         );
+    }
+}
+
+#[cfg(test)]
+mod usage_report_scope_tests {
+    use super::{plan_usage_refresh, UsageRefreshCaller, UsageRefreshPlan};
+
+    fn plan(
+        probe_configured: bool,
+        probe_effective: bool,
+        record_snapshot: bool,
+    ) -> UsageRefreshPlan {
+        UsageRefreshPlan {
+            probe_configured,
+            probe_effective,
+            record_snapshot,
+        }
+    }
+
+    /// The picker path (startup, account migration) is unchanged by the fleet
+    /// report: it probes and records only from two configured accounts up, so
+    /// a single-account runner pays no probe in front of its first pick.
+    #[test]
+    fn the_selection_path_needs_two_accounts() {
+        let c = UsageRefreshCaller::SelectionSnapshot;
+        assert_eq!(plan_usage_refresh(0, c), plan(false, false, false));
+        assert_eq!(plan_usage_refresh(1, c), plan(false, false, false));
+        assert_eq!(plan_usage_refresh(2, c), plan(true, false, true));
+    }
+
+    /// The fleet report reaches every runner: a single configured account is
+    /// probed and reported (but not fed to the picker), and a runner with no
+    /// configured list reports its effective account.
+    #[test]
+    fn the_fleet_report_covers_single_and_unlisted_accounts() {
+        let c = UsageRefreshCaller::FleetReport;
+        assert_eq!(plan_usage_refresh(0, c), plan(false, true, false));
+        assert_eq!(plan_usage_refresh(1, c), plan(true, false, false));
+        assert_eq!(plan_usage_refresh(3, c), plan(true, false, true));
     }
 }
 

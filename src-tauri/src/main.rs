@@ -6557,9 +6557,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // runners whose Settings/Terminal UI never polls usage. This
                 // loop ONLY refreshes the cache — re-picking is deferred to
                 // the next unit of AI work (so warm-provider prompt-cache
-                // locality within a unit is preserved). The account half is a
-                // no-op unless ≥2 accounts are configured; the prepaid half
-                // (`refresh_fleet_usage_report`) reports regardless.
+                // locality within a unit is preserved). Both halves report
+                // on every runner: the account half covers a single configured
+                // account, or the effective account when no list is configured,
+                // while the startup refresh above stays a no-op below two
+                // accounts so it never delays the first pick.
                 //
                 // The immediate first tick is NOT skipped: it is the first
                 // prepaid report, run here rather than in the startup call
