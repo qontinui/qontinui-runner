@@ -56,7 +56,7 @@ pub fn init_lifecycle_debug() {
     );
     log_lifecycle(
         "STARTUP",
-        &format!("Debug build: {}", cfg!(debug_assertions)),
+        &qontinui_runner_lib::build_provenance::lifecycle_line(),
     );
 
     // Write startup timestamp to a separate file for easy checking

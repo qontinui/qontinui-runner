@@ -110,7 +110,7 @@ const LABEL_RELEASE_POLL_MS: u64 = 50;
 /// The calibration is borrowed rather than invented:
 /// [`crate::ui_error::UI_STALE_AFTER_MS`] is already this codebase's answer to
 /// "a live UI has checked in within this long", and Rust emits `ui-bridge-ping`
-/// unconditionally every 3s, so this is ten consecutive missed pings.
+/// unconditionally every 3s (`ui_ping.rs`), so this is ten consecutive missed pings.
 pub const RECREATE_PONG_DEADLINE_MS: u64 = crate::ui_error::UI_STALE_AFTER_MS;
 
 /// How long a reloaded main webview has to prove it is running a UI again, by
@@ -3801,6 +3801,14 @@ mod tests {
             false,
             Some((10, 10)),
             Some((0, 0)),
+            &fb
+        )));
+        // So does a non-zero sliver below the shared minimum, off the sentinel.
+        assert!(is_fallback(placement_from_snapshot(
+            false,
+            false,
+            Some((10, 10)),
+            Some((160, 28)),
             &fb
         )));
         assert!(is_fallback(placement_from_snapshot(

@@ -906,7 +906,10 @@ fn execute_read_referenced_files(input: &DiscoveryInput) -> Result<String, Strin
 /// List existing code quality checks from the runner.
 fn execute_list_checks(config: &DiscoveryConfig) -> Result<String, String> {
     let client = build_http_client(config)?;
-    let url = format!("http://localhost:{}/checks", config.runner_port);
+    let url = format!(
+        "{}/checks",
+        crate::mcp::types::runner_loopback_base(config.runner_port)
+    );
     let resp = client
         .get(&url)
         .send()
@@ -959,8 +962,8 @@ fn execute_list_checks(config: &DiscoveryConfig) -> Result<String, String> {
 fn execute_scan_apps(config: &DiscoveryConfig) -> Result<String, String> {
     let client = build_http_client(config)?;
     let url = format!(
-        "http://localhost:{}/ui-bridge/apps/scan",
-        config.runner_port
+        "{}/ui-bridge/apps/scan",
+        crate::mcp::types::runner_loopback_base(config.runner_port)
     );
     let resp = client
         .get(&url)
@@ -1025,7 +1028,7 @@ fn execute_sdk_snapshot(
     config: &DiscoveryConfig,
 ) -> Result<String, String> {
     let client = build_http_client(config)?;
-    let base = format!("http://localhost:{}", config.runner_port);
+    let base = crate::mcp::types::runner_loopback_base(config.runner_port);
 
     // Determine the target URL — prefer explicitly mentioned URLs, otherwise try to auto-detect
     let target_url = if let Some(url) = input.target_urls.first() {
@@ -1171,7 +1174,7 @@ fn take_sdk_snapshot(
 /// understanding of the target application's pages and purpose.
 fn execute_ui_bridge_specs(config: &DiscoveryConfig) -> Result<String, String> {
     let client = build_http_client(config)?;
-    let base = format!("http://localhost:{}", config.runner_port);
+    let base = crate::mcp::types::runner_loopback_base(config.runner_port);
 
     let mut all_specs: Vec<serde_json::Value> = Vec::new();
 
@@ -1441,7 +1444,7 @@ fn execute_ui_bridge_specs(config: &DiscoveryConfig) -> Result<String, String> {
 /// Test an API request and show the response shape.
 fn execute_test_api(input: &DiscoveryInput, config: &DiscoveryConfig) -> Result<String, String> {
     let client = build_http_client(config)?;
-    let base = format!("http://localhost:{}", config.runner_port);
+    let base = crate::mcp::types::runner_loopback_base(config.runner_port);
 
     let mut sections = Vec::new();
 
@@ -1528,7 +1531,10 @@ fn execute_test_api(input: &DiscoveryInput, config: &DiscoveryConfig) -> Result<
 /// List available MCP servers and their tools.
 fn execute_list_mcp_servers(config: &DiscoveryConfig) -> Result<String, String> {
     let client = build_http_client(config)?;
-    let url = format!("http://localhost:{}/mcp-servers", config.runner_port);
+    let url = format!(
+        "{}/mcp-servers",
+        crate::mcp::types::runner_loopback_base(config.runner_port)
+    );
     let resp = client
         .get(&url)
         .send()
@@ -1585,7 +1591,10 @@ fn execute_list_mcp_servers(config: &DiscoveryConfig) -> Result<String, String> 
 /// List saved shell commands from the runner.
 fn execute_list_shell_commands(config: &DiscoveryConfig) -> Result<String, String> {
     let client = build_http_client(config)?;
-    let url = format!("http://localhost:{}/shell-commands", config.runner_port);
+    let url = format!(
+        "{}/shell-commands",
+        crate::mcp::types::runner_loopback_base(config.runner_port)
+    );
     let resp = client
         .get(&url)
         .send()
@@ -1639,7 +1648,7 @@ fn execute_list_shell_commands(config: &DiscoveryConfig) -> Result<String, Strin
 /// Gather database stats (workflow count, active task runs) from existing endpoints.
 fn execute_database_stats(config: &DiscoveryConfig) -> Result<String, String> {
     let client = build_http_client(config)?;
-    let base = format!("http://localhost:{}", config.runner_port);
+    let base = crate::mcp::types::runner_loopback_base(config.runner_port);
 
     let mut s = String::from("### Database Stats\n");
 
@@ -1701,7 +1710,7 @@ fn execute_database_stats(config: &DiscoveryConfig) -> Result<String, String> {
 /// Fetch cached architecture specs and format them as markdown context.
 fn execute_architecture_specs(config: &DiscoveryConfig) -> Result<String, String> {
     let client = build_http_client(config)?;
-    let base = format!("http://localhost:{}", config.runner_port);
+    let base = crate::mcp::types::runner_loopback_base(config.runner_port);
     let url = format!("{}/ui-bridge/sdk/cached-specs", base);
 
     let resp = client
