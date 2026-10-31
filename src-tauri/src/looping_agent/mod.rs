@@ -52,3 +52,15 @@ pub mod playbook;
 pub mod policy;
 pub mod registry;
 pub mod turn_ending;
+
+/// The root every looping agent's private home dir lives under:
+/// `<runner data dir>/looping-agents`, one `<agent id>` subdirectory each.
+///
+/// The ONE resolver, shared by the supervisor (which creates and spawns into
+/// `<root>/<id>`) and the terminal manager's workspace-trust scope (which must
+/// recognise those dirs as runner-owned, so the trust gate runs for them — coord
+/// finding `9089767f`). Two spellings of the path would let the scope drift
+/// away from where agents actually run, which is the silent skip it fixes.
+pub fn home_root() -> std::path::PathBuf {
+    crate::ambient::runner_dir_or_cwd().join("looping-agents")
+}

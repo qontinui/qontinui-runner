@@ -64,7 +64,9 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::process_capture::process_tree::{claude_pids_in_inclusive_subtree, ProcessSnapshot};
-use qontinui_runner_lib::looping_agent::idle::snapshot_looks_idle;
+use qontinui_runner_lib::looping_agent::idle::{
+    snapshot_looks_idle, DIALOG_CHROME_MARKERS, DIALOG_SCAN_ROWS,
+};
 
 /// The command typed at the prompt. Submitted separately ([`SUBMIT`]) once it
 /// has echoed on the input line.
@@ -100,9 +102,9 @@ pub const GONE_PROBES_REQUIRED: u32 = 2;
 /// The placeholder Claude Code renders on an empty input line.
 const PLACEHOLDER_PREFIX: &str = "Try \"";
 
-/// Rows above the cursor scanned for a dialog when no input-box edge bounds
-/// the scan.
-const DIALOG_SCAN_ROWS: usize = 8;
+// `DIALOG_SCAN_ROWS` — rows above the cursor scanned for a dialog when no
+// input-box edge bounds the scan. Shared with the looping-agent supervisor's
+// dialog guard (`looping_agent::idle::snapshot_shows_dialog`).
 
 /// Case-insensitive text that marks a dialog rather than the input prompt.
 const DIALOG_MARKERS: &[&str] = &["do you want", "allow", "esc to cancel", "enter to confirm"];
@@ -178,12 +180,13 @@ fn is_box_edge(line: &str) -> bool {
     !t.is_empty() && t.chars().all(|c| "─━╭╮╰╯┌┐└┘│".contains(c))
 }
 
-/// Dialog text that is Claude Code's own CHROME rather than prose: the key
-/// hints a dialog prints under its choices. Unlike `do you want` / `allow`,
-/// these do not turn up in an ordinary finished turn ("Do you want me to run
-/// the tests?", "the allowlist"), so a check that must ADMIT the common idle
-/// screen can scan for them without refusing it.
-const DIALOG_CHROME_MARKERS: &[&str] = &["esc to cancel", "enter to confirm"];
+// `DIALOG_CHROME_MARKERS` — dialog text that is Claude Code's own CHROME rather
+// than prose: the key hints a dialog prints under its choices. Unlike `do you
+// want` / `allow`, these do not turn up in an ordinary finished turn ("Do you
+// want me to run the tests?", "the allowlist"), so a check that must ADMIT the
+// common idle screen can scan for them without refusing it. The one list lives
+// beside the idle predicate, which the looping-agent supervisor's dialog guard
+// (`snapshot_shows_dialog`) reads too.
 
 /// May `/exit` be typed now? `Ok` only for an idle screen whose cursor sits at
 /// the start of an empty `❯` input line with no dialog showing. The `Err`

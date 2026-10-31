@@ -49,10 +49,14 @@ use tracing::{debug, info, warn};
 use qontinui_runner_lib::looping_agent::desired_state::{
     self, CoordDesiredState, DesiredSource, EffectiveDesired,
 };
-use qontinui_runner_lib::looping_agent::idle::{snapshot_context_low, snapshot_looks_idle};
+use qontinui_runner_lib::looping_agent::idle::{
+    snapshot_context_low, snapshot_looks_idle, snapshot_shows_dialog,
+};
 use qontinui_runner_lib::looping_agent::lease::{self, HeldSlot};
 use qontinui_runner_lib::looping_agent::playbook;
-use qontinui_runner_lib::looping_agent::policy::{self, Action, Liveness, SpawnReason, TickInput};
+use qontinui_runner_lib::looping_agent::policy::{
+    self, Action, Liveness, SpawnReason, TabProbe, TickInput,
+};
 use qontinui_runner_lib::looping_agent::registry::{
     DesiredState, LoopingAgentDef, LoopingAgentRecord, LoopingAgentRegistry, MERGE_SHEPHERD_ID,
 };
@@ -147,9 +151,7 @@ fn registry_path() -> PathBuf {
 /// isolated worktrees for fixes, and provisioning into a private dir never
 /// clobbers operator files in a shared checkout.
 fn agent_home_dir(agent_id: &str) -> PathBuf {
-    qontinui_runner_lib::ambient::runner_dir_or_cwd()
-        .join("looping-agents")
-        .join(agent_id)
+    qontinui_runner_lib::looping_agent::home_root().join(agent_id)
 }
 
 /// Default journal path for a seeded built-in agent.
@@ -268,33 +270,55 @@ fn role_for_agent(playbook_ref: &str) -> Option<&'static str> {
 
 /// Resolve the agent's live tab: direct terminal-id hit first, then re-attach
 /// through the durable lifecycle record (whose terminal id a boot-restore
-/// rewrites). Returns the pure [`Liveness`] plus the live session handle.
+/// rewrites). Returns the pure [`Liveness`], the live session handle (only for
+/// a tab whose process is RUNNING), and the id of a registered tab whose
+/// process has EXITED — the stale pane the death-respawn arm closes.
+///
+/// "Registered" alone used to mean live, so a tab whose `claude` had exited
+/// read [`Liveness::Live`] and the supervisor nudged into its dead PTY every
+/// tick for hours instead of respawning (coord finding `9089767f`). The
+/// process's own liveness ([`crate::terminal::session::TerminalSession::is_alive`],
+/// the same flag the PTY write gate refuses `TERMINAL_EXITED` on) now decides.
+#[allow(clippy::type_complexity)]
 fn resolve_live_session(
     app: &tauri::AppHandle,
     rec: &LoopingAgentRecord,
 ) -> (
     Liveness,
     Option<(String, Arc<crate::terminal::session::TerminalSession>)>,
+    Option<String>,
 ) {
     let Some(tm) = app.try_state::<Arc<crate::terminal::TerminalManager>>() else {
         // No terminal manager managed (shouldn't happen in a real runner):
         // treat as pending — NEVER spawn into a half-initialized app.
-        return (Liveness::PendingRestore, None);
+        return (Liveness::PendingRestore, None, None);
     };
     let tm = tm.inner();
 
+    let probe = |s: &Arc<crate::terminal::session::TerminalSession>| {
+        if s.is_alive() {
+            TabProbe::Running
+        } else {
+            TabProbe::Exited
+        }
+    };
+
     let mut live: Option<(String, Arc<crate::terminal::session::TerminalSession>)> = None;
-    let mut terminal_registered = false;
+    let mut exited: Option<String> = None;
+    let mut direct = TabProbe::Absent;
     if let Some(tid) = rec.runtime.terminal_id.as_deref() {
         if let Some(s) = tm.get(tid) {
-            terminal_registered = true;
-            live = Some((tid.to_string(), s));
+            direct = probe(&s);
+            match direct {
+                TabProbe::Running => live = Some((tid.to_string(), s)),
+                _ => exited = Some(tid.to_string()),
+            }
         }
     }
 
     let mut lifecycle_open = false;
-    let mut lifecycle_terminal_registered = false;
-    if !terminal_registered {
+    let mut lifecycle_tab = TabProbe::Absent;
+    if direct != TabProbe::Running {
         if let (Some(store), Some(csid)) = (
             app.try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>(),
             rec.runtime.claude_session_id.as_deref(),
@@ -303,21 +327,122 @@ fn resolve_live_session(
                 if lrec.state == "open" {
                     lifecycle_open = true;
                     if let Some(s) = tm.get(&lrec.terminal_id) {
-                        lifecycle_terminal_registered = true;
-                        live = Some((lrec.terminal_id.clone(), s));
+                        lifecycle_tab = probe(&s);
+                        match lifecycle_tab {
+                            TabProbe::Running => live = Some((lrec.terminal_id.clone(), s)),
+                            _ => {
+                                exited.get_or_insert_with(|| lrec.terminal_id.clone());
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    (
-        policy::resolve_liveness(
-            terminal_registered,
-            lifecycle_open,
-            lifecycle_terminal_registered,
+    let liveness = policy::resolve_liveness(direct, lifecycle_open, lifecycle_tab);
+    if liveness != Liveness::Exited {
+        // Only an `Exited` verdict hands a stale tab to the respawn arm; on
+        // `Live` via a re-attached tab the stale direct id is simply dropped.
+        exited = None;
+    }
+    (liveness, live, exited)
+}
+
+/// The supervisor's NUDGE-SAFE idle read over one settled grid: the shared
+/// turn-complete predicate's verdict (`probe_idle`) AND no dialog on screen.
+/// Returns the verdict plus, when a dialog vetoed it, the marker that did.
+///
+/// The second conjunct is the fix for coord finding `9089767f`: Claude Code's
+/// workspace-trust dialog reads idle to [`snapshot_looks_idle`] (no working
+/// indicator, its selection pointer is the input caret's `❯`), the nudge's
+/// keystrokes answered the dialog with "No, exit", and `claude` exited. A
+/// dialog is never a screen to type a prompt into.
+fn nudge_safe_idle(probe_idle: bool, lines: &[String]) -> (bool, Option<&'static str>) {
+    if !probe_idle {
+        return (false, None);
+    }
+    match snapshot_shows_dialog(lines) {
+        Some(marker) => (false, Some(marker)),
+        None => (true, None),
+    }
+}
+
+/// Per-agent "a dialog is on screen" memo, so the warning is edge-triggered
+/// rather than repeated every 5 s tick (the `LAST_POSTURE` discipline).
+static LAST_DIALOG: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
+
+fn log_dialog_transition(agent_id: &str, terminal_id: &str, dialog: Option<&'static str>) {
+    let mut guard = LAST_DIALOG.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    let now = dialog.is_some();
+    // An agent never seen before counts as "no dialog", so its first clean
+    // tick after boot does not log a spurious "dialog cleared".
+    if map.insert(agent_id.to_string(), now).unwrap_or(false) == now {
+        return;
+    }
+    match dialog {
+        Some(marker) => warn!(
+            agent = %agent_id,
+            terminal = %terminal_id,
+            marker,
+            "looping_agent_supervisor: a Claude Code dialog is on screen — NOT nudging into it \
+             (an Enter would answer the dialog); the tab needs the dialog answered"
         ),
-        live,
+        None => info!(
+            agent = %agent_id,
+            terminal = %terminal_id,
+            "looping_agent_supervisor: dialog cleared — nudges resume"
+        ),
+    }
+}
+
+/// Did a tab's process exit inside the spawn grace? Measured from the spawn
+/// to the process's own exit instant, not to the tick that noticed, so the
+/// answer does not depend on tick timing. An early exit is evidence of a
+/// broken spawn (bad account, a dialog answered "No") and takes the
+/// escalating backoff; respawning it every tick would hot-spin `claude`.
+fn exited_within_grace(
+    last_spawn_at_ms: Option<i64>,
+    exit_at_ms: Option<i64>,
+    grace_secs: u64,
+) -> bool {
+    match (last_spawn_at_ms, exit_at_ms) {
+        (Some(spawned), Some(exited)) => {
+            exited.saturating_sub(spawned) < (grace_secs as i64).saturating_mul(1000)
+        }
+        // No spawn recorded (an adopted tab) or no exit instant: nothing
+        // shows the spawn itself was broken.
+        _ => false,
+    }
+}
+
+/// What the death-respawn arm does with an EXITED tab once it has closed it:
+/// `true` = back off (count a failed spawn, respawn on a later tick), `false`
+/// = respawn now. Only an exit inside the spawn grace that the AGENT caused
+/// backs off — a runner-initiated close (`close_requested`: a relaunch, a
+/// wind-down, an operator closing the pane) says nothing about the spawn.
+fn exited_tab_backs_off(early: bool, close_requested: bool) -> bool {
+    early && !close_requested
+}
+
+/// Whether this tick clears the spawn-failure streak: only once a spawn has
+/// PROVEN itself — its tab still running past the spawn grace. Clearing at
+/// spawn time reset the streak for a `claude` that dies a second after every
+/// spawn, so an early-exit loop could never escalate past the first step.
+fn spawn_streak_clears(liveness: Liveness, spawn_grace_elapsed: bool) -> bool {
+    liveness == Liveness::Live && spawn_grace_elapsed
+}
+
+/// Is a trust-gate spawn refusal a STANDING verdict worth the escalating
+/// backoff? Not when the tenant's dial could not be READ: that refusal is a
+/// failed coord read (Withhold, promoted to a block on the interactive PTY),
+/// and backing it off would keep the agent down for up to 15 minutes after
+/// coord recovers — the same reason the resource-guard refusal takes none.
+fn trust_refusal_backs_off(dial: &crate::claude_session::trust_gate::DialResolution) -> bool {
+    !matches!(
+        dial,
+        crate::claude_session::trust_gate::DialResolution::Unresolved { .. }
     )
 }
 
@@ -405,7 +530,7 @@ async fn supervise_one(
     // lease state is an INPUT to acting, never a check performed afterwards.
     let holds_lease = reconcile_slot_lease(app, rec, &effective, authz_permits_spawn).await;
 
-    let (liveness, live) = resolve_live_session(app, rec);
+    let (liveness, live, exited_tab) = resolve_live_session(app, rec);
 
     // Re-attach bookkeeping: adopt a lifecycle-resolved terminal id so the
     // next tick (and the status command) hit it directly.
@@ -427,13 +552,19 @@ async fn supervise_one(
     // in which case neither signal is computed, exactly as before: this used to
     // be a byte-for-byte copy of that debounce, the last one left after the
     // predicate itself was consolidated into `looping_agent::idle`.
+    //
+    // The settled screen must also show no DIALOG ([`nudge_safe_idle`]): every
+    // action this `idle` unlocks types into the tab or closes it, and Enter on
+    // a dialog answers it (coord finding `9089767f`).
     let (mut idle, mut context_low) = (false, false);
-    if let Some((_, session)) = &live {
+    if let Some((tid, session)) = &live {
         if let Some(probe) = session
             .idle_quiescence_probe(IDLE_QUIESCENCE_DEBOUNCE)
             .await
         {
-            idle = probe.idle;
+            let (safe, dialog) = nudge_safe_idle(probe.idle, &probe.lines);
+            log_dialog_transition(&rec.def.id, tid, dialog);
+            idle = safe;
             context_low = snapshot_context_low(
                 &probe.lines,
                 rec.def.lifecycle_policy.context_low_threshold_pct,
@@ -486,7 +617,7 @@ async fn supervise_one(
         // armed `count=0` can stop one whose local flag is on.
         enabled: effective.running,
         desired_running: effective.running,
-        tab_alive: liveness != Liveness::Dead,
+        tab_alive: liveness.tab_alive(),
         ever_spawned: rec.runtime.last_spawn_at_ms.is_some(),
         spawn_backoff_elapsed: spawn_backoff_elapsed(&rec.def.id, now_ms),
         spawn_grace_elapsed: policy::spawn_grace_elapsed(
@@ -504,6 +635,12 @@ async fn supervise_one(
         cycles_since_relaunch: rec.runtime.cycles_since_relaunch,
         relaunch_every_cycles: rec.def.lifecycle_policy.relaunch_every_cycles,
     };
+
+    // See [`spawn_streak_clears`]: the streak clears only once a spawn has
+    // proven itself, never at spawn time.
+    if spawn_streak_clears(liveness, input.spawn_grace_elapsed) {
+        clear_spawn_failures(&rec.def.id);
+    }
 
     // CLAIM-FIRST: the gate makes a lease-less spawn/relaunch structurally
     // impossible. This is the whole point of the phase — not "check whether a
@@ -578,6 +715,66 @@ async fn supervise_one(
     match action {
         Action::None => {}
         Action::Spawn(reason) => {
+            // A registered tab whose process EXITED (coord finding `9089767f`):
+            // close the frozen pane first so the respawn does not leave a dead
+            // tab behind it, then decide whether the exit was a broken spawn.
+            if let Some(stale) = exited_tab.as_deref() {
+                if let Some(tm) = app.try_state::<Arc<crate::terminal::TerminalManager>>() {
+                    let tm = tm.inner();
+                    // The wall-clock exit instant: a FRESH `now` beside
+                    // `elapsed()` — the tick's `now_ms` predates this fn's
+                    // awaits and would skew the exit early.
+                    let snapshot = tm.get(stale).and_then(|s| s.exit_snapshot());
+                    let exit_code = snapshot.and_then(|(facts, _)| facts.code);
+                    let close_requested = snapshot.is_some_and(|(facts, _)| facts.close_requested);
+                    let exit_at_ms = snapshot.map(|(_, at)| {
+                        chrono::Utc::now().timestamp_millis().saturating_sub(
+                            i64::try_from(at.elapsed().as_millis()).unwrap_or(i64::MAX),
+                        )
+                    });
+                    let early = exited_within_grace(
+                        rec.runtime.last_spawn_at_ms,
+                        exit_at_ms,
+                        rec.def.lifecycle_policy.spawn_grace_secs,
+                    );
+                    let back_off = exited_tab_backs_off(early, close_requested);
+                    info!(
+                        agent = %rec.def.id,
+                        terminal = %stale,
+                        exit_code = ?exit_code,
+                        early_exit = early,
+                        close_requested,
+                        "looping_agent_supervisor: the agent's tab process EXITED — closing the \
+                         stale tab and respawning"
+                    );
+                    if let Err(e) = tm.close(stale) {
+                        warn!(
+                            agent = %rec.def.id,
+                            terminal = %stale,
+                            error = %e,
+                            "looping_agent_supervisor: closing the exited tab failed — \
+                             proceeding to respawn"
+                        );
+                    }
+                    registry.update_runtime(&rec.def.id, |rt| {
+                        if rt.terminal_id.as_deref() == Some(stale) {
+                            rt.terminal_id = None;
+                        }
+                    });
+                    if back_off {
+                        warn!(
+                            agent = %rec.def.id,
+                            terminal = %stale,
+                            exit_code = ?exit_code,
+                            grace_secs = rec.def.lifecycle_policy.spawn_grace_secs,
+                            "looping_agent_supervisor: the tab exited inside its spawn grace — \
+                             treating it as a failed spawn and backing off before the respawn"
+                        );
+                        note_spawn_failure(&rec.def.id, now_ms);
+                        return;
+                    }
+                }
+            }
             let prompt = spawn_prompt(&rec.def, reason != SpawnReason::FirstSpawn).await;
             let focus = reason == SpawnReason::FirstSpawn;
             do_spawn(app, registry, &rec.def, prompt, focus, false).await;
@@ -873,7 +1070,8 @@ fn note_spawn_failure(agent_id: &str, now_ms: i64) {
     );
 }
 
-/// Clear an agent's spawn-failure streak (a spawn succeeded).
+/// Clear an agent's spawn-failure streak (a spawn proved itself: its tab is
+/// still running past the spawn grace).
 fn clear_spawn_failures(agent_id: &str) {
     let mut guard = SPAWN_FAILURES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(map) = guard.as_mut() {
@@ -935,7 +1133,9 @@ async fn do_spawn(
                 claude_session = %claude_session_id,
                 "looping_agent_supervisor: spawned visible looping-agent tab"
             );
-            clear_spawn_failures(&def.id);
+            // The failure streak is NOT cleared here: a spawn that returns Ok
+            // has not yet proven the `claude` stays up. `supervise_one` clears
+            // it once the tab is still running past its spawn grace.
             registry.update_runtime(&def.id, |rt| {
                 rt.terminal_id = Some(terminal_id.clone());
                 rt.claude_session_id = Some(claude_session_id.clone());
@@ -976,20 +1176,41 @@ async fn do_spawn(
         Err(e) if crate::claude_session::trust_gate::is_spawn_blocked_refusal(&e) => {
             // The trust gate refused: workspace trust for the agent's home dir
             // could not be DERIVED for the pinned account and the tenant's
-            // autonomy dial forbids minting it. Also a policy verdict, not a
-            // broken agent — but unlike the resource refusal it is
-            // DETERMINISTIC: the conjuncts and the dial do not change between
-            // ticks, so it DOES take the backoff. Retrying every 30 s would
-            // only re-log the same refusal; what changes it is an operator
-            // trusting the directory for that account, or the dial moving.
-            warn!(
-                agent = %def.id,
-                error = %e,
-                "looping_agent_supervisor: spawn refused by the workspace-trust gate — \
-                 a policy verdict, backing off; trust the agent's home dir for the pinned \
-                 account or move the tenant's autonomy dial"
-            );
-            note_spawn_failure(&def.id, now_ms);
+            // autonomy dial forbids minting it. Since the looping-agent home is
+            // in the trust scope (coord finding `9089767f`) and is never a git
+            // worktree, the derivation conjuncts always fail there, so the DIAL
+            // alone decides: `proceed` mints (stamped runner-minted), anything
+            // stricter refuses.
+            //
+            // A policy verdict, not a broken agent. When the dial was READ it is
+            // a STANDING verdict — the conjuncts and the dial do not change
+            // between ticks — so it takes the backoff; what changes it is an
+            // operator trusting the directory for that account, or the dial
+            // moving. When the dial could NOT be read the refusal is a failed
+            // coord read, not a verdict, and takes no backoff
+            // ([`trust_refusal_backs_off`]) — the next tick re-asks, exactly as
+            // the resource-guard refusal does.
+            let dial = crate::claude_session::trust_gate::peek_dial();
+            if trust_refusal_backs_off(&dial) {
+                warn!(
+                    agent = %def.id,
+                    error = %e,
+                    dial = ?dial,
+                    "looping_agent_supervisor: spawn refused by the workspace-trust gate — \
+                     a policy verdict, backing off; trust the agent's home dir for the pinned \
+                     account or move the tenant's autonomy dial"
+                );
+                note_spawn_failure(&def.id, now_ms);
+            } else {
+                warn!(
+                    agent = %def.id,
+                    error = %e,
+                    dial = ?dial,
+                    "looping_agent_supervisor: spawn refused by the workspace-trust gate \
+                     because the tenant's autonomy dial could not be read — retrying on the \
+                     next tick, no backoff"
+                );
+            }
         }
         Err(e) => {
             warn!(
@@ -1244,15 +1465,107 @@ pub(crate) fn status_snapshot(
     app: &tauri::AppHandle,
     rec: &LoopingAgentRecord,
 ) -> LoopingAgentStatus {
-    let (liveness, live) = resolve_live_session(app, rec);
+    let (liveness, live, _exited) = resolve_live_session(app, rec);
     let idle = live.as_ref().map(|(_, session)| {
         let (lines, cursor_row) = session.grid_text();
-        snapshot_looks_idle(&lines, cursor_row)
+        nudge_safe_idle(snapshot_looks_idle(&lines, cursor_row), &lines).0
     });
     LoopingAgentStatus {
         record: rec.clone(),
-        tab_alive: liveness != Liveness::Dead,
+        tab_alive: liveness.tab_alive(),
         idle,
+    }
+}
+
+/// Coord finding `9089767f`: the supervisor's nudge-safe idle read and its
+/// early-exit classification.
+#[cfg(test)]
+mod nudge_and_exit_tests {
+    use super::*;
+
+    fn lines(rows: &[&str]) -> Vec<String> {
+        rows.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The screen the Merge Shepherd sat on when the nudge's Enter answered
+    /// "No, exit": the shared predicate calls it idle, the supervisor must not.
+    #[test]
+    fn the_trust_dialog_is_never_nudge_safe() {
+        let grid = lines(&[
+            " Accessing workspace:",
+            r" C:\Users\jspin\.qontinui\runner\looping-agents\merge-shepherd",
+            " Quick safety check: Is this a project you created or one you trust?",
+            " Claude Code'll be able to read, edit, and execute files here.",
+            " ❯ 1. Yes, I trust this folder",
+            "   2. No, exit",
+            " Enter to confirm · Esc to cancel",
+        ]);
+        assert!(
+            snapshot_looks_idle(&grid, 4),
+            "fixture must fool the shared predicate"
+        );
+        let (safe, dialog) = nudge_safe_idle(true, &grid);
+        assert!(!safe);
+        assert_eq!(dialog, Some("selected numbered choice on a `❯` row"));
+    }
+
+    #[test]
+    fn an_idle_input_prompt_stays_nudge_safe_and_a_busy_one_stays_busy() {
+        let grid = lines(&[
+            "● Cycle done — journal updated.",
+            "╭──────────────────────────────────────────╮",
+            "│ ❯                                          │",
+            "╰──────────────────────────────────────────╯",
+        ]);
+        assert_eq!(nudge_safe_idle(true, &grid), (true, None));
+        assert_eq!(nudge_safe_idle(false, &grid), (false, None));
+    }
+
+    #[test]
+    fn only_an_early_agent_caused_exit_backs_off() {
+        assert!(exited_tab_backs_off(true, false));
+        // A runner-initiated close inside the grace is not a broken spawn.
+        assert!(!exited_tab_backs_off(true, true));
+        // A session that ran past the grace and died respawns at once.
+        assert!(!exited_tab_backs_off(false, false));
+        assert!(!exited_tab_backs_off(false, true));
+    }
+
+    #[test]
+    fn the_failure_streak_clears_only_for_a_tab_live_past_its_grace() {
+        assert!(spawn_streak_clears(Liveness::Live, true));
+        // Not at spawn time (inside the grace)...
+        assert!(!spawn_streak_clears(Liveness::Live, false));
+        // ...and never for a tab that is not running.
+        for l in [Liveness::Exited, Liveness::Dead, Liveness::PendingRestore] {
+            assert!(!spawn_streak_clears(l, true), "{l:?}");
+        }
+    }
+
+    #[test]
+    fn a_trust_refusal_backs_off_unless_the_dial_could_not_be_read() {
+        use crate::claude_session::trust_gate::{AutonomyTier, DialResolution};
+        assert!(!trust_refusal_backs_off(&DialResolution::Unresolved {
+            error: "coord unreachable".to_string()
+        }));
+        assert!(trust_refusal_backs_off(&DialResolution::Fresh {
+            tier: AutonomyTier::DraftRequired
+        }));
+        assert!(trust_refusal_backs_off(&DialResolution::Absent));
+    }
+
+    #[test]
+    fn an_exit_inside_the_spawn_grace_is_a_failed_spawn() {
+        // Spawned at t=10s, grace 90s.
+        assert!(exited_within_grace(Some(10_000), Some(10_600), 90));
+        assert!(exited_within_grace(Some(10_000), Some(99_999), 90));
+        // The incident's shape: exited ~5 min after the spawn — a real
+        // session that died, respawned at once.
+        assert!(!exited_within_grace(Some(10_000), Some(310_000), 90));
+        assert!(!exited_within_grace(Some(10_000), Some(100_000), 90));
+        // No spawn recorded (adopted tab) or no exit instant: not evidence.
+        assert!(!exited_within_grace(None, Some(10_600), 90));
+        assert!(!exited_within_grace(Some(10_000), None, 90));
     }
 }
 
