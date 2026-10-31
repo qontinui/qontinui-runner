@@ -35,6 +35,7 @@ pub mod history;
 pub mod intents;
 pub mod intents_registry;
 pub mod keyboard;
+pub mod media_override;
 pub mod misc;
 pub mod network;
 pub mod page;
@@ -366,6 +367,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(intents::route_entries());
         all.extend_from_slice(intents_registry::route_entries());
         all.extend_from_slice(keyboard::route_entries());
+        all.extend_from_slice(media_override::route_entries());
         all.extend_from_slice(misc::route_entries());
         all.extend_from_slice(network::route_entries());
         all.extend_from_slice(page::route_entries());
@@ -449,6 +451,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .merge(intents::routes())
         .merge(intents_registry::routes())
         .merge(keyboard::routes())
+        .merge(media_override::routes())
         .merge(misc::routes())
         .merge(network::routes())
         .merge(page::routes())

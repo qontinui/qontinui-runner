@@ -1132,22 +1132,17 @@ pub struct AppDispatchRequest {
     pub params: serde_json::Value,
 }
 
-/// Build the dispatch payload for the transport-agnostic endpoint.
-///
-/// Extracted from `dispatch_to_app` so unit tests can verify the
-/// payload shape without spinning up a full `ApiState`. WebSocket-transport
-/// apps receive the user's `params` verbatim (the wrapper SDK's relay
-/// already forwards `action` separately in the command frame); HTTP apps
-/// receive an `{action, params}` envelope so the wrapper sees the same
-/// shape on both transports.
-fn build_dispatch_payload(
-    transport: crate::mcp::app_registry::AppTransport,
+/// The `/dispatch` route's body per arm: a WebSocket wrapper is sent the
+/// caller's params verbatim, an HTTP wrapper's `/dispatch` endpoint the
+/// `{action, params}` envelope. The dispatcher picks one on the registry read
+/// that routes (`ArmPayloads`).
+fn dispatch_payloads(
     action: &str,
     params: &serde_json::Value,
-) -> serde_json::Value {
-    match transport {
-        crate::mcp::app_registry::AppTransport::Websocket => params.clone(),
-        crate::mcp::app_registry::AppTransport::Http => serde_json::json!({
+) -> crate::mcp::app_dispatch::ArmPayloads {
+    crate::mcp::app_dispatch::ArmPayloads::PerArm {
+        websocket: params.clone(),
+        http: serde_json::json!({
             "action": action,
             "params": params,
         }),
@@ -1166,17 +1161,17 @@ async fn dispatch_to_app_inner(
     // `get_live`: a reservation-only row is not dispatchable, and answering
     // 404 here is the same status `dispatch`'s `NotRegistered` maps to —
     // reached truthfully instead of after building a payload from a dead row.
-    let entry = match registry.get_live(app_id).await {
-        Some(e) => e,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                ApiResponse::error("app not registered"),
-            );
-        }
-    };
+    //
+    // That read answers the 404 and nothing else: which arm's body is sent is
+    // decided by `dispatch`, on the read that routes.
+    if registry.get_live(app_id).await.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            ApiResponse::error("app not registered"),
+        );
+    }
 
-    let payload = build_dispatch_payload(entry.transport, &req.action, &req.params);
+    let payload = dispatch_payloads(&req.action, &req.params);
 
     match dispatcher
         .dispatch(app_id, &req.action, Method::POST, "/dispatch", payload)
@@ -1597,9 +1592,9 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn build_dispatch_payload_websocket_returns_params_verbatim() {
+    fn dispatch_payloads_send_a_websocket_wrapper_the_params_verbatim() {
         let params = serde_json::json!({"x": 1, "y": "two"});
-        let payload = build_dispatch_payload(AppTransport::Websocket, "doThing", &params);
+        let payload = dispatch_payloads("doThing", &params).for_transport(AppTransport::Websocket);
         assert_eq!(
             payload, params,
             "WS-transport apps must receive the user's params verbatim"
@@ -1607,9 +1602,9 @@ mod tests {
     }
 
     #[test]
-    fn build_dispatch_payload_http_wraps_action_and_params() {
+    fn dispatch_payloads_send_an_http_wrapper_the_action_and_params_envelope() {
         let params = serde_json::json!({"x": 1});
-        let payload = build_dispatch_payload(AppTransport::Http, "doThing", &params);
+        let payload = dispatch_payloads("doThing", &params).for_transport(AppTransport::Http);
         assert_eq!(payload["action"], "doThing");
         assert_eq!(payload["params"]["x"], 1);
         // The HTTP envelope must have *exactly* the two keys.
