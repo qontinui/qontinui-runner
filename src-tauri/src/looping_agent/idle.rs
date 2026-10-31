@@ -247,7 +247,10 @@ mod tests {
             2
         ));
         // A glyph row that merely mentions "for" is not a summary.
-        assert!(!snapshot_looks_idle(&lines(&["✻ working for you", "❯ "]), 1));
+        assert!(!snapshot_looks_idle(
+            &lines(&["✻ working for you", "❯ "]),
+            1
+        ));
         assert!(!snapshot_looks_idle(&lines(&["✻ Worked for", "❯ "]), 1));
     }
 
