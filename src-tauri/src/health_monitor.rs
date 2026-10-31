@@ -2390,21 +2390,45 @@ mod tests {
     /// answers the same way the live sensor does.
     ///
     /// Deliberately weak on the VALUE (a CI box's thread count is not a
-    /// constant) and strong on the SHAPE: memoized and live agree about whether
-    /// the sensor is readable at all, and a second call inside the window
-    /// returns the identical number.
+    /// constant): memoized and live agree about whether the sensor is readable
+    /// at all, and a reading the entry point returned was stored in the
+    /// process-global slot.
+    ///
+    /// It inspects the slot rather than timing a second call. Asserting that two
+    /// calls return the same number races the 250 ms window on a loaded box: an
+    /// entry is stamped with the caller's pre-read instant, so a slow read alone
+    /// can expire it. What this pins without a clock: a `Some` reading leaves an
+    /// entry that was live when the call began, and an entry stamped before the
+    /// call began is the one the call was served (any later writer stamps an
+    /// instant after this call's, because the entry was live for every earlier
+    /// one). The memo's caching decisions are pinned, with an injected clock, by
+    /// the tests above.
     #[test]
     fn the_memoized_entry_point_agrees_with_the_live_sensor() {
+        let called_at = std::time::Instant::now();
         let memoized = thread_count_reading_memoized();
+        if let Some(value) = memoized {
+            let slot = thread_reading_memo()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let entry = slot
+                .as_ref()
+                .expect("a reading the entry point returned is stored in the process-global slot");
+            assert!(
+                called_at.saturating_duration_since(entry.taken_at) < THREAD_READING_TTL,
+                "the stored entry was live when the call began, or stamped since"
+            );
+            if entry.taken_at <= called_at {
+                assert_eq!(
+                    entry.value, value,
+                    "an entry older than the call is the one it was served"
+                );
+            }
+        }
         assert_eq!(
             memoized.is_some(),
             thread_count_reading().is_some(),
             "the memo must not change whether this sensor is readable"
-        );
-        assert_eq!(
-            thread_count_reading_memoized(),
-            memoized,
-            "two calls inside the 250 ms window are the same reading"
         );
     }
 
