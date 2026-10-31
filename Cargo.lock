@@ -6719,6 +6719,7 @@ dependencies = [
  "image 0.25.10",
  "imageproc",
  "include_dir",
+ "json-patch",
  "jsonpath-rust",
  "jsonschema",
  "keyring",
