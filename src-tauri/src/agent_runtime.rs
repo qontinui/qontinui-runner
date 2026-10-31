@@ -1057,8 +1057,8 @@ pub(crate) fn claude_bin_path() -> String {
 
 /// `resolved` when it is launchable, else the bare [`claude_bin_path`].
 ///
-/// [`resolve_claude_bin`] accepts any regular file on unix and does not check
-/// the execute bit. A bare name goes through `execvp`, which skips a
+/// [`resolve_claude_bin`] accepts any regular file on unix bar npm's stub and
+/// does not check the execute bit. A bare name goes through `execvp`, which skips a
 /// non-executable PATH entry and keeps searching. Pinning an absolute path to
 /// such a file would trade that for an `EACCES` on every attempt. On
 /// Windows, and for anything that is not an absolute path, `resolved` is
@@ -1100,9 +1100,21 @@ fn launchable_or_bare(resolved: String) -> String {
 /// candidate to find; this correctly falls through to the bare-name fallback
 /// below — no worse than pre-fix behavior for that install shape.
 ///
+/// Off Windows, npm's placeholder stub is not a candidate: it counts as a miss,
+/// the same as the absent tool it stands in for mid-reinstall. The shims skip
+/// it, but a path pinned here never reaches them. The stub has no shebang, so a
+/// PTY child (portable-pty execs through `execvp`, which hands an `ENOEXEC`
+/// file to `sh`) really runs it and exits 1 although the spawn succeeded. A gate
+/// continuation's start verdict retries that; a condition check does not. On a
+/// miss, the bare name normally finds the identity shim first on a PTY child's
+/// PATH, and the shim's bounded wait applies; portable-pty tries `<cwd>/claude`
+/// before PATH, so a workdir holding one takes it instead. (On Windows npm never
+/// puts the stub on PATH as an `.exe`; its cmd-shim wrapper sits there instead.)
+///
 /// Falls back to [`claude_bin_path`] when nothing resolves, so behavior is
-/// never worse than the bare name. Does blocking filesystem stats — callers
-/// on an async task must run this via `spawn_blocking`.
+/// never worse than the bare name. Does blocking filesystem stats and reads the
+/// head of each candidate — callers on an async task must run this via
+/// `spawn_blocking`.
 pub(crate) fn resolve_claude_bin() -> String {
     let bare = claude_bin_path();
     // An explicit `QONTINUI_CLAUDE_BIN` override (or any absolute path) is
@@ -1143,8 +1155,9 @@ pub(crate) fn resolve_claude_bin() -> String {
         }
         #[cfg(not(windows))]
         {
+            use qontinui_runner_lib::intercept_core::npm_placeholder::is_npm_placeholder;
             let cand = dir.join(&bare);
-            if cand.is_file() {
+            if cand.is_file() && !is_npm_placeholder(&cand) {
                 return cand.to_string_lossy().into_owned();
             }
         }
@@ -13756,6 +13769,43 @@ mod tests {
         }
     }
 
+    /// Clears `QONTINUI_CLAUDE_BIN` and prepends `dirs` to PATH. Restored on
+    /// drop, so a panicking assertion cannot leave the process PATH changed for
+    /// the rest of the test binary. Hold [`env_lock`] across its lifetime.
+    #[cfg(unix)]
+    struct ClaudeBinEnv(Option<String>, Option<std::ffi::OsString>);
+
+    #[cfg(unix)]
+    impl ClaudeBinEnv {
+        fn prepend(dirs: &[std::path::PathBuf]) -> Self {
+            let prev_path = std::env::var_os("PATH");
+            let restore = Self(std::env::var("QONTINUI_CLAUDE_BIN").ok(), prev_path.clone());
+            std::env::remove_var("QONTINUI_CLAUDE_BIN");
+            // PREPEND, never replace: parallel tests outside the env lock still
+            // spawn `git`/`sh` by bare name and must keep finding them.
+            let mut all = dirs.to_vec();
+            if let Some(p) = &prev_path {
+                all.extend(std::env::split_paths(p));
+            }
+            std::env::set_var("PATH", std::env::join_paths(all).unwrap());
+            restore
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ClaudeBinEnv {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("QONTINUI_CLAUDE_BIN", v),
+                None => std::env::remove_var("QONTINUI_CLAUDE_BIN"),
+            }
+            match self.1.take() {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
     /// The spawn seam resolves `claude` to the absolute file a PATH walk finds
     /// (plan `2026-10-03-runner-claude-spawn-fails-enoent-during-cli-auto-update`).
     #[cfg(unix)]
@@ -13772,33 +13822,42 @@ mod tests {
         std::fs::write(&bin, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        // Restored on drop, so a panicking assertion cannot leave the
-        // process PATH changed for the rest of the test binary.
-        struct Restore(Option<String>, Option<std::ffi::OsString>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(v) => std::env::set_var("QONTINUI_CLAUDE_BIN", v),
-                    None => std::env::remove_var("QONTINUI_CLAUDE_BIN"),
-                }
-                match self.1.take() {
-                    Some(v) => std::env::set_var("PATH", v),
-                    None => std::env::remove_var("PATH"),
-                }
-            }
-        }
-        let prev_path = std::env::var_os("PATH");
-        let _restore = Restore(std::env::var("QONTINUI_CLAUDE_BIN").ok(), prev_path.clone());
-        std::env::remove_var("QONTINUI_CLAUDE_BIN");
-        // PREPEND, never replace: parallel tests outside the env lock still
-        // spawn `git`/`sh` by bare name and must keep finding them.
-        let mut dirs = vec![empty.clone(), bin_dir.clone()];
-        if let Some(p) = &prev_path {
-            dirs.extend(std::env::split_paths(p));
-        }
-        std::env::set_var("PATH", std::env::join_paths(dirs).unwrap());
+        let _env = ClaudeBinEnv::prepend(&[empty.clone(), bin_dir.clone()]);
         let found = resolve_claude_bin();
         assert_eq!(found, bin.to_string_lossy());
+    }
+
+    /// npm's placeholder stub is a miss: the walk moves past it to a real binary
+    /// further down PATH, and a stub alone is never pinned.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_claude_bin_never_pins_the_npm_placeholder_stub() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env_lock = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let stub_dir = tmp.path().join("stub");
+        let real_dir = tmp.path().join("real");
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let stub = stub_dir.join("claude");
+        std::fs::write(
+            &stub,
+            "echo \"Error: claude native binary not installed.\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let real = real_dir.join("claude");
+        std::fs::write(&real, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        {
+            let _env = ClaudeBinEnv::prepend(&[stub_dir.clone(), real_dir.clone()]);
+            assert_eq!(resolve_claude_bin(), real.to_string_lossy());
+        }
+        // Not asserted equal to the bare name: this box's own `claude` may
+        // follow on the inherited PATH, and that is a correct answer too.
+        let _env = ClaudeBinEnv::prepend(&[stub_dir.clone()]);
+        assert_ne!(resolve_claude_bin(), stub.to_string_lossy());
     }
 
     /// A resolved path to a NON-executable file is not pinned: the bare name
