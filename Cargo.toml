@@ -114,6 +114,33 @@ opt-level = 2
 codegen-units = 256
 lto = false
 
+# The PRIMARY runner's profile (plan
+# 2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it): release's
+# optimization (opt-level 2, cgu 256, lto off -- the #655 tuning above) with
+# debug assertions and overflow checks KEPT, so every cfg(debug_assertions) arm
+# and the std `rc.rs` UB tripwire that identified the tao refcount race behave
+# exactly as in today's debug primary. The ONLY variable versus `dev` is
+# optimization. Output lands in <target>/release-checked/, the same depth as
+# debug/. Temp, named, slot and test builds stay on `dev`.
+#
+# Measured on spaceship 2026-10-24 (plan Phase 1, shared target-agent/, jobs=4):
+# cold build 23m50s; runner-crate rebuild 20m54s vs 9m18s for `dev` (2.25x,
+# under the plan's 3x bound); peak single rustc working set 24.9 GB (the
+# runner crate at opt-level 2; bound 60% of 128 GB); 4.1 GB of output. The
+# terminal transport benches (src/terminal/transport_cost.rs) ran 21-35x
+# faster per byte on repaint corpora and 4-8x on the typing corpus, with the
+# redaction hop 59-66x faster per frame on repaint corpora (6.2x on typing).
+# The full table is in the plan's "Phase 1 result" section.
+[profile.release-checked]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
+incremental = false
+[profile.release-checked.package.aws-lc-rs]
+debug-assertions = false
+[profile.release-checked.package.aws-lc-sys]
+debug-assertions = false
+
 # ---------------------------------------------------------------------------
 # tao: make `EventLoopRunnerShared`'s refcount atomic.
 #

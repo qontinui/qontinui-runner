@@ -519,7 +519,8 @@ fn ensure_dist_placeholder() {
 
 /// The `bundle.externalBin` sidecars, spelled exactly as `tauri.conf.json`
 /// spells them. Keep in sync with it (a test pins that) and with
-/// `scripts/bundle-profile-sidecar.mjs` `SIDECAR_BINS`.
+/// `scripts/lib/sidecars.mjs` `SIDECAR_BINS`, the roster
+/// `scripts/bundle-profile-sidecar.mjs` and `scripts/build-exe.mjs` read.
 ///
 /// `qontinui-pty-holder` is the per-pane PTY holder (plan
 /// 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions, Phase 2):
@@ -1573,19 +1574,27 @@ mod sidecar_scope_tests {
     /// that nothing built.
     #[test]
     fn the_bundle_script_builds_every_external_bin_sidecar() {
-        let script = include_str!("../scripts/bundle-profile-sidecar.mjs");
-        let line = script
+        // The roster lives in scripts/lib/sidecars.mjs, shared by the bundle
+        // step and `pnpm run build:exe` (the primary's build, which builds the
+        // same sidecars beside the runner in its own profile dir).
+        let roster = include_str!("../scripts/lib/sidecars.mjs");
+        let line = roster
             .lines()
-            .find(|l| l.trim_start().starts_with("const SIDECAR_BINS"))
-            .expect("bundle-profile-sidecar.mjs declares SIDECAR_BINS");
+            .find(|l| l.trim_start().starts_with("export const SIDECAR_BINS"))
+            .expect("scripts/lib/sidecars.mjs declares SIDECAR_BINS");
         let quoted: Vec<String> = EXTERNAL_BIN_SIDECARS
             .iter()
             .map(|e| format!("\"{}\"", e.trim_start_matches("binaries/")))
             .collect();
         assert_eq!(
             line.trim(),
-            format!("const SIDECAR_BINS = [{}];", quoted.join(", "))
+            format!("export const SIDECAR_BINS = [{}];", quoted.join(", "))
         );
+        // ...and both build paths actually read that roster.
+        let bundle = include_str!("../scripts/bundle-profile-sidecar.mjs");
+        assert!(bundle.contains("from \"./lib/sidecars.mjs\""));
+        let build_exe = include_str!("../scripts/build-exe.mjs");
+        assert!(build_exe.contains("from \"./lib/sidecars.mjs\""));
     }
 
     #[test]

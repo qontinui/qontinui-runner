@@ -124,6 +124,22 @@ $paths.Add((Join-Path $RunnerRoot "target\debug\qontinui-runner.exe"))
 # Primary runner exe (id-based naming; "primary" is the default).
 $paths.Add((Join-Path $RunnerRoot "target\debug\qontinui-runner-primary.exe"))
 
+# The PRIMARY in its optimized `release-checked` profile (plan
+# 2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it). Allowlisted
+# ahead of the plan's Phases 4 and 5, which make dev-start's -Runner build into
+# target\release-checked\ and launch its devstart copy there, and make the
+# supervisor build the primary in target-pool\primary\, copy it to
+# target\release-checked\ and keep a per-profile LKG under
+# target-pool\lkg\<profile-dir>\. Without these an unattended primary start
+# raises the Allow-access dialog with nobody there to click it.
+$paths.Add((Join-Path $RunnerRoot "target\release-checked\qontinui-runner.exe"))
+$paths.Add((Join-Path $RunnerRoot "target\release-checked\qontinui-runner-primary.exe"))
+$paths.Add((Join-Path $RunnerRoot "target\release-checked\qontinui-devstart-runner.exe"))
+$paths.Add((Join-Path $RunnerRoot "target\debug\qontinui-devstart-runner.exe"))
+$paths.Add((Join-Path $RunnerRoot "target-pool\primary\release-checked\qontinui-runner.exe"))
+$paths.Add((Join-Path $RunnerRoot "target-pool\lkg\release-checked\qontinui-runner.exe"))
+$paths.Add((Join-Path $RunnerRoot "target-pool\lkg\debug\qontinui-runner.exe"))
+
 # Temp + named runner exes for every port in the supervisor's pool.
 #
 # Current layout (qontinui-supervisor#197): each runner gets its own directory
