@@ -1,0 +1,3 @@
+   Compiling qontinui-runner v1.0.11 (D:\a\qontinui-runner\qontinui-runner\src-tauri)
+error: could not exec the linker `link.exe`: The paging file is too small for this operation to complete. (os error 1455)
+error: could not compile `qontinui-runner` (lib test) due to 1 previous error
