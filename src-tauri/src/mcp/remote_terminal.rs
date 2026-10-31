@@ -63,6 +63,47 @@ pub struct AttachGrant {
     pub expires_at: u64,
 }
 
+/// What one grant-table `insert` did — the answer of [`RemoteAttachGrants::insert`]
+/// and [`RemoteCreateGrants::insert`], decided inside the same critical section
+/// that did it.
+///
+/// Both inserts are idempotent on `grant_jti`, and coord re-lists every
+/// unexpired, unconsumed grant on every catch-up pass, so the same row arrives
+/// again and again. A `bool` answered `true` for a re-insert exactly as for a
+/// new row, and every caller logged "grant recorded" on every delivery. This
+/// tells the two apart, so a caller can log only what is new.
+///
+/// Deliberately not `#[must_use]`: most test fixtures insert and ignore the
+/// answer, and the push arm has nothing to do with it either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantInsert {
+    /// A row this table did not hold is now in it.
+    Recorded,
+    /// The table already held this jti. Its expiry was refreshed; an attach
+    /// row keeps its terminal binding.
+    Refreshed,
+    /// Not recorded: a lock is poisoned, or (attach) every row is a live
+    /// binding and none can be evicted to make room. `insert` WARNs the
+    /// capacity refusal and a poisoned create tombstone lock; a poisoned map
+    /// lock it does not log (the create feed's `record_into` WARNs the drop).
+    Refused,
+    /// Not recorded: a create grant this process already spent. Coord keeps
+    /// listing it until its `consumed_at` is set.
+    RefusedSpent,
+    /// Not recorded: the feed row cannot become a grant (an unreadable
+    /// `expires_at`, or a create row naming no source device). Never returned
+    /// by a table — the feed's `record_into` answers it before any insert.
+    Unusable,
+}
+
+impl GrantInsert {
+    /// True when the table holds the row afterwards (`Recorded | Refreshed`) —
+    /// what the old `bool` answer meant.
+    pub fn accepted(self) -> bool {
+        matches!(self, GrantInsert::Recorded | GrantInsert::Refreshed)
+    }
+}
+
 /// Why a `remote` frame was refused. `code()` is the wire spelling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachRefusal {
@@ -132,10 +173,17 @@ impl RemoteAttachGrants {
     /// soonest-expiring UNBOUND row is evicted; a bound row is a live
     /// attachment, and when every row is bound the new grant is refused
     /// (logged) rather than knocking a live tab off — a flood of mints must
-    /// not be a way to sever attachments. Returns `false` when refused.
-    pub fn insert(&self, grant: AttachGrant, now: u64) -> bool {
+    /// not be a way to sever attachments. See [`GrantInsert`] for what it
+    /// answers.
+    pub fn insert(&self, grant: AttachGrant, now: u64) -> GrantInsert {
         let Ok(mut map) = self.inner.lock() else {
-            return false;
+            // Every other refusal is logged where it is decided; without this
+            // line a poisoned table would drop the grant without a trace.
+            warn!(
+                grant_jti = %grant.grant_jti,
+                "remote attach: grant NOT recorded (the grant table lock is poisoned)"
+            );
+            return GrantInsert::Refused;
         };
         map.retain(|_, g| g.expires_at > now);
         if let Some(existing) = map.get_mut(&grant.grant_jti) {
@@ -143,7 +191,7 @@ impl RemoteAttachGrants {
                 existing.terminal_id = grant.terminal_id.clone();
             }
             existing.expires_at = grant.expires_at;
-            return true;
+            return GrantInsert::Refreshed;
         }
         if map.len() >= MAX_GRANTS {
             let victim = map
@@ -166,12 +214,12 @@ impl RemoteAttachGrants {
                         cap = MAX_GRANTS,
                         "remote attach: grant table at capacity and every row is a live binding — refusing the new grant"
                     );
-                    return false;
+                    return GrantInsert::Refused;
                 }
             }
         }
         map.insert(grant.grant_jti.clone(), grant);
-        true
+        GrantInsert::Recorded
     }
 
     /// Admit or refuse one frame. Order: preference (a disabled device leaks
@@ -442,22 +490,45 @@ impl RemoteCreateGrants {
     /// [`MAX_GRANTS`] the soonest-expiring row is evicted. No row here is ever
     /// "live" the way a bound attach row is — a create grant is consumed the
     /// moment it is used — so eviction has no attachment to sever and never
-    /// refuses. Returns `false` only when the lock is poisoned.
-    pub fn insert(&self, grant: CreateGrant, now: u64) -> bool {
+    /// refuses. See [`GrantInsert`] for what it answers: `RefusedSpent` for a
+    /// jti this process already spent, `Refused` only for a poisoned lock.
+    pub fn insert(&self, grant: CreateGrant, now: u64) -> GrantInsert {
         // A jti this process already spent is NEVER re-admitted, however it
         // arrives. Coord keeps serving a grant until its `consumed_at` is set,
         // and the catch-up poll runs every 60 s, so without this the single-use
         // property degrades into "once per poll interval".
-        if self.is_spent(&grant.grant_jti, now) {
-            warn!(
-                grant_jti = %grant.grant_jti,
-                "remote create: refusing to re-record a grant this device already spent \\
-                 (coord has not marked it consumed yet)"
-            );
-            return false;
+        //
+        // The refusal is DEBUG, every time. It repeats on every re-listing
+        // until coord flips `consumed_at`, which in the normal case is about a
+        // second after the spend — a WARN there is a false alarm. The cases
+        // where the re-listing PERSISTS are coord refusing the consume notice
+        // or the notice's retries running out, and `notify_consumed` already
+        // WARNs on exactly those.
+        match self.spent_state(&grant.grant_jti, now) {
+            Some(false) => {}
+            Some(true) => {
+                debug!(
+                    grant_jti = %grant.grant_jti,
+                    "remote create: refusing to re-record a grant this device already spent \
+                     (coord has not marked it consumed yet)"
+                );
+                return GrantInsert::RefusedSpent;
+            }
+            // Not "already spent": that cannot be read. Still refused — the
+            // table cannot record a row it cannot prove unspent — but named
+            // for what it is.
+            None => {
+                warn!(
+                    grant_jti = %grant.grant_jti,
+                    "remote create: the spent-grant tombstone lock is poisoned — refusing \
+                     to record the grant, because whether this device already spent it \
+                     cannot be read"
+                );
+                return GrantInsert::Refused;
+            }
         }
         let Ok(mut map) = self.inner.lock() else {
-            return false;
+            return GrantInsert::Refused;
         };
         map.retain(|_, g| g.expires_at > now);
         if let Some(existing) = map.get_mut(&grant.grant_jti) {
@@ -468,7 +539,7 @@ impl RemoteCreateGrants {
             if existing.source_user_id.trim().is_empty() {
                 existing.source_user_id = grant.source_user_id;
             }
-            return true;
+            return GrantInsert::Refreshed;
         }
         if map.len() >= MAX_GRANTS {
             if let Some(victim) = map
@@ -485,7 +556,7 @@ impl RemoteCreateGrants {
             }
         }
         map.insert(grant.grant_jti.clone(), grant);
-        true
+        GrantInsert::Recorded
     }
 
     /// Presence + source device + expiry, WITHOUT consuming. The read a test
@@ -604,11 +675,16 @@ impl RemoteCreateGrants {
     /// refusing creates on a process whose lock is already broken; the
     /// alternative is admitting a spent grant.
     fn is_spent(&self, grant_jti: &str, now: u64) -> bool {
-        let Ok(mut spent) = self.spent.lock() else {
-            return true;
-        };
+        self.spent_state(grant_jti, now).unwrap_or(true)
+    }
+
+    /// [`Self::is_spent`] without the fail-closed reading: `None` when the
+    /// tombstone lock is poisoned, so [`Self::insert`] can say so rather than
+    /// report an unreadable tombstone as "already spent".
+    fn spent_state(&self, grant_jti: &str, now: u64) -> Option<bool> {
+        let mut spent = self.spent.lock().ok()?;
         spent.retain(|_, exp| *exp > now);
-        spent.contains_key(grant_jti)
+        Some(spent.contains_key(grant_jti))
     }
 
     fn mark_spent(&self, grant: &CreateGrant, now: u64) {
@@ -626,6 +702,16 @@ impl RemoteCreateGrants {
             .lock()
             .map(|map| map.contains_key(grant_jti))
             .unwrap_or(false)
+    }
+
+    /// Drop a row without spending it — test cleanup for tests that must
+    /// write the GLOBAL table (the catch-up entry point feeds only that one).
+    /// Production retires a grant through `resolve`/`consume`, never this.
+    #[cfg(test)]
+    pub(crate) fn remove(&self, grant_jti: &str) {
+        if let Ok(mut map) = self.inner.lock() {
+            map.remove(grant_jti);
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -4740,7 +4826,10 @@ mod tests {
     fn grant_table_is_bounded_and_keeps_bindings_on_reinsert() {
         let table = RemoteAttachGrants::new();
         for i in 0..MAX_GRANTS {
-            assert!(table.insert(grant(&format!("j{i}"), None, NOW + 100 + i as u64), NOW));
+            assert_eq!(
+                table.insert(grant(&format!("j{i}"), None, NOW + 100 + i as u64), NOW),
+                GrantInsert::Recorded
+            );
         }
         assert_eq!(table.len(), MAX_GRANTS);
         // j5 becomes a live attachment; it expires sooner than almost
@@ -4748,7 +4837,10 @@ mod tests {
         assert!(table.bind("j5", "term-Q"));
 
         // One more evicts the soonest-expiring UNBOUND row (j0), not j5.
-        assert!(table.insert(grant("overflow", None, NOW + 5000), NOW));
+        assert_eq!(
+            table.insert(grant("overflow", None, NOW + 5000), NOW),
+            GrantInsert::Recorded
+        );
         assert_eq!(table.len(), MAX_GRANTS);
         assert!(matches!(
             table.admit("j0", None, None, AcceptRemoteAttach::Tenant, NOW),
@@ -4761,10 +4853,13 @@ mod tests {
         // A flood of MAX_GRANTS further mints churns every unbound row and
         // never touches the bound one.
         for i in 0..MAX_GRANTS {
-            assert!(table.insert(
-                grant(&format!("flood{i}"), None, NOW + 7000 + i as u64),
-                NOW
-            ));
+            assert_eq!(
+                table.insert(
+                    grant(&format!("flood{i}"), None, NOW + 7000 + i as u64),
+                    NOW
+                ),
+                GrantInsert::Recorded
+            );
         }
         assert_eq!(table.len(), MAX_GRANTS);
         let live = table
@@ -4807,7 +4902,10 @@ mod tests {
             );
         }
         assert_eq!(table.len(), MAX_GRANTS);
-        assert!(!table.insert(grant("one-too-many", None, NOW + 5000), NOW));
+        assert_eq!(
+            table.insert(grant("one-too-many", None, NOW + 5000), NOW),
+            GrantInsert::Refused
+        );
         assert_eq!(table.len(), MAX_GRANTS);
         assert!(matches!(
             table.admit("one-too-many", None, None, AcceptRemoteAttach::Tenant, NOW),
@@ -4821,7 +4919,73 @@ mod tests {
         }
         // Once one binding is released (detach), the next mint fits again.
         table.unbind("j3");
-        assert!(table.insert(grant("fits-now", None, NOW + 5000), NOW));
+        assert_eq!(
+            table.insert(grant("fits-now", None, NOW + 5000), NOW),
+            GrantInsert::Recorded
+        );
+    }
+
+    /// `insert` says what it did, so its caller can log only what is new:
+    /// coord re-lists every unexpired grant on every 15 s catch-up pass, and a
+    /// `bool` answered `true` for a re-insert exactly as for a new row.
+    ///
+    /// A new jti is `Recorded`; the same jti again is `Refreshed`, and a
+    /// terminal binding made between the two survives it; a full table whose
+    /// every row is bound is `Refused`, as is a poisoned lock. Fails against a
+    /// refresh arm answering `Recorded`.
+    #[test]
+    fn attach_insert_reports_recorded_then_refreshed_and_refused() {
+        let table = RemoteAttachGrants::new();
+        assert_eq!(
+            table.insert(grant("j1", None, NOW + 600), NOW),
+            GrantInsert::Recorded
+        );
+        assert!(table.bind("j1", "term-A"));
+        assert_eq!(
+            table.insert(grant("j1", None, NOW + 900), NOW),
+            GrantInsert::Refreshed
+        );
+        let held = table.get("j1").expect("still held");
+        assert_eq!(held.terminal_id.as_deref(), Some("term-A"), "binding kept");
+        assert_eq!(held.expires_at, NOW + 900, "expiry refreshed");
+        assert_eq!(table.len(), 1);
+
+        let full = RemoteAttachGrants::new();
+        for i in 0..MAX_GRANTS {
+            full.insert(
+                grant(&format!("b{i}"), Some(&format!("t{i}")), NOW + 600),
+                NOW,
+            );
+        }
+        assert_eq!(
+            full.insert(grant("one-more", None, NOW + 600), NOW),
+            GrantInsert::Refused
+        );
+
+        let poisoned = RemoteAttachGrants::new();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = poisoned.inner.lock().unwrap();
+            panic!("test: poisoning the lock");
+        }));
+        const SENTINEL: &str = "sentinel: poisoned attach table capture is live";
+        let (outcome, logs) = crate::resource_guard::capture_logs(|| {
+            tracing::info!("{SENTINEL}");
+            poisoned.insert(grant("j1", None, NOW + 600), NOW)
+        });
+        assert_eq!(outcome, GrantInsert::Refused);
+        assert!(
+            logs.contains(SENTINEL),
+            "the capture must be live: {logs:?}"
+        );
+        let warns: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.contains("WARN") && l.contains("grant table lock is poisoned"))
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "a poisoned table names itself rather than dropping the grant silently: {logs}"
+        );
     }
 
     #[test]
@@ -7176,15 +7340,17 @@ mod grant_gate_tests {
     /// they name and not an incidental unknown-grant.
     fn known_create_grants() -> RemoteCreateGrants {
         let table = RemoteCreateGrants::new();
-        assert!(table.insert(
-            CreateGrant {
-                grant_jti: "jti-create-1".to_string(),
-                source_device_id: "dev-source".to_string(),
-                source_user_id: PAIRED_USER.to_string(),
-                expires_at: NOW + 900,
-            },
-            NOW,
-        ));
+        assert!(table
+            .insert(
+                CreateGrant {
+                    grant_jti: "jti-create-1".to_string(),
+                    source_device_id: "dev-source".to_string(),
+                    source_user_id: PAIRED_USER.to_string(),
+                    expires_at: NOW + 900,
+                },
+                NOW,
+            )
+            .accepted());
         table
     }
 
@@ -7426,16 +7592,18 @@ mod grant_gate_tests {
     #[test]
     fn a_jti_known_as_an_attach_grant_cannot_create() {
         let grants = RemoteAttachGrants::new();
-        assert!(grants.insert(
-            AttachGrant {
-                grant_jti: "jti-create-1".to_string(),
-                source_device_id: "dev-source".to_string(),
-                session_id: Uuid::from_u128(3),
-                terminal_id: None,
-                expires_at: u64::MAX,
-            },
-            0,
-        ));
+        assert!(grants
+            .insert(
+                AttachGrant {
+                    grant_jti: "jti-create-1".to_string(),
+                    source_device_id: "dev-source".to_string(),
+                    session_id: Uuid::from_u128(3),
+                    terminal_id: None,
+                    expires_at: u64::MAX,
+                },
+                0,
+            )
+            .accepted());
         let err = admit_terminal_create(
             &grants,
             &known_create_grants(),
@@ -7589,8 +7757,15 @@ mod grant_gate_tests {
     /// This fails against an implementation that only removes the row on
     /// consume: `insert` would take the re-delivered grant and the second
     /// admission would succeed.
+    ///
+    /// And the re-deliveries are QUIET: each is `RefusedSpent` with no WARN.
+    /// Coord re-lists the row on every pass until it flips `consumed_at`, which
+    /// normally takes about a second, so a WARN per re-delivery is a false
+    /// alarm; `notify_consumed` WARNs on the cases where the re-listing
+    /// persists. Fails against the old WARN in `insert`'s spent arm.
     #[test]
     fn a_spent_jti_cannot_be_re_recorded_by_the_catch_up_feed() {
+        const SENTINEL: &str = "sentinel: spent re-delivery capture is live";
         let table = known_create_grants();
         assert!(admit_terminal_create(
             &empty_grants(),
@@ -7606,18 +7781,27 @@ mod grant_gate_tests {
         assert!(table.is_empty());
         assert_eq!(table.spent_len(NOW), 1);
 
-        // Coord's poll re-delivers the row — it has not marked it consumed yet.
-        assert!(
-            !table.insert(
-                CreateGrant {
-                    grant_jti: "jti-create-1".to_string(),
-                    source_device_id: "dev-source".to_string(),
-                    source_user_id: PAIRED_USER.to_string(),
-                    expires_at: NOW + 900,
-                },
-                NOW,
-            ),
+        // Coord's poll re-delivers the row — it has not marked it consumed yet —
+        // on every pass until it does.
+        let (outcomes, logs) = crate::resource_guard::capture_logs(|| {
+            tracing::warn!("{SENTINEL}");
+            (0..3)
+                .map(|_| table.insert(known_create_grant(), NOW))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            outcomes,
+            vec![GrantInsert::RefusedSpent; 3],
             "a spent jti must not be re-recorded"
+        );
+        assert!(
+            logs.contains(SENTINEL),
+            "the capture must be live: {logs:?}"
+        );
+        let others: Vec<&str> = logs.lines().filter(|l| !l.contains(SENTINEL)).collect();
+        assert!(
+            others.is_empty(),
+            "a spent re-delivery logs nothing at INFO or above: {others:?}"
         );
         assert!(table.is_empty(), "and it must not be in the table");
 
@@ -7636,6 +7820,145 @@ mod grant_gate_tests {
         // The tombstone expires with the grant — past that coord stops serving
         // it too, so there is nothing left to guard.
         assert_eq!(table.spent_len(NOW + 901), 0);
+    }
+
+    /// The spent refusal is ONE DEBUG line. Its message used to end its first
+    /// line with an escaped backslash (`\\`) where a line continuation (`\`)
+    /// was meant, so the logged text carried a literal backslash, a newline and
+    /// the next line's indentation. Fails against that spelling, and against
+    /// the refusal moving back above DEBUG.
+    #[test]
+    fn the_spent_refusal_is_one_debug_line_with_no_backslash() {
+        const SENTINEL: &str = "sentinel: spent refusal capture is live";
+        let table = known_create_grants();
+        table
+            .consume("jti-create-1", Some("dev-source"), NOW)
+            .expect("the first use spends it");
+        let (outcome, logs) = crate::resource_guard::capture_logs_at(tracing::Level::DEBUG, || {
+            tracing::debug!("{SENTINEL}");
+            table.insert(known_create_grant(), NOW)
+        });
+        assert_eq!(outcome, GrantInsert::RefusedSpent);
+        assert!(
+            logs.contains(SENTINEL),
+            "the capture must be live: {logs:?}"
+        );
+        let refusals: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.contains("refusing to re-record"))
+            .collect();
+        assert_eq!(refusals.len(), 1, "{logs:?}");
+        let line = refusals[0];
+        assert!(line.contains(" DEBUG "), "logged at DEBUG: {line:?}");
+        assert!(
+            line.contains("already spent (coord has not marked it consumed yet)"),
+            "one line, joined by a continuation: {line:?}"
+        );
+        assert!(!logs.contains('\\'), "no literal backslash: {logs:?}");
+    }
+
+    /// A POISONED tombstone lock is refused AND NAMED: `Refused` with one WARN
+    /// saying the lock is poisoned, not `RefusedSpent` — whether the jti was
+    /// spent is exactly what cannot be read. `resolve`'s own reading of the
+    /// same lock stays fail-closed: a row the table holds is still refused.
+    #[test]
+    fn a_poisoned_tombstone_lock_is_refused_and_named_rather_than_read_as_spent() {
+        const SENTINEL: &str = "sentinel: poisoned tombstone capture is live";
+        let table = RemoteCreateGrants::new();
+        poison(&table.spent);
+        let (outcome, logs) = crate::resource_guard::capture_logs(|| {
+            tracing::info!("{SENTINEL}");
+            table.insert(known_create_grant(), NOW)
+        });
+        assert_eq!(outcome, GrantInsert::Refused);
+        assert!(
+            logs.contains(SENTINEL),
+            "the capture must be live: {logs:?}"
+        );
+        let warns: Vec<&str> = logs.lines().filter(|l| l.contains(" WARN ")).collect();
+        assert_eq!(warns.len(), 1, "{logs:?}");
+        assert!(
+            warns[0].contains("tombstone lock is poisoned"),
+            "{:?}",
+            warns[0]
+        );
+        assert!(!table.contains("jti-create-1"));
+
+        // `resolve` is unchanged: with the row present, a poisoned tombstone
+        // still reads as spent there, and the grant is refused.
+        table
+            .inner
+            .lock()
+            .unwrap()
+            .insert("jti-create-1".to_string(), known_create_grant());
+        assert!(matches!(
+            table.lookup("jti-create-1", Some("dev-source"), NOW),
+            Err(CreateRefusal::GrantUnknown)
+        ));
+    }
+
+    /// The create table's other arms, enumerated: a new jti is `Recorded`; the
+    /// same jti again is `Refreshed` (expiry moved, the stored source kept); a
+    /// full table still RECORDS, by evicting, because no create row is a live
+    /// attachment; a poisoned map lock is `Refused`. Fails against a refresh
+    /// arm answering `Recorded`, which is what made every re-listing look new.
+    #[test]
+    fn create_insert_reports_recorded_refreshed_and_refused() {
+        let table = RemoteCreateGrants::new();
+        assert_eq!(
+            table.insert(known_create_grant(), NOW),
+            GrantInsert::Recorded
+        );
+        let mut again = known_create_grant();
+        again.expires_at = NOW + 1_800;
+        again.source_device_id = "dev-other".to_string();
+        assert_eq!(table.insert(again, NOW), GrantInsert::Refreshed);
+        let held = table
+            .lookup("jti-create-1", Some("dev-source"), NOW)
+            .expect("the refreshed row keeps its source binding");
+        assert_eq!(held.expires_at, NOW + 1_800);
+        assert_eq!(table.len(), 1);
+
+        for i in 1..MAX_GRANTS {
+            let mut g = known_create_grant();
+            g.grant_jti = format!("fill-{i}");
+            assert_eq!(table.insert(g, NOW), GrantInsert::Recorded);
+        }
+        let mut overflow = known_create_grant();
+        overflow.grant_jti = "overflow".to_string();
+        overflow.expires_at = NOW + 5_000;
+        assert_eq!(
+            table.insert(overflow, NOW),
+            GrantInsert::Recorded,
+            "a full create table evicts rather than refuses"
+        );
+        assert_eq!(table.len(), MAX_GRANTS);
+
+        let poisoned = RemoteCreateGrants::new();
+        poison(&poisoned.inner);
+        assert_eq!(
+            poisoned.insert(known_create_grant(), NOW),
+            GrantInsert::Refused
+        );
+    }
+
+    /// The grant [`known_create_grants`] holds, as the feed re-delivers it.
+    fn known_create_grant() -> CreateGrant {
+        CreateGrant {
+            grant_jti: "jti-create-1".to_string(),
+            source_device_id: "dev-source".to_string(),
+            source_user_id: PAIRED_USER.to_string(),
+            expires_at: NOW + 900,
+        }
+    }
+
+    /// Poison `lock` the way production would: a panic while it is held.
+    fn poison<T>(lock: &Mutex<T>) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = lock.lock().unwrap();
+            panic!("test: poisoning the lock");
+        }));
+        assert!(lock.is_poisoned());
     }
 
     /// **An unreadable clock fails CLOSED.** `now_epoch_secs()` answers `0`
@@ -8739,15 +9062,17 @@ mod same_user_dial_tests {
 
     fn table(source_user_id: &str) -> RemoteCreateGrants {
         let t = RemoteCreateGrants::new();
-        assert!(t.insert(
-            CreateGrant {
-                grant_jti: "jti-c".to_string(),
-                source_device_id: "dev-source".to_string(),
-                source_user_id: source_user_id.to_string(),
-                expires_at: NOW + 900,
-            },
-            NOW,
-        ));
+        assert!(t
+            .insert(
+                CreateGrant {
+                    grant_jti: "jti-c".to_string(),
+                    source_device_id: "dev-source".to_string(),
+                    source_user_id: source_user_id.to_string(),
+                    expires_at: NOW + 900,
+                },
+                NOW,
+            )
+            .accepted());
         t
     }
 

@@ -3267,13 +3267,63 @@ impl BackgroundShed {
     }
 }
 
-/// Test-only: run `f` with a scoped `tracing` subscriber and return what it
-/// logged at INFO and above. Scoped (`with_default`) rather than global because
-/// the harness runs tests in parallel and a global subscriber can be set once.
+/// Test-only: [`capture_logs_at`] at INFO — what `f` logged at INFO and above.
 /// Shared by every module whose shedding wiring asserts "exactly one line".
 #[cfg(test)]
-pub(crate) fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
+pub(crate) fn capture_logs<R>(f: impl FnMut() -> R) -> (R, String) {
+    capture_logs_at(tracing::Level::INFO, f)
+}
+
+/// Test-only: run `f` under a scoped `tracing` subscriber at `level` and return
+/// its result and everything it logged at `level` and above. Scoped
+/// (`with_default`), not global: the harness runs tests in parallel and a
+/// global subscriber can be installed once per process.
+///
+/// Two guards against tracing's PROCESS-GLOBAL callsite caches, which a scoped
+/// subscriber does not escape: a callsite's `Interest` and the global max
+/// level are recomputed whenever any dispatcher registers, and capture tests
+/// at different levels racing each other measurably lost a whole log (an empty
+/// capture) under a parallel run. So captures run one at a time, and each
+/// rebuilds the interest cache once its own subscriber is the thread default,
+/// before `f` logs anything.
+///
+/// Those two guards narrow the race but cannot close it: any OTHER test in the
+/// binary that logs or builds a dispatcher still touches the same caches, and
+/// a whole capture was observed lost once again in a wide parallel run. So a
+/// capture that came back COMPLETELY empty is re-run (up to `CAPTURE_ATTEMPTS`
+/// times), which is why `f` is `FnMut` — a subscriber that received not one
+/// byte is the race's signature. The result returned is the last attempt's.
+///
+/// **An absence assertion must not rest on an empty capture**, because an
+/// empty capture is also what the race produces. Have `f` emit a sentinel line
+/// first and assert the sentinel IS present; then "nothing else was logged"
+/// cannot pass on a lost capture, and the retry never fires.
+///
+/// Because a lost capture re-runs `f`, `f` should be safe to run more than
+/// once: a closure that bumps a counter or performs a one-shot effect will see
+/// it again on the retry, and its caller's later assertions on that effect then
+/// fail for the race's reason rather than the log's (still a failure, never a
+/// false pass).
+#[cfg(test)]
+pub(crate) fn capture_logs_at<R>(level: tracing::Level, mut f: impl FnMut() -> R) -> (R, String) {
+    const CAPTURE_ATTEMPTS: usize = 5;
+    let mut attempt = capture_logs_once(level, &mut f);
+    for _ in 1..CAPTURE_ATTEMPTS {
+        if !attempt.1.is_empty() {
+            break;
+        }
+        attempt = capture_logs_once(level, &mut f);
+    }
+    attempt
+}
+
+/// One attempt of [`capture_logs_at`].
+#[cfg(test)]
+fn capture_logs_once<R>(level: tracing::Level, f: &mut impl FnMut() -> R) -> (R, String) {
     use std::sync::Arc;
+
+    static CAPTURE_SERIAL: Mutex<()> = Mutex::new(());
+    let _serial = CAPTURE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     #[derive(Clone, Default)]
     struct Sink(Arc<Mutex<Vec<u8>>>);
@@ -3301,9 +3351,12 @@ pub(crate) fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
     let subscriber = tracing_subscriber::fmt()
         .with_writer(sink)
         .with_ansi(false)
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(level)
         .finish();
-    let out = tracing::subscriber::with_default(subscriber, f);
+    let out = tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        f()
+    });
     let text = String::from_utf8_lossy(&buf.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
     (out, text)
 }

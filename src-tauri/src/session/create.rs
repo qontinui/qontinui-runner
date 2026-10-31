@@ -46,9 +46,12 @@ use std::time::Duration;
 use serde::Deserialize;
 use uuid::Uuid;
 
+use super::attach::CatchupTally;
 use super::handoff::HandoffError;
 use super::SessionRegistry;
-use crate::mcp::remote_terminal::{create_grants, now_epoch_secs, CreateGrant};
+use crate::mcp::remote_terminal::{
+    create_grants, now_epoch_secs, CreateGrant, GrantInsert, RemoteCreateGrants,
+};
 
 /// Catch-up poll cadence. Grants live 900 s; one minute keeps the window a
 /// dropped push can hide in well inside that. Same value as the attach poll,
@@ -170,49 +173,92 @@ pub(super) fn parse_create_push(text: &str, device_id: Uuid) -> Option<PendingCr
     Some(pending)
 }
 
-/// Record one request in the create-grant table. Returns `false` when the row
-/// was unusable (no readable expiry), when the jti is one this process already
-/// spent, or when the table's lock is poisoned.
+/// Record one request in the process-wide create-grant table. See
+/// [`record_into`].
+pub fn record(pending: PendingCreate) -> GrantInsert {
+    record_into(create_grants(), pending, now_epoch_secs())
+}
+
+/// Record one request in `table`, the seam behind [`record`] (which passes
+/// [`create_grants`]) so a test can drive a table of its own.
 ///
-/// The `false` is LOGGED here rather than discarded by every caller: the two
-/// non-obvious causes — a spent-jti tombstone and a poisoned lock — are exactly
-/// the ones a silent drop would hide.
-pub fn record(pending: PendingCreate) -> bool {
+/// Logs by outcome, because coord re-lists a grant on every catch-up pass until
+/// it expires or is consumed:
+///
+/// - `Recorded` — INFO `grant recorded`, once per grant.
+/// - `Refreshed` — TRACE: the table already held it.
+/// - `RefusedSpent` — nothing more than `insert`'s own DEBUG. A spent jti is
+///   re-listed until coord flips `consumed_at`; the cases where that never
+///   happens are WARNed by [`notify_consumed`].
+/// - `Refused` and `Unusable` — WARN, as before: a poisoned lock and a
+///   malformed row are exactly the drops a silent caller would hide, and a
+///   later `remote_create_grant_unknown` is explicable only with this line.
+fn record_into(table: &RemoteCreateGrants, pending: PendingCreate, now: u64) -> GrantInsert {
     let jti = pending.grant_jti.clone();
-    match pending.into_grant() {
-        Some(grant) => {
-            let source_device = grant.source_device_id.clone();
-            let source_user = grant.source_user_id.clone();
-            let expires_at = grant.expires_at;
-            let recorded = create_grants().insert(grant, now_epoch_secs());
-            if recorded {
-                tracing::info!(
-                    grant_jti = %jti,
-                    source_device = %source_device,
-                    source_user = %source_user,
-                    expires_at,
-                    "remote create: grant recorded"
-                );
-            } else {
-                // `insert` names the reason; this says the row was DROPPED, so
-                // a later `remote_create_grant_unknown` is explicable.
-                tracing::warn!(
-                    grant_jti = %jti,
-                    "remote create: grant NOT recorded — a frame presenting it will be refused"
-                );
-            }
-            recorded
-        }
-        None => {
-            tracing::warn!(
-                grant_jti = %jti,
-                "remote create: request carries an unreadable expires_at, or no \
-                 source_device_id — skipped (both are fail-closed: a grant with no source \
-                 binding would be replayable from any device)"
-            );
-            false
-        }
+    let Some(grant) = pending.into_grant() else {
+        tracing::warn!(
+            grant_jti = %jti,
+            "remote create: request carries an unreadable expires_at, or no \
+             source_device_id — skipped (both are fail-closed: a grant with no source \
+             binding would be replayable from any device)"
+        );
+        return GrantInsert::Unusable;
+    };
+    let source_device = grant.source_device_id.clone();
+    let source_user = grant.source_user_id.clone();
+    let expires_at = grant.expires_at;
+    let outcome = table.insert(grant, now);
+    match outcome {
+        GrantInsert::Recorded => tracing::info!(
+            grant_jti = %jti,
+            source_device = %source_device,
+            source_user = %source_user,
+            expires_at,
+            "remote create: grant recorded"
+        ),
+        GrantInsert::Refreshed => tracing::trace!(
+            grant_jti = %jti,
+            expires_at,
+            "remote create: grant already recorded — expiry refreshed"
+        ),
+        GrantInsert::RefusedSpent => {}
+        // `insert` names the reason; this says the row was DROPPED, so a
+        // later `remote_create_grant_unknown` is explicable.
+        GrantInsert::Refused | GrantInsert::Unusable => tracing::warn!(
+            grant_jti = %jti,
+            "remote create: grant NOT recorded — a frame presenting it will be refused"
+        ),
     }
+    outcome
+}
+
+/// Record every row of one catch-up pass in `table` and log ONE summary line:
+/// INFO when the pass recorded something new, TRACE otherwise — the attach
+/// twin's rule. A spent jti coord keeps re-listing must not bring back a
+/// per-tick INFO line.
+fn record_all(table: &RemoteCreateGrants, rows: Vec<PendingCreate>, now: u64) -> CatchupTally {
+    let mut tally = CatchupTally::default();
+    for pending in rows {
+        tally.note(record_into(table, pending, now));
+    }
+    if tally.new > 0 {
+        tracing::info!(
+            new = tally.new,
+            known = tally.known,
+            refused = tally.refused,
+            spent = tally.spent,
+            "remote create: catch-up recorded new pending grants"
+        );
+    } else {
+        tracing::trace!(
+            new = tally.new,
+            known = tally.known,
+            refused = tally.refused,
+            spent = tally.spent,
+            "remote create: catch-up recorded new pending grants"
+        );
+    }
+    tally
 }
 
 /// How long to keep re-trying `notify_consumed`, and how long to wait between
@@ -369,15 +415,7 @@ pub(super) async fn run_catchup(
                      the only feed"
                 );
             }
-            if !list.requests.is_empty() {
-                tracing::info!(
-                    count = list.requests.len(),
-                    "remote create: catch-up recording pending grants"
-                );
-            }
-            for pending in list.requests {
-                record(pending);
-            }
+            record_all(create_grants(), list.requests, now_epoch_secs());
             create_grants().purge_expired(now_epoch_secs());
         }
         Err(HandoffError::Status(401 | 403, _)) => {
@@ -548,8 +586,9 @@ mod tests {
             pending.into_grant().is_none(),
             "…and is dropped rather than recorded with an empty binding"
         );
-        assert!(
-            !record(serde_json::from_value(body).unwrap()),
+        assert_eq!(
+            record(serde_json::from_value(body).unwrap()),
+            GrantInsert::Unusable,
             "`record` reports the drop"
         );
 
@@ -672,5 +711,276 @@ mod tests {
         let grant = pending.into_grant().unwrap();
         assert_eq!(grant.grant_jti, "0192a1b2-0000-7000-8000-000000000001");
         assert_eq!(grant.expires_at, 1_900_000_000);
+    }
+
+    // ---- Logging only what is new — the attach twin's rule (plan
+    // `2026-10-19-runner-remote-attach-catch-up-re-records-the-same-grants`
+    // Phase 2). Every test below drives a LOCAL table.
+
+    const NOW: u64 = 1_700_000_000;
+
+    fn row(jti: &str) -> PendingCreate {
+        PendingCreate {
+            grant_jti: jti.to_string(),
+            source_device_id: Some(Uuid::from_u128(1)),
+            source_user_id: Some(Uuid::from_u128(2)),
+            target_device_id: Some(Uuid::from_u128(10)),
+            expires_at: json!(NOW + 900),
+        }
+    }
+
+    fn rows(n: usize) -> Vec<PendingCreate> {
+        (0..n).map(|i| row(&format!("jti-{i}"))).collect()
+    }
+
+    /// The lines of a capture other than its sentinel.
+    fn besides<'a>(logs: &'a str, sentinel: &str) -> Vec<&'a str> {
+        logs.lines().filter(|l| !l.contains(sentinel)).collect()
+    }
+
+    /// A row that cannot become a grant is `Unusable` (both fail-closed
+    /// readings), and a readable one is `Recorded`, then `Refreshed`.
+    #[test]
+    fn record_into_answers_unusable_then_recorded_then_refreshed() {
+        let table = RemoteCreateGrants::new();
+        let mut bad = row("jti-bad");
+        bad.expires_at = json!("not a time");
+        assert_eq!(record_into(&table, bad, NOW), GrantInsert::Unusable);
+        let mut sourceless = row("jti-sourceless");
+        sourceless.source_device_id = None;
+        assert_eq!(record_into(&table, sourceless, NOW), GrantInsert::Unusable);
+        assert!(table.is_empty());
+        assert_eq!(
+            record_into(&table, row("jti-ok"), NOW),
+            GrantInsert::Recorded
+        );
+        assert_eq!(
+            record_into(&table, row("jti-ok"), NOW),
+            GrantInsert::Refreshed
+        );
+    }
+
+    /// The tally a pass returns counts a re-listed grant as `known`, not
+    /// `new`. Fails against an `insert` whose refresh arm answers `Recorded`.
+    #[test]
+    fn record_all_counts_only_unseen_rows_as_new() {
+        let table = RemoteCreateGrants::new();
+        assert_eq!(record_all(&table, rows(20), NOW).new, 20);
+        assert_eq!(
+            record_all(&table, rows(20), NOW),
+            CatchupTally {
+                known: 20,
+                ..CatchupTally::default()
+            }
+        );
+        let mut mixed = rows(19);
+        mixed.push(row("jti-new"));
+        assert_eq!(
+            record_all(&table, mixed, NOW),
+            CatchupTally {
+                new: 1,
+                known: 19,
+                refused: 0,
+                spent: 0,
+            }
+        );
+    }
+
+    /// The steady state is silent at INFO, and one new grant among known ones
+    /// is exactly one `grant recorded` line plus one summary with `new=1`.
+    /// Each capture first logs a sentinel the test requires.
+    #[test]
+    fn a_pass_over_known_grants_logs_nothing_at_info() {
+        use crate::resource_guard::capture_logs;
+        const SENTINEL: &str = "sentinel: create record_all capture is live";
+        let table = RemoteCreateGrants::new();
+        record_all(&table, rows(20), NOW);
+
+        let (tally, logs) = capture_logs(|| {
+            tracing::info!("{SENTINEL}");
+            record_all(&table, rows(20), NOW)
+        });
+        assert_eq!(tally.known, 20);
+        assert!(
+            logs.contains(SENTINEL),
+            "the capture must be live: {logs:?}"
+        );
+        assert!(besides(&logs, SENTINEL).is_empty(), "{logs}");
+
+        let mut mixed = rows(19);
+        mixed.push(row("jti-new"));
+        let (tally, logs) = capture_logs(|| {
+            tracing::info!("{SENTINEL}");
+            record_all(&table, mixed.clone(), NOW)
+        });
+        assert_eq!(tally.new, 1);
+        assert!(
+            logs.contains(SENTINEL),
+            "the capture must be live: {logs:?}"
+        );
+        let others = besides(&logs, SENTINEL);
+        assert_eq!(
+            others
+                .iter()
+                .filter(|l| l.contains("remote create: grant recorded")
+                    && l.contains("grant_jti=jti-new"))
+                .count(),
+            1,
+            "{logs}"
+        );
+        let summary: Vec<&&str> = others
+            .iter()
+            .filter(|l| l.contains("remote create: catch-up recorded new pending grants"))
+            .collect();
+        assert_eq!(summary.len(), 1, "{logs}");
+        assert!(summary[0].contains("new=1"), "{logs}");
+        assert_eq!(others.len(), 2, "nothing else at INFO: {logs}");
+    }
+
+    /// A grant this device SPENT stays in coord's list until coord flips
+    /// `consumed_at`, so every later pass re-delivers it beside the known
+    /// rows. Those passes report it as `spent` and log NOTHING at INFO or
+    /// above — no per-tick summary, no `grant NOT recorded` WARN from
+    /// `record_into`, no WARN from `insert`. Fails against the old WARN pair.
+    #[test]
+    fn a_relisted_spent_grant_keeps_later_passes_silent() {
+        use crate::resource_guard::capture_logs;
+        const SENTINEL: &str = "sentinel: create spent re-listing capture is live";
+        let table = RemoteCreateGrants::new();
+        assert_eq!(record_all(&table, rows(20), NOW).new, 20);
+        let source = Uuid::from_u128(1).to_string();
+        table
+            .consume("jti-0", Some(&source), NOW)
+            .expect("the first use spends jti-0");
+
+        for pass in 2..=3 {
+            let (tally, logs) = capture_logs(|| {
+                tracing::warn!("{SENTINEL}");
+                record_all(&table, rows(20), NOW)
+            });
+            assert_eq!(
+                tally,
+                CatchupTally {
+                    new: 0,
+                    known: 19,
+                    refused: 0,
+                    spent: 1,
+                },
+                "pass {pass}"
+            );
+            assert!(
+                logs.contains(SENTINEL),
+                "the capture must be live: {logs:?}"
+            );
+            assert!(
+                besides(&logs, SENTINEL).is_empty(),
+                "pass {pass} logs nothing at INFO or above: {logs}"
+            );
+        }
+        assert!(!table.contains("jti-0"), "the spent grant stays spent");
+    }
+
+    /// The create entry point, end to end: `run_catchup` against a loopback
+    /// coord serving the same 20 rows twice. The first pass records them (20
+    /// `grant recorded` lines and one `new=20` summary); the second, which is
+    /// every later 60 s tick in production, logs nothing at INFO.
+    ///
+    /// Writes the GLOBAL table (that is what `run_catchup` feeds), so its jtis
+    /// are unique to this run and removed afterwards. Runs under
+    /// `isolated_ambient` so the coord GET reads no real credential.
+    #[test]
+    fn run_catchup_logs_a_relisted_create_grant_once_rather_than_on_every_pass() {
+        use super::super::attach::tests::serve_canned;
+        use crate::resource_guard::capture_logs;
+        const SENTINEL: &str = "sentinel: create run_catchup capture is live";
+        // Logged at INFO by the lib `auth` on every 25th coord call
+        // process-wide (see the attach twin); not this module's line.
+        const UNRELATED: &str = "coord data-plane device-JWT coverage";
+        let _amb = crate::test_env::isolated_ambient();
+
+        let device = Uuid::new_v4();
+        let run = Uuid::new_v4();
+        let jtis: Vec<String> = (0..20).map(|i| format!("{run}-{i}")).collect();
+        let expires = now_epoch_secs() + 900;
+        let body = json!({
+            "requests": jtis.iter().map(|jti| json!({
+                "grant_jti": jti,
+                "source_device_id": Uuid::from_u128(1).to_string(),
+                "source_user_id": Uuid::from_u128(2).to_string(),
+                "target_device_id": device.to_string(),
+                "expires_at": expires,
+            })).collect::<Vec<_>>(),
+            "storage": "present",
+        })
+        .to_string();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = rt
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        rt.spawn(serve_canned(listener, body, seen.clone()));
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let coord_url = format!("http://{addr}");
+        let pass = || {
+            capture_logs(|| {
+                tracing::info!("{SENTINEL}");
+                rt.block_on(run_catchup(
+                    &http,
+                    &coord_url,
+                    device,
+                    Duration::from_secs(10),
+                ));
+            })
+            .1
+        };
+
+        let first = pass();
+        let held: Vec<bool> = jtis.iter().map(|j| create_grants().contains(j)).collect();
+        let second = pass();
+        for jti in &jtis {
+            create_grants().remove(jti);
+        }
+
+        let expected_line = format!("GET /sessions/create-requests?device_id={device} HTTP/1.1");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![expected_line.clone(), expected_line],
+            "one GET per pass, on the create catch-up route"
+        );
+        assert!(held.iter().all(|h| *h), "the first pass records every row");
+
+        assert!(
+            first.contains(SENTINEL),
+            "the capture must be live: {first:?}"
+        );
+        assert_eq!(
+            first.matches("remote create: grant recorded").count(),
+            20,
+            "{first}"
+        );
+        let summary: Vec<&str> = first
+            .lines()
+            .filter(|l| l.contains("remote create: catch-up recorded new pending grants"))
+            .collect();
+        assert_eq!(summary.len(), 1, "{first}");
+        assert!(summary[0].contains("new=20"), "{first}");
+
+        assert!(
+            second.contains(SENTINEL),
+            "the capture must be live: {second:?}"
+        );
+        let noise: Vec<&str> = besides(&second, SENTINEL)
+            .into_iter()
+            .filter(|l| !l.contains(UNRELATED))
+            .collect();
+        assert!(
+            noise.is_empty(),
+            "a pass that re-lists only known grants logs nothing at INFO: {noise:?}"
+        );
     }
 }

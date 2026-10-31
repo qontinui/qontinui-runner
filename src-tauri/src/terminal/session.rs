@@ -7989,76 +7989,9 @@ pub(crate) mod tests {
     // `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`
     // Phase 2) ----------------------------------------------------------------
 
-    /// Run `f` under a scoped fmt subscriber at `level` and return everything
-    /// it logged. Scoped (`with_default`), not global: the harness runs tests
-    /// in parallel and a global subscriber can be installed once per process.
-    ///
-    /// Two guards against tracing's PROCESS-GLOBAL callsite caches, which a
-    /// scoped subscriber does not escape: a callsite's `Interest` and the
-    /// global max level are recomputed whenever any dispatcher registers, and
-    /// capture tests at different levels racing each other measurably lost a
-    /// whole log (an empty capture) under a parallel run. So the captures
-    /// here run one at a time, and each rebuilds the interest cache once its
-    /// own subscriber is the thread default, before `f` logs anything.
-    ///
-    /// Those two guards narrow the race but cannot close it: any OTHER test in
-    /// the binary that logs or builds a dispatcher still touches the same
-    /// caches, and a whole capture was observed lost once again in a wide
-    /// parallel run. So a capture that came back COMPLETELY empty is re-run (up to
-    /// `CAPTURE_ATTEMPTS` times) — a subscriber that received not one byte
-    /// is the race's signature, never a meaningful result for a caller that
-    /// expects output. A caller asserting ABSENCE is unaffected: an empty
-    /// capture stays empty on every attempt.
-    fn capture_logs(level: tracing::Level, f: impl Fn()) -> String {
-        const CAPTURE_ATTEMPTS: usize = 5;
-        let mut logs = String::new();
-        for _ in 0..CAPTURE_ATTEMPTS {
-            logs = capture_logs_once(level, &f);
-            if !logs.is_empty() {
-                break;
-            }
-        }
-        logs
-    }
-
-    /// One attempt of [`capture_logs`].
-    fn capture_logs_once(level: tracing::Level, f: &impl Fn()) -> String {
-        static CAPTURE_SERIAL: Mutex<()> = Mutex::new(());
-        let _serial = CAPTURE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        #[derive(Clone, Default)]
-        struct Captured(Arc<Mutex<Vec<u8>>>);
-        impl Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-            type Writer = Captured;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-        let sink = Captured::default();
-        let buf = sink.0.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(sink)
-            .with_ansi(false)
-            .with_max_level(level)
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::callsite::rebuild_interest_cache();
-            f()
-        });
-        let bytes = buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        String::from_utf8_lossy(&bytes).into_owned()
-    }
+    // The race-guarded capture (serial lock, interest-cache rebuild, retry on
+    // an empty capture) that used to be a private copy here.
+    use crate::resource_guard::capture_logs_at;
 
     /// Every production producer, so the per-producer tests below cannot
     /// silently skip a variant added later without touching this list.
@@ -8130,7 +8063,7 @@ pub(crate) mod tests {
             let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
             let session = LiveTestSession::new(buf);
             let tag = caller.tag().into_owned();
-            let logs = capture_logs(tracing::Level::INFO, || {
+            let ((), logs) = capture_logs_at(tracing::Level::INFO, || {
                 session
                     .submit_prompt("hello", caller.clone())
                     .expect("submit_prompt failed");
@@ -8170,7 +8103,7 @@ pub(crate) mod tests {
     fn submit_prompt_log_never_carries_the_body() {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let session = LiveTestSession::new(buf);
-        let logs = capture_logs(tracing::Level::TRACE, || {
+        let ((), logs) = capture_logs_at(tracing::Level::TRACE, || {
             session
                 .submit_prompt("hunter2-secret-body", PtyWriteCaller::HttpSubmitPrompt)
                 .expect("submit_prompt failed");
@@ -8190,7 +8123,7 @@ pub(crate) mod tests {
             let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
             let session = LiveTestSession::new(buf);
             let tag = caller.tag().into_owned();
-            let at_debug = capture_logs(tracing::Level::DEBUG, || {
+            let ((), at_debug) = capture_logs_at(tracing::Level::DEBUG, || {
                 session.write(b"k", caller.clone()).expect("write failed");
             });
             assert!(
@@ -8200,7 +8133,7 @@ pub(crate) mod tests {
                         && l.contains(&format!("caller={tag}"))),
                 "no debug write line for {tag}; logs: {at_debug:?}"
             );
-            let at_info = capture_logs(tracing::Level::INFO, || {
+            let ((), at_info) = capture_logs_at(tracing::Level::INFO, || {
                 session.write(b"k", caller.clone()).expect("write failed");
             });
             assert!(
