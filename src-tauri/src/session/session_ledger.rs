@@ -2360,6 +2360,80 @@ mod tests {
         assert_eq!(gens[0].ledger, boot1);
     }
 
+    /// Plan `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
+    /// Phase 5: the 2026-10-27 shape, proved on this code rather than rebuilt.
+    /// The prior boot left a 65-session ledger; this boot's poll then shrank
+    /// the live file to 57 and then to 1. On the incident build each capture
+    /// overwrote the only copy. Here the boot latch keeps the 65 twice: the
+    /// in-memory prior the report diffs (`expected` reads 65), and the
+    /// generation `rotate_in` wrote before any capture, which the NEXT boot
+    /// still lists although its own prior is the 1-session file. Steps are in
+    /// `load_prior_once` / `persist_capture` order, on the same primitives.
+    #[test]
+    fn poll_captures_that_shrink_the_live_file_keep_the_boot_generation() {
+        let roster = |n: usize| {
+            let mut l = ledger(
+                (0..n)
+                    .map(|i| entry(&format!("s-{i:02}"), Some(true), None))
+                    .collect(),
+            );
+            l.reason = REASON_POLL.to_string();
+            l
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let live = write_live(dir.path(), &roster(65));
+
+        // Boot: latch the prior, then retire it into a generation, before any
+        // capture is written.
+        let prior = load_from(&live);
+        let this_boot =
+            rotate_in(&live, 2_000, LEDGER_GENERATIONS_KEPT).expect("the prior is retained");
+
+        // The poll's captures shrink the live file. A non-empty capture is
+        // never refused, so both land.
+        let mut wrote_non_empty = false;
+        for n in [57, 1] {
+            let capture = roster(n);
+            assert!(!refuses_overwrite(
+                &capture,
+                prior.as_ref(),
+                wrote_non_empty
+            ));
+            assert!(write_ledger(&live, &capture));
+            wrote_non_empty = true;
+        }
+        assert_eq!(load_from(&live).map(|l| l.sessions.len()), Some(1));
+
+        // GET /control/sessions/ledger diffs the latched prior: expected 65.
+        let back = vec!["s-00".to_string()];
+        let report = diff(prior.as_ref(), &back, &none(), roster(1), true);
+        assert_eq!(report.expected.len(), 65);
+        assert_eq!(report.returned.len(), 1);
+        assert_eq!(report.missing.len(), 64);
+        assert_eq!(report.verdict, VERDICT_PARTIAL);
+
+        // The boot generation still holds the whole prior roster, served first.
+        let gens = generation_reports(
+            &generations_in(dir.path()),
+            Some(&this_boot),
+            &back,
+            &none(),
+            true,
+        );
+        assert!(gens[0].this_boot);
+        assert_eq!(gens[0].session_count, 65);
+
+        // The NEXT boot latches the 1-session file as its prior, and the 65
+        // generation survives beside it.
+        assert_eq!(load_from(&live).map(|l| l.sessions.len()), Some(1));
+        assert!(rotate_in(&live, 3_000, LEDGER_GENERATIONS_KEPT).is_some());
+        let counts: Vec<(i64, usize)> = generations_in(dir.path())
+            .iter()
+            .map(|g| (g.rotated_at_ms, g.ledger.sessions.len()))
+            .collect();
+        assert_eq!(counts, vec![(3_000, 1), (2_000, 65)]);
+    }
+
     /// Each retained generation is diffed on its own, against the same ids
     /// that are back now — never unioned.
     #[test]
@@ -2443,6 +2517,7 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
         }
     }
 

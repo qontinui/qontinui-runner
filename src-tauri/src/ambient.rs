@@ -815,6 +815,19 @@ pub mod test_support {
             .filter(|k| !KEYS_SET_TO_DIR.contains(k))
     }
 
+    /// The other half of [`root_confined_keys_removed`]: the root-confined keys
+    /// [`KEYS_SET_TO_DIR`] points at the fixture's dir, which is OUTSIDE any
+    /// subject root a test sets. A test entering a subject launch clears exactly
+    /// these and lets the root defaults fill them. It clears no more, so the
+    /// fixture's own removal of every other root-confined key stays what that
+    /// test proves. Derived for the same reason, with no second list to drift.
+    pub fn root_confined_keys_set_to_dir() -> impl Iterator<Item = &'static str> {
+        KEYS_SET_TO_DIR
+            .iter()
+            .copied()
+            .filter(|k| crate::instance_env::ROOT_CONFINED_ENV_KEYS.contains(k))
+    }
+
     /// Every key the fixture captures, and restores on drop:
     /// [`super::AMBIENT_ENV_KEYS`] plus the root-confined keys that list does
     /// not declare, so every key [`root_confined_keys_removed`] removes is put

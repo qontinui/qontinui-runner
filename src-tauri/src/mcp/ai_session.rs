@@ -19,7 +19,7 @@ use tracing::{error, info, warn};
 use crate::context;
 use crate::database::CreateTaskRunInput;
 use crate::mcp::shared::{
-    emit_ai_output, get_workspace_paths_internal, spawn_python_with_console, FINDING_INSTRUCTIONS,
+    emit_ai_output, get_workspace_paths_internal, spawn_python_script, FINDING_INSTRUCTIONS,
 };
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::prompts;
@@ -3024,7 +3024,7 @@ If your task requires running visual automation, use the Runner API to execute w
             // set. The Python wrapper forwards each verbatim to `claude`.
             //
             // We hold the formatted strings (max_turns_str) in this scope so
-            // their `OsStr` borrow stays valid until spawn_python_with_console
+            // their `OsStr` borrow stays valid until spawn_python_script
             // returns.
             let max_turns_str = remote_max_turns_for_spawn.map(|n| n.to_string());
 
@@ -3056,9 +3056,12 @@ If your task requires running visual automation, use the Runner API to execute w
                 spawn_args.push(std::ffi::OsStr::new(cd.as_str()));
             }
 
-            // Spawn Claude independently using the spawn script
-            // Use spawn_python_with_console to ensure Claude CLI gets a console window
-            let spawn_result = spawn_python_with_console("python", &spawn_args, &workspace_root);
+            // Spawn Claude independently using the spawn script. python gets
+            // no window (see `spawn_python_script`); the script's powershell
+            // child opens its own console unless the script passes
+            // CREATE_NO_WINDOW (fixed in qontinui-claude-config's
+            // spawn-independent-claude.py).
+            let spawn_result = spawn_python_script("python", &spawn_args, &workspace_root);
 
             match spawn_result {
                 Ok(child) => {
@@ -3857,6 +3860,9 @@ pub mod emergency_quit {
         std::thread::spawn(move || {
             std::thread::sleep(hard_deadline);
             warn!(
+                marker = %crate::session::shutdown_marker::describe_on_disk(
+                    &crate::session::shutdown_marker::marker_path()
+                ),
                 "Force-close watchdog: teardown did not finish within {}s — exiting process",
                 hard_deadline.as_secs()
             );
@@ -4045,7 +4051,10 @@ pub mod emergency_quit {
         // Stamp the marker so the next boot classifies the restart as quiet,
         // and retract the out-of-process port advertisement (plan 2026-07-17
         // §4) so the runner stops advertising a port it is releasing. Both are
-        // idempotent backstops for `drain()`'s own stamping/retraction.
+        // idempotent backstops for `drain()`'s own stamping/retraction. The
+        // stamp says the shutdown STARTED, not that it finished:
+        // `teardown_complete` stays false until `close_all` below reports a
+        // teardown with no kill-only fallback.
         let marker_path = crate::session::shutdown_marker::marker_path();
         crate::session::shutdown_marker::mark_clean_shutdown(&marker_path);
         qontinui_runner_lib::runner_breadcrumb::remove_published();
@@ -4067,9 +4076,17 @@ pub mod emergency_quit {
         // i.e. ≈4s each and `O(terminals)` unbounded without the cap. Past the
         // deadline the remaining sessions get a kill-only teardown: the child
         // process tree still dies, the joins and the shim-dir sweep are
-        // skipped.
+        // skipped. Only a teardown with no such fallback stamps the marker
+        // `teardown_complete` — the one bit that lets the next boot trust the
+        // marker as the open rows' anchor (plan
+        // `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
+        // Phase 3).
         if let Some(tm) = app_handle.try_state::<Arc<crate::terminal::TerminalManager>>() {
-            tm.close_all(budget.sub_deadline(shutdown_budget::TERMINAL_CLOSE_BUDGET));
+            if tm.close_all(budget.sub_deadline(shutdown_budget::TERMINAL_CLOSE_BUDGET)) {
+                crate::session::shutdown_marker::mark_teardown_complete(&marker_path);
+            } else {
+                warn!("Shutdown: terminal teardown degraded — marker left teardown_complete=false");
+            }
         }
 
         kill_orphaned_ai_processes(app_state, budget);

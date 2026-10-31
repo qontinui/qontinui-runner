@@ -1361,6 +1361,7 @@ pub fn terminal_session_record_open(
         finish_synced: false,
         spawn_device_default: None,
         adopted_from: None,
+        last_session_start_at: None,
     };
     let session_id = record.claude_session_id.clone();
     store.record_open(record);
@@ -2688,7 +2689,7 @@ pub(crate) fn create_terminal_session_backend(
                 let close_registry = session_registry.clone();
                 // Capacity-freed re-poll: capture this terminal's id so the exit
                 // hook can tell `agent_runtime` a continuation slot just freed and
-                // a deferred (AtCap) continuation can be re-polled promptly. The
+                // a load-deferred continuation can be re-polled promptly. The
                 // notify is a no-op unless this terminal is a registered
                 // continuation session, so operator tabs (a different create path)
                 // never trigger a poll. The PTY waiter that fires this hook is a
@@ -2945,6 +2946,7 @@ async fn poll_and_record_session<F>(
                 finish_synced: false,
                 spawn_device_default: None,
                 adopted_from: None,
+                last_session_start_at: None,
             };
             store.record_open(record);
             info!(
@@ -3039,6 +3041,7 @@ pub(crate) fn record_pinned_session_open(
         finish_synced: false,
         spawn_device_default: None,
         adopted_from: None,
+        last_session_start_at: None,
     });
     info!(
         terminal_id = %terminal_id,
@@ -3283,6 +3286,7 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
         }
     }
 

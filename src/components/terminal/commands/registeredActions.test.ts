@@ -35,6 +35,7 @@ vi.mock("../result-card", () => ({
   buildHistoryCardSpec: () => ({ title: "h", sections: [] }),
 }));
 vi.mock("../contexts", () => ({
+  usePageSessionGetter: () => () => null,
   useTerminalSession: () => ({
     tabs: [{ id: "tab-a" }],
     activeId: "tab-a",

@@ -40,6 +40,9 @@ pub mod observable_bridge;
 // gauges (`LIVE_PIPE_READERS`, `DETACHED_CHILDREN`) exist once per process.
 pub mod git_posture;
 pub mod process_helpers;
+// Deadline-honest bounded run (process creation INCLUDED) for read-only
+// probes; reuses `process_helpers` internals, so it lives beside it.
+pub mod process_deadline;
 pub mod profile_cli;
 // Out-of-process PTY holder (plan
 // `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`): the
@@ -54,6 +57,10 @@ pub mod pty_holder;
 // a second bin cannot import from the runner bin's module tree. One module ⇒
 // one schema ⇒ writer and reader cannot drift. See the module doc.
 pub mod profiles;
+// Journey query answer values (plan 2026-09-20-ui-bridge-represents-the-
+// users-path-and-the-passage-of-time): registered by `schema_export`, built by
+// the bin's `journey::routes`.
+pub mod journey_wire;
 pub mod relay_envelopes;
 pub mod runner_breadcrumb;
 pub mod schema_export;
