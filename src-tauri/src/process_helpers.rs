@@ -3356,11 +3356,11 @@ mod console_window_guard {
                 "process group",
                 "fn f(c: &mut C) { c.creation_flags(0x0000_0200 | CREATE_NO_WINDOW); }\n",
             ),
-            ("0x100", "fn f(c: &mut C) { c.creation_flags(0x100); }\n"),
-            ("0x1000", "fn f(c: &mut C) { c.creation_flags(0x1000); }\n"),
+            ("0x100", "fn f(c: &mut C) { c.creation_flags(0x0800_0100); }\n"),
+            ("0x1000", "fn f(c: &mut C) { c.creation_flags(0x0800_1000); }\n"),
             (
                 "decimal 512",
-                "fn f(c: &mut C) { c.creation_flags(512); }\n",
+                "fn f(c: &mut C) { c.creation_flags(512 | CREATE_NO_WINDOW); }\n",
             ),
             (
                 "trailing comment",
@@ -3368,7 +3368,7 @@ mod console_window_guard {
             ),
             (
                 "longer identifier",
-                "fn f(c: &mut C) { c.creation_flags(NOT_CREATE_NEW_CONSOLE_X); }\n",
+                "fn f(c: &mut C) { c.creation_flags(NOT_CREATE_NEW_CONSOLE_X | CREATE_NO_WINDOW); }\n",
             ),
         ] {
             assert_eq!(
@@ -3421,34 +3421,39 @@ mod console_window_guard {
 
     /// A `creation_flags(..)` that replaces `CREATE_NO_WINDOW` without naming
     /// `CREATE_NEW_CONSOLE` is caught by scan 3; one keeping either no-console
-    /// bit, by name or literal, is not.
+    /// bit, by name or literal, is not. The fixtures are built with `format!`
+    /// so this module's own text holds no `creation_flags(` call for the scans
+    /// to read.
     #[test]
     fn a_creation_flags_that_drops_no_window_is_a_site() {
-        let bad = "fn f(c: &mut C) {
-    c.creation_flags(CREATE_NEW_PROCESS_GROUP);
-}
-";
+        let call = |arg: &str| format!("c.{}({arg});", "creation_flags");
+        let bad = format!("fn f(c: &mut C) {{
+    {}
+}}
+", call("CREATE_NEW_PROCESS_GROUP"));
         assert_eq!(
-            file_violations("a.rs", bad),
-            vec!["a.rs:2: c.creation_flags(CREATE_NEW_PROCESS_GROUP);".to_string()]
+            file_violations("a.rs", &bad),
+            vec![format!("a.rs:2: {}", call("CREATE_NEW_PROCESS_GROUP"))]
         );
-        for ok in [
-            "fn f(c: &mut C) { c.creation_flags(CREATE_NO_WINDOW); }
-",
-            "fn f(c: &mut C) { c.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW); }
-",
-            "fn f(c: &mut C) { c.creation_flags(0x0800_0000); }
-",
-            "fn f(c: &mut C) { c.creation_flags(DETACHED_PROCESS); }
-",
-            "fn f(c: &mut C) {
-    // console-ok: test
-    c.creation_flags(CREATE_NEW_PROCESS_GROUP);
-}
-",
+        for arg in [
+            "CREATE_NO_WINDOW",
+            "CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW",
+            "0x0800_0000",
+            "DETACHED_PROCESS",
         ] {
-            assert!(file_violations("a.rs", ok).is_empty(), "{ok}");
+            let ok = format!("fn f(c: &mut C) {{ {} }}
+", call(arg));
+            assert!(file_violations("a.rs", &ok).is_empty(), "{arg}");
         }
+        let marked = format!(
+            "fn f(c: &mut C) {{
+    // console-ok: fixture
+    {}
+}}
+",
+            call("CREATE_NEW_PROCESS_GROUP")
+        );
+        assert!(file_violations("a.rs", &marked).is_empty());
     }
 
     /// Every `Command::new(` in production code must either be suppressed
