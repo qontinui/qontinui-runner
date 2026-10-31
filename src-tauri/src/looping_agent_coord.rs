@@ -10,7 +10,8 @@
 //!    poll-into-process-global-cache shape (45s; NOT ETag — coord serves no
 //!    validators on this route).
 //! 2. **Slot leases** — `POST /claims/{acquire,heartbeat,release}`, the
-//!    claim-first primitive (D3).
+//!    claim-first primitive (D3), plus the informational
+//!    `GET /coord/claims/by-resource` holder lookup.
 //! 3. **Playbook** — `GET /coord/agent-playbook/:name`, so coord's versioned
 //!    document is the shepherd's source of truth and the runner-bundled copy is
 //!    only the offline fallback.
@@ -32,8 +33,9 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 use qontinui_runner_lib::looping_agent::desired_state::CoordDesiredState;
+use qontinui_runner_lib::looping_agent::holder::{by_resource_url, parse_by_resource_body};
 use qontinui_runner_lib::looping_agent::lease::{
-    parse_acquire_result, parse_heartbeat_result, AcquireOutcome, HeartbeatOutcome,
+    parse_acquire_body, parse_heartbeat_body, AcquireOutcome, HeartbeatOutcome, SlotHolder,
     LEASE_CLAIM_KIND, LEASE_TTL_SECS,
 };
 
@@ -134,7 +136,7 @@ async fn fetch_desired_state() -> Result<Vec<CoordDesiredState>, String> {
     let url = format!("{base}/coord/agent-desired-state");
     let client = http_client()?;
 
-    // coord-tenant-scope(device): fleet-wide supervisor poll -- only base is in scope (:133); coord lifts the tenant from the JWT so a device reads only its own fleet's desired state.
+    // coord-tenant-scope(device): fleet-wide supervisor poll -- only the coord base (from coord_base_with_source) is in scope; coord lifts the tenant from the JWT so a device reads only its own fleet's desired state.
     let resp = crate::auth::attach_device_auth(client.get(&url))
         .send()
         .await
@@ -231,7 +233,7 @@ pub async fn acquire_slot(
     let url = format!("{base}/claims/acquire");
     let body = claim_body(resource_key, machine_id, agent_id, claude_session_id);
 
-    // coord-tenant-scope(device): the Tier-0 per-machine slot lease: claim_body sets agent_session_id: Value::Null explicitly (:206) and no tenant_id -- sending nothing is correct.
+    // coord-tenant-scope(device): the Tier-0 per-machine slot lease: claim_body sets agent_session_id: Value::Null explicitly and no tenant_id -- sending nothing is correct.
     let resp = match crate::auth::attach_device_auth(client.post(&url).json(&body))
         .send()
         .await
@@ -250,15 +252,9 @@ pub async fn acquire_slot(
         Ok(v) => v,
         Err(e) => return AcquireOutcome::Unavailable(format!("decode: {e}")),
     };
-    match v.get("result").and_then(|r| r.as_str()) {
-        Some(result) => parse_acquire_result(
-            result,
-            v.get("current_holder")
-                .and_then(|s| s.as_str())
-                .map(str::to_string),
-        ),
-        None => AcquireOutcome::Unavailable("body missing `result` discriminator".to_string()),
-    }
+    // The body is the semantic-reserve shape on today's wire (`granted`/`held`
+    // + `holder`), the plain shape tolerated — the pure parse handles both.
+    parse_acquire_body(&v)
 }
 
 /// `POST /claims/heartbeat` on a lease we believe we hold.
@@ -291,10 +287,7 @@ pub async fn heartbeat_slot(
         Ok(v) => v,
         Err(e) => return HeartbeatOutcome::Unavailable(format!("decode: {e}")),
     };
-    match v.get("result").and_then(|r| r.as_str()) {
-        Some(result) => parse_heartbeat_result(result),
-        None => HeartbeatOutcome::Unavailable("body missing `result` discriminator".to_string()),
-    }
+    parse_heartbeat_body(&v)
 }
 
 /// `POST /claims/release` — best-effort. Frees the slot IMMEDIATELY on a clean
@@ -307,7 +300,7 @@ pub async fn release_slot(resource_key: &str, machine_id: &uuid::Uuid, agent_id:
     };
     let url = format!("{base}/claims/release");
     let body = claim_body(resource_key, machine_id, agent_id, None);
-    // coord-tenant-scope(device): same per-machine slot lease, release verb; claude_session_id is passed None at :306.
+    // coord-tenant-scope(device): same per-machine slot lease, release verb; claude_session_id is passed None by release_slot.
     match crate::auth::attach_device_auth(client.post(&url).json(&body))
         .send()
         .await
@@ -318,6 +311,47 @@ pub async fn release_slot(resource_key: &str, machine_id: &uuid::Uuid, agent_id:
         ),
         Err(e) => warn!("looping_agent_coord: release {resource_key} failed (best-effort): {e}"),
     }
+}
+
+/// `GET /coord/claims/by-resource?kind=semantic_resource&key=<resource_key>` —
+/// who holds this slot, when the acquire reply did not say.
+///
+/// INFORMATIONAL ONLY. The answer names a holder for a log line and the status
+/// surface; it is never permission and never consulted by the spawn gate. The
+/// caller bounds it to one read per lease TTL per key
+/// (`looping_agent::holder::holder_lookup_due`). `Ok(None)` = nothing visible
+/// holds the key now (coord also answers `null` for a holder its read scope
+/// hides); `Err` = we could not tell (transport, non-2xx, unparseable body).
+///
+/// `tenant_id` is the tenant the slot key is built from, and the bearer is
+/// that tenant's (`TenantScope::Owned`): coord reads this route unscoped
+/// while `COORD_CLAIMS_READ_AUTH_REQUIRED` is dark, and scopes it to the
+/// bearer's tenant once armed, so stating the key's tenant keeps the read
+/// right in both postures.
+pub async fn lookup_slot_holder(
+    resource_key: &str,
+    tenant_id: uuid::Uuid,
+) -> Result<Option<SlotHolder>, String> {
+    let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
+    let client = http_client()?;
+    let url = by_resource_url(&base);
+
+    let resp = crate::auth::attach_device_auth_for(
+        client
+            .get(&url)
+            .query(&[("kind", LEASE_CLAIM_KIND), ("key", resource_key)]),
+        crate::auth::TenantScope::Owned(tenant_id),
+    )
+    .send()
+    .await
+    .map_err(|e| format!("GET {url}: {e}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("coord status {}", status.as_u16()));
+    }
+    let v: serde_json::Value = resp.json().await.map_err(|e| format!("decode: {e}"))?;
+    parse_by_resource_body(&v)
 }
 
 // ===========================================================================
@@ -335,7 +369,7 @@ pub async fn fetch_playbook(name: &str) -> Option<String> {
     let client = http_client().ok()?;
     let url = format!("{base}/coord/agent-playbook/{name}");
 
-    // coord-tenant-scope(device): only name and base are in scope (:330-332); the fleet playbook is a per-tenant document and the device default IS the fleet this runner belongs to.
+    // coord-tenant-scope(device): only name and the coord base (from coord_base_with_source) are in scope; the fleet playbook is a per-tenant document and the device default IS the fleet this runner belongs to.
     let resp = crate::auth::attach_device_auth(client.get(&url))
         .send()
         .await

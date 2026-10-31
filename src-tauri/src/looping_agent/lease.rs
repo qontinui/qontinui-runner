@@ -35,7 +35,8 @@
 //! ## Lifecycle
 //!
 //! ```text
-//! acquire(role:<tenant>:<role>:<slot>)  ──claimed/renewed──> spawn permitted
+//! acquire(role:<tenant>:<role>:<slot>)  ──granted/claimed/──> spawn permitted
+//!                                         renewed
 //!                                       ──held─────────────> another live
 //!                                                             shepherd owns
 //!                                                             this slot: DO
@@ -76,17 +77,39 @@ pub const LEASE_CLAIM_KIND: &str = "semantic_resource";
 /// blip needs.
 pub const LEASE_TTL_SECS: i64 = 120;
 
-/// Outcome of an acquire attempt. Mirrors coord's `AcquireResult` discriminator
-/// (`claimed` | `renewed` | `held` | …) folded to the three cases the
-/// supervisor can act on.
+/// Who holds a slot lease that is not ours, as coord named it.
+///
+/// `machine_id` is the holder's runner machine id, as coord parses it from the
+/// claim's stored owner token. `session` is the holder's `agent_session_id` when the holding token is
+/// session-scoped (`machine:session`); our own token is bare-machine, so a
+/// `Some` session on our own machine id means a DIFFERENT session on this box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotHolder {
+    pub machine_id: String,
+    pub session: Option<String>,
+}
+
+/// Outcome of an acquire attempt, folded to the three cases the supervisor can
+/// act on.
+///
+/// Two discriminator vocabularies reach this fold. The slot lease uses
+/// `kind = semantic_resource` with no topic, and coord's `claims_acquire`
+/// diverts exactly that request shape to the semantic-reserve door
+/// (`routes.rs:7100` → `semantic_reserve_response`), so the LIVE wire is
+/// `ReserveOutcome`: `granted` | `renewed` | `held` (holder in `holder`). The
+/// plain `AcquireResult` vocabulary — `claimed` | `renewed` | `held` (holder in
+/// `current_holder`) — is tolerated too, in case coord ever stops diverting.
+/// See [`parse_acquire_body`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcquireOutcome {
-    /// `claimed` (fresh) or `renewed` (we already held it — an idempotent
-    /// re-acquire that extends the TTL). Both mean: this slot is OURS.
+    /// `granted` (reserve door, fresh), `claimed` (plain door, fresh) or
+    /// `renewed` (we already held it — an idempotent re-acquire that extends
+    /// the TTL). All three mean: this slot is OURS.
     Acquired,
     /// `held` — a DIFFERENT owner holds this slot. Another live shepherd is
-    /// filling it; do nothing at all.
-    Held { current_holder: Option<String> },
+    /// filling it; do nothing at all. `holder` is `None` when coord's body named
+    /// nobody (key absent or an empty string) — never a fabricated id.
+    Held { holder: Option<SlotHolder> },
     /// Transport error, non-2xx, or an unparseable body. NOT permission.
     Unavailable(String),
 }
@@ -96,8 +119,9 @@ pub enum AcquireOutcome {
 pub enum HeartbeatOutcome {
     /// Still ours; TTL extended.
     Ok,
-    /// Another owner holds this slot now — coord returned a current holder.
-    Stolen,
+    /// Another owner holds this slot now — coord returned a current holder
+    /// (`None` when the body named nobody).
+    Stolen { holder: Option<SlotHolder> },
     /// Nothing holds this slot: the grant EXPIRED, or was never taken. Coord
     /// answers this separately from `Stolen` so a lapse is not read as a theft
     /// (plan `2026-09-15-coord-claims-heartbeat-answers-an-expired-claim-as-stolen-with-no-holder`).
@@ -188,17 +212,55 @@ pub fn spawn_permitted(outcome: &AcquireOutcome) -> bool {
 pub fn still_held_after_heartbeat(outcome: &HeartbeatOutcome) -> bool {
     match outcome {
         HeartbeatOutcome::Ok => true,
-        HeartbeatOutcome::Stolen => false,
+        HeartbeatOutcome::Stolen { .. } => false,
         HeartbeatOutcome::NotHeld => false,
         HeartbeatOutcome::Unavailable(_) => true,
     }
 }
 
-/// Parse coord's `/claims/acquire` `result` discriminator.
-pub fn parse_acquire_result(result: &str, current_holder: Option<String>) -> AcquireOutcome {
+/// The first non-empty string among `keys` on `v`.
+///
+/// An empty string counts as absent: coord emits `""` when the key vanished
+/// between SET-NX and GET (`claims.rs:527-531`), and the reserve mapper emits
+/// `held` + `""` for any non-claim acquire variant (`semantic_reserve.rs:398-405`).
+fn first_non_empty_str(v: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .filter_map(|k| v.get(*k).and_then(|s| s.as_str()))
+        .find(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// The holder named by an acquire/heartbeat body.
+///
+/// Precedence: `holder` (the semantic-reserve shape — today's live wire), then
+/// `current_holder` (the plain `AcquireResult` / `HeartbeatResult::Stolen`
+/// shape). The session is read from `current_holder_session` on both shapes,
+/// and only once a machine id was found — a session with no machine is not a
+/// holder.
+fn holder_from_body(v: &serde_json::Value) -> Option<SlotHolder> {
+    let machine_id = first_non_empty_str(v, &["holder", "current_holder"])?;
+    let session = first_non_empty_str(v, &["current_holder_session"]);
+    Some(SlotHolder {
+        machine_id,
+        session,
+    })
+}
+
+/// Parse a decoded `/claims/acquire` body (either door's shape — see
+/// [`AcquireOutcome`]).
+pub fn parse_acquire_body(v: &serde_json::Value) -> AcquireOutcome {
+    let Some(result) = v.get("result").and_then(|r| r.as_str()) else {
+        return AcquireOutcome::Unavailable("body missing `result` discriminator".to_string());
+    };
     match result {
-        "claimed" | "renewed" => AcquireOutcome::Acquired,
-        "held" => AcquireOutcome::Held { current_holder },
+        // `granted` is the reserve door's fresh-grant word; `claimed` the plain
+        // door's. Both are coord's authoritative grant to OUR owner token —
+        // mapping `granted` is not fail-open, it is the same thing `claimed`
+        // means. Leaving it unmapped stranded every fresh grant for one tick.
+        "claimed" | "granted" | "renewed" => AcquireOutcome::Acquired,
+        "held" => AcquireOutcome::Held {
+            holder: holder_from_body(v),
+        },
         // Topic/tenant/invalid results can't arise for this call shape (no
         // topic, no explicit tenant), but an unknown discriminator is NEVER
         // silently treated as permission.
@@ -206,11 +268,19 @@ pub fn parse_acquire_result(result: &str, current_holder: Option<String>) -> Acq
     }
 }
 
-/// Parse coord's `/claims/heartbeat` `result` discriminator.
-pub fn parse_heartbeat_result(result: &str) -> HeartbeatOutcome {
+/// Parse a decoded `/claims/heartbeat` body. The heartbeat is NOT diverted to
+/// the reserve door, so `stolen` carries the plain `current_holder` /
+/// `current_holder_session` (`claims.rs:616-651`); the same precedence as
+/// [`parse_acquire_body`] applies so a future divert parses too.
+pub fn parse_heartbeat_body(v: &serde_json::Value) -> HeartbeatOutcome {
+    let Some(result) = v.get("result").and_then(|r| r.as_str()) else {
+        return HeartbeatOutcome::Unavailable("body missing `result` discriminator".to_string());
+    };
     match result {
         "ok" => HeartbeatOutcome::Ok,
-        "stolen" => HeartbeatOutcome::Stolen,
+        "stolen" => HeartbeatOutcome::Stolen {
+            holder: holder_from_body(v),
+        },
         // An expired or absent claim. coord spelled this `stolen` with a null
         // holder until the plan above; an unmapped word here would fall to
         // `Unavailable`, which `still_held_after_heartbeat` reads as STILL
@@ -291,12 +361,28 @@ mod tests {
         assert_eq!(gate_action(Action::None, false), Action::None);
     }
 
+    fn holder(machine_id: &str, session: Option<&str>) -> Option<SlotHolder> {
+        Some(SlotHolder {
+            machine_id: machine_id.to_string(),
+            session: session.map(str::to_string),
+        })
+    }
+
+    fn acquire(body: &str) -> AcquireOutcome {
+        parse_acquire_body(&serde_json::from_str(body).expect("fixture is valid JSON"))
+    }
+
+    fn heartbeat(body: &str) -> HeartbeatOutcome {
+        parse_heartbeat_body(&serde_json::from_str(body).expect("fixture is valid JSON"))
+    }
+
     #[test]
     fn only_an_acquired_outcome_grants_permission() {
         assert!(spawn_permitted(&AcquireOutcome::Acquired));
         assert!(!spawn_permitted(&AcquireOutcome::Held {
-            current_holder: Some("other-machine".into())
+            holder: holder("other-machine", None)
         }));
+        assert!(!spawn_permitted(&AcquireOutcome::Held { holder: None }));
         // "I couldn't reach coord" is NOT "the slot is free" — this assertion
         // is the storm-prevention invariant in one line.
         assert!(!spawn_permitted(&AcquireOutcome::Unavailable(
@@ -306,11 +392,11 @@ mod tests {
 
     #[test]
     fn held_means_another_live_shepherd_owns_the_slot_so_do_nothing() {
-        let outcome = parse_acquire_result("held", Some("machine-b".into()));
+        let outcome = acquire(r#"{"result":"held","current_holder":"machine-b"}"#);
         assert_eq!(
             outcome,
             AcquireOutcome::Held {
-                current_holder: Some("machine-b".into())
+                holder: holder("machine-b", None)
             }
         );
         assert!(
@@ -323,35 +409,205 @@ mod tests {
         );
     }
 
+    // -- parse_acquire_body: literal bodies in coord's serde shapes ----------
+    //
+    // Reserve shape = `ReserveOutcome` (`semantic_reserve.rs:263-345`,
+    // internally tagged on `result`, augmented with kind/resource_key/class/
+    // name/grammar). Plain shape = `AcquireResult` (`claims.rs:502-560`).
+
+    /// The LIVE wire: the reserve door's `held` names the holder in `holder`.
+    /// A mutation dropping the `"holder"` lookup turns this red.
     #[test]
-    fn acquire_discriminators_parse_and_unknown_is_never_permission() {
+    fn reserve_held_with_holder_and_session_names_both() {
+        let outcome = acquire(
+            r#"{"result":"held","holder":"3e7e4b04-75de-4efb-b718-c8ce8fcf7b17","current_holder_session":"5d7c3a7e-0b8b-4f3e-9d43-1c2a7e9b0f11","kind":"semantic_resource","resource_key":"role:c231d9da-0ca8-4fe4-bd81-0e3d6c20339a:merge_shepherd:0","class":"role","name":"c231d9da-0ca8-4fe4-bd81-0e3d6c20339a:merge_shepherd:0","grammar":"class_name"}"#,
+        );
         assert_eq!(
-            parse_acquire_result("claimed", None),
+            outcome,
+            AcquireOutcome::Held {
+                holder: holder(
+                    "3e7e4b04-75de-4efb-b718-c8ce8fcf7b17",
+                    Some("5d7c3a7e-0b8b-4f3e-9d43-1c2a7e9b0f11")
+                )
+            }
+        );
+        assert!(!spawn_permitted(&outcome));
+    }
+
+    #[test]
+    fn reserve_held_without_session_key_has_no_session() {
+        let outcome = acquire(
+            r#"{"result":"held","holder":"3e7e4b04-75de-4efb-b718-c8ce8fcf7b17","kind":"semantic_resource","resource_key":"role:t:merge_shepherd:0"}"#,
+        );
+        assert_eq!(
+            outcome,
+            AcquireOutcome::Held {
+                holder: holder("3e7e4b04-75de-4efb-b718-c8ce8fcf7b17", None)
+            }
+        );
+        assert!(!spawn_permitted(&outcome));
+    }
+
+    #[test]
+    fn legacy_plain_held_reads_current_holder_and_session() {
+        let outcome = acquire(
+            r#"{"result":"held","current_holder":"machine-legacy","current_holder_session":"sess-legacy"}"#,
+        );
+        assert_eq!(
+            outcome,
+            AcquireOutcome::Held {
+                holder: holder("machine-legacy", Some("sess-legacy"))
+            }
+        );
+        assert!(!spawn_permitted(&outcome));
+    }
+
+    #[test]
+    fn when_both_keys_are_present_holder_wins() {
+        let outcome = acquire(
+            r#"{"result":"held","holder":"machine-reserve","current_holder":"machine-plain"}"#,
+        );
+        assert_eq!(
+            outcome,
+            AcquireOutcome::Held {
+                holder: holder("machine-reserve", None)
+            }
+        );
+        assert!(!spawn_permitted(&outcome));
+    }
+
+    #[test]
+    fn held_with_no_holder_key_is_held_with_unknown_holder() {
+        let outcome = acquire(r#"{"result":"held","kind":"semantic_resource"}"#);
+        assert_eq!(outcome, AcquireOutcome::Held { holder: None });
+        assert!(
+            !spawn_permitted(&outcome),
+            "an unnamed holder is still held"
+        );
+    }
+
+    #[test]
+    fn held_with_an_empty_holder_is_never_some_empty_string() {
+        // The vanish race / non-claim reserve variant: `held` + `""`. A session
+        // with no machine id is not a holder either.
+        let outcome = acquire(r#"{"result":"held","holder":"","current_holder_session":"s"}"#);
+        assert_eq!(outcome, AcquireOutcome::Held { holder: None });
+        assert!(!spawn_permitted(&outcome));
+
+        // An empty `holder` falls through to a non-empty legacy key.
+        let outcome = acquire(r#"{"result":"held","holder":"","current_holder":"machine-c"}"#);
+        assert_eq!(
+            outcome,
+            AcquireOutcome::Held {
+                holder: holder("machine-c", None)
+            }
+        );
+        assert!(!spawn_permitted(&outcome));
+    }
+
+    /// The reserve door's fresh-grant word. A mutation dropping `"granted"`
+    /// turns this red.
+    #[test]
+    fn reserve_granted_is_acquired() {
+        let outcome = acquire(
+            r#"{"result":"granted","ttl_seconds":120,"kind":"semantic_resource","resource_key":"role:t:merge_shepherd:0","class":"role","name":"t:merge_shepherd:0"}"#,
+        );
+        assert_eq!(outcome, AcquireOutcome::Acquired);
+        assert!(spawn_permitted(&outcome));
+    }
+
+    #[test]
+    fn plain_claimed_and_renewed_are_acquired() {
+        assert_eq!(
+            acquire(r#"{"result":"claimed","ttl_seconds":120}"#),
             AcquireOutcome::Acquired
         );
         // `renewed` = we already hold it (restart / re-acquire) — still ours.
         assert_eq!(
-            parse_acquire_result("renewed", None),
+            acquire(r#"{"result":"renewed","ttl_seconds":120}"#),
             AcquireOutcome::Acquired
         );
-        assert!(!spawn_permitted(&parse_acquire_result(
-            "tenant_not_bound",
-            None
-        )));
-        assert!(!spawn_permitted(&parse_acquire_result("", None)));
     }
 
     #[test]
-    fn heartbeat_stolen_drops_the_lease_but_a_transport_error_does_not() {
-        assert!(still_held_after_heartbeat(&parse_heartbeat_result("ok")));
+    fn acquire_unknown_empty_or_missing_result_is_unavailable_never_permission() {
+        for body in [
+            r#"{"result":"tenant_not_bound"}"#,
+            r#"{"result":""}"#,
+            r#"{"ttl_seconds":120}"#,
+            r#"{"result":7}"#,
+            r#"null"#,
+        ] {
+            let outcome = acquire(body);
+            assert!(
+                matches!(outcome, AcquireOutcome::Unavailable(_)),
+                "{body} must be Unavailable, got {outcome:?}"
+            );
+            assert!(
+                !spawn_permitted(&outcome),
+                "{body} must never be permission"
+            );
+        }
+        assert_eq!(
+            acquire(r#"{"ttl_seconds":120}"#),
+            AcquireOutcome::Unavailable("body missing `result` discriminator".into())
+        );
+        assert_eq!(
+            acquire(r#"{"result":"tenant_not_bound"}"#),
+            AcquireOutcome::Unavailable("unexpected acquire result `tenant_not_bound`".into())
+        );
+    }
+
+    // -- parse_heartbeat_body: plain `HeartbeatResult` (`claims.rs:616-651`) --
+
+    #[test]
+    fn heartbeat_stolen_names_the_new_holder() {
+        let outcome = heartbeat(
+            r#"{"result":"stolen","current_holder":"3e7e4b04-75de-4efb-b718-c8ce8fcf7b17","current_holder_session":"sess-x"}"#,
+        );
+        assert_eq!(
+            outcome,
+            HeartbeatOutcome::Stolen {
+                holder: holder("3e7e4b04-75de-4efb-b718-c8ce8fcf7b17", Some("sess-x"))
+            }
+        );
+        assert!(!still_held_after_heartbeat(&outcome));
+    }
+
+    #[test]
+    fn heartbeat_stolen_without_a_holder_is_stolen_with_none() {
+        let outcome = heartbeat(r#"{"result":"stolen"}"#);
+        assert_eq!(outcome, HeartbeatOutcome::Stolen { holder: None });
+        assert!(!still_held_after_heartbeat(&outcome));
+        assert_eq!(
+            heartbeat(r#"{"result":"stolen","current_holder":null}"#),
+            HeartbeatOutcome::Stolen { holder: None }
+        );
+    }
+
+    #[test]
+    fn heartbeat_ok_keeps_the_lease_and_a_transport_error_does_too() {
+        assert_eq!(
+            heartbeat(r#"{"result":"ok","ttl_seconds":120}"#),
+            HeartbeatOutcome::Ok
+        );
+        assert!(still_held_after_heartbeat(&heartbeat(r#"{"result":"ok"}"#)));
         assert!(
-            !still_held_after_heartbeat(&parse_heartbeat_result("stolen")),
+            !still_held_after_heartbeat(&heartbeat(r#"{"result":"stolen"}"#)),
             "stolen is coord's authoritative answer that we do not hold it"
         );
         assert!(
             still_held_after_heartbeat(&HeartbeatOutcome::Unavailable("timeout".into())),
             "a transport blip must not make every runner drop and re-race its slot"
         );
+        assert!(matches!(
+            heartbeat(r#"{"ttl_seconds":120}"#),
+            HeartbeatOutcome::Unavailable(_)
+        ));
+        assert!(matches!(
+            heartbeat(r#"{"result":"wat"}"#),
+            HeartbeatOutcome::Unavailable(_)
+        ));
     }
 
     /// An EXPIRED claim drops the lease exactly as a stolen one does, and is
@@ -364,17 +620,14 @@ mod tests {
     /// deleting the `"not_held"` arm turns this red.
     #[test]
     fn heartbeat_not_held_drops_the_lease_and_is_not_an_unavailable() {
-        assert_eq!(
-            parse_heartbeat_result("not_held"),
-            HeartbeatOutcome::NotHeld
-        );
+        let outcome = heartbeat(r#"{"result":"not_held"}"#);
+        assert_eq!(outcome, HeartbeatOutcome::NotHeld);
         assert!(
-            !still_held_after_heartbeat(&parse_heartbeat_result("not_held")),
+            !still_held_after_heartbeat(&outcome),
             "an expired claim is not held, however politely coord says so"
         );
-        assert_ne!(
-            parse_heartbeat_result("not_held"),
-            HeartbeatOutcome::Stolen,
+        assert!(
+            !matches!(outcome, HeartbeatOutcome::Stolen { .. }),
             "an expiry must stay distinguishable from a theft on the wire"
         );
     }
@@ -408,7 +661,10 @@ mod tests {
             match self.owners.get(key) {
                 Some((holder, expires)) if *expires > now && holder != owner => {
                     AcquireOutcome::Held {
-                        current_holder: Some(holder.clone()),
+                        holder: Some(SlotHolder {
+                            machine_id: holder.clone(),
+                            session: None,
+                        }),
                     }
                 }
                 // Free, expired, or already ours (renew).
