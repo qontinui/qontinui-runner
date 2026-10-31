@@ -213,6 +213,16 @@ export function describeRemoteCreateFailure(err: unknown): RemoteCreateRefusal {
       ],
     };
   }
+  if (code === "role_closes_agent_lane") {
+    return {
+      ...base,
+      headline: "That device does not take sessions — its dispatch role closes the agent lane",
+      remedy: [
+        "coord's dispatch role for that machine closes the agent lane (`ci_node` or `bench`), so its runner refuses remote creates. Nothing was spawned, and the create is not queued.",
+        "This is not the create dial and not a drain: pick another device, or change the machine's role.",
+      ],
+    };
+  }
   if (code === "drain_unreadable") {
     return {
       ...base,
