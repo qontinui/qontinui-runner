@@ -33,6 +33,11 @@ pub mod job_object;
 // route runs on Linux CI too. The Win32 calls inside are gated individually.
 pub mod holder_spawn;
 
+// In-process process-TREE termination (no process is created). Not gated:
+// the admission rule, the report type and the generic walk are plain logic, so
+// their tests run on Linux CI too; the Win32 table inside is gated.
+pub mod process_tree;
+
 #[cfg(windows)]
 pub use job_object::{
     assign_process_to_job, current_job_pid_saturation, init_job_object, ScopedKillOnCloseJob,

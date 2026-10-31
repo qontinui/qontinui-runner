@@ -7,18 +7,18 @@ UI Bridge enables AI-driven control of applications through a unified HTTP API. 
 ```python
 from ui_bridge import UIBridgeClient
 
-# Default connection (localhost:9876)
+# Default connection (127.0.0.1:9876)
 client = UIBridgeClient()
 
 # Custom connection
 client = UIBridgeClient(
-    base_url="http://localhost:9876",
+    base_url="http://127.0.0.1:9876",
     timeout=30.0,
     api_path="/ui-bridge"
 )
 
 # Common connection targets:
-# - Local runner:        http://localhost:9876
+# - Local runner:        http://127.0.0.1:9876
 # - Android emulator:    http://10.0.2.2:8087
 # - iOS simulator:       http://localhost:8087
 # - Physical device:     http://<device-ip>:8087

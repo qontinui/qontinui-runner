@@ -159,34 +159,18 @@ pub use imp::{list_pids, stat};
 
 #[cfg(windows)]
 mod imp {
-    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     /// `GetExitCodeProcess`'s answer for a process that has not exited
     /// (`STILL_ACTIVE`, 259).
     const STILL_ACTIVE: u32 = 259;
 
-    /// The creation time of the process behind `handle`, as one 64-bit
-    /// FILETIME value.
-    ///
-    /// # Safety
-    /// `handle` must be a valid process handle with at least
-    /// `PROCESS_QUERY_LIMITED_INFORMATION` access.
-    pub unsafe fn creation_time(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<u64> {
-        let zero = FILETIME {
-            dwLowDateTime: 0,
-            dwHighDateTime: 0,
-        };
-        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
-        // SAFETY: the caller guarantees `handle`; the four out-pointers are
-        // valid locals for the duration of the call.
-        let ok =
-            unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) };
-        (ok != 0)
-            .then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
-    }
+    /// The creation time of the process behind `handle` — ONE implementation,
+    /// in runner-win32, shared with the pane-tree kill.
+    pub use qontinui_runner_win32::process_tree::creation_time;
 
     pub fn start_token(pid: u32) -> Option<String> {
         // SAFETY: OpenProcess takes no pointers; a non-null result is a handle

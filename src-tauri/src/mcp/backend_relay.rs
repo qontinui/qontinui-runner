@@ -1951,7 +1951,7 @@ async fn handle_inbound<S>(
                     // closes the remote terminal it announced
                     // (`deliver_create_reply`), and a full reply lane ends the
                     // connection through `end_connection`.
-                    if msg_type == "terminal_create" {
+                    if runs_off_read_loop(msg_type, &data) {
                         let api_state = api_state.clone();
                         let writer = writer.clone();
                         let end_connection = end_connection.clone();
@@ -2201,9 +2201,9 @@ async fn run_heartbeat_sender(api_state: Arc<ApiState>, writer: RelayWriter) {
         // can derive its `derived_status` from this.
         let ui_error_snapshot = api_state.app_state.ui_error.get().await;
         let recent_crash_snapshot = api_state.app_state.crash_dumps.get().await;
-        // `pg_reachable = None`: the web-backend heartbeat relay does not run
-        // a DB round-trip; the bounded PG liveness probe lives only in the
-        // `/health` handler.
+        // `pg_reachable` / `pg_schema_ok` come from the CACHED PG health
+        // snapshot (`database::pg::health`): no DB round-trip, age-bounded,
+        // and an open breaker reads `Some(false)`.
         //
         // `ui_dead` is NOT `None` here, and that matters: nothing polls
         // `/health` on an end user's machine, so this relay (and the
@@ -2223,6 +2223,7 @@ async fn run_heartbeat_sender(api_state: Arc<ApiState>, writer: RelayWriter) {
         // close relays `healthy` to the web backend indefinitely.
         let native_ui =
             crate::ui_error::native_ui_liveness_now(&api_state.app_state.ui_bridge_last_pong);
+        let (pg_reachable, pg_schema_ok) = crate::database::pg::health::status_pg_inputs();
         let derived_status =
             crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
                 has_ui_error: ui_error_snapshot.is_some(),
@@ -2230,6 +2231,8 @@ async fn run_heartbeat_sender(api_state: Arc<ApiState>, writer: RelayWriter) {
                 ui_dead: Some(ui_dead),
                 native_ui_wedged: native_ui.wedged,
                 embedding_reachable: crate::mcp_api::embedding_reachable_cached(),
+                pg_reachable,
+                pg_schema_ok,
                 relay_connected,
                 ..Default::default()
             })
@@ -2638,6 +2641,13 @@ const REMOTE_TARGET_ADMITTED: &[&str] = &[
     "terminal_flow",
     "remote_terminal_flow",
     "terminal_create",
+    // Plan `2026-09-30-close-remote-sessions-from-the-local-runner`, Phase 1:
+    // END the grant's session (graceful `/exit`, or a hard close on `force`).
+    // No new capability — an attach grant already admits `terminal_input`, so
+    // its holder can type `/exit` today (D3). The handler resolves the
+    // terminal from the grant ROW's session and binds nothing
+    // (`remote_terminal::admit_terminal_end`).
+    "terminal_end",
 ];
 
 /// SOURCE role — the RETURN path for panes THIS runner opened on another
@@ -2667,6 +2677,11 @@ const REMOTE_SOURCE_ADMITTED: &[&str] = &[
     // Listed anyway, so a relay that ever echoes the block does not reopen it.
     "remote_terminal_created",
     "remote_terminal_attached",
+    // The answer to a `remote_terminal_end` (plan
+    // `2026-09-30-close-remote-sessions-from-the-local-runner`, Phase 3). The
+    // relay rebuilds it from the target's `terminal_ended`; listed for the
+    // same hedge reason as `remote_terminal_created` above.
+    "remote_terminal_ended",
     "remote_terminal_output",
     "remote_terminal_exit",
     "remote_terminal_buffer",
@@ -3028,6 +3043,9 @@ async fn handle_relay_command(
         // `remote_terminal_attach` that way, correlated by `request_id`.
         // --------------------------------------------------------------
         "terminal_attach" => handle_terminal_attach(api_state, data).await,
+        // Runs OFF the read loop (`runs_off_read_loop`): a graceful end waits
+        // up to `graceful_exit::DEFAULT_DEADLINE` (60 s), past the keepalive.
+        "terminal_end" => handle_terminal_end(api_state, data).await,
         "terminal_detach" => handle_terminal_detach(data),
         // A source's `set_paused` toggle, applied to this target's per-grant
         // `EmissionGate` (Phase 5). Both spellings route here on purpose: the
@@ -3047,8 +3065,12 @@ async fn handle_relay_command(
         // and replied correctly, leaving it running there unattached.
         // Observed on merytshost 2026-09-18; coord finding a5f08a4d.
         // `a_relay_shaped_created_reply_passes_admission` pins the relay's shape.
+        // `remote_terminal_ended` is listed from its first day for exactly that
+        // reason — the answer to a `remote_terminal_end` (plan
+        // `2026-09-30-close-remote-sessions-from-the-local-runner`, Phase 3).
         "remote_terminal_created"
         | "remote_terminal_attached"
+        | "remote_terminal_ended"
         | "remote_terminal_output"
         | "remote_terminal_exit"
         | "remote_terminal_buffer"
@@ -3056,7 +3078,7 @@ async fn handle_relay_command(
         | "remote_terminal_input_ack" => {
             // The return is "did this client CONSUME the frame"
             // (`handle_inbound`'s own doc), NOT "did it wake a waiter": every
-            // arm for these seven returns `true` unconditionally, warning
+            // arm for these eight returns `true` unconditionally, warning
             // internally on the no-waiter path. So there is nothing to branch
             // on here, and a check would be dead code. The sibling `error` arm
             // below checks it because `handle_inbound` genuinely can return
@@ -3600,6 +3622,8 @@ fn http_relay_error(request_id: &Value, status: u16, message: &str) -> Value {
 /// | `GET /health`, `/status` | none — device status |
 /// | `GET /apps/{app_id}/spec/list`, `/spec/graph` | none — app specs, not session content |
 /// | `GET /ui-bridge/control/snapshot` | terminal stream, strictest, refuse — the runner UI shows session panes |
+/// | `GET /ui-bridge/control/components` | none — relayed, it carries the runner's own registry only: `ui_bridge::elements::ComponentSources` withholds every WebSocket-registered app's reply from a request bearing `relay_path_policy::RELAYED_REQUEST_HEADER`. What remains is `serializeComponent` metadata (ids, names, descriptions, actions with declared effects) and no component state; some names embed a saved project's name, or a registered app's self-declared name while the runner's UI Bridge integration page lists that app |
+/// | `POST /ui-bridge/control/page-health` | terminal stream, strictest, refuse — its text findings quote the same webview as the snapshot |
 /// | `POST /prompt-home/plan` | none — plans the caller's own prompt |
 /// | `GET /task-runs`, `/task-runs/running`, `/task-runs/{id}` | terminal stream, per run, redact |
 /// | `GET /task-runs/{id}/events`, `/output`, `/session-state`, `/workflow-state`, `/screenshots` | terminal stream, that run's tenant, refuse |
@@ -3658,9 +3682,16 @@ fn http_request_egress_refusal(request_id: &Value, raw_path: &str) -> Option<Val
         [route, leaf] if route == "memory" && leaf == "search" => {
             (Flow::TranscriptSync, SessionScope::Unresolved)
         }
-        // Matched as one route string: it is the runner's own HTTP route, not
-        // the `ui-bridge` sibling repo the workspace-assumption scan looks for.
-        _ if segments.join("/") == "ui-bridge/control/snapshot" => {
+        // Matched as whole route strings: they are the runner's own HTTP
+        // routes, not the `ui-bridge` sibling repo the workspace-assumption
+        // scan looks for. Both read the runner's own webview, which shows
+        // session panes: the snapshot carries every element's text, and page
+        // health quotes the text of each element its findings flag.
+        _ if matches!(
+            segments.join("/").as_str(),
+            "ui-bridge/control/snapshot" | "ui-bridge/control/page-health"
+        ) =>
+        {
             (Flow::TerminalStream, SessionScope::Unresolved)
         }
         _ => return None,
@@ -4165,7 +4196,7 @@ async fn handle_http_request(api_state: &Arc<ApiState>, data: &Value) -> Option<
 }
 
 /// Transport-agnostic core of the `http_request` relay: given the loopback
-/// base URL (e.g. `http://localhost:9876`) and the inbound envelope, issue
+/// base URL (e.g. `http://127.0.0.1:9876`) and the inbound envelope, issue
 /// the local call and build the `command_response` reply frame. Split out so
 /// it can be unit-tested against a real local server without constructing a
 /// full `ApiState`. Always returns a `command_response` value.
@@ -4295,6 +4326,19 @@ async fn relay_http_to_base(base: &str, data: &Value) -> Value {
             }
         }
     }
+    // Mark the request as relayed, AFTER the frame's own headers are copied:
+    // `insert` replaces every value already under the name, so the local API
+    // always sees the marker and no frame can strip or replace it. It only
+    // ever narrows what a handler does for a remote caller; see
+    // `relay_path_policy::RELAYED_REQUEST_HEADER`.
+    header_map.insert(
+        reqwest::header::HeaderName::from_static(
+            crate::mcp::relay_path_policy::RELAYED_REQUEST_HEADER,
+        ),
+        reqwest::header::HeaderValue::from_static(
+            crate::mcp::relay_path_policy::RELAYED_REQUEST_HEADER_VALUE,
+        ),
+    );
 
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
@@ -5322,6 +5366,44 @@ fn terminal_gone_after_confirm(
 /// succeed against.
 const REMOTE_CREATE_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Frame types whose handler runs in its OWN task rather than on the relay's
+/// serial read loop, replying through the writer.
+///
+/// - `terminal_create` — see the comment at the spawn site.
+/// - `terminal_end` — a graceful end waits up to
+///   `graceful_exit::DEFAULT_DEADLINE` (60 s) for `claude` to leave, which is
+///   longer than the keepalive tolerates (`STALE_INBOUND_TIMEOUT`): awaited
+///   inline it would drop the relay socket and stall every other terminal's
+///   frames for the whole wait (plan
+///   `2026-09-30-close-remote-sessions-from-the-local-runner`, Phase 1).
+///
+/// Their replies go through [`deliver_create_reply`], which closes an orphaned
+/// remote create and otherwise only sends.
+const SPAWNED_OFF_READ_LOOP: &[&str] = &["terminal_create", "terminal_end"];
+
+/// Does this inbound frame run in its own task?
+///
+/// Decided on the OPERATION, not the outer `type`: a carrier such as
+/// `{"type":"terminal","subtype":"terminal_end","payload":{…}}` dispatches to
+/// the very same `terminal_end` arm, so keyed on `type` alone it waited out a
+/// 60 s graceful end ON the read loop. A carrier is resolved through
+/// [`route_relay_frame`] — the same unwrapping `handle_relay_command` applies,
+/// so the two can never disagree about what a frame is. A frame that routing
+/// refuses dispatches nothing slow, and stays inline. Non-carrier frames skip
+/// the routing (and its clone) entirely: this runs for every inbound frame.
+fn runs_off_read_loop(msg_type: &str, data: &Value) -> bool {
+    if SPAWNED_OFF_READ_LOOP.contains(&msg_type) {
+        return true;
+    }
+    if !REMOTE_ENVELOPE_TYPES.contains(&msg_type) {
+        return false;
+    }
+    match route_relay_frame(msg_type, data) {
+        RelayRoute::Dispatch { msg_type, .. } => SPAWNED_OFF_READ_LOOP.contains(&msg_type.as_str()),
+        RelayRoute::Refuse(_) => false,
+    }
+}
+
 /// Send a spawned `terminal_create`'s reply, and deal with a reply that cannot
 /// be sent. Returns `true` when the caller must END the connection.
 ///
@@ -5365,7 +5447,7 @@ where
             );
             close_terminal(terminal_id).await;
         }
-        None => warn!("Failed to send terminal_create reply: {}", e),
+        None => warn!("Failed to send a spawned relay reply: {}", e),
     }
     matches!(e, RelayWriteError::ReplyLaneFull)
 }
@@ -6144,6 +6226,162 @@ async fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Opti
     }))
 }
 
+/// TARGET role: a SOURCE device asks to END one of our sessions under its
+/// attach grant (plan `2026-09-30-close-remote-sessions-from-the-local-runner`,
+/// Phase 1). Runs in its own task (`runs_off_read_loop`).
+///
+/// Admission is `admit_terminal_end`: the terminal comes from the grant ROW's
+/// session, a named terminal is only compared, a missing `remote` block is
+/// refused, and the grant is never bound. `force: false` runs
+/// `TerminalManager::graceful_exit` (types `/exit` only at an empty prompt,
+/// never kills a `claude` that outlives the deadline); `force: true` is the
+/// hard `tm.close`. Either close funnels through `close_with_deadline` /
+/// `close_inner`, which emits the pane's ordinary `terminal-exit` — the path
+/// that retires an OPEN tab on the source (relay `terminal_exit` →
+/// `remote_terminal_exit`), and that this handler does not duplicate.
+async fn handle_terminal_end(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
+    use crate::mcp::remote_terminal::{
+        admit_terminal_end, end_slots, execute_terminal_end, grants, now_epoch_secs,
+        single_flight_end, terminal_ended_frame, AdmittedEnd, EndOutcome, EndVerdict,
+    };
+    let Some(tm) = api_state
+        .app_handle
+        .try_state::<Arc<crate::terminal::TerminalManager>>()
+        .map(|s| s.inner().clone())
+    else {
+        return Some(serde_json::json!({
+            "type": "error",
+            "message": "TerminalManager not available",
+            "request_id": data.get("request_id"),
+            "remote": crate::mcp::remote_terminal::remote_echo(data),
+        }));
+    };
+    let force = data.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let gate = || {
+        admit_terminal_end(
+            grants(),
+            crate::settings::get_remote_attach_preference,
+            data,
+            now_epoch_secs(),
+            |session_id| resolve_local_terminal(tm.as_ref(), session_id),
+        )
+    };
+    let admitted = match gate() {
+        Ok(admitted) => admitted,
+        Err(frame) => {
+            // The ONE refusal worth a coord re-read, exactly as
+            // `handle_terminal_attach` carries it: the source mints a FRESH
+            // grant to end an unattached session and presents it at once, so
+            // the frame can beat the `attach_request` directive here (finding
+            // a5f08a4d). Same family, same throttle; this runs in its own task,
+            // so the bounded wait stalls no other frame.
+            let Some(jti) = crate::mcp::remote_terminal::reread_decision(
+                &frame,
+                crate::mcp::remote_terminal::GrantFamily::Attach,
+                now_epoch_secs(),
+            ) else {
+                return Some(frame);
+            };
+            let Some(registry) = api_state
+                .app_handle
+                .try_state::<Arc<crate::session::SessionRegistry>>()
+                .map(|r| r.inner().clone())
+            else {
+                return Some(frame);
+            };
+            crate::session::attach::catch_up_now_within(
+                &registry,
+                crate::mcp::remote_terminal::GRANT_REREAD_TIMEOUT,
+            )
+            .await;
+            crate::mcp::remote_terminal::finish_grant_reread(now_epoch_secs());
+            match gate() {
+                Ok(admitted) => {
+                    crate::mcp::remote_terminal::clear_grant_reread(
+                        crate::mcp::remote_terminal::GrantFamily::Attach,
+                        &jti,
+                    );
+                    admitted
+                }
+                Err(frame) => return Some(frame),
+            }
+        }
+    };
+
+    let (grant, terminal_id) = match admitted {
+        AdmittedEnd::NotLocal { grant, .. } => {
+            let verdict = EndVerdict {
+                outcome: EndOutcome::NotFound,
+                via: None,
+                reason: Some(
+                    "session_not_local: no local terminal hosts that coord session".to_string(),
+                ),
+            };
+            return Some(terminal_ended_frame(
+                data,
+                Some(grant.session_id),
+                None,
+                &verdict,
+            ));
+        }
+        AdmittedEnd::Terminal {
+            grant, terminal_id, ..
+        } => (grant, terminal_id),
+    };
+
+    info!(
+        grant_jti = %grant.grant_jti,
+        source_device = %grant.source_device_id,
+        session = %grant.session_id,
+        terminal_id = %terminal_id,
+        force,
+        "remote end: admitted — ending the grant's session"
+    );
+    let graceful_tm = tm.clone();
+    let graceful_id = terminal_id.clone();
+    let close_tm = tm.clone();
+    let close_id = terminal_id.clone();
+    // Single-flight per terminal: a second end while this one's driver runs is
+    // answered `refused` / `end_already_running` and starts nothing. The slot
+    // is guard-held, so it is freed on every path this leaves by, panic too.
+    let verdict = single_flight_end(end_slots(), &terminal_id, move || {
+        execute_terminal_end(
+            force,
+            move || async move {
+                graceful_tm
+                    .graceful_exit(
+                        &graceful_id,
+                        crate::terminal::graceful_exit::DEFAULT_DEADLINE,
+                    )
+                    .await
+            },
+            move || async move {
+                match spawn_blocking_tracked(move || close_tm.close(&close_id)).await {
+                    Ok(result) => result,
+                    Err(e) => Err(format!("close task failed: {e}")),
+                }
+            },
+        )
+    })
+    .await;
+    info!(
+        grant_jti = %grant.grant_jti,
+        session = %grant.session_id,
+        terminal_id = %terminal_id,
+        outcome = verdict.outcome.as_str(),
+        via = ?verdict.via,
+        reason = ?verdict.reason,
+        "remote end: answered"
+    );
+    Some(terminal_ended_frame(
+        data,
+        Some(grant.session_id),
+        Some(&terminal_id),
+        &verdict,
+    ))
+}
+
 /// TARGET role, Phase 5: the SOURCE's `EmissionGate` (relayed as
 /// `remote_terminal_flow` → `terminal_flow {paused, remote}`) drives this
 /// subscriber's wire gate. `paused: true` withholds the terminal's
@@ -6617,13 +6855,13 @@ mod tests {
         };
         // A floor guard, deliberately not claimed as more: the extraction is
         // textual, so a literal that survives elsewhere in the scanned window
-        // (an `unwrap_or("remote_terminal_error")`, say) keeps the count at 6
+        // (an `unwrap_or("remote_terminal_error")`, say) keeps the count at 8
         // even if its match arm is gone. It catches wholesale extraction
         // failure, which is what it is for.
         assert_eq!(
             known.len(),
-            7,
-            "expected 7 remote_terminal_* reply types in handle_inbound, got {known:?} — if a \
+            8,
+            "expected 8 remote_terminal_* reply types in handle_inbound, got {known:?} — if a \
              type was genuinely added or removed, update this count deliberately"
         );
 
@@ -7456,6 +7694,11 @@ mod tests {
             ("GET", "/files"),
             ("POST", "/files/read"),
             ("DELETE", "/task-runs/abc"),
+            // Beside the UI Bridge dashboard's two reads: the other method on
+            // each, and the action invocation the component read advertises.
+            ("POST", "/ui-bridge/control/components"),
+            ("GET", "/ui-bridge/control/page-health"),
+            ("POST", "/ui-bridge/control/component/x1/action/delete"),
         ] {
             let env = json!({
                 "type": "http_request",
@@ -7494,6 +7737,9 @@ mod tests {
             ("GET", "/ui-bridge/control/snapshot"),
             // qontinui-web: the co-pilot planner.
             ("POST", "/prompt-home/plan"),
+            // qontinui-web: the console's UI Bridge dashboard (`relayReads.ts`).
+            ("GET", "/ui-bridge/control/components"),
+            ("POST", "/ui-bridge/control/page-health"),
             // qontinui-mobile in remote mode: its whole API surface rides
             // this arm, so a sample from across its domain clients.
             ("GET", "/status"),
@@ -7525,6 +7771,185 @@ mod tests {
             cases.len(),
             "every allowlisted call must have reached the local API"
         );
+    }
+
+    /// Every request the arm forwards arrives with the relay's marker, and a
+    /// frame cannot replace it. A frame that sends the marker's own name with
+    /// another value, or with none, still arrives carrying exactly the arm's
+    /// value. The name and value are spelled here as literals, so renaming
+    /// either fails this test.
+    #[tokio::test]
+    async fn every_relayed_request_carries_the_relay_marker() {
+        async fn handler(headers: HeaderMap) -> impl axum::response::IntoResponse {
+            let marker: Vec<String> = headers
+                .get_all("x-qontinui-relayed")
+                .iter()
+                .filter_map(|v| v.to_str().ok().map(str::to_string))
+                .collect();
+            (
+                AxumStatus::OK,
+                [("content-type", "application/json")],
+                json!({ "marker": marker }).to_string(),
+            )
+        }
+        // A fallback, not a `.route("…")`: the relay registration tripwire
+        // scans `.route` literals, test code included, and a test router must
+        // not count as the runner registering a route. The frame's path,
+        // `/status`, is RELAY_ALLOWED (see the GET round trip above).
+        let base = spawn_test_server(Router::new().fallback(handler)).await;
+        for frame_headers in [
+            json!({}),
+            json!({ "X-Qontinui-Relayed": "forged" }),
+            json!({ "x-qontinui-relayed": "" }),
+        ] {
+            let env = json!({
+                "type": "http_request",
+                "request_id": "req-marker",
+                "method": "GET",
+                "path": "/status",
+                "headers": frame_headers.clone(),
+                "body_b64": ""
+            });
+            let reply = relay_http_to_base(&base, &env).await;
+            assert_eq!(reply["status"], 200, "{reply}");
+            let body: Value =
+                serde_json::from_slice(&b64_decode(reply["body_b64"].as_str().unwrap())).unwrap();
+            assert_eq!(
+                body["marker"],
+                json!(["http_request"]),
+                "frame headers {frame_headers}"
+            );
+        }
+    }
+
+    /// Plan 2026-10-23-console-presentation-spaces Phase 6, review round 1:
+    /// a relayed component read never waits on a WebSocket app. The relay
+    /// awaits every `http_request` inline on its read loop, which has to answer
+    /// the server's PING inside 20 s, and one dispatch to a wrapper that never
+    /// answers waits the command relay's 30 s.
+    ///
+    /// The loopback API here stands in for the runner's router. It cannot mount
+    /// `ui_bridge_get_components_handler` itself, because that handler extracts
+    /// an `ApiState` no test can build. So its fallback does what the handler
+    /// does past its extractors: it hands the forwarded request's own headers
+    /// to the real read core, `ui_bridge::elements::components_read`, which
+    /// chooses the sources from them and runs the WebSocket fan-out, the merge
+    /// and the envelope. The fallback extracts the same `HeaderMap` the
+    /// handler does; what does not run is the handler's own body, and the one
+    /// stub is the runner's own IPC read. That the handler passes its request
+    /// headers through untouched is pinned by
+    /// `elements::ws_dispatch_selection_tests::the_component_handler_hands_its_request_headers_to_the_read_core`.
+    ///
+    /// The registered wrapper is live and never answers, and the dispatcher
+    /// uses the PRODUCTION command timeout. Relayed, the read returns at once
+    /// with the runner's entries and `wrapperComponents: "withheld"`, and the
+    /// wrapper is sent nothing. The same route read LOCALLY does send that
+    /// wrapper `getComponents`, so the wrapper was live and dispatchable the
+    /// whole time.
+    #[tokio::test]
+    async fn a_relayed_component_read_never_waits_on_a_websocket_app() {
+        use crate::mcp::app_discovery::DiscoveredApp;
+        use crate::mcp::app_dispatch::AppDispatcher;
+        use crate::mcp::app_registry::{AppRegistry, AppTransport};
+        use crate::mcp::command_relay::{CommandRelay, CommandResponse};
+        use crate::mcp::ui_bridge::elements::components_read;
+        use crate::mcp::ws_relay::WsConnectionManager;
+
+        let registry = AppRegistry::new();
+        let ws = WsConnectionManager::new();
+        let (conn, mut wrapper_rx) = ws.test_register("hung-wrapper").await;
+        registry
+            .upsert(
+                DiscoveredApp {
+                    app_id: "hung-wrapper".into(),
+                    app_name: "hung-wrapper".into(),
+                    app_type: "web".into(),
+                    framework: None,
+                    url: "http://unused".into(),
+                    port: 0,
+                    base_path: "".into(),
+                    version: None,
+                    capabilities: vec![],
+                    element_count: None,
+                    component_count: None,
+                    discovered_at: 0,
+                },
+                None,
+                AppTransport::Websocket,
+                Some(conn),
+                None,
+            )
+            .await;
+        let relay = CommandRelay::new(ws);
+        let dispatcher = AppDispatcher::new(registry.clone(), relay.clone());
+
+        // A fallback, not a `.route("…")`, so this test router never counts as
+        // the runner registering the component route (the registration
+        // tripwire scans `.route` literals, test code included). The relay
+        // forwards only the component path here, and the local read below
+        // asks for the same one.
+        let (reg, disp) = (registry.clone(), dispatcher.clone());
+        let base = spawn_test_server(Router::new().fallback(move |headers: HeaderMap| {
+            let (reg, disp) = (reg.clone(), disp.clone());
+            async move {
+                components_read(&headers, &reg, &disp, async {
+                    Ok::<_, String>(json!([{ "id": "runner-own" }]))
+                })
+                .await
+            }
+        }))
+        .await;
+
+        let frame = json!({
+            "type": "http_request",
+            "request_id": "req-components",
+            "method": "GET",
+            "path": "/ui-bridge/control/components",
+            "headers": {},
+            "body_b64": ""
+        });
+        let reply = tokio::time::timeout(Duration::from_secs(5), relay_http_to_base(&base, &frame))
+            .await
+            .expect("a relayed component read waited on a WebSocket app");
+        assert_eq!(reply["status"], 200, "{reply}");
+        let body: Value =
+            serde_json::from_slice(&b64_decode(reply["body_b64"].as_str().unwrap())).unwrap();
+        assert_eq!(body["data"]["components"], json!([{ "id": "runner-own" }]));
+        assert_eq!(body["data"]["wrapperComponents"], "withheld");
+        assert!(
+            wrapper_rx.try_recv().is_err(),
+            "the relayed read sent the wrapper a command"
+        );
+
+        let url = format!("{base}/ui-bridge/control/components");
+        let local = tokio::spawn(async move { reqwest::get(url).await?.json::<Value>().await });
+        let command = tokio::time::timeout(Duration::from_secs(5), wrapper_rx.recv())
+            .await
+            .expect("a local read asks the live wrapper")
+            .expect("the wrapper's command channel is open");
+        let command: Value = serde_json::from_str(&command).unwrap();
+        assert_eq!(command["action"], "getComponents");
+        relay
+            .resolve(
+                conn,
+                crate::mcp::relay_binding::BindingMode::Enforce,
+                CommandResponse {
+                    command_id: command["commandId"].as_str().unwrap().to_string(),
+                    success: true,
+                    result: Some(json!([{ "id": "wrapper-own" }])),
+                    error: None,
+                },
+            )
+            .await;
+        let local = local
+            .await
+            .unwrap()
+            .expect("the local read answered over HTTP");
+        assert_eq!(
+            local["data"]["components"],
+            json!([{ "id": "runner-own" }, { "id": "wrapper-own" }])
+        );
+        assert_eq!(local["data"]["wrapperComponents"], "included");
     }
 
     #[test]
@@ -8510,6 +8935,7 @@ mod remote_admission_tests {
             "terminal_detach",
             "terminal_flow",
             "remote_terminal_flow",
+            "terminal_end",
         ] {
             assert!(
                 remote_frame_admitted(t, &with_grant(json!({ "type": t }))),
@@ -8529,6 +8955,7 @@ mod remote_admission_tests {
         for t in [
             "remote_terminal_created",
             "remote_terminal_attached",
+            "remote_terminal_ended",
             "remote_terminal_output",
             "remote_terminal_exit",
             "remote_terminal_buffer",
@@ -8888,6 +9315,129 @@ mod relay_routing_tests {
         let (msg_type, data) = dispatched(route_relay_frame("terminal_create", &frame));
         assert_eq!(msg_type, "terminal_create");
         assert_eq!(data, frame);
+    }
+
+    /// `terminal_end` ends a session: admitted under an ATTACH grant (D3 — its
+    /// holder can already type `/exit`), never under a CREATE grant, which
+    /// buys exactly one spawn.
+    #[test]
+    fn terminal_end_is_admitted_under_an_attach_grant_only() {
+        let mut attach = json!({ "type": "terminal_end", "force": false });
+        attach["remote"] = attach_block();
+        assert!(super::remote_frame_admitted("terminal_end", &attach));
+        let mut create = json!({ "type": "terminal_end", "force": true });
+        create["remote"] = create_block();
+        assert!(
+            !super::remote_frame_admitted("terminal_end", &create),
+            "a create grant must not end a session"
+        );
+    }
+
+    /// A graceful end waits up to 60 s for `claude` to leave — longer than the
+    /// keepalive tolerates. It must run in its own task like `terminal_create`,
+    /// or one slow `/exit` drops the relay socket and stalls every other
+    /// terminal's frames for the whole wait. Pinned on the predicate the read
+    /// loop consults AND on the read loop consulting it.
+    #[test]
+    fn a_graceful_end_never_runs_on_the_serial_read_loop() {
+        let bare = serde_json::json!({});
+        assert!(super::runs_off_read_loop("terminal_end", &bare));
+        assert!(super::runs_off_read_loop("terminal_create", &bare));
+        for inline in [
+            "terminal_input",
+            "terminal_attach",
+            "terminal_close",
+            "heartbeat",
+        ] {
+            assert!(!super::runs_off_read_loop(inline, &bare), "{inline}");
+        }
+        const SRC: &str = include_str!("backend_relay.rs");
+        let read_loop = SRC
+            .find("async fn handle_inbound<S>(")
+            .expect("read loop not found");
+        let body = SRC.get(read_loop..).expect("char boundary");
+        let spawn_site = body
+            .find("if runs_off_read_loop(msg_type, &data) {")
+            .expect("the read loop must consult runs_off_read_loop");
+        let inline_site = body
+            .find("let response = handle_relay_command(&api_state, msg_type, &data).await;")
+            .expect("inline dispatch not found");
+        assert!(
+            spawn_site < inline_site,
+            "the spawn branch must be decided BEFORE the inline dispatch"
+        );
+    }
+
+    /// A `terminal_end` carried in a `terminal` envelope dispatches to the same
+    /// 60 s graceful-end arm, so it must run off the read loop exactly like the
+    /// bare frame — the predicate decides on the operation, not the carrier.
+    #[test]
+    fn an_enveloped_terminal_end_also_runs_off_the_read_loop() {
+        let remote = serde_json::json!({
+            "grant_jti": "j1",
+            "source_device_id": "src",
+            "kind": "attach",
+        });
+        let enveloped = serde_json::json!({
+            "type": "terminal",
+            "subtype": "terminal_end",
+            "payload": { "request_id": "r1", "force": false, "remote": remote },
+        });
+        assert!(super::runs_off_read_loop("terminal", &enveloped));
+        // Envelope-level remote block, carried down by routing.
+        let outer_block = serde_json::json!({
+            "type": "terminal",
+            "subtype": "terminal_end",
+            "remote": remote,
+            "payload": { "request_id": "r1" },
+        });
+        assert!(super::runs_off_read_loop("terminal", &outer_block));
+        // Two levels deep.
+        let nested = serde_json::json!({
+            "type": "terminal",
+            "subtype": "terminal",
+            "payload": enveloped,
+        });
+        assert!(super::runs_off_read_loop("terminal", &nested));
+        // Other carriers of fast operations stay inline.
+        let input = serde_json::json!({
+            "type": "terminal",
+            "subtype": "terminal_input",
+            "payload": { "terminal_id": "t", "data": "x" },
+        });
+        assert!(!super::runs_off_read_loop("terminal", &input));
+        let chat = serde_json::json!({ "type": "chat", "subtype": "chat_message", "payload": {} });
+        assert!(!super::runs_off_read_loop("chat", &chat));
+        // A refused envelope dispatches nothing slow.
+        let disagreeing = serde_json::json!({
+            "type": "terminal",
+            "subtype": "terminal_end",
+            "remote": remote,
+            "payload": { "remote": { "grant_jti": "other", "source_device_id": "src" } },
+        });
+        assert!(!super::runs_off_read_loop("terminal", &disagreeing));
+    }
+
+    /// The relay's `remote_terminal_ended` — rebuilt from the target's
+    /// `terminal_ended` with no `remote` block — must reach the dispatch arm
+    /// unchanged, and with an echoed block must not be refused one gate early.
+    #[test]
+    fn a_relay_shaped_ended_reply_passes_admission() {
+        let relay_shaped = json!({
+            "type": "remote_terminal_ended",
+            "request_id": "rid-e1",
+            "session_id": "00000000-0000-0000-0000-000000000007",
+            "terminal_id": null,
+            "outcome": "not_found",
+        });
+        let (msg_type, data) =
+            dispatched(route_relay_frame("remote_terminal_ended", &relay_shaped));
+        assert_eq!(msg_type, "remote_terminal_ended");
+        assert_eq!(data, relay_shaped, "routing must not reshape the frame");
+        let mut echoed = relay_shaped.clone();
+        echoed["remote"] = attach_block();
+        let (msg_type, _) = dispatched(route_relay_frame("remote_terminal_ended", &echoed));
+        assert_eq!(msg_type, "remote_terminal_ended");
     }
 }
 
@@ -10018,6 +10568,105 @@ mod egress_tests {
         let reply = relay_http_to_base(&counter.http_base(), &get("/configs")).await;
         assert_ne!(reply["status"], 409, "{reply}");
         assert!(counter.wait_for(before + 1, Duration::from_secs(5)) > before);
+    }
+
+    // Plan 2026-10-23-console-presentation-spaces Phase 6: the egress verdicts
+    // of the UI Bridge dashboard's two relay reads, one claim per test. Page
+    // health quotes up to 120 characters of the text of each element it flags
+    // in the runner's own webview, session panes included, so it is gated as
+    // the snapshot is: judged by the strictest bound tenant, and refused
+    // before the loopback API is called. The component read carries the
+    // runner's own registry metadata, and no egress flow is consulted for it.
+
+    /// The bound tenant every test below judges a read by.
+    const DASHBOARD_TENANT: u128 = 0x7e7a_0016;
+
+    fn dashboard_frame(method: &str, path: &str) -> serde_json::Value {
+        serde_json::json!({"request_id": "rq", "method": method, "path": path})
+    }
+
+    /// Page health is refused with the terminal-stream verdict while a bound
+    /// tenant refuses that flow, and the loopback API is never called. Fails
+    /// if page health drops out of the egress match.
+    #[tokio::test]
+    async fn page_health_is_refused_while_a_bound_tenant_refuses_terminal_streaming() {
+        use crate::egress::test_support::{fake_bound_tenants, pin_for};
+        let tenant = uuid::Uuid::from_u128(DASHBOARD_TENANT);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _bound = fake_bound_tenants(vec![tenant]);
+        let _off = pin_for(Flow::TerminalStream, tenant, Level::Off);
+        let counter = crate::egress::test_support::ConnCounter::start();
+
+        let reply = relay_http_to_base(
+            &counter.http_base(),
+            &dashboard_frame("POST", "/ui-bridge/control/page-health"),
+        )
+        .await;
+        assert_eq!(
+            status_and_flow(&reply),
+            (409, Some("terminal_stream".into())),
+            "{reply}"
+        );
+        assert_eq!(
+            counter.count(),
+            0,
+            "a refused read never reaches the loopback API"
+        );
+    }
+
+    /// Page health reaches the loopback API once every bound tenant permits
+    /// terminal streaming: the refusal test's setup, with that tenant's pin
+    /// flipped to on, so the tenant's verdict is the only thing the two tests
+    /// differ in. The stub's 503 is what comes back. Fails if page health is
+    /// refused whatever the tenants say.
+    #[tokio::test]
+    async fn page_health_reaches_the_loopback_api_once_every_bound_tenant_permits() {
+        use crate::egress::test_support::{fake_bound_tenants, pin_for};
+        let tenant = uuid::Uuid::from_u128(DASHBOARD_TENANT);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _bound = fake_bound_tenants(vec![tenant]);
+        let _permit = pin_for(Flow::TerminalStream, tenant, Level::On);
+        let counter = crate::egress::test_support::ConnCounter::start();
+
+        let reply = relay_http_to_base(
+            &counter.http_base(),
+            &dashboard_frame("POST", "/ui-bridge/control/page-health"),
+        )
+        .await;
+        assert_eq!(
+            reply["status"], 503,
+            "the loopback stub's own answer: {reply}"
+        );
+        assert!(counter.wait_for(1, Duration::from_secs(5)) >= 1);
+    }
+
+    /// The component read consults no egress flow at all: with every flow
+    /// pinned off, both flow-wide and for the bound tenant, it still reaches
+    /// the loopback API, and the stub's 503 is what comes back. Fails if the
+    /// component route joins the egress match (a 409), or leaves
+    /// `RELAY_ALLOWED` (a 403).
+    #[tokio::test]
+    async fn the_component_read_consults_no_egress_flow() {
+        use crate::egress::test_support::{fake_bound_tenants, pin_for};
+        let tenant = uuid::Uuid::from_u128(DASHBOARD_TENANT);
+        let _bound = fake_bound_tenants(vec![tenant]);
+        let _flow_pins: Vec<_> = Flow::ALL.into_iter().map(|f| pin(f, Level::Off)).collect();
+        let _tenant_pins: Vec<_> = Flow::ALL
+            .into_iter()
+            .map(|f| pin_for(f, tenant, Level::Off))
+            .collect();
+        let counter = crate::egress::test_support::ConnCounter::start();
+
+        let reply = relay_http_to_base(
+            &counter.http_base(),
+            &dashboard_frame("GET", "/ui-bridge/control/components"),
+        )
+        .await;
+        assert_eq!(
+            reply["status"], 503,
+            "the loopback stub's own answer: {reply}"
+        );
+        assert!(counter.wait_for(1, Duration::from_secs(5)) >= 1);
     }
 
     /// Re-review m5: a recognised record carrying NO run id is unattributable
