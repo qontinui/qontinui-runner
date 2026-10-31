@@ -39,6 +39,12 @@ const DIR = subjectDir(import.meta.url);
 const SOURCE = readFileSync(`${DIR}FleetSessionPicker.tsx`, "utf8");
 const HOOK = readFileSync(`${DIR}useFleetSessions.ts`, "utf8");
 const DISCOVERY = readFileSync(`${DIR}fleetDiscovery.ts`, "utf8");
+/** One tenant's walk, lifted out of the hook in Phase 4. Its RULES are
+ * asserted behaviourally in `fleetWalker.test.ts`; the pins here are only the
+ * wiring between it and the hook. */
+const WALKER = readFileSync(`${DIR}fleetWalker.ts`, "utf8");
+/** The selector itself — the component that owns the `<select>`'s `onChange`. */
+const TENANT_SELECT = readFileSync(`${DIR}FleetTenantSelect.tsx`, "utf8");
 
 /**
  * The same source with its comments removed.
@@ -108,7 +114,14 @@ describe("everything said ABOUT the loaded rows is said with the query they came
     // the response itself, so there is no parameter a caller could hand the
     // wrong value to. `sessions` is the hook's accumulation for that same
     // response — both move in one tick.
-    expect(SOURCE).toContain("fleetTruncation(response, sessions.length, hasMore)");
+    //
+    // Phase 4: classified per WALK inside the hook and folded over the union —
+    // each walk by its own envelope, its own accumulation, and its own cursor —
+    // so the picker can no longer pair one walk's envelope with the union.
+    expect(HOOK).toContain("truncation: fleetUnionTruncation(");
+    expect(HOOK).toContain("loaded: w.walk.sessions.length,");
+    expect(SOURCE).toContain("    truncation,\n");
+    expect(codeOf(SOURCE)).not.toContain("fleetTruncation(");
     expect(SOURCE).not.toContain("fleetTruncation(response, server.limit");
     expect(SOURCE).not.toContain("fleetTruncation(response, appliedQuery");
     // And never on the ENVELOPE's cursor, which is the pair that diverges the
@@ -141,7 +154,14 @@ describe("everything said ABOUT the loaded rows is said with the query they came
     // tenant, a default, the device's binding — which is exactly the read that
     // produced the 2026-09-28 false report: a correct, empty read of a
     // DIFFERENT tenant than the one holding 200 sessions.
-    expect(emptyReadArgs()[2]).toBe("response?.tenantId ?? null");
+    //
+    // Phase 4: the argument is the hook's `readTenants` — the tenant(s) whose
+    // walks ANSWERED, each by the tenant its rows were served under, plus the
+    // ones whose read FAILED — so a merged empty page cannot claim a tenant it
+    // never read.
+    expect(emptyReadArgs()[2]).toBe("readTenants");
+    expect(HOOK).toContain(".map((w) => servedTenantOf(w.response, w.requestedTenant)),");
+    expect(HOOK).toContain("failed: walks.filter(walkFailed).map((w) => w.requestedTenant),");
   });
 
   it("takes completeness from coord's POSITIVE signal, not from the walk's silence", () => {
@@ -185,7 +205,8 @@ describe("everything said ABOUT the loaded rows is said with the query they came
     const end = assertAnchored(code, "data-fleet-pending-include-closed=", start);
     const block = code.slice(start, end);
     expect(block).toContain("data-ui-bridge-id={FLEET_PICKER_ROOT_ID}");
-    expect(block).toContain('data-fleet-tenant={response?.tenantId ?? ""}');
+    expect(block).toContain('data-fleet-tenant={servedTenants.join(",")}');
+    expect(block).toContain("data-fleet-tenant-failed=");
   });
 
   it("does not print an UNSCOPED count beside the scoped message", () => {
@@ -207,7 +228,13 @@ describe("everything said ABOUT the loaded rows is said with the query they came
     // "not-loaded" whenever `response` is null, so the null-tenant arm can
     // never actually render — the reachable unknown-tenant case is coord's
     // untyped envelope, not a first paint.
-    expect(codeOf(SOURCE)).toContain('emptyReason !== "observed-empty"');
+    //
+    // Phase 4 adds `partial` (some tenants answered empty, others failed),
+    // which licenses the message only because `readTenants` makes it name the
+    // failed tenants — see `fleetEmptyReadMessage`.
+    expect(codeOf(SOURCE)).toContain(
+      'emptyReason !== "observed-empty" && emptyReason !== "partial"',
+    );
   });
 
   // NOT COVERED HERE, and stated rather than implied: nothing asserts that the
@@ -244,16 +271,17 @@ describe("everything said ABOUT the loaded rows is said with the query they came
   });
 
   it("publishes the applied query in the SAME tick as the response it belongs to", () => {
-    // The pairing the sibling review established. `setAppliedQuery` sits in the
-    // success branch beside `setResponse`, never in an effect over `response`
-    // — an effect would publish the PREVIOUS response's rows under the NEW
-    // query for one render, which is exactly the false claim it exists to stop.
-    const from = assertAnchored(HOOK, "setResponse(result)");
-    const setAt = assertAnchored(HOOK, "setAppliedQuery({", from);
-    const catchAt = assertAnchored(HOOK, "} catch", from);
+    // The pairing the sibling review established: the applied query is written
+    // in the SAME snapshot update as the response, never by an effect over it —
+    // an effect would publish the PREVIOUS response's rows under the NEW query
+    // for one render. Behaviourally asserted in `fleetWalker.test.ts`; pinned
+    // here so the update cannot be split without this failing.
+    const from = assertAnchored(WALKER, "response: result,");
+    const setAt = assertAnchored(WALKER, "appliedQuery: {", from);
+    const catchAt = assertAnchored(WALKER, "} catch", from);
     expect(setAt).toBeLessThan(catchAt);
     for (const effect of callsOf(codeOf(HOOK), "useEffect(")) {
-      expect(effect).not.toContain("setAppliedQuery");
+      expect(effect).not.toContain("appliedQuery");
     }
   });
 });
@@ -268,6 +296,7 @@ describe("the retired `truncated` contract is gone from every layer", () => {
       ["FleetSessionPicker.tsx", SOURCE],
       ["useFleetSessions.ts", HOOK],
       ["fleetDiscovery.ts", DISCOVERY],
+      ["fleetWalker.ts", WALKER],
     ] as const) {
       const code = codeOf(text);
       expect(code, name).not.toMatch(/\.truncated\b/);
@@ -283,6 +312,7 @@ describe("the retired `truncated` contract is gone from every layer", () => {
       expect(codeOf(DISCOVERY), gone).not.toContain(gone);
       expect(codeOf(SOURCE), gone).not.toContain(gone);
       expect(codeOf(HOOK), gone).not.toContain(gone);
+      expect(codeOf(WALKER), gone).not.toContain(gone);
     }
   });
 
@@ -297,45 +327,39 @@ describe("the retired `truncated` contract is gone from every layer", () => {
 });
 
 describe("the walk sends the cursor, and only within its own scope", () => {
-  it("puts the cursor on the wire beside the three scope parameters", () => {
+  // The walk's RULES — no cursor on a restart, none invented on an advance, a
+  // superseded page discarded, a scope mismatch restarted silently — are
+  // behaviour of `FleetTenantWalker` and are asserted against a fake coord in
+  // `fleetWalker.test.ts`. What only a source read can pin is the wiring to the
+  // real command.
+  it("puts the cursor on the wire beside the scope parameters and the tenant", () => {
     expect(HOOK).toContain('invoke<FleetSessionsResponse>("fleet_sessions_list"');
-    expect(HOOK).toContain("args: { deviceId, state, includeClosed, limit, cursor }");
+    // `tenant` is the Rust arg name (`FleetSessionsArgs.tenant`); a misspelled
+    // key is dropped by serde in silence and the read runs under the default.
+    for (const arg of [
+      "deviceId: req.deviceId,",
+      "state: req.state,",
+      "includeClosed: req.includeClosed,",
+      "limit: req.limit,",
+      "cursor: req.cursor,",
+      "tenant: req.tenant,",
+    ]) {
+      expect(HOOK, arg).toContain(arg);
+    }
+    expect(HOOK).toContain("fetchPage: invokeFleetPage,");
   });
 
-  it("sends a cursor ONLY when advancing, never on a restart", () => {
-    // An empty `cursor` is page one to coord rather than an error, so a restart
-    // that sent a stale one would silently walk the previous scope.
-    expect(HOOK).toContain('const cursor = mode === "more" ? cursorRef.current : null;');
-    expect(HOOK).toContain('if (mode === "restart") cursorRef.current = null;');
+  it("builds a NEW walker per scope and disposes the old ones", () => {
+    // A response still in flight for the previous scope must be discarded,
+    // not merged; disposal is what makes it so.
+    expect(HOOK).toContain("new FleetTenantWalker({");
+    expect(HOOK).toContain("for (const w of walkers) w.dispose();");
   });
 
-  it("refuses to 'advance' with no cursor instead of re-reading page one", () => {
-    expect(HOOK).toContain('if (mode === "more" && cursor === null) return;');
-  });
-
-  it("restarts on a scope mismatch and shows the operator nothing", () => {
-    // Changing a filter mid-walk is ordinary use. The restart goes through a
-    // token the single effect watches, so no second effect is added and the
-    // cursor is dropped before the new page one is asked for.
-    expect(HOOK).toContain("if (fleetErrorIsRestart(code)) {");
-    expect(HOOK).toContain("setRestartToken((t) => t + 1);");
-    const branchStart = assertAnchored(HOOK, "if (fleetErrorIsRestart(code)) {");
-    const branchEnd = assertAnchored(HOOK, "if (fleetErrorInvalidatesCursor(code)) {", branchStart);
-    const branch = HOOK.slice(branchStart, branchEnd);
-    expect(branch).toContain("cursorRef.current = null;");
-    // No error is published on this path — `return` precedes the setError below.
-    expect(branch).not.toContain("setError(");
-  });
-
-  it("discards a response whose scope has been superseded rather than merging it", () => {
-    // Without this a page from the previous scope lands in the new scope's
-    // accumulation, and the count beside the filters describes neither query.
-    expect(HOOK).toContain("if (generationRef.current !== generation) return;");
-  });
-
-  it("keeps `loadMore` off a stale closure by reading the cursor from a ref", () => {
-    expect(HOOK).toContain("const cursorRef = useRef<string | null>(null);");
-    expect(HOOK).toContain('const loadMore = useCallback(() => fetchPage("more"), [fetchPage]);');
+  it("advances only walks that hold a cursor", () => {
+    expect(HOOK).toContain(
+      "await Promise.all(walkersRef.current.filter((w) => w.canAdvance).map((w) => w.loadMore()));",
+    );
   });
 });
 
@@ -403,10 +427,10 @@ describe("a page in flight never makes a true list read as a stale one", () => {
  * whole phase exists to remove rather than a cosmetic one.
  */
 describe("a dropped cursor removes the control, and does not claim completeness", () => {
-  it("reads the WALK's answer, which the hook exports for this", () => {
-    expect(HOOK).toContain("hasMore: walk.nextCursor !== null,");
-    expect(SOURCE).toContain("hasMore,");
-    expect(SOURCE).toContain("fleetTruncation(response, sessions.length, hasMore)");
+  it("reads each WALK's answer, never the envelope's cursor", () => {
+    expect(HOOK).toContain("canAdvance: w.walk.nextCursor !== null,");
+    expect(HOOK).toContain("hasMore: walks.some((w) => w.walk.nextCursor !== null),");
+    expect(codeOf(HOOK)).not.toContain("response.nextCursor");
   });
 
   it("invokes `loadMore` from exactly ONE place, inside the `more-available` guard", () => {
@@ -482,14 +506,17 @@ describe("a dropped cursor removes the control, and does not claim completeness"
  * every accumulated page is discarded and re-fetched.
  */
 describe("the restart trigger is the SCOPE, not the callback's identity", () => {
-  it("names the scope explicitly in the restart trigger", () => {
-    // Not because `fetchPage`'s identity is wrong — the two move together — but
-    // so the trigger SAYS what it is. Keying only on a callback's identity makes
-    // the trigger an implicit consequence of that callback's dependency list,
-    // which is exactly how `limit` got in.
-    expect(HOOK).toContain("const scopeKey = fleetScopeKey({ deviceId, state, includeClosed });");
-    expect(HOOK).toContain("}, [fetchPage, scopeKey, restartToken]);");
-    // And it needs no suppression: both are real dependencies of the effect.
+  it("names the scope explicitly in the restart trigger — every tenant's cursor scope", () => {
+    // The trigger SAYS what it is: one cursor scope per walked tenant. Keying
+    // on a callback's identity made the trigger an implicit consequence of that
+    // callback's dependency list, which is exactly how `limit` once got in.
+    expect(HOOK).toContain(
+      "tenants.map((tenantId) => fleetScopeKey({ deviceId, state, includeClosed, tenantId })),",
+    );
+    expect(HOOK).toContain(
+      "}, [scopeKey, tenantsKey, deviceId, state, includeClosed, publish, acceptRows]);",
+    );
+    // And it needs no suppression: every entry is a real dependency.
     expect(HOOK).not.toContain("eslint-disable-next-line react-hooks/exhaustive-deps");
   });
 
@@ -498,25 +525,28 @@ describe("the restart trigger is the SCOPE, not the callback's identity", () => 
     // the page size and the scope together fetches page one at the OLD size —
     // silently, and only in that one case.
     expect(assertAnchored(HOOK, "limitRef.current = limit;")).toBeLessThan(
-      assertAnchored(HOOK, 'void fetchPage("restart");'),
+      assertAnchored(HOOK, "for (const w of walkers) void w.restart();"),
     );
   });
 
   it("keeps `limit` out of the dependency list that restarts the walk", () => {
-    expect(HOOK).toContain("[deviceId, state, includeClosed],");
-    expect(HOOK).not.toContain("[deviceId, state, includeClosed, limit],");
+    expect(HOOK).not.toMatch(/\[scopeKey,[^\]]*\blimit\b[^\]]*\]\);/);
   });
 
   it("reads the page size through a ref so the next page uses the new one", () => {
-    // Out of the dep list, but still current at the moment of the call — the
-    // same reason `cursorRef` exists.
+    // Out of the dep list, but still current at the moment of the call.
     expect(HOOK).toContain("const limitRef = useRef(limit);");
-    expect(HOOK).toContain("const limit = limitRef.current;");
+    expect(HOOK).toContain("pageSize: () => limitRef.current,");
+    expect(WALKER).toContain("const limit = this.opts.pageSize();");
   });
 
   it("leaves `limit` out of the scope fingerprint itself", () => {
-    expect(DISCOVERY).toContain(
-      "return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed]);",
+    // `sessionStatus` joined the fingerprint with coord's Phase 4 filter (plan
+    // `2026-09-30-close-remote-sessions-from-the-local-runner`); `limit` still
+    // stays out.
+    const fingerprint = /return JSON\.stringify\(\[([^\]]*)\]\);/.exec(codeOf(DISCOVERY))?.[1];
+    expect(fingerprint?.replace(/\s+/g, " ").trim()).toBe(
+      "scope.deviceId, scope.state, scope.includeClosed, scope.tenantId, scope.sessionStatus ?? null,",
     );
   });
 });
@@ -566,5 +596,143 @@ describe("the 'tab open on this page' notices follow the live tab list", () => {
     expect(code).toMatch(/openedTabStillOpen\(state\.openedId, tabs\)/);
     expect(code).not.toMatch(/\{\s*row\?\.openedId\s*&&/);
     expect(code).not.toMatch(/if \(state\.openedId\)/);
+  });
+});
+
+/**
+ * The Fleet view's tenant (plan
+ * `2026-09-29-fleet-view-reads-one-unchosen-tenant-so-a-multi-bound-device-sees-a-fraction-of-its-fleet`,
+ * Phase 3). coord scopes the read to the PRESENTED credential's tenant, so the
+ * tenant is chosen here, stays view-local, and follows a row into its attach.
+ */
+describe("the tenant selector reads, and attaches, the tenant it names", () => {
+  it("restarts the walk on a tenant change — the tenant is in every walk's scope", () => {
+    expect(HOOK).toContain("fleetScopeKey({ deviceId, state, includeClosed, tenantId })");
+  });
+
+  it("hands the selection to the hook and never to set_active_tenant", () => {
+    expect(SOURCE).toContain("tenants: walkTenants,");
+    expect(SOURCE).toContain("fleetWalkTenants(fleetTenant, tenantCandidates)");
+    // Moving the device default for new sessions is not this view's to do —
+    // neither in the picker nor in the selector whose `onChange` it hands down.
+    for (const [name, text] of [
+      ["FleetSessionPicker.tsx", SOURCE],
+      ["FleetTenantSelect.tsx", TENANT_SELECT],
+    ] as const) {
+      expect(codeOf(text), name).not.toContain("set_active_tenant");
+      expect(codeOf(text), name).not.toContain("setDefaultTenantForNewSessions");
+    }
+  });
+
+  it("opens on the policy default until the operator picks — derived, not written by an effect", () => {
+    // `resolveFleetTenantChoice` falls back to `defaultFleetTenantChoice` both
+    // before a pick and after a picked tenant stops being bound.
+    const code = codeOf(SOURCE);
+    expect(code).toContain(
+      "resolveFleetTenantChoice(\n    fleetTenantPick,\n    tenantPin,\n    tenantCandidates,",
+    );
+    // A pick that resolved stale is consumed with its device filter, in render.
+    expect(code).toContain(
+      "if (fleetTenantPick !== undefined && fleetTenant !== fleetTenantPick) {\n    setFleetTenantPick(undefined);\n    setServer((s) => ({ ...s, deviceId: null }));",
+    );
+    // No effect writes the pick: an effect would publish one render under the
+    // stale choice first. Scanned per call, so a pick written in render (above)
+    // or in a handler does not trip it.
+    for (const effect of callsOf(code, "useEffect(")) {
+      expect(effect).not.toContain("setFleetTenantPick");
+    }
+  });
+
+  it("projects the requested tenant beside the one(s) that answered", () => {
+    expect(SOURCE).toContain('data-fleet-tenant={servedTenants.join(",")}');
+    expect(SOURCE).toContain(
+      'data-fleet-tenant-requested={allTenants ? FLEET_TENANT_ALL_VALUE : (fleetTenant ?? "")}',
+    );
+    expect(SOURCE).toContain('data-fleet-row-tenant={s.servedTenantId ?? ""}');
+  });
+
+  it("mints attach and create grants under the tenant the ROW's or GROUP's own walk presented", () => {
+    // Never the selection — in a merged view that is every tenant, and between
+    // a switch and its answer the rows still belong to the previous one.
+    // The mint tenant is the one the row's own walk PRESENTED (`mintTenantOf`):
+    // null for a read that named none, so a single-tenant device mints exactly
+    // as before the selector.
+    expect(SOURCE).toContain("tenant: s.mintTenantId ?? null,");
+    // Every group create call — the button AND its retry — names the group's
+    // mint tenant; a third spelling (the selection, a literal null) is a
+    // second call site this count refuses.
+    const code = codeOf(SOURCE);
+    expect(code).toContain(
+      "onCreate={() => createRemote(groupKey, g.deviceId, g.label, g.mintTenantId)}",
+    );
+    expect(code).toContain(
+      "onRetry={() => void createRemote(groupKey, g.deviceId, g.label, g.mintTenantId)}",
+    );
+    expect(code.match(/createRemote\(\s*groupKey\s*,/g)?.length).toBe(2);
+    expect(code).toContain(
+      "singleTenant: merged ? null : mintTenantOf(walks[0]?.requestedTenant ?? null),",
+    );
+    expect(codeOf(SOURCE)).not.toContain("tenant: s.servedTenantId");
+    expect(codeOf(SOURCE)).not.toContain("g.label, g.tenantId)");
+    expect(codeOf(SOURCE)).not.toMatch(/tenant: fleetTenant/);
+    expect(codeOf(SOURCE)).not.toContain("rowsTenant");
+  });
+});
+
+/**
+ * The merged multi-tenant view (Phase 4). The union's honesty rules are pure
+ * and asserted in `fleetWalker.test.ts`; these pin the picker's use of them.
+ */
+describe("the merged view shows every tenant's rows and every tenant's failure", () => {
+  it("renders the per-tenant error strip in the merged view only", () => {
+    expect(SOURCE).toContain("{merged && failures.length > 0 && (");
+    expect(SOURCE).toContain("data-ui-bridge-id={fleetTenantErrorId(f.requestedTenant)}");
+    expect(SOURCE).toContain("onClick={() => void refreshTenant(f.requestedTenant)}");
+  });
+
+  it("groups a merged read by device AND tenant", () => {
+    expect(SOURCE.replace(/\s+/g, " ")).toContain(
+      "groupByDevice( visible.filter((s) => !endedHere.has(s.sessionId)), { byTenant: merged }, )",
+    );
+  });
+
+  it("reads a row's degraded flags off its OWN tenant's envelope", () => {
+    // Both the attach button and the end button read the row's OWN walk's flag.
+    expect(SOURCE.replace(/\s+/g, " ")).toContain(
+      "envelopes.get( s.servedTenantId ?? null, )?.deviceIdentityColumnsPresent;",
+    );
+    expect(SOURCE).toContain("endButtonState(s, rowColumnsPresent)");
+  });
+
+  it("ends a row, and bulk-ends, under the tenant the ROW was listed under", () => {
+    // coord resolves the session within the presented principal's tenant only:
+    // an end minted under the selection or the default slot is a 404 in a
+    // merged view. The finished read is also one walk per walked tenant.
+    // Anchored to each call: the string also appears in the attach call, so a
+    // bare `toContain` would pass with the End button's target missing it.
+    const src = SOURCE.replace(/\s+/g, " ");
+    expect(src).toMatch(/setEndTarget\(\{[^}]*tenant: s\.mintTenantId \?\? null,[^}]*\}\)/);
+    expect(src).toMatch(
+      /items: candidates\.map\(\(s\) => \(\{[^}]*tenant: s\.mintTenantId \?\? null,/,
+    );
+    expect(SOURCE).toContain("useFinishedFleetSessions(walkTenants)");
+  });
+
+  it("offers the empty state's create PER answered tenant in a merged read, never an unchosen default", () => {
+    // The pure rule is asserted in `remoteCreate.test.ts`; this pins that the
+    // picker feeds it the ANSWERED tenants and mints under each target's own.
+    expect(SOURCE).toContain("answeredTenants: readTenants.answered,");
+    expect(SOURCE).toContain("onCreate={() => createRemote(key, pinned, label, t.tenant)}");
+    expect(SOURCE).toContain("tenantLabel={t.tenantLabel}");
+    expect(SOURCE).toContain("blockedReason={emptyCreate.disabledReason}");
+    // The retired form: a merged read sent NO tenant, so the runner's authority
+    // order picked one the operator never chose.
+    expect(codeOf(SOURCE)).not.toContain("emptyCreateTenant");
+    expect(codeOf(SOURCE)).not.toMatch(/merged \? null : \(servedTenants\[0\]/);
+  });
+
+  it("counts devices, not groups, and names the tenant count of a merged read", () => {
+    expect(SOURCE).toContain("devices: devicesShown,");
+    expect(SOURCE).toContain("tenants: merged ? servedTenants.length : undefined,");
   });
 });

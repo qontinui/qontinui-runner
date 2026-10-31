@@ -8,7 +8,7 @@
 import { useEffect, useState } from "react";
 import { Users, RefreshCw } from "lucide-react";
 import { getAccentColors } from "@/design-system";
-import { getApiPort } from "@/lib/runner-api";
+import { getApiPort, runnerBaseForPort } from "@/lib/runner-api";
 import type { AccountUsageInfo } from "../settings/types";
 
 export function AccountUsageCard() {
@@ -19,7 +19,7 @@ export function AccountUsageCard() {
     setLoading(true);
     try {
       const port = getApiPort();
-      const res = await fetch(`http://localhost:${port}/analytics/account-usage`);
+      const res = await fetch(`${runnerBaseForPort(port)}/analytics/account-usage`);
       if (res.ok) {
         const json = await res.json();
         setAccounts(json.data ?? []);

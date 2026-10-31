@@ -283,7 +283,7 @@ The API is localhost-only (same as REST), so CORS is permissive. Security comes 
     {
       id: "graphiql",
       title: "GraphiQL Playground",
-      content: `In development mode, navigate to **http://localhost:9876/graphql** in your browser to access the **GraphiQL IDE**.
+      content: `In development mode, navigate to **http://127.0.0.1:9876/graphql** in your browser to access the **GraphiQL IDE**.
 
 The playground provides:
 - **Query editor** with syntax highlighting and autocomplete

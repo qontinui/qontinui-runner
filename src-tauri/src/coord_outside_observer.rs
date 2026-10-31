@@ -1319,6 +1319,16 @@ pub struct ObserverState {
     /// Workers already reported dead in the current episode. A worker that
     /// recovers is dropped, so a second death is reported again.
     dead_notified: BTreeSet<String>,
+    /// Classes whose NOTIFIED episode ended since the last
+    /// [`Self::take_cleared`] — the faults the operator was shown a card for
+    /// and that this observer has now seen settle. A latch that never fired
+    /// clears nothing: the operator was never told about it.
+    ///
+    /// Before this existed the latches re-armed silently, so the frontend's
+    /// card (or its dismissed residual) could never learn the fault was over
+    /// (plan `2026-10-22-runner-terminal-overlays-cover-zone-content-and-controls`
+    /// Phase 1.3).
+    cleared: Vec<FaultClass>,
 }
 
 impl ObserverState {
@@ -1360,19 +1370,34 @@ impl ObserverState {
         out
     }
 
+    /// Drain the classes whose notified episode ended — each becomes one
+    /// `error-cleared` event for that class's `error_code`.
+    pub fn take_cleared(&mut self) -> Vec<FaultClass> {
+        std::mem::take(&mut self.cleared)
+    }
+
     fn clear_unreachable(&mut self) {
+        if self.unreachable_notified {
+            self.cleared.push(FaultClass::Unreachable);
+        }
         self.unreachable_streak = 0;
         self.unreachable_notified = false;
         self.unreachable_since = None;
     }
 
     fn clear_unobserved(&mut self) {
+        if self.unobserved_notified {
+            self.cleared.push(FaultClass::LivenessUnknown);
+        }
         self.unobserved_streak = 0;
         self.unobserved_notified = false;
         self.unobserved_since = None;
     }
 
     fn clear_leaderless(&mut self) {
+        if self.leaderless_notified {
+            self.cleared.push(FaultClass::NoLeader);
+        }
         self.leaderless_streak = 0;
         self.leaderless_probes = 0;
         self.leaderless_notified = false;
@@ -1496,8 +1521,15 @@ impl ObserverState {
             .chain(read.rolled_off_excluded.iter().map(String::as_str))
             .collect();
         // Re-arm anything that recovered, so a second death pages again.
+        let had_dead = !self.dead_notified.is_empty();
         self.dead_notified
             .retain(|n| still_judged.contains(n.as_str()));
+        // Every reported death recovered: the card's code is clear. (One
+        // `error_code` covers every worker, so it clears only when none of
+        // the reported workers is still judged dead.)
+        if had_dead && self.dead_notified.is_empty() {
+            self.cleared.push(FaultClass::WorkerDead);
+        }
 
         let mut out = Vec::new();
         for worker in &read.dead_leader_gated {
@@ -1827,6 +1859,25 @@ fn surface(app: Option<&tauri::AppHandle>, report: &Report) {
     // turn that into a second failure. The incident line above is already on
     // disk either way.
     let _ = crate::error::emit_user_facing_error(app, &err);
+}
+
+/// Tell the operator surface that a fault it was shown a card for has been
+/// observed over. The durable incident line records the recovery too, so the
+/// log reads as an episode rather than an unterminated alarm.
+fn surface_cleared(app: Option<&tauri::AppHandle>, class: FaultClass) {
+    info!(
+        class = class.breadcrumb_reason(),
+        "coord outside observer: {} — observed cleared",
+        class.title()
+    );
+    crate::health_monitor::append_wedge_incident(
+        class.breadcrumb_reason(),
+        &format!("{} — observed cleared", class.title()),
+    );
+    let Some(app) = app else {
+        return;
+    };
+    let _ = crate::error::emit_user_facing_error_cleared(app, class.error_code());
 }
 
 /// The finding's title: the report's one-line claim, bounded to coord's
@@ -2431,13 +2482,19 @@ impl CoordOutsideObserver {
             }
         }
         let coord_answered = !matches!(outcome, ProbeOutcome::Unreachable { .. });
-        let reports = {
+        let (reports, cleared) = {
             let mut guard = match self.state.lock() {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            guard.observe(&outcome)
+            let reports = guard.observe(&outcome);
+            (reports, guard.take_cleared())
         };
+        // Clears first: a read that ends one episode and opens another in the
+        // same class must leave the NEW card standing, not clear it.
+        for class in &cleared {
+            surface_cleared(app, *class);
+        }
         for report in &reports {
             surface(app, report);
             // The write is gated on coord having ANSWERED this cycle, not on
@@ -3066,6 +3123,85 @@ mod tests {
             1,
             "the streak restarts from zero after a healthy read"
         );
+    }
+
+    // ── observed clears (plan 2026-10-22-runner-terminal-overlays-…, 1.3) ──
+
+    #[test]
+    fn a_notified_no_leader_episode_ended_by_a_settling_read_yields_exactly_one_clear() {
+        let dark = ledger_body(0, json!([no_leader_row("gate_evaluation_sweep")]));
+        let clean = ledger_body(0, json!([]));
+        let mut state = ObserverState::default();
+        for _ in 0..3 {
+            state.observe(&classify_ledger(&dark));
+        }
+        assert_eq!(state.take_cleared(), Vec::<FaultClass>::new(), "still dark");
+        state.observe(&classify_ledger(&clean));
+        assert_eq!(state.take_cleared(), vec![FaultClass::NoLeader]);
+        state.observe(&classify_ledger(&clean));
+        assert_eq!(
+            state.take_cleared(),
+            Vec::<FaultClass>::new(),
+            "a clear is reported once per episode, not once per healthy read"
+        );
+    }
+
+    #[test]
+    fn an_episode_that_never_notified_clears_nothing() {
+        let dark = ledger_body(0, json!([no_leader_row("gate_evaluation_sweep")]));
+        let clean = ledger_body(0, json!([]));
+        let mut state = ObserverState::default();
+        // Two dark probes: below the cadence, so no card was ever shown.
+        state.observe(&classify_ledger(&dark));
+        state.observe(&classify_ledger(&dark));
+        state.observe(&classify_ledger(&clean));
+        assert_eq!(state.take_cleared(), Vec::<FaultClass>::new());
+    }
+
+    #[test]
+    fn a_recovered_dead_worker_and_a_returned_coord_each_clear_their_code() {
+        let dead = ledger_body(
+            1,
+            json!([dead_row("merge_scheduler.dispatch", true, false)]),
+        );
+        let clean = ledger_body(0, json!([]));
+        let mut state = ObserverState::default();
+        state.observe(&classify_ledger(&dead));
+        state.observe(&classify_ledger(&clean));
+        assert_eq!(state.take_cleared(), vec![FaultClass::WorkerDead]);
+
+        let down = ProbeOutcome::Unreachable {
+            reason: "connection refused".into(),
+        };
+        for _ in 0..3 {
+            state.observe(&down);
+        }
+        state.take_cleared();
+        state.observe(&classify_ledger(&clean));
+        let cleared = state.take_cleared();
+        assert!(
+            cleared.contains(&FaultClass::Unreachable),
+            "coord answering again clears the unreachable card: {cleared:?}"
+        );
+    }
+
+    #[test]
+    fn one_dead_worker_recovering_as_another_dies_clears_once_and_reports_the_new_death() {
+        let a_dead = ledger_body(
+            1,
+            json!([dead_row("merge_scheduler.dispatch", true, false)]),
+        );
+        let b_dead = ledger_body(1, json!([dead_row("gate_evaluation_sweep", true, false)]));
+        let mut state = ObserverState::default();
+        state.observe(&classify_ledger(&a_dead));
+        state.take_cleared();
+        // Same read: A recovered, B died. The caller emits the clear FIRST and
+        // the report after it, so B's card is the one left standing.
+        let reports = state.observe(&classify_ledger(&b_dead));
+        assert_eq!(state.take_cleared(), vec![FaultClass::WorkerDead]);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].class, FaultClass::WorkerDead);
+        assert_eq!(reports[0].worker.as_deref(), Some("gate_evaluation_sweep"));
     }
 
     #[test]
