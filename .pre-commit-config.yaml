@@ -117,6 +117,20 @@ repos:
         files: '^\.pre-commit-hooks/(lib/gen-events-attribution\.sh|gen-events-drift-attribution-test\.sh|gen-events-drift\.sh|gen-events-path-deps-check\.sh)$'
         pass_filenames: false
 
+      # How the drift hook finds the repo root. The commit-sourced pre-push shim
+      # may run it from an EXTRACTED copy of .pre-commit-hooks/, where
+      # "$SCRIPT_DIR/.." is a temp dir; a root derived from there makes the hook
+      # report CANNOT EVALUATE and check nothing. Cheap: throwaway dirs only.
+      - id: gen-events-drift-root-test
+        name: gen-events drift — repo-root resolution tests
+        entry: bash .pre-commit-hooks/gen-events-drift-root-test.sh
+        language: system
+        files: '^\.pre-commit-hooks/(gen-events-drift\.sh|gen-events-drift-root-test\.sh)$'
+        pass_filenames: false
+        # pre-commit only: adding a pre-push id would change the armed stage's id
+        # set, which install-repo-git-hooks.sh --check reports as DRIFT.
+        stages: [pre-commit]
+
       # Every in-repo path dependency of the export build must be an attribution
       # input, or an edit to that crate clears a guilty pusher (two crates were
       # once missing). What can break that is a MANIFEST edit, so this runs on
@@ -200,9 +214,13 @@ repos:
       # shared cargo target instead of a cold per-worktree one. It also covers
       # `generate_types.sh`'s QONTINUI_SCHEMAS_JSON override, which is what keeps
       # the now-shared target from becoming a collision point between two
-      # concurrent pushes — so that script is on the trigger list too.
+      # concurrent pushes — so that script is on the trigger list too. Since plan
+      # 2026-10-29-runner-prepush-gate-builds-the-shared-target-without-the-tree-lock
+      # it also pins the tree-lock guard against the REAL
+      # qontinui-claude-config library (an arm that SKIPS, saying so, where that
+      # repo is absent); the hook-level guard arms live in push-range-test.
       - id: shared-target-test
-        name: shared cargo target resolution — tests
+        name: shared cargo target resolution + tree lock — tests
         entry: bash .pre-commit-hooks/shared-target-test.sh
         language: system
         stages: [pre-commit]
