@@ -3563,6 +3563,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_flow_reset,
             commands::terminal::terminal_get_bracketed_paste,
             commands::terminal::terminal_probe_claude,
+            commands::terminal::terminal_probe_claude_many,
             commands::terminal::terminal_get_grid,
             commands::terminal::terminal_get_saved_scrollback,
             commands::terminal::terminal_get_scrollback,

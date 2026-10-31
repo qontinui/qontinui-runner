@@ -849,6 +849,58 @@ pub fn terminal_grid_text(
     })
 }
 
+/// [`terminal_probe_claude`]'s `state` for many panes from ONE process
+/// snapshot — the "Keep AI" button's check before it closes any window it
+/// believes is a plain shell. One snapshot is one WMI query on Windows, so N
+/// single probes would be N concurrent `Get-CimInstance` processes.
+///
+/// Returns `{ states: { terminal_id -> "live" | "absent" | "remote" |
+/// "unknown" } }`. A terminal this manager does not hold is `unknown`, and so
+/// is every local pane when the table could not be read. No session ids are
+/// parsed: the caller only needs presence.
+#[tauri::command]
+pub async fn terminal_probe_claude_many(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    terminal_ids: Vec<String>,
+) -> Result<CommandResponse, String> {
+    use crate::terminal::graceful_exit::{probe_from_snapshot, ClaudeProbe};
+
+    // `None` = not held here, `Some(None)` = held but no local pid (remote).
+    let roots: Vec<(String, Option<Option<u32>>)> = terminal_ids
+        .into_iter()
+        .map(|id| {
+            let root = terminal_manager.get(&id).map(|s| s.child_pid());
+            (id, root)
+        })
+        .collect();
+    let needs_table = roots.iter().any(|(_, r)| matches!(r, Some(Some(_))));
+    let snapshot = if needs_table {
+        crate::process_capture::process_tree::snapshot_process_table_public().await
+    } else {
+        Default::default()
+    };
+
+    let mut states = serde_json::Map::new();
+    for (id, root) in roots {
+        let state = match root {
+            None => "unknown",
+            Some(None) => "remote",
+            Some(Some(pid)) => match probe_from_snapshot(pid, &snapshot, &[]) {
+                ClaudeProbe::Readable(p) if p.subtree_claude.is_empty() => "absent",
+                ClaudeProbe::Readable(_) => "live",
+                ClaudeProbe::Unreadable(_) => "unknown",
+            },
+        };
+        states.insert(id, serde_json::Value::String(state.to_string()));
+    }
+
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({ "states": serde_json::Value::Object(states) })),
+    })
+}
+
 /// Search the rendered grid of one terminal for a substring or regex.
 ///
 /// `regex=true` compiles the needle as a regex; `regex=false` is a
