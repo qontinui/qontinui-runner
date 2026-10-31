@@ -245,6 +245,7 @@ fi
 user_chose_session=0
 for a in "$@"; do
   case "$a" in
+    --) break ;;
     --session-id|--session-id=*|--resume|--resume=*|-r|resume|--continue|-c)
       user_chose_session=1; break ;;
   esac
@@ -279,6 +280,7 @@ if [ "$TOOL" = "claude" ]; then
   if [ -n "$delivered_file" ] && [ "$replacement_prompt" = "0" ]; then
     prev_arg=""
     for a in "$@"; do
+      [ "$a" = "--" ] && break
       if [ "$prev_arg" = "--append-system-prompt-file" ] && [ "$a" = "$delivered_file" ]; then
         keep_policy_sha=1; break
       fi
@@ -340,6 +342,22 @@ notify_shim_beacon() {
 }
 notify_shim_beacon
 
+# Our flags go BEFORE the first `--`. Everything after it is positional, so a
+# flag appended there would reach the provider as a prompt word and deliver
+# nothing. A runner continuation's argv carries `--` before its prompt, and it
+# reaches this shim by bare name when the runner could not pin a real binary.
+# Below 4.4 an empty array's "${a[@]}" is an unbound variable under `set -u`,
+# hence the ${a[@]+...} spelling on every array the exec lines expand.
+ARGS_HEAD=()
+ARGS_TAIL=()
+for a in "$@"; do
+  if [ "${#ARGS_TAIL[@]}" -gt 0 ] || [ "$a" = "--" ]; then
+    ARGS_TAIL+=("$a")
+  else
+    ARGS_HEAD+=("$a")
+  fi
+done
+
 if [ "$user_chose_session" -eq 1 ] || [ -z "$PINNED" ]; then
   # User chose their own session (or we have no pinned id) — don't append our
   # `--session-id`, but STILL deliver the `--settings` hook (claude) so a
@@ -349,11 +367,15 @@ if [ "$user_chose_session" -eq 1 ] || [ -z "$PINNED" ]; then
   if [ "$user_chose_session" -eq 0 ] && [ -n "$PINNED" ]; then
     notify_session_open "$PINNED" "startup"
   fi
-  exec_real "$@" "${SETTINGS_ARGS[@]}" "${MCP_CONFIG_ARGS[@]}"
+  exec_real ${ARGS_HEAD[@]+"${ARGS_HEAD[@]}"} \
+    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${MCP_CONFIG_ARGS[@]+"${MCP_CONFIG_ARGS[@]}"} \
+    ${ARGS_TAIL[@]+"${ARGS_TAIL[@]}"}
 fi
 
 # Append our pinned id (+ the claude --settings hook) and run the real provider.
 # Confirmation POST first (fire-and-forget); then exec so stdio/exit are
 # transparent.
 notify_session_open "$PINNED" "startup"
-exec_real "$@" "${SETTINGS_ARGS[@]}" "${MCP_CONFIG_ARGS[@]}" --session-id "$PINNED"
+exec_real ${ARGS_HEAD[@]+"${ARGS_HEAD[@]}"} \
+  ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${MCP_CONFIG_ARGS[@]+"${MCP_CONFIG_ARGS[@]}"} \
+  --session-id "$PINNED" ${ARGS_TAIL[@]+"${ARGS_TAIL[@]}"}
