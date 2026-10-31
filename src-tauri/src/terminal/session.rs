@@ -1729,6 +1729,12 @@ impl TerminalSession {
             working_dir.clone()
         };
         cmd.cwd(&cwd);
+        // Start the served-corpus measurement NOW and join it inside the
+        // identity seam, so it overlaps the seam's other work (plan
+        // `2026-10-19-served-corpus-probe-budget-excludes-process-creation`,
+        // Phase 5). Nothing between here and the join writes `<cwd>/.claude/`
+        // or the provision ledger the probe reads.
+        let served_probe = crate::served_corpus::probe_start(std::path::Path::new(&cwd), Some(&id));
 
         // The terminal-invariant half of the child env: markers, TERM, the
         // runner port + briefing, and the non-interactive git posture. Extracted
@@ -1810,6 +1816,7 @@ impl TerminalSession {
                 &page_id,
                 effective_claude_config_dir.clone(),
                 spawn_tenant,
+                served_probe,
             )
         }?;
         let pinned_session_id = seam.pinned_session_id;
@@ -3314,6 +3321,9 @@ impl TerminalSession {
         config_dir: Option<String>,
         // The caller's chosen tenant, BEFORE the kill switch — resolved below.
         spawn_tenant: Option<uuid::Uuid>,
+        // The served-corpus measurement, started before this seam so it runs
+        // alongside it; joined below.
+        served_probe: crate::served_corpus::ProbeHandle,
     ) -> Result<IdentitySeamOutcome, String> {
         use crate::install_effects_producer::intercept::shim_materializer;
         use tauri::Manager;
@@ -3500,14 +3510,18 @@ impl TerminalSession {
             );
         }
 
-        // The served-corpus measurement for the briefing's header line. Bounded
-        // (`served_corpus::PROBE_BUDGET` for the whole probe, however many git spawns)
-        // and fail-soft: every failure is an `UNKNOWN (<reason>)` token.
+        // The served-corpus measurement for the briefing's header line,
+        // started before this seam and joined here. The join returns within
+        // `PROBE_BUDGET + PROBE_COLLECT_GRACE` of the START whatever process
+        // creation costs (a git that could not start in time reads
+        // `UNKNOWN(timed-out)`; one that started late is killed, never waited
+        // on), and is fail-soft: every failure is an `UNKNOWN (<reason>)` token.
+        // The span covers the JOIN: what the operator still waits for.
         let served = {
             let _span =
                 tracing::debug_span!("terminal_spawn.served_corpus_probe", terminal_id = %terminal_id)
                     .entered();
-            crate::served_corpus::probe(std::path::Path::new(cwd))
+            served_probe.join()
         };
 
         Ok(IdentitySeamOutcome {
@@ -4839,6 +4853,13 @@ impl TerminalSession {
         self.exit_snapshot.lock().ok().and_then(|s| *s)
     }
 
+    /// Test seam: flip the liveness flag of a PTY-less fixture. Set it back to
+    /// `false` before the session drops, or `Drop` runs `close()`.
+    #[cfg(test)]
+    pub(crate) fn set_alive_for_test(&self, alive: bool) {
+        self.is_alive.store(alive, Ordering::Relaxed);
+    }
+
     /// The shell process's exit code, once the waiter thread has recorded one.
     ///
     /// `None` means either "still running" or "exited but the wait itself
@@ -5091,10 +5112,12 @@ fn on_exit_hook_code(code: Option<i32>, runner_initiated: bool) -> Option<i32> {
 /// Default per-thread join cap on the interactive close path.
 const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Default cap on the shutdown `taskkill` subprocess.
+/// Default cap on the pane-tree kill. On Windows that is an in-process walk
+/// (`qontinui_runner_win32::process_tree`), not a `taskkill` subprocess; the
+/// constant's name predates that change.
 const TASKKILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Floor under the `taskkill` cap. Every other step may be squeezed to nothing
+/// Floor under the kill cap. Every other step may be squeezed to nothing
 /// by an exhausted shutdown budget; the kill may not, because skipping it leaks
 /// a process tree that outlives the runner.
 const KILL_FLOOR: std::time::Duration = std::time::Duration::from_millis(500);

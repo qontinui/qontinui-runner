@@ -23,7 +23,11 @@
 # 237 -> 239 (rebase onto main eefa3a189): main re-split plans_dir_migration's
 # seed log lines into `outcome_message` (3 rows replacing 1), +2 unreviewed
 # plans_dir rows landed by main, not by this PR. Exact count, not a loosening.
-unreviewed_ceiling = 238
+# 238 -> 229 (plan 2026-10-19-served-corpus-probe-budget-excludes-process-creation
+# Phase 4): the nine unreviewed `os_bound_tooling` taskkill rows in
+# mcp/ai_session.rs, mcp/headless_browser.rs and mcp/task_runs.rs are gone with
+# the taskkill spawns they named. A fall, held.
+unreviewed_ceiling = 229
 
 # First triage pass (plan 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports Phase 4):
 # every supervisor_dependency, tenant_literal and machine_path key. The
