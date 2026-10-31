@@ -242,6 +242,16 @@ inputs:
       "no declaration".
     required: false
     default: 'false'
+  pr-number:
+    description: >-
+      The pull request whose coord dep-edge labels may name an adaptation PR.
+      Empty (the default) means the triggering `pull_request` event's number,
+      so every existing caller is unchanged. Set it only from a workflow that
+      is NOT triggered by `pull_request` but still acts for one PR — today
+      coord-repair.yml (workflow_dispatch, with the PR number as an input).
+      Validated numeric before it reaches a URL, like the event's number.
+    required: false
+    default: ''
   pin-file:
     description: >-
       Manifest recording WHICH COMMIT of each sibling this repo's CI builds
@@ -295,7 +305,7 @@ runs:
       # Values via env, never `${{ }}`-spliced into the script body (property 1).
       env:
         GH_TOKEN: ${{ github.token }}
-        PR_NUMBER: ${{ github.event.pull_request.number }}
+        PR_NUMBER: ${{ inputs.pr-number || github.event.pull_request.number }}
         THIS_REPO: ${{ github.repository }}
         SIBLING_REPO: ${{ inputs.repo }}
         ACCEPT_TRAILING: ${{ inputs.accept-trailing-sibling }}

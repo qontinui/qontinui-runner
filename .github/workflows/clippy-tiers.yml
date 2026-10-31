@@ -45,11 +45,14 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
 
 jobs:
-  # Nightly UNSCOPED clippy sweep. The per-PR `Clippy check` step in ci.yml runs
-  # plain `cargo clippy` (default target only, levels from Cargo.toml) so it
-  # never ambushes an unrelated PR with test-module / whole-tree lint rot. This
-  # job restores that whole-tree coverage on a schedule instead: `--all-targets`
-  # compiles #[cfg(test)] modules too, surfacing warn-tier rot loudly once a day
+  # Nightly UNSCOPED clippy sweep. The per-PR ubuntu `Clippy check` step in
+  # ci.yml runs plain `cargo clippy` (default target only, levels from
+  # Cargo.toml); ci.yml's `clippy-windows` runs `--all-targets` per PR, so
+  # shared and cfg(windows) test code is already linted there, and THIS job is
+  # the only all-targets pass over Linux-only (cfg(unix)) test code in the
+  # src-tauri package. This job supplies whole-tree coverage on a schedule:
+  # `--all-targets` compiles #[cfg(test)] modules too, surfacing warn-tier rot
+  # loudly once a day
   # (and on-demand via workflow_dispatch) without gating any PR. It is allowed to
   # fail on its own to make rot visible; it is NOT a required check and blocks
   # nothing. Runs on schedule/manual only.
@@ -182,8 +185,10 @@ jobs:
 
       - name: Clippy (unscoped, all-targets)
         # No `-D warnings`: report rot, don't deny-block the world. Levels come
-        # from Cargo.toml; --all-targets adds the test-module coverage the PR
-        # gate intentionally drops. A deny-tier lint anywhere in the tree still
+        # from Cargo.toml; --all-targets adds the Linux test-module coverage no
+        # per-PR gate has (the ubuntu PR leg lints the default target; at
+        # default parallelism its --all-targets run exhausted the hosted runner
+        # on qontinui-runner#2392). A deny-tier lint anywhere in the tree still
         # fails this job (by design — that's the loud signal), but this job
         # gates no PR.
         env:
@@ -197,7 +202,9 @@ jobs:
   # comments/fails ONLY on findings introduced on the lines this PR changed —
   # style rot elsewhere in the tree is ignored. This is the T3 mechanism: warn-
   # tier lints (style/complexity/perf) stay non-blocking globally but a NEW one
-  # you introduce is surfaced on your diff.
+  # you introduce is surfaced on your diff. DEFAULT TARGET ONLY: a warn-tier
+  # lint added in #[cfg(test)] code gets no annotation here (ci.yml's
+  # `clippy-windows` prints it without blocking, and fails on deny-tier ones).
   #
   # ADVISORY / NOT A REQUIRED CHECK — do NOT add to required-status-checks or
   # branch protection. Promote to required only after burn-in (plan Phase 2).

@@ -142,6 +142,9 @@ function cardStatuses(): Record<string, string | null> {
   return out;
 }
 
+/** The panel's view is owned by `TerminalPage`; these tests pin the Live view. */
+const noopView = (): void => {};
+
 describe("SessionManagerPanel — tmux mode off-screen wording", () => {
   it("in tmux mode a running session that is not on screen reads off screen, not in zone", () => {
     const rows = [
@@ -154,6 +157,8 @@ describe("SessionManagerPanel — tmux mode off-screen wording", () => {
       return SessionManagerPanel({
         manager: managerOver(rows),
         selectedSessionId: null,
+        view: "live",
+        onViewChange: noopView,
         onScreenTabId: "tab-shown",
         workMode: "tmux",
       });
@@ -188,6 +193,8 @@ describe("SessionManagerPanel — closing a session from its row", () => {
           closeSession,
         }),
         selectedSessionId: null,
+        view: "live",
+        onViewChange: noopView,
         onScreenTabId: "tab-b",
         workMode: "tmux",
       });

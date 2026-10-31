@@ -1,0 +1,6 @@
+     Running `/home/runner/work/qontinui-runner/qontinui-runner/src-tauri/target/debug/deps/qontinui_runner_lib-0c1d2e3f`
+
+running 2 tests
+note: a child reported: memory allocation of 2097152 bytes failed
+test a::b ... ok
+##[error]Process completed with exit code 1.

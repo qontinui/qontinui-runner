@@ -144,7 +144,8 @@ const NEVER_KILL = ["node", "node.exe", "powershell", "powershell.exe", "pwsh", 
 /** The runner's own image name — the only thing T10 is allowed to stop. */
 const RUNNER_PROCESS_NAME = "qontinui-runner";
 
-/** The sixteen addressable row fields (plan D5). */
+/** The seventeen addressable row fields this oracle compares raw-to-raw (plan
+ * D5). The panel renders eighteen: `prs-scanned` is not compared here. */
 const INFO_FIELDS = [
   "account",
   "name",
@@ -152,6 +153,7 @@ const INFO_FIELDS = [
   "claude-session-id",
   "fleet-handle",
   "tenant",
+  "spawn-stamp",
   "task-run",
   "working-dir",
   "recorded-page",
@@ -1616,7 +1618,7 @@ async function collectZones() {
 
 /** The backend's own value for one addressable row — the RAW half of D5. */
 function backendValueForField(body, field) {
-  const { identity, name, account, placement, lifecycle, prs } = body;
+  const { identity, name, account, placement, lifecycle, prs, tenancy } = body;
   const prsOk = prs?.status === "ok";
   switch (field) {
     case "account":
@@ -1629,8 +1631,18 @@ function backendValueForField(body, field) {
       return identity?.claudeSessionId ?? null;
     case "fleet-handle":
       return identity?.fleetSessionHandle ?? null;
-    case "tenant":
-      return identity?.tenantId ?? null;
+    // The ACTING tenant, from the runner's one derived projection
+    // (`tenancy.display`, plan 2026-10-17-session-info-tenant-row-renders-
+    // unknown-for-a-resolved-tenant) — not the spawn stamp, which is null for
+    // every spawn that chose no tenant. `unknown` carries no value.
+    case "tenant": {
+      const display = tenancy?.display;
+      if (!display || display.status === "unknown") return null;
+      return display.tenantId ?? null;
+    }
+    // The spawn stamp, on its own row.
+    case "spawn-stamp":
+      return tenancy?.row?.tenantId ?? null;
     case "task-run":
       return identity?.taskRunId ?? null;
     case "working-dir":

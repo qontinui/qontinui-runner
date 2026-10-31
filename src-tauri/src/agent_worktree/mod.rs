@@ -59,6 +59,7 @@ use crate::worktree::run_git_command;
 pub mod canonical_paths;
 pub mod cargo_locks;
 pub mod census;
+pub(crate) mod census_size_memo;
 /// WIP custody — who owns the uncommitted work in a worktree (plan
 /// `2026-08-22-wip-custody-rebuild-survivable-attribution`, Phase 3).
 pub mod custody;
@@ -1127,6 +1128,11 @@ pub struct SharedBranchResult {
     /// shared-branch path is never single-claim.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub active_claims: Vec<ActiveClaim>,
+    /// coord's `sibling_notes` for this allocation, carried exactly as on
+    /// [`AllocateResult::sibling_notes`] so the shared-branch arm does not drop
+    /// what the worktree arm hands to the agent.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sibling_notes: Vec<String>,
 }
 
 /// One repo's shared-branch checkout.
@@ -1810,11 +1816,17 @@ pub async fn allocate_and_materialize_with_claim(
         w.parent_sha_provenance
             .warn_if_not_fresh(&w.repo, &w.parent_sha);
     }
-    for note in &coord_resp.sibling_notes {
+    // Forced onto bounded single lines once; logged here and carried on both
+    // the shared-branch and worktree results below.
+    let sibling_notes: Vec<String> = coord_resp
+        .sibling_notes
+        .iter()
+        .map(|n| sibling_note_log_line(n))
+        .collect();
+    for note in &sibling_notes {
         warn!(
             "allocate: coord sibling note agent_id={}: {}",
-            coord_resp.agent_id,
-            sibling_note_log_line(note)
+            coord_resp.agent_id, note
         );
     }
 
@@ -1961,6 +1973,7 @@ pub async fn allocate_and_materialize_with_claim(
             token_jti: coord_resp.token_jti.unwrap_or(uuid::Uuid::nil()),
             token_exp: coord_resp.token_exp.unwrap_or(0),
             active_claims,
+            sibling_notes,
         }));
     }
 
@@ -2148,11 +2161,6 @@ pub async fn allocate_and_materialize_with_claim(
         });
     }
 
-    let sibling_notes: Vec<String> = coord_resp
-        .sibling_notes
-        .iter()
-        .map(|n| sibling_note_log_line(n))
-        .collect();
     Ok(MaterializeOutcome::Worktrees(AllocateResult {
         agent_id: coord_resp.agent_id,
         worktrees: materialized,

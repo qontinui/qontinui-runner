@@ -42,6 +42,7 @@
 
 pub(crate) mod admission;
 pub(crate) mod canonical;
+pub(crate) mod cgroup;
 pub(crate) mod checkout;
 pub(crate) mod executor;
 pub(crate) mod host_sizing;

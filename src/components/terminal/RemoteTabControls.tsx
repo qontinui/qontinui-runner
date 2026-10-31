@@ -118,6 +118,8 @@ export function RemoteTabControls({
         sessionLabel: sessionLabelFromTitle(tab.title, remote.deviceLabel),
         workingDir: tab.workingDir ?? null,
         pageId: session.pageId !== "default" ? session.pageId : null,
+        // Re-mint in the tenant the tab was opened under, not the default.
+        tenant: remote.tenant ?? null,
       });
       // The new tab is already open (terminal-created + terminal-remote-identity);
       // retire the dead one it replaces.
@@ -130,22 +132,26 @@ export function RemoteTabControls({
     }
   };
 
+  // Every control here truncates (its `title` carries the full text) so a
+  // narrow zone header keeps its toggles clear of the hover cluster; an action
+  // button and the device badge keep their icons (`min-w-[18px]`). Budgeted in
+  // `HEADER_REMOTE_FLOORS_PX`.
   const btn =
-    "flex items-center gap-0.5 shrink-0 text-[8px] px-1 py-0 rounded transition-colors disabled:opacity-50 " +
+    "flex items-center gap-0.5 min-w-[18px] overflow-hidden text-[8px] px-1 py-0 rounded transition-colors disabled:opacity-50 " +
     "text-[#7aa2f7] bg-[#7aa2f7]/10 hover:bg-[#7aa2f7]/25";
 
   return (
     <>
       <span
         data-ui-bridge-id={`terminal.remote-badge.${tab.id}`}
-        className={`flex items-center gap-0.5 shrink-0 text-[8px] text-[#7aa2f7] bg-[#7aa2f7]/15 px-1 py-0 ${
+        className={`flex items-center gap-0.5 min-w-[18px] overflow-hidden text-[8px] text-[#7aa2f7] bg-[#7aa2f7]/15 px-1 py-0 ${
           compact ? "rounded-full py-0.5" : "rounded"
         }`}
         title={badge.title}
         aria-label={`Remote tab: ${badge.title}`}
       >
-        <Monitor className="w-2.5 h-2.5" />
-        {badge.text}
+        <Monitor className="w-2.5 h-2.5 shrink-0" />
+        <span className="truncate">{badge.text}</span>
       </span>
       {tab.isAlive && remote.historyAvailable && (
         <button
@@ -159,8 +165,8 @@ export function RemoteTabControls({
           className={btn}
           title="The attach delivered only the newest part of the remote scrollback. Load what came before it (re-renders this pane)."
         >
-          <History className={`w-2.5 h-2.5 ${busy === "history" ? "animate-spin" : ""}`} />
-          {busy === "history" ? "loading…" : "earlier output"}
+          <History className={`w-2.5 h-2.5 shrink-0 ${busy === "history" ? "animate-spin" : ""}`} />
+          <span className="truncate">{busy === "history" ? "loading…" : "earlier output"}</span>
         </button>
       )}
       {!tab.isAlive && (
@@ -178,8 +184,12 @@ export function RemoteTabControls({
             "This remote pane ended (the session exited, or the grant expired). Mint a fresh grant and reattach to the same session."
           }
         >
-          <RefreshCw className={`w-2.5 h-2.5 ${busy === "reattach" ? "animate-spin" : ""}`} />
-          {busy === "reattach" ? (waitingLine ? "waiting…" : "reattaching…") : "reattach"}
+          <RefreshCw
+            className={`w-2.5 h-2.5 shrink-0 ${busy === "reattach" ? "animate-spin" : ""}`}
+          />
+          <span className="truncate">
+            {busy === "reattach" ? (waitingLine ? "waiting…" : "reattaching…") : "reattach"}
+          </span>
         </button>
       )}
       {/* The runner's own progress while it re-presents the grant. Shown in
