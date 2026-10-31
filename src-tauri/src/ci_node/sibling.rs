@@ -111,8 +111,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-use super::checkout::run_git;
 use super::manifest::{CiSibling, SiblingPin};
+use super::sibling_git_env::{self, run_sibling_git, SiblingGitEnv};
 use crate::github_budget::{self, CacheMode};
 use crate::trigger_system::github_api::{cache_action, CacheAction};
 
@@ -883,13 +883,19 @@ async fn fetch_sibling_pr_detail(
 
 /// Resolve a branch tip to a SHA so both resolution paths converge on the
 /// same "fetch this exact commit" primitive.
-async fn ls_remote_branch_sha(cwd: &Path, repo: &str, branch: &str) -> Result<String, String> {
+async fn ls_remote_branch_sha(
+    cwd: &Path,
+    git_env: &SiblingGitEnv,
+    repo: &str,
+    branch: &str,
+) -> Result<String, String> {
     let url = clone_url(repo);
     let refspec = format!("refs/heads/{branch}");
-    let out = run_git(
+    let out = run_sibling_git(
         cwd,
         &["ls-remote", "--exit-code", &url, &refspec],
         SIBLING_FETCH_TIMEOUT,
+        git_env,
     )
     .await
     .map_err(|e| format!("resolving {repo}@{branch}: {e}"))?;
@@ -931,6 +937,7 @@ pub(crate) struct ResolvedSibling {
 /// action's `if [ -n "${SHA}" ]; then return 0; fi`.
 async fn no_declaration(
     cwd: &Path,
+    git_env: &SiblingGitEnv,
     worktree: &Path,
     sibling: &CiSibling,
     why: &str,
@@ -943,7 +950,7 @@ async fn no_declaration(
             provenance: format!("pinned in {SIBLING_PIN_FILE} ({why}; no declaration applied)"),
         });
     }
-    let sha = ls_remote_branch_sha(cwd, &sibling.repo, &sibling.branch).await?;
+    let sha = ls_remote_branch_sha(cwd, git_env, &sibling.repo, &sibling.branch).await?;
     Ok(ResolvedSibling {
         repo: sibling.repo.clone(),
         sha,
@@ -956,6 +963,7 @@ async fn no_declaration(
 /// dispatched commit, exactly as `.qontinui/ci.toml` itself was.
 async fn resolve_one(
     cwd: &Path,
+    git_env: &SiblingGitEnv,
     worktree: &Path,
     client: &reqwest::Client,
     token: Option<&str>,
@@ -964,7 +972,7 @@ async fn resolve_one(
     pr_number: Option<u64>,
 ) -> Result<ResolvedSibling, String> {
     if sibling.pin == SiblingPin::DefaultBranch {
-        let sha = ls_remote_branch_sha(cwd, &sibling.repo, &sibling.branch).await?;
+        let sha = ls_remote_branch_sha(cwd, git_env, &sibling.repo, &sibling.branch).await?;
         return Ok(ResolvedSibling {
             repo: sibling.repo.clone(),
             sha,
@@ -977,6 +985,7 @@ async fn resolve_one(
     let Some(pr) = pr_number else {
         return no_declaration(
             cwd,
+            git_env,
             worktree,
             sibling,
             "no pull request on this dispatch — no declaration probe",
@@ -997,10 +1006,13 @@ async fn resolve_one(
         sibling.accept_trailing_sibling,
         &inputs,
     )? {
-        DeclaredTarget::None => no_declaration(cwd, worktree, sibling, "no declaration").await,
+        DeclaredTarget::None => {
+            no_declaration(cwd, git_env, worktree, sibling, "no declaration").await
+        }
         DeclaredTarget::TrailingSiblingDeclined { number, forms } => {
             no_declaration(
                 cwd,
+                git_env,
                 worktree,
                 sibling,
                 &format!(
@@ -1034,7 +1046,11 @@ async fn resolve_one(
 /// `git init` → `fetch --depth 1 <sha>` → `checkout FETCH_HEAD` → **assert we
 /// got exactly that commit**. The assertion is the point: without it a fetch
 /// that resolved something else is a silent substitution.
-async fn materialise(dest: &Path, resolved: &ResolvedSibling) -> Result<(), String> {
+async fn materialise(
+    dest: &Path,
+    git_env: &SiblingGitEnv,
+    resolved: &ResolvedSibling,
+) -> Result<(), String> {
     if dest.exists() {
         return Err(format!(
             "{} already exists — refusing to overwrite a checkout that is already there",
@@ -1048,9 +1064,21 @@ async fn materialise(dest: &Path, resolved: &ResolvedSibling) -> Result<(), Stri
     let dest_str = dest.to_string_lossy().to_string();
     let url = clone_url(&resolved.repo);
 
-    run_git(parent, &["init", "-q", &dest_str], GIT_LOCAL_TIMEOUT).await?;
-    run_git(dest, &["remote", "add", "origin", &url], GIT_LOCAL_TIMEOUT).await?;
-    run_git(
+    run_sibling_git(
+        parent,
+        &["init", "-q", &dest_str],
+        GIT_LOCAL_TIMEOUT,
+        git_env,
+    )
+    .await?;
+    run_sibling_git(
+        dest,
+        &["remote", "add", "origin", &url],
+        GIT_LOCAL_TIMEOUT,
+        git_env,
+    )
+    .await?;
+    run_sibling_git(
         dest,
         &[
             "fetch",
@@ -1061,6 +1089,7 @@ async fn materialise(dest: &Path, resolved: &ResolvedSibling) -> Result<(), Stri
             &resolved.sha,
         ],
         SIBLING_FETCH_TIMEOUT,
+        git_env,
     )
     .await
     .map_err(|e| {
@@ -1069,9 +1098,15 @@ async fn materialise(dest: &Path, resolved: &ResolvedSibling) -> Result<(), Stri
             resolved.repo, resolved.sha
         )
     })?;
-    run_git(dest, &["checkout", "-q", "FETCH_HEAD"], GIT_LOCAL_TIMEOUT).await?;
+    run_sibling_git(
+        dest,
+        &["checkout", "-q", "FETCH_HEAD"],
+        GIT_LOCAL_TIMEOUT,
+        git_env,
+    )
+    .await?;
 
-    let got = run_git(dest, &["rev-parse", "HEAD"], GIT_LOCAL_TIMEOUT).await?;
+    let got = run_sibling_git(dest, &["rev-parse", "HEAD"], GIT_LOCAL_TIMEOUT, git_env).await?;
     if got.trim() != resolved.sha {
         return Err(format!(
             "asked for {} but checked out {} — refusing a substituted tree",
@@ -1116,6 +1151,10 @@ pub(crate) async fn provision(
         }
     }
 
+    // One isolated git environment (and one `git --version` floor check) for
+    // every sibling git call of this provision — see [`sibling_git_env`].
+    let git_env = sibling_git_env::prepare_isolated_sibling_git(dispatch_root).await?;
+
     let token = crate::session_pr_reconciler::resolve_github_token().await;
     if token.is_none() && pr_number.is_some() {
         // Unauthenticated GitHub reads work for public repos but are limited
@@ -1135,6 +1174,7 @@ pub(crate) async fn provision(
     for sibling in siblings {
         let resolved = resolve_one(
             dispatch_root,
+            &git_env,
             worktree,
             &client,
             token.as_deref(),
@@ -1151,7 +1191,7 @@ pub(crate) async fn provision(
             resolved.sha,
             resolved.provenance
         ));
-        materialise(&dest, &resolved).await?;
+        materialise(&dest, &git_env, &resolved).await?;
         info!(
             "ci_node: sibling {} materialised at {} ({})",
             sibling.repo,
@@ -1818,40 +1858,151 @@ mod tests {
         assert_eq!(read_pin(dir.path(), UI_BRIDGE).unwrap(), PIN_A);
     }
 
+    /// Drive the production provisioning entry for one sibling and collect
+    /// what it logged.
+    async fn provision_one(
+        dispatch_root: &Path,
+        worktree: &Path,
+        sibling: &CiSibling,
+    ) -> (Result<Vec<ResolvedSibling>, String>, Vec<String>) {
+        let mut lines = Vec::new();
+        let res = {
+            let mut log = |l: String| lines.push(l);
+            provision(
+                dispatch_root,
+                worktree,
+                std::slice::from_ref(sibling),
+                "qontinui/qontinui-runner",
+                None,
+                &mut log,
+            )
+            .await
+        };
+        (res, lines)
+    }
+
     /// The no-declaration funnel: under `pin-file` every exit that found no
     /// declaration answers with the recorded commit and says so in the
     /// provenance, with NO network call — the branch is never consulted.
+    ///
+    /// Entered through [`provision`] with the sibling's destination already
+    /// present, so materialisation refuses before any fetch: what the
+    /// resolution chose is read off the provision log.
     #[tokio::test]
     async fn no_declaration_answers_with_the_recorded_pin() {
         let dir = tempfile::tempdir().unwrap();
-        let manifest = dir.path().join(SIBLING_PIN_FILE);
+        let worktree = dir.path().join("qontinui-runner");
+        let manifest = worktree.join(SIBLING_PIN_FILE);
         std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
         std::fs::write(&manifest, format!("{UI_BRIDGE} {PIN_A}\n")).unwrap();
 
         let mut sibling = sib(UI_BRIDGE);
         sibling.pin = SiblingPin::PinFile;
+        std::fs::create_dir_all(sibling_dest(dir.path(), &sibling)).unwrap();
         // The SHA assertion below is what catches a regression that consulted
         // the branch: `ls-remote` needs no repository cwd, so on a networked
         // box it would answer with ui-bridge's real tip, which is not PIN_A.
-        let resolved = no_declaration(dir.path(), dir.path(), &sibling, "no declaration")
-            .await
-            .unwrap();
-        assert_eq!(resolved.sha, PIN_A);
-        assert_eq!(resolved.repo, UI_BRIDGE);
+        let (res, lines) = provision_one(dir.path(), &worktree, &sibling).await;
+        let err = res.unwrap_err();
+        assert!(err.contains("already exists"), "got: {err}");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
         assert!(
-            resolved.provenance.contains(SIBLING_PIN_FILE)
-                && resolved.provenance.contains("no declaration"),
-            "got: {}",
-            resolved.provenance
+            line.contains(&format!("sibling {UI_BRIDGE} "))
+                && line.contains(&format!("@ {PIN_A} ")),
+            "got: {line}"
+        );
+        assert!(
+            line.contains(SIBLING_PIN_FILE) && line.contains("no declaration"),
+            "got: {line}"
         );
 
         // A half-finished bump reaches the dispatch as the manifest's own
         // error, not as a float: the branch is still never consulted.
         std::fs::write(&manifest, format!("{UI_BRIDGE}\n")).unwrap();
-        let err = no_declaration(dir.path(), dir.path(), &sibling, "no declaration")
-            .await
-            .unwrap_err();
+        let (res, lines) = provision_one(dir.path(), &worktree, &sibling).await;
+        let err = res.unwrap_err();
         assert!(err.contains("no commit SHA after it"), "got: {err}");
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    /// The runner's CI root is the workspace root, itself a git repository:
+    /// `<root>/.ci-worktrees/<id>` sits INSIDE it. That enclosing repo's own
+    /// `.git/config` — here an `insteadOf` that would route a sibling's
+    /// GitHub URL to a local repository — must not reach the sibling's
+    /// `ls-remote`. Unisolated, the rewrite resolves the local repository's
+    /// tip and the provision logs it; isolated, the GitHub URL is asked
+    /// as-is (a repository that does not exist, so it fails — offline or
+    /// not) and the local tip is never seen.
+    #[tokio::test]
+    async fn a_sibling_provision_ignores_an_enclosing_repos_url_rewrite() {
+        let git = |cwd: &Path, args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // A local "remote" with one commit on `main`.
+        let remote = dir.path().join("remote");
+        std::fs::create_dir_all(&remote).unwrap();
+        git(&remote, &["init", "-q", "-b", "main"]);
+        git(
+            &remote,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "local",
+            ],
+        );
+        let local_tip = git(&remote, &["rev-parse", "HEAD"]);
+        // The enclosing repository, carrying the rewrite in its local config.
+        let enclosing = dir.path().join("ws");
+        std::fs::create_dir_all(&enclosing).unwrap();
+        git(&enclosing, &["init", "-q"]);
+        let target = format!("{}/", remote.parent().unwrap().display());
+        git(
+            &enclosing,
+            &[
+                "config",
+                &format!("url.{target}.insteadOf"),
+                "https://github.com/qontinui-arming-probe/",
+            ],
+        );
+        let dispatch_root = enclosing.join(".ci-worktrees").join("d-1");
+        let worktree = dispatch_root.join("qontinui-runner");
+        std::fs::create_dir_all(&worktree).unwrap();
+        // `https://github.com/qontinui-arming-probe/remote.git` → `<dir>/remote.git`.
+        std::fs::rename(&remote, dir.path().join("remote.git")).unwrap();
+
+        let text = "version = 1\n[[siblings]]\nrepo = \"qontinui-arming-probe/remote\"\n\
+                    pin = \"default-branch\"\nbranch = \"main\"\n\
+                    [[steps]]\nname = \"x\"\ncommand = [\"true\"]\n";
+        let sibling = super::super::manifest::parse_and_validate(text)
+            .unwrap()
+            .siblings
+            .remove(0);
+        let (res, lines) = provision_one(&dispatch_root, &worktree, &sibling).await;
+        assert!(
+            !lines.iter().any(|l| l.contains(&local_tip)),
+            "the enclosing repo's insteadOf reached sibling git: {lines:?}"
+        );
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("resolving qontinui-arming-probe/remote@main"),
+            "got: {err}"
+        );
     }
 
     /// Lane parity on this repo's REAL files, so the audit the manifests ask

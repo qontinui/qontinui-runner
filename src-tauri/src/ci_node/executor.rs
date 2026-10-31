@@ -932,6 +932,103 @@ mod tests {
         }
     }
 
+    /// Where the runner's CI node actually enters sibling provisioning:
+    /// [`provision`], called by `run_dispatch` with the dispatch root under
+    /// `<root>/.ci-worktrees/<id>`. The runner's CI root is the workspace
+    /// root, itself a git repository, so that dispatch root sits INSIDE an
+    /// enclosing repo whose own `.git/config` carries an `insteadOf` routing
+    /// the sibling's GitHub URL to a local repository. The sibling's git must
+    /// not read it: isolated, the GitHub URL is asked as-is (a repository that
+    /// does not exist, so the resolve fails offline or not); unisolated, the
+    /// rewrite answers with the local repository's tip and provisioning goes
+    /// on to succeed.
+    #[tokio::test]
+    async fn a_dispatch_provision_ignores_an_enclosing_repos_url_rewrite() {
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // A local "remote" with one commit on `main`, at `<dir>/remote.git`.
+        let remote = dir.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        git(&remote, &["init", "-q", "-b", "main"]);
+        git(
+            &remote,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "local",
+            ],
+        );
+        // The CI root: a git repository whose local config rewrites the
+        // sibling's GitHub URL (`https://github.com/qontinui-arming-probe/
+        // remote.git`) to the local repository above.
+        let root = dir.path().join("ws");
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        git(
+            &root,
+            &[
+                "config",
+                &format!("url.{}/.insteadOf", dir.path().display()),
+                "https://github.com/qontinui-arming-probe/",
+            ],
+        );
+        let payload: CiDispatchPayload = serde_json::from_value(serde_json::json!({
+            "dispatch_id": "d-1",
+            "repo": "qontinui/qontinui-runner",
+            "head_sha": "s",
+            "fetch_url": "u",
+            "candidate_ref": "refs/heads/merge-candidate/1",
+        }))
+        .unwrap();
+        let worktree = super::super::checkout::ci_worktree_path(&root, "d-1", &payload.repo);
+        std::fs::create_dir_all(&worktree).unwrap();
+        let manifest = super::super::manifest::parse_and_validate(
+            "version = 1\n[[siblings]]\nrepo = \"qontinui-arming-probe/remote\"\n\
+             pin = \"default-branch\"\nbranch = \"main\"\n\
+             [[steps]]\nname = \"x\"\ncommand = [\"true\"]\n",
+        )
+        .unwrap();
+        let cancel = CancellationToken::new();
+        // A coord base nothing listens on: the sink's flusher fails and drops.
+        let sink = ProgressSink::start(
+            "http://127.0.0.1:9".to_string(),
+            "d-1".to_string(),
+            cancel.clone(),
+        );
+        let mut services = super::super::services::ServiceStack::new("d-1");
+
+        let res = provision(
+            &payload,
+            &root,
+            &worktree,
+            &manifest,
+            &sink,
+            &cancel,
+            &mut services,
+        )
+        .await;
+        let err = res.expect_err("the enclosing repo's rewrite reached sibling git");
+        assert!(
+            err.contains("resolving qontinui-arming-probe/remote@main"),
+            "got: {err}"
+        );
+    }
+
     #[test]
     fn step_outcome_conclusions() {
         assert_eq!(StepOutcome::Success.as_conclusion(), "success");
