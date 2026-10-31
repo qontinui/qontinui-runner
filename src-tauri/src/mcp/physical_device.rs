@@ -46,8 +46,9 @@ pub struct PhysicalDeviceInfo {
 #[serde(rename_all = "camelCase")]
 pub struct ActiveTransport {
     pub kind: TransportKind,
-    /// Always `http://127.0.0.1:{port}` — even for LAN, which runs a local
-    /// TCP proxy so the caller never needs to know the real device IP.
+    /// `http://127.0.0.1:{port}` for USB, Cloud and a manually registered LAN
+    /// device, which goes through a local TCP proxy. `http://{ip}:{port}` for a
+    /// LAN device found over mDNS, which is dialled directly.
     pub proxy_url: String,
     /// Unix timestamp (ms) when this transport was established.
     pub established_at: i64,

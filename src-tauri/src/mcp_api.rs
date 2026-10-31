@@ -12954,6 +12954,20 @@ pub fn create_router(
         });
     }
 
+    // Stored SDK connections' bearer re-check (30-second interval)
+    // Nothing else re-reads the adb forward list and settles stored clients between
+    // connects. A loop of its own, so neither it nor the device scan can stall the other.
+    {
+        let sdk_connection = api_state.sdk_connection.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                crate::mcp::sdk_client::recheck_stored_bearers(&sdk_connection).await;
+            }
+        });
+    }
+
     // Physical device USB scanner (30-second interval)
     // Discovers ADB-attached Android devices and registers them with PhysicalDeviceRegistry.
     {
