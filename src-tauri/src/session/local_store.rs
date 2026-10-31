@@ -2152,12 +2152,27 @@ mod tests {
 // Arming test for plan
 // 2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume,
 // Phase 2: a gate continuation's consume-outcome row survives the cap trim
-// that drops the OLDEST unacked rows. It enters where every outbox row
-// enters, `OutboxWriter::record`, and reads the file back. Written so it
-// compiles against the pre-change outbox too (the row is planted as raw JSON).
+// that drops the OLDEST unacked rows. It enters by the trim every runner start
+// runs, `OutboxWriter::open_with_max_bytes` (an outbox left over the cap by an
+// outage is brought back under it at open), and reads the file back. Written
+// so it compiles against the pre-change outbox too: every row is planted as
+// raw JSON.
 #[cfg(test)]
 mod outcome_row_trim_arming {
     use super::*;
+
+    fn row(machine: Uuid, sid: Uuid, seq: u64, kind: &str, payload: serde_json::Value) -> String {
+        serde_json::json!({
+            "machine_id": machine,
+            "session_id": sid,
+            "seq": seq,
+            "event_kind": kind,
+            "payload": payload,
+            "recorded_at": "2026-10-30T00:00:00Z",
+            "acked_at": null,
+        })
+        .to_string()
+    }
 
     #[test]
     fn an_outcome_row_outlives_the_trim_that_drops_older_rows() {
@@ -2165,33 +2180,35 @@ mod outcome_row_trim_arming {
         let path = dir.path().join("outbox.jsonl");
         let machine = Uuid::new_v4();
         let consume_lane = Uuid::new_v4();
-        // The oldest unacked row on disk: the trim's first victim.
-        let row = serde_json::json!({
-            "machine_id": machine,
-            "session_id": consume_lane,
-            "seq": 1,
-            "event_kind": "gate_continuation_outcome",
-            "payload": {"gate_id": Uuid::new_v4(), "outcome": "spawned"},
-            "recorded_at": "2026-10-30T00:00:00Z",
-            "acked_at": null,
-        });
-        std::fs::write(&path, format!("{row}\n")).unwrap();
-        let writer = OutboxWriter::open_with_max_bytes(&path, 4096).unwrap();
-        let chunk = "x".repeat(1500);
         let session = Uuid::new_v4();
-        for _ in 0..8 {
-            OutboxWriter::record(
-                &writer,
+        // The oldest unacked row on disk is the consume outcome: the trim's
+        // first victim. Behind it, a backlog three times the cap.
+        let mut file = row(
+            machine,
+            consume_lane,
+            1,
+            "gate_continuation_outcome",
+            serde_json::json!({"gate_id": Uuid::new_v4(), "outcome": "spawned"}),
+        );
+        file.push_str("\n");
+        let chunk = "x".repeat(1500);
+        for seq in 1..=8 {
+            file.push_str(&row(
                 machine,
                 session,
-                SessionEventKind::OutputChunk,
+                seq,
+                "output_chunk",
                 serde_json::json!({ "text": chunk }),
-            )
-            .unwrap();
+            ));
+            file.push_str("\n");
         }
+        std::fs::write(&path, file).unwrap();
+
+        let writer = OutboxWriter::open_with_max_bytes(&path, 4096).unwrap();
+
         assert!(
             writer.dropped_unacked() > 0,
-            "the cap trim ran and dropped rows"
+            "the open-time cap trim ran and dropped rows"
         );
         let left = writer.pending().unwrap();
         assert!(
