@@ -2183,26 +2183,25 @@ mod outcome_row_trim_arming {
         let session = Uuid::new_v4();
         // The oldest unacked row on disk is the consume outcome: the trim's
         // first victim. Behind it, a backlog three times the cap.
-        let mut file = row(
+        let chunk = "x".repeat(1500);
+        let rows: Vec<String> = std::iter::once(row(
             machine,
             consume_lane,
             1,
             "gate_continuation_outcome",
             serde_json::json!({"gate_id": Uuid::new_v4(), "outcome": "spawned"}),
-        );
-        file.push_str("\n");
-        let chunk = "x".repeat(1500);
-        for seq in 1..=8 {
-            file.push_str(&row(
+        ))
+        .chain((1..=8).map(|seq| {
+            row(
                 machine,
                 session,
                 seq,
                 "output_chunk",
                 serde_json::json!({ "text": chunk }),
-            ));
-            file.push_str("\n");
-        }
-        std::fs::write(&path, file).unwrap();
+            )
+        }))
+        .collect();
+        std::fs::write(&path, rows.join("\n") + "\n").unwrap();
 
         let writer = OutboxWriter::open_with_max_bytes(&path, 4096).unwrap();
 
