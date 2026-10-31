@@ -115,10 +115,14 @@ struct TransportInfoResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ConnectDeviceResponse {
+pub(crate) struct ConnectDeviceResponse {
     device_id: String,
     proxy_url: String,
     sdk_url: String,
+    /// Which bearer the handshake attached: see the `AUTH_PATH_*` constants in
+    /// `sdk_client`. `withheld_foreign_host` here: a physical device is not sent
+    /// the operator's bearer.
+    auth_path: String,
 }
 
 // ============================================================================
@@ -228,9 +232,23 @@ async fn connect_device(
         }
     };
 
+    connect_device_at(&state.sdk_connection, id, proxy_url)
+        .await
+        .map(|resp| Json(ApiResponse::success(resp)))
+        .map_err(|resp| (StatusCode::BAD_GATEWAY, Json(resp)))
+}
+
+/// Make the device at `proxy_url` the active SDK target. The handshake's
+/// `auth_path` is surfaced the way `handle_connect` surfaces it: on the response,
+/// or in the error envelope's `hint`.
+pub(crate) async fn connect_device_at(
+    sdk_connection: &tokio::sync::Mutex<crate::mcp::sdk_client::SdkConnectionManager>,
+    id: String,
+    proxy_url: String,
+) -> Result<ConnectDeviceResponse, ApiResponse<()>> {
     // Connect via the existing SDK connection logic
     match crate::mcp::sdk_client::connect_sdk_app(
-        &state.sdk_connection,
+        sdk_connection,
         &proxy_url,
         None,
         None,
@@ -241,19 +259,19 @@ async fn connect_device(
     .await
     {
         Ok(resp) => {
-            info!(device_id = %id, proxy_url = %proxy_url, "Physical device connected as SDK target");
-            Ok(Json(ApiResponse::success(ConnectDeviceResponse {
+            info!(device_id = %id, proxy_url = %proxy_url, auth_path = %resp.auth_path, "Physical device connected as SDK target");
+            Ok(ConnectDeviceResponse {
                 device_id: id,
                 proxy_url,
                 sdk_url: resp.url,
-            })))
+                auth_path: resp.auth_path,
+            })
         }
         Err(e) => {
-            warn!(device_id = %id, error = %e, "Failed to connect physical device");
-            Err((
-                StatusCode::BAD_GATEWAY,
-                Json(ApiResponse::error(format!("Connection failed: {}", e))),
-            ))
+            warn!(device_id = %id, error = %e, auth_path = %e.auth_path, "Failed to connect physical device");
+            let mut resp = ApiResponse::error(format!("Connection failed: {}", e));
+            resp.hint = Some(serde_json::json!({ "authPath": e.auth_path }));
+            Err(resp)
         }
     }
 }

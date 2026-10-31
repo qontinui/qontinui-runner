@@ -64,6 +64,65 @@ pub struct SdkConnection {
     /// Extension origins. A WS registration records its browser principal here
     /// so a later foreign registration can be compared against it.
     pub activated_by: Option<crate::mcp::relay_binding::Principal>,
+    /// What `client` does with the operator's bearer.
+    pub bearer: ConnectionBearer,
+}
+
+/// What a stored connection's client does with the operator's bearer. It is decided
+/// at the handshake and holds until the next one, or until
+/// [`recheck_stored_bearers`] settles a [`Self::WithheldListUnreadable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionBearer {
+    /// Sent on every request.
+    Sent,
+    /// Held back because of what the target was: a foreign host or a forwarder. A
+    /// later handshake may decide differently. Only a handshake may, because the port
+    /// reading local says nothing about what it reaches by the time it is next used.
+    WithheldFromTarget,
+    /// Held back only because the adb list could not be read, so nothing is known
+    /// against the target.
+    WithheldListUnreadable,
+    /// Never part of this connection: no usable one was stored, or it did not come
+    /// from a connect handshake.
+    Absent,
+}
+
+impl SdkConnection {
+    /// Whether `client` would send the operator's bearer to an off-machine
+    /// forwarder: a connection made while its port was a local relay keeps the
+    /// bearer after a forwarder is handed that port.
+    fn sends_bearer_off_machine(&self) -> bool {
+        self.bearer == ConnectionBearer::Sent
+            && classify_bearer_target(&self.app_url, Vec::new) == BearerTarget::OffMachineForwarder
+    }
+
+    /// Whether this connection holds the bearer back only for want of an adb list that
+    /// now reads, and names nothing against its port.
+    fn waits_only_on_the_list(&self) -> bool {
+        self.bearer == ConnectionBearer::WithheldListUnreadable
+            && classify_bearer_target(&self.app_url, Vec::new) == BearerTarget::Loopback
+    }
+
+    /// Whether this connection's handshake no longer holds, and only a new one can
+    /// put it right. `forward_list_known` is the verdict of the adb list read the
+    /// caller just ran.
+    /// - It sends the bearer to a port that is a forwarder, or to a loopback port
+    ///   that might be one because the list cannot be read.
+    /// - It held the bearer back from a port known to be a local relay, which would
+    ///   answer it with 401s.
+    fn bearer_decision_is_stale(&self, forward_list_known: bool) -> bool {
+        let target = classify_bearer_target(&self.app_url, Vec::new);
+        match self.bearer {
+            ConnectionBearer::Sent => {
+                target == BearerTarget::OffMachineForwarder
+                    || (target == BearerTarget::Loopback && !forward_list_known)
+            }
+            ConnectionBearer::WithheldFromTarget | ConnectionBearer::WithheldListUnreadable => {
+                target == BearerTarget::Loopback && forward_list_known
+            }
+            ConnectionBearer::Absent => false,
+        }
+    }
 }
 
 /// Manages multiple simultaneous SDK connections with one active connection
@@ -86,11 +145,72 @@ impl SdkConnectionManager {
         }
     }
 
-    /// Get the currently active connection
+    /// Get the currently active connection, unless using it would send the
+    /// operator's bearer off this machine.
     pub fn active_connection(&self) -> Option<&SdkConnection> {
         self.active_url
             .as_ref()
             .and_then(|url| self.connections.get(url))
+            .filter(|conn| !conn.sends_bearer_off_machine())
+    }
+
+    /// Make the stored connection to `url` active and describe it, with no
+    /// handshake. A connection whose handshake no longer holds gets `None` instead,
+    /// and is dropped if it would send the bearer off this machine. Any other stays
+    /// the target until a new handshake replaces it: with no stored connection a
+    /// dispatch falls back to the runner's own UI.
+    pub(crate) fn reuse_stored_connection(
+        &mut self,
+        url: &str,
+        forward_list_known: bool,
+    ) -> Option<ConnectResponse> {
+        let conn = self.connections.get(url)?;
+        if conn.bearer_decision_is_stale(forward_list_known) {
+            if conn.sends_bearer_off_machine() {
+                self.drop_connection_sending_bearer_off_machine(url);
+            }
+            return None;
+        }
+        let response = ConnectResponse {
+            app: conn.app_info.clone(),
+            url: conn.app_url.clone(),
+            base_path: conn.base_path.clone(),
+            // No handshake, so the bearer choice was not re-evaluated. `"none"`
+            // would falsely read as "unauthenticated".
+            auth_path: AUTH_PATH_REUSED.to_string(),
+        };
+        self.active_url = Some(url.to_string());
+        self.active_responsive = None;
+        self.active_responsive_checked_at = 0;
+        Some(response)
+    }
+
+    /// Drop every connection whose client would send the operator's bearer off this
+    /// machine, so the token leaves memory and every read of the connections agrees.
+    /// [`Self::active_connection`] already refuses such a client until this runs.
+    pub fn drop_connections_sending_bearer_off_machine(&mut self) {
+        let doomed: Vec<String> = self
+            .connections
+            .iter()
+            .filter(|(_, conn)| conn.sends_bearer_off_machine())
+            .map(|(url, _)| url.clone())
+            .collect();
+        for url in doomed {
+            self.drop_connection_sending_bearer_off_machine(&url);
+        }
+    }
+
+    fn drop_connection_sending_bearer_off_machine(&mut self, url: &str) {
+        warn!(
+            "SDK relay client: dropping the connection to {url}: its port now forwards off this \
+             machine"
+        );
+        self.connections.remove(url);
+        if self.active_url.as_deref() == Some(url) {
+            self.active_url = None;
+            self.active_responsive = None;
+            self.active_responsive_checked_at = 0;
+        }
     }
 }
 
@@ -230,14 +350,20 @@ struct ConnectionHealthResult {
 ///   handshake ran, so the bearer choice was NOT re-evaluated (whatever was
 ///   attached at original connect time is still in effect).
 /// - `"withheld_foreign_host"` — the target is neither a Qontinui web origin
-///   the bearer is minted for nor a loopback relay, so NO bearer was sent and
-///   none was loaded (see [`choose_connect_bearer`]).
+///   the bearer is minted for nor a loopback relay on this machine (a loopback
+///   port that forwards to a device counts as foreign), so NO bearer was sent
+///   and none was loaded (see [`choose_connect_bearer`]).
+/// - `"withheld_forward_list_unreadable"` — the target is on loopback, but the adb
+///   server's forward list could not be read, so the port might reach a phone. NO
+///   bearer was sent; a connect, or the next 30s re-check, decides afresh once the
+///   list is readable again.
 const AUTH_PATH_COGNITO: &str = "cognito";
 const AUTH_PATH_DEVICE_JWT: &str = "device-jwt";
 const AUTH_PATH_DEVICE_JWT_EXPIRED: &str = "device-jwt-expired-skipped";
 const AUTH_PATH_NONE: &str = "none";
 const AUTH_PATH_REUSED: &str = "reused";
 const AUTH_PATH_WITHHELD_FOREIGN_HOST: &str = "withheld_foreign_host";
+const AUTH_PATH_WITHHELD_FORWARD_LIST: &str = "withheld_forward_list_unreadable";
 
 /// Connect response
 #[derive(Debug, Serialize)]
@@ -605,50 +731,27 @@ async fn handle_connect(
     let url = crate::mcp::types::canonical_loopback_url(req.url.trim_end_matches('/'));
     info!(url = %url, "Connecting to SDK app");
 
-    // Check if we're already connected to this URL
-    {
-        let mut manager = state.sdk_connection.lock().await;
-        if manager.connections.contains_key(&url) {
-            // Already connected — just make it active
-            manager.active_url = Some(url.clone());
-            manager.active_responsive = None;
-            manager.active_responsive_checked_at = 0;
-            let conn = manager.connections.get(&url).unwrap();
-            let response = ConnectResponse {
-                app: conn.app_info.clone(),
-                url: conn.app_url.clone(),
-                base_path: conn.base_path.clone(),
-                // No fresh handshake was performed — we reused an existing
-                // connection — so the bearer choice was not re-evaluated.
-                // `"none"` would falsely read as "unauthenticated".
-                auth_path: AUTH_PATH_REUSED.to_string(),
-            };
-            info!(
-                "Switched active connection to already-connected SDK app: {}",
-                response.app.app_name
-            );
-            return Json(ApiResponse::success(response));
-        }
-    }
-
-    // Delegate to the shared connect_sdk_app function
-    match connect_sdk_app(
+    match connect_or_reuse(
         &state.sdk_connection,
         &url,
-        req.port,
-        req.app_id,
-        req.app_name,
-        req.app_type,
-        req.framework,
+        ConnectHints {
+            port: req.port,
+            app_id: req.app_id,
+            app_name: req.app_name,
+            app_type: req.app_type,
+            framework: req.framework,
+        },
     )
     .await
     {
         Ok(response) => {
-            // Fire-and-forget: push element reliability data for CTR seeding
-            let state_clone = state.clone();
-            tokio::spawn(async move {
-                push_ctr_reliability_to_sdk(&state_clone).await;
-            });
+            if response.auth_path != AUTH_PATH_REUSED {
+                // Fire-and-forget: push element reliability data for CTR seeding
+                let state_clone = state.clone();
+                tokio::spawn(async move {
+                    push_ctr_reliability_to_sdk(&state_clone).await;
+                });
+            }
             Json(ApiResponse::success(response))
         }
         Err(e) => {
@@ -662,11 +765,98 @@ async fn handle_connect(
     }
 }
 
-/// Connect to an SDK app by URL. Shared logic used by both `handle_connect`
-/// (user-initiated) and auto-connect (proxy creation).
+/// Read the adb server's list and settle every stored connection against it, for
+/// whatever changes between connects. A connection sending the bearer to a known
+/// forwarder is dropped. Once the list reads, a connection that held the bearer back
+/// only because it could not be read is decided from what it says: a listed port is
+/// now withheld for what it is, and any other loopback port gets a client with a fresh
+/// decision, in place, keeping its target. An unreadable list settles nothing else: a
+/// stored client keeps its last decision, since dropping it would turn the next
+/// dispatch onto the runner's own UI, and the next connect or switch refuses it.
+pub async fn recheck_stored_bearers(sdk_connection: &tokio::sync::Mutex<SdkConnectionManager>) {
+    let forward_list_known = crate::mcp::adb_helper::refresh_adb_listed_forwarders().await;
+    {
+        let mut manager = sdk_connection.lock().await;
+        manager.drop_connections_sending_bearer_off_machine();
+        if !forward_list_known {
+            return;
+        }
+        for conn in manager.connections.values_mut() {
+            if conn.bearer == ConnectionBearer::WithheldListUnreadable
+                && classify_bearer_target(&conn.app_url, Vec::new)
+                    == BearerTarget::OffMachineForwarder
+            {
+                conn.bearer = ConnectionBearer::WithheldFromTarget;
+            }
+        }
+        if !manager
+            .connections
+            .values()
+            .any(SdkConnection::waits_only_on_the_list)
+        {
+            return;
+        }
+    }
+
+    let choice = load_operator_bearer().await;
+    if choice.bearer.is_none() {
+        // Left withheld, so the next re-check decides again rather than a connection with
+        // no bearer reading as settled once the operator pairs.
+        return;
+    }
+    let mut manager = sdk_connection.lock().await;
+    for (url, conn) in manager
+        .connections
+        .iter_mut()
+        .filter(|(_, conn)| conn.waits_only_on_the_list())
+    {
+        let builder = connect_client_builder(BearerTarget::Loopback);
+        match connection_client(url, builder, choice.clone()) {
+            (Ok(client), bearer) => {
+                info!(
+                    "SDK relay client: decided the bearer for {url} afresh: the adb forward \
+                     list reads again and does not name its port ({})",
+                    choice.auth_path
+                );
+                conn.client = client;
+                conn.bearer = bearer;
+            }
+            (Err(e), _) => warn!("SDK relay client: could not rebuild the client for {url}: {e}"),
+        }
+    }
+}
+
+/// What `POST /ui-bridge/sdk/connect` does: make the stored connection to `url`
+/// active if its handshake still holds, and otherwise make a new handshake.
+pub(crate) async fn connect_or_reuse(
+    sdk_connection: &tokio::sync::Mutex<SdkConnectionManager>,
+    url: &str,
+    hints: ConnectHints,
+) -> Result<ConnectResponse, ConnectError> {
+    let forward_list_known = refresh_forward_list_for(url).await;
+
+    // Check if we're already connected to this URL
+    if let Some(response) = sdk_connection
+        .lock()
+        .await
+        .reuse_stored_connection(url, forward_list_known)
+    {
+        info!(
+            "Switched active connection to already-connected SDK app: {}",
+            response.app.app_name
+        );
+        return Ok(response);
+    }
+
+    connect_with_forward_list(sdk_connection, url, forward_list_known, hints).await
+}
+
+/// Connect to an SDK app by URL, with no stored connection reused. The
+/// physical-device connect uses it
+/// ([`crate::mcp::physical_device_api::connect_device_at`]).
 ///
-/// When called from auto-connect, the `app_*` / `framework` hints will be `None`
-/// and values are inferred from the health response.
+/// An `app_*` or `framework` hint left `None` is inferred from the health
+/// response.
 ///
 /// The operator's bearer rides along only to an origin it is minted for — see
 /// [`choose_connect_bearer`].
@@ -679,11 +869,11 @@ pub async fn connect_sdk_app(
     app_type: Option<String>,
     framework: Option<String>,
 ) -> Result<ConnectResponse, ConnectError> {
-    let (target, bearer) =
-        choose_connect_bearer(url, qontinui_bearer_origins, load_operator_bearer).await;
-    connect_sdk_app_with(
+    let forward_list_known = refresh_forward_list_for(url).await;
+    connect_with_forward_list(
         sdk_connection,
         url,
+        forward_list_known,
         ConnectHints {
             port: port_hint,
             app_id,
@@ -691,6 +881,47 @@ pub async fn connect_sdk_app(
             app_type,
             framework,
         },
+    )
+    .await
+}
+
+/// Re-read the adb server's forward list when `url` is on loopback, the only place
+/// the list can change the bearer decision. Returns whether the decision can rely on
+/// it, which is always so for any other host.
+async fn refresh_forward_list_for(url: &str) -> bool {
+    let on_loopback = url::Url::parse(url).is_ok_and(|url| is_loopback_relay_host(&url));
+    !on_loopback || crate::mcp::adb_helper::refresh_adb_listed_forwarders().await
+}
+
+/// The handshake with the production bearer sources, given the verdict of a
+/// [`refresh_forward_list_for`] the caller just ran. A loopback target whose port
+/// cannot be told from a forward to a phone gets no bearer.
+async fn connect_with_forward_list(
+    sdk_connection: &tokio::sync::Mutex<SdkConnectionManager>,
+    url: &str,
+    forward_list_known: bool,
+    hints: ConnectHints,
+) -> Result<ConnectResponse, ConnectError> {
+    let (target, bearer) = choose_connect_bearer(url, qontinui_bearer_origins, || async move {
+        if forward_list_known {
+            load_operator_bearer().await
+        } else {
+            info!(
+                "SDK relay client: withholding the operator bearer from {url} — the adb forward \
+                 list could not be read, so this port might reach a phone \
+                 ({AUTH_PATH_WITHHELD_FORWARD_LIST})"
+            );
+            BearerChoice {
+                bearer: None,
+                auth_path: AUTH_PATH_WITHHELD_FORWARD_LIST,
+            }
+        }
+    })
+    .await;
+    connect_sdk_app_with(
+        sdk_connection,
+        url,
+        hints,
         bearer,
         connect_client_builder(target),
     )
@@ -709,11 +940,17 @@ pub async fn connect_sdk_app(
 /// admits all of `127.0.0.0/8` and the IPv4-mapped form, and a process that
 /// never ran that export has no bypass at all.
 ///
+/// An off-machine forwarder is on loopback too, so it is dialled direct as well:
+/// a proxy could not reach this machine's port, and the forwarder carries the
+/// request onward itself.
+///
 /// Every other target keeps the proxy: a foreign host is sent no bearer, and
 /// a Qontinui origin is the backend the operator configured.
 fn connect_client_builder(target: BearerTarget) -> reqwest::ClientBuilder {
     match target {
-        BearerTarget::Loopback => reqwest::Client::builder().no_proxy(),
+        BearerTarget::Loopback | BearerTarget::OffMachineForwarder => {
+            reqwest::Client::builder().no_proxy()
+        }
         BearerTarget::QontinuiOrigin | BearerTarget::Foreign => reqwest::Client::builder(),
     }
 }
@@ -721,7 +958,7 @@ fn connect_client_builder(target: BearerTarget) -> reqwest::ClientBuilder {
 /// The caller's identity hints for a connect; every `None` is read from the
 /// app's `/health` answer instead.
 #[derive(Debug, Default)]
-struct ConnectHints {
+pub(crate) struct ConnectHints {
     port: Option<u16>,
     app_id: Option<String>,
     app_name: Option<String>,
@@ -731,6 +968,7 @@ struct ConnectHints {
 
 /// What the connect handshake sends as `Authorization`, and the
 /// `AUTH_PATH_*` tag that says why — surfaced on the connect response.
+#[derive(Clone)]
 struct BearerChoice {
     /// `(token, human-readable kind)` to attach, or `None` to send no header.
     bearer: Option<(String, &'static str)>,
@@ -741,8 +979,12 @@ struct BearerChoice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BearerTarget {
     /// A relay on THIS machine's loopback (`127.0.0.0/8`, `::1`, `localhost`):
-    /// the dev web relay, a temp runner, an `adb forward`.
+    /// the dev web relay, a temp runner, a local emulator's `adb forward`.
     Loopback,
+    /// A loopback port known to carry traffic to another machine, whether or not
+    /// this runner opened it. Dialled like [`Self::Loopback`] and sent no bearer, like [`Self::Foreign`].
+    /// See [`crate::mcp::transport::mark_off_machine_forwarder`].
+    OffMachineForwarder,
     /// An origin the bearer is minted for — see [`qontinui_bearer_origins`].
     QontinuiOrigin,
     /// Anything else, including a URL that does not parse as `http(s)`.
@@ -763,14 +1005,18 @@ enum BearerTarget {
 /// the bearer across the network in the clear. Loopback is the one host class
 /// admitted on any scheme and port — see [`is_loopback_relay_host`].
 ///
-/// A LAN address is FOREIGN by design. A physical device found over mDNS is
-/// dialled at `http://<lan-ip>:<port>` (the LAN transport in `mcp_api.rs`,
-/// connected through `physical_device_api::connect_device`), and that connect
-/// now carries no bearer. The hop is plaintext over a shared network, and the
-/// address is whatever an mDNS answer announced. A LAN UI Bridge wrapper that
-/// relied on the operator's `Authorization` header therefore fails its auth
-/// after this change, and it has to authenticate another way (its pairing
-/// token) rather than on the operator's credential.
+/// A physical device gets no bearer, however it is reached. One found over mDNS
+/// is dialled at `http://<lan-ip>:<port>` (the LAN transport in `mcp_api.rs`) and
+/// is foreign. The others are dialled at a local port that forwards to the
+/// device: a TCP proxy for one registered by hand
+/// (`POST /ui-bridge/devices/register-lan`, which takes any `IP:port`), a tunnel
+/// for Cloud, `adb` for Android and the sidecar for iOS. Their URLs are loopback,
+/// and only [`crate::mcp::transport::is_off_machine_forwarder`] tells them apart.
+/// The far end is the device, not a host the bearer is minted for, and any app on
+/// it can hold the port. The `ui-bridge-native` server reads no `Authorization`
+/// header. A wrapper that did rely on the operator's header would fail its auth,
+/// and the runner sends nothing in its place: `PhysicalDeviceInfo::pairing_token`
+/// is not sent on a connect.
 fn classify_bearer_target(
     url: &str,
     qontinui_origins: impl FnOnce() -> Vec<url::Origin>,
@@ -780,7 +1026,14 @@ fn classify_bearer_target(
         _ => return BearerTarget::Foreign,
     };
     if is_loopback_relay_host(&parsed) {
-        return BearerTarget::Loopback;
+        let forwards_off_machine = parsed
+            .port_or_known_default()
+            .is_some_and(crate::mcp::transport::is_off_machine_forwarder);
+        return if forwards_off_machine {
+            BearerTarget::OffMachineForwarder
+        } else {
+            BearerTarget::Loopback
+        };
     }
     if qontinui_origins().contains(&parsed.origin()) {
         BearerTarget::QontinuiOrigin
@@ -869,10 +1122,11 @@ where
     let target = classify_bearer_target(url, qontinui_origins);
     let choice = match target {
         BearerTarget::Loopback | BearerTarget::QontinuiOrigin => load_bearer().await,
-        BearerTarget::Foreign => {
+        BearerTarget::OffMachineForwarder | BearerTarget::Foreign => {
             info!(
                 "SDK relay client: withholding the operator bearer from {url} — not a Qontinui \
-                 web origin or a loopback relay ({AUTH_PATH_WITHHELD_FOREIGN_HOST})"
+                 web origin or a loopback relay on this machine \
+                 ({AUTH_PATH_WITHHELD_FOREIGN_HOST})"
             );
             BearerChoice {
                 bearer: None,
@@ -989,6 +1243,56 @@ fn bearer_redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
+/// The client a connection talks through, given its bearer decision, and what that
+/// client does with the bearer.
+fn connection_client(
+    url: &str,
+    builder: reqwest::ClientBuilder,
+    choice: BearerChoice,
+) -> (reqwest::Result<reqwest::Client>, ConnectionBearer) {
+    let BearerChoice { bearer, auth_path } = choice;
+    let mut connection_bearer = ConnectionBearer::Absent;
+    // 30s request timeout matches the UI Bridge IPC timeout — the app's snapshot/elements
+    // endpoints proxy through the IPC layer and can take >10s on cold pages.
+    let mut builder = builder
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(5));
+
+    match bearer {
+        Some((token, kind)) => {
+            match reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) {
+                Ok(mut value) => {
+                    value.set_sensitive(true);
+                    let mut headers = reqwest::header::HeaderMap::new();
+                    headers.insert(reqwest::header::AUTHORIZATION, value);
+                    builder = builder
+                        .default_headers(headers)
+                        .redirect(bearer_redirect_policy());
+                    connection_bearer = ConnectionBearer::Sent;
+                    info!("SDK relay client: attached {kind} bearer for {}", url);
+                }
+                Err(e) => warn!("SDK relay client: malformed bearer, connecting without auth: {e}"),
+            }
+        }
+        None if auth_path == AUTH_PATH_DEVICE_JWT_EXPIRED => {
+            // Already logged at `warn!` by `load_operator_bearer`, with the
+            // expiry delta.
+        }
+        // Already logged where they were decided, and no bearer was even loaded.
+        None if auth_path == AUTH_PATH_WITHHELD_FOREIGN_HOST => {
+            connection_bearer = ConnectionBearer::WithheldFromTarget;
+        }
+        None if auth_path == AUTH_PATH_WITHHELD_FORWARD_LIST => {
+            connection_bearer = ConnectionBearer::WithheldListUnreadable;
+        }
+        None => debug!(
+            "SDK relay client: no Cognito session and no device-JWT (legacy/local install or \
+             not paired); connecting without auth"
+        ),
+    }
+    (builder.build(), connection_bearer)
+}
+
 /// [`connect_sdk_app`] with the bearer already chosen and the client builder
 /// supplied — the seam the bearer tests drive with a builder that resolves
 /// their test host names to a local recorder.
@@ -1006,45 +1310,9 @@ async fn connect_sdk_app_with(
         app_type,
         framework,
     } = hints;
-    let BearerChoice { bearer, auth_path } = choice;
-    // Create HTTP client with timeout
-    // 30s request timeout matches the UI Bridge IPC timeout — the app's snapshot/elements
-    // endpoints proxy through the IPC layer and can take >10s on cold pages.
-    let mut builder = builder
-        .timeout(std::time::Duration::from_secs(30))
-        .connect_timeout(std::time::Duration::from_secs(5));
-
-    match bearer {
-        Some((token, kind)) => {
-            match reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) {
-                Ok(mut value) => {
-                    value.set_sensitive(true);
-                    let mut headers = reqwest::header::HeaderMap::new();
-                    headers.insert(reqwest::header::AUTHORIZATION, value);
-                    builder = builder
-                        .default_headers(headers)
-                        .redirect(bearer_redirect_policy());
-                    info!("SDK relay client: attached {kind} bearer for {}", url);
-                }
-                Err(e) => warn!("SDK relay client: malformed bearer, connecting without auth: {e}"),
-            }
-        }
-        None if auth_path == AUTH_PATH_DEVICE_JWT_EXPIRED => {
-            // Already logged at `warn!` by `load_operator_bearer`, with the
-            // expiry delta.
-        }
-        None if auth_path == AUTH_PATH_WITHHELD_FOREIGN_HOST => {
-            // Already logged by `choose_connect_bearer`: a foreign host never
-            // gets the operator's bearer, so none was even loaded.
-        }
-        None => debug!(
-            "SDK relay client: no Cognito session and no device-JWT (legacy/local install or \
-             not paired); connecting without auth"
-        ),
-    }
-    let auth_path = auth_path.to_string();
-
-    let client = builder.build().map_err(|e| ConnectError {
+    let auth_path = choice.auth_path.to_string();
+    let (client, connection_bearer) = connection_client(url, builder, choice);
+    let client = client.map_err(|e| ConnectError {
         message: format!("Failed to create HTTP client: {}", e),
         auth_path: auth_path.clone(),
     })?;
@@ -1131,6 +1399,7 @@ async fn connect_sdk_app_with(
             transport_kind: None,
             physical_device_id: None,
             activated_by: None,
+            bearer: connection_bearer,
         },
     );
     manager.active_url = Some(url.to_string());
@@ -3484,26 +3753,25 @@ pub(crate) async fn handle_switch(
     Json(req): Json<SwitchRequest>,
 ) -> Json<ApiResponse<ConnectResponse>> {
     let url = req.url.trim_end_matches('/').to_string();
+    let forward_list_known = refresh_forward_list_for(&url).await;
     let mut manager = state.sdk_connection.lock().await;
 
-    if let Some(conn) = manager.connections.get(&url) {
-        let response = ConnectResponse {
-            app: conn.app_info.clone(),
-            url: conn.app_url.clone(),
-            base_path: conn.base_path.clone(),
-            // Switching to an already-established connection — no handshake,
-            // so the bearer choice was not re-evaluated. `"none"` would
-            // falsely read as "unauthenticated".
-            auth_path: AUTH_PATH_REUSED.to_string(),
-        };
-        manager.active_url = Some(url.clone());
-        manager.active_responsive = None;
-        manager.active_responsive_checked_at = 0;
+    let stale = manager
+        .connections
+        .get(&url)
+        .is_some_and(|conn| conn.bearer_decision_is_stale(forward_list_known));
+    if let Some(response) = manager.reuse_stored_connection(&url, forward_list_known) {
         info!(
             "Switched active SDK connection to: {} ({})",
             response.app.app_name, url
         );
         Json(ApiResponse::success(response))
+    } else if stale {
+        Json(ApiResponse::error(format!(
+            "The stored connection to {url} was not reused: the bearer decision made at its \
+             handshake no longer holds, or the adb forward list cannot be read to confirm it. \
+             Connect to it again with POST /ui-bridge/sdk/connect."
+        )))
     } else {
         let available: Vec<&String> = manager.connections.keys().collect();
         Json(ApiResponse::error(format!(
@@ -8915,6 +9183,160 @@ mod connect_bearer_scope_tests {
         }
     }
 
+    /// A loopback port marked as a forwarder is classified as one under every
+    /// loopback spelling, without reading settings. An unmarked port stays a
+    /// loopback relay. The port is held bound so no peer test can be handed it.
+    #[test]
+    fn a_marked_loopback_port_is_an_off_machine_forwarder_under_every_spelling() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a port to mark");
+        let port = held.local_addr().expect("local addr").port();
+        let unmarked_held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let unmarked = unmarked_held.local_addr().expect("local addr").port();
+        crate::mcp::transport::mark_off_machine_forwarder(port);
+        let _forget = crate::mcp::transport::ForgetForwarder(port);
+
+        let no_settings = || -> Vec<url::Origin> {
+            panic!("a loopback target must not consult the configured origins")
+        };
+        for host in ["127.0.0.1", "localhost", "[::1]", "127.9.9.9"] {
+            let url = format!("http://{host}:{port}");
+            assert_eq!(
+                classify_bearer_target(&url, no_settings),
+                BearerTarget::OffMachineForwarder,
+                "{url}"
+            );
+        }
+        assert_eq!(
+            classify_bearer_target(&format!("http://127.0.0.1:{unmarked}"), no_settings),
+            BearerTarget::Loopback
+        );
+    }
+
+    /// Store a connection to a fresh recorder and make it active.
+    async fn stored_connection(
+        bearer: Option<(String, &'static str)>,
+    ) -> (u16, String, SdkConnectionManager) {
+        stored_connection_choosing(BearerChoice {
+            bearer,
+            auth_path: AUTH_PATH_COGNITO,
+        })
+        .await
+    }
+
+    /// [`stored_connection`] with the whole bearer decision given.
+    async fn stored_connection_choosing(
+        choice: BearerChoice,
+    ) -> (u16, String, SdkConnectionManager) {
+        let (port, _seen) = spawn_recorder().await;
+        let url = format!("http://127.0.0.1:{port}");
+        let manager = tokio::sync::Mutex::new(SdkConnectionManager::new());
+        connect_sdk_app_with(
+            &manager,
+            &url,
+            ConnectHints::default(),
+            choice,
+            connect_client_builder(BearerTarget::Loopback),
+        )
+        .await
+        .expect("connect to the recorder");
+        (port, url, manager.into_inner())
+    }
+
+    /// A client holding the bearer is used by nothing once a forwarder holds its
+    /// port: not as the active connection, and not by a reuse.
+    #[tokio::test]
+    async fn a_stored_bearer_client_is_not_used_once_its_port_is_a_forwarder() {
+        let bearer = Some(("test-operator-token".to_string(), "test"));
+        let (port, url, mut manager) = stored_connection(bearer).await;
+        assert!(manager.active_connection().is_some(), "a live local relay");
+        assert_eq!(
+            manager
+                .reuse_stored_connection(&url, true)
+                .map(|r| r.auth_path),
+            Some(AUTH_PATH_REUSED.to_string())
+        );
+
+        crate::mcp::transport::mark_off_machine_forwarder(port);
+        let _forget = crate::mcp::transport::ForgetForwarder(port);
+        assert!(manager.active_connection().is_none());
+        assert!(manager.reuse_stored_connection(&url, true).is_none());
+        assert!(!manager.connections.contains_key(&url));
+        assert_eq!(manager.active_url, None);
+    }
+
+    /// A device's own connection never held the bearer, so it stays in use.
+    #[tokio::test]
+    async fn a_bearerless_client_stays_usable_on_a_forwarder() {
+        let (port, url, mut manager) = stored_connection(None).await;
+        crate::mcp::transport::mark_off_machine_forwarder(port);
+        let _forget = crate::mcp::transport::ForgetForwarder(port);
+        assert!(manager.active_connection().is_some());
+        assert!(manager.reuse_stored_connection(&url, true).is_some());
+    }
+
+    /// A connection that held the bearer back stays in use while the reason holds,
+    /// and is decided again once its port is a plain local relay, which would
+    /// otherwise answer it with 401s for good.
+    #[tokio::test]
+    async fn a_withheld_connection_is_decided_again_once_its_port_is_local() {
+        let (port, url, mut manager) = stored_connection_choosing(BearerChoice {
+            bearer: None,
+            auth_path: AUTH_PATH_WITHHELD_FOREIGN_HOST,
+        })
+        .await;
+        crate::mcp::transport::mark_off_machine_forwarder(port);
+        assert!(manager.reuse_stored_connection(&url, true).is_some());
+        assert!(manager.active_connection().is_some());
+
+        crate::mcp::transport::unmark_off_machine_forwarder(port);
+        assert!(manager.reuse_stored_connection(&url, true).is_none());
+        assert!(
+            manager.connections.contains_key(&url),
+            "until a new handshake"
+        );
+    }
+
+    /// The re-check's sweep drops a client that would send the bearer off this machine,
+    /// and leaves no active connection pointing at it. It leaves a bearerless one.
+    #[tokio::test]
+    async fn the_sweep_drops_only_a_bearer_client_whose_port_is_a_forwarder() {
+        let bearer = Some(("test-operator-token".to_string(), "test"));
+        let (port, url, mut manager) = stored_connection(bearer).await;
+
+        manager.drop_connections_sending_bearer_off_machine();
+        assert!(manager.connections.contains_key(&url), "a live local relay");
+
+        crate::mcp::transport::mark_off_machine_forwarder(port);
+        let _forget = crate::mcp::transport::ForgetForwarder(port);
+        manager.drop_connections_sending_bearer_off_machine();
+        assert!(!manager.connections.contains_key(&url));
+        assert_eq!(manager.active_url, None);
+
+        let (other_port, other_url, mut other) = stored_connection(None).await;
+        crate::mcp::transport::mark_off_machine_forwarder(other_port);
+        let _forget_other = crate::mcp::transport::ForgetForwarder(other_port);
+        other.drop_connections_sending_bearer_off_machine();
+        assert!(other.connections.contains_key(&other_url));
+    }
+
+    /// An unreadable forward list makes any loopback port a possible forward to a
+    /// phone: a reuse refuses a client holding the bearer but keeps it as the target,
+    /// and does not count the list against a client holding none.
+    #[tokio::test]
+    async fn an_unknown_forward_list_refuses_only_a_client_sending_the_bearer() {
+        let bearer = Some(("test-operator-token".to_string(), "test"));
+        let (_, url, mut manager) = stored_connection(bearer).await;
+        assert!(manager.reuse_stored_connection(&url, false).is_none());
+        assert!(manager.active_connection().is_some(), "still the target");
+
+        let (_, url, mut manager) = stored_connection_choosing(BearerChoice {
+            bearer: None,
+            auth_path: AUTH_PATH_WITHHELD_FORWARD_LIST,
+        })
+        .await;
+        assert!(manager.reuse_stored_connection(&url, false).is_some());
+    }
+
     /// No configured origin admits nothing but loopback.
     #[test]
     fn with_no_configured_origin_every_remote_host_is_foreign() {
@@ -9058,7 +9480,9 @@ mod connect_bearer_scope_tests {
             // two test host names need a builder that resolves them to the
             // local recorder, so no real host is ever contacted.
             let builder = match target {
-                BearerTarget::Loopback => connect_client_builder(target),
+                BearerTarget::Loopback | BearerTarget::OffMachineForwarder => {
+                    connect_client_builder(target)
+                }
                 BearerTarget::QontinuiOrigin | BearerTarget::Foreign => reqwest::Client::builder()
                     .no_proxy()
                     .resolve("qontinui-web.test", local)
