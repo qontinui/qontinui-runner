@@ -1532,6 +1532,8 @@ mod script_tests {
     const STOP_HOOK: &str = include_str!("../../resources/session-restore/claude_stop_hook.sh");
     const PRECOMPACT_HOOK: &str =
         include_str!("../../resources/session-restore/claude_precompact_hook.sh");
+    const PERMISSION_REQUEST_HOOK: &str =
+        include_str!("../../resources/session-restore/claude_permission_request_hook.sh");
 
     /// Every rung of the cascade, exercised unconditionally. `jq` is rung ONE
     /// -- the rung most production boxes actually run -- so skipping it when the
@@ -1908,6 +1910,471 @@ mod script_tests {
         }
     }
 
+    // ── The PermissionRequest hook (plan 2026-10-23-runner-sessions-stop-at-
+    // permission-dialogs-so-accept-them-by-default-with-a-tenant-switch,
+    // Phase 2). It must print Claude Code's allow envelope ONLY for a
+    // `decision: allow` answer, and NOTHING on any failure — a stray byte on
+    // its stdout would be parsed as a hook decision.
+
+    /// Exactly what the hook prints on an allow.
+    const ALLOW_ENVELOPE: &str = r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#;
+
+    /// A Phase 0-shaped PermissionRequest payload.
+    const PR_PAYLOAD: &str = r#"{"session_id":"c4095874-264a-4ce7-9c7f-7d6c9b1748ba","hook_event_name":"PermissionRequest","permission_mode":"default","tool_name":"Bash","tool_input":{"command":"rmdir $X/"}}"#;
+
+    /// One PermissionRequest-hook run: stdout, the curl argv (empty when curl
+    /// was never called), and the wall time.
+    struct PrRun {
+        stdout: String,
+        curl_args: Vec<String>,
+        elapsed: Duration,
+    }
+
+    /// Run the bundled PermissionRequest hook on a stripped PATH with NO JSON
+    /// parser at all (the hook must need none). `bin_setup` populates the bin
+    /// dir: a fake curl, the real one, or nothing.
+    fn run_pr_hook(envs: &[(&str, &str)], bin_setup: impl FnOnce(&Path, &Path)) -> PrRun {
+        let _serial = exe_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let bash = which_host("bash").expect("bash is on PATH (this module drives bash)");
+        std::os::unix::fs::symlink(&bash, bin.join("bash")).unwrap();
+        // `rm` removes the hook's private header file; no other tool is given.
+        let rm = which_host("rm").expect("rm is on PATH");
+        std::os::unix::fs::symlink(&rm, bin.join("rm")).unwrap();
+        let hook_tmp = tmp.path().join("hook-tmp");
+        std::fs::create_dir(&hook_tmp).unwrap();
+        let argv = tmp.path().join("curl-argv.txt");
+        bin_setup(&bin, &argv);
+
+        let hook = tmp.path().join("claude_permission_request_hook.sh");
+        write_exe(&hook, PERMISSION_REQUEST_HOOK);
+        let payload_file = tmp.path().join("payload.json");
+        std::fs::write(&payload_file, PR_PAYLOAD).unwrap();
+        let mut cmd = Command::new(&bash);
+        cmd.arg("-c")
+            .arg(format!(
+                "exec '{}' '{}' < '{}'",
+                bash.display(),
+                hook.display(),
+                payload_file.display()
+            ))
+            .env_clear()
+            .env("PATH", bin.display().to_string())
+            .env("TMPDIR", hook_tmp.display().to_string())
+            .envs(envs.iter().copied());
+        let started = std::time::Instant::now();
+        let res = output_with_timeout(cmd, SCRIPT_BUDGET).expect("the hook runs inside its budget");
+        let elapsed = started.elapsed();
+        assert!(
+            res.status.success(),
+            "the PermissionRequest hook must never fail a session: {}",
+            String::from_utf8_lossy(&res.stderr)
+        );
+        // The private header file never outlives the hook.
+        let left: Vec<_> = std::fs::read_dir(&hook_tmp).unwrap().collect();
+        assert!(left.is_empty(), "the hook left files behind: {left:?}");
+        PrRun {
+            stdout: String::from_utf8_lossy(&res.stdout).into_owned(),
+            curl_args: std::fs::read_to_string(&argv)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect(),
+            elapsed,
+        }
+    }
+
+    /// The per-spawn nonce the runner injects; the hook never sends it and
+    /// requires the pad's exact echo.
+    const PR_NONCE: &str = "0123456789abcdef0123456789abcdef";
+
+    /// The per-spawn request key the hook SENDS (the runner derives it from
+    /// the nonce; the hook only checks its shape).
+    const PR_KEY: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    const PR_SEAM: [(&str, &str); 4] = [
+        ("QONTINUI_RUNNER_API_PORT", "9876"),
+        ("QONTINUI_TERMINAL_ID", "term-1"),
+        ("QONTINUI_PERMREQ_NONCE", PR_NONCE),
+        ("QONTINUI_PERMREQ_KEY", PR_KEY),
+    ];
+
+    /// The pad's allow answer for `PR_NONCE`'s terminal, as a fake-curl tail.
+    fn allow_tail(nonce: &str) -> String {
+        format!(
+            r#"printf '%s' '{{"recorded":true,"decision":"allow","decision_reason":"allow","nonce":"{nonce}","session":"term-1"}}'"#
+        )
+    }
+
+    /// A fake curl that records its argv, drains the payload with a builtin,
+    /// and then runs `tail` (print a body, exit non-zero, …).
+    fn fake_curl(tail: &str) -> impl FnOnce(&Path, &Path) + '_ {
+        move |bin, argv| {
+            let bash = which_host("bash").unwrap();
+            write_exe(
+                &bin.join("curl"),
+                &format!(
+                    "#!{}\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\n\
+                     IFS= read -r -d '' _ 2>/dev/null || true\n{tail}\n",
+                    bash.display(),
+                    argv.display()
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn the_permission_request_hook_prints_the_allow_envelope_only_for_decision_allow() {
+        let tail = allow_tail(PR_NONCE);
+        let allow = run_pr_hook(&PR_SEAM, fake_curl(&tail));
+        assert_eq!(allow.stdout, format!("{ALLOW_ENVELOPE}\n"));
+        // Addressed to the pad, on the seam's port and terminal id, inside the
+        // ~1 s budget, with curl STREAMING stdin (`-T -`) so the read is inside
+        // that budget too, and no proxy.
+        assert!(
+            allow
+                .curl_args
+                .iter()
+                .any(|a| a == "http://127.0.0.1:9876/sessions/term-1/permission-request"),
+            "{:?}",
+            allow.curl_args
+        );
+        for flag in [
+            "-fsS",
+            "--noproxy",
+            "*",
+            "--connect-timeout",
+            "--max-time",
+            "-X",
+            "POST",
+            "Expect:",
+            "-T",
+            "-",
+        ] {
+            assert!(
+                allow.curl_args.iter().any(|a| a == flag),
+                "{flag} missing: {:?}",
+                allow.curl_args
+            );
+        }
+        for absent in ["--data-binary", "@-", PR_NONCE] {
+            assert!(
+                !allow.curl_args.iter().any(|a| a.contains(absent)),
+                "{absent} must not be in curl's argv: {:?}",
+                allow.curl_args
+            );
+        }
+        // The request key rides a header read from a private FILE (`-H @file`),
+        // never curl's argv; the nonce never leaves at all. The real-curl test
+        // below proves the header reaches the pad.
+        assert!(
+            allow
+                .curl_args
+                .windows(2)
+                .any(|w| w[0] == "-H" && w[1].starts_with('@') && w[1].len() > 1),
+            "{:?}",
+            allow.curl_args
+        );
+        assert!(
+            !allow.curl_args.iter().any(|a| a.contains(PR_KEY)),
+            "the request key must not be in curl's argv: {:?}",
+            allow.curl_args
+        );
+        let at = |f: &str| allow.curl_args.iter().position(|a| a == f).unwrap();
+        assert_eq!(allow.curl_args[at("--connect-timeout") + 1], "1");
+        assert_eq!(allow.curl_args[at("--max-time") + 1], "1");
+        assert_eq!(allow.curl_args[at("--noproxy") + 1], "*");
+        assert_eq!(allow.curl_args[at("-T") + 1], "-");
+
+        // The fallback port is honoured when the API port is unset.
+        let fallback = run_pr_hook(
+            &[
+                ("QONTINUI_INSTALL_INTERCEPT_PORT", "9999"),
+                ("QONTINUI_TERMINAL_ID", "term-1"),
+                ("QONTINUI_PERMREQ_NONCE", PR_NONCE),
+                ("QONTINUI_PERMREQ_KEY", PR_KEY),
+            ],
+            fake_curl(&tail),
+        );
+        assert_eq!(fallback.stdout, format!("{ALLOW_ENVELOPE}\n"));
+        assert!(fallback
+            .curl_args
+            .iter()
+            .any(|a| a.starts_with("http://127.0.0.1:9999/")));
+
+        // Every other answer — including bodies that merely MENTION allow,
+        // and an allow WITHOUT the exact nonce echo — prints nothing at all.
+        let wrong = allow_tail("ffffffffffffffffffffffffffffffff");
+        let longer = allow_tail(&format!("{PR_NONCE}0"));
+        let no_nonce = r#"printf '%s' '{"decision":"allow"}'"#.to_string();
+        let nonce_elsewhere =
+            format!(r#"printf '%s' '{{"decision":"allow","session":"{PR_NONCE}"}}'"#);
+        let late_failure = format!("{}; exit 28", allow_tail(PR_NONCE));
+        for body in [
+            r#"printf '%s' '{"decision":"none"}'"#,
+            r#"printf '%s' '{"decision":"none","reason":"allow","class_key":"allow"}'"#,
+            r#"printf '%s' '{"decision":"allowed"}'"#,
+            r#"printf '%s' 'allow'"#,
+            r#"printf '%s' 'not json'"#,
+            "true",
+            // A non-2xx (curl -f exits 22 and prints nothing).
+            "exit 22",
+            no_nonce.as_str(),
+            wrong.as_str(),
+            longer.as_str(),
+            nonce_elsewhere.as_str(),
+            // An allow body followed by a curl failure (a timeout mid-read):
+            // a failed request answers nothing, whatever arrived.
+            late_failure.as_str(),
+        ] {
+            let run = run_pr_hook(&PR_SEAM, fake_curl(body));
+            assert!(run.stdout.is_empty(), "{body}: printed {:?}", run.stdout);
+        }
+    }
+
+    #[test]
+    fn the_permission_request_hook_is_silent_without_its_seam() {
+        let tail = allow_tail(PR_NONCE);
+        let n = ("QONTINUI_PERMREQ_NONCE", PR_NONCE);
+        let k = ("QONTINUI_PERMREQ_KEY", PR_KEY);
+        for envs in [
+            vec![("QONTINUI_TERMINAL_ID", "term-1"), n, k],
+            vec![("QONTINUI_RUNNER_API_PORT", "9876"), n, k],
+            vec![
+                ("QONTINUI_RUNNER_API_PORT", "98x6"),
+                ("QONTINUI_TERMINAL_ID", "term-1"),
+                n,
+                k,
+            ],
+            vec![
+                ("QONTINUI_RUNNER_API_PORT", "9876"),
+                ("QONTINUI_TERMINAL_ID", "../x"),
+                n,
+                k,
+            ],
+            vec![
+                ("QONTINUI_RUNNER_API_PORT", "9876"),
+                ("QONTINUI_TERMINAL_ID", "a/b"),
+                n,
+                k,
+            ],
+            vec![
+                ("QONTINUI_RUNNER_API_PORT", "9876"),
+                ("QONTINUI_TERMINAL_ID", ".."),
+                n,
+                k,
+            ],
+            // No nonce, a non-hex nonce, a too-short nonce: nothing to check
+            // an echo against, so curl is never even called.
+            vec![
+                ("QONTINUI_RUNNER_API_PORT", "9876"),
+                ("QONTINUI_TERMINAL_ID", "term-1"),
+                k,
+            ],
+            vec![
+                ("QONTINUI_RUNNER_API_PORT", "9876"),
+                ("QONTINUI_TERMINAL_ID", "term-1"),
+                ("QONTINUI_PERMREQ_NONCE", "0123456789abcdef0123456789abcdeZ"),
+                k,
+            ],
+            vec![
+                ("QONTINUI_RUNNER_API_PORT", "9876"),
+                ("QONTINUI_TERMINAL_ID", "term-1"),
+                ("QONTINUI_PERMREQ_NONCE", "abc123"),
+                k,
+            ],
+            // No key, a non-hex key (it would be a header line), a too-short
+            // key: the pad could never answer allow, so curl is never called.
+            vec![
+                ("QONTINUI_RUNNER_API_PORT", "9876"),
+                ("QONTINUI_TERMINAL_ID", "term-1"),
+                n,
+            ],
+            vec![
+                ("QONTINUI_RUNNER_API_PORT", "9876"),
+                ("QONTINUI_TERMINAL_ID", "term-1"),
+                n,
+                ("QONTINUI_PERMREQ_KEY", "abababababababab\r\nX-Evil: 1"),
+            ],
+            vec![
+                ("QONTINUI_RUNNER_API_PORT", "9876"),
+                ("QONTINUI_TERMINAL_ID", "term-1"),
+                n,
+                ("QONTINUI_PERMREQ_KEY", "abc123"),
+            ],
+            vec![
+                ("QONTINUI_RUNNER_API_PORT", "9876"),
+                ("QONTINUI_TERMINAL_ID", "term-1"),
+                n,
+                ("QONTINUI_PERMREQ_KEY", &PR_KEY[..63]),
+            ],
+        ] {
+            let run = run_pr_hook(&envs, fake_curl(&tail));
+            assert!(run.stdout.is_empty(), "{envs:?}: printed {:?}", run.stdout);
+            assert!(run.curl_args.is_empty(), "{envs:?}: curl was called");
+        }
+        // No curl on PATH at all.
+        let run = run_pr_hook(&PR_SEAM, |_, _| {});
+        assert!(run.stdout.is_empty(), "printed {:?}", run.stdout);
+    }
+
+    /// The REAL curl, so the ~1 s budget is curl's own, not a fake's: a dead
+    /// runner (connection refused) and a hung one (accepts, never answers)
+    /// both print nothing, and the hung one is cut off by `--max-time 1` —
+    /// well inside five seconds. Then a real loopback answer of `allow` with
+    /// the right nonce prints the envelope (the request shape against an
+    /// actual HTTP exchange, curl's chunked body decoded), and the same answer
+    /// from a squatter that cannot know the nonce prints nothing.
+    #[test]
+    fn the_permission_request_hook_prints_nothing_against_a_dead_or_hung_runner() {
+        let real_curl = which_host("curl").expect("`curl` must be on PATH to exercise the hook");
+        let with_real_curl = |bin: &Path, _argv: &Path| {
+            std::os::unix::fs::symlink(&real_curl, bin.join("curl")).unwrap();
+        };
+        let seam = |port: u16| {
+            [
+                ("QONTINUI_RUNNER_API_PORT", port.to_string()),
+                ("QONTINUI_TERMINAL_ID", "term-1".to_string()),
+                ("QONTINUI_PERMREQ_NONCE", PR_NONCE.to_string()),
+                ("QONTINUI_PERMREQ_KEY", PR_KEY.to_string()),
+            ]
+        };
+
+        // Dead: a port that was just released.
+        let dead_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let env = seam(dead_port);
+        let envs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let dead = run_pr_hook(&envs, with_real_curl);
+        assert!(
+            dead.stdout.is_empty(),
+            "dead runner printed {:?}",
+            dead.stdout
+        );
+
+        // Hung: listening (the kernel completes the handshake) but never
+        // accepting or answering.
+        let hung = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let env = seam(hung.local_addr().unwrap().port());
+        let envs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let run = run_pr_hook(&envs, with_real_curl);
+        assert!(
+            run.stdout.is_empty(),
+            "hung runner printed {:?}",
+            run.stdout
+        );
+        assert!(
+            // The point is "bounded by curl's ~1 s budget", not a latency SLO:
+            // a saturated CI host can add seconds of process-start time, and a
+            // hook with no budget would hang until the harness killed it.
+            run.elapsed < Duration::from_secs(5),
+            "the hook must be cut off by curl's ~1 s budget, took {:?}",
+            run.elapsed
+        );
+        drop(hung);
+
+        // One real HTTP exchange, answering `answer`; returns the request
+        // line and the (chunk-decoded) body.
+        let serve_once = |answer: String| {
+            let live = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = live.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let (mut sock, _) = live.accept().unwrap();
+                sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                let (head, body) = loop {
+                    let n = sock.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        break (String::from_utf8_lossy(&req).into_owned(), String::new());
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&req).into_owned();
+                    let Some((head, raw)) = text.split_once("\r\n\r\n") else {
+                        continue;
+                    };
+                    let chunked = head
+                        .to_ascii_lowercase()
+                        .contains("transfer-encoding: chunked");
+                    if chunked && raw.ends_with("0\r\n\r\n") {
+                        // Decode `<hex>\r\n<data>\r\n` … `0\r\n\r\n`.
+                        let mut body = String::new();
+                        let mut rest = raw;
+                        while let Some((size, tail)) = rest.split_once("\r\n") {
+                            let n = usize::from_str_radix(size.trim(), 16).unwrap_or(0);
+                            if n == 0 {
+                                break;
+                            }
+                            body.push_str(tail.get(..n).unwrap_or(""));
+                            rest = tail.get(n + 2..).unwrap_or("");
+                        }
+                        break (head.to_string(), body);
+                    }
+                    let len = head.lines().find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())
+                            .flatten()
+                    });
+                    if let Some(len) = len.filter(|len| raw.len() >= *len) {
+                        break (head.to_string(), raw.get(..len).unwrap_or("").to_string());
+                    }
+                };
+                let _ = write!(
+                    sock,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    answer.len(),
+                    answer
+                );
+                (head, body)
+            });
+            (port, server)
+        };
+
+        let (port, server) = serve_once(format!(
+            r#"{{"recorded":true,"decision":"allow","nonce":"{PR_NONCE}","session":"term-1"}}"#
+        ));
+        let env = seam(port);
+        let envs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let run = run_pr_hook(&envs, with_real_curl);
+        let (head, body) = server.join().unwrap();
+        assert_eq!(
+            run.stdout,
+            format!("{ALLOW_ENVELOPE}\n"),
+            "request was:\n{head}"
+        );
+        assert!(
+            head.starts_with("POST /sessions/term-1/permission-request "),
+            "{head}"
+        );
+        assert_eq!(body, PR_PAYLOAD, "the payload is forwarded verbatim");
+        assert!(!head.contains(PR_NONCE), "the nonce is never sent: {head}");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains(&format!("x-qontinui-permreq-key: {PR_KEY}")),
+            "the request key is sent: {head}"
+        );
+        assert!(!head.to_ascii_lowercase().contains("expect:"), "{head}");
+
+        // A squatter answering allow with no (or a guessed) nonce: nothing.
+        for answer in [
+            r#"{"decision":"allow"}"#.to_string(),
+            r#"{"decision":"allow","nonce":"ffffffffffffffffffffffffffffffff"}"#.to_string(),
+        ] {
+            let (port, server) = serve_once(answer.clone());
+            let env = seam(port);
+            let envs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let run = run_pr_hook(&envs, with_real_curl);
+            let _ = server.join();
+            assert!(run.stdout.is_empty(), "{answer}: printed {:?}", run.stdout);
+        }
+    }
+
     /// The static twin of the behavioural tests above: no bundled hook may
     /// reach for an interpreter without offering `python3` AND a rung that
     /// needs no interpreter at all. This is what catches a reintroduction in
@@ -1919,6 +2386,7 @@ mod script_tests {
             ("claude_session_hook.sh", SESSION_HOOK),
             ("claude_stop_hook.sh", STOP_HOOK),
             ("claude_precompact_hook.sh", PRECOMPACT_HOOK),
+            ("claude_permission_request_hook.sh", PERMISSION_REQUEST_HOOK),
         ] {
             // Strip comments FIRST. Every literal below also appears in the
             // prose explaining the defect, so a grep over the raw file is
