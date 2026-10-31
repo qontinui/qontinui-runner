@@ -704,9 +704,35 @@ mod tests {
         assert!(registry.get_live(expired).await.is_none());
         assert_eq!(claim_slot_if_registered(&registry, expired).await, Ok(()));
 
+        // The `beforeunload` release is the embedding page's own: a browser
+        // holder's release keeps the id reserved. (An operator-trust release
+        // frees the id at once, so it has no reservation to outrun.)
         let released = "observe-released";
-        register(&registry, released).await;
-        assert!(registry.remove(released).await);
+        let binding = crate::mcp::relay_binding::RelayBinding::new(
+            crate::mcp::relay_binding::BindingConfig::default(),
+        );
+        let page = crate::mcp::relay_binding::Principal::Browser {
+            class: crate::mcp::origin_guard::OriginClass::Trusted,
+            origin: crate::mcp::origin_guard::NormOrigin::parse("http://localhost:3001").unwrap(),
+        };
+        registry
+            .claim(
+                &binding,
+                &page,
+                "test",
+                None,
+                registered_app(released),
+                None,
+                crate::mcp::app_registry::AppTransport::Http,
+                None,
+                None,
+            )
+            .await
+            .expect("the page's own claim is admitted");
+        assert!(registry
+            .release(&binding, released, &page, None, "test")
+            .await
+            .expect("the holder may release its own id"));
         assert!(registry.get_live(released).await.is_none());
         assert_eq!(claim_slot_if_registered(&registry, released).await, Ok(()));
 
