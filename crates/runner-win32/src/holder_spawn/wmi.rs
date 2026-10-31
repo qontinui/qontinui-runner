@@ -39,14 +39,16 @@ use windows::Win32::System::Variant::{VariantClear, VARIANT, VT_BSTR, VT_I4, VT_
 use windows::Win32::System::Wmi::{
     IWbemClassObject, IWbemLocator, IWbemServices, WbemLocator, WBEM_FLAG_RETURN_WBEM_COMPLETE,
 };
-use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Threading::{
-    GetExitCodeProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
+    GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
     WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
 use super::{quote_windows_arg, HolderSpawnError, HolderSpawnRoute};
+// One `creation_time`, shared with the pane-tree kill and pty-holder.
+use crate::process_tree::creation_time;
 
 /// `Win32_ProcessStartup.ShowWindow`: `SW_HIDE`.
 const SW_HIDE: i32 = 0;
@@ -233,22 +235,6 @@ fn open_verified(
             ),
         }),
     }
-}
-
-/// The creation time of the process behind `handle`, as one FILETIME value.
-///
-/// # Safety
-/// `handle` must be a valid process handle with at least
-/// `PROCESS_QUERY_LIMITED_INFORMATION` access.
-unsafe fn creation_time(handle: HANDLE) -> Option<u64> {
-    let zero = FILETIME {
-        dwLowDateTime: 0,
-        dwHighDateTime: 0,
-    };
-    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
-    // SAFETY: the caller's guarantee; the out-pointers are valid locals.
-    let ok = unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) };
-    (ok != 0).then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
 }
 
 fn image_path(handle: HANDLE) -> std::io::Result<PathBuf> {

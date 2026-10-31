@@ -313,11 +313,15 @@ pub async fn ui_bridge_with_diff_handler(
 /// body rather than rebuilding the body from it.
 ///
 /// `ChangeTracker.executeWithDiff` takes an `ActionWithDiffRequest`, whose
-/// `elementAction` is only one of ten declared fields — the others being
+/// `elementAction` is only one of twelve declared fields — the others being
 /// `instruction`, `settleTimeout`, `settleMinStable`, `scope`, `categorize`,
-/// `timeline`, `timelineInterval`, `summaryBudget` and `analyzeStructured`.
+/// `timeline`, `timelineInterval`, `expectStates`, `withinMs`, `summaryBudget`
+/// and `analyzeStructured`. (`timeline` is DEFAULT-ON in the SDK since plan
+/// 2026-09-20 Phase 4 — an explicit `timeline: false` is the opt-out, so
+/// dropping it would silently re-enable recording — and `expectStates` +
+/// `withinMs` ask the timeline for declared-state arrivals.)
 /// This arm used to emit a payload built from scratch out of
-/// `{elementId, operation, params}`, so **every one of those nine was silently
+/// `{elementId, operation, params}`, so **every one of those options was silently
 /// dropped**: a caller scoping the diff with `{"scope": "#main"}` or capping it
 /// with `{"summaryBudget": 500}` got neither, while the request still reported
 /// success. The batch arm forwards the body whole, so the two arms of one
@@ -397,6 +401,24 @@ mod with_diff_single_payload_tests {
         let (resp, failed) = diff_verdict(&action_failed_400(diff.clone())).expect("attempted");
         assert!(failed);
         assert_eq!(resp, diff);
+    }
+
+    /// Plan 2026-09-20 Phase 4 wire-through: the verdict hands the journey
+    /// recorder the diff WITH its timeline, on success and on ACTION_FAILED.
+    #[test]
+    fn the_verdict_keeps_the_timeline_for_the_ledger() {
+        let timeline = crate::journey::test_fixtures::timeline_json(vec![], 80);
+        let diff = serde_json::json!({ "actionSuccess": true, "timeline": timeline.clone() });
+        let ok: Result<Json<ApiResponse<serde_json::Value>>, DiffFailure> =
+            Ok(Json(ApiResponse::success(diff.clone())));
+        let (resp, _) = diff_verdict(&ok).expect("attempted");
+        assert_eq!(resp["timeline"], timeline);
+        let failed = serde_json::json!({ "actionSuccess": false, "timeline": timeline.clone() });
+        let (resp, _) = diff_verdict(&action_failed_400(failed)).expect("attempted");
+        assert!(matches!(
+            crate::journey::capture::diff_timeline(&resp),
+            crate::journey::capture::DiffTimeline::Parsed(_)
+        ));
     }
 
     #[test]
@@ -523,8 +545,10 @@ mod with_diff_single_payload_tests {
             "settleMinStable": 250,
             "scope": "#main",
             "categorize": false,
-            "timeline": true,
+            "timeline": false,
             "timelineInterval": 50,
+            "expectStates": ["saved-toast"],
+            "withinMs": 2000,
             "summaryBudget": 500,
             "analyzeStructured": true,
         }));
@@ -533,8 +557,14 @@ mod with_diff_single_payload_tests {
         assert_eq!(payload["settleMinStable"], json!(250));
         assert_eq!(payload["scope"], json!("#main"));
         assert_eq!(payload["categorize"], json!(false));
-        assert_eq!(payload["timeline"], json!(true));
+        assert_eq!(
+            payload["timeline"],
+            json!(false),
+            "the opt-out of the default-on timeline survives"
+        );
         assert_eq!(payload["timelineInterval"], json!(50));
+        assert_eq!(payload["expectStates"], json!(["saved-toast"]));
+        assert_eq!(payload["withinMs"], json!(2000));
         assert_eq!(payload["summaryBudget"], json!(500));
         assert_eq!(payload["analyzeStructured"], json!(true));
     }

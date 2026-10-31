@@ -738,6 +738,13 @@ impl SchedulerService {
                     .await;
                 return;
             }
+            // `..`, not the full field list. This arm must build against a
+            // qontinui-types whose `RemoteAgent` carries `effort`, `ultracode`
+            // and `effort_profile` (plan
+            // `2026-10-27-spawn-time-effort-and-ultracode-profiles-for-every-fleet-spawn-path`
+            // Phase 3), and also against the older one that
+            // `.github/sibling-pins.conf` may still pin. Those three fields are
+            // not read yet. Phase 6 binds them here by name and removes the `..`.
             ScheduledTaskType::RemoteAgent {
                 prompt,
                 working_directory,
@@ -746,6 +753,7 @@ impl SchedulerService {
                 mcp_connections,
                 max_turns,
                 timeout_seconds,
+                ..
             } => {
                 // Phase 5b of plan `2026-09-13-nightly-return-to-main-sweep`:
                 // the runner's own in-binary spawn seam, not `/prompts/run`.
