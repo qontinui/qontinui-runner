@@ -1360,9 +1360,9 @@ pub fn graceful_end_step(
         // refused before typing anything. NOT `CloseBareShell`: the pane holds
         // a live session, so the bare-shell close must never follow.
         Ok(G::NoCloseAuthority { claude_pids }) => refused(format!(
-            "no_close_authority: a live claude (pids {}) is in the pane and this end \
-             carries no close authority — nothing was typed or killed; only the lifecycle \
-             Closer can end a live session",
+            "no_close_authority: a graceful end needs a close authority, which only the \
+             lifecycle Closer will mint (plan Phase 93); the session was left running (live \
+             claude pids {}, nothing typed)",
             pids(claude_pids)
         )),
         Ok(G::CloseRefused { reason, .. }) => refused(format!("close_refused: {reason}")),
@@ -5595,7 +5595,7 @@ mod tests {
                 G::NoCloseAuthority { .. } => Some((
                     EndOutcome::Refused,
                     None,
-                    Some("no_close_authority: a live claude (pids 7)"),
+                    Some("no_close_authority: a graceful end needs a close authority"),
                 )),
                 G::CloseRefused { .. } => {
                     Some((EndOutcome::Refused, None, Some("close_refused: relaunched")))
