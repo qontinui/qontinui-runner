@@ -246,8 +246,8 @@ inputs:
       against when this change lands, so a compile gate that followed it would
       go green against code that is not there yet and red main on landing. Set
       it ONLY on a step whose question is about the PAIR rather than about what
-      main will look like — today that is exactly `check-drift` in
-      qontinui-types-drift.yml. A declined trailing declaration resolves to the
+      main will look like (`check-drift` in qontinui-types-drift.yml is one;
+      grep the callers rather than trusting a count). A declined trailing declaration resolves to the
       default branch and SAYS SO; it is never silently indistinguishable from
       "no declaration".
     required: false
