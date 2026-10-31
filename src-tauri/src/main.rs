@@ -253,6 +253,7 @@ mod scheduler_script;
 mod scheduler_service;
 mod schema_registry;
 mod screen;
+mod sd_notify; // Plan 2026-10-19 ci-node Phase 2b — systemd READY/WATCHDOG, readiness-gated
 mod sdk_features;
 pub(crate) use qontinui_runner_lib::secure_storage;
 mod security;

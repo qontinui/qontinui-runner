@@ -1318,6 +1318,9 @@ async fn run_once(
     session_manager: &Arc<crate::claude_session::SessionManager>,
     primary_boot_unix_millis: i64,
 ) {
+    // When this census was observed: the systemd watchdog gate ages and
+    // orders the readiness snapshot by it (plan 2026-10-19 Phase 2b).
+    let observed_at = std::time::Instant::now();
     let Some(pass) = compute(
         terminal_manager,
         store,
@@ -1377,6 +1380,9 @@ async fn run_once(
         );
     }
 
+    // The last-good readiness snapshot the systemd watchdog gate reads from
+    // its own OS thread (plan 2026-10-19 Phase 2b, `crate::sd_notify`).
+    crate::sd_notify::publish_census_report(&report, observed_at);
     store_latest(report);
 }
 

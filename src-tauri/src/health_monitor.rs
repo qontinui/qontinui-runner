@@ -1317,6 +1317,22 @@ fn watchdog_loop<S>(dir: PathBuf, tick: Duration, stop: Arc<AtomicBool>, sample:
 where
     S: Fn() -> WatchdogSample,
 {
+    watchdog_loop_with_hook(dir, tick, stop, sample, |_, _| {})
+}
+
+/// [`watchdog_loop`] plus a per-tick hook that runs AFTER the heartbeat and
+/// incident writes, on the same OS thread. Production passes
+/// [`SdWatchdogFeed::tick`]; the tests drive the hookless form.
+fn watchdog_loop_with_hook<S, H>(
+    dir: PathBuf,
+    tick: Duration,
+    stop: Arc<AtomicBool>,
+    sample: S,
+    mut on_tick: H,
+) where
+    S: Fn() -> WatchdogSample,
+    H: FnMut(&Path, WatchdogSample),
+{
     let mut state = WatchdogState::default();
     while !stop.load(Ordering::SeqCst) {
         let s = sample();
@@ -1324,7 +1340,110 @@ where
         if let Some(reason) = state.step(s) {
             append_watchdog_incident(&dir, reason, s);
         }
+        on_tick(&dir, s);
         std::thread::sleep(tick);
+    }
+}
+
+/// Is the self-probe thread's heartbeat fresh enough that its
+/// `backend_wedged` flag can be trusted? Same threshold as
+/// [`WatchdogState::step`]'s `monitor_stalled`. A thread that has never
+/// ticked gets the same allowance measured from `started_ms` (the feed's
+/// first sample) — but NOT forever: for systemd a probe thread that never
+/// starts must eventually read stale, or its keepalive would be unconditional.
+fn sd_monitor_heartbeat_fresh(s: WatchdogSample, started_ms: i64) -> bool {
+    let since = if s.monitor_heartbeat_ms > 0 {
+        s.monitor_heartbeat_ms
+    } else {
+        started_ms
+    };
+    (s.now_ms - since) / 1000 <= WATCHDOG_MONITOR_STALL_SECS
+}
+
+/// Feeds systemd's `WatchdogSec=` from the wedge-watchdog thread (plan
+/// `2026-10-19-ci-nodes-run-the-tauri-runner-always-on-as-ci-node-role`
+/// Phase 2b). Inert without `NOTIFY_SOCKET` — see [`crate::sd_notify`].
+#[derive(Debug, Default)]
+struct SdWatchdogFeed {
+    /// Monotonic ms of the first sample (`0` = no tick yet).
+    started_ms: i64,
+    /// The last decision, so a transition into `Withhold` is recorded once.
+    last: Option<crate::sd_notify::WatchdogDecision>,
+}
+
+impl SdWatchdogFeed {
+    fn tick(&mut self, dir: &Path, s: WatchdogSample) {
+        self.tick_with(dir, s, crate::sd_notify::watchdog_tick);
+    }
+
+    /// [`Self::tick`] with the decide-and-send step injected — the test seam.
+    /// `decide(backend_wedged, monitor_fresh)` returns `None` when there is no
+    /// service manager to notify.
+    fn tick_with<D>(&mut self, dir: &Path, s: WatchdogSample, decide: D)
+    where
+        D: FnOnce(bool, bool) -> Option<crate::sd_notify::WatchdogDecision>,
+    {
+        use crate::sd_notify::WatchdogDecision;
+        if self.started_ms == 0 {
+            self.started_ms = s.now_ms;
+        }
+        let fresh = sd_monitor_heartbeat_fresh(s, self.started_ms);
+        let Some(decision) = decide(s.backend_wedged, fresh) else {
+            return;
+        };
+        if self.last != Some(decision)
+            && decision != WatchdogDecision::Keepalive(crate::sd_notify::KeepaliveReason::Healthy)
+        {
+            append_sd_watchdog_line(dir, decision, s, fresh);
+        }
+        self.last = Some(decision);
+    }
+}
+
+/// One `wedge-incidents.log` line per transition of the systemd keepalive
+/// away from healthy — the record the plan names beside `NRestarts`.
+fn append_sd_watchdog_line(
+    dir: &Path,
+    decision: crate::sd_notify::WatchdogDecision,
+    s: WatchdogSample,
+    monitor_fresh: bool,
+) {
+    use crate::sd_notify::{KeepaliveReason, WatchdogDecision};
+    use std::io::Write;
+    let what = match decision {
+        WatchdogDecision::Withhold => concat!(
+            "WITHHOLDING WATCHDOG=1 (no CI build in flight, restart-readiness snapshot ",
+            "reads safe) — systemd will restart this runner when WatchdogSec= expires"
+        ),
+        WatchdogDecision::Keepalive(KeepaliveReason::HostingWork) => concat!(
+            "keeping WATCHDOG=1 despite the wedge: a CI build is in flight or the ",
+            "readiness snapshot counts live work"
+        ),
+        WatchdogDecision::Keepalive(KeepaliveReason::ReadinessUnknown) => concat!(
+            "keeping WATCHDOG=1 despite the wedge: the readiness snapshot is UNKNOWN ",
+            "(never ran, contended, or stale)"
+        ),
+        WatchdogDecision::Keepalive(KeepaliveReason::Healthy) => "WATCHDOG=1 (healthy)",
+    };
+    let line = format!(
+        concat!(
+            "{} SD_WATCHDOG {} — pid {}, backend_wedged={}, probe heartbeat fresh={}, ",
+            "consecutive /livez failures {}\n"
+        ),
+        chrono::Utc::now().to_rfc3339(),
+        what,
+        std::process::id(),
+        s.backend_wedged,
+        monitor_fresh,
+        s.consecutive_failures,
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(wedge_incidents_path(dir))
+    {
+        let _ = f.write_all(line.as_bytes());
+        let _ = f.flush();
     }
 }
 
@@ -1351,11 +1470,26 @@ fn start_wedge_watchdog_with<S>(dir: PathBuf, tick: Duration, stop: Arc<AtomicBo
 where
     S: Fn() -> WatchdogSample + Send + 'static,
 {
+    start_wedge_watchdog_with_hook(dir, tick, stop, sample, |_, _| {});
+}
+
+/// [`start_wedge_watchdog_with`] with a per-tick hook (see
+/// [`watchdog_loop_with_hook`]).
+fn start_wedge_watchdog_with_hook<S, H>(
+    dir: PathBuf,
+    tick: Duration,
+    stop: Arc<AtomicBool>,
+    sample: S,
+    on_tick: H,
+) where
+    S: Fn() -> WatchdogSample + Send + 'static,
+    H: FnMut(&Path, WatchdogSample) + Send + 'static,
+{
     // `std::thread::spawn`, NOT a tokio task. This is the entire point of the
     // item: the thread must be schedulable by the OS when the runtime is not.
     let _ = std::thread::Builder::new()
         .name("wedge-watchdog".to_string())
-        .spawn(move || watchdog_loop(dir, tick, stop, sample));
+        .spawn(move || watchdog_loop_with_hook(dir, tick, stop, sample, on_tick));
 }
 
 /// Guard so `stop_health_monitor` also stops the watchdog.
@@ -1369,11 +1503,30 @@ fn start_wedge_watchdog() {
     // loop, where a stall in settings/path resolution would silence us.
     let dir = crate::paths::get_dev_logs_dir();
     WATCHDOG_STOP.store(false, Ordering::SeqCst);
-    start_wedge_watchdog_with(
-        dir,
+    // The systemd keepalive rides THIS thread's tick (plan 2026-10-19
+    // Phase 2b), never the tokio-hosted self-probe loop: a stalled probe loop
+    // then reads as a stale heartbeat, i.e. a readiness-GATED kill.
+    let mut feed = SdWatchdogFeed::default();
+    // A tick longer than half systemd's `WatchdogSec=` would leave no slack
+    // for one late wake, so it is shortened to fit (and said once).
+    let (tick, shortened) = crate::sd_notify::tick_for_watchdog(
         Duration::from_secs(WATCHDOG_TICK_SECS),
+        crate::sd_notify::watchdog_interval(),
+    );
+    if shortened {
+        warn!(
+            "sd_notify: wedge-watchdog tick {}s exceeds half of WATCHDOG_USEC ({:?}) — ticking every {:?} instead",
+            WATCHDOG_TICK_SECS,
+            crate::sd_notify::watchdog_interval(),
+            tick
+        );
+    }
+    start_wedge_watchdog_with_hook(
+        dir,
+        tick,
         WATCHDOG_STOP.clone(),
         live_watchdog_sample,
+        move |dir, s| feed.tick(dir, s),
     );
 }
 
@@ -2645,6 +2798,91 @@ mod tests {
             backend_wedged: wedged,
             consecutive_failures: if wedged { 3 } else { 0 },
         }
+    }
+
+    /// Plan 2026-10-19 Phase 2b: the systemd keepalive trusts
+    /// `backend_wedged` only while the probe heartbeat is fresh, and a probe
+    /// thread that NEVER ticks reads stale once the allowance from the feed's
+    /// first sample is spent (otherwise its keepalive would be unconditional).
+    #[test]
+    fn sd_heartbeat_freshness_bounds_a_never_started_probe_thread() {
+        let stall_ms = WATCHDOG_MONITOR_STALL_SECS * 1000;
+        // Ticking probe thread: fresh within the threshold, stale past it.
+        assert!(sd_monitor_heartbeat_fresh(sample(10_000, 9_000, false), 1));
+        assert!(!sd_monitor_heartbeat_fresh(
+            sample(10_000 + stall_ms + 1_000, 10_000, false),
+            1
+        ));
+        // Never ticked: fresh during the startup allowance, stale after it.
+        assert!(sd_monitor_heartbeat_fresh(sample(5_000, 0, false), 1_000));
+        assert!(!sd_monitor_heartbeat_fresh(
+            sample(1_000 + stall_ms + 1_000, 0, false),
+            1_000
+        ));
+    }
+
+    /// Without `NOTIFY_SOCKET` (every test process, every desktop runner) the
+    /// feed decides nothing and writes no incident line.
+    #[test]
+    fn sd_feed_is_inert_without_notify_socket() {
+        if std::env::var_os(crate::sd_notify::NOTIFY_SOCKET_ENV).is_some() {
+            return; // running under a notify-type service; not this case
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut feed = SdWatchdogFeed::default();
+        feed.tick(dir.path(), sample(10_000, 9_000, true));
+        assert_eq!(feed.last, None);
+        assert!(!wedge_incidents_path(dir.path()).exists());
+    }
+
+    /// The `SD_WATCHDOG` record is written once per transition away from a
+    /// healthy keepalive — not once per tick — and a return to healthy then a
+    /// second withhold writes a second line.
+    #[test]
+    fn sd_feed_records_each_transition_away_from_healthy_once() {
+        use crate::sd_notify::{KeepaliveReason, WatchdogDecision};
+        let dir = tempfile::tempdir().unwrap();
+        let mut feed = SdWatchdogFeed::default();
+        let lines = |d: &Path| {
+            std::fs::read_to_string(wedge_incidents_path(d))
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.contains("SD_WATCHDOG"))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let healthy = || Some(WatchdogDecision::Keepalive(KeepaliveReason::Healthy));
+        let withhold = || Some(WatchdogDecision::Withhold);
+
+        feed.tick_with(dir.path(), sample(10_000, 9_000, false), |_, _| healthy());
+        assert!(lines(dir.path()).is_empty());
+
+        feed.tick_with(dir.path(), sample(20_000, 19_000, true), |w, fresh| {
+            assert!(
+                w && fresh,
+                "the feed hands the sample's wedge flag and freshness through"
+            );
+            withhold()
+        });
+        feed.tick_with(dir.path(), sample(35_000, 34_000, true), |_, _| withhold());
+        let after_two = lines(dir.path());
+        assert_eq!(after_two.len(), 1, "{after_two:?}");
+        assert!(
+            after_two[0].contains("WITHHOLDING WATCHDOG=1"),
+            "{after_two:?}"
+        );
+        assert!(
+            !after_two[0].contains("  "),
+            "no run of spaces: {after_two:?}"
+        );
+
+        feed.tick_with(dir.path(), sample(50_000, 49_000, false), |_, _| healthy());
+        feed.tick_with(dir.path(), sample(65_000, 64_000, true), |_, _| {
+            Some(WatchdogDecision::Keepalive(KeepaliveReason::HostingWork))
+        });
+        let all = lines(dir.path());
+        assert_eq!(all.len(), 2, "{all:?}");
+        assert!(all[1].contains("a CI build is in flight"), "{all:?}");
     }
 
     /// Independent stamps, for the cases Item 4 introduced.
