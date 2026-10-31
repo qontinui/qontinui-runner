@@ -737,7 +737,10 @@ pub async fn get_instances(
             continue;
         }
         let reachable = if let Some(ref client) = client {
-            let url = format!("http://localhost:{}/health", config.port);
+            let url = format!(
+                "{}/health",
+                crate::mcp::types::runner_loopback_base(config.port)
+            );
             client.get(&url).send().await.is_ok()
         } else {
             false
@@ -758,7 +761,10 @@ pub async fn get_instances(
             continue;
         }
         let reachable = if let Some(ref client) = client {
-            let url = format!("http://localhost:{}/health", reg.port);
+            let url = format!(
+                "{}/health",
+                crate::mcp::types::runner_loopback_base(reg.port)
+            );
             client.get(&url).send().await.is_ok()
         } else {
             false
@@ -780,7 +786,7 @@ pub async fn get_instances(
                 continue; // already listed from another source
             }
             let reachable = if let Some(ref client) = client {
-                let url = format!("http://localhost:{}/health", port);
+                let url = format!("{}/health", crate::mcp::types::runner_loopback_base(port));
                 client.get(&url).send().await.is_ok()
             } else {
                 false

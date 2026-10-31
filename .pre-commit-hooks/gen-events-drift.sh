@@ -107,7 +107,32 @@ set -euo pipefail
 STRICT="${QONTINUI_GEN_EVENTS_DRIFT_STRICT:-0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUNNER_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# The repo root is NOT "$SCRIPT_DIR/..": the commit-sourced pre-push shim
+# (qontinui-claude-config install-repo-git-hooks.sh, shim v2) may run this hook
+# from a copy of .pre-commit-hooks/ extracted into a private temp dir, whose
+# parent is not the checkout - so a root derived from our own location would look
+# for ../qontinui-schemas in the temp dir and report CANNOT EVALUATE, checking
+# nothing. Order: the root the shim exports; the git checkout this script sits in
+# (in place, or run by path from a test); the checkout we were invoked from (the
+# shim and pre-commit both run hooks with cwd at the repo top level); and only
+# then our own parent directory.
+#
+# The two git lookups run WITHOUT the scope variables git exports to hooks: in a
+# linked worktree git sets GIT_DIR (and no GIT_WORK_TREE), so the work tree
+# becomes the cwd and `git -C "$SCRIPT_DIR" rev-parse --show-toplevel` answers
+# `.pre-commit-hooks` itself. gen_events_clear_inherited_git_env (below) cannot
+# simply move up here: it records GIT_INDEX_FILE against the hook's real GIT_DIR.
+# An exported root is accepted only when it looks like this repo (src-tauri/),
+# so a stale or foreign value falls through rather than aborting on `cd`.
+_root_git() { env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE -u GIT_PREFIX git "$@"; }
+RUNNER_DIR=""
+if [ -n "${QONTINUI_HOOK_REPO_ROOT:-}" ] && [ -d "${QONTINUI_HOOK_REPO_ROOT}/src-tauri" ]; then
+    RUNNER_DIR="$QONTINUI_HOOK_REPO_ROOT"
+fi
+[ -n "$RUNNER_DIR" ] || RUNNER_DIR="$(_root_git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+[ -n "$RUNNER_DIR" ] || RUNNER_DIR="$(_root_git rev-parse --show-toplevel 2>/dev/null || true)"
+[ -n "$RUNNER_DIR" ] || RUNNER_DIR="$SCRIPT_DIR/.."
+RUNNER_DIR="$(cd "$RUNNER_DIR" && pwd)"
 
 # `cd`-and-`pwd` only works on a path that exists; resolve defensively so a
 # missing sibling produces our own message rather than a bash error.
@@ -284,7 +309,13 @@ SCRATCH_ROOT="$(mktemp -d -t gen-events-drift-XXXXXXXX)"
 # sibling store) left directories `rm` could not empty. As the EXIT trap's last
 # command, that failure became this hook's exit status and aborted a push whose
 # drift check had passed (coord finding 51901722). See lib/scratch-cleanup.sh.
-cleanup() { scratch_dir_remove "$SCRATCH_ROOT"; }
+# The tree-lock release runs FIRST and always returns 0, so the scratch removal
+# stays the trap's last command (see above). Defined only once the shared-target
+# library is sourced below; absent, there is nothing to release.
+cleanup() {
+    if declare -F release_shared_target >/dev/null 2>&1; then release_shared_target; fi
+    scratch_dir_remove "$SCRATCH_ROOT"
+}
 trap cleanup EXIT
 
 # Belt and braces: mktemp may ignore TMPDIR (some implementations, or a -t
@@ -394,6 +425,25 @@ if [ -f "$SHARED_TARGET_LIB" ]; then
     # shellcheck source=lib/shared-target.sh
     . "$SHARED_TARGET_LIB"
     resolve_shared_target "$RUNNER_DIR" "[gen-events-drift]"
+    # The release build below writes the same shared target, so it runs under
+    # the same tree lock and freshness ledger as cargo-prepush.sh's clippy
+    # (coord finding 7b603cde; see the library). Released by `cleanup` on EXIT,
+    # so the lock spans the whole generate_types.sh child. On 1-4 the build is
+    # NOT run unguarded: a peer's stale units would make the drift verdict about
+    # another tree. rc 10 (no library on this machine) builds as before.
+    GUARD_RC=0
+    guard_shared_target "$RUNNER_DIR" "[gen-events-drift]" "$RUNNER_DIR/src-tauri" || GUARD_RC=$?
+    case "$GUARD_RC" in
+        0|10) ;;
+        1|3)
+            cannot_evaluate \
+                "the shared cargo target could not be guarded: ${SHARED_TARGET_GUARD_REASON:-guard rc $GUARD_RC}" \
+                "retry once the peer build holding the tree lock finishes (raise QONTINUI_PREPUSH_TREE_LOCK_MAX_WAIT to wait longer)" ;;
+        *)
+            cannot_evaluate \
+                "the shared cargo target could not be guarded: ${SHARED_TARGET_GUARD_REASON:-guard rc $GUARD_RC}" \
+                "fix the cause named above (for a 'cargo metadata' failure, run 'cargo metadata --no-deps --format-version 1' in $RUNNER_DIR/src-tauri for cargo's full error), then push again" ;;
+    esac
 else
     log "NOTE — missing $SHARED_TARGET_LIB, so the shared target cannot be"
     log "       resolved. Building into this checkout's own target/."
@@ -437,7 +487,7 @@ QONTINUI_PY_OUT_DIR="$SCRATCH_PY_DIR" \
 QONTINUI_SCHEMAS_DIR="$SCHEMAS_DIR" \
 QONTINUI_SCHEMAS_JSON="$SCRATCH_ROOT/schemas.json" \
 QONTINUI_TS_COMPILE_SCRIPT="$TS_CODEGEN_DEPS_SCRIPT" \
-    bash src-tauri/scripts/generate_types.sh --ts-only >"$GEN_LOG" 2>&1
+    bash src-tauri/scripts/generate_types.sh --ts-only >"$GEN_LOG" 2>&1 9>&-
 GEN_RC=$?
 set -e
 

@@ -31,7 +31,7 @@
 # A row changing action or args is a semantic change and needs a reason in
 # the PR. A row changing only its verdict may be the stubbed context in
 # realRegistry.testkit.ts moving instead — check that first.
-# tier: golden   inputs: 3148
+# tier: golden   inputs: 3156
 
 /admin	literal	terminal.elevated	[]	ok	ok /elevated ✓ launched 1 elevated terminal
 /admin "1 gmail fix the bug"	literal	terminal.elevated	[]	unbound	-
@@ -255,7 +255,7 @@
 /conduct 1 gmail fix the bug --tenant	literal	terminal.orchestrate	[["goal","1 gmail fix the bug --tenant"]]	error:no-run-id	error /orchestrate: conductor did not return a run id
 /conduct 3 best	literal	terminal.orchestrate	[["goal","3 best"]]	error:no-run-id	error /orchestrate: conductor did not return a run id
 /conduct 3 best --tenant	literal	terminal.orchestrate	[["goal","3 best --tenant"]]	error:no-run-id	error /orchestrate: conductor did not return a run id
-/copy names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+/copy names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 /copy names "1 gmail fix the bug"	none	-	null	none	-
 /copy names "1 gmail fix the bug" --tenant	none	-	null	none	-
 /copy names "3 best"	none	-	null	none	-
@@ -265,7 +265,7 @@
 /copy names 1 gmail fix the bug --tenant	none	-	null	none	-
 /copy names 3 best	none	-	null	none	-
 /copy names 3 best --tenant	none	-	null	none	-
-/copy sessions	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+/copy sessions	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 /copy sessions "1 gmail fix the bug"	none	-	null	none	-
 /copy sessions "1 gmail fix the bug" --tenant	none	-	null	none	-
 /copy sessions "3 best"	none	-	null	none	-
@@ -275,7 +275,7 @@
 /copy sessions 1 gmail fix the bug --tenant	none	-	null	none	-
 /copy sessions 3 best	none	-	null	none	-
 /copy sessions 3 best --tenant	none	-	null	none	-
-/copy-names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+/copy-names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 /copy-names "1 gmail fix the bug"	literal	terminal.copy-names	[]	unbound	-
 /copy-names "1 gmail fix the bug" --tenant	literal	terminal.copy-names	[]	unbound	-
 /copy-names "3 best"	literal	terminal.copy-names	[]	unbound	-
@@ -285,7 +285,7 @@
 /copy-names 1 gmail fix the bug --tenant	literal	terminal.copy-names	[]	unbound	-
 /copy-names 3 best	literal	terminal.copy-names	[]	unbound	-
 /copy-names 3 best --tenant	literal	terminal.copy-names	[]	unbound	-
-/copy-sessions	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+/copy-sessions	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 /copy-sessions "1 gmail fix the bug"	literal	terminal.copy-names	[]	unbound	-
 /copy-sessions "1 gmail fix the bug" --tenant	literal	terminal.copy-names	[]	unbound	-
 /copy-sessions "3 best"	literal	terminal.copy-names	[]	unbound	-
@@ -611,30 +611,34 @@
 /keys 1 gmail fix the bug --tenant	literal	terminal.show-shortcuts	[]	unbound	-
 /keys 3 best	literal	terminal.show-shortcuts	[]	unbound	-
 /keys 3 best --tenant	literal	terminal.show-shortcuts	[]	unbound	-
-/layout	literal	terminal.layout	[]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
-/layout "1 gmail fix the bug"	literal	terminal.layout	[["preset","1 gmail fix the bug"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
-/layout "1 gmail fix the bug" --tenant	literal	terminal.layout	[["preset","1 gmail fix the bug --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
-/layout "3 best"	literal	terminal.layout	[["preset","3 best"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
-/layout "3 best" --tenant	literal	terminal.layout	[["preset","3 best --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
-/layout --tenant	literal	terminal.layout	[["preset","--tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
-/layout 1 gmail fix the bug	literal	terminal.layout	[["preset","1 gmail fix the bug"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
-/layout 1 gmail fix the bug --tenant	literal	terminal.layout	[["preset","1 gmail fix the bug --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
-/layout 3 best	literal	terminal.layout	[["preset","3 best"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
-/layout 3 best --tenant	literal	terminal.layout	[["preset","3 best --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
+/layout	literal	terminal.layout	[]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+/layout "1 gmail fix the bug"	literal	terminal.layout	[["preset","1 gmail fix the bug"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+/layout "1 gmail fix the bug" --tenant	literal	terminal.layout	[["preset","1 gmail fix the bug --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+/layout "3 best"	literal	terminal.layout	[["preset","3 best"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+/layout "3 best" --tenant	literal	terminal.layout	[["preset","3 best --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+/layout --tenant	literal	terminal.layout	[["preset","--tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+/layout 1	pattern	terminal.layout	[["preset",1]]	ok	ok /layout ✓ changed 1 layout — grew to split — 2 sessions do not fit single
+/layout 1 --tenant	literal	terminal.layout	[["preset","1 --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+/layout 1 gmail fix the bug	literal	terminal.layout	[["preset","1 gmail fix the bug"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+/layout 1 gmail fix the bug --tenant	literal	terminal.layout	[["preset","1 gmail fix the bug --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+/layout 13	pattern	terminal.layout	[["preset",13]]	ok	ok /layout ✓ changed 1 layout — flow-grid
+/layout 13 --tenant	literal	terminal.layout	[["preset","13 --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+/layout 3 best	literal	terminal.layout	[["preset","3 best"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+/layout 3 best --tenant	literal	terminal.layout	[["preset","3 best --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 /layout full-grid	pattern	terminal.layout	[["preset","full-grid"]]	ok	ok /layout ✓ changed 1 layout — full-grid
-/layout full-grid --tenant	literal	terminal.layout	[["preset","full-grid --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
+/layout full-grid --tenant	literal	terminal.layout	[["preset","full-grid --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 /layout fullgrid	pattern	terminal.layout	[["preset","fullgrid"]]	ok	ok /layout ✓ changed 1 layout — full-grid
-/layout fullgrid --tenant	literal	terminal.layout	[["preset","fullgrid --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
+/layout fullgrid --tenant	literal	terminal.layout	[["preset","fullgrid --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 /layout quad	pattern	terminal.layout	[["preset","quad"]]	ok	noop /layout · no layouts changed — already quad; re-applied
-/layout quad --tenant	literal	terminal.layout	[["preset","quad --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
+/layout quad --tenant	literal	terminal.layout	[["preset","quad --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 /layout single	pattern	terminal.layout	[["preset","single"]]	ok	ok /layout ✓ changed 1 layout — grew to split — 2 sessions do not fit single
-/layout single --tenant	literal	terminal.layout	[["preset","single --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
+/layout single --tenant	literal	terminal.layout	[["preset","single --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 /layout six-pack	pattern	terminal.layout	[["preset","six-pack"]]	ok	ok /layout ✓ changed 1 layout — six-pack
-/layout six-pack --tenant	literal	terminal.layout	[["preset","six-pack --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
+/layout six-pack --tenant	literal	terminal.layout	[["preset","six-pack --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 /layout sixpack	pattern	terminal.layout	[["preset","sixpack"]]	ok	ok /layout ✓ changed 1 layout — six-pack
-/layout sixpack --tenant	literal	terminal.layout	[["preset","sixpack --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
+/layout sixpack --tenant	literal	terminal.layout	[["preset","sixpack --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 /layout split	pattern	terminal.layout	[["preset","split"]]	ok	ok /layout ✓ changed 1 layout — split
-/layout split --tenant	literal	terminal.layout	[["preset","split --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
+/layout split --tenant	literal	terminal.layout	[["preset","split --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 /maximize	pattern	terminal.maximize	[]	ok	ok /maximize ✓ maximized zone 1
 /maximize "1 gmail fix the bug"	literal	terminal.maximize	[["zone","1 gmail fix the bug"]]	error:invalid-zone	error /maximize: "1 gmail fix the bug" is not a zone number
 /maximize "1 gmail fix the bug" --tenant	literal	terminal.maximize	[["zone","1 gmail fix the bug --tenant"]]	error:invalid-zone	error /maximize: "1 gmail fix the bug --tenant" is not a zone number
@@ -991,7 +995,7 @@
 /select-state 1 gmail fix the bug --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
 /select-state 3 best	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
 /select-state 3 best --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-/session names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+/session names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 /session names "1 gmail fix the bug"	none	-	null	none	-
 /session names "1 gmail fix the bug" --tenant	none	-	null	none	-
 /session names "3 best"	none	-	null	none	-
@@ -1001,7 +1005,7 @@
 /session names 1 gmail fix the bug --tenant	none	-	null	none	-
 /session names 3 best	none	-	null	none	-
 /session names 3 best --tenant	none	-	null	none	-
-/session-names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+/session-names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 /session-names "1 gmail fix the bug"	literal	terminal.copy-names	[]	unbound	-
 /session-names "1 gmail fix the bug" --tenant	literal	terminal.copy-names	[]	unbound	-
 /session-names "3 best"	literal	terminal.copy-names	[]	unbound	-
@@ -1661,7 +1665,7 @@ conduct 1 gmail fix the bug	literal	terminal.orchestrate	[["goal","1 gmail fix t
 conduct 1 gmail fix the bug --tenant	literal	terminal.orchestrate	[["goal","1 gmail fix the bug --tenant"]]	error:no-run-id	error /orchestrate: conductor did not return a run id
 conduct 3 best	literal	terminal.orchestrate	[["goal","3 best"]]	error:no-run-id	error /orchestrate: conductor did not return a run id
 conduct 3 best --tenant	literal	terminal.orchestrate	[["goal","3 best --tenant"]]	error:no-run-id	error /orchestrate: conductor did not return a run id
-copy names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+copy names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 copy names "1 gmail fix the bug"	none	-	null	none	-
 copy names "1 gmail fix the bug" --tenant	none	-	null	none	-
 copy names "3 best"	none	-	null	none	-
@@ -1671,7 +1675,7 @@ copy names 1 gmail fix the bug	none	-	null	none	-
 copy names 1 gmail fix the bug --tenant	none	-	null	none	-
 copy names 3 best	none	-	null	none	-
 copy names 3 best --tenant	none	-	null	none	-
-copy sessions	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+copy sessions	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 copy sessions "1 gmail fix the bug"	none	-	null	none	-
 copy sessions "1 gmail fix the bug" --tenant	none	-	null	none	-
 copy sessions "3 best"	none	-	null	none	-
@@ -1681,7 +1685,7 @@ copy sessions 1 gmail fix the bug	none	-	null	none	-
 copy sessions 1 gmail fix the bug --tenant	none	-	null	none	-
 copy sessions 3 best	none	-	null	none	-
 copy sessions 3 best --tenant	none	-	null	none	-
-copy-names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+copy-names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 copy-names "1 gmail fix the bug"	literal	terminal.copy-names	[]	unbound	-
 copy-names "1 gmail fix the bug" --tenant	literal	terminal.copy-names	[]	unbound	-
 copy-names "3 best"	literal	terminal.copy-names	[]	unbound	-
@@ -1691,7 +1695,7 @@ copy-names 1 gmail fix the bug	literal	terminal.copy-names	[]	unbound	-
 copy-names 1 gmail fix the bug --tenant	literal	terminal.copy-names	[]	unbound	-
 copy-names 3 best	literal	terminal.copy-names	[]	unbound	-
 copy-names 3 best --tenant	literal	terminal.copy-names	[]	unbound	-
-copy-sessions	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+copy-sessions	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 copy-sessions "1 gmail fix the bug"	literal	terminal.copy-names	[]	unbound	-
 copy-sessions "1 gmail fix the bug" --tenant	literal	terminal.copy-names	[]	unbound	-
 copy-sessions "3 best"	literal	terminal.copy-names	[]	unbound	-
@@ -2017,30 +2021,34 @@ keys 1 gmail fix the bug	literal	terminal.show-shortcuts	[]	unbound	-
 keys 1 gmail fix the bug --tenant	literal	terminal.show-shortcuts	[]	unbound	-
 keys 3 best	literal	terminal.show-shortcuts	[]	unbound	-
 keys 3 best --tenant	literal	terminal.show-shortcuts	[]	unbound	-
-layout	literal	terminal.layout	[]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
-layout "1 gmail fix the bug"	literal	terminal.layout	[["preset","1 gmail fix the bug"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
-layout "1 gmail fix the bug" --tenant	literal	terminal.layout	[["preset","1 gmail fix the bug --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
-layout "3 best"	literal	terminal.layout	[["preset","3 best"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
-layout "3 best" --tenant	literal	terminal.layout	[["preset","3 best --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
-layout --tenant	literal	terminal.layout	[["preset","--tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
-layout 1 gmail fix the bug	literal	terminal.layout	[["preset","1 gmail fix the bug"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
-layout 1 gmail fix the bug --tenant	literal	terminal.layout	[["preset","1 gmail fix the bug --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
-layout 3 best	literal	terminal.layout	[["preset","3 best"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
-layout 3 best --tenant	literal	terminal.layout	[["preset","3 best --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
+layout	literal	terminal.layout	[]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+layout "1 gmail fix the bug"	literal	terminal.layout	[["preset","1 gmail fix the bug"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+layout "1 gmail fix the bug" --tenant	literal	terminal.layout	[["preset","1 gmail fix the bug --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+layout "3 best"	literal	terminal.layout	[["preset","3 best"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+layout "3 best" --tenant	literal	terminal.layout	[["preset","3 best --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+layout --tenant	literal	terminal.layout	[["preset","--tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+layout 1	pattern	terminal.layout	[["preset",1]]	ok	ok /layout ✓ changed 1 layout — grew to split — 2 sessions do not fit single
+layout 1 --tenant	literal	terminal.layout	[["preset","1 --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+layout 1 gmail fix the bug	literal	terminal.layout	[["preset","1 gmail fix the bug"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+layout 1 gmail fix the bug --tenant	literal	terminal.layout	[["preset","1 gmail fix the bug --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+layout 13	pattern	terminal.layout	[["preset",13]]	ok	ok /layout ✓ changed 1 layout — flow-grid
+layout 13 --tenant	literal	terminal.layout	[["preset","13 --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+layout 3 best	literal	terminal.layout	[["preset","3 best"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+layout 3 best --tenant	literal	terminal.layout	[["preset","3 best --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 layout full-grid	pattern	terminal.layout	[["preset","full-grid"]]	ok	ok /layout ✓ changed 1 layout — full-grid
-layout full-grid --tenant	literal	terminal.layout	[["preset","full-grid --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
+layout full-grid --tenant	literal	terminal.layout	[["preset","full-grid --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 layout fullgrid	pattern	terminal.layout	[["preset","fullgrid"]]	ok	ok /layout ✓ changed 1 layout — full-grid
-layout fullgrid --tenant	literal	terminal.layout	[["preset","fullgrid --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
+layout fullgrid --tenant	literal	terminal.layout	[["preset","fullgrid --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 layout quad	pattern	terminal.layout	[["preset","quad"]]	ok	noop /layout · no layouts changed — already quad; re-applied
-layout quad --tenant	literal	terminal.layout	[["preset","quad --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
+layout quad --tenant	literal	terminal.layout	[["preset","quad --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 layout single	pattern	terminal.layout	[["preset","single"]]	ok	ok /layout ✓ changed 1 layout — grew to split — 2 sessions do not fit single
-layout single --tenant	literal	terminal.layout	[["preset","single --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
+layout single --tenant	literal	terminal.layout	[["preset","single --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 layout six-pack	pattern	terminal.layout	[["preset","six-pack"]]	ok	ok /layout ✓ changed 1 layout — six-pack
-layout six-pack --tenant	literal	terminal.layout	[["preset","six-pack --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
+layout six-pack --tenant	literal	terminal.layout	[["preset","six-pack --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 layout sixpack	pattern	terminal.layout	[["preset","sixpack"]]	ok	ok /layout ✓ changed 1 layout — six-pack
-layout sixpack --tenant	literal	terminal.layout	[["preset","sixpack --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
+layout sixpack --tenant	literal	terminal.layout	[["preset","sixpack --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 layout split	pattern	terminal.layout	[["preset","split"]]	ok	ok /layout ✓ changed 1 layout — split
-layout split --tenant	literal	terminal.layout	[["preset","split --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
+layout split --tenant	literal	terminal.layout	[["preset","split --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 maximize	pattern	terminal.maximize	[]	ok	ok /maximize ✓ maximized zone 1
 maximize "1 gmail fix the bug"	literal	terminal.maximize	[["zone","1 gmail fix the bug"]]	error:invalid-zone	error /maximize: "1 gmail fix the bug" is not a zone number
 maximize "1 gmail fix the bug" --tenant	literal	terminal.maximize	[["zone","1 gmail fix the bug --tenant"]]	error:invalid-zone	error /maximize: "1 gmail fix the bug --tenant" is not a zone number
@@ -2397,7 +2405,7 @@ select-state 1 gmail fix the bug	literal	terminal.select-by-state	[["state","1 g
 select-state 1 gmail fix the bug --tenant	literal	terminal.select-by-state	[["state","1 gmail fix the bug --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
 select-state 3 best	literal	terminal.select-by-state	[["state","3 best"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
 select-state 3 best --tenant	literal	terminal.select-by-state	[["state","3 best --tenant"]]	error:invalid-args	error /select-by-state: state must be one of: idle, working, needs-input, completed, error
-session names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+session names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 session names "1 gmail fix the bug"	none	-	null	none	-
 session names "1 gmail fix the bug" --tenant	none	-	null	none	-
 session names "3 best"	none	-	null	none	-
@@ -2407,7 +2415,7 @@ session names 1 gmail fix the bug	none	-	null	none	-
 session names 1 gmail fix the bug --tenant	none	-	null	none	-
 session names 3 best	none	-	null	none	-
 session names 3 best --tenant	none	-	null	none	-
-session-names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+session-names	pattern	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 session-names "1 gmail fix the bug"	literal	terminal.copy-names	[]	unbound	-
 session-names "1 gmail fix the bug" --tenant	literal	terminal.copy-names	[]	unbound	-
 session-names "3 best"	literal	terminal.copy-names	[]	unbound	-
@@ -2863,8 +2871,8 @@ yes all 3 best --tenant	none	-	null	none	-
 «ai» terminal.close [valid] do the thing	ai	terminal.close	[["tabId","tab-1"],["zone",1]]	error:unknown-tab	error /close: "tab-1" is not an open tab id
 «ai» terminal.copy-names [alien] do the thing	ai	terminal.copy-names	[["nonsense","x"]]	refused	error /copy-names: takes no arguments (got "nonsense")
 «ai» terminal.copy-names [bool] do the thing	ai	terminal.copy-names	[]	refused	error /copy-names: "count" must be text or a number (got true/false)
-«ai» terminal.copy-names [empty] do the thing	ai	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
-«ai» terminal.copy-names [valid] do the thing	ai	terminal.copy-names	[]	error:no-sessions	error /copy-names: no live Claude Code sessions found
+«ai» terminal.copy-names [empty] do the thing	ai	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
+«ai» terminal.copy-names [valid] do the thing	ai	terminal.copy-names	[]	error:no-sessions	error /copy-names: no sessions on the runner's roster
 «ai» terminal.doc-finder [alien] do the thing	ai	terminal.doc-finder	[["nonsense","x"]]	refused	error /doc-finder: takes no arguments (got "nonsense")
 «ai» terminal.doc-finder [bool] do the thing	ai	terminal.doc-finder	[]	refused	error /doc-finder: "count" must be text or a number (got true/false)
 «ai» terminal.doc-finder [empty] do the thing	ai	terminal.doc-finder	[]	ok	ok /doc-finder ✓ opened the doc finder
@@ -2891,8 +2899,8 @@ yes all 3 best --tenant	none	-	null	none	-
 «ai» terminal.history [valid] do the thing	ai	terminal.history	[]	ok	noop /history · no events showed
 «ai» terminal.layout [alien] do the thing	ai	terminal.layout	[["nonsense","x"]]	refused	error /layout: takes no argument named "nonsense"
 «ai» terminal.layout [bool] do the thing	ai	terminal.layout	[]	refused	error /layout: "preset" must be text or a number (got true/false)
-«ai» terminal.layout [empty] do the thing	ai	terminal.layout	[]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
-«ai» terminal.layout [valid] do the thing	ai	terminal.layout	[["preset","six-pack"]]	ok	ok /layout ✓ changed 1 layout — six-pack
+«ai» terminal.layout [empty] do the thing	ai	terminal.layout	[]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+«ai» terminal.layout [valid] do the thing	ai	terminal.layout	[["page","page-1"],["preset","six-pack"]]	ok	ok /layout ✓ changed 1 layout — six-pack
 «ai» terminal.maximize [alien] do the thing	ai	terminal.maximize	[["nonsense","x"]]	refused	error /maximize: takes no argument named "nonsense"
 «ai» terminal.maximize [bool] do the thing	ai	terminal.maximize	[]	refused	error /maximize: "zone" must be text or a number (got true/false)
 «ai» terminal.maximize [empty] do the thing	ai	terminal.maximize	[]	ok	ok /maximize ✓ maximized zone 1
@@ -3031,8 +3039,8 @@ yes all 3 best --tenant	none	-	null	none	-
 «direct» terminal.close [valid]	direct	terminal.close	[["tabId","tab-1"],["zone",1]]	threw	error /close: "tab-1" is not an open tab id
 «direct» terminal.copy-names [alien]	direct	terminal.copy-names	[["nonsense","x"]]	threw	error /copy-names: takes no arguments (got "nonsense")
 «direct» terminal.copy-names [bool]	direct	terminal.copy-names	[["count",true]]	threw	error /copy-names: "count" must be text or a number (got true/false)
-«direct» terminal.copy-names [empty]	direct	terminal.copy-names	[]	threw	error /copy-names: no live Claude Code sessions found
-«direct» terminal.copy-names [valid]	direct	terminal.copy-names	[]	threw	error /copy-names: no live Claude Code sessions found
+«direct» terminal.copy-names [empty]	direct	terminal.copy-names	[]	threw	error /copy-names: no sessions on the runner's roster
+«direct» terminal.copy-names [valid]	direct	terminal.copy-names	[]	threw	error /copy-names: no sessions on the runner's roster
 «direct» terminal.doc-finder [alien]	direct	terminal.doc-finder	[["nonsense","x"]]	threw	error /doc-finder: takes no arguments (got "nonsense")
 «direct» terminal.doc-finder [bool]	direct	terminal.doc-finder	[["count",true]]	threw	error /doc-finder: "count" must be text or a number (got true/false)
 «direct» terminal.doc-finder [empty]	direct	terminal.doc-finder	[]	ok	ok /doc-finder ✓ opened the doc finder
@@ -3059,8 +3067,8 @@ yes all 3 best --tenant	none	-	null	none	-
 «direct» terminal.history [valid]	direct	terminal.history	[]	ok	noop /history · no events showed
 «direct» terminal.layout [alien]	direct	terminal.layout	[["nonsense","x"]]	threw	error /layout: takes no argument named "nonsense"
 «direct» terminal.layout [bool]	direct	terminal.layout	[["preset",true]]	threw	error /layout: "preset" must be text or a number (got true/false)
-«direct» terminal.layout [empty]	direct	terminal.layout	[]	threw	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid
-«direct» terminal.layout [valid]	direct	terminal.layout	[["preset","six-pack"]]	ok	ok /layout ✓ changed 1 layout — six-pack
+«direct» terminal.layout [empty]	direct	terminal.layout	[]	threw	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
+«direct» terminal.layout [valid]	direct	terminal.layout	[["page","page-1"],["preset","six-pack"]]	ok	ok /layout ✓ changed 1 layout — six-pack
 «direct» terminal.maximize [alien]	direct	terminal.maximize	[["nonsense","x"]]	threw	error /maximize: takes no argument named "nonsense"
 «direct» terminal.maximize [bool]	direct	terminal.maximize	[["zone",true]]	threw	error /maximize: "zone" must be text or a number (got true/false)
 «direct» terminal.maximize [empty]	direct	terminal.maximize	[]	ok	ok /maximize ✓ maximized zone 1

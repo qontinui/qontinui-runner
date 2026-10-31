@@ -185,11 +185,11 @@ expect_reject "$ONE_OVER" "51 characters"
 expect_reject "$ONE_OVER" 'coord:upstream-of=qontinui-supervisor#1234'
 
 # ----- known-BAD: over the ceiling --------------------------------------------
-# The case that first hit, 2026-08-19 (claude-config#296 -> dev-notes#167).
+# The case that first hit, 2026-08-19 (claude-config#296 -> the plans repo#167).
 expect_reject "coord:downstream-of=qontinui/qontinui-claude-config#296" \
   'coord:downstream-of=qontinui-claude-config#296'
-expect_reject "coord:downstream-of=qontinui/qontinui-dev-notes#1234" \
-  'coord:downstream-of=qontinui-dev-notes#1234'
+expect_reject "coord:downstream-of=qontinui/example-plans-repo#1234" \
+  'coord:downstream-of=example-plans-repo#1234'
 # The mis-signpost warning is the point of the guard, so assert it is present.
 expect_reject "coord:downstream-of=qontinui/qontinui-claude-config#296" \
   "not found"
@@ -201,9 +201,9 @@ expect_reject "coord:requires-tag=ts-v0.0.0-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" 
 # A FOREIGN owner is not ours to drop: coord canonicalizes a bare name to the
 # TENANT's owner, so the "short form" would silently retarget the edge at a
 # different repo. Suggest nothing.
-expect_absent "coord:downstream-of=some-other-org/qontinui-dev-notes#1234" \
+expect_absent "coord:downstream-of=some-other-org/example-plans-repo#1234" \
   "drop the owner"
-expect_reject "coord:downstream-of=some-other-org/qontinui-dev-notes#1234" \
+expect_reject "coord:downstream-of=some-other-org/example-plans-repo#1234" \
   "shorten the value"
 # An owner with an EMPTY repo part would shorten to `coord:upstream-of=#<n>`,
 # which validate_label rejects ("missing repo"). Suggest nothing.
@@ -241,6 +241,14 @@ expect_accept "coord:credibility-override"
 expect_accept "coord:migrate-repair"
 expect_accept "coord:merge-strategy=squash"
 expect_accept "coord:requires-tag=ts-v*"
+# `clears-red` is GitHub-applied only (coord's provenance gate, like priority):
+# every spelling is refused with the error that names the working route.
+for _cr in "coord:clears-red=some-repo" "coord:clears-red=acme/some-repo" \
+           "coord:clears-red" "coord:clears-red=a/b/c"; do
+  expect_reject "$_cr" "coord:clears-red must be set on the PR itself"
+  expect_reject "$_cr" "labels[]=coord:clears-red=<repo>"
+  expect_absent "$_cr" "unknown coord:* label key"
+done
 
 # ----- an accepted dry run states what it did NOT check -----------------------
 # `--dry-run` clears the grammar and the ceiling, which closes cause 2 of
@@ -254,7 +262,7 @@ expect_accept "coord:requires-tag=ts-v*"
 # and a CLOSED-enum one get the caveat without it (pointing at a repo-wide
 # mutation for a label somebody creates once is advice nobody needs -- the same
 # over-broad-signposting the post-gh arm narrows its match to avoid).
-DYN_LABEL="coord:downstream-of=qontinui-dev-notes#167"
+DYN_LABEL="coord:downstream-of=example-plans-repo#167"
 expect_dry_contains "$DYN_LABEL" "NOT checked"
 expect_dry_contains "$DYN_LABEL" "gh label create \"$DYN_LABEL\" --repo $REPO"
 # ...and it must never assert an absence it has no evidence for. A dry run sent
@@ -650,8 +658,12 @@ trap 'cleanup; cleanup2; cleanup3' EXIT
   echo '  */author-session) k=door ;;'
   echo '  */coord/agent-pr-labels) if [ -n "$getflag" ]; then k=read; else k=read_not_get; fi ;;'
   echo '  */pr-merge/labels) case "$data" in *"\"labels\": []"*) k=probe ;; *) k=post ;; esac ;;'
+  echo '  */ui-bridge/invoke/get_coord_device_token) k=runner ;;'
   echo '  *) k=other ;; esac'
   echo 'bearer=""; case "$hdr" in *"@"*) f="${hdr##*@}"; [ -r "$f" ] && bearer="$(cat "$f")" ;; esac'
+  # A runner-minted token (signature `.runner`) gets the read_runner answer when
+  # one is staged -- coord refusing the runner's token on the read-back only.
+  echo 'case "$k:$bearer" in read:*.runner) [ -r "$d/read_runner.code" ] && k=read_runner ;; esac'
   echo 'printf "%s %s%s %s\n" "$k" "$url" "$q" "$data" >> "$d/calls"'
   echo '[ -n "$bearer" ] && printf "%s\n" "$bearer" >> "$d/bearers"'
   echo '[ -n "$out" ] && cat "$d/$k.body" > "$out" 2>/dev/null'
@@ -676,9 +688,12 @@ b=lambda o: base64.urlsafe_b64encode(json.dumps(o).encode()).decode().rstrip("="
 print(b({"alg":"EdDSA"})+"."+b({"tenant_id":os.environ["H_T"],"exp":int(time.time())+int(os.environ["H_OFF"])})+".sig")'
 }
 # Isolate the credential cascade from this box: no env token, an empty HOME
-# (no file token, no machine.json), a pinned device id.
+# (no file token, no machine.json), a pinned device id, and no local-runner
+# rung (CTC_NO_RUNNER=1: the box's runner is not part of this fixture, and its
+# 127.0.0.1 mint is not a coord call, which T13 counts).
 FAKEHOME="$STUBDIR3/home"; mkdir -p "$FAKEHOME"
 unset COORD_DEVICE_JWT
+export CTC_NO_RUNNER=1
 export QONTINUI_MACHINE_ID="11111111-2222-4333-8444-555555555555"
 printf '0\n' > "$GH_STUB_RC_FILE"; : > "$GH_STUB_MSG_FILE"
 
@@ -880,6 +895,21 @@ if [[ "$(grep -c " https://coord.example.test/" "$STUBDIR3/calls")" -ne "$(wc -l
 if [[ "$(cat "$STUBDIR3/t13b.rc")" != 0 ]]; then fail "T13b: expected rc=0, got $(cat "$STUBDIR3/t13b.rc") :: $(cat "$STUBDIR3/calls")"; else ok; fi
 if [[ "$(grep -c " https://coord.qontinui.io/" "$STUBDIR3/calls")" -ne "$(wc -l < "$STUBDIR3/calls" | tr -d ' ')" ]]; then
   fail "T13b: not every call used the hosted base :: $(cat "$STUBDIR3/calls")"; else ok; fi
+# T13c: the read-back under the local runner's token answers 401 -- the runner
+# token is dropped and the read is re-staged ONCE, reaching the mint, exactly as
+# the library's own walkers retry it. Production coord, so the runner is asked.
+RUNNER_TOK="$(mkjwt "$T_OWN" | sed 's/\.sig$/.runner/')"
+stub runner 200 "{\"success\":true,\"data\":\"$RUNNER_TOK\"}"
+stub read_runner 401 '{"error":"unknown signer"}'
+stub read 200 "$(rb_body "coord:stacked-on=#6")"
+COORD_URL="https://coord.qontinui.io" CTC_NO_RUNNER=0 run_coord "coord:stacked-on=#6"
+expect_rc 0 "T13c a 401 to the runner's token on the read-back re-stages to the mint"
+expect_out "coord recorded label" "T13c"
+expect_calls runner 1 "T13c (the owner check staged the runner's token)"
+expect_calls read_runner 1 "T13c (the first read went out under it)"
+expect_calls read 1 "T13c (the retry read went out under the mint)"
+expect_calls mint 1 "T13c (the re-stage minted)"
+rm -f "$STUBDIR3/read_runner.code" "$STUBDIR3/read_runner.body" "$STUBDIR3/runner.code" "$STUBDIR3/runner.body"
 
 no_ok() { if [[ "$OUT" == *"ok: coord recorded"* ]]; then fail "$1: printed ok without a present read-back :: $OUT"; else ok; fi; }
 
