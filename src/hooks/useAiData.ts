@@ -422,9 +422,10 @@ export function useTaskRunEvents(taskRunId: string | null, eventType?: string, l
  * Counts (`first.total`, `first.passed`, …) come from the FIRST page, whose
  * separate counts statement covers the whole match set (later pages run none,
  * so their `bound_kind` is `at_least` and their per-status counts are absent);
- * the rows are every page's rows in walk order; `remaining` is what the last
- * page's exact total says lies beyond the loaded rows (`null` when that page
- * ran no exact count, i.e. on every page after the first).
+ * the rows are every page's rows in walk order; `remaining` is what the FIRST
+ * page's exact total says lies beyond the loaded rows (`null` when the first
+ * page ran no exact count). Later pages carry `total: null`, so reading the
+ * last page would blank the count after the first "show more".
  */
 export interface BoundedWalk<P extends BoundedReadMeta, R> {
   first: P;
@@ -442,7 +443,10 @@ function mergeWalk<P extends BoundedReadMeta, R>(
   return {
     first: pages[0],
     rows: pages.flatMap(rowsOf),
-    remaining: last.total === null ? null : last.total - last.shown,
+    remaining:
+      pages[0].total === null
+        ? null
+        : Math.max(0, pages[0].total - pages.reduce((n, p) => n + rowsOf(p).length, 0)),
     hasMore: last.next_cursor !== null,
   };
 }
