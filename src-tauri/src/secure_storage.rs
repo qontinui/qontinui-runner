@@ -64,9 +64,11 @@ use anyhow::{Context, Result};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
-use tracing::{debug, info, warn};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use tracing::{debug, info, trace, warn};
 
 /// Service identifier for the storage
 const SERVICE_NAME: &str = "com.qontinui.runner";
@@ -140,6 +142,38 @@ pub(crate) fn lock_path_for(path: &std::path::Path) -> PathBuf {
         .map(|p| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()))
         .unwrap_or_default();
     parent.join(name)
+}
+
+/// `true` only the first time `path` is seen in `seen`: the pure half of
+/// [`first_initialization`], so the once-guard is testable without the
+/// process-global set. Same shape as `commands::transcript::first_sighting`,
+/// which lives in the bin crate and so cannot be reused from this lib module.
+fn first_sighting(seen: &mut HashSet<PathBuf>, path: &Path) -> bool {
+    seen.insert(path.to_path_buf())
+}
+
+/// `true` only the first time THIS PROCESS initializes a [`SecureStorage`] at
+/// `path`.
+///
+/// `AuthManager::new()` builds a `SecureStorage` on every use, from every
+/// periodic loop (heartbeat, coord sync, the message poller, ...), so without
+/// this memo the init log line and the temp-file sweep's `read_dir` ran about
+/// once a second, in bursts of 100+ (plan
+/// `2026-10-19-runner-secure-storage-reinitialises-and-logs-every-five-seconds`).
+/// Keyed on the path rather than a single flag so a different store (another
+/// instance root, a test fixture's directory) still gets its own first sweep.
+///
+/// A poisoned lock is recovered: the guarded region is one `HashSet::insert`,
+/// so a poisoned set holds no torn state.
+fn first_initialization(path: &Path) -> bool {
+    static INITIALIZED_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    first_sighting(
+        &mut INITIALIZED_PATHS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        path,
+    )
 }
 
 /// `true` under `cfg(test)` when `QONTINUI_TEST_DISABLE_STORE_LOCK=1`: the
@@ -707,18 +741,22 @@ impl SecureStorage {
     ///
     /// The storage file will be created in the app's data directory.
     pub fn new() -> Result<Self> {
-        let data_dir = std::env::var("QONTINUI_SECURE_STORAGE_DIR")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(std::path::PathBuf::from)
-            .or_else(|| dirs::data_local_dir().map(|d| d.join(SERVICE_NAME)))
-            .context("Failed to get data directory")?;
+        let data_dir =
+            crate::instance_env::secure_storage_dir().context("Failed to get data directory")?;
 
-        // Ensure directory exists
+        // Ensure directory exists. Per call, deliberately not memoised: a store
+        // directory deleted at runtime is recreated by the next construction,
+        // and the directory itself is re-resolved every time (instance roots,
+        // per-test fixtures).
         fs::create_dir_all(&data_dir).context("Failed to create data directory")?;
 
         let storage_path = data_dir.join(STORAGE_FILE);
-        debug!("SecureStorage initialized at: {:?}", storage_path);
+        // The init line and the sweep below run once per storage path per
+        // process, not once per construction (see `first_initialization`).
+        let first_for_path = first_initialization(&storage_path);
+        if first_for_path {
+            debug!("SecureStorage initialized at: {:?}", storage_path);
+        }
 
         let lock_file = lock_path_for(&storage_path);
         let storage = Self {
@@ -726,8 +764,14 @@ impl SecureStorage {
             lock_file,
         };
         // Best-effort boot sweep of crash-orphaned atomic-write temp files
-        // (older than 5 min so we never race a live writer). Never fatal.
-        storage.sweep_stale_temp_files(std::time::Duration::from_secs(5 * 60));
+        // (older than 5 min so we never race a live writer), once per storage
+        // path per process. That is still a boot sweep for every orphan a
+        // previous process left behind; a temp orphaned during THIS process's
+        // lifetime waits for the next start, which is harmless (readers only
+        // ever open the real store path). Never fatal.
+        if first_for_path {
+            storage.sweep_stale_temp_files(std::time::Duration::from_secs(5 * 60));
+        }
         Ok(storage)
     }
 
@@ -831,7 +875,10 @@ impl SecureStorage {
     /// Loads tokens from encrypted storage.
     fn load_tokens(&self) -> Result<StoredTokens> {
         if !self.storage_path.exists() {
-            debug!("Storage file does not exist, returning empty tokens");
+            // TRACE, not DEBUG: this runs on every token read of an unpaired
+            // store, so at DEBUG it floods (plan
+            // `2026-10-19-runner-secure-storage-reinitialises-and-logs-every-five-seconds`).
+            trace!("Storage file does not exist, returning empty tokens");
             return Ok(StoredTokens::default());
         }
 
@@ -842,7 +889,8 @@ impl SecureStorage {
         let tokens: StoredTokens =
             serde_json::from_slice(&decrypted).context("Failed to parse stored tokens")?;
 
-        debug!("Loaded tokens from secure storage");
+        // TRACE: every token read lands here (thousands per hour at DEBUG).
+        trace!("Loaded tokens from secure storage");
         Ok(tokens)
     }
 
@@ -2300,37 +2348,73 @@ mod tests {
         );
     }
 
+    /// Wait for a concurrent peer writer to reach a step, failing only if the
+    /// peer makes NO progress for [`PEER_STALL_LIMIT`] — a dead peer, not a
+    /// slow disk.
+    ///
+    /// The writers below run in LOCKSTEP: a writer starts write `i` only once
+    /// its peer has finished write `i - 1`. The store lock is polled and so not
+    /// fair, and with two free-running writers the one that releases re-takes
+    /// it within microseconds while the other sleeps between polls. On a slow
+    /// Windows disk a writer was starved behind the peer's whole burst of 120
+    /// writes for more than [`STORE_LOCK_TIMEOUT`] and failed "lock … still
+    /// held after 10s" although every single hold lasted milliseconds. In
+    /// lockstep a waiter waits behind at most ONE peer write, so nothing here
+    /// depends on how fast the disk is — and both writers still race for the
+    /// lock at every step, which is what the lost-update check needs (with
+    /// `QONTINUI_TEST_DISABLE_STORE_LOCK=1` they load together every round).
+    fn wait_for_peer(peer_reached: impl Fn() -> bool, what: &str) {
+        let stall_started = std::time::Instant::now();
+        while !peer_reached() {
+            assert!(
+                stall_started.elapsed() < PEER_STALL_LIMIT,
+                "peer writer made no progress for {PEER_STALL_LIMIT:?} waiting for {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// How long a lockstep writer waits for its peer's NEXT step before
+    /// concluding the peer died. One step is one store write.
+    const PEER_STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
     /// D4: two writers — separate `SecureStorage` instances (separate lock
     /// handles, exactly as two processes would hold them) on the SAME store —
-    /// each add a NEW tenant slot per iteration, concurrently. Every slot is a
-    /// distinct key, so any lost update (a load→insert→save interleaving that
-    /// drops a peer's insert) stays visible at the end rather than being
-    /// papered over by the next round.
+    /// each add a NEW tenant slot per iteration, concurrently and in lockstep
+    /// ([`wait_for_peer`]). Every slot is a distinct key, so any lost update (a
+    /// load→insert→save interleaving that drops a peer's insert) stays visible
+    /// at the end rather than being papered over by the next round.
     #[test]
     fn test_concurrent_writers_of_different_tenants_both_survive() {
-        const N: u128 = 120;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const N: usize = 120;
         let storage = create_test_storage("concurrent_tenant_writers");
         let path = storage.storage_path.clone();
         let _ = fs::remove_file(storage.lock_path());
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let writer = |base: u128| {
+        let done = std::sync::Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let writer = |me: usize, base: u128| {
             let path = path.clone();
-            let barrier = barrier.clone();
+            let done = done.clone();
             std::thread::spawn(move || {
                 let s = SecureStorage::with_path(path).unwrap();
-                barrier.wait();
+                let peer = 1 - me;
                 for i in 0..N {
-                    s.store_tenant_device_jwt(&uuid::Uuid::from_u128(base + i), "x")
+                    wait_for_peer(
+                        || done[peer].load(Ordering::Acquire) >= i,
+                        &format!("write {i}"),
+                    );
+                    s.store_tenant_device_jwt(&uuid::Uuid::from_u128(base + i as u128), "x")
                         .unwrap();
+                    done[me].store(i + 1, Ordering::Release);
                 }
             })
         };
-        let a = writer(0xA000);
-        let b = writer(0xB000);
+        let a = writer(0, 0xA000);
+        let b = writer(1, 0xB000);
         a.join().unwrap();
         b.join().unwrap();
         let slots = storage.try_list_tenant_device_jwt_tenants().unwrap();
-        assert_eq!(slots.len() as u128, 2 * N, "a concurrent writer lost slots");
+        assert_eq!(slots.len(), 2 * N, "a concurrent writer lost slots");
         let _ = fs::remove_file(&storage.storage_path);
     }
 
@@ -2363,6 +2447,9 @@ mod tests {
     const LOCK_CHILD_STORE_ENV: &str = "QONTINUI_TEST_SS_LOCK_CHILD_STORE";
     /// Env var naming the first tenant (u128) of the range that child writes.
     const LOCK_CHILD_TENANT_ENV: &str = "QONTINUI_TEST_SS_LOCK_CHILD_TENANT";
+    /// Env var naming the PEER child's first tenant, whose step markers this
+    /// child waits on to stay in lockstep ([`wait_for_peer`]).
+    const LOCK_CHILD_PEER_ENV: &str = "QONTINUI_TEST_SS_LOCK_CHILD_PEER";
     /// Distinct tenant slots each child adds.
     const LOCK_CHILD_WRITES: u128 = 120;
 
@@ -2373,18 +2460,31 @@ mod tests {
         PathBuf::from(os)
     }
 
+    /// Remove both children's `ready.*` and `step.*` markers, so a stale one
+    /// from an earlier run cannot let a child skip a wait.
+    fn remove_child_markers(store: &std::path::Path) {
+        for base in [0xA000u128, 0xB000] {
+            let _ = fs::remove_file(lock_child_marker(store, &format!("ready.{base}")));
+            for i in 0..LOCK_CHILD_WRITES {
+                let _ = fs::remove_file(lock_child_marker(store, &format!("step.{base}.{i}")));
+            }
+        }
+    }
+
     /// Child half of the two-PROCESS test below: a no-op in a normal run; when
     /// the parent re-invokes this test binary with the env vars set, it
     /// hammers one tenant slot of the shared store.
     #[test]
     fn lock_child_process_writer() {
-        let (Ok(store), Ok(tenant)) = (
+        let (Ok(store), Ok(tenant), Ok(peer)) = (
             std::env::var(LOCK_CHILD_STORE_ENV),
             std::env::var(LOCK_CHILD_TENANT_ENV),
+            std::env::var(LOCK_CHILD_PEER_ENV),
         ) else {
             return;
         };
         let base: u128 = tenant.parse().unwrap();
+        let peer: u128 = peer.parse().unwrap();
         let store = PathBuf::from(store);
         let s = SecureStorage::with_path(store.clone()).unwrap();
         // Start barrier: announce readiness, then wait for the parent's GO so
@@ -2396,9 +2496,16 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "parent never said GO");
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        // Lockstep with the peer child: write `i` starts once the peer has
+        // finished write `i - 1` (its `step.<peer>.<i - 1>` marker exists).
         for i in 0..LOCK_CHILD_WRITES {
+            if i > 0 {
+                let peer_step = lock_child_marker(&store, &format!("step.{peer}.{}", i - 1));
+                wait_for_peer(|| peer_step.exists(), &format!("peer step {}", i - 1));
+            }
             s.store_tenant_device_jwt(&uuid::Uuid::from_u128(base + i), "x")
                 .unwrap();
+            fs::write(lock_child_marker(&store, &format!("step.{base}.{i}")), b"").unwrap();
         }
     }
 
@@ -2410,7 +2517,7 @@ mod tests {
         let storage = create_test_storage("two_process_tenant_writers");
         let _ = fs::remove_file(storage.lock_path());
         let exe = std::env::current_exe().unwrap();
-        let spawn = |tenant: u128| {
+        let spawn = |tenant: u128, peer: u128| {
             std::process::Command::new(&exe)
                 .args([
                     "--exact",
@@ -2420,6 +2527,7 @@ mod tests {
                 ])
                 .env(LOCK_CHILD_STORE_ENV, &storage.storage_path)
                 .env(LOCK_CHILD_TENANT_ENV, tenant.to_string())
+                .env(LOCK_CHILD_PEER_ENV, peer.to_string())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
@@ -2427,14 +2535,9 @@ mod tests {
         };
         let go = lock_child_marker(&storage.storage_path, "go");
         let _ = fs::remove_file(&go);
-        for base in [0xA000u128, 0xB000] {
-            let _ = fs::remove_file(lock_child_marker(
-                &storage.storage_path,
-                &format!("ready.{base}"),
-            ));
-        }
-        let a = spawn(0xA000);
-        let b = spawn(0xB000);
+        remove_child_markers(&storage.storage_path);
+        let a = spawn(0xA000, 0xB000);
+        let b = spawn(0xB000, 0xA000);
         // Release both children together once each has reported ready.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         while ![0xA000u128, 0xB000]
@@ -2470,12 +2573,7 @@ mod tests {
             "one process's slots were lost to the other"
         );
         let _ = fs::remove_file(&go);
-        for base in [0xA000u128, 0xB000] {
-            let _ = fs::remove_file(lock_child_marker(
-                &storage.storage_path,
-                &format!("ready.{base}"),
-            ));
-        }
+        remove_child_markers(&storage.storage_path);
         let _ = fs::remove_file(&storage.storage_path);
     }
 
@@ -3098,6 +3196,284 @@ mod tests {
         assert!(
             uuid::Uuid::parse_str(&retrieved).is_ok(),
             "Device ID should be a valid UUID"
+        );
+    }
+
+    // ---- once-per-path init, and the per-read lines at TRACE (plan
+    // `2026-10-19-runner-secure-storage-reinitialises-and-logs-every-five-seconds`
+    // Phase 1) ----------------------------------------------------------------
+
+    /// Logged first by every capture closure below. An absence assertion is
+    /// only meaningful on a capture that demonstrably received output, so
+    /// each test also asserts this line IS present: an empty capture can
+    /// never pass.
+    const CAPTURE_SENTINEL: &str = "secure-storage-capture-sentinel";
+
+    /// Run `f` under a scoped fmt subscriber at `level` and return what it
+    /// logged on this thread: the first capture that holds
+    /// [`CAPTURE_SENTINEL`] and satisfies `complete`, or the last attempt when
+    /// none does.
+    ///
+    /// Adopts the guards of `terminal::session`'s `capture_logs` (a bin-crate
+    /// test helper, so not reachable from this lib module). Tracing's callsite
+    /// `Interest` cache and global max level are PROCESS-global, which a scoped
+    /// subscriber does not escape, and parallel captures measurably lost a
+    /// whole log. So captures here run one at a time, and each rebuilds the
+    /// interest cache once its own subscriber is the thread default.
+    ///
+    /// Those guards narrow the race but cannot close it, and here it was seen
+    /// to lose PART of a capture as well: one TRACE callsite missing while its
+    /// neighbours in the same capture arrived. So a capture that lacks the
+    /// sentinel, or is not `complete`, is re-run, up to `CAPTURE_ATTEMPTS`
+    /// times. That cannot hide a real defect, which fails every attempt the
+    /// same way. `f` must therefore be safe to run more than once.
+    fn capture_logs(
+        level: tracing::Level,
+        f: impl Fn(),
+        complete: impl Fn(&str) -> bool,
+    ) -> String {
+        const CAPTURE_ATTEMPTS: usize = 5;
+        let mut logs = String::new();
+        for _ in 0..CAPTURE_ATTEMPTS {
+            logs = capture_logs_once(level, &f);
+            if logs.contains(CAPTURE_SENTINEL) && complete(&logs) {
+                break;
+            }
+        }
+        logs
+    }
+
+    /// How many lines of `logs` were emitted at exactly `level` (`"DEBUG"`,
+    /// `"TRACE"`, ...) and contain `needle`.
+    ///
+    /// Reads the level token the fmt layer prints, not only the text. A stale
+    /// process-global interest can hand a TRACE event to a DEBUG capture, and
+    /// that event is still printed as TRACE, so it is never miscounted as a
+    /// DEBUG line.
+    fn count_at(logs: &str, level: &str, needle: &str) -> usize {
+        logs.lines()
+            .filter(|line| line.split_whitespace().next() == Some(level))
+            .filter(|line| line.contains(needle))
+            .count()
+    }
+
+    /// One attempt of [`capture_logs`].
+    fn capture_logs_once(level: tracing::Level, f: &impl Fn()) -> String {
+        static CAPTURE_SERIAL: Mutex<()> = Mutex::new(());
+        let _serial = CAPTURE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Captured;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let sink = Captured::default();
+        let buf = sink.0.clone();
+        // No timestamp, so every line starts with its level (see `count_at`).
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink)
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(level)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            f()
+        });
+        let bytes = buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Plant `<dir>/auth_tokens.enc.tmp.<tag>` with an mtime ten minutes ago,
+    /// past `new()`'s five-minute sweep threshold.
+    fn plant_stale_temp(dir: &Path, tag: &str) -> PathBuf {
+        let temp = dir.join(format!("{STORAGE_FILE}.tmp.{tag}"));
+        fs::write(&temp, b"orphaned").unwrap();
+        let ten_minutes_ago = filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 60),
+        );
+        filetime::set_file_mtime(&temp, ten_minutes_ago).unwrap();
+        temp
+    }
+
+    /// The pure half of the memo: new the first time per path, then not.
+    #[test]
+    fn first_sighting_is_true_once_per_path() {
+        let mut seen = HashSet::new();
+        let a = Path::new("store-a").join(STORAGE_FILE);
+        let b = Path::new("store-b").join(STORAGE_FILE);
+        assert!(
+            first_sighting(&mut seen, &a),
+            "a path's first sighting is new"
+        );
+        assert!(
+            !first_sighting(&mut seen, &a),
+            "the same path a second time is not new"
+        );
+        assert!(
+            first_sighting(&mut seen, &b),
+            "a different path is new even after another was seen"
+        );
+        assert!(!first_sighting(&mut seen, &b));
+    }
+
+    /// `new()` sweeps stale temps the FIRST time it initializes a storage path
+    /// in this process, and not on every construction after that.
+    #[test]
+    fn new_sweeps_stale_temps_once_per_storage_path() {
+        let amb = crate::ambient::test_support::isolated_ambient();
+        let dir = amb.dir().to_path_buf();
+
+        let first = plant_stale_temp(&dir, "first");
+        let storage = SecureStorage::new().unwrap();
+        assert_eq!(
+            storage.storage_path,
+            dir.join(STORAGE_FILE),
+            "the fixture must redirect the store into its own directory"
+        );
+        assert!(
+            !first.exists(),
+            "the first construction for a storage path must sweep a stale temp"
+        );
+
+        let second = plant_stale_temp(&dir, "second");
+        let _again = SecureStorage::new().unwrap();
+        assert!(
+            second.exists(),
+            "a second construction for the same storage path must not sweep again"
+        );
+    }
+
+    /// Every per-read and absent-store line demoted from DEBUG to TRACE.
+    const PER_READ_LINES: &[&str] = &[
+        // secure_storage `load_tokens`, store present
+        "Loaded tokens from secure storage",
+        // auth `get_access_token`, store present
+        "Retrieved access token from secure storage",
+        // auth `get_refresh_token`, store present
+        "Retrieved refresh token from secure storage",
+        // secure_storage `load_tokens`, store absent
+        "Storage file does not exist",
+        // auth `get_access_token`, store absent
+        "Access token not in secure storage",
+        // auth `get_access_token`, store absent and no keychain
+        "Access token not in keychain",
+        // auth `get_refresh_token`, store absent
+        "Refresh token not in secure storage",
+        // auth `get_refresh_token`, store absent and no keychain
+        "Refresh token not in keychain",
+    ];
+
+    /// The per-read and absent-store lines are silent at DEBUG and still
+    /// emitted at TRACE (the positive control: the same reads demonstrably
+    /// reach every one of them, so their absence at DEBUG is not vacuous).
+    #[test]
+    fn per_read_and_absent_store_lines_are_trace_not_debug() {
+        let present = create_test_storage("per_read_lines_present");
+        present.store_tokens("t", "").unwrap();
+        let absent = create_test_storage("per_read_lines_absent");
+        assert!(
+            !absent.store_file_exists(),
+            "the absent store must be absent"
+        );
+
+        let reads = || {
+            // DEBUG, not INFO: the DEBUG capture's sentinel then also proves
+            // that capture really admitted DEBUG events.
+            tracing::debug!("{CAPTURE_SENTINEL}");
+            let paired = crate::auth::AuthManager::with_storage_no_keychain(present.clone());
+            assert_eq!(paired.get_access_token().unwrap(), "t");
+            assert_eq!(paired.get_refresh_token().unwrap(), "");
+            let unpaired = crate::auth::AuthManager::with_storage_no_keychain(absent.clone());
+            assert!(unpaired.get_access_token().is_err());
+            assert!(unpaired.get_refresh_token().is_err());
+        };
+
+        // Every line that `logs` carries at `level`, or that it lacks there.
+        let logged_at = |logs: &str, level: &str| -> Vec<&'static str> {
+            PER_READ_LINES
+                .iter()
+                .copied()
+                .filter(|line| count_at(logs, level, line) > 0)
+                .collect()
+        };
+        let missing_at = |logs: &str, level: &str| -> Vec<&'static str> {
+            PER_READ_LINES
+                .iter()
+                .copied()
+                .filter(|line| count_at(logs, level, line) == 0)
+                .collect()
+        };
+
+        let at_debug = capture_logs(tracing::Level::DEBUG, reads, |_| true);
+        assert!(
+            at_debug.contains(CAPTURE_SENTINEL),
+            "positive control: the DEBUG capture lost the sentinel:\n{at_debug}"
+        );
+        // Collected rather than asserted one by one, so a failure names every
+        // line still at DEBUG, not only the first.
+        let leaked = logged_at(&at_debug, "DEBUG");
+        assert!(
+            leaked.is_empty(),
+            "per-read lines still logged at DEBUG: {leaked:?}\n{at_debug}"
+        );
+
+        let at_trace = capture_logs(tracing::Level::TRACE, reads, |logs| {
+            missing_at(logs, "TRACE").is_empty()
+        });
+        assert!(
+            at_trace.contains(CAPTURE_SENTINEL),
+            "positive control: the TRACE capture lost the sentinel:\n{at_trace}"
+        );
+        let unreached = missing_at(&at_trace, "TRACE");
+        assert!(
+            unreached.is_empty(),
+            "the reads never reached these lines even at TRACE, so their absence at DEBUG \
+             proves nothing: {unreached:?}\n{at_trace}"
+        );
+    }
+
+    /// Two `SecureStorage::new()` constructions of one storage path log the
+    /// init line once, at DEBUG.
+    #[test]
+    fn init_line_logs_once_per_storage_path() {
+        const INIT_LINE: &str = "SecureStorage initialized at";
+        let logs = capture_logs(
+            tracing::Level::DEBUG,
+            || {
+                // A fresh fixture per attempt, so a re-run capture still starts
+                // from a storage path the memo has never recorded.
+                let _amb = crate::ambient::test_support::isolated_ambient();
+                tracing::info!("{CAPTURE_SENTINEL}");
+                let _first = SecureStorage::new().unwrap();
+                let _second = SecureStorage::new().unwrap();
+            },
+            // A capture with no init line at all lost it to the race (the
+            // positive control below), so it is re-run rather than trusted.
+            |logs| count_at(logs, "DEBUG", INIT_LINE) > 0,
+        );
+        assert!(
+            logs.contains(CAPTURE_SENTINEL),
+            "positive control: the capture lost the sentinel:\n{logs}"
+        );
+        let inits = count_at(&logs, "DEBUG", INIT_LINE);
+        assert_eq!(
+            inits, 1,
+            "two constructions of one storage path must log the init line exactly once:\n{logs}"
         );
     }
 }

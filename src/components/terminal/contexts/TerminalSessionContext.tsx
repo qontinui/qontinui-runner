@@ -57,6 +57,7 @@ import {
   useState,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useMemo,
   createRef,
@@ -78,15 +79,10 @@ import { useZoneLayout } from "../useZoneLayout";
 import { type TerminalInstanceHandle } from "../TerminalInstance";
 import { TerminalBridgeProxies } from "../TerminalBridgeProxies";
 import { type ZoneSessionInfo } from "../zoneProfileStorage";
-import { writeWhenReady } from "../writeWhenReady";
 import { fetchLiveClaudeSessionIds } from "../liveClaudeSessions";
 import { decideColdResume } from "../useTerminalInitialization";
-import {
-  buildSessionOpenArgs,
-  describeRecordOpenOutcome,
-  noteRecordedZone,
-  recordedZoneLedgerFor,
-} from "../sessionRecordArgs";
+import { buildSessionOpenArgs } from "../sessionRecordArgs";
+import { resumeProfileSession } from "../resumeInNewTab";
 import { createLogger } from "@/lib/logger";
 
 import { useSessionStateTracking } from "../useSessionStateTracking";
@@ -105,8 +101,10 @@ import { useTranscriptSessions } from "../useTranscriptSessions";
 import { useSessionManager } from "../useSessionManager";
 import { deriveSyntheticTabs } from "../syntheticTabs";
 import { planTabReveal } from "../tabReveal";
+import { rightPanelModeAfterRowSelect } from "../sessionManagerLiveRows";
 import { useZoneLabelsAndTags } from "../useZoneLabelsAndTags";
-import { TerminalOutputCoalescer, base64ToBytes } from "../terminalOutputTap";
+import { TerminalOutputCoalescer, base64ToBytes, chunkEndOffset } from "../terminalOutputTap";
+import { getTerminalHotStore } from "../terminalHotStore";
 import { noteDecode, transportClockStart } from "../transportStats";
 
 import { instanceStorage } from "@/lib/instance-storage";
@@ -191,6 +189,24 @@ export interface TerminalSessionContextValue extends TerminalManagerReturn, Stat
 }
 
 export const TerminalSessionContext = createContext<TerminalSessionContextValue | null>(null);
+
+/**
+ * Read ANY page's session value by id, not only the active page's — `null` for
+ * a page with no mounted scope. Every page keeps an always-mounted scope (see
+ * {@link TerminalSessionProvider}), so a page the operator is not looking at
+ * still has a live `zoneLayout` and `tabs`; this is how `/layout --page` sets
+ * that page's grid without switching the operator's view to it.
+ *
+ * The getter is stable and reads a ref, so consumers do not re-render whenever
+ * some other page's state moves.
+ */
+export type PageSessionGetter = (pageId: string) => TerminalSessionContextValue | null;
+
+const PageSessionGetterContext = createContext<PageSessionGetter>(() => null);
+
+export function usePageSessionGetter(): PageSessionGetter {
+  return useContext(PageSessionGetterContext);
+}
 
 interface PageSessionScopeProps {
   pageId: string;
@@ -295,7 +311,14 @@ const PageSessionScope = memo(function PageSessionScope({
   // Live-tab set so the zone layout can exclude exited tombstones from the
   // hidden-but-LIVE "N more" count (and surface them separately).
   const liveTabIds = useMemo(() => new Set(tabs.filter((t) => t.isAlive).map((t) => t.id)), [tabs]);
-  const zoneLayout = useZoneLayout(tabIds, pageId, myWindowLabel, liveTabIds);
+  // Each tab's durable session key: tmux mode's grid snapshot re-finds a
+  // session's zone by it after a runner restart re-creates the session's tab.
+  const sessionKeyByTab = useMemo(() => {
+    const keys = new Map<string, string>();
+    for (const t of tabs) if (t.claudeSessionId) keys.set(t.id, t.claudeSessionId);
+    return keys;
+  }, [tabs]);
+  const zoneLayout = useZoneLayout(tabIds, pageId, myWindowLabel, liveTabIds, sessionKeyByTab);
 
   // Page-namespaced zone labels / notes / pins / tags. Moved into the scope
   // (from ZoneMetadataProvider) so each page owns its own labels regardless of
@@ -333,6 +356,11 @@ const PageSessionScope = memo(function PageSessionScope({
     }
   }, [tabs]);
 
+  // The page notification, for the zone-profile resume below — workflowGen
+  // (which owns it) is defined further down, so it is wired through a ref like
+  // the other cross-hook setters.
+  const notificationSetterRef = useRef<WorkflowGenReturn["setNotification"]>(() => {});
+
   // Pending Claude sessions to resume after a zone profile load settles.
   const pendingProfileSessionsRef = useRef<ZoneSessionInfo[] | null>(null);
 
@@ -340,17 +368,6 @@ const PageSessionScope = memo(function PageSessionScope({
     const SESSION_ID_RE = /^[a-zA-Z0-9_-]+$/;
     const sessions = pendingProfileSessionsRef.current;
     if (!sessions || sessions.length === 0) return;
-
-    const isWindows = navigator.platform.startsWith("Win");
-    const buildResumeCmd = (sessionId: string, configDir: string | undefined) => {
-      // Autonomous resume (matches clg/clh/clp) so a re-attached session
-      // doesn't stall on a permission prompt.
-      const base = `claude --permission-mode bypassPermissions --resume ${sessionId}`;
-      if (!configDir) return `${base}\r`;
-      return isWindows
-        ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; ${base}\r`
-        : `CLAUDE_CONFIG_DIR="${configDir}" ${base}\r`;
-    };
 
     // Process only sessions whose zone now has an assignment; leave the
     // rest in the ref for the next assignments tick. The partition (and the
@@ -395,33 +412,21 @@ const PageSessionScope = memo(function PageSessionScope({
           );
           continue;
         }
-        updateTab(tabId, {
-          claudeSessionId: s.claudeSessionId,
-          claudeConfigDir: s.claudeConfigDir,
-        });
-        // Durable-registry OPEN at type time (#548 Phase 1): `--resume` names
-        // the exact id in the typed command — no transcript guess.
+        // The open record for the VERIFIED branch.
         //
         // Built by `buildSessionOpenArgs` rather than by hand, so this writer
         // cannot drift from the command's signature the way it once did:
-        // `origin`, NOT the retired `bindOrigin`. This call site was the last
-        // writer still spelling the pre-migration key AND the pre-migration
-        // value ("pinned"). `terminal_session_record_open` has no `bind_origin`
-        // parameter, so Tauri dropped the argument silently and the row landed
-        // with `origin: None` -- which reads as "reconciled", and
-        // `classifyRestoreAction` keeps a reconciled row off the auto-resume
-        // track. A profile resume types the exact id in `--resume`, so it is
-        // the most authoritative bind there is; saying so in the key the
-        // command actually reads was the whole fix, and a typed builder is what
-        // keeps it said. (A hand-built object literal is exactly what let the
-        // dead key survive migration unnoticed.)
+        // `origin`, NOT the retired `bindOrigin` (a hand-built literal let the
+        // dead key survive migration, and the row landed `origin: None`, which
+        // reads as "reconciled" and keeps it off the auto-resume track). A
+        // profile resume types the exact id in `--resume`, so it is the most
+        // authoritative bind there is.
         //
-        // The builder resolves `workingDir`/`title` off the live tab list (the
-        // `resumedTab` lookup this used to do inline) and the zone by reverse
-        // lookup over `zoneLayout.assignments` — which yields `s.zoneIndex`
-        // here by construction, since `tabId` came from
+        // The builder resolves `workingDir`/`title` off the live tab list and
+        // the zone by reverse lookup over `zoneLayout.assignments` — which
+        // yields `s.zoneIndex` here by construction, since `tabId` came from
         // `zoneLayout.assignments[s.zoneIndex]` a few lines up.
-        const openArgs = buildSessionOpenArgs({
+        const recordOpen = buildSessionOpenArgs({
           assignments: zoneLayout.assignments,
           tabs,
           tabId,
@@ -430,37 +435,33 @@ const PageSessionScope = memo(function PageSessionScope({
           pageId,
           origin: "authoritative",
         });
-        // Note the zone we are about to WRITE so the re-resolution backstop in
-        // `TerminalPage` only fires if the tab ends up somewhere else (e.g. the
-        // profile's zone was out of range for the live layout and the tab got
-        // compacted elsewhere) — and stays silent when the profile placement
-        // holds. Read off `openArgs`, not off `s`: the ledger's contract is
-        // "what was WRITTEN", so it must be the same number the payload
-        // carries.
-        noteRecordedZone(recordedZoneLedgerFor(pageId), s.claudeSessionId, openArgs.zoneIndex);
-        invoke("terminal_session_record_open", openArgs)
-          // Written is not bound — report which, rather than only the failure.
-          .then((response) =>
+        // THE resume choke point, shared with the boot restore and every
+        // one-click resume: the account rule (`resolveAccountDir` — the
+        // default home is never typed, an unsafe dir is refused), the typed
+        // command (`runVerifiedResume`), a verified handshake, and the open
+        // record written only once it verified. Fire-and-forget per tab, like
+        // the boot drain: a failed verification parks the tab in its Retry.
+        void resumeProfileSession(
+          {
+            terminalRefs: terminalRefs.current,
+            updateTab,
+            notify: (message) => notificationSetterRef.current({ message, type: "error" }),
+          },
+          {
+            tabId,
+            claudeSessionId: s.claudeSessionId,
+            configDir: s.claudeConfigDir,
+            recordOpen,
+          },
+        )
+          .then((attempt) =>
             recordOpenLogger.debug(
-              describeRecordOpenOutcome({
-                claudeSessionId: s.claudeSessionId,
-                terminalId: tabId,
-                response,
-              }),
+              `profile resume ${s.claudeSessionId} → ${tabId}: ${
+                attempt.kind === "verified" ? "verified" : attempt.failure
+              }`,
             ),
           )
-          .catch((err) => console.warn(`[TerminalSession] profile resume record failed:`, err));
-        writeWhenReady(
-          terminalRefs.current,
-          tabId,
-          buildResumeCmd(s.claudeSessionId, s.claudeConfigDir),
-          {
-            onTimeout: (id) =>
-              console.warn(
-                `[TerminalSession] profile resume: terminal ref for ${id} never became ready`,
-              ),
-          },
-        );
+          .catch((err) => console.warn(`[TerminalSession] profile resume threw:`, err));
       }
     })();
   }, [zoneLayout.assignments, updateTab, tabs, pageId]);
@@ -593,6 +594,11 @@ const PageSessionScope = memo(function PageSessionScope({
 
   useEffect(() => {
     const coalescer = coalescerRef.current;
+    const hotStore = getTerminalHotStore(pageId);
+    // Per-tab total output (end of the newest chunk), published on the same
+    // flush as the decoded text so a streaming pane re-renders once per frame,
+    // not once per raw event.
+    const pendingTotals = new Map<string, number>();
     let rafHandle: ReturnType<typeof requestAnimationFrame> | null = null;
 
     // rAF suspends in occluded/minimized windows (WebView2), which would leave
@@ -616,6 +622,10 @@ const PageSessionScope = memo(function PageSessionScope({
       for (const [tabId, text] of coalescer.drain()) {
         fn(tabId, text);
       }
+      for (const [tabId, total] of pendingTotals) {
+        hotStore.noteTabTotalBytes(tabId, total);
+      }
+      pendingTotals.clear();
     };
     const scheduleFlush = () => {
       if (rafHandle !== null || timeoutHandle !== null) return;
@@ -647,6 +657,10 @@ const PageSessionScope = memo(function PageSessionScope({
       const bytes = base64ToBytes(payload.data);
       noteDecode("tap", decodeStart, bytes.length);
       coalescer.push(tid, bytes);
+      const total = chunkEndOffset(payload.offset, bytes.length);
+      if (total !== undefined) {
+        pendingTotals.set(tid, Math.max(pendingTotals.get(tid) ?? 0, total));
+      }
       scheduleFlush();
     });
 
@@ -657,6 +671,7 @@ const PageSessionScope = memo(function PageSessionScope({
     const unlistenActivity = subscribeTerminalActivityStream((payload) => {
       if (!tabIdSetRef.current.has(payload.terminalId)) return;
       handleActivityDigestRef.current(payload.terminalId, payload.bytesDelta, payload.lines);
+      hotStore.noteTabTotalBytes(payload.terminalId, payload.totalBytesProduced);
     });
 
     return () => {
@@ -668,7 +683,7 @@ const PageSessionScope = memo(function PageSessionScope({
       unlisten();
       unlistenActivity();
     };
-  }, []);
+  }, [pageId]);
 
   // ---- ShellInfra ----
   const fileConflicts = useFileConflicts();
@@ -702,6 +717,8 @@ const PageSessionScope = memo(function PageSessionScope({
     setRightPanelMode: (v) => rightPanelModeSetterRef.current(v as never),
     setSelectedTranscriptSessionId: (v) => selectedSessionSetterRef.current(v as never),
     pageId,
+    // A session the operator resumes is shown (tmux `new-window`; no-op in grid).
+    onResumedTab: zoneLayout.showSpawnedTab,
   });
 
   const getScrollback = useCallback(
@@ -747,7 +764,7 @@ const PageSessionScope = memo(function PageSessionScope({
       selectedSessionSetterRef.current(sessionId);
       rightPanelModeSetterRef.current("transcript" as never);
     },
-    onFocusSessionTab: (sessionId: string, tabId: string) => {
+    onFocusSessionTab: (sessionId: string, tabId: string, source: "transcript" | "tab") => {
       // Defensive: `zoneTabId` only ever names a tab this window owns, but a
       // stale or synthetic id must fall back to the transcript, not a no-op.
       const plan = tabs.some((t) => t.id === tabId)
@@ -760,6 +777,8 @@ const PageSessionScope = memo(function PageSessionScope({
           )
         : null;
       if (!plan) {
+        // A tab row has no transcript to fall back to — its id is a tab id.
+        if (source === "tab") return;
         selectedSessionSetterRef.current(sessionId);
         rightPanelModeSetterRef.current("transcript" as never);
         return;
@@ -776,7 +795,11 @@ const PageSessionScope = memo(function PageSessionScope({
       zoneLayout.requestReveal(tabId);
       // Keep the card highlighted as the current session.
       selectedSessionSetterRef.current(sessionId);
+      // A tab row's id names no transcript: an open transcript panel would
+      // keep painting the previous session's messages under it, so close it.
+      rightPanelModeSetterRef.current((mode) => rightPanelModeAfterRowSelect(source, mode));
     },
+    onCloseSessionTab: terminalManager.closeTerminal,
   });
 
   const workflowGen = useWorkflowGeneration({
@@ -785,6 +808,8 @@ const PageSessionScope = memo(function PageSessionScope({
     loadMessages,
     onNavigateToBuilder,
     onNavigateToActive,
+    pageId,
+    windowLabel: myWindowLabel,
   });
 
   const analysis = useAnalysis({
@@ -802,9 +827,9 @@ const PageSessionScope = memo(function PageSessionScope({
     tabs,
     terminalRefs,
     createTerminal,
-    pendingResumeRef: shellIntegration.pendingResumeRef,
     runGeneration: workflowGen.runGeneration,
     setRightPanelMode: workflowGen.setRightPanelMode,
+    showSpawnedTab: zoneLayout.showSpawnedTab,
   });
 
   // Session summary (AI Tier 2).
@@ -854,6 +879,7 @@ const PageSessionScope = memo(function PageSessionScope({
   useEffect(() => {
     rightPanelModeSetterRef.current = workflowGen.setRightPanelMode;
     selectedSessionSetterRef.current = workflowGen.setSelectedTranscriptSessionId;
+    notificationSetterRef.current = workflowGen.setNotification;
   });
 
   // Memoize the value object. Keys in deps list mirror the prior
@@ -1011,8 +1037,20 @@ export function TerminalSessionProvider({
 
   const activeValue = values[activePageId] ?? null;
 
+  // Layout effect, not a passive one, so the ref matches what the provider last
+  // committed. A scope publishes its value from a passive effect, so a lookup
+  // can still trail that scope by one render; callers read the result back.
+  const valuesRef = useRef(values);
+  useLayoutEffect(() => {
+    valuesRef.current = values;
+  }, [values]);
+  const getPageSession = useCallback<PageSessionGetter>(
+    (pageId) => valuesRef.current[pageId] ?? null,
+    [],
+  );
+
   return (
-    <>
+    <PageSessionGetterContext.Provider value={getPageSession}>
       {scopedPages.map((p) => (
         <PageSessionScope
           key={p.id}
@@ -1041,7 +1079,7 @@ export function TerminalSessionProvider({
           </div>
         </div>
       )}
-    </>
+    </PageSessionGetterContext.Provider>
   );
 }
 

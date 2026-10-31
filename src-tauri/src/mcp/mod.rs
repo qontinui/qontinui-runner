@@ -142,6 +142,10 @@ pub mod reviews;
 pub mod saved_api_requests;
 pub mod scheduler;
 pub mod sdk_client;
+// The connect handshake's door tests (coord finding c89c2766), in a file of
+// their own so a whole-file revert of sdk_client.rs keeps them.
+#[cfg(test)]
+mod sdk_connect_door_tests;
 pub mod sdk_terminal_buffer;
 pub mod security_audit;
 pub mod server;

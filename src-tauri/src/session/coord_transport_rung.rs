@@ -357,6 +357,7 @@ pub fn parse_reporter_step(raw: Option<&str>) -> Option<String> {
 /// MUST stay sorted: membership is a `binary_search`.
 const READ_TOOLS: &[&str] = &[
     "coord_agent_registry_effective",
+    "coord_alert_queue",
     "coord_am_i_clear",
     "coord_blockers",
     "coord_build_info",
@@ -365,22 +366,28 @@ const READ_TOOLS: &[&str] = &[
     "coord_conflict_check",
     "coord_diagnose",
     "coord_diff_impact",
+    "coord_fleet_drain_status",
     "coord_inbox",
     "coord_layering_triage",
     "coord_memory_get",
     "coord_memory_overview",
     "coord_memory_search",
     "coord_merge_order",
+    "coord_message_status",
     "coord_migration_queue",
+    "coord_next_step_settings_effective",
     "coord_orient",
     "coord_overlord_interventions",
+    "coord_pending_agent_questions",
     "coord_pr_status",
+    "coord_primary_tree_branch_status",
     "coord_reevaluate_dry",
     "coord_session_obligations",
     "coord_session_worktrees",
     "coord_verification_queue",
     "coord_watch_verdict",
     "coord_who_is_working_on",
+    "coord_work_unit_overview",
 ];
 
 /// Read-only tool FAMILIES by prefix.
@@ -947,6 +954,12 @@ mod tests {
             operation_for_call("tools/call", Some("coord_can")),
             OPERATION_READ
         );
+        // The sender's receipt read matches no read prefix, so only its
+        // exact `READ_TOOLS` entry keeps it from defaulting to a write.
+        assert_eq!(
+            operation_for_call("tools/call", Some("coord_message_status")),
+            OPERATION_READ
+        );
         // The by-id memory read-back is an exact read, while its write
         // siblings (`coord_memory_record` / `_supersede`) stay writes.
         assert_eq!(
@@ -957,19 +970,36 @@ mod tests {
             operation_for_call("tools/call", Some("coord_memory_record")),
             OPERATION_WRITE
         );
-        // The overlord's proof reads and ledger read are reads; the ledger
-        // append (`coord_overlord_record`) stays a write.
+        // The overlord's proof reads and ledger reads are reads; the ledger
+        // appends (`coord_overlord_record`, and the triage-pass ledger's
+        // `coord_overlord_pass_record`) stay writes. The pass ledger's two reads
+        // are reads by the `coord_query_` prefix, with no exact entry.
         for tool in [
             "coord_watch_verdict",
             "coord_session_obligations",
             "coord_overlord_interventions",
+            "coord_query_overlord_passes",
+            "coord_query_overlord_flow",
         ] {
             assert_eq!(operation_for_call("tools/call", Some(tool)), OPERATION_READ);
         }
-        assert_eq!(
-            operation_for_call("tools/call", Some("coord_overlord_record")),
-            OPERATION_WRITE
-        );
+        for tool in ["coord_overlord_record", "coord_overlord_pass_record"] {
+            assert_eq!(
+                operation_for_call("tools/call", Some(tool)),
+                OPERATION_WRITE,
+                "{tool} is a ledger append"
+            );
+        }
+        for tool in [
+            "coord_alert_queue",
+            "coord_fleet_drain_status",
+            "coord_next_step_settings_effective",
+            "coord_pending_agent_questions",
+            "coord_primary_tree_branch_status",
+            "coord_work_unit_overview",
+        ] {
+            assert_eq!(operation_for_call("tools/call", Some(tool)), OPERATION_READ);
+        }
         // `coord_can` is exact, so the cancel WRITE is not swallowed by it.
         assert_eq!(
             operation_for_call("tools/call", Some("coord_cancel_continuation")),

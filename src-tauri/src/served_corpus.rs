@@ -50,17 +50,47 @@
 //! ## Where the I/O happens
 //!
 //! [`crate::terminal::runner_context`] is a zero-I/O renderer by contract. The
-//! SEAM that spawns a session calls [`probe`] and hands the result in, the same
-//! way it hands in the per-session `CoordMcpDelivery`. [`probe`] is bounded by
-//! ONE deadline, [`PROBE_BUDGET`], for the whole measurement: each `git` spawn
-//! runs under whatever is left of it through
-//! [`crate::process_helpers::run_with_timeout_detailed`], which kills the whole
-//! process tree on expiry. Once the budget is spent — by one hung `git` or by
-//! several slow ones — every later `git` question answers `UNKNOWN (deadline:
-//! …)` at once, so a probe never outlives its budget however many questions it
-//! has left. It never fetches, never writes, and runs `git status` with
-//! `GIT_OPTIONAL_LOCKS=0` (so not even the index is refreshed), without
-//! untracked files, renames or submodules.
+//! SEAM that spawns a session measures and hands the result in, the same way it
+//! hands in the per-session `CoordMcpDelivery`: the terminal spawn starts the
+//! measurement with [`probe_start`] as soon as its cwd is known and joins it
+//! inside the identity seam, so the measurement overlaps the seam's other work;
+//! every other caller uses [`probe`] (start and join at once).
+//!
+//! **The guarantee: [`probe`] (and a [`ProbeHandle::join`], counted from its
+//! [`probe_start`]) returns within
+//! [`PROBE_BUDGET`] + [`PROBE_COLLECT_GRACE`], whatever process creation
+//! costs.** Two walls make that true (plan
+//! `2026-10-19-served-corpus-probe-budget-excludes-process-creation`):
+//!
+//! - **The inner wall is one absolute deadline for every `git` spawn**, PROCESS
+//!   CREATION INCLUDED: each run goes through
+//!   [`crate::process_deadline::run_with_deadline_detailed`], whose clock starts
+//!   before `spawn()`, not after it. A `git` that could not even START before
+//!   the deadline reads `UNKNOWN(timed-out)` with a reason naming process
+//!   creation; a child that starts late is killed and parked, never waited on.
+//!   Once the budget is spent every later question answers `UNKNOWN (deadline:
+//!   …)` at once. (On Windows Rust std holds one process-wide lock across
+//!   `CreateProcessW`, so one slow `std::process` or tokio spawn anywhere in
+//!   the runner can queue this probe's spawns behind it for minutes — the
+//!   plan's 2026-10-19 read of spaceship's span log, 2026-10-15..18, measured
+//!   the probe at up to 208 s before this wall existed.)
+//! - **The outer wall is the caller's**: the measurement runs on a
+//!   `served-corpus-probe` worker thread, and the caller waits for it until
+//!   `called_at + PROBE_BUDGET + PROBE_COLLECT_GRACE` and no longer. A worker
+//!   still running then — stuck in non-git I/O, say — leaves the caller with
+//!   `[served-corpus: UNKNOWN (deadline: served-corpus probe budget … spent)]`.
+//!   That UNKNOWN is never memoised; the worker's own late result is, so the
+//!   next spawn within [`MEMO_TTL`] reads the real measurement.
+//!
+//! Concurrent probes of one workdir share ONE measurement (single-flight; keyed
+//! on the workdir as spelled, so two spellings of one directory measure
+//! twice, and the memo, keyed on the canonical path, then serves the later
+//! one), and
+//! at most [`MAX_INFLIGHT_PROBES`] measurements run at once; past that a probe
+//! answers `UNKNOWN` at once rather than start another thread. The probe never
+//! fetches, never writes, and runs `git status` with `GIT_OPTIONAL_LOCKS=0`
+//! (so not even the index is refreshed — which is also what makes killing a
+//! late `git` harmless), without untracked files, renames or submodules.
 //!
 //! ## Why the answer is memoised
 //!
@@ -82,6 +112,40 @@ pub(crate) const PROBE_BUDGET: Duration = Duration::from_secs(5);
 
 /// How long a probe result is reused for the same workdir and build.
 const MEMO_TTL: Duration = Duration::from_secs(30);
+
+/// How long past [`PROBE_BUDGET`] the caller of [`probe`] keeps waiting for
+/// the measurement, so a worker that returns at its own deadline, carrying
+/// partial measurements, is collected rather than discarded.
+///
+/// It must cover [`crate::process_deadline::KILL_GRACE`]: a `git` killed at
+/// the deadline can take that long to hand its run back, and a shorter wall
+/// would throw away every measurement the probe had already made. The plan
+/// named 250 ms; that is shorter than the kill grace (500 ms), so the wall is
+/// the kill grace plus 100 ms of margin (enforced below).
+pub(crate) const PROBE_COLLECT_GRACE: Duration = Duration::from_millis(600);
+
+const _: () = assert!(
+    PROBE_COLLECT_GRACE.as_millis() >= crate::process_deadline::KILL_GRACE.as_millis() + 100,
+    "PROBE_COLLECT_GRACE must cover the deadline primitive's kill grace"
+);
+
+/// Most served-corpus measurement WORKERS running at once. A probe past it
+/// answers UNKNOWN at once instead of starting another worker.
+///
+/// Sized from the terminal-spawn population: 126 terminal spawns in 3.5 days
+/// on spaceship (2026-10-15..18) is about 1.5 an hour, and the only structural
+/// concurrency is a gate continuation's two renders of ONE workdir, which
+/// single-flight folds into one measurement. The other callers
+/// ([`probe_async`]: agent runtime, looping supervisor) are rarer still. 4
+/// leaves headroom for a burst of distinct workdirs.
+///
+/// What it does NOT bound: a worker returns at its deadline even when its
+/// `git` is still inside `spawn()`, so the `deadline-spawn` helper thread that
+/// is waiting on process creation outlives the worker's slot (one per
+/// abandoned probe, ended when the kernel returns and the late child is
+/// killed). On a box where process creation is stuck those helpers accumulate
+/// at the rate probes are made, not at this cap.
+pub(crate) const MAX_INFLIGHT_PROBES: usize = 4;
 
 /// The commit this binary was built from, as `/health` reports `gitSha`.
 const BUILD_SHA: &str = env!("QONTINUI_GIT_SHA");
@@ -297,6 +361,16 @@ impl SourceIdentity {
                 self.canonical,
                 clean(&s.fetched_at)
             ),
+            // The tenant's `egress_skill_mirror` switch is the REASON nothing
+            // is loaded when it is off — named, so a session can tell "the
+            // tenant turned the mirror off" from "the first fetch has not
+            // landed yet" (plan 2026-10-10-spec-front-end-phase-9-generic-boundary).
+            None if !crate::egress::permit(crate::egress::Flow::SkillMirror).allowed => {
+                format!(
+                    "canonical@unloaded(egress_skill_mirror=off) {}",
+                    self.canonical
+                )
+            }
             None => format!("canonical@unloaded {}", self.canonical),
         };
         format!(
@@ -410,8 +484,9 @@ pub(crate) struct ServedCorpus {
 impl ServedCorpus {
     /// The value for a call site with no session to measure. Every token reads
     /// `UNKNOWN (<reason>)`, so a caller never fabricates a measurement.
-    pub(crate) fn unknown(reason: &'static str) -> ServedCorpus {
-        let r = || reason.to_string();
+    pub(crate) fn unknown(reason: impl Into<String>) -> ServedCorpus {
+        let reason: String = reason.into();
+        let r = || reason.clone();
         ServedCorpus {
             corpus: Probe::Unknown(r()),
             checkout: Probe::Unknown(r()),
@@ -558,17 +633,225 @@ fn memo() -> &'static Mutex<HashMap<MemoKey, (Instant, ServedCorpus)>> {
 ///
 /// Never fails and never panics: it runs on a spawn path, and every failure is
 /// an `UNKNOWN (<reason>)` token.
+///
+/// Returns within [`PROBE_BUDGET`] + [`PROBE_COLLECT_GRACE`] of the call — see
+/// the module docs. Exactly `probe_start(workdir, None).join()`.
 pub(crate) fn probe(workdir: &Path) -> ServedCorpus {
-    let key_dir = std::fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf());
-    memoised((key_dir, RUNNER_BUILD), MEMO_TTL, || {
-        let canonical = crate::canonical_corpus::latest();
-        probe_with(
-            workdir,
-            OsStr::new("git"),
-            PROBE_BUDGET,
-            canonical.as_deref(),
-        )
-    })
+    probe_start(workdir, None).join()
+}
+
+/// Start measuring what `<workdir>/.claude/` serves — or join the measurement
+/// of that workdir already in flight — WITHOUT waiting for it. The returned
+/// handle's [`ProbeHandle::join`] waits until THIS call's
+/// `called_at + PROBE_BUDGET + PROBE_COLLECT_GRACE` and no longer, so a caller
+/// with other work to do (the terminal spawn seam) can overlap the measurement
+/// with it and still keep the bound (plan
+/// `2026-10-19-served-corpus-probe-budget-excludes-process-creation`, Phase 5).
+///
+/// Non-blocking: it takes the in-flight table's lock and at most starts one
+/// thread. A dropped handle leaves the worker to finish and memoise.
+///
+/// `terminal_id` is recorded on the worker's `served_corpus.measure` span so a
+/// span-log read can pair a measurement with the terminal spawn that started
+/// it (`terminal_spawn.served_corpus_probe{terminal_id}`). A spawn that JOINS a
+/// measurement another caller started has no measure span of its own (the
+/// span carries the starter's id, empty for [`probe`]), so such a read must
+/// leave unpaired spawns and `terminal_id=""` out. The worker's span is
+/// deliberately NOT a child of the caller's: a parent stays open until its last
+/// child closes, so a worker that outlives its caller would stretch the
+/// caller's recorded duration.
+pub(crate) fn probe_start(workdir: &Path, terminal_id: Option<&str>) -> ProbeHandle {
+    let called_at = Instant::now();
+    let deadline = called_at + PROBE_BUDGET;
+    let owned = workdir.to_path_buf();
+    let terminal_id = terminal_id.unwrap_or_default().to_string();
+    start_bounded(
+        &PRODUCTION_FLIGHTS,
+        (workdir.to_path_buf(), RUNNER_BUILD),
+        deadline + PROBE_COLLECT_GRACE,
+        format!("deadline: served-corpus probe budget {PROBE_BUDGET:?} spent"),
+        move || {
+            // The canonicalize, the memo lookup and the measurement all run
+            // here, on the worker: the caller only waits. The span is what the
+            // spawn seam's `terminal_spawn.served_corpus_probe` (the JOIN wait)
+            // is compared against to show the overlap.
+            let span = tracing::debug_span!(
+                parent: None,
+                "served_corpus.measure",
+                terminal_id = %terminal_id,
+                memo_hit = tracing::field::Empty
+            );
+            let _entered = span.enter();
+            let key_dir = std::fs::canonicalize(&owned).unwrap_or_else(|_| owned.clone());
+            let mut measured = false;
+            let value = memoised((key_dir, RUNNER_BUILD), MEMO_TTL, || {
+                measured = true;
+                let canonical = crate::canonical_corpus::latest();
+                probe_with_opts(
+                    &owned,
+                    OsStr::new("git"),
+                    PROBE_BUDGET,
+                    deadline,
+                    std::process::Command::spawn,
+                    canonical.as_deref(),
+                )
+            });
+            span.record("memo_hit", !measured);
+            value
+        },
+    )
+}
+
+/// The measurements in flight, keyed like the memo but on the workdir AS
+/// GIVEN (the canonicalize is part of the measurement, so it cannot key the
+/// join). `cap` is [`MAX_INFLIGHT_PROBES`] in production; a test builds its
+/// own table so it can fill one without starving every other probe.
+struct Flights {
+    table: Mutex<HashMap<MemoKey, std::sync::Arc<Flight>>>,
+    cap: usize,
+}
+
+static PRODUCTION_FLIGHTS: std::sync::LazyLock<Flights> = std::sync::LazyLock::new(|| Flights {
+    table: Mutex::new(HashMap::new()),
+    cap: MAX_INFLIGHT_PROBES,
+});
+
+/// One measurement, joined by every caller that asks for its key while it
+/// runs.
+#[derive(Default)]
+struct Flight {
+    value: Mutex<Option<ServedCorpus>>,
+    done: std::sync::Condvar,
+}
+
+/// A served-corpus measurement started (or joined) by [`probe_start`]. Its
+/// wall was fixed when it was STARTED, not when it is joined.
+pub(crate) struct ProbeHandle {
+    pending: Pending,
+    wall: Instant,
+    deadline_reason: String,
+}
+
+enum Pending {
+    /// Answered at start, with nothing to wait for (capacity, or a worker
+    /// that could not start).
+    Ready(Box<ServedCorpus>),
+    /// A measurement in flight — this call's own, or one it joined.
+    InFlight(std::sync::Arc<Flight>),
+}
+
+impl ProbeHandle {
+    /// The measurement, waiting for it until the wall fixed at start and no
+    /// longer. A measurement that has finished is returned even when the wall
+    /// has passed; one that has not reads the one-token deadline UNKNOWN,
+    /// which is never memoised (the worker memoises its own late result).
+    pub(crate) fn join(self) -> ServedCorpus {
+        let flight = match self.pending {
+            Pending::Ready(v) => return *v,
+            Pending::InFlight(f) => f,
+        };
+        let mut g = flight.value.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if let Some(v) = g.as_ref() {
+                return v.clone();
+            }
+            let now = Instant::now();
+            if now >= self.wall {
+                return ServedCorpus::unknown(self.deadline_reason);
+            }
+            g = flight
+                .done
+                .wait_timeout(g, self.wall - now)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+    }
+}
+
+/// Run `measure` on a worker — or join the one already measuring `key` — and
+/// hand back a handle that waits for it until `wall`. Past the wall,
+/// `deadline_reason` as a one-token UNKNOWN; past `flights.cap`, a capacity
+/// UNKNOWN at once. Neither UNKNOWN is memoised: only `measure` itself writes
+/// the memo, when it completes.
+fn start_bounded(
+    flights: &'static Flights,
+    key: MemoKey,
+    wall: Instant,
+    deadline_reason: String,
+    measure: impl FnOnce() -> ServedCorpus + Send + 'static,
+) -> ProbeHandle {
+    let ready = |v: ServedCorpus| ProbeHandle {
+        pending: Pending::Ready(Box::new(v)),
+        wall,
+        deadline_reason: String::new(),
+    };
+    let mut table = flights.table.lock().unwrap_or_else(|p| p.into_inner());
+    let flight = if let Some(f) = table.get(&key) {
+        std::sync::Arc::clone(f)
+    } else {
+        if table.len() >= flights.cap {
+            return ready(ServedCorpus::unknown(
+                "served-corpus probe capacity: measurements still in flight",
+            ));
+        }
+        let f = std::sync::Arc::new(Flight::default());
+        let worker_flight = std::sync::Arc::clone(&f);
+        let worker_key = key.clone();
+        let spawned = std::thread::Builder::new()
+            .name("served-corpus-probe".to_string())
+            .spawn(move || {
+                // A panicking measurement must still complete its flight:
+                // otherwise every later probe of this workdir would join a
+                // flight that never ends, and its capacity slot would leak.
+                let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(measure))
+                    .unwrap_or_else(|_| {
+                        ServedCorpus::unknown("served-corpus probe worker panicked")
+                    });
+                {
+                    let mut g = worker_flight
+                        .value
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    *g = Some(value);
+                }
+                worker_flight.done.notify_all();
+                let mut table = flights.table.lock().unwrap_or_else(|p| p.into_inner());
+                if table
+                    .get(&worker_key)
+                    .is_some_and(|cur| std::sync::Arc::ptr_eq(cur, &worker_flight))
+                {
+                    table.remove(&worker_key);
+                }
+            });
+        if spawned.is_err() {
+            return ready(ServedCorpus::unknown(
+                "served-corpus probe worker could not start",
+            ));
+        }
+        // Inserted while the table lock is still held, so the worker's
+        // removal (which takes the same lock) can never run first.
+        table.insert(key, std::sync::Arc::clone(&f));
+        f
+    };
+    drop(table);
+    ProbeHandle {
+        pending: Pending::InFlight(flight),
+        wall,
+        deadline_reason,
+    }
+}
+
+/// [`start_bounded`] and an immediate [`ProbeHandle::join`]: what [`probe`]
+/// does, over a test's own in-flight table.
+#[cfg(test)]
+fn probe_bounded(
+    flights: &'static Flights,
+    key: MemoKey,
+    wall: Instant,
+    deadline_reason: String,
+    measure: impl FnOnce() -> ServedCorpus + Send + 'static,
+) -> ServedCorpus {
+    start_bounded(flights, key, wall, deadline_reason, measure).join()
 }
 
 /// The memo behind [`probe`]: `key`'s value when one was STORED within `ttl`,
@@ -596,7 +879,8 @@ fn memoised(key: MemoKey, ttl: Duration, measure: impl FnOnce() -> ServedCorpus)
 }
 
 /// [`probe`] for an async seam: the bounded `git` spawns run on the blocking
-/// pool, never on a runtime worker.
+/// pool, never on a runtime worker, and hold that pool thread for at most
+/// [`PROBE_BUDGET`] + [`PROBE_COLLECT_GRACE`].
 pub(crate) async fn probe_async(workdir: impl Into<PathBuf>) -> ServedCorpus {
     let workdir = workdir.into();
     qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || probe(&workdir))
@@ -607,13 +891,36 @@ pub(crate) async fn probe_async(workdir: impl Into<PathBuf>) -> ServedCorpus {
 /// [`probe`] without the memo, with the `git` program, the probe's overall
 /// budget and the loaded canonical snapshot as parameters, so a test can point
 /// them at nothing, at a hang, or at a corpus of its own.
+#[cfg(test)]
 fn probe_with(
     workdir: &Path,
     git_program: &OsStr,
     budget: Duration,
     canonical: Option<&crate::canonical_corpus::CanonicalCorpus>,
 ) -> ServedCorpus {
-    let git = Git::new(git_program, budget);
+    probe_with_opts(
+        workdir,
+        git_program,
+        budget,
+        Instant::now() + budget,
+        std::process::Command::spawn,
+        canonical,
+    )
+}
+
+/// The measurement itself, with the `git` program, the absolute `git`
+/// deadline, the process [`crate::process_deadline::Spawner`] and the loaded
+/// canonical snapshot as parameters, so a test can point them at nothing, at
+/// a hang, at slow process creation, or at a corpus of its own.
+fn probe_with_opts(
+    workdir: &Path,
+    git_program: &OsStr,
+    budget: Duration,
+    deadline: Instant,
+    spawner: crate::process_deadline::Spawner,
+    canonical: Option<&crate::canonical_corpus::CanonicalCorpus>,
+) -> ServedCorpus {
+    let git = Git::until(git_program, budget, deadline, spawner);
     let claude = workdir.join(".claude");
     let corpus = match std::fs::canonicalize(&claude) {
         Ok(p) if p.is_dir() => Probe::Measured(p),
@@ -1181,7 +1488,9 @@ fn bundle_identity(
 pub(crate) enum GitErrorCode {
     /// `deadline`: the probe's budget was already spent, so git was not run.
     Deadline,
-    /// `timed-out`: THIS git run was killed at the budget's end.
+    /// `timed-out`: THIS git run was killed at the probe budget, or abandoned
+    /// before it could start because process creation ate the budget (the
+    /// reason text says which).
     TimedOut,
     /// `git-unavailable`: git could not be spawned.
     GitUnavailable,
@@ -1221,25 +1530,46 @@ struct GitOut {
     stderr: String,
 }
 
-/// A `git` runner for ONE probe, under ONE deadline. Each spawn gets what is
-/// left of the budget, never a fresh allowance, so however many questions the
-/// probe asks it returns within the budget. A spawn failure, and a spent
+/// A `git` runner for ONE probe, under ONE absolute deadline that covers
+/// process creation. Each spawn gets what is left of the budget, never a fresh
+/// allowance, so however many questions the probe asks it returns within the
+/// budget plus [`crate::process_deadline::KILL_GRACE`] (a run killed at the
+/// deadline hands back within that grace). A spawn failure, and a spent
 /// budget, are sticky: every later call fails at once — a spawn failure with
 /// the same error, a spent budget as [`GitErrorCode::Deadline`].
 struct Git<'a> {
     program: &'a OsStr,
     budget: Duration,
     deadline: Instant,
+    spawner: crate::process_deadline::Spawner,
     dead: std::cell::RefCell<Option<GitError>>,
 }
 
 impl<'a> Git<'a> {
     /// A runner whose deadline is `budget` from now.
+    #[cfg(test)]
     fn new(program: &'a OsStr, budget: Duration) -> Self {
+        Self::until(
+            program,
+            budget,
+            Instant::now() + budget,
+            std::process::Command::spawn,
+        )
+    }
+
+    /// A runner whose deadline is the absolute `deadline` (`budget` is what its
+    /// reasons report), creating each child through `spawner`.
+    fn until(
+        program: &'a OsStr,
+        budget: Duration,
+        deadline: Instant,
+        spawner: crate::process_deadline::Spawner,
+    ) -> Self {
         Git {
             program,
             budget,
-            deadline: Instant::now() + budget,
+            deadline,
+            spawner,
             dead: std::cell::RefCell::new(None),
         }
     }
@@ -1278,15 +1608,34 @@ impl<'a> Git<'a> {
         if let Some(e) = self.dead.borrow().as_ref() {
             return Err(e.clone());
         }
-        let remaining = self.deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            let e = self.deadline_error(GitErrorCode::Deadline);
-            *self.dead.borrow_mut() = Some(e.clone());
-            return Err(e);
-        }
         let cmd = self.command(dir, args);
-        use crate::process_helpers::TimedOutput;
-        match crate::process_helpers::run_with_timeout_detailed(cmd, remaining) {
+        // ONE absolute deadline, process creation included: the clock does
+        // not wait for `spawn()` to return (plan
+        // `2026-10-19-served-corpus-probe-budget-excludes-process-creation`).
+        use crate::process_deadline::{DeadlineOutcome, NotStarted};
+        let span = tracing::debug_span!(
+            "served_corpus.git_run",
+            spawn_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty
+        )
+        .entered();
+        let result =
+            crate::process_deadline::run_with_deadline_spawner(cmd, self.deadline, self.spawner);
+        let outcome = match &result {
+            Err(_) => "spawn-error",
+            Ok(r) => match r.outcome {
+                DeadlineOutcome::Completed(_) => "completed",
+                DeadlineOutcome::TimedOut { .. } => "timed-out",
+                DeadlineOutcome::NotStarted(NotStarted::SpawnPending) => "spawn-pending",
+                DeadlineOutcome::NotStarted(NotStarted::DeadlinePassed) => "deadline",
+            },
+        };
+        span.record("outcome", outcome);
+        if let Some(d) = result.as_ref().ok().and_then(|r| r.spawn_elapsed) {
+            span.record("spawn_ms", u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        }
+        drop(span);
+        match result {
             Err(e) => {
                 let reason = if e.kind() == std::io::ErrorKind::NotFound {
                     "git unavailable".to_string()
@@ -1301,16 +1650,34 @@ impl<'a> Git<'a> {
                 Err(e)
             }
             Ok(run) => match run.outcome {
-                TimedOutput::TimedOut { .. } => {
+                DeadlineOutcome::NotStarted(NotStarted::DeadlinePassed) => {
+                    let e = self.deadline_error(GitErrorCode::Deadline);
+                    *self.dead.borrow_mut() = Some(e.clone());
+                    Err(e)
+                }
+                DeadlineOutcome::NotStarted(NotStarted::SpawnPending) => {
+                    // Git never started: process creation ate the budget. Same
+                    // `timed-out` code (every consumer of the code grammar
+                    // stays unchanged), with a reason that names the cause.
+                    *self.dead.borrow_mut() = Some(self.deadline_error(GitErrorCode::Deadline));
+                    Err(GitError {
+                        code: GitErrorCode::TimedOut,
+                        reason: format!(
+                            "deadline: git probe budget {:?} spent waiting for process creation",
+                            self.budget
+                        ),
+                    })
+                }
+                DeadlineOutcome::TimedOut { .. } => {
                     // This run was killed; every later one is never started.
                     *self.dead.borrow_mut() = Some(self.deadline_error(GitErrorCode::Deadline));
                     Err(self.deadline_error(GitErrorCode::TimedOut))
                 }
-                TimedOutput::Completed(_) if run.truncation.is_some() => Err(GitError {
+                DeadlineOutcome::Completed(_) if run.truncation.is_some() => Err(GitError {
                     code: GitErrorCode::OutputIncomplete,
                     reason: "git output incomplete".to_string(),
                 }),
-                TimedOutput::Completed(out) => Ok(GitOut {
+                DeadlineOutcome::Completed(out) => Ok(GitOut {
                     success: out.status.success(),
                     stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
                     stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -2152,6 +2519,485 @@ mod tests {
         assert_eq!(probe(tmp.path()).render_line(), first);
     }
 
+    // ── Process creation inside the budget (plan
+    // `2026-10-19-served-corpus-probe-budget-excludes-process-creation`) ──
+
+    const SLOW_SPAWN_BUDGET: Duration = Duration::from_millis(400);
+
+    /// Process creation that costs 3x the whole budget, per spawn.
+    fn slow_spawner(cmd: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+        std::thread::sleep(SLOW_SPAWN_BUDGET * 3);
+        cmd.spawn()
+    }
+
+    /// THE defect, as a regression test: every `git` spawn takes 3x the
+    /// budget to be created. The probe still returns inside budget + collect
+    /// grace, every git-derived value is UNKNOWN (never a measured-looking
+    /// default), and what needs no git — the corpus path and the bundle
+    /// identity — is still measured.
+    #[test]
+    fn a_slow_process_creation_cannot_stretch_the_probe() {
+        let tmp = checkout_with_bundle();
+        let started = Instant::now();
+        let line = probe_with_opts(
+            tmp.path(),
+            OsStr::new("git"),
+            SLOW_SPAWN_BUDGET,
+            started + SLOW_SPAWN_BUDGET,
+            slow_spawner,
+            None,
+        )
+        .render_line();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < SLOW_SPAWN_BUDGET + PROBE_COLLECT_GRACE + Duration::from_millis(250),
+            "process creation stretched the probe to {elapsed:?}"
+        );
+        // Normally the first git is the one stuck in process creation and
+        // says so; on a box loaded enough that the non-git work before it
+        // (the bundle identity) spends the budget first, it reads the plain
+        // deadline instead. Either way it is UNKNOWN on the budget.
+        assert!(
+            line.contains("[checkout: UNKNOWN (deadline: git probe budget 400ms spent"),
+            "{line}"
+        );
+        assert!(
+            line.contains("[cwd: UNKNOWN (deadline: git probe budget 400ms spent)]"),
+            "{line}"
+        );
+        assert!(
+            line.contains(
+                "stamped-tracked=UNKNOWN(checkout-unknown) dirty-bundle=UNKNOWN(checkout-unknown)"
+            ),
+            "{line}"
+        );
+        assert!(!line.starts_with("[served-corpus: UNKNOWN"), "{line}");
+        assert!(
+            line.contains(&format!("[bundle: {}/{} ", total(), total())),
+            "{line}"
+        );
+    }
+
+    /// The spawn that could not start before the deadline keeps the existing
+    /// `timed-out` code (D3), so the roster-count grammar is unchanged.
+    #[test]
+    fn a_git_that_never_started_reads_timed_out() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let checkout = repo_at(tmp.path(), Probe::Measured(vec![]));
+        let started = Instant::now();
+        let git = Git::until(
+            OsStr::new("git"),
+            SLOW_SPAWN_BUDGET,
+            started + SLOW_SPAWN_BUDGET,
+            slow_spawner,
+        );
+        assert_eq!(
+            counts(&git, &tmp.path().join(".claude"), &checkout),
+            "stamped-tracked=UNKNOWN(timed-out) dirty-bundle=0"
+        );
+        assert!(started.elapsed() < SLOW_SPAWN_BUDGET + Duration::from_millis(250));
+
+        // The reason names process creation. Nothing runs before this first
+        // git call on a fresh runner, so the spawn, not the budget, is what
+        // ran out.
+        let fresh = Git::until(
+            OsStr::new("git"),
+            SLOW_SPAWN_BUDGET,
+            Instant::now() + SLOW_SPAWN_BUDGET,
+            slow_spawner,
+        );
+        match fresh.run(tmp.path(), &["status"]) {
+            Err(GitError {
+                code: GitErrorCode::TimedOut,
+                reason,
+            }) => assert!(
+                reason.ends_with("spent waiting for process creation"),
+                "{reason}"
+            ),
+            Err(other) => panic!("expected TimedOut, got {other:?}"),
+            Ok(_) => panic!("expected TimedOut, git ran"),
+        }
+
+        // Sticky: the next question is not even asked.
+        assert!(matches!(
+            git.run(tmp.path(), &["status"]),
+            Err(GitError {
+                code: GitErrorCode::Deadline,
+                ..
+            })
+        ));
+    }
+
+    fn test_flights(cap: usize) -> &'static Flights {
+        Box::leak(Box::new(Flights {
+            table: Mutex::new(HashMap::new()),
+            cap,
+        }))
+    }
+
+    /// The outer wall: a measurement that does not come back in time (here:
+    /// non-git I/O that hangs) leaves the caller with a one-token UNKNOWN at
+    /// budget + grace, and that UNKNOWN is never memoised.
+    #[test]
+    fn the_caller_is_bounded_even_when_the_measurement_is_not() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let key: MemoKey = (tmp.path().to_path_buf(), "outer-wall-test");
+        let memo_key = key.clone();
+        let budget = Duration::from_millis(400);
+        let started = Instant::now();
+        let got = probe_bounded(
+            test_flights(4),
+            key.clone(),
+            started + budget + PROBE_COLLECT_GRACE,
+            format!("deadline: served-corpus probe budget {budget:?} spent"),
+            move || {
+                memoised(memo_key, MEMO_TTL, || {
+                    std::thread::sleep(Duration::from_secs(3));
+                    ServedCorpus::unknown("measured too late")
+                })
+            },
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(
+            got.render_line(),
+            "[served-corpus: UNKNOWN (deadline: served-corpus probe budget 400ms spent)]"
+        );
+        assert!(
+            elapsed < budget + PROBE_COLLECT_GRACE + Duration::from_millis(250),
+            "{elapsed:?}"
+        );
+        let memo_has_it = memo()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&key);
+        assert!(!memo_has_it, "the deadline UNKNOWN must never be memoised");
+    }
+
+    /// The outer wall waits long enough to collect a measurement whose git
+    /// was KILLED at the deadline: the caller gets the partial measurement
+    /// (git questions UNKNOWN on the budget, the bundle measured), never the
+    /// one-token deadline UNKNOWN. A SIGKILLed `sleep` hands its run back in
+    /// milliseconds, so this would also pass with a too-short grace; the const
+    /// assert beside [`PROBE_COLLECT_GRACE`] is what holds the grace above the
+    /// kill grace.
+    #[cfg(unix)]
+    #[test]
+    fn the_outer_wall_collects_a_measurement_whose_git_was_killed() {
+        let tmp = checkout_with_bundle();
+        let script = tmp.path().join("hung-git");
+        crate::canonical_corpus::test_support::executable_script(
+            &script,
+            "#!/bin/sh\nexec sleep 5\n",
+        );
+        let budget = Duration::from_millis(300);
+        let deadline = Instant::now() + budget;
+        let workdir = tmp.path().to_path_buf();
+        let got = probe_bounded(
+            test_flights(4),
+            (workdir.clone(), "killed-git-collect-test"),
+            deadline + PROBE_COLLECT_GRACE,
+            "deadline: outer wall".to_string(),
+            move || {
+                probe_with_opts(
+                    &workdir,
+                    script.as_os_str(),
+                    budget,
+                    deadline,
+                    std::process::Command::spawn,
+                    None,
+                )
+            },
+        )
+        .render_line();
+        assert!(!got.starts_with("[served-corpus: UNKNOWN"), "{got}");
+        assert!(
+            got.contains("[checkout: UNKNOWN (deadline: git probe budget 300ms spent)]"),
+            "{got}"
+        );
+        assert!(
+            got.contains(&format!("[bundle: {}/{} ", total(), total())),
+            "{got}"
+        );
+    }
+
+    /// Two concurrent probes of one workdir run ONE measurement.
+    #[test]
+    fn concurrent_probes_of_one_workdir_share_one_measurement() {
+        static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let flights = test_flights(4);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let key: MemoKey = (tmp.path().to_path_buf(), "single-flight-test");
+        let call = |key: MemoKey| {
+            std::thread::spawn(move || {
+                probe_bounded(
+                    flights,
+                    key,
+                    Instant::now() + Duration::from_secs(10),
+                    "deadline".to_string(),
+                    || {
+                        RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(300));
+                        ServedCorpus::unknown("one measurement")
+                    },
+                )
+            })
+        };
+        let a = call(key.clone());
+        std::thread::sleep(Duration::from_millis(50));
+        let b = call(key);
+        let (a, b) = (a.join().unwrap(), b.join().unwrap());
+        assert_eq!(a, b);
+        assert_eq!(
+            a.render_line(),
+            "[served-corpus: UNKNOWN (one measurement)]"
+        );
+        assert_eq!(RUNS.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A measurement abandoned at the wall still completes, and the next
+    /// probe inside the memo window reads ITS result, not a stale default.
+    #[test]
+    fn a_late_measurement_is_served_to_the_next_probe() {
+        let flights = test_flights(4);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let key: MemoKey = (tmp.path().to_path_buf(), "late-completion-test");
+        let k1 = key.clone();
+        let first = probe_bounded(
+            flights,
+            key.clone(),
+            Instant::now() + Duration::from_millis(200),
+            "deadline: first probe".to_string(),
+            move || {
+                memoised(k1, MEMO_TTL, || {
+                    std::thread::sleep(Duration::from_millis(600));
+                    ServedCorpus::unknown("late measurement")
+                })
+            },
+        );
+        assert_eq!(
+            first.render_line(),
+            "[served-corpus: UNKNOWN (deadline: first probe)]"
+        );
+        // Let the abandoned worker finish and leave the table.
+        let end = Instant::now() + Duration::from_secs(10);
+        while flights
+            .table
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&key)
+        {
+            assert!(Instant::now() < end, "the abandoned worker never finished");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let k2 = key.clone();
+        let second = probe_bounded(
+            flights,
+            key,
+            Instant::now() + Duration::from_secs(5),
+            "deadline: second probe".to_string(),
+            move || memoised(k2, MEMO_TTL, || ServedCorpus::unknown("re-measured")),
+        );
+        assert_eq!(
+            second.render_line(),
+            "[served-corpus: UNKNOWN (late measurement)]"
+        );
+    }
+
+    /// Past the capacity a probe answers UNKNOWN at once, starting nothing.
+    #[test]
+    fn a_probe_past_capacity_answers_at_once() {
+        let flights = test_flights(2);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for i in 0..2 {
+            // Each call gives up almost at once; its worker stays in flight.
+            let _ = probe_bounded(
+                flights,
+                (tmp.path().join(format!("busy-{i}")), "capacity-test"),
+                Instant::now() + Duration::from_millis(5),
+                "deadline".to_string(),
+                || {
+                    std::thread::sleep(Duration::from_secs(2));
+                    ServedCorpus::unknown("busy")
+                },
+            );
+        }
+        let started = Instant::now();
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_in = std::sync::Arc::clone(&ran);
+        let got = probe_bounded(
+            flights,
+            (tmp.path().join("third"), "capacity-test"),
+            Instant::now() + Duration::from_secs(5),
+            "deadline".to_string(),
+            move || {
+                ran_in.store(true, std::sync::atomic::Ordering::SeqCst);
+                ServedCorpus::unknown("should not run")
+            },
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(
+            got.render_line(),
+            "[served-corpus: UNKNOWN (served-corpus probe capacity: measurements still in flight)]"
+        );
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    // ── Phase 5: the measurement overlaps the caller's other work ──
+
+    /// Started, then the caller does 300 ms of other work, then joins: a
+    /// measurement shorter than that work is already done, so the join costs
+    /// (almost) nothing — the overlap, proven by elapsed time.
+    #[test]
+    fn a_join_after_other_work_waits_only_for_what_is_left() {
+        let flights = test_flights(4);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let handle = start_bounded(
+            flights,
+            (tmp.path().to_path_buf(), "overlap-test"),
+            Instant::now() + Duration::from_secs(5),
+            "deadline".to_string(),
+            || {
+                std::thread::sleep(Duration::from_millis(100));
+                ServedCorpus::unknown("overlapped")
+            },
+        );
+        std::thread::sleep(Duration::from_millis(600));
+        let joined_at = Instant::now();
+        let got = handle.join();
+        assert!(
+            joined_at.elapsed() <= Duration::from_millis(100),
+            "join waited {:?} for a measurement that should already be done",
+            joined_at.elapsed()
+        );
+        assert_eq!(got.render_line(), "[served-corpus: UNKNOWN (overlapped)]");
+    }
+
+    /// The wall is anchored at START: a handle joined after it returns at
+    /// once — the measurement when it finished, the deadline UNKNOWN when it
+    /// did not.
+    #[test]
+    fn a_handle_joined_after_its_wall_returns_at_once() {
+        let flights = test_flights(4);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wall = Duration::from_millis(150);
+
+        let finished = start_bounded(
+            flights,
+            (tmp.path().join("finished"), "late-join-test"),
+            Instant::now() + wall,
+            "deadline: finished".to_string(),
+            || ServedCorpus::unknown("finished in time"),
+        );
+        let unfinished = start_bounded(
+            flights,
+            (tmp.path().join("unfinished"), "late-join-test"),
+            Instant::now() + wall,
+            "deadline: unfinished".to_string(),
+            || {
+                std::thread::sleep(Duration::from_secs(2));
+                ServedCorpus::unknown("too late")
+            },
+        );
+        std::thread::sleep(wall + Duration::from_millis(100));
+
+        let t = Instant::now();
+        assert_eq!(
+            finished.join().render_line(),
+            "[served-corpus: UNKNOWN (finished in time)]"
+        );
+        assert_eq!(
+            unfinished.join().render_line(),
+            "[served-corpus: UNKNOWN (deadline: unfinished)]"
+        );
+        assert!(t.elapsed() < Duration::from_millis(50), "{:?}", t.elapsed());
+    }
+
+    /// A handle that is dropped unjoined leaves its worker to finish and
+    /// memoise, so the next probe inside the memo window reads that result.
+    #[test]
+    fn a_dropped_handle_still_memoises_its_measurement() {
+        let flights = test_flights(4);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let key: MemoKey = (tmp.path().to_path_buf(), "dropped-handle-test");
+        let k1 = key.clone();
+        drop(start_bounded(
+            flights,
+            key.clone(),
+            Instant::now() + Duration::from_secs(5),
+            "deadline".to_string(),
+            move || {
+                memoised(k1, MEMO_TTL, || {
+                    std::thread::sleep(Duration::from_millis(100));
+                    ServedCorpus::unknown("measured with nobody waiting")
+                })
+            },
+        ));
+        let end = Instant::now() + Duration::from_secs(10);
+        while flights
+            .table
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&key)
+        {
+            assert!(Instant::now() < end, "the worker never finished");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let memoised_value = memo()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&key)
+            .map(|(_, v)| v.render_line());
+        assert_eq!(
+            memoised_value.as_deref(),
+            Some("[served-corpus: UNKNOWN (measured with nobody waiting)]")
+        );
+    }
+
+    /// A measurement that panics still ends its flight: the joiner gets an
+    /// UNKNOWN naming the panic, and the next probe of the key starts afresh
+    /// instead of joining a flight that never ends.
+    #[test]
+    fn a_panicking_measurement_still_ends_its_flight() {
+        let flights = test_flights(4);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let key: MemoKey = (tmp.path().to_path_buf(), "panic-test");
+        let got = probe_bounded(
+            flights,
+            key.clone(),
+            Instant::now() + Duration::from_secs(5),
+            "deadline".to_string(),
+            || panic!("measurement blew up"),
+        );
+        assert_eq!(
+            got.render_line(),
+            "[served-corpus: UNKNOWN (served-corpus probe worker panicked)]"
+        );
+        let end = Instant::now() + Duration::from_secs(5);
+        while flights
+            .table
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&key)
+        {
+            assert!(
+                Instant::now() < end,
+                "the panicked flight never left the table"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// `probe` itself returns inside budget + grace on a real checkout.
+    #[test]
+    fn probe_returns_inside_its_wall() {
+        let tmp = checkout_with_bundle();
+        let started = Instant::now();
+        let _ = probe(tmp.path());
+        assert!(
+            started.elapsed() < PROBE_BUDGET + PROBE_COLLECT_GRACE + Duration::from_millis(250)
+        );
+    }
+
     #[test]
     fn unknown_renders_one_token() {
         assert_eq!(
@@ -2163,5 +3009,25 @@ mod tests {
     #[test]
     fn no_rendered_value_can_close_a_token_early() {
         assert_eq!(clean("a]b[c\nd"), "a)b(c d");
+    }
+}
+
+#[cfg(test)]
+mod egress_header_tests {
+    use super::*;
+    use crate::egress::test_support::pin;
+    use crate::egress::{Flow, Level};
+
+    #[test]
+    fn the_served_line_names_the_skill_mirror_switch_as_the_reason() {
+        let ident = SourceIdentity::default();
+        assert!(ident.render().starts_with("served: canonical@unloaded 0,"));
+        let _pin = pin(Flow::SkillMirror, Level::Off);
+        let line = ident.render();
+        assert!(
+            line.starts_with("served: canonical@unloaded(egress_skill_mirror=off) 0,"),
+            "{line}"
+        );
+        assert!(!line.contains(']'));
     }
 }

@@ -1,8 +1,10 @@
 //! Device-scoped poller for the fleet-policy domains this runner consumes:
 //! `install_interception` (P3 + P4 of
 //! `2026-06-08-fleet-policy-channel-redesign.md`), `fleet_resources` (Part B
-//! item 3 of `2026-08-07-runner-resource-guard-and-session-protection.md`) and
-//! `plan_capture` (Phase 4 of `2026-08-10-plan-and-prompt-library-in-web.md`).
+//! item 3 of `2026-08-07-runner-resource-guard-and-session-protection.md`),
+//! `plan_capture` (Phase 4 of `2026-08-10-plan-and-prompt-library-in-web.md`)
+//! and `account_selection_mode` (Phase 1 of
+//! `2026-09-27-fleet-policy-domain-for-account-selection-mode.md`).
 //!
 //! Coord exposes `GET /coord/fleet-policy?domain=<d>` (FleetPrincipal /
 //! device-JWT gated) which returns the EFFECTIVE interception level resolved
@@ -165,6 +167,29 @@
 //!   process that actually builds the prompt.
 //! - Degradation is logged ONCE, on a transition, PER DOCUMENT.
 //!
+//! For the account-selection mode (the fifth cache,
+//! [`fleet_account_selection_mode`]) the safe value is **no fleet opinion**
+//! (`None`): the machine's own local mode governs, exactly as it did before
+//! this domain existed.
+//!
+//! - Before the FIRST successful poll ⇒ `None`.
+//! - A poll ERROR ⇒ the LAST-GOOD value is kept.
+//! - A coord **404** ⇒ reset to `None`.
+//! - A coord **401** ⇒ the LAST-GOOD value is kept: it is a statement about the
+//!   device credential, not the tenant's policy, and resetting on it would flip
+//!   every unpinned machine between the fleet mode and its local mode each
+//!   time a device JWT lapses (the same reasoning as plan capture's 401 arm).
+//! - A 2xx NO-ROW answer (`resolved_scope == "none"`) ⇒ `None`: coord's
+//!   domain default for an unlisted domain is `off`, which is not a mode.
+//! - Any level that is not an `AccountSelectionMode` wire spelling
+//!   (`AccountSelectionMode::ALL`) ⇒ `None`.
+//! - Unpaired ⇒ SKIPPED quietly, cache untouched.
+//! - A poisoned lock ⇒ `None`.
+//!
+//! A `Some` fleet value is FORCE-APPLIED over the local mode unless the machine
+//! is pinned — [`crate::claude_accounts::resolve_selection_mode`] owns that
+//! rule; this module only caches the fleet's half of it.
+//!
 //! **Disk persistence is PER RUNNER INSTANCE.** The store lives in the
 //! directory [`crate::settings::resolve_config_dir`] names — the NON-creating
 //! resolver, because every door into the cache is a read (see
@@ -184,6 +209,7 @@ use tokio::sync::{watch, Mutex};
 use tracing::{info, warn};
 
 use crate::mcp::types::ApiState;
+use crate::settings::AccountSelectionMode;
 pub(crate) use qontinui_runner_lib::plan_workunit_adapter::trigger::CaptureVerdict;
 
 /// How often the loop refreshes the cached effective level. 45s sits in the
@@ -252,6 +278,21 @@ const PLAN_CAPTURE_DEFAULT_LEVEL: &str = PLAN_CAPTURE_RECORD;
 /// an authorization to capture. Spelled separately from [`DEFAULT_MODE`] too:
 /// the two domains' `off` merely coincide.
 const PLAN_CAPTURE_UNRECOGNISED_LEVEL: &str = "off";
+
+/// The fleet-policy domain carrying the fleet's Claude **account-selection
+/// mode** (plan `2026-09-27-fleet-policy-domain-for-account-selection-mode`).
+///
+/// Data, not schema, for the same reason as [`PLAN_CAPTURE_DOMAIN`]: coord's
+/// `domain` column is plain `TEXT` with no allowlist, and `put_fleet_policy`
+/// does not validate `level`, so `highest_expected_usage` is stored as-is.
+///
+/// Its vocabulary is [`AccountSelectionMode::as_str`]'s wire spellings
+/// ([`AccountSelectionMode::ALL`]);
+/// its resting value is NO fleet opinion (`None`), not a mode — see
+/// [`normalize_account_selection_level`]. Scope band is **tenant-wide**: the
+/// mode is a machine-global fact (it lives in `claude-accounts.json`), and a
+/// machine is not repo-scoped.
+const ACCOUNT_SELECTION_DOMAIN: &str = "account_selection_mode";
 
 // ===========================================================================
 // Process-global cache
@@ -764,6 +805,198 @@ fn plan_capture_log_key(outcome: &PollOutcome) -> String {
 }
 
 // ===========================================================================
+// Process-global cache #5 — the tenant-wide account-selection mode
+// ===========================================================================
+//
+// Numbered #5 though it sits here: it is the third LEVEL-carrying domain and
+// belongs beside the plan-capture level it mirrors, while #4 (the briefings)
+// kept its number when this cache was added.
+
+/// The cached fleet account-selection mode. `None` = the fleet has NO opinion
+/// (the resting and fail-safe value) — never a made-up default mode, because a
+/// default mode here would be FORCE-APPLIED over every unpinned machine's local
+/// choice.
+static ACCOUNT_SELECTION_MODE: OnceLock<RwLock<Option<AccountSelectionMode>>> = OnceLock::new();
+
+/// The cache's INITIAL value, as a named function so a test can assert the
+/// shipping expression (see [`new_plan_capture_cache`]).
+fn new_account_selection_cache() -> RwLock<Option<AccountSelectionMode>> {
+    RwLock::new(None)
+}
+
+fn account_selection_cache() -> &'static RwLock<Option<AccountSelectionMode>> {
+    ACCOUNT_SELECTION_MODE.get_or_init(new_account_selection_cache)
+}
+
+/// The fleet's account-selection mode, `None` when the fleet has no opinion
+/// (before the first successful poll, after an auth/absent reset, on a no-row
+/// or unrecognised answer, and on a poisoned lock).
+///
+/// SYNCHRONOUS + lock-only — read on the spawn path by
+/// [`crate::claude_accounts::effective_selection_mode`] /
+/// [`crate::claude_accounts::resolve_for_cli_settings`], which must not do
+/// network I/O. This is the fleet's HALF of the decision only; the pin and the
+/// local mode are combined with it by
+/// [`crate::claude_accounts::resolve_selection_mode`].
+pub(crate) fn fleet_account_selection_mode() -> Option<AccountSelectionMode> {
+    account_selection_cache().read().ok().and_then(|g| *g)
+}
+
+/// Whether coord has ANSWERED the account-selection domain at least once in
+/// this process (a 2xx row / no-row answer, or an auth/absent reset). Until
+/// then the cache's `None` means "not yet asked", not "the fleet has no
+/// opinion", so a REPORT of the selection's source (the env capture) must say
+/// `unknown` rather than `local`. Never reset. Decision sites ignore it — they
+/// fail safe to the local mode either way.
+static ACCOUNT_SELECTION_ANSWERED: AtomicBool = AtomicBool::new(false);
+
+/// See [`ACCOUNT_SELECTION_ANSWERED`]. Lock-free, safe on any path.
+pub(crate) fn account_selection_answered() -> bool {
+    ACCOUNT_SELECTION_ANSWERED.load(Ordering::Acquire)
+}
+
+/// Whether `outcome` is an answer from coord about the account-selection
+/// domain. PURE. A skip while unpaired and a kept transient failure are not.
+fn is_account_selection_answer(outcome: &PollOutcome) -> bool {
+    matches!(
+        outcome,
+        PollOutcome::Updated(_) | PollOutcome::UpdatedNoRow | PollOutcome::ResetOff(_)
+    )
+}
+
+/// Overwrite the cached fleet account-selection mode. Internal — only the poll
+/// loop calls this (and the test guard below).
+fn set_account_selection_mode(mode: Option<AccountSelectionMode>) {
+    if let Ok(mut g) = account_selection_cache().write() {
+        *g = mode;
+    }
+}
+
+/// Test-only RAII pin over the fleet account-selection cache. Same two jobs as
+/// [`PlanCaptureLevelPin`] — it SERIALIZES every test that pins the cache
+/// (whichever module it lives in) and RESTORES `None` on `Drop`, so a failing
+/// assertion cannot leak a fleet mode into the next test's account decision.
+///
+/// A mutex of its own rather than the plan-capture one: the two caches are read
+/// by disjoint code (the spawn-time briefing vs. the account picker), so
+/// sharing a lock would only serialize unrelated tests.
+///
+/// **It sits UNDER `env_lock` in the test-lock hierarchy**, exactly like
+/// [`PlanCaptureLevelPin`]: it is acquired through
+/// [`crate::test_env::hierarchy_lock`], which takes `env_lock` FIRST and holds
+/// it for the pin's life. `env_lock` is reentrant per thread, so a test may
+/// take this pin and `env_lock` / `isolated_ambient()` / the plan-capture pin
+/// in EITHER order without an AB/BA cycle. `env_test_lock_hierarchy_guard.rs`
+/// enforces the shape.
+///
+/// Field order is load-bearing: `Drop::drop` restores the cache first, then the
+/// [`crate::test_env::TestLockGuard`] releases the pin mutex and then the env
+/// lock — so the restore runs while BOTH locks are still held.
+///
+/// NEVER compiled into a release binary.
+#[cfg(test)]
+pub(crate) struct AccountSelectionPin(crate::test_env::TestLockGuard);
+
+#[cfg(test)]
+impl AccountSelectionPin {
+    /// Pin the fleet mode to `mode`. Callable repeatedly under one guard.
+    pub(crate) fn set(&self, mode: Option<AccountSelectionMode>) {
+        set_account_selection_mode(mode);
+    }
+}
+
+#[cfg(test)]
+impl Drop for AccountSelectionPin {
+    fn drop(&mut self) {
+        set_account_selection_mode(None);
+    }
+}
+
+/// Acquire the pin with the fleet mode set to `mode`. Blocks until any other
+/// pinning test has released it; restores "no fleet opinion" on drop.
+#[cfg(test)]
+pub(crate) fn pin_account_selection_for_test(
+    mode: Option<AccountSelectionMode>,
+) -> AccountSelectionPin {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // The hierarchy root (`env_lock`) FIRST, then this pin's own mutex — see
+    // [`AccountSelectionPin`]. Poison-recovering: a previous pinning test that
+    // panicked already restored `None` in its `Drop`, so the data is fine.
+    let pin = AccountSelectionPin(crate::test_env::hierarchy_lock(&LOCK));
+    pin.set(mode);
+    pin
+}
+
+/// The guards a test holds when it reaches account selection through a
+/// production path that reads the machine roster (the config report, the
+/// retry loop's rate-limit rotation): an isolated ambient, THEN the fleet pin
+/// at "no fleet opinion".
+///
+/// Both guards are children of `env_lock` (the ambient holds it directly, the
+/// fleet pin through [`crate::test_env::hierarchy_lock`]), and `env_lock` is
+/// reentrant per thread, so the pair cannot deadlock against any other test
+/// whatever order that test takes them in. The ambient points
+/// `QONTINUI_CONFIG_DIR` / `HOME` at an empty temp dir, so the per-instance
+/// roster is empty. The machine-global roster is NOT reliably isolated: it
+/// resolves through `dirs::config_dir()`, which is empty only on Linux under
+/// the fixture with `XDG_CONFIG_HOME` unset or pointed at cargo-guard's
+/// per-run sandbox. On Windows (`dirs` ignores HOME/USERPROFILE) or with an
+/// exported `XDG_CONFIG_HOME` under raw cargo, the REAL roster may be read — so
+/// a test that can reach a `RESOLVED_CONFIG_DIR` writer must also hold
+/// `ai_provider::config::ResolvedConfigDirRestore`. The pin serializes the
+/// holder against every other fleet-pin holder, including the test that
+/// publishes a temp dir into `RESOLVED_CONFIG_DIR`.
+///
+/// Returned as a tuple whose fields drop in declaration order — the fleet pin
+/// FIRST, then the ambient: the REVERSE of acquisition, which `EnvLockGuard`
+/// requires. The ambient took `env_lock` first, so its guard owns the real
+/// mutex; dropping it before the pin would release `env_lock` while the pin's
+/// nested guard still counted as held — a silent loss of exclusion over the
+/// pin's restore.
+#[cfg(test)]
+pub(crate) fn isolated_ambient_with_fleet_pin() -> (
+    AccountSelectionPin,
+    qontinui_runner_lib::ambient::test_support::IsolatedAmbient,
+) {
+    let ambient = crate::test_env::isolated_ambient();
+    let pin = pin_account_selection_for_test(None);
+    (pin, ambient)
+}
+
+/// Normalize coord's `effective_level` onto an account-selection mode. PURE.
+///
+/// Trimmed, ASCII-case-insensitive match against the three
+/// [`AccountSelectionMode::as_str`] spellings ⇒ `Some(mode)`. Absent, empty, a
+/// typo, and coord's own no-row fallback `off` ⇒ `None`: a level this runner
+/// cannot identify is "no fleet opinion", never a guessed mode — a guessed mode
+/// would be force-applied over every unpinned machine.
+fn normalize_account_selection_level(raw: Option<&str>) -> Option<AccountSelectionMode> {
+    AccountSelectionMode::from_wire(raw?)
+}
+
+/// The WRITE, if any, that `outcome` implies for the account-selection cache.
+/// PURE — the fail-safe contract itself, shaped like
+/// [`next_plan_capture_level`].
+///
+/// - `None` ⇒ do not write at all (unpaired, or a transient failure: the
+///   last-good value is kept because no write happened).
+/// - `Some(None)` ⇒ write "no fleet opinion" (an absent/auth reset, or an
+///   authoritative no-row answer).
+/// - `Some(Some(mode))` ⇒ the fleet names a mode.
+fn next_account_selection(outcome: &PollOutcome) -> Option<Option<AccountSelectionMode>> {
+    match outcome {
+        PollOutcome::Updated(level) => Some(normalize_account_selection_level(Some(level))),
+        PollOutcome::UpdatedNoRow | PollOutcome::ResetOff(_) => Some(None),
+        PollOutcome::SkippedNoJwt | PollOutcome::Kept(_) => None,
+    }
+}
+
+/// Render a fleet account-selection value for a log line or the config report.
+fn describe_account_selection(mode: Option<AccountSelectionMode>) -> &'static str {
+    mode.map_or("(no fleet opinion — local mode governs)", |m| m.as_str())
+}
+
+// ===========================================================================
 // Process-global cache #4 — the operator-editable session-briefing documents
 // ===========================================================================
 
@@ -1005,10 +1238,15 @@ pub(crate) struct FleetPolicyDial {
     /// means the level is the unconfirmed default and the write paths are
     /// held — so a never-answered runner is distinguishable from an armed one.
     pub(crate) plan_capture_answered: bool,
+    /// Cache 5 — the fleet's account-selection mode as its wire spelling, or
+    /// `None` when the fleet has NO opinion (the resting value: the local mode
+    /// governs). Not a string with a resting default like caches 1 and 3,
+    /// because "no opinion" is not a mode and must not render as one.
+    pub(crate) account_selection_mode: Option<&'static str>,
     /// Cache 4 — one entry per name in [`BRIEFING_NAMES`], always all three
     /// (an absent document is `present: false`, never a missing entry).
     pub(crate) briefings: Vec<BriefingDial>,
-    /// `false`, always, for caches 1-3 — see the type docs. Kept as a FIELD
+    /// `false`, always, for caches 1-3 and 5 — see the type docs. Kept as a FIELD
     /// rather than a comment so the consumer's honesty is data-driven: a future
     /// stamp on those caches flips this and the report gains the fact without
     /// the consumer inventing one in the meantime.
@@ -1048,6 +1286,7 @@ pub(crate) fn dial_snapshot() -> FleetPolicyDial {
         plan_capture_default: PLAN_CAPTURE_DEFAULT_LEVEL,
         plan_capture_record_level: PLAN_CAPTURE_RECORD,
         plan_capture_answered: plan_capture_answered(),
+        account_selection_mode: fleet_account_selection_mode().map(AccountSelectionMode::as_str),
         briefings: BRIEFING_NAMES
             .iter()
             .map(|name| match cache.get(*name) {
@@ -1846,6 +2085,14 @@ struct FleetPolicyResponse {
     /// at (`tenant`, `fleet`, …). Absent on a coord that predates the field.
     #[serde(default)]
     resolved_scope: Option<String>,
+    /// On a no-row answer, WHICH default coord applied:
+    /// `deployment_profile` (a self-hosted coord's egress `off`) or `product`.
+    /// Absent on a coord that predates the egress family — which is exactly
+    /// what [`crate::egress::classify_coord_answer`] needs to know, because
+    /// such a coord's no-row answer for an `egress_*` domain is its generic
+    /// unknown-domain default, not a tenant decision.
+    #[serde(default)]
+    default_source: Option<String>,
     /// Coord's own "I could not read the control columns" flag. `Some(false)`
     /// means the §D1 columns are not provisioned on that deployment yet, which
     /// is NOT the same statement as "the tenant set no floors" — but both
@@ -2081,8 +2328,9 @@ pub fn start_poller(api_state: Arc<ApiState>) -> Arc<PollerState> {
 /// Outcome of a single poll attempt. Factored out so the loop's logging stays
 /// edge-triggered (log only on a transition, never every tick).
 ///
-/// SHARED by both LEVEL-carrying domains ([`DOMAIN`] and
-/// [`PLAN_CAPTURE_DOMAIN`]) — they cache different vocabularies but classify
+/// SHARED by all three LEVEL-carrying domains ([`DOMAIN`],
+/// [`PLAN_CAPTURE_DOMAIN`] and [`ACCOUNT_SELECTION_DOMAIN`]) — they cache
+/// different vocabularies but classify
 /// coord's answers identically, and one enum is what keeps them from drifting
 /// apart on what a 404 means. ([`CONTROLS_DOMAIN`] needs its own because it
 /// carries floors, not a level.)
@@ -2092,9 +2340,10 @@ enum PollOutcome {
     Updated(String),
     /// Coord returned 2xx and said NO ROW exists for the domain
     /// (`resolved_scope == "none"`) — an authoritative answer whose content is
-    /// the domain's own default. Produced by the plan-capture domain only
-    /// ([`plan_capture_outcome_for_body`]); the interception domain never yields
-    /// it and treats it as its fail-safe if it ever did.
+    /// the domain's own default. Produced by the plan-capture
+    /// ([`plan_capture_outcome_for_body`]) and account-selection
+    /// ([`account_selection_outcome_for_body`]) domains; the interception
+    /// domain never yields it and treats it as its fail-safe if it ever did.
     UpdatedNoRow,
     /// No device JWT yet (unpaired) — poll skipped, cache untouched.
     SkippedNoJwt,
@@ -2130,7 +2379,7 @@ enum ControlsOutcome {
 /// ONE decision: a 401 resets, an error keeps, an absent JWT skips. The two
 /// caches are allowed to hold different values; they are not allowed to disagree
 /// about what a 404 means.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum FetchError {
     /// No device JWT yet — this runner is unpaired.
     NoJwt,
@@ -2238,10 +2487,11 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
     }
 
     info!(
-        "Fleet-policy poller started (domains={DOMAIN},{CONTROLS_DOMAIN},{PLAN_CAPTURE_DOMAIN}, \
-         interval={}s, fail-safe defaults: mode={DEFAULT_MODE}, session floors unset; domain \
-         default: plan capture={PLAN_CAPTURE_DEFAULT_LEVEL}, plan-capture writes held until \
-         coord answers)",
+        "Fleet-policy poller started (domains={DOMAIN},{CONTROLS_DOMAIN},{PLAN_CAPTURE_DOMAIN},\
+         {ACCOUNT_SELECTION_DOMAIN}, egress_*×6, interval={}s, fail-safe defaults: \
+         mode={DEFAULT_MODE}, session floors unset, account selection unset (local mode \
+         governs); domain default: plan capture={PLAN_CAPTURE_DEFAULT_LEVEL}, plan-capture \
+         writes held until coord answers)",
         POLL_INTERVAL.as_secs()
     );
 
@@ -2257,11 +2507,17 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
     // A KEY, not an outcome — see `plan_capture_log_key` for why the whole
     // value is the wrong thing to compare for this domain.
     let mut last_logged_plan_capture: Option<String> = None;
+    let mut last_logged_account_selection: Option<String> = None;
     // One key PER DOCUMENT: the three session-briefing documents fail
     // independently (coord can serve one and 404 another), so a shared marker
     // would suppress one document's transition because another's was logged.
     let mut last_logged_briefings: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    // One key PER EGRESS FLOW, for the same reason.
+    let mut last_logged_egress: std::collections::HashMap<
+        (Option<uuid::Uuid>, crate::egress::Flow),
+        String,
+    > = std::collections::HashMap::new();
 
     loop {
         if *shutdown_rx.borrow() {
@@ -2442,6 +2698,90 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
             last_logged_plan_capture = Some(plan_capture_key);
         }
 
+        // Fifth cache: the tenant-wide fleet account-selection mode. Its own
+        // request and its own cache, so no other domain's failure withholds it.
+        let account_selection_outcome = poll_account_selection_once().await;
+        if let Some(next_mode) = next_account_selection(&account_selection_outcome) {
+            set_account_selection_mode(next_mode);
+        }
+        if is_account_selection_answer(&account_selection_outcome) {
+            ACCOUNT_SELECTION_ANSWERED.store(true, Ordering::Release);
+        }
+        // The same outcome-shaped key as plan capture: a varying error message
+        // must not reopen the edge every tick.
+        let account_selection_key = plan_capture_log_key(&account_selection_outcome);
+        if is_new_outcome(
+            last_logged_account_selection.as_ref(),
+            &account_selection_key,
+        ) {
+            match &account_selection_outcome {
+                PollOutcome::Updated(level) => {
+                    let mode = normalize_account_selection_level(Some(level));
+                    info!(
+                        "fleet_policy_poller: fleet account-selection mode \
+                         ({ACCOUNT_SELECTION_DOMAIN}) = {}{} — applies to every UNPINNED machine",
+                        describe_account_selection(mode),
+                        if mode.is_none() {
+                            format!(" (coord sent unrecognised level {level:?})")
+                        } else {
+                            String::new()
+                        }
+                    );
+                    // A fleet-wide `manual` is force-applied like any other
+                    // mode, but `manual` means "spawn on THIS machine's
+                    // configured config_dir" — an unpinned machine without one
+                    // has no account to spawn on. Said once, loudly, on the
+                    // transition, so the operator's PUT is not a silent outage.
+                    if mode == Some(AccountSelectionMode::Manual) {
+                        // Pin and config_dir from ONE document (the
+                        // roster-overlaid settings): a pinned machine is not
+                        // governed by the fleet, so it has nothing to warn about.
+                        let cli = crate::settings::get_ai_settings().claude_cli;
+                        let no_local_dir = cli
+                            .config_dir
+                            .as_deref()
+                            .is_none_or(|d| d.trim().is_empty());
+                        if !cli.account_selection_pinned && no_local_dir {
+                            warn!(
+                                "fleet_policy_poller: the fleet says {ACCOUNT_SELECTION_DOMAIN}=manual \
+                                 and this machine is not pinned, but it has NO local config_dir — \
+                                 spawns will find no account until one is configured or the \
+                                 machine is pinned"
+                            );
+                        }
+                    }
+                }
+                PollOutcome::UpdatedNoRow => {
+                    info!(
+                        "fleet_policy_poller: coord reported no {ACCOUNT_SELECTION_DOMAIN} row \
+                         for this tenant (resolved_scope={RESOLVED_SCOPE_NONE}) — no fleet \
+                         opinion, each machine's local mode governs"
+                    );
+                }
+                PollOutcome::SkippedNoJwt => {
+                    info!(
+                        "fleet_policy_poller: no device JWT yet (unpaired) — skipping the \
+                         {ACCOUNT_SELECTION_DOMAIN} poll, the local mode governs"
+                    );
+                }
+                PollOutcome::ResetOff(status) => {
+                    info!(
+                        "fleet_policy_poller: coord returned {status} for \
+                         {ACCOUNT_SELECTION_DOMAIN} (auth/absent) — reset to no fleet opinion, \
+                         the local mode governs"
+                    );
+                }
+                PollOutcome::Kept(err) => {
+                    warn!(
+                        "fleet_policy_poller: {ACCOUNT_SELECTION_DOMAIN} poll failed ({err}) — \
+                         keeping last-good fleet account-selection mode ({})",
+                        describe_account_selection(fleet_account_selection_mode())
+                    );
+                }
+            }
+            last_logged_account_selection = Some(account_selection_key);
+        }
+
         // Fourth cache: the three operator-editable session-briefing documents.
         // ONE conditional LIST GET per tick — coord validates `If-None-Match`
         // on the list route only — plus a body fetch for a document whose
@@ -2450,6 +2790,11 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
         // already makes. Each document applies to its own cache entry and logs
         // on its own transition, so no document's failure withholds another's.
         poll_session_briefings_once(&mut last_logged_briefings).await;
+
+        // Fifth: the six per-tenant egress switches (plan
+        // 2026-10-10-spec-front-end-phase-9-generic-boundary Phase 7). Each
+        // domain applies to its own slot and logs on its own transition.
+        poll_egress_once(&mut last_logged_egress).await;
 
         // Sleep until the next tick, waking early on shutdown.
         tokio::select! {
@@ -2481,7 +2826,15 @@ async fn fetch_fleet_policy(domain: &str) -> Result<FleetPolicyResponse, FetchEr
         Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
         _ => return Err(FetchError::NoJwt),
     };
+    fetch_fleet_policy_with(domain, &device_jwt).await
+}
 
+/// [`fetch_fleet_policy`] presenting an explicit credential — the egress poll
+/// asks once per tenant, each with that tenant's own slot.
+async fn fetch_fleet_policy_with(
+    domain: &str,
+    device_jwt: &str,
+) -> Result<FleetPolicyResponse, FetchError> {
     // coord base — identical source-of-truth chain to the producer's
     // `coord_base()` (env COORD_HTTP_URL → profile coord_url → default).
     let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
@@ -2646,6 +2999,317 @@ async fn poll_plan_capture_once() -> PlanCapturePoll {
     }
 }
 
+/// Classify a 2xx account-selection body. PURE.
+///
+/// `resolved_scope == "none"` is coord saying no row exists and its domain
+/// default applied — for an unlisted domain that default is `off`, which is
+/// not a mode — so it is [`PollOutcome::UpdatedNoRow`], which
+/// [`next_account_selection`] maps to "no fleet opinion" whatever level string
+/// rode along. Any other 2xx is [`PollOutcome::Updated`] carrying the level as
+/// coord sent it (trimmed; empty when absent); [`next_account_selection`]
+/// normalizes it, so an unrecognised level is "no opinion" too.
+fn account_selection_outcome_for_body(body: &FleetPolicyResponse) -> PollOutcome {
+    if body.resolved_scope.as_deref().map(str::trim) == Some(RESOLVED_SCOPE_NONE) {
+        return PollOutcome::UpdatedNoRow;
+    }
+    PollOutcome::Updated(
+        body.effective_level
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
+/// Map a fetch failure onto the ACCOUNT-SELECTION cache outcome. PURE.
+///
+/// The shared [`level_outcome_for_error`] for everything but a **401**, which
+/// KEEPS last-good (like [`plan_capture_outcome_for_error`]): a rejected device
+/// token says nothing about the tenant's policy, and resetting on it would make
+/// every unpinned machine's account rotation flip to its local mode and back
+/// each time the ~4h device JWT lapses before the refresher replaces it. A 404
+/// still resets to "no fleet opinion".
+fn account_selection_outcome_for_error(err: FetchError) -> PollOutcome {
+    match err {
+        FetchError::AuthOrAbsent(401) => PollOutcome::Kept(
+            "coord rejected the device token (401) — non-authoritative for the tenant's \
+             account_selection_mode policy, keeping last-good"
+                .to_string(),
+        ),
+        other => level_outcome_for_error(other),
+    }
+}
+
+/// One poll of the [`ACCOUNT_SELECTION_DOMAIN`] cache. See
+/// [`account_selection_outcome_for_body`] for the 2xx arms and
+/// [`account_selection_outcome_for_error`] for why a 401 keeps.
+async fn poll_account_selection_once() -> PollOutcome {
+    match fetch_fleet_policy(ACCOUNT_SELECTION_DOMAIN).await {
+        Ok(body) => account_selection_outcome_for_body(&body),
+        Err(e) => account_selection_outcome_for_error(e),
+    }
+}
+
+/// What one egress-domain poll means for the switch cache. PURE.
+///
+/// A 2xx is classified by [`crate::egress::classify_coord_answer`]: a tenant
+/// row or a self-hosted deployment's default is a decision, coord's product
+/// default is "no opinion" (clears the scope so the profile answers), and a
+/// 2xx from a coord that predates the egress family (no `default_source`)
+/// marks the scope answered without overriding a held decision. A FAILED
+/// fetch — unpaired, a 401/404, a network error, a 5xx — is `None`: coord gave
+/// no answer, so nothing is recorded or persisted and an unanswered tenant
+/// stays UNKNOWN (refusing).
+fn egress_answer_for(
+    result: &Result<FleetPolicyResponse, FetchError>,
+) -> Option<crate::egress::CoordAnswer> {
+    let body = result.as_ref().ok()?;
+    Some(crate::egress::classify_coord_answer(
+        body.effective_level.as_deref(),
+        body.resolved_scope.as_deref(),
+        body.default_source.as_deref(),
+    ))
+}
+
+/// The scope a poll's answers are filed under: this coord, and the tenant the
+/// PRESENTED credential names (its `tenant_id` claim) — the tenant coord
+/// actually answered for. A claimless credential files under the requested
+/// tenant, which is sound ONLY because of the precondition
+/// `auth::legacy_token_serves_tenant` enforces before the bearer selector
+/// hands one out: the per-tenant slot store was read and holds no slot for
+/// that tenant, AND the device's binding count was MEASURED as exactly one. On
+/// a multi-binding device (or an unreadable `paired_user.json`) a claimless
+/// token is refused, so it never reaches this function for a second tenant.
+fn egress_poll_scope(
+    base: &str,
+    presented_bearer: Option<&str>,
+    requested_tenant: Option<uuid::Uuid>,
+) -> crate::egress::ScopeKey {
+    let claim = presented_bearer.and_then(crate::auth::jwt_tenant_claim);
+    crate::egress::ScopeKey::new(base, claim.or(requested_tenant))
+}
+
+/// Every tenant this device may hold a credential for: the per-tenant slots,
+/// the default binding, and the tenant the default slot's credential names —
+/// with whether the enumeration was COMPLETE. Blocking (secure-storage and
+/// paired_user.json reads).
+fn egress_poll_tenants() -> (Vec<uuid::Uuid>, bool) {
+    let am = crate::auth::AuthManager::new();
+    let slots = am.try_list_tenant_device_jwt_tenants().map_err(|e| {
+        warn!("fleet_policy_poller: egress: tenant slots unreadable ({e:#})");
+    });
+    enumerate_bound_tenants(
+        slots,
+        crate::auth::default_binding_tenant_probe(),
+        am.probe_access_token(),
+    )
+}
+
+/// The bound-tenant enumeration over what the three credential sources read.
+/// PURE. COMPLETE only when every source was read and answered definitely:
+/// an unreadable slot store, an UNKNOWN binding read, an unreadable token
+/// store, or a present token that names no tenant (whose owner is therefore
+/// unknown) each make it incomplete — so only a fully read, genuinely
+/// credential-less device can come out as unbound.
+fn enumerate_bound_tenants(
+    slots: Result<Vec<uuid::Uuid>, ()>,
+    binding: crate::auth::BindingTenantRead,
+    token: crate::secure_storage::StoredTokenRead,
+) -> (Vec<uuid::Uuid>, bool) {
+    use crate::auth::BindingTenantRead;
+    use crate::secure_storage::StoredTokenRead;
+    let mut tenants = std::collections::BTreeSet::new();
+    let mut complete = true;
+    match slots {
+        Ok(s) => tenants.extend(s),
+        Err(()) => complete = false,
+    }
+    match binding {
+        BindingTenantRead::Bound(t) => {
+            tenants.insert(t);
+        }
+        BindingTenantRead::Unbound => {}
+        BindingTenantRead::Unknown => complete = false,
+    }
+    match token {
+        StoredTokenRead::Present(token) => match crate::auth::jwt_tenant_claim(&token) {
+            Some(t) => {
+                tenants.insert(t);
+            }
+            None => complete = false,
+        },
+        StoredTokenRead::Absent => {}
+        StoredTokenRead::Unreadable(_) => complete = false,
+    }
+    (tenants.into_iter().collect(), complete)
+}
+
+/// The edge-trigger key for one egress poll: the class plus the level, so a
+/// flip logs and a steady state does not.
+fn egress_log_key(result: &Result<FleetPolicyResponse, FetchError>) -> String {
+    use crate::egress::CoordAnswer;
+    match result {
+        Err(FetchError::NoJwt) => "unpaired".to_string(),
+        Err(FetchError::AuthOrAbsent(status)) => format!("status:{status}"),
+        Err(FetchError::Failed(_)) => "failed".to_string(),
+        Ok(_) => match egress_answer_for(result) {
+            Some(CoordAnswer::Authoritative(d)) => {
+                format!("answer:{}:{}", d.level.as_str(), d.decided_by.as_str())
+            }
+            Some(CoordAnswer::NoOpinion) => "product-default".to_string(),
+            Some(CoordAnswer::NotAnEgressAnswer) | None => "coord-predates-egress".to_string(),
+        },
+    }
+}
+
+/// Apply one egress poll result for `flow` in `scope` to `state`.
+fn apply_egress_result(
+    state: &crate::egress::EgressState,
+    scope: &crate::egress::ScopeKey,
+    flow: crate::egress::Flow,
+    result: &Result<FleetPolicyResponse, FetchError>,
+) {
+    if let Some(answer) = egress_answer_for(result) {
+        state.apply_coord_answer(scope, flow, answer);
+    }
+}
+
+/// Poll the six egress domains for EVERY tenant this device holds a
+/// credential for — each with that tenant's own credential, the six GETs per
+/// tenant concurrently — and file every answer under (this coord, the tenant
+/// the presented credential names). A tenant with no usable credential is not
+/// asked, so its switches stay UNKNOWN and fail closed (`egress` module doc).
+///
+/// The default scope is moved to (this coord, the tenant a new session is
+/// stamped with) — the same resolver the session paths use. The move takes
+/// effect once coord has answered for it; until then the stricter applies.
+async fn poll_egress_once(
+    last_logged: &mut std::collections::HashMap<(Option<uuid::Uuid>, crate::egress::Flow), String>,
+) {
+    let (base, _source) = qontinui_runner_lib::profiles::coord_base_with_source();
+    let default_tenant = tokio::task::spawn_blocking(crate::session::resolve_new_session_tenant)
+        .await
+        .ok()
+        .flatten();
+    // Every bound tenant, each paired with ITS OWN slot credential (blocking
+    // secure-storage reads, so off the async runtime).
+    // A join failure is an incomplete enumeration (nothing merged).
+    let (targets, enumeration_complete) = tokio::task::spawn_blocking(|| {
+        let (tenants, complete) = egress_poll_tenants();
+        let targets = tenants
+            .into_iter()
+            .map(|tenant| (tenant, crate::auth::device_bearer_for(Some(&tenant))))
+            .collect::<Vec<_>>();
+        (targets, complete)
+    })
+    .await
+    .unwrap_or_default();
+    poll_egress_with(
+        crate::egress::global_state(),
+        &base,
+        default_tenant,
+        targets,
+        enumeration_complete,
+        |domain, bearer| async move { fetch_fleet_policy_with(domain, &bearer).await },
+        last_logged,
+    )
+    .await;
+}
+
+/// The body of [`poll_egress_once`] over injected parts: the switch state,
+/// the coord base, the default tenant, every bound tenant with the credential
+/// to present for it (`None` = no usable credential), and the fetcher.
+async fn poll_egress_with<F, Fut>(
+    state: &crate::egress::EgressState,
+    base: &str,
+    default_tenant: Option<uuid::Uuid>,
+    targets: Vec<(uuid::Uuid, Option<String>)>,
+    enumeration_complete: bool,
+    fetch: F,
+    last_logged: &mut std::collections::HashMap<(Option<uuid::Uuid>, crate::egress::Flow), String>,
+) where
+    F: Fn(&'static str, String) -> Fut,
+    Fut: std::future::Future<Output = Result<FleetPolicyResponse, FetchError>>,
+{
+    state.set_current_scope(crate::egress::ScopeKey::new(base, default_tenant));
+    // Merged, never replaced: a failed or partial enumeration cannot shrink
+    // the set the strictest rule is taken across.
+    state.record_bound_enumeration(
+        targets.iter().map(|(t, _)| *t).collect(),
+        enumeration_complete,
+    );
+
+    for (tenant, bearer) in targets {
+        let Some(bearer) = bearer else {
+            let key = (Some(tenant), crate::egress::Flow::TranscriptSync);
+            if last_logged.get(&key).map(String::as_str) != Some("no-credential") {
+                warn!(
+                    "fleet_policy_poller: egress: no usable credential for tenant {tenant} — \
+                     its switches stay UNKNOWN and every flow fails closed for its sessions"
+                );
+                last_logged.insert(key, "no-credential".to_string());
+            }
+            continue;
+        };
+        let scope = egress_poll_scope(base, Some(&bearer), Some(tenant));
+        let fetch = &fetch;
+        let results = futures::future::join_all(crate::egress::Flow::ALL.map(|flow| {
+            let bearer = bearer.clone();
+            async move { (flow, fetch(flow.domain(), bearer).await) }
+        }))
+        .await;
+
+        for (flow, result) in results {
+            apply_egress_result(state, &scope, flow, &result);
+            let log_key = egress_log_key(&result);
+            let slot = (scope.tenant_id, flow);
+            if last_logged.get(&slot) == Some(&log_key) {
+                continue;
+            }
+            let verdict = state.permit_for(flow, scope.tenant_id);
+            let level = if verdict.allowed { "on" } else { "off" };
+            let who = scope
+                .tenant_id
+                .map_or_else(|| "no tenant".to_string(), |t| format!("tenant {t}"));
+            match &result {
+                Ok(_) if log_key.starts_with("answer:") => info!(
+                    "fleet_policy_poller: egress {} ({}) for {who} decided by coord ({log_key}) — {}",
+                    flow.key(),
+                    flow.domain(),
+                    if verdict.allowed { "allowed" } else { "refused at the source" }
+                ),
+                Ok(_) if log_key == "product-default" => info!(
+                    "fleet_policy_poller: coord has no row for {who} and applies its product \
+                     default for {} — not a tenant decision; {} stays {level} (source={})",
+                    flow.domain(),
+                    flow.key(),
+                    verdict.source.as_str()
+                ),
+                Ok(_) => info!(
+                    "fleet_policy_poller: coord does not know {} yet (no default_source on its \
+                     no-row answer) — {} for {who} stays {level} (source={})",
+                    flow.domain(),
+                    flow.key(),
+                    verdict.source.as_str()
+                ),
+                Err(e) => warn!(
+                    "fleet_policy_poller: {} poll for {who} gave no answer ({}) — {} stays {level} \
+                     (source={})",
+                    flow.domain(),
+                    match e {
+                        FetchError::NoJwt => "unpaired".to_string(),
+                        FetchError::AuthOrAbsent(s) => format!("coord {s}"),
+                        FetchError::Failed(m) => m.clone(),
+                    },
+                    flow.key(),
+                    verdict.source.as_str()
+                ),
+            }
+            last_logged.insert(slot, log_key);
+        }
+    }
+}
+
 /// One poll of the [`CONTROLS_DOMAIN`] (session-protection floors) cache.
 ///
 /// A 2xx with no usable floors — which is what coord returns until BOTH the
@@ -2707,6 +3371,22 @@ pub mod commands {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only an answer from coord marks the account-selection domain answered;
+    /// an unpaired skip or a transient failure leaves the env capture's source
+    /// `unknown`.
+    #[test]
+    fn account_selection_answer_classification() {
+        assert!(is_account_selection_answer(&PollOutcome::Updated(
+            "manual".into()
+        )));
+        assert!(is_account_selection_answer(&PollOutcome::UpdatedNoRow));
+        assert!(is_account_selection_answer(&PollOutcome::ResetOff(401)));
+        assert!(!is_account_selection_answer(&PollOutcome::SkippedNoJwt));
+        assert!(!is_account_selection_answer(&PollOutcome::Kept(
+            "timeout".into()
+        )));
+    }
 
     #[test]
     fn default_mode_constant_is_off() {
@@ -4130,5 +4810,662 @@ mod tests {
         // A restored document is `cached` by default — it has NOT been checked
         // against coord in this process.
         assert_eq!(doc.provenance, BriefingProvenance::Cached);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache #5 — the fleet account-selection mode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn account_selection_domain_is_pinned() {
+        // The domain string is the wire contract with the operator's PUT — a
+        // rename here silently detaches every runner from the fleet value.
+        assert_eq!(ACCOUNT_SELECTION_DOMAIN, "account_selection_mode");
+    }
+
+    /// Calls the SHIPPING init: a runner that has never reached coord must
+    /// hold NO fleet opinion, never a default mode it would force-apply.
+    #[test]
+    fn fresh_account_selection_cache_holds_no_fleet_opinion() {
+        let fresh = new_account_selection_cache();
+        assert_eq!(*fresh.read().unwrap(), None);
+    }
+
+    #[test]
+    fn only_the_wire_spellings_name_a_fleet_mode() {
+        use AccountSelectionMode::*;
+        for mode in AccountSelectionMode::ALL {
+            assert_eq!(
+                normalize_account_selection_level(Some(mode.as_str())),
+                Some(mode)
+            );
+        }
+        assert_eq!(
+            normalize_account_selection_level(Some(" Alternating_Handoff ")),
+            Some(AlternatingHandoff)
+        );
+        assert_eq!(
+            normalize_account_selection_level(Some("manual")),
+            Some(Manual)
+        );
+        assert_eq!(
+            normalize_account_selection_level(Some("least_usage")),
+            Some(LeastUsage)
+        );
+        assert_eq!(
+            normalize_account_selection_level(Some("highest_expected_usage")),
+            Some(HighestExpectedUsage)
+        );
+        // Trimmed and ASCII-case-insensitive, like plan capture.
+        assert_eq!(
+            normalize_account_selection_level(Some("  Highest_Expected_Usage ")),
+            Some(HighestExpectedUsage)
+        );
+        assert_eq!(
+            normalize_account_selection_level(Some("LEAST_USAGE")),
+            Some(LeastUsage)
+        );
+        // Coord's no-row fallback for an unlisted domain, other domains'
+        // vocabularies, typos and blanks are all "no opinion".
+        for raw in [
+            "off",
+            "record",
+            "gate",
+            "least-usage",
+            "leastusage",
+            "highest_expected",
+            "",
+            "   ",
+        ] {
+            assert_eq!(
+                normalize_account_selection_level(Some(raw)),
+                None,
+                "{raw:?}"
+            );
+        }
+        assert_eq!(normalize_account_selection_level(None), None);
+    }
+
+    #[test]
+    fn account_selection_fail_safe_contract_holds_on_every_arm() {
+        // A named mode is written.
+        assert_eq!(
+            next_account_selection(&PollOutcome::Updated("least_usage".into())),
+            Some(Some(AccountSelectionMode::LeastUsage))
+        );
+        // An unrecognised level is WRITTEN as "no opinion" — it is a real
+        // answer, not a failure, so it must displace a previous fleet mode.
+        assert_eq!(
+            next_account_selection(&PollOutcome::Updated("off".into())),
+            Some(None)
+        );
+        // No row / absent / auth ⇒ no fleet opinion.
+        assert_eq!(
+            next_account_selection(&PollOutcome::UpdatedNoRow),
+            Some(None)
+        );
+        assert_eq!(
+            next_account_selection(&PollOutcome::ResetOff(404)),
+            Some(None)
+        );
+        // The loop never produces ResetOff(401) for this domain (see
+        // `account_selection_outcome_for_error`), but the pure mapper stays
+        // total over the enum.
+        assert_eq!(
+            next_account_selection(&PollOutcome::ResetOff(401)),
+            Some(None)
+        );
+        // Unpaired or transient ⇒ NO write: last-good is kept.
+        assert_eq!(next_account_selection(&PollOutcome::SkippedNoJwt), None);
+        assert_eq!(
+            next_account_selection(&PollOutcome::Kept("request: timeout".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn account_selection_body_maps_no_row_to_no_opinion_and_rows_to_their_level() {
+        let decode = |raw: &str| serde_json::from_str::<FleetPolicyResponse>(raw).unwrap();
+        // What coord answers for a tenant that never set the domain.
+        let no_row = decode(
+            r#"{"domain":"account_selection_mode","effective_level":"off","resolved_scope":"none"}"#,
+        );
+        assert_eq!(
+            account_selection_outcome_for_body(&no_row),
+            PollOutcome::UpdatedNoRow
+        );
+        assert_eq!(
+            next_account_selection(&account_selection_outcome_for_body(&no_row)),
+            Some(None)
+        );
+        // An explicit tenant row.
+        let row =
+            decode(r#"{"effective_level":" highest_expected_usage ","resolved_scope":"tenant"}"#);
+        assert_eq!(
+            account_selection_outcome_for_body(&row),
+            PollOutcome::Updated("highest_expected_usage".into())
+        );
+        assert_eq!(
+            next_account_selection(&account_selection_outcome_for_body(&row)),
+            Some(Some(AccountSelectionMode::HighestExpectedUsage))
+        );
+        // A 2xx with no level at all is "no opinion", not an error.
+        let bare = decode(r#"{"domain":"account_selection_mode"}"#);
+        assert_eq!(
+            next_account_selection(&account_selection_outcome_for_body(&bare)),
+            Some(None)
+        );
+        // Fetch failures: a 404 resets to no opinion; a 401 KEEPS last-good
+        // (a credential blip must not flip every unpinned machine's rotation);
+        // unpaired and transient failures write nothing.
+        assert_eq!(
+            next_account_selection(&account_selection_outcome_for_error(
+                FetchError::AuthOrAbsent(404)
+            )),
+            Some(None)
+        );
+        assert!(matches!(
+            account_selection_outcome_for_error(FetchError::AuthOrAbsent(401)),
+            PollOutcome::Kept(_)
+        ));
+        assert_eq!(
+            next_account_selection(&account_selection_outcome_for_error(
+                FetchError::AuthOrAbsent(401)
+            )),
+            None
+        );
+        assert_eq!(
+            next_account_selection(&account_selection_outcome_for_error(FetchError::NoJwt)),
+            None
+        );
+        assert_eq!(
+            next_account_selection(&account_selection_outcome_for_error(FetchError::Failed(
+                "x".into()
+            ))),
+            None
+        );
+    }
+
+    /// The reader, the pin guard and the dial agree on every value the cache
+    /// can hold.
+    #[test]
+    fn account_selection_pin_reader_and_dial_agree() {
+        {
+            let pin = pin_account_selection_for_test(Some(AccountSelectionMode::Manual));
+            assert_eq!(
+                fleet_account_selection_mode(),
+                Some(AccountSelectionMode::Manual)
+            );
+            assert_eq!(dial_snapshot().account_selection_mode, Some("manual"));
+            pin.set(None);
+            assert_eq!(fleet_account_selection_mode(), None);
+            assert_eq!(dial_snapshot().account_selection_mode, None);
+            pin.set(Some(AccountSelectionMode::HighestExpectedUsage));
+        }
+        let _pin = pin_account_selection_for_test(None);
+        assert_eq!(fleet_account_selection_mode(), None);
+        assert_eq!(
+            describe_account_selection(None),
+            "(no fleet opinion — local mode governs)"
+        );
+        assert_eq!(
+            describe_account_selection(Some(AccountSelectionMode::LeastUsage)),
+            "least_usage"
+        );
+    }
+}
+
+/// The egress half of the poller: how a decoded coord body maps onto the
+/// switch cache (plan 2026-10-10-spec-front-end-phase-9-generic-boundary).
+#[cfg(test)]
+mod egress_poll_tests {
+    use super::*;
+    use crate::egress::{CoordAnswer, CoordOrigin, Decision, Level};
+
+    fn body(json: &str) -> Result<FleetPolicyResponse, FetchError> {
+        Ok(serde_json::from_str(json).expect("decode"))
+    }
+
+    #[test]
+    fn an_egress_aware_no_row_answer_is_classified_by_its_default_source() {
+        let r =
+            body(r#"{"effective_level":"on","resolved_scope":"none","default_source":"product"}"#);
+        assert_eq!(egress_answer_for(&r).unwrap(), CoordAnswer::NoOpinion);
+        assert_eq!(egress_log_key(&r), "product-default");
+        let r = body(
+            r#"{"effective_level":"off","resolved_scope":"none","default_source":"deployment_profile"}"#,
+        );
+        assert_eq!(
+            egress_answer_for(&r).unwrap(),
+            CoordAnswer::Authoritative(Decision {
+                level: Level::Off,
+                decided_by: CoordOrigin::DeploymentProfile
+            })
+        );
+        assert_eq!(egress_log_key(&r), "answer:off:deployment_profile");
+    }
+
+    #[test]
+    fn a_tenant_row_is_recorded_even_from_a_coord_without_default_source() {
+        let r = body(r#"{"effective_level":"off","resolved_scope":"tenant"}"#);
+        assert_eq!(
+            egress_answer_for(&r).unwrap(),
+            CoordAnswer::Authoritative(Decision {
+                level: Level::Off,
+                decided_by: CoordOrigin::TenantRow
+            })
+        );
+    }
+
+    #[test]
+    fn a_pre_egress_coord_no_row_answer_is_not_recorded() {
+        // Today's coord answers every unknown domain `off` with no
+        // default_source; recording it would switch all six flows off.
+        let r = body(r#"{"effective_level":"off","resolved_scope":"none","default_source":null}"#);
+        assert_eq!(
+            egress_answer_for(&r).unwrap(),
+            CoordAnswer::NotAnEgressAnswer
+        );
+        assert_eq!(egress_log_key(&r), "coord-predates-egress");
+    }
+
+    /// H1: coord's PRODUCT default (no row, `default_source: "product"`) is
+    /// coord having no opinion — it must not outrank the machine profile's
+    /// `egress.default: off`, neither on the first poll nor after a restart
+    /// that reads the persisted store.
+    #[test]
+    fn a_product_default_answer_never_outranks_a_profile_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("egress-levels.json");
+        let flow = crate::egress::Flow::CodeMirror;
+        let r =
+            body(r#"{"effective_level":"on","resolved_scope":"none","default_source":"product"}"#);
+
+        let scope = crate::egress::ScopeKey::new("http://coord.example", None);
+        let first =
+            crate::egress::EgressState::new(Some(path.clone()), Some(Level::Off), scope.clone());
+        apply_egress_result(&first, &scope, flow, &r);
+        assert!(
+            !first.permit(flow).allowed,
+            "first poll: the profile's off must hold"
+        );
+
+        let restarted = crate::egress::EgressState::new(Some(path), Some(Level::Off), scope);
+        assert!(
+            !restarted.permit(flow).allowed,
+            "after restart: coord's product default must not outrank the profile"
+        );
+    }
+
+    /// Re-review 1: answers are filed under the tenant of the credential the
+    /// poll actually PRESENTED (its `tenant_id` claim), the tenant coord
+    /// answered for — not a separate pin read.
+    #[test]
+    fn a_poll_is_filed_under_the_presented_credentials_tenant() {
+        use base64::Engine;
+        let t = uuid::Uuid::from_u128(0x5eed);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::json!({ "tenant_id": t.to_string() }).to_string());
+        let jwt = format!("e30.{payload}.sig");
+        let scope = egress_poll_scope("http://coord.example", Some(&jwt), None);
+        assert_eq!(scope.tenant_id, Some(t));
+    }
+
+    /// Re-review 1, with the REAL resolvers: a device paired to tenant T and not
+    /// pinned stamps its sessions with T (`default_binding_tenant`, which
+    /// `resolve_new_session_tenant` falls to when unpinned), and its poll is
+    /// filed under T because the presented credential names T. The session's
+    /// lookup, the default scope's, and the poll's key therefore agree.
+    #[test]
+    fn the_poll_key_and_the_session_stamp_resolve_to_the_same_tenant() {
+        use base64::Engine;
+        let t = uuid::Uuid::from_u128(0xd00d);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("paired_user.json"),
+            serde_json::json!({ "default_tenant_id": t.to_string() }).to_string(),
+        )
+        .unwrap();
+        let stamped = match crate::auth::default_binding_tenant_in(dir.path()) {
+            crate::auth::BindingTenantRead::Bound(t) => Some(t),
+            other => panic!("expected a bound tenant, got {other:?}"),
+        };
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::json!({ "tenant_id": t.to_string() }).to_string());
+        let presented = format!("e30.{payload}.sig");
+
+        let base = "http://coord.example";
+        let poll_scope = egress_poll_scope(base, Some(&presented), stamped);
+        let state = crate::egress::EgressState::new(
+            None,
+            None,
+            crate::egress::ScopeKey::new(base, stamped),
+        );
+        let off = body(r#"{"effective_level":"off","resolved_scope":"tenant"}"#);
+        let flow = crate::egress::Flow::TerminalStream;
+        apply_egress_result(&state, &poll_scope, flow, &off);
+
+        assert_eq!(poll_scope.tenant_id, stamped);
+        assert_eq!(
+            state.permit_for(flow, stamped).source.as_str(),
+            "coord",
+            "the session's lookup finds the polled decision"
+        );
+        assert!(!state.permit_for(flow, stamped).allowed);
+        assert!(!state.permit(flow).allowed, "and so does the default scope");
+        // A session of a tenant nobody polled is UNKNOWN, never the default.
+        let other = state.permit_for(flow, Some(uuid::Uuid::from_u128(0xbeef)));
+        assert_eq!(other.source.as_str(), "unknown");
+        assert!(!other.allowed);
+    }
+
+    /// Re-review 2+4: every bound tenant is polled with its own credential.
+    #[test]
+    fn every_bound_tenant_is_polled_with_its_own_credential() {
+        let src = include_str!("fleet_policy_poller.rs");
+        let poll = src.split_once("async fn poll_egress_once(").unwrap().1;
+        let poll = poll.split_once("\n}\n").unwrap().0;
+        assert!(poll.contains("egress_poll_tenants()"), "{poll}");
+        assert!(poll.contains("device_bearer_for(Some(&tenant))"), "{poll}");
+    }
+
+    /// L2: the six domain fetches run concurrently, not one after another.
+    #[test]
+    fn the_six_egress_fetches_run_concurrently() {
+        let src = include_str!("fleet_policy_poller.rs");
+        let poll = src.split_once("async fn poll_egress_with<").unwrap().1;
+        let poll = poll.split_once("\n}\n").unwrap().0;
+        assert!(poll.contains("join_all("), "{poll}");
+    }
+
+    fn fetch_errors() -> Vec<FetchError> {
+        vec![
+            FetchError::NoJwt,
+            FetchError::AuthOrAbsent(401),
+            FetchError::AuthOrAbsent(404),
+            FetchError::Failed("network".into()),
+            FetchError::Failed("coord 503".into()),
+        ]
+    }
+
+    fn jwt_for(tenant: uuid::Uuid) -> String {
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::json!({ "tenant_id": tenant.to_string() }).to_string());
+        format!("e30.{payload}.sig")
+    }
+
+    /// C1: a failed poll (no credential, 401, 404, network, 5xx) records
+    /// NOTHING: a decision already held stays as it was — in memory and on
+    /// disk — and the store file is not rewritten.
+    #[test]
+    fn a_failed_poll_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("egress-levels.json");
+        let t = uuid::Uuid::from_u128(0xfa11);
+        let scope = crate::egress::ScopeKey::new("http://coord.example", Some(t));
+        let state = crate::egress::EgressState::new(Some(path.clone()), None, scope.clone());
+        let flow = crate::egress::Flow::TerminalStream;
+        let off = body(r#"{"effective_level":"off","resolved_scope":"tenant"}"#);
+        apply_egress_result(&state, &scope, flow, &off);
+        let stored = std::fs::read_to_string(&path).unwrap();
+        for e in fetch_errors() {
+            apply_egress_result(&state, &scope, flow, &Err(e));
+            let v = state.permit(flow);
+            assert!(!v.allowed);
+            assert_eq!(v.source.as_str(), "coord", "the held decision is untouched");
+            assert_eq!(
+                v.source.decided_by(),
+                Some(CoordOrigin::TenantRow),
+                "and still a tenant row"
+            );
+        }
+        let after = std::fs::read_to_string(&path).unwrap();
+        let strip = |raw: &str| {
+            let mut v: serde_json::Value = serde_json::from_str(raw).unwrap();
+            v.as_object_mut().unwrap().remove("written_at");
+            v
+        };
+        assert_eq!(strip(&after), strip(&stored), "nothing was persisted");
+    }
+
+    /// C1: an UNKNOWN tenant stays UNKNOWN (refusing) through an error tick,
+    /// and nothing is persisted, so a fresh process reading the store still
+    /// refuses.
+    #[test]
+    fn an_error_tick_leaves_an_unknown_tenant_refusing_also_after_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("egress-levels.json");
+        let t = uuid::Uuid::from_u128(0xfa12);
+        let scope = crate::egress::ScopeKey::new("http://coord.example", Some(t));
+        let state = crate::egress::EgressState::new(Some(path.clone()), None, scope.clone());
+        for e in fetch_errors() {
+            for flow in crate::egress::Flow::ALL {
+                apply_egress_result(&state, &scope, flow, &Err(e.clone()));
+            }
+        }
+        for flow in crate::egress::Flow::ALL {
+            let v = state.permit(flow);
+            assert!(!v.allowed, "{flow:?}: an unanswered tenant refuses");
+            assert_eq!(v.source.as_str(), "unknown", "{flow:?}");
+        }
+        assert!(!path.exists(), "an error tick persists nothing");
+        let reloaded = crate::egress::EgressState::new(Some(path), None, scope);
+        for flow in crate::egress::Flow::ALL {
+            let v = reloaded.permit(flow);
+            assert!(!v.allowed, "{flow:?}: still refusing after reload");
+            assert_eq!(v.source.as_str(), "unknown", "{flow:?}");
+        }
+    }
+
+    /// C1: only a SUCCESSFUL response lacking `default_source` marks the scope
+    /// answered (coord replied; it just predates the egress family).
+    #[test]
+    fn only_a_successful_answer_marks_an_unknown_scope_answered() {
+        let t = uuid::Uuid::from_u128(0xfa13);
+        let scope = crate::egress::ScopeKey::new("http://coord.example", Some(t));
+        let state = crate::egress::EgressState::new(None, None, scope.clone());
+        let flow = crate::egress::Flow::CodeMirror;
+        let pre = body(r#"{"effective_level":"off","resolved_scope":"none"}"#);
+        apply_egress_result(&state, &scope, flow, &pre);
+        assert_ne!(state.permit(flow).source.as_str(), "unknown");
+    }
+
+    /// Re-review M2: only a FULLY read, genuinely credential-less device is an
+    /// unbound one — an unreadable slot store, an unreadable binding file, an
+    /// unreadable token, or a token naming no tenant are each incomplete.
+    #[test]
+    fn only_a_fully_read_credential_less_device_is_a_complete_empty_enumeration() {
+        use crate::auth::BindingTenantRead as B;
+        use crate::secure_storage::StoredTokenRead as T;
+        let t = uuid::Uuid::from_u128(0xe1);
+        let claimless = {
+            use base64::Engine;
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"sub":"x"}"#);
+            format!("e30.{payload}.sig")
+        };
+        assert_eq!(
+            enumerate_bound_tenants(Ok(vec![]), B::Unbound, T::Absent),
+            (vec![], true),
+            "nothing anywhere, every source read"
+        );
+        assert_eq!(
+            enumerate_bound_tenants(Err(()), B::Unbound, T::Absent),
+            (vec![], false),
+            "slot store unreadable"
+        );
+        assert_eq!(
+            enumerate_bound_tenants(Ok(vec![]), B::Unknown, T::Absent),
+            (vec![], false),
+            "binding file unreadable"
+        );
+        assert_eq!(
+            enumerate_bound_tenants(Ok(vec![]), B::Unbound, T::Unreadable("x".into())),
+            (vec![], false),
+            "token store unreadable"
+        );
+        assert_eq!(
+            enumerate_bound_tenants(Ok(vec![]), B::Unbound, T::Present(claimless)),
+            (vec![], false),
+            "a token that names no tenant"
+        );
+        assert_eq!(
+            enumerate_bound_tenants(Ok(vec![]), B::Bound(t), T::Present(jwt_for(t))),
+            (vec![t], true)
+        );
+    }
+
+    /// Item 5 (behavioural): a poll whose fetches all FAIL does not move the
+    /// default scope to the new tenant — no answer for it was applied.
+    #[tokio::test]
+    async fn a_failed_poll_does_not_move_the_default_scope() {
+        let base = "http://coord.example";
+        let a = uuid::Uuid::from_u128(0xa);
+        let b = uuid::Uuid::from_u128(0xb);
+        let state = crate::egress::EgressState::new(
+            None,
+            None,
+            crate::egress::ScopeKey::new(base, Some(a)),
+        );
+        let mut logged = std::collections::HashMap::new();
+        poll_egress_with(
+            &state,
+            base,
+            Some(b),
+            vec![(b, Some(jwt_for(b)))],
+            true,
+            |_domain, _bearer| async { Err(FetchError::Failed("down".into())) },
+            &mut logged,
+        )
+        .await;
+        assert_eq!(
+            state.current_scope().tenant_id,
+            Some(a),
+            "the move waits for an applied answer"
+        );
+    }
+
+    /// m5 (behavioural): every bound tenant is polled with ITS OWN credential,
+    /// each answer filed under that tenant; a tenant with no credential is not
+    /// asked and stays UNKNOWN; the bound set is recorded.
+    #[tokio::test]
+    async fn every_bound_tenant_is_polled_with_its_own_credential_behaviourally() {
+        let base = "http://coord.example";
+        let a = uuid::Uuid::from_u128(0xa1);
+        let b = uuid::Uuid::from_u128(0xb1);
+        let c = uuid::Uuid::from_u128(0xc1);
+        let (ja, jb) = (jwt_for(a), jwt_for(b));
+        let state = crate::egress::EgressState::new(
+            None,
+            None,
+            crate::egress::ScopeKey::new(base, Some(a)),
+        );
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let mut logged = std::collections::HashMap::new();
+        let ja2 = ja.clone();
+        poll_egress_with(
+            &state,
+            base,
+            Some(a),
+            vec![(a, Some(ja.clone())), (b, Some(jb.clone())), (c, None)],
+            true,
+            |domain, bearer| {
+                let seen = seen.clone();
+                let off = bearer == ja2;
+                async move {
+                    seen.lock().unwrap().push((domain.to_string(), bearer));
+                    let level = if off { "off" } else { "on" };
+                    Ok(serde_json::from_str(&format!(
+                        r#"{{"effective_level":"{level}","resolved_scope":"tenant"}}"#
+                    ))
+                    .unwrap())
+                }
+            },
+            &mut logged,
+        )
+        .await;
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.len(),
+            12,
+            "six domains for each tenant with a credential"
+        );
+        assert_eq!(seen.iter().filter(|(_, b)| *b == ja).count(), 6);
+        assert_eq!(seen.iter().filter(|(_, b)| *b == jb).count(), 6);
+        for flow in crate::egress::Flow::ALL {
+            let va = state.permit_for(flow, Some(a));
+            assert!(!va.allowed && va.source.as_str() == "coord", "{flow:?} A");
+            let vb = state.permit_for(flow, Some(b));
+            assert!(vb.allowed && vb.source.as_str() == "coord", "{flow:?} B");
+            let vc = state.permit_for(flow, Some(c));
+            assert!(!vc.allowed && vc.source.as_str() == "unknown", "{flow:?} C");
+        }
+        assert_eq!(state.bound_tenants(), vec![a, b, c]);
+    }
+
+    /// m5 (behavioural): the six fetches for a tenant run CONCURRENTLY — each
+    /// waits on a six-party barrier, which a sequential poll never releases.
+    #[tokio::test]
+    async fn the_six_egress_fetches_run_concurrently_behaviourally() {
+        let base = "http://coord.example";
+        let a = uuid::Uuid::from_u128(0xa2);
+        let state = crate::egress::EgressState::new(
+            None,
+            None,
+            crate::egress::ScopeKey::new(base, Some(a)),
+        );
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(6));
+        let mut logged = std::collections::HashMap::new();
+        poll_egress_with(
+            &state,
+            base,
+            Some(a),
+            vec![(a, Some(jwt_for(a)))],
+            true,
+            |_domain, _bearer| {
+                let barrier = barrier.clone();
+                async move {
+                    match tokio::time::timeout(Duration::from_secs(5), barrier.wait()).await {
+                        Ok(_) => Ok(serde_json::from_str(
+                            r#"{"effective_level":"off","resolved_scope":"tenant"}"#,
+                        )
+                        .unwrap()),
+                        Err(_) => Err(FetchError::Failed("sequential".into())),
+                    }
+                }
+            },
+            &mut logged,
+        )
+        .await;
+        for flow in crate::egress::Flow::ALL {
+            assert_eq!(
+                state.permit_for(flow, Some(a)).source.as_str(),
+                "coord",
+                "{flow:?}: every fetch completed together"
+            );
+        }
+    }
+
+    #[test]
+    fn the_egress_poll_runs_inside_the_poller_loop() {
+        let src = include_str!("fleet_policy_poller.rs");
+        let loop_body = src
+            .split_once("async fn poller_loop(")
+            .expect("poller_loop")
+            .1
+            .split_once("\nasync fn fetch_fleet_policy(")
+            .expect("fetch_fleet_policy follows the loop")
+            .0;
+        assert!(loop_body.contains("poll_egress_once(&mut last_logged_egress).await"));
+        let poll = src.split_once("async fn poll_egress_once(").unwrap().1;
+        let poll = poll.split_once("\n}\n").unwrap().0;
+        assert!(poll.contains("fetch_fleet_policy_with(domain, &bearer)"));
+        assert!(poll.contains("spawn_blocking(crate::session::resolve_new_session_tenant)"));
+        assert!(poll.contains("poll_egress_with("));
+        let core = src.split_once("async fn poll_egress_with<").unwrap().1;
+        let core = core.split_once("\n}\n").unwrap().0;
+        assert!(core.contains("crate::egress::Flow::ALL"));
+        assert!(core.contains("egress_poll_scope(base, Some(&bearer), Some(tenant))"));
+        assert!(core.contains("apply_egress_result(state, &scope, flow, &result)"));
     }
 }

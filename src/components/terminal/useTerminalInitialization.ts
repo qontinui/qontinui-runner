@@ -1,8 +1,10 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import { autonomousResumeDetector, subscribeCoordDrainState } from "@/hooks/useCoordDrainState";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LAYOUT_PRESETS, FLOW_GRID_ID } from "./useZoneLayout";
+import type { LayoutRequestSource } from "./terminalWorkMode";
 import type { TerminalRefsMap } from "./writeWhenReady";
 import {
   typeResumeAndVerify,
@@ -19,9 +21,17 @@ import type { CommandResponse, TerminalSessionRecord } from "./types";
 import type { SaveSessionLayoutParams } from "./useSessionPersistence";
 import { noteRecordedZone, recordedZoneLedgerFor, type SessionOpenArgs } from "./sessionRecordArgs";
 import { rememberSessionId } from "./lastKnownSessionIds";
-import { loadKnownPageIds } from "./useTerminalPages";
+import { loadKnownPageIds, readPinnedPageId } from "./useTerminalPages";
+import { getPageBindings, type PageBindings } from "@/lib/pageBindings";
 import { fetchLiveClaudeSessionIds } from "./liveClaudeSessions";
 import type { ResourceGuardSource } from "@/lib/resourceGuard";
+import {
+  loadDefaultConfigHome,
+  resolveAccountDir,
+  sanitizeConfigDir,
+  typedConfigDir,
+} from "./defaultConfigHome";
+import { displayNameOf } from "@/lib/session-ledger";
 
 /**
  * Fetch the durable RESTORABLE session records for `pageId` from the backend
@@ -45,6 +55,400 @@ export async function fetchOpenRecords(
   opts?: { knownPageIds?: readonly string[]; adoptOrphans?: boolean },
 ): Promise<TerminalSessionRecord[]> {
   return (await fetchRestoreSet(pageId, opts)).records;
+}
+
+/**
+ * Wait for the runner's PTY-holder boot sweep to settle — every pane a holder
+ * kept alive across the last runner exit adopted back as a live terminal (or,
+ * if it could not be adopted, ended so its session is resumed normally) and
+ * every dead holder's leftovers reaped — before the restore reads
+ * `terminal_list` (plan
+ * `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`, Phase 3).
+ * Otherwise a surviving session would look dead and be cold-resumed beside
+ * its still-running `claude`. The backend bounds the wait itself. Returns
+ * whether the sweep SETTLED: `false` only when the wait ran out — the restore
+ * then proceeds, and the records it refuses as "live" meanwhile are
+ * re-decided once the sweep settles ({@link recheckRefusedAfterSweep}). An
+ * error (an older runner without the command, so no sweep) counts as settled.
+ * Exported for tests.
+ */
+export async function waitForHolderSweep(): Promise<boolean> {
+  try {
+    const resp = await invoke<CommandResponse>("terminal_holder_sweep_settled");
+    const settled = (resp?.data as { settled?: boolean } | undefined)?.settled;
+    if (settled === false) {
+      console.warn(
+        "[TerminalPage] the PTY-holder boot sweep did not settle in time; restoring anyway, " +
+          "and re-deciding the sessions it refuses as live once it settles",
+      );
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.warn(`[TerminalPage] terminal_holder_sweep_settled unavailable: ${err}`);
+    return true;
+  }
+}
+
+/** The boot sweep as the restore sees it before it starts. */
+export interface HolderSweepStatus {
+  settled: boolean;
+  /**
+   * Terminal ids of live holder panes still being adopted. `null` when the
+   * census did not come in within the runner's wait — the restore then waits
+   * for the whole sweep instead.
+   */
+  held: ReadonlySet<string> | null;
+}
+
+/**
+ * The PTY-holder boot sweep's status as soon as its CENSUS is in — a few
+ * seconds at most, not the whole sweep (review round 4, M1): which panes are
+ * HELD (live, still being adopted). The restore restores every other record
+ * at once, and waits only for the held ones. An error (an older runner
+ * without the command, so no sweep) is "settled, nothing held". Exported for
+ * tests.
+ */
+export async function fetchHolderSweepStatus(): Promise<HolderSweepStatus> {
+  try {
+    const resp = await invoke<CommandResponse>("terminal_holder_sweep_status");
+    const data = resp?.data as { settled?: boolean; held?: string[] | null } | undefined;
+    return {
+      settled: data?.settled !== false,
+      held: Array.isArray(data?.held) ? new Set(data.held) : null,
+    };
+  } catch (err) {
+    console.warn(`[TerminalPage] terminal_holder_sweep_status unavailable: ${err}`);
+    return { settled: true, held: new Set() };
+  }
+}
+
+/**
+ * Split the restore's records by the sweep's census: those whose terminal a
+ * holder pane is still being adopted into are HELD BACK (they come back as an
+ * adopted tab, or through the re-run after the sweep settles); every other
+ * record is restored NOW. A settled sweep holds nothing back. Pure; exported
+ * for tests.
+ */
+export function splitRestoreByHold<T extends { terminalId: string }>(
+  records: readonly T[],
+  status: HolderSweepStatus,
+): { now: T[]; heldBack: T[] } {
+  if (status.settled || status.held === null || status.held.size === 0) {
+    return { now: [...records], heldBack: [] };
+  }
+  const held = status.held;
+  return {
+    now: records.filter((r) => !held.has(r.terminalId)),
+    heldBack: records.filter((r) => held.has(r.terminalId)),
+  };
+}
+
+/** How many more times {@link recheckRefusedAfterSweep} waits for the sweep. */
+export const HOLDER_SWEEP_RECHECK_ATTEMPTS = 3;
+
+/**
+ * The restore ran before the PTY-holder boot sweep settled, and refused to
+ * cold-resume `refused` because a live `claude` hosted each of them. Some of
+ * those processes may have been a DEAD holder's leftovers that the sweep then
+ * reaped, or a holder it ended after a failed adoption — sessions that would
+ * otherwise come back with no tab and no resume. Wait for the sweep (a few
+ * more bounded waits), then return exactly those refused session ids that are
+ * no longer hosted by a live process: the ones the restore must now resume.
+ * A sweep that never settles, or a live registry that cannot be read, returns
+ * none (fail closed: a missing tab is recoverable, a forked session is not).
+ * Exported for tests.
+ */
+export async function recheckRefusedAfterSweep(
+  refused: readonly string[],
+  liveIds: () => Promise<ReadonlySet<string> | null> = fetchLiveClaudeSessionIds,
+  heldBack: readonly string[] = [],
+): Promise<string[]> {
+  if (refused.length === 0 && heldBack.length === 0) return [];
+  let settled = false;
+  for (let i = 0; i < HOLDER_SWEEP_RECHECK_ATTEMPTS && !settled; i++) {
+    settled = await waitForHolderSweep();
+  }
+  // Held-back records are always restored after the wait — the re-run
+  // reconnects the ones that were adopted, and applies the same live-process
+  // check to the rest. Refused ones only once the sweep SETTLED.
+  if (!settled) return [...heldBack];
+  const live = refused.length > 0 ? await liveIds() : null;
+  return [...heldBack, ...refused.filter((id) => decideColdResume(live, id) === "respawn")];
+}
+
+/** The runner's event for a session handed back to the restore (Rust: `HOLDER_SESSION_RELEASED_EVENT`). */
+export const HOLDER_SESSION_RELEASED_EVENT = "pty-holder-session-released";
+
+/** Its payload. */
+export interface HolderSessionReleased {
+  sessionId: string;
+  terminalId: string;
+  pageId: string | null;
+}
+
+/**
+ * A holder whose adoption the runner was still retrying DIED (review round 6,
+ * T1). The restore had refused its session's resume while that holder's
+ * `claude` was alive, and nothing else would re-decide it: re-decide it now
+ * — the same recheck a late sweep settle runs — and `schedule` a re-run of
+ * the restore for its page when it is resumable. Returns whether one was
+ * scheduled. Exported for tests.
+ */
+export async function onHolderSessionReleased(
+  payload: HolderSessionReleased,
+  schedule: (pageId: string, sessionIds: string[]) => void,
+  liveIds: () => Promise<ReadonlySet<string> | null> = fetchLiveClaudeSessionIds,
+): Promise<boolean> {
+  const resumable = await recheckRefusedAfterSweep([payload.sessionId], liveIds);
+  if (resumable.length === 0) return false;
+  schedule(payload.pageId ?? "default", resumable);
+  return true;
+}
+
+/**
+ * Whether THIS window owns the restore of `pageId` and so handles a released
+ * session on it (review round 7, N4). Every window — the main one and each
+ * pop-out — mounts its own `TerminalPage`, so its own restore hook, and the
+ * runner broadcasts the event to all of them. A page-pinned pop-out owns its
+ * one page; the main window owns every page not detached into a pop-out —
+ * the same split `useTerminalPages` uses to decide which window restores a
+ * page. Exported for tests.
+ */
+export function ownsReleasedPage(
+  pageId: string,
+  pinnedPageId: string | null,
+  bindings: PageBindings,
+): boolean {
+  if (pinnedPageId !== null) return pageId === pinnedPageId;
+  return !bindings[pageId];
+}
+
+/** How many times an ABORTED restore re-runs on its own for ids it still owes (review V1). */
+export const ABORT_RETRY_LIMIT = 3;
+/**
+ * The first such re-run's delay; each later one doubles it (2 s, 4 s, 8 s), so
+ * the last retry fires ~14 s after the first abort — well inside the ~3 min
+ * (4 × 45 s ticks) before the lifecycle poll retires an unmatched record.
+ */
+export const ABORT_RETRY_BASE_MS = 2_000;
+
+/** How a restore run of a page ended. */
+export type RestoreRunOutcome = "restored" | "aborted" | "deferred";
+
+/**
+ * Serializes the targeted re-runs of each page's restore (review round 7,
+ * U1). A late sweep settle and a released holder can both ask for a re-run of
+ * the same page, for the same session, while a run is still in flight; two
+ * runs racing would each cold-resume it. Ids scheduled while a run of the
+ * page is in flight are only merged, and the run's end triggers ONE re-run
+ * for all of them. A page this window has not begun restoring is not re-run
+ * at all: its first full restore, whenever it runs, covers every id — and a
+ * window that does not own the page never restores it.
+ *
+ * An ABORTED run (indeterminate reconnect) restored nothing, but its page
+ * stays known and every id it owed is KEPT (review V1, coord finding
+ * c7d478a8): dropping them left a released session unresumed until the
+ * operator re-activated the page, and the lifecycle poll retires such a
+ * record within minutes. The queue re-runs the page itself, at most
+ * {@link ABORT_RETRY_LIMIT} times in a row with a doubling backoff; past
+ * that, the ids wait for the next schedule or activation — never a loop. A
+ * page with no completed restore re-runs IN FULL, which covers the ids. A
+ * drain-deferred run drops them: the drain lift re-runs the page in full.
+ * Exported for tests.
+ */
+export class RestoreRerunQueue {
+  private readonly inFlight = new Set<string>();
+  private readonly restored = new Set<string>();
+  /** Consecutive aborted runs per page; a page in here is known. */
+  private readonly aborted = new Map<string, number>();
+  private readonly pending = new Map<string, Set<string>>();
+  /** The ids each in-flight run took, given back if it aborts. */
+  private readonly taken = new Map<string, Set<string>>();
+
+  /** Merge `sessionIds` for `pageId`; true when the caller must trigger a re-run now. */
+  schedule(pageId: string, sessionIds: readonly string[]): boolean {
+    const known =
+      this.restored.has(pageId) || this.inFlight.has(pageId) || this.aborted.has(pageId);
+    if (!known || sessionIds.length === 0) return false;
+    const merged = this.pending.get(pageId) ?? new Set<string>();
+    for (const id of sessionIds) merged.add(id);
+    this.pending.set(pageId, merged);
+    return !this.inFlight.has(pageId);
+  }
+
+  /** Whether ids for `pageId` are still owed a re-run. */
+  owes(pageId: string): boolean {
+    return (this.pending.get(pageId)?.size ?? 0) > 0;
+  }
+
+  /** Whether a restore of `pageId` has completed — a re-run of it merges. */
+  restoredOnce(pageId: string): boolean {
+    return this.restored.has(pageId);
+  }
+
+  /**
+   * A run of `pageId` starts. Returns the ids it alone must restore, or
+   * `undefined` for a full restore — always, until a restore of the page has
+   * completed.
+   */
+  begin(pageId: string): ReadonlySet<string> | undefined {
+    this.inFlight.add(pageId);
+    const ids = this.pending.get(pageId);
+    this.pending.delete(pageId);
+    if (ids) this.taken.set(pageId, ids);
+    else this.taken.delete(pageId);
+    return this.restored.has(pageId) ? ids : undefined;
+  }
+
+  /**
+   * The run of `pageId` ended with `outcome`. Returns `null` for no re-run,
+   * or the delay in ms after which the caller triggers ONE re-run (`0`: now).
+   */
+  finish(pageId: string, outcome: RestoreRunOutcome): number | null {
+    this.inFlight.delete(pageId);
+    const taken = this.taken.get(pageId);
+    this.taken.delete(pageId);
+    if (outcome === "deferred") {
+      this.pending.delete(pageId);
+      return null;
+    }
+    if (outcome === "restored") {
+      this.restored.add(pageId);
+      this.aborted.delete(pageId);
+      return (this.pending.get(pageId)?.size ?? 0) > 0 ? 0 : null;
+    }
+    const kept = this.pending.get(pageId) ?? new Set<string>();
+    for (const id of taken ?? []) kept.add(id);
+    if (kept.size > 0) this.pending.set(pageId, kept);
+    const streak = (this.aborted.get(pageId) ?? 0) + 1;
+    this.aborted.set(pageId, streak);
+    if (kept.size === 0 || streak > ABORT_RETRY_LIMIT) return null;
+    return ABORT_RETRY_BASE_MS * 2 ** (streak - 1);
+  }
+}
+
+/**
+ * Session-level "cold resume in progress" claims (review round 7, U1): two
+ * runs in flight at once — of different pages — never both create a tab for
+ * one session. A run claims a session before `createTerminal` and releases
+ * its claims when it ends; by the next run, the tab it created is in the live
+ * tabs, which a re-run checks. Exported for tests.
+ */
+export class ColdResumeGuard {
+  private readonly claimed = new Set<string>();
+
+  tryClaim(sessionId: string): boolean {
+    if (this.claimed.has(sessionId)) return false;
+    this.claimed.add(sessionId);
+    return true;
+  }
+
+  release(sessionId: string): void {
+    this.claimed.delete(sessionId);
+  }
+}
+
+/**
+ * One backoff timer per page for an aborted restore's retry (review V1, r1).
+ * Setting a page's timer replaces the previous one; a run of the page
+ * beginning cancels it (see {@link beginRestoreRun}). While inactive — the
+ * hook unmounted — nothing is scheduled and every pending timer is cleared,
+ * so a run that ends after unmount cannot leave one behind. Exported for
+ * tests.
+ */
+export class RerunTimers {
+  private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
+  private active = true;
+
+  /** Mount (`true`) / unmount (`false`); unmounting clears every timer. */
+  setActive(active: boolean): void {
+    this.active = active;
+    if (!active) {
+      for (const t of this.timers.values()) clearTimeout(t);
+      this.timers.clear();
+    }
+  }
+
+  get isActive(): boolean {
+    return this.active;
+  }
+
+  set(pageId: string, delayMs: number, fire: () => void): void {
+    if (!this.active) return;
+    this.cancel(pageId);
+    const timer = setTimeout(() => {
+      this.timers.delete(pageId);
+      fire();
+    }, delayMs);
+    this.timers.set(pageId, timer);
+  }
+
+  cancel(pageId: string): void {
+    const timer = this.timers.get(pageId);
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    this.timers.delete(pageId);
+  }
+}
+
+/** The hook's restore re-run wiring, extracted so it is driven by tests. */
+export interface RestoreRerunWiring {
+  queue: RestoreRerunQueue;
+  timers: RerunTimers;
+  /** Put `pageId` into the hook's `drainDeferredPages`: its next run MERGES. */
+  markMerging: (pageId: string) => void;
+  /** Re-run `pageId`'s restore; `merge` marks it a merging re-run. */
+  trigger: (pageId: string, merge: boolean) => void;
+}
+
+/** A run of `pageId` starts: its pending backoff retry is moot. See {@link RestoreRerunQueue.begin}. */
+export function beginRestoreRun(
+  w: RestoreRerunWiring,
+  pageId: string,
+): ReadonlySet<string> | undefined {
+  w.timers.cancel(pageId);
+  return w.queue.begin(pageId);
+}
+
+/** Merge `sessionIds` for a re-run of `pageId`, triggering it when no run is in flight. */
+export function scheduleRestoreRerun(
+  w: RestoreRerunWiring,
+  pageId: string,
+  sessionIds: readonly string[],
+): void {
+  // A page whose restore only ever aborted re-runs as its first restore
+  // (unless the aborted run was itself a merging one — it is then in
+  // `drainDeferredPages`, which makes the re-run merge however triggered).
+  if (w.queue.schedule(pageId, sessionIds)) w.trigger(pageId, w.queue.restoredOnce(pageId));
+}
+
+/**
+ * A run of `pageId` ended with `outcome`. An aborted merging re-run puts its
+ * page back into `drainDeferredPages`, so EVERY retry path — a schedule, an
+ * activation, the backoff timer — re-runs it merging. Then: one re-run now
+ * for ids scheduled meanwhile, or a backoff retry for the ids an abort still
+ * owes. The retry re-reads the queue when it fires: nothing owed (a run took
+ * them meanwhile), nothing runs; merging is decided then, not at scheduling.
+ * Once unmounted, nothing is scheduled.
+ */
+export function settleRestoreRun(
+  w: RestoreRerunWiring,
+  pageId: string,
+  outcome: RestoreRunOutcome,
+  wasMergingRun: boolean,
+): void {
+  if (outcome === "aborted" && wasMergingRun) w.markMerging(pageId);
+  const after = w.queue.finish(pageId, outcome);
+  if (after === null || !w.timers.isActive) return;
+  if (after === 0) {
+    w.trigger(pageId, true);
+    return;
+  }
+  w.timers.set(pageId, after, () => {
+    if (!w.queue.owes(pageId)) return;
+    w.trigger(pageId, w.queue.restoredOnce(pageId));
+  });
 }
 
 /** The restore set for a page, or the coord device drain's deferral of it. */
@@ -116,8 +520,9 @@ export async function fetchRestoreSet(
  * - Its `pageId` names NO live page (an ORPHAN — e.g. the hook-confirm path
  *   wrote its hardcoded "default" onto a layout whose default page was
  *   replaced) ⇒ adopted by the FIRST page to restore (`adoptOrphans`), but
- *   ONLY when the record classifies `auto-resume` (a confirmed, resumable
- *   provider session someone would actually miss). Unconfirmed shells and
+ *   ONLY when the record classifies `auto-resume` or `needs-account` (a
+ *   confirmed, resumable provider session someone would actually miss — the
+ *   latter waiting only for its account). Unconfirmed shells and
  *   quarantine-tier guesses are never adopted — restoring a stale agent
  *   shell into the operator's page would be noise, not recovery.
  *
@@ -136,7 +541,13 @@ export function recordBelongsToRestore(
   if (recPage === pageId) return true;
   if (!adoptOrphans) return false;
   if (knownPageIds.includes(recPage)) return false;
-  return classifyRestoreAction(rec) === "auto-resume";
+  // A confirmed resumable session whose ACCOUNT is unknown is adopted too: it
+  // is just as missed, and adopting it is what surfaces it for an account
+  // choice instead of leaving it on no page at all. The default home only
+  // decides between those two (an unknown home can make a dir needs-account),
+  // and both are adopted, so it is not needed here.
+  const action = classifyRestoreAction(rec, null);
+  return action === "auto-resume" || action === "needs-account";
 }
 
 /**
@@ -156,46 +567,41 @@ export function recordBelongsToRestore(
  * picker appears and the verification loop answers it
  * (`buildPickerAnswer`). Exported for unit tests.
  *
- * Autonomous resume (`--permission-mode bypassPermissions`, matching the
- * zone-profile + shell-integration resume builders): a boot-restored session
- * is unattended, so a bare `claude --resume` would stall forever on its first
- * permission prompt. Aligned with PR #547 — whichever lands second resolves
- * the textual conflict by keeping this union form.
+ * Every resume, for every provider, is RENDERED BY THE BACKEND
+ * (`build_ai_resume_command`), never assembled here. The backend owns the two decisions a typed resume must not
+ * get wrong: which `CLAUDE_CONFIG_DIR` the session runs under (a declared model
+ * gateway replaces the recorded subscription dir, so a subscription token can
+ * never ride a gateway-routed session) and the permission posture (bypass, or
+ * the operator's allow-list). The resume-summary env thresholds ride along
+ * under the default `"full"` policy.
  *
- * Phase 4 (provider-agnostic resume): the program + resume-flag SHAPE is
- * sourced from the provider descriptor's `resumeCommand` (so a future Gemini
- * record resumes via `gemini --resume <id>`, not a hardcoded `claude`); the
- * Claude-specific autonomous flag (`--permission-mode bypassPermissions`) and
- * the resume-summary env thresholds are applied ONLY when the resolved program
- * is Claude — they are CLI-specific and harmless to omit for other providers.
+ * A non-Claude provider is rendered there too (review N7): the backend
+ * applies the gateway's provider refusal and validates/quotes the session id.
  */
-export function buildResumeCmd(
+export async function buildResumeCmd(
   sessionId: string,
   configDir: string | undefined,
   policy: ResumeSummaryPolicy = getResumeSummaryPolicy(),
   provider?: string,
-): string {
-  // Adapter-supplied resume shape, e.g. ["claude","--resume",id] /
-  // ["gemini","--resume",id]. The descriptor owns the program + flags so the
-  // boot restore is not Claude-hardcoded.
-  const argv = providerDescriptorFor(provider).resumeCommand(sessionId);
-  const program = argv[0];
-  const isClaude = program === "claude";
-  const base = isClaude
-    ? `claude --permission-mode bypassPermissions --resume ${sessionId}`
-    : argv.join(" ");
-  const env: Array<[string, string]> = [];
-  if (configDir && isClaude) env.push(["CLAUDE_CONFIG_DIR", configDir]);
-  if (isClaude && policy === "full") {
-    env.push(["CLAUDE_CODE_RESUME_TOKEN_THRESHOLD", "999999999"]);
-    env.push(["CLAUDE_CODE_RESUME_THRESHOLD_MINUTES", "999999999"]);
-  }
-  if (env.length === 0) return `${base}\r`;
+): Promise<string> {
+  // Every provider is rendered by the backend (review N7): a provider that
+  // cannot route through a declared model gateway is refused there, and the
+  // session id is validated/quoted there — never assembled here.
+  const resumeProvider = provider ?? "claude";
   const isWindows =
     typeof navigator !== "undefined" && (navigator.platform ?? "").startsWith("Win");
-  return isWindows
-    ? `${env.map(([k, v]) => `$env:${k}="${v}"; `).join("")}${base}\r`
-    : `${env.map(([k, v]) => `${k}="${v}" `).join("")}${base}\r`;
+  const resp = await invoke<CommandResponse>("build_ai_resume_command", {
+    sessionId,
+    provider: resumeProvider,
+    configDir: configDir ?? null,
+    isWindows,
+    fullResume: policy === "full",
+  });
+  const command = (resp?.data as { command?: string } | null | undefined)?.command;
+  if (!resp?.success || !command) {
+    throw new Error(resp?.message ?? "build_ai_resume_command returned no command");
+  }
+  return `${command}\r`;
 }
 
 /**
@@ -234,6 +640,8 @@ export async function runVerifiedResume(params: {
    */
   recordOpen?: SessionOpenArgs;
   verifyOptions?: TypeAndVerifyOptions;
+  /** Injectable for tests: the default Claude home (see `defaultConfigHome.ts`). */
+  defaultConfigHome?: () => Promise<string | null>;
 }): Promise<ResumeOutcome> {
   const {
     terminalRefs,
@@ -246,7 +654,26 @@ export async function runVerifiedResume(params: {
     verifyOptions,
   } = params;
   const policy = getResumeSummaryPolicy();
-  const resumeCmd = buildResumeCmd(claudeSessionId, configDir, policy, provider);
+  // THE choke point every typed resume goes through: the default home is never
+  // typed as `CLAUDE_CONFIG_DIR` (it would swap `~/.claude.json` for
+  // `~/.claude/.claude.json`). Records keep the explicit path.
+  const home = await (params.defaultConfigHome ?? loadDefaultConfigHome)();
+  let resumeCmd: string;
+  try {
+    resumeCmd = await buildResumeCmd(
+      claudeSessionId,
+      typedConfigDir(configDir, home),
+      policy,
+      provider,
+    );
+  } catch (err) {
+    // The backend refused to render a resume (e.g. an unresolved model
+    // gateway). Type nothing; park the tab for an explicit retry and keep the
+    // restore-pending marker, exactly like an unverified resume.
+    console.warn(`[TerminalPage] resume not rendered for ${claudeSessionId}:`, err);
+    updateTab(tabId, { isReconnecting: false, resumeFailed: true });
+    return "failed";
+  }
   // Per-adapter handshake patterns (Phase 4): the verification loop matches the
   // resume success/failure against the descriptor's patterns instead of the
   // Claude-hardcoded sets, so a future Gemini resume verifies against Gemini's
@@ -489,6 +916,28 @@ export function decideColdResume(
 }
 
 /**
+ * The live reconnected tab a record re-attaches to on a React remount (restore
+ * branch (a)), or `null` when it has none.
+ *
+ * A record held for an account choice (`awaitingAccountSince` set) has NO pane
+ * by design: the backend detaches its terminal when it holds it, because its
+ * old terminal id may already host another session. Matching it by
+ * `terminalId` would stamp that live tab with the held session's id, so a held
+ * record never reconnects — whatever `terminalId` it carries. A blank
+ * `terminalId` (unbound) names no tab either.
+ *
+ * Pure + exported for direct unit tests.
+ */
+export function reconnectedTabFor(
+  rec: Pick<TerminalSessionRecord, "terminalId" | "awaitingAccountSince">,
+  reconnectedTabIds: ReadonlySet<string>,
+): string | null {
+  if (rec.awaitingAccountSince != null) return null;
+  if (!rec.terminalId.trim()) return null;
+  return reconnectedTabIds.has(rec.terminalId) ? rec.terminalId : null;
+}
+
+/**
  * What a DRAIN-TIME skip must do to the record + tab it is walking away from.
  *
  * ## THE DEFECT (the loop's oldest, and the reason this is a pure function)
@@ -677,6 +1126,16 @@ function isValidSessionId(id: string): boolean {
  *   restore, identical to any other unresumable row.
  * - `"skip-invalid"`: the recorded id fails shell-safety validation — never
  *   typed, nothing actionable.
+ * - `"needs-account"`: a Claude record that would otherwise auto-resume, but
+ *   whose ACCOUNT cannot be established (see {@link resolveRestoreAccount}):
+ *   its recorded `configDir` was rejected by `sanitizeConfigDir`, or may be
+ *   the default home while that home is unreadable, or it has none and zero /
+ *   several config dirs hold its transcript. NOT auto-resumed
+ *   — a `--resume` under a guessed (default) account fails with "No
+ *   conversation found", which reads exactly like a session that never
+ *   existed. The hook surfaces it instead (`needsAccountRecords`) for the
+ *   operator to resume under a chosen account (plan
+ *   `2026-10-04-runner-session-roster-restore-picker`, Phase 3).
  *
  * The auto-resume GATE lives here on the frontend as
  * `(origin === "authoritative" || origin === "observed") && confirmed &&
@@ -689,13 +1148,185 @@ function isValidSessionId(id: string): boolean {
  * (cold boot, no live process) still can't be auto-resumed. Pure + exported so
  * the gate is unit-testable without React.
  */
-export type RestoreAction = "auto-resume" | "terminal-only" | "skip-invalid";
+export type RestoreAction = "auto-resume" | "terminal-only" | "skip-invalid" | "needs-account";
+
+/** Why a record's account could not be established. */
+export type NeedsAccountReason =
+  /** The recorded (or the transcript-located) config dir failed `sanitizeConfigDir`. */
+  | "config-dir-rejected"
+  /** The default home is unreadable and the recorded dir may be it — never typed on a guess. */
+  | "default-home-unknown"
+  /** No recorded dir, and no config dir holds the transcript. */
+  | "no-transcript-holder"
+  /** No recorded dir, and SEVERAL config dirs hold the transcript. */
+  | "ambiguous-transcript"
+  /** No recorded dir, and the backend did not probe where the transcript lives. */
+  | "transcript-unprobed";
+
+/**
+ * The account a restore resumes under, resolved from evidence:
+ * - `resolved` — the recorded `configDir`, else the UNIQUE config dir holding
+ *   the transcript. `recordDir` is the explicit path the REGISTRY record keeps
+ *   (`undefined` only when no path is known at all); `typedDir` is what the
+ *   resume types as `CLAUDE_CONFIG_DIR` and what the tab carries — `undefined`
+ *   for the default home (`~/.claude`), see `resolveAccountDir`;
+ * - `unknown` — the account cannot be named: the evidence says so, or there is
+ *   none at all (no recorded dir AND no transcript probe). A resume under the
+ *   default account in that case is a guess, and a wrong guess fails as "No
+ *   conversation found" — so it is asked, never assumed.
+ */
+export type RestoreAccount =
+  | { kind: "resolved"; recordDir: string | undefined; typedDir: string | undefined }
+  | { kind: "unknown"; reason: NeedsAccountReason };
+
+type RestoreAccountFields = Pick<
+  TerminalSessionRecord,
+  "configDir" | "transcriptConfigDir" | "transcriptConfigDirCount" | "transcriptConfigDirIsDefault"
+>;
+
+/**
+ * Resolve a record's account: recorded `configDir` first, then a unique
+ * `transcriptConfigDir`. The same order as the Rust
+ * `session_ledger::resolve_config_dir`, which builds every copy-able resume
+ * line. A recorded dir goes through `resolveAccountDir` against the default
+ * home `home` (`null` = unreadable). Pure + exported for unit tests.
+ */
+export function resolveRestoreAccount(
+  rec: RestoreAccountFields,
+  home: string | null,
+): RestoreAccount {
+  const recorded = rec.configDir?.trim();
+  if (recorded) {
+    const dir = resolveAccountDir(recorded, home);
+    return dir.kind === "resolved"
+      ? { kind: "resolved", recordDir: dir.recordDir, typedDir: dir.typedDir }
+      : { kind: "unknown", reason: dir.reason };
+  }
+  const holders = rec.transcriptConfigDirCount;
+  if (holders === undefined) return { kind: "unknown", reason: "transcript-unprobed" };
+  if (holders === 0) return { kind: "unknown", reason: "no-transcript-holder" };
+  if (holders > 1) return { kind: "unknown", reason: "ambiguous-transcript" };
+  const transcriptDir = rec.transcriptConfigDir?.trim() || undefined;
+  // The backend judged the holder to be the default home: never typed, so it
+  // needs no shell-safety check.
+  if (rec.transcriptConfigDirIsDefault === true) {
+    return { kind: "resolved", recordDir: transcriptDir, typedDir: undefined };
+  }
+  const located = sanitizeConfigDir(transcriptDir);
+  return located
+    ? { kind: "resolved", recordDir: located, typedDir: located }
+    : { kind: "unknown", reason: "config-dir-rejected" };
+}
+
+/**
+ * The restored tab's name: THE display-name rule (`displayNameOf`, mirroring
+ * Rust `session_ledger::display_name`) — an operator-chosen `/rename` name
+ * wins, a `derived` auto-name falls back behind the tab title. Not the bare
+ * `title`, which is just `"claude"` for about half of all rows.
+ */
+export function restoreTabName(
+  rec: Pick<TerminalSessionRecord, "claudeSessionId" | "sessionName" | "nameSource" | "title">,
+): string {
+  return displayNameOf({
+    claudeSessionId: rec.claudeSessionId,
+    sessionName: rec.sessionName ?? null,
+    nameSource: rec.nameSource ?? null,
+    title: rec.title ?? null,
+  });
+}
+
+/** A restore candidate the boot restore did NOT resume because its account is unknown. */
+export interface NeedsAccountRecord {
+  record: TerminalSessionRecord;
+  reason: NeedsAccountReason;
+}
+
+/**
+ * Hold a `needs-account` record for an account choice — but NEVER a session a
+ * live Claude process already hosts. Holding marks the row awaiting-account,
+ * which DETACHES it from its terminal; doing that to a live session would cut
+ * it off its own pane. So the same liveness gate the cold auto-resume path
+ * uses runs first, and only a `"respawn"` verdict (registry read, id not live)
+ * lets the hold through. `"skip-alive"` leaves the row untouched and surfaces
+ * nothing. `"skip-unknown"` (registry unreadable) still SURFACES the record for
+ * an account choice but does not re-mark it: the boot hold may already have
+ * held it, and hiding it would leave a held row with no chooser until the hold
+ * ages out. Not marking can detach nothing; its cost is that a row no earlier
+ * hold covers may be closed `no-terminal` by the liveness poll and so miss the
+ * NEXT boot's restore set (this boot's chooser still lists it).
+ *
+ * Returns the liveness decision. Pure wiring with injected effects, exported
+ * so the gate — not just `decideColdResume` — is unit-testable.
+ */
+export async function holdNeedsAccountIfNotLive(params: {
+  entry: NeedsAccountRecord;
+  getLiveSessionIds: () => Promise<ReadonlySet<string> | null>;
+  noteNeedsAccount: (entry: NeedsAccountRecord, opts: { mark: boolean }) => void;
+}): Promise<ColdResumeDecision> {
+  const { entry } = params;
+  const decision = decideColdResume(await params.getLiveSessionIds(), entry.record.claudeSessionId);
+  if (decision === "skip-alive") {
+    console.warn(
+      `[TerminalPage] not holding needs-account session ${entry.record.claudeSessionId}: ` +
+        "a live Claude process already hosts this id",
+    );
+    return decision;
+  }
+  if (decision === "skip-unknown") {
+    console.warn(
+      `[TerminalPage] live-session registry unreadable — surfacing needs-account session ` +
+        `${entry.record.claudeSessionId} without re-marking it`,
+    );
+    params.noteNeedsAccount(entry, { mark: false });
+    return decision;
+  }
+  params.noteNeedsAccount(entry, { mark: true });
+  return decision;
+}
+
+/**
+ * Record a `needs-account` entry for the account chooser and, only when
+ * `mark` is set, ask the backend to hold its registry row awaiting an account
+ * (`terminal_session_mark_awaiting_account`: stamps the hold and DETACHES the
+ * row from its terminal, keeping it open and on the roster instead of being
+ * closed `no-terminal` by the liveness poll; the backend declines a row bound
+ * to a live PTY, ignores a closed or finished row, and keeps a running
+ * hold's stamp on a re-mark (an expired stamp is re-stamped)). With
+ * `mark: false` the row is left untouched. Effects
+ * injected so the suppression is unit-testable.
+ */
+export function applyNeedsAccountNote(
+  entry: NeedsAccountRecord,
+  opts: { mark: boolean },
+  effects: {
+    setRecords: (update: (prev: NeedsAccountRecord[]) => NeedsAccountRecord[]) => void;
+    invoke: (cmd: string, args: Record<string, unknown>) => Promise<unknown>;
+  },
+): void {
+  effects.setRecords((prev) => [
+    ...prev.filter((e) => e.record.claudeSessionId !== entry.record.claudeSessionId),
+    entry,
+  ]);
+  if (!opts.mark) return;
+  effects
+    .invoke("terminal_session_mark_awaiting_account", {
+      claudeSessionId: entry.record.claudeSessionId,
+    })
+    .catch((err) =>
+      console.warn(
+        `[TerminalPage] could not hold needs-account session ${entry.record.claudeSessionId}:`,
+        err,
+      ),
+    );
+}
 
 export function classifyRestoreAction(
   rec: Pick<
     TerminalSessionRecord,
     "claudeSessionId" | "origin" | "confirmedAt" | "provider" | "transcriptExists"
-  >,
+  > &
+    RestoreAccountFields,
+  home: string | null,
 ): RestoreAction {
   if (!isValidSessionId(rec.claudeSessionId)) return "skip-invalid";
   if (rec.origin === "authoritative" || rec.origin === "observed") {
@@ -719,9 +1350,14 @@ export function classifyRestoreAction(
     // re-open the terminal but not the chat, so a CONFIRMED row of that provider
     // restores terminal-only (honest "fresh conversation"), never a resume typed
     // against an id the provider can't resume by `--resume`.
-    return providerDescriptorFor(rec.provider).restoreTier() === "full"
-      ? "auto-resume"
-      : "terminal-only";
+    const descriptor = providerDescriptorFor(rec.provider);
+    if (descriptor.restoreTier() !== "full") return "terminal-only";
+    // The account gate (Claude only — the account is Claude's
+    // `CLAUDE_CONFIG_DIR`): a resume under a guessed account is refused.
+    if (descriptor.provider === "claude" && resolveRestoreAccount(rec, home).kind === "unknown") {
+      return "needs-account";
+    }
+    return "auto-resume";
   }
   // Reconciled / pre-field origin: a backstop guess that can name a foreign
   // session — not strong enough to act on. Restore the terminal only, same as
@@ -736,13 +1372,6 @@ export function classifyRestoreAction(
  */
 export function isWorkerRecord(rec: Pick<TerminalSessionRecord, "taskRunId">): boolean {
   return typeof rec.taskRunId === "string" && rec.taskRunId.length > 0;
-}
-
-/** Validate config dir paths — reject shell metacharacters. */
-const SAFE_PATH_RE = /^[a-zA-Z0-9_\-./\\: ]+$/;
-function sanitizeConfigDir(dir: string | undefined): string | undefined {
-  if (!dir) return undefined;
-  return SAFE_PATH_RE.test(dir) ? dir : undefined;
 }
 
 interface UseTerminalInitializationParams {
@@ -783,6 +1412,7 @@ interface UseTerminalInitializationParams {
     updates: Partial<{
       claudeSessionId?: string;
       claudeConfigDir?: string;
+      claudeRecordConfigDir?: string;
       isReconnecting?: boolean;
       resumeFailed?: boolean;
       restoreTerminalOnly?: boolean;
@@ -790,10 +1420,15 @@ interface UseTerminalInitializationParams {
   ) => void;
   zoneLayout: {
     layoutId: string;
-    setLayoutId: (id: string) => void;
-    assignTabToZone: (zoneIdx: number, tabId: string) => void;
+    setLayoutId: (id: string, request: { source: LayoutRequestSource }) => void;
+    /**
+     * Place a restored session at its recorded GRID zone — into the grid in
+     * grid mode, into the grid snapshot in tmux mode (never onto the screen).
+     */
+    placeRestoredTab: (zoneIdx: number, tabId: string) => void;
     setFocusedZone: (zoneIdx: number) => void;
-    assignments: Record<number, string>;
+    /** The grid's assignments — the snapshot's in tmux mode (`useZoneLayout().gridView`). */
+    gridView: { assignments: Record<number, string> };
   };
   labelsAndTags: {
     setZoneLabel: (zoneIdx: number, label: string) => void;
@@ -828,8 +1463,10 @@ interface UseTerminalInitializationParams {
     clearSavedLayout: () => void;
     hasSavedLayout: () => boolean;
   };
+  /** The grid as persisted: `useZoneLayout().gridView` plus the zone cosmetics. */
   layoutState: {
     layoutId: string;
+    assignments: Record<number, string>;
     zoneLabels: Record<number, string>;
     zoneNotes: Record<number, string>;
     pinnedZones: Set<number>;
@@ -918,6 +1555,18 @@ export function useTerminalInitialization({
   // auto-save runs in the single page instance for whichever page is active.
   const restoreCompletePages = useRef<Set<string>>(new Set());
 
+  // Restore candidates NOT resumed because their account is unknown
+  // (`needs-account`), keyed by `claudeSessionId` so a page's re-run never
+  // lists one twice. Returned from the hook for the "Since restart" panel to
+  // offer an account chooser. See `applyNeedsAccountNote` for what happens to
+  // the registry row on each path.
+  const [needsAccountRecords, setNeedsAccountRecords] = useState<NeedsAccountRecord[]>([]);
+  const noteNeedsAccount = useCallback(
+    (entry: NeedsAccountRecord, opts: { mark: boolean }) =>
+      applyNeedsAccountNote(entry, opts, { setRecords: setNeedsAccountRecords, invoke }),
+    [],
+  );
+
   // Coord device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
   // Phase 3): bumped each time autonomous spawns become allowed again. The init
   // effect below depends on it, so a restore the drain deferred (which released
@@ -932,6 +1581,23 @@ export function useTerminalInitialization({
   // Pages whose restore the drain deferred, so their re-run merges into the
   // tabs that exist by then instead of re-laying the page out.
   const drainDeferredPages = useRef<Set<string>>(new Set());
+
+  // The two page sets above, PUBLISHED as state for the "Since restart" strip
+  // (plan `2026-10-04-runner-session-roster-restore-picker`, Phase 4): it
+  // speaks only once every page holding a prior-ledger row has settled, which
+  // is this per-page completion — never the boot census latch, which runs
+  // before any restore. A new Set identity is published only when a page's
+  // status actually moves.
+  const [publishedCompletePages, setPublishedCompletePages] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const [publishedDeferredPages, setPublishedDeferredPages] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const publishRestorePages = useCallback(() => {
+    setPublishedCompletePages(new Set(restoreCompletePages.current));
+    setPublishedDeferredPages(new Set(drainDeferredPages.current));
+  }, []);
   // Live tabs, for the re-run's "already open" check (the init effect does not
   // re-run on every tab change, so it cannot close over `tabs`).
   const liveTabsRef = useRef(tabs);
@@ -939,6 +1605,64 @@ export function useTerminalInitialization({
     liveTabsRef.current = tabs;
   }, [tabs]);
   const [drainResumeEpoch, setDrainResumeEpoch] = useState(0);
+  // Sessions a restore refused as "live" BEFORE the PTY-holder boot sweep
+  // settled, which the sweep's settle then showed to be resumable (see
+  // `recheckRefusedAfterSweep`), per page, and the page runs in flight. A
+  // re-run triggered for them (the same epoch bump as a drain re-run)
+  // restores exactly these records — one run per page at a time.
+  // Sessions a run is creating a tab for right now.
+  const coldResumeGuard = useRef(new ColdResumeGuard());
+  // Re-run `forPage`'s restore: merging into its live tabs (`merge`, like a
+  // drain re-run), or — retrying an aborted first restore — as that restore.
+  const triggerRerun = useCallback((forPage: string, merge = true) => {
+    if (merge) drainDeferredPages.current.add(forPage);
+    didInitPages.current.delete(forPage);
+    setDrainResumeEpoch((n) => n + 1);
+  }, []);
+  // The re-run queue, an aborted restore's backoff retries (review V1) and
+  // how they trigger a re-run. Stable for the hook's lifetime.
+  const [rerun] = useState<RestoreRerunWiring>(() => ({
+    queue: new RestoreRerunQueue(),
+    timers: new RerunTimers(),
+    markMerging: (forPage) => drainDeferredPages.current.add(forPage),
+    trigger: triggerRerun,
+  }));
+  // Active while mounted (re-armed on a StrictMode re-mount); unmounting
+  // clears the timers and stops a run that ends later from scheduling one.
+  useEffect(() => {
+    rerun.timers.setActive(true);
+    return () => rerun.timers.setActive(false);
+  }, [rerun]);
+  // Re-run the restore of `forPage` (merging, like a drain re-run) for
+  // exactly `sessionIds` — after a late sweep settle, or a session a dead
+  // holder handed back. The active page re-runs now (or when its run in
+  // flight ends); another page when it is next activated.
+  const scheduleRecheckRerun = useCallback(
+    (forPage: string, sessionIds: string[]) => {
+      scheduleRestoreRerun(rerun, forPage, sessionIds);
+    },
+    [rerun],
+  );
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    void listen<HolderSessionReleased>(HOLDER_SESSION_RELEASED_EVENT, (event) => {
+      // Broadcast to every window: only the one that restores the page acts.
+      const releasedPage = event.payload.pageId ?? "default";
+      if (!ownsReleasedPage(releasedPage, readPinnedPageId(), getPageBindings())) return;
+      console.warn(
+        `[TerminalPage] a PTY holder died before adoption; re-deciding session ${event.payload.sessionId}`,
+      );
+      void onHolderSessionReleased(event.payload, scheduleRecheckRerun);
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [scheduleRecheckRerun]);
   useEffect(
     () =>
       subscribeCoordDrainState(
@@ -964,6 +1688,17 @@ export function useTerminalInitialization({
     // same finally / drain timer.
     const isDrainRerun = drainDeferredPages.current.delete(initPageId);
     if (isDrainRerun) restoreCompletePages.current.delete(initPageId);
+    // A re-run for the holder sweep's late settle restores only these. Ids
+    // scheduled while this run is in flight wait for its end.
+    const recheckOnly = beginRestoreRun(rerun, initPageId);
+    // Sessions this run claimed for a cold resume; released when it ends.
+    const coldClaims: string[] = [];
+    // The drain withheld the restore set: this run restored nothing.
+    let restoreDeferred = false;
+    // Sessions THIS run refuses as live while the sweep is unsettled, and
+    // sessions it holds back because their pane is still being adopted.
+    const refusedWhileSweeping: string[] = [];
+    const heldBackWhileSweeping: string[] = [];
 
     // Per-page restore queue (Phase 3): local to this page's init run so a
     // second page initializing before this one's drain timer fires can't see
@@ -981,6 +1716,8 @@ export function useTerminalInitialization({
     }> = [];
 
     (async () => {
+      // A drain re-run moved this page out of both sets above.
+      if (isDrainRerun) publishRestorePages();
       // True once a deferred resume/scrollback drain timer is scheduled. When
       // set, that timer owns flipping the per-page restore-complete gate (after
       // it issues the resume commands); the `finally` below only opens the gate
@@ -1004,6 +1741,16 @@ export function useTerminalInitialization({
         //    generation per pass. Abort instead: leave the page as-is and let
         //    the next activation retry. (Same null-awareness as the plan-tab
         //    cold-start check in step 4 below.)
+        // Holder panes that survived the last runner exit are adopted by the
+        // runner's boot sweep. Learn its census first (seconds, not the whole
+        // sweep): every record whose pane is NOT held is restored now; the
+        // held ones wait for the sweep (review round 4, M1). Without a census
+        // — or on a re-run for its late settle — fall back to the full wait.
+        const sweepStatus = recheckOnly
+          ? { settled: await waitForHolderSweep(), held: new Set<string>() }
+          : await fetchHolderSweepStatus();
+        const holderSweepSettled =
+          sweepStatus.held === null ? await waitForHolderSweep() : sweepStatus.settled;
         const reconnectDecision = decideReconnectOutcome(await reconnectToExistingSessions());
         if (reconnectDecision.kind === "abort-restore") {
           restoreAborted = true;
@@ -1043,6 +1790,7 @@ export function useTerminalInitialization({
           // once-per-page guard and the orphan-adoption claim are released so
           // the restore re-runs — merging, not re-laying out — when
           // `drainResumeEpoch` moves.
+          restoreDeferred = true;
           drainDeferredPages.current.add(initPageId);
           didInitPages.current.delete(initPageId);
           if (adoptOrphans) didClaimOrphanAdoption.current = false;
@@ -1053,6 +1801,9 @@ export function useTerminalInitialization({
           return;
         }
         const openRecords = restoreSet.records;
+        // The default Claude home, for the account rule (`resolveAccountDir`):
+        // `null` = unreadable, which makes a dir that may be it needs-account.
+        const defaultHome = await loadDefaultConfigHome();
 
         // P1 defect (b): before ANY cold `claude --resume`, read which session
         // ids are ALREADY hosted by a live Claude process (Claude Code's own
@@ -1113,7 +1864,7 @@ export function useTerminalInitialization({
             saved.layoutId === FLOW_GRID_ID ||
             LAYOUT_PRESETS.some((p) => p.id === saved.layoutId)
           ) {
-            zoneLayout.setLayoutId(saved.layoutId);
+            zoneLayout.setLayoutId(saved.layoutId, { source: "restore" });
           }
         }
 
@@ -1121,7 +1872,19 @@ export function useTerminalInitialization({
         //    are claimed from records FIRST so the creation-order auto-fill in
         //    `useZoneLayout` can never steal a zone a record owns (it only fills
         //    zones still empty after this loop runs).
+        const { heldBack } = splitRestoreByHold(openRecords, {
+          settled: holderSweepSettled,
+          held: sweepStatus.held,
+        });
+        const heldBackIds = new Set(heldBack.map((r) => r.terminalId));
+        for (const r of heldBack) heldBackWhileSweeping.push(r.claudeSessionId);
         for (const [recIndex, rec] of openRecords.entries()) {
+          // A re-run for the holder sweep's late settle restores ONLY the
+          // sessions that settle showed resumable.
+          if (recheckOnly && !recheckOnly.has(rec.claudeSessionId)) continue;
+          // Its holder pane is still being adopted: it comes back as that
+          // tab, or through the re-run once the sweep settles.
+          if (heldBackIds.has(rec.terminalId)) continue;
           // A Conductor worker (Phase 2b): no PTY exists or should exist for
           // it. Adopt the record as a `sessionBacked` tab and let
           // `reconcileAssignments` place it — every worker record is written
@@ -1132,23 +1895,38 @@ export function useTerminalInitialization({
             adoptWorkerTab(rec);
             continue;
           }
-          const safeConfigDir = sanitizeConfigDir(rec.configDir);
-          const restoreAction = classifyRestoreAction(rec);
+          const account = resolveRestoreAccount(rec, defaultHome);
+          // What the tab, the last-known id and the typed resume carry — never
+          // the default home's explicit path (that goes to the record only).
+          const typedDir = account.kind === "resolved" ? account.typedDir : undefined;
+          // The explicit path, for the registry record only (a Retry's too).
+          const recordDir = account.kind === "resolved" ? account.recordDir : undefined;
+          const restoreAction = classifyRestoreAction(rec, defaultHome);
 
           // a) A live reconnected PTY is already running this session (React
           //    remount): match by the record's stable terminalId. Just rebind
-          //    the zone + re-attach the claudeSessionId; no resume needed.
-          if (reconnectedSet.has(rec.terminalId)) {
-            const tabId = rec.terminalId;
-            if (mayClaimRecordedZone(isDrainRerun, rec.zoneIndex, tabId, zoneLayout.assignments)) {
-              zoneLayout.assignTabToZone(rec.zoneIndex, tabId);
+          //    the zone + re-attach the claudeSessionId; no resume needed. A
+          //    record held for an account choice has no pane and never matches.
+          const reconnectedTabId = reconnectedTabFor(rec, reconnectedSet);
+          if (reconnectedTabId !== null) {
+            const tabId = reconnectedTabId;
+            if (
+              mayClaimRecordedZone(
+                isDrainRerun,
+                rec.zoneIndex,
+                tabId,
+                zoneLayout.gridView.assignments,
+              )
+            ) {
+              zoneLayout.placeRestoredTab(rec.zoneIndex, tabId);
               applyZoneCosmetics(rec.zoneIndex);
             }
             updateTab(tabId, {
               claudeSessionId: rec.claudeSessionId,
-              claudeConfigDir: safeConfigDir,
+              claudeConfigDir: typedDir,
+              claudeRecordConfigDir: recordDir,
             });
-            rememberSessionId(tabId, rec.claudeSessionId, safeConfigDir);
+            rememberSessionId(tabId, rec.claudeSessionId, typedDir);
             continue;
           }
 
@@ -1167,6 +1945,9 @@ export function useTerminalInitialization({
           // the transcript.
           if (restoreAction === "auto-resume") {
             const resumeDecision = decideColdResume(await getLiveSessionIds(), rec.claudeSessionId);
+            if (resumeDecision === "skip-alive" && !holderSweepSettled) {
+              refusedWhileSweeping.push(rec.claudeSessionId);
+            }
             if (resumeDecision !== "respawn") {
               console.warn(
                 `[TerminalPage] skipping cold respawn for session ${rec.claudeSessionId}: ` +
@@ -1176,6 +1957,25 @@ export function useTerminalInitialization({
               );
               continue;
             }
+          }
+
+          // An unknown account is never guessed: no pane, no resume, the
+          // registry row untouched (like the skip-alive branch above). The
+          // hook surfaces the record for an account choice instead.
+          if (restoreAction === "needs-account") {
+            if (account.kind === "unknown") {
+              console.warn(
+                `[TerminalPage] not resuming session ${rec.claudeSessionId}: account unknown ` +
+                  `(${account.reason}) — a resume under a guessed account fails as "No conversation found"`,
+              );
+              // Never hold (and so detach) a session that is alive.
+              await holdNeedsAccountIfNotLive({
+                entry: { record: rec, reason: account.reason },
+                getLiveSessionIds,
+                noteNeedsAccount,
+              });
+            }
+            continue;
           }
 
           // A drain re-run never duplicates a session a live tab already shows.
@@ -1195,7 +1995,11 @@ export function useTerminalInitialization({
           // The source names this restore in the resource-guard dialog. `queued`
           // counts the records still ahead, this one included — an upper bound,
           // since reconnected and live records ahead will be skipped.
-          const tabId = await createTerminal(rec.title, rec.workingDir, undefined, {
+          // Another run in flight is already creating this session's tab.
+          if (!coldResumeGuard.current.tryClaim(rec.claudeSessionId)) continue;
+          coldClaims.push(rec.claudeSessionId);
+          const tabName = restoreTabName(rec);
+          const tabId = await createTerminal(tabName, rec.workingDir, undefined, {
             label: "session restore",
             queued: openRecords.length - recIndex,
           });
@@ -1213,13 +2017,21 @@ export function useTerminalInitialization({
           // `runVerifiedResume`). What is NOT done is re-asserting the record
           // from here: that refreshes `last_seen_at` and is what made ghost
           // rows immortal.
-          if (mayClaimRecordedZone(isDrainRerun, rec.zoneIndex, tabId, zoneLayout.assignments)) {
-            zoneLayout.assignTabToZone(rec.zoneIndex, tabId);
+          if (
+            mayClaimRecordedZone(
+              isDrainRerun,
+              rec.zoneIndex,
+              tabId,
+              zoneLayout.gridView.assignments,
+            )
+          ) {
+            zoneLayout.placeRestoredTab(rec.zoneIndex, tabId);
             applyZoneCosmetics(rec.zoneIndex);
           }
           updateTab(tabId, {
             claudeSessionId: rec.claudeSessionId,
-            claudeConfigDir: safeConfigDir,
+            claudeConfigDir: typedDir,
+            claudeRecordConfigDir: recordDir,
             // Show a "resuming" affordance until the resume lands; cleared in
             // the drain loop after the resume command is written. Phase 4:
             // CONFIRMED authoritative rows of a FULL-tier provider auto-resume
@@ -1241,7 +2053,7 @@ export function useTerminalInitialization({
             // the honest, clutter-free outcome.
             restoreTerminalOnly: restoreAction === "terminal-only" && rec.confirmedAt != null,
           });
-          rememberSessionId(tabId, rec.claudeSessionId, safeConfigDir);
+          rememberSessionId(tabId, rec.claudeSessionId, typedDir);
 
           // Re-point the record at the tab we JUST created for it.
           //
@@ -1286,6 +2098,7 @@ export function useTerminalInitialization({
             // the poll once it sees the session confidently alive).
             invoke("terminal_session_mark_restore_pending", {
               claudeSessionId: rec.claudeSessionId,
+              boot: true,
             }).catch((err) => {
               console.warn(
                 `[TerminalPage] mark restore-pending failed for ${rec.claudeSessionId}:`,
@@ -1304,7 +2117,7 @@ export function useTerminalInitialization({
                 rec.zoneIndex >= 0 ? cosmeticsByZone.get(rec.zoneIndex)?.scrollbackPath : undefined,
               isClaudeSession: restoreAction === "auto-resume",
               claudeSessionId: rec.claudeSessionId,
-              claudeConfigDir: safeConfigDir,
+              claudeConfigDir: typedDir,
               // Provider drives the adapter-supplied resume command + handshake
               // patterns (Phase 4) — defaults to "claude" on pre-provider rows.
               provider: rec.provider,
@@ -1315,11 +2128,16 @@ export function useTerminalInitialization({
                 restoreAction === "auto-resume"
                   ? {
                       claudeSessionId: rec.claudeSessionId,
-                      configDir: rec.configDir,
+                      // The RESOLVED account's explicit path (the default
+                      // home's too), so a record whose dir came from
+                      // transcript evidence carries it from now on.
+                      configDir: recordDir,
                       workingDir: rec.workingDir,
                       pageId,
                       zoneIndex: rec.zoneIndex,
-                      title: rec.title,
+                      // Re-assert the name the tab now shows, not the bare
+                      // `"claude"` label the row may carry.
+                      title: tabName,
                       terminalId: tabId,
                     }
                   : undefined,
@@ -1339,7 +2157,7 @@ export function useTerminalInitialization({
             if (session.type !== "plan" || !session.planFilePath) continue;
             const tabId = createPlanTab(session.planFilePath);
             if (tabId && session.zoneIndex >= 0) {
-              zoneLayout.assignTabToZone(session.zoneIndex, tabId);
+              zoneLayout.placeRestoredTab(session.zoneIndex, tabId);
               applyZoneCosmetics(session.zoneIndex);
             }
           }
@@ -1461,6 +2279,7 @@ export function useTerminalInitialization({
               // Restored tabs now carry their claudeSessionId / scrollback —
               // safe to let the debounced auto-save persist this page's layout.
               restoreCompletePages.current.add(initPageId);
+              publishRestorePages();
             }
           }, 1500);
         }
@@ -1490,6 +2309,8 @@ export function useTerminalInitialization({
         if (!drainScheduled && !restoreAborted) {
           restoreCompletePages.current.add(initPageId);
         }
+        // Publishes the deferral too (set before the early return above).
+        publishRestorePages();
         // ALWAYS leave the loading state, even if restore threw. `initialized`
         // gates the whole page behind a "Loading terminals..." spinner, and the
         // once-per-pageId guard above has already consumed `initPageId` — so a
@@ -1499,11 +2320,40 @@ export function useTerminalInitialization({
         // fewer tabs than expected" (recoverable, and the console carries the
         // cause) instead of a permanently blank window.
         setInitialized(true);
+        // The PTY-holder boot sweep had not settled, and this run refused
+        // some sessions as live or held some back for an adoption in flight:
+        // once it settles, re-run the restore (merging, like a drain re-run)
+        // for the held-back ones and the refused ones no longer hosted live.
+        if (refusedWhileSweeping.length > 0 || heldBackWhileSweeping.length > 0) {
+          void recheckRefusedAfterSweep(
+            refusedWhileSweeping,
+            fetchLiveClaudeSessionIds,
+            heldBackWhileSweeping,
+          ).then((resumable) => {
+            if (resumable.length === 0) return;
+            console.warn(
+              `[TerminalPage] the holder sweep settled late; resuming ${resumable.length} ` +
+                `session(s) it had kept from a cold resume`,
+            );
+            scheduleRecheckRerun(initPageId, resumable);
+          });
+        }
+        for (const id of coldClaims) coldResumeGuard.current.release(id);
+        // Re-runs scheduled while this run was in flight: one, now — or,
+        // after an abort, a bounded retry for the ids it still owes.
+        settleRestoreRun(
+          rerun,
+          initPageId,
+          restoreAborted ? "aborted" : restoreDeferred ? "deferred" : "restored",
+          isDrainRerun,
+        );
       }
     })();
   }, [
     pageId,
     drainResumeEpoch,
+    scheduleRecheckRerun,
+    rerun,
     reconnectToExistingSessions,
     createTerminal,
     adoptWorkerTab,
@@ -1514,6 +2364,8 @@ export function useTerminalInitialization({
     labelsAndTags,
     updateTab,
     terminalRefs,
+    noteNeedsAccount,
+    publishRestorePages,
   ]);
 
   // Auto-save session layout for persistence across app restarts
@@ -1529,7 +2381,7 @@ export function useTerminalInitialization({
     sessionPersistence.saveSessionLayout({
       layoutId: layoutState.layoutId,
       tabs,
-      assignments: zoneLayout.assignments,
+      assignments: layoutState.assignments,
       zoneLabels: layoutState.zoneLabels,
       zoneNotes: layoutState.zoneNotes,
       pinnedZones: layoutState.pinnedZones,
@@ -1538,7 +2390,7 @@ export function useTerminalInitialization({
   }, [
     pageId,
     tabs,
-    zoneLayout.assignments,
+    layoutState.assignments,
     layoutState.layoutId,
     layoutState.focusedZone,
     layoutState.zoneLabels,
@@ -1552,10 +2404,6 @@ export function useTerminalInitialization({
   useEffect(() => {
     tabsRef.current = tabs;
   }, [tabs]);
-  const zoneLayoutRef = useRef(zoneLayout);
-  useEffect(() => {
-    zoneLayoutRef.current = zoneLayout;
-  }, [zoneLayout]);
   const layoutStateRef = useRef(layoutState);
   useEffect(() => {
     layoutStateRef.current = layoutState;
@@ -1571,7 +2419,7 @@ export function useTerminalInitialization({
         sessionPersistence.saveSessionLayout({
           layoutId: ls.layoutId,
           tabs: currentTabs,
-          assignments: zoneLayoutRef.current.assignments,
+          assignments: ls.assignments,
           zoneLabels: ls.zoneLabels,
           zoneNotes: ls.zoneNotes,
           pinnedZones: ls.pinnedZones,
@@ -1598,7 +2446,8 @@ export function useTerminalInitialization({
       const terminalTabs = currentTabs.filter((t) => t.type !== "plan");
       const pathMap = await sessionPersistence.saveScrollbackBuffers(terminalTabs);
       const tabIdToSessionIndex: Record<string, number> = {};
-      const currentAssignments = zoneLayoutRef.current.assignments;
+      // The same assignments the layout save walks, so the indices line up.
+      const currentAssignments = layoutStateRef.current.assignments;
       const assignedTabIds = new Set(Object.values(currentAssignments));
       let idx = 0;
       for (const [, tabId] of Object.entries(currentAssignments)) {
@@ -1632,4 +2481,22 @@ export function useTerminalInitialization({
       unlisten?.();
     };
   }, [handleWindowClose]);
+
+  return {
+    /**
+     * Boot-restore candidates NOT resumed because their account is unknown
+     * (`needs-account`), each with why. The record is left in the registry;
+     * resume it under an operator-chosen account.
+     */
+    needsAccountRecords,
+    /**
+     * Pages whose boot restore has fully drained (resume commands issued). A
+     * page restores lazily, the first time it is opened. A drain-DEFERRED page
+     * is in here too (its auto-save gate opened) — read it together with
+     * {@link restoreDeferredPages}.
+     */
+    restoreCompletePages: publishedCompletePages,
+    /** Pages whose restore the coord device drain deferred; they re-run when it lifts. */
+    restoreDeferredPages: publishedDeferredPages,
+  };
 }

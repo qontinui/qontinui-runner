@@ -108,8 +108,10 @@ pub const QONTINUI_HOME_ENV: &str = "QONTINUI_HOME";
 /// - `QONTINUI_ROOT` / `QONTINUI_WORKSPACE_ROOT` — workspace discovery.
 /// - `QONTINUI_PLANS_DIR` — the plan corpus authoring directory.
 /// - `QONTINUI_DISABLE_KEYCHAIN` — flips the credential store to a file
-///   backend; a headless Linux box exports it and a test that inherits it
-///   exercises a different code path than CI does.
+///   backend. Captured and restored, but NOT set or removed by the fixture:
+///   CI sets it to `1` on purpose (the test step in `.github/workflows/ci.yml`),
+///   and removing it would re-arm the macOS keychain hang for every fixture
+///   test that does not set it again.
 /// - `DATABASE_URL` — set on a developer box and in DB-gated CI, unset
 ///   elsewhere.
 /// - `CLAUDE_CONFIG_DIR` — the Claude account in force on this box. A runner
@@ -124,7 +126,8 @@ pub const QONTINUI_HOME_ENV: &str = "QONTINUI_HOME";
 /// `std::env::var("QONTINUI_…")` / `("COORD_…")` literal appears in the
 /// PRODUCTION code under `src-tauri/src` — `#[cfg(test)]` modules and
 /// `#[test]` fns are outside the scan — that is not in this list, and the
-/// fixture captures and restores exactly this list around every test. A key
+/// fixture captures and restores this list around every test (with the
+/// root-confined keys, `test_support::captured_keys`). A key
 /// that exists only inside a test (an e2e opt-in, a marker a test plants) is
 /// not the ambient surface and is NOT listed: the test that reads it owns it.
 /// Keys read through a `const` (`env::var(SOME_ENV)`) are listed too, by
@@ -776,6 +779,15 @@ pub mod test_support {
         // A subject runner's root: a test that inherited one would run as a
         // secondary with the keychain gated off.
         "QONTINUI_INSTANCE_ROOT",
+        // A subject runner's identity, which a session it hosts passes to every
+        // test binary it runs: an inherited name reads the fixture as a named
+        // secondary, an inherited primary port as a nameless one (coord finding
+        // e0834743).
+        "QONTINUI_INSTANCE_NAME",
+        "QONTINUI_PRIMARY_PORT",
+        // QONTINUI_DISABLE_KEYCHAIN is deliberately NOT here, although a subject
+        // exports it too: CI sets it on purpose (plan
+        // 2026-10-24-runner-tests-inherit-the-hosting-runners-env-through-cargo-guard, D3).
         "COORD_HTTP_URL",
         "QONTINUI_WORKSPACE_ROOT",
         "QONTINUI_SERVER_MODE",
@@ -783,6 +795,53 @@ pub mod test_support {
         "QONTINUI_RUNNER_TIER",
         "DATABASE_URL",
     ];
+
+    /// The root-confined keys the fixture removes: every
+    /// [`crate::instance_env::ROOT_CONFINED_ENV_KEYS`] entry [`KEYS_SET_TO_DIR`]
+    /// does not already point at its dir. A subject runner (a supervisor temp or
+    /// named instance) exports the whole family under its instance root, and a
+    /// session it hosts passes them to every test binary it runs, so a test
+    /// would read the HOSTING runner's dirs, and `apply_instance_root_env`
+    /// refuses any of them outside the instance root a subject test sets
+    /// (`<fixture>/subject`) (coord finding
+    /// e0834743; plan
+    /// `2026-10-24-runner-tests-inherit-the-hosting-runners-env-through-cargo-guard`).
+    /// Derived rather than listed, so a key the runner confines later is
+    /// removed here too, with no second list to drift.
+    pub fn root_confined_keys_removed() -> impl Iterator<Item = &'static str> {
+        crate::instance_env::ROOT_CONFINED_ENV_KEYS
+            .iter()
+            .copied()
+            .filter(|k| !KEYS_SET_TO_DIR.contains(k))
+    }
+
+    /// The other half of [`root_confined_keys_removed`]: the root-confined keys
+    /// [`KEYS_SET_TO_DIR`] points at the fixture's dir, which is OUTSIDE any
+    /// subject root a test sets. A test entering a subject launch clears exactly
+    /// these and lets the root defaults fill them. It clears no more, so the
+    /// fixture's own removal of every other root-confined key stays what that
+    /// test proves. Derived for the same reason, with no second list to drift.
+    pub fn root_confined_keys_set_to_dir() -> impl Iterator<Item = &'static str> {
+        KEYS_SET_TO_DIR
+            .iter()
+            .copied()
+            .filter(|k| crate::instance_env::ROOT_CONFINED_ENV_KEYS.contains(k))
+    }
+
+    /// Every key the fixture captures, and restores on drop:
+    /// [`super::AMBIENT_ENV_KEYS`] plus the root-confined keys that list does
+    /// not declare, so every key [`root_confined_keys_removed`] removes is put
+    /// back.
+    pub fn captured_keys() -> Vec<&'static str> {
+        let mut keys = super::AMBIENT_ENV_KEYS.to_vec();
+        keys.extend(
+            crate::instance_env::ROOT_CONFINED_ENV_KEYS
+                .iter()
+                .copied()
+                .filter(|k| !super::AMBIENT_ENV_KEYS.contains(k)),
+        );
+        keys
+    }
 
     /// A single process-wide lock that serializes every test which reads or
     /// mutates a `std::env` variable.
@@ -1088,8 +1147,8 @@ pub mod test_support {
     ///
     /// - takes the process-wide [`env_lock`], so no sibling test can observe or
     ///   race the environment it is about to rewrite;
-    /// - captures every [`super::AMBIENT_ENV_KEYS`] value for restoration on
-    ///   drop, **including the panic path**;
+    /// - captures every [`captured_keys`] value for restoration on drop,
+    ///   **including the panic path**;
     /// - creates a `tempfile::tempdir()` and points every [`KEYS_SET_TO_DIR`]
     ///   key at it — so [`super::qontinui_dir`], `dirs::home_dir()`, the
     ///   runner's config dir and its secure-storage dir all resolve inside the
@@ -1097,7 +1156,9 @@ pub mod test_support {
     /// - creates `<dir>/root` and points `QONTINUI_ROOT` at it, so the
     ///   workspace-root resolver answers a directory this test owns;
     /// - removes every [`KEYS_REMOVED`] key, which a configured developer box
-    ///   exports and a clean CI runner does not;
+    ///   exports and a clean CI runner does not, and every
+    ///   [`root_confined_keys_removed`] key, which a session a subject runner
+    ///   hosts inherits;
     /// - sets `QONTINUI_ENV` to [`NO_SUCH_PROFILE`], so the profile arm of the
     ///   coord-base resolver misses deterministically;
     /// - clears the process-global runtime tier override
@@ -1133,10 +1194,21 @@ pub mod test_support {
         #[allow(clippy::new_without_default)]
         pub fn new() -> Self {
             let lock = env_lock();
-            let restore = EnvVarRestore::capture(super::AMBIENT_ENV_KEYS);
+            let restore = EnvVarRestore::capture(&captured_keys());
             let dir = tempfile::tempdir().expect("isolated ambient fixture needs a temp dir");
             let root = dir.path().join("root");
             std::fs::create_dir_all(&root).expect("isolated ambient fixture needs <dir>/root");
+            // Windows resolves the known folders (`dirs::config_dir()` is
+            // FOLDERID_RoamingAppData) from `USERPROFILE`, which this fixture
+            // points at `dir`, and VERIFIES they exist. Without these the
+            // lookup fails, and (on the CI evidence) the answer can stick for the rest of
+            // the process, so every later test outside a fixture saw no
+            // platform config dir (backup::test_backup_paths, and every seam
+            // that reads the live model-gateway plan).
+            #[cfg(windows)]
+            for sub in ["AppData/Roaming", "AppData/Local"] {
+                let _ = std::fs::create_dir_all(dir.path().join(sub));
+            }
 
             let prev_thread_armed = THREAD_ARMED.with(|c| c.replace(true));
             LIVE_GUARDS.fetch_add(1, Ordering::SeqCst);
@@ -1145,7 +1217,11 @@ pub mod test_support {
                 std::env::set_var(key, dir.path());
             }
             std::env::set_var("QONTINUI_ROOT", &root);
-            for key in KEYS_REMOVED {
+            for key in KEYS_REMOVED
+                .iter()
+                .copied()
+                .chain(root_confined_keys_removed())
+            {
                 std::env::remove_var(key);
             }
             std::env::set_var("QONTINUI_ENV", NO_SUCH_PROFILE);
@@ -1363,7 +1439,9 @@ mod tests {
 
     /// Sorted so an addition has one obvious place, and covering every key the
     /// fixture itself steers — a key the fixture sets or removes but does not
-    /// declare would not be restored on drop.
+    /// capture would not be restored on drop. The derived root-confined keys
+    /// are captured through [`captured_keys`]; every other steered key must be
+    /// declared in [`AMBIENT_ENV_KEYS`].
     #[test]
     fn ambient_env_keys_are_sorted_and_cover_the_fixture() {
         let mut sorted = AMBIENT_ENV_KEYS.to_vec();
@@ -1371,7 +1449,17 @@ mod tests {
         assert_eq!(sorted, AMBIENT_ENV_KEYS, "AMBIENT_ENV_KEYS must be sorted");
         let set: BTreeSet<&str> = AMBIENT_ENV_KEYS.iter().copied().collect();
         for k in fixture_steered_keys() {
-            assert!(set.contains(k), "{k} must be in AMBIENT_ENV_KEYS");
+            assert!(
+                set.contains(k) || root_confined_keys_removed().any(|r| r == k),
+                "{k} is steered by the fixture but not captured: add it to AMBIENT_ENV_KEYS"
+            );
+        }
+        let captured: BTreeSet<&str> = captured_keys().into_iter().collect();
+        for k in root_confined_keys_removed() {
+            assert!(
+                captured.contains(k),
+                "{k} is removed by the fixture but not captured"
+            );
         }
     }
 
@@ -1577,6 +1665,7 @@ mod tests {
             .chain(KEYS_REMOVED)
             .chain(&["QONTINUI_ROOT", "QONTINUI_ENV", QONTINUI_HOME_ENV])
             .copied()
+            .chain(root_confined_keys_removed())
             .collect()
     }
 
@@ -1592,7 +1681,7 @@ mod tests {
         const SENTINEL: &str = "__qontinui_ambient_sentinel__";
         let steered = fixture_steered_keys();
         let _lock = env_lock();
-        let _outer = EnvVarRestore::capture(AMBIENT_ENV_KEYS);
+        let _outer = EnvVarRestore::capture(&captured_keys());
         for k in &steered {
             std::env::set_var(k, SENTINEL);
         }
@@ -1609,7 +1698,8 @@ mod tests {
                         Some(dir.as_os_str()),
                         "{k} must point at the fixture dir"
                     );
-                } else if KEYS_REMOVED.contains(k) {
+                } else if KEYS_REMOVED.contains(k) || root_confined_keys_removed().any(|r| r == *k)
+                {
                     assert_eq!(got, None, "{k} must be removed");
                 } else if *k == "QONTINUI_ROOT" {
                     assert_eq!(got.as_deref(), Some(amb.root().as_os_str()));
@@ -2176,6 +2266,321 @@ mod tests {
             violations.into_iter().collect::<Vec<_>>().join("\n  ")
         );
     }
+    /// Tauri `PathResolver` methods that resolve the app's machine-global
+    /// directories (`app_data_dir()` is `<data_dir>/com.qontinui.runner`).
+    /// `resource_dir` is the installer's read-only bundle and `temp_dir` the
+    /// OS temp dir — neither is runner state, so neither is listed.
+    const TAURI_APP_DIR_METHODS: &[&str] = &[
+        "app_cache_dir",
+        "app_config_dir",
+        "app_data_dir",
+        "app_local_data_dir",
+        "app_log_dir",
+    ];
+
+    /// Tauri `PathResolver` methods that resolve a machine-global directory,
+    /// matched only on `.path().<method>` — a positive list, so `Path::is_dir`
+    /// or `read_dir` on an `entry.path()` is never mistaken for one.
+    const TAURI_PATH_RESOLVER_DIR_METHODS: &[&str] = &[
+        "audio_dir",
+        "cache_dir",
+        "config_dir",
+        "data_dir",
+        "desktop_dir",
+        "document_dir",
+        "download_dir",
+        "executable_dir",
+        "font_dir",
+        "home_dir",
+        "local_data_dir",
+        "picture_dir",
+        "public_dir",
+        "runtime_dir",
+        "template_dir",
+        "video_dir",
+    ];
+
+    /// The machine-global directory a call at `leaves[i]` resolves, if one
+    /// starts there: `dirs::<x>_dir` (called or passed as a fn), a Tauri
+    /// `.app_*_dir()`, or the seam's explicit `.machine_dir()` escape hatch.
+    fn machine_global_dir_call(leaves: &[Leaf], i: usize) -> Option<String> {
+        let ident = leaf_ident(&leaves[i])?;
+        if ident == "dirs"
+            && leaves.get(i + 1).is_some_and(|l| l.is_punct(':'))
+            && leaves.get(i + 2).is_some_and(|l| l.is_punct(':'))
+        {
+            let item = leaves.get(i + 3).and_then(leaf_ident)?;
+            return item.ends_with("_dir").then(|| format!("dirs::{item}"));
+        }
+        // `BaseDirectory::<X>` for a `PathResolver::resolve` — every variant
+        // but the read-only bundle and the OS temp dir is a machine dir.
+        if ident == "BaseDirectory"
+            && leaves.get(i + 1).is_some_and(|l| l.is_punct(':'))
+            && leaves.get(i + 2).is_some_and(|l| l.is_punct(':'))
+        {
+            let variant = leaves.get(i + 3).and_then(leaf_ident)?;
+            return (!matches!(variant, "Resource" | "Temp"))
+                .then(|| format!("BaseDirectory::{variant}"));
+        }
+        let after_dot = i > 0 && leaves[i - 1].is_punct('.');
+        if !after_dot {
+            return None;
+        }
+        let called = leaves
+            .get(i + 1)
+            .is_some_and(|l| l.is_open(Delimiter::Parenthesis));
+        // `.path().<x>_dir()` — Tauri's `PathResolver` (`home_dir`,
+        // `data_dir`, `document_dir`, …), whatever its name.
+        let on_path_resolver = i >= 4
+            && leaves[i - 2].is_close(Delimiter::Parenthesis)
+            && leaves[i - 3].is_open(Delimiter::Parenthesis)
+            && leaves[i - 4].is_ident("path");
+        let resolver_dir = on_path_resolver && TAURI_PATH_RESOLVER_DIR_METHODS.contains(&ident);
+        if resolver_dir
+            || (called && (TAURI_APP_DIR_METHODS.contains(&ident) || ident == "machine_dir"))
+        {
+            return Some(format!(".{ident}()"));
+        }
+        None
+    }
+
+    /// The census (plan
+    /// `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`
+    /// Phase 1 / D4): every PRODUCTION file that still resolves a
+    /// machine-global directory directly, how many call sites it has, and why
+    /// each is genuinely user-global (or is a seam). Every OTHER runner-owned
+    /// location resolves through `instance_env::platform_dir` and its
+    /// wrappers, so a subject runner keeps it under its instance root.
+    ///
+    /// The COUNT is exact: a new call site in a listed file fails the guard
+    /// just as one in an unlisted file does, and a removed one demands the
+    /// entry shrink — so the list cannot quietly cover more than it says.
+    const USER_GLOBAL_DIRS_ALLOWLIST: &[(&str, usize, &str)] = &[
+        (
+            "ambient.rs",
+            1,
+            "SEAM: `qontinui_dir()`'s `~/.qontinui` fallback. Under an instance root \
+             startup always exports `QONTINUI_HOME=<root>/home`, which wins",
+        ),
+        (
+            "instance_env.rs",
+            10,
+            "SEAM: `PlatformDir::machine_dir` (the one door to the platform dirs) and \
+             `machine_global_dirs`, which names the dirs an instance root must not contain",
+        ),
+        (
+            "pair.rs",
+            1,
+            "`paired_user_path_with`: the BARE-DEFAULT binding-store candidate, consulted only \
+             without an instance root (`pair/subject_isolation.rs` replaces the candidate set \
+             under one, D2)",
+        ),
+        (
+            "fleet.rs",
+            1,
+            "`CredProbeEnv::from_process`: gh's own `~/.config/gh/hosts.yml` fallback, the \
+             user's gh login read for presence only (never its value), not runner state",
+        ),
+        (
+            "coord_doctor.rs",
+            1,
+            "Claude Code's own `~/.claude/.credentials.json` — the user's Claude login, read \
+             only, not runner state",
+        ),
+        (
+            "ai_provider/oauth_refresh.rs",
+            1,
+            "Claude Code's own `~/.claude/.credentials.json` (the user's Claude login)",
+        ),
+        (
+            "commands/ai_settings.rs",
+            1,
+            "Claude Code's own `~/.claude/.credentials.json` (the user's Claude login)",
+        ),
+        (
+            "claude_session/workspace_trust.rs",
+            2,
+            "the ambient Claude config (`~/.claude.json`) a child with no account resolves — \
+             Claude Code's own file, reported, never runner state",
+        ),
+        (
+            "claude_session/spawn_preconditions.rs",
+            1,
+            "the ambient Claude config (`~/.claude.json`) a child with no account reads",
+        ),
+        (
+            "claude_session/trust_gate.rs",
+            1,
+            "the ambient Claude config (`~/.claude.json`) a child with no account reads",
+        ),
+        (
+            "session_archive/discovery.rs",
+            2,
+            "the user's Claude session archives (`~/.claude/projects`) — Claude Code's data — \
+             and the default Claude account home (`~/.claude`) the account-home scan and \
+             `is_default_config_home_from_env` compare against",
+        ),
+        (
+            "commands/terminal.rs",
+            1,
+            "`claude_default_config_home`: the default Claude account home (`~/.claude`), read \
+             only so a resume never types it as `CLAUDE_CONFIG_DIR` — Claude Code's, not runner \
+             state",
+        ),
+        (
+            "wrappers/clients.rs",
+            8,
+            "third-party AI clients' own config files (Claude CLI/Desktop, Cursor, Continue, \
+             Cline) the user asked the runner to wire",
+        ),
+        (
+            "env_agent/collectors.rs",
+            6,
+            "environment PROBES of the user's machine (home-scoped tool probes, shell profiles, \
+             the machine's Claude roster and harness layout as a report) — read-only",
+        ),
+        (
+            "env_agent/apply_versions.rs",
+            2,
+            "the user's home as the default probe scope and the user's `~/.nvm` install",
+        ),
+        (
+            "mcp/file_browser.rs",
+            3,
+            "the user's home, Desktop and Documents offered as browse roots",
+        ),
+        (
+            "commands/file_browser.rs",
+            1,
+            "the user's home output folders offered as browse roots",
+        ),
+        (
+            "commands/mobile.rs",
+            1,
+            "the user's Android SDK install (`~/Android/Sdk`)",
+        ),
+        (
+            "terminal/session.rs",
+            1,
+            "a terminal with no working dir opens in the user's home",
+        ),
+        (
+            "test_executor/repo_test_runner.rs",
+            1,
+            "`${HOME}` substitution in a user's test command",
+        ),
+        (
+            "mcp_api.rs",
+            1,
+            "refuses the user's home directory as a workspace root (a check, not a store)",
+        ),
+    ];
+
+    /// Drift guard (d), plan
+    /// `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`
+    /// D4: outside the census in [`USER_GLOBAL_DIRS_ALLOWLIST`], no PRODUCTION
+    /// code resolves a machine-global directory directly — it goes through
+    /// `instance_env::platform_dir` (or `runner_config_base`,
+    /// `runner_data_local_base`, `runner_app_data_dir`, `secure_storage_dir`,
+    /// `runner_config_dir`), which re-roots under an instance root. Also
+    /// refused: `use dirs…`, which would let a bare `config_dir()` past the
+    /// token match.
+    #[test]
+    fn no_machine_global_dir_outside_the_seams() {
+        let mut violations = Vec::new();
+        let mut counts: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        let mut total = 0usize;
+        for (rel, leaves) in production_sources() {
+            for i in 0..leaves.len() {
+                if leaves[i].is_ident("use")
+                    && leaves.get(i + 1).is_some_and(|l| l.is_ident("dirs"))
+                {
+                    violations.push(format!(
+                        "{rel}:{} imports from `dirs`; call `dirs::<x>_dir` by path, or better the seam",
+                        leaves[i].line
+                    ));
+                }
+                if let Some(call) = machine_global_dir_call(&leaves, i) {
+                    total += 1;
+                    counts
+                        .entry(rel.clone())
+                        .or_default()
+                        .push(format!("{call} at line {}", leaves[i].line));
+                }
+            }
+        }
+        for (rel, sites) in &counts {
+            match USER_GLOBAL_DIRS_ALLOWLIST.iter().find(|(f, _, _)| f == rel) {
+                None => violations.push(format!(
+                    "{rel}: {} — runner-owned state must resolve through \
+                     instance_env::platform_dir (or list a GENUINELY user-global use, with a \
+                     reason, in USER_GLOBAL_DIRS_ALLOWLIST)",
+                    sites.join(", ")
+                )),
+                Some((_, expected, _)) if *expected != sites.len() => violations.push(format!(
+                    "{rel}: USER_GLOBAL_DIRS_ALLOWLIST says {expected} site(s), found {}: {}",
+                    sites.len(),
+                    sites.join(", ")
+                )),
+                Some(_) => {}
+            }
+        }
+        for (f, _, _) in USER_GLOBAL_DIRS_ALLOWLIST {
+            if !counts.contains_key(*f) {
+                violations.push(format!(
+                    "{f} is in USER_GLOBAL_DIRS_ALLOWLIST but no longer resolves a machine-global \
+                     dir — remove the entry"
+                ));
+            }
+        }
+        // A scan that sees far fewer has stopped recognising the call shape.
+        assert!(total >= 30, "only {total} machine-global dir calls found");
+        assert!(
+            violations.is_empty(),
+            "machine-global directory resolved outside the seams:\n  {}",
+            violations.join("\n  ")
+        );
+    }
+
+    /// The call matcher behind guard (d) sees each shape it claims to, and not
+    /// a lookalike.
+    #[test]
+    fn machine_global_dir_call_matches_its_shapes_only() {
+        let src = r#"
+            fn f(app: &App) {
+                let a = dirs::config_dir();
+                let b = x.or_else(dirs::data_local_dir);
+                let c = app.path().app_data_dir();
+                let d = PlatformDir::Home.machine_dir();
+                let e = app.path().resource_dir();
+                let g = dirs::config_dir_fake_not;
+                let h = my::config_dir();
+                let i = machine_dir();
+                let j = app.path().home_dir();
+                let k = app.path().resolve("x", BaseDirectory::AppLocalData);
+                let l = app.path().resolve("x", BaseDirectory::Resource);
+                let m = app.path().temp_dir();
+                let n = entry.path().is_dir();
+                let o = entry.path().read_dir();
+            }
+        "#;
+        let leaves = prod_tokens(src, "synthetic.rs").leaves;
+        let found: Vec<String> = (0..leaves.len())
+            .filter_map(|i| machine_global_dir_call(&leaves, i))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "dirs::config_dir",
+                "dirs::data_local_dir",
+                ".app_data_dir()",
+                ".machine_dir()",
+                ".home_dir()",
+                "BaseDirectory::AppLocalData",
+            ]
+        );
+    }
+
     /// The gate every `keyring::Entry::new*` must name, in the same fn and
     /// before the entry is built.
     const KEYCHAIN_GATE: &str = "os_keychain_allowed";

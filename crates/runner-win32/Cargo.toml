@@ -23,10 +23,26 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_JobObjects",
+    # `process_tree`: the Toolhelp snapshot a pane-tree termination walks
+    # (CreateToolhelp32Snapshot / Process32FirstW / Process32NextW).
+    "Win32_System_Diagnostics_ToolHelp",
     # NOT decoration, and NOT droppable: `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`
     # does not resolve without it. Removing it because nothing in this crate
     # writes `Win32::System::Threading::` by hand fails with E0432 -- the
     # dependency is transitive through the struct, not textual. Verified by
     # removing it and watching the build break.
     "Win32_System_Threading",
+] }
+# The holder spawner's WMI fallback (`holder_spawn::wmi`, plan
+# 2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions Phase 3):
+# `Win32_Process.Create` is a COM call, and `windows-sys` carries no COM
+# interfaces. The version already in Cargo.lock (tauri/wry pull it in), so this
+# adds an edge, not a crate. Windows-only like the rest.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Rpc",
+    "Win32_System_Variant",
+    "Win32_System_Wmi",
 ] }

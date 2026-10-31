@@ -29,16 +29,16 @@ importers:
         version: 1.0.0(tailwindcss@4.2.4)
       '@qontinui/navigation':
         specifier: ^0.4.0
-        version: 0.4.0(@qontinui/ui-bridge@0.27.0(@qontinui/ui-bridge-auto@0.1.8(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0))(react@19.2.5)
+        version: 0.4.0(@qontinui/ui-bridge@0.31.0)(react@19.2.5)
       '@qontinui/shared-types':
         specifier: ^0.6.0
         version: 0.6.0
       '@qontinui/ui-bridge':
-        specifier: ^0.27.0
-        version: 0.27.0(@qontinui/ui-bridge-auto@0.1.8(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0)
+        specifier: ^0.31.0
+        version: 0.31.0(@qontinui/ui-bridge-auto@0.2.0)(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0)
       '@qontinui/ui-bridge-auto':
-        specifier: ^0.1.8
-        version: 0.1.8(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0)
+        specifier: ^0.2.0
+        version: 0.2.0(@qontinui/ui-bridge@0.31.0)
       '@qontinui/workflow-ui':
         specifier: ^0.1.0
         version: 0.1.0(@xyflow/react@12.10.2(@types/react@19.2.14)(immer@11.1.4)(react-dom@19.2.5(react@19.2.5))(react@19.2.5))(lucide-react@1.14.0(react@19.2.5))(mermaid@11.15.0)(react-window@2.2.7(react-dom@19.2.5(react@19.2.5))(react@19.2.5))(react@19.2.5)
@@ -138,9 +138,6 @@ importers:
       graphql-ws:
         specifier: ^6.0.7
         version: 6.0.8(graphql@16.13.2)(ws@8.21.0)
-      html2canvas:
-        specifier: ^1.4.1
-        version: 1.4.1
       html5-qrcode:
         specifier: ^2.3.8
         version: 2.3.8
@@ -1201,10 +1198,11 @@ packages:
   '@qontinui/shared-types@0.6.0':
     resolution: {integrity: sha512-dnxCeekllKF5U3nK4Nlb5d1ciTi60uqZ/gDBnSG9nPHCsBdl/eawn0IGLYIIsUdaMFtMblupu67g2QYbGXD/TQ==}
 
-  '@qontinui/ui-bridge-auto@0.1.8':
-    resolution: {integrity: sha512-PLTr9logmrpY83ZdxQIlvK08xnjhFYY9U7fA6067kszYYLlSH+/R+tIXMdG9y5toVmi0mhaWI0n85HO4W3zHgQ==}
+  '@qontinui/ui-bridge-auto@0.2.0':
+    resolution: {integrity: sha512-EEoQohR6zLh5E+2oQQesNsCvyHxvtRxkZIxmnf0NmFfxjDJrKDzHNAWea8S30Bsc42mlXZ3Y/oTTgVI3hEeOww==}
     hasBin: true
     peerDependencies:
+      '@qontinui/ui-bridge': '>=0.30.0 <1'
       tesseract.js: '>=5.0.0'
     peerDependenciesMeta:
       tesseract.js:
@@ -1216,39 +1214,12 @@ packages:
     peerDependencies:
       eslint: ^8.0.0 || ^9.0.0 || ^10.0.0
 
-  '@qontinui/ui-bridge@0.27.0':
-    resolution: {integrity: sha512-rB8fweKnM8NFyAQN73kaMk7wz35VpgU/fH6aCz3LJZ0k0VFyjErM3jND09PL4LKKVaGAo9uHn4n0cbvfUPA0aA==}
+  '@qontinui/ui-bridge@0.31.0':
+    resolution: {integrity: sha512-1ksB+NEVpnnwiB+nV5pVzfcC5cV2bzolxAwXEAJWKsWIxvkUxV2wBJE9UTsjU61Ayci0+Tb3GnZHMzQvBeSO6w==}
     hasBin: true
     peerDependencies:
       '@qontinui/ui-bridge-auto': '>=0.1.0 <1'
       '@qontinui/ui-bridge-headless': '>=0.1.0 <1'
-      express: ^4.18.0 || ^5.0.0
-      next: '>=13.0.0'
-      react: ^18.0.0 || ^19.0.0
-      react-dom: ^18.0.0 || ^19.0.0
-      react-native: '>=0.70.0'
-      ws: ^8.0.0
-    peerDependenciesMeta:
-      '@qontinui/ui-bridge-auto':
-        optional: true
-      '@qontinui/ui-bridge-headless':
-        optional: true
-      express:
-        optional: true
-      next:
-        optional: true
-      react-dom:
-        optional: true
-      react-native:
-        optional: true
-      ws:
-        optional: true
-
-  '@qontinui/ui-bridge@0.3.9':
-    resolution: {integrity: sha512-VLWgdvkm3lP/gTYXYqd4FgUFZhVRG7VNB7/GEwoDLF6QvxwUsDPenyb/CSTvHSO54xFMX9A4KELhkpHv+dhYqQ==}
-    peerDependencies:
-      '@qontinui/ui-bridge-auto': '>=0.1.0'
-      '@qontinui/ui-bridge-headless': '>=0.1.0'
       express: ^4.18.0 || ^5.0.0
       next: '>=13.0.0'
       react: ^18.0.0 || ^19.0.0
@@ -2585,10 +2556,6 @@ packages:
     resolution: {integrity: sha512-BLrgEcRTwX2o6gGxGOCNyMvGSp35YofuYzw9h1IMTRmKqttAZZVU67bdb9Pr2vUHA8+j3i2tJfjO6C6+4myGTA==}
     engines: {node: 18 || 20 || >=22}
 
-  base64-arraybuffer@1.0.2:
-    resolution: {integrity: sha512-I3yl4r9QB5ZRY3XuJVEPfc2XhZO6YweFPI+UovAzn+8/hb3oJ6lnysaFcjVpkCPfVWFUDvoZ8kmVDP7WyRtYtQ==}
-    engines: {node: '>= 0.6.0'}
-
   baseline-browser-mapping@2.10.41:
     resolution: {integrity: sha512-WwS7MHhqGHHlaVsqRZnhvCEMS0owDX+SxRlve7JkuH7My1Ara3ZriTmCQupPfYjxMZ8I/tgxtJYr2t7taHaH4A==}
     engines: {node: '>=6.0.0'}
@@ -2785,9 +2752,6 @@ packages:
   cross-spawn@7.0.6:
     resolution: {integrity: sha512-uV2QOWP2nWzsy2aMp8aRibhi9dlzF5Hgh5SHaB9OiTGEyDTiJJyx0uy51QXdyWbtAHNua4XJzUKca3OzKUd3vA==}
     engines: {node: '>= 8'}
-
-  css-line-break@2.1.0:
-    resolution: {integrity: sha512-FHcKFCZcAha3LwfVBhCQbW2nCNbkZXn7KVUJcsT5/P8YmfsVja0FMPJr0B903j/E69HUphKiV9iQArX8SDYA4w==}
 
   css.escape@1.5.1:
     resolution: {integrity: sha512-YUifsXXuknHlUsmlgyY0PKzgPOr7/FjCePfHNt0jxm83wHZi44VDMQ7/fGNkjY3/jV1MC+1CmZbaHzugyeRtpg==}
@@ -3515,10 +3479,6 @@ packages:
 
   html-void-elements@3.0.0:
     resolution: {integrity: sha512-bEqo66MRXsUGxWHV5IP0PUiAWwoEjba4VCzg0LjFJBpchPaTfyfCKTG6bc5F8ucKec3q5y6qOdGyYTSBEvhCrg==}
-
-  html2canvas@1.4.1:
-    resolution: {integrity: sha512-fPU6BHNpsyIhr8yyMpTLLxAbkaK8ArIBcmZIRiBLiDhjeqvXolaEmDGmELFuX9I4xDcaKKcJl+TKZLqruBbmWA==}
-    engines: {node: '>=8.0.0'}
 
   html5-qrcode@2.3.8:
     resolution: {integrity: sha512-jsr4vafJhwoLVEDW3n1KvPnCCXWaQfRng0/EEYk1vNcQGcG/htAdhJX0be8YyqMoSz7+hZvOZSTAepsabiuhiQ==}
@@ -4899,9 +4859,6 @@ packages:
     resolution: {integrity: sha512-uxc/zpqFg6x7C8vOE7lh6Lbda8eEL9zmVm/PLeTPBRhh1xCgdWaQ+J1CUieGpIfm2HdtsUpRv+HshiasBMcc6A==}
     engines: {node: '>=6'}
 
-  text-segmentation@1.0.3:
-    resolution: {integrity: sha512-iOiPUo/BGnZ6+54OsWxZidGCsdU8YbE4PSpdPinp7DeMtUJNJBoJ/ouUSTJjHkh1KntHaltHl/gDs2FC4i5+Nw==}
-
   timeout-signal@2.0.0:
     resolution: {integrity: sha512-YBGpG4bWsHoPvofT6y/5iqulfXIiIErl5B0LdtHT1mGXDFTAhhRrbUpTvBgYbovr+3cKblya2WAOcpoy90XguA==}
     engines: {node: '>=16'}
@@ -5094,9 +5051,6 @@ packages:
     resolution: {integrity: sha512-Pp6GSwGP/NrPIrxVFAIkOQeyw8lFenOHijQWkUTrDvrF4ALqylP2C/KCkeS9dpUM3KvYRQhna5vt7IL95+ZQ9w==}
     peerDependencies:
       react: ^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0
-
-  utrie@1.0.2:
-    resolution: {integrity: sha512-1MLa5ouZiOmQzUbjbu9VmjLzn1QLXBhwpUa7kdLUQK+KQ5KA9I1vk5U4YHe/X2Ch7PYnJfWuWT+VbuxbGwljhw==}
 
   uuid@11.1.1:
     resolution: {integrity: sha512-vIYxrBCC/N/K+Js3qSN88go7kIfNPssr/hHCesKCQNAjmgvYS2oqr69kIufEG+O4+PfezOH4EbIeHCfFov8ZgQ==}
@@ -6361,26 +6315,18 @@ snapshots:
     optionalDependencies:
       tailwindcss: 4.2.4
 
-  '@qontinui/navigation@0.4.0(@qontinui/ui-bridge@0.27.0(@qontinui/ui-bridge-auto@0.1.8(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0))(react@19.2.5)':
+  '@qontinui/navigation@0.4.0(@qontinui/ui-bridge@0.31.0)(react@19.2.5)':
     optionalDependencies:
-      '@qontinui/ui-bridge': 0.27.0(@qontinui/ui-bridge-auto@0.1.8(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0)
+      '@qontinui/ui-bridge': 0.31.0(@qontinui/ui-bridge-auto@0.2.0)(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0)
       react: 19.2.5
 
   '@qontinui/shared-types@0.6.0': {}
 
-  '@qontinui/ui-bridge-auto@0.1.8(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0)':
+  '@qontinui/ui-bridge-auto@0.2.0(@qontinui/ui-bridge@0.31.0)':
     dependencies:
       '@qontinui/shared-types': 0.6.0
-      '@qontinui/ui-bridge': 0.3.9(@qontinui/ui-bridge-auto@0.1.8(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0)
+      '@qontinui/ui-bridge': 0.31.0(@qontinui/ui-bridge-auto@0.2.0)(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0)
       ts-morph: 27.0.2
-    transitivePeerDependencies:
-      - '@qontinui/ui-bridge-headless'
-      - express
-      - next
-      - react
-      - react-dom
-      - react-native
-      - ws
 
   '@qontinui/ui-bridge-eslint-plugin@0.2.0(eslint@10.3.0(jiti@2.6.1))(typescript@6.0.3)':
     dependencies:
@@ -6390,27 +6336,18 @@ snapshots:
       - supports-color
       - typescript
 
-  '@qontinui/ui-bridge@0.27.0(@qontinui/ui-bridge-auto@0.1.8(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0)':
+  '@qontinui/ui-bridge@0.31.0(@qontinui/ui-bridge-auto@0.2.0)(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0)':
     dependencies:
       dom-accessibility-api: 0.5.16
       react: 19.2.5
     optionalDependencies:
-      '@qontinui/ui-bridge-auto': 0.1.8(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0)
+      '@qontinui/ui-bridge-auto': 0.2.0(@qontinui/ui-bridge@0.31.0)
       '@tauri-apps/api': 2.11.0
       ioredis: 5.11.0
       react-dom: 19.2.5(react@19.2.5)
       ws: 8.21.0
     transitivePeerDependencies:
       - supports-color
-
-  '@qontinui/ui-bridge@0.3.9(@qontinui/ui-bridge-auto@0.1.8(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0)':
-    dependencies:
-      react: 19.2.5
-    optionalDependencies:
-      '@qontinui/ui-bridge-auto': 0.1.8(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0)
-      '@tauri-apps/api': 2.11.0
-      react-dom: 19.2.5(react@19.2.5)
-      ws: 8.21.0
 
   '@qontinui/workflow-ui@0.1.0(@xyflow/react@12.10.2(@types/react@19.2.14)(immer@11.1.4)(react-dom@19.2.5(react@19.2.5))(react@19.2.5))(lucide-react@1.14.0(react@19.2.5))(mermaid@11.15.0)(react-window@2.2.7(react-dom@19.2.5(react@19.2.5))(react@19.2.5))(react@19.2.5)':
     dependencies:
@@ -7757,8 +7694,6 @@ snapshots:
 
   balanced-match@4.0.4: {}
 
-  base64-arraybuffer@1.0.2: {}
-
   baseline-browser-mapping@2.10.41: {}
 
   brace-expansion@1.1.16:
@@ -7973,10 +7908,6 @@ snapshots:
       path-key: 3.1.1
       shebang-command: 2.0.0
       which: 2.0.2
-
-  css-line-break@2.1.0:
-    dependencies:
-      utrie: 1.0.2
 
   css.escape@1.5.1: {}
 
@@ -8873,11 +8804,6 @@ snapshots:
   html-url-attributes@3.0.1: {}
 
   html-void-elements@3.0.0: {}
-
-  html2canvas@1.4.1:
-    dependencies:
-      css-line-break: 2.1.0
-      text-segmentation: 1.0.3
 
   html5-qrcode@2.3.8: {}
 
@@ -10599,10 +10525,6 @@ snapshots:
 
   tapable@2.3.3: {}
 
-  text-segmentation@1.0.3:
-    dependencies:
-      utrie: 1.0.2
-
   timeout-signal@2.0.0: {}
 
   tiny-invariant@1.3.3: {}
@@ -10808,10 +10730,6 @@ snapshots:
   use-sync-external-store@1.6.0(react@19.2.5):
     dependencies:
       react: 19.2.5
-
-  utrie@1.0.2:
-    dependencies:
-      base64-arraybuffer: 1.0.2
 
   uuid@11.1.1: {}
 

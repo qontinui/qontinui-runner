@@ -5,8 +5,10 @@
 //! with proper environment for running Claude CLI and other dev tools.
 //!
 //! Spawn-path contract: [`runner_context`] renders with zero I/O; the one
-//! bounded I/O a spawn seam performs for it is [`crate::served_corpus::probe`],
-//! whose result the seam passes in beside the per-session `CoordMcpDelivery`.
+//! bounded I/O a spawn seam performs for it is the served-corpus measurement
+//! ([`crate::served_corpus::probe`], or [`crate::served_corpus::probe_start`]
+//! joined later), whose result the seam passes in beside the per-session
+//! `CoordMcpDelivery`.
 
 pub mod account_migration;
 pub mod agent_status_sideband;
@@ -20,6 +22,8 @@ pub mod daemon_pane_io;
 pub mod exit_notice;
 pub mod graceful_exit;
 pub mod grid;
+pub mod holder_boot_sweep;
+pub mod holder_census;
 pub mod interceptor;
 pub mod manager;
 pub mod operator_touch_watch; // Trigger 1 (idle_at_prompt, riding the context_watcher grid-scan tick) + the Notification-hook landing pad for triggers 2/3 (permission_prompt) (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)
@@ -31,6 +35,7 @@ pub mod remote_pane_io;
 mod scan_gate;
 pub mod scan_interval;
 pub mod session;
+pub mod session_carry;
 pub mod transcript;
 pub mod transcript_watcher;
 #[cfg(test)]
@@ -198,6 +203,18 @@ pub(crate) fn scrub_credential_env_pty(cmd: &mut portable_pty::CommandBuilder) {
     for name in CREDENTIAL_VALUE_ENV_VARS {
         cmd.env_remove(name);
     }
+    apply_model_gateway_env_pty(cmd);
+}
+
+/// Twin of [`apply_model_gateway_env_std`] for this seam's `Command` type.
+fn apply_model_gateway_env_pty(cmd: &mut portable_pty::CommandBuilder) {
+    let plan = crate::model_gateway::live_child_env_plan();
+    for name in &plan.remove {
+        cmd.env_remove(name);
+    }
+    for (k, v) in &plan.set {
+        cmd.env(k, v);
+    }
 }
 
 /// Strip [`CREDENTIAL_VALUE_ENV_VARS`] from a tokio child's environment.
@@ -208,6 +225,18 @@ pub(crate) fn scrub_credential_env_pty(cmd: &mut portable_pty::CommandBuilder) {
 pub(crate) fn scrub_credential_env_tokio(cmd: &mut tokio::process::Command) {
     for name in CREDENTIAL_VALUE_ENV_VARS {
         cmd.env_remove(name);
+    }
+    apply_model_gateway_env_tokio(cmd);
+}
+
+/// Twin of [`apply_model_gateway_env_std`] for this seam's `Command` type.
+fn apply_model_gateway_env_tokio(cmd: &mut tokio::process::Command) {
+    let plan = crate::model_gateway::live_child_env_plan();
+    for name in &plan.remove {
+        cmd.env_remove(name);
+    }
+    for (k, v) in &plan.set {
+        cmd.env(k, v);
     }
 }
 
@@ -229,6 +258,24 @@ pub(crate) fn scrub_credential_env_tokio(cmd: &mut tokio::process::Command) {
 pub(crate) fn scrub_credential_env_std(cmd: &mut std::process::Command) {
     for name in CREDENTIAL_VALUE_ENV_VARS {
         cmd.env_remove(name);
+    }
+    apply_model_gateway_env_std(cmd);
+}
+
+/// The model-gateway half of the child env posture
+/// ([`crate::model_gateway::live_child_env_plan`]): on an install that declares
+/// a gateway, the child runs under the gateway config dir with
+/// `ANTHROPIC_BASE_URL` set and env-borne vendor credentials removed. It runs
+/// inside the scrub, which every seam calls LAST, so it overrides any
+/// subscription-account `CLAUDE_CONFIG_DIR` pin set earlier in the seam. A
+/// no-op without a gateway.
+fn apply_model_gateway_env_std(cmd: &mut std::process::Command) {
+    let plan = crate::model_gateway::live_child_env_plan();
+    for name in &plan.remove {
+        cmd.env_remove(name);
+    }
+    for (k, v) in &plan.set {
+        cmd.env(k, v);
     }
 }
 
@@ -325,8 +372,10 @@ pub const RUNNER_CONTEXT_SOURCE_MARKER: &str = concat!(
 /// 5. the fleet-gated plan-capture clause, on the same condition as before.
 ///
 /// The spawn-path I/O this render needs is done by the SEAM, not here: each
-/// seam calls the bounded [`crate::served_corpus::probe`] on its workdir and
-/// passes the result in as `served`, exactly as it passes `coord_mcp`.
+/// seam measures its workdir with the bounded [`crate::served_corpus::probe`]
+/// (the terminal spawn starts [`crate::served_corpus::probe_start`] early and
+/// joins it) and passes the result in as `served`, exactly as it passes
+/// `coord_mcp`.
 ///
 /// Every degradation — coord unreachable, unpaired runner, absent document, a
 /// body that fails the render-time guard — falls back to the builtin and SAYS

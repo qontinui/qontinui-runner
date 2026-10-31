@@ -673,3 +673,219 @@ fn the_job_cap_contains_both_rust_step_bounds_plus_measured_overhead() {
          `cancelled`, which the `if: failure()` expiry summariser never explains."
     );
 }
+
+#[test]
+fn no_step_after_the_build_half_invokes_cargo_again() {
+    // The run half is not the only place a second cargo invocation pays the
+    // full rebuild. The package is an input to itself (see the `Run Rust tests`
+    // comment), so ANY later cargo invocation in this job finds it Dirty and
+    // recompiles the main crate. That covers `build`, `check` and `clippy` as
+    // well as `test`. This test sees only cargo invocations written in a
+    // step's `run:` body. `Build Tauri app (development)` runs
+    // `pnpm run tauri build`, which calls cargo internally, and no pattern on
+    // the step text can see that. So a pass here does not prove the job has
+    // no second compile. `Live AI extractor smoke` ran `cargo test` there until
+    // this test was added, with no bound of its own and no compile throttle. It stayed
+    // dormant only because its secret is unset. Later steps run the binaries
+    // the build half produced, as the run half does.
+    //
+    // Unnamed steps are checked too. `step_name` returns `None` for them, and
+    // skipping them would let an anonymous `run: cargo test` through.
+    let doc = ci_workflow();
+    let steps = job_steps(&doc, "test");
+    let start = position(&steps, BUILD) + 1;
+    let mut offenders = Vec::new();
+    for (i, step) in steps.iter().enumerate().skip(start) {
+        let label = step_name(step)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("<unnamed step #{i}>"));
+        if step.get("run").is_none() {
+            continue;
+        }
+        let body = command_lines(step, &label);
+        for caps in CARGO_INVOCATION.captures_iter(&body) {
+            offenders.push(format!(
+                "`{label}`: `{}`",
+                caps.get(0).unwrap().as_str().trim()
+            ));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these steps invoke cargo after `{BUILD}`, and each one pays a full \
+         recompile of the main crate: {offenders:?}. Recover the binary from \
+         `cargo-test-build.log` and run it directly, as `{RUN}` does."
+    );
+}
+
+/// Plan `2026-10-27-coord-routes-ci-jobs-by-runner-capability` Phase 1: an
+/// out-of-memory Rust test step is annotated as CAPACITY, in the title coord
+/// reads as "not a verdict on this PR". The matching itself is fixture-tested
+/// by `scripts/tests/test_oom_signature.sh`; this pins the WIRING, whose
+/// failure modes are all silent — an emitter that never runs, reads the wrong
+/// log, or drops the build-phase suffix still leaves every job green-or-red
+/// exactly as before.
+#[test]
+fn an_out_of_memory_rust_test_step_is_annotated_as_capacity() {
+    const EMITTER: &str = "Annotate an out-of-memory Rust test step";
+    let doc = ci_workflow();
+    let steps = job_steps(&doc, "test");
+    let emitter = find_step(&steps, EMITTER);
+
+    let cond = emitter
+        .get("if")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("`{EMITTER}` must carry an `if:` condition"));
+    assert!(
+        cond.contains("failure()"),
+        "`{EMITTER}`'s `if:` must include `failure()`, got `{cond}` — a default \
+         `success()` never runs on the one state it exists to explain"
+    );
+    // ...and on EITHER Rust half failing: an `if:` that names only one half
+    // never annotates the other half's OOM.
+    for half in [
+        "steps.build_rust_tests.outcome == 'failure'",
+        "steps.run_rust_tests.outcome == 'failure'",
+    ] {
+        assert!(
+            cond.contains(half),
+            "`{EMITTER}`'s `if:` must include `{half}`, got `{cond}`"
+        );
+    }
+    assert_eq!(
+        emitter.get("continue-on-error").and_then(|v| v.as_bool()),
+        Some(true),
+        "`{EMITTER}` is a diagnostic and must carry `continue-on-error: true`"
+    );
+    assert!(
+        emitter.get("timeout-minutes").is_none(),
+        "`{EMITTER}` must NOT carry a step-level `timeout-minutes` (see the \
+         other two diagnostics)"
+    );
+    assert!(
+        position(&steps, RUN) < position(&steps, EMITTER),
+        "`{EMITTER}` must run after `{RUN}`, whose log it reads"
+    );
+
+    let body = command_lines(emitter, EMITTER);
+    assert!(
+        body.contains("scripts/ci/oom-signature.sh"),
+        "`{EMITTER}` must call scripts/ci/oom-signature.sh, the fixture-tested matcher"
+    );
+    // The BRANCH, not just the presence of two calls: `build outcome ==
+    // failure` must select the BUILD call and every other case (the run half
+    // failed) the RUN call. Swapping the arms leaves both calls present and
+    // annotates a build OOM as run-phase (kept red) and a run OOM as
+    // build-killed (write-skipped on main, hiding a possible real assertion).
+    const BUILD_BRANCH: &str =
+        "if [ \"${{ steps.build_rust_tests.outcome }}\" = \"failure\" ]; then";
+    let (_, after_branch) = body
+        .split_once(BUILD_BRANCH)
+        .unwrap_or_else(|| panic!("`{EMITTER}` must branch on `{BUILD_BRANCH}`; body:\n{body}"));
+    let lines: Vec<&str> = after_branch.lines().map(str::trim).collect();
+    let else_at = lines
+        .iter()
+        .position(|l| *l == "else")
+        .unwrap_or_else(|| panic!("`{EMITTER}`'s build-outcome branch has no `else`"));
+    let fi_at = lines
+        .iter()
+        .position(|l| *l == "fi")
+        .unwrap_or_else(|| panic!("`{EMITTER}`'s build-outcome branch has no `fi`"));
+    assert!(else_at < fi_at, "`else` must come before `fi`");
+    let build_call = lines[..else_at].join("\n");
+    let run_call = lines[else_at + 1..fi_at].join("\n");
+    for (call, which) in [(&build_call, "then"), (&run_call, "else")] {
+        assert_eq!(
+            call.matches("bash scripts/ci/oom-signature.sh").count(),
+            1,
+            "the `{which}` arm must make exactly one emitter call: {call}"
+        );
+        // The cgroup evidence: without `--memory-events` and a baseline the
+        // SIGKILL / `Killed` arms can never fire.
+        assert!(
+            call.contains("--memory-events \"$memory_events\""),
+            "the `{which}` arm must pass `--memory-events \"$memory_events\"`: {call}"
+        );
+    }
+    // `then` arm: the BUILD log, `--build-phase` (the `killed IN THE BUILD`
+    // suffix coord write-skips), and the baseline taken before the BUILD half.
+    assert!(
+        build_call.contains(&format!("--step \"{BUILD}\""))
+            && build_call.contains("--build-phase")
+            && build_call.contains("cargo-test-build.log")
+            && !build_call.contains("cargo-test-output.log"),
+        "the build-failure arm must call the emitter for `{BUILD}` with \
+         `--build-phase` and the build log: {build_call}"
+    );
+    assert!(
+        build_call
+            .contains("--oom-kill-baseline \"${{ steps.oom_kill_before_build.outputs.count }}\""),
+        "the build-failure arm must pass the oom_kill count recorded before \
+         `{BUILD}`: {build_call}"
+    );
+    // `else` arm: the RUN log without `--build-phase` (tests may have run, so
+    // it must stay red and be re-run), and the baseline taken before the RUN
+    // half.
+    assert!(
+        run_call.contains(&format!("--step \"{RUN}\""))
+            && !run_call.contains("--build-phase")
+            && run_call.contains("cargo-test-output.log")
+            && !run_call.contains("cargo-test-build.log"),
+        "the else arm must call the emitter for `{RUN}` with the run log and \
+         WITHOUT `--build-phase`: {run_call}"
+    );
+    assert!(
+        run_call.contains("--oom-kill-baseline \"${{ steps.oom_kill_before_run.outputs.count }}\""),
+        "the else arm must pass the oom_kill count recorded before `{RUN}`: {run_call}"
+    );
+
+    // The two baselines: `oom_kill` is cumulative per cgroup, so each is read
+    // immediately before the half it baselines, Linux-only and best-effort.
+    for (id, half) in [
+        ("oom_kill_before_build", BUILD),
+        ("oom_kill_before_run", RUN),
+    ] {
+        let (at, step) = steps
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.get("id").and_then(|v| v.as_str()) == Some(id))
+            .unwrap_or_else(|| panic!("no step carries `id: {id}`"));
+        assert!(
+            at < position(&steps, half),
+            "`{id}` must run BEFORE `{half}`, whose oom_kill rise it baselines"
+        );
+        assert_eq!(
+            step.get("if").and_then(|v| v.as_str()),
+            Some("runner.os == 'Linux'"),
+            "`{id}` reads a cgroup and must be Linux-only"
+        );
+        assert_eq!(
+            step.get("continue-on-error").and_then(|v| v.as_bool()),
+            Some(true),
+            "`{id}` is best-effort and must never fail the job"
+        );
+        let body = command_lines(step, id);
+        assert!(
+            body.contains("memory.events")
+                && body.contains("count=")
+                && body.contains("GITHUB_OUTPUT"),
+            "`{id}` must write the `oom_kill` count from memory.events as output `count`: {body}"
+        );
+    }
+    assert!(
+        position(&steps, BUILD)
+            < steps
+                .iter()
+                .position(|s| s.get("id").and_then(|v| v.as_str()) == Some("oom_kill_before_run"))
+                .unwrap(),
+        "`oom_kill_before_run` must come AFTER `{BUILD}`, or a build-phase kill \
+         is inside the run half's baseline window"
+    );
+    // A saturated pagefile is NOT OOM evidence (plan Phase 0: hosted Windows
+    // peaks at 32767 of 32768 MB on jobs that failed in tests, and near it on
+    // green ones), so the emitter must not be handed a MEMPEAK reading.
+    assert!(
+        !body.contains("MEMPEAK") && !body.contains("mempeak"),
+        "`{EMITTER}` must not read a MEMPEAK/pagefile reading as an OOM signature"
+    );
+}

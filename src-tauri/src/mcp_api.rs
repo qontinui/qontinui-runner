@@ -774,37 +774,26 @@ async fn embedding_service_health() -> serde_json::Value {
     })
 }
 
-/// Bounded PG liveness probe for `/health` (iter4 B-5). Runs a `SELECT 1`
-/// through the global deadpool pool with a hard 2s ceiling *on top of* the
-/// pool's own bounded `get()` timeout (B-1), so the health handler can never
-/// hang on a wedged data layer even in a pathological pool state.
+/// A FRESH PG liveness read for GATING consumers (`/restart-readiness`), now
+/// the guarded pool's `probe_now`: a real `SELECT 1` while the breaker is
+/// Closed (a connect failure trips it), an immediate single-flight trial
+/// while it is Open. Bounded at 5 s; feeds the breaker either way.
 ///
-/// Returns:
-/// * `None` — no PG configured (the global `PgDb` was never set). Do not
-///   downgrade a runner that legitimately runs without PG.
-/// * `Some(true)` — a connection was checked out and `SELECT 1` succeeded
-///   within the window.
-/// * `Some(false)` — the pool errored (unreachable / exhausted, incl. the
-///   degraded-boot pool with no live backend), or the probe exceeded 2s.
+/// `/health` no longer calls this: it reads cached state
+/// (`database::pg::health`, plan
+/// `2026-10-19-runner-pg-unreachable-costs-every-caller-a-pool-timeout`
+/// Phase 5, which reverses iter4 B-5's "intentionally NOT cached" choice —
+/// that bought freshness by charging every poll ~2 s while the database was
+/// down).
 ///
-/// Unlike the embedding probe this is intentionally NOT cached: it is a single
-/// sub-millisecond round-trip on a healthy DB, and when the DB is down the 2s
-/// ceiling bounds the cost — surfacing the outage on the very next `/health`
-/// poll is the whole point (the B-5 observability gap the plan calls out).
+/// Returns `None` when no PG is configured (the global `PgDb` was never set)
+/// OR the probe could not tell (a saturated pool, a probe that ran out its
+/// bound), else whether the database answered. Gating consumers pass only on
+/// `Some(true)`, so `None` withholds exactly as `Some(false)` does, while
+/// `derive_schema_health` labels it "unknown" rather than "false".
 pub(crate) async fn pg_liveness_probe() -> Option<bool> {
     let pg = crate::database::pg::PgDb::try_global()?;
-    let probe = async move {
-        let conn = pg.pool().get().await.map_err(|e| e.to_string())?;
-        conn.simple_query("SELECT 1")
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok::<(), String>(())
-    };
-    match tokio::time::timeout(std::time::Duration::from_secs(2), probe).await {
-        Ok(Ok(())) => Some(true),
-        Ok(Err(_)) => Some(false),
-        Err(_) => Some(false),
-    }
+    pg.pool().probe_now().await.reachable
 }
 
 /// Fixed, minimal set of relations the runner cannot work without. `schema_ok`
@@ -2092,37 +2081,16 @@ async fn health(
     // who care about the distinction should branch on `ui_error` /
     // `recent_crash` / `embeddingService.reachable` presence instead of
     // re-parsing the compound status string.
-    // iter4 B-5: bounded PG liveness. `/health` previously reported "healthy"
-    // in 3ms while every PG-backed panel hung forever (B-1). Fold a hard-capped
-    // `SELECT 1` into the aggregation so a wedged/unreachable data layer
-    // downgrades the runner to `degraded`. `None` (no PG configured) does NOT
-    // downgrade. Depends on B-1's pool timeout — plus a 2s ceiling here — so
-    // the probe itself can never hang the handler.
-    // Time the PG probe SEPARATELY, and publish it as its own field.
-    //
-    // This is not curiosity, it is a latency confound that already caused a
-    // near-misreading. On 2026-08-19 `/health` answered `200` in 2.039 s while
-    // the process reported `Responding: False`, and that number was very
-    // nearly read as UI-thread latency. It was not: `pg_liveness_probe` is
-    // awaited here, BEFORE anything touches the event loop, and it is capped
-    // at exactly 2 s (and deliberately uncached). So 2.039 s was ~2.000 s of
-    // PG-timeout tax plus ~39 ms for everything else, and said almost nothing
-    // about the UI thread. With `pgProbeMs` on the wire the split is
-    // arithmetic, not inference.
-    let pg_probe_started = std::time::Instant::now();
-    let pg_reachable = pg_liveness_probe().await;
-    let pg_probe_ms = pg_probe_started.elapsed().as_millis() as u64;
-    // Phase 1 of `2026-09-07-health-database-reachable-is-a-connect-probe-not-a-schema-probe`:
-    // `reachable` only proves a connect+auth handshake, not that the schema
-    // the runner needs exists. Only attempt the schema probe once the connect
-    // already succeeded — a connect failure is reported as `schema_ok: None`
-    // below, never silently re-tried or turned into `false`.
-    let schema_probe_result = if pg_reachable == Some(true) {
-        Some(pg_schema_probe().await)
-    } else {
-        None
-    };
-    let (schema_ok, schema_detail) = derive_schema_health(pg_reachable, schema_probe_result);
+    // PG state is read from CACHED state, with no PG I/O here (plan
+    // `2026-10-19-runner-pg-unreachable-costs-every-caller-a-pool-timeout`
+    // Phase 5). The old inline `SELECT 1` cost every poll ~2 s while the
+    // database was down (the 2026-08-19 2.039 s confound). `pg_reachable` is
+    // the runner's own state for `derived_status`: Some(false) while the
+    // breaker is open, the age-bounded probe verdict otherwise.
+    let pg_health = crate::database::pg::health::pg_health_snapshot();
+    let pg_now = std::time::Instant::now();
+    let pg_reachable = pg_health.status_reachable(pg_now);
+    let (schema_ok, _) = pg_health.schema(pg_now);
 
     let main_window = {
         use tauri::Manager;
@@ -2211,6 +2179,10 @@ async fn health(
         pong_age_ms,
         last_event_pong: crate::ui_error::last_event_pong(),
         event_pong_age_ms: crate::ui_error::last_event_pong_age_ms(),
+        // From the SAME snapshot (`last_ping_emit_ok`) and clock reading the
+        // `pingDelivery` verdict beside it was classified with, so the verdict
+        // and the published `lastPingEmitOk` come from one read.
+        ping: crate::ui_error::ping_ask_from(last_ping_emit_ok, ping_now_ms),
     });
     let derived_status = crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
         has_ui_error: ui_error_snapshot.is_some(),
@@ -2378,49 +2350,9 @@ async fn health(
             "hasDeviceJwt": relay_status.has_device_jwt,
             "lastError": relay_status.last_error,
         },
-        // iter4 B-5: PG data-layer liveness (bounded `SELECT 1`). `reachable`
-        // is null when unprobed/unconfigured, true/false otherwise. Drives the
-        // `degraded` downgrade above so `/health` mirrors the data layer.
-        "database": {
-            "reachable": pg_reachable,
-            // WHICH database this process is on -- `reachable` only says
-            // whether it answers, and is identically `true` for a developer's
-            // docker-compose cluster, for a bundled cluster this process
-            // started, and for one it attached to. Three states with
-            // completely different blast radii, previously distinguishable
-            // only by scraping the boot log. One of `external` /
-            // `embedded-owned` / `embedded-attached` / `degraded`; `unknown`
-            // only before boot reaches the PG block. Fixed at boot: it names
-            // the arm taken, not current liveness, so a cluster that dies
-            // later flips `reachable`, not `arm`.
-            "arm": crate::embedded_pg::db_arm().as_str(),
-            // The embedded cluster's loopback port, null off the embedded arms.
-            // Two runners reporting the same port is the observable form of the
-            // attach path's claim: one cluster, joined, not two fighting over a
-            // locked data dir.
-            "embeddedPort": crate::embedded_pg::embedded_port(),
-            // WHICH data dir is behind that port. `embeddedPort` alone cannot
-            // distinguish "this temp runner provisioned a private cluster"
-            // from "it attached to the machine-shared one" — the port is
-            // ephemeral either way. Null off the embedded arms.
-            "embeddedDataRoot": crate::embedded_pg::embedded_data_root(),
-            // How much of THIS response's latency was the PG probe. A timed-out
-            // probe costs exactly its 2s ceiling, which is most of a "slow"
-            // /health and has nothing to do with the UI thread — the 2026-08-19
-            // confound, now reported instead of inferred.
-            "probeMs": pg_probe_ms,
-            // Phase 1 of `2026-09-07-health-database-reachable-is-a-connect-
-            // probe-not-a-schema-probe`: does the SCHEMA the runner needs
-            // actually exist, not just "can we connect". `Some(true)` only
-            // when every relation in `SCHEMA_PROBE_REQUIRED_RELATIONS`
-            // resolves via `to_regclass()` — never a migration check, never a
-            // table scan. `None` means "could not determine" (the connect
-            // probe itself failed/is unknown, or the schema probe errored) —
-            // it must NEVER be read as `false`; `schema_detail` always
-            // explains whichever non-`Some(true)` state this is.
-            "schema_ok": schema_ok,
-            "schema_detail": schema_detail,
-        },
+        // PG liveness, the arm, the breaker and the schema check, from cached
+        // state (`database::pg::health`, plan Phase 5 / D7).
+        "database": crate::database::pg::health::database_health_json(&pg_health, pg_now),
         // Native message-loop liveness (plan
         // 2026-08-19-runner-blocked-ui-thread-cannot-be-closed, Phase 5).
         // `wedged: true` means the window is frozen and the X button does
@@ -2455,6 +2387,11 @@ async fn health(
             "pingEmitFailures": ping_emit_failures,
             "lastPingEmitOk": last_ping_emit_ok,
             "lastPingEmitFail": last_ping_emit_fail,
+            // The `ui-bridge-ping` OS thread's own liveness (`ui_ping.rs`):
+            // wall-clock ms of its last tick, 0 = it never ran. A ping thread
+            // that died reads as an aging stamp here, and the native verdict
+            // above then reads `ping_not_emitted` rather than wedged.
+            "pingThreadTickMs": crate::ui_ping::ping_thread_tick_ms(),
             "pingDelivery": ping_delivery.as_str(),
             "falseDeathSuppressed": false_death_suppressed,
             // Descriptor pressure — the RECEIVE side (plan 2026-09-09 pong
@@ -2478,6 +2415,14 @@ async fn health(
         // populated only when unauthenticated (incl. the gh-not-installed
         // case). /health never blocks on the probe.
         "prCredential": pr_credential_health(),
+        // The instance root this runner was launched under
+        // (`QONTINUI_INSTANCE_ROOT`), or `null` for a runner that is not a
+        // subject. Plan
+        // 2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-
+        // runner D5: a client that reached this port can tell a subject from
+        // the harness, and find the subject's own `~/.qontinui` (loopback key,
+        // api-port records) under `<instanceRoot>/home`.
+        "instanceRoot": crate::instance::instance_root().map(|r| r.display().to_string()),
         // Session-fabric Phase 0: how each proxied coord call resolved the
         // caller's own coord agent_session_id, since this process booted.
         // coord sees only "header present / absent" — this is the ONLY place
@@ -2530,7 +2475,9 @@ async fn health(
         // network / timeout. `retryingSessions` are on their own backoff;
         // `quarantinedSessions` had their rows moved to the
         // `<outbox>.quarantine.jsonl` sidecar after failing while coord served
-        // everything else. A stalled drain used to be invisible from here.
+        // everything else. `heartbeatsSuperseded` counts pending heartbeat
+        // rows dropped unsent because a newer heartbeat was queued right
+        // behind them. A stalled drain used to be invisible from here.
         "sessionOutbox": crate::session::coord_sync::session_outbox_health_json(),
         // Session-message push evidence (plan
         // 2026-09-07-session-message-delivery-is-blind-and-park-collection-
@@ -2614,6 +2561,13 @@ async fn health(
         // only populates where the fleet resource sample publishes, and `null`
         // there means the 256/400 floor by design, not a fault.
         "threadCeilings": crate::resource_guard::thread_ceilings_health_json(),
+        // Plan 2026-10-03-retire-the-continuation-session-cap-and-let-the-
+        // queue-pre-check-read-both-resource-lanes, Phase 3: what unattended
+        // admission (gate continuations, coord launches) would decide RIGHT
+        // NOW — the memory and thread lanes' readings, limits and verdicts, and
+        // the deferral stamp the pre-check would write. Read through the same
+        // `resource_guard::lane_verdicts` the gate uses. There is no count cap.
+        "spawnAdmission": crate::agent_runtime::spawn_admission_health_json(),
         // Same plan, Phase 0: the transcript-tail population — live, parked,
         // started/ended since boot, and the last cohort wake (>25 tails woken
         // inside 250 ms), which is the log line Evidence 5 of that plan was
@@ -2646,6 +2600,13 @@ async fn health(
         // For "is this runner out of date", use `buildDrift` below — it is
         // the only field here that can change while the window is open.
         "buildId": env!("RUNNER_BUILD_ID"),
+        // Which cargo profile DIRECTORY this binary was built into (`debug`,
+        // `release-checked`, …), read from the build's own `OUT_DIR`; `null`
+        // when unmeasured, never a defaulted `"debug"`. The opt-level and the
+        // derived `optimized` verdict are in `provenance.build` (plan
+        // 2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it,
+        // Phase 2). Compile-time, like `buildId`.
+        "buildProfile": qontinui_runner_lib::build_provenance::build_profile_json(),
         // WHAT TREE STATE the two build halves came from, as content hashes
         // (gitDirty, treeHash, rustSrcHash, frontendSrcHash, halvesAgree) —
         // compile-time constants, like `gitSha`/`buildId` above. Compare them
@@ -2683,6 +2644,11 @@ async fn health(
         // `{driftedTools: [], …}` = observed clean. Same producer as
         // `/coord-mcp/tool-policy`'s field, never re-derived.
         "coordMcpDrift": observed_coord_mcp_drift_json(),
+        // The reverse direction: names this door forwards that coord did not
+        // advertise to the DEVICE principal on the last readable `tools/list`.
+        // `null` = no device `tools/list` recorded since boot (UNKNOWN); an
+        // unreadable later answer leaves the previous reading in place.
+        "coordMcpForwardedUnadvertised": observed_forwarded_unadvertised_json(),
         // `coord_mcp_tenant_verdict_total{verdict}` since boot (plan
         // 2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-
         // answer-names-its-tenant, Phase 2): how coord-mcp answers compared
@@ -2729,6 +2695,14 @@ async fn health(
         // Foreign requester, since they name the other sites that reached this
         // runner.
         "originGuard": crate::mcp::origin_guard::health_json(requester.map(|e| e.0.class)),
+        // The six per-tenant egress switches (plan
+        // 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7): for
+        // each flow, whether it may send right now, which rung decided it
+        // (coord | persisted | profile | product_default), its coord domain,
+        // whether a flip applies only at the next start, and how many sends
+        // the switch refused in this process. The per-deployment answer to
+        // "which flows are on" — read by the desktop Privacy section.
+        "egress": crate::egress::health_json(),
         // Per-local-user connection guard (plan 2026-10-04-runner-loopback-
         // api-refuses-other-local-users): installed/enabled/supported, the kill
         // switch's name, and admit/refusal counters. No uid or SID is served —
@@ -2815,6 +2789,8 @@ async fn health(
         // the response root without descending into `data`. Same provenance
         // semantics — and same non-semantics — as `data.buildId` above.
         "buildId": env!("RUNNER_BUILD_ID"),
+        // Top-level mirror of `data.buildProfile`, for the same consumers.
+        "buildProfile": qontinui_runner_lib::build_provenance::build_profile_json(),
         // Top-level mirror of `data.provenance`, for the same consumers.
         "provenance": qontinui_runner_lib::build_provenance::health_json(),
         // Phase 3J.2 — top-level mirrors of `derived_status` and `ui_error`
@@ -2878,8 +2854,9 @@ async fn drain_handler(
 /// Gate (`coord_mcp::proxy_request_gate`, 401 before any network I/O):
 /// registered proxy nonce (from `Authorization: Bearer <nonce>` or the legacy
 /// `X-Coord-Mcp-Proxy-Key`) AND the live bearer decodes
-/// `sub_type == "device"` — the proxy must never attach a non-device token
-/// (agent-spawn sessions carry their own narrower JWT and never route here).
+/// `sub_type == "device"` for a DEVICE nonce. A nonce bound to an agent
+/// (`ProxyPrincipal::Agent`) forwards with THAT agent's own JWT instead; the
+/// proxy never attaches the device credential on an agent's behalf.
 ///
 /// Transport: coord `/mcp` is single-shot `application/json` JSON-RPC per POST
 /// (no SSE, no session machinery), so this is a plain passthrough — forward
@@ -5186,8 +5163,9 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// dedicated `/vcs/pull-requests` loopback route, not this proxy), reservations
 /// (`coord_migration_reserve`, `coord_reserve_resource`), policy/state
 /// mutation (`coord_request_policy`, `coord_flag_state`, `coord_flag_states`),
-/// and per-agent grants this device-only door never carries (`coord_fleet_drain`,
-/// `coord_fleet_undrain`, `coord_fleet_drain_host`, `coord_fleet_undrain_host`).
+/// and per-agent levers coord would also hand to every un-curated agent
+/// (`coord_fleet_drain`, `coord_fleet_undrain`, `coord_fleet_drain_host`,
+/// `coord_fleet_undrain_host`).
 ///
 /// LOAD-BEARING, do not strip as "reads nobody uses": `coord_list_prompt_documents`
 /// and `coord_get_prompt_document` are how the fleet reads served POLICY, and the
@@ -5542,10 +5520,21 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 ///   same shape as `coord_post_finding`: it records what an overlord did, and
 ///   performs nothing.
 ///
+/// * the triage-pass ledger (plan
+///   `2026-10-23-the-overlord-keeps-no-record-of-session-flow-so-its-development-runs-on-anecdote`
+///   Phase 2b) — `coord_overlord_pass_record` (twin `POST /coord/overlord/passes`),
+///   the store-of-record for one `/triage-sessions` pass and its per-terminal
+///   rows, so session FLOW (time-to-close, nudge→progress) is measured rather
+///   than recalled. Like `coord_overlord_record` it is an append-only,
+///   self-attributed write that performs nothing. Its reads
+///   (`coord_query_overlord_passes`, `coord_query_overlord_flow`) need no entry:
+///   they ride the `coord_query_` read-family prefix.
+///
 /// Finding `31a69d12` (posted by this runner itself on build `44691aaec4d4`)
 /// reported eleven names that coord ADVERTISED to this door's principal, which
 /// this list neither allowed nor named as deliberate. Each was classified; the
-/// design-fork record is coord finding `73b15a9b` (which revises `e652d447`).
+/// design-fork record is coord finding `4ba64e8b` (correcting `73b15a9b`, which
+/// revised `e652d447`).
 /// None of the eleven is on coord's device floor at coord `origin/main`
 /// `1e720228b802`, so which coord build and principal advertised them is
 /// unestablished. That is why forwarding
@@ -5567,6 +5556,44 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 ///
 /// The other eight are in [`COORD_MCP_DELIBERATE_EXCLUSIONS`], each with its
 /// reason in that list's note.
+///
+/// **The per-repo tenant binding writes are IN, with their risk stated** (plan
+/// `2026-10-17-per-repo-tenant-binding-overrides-the-org-tenant` Phase 6; the
+/// design fork is coord finding `e28caba2-9727-494a-91a0-4a321c377cb3`).
+/// `coord_bind_repo_tenant` / `coord_unbind_repo_tenant` move a repository's
+/// governance — and with it who coord mints that repo's push and clone tokens
+/// for — from one tenant to another. They are onboarding-family in substance,
+/// named outside the `coord_onboard` prefix on purpose so the sessions coord's
+/// bind door admits can reach them. What a LEAKED device nonce reaches through
+/// them: this proxy presents the paired device JWT, which passes coord's
+/// possession check, so possession is NOT the limit here. The limits are
+/// coord's: the device's USER must hold `admin` in BOTH the losing and the
+/// gaining tenant, the credential's own tenant must be one of the two, coord
+/// itself writes an audit row per tenant and a `repo_bound` / `repo_unbound`
+/// operator notification on every call, and either side undoes it with one
+/// call. Residual risk: tokens minted for the repo while a wrong binding stood
+/// are not taken back by the unbind. This differs from
+/// `coord_request_expedited_land`, withheld because a land cannot be undone and
+/// its only gate is that same possession check. `coord_enroll_repo` stays
+/// withheld as an onboarding-family name (its HTTP twin remains the door); the
+/// binding writes are let through because they carry a both-tenants admin
+/// check and a server-written audit and notification that no other
+/// onboarding-family write has — that is the security rationale the note
+/// above asks for. As of this entry coord does not serve the three binding
+/// tools yet; they are forwarded ahead, which the note below says is harmless.
+///
+/// `coord_merge_order` stays IN although coord keeps it off the device floor.
+/// It is a READ: it composes a safe merge ordering from the queue, the PR
+/// dependency edges and the plan `Depends-On` graph. coord grants it to the
+/// per-agent `merger` role template, and merger agents reach this door with
+/// their own JWT, so coord's allow-set is the gate for each principal: a device
+/// gets coord's refusal, and a merger gets the tool (the runner's merge-shepherd
+/// playbook names it as one of its merge levers). The reverse-parity
+/// observation reports it for a DEVICE principal, and that report is expected.
+/// It is not the only such name: about fifty forwarded names were off coord's
+/// device floor at `origin/main` `2e9c85585` (for example `coord_claim_acquire`,
+/// `coord_build_info`, `coord_yield`). That backlog is why the observation logs
+/// at INFO and is read from `/health`, not raised as a WARN on every boot.
 ///
 /// Forwarding a name coord does not yet serve is harmless — coord answers it as
 /// an unknown tool — so these entries may land ahead of the coord side.
@@ -5596,6 +5623,11 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_answer_agent_question",
     "coord_ask_question",
     "coord_attest_gate",
+    // Plan 2026-10-17-per-repo-tenant-binding-overrides-the-org-tenant Phase 6:
+    // the per-repo tenant binding door, forwarded ahead of coord serving it.
+    // coord will authorize it (the device user must be admin in BOTH tenants);
+    // this list only forwards. Risk and limits: the doc comment above.
+    "coord_bind_repo_tenant",
     "coord_bind_self_session",
     "coord_blockers",
     "coord_build_info",
@@ -5673,6 +5705,12 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_memory_search",
     "coord_memory_supersede",
     "coord_merge_order",
+    // Plan 2026-09-17-a-sender-cannot-see-its-ack-and-recon-reads-answer-for-the-credentials-tenant
+    // Phase 1: coord's sender-side receipt read — the messaging family's
+    // sender-side verb beside `coord_send_message` / `coord_inbox` / `coord_ack_message`,
+    // so a sender can see whether its message was delivered and acked. coord's
+    // device grant is the authority; this list only forwards.
+    "coord_message_status",
     "coord_migration_queue",
     "coord_mute_gate",
     "coord_next_step_settings_effective",
@@ -5680,6 +5718,13 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_operator_touch_classify",
     "coord_orient",
     "coord_overlord_interventions",
+    // Plan 2026-10-23-the-overlord-keeps-no-record-of-session-flow-so-its-development-runs-on-anecdote
+    // Phase 2b: the triage-PASS ledger write (twin `POST /coord/overlord/passes`).
+    // An append-only, self-attributed record of one /triage-sessions pass and its
+    // per-terminal rows; it records what the overlord observed and did, and
+    // performs nothing. Its two reads (`coord_query_overlord_passes`,
+    // `coord_query_overlord_flow`) ride the `coord_query_` prefix below.
+    "coord_overlord_pass_record",
     "coord_overlord_record",
     "coord_pending_agent_questions",
     "coord_pin_worktree",
@@ -5711,6 +5756,9 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_register_gate",
     "coord_reject_gate",
     "coord_reopen_gate",
+    // Plan 2026-10-17-per-repo-tenant-binding-overrides-the-org-tenant Phase 6:
+    // the bindings read twin.
+    "coord_repo_tenant_bindings",
     "coord_repoint_gate",
     "coord_report_status",
     "coord_request_handoff",
@@ -5727,8 +5775,14 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_snooze_gate",
     "coord_submit_escalate_evidence",
     "coord_symbol_lookup",
+    // Plan 2026-10-17-per-repo-tenant-binding-… Phase 6: the read twin of
+    // GET /coord/repos/tenants (which tenant governs a repo), previously absent.
+    "coord_tenants_for_repo",
     "coord_twin_catalog",
     "coord_typecheck_file",
+    // Plan 2026-10-17-per-repo-tenant-binding-overrides-the-org-tenant Phase 6:
+    // release / reclaim.
+    "coord_unbind_repo_tenant",
     "coord_unmute_gate",
     // Plan 2026-09-20-trust-calibration-… Phase 4: the lane's queue read.
     "coord_verification_queue",
@@ -5809,20 +5863,23 @@ fn coord_mcp_tool_is_allowed(name: &str) -> bool {
 /// MUST stay sorted — membership is a `binary_search`.
 ///
 /// Eight of them were added on the classification of finding `31a69d12` (record:
-/// coord finding `73b15a9b`, revising `e652d447`). None of them was forwarded
+/// coord finding `4ba64e8b`, correcting `73b15a9b`). None of them was forwarded
 /// before, so listing it here takes nothing away. Four join an existing family
 /// in the note above, and the fleet-drain writes start a new one (per-agent
 /// grants):
 ///
 /// * `coord_fleet_drain`, `coord_fleet_undrain`, `coord_fleet_drain_host`,
 ///   `coord_fleet_undrain_host`: coord keeps these off its device floor and
-///   grants them per AGENT (`decision_record/fleet-drain-agent-authority`).
-///   This door only ever attaches a DEVICE token: agent-spawn sessions carry
-///   their own JWT and never route here. So no agent holding the grant ever
-///   reaches it through this proxy. Forwarding could only matter if coord
-///   advertised them to a device, and in that case it would hand a fleet-wide
-///   capacity lever to every session on the box. That is exactly what the
-///   decision withholds from an ordinary implementation agent.
+///   grants them per AGENT (`decision_record/fleet-drain-agent-authority`), so
+///   a dev-ops agent holds them and an ordinary implementation agent does not.
+///   Agents DO reach this door: a nonce bound to an agent (`ProxyPrincipal::Agent`)
+///   forwards with that agent's own JWT. But coord gives an agent token with NO
+///   `coord.agent_tool_access` rows its whole UN-CURATED catalog (`allow ==
+///   None`), which includes these four. Forwarding them would therefore hand a
+///   fleet-wide capacity lever to every spawned agent that has no rows, which is
+///   exactly the agent the decision withholds them from. They stay withheld
+///   here until coord curates row-less agents; then move them to the allowlist
+///   and let coord's per-agent grant decide.
 /// * `coord_push_credential`: code publication. It mints a `contents:write`
 ///   token for ANY repository under a tenant-bound owner, including existing
 ///   ones, which is a raw push that bypasses the PR path. That is a stronger
@@ -5843,6 +5900,28 @@ fn coord_mcp_tool_is_allowed(name: &str) -> bool {
 ///   operator's release lever under the served `security-surface-implement-tier`
 ///   setting `draft-required` ("the operator undrafts to release it to the
 ///   train").
+///
+/// Two more are recorded here because coord grants them on the device floor and
+/// this list masks them on purpose. They were found while classifying the
+/// eleven above:
+///
+/// * `coord_create_pr`: coord grants it on the device floor (operator decision
+///   2026-08-04), and this door MASKS it anyway. That is a recorded deselection,
+///   not drift: served policy `git-operations`
+///   `masked-is-not-missing-and-the-loopback-door-precedes-the-fallback`, and the
+///   non-goal of plan `2026-08-22-primary-runner-build-drift-reads-as-a-policy-boundary`
+///   ("Do not allowlist it"). Sessions open PRs through the loopback
+///   `POST /vcs/pull-requests` door instead.
+/// * `coord_cancel_merge`: coord also put it on the device floor (2026-08-09,
+///   plan `2026-07-30-coord-tenant-self-service-merge-recovery`, coord#1409).
+///   Its HTTP twin `POST /pr-merge/tenant/proposals/:id/cancel` admits a device,
+///   so a session that must withdraw its own tenant's proposal still has that
+///   door. It stays withheld HERE for the same reason as `coord_create_pr`: the
+///   non-goal of plan
+///   `2026-08-22-primary-runner-build-drift-reads-as-a-policy-boundary` names it
+///   among the exclusions that are "decisions, not drift". It was explicitly
+///   left unmoved when `coord_reevaluate` was granted (2026-08-31). Reversing it
+///   is a decision to make on its own, not as a side effect of a parity sweep.
 const COORD_MCP_DELIBERATE_EXCLUSIONS: &[&str] = &[
     "coord_attest_advisory_ci_override",
     "coord_attest_escalate_override",
@@ -5965,6 +6044,7 @@ fn coord_mcp_tool_policy_json() -> serde_json::Value {
         // producer, so the two can never disagree about this binary.
         "gitSha": env!("QONTINUI_GIT_SHA"),
         "buildId": env!("RUNNER_BUILD_ID"),
+        "buildProfile": qontinui_runner_lib::build_provenance::build_profile_json(),
         "mainSha": main_sha,
         "buildDrift": build_drift,
         // The drift WARN's reader (plan
@@ -5973,6 +6053,8 @@ fn coord_mcp_tool_policy_json() -> serde_json::Value {
         // as `/health`'s `coordMcpDrift`. `null` = no `tools/list` observed
         // since boot (UNKNOWN, not zero); `{driftedTools: [], …}` = clean.
         "coordMcpDrift": observed_coord_mcp_drift_json(),
+        // The reverse direction, same producer as `/health`'s field.
+        "coordMcpForwardedUnadvertised": observed_forwarded_unadvertised_json(),
         // Say what the numbers mean, in the response, because a reader who has
         // to go find the rule will assume the wrong one.
         "readThis": "These are the lists COMPILED INTO THE RUNNING BINARY. A -32601 from \
@@ -6258,6 +6340,105 @@ fn coord_mcp_retain_allowed_tools(resp: &mut serde_json::Value, removed: &mut Ve
         }
     });
     true
+}
+
+/// The other direction of the parity check. Returns the exact names this door
+/// FORWARDS (`COORD_MCP_ALLOWED_TOOLS`) that coord's own `tools/list` for this
+/// principal does NOT advertise. coord filters `tools/list` by the caller's
+/// allow-set, so every name here is one this door would forward and coord would
+/// refuse: a capability the allowlist claims and the session does not have.
+///
+/// `None` means UNKNOWN, never "clean": the request is not a `tools/list`, the
+/// response is not JSON, there is no `result.tools` array, or coord paginated
+/// the list (`result.nextCursor`). One page cannot show what a later page
+/// carries. Names forwarded only through `COORD_MCP_ALLOWED_TOOL_PREFIXES` are
+/// never reported; an enumerated `coord_query_*` entry is. A name in this set
+/// is not necessarily wrong: an entry may land ahead of coord's grant on
+/// purpose (see the allowlist note). It is reported so that a
+/// forwarded-but-ungranted name is a visible, per-box fact, not a silent
+/// `-32601`.
+fn coord_mcp_forwarded_unadvertised(request: &[u8], response: &[u8]) -> Option<Vec<String>> {
+    if !coord_mcp_request_is_tools_list(request) {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(response).ok()?;
+    let result = parsed.get("result")?;
+    if result.get("nextCursor").is_some_and(|c| !c.is_null()) {
+        return None;
+    }
+    let advertised: std::collections::HashSet<&str> = result
+        .get("tools")?
+        .as_array()?
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+        .collect();
+    Some(
+        COORD_MCP_ALLOWED_TOOLS
+            .iter()
+            .filter(|name| !advertised.contains(**name))
+            .map(|name| name.to_string())
+            .collect(),
+    )
+}
+
+/// One forwarded-but-unadvertised observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedForwardedUnadvertised {
+    /// Forwarded names coord did not advertise, sorted. Empty = observed clean.
+    names: Vec<String>,
+    /// Unix millis of the `tools/list` that produced it.
+    observed_at: i64,
+}
+
+/// The last forwarded-but-unadvertised observation (see
+/// [`coord_mcp_forwarded_unadvertised`]), served beside `coordMcpDrift`. Only a
+/// DEVICE principal's `tools/list` is recorded: coord's answer differs by
+/// principal (device floor, a role template, or an un-curated agent's whole
+/// catalog), and the allowlist's parity target is the device floor. An agent's
+/// answer would report most of the list and overwrite the device reading.
+static LAST_OBSERVED_FORWARDED_UNADVERTISED: std::sync::OnceLock<
+    std::sync::Mutex<Option<ObservedForwardedUnadvertised>>,
+> = std::sync::OnceLock::new();
+
+fn observed_forwarded_unadvertised_cell(
+) -> &'static std::sync::Mutex<Option<ObservedForwardedUnadvertised>> {
+    LAST_OBSERVED_FORWARDED_UNADVERTISED.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Record one observation. Returns `true` when the set CHANGED from the last
+/// one this process recorded, so the caller warns once per distinct set rather
+/// than on every `tools/list`.
+fn record_forwarded_unadvertised_in(
+    cell: &std::sync::Mutex<Option<ObservedForwardedUnadvertised>>,
+    names: Vec<String>,
+) -> bool {
+    let Ok(mut g) = cell.lock() else {
+        return false;
+    };
+    let changed = g.as_ref().map(|o| o.names != names).unwrap_or(true);
+    *g = Some(ObservedForwardedUnadvertised {
+        names,
+        observed_at: chrono::Utc::now().timestamp_millis(),
+    });
+    changed
+}
+
+/// Wire shape: `null` = never observed (UNKNOWN); otherwise the names, their
+/// count and when. Same producer for `/health` and `/coord-mcp/tool-policy`.
+fn observed_forwarded_unadvertised_json() -> serde_json::Value {
+    match observed_forwarded_unadvertised_cell()
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+    {
+        Some(o) => serde_json::json!({
+            "principal": "device",
+            "forwardedUnadvertisedTools": o.names,
+            "forwardedUnadvertisedCount": o.names.len(),
+            "observedAt": o.observed_at,
+        }),
+        None => serde_json::Value::Null,
+    }
 }
 
 /// What a `tools/list` entry with no string `name` is recorded as in the
@@ -8684,6 +8865,33 @@ async fn coord_mcp_proxy_handler(
         bytes
     };
 
+    // The reverse direction, measured on the UNFILTERED upstream answer: names
+    // this door forwards that coord does not grant a DEVICE principal. Warned
+    // once per distinct set; served on `/health` + `/coord-mcp/tool-policy`.
+    // An agent's `tools/list` is not recorded (its grant is a different set).
+    let unadvertised = if matches!(&principal, crate::coord_mcp::ProxyPrincipal::Device) {
+        coord_mcp_forwarded_unadvertised(&body, &bytes)
+    } else {
+        None
+    };
+    if let Some(unadvertised) = unadvertised {
+        let count = unadvertised.len();
+        let joined = unadvertised.join(",");
+        if record_forwarded_unadvertised_in(observed_forwarded_unadvertised_cell(), unadvertised)
+            && count > 0
+        {
+            // INFO, not WARN: a known backlog of forwarded names sits off coord's
+            // device floor (see the allowlist note), so a WARN on every boot would
+            // train readers to ignore it. `/health` serves the set.
+            info!(
+                forwarded_unadvertised_count = count,
+                forwarded_unadvertised = %joined,
+                "coord-mcp proxy: COORD_MCP_ALLOWED_TOOLS forwards tools coord does not grant \
+                 the device principal — a device session calling them gets coord's refusal"
+            );
+        }
+    }
+
     // Keep the two gates in agreement: a `tools/list` answer is filtered
     // through the same allowlist that gates `tools/call`, so this door never
     // advertises a tool it would refuse to forward. See
@@ -10718,7 +10926,18 @@ async fn coord_work_unit_deps_get_handler(
 // ---------------------------------------------------------------------------
 
 /// Request body for `POST /coord-mcp/provision-session`.
+///
+/// **`deny_unknown_fields` is load-bearing, not tidiness.** This is a
+/// cross-repo wire contract whose callers live in other checkouts
+/// (qontinui-claude-config's `coord-provision-nonce.sh`, the bundled
+/// `coord-revive`), and serde's default is to DROP a key it does not know. A
+/// misspelled tenant key therefore used to deserialize as "no tenant" and mint
+/// on the machine's default slot with a 200 — measured live (coord finding
+/// `659b574a`), when every shipped caller sent `tenant_id` while this struct
+/// only knew `tenant`. An unknown key is now a typed 400
+/// `COORD_MCP_PROVISION_INVALID_BODY`, so the NEXT drift reports itself.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProvisionSessionBody {
     /// The requesting session's working directory. The minted nonce is BOUND to
     /// this path (`NonceBinding::workdir`), which is what gives a bare session
@@ -10746,7 +10965,14 @@ struct ProvisionSessionBody {
     /// exactly the tenant-less document. That is the point of the switch: one
     /// lever reverses "a chosen tenant reaches the credential" on every door,
     /// rather than on the spawn paths while this one quietly keeps pinning.
-    #[serde(default)]
+    ///
+    /// **Accepted as `tenant_id` too.** Plan
+    /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P2
+    /// specified the field as `tenant_id`, and that is the spelling every
+    /// shipped caller sends (`coord-provision-nonce.sh`, which `/coord-revive`
+    /// L4 source 3 drives, and the runner's own bundled copy of it). Sending
+    /// both keys is a duplicate-field 400, never a silent pick.
+    #[serde(default, alias = "tenant_id")]
     tenant: Option<uuid::Uuid>,
 }
 
@@ -10854,7 +11080,7 @@ struct ProvisionSessionBody {
 ///
 /// | Status | `code` | Meaning |
 /// |---|---|---|
-/// | 400 | `COORD_MCP_PROVISION_INVALID_BODY` | body is not `{cwd:String, tenant?:Uuid}` (a non-UUID `tenant` lands here) |
+/// | 400 | `COORD_MCP_PROVISION_INVALID_BODY` | body is not `{cwd:String, tenant?:Uuid}` — `tenant_id` is accepted as an alias for `tenant`; a non-UUID tenant, both spellings at once, and any other key all land here |
 /// | 400 | `COORD_MCP_PROVISION_INVALID_CWD` | `cwd` empty or not an existing dir |
 /// | 403 | `COORD_MCP_PROVISION_NO_HANDSHAKE` | no (or empty) `X-Qontinui-Loopback-Key` header |
 /// | 403 | `COORD_MCP_PROVISION_HANDSHAKE_MISMATCH` | handshake presented, not this runner start's key |
@@ -10936,7 +11162,8 @@ fn provision_session_after_gate(body: &[u8]) -> axum::response::Response {
                 "COORD_MCP_PROVISION_INVALID_BODY",
                 format!(
                     "expected a JSON body of the shape {{\"cwd\": \"<path>\", \
-                     \"tenant\"?: \"<uuid>\"}}: {e}"
+                     \"tenant\"?: \"<uuid>\"}} (\"tenant_id\" is accepted for \
+                     \"tenant\"; any other key is refused): {e}"
                 ),
             );
         }
@@ -11634,16 +11861,18 @@ pub fn create_router(
         // D4+D6 Blind-Spot Recommender Phase 2 — read-through observer facade.
         observer_registry,
         // Phase 3 vision pipeline (cache + concurrency).
-        // Cache root = `tmp_vision_cache/` under the runner's working dir
-        // (scratch-file whitelist per feedback_scratch_file_paths.md).
+        // Cache root = the instance-scoped DataLocal dir
+        // `<data_local>/com.qontinui.runner/vision_cache[/instance-<name>]`,
+        // never the source checkout or the process CWD; unresolvable = loud
+        // failure (plan 2026-10-22-runner-ui-bridge-makes-an-agent-guess-its-own-vocabulary D2).
         // Cap = 512 MB per plan §3.5.
         vision_cache: {
-            let runner_root = crate::mcp::shared::current_runner_path()
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| {
-                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-                });
-            let root = runner_root.join("tmp_vision_cache");
+            let data_local_base = qontinui_runner_lib::instance_env::runner_data_local_base();
+            let root = crate::mcp::ui_bridge::vision_capture_access::vision_cache_root_from(
+                data_local_base,
+                crate::instance::scope_path,
+            )
+            .unwrap_or_else(|e| panic!("vision cache init: {e}"));
             Arc::new(
                 qontinui_vision_core::VisionCache::new(&root, 512 * 1024 * 1024)
                     .unwrap_or_else(|e| panic!("vision cache init at {}: {e}", root.display())),
@@ -12072,8 +12301,11 @@ pub fn create_router(
         handle.listen("ui-bridge-pong", move |event| {
             // EVENT PROVENANCE, from whichever window answered: this pong
             // answered a `ui-bridge-ping` the event loop delivered, and
-            // travelled back as a Tauri event, so it proves the native loop
-            // is pumping. `ui_bridge_last_pong` cannot carry that fact — the
+            // travelled back as a Tauri event (the FALLBACK leg since the
+            // 2026-10-19 ui-wedge plan: the frontend answers over
+            // `POST /ui-bridge/pong?source=event` first, because a JS `emit`
+            // runs on `app-rt` and never settles while it is starved), so it
+            // proves the native loop is pumping. `ui_bridge_last_pong` cannot carry that fact — the
             // frontend also pongs unconditionally over HTTP, which WebView2
             // serves from its browser process while the UI thread is frozen.
             //
@@ -12098,45 +12330,10 @@ pub fn create_router(
         });
     }
 
-    // Start UI Bridge ping task (every 3s)
-    {
-        let handle = app_handle.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
-            loop {
-                interval.tick().await;
-                // The `Result` is CHECKED, not discarded. This emit is the
-                // unfiltered broadcast (`handle.emit`, not `emit_to`), so it
-                // posts to every live window handle — and on Windows a single
-                // destroyed pop-out makes it fail with
-                // `ERROR_INVALID_WINDOW_HANDLE (0x80070578)`. It failed 119,012
-                // times on the operator box on 2026-09-01 while `let _ =`
-                // swallowed every one of them, and `ui_dead_now` — whose only
-                // evidence is a pong that this ping is supposed to elicit —
-                // called the UI dead 49 times as a result.
-                //
-                // Recording both arms is what lets `ui_error::ping_delivery_now`
-                // tell "the UI did not answer" from "we never asked".
-                match handle.emit(
-                    "ui-bridge-ping",
-                    serde_json::json!({ "timestamp": chrono::Utc::now().timestamp_millis() }),
-                ) {
-                    Ok(()) => crate::ui_error::record_ping_emit_ok(),
-                    Err(e) => {
-                        crate::ui_error::record_ping_emit_failure();
-                        // Deliberately `debug!`: a storm is 20/minute and the
-                        // COUNTER on `/health` is the surface meant to carry
-                        // it. One line per failure at `warn!` would be the
-                        // 119,012-line log this plan is cleaning up.
-                        tracing::debug!(
-                            error = %e,
-                            "ui-bridge-ping emit failed — the frontend was not asked for a pong"
-                        );
-                    }
-                }
-            }
-        });
-    }
+    // The `ui-bridge-ping` emitter is NOT started here any more: it runs on its
+    // own OS thread, started from `main.rs` setup beside the API server spawn
+    // (`ui_ping.rs`). A `tokio::spawn` here landed on `app-rt`, which is what
+    // let a starved runtime stop the ping.
 
     // Resume interrupted unified workflows on startup
     let state_for_resume = api_state.clone();
@@ -13876,8 +14073,11 @@ fn try_bind_port(port: u16) -> Result<std::net::TcpListener, std::io::Error> {
     // co-located with the runner. Loopback traffic bypasses Windows Firewall, so
     // every uniquely-renamed `qontinui-runner-<id>.exe` copy avoids triggering a
     // first-run permission prompt. Also reduces attack surface — the API is never
-    // exposed to LAN.
-    socket.bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())?;
+    // exposed to LAN. Every URL the runner builds for its own API names this SAME
+    // constant (`runner_loopback_base`), so the address a self-call dials cannot
+    // drift from the address bound here.
+    socket
+        .bind(&std::net::SocketAddr::from((crate::mcp::types::RUNNER_API_BIND_IP, port)).into())?;
     socket.listen(1024)?;
     Ok(socket.into())
 }
@@ -14020,17 +14220,16 @@ pub async fn start_server(
     let router = create_router(app_state, rag_state, app_handle, instance_manager);
     info!("MCP API server: create_router returned, entering bind loop");
 
-    // D3 (self-healing degraded mode): if the runner booted degraded (PG
-    // unreachable + QONTINUI_ALLOW_NO_DB), start a background probe that
-    // reconnects + provisions and lifts the pg_guard 503 gate when PG returns —
-    // no restart needed for a transient outage. No-op on a normal boot.
-    if !crate::database::pg::pg_available() {
-        if let Some(pg) = crate::database::pg::PgDb::try_global() {
-            tracing::warn!(
-                "Runner booted DEGRADED (no PG); starting background PG reconnect probe"
-            );
-            pg.spawn_reconnect_probe();
+    // The PG circuit breaker's prober needs a process-lived runtime: this one.
+    // On a degraded boot (breaker Open, `cause=boot`) the prober starts now and
+    // reconnects + provisions, lifting the pg_guard 503 when PG returns; on a
+    // normal boot it starts on the first runtime trip.
+    if let Some(pg) = crate::database::pg::PgDb::try_global() {
+        if !crate::database::pg::pg_available() {
+            tracing::warn!("Runner booted DEGRADED (no PG); starting the PG breaker's prober");
         }
+        pg.start_background(tokio::runtime::Handle::current());
+        crate::database::pg::health::spawn_health_refresher();
     }
 
     // Try the requested port first, then fallback ports if zombie connections are blocking
@@ -15222,6 +15421,7 @@ mod self_id_chain_tests {
             provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: None,
             handle: None,
             account_label: None,
@@ -15236,10 +15436,12 @@ mod self_id_chain_tests {
             finished_at: None,
             wind_down_outcome: None,
             wind_down_at: None,
+            wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
         }
     }
 
@@ -17280,10 +17482,11 @@ mod memory_search_enrichment_tests {
 mod coord_mcp_body_gate_tests {
     use super::{
         coord_mcp_append_runner_local_tools, coord_mcp_body_gate,
-        coord_mcp_filter_tools_list_response, coord_mcp_runner_local_call,
-        coord_mcp_tool_is_allowed, coord_mcp_withholding_is_deliberate, CoordMcpToolsListFilter,
-        COORD_MCP_ALLOWED_METHODS, COORD_MCP_ALLOWED_TOOLS, COORD_MCP_DELIBERATE_EXCLUSIONS,
-        RUNNER_LOCAL_REPORT_TOOL,
+        coord_mcp_filter_tools_list_response, coord_mcp_forwarded_unadvertised,
+        coord_mcp_runner_local_call, coord_mcp_tool_is_allowed,
+        coord_mcp_withholding_is_deliberate, record_forwarded_unadvertised_in,
+        CoordMcpToolsListFilter, COORD_MCP_ALLOWED_METHODS, COORD_MCP_ALLOWED_TOOLS,
+        COORD_MCP_DELIBERATE_EXCLUSIONS, RUNNER_LOCAL_REPORT_TOOL,
     };
 
     fn gate(v: serde_json::Value) -> Result<(), (serde_json::Value, String)> {
@@ -17404,6 +17607,7 @@ mod coord_mcp_body_gate_tests {
             "coord_session_obligations",
             "coord_overlord_record",
             "coord_overlord_interventions",
+            "coord_overlord_pass_record",
         ] {
             assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
             assert!(!coord_mcp_withholding_is_deliberate(tool));
@@ -17414,6 +17618,95 @@ mod coord_mcp_body_gate_tests {
                 }))
                 .is_ok(),
                 "{tool} must be callable through the proxy"
+            );
+            assert_eq!(
+                parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+                1,
+                "the parser must read {tool} exactly once: {:?}",
+                parsed.allowed
+            );
+        }
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+        // The pass ledger's two reads are NOT named in the list: they forward
+        // through the `coord_query_` read-family prefix, so the parser must not
+        // find them as named entries while the gate still lets them through.
+        for read in ["coord_query_overlord_passes", "coord_query_overlord_flow"] {
+            assert!(coord_mcp_tool_is_allowed(read), "{read} must forward");
+            assert!(!coord_mcp_withholding_is_deliberate(read));
+            assert!(
+                gate(serde_json::json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":read,"arguments":{}}
+                }))
+                .is_ok(),
+                "{read} must be callable through the proxy"
+            );
+            assert!(
+                !parsed.allowed.iter().any(|t| t == read),
+                "{read} rides the prefix and must not be named: {:?}",
+                parsed.allowed
+            );
+        }
+    }
+
+    /// Plan `2026-09-17-a-sender-cannot-see-its-ack-and-recon-reads-answer-for-the-credentials-tenant`
+    /// Phase 1: coord's sender-side receipt read forwards beside its messaging
+    /// siblings, sits in sorted position, and the source-text parser reads it
+    /// back exactly once despite the comment above it.
+    #[test]
+    fn coord_message_status_is_allowed_beside_its_messaging_siblings() {
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        for tool in [
+            "coord_ack_message",
+            "coord_inbox",
+            "coord_message_status",
+            "coord_send_message",
+        ] {
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
+            assert!(!coord_mcp_withholding_is_deliberate(tool));
+            assert!(
+                COORD_MCP_ALLOWED_TOOLS.binary_search(&tool).is_ok(),
+                "{tool} must sit in sorted position"
+            );
+            assert_eq!(
+                parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+                1,
+                "the parser must read {tool} exactly once: {:?}",
+                parsed.allowed
+            );
+        }
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
+    /// Plan `2026-10-17-per-repo-tenant-binding-overrides-the-org-tenant`
+    /// Phase 6: the per-repo tenant binding tools and the repo-tenants read
+    /// twin forward (the binding tools ahead of coord serving them). Their
+    /// names deliberately stay OUT of the `coord_onboard` family, whose prefix
+    /// exclusion would mask them from the device-provisioned sessions coord's
+    /// bind door is designed to admit — so this pins both that
+    /// they forward and that no deliberate exclusion (named or by prefix)
+    /// claims them, and that the source-text parser reads each exactly once
+    /// despite the comments above them.
+    #[test]
+    fn repo_tenant_binding_tools_forward_and_are_not_deliberately_withheld() {
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        for tool in [
+            "coord_bind_repo_tenant",
+            "coord_repo_tenant_bindings",
+            "coord_tenants_for_repo",
+            "coord_unbind_repo_tenant",
+        ] {
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
+            // Covers the named exclusions AND the `coord_onboard` prefix.
+            assert!(
+                !coord_mcp_withholding_is_deliberate(tool),
+                "{tool} must not be deliberately withheld (by name or prefix)"
+            );
+            assert!(
+                COORD_MCP_ALLOWED_TOOLS.binary_search(&tool).is_ok(),
+                "{tool} must sit in sorted position"
             );
             assert_eq!(
                 parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
@@ -17979,9 +18272,139 @@ mod coord_mcp_body_gate_tests {
         }
     }
 
+    /// The proxy-vs-coord mismatches found beside finding `31a69d12`, pinned by
+    /// name. `coord_create_pr` and `coord_cancel_merge` are coord device grants
+    /// that this door masks on purpose (served policy `git-operations`
+    /// `masked-is-not-missing-and-the-loopback-door-precedes-the-fallback`).
+    /// `coord_merge_order` is off coord's device floor but granted to merger
+    /// agents, which reach this door with their own JWT, so it stays forwarded.
+    #[test]
+    fn proxy_and_coord_grant_mismatches_are_decided() {
+        assert!(coord_mcp_tool_is_allowed("coord_merge_order"));
+        assert!(!coord_mcp_withholding_is_deliberate("coord_merge_order"));
+        for tool in ["coord_create_pr", "coord_cancel_merge"] {
+            assert!(
+                !coord_mcp_tool_is_allowed(tool),
+                "{tool} must not be forwarded"
+            );
+            assert!(
+                coord_mcp_withholding_is_deliberate(tool),
+                "{tool} must be a recorded exclusion, not drift"
+            );
+        }
+    }
+
+    fn tools_list_answer(names: &[&str], next_cursor: Option<&str>) -> Vec<u8> {
+        let tools: Vec<serde_json::Value> = names
+            .iter()
+            .map(|n| serde_json::json!({ "name": n }))
+            .collect();
+        let mut result = serde_json::json!({ "tools": tools });
+        if let Some(c) = next_cursor {
+            result["nextCursor"] = serde_json::json!(c);
+        }
+        serde_json::to_vec(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": result}))
+            .unwrap()
+    }
+
+    /// Proxy ⊆ coord grant. When coord advertises every forwarded name, the
+    /// reverse check reports nothing. Drop one from coord's answer and exactly
+    /// that name is reported. A `coord_query_*` name forwarded only by prefix is
+    /// never reported, but an ENUMERATED one is. A tool coord advertises that
+    /// this door does not forward is the OTHER direction's business, so it is
+    /// not reported here either.
+    #[test]
+    fn forwarded_unadvertised_reports_exactly_the_forwarded_names_coord_withholds() {
+        let mut all: Vec<&str> = COORD_MCP_ALLOWED_TOOLS.to_vec();
+        all.push("coord_create_pr");
+        all.push("coord_query_anything");
+        let clean = coord_mcp_forwarded_unadvertised(
+            TOOLS_LIST_REQ.as_bytes(),
+            &tools_list_answer(&all, None),
+        );
+        assert_eq!(
+            clean,
+            Some(Vec::new()),
+            "every forwarded name advertised = clean"
+        );
+
+        let missing = COORD_MCP_ALLOWED_TOOLS[0];
+        let without: Vec<&str> = all.iter().copied().filter(|n| *n != missing).collect();
+        let got = coord_mcp_forwarded_unadvertised(
+            TOOLS_LIST_REQ.as_bytes(),
+            &tools_list_answer(&without, None),
+        );
+        assert_eq!(got, Some(vec![missing.to_string()]));
+
+        // An enumerated `coord_query_*` entry IS reported when coord omits it.
+        let enumerated = "coord_query_verification_metrics";
+        assert!(COORD_MCP_ALLOWED_TOOLS.contains(&enumerated));
+        let without_query: Vec<&str> = all.iter().copied().filter(|n| *n != enumerated).collect();
+        let got = coord_mcp_forwarded_unadvertised(
+            TOOLS_LIST_REQ.as_bytes(),
+            &tools_list_answer(&without_query, None),
+        );
+        assert_eq!(got, Some(vec![enumerated.to_string()]));
+    }
+
+    /// UNKNOWN is never reported as clean: a non-`tools/list` request, a
+    /// non-JSON body, a body with no `result.tools`, and a PAGINATED list (one
+    /// page cannot show what a later page carries) all answer `None`.
+    #[test]
+    fn forwarded_unadvertised_is_unknown_when_the_list_cannot_be_read_whole() {
+        let call =
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coord_orient"}}"#;
+        assert_eq!(
+            coord_mcp_forwarded_unadvertised(call, &tools_list_answer(&[], None)),
+            None
+        );
+        assert_eq!(
+            coord_mcp_forwarded_unadvertised(TOOLS_LIST_REQ.as_bytes(), b"<html>gateway</html>"),
+            None
+        );
+        assert_eq!(
+            coord_mcp_forwarded_unadvertised(
+                TOOLS_LIST_REQ.as_bytes(),
+                br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"x"}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            coord_mcp_forwarded_unadvertised(
+                TOOLS_LIST_REQ.as_bytes(),
+                &tools_list_answer(&["coord_orient"], Some("page-2"))
+            ),
+            None
+        );
+        // A batch `tools/list` answers with an array; no `result` at the top.
+        assert_eq!(
+            coord_mcp_forwarded_unadvertised(
+                TOOLS_LIST_REQ.as_bytes(),
+                br#"[{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}]"#
+            ),
+            None
+        );
+    }
+
+    /// The warn fires once per DISTINCT set, not on every `tools/list`.
+    #[test]
+    fn forwarded_unadvertised_warns_once_per_distinct_set() {
+        let cell = std::sync::Mutex::new(None);
+        assert!(record_forwarded_unadvertised_in(
+            &cell,
+            vec!["coord_a".into()]
+        ));
+        assert!(!record_forwarded_unadvertised_in(
+            &cell,
+            vec!["coord_a".into()]
+        ));
+        assert!(record_forwarded_unadvertised_in(&cell, vec![]));
+        assert!(!record_forwarded_unadvertised_in(&cell, vec![]));
+    }
+
     /// Finding `31a69d12`: the eleven names coord advertised that this door had
     /// left unclassified. A literal enumeration of the decision recorded in
-    /// coord finding `73b15a9b`. Moving any name between the two lists reds
+    /// coord finding `4ba64e8b`. Moving any name between the two lists reds
     /// this test by name, so the decision cannot change by drift.
     #[test]
     fn finding_31a69d12_drift_is_classified() {
@@ -18735,7 +19158,9 @@ mod coord_mcp_tool_policy_tests {
             "deliberateExclusionPrefixes",
             "gitSha",
             "buildId",
+            "buildProfile",
         ] {
+            assert!(served.get(key).is_some(), "{key} missing over the wire");
             assert_eq!(served[key], direct[key], "{key} differs over the wire");
         }
     }
@@ -19960,6 +20385,80 @@ mod coord_provision_session_gate_tests {
         );
     }
 
+    /// Coord finding `659b574a`: every shipped caller spells the selector
+    /// `tenant_id` (plan 2026-09-10 P2's name), and before the alias serde
+    /// dropped it — so a named tenant minted on the machine's default slot with
+    /// a 200. Both spellings select; both at once, and any unknown key, refuse.
+    #[test]
+    fn provision_body_takes_tenant_id_and_refuses_unknown_keys() {
+        use super::ProvisionSessionBody;
+        let t = uuid::Uuid::from_u128(0xC5C5_0000_0000_4000_8000_0000_0000_00C5);
+        let aliased: ProvisionSessionBody =
+            serde_json::from_str(&format!(r#"{{"cwd":"/tmp","tenant_id":"{t}"}}"#)).unwrap();
+        assert_eq!(
+            aliased.tenant,
+            Some(t),
+            "tenant_id is the fleet callers' spelling and must select, not vanish"
+        );
+
+        assert!(
+            serde_json::from_str::<ProvisionSessionBody>(&format!(
+                r#"{{"cwd":"/tmp","tenant":"{t}","tenant_id":"{t}"}}"#
+            ))
+            .is_err(),
+            "both spellings at once is a duplicate field, never a silent pick"
+        );
+
+        for body in [
+            r#"{"cwd":"/tmp","tennant":"x"}"#,
+            r#"{"cwd":"/tmp","tenantId":"00000000-0000-4000-8000-0000deadbeef"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ProvisionSessionBody>(body).is_err(),
+                "an unknown key must refuse rather than read as 'no tenant': {body}"
+            );
+        }
+    }
+
+    /// The route-level half of `659b574a`: the measured defect was
+    /// `{"cwd", "tenant_id": <unpaired>}` answering **200** with a document
+    /// minted on the default slot. Through the post-gate half it must now be the
+    /// same typed 403 the `tenant` spelling gets, and a misspelled key a 400 —
+    /// neither of which mints anything for the caller's cwd.
+    #[tokio::test]
+    async fn a_tenant_id_body_is_admitted_like_tenant_and_a_misspelling_is_refused() {
+        let amb = crate::test_env::isolated_ambient();
+        let tenant = uuid::Uuid::from_u128(0xD6D6_0000_0000_4000_8000_0000_0000_00D6);
+        let cwd = amb.dir().join("provision-tenant-id-cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd_str = cwd.to_string_lossy().to_string();
+
+        let body = serde_json::json!({ "cwd": cwd_str, "tenant_id": tenant.to_string() });
+        let resp = super::provision_session_after_gate(body.to_string().as_bytes());
+        assert_eq!(resp.status(), 403, "tenant_id must reach tenant admission");
+        let v = body_json(resp).await;
+        assert_eq!(v["code"], "COORD_MCP_PROVISION_TENANT_NOT_PAIRED");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&tenant.to_string()),
+            "the refusal names the tenant the caller sent under tenant_id: {v}"
+        );
+
+        let body = serde_json::json!({ "cwd": cwd_str, "tenantId": tenant.to_string() });
+        let resp = super::provision_session_after_gate(body.to_string().as_bytes());
+        assert_eq!(resp.status(), 400, "an unknown key is refused, not dropped");
+        let v = body_json(resp).await;
+        assert_eq!(v["code"], "COORD_MCP_PROVISION_INVALID_BODY");
+
+        let registry = crate::coord_mcp::NonceRegistry::global().test_live();
+        assert!(
+            registry.values().all(|b| b.workdir() != cwd_str),
+            "neither refusal may mint anything for the caller's cwd"
+        );
+    }
+
     /// Phase 5, the load-bearing half: a `tenant` this runner holds no
     /// credential for is a typed 403 naming the tenant, decided BEFORE the
     /// mint — the nonce registry is byte-identical afterwards, so the caller
@@ -20210,6 +20709,67 @@ mod coord_provision_session_gate_tests {
             "the fields must be rendered from that live pin"
         );
         assert!(src.contains(".route(\"/health\", get(health))"));
+    }
+
+    /// Plan `2026-10-10-spec-front-end-phase-9-generic-boundary` Phase 7:
+    /// `/health` carries the `egress` block, rendered by the one
+    /// `egress::health_json` (same source-scan technique as the tests around
+    /// it), and that block names all six flows.
+    #[test]
+    fn the_health_handler_emits_the_egress_block() {
+        let src = include_str!("mcp_api.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("async fn health("))
+            .expect("the /health handler is `async fn health(`");
+        let end = lines[start..]
+            .iter()
+            .position(|l| *l == "}")
+            .map(|i| start + i)
+            .expect("the handler closes at column 0");
+        let region = lines[start..=end]
+            .iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            region.contains("\"egress\": crate::egress::health_json()"),
+            "{region}"
+        );
+        let block = crate::egress::health_json();
+        for flow in crate::egress::Flow::ALL {
+            assert_eq!(block[flow.key()]["domain"], flow.domain());
+        }
+    }
+
+    /// Plan `2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it`
+    /// Phase 2: `/health` carries `buildProfile` TWICE — under `data` beside
+    /// `buildId`, and at the root beside the root-level `buildId` mirror —
+    /// both rendered by the one `build_provenance::build_profile_json`, and
+    /// `provenance` (both copies) carries the `build` object it mirrors.
+    #[test]
+    fn the_health_handler_emits_build_profile_in_data_and_at_the_root() {
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let emit = "\"buildProfile\": qontinui_runner_lib::build_provenance::build_profile_json()";
+        assert_eq!(region.matches(emit).count(), 2, "{region}");
+        assert_eq!(
+            region
+                .matches("\"provenance\": qontinui_runner_lib::build_provenance::health_json()")
+                .count(),
+            2,
+            "{region}"
+        );
+        let provenance = qontinui_runner_lib::build_provenance::health_json();
+        assert_eq!(
+            provenance["build"]["profile"],
+            qontinui_runner_lib::build_provenance::build_profile_json()
+        );
     }
 
     /// Plan `2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-
