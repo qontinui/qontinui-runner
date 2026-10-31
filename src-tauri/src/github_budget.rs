@@ -16,8 +16,7 @@
 //! or — the common case on an operator box — `gh auth token`
 //! (`session_pr_reconciler::resolve_github_token`, `ci_node::sibling`), which
 //! is the *same user token the sampler measured*. It then polls on that token
-//! every 30s (`session_pr_reconciler::POLL_INTERVAL`) and as often as every 10s
-//! (`trigger_system::watchers::pr_watcher`). Re-measured 2026-09-01:
+//! every 30s (`session_pr_reconciler::POLL_INTERVAL`). Re-measured 2026-09-01:
 //! **309 calls in 301s ≈ 62/min ≈ 3,700/hr on that one shared token**, and the
 //! runner exported *nothing* about it — no counter, no gauge, no ETag cache,
 //! and no statement of which bucket it was billing.
@@ -393,7 +392,7 @@ pub fn low_fraction() -> f64 {
 #[serde(rename_all = "camelCase")]
 pub struct ConsumerRow {
     /// Which subsystem issued the call — e.g. `session_pr_reconciler`,
-    /// `pr_watcher`, `ci_node`. Free-form on purpose: a new caller should show
+    /// `ci_node`. Free-form on purpose: a new caller should show
     /// up in the histogram without a code change here.
     pub consumer: String,
     /// [`normalize_url_template`] of the request URL.

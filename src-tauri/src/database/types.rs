@@ -290,9 +290,9 @@ pub struct TaskRun {
     pub is_meta_optimizer: bool,
 
     // ========================================================================
-    // Review Fields
+    // Review Fields (no new run sets these; older rows may)
     // ========================================================================
-    /// Whether this task run is a review subtask (code review of a PR).
+    /// Whether this task run was a review subtask (code review of a PR).
     #[serde(default)]
     pub is_review: bool,
     /// Whether this task blocks its parent from completing.
@@ -339,8 +339,6 @@ pub struct CreateTaskRunInput {
     pub log_sources_json: Option<String>,
     pub workflow_type: Option<String>,
     pub parent_task_run_id: Option<String>,
-    pub root_task_run_id: Option<String>,
-    pub depth: u32,
     pub workspace_id: Option<String>,
     pub triggered_by: Option<String>,
     pub bridge_id: Option<String>,
@@ -351,8 +349,6 @@ pub struct CreateTaskRunInput {
     pub is_fixer: bool,
     pub fixer_source_task_run_id: Option<String>,
     pub is_meta_optimizer: bool,
-    pub is_review: bool,
-    pub blocks_parent: bool,
     pub runner_port: Option<u16>,
 }
 
@@ -373,8 +369,6 @@ impl CreateTaskRunInput {
             log_sources_json: None,
             workflow_type: None,
             parent_task_run_id: None,
-            root_task_run_id: None,
-            depth: 0,
             workspace_id: None,
             triggered_by: None,
             bridge_id: None,
@@ -385,8 +379,6 @@ impl CreateTaskRunInput {
             is_fixer: false,
             fixer_source_task_run_id: None,
             is_meta_optimizer: false,
-            is_review: false,
-            blocks_parent: false,
             runner_port: None,
         }
     }
@@ -457,18 +449,6 @@ impl CreateTaskRunInput {
         self
     }
 
-    /// Set the root task run ID for the task hierarchy.
-    pub fn with_root_task_run_id(mut self, root_id: impl Into<String>) -> Self {
-        self.root_task_run_id = Some(root_id.into());
-        self
-    }
-
-    /// Set the nesting depth (0 = root/top-level task).
-    pub fn with_depth(mut self, depth: u32) -> Self {
-        self.depth = depth;
-        self
-    }
-
     /// Set the workspace/organization ID from the web backend.
     pub fn with_workspace_id(mut self, workspace_id: impl Into<String>) -> Self {
         self.workspace_id = Some(workspace_id.into());
@@ -526,18 +506,6 @@ impl CreateTaskRunInput {
     /// Mark this task run as a meta-optimizer run.
     pub fn with_is_meta_optimizer(mut self, is_meta_optimizer: bool) -> Self {
         self.is_meta_optimizer = is_meta_optimizer;
-        self
-    }
-
-    /// Mark this task run as a review subtask.
-    pub fn with_is_review(mut self, is_review: bool) -> Self {
-        self.is_review = is_review;
-        self
-    }
-
-    /// Mark this task as blocking its parent from completing.
-    pub fn with_blocks_parent(mut self, blocks_parent: bool) -> Self {
-        self.blocks_parent = blocks_parent;
         self
     }
 

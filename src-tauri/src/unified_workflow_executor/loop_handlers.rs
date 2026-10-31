@@ -1306,31 +1306,6 @@ impl LoopController {
 
         let failure_context = verification_result.build_failure_context();
 
-        // Prepend CI failure context if this is a CI-triggered auto-resume
-        let failure_context = if let Some(ref ci_ctx) = config.ci_failure_context {
-            let mut ci_section = String::from("## CI Failure Context\n\n");
-            if ci_ctx.merge_conflict {
-                ci_section.push_str(
-                    "**Merge conflict detected** — resolve conflicts before proceeding.\n\n",
-                );
-            }
-            if !ci_ctx.failed_check_names.is_empty() {
-                ci_section.push_str(&format!(
-                    "The following CI checks failed: {}\n\n",
-                    ci_ctx.failed_check_names.join(", ")
-                ));
-            }
-            for (check_name, log) in &ci_ctx.check_logs {
-                ci_section.push_str(&format!(
-                    "### {} (log excerpt)\n```\n{}\n```\n\n",
-                    check_name, log
-                ));
-            }
-            format!("{}{}", ci_section, failure_context)
-        } else {
-            failure_context
-        };
-
         // Inject convergence analysis into the failure context.
         // The detector's context_injection contains formatted warnings about
         // stuck, diverging, oscillating, or plateau patterns — giving the AI

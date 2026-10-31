@@ -185,8 +185,8 @@ pub(crate) struct LoopContext {
     pub best_passed_checks: usize,
     /// Last iteration where passed_checks improved over the previous best.
     pub last_progress_iteration: u32,
-    /// Number of times this task was auto-resumed by the PR watcher after CI failure.
-    /// Tracked here for Phase 2 integration.
+    /// Always 0: nothing increments it. Still written to
+    /// `task_runs.ci_auto_resumes`.
     pub ci_auto_resumes: u32,
 
     /// The run's `any_stage_passed` accumulator as of this stage's START.

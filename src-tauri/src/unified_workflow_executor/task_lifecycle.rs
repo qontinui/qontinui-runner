@@ -40,30 +40,6 @@ impl LoopController {
             }
         }
 
-        // If this task is a review subtask, process its outcome before writing status.
-        // The outcome may redirect to mark_task_failed instead of completing.
-        if let Ok(Some(tr)) = self.app_state.pg_db.get_task_run(execution_id).await {
-            if tr.is_review {
-                let parent_id = tr.parent_task_run_id.as_deref().unwrap_or("");
-                if !parent_id.is_empty() {
-                    let should_complete = super::review_subtask::process_review_outcome(
-                        &self.app_state.pg_db,
-                        execution_id,
-                    )
-                    .await;
-                    if !should_complete {
-                        info!(
-                            "Review {} requested changes, marking as failed instead of completed",
-                            execution_id
-                        );
-                        self.mark_task_failed(execution_id, "changes_requested", workflow_id)
-                            .await;
-                        return;
-                    }
-                }
-            }
-        }
-
         // Release advisory file registry entries on completion
         self.app_state
             .file_registry_manager
@@ -430,7 +406,7 @@ impl LoopController {
             }
 
             // ── Parent advancement: failed blocking children also unblock parents ──
-            // A failed review (or any blocking child) should let the parent proceed
+            // A failed blocking child should let the parent proceed
             // rather than leaving it permanently blocked.
             {
                 let pg = self.app_state.pg_db.clone();

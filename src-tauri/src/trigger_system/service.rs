@@ -410,34 +410,6 @@ impl TriggerService {
                     trigger.name, config.source, config.target
                 );
             }
-
-            super::types::TriggerConfig::PrWatch {
-                github_token,
-                poll_interval_seconds,
-                auto_resume_on_ci_failure: _,
-                max_auto_resumes: _,
-            } => {
-                let pr_deps = watchers::pr_watcher::PrWatcherDeps {
-                    app_state: self.deps.app_state.clone(),
-                    config_storage: self.deps.config_storage.clone(),
-                    app_handle: self.deps.app_handle.clone(),
-                    pid_tracker: self.deps.pid_tracker.clone(),
-                };
-                let handle = watchers::pr_watcher::start_pr_watcher(
-                    self.deps.app_state.pg_db.clone(),
-                    github_token.clone(),
-                    *poll_interval_seconds,
-                    watcher_stop,
-                    Some(pr_deps),
-                );
-
-                let mut handles = self.watcher_handles.write().await;
-                handles.insert(trigger.id.clone(), WatcherHandle::Task(handle));
-                info!(
-                    "Registered PR watcher for trigger '{}' ({}s interval)",
-                    trigger.name, poll_interval_seconds
-                );
-            }
         }
 
         Ok(())
