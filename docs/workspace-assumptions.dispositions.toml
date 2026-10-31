@@ -609,3 +609,16 @@ reviewed = [
     "\"powershell\",",
     "\"pwsh\",",
 ]
+
+# qontinui-runner#2376 (plan 2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch
+# Phase 2): the PermissionRequest hook carrier's shell-program list.
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/session/claude_hook.rs"
+symbol = "const SHELL_PROGRAMS"
+disposition = "fallback_correct"
+note = "Shell-name stems compared against the argv[0] of a spawn on every OS, never launched or required: the env-var carrier applies only where an interactive shell resolves `claude` through the identity shim. pwsh/powershell are two entries among ten (bash, sh, zsh, fish, dash, ksh, cmd, nu); on a box without PowerShell they match nothing and the rest decide as before."
+reviewed = [
+    "\"powershell\",",
+    "\"pwsh\",",
+]

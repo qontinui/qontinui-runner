@@ -821,6 +821,24 @@
     },
     {
       "class": "os_bound_tooling",
+      "file": "src/session/claude_hook.rs",
+      "symbol": "const SHELL_PROGRAMS",
+      "excerpt": "\"powershell\",",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Shell-name stems compared against the argv[0] of a spawn on every OS, never launched or required: the env-var carrier applies only where an interactive shell resolves `claude` through the identity shim. pwsh/powershell are two entries among ten (bash, sh, zsh, fish, dash, ksh, cmd, nu); on a box without PowerShell they match nothing and the rest decide as before."
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/session/claude_hook.rs",
+      "symbol": "const SHELL_PROGRAMS",
+      "excerpt": "\"pwsh\",",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "Shell-name stems compared against the argv[0] of a spawn on every OS, never launched or required: the env-var carrier applies only where an interactive shell resolves `claude` through the identity shim. pwsh/powershell are two entries among ten (bash, sh, zsh, fish, dash, ksh, cmd, nu); on a box without PowerShell they match nothing and the rest decide as before."
+    },
+    {
+      "class": "os_bound_tooling",
       "file": "src/session/tracking_health.rs",
       "symbol": "const WORK_CHILD_IMAGES",
       "excerpt": "\"powershell\",",
