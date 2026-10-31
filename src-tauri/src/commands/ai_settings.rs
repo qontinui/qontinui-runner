@@ -1566,8 +1566,9 @@ pub async fn refresh_account_usage_snapshot() -> Vec<AccountUsageInfo> {
 /// lone Claude account spends a usage window that coord's launch budget has to
 /// count (plan `2026-10-29-launch-budget-is-a-coord-answer-not-a-per-box-script`
 /// Phase 2). That includes a runner with NO configured account list, whose one
-/// account is its effective config dir. Before that plan, this half sent
-/// nothing for such a runner.
+/// account is its `claude_cli.config_dir` or the default `~/.claude` (see
+/// [`effective_account_dir`]). Before that plan, this half sent nothing for
+/// such a runner.
 pub async fn refresh_fleet_usage_report() -> Vec<AccountUsageInfo> {
     refresh_usage(UsageRefreshCaller::FleetReport).await
 }
@@ -1614,16 +1615,28 @@ fn plan_usage_refresh(dir_count: usize, caller: UsageRefreshCaller) -> UsageRefr
     }
 }
 
-/// The effective config dir of a runner with no configured account list, when
-/// it names a real subscription account. A model-gateway dir is not one:
-/// subscription usage is switched off under a gateway, so a probe of it is an
-/// error row, not a reading.
+/// The one account a runner with no configured account list runs on: the
+/// explicit `claude_cli.config_dir` when set, else the platform default
+/// `~/.claude` when it exists. It is chosen WITHOUT the credential check
+/// `get_effective_config_dir` applies, on purpose. A logged-out account is then
+/// probed and reported as an error row, the way a listed account in the same
+/// state is, instead of vanishing and leaving coord its last good reading.
+/// Under a model gateway there is no subscription account to report, so this
+/// returns `None`.
 fn effective_account_dir() -> Option<String> {
-    let ai_settings = settings::get_ai_settings();
-    match crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli) {
-        (_, crate::ai_provider::ClaudeConfigDirSource::ModelGateway) => None,
-        (dir, _) => dir,
+    if crate::model_gateway::gateway_declared() {
+        return None;
     }
+    settings::get_ai_settings()
+        .claude_cli
+        .config_dir
+        .filter(|dir| !dir.trim().is_empty())
+        .or_else(|| {
+            dirs::home_dir()
+                .map(|home| home.join(".claude"))
+                .filter(|dir| dir.is_dir())
+                .map(|dir| dir.to_string_lossy().into_owned())
+        })
 }
 
 async fn refresh_usage(caller: UsageRefreshCaller) -> Vec<AccountUsageInfo> {
