@@ -985,6 +985,9 @@ export function isElementActionAllowed(allowedActions: readonly string[], action
   if (allowedActions.length === 0) return true;
   if (allowedActions.includes(action)) return true;
   if (action === "hoverClick" && allowedActions.includes("click")) return true;
+  // `unhover` releases what `hover` forced, so it is allowed wherever `hover` is
+  // (mirrors the Rust `is_action_advertised` unhover exemption).
+  if (action === "unhover" && allowedActions.includes("hover")) return true;
   return false;
 }
 

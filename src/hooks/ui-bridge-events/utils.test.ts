@@ -178,6 +178,14 @@ describe("isElementActionAllowed — execute_action per-element gate", () => {
   it("does NOT exempt hoverClick when click is absent", () => {
     expect(isElementActionAllowed(["focus", "blur", "hover"], "hoverClick")).toBe(false);
   });
+
+  it("exempts unhover wherever hover is advertised (releases a forced hover)", () => {
+    expect(isElementActionAllowed(["focus", "click", "hover"], "unhover")).toBe(true);
+  });
+
+  it("does NOT exempt unhover when hover is absent", () => {
+    expect(isElementActionAllowed(["focus", "click"], "unhover")).toBe(false);
+  });
 });
 
 describe("compileEvaluateExpression — page_evaluate wrapping", () => {
