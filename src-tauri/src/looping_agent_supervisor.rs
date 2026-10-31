@@ -126,6 +126,18 @@ fn clear_held_slot(agent_id: &str) -> Option<HeldSlot> {
 /// edge-triggered rather than emitted every 5s tick (the same
 /// log-only-on-transition discipline `fleet_policy_poller` uses).
 #[allow(clippy::type_complexity)]
+/// Last observed `(tab_alive, idle, cadence_elapsed)` per agent, for
+/// edge-triggered tick-state logging (see [`log_tick_state`]).
+static LAST_TICK_STATE: Mutex<Option<HashMap<String, (bool, bool, bool)>>> = Mutex::new(None);
+
+/// When each agent last got the "cadence elapsed but the tab never looks idle"
+/// warning, so a stuck gate is reported every [`STUCK_IDLE_WARN_EVERY_MS`], not
+/// every 5s tick.
+static LAST_STUCK_IDLE_WARN: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
+
+/// Re-warn interval for a tab that is overdue for a nudge but not idle.
+const STUCK_IDLE_WARN_EVERY_MS: i64 = 10 * 60 * 1000;
+
 static LAST_POSTURE: Mutex<Option<HashMap<String, (bool, u32, DesiredSource)>>> = Mutex::new(None);
 
 /// Registry file path, port-namespaced like the session lifecycle store so a
@@ -505,6 +517,8 @@ async fn supervise_one(
         relaunch_every_cycles: rec.def.lifecycle_policy.relaunch_every_cycles,
     };
 
+    log_tick_state(&rec.def.id, &input, rec.def.cadence_secs, now_ms);
+
     // CLAIM-FIRST: the gate makes a lease-less spawn/relaunch structurally
     // impossible. This is the whole point of the phase — not "check whether a
     // shepherd exists and spawn if not" (a TOCTOU race every runner in the
@@ -600,12 +614,44 @@ async fn supervise_one(
                         rt.last_cycle_started_at_ms = Some(now_ms);
                     });
                 }
-                Err(e) => warn!(
-                    agent = %rec.def.id,
-                    terminal = %tid,
-                    error = %e,
-                    "looping_agent_supervisor: nudge submit failed (will retry next tick)"
-                ),
+                Err(e) => {
+                    let exited = e
+                        .to_string()
+                        .starts_with(crate::terminal::session::TERMINAL_EXITED);
+                    // A tab whose process exited stays registered, so it reads
+                    // as alive and every later nudge fails the same way. Retrying
+                    // cannot recover it; respawn instead, through the same
+                    // lease + registry gates a `Relaunch` passes.
+                    if exited && holds_lease && authz_permits_spawn {
+                        warn!(
+                            agent = %rec.def.id,
+                            terminal = %tid,
+                            error = %e,
+                            "looping_agent_supervisor: tab process exited — respawning fresh"
+                        );
+                        if let Some(tm) = app.try_state::<Arc<crate::terminal::TerminalManager>>()
+                        {
+                            if let Err(ce) = tm.inner().close(tid) {
+                                warn!(
+                                    agent = %rec.def.id,
+                                    terminal = %tid,
+                                    error = %ce,
+                                    "looping_agent_supervisor: closing exited tab failed — proceeding to respawn"
+                                );
+                            }
+                        }
+                        let prompt = spawn_prompt(&rec.def, true).await;
+                        do_spawn(app, registry, &rec.def, prompt, false, true).await;
+                    } else {
+                        warn!(
+                            agent = %rec.def.id,
+                            terminal = %tid,
+                            error = %e,
+                            exited,
+                            "looping_agent_supervisor: nudge submit failed (will retry next tick)"
+                        );
+                    }
+                }
             }
         }
         Action::Relaunch(reason) => {
@@ -826,6 +872,48 @@ async fn reconcile_slot_lease(
         }
     }
     false
+}
+
+/// Make the nudge gate observable. Without this a tab that is overdue for its
+/// next cycle but never looks idle (a processing indicator or spinner glyph on
+/// screen, or no `❯` prompt row — see `looping_agent::idle`) produces no log
+/// line at all, so "no further cycles" cannot be told apart from "the agent is
+/// disabled".
+///
+/// Edge-triggered at info on any change of `(tab_alive, idle, cadence_elapsed)`,
+/// plus a rate-limited warn while the cadence is elapsed and a live tab is not
+/// idle.
+fn log_tick_state(agent_id: &str, input: &TickInput, cadence_secs: u64, now_ms: i64) {
+    let now = (input.tab_alive, input.idle, input.cadence_elapsed);
+    {
+        let mut guard = LAST_TICK_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let map = guard.get_or_insert_with(HashMap::new);
+        if map.get(agent_id) != Some(&now) {
+            map.insert(agent_id.to_string(), now);
+            info!(
+                agent = %agent_id,
+                tab_alive = input.tab_alive,
+                idle = input.idle,
+                cadence_elapsed = input.cadence_elapsed,
+                "looping_agent_supervisor: tick state changed"
+            );
+        }
+    }
+    if input.tab_alive && input.cadence_elapsed && !input.idle {
+        let mut guard = LAST_STUCK_IDLE_WARN.lock().unwrap_or_else(|e| e.into_inner());
+        let map = guard.get_or_insert_with(HashMap::new);
+        let due = map
+            .get(agent_id)
+            .is_none_or(|at| now_ms - *at >= STUCK_IDLE_WARN_EVERY_MS);
+        if due {
+            map.insert(agent_id.to_string(), now_ms);
+            warn!(
+                agent = %agent_id,
+                cadence_secs,
+                "looping_agent_supervisor: next cycle is due but the tab does not look idle                  (processing text / spinner on screen, or no input prompt row) — not nudging"
+            );
+        }
+    }
 }
 
 /// Edge-triggered posture logging: emit a line only when an agent's effective
