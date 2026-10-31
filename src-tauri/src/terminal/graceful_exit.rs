@@ -14,9 +14,19 @@
 //!
 //! 1. **Probe the pane's process subtree.** No `claude` → `NoLiveClaude`, and
 //!    nothing is typed (typing into a bare shell is not a no-op). An
-//!    unreadable table → `ProbeUnavailable`. More than one `claude` (a nested
-//!    one would not leave with `/exit`), or a `claude` with child processes
-//!    attached → `Refused`.
+//!    unreadable table → `ProbeUnavailable`.
+//!
+//!    **Then check the close authority.** A live `claude` has been found and
+//!    nothing has been typed yet. A caller that presents no
+//!    [`CloseAuthority`] is refused `NoCloseAuthority` here (plan
+//!    `2026-10-28-one-session-lifecycle-authority`, Phase 14 / R0a). No
+//!    production code can mint one until the lifecycle Closer does (Phase
+//!    93), so today EVERY production call that finds a live `claude` ends
+//!    here — see [`crate::terminal::close_authority`].
+//!
+//!    Past the authority: more than one `claude` (a nested one would not
+//!    leave with `/exit`), or a `claude` with child processes attached →
+//!    `Refused`.
 //! 2. **Check the screen** ([`exit_prompt_ready`]): the cursor sits at the
 //!    start of an empty `❯` input line, the screen looks idle, and no dialog is
 //!    showing. Otherwise `Refused` — typing `\r` into a permission dialog would
@@ -36,7 +46,8 @@
 //!
 //! There is no kill anywhere in this module; the tab-closing callback is
 //! reachable only from the gone arm, and the tests below pin that. The one
-//! public entry point is `TerminalManager::graceful_exit`, whose close skips
+//! public entry point is `TerminalManager::graceful_exit`, which takes the
+//! caller's `Option<CloseAuthority>` and hands it to [`drive`]. Its close skips
 //! the kill entirely when the pane's own process (the `claude`, when it is the
 //! pane root) has already exited.
 //!
@@ -64,6 +75,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::process_capture::process_tree::{claude_pids_in_inclusive_subtree, ProcessSnapshot};
+use crate::terminal::close_authority::CloseAuthority;
 use qontinui_runner_lib::looping_agent::idle::{
     snapshot_looks_idle, DIALOG_CHROME_MARKERS, DIALOG_SCAN_ROWS,
 };
@@ -405,6 +417,13 @@ pub async fn probe_claude_under(root_pid: Option<u32>, tracked: Vec<ProcIdentity
                 .to_string(),
         );
     };
+    // Test builds only: a pane registered with [`fake_process_table`] under a
+    // pid no real process can hold reads its scripted view instead of the OS
+    // table. Every real pid falls through to the snapshot below.
+    #[cfg(test)]
+    if let Some(scripted) = fake_process_table::probe(root, &tracked) {
+        return scripted;
+    }
     let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
     probe_from_snapshot(root, &snapshot, &tracked)
 }
@@ -449,6 +468,17 @@ pub enum GracefulExitOutcome {
     },
     /// No `claude` in the pane's subtree; nothing was typed or closed.
     NoLiveClaude,
+    /// A live `claude` IS in the pane, and the caller presented no
+    /// [`CloseAuthority`]. Nothing was typed and nothing was closed (plan
+    /// `2026-10-28-one-session-lifecycle-authority`, Phase 14 / R0a).
+    ///
+    /// On every build that ships today, EVERY caller that finds a live
+    /// `claude` gets this answer. No production code can mint an authority
+    /// until the lifecycle Closer does (Phase 93).
+    NoCloseAuthority {
+        /// The `claude` pids the probe found.
+        claude_pids: Vec<u32>,
+    },
     /// The process table could not be read before starting; nothing was typed
     /// or closed.
     ProbeUnavailable { detail: String },
@@ -476,6 +506,27 @@ pub enum GracefulExitOutcome {
         claude_pids: Vec<u32>,
         detail: String,
     },
+}
+
+impl GracefulExitOutcome {
+    /// The outcome's wire word — exactly the `outcome` tag it serializes
+    /// with — for log lines and refusal reasons, so a log reader greps the same
+    /// word a JSON reader sees (`no_close_authority`, `exit_stuck`, …).
+    ///
+    /// An exhaustive `match`, so a new variant cannot ship unnamed.
+    pub fn word(&self) -> &'static str {
+        match self {
+            Self::Exited { .. } => "exited",
+            Self::ExitStuck { .. } => "exit_stuck",
+            Self::Refused { .. } => "refused",
+            Self::NoLiveClaude => "no_live_claude",
+            Self::NoCloseAuthority { .. } => "no_close_authority",
+            Self::ProbeUnavailable { .. } => "probe_unavailable",
+            Self::WriteFailed { .. } => "write_failed",
+            Self::CloseRefused { .. } => "close_refused",
+            Self::CloseOutcomeUnknown { .. } => "close_outcome_unknown",
+        }
+    }
 }
 
 /// What the close step did — the answer to the ONE question `drive` cannot ask
@@ -518,12 +569,19 @@ fn millis(d: Duration) -> u64 {
 /// `screen` reads its rendered grid, `probe` looks at its processes (given the
 /// identities to check for anywhere in the table), `close_tab` closes it. The
 /// pane is reached no other way.
+///
+/// `authority` is the caller's [`CloseAuthority`]. It is checked once the first
+/// probe has found a live `claude`, and before any byte reaches it. `None`
+/// there answers [`GracefulExitOutcome::NoCloseAuthority`] with nothing typed
+/// and nothing closed. A pane with no live `claude` answers `NoLiveClaude`, and
+/// an unreadable table answers `ProbeUnavailable`, whatever was presented.
 pub async fn drive<W, S, P, PF, C, CF>(
     mut write: W,
     mut screen: S,
     mut probe: P,
     close_tab: C,
     timing: ExitTiming,
+    authority: Option<CloseAuthority>,
 ) -> GracefulExitOutcome
 where
     W: FnMut(&[u8]) -> Result<(), String>,
@@ -539,17 +597,31 @@ where
         ClaudeProbe::Readable(view) => view,
     };
     let claude_pids = pids_of(&initial.subtree_claude);
-    match initial.subtree_claude.len() {
-        0 => return GracefulExitOutcome::NoLiveClaude,
-        1 => {}
-        n => {
-            return GracefulExitOutcome::Refused {
-                reason: format!(
-                    "{n} claude processes in the pane — a nested claude does not leave with /exit"
-                ),
-                claude_pids,
-            }
-        }
+    if initial.subtree_claude.is_empty() {
+        return GracefulExitOutcome::NoLiveClaude;
+    }
+
+    // (1b) The close authority (R0a). A live `claude` has just been found and
+    // nothing has been typed, so this is the last point at which a refusal
+    // touches nothing. It sits BEFORE the nested-claude and child refusals on
+    // purpose. The refusal must not depend on any predicate a later change can
+    // relax: a caller without an authority is refused here however few
+    // children its `claude` has. And this is the refusal a box that restarts
+    // into this build logs, so it shows up as `no_close_authority` in the
+    // wind-down log. The binding is held to the end of the protocol, because
+    // the authority covers this one close attempt and no other.
+    let Some(_authority) = authority else {
+        return GracefulExitOutcome::NoCloseAuthority { claude_pids };
+    };
+
+    let n = initial.subtree_claude.len();
+    if n > 1 {
+        return GracefulExitOutcome::Refused {
+            reason: format!(
+                "{n} claude processes in the pane — a nested claude does not leave with /exit"
+            ),
+            claude_pids,
+        };
     }
     if initial.top_level_children > 0 {
         return GracefulExitOutcome::Refused {
@@ -668,6 +740,82 @@ where
                 last_probe_unreadable = true;
             }
         }
+    }
+}
+
+/// Test-only scripted process tables, keyed by a pane root pid that no real
+/// process can hold.
+///
+/// [`drive`]'s own tests script `probe` directly. A test that must enter
+/// through a CALLER of the primitive cannot: the wind-down arms, the steward
+/// stop, the relay's end and the debug door all reach `probe_claude_under`
+/// through `TerminalManager::graceful_exit`, which reads the real OS table.
+/// Registering a pane here gives that path the same `PaneProcesses` view the
+/// driver tests use. Everything between the caller and the probe stays
+/// production code.
+#[cfg(test)]
+pub(crate) mod fake_process_table {
+    use super::{ClaudeProbe, PaneProcesses, ProcIdentity};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Mutex, OnceLock, PoisonError};
+
+    /// First fake root pid. Above Linux's `pid_max` ceiling (2^22) and above any
+    /// pid Windows hands out in practice, so no real pane can collide with one.
+    const FAKE_PID_BASE: u32 = 4_000_000_000;
+
+    static NEXT_PID: AtomicU32 = AtomicU32::new(FAKE_PID_BASE);
+
+    fn table() -> &'static Mutex<HashMap<u32, PaneProcesses>> {
+        static TABLE: OnceLock<Mutex<HashMap<u32, PaneProcesses>>> = OnceLock::new();
+        TABLE.get_or_init(Mutex::default)
+    }
+
+    /// A registered pane. Unregistered when dropped, so tests running in
+    /// parallel never see each other's panes (each has its own pid).
+    #[derive(Debug)]
+    pub(crate) struct FakePane {
+        pub(crate) root_pid: u32,
+    }
+
+    impl Drop for FakePane {
+        fn drop(&mut self) {
+            table()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&self.root_pid);
+        }
+    }
+
+    /// Register a pane whose every probe reads `view`, under a fresh fake root
+    /// pid.
+    pub(crate) fn register(view: PaneProcesses) -> FakePane {
+        let root_pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+        table()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(root_pid, view);
+        FakePane { root_pid }
+    }
+
+    /// The scripted probe for `root_pid`, or `None` for any pid nobody
+    /// registered (every real one). Of the identities asked about, those the
+    /// view holds (in its subtree or as alive elsewhere) read alive.
+    pub(super) fn probe(root_pid: u32, tracked: &[ProcIdentity]) -> Option<ClaudeProbe> {
+        let view = table()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&root_pid)?
+            .clone();
+        let tracked_alive = tracked
+            .iter()
+            .copied()
+            .filter(|id| view.subtree_claude.contains(id) || view.tracked_alive.contains(id))
+            .collect();
+        Some(ClaudeProbe::Readable(PaneProcesses {
+            tracked_alive,
+            ..view
+        }))
     }
 }
 
@@ -1097,6 +1245,7 @@ mod tests {
             ),
             recording_close(log.clone()),
             timing(),
+            Some(CloseAuthority::for_test()),
         )
         .await;
         assert_eq!(
@@ -1140,6 +1289,7 @@ mod tests {
             ),
             refusing_close(log.clone()),
             timing(),
+            Some(CloseAuthority::for_test()),
         )
         .await;
         assert_eq!(
@@ -1167,6 +1317,7 @@ mod tests {
             ),
             recording_close(log.clone()),
             timing(),
+            Some(CloseAuthority::for_test()),
         )
         .await;
         assert_eq!(
@@ -1190,6 +1341,7 @@ mod tests {
             scripted_probe(vec![readable(&[CLAUDE], 0, &[CLAUDE])], log.clone()),
             recording_close(log.clone()),
             timing(),
+            Some(CloseAuthority::for_test()),
         )
         .await;
         assert!(
@@ -1227,6 +1379,7 @@ mod tests {
                 deadline: Duration::from_secs(5),
                 ..timing()
             },
+            Some(CloseAuthority::for_test()),
         )
         .await;
         assert_eq!(
@@ -1273,6 +1426,7 @@ mod tests {
                 scripted_probe(vec![probe], log.clone()),
                 recording_close(log.clone()),
                 timing(),
+                Some(CloseAuthority::for_test()),
             )
             .await;
             match &outcome {
@@ -1303,6 +1457,7 @@ mod tests {
             scripted_probe(vec![readable(&[CLAUDE], 0, &[])], log.clone()),
             recording_close(log.clone()),
             timing(),
+            Some(CloseAuthority::for_test()),
         )
         .await;
         match &outcome {
@@ -1355,6 +1510,7 @@ mod tests {
             scripted_probe(vec![readable(&[CLAUDE], 0, &[])], log.clone()),
             recording_close(log.clone()),
             timing(),
+            Some(CloseAuthority::for_test()),
         )
         .await;
         match &outcome {
@@ -1372,30 +1528,164 @@ mod tests {
         assert!(!entries(&log).iter().any(|e| e == "close"));
     }
 
+    /// No `claude`, or an unreadable table, answers the same with or WITHOUT
+    /// an authority. Neither types anything, so the authority is never asked
+    /// for. This is what keeps the relay's close of a bare shell pane
+    /// (`NoLiveClaude` → its own `tm.close`) unchanged by R0a.
     #[tokio::test(start_paused = true)]
     async fn no_claude_or_an_unreadable_table_types_nothing() {
-        for (probe, expected) in [
-            (readable(&[], 0, &[]), GracefulExitOutcome::NoLiveClaude),
+        for with_authority in [true, false] {
+            for (probe, expected) in [
+                (readable(&[], 0, &[]), GracefulExitOutcome::NoLiveClaude),
+                (
+                    ClaudeProbe::Unreadable("x".into()),
+                    GracefulExitOutcome::ProbeUnavailable {
+                        detail: "x".to_string(),
+                    },
+                ),
+            ] {
+                let log: Log = Arc::default();
+                let pane = FakePane::new(empty_prompt(), true);
+                let outcome = drive(
+                    pane.write(log.clone()),
+                    pane.screen(),
+                    scripted_probe(vec![probe], log.clone()),
+                    recording_close(log.clone()),
+                    timing(),
+                    with_authority.then(CloseAuthority::for_test),
+                )
+                .await;
+                assert_eq!(outcome, expected, "with_authority={with_authority}");
+                assert_eq!(entries(&log).len(), 1, "with_authority={with_authority}");
+            }
+        }
+    }
+
+    /// R0a: a live `claude` and no authority is refused `NoCloseAuthority`
+    /// after ONE probe, before any byte reaches the pane and before any close.
+    ///
+    /// The first case is the one that matters most: one `claude`, ZERO
+    /// children, at an empty prompt that echoes. With an authority, that pane
+    /// is typed into (`exits_then_closes_only_after_two_consecutive_gone_probes`).
+    /// The other cases pin that the refusal does not wait on any later
+    /// predicate: children, a nested `claude`, a draft or a dialog each answer
+    /// `NoCloseAuthority` too, not their own refusal.
+    #[tokio::test(start_paused = true)]
+    async fn a_live_claude_without_an_authority_is_refused_before_any_byte() {
+        let cases: Vec<(ClaudeProbe, ScreenText, Vec<u32>)> = vec![
+            (readable(&[CLAUDE], 0, &[]), empty_prompt(), vec![42]),
+            (readable(&[CLAUDE], 3, &[]), empty_prompt(), vec![42]),
             (
-                ClaudeProbe::Unreadable("x".into()),
-                GracefulExitOutcome::ProbeUnavailable {
-                    detail: "x".to_string(),
-                },
+                readable(&[CLAUDE, id(43, 1_001)], 0, &[]),
+                empty_prompt(),
+                vec![42, 43],
             ),
-        ] {
+            (readable(&[CLAUDE], 0, &[]), draft_prompt(), vec![42]),
+            (readable(&[CLAUDE], 0, &[]), permission_dialog(), vec![42]),
+        ];
+        for (probe, initial, pids) in cases {
             let log: Log = Arc::default();
-            let pane = FakePane::new(empty_prompt(), true);
+            let pane = FakePane::new(initial, true);
             let outcome = drive(
                 pane.write(log.clone()),
                 pane.screen(),
                 scripted_probe(vec![probe], log.clone()),
                 recording_close(log.clone()),
                 timing(),
+                None,
             )
             .await;
-            assert_eq!(outcome, expected);
-            assert_eq!(entries(&log).len(), 1);
+            assert_eq!(
+                outcome,
+                GracefulExitOutcome::NoCloseAuthority {
+                    claude_pids: pids.clone()
+                },
+                "pids {pids:?}"
+            );
+            assert!(
+                pane.typed.lock().unwrap().is_empty(),
+                "{pids:?}: a refusal without an authority typed into a live claude"
+            );
+            assert_eq!(
+                entries(&log),
+                vec!["probe(tracked=0)"],
+                "{pids:?}: exactly one probe, no write, no close"
+            );
         }
+    }
+
+    #[test]
+    fn the_authority_refusal_has_its_own_wire_word() {
+        let refusal = GracefulExitOutcome::NoCloseAuthority {
+            claude_pids: vec![42],
+        };
+        assert_eq!(
+            serde_json::to_value(&refusal).unwrap(),
+            serde_json::json!({ "outcome": "no_close_authority", "claude_pids": [42] })
+        );
+        assert_eq!(refusal.word(), "no_close_authority");
+    }
+
+    /// `word()` is the serialized `outcome` tag for every variant, so a log
+    /// line and a JSON reply never name one outcome two ways.
+    #[test]
+    fn every_outcome_word_is_its_wire_tag() {
+        let all = [
+            GracefulExitOutcome::Exited {
+                waited_ms: 1,
+                claude_pids: vec![1],
+            },
+            GracefulExitOutcome::ExitStuck {
+                waited_ms: 1,
+                claude_pids: vec![1],
+                last_probe_unreadable: false,
+            },
+            GracefulExitOutcome::Refused {
+                reason: "r".into(),
+                claude_pids: vec![1],
+            },
+            GracefulExitOutcome::NoLiveClaude,
+            GracefulExitOutcome::NoCloseAuthority {
+                claude_pids: vec![1],
+            },
+            GracefulExitOutcome::ProbeUnavailable { detail: "d".into() },
+            GracefulExitOutcome::WriteFailed {
+                error: "e".into(),
+                claude_pids: vec![1],
+            },
+            GracefulExitOutcome::CloseRefused {
+                waited_ms: 1,
+                claude_pids: vec![1],
+                reason: "r".into(),
+            },
+            GracefulExitOutcome::CloseOutcomeUnknown {
+                waited_ms: 1,
+                claude_pids: vec![1],
+                detail: "d".into(),
+            },
+        ];
+        for outcome in all {
+            let json = serde_json::to_value(&outcome).unwrap();
+            assert_eq!(json["outcome"], outcome.word(), "{outcome:?}");
+        }
+    }
+
+    /// The scripted table answers only for the pid it registered, and forgets
+    /// the pane when its handle drops, so it cannot leak into a real probe.
+    #[tokio::test]
+    async fn a_scripted_pane_answers_only_while_registered() {
+        let pane = fake_process_table::register(PaneProcesses {
+            subtree_claude: vec![CLAUDE],
+            top_level_children: 0,
+            tracked_alive: Vec::new(),
+        });
+        let root = pane.root_pid;
+        assert_eq!(
+            probe_claude_under(Some(root), vec![CLAUDE, id(7, 7)]).await,
+            readable(&[CLAUDE], 0, &[CLAUDE])
+        );
+        drop(pane);
+        assert!(fake_process_table::probe(root, &[]).is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1408,6 +1698,7 @@ mod tests {
             scripted_probe(vec![readable(&[CLAUDE], 0, &[])], log.clone()),
             recording_close(log.clone()),
             timing(),
+            Some(CloseAuthority::for_test()),
         )
         .await;
         assert_eq!(
@@ -1450,8 +1741,11 @@ mod tests {
     #[test]
     fn this_module_contains_no_kill_path() {
         let source = include_str!("graceful_exit.rs");
+        // Split at the test MODULE, not at the first `#[cfg(test)]`: the
+        // scripted-probe seam inside `probe_claude_under` is an earlier
+        // `#[cfg(test)]`, and splitting there would leave `drive` unscanned.
         let production: String = source
-            .split("#[cfg(test)]")
+            .split("#[cfg(test)]\nmod tests {")
             .next()
             .expect("module has a production section")
             .lines()
