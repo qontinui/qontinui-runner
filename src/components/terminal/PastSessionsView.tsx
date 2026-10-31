@@ -495,12 +495,13 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
   // The "Since restart" roster (null outside a `SinceRestartProvider`).
   const roster = useSinceRestart();
   const refreshRoster = roster?.refresh;
-  // Finish/Unfinish on a card re-reads both this list and the roster.
-  const onFinishSettled = useCallback(() => {
+  // Finish/Unfinish on a card, or a resume from the Unfinished section, re-reads
+  // both this list and the roster.
+  const onSessionSettled = useCallback(() => {
     refreshSessions();
     refreshRoster?.();
   }, [refreshSessions, refreshRoster]);
-  const { ops: finishOps, setFinished } = useFinishOps(onFinishSettled);
+  const { ops: finishOps, setFinished } = useFinishOps(onSessionSettled);
   // …and a Finish/Unfinish made in the roster section re-reads this list.
   const finishEpoch = roster?.finishEpoch ?? 0;
   useEffect(() => {
@@ -603,7 +604,8 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
           sessions={sessions}
           loaded={loaded}
           error={error}
-          onSettled={refreshSessions}
+          resumeBlockerOf={pastSessionResumeBlocker}
+          onSettled={onSessionSettled}
         />
         {loading && sessions.length === 0 ? (
           <div className="flex items-center justify-center py-8 text-[#565f89] text-xs">

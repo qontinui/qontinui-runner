@@ -38,13 +38,32 @@ export function finishMarkReported(s: PastSession): boolean {
   return s.finished !== undefined;
 }
 
+/**
+ * The ids a bulk Resume acts on: the rows whose own Resume is available. The door
+ * re-checks a row, but it does not check `confirmed`, so an unconfirmed id whose
+ * transcript exists (`restorable: false`, quarantined as a possible foreign
+ * session) would really be spawned if this offered it.
+ */
+export function resumableIds(
+  rows: readonly PastSession[],
+  blockerOf: (s: PastSession) => string | null,
+): string[] {
+  return rows.filter((r) => blockerOf(r) === null).map((r) => r.claudeSessionId);
+}
+
+/**
+ * The door's per-call bound (`MAX_IDS` in `src-tauri/src/session/resume_door.rs`).
+ * A longer `ids` is a 400 for the WHOLE call: nothing is attempted.
+ */
+export const MAX_RESUME_IDS_PER_CALL = 50;
+
 export type ResumeOutcome = "resumed" | "failed" | "skipped";
 
 export interface ResumeVerdict {
   id: string;
   outcome: ResumeOutcome;
   reason: string | null;
-  /** Spelling shown to the operator, e.g. `skipped(transcript-missing)`. */
+  /** Spelling shown to the operator, e.g. `skipped(no_transcript)`. */
   verdict: string;
 }
 
@@ -84,10 +103,27 @@ export function parseResumeResponse(ids: readonly string[], body: unknown): Resu
   return ids.map((id) => byId.get(id) ?? callFailed([id], "no-verdict-returned")[0]);
 }
 
+/**
+ * Resume `ids`, one door call per {@link MAX_RESUME_IDS_PER_CALL} ids, in order
+ * and sequentially. A failed call fails only the ids it carried.
+ */
 export async function resumeUnfinished(
   ids: readonly string[],
   fetchImpl: typeof fetch = fetch,
   port: number = resolvePort(),
+): Promise<ResumeVerdict[]> {
+  const verdicts: ResumeVerdict[] = [];
+  for (let i = 0; i < ids.length; i += MAX_RESUME_IDS_PER_CALL) {
+    const batch = ids.slice(i, i + MAX_RESUME_IDS_PER_CALL);
+    verdicts.push(...(await resumeBatch(batch, fetchImpl, port)));
+  }
+  return verdicts;
+}
+
+async function resumeBatch(
+  ids: readonly string[],
+  fetchImpl: typeof fetch,
+  port: number,
 ): Promise<ResumeVerdict[]> {
   try {
     const resp = await fetchImpl(`http://127.0.0.1:${port}/control/sessions/resume`, {
