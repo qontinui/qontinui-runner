@@ -166,6 +166,8 @@ pub async fn get_page(
 // GET /spec/graph
 // ---------------------------------------------------------------------------
 
+/// The DECLARED cross-page graph (page ids only); the OBSERVED user path is
+/// `GET /apps/{app_id}/journey/{graph,reachable,steps,dead-ends,prior-knowledge,frontier}`.
 pub async fn get_graph(
     AxPath(app_id): AxPath<String>,
     State(state): State<Arc<ApiState>>,

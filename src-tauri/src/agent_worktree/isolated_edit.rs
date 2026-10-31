@@ -632,7 +632,7 @@ async fn materialize_repos(
             token_jti: sb.token_jti,
             token_exp: sb.token_exp,
             active_claims: sb.active_claims,
-            sibling_notes: Vec::new(),
+            sibling_notes: sb.sibling_notes,
         }),
         MaterializeOutcome::Wait(w) => Err(AllocateError::Wait(w)),
     }

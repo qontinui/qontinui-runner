@@ -56,8 +56,12 @@ export interface LiveClaudeSession {
   kind: string;
   startedAt: number;
   updatedAt: number;
-  /** Ready-to-run `cd '<dir>' && <wrapper> --resume <id>`. */
-  resumeCommand: string;
+  /**
+   * Ready-to-run `cd "<dir>" && CLAUDE_CONFIG_DIR="<config>" claude --resume
+   * <id>` (Rust `session_ledger::resume_command_for`). `null` when the row
+   * carries no cwd — a resume from the wrong dir finds nothing.
+   */
+  resumeCommand: string | null;
 }
 
 /**
@@ -111,8 +115,8 @@ export const DERIVED_NAME_SOURCE = "derived";
  * case here is showing a name we could have shown anyway.
  *
  * A blank name never qualifies: it would blank out a card that has a perfectly
- * good fallback. The `typeof` guard is the same defensiveness `groupByAccount`
- * applies to `account`: this runs during render over a payload that reached us
+ * good fallback. The `typeof` guard is deliberate: this runs during render over
+ * a payload that reached us
  * through an unchecked cast, so a version skew must degrade to "no registry
  * name" rather than throw.
  */
@@ -182,32 +186,6 @@ export function registryNamesBySessionId(
 }
 
 /**
- * Session ids reported by more than one live process.
- *
- * This is not a curiosity — it is the operator-visible symptom of the restore
- * duplication loop: a restore that respawns `claude --resume <id>` while the
- * previous generation is still alive leaves several live processes on one
- * session id, each with its own auto-generated `<dir>-<2hex>` name. 22 of 80
- * ids were in this state on 2026-07-23. Resuming such an id once does NOT
- * reproduce every window, so the caller must surface it rather than silently
- * collapsing the rows.
- */
-export function sharedSessionIds(
-  sessions: readonly LiveClaudeSession[],
-): Map<string, LiveClaudeSession[]> {
-  const byId = new Map<string, LiveClaudeSession[]>();
-  for (const s of sessions) {
-    const list = byId.get(s.sessionId) ?? [];
-    list.push(s);
-    byId.set(s.sessionId, list);
-  }
-  for (const [id, list] of byId) {
-    if (list.length < 2) byId.delete(id);
-  }
-  return byId;
-}
-
-/**
  * Read the set of session ids that some LIVE Claude Code process is already
  * hosting, via `terminal_claude_session_list_live` (each entry is PID-verified
  * against the live process table on the Rust side —
@@ -251,18 +229,4 @@ export async function fetchLiveClaudeSessionIds(): Promise<ReadonlySet<string> |
     if (s && typeof s.sessionId === "string" && s.sessionId) ids.add(s.sessionId);
   }
   return ids;
-}
-
-/** Group sessions by account label, preserving input order within a group. */
-export function groupByAccount(
-  sessions: readonly LiveClaudeSession[],
-): Map<string, LiveClaudeSession[]> {
-  const byAccount = new Map<string, LiveClaudeSession[]>();
-  for (const s of sessions) {
-    const label = s.account?.label || "unknown";
-    const list = byAccount.get(label) ?? [];
-    list.push(s);
-    byAccount.set(label, list);
-  }
-  return byAccount;
 }

@@ -198,6 +198,14 @@ const CREATE_PLAN: &str = include_str!("fleet_commands/create-plan.md");
 /// there, then re-vendor.
 const FIND_DEBT: &str = include_str!("fleet_commands/find-debt.md");
 
+/// `/finish-session` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/finish-session.md` (canonical) — edit it
+/// there, then re-vendor. Bundled because the bundled `/unattended` closes every
+/// session with it: a dispatched session on a device with no fleet `.claude`
+/// tree otherwise has no way to record `session_status=finished` (plan
+/// `2026-10-29-bundle-finish-session-so-every-dispatched-session-can-record-finished`).
+const FINISH_SESSION: &str = include_str!("fleet_commands/finish-session.md");
+
 /// `/fix` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/fix.md` (canonical) — edit it
 /// there, then re-vendor.
@@ -364,6 +372,7 @@ pub(crate) const FLEET_COMMANDS: &[(&str, &str)] = &[
     ("code-fix", CODE_FIX),
     ("create-plan", CREATE_PLAN),
     ("find-debt", FIND_DEBT),
+    ("finish-session", FINISH_SESSION),
     ("fix", FIX),
     ("implement-phase", IMPLEMENT_PHASE),
     ("improve-all", IMPROVE_ALL),
@@ -487,9 +496,9 @@ fn classify_existing(dst: &Path) -> Option<Existing> {
 /// broken cache each degrade one step and warn, never propagate.
 ///
 /// Idempotent, and existing files are overwritten — EXCEPT where the
-/// destination is already tracked by the enclosing git repository, which is
-/// skipped (see [`provision_fleet_commands_into`] and
-/// [`crate::provision_guard`]).
+/// destination is already tracked by the enclosing git repository, or the
+/// tracked-file probe could not answer inside one; both are skipped (see
+/// [`provision_fleet_commands_into`] and [`crate::provision_guard`]).
 pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
     let registry = crate::agent_commands::resolve_registry();
     let commands_dir = Path::new(workdir).join(".claude").join("commands");
@@ -559,9 +568,12 @@ pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
 /// **Fail-soft, and this is a hard requirement.** The tracked probe
 /// ([`crate::provision_guard::TrackedPaths::probe`]) resolves EVERY failure — an
 /// unreadable or absent git dir, no `git` binary, any non-zero exit, and a `git`
-/// that hangs — to "nothing tracked", i.e. to writing exactly as before. A
-/// skipped write must never become an aborted spawn, and a failed or slow probe
-/// must never become one either. The probe runs ONCE per pass, not once per
+/// that hangs — to "nothing tracked", i.e. to writing exactly as before, with ONE
+/// narrowing: when that failure happens inside a repository (a `.git` at or
+/// above the dir), only ABSENT files are written and existing ones are kept
+/// (see that module's "UNKNOWN inside a repository" section). A skipped write
+/// must never become an aborted spawn, and a failed or slow probe must never
+/// become one either. The probe runs ONCE per pass, not once per
 /// file, so this costs one process spawn rather than seven.
 pub(crate) fn provision_fleet_commands_into(
     commands_dir: &Path,
@@ -583,14 +595,14 @@ pub(crate) fn provision_fleet_commands_into(
     for command in &resolved {
         let file_name = command.file_name();
         let dst = commands_dir.join(&file_name);
-        if tracked.should_skip(&dst, Path::new(&file_name)) {
+        if let Some(reason) = tracked.skip_reason(&dst, Path::new(&file_name)) {
             info!(
-                "fleet_commands: skipping {} — it is tracked by the enclosing git \
-                 repository, and overwriting it would silently replace that repo's \
-                 own content and dirty its tree",
-                dst.display()
+                "fleet_commands: skipping {} — {}; overwriting it could silently \
+                 replace the enclosing repo's own content and dirty its tree",
+                dst.display(),
+                reason.describe()
             );
-            out.skip(file_name, capability_manifest::SkipReason::GitTracked);
+            out.skip(file_name, reason);
             continue;
         }
         // The write below is still unconditional — this reads the OUTGOING file
@@ -808,6 +820,51 @@ mod tests {
             std::fs::read_to_string(&tracked).unwrap(),
             "# the repo's own body\n",
             "a tracked destination must keep the repo's content, not the embedded copy"
+        );
+    }
+
+    /// Entering where a spawn enters: inside a repository whose git cannot be
+    /// asked (a linked-worktree `.git` FILE pointing at a gitdir that does not
+    /// exist), an EXISTING command file is kept with
+    /// [`SkipReason::ProbeUnknownInRepo`] and every absent one is still written.
+    /// Before plan `2026-10-04-shared-checkouts-pull-deterministically` Phase 2
+    /// the failed probe read "nothing tracked" and the existing file was
+    /// overwritten.
+    ///
+    /// [`SkipReason::ProbeUnknownInRepo`]: crate::capability_manifest::SkipReason::ProbeUnknownInRepo
+    #[test]
+    fn an_unanswered_probe_inside_a_repo_keeps_existing_commands() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        crate::provision_guard::test_support::assert_not_in_any_repo(tmp.path());
+        std::fs::write(
+            tmp.path().join(".git"),
+            b"gitdir: /nonexistent/qontinui-fleet-commands-test\n",
+        )
+        .unwrap();
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+
+        let (existing_name, _) = FLEET_COMMANDS[0];
+        let existing = commands_dir.join(format!("{existing_name}.md"));
+        std::fs::write(&existing, b"# a body git could not vouch for\n").unwrap();
+
+        let registry = AgentCommandRegistry::new();
+        let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
+
+        assert_eq!(out.skipped.len(), 1, "only the existing file is kept");
+        assert_eq!(
+            out.skipped[0].reason,
+            crate::capability_manifest::SkipReason::ProbeUnknownInRepo
+        );
+        assert_eq!(
+            std::fs::read_to_string(&existing).unwrap(),
+            "# a body git could not vouch for\n",
+            "an existing file must not be overwritten when git could not be asked"
+        );
+        assert_eq!(
+            out.written,
+            FLEET_COMMANDS.len() - 1,
+            "every absent command is still written"
         );
     }
 
@@ -2567,6 +2624,62 @@ mod tests {
              2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run \
              Phase 5) or this guard's content probe went stale. Both are findings; \
              neither is a pass"
+        );
+    }
+
+    /// The bundled `/unattended` closes every session by running
+    /// `/finish-session`, so the bundle must carry `/finish-session` too.
+    ///
+    /// Before plan
+    /// `2026-10-29-bundle-finish-session-so-every-dispatched-session-can-record-finished`
+    /// (Phase 3) it did not: a runner-dispatched session on a device with no
+    /// fleet `.claude` tree was told to run a command its workdir never had, so
+    /// it could not record `session_status=finished` and a rebuilt runner kept
+    /// offering it for resume. Literals are spelled here on purpose — this test
+    /// must fail if the roster line is dropped, not follow it.
+    #[test]
+    fn bundle_carries_finish_session_beside_unattended() {
+        let roster: Vec<&str> = FLEET_COMMANDS.iter().map(|(n, _)| *n).collect();
+        assert!(
+            roster.contains(&"finish-session"),
+            "FLEET_COMMANDS has no \"finish-session\" entry, but the bundled \
+             /unattended ends every session with /finish-session — a dispatched \
+             session on a device without a fleet .claude tree cannot record \
+             finished. Restore (\"finish-session\", FINISH_SESSION) in FLEET_COMMANDS"
+        );
+        let unattended = FLEET_COMMANDS
+            .iter()
+            .find(|(n, _)| *n == "unattended")
+            .map(|(_, b)| *b)
+            .expect("the bundle carries \"unattended\"");
+
+        // Every `/finish-session` reference, read as the whole slash-command
+        // token it starts (so `/finish-session-foo` would be read as
+        // `finish-session-foo`, not as a hit on the roster name).
+        // Split on `/` rather than byte-slicing after a match, so no index can
+        // land inside a UTF-8 character (the bodies are full of em dashes).
+        let mut references = 0usize;
+        for after_slash in unattended.split('/').skip(1) {
+            let token: String = after_slash
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if !token.starts_with("finish-session") {
+                continue;
+            }
+            assert!(
+                roster.contains(&token.as_str()),
+                "the bundled /unattended references /{token}, which is not a bundled \
+                 command name — the reference dangles on any device whose workdir \
+                 only has the bundle. Bundled names: {roster:?}"
+            );
+            references += 1;
+        }
+        assert!(
+            references > 0,
+            "the bundled /unattended no longer references /finish-session, so this \
+             guard watches an edge that no longer exists. Re-read the plan before \
+             dropping finish-session from the bundle"
         );
     }
 }

@@ -366,32 +366,38 @@ pub fn get_workspace_paths_internal(
     Ok((workspace_root, dev_logs_path, scripts_path))
 }
 
-// Windows-specific imports for process creation flags
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
-
-// Windows constants for process creation
-#[cfg(target_os = "windows")]
-const CREATE_NEW_CONSOLE: u32 = 0x00000010;
-
-/// Spawn Python script with proper console on Windows.
-/// Claude CLI requires a console window to function properly.
-pub(crate) fn spawn_python_with_console(
+/// Spawn a Python script with no console window of its own.
+///
+/// Built with [`crate::process_helpers::no_window`] and left that way. Until
+/// 2026-10-28 this function overrode the helper's `CREATE_NO_WINDOW` with
+/// `CREATE_NEW_CONSOLE`, claiming "Claude CLI requires a console window", so
+/// every call opened a visible console window — a classic conhost window on a
+/// box whose default terminal is the inbox console host. The claim does not
+/// hold for this path:
+/// - the only caller runs `qontinui-claude-config/scripts/spawn-independent-claude.py`,
+///   which starts `claude` as a GRANDCHILD, under a `powershell.exe` it
+///   launches with a console of its OWN (`CREATE_NO_WINDOW` since
+///   qontinui-claude-config#2111; `CREATE_NEW_CONSOLE` before). The console
+///   this flag gave `python.exe` was never the one `claude` ran in.
+/// - That `claude` runs `--print` with stdin and stdout redirected, the mode
+///   the runner already launches with no window at all
+///   (`ai_provider::claude_cli`, `agent_runtime::spawn_claude_child`).
+///
+/// So `python.exe` gets no window. The script's `powershell.exe` child still
+/// opens its own console unless the script passes `CREATE_NO_WINDOW` (fixed
+/// in qontinui-claude-config's `spawn-independent-claude.py`).
+///
+/// Job membership is unaffected either way: neither flag is
+/// `CREATE_BREAKAWAY_FROM_JOB`. Plan
+/// `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`
+/// Phase 6.
+pub(crate) fn spawn_python_script(
     python_path: &str,
     args: &[&std::ffi::OsStr],
     working_dir: &std::path::Path,
 ) -> std::io::Result<std::process::Child> {
     let mut cmd = crate::process_helpers::no_window(python_path);
     cmd.args(args).current_dir(working_dir);
-
-    #[cfg(target_os = "windows")]
-    {
-        // CREATE_NEW_CONSOLE: Creates a new console window (required for Claude CLI)
-        // Note: CREATE_BREAKAWAY_FROM_JOB requires special permissions so we don't use it here.
-        // The Python spawn script handles job breakaway internally via subprocess.Popen flags.
-        cmd.creation_flags(CREATE_NEW_CONSOLE);
-    }
-
     cmd.spawn()
 }
 
