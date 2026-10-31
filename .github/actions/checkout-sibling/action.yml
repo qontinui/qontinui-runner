@@ -532,7 +532,7 @@ runs:
         }
 
         # Every "you declared two different things" red, in one shape so the
-        # three ways of being ambiguous read alike (§3.2 / §3.7 of the plan).
+        # ways of being ambiguous read alike (§3.2 / §3.7 of the plan).
         # $1 = what was contradictory, $2 = newline-separated sibling PR numbers.
         ambiguous() {
           local t
@@ -643,9 +643,10 @@ runs:
         # `self_ups` is deliberately NOT refused here when it names several
         # sibling PRs. It is a TRAILING form (this side leads), and several
         # trailing declarations are only a contradiction when a tree must be
-        # chosen from among them — which depends on whether a leading form
-        # exists and on ACCEPT_TRAILING. Both are only known after the reverse
-        # search, so the trailing set is reconciled there. See "Reconcile".
+        # chosen from among them — which depends on ACCEPT_TRAILING (validated
+        # above) and on whether a leading form exists, which is only known
+        # after the reverse search (a sibling PR's `upstream-of` is a leading
+        # form). So the trailing set is reconciled there. See "Reconcile".
 
         # --- Reverse search: BOTH dep-edge directions on the sibling's PRs. ---
         # Evaluated UNCONDITIONALLY, even when the self-read hit, so a
@@ -696,9 +697,10 @@ runs:
           [ -n "${hits}" ] && ups="${ups}${hits}"$'\n'
 
           # Same query, opposite direction. Kept as a separate `jq` rather than
-          # one pass emitting "form:number" pairs: the two lists are checked for
-          # ambiguity independently, and a combined capture would need splitting
-          # back apart right here — for no saved subprocess on the page that
+          # one pass emitting "form:number" pairs: the two lists are reconciled
+          # differently (`ups` is a leading form, refused at >1; `sib_downs` is
+          # a trailing form, kept as a set), and a combined capture would need
+          # splitting back apart right here — for no saved subprocess on the page that
           # matters (the first).
           hits="$(printf '%s' "${API_BODY}" | jq -r --arg short "${THIS_SHORT}" --arg num "${PR_NUMBER}" '
             [ .[]
@@ -781,6 +783,12 @@ runs:
           # target DIFFERENT from the leading one reads as the ambiguity it is;
           # only when every form names the same PR does the cycle check below
           # get to say "both directions on one pair".
+          #
+          # DELIBERATE: a leading target PLUS a trailing declaration naming a
+          # DIFFERENT sibling PR (this PR waits on #5 while #7 waits on this
+          # PR) is acyclic and the tree is plainly #5, yet it is still refused.
+          # That keeps the pre-existing strictness for mixed directions; relax
+          # it only as its own, separately reviewed change.
           uniq_list "${target_down}"$'\n'"${target_up}"$'\n'"${trail_targets}"
           if [ "${UNIQ_N}" -gt 1 ]; then
             ambiguous "the coord dep labels on this PR and on ${SIBLING_REPO}'s open PRs name DIFFERENT ${SIBLING_SHORT} PRs" "${UNIQ}"
@@ -822,8 +830,8 @@ runs:
               echo "Each of them orders ${SIBLING_SHORT} AFTER"
             fi
             echo "${THIS_SHORT}#${PR_NUMBER}, and this step does not accept a trailing sibling."
-            echo "Its tree is not what ${THIS_SHORT} compiles against when this change lands, so"
-            echo "following it would go green against code that is not there yet."
+            echo "A trailing tree is not what ${THIS_SHORT} compiles against when this change lands,"
+            echo "so following one would go green against code that is not there yet."
             echo "Using ${SIBLING_REPO} ref: main (trailing declaration declined)"
             SOURCE="trailing-declined"
             emit
