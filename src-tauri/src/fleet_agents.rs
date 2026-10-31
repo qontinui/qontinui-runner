@@ -58,6 +58,7 @@ use std::path::Path;
 use include_dir::{include_dir, Dir};
 
 use crate::capability_manifest::{self, ProvisionReport, SkipReason};
+use crate::provision_guard::KeepDecisions;
 
 /// The embedded subagent definitions. A flat directory of `*.md`, matching what
 /// `claude` expects under `.claude/agents/`.
@@ -71,7 +72,13 @@ static FLEET_AGENTS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/fleet_agent
 
 /// Write every embedded subagent definition into `dst_dir`, returning a
 /// [`ProvisionReport`] describing what landed. Creates `dst_dir` if absent;
-/// overwrites existing files (idempotent).
+/// overwrites existing files (idempotent) EXCEPT those `keep` names: a
+/// definition the enclosing git repository tracks (or one that exists when the
+/// tracked-file probe could not answer inside a repository) is left alone and
+/// reported as skipped, exactly as [`crate::fleet_commands`] and
+/// [`crate::fleet_skills`] do. In a `qontinui-claude-config` checkout
+/// `.claude/agents/*.md` IS tracked content, and overwriting it with this
+/// binary's render dirtied every such worktree.
 ///
 /// Only `*.md` at the top level is written — the same filter the checkout copy
 /// applies, so the two layers cannot disagree about what counts as a definition.
@@ -84,7 +91,10 @@ static FLEET_AGENTS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/fleet_agent
 /// remove — `claude` cannot resolve the named subagent, the review never runs,
 /// and coord ages the PR out as `specialist_timeout` with no error at the point
 /// of cause — so "how many" was never the interesting half.
-pub(crate) fn provision_fleet_agents_into(dst_dir: &Path) -> std::io::Result<ProvisionReport> {
+pub(crate) fn provision_fleet_agents_into(
+    dst_dir: &Path,
+    keep: &KeepDecisions,
+) -> std::io::Result<ProvisionReport> {
     std::fs::create_dir_all(dst_dir)?;
     let mut out = ProvisionReport::new(
         "fleet_agents",
@@ -100,6 +110,15 @@ pub(crate) fn provision_fleet_agents_into(dst_dir: &Path) -> std::io::Result<Pro
             continue;
         };
         let unit = name.to_string_lossy().into_owned();
+        if let Some(reason) = keep.reason(&unit) {
+            tracing::info!(
+                "fleet_agents: keeping {} as it is on disk — {}",
+                dst_dir.join(name).display(),
+                reason.describe()
+            );
+            out.skip(unit, reason.clone());
+            continue;
+        }
         // Per-file rather than `?`: one unwritable definition must not cost the
         // session the other four, and it must be NAMED rather than aborting the
         // pass at whatever point it happened to reach.
@@ -112,6 +131,17 @@ pub(crate) fn provision_fleet_agents_into(dst_dir: &Path) -> std::io::Result<Pro
         out.set_rung(capability_manifest::Rung::Unresolved);
     }
     Ok(out)
+}
+
+/// File names of the embedded subagent definitions (`*.md` only), the
+/// candidates [`KeepDecisions::decide`] is asked about.
+pub(crate) fn embedded_agent_names() -> Vec<String> {
+    FLEET_AGENTS
+        .files()
+        .filter(|f| f.path().extension().and_then(|e| e.to_str()) == Some("md"))
+        .filter_map(|f| f.path().file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .collect()
 }
 
 /// Number of embedded subagent definitions, for log lines that want to say how
@@ -132,7 +162,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let dst = tmp.path().join(".claude").join("agents");
 
-        let report = provision_fleet_agents_into(&dst).expect("provision");
+        let report =
+            provision_fleet_agents_into(&dst, &KeepDecisions::default()).expect("provision");
         assert_eq!(
             report.written,
             embedded_agent_count(),
@@ -166,11 +197,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let dst = tmp.path().join(".claude").join("agents");
 
-        let first = provision_fleet_agents_into(&dst).expect("first");
+        let first = provision_fleet_agents_into(&dst, &KeepDecisions::default()).expect("first");
         let victim = dst.join("code-reviewer.md");
         std::fs::write(&victim, b"CLOBBERED").expect("clobber");
 
-        let second = provision_fleet_agents_into(&dst).expect("second");
+        let second = provision_fleet_agents_into(&dst, &KeepDecisions::default()).expect("second");
         assert_eq!(
             (first.written, first.skipped.len()),
             (second.written, second.skipped.len()),

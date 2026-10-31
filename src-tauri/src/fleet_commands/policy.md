@@ -300,8 +300,15 @@ for f in "${CANDIDATES[@]}"; do
   [ -s "$HDR" ] || { echo "cannot stage the nonce header (LOCAL fault, not a coord verdict)" >&2; break; }
   # AFTER the -s guard: the session line alone must never make it pass.
   caller_session_line >> "$HDR"
+  # The three x-qontinui-* headers DECLARE the rung (plan
+  # 2026-09-20-first-rung-coord-reachability-is-unmeasured-then-unfixed): the
+  # runner cannot tell a /policy sweep from any other caller otherwise, and
+  # reporter-step `probe` keeps a diagnostic sweep out of the reads coord's
+  # fold counts once that plan's Phase 3 coord half (the probe filter) lands.
   code=$(curl -s --connect-timeout 5 -m 20 -o /dev/null -w '%{http_code}' -X POST "$url" \
     -H "Content-Type: application/json" \
+    -H 'x-qontinui-transport: loopback_proxy' -H 'x-qontinui-reporter: policy' \
+    -H 'x-qontinui-reporter-step: probe' \
     -H @"$(hdrp)" -d "$COORD_RPC")
   if [ "$code" = "200" ]; then LIVE_URL="$url"; LIVE_KEY="$key"; LIVE_HDR="$(mcp_keyhdr)"; echo "live proxy: $f ($url)"; break; fi
   echo "skip stale: $f -> HTTP $code"
@@ -334,13 +341,16 @@ proxy carries MCP JSON-RPC only, so use the **MCP tools** here:
 #   printf '%s: %s\n' "$LIVE_HDR" "$LIVE_KEY" > "$HDR"   # $LIVE_HDR = the header name the sweep found the nonce under
 #   caller_session_line >> "$HDR"   # define caller_session_line as in the Step-2 sweep first
 #   hdrp() { command -v cygpath >/dev/null 2>&1 && cygpath -w "$HDR" || printf '%s' "$HDR"; }
+# Every read DECLARES its rung: the loopback proxy, reporter `policy`.
 # list:
 curl -fsS -X POST "$LIVE_URL" -H "Content-Type: application/json" \
+  -H 'x-qontinui-transport: loopback_proxy' -H 'x-qontinui-reporter: policy' \
   -H @"$(hdrp)" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
         "name":"coord_list_prompt_documents","arguments":{}}}'
 # get one:
 curl -fsS -X POST "$LIVE_URL" -H "Content-Type: application/json" \
+  -H 'x-qontinui-transport: loopback_proxy' -H 'x-qontinui-reporter: policy' \
   -H @"$(hdrp)" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
         "name":"coord_get_prompt_document",
@@ -388,6 +398,11 @@ and freshness-checked in `scripts/lib/coord-credential.psm1`
 runner as a **dead transport** rather than a missing credential — call it
 rather than writing a fourth copy of the cascade here.
 
+> The file token expires (~4 h). When it has, refresh it with the tracked, eval-free refresher
+> `bash <workspace-root>/qontinui-claude-config/scripts/refresh-coord-device-jwt.sh --if-stale`
+> (`--tenant <uuid>` on a device bound to several tenants; it never prints the token, and exits 2 when
+> the runner is unreachable) before treating the file source as missing.
+
 > ⚠️ **NEVER carry this rung on a JWT minted from `POST /agents/allocate`.**
 > That route is genuinely unauthenticated and mints a 4-hour full-scope agent
 > JWT to anyone who knows a registered device UUID. It is an open security
@@ -400,12 +415,34 @@ rather than writing a fourth copy of the cascade here.
 COORD_HTTP_URL="${COORD_HTTP_URL:-https://coord.qontinui.io}"
 # 1) Resolve the device JWT. $ROOT is the workspace root resolved exactly as the
 #    Step-2 block does (`--git-common-dir`, NOT `--show-toplevel`).
-DEVICE_JWT="${COORD_DEVICE_JWT:-}"
-[ -n "$DEVICE_JWT" ] || DEVICE_JWT="$(tr -d '\r\n' < "$HOME/.qontinui/coord-device-jwt" 2>/dev/null)"
-[ -n "$DEVICE_JWT" ] || DEVICE_JWT="$(powershell -NoProfile -Command "
+#    The module owns the WHOLE cascade (both static sources included) and
+#    selects every source by its tenant_id CLAIM: the tenant is this SESSION's
+#    ($QONTINUI_TENANT_ID, else the runner session census for
+#    $QONTINUI_TERMINAL_ID, else the device's sole binding), the runner is asked
+#    for it as {"args":{"tenantId":"<uuid>"}} (a top-level key is dropped by the
+#    runner), and a token claiming ANOTHER tenant is discarded, never used. On a
+#    device proven multi-bound with no tenant it REFUSES (TENANT_REQUIRED), and
+#    so it does when no tenant resolves and the bindings are UNKNOWN
+#    (TENANT_UNKNOWN) - it never mints the default slot. The `tenant:` line goes to stderr.
+#    No PowerShell on the box (a Linux box without pwsh): the one static arm
+#    left is $COORD_DEVICE_JWT, used ONLY when it claims $QONTINUI_TENANT_ID.
+PS_BIN="$(command -v powershell || command -v pwsh)"
+if [ -z "$PS_BIN" ]; then
+  DEVICE_JWT=""
+  _claim="$(T="${COORD_DEVICE_JWT:-}" python3 -c 'import os,json,base64
+p=os.environ["T"].split(".")[1]; p+="="*(-len(p)%4)
+print(json.loads(base64.urlsafe_b64decode(p)).get("tenant_id") or "")' 2>/dev/null)"
+  if [ -n "${QONTINUI_TENANT_ID:-}" ] && [ "${_claim,,}" = "${QONTINUI_TENANT_ID,,}" ]; then DEVICE_JWT="$COORD_DEVICE_JWT"
+  else echo "no PowerShell for the tenant-checked mint, and \$COORD_DEVICE_JWT does not claim \$QONTINUI_TENANT_ID (claims '${_claim:-none}')" >&2; fi
+else
+DEVICE_JWT="$("$PS_BIN" -NoProfile -Command "
   Import-Module '$ROOT/qontinui-claude-config/scripts/lib/coord-credential.psm1' -Force
-  \$t = Get-CoordDoorTransport -Cwd (Get-Location).Path
-  if (\$t.Kind -eq 'bearer') { \$t.Jwt } else { [Console]::Error.WriteLine(\$t.FailureReport) }" 2>/dev/null | tr -d '\r\n')"
+  \$r = Resolve-QontinuiExpectedTenant -Scope Session
+  [Console]::Error.WriteLine(\$r.Line)
+  if (\$r.State -in 'required','invalid','unknown') { [Console]::Error.WriteLine(\$r.Warning); exit }
+  \$t = Get-CoordDoorTransport -Cwd (Get-Location).Path -TenantId \$r.TenantId -AllowDefaultSlot:\$r.AllowDefaultSlot
+  if (\$t.Kind -eq 'bearer') { \$t.Jwt } else { [Console]::Error.WriteLine(\$t.FailureReport) }" | tr -d '\r\n')"
+fi
 # 2) Stage it OFF argv — same rule and same reason as the Step-2 nonce. $AUTH +
 #    the EXIT trap come from the Step-2 block when you carried that shell
 #    forward; in a fresh shell the guard below creates both, and the trap MUST
@@ -450,6 +487,15 @@ AUTHP=$AUTH; command -v cygpath >/dev/null 2>&1 && AUTHP=$(cygpath -w "$AUTH")
 # below carry no bound on purpose: once the probe has said the door is live, a
 # slow write is still a write, and killing one at 15s would leave a coord-side
 # effect nobody read back.
+# DECLARE the rung on every call (plan
+# 2026-09-20-first-rung-coord-reachability-is-unmeasured-then-unfixed). This one
+# reaches coord DIRECTLY, where coord's own observer reads it: `remote_mcp`,
+# after the two rungs above it refused. Edit the attempted list to what you
+# actually tried.
+# It rides in the staged header file every call below already sends.
+printf '%s\n' 'x-qontinui-transport: remote_mcp' \
+  'x-qontinui-transport-attempted: native_mcp,loopback_proxy' \
+  'x-qontinui-reporter: policy' >> "$AUTH"
 curl -fsS --connect-timeout 5 -m 15 -X POST "$COORD_HTTP_URL/mcp" \
   -H "Content-Type: application/json" \
   -H @"$AUTHP" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
@@ -571,6 +617,11 @@ printf 'Authorization: Bearer %s\n' "$DEVICE_JWT" > "$AUTH"
 [ -s "$AUTH" ] || { echo "cannot stage the JWT header (LOCAL fault)" >&2; exit 1; }
 caller_session_line >> "$AUTH"   # after the guard, so it can never satisfy it
 AUTHP=$AUTH; command -v cygpath >/dev/null 2>&1 && AUTHP=$(cygpath -w "$AUTH")
+# The rung: coord's hand-written agent routes, `http_agent_door`, after the three
+# rungs above refused (edit the attempted list to what you actually tried).
+printf '%s\n' 'x-qontinui-transport: http_agent_door' \
+  'x-qontinui-transport-attempted: native_mcp,loopback_proxy,remote_mcp' \
+  'x-qontinui-reporter: policy' >> "$AUTH"
 # list:
 curl -fsS "$COORD_HTTP_URL/coord/agent-prompt-documents" -H @"$AUTHP"
 # get one:
@@ -685,6 +736,13 @@ are `/policy`-specific:
   one, the transport line is `HTTP agent door (bootstrap credential)`, never a
   bare `HTTP agent door`: a reader weighing a policy answer is entitled to know it
   came from the rung of last resort.
+- **And DECLARE it on the wire.** Send Step 4's two GETs with
+  `-H 'x-qontinui-transport: bootstrap_credential'
+  -H 'x-qontinui-transport-attempted: native_mcp,loopback_proxy,remote_mcp,http_agent_door'
+  -H 'x-qontinui-reporter: policy'` (written into the staged header file in
+  place of Step 4's `http_agent_door` lines), so
+  coord counts this session as the degraded one it is (plan
+  `2026-09-20-first-rung-coord-reachability-is-unmeasured-then-unfixed`).
 
 **Record that you got this far.** Reaching Step 4b means every ordinary door
 failed, and nothing counts how often that happens — the supervisor already
@@ -739,6 +797,15 @@ else
   python -c "import json,sys;d=json.load(sys.stdin);print('STEERING CACHE (rung 4c) rendered',d['rendered_at'],'UTC over',d['transport'])" < "$STEERING/STEERING-CACHE.json"
   python -c "import json,sys;d=json.load(sys.stdin);print('  last attempt',d.get('last_attempt_at'),'->',d.get('render_exit_reason'))" < "$STEERING/STEERING-CACHE.state.json" 2>/dev/null || echo "  (no readable sidecar - the last attempt's outcome is UNKNOWN)"
   echo "  DRIFT: UNKNOWN - no live door answered, so nothing here can be compared to served."
+  # COUNT this mirror read: a cache reaches no server, so nothing else can. Over
+  # this session's own proxy when it answers, else one line in
+  # ~/.qontinui/logs/coord-rung-unreported.jsonl (exit 2) - never lost silently.
+  if [ -n "${ROOT:-}" ]; then
+    bash "$ROOT/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh" observe steering_cache policy \
+      || echo "  steering-cache read NOT reported (observe exit $?; 2 = counted in the local unreported log)" >&2
+  else
+    echo "  steering-cache read NOT counted: \$ROOT is unset in this shell (derive it as the Step-2 block does)" >&2
+  fi
   # A drift verdict is only as wide as the doors that were ASKED, so name them
   # beside it. Without this line "no live door answered" reads as "the doors are
   # down", when what actually happened is that ONE host was asked: rungs 1-4b are
@@ -967,6 +1034,10 @@ if [ ! -d "$MIRRORS" ]; then
   echo "this is a LOCAL fault — report it as such, never as 'no policy found'" >&2
   exit 1
 fi
+# COUNT this mirror read, exactly as Step 4c does: over this session's own proxy
+# when it answers, else one line in ~/.qontinui/logs/coord-rung-unreported.jsonl.
+bash "$ROOT/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh" observe file_mirror policy \
+  || echo "file-mirror read NOT reported (observe exit $?; 2 = counted in the local unreported log)" >&2
 
 # ---------------------------------------------------------------------------
 # THE CHECKOUT AXIS. Everything else in this rung compares MIRROR to SERVED.
@@ -1306,28 +1377,66 @@ no door for this kind", "agents cannot read policy here", "that route does not
 exist" are searches, and a cascade of probes is a sample:
 
 <!-- detector-reach-fence:start -->
-> **A capability negative cites a CENSUS, never a probe.** Before recording
-> "no door", "agents cannot", "this route does not exist" or any other claim
-> that a capability is ABSENT, run the route census,
-> `coord-route-census.sh <fragment>`, from wherever your deployment installs
-> it — spelled by its absolute path, because a bare relative path resolves
-> only from the checkout that ships it, and a session standing anywhere else
-> gets exit 127
-> (it reads `origin/main` of BOTH `qontinui-coord` and `qontinui-web`, never
-> a working tree and never a live host) — and paste its trailer verbatim
-> beside the claim:
-> `census: fragment=<f> hosts_read=coord.qontinui.io,api.qontinui.io ref=<sha>,<sha> routes=<n> unextracted=<n> unmounted=<n> generated=<ISO time>`
-> — the line that parses under the census tool's own `CENSUS_TRAILER_RE`.
-> Where no census tool is reachable at all, the negative cannot be settled and
-> is UNVERIFIED.
-> A 401, 404 or 405 on ONE spelling of
+> **A capability negative cites EMITTED EVIDENCE, never a probe.** Before
+> recording "no door", "agents cannot", "this route does not exist" or any
+> other claim that a capability is ABSENT, paste beside it, verbatim, ONE of
+> the two lines that can evidence one (items 1 and 2; item 3 can only refute
+> one) — each from a tool run from wherever your deployment installs it,
+> spelled by its absolute path, because a bare relative path resolves only
+> from the checkout that ships it, and a session standing anywhere else gets
+> exit 127:
+>
+> 1. **A census trailer** from the route census,
+>    `coord-route-census.sh <fragment>` (it reads `origin/main` of BOTH
+>    `qontinui-coord` and `qontinui-web`, never a working tree and never a
+>    live host):
+>    `census: fragment=<f> hosts_read=coord.qontinui.io,api.qontinui.io ref=<sha>,<sha> routes=<n> unextracted=<n> unmounted=<n> generated=<ISO time>`
+>    — the line that parses under the census tool's own `CENSUS_TRAILER_RE`.
+>    `routes=UNKNOWN` (exit 2) settles nothing; `routes=0` with both refs
+>    resolved is the only honest negative; `routes=` above 0 contradicts it;
+>    `admits=unknown` on a listed row means unmeasured, never "operator-only".
+> 2. **A `FLOOR-CLAIM:` line** from
+>    `coord-revive.sh --floor-claim` (the coord-revive skill's resolver)
+>    whose verdict is `FLOOR` — `verdict=LIVE` contradicts the negative, and
+>    `verdict=UNKNOWN` settles nothing.
+> 3. **A `refusal-read:` line is NOT evidence FOR a negative.** It comes from
+>    `refusal-remedy.sh`:
+>    `refusal-read: code=<code> tool=<tool> state=<REMEDY_WORKS|REMEDY_PRECONDITION_UNMET|REMEDY_FAILED|NO_REMEDY_PROBE|UNKNOWN> detail=<token> measured=<ISO>`
+>    — and a typed refusal shows coord ANSWERED and named a precondition, so
+>    it never stamps a negative. Any state that shows coord answered
+>    CONTRADICTS the negative whose code (or the tool the probe called) it
+>    matches: `state=REMEDY_WORKS`, `REMEDY_PRECONDITION_UNMET` with
+>    `detail=` `session_not_owned_by_caller`, `caller_owns_no_active_session`,
+>    `harness_session_id_required_measured`, `header_not_honored` or
+>    `stale_build`, and `REMEDY_FAILED detail=build_current`. Publish the
+>    precondition and its remedy instead of the negative. Every other line
+>    shows nothing either way: `UNKNOWN`, `NO_REMEDY_PROBE` (no probe ran),
+>    `REMEDY_FAILED detail=orient_refused` (the probe's own call was
+>    refused), a detail this list does not name.
+>
+> Where no census tool is reachable at all, a route negative cannot be
+> settled and is UNVERIFIED.
+>
+> A stamp counts only when the tool EMITTED it on this box; a line you typed,
+> however well-formed, is not evidence. It counts only beside the negative it
+> is offered for: a census only for a negative about the route it names —
+> never a refusal, never one in a sentence naming a coord tool — and only
+> when censuses cover every route that negative names; a `FLOOR-CLAIM:` for
+> a door or credential negative with no refusal in it — and every negative
+> in the text, clause by clause, needs its own. A 401, 404 or 405 on ONE spelling of
 > ONE host is a sample, not a search: `/api/v1/memory` refuses on
-> `coord.qontinui.io` and answers on `api.qontinui.io`. A claim without the
-> trailer is **UNVERIFIED and is not recorded** — not as a finding, not as a
-> memory, not as a plan premise. `routes=UNKNOWN` (exit 2) means the census
-> could not read a source and settles nothing; `routes=0` with both refs
-> resolved is the only honest negative, and `admits=unknown` on a listed row
-> means unmeasured, never "operator-only".
+> `coord.qontinui.io` and answers on `api.qontinui.io`. `_routes` is not a
+> census either — of the five `user_id`-bearing credential doors (roster in
+> `knowledge-base/qontinui-specific/coord-gates-and-access.md`), "three of
+> them are not routes at all, and one of them (door 5) is a file on local disk
+> that no route census, `_routes` enumeration or allowlist read can surface."
+> So **a credential-door class-negative is settled by probing the roster,
+> never by enumerating a surface**, and a report that could not probe a
+> member says `UNKNOWN (door N unprobed)` for it rather than folding the miss
+> into a class verdict. A claim without accepted evidence is **UNVERIFIED and
+> is not recorded** — not as a finding, not as a memory, not as a plan
+> premise. The publication-time capability-negative gate quotes this very
+> block as its deny message.
 <!-- detector-reach-fence:end -->
 
 ---
