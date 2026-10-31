@@ -83,7 +83,8 @@ pub struct TickInput {
     pub context_low: bool,
     /// `cadence_secs` have passed since the last cycle START.
     pub cadence_elapsed: bool,
-    /// Cycles run since the last fresh spawn (spawn counts as cycle 1).
+    /// Cycles run since the last fresh spawn (the spawn's own cycle counts
+    /// from its first transcript turn).
     pub cycles_since_relaunch: u32,
     /// `lifecycle_policy.relaunch_every_cycles` (a 0 is clamped to 1).
     pub relaunch_every_cycles: u32,
@@ -170,6 +171,34 @@ pub fn spawn_grace_elapsed(now_ms: i64, last_spawn_at_ms: Option<i64>, grace_sec
     }
 }
 
+/// Whether the current spawn is `spawn_stalled`: spawned, past its grace window,
+/// and still without a single transcript turn.
+///
+/// `spawn_stalled` is the runner's existing name for a spawn that produced
+/// nothing (`claude_session::spawn_preconditions`, `SpawnStalledBody`, wired for
+/// headless gate continuations); a looping agent's launch reuses it rather than
+/// coining a second state. Plan
+/// `2026-10-28-merge-shepherd-slot-is-won-by-any-runner-regardless-of-role-or-load`
+/// D6: a launch that hung on Claude Code's trust prompt still read as 2 cycles,
+/// because the supervisor counted its own spawn and nudges as cycles while the
+/// turn-ending observer logged `transcript_missing`. Cycles are now counted only
+/// from the first transcript turn, and a launch with none after
+/// `spawn_grace_secs` is reported stalled.
+///
+/// `first_turn_seen` is whether the current spawn's transcript has been
+/// observed; the glue records the first sighting durably and clears it on every
+/// spawn/relaunch.
+pub fn spawn_stalled(
+    now_ms: i64,
+    last_spawn_at_ms: Option<i64>,
+    spawn_grace_secs: u64,
+    first_turn_seen: bool,
+) -> bool {
+    last_spawn_at_ms.is_some()
+        && !first_turn_seen
+        && spawn_grace_elapsed(now_ms, last_spawn_at_ms, spawn_grace_secs)
+}
+
 /// How the glue's liveness resolution reads for one agent this tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Liveness {
@@ -185,26 +214,53 @@ pub enum Liveness {
     Dead,
 }
 
+/// What the glue saw when it looked a terminal id up in the `TerminalManager`.
+///
+/// A REGISTERED terminal is not a live one: the manager keeps an exited tab
+/// registered until someone closes it, so `TerminalManager::get` alone cannot
+/// tell a running agent from a dead pane. Measured 2026-10-28 (plan
+/// `2026-10-28-merge-shepherd-slot-is-won-by-any-runner-regardless-of-role-or-load`
+/// D6): an exited Merge Shepherd tab (`isAlive: false`, exit code 1) held its
+/// fleet slot for 20 minutes because it read as `Live`, so the death-respawn
+/// arm never fired and the supervisor kept nudging the dead PTY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalObservation {
+    /// No terminal is registered under that id.
+    Absent,
+    /// A terminal is registered, but its PTY child has exited.
+    Exited,
+    /// A terminal is registered and its PTY child is running.
+    Alive,
+}
+
 /// Pure liveness resolution from the glue's three observations:
 ///
-/// - `terminal_registered`: `TerminalManager::get(runtime.terminal_id)` hit.
+/// - `direct`: what `TerminalManager::get(runtime.terminal_id)` found.
 /// - `lifecycle_open`: the lifecycle record for `runtime.claude_session_id`
 ///   exists and is `state == "open"`.
-/// - `lifecycle_terminal_registered`: that record's CURRENT `terminal_id`
-///   (which a boot-restore rewrites) resolves to a live terminal — the
-///   re-attach path after a runner restart.
+/// - `lifecycle_terminal`: what that record's CURRENT `terminal_id` (which a
+///   boot-restore rewrites) resolved to — the re-attach path after a runner
+///   restart.
+///
+/// Only a running PTY child is `Live`. An EXITED terminal is a confident death
+/// — this runner process watched the child exit — so it resolves `Dead` (the
+/// death-respawn path) rather than `PendingRestore`, unless the lifecycle
+/// record has already re-pointed the agent at a different, running terminal.
+/// `PendingRestore` stays reserved for the one case it exists for: an open
+/// record whose terminal is not registered YET, as during a boot-restore.
 pub fn resolve_liveness(
-    terminal_registered: bool,
+    direct: TerminalObservation,
     lifecycle_open: bool,
-    lifecycle_terminal_registered: bool,
+    lifecycle_terminal: TerminalObservation,
 ) -> Liveness {
-    if terminal_registered {
+    use TerminalObservation::{Absent, Alive, Exited};
+    if direct == Alive || (lifecycle_open && lifecycle_terminal == Alive) {
         return Liveness::Live;
     }
-    if lifecycle_open {
-        if lifecycle_terminal_registered {
-            return Liveness::Live;
-        }
+    if direct == Exited {
+        return Liveness::Dead;
+    }
+    if lifecycle_open && lifecycle_terminal == Absent {
         return Liveness::PendingRestore;
     }
     Liveness::Dead
@@ -425,19 +481,58 @@ mod tests {
 
     #[test]
     fn liveness_resolution_matrix() {
-        // Direct terminal hit wins.
-        assert_eq!(resolve_liveness(true, false, false), Liveness::Live);
-        assert_eq!(resolve_liveness(true, true, true), Liveness::Live);
+        use TerminalObservation::{Absent, Alive, Exited};
+        // A running direct terminal wins.
+        assert_eq!(resolve_liveness(Alive, false, Absent), Liveness::Live);
+        assert_eq!(resolve_liveness(Alive, true, Alive), Liveness::Live);
         // Re-attach via the lifecycle record's rewritten terminal id.
-        assert_eq!(resolve_liveness(false, true, true), Liveness::Live);
+        assert_eq!(resolve_liveness(Absent, true, Alive), Liveness::Live);
         // Open record, terminal not (yet) registered: WAIT — a boot-restore
         // may be mid-flight; spawning now would duplicate the shepherd.
         assert_eq!(
-            resolve_liveness(false, true, false),
+            resolve_liveness(Absent, true, Absent),
             Liveness::PendingRestore
         );
         // No terminal, record closed/absent: confidently dead.
-        assert_eq!(resolve_liveness(false, false, false), Liveness::Dead);
-        assert_eq!(resolve_liveness(false, false, true), Liveness::Dead);
+        assert_eq!(resolve_liveness(Absent, false, Absent), Liveness::Dead);
+        assert_eq!(resolve_liveness(Absent, false, Alive), Liveness::Dead);
+    }
+
+    #[test]
+    fn an_exited_but_still_registered_terminal_is_dead_not_live() {
+        // D6: the 2026-10-28 dead Shepherd tab — registered in the manager,
+        // child exited with code 1. It must resolve Dead so the existing
+        // death-respawn arm fires, not Live (nudged forever) and not
+        // PendingRestore (waited on forever behind its still-open record).
+        use TerminalObservation::{Absent, Alive, Exited};
+        assert_eq!(resolve_liveness(Exited, false, Absent), Liveness::Dead);
+        assert_eq!(resolve_liveness(Exited, true, Exited), Liveness::Dead);
+        assert_eq!(resolve_liveness(Exited, true, Absent), Liveness::Dead);
+        // The lifecycle record pointing at the SAME exited pane is not a
+        // restore in flight either.
+        assert_eq!(resolve_liveness(Absent, true, Exited), Liveness::Dead);
+        // But a record re-pointed at a DIFFERENT running terminal still
+        // re-attaches: the old pane's death is not the agent's.
+        assert_eq!(resolve_liveness(Exited, true, Alive), Liveness::Live);
+    }
+
+    #[test]
+    fn a_launch_with_no_transcript_after_the_grace_window_is_spawn_stalled() {
+        // D6: spawned at t=0 with a 90 s grace and no transcript yet.
+        assert!(
+            !spawn_stalled(0, None, 90, false),
+            "nothing spawned, nothing stalled"
+        );
+        assert!(
+            !spawn_stalled(89_999, Some(0), 90, false),
+            "still inside the grace window"
+        );
+        assert!(
+            spawn_stalled(90_000, Some(0), 90, false),
+            "no transcript once the grace window has passed is a hung launch, not progress"
+        );
+        // The first transcript turn ends the question either way.
+        assert!(!spawn_stalled(10_000, Some(0), 90, true));
+        assert!(!spawn_stalled(9_000_000, Some(0), 90, true));
     }
 }

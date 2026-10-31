@@ -64,7 +64,9 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::process_capture::process_tree::{claude_pids_in_inclusive_subtree, ProcessSnapshot};
-use qontinui_runner_lib::looping_agent::idle::snapshot_looks_idle;
+use qontinui_runner_lib::looping_agent::idle::{
+    is_box_edge, snapshot_looks_idle, DIALOG_MENU_ROWS,
+};
 
 /// The command typed at the prompt. Submitted separately ([`SUBMIT`]) once it
 /// has echoed on the input line.
@@ -101,8 +103,8 @@ pub const GONE_PROBES_REQUIRED: u32 = 2;
 const PLACEHOLDER_PREFIX: &str = "Try \"";
 
 /// Rows above the cursor scanned for a dialog when no input-box edge bounds
-/// the scan.
-const DIALOG_SCAN_ROWS: usize = 8;
+/// the scan. The looping-agent idle predicate's dialog scan uses the same depth.
+const DIALOG_SCAN_ROWS: usize = DIALOG_MENU_ROWS;
 
 /// Case-insensitive text that marks a dialog rather than the input prompt.
 const DIALOG_MARKERS: &[&str] = &["do you want", "allow", "esc to cancel", "enter to confirm"];
@@ -172,12 +174,6 @@ fn is_numbered_option(text: &str) -> bool {
     digits > 0 && body[digits..].starts_with(". ")
 }
 
-/// Only box-drawing characters: the input box's top edge.
-fn is_box_edge(line: &str) -> bool {
-    let t = line.trim();
-    !t.is_empty() && t.chars().all(|c| "─━╭╮╰╯┌┐└┘│".contains(c))
-}
-
 /// Dialog text that is Claude Code's own CHROME rather than prose: the key
 /// hints a dialog prints under its choices. Unlike `do you want` / `allow`,
 /// these do not turn up in an ordinary finished turn ("Do you want me to run
@@ -217,9 +213,6 @@ fn prompt_ready_with(screen: &ScreenText, dialog_markers: &[&str]) -> Result<(),
     let Some(line) = prompt_line(screen) else {
         return Err("no `❯` input prompt on the cursor row".to_string());
     };
-    if !snapshot_looks_idle(&screen.lines, screen.cursor_row) {
-        return Err("the screen does not look idle".to_string());
-    }
     if is_numbered_option(&line.input) {
         return Err("a numbered choice is selected — a dialog, not the input prompt".to_string());
     }
@@ -276,6 +269,14 @@ fn prompt_ready_with(screen: &ScreenText, dialog_markers: &[&str]) -> Result<(),
         if let Some(marker) = dialog_markers.iter().find(|m| lower.contains(*m)) {
             return Err(format!("dialog marker `{marker}` on row {r}"));
         }
+    }
+    // The generic idle predicate runs LAST: every check above is a refusal
+    // too, so the accepted set is the same in any order, and running the
+    // specific ones first keeps their reasons ("a numbered choice", "dialog
+    // marker") instead of the generic "does not look idle" — the shared
+    // predicate now refuses dialogs as well, and would otherwise answer first.
+    if !snapshot_looks_idle(&screen.lines, screen.cursor_row) {
+        return Err("the screen does not look idle".to_string());
     }
     Ok(())
 }

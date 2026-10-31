@@ -1153,6 +1153,16 @@ impl TrustGateDecision {
     /// [`is_spawn_blocked_refusal`].
     pub fn refusal(&self) -> Option<String> {
         match self {
+            TrustGateDecision::SpawnBlocked { rule, failed }
+                if *rule == RULE_GRANT_DID_NOT_LAND_ON_INTERACTIVE_PTY =>
+            {
+                Some(format!(
+                    "{SPAWN_BLOCKED_REFUSAL_PREFIX} ({rule}): the workspace-trust grant for this \
+                     target did not land, so an interactive child would wait on Claude Code's \
+                     trust dialog — {}",
+                    failed.join("; ")
+                ))
+            }
             TrustGateDecision::SpawnBlocked { rule, failed } => Some(format!(
                 "{SPAWN_BLOCKED_REFUSAL_PREFIX} ({rule}): workspace trust could not be DERIVED \
                  for this target and the tenant's autonomy dial forbids minting it — {}",
@@ -1270,6 +1280,45 @@ pub fn promote_for_surface(
             }
         }
         (other, _) => other,
+    }
+}
+
+/// Rule name for the decision [`promote_unlanded_grant`] produces.
+pub const RULE_GRANT_DID_NOT_LAND_ON_INTERACTIVE_PTY: &str =
+    "grant-did-not-land-on-interactive-pty";
+
+/// Refuse an interactive spawn whose trust GRANT did not land.
+///
+/// Pure. `landing` is the grant's write result: `None` when no grant was
+/// attempted, `Some(Ok(()))` when the flag now reads trusted (`Trusted` or
+/// `AlreadyTrusted`), `Some(Err(why))` when it does not (`Skipped`, `Failed`,
+/// or no account config file / project key to write). Exactly one arm changes:
+/// a [`TrustGateDecision::Grant`] whose write did not land, reaching an
+/// [`SpawnSurface::InteractivePty`], becomes [`TrustGateDecision::SpawnBlocked`]
+/// under its own rule. The reasoning is [`promote_for_surface`]'s: a PTY child
+/// in an untrusted directory does not degrade, it waits on Claude Code's trust
+/// dialog with nobody to answer it. Measured 2026-10-28 (plan
+/// `2026-10-28-merge-shepherd-slot-is-won-by-any-runner-regardless-of-role-or-load`
+/// D6): a Merge Shepherd tab sat on that dialog. Which path let it through is
+/// still to be probed, but a grant whose write made no change was recorded
+/// only as a `debug!` line and the spawn went ahead, which is the gap this
+/// closes. A refusal is a typed `spawn_blocked` the operator can see; a
+/// hang is a live terminal with nobody in it. This only ever tightens: it can
+/// turn a spawn into a refusal, never a refusal into a spawn, and it writes
+/// nothing.
+pub fn promote_unlanded_grant(
+    decision: TrustGateDecision,
+    surface: SpawnSurface,
+    landing: Option<&Result<(), String>>,
+) -> TrustGateDecision {
+    match (&decision, surface, landing) {
+        (TrustGateDecision::Grant { .. }, SpawnSurface::InteractivePty, Some(Err(why))) => {
+            TrustGateDecision::SpawnBlocked {
+                rule: RULE_GRANT_DID_NOT_LAND_ON_INTERACTIVE_PTY,
+                failed: vec![format!("the workspace-trust grant did not land ({why})")],
+            }
+        }
+        _ => decision,
     }
 }
 
@@ -1825,7 +1874,13 @@ fn finish(
     let decision = promote_for_surface(decide(trust, &conjuncts, posture), surface);
 
     let mut write_outcome = None;
+    // Whether a GRANT actually left the flag trusted — read by
+    // `promote_unlanded_grant` below. `None`: no grant was attempted.
+    let mut grant_landing: Option<Result<(), String>> = None;
     if decision.writes_trust() {
+        grant_landing = Some(Err(
+            "no account config file or project key resolved, so nothing was written".to_string(),
+        ));
         if let (Some(file), Some(key)) = (&write_target, &project_key) {
             // A derived grant projects a human's trust; an underived one is the
             // runner's own and is stamped so it can never be derived FROM.
@@ -1857,9 +1912,14 @@ fn finish(
                     "trust gate: grant made no change"
                 ),
             }
+            grant_landing = Some(match &outcome {
+                TrustOutcome::Trusted | TrustOutcome::AlreadyTrusted => Ok(()),
+                other => Err(format!("{other:?}")),
+            });
             write_outcome = Some(format!("{outcome:?}"));
         }
     }
+    let decision = promote_unlanded_grant(decision, surface, grant_landing.as_ref());
 
     let mut primary_checkout_write_outcome = None;
     if mints_primary_checkout_trust(&decision, &conjuncts, posture, parent.is_some()) {
@@ -1933,6 +1993,21 @@ fn finish(
             "trust gate: WITHHELD the trust write — the spawn proceeds and may face the \
              workspace-trust dialog or silently lose this workspace's hooks and MCP servers"
         ),
+        TrustGateDecision::SpawnBlocked { rule, failed }
+            if *rule == RULE_GRANT_DID_NOT_LAND_ON_INTERACTIVE_PTY =>
+        {
+            warn!(
+                cwd = %cwd,
+                project_key = project_key.as_deref().unwrap_or("<underivable>"),
+                rule,
+                dial = ?dial,
+                surface = ?surface,
+                failed = %failed.join("; "),
+                write_outcome = write_outcome.as_deref().unwrap_or("<no write>"),
+                "trust gate: SPAWN BLOCKED — the trust grant did not land, and an interactive \
+                 child in an untrusted directory waits on the trust dialog with nobody to answer it"
+            )
+        }
         TrustGateDecision::SpawnBlocked { rule, failed } => warn!(
             cwd = %cwd,
             project_key = project_key.as_deref().unwrap_or("<underivable>"),
@@ -3251,5 +3326,73 @@ THE AUTONOMY DIAL. One of:
             "{refusal}"
         );
         assert!(pty_child.write_outcome.is_none(), "still nothing minted");
+    }
+
+    #[test]
+    fn an_interactive_grant_that_did_not_land_is_refused_spawn_blocked() {
+        // D6: a granted trust write that left the flag untrusted must not start
+        // a PTY child that can only hang on the dialog.
+        let grant = TrustGateDecision::Grant {
+            rule: "derived-from-parent-repo",
+        };
+        for why in ["Skipped(\"no-projects-map\")", "Failed(\"disk full\")"] {
+            let landing: Result<(), String> = Err(why.to_string());
+            let d =
+                promote_unlanded_grant(grant.clone(), SpawnSurface::InteractivePty, Some(&landing));
+            assert_eq!(
+                d.rule(),
+                RULE_GRANT_DID_NOT_LAND_ON_INTERACTIVE_PTY,
+                "{why}"
+            );
+            assert!(!d.allows_spawn(), "{why}");
+            let refusal = d.refusal().expect("a block always renders a refusal");
+            assert!(is_spawn_blocked_refusal(&refusal), "{refusal}");
+            assert!(refusal.contains("did not land"), "{refusal}");
+            assert!(
+                refusal.contains(why),
+                "the refusal names the write outcome: {refusal}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_landed_or_absent_grant_and_a_print_child_are_left_alone() {
+        let grant = TrustGateDecision::Grant {
+            rule: "derived-from-parent-repo",
+        };
+        let landed: Result<(), String> = Ok(());
+        let failed: Result<(), String> = Err("Failed(\"x\")".to_string());
+        // The grant landed: spawn as before.
+        assert_eq!(
+            promote_unlanded_grant(grant.clone(), SpawnSurface::InteractivePty, Some(&landed)),
+            grant
+        );
+        // A `--print` child degrades instead of hanging, so it is not blocked.
+        assert_eq!(
+            promote_unlanded_grant(grant.clone(), SpawnSurface::NonInteractive, Some(&failed)),
+            grant
+        );
+        // Nothing to promote when no grant was attempted, whatever the decision.
+        for d in [
+            TrustGateDecision::AlreadyTrusted,
+            TrustGateDecision::Withhold {
+                rule: "w",
+                failed: vec![],
+            },
+            TrustGateDecision::SpawnBlocked {
+                rule: "b",
+                failed: vec![],
+            },
+        ] {
+            assert_eq!(
+                promote_unlanded_grant(d.clone(), SpawnSurface::InteractivePty, None),
+                d
+            );
+            assert_eq!(
+                promote_unlanded_grant(d.clone(), SpawnSurface::InteractivePty, Some(&failed)),
+                d,
+                "only a Grant is promoted"
+            );
+        }
     }
 }
