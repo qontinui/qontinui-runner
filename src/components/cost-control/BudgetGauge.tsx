@@ -6,6 +6,7 @@
  */
 
 import type { ActiveBudgetStatus } from "./types";
+import { LIST_PRICE_EQUIVALENT } from "./costProvenance";
 
 interface BudgetGaugeProps {
   budget: ActiveBudgetStatus;
@@ -75,6 +76,7 @@ export function BudgetGauge({ budget }: BudgetGaugeProps) {
         <p className="text-sm font-medium">
           {formatCost(budget.total_cost_usd)} / {formatCost(budget.max_cost_usd)}
         </p>
+        <p className="text-[10px] text-muted-foreground">{LIST_PRICE_EQUIVALENT}</p>
         <p className="text-xs text-muted-foreground">
           {(budget.remaining_fraction * 100).toFixed(0)}% remaining
         </p>
