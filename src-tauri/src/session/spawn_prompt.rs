@@ -1993,6 +1993,8 @@ mod script_tests {
     /// The per-spawn request key the hook SENDS (the runner derives it from
     /// the nonce; the hook only checks its shape).
     const PR_KEY: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    /// `PR_KEY` less its last character (63 of 64): a key that is one short.
+    const PR_KEY_SHORT: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba987654321";
 
     const PR_SEAM: [(&str, &str); 4] = [
         ("QONTINUI_RUNNER_API_PORT", "9876"),
@@ -2208,7 +2210,7 @@ mod script_tests {
                 ("QONTINUI_RUNNER_API_PORT", "9876"),
                 ("QONTINUI_TERMINAL_ID", "term-1"),
                 n,
-                ("QONTINUI_PERMREQ_KEY", &PR_KEY[..63]),
+                ("QONTINUI_PERMREQ_KEY", PR_KEY_SHORT),
             ],
         ] {
             let run = run_pr_hook(&envs, fake_curl(&tail));
