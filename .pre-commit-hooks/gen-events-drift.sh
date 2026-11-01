@@ -309,7 +309,13 @@ SCRATCH_ROOT="$(mktemp -d -t gen-events-drift-XXXXXXXX)"
 # sibling store) left directories `rm` could not empty. As the EXIT trap's last
 # command, that failure became this hook's exit status and aborted a push whose
 # drift check had passed (coord finding 51901722). See lib/scratch-cleanup.sh.
-cleanup() { scratch_dir_remove "$SCRATCH_ROOT"; }
+# The tree-lock release runs FIRST and always returns 0, so the scratch removal
+# stays the trap's last command (see above). Defined only once the shared-target
+# library is sourced below; absent, there is nothing to release.
+cleanup() {
+    if declare -F release_shared_target >/dev/null 2>&1; then release_shared_target; fi
+    scratch_dir_remove "$SCRATCH_ROOT"
+}
 trap cleanup EXIT
 
 # Belt and braces: mktemp may ignore TMPDIR (some implementations, or a -t
@@ -419,6 +425,25 @@ if [ -f "$SHARED_TARGET_LIB" ]; then
     # shellcheck source=lib/shared-target.sh
     . "$SHARED_TARGET_LIB"
     resolve_shared_target "$RUNNER_DIR" "[gen-events-drift]"
+    # The release build below writes the same shared target, so it runs under
+    # the same tree lock and freshness ledger as cargo-prepush.sh's clippy
+    # (coord finding 7b603cde; see the library). Released by `cleanup` on EXIT,
+    # so the lock spans the whole generate_types.sh child. On 1-4 the build is
+    # NOT run unguarded: a peer's stale units would make the drift verdict about
+    # another tree. rc 10 (no library on this machine) builds as before.
+    GUARD_RC=0
+    guard_shared_target "$RUNNER_DIR" "[gen-events-drift]" "$RUNNER_DIR/src-tauri" || GUARD_RC=$?
+    case "$GUARD_RC" in
+        0|10) ;;
+        1|3)
+            cannot_evaluate \
+                "the shared cargo target could not be guarded: ${SHARED_TARGET_GUARD_REASON:-guard rc $GUARD_RC}" \
+                "retry once the peer build holding the tree lock finishes (raise QONTINUI_PREPUSH_TREE_LOCK_MAX_WAIT to wait longer)" ;;
+        *)
+            cannot_evaluate \
+                "the shared cargo target could not be guarded: ${SHARED_TARGET_GUARD_REASON:-guard rc $GUARD_RC}" \
+                "fix the cause named above (for a 'cargo metadata' failure, run 'cargo metadata --no-deps --format-version 1' in $RUNNER_DIR/src-tauri for cargo's full error), then push again" ;;
+    esac
 else
     log "NOTE — missing $SHARED_TARGET_LIB, so the shared target cannot be"
     log "       resolved. Building into this checkout's own target/."
@@ -462,7 +487,7 @@ QONTINUI_PY_OUT_DIR="$SCRATCH_PY_DIR" \
 QONTINUI_SCHEMAS_DIR="$SCHEMAS_DIR" \
 QONTINUI_SCHEMAS_JSON="$SCRATCH_ROOT/schemas.json" \
 QONTINUI_TS_COMPILE_SCRIPT="$TS_CODEGEN_DEPS_SCRIPT" \
-    bash src-tauri/scripts/generate_types.sh --ts-only >"$GEN_LOG" 2>&1
+    bash src-tauri/scripts/generate_types.sh --ts-only >"$GEN_LOG" 2>&1 9>&-
 GEN_RC=$?
 set -e
 
@@ -642,6 +667,11 @@ if [ "$ATTRIBUTION_STATE" = "pre-existing" ] && [ "$STRICT" != "1" ]; then
         log " see lib/gen-events-attribution.sh)"
     else
         log "(markdown included this time: $ATTRIBUTION_EXCLUDES_DROPPED_REASON)"
+    fi
+    if [ -z "$ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON" ]; then
+        log "(and src-tauri/src/fleet_skills .sh/.py files aside, under their own premise guard)"
+    else
+        log "(fleet_skills .sh/.py included this time: $ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON)"
     fi
     log "differs between HEAD and $ATTRIBUTION_BASE_REF (merge-base ${ATTRIBUTION_BASE_SHA:0:12}),"
     log "and the working tree adds nothing either. The inputs behind the diff"

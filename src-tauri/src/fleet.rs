@@ -51,6 +51,12 @@ use crate::database::pg::PgDb;
 /// Appended in [`host_capabilities`].
 pub(crate) mod imagegen_probe;
 
+/// The periodic coord heartbeat loop: drives [`heartbeat_to_coord`] under a
+/// per-tick timeout, warns on stalls, and logs a 10-minute summary (plan
+/// `2026-10-29-a-drained-device-is-alerted-as-no-runner-online`, Phase 3).
+pub(crate) mod heartbeat_loop;
+pub use heartbeat_loop::spawn_heartbeat;
+
 /// Per-machine resource samples (plan §A1/§A2). Driven from
 /// [`spawn_budget_republisher`] so it inherits that function's
 /// shared-machine-state ownership gate instead of restating it — see the
@@ -63,6 +69,12 @@ pub(crate) mod resource_sample;
 /// for why the local/remote split is load-bearing and why an unmeasured census
 /// is `None` rather than a row of zeroes.
 pub(crate) mod socket_census;
+
+/// Per-slice cgroup v2 memory and PSI telemetry (plan
+/// `2026-10-19-ci-nodes-run-the-tauri-runner-always-on-as-ci-node-role`,
+/// Phase 0b). Consumed by [`resource_sample`]'s host lane; off Linux it reports
+/// `not_supported` rather than zeroes.
+pub(crate) mod slice_telemetry;
 
 /// §3.2 declared role. Mirrors `qontinui-coord::fleet::MachineRole`.
 /// The runner publishes itself as `Agent`; the supervisor publishes
@@ -3058,7 +3070,17 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
     };
     let bearer_scope = bindings.bearer_scope();
 
-    let claude_code_available = claude_code_probe();
+    // Off the async worker: this loop runs on a current_thread runtime, so the
+    // synchronous probe (a `claude --version` fork, up to its 3s budget) would
+    // block the only worker — and with it the tick timer that bounds this whole
+    // call in `heartbeat_loop::run_tick`. On the blocking pool the await is
+    // bounded by that tick timeout. A failed probe task counts as unavailable.
+    let claude_code_available = spawn_blocking_tracked(claude_code_probe)
+        .await
+        .unwrap_or_else(|e| {
+            warn!("fleet::heartbeat: claude_code_probe task failed ({e}); advertising unavailable");
+            false
+        });
 
     let (capture_preview_count, monitor_crop_count, last_capture_fallback_at) =
         capture_telemetry_snapshot();
@@ -3375,69 +3397,9 @@ fn detect_claude_code_now() -> bool {
     }
 }
 
-/// Spawn the periodic heartbeat task on the ambient tokio runtime.
-///
-/// Interval is read from `COORD_HEARTBEAT_INTERVAL_SECS` (default 30s,
-/// floored at 1s). `MissedTickBehavior::Skip` mirrors the watcher in
-/// `qontinui-coord/src/health_watcher.rs:99-100` — if a tick is missed
-/// (e.g. system suspend), skip catch-up and resume on the next aligned
-/// tick. Heartbeat failures `warn!` and retry on the next interval;
-/// the loop never panics.
-pub fn spawn_heartbeat() {
-    let secs: u64 = std::env::var("COORD_HEARTBEAT_INTERVAL_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30)
-        .max(1);
-
-    info!(
-        "fleet::heartbeat: starting periodic heartbeat task, interval={}s",
-        secs
-    );
-
-    // Supervised (plan 2026-09-03-…-supervisor Phase 4): a panic in a tick
-    // used to kill this task silently and let coord's 120s liveness TTL
-    // expire; the supervisor rebuilds the loop after a bounded backoff and
-    // `/health` `supervised_workers` shows the restart. Per-run state lives
-    // inside the future, so a rebuilt loop re-enters cleanly from the top.
-    crate::worker_supervisor::spawn_supervised_with_heartbeat(
-        "fleet.heartbeat",
-        move |hb| async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(secs));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // Failure-streak counter: each WARN carries the running count (so
-            // log timestamps reveal whether ticks are actually firing every
-            // `secs`), and recovery logs once at info — the success path is
-            // otherwise debug-quiet, which hid the 2026-06-03 outage's
-            // intermittency from the default log level.
-            let mut consecutive_failures: u32 = 0;
-            loop {
-                tick.tick().await;
-                hb.tick();
-                match heartbeat_to_coord().await {
-                    Err(e) => {
-                        consecutive_failures += 1;
-                        warn!(
-                            "fleet::heartbeat: {e} (consecutive_failures={consecutive_failures})"
-                        );
-                        // Three of these in a row make the drain state Unknown.
-                        crate::coord_drain_state::note_heartbeat_failure(&e);
-                    }
-                    Ok(outcome) => {
-                        if consecutive_failures > 0 {
-                            info!(
-                                "fleet::heartbeat: recovered after {consecutive_failures} \
-                                 failed tick(s)"
-                            );
-                            consecutive_failures = 0;
-                        }
-                        crate::coord_drain_state::note_heartbeat(outcome).await;
-                    }
-                }
-            }
-        },
-    );
-}
+// The loop that drives `heartbeat_to_coord` (`spawn_heartbeat`) lives in
+// `fleet/heartbeat_loop.rs`, with its tick timeout, stall warning and periodic
+// summary line.
 
 // =============================================================================
 // Primary-tree state publisher
@@ -3448,7 +3410,7 @@ pub fn spawn_heartbeat() {
 // + `git rev-parse HEAD` + `git symbolic-ref --short HEAD` + mtime-scans the
 // working tree, then POSTs one row per repo to `<base>/coord/trees/upsert`.
 //
-// Mirrors the `heartbeat_to_coord` + `spawn_heartbeat` pair above:
+// Mirrors `heartbeat_to_coord` above and its loop, `heartbeat_loop::spawn_heartbeat`:
 // - Reuses `load_device_file` for identity.
 // - Reuses `profiles::connected_coord_base` for the coord HTTP endpoint.
 // - Best-effort: errors `warn!` and the next tick retries; the loop never
@@ -7245,9 +7207,12 @@ mod tests {",
             (
                 "agent_worktree/census.rs",
                 include_str!("agent_worktree/census.rs"),
-                2,
-                "the periodic walk spawn AND `ChunkPoster::resolve_dest`, the POST chokepoint \
-                 every walk trigger routes through",
+                1,
+                "`runs_machine_census`, the module's one spelling of the rule. Its call \
+                 sites — the periodic walk spawn, `ChunkPoster::resolve_dest` (the POST \
+                 chokepoint every walk trigger routes through) and the volume probe — are \
+                 pinned by census.rs's own `the_census_post_chokepoint_carries_the_guard` and \
+                 `the_walk_spawn_and_the_volume_probe_ask_runs_machine_census`",
             ),
             (
                 "agent_worktree/fs_backstop.rs",
@@ -10003,6 +9968,7 @@ Add-Content -LiteralPath $Out -Value $lines
             "host_capabilities",
             "capability_tokens",
             "slow_host_probes",
+            "claude_code_probe",
         ] {
             assert!(
                 !calls_fn(&rest, inline),

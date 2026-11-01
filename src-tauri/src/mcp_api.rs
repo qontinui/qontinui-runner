@@ -11880,7 +11880,9 @@ pub fn create_router(
         },
         // 2 permits — xcap is GDI-bound, fits-2-parallel pattern per
         // proj_supervisor_build_pool.md.
-        vision_capture_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
+        vision_capture_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            crate::mcp::ui_bridge::vision_routes::VISION_CAPTURE_PERMITS as usize,
+        )),
         vision_mutation_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         // Capture-backend telemetry — per-backend counters + last-fallback record.
         vision_capture_preview_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -15436,6 +15438,7 @@ mod self_id_chain_tests {
             finished_at: None,
             wind_down_outcome: None,
             wind_down_at: None,
+            wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,

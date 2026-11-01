@@ -1,0 +1,31 @@
+2026-10-27T06:42:22.6191792Z ##[group]Run cat <<'EOF' > expected-oom-lines.txt
+2026-10-27T06:42:22.6192602Z [36;1mmatch "rustc-LLVM ERROR: out of memory" -E '^rustc-LLVM ERROR: out of memory'[0m
+2026-10-27T06:42:22.6192602Z [36;1mmatch "memory allocation failed" -E '^memory allocation of [0-9]+ bytes failed'[0m
+2026-10-27T06:42:22.6192602Z [36;1mmatch "STATUS_NO_MEMORY (0xc0000017)" -iE \[0m
+2026-10-27T06:42:22.6192602Z [36;1m  "^[[:space:]]*process didn't exit successfully: .*\\(exit code: 0xc0000017(, STATUS_NO_MEMORY)?\\)$"[0m
+2026-10-27T06:42:22.6192602Z [36;1mmatch "commit limit (os error 1455)" -E '\(os error 1455\)$'[0m
+2026-10-27T06:42:22.6192602Z [36;1mmatch "LNK1102 linker out of memory" -E '^[[:space:]]*(= note: )?LINK : fatal error LNK1102'[0m
+2026-10-27T06:42:22.6192602Z [36;1m[0m
+2026-10-27T06:42:22.6192602Z [36;1m# 6. SIGKILL with the cgroup's own record of an OOM kill.[0m
+2026-10-27T06:42:22.6192602Z [36;1mif [ -z "$signature" ] && [ -n "$memory_events" ] && [ -r "$memory_events" ]; then[0m
+2026-10-27T06:42:22.6192602Z [36;1m  oom_kills="$(awk '$1 == "oom_kill" { print $2; exit }' "$memory_events" 2>/dev/null)"[0m
+2026-10-27T06:42:22.6192602Z [36;1m  case "$oom_kills" in[0m
+2026-10-27T06:42:22.6192602Z [36;1m    '' | *[!0-9]*) oom_kills=0 ;;[0m
+2026-10-27T06:42:22.6192602Z [36;1m  esac[0m
+2026-10-27T06:42:22.6192602Z [36;1m  if [ "$oom_kills" -gt 0 ]; then[0m
+2026-10-27T06:42:22.6192602Z [36;1m    hit="$(first_line -E '\(signal: 9, SIGKILL: kill\)$')"[0m
+2026-10-27T06:42:22.6192602Z [36;1m    if [ -n "$hit" ]; then[0m
+2026-10-27T06:42:22.6192602Z [36;1m      signature="SIGKILL with cgroup oom_kill=$oom_kills"[0m
+2026-10-27T06:42:22.6192602Z [36;1m      line="$hit"[0m
+2026-10-27T06:42:22.6192602Z [36;1m    fi[0m
+2026-10-27T06:42:22.6192602Z [36;1m  fi[0m
+2026-10-27T06:42:22.6192602Z [36;1mfi[0m
+2026-10-27T06:42:22.6193224Z [36;1mrustc-LLVM ERROR: out of memory[0m
+2026-10-27T06:42:22.6193224Z [36;1mmemory allocation of 2097152 bytes failed[0m
+2026-10-27T06:42:22.6193224Z [36;1m  process didn't exit successfully: `rustc` (signal: 9, SIGKILL: kill)[0m
+2026-10-27T06:42:22.6193224Z [36;1m  = note: LINK : fatal error LNK1102: out of memory[0m
+2026-10-27T06:42:22.6193224Z [36;1mEOF[0m
+2026-10-27T06:42:22.6193861Z shell: /usr/bin/bash -e {0}
+2026-10-27T06:42:22.6194470Z ##[endgroup]
+2026-10-27T06:42:23.1000000Z error: could not compile `qontinui-runner` (lib test)
+2026-10-27T06:42:23.2000000Z ##[error]Process completed with exit code 101.
