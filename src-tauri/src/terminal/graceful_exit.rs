@@ -10,7 +10,7 @@
 //! that can drop its transcript tail. Wind-down must never do that to a live
 //! `claude`.
 //!
-//! ## The protocol ([`drive`])
+//! ## The protocol ([`drive_graceful_exit`])
 //!
 //! 1. **Probe the pane's process subtree.** No `claude` → `NoLiveClaude`, and
 //!    nothing is typed (typing into a bare shell is not a no-op). An
@@ -47,7 +47,7 @@
 //! There is no kill anywhere in this module; the tab-closing callback is
 //! reachable only from the gone arm, and the tests below pin that. The one
 //! public entry point is `TerminalManager::graceful_exit`, which takes the
-//! caller's `Option<CloseAuthority>` and hands it to [`drive`]. Its close skips
+//! caller's `Option<CloseAuthority>` and hands it to [`drive_graceful_exit`]. Its close skips
 //! the kill entirely when the pane's own process (the `claude`, when it is the
 //! pane root) has already exited.
 //!
@@ -121,7 +121,7 @@ const PLACEHOLDER_PREFIX: &str = "Try \"";
 /// Case-insensitive text that marks a dialog rather than the input prompt.
 const DIALOG_MARKERS: &[&str] = &["do you want", "allow", "esc to cancel", "enter to confirm"];
 
-/// Timing knobs for [`drive`].
+/// Timing knobs for [`drive_graceful_exit`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExitTiming {
     pub deadline: Duration,
@@ -529,7 +529,7 @@ impl GracefulExitOutcome {
     }
 }
 
-/// What the close step did — the answer to the ONE question `drive` cannot ask
+/// What the close step did — the answer to the ONE question `drive_graceful_exit` cannot ask
 /// itself, because the pane is reached only through the injected effects.
 ///
 /// ## Why the close is allowed to refuse (Phase 1 review, hazard 2)
@@ -578,9 +578,11 @@ fn millis(d: Duration) -> u64 {
 ///
 /// `pub(super)`: only `crate::terminal` may drive the protocol, and everything
 /// else goes through `TerminalManager::graceful_exit`. The close-authority scan
-/// (`runner_close_sites.rs`) checks the authority every caller passes, and it
-/// reads `drive(` calls under `terminal/` only, which this keeps complete.
-pub(super) async fn drive<W, S, P, PF, C, CF>(
+/// (`runner_close_sites.rs`) checks the authority every caller passes. It reads
+/// a call of this fn in every file, by a name no other fn in the crate uses, so
+/// a macro defined elsewhere that expands to a call is read where it is
+/// written.
+pub(super) async fn drive_graceful_exit<W, S, P, PF, C, CF>(
     mut write: W,
     mut screen: S,
     mut probe: P,
@@ -751,7 +753,7 @@ where
 /// Test-only scripted process tables, keyed by a pane root pid that no real
 /// process can hold.
 ///
-/// [`drive`]'s own tests script `probe` directly. A test that must enter
+/// [`drive_graceful_exit`]'s own tests script `probe` directly. A test that must enter
 /// through a CALLER of the primitive cannot: the wind-down arms, the steward
 /// stop, the relay's end and the debug door all reach `probe_claude_under`
 /// through `TerminalManager::graceful_exit`, which reads the real OS table.
@@ -1236,7 +1238,7 @@ mod tests {
     async fn exits_then_closes_only_after_two_consecutive_gone_probes() {
         let log: Log = Arc::default();
         let pane = FakePane::new(empty_prompt(), true);
-        let outcome = drive(
+        let outcome = drive_graceful_exit(
             pane.write(log.clone()),
             pane.screen(),
             scripted_probe(
@@ -1282,7 +1284,7 @@ mod tests {
     async fn a_close_that_refuses_is_reported_as_close_refused_not_exited() {
         let log: Log = Arc::default();
         let pane = FakePane::new(empty_prompt(), true);
-        let outcome = drive(
+        let outcome = drive_graceful_exit(
             pane.write(log.clone()),
             pane.screen(),
             scripted_probe(
@@ -1314,7 +1316,7 @@ mod tests {
     async fn a_claude_alive_elsewhere_in_the_table_blocks_the_close_until_the_deadline() {
         let log: Log = Arc::default();
         let pane = FakePane::new(empty_prompt(), true);
-        let outcome = drive(
+        let outcome = drive_graceful_exit(
             pane.write(log.clone()),
             pane.screen(),
             scripted_probe(
@@ -1341,7 +1343,7 @@ mod tests {
     async fn a_claude_that_outlives_the_deadline_is_left_running() {
         let log: Log = Arc::default();
         let pane = FakePane::new(empty_prompt(), true);
-        let outcome = drive(
+        let outcome = drive_graceful_exit(
             pane.write(log.clone()),
             pane.screen(),
             scripted_probe(vec![readable(&[CLAUDE], 0, &[CLAUDE])], log.clone()),
@@ -1367,7 +1369,7 @@ mod tests {
     async fn an_unreadable_probe_breaks_the_gone_streak() {
         let log: Log = Arc::default();
         let pane = FakePane::new(empty_prompt(), true);
-        let outcome = drive(
+        let outcome = drive_graceful_exit(
             pane.write(log.clone()),
             pane.screen(),
             scripted_probe(
@@ -1426,7 +1428,7 @@ mod tests {
         for (probe, initial, expect) in cases {
             let log: Log = Arc::default();
             let pane = FakePane::new(initial, true);
-            let outcome = drive(
+            let outcome = drive_graceful_exit(
                 pane.write(log.clone()),
                 pane.screen(),
                 scripted_probe(vec![probe], log.clone()),
@@ -1457,7 +1459,7 @@ mod tests {
     async fn a_missing_echo_never_submits_and_leaves_a_foreign_line_alone() {
         let log: Log = Arc::default();
         let pane = FakePane::new(empty_prompt(), false);
-        let outcome = drive(
+        let outcome = drive_graceful_exit(
             pane.write(log.clone()),
             pane.screen(),
             scripted_probe(vec![readable(&[CLAUDE], 0, &[])], log.clone()),
@@ -1510,7 +1512,7 @@ mod tests {
                 }
             }
         };
-        let outcome = drive(
+        let outcome = drive_graceful_exit(
             write,
             screen,
             scripted_probe(vec![readable(&[CLAUDE], 0, &[])], log.clone()),
@@ -1552,7 +1554,7 @@ mod tests {
             ] {
                 let log: Log = Arc::default();
                 let pane = FakePane::new(empty_prompt(), true);
-                let outcome = drive(
+                let outcome = drive_graceful_exit(
                     pane.write(log.clone()),
                     pane.screen(),
                     scripted_probe(vec![probe], log.clone()),
@@ -1592,7 +1594,7 @@ mod tests {
         for (probe, initial, pids) in cases {
             let log: Log = Arc::default();
             let pane = FakePane::new(initial, true);
-            let outcome = drive(
+            let outcome = drive_graceful_exit(
                 pane.write(log.clone()),
                 pane.screen(),
                 scripted_probe(vec![probe], log.clone()),
@@ -1698,7 +1700,7 @@ mod tests {
     async fn a_failed_write_closes_nothing() {
         let log: Log = Arc::default();
         let pane = FakePane::new(empty_prompt(), true);
-        let outcome = drive(
+        let outcome = drive_graceful_exit(
             |_bytes: &[u8]| Err("terminal exited".to_string()),
             pane.screen(),
             scripted_probe(vec![readable(&[CLAUDE], 0, &[])], log.clone()),
@@ -1742,14 +1744,14 @@ mod tests {
     }
 
     /// Structural pin on the invariant: this module's code never names a kill
-    /// path. `drive` reaches the pane only through its injected effects, and
+    /// path. `drive_graceful_exit` reaches the pane only through its injected effects, and
     /// the production close is `TerminalManager::graceful_exit`'s.
     #[test]
     fn this_module_contains_no_kill_path() {
         let source = include_str!("graceful_exit.rs");
         // Split at the test MODULE, not at the first `#[cfg(test)]`: the
         // scripted-probe seam inside `probe_claude_under` is an earlier
-        // `#[cfg(test)]`, and splitting there would leave `drive` unscanned.
+        // `#[cfg(test)]`, and splitting there would leave `drive_graceful_exit` unscanned.
         let production: String = source
             .split("#[cfg(test)]\nmod tests {")
             .next()

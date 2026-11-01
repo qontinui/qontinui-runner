@@ -998,7 +998,7 @@ impl TerminalManager {
                 // NARROWER than the driver's own gone-gate on purpose: that
                 // gate requires `subtree_claude.is_empty() &&
                 // tracked_alive.is_empty()`, this one re-proves only the
-                // subtree (the tracked set lives inside `drive` and is not
+                // subtree (the tracked set lives inside `drive_graceful_exit` and is not
                 // reachable here). The scope is right for what this guard
                 // protects — `close_inner`'s kill reaches the PANE's process
                 // and nothing else, so a tracked `claude` that has drifted out

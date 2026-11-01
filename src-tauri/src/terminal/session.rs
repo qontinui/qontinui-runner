@@ -4893,7 +4893,7 @@ impl TerminalSession {
         C: FnOnce() -> CF,
         CF: std::future::Future<Output = crate::terminal::graceful_exit::CloseTabResult>,
     {
-        use crate::terminal::graceful_exit::{drive, GracefulExitOutcome};
+        use crate::terminal::graceful_exit::{drive_graceful_exit, GracefulExitOutcome};
 
         info!(
             terminal_id = %self.id,
@@ -4901,7 +4901,7 @@ impl TerminalSession {
             authority = authority.is_some(),
             "graceful_exit: starting"
         );
-        let outcome = drive(
+        let outcome = drive_graceful_exit(
             |bytes| self.write(bytes, PtyWriteCaller::GracefulExit),
             || self.grid_screen(),
             probe,

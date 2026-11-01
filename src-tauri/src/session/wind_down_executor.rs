@@ -732,7 +732,7 @@ pub fn claude_left(outcome: &GracefulExitOutcome) -> bool {
 ///
 /// This reads the evidence the exit already gathered rather than re-deriving
 /// it: seven of the nine outcomes carry `claude_pids`, and a NON-EMPTY list is
-/// the pids `drive` actually saw. `NoLiveClaude` (looked, found none) and
+/// the pids `drive_graceful_exit` actually saw. `NoLiveClaude` (looked, found none) and
 /// `ProbeUnavailable` (could not look) carry none, and both correctly answer
 /// false — the second because "could not look" is never evidence.
 ///
@@ -1326,7 +1326,7 @@ pub(crate) trait CloseEffects {
 ///   restarted, so a re-observed verdict is `NotYet` for another full grace
 ///   period — but the frozen one still says `Eligible`, `exit_prompt_ready`
 ///   passes (the pane genuinely IS at an empty prompt), and the session is
-///   closed out from under them. `drive`'s own preamble catches a pane that is
+///   closed out from under them. `drive_graceful_exit`'s own preamble catches a pane that is
 ///   BUSY at close time; it cannot catch one that was busy twenty seconds ago
 ///   and is momentarily quiet, which is precisely the state a grace period
 ///   exists to distinguish from idleness. Without this, two of this module's
@@ -1422,7 +1422,7 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
         }
 
         // D6: a steward the drain STOPPED is owed a restart on undrain. The
-        // predicate is "`claude` left", NOT "the tab closed" — `drive` reaches
+        // predicate is "`claude` left", NOT "the tab closed" — `drive_graceful_exit` reaches
         // its close callback only after `GONE_PROBES_REQUIRED` consecutive gone
         // probes, so `CloseRefused` and `CloseOutcomeUnknown` both mean the
         // steward's `claude` is already gone and only the bare shell survives.
