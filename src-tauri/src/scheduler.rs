@@ -220,6 +220,8 @@ impl ScheduledTaskExt for ScheduledTask {
             catch_up_grace_seconds: 300,
             consecutive_launch_failures: 0,
             launch_failure_backoff_seconds: 60,
+            timezone: None,
+            managed: None,
         }
     }
 
