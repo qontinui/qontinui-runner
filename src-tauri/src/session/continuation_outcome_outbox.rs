@@ -85,6 +85,7 @@
 //! means the field is omitted, which is coord's pre-guard behaviour.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -373,6 +374,12 @@ struct Book {
     seen_dropped: u64,
 }
 
+impl Book {
+    fn row_count(&self) -> usize {
+        self.by_gate.values().map(Vec::len).sum()
+    }
+}
+
 /// Writer for the outcome kind, over the SAME [`OutboxWriter`] the
 /// `CoordSync` drain reads (a second writer over one file mints colliding
 /// seqs — see [`super::closeout_spool::CloseoutSpool`]).
@@ -386,6 +393,12 @@ pub struct ContinuationOutcomeOutbox {
     outbox: Arc<OutboxWriter>,
     machine_id: Uuid,
     book: Mutex<Book>,
+    /// The book's row count, published under the book lock after every change
+    /// and read WITHOUT it. `GET /health` reads this: the book lock is held
+    /// across an enqueue's fsync (and its cap trim) and across a reconcile's
+    /// full re-read of the outbox, so a health read that took it would stall
+    /// the liveness probe for exactly as long as the disk does.
+    pending_count: AtomicUsize,
     /// [`EXEMPT_PENDING_CEILING`], or a test's own.
     ceiling: usize,
 }
@@ -418,7 +431,11 @@ impl ContinuationOutcomeOutbox {
             }
         };
         let seen_dropped = outbox.dropped_unacked();
-        let seeded: usize = by_gate.values().map(Vec::len).sum();
+        let book = Book {
+            by_gate,
+            seen_dropped,
+        };
+        let seeded = book.row_count();
         if seeded > ceiling {
             // Seeded PAST the ceiling (a restart mid-outage): the per-enqueue
             // crossing below would never fire, so say it here.
@@ -427,10 +444,8 @@ impl ContinuationOutcomeOutbox {
         Self {
             outbox,
             machine_id,
-            book: Mutex::new(Book {
-                by_gate,
-                seen_dropped,
-            }),
+            book: Mutex::new(book),
+            pending_count: AtomicUsize::new(seeded),
             ceiling,
         }
     }
@@ -509,7 +524,7 @@ impl ContinuationOutcomeOutbox {
             .entry(rec.gate_id)
             .or_default()
             .push((key, row.seq));
-        let pending: usize = book.by_gate.values().map(Vec::len).sum();
+        let pending = self.publish_count(&book);
         if pending > self.ceiling && pending - 1 <= self.ceiling {
             // Crossing the ceiling, said once per crossing.
             log_over_ceiling(pending, self.ceiling);
@@ -524,9 +539,10 @@ impl ContinuationOutcomeOutbox {
         ))
     }
 
-    /// Pending outcome rows, across every gate.
+    /// Pending outcome rows, across every gate. Takes no lock — it reads the
+    /// count the book publishes on every change — so it never waits on disk I/O.
     pub fn pending_rows(&self) -> usize {
-        self.lock().by_gate.values().map(Vec::len).sum()
+        self.pending_count.load(Ordering::Acquire)
     }
 
     /// Whether the pending outcome rows are past [`EXEMPT_PENDING_CEILING`]
@@ -557,6 +573,7 @@ impl ContinuationOutcomeOutbox {
         let Some(seq) = remove_key(&mut book, rec.gate_id, &key) else {
             return false;
         };
+        self.publish_count(&book);
         if let Err(e) = self.outbox.ack(&[(lane(rec.gate_id), seq)]) {
             tracing::warn!(
                 "continuation-outcome gate_id={} outcome={} answered, but its outbox row could \
@@ -582,6 +599,7 @@ impl ContinuationOutcomeOutbox {
                 book.by_gate.remove(&rec.gate_id);
             }
         }
+        self.publish_count(&book);
     }
 
     /// Rebuild the book from the outbox. With `after_trim`, every record the
@@ -618,6 +636,15 @@ impl ContinuationOutcomeOutbox {
         }
         book.by_gate = fresh;
         book.seen_dropped = self.outbox.dropped_unacked();
+        self.publish_count(book);
+    }
+
+    /// Publish `book`'s row count for the lock-free readers, returning it.
+    /// Called with the book lock held, after every change to it.
+    fn publish_count(&self, book: &Book) -> usize {
+        let rows = book.row_count();
+        self.pending_count.store(rows, Ordering::Release);
+        rows
     }
 
     fn lock(&self) -> MutexGuard<'_, Book> {
@@ -2122,6 +2149,31 @@ mod tests {
             logs.contains("past the ceiling of 2"),
             "a store seeded past the ceiling says so at once: {logs}"
         );
+    }
+
+    /// `/health` answers while the book lock is held — as it is across an
+    /// enqueue's fsync and cap trim, and across a reconcile's re-read of the
+    /// whole outbox — and its count follows every change to the book.
+    #[test]
+    fn health_answers_while_the_book_lock_is_held() {
+        let (s, _d) = store();
+        let rec = record(Uuid::new_v4(), "spawned", None);
+        s.enqueue(&rec).unwrap();
+        s.enqueue(&record(Uuid::new_v4(), "spawned", None)).unwrap();
+        let s = Arc::new(s);
+        let held = s.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = s.clone();
+        let t = std::thread::spawn(move || {
+            let _ = tx.send(reader.health_json());
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(10));
+        drop(held);
+        t.join().unwrap();
+        let got = got.expect("health answered while the book lock was held");
+        assert_eq!(got["pending"], 2);
+        assert!(s.complete(&rec));
+        assert_eq!(s.pending_rows(), 1, "an ACK is reflected in the count");
     }
 
     /// A detail is capped at 300 characters (plus the ellipsis); a short one

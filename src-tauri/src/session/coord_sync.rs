@@ -3940,7 +3940,8 @@ mod tests {
         // `SessionEventKind::GateContinuationOutcome`, by its wire name.
         assert!(
             dispatch.contains("\"gate_continuation_outcome\" =>"),
-            "gate_continuation_outcome has NO dispatch arm — the catch-all would ACK and              DROP the only record of a consume"
+            "gate_continuation_outcome has NO dispatch arm — the catch-all would ACK and \
+             DROP the only record of a consume"
         );
     }
 

@@ -3306,10 +3306,11 @@ fn prune_dead_continuations(is_live: &dyn Fn(&str) -> bool) {
     }
     // Only `live` is reaped: a pending anchor has no terminal to test and is
     // released by the dispatch that holds it (`AnchorReservation`).
-    let reaped: Vec<ContinuationSession> = {
+    let reaped: Vec<ExitedContinuation> = {
         let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
         dead.iter()
             .filter_map(|tid| registry.live.remove(tid))
+            .map(ExitedContinuation::left_live)
             .collect()
     };
 
@@ -3332,7 +3333,8 @@ fn prune_dead_continuations(is_live: &dyn Fn(&str) -> bool) {
     let Some(device_id) = load_local_device_id() else {
         return;
     };
-    for session in &reaped {
+    for exited in &reaped {
+        let session = &exited.session;
         let snapshot = pane_exit_facts(&session.terminal_id);
         let detail = work_unreported_detail(
             snapshot.map(|(f, _)| f),
@@ -3341,7 +3343,7 @@ fn prune_dead_continuations(is_live: &dyn Fn(&str) -> bool) {
         );
         spawn_work_unreported_fallback(
             &handle,
-            session.gate_id,
+            exited.report_to(),
             device_id,
             &session.terminal_id,
             detail,
@@ -4001,7 +4003,7 @@ pub(crate) fn notify_continuation_terminal_exit(
     rt_handle: Option<&tokio::runtime::Handle>,
     exit: Option<crate::terminal::session::PaneExitFacts>,
 ) {
-    let Some(session) = deregister_exited_continuation(terminal_id) else {
+    let Some(exited) = deregister_exited_continuation(terminal_id) else {
         return;
     };
     let (exit, exited_at) = match exit {
@@ -4013,18 +4015,13 @@ pub(crate) fn notify_continuation_terminal_exit(
     };
     let detail = work_unreported_detail(
         exit,
-        session_lifetime(session.registered_at, exited_at),
+        session_lifetime(exited.session.registered_at, exited_at),
         terminal_id,
     );
-    // The two early returns below post no `work_unreported`, so they forget the
-    // episode remembered for it (the fallback that would have taken it).
-    let forget_episode = || {
-        if let Some(gate_id) = session.gate_id {
-            crate::session::continuation_outcome_outbox::take_episode(gate_id);
-        }
-    };
+    // The episode was taken from the book as the registration left `live`, so
+    // the two early returns below, which post no `work_unreported`, leave
+    // nothing behind in it.
     let Some(device_id) = load_local_device_id() else {
-        forget_episode();
         return;
     };
     let Some(handle) = rt_handle else {
@@ -4032,7 +4029,6 @@ pub(crate) fn notify_continuation_terminal_exit(
             "agent_runtime: continuation terminal_id={terminal_id} exited but no tokio \
              handle to poll on — relying on the periodic backstop / next WS reconnect"
         );
-        forget_episode();
         return;
     };
     debug!(
@@ -4043,7 +4039,7 @@ pub(crate) fn notify_continuation_terminal_exit(
     // drain a deferred (`AtCap`) continuation PROMPTLY; putting a 5s-timeout
     // network POST in front of it would tax that latency for an unrelated
     // concern, and an aborted outcome task would take the polls with it.
-    spawn_work_unreported_fallback(handle, session.gate_id, device_id, terminal_id, detail);
+    spawn_work_unreported_fallback(handle, exited.report_to(), device_id, terminal_id, detail);
     handle.spawn(async move {
         poll_pending_continuations(device_id).await;
         poll_pending_unit_dispatches(device_id).await;
@@ -4060,18 +4056,74 @@ pub(crate) fn notify_continuation_terminal_exit(
 /// failed) or which exited before its post-spawn `register` landed.
 fn spawn_work_unreported_fallback(
     handle: &tokio::runtime::Handle,
-    gate_id: Option<uuid::Uuid>,
+    gate: Option<ExitedGate>,
     device_id: uuid::Uuid,
     terminal_id: &str,
     detail: String,
 ) {
-    let Some(gate_id) = gate_id else {
+    let Some(gate) = gate else {
         return;
     };
     let terminal_id = terminal_id.to_string();
+    // The episode is MOVED into the task, already taken: the task may first
+    // run after a fresh claim of the same gate has remembered its own.
     handle.spawn(async move {
-        post_work_unreported_fallback(gate_id, device_id, &terminal_id, detail).await;
+        post_work_unreported_fallback(gate, device_id, &terminal_id, detail).await;
     });
+}
+
+/// The gate an ended continuation reports `work_unreported` to, and the
+/// dispatch episode it was claimed under (`None` = unknown).
+///
+/// The episode is taken from the episode book in the same step that removes
+/// the registration from `live` ([`ExitedContinuation::left_live`]), never
+/// later in the posting task: a fresh claim of the same gate can remember its
+/// own episode before that task is first polled, and the old run's outcome
+/// would then be posted under the new run's episode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExitedGate {
+    gate_id: uuid::Uuid,
+    dispatched_at: Option<String>,
+}
+
+/// A gate whose dispatch episode is unknown — coord applies its pre-guard
+/// behaviour to an outcome that names none.
+impl From<uuid::Uuid> for ExitedGate {
+    fn from(gate_id: uuid::Uuid) -> Self {
+        Self {
+            gate_id,
+            dispatched_at: None,
+        }
+    }
+}
+
+/// A registration that has just left `live` — through the PTY exit hook or the
+/// liveness reaper — with its gate's episode already taken from the book.
+#[derive(Debug)]
+struct ExitedContinuation {
+    session: ContinuationSession,
+    /// The episode the gate was claimed under, taken as the entry left `live`.
+    episode: Option<String>,
+}
+
+impl ExitedContinuation {
+    /// Wrap a registration just removed from `live`, taking its gate's
+    /// episode in the same step. Called with the registry lock held.
+    fn left_live(session: ContinuationSession) -> Self {
+        let episode = session
+            .gate_id
+            .and_then(crate::session::continuation_outcome_outbox::take_episode);
+        Self { session, episode }
+    }
+
+    /// The gate to report to, with the episode — `None` when the session had
+    /// no gate (a work-unit dispatch, or a legacy frame).
+    fn report_to(&self) -> Option<ExitedGate> {
+        self.session.gate_id.map(|gate_id| ExitedGate {
+            gate_id,
+            dispatched_at: self.episode.clone(),
+        })
+    }
 }
 
 /// How a continuation session that STARTED ended — the `exit=` class of the
@@ -4193,24 +4245,26 @@ fn session_lifetime(
 ///
 /// Never fails the exit path: every arm logs and returns.
 async fn post_work_unreported_fallback(
-    gate_id: uuid::Uuid,
+    gate: impl Into<ExitedGate>,
     device_id: uuid::Uuid,
     terminal_id: &str,
     detail: String,
 ) {
+    let ExitedGate {
+        gate_id,
+        dispatched_at: episode,
+    } = gate.into();
     // The detail is [`work_unreported_detail`]'s one line — HOW the session
     // ended, which is what lets coord re-deliver a crash and leave a deliberate
     // end alone. Coord persists `work_unreported: <detail>`.
     // Durable (a real outcome on a consumed row), on the same per-gate lane
     // as `spawned`, so a queued `spawned` stays ahead of it. Names the episode
-    // the session was claimed under, when the poll told us.
-    //
-    // TAKEN, whatever coord answers: this runs at most once per registration.
-    // The exit hook and the reaper both remove the registration from `live`
-    // under the same lock before calling here, so only one of them can. On
-    // NoVerdict the queued row carries the episode in its own payload, so the
-    // entry has no further use either way.
-    let episode = crate::session::continuation_outcome_outbox::take_episode(gate_id);
+    // the session was claimed under, when the poll told us — taken from the
+    // book when the registration left `live` (see [`ExitedGate`]), so this
+    // post is its only use. Where the post is written ahead, a NoVerdict leaves
+    // the queued row carrying the episode in its own payload; with no coord
+    // configured ([`OutcomeDoor::live`] is `None`) nothing is written ahead and
+    // the episode goes with the outcome, which is not recorded at all.
     let ack = post_continuation_outcome(
         gate_id,
         device_id,
@@ -4295,7 +4349,7 @@ fn marker_matches(marker: &str, recorded: &str) -> bool {
 /// Pure over the registry (the only side effect is the removal), so the
 /// capacity-freed re-poll decision is unit-testable without a tokio runtime or a
 /// live `TerminalManager`. Operator tabs are never in the registry → `None`.
-fn deregister_exited_continuation(terminal_id: &str) -> Option<ContinuationSession> {
+fn deregister_exited_continuation(terminal_id: &str) -> Option<ExitedContinuation> {
     // `lock_recover`, not a bare `.lock()` + `unwrap_or(None)`: a poisoned lock
     // must not silently leak the cap slot AND permanently disable the
     // work-outcome fallback for every later continuation. The other two writers
@@ -4304,6 +4358,7 @@ fn deregister_exited_continuation(terminal_id: &str) -> Option<ContinuationSessi
     lock_recover(continuation_sessions(), "continuation_sessions")
         .live
         .remove(terminal_id)
+        .map(ExitedContinuation::left_live)
 }
 
 /// A continuation registration lifted off one terminal so it can be re-pinned
@@ -16317,12 +16372,12 @@ mod tests {
         let moved = deregister_exited_continuation("term-new")
             .expect("the continuation is registered against the new terminal");
         assert_eq!(
-            moved.gate_id,
+            moved.session.gate_id,
             Some(gate),
             "the hop still carries the gate onto the new terminal"
         );
         assert_eq!(
-            moved.anchor_key.as_deref(),
+            moved.session.anchor_key.as_deref(),
             Some(anchor),
             "the hop still carries the anchor onto the new terminal"
         );
@@ -16451,6 +16506,7 @@ mod tests {
         assert_eq!(
             deregister_exited_continuation("term-old")
                 .expect("the continuation is registered against the old terminal")
+                .session
                 .gate_id,
             Some(gate),
             "the failed hop still carries the gate, so the eventual real exit reports honestly"
@@ -18030,6 +18086,56 @@ mod tests {
     /// reports it WAS a continuation (`true`) — the signal the on-exit hook uses
     /// to kick a capacity-freed pending-continuations poll. The registry entry is
     /// gone afterward (the freed slot is reflected immediately, not lazily).
+    /// Leaving `live` takes the gate's episode in the same step — through the
+    /// exit hook's deregister and through the reaper — so a fresh claim of the
+    /// gate that remembers its own episode before the old run's fallback task
+    /// first runs keeps it, and the old run reports under the old one.
+    #[test]
+    fn leaving_live_takes_the_gate_episode_at_once() {
+        use crate::session::continuation_outcome_outbox::{remember_episode, take_episode};
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let gate = uuid::Uuid::now_v7();
+
+        register_continuation_session(
+            "term-ep-1".to_string(),
+            Some("anchor-ep-1".into()),
+            Some(gate),
+        );
+        remember_episode(gate, Some("e1"));
+        let exited = deregister_exited_continuation("term-ep-1").expect("registered");
+        // A fresh claim of the same gate lands before the fallback task runs.
+        remember_episode(gate, Some("e2"));
+        assert_eq!(
+            exited.report_to(),
+            Some(ExitedGate {
+                gate_id: gate,
+                dispatched_at: Some("e1".into()),
+            }),
+            "the exited run carries the episode it was claimed under"
+        );
+        assert_eq!(
+            take_episode(gate).as_deref(),
+            Some("e2"),
+            "the fresh claim's episode is left for its own run"
+        );
+
+        register_continuation_session(
+            "term-ep-2".to_string(),
+            Some("anchor-ep-2".into()),
+            Some(gate),
+        );
+        remember_episode(gate, Some("e3"));
+        // No runtime here, so the reaper reaps and posts nothing.
+        prune_dead_continuations(&|tid| tid != "term-ep-2");
+        assert_eq!(
+            take_episode(gate),
+            None,
+            "the reaper took the episode as it removed the entry"
+        );
+        clear_continuation_registry();
+    }
+
     #[test]
     fn continuation_exit_triggers_repoll_and_deregisters() {
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -18060,7 +18166,7 @@ mod tests {
         // address the exit path will ever have (an anchor_key cannot address a
         // gate), so the work-outcome fallback can POST against it.
         assert_eq!(
-            removed.and_then(|s| s.gate_id),
+            removed.and_then(|e| e.session.gate_id),
             Some(gate),
             "the exiting continuation's gate_id must survive deregistration"
         );
@@ -18113,11 +18219,11 @@ mod tests {
         let moved = deregister_exited_continuation("term-new")
             .expect("the continuation must now be registered against the new terminal");
         assert_eq!(
-            moved.gate_id,
+            moved.session.gate_id,
             Some(gate),
             "the gate must survive the account-migration hop"
         );
-        assert_eq!(moved.anchor_key.as_deref(), Some("anchor-m"));
+        assert_eq!(moved.session.anchor_key.as_deref(), Some("anchor-m"));
 
         clear_continuation_registry();
     }
@@ -18701,28 +18807,6 @@ mod outcome_wiring_tests {
         .await
     }
 
-    /// The fallback forgets the gate's remembered episode whatever coord
-    /// answers — here no verdict at all (no coord configured) — so the book
-    /// does not keep an entry nothing will ever take.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_fallback_forgets_its_episode_even_on_no_verdict() {
-        let _amb = crate::test_env::isolated_ambient();
-        let gate = uuid::Uuid::new_v4();
-        crate::session::continuation_outcome_outbox::remember_episode(gate, Some(SERVED_AT));
-        post_work_unreported_fallback(
-            gate,
-            uuid::Uuid::from_u128(0xeb21_55ed),
-            "t-fallback",
-            "exit=unknown".into(),
-        )
-        .await;
-        assert_eq!(
-            crate::session::continuation_outcome_outbox::take_episode(gate),
-            None,
-            "a NoVerdict fallback leaves no episode behind"
-        );
-    }
-
     /// A direct post whose connection drops leaves the written-ahead record
     /// queued for the drain.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -19024,9 +19108,16 @@ mod continuation_consume_arming {
         );
     }
 
-    // A work outcome whose post coord never answered is HELD for the drain:
-    // the gate's next identical outcome waits behind it rather than going on
-    // the wire again (before, every post was a fresh fire-and-forget attempt).
+    // A work outcome whose post coord never answered is HELD: the gate's next
+    // identical outcome is not put on the wire again (before, every post was a
+    // fresh fire-and-forget attempt). What holds it HERE is the process-wide
+    // pre-install buffer, not the installed store, and the drain never runs:
+    // the store is installed once per process by `main.rs`, and this test must
+    // also build against the pre-change runtime, which has neither, so it can
+    // name neither. The installed store's dedupe and the drain are covered by
+    // `outcome_wiring_tests` and `outcome_row_drain_arming`. The held record
+    // stays in that buffer for the rest of the process; its gate is fresh, so
+    // no other test's lane is behind it.
     #[tokio::test]
     async fn an_unanswered_work_outcome_is_held_rather_than_reposted() {
         let _amb = crate::test_env::isolated_ambient();
