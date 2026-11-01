@@ -19,11 +19,17 @@
 #     runner_close_sites::every_close_site_is_listed_and_no_row_is_a_ghost
 # (a new close site is RED until it is classified here; a row naming no current site is red too),
 #     runner_close_sites::no_operator_close_is_borrowable_through_either_ui_bridge_route
-# (whose twins an_allowlisted_operator_close_row_is_caught, the_operator_check_on_the_real_proxy,
-#  an_operator_fn_with_any_production_caller_is_red, an_operator_fn_passed_as_a_value_is_red and
-#  an_operator_fn_named_in_the_proxy_list_is_red prove each of its arms can fail, and
+# (whose twins an_allowlisted_operator_close_row_is_caught, the_operator_check_on_the_real_doors,
+#  an_operator_fn_with_any_production_caller_is_red, an_operator_fn_passed_as_a_value_is_red,
+#  an_operator_fn_named_in_the_proxy_list_is_red, an_operator_fn_the_observe_tier_runs_is_red and
+#  a_registration_inside_the_proxy_is_red prove each of its arms can fail, and
 #  an_operator_fn_named_only_in_its_registrations_is_green is the control), and
 #     runner_close_sites::the_session_level_close_entry_points_are_terminal_only
+# The same module's close-authority scan (rules 1-9b, its module doc) is pinned by
+#     runner_close_sites::close_authority_has_no_constructor_outside_test_code
+# Its rule 9b allows the word `authority` in a primitive entry point's body only as the forwarded
+# argument, an `is_some()` / `is_none()` read, the log field `authority = authority.is_some()`
+# followed by `,` or `)`, and drive's `let Some(_authority) = authority else`; anything else is red.
 #
 # Columns:  file (relative to src/) | fn | class | detail
 #
@@ -34,14 +40,17 @@
 #                (the looping-agent supervisor — an open question for R0b-1). detail = what it is.
 #   operator     an operator twin (`operator_terminal_close`, `operator_remote_session_end`, R0b), or a
 #                target's arm for an end or close stamped `origin: user_session` (P6f-1). None exists
-#                yet. CHECKED four ways, so that no automation can borrow it: (1) its name is NOT on
+#                yet. CHECKED five ways, so that no automation can borrow it: (1) its name is NOT on
 #                the POST /ui-bridge/invoke/<name> allowlist (NC5-1); (2) its name is NOT in the
-#                POST /ui-bridge/tauri/invoke proxy's command list, ALLOWED_PROXIED_COMMANDS; (3) it
-#                is not a fn of that proxy; and (4) production Rust NAMES it only in its own
-#                declaration and inside a `tauri::generate_handler![…]` or `ipc_group!(…)`
-#                registration. Any other mention is red: a call, a fn value handed to a proxy arm, an
-#                entry in a name-to-handler table, at any depth. Strings and comments are not read
-#                by (4); (2) reads the proxy's list. detail = what it is.
+#                POST /ui-bridge/tauri/invoke proxy's command list, ALLOWED_PROXIED_COMMANDS; (3) the
+#                POST /ui-bridge/observe/{command} tier does NOT run it (observe_projection_for is
+#                None and the name is not in UI_BRIDGE_OBSERVE_COMMANDS); (4) it is not a fn of the
+#                proxy; and (5) production Rust NAMES it only in its own declaration and inside a
+#                `tauri::generate_handler![…]` or `ipc_group!(…)` registration outside the proxy (a
+#                registration inside mcp/tauri_proxy.rs counts as a mention). Any other mention is
+#                red: a call, a fn value handed to a proxy arm, an entry in a name-to-handler table,
+#                at any depth. Strings and comments are not read by (5); (2) and (3) read the doors'
+#                own lists. detail = what it is.
 #   webview      a plain Tauri command the webview calls programmatically: never D3, since it cannot
 #                tell the operator's gesture from the webview's own close. detail = what it is.
 #   agent        a door any local process reaches: an HTTP route, the UI Bridge proxy, the steward
