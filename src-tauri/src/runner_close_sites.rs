@@ -2760,6 +2760,17 @@ fn the_operator_check_on_the_real_doors() {
     );
 }
 
+/// The fixture's operator command module: the command and its `ipc_group`
+/// registration. The macro's name is split across `concat!` on purpose:
+/// `tests/tauri_commands_are_registered.rs` reads every source file for an
+/// invocation of that macro, string literals included, and would take this
+/// fixture for a real command group with no `GROUPS` entry.
+const OPERATOR_MODULE: &str = concat!(
+    "#[tauri::command]\npub async fn operator_close(id: &str) {\n    tm.close(id);\n}\n",
+    "crate::ipc_",
+    "group!(operator_close, other_command);\n",
+);
+
 /// The synthetic operator tree: a proxy, an operator command, and its two
 /// registrations (a plugin's `generate_handler!` and an `ipc_group!`).
 fn operator_tree(proxy_body: &str, shared_body: &str) -> Vec<Prepared> {
@@ -2768,11 +2779,7 @@ fn operator_tree(proxy_body: &str, shared_body: &str) -> Vec<Prepared> {
     synthetic(&[
         ("mcp/tauri_proxy.rs", proxy.as_str()),
         ("commands/shared.rs", shared.as_str()),
-        (
-            "commands/operator.rs",
-            "#[tauri::command]\npub async fn operator_close(id: &str) {\n    tm.close(id);\n}\n\
-             crate::ipc_group!(operator_close, other_command);\n",
-        ),
+        ("commands/operator.rs", OPERATOR_MODULE),
         (
             "main.rs",
             "fn run() {\n    let _h = tauri::generate_handler![\n        \
