@@ -328,6 +328,7 @@ GET /orchestration-loop/status-all status_all
 GET /orchestration/runs list_runs
 GET /orchestration/runs/{id} run_status
 GET /otel/status get_otel_status
+GET /permission-prompts/snapshot permission_prompts_snapshot
 GET /plan-library/artifacts/{id} read_artifact_handler
 GET /plan-library/artifacts/{id}/export export_artifact_handler
 GET /plan-library/candidates candidates_handler
@@ -1222,6 +1223,7 @@ POST /orchestration/report-subtask report_subtask
 POST /orchestration/runs start_run
 POST /pattern/find pattern_find
 POST /pattern/find-all pattern_find_all
+POST /permission-prompts/classify classify_permission_prompt
 POST /plan-library/artifacts write_artifact_handler
 POST /plan-library/links create_link_handler
 POST /playwright-collection/start start_playwright_collection
@@ -1272,6 +1274,7 @@ POST /sessions/{id}/continuation-verdict continuation_verdict
 POST /sessions/{id}/finish finish_session
 POST /sessions/{id}/message send_message
 POST /sessions/{id}/notification operator_touch_notification
+POST /sessions/{id}/permission-request permission_request
 POST /sessions/{session_id}/commit-progress commit_session_progress_handler
 POST /sessions/{session_id}/promote-to-worktree promote_session_to_worktree_handler
 POST /sessions/{session_id}/review/insert insert_handler
