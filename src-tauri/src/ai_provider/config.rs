@@ -29,8 +29,11 @@ const RATE_LIMIT_COOLDOWN_SECS: u64 = 300;
 /// `usage_delta` is the account's actual 7-day utilization minus its
 /// *expected* linear utilization at this point in the billing window
 /// (negative = under projected pace); `None` when the probe couldn't compute
-/// it (e.g. the 7d-reset header was absent). Its **sign** is what selects the
-/// pace tier — it is no longer a ranking key in its own right. `expected` is
+/// it (e.g. the 7d-reset header was absent). Against the floors of
+/// [`under_pace_shortfall`] (less any handoff charge) it is what selects the
+/// pace tier — it is no longer a ranking key in its own right. The handoff
+/// charge is deliberately NOT a field here: [`record_account_usage`] replaces
+/// the whole sample on every probe, which would wipe it (`handoff_ledger`). `expected` is
 /// the key the under-pace tier actually ranks on, and the denominator of the
 /// over-pace ratio; it is also the value [`usage_rank_highest_expected`]
 /// returns directly for a qualifying under-pace account. `utilization` is the
@@ -88,6 +91,99 @@ const USAGE_SNAPSHOT_TTL: Duration = Duration::from_secs(15 * 60);
 /// minutes — so the cold-start/stale fallback can still avoid an account we
 /// saw maxed out a little while ago, without acting on hours-old data.
 const EXHAUSTION_STALE_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// Minimum shortfall `expected - effective_utilization` for an account to count
+/// as UNDER its pace (see [`under_pace_shortfall`]).
+///
+/// A bare `delta < 0` admitted an account by a hair: on 2026-10-18 pakqon
+/// qualified on a 0.4-point margin, won the handoffs, and ran out with ten
+/// sessions on it. The probe also reports whole percents, so a sub-point delta
+/// is below the measurement's own resolution. Override:
+/// `claude_cli.selection_min_shortfall`, clamped to [`MIN_FLOOR_SETTING`].
+pub const MIN_SHORTFALL: f64 = 0.02;
+
+/// Minimum capacity left before the reset, `1 - effective_utilization`, for an
+/// account to count as under its pace — and the line below which an account
+/// ranks after every other usable one ([`UsageRank::low_headroom`]). Guards a
+/// thin account that is still well under pace late in its window. Override:
+/// `claude_cli.selection_min_headroom`, clamped to [`MIN_FLOOR_SETTING`].
+pub const MIN_HEADROOM: f64 = 0.10;
+
+/// The load a handoff charges its target, in utilization units, until it
+/// decays (`handoff_ledger`). With [`MIN_SHORTFALL`] an account with shortfall
+/// `s` admits about `(s - MIN_SHORTFALL) / HANDOFF_LOAD_ESTIMATE + 1`
+/// handoffs in one window before it drops out of the under-pace tier.
+///
+/// Calibration (2026-10-28, from the incident's runner logs on spaceship,
+/// `qontinui-runner.log.2026-10-18`/`-19`): pakqon's `(oauth_usage): 7d=`
+/// probe read 82 % at 22:03 and 100 % at 07:32 — 18 points in 9.5 h — while
+/// it carried at least 13 handed-over sessions (10 from merytshost per the
+/// plan, 3 landed on spaceship at 21:07–21:17), i.e. 0.014–0.018 per session.
+/// The probe resolves whole percents, so 0.02 is the nearest step at or above
+/// the measurement, erring toward spreading load. Override: `claude_cli.handoff_load_estimate`, clamped to `0.0..=1.0`
+/// (`0.0` turns the charge off).
+pub const HANDOFF_LOAD_ESTIMATE: f64 = 0.02;
+
+/// The lowest value either floor may be set to. Utilization is reported in
+/// whole percents, so a floor below one point is below the measurement's
+/// resolution.
+pub const MIN_FLOOR_SETTING: f64 = 0.01;
+
+/// Slack for the floor comparisons, so a shortfall or headroom that equals its
+/// floor in decimal (`0.84 - 0.82`) is not refused for a binary rounding error.
+const FLOOR_EPSILON: f64 = 1e-9;
+
+/// The two headroom floors every pace reader applies (D1 of plan
+/// `2026-10-19-usage-limit-handoff-lands-sessions-on-accounts-that-cannot-absorb-them`).
+/// Resolved from settings once per pick, BEFORE any selection lock is taken,
+/// and passed to the readers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HeadroomFloors {
+    pub min_shortfall: f64,
+    pub min_headroom: f64,
+}
+
+impl Default for HeadroomFloors {
+    fn default() -> Self {
+        Self {
+            min_shortfall: MIN_SHORTFALL,
+            min_headroom: MIN_HEADROOM,
+        }
+    }
+}
+
+impl HeadroomFloors {
+    /// The floors a `ClaudeCliSettings` asks for: each override clamped to
+    /// `MIN_FLOOR_SETTING..=1.0`, an absent or non-finite one the constant.
+    pub fn from_cli(cli: &settings::ClaudeCliSettings) -> Self {
+        let floor = |v: Option<f64>, default: f64| {
+            v.filter(|v| v.is_finite())
+                .map_or(default, |v| v.clamp(MIN_FLOOR_SETTING, 1.0))
+        };
+        Self {
+            min_shortfall: floor(cli.selection_min_shortfall, MIN_SHORTFALL),
+            min_headroom: floor(cli.selection_min_headroom, MIN_HEADROOM),
+        }
+    }
+
+    /// The floors from the stored settings.
+    pub fn effective() -> Self {
+        Self::from_cli(&settings::get_ai_settings().claude_cli)
+    }
+}
+
+/// The handoff load charge a `ClaudeCliSettings` asks for: the override
+/// clamped to `0.0..=1.0`, an absent or non-finite one [`HANDOFF_LOAD_ESTIMATE`].
+pub fn handoff_load_estimate_from(cli: &settings::ClaudeCliSettings) -> f64 {
+    cli.handoff_load_estimate
+        .filter(|v| v.is_finite())
+        .map_or(HANDOFF_LOAD_ESTIMATE, |v| v.clamp(0.0, 1.0))
+}
+
+/// [`handoff_load_estimate_from`] the stored settings.
+pub fn effective_handoff_load_estimate() -> f64 {
+    handoff_load_estimate_from(&settings::get_ai_settings().claude_cli)
+}
 
 /// Set the resolved config directory (called after usage check).
 pub fn set_resolved_config_dir(dir: Option<String>) {
@@ -403,20 +499,22 @@ pub fn record_account_usage(samples: &[(String, f64, Option<f64>, Option<f64>, b
 /// tiers' keys — a comparison with no meaning.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PaceRank {
-    /// Under pace (`usage_delta < 0`): burn the capacity that expires
-    /// soonest. Ordered by `expected` **DESCENDING** — the account whose
-    /// 7-day window is furthest along wins, because unused weekly capacity
-    /// does not roll over past the reset (use-it-or-lose-it).
+    /// Under pace with real headroom ([`under_pace_shortfall`]'s floors):
+    /// burn the capacity that expires soonest. Ordered by `expected`
+    /// **DESCENDING** — the account whose 7-day window is furthest along
+    /// wins, because unused weekly capacity does not roll over past the reset
+    /// (use-it-or-lose-it).
     UnderPace { expected: f64 },
     /// No usable pace signal — `usage_delta` and/or `expected` is absent, so
     /// the account cannot be classified under- or over-pace at all. Ordered
     /// by raw `utilization` ASCENDING, which is exactly how this population
     /// has always been ranked.
     Unknown { utilization: f64 },
-    /// At or over pace (`usage_delta >= 0`): least-over **relative to its own
-    /// pace**. Ordered by `ratio = utilization / expected` ASCENDING. A
-    /// difference is not comparable across accounts at different points in
-    /// their windows; a ratio is.
+    /// At or over pace, OR under it by less than the floors allow (demoted,
+    /// not excluded): least-over **relative to its own pace**. Ordered by
+    /// `ratio = effective_utilization / expected` ASCENDING. A difference is
+    /// not comparable across accounts at different points in their windows; a
+    /// ratio is.
     OverPace { ratio: f64 },
 }
 
@@ -433,28 +531,45 @@ impl PaceRank {
     }
 }
 
-/// One account's full selection rank: the dominating `exhausted` tier plus its
-/// [`PaceRank`]. Compare two of these with [`cmp_rank`] — never field by
-/// field, and never by flattening.
+/// One account's full selection rank: the dominating `exhausted` tier, the
+/// `low_headroom` tier below it, and its [`PaceRank`]. Compare two of these
+/// with [`cmp_rank`] — never field by field, and never by flattening.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct UsageRank {
     pub exhausted: bool,
+    /// Less than [`HeadroomFloors::min_headroom`] left before the reset
+    /// (`1 - effective_utilization`). Such an account ranks after every other
+    /// usable account, whatever either's pace tier, but before any exhausted
+    /// one — so it is picked only when nothing with real headroom is usable.
+    pub low_headroom: bool,
     pub pace: PaceRank,
 }
 
 /// Selection rank for an account from the latest snapshot, if a fresh sample
-/// exists: a [`UsageRank`] carrying the dominating `exhausted` flag plus the
-/// account's [`PaceRank`] — the pace tier it sits in AND that tier's own key.
+/// exists: a [`UsageRank`] carrying the dominating `exhausted` flag, the
+/// `low_headroom` flag, and the account's [`PaceRank`] — the pace tier it sits
+/// in AND that tier's own key.
+///
+/// `charge` is the account's decayed handoff load
+/// (`handoff_ledger::HandoffLedger::charge_sum`), added to the probed
+/// utilization to give `effective_utilization`; the caller reads it from the
+/// ledger it already holds, so this reader never locks the ledger.
 ///
 /// `exhausted` is the dominating tier: an exhausted account (out of tokens /
 /// rejected) always sorts after a usable one, no matter how favourable its
-/// pace key. Below it, the sample is classified into exactly one pace tier:
+/// pace key. Below it, `low_headroom` (`1 - effective_utilization <
+/// floors.min_headroom`) sorts after every account with headroom. Below that,
+/// the sample is classified into exactly one pace tier:
 ///
 /// | condition | tier | that tier's key |
 /// |---|---|---|
-/// | `usage_delta < 0` and `expected` present | [`PaceRank::UnderPace`] | `expected` **DESCENDING** |
-/// | `usage_delta` and/or `expected` absent | [`PaceRank::Unknown`] | `utilization` ascending |
-/// | `usage_delta >= 0` and `expected` present | [`PaceRank::OverPace`] | `utilization / expected` **ASCENDING** |
+/// | under pace past both floors ([`under_pace_shortfall`]'s predicate) | [`PaceRank::UnderPace`] | `expected` **DESCENDING** |
+/// | `usage_delta` and/or `expected` absent | [`PaceRank::Unknown`] | `effective_utilization` ascending |
+/// | `usage_delta` and `expected` present, either floor failed | [`PaceRank::OverPace`] | `effective_utilization / expected` **ASCENDING** |
+///
+/// A floor-failing account is DEMOTED to the over-pace tier, not excluded: it
+/// drops out of the handoff strategies' candidates but stays reachable through
+/// the ranked fallback when no account qualifies.
 ///
 /// The under-pace key is descending **because unused weekly capacity expires
 /// at the reset and does not roll over**: the account worth burning is the one
@@ -474,30 +589,52 @@ pub struct UsageRank {
 ///
 /// Returns `None` when there is no sample or it is older than
 /// [`USAGE_SNAPSHOT_TTL`], so callers fall back to cooldown-only ordering.
-pub fn usage_rank(config_dir: &str) -> Option<UsageRank> {
+pub fn usage_rank(config_dir: &str, charge: f64, floors: &HeadroomFloors) -> Option<UsageRank> {
     let snap = USAGE_SNAPSHOT.lock().ok()?;
     let map = snap.as_ref()?;
     let sample = map.get(config_dir)?;
     if sample.captured_at.elapsed() > USAGE_SNAPSHOT_TTL {
         return None;
     }
+    Some(rank_sample(sample, charge, floors))
+}
+
+/// The pure half of [`usage_rank`]: one fresh sample's rank.
+fn rank_sample(sample: &UsageSample, charge: f64, floors: &HeadroomFloors) -> UsageRank {
+    let effective = effective_utilization(sample, charge);
     let pace = match (sample.usage_delta, sample.expected) {
-        // Measured under its own projected pace → use-it-or-lose-it tier.
-        (Some(delta), Some(expected)) if delta < 0.0 => PaceRank::UnderPace { expected },
-        // Measured at-or-over pace → ranked by overrun relative to its pace.
+        // Measured under its own projected pace with real headroom →
+        // use-it-or-lose-it tier. The SAME predicate the handoff strategies
+        // and `usage_rank_highest_expected` read.
+        (Some(_), Some(expected)) if floored_shortfall(sample, charge, floors).is_some() => {
+            PaceRank::UnderPace { expected }
+        }
+        // Measured at-or-over pace, or under it by less than the floors allow
+        // (demoted, not excluded) → ranked by overrun relative to its pace.
         (Some(_), Some(expected)) => PaceRank::OverPace {
-            ratio: over_pace_ratio(sample.utilization, expected),
+            ratio: over_pace_ratio(effective, expected),
         },
         // Either half of the pace signal missing → no pace classification is
         // measurable, so it gets its own tier rather than a manufactured one.
         _ => PaceRank::Unknown {
-            utilization: sample.utilization,
+            utilization: effective,
         },
     };
-    Some(UsageRank {
+    UsageRank {
         exhausted: sample.exhausted,
+        low_headroom: !has_min_headroom(effective, floors),
         pace,
-    })
+    }
+}
+
+/// Probed utilization plus the handoff charge (D2).
+fn effective_utilization(sample: &UsageSample, charge: f64) -> f64 {
+    sample.utilization + charge.max(0.0)
+}
+
+/// `1 - effective_utilization >= floors.min_headroom`.
+fn has_min_headroom(effective: f64, floors: &HeadroomFloors) -> bool {
+    1.0 - effective + FLOOR_EPSILON >= floors.min_headroom
 }
 
 /// The over-pace ratio `utilization / expected`, computed through an explicit
@@ -528,12 +665,15 @@ fn over_pace_ratio(utilization: f64, expected: f64) -> f64 {
 
 /// Total order over [`UsageRank`] — the ONE comparator both pickers use.
 ///
-/// Three levels, in order:
+/// Four levels, in order:
 /// 1. `exhausted` — `false` before `true`. An out-of-tokens account sorts last
 ///    no matter how favourable its pace key.
-/// 2. The pace **tier** ([`PaceRank::tier_index`]): under-pace before unknown
+/// 2. `low_headroom` — `false` before `true`. An account with less than
+///    [`HeadroomFloors::min_headroom`] left ranks after every other usable
+///    account in every tier, but still before every exhausted one.
+/// 3. The pace **tier** ([`PaceRank::tier_index`]): under-pace before unknown
 ///    before over-pace.
-/// 3. Only for two accounts in the *same* tier, that tier's own key in that
+/// 4. Only for two accounts in the *same* tier, that tier's own key in that
 ///    tier's own direction. Keys from different tiers are never compared —
 ///    they measure different things and a comparison between them would be
 ///    meaningless.
@@ -547,6 +687,7 @@ fn over_pace_ratio(utilization: f64, expected: f64) -> f64 {
 pub fn cmp_rank(a: &UsageRank, b: &UsageRank) -> Ordering {
     a.exhausted
         .cmp(&b.exhausted)
+        .then_with(|| a.low_headroom.cmp(&b.low_headroom))
         .then_with(|| a.pace.tier_index().cmp(&b.pace.tier_index()))
         .then_with(|| match (a.pace, b.pace) {
             // DESCENDING: the account whose window is furthest along wins,
@@ -569,9 +710,9 @@ pub fn cmp_rank(a: &UsageRank, b: &UsageRank) -> Ordering {
 
 /// Selection rank for the `HighestExpectedUsage` mode: `Some(expected_utilization)`
 /// only for an account that is BOTH usable (not exhausted) AND currently under
-/// its projected weekly pace (`usage_delta < 0.0`, i.e. actual utilization is
-/// less than expected). Every other case — exhausted, at-or-over projected
-/// pace, or no fresh/computable sample — returns `None`, exactly like
+/// its projected weekly pace with real headroom ([`under_pace_shortfall`]).
+/// Every other case — exhausted, at-or-over projected pace, under it by less
+/// than a floor, or no fresh/computable sample — returns `None`, exactly like
 /// [`usage_rank`] returning `None` for a stale/missing sample: the caller
 /// (`account_usage::pick_from_highest_expected`) treats `None` as "not a
 /// candidate for the primary ranking" and falls through to the same
@@ -582,17 +723,37 @@ pub fn cmp_rank(a: &UsageRank, b: &UsageRank) -> Ordering {
 /// furthest along its billing window (soonest to reset), so an account that
 /// still has a full week of headroom ahead of it is saved for later rather
 /// than spent down first.
-pub fn usage_rank_highest_expected(config_dir: &str) -> Option<f64> {
-    under_pace_shortfall(config_dir).map(|(expected, _)| expected)
+pub fn usage_rank_highest_expected(
+    config_dir: &str,
+    charge: f64,
+    floors: &HeadroomFloors,
+) -> Option<f64> {
+    under_pace_shortfall(config_dir, charge, floors).map(|(expected, _)| expected)
 }
 
 /// `Some((expected, shortfall))` for an account that is usable (not exhausted)
-/// and under its projected weekly pace, from a fresh sample: `expected` is the
-/// expected utilization at this point in the window and `shortfall` is
-/// `expected - actual`, always `> 0`. `None` in every case
+/// and under its projected weekly pace WITH REAL HEADROOM, from a fresh sample:
+/// `expected` is the expected utilization at this point in the window and
+/// `shortfall` is `expected - effective_utilization`. `None` in every case
 /// [`usage_rank_highest_expected`] excludes. The input of the
 /// `WeightedRandom` and `AlternatingHandoff` selection modes.
-pub fn under_pace_shortfall(config_dir: &str) -> Option<(f64, f64)> {
+///
+/// `effective_utilization` is the probed utilization plus `charge`, the
+/// account's decayed handoff load, which the caller reads from the ledger it
+/// already holds (`handoff_ledger`, "Lock order"). The account qualifies only
+/// when BOTH floors hold:
+/// - shortfall `>= floors.min_shortfall` ([`MIN_SHORTFALL`]);
+/// - headroom `1 - effective_utilization >= floors.min_headroom`
+///   ([`MIN_HEADROOM`]).
+///
+/// This is the ONE under-pace predicate: [`usage_rank`]'s under-pace tier
+/// reads it too (through [`floored_shortfall`]), so every mode, the spawn-time
+/// picker and the handoff picker agree.
+pub fn under_pace_shortfall(
+    config_dir: &str,
+    charge: f64,
+    floors: &HeadroomFloors,
+) -> Option<(f64, f64)> {
     let snap = USAGE_SNAPSHOT.lock().ok()?;
     let map = snap.as_ref()?;
     let sample = map.get(config_dir)?;
@@ -602,12 +763,29 @@ pub fn under_pace_shortfall(config_dir: &str) -> Option<(f64, f64)> {
     if sample.exhausted {
         return None;
     }
+    floored_shortfall(sample, charge, floors)
+}
+
+/// The floors of [`under_pace_shortfall`] over one sample, without the
+/// freshness and exhaustion checks (which [`usage_rank`] keeps as their own
+/// tiers). `shortfall = -usage_delta - charge`: the measured delta stays the
+/// authority on where the account sits against its pace, and the charge moves
+/// it as if that load had already been burned.
+fn floored_shortfall(
+    sample: &UsageSample,
+    charge: f64,
+    floors: &HeadroomFloors,
+) -> Option<(f64, f64)> {
     let expected = sample.expected?;
     let delta = sample.usage_delta?;
-    if delta >= 0.0 {
+    let shortfall = -delta - charge.max(0.0);
+    if shortfall + FLOOR_EPSILON < floors.min_shortfall {
         return None;
     }
-    Some((expected, -delta))
+    if !has_min_headroom(effective_utilization(sample, charge), floors) {
+        return None;
+    }
+    Some((expected, shortfall))
 }
 
 /// Whether an account was last seen **exhausted** (out of tokens / rejected),
@@ -1125,7 +1303,9 @@ mod tests {
     /// Convenience: the `PaceRank` of a fresh sample, panicking if there is
     /// none (every caller below has just recorded one).
     fn pace_of(dir: &str) -> PaceRank {
-        usage_rank(dir).expect("a sample was just recorded").pace
+        usage_rank(dir, 0.0, &HeadroomFloors::default())
+            .expect("a sample was just recorded")
+            .pace
     }
 
     #[test]
@@ -1169,6 +1349,144 @@ mod tests {
             }
             other => panic!("expected OverPace, got {other:?}"),
         }
+    }
+
+    /// REGRESSION — the 2026-10-18 incident (plan
+    /// `2026-10-19-usage-limit-handoff-lands-sessions-on-accounts-that-cannot-absorb-them`,
+    /// Finding 1): pakqon's probe samples on merytshost, read from the runner
+    /// log `qontinui-runner.log.2026-10-18`.
+    ///
+    /// | time (CEST) | utilization | expected | delta | picked then |
+    /// |---|---|---|---|---|
+    /// | 20:41 | 0.81 | 0.8136 | −0.004 | pakqon |
+    /// | 21:34 | 0.82 | 0.8189 | +0.001 | ben |
+    /// | 22:03 | 0.82 | 0.8217 | −0.002 | pakqon |
+    /// | 22:29:56 | 0.82 | 0.8243 | −0.004 | pakqon |
+    /// | 23:31 | 0.84 | 0.8305 | +0.010 | ben |
+    ///
+    /// pakqon is under pace at NO row. On the under-pace rows the floor that
+    /// excludes it is `MIN_SHORTFALL`: with that floor relaxed the rows
+    /// qualify, because pakqon had 16–19 % left, above `MIN_HEADROOM`.
+    #[test]
+    fn incident_2026_10_18_pakqon_is_never_under_pace_and_min_shortfall_is_why() {
+        let rows = [
+            ("20_41", 0.81, 0.8136),
+            ("21_34", 0.82, 0.8189),
+            ("22_03", 0.82, 0.8217),
+            ("22_29_56", 0.82, 0.8243),
+            ("23_31", 0.84, 0.8305),
+        ];
+        let no_shortfall_floor = HeadroomFloors {
+            min_shortfall: f64::MIN_POSITIVE,
+            min_headroom: MIN_HEADROOM,
+        };
+        for (at, utilization, expected) in rows {
+            let dir = format!("/test/config/incident_2026_10_18/pakqon_{at}");
+            let delta: f64 = utilization - expected;
+            record_account_usage(&[(dir.clone(), utilization, Some(delta), Some(expected), false)]);
+            assert_eq!(
+                under_pace_shortfall(&dir, 0.0, &HeadroomFloors::default()),
+                None,
+                "{at}: pakqon must not be under pace"
+            );
+            assert!(
+                matches!(pace_of(&dir), PaceRank::OverPace { .. }),
+                "{at}: demoted to the over-pace tier, not excluded"
+            );
+            assert!(
+                !usage_rank(&dir, 0.0, &HeadroomFloors::default())
+                    .unwrap()
+                    .low_headroom
+            );
+            if delta < 0.0 {
+                assert!(
+                    under_pace_shortfall(&dir, 0.0, &no_shortfall_floor).is_some(),
+                    "{at}: MIN_SHORTFALL is the floor that excluded it, not MIN_HEADROOM"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn floors_are_read_from_settings_and_clamped() {
+        let cli = |s: Option<f64>, h: Option<f64>, e: Option<f64>| settings::ClaudeCliSettings {
+            selection_min_shortfall: s,
+            selection_min_headroom: h,
+            handoff_load_estimate: e,
+            ..Default::default()
+        };
+        let none = cli(None, None, None);
+        assert_eq!(HeadroomFloors::from_cli(&none), HeadroomFloors::default());
+        assert_eq!(handoff_load_estimate_from(&none), HANDOFF_LOAD_ESTIMATE);
+
+        let set = cli(Some(0.05), Some(0.2), Some(0.03));
+        assert_eq!(
+            HeadroomFloors::from_cli(&set),
+            HeadroomFloors {
+                min_shortfall: 0.05,
+                min_headroom: 0.2
+            }
+        );
+        assert_eq!(handoff_load_estimate_from(&set), 0.03);
+
+        // Neither floor may go below one whole percent.
+        let low = cli(Some(0.0), Some(-1.0), Some(-0.5));
+        assert_eq!(
+            HeadroomFloors::from_cli(&low),
+            HeadroomFloors {
+                min_shortfall: MIN_FLOOR_SETTING,
+                min_headroom: MIN_FLOOR_SETTING
+            }
+        );
+        assert_eq!(
+            handoff_load_estimate_from(&low),
+            0.0,
+            "0 turns the charge off"
+        );
+
+        let high = cli(Some(7.0), Some(f64::NAN), Some(f64::INFINITY));
+        assert_eq!(
+            HeadroomFloors::from_cli(&high),
+            HeadroomFloors {
+                min_shortfall: 1.0,
+                min_headroom: MIN_HEADROOM
+            }
+        );
+        assert_eq!(handoff_load_estimate_from(&high), HANDOFF_LOAD_ESTIMATE);
+    }
+
+    #[test]
+    fn under_pace_needs_both_floors_and_reads_the_charge() {
+        let floors = HeadroomFloors::default();
+        // Shortfall 0.05, headroom 0.30: under pace.
+        let dir = "/test/config/floors_both";
+        record_account_usage(&[(dir.to_string(), 0.70, Some(-0.05), Some(0.75), false)]);
+        let (expected, shortfall) = under_pace_shortfall(dir, 0.0, &floors).unwrap();
+        assert_eq!(expected, 0.75);
+        assert!((shortfall - 0.05).abs() < 1e-12);
+        // A charge reduces the shortfall one for one…
+        let (_, charged) = under_pace_shortfall(dir, 0.02, &floors).unwrap();
+        assert!((charged - 0.03).abs() < 1e-12);
+        // …and exactly at the floor still qualifies (decimal, not binary).
+        assert!(under_pace_shortfall(dir, 0.03, &floors).is_some());
+        assert_eq!(under_pace_shortfall(dir, 0.031, &floors), None);
+        assert!(matches!(
+            usage_rank(dir, 0.031, &floors).unwrap().pace,
+            PaceRank::OverPace { .. }
+        ));
+
+        // Plenty of shortfall, too little headroom: not under pace.
+        let thin = "/test/config/floors_thin";
+        record_account_usage(&[(thin.to_string(), 0.91, Some(-0.08), Some(0.99), false)]);
+        assert_eq!(under_pace_shortfall(thin, 0.0, &floors), None);
+        let r = usage_rank(thin, 0.0, &floors).unwrap();
+        assert!(r.low_headroom);
+        assert!(matches!(r.pace, PaceRank::OverPace { .. }));
+        // The charge counts against headroom too.
+        let edge = "/test/config/floors_headroom_charge";
+        record_account_usage(&[(edge.to_string(), 0.85, Some(-0.10), Some(0.95), false)]);
+        assert!(!usage_rank(edge, 0.0, &floors).unwrap().low_headroom);
+        assert!(usage_rank(edge, 0.06, &floors).unwrap().low_headroom);
     }
 
     #[test]
@@ -1220,25 +1538,65 @@ mod tests {
         let dir = "/test/config/rank_exhausted";
         // Exhausted even though the pace key looks favourable (under pace with
         // a nearly-elapsed window).
-        record_account_usage(&[(dir.to_string(), 0.95, Some(-0.05), Some(1.0), true)]);
+        record_account_usage(&[(dir.to_string(), 0.55, Some(-0.35), Some(0.90), true)]);
         assert_eq!(
-            usage_rank(dir),
+            usage_rank(dir, 0.0, &HeadroomFloors::default()),
             Some(UsageRank {
                 exhausted: true,
-                pace: PaceRank::UnderPace { expected: 1.0 },
+                low_headroom: false,
+                pace: PaceRank::UnderPace { expected: 0.90 },
             })
         );
     }
 
     #[test]
     fn usage_rank_none_when_unrecorded() {
-        assert_eq!(usage_rank("/test/config/rank_never"), None);
+        assert_eq!(
+            usage_rank("/test/config/rank_never", 0.0, &HeadroomFloors::default()),
+            None
+        );
     }
 
     // --- cmp_rank: the one shared comparator --------------------------------
 
     fn rank(exhausted: bool, pace: PaceRank) -> UsageRank {
-        UsageRank { exhausted, pace }
+        UsageRank {
+            exhausted,
+            low_headroom: false,
+            pace,
+        }
+    }
+
+    fn thin_rank(exhausted: bool, pace: PaceRank) -> UsageRank {
+        UsageRank {
+            exhausted,
+            low_headroom: true,
+            pace,
+        }
+    }
+
+    #[test]
+    fn cmp_rank_low_headroom_sorts_after_every_usable_tier_but_before_exhausted() {
+        // A thin account with the best possible under-pace key still sorts
+        // after the WORST member of every usable tier…
+        let thin_under = thin_rank(false, PaceRank::UnderPace { expected: 0.99 });
+        let worst_under = rank(false, PaceRank::UnderPace { expected: 0.0 });
+        let worst_unknown = rank(false, PaceRank::Unknown { utilization: 0.89 });
+        let worst_over = rank(false, PaceRank::OverPace { ratio: 50.0 });
+        for usable in [worst_under, worst_unknown, worst_over] {
+            assert_eq!(cmp_rank(&usable, &thin_under), Ordering::Less);
+            assert_eq!(cmp_rank(&thin_under, &usable), Ordering::Greater);
+        }
+        // …and before every exhausted one, thin or not.
+        for dead in [
+            rank(true, PaceRank::UnderPace { expected: 0.99 }),
+            thin_rank(true, PaceRank::UnderPace { expected: 0.99 }),
+        ] {
+            assert_eq!(cmp_rank(&thin_under, &dead), Ordering::Less);
+        }
+        // Between two thin accounts the tier and its key still decide.
+        let thin_over = thin_rank(false, PaceRank::OverPace { ratio: 1.1 });
+        assert_eq!(cmp_rank(&thin_under, &thin_over), Ordering::Less);
     }
 
     #[test]
@@ -1310,7 +1668,10 @@ mod tests {
         let dir = "/test/config/hexp_under_pace";
         // utilization 0.30, expected 0.50 → delta -0.20 (under pace).
         record_account_usage(&[(dir.to_string(), 0.30, Some(-0.20), Some(0.50), false)]);
-        assert_eq!(usage_rank_highest_expected(dir), Some(0.50));
+        assert_eq!(
+            usage_rank_highest_expected(dir, 0.0, &HeadroomFloors::default()),
+            Some(0.50)
+        );
     }
 
     #[test]
@@ -1319,10 +1680,16 @@ mod tests {
         let dir_at = "/test/config/hexp_at_pace";
         // utilization 0.60, expected 0.50 → delta +0.10 (over pace) → excluded.
         record_account_usage(&[(dir_over.to_string(), 0.60, Some(0.10), Some(0.50), false)]);
-        assert_eq!(usage_rank_highest_expected(dir_over), None);
+        assert_eq!(
+            usage_rank_highest_expected(dir_over, 0.0, &HeadroomFloors::default()),
+            None
+        );
         // utilization exactly at expected pace (delta 0.0) → excluded too.
         record_account_usage(&[(dir_at.to_string(), 0.50, Some(0.0), Some(0.50), false)]);
-        assert_eq!(usage_rank_highest_expected(dir_at), None);
+        assert_eq!(
+            usage_rank_highest_expected(dir_at, 0.0, &HeadroomFloors::default()),
+            None
+        );
     }
 
     #[test]
@@ -1330,7 +1697,10 @@ mod tests {
         let dir = "/test/config/hexp_exhausted";
         // Under pace on paper, but exhausted → still excluded.
         record_account_usage(&[(dir.to_string(), 1.0, Some(-0.05), Some(1.05), true)]);
-        assert_eq!(usage_rank_highest_expected(dir), None);
+        assert_eq!(
+            usage_rank_highest_expected(dir, 0.0, &HeadroomFloors::default()),
+            None
+        );
     }
 
     #[test]
@@ -1338,7 +1708,10 @@ mod tests {
         let dir = "/test/config/hexp_unknown";
         // No usage_delta / expected_utilization (probe couldn't compute it).
         record_account_usage(&[(dir.to_string(), 0.30, None, None, false)]);
-        assert_eq!(usage_rank_highest_expected(dir), None);
+        assert_eq!(
+            usage_rank_highest_expected(dir, 0.0, &HeadroomFloors::default()),
+            None
+        );
     }
 
     #[test]

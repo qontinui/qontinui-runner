@@ -22,6 +22,7 @@ mod config;
 mod gemini_api;
 mod gemini_cli;
 pub(crate) mod gemma_local_warm;
+mod handoff_ledger;
 pub mod middleware;
 pub mod multimodal;
 pub(crate) mod oauth_refresh;
@@ -39,8 +40,8 @@ mod types;
 
 // Re-export public API
 pub use account_usage::{
-    pick_best_account, pick_migration_target, record_handoff, resolve_requested_account,
-    unrecord_handoff, AccountSelectError, ResolvedAccount,
+    pick_best_account, pick_migration_target, resolve_requested_account, AccountSelectError,
+    ResolvedAccount,
 };
 pub use cache_aware_builder::StructuredPrompt;
 pub use config::{
@@ -49,6 +50,7 @@ pub use config::{
     mark_account_rate_limited_with_duration, record_account_usage, rotate_account_on_rate_limit,
     set_resolved_config_dir, switch_to_account, ClaudeConfigDirSource,
 };
+pub use handoff_ledger::{record_handoff, unrecord_handoff};
 pub use multimodal::{ContentBlock, ImageSource, MultimodalPrompt};
 pub use oneshot::{
     oneshot_for_settings, snapshot_oneshot_stats, OneshotClaudeApi, OneshotClaudeApiWarm,

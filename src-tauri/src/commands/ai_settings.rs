@@ -113,9 +113,11 @@ fn resolve_saved_selection_mode(
 /// Updates the AI settings in the persistent settings file.
 ///
 /// Absent-means-keep for `account_selection_mode`, `account_selection_pinned`
-/// and the migration toggles; `config_dir` stays EXPLICIT — over Tauri IPC an
-/// absent and a `null` value both arrive as `None`, and the Settings page
-/// always sends it, so `None` clears it.
+/// and the migration toggles; `config_dir` and the three account-selection
+/// overrides (`selection_min_shortfall`, `selection_min_headroom`,
+/// `handoff_load_estimate`) stay EXPLICIT — over Tauri IPC an absent and a
+/// `null` value both arrive as `None`, and the Settings page always sends
+/// them, so `None` clears them.
 ///
 /// # Arguments
 /// * `provider` - AI provider ("claude_cli" or "claude_api")
@@ -146,6 +148,9 @@ pub fn save_ai_settings(
     auto_migrate_on_token_exhaustion: Option<bool>,
     auto_continue_after_migration: Option<bool>,
     account_selection_pinned: Option<bool>,
+    selection_min_shortfall: Option<f64>,
+    selection_min_headroom: Option<f64>,
+    handoff_load_estimate: Option<f64>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Saving AI settings: provider={}, execution_mode={}, timeout={}s, config_dir={:?}, account_selection={:?}, account_selection_pinned={:?}, video_after_iterations={:?}, interactive={:?}",
@@ -202,6 +207,14 @@ pub fn save_ai_settings(
                 ),
                 auto_continue_after_migration: auto_continue_after_migration
                     .unwrap_or(existing_settings.claude_cli.auto_continue_after_migration),
+                // REPLACED, like `config_dir`: the overrides are themselves
+                // optional, so `None` here means "no override" (the built-in
+                // value), and the Settings form always sends what it loaded.
+                // The clamps are applied where they are read
+                // (`ai_provider::config::HeadroomFloors::from_cli`).
+                selection_min_shortfall,
+                selection_min_headroom,
+                handoff_load_estimate,
             },
             claude_api: ClaudeApiSettings { model, max_tokens },
             // Preserve existing Gemini settings

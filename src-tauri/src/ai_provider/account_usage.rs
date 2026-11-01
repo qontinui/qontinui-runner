@@ -28,9 +28,14 @@
 //!      account is deprioritized no matter how favourable its pace key; a
 //!      fully-used account whose window is nearly over still has nothing
 //!      left to burn.
-//!   2. Pace **tier**: under-pace (`usage_delta < 0`) before unknown (no
-//!      usable pace signal) before over-pace (`usage_delta >= 0`).
-//!   3. Within a tier only, that tier's own key in its own direction:
+//!   2. `low_headroom` — less than `MIN_HEADROOM` left before the reset.
+//!      Such an account ranks after every other usable account in every tier,
+//!      but before every exhausted one.
+//!   3. Pace **tier**: under-pace (under pace by at least `MIN_SHORTFALL`,
+//!      with at least `MIN_HEADROOM` left — [`super::config::under_pace_shortfall`])
+//!      before unknown (no usable pace signal) before over-pace (at or over
+//!      pace, or under it by less than a floor allows).
+//!   4. Within a tier only, that tier's own key in its own direction:
 //!      - under-pace → `expected` **DESCENDING** (use-it-or-lose-it);
 //!      - unknown → raw `utilization` ascending (unchanged behaviour for the
 //!        population that never had a pace signal);
@@ -78,9 +83,8 @@
 //!
 //! A *handoff* is a token-exhausted session moving to another account
 //! ([`pick_migration_target`]). Both strategies consider only the accounts
-//! that are under their expected pace (actual 7-day utilization < expected),
-//! usable, out of cooldown and logged in — see
-//! [`super::config::under_pace_shortfall`]:
+//! that are under their expected pace with real headroom, usable, out of
+//! cooldown and logged in — see [`super::config::under_pace_shortfall`]:
 //!
 //! - `WeightedRandom`: each account's weight is `expected * (expected -
 //!   actual)`. The weights are laid end to end as ranges from 0 to their sum,
@@ -97,25 +101,33 @@
 //!
 //! With no account under pace both fall back to the cross-mode ranking
 //! [`pick_target_from`] uses. Every handoff in every mode is recorded in the
-//! ledger, so switching to `AlternatingHandoff` continues from real history.
+//! ledger ([`super::handoff_ledger`]), so switching to `AlternatingHandoff`
+//! continues from real history.
+//!
+//! # Handoff load charge
+//!
+//! Each recorded handoff charges its target `HANDOFF_LOAD_ESTIMATE`
+//! (utilization units), decaying to zero over the handoff window, and every
+//! pace reader ranks on `effective_utilization = probed + charge`. So a burst
+//! of handoffs ranked off one cached snapshot stops admitting an account once
+//! the charges push its shortfall below `MIN_SHORTFALL`, and the next pick
+//! moves on. The readers take the charge as an argument; they never lock the
+//! ledger (lock order `HANDOFFS` -> `USAGE_SNAPSHOT`, see
+//! [`super::handoff_ledger`]).
 
-use super::config::{cmp_rank, UsageRank};
+use super::config::{cmp_rank, HeadroomFloors, UsageRank};
+use super::handoff_ledger::{self, HandoffLedger};
 use crate::claude_session::federation::derive_account_name;
 use crate::settings::{self, AccountSelectionMode};
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::info;
 
-/// How far back [`AccountSelectionMode::AlternatingHandoff`] looks at earlier
-/// handoffs.
-pub const HANDOFF_WINDOW: Duration = Duration::from_secs(3 * 3600);
-
-/// Handoffs as `(when, target config dir)`, oldest first, pruned to
-/// [`HANDOFF_WINDOW`] whenever it is read. `Instant` is monotonic, so a wall
-/// clock step neither drops nor keeps entries wrongly.
-static HANDOFFS: Mutex<VecDeque<(Instant, String)>> = Mutex::new(VecDeque::new());
+/// The charge `charges` holds for `config_dir`, zero when it has none.
+fn charge_of(charges: &HashMap<String, f64>, config_dir: &str) -> f64 {
+    charges.get(config_dir).copied().unwrap_or(0.0)
+}
 
 /// Pin the most-available Claude config dir as the effective account for the
 /// current process. Call this once at the start of each logical unit of AI
@@ -156,19 +168,34 @@ pub fn pick_best_account() {
         return;
     }
 
+    // The same pace inputs a handoff ranks on: the floors, and every account's
+    // decayed handoff charge — read under a ledger lock released BEFORE the
+    // usage snapshot is read, so the lock order matches `pick_migration_target`
+    // (HANDOFFS -> USAGE_SNAPSHOT) without nesting at all.
+    let floors = HeadroomFloors::effective();
+    let charges = handoff_ledger::charge_sums_now();
+    let charge = |d: &str| charge_of(&charges, d);
+    let low_headroom =
+        |d: &str| super::config::usage_rank(d, charge(d), &floors).is_some_and(|r| r.low_headroom);
+
     let chosen = match mode {
         AccountSelectionMode::WeightedRandom => {
-            let candidates = under_pace_candidates(&config_dirs, |d| {
-                super::oauth_refresh::has_valid_credentials(d)
-                    && !super::config::is_account_cooled_down(d)
-            });
+            let candidates = under_pace_candidates(
+                &config_dirs,
+                |d| {
+                    super::oauth_refresh::has_valid_credentials(d)
+                        && !super::config::is_account_cooled_down(d)
+                },
+                |d| super::config::under_pace_shortfall(d, charge(d), &floors),
+            );
             weighted_pick(&candidates, rand::random::<f64>()).or_else(|| {
                 pick_from_highest_expected(
                     &config_dirs,
                     |d| super::oauth_refresh::has_valid_credentials(d),
                     |d| super::config::is_account_cooled_down(d),
-                    |d| super::config::usage_rank_highest_expected(d),
+                    |d| super::config::usage_rank_highest_expected(d, charge(d), &floors),
                     |d| super::config::account_known_exhausted(d),
+                    low_headroom,
                     |d| super::config::time_until_cooled_down(d),
                 )
             })
@@ -180,8 +207,9 @@ pub fn pick_best_account() {
                 &config_dirs,
                 |d| super::oauth_refresh::has_valid_credentials(d),
                 |d| super::config::is_account_cooled_down(d),
-                |d| super::config::usage_rank_highest_expected(d),
+                |d| super::config::usage_rank_highest_expected(d, charge(d), &floors),
                 |d| super::config::account_known_exhausted(d),
+                low_headroom,
                 |d| super::config::time_until_cooled_down(d),
             )
         }
@@ -189,7 +217,7 @@ pub fn pick_best_account() {
             &config_dirs,
             |d| super::oauth_refresh::has_valid_credentials(d),
             |d| super::config::is_account_cooled_down(d),
-            |d| super::config::usage_rank(d),
+            |d| super::config::usage_rank(d, charge(d), &floors),
             |d| super::config::account_known_exhausted(d),
             |d| super::config::time_until_cooled_down(d),
         ),
@@ -283,11 +311,14 @@ fn pick_from<'a>(
 }
 
 /// Pure selection core for `AccountSelectionMode::HighestExpectedUsage`,
-/// parameterised exactly like [`pick_from`] except for the `usage` closure:
-/// here it returns `Some(expected_utilization)` only for an account that
-/// qualifies for the primary tier — usable AND currently under its expected
-/// pace (mirrors [`super::config::usage_rank_highest_expected`]) — and `None`
-/// for everything else (exhausted, at-or-over pace, or no fresh sample).
+/// parameterised like [`pick_from`] except for the `usage` closure — here it
+/// returns `Some(expected_utilization)` only for an account that qualifies for
+/// the primary tier: usable AND under its expected pace with real headroom
+/// (mirrors [`super::config::usage_rank_highest_expected`]), and `None` for
+/// everything else (exhausted, at-or-over pace, under a floor, or no fresh
+/// sample) — and for the extra `low_headroom` closure, which the fallback
+/// reads so a thin account (`UsageRank::low_headroom`) is taken only when no
+/// account with headroom is available.
 ///
 /// Because a `None` from `usage` is indistinguishable here from "no sample",
 /// an over-pace or exhausted account is never chosen by the primary ranking —
@@ -305,6 +336,7 @@ fn pick_from_highest_expected<'a>(
     is_cooled: impl Fn(&str) -> bool,
     usage: impl Fn(&str) -> Option<f64>,
     known_exhausted: impl Fn(&str) -> bool,
+    low_headroom: impl Fn(&str) -> bool,
     remaining: impl Fn(&str) -> Option<Duration>,
 ) -> Option<String> {
     let valid: Vec<&'a String> = config_dirs.iter().filter(|d| has_valid_creds(d)).collect();
@@ -325,7 +357,15 @@ fn pick_from_highest_expected<'a>(
         return best
             // No account qualified (none under pace, or cold start / stale
             // snapshot): prefer the first available account NOT
-            // known-exhausted, same fallback as `pick_from`.
+            // known-exhausted and not thin, then the first not
+            // known-exhausted — same fallback as `pick_from`, with the
+            // headroom tier kept ahead of exhaustion.
+            .or_else(|| {
+                available
+                    .iter()
+                    .find(|d| !known_exhausted(d) && !low_headroom(d))
+                    .map(|d| (*d).clone())
+            })
             .or_else(|| {
                 available
                     .iter()
@@ -363,40 +403,84 @@ fn pick_from_highest_expected<'a>(
 /// Under `WeightedRandom` and `AlternatingHandoff` the target is chosen by
 /// that strategy (module doc, "Handoff strategies") and the ranking above is
 /// only the fallback for when no account is under pace. The pick is recorded
-/// in the handoff ledger under the same lock that read it, so a burst of
-/// concurrent handoffs each sees the ones before it. A migration that fails
-/// after the pick still counts as a handoff in the ledger.
+/// in the handoff ledger — with its `HANDOFF_LOAD_ESTIMATE` charge — under the
+/// same lock that read it, so a burst of concurrent handoffs each sees the
+/// ones before it, both in the alternation and in every account's
+/// `effective_utilization` (module doc, "Handoff load charge"). A migration
+/// refused or failed after the pick withdraws the entry and its charge
+/// ([`super::handoff_ledger::unrecord_handoff`]).
 pub fn pick_migration_target(exclude_dir: &str) -> Option<String> {
     let config_dirs: Vec<String> = settings::get_claude_config_dirs()
         .into_iter()
         .filter(|d| d != exclude_dir)
         .collect();
 
-    let mut ledger = HANDOFFS.lock().unwrap_or_else(|e| e.into_inner());
-    let now = Instant::now();
-    prune_handoffs(&mut ledger, now);
-    let under = under_pace_candidates(&config_dirs, |d| {
-        super::oauth_refresh::has_valid_credentials(d)
-            && !super::config::is_account_cooled_down(d)
-            && !super::config::account_known_exhausted(d)
-    });
-    let chosen = choose_handoff_target(
-        crate::claude_accounts::effective_selection_mode(),
-        &under,
-        ledger.iter().map(|(_, d)| d.as_str()),
-        rand::random::<f64>(),
+    // Everything settings-backed is read BEFORE the ledger lock, so nothing
+    // nests inside it but the usage-snapshot reads.
+    let pick = HandoffPick {
+        mode: crate::claude_accounts::effective_selection_mode(),
+        floors: HeadroomFloors::effective(),
+        charge: super::config::effective_handoff_load_estimate(),
+        roll: rand::random::<f64>(),
+    };
+
+    let mut ledger = handoff_ledger::lock();
+    pick_migration_target_in(
+        &mut ledger,
+        Instant::now(),
+        &config_dirs,
+        pick,
+        |d| super::oauth_refresh::has_valid_credentials(d),
+        |d| super::config::is_account_cooled_down(d),
+        |d| super::config::account_known_exhausted(d),
     )
-    .or_else(|| {
-        pick_target_from(
-            &config_dirs,
-            |d| super::oauth_refresh::has_valid_credentials(d),
-            |d| super::config::is_account_cooled_down(d),
-            |d| super::config::usage_rank(d),
-            |d| super::config::account_known_exhausted(d),
-        )
-    });
+}
+
+/// The resolved inputs of one handoff pick.
+#[derive(Clone, Copy, Debug)]
+struct HandoffPick {
+    mode: AccountSelectionMode,
+    floors: HeadroomFloors,
+    /// What this handoff charges its target.
+    charge: f64,
+    /// A uniform draw in `[0, 1)` for `WeightedRandom`.
+    roll: f64,
+}
+
+/// [`pick_migration_target`] over an already-held `ledger` and an already
+/// filtered roster. Reads the real usage snapshot through the pace readers,
+/// handing each the account's decayed charge from `ledger` — never re-locking
+/// it — and records the pick, with `pick.charge`, before returning.
+fn pick_migration_target_in(
+    ledger: &mut HandoffLedger,
+    now: Instant,
+    config_dirs: &[String],
+    pick: HandoffPick,
+    has_valid_creds: impl Fn(&str) -> bool,
+    is_cooled: impl Fn(&str) -> bool,
+    known_exhausted: impl Fn(&str) -> bool,
+) -> Option<String> {
+    ledger.prune(now);
+    let charges = ledger.charge_sums(now);
+    let charge = |d: &str| charge_of(&charges, d);
+    let floors = pick.floors;
+    let under = under_pace_candidates(
+        config_dirs,
+        |d| has_valid_creds(d) && !is_cooled(d) && !known_exhausted(d),
+        |d| super::config::under_pace_shortfall(d, charge(d), &floors),
+    );
+    let chosen =
+        choose_handoff_target(pick.mode, &under, ledger.targets(), pick.roll).or_else(|| {
+            pick_target_from(
+                config_dirs,
+                &has_valid_creds,
+                &is_cooled,
+                |d| super::config::usage_rank(d, charge(d), &floors),
+                &known_exhausted,
+            )
+        });
     if let Some(dir) = &chosen {
-        ledger.push_back((now, dir.clone()));
+        ledger.push(now, dir, pick.charge);
     }
     chosen
 }
@@ -422,52 +506,23 @@ fn choose_handoff_target<'a>(
     }
 }
 
-/// Record a handoff whose target the caller chose itself (an explicit
-/// migration target), so [`AccountSelectionMode::AlternatingHandoff`] sees it.
-pub fn record_handoff(config_dir: &str) {
-    let mut ledger = HANDOFFS.lock().unwrap_or_else(|e| e.into_inner());
-    let now = Instant::now();
-    prune_handoffs(&mut ledger, now);
-    ledger.push_back((now, config_dir.to_string()));
-}
-
-/// Withdraw the most recent handoff to `config_dir`: the migration it was
-/// recorded for failed, so the session never reached that account and the
-/// alternation must not count it.
-pub fn unrecord_handoff(config_dir: &str) {
-    let mut ledger = HANDOFFS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(i) = ledger.iter().rposition(|(_, d)| d == config_dir) {
-        ledger.remove(i);
-    }
-}
-
-fn prune_handoffs(ledger: &mut VecDeque<(Instant, String)>, now: Instant) {
-    while ledger
-        .front()
-        .is_some_and(|(at, _)| now.saturating_duration_since(*at) > HANDOFF_WINDOW)
-    {
-        ledger.pop_front();
-    }
-}
-
 /// One account under its expected pace: `(config dir, expected utilization,
-/// shortfall = expected - actual)`.
+/// shortfall = expected - effective utilization)`.
 type UnderPace = (String, f64, f64);
 
 /// The accounts among `config_dirs` that pass `eligible` and are under their
-/// expected pace ([`super::config::under_pace_shortfall`]), sorted by
-/// expected usage, highest first (stable, so ties keep roster order).
+/// expected pace — `shortfall` is [`super::config::under_pace_shortfall`]
+/// with the caller's charge and floors bound — sorted by expected usage,
+/// highest first (stable, so ties keep roster order).
 fn under_pace_candidates(
     config_dirs: &[String],
     eligible: impl Fn(&str) -> bool,
+    shortfall: impl Fn(&str) -> Option<(f64, f64)>,
 ) -> Vec<UnderPace> {
     let mut under: Vec<UnderPace> = config_dirs
         .iter()
         .filter(|d| eligible(d))
-        .filter_map(|d| {
-            super::config::under_pace_shortfall(d)
-                .map(|(expected, shortfall)| (d.clone(), expected, shortfall))
-        })
+        .filter_map(|d| shortfall(d).map(|(expected, shortfall)| (d.clone(), expected, shortfall)))
         .collect();
     sort_by_expected_desc(&mut under);
     under
@@ -747,9 +802,18 @@ fn resolve_from(
 
 #[cfg(test)]
 mod tests {
-    use super::super::config::{record_account_usage, usage_rank, PaceRank};
+    use super::super::config::{
+        record_account_usage, usage_rank, PaceRank, HANDOFF_LOAD_ESTIMATE, MIN_HEADROOM,
+        MIN_SHORTFALL,
+    };
     use super::*;
     use std::time::Duration;
+
+    /// `usage_rank` with no handoff charge and the built-in floors — the
+    /// classifier as a spawn-time pick with an empty ledger sees it.
+    fn rank_now(dir: &str) -> Option<UsageRank> {
+        usage_rank(dir, 0.0, &HeadroomFloors::default())
+    }
 
     fn ranked_under_pace(rows: &[(&str, f64, f64)]) -> Vec<UnderPace> {
         let mut v: Vec<UnderPace> = rows
@@ -845,22 +909,6 @@ mod tests {
         assert_eq!(
             weighted_pick(&ranked_under_pace(&[("a", 0.0, 0.3)]), 0.5),
             None
-        );
-    }
-
-    #[test]
-    fn prune_handoffs_drops_entries_older_than_the_window() {
-        let t0 = Instant::now();
-        let mut ledger: VecDeque<(Instant, String)> = [
-            (t0, "old".to_string()),
-            (t0 + Duration::from_secs(10), "edge".to_string()),
-            (t0 + Duration::from_secs(20), "new".to_string()),
-        ]
-        .into();
-        prune_handoffs(&mut ledger, t0 + HANDOFF_WINDOW + Duration::from_secs(5));
-        assert_eq!(
-            ledger.iter().map(|(_, d)| d.as_str()).collect::<Vec<_>>(),
-            vec!["edge", "new"]
         );
     }
 
@@ -1054,6 +1102,7 @@ mod tests {
     fn under(expected: f64) -> UsageRank {
         UsageRank {
             exhausted: false,
+            low_headroom: false,
             pace: PaceRank::UnderPace { expected },
         }
     }
@@ -1063,6 +1112,7 @@ mod tests {
     fn over(ratio: f64) -> UsageRank {
         UsageRank {
             exhausted: false,
+            low_headroom: false,
             pace: PaceRank::OverPace { ratio },
         }
     }
@@ -1072,6 +1122,7 @@ mod tests {
     fn unknown(utilization: f64) -> UsageRank {
         UsageRank {
             exhausted: false,
+            low_headroom: false,
             pace: PaceRank::Unknown { utilization },
         }
     }
@@ -1080,7 +1131,15 @@ mod tests {
     fn exhausted(rank: UsageRank) -> UsageRank {
         UsageRank {
             exhausted: true,
-            pace: rank.pace,
+            ..rank
+        }
+    }
+
+    /// Same pace key as `rank`, but with less than `MIN_HEADROOM` left.
+    fn thin(rank: UsageRank) -> UsageRank {
+        UsageRank {
+            low_headroom: true,
+            ..rank
         }
     }
 
@@ -1239,8 +1298,16 @@ mod tests {
     /// | `.claude` (gmail) | 1.00 | 0.8275 | +0.1725 (EXHAUSTED) |
     /// | `.claude-paktis-gmail` | 0.76 | 0.7025 | +0.0575 |
     /// | `.claude-tiohorst` | 0.79 | 0.4822 | +0.3078 |
+    ///
+    /// Since the `MIN_SHORTFALL` floor (plan
+    /// `2026-10-19-usage-limit-handoff-lands-sessions-on-accounts-that-cannot-absorb-them`
+    /// D1), paktis' 1.37-point shortfall is below the floor: it is demoted to
+    /// the over-pace tier — exactly the by-a-hair admission that sent ten
+    /// sessions onto pakqon on 2026-10-18. Among the accounts still under pace
+    /// with real margin, iris' window is furthest along, so iris wins, and the
+    /// use-it-or-lose-it half of the regression (never hotmail) still holds.
     #[test]
-    fn measured_roster_2026_09_01_picks_paktis_not_hotmail() {
+    fn measured_roster_2026_09_01_picks_iris_not_hotmail() {
         let base = "/test/account_usage/roster_2026_09_01";
         let paktis = format!("{base}/.claude-paktis");
         let iris = format!("{base}/.claude-iris");
@@ -1270,21 +1337,30 @@ mod tests {
 
         let d = vec![
             paktis.clone(),
-            iris,
+            iris.clone(),
             qontinui,
             hotmail.clone(),
-            pakqon,
+            pakqon.clone(),
             gmail,
             paktis_gmail,
             tiohorst,
         ];
-        let chosen = pick_from(&d, |_| true, |_| false, usage_rank, |_| false, |_| None);
+        let chosen = pick_from(&d, |_| true, |_| false, rank_now, |_| false, |_| None);
 
+        for thin_margin in [&paktis, &pakqon] {
+            assert!(
+                matches!(
+                    rank_now(thin_margin).map(|r| r.pace),
+                    Some(PaceRank::OverPace { .. })
+                ),
+                "{thin_margin}: under pace by less than MIN_SHORTFALL ({MIN_SHORTFALL}) is demoted"
+            );
+        }
         assert_eq!(
             chosen.as_deref(),
-            Some(paktis.as_str()),
-            "among the under-pace accounts, paktis' window is furthest along (expected 0.8037), \
-             so its spare capacity is the capacity that expires soonest"
+            Some(iris.as_str()),
+            "among the accounts under pace past the floor, iris' window is furthest along \
+             (expected 0.6489), so its spare capacity is the capacity that expires soonest"
         );
         assert_ne!(
             chosen.as_deref(),
@@ -1315,7 +1391,7 @@ mod tests {
         ]);
 
         let d = vec![x.clone(), y.clone()];
-        let chosen = pick_from(&d, |_| true, |_| false, usage_rank, |_| false, |_| None);
+        let chosen = pick_from(&d, |_| true, |_| false, rank_now, |_| false, |_| None);
 
         assert_eq!(
             chosen.as_deref(),
@@ -1343,7 +1419,7 @@ mod tests {
         ]);
 
         let d = vec![a, b.clone(), c];
-        let chosen = pick_from(&d, |_| true, |_| false, usage_rank, |_| false, |_| None);
+        let chosen = pick_from(&d, |_| true, |_| false, rank_now, |_| false, |_| None);
 
         assert!(
             chosen.is_some(),
@@ -1479,6 +1555,7 @@ mod tests {
                 _ => None,
             },
             |_| false,
+            |_| false,
             |_| None,
         );
         assert_eq!(chosen.as_deref(), Some("/b"));
@@ -1500,6 +1577,7 @@ mod tests {
                 _ => None,
             },
             |_| false,
+            |_| false,
             |_| None,
         );
         assert_eq!(chosen.as_deref(), Some("/under"));
@@ -1510,8 +1588,15 @@ mod tests {
         let d = dirs(&["/a", "/b"]);
         // Neither account is under pace (usage() → None for both) → falls
         // back like a stale snapshot: first available not known-exhausted.
-        let chosen =
-            pick_from_highest_expected(&d, |_| true, |_| false, |_| None, |x| x == "/a", |_| None);
+        let chosen = pick_from_highest_expected(
+            &d,
+            |_| true,
+            |_| false,
+            |_| None,
+            |x| x == "/a",
+            |_| false,
+            |_| None,
+        );
         assert_eq!(chosen.as_deref(), Some("/b"));
     }
 
@@ -1529,6 +1614,7 @@ mod tests {
                 _ => None,
             },
             |_| false,
+            |_| false,
             |_| None,
         );
         assert_eq!(chosen.as_deref(), Some("/b"));
@@ -1543,6 +1629,7 @@ mod tests {
             |_| true, // all cooled
             |_| None,
             |_| false,
+            |_| false,
             |x| match x {
                 "/a" => Some(Duration::from_secs(600)),
                 "/b" => Some(Duration::from_secs(30)),
@@ -1555,8 +1642,15 @@ mod tests {
     #[test]
     fn highest_expected_single_account_is_pinned() {
         let d = dirs(&["/only"]);
-        let chosen =
-            pick_from_highest_expected(&d, |_| true, |_| false, |_| None, |_| false, |_| None);
+        let chosen = pick_from_highest_expected(
+            &d,
+            |_| true,
+            |_| false,
+            |_| None,
+            |_| false,
+            |_| false,
+            |_| None,
+        );
         assert_eq!(chosen.as_deref(), Some("/only"));
     }
 
@@ -1574,6 +1668,7 @@ mod tests {
                 "/authed" => Some(0.30),
                 _ => None,
             },
+            |_| false,
             |_| false,
             |_| None,
         );
@@ -1911,5 +2006,332 @@ mod tests {
             "message lists available accounts: {}",
             msg
         );
+    }
+
+    // --- headroom floors and the handoff load charge -------------------------
+    //
+    // Plan `2026-10-19-usage-limit-handoff-lands-sessions-on-accounts-that-cannot-absorb-them`
+    // Phase 1. `USAGE_SNAPSHOT` is process-global and keyed by config dir, so
+    // every dir below is unique to its test; each test drives its OWN
+    // `HandoffLedger` rather than the process static, so no two tests share
+    // handoff state.
+
+    #[test]
+    fn low_headroom_sorts_after_every_usable_account_but_before_exhausted() {
+        let d = dirs(&["/thin", "/over", "/unknown", "/dead"]);
+        let usage = |x: &str| match x {
+            // Under pace on paper, with the best possible key — but thin.
+            "/thin" => Some(thin(under(0.99))),
+            "/over" => Some(over(3.0)),
+            "/unknown" => Some(unknown(0.80)),
+            "/dead" => Some(exhausted(under(0.99))),
+            _ => None,
+        };
+        let mut order: Vec<&String> = d.iter().collect();
+        order.sort_by(|a, b| cmp_rank(&usage(a).unwrap(), &usage(b).unwrap()));
+        assert_eq!(order, vec!["/unknown", "/over", "/thin", "/dead"]);
+
+        // Both pickers agree: a usable account with headroom wins…
+        assert_eq!(
+            pick_from(&d, |_| true, |_| false, usage, |_| false, |_| None).as_deref(),
+            Some("/unknown")
+        );
+        assert_eq!(
+            pick_target_from(&d, |_| true, |_| false, usage, |_| false).as_deref(),
+            Some("/unknown")
+        );
+        // …and the thin account is still pickable when it is the only
+        // non-exhausted one — demoted, never excluded.
+        let only = dirs(&["/dead", "/thin"]);
+        assert_eq!(
+            pick_from(&only, |_| true, |_| false, usage, |_| false, |_| None).as_deref(),
+            Some("/thin")
+        );
+        assert_eq!(
+            pick_target_from(&only, |_| true, |_| false, usage, |_| false).as_deref(),
+            Some("/thin")
+        );
+    }
+
+    #[test]
+    fn low_headroom_through_the_real_classifier() {
+        let base = "/test/account_usage/low_headroom_classifier";
+        // 0.93 used of 0.99 expected: a 6-point shortfall, but only 7 points
+        // left before the reset (< MIN_HEADROOM).
+        let thin_dir = format!("{base}/thin");
+        // Well over pace, plenty left.
+        let over_dir = format!("{base}/over");
+        let dead_dir = format!("{base}/dead");
+        record_account_usage(&[
+            (thin_dir.clone(), 0.93, Some(-0.06), Some(0.99), false),
+            (over_dir.clone(), 0.50, Some(0.20), Some(0.30), false),
+            (dead_dir.clone(), 1.00, Some(0.10), Some(0.90), true),
+        ]);
+        let thin_rank = rank_now(&thin_dir).unwrap();
+        assert!(thin_rank.low_headroom);
+        assert!(
+            matches!(thin_rank.pace, PaceRank::OverPace { .. }),
+            "the headroom floor fails, so it is not under pace either"
+        );
+        assert_eq!(
+            super::super::config::under_pace_shortfall(&thin_dir, 0.0, &HeadroomFloors::default()),
+            None
+        );
+        assert!(1.0 - 0.93 < MIN_HEADROOM);
+
+        let all = vec![thin_dir.clone(), over_dir.clone(), dead_dir.clone()];
+        assert_eq!(
+            pick_target_from(&all, |_| true, |_| false, rank_now, |_| false),
+            Some(over_dir.clone())
+        );
+        let usable = |d: &str| d != over_dir;
+        assert_eq!(
+            pick_target_from(&all, usable, |_| false, rank_now, |_| false),
+            Some(thin_dir.clone()),
+            "the only non-exhausted account stays pickable"
+        );
+        // The spawn-time HighestExpected fallback skips the thin account while
+        // a healthy one is available, and takes it when none is.
+        let thin_flag = |d: &str| rank_now(d).is_some_and(|r| r.low_headroom);
+        let hexp = |d: &str| {
+            super::super::config::usage_rank_highest_expected(d, 0.0, &HeadroomFloors::default())
+        };
+        let roster = vec![thin_dir.clone(), over_dir.clone()];
+        assert_eq!(
+            pick_from_highest_expected(
+                &roster,
+                |_| true,
+                |_| false,
+                hexp,
+                |_| false,
+                thin_flag,
+                |_| None
+            ),
+            Some(over_dir.clone())
+        );
+        assert_eq!(
+            pick_from_highest_expected(
+                &[thin_dir.clone()],
+                |_| true,
+                |_| false,
+                hexp,
+                |_| false,
+                thin_flag,
+                |_| None
+            ),
+            Some(thin_dir.clone())
+        );
+    }
+
+    /// One account's probe result as `refresh_account_usage_snapshot` would
+    /// return it from the 60 s probe cache.
+    fn probe_body(
+        dir: &str,
+        utilization: f64,
+        expected: f64,
+    ) -> crate::commands::ai_settings::AccountUsageInfo {
+        crate::commands::ai_settings::AccountUsageInfo {
+            config_dir: dir.to_string(),
+            label: dir.to_string(),
+            utilization,
+            expected_utilization: Some(expected),
+            usage_delta: Some(utilization - expected),
+            source: Some("oauth_usage".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn pick_with(mode: AccountSelectionMode, charge: f64) -> HandoffPick {
+        HandoffPick {
+            mode,
+            floors: HeadroomFloors::default(),
+            charge,
+            // Roll 0 always lands in the first (highest-expected) range of
+            // `WeightedRandom`, so without the charge every draw is account 1.
+            roll: 0.0,
+        }
+    }
+
+    /// Acceptance (Phase 1): fifteen handoffs in one minute, with the snapshot
+    /// re-recorded from the SAME cached bodies before every pick — the
+    /// 2026-10-18 22:30:53–22:31:37 burst shape — put no more handoffs on any
+    /// account than `(shortfall - MIN_SHORTFALL) / HANDOFF_LOAD_ESTIMATE`
+    /// allows (+1: the pick that crosses the floor is the last one admitted).
+    /// The charge rides on the ledger, so re-recording cannot wipe it.
+    #[test]
+    fn burst_from_one_rerecorded_snapshot_spreads_once_charges_cross_the_floor() {
+        for (tag, mode) in [
+            ("hexp", AccountSelectionMode::HighestExpectedUsage),
+            ("alt", AccountSelectionMode::AlternatingHandoff),
+            ("weighted", AccountSelectionMode::WeightedRandom),
+        ] {
+            let base = format!("/test/account_usage/burst_{tag}");
+            // (dir, utilization, expected) → shortfall 0.11 / 0.13 / 0.09.
+            let rows = [
+                (format!("{base}/a"), 0.79, 0.90),
+                (format!("{base}/b"), 0.57, 0.70),
+                (format!("{base}/c"), 0.41, 0.50),
+            ];
+            let bodies: Vec<_> = rows.iter().map(|(d, u, e)| probe_body(d, *u, *e)).collect();
+            let config_dirs: Vec<String> = rows.iter().map(|(d, _, _)| d.clone()).collect();
+            let allowed = |shortfall: f64| {
+                ((shortfall - MIN_SHORTFALL) / HANDOFF_LOAD_ESTIMATE + 1e-9).floor() as usize + 1
+            };
+
+            let mut ledger = HandoffLedger::new();
+            let t0 = Instant::now();
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            for i in 0..15u64 {
+                // Every hint re-probes first; the probe cache hands back the
+                // identical bodies and `record_usage_snapshot` REPLACES each
+                // sample with a fresh `captured_at`.
+                crate::commands::ai_settings::record_usage_snapshot(&bodies);
+                let picked = pick_migration_target_in(
+                    &mut ledger,
+                    t0 + Duration::from_secs(4 * i),
+                    &config_dirs,
+                    pick_with(mode, HANDOFF_LOAD_ESTIMATE),
+                    |_| true,
+                    |_| false,
+                    |_| false,
+                )
+                .expect("a usable roster always yields a target");
+                *counts.entry(picked).or_insert(0) += 1;
+            }
+            for (dir, u, e) in &rows {
+                assert_eq!(
+                    counts.get(dir).copied().unwrap_or(0),
+                    allowed(e - u),
+                    "{tag}: {dir} (shortfall {:.2}) took {:?} of 15",
+                    e - u,
+                    counts
+                );
+            }
+            assert_eq!(ledger.len(), 15);
+
+            // Every account is now charged below the floor: the next pick is
+            // the demoted fallback, not a refusal.
+            crate::commands::ai_settings::record_usage_snapshot(&bodies);
+            let after = t0 + Duration::from_secs(60);
+            for (dir, _, _) in &rows {
+                assert_eq!(
+                    super::super::config::under_pace_shortfall(
+                        dir,
+                        ledger.charge_sum(dir, after),
+                        &HeadroomFloors::default()
+                    ),
+                    None,
+                    "{tag}: {dir} is charged below MIN_SHORTFALL"
+                );
+            }
+            let fallback = pick_migration_target_in(
+                &mut ledger,
+                after,
+                &config_dirs,
+                pick_with(mode, HANDOFF_LOAD_ESTIMATE),
+                |_| true,
+                |_| false,
+                |_| false,
+            );
+            assert!(fallback.is_some(), "{tag}: demoted, never excluded");
+        }
+    }
+
+    /// Without the charge the same burst is the incident: every pick lands on
+    /// the account ranked first. Pins that the spreading above IS the charge.
+    #[test]
+    fn burst_without_a_charge_lands_every_handoff_on_one_account() {
+        let base = "/test/account_usage/burst_no_charge";
+        let a = format!("{base}/a");
+        let b = format!("{base}/b");
+        let bodies = vec![probe_body(&a, 0.79, 0.90), probe_body(&b, 0.57, 0.70)];
+        let config_dirs = vec![a.clone(), b.clone()];
+        let mut ledger = HandoffLedger::new();
+        let t0 = Instant::now();
+        for i in 0..10u64 {
+            crate::commands::ai_settings::record_usage_snapshot(&bodies);
+            let picked = pick_migration_target_in(
+                &mut ledger,
+                t0 + Duration::from_secs(4 * i),
+                &config_dirs,
+                pick_with(AccountSelectionMode::HighestExpectedUsage, 0.0),
+                |_| true,
+                |_| false,
+                |_| false,
+            );
+            assert_eq!(picked.as_deref(), Some(a.as_str()));
+        }
+    }
+
+    #[test]
+    fn charge_decays_to_zero_at_the_window_and_a_rerecorded_probe_keeps_it() {
+        let dir = "/test/account_usage/charge_decay/a";
+        // Shortfall 0.03: one charge of 0.02 takes it to 0.01, below the floor.
+        let bodies = vec![probe_body(dir, 0.60, 0.63)];
+        let floors = HeadroomFloors::default();
+        let shortfall = |charge: f64| {
+            super::super::config::under_pace_shortfall(dir, charge, &floors).map(|(_, s)| s)
+        };
+        crate::commands::ai_settings::record_usage_snapshot(&bodies);
+
+        let t0 = Instant::now();
+        let mut ledger = HandoffLedger::new();
+        ledger.push(t0, dir, HANDOFF_LOAD_ESTIMATE);
+
+        let soon = t0 + Duration::from_secs(60);
+        assert_eq!(shortfall(ledger.charge_sum(dir, soon)), None);
+        // A fresh probe a minute later shows none of the moved load and
+        // REPLACES the sample — the charge is on the ledger, so it survives.
+        crate::commands::ai_settings::record_usage_snapshot(&bodies);
+        assert_eq!(shortfall(ledger.charge_sum(dir, soon)), None);
+
+        // Decayed past half: 0.03 - 0.0099 >= 0.02, so it is admitted again.
+        let later = t0 + handoff_ledger::HANDOFF_WINDOW / 2 + Duration::from_secs(60);
+        assert!(shortfall(ledger.charge_sum(dir, later)).is_some());
+        // At the window the charge is gone entirely.
+        let at_window = t0 + handoff_ledger::HANDOFF_WINDOW;
+        assert_eq!(ledger.charge_sum(dir, at_window), 0.0);
+        let full = shortfall(ledger.charge_sum(dir, at_window)).unwrap();
+        assert!(
+            (full - 0.03).abs() < 1e-9,
+            "full shortfall back, got {full}"
+        );
+    }
+
+    #[test]
+    fn unrecorded_handoff_takes_its_charge_with_it() {
+        let dir = "/test/account_usage/unrecord_charge/a";
+        let bodies = vec![probe_body(dir, 0.60, 0.63)];
+        crate::commands::ai_settings::record_usage_snapshot(&bodies);
+        let floors = HeadroomFloors::default();
+        let t0 = Instant::now();
+        let mut ledger = HandoffLedger::new();
+        let picked = pick_migration_target_in(
+            &mut ledger,
+            t0,
+            &[dir.to_string()],
+            pick_with(
+                AccountSelectionMode::AlternatingHandoff,
+                HANDOFF_LOAD_ESTIMATE,
+            ),
+            |_| true,
+            |_| false,
+            |_| false,
+        );
+        assert_eq!(picked.as_deref(), Some(dir));
+        assert_eq!(
+            super::super::config::under_pace_shortfall(dir, ledger.charge_sum(dir, t0), &floors),
+            None,
+            "the pick charged the account below the floor"
+        );
+        // The migration failed: withdraw it.
+        assert!(ledger.unrecord(dir));
+        assert_eq!(ledger.len(), 0);
+        assert!(super::super::config::under_pace_shortfall(
+            dir,
+            ledger.charge_sum(dir, t0),
+            &floors
+        )
+        .is_some());
     }
 }
