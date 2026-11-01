@@ -4126,6 +4126,15 @@ impl ExitedContinuation {
     }
 }
 
+/// Reads through to the registration that left `live`.
+impl std::ops::Deref for ExitedContinuation {
+    type Target = ContinuationSession;
+
+    fn deref(&self) -> &ContinuationSession {
+        &self.session
+    }
+}
+
 /// How a continuation session that STARTED ended — the `exit=` class of the
 /// `work_unreported` detail coord classifies (plan
 /// `2026-10-01-a-lost-gate-continuation-is-never-re-delivered`, D2). Coord
@@ -16372,12 +16381,12 @@ mod tests {
         let moved = deregister_exited_continuation("term-new")
             .expect("the continuation is registered against the new terminal");
         assert_eq!(
-            moved.session.gate_id,
+            moved.gate_id,
             Some(gate),
             "the hop still carries the gate onto the new terminal"
         );
         assert_eq!(
-            moved.session.anchor_key.as_deref(),
+            moved.anchor_key.as_deref(),
             Some(anchor),
             "the hop still carries the anchor onto the new terminal"
         );
@@ -16506,7 +16515,6 @@ mod tests {
         assert_eq!(
             deregister_exited_continuation("term-old")
                 .expect("the continuation is registered against the old terminal")
-                .session
                 .gate_id,
             Some(gate),
             "the failed hop still carries the gate, so the eventual real exit reports honestly"
@@ -18082,10 +18090,6 @@ mod tests {
     // Defect A item 3 (layered on #484): capacity-freed re-poll
     // =========================================================================
 
-    /// A continuation terminal's exit deregisters it from the live registry AND
-    /// reports it WAS a continuation (`true`) — the signal the on-exit hook uses
-    /// to kick a capacity-freed pending-continuations poll. The registry entry is
-    /// gone afterward (the freed slot is reflected immediately, not lazily).
     /// Leaving `live` takes the gate's episode in the same step — through the
     /// exit hook's deregister and through the reaper — so a fresh claim of the
     /// gate that remembers its own episode before the old run's fallback task
@@ -18136,6 +18140,10 @@ mod tests {
         clear_continuation_registry();
     }
 
+    /// A continuation terminal's exit deregisters it from the live registry AND
+    /// reports it WAS a continuation (`true`) — the signal the on-exit hook uses
+    /// to kick a capacity-freed pending-continuations poll. The registry entry is
+    /// gone afterward (the freed slot is reflected immediately, not lazily).
     #[test]
     fn continuation_exit_triggers_repoll_and_deregisters() {
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -18166,7 +18174,7 @@ mod tests {
         // address the exit path will ever have (an anchor_key cannot address a
         // gate), so the work-outcome fallback can POST against it.
         assert_eq!(
-            removed.and_then(|e| e.session.gate_id),
+            removed.and_then(|s| s.gate_id),
             Some(gate),
             "the exiting continuation's gate_id must survive deregistration"
         );
@@ -18219,11 +18227,11 @@ mod tests {
         let moved = deregister_exited_continuation("term-new")
             .expect("the continuation must now be registered against the new terminal");
         assert_eq!(
-            moved.session.gate_id,
+            moved.gate_id,
             Some(gate),
             "the gate must survive the account-migration hop"
         );
-        assert_eq!(moved.session.anchor_key.as_deref(), Some("anchor-m"));
+        assert_eq!(moved.anchor_key.as_deref(), Some("anchor-m"));
 
         clear_continuation_registry();
     }
@@ -19114,8 +19122,8 @@ mod continuation_consume_arming {
     // pre-install buffer, not the installed store, and the drain never runs:
     // the store is installed once per process by `main.rs`, and this test must
     // also build against the pre-change runtime, which has neither, so it can
-    // name neither. The installed store's dedupe and the drain are covered by
-    // `outcome_wiring_tests` and `outcome_row_drain_arming`. The held record
+    // name neither. The installed store's dedupe and the drain have their own
+    // wiring and drain tests. The held record
     // stays in that buffer for the rest of the process; its gate is fresh, so
     // no other test's lane is behind it.
     #[tokio::test]
