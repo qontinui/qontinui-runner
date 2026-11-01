@@ -2261,7 +2261,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // one-shot best-effort sweep of stale credential-helper
                 // config files (%TEMP%/qontinui-git-cred-*.json older than
                 // 24h). Sessions normally remove their own file via the
-                // SessionRegistry::close funnel; the sweep reaps files
+                // SessionRegistry::close_by_id funnel; the sweep reaps files
                 // orphaned by crashes/kills. Never fails or slows the boot.
                 credential_helper::spawn_startup_sweep();
                 // Scheduled-maintenance executor (Phase 1, plan

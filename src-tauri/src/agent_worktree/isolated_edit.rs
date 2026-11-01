@@ -148,7 +148,7 @@ impl Drop for IsolatedEditContext {
         // Tear down the per-agent git credential material installed by
         // `allocate_and_materialize_with_claim` (one
         // `setup_credential_helper_for_worktree` per materialized worktree,
-        // keyed on the AGENT id — a key space `SessionRegistry::close` never
+        // keyed on the AGENT id — a key space `SessionRegistry::close_by_id` never
         // reaches, because it drains the coord SESSION uuid).
         //
         // Without this the install leaks three ways for the whole runner
@@ -1725,7 +1725,7 @@ mod tests {
     #[test]
     fn drop_tears_down_the_per_agent_credential_config() {
         // The gap this closes: agent-worktree credential installs are keyed on
-        // the AGENT id, which `SessionRegistry::close` never sees — so nothing
+        // the AGENT id, which `SessionRegistry::close_by_id` never sees — so nothing
         // removed the `%TEMP%` token config, and the refresh loop (which exits
         // only when that file disappears) ran for the runner's whole lifetime.
         // Drop is the funnel that matches the agent-id key space.

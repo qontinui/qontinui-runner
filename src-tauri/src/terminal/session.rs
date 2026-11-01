@@ -1587,7 +1587,7 @@ pub struct TerminalSession {
     /// slot so the already-spawned waiter thread can read it once the
     /// registration completes; cloned into the waiter at spawn time.
     /// Idempotent against the frontend `terminal_close` path because
-    /// `SessionRegistry::close` is itself idempotent.
+    /// `SessionRegistry::close_by_id` is itself idempotent.
     /// Widened from `Fn(uuid::Uuid)` to also carry the exit code (plan
     /// `2026-08-27-operator-touch-observation-runner-emitter` §2b/§2c,
     /// Phase B2): the coord-close callback still receives the coord session
