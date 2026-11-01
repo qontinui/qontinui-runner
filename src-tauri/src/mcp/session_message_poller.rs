@@ -917,7 +917,7 @@ async fn idle_gate(
         // (a process-table snapshot is a PowerShell/CIM call on Windows), and
         // anything the operator types or any `/exit` in that window must be
         // seen by the check that immediately precedes the paste. Same order
-        // as `graceful_exit::drive` (probe, then screen, then write).
+        // as `graceful_exit::drive_graceful_exit` (probe, then screen, then write).
         let probe =
             crate::terminal::graceful_exit::probe_claude_under(term.child_pid(), Vec::new()).await;
         claude_live(&probe, pid_reads_its_terminal)?;

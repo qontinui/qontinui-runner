@@ -4,7 +4,7 @@
 //!
 //! ## What it gates
 //!
-//! `TerminalManager::graceful_exit` and `graceful_exit::drive` take an
+//! `TerminalManager::graceful_exit` and `graceful_exit::drive_graceful_exit` take an
 //! `Option<CloseAuthority>`. Once the probe has found a live `claude` in the
 //! pane, and before a single byte is typed into it, a call that presents
 //! `None` is refused `no_close_authority`

@@ -29,7 +29,8 @@
 #     runner_close_sites::close_authority_has_no_constructor_outside_test_code
 # Its rule 9b allows the word `authority` in a primitive entry point's body only as the forwarded
 # argument, an `is_some()` / `is_none()` read, the log field `authority = authority.is_some()`
-# followed by `,` or `)`, and drive's `let Some(_authority) = authority else`; anything else is red.
+# followed by `,` or `)`, and drive_graceful_exit's `let Some(_authority) = authority else`; anything
+# else is red.
 #
 # Columns:  file (relative to src/) | fn | class | detail
 #

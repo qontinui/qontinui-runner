@@ -93,7 +93,7 @@
 //!    argument at the authority's place in a primitive call (rule 9 locates
 //!    it); a read, `authority.is_some()` or `.is_none()`; both words of the log
 //!    field `authority = authority.is_some()` (or `.is_none()`) followed at once
-//!    by `,` or `)`; and, in `drive` only, the `authority` of
+//!    by `,` or `)`; and, in `drive_graceful_exit` only, the `authority` of
 //!    `let Some(_authority) = authority else`. Any other occurrence is red. That
 //!    covers every binding form (`let`, `if let`, `for`, `match`, a closure
 //!    parameter) and every assignment, because each puts the name somewhere
@@ -152,7 +152,7 @@
 //!   string or a comment is blanked first, and anything else that is not one
 //!   of its four allowed uses is red, so it errs toward red. Its real-tree
 //!   test pins the uses it allows today: three forwards, the log field's two
-//!   words and `drive`'s let-else.
+//!   words and `drive_graceful_exit`'s let-else.
 //! * A green scan claims "every close this scan RECOGNISES is classified", not
 //!   "every close path is classified".
 
@@ -247,7 +247,7 @@ const ALLOWED_STRUCT_ATTRS: &[&str] = &["derive", "doc", "must_use", "allow", "e
 /// mention of the type (rule 8), and forwarding it is the one non-`None`
 /// authority a call may pass (rule 9).
 const AUTHORITY_PARAM_FNS: &[(&str, Option<&str>, &str)] = &[
-    ("terminal/graceful_exit.rs", None, "drive"),
+    ("terminal/graceful_exit.rs", None, "drive_graceful_exit"),
     (
         "terminal/session.rs",
         Some("TerminalSession"),
@@ -1994,17 +1994,23 @@ fn call_args(code: &str, open: usize) -> Option<Vec<(usize, &str)>> {
     None
 }
 
-/// The primitive's entry points, by the name a call uses.
+/// The primitive's entry points, by the name a call uses. Each name is used by
+/// no other fn in the crate, so a call is read in every file, a macro body
+/// included.
 const PRIMITIVE_CALLS: &[&str] = &[
     "graceful_exit",
     "graceful_exit_then",
     "graceful_exit_driven",
+    "drive_graceful_exit",
 ];
 
 /// Rule 9: every call of the primitive passes `None` as its authority. An
 /// entry point may forward its own `authority`, and an authorized minter may
-/// pass what it minted. `drive` counts under `terminal/` only, the one module
-/// that can call it (it is `pub(super)`).
+/// pass what it minted. Every file is read the same way. A call written in a
+/// macro body is read where the macro is DEFINED, so a `#[macro_export]`
+/// macro that expands to a call inside `crate::terminal` is still read. A
+/// `use … as` rename of an entry point is red, because a call through the new
+/// name would not be read.
 ///
 /// The authority's argument is the one at the `authority` parameter's place in
 /// the entry point's own signature (`signatures`), one later for a path call
@@ -2023,20 +2029,24 @@ fn primitive_call_violations(
     scan: &mut AuthorityScan,
 ) -> BTreeSet<usize> {
     let mut forwards = BTreeSet::new();
-    static IN_TERMINAL: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    static ELSEWHERE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static PRIMITIVE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     static NOT_AN_EXPRESSION: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let re = if p.file.starts_with("terminal/") {
-        once(
-            &IN_TERMINAL,
-            &format!(r"\b(?:{}|drive)\b", PRIMITIVE_CALLS.join("|")),
-        )
-    } else {
-        once(
-            &ELSEWHERE,
-            &format!(r"\b(?:{})\b", PRIMITIVE_CALLS.join("|")),
-        )
-    };
+    let re = once(
+        &PRIMITIVE,
+        &format!(r"\b(?:{})\b", PRIMITIVE_CALLS.join("|")),
+    );
+    for r in p
+        .structure
+        .renames
+        .iter()
+        .filter(|r| !r.in_test && PRIMITIVE_CALLS.contains(&r.from.as_str()))
+    {
+        scan.violations.push(format!(
+            "{}:{} `use … as {}` renames `{}` — a call through the new name is not read; \
+             every call passes `None`",
+            p.file, r.line, r.to, r.from
+        ));
+    }
     // A `mod` declaration, or a `let` / `let mut` binding of the name.
     let not_an_expression = once(&NOT_AN_EXPRESSION, r"(?:\bmod|\blet(?:\s+mut)?)\s*$");
     let code = &p.code_only;
@@ -2046,12 +2056,11 @@ fn primitive_call_violations(
         let before = prefix.trim_end();
         let name = m.as_str();
         // `.graceful_exit(` is the commonest call; `.graceful_exit` with no call
-        // is a field access. `.drive` is never the free fn.
+        // is a field access.
         let method_or_field = before.ends_with('.');
         if is_declaration(code, m.start())
             || p.structure.in_use_span(line)
             || not_an_expression.is_match(prefix)
-            || (method_or_field && name == "drive")
         {
             continue;
         }
@@ -2143,7 +2152,7 @@ fn primitive_call_violations(
 /// * a read, `authority.is_some()` or `authority.is_none()`;
 /// * both words of the log field `authority = authority.is_some()` (or
 ///   `.is_none()`), followed at once by `,` or `)`;
-/// * in `drive` only, the `authority` of `let Some(_authority) = authority else`.
+/// * in `drive_graceful_exit` only, the `authority` of `let Some(_authority) = authority else`.
 ///
 /// Any other occurrence is red. Every binding form (`let`, `if let`, `for`,
 /// `match`, a closure parameter, a macro's `$i`) and every assignment puts the
@@ -2201,7 +2210,7 @@ fn entry_point_violations(p: &Prepared, forwards: &BTreeSet<usize>, scan: &mut A
                 "log field"
             } else if read.is_match(tail) {
                 "read"
-            } else if f.name == "drive"
+            } else if f.name == "drive_graceful_exit"
                 && let_else_head.is_match(prefix_of(p, at))
                 && let_else_tail.is_match(tail)
             {
@@ -2216,7 +2225,7 @@ fn entry_point_violations(p: &Prepared, forwards: &BTreeSet<usize>, scan: &mut A
         scan.violations.extend(red_lines.into_iter().map(|line| {
             format!(
                 "{}:{line} ({}) uses `authority` other than as the forwarded argument, an \
-                 `is_some()` / `is_none()` read, the log field or drive's let-else — \
+                 `is_some()` / `is_none()` read, the log field or drive_graceful_exit's let-else — \
                  {unchanged}",
                 p.file, f.name
             )
@@ -2416,7 +2425,7 @@ fn no_module_but_the_closer_can_obtain_a_close_authority() {
     assert_eq!(
         sorted(&scan.param_mentions),
         vec![
-            "terminal/graceful_exit.rs:drive",
+            "terminal/graceful_exit.rs:drive_graceful_exit",
             "terminal/manager.rs:graceful_exit",
             "terminal/session.rs:graceful_exit_driven",
             "terminal/session.rs:graceful_exit_then",
@@ -2431,12 +2440,12 @@ fn no_module_but_the_closer_can_obtain_a_close_authority() {
             "terminal/session.rs:graceful_exit_driven",
             "terminal/session.rs:graceful_exit_then",
         ],
-        "the entry points forward the caller's authority down to `drive`"
+        "the entry points forward the caller's authority down to `drive_graceful_exit`"
     );
     assert_eq!(
         sorted(&scan.entry_uses),
         vec![
-            "terminal/graceful_exit.rs:drive let-else",
+            "terminal/graceful_exit.rs:drive_graceful_exit let-else",
             "terminal/manager.rs:graceful_exit forward",
             "terminal/session.rs:graceful_exit_driven forward",
             "terminal/session.rs:graceful_exit_driven log field",
@@ -2444,7 +2453,7 @@ fn no_module_but_the_closer_can_obtain_a_close_authority() {
             "terminal/session.rs:graceful_exit_then forward",
         ],
         "the four entry bodies use `authority` exactly as rule 9b allows: three forwards, \
-         the log field's two words, and drive's let-else"
+         the log field's two words, and drive_graceful_exit's let-else"
     );
     for caller in [
         "mcp/backend_relay.rs:end_admitted_terminal",
@@ -2911,7 +2920,7 @@ fn the_sealed_shape_passes_and_a_test_module_may_mint() {
         SEALED,
         &[(
             "terminal/graceful_exit.rs",
-            "#[cfg(test)]\nmod tests {\n    fn t() { drive(Some(CloseAuthority::for_test())); }\n}\n",
+            "#[cfg(test)]\nmod tests {\n    fn t() { drive_graceful_exit(Some(CloseAuthority::for_test())); }\n}\n",
         )],
     );
     assert_eq!(close_authority_violations(&prepared), Vec::<String>::new());
@@ -3172,7 +3181,7 @@ fn the_authority_parameter_is_allowed_only_on_the_four_entry_points() {
             (
                 "terminal/graceful_exit.rs",
                 "use crate::terminal::close_authority::CloseAuthority;\n\
-                 pub(super) async fn drive<W>(\n    write: W,\n    screen: S,\n    probe: P,\n    close_tab: C,\n    \
+                 pub(super) async fn drive_graceful_exit<W>(\n    write: W,\n    screen: S,\n    probe: P,\n    close_tab: C,\n    \
                  timing: T,\n    authority: Option<CloseAuthority>,\n) -> O {\n    \
                  let Some(_authority) = authority else {\n        return O::Refused;\n    };\n    todo!()\n}\n",
             ),
@@ -3181,7 +3190,7 @@ fn the_authority_parameter_is_allowed_only_on_the_four_entry_points() {
                 "impl TerminalSession {\n    pub(super) async fn graceful_exit_then(&self, d: D, c: C, authority: Option<crate::terminal::close_authority::CloseAuthority>) -> O {\n        \
                  self.graceful_exit_driven(t, p, c, authority).await\n    }\n    \
                  async fn graceful_exit_driven(&self, t: T, p: P, c: C, authority: Option<crate::terminal::close_authority::CloseAuthority>) -> O {\n        \
-                 drive(|b| w(b, x), || s(), p, c, t, authority).await\n    }\n}\n",
+                 drive_graceful_exit(|b| w(b, x), || s(), p, c, t, authority).await\n    }\n}\n",
             ),
             (
                 "terminal/manager.rs",
@@ -3205,7 +3214,7 @@ fn the_authority_parameter_is_allowed_only_on_the_four_entry_points() {
     assert_eq!(
         sorted(&scan.param_mentions),
         vec![
-            "terminal/graceful_exit.rs:drive",
+            "terminal/graceful_exit.rs:drive_graceful_exit",
             "terminal/manager.rs:graceful_exit",
             "terminal/session.rs:graceful_exit_driven",
             "terminal/session.rs:graceful_exit_then",
@@ -3223,7 +3232,7 @@ fn the_authority_parameter_is_allowed_only_on_the_four_entry_points() {
     assert_eq!(
         sorted(&scan.entry_uses),
         vec![
-            "terminal/graceful_exit.rs:drive let-else",
+            "terminal/graceful_exit.rs:drive_graceful_exit let-else",
             "terminal/manager.rs:graceful_exit forward",
             "terminal/session.rs:graceful_exit_driven forward",
             "terminal/session.rs:graceful_exit_then forward",
@@ -3246,7 +3255,7 @@ fn the_authority_parameter_is_allowed_only_on_the_four_entry_points() {
                 (
                     "terminal/graceful_exit.rs",
                     "use crate::terminal::close_authority::CloseAuthority;\n\
-                     pub(super) async fn drive(authority: Option<CloseAuthority>) -> CloseAuthority {\n    \
+                     pub(super) async fn drive_graceful_exit(authority: Option<CloseAuthority>) -> CloseAuthority {\n    \
                      let _held: Option<CloseAuthority> = None;\n    todo!()\n}\n",
                 ),
             ],
@@ -3254,8 +3263,8 @@ fn the_authority_parameter_is_allowed_only_on_the_four_entry_points() {
         &[
             "mcp/helper.rs:2 (pass) names `CloseAuthority`",
             "terminal/manager.rs:2 (graceful_exit) names `CloseAuthority`",
-            "terminal/graceful_exit.rs:2 (drive) names `CloseAuthority`",
-            "terminal/graceful_exit.rs:3 (drive) names `CloseAuthority`",
+            "terminal/graceful_exit.rs:2 (drive_graceful_exit) names `CloseAuthority`",
+            "terminal/graceful_exit.rs:3 (drive_graceful_exit) names `CloseAuthority`",
         ],
     );
 }
@@ -3312,7 +3321,7 @@ fn an_entry_point_that_rebinds_its_authority_is_red() {
                 (
                     "terminal/session.rs",
                     "impl TerminalSession {\n    async fn graceful_exit_driven(&self, t: T, p: P, c: C, authority: Option<crate::terminal::close_authority::CloseAuthority>) -> O {\n        \
-                     let authority = forge();\n        drive(w, s, p, c, t, authority).await\n    }\n}\n",
+                     let authority = forge();\n        drive_graceful_exit(w, s, p, c, t, authority).await\n    }\n}\n",
                 ),
             ],
         ),
@@ -3346,7 +3355,7 @@ fn a_rebinding_inside_a_macro_is_red() {
                     "terminal/session.rs",
                     "impl TerminalSession {\n    async fn graceful_exit_driven(&self, t: T, p: P, c: C, authority: Option<crate::terminal::close_authority::CloseAuthority>) -> O {\n        \
                      info!(terminal_id = %self.id, authority = authority.is_some(), \"starting\");\n        \
-                     drive(w, s, p, c, t, authority).await\n    }\n}\n",
+                     drive_graceful_exit(w, s, p, c, t, authority).await\n    }\n}\n",
                 ),
             ],
         ),
@@ -3424,6 +3433,74 @@ fn a_closure_parameter_inside_a_macro_is_red() {
 fn an_unanchored_log_field_forge_is_red() {
     assert_forged_in_a_macro_is_red(
         "authority = authority.is_none().then(|| unsafe { std::mem::zeroed() }); session.graceful_exit_then(d, close, authority).await",
+    );
+}
+
+/// Round 5: a `#[macro_export]` macro defined OUTSIDE `terminal/` can expand
+/// to a call of the driver inside `crate::terminal`, where its privacy holds.
+/// The expansion site names nothing, so the call is read where it is written,
+/// in the macro's body. Forging `Some(…)` there is red, read at the
+/// `authority` parameter's place in the driver's own signature.
+#[test]
+fn a_macro_defined_outside_terminal_that_calls_the_driver_is_red() {
+    let violations = assert_red(
+        &authority_tree(
+            SEALED,
+            &[
+                (
+                    "terminal/graceful_exit.rs",
+                    "use crate::terminal::close_authority::CloseAuthority;\n\
+                     pub(super) async fn drive_graceful_exit<W>(\n    write: W,\n    screen: S,\n    \
+                     probe: P,\n    close_tab: C,\n    timing: T,\n    \
+                     authority: Option<CloseAuthority>,\n) -> O {\n    todo!()\n}\n",
+                ),
+                (
+                    "ipc_forge.rs",
+                    "#[macro_export]\nmacro_rules! forge_close {\n    ($w:expr) => {\n        \
+                     $crate::terminal::graceful_exit::drive_graceful_exit($w, s, p, c, t, Some(unsafe { ::std::mem::zeroed() }))\n    \
+                     };\n}\n",
+                ),
+                (
+                    "terminal/caller.rs",
+                    "pub(super) async fn close_it(w: W) {\n    let _ = crate::forge_close!(w).await;\n}\n",
+                ),
+            ],
+        ),
+        &["ipc_forge.rs:4 (<file scope>) passes `Some(unsafe { ::std::mem::zeroed() })` as the \
+           authority of `drive_graceful_exit(`"],
+    );
+    assert_eq!(
+        violations.len(),
+        1,
+        "the macro's body is the only red; its expansion site names nothing: {violations:#?}"
+    );
+}
+
+/// Round 5: a `use … as` rename of the driver, or a fn value of it, outside
+/// `terminal/` is red. A call through the new name, or through the value,
+/// would never be read.
+#[test]
+fn a_rename_or_a_fn_value_of_the_driver_is_red() {
+    assert_red(
+        &authority_tree(
+            SEALED,
+            &[
+                (
+                    "mcp/alias.rs",
+                    "use crate::terminal::graceful_exit::drive_graceful_exit as d;\n\
+                     pub(crate) async fn go(w: W) {\n    let _ = d(w, s, p, c, t, Some(forge())).await;\n}\n",
+                ),
+                (
+                    "mcp/value.rs",
+                    "pub(crate) fn hold() {\n    let _d = crate::terminal::graceful_exit::drive_graceful_exit;\n}\n",
+                ),
+            ],
+        ),
+        &[
+            "mcp/alias.rs:1 `use … as d` renames `drive_graceful_exit` — a call through the new \
+             name is not read",
+            "mcp/value.rs:2 (hold) names `drive_graceful_exit` as a value",
+        ],
     );
 }
 
