@@ -842,7 +842,7 @@ mod tests {
         assert_eq!(ok.nonce.as_deref(), Some("cafebabecafebabe"));
 
         let wrong_key = request_key_for("0000000000000000");
-        let truncated = right[..63].to_string();
+        let truncated: String = right.chars().take(63).collect();
         let the_nonce_itself = "cafebabecafebabe".to_string();
         for presented in [
             None,
