@@ -24,21 +24,20 @@
 //! header says what each one means.
 //!
 //! An `operator` row claims that no automation can borrow that close. The
-//! claim is checked three ways:
+//! claim is checked four ways:
 //!
-//! * BY NAME against the `POST /ui-bridge/invoke/<name>` allowlist, whose
+//! * Its name is not on the `POST /ui-bridge/invoke/<name>` allowlist, whose
 //!   dispatch runs the named fn (NC5-1).
-//! * No fn of the `POST /ui-bridge/tauri/invoke` proxy may itself be classed
-//!   `operator`.
-//! * The fn has NO production Rust caller anywhere in the crate. A check of the
-//!   proxy's own arms alone would be one hop deep, so a shared helper that a
-//!   proxy arm calls could still reach the operator fn. With no caller at all,
-//!   no arm, door or helper reaches it at any depth. Its legitimate callers are
-//!   outside Rust: the webview over IPC. Naming it in `tauri::generate_handler!`
-//!   registers it, which is not a call.
-//!
-//! A name check against the proxy's safelist would be wrong: its
-//! `terminal_close` arm never calls the Tauri command of that name.
+//! * Its name is not in the `POST /ui-bridge/tauri/invoke` proxy's command list
+//!   (`ALLOWED_PROXIED_COMMANDS`).
+//! * It is not a fn of that proxy.
+//! * Its name appears in production Rust ONLY in its own declaration and inside
+//!   a registration: `tauri::generate_handler![…]` or `ipc_group!(…)`, the two
+//!   macros this crate registers commands with. Any other mention is red,
+//!   whether it is a call, a fn value handed to something, or an entry in a
+//!   name-to-handler table. A check of calls alone would miss the last two; a
+//!   check of the proxy's own arms alone would be one hop deep. Its only
+//!   legitimate caller is outside Rust: the webview, over IPC.
 //!
 //! ## The close-authority scan
 //!
@@ -52,7 +51,8 @@
 //! 1. SHAPE. There is one definition, in its own module, with at least one
 //!    field and every field private. Its derives are `Debug` and nothing else,
 //!    counting a `cfg_attr(…, derive(…))` as a derive.
-//! 2. No trait impl for the type anywhere.
+//! 2. No trait impl for the type, except [`CONSTRUCTION_FREE_TRAITS`] (`Drop`,
+//!    `Debug`, `Display`), whose methods only borrow a value that exists.
 //! 3. No inherent impl outside its own module.
 //! 4. No fn that returns one, unless it is an authorized constructor.
 //! 5. No `const` or `static` of the type, an associated one included.
@@ -72,13 +72,21 @@
 //!    parameter, and an authorized minter. This catches a forged value that
 //!    never names the type, such as `Some(unsafe { std::mem::zeroed() })`
 //!    passed straight to `TerminalManager::graceful_exit`, because the only
-//!    use of an authority is to hand it to the primitive. Naming the primitive
-//!    without calling it (a fn value), or calling it with a turbofish, hides
-//!    the argument, so both are red as well.
+//!    use of an authority is to hand it to the primitive. The authority's
+//!    argument is found by the `authority` parameter's place in the entry
+//!    point's own signature (one later for a path call of a method), so a
+//!    parameter appended after it changes nothing. A fn value of the primitive
+//!    (a path `X::graceful_exit` not followed by `(`, or a bare name in an
+//!    expression) or a turbofish call hides the argument, so both are red as
+//!    well. A field access `.graceful_exit` or a field named `graceful_exit`
+//!    is not a fn value and is not read.
 //!
 //!    9b. Inside an entry point, `authority` is the caller's value: the
 //!    parameter is not `mut`, `ref` or a sub-pattern, and nothing in the body
-//!    binds the name again.
+//!    binds or assigns the name again. Bindings `syn` parses are read from the
+//!    tree; the body's blanked text is read as well, for a `let authority`, an
+//!    `authority =` or an `authority` closure parameter inside a macro such as
+//!    `tokio::select!`, which `syn` does not parse.
 //!
 //! So a public constructor, an associated const, an alias, a transmute, a
 //! zeroed value, a `cfg_attr` derive, or a production call of the test
@@ -124,14 +132,15 @@
 //!   toward REPORTING a site, never toward hiding one.
 //! * Rule 9 splits arguments on brackets and braces only, so a comma inside a
 //!   turbofish or a closure's parameter list splits an argument. That can only
-//!   make the last argument read as something other than `None`, which is red.
+//!   make the authority's argument read as something other than `None`, which
+//!   is red.
 //! * An alias is resolved within the file that defines it. It is red there
 //!   (rule 6), so a use of it elsewhere is never the only red.
-//! * Rule 9b reads bindings `syn` parses. A macro invoked inside an entry
-//!   point is not read for a binding of `authority`.
-//! * The operator check finds CALLS. A reference that is not a call, such as
-//!   a fn pointer kept in a table, is not a caller; `generate_handler!` and
-//!   `ipc_group!` register commands exactly that way.
+//! * Rule 9b's text scan sees a closure parameter only after `(`, `,`, `=`,
+//!   `;`, `{`, `move` or a line start, so `a || authority.is_some()` is not
+//!   read as one. It exempts exactly one assignment form,
+//!   `authority = authority.is_some()` (or `.is_none()`), a log field that
+//!   cannot rebind anything.
 //! * A green scan claims "every close this scan RECOGNISES is classified", not
 //!   "every close path is classified".
 
@@ -253,10 +262,9 @@ const AUTHORITY_PARAM_FNS: &[(&str, Option<&str>, &str)] = &[
 /// it sits in, whether it is test code, and the identifiers its return type
 /// names.
 ///
-/// For a fn NAMED like one of [`AUTHORITY_PARAM_FNS`], rule 9b also needs two
-/// facts. The first is whether its `authority` parameter is declared `mut`,
-/// `ref` or with a sub-pattern (`None` when it has no such parameter). The
-/// second is the lines in its body that bind a pattern named `authority`.
+/// For a fn NAMED like one of [`AUTHORITY_PARAM_FNS`], rules 9 and 9b also
+/// need its `authority` parameter (`None` when it has none), whether it takes a
+/// receiver, and the lines in its body that bind a pattern named `authority`.
 #[derive(Debug, Clone)]
 struct FnSpan {
     name: String,
@@ -267,8 +275,18 @@ struct FnSpan {
     in_test: bool,
     output_idents: Vec<String>,
     vis: Vis,
-    authority_param_rebindable: Option<bool>,
+    authority_param: Option<AuthorityParam>,
+    has_receiver: bool,
     authority_rebinds: Vec<usize>,
+}
+
+/// A signature's `authority` parameter: its place among the parameters after
+/// any receiver, and whether it could hold anything but the value its caller
+/// passed (declared `mut` or `ref`, or with a sub-pattern).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AuthorityParam {
+    index: usize,
+    rebindable: bool,
 }
 
 /// A fn's visibility, as far as the scan needs it.
@@ -554,19 +572,22 @@ impl<'ast> Visit<'ast> for AuthorityBinds {
     }
 }
 
-/// Whether `sig`'s `authority` parameter could be anything but the value its
-/// caller passed: declared `mut` or `ref`, or with a sub-pattern. `None` when
-/// the fn has no `authority` parameter.
-fn authority_param_is_rebindable(sig: &syn::Signature) -> Option<bool> {
-    sig.inputs.iter().find_map(|arg| match arg {
-        syn::FnArg::Typed(typed) => match &*typed.pat {
-            syn::Pat::Ident(p) if p.ident == AUTHORITY_PARAM => {
-                Some(p.mutability.is_some() || p.by_ref.is_some() || p.subpat.is_some())
-            }
+/// `sig`'s `authority` parameter, if it has one.
+fn authority_param_of(sig: &syn::Signature) -> Option<AuthorityParam> {
+    sig.inputs
+        .iter()
+        .filter_map(|arg| match arg {
+            syn::FnArg::Typed(typed) => Some(&*typed.pat),
+            syn::FnArg::Receiver(_) => None,
+        })
+        .enumerate()
+        .find_map(|(index, pat)| match pat {
+            syn::Pat::Ident(p) if p.ident == AUTHORITY_PARAM => Some(AuthorityParam {
+                index,
+                rebindable: p.mutability.is_some() || p.by_ref.is_some() || p.subpat.is_some(),
+            }),
             _ => None,
-        },
-        syn::FnArg::Receiver(_) => None,
-    })
+        })
 }
 
 #[derive(Default)]
@@ -609,12 +630,12 @@ impl StructureVisitor {
         let entry_point = AUTHORITY_PARAM_FNS
             .iter()
             .any(|&(_, _, name)| sig.ident == name);
-        let (authority_param_rebindable, authority_rebinds) = if entry_point {
+        let (authority_param, authority_rebinds) = if entry_point {
             let mut binds = AuthorityBinds::default();
             if let Some(b) = body {
                 binds.visit_block(b);
             }
-            (authority_param_is_rebindable(sig), binds.0)
+            (authority_param_of(sig), binds.0)
         } else {
             (None, Vec::new())
         };
@@ -627,7 +648,8 @@ impl StructureVisitor {
             in_test: self.test_depth > 0,
             output_idents: output.0,
             vis,
-            authority_param_rebindable,
+            authority_param,
+            has_receiver: sig.receiver().is_some(),
             authority_rebinds,
         });
     }
@@ -1339,18 +1361,64 @@ fn roster_verdict(prepared: &[Prepared], rows: &Rows) -> RosterVerdict {
 /// The `POST /ui-bridge/tauri/invoke` proxy.
 const PROXY_FILE: &str = "mcp/tauri_proxy.rs";
 
-/// `operator` rows an automation can borrow (NC5-1), each with the route. An
-/// operator fn is borrowable when it is on the `/ui-bridge/invoke/<name>`
-/// allowlist, when it is a fn of the Tauri proxy, or when ANY production Rust
-/// code calls it. The last test covers every depth at once: a proxy arm, a
-/// door, or a shared helper either of them calls. A bare name is not a call,
-/// so registering the fn in `tauri::generate_handler!` (or `ipc_group!`) is
-/// not one.
-fn borrowable_operator_rows(prepared: &[Prepared], rows: &Rows) -> Vec<String> {
+/// The macros this crate registers Tauri commands with: `tauri::generate_handler!`
+/// (in `main.rs` and in each plugin builder) and `ipc_group!` (the per-module
+/// groups `ipc_registry.rs` routes to). Naming a command inside one registers
+/// it; it does not call it.
+const REGISTRATION_MACROS: &[&str] = &["generate_handler", "ipc_group"];
+
+/// The byte ranges of every registration macro invocation in `code`, from its
+/// opening bracket to its closing one.
+fn registration_spans(code: &str) -> Vec<(usize, usize)> {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = once(
+        &RE,
+        &format!(r"\b(?:{})\s*!\s*[\[({{]", REGISTRATION_MACROS.join("|")),
+    );
+    re.find_iter(code)
+        .filter_map(|m| {
+            let open = m.end() - 1;
+            closing_bracket(code, open).map(|close| (open, close))
+        })
+        .collect()
+}
+
+/// The offset of the bracket that closes the one at `open` in `code`.
+fn closing_bracket(code: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (n, &c) in code.as_bytes().get(open..)?.iter().enumerate() {
+        match c {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(open + n);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `operator` rows an automation can borrow (NC5-1), each with the route.
+///
+/// An operator fn is borrowable when its name is on the
+/// `/ui-bridge/invoke/<name>` allowlist, when its name is in `proxied` (the
+/// `/ui-bridge/tauri/invoke` proxy's `ALLOWED_PROXIED_COMMANDS`), when it is a
+/// fn of that proxy, or when production Rust names it anywhere but its own
+/// declaration and a [`REGISTRATION_MACROS`] invocation. The last is a MENTION
+/// rule, not a call rule: a fn value handed to a proxy arm, or an entry in a
+/// name-to-handler table, names the fn without calling it and is red too.
+fn borrowable_operator_rows(prepared: &[Prepared], rows: &Rows, proxied: &[&str]) -> Vec<String> {
     assert!(
         prepared.iter().any(|p| p.file == PROXY_FILE),
         "the UI Bridge Tauri proxy ({PROXY_FILE}) is part of the scan"
     );
+    let spans: Vec<Vec<(usize, usize)>> = prepared
+        .iter()
+        .map(|p| registration_spans(&p.code_only))
+        .collect();
     let mut out = Vec::new();
     for ((file, func), _) in rows.iter().filter(|(_, r)| r.class == "operator") {
         if crate::ui_bridge_invoke::is_allowlisted(func) {
@@ -1358,24 +1426,34 @@ fn borrowable_operator_rows(prepared: &[Prepared], rows: &Rows) -> Vec<String> {
                 "{file}:{func} is on the POST /ui-bridge/invoke/<name> allowlist"
             ));
         }
+        if proxied.contains(&func.as_str()) {
+            out.push(format!(
+                "{file}:{func} is a command name of the POST /ui-bridge/tauri/invoke proxy \
+                 (ALLOWED_PROXIED_COMMANDS)"
+            ));
+        }
         if file == PROXY_FILE {
             out.push(format!(
                 "{file}:{func} is a fn of the POST /ui-bridge/tauri/invoke proxy itself"
             ));
         }
-        let call = token_re(&format!("{func}("));
-        let mut callers = BTreeSet::new();
-        for p in prepared {
-            for m in call.find_iter(&p.code_only) {
-                if !is_declaration(&p.code_only, m.start()) {
-                    callers.insert(format!("{}:{}", p.file, owner_of(p, p.line_of(m.start()))));
+        let name = Regex::new(&format!(r"\b{}\b", regex::escape(func))).expect("name regex");
+        let mut named = BTreeSet::new();
+        for (p, spans) in prepared.iter().zip(&spans) {
+            for m in name.find_iter(&p.code_only) {
+                let own_declaration = p.file == *file && is_declaration(&p.code_only, m.start());
+                let registered = spans.iter().any(|&(s, e)| m.start() > s && m.start() < e);
+                if !own_declaration && !registered {
+                    let line = p.line_of(m.start());
+                    named.insert(format!("{}:{line} ({})", p.file, owner_of(p, line)));
                 }
             }
         }
-        out.extend(callers.into_iter().map(|caller| {
+        out.extend(named.into_iter().map(|at| {
             format!(
-                "{file}:{func} has a production Rust caller, {caller} — an operator close is \
-                 reached only from the webview, over IPC"
+                "{file}:{func} is named at {at} — an operator fn may be named only in its own \
+                 declaration and in a `generate_handler!` / `ipc_group!` registration, so only \
+                 the webview's IPC reaches it"
             )
         }));
     }
@@ -1417,6 +1495,7 @@ fn close_authority_violations(prepared: &[Prepared]) -> Vec<String> {
 /// Rules 2-9b over every file, without rule 1's whole-tree shape check.
 fn file_scan(prepared: &[Prepared]) -> AuthorityScan {
     let mut scan = AuthorityScan::default();
+    let signatures = entry_signatures(prepared);
     for p in prepared {
         let names = authority_names(p);
         scan.violations.extend(impl_violations(p, &names));
@@ -1425,10 +1504,29 @@ fn file_scan(prepared: &[Prepared]) -> AuthorityScan {
         scan.violations.extend(alias_violations(p, &names));
         scan.violations.extend(literal_violations(p, &names));
         mention_violations(p, &names, &mut scan);
-        primitive_call_violations(p, &mut scan);
+        primitive_call_violations(p, &signatures, &mut scan);
         scan.violations.extend(entry_point_violations(p));
     }
     scan
+}
+
+/// Each primitive entry point's name, with its `authority` parameter's place
+/// and whether it takes a receiver, as its own signature declares them. Rule 9
+/// reads a call's authority at that place.
+fn entry_signatures(prepared: &[Prepared]) -> BTreeMap<String, (usize, bool)> {
+    prepared
+        .iter()
+        .flat_map(|p| {
+            p.structure
+                .fns
+                .iter()
+                .filter(move |f| !f.in_test && is_entry_point(&p.file, f))
+                .filter_map(|f| {
+                    f.authority_param
+                        .map(|a| (f.name.clone(), (a.index, f.has_receiver)))
+                })
+        })
+        .collect()
 }
 
 /// A regex compiled once per test process.
@@ -1616,8 +1714,14 @@ fn is_authorized(list: &[(&str, &str)], file: &str, f: Option<&FnSpan>) -> bool 
     f.is_some_and(|f| list.iter().any(|&(lf, lfn)| lf == file && lfn == f.name))
 }
 
-/// Rules 2 and 3: no trait impl for the type anywhere, and no inherent impl
-/// outside its own module.
+/// The traits a close authority may implement: each method only borrows a
+/// value that already exists, so none can build, duplicate or convert into one.
+/// Every other trait (`Clone`, `Copy`, `Default`, `From`, `Into`, `TryFrom`,
+/// `Deserialize`, …) is red.
+const CONSTRUCTION_FREE_TRAITS: &[&str] = &["Drop", "Debug", "Display"];
+
+/// Rules 2 and 3: no trait impl for the type outside
+/// [`CONSTRUCTION_FREE_TRAITS`], and no inherent impl outside its own module.
 fn impl_violations(p: &Prepared, names: &BTreeSet<String>) -> Vec<String> {
     p.structure
         .impls
@@ -1626,6 +1730,7 @@ fn impl_violations(p: &Prepared, names: &BTreeSet<String>) -> Vec<String> {
         .filter_map(|i| {
             let ty = i.self_ty.as_deref().filter(|t| names.contains(*t))?;
             match &i.trait_name {
+                Some(t) if CONSTRUCTION_FREE_TRAITS.contains(&t.as_str()) => None,
                 Some(t) => Some(format!(
                     "{}:{} impl {t} for {} — no trait may build, duplicate or convert into one",
                     p.file,
@@ -1855,16 +1960,30 @@ const PRIMITIVE_CALLS: &[&str] = &[
     "graceful_exit_driven",
 ];
 
-/// Rule 9: every call of the primitive passes `None` as its authority (its
-/// last argument). An entry point may forward its own `authority`, and an
-/// authorized minter may pass what it minted. `drive` counts under
-/// `terminal/` only, the one module that can call it (it is `pub(super)`).
-/// Naming the primitive without calling it (a fn value) or calling it with a
-/// turbofish hides the argument, so both are red too.
-fn primitive_call_violations(p: &Prepared, scan: &mut AuthorityScan) {
+/// Rule 9: every call of the primitive passes `None` as its authority. An
+/// entry point may forward its own `authority`, and an authorized minter may
+/// pass what it minted. `drive` counts under `terminal/` only, the one module
+/// that can call it (it is `pub(super)`).
+///
+/// The authority's argument is the one at the `authority` parameter's place in
+/// the entry point's own signature (`signatures`), one later for a path call
+/// of a method (`TerminalManager::graceful_exit(&tm, …)`), so a parameter
+/// appended after it changes nothing. A name with no signature in the scanned
+/// tree falls back to the last argument.
+///
+/// A fn value of the primitive hides the argument, so it is red: a path
+/// `X::graceful_exit` not followed by `(`, or a bare name in an expression. A
+/// turbofish call hides it too. A field access `.graceful_exit` (Rust has no
+/// `obj.method` fn values) and a field or binding NAMED `graceful_exit` (a
+/// `name:` declaration, a `let`) are not read.
+fn primitive_call_violations(
+    p: &Prepared,
+    signatures: &BTreeMap<String, (usize, bool)>,
+    scan: &mut AuthorityScan,
+) {
     static IN_TERMINAL: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     static ELSEWHERE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    static MOD_DECL: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static NOT_AN_EXPRESSION: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let re = if p.file.starts_with("terminal/") {
         once(
             &IN_TERMINAL,
@@ -1876,16 +1995,21 @@ fn primitive_call_violations(p: &Prepared, scan: &mut AuthorityScan) {
             &format!(r"\b(?:{})\b", PRIMITIVE_CALLS.join("|")),
         )
     };
-    let mod_decl = once(&MOD_DECL, r"\bmod\s*$");
+    // A `mod` declaration, or a `let` / `let mut` binding of the name.
+    let not_an_expression = once(&NOT_AN_EXPRESSION, r"(?:\bmod|\blet(?:\s+mut)?)\s*$");
     let code = &p.code_only;
     for m in re.find_iter(code) {
         let line = p.line_of(m.start());
         let prefix = prefix_of(p, m.start());
+        let before = prefix.trim_end();
         let name = m.as_str();
+        // `.graceful_exit(` is the commonest call; `.graceful_exit` with no call
+        // is a field access. `.drive` is never the free fn.
+        let method_or_field = before.ends_with('.');
         if is_declaration(code, m.start())
             || p.structure.in_use_span(line)
-            || mod_decl.is_match(prefix)
-            || (name == "drive" && prefix.trim_end().ends_with('.'))
+            || not_an_expression.is_match(prefix)
+            || (method_or_field && name == "drive")
         {
             continue;
         }
@@ -1913,10 +2037,12 @@ fn primitive_call_violations(p: &Prepared, scan: &mut AuthorityScan) {
             continue;
         }
         if !after.starts_with('(') {
-            if !minter {
+            // Not a call. A field access, or a field / parameter / literal field
+            // NAMED like the primitive (`graceful_exit: bool`), is no fn value.
+            let field = method_or_field || after.starts_with(':');
+            if !field && !minter {
                 scan.violations.push(refused(format!(
-                    "names `{name}` without calling it, so the authority it is handed cannot \
-                     be read"
+                    "names `{name}` as a value, so the authority it is handed cannot be read"
                 )));
             }
             continue;
@@ -1928,13 +2054,29 @@ fn primitive_call_violations(p: &Prepared, scan: &mut AuthorityScan) {
             )));
             continue;
         };
-        let last = args.last().copied().unwrap_or("");
-        if last == "None" {
+        let authority = match signatures.get(name) {
+            Some(&(index, has_receiver)) => {
+                let path_call = before.ends_with("::");
+                args.get(if has_receiver && path_call {
+                    index + 1
+                } else {
+                    index
+                })
+            }
+            None => args.last(),
+        };
+        let Some(&authority) = authority else {
+            scan.violations.push(refused(format!(
+                "calls `{name}(` with no argument at the authority's place"
+            )));
+            continue;
+        };
+        if authority == "None" {
             scan.none_calls.push(format!("{}:{owner}", p.file));
-        } else if last == AUTHORITY_PARAM && f.is_some_and(|f| is_entry_point(&p.file, f)) {
+        } else if authority == AUTHORITY_PARAM && f.is_some_and(|f| is_entry_point(&p.file, f)) {
             scan.forwarded_calls.push(format!("{}:{owner}", p.file));
         } else if !minter {
-            let shown: String = last
+            let shown: String = authority
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ")
@@ -1948,11 +2090,28 @@ fn primitive_call_violations(p: &Prepared, scan: &mut AuthorityScan) {
     }
 }
 
-/// Rule 9b: inside a primitive entry point, `authority` IS the caller's
-/// value. The parameter is not `mut`, `ref` or a sub-pattern, and nothing in
-/// the body binds the name again, so the `authority` rule 9 lets an entry point
-/// forward cannot be a value the entry point made.
+/// Rule 9b: inside a primitive entry point, `authority` IS the caller's value.
+/// The parameter is not `mut`, `ref` or a sub-pattern, and nothing in the body
+/// binds or assigns the name again, so the `authority` rule 9 lets an entry
+/// point forward cannot be a value the entry point made.
+///
+/// Bindings `syn` parses come from the tree. The body's blanked text is read
+/// as well, because `syn` does not parse a macro body (a `tokio::select!`
+/// arm): a `let authority`, an `authority =` assignment, or an `authority`
+/// closure parameter there is red too. One form is exempt,
+/// `authority = authority.is_some()` (or `.is_none()`): a log field that
+/// rebinds nothing.
 fn entry_point_violations(p: &Prepared) -> Vec<String> {
+    static REBINDING: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static LOG_FIELD: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let rebinding = once(
+        &REBINDING,
+        r"(?m)\blet\s+(?:mut\s+)?authority\b|\bauthority\s*=[^=]|(?:^|[(,=;{]|\bmove)\s*\|[^|]*\bauthority\b[^|]*\|",
+    );
+    let log_field = once(
+        &LOG_FIELD,
+        r"^authority\s*=\s*authority\s*\.\s*is_(?:some|none)\s*\(\s*\)",
+    );
     let mut out = Vec::new();
     let unchanged = "a primitive entry point forwards the authority its caller passed, unchanged";
     for f in p
@@ -1961,21 +2120,57 @@ fn entry_point_violations(p: &Prepared) -> Vec<String> {
         .iter()
         .filter(|f| !f.in_test && is_entry_point(&p.file, f))
     {
-        if f.authority_param_rebindable == Some(true) {
+        if f.authority_param.is_some_and(|a| a.rebindable) {
             out.push(format!(
                 "{}:{} declares its `authority` parameter `mut`, `ref` or with a sub-pattern — \
                  {unchanged}",
                 p.file, f.name
             ));
         }
-        for line in &f.authority_rebinds {
-            out.push(format!(
-                "{}:{line} ({}) binds `authority` again — {unchanged}",
-                p.file, f.name
-            ));
+        let mut lines: BTreeSet<usize> = f.authority_rebinds.iter().copied().collect();
+        let body = entry_body(p, f);
+        let body_text = p.code_only.get(body.clone()).unwrap_or("");
+        for m in rebinding.find_iter(body_text) {
+            let at = m.as_str().find("authority").unwrap_or(0);
+            let tail = body_text.get(m.start() + at..).unwrap_or("");
+            // Only an ASSIGNMENT match can be the log field; `let authority =
+            // authority.is_some()` is a rebinding like any other.
+            let log_field_only =
+                m.as_str().starts_with(AUTHORITY_PARAM) && log_field.is_match(tail);
+            if !log_field_only {
+                lines.insert(p.line_of(body.start + m.start() + at));
+            }
         }
+        out.extend(lines.into_iter().map(|line| {
+            format!(
+                "{}:{line} ({}) binds or assigns `authority` again — {unchanged}",
+                p.file, f.name
+            )
+        }));
     }
     out
+}
+
+/// The byte range of `f`'s body in `p.code_only`: from the first `{` on the
+/// line its body opens on, to the end of its last line.
+fn entry_body(p: &Prepared, f: &FnSpan) -> std::ops::Range<usize> {
+    let line_start = |line: usize| {
+        p.line_starts
+            .get(line.saturating_sub(1))
+            .copied()
+            .unwrap_or(p.code_only.len())
+    };
+    let open_line = line_start(f.body_start);
+    let start = p
+        .code_only
+        .get(open_line..)
+        .and_then(|rest| rest.find('{'))
+        .map_or(open_line, |n| open_line + n);
+    let end = p
+        .line_starts
+        .get(f.end)
+        .map_or(p.code_only.len(), |&next| next.saturating_sub(1));
+    start..end.max(start)
 }
 
 // ---------------------------------------------------------------------------
@@ -2028,7 +2223,11 @@ fn every_close_site_is_listed_and_no_row_is_a_ghost() {
 
 #[test]
 fn no_operator_close_is_borrowable_through_either_ui_bridge_route() {
-    let violations = borrowable_operator_rows(real_tree(), &load_rows());
+    let violations = borrowable_operator_rows(
+        real_tree(),
+        &load_rows(),
+        crate::mcp::tauri_proxy::ALLOWED_PROXIED_COMMANDS,
+    );
     assert!(
         violations.is_empty(),
         "an `operator` row claims no automation can borrow the close, and these can: \
@@ -2380,7 +2579,7 @@ fn an_allowlisted_operator_close_row_is_caught() {
         "x",
     )]);
     assert_eq!(
-        borrowable_operator_rows(&prepared, &rows),
+        borrowable_operator_rows(&prepared, &rows, &[]),
         vec![
             "commands/terminal.rs:terminal_set_title is on the POST /ui-bridge/invoke/<name> \
              allowlist"
@@ -2389,19 +2588,21 @@ fn an_allowlisted_operator_close_row_is_caught() {
     );
 }
 
-/// The per-site half of NC5-1, on the REAL tree. An `operator` row for a fn a
-/// proxy arm calls is caught (`end_remote_session`, which the
-/// `remote_session_end` arm calls). An `operator` row for the Tauri command
-/// `terminal_close` is NOT caught, although `terminal_close` is a safelisted
-/// proxy command NAME: the proxy's arm of that name calls `tm.close` and never
-/// the command, and the command's only other appearances are its registrations
-/// (`generate_handler!` in `main.rs`, `ipc_group!` in its module), which name it
-/// without calling it. A name check would be red there, which is why the check
-/// is per site.
+/// The operator check on the REAL tree, against the real proxy list.
+///
+/// * An `operator` row for `end_remote_session` is caught: the proxy's
+///   `remote_session_end` arm names it, in `dispatch`.
+/// * An `operator` row for the Tauri command `terminal_close` is caught ONLY
+///   by name, because `terminal_close` is in `ALLOWED_PROXIED_COMMANDS`. Its
+///   other appearances are its registrations, `generate_handler!` in its
+///   plugin builder and in `main.rs`, which name it without calling it. So this
+///   is also the real tree's control for the registration exemption.
+/// * The proxy's own `dispatch` can never be an operator door.
 #[test]
-fn the_proxy_check_is_per_site_not_by_name() {
+fn the_operator_check_on_the_real_proxy() {
+    let proxied = crate::mcp::tauri_proxy::ALLOWED_PROXIED_COMMANDS;
     assert!(
-        crate::mcp::tauri_proxy::ALLOWED_PROXIED_COMMANDS.contains(&"terminal_close"),
+        proxied.contains(&"terminal_close"),
         "fixture: terminal_close must stay a proxied command name for this to mean anything"
     );
     let prepared = real_tree();
@@ -2411,82 +2612,127 @@ fn the_proxy_check_is_per_site_not_by_name() {
         "operator",
         "x",
     )]);
-    let violations = borrowable_operator_rows(prepared, &caught);
+    let violations = borrowable_operator_rows(prepared, &caught, proxied);
     assert!(
-        violations.iter().any(|v| v
-            == "commands/remote_end.rs:end_remote_session has a production Rust caller, \
-                mcp/tauri_proxy.rs:dispatch — an operator close is reached only from the \
-                webview, over IPC"),
+        violations.iter().any(|v| v.starts_with(
+            "commands/remote_end.rs:end_remote_session is named at mcp/tauri_proxy.rs:"
+        ) && v.contains(" (dispatch) — ")),
         "{violations:#?}"
     );
-    let by_name_only = rows_of(&[("commands/terminal.rs", "terminal_close", "operator", "x")]);
+    let by_name = rows_of(&[("commands/terminal.rs", "terminal_close", "operator", "x")]);
     assert_eq!(
-        borrowable_operator_rows(prepared, &by_name_only),
-        Vec::<String>::new(),
-        "the proxy's terminal_close arm never calls the Tauri command of that name, and a \
-         registration is not a call"
+        borrowable_operator_rows(prepared, &by_name, proxied),
+        vec![
+            "commands/terminal.rs:terminal_close is a command name of the POST \
+             /ui-bridge/tauri/invoke proxy (ALLOWED_PROXIED_COMMANDS)"
+                .to_string()
+        ],
+        "terminal_close is caught by the proxy's name list and by nothing else: its \
+         registrations are not mentions"
     );
     let the_proxy_itself = rows_of(&[("mcp/tauri_proxy.rs", "dispatch", "operator", "x")]);
     assert!(
-        borrowable_operator_rows(prepared, &the_proxy_itself)
+        borrowable_operator_rows(prepared, &the_proxy_itself, proxied)
             .iter()
             .any(|v| v.ends_with("is a fn of the POST /ui-bridge/tauri/invoke proxy itself")),
         "the proxy's own dispatch can never be an operator door"
     );
 }
 
-/// The depth half of NC5-1 (finding 4). A check of the proxy's own arms is one
-/// hop deep. Here an arm calls a shared helper, and the helper calls the
-/// operator fn, so the operator fn has a production Rust caller and is red. The
-/// same tree with only the fn's `generate_handler!` registration left is
-/// green: naming a command there registers it, which is not a call.
+/// The synthetic operator tree: a proxy, an operator command, and its two
+/// registrations (a plugin's `generate_handler!` and an `ipc_group!`).
+fn operator_tree(proxy_body: &str, shared_body: &str) -> Vec<Prepared> {
+    let proxy = format!("pub(crate) async fn dispatch(cmd: &str, args: A) {{\n{proxy_body}}}\n");
+    let shared = format!("pub(crate) async fn shared_helper() {{\n{shared_body}}}\n");
+    synthetic(&[
+        ("mcp/tauri_proxy.rs", proxy.as_str()),
+        ("commands/shared.rs", shared.as_str()),
+        (
+            "commands/operator.rs",
+            "#[tauri::command]\npub async fn operator_close(id: &str) {\n    tm.close(id);\n}\n\
+             crate::ipc_group!(operator_close, other_command);\n",
+        ),
+        (
+            "main.rs",
+            "fn run() {\n    let _h = tauri::generate_handler![\n        \
+             commands::operator::operator_close,\n        other,\n    ];\n}\n",
+        ),
+    ])
+}
+
+fn operator_row() -> Rows {
+    rows_of(&[("commands/operator.rs", "operator_close", "operator", "x")])
+}
+
+/// The control: an operator fn named only in its own declaration and in its
+/// `generate_handler!` / `ipc_group!` registrations is not borrowable.
+#[test]
+fn an_operator_fn_named_only_in_its_registrations_is_green() {
+    let tree = operator_tree("    let _ = cmd;\n", "");
+    assert_eq!(
+        borrowable_operator_rows(&tree, &operator_row(), &["other_command"]),
+        Vec::<String>::new()
+    );
+}
+
+/// The depth half of NC5-1 (round-2 finding 4). A proxy arm calls a shared
+/// helper, and the helper calls the operator fn.
 #[test]
 fn an_operator_fn_with_any_production_caller_is_red() {
-    const PROXY: (&str, &str) = (
-        "mcp/tauri_proxy.rs",
-        "pub(crate) async fn dispatch(cmd: &str) {\n    if cmd == \"x\" {\n        \
-         crate::commands::shared::shared_helper().await;\n    }\n}\n",
+    let tree = operator_tree(
+        "    if cmd == \"x\" {\n        crate::commands::shared::shared_helper().await;\n    }\n",
+        "    crate::commands::operator::operator_close(\"t\").await;\n",
     );
-    const OPERATOR: (&str, &str) = (
-        "commands/operator.rs",
-        "#[tauri::command]\npub async fn operator_close(id: &str) {\n    tm.close(id);\n}\n",
-    );
-    const REGISTRATION: (&str, &str) = (
-        "main.rs",
-        "fn run() {\n    let _h = tauri::generate_handler![commands::operator::operator_close, other];\n}\n",
-    );
-    let rows = rows_of(&[("commands/operator.rs", "operator_close", "operator", "x")]);
-    let through_a_helper = synthetic(&[
-        PROXY,
-        (
-            "commands/shared.rs",
-            "pub(crate) async fn shared_helper() {\n    \
-             crate::commands::operator::operator_close(\"t\").await;\n}\n",
-        ),
-        OPERATOR,
-        REGISTRATION,
-    ]);
     assert_eq!(
-        borrowable_operator_rows(&through_a_helper, &rows),
+        borrowable_operator_rows(&tree, &operator_row(), &[]),
         vec![
-            "commands/operator.rs:operator_close has a production Rust caller, \
-             commands/shared.rs:shared_helper — an operator close is reached only from the \
-             webview, over IPC"
+            "commands/operator.rs:operator_close is named at commands/shared.rs:2 \
+             (shared_helper) — an operator fn may be named only in its own declaration and \
+             in a `generate_handler!` / `ipc_group!` registration, so only the webview's IPC \
+             reaches it"
                 .to_string()
         ]
     );
-    let registered_only = synthetic(&[
-        PROXY,
-        (
-            "commands/shared.rs",
-            "pub(crate) async fn shared_helper() {}\n",
-        ),
-        OPERATOR,
-        REGISTRATION,
-    ]);
+}
+
+/// Round-3 R1: a proxy arm that hands the fn over as a VALUE calls nothing,
+/// and neither does a name-to-handler table. Both name it, so both are red.
+#[test]
+fn an_operator_fn_passed_as_a_value_is_red() {
+    let tree = operator_tree(
+        "    run_command(args, crate::commands::operator::operator_close).await;\n",
+        "    static HANDLERS: &[(&str, Handler)] =\n        \
+         &[(\"close\", crate::commands::operator::operator_close)];\n",
+    );
     assert_eq!(
-        borrowable_operator_rows(&registered_only, &rows),
-        Vec::<String>::new()
+        borrowable_operator_rows(&tree, &operator_row(), &[]),
+        vec![
+            "commands/operator.rs:operator_close is named at commands/shared.rs:3 \
+             (static HANDLERS) — an operator fn may be named only in its own declaration and \
+             in a `generate_handler!` / `ipc_group!` registration, so only the webview's IPC \
+             reaches it"
+                .to_string(),
+            "commands/operator.rs:operator_close is named at mcp/tauri_proxy.rs:2 (dispatch) — \
+             an operator fn may be named only in its own declaration and in a \
+             `generate_handler!` / `ipc_group!` registration, so only the webview's IPC \
+             reaches it"
+                .to_string(),
+        ]
+    );
+}
+
+/// Round-3 R1: an operator fn's name in the proxy's command list is red, even
+/// with no Rust mention at all: the proxy would offer a command of that name.
+#[test]
+fn an_operator_fn_named_in_the_proxy_list_is_red() {
+    let tree = operator_tree("    let _ = cmd;\n", "");
+    assert_eq!(
+        borrowable_operator_rows(&tree, &operator_row(), &["setting_get", "operator_close"]),
+        vec![
+            "commands/operator.rs:operator_close is a command name of the POST \
+             /ui-bridge/tauri/invoke proxy (ALLOWED_PROXIED_COMMANDS)"
+                .to_string()
+        ]
     );
 }
 
@@ -2778,7 +3024,8 @@ fn the_authority_parameter_is_allowed_only_on_the_four_entry_points() {
             (
                 "terminal/graceful_exit.rs",
                 "use crate::terminal::close_authority::CloseAuthority;\n\
-                 pub(super) async fn drive<W>(\n    write: W,\n    authority: Option<CloseAuthority>,\n) -> O {\n    \
+                 pub(super) async fn drive<W>(\n    write: W,\n    screen: S,\n    probe: P,\n    close_tab: C,\n    \
+                 timing: T,\n    authority: Option<CloseAuthority>,\n) -> O {\n    \
                  let Some(_authority) = authority else {\n        return O::Refused;\n    };\n    todo!()\n}\n",
             ),
             (
@@ -2791,7 +3038,7 @@ fn the_authority_parameter_is_allowed_only_on_the_four_entry_points() {
             (
                 "terminal/manager.rs",
                 "impl TerminalManager {\n    pub async fn graceful_exit(\n        self: &Arc<Self>,\n        id: &str,\n        \
-                 authority: Option<crate::terminal::close_authority::CloseAuthority>,\n    ) -> R {\n        \
+                 deadline: Duration,\n        authority: Option<crate::terminal::close_authority::CloseAuthority>,\n    ) -> R {\n        \
                  Ok(s.graceful_exit_then(d, move || async move { close(id, 1) }, authority).await)\n    }\n}\n",
             ),
             (
@@ -2883,7 +3130,7 @@ fn hiding_or_relaying_the_authority_argument_is_red() {
             ],
         ),
         &[
-            "mcp/value.rs:2 (as_value) names `graceful_exit` without calling it",
+            "mcp/value.rs:2 (as_value) names `graceful_exit` as a value",
             "mcp/relay.rs:2 (relay) passes `authority` as the authority of `graceful_exit(`",
             "terminal/session.rs:3 (graceful_exit_then) calls `graceful_exit_driven` with a \
              turbofish",
@@ -2892,8 +3139,8 @@ fn hiding_or_relaying_the_authority_argument_is_red() {
 }
 
 /// Rule 9b: inside an entry point, `authority` must be the caller's value. A
-/// `mut` parameter could be reassigned and a `let` could shadow it, so both
-/// are red, while the forward that follows each still passes rule 9.
+/// `mut` parameter is red, so is the reassignment it allows, and so is a `let`
+/// that shadows it, while the forward that follows each still passes rule 9.
 #[test]
 fn an_entry_point_that_rebinds_its_authority_is_red() {
     let violations = assert_red(
@@ -2914,10 +3161,131 @@ fn an_entry_point_that_rebinds_its_authority_is_red() {
         ),
         &[
             "terminal/manager.rs:graceful_exit declares its `authority` parameter `mut`",
-            "terminal/session.rs:3 (graceful_exit_driven) binds `authority` again",
+            "terminal/manager.rs:3 (graceful_exit) binds or assigns `authority` again",
+            "terminal/session.rs:3 (graceful_exit_driven) binds or assigns `authority` again",
         ],
     );
-    assert_eq!(violations.len(), 2, "{violations:#?}");
+    assert_eq!(violations.len(), 3, "{violations:#?}");
+}
+
+/// Round-3 R3: `syn` does not parse a macro body, so a rebinding inside a
+/// `tokio::select!` arm forwards a forged value the tree never shows. Rule 9b
+/// reads the body's blanked text too. The control, the log field
+/// `authority = authority.is_some()` in a tracing macro, stays green.
+#[test]
+fn a_rebinding_inside_a_macro_is_red() {
+    let violations = assert_red(
+        &authority_tree(
+            SEALED,
+            &[
+                (
+                    "terminal/manager.rs",
+                    "impl TerminalManager {\n    pub async fn graceful_exit(&self, id: &str, d: D, authority: Option<crate::terminal::close_authority::CloseAuthority>) -> R {\n        \
+                     tokio::select! {\n            _ = tick() => {\n                \
+                     let authority = Some(unsafe { std::mem::zeroed() });\n                \
+                     session.graceful_exit_then(d, close, authority).await\n            }\n        }\n    }\n}\n",
+                ),
+                (
+                    "terminal/session.rs",
+                    "impl TerminalSession {\n    async fn graceful_exit_driven(&self, t: T, p: P, c: C, authority: Option<crate::terminal::close_authority::CloseAuthority>) -> O {\n        \
+                     info!(terminal_id = %self.id, authority = authority.is_some(), \"starting\");\n        \
+                     drive(w, s, p, c, t, authority).await\n    }\n}\n",
+                ),
+            ],
+        ),
+        &["terminal/manager.rs:5 (graceful_exit) binds or assigns `authority` again"],
+    );
+    assert_eq!(violations.len(), 1, "{violations:#?}");
+}
+
+/// Round-3 R4(a): rule 2 refuses a trait that can build or duplicate an
+/// authority, and only that. `Drop` (like `Debug` and `Display`) only
+/// borrows a value that exists, so `impl Drop` is green and `impl Default` is
+/// red.
+#[test]
+fn a_drop_impl_is_green_and_a_default_impl_is_red() {
+    let drop =
+        format!("{SEALED}impl Drop for CloseAuthority {{\n    fn drop(&mut self) {{}}\n}}\n");
+    assert_eq!(
+        close_authority_violations(&authority_tree(&drop, &[])),
+        Vec::<String>::new()
+    );
+    let default = format!(
+        "{SEALED}impl Default for CloseAuthority {{\n    fn default() -> Self {{\n        todo!()\n    }}\n}}\n"
+    );
+    assert_red(
+        &authority_tree(&default, &[]),
+        &["terminal/close_authority.rs:11 impl Default for CloseAuthority"],
+    );
+}
+
+/// Round-3 R4(b): rule 9 reads the authority at the `authority` parameter's
+/// place in the entry point's own signature. With a parameter appended after
+/// it (R0b-1's `door`), a call passing `None` there stays green, a path call
+/// counts its receiver, and a forged value there is still red.
+#[test]
+fn the_authority_is_read_at_its_place_in_the_signature() {
+    let tree = authority_tree(
+        SEALED,
+        &[
+            (
+                "terminal/manager.rs",
+                "impl TerminalManager {\n    pub async fn graceful_exit(\n        &self,\n        id: &str,\n        \
+                 authority: Option<crate::terminal::close_authority::CloseAuthority>,\n        door: Door,\n    ) -> R {\n        \
+                 todo!()\n    }\n}\n",
+            ),
+            (
+                "mcp/door.rs",
+                "pub(crate) async fn by_method(tm: &T) {\n    let _ = tm.graceful_exit(id, None, Door::Agent).await;\n}\n\
+                 pub(crate) async fn by_path(tm: &T) {\n    let _ = TerminalManager::graceful_exit(tm, id, None, Door::Agent).await;\n}\n\
+                 pub(crate) async fn forged(tm: &T) {\n    let _ = tm.graceful_exit(id, Some(forge()), Door::Agent).await;\n}\n",
+            ),
+        ],
+    );
+    let scan = close_authority_scan(&tree);
+    assert_eq!(
+        scan.none_calls,
+        vec!["mcp/door.rs:by_method", "mcp/door.rs:by_path"]
+    );
+    assert_eq!(
+        scan.violations.len(),
+        1,
+        "only the forged call is red: {:#?}",
+        scan.violations
+    );
+    assert!(scan.violations[0].starts_with(
+        "mcp/door.rs:8 (forged) passes `Some(forge())` as the authority of `graceful_exit(`"
+    ));
+}
+
+/// Round-3 R4(c): only what can be a fn value is read as one. A path
+/// `TerminalManager::graceful_exit` handed to `map` is red. A struct field
+/// named `graceful_exit`, its access `s.graceful_exit`, and a literal setting
+/// it are not fn values, so they are green.
+#[test]
+fn a_path_fn_value_is_red_and_a_field_of_that_name_is_green() {
+    assert_red(
+        &authority_tree(
+            SEALED,
+            &[(
+                "mcp/value.rs",
+                "pub(crate) fn all(v: Vec<T>) {\n    let _ = v.into_iter().map(TerminalManager::graceful_exit);\n}\n",
+            )],
+        ),
+        &["mcp/value.rs:2 (all) names `graceful_exit` as a value"],
+    );
+    assert_eq!(
+        close_authority_violations(&authority_tree(
+            SEALED,
+            &[(
+                "mcp/flags.rs",
+                "pub struct Flags {\n    pub graceful_exit: bool,\n}\n\
+                 pub(crate) fn read(s: &Flags) -> bool {\n    s.graceful_exit\n}\n\
+                 pub(crate) fn make() -> Flags {\n    Flags { graceful_exit: true }\n}\n",
+            )],
+        )),
+        Vec::<String>::new()
+    );
 }
 
 /// Rules 8 and 9 read code, not text. The type named in a string, a log
