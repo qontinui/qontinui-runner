@@ -22,7 +22,7 @@
 #
 # Plus one section that reads the REAL tree rather than a fixture: the premise
 # guard for the library's markdown exclusion, which must fail the day markdown
-# can reach schemas.json.
+# can reach schemas.json, and the same for its fleet_skills .sh/.py exclusion.
 
 set -uo pipefail
 
@@ -814,6 +814,170 @@ decide
 check "with the premise intact, the exclusion applies and no reason is set" \
     "pre-existing|" "$ATTRIBUTION_STATE|$ATTRIBUTION_EXCLUDES_DROPPED_REASON"
 
+echo "  -- embedded fleet_skills .sh/.py files are not inputs, under their own guard --"
+
+BUNDLE_SH="src-tauri/src/fleet_skills/return-to-main/land-evidence.sh"
+BUNDLE_PY="src-tauri/src/fleet_skills/return-to-main/lib/plan_stamp.py"
+bundle_reason_is() {
+    case "$ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON" in $1) echo yes ;; *) echo no ;; esac
+}
+
+# The shape runner#2314 was blamed for: one script, one module, nothing else.
+fixture
+commit_change "$BUNDLE_SH" "#!/bin/sh"
+commit_change "$BUNDLE_PY" "print()"
+decide
+check "a committed fleet_skills .sh and .py are PRE-EXISTING, with no reason set" \
+    "pre-existing||" "$ATTRIBUTION_STATE|$ATTRIBUTION_EXCLUDES_DROPPED_REASON|$ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON"
+
+# The other three sources a push or a commit carries.
+fixture
+mkdir -p "$WORK/$(dirname "$BUNDLE_PY")"
+printf 'print()\n' > "$WORK/$BUNDLE_PY"
+decide
+check "an untracked fleet_skills .py is PRE-EXISTING" "pre-existing" "$ATTRIBUTION_STATE"
+git -C "$WORK" add -A >/dev/null
+decide
+check "a staged fleet_skills .py is PRE-EXISTING" "pre-existing" "$ATTRIBUTION_STATE"
+printf 'print(1)\n' > "$WORK/$BUNDLE_PY"
+git -C "$WORK" -c core.hooksPath=/dev/null commit --quiet -m seed
+decide
+state_after_commit="$ATTRIBUTION_STATE"
+printf 'print(2)\n' > "$WORK/$BUNDLE_PY"
+decide
+check "an unstaged edit to a fleet_skills .py is PRE-EXISTING" "pre-existing|pre-existing" \
+    "$state_after_commit|$ATTRIBUTION_STATE"
+
+# The narrowing stops at that tree and those extensions.
+for STILL_MINE in \
+    "src-tauri/src/fleet_skills/gen.rs" \
+    "src-tauri/src/fleet_skills/data.json" \
+    "src-tauri/src/fleet_commands/x.sh" \
+    "src-tauri/src/fleet_agents/x.py" \
+    "src-tauri/src/helper.py" \
+    "src-tauri/scripts/generate_types.sh"; do
+    fixture
+    commit_change "$STILL_MINE" "x"
+    decide
+    check "$STILL_MINE is still an input, so it is MINE" "mine" "$ATTRIBUTION_STATE"
+done
+
+# A real input beside a bundle file: the bundle file is not what is listed.
+fixture
+commit_change "$BUNDLE_PY" "print()"
+commit_change "src-tauri/src/lib.rs" "// changed"
+decide
+check "beside a real input, only the input is blamed" "mine|src-tauri/src/lib.rs" \
+    "$ATTRIBUTION_STATE|$ATTRIBUTION_TOUCHED"
+
+# Compiled as Rust, in every spelling the guard reads: the exclusion must drop.
+for AS_RUST in \
+    'include!("fleet_skills/x.py");' \
+    'include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fleet_skills/x"));' \
+    '#[path = "fleet_skills/x.sh"] mod body;' \
+    '#[cfg_attr(unix, path = "gen/x.py")] mod body;'; do
+    fixture
+    seed_base "src-tauri/src/schema.rs" "$AS_RUST"
+    commit_change "$BUNDLE_PY" "#[derive(JsonSchema)] struct S;"
+    decide
+    check "with a bundle file compiled as Rust ($AS_RUST), it is MINE and says why" \
+        "mine|yes|" "$ATTRIBUTION_STATE|$(bundle_reason_is "fleet_skills .sh/.py may reach schemas.json ("*)|$ATTRIBUTION_EXCLUDES_DROPPED_REASON"
+done
+
+# A build script that names the tree, filters a walk on the extension, or names
+# a .py path, under every directory input the guard's reach is derived from.
+for BUILD_DIR in "src-tauri" "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}"; do
+    case "$BUILD_DIR" in src-tauri) ;; */) BUILD_DIR="${BUILD_DIR%/}" ;; *) continue ;; esac
+    fixture
+    seed_base "$BUILD_DIR/build.rs" 'fn main() { println!("cargo:rerun-if-changed=src/fleet_skills"); }'
+    commit_change "$BUNDLE_SH" "#!/bin/sh"
+    decide
+    check "a $BUILD_DIR build script naming fleet_skills makes its .sh MINE and says why" "mine|yes" \
+        "$ATTRIBUTION_STATE|$(bundle_reason_is *"a build script naming fleet_skills"*)"
+done
+for BUILD_BODY in \
+    'fn main() { if p.extension() == Some("py".as_ref()) {} }' \
+    'fn main() { if p.extension() == Some("sh".as_ref()) {} }' \
+    'fn main() { read(format!("fleet_{}/gen.py", "skills")); }'; do
+    fixture
+    seed_base "src-tauri/build.rs" "$BUILD_BODY"
+    commit_change "$BUNDLE_PY" "print()"
+    decide
+    check "a build script reaching the tree another way ($BUILD_BODY) makes its .py MINE" "mine|yes" \
+        "$ATTRIBUTION_STATE|$(bundle_reason_is *"a build script naming"*)"
+done
+# build.rs really does embed one unrelated script; that must stay quiet.
+fixture
+seed_base "src-tauri/build.rs" 'const S: &str = include_str!("../scripts/dev-tokio-console.sh");'
+commit_change "$BUNDLE_SH" "#!/bin/sh"
+decide
+check "a build script embedding an unrelated .sh leaves the exclusion in force" "pre-existing|" \
+    "$ATTRIBUTION_STATE|$ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON"
+
+# A hand-written schema over the embedded tree embeds nothing itself.
+fixture
+seed_base "src-tauri/src/schema.rs" 'impl JsonSchema for SkillName { fn s() { enum_of(crate::fleet_skills::embedded_skills()) } }'
+commit_change "$BUNDLE_SH" "#!/bin/sh"
+decide
+check "fleet_skills named beside JsonSchema makes its .sh MINE and says why" "mine|yes" \
+    "$ATTRIBUTION_STATE|$(bundle_reason_is *"fleet_skills named in a file that mentions JsonSchema"*)"
+
+# The markdown premise's embed arms are this exclusion's too.
+fixture
+seed_base "src-tauri/src/schema.rs" '#[derive(JsonSchema)] struct S; const B: &str = include_str!("fleet_skills/x.py");'
+commit_change "$BUNDLE_PY" "print()"
+decide
+check "an embed beside JsonSchema drops this exclusion as well, so the .py is MINE" "mine|yes" \
+    "$ATTRIBUTION_STATE|$(bundle_reason_is "its embed arms are the markdown premise's:"*)"
+
+# The hook's own verdict lines say which way this exclusion went.
+check "gen-events-drift.sh states both arms of this exclusion in its pre-existing verdict" "yes|yes" \
+    "$(grep -qF 'files aside, under their own premise guard' "$SCRIPT_DIR/gen-events-drift.sh" && echo yes || echo no)|$(grep -qF 'fleet_skills .sh/.py included this time: $ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON' "$SCRIPT_DIR/gen-events-drift.sh" && echo yes || echo no)"
+
+# The renderer names the reason only to a pusher blamed for such a file.
+render_stub_blamed() {
+    ATTRIBUTION_BASE_REF="origin/main"
+    ATTRIBUTION_BASE_SHA="0123456789abcdef"
+    ATTRIBUTION_EXCLUDES_DROPPED_REASON=""
+    ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON="fleet_skills .sh/.py may reach schemas.json (x)"
+    ATTRIBUTION_TOUCHED="$1"
+    ATTRIBUTION_TOUCHED_DETAIL="$(printf '%s\tcommitted' "$1")"
+    gen_events_render_mine
+}
+BUNDLE_LINE='fleet_skills .sh/.py files were counted as codegen inputs this time'
+# Captured rather than piped: `grep -q` closing a pipe under pipefail reads as a
+# miss, and the renderer prints more after this line.
+rendered_names_bundle() {
+    local rendered
+    rendered="$(render_stub_blamed "$1")"
+    case "$rendered" in *"$BUNDLE_LINE"*) echo yes ;; *) echo no ;; esac
+}
+check "a dropped bundle exclusion is stated when a bundle .py is blamed" yes "$(rendered_names_bundle "$BUNDLE_PY")"
+check "  and not when no bundle file is blamed" no "$(rendered_names_bundle "src-tauri/src/lib.rs")"
+ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON=""
+
+# The real tree: the guard holds, and it is looking at what it reasons about.
+if [ "$REPO_TOP" = "$REPO_ROOT" ]; then
+    VIOLATIONS="$(gen_events_bundle_premise_violations "$REPO_ROOT")" && PREMISE_RC=0 || PREMISE_RC=$?
+    if [ "$PREMISE_RC" -eq 0 ] && [ -z "$VIOLATIONS" ]; then
+        pass_note "no fleet_skills .sh/.py in the real tree can reach schemas.json"
+    else
+        fail_note "fleet_skills .sh/.py may now reach schemas.json (premise exit $PREMISE_RC):"
+        printf '%s\n' "$VIOLATIONS" | sed 's/^/         /'
+    fi
+    BUNDLE_FILES="$(git -C "$REPO_ROOT" ls-files -- 'src-tauri/src/fleet_skills/*.sh' 'src-tauri/src/fleet_skills/*.py' | grep -c . || true)"
+    if [ "${BUNDLE_FILES:-0}" -gt 0 ]; then
+        pass_note "  and the exclusion names the $BUNDLE_FILES files actually there"
+    else
+        fail_note "  no .sh/.py under src-tauri/src/fleet_skills at all — the exclusion names nothing"
+    fi
+    if git -C "$REPO_ROOT" grep -q -F 'include_dir!("$CARGO_MANIFEST_DIR/src/fleet_skills")' -- src-tauri/src/fleet_skills.rs; then
+        pass_note "  and fleet_skills.rs still embeds that tree through include_dir!"
+    else
+        fail_note "  fleet_skills.rs no longer embeds the tree through include_dir! — re-derive this exclusion's premise"
+    fi
+fi
+
 echo "  -- a git failure is UNAVAILABLE, never a cleared pusher --"
 
 # A `git` on PATH that fails any invocation whose argument string matches a
@@ -890,6 +1054,15 @@ check "a failing comm drops the exclusion, so the .md is MINE" \
 check "  and the reason names the failed intersection" yes \
     "$(grep -qF 'intersecting the premise lists failed' "$WORK/.state" && echo yes || echo no)"
 
+# A failed probe is a violation here as it is there. Only this guard's own list
+# grep fails, so the markdown premise holds and cannot be what dropped it.
+fixture
+commit_change "src-tauri/src/fleet_skills/return-to-main/land-evidence.sh" "#!/bin/sh"
+SHIM="$(git_shim_failing bundle-grep '*" grep "*"fleet_skills|"*')"
+( PATH="$SHIM:$PATH"; decide; printf '%s|%s|%s\n' "$ATTRIBUTION_STATE" "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" "$ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON" > "$WORK/.state" )
+check "a failing bundle probe drops only this exclusion, so the .sh is MINE" "mine||yes" \
+    "$(cut -d'|' -f1-2 < "$WORK/.state")|$(grep -qF 'the fleet_skills premise probe failed (ERROR' "$WORK/.state" && echo yes || echo no)"
+
 echo "  -- the hook runs under set -e: the MINE path must survive it --"
 
 # The hook is `set -euo pipefail`. A non-zero status leaking out of the
@@ -934,7 +1107,9 @@ render_with() {
     ATTRIBUTION_TOUCHED_DETAIL="$1"
     render_now
 }
-has() { printf '%s\n' "$RENDERED" | grep -qF -- "$1" && echo yes || echo no; }
+# Not `printf | grep -q`: bash flushes stdout per line, so on a match grep closes
+# the pipe mid-write and pipefail reports the SIGPIPE as a miss.
+has() { case "$RENDERED" in *"$1"*) echo yes ;; *) echo no ;; esac; }
 
 LOCAL_NOTE="Inputs marked 'not part of this push' are local working-tree state"
 LOCAL_REMEDY="set them aside so the working tree"

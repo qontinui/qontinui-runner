@@ -124,6 +124,33 @@
 # every push. That last is deliberately not carved out: a crate doc cannot
 # reach a schema today, but a carve-out is a narrowing, and the header's rule
 # for those is evidence plus a guard, not convenience.
+#
+# A SECOND NARROWING, AND ITS GUARD
+#
+# `.sh` and `.py` under src-tauri/src/fleet_skills/ are excluded too
+# (GEN_EVENTS_ATTRIBUTION_BUNDLE_EXCLUDES below), for the same reason as
+# markdown and on the same kind of evidence: qontinui-runner #2314 pushed one
+# script and one Python module under that tree and was blamed for a 13-file,
+# 933-deletion diff, while a control on a clean origin/main checkout against
+# the same schemas baseline printed the identical diff and PRE-EXISTING DRIFT.
+# Those files reach the binary only through fleet_skills.rs's `include_dir!`,
+# as bytes the provisioner writes to disk. Only that tree and only those two
+# extensions: a `.rs` file there is still an input, and fleet_commands/ and
+# fleet_agents/ hold nothing but markdown, so no evidence covers them.
+#
+# `gen_events_bundle_premise_violations` is its guard, and it only runs once
+# the markdown premise holds, because the markdown arms that read embeds beside
+# JsonSchema and schemars do not care about the extension and are this
+# exclusion's arms as well. What it adds is the two ways these files could
+# matter without being embedded as data: compiled as Rust (`include!`, a `path`
+# attribute), named by a build script, or named in a file that mentions
+# JsonSchema (a hand-written `impl JsonSchema` over the embedded tree). Its reason
+# is kept apart, in ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON, so a pusher blamed
+# for a `.py` hears about that exclusion; when the markdown premise is what
+# dropped it, the reason quotes that premise. It shares the blind spots listed
+# above: a name assembled without a `fleet_skills`, `.py"` or `"sh"`/`"py"`
+# literal, and a runtime read by the exporter itself. A build script's `.sh"` is
+# deliberately not read, because build.rs embeds scripts/dev-tokio-console.sh.
 
 # Every path whose content can change the exported JSON Schemas. Wider than
 # `files:` in .pre-commit-config.yaml on purpose (see above): a schemars type
@@ -281,6 +308,13 @@ GEN_EVENTS_ATTRIBUTION_PATHS=(
 # guard of its own.
 GEN_EVENTS_ATTRIBUTION_EXCLUDES=(
     ':(exclude)*.md'
+)
+
+# Applied only while gen_events_bundle_premise_violations holds, separately from
+# the markdown entry above. See "A SECOND NARROWING" in the header.
+GEN_EVENTS_ATTRIBUTION_BUNDLE_EXCLUDES=(
+    ':(exclude)src-tauri/src/fleet_skills/*.sh'
+    ':(exclude)src-tauri/src/fleet_skills/*.py'
 )
 
 # Where the premise guard looks, DERIVED from GEN_EVENTS_ATTRIBUTION_PATHS
@@ -509,6 +543,10 @@ _gen_events_premise_arm() {
     return 0
 }
 
+# What compiles a file AS RUST, whatever its extension: `include!` with any
+# delimiter, a `path` attribute, and its rustfmt-wrapped form.
+GEN_EVENTS_AS_RUST_RE='(^|[^_[:alnum:]])include![[:space:]]*[({[]|#!?\[[[:space:]]*(cfg_attr\(.*[(,][[:space:]]*)?path[[:space:]]*=|^[[:space:]]*path[[:space:]]*=[[:space:]]*"'
+
 # Could markdown in the repo at $1 reach `schemas.json`? Prints one line per
 # way it could. Exit 0: premise holds. Exit 1: violated. Exit 2: the probe
 # itself failed or could not be verified (its ERROR lines are printed too) —
@@ -531,7 +569,7 @@ gen_events_markdown_premise_violations() {
     # any `, path =`: tracing's `debug!(path = %p, ..)` and format!'s named
     # `path=` sit beside `.md"` literals in four real files, and would drop
     # the exclusion on every decision.
-    as_rust="$(gen_events_premise_grep "$dir" -l -E '(^|[^_[:alnum:]])include![[:space:]]*[({[]|#!?\[[[:space:]]*(cfg_attr\(.*[(,][[:space:]]*)?path[[:space:]]*=|^[[:space:]]*path[[:space:]]*=[[:space:]]*"' | LC_ALL=C sort)" || probe_failed=1
+    as_rust="$(gen_events_premise_grep "$dir" -l -E "$GEN_EVENTS_AS_RUST_RE" | LC_ALL=C sort)" || probe_failed=1
     inc_any="$(printf '%s\n' "$inc_text" "$inc_dir" | LC_ALL=C sort -u)" || probe_failed=1
 
     # A failed probe prints its ERROR line into whichever list it fed, and
@@ -620,6 +658,47 @@ gen_events_markdown_premise_violations() {
     return 0
 }
 
+# Could a `.sh` or `.py` under src-tauri/src/fleet_skills/ reach `schemas.json`
+# by a route the markdown premise does not read? Same contract as
+# gen_events_markdown_premise_violations: one line per way, exit 0 holds, 1
+# violated, 2 the probe failed.
+gen_events_bundle_premise_violations() {
+    local dir="$1" probe_failed=0 found=0 as_rust names schema tree_names line arm_rc
+    as_rust="$(gen_events_premise_grep "$dir" -l -E "$GEN_EVENTS_AS_RUST_RE" | LC_ALL=C sort)" || probe_failed=1
+    names="$(gen_events_premise_grep "$dir" -l -E 'fleet_skills|\.(sh|py)"' | LC_ALL=C sort)" || probe_failed=1
+    schema="$(gen_events_premise_grep "$dir" -l -F 'JsonSchema' | LC_ALL=C sort)" || probe_failed=1
+    tree_names="$(gen_events_premise_grep "$dir" -l -F 'fleet_skills' | LC_ALL=C sort)" || probe_failed=1
+    # As in the markdown premise, a failed probe's ERROR line lands in the list
+    # and `sort` returns 0 over it, so the lists are scanned.
+    if printf '%s\n' "$as_rust" "$names" "$schema" "$tree_names" | grep -q '^ERROR'; then
+        printf '%s\n' "$as_rust" "$names" "$schema" "$tree_names" | grep '^ERROR'
+        probe_failed=1
+    fi
+    _gen_events_premise_arm "include!/path attribute in a file that names fleet_skills or a .sh/.py path" \
+        "$as_rust" "$names" && arm_rc=0 || arm_rc=$?
+    case "$arm_rc" in 1) found=1 ;; 2) probe_failed=1 ;; esac
+    _gen_events_premise_arm "fleet_skills named in a file that mentions JsonSchema" \
+        "$tree_names" "$schema" && arm_rc=0 || arm_rc=$?
+    case "$arm_rc" in 1) found=1 ;; 2) probe_failed=1 ;; esac
+    # Not any `.sh"`: build.rs embeds scripts/dev-tokio-console.sh, which has
+    # nothing to do with this tree. `"sh"`/`"py"` is an extension filter over a
+    # walk, which names neither the tree nor a file.
+    local build_rc=0
+    line="$(_gen_events_grep_in "$dir" "${#GEN_EVENTS_PREMISE_BUILD_SCRIPTS[@]}" \
+        "${GEN_EVENTS_PREMISE_BUILD_SCRIPTS[@]}" -n -E 'fleet_skills|"(sh|py)"|\.py"')" || build_rc=$?
+    if [ "$build_rc" -ne 0 ]; then
+        printf '%s\n' "$line"
+        probe_failed=1
+    elif [ -n "$line" ]; then
+        printf '%s\n' "$line" | sed 's/$/  (a build script naming fleet_skills or a .py path)/'
+        found=1
+    fi
+
+    [ "$probe_failed" = "1" ] && return 2
+    [ "$found" = "1" ] && return 1
+    return 0
+}
+
 # Read NUL-delimited records from stdin into the global array _GEA_RECS. The
 # producer appends its own exit status as one final `rc=N` record, because a
 # process substitution's status is otherwise lost; anything but `rc=0` last —
@@ -653,6 +732,9 @@ _gen_events_read_z() {
 #   ATTRIBUTION_EXCLUDES_DROPPED_REASON  "" when the markdown exclusion
 #                       applied; otherwise why this decision ran on the full,
 #                       unexcluded list (premise violated, or its probe failed)
+#   ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON  the same for the fleet_skills
+#                       .sh/.py exclusion, which also drops whenever the
+#                       markdown one does
 #   ATTRIBUTION_UNAVAILABLE_REASON  set only for `unavailable` — including a
 #                       git call that failed, which must never read as "touched
 #                       nothing" and clear the pusher
@@ -669,6 +751,7 @@ gen_events_attribution() {
     ATTRIBUTION_TOUCHED=""
     ATTRIBUTION_TOUCHED_DETAIL=""
     ATTRIBUTION_EXCLUDES_DROPPED_REASON=""
+    ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON=""
     ATTRIBUTION_UNAVAILABLE_REASON=""
 
     if ! git -C "$repo" rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
@@ -700,6 +783,15 @@ gen_events_attribution() {
     local pathspec=("${GEN_EVENTS_ATTRIBUTION_PATHS[@]%/}")
     if [ "$premise_rc" -eq 0 ]; then
         pathspec+=("${GEN_EVENTS_ATTRIBUTION_EXCLUDES[@]}")
+        local bundle_premise bundle_rc
+        bundle_premise="$(gen_events_bundle_premise_violations "$repo")" && bundle_rc=0 || bundle_rc=$?
+        if [ "$bundle_rc" -eq 0 ]; then
+            pathspec+=("${GEN_EVENTS_ATTRIBUTION_BUNDLE_EXCLUDES[@]}")
+        elif [ "$bundle_rc" -eq 1 ]; then
+            ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON="fleet_skills .sh/.py may reach schemas.json (${bundle_premise%%$'\n'*})"
+        else
+            ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON="the fleet_skills premise probe failed ($(printf '%s\n' "$bundle_premise" | sed -n '/^ERROR/{p;q;}'))"
+        fi
     elif [ "$premise_rc" -eq 1 ]; then
         ATTRIBUTION_EXCLUDES_DROPPED_REASON="markdown may reach schemas.json (${premise%%$'\n'*})"
     else
@@ -708,6 +800,9 @@ gen_events_attribution() {
         local first_error
         first_error="$(printf '%s\n' "$premise" | sed -n '/^ERROR/{p;q;}')"
         ATTRIBUTION_EXCLUDES_DROPPED_REASON="the markdown premise probe failed (${first_error:-no ERROR line})"
+    fi
+    if [ -n "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" ]; then
+        ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON="its embed arms are the markdown premise's: $ATTRIBUTION_EXCLUDES_DROPPED_REASON"
     fi
 
     # Each call's status is checked, not swallowed: an empty list from a git
@@ -910,8 +1005,12 @@ gen_events_render_mine() {
     # dropped exclusion changed nothing this pusher sees, and the line would
     # be noise. A `%q`-escaped name ends in `'`, hence the optional quote.
     if [ -n "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" ] \
-       && printf '%s\n' "$ATTRIBUTION_TOUCHED" | grep -qE "\.md'?\$"; then
+       && grep -qE "\.md'?\$" <<< "$ATTRIBUTION_TOUCHED"; then
         echo "Markdown was counted as a codegen input this time: $ATTRIBUTION_EXCLUDES_DROPPED_REASON."
+    fi
+    if [ -n "${ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON:-}" ] \
+       && grep -qE "src-tauri/src/fleet_skills/.*\.(sh|py)'?\$" <<< "$ATTRIBUTION_TOUCHED"; then
+        echo "fleet_skills .sh/.py files were counted as codegen inputs this time: $ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON."
     fi
     # Working tree outside the change being made. At pre-push that is staged,
     # unstaged and untracked input; at pre-commit, unstaged and untracked.
