@@ -163,6 +163,88 @@ env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
+  # Where the two heavy Windows jobs run (plan
+  # 2026-10-27-coord-routes-ci-jobs-by-runner-capability, Phase 7). coord's
+  # anonymous `GET /coord/ci/route` compares each job's measured requirement
+  # with every runner class it may run on and answers one of four lanes:
+  # `hosted` (it fits on windows-latest), `self_hosted` (it does not, and a
+  # self-hosted Windows host registered here does -- never for a fork
+  # pull_request), `fail_fast` (it fits nowhere: the job fails in seconds with
+  # a `ci-capacity` message instead of OOMing 40 minutes in), or `static`
+  # (anything coord does not know). The script is a vendored copy of
+  # qontinui-coord's `.github/scripts/route_ci_job.py`; its header is the
+  # contract.
+  #
+  # THIS JOB MUST NOT FAIL. A failed `needs:` job SKIPS its dependant, and a
+  # skipped required check reads as a pass. So the script always exits 0 with
+  # outputs written, and each dependant additionally runs on `!cancelled()`
+  # with its static default for an empty output.
+  #
+  # A route job on a hosted runner is refused by the spending cap, and its
+  # dependant then gets an EMPTY output -- so it must run where the dependants'
+  # static default runs. That default is `windows-latest`, a standard hosted
+  # runner, which is free on this PUBLIC repo; so this job runs on the cheapest
+  # standard hosted runner. Move it with the dependants' default, never apart.
+  #
+  # Known deviation (route review M4): ci_hosted_guard cancels a hosted job
+  # when the tenant's hosted CI is OFF, and this job is hosted. With hosted
+  # off the dependants' hosted static default is cancelled too, so nothing is
+  # lost -- but coord's `self_hosted` answer is then unreachable here. It is
+  # reachable only from a route job on a self-hosted pool the repo's workflow
+  # names, and this workflow names none (no roster read here establishes one):
+  # a self-hosted route job with no runner would queue and hold every
+  # required check behind it. Coord's NOT_SERVED says the same.
+  #
+  # The ubuntu leg of `test` also waits on this job (one `needs:` for the
+  # matrix): a few seconds, accepted (review N5).
+  #
+  # ROUTE_HOSTED_PAGEFILE_MB is what each job's own `Configure pagefile` step
+  # sets (32 GB) -- coord forms the hosted class's commit limit from it.
+  #
+  # Composes with plan 2026-09-29-ci-lanes-routing-and-merge-train-speed: Lane
+  # B (ci_node) is authoritative for no job today, so this answers every event;
+  # where Lane B comes to own `test (windows-latest)` on candidate refs, that
+  # plan skips the GitHub twin there and this answer is simply not read.
+  route:
+    name: Route heavy jobs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      test_windows_runs_on: ${{ steps.test_windows.outputs.test_windows_runs_on }}
+      test_windows_lane: ${{ steps.test_windows.outputs.test_windows_lane }}
+      test_windows_reason: ${{ steps.test_windows.outputs.test_windows_reason }}
+      clippy_windows_runs_on: ${{ steps.clippy_windows.outputs.clippy_windows_runs_on }}
+      clippy_windows_lane: ${{ steps.clippy_windows.outputs.clippy_windows_lane }}
+      clippy_windows_reason: ${{ steps.clippy_windows.outputs.clippy_windows_reason }}
+    steps:
+      # Only the script (cone mode: the root files plus .github/scripts): a
+      # full checkout would be most of this job's cost.
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Route test (windows-latest)
+        id: test_windows
+        continue-on-error: true
+        shell: bash
+        env:
+          ROUTE_JOB: test (windows-latest)
+          ROUTE_DEFAULT: windows-latest
+          ROUTE_HOSTED_PAGEFILE_MB: "32768"
+          ROUTE_OUTPUT_PREFIX: test_windows_
+        run: python3 -B .github/scripts/route_ci_job.py || true
+
+      - name: Route Clippy (windows)
+        id: clippy_windows
+        continue-on-error: true
+        shell: bash
+        env:
+          ROUTE_JOB: Clippy (windows)
+          ROUTE_DEFAULT: windows-latest
+          ROUTE_HOSTED_PAGEFILE_MB: "32768"
+          ROUTE_OUTPUT_PREFIX: clippy_windows_
+        run: python3 -B .github/scripts/route_ci_job.py || true
+
   test:
     strategy:
       # Surface platform-specific failures independently. Default fail-fast
@@ -177,7 +259,13 @@ jobs:
         # when cross-platform demos / mac users matter.
         platform: [ubuntu-22.04, windows-latest]
 
-    runs-on: ${{ matrix.platform }}
+    # The windows leg runs where the `route` job says (its header above); the
+    # ubuntu leg is not routed. An empty route output (the route job did not
+    # run) falls back to the static `windows-latest`. `!cancelled()` so a
+    # failed route job cannot SKIP this required check.
+    needs: route
+    if: ${{ !cancelled() }}
+    runs-on: ${{ matrix.platform == 'windows-latest' && fromJSON(needs.route.outputs.test_windows_runs_on || '"windows-latest"') || matrix.platform }}
 
     # Backstop cap for any step in this job that is not individually bounded.
     # This job previously had NO job-level timeout, so the 4h24m apt hang above
@@ -223,6 +311,25 @@ jobs:
     timeout-minutes: 180
 
     steps:
+      # coord's `fail_fast` lane: the windows leg's requirement is Incapable
+      # on every runner class it may run on, so it fails here in seconds with
+      # the shortfall named rather than OOMing 40 minutes into the build. The
+      # reason travels through env, never interpolated into the script. The
+      # annotation title is coord's `CI_CAPACITY_ANNOTATION_MARKER` verbatim
+      # (pr_merge/author_feedback.rs). coord write-skips a main run whose every
+      # non-passing job carries it (or was build-killed, runner-lost or
+      # cancelled), once its
+      # own trace shows it answered fail_fast for that check; any other red,
+      # or an unread annotation, keeps main red. Both sides pin the title.
+      - name: CI capacity (route said fail_fast)
+        if: matrix.platform == 'windows-latest' && needs.route.outputs.test_windows_lane == 'fail_fast'
+        shell: bash
+        env:
+          ROUTE_REASON: ${{ needs.route.outputs.test_windows_reason }}
+        run: |
+          echo "::error title=CI CAPACITY (not a verdict on this PR)::${ROUTE_REASON}"
+          exit 1
+
       # Full history, blobless: workspace_assumptions_are_enumerated.rs takes its
       # swap-rule base from `merge-base HEAD origin/main`, which a depth-1 clone
       # cannot compute (it would print SWAP RULE UNKNOWN and enforce nothing).
@@ -233,6 +340,104 @@ jobs:
         with:
           fetch-depth: 0
           filter: blob:none
+
+      # SELF-HOSTED ONLY, and directly after the checkout, before any step that
+      # runs code from the PR (pnpm lifecycle scripts, build.rs, proc macros,
+      # tests). A rerouted leg runs in a fleet machine's real home with no
+      # file poison (`dirs::home_dir()` ignores $HOME on Windows, so it cannot
+      # be pointed away), and `qontinui-ci-isolated`, the label coord requires
+      # before it routes a job here, is the host's declaration that the home
+      # holds nothing a job could use against coord. This step checks exactly
+      # four things, under $HOME and (Windows) $USERPROFILE:
+      #   1-3. `.qontinui/coord-device-jwt`, `.qontinui/machine.json` and
+      #        `.qontinui/profiles.json` do not exist;
+      #   4.   nothing LISTENS on 127.0.0.1:9876 (a live runner there mints
+      #        device JWTs on demand, with no file). Probed with a bash
+      #        `/dev/tcp` connect, which needs no curl and no proxy and
+      #        cannot be fooled by a slow `/health`: a connect that succeeds
+      #        refuses, and "Connection refused" passes. Where `/dev/tcp` is
+      #        unavailable, or its connect runs past 5 s (a full backlog, or
+      #        a loaded Windows host retrying the SYN), it falls back to curl
+      #        with no proxy and refuses unless curl exits 7 (could not
+      #        connect). curl's connect gets 10 s, longer than `/dev/tcp`
+      #        had, because a refused loopback connect on Windows comes back
+      #        only after ~2 s of SYN retries; a hung listener still runs
+      #        past it (exit 28) and refuses. The success line names which
+      #        probe decided.
+      # It does not check other ports, a credential under another account or
+      # path, or environment the runner service passes in -- coord's
+      # ci_route NOT_SERVED lists those. The title carries coord's generic
+      # no-verdict marker (author_feedback NOT_A_VERDICT_ANNOTATION_MARKER):
+      # a misconfigured host is kept red and re-run, never read as a verdict
+      # on the code and never write-skipped.
+      - name: Refuse a host that is not isolated (self-hosted)
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -uo pipefail
+          refuse() {
+            echo "::error title=HOST NOT ISOLATED (not a verdict on this PR)::$1 Run the CI runner as a user with no coord credential and no local runner, or remove the qontinui-ci-isolated label."
+            exit 1
+          }
+          homes=("$HOME")
+          if [ "$RUNNER_OS" = "Windows" ] && [ -n "${USERPROFILE:-}" ]; then
+            homes+=("$(cygpath -u "$USERPROFILE")")
+          fi
+          for h in "${homes[@]}"; do
+            for f in coord-device-jwt machine.json profiles.json; do
+              if [ -e "$h/.qontinui/$f" ]; then
+                refuse "$h/.qontinui/$f exists on this runner; a job could read it."
+              fi
+            done
+          done
+          # A listener on 127.0.0.1:9876, by connect (bash /dev/tcp).
+          if command -v timeout >/dev/null 2>&1; then
+            probe=(timeout -k 2 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/9876')
+          else
+            probe=(bash -c 'exec 3<>/dev/tcp/127.0.0.1/9876')
+          fi
+          # `shell: bash` runs with -e, so the rc is caught, never fatal.
+          probe_rc=0
+          probe_err="$("${probe[@]}" 2>&1)" || probe_rc=$?
+          # One line: a newline would end the ::error annotation early.
+          probe_err="${probe_err//$'\n'/ }"
+          if [ "$probe_rc" -eq 0 ]; then
+            refuse "something listens on 127.0.0.1:9876 (a local runner mints device JWTs there)."
+          elif [ "$probe_rc" -ne 124 ] && printf '%s' "$probe_err" | grep -qi 'connection refused'; then
+            probe_by="dev-tcp"
+          else
+            # No usable /dev/tcp here, or its connect ran past 5 s (a full
+            # backlog, or a loaded Windows host retrying a refused SYN):
+            # curl, with no proxy, refusing unless it could not connect at
+            # all (exit 7). The 10 s connect outlasts Windows' ~2 s of SYN
+            # retries on a refused loopback port; a hung listener runs past
+            # it (exit 28), so it still refuses.
+            command -v curl >/dev/null 2>&1 || refuse "neither /dev/tcp (rc $probe_rc: $probe_err) nor curl is available, so whether anything listens on 127.0.0.1:9876 is UNKNOWN."
+            curl_rc=0
+            curl -s -o /dev/null --noproxy '*' --connect-timeout 10 --max-time 12 http://127.0.0.1:9876/health || curl_rc=$?
+            [ "$curl_rc" -eq 7 ] || refuse "curl to 127.0.0.1:9876 exited $curl_rc (7 = nothing listening); a listener may be there."
+            probe_by="curl rc=7"
+          fi
+          echo "isolated: no coord-device-jwt, machine.json or profiles.json under ${homes[*]}, and nothing listens on 127.0.0.1:9876 (probe: $probe_by)"
+
+      # A rerouted self-hosted leg (route review H1): the runner's build and
+      # tests resolve the operator's config and secure-storage dirs, and a test
+      # binary once overwrote a real settings.json from defaults
+      # (qontinui-runner#1769). Point both at this job's $RUNNER_TEMP for every
+      # later step, as cargo-guard.sh does for a local test run.
+      - name: Sandbox the runner config dirs (self-hosted)
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SANDBOX="$RUNNER_TEMP/qontinui-config-sandbox"
+          mkdir -p "$SANDBOX/config" "$SANDBOX/secure"
+          {
+            echo "QONTINUI_CONFIG_DIR=$SANDBOX/config"
+            echo "QONTINUI_SECURE_STORAGE_DIR=$SANDBOX/secure"
+            if [ "$RUNNER_OS" != "Windows" ]; then echo "XDG_CONFIG_HOME=$SANDBOX/xdg"; fi
+          } >> "$GITHUB_ENV"
+          echo "config dirs sandboxed under $SANDBOX"
 
       # qontinui-runner's frontend cross-repo deps now resolve via npm
       # (see package.json: @qontinui/* moved from link: to ^x.y.z ranges).
@@ -323,11 +528,26 @@ jobs:
       # rustfmt/clippy components must be installed for 1.95.0 specifically —
       # otherwise `cargo fmt`/`cargo clippy` auto-switch to a component-less
       # 1.95.0 and fail with "'cargo-fmt' is not installed".
+      # Hosted only: the action also runs `rustup default`, which on a
+      # self-hosted host would change the machine's own default toolchain.
       - name: Setup Rust
+        if: runner.environment == 'github-hosted'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
           components: rustfmt, clippy
+
+      # A rerouted self-hosted leg (the `route` job): install the pinned
+      # toolchain into the host's rustup WITHOUT touching its default --
+      # rust-toolchain.toml selects 1.95.0 for every cargo call in this repo.
+      # Additive: an already-installed toolchain is a no-op.
+      - name: Setup Rust (self-hosted, default untouched)
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v rustup >/dev/null 2>&1 || { echo "::error::rustup is not on this self-hosted runner's PATH"; exit 1; }
+          rustup toolchain install 1.95.0 --profile minimal -c rustfmt -c clippy
 
       # Cargo.lock must match the PINNED qontinui-schemas tree (plan
       # 2026-08-31-schemas-releases-strand-consumer-cargo-locks §7.4 Phase 3).
@@ -456,8 +676,14 @@ jobs:
       # revert the test step to JOBS=1 and keep this pagefile. (That happened
       # on 2026-10-27, run 40449994591; the test step is now JOBS=1 on every
       # leg.)
+      # Hosted runners ONLY (`runner.environment`, never the route `lane`: the
+      # lane is empty when the route job did not run, and this leg then runs on
+      # the hosted default that needs the pagefile). The action resizes the
+      # Windows pagefile on the hosted image's `D:` scratch disk; on a
+      # self-hosted host it would rewrite the machine's own paging setup, and a
+      # host is routed here only because its own commit limit already fits.
       - name: Configure pagefile (Windows — guard against link-time OOM)
-        if: matrix.platform == 'windows-latest'
+        if: matrix.platform == 'windows-latest' && runner.environment == 'github-hosted'
         uses: al-cheb/configure-pagefile-action@v1.4
         with:
           minimum-size: 32GB
@@ -491,7 +717,10 @@ jobs:
       # saves from merge-candidate/* refs are invisible to sibling
       # candidates. The cache that matters is the one saved by `main` runs
       # (every land), which all candidates and PRs can restore.
+      # Hosted only: the action's post step prunes CARGO_HOME, which on a
+      # self-hosted host is the machine's own registry and git cache.
       - name: Cache Rust dependencies
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           # Workspace root is the repo root: ./Cargo.toml -> ./target
@@ -634,7 +863,7 @@ jobs:
       # prints both and poisons both when they are not.
       #
       # The env half goes through `$GITHUB_ENV` and is blanked again by the
-      # `Unpoison ambient state` step below, so the poison covers exactly the
+      # `Unpoison ambient state (env)` step below, so the poison covers exactly the
       # test step: `QONTINUI_SERVER_MODE=1` means "this runner has no webview
       # and must never be given one" (`webview_recovery::is_server_mode`), which
       # the windows contract smoke's exe boot must not inherit.
@@ -654,9 +883,29 @@ jobs:
       # the PR body when an existing job's surface moves — which includes adding
       # or removing a STEP, and editing a shell comment inside a `run:` block.
       # A deleted job takes `Gate-Removal:` instead. Then re-run the job.
-      - name: Poison ambient state
+      #
+      # HOSTED ONLY (route review H1). On a rerouted self-hosted leg the home
+      # is a fleet machine's real one, holding its real machine.json and device
+      # JWT: this step would overwrite them and `Unpoison` would delete them.
+      # `dirs::home_dir()` ignores $HOME/$USERPROFILE on Windows, so the poison
+      # cannot be pointed at $RUNNER_TEMP instead; a self-hosted leg runs the
+      # tests with the env poison only (the ubuntu and hosted windows legs keep
+      # the file canary too), in a home that `Refuse a host that is not
+      # isolated (self-hosted)` checked right after the checkout, with its
+      # config dirs sandboxed. And even on
+      # a hosted runner a target FILE that already exists is a refusal, never
+      # an overwrite: only files this step created are recorded, and only those
+      # are removed by `Unpoison`.
+      #
+      # The ENV half is the step after this one and runs on EVERY leg: it
+      # writes only this job's `$GITHUB_ENV`, so a self-hosted leg keeps the
+      # env canary (route review round 2, M2).
+      - name: Poison ambient state (files)
+        if: runner.environment == 'github-hosted'
         run: |
           set -euo pipefail
+          CREATED="$RUNNER_TEMP/poison-created-files"
+          : > "$CREATED"
 
           # A v4-shaped UUID: `uuidgen` on ubuntu (util-linux), python where bash
           # ships none (Git Bash on windows), and 16 bytes of /dev/urandom laid
@@ -680,7 +929,10 @@ jobs:
             profile_dir="$(cygpath -u "$USERPROFILE")"
             echo "HOME=$HOME"
             echo "USERPROFILE=$USERPROFILE (bash: $profile_dir)"
-            if [ "${profile_dir%/}" != "${HOME%/}" ]; then
+            # Compare the directories, not their spellings (route review L3):
+            # `-ef` is true when both name one directory (same device and
+            # inode), so a trailing slash or a symlink cannot poison it twice.
+            if ! [ "$HOME" -ef "$profile_dir" ]; then
               echo "::warning::HOME and USERPROFILE name different directories — poisoning both"
               homes+=("$profile_dir")
             fi
@@ -688,11 +940,24 @@ jobs:
 
           for h in "${homes[@]}"; do
             q="$h/.qontinui"
+            case "$q" in
+              "$RUNNER_TEMP"/*) ;;
+              *)
+                for f in machine.json profiles.json coord-device-jwt; do
+                  if [ -e "$q/$f" ]; then
+                    echo "::error::$q/$f already exists: refusing to overwrite a real machine's state (this runner's home is not the clean one this step assumes)"
+                    ls -la "$q"
+                    exit 1
+                  fi
+                done
+                ;;
+            esac
             if [ -e "$q" ]; then
-              echo "::warning::$q already exists before poisoning — this runner's home is not the clean one this step assumes:"
+              echo "::warning::$q already exists (without the three poison targets) before poisoning:"
               ls -la "$q"
             fi
             mkdir -p "$q"
+            printf '%s\n' "$q/machine.json" "$q/profiles.json" "$q/coord-device-jwt" >> "$CREATED"
             # `DeviceFile` (bin/qontinui_profile.rs): device_id + hostname; the
             # tenant pin (`tenant_pin.rs`) reads the sibling `active_tenant_id`.
             cat > "$q/machine.json" <<EOF
@@ -724,7 +989,15 @@ jobs:
             ls -la "$q"
             cat "$q/machine.json" "$q/profiles.json"
           done
+          echo "device_id=$DEVICE_ID active_tenant_id=$TENANT_ID"
+        shell: bash
 
+      # The env half of the poison, on every leg (hosted and self-hosted): it
+      # writes only this job's `$GITHUB_ENV`, which `Unpoison ambient state
+      # (env)` blanks again with `always()`.
+      - name: Poison ambient state (env)
+        run: |
+          set -euo pipefail
           # A workspace root that does not exist: `default_canonical_path` must
           # fail closed naming `$QONTINUI_ROOT`, never resolve.
           POISON_ROOT="$RUNNER_TEMP/qontinui-root-poison-does-not-exist"
@@ -740,7 +1013,6 @@ jobs:
           echo "QONTINUI_ROOT=$POISON_ROOT"
           echo "QONTINUI_SERVER_MODE=1"
           echo "QONTINUI_RUNNER_TIER=local"
-          echo "device_id=$DEVICE_ID active_tenant_id=$TENANT_ID"
         shell: bash
 
       # Plan 2026-10-27-coord-routes-ci-jobs-by-runner-capability, Phase 1:
@@ -1247,8 +1519,11 @@ jobs:
       # `MEMPEAK` lines are kept only because the CARGO_BUILD_JOBS soak of plan
       # 2026-09-17 Phase 3 step 2 (still open) greps them out of job logs;
       # delete this step once that soak reads the report instead.
+      # Hosted only: on a self-hosted host the pagefile counters are the
+      # machine's, shared with whatever else it runs, so a peak there is not
+      # attributable to this job (route review L2).
       - name: Windows memory peak after the Rust test steps
-        if: always() && matrix.platform == 'windows-latest'
+        if: always() && matrix.platform == 'windows-latest' && runner.environment == 'github-hosted'
         continue-on-error: true
         shell: bash
         run: |
@@ -1433,19 +1708,18 @@ jobs:
         shell: bash
         env:
           COORD_INGEST_TOKEN: ${{ secrets.COORD_INGEST_TOKEN }}
-          # `Poison ambient state` sets COORD_HTTP_URL=http://poison.invalid via
-          # $GITHUB_ENV, and `Unpoison ambient state` — which blanks it — runs
+          # `Poison ambient state (env)` sets COORD_HTTP_URL=http://poison.invalid via
+          # $GITHUB_ENV, and `Unpoison ambient state (env)` — which blanks it — runs
           # AFTER this step. So without this override the ingest POSTs to the
           # poison host and records nothing: measured 2026-09-09 on job
           # 102391645194, `0/10603 row(s) recorded across 11 chunk(s)`, every
           # chunk FAILED, while the step still reported green because it is
           # `continue-on-error`.
           #
-          # Reordering does NOT fix it: `Unpoison` carries no `if: always()`, so
-          # a red suite skips it entirely — and a red suite is exactly the case
-          # this ingest exists to record. A step-level `env:` beats $GITHUB_ENV
-          # for this step only, so it is correct on both the green and red paths
-          # and independent of where the unpoison sits.
+          # The unpoison now runs `always()`, but it still runs AFTER this
+          # step. A step-level `env:` beats $GITHUB_ENV for this step only, so
+          # it is correct on both the green and red paths and independent of
+          # where the unpoison sits.
           #
           # Empty, not a literal host: the script reads
           # `process.env.COORD_HTTP_URL || DEFAULT_COORD_URL` (in `main()` of
@@ -1468,27 +1742,39 @@ jobs:
             --shard "${{ matrix.platform }}" \
             --gating-outcome "${{ steps.run_rust_tests.outcome }}"
 
-      # Undo `Poison ambient state` so the poison covers the test step and
+      # Undo the two `Poison ambient state` steps so the poison covers the test step and
       # nothing after it. `$GITHUB_ENV` cannot unset, only assign — but every
       # one of the four readers treats an EMPTY value as unset
       # (`resolve_coord_base_with_source` trims and skips; `server_mode` matches
       # "1"/"true" only; `parse_tier_value` finds no tier in ""; the workspace
-      # root resolver trims and skips). The three files are removed by name, not
-      # `rm -rf ~/.qontinui`, so a home that was NOT clean (the poison step warns
-      # when it sees one) keeps whatever else it held.
-      - name: Unpoison ambient state
+      # root resolver trims and skips). Only the files the poison step recorded
+      # creating are removed, by name, never `rm -rf ~/.qontinui`, so a home
+      # that was NOT clean keeps whatever else it held.
+      # Both halves run `always()`, so a red test step still cleans up. The
+      # env half runs on every leg, like its poison; the file half is hosted
+      # only and removes only the files `Poison ambient state (files)`
+      # recorded creating -- never a file it found already there.
+      - name: Unpoison ambient state (files)
+        if: always() && runner.environment == 'github-hosted'
         run: |
           set -u
-          homes=("$HOME")
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            homes+=("$(cygpath -u "$USERPROFILE")")
+          CREATED="$RUNNER_TEMP/poison-created-files"
+          if [ -f "$CREATED" ]; then
+            while IFS= read -r f; do
+              [ -n "$f" ] && rm -f "$f"
+            done < "$CREATED"
+            while IFS= read -r f; do
+              [ -n "$f" ] && rmdir "$(dirname "$f")" 2>/dev/null || true
+            done < "$CREATED"
+            rm -f "$CREATED"
           fi
-          for h in "${homes[@]}"; do
-            for f in machine.json profiles.json coord-device-jwt; do
-              rm -f "$h/.qontinui/$f"
-            done
-            rmdir "$h/.qontinui" 2>/dev/null || true
-          done
+          echo "poison files removed"
+        shell: bash
+
+      - name: Unpoison ambient state (env)
+        if: always()
+        run: |
+          set -u
           {
             echo "COORD_HTTP_URL="
             echo "QONTINUI_ROOT="
@@ -1627,8 +1913,12 @@ jobs:
           python3 scripts/tests/ci-integrity/test-surface.py
         shell: bash
 
+      # Hosted runners ONLY: it boots a second runner exe on the host (ports
+      # from 9877, the CI account's config dir). A disposable hosted VM is the
+      # only host where that is free of side effects; a rerouted self-hosted
+      # leg skips it, and the hosted legs keep the gate.
       - name: SDK↔runner contract smoke (direct-exe)
-        if: matrix.platform == 'windows-latest'
+        if: matrix.platform == 'windows-latest' && runner.environment == 'github-hosted'
         env:
           QONTINUI_ALLOW_NO_DB: "1"
         run: powershell -File scripts/contract-smoke.ps1 -DirectExe target/debug/qontinui-runner.exe -Profile ci -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts
@@ -1695,7 +1985,12 @@ jobs:
   # GB saves against the 10 GB repo cache cap.
   clippy-windows:
     name: Clippy (windows)
-    runs-on: windows-latest
+    # Routed like the `test` windows leg (see the `route` job): an empty
+    # output falls back to the static `windows-latest`, and `!cancelled()`
+    # keeps a failed route job from skipping this check.
+    needs: route
+    if: ${{ !cancelled() }}
+    runs-on: ${{ fromJSON(needs.route.outputs.clippy_windows_runs_on || '"windows-latest"') }}
     # Default-target clippy, 23 successful runs 2026-10-22..10-25 on commits now
     # on main (push and pull_request events; GraphQL check-run timings): job p50
     # 14.9m, p90 17.2m, max 17.8m (Clippy check step p50 11.9m, max 14.0m).
@@ -1709,7 +2004,114 @@ jobs:
     # Previously unbounded, i.e. GitHub's 360-minute default.
     timeout-minutes: 60
     steps:
+      - name: CI capacity (route said fail_fast)
+        if: needs.route.outputs.clippy_windows_lane == 'fail_fast'
+        shell: bash
+        env:
+          ROUTE_REASON: ${{ needs.route.outputs.clippy_windows_reason }}
+        run: |
+          echo "::error title=CI CAPACITY (not a verdict on this PR)::${ROUTE_REASON}"
+          exit 1
+
       - uses: actions/checkout@v5
+
+      # SELF-HOSTED ONLY, and directly after the checkout, before any step that
+      # runs code from the PR (pnpm lifecycle scripts, build.rs, proc macros,
+      # tests). A rerouted leg runs in a fleet machine's real home with no
+      # file poison (`dirs::home_dir()` ignores $HOME on Windows, so it cannot
+      # be pointed away), and `qontinui-ci-isolated`, the label coord requires
+      # before it routes a job here, is the host's declaration that the home
+      # holds nothing a job could use against coord. This step checks exactly
+      # four things, under $HOME and (Windows) $USERPROFILE:
+      #   1-3. `.qontinui/coord-device-jwt`, `.qontinui/machine.json` and
+      #        `.qontinui/profiles.json` do not exist;
+      #   4.   nothing LISTENS on 127.0.0.1:9876 (a live runner there mints
+      #        device JWTs on demand, with no file). Probed with a bash
+      #        `/dev/tcp` connect, which needs no curl and no proxy and
+      #        cannot be fooled by a slow `/health`: a connect that succeeds
+      #        refuses, and "Connection refused" passes. Where `/dev/tcp` is
+      #        unavailable, or its connect runs past 5 s (a full backlog, or
+      #        a loaded Windows host retrying the SYN), it falls back to curl
+      #        with no proxy and refuses unless curl exits 7 (could not
+      #        connect). curl's connect gets 10 s, longer than `/dev/tcp`
+      #        had, because a refused loopback connect on Windows comes back
+      #        only after ~2 s of SYN retries; a hung listener still runs
+      #        past it (exit 28) and refuses. The success line names which
+      #        probe decided.
+      # It does not check other ports, a credential under another account or
+      # path, or environment the runner service passes in -- coord's
+      # ci_route NOT_SERVED lists those. The title carries coord's generic
+      # no-verdict marker (author_feedback NOT_A_VERDICT_ANNOTATION_MARKER):
+      # a misconfigured host is kept red and re-run, never read as a verdict
+      # on the code and never write-skipped.
+      - name: Refuse a host that is not isolated (self-hosted)
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -uo pipefail
+          refuse() {
+            echo "::error title=HOST NOT ISOLATED (not a verdict on this PR)::$1 Run the CI runner as a user with no coord credential and no local runner, or remove the qontinui-ci-isolated label."
+            exit 1
+          }
+          homes=("$HOME")
+          if [ "$RUNNER_OS" = "Windows" ] && [ -n "${USERPROFILE:-}" ]; then
+            homes+=("$(cygpath -u "$USERPROFILE")")
+          fi
+          for h in "${homes[@]}"; do
+            for f in coord-device-jwt machine.json profiles.json; do
+              if [ -e "$h/.qontinui/$f" ]; then
+                refuse "$h/.qontinui/$f exists on this runner; a job could read it."
+              fi
+            done
+          done
+          # A listener on 127.0.0.1:9876, by connect (bash /dev/tcp).
+          if command -v timeout >/dev/null 2>&1; then
+            probe=(timeout -k 2 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/9876')
+          else
+            probe=(bash -c 'exec 3<>/dev/tcp/127.0.0.1/9876')
+          fi
+          # `shell: bash` runs with -e, so the rc is caught, never fatal.
+          probe_rc=0
+          probe_err="$("${probe[@]}" 2>&1)" || probe_rc=$?
+          # One line: a newline would end the ::error annotation early.
+          probe_err="${probe_err//$'\n'/ }"
+          if [ "$probe_rc" -eq 0 ]; then
+            refuse "something listens on 127.0.0.1:9876 (a local runner mints device JWTs there)."
+          elif [ "$probe_rc" -ne 124 ] && printf '%s' "$probe_err" | grep -qi 'connection refused'; then
+            probe_by="dev-tcp"
+          else
+            # No usable /dev/tcp here, or its connect ran past 5 s (a full
+            # backlog, or a loaded Windows host retrying a refused SYN):
+            # curl, with no proxy, refusing unless it could not connect at
+            # all (exit 7). The 10 s connect outlasts Windows' ~2 s of SYN
+            # retries on a refused loopback port; a hung listener runs past
+            # it (exit 28), so it still refuses.
+            command -v curl >/dev/null 2>&1 || refuse "neither /dev/tcp (rc $probe_rc: $probe_err) nor curl is available, so whether anything listens on 127.0.0.1:9876 is UNKNOWN."
+            curl_rc=0
+            curl -s -o /dev/null --noproxy '*' --connect-timeout 10 --max-time 12 http://127.0.0.1:9876/health || curl_rc=$?
+            [ "$curl_rc" -eq 7 ] || refuse "curl to 127.0.0.1:9876 exited $curl_rc (7 = nothing listening); a listener may be there."
+            probe_by="curl rc=7"
+          fi
+          echo "isolated: no coord-device-jwt, machine.json or profiles.json under ${homes[*]}, and nothing listens on 127.0.0.1:9876 (probe: $probe_by)"
+
+      # A rerouted self-hosted leg (route review H1): the runner's build and
+      # tests resolve the operator's config and secure-storage dirs, and a test
+      # binary once overwrote a real settings.json from defaults
+      # (qontinui-runner#1769). Point both at this job's $RUNNER_TEMP for every
+      # later step, as cargo-guard.sh does for a local test run.
+      - name: Sandbox the runner config dirs (self-hosted)
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SANDBOX="$RUNNER_TEMP/qontinui-config-sandbox"
+          mkdir -p "$SANDBOX/config" "$SANDBOX/secure"
+          {
+            echo "QONTINUI_CONFIG_DIR=$SANDBOX/config"
+            echo "QONTINUI_SECURE_STORAGE_DIR=$SANDBOX/secure"
+            if [ "$RUNNER_OS" != "Windows" ]; then echo "XDG_CONFIG_HOME=$SANDBOX/xdg"; fi
+          } >> "$GITHUB_ENV"
+          echo "config dirs sandboxed under $SANDBOX"
 
       # Rust path-dep on ../../qontinui-schemas/rust + the SDK↔runner manifest
       # diff test read; same rationale as the `test` job's sibling checkout,
@@ -1743,20 +2145,44 @@ jobs:
           cache: "pnpm"
           cache-dependency-path: pnpm-lock.yaml
 
+      # Hosted only: the action also runs `rustup default`, which on a
+      # self-hosted host would change the machine's own default toolchain.
       - name: Setup Rust
+        if: runner.environment == 'github-hosted'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
           components: rustfmt, clippy
 
+      # A rerouted self-hosted leg (the `route` job): install the pinned
+      # toolchain into the host's rustup WITHOUT touching its default --
+      # rust-toolchain.toml selects 1.95.0 for every cargo call in this repo.
+      # Additive: an already-installed toolchain is a no-op.
+      - name: Setup Rust (self-hosted, default untouched)
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v rustup >/dev/null 2>&1 || { echo "::error::rustup is not on this self-hosted runner's PATH"; exit 1; }
+          rustup toolchain install 1.95.0 --profile minimal -c rustfmt -c clippy
+
+      # Hosted runners ONLY (`runner.environment`, never the route `lane`: the
+      # lane is empty when the route job did not run, and this job then runs on
+      # the hosted default that needs the pagefile). The action resizes the
+      # Windows pagefile on the hosted image's `D:` scratch disk; on a
+      # self-hosted host it would rewrite the machine's own paging setup, and a
+      # host is routed here only because its own commit limit already fits.
       - name: Configure pagefile (Windows — guard against link-time OOM)
+        if: runner.environment == 'github-hosted'
         uses: al-cheb/configure-pagefile-action@v1.4
         with:
           minimum-size: 32GB
           maximum-size: 32GB
           disk-root: "D:"
 
+      # Hosted only, as in the `test` job: the post step prunes CARGO_HOME.
       - name: Cache Rust dependencies
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
