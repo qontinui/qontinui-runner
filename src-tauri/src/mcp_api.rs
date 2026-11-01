@@ -5775,6 +5775,12 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     // `/reverify-shipped` lane POSTs through (coord refuses a verifier that is
     // the unit's author; this list only forwards).
     "coord_record_verification",
+    // Plan 2026-10-11-reverify-verdicts-are-source-bound-tree-checked-and-judge-agreement-is-measured
+    // Phase 3: the ground-truth label write (twin `POST /coord/verification/labels`)
+    // the judge-agreement measure is scored against. coord refuses an operator
+    // label from a non-operator principal; an agent records `seeded` labels only.
+    // This list only forwards.
+    "coord_record_verification_label",
     "coord_reevaluate",
     "coord_reevaluate_dry",
     "coord_register_gate",
@@ -17591,7 +17597,10 @@ mod coord_mcp_body_gate_tests {
     /// Phase 4: the re-verification lane's three tools forward, each sits in
     /// sorted position (membership is a `binary_search`), and the source-text
     /// parser `build_drift` runs over this file reads each exactly once — the
-    /// comments above them must not hide one or add a phantom.
+    /// comments above them must not hide one or add a phantom. Plan
+    /// `2026-10-11-reverify-verdicts-are-source-bound-tree-checked-and-judge-agreement-is-measured`
+    /// Phase 3 adds the ground-truth label write to the lane, and every tool
+    /// must pass the proxy's body gate as a `tools/call`.
     #[test]
     fn verification_lane_tools_are_allowed_and_parse_from_source() {
         let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
@@ -17599,8 +17608,17 @@ mod coord_mcp_body_gate_tests {
         for tool in [
             "coord_query_verification_metrics",
             "coord_record_verification",
+            "coord_record_verification_label",
             "coord_verification_queue",
         ] {
+            assert!(
+                gate(serde_json::json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":tool,"arguments":{}}
+                }))
+                .is_ok(),
+                "{tool} must be callable through the proxy"
+            );
             assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
             assert!(
                 COORD_MCP_ALLOWED_TOOLS.binary_search(&tool).is_ok(),
