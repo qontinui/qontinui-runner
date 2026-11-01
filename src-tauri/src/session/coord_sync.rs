@@ -67,6 +67,10 @@
 //!   bootstrap — see [`gate_registration_outcome`].
 //! - `event_kind = "finding_posted"` → `POST /coord/agent-findings` with the
 //!   payload forwarded verbatim. Best-effort.
+//! - `event_kind = "gate_continuation_outcome"` → `POST /coord/gates/:gate_id/
+//!   continuation-consumed` with the OUTCOME-shape body
+//!   ([`super::continuation_outcome_outbox`]). NOT best-effort and exempt from
+//!   quarantine ([`is_quarantine_exempt_kind`]): retried until coord answers.
 //!
 //! ## Idempotency
 //!
@@ -898,7 +902,19 @@ pub(crate) fn session_outbox_health_json() -> JsonValue {
         .lock()
         .map(|h| h.clone())
         .unwrap_or_default();
-    render_session_outbox_health(&snapshot)
+    let mut block = render_session_outbox_health(&snapshot);
+    // The gate-continuation outcome rows' own count and ceiling, read live
+    // from the store: they are exempt from the cap trim, so nothing else
+    // bounds them (plan
+    // 2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume).
+    if let Some(obj) = block.as_object_mut() {
+        let store = super::continuation_outcome_outbox::global();
+        obj.insert(
+            "continuationOutcomes".into(),
+            super::continuation_outcome_outbox::health_json(store.as_deref()),
+        );
+    }
+    block
 }
 
 /// Render one `sessionOutbox` block from an explicit snapshot (so a test can
@@ -1262,6 +1278,35 @@ fn is_best_effort_kind(kind: &str) -> bool {
         || kind == SessionEventKind::OperatorTouch.as_str()
 }
 
+/// Kinds whose failures never count toward
+/// [`QUARANTINE_AFTER_SERVING_FAILURES`]: their lane backs off and retries for
+/// as long as coord keeps failing it, however many OTHER rows coord takes
+/// meanwhile.
+///
+/// Only `gate_continuation_outcome` (plan
+/// `2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume`,
+/// Phase 2). A partial brownout — 500 on the consume route while coord serves
+/// session rows — is exactly the 2026-10-22 shape, and quarantining the lane
+/// there would turn a durable consume record back into a fire-few one. Each
+/// lane is ONE gate, so a lane that keeps failing blocks only that gate.
+///
+/// Only a confirmed 2xx or a content refusal (400/404/409/422) ends such a
+/// row. A request-level 4xx (401, 403, 408, any other 4xx but 429) is retried
+/// and logged at ERROR, bounded only by the lane's 60 s backoff ceiling — so a
+/// broken credential keeps such a row retrying until someone fixes it, by
+/// design, rather than dropping the only record of a consume.
+fn is_quarantine_exempt_kind(kind: &str) -> bool {
+    kind == SessionEventKind::GateContinuationOutcome.as_str()
+}
+
+/// A retried request-level 4xx (anything 4xx but 429) on an
+/// [`is_quarantine_exempt_kind`] row. Its retry is about the request — the
+/// device credential, a proxy — not about whether coord is serving, so it must
+/// not trip the tick-wide abort that puts the whole drain on outage backoff.
+fn is_exempt_request_refusal(kind: &str, status: Option<u16>) -> bool {
+    is_quarantine_exempt_kind(kind) && status.is_some_and(|s| (400..500).contains(&s) && s != 429)
+}
+
 /// How many per-session push chains run at once (plan
 /// `2026-07-28-runner-many-sessions-performance` §7a/B6).
 ///
@@ -1291,6 +1336,9 @@ struct ChainOutcome {
     /// `Some(error)` when a NON-best-effort row failed and stopped this chain:
     /// the session is blocked on its head row and goes on its own backoff.
     blocked_on: Option<String>,
+    /// The row in `blocked_on` is of an [`is_quarantine_exempt_kind`] kind, so
+    /// its failure never counts toward quarantine.
+    blocked_quarantine_exempt: bool,
     /// The chain stopped because ANOTHER chain tripped the abort flag, not
     /// because of anything about this session — its retry state is untouched.
     aborted: bool,
@@ -1321,6 +1369,7 @@ async fn push_chain(
         cleared: Vec::new(),
         had_transport_error: false,
         blocked_on: None,
+        blocked_quarantine_exempt: false,
         aborted: false,
     };
 
@@ -1438,9 +1487,15 @@ async fn push_chain(
                 );
                 out.had_transport_error = true;
                 out.blocked_on = Some(e);
+                out.blocked_quarantine_exempt = is_quarantine_exempt_kind(&rec.event_kind);
                 // Stop THIS chain — preserves (session, seq) order on retry.
                 // The unACKed tail stays in the file for a later tick.
-                if trip_abort {
+                //
+                // A request-level 4xx (401/403/408/…) on a quarantine-exempt
+                // row is retried, but it is about the credential, not about
+                // coord being up — so it never trips the tick-wide abort, and
+                // never puts the whole drain on the outage backoff.
+                if trip_abort && !is_exempt_request_refusal(&rec.event_kind, fail_status) {
                     abort.store(true, Ordering::Relaxed);
                 }
                 break;
@@ -1687,6 +1742,14 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         if held.contains(&rec.session_id) {
             continue;
         }
+        // A gate continuation's consume outcome being posted DIRECTLY right
+        // now (plan 2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume,
+        // Phase 2): its lane sits this tick out, so the same row is never on
+        // the wire twice. Checked after the snapshot; the hold is taken before
+        // the row is appended, so a row in the snapshot is still held or done.
+        if super::continuation_outcome_outbox::lane_held_by_direct_post(rec.session_id) {
+            continue;
+        }
         if state.quarantined.contains(&rec.session_id) {
             if rec.event_kind != heartbeat_kind {
                 to_quarantine.push(rec);
@@ -1754,7 +1817,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
 
     let mut had_transport_error = false;
     let mut delivered = false;
-    let mut blocked: Vec<(Uuid, String)> = Vec::new();
+    let mut blocked: Vec<(Uuid, String, bool)> = Vec::new();
     for outcome in outcomes {
         delivered |= outcome.acked_by_coord;
         succeeded.extend(outcome.succeeded);
@@ -1768,7 +1831,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             state.best_effort_attempts.remove(&key);
         }
         match outcome.blocked_on {
-            Some(err) => blocked.push((outcome.session_id, err)),
+            Some(err) => blocked.push((outcome.session_id, err, outcome.blocked_quarantine_exempt)),
             None if !outcome.aborted => {
                 // Ran to the end: whatever blocked it before has cleared.
                 state.retry.remove(&outcome.session_id);
@@ -1782,7 +1845,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         state.ack_ticks += 1;
     }
     let last_ack = state.last_ack;
-    for (sid, err) in blocked {
+    for (sid, err, quarantine_exempt) in blocked {
         // First failure: coord counts as serving if it took a row within the
         // window. Later failures: only if it took one since THIS session's
         // previous failure (this tick's rows included).
@@ -1803,7 +1866,10 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         // / `finished`) is coord pacing this runner, not
         // refusing the row — it never counts toward quarantine.
         let rate_limited = classify_push_failure(&err, false).0 == "rate_limited";
-        if serving && !rate_limited {
+        // An `is_quarantine_exempt_kind` row (a gate continuation's consume
+        // outcome) keeps its backoff but never earns quarantine: it is the only
+        // record of a consume, so it retries for as long as coord fails it.
+        if serving && !rate_limited && !quarantine_exempt {
             entry.serving_failures += 1;
         }
         entry.next_attempt_at = now + SessionRetry::backoff(entry.failures);
@@ -2158,6 +2224,30 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 .send()
                 .await
         }
+        "gate_continuation_outcome" => {
+            // A gate continuation's consume OUTCOME (plan
+            // 2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume,
+            // Phase 2). The row is written AHEAD of every durable outcome post
+            // and ACKed by that post's direct answer or, failing that, here. POST /coord/gates/{gate_id}/continuation-consumed with
+            // the OUTCOME-shape body, under the DEVICE credential (the lane is
+            // synthetic, so `scope` above is `Unresolved` and is not used).
+            //
+            // ⚠️ THIS ARM IS LOAD-BEARING. On the SpawnDespiteClaimError path
+            // the queued `spawned` is the ONLY record of the consume; without
+            // the arm the `other` catch-all would ACK and drop it and coord
+            // would later expire live work as never-run. Not best-effort, and
+            // exempt from the serving-failure quarantine
+            // (`is_quarantine_exempt_kind`).
+            return match super::continuation_outcome_outbox::push(&inner.http, base, rec).await {
+                super::continuation_outcome_outbox::ReplayVerdict::Acked => PushOutcome::Acked,
+                super::continuation_outcome_outbox::ReplayVerdict::Retry(e) => {
+                    PushOutcome::Transport(e)
+                }
+                super::continuation_outcome_outbox::ReplayVerdict::Drop(e) => {
+                    PushOutcome::PermanentFailure(e)
+                }
+            };
+        }
         "agent_notification" => {
             // Sensitive-action notification (plan
             // 2026-09-18-notifications-are-agent-actions-and-alerts-are-agent-work,
@@ -2454,7 +2544,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
 /// `[connect]` tag, so a log line and `/health` `sessionOutbox.lastFailure`
 /// say WHICH transport fault it was instead of reqwest's generic
 /// "error sending request for url (…)".
-fn transport_error(e: &reqwest::Error) -> String {
+pub(crate) fn transport_error(e: &reqwest::Error) -> String {
     let chain = crate::util::error_chain::error_chain(e);
     if e.is_timeout() {
         format!("[timeout] {chain}")
@@ -4027,6 +4117,12 @@ mod tests {
                 kind.as_str()
             );
         }
+        // `SessionEventKind::GateContinuationOutcome`, by its wire name.
+        assert!(
+            dispatch.contains("\"gate_continuation_outcome\" =>"),
+            "gate_continuation_outcome has NO dispatch arm — the catch-all would ACK and \
+             DROP the only record of a consume"
+        );
     }
 
     /// The finished marker must ride `PATCH /sessions/:id`, where the target is
@@ -9546,6 +9642,8 @@ mod tests {
         ] {
             assert!(!is_best_effort_kind(kind.as_str()), "{kind:?}");
         }
+        // The one record of a claim-error consume: never budget-dropped.
+        assert!(!is_best_effort_kind("gate_continuation_outcome"));
     }
 
     // ========================================================================
@@ -10699,6 +10797,628 @@ pub(crate) mod egress_tests {
         assert!(
             check < dispatch,
             "the check must run before any request is built"
+        );
+    }
+}
+
+// The drain half of plan
+// `2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume`
+// Phase 2: a `gate_continuation_outcome` row is retried through transport
+// failures, 5xx and request-level 4xx — past the best-effort budget and past
+// the serving-failure quarantine — and terminated exactly once by coord's
+// answer.
+//
+// The fake coord is the shared raw-TCP one
+// (`continuation_outcome_outbox::fake_coord`), because the first test needs a
+// TRANSPORT failure (a connection closed with no response).
+#[cfg(test)]
+mod continuation_outcome_drain_tests {
+    use super::*;
+    use crate::session::continuation_outcome_outbox::fake_coord::{self, recorded, Reply};
+    use crate::session::continuation_outcome_outbox::{
+        self as coo, ContinuationOutcomeOutbox, ContinuationOutcomeRecord, DirectFailure,
+        FailureDisposition, Installer, WriteAhead,
+    };
+    use std::collections::VecDeque;
+
+    /// The coord-served `dispatched_at`, passed through verbatim.
+    const SERVED_AT: &str = "2026-10-22T18:48:46.123456+00:00";
+
+    fn outcome_record(gate: Uuid, outcome: &str) -> ContinuationOutcomeRecord {
+        ContinuationOutcomeRecord {
+            gate_id: gate,
+            device_id: Uuid::from_u128(0xeb21_55ed_0000_4000_8000_0000_0000_0001),
+            outcome: outcome.to_string(),
+            detail: None,
+            claude_code_session_id: Some("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into()),
+            dispatched_at: Some(SERVED_AT.to_string()),
+        }
+    }
+
+    struct Rig {
+        _dir: tempfile::TempDir,
+        outbox: Arc<OutboxWriter>,
+        coord: CoordSync,
+        installer: Installer,
+    }
+
+    fn store_of(rig: &Rig) -> Arc<ContinuationOutcomeOutbox> {
+        rig.installer.store().expect("installed")
+    }
+
+    /// The outcome kind is the only one the serving-failure quarantine
+    /// exempts.
+    #[test]
+    fn only_the_outcome_kind_is_quarantine_exempt() {
+        assert!(is_quarantine_exempt_kind(
+            SessionEventKind::GateContinuationOutcome.as_str()
+        ));
+        for kind in [
+            SessionEventKind::Started,
+            SessionEventKind::Heartbeat,
+            SessionEventKind::GateRegistration,
+            SessionEventKind::OutputChunk,
+        ] {
+            assert!(!is_quarantine_exempt_kind(kind.as_str()), "{kind:?}");
+        }
+    }
+
+    fn rig(base: String) -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap());
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let installer = Installer::new();
+        assert!(installer.install(Arc::new(ContinuationOutcomeOutbox::new(
+            outbox.clone(),
+            Uuid::new_v4()
+        ))));
+        Rig {
+            _dir: dir,
+            outbox,
+            coord,
+            installer,
+        }
+    }
+
+    fn pending_for(outbox: &OutboxWriter, gate: Uuid) -> usize {
+        outbox
+            .pending()
+            .unwrap()
+            .iter()
+            .filter(|r| r.session_id == coo::lane(gate))
+            .count()
+    }
+
+    /// Make every backed-off lane due now, so a test drives ticks without
+    /// waiting out the real backoff.
+    fn make_due(state: &mut DrainState) {
+        for r in state.retry.values_mut() {
+            r.next_attempt_at = Instant::now();
+        }
+    }
+
+    /// Transport error, then success: the record written ahead by the
+    /// PRODUCTION path and kept by its failure handling is retried, ACKed
+    /// once, and never posted again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transport_failure_then_success_is_acked_exactly_once() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, script) = fake_coord::spawn().await;
+        let r = rig(base);
+        let gate = Uuid::new_v4();
+        script
+            .lock()
+            .await
+            .replies
+            .insert(gate, VecDeque::from([Reply::Drop]));
+
+        // The direct post failed in transport: these are the calls
+        // `post_continuation_outcome` makes.
+        let rec = outcome_record(gate, "spawned");
+        let written = r.installer.write_ahead(&rec, true);
+        assert_eq!(written, WriteAhead::Head);
+        let disposition = coo::handle_direct_failure(
+            &r.installer,
+            &written,
+            &DirectFailure::Transport("[timeout] operation timed out".into()),
+            &rec,
+        );
+        assert_eq!(disposition, FailureDisposition::Queued);
+        assert_eq!(pending_for(&r.outbox, gate), 1, "queued durably");
+
+        let mut state = DrainState::default();
+        drain_tick(&r.coord.inner, &mut state).await;
+        assert_eq!(
+            pending_for(&r.outbox, gate),
+            1,
+            "a transport error keeps it"
+        );
+        assert!(state.retry.contains_key(&coo::lane(gate)));
+
+        make_due(&mut state);
+        drain_tick(&r.coord.inner, &mut state).await;
+        assert_eq!(pending_for(&r.outbox, gate), 0, "acked after the success");
+        make_due(&mut state);
+        drain_tick(&r.coord.inner, &mut state).await;
+
+        let s = script.lock().await;
+        assert_eq!(
+            s.answered(gate),
+            vec![0, 200],
+            "one dropped attempt, then exactly one delivered post — no duplicate"
+        );
+        let (_, body, _) = s.seen.iter().rfind(|(g, _, _)| *g == gate).unwrap();
+        assert_eq!(body["outcome"], json!("spawned"));
+        assert_eq!(body["dispatched_at"], json!(SERVED_AT), "passed verbatim");
+        assert_eq!(
+            body["device_id"],
+            json!("eb2155ed-0000-4000-8000-000000000001")
+        );
+        assert_eq!(
+            body["claude_code_session_id"],
+            json!("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b")
+        );
+        assert!(body.get("gate_id").is_none(), "the gate rides the path");
+    }
+
+    /// A 5xx more than `BEST_EFFORT_MAX_ATTEMPTS` times is still retried — the
+    /// kind is not best-effort, so the budget never drops it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_5xx_past_the_best_effort_budget_is_still_retried_then_acked() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, script) = fake_coord::spawn().await;
+        let r = rig(base);
+        let gate = Uuid::new_v4();
+        let failures = BEST_EFFORT_MAX_ATTEMPTS as usize + 2;
+        script.lock().await.replies.insert(
+            gate,
+            (0..failures)
+                .map(|_| Reply::Status(500, json!({"error": "db_error"})))
+                .collect(),
+        );
+        store_of(&r)
+            .enqueue(&outcome_record(gate, "spawned"))
+            .unwrap();
+
+        let mut state = DrainState::default();
+        for i in 0..failures {
+            make_due(&mut state);
+            drain_tick(&r.coord.inner, &mut state).await;
+            assert_eq!(
+                pending_for(&r.outbox, gate),
+                1,
+                "dropped after {} failures",
+                i + 1
+            );
+        }
+        make_due(&mut state);
+        drain_tick(&r.coord.inner, &mut state).await;
+        assert_eq!(pending_for(&r.outbox, gate), 0);
+        let answered = script.lock().await.answered(gate);
+        assert_eq!(answered.len(), failures + 1);
+        assert_eq!(answered.last(), Some(&200));
+    }
+
+    /// A 401, a 403, a 408, and a 200 that does not confirm the consume are
+    /// all retried, not dropped — the record is ACKed only by the confirmed
+    /// answer that follows them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_level_4xx_and_an_unconfirmed_200_are_retried() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, script) = fake_coord::spawn().await;
+        let r = rig(base);
+        let gate = Uuid::new_v4();
+        script.lock().await.replies.insert(
+            gate,
+            VecDeque::from([
+                Reply::Status(401, json!({"error": "unauthorized"})),
+                Reply::Status(403, json!({"error": "forbidden"})),
+                Reply::Status(408, json!({})),
+                Reply::Status(200, json!({"gate_id": gate})),
+            ]),
+        );
+        store_of(&r)
+            .enqueue(&outcome_record(gate, "spawned"))
+            .unwrap();
+        let mut state = DrainState::default();
+        for _ in 0..4 {
+            make_due(&mut state);
+            drain_tick(&r.coord.inner, &mut state).await;
+            assert_eq!(pending_for(&r.outbox, gate), 1, "kept for retry");
+        }
+        make_due(&mut state);
+        drain_tick(&r.coord.inner, &mut state).await;
+        assert_eq!(pending_for(&r.outbox, gate), 0, "ACKed by the confirmation");
+        assert_eq!(
+            script.lock().await.answered(gate),
+            vec![401, 403, 408, 200, 200]
+        );
+        assert!(!quarantine_path(&r.outbox).exists());
+    }
+
+    /// A lane answering 5xx for more than `QUARANTINE_AFTER_SERVING_FAILURES`
+    /// ticks while coord ACKs other lanes is never quarantined, and its backoff
+    /// keeps growing rather than resetting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_lane_is_never_quarantined_while_coord_serves_others() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, script) = fake_coord::spawn().await;
+        let r = rig(base);
+        let stuck = Uuid::new_v4();
+        let ticks = QUARANTINE_AFTER_SERVING_FAILURES as usize + 4;
+        script.lock().await.replies.insert(
+            stuck,
+            (0..ticks * 2)
+                .map(|_| Reply::Status(500, json!({"error": "db_error"})))
+                .collect(),
+        );
+        store_of(&r)
+            .enqueue(&outcome_record(stuck, "spawned"))
+            .unwrap();
+
+        let mut state = DrainState::default();
+        for _ in 0..ticks {
+            // A healthy gate's record ACKs in the same tick: coord is serving.
+            store_of(&r)
+                .enqueue(&outcome_record(Uuid::new_v4(), "spawned"))
+                .unwrap();
+            make_due(&mut state);
+            drain_tick(&r.coord.inner, &mut state).await;
+        }
+
+        let lane = coo::lane(stuck);
+        assert!(state.ack_ticks as usize >= ticks, "coord took other rows");
+        assert!(state.quarantined.is_empty(), "the lane was quarantined");
+        assert_eq!(state.retry[&lane].serving_failures, 0);
+        assert_eq!(state.retry[&lane].failures as usize, ticks);
+        assert!(
+            state.retry[&lane].next_attempt_at > Instant::now() + Duration::from_secs(30),
+            "the per-lane backoff grew to its ceiling instead of resetting"
+        );
+        assert_eq!(pending_for(&r.outbox, stuck), 1, "still queued for retry");
+        assert!(
+            !quarantine_path(&r.outbox).exists(),
+            "nothing reached the quarantine sidecar"
+        );
+        assert_eq!(
+            r.outbox.pending().unwrap().len(),
+            1,
+            "every healthy lane was ACKed"
+        );
+    }
+
+    /// Backoff is per LANE and survives the head record ACKing: a second
+    /// record failing on the same lane continues the count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_lane_backoff_does_not_reset_per_record() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, script) = fake_coord::spawn().await;
+        let r = rig(base);
+        let gate = Uuid::new_v4();
+        script.lock().await.replies.insert(
+            gate,
+            VecDeque::from([
+                Reply::Status(503, json!({})),
+                Reply::Status(503, json!({})),
+                recorded("spawned"),
+                Reply::Status(503, json!({})),
+            ]),
+        );
+        store_of(&r)
+            .enqueue(&outcome_record(gate, "spawned"))
+            .unwrap();
+        store_of(&r)
+            .enqueue(&outcome_record(gate, "work_unreported"))
+            .unwrap();
+        let mut state = DrainState::default();
+        for _ in 0..3 {
+            make_due(&mut state);
+            drain_tick(&r.coord.inner, &mut state).await;
+        }
+        assert_eq!(
+            pending_for(&r.outbox, gate),
+            1,
+            "spawned acked, work_unreported left"
+        );
+        assert_eq!(state.retry[&coo::lane(gate)].failures, 3);
+        let s = script.lock().await;
+        let order: Vec<&str> = s
+            .seen
+            .iter()
+            .filter(|(g, _, _)| *g == gate)
+            .map(|(_, b, _)| b["outcome"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            order,
+            ["spawned", "spawned", "spawned", "work_unreported"],
+            "the lane keeps spawned ahead of work_unreported"
+        );
+    }
+
+    /// Drive one record through one push against `reply` and assert it is
+    /// TERMINAL: gone from the outbox, never posted again, never quarantined.
+    async fn assert_terminal_after_one_push(reply: Reply) {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, script) = fake_coord::spawn().await;
+        let r = rig(base);
+        let gate = Uuid::new_v4();
+        script
+            .lock()
+            .await
+            .replies
+            .insert(gate, VecDeque::from([reply.clone()]));
+        store_of(&r)
+            .enqueue(&outcome_record(gate, "spawned"))
+            .unwrap();
+        let mut state = DrainState::default();
+        for _ in 0..3 {
+            make_due(&mut state);
+            drain_tick(&r.coord.inner, &mut state).await;
+        }
+        assert_eq!(pending_for(&r.outbox, gate), 0, "{reply:?} must terminate");
+        assert_eq!(
+            script.lock().await.answered(gate).len(),
+            1,
+            "{reply:?} must not be retried"
+        );
+        assert!(!quarantine_path(&r.outbox).exists());
+    }
+
+    /// 200 with a DIFFERENT `outcome_recorded`: a legal supersede — ACKed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_differing_outcome_recorded_is_acked_not_retried() {
+        assert_terminal_after_one_push(recorded("work_completed")).await;
+    }
+
+    /// 200 with `outcome_recorded: null`: ACK (+ ERROR), never retried.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_null_echo_is_acked_not_retried() {
+        assert_terminal_after_one_push(Reply::Status(
+            200,
+            json!({"consumed": true, "outcome_recorded": null}),
+        ))
+        .await;
+    }
+
+    /// 409 `cancelled`: ACK (+ ERROR), never retried.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_409_is_acked_not_retried() {
+        assert_terminal_after_one_push(Reply::Status(
+            409,
+            json!({"error": "cancelled", "cancel_reason": "withdrawn"}),
+        ))
+        .await;
+    }
+
+    /// 404: ACK-dropped (+ ERROR), never retried.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_404_is_ack_dropped() {
+        assert_terminal_after_one_push(Reply::Status(404, json!({"error": "gate_not_found"})))
+            .await;
+    }
+
+    /// Restart: an un-ACKed record written through one `OutboxWriter` is
+    /// replayed by a fresh writer (and drain) over the same file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unacked_record_is_replayed_after_a_restart() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, script) = fake_coord::spawn().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.jsonl");
+        let gate = Uuid::new_v4();
+        {
+            let outbox = Arc::new(OutboxWriter::open(&path).unwrap());
+            let store = ContinuationOutcomeOutbox::new(outbox, Uuid::new_v4());
+            store.enqueue(&outcome_record(gate, "spawned")).unwrap();
+        }
+        let outbox = Arc::new(OutboxWriter::open(&path).unwrap());
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let mut state = DrainState::default();
+        drain_tick(&coord.inner, &mut state).await;
+        assert_eq!(pending_for(&outbox, gate), 0);
+        assert_eq!(script.lock().await.answered(gate), vec![200]);
+    }
+
+    /// While a direct post holds its gate's lane, the drain does not post
+    /// that lane at all — the same row is never on the wire twice — and it
+    /// takes the row as soon as the hold drops.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_drain_skips_a_lane_held_by_a_direct_post() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, script) = fake_coord::spawn().await;
+        let r = rig(base);
+        let gate = Uuid::new_v4();
+        let (written, hold) = r
+            .installer
+            .write_ahead_held(&outcome_record(gate, "spawned"), true);
+        assert_eq!(written, WriteAhead::Head);
+        assert!(hold.is_held());
+
+        let mut state = DrainState::default();
+        drain_tick(&r.coord.inner, &mut state).await;
+        assert!(
+            script.lock().await.answered(gate).is_empty(),
+            "the drain posted a lane a direct attempt was holding"
+        );
+        assert_eq!(pending_for(&r.outbox, gate), 1, "still queued");
+
+        drop(hold);
+        drain_tick(&r.coord.inner, &mut state).await;
+        assert_eq!(script.lock().await.answered(gate), vec![200]);
+        assert_eq!(pending_for(&r.outbox, gate), 0);
+    }
+
+    /// A request-level 4xx (401) on an outcome row is retried, but it does NOT
+    /// trip the tick-wide abort: a tick whose only failure is that 401 is not
+    /// an outage. A transport failure on the same kind still is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_401_on_an_outcome_row_is_not_an_outage() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, script) = fake_coord::spawn().await;
+        let r = rig(base);
+        let refused = Uuid::new_v4();
+        let dropped = Uuid::new_v4();
+        {
+            let mut s = script.lock().await;
+            s.replies.insert(
+                refused,
+                VecDeque::from([Reply::Status(401, json!({"error": "unauthorized"}))]),
+            );
+            s.replies.insert(dropped, VecDeque::from([Reply::Drop]));
+        }
+        store_of(&r)
+            .enqueue(&outcome_record(refused, "spawned"))
+            .unwrap();
+        let mut state = DrainState::default();
+        let tick = drain_tick(&r.coord.inner, &mut state).await;
+        assert_eq!(script.lock().await.answered(refused), vec![401]);
+        assert_eq!(pending_for(&r.outbox, refused), 1, "retried, not dropped");
+        assert!(
+            !tick.outage,
+            "a credential 4xx put the whole drain on outage backoff"
+        );
+        assert!(is_exempt_request_refusal(
+            SessionEventKind::GateContinuationOutcome.as_str(),
+            Some(403)
+        ));
+        assert!(!is_exempt_request_refusal(
+            SessionEventKind::GateContinuationOutcome.as_str(),
+            Some(429)
+        ));
+        assert!(!is_exempt_request_refusal("started", Some(401)));
+
+        // Control: a transport failure on the same kind is still an outage.
+        let r2 = rig(r.coord.inner.coord_url.clone());
+        store_of(&r2)
+            .enqueue(&outcome_record(dropped, "spawned"))
+            .unwrap();
+        let mut state2 = DrainState::default();
+        let tick2 = drain_tick(&r2.coord.inner, &mut state2).await;
+        assert_eq!(script.lock().await.answered(dropped), vec![0]);
+        assert!(tick2.outage, "a transport failure is still an outage");
+    }
+}
+
+// Arming test for plan
+// 2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume,
+// Phase 2: a queued `gate_continuation_outcome` row is DELIVERED by the drain
+// (POSTed to the gate's continuation-consumed route), not ACK-dropped by the
+// catch-all arm. It enters where every queued row enters, `drain_tick`, over a
+// row planted as raw JSON so it compiles against the pre-change drain too.
+#[cfg(test)]
+mod outcome_row_drain_arming {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // A coord that answers every request 200 `{"consumed":true,
+    // "outcome_recorded":"spawned"}` and counts the requests whose request
+    // line names a continuation-consumed route.
+    async fn counting_coord() -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let request = read_request(&mut sock).await;
+                    let line = request.lines().next().unwrap_or_default().to_string();
+                    if line.contains("/continuation-consumed") {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let body = r#"{"consumed":true,"outcome_recorded":"spawned"}"#;
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    // Read one HTTP/1.1 request: headers, then `content-length` body bytes.
+    async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
+        let mut got: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            got.extend_from_slice(&buf[..n]);
+            if let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                let want = String::from_utf8_lossy(&got[..end])
+                    .lines()
+                    .filter_map(|l| l.split_once(':'))
+                    .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if got.len() >= end + 4 + want {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&got).to_string()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_queued_outcome_row_is_posted_to_coord_by_the_drain() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, hits) = counting_coord().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.jsonl");
+        let gate = Uuid::new_v4();
+        let row = json!({
+            "machine_id": Uuid::new_v4(),
+            "session_id": Uuid::new_v4(),
+            "seq": 1,
+            "event_kind": "gate_continuation_outcome",
+            "payload": {
+                "gate_id": gate,
+                "device_id": Uuid::new_v4(),
+                "outcome": "spawned",
+                "detail": null,
+                "claude_code_session_id": null,
+                "dispatched_at": null,
+            },
+            "recorded_at": "2026-10-30T00:00:00Z",
+            "acked_at": null,
+        });
+        std::fs::write(&path, format!("{row}\n")).unwrap();
+        let writer = Arc::new(OutboxWriter::open(&path).unwrap());
+        let coord = CoordSync::new_for_test(
+            writer.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let mut state = DrainState::default();
+        drain_tick(&coord.inner, &mut state).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the queued consume outcome must reach coord's continuation-consumed route \
+             exactly once, not be ACKed and dropped unsent"
+        );
+        assert!(
+            writer.pending().unwrap().is_empty(),
+            "coord's recorded answer settles the row"
         );
     }
 }

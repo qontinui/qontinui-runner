@@ -61,6 +61,7 @@ pub mod claude_activity; // The ACTIVITY axis of a live `claude` (working/idle/s
 pub mod claude_hook;
 pub mod claude_session_registry;
 pub mod closeout_spool; // Producer for the two closeout outbox kinds — the loopback coord-write forwarders spool here when coord is UNREACHABLE (plan 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline, Phase 3)
+pub mod continuation_outcome_outbox; // Durable retry for a gate continuation's consume OUTCOME post (plan 2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume, Phase 2)
 pub mod coord_sync;
 pub mod coord_transport_rung; // WHICH transport rung carried a coord call — the producer for `coord-transport-rung` session events (plan 2026-09-07-no-per-session-record-of-which-transport-rung-carried-a-coord-read, Phase 1)
 pub mod create; // Remote-CREATE grants: the `create_request` directive arm + device-bound catch-up poll — the attach twin, so the target verifies a create grant itself instead of trusting the relay (plan 2026-09-11-headless-runner-parity-from-a-headed-runner, Phase 3b)
@@ -409,6 +410,24 @@ pub enum SessionEventKind {
     /// `every_session_outbox_kind_has_a_dispatch_arm` fails if it is missed.
     #[serde(rename = "operator_touch")]
     OperatorTouch,
+    /// A gate continuation's consume OUTCOME (`spawned` / `spawn_failed` /
+    /// `work_unreported`), written to the outbox AHEAD of every durable
+    /// outcome post and ACKed by that post's direct answer or by the drain
+    /// (plan
+    /// `2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume`,
+    /// Phase 2). Producer and drain arm:
+    /// [`continuation_outcome_outbox`]. Payload
+    /// `{gate_id, device_id, outcome, detail?, claude_code_session_id?, dispatched_at?}`,
+    /// drained to `POST /coord/gates/{gate_id}/continuation-consumed`.
+    ///
+    /// NOT best-effort and exempt from the serving-failure quarantine: on the
+    /// `SpawnDespiteClaimError` path this record is the ONLY record of the
+    /// consume, so it is retried until coord answers. One lane per gate.
+    ///
+    /// ⚠️ Like [`Self::CoordTransportRung`], a kind with no [`coord_sync`]
+    /// `push_record` arm is ACK-DROPPED silently by that function's catch-all.
+    #[serde(rename = "gate_continuation_outcome")]
+    GateContinuationOutcome,
 }
 
 impl SessionEventKind {
@@ -433,6 +452,7 @@ impl SessionEventKind {
             SessionEventKind::CoordTransportRung => "coord-transport-rung",
             SessionEventKind::AgentNotification => "agent_notification",
             SessionEventKind::OperatorTouch => "operator_touch",
+            SessionEventKind::GateContinuationOutcome => "gate_continuation_outcome",
         }
     }
 }

@@ -349,6 +349,18 @@ pub struct GateContinuationPayload {
     /// and never fails the frame.
     #[serde(default, deserialize_with = "deserialize_lenient_allocation")]
     pub allocation: Option<ContinuationAllocation>,
+    /// The `dispatched_at` coord served beside this row in
+    /// `pending-continuations` — the dispatch EPISODE the consume record names
+    /// (plan `2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume`,
+    /// D1 correction). Stamped by [`poll_pending_continuations`] only, and
+    /// echoed verbatim on the outcome post.
+    ///
+    /// `serde(skip)`, never read off the frame: a WS frame's own keys are not
+    /// the row's `continuation_dispatched_at`, and a mismatched value would make
+    /// coord's episode guard drop a genuine record. `None` (every WS delivery)
+    /// omits the field, which is coord's pre-guard behaviour.
+    #[serde(skip)]
+    pub dispatched_at: Option<String>,
 }
 
 /// The typed half of coord's re-delivery annotation. See
@@ -2043,8 +2055,9 @@ fn spawn_run_task(payload: LaunchPayload) {
 struct PendingContinuation {
     gate_id: uuid::Uuid,
     payload: GateContinuationPayload,
+    /// Threaded onto the payload ([`GateContinuationPayload::dispatched_at`])
+    /// so the outcome post names the episode it consumes.
     #[serde(default)]
-    #[allow(dead_code)]
     dispatched_at: Option<String>,
 }
 
@@ -2169,6 +2182,11 @@ struct ContinuationConsumedBody {
     detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     claude_code_session_id: Option<String>,
+    /// The dispatch episode ([`GateContinuationPayload::dispatched_at`]),
+    /// echoed verbatim on the OUTCOME shape only; coord records nothing (200,
+    /// null echo) when it names a different episode than the row's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dispatched_at: Option<String>,
 }
 
 impl ContinuationConsumedBody {
@@ -2179,6 +2197,7 @@ impl ContinuationConsumedBody {
             outcome: None,
             detail: None,
             claude_code_session_id: None,
+            dispatched_at: None,
         }
     }
 
@@ -2200,7 +2219,15 @@ impl ContinuationConsumedBody {
             outcome: Some(outcome.wire()),
             detail,
             claude_code_session_id,
+            dispatched_at: None,
         }
+    }
+
+    /// Name the dispatch episode this outcome consumes (`None` = unknown,
+    /// omitted from the body).
+    fn at_episode(mut self, dispatched_at: Option<String>) -> Self {
+        self.dispatched_at = dispatched_at;
+        self
     }
 }
 
@@ -2242,6 +2269,26 @@ enum SpawnDecision {
     /// Plan `2026-09-23-a-continuation-is-not-dispatched-until-the-spawn-actually-occurs`,
     /// Phase 3.
     SkipRerouted {
+        target_device_id: Option<uuid::Uuid>,
+    },
+    /// Claim refused (HTTP 409 `{"error":"expired","expired_at",
+    /// "expired_reason","target_device_id"}`) → coord already expired this
+    /// row on its TTL, and this device is NOT the row's target, so the claim
+    /// is a late delivery of work coord has given up on. SKIP the spawn and
+    /// post NO outcome: a spawn here is exactly the unrecorded run the plan
+    /// exists to stop. Like the rerouted skip, the local dispatch claim is
+    /// RELEASED: an expired row is NOT terminal on coord — a re-clearance
+    /// (`stamp_continuation_dispatched`) clears `continuation_expired_at` and
+    /// re-dispatches it, possibly to this device, and a kept claim would drop
+    /// that re-delivery at the dedupe check. Carries `expired_reason` and the
+    /// target device for the INFO log.
+    ///
+    /// Before this arm the shape fell into the "any other 409" branch and
+    /// spawned anyway ([`SpawnDecision::SpawnDespiteClaimError`]). Plan
+    /// `2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume`,
+    /// coord Phase 3.
+    SkipExpired {
+        expired_reason: Option<String>,
         target_device_id: Option<uuid::Uuid>,
     },
     /// Network failure / timeout / any other non-2xx → PROCEED to spawn anyway
@@ -2334,6 +2381,10 @@ fn continuation_drain_admission_for(
 ///   [`SpawnDecision::SkipRerouted`] (new target from `target_device_id`, when
 ///   it parses as a UUID). Without this arm the rerouted refusal fell into the
 ///   "any other 409" spawn-anyway branch below and double-spawned.
+/// - 409 with a JSON body whose `error == "expired"` →
+///   [`SpawnDecision::SkipExpired`] (coord's TTL expiry answered to a
+///   non-target device; reason from `expired_reason`, target from
+///   `target_device_id` when it parses as a UUID).
 /// - any other status (incl. a 409 that is NONE of those shapes) →
 ///   [`SpawnDecision::SpawnDespiteClaimError`] (availability over consistency).
 ///
@@ -2372,13 +2423,31 @@ fn decide_spawn(status: u16, body: &str) -> SpawnDecision {
                     .and_then(|s| uuid::Uuid::parse_str(s).ok());
                 return SpawnDecision::SkipRerouted { target_device_id };
             }
+            // The TTL-expired shape, answered to a NON-target device:
+            // `{"error":"expired","expired_at":…,"expired_reason":…,
+            // "target_device_id":<uuid|null>}`. The row is terminal on coord.
+            if v.get("error").and_then(|e| e.as_str()) == Some("expired") {
+                let expired_reason = v
+                    .get("expired_reason")
+                    .and_then(|r| r.as_str())
+                    .map(|s| s.to_string());
+                let target_device_id = v
+                    .get("target_device_id")
+                    .and_then(|t| t.as_str())
+                    .and_then(|s| uuid::Uuid::parse_str(s).ok());
+                return SpawnDecision::SkipExpired {
+                    expired_reason,
+                    target_device_id,
+                };
+            }
         }
-        // A 409 that is none of the cancelled / superseded / rerouted contracts
-        // (e.g. some other conflict): proceed rather than silently drop the
-        // continuation.
+        // A 409 that is none of the cancelled / superseded / rerouted / expired
+        // contracts (e.g. some other conflict): proceed rather than silently
+        // drop the continuation.
         return SpawnDecision::SpawnDespiteClaimError {
             cause: format!(
-                "claim returned 409 without a cancelled, superseded or rerouted body: {body}"
+                "claim returned 409 without a cancelled, superseded, rerouted or expired \
+                 body: {body}"
             ),
         };
     }
@@ -2617,12 +2686,19 @@ fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
 ///   the new target: the same availability-over-consistency trade every
 ///   claim-error path already makes, and reachable only through an in-flight
 ///   duplicate or a frame-only offline republish.
+/// * [`SpawnDecision::SkipExpired`] → **true**. coord expired the row on its
+///   TTL, but expiry is not terminal: a re-clearance clears
+///   `continuation_expired_at` and re-dispatches the row, possibly to this
+///   device. Only `cancelled` is terminal. Released for the reason the
+///   rerouted skip is.
 ///
 /// The remaining decisions spawn or defer, so none is a skip: `false`.
 fn skip_leaves_row_pending(decision: &SpawnDecision) -> bool {
     matches!(
         decision,
-        SpawnDecision::SkipSuperseded { .. } | SpawnDecision::SkipRerouted { .. }
+        SpawnDecision::SkipSuperseded { .. }
+            | SpawnDecision::SkipRerouted { .. }
+            | SpawnDecision::SkipExpired { .. }
     )
 }
 
@@ -2776,6 +2852,25 @@ fn settle_claim_decision(
             // rather than incidental). No outcome and no deferred stamp: the
             // row now belongs to the new target, and a deferral from us would
             // write this device's pressure onto a row another device owns.
+            settle_skipped_claim(decision, consume_target);
+            ClaimOutcome::Skip
+        }
+        SpawnDecision::SkipExpired {
+            expired_reason,
+            target_device_id,
+        } => {
+            info!(
+                "agent_runtime: continuation already expired by coord and this device is not \
+                 its target — skipping spawn, no outcome posted (gate_id={gate_id} \
+                 expired_reason={} target_device_id={})",
+                expired_reason.as_deref().unwrap_or("(not named)"),
+                target_device_id
+                    .as_ref()
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "(none)".to_string())
+            );
+            // RELEASES, like the rerouted arm: a re-clearance can revive the
+            // row and re-dispatch it here (`skip_leaves_row_pending`).
             settle_skipped_claim(decision, consume_target);
             ClaimOutcome::Skip
         }
@@ -3188,10 +3283,11 @@ fn prune_dead_continuations(is_live: &dyn Fn(&str) -> bool) {
     }
     // Only `live` is reaped: a pending anchor has no terminal to test and is
     // released by the dispatch that holds it (`AnchorReservation`).
-    let reaped: Vec<ContinuationSession> = {
+    let reaped: Vec<ExitedContinuation> = {
         let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
         dead.iter()
             .filter_map(|tid| registry.live.remove(tid))
+            .map(ExitedContinuation::left_live)
             .collect()
     };
 
@@ -3214,7 +3310,8 @@ fn prune_dead_continuations(is_live: &dyn Fn(&str) -> bool) {
     let Some(device_id) = load_local_device_id() else {
         return;
     };
-    for session in &reaped {
+    for exited in &reaped {
+        let session = &exited.session;
         let snapshot = pane_exit_facts(&session.terminal_id);
         let detail = work_unreported_detail(
             snapshot.map(|(f, _)| f),
@@ -3223,7 +3320,7 @@ fn prune_dead_continuations(is_live: &dyn Fn(&str) -> bool) {
         );
         spawn_work_unreported_fallback(
             &handle,
-            session.gate_id,
+            exited.report_to(),
             device_id,
             &session.terminal_id,
             detail,
@@ -3945,7 +4042,7 @@ pub(crate) fn notify_continuation_terminal_exit(
     rt_handle: Option<&tokio::runtime::Handle>,
     exit: Option<crate::terminal::session::PaneExitFacts>,
 ) {
-    let Some(session) = deregister_exited_continuation(terminal_id) else {
+    let Some(exited) = deregister_exited_continuation(terminal_id) else {
         return;
     };
     let (exit, exited_at) = match exit {
@@ -3957,9 +4054,12 @@ pub(crate) fn notify_continuation_terminal_exit(
     };
     let detail = work_unreported_detail(
         exit,
-        session_lifetime(session.registered_at, exited_at),
+        session_lifetime(exited.session.registered_at, exited_at),
         terminal_id,
     );
+    // The episode was taken from the book as the registration left `live`, so
+    // the two early returns below, which post no `work_unreported`, leave
+    // nothing behind in it.
     let Some(device_id) = load_local_device_id() else {
         return;
     };
@@ -3978,7 +4078,7 @@ pub(crate) fn notify_continuation_terminal_exit(
     // drain a load-deferred continuation PROMPTLY; putting a 5s-timeout
     // network POST in front of it would tax that latency for an unrelated
     // concern, and an aborted outcome task would take the polls with it.
-    spawn_work_unreported_fallback(handle, session.gate_id, device_id, terminal_id, detail);
+    spawn_work_unreported_fallback(handle, exited.report_to(), device_id, terminal_id, detail);
     handle.spawn(async move {
         poll_pending_continuations(device_id).await;
         poll_pending_unit_dispatches(device_id).await;
@@ -3995,18 +4095,83 @@ pub(crate) fn notify_continuation_terminal_exit(
 /// failed) or which exited before its post-spawn `register` landed.
 fn spawn_work_unreported_fallback(
     handle: &tokio::runtime::Handle,
-    gate_id: Option<uuid::Uuid>,
+    gate: Option<ExitedGate>,
     device_id: uuid::Uuid,
     terminal_id: &str,
     detail: String,
 ) {
-    let Some(gate_id) = gate_id else {
+    let Some(gate) = gate else {
         return;
     };
     let terminal_id = terminal_id.to_string();
+    // The episode is MOVED into the task, already taken: the task may first
+    // run after a fresh claim of the same gate has remembered its own.
     handle.spawn(async move {
-        post_work_unreported_fallback(gate_id, device_id, &terminal_id, detail).await;
+        post_work_unreported_fallback(gate, device_id, &terminal_id, detail).await;
     });
+}
+
+/// The gate an ended continuation reports `work_unreported` to, and the
+/// dispatch episode it was claimed under (`None` = unknown).
+///
+/// The episode is taken from the episode book in the same step that removes
+/// the registration from `live` ([`ExitedContinuation::left_live`]), never
+/// later in the posting task: a fresh claim of the same gate can remember its
+/// own episode before that task is first polled, and the old run's outcome
+/// would then be posted under the new run's episode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExitedGate {
+    gate_id: uuid::Uuid,
+    dispatched_at: Option<String>,
+}
+
+/// A gate whose dispatch episode is unknown — coord applies its pre-guard
+/// behaviour to an outcome that names none.
+impl From<uuid::Uuid> for ExitedGate {
+    fn from(gate_id: uuid::Uuid) -> Self {
+        Self {
+            gate_id,
+            dispatched_at: None,
+        }
+    }
+}
+
+/// A registration that has just left `live` — through the PTY exit hook or the
+/// liveness reaper — with its gate's episode already taken from the book.
+#[derive(Debug)]
+struct ExitedContinuation {
+    session: ContinuationSession,
+    /// The episode the gate was claimed under, taken as the entry left `live`.
+    episode: Option<String>,
+}
+
+impl ExitedContinuation {
+    /// Wrap a registration just removed from `live`, taking its gate's
+    /// episode in the same step. Called with the registry lock held.
+    fn left_live(session: ContinuationSession) -> Self {
+        let episode = session
+            .gate_id
+            .and_then(crate::session::continuation_outcome_outbox::take_episode);
+        Self { session, episode }
+    }
+
+    /// The gate to report to, with the episode — `None` when the session had
+    /// no gate (a work-unit dispatch, or a legacy frame).
+    fn report_to(&self) -> Option<ExitedGate> {
+        self.session.gate_id.map(|gate_id| ExitedGate {
+            gate_id,
+            dispatched_at: self.episode.clone(),
+        })
+    }
+}
+
+/// Reads through to the registration that left `live`.
+impl std::ops::Deref for ExitedContinuation {
+    type Target = ContinuationSession;
+
+    fn deref(&self) -> &ContinuationSession {
+        &self.session
+    }
 }
 
 /// How a continuation session that STARTED ended — the `exit=` class of the
@@ -4128,23 +4293,37 @@ fn session_lifetime(
 ///
 /// Never fails the exit path: every arm logs and returns.
 async fn post_work_unreported_fallback(
-    gate_id: uuid::Uuid,
+    gate: impl Into<ExitedGate>,
     device_id: uuid::Uuid,
     terminal_id: &str,
     detail: String,
 ) {
+    let ExitedGate {
+        gate_id,
+        dispatched_at: episode,
+    } = gate.into();
     // The detail is [`work_unreported_detail`]'s one line — HOW the session
     // ended, which is what lets coord re-deliver a crash and leave a deliberate
     // end alone. Coord persists `work_unreported: <detail>`.
-    match post_continuation_outcome(
+    // Durable (a real outcome on a consumed row), on the same per-gate lane
+    // as `spawned`, so a queued `spawned` stays ahead of it. Names the episode
+    // the session was claimed under, when the poll told us — taken from the
+    // book when the registration left `live` (see [`ExitedGate`]), so this
+    // post is its only use. Where the post is written ahead, a NoVerdict leaves
+    // the queued row carrying the episode in its own payload; with no coord
+    // configured ([`OutcomeDoor::live`] is `None`) nothing is written ahead and
+    // the episode goes with the outcome, which is not recorded at all.
+    let ack = post_continuation_outcome(
         gate_id,
         device_id,
         ContinuationOutcome::WorkUnreported,
         Some(detail),
         None,
+        episode,
+        true,
     )
-    .await
-    {
+    .await;
+    match ack {
         OutcomeAck::Recorded => {
             info!(
                 "agent_runtime: continuation terminal_id={terminal_id} gate_id={gate_id} exited \
@@ -4218,7 +4397,7 @@ fn marker_matches(marker: &str, recorded: &str) -> bool {
 /// Pure over the registry (the only side effect is the removal), so the
 /// capacity-freed re-poll decision is unit-testable without a tokio runtime or a
 /// live `TerminalManager`. Operator tabs are never in the registry → `None`.
-fn deregister_exited_continuation(terminal_id: &str) -> Option<ContinuationSession> {
+fn deregister_exited_continuation(terminal_id: &str) -> Option<ExitedContinuation> {
     // `lock_recover`, not a bare `.lock()` + `unwrap_or(None)`: a poisoned lock
     // must not silently leak the cap slot AND permanently disable the
     // work-outcome fallback for every later continuation. The other two writers
@@ -4227,6 +4406,7 @@ fn deregister_exited_continuation(terminal_id: &str) -> Option<ContinuationSessi
     lock_recover(continuation_sessions(), "continuation_sessions")
         .live
         .remove(terminal_id)
+        .map(ExitedContinuation::left_live)
 }
 
 /// A continuation registration lifted off one terminal so it can be re-pinned
@@ -4859,6 +5039,7 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
         // shared seam dedupes + acks even if coord omitted it inside `payload`.
         let mut payload = row.payload;
         payload.gate_id = Some(row.gate_id);
+        payload.dispatched_at = row.dispatched_at;
         match dispatch_gate_continuation(payload, device_id).await {
             DispatchOutcome::Dispatched => counts.dispatched_n += 1,
             DispatchOutcome::AlreadyDispatched => counts.already_dispatched += 1,
@@ -5101,6 +5282,8 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
 /// - 409 `{"error":"cancelled", cancel_reason}` → [`SpawnDecision::SkipCancelled`].
 /// - 409 `{"error":"superseded", winner_gate_id, …}` → [`SpawnDecision::SkipSuperseded`].
 /// - 409 `{"error":"rerouted", target_device_id, …}` → [`SpawnDecision::SkipRerouted`].
+/// - 409 `{"error":"expired", expired_reason, target_device_id, …}` →
+///   [`SpawnDecision::SkipExpired`].
 /// - 5s timeout / network failure / any other non-2xx →
 ///   [`SpawnDecision::SpawnDespiteClaimError`] (availability over consistency —
 ///   preserves the pre-restructure behavior; the in-process dedupe still guards).
@@ -5150,17 +5333,58 @@ async fn claim_before_spawn(gate_id: uuid::Uuid, device_id: uuid::Uuid) -> Spawn
             let text = resp.text().await.unwrap_or_default();
             decide_spawn(status, &text)
         }
+        // The cause CHAIN with a `[timeout]` / `[connect]` tag: a bare `{e:#}`
+        // on a reqwest error printed only "error sending request for url (…)",
+        // which left the 2026-10-22 incident unable to say which fault it was.
         Err(e) => SpawnDecision::SpawnDespiteClaimError {
-            cause: format!("claim POST failed: {e:#}"),
+            cause: format!(
+                "claim POST failed: {}",
+                crate::session::coord_sync::transport_error(&e)
+            ),
         },
     }
 }
 
-/// POST the consume OUTCOME (`{device_id, outcome, detail?}`) after the spawn
-/// attempt resolves, or after the spawned session's PTY exits without having
-/// reported. Best-effort, 5s timeout — a failure `warn!`s once and is
-/// swallowed (coord already recorded the claim; a missed outcome only leaves
-/// `continuation_consumed_outcome` NULL). NEVER crashes the caller.
+/// Where a consume OUTCOME post goes: coord's base URL, the HTTP client, and
+/// the durable store's install point. Production resolves one per post
+/// ([`OutcomeDoor::live`]); the wiring tests build one over a fake coord.
+struct OutcomeDoor<'a> {
+    base: String,
+    /// `None` = the runner has no shared coord client; the write-ahead copy is
+    /// left for the drain, which has its own.
+    client: Option<&'a reqwest::Client>,
+    installer: &'a crate::session::continuation_outcome_outbox::Installer,
+}
+
+impl OutcomeDoor<'static> {
+    /// The live door, or `None` when no coord is configured (nothing to post
+    /// to and nothing to retry against).
+    fn live() -> Option<Self> {
+        Some(Self {
+            base: connected_coord_base()?,
+            client: crate::coord_http::coord_client(),
+            installer: crate::session::continuation_outcome_outbox::installer(),
+        })
+    }
+}
+
+/// POST the consume OUTCOME (`{device_id, outcome, detail?, dispatched_at?}`)
+/// after the spawn attempt resolves, or after the spawned session's PTY exits
+/// without having reported. NEVER crashes the caller.
+///
+/// **Durable** (plan
+/// `2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume`,
+/// Phase 2). It is NOT safe to assume "coord already recorded the claim": on
+/// the [`SpawnDecision::SpawnDespiteClaimError`] path this post is the ONLY
+/// record of the consume, and the 2026-10-22 brownout saw hundreds of these
+/// posts fail. So when `durable`, the record is written to the session outbox
+/// (kind `gate_continuation_outcome`) BEFORE the one direct 5 s attempt; the
+/// direct answer then ACKs it (a confirmed 2xx, or a 400/404/409/422 refusal)
+/// or leaves it for the `coord_sync` drain, which retries until coord answers.
+/// A gate with a record already pending is written behind it and not posted
+/// directly, so the lane's order holds. All of that lives in
+/// [`crate::session::continuation_outcome_outbox`]; `durable` is that module's
+/// `durable_retry_applies` for this post.
 ///
 /// **Verifies by read.** The route answers 200 for a REFUSED outcome write as
 /// well as an accepted one — the consume ack is recorded either way, and only
@@ -5176,18 +5400,76 @@ async fn post_continuation_outcome(
     outcome: ContinuationOutcome,
     detail: Option<String>,
     claude_code_session_id: Option<String>,
+    dispatched_at: Option<String>,
+    durable: bool,
 ) -> OutcomeAck {
-    let Some(base) = connected_coord_base() else {
+    let Some(door) = OutcomeDoor::live() else {
         return OutcomeAck::NoVerdict;
     };
-    let url = format!("{base}/coord/gates/{gate_id}/continuation-consumed");
-    let Some(client) = crate::coord_http::coord_client() else {
-        warn!("agent_runtime: continuation-outcome: no shared coord client gate_id={gate_id}");
-        return OutcomeAck::NoVerdict;
-    };
+    post_continuation_outcome_via(
+        &door,
+        gate_id,
+        device_id,
+        outcome,
+        detail,
+        claude_code_session_id,
+        dispatched_at,
+        durable,
+    )
+    .await
+}
+
+/// [`post_continuation_outcome`] through an explicit [`OutcomeDoor`] — the
+/// seam the wiring tests drive.
+#[allow(clippy::too_many_arguments)]
+async fn post_continuation_outcome_via(
+    door: &OutcomeDoor<'_>,
+    gate_id: uuid::Uuid,
+    device_id: uuid::Uuid,
+    outcome: ContinuationOutcome,
+    detail: Option<String>,
+    claude_code_session_id: Option<String>,
+    dispatched_at: Option<String>,
+    durable: bool,
+) -> OutcomeAck {
+    use crate::session::continuation_outcome_outbox as outbox;
     let token = outcome.wire();
+    // Capped once, so the direct body and the queued row carry the same text
+    // (a `spawn_failed` detail is an error chain; the row is trim-exempt).
+    let detail = detail.map(outbox::bound_detail);
+    let record = outbox::ContinuationOutcomeRecord {
+        gate_id,
+        device_id,
+        outcome: token.to_string(),
+        detail: detail.clone(),
+        claude_code_session_id: claude_code_session_id.clone(),
+        dispatched_at: dispatched_at.clone(),
+    };
+    // Write-ahead: on disk (or in the pre-install buffer) before the network.
+    // `_hold` keeps the drain off this gate's lane until the direct attempt
+    // below is settled (dropped at return), so the row is posted once at a time.
+    let (written, _hold) = door.installer.write_ahead_held(&record, durable);
+    if !written.posts_directly() {
+        // Behind a pending record for this gate, or already pending: the
+        // drain posts the lane in order.
+        return OutcomeAck::NoVerdict;
+    }
+    let url = format!(
+        "{}/coord/gates/{gate_id}/continuation-consumed",
+        door.base.trim_end_matches('/')
+    );
+    let Some(client) = door.client else {
+        outbox::handle_direct_failure(
+            door.installer,
+            &written,
+            &outbox::DirectFailure::NoClient,
+            &record,
+        );
+        return OutcomeAck::NoVerdict;
+    };
     let body =
-        ContinuationConsumedBody::outcome(device_id, outcome, detail, claude_code_session_id);
+        ContinuationConsumedBody::outcome(device_id, outcome, detail, claude_code_session_id)
+            .at_episode(dispatched_at);
     // coord-tenant-scope(device): ContinuationConsumedBody::outcome(device_id, ..); same device-keyed route — coord resolves the gate row from the path gate_id plus the verified claiming device, and the optional claude_code_session_id is a value it STAMPS onto that row, never a key it scopes or looks up by.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
@@ -5196,7 +5478,10 @@ async fn post_continuation_outcome(
         .await
     {
         Ok(resp) if resp.status().is_success() => {
+            let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
+            // ACK the written-ahead copy only when coord confirmed the consume.
+            outbox::handle_direct_answer(door.installer, &written, &record, status, &text);
             let ack = classify_outcome_ack(outcome, &text);
             debug!(
                 "agent_runtime: continuation-outcome posted gate_id={gate_id} \
@@ -5225,18 +5510,25 @@ async fn post_continuation_outcome(
             }
             ack
         }
+        // A non-2xx: coord's own answer is logged by the module, and the
+        // written-ahead copy is dropped only on a content refusal.
         Ok(resp) => {
-            warn!(
-                "agent_runtime: continuation-outcome POST gate_id={gate_id} outcome={token} \
-                 returned {} (continuing)",
-                resp.status()
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            outbox::handle_direct_failure(
+                door.installer,
+                &written,
+                &outbox::DirectFailure::Status { status, body },
+                &record,
             );
             OutcomeAck::NoVerdict
         }
         Err(e) => {
-            warn!(
-                "agent_runtime: continuation-outcome POST gate_id={gate_id} outcome={token} \
-                 failed (continuing): {e:#}"
+            outbox::handle_direct_failure(
+                door.installer,
+                &written,
+                &outbox::DirectFailure::Transport(crate::session::coord_sync::transport_error(&e)),
+                &record,
             );
             OutcomeAck::NoVerdict
         }
@@ -5313,9 +5605,61 @@ async fn post_spawn_outcome(
     detail: Option<String>,
     // The pinned Claude session uuid — `Some` only on a `Spawned` outcome.
     claude_code_session_id: Option<String>,
+    // The dispatch episode this run was claimed under (`None` = unknown).
+    dispatched_at: Option<String>,
+    // Whether coord CONFIRMED the consume claim (a 200). Decides whether a
+    // failed `spawn_failed` earns a durable retry; `spawned` always does.
+    claim_confirmed: bool,
 ) {
-    if let OutcomeAck::Superseded(standing) =
-        post_continuation_outcome(gate_id, device_id, outcome, detail, claude_code_session_id).await
+    // A failed spawn never reaches the PTY exit fallback, so the episode it
+    // was remembered under for that fallback is forgotten here.
+    if outcome == ContinuationOutcome::SpawnFailed {
+        crate::session::continuation_outcome_outbox::take_episode(gate_id);
+    }
+    let Some(door) = OutcomeDoor::live() else {
+        return;
+    };
+    post_spawn_outcome_via(
+        &door,
+        gate_id,
+        device_id,
+        outcome,
+        detail,
+        claude_code_session_id,
+        dispatched_at,
+        claim_confirmed,
+    )
+    .await;
+}
+
+/// [`post_spawn_outcome`] through an explicit [`OutcomeDoor`] — the seam the
+/// wiring tests drive, so the `claim_confirmed` gate is covered.
+#[allow(clippy::too_many_arguments)]
+async fn post_spawn_outcome_via(
+    door: &OutcomeDoor<'_>,
+    gate_id: uuid::Uuid,
+    device_id: uuid::Uuid,
+    outcome: ContinuationOutcome,
+    detail: Option<String>,
+    claude_code_session_id: Option<String>,
+    dispatched_at: Option<String>,
+    claim_confirmed: bool,
+) {
+    let durable = crate::session::continuation_outcome_outbox::durable_retry_applies(
+        outcome.wire(),
+        claim_confirmed,
+    );
+    if let OutcomeAck::Superseded(standing) = post_continuation_outcome_via(
+        door,
+        gate_id,
+        device_id,
+        outcome,
+        detail,
+        claude_code_session_id,
+        dispatched_at,
+        durable,
+    )
+    .await
     {
         warn!(
             "agent_runtime: continuation-outcome gate_id={gate_id} REFUSED — posted {} but \
@@ -6069,6 +6413,11 @@ async fn run_gate_continuation_inner(
     // AFTER the #469 guards pass and AWAITED — its result decides whether to
     // spawn. This closes the poll→cancel→spawn race: if a cancel landed between
     // the poll and now, coord returns 409 cancelled and we skip the spawn.
+    //
+    // `claim_confirmed` carries coord's 200 to step 4: a failed `spawn_failed`
+    // is durably retried only on a CONFIRMED claim (see
+    // `continuation_outcome_outbox::durable_retry_applies`).
+    let mut claim_confirmed = false;
     if let ConsumeTarget::Gate(gate_id, _) = consume_target {
         // ONE wiring statement. Every per-decision behaviour — which skip
         // releases the local claim, which decision proceeds, and what each
@@ -6083,8 +6432,18 @@ async fn run_gate_continuation_inner(
         // So the DECISION (log + whether the claim is settled here) stays
         // there and only the await lands at this call site.
         let decision = post_continuation_claim(gate_id, device_id).await;
+        claim_confirmed = decision == SpawnDecision::Spawn;
         match settle_claim_decision(&decision, consume_target, gate_id) {
-            ClaimOutcome::Spawn => {}
+            ClaimOutcome::Spawn => {
+                // The PTY exit fallback knows only the gate id; let it name
+                // the same dispatch episode this run was claimed under. A
+                // poll that named none FORGETS an earlier claim's episode, so
+                // this run's fallback cannot post under a stale one.
+                crate::session::continuation_outcome_outbox::remember_episode(
+                    gate_id,
+                    payload.dispatched_at.as_deref(),
+                );
+            }
             ClaimOutcome::Skip => return Ok(()),
             ClaimOutcome::DeferUnclaimed(class) => {
                 defer_continuation_unclaimed(consume_target, device_id, drain_stamp_reason(class))
@@ -6168,6 +6527,8 @@ async fn run_gate_continuation_inner(
                         &e.to_string(),
                     ))),
                     None,
+                    payload.dispatched_at.clone(),
+                    claim_confirmed,
                 )
                 .await;
             }
@@ -6259,12 +6620,19 @@ async fn run_gate_continuation_inner(
     match consume_target {
         ConsumeTarget::Gate(gate_id, _) => {
             let resolution = spawn_resolution_outcome(&result);
+            // A headless child has already exited here and has no PTY exit
+            // hook, so nothing will read the episode remembered for it.
+            if payload.presentation == Presentation::Headless {
+                crate::session::continuation_outcome_outbox::take_episode(gate_id);
+            }
             post_spawn_outcome(
                 gate_id,
                 device_id,
                 resolution.outcome,
                 resolution.detail,
                 resolution.claude_code_session_id,
+                payload.dispatched_at.clone(),
+                claim_confirmed,
             )
             .await
         }
@@ -14373,6 +14741,11 @@ mod tests {
             brief: None,
             retry: None,
             allocation: None,
+            ..serde_json::from_value(serde_json::json!({
+                "target_device_id": uuid::Uuid::nil(),
+                "initial_prompt": "",
+            }))
+            .unwrap()
         };
         let workdir = std::env::temp_dir().to_string_lossy().to_string();
         let res = run_continuation_terminal(
@@ -17523,6 +17896,11 @@ mod tests {
                 brief: None,
                 retry: None,
                 allocation: None,
+                ..serde_json::from_value(serde_json::json!({
+                    "target_device_id": uuid::Uuid::nil(),
+                    "initial_prompt": "",
+                }))
+                .unwrap()
             }
         }
         let gate = uuid::Uuid::now_v7();
@@ -17655,6 +18033,65 @@ mod tests {
         }
     }
 
+    /// 409 with coord Phase 3's TTL-expired contract (answered to a NON-target
+    /// device) → SkipExpired: no spawn, no outcome, local claim RELEASED. Before
+    /// this arm the shape fell into "any other 409" and spawned anyway — an
+    /// unrecorded run of work coord had already given up on (plan
+    /// `2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume`).
+    #[test]
+    fn decide_spawn_on_409_expired_skips_without_spawning() {
+        let target = uuid::Uuid::now_v7();
+        let body = format!(
+            r#"{{"error":"expired","expired_at":"2026-10-29T10:00:00.123456+00:00","expired_reason":"ttl_7d_elapsed","target_device_id":"{target}"}}"#
+        );
+        let decision = decide_spawn(409, &body);
+        assert_eq!(
+            decision,
+            SpawnDecision::SkipExpired {
+                expired_reason: Some("ttl_7d_elapsed".to_string()),
+                target_device_id: Some(target),
+            }
+        );
+        // A null / absent target and reason still skip: the refusal is
+        // authoritative, the fields are for the log only.
+        for body in [
+            r#"{"error":"expired","target_device_id":null}"#,
+            r#"{"error":"expired"}"#,
+        ] {
+            assert_eq!(
+                decide_spawn(409, body),
+                SpawnDecision::SkipExpired {
+                    expired_reason: None,
+                    target_device_id: None,
+                },
+                "{body}"
+            );
+        }
+        // Not terminal on coord (a re-clearance revives an expired row): the
+        // skip RELEASES the local claim, and the funnel returns Skip (no
+        // spawn, no deferral, no outcome).
+        assert!(skip_leaves_row_pending(&decision));
+        let gate = uuid::Uuid::now_v7();
+        assert!(claim_gate_dispatch(gate));
+        assert_eq!(
+            settle_claim_decision(&decision, ConsumeTarget::Gate(gate, 0), gate),
+            ClaimOutcome::Skip
+        );
+        assert!(
+            claim_gate_dispatch(gate),
+            "an expired skip releases the local claim: a revived row may be re-delivered here"
+        );
+        release_gate_dispatch(gate);
+        // The drain never turns a refusal into anything else.
+        assert_eq!(
+            apply_drain_to_claim(
+                decision.clone(),
+                &crate::coord_drain_state::CoordDrainState::Clear
+            ),
+            decision
+        );
+    }
+
     /// 409 cancelled with no `cancel_reason` → SkipCancelled with `None` reason
     /// (still skips — the cancel is authoritative even without a reason string).
     #[test]
@@ -17699,6 +18136,56 @@ mod tests {
     // =========================================================================
     // Defect A item 3 (layered on #484): capacity-freed re-poll
     // =========================================================================
+
+    /// Leaving `live` takes the gate's episode in the same step — through the
+    /// exit hook's deregister and through the reaper — so a fresh claim of the
+    /// gate that remembers its own episode before the old run's fallback task
+    /// first runs keeps it, and the old run reports under the old one.
+    #[test]
+    fn leaving_live_takes_the_gate_episode_at_once() {
+        use crate::session::continuation_outcome_outbox::{remember_episode, take_episode};
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let gate = uuid::Uuid::now_v7();
+
+        register_continuation_session(
+            "term-ep-1".to_string(),
+            Some("anchor-ep-1".into()),
+            Some(gate),
+        );
+        remember_episode(gate, Some("e1"));
+        let exited = deregister_exited_continuation("term-ep-1").expect("registered");
+        // A fresh claim of the same gate lands before the fallback task runs.
+        remember_episode(gate, Some("e2"));
+        assert_eq!(
+            exited.report_to(),
+            Some(ExitedGate {
+                gate_id: gate,
+                dispatched_at: Some("e1".into()),
+            }),
+            "the exited run carries the episode it was claimed under"
+        );
+        assert_eq!(
+            take_episode(gate).as_deref(),
+            Some("e2"),
+            "the fresh claim's episode is left for its own run"
+        );
+
+        register_continuation_session(
+            "term-ep-2".to_string(),
+            Some("anchor-ep-2".into()),
+            Some(gate),
+        );
+        remember_episode(gate, Some("e3"));
+        // No runtime here, so the reaper reaps and posts nothing.
+        prune_dead_continuations(&|tid| tid != "term-ep-2");
+        assert_eq!(
+            take_episode(gate),
+            None,
+            "the reaper took the episode as it removed the entry"
+        );
+        clear_continuation_registry();
+    }
 
     /// A continuation terminal's exit deregisters it from the live registry AND
     /// reports it WAS a continuation (`true`) — the signal the on-exit hook uses
@@ -18506,5 +18993,409 @@ mod gateway_spawn_refusal_tests {
             Ok(_) => panic!("an unresolved gateway must refuse the spawn"),
             Err(err) => assert!(format!("{err:#}").contains("model gateway"), "{err:#}"),
         }
+    }
+}
+
+// The `agent_runtime` half of plan
+// `2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume`
+// Phase 2: the outcome post's wiring to the durable store, driven through the
+// [`OutcomeDoor`] seam against the shared raw-TCP fake coord.
+#[cfg(test)]
+mod outcome_wiring_tests {
+    use super::*;
+    use crate::session::continuation_outcome_outbox::fake_coord::{self, Reply};
+    use crate::session::continuation_outcome_outbox::{
+        lane, ContinuationOutcomeOutbox, ContinuationOutcomeRecord, Installer,
+    };
+    use crate::session::local_store::OutboxWriter;
+    use serde_json::json;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+
+    const SERVED_AT: &str = "2026-10-22T18:48:46.123456+00:00";
+
+    struct Rig {
+        _dir: tempfile::TempDir,
+        outbox: Arc<OutboxWriter>,
+        installer: Installer,
+        client: reqwest::Client,
+        base: String,
+    }
+
+    fn door(rig: &Rig) -> OutcomeDoor<'_> {
+        OutcomeDoor {
+            base: rig.base.clone(),
+            client: Some(&rig.client),
+            installer: &rig.installer,
+        }
+    }
+
+    fn pending_for(rig: &Rig, gate: uuid::Uuid) -> Vec<serde_json::Value> {
+        rig.outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.session_id == lane(gate))
+            .map(|r| r.payload)
+            .collect()
+    }
+
+    fn rig(base: String) -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap());
+        let installer = Installer::new();
+        assert!(installer.install(Arc::new(ContinuationOutcomeOutbox::new(
+            outbox.clone(),
+            uuid::Uuid::new_v4()
+        ))));
+        Rig {
+            _dir: dir,
+            outbox,
+            installer,
+            client: reqwest::Client::new(),
+            base,
+        }
+    }
+
+    async fn post(rig: &Rig, gate: uuid::Uuid, outcome: ContinuationOutcome) -> OutcomeAck {
+        post_continuation_outcome_via(
+            &door(rig),
+            gate,
+            uuid::Uuid::from_u128(0xeb21_55ed),
+            outcome,
+            None,
+            None,
+            Some(SERVED_AT.to_string()),
+            true,
+        )
+        .await
+    }
+
+    /// A direct post whose connection drops leaves the written-ahead record
+    /// queued for the drain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_direct_post_is_queued_for_the_drain() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, script) = fake_coord::spawn().await;
+        let r = rig(base);
+        let gate = uuid::Uuid::new_v4();
+        script
+            .lock()
+            .await
+            .replies
+            .insert(gate, VecDeque::from([Reply::Drop]));
+        assert_eq!(
+            post(&r, gate, ContinuationOutcome::Spawned).await,
+            OutcomeAck::NoVerdict
+        );
+        assert_eq!(script.lock().await.answered(gate), vec![0]);
+        let queued = pending_for(&r, gate);
+        assert_eq!(queued.len(), 1, "the dropped post is durably queued");
+        assert_eq!(queued[0]["outcome"], json!("spawned"));
+        assert_eq!(queued[0]["dispatched_at"], json!(SERVED_AT));
+    }
+
+    /// A direct 409 is coord's verdict on the row: nothing stays queued.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_direct_409_is_not_queued() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, script) = fake_coord::spawn().await;
+        let r = rig(base);
+        let gate = uuid::Uuid::new_v4();
+        script.lock().await.replies.insert(
+            gate,
+            VecDeque::from([Reply::Status(409, json!({"error": "cancelled"}))]),
+        );
+        assert_eq!(
+            post(&r, gate, ContinuationOutcome::Spawned).await,
+            OutcomeAck::NoVerdict
+        );
+        assert_eq!(script.lock().await.answered(gate), vec![409]);
+        assert!(pending_for(&r, gate).is_empty(), "a 409 is not queued");
+    }
+
+    /// A confirmed direct post carries the episode verbatim, is `Recorded`,
+    /// and leaves nothing queued (the write-ahead row is ACKed).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_confirmed_post_carries_the_episode_and_leaves_nothing_queued() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, script) = fake_coord::spawn().await;
+        let r = rig(base);
+        let gate = uuid::Uuid::new_v4();
+        assert_eq!(
+            post(&r, gate, ContinuationOutcome::Spawned).await,
+            OutcomeAck::Recorded
+        );
+        let s = script.lock().await;
+        assert_eq!(s.answered(gate), vec![200]);
+        let (_, body, _) = s.seen.iter().find(|(g, _, _)| *g == gate).unwrap();
+        assert_eq!(
+            body["dispatched_at"],
+            json!(SERVED_AT),
+            "at_episode carried"
+        );
+        assert_eq!(body["outcome"], json!("spawned"));
+        assert!(pending_for(&r, gate).is_empty());
+    }
+
+    /// `spawn_failed` after an UNCONFIRMED claim is never queued; after a
+    /// confirmed one it is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_failed_is_queued_only_after_a_confirmed_claim() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, script) = fake_coord::spawn().await;
+        let r = rig(base);
+        let unconfirmed = uuid::Uuid::new_v4();
+        let confirmed = uuid::Uuid::new_v4();
+        {
+            let mut s = script.lock().await;
+            s.replies.insert(unconfirmed, VecDeque::from([Reply::Drop]));
+            s.replies.insert(confirmed, VecDeque::from([Reply::Drop]));
+        }
+        for (gate, claim_confirmed) in [(unconfirmed, false), (confirmed, true)] {
+            post_spawn_outcome_via(
+                &door(&r),
+                gate,
+                uuid::Uuid::from_u128(0xeb21_55ed),
+                ContinuationOutcome::SpawnFailed,
+                Some("spawn failed".into()),
+                None,
+                Some(SERVED_AT.to_string()),
+                claim_confirmed,
+            )
+            .await;
+        }
+        assert!(
+            pending_for(&r, unconfirmed).is_empty(),
+            "spawn_failed on an unconfirmed claim is left for the replay backstop"
+        );
+        assert_eq!(pending_for(&r, confirmed).len(), 1);
+        let s = script.lock().await;
+        assert_eq!(s.answered(unconfirmed), vec![0], "still posted directly");
+        assert_eq!(s.answered(confirmed), vec![0]);
+    }
+
+    /// An outcome for a gate with a record already queued is written behind
+    /// it and NOT posted directly; with no client the record stays queued.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_post_behind_a_queued_record_or_with_no_client_stays_queued() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, script) = fake_coord::spawn().await;
+        let r = rig(base);
+        let gate = uuid::Uuid::new_v4();
+        r.installer
+            .store()
+            .unwrap()
+            .enqueue(&ContinuationOutcomeRecord {
+                gate_id: gate,
+                device_id: uuid::Uuid::from_u128(0xeb21_55ed),
+                outcome: "spawned".into(),
+                detail: None,
+                claude_code_session_id: None,
+                dispatched_at: Some(SERVED_AT.to_string()),
+            })
+            .unwrap();
+        post(&r, gate, ContinuationOutcome::WorkUnreported).await;
+        assert!(
+            script.lock().await.answered(gate).is_empty(),
+            "nothing overtakes the queued spawned"
+        );
+        let queued = pending_for(&r, gate);
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[1]["outcome"], json!("work_unreported"));
+
+        let lone = uuid::Uuid::new_v4();
+        let door = OutcomeDoor {
+            base: r.base.clone(),
+            client: None,
+            installer: &r.installer,
+        };
+        post_continuation_outcome_via(
+            &door,
+            lone,
+            uuid::Uuid::from_u128(0xeb21_55ed),
+            ContinuationOutcome::Spawned,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(
+            pending_for(&r, lone).len(),
+            1,
+            "no client: left for the drain"
+        );
+        assert!(script.lock().await.answered(lone).is_empty());
+    }
+
+    /// A long `spawn_failed` detail is capped at 300 characters, the same text
+    /// on the wire and in the queued row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_long_spawn_failed_detail_is_capped_on_the_wire_and_in_the_row() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, script) = fake_coord::spawn().await;
+        let r = rig(base);
+        let gate = uuid::Uuid::new_v4();
+        script
+            .lock()
+            .await
+            .replies
+            .insert(gate, VecDeque::from([Reply::Drop]));
+        post_spawn_outcome_via(
+            &door(&r),
+            gate,
+            uuid::Uuid::from_u128(0xeb21_55ed),
+            ContinuationOutcome::SpawnFailed,
+            Some("e".repeat(5000)),
+            None,
+            Some(SERVED_AT.to_string()),
+            true,
+        )
+        .await;
+        let queued = pending_for(&r, gate);
+        assert_eq!(queued.len(), 1);
+        let row_detail = queued[0]["detail"].as_str().unwrap().to_string();
+        assert_eq!(
+            row_detail.chars().count(),
+            301,
+            "300 chars plus the ellipsis"
+        );
+        let s = script.lock().await;
+        let (_, body, _) = s.seen.iter().find(|(g, _, _)| *g == gate).unwrap();
+        assert_eq!(
+            body["detail"],
+            json!(row_detail),
+            "the wire carries the same text"
+        );
+    }
+}
+
+// Arming tests for plan
+// 2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume,
+// Phase 2. Each enters where the population enters — the claim post a
+// delivered continuation makes, and the work-outcome fallback an ended
+// continuation fires — against a raw-TCP coord configured the way production
+// finds one (`COORD_HTTP_URL`). Written so they compile against the pre-change
+// runtime too.
+#[cfg(test)]
+mod continuation_consume_arming {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // A coord that counts the requests whose request line names a
+    // continuation-consumed route, then answers `reply` — or, with `None`,
+    // drops the connection unanswered (a transport failure).
+    async fn counting_coord(reply: Option<(u16, &'static str)>) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let request = read_request(&mut sock).await;
+                    let line = request.lines().next().unwrap_or_default().to_string();
+                    if line.contains("/continuation-consumed") {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let Some((status, body)) = reply else {
+                        return;
+                    };
+                    let answer = format!(
+                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(answer.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    // Read one HTTP/1.1 request: headers, then `content-length` body bytes.
+    async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
+        let mut got: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            got.extend_from_slice(&buf[..n]);
+            if let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                let want = String::from_utf8_lossy(&got[..end])
+                    .lines()
+                    .filter_map(|l| l.split_once(':'))
+                    .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if got.len() >= end + 4 + want {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&got).to_string()
+    }
+
+    // coord's TTL-expired refusal, answered to a non-target device, is a
+    // refusal: the continuation is NOT spawned (before, it fell into the
+    // "any other 409" branch and spawned an unrecorded run).
+    #[tokio::test]
+    async fn a_claim_refused_as_expired_is_not_spawned() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, hits) = counting_coord(Some((
+            409,
+            r#"{"error":"expired","expired_reason":"ttl_7d_elapsed","target_device_id":null}"#,
+        )))
+        .await;
+        std::env::set_var("COORD_HTTP_URL", &base);
+        let decision = post_continuation_claim(uuid::Uuid::new_v4(), uuid::Uuid::new_v4()).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the claim reached coord");
+        assert!(
+            !matches!(
+                decision,
+                SpawnDecision::Spawn
+                    | SpawnDecision::SpawnDespiteClaimError { .. }
+                    | SpawnDecision::DeferClaimErrorByDrain { .. }
+            ),
+            "an expired refusal must not spawn: {decision:?}"
+        );
+        assert!(
+            format!("{decision:?}").starts_with("SkipExpired"),
+            "{decision:?}"
+        );
+    }
+
+    // A work outcome whose post coord never answered is HELD: the gate's next
+    // identical outcome is not put on the wire again (before, every post was a
+    // fresh fire-and-forget attempt). What holds it HERE is the process-wide
+    // pre-install buffer, not the installed store, and the drain never runs:
+    // the store is installed once per process by `main.rs`, and this test must
+    // also build against the pre-change runtime, which has neither, so it can
+    // name neither. The installed store's dedupe and the drain have their own
+    // wiring and drain tests. The held record
+    // stays in that buffer for the rest of the process; its gate is fresh, so
+    // no other test's lane is behind it.
+    #[tokio::test]
+    async fn an_unanswered_work_outcome_is_held_rather_than_reposted() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, hits) = counting_coord(None).await;
+        std::env::set_var("COORD_HTTP_URL", &base);
+        let gate = uuid::Uuid::new_v4();
+        let device = uuid::Uuid::new_v4();
+        for terminal in ["t-arming-1", "t-arming-2"] {
+            post_work_unreported_fallback(gate, device, terminal, "exit=crashed".into()).await;
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the unanswered outcome is held once, not posted twice"
+        );
     }
 }

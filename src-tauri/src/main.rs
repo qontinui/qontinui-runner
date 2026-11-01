@@ -4021,6 +4021,25 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                          handle (a second OutboxWriter over one file would collide)"
                     );
                 }
+                // Gate-continuation outcome outbox (plan
+                // 2026-10-29-a-gate-continuation-spawned-through-a-claim-error-never-records-its-consume,
+                // Phase 2) — `agent_runtime::post_continuation_outcome` writes a
+                // consume outcome here before its direct post, and the
+                // `CoordSync` drain retries whatever coord did not confirm. Same
+                // `registrar_outbox` Arc as the closeout spool, for the same
+                // collision reason. `agent_runtime::spawn_runtime` starts long
+                // before this point; an outcome posted in that window is held
+                // in the module's bounded pre-install buffer and written to the
+                // outbox by this install, not lost.
+                if !session::continuation_outcome_outbox::install(
+                    registrar_outbox.clone(),
+                    machine_id,
+                ) {
+                    tracing::warn!(
+                        "session: continuation-outcome outbox was already installed — keeping \
+                         the first handle (a second OutboxWriter over one file would collide)"
+                    );
+                }
                 // Transport-rung recorder (plan
                 // 2026-09-07-no-per-session-record-of-which-transport-rung-
                 // carried-a-coord-read, Phase 1) — the `/coord-mcp` proxy
