@@ -73,6 +73,7 @@ mod check_generation;
 mod ci_node;
 mod claude_accounts;
 mod claude_cli_spawn;
+mod claude_cli_update;
 mod claude_protocol;
 mod claude_session;
 mod click_overlay;
@@ -4613,8 +4614,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                     use session::session_lifecycle_store::{
                         boot_restore_hold, boot_restore_phase, carries_boot_restore_hold, classify,
-                        close_reason_for_dead_shell, hold_for_withheld_boot_restore,
-                        match_live_terminal, PollAction, WorkerPlane,
+                        close_reason_for_dead_shell, match_live_terminal, PollAction, WorkerPlane,
                     };
 
                     // Reference instant for `claude_present_in_inclusive_subtree`'s
@@ -5053,7 +5053,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             // restore — never closed `no-terminal` meanwhile.
                             let adoption_pending =
                                 terminal::holder_boot_sweep::adoption_pending(&rec.terminal_id);
-                            let action = hold_for_withheld_boot_restore(
+                            // A respawn (account migration, resume door,
+                            // respawn receiver) is proving this session's new
+                            // pane alive or rolling it back: its row may sit
+                            // on a pane whose child already exited, and a
+                            // close here would destroy what the retry or the
+                            // rollback rebinds (plan
+                            // 2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn).
+                            let action = session::in_flight::hold_poll_action(
                                 classify(
                                     live_is_alive,
                                     claude_present,
@@ -5065,6 +5072,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     worker_plane,
                                 ),
                                 held || adoption_pending,
+                                &rec.claude_session_id,
                             );
                             if adoption_pending && action == PollAction::Skip {
                                 consecutive_no_match.remove(&rec.claude_session_id);
@@ -5892,6 +5900,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let health_pg = app.state::<Arc<commands::AppState>>().pg_db.clone();
                 let health_im = app.state::<Arc<instance_manager::InstanceManager>>().inner().clone();
                 instance_health::start_instance_health_monitor(health_pg, health_im);
+
+                // The runner-owned Claude CLI updater (plan
+                // `2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn`,
+                // Phase 2). Primary only: installing is a machine-wide duty and two
+                // runners on one box would race each other's installs. A secondary
+                // never completes a version read, so its children keep the CLI's
+                // own updater (see `claude_cli_update::child_env_pairs`).
+                tauri::async_runtime::spawn(async move {
+                    claude_cli_update::run_periodic().await;
+                });
             }
 
             // Start scheduler service in background (skip for secondary instances to avoid duplicate executions)

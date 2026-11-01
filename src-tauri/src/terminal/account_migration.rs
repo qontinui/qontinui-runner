@@ -42,15 +42,23 @@
 //!    before the migration can be resumed; a diverged one is renamed aside the
 //!    same way), respawn
 //!    `claude --permission-mode bypassPermissions --resume <sid>` in a fresh
-//!    PTY pinned to the target account, on the same grid page/zone, and only
-//!    THEN close the old pane. The respawn re-keys the session's lifecycle
-//!    row onto the new PTY; the old pane's exit is answered as
+//!    PTY pinned to the target account, on the same grid page/zone, PROVE the
+//!    resumed CLI alive ([`super::respawn_liveness`]: running and painting),
+//!    and only THEN close the old pane. The respawn re-keys the session's
+//!    lifecycle row onto the new PTY; the old pane's exit is answered as
 //!    `TerminalSuperseded` and closes nothing. A failed respawn leaves the
-//!    old pane in place.
+//!    old pane in place; a respawn that dies is retried and then rolled back
+//!    onto the old pane; one that runs but never paints is rolled back onto
+//!    the old pane while that pane still runs, unless its subtree is READ to
+//!    hold no CLI (a bare shell) — then the new pane keeps the row.
 //!
 //! Guards: per-session migration cap (no ping-pong when every account is
-//! dry), one migration in flight per session ([`begin_migration`], which also
-//! refuses a session that already moved or is closed), settings kill-switch
+//! dry), one mover per session ([`begin_migration`], which claims the
+//! session in the ONE shared in-flight registry,
+//! [`crate::session::in_flight`] — so a resume-door call or a respawn
+//! receiver for the same session is refused too, and the lifecycle poll holds
+//! its row — and also refuses a session that already moved or is closed),
+//! settings kill-switch
 //! (`claude_cli.auto_migrate_on_token_exhaustion`), and a no-op with fewer
 //! than two configured accounts. A refusal by [`begin_migration`] is not a
 //! failure: the automatic path logs it, reports nothing to the UI and gives
@@ -59,7 +67,8 @@
 //! operator click is its own confirmation.
 //!
 //! The in-flight guard covers the migration itself — carry, trust, respawn,
-//! close — and NOT the detached step-4b delta sync
+//! the liveness proof and its retries or rollback, close — and NOT the
+//! detached step-4b delta sync
 //! ([`crate::terminal::session_carry::spawn_delta_sync_after_exit`]), which
 //! outlives it by up to its writer-exit wait plus the copy. That is
 //! deliberate: a fast second hop is legitimate (the target account can run
@@ -76,7 +85,7 @@
 //! not lost, just not forwarded — and a later migration or respawn picks them
 //! up from there.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -146,9 +155,71 @@ pub(crate) enum MigrateError {
     /// ([`still_migratable`]): the session closed or moved while the carry
     /// ran, so nothing was respawned and the old pane was not touched; the
     /// carried files stay at the destination, which a carry never makes worse.
+    /// And the old pane closed or gone once the respawn has begun
+    /// ([`super::respawn_liveness::RespawnOutcome::OldPaneClosed`]): before the
+    /// first spawn nothing was spawned; closed by the user mid-proof, the pane
+    /// under proof was closed with the session, as the user asked.
     Refused(MigrationRefusal),
-    /// The migration ran and failed; the old pane is left in place.
+    /// The migration ran and did not move the session: a step before the
+    /// respawn failed, or the FIRST spawn did — the old pane is untouched, still
+    /// at its usage-limit prompt. Also a user close of the resumed pane while it
+    /// was being proven (`closed_by_user`): the session is back on the old pane
+    /// when that still runs, else the close ended it.
     Failed(String),
+    /// Every respawn attempt exited before painting. With the old pane still
+    /// running, rolled back: the row, its account and the continuation are on
+    /// the old pane again, and the old pane is open. With the old pane gone
+    /// mid-proof, the session ended with its last pane.
+    RespawnDied {
+        exit_code: Option<i32>,
+        attempts: usize,
+    },
+    /// The resumed child runs but never painted by the deadline. With the old
+    /// pane still running (its CLI seen, or its subtree unreadable) the
+    /// migration was ROLLED BACK onto it (the unproven pane closed); with the
+    /// old pane gone, or read to be a shell whose CLI exited, the new pane
+    /// keeps the row.
+    Unconfirmed {
+        new_terminal_id: String,
+        rolled_back: bool,
+    },
+}
+
+impl MigrateError {
+    /// Whether the session ended up on the destination account in spite of the
+    /// error: only an unconfirmed migration whose old pane was gone (or read to
+    /// host no CLI), where the new pane keeps the row. Every other arm leaves
+    /// the session on the source account.
+    pub(crate) fn reached_destination(&self) -> bool {
+        matches!(
+            self,
+            Self::Unconfirmed {
+                rolled_back: false,
+                ..
+            }
+        )
+    }
+
+    /// Whether the migration already emitted its own
+    /// `session-account-migration-skipped`: the died / unconfirmed arms
+    /// changed panes and report themselves, so a caller must not report them
+    /// a second time.
+    pub(crate) fn reported_itself(&self) -> bool {
+        matches!(self, Self::RespawnDied { .. } | Self::Unconfirmed { .. })
+    }
+
+    /// The `session-account-migration-skipped` reason for this outcome.
+    pub(crate) fn skip_reason(&self) -> String {
+        match self {
+            Self::Refused(refusal) => refusal.to_string(),
+            Self::Failed(e) => format!("migration-failed: {e}"),
+            Self::RespawnDied {
+                exit_code,
+                attempts,
+            } => super::respawn_liveness::RespawnOutcome::died_reason(*exit_code, *attempts),
+            Self::Unconfirmed { .. } => "migration-unconfirmed".to_string(),
+        }
+    }
 }
 
 impl From<String> for MigrateError {
@@ -168,20 +239,47 @@ impl std::fmt::Display for MigrateError {
         match self {
             Self::Refused(refusal) => refusal.fmt(f),
             Self::Failed(e) => f.write_str(e),
+            Self::RespawnDied {
+                exit_code,
+                attempts,
+            } => f.write_str(&super::respawn_liveness::RespawnOutcome::died_reason(
+                *exit_code, *attempts,
+            )),
+            Self::Unconfirmed {
+                new_terminal_id,
+                rolled_back: true,
+            } => write!(
+                f,
+                "migration-unconfirmed: the resumed pane {new_terminal_id} never painted its \
+                 prompt — rolled back onto the old pane, which still runs"
+            ),
+            Self::Unconfirmed {
+                new_terminal_id,
+                rolled_back: false,
+            } => write!(
+                f,
+                "migration-unconfirmed: the resumed pane {new_terminal_id} is running but never \
+                 painted its prompt — kept, the old pane no longer hosting a CLI"
+            ),
         }
     }
 }
 
-/// Claude session ids with a migration in flight, for [`begin_migration`].
-static MIGRATIONS_IN_FLIGHT: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// The label this module claims a session under in the shared in-flight
+/// registry ([`crate::session::in_flight`]).
+const IN_FLIGHT_HOLDER: &str = "account-migration";
 
 /// Why [`begin_migration`] refused to start a migration. `Display` is the
 /// error string the manual Tauri command returns to the UI; the automatic
 /// path only logs it ([`settle_hint_migration`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MigrationRefusal {
-    /// Another migration of the same session is still running.
-    InFlight { session: String },
+    /// Another mover of the same session is still running: another migration,
+    /// the resume door or the respawn receiver (`holder` names which).
+    InFlight {
+        session: String,
+        holder: &'static str,
+    },
     /// The session no longer runs where the caller saw it: its record now
     /// names another account (`to` = that config dir) or another terminal.
     AlreadyMoved { to: String },
@@ -194,7 +292,12 @@ pub(crate) enum MigrationRefusal {
 impl std::fmt::Display for MigrationRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InFlight { session } => write!(f, "migration already in flight for {session}"),
+            Self::InFlight { session, holder } => {
+                write!(
+                    f,
+                    "migration already in flight for {session} (held by {holder})"
+                )
+            }
             Self::AlreadyMoved { to } => write!(f, "session already moved to {to}"),
             Self::Unknown { session } => {
                 write!(f, "session {session} is no longer in the lifecycle store")
@@ -209,42 +312,25 @@ impl std::fmt::Display for MigrationRefusal {
     }
 }
 
-/// Holds one session's slot in [`MIGRATIONS_IN_FLIGHT`]; dropping it — on
-/// return, on `?`, or while unwinding from a panic — releases the slot.
+/// Holds one session's slot in the shared in-flight registry
+/// ([`crate::session::in_flight::SessionInFlight`]); dropping it — on return,
+/// on `?`, while unwinding from a panic, or with a cancelled future — releases
+/// the slot.
 #[derive(Debug)]
 pub(crate) struct MigrationInFlight {
-    session: String,
+    _claim: crate::session::in_flight::SessionInFlight,
 }
 
-impl Drop for MigrationInFlight {
-    fn drop(&mut self) {
-        // A poisoned lock still guards a valid set; never leave a slot held.
-        let mut set = MIGRATIONS_IN_FLIGHT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(set) = set.as_mut() {
-            set.remove(&self.session);
-        }
-    }
-}
-
-/// Take `claude_session_id`'s in-flight slot, or refuse when another migration
-/// of the same session holds it.
+/// Take `claude_session_id`'s in-flight slot, or refuse when another mover of
+/// the same session (a migration, the resume door, the respawn receiver)
+/// holds it.
 fn claim_migration_slot(claude_session_id: &str) -> Result<MigrationInFlight, MigrationRefusal> {
-    let mut set = MIGRATIONS_IN_FLIGHT
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !set
-        .get_or_insert_with(HashSet::new)
-        .insert(claude_session_id.to_string())
-    {
-        return Err(MigrationRefusal::InFlight {
+    crate::session::in_flight::SessionInFlight::claim(claude_session_id, IN_FLIGHT_HOLDER)
+        .map(|claim| MigrationInFlight { _claim: claim })
+        .map_err(|holder| MigrationRefusal::InFlight {
             session: claude_session_id.to_string(),
-        });
-    }
-    Ok(MigrationInFlight {
-        session: claude_session_id.to_string(),
-    })
+            holder,
+        })
 }
 
 /// Serialise migrations per session, then re-check the caller's view.
@@ -285,7 +371,7 @@ pub(crate) fn begin_migration(
 /// (no `config_dir`) stands for `src_config_dir`.
 ///
 /// Run twice per migration, both times under the session's in-flight guard:
-/// by [`begin_migration`] as it takes the guard, and by [`migrate_session`]
+/// by [`begin_migration`] as it takes the guard, and by [`prepare_migration`]
 /// again just before the respawn, because the async prepare and the carry in
 /// between take real time and the operator may close the pane meanwhile. A
 /// closed pane must not be respawned: the second check aborts with the
@@ -361,6 +447,22 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
         );
         return;
     };
+
+    // A respawn is already moving this session (a migration proving its new
+    // pane alive — whose `--resume` repaint can re-render the old limit
+    // banner — the resume door, the respawn receiver). Stand down before the
+    // usage probe below marks an account rate-limited and the cap charges a
+    // slot. This read is the cheap early exit only; the race-free decision is
+    // the claim inside [`begin_migration`], whose refusal gives the slot back
+    // ([`settle_hint_migration`]).
+    if crate::session::in_flight::is_in_flight(&record.claude_session_id) {
+        info!(
+            terminal_id,
+            session = %record.claude_session_id,
+            "usage-limit hint on a session a respawn is already moving — ignoring"
+        );
+        return;
+    }
 
     // Source account: the dir the session launched under, else the runner's
     // currently-resolved global dir (pre-existing sessions registered before
@@ -481,9 +583,15 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
 ///   ran; the refund, not a pre-check, because only the guard inside
 ///   [`begin_migration`] decides a refusal race-free.
 /// - [`MigrateError::Failed`]: warned and reported `migration-failed: …`.
+/// - [`MigrateError::RespawnDied`] / [`MigrateError::Unconfirmed`]: warned;
+///   the migration already reported itself (it changed panes), so nothing is
+///   emitted here. The cap slot stays consumed: a dead respawn counts as a
+///   hop.
 ///
-/// Refused and Failed both `unrecord_handoff`: the session never reached the
-/// target this hint picked, so it must not count as a handoff to it.
+/// Every arm but an unconfirmed migration that kept the new pane
+/// ([`MigrateError::reached_destination`]) `unrecord_handoff`s: the session
+/// never reached the target this hint picked, so it must not count as a
+/// handoff to it.
 fn settle_hint_migration(
     claude_session_id: &str,
     cap_stamp: i64,
@@ -508,14 +616,18 @@ fn settle_hint_migration(
             unrecord_handoff();
             refund_migration_cap(claude_session_id, cap_stamp);
         }
-        Err(MigrateError::Failed(e)) => {
+        Err(e) => {
             warn!(
                 session = %claude_session_id,
                 error = %e,
                 "session migration failed"
             );
-            unrecord_handoff();
-            emit_skipped(&format!("migration-failed: {e}"));
+            if !e.reached_destination() {
+                unrecord_handoff();
+            }
+            if !e.reported_itself() {
+                emit_skipped(&e.skip_reason());
+            }
         }
     }
 }
@@ -583,7 +695,7 @@ const BUSY_MARKER: &str = "esc to interrupt";
 
 /// What one grid read tells the idle watcher.
 #[derive(Debug, PartialEq, Eq)]
-enum IdlePromptProbe {
+pub(crate) enum IdlePromptProbe {
     /// Claude is mid-turn: the session picked itself up, no prompt is needed.
     Busy,
     /// The input box is idle and empty: submit now.
@@ -595,7 +707,9 @@ enum IdlePromptProbe {
 
 /// Classify one rendered screen. Busy wins over ready, as before: a pane
 /// showing `esc to interrupt` never receives the prompt.
-fn probe_idle_prompt(screen: &crate::terminal::graceful_exit::ScreenText) -> IdlePromptProbe {
+pub(crate) fn probe_idle_prompt(
+    screen: &crate::terminal::graceful_exit::ScreenText,
+) -> IdlePromptProbe {
     let normalized = super::output_scan::normalize(&screen.lines.join("\n"));
     if normalized.contains(BUSY_MARKER) {
         return IdlePromptProbe::Busy;
@@ -612,21 +726,21 @@ fn probe_idle_prompt(screen: &crate::terminal::graceful_exit::ScreenText) -> Idl
 /// that is still settling. The session message poller debounces the same way
 /// (`looks_idle_quiescent`).
 #[derive(Default)]
-struct ReadyDebounce {
+pub(crate) struct ReadyDebounce {
     last_ready: Option<crate::terminal::graceful_exit::ScreenText>,
 }
 
 impl ReadyDebounce {
     /// `true` when `screen` read `Ready` and is identical to the previous
     /// read, which also read `Ready`.
-    fn settled(&mut self, screen: crate::terminal::graceful_exit::ScreenText) -> bool {
+    pub(crate) fn settled(&mut self, screen: crate::terminal::graceful_exit::ScreenText) -> bool {
         let settled = self.last_ready.as_ref() == Some(&screen);
         self.last_ready = Some(screen);
         settled
     }
 
     /// A read that was not `Ready` restarts the debounce.
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.last_ready = None;
     }
 }
@@ -852,6 +966,17 @@ async fn prompt_when_idle(terminal_id: String, prompt: String, label: &'static s
             );
             return;
         };
+        // A pane whose child exited will never paint a prompt: reading it
+        // for the full bound is how a 127 hid behind a 3-minute give-up.
+        if !session.is_alive() {
+            info!(
+                terminal_id,
+                label,
+                exit_code = ?session.exit_code(),
+                "prompt-when-idle: the pane's child exited — standing down"
+            );
+            return;
+        }
         let screen = session.grid_screen();
         let refusal = match probe_idle_prompt(&screen) {
             IdlePromptProbe::Busy => {
@@ -901,10 +1026,15 @@ async fn prompt_when_idle(terminal_id: String, prompt: String, label: &'static s
 ///
 /// The parameter block for [`spawn_resumed_pane`], which is the shipped
 /// `claude --permission-mode bypassPermissions --resume <sid>` respawn — step 3
-/// of [`migrate_session`], lifted out verbatim so the cross-machine respawn
+/// of [`confirm_migration`], lifted out verbatim so the cross-machine respawn
 /// receiver (`crate::session::respawn`) reuses it rather than growing a second,
 /// drifting copy of the launch-spec + capture-hint wiring.
 pub(crate) struct ResumeSpawn<'a> {
+    /// The ABSOLUTE `claude` the PTY child execs — resolved by the caller's
+    /// async pre-step, [`super::resume_bin::resolve_resume_bin`], which never
+    /// yields the bare name (a bare name lands on the identity shim, whose
+    /// fall-through exits 127 while the CLI is mid-reinstall).
+    pub claude_bin: String,
     /// The Claude session id to `--resume`. NEVER synthesized: a caller with
     /// no id must fail rather than invent one.
     pub claude_session_id: &'a str,
@@ -983,13 +1113,15 @@ pub(crate) fn spawn_resumed_pane(
     let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(None);
     let command = resume_respawn_argv(
         // The ABSOLUTE binary — see `resume_respawn_argv` for why the bare
-        // `claude_bin_path()` cannot be the PTY child's program on Windows.
-        &crate::agent_runtime::resolve_claude_bin(),
+        // `claude_bin_path()` cannot be the PTY child's program on Windows,
+        // and `resume_bin` for why the caller resolves it (async, retried,
+        // never the bare name) rather than this sync seam.
+        &spec.claude_bin,
         spec.claude_session_id,
         model,
         &launch_cfg,
         // The hook carrier, spelled out because this respawn execs the
-        // resolved `resolve_claude_bin()` DIRECTLY — the identity shim,
+        // resolved binary DIRECTLY — the identity shim,
         // which is what appends `--settings` for a PATH-resolved `claude`,
         // is not in this chain. Without it the migrated session runs with no
         // `SessionStart` hook, and `SessionStart` on a `--resume` is exactly
@@ -1067,7 +1199,7 @@ pub(crate) fn spawn_resumed_pane(
 /// lands on the EXTENSIONLESS shim script, which `CreateProcessW` refuses with
 /// `%1 is not a valid Win32 application (os error 193)`. Measured 2026-09-18:
 /// three usage-limit migrations each closed the source terminal (the
-/// pre-reorder [`migrate_session`] closed BEFORE it respawned) and then failed
+/// pre-reorder `migrate_session` closed BEFORE it respawned) and then failed
 /// at the respawn, so the pane vanished with nothing in its place (two more of
 /// the same shape the day before). Same resolver the condition-check / gate-continuation PTY spawns
 /// use.
@@ -1080,11 +1212,9 @@ pub(crate) fn spawn_resumed_pane(
 /// `extra_required`, and a cwd that declares coord-mcp (every allocated
 /// worktree) needs no injection.
 ///
-/// `resolve_claude_bin` does blocking filesystem stats. Its callers here —
-/// [`spawn_resumed_pane`] via [`migrate_session`] and the respawn receiver —
-/// run on the blocking pool ([`migrate_session_off_runtime`], and the
-/// receiver's own `spawn_blocking_tracked` around the transcript copy) or
-/// alongside the PTY spawn itself, so a PATH walk widens nothing.
+/// `resolve_claude_bin` does blocking filesystem stats, so it is not called
+/// here: every caller of [`spawn_resumed_pane`] resolves first through
+/// [`super::resume_bin::resolve_resume_bin`], off the async worker.
 fn resume_respawn_argv(
     claude_bin: &str,
     claude_session_id: &str,
@@ -1119,9 +1249,13 @@ fn resume_respawn_extra_required(
     out
 }
 
-/// [`migrate_session`] on the blocking pool rather than an async worker.
+/// Migrate `record`'s session from `src_config_dir` to `dst_config_dir`: the
+/// blocking prefix ([`prepare_migration`] — carry, trust, re-check) on the
+/// blocking pool, then the respawn-and-prove half ([`confirm_migration`]) on
+/// the async runtime, because proving the resumed CLI alive is minutes of
+/// polling, not work.
 ///
-/// The migration is synchronous file and process work, and since the `<sid>/`
+/// The prefix is synchronous file and process work, and since the `<sid>/`
 /// carry it can copy a whole session directory, which for a long fan-out can
 /// be many files. A usage limit is per account, so every session on that
 /// account migrates at about the same moment; run inline, each of those would
@@ -1129,16 +1263,22 @@ fn resume_respawn_extra_required(
 /// usage-limit hint and the manual Tauri command) go through here.
 ///
 /// The whole migration runs under the session's in-flight guard
-/// ([`begin_migration`]): a second concurrent migration of the same session,
-/// or one whose view of the session is stale, is refused
+/// ([`begin_migration`], a claim in the ONE shared registry,
+/// [`crate::session::in_flight`]): a second concurrent mover of the same
+/// session, or one whose view of the session is stale, is refused
 /// ([`MigrateError::Refused`]) before anything is read or written. The guard
-/// moves into the blocking task, so it is released when the migration itself
-/// ends — on success, on error, or on a panic — even if this future is
-/// dropped first; and a future dropped BEFORE the blocking task is spawned
-/// drops the guard with it ([`run_migration_guarded`]).
+/// moves into the blocking task for the prefix and comes BACK with its output
+/// ([`run_migration_guarded`]), then is held across the liveness proof and
+/// its retries or rollback — so `poll-dead` cannot close the row mid-proof
+/// (the lifecycle poll holds an in-flight session) and no resume door or
+/// respawn receiver can move the session concurrently. A future dropped while
+/// the prefix runs releases the guard when the prefix ends; one dropped BEFORE
+/// the blocking task is spawned drops the guard with it; one dropped during
+/// the proof releases it at once, and the lifted continuation registration is
+/// re-pinned onto the old terminal ([`super::respawn_liveness::OwedSettle`]).
 ///
 /// The guard does NOT cover the detached step-4b delta sync that
-/// [`migrate_session`] starts and returns without awaiting: it is released
+/// [`confirm_migration`] starts and returns without awaiting: it is released
 /// while that sync may still be waiting for the old writer to exit. A fast
 /// second hop is legitimate (the target can run dry too), and the sync needs
 /// no guard for safety — it only writes a destination still exactly as its
@@ -1160,38 +1300,56 @@ pub(crate) async fn migrate_session_off_runtime(
         .clone();
     let (app_owned, record_owned) = (app.clone(), record.clone());
     let (src, dst) = (src_config_dir.to_string(), dst_config_dir.to_string());
-    run_migration_guarded(
-        || {
-            begin_migration(record, src_config_dir, || {
-                store.get(&record.claude_session_id)
-            })
-        },
-        // The old pane's `claude`, identified BEFORE anything is closed: the
-        // detached delta sync waits for exactly this process to leave the
-        // table. Taken here because the snapshot is async and
-        // `migrate_session` is not.
-        || old_pane_claude(app, &record.terminal_id),
-        move |old_writer| migrate_session(&app_owned, &record_owned, &src, &dst, old_writer),
-    )
-    .await
-    .inspect_err(|e| {
+    let result = async {
+        let (in_flight, (prepared, old_writer)) = run_migration_guarded(
+            || {
+                begin_migration(record, src_config_dir, || {
+                    store.get(&record.claude_session_id)
+                })
+            },
+            // The old pane's `claude`, identified BEFORE anything is closed:
+            // the detached delta sync waits for exactly this process to leave
+            // the table. Taken here because the snapshot is async and
+            // `prepare_migration` is not.
+            || old_pane_claude(app, &record.terminal_id),
+            move |old_writer| {
+                prepare_migration(&app_owned, &record_owned, &src, &dst)
+                    .map(|prepared| (prepared, old_writer))
+            },
+        )
+        .await?;
+        confirm_migration(
+            app,
+            record,
+            src_config_dir,
+            dst_config_dir,
+            prepared,
+            old_writer,
+            in_flight,
+        )
+        .await
+    }
+    .await;
+    result.inspect_err(|e| {
         if let MigrateError::Refused(refusal) = e {
             info!(session = %record.claude_session_id, %refusal, "session migration refused");
         }
     })
 }
 
-/// The guard-holding shape of [`migrate_session_off_runtime`], free of the app
-/// handle so it is testable: take the in-flight slot (`begin`), run the async
-/// `prepare`, then run `work` on the blocking pool with the guard moved into
-/// it. The guard is a local of this future until that spawn, so dropping the
-/// future at any await before it releases the slot; after it, the blocking
-/// task owns the guard and releases it when `work` ends.
+/// The guard-holding shape of [`migrate_session_off_runtime`]'s prefix, free
+/// of the app handle so it is testable: take the in-flight slot (`begin`), run
+/// the async `prepare`, then run `work` on the blocking pool with the guard
+/// moved into it, and hand the guard BACK with `work`'s output so the caller
+/// keeps holding it. The guard is a local of this future until that spawn, so
+/// dropping the future at any await before it releases the slot; after it,
+/// the blocking task owns the guard until `work` ends — and releases it there
+/// when `work` fails, or when nobody is left to take it back.
 async fn run_migration_guarded<B, P, PF, W, T, E>(
     begin: B,
     prepare: P,
     work: W,
-) -> Result<T, MigrateError>
+) -> Result<(MigrationInFlight, T), MigrateError>
 where
     B: FnOnce() -> Result<MigrationInFlight, MigrationRefusal>,
     P: FnOnce() -> PF,
@@ -1205,8 +1363,7 @@ where
     let in_flight = begin().map_err(MigrateError::Refused)?;
     let prepared = prepare().await;
     qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
-        let _in_flight = in_flight;
-        work(prepared)
+        work(prepared).map(|out| (in_flight, out))
     })
     .await
     .map_err(|e| MigrateError::Failed(format!("migration task did not complete: {e}")))?
@@ -1229,38 +1386,35 @@ async fn old_pane_claude(app: &tauri::AppHandle, terminal_id: &str) -> Option<Pr
     Some(ProcIdentity { pid, started_at })
 }
 
-/// Perform the migration mechanics: transcript copy → trust for the
-/// destination → respawn under the target account (which re-keys the
-/// lifecycle row onto the new PTY) → close the old pane → emit event.
-///
-/// **The old pane closes only after the respawn has succeeded.** Any failure
-/// before that — transcript, trust, the spawn itself — returns with the old
-/// pane untouched (and a session closed or moved while the carry ran is
-/// refused just before the respawn, [`still_migratable`]), still sitting at its usage-limit prompt, and the caller
-/// emits `skipped`. Until 2026-09-18 the order was close-then-respawn, so a
-/// respawn failure (three that day, from a resolver defect) was a vanished
-/// window with nothing in its place. For a moment two PTYs now carry one
-/// session; the old one is idle at a limit prompt and consumes nothing.
-///
-/// Shared by the automatic path ([`handle_usage_limit_hint`], which has
-/// already confirmed exhaustion) and the manual Tauri command
-/// (`terminal_migrate_session_account`, where the operator's click is the
-/// confirmation).
+/// What the blocking prefix ([`prepare_migration`]) hands the async half.
+struct PreparedMigration {
+    working_dir: String,
+    terminal_manager: std::sync::Arc<crate::terminal::TerminalManager>,
+    session_registry: std::sync::Arc<crate::session::SessionRegistry>,
+    store: std::sync::Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>,
+    carried: TranscriptCopy,
+    /// The session's record as re-read under the guard after the carry
+    /// (step 1c) — what a rollback restores, so a field that changed after the
+    /// caller first read the record (a finish stamp, an account wait) is not
+    /// reverted to the caller's older copy.
+    current_record: TerminalSessionRecord,
+}
+
+/// The blocking prefix of the migration: transcript carry → trust for the
+/// destination → re-check the session is still where the caller saw it.
+/// Every fallible step before the respawn lives here, so a failure leaves the
+/// old pane untouched, still sitting at its usage-limit prompt, and nothing
+/// lifted or spawned ([`MigrateError::Failed`] / [`MigrateError::Refused`]).
 ///
 /// Private on purpose: the only caller is [`migrate_session_off_runtime`],
 /// which holds the per-session in-flight guard across it, so the compiler —
 /// not a comment — keeps it from running unguarded.
-#[expect(
-    clippy::string_slice,
-    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-)]
-fn migrate_session(
+fn prepare_migration(
     app: &tauri::AppHandle,
     record: &TerminalSessionRecord,
     src_config_dir: &str,
     dst_config_dir: &str,
-    old_writer: Option<ProcIdentity>,
-) -> Result<MigrationOutcome, MigrateError> {
+) -> Result<PreparedMigration, MigrateError> {
     use tauri::Manager;
 
     if crate::model_gateway::gateway_declared() {
@@ -1303,7 +1457,7 @@ fn migrate_session(
     // respawn below reaches `TerminalManager::create` on its pinned arm, which
     // derives trust for `dst` through the trust gate and refuses when it
     // cannot. Since 2026-09-18 the old pane is closed only AFTER the respawn
-    // succeeds, so a refusal inside the spawn no longer destroys anything —
+    // is proven, so a refusal inside the spawn no longer destroys anything —
     // but deciding it here still gives the operator a typed, named refusal
     // (the caller emits `skipped` with it) instead of a generic spawn failure,
     // and a grant means the seam's own check short-circuits on
@@ -1328,54 +1482,207 @@ fn migrate_session(
     // session moved) since `begin_migration` read it, and a closed pane must
     // not come back as a respawn. Abort with the refusal before anything is
     // lifted or spawned; the carried files stay at the destination, which a
-    // carry never makes worse. Above the step-2 lift on purpose (see GUARD).
-    still_migratable(record, src_config_dir, store.get(&record.claude_session_id))
-        .map_err(MigrateError::Refused)?;
+    // carry never makes worse. Above the step-2 lift on purpose (see GUARD in
+    // `confirm_migration`).
+    let current = store.get(&record.claude_session_id);
+    still_migratable(record, src_config_dir, current.clone()).map_err(MigrateError::Refused)?;
+    // `still_migratable` refuses a missing record, so `current` is `Some` here;
+    // the fallback is unreachable and keeps this free of a panic path.
+    let current_record = current.unwrap_or_else(|| record.clone());
+
+    Ok(PreparedMigration {
+        working_dir,
+        terminal_manager,
+        session_registry,
+        store,
+        carried,
+        current_record,
+    })
+}
+
+/// The migration's side of [`super::respawn_liveness::RespawnEffects`]: one
+/// resumed pane under the DESTINATION account per call.
+struct MigrationRespawn<'a> {
+    app: &'a tauri::AppHandle,
+    terminal_manager: std::sync::Arc<crate::terminal::TerminalManager>,
+    session_registry: std::sync::Arc<crate::session::SessionRegistry>,
+    record: &'a TerminalSessionRecord,
+    src_config_dir: &'a str,
+    dst_config_dir: &'a str,
+    working_dir: &'a str,
+    title: String,
+    gate_identity: Option<crate::commands::terminal::GateIdentity>,
+}
+
+impl super::respawn_liveness::RespawnEffects for MigrationRespawn<'_> {
+    fn claude_session_id(&self) -> &str {
+        &self.record.claude_session_id
+    }
+
+    async fn spawn_next(&mut self) -> Result<String, String> {
+        // The async pre-step (D3.1): the ABSOLUTE binary, retried, never bare.
+        let claude_bin = super::resume_bin::resolve_resume_bin().await?;
+        // The seam is synchronous and runs here, on the async worker, NOT on
+        // the blocking pool: a spawn handed to `spawn_blocking` keeps running
+        // when this future is cancelled (task abort, shutdown), and would
+        // create a pane — and re-key the row onto it — that the respawn's close
+        // hold never learns about. Inline, a cancel lands before or after the
+        // spawn, never inside it. The heavy part of a migration, the carry, is
+        // already on the blocking pool (`prepare_migration`).
+        spawn_resumed_pane(
+            self.app,
+            &self.terminal_manager,
+            &self.session_registry,
+            ResumeSpawn {
+                claude_bin,
+                claude_session_id: &self.record.claude_session_id,
+                working_dir: self.working_dir,
+                // Model is sniffed off the SOURCE transcript: `--resume` alone
+                // restores the conversation but the model falls back to the
+                // target account's default.
+                model_transcript: super::transcript::session_transcript_path(
+                    Path::new(self.src_config_dir),
+                    self.working_dir,
+                    &self.record.claude_session_id,
+                ),
+                config_dir: self.dst_config_dir,
+                title: self.title.clone(),
+                page_id: self.record.page_id.clone(),
+                zone_index: self.record.zone_index,
+                // The migration keeps the coord row it already had — it claims
+                // no new work-unit / topic / repo, and no lineage.
+                work_unit_slug: None,
+                correlation_topic: None,
+                intent_repo: None,
+                coord_lineage: None,
+                // OVERRIDE — the one call site that passes `true`, and the only
+                // one that should. An account migration is not the creation of
+                // a new session: the operator's session already exists, and
+                // this respawn moves it. Refusing here would not protect a live
+                // session — it would strand one at a usage-limit prompt, which
+                // inverts the whole point of the guard (plan §Part D step 5:
+                // never touch an already-running session; this gate fires only
+                // when something NEW is created). The bound on what it adds:
+                // at most ONE extra `claude` at a time — a retry replaces a
+                // pane whose child already exited. The `migration-unconfirmed`
+                // arm never leaves two CLIs running: with the old pane still
+                // running it rolls back and closes the new pane (also when the
+                // old pane's subtree cannot be read); it leaves the old pane
+                // beside the new one only when a READ showed it a bare shell
+                // whose CLI already exited, which consumes nothing. A
+                // RESPAWN, by contrast, creates something genuinely new (its
+                // source is already closed) and passes `false`.
+                resource_override: true,
+                gate_identity: self.gate_identity,
+            },
+        )
+        .map(|(terminal_id, _coord_session_id)| terminal_id)
+    }
+
+    async fn await_liveness(
+        &mut self,
+        terminal_id: &str,
+    ) -> super::respawn_liveness::LivenessVerdict {
+        super::respawn_liveness::await_resumed_cli(
+            &self.terminal_manager,
+            terminal_id,
+            super::respawn_liveness::RESUME_LIVENESS_DEADLINE,
+        )
+        .await
+    }
+
+    async fn pause_before_retry(&mut self, retry: usize) {
+        tokio::time::sleep(super::respawn_liveness::retry_delay(retry)).await;
+    }
+
+    fn panes(&self) -> std::sync::Arc<dyn crate::terminal::respawn_liveness::PaneOps> {
+        std::sync::Arc::new(crate::terminal::respawn_liveness::ManagerPanes(
+            std::sync::Arc::clone(&self.terminal_manager),
+        ))
+    }
+}
+
+/// The async half of the migration: respawn under the target account (which
+/// re-keys the lifecycle row onto the new PTY) → PROVE the resumed CLI alive
+/// → close the old pane → top up the carry, nudge, emit.
+///
+/// **The old pane closes only after the resumed CLI is proven alive** —
+/// running AND painting ([`super::respawn_liveness`]). A successful PTY spawn
+/// is not that: until 2026-10-20 it was treated as one, and one migration in
+/// twelve on merytshost then watched its new child exit 127 while the old pane
+/// was already gone. Now:
+/// - a failure of the first spawn returns [`MigrateError::Failed`] with the
+///   old pane untouched (the 2026-09-18 ordering; every earlier failure is
+///   [`prepare_migration`]'s);
+/// - a child that dies before painting is retried (next pane first, then the
+///   dead one is superseded and closed), and when every attempt dies the
+///   pre-migration record is restored onto the old pane while that still
+///   runs (with the old pane gone, the session ends with its last pane)
+///   ([`MigrateError::RespawnDied`]);
+/// - a child alive but unpainted at the deadline is rolled back onto the old
+///   pane while that still runs, else keeps the row
+///   ([`MigrateError::Unconfirmed`]).
+///
+/// `session migrated` (in each caller) and `session-account-migrated` (here)
+/// happen only on the proven arm; the died / unconfirmed arms emit their own
+/// `session-account-migration-skipped` here, since they changed panes.
+#[expect(
+    clippy::string_slice,
+    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
+)]
+async fn confirm_migration(
+    app: &tauri::AppHandle,
+    record: &TerminalSessionRecord,
+    src_config_dir: &str,
+    dst_config_dir: &str,
+    prepared: PreparedMigration,
+    old_writer: Option<ProcIdentity>,
+    in_flight: MigrationInFlight,
+) -> Result<MigrationOutcome, MigrateError> {
+    // Held until this returns: the liveness proof below is the window the
+    // in-flight registry exists to protect.
+    let _in_flight = in_flight;
+    let PreparedMigration {
+        working_dir,
+        terminal_manager,
+        session_registry,
+        store,
+        carried,
+        current_record,
+    } = prepared;
 
     // 2. Lift any gate-continuation registration off the old terminal
-    // BEFORE the respawn: the new PTY is spawned with the carried gate identity
-    // and the registration is re-pinned onto it on success. On failure it goes
-    // straight back onto the old terminal, which is still alive — so the
-    // liveness reaper never sees a registration on a dead pane and never posts
-    // a false `work_unreported` for a session that merely failed to move.
-    // (Coord admits exactly one `spawned → work_*` transition, so that false
-    // negative would be irreversible.)
-    //
-    // The lift hands back an OWNED reservation on the continuation's anchor,
-    // taken under the same lock that removed the live row. It is held across
-    // the synchronous respawn below and settled by whichever re-pin arm runs,
-    // so the anchor is never in neither half of the registry and a same-anchor
+    // BEFORE the respawn: the new PTY is spawned with the carried gate identity.
+    // While the respawn is being proven (an `await` of up to minutes, with
+    // retries) the registration is in NEITHER half of the registry — so the
+    // liveness reaper never sees it on a pane that may die — and its anchor is
+    // held by the owned reservation the lift hands back, so a same-anchor
     // continuation dispatched during the hop is deferred by P3 rather than
-    // spawned alongside this one.
+    // spawned alongside this one. (Coord admits exactly one `spawned → work_*`
+    // transition, so a false `work_unreported` would be irreversible.)
     //
-    // GUARD: anchor-held window OPENS here and closes at the
-    // `restore_continuation_registration` call INSIDE each arm of the
-    // `match spawned` below — see the matching GUARD marker there, which is
-    // where the arms diverge, not where the window ends. NOTHING between the
-    // lift and those two calls may exit early
-    // — no `?`, no `return`, no `unwrap`/`expect` you add. Every fallible step
-    // of this function is deliberately ABOVE this line (the `working_dir` and
-    // three `try_state` lookups, `copy_transcript`, the trust-gate refusal,
-    // and the step-1c record re-check), and it must stay that way. An early exit inserted inside the
-    // window drops `carried_continuation`, whose RAII drop releases the
-    // anchor, which silently reopens the double-spawn window this lift exists
-    // to close — with NO compiler warning, no clippy lint and no failing test,
-    // because `#[must_use]` does not fire on a value that IS bound and no test
-    // calls `migrate_session`. The RAII drop is the PANIC backstop only; the
-    // no-early-exit property is a reviewer obligation. If you need a new
-    // failure check here, put it above the lift or restructure so the compiler
-    // can enforce the pairing.
-    let carried_continuation =
-        crate::agent_runtime::take_continuation_registration(&record.terminal_id);
+    // GUARD: anchor-held window OPENS here and closes at `carried_continuation
+    // .settle` below, the ONE settle call, which re-pins onto whichever
+    // terminal hosts the session when the respawn has ended. Everything between
+    // is infallible: no `?`, no `return`, no `unwrap`/`expect` — every fallible
+    // step of the migration is deliberately in `prepare_migration`, above this
+    // line. `OwedSettle` turns an early exit or a cancelled future inside the
+    // window into a `warn!` and a re-pin onto the old terminal instead of a
+    // silent anchor release; the reservation's own RAII drop stays the PANIC
+    // backstop.
+    let fallback_host = record.terminal_id.clone();
+    let carried_continuation = super::respawn_liveness::OwedSettle::new(
+        crate::agent_runtime::take_continuation_registration(&record.terminal_id),
+        // A cancelled migration (task abort, shutdown) re-pins onto the OLD
+        // terminal rather than releasing the anchor.
+        move |(c, reservation)| {
+            crate::agent_runtime::restore_continuation_registration(fallback_host, c, reservation);
+        },
+    );
 
-    // 3. Respawn under the target account, through the SHARED resume seam
-    // ([`spawn_resumed_pane`]) — the same code path the respawn receiver
-    // (`crate::session::respawn`) uses, so the two never drift. The pinned-id
-    // capture hint inside `create_terminal_session_backend` re-keys the SAME
-    // lifecycle row (`--resume <id>`) onto the new terminal/account
-    // synchronously, preserving page/zone; the old PTY is still running at
-    // this point and no longer owns a row.
-    let title = record.title.clone().unwrap_or_else(|| {
+    // The spawn spec (title, page, zone) is built from the record as re-read
+    // under the guard, so a rename or tile move made during the carry is kept.
+    let title = current_record.title.clone().unwrap_or_else(|| {
         format!(
             "Resumed {}",
             &record.claude_session_id[..8.min(record.claude_session_id.len())]
@@ -1385,7 +1692,7 @@ fn migrate_session(
     // the consuming device coord keys the outcome write on. Absent when the
     // session was not a continuation, or when the local device id is unreadable
     // (in which case nothing could report anyway).
-    let carried_gate_identity = carried_continuation.as_ref().and_then(|(c, _reservation)| {
+    let gate_identity = carried_continuation.get().and_then(|(c, _reservation)| {
         let gate_id = c.gate_id?;
         let device_id = crate::agent_runtime::load_local_device_id()?;
         Some(crate::commands::terminal::GateIdentity {
@@ -1393,118 +1700,126 @@ fn migrate_session(
             consuming_device_id: device_id,
         })
     });
-    let spawned = spawn_resumed_pane(
+
+    // 3 + 4. Respawn under the target account through the SHARED resume seam
+    // ([`spawn_resumed_pane`], the same code path the respawn receiver and the
+    // resume door use), prove it alive, retry or roll back, and — on the proven
+    // arm only — supersede and close the old pane. The pinned-id capture hint
+    // re-keys the SAME lifecycle row (`--resume <id>`) onto each new terminal
+    // synchronously, preserving page/zone.
+    let mut effects = MigrationRespawn {
         app,
-        &terminal_manager,
-        &session_registry,
-        ResumeSpawn {
-            claude_session_id: &record.claude_session_id,
-            working_dir: &working_dir,
-            // Model is sniffed off the SOURCE transcript: `--resume` alone
-            // restores the conversation but the model falls back to the target
-            // account's default.
-            model_transcript: super::transcript::session_transcript_path(
-                Path::new(src_config_dir),
-                &working_dir,
-                &record.claude_session_id,
-            ),
-            config_dir: dst_config_dir,
-            title: title.clone(),
-            page_id: record.page_id.clone(),
-            zone_index: record.zone_index,
-            // The migration keeps the coord row it already had — it claims no
-            // new work-unit / topic / repo, and no lineage.
-            work_unit_slug: None,
-            correlation_topic: None,
-            intent_repo: None,
-            coord_lineage: None,
-            // OVERRIDE — the one call site that passes `true`, and the only one
-            // that should. An account migration is not the creation of a new
-            // session: the operator's session already exists, and this respawn
-            // is the first half of a move whose second half (step 4) closes the
-            // old PTY the moment this one is up. Refusing here would not
-            // protect a live session — it would strand one at a usage-limit
-            // prompt, which inverts the whole point of the guard (plan §Part D
-            // step 5: never touch an already-running session; this gate fires
-            // only when something NEW is created). The migration is
-            // commit-neutral by construction: one `claude` comes up, one goes
-            // away a moment later, and the one going away is idle at a limit
-            // prompt. A RESPAWN, by contrast, creates something genuinely new
-            // (its source is already closed) and passes `false`.
-            resource_override: true,
-            gate_identity: carried_gate_identity,
-        },
-    );
-    // GUARD: anchor-held window closes at the `restore_continuation_registration`
-    // call INSIDE each arm below, not at this line — an early exit added in
-    // the `Ok` arm before that call would still drop the permit and free the
-    // anchor. This marker is where the two arms diverge; see the matching
-    // GUARD marker at the lift for what may not appear anywhere in between.
-    let new_terminal_id = match spawned {
-        Ok((terminal_id, _coord_session_id)) => {
-            // Re-pin the continuation onto the terminal that now hosts it, so
-            // the registry's dedup/cap view stays true and the eventual real
-            // exit still reports an outcome. The permit taken by the lift is
-            // handed on here: the live row replaces the reservation under one
-            // lock, so the anchor moves from held-by-permit to
-            // held-by-session with no gap.
-            if let Some((carried, reservation)) = carried_continuation {
-                crate::agent_runtime::restore_continuation_registration(
-                    terminal_id.clone(),
-                    carried,
-                    reservation,
-                );
-            }
-            terminal_id
+        terminal_manager,
+        session_registry,
+        record: &current_record,
+        src_config_dir,
+        dst_config_dir,
+        working_dir: &working_dir,
+        title,
+        gate_identity,
+    };
+    // The rollback target is the record as re-read under the guard, not the
+    // caller's copy (read before the usage probe and the carry).
+    let outcome = super::respawn_liveness::confirm_respawn(
+        &mut effects,
+        &store,
+        Some(&current_record),
+        super::respawn_liveness::MAX_RESPAWN_ATTEMPTS,
+    )
+    .await;
+
+    // GUARD: anchor-held window closes HERE. The registration (and its permit)
+    // go to the terminal that now hosts the session: the new pane when it runs
+    // (alive, or alive-but-unconfirmed — it owns the row), the OLD pane when
+    // nothing moved or every respawn died (the old PTY is alive and owns the
+    // row again, so its eventual real exit still reports honestly).
+    use super::respawn_liveness::RespawnOutcome;
+    let host = match &outcome {
+        RespawnOutcome::Alive { terminal_id, .. } | RespawnOutcome::Unconfirmed { terminal_id } => {
+            terminal_id.clone()
         }
-        Err(e) => {
-            // The respawn failed and the old PTY is UNTOUCHED — the session is
-            // exactly where it was, at its usage-limit prompt. Put the
-            // registration back on it so the eventual real exit reports
-            // honestly. The caller emits `skipped` with this error. The permit
-            // goes with it — the failed arm settles the reservation exactly
-            // like the successful one, just onto the OLD terminal id.
-            if let Some((carried, reservation)) = carried_continuation {
-                crate::agent_runtime::restore_continuation_registration(
-                    record.terminal_id.clone(),
-                    carried,
-                    reservation,
-                );
-            }
-            return Err(e.into());
+        RespawnOutcome::NotSpawned(_)
+        | RespawnOutcome::Died { .. }
+        | RespawnOutcome::ClosedByUser { .. }
+        | RespawnOutcome::OldPaneClosed { .. }
+        | RespawnOutcome::UnconfirmedRolledBack { .. } => record.terminal_id.clone(),
+    };
+    carried_continuation.settle(|(c, reservation)| {
+        crate::agent_runtime::restore_continuation_registration(host, c, reservation);
+    });
+
+    let new_terminal_id = match outcome {
+        RespawnOutcome::Alive { terminal_id, .. } => terminal_id,
+        RespawnOutcome::NotSpawned(e) => return Err(MigrateError::Failed(e)),
+        // The user closed the new pane while it was being proven: no retry;
+        // the session is back on the old pane if that still runs, else the
+        // user's close ended it.
+        RespawnOutcome::ClosedByUser { .. } => {
+            return Err(MigrateError::Failed(
+                "closed_by_user: the user closed the resumed pane mid-migration — nothing retried; the session is back on the old pane if that pane still runs, otherwise the close ended it"
+                    .to_string(),
+            ))
+        }
+        // The old pane closed (before the first spawn, or by the user during
+        // the proof): the same fact `still_migratable` refuses up front, met
+        // one step later — a refusal, not a failure, so the auto path reports
+        // nothing and gives the cap slot back.
+        RespawnOutcome::OldPaneClosed { .. } => {
+            return Err(MigrateError::Refused(MigrationRefusal::Closed {
+                session: record.claude_session_id.clone(),
+            }))
+        }
+        RespawnOutcome::Died {
+            exit_code,
+            attempts,
+            retry_spawn_error,
+        } => {
+            let err = MigrateError::RespawnDied {
+                exit_code,
+                attempts,
+            };
+            warn!(
+                session = %record.claude_session_id,
+                retry_spawn_error = ?retry_spawn_error,
+                "{err} — rolled back onto the old pane if it still runs, else the session ended"
+            );
+            emit_skipped(app, record, src_config_dir, &err.skip_reason());
+            return Err(err);
+        }
+        RespawnOutcome::Unconfirmed { terminal_id } => {
+            // The new pane keeps the row (the old pane is gone or a bare
+            // shell), so the session now lives on `dst`: top that copy up
+            // with whatever the old writer wrote, as the proven arm does. No
+            // nudge — nothing proved the CLI would take one.
+            let _sync_done = crate::terminal::session_carry::spawn_delta_sync_after_exit(
+                old_writer,
+                record.claude_session_id.clone(),
+                carried,
+            );
+            let err = MigrateError::Unconfirmed {
+                new_terminal_id: terminal_id,
+                rolled_back: false,
+            };
+            emit_skipped(app, record, src_config_dir, &err.skip_reason());
+            return Err(err);
+        }
+        RespawnOutcome::UnconfirmedRolledBack { terminal_id } => {
+            let err = MigrateError::Unconfirmed {
+                new_terminal_id: terminal_id,
+                rolled_back: true,
+            };
+            emit_skipped(app, record, src_config_dir, &err.skip_reason());
+            return Err(err);
         }
     };
 
-    // 4. The replacement is up: close the old pane. Its lifecycle row already
-    // belongs to the new terminal (step 3), so the exit hook's later
-    // `(session id, old terminal)` close must not be resolved against the map
-    // — it would read as a mis-bound `NotFound`. Mark the hand-off first so the
-    // store answers that close with `TerminalSuperseded`: no mutation, no coord
-    // `Closed`, and the workdir nonce the resumed pane still uses is kept.
-    // There is no close-reason to record because the row is never closed —
-    // which is also what keeps boot-restore from ever offering the old pane.
-    store.mark_terminal_superseded(&record.terminal_id, &new_terminal_id);
-    if let Err(e) = terminal_manager.close(&record.terminal_id) {
-        // Old pane was already gone (user closed it after exhaustion) — not
-        // fatal, the replacement is what matters. Its exit-close then either
-        // arrived before the mark or never will, so withdraw the mark rather
-        // than leave an entry nothing consumes.
-        store.unmark_terminal_superseded(&record.terminal_id);
-        info!(
-            terminal_id = %record.terminal_id,
-            new_terminal_id = %new_terminal_id,
-            error = %e,
-            "old terminal close failed after a successful respawn"
-        );
-    }
-
     // 4b. Top up `<sid>/` with whatever the old pane wrote between the carry
-    // and its exit — detached, because `close` does not wait for the `claude`
-    // and this fn is synchronous. It waits (bounded) until `old_writer` is
-    // gone from the whole process table and never touches `<sid>.jsonl`; for
-    // a side-car file it backs out if the destination changed since the
-    // carry — best-effort, see `session_carry::delta_sync`. Runs after a
-    // failed close too: the pane was already gone, and the wait still decides.
+    // and its exit — detached, because `close` does not wait for the `claude`.
+    // It waits (bounded) until `old_writer` is gone from the whole process
+    // table and never touches `<sid>.jsonl`; for a side-car file it backs out
+    // if the destination changed since the carry — best-effort, see
+    // `session_carry::delta_sync`. Runs after a failed close too: the pane was
+    // already gone, and the wait still decides.
     let sync_done = crate::terminal::session_carry::spawn_delta_sync_after_exit(
         old_writer,
         record.claude_session_id.clone(),
@@ -1741,8 +2056,8 @@ mod tests {
     /// the flags the migration has always carried behind it. The head is passed
     /// in rather than read from the resolver so this reads no process-global
     /// env (`PATH`, `QONTINUI_CLAUDE_BIN`) that other tests in this binary
-    /// mutate; the one-line wiring in `spawn_resumed_pane` is the
-    /// `resolve_claude_bin()` call itself.
+    /// mutate; the one-line wiring in `spawn_resumed_pane` is
+    /// `&spec.claude_bin`, which `resume_bin::resolve_resume_bin` fills.
     #[test]
     fn resume_respawn_argv_head_is_the_binary_the_caller_resolved() {
         let bin = if cfg!(windows) {
@@ -1832,13 +2147,29 @@ mod tests {
         assert_eq!(
             refusal,
             MigrationRefusal::InFlight {
-                session: sid.to_string()
+                session: sid.to_string(),
+                holder: IN_FLIGHT_HOLDER,
             }
         );
         assert_eq!(
             refusal.to_string(),
-            format!("migration already in flight for {sid}")
+            format!("migration already in flight for {sid} (held by account-migration)")
         );
+        // ONE registry: a resume-door or respawn-receiver claim on the same
+        // session refuses a migration too, naming its holder.
+        let other_mover = "test/account_migration/in-flight-resume-door";
+        let door = crate::session::in_flight::SessionInFlight::claim(other_mover, "resume-door")
+            .expect("the door claims first");
+        let door_rec = session_record(other_mover, "t-3", Some("C:/a"));
+        assert_eq!(
+            begin_migration(&door_rec, "C:/a", || Some(door_rec.clone())).unwrap_err(),
+            MigrationRefusal::InFlight {
+                session: other_mover.to_string(),
+                holder: "resume-door",
+            }
+        );
+        drop(door);
+        assert!(begin_migration(&door_rec, "C:/a", || Some(door_rec.clone())).is_ok());
         let other = session_record("test/account_migration/in-flight-other", "t-2", None);
         assert!(
             begin_migration(&other, "C:/a", || Some(other.clone())).is_ok(),
@@ -1962,6 +2293,7 @@ mod tests {
             },
         )
         .await
+        .map(|(_guard, out)| out)
         .expect("the migration runs");
         assert_eq!(
             out,
@@ -2029,6 +2361,7 @@ mod tests {
         for (i, refusal) in [
             MigrationRefusal::InFlight {
                 session: "s".to_string(),
+                holder: IN_FLIGHT_HOLDER,
             },
             MigrationRefusal::AlreadyMoved {
                 to: "C:/b".to_string(),
@@ -2092,7 +2425,7 @@ mod tests {
         assert_eq!(cap_left(sid, base + 10), MIGRATION_CAP);
     }
 
-    /// R9 S5a — the re-check `migrate_session` runs just before the respawn,
+    /// R9 S5a — the re-check `prepare_migration` runs just before the respawn,
     /// under the guard `begin_migration` took: a pane the operator closed (or
     /// a session that moved, or vanished) while the carry ran is refused with
     /// the typed refusal, without contending for the slot it already holds;
@@ -2154,7 +2487,8 @@ mod tests {
                 still_migratable(&seen, "C:/a", Some(closed)).map_err(MigrateError::Refused)
             },
         )
-        .await;
+        .await
+        .map(|(_guard, ())| ());
         assert!(
             matches!(
                 out,
@@ -2186,6 +2520,98 @@ mod tests {
         assert!(unrecorded);
         assert_eq!(skipped.as_deref(), Some("migration-failed: respawn failed"));
         assert_eq!(cap_left(sid, base + 10), MIGRATION_CAP - 1);
+    }
+
+    /// The guard is handed BACK with the prefix's output: still held after the
+    /// blocking work returns, released only when the caller drops it — the
+    /// liveness proof that follows runs under it.
+    #[tokio::test]
+    async fn the_guard_outlives_the_blocking_prefix_until_the_caller_drops_it() {
+        let sid = "test/account_migration/guard-handed-back";
+        let rec = session_record(sid, "t-1", Some("C:/a"));
+        let (guard, ()) = run_migration_guarded(
+            || begin_migration(&rec, "C:/a", || Some(rec.clone())),
+            || std::future::ready(()),
+            |()| -> Result<(), String> { Ok(()) },
+        )
+        .await
+        .expect("the prefix runs");
+        assert!(
+            crate::session::in_flight::is_in_flight(sid),
+            "the session stays claimed for the proof"
+        );
+        assert!(matches!(
+            begin_migration(&rec, "C:/a", || Some(rec.clone())),
+            Err(MigrationRefusal::InFlight { .. })
+        ));
+        drop(guard);
+        assert!(!crate::session::in_flight::is_in_flight(sid));
+    }
+
+    /// Only an unconfirmed migration that kept the new pane leaves the session
+    /// on `dst`; every other failure must withdraw its handoff.
+    #[test]
+    fn only_an_unrolled_back_unconfirmed_migration_reached_the_destination() {
+        assert!(MigrateError::Unconfirmed {
+            new_terminal_id: "new-1".into(),
+            rolled_back: false,
+        }
+        .reached_destination());
+        for e in [
+            MigrateError::Failed("spawn failed".into()),
+            MigrateError::Refused(MigrationRefusal::AlreadyMoved { to: "C:/b".into() }),
+            MigrateError::RespawnDied {
+                exit_code: Some(127),
+                attempts: 3,
+            },
+            MigrateError::Unconfirmed {
+                new_terminal_id: "new-1".into(),
+                rolled_back: true,
+            },
+        ] {
+            assert!(!e.reached_destination(), "{e}");
+        }
+    }
+
+    /// The died / unconfirmed arms reported themselves (they changed panes):
+    /// the auto path emits nothing more, keeps the cap slot (a dead respawn
+    /// is a hop), and withdraws the handoff unless the new pane kept the row.
+    #[test]
+    fn a_died_or_unconfirmed_auto_migration_is_not_reported_twice() {
+        let base = 1_780_000_000_000i64;
+        for (i, (e, handoff_withdrawn)) in [
+            (
+                MigrateError::RespawnDied {
+                    exit_code: Some(127),
+                    attempts: 3,
+                },
+                true,
+            ),
+            (
+                MigrateError::Unconfirmed {
+                    new_terminal_id: "new-1".into(),
+                    rolled_back: true,
+                },
+                true,
+            ),
+            (
+                MigrateError::Unconfirmed {
+                    new_terminal_id: "new-1".into(),
+                    rolled_back: false,
+                },
+                false,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sid = format!("test/account_migration/self-reported-{i}");
+            assert!(migration_cap_permits(&sid, base));
+            let (unrecorded, skipped) = settle(&sid, base, Err(e));
+            assert_eq!(unrecorded, handoff_withdrawn, "case {i}");
+            assert_eq!(skipped, None, "case {i}: reported once, by the migration");
+            assert_eq!(cap_left(&sid, base + 10), MIGRATION_CAP - 1, "case {i}");
+        }
     }
 
     /// Two hints that took slots in the same millisecond: refunding one leaves
