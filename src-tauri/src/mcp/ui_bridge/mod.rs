@@ -1118,11 +1118,6 @@ mod manifest_drift_tests {
     const BASELINE_PENDING_REMOVAL: &[(&str, &str, &str)] = &[
         (
             "POST",
-            "/ui-bridge/ai/media/audit/{}",
-            "qontinui-runner#2266 deletes this entry (the /ai/media family went to /vision/*)",
-        ),
-        (
-            "POST",
             "/ui-bridge/control/capture-element-images",
             "qontinui-runner#2266 deletes this entry with the dead element-capture path",
         ),
