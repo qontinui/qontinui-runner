@@ -1,5 +1,5 @@
 ---
-description: "Mark THIS session finished — the work axis, not liveness. Records `session_status=finished` on the session's coord row, so a rebuilt runner offers only UNFINISHED sessions for resume. Reversible with --undo (a transition back to `working`). Never closes the session or touches the process."
+description: "Mark THIS session finished — the work axis, not liveness. Records `session_status=finished` on the session's coord row, so a rebuilt runner offers only UNFINISHED sessions for resume. Reversible with --undo (a transition back to `working`). Never closes the session; it ends only this session's own proven-stray wait loops, and refuses while live background work remains."
 argument-hint: "[--reason \"<why>\"] [--undo] [--session <claude-session-uuid>] [--force]"
 allowed-tools: Read, Bash, ToolSearch, Grep
 ---
@@ -10,12 +10,14 @@ Marks a session **FINISHED** on the WORK axis. One durable consequence: the
 runner stops offering it for resume, so after you rebuild the runner you get back
 only the sessions that still have work left.
 
-> **This never touches the process.** Finishing is pure metadata. The session
-> keeps running until it exits on its own, you can keep typing in it, and
-> `--undo` lifts the mark (a transition back to `working` — coord has no "unset"
-> status, so it reverses the CONSEQUENCES, not the history; see Part B step 2).
-> If you want the session GONE, close it — that is a different axis and a
-> different action.
+> **It ends only this session's own proven-stray wait loops** (step 0.7):
+> background loops that can never exit on their own. Everything else about
+> finishing is pure metadata. The session keeps running until it exits on its
+> own, you can keep typing in it, and `--undo` lifts the mark (a transition back
+> to `working` — coord has no "unset" status, so it reverses the CONSEQUENCES,
+> not the history; see Part B step 2). Real background work is never stopped: a
+> live task refuses the finish instead. If you want the session GONE, close it —
+> that is a different axis and a different action.
 
 **`finished` is not `closed`.** They are orthogonal, and conflating them is the
 mistake this command exists to avoid:
@@ -214,6 +216,91 @@ then quote the verdict line it overrode. An `--undo` skips this step: moving a
 row back to `working` closes nothing. A subagent never reaches this step (step
 0 already stopped it).
 
+**0.7. Stop this session's own stray wait loops; refuse while live background
+work remains.** Skip it for `--undo`: unmarking stops nothing.
+
+A background task this session started (a `run_in_background` Bash call, a
+Monitor) outlives the finish. Most are real work, and a finish over them hides
+work in flight, the same evidence step 0.5 reads in claims. Some are waits that
+can never end. `until ! pgrep -f X` matches the loop's OWN command line, which
+holds X, and a loop polling a task output file that nothing writes any more
+sleeps forever. Those hold the finished session `BUSY` in
+`/close-finished-sessions` until something ends them (2026-10-23: 15 such loops
+on one box, 31-48 h old). This step lists the session's tasks with the same
+classifier the closer uses. The helper is `close-finished-sessions.py` in the
+`command-scripts` skill, found the way `/close-finished-sessions` Step 1 finds
+it:
+
+```bash
+command_script() {  # print the path of helper $CS_REL, carried by the command-scripts skill
+  local d="$PWD" c
+  while :; do
+    c="$d/.claude/skills/command-scripts/_scripts/$CS_REL"
+    [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+    [ "$d" = / ] && break; d=$(dirname "$d")
+  done
+  c="$HOME/.claude/skills/command-scripts/_scripts/$CS_REL"
+  [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+  echo "command-scripts: _scripts/$CS_REL not found in .claude/skills/command-scripts/ under $PWD, any parent of it, or $HOME -- the command-scripts skill is not provisioned here" >&2
+  return 1
+}
+if CFS=$(CS_REL=close-finished-sessions.py command_script); then
+  python3 "$CFS" --own-tasks; echo "own-tasks exit=$?"
+else
+  echo "own-tasks exit=3 (helper not provisioned)"
+fi
+```
+
+It walks up from its own process to the nearest `claude`, lists that claude's
+direct tool-shell children (its own ancestry left out), and maps each to its
+harness task id through fd 1, the `<session>/tasks/<task_id>.output` file. A
+foreground or background Bash shell has one. A shell whose fd 1 is a socket
+has no task file to name, so its row shows `-` for the id. Each row is one of
+two kinds:
+
+- `STRAY <task_id> pid=<pid> <class>: <command>` is a proven-stray wait loop.
+  Its condition can never change: a self-matching `pgrep -f` / `ps | grep` with
+  no live target (class `a`), a file no process holds open and unchanged past
+  `--idle-min` (`b-file`), or a `kill -0` pid that is gone or was reused
+  (`b-pid`).
+- `LIVE <task_id> pid=<pid> <reason>: <command>` is work in flight. That covers
+  a bounded wait (class `c`), a loop whose target still runs (`waits on live
+  pid N`), and anything the classifier cannot read.
+
+Read the exit code BEFORE you stop anything:
+
+- **1**: **do not finish, and stop NOTHING**, not even the `STRAY` rows. Name
+  every `LIVE` row and say the session still has background work in flight, as
+  step 0.5 does for claims. Wait for that work, or stop the tasks you started
+  and no longer need, then run this step again. `--force` overrides the
+  refusal as it does in step 0.5. It never widens what is stopped.
+- **0**: no live task. Stop only the `STRAY` rows whose task id THIS context
+  launched, meaning an id one of your own `run_in_background` results returned
+  to you. Stop each with `TaskStop(task_id)`, loading the tool through
+  `ToolSearch` if it is deferred. Never use `KillShell` / `shell_id`, which is
+  the deprecated spelling. Then run the block once more: a `STRAY` row still
+  listed is one `TaskStop` could not stop. Name every stray you did not stop in
+  the finish output as `stray left running: pid N`: one you did not launch, one
+  with a `-` id, and one `TaskStop` could not stop. The next
+  `/close-finished-sessions` close ends any that outlive the pane, after
+  proving each is still a stray.
+- **3**: print `background tasks: UNKNOWN on this OS`, and proceed. The script
+  also exits 3 when no `claude` runs above it, or when the walk above found no
+  helper; quote its own reason then. The closer is the backstop: it ends a
+  proven stray after the pane close.
+
+> **A subagent never reaches this step**, because step 0 stops it. If you are
+> reading this from one anyway, know that a subagent runs inside its parent's
+> `claude` process: one pid, one `tasks/` directory. So `--own-tasks` lists the
+> PARENT's tasks and every sibling subagent's, not yours alone (measured
+> 2026-10-24 from a subagent: every listed task was the parent's or a
+> sibling's). Do not `TaskStop` a task you did not start. Report the list as
+> owed by the parent. The same sharing means a parent sees a subagent's
+> CURRENTLY RUNNING tool shell, and a live one refuses the parent's finish,
+> which is correct. A background subagent between tool calls has no tool shell,
+> so this step does not see it at all. And because a stray a subagent launched
+> was not launched by the parent, the parent names it rather than stopping it.
+
 **1. Resolve YOUR session id. This is the one step you must not skip.**
 
 ```bash
@@ -334,7 +421,7 @@ which repairs your own row (operator-launched) or ends at its terminal state
 exact act this check exists to stop.
 
 > **`--force` does not lift this check.** That flag is the override for steps
-> 0.5 and 0.6. There is no override here: the whole point is that a session which
+> 0.5, 0.6 and 0.7. There is no override here: the whole point is that a session which
 > cannot prove the id is its own has no way to make the write safe.
 
 **1b. Bind your own row when coord cannot find it — then write.**
@@ -506,8 +593,9 @@ Previous-sessions list.
 which step carried the write.
 
 **Part A still runs first, all of it.** Steps 0 (subagent stop), 0.5 (live-claims
-fence), 0.6 (closeable) and 1 / 1a (resolve the id; ownership-check any id that did not come from
-`$CLAUDE_CODE_SESSION_ID`) apply unchanged BEFORE Step 1 below. Step 1 is
+fence), 0.6 (closeable), 0.7 (background tasks) and 1 / 1a (resolve the id; ownership-check any id
+that did not come from `$CLAUDE_CODE_SESSION_ID`) apply unchanged BEFORE Step 1
+below. Step 1 is
 path-addressed: it finishes exactly the id in its URL, whoever that id belongs
 to. That makes it immune to a peer-landing unscoped spelling. It does not make a
 wrong id safe, so a wrong id is still a wrong finish.
