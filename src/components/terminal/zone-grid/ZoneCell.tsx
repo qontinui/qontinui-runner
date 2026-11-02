@@ -288,6 +288,9 @@ function ZoneCellInner({
   // The maximized zone: the maximized view's header replaces the zone chrome.
   const isMaximizedPane = presentation === "maximized";
   const hideZoneChrome = isParked || isMaximizedPane;
+  const scrollZoneToBottom = () => {
+    if (tab) terminalRefs.get(tab.id)?.current?.scrollToBottom();
+  };
   const showLabels = showLabelsProp && !hideZoneChrome;
   // Per-tab subscription — THIS is what stops one pane's output frame from
   // re-rendering the other 39 zones (plan §0 A1). Only the cell whose tab
@@ -716,10 +719,7 @@ function ZoneCellInner({
               onTogglePin={togglePin}
               zoneLabel={zoneLabel}
               onSetZoneLabel={setLabel}
-              onScrollToBottom={() => {
-                const ref = terminalRefs.get(tab.id);
-                ref?.current?.scrollToBottom();
-              }}
+              onScrollToBottom={scrollZoneToBottom}
               totalOutputBytes={hot.totalBytes}
               onToggleFilter={cosmeticZone !== null ? handleToggleFilterInput : undefined}
               filterActive={!!zoneFilter}
@@ -956,7 +956,26 @@ function ZoneCellInner({
           restart / label / export / close). Fades in on cell hover
           via group-hover from the cell's outer div. */}
       {!hideZoneChrome && (
-        <ZoneHoverActions zoneIdx={zoneIdx} labelZone={cosmeticZone} onExportZone={onExportZone} />
+        <ZoneHoverActions
+          zoneIdx={zoneIdx}
+          labelZone={cosmeticZone}
+          onExportZone={onExportZone}
+          headerActions={
+            tab && !showCompactCard && showLabels
+              ? {
+                  isPinned,
+                  onTogglePin: togglePin,
+                  filterActive: !!zoneFilter,
+                  onToggleFilter: cosmeticZone !== null ? handleToggleFilterInput : undefined,
+                  promptsVisible: showPromptsPanel,
+                  onTogglePrompts: promptsAvailable ? handleTogglePrompts : undefined,
+                  reviewOpen: showReviewPanel,
+                  onToggleReview: reviewAvailable ? handleToggleReview : undefined,
+                  onScrollToBottom: scrollZoneToBottom,
+                }
+              : undefined
+          }
+        />
       )}
     </div>
   );

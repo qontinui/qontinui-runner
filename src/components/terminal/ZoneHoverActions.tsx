@@ -31,19 +31,24 @@
  * Coexists with `SuggestionChip` (Phase 4) in the same corner — both
  * render at `z-30`. When a chip is present its rule was specifically
  * authored to be the more relevant signal (error, stuck-needs-input,
- * layout-mismatch), so the chip visually dominates that moment. Hover
- * actions are still discoverable by mousing into the cell; they sit
- * just below the chip's pixels via document order. Phase 9 retire of
- * the per-tab badge cluster will tighten this layout further.
+ * layout-mismatch). At the same z-index this cluster renders after the
+ * chip (`ZoneCell`), so it paints over the chip's pixels while revealed.
+ * Phase 9 retire of the per-tab badge cluster will tighten this layout
+ * further.
  */
 
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import {
   AppWindow,
+  ArrowDownToLine,
   Download,
+  FileDiff,
+  Filter,
   Maximize2,
+  MessageSquare,
   Minimize2,
   MoreHorizontal,
+  Pin,
   RefreshCw,
   Tag,
   X,
@@ -59,6 +64,28 @@ import {
   ZONE_HOVER_FULL_ONLY_CLASS,
   ZONE_HOVER_FULL_ONLY_REMOTE_CLASS,
 } from "./zone-grid/headerReserve";
+
+/**
+ * The `ZoneLabel` row toggles that hide in the narrowest zones
+ * (`ZONE_HEADER_TOGGLE_CLASS`), for the overflow menu to carry. Omitted when the
+ * zone shows no `ZoneLabel` (a compact card, the solo strip); a handler left out
+ * means the row has no such toggle either.
+ */
+export interface ZoneHeaderMenuActions {
+  isPinned?: boolean;
+  onTogglePin?: () => void;
+  filterActive?: boolean;
+  onToggleFilter?: () => void;
+  promptsVisible?: boolean;
+  onTogglePrompts?: () => void;
+  /**
+   * Stays on the row at every width, but it is the rightmost toggle left there,
+   * so it is the first to reach under the cluster; this keeps a route to it.
+   */
+  reviewOpen?: boolean;
+  onToggleReview?: () => void;
+  onScrollToBottom?: () => void;
+}
 
 interface ZoneHoverActionsProps {
   zoneIdx: number;
@@ -77,6 +104,7 @@ interface ZoneHoverActionsProps {
    * maximized view's title bar) instead of the hover-revealed top-right overlay.
    */
   inline?: boolean;
+  headerActions?: ZoneHeaderMenuActions;
 }
 
 /**
@@ -117,12 +145,15 @@ export const HEADER_FIXED_ITEMS_PX = {
 /**
  * The row items that truncate, with the width each keeps once truncated: its
  * horizontal padding or margin (`nonDurable` and `reviewBadge` `px-1`,
- * `totalOutput` `ml-1`). Each still takes a row gap.
+ * `totalOutput` `ml-1`), or its icon (`tenantBadge`, `min-w-[18px]`, only on a
+ * multi-tenant device, but the collapse width is one number for every device).
+ * Each still takes a row gap.
  */
 export const HEADER_TRUNCATING_FLOORS_PX = {
   name: 0,
   position: 0,
   nonDurable: 8,
+  tenantBadge: 18,
   totalOutput: 4,
   reviewBadge: 8,
   cwd: 0,
@@ -154,9 +185,6 @@ export const HEADER_ROW_GAP_PX = 6;
  * hover cluster collapses.
  *
  * `remote` adds a remote tab's `RemoteTabControls` items.
- *
- * Not budgeted: `TenantBadge` (multi-tenant devices only), whose width follows
- * unbounded text.
  */
 export function headerControlsMinPx(remote = false): number {
   const widths: number[] = [
@@ -182,6 +210,7 @@ export function ZoneHoverActions({
   labelZone,
   onExportZone,
   inline,
+  headerActions,
 }: ZoneHoverActionsProps) {
   const session = useTerminalSession();
   const { zoneLayout, closeTerminal, sessionStates, tabs } = session;
@@ -320,6 +349,16 @@ export function ZoneHoverActions({
     items[focusOnOpen.current === "first" ? 0 : items.length - 1]?.focus();
   }, [showOverflowMenu]);
 
+  // The cluster hides when the pointer leaves the cell, so the menu closes with
+  // it: left open and focused, Enter or Space would run an item nobody can see.
+  useEffect(() => {
+    if (!showOverflowMenu) return;
+    const cell = overflowRef.current?.closest<HTMLElement>(".group");
+    if (!cell) return;
+    cell.addEventListener("mouseleave", closeOverflow);
+    return () => cell.removeEventListener("mouseleave", closeOverflow);
+  }, [showOverflowMenu, closeOverflow]);
+
   const refreshWindows = useCallback(() => {
     // Refresh the target list each open — pop-outs may have come/gone.
     listWindows()
@@ -446,6 +485,13 @@ export function ZoneHoverActions({
       if (disabled) return;
       action(e);
       closeOverflow();
+      // From the keyboard (`detail` 0), the focused item is about to be hidden,
+      // which would drop focus to the page, so hand it back to the button; a
+      // surface that takes focus (the label popover, the filter bar) then takes
+      // it from there. Never after a mouse click: a user who clicks an action and
+      // goes on typing would be typing into this button, and Space or Enter
+      // would open the menu and run its first item.
+      if (e.detail === 0) overflowButtonRef.current?.focus();
     };
 
   const toggleMenuExpand =
@@ -465,6 +511,12 @@ export function ZoneHoverActions({
   // focus move on, Up / Down / Home / End move between items.
   const handleOverflowKeyDown = (e: React.KeyboardEvent) => {
     const fromButton = e.target === overflowButtonRef.current;
+    // Only a fresh Enter acts. A held one would otherwise run the first item of
+    // the menu it just opened, then reopen the menu from the button, and so on.
+    if (e.key === "Enter" && e.repeat) {
+      e.preventDefault();
+      return;
+    }
     if (!showOverflowMenu) {
       if (fromButton && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
         e.preventDefault();
@@ -516,11 +568,12 @@ export function ZoneHoverActions({
       // clicks on the terminal underneath; hover flips it back so
       // buttons are clickable once visible. Enter delay lives on the
       // group-hover variant only — exit transition fires immediately
-      // for a snappy "mouse left" feel.
+      // for a snappy "mouse left" feel. Keyboard focus reveals it too, so
+      // Tab never lands on an invisible button or opens an invisible menu.
       className={
         inline
           ? "relative shrink-0"
-          : "absolute top-1 right-1 z-30 opacity-0 pointer-events-none transition-opacity duration-200 group-hover:opacity-100 group-hover:pointer-events-auto group-hover:delay-150"
+          : "absolute top-1 right-1 z-30 opacity-0 pointer-events-none transition-opacity duration-200 group-hover:opacity-100 group-hover:pointer-events-auto group-hover:delay-150 has-[:focus-visible]:opacity-100 has-[:focus-visible]:pointer-events-auto"
       }
       // Inline (maximized header): keep clicks/double-clicks from reaching the
       // header, whose double-click restores the zone.
@@ -690,8 +743,12 @@ export function ZoneHoverActions({
               id={overflowMenuId}
               role="menu"
               aria-label="Zone actions"
+              // `max-w`: it opens leftward from beside Close (and a remote End),
+              // up to 53 px in from the cell's right edge, so with a 5 px margin
+              // it fits the narrowest zones rather than losing its left end to
+              // the cell's `overflow-hidden`.
               hidden={!showOverflowMenu}
-              className="absolute top-full right-0 mt-1 w-48 bg-[#1a1b26] border border-[#2a2d3d] rounded shadow-xl z-50 overflow-x-hidden overflow-y-auto py-0.5"
+              className="absolute top-full right-0 mt-1 w-48 max-w-[calc(100cqw-58px)] bg-[#1a1b26] border border-[#2a2d3d] rounded shadow-xl z-50 overflow-x-hidden overflow-y-auto py-0.5"
               style={menuMaxHeight !== null ? { maxHeight: `${menuMaxHeight}px` } : undefined}
             >
               {canMaximize && (
@@ -802,6 +859,65 @@ export function ZoneHoverActions({
                     ))}
                 </div>
               )}
+              {headerActions && (
+                <div role="group" aria-label="Zone header">
+                  {headerActions.onTogglePin && (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={fromOverflow(headerActions.onTogglePin)}
+                      className={OVERFLOW_ITEM_CLASS}
+                    >
+                      <Pin className="w-3 h-3 shrink-0" aria-hidden />
+                      {headerActions.isPinned ? "Unpin zone" : "Pin zone"}
+                    </button>
+                  )}
+                  {headerActions.onToggleFilter && (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={fromOverflow(headerActions.onToggleFilter)}
+                      className={OVERFLOW_ITEM_CLASS}
+                    >
+                      <Filter className="w-3 h-3 shrink-0" aria-hidden />
+                      {headerActions.filterActive ? "Filter output (active)" : "Filter output"}
+                    </button>
+                  )}
+                  {headerActions.onTogglePrompts && (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={fromOverflow(headerActions.onTogglePrompts)}
+                      className={OVERFLOW_ITEM_CLASS}
+                    >
+                      <MessageSquare className="w-3 h-3 shrink-0" aria-hidden />
+                      {headerActions.promptsVisible ? "Hide my prompts" : "Show my prompts"}
+                    </button>
+                  )}
+                  {headerActions.onToggleReview && (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={fromOverflow(headerActions.onToggleReview)}
+                      className={OVERFLOW_ITEM_CLASS}
+                    >
+                      <FileDiff className="w-3 h-3 shrink-0" aria-hidden />
+                      {headerActions.reviewOpen ? "Hide session review" : "Review session changes"}
+                    </button>
+                  )}
+                  {headerActions.onScrollToBottom && (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={fromOverflow(headerActions.onScrollToBottom)}
+                      className={OVERFLOW_ITEM_CLASS}
+                    >
+                      <ArrowDownToLine className="w-3 h-3 shrink-0" aria-hidden />
+                      Scroll to bottom
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -833,7 +949,7 @@ export function ZoneHoverActions({
       {showLabelInput && (
         <div
           ref={labelPopoverRef}
-          className="absolute top-full right-0 mt-1 w-44 bg-[#1a1b26] border border-[#2a2d3d] rounded shadow-xl p-2 z-50"
+          className="absolute top-full right-0 mt-1 w-44 max-w-[calc(100cqw-8px)] bg-[#1a1b26] border border-[#2a2d3d] rounded shadow-xl p-2 z-50"
         >
           <input
             ref={labelInputRef}
@@ -843,7 +959,8 @@ export function ZoneHoverActions({
             onMouseDown={(e) => e.stopPropagation()}
             onKeyDown={(e) => {
               e.stopPropagation();
-              if (e.key === "Enter") {
+              // A held Enter that opened this from the menu is not a submit.
+              if (e.key === "Enter" && !e.repeat) {
                 if (labelZone !== null) labelsAndTags.setZoneLabel(labelZone, labelDraft.trim());
                 setShowLabelInput(false);
               } else if (e.key === "Escape") {

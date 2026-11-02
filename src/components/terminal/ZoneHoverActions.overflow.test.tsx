@@ -47,15 +47,17 @@ vi.mock("./useTerminalWindowActions", () => ({
   }),
 }));
 
-import { ZoneHoverActions } from "./ZoneHoverActions";
+import { ZoneHoverActions, type ZoneHeaderMenuActions } from "./ZoneHoverActions";
 
 let container: HTMLDivElement;
 let root: Root;
 const onExportZone = vi.fn();
 
-function mount() {
+function mount(headerActions?: ZoneHeaderMenuActions) {
   act(() => {
-    root.render(createElement(ZoneHoverActions, { zoneIdx: 0, labelZone: 0, onExportZone }));
+    root.render(
+      createElement(ZoneHoverActions, { zoneIdx: 0, labelZone: 0, onExportZone, headerActions }),
+    );
   });
 }
 
@@ -168,6 +170,18 @@ describe("ZoneHoverActions overflow menu", () => {
     expect(isOpen()).toBe(false);
   });
 
+  it("the pointer leaving the cell closes it, so nothing unseen keeps focus", () => {
+    container.classList.add("group");
+    mount();
+    click(button());
+    expect(isOpen()).toBe(true);
+    act(() => {
+      container.dispatchEvent(new MouseEvent("mouseleave"));
+    });
+    expect(isOpen()).toBe(false);
+    container.classList.remove("group");
+  });
+
   it("focus moving to another element closes it", () => {
     mount();
     click(button());
@@ -184,6 +198,157 @@ describe("ZoneHoverActions overflow menu", () => {
     click(item("Maximize zone"));
     expect(h.toggleMaximize).toHaveBeenCalledWith(0);
     expect(isOpen()).toBe(false);
+  });
+
+  it("a keyboard action returns focus to the button rather than dropping it to the page", () => {
+    mount();
+    click(button());
+    item("Restart session").focus();
+    // Enter on a button clicks it with `detail` 0, as `el.click()` does.
+    click(item("Restart session"));
+    expect(h.handleRestartInZone).toHaveBeenCalledWith(0);
+    expect(document.activeElement).toBe(button());
+  });
+
+  it("a mouse action leaves focus off the button, so later typing cannot run an item", () => {
+    mount();
+    click(button());
+    const restart = item("Restart session");
+    restart.focus();
+    act(() => {
+      restart.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 1 }));
+    });
+    expect(h.handleRestartInZone).toHaveBeenCalledWith(0);
+    expect(isOpen()).toBe(false);
+    expect(document.activeElement).not.toBe(button());
+  });
+
+  it("the menu and the label popover fit the cell rather than losing their left end", () => {
+    mount();
+    expect(menu().className).toContain("max-w-[calc(100cqw-58px)]");
+    click(button());
+    click(item("Edit zone label"));
+    const popover = container.querySelector("input")!.parentElement!;
+    expect(popover.className).toContain("max-w-[calc(100cqw-8px)]");
+  });
+
+  it("a held Enter that opened the label popover does not submit it", () => {
+    mount();
+    click(button());
+    click(item("Edit zone label"));
+    const input = () => container.querySelector("input");
+    act(() => {
+      input()!.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Enter", repeat: true, bubbles: true }),
+      );
+    });
+    expect(input()).not.toBeNull();
+    act(() => {
+      input()!.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    });
+    expect(input()).toBeNull();
+  });
+
+  it("a held Enter runs nothing, on the button or on the menu it opened", () => {
+    mount();
+    const held = () =>
+      new KeyboardEvent("keydown", {
+        key: "Enter",
+        repeat: true,
+        bubbles: true,
+        cancelable: true,
+      });
+    const onButton = held();
+    act(() => {
+      button().dispatchEvent(onButton);
+    });
+    expect(onButton.defaultPrevented).toBe(true);
+    click(button());
+    const onItem = held();
+    act(() => {
+      items()[0]!.dispatchEvent(onItem);
+    });
+    expect(onItem.defaultPrevented).toBe(true);
+    click(button());
+    const first = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    act(() => {
+      button().dispatchEvent(first);
+    });
+    expect(first.defaultPrevented).toBe(false);
+  });
+
+  it("carries the row toggles it is handed, each running its handler", () => {
+    const onTogglePin = vi.fn();
+    const onToggleFilter = vi.fn();
+    const onTogglePrompts = vi.fn();
+    const onToggleReview = vi.fn();
+    const onScrollToBottom = vi.fn();
+    mount({
+      isPinned: true,
+      onTogglePin,
+      onToggleFilter,
+      onTogglePrompts,
+      onToggleReview,
+      onScrollToBottom,
+    });
+    click(button());
+    expect(menu().querySelector('[role="group"][aria-label="Zone header"]')).not.toBeNull();
+    for (const [text, handler] of [
+      ["Unpin zone", onTogglePin],
+      ["Filter output", onToggleFilter],
+      ["Show my prompts", onTogglePrompts],
+      ["Review session changes", onToggleReview],
+      ["Scroll to bottom", onScrollToBottom],
+    ] as const) {
+      if (!isOpen()) click(button());
+      click(item(text));
+      expect(handler, text).toHaveBeenCalledTimes(1);
+      expect(isOpen(), text).toBe(false);
+    }
+  });
+
+  it("names each toggle by its state", () => {
+    const f = () => {};
+    mount({
+      isPinned: false,
+      onTogglePin: f,
+      filterActive: true,
+      onToggleFilter: f,
+      promptsVisible: true,
+      onTogglePrompts: f,
+      reviewOpen: true,
+      onToggleReview: f,
+    });
+    click(button());
+    expect(item("Pin zone")).toBeTruthy();
+    expect(item("Filter output (active)")).toBeTruthy();
+    expect(item("Hide my prompts")).toBeTruthy();
+    expect(item("Hide session review")).toBeTruthy();
+  });
+
+  it("leaves out a row toggle with no handler, and the group with none", () => {
+    mount({ onScrollToBottom: () => {} });
+    click(button());
+    expect(item("Scroll to bottom")).toBeTruthy();
+    expect(item("Pin zone")).toBeUndefined();
+    expect(item("Filter output")).toBeUndefined();
+    expect(item("Show my prompts")).toBeUndefined();
+    act(() => root.unmount());
+    root = createRoot(container);
+    mount();
+    click(button());
+    expect(menu().querySelector('[aria-label="Zone header"]')).toBeNull();
+  });
+
+  it("Edit zone label moves focus on into the label input", async () => {
+    mount();
+    click(button());
+    await act(async () => {
+      item("Edit zone label").click();
+      await Promise.resolve();
+    });
+    expect(isOpen()).toBe(false);
+    expect(document.activeElement?.tagName).toBe("INPUT");
   });
 
   it("a disabled item stays focusable, does nothing, and leaves the menu open", () => {
