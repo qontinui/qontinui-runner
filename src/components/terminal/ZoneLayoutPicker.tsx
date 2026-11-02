@@ -11,7 +11,11 @@ import { useUIComponent, UIBridgeComponentScope } from "@qontinui/ui-bridge";
 import { callRegistry, textArg } from "./commands";
 import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
 import { usePageSessionGetter, useTerminalSession } from "./contexts";
-import { LIST_LAYOUTS_SIGNATURE, selectLayoutSignature } from "./zonePickerSignatures";
+import {
+  GET_PAGE_LAYOUT_SIGNATURE,
+  LIST_LAYOUTS_SIGNATURE,
+  selectLayoutSignature,
+} from "./zonePickerSignatures";
 
 /** Hoisted so the registration and its guarded handler read one declaration. */
 const SELECT_LAYOUT_SCHEMA = {
@@ -178,6 +182,7 @@ export function ZoneLayoutPicker({
         paramSchema: GET_PAGE_LAYOUT_SCHEMA,
         // `read` — reports one page's grid state; changes nothing.
         effect: "read",
+        signature: GET_PAGE_LAYOUT_SIGNATURE,
         handler: guardedHandler("get-page-layout", GET_PAGE_LAYOUT_SCHEMA, (args) => {
           const pageId = textArg(args, "pageId") || activePageId;
           const page = getPageSession(pageId);

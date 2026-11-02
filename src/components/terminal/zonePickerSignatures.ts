@@ -83,6 +83,8 @@ export function selectLayoutSignature(tabCount: number): EffectSignature {
   };
 }
 
+export const GET_PAGE_LAYOUT_SIGNATURE = readSignature("zone-layout-picker.get-page-layout");
+
 export const LIST_LAYOUTS_SIGNATURE = readSignature("zone-layout-picker.list-layouts");
 
 // ---------------------------------------------------------------------------
