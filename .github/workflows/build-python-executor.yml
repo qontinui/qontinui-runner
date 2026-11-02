@@ -97,6 +97,14 @@ jobs:
         run: |
           poetry run pip install -e ../qontinui-lib
 
+      # Poetry's parallel install can mix or tear the files of Xlib/ and cv2/,
+      # which several locked distributions write, and PyInstaller would freeze
+      # that damage into the executor. Runs after the last install step. Why
+      # and how: qontinui's scripts/enforce_package_owners.py.
+      - name: Enforce owners of contested packages (Xlib, cv2)
+        working-directory: python-bridge
+        run: poetry run python ../qontinui-lib/scripts/enforce_package_owners.py --lock poetry.lock
+
       # Build the executor
       - name: Build Python executor (Linux/macOS)
         if: runner.os != 'Windows'

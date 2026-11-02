@@ -102,5 +102,4 @@ terminal/account_migration.rs | spawn_resumed_pane | helper | spawn_resumed_pane
 trigger_system/executor.rs | execute_triggered_workflow | autonomous | execute_triggered_workflow
 unified_ai_session.rs | execute | exempt | a phase of a unified-workflow run that is already running; every workflow START is a gated row here
 unified_workflow_executor/auto_run.rs | launch_workflow_by_id | autonomous | launch_workflow_by_id
-unified_workflow_executor/review_subtask.rs | execute_review_subtask | autonomous | execute_review_subtask
 unified_workflow_executor/startup_resume.rs | resume_interrupted_workflows | autonomous | resume_interrupted_workflows
