@@ -35,7 +35,8 @@
 //       - exactly one `macro_rules!`, named `add`;
 //       - exactly one `let mut <map> = Map::new();`, and that map is named
 //         exactly three times: the `let`, ONE `.insert(` inside the macro, and
-//         the final `Object(<map>)`. Nothing else can put an entry in it;
+//         the final `Value::Object(<map>)`. Nothing else can put an entry in
+//         it, and nothing can rewrite it on the way out;
 //       - the macro body is exactly `<map>.insert($name.to_string(),
 //         serde_json::to_value(schema_for!($ty)).unwrap())`, so the map key
 //         is the literal name;
@@ -47,11 +48,12 @@
 //         anywhere in the file, so no code is spliced in from another file;
 //       - every `add!(` invocation parses as `add!("Name", <type>)`;
 //   * the names the macro body spells mean what they spell. `schema_for` is
-//     imported from `schemars` and from nowhere else, `serde_json` is not
-//     rebound, an unqualified `Map` is `serde_json::Map`, the file defines no
-//     `schema_for` macro, and it declares no `extern crate`. Otherwise the
-//     macro's text can read correctly while a runner module decides every
-//     schema, and that module is a source-only input to the caller.
+//     imported from `schemars` and from nowhere else, `schemars` and
+//     `serde_json` are not rebound, unqualified `Map` and `Value` are
+//     serde_json's, the file defines no `schema_for` macro, and the word
+//     `extern` appears nowhere in its code. Otherwise the macro's text can read
+//     correctly while a runner module decides every schema, and that module is
+//     a source-only input to the caller.
 //
 // The caller adds the one premise only a regeneration can check: the parsed
 // working-tree names must equal the set of files the regeneration emitted.
@@ -384,7 +386,11 @@ function parseRegistry(src) {
   const mapVar = lets[0][1];
   const mentions = count(body, new RegExp(`\\b${mapVar}\\b`, 'g'));
   const inserts = count(macroBody, new RegExp(`\\b${mapVar}\\s*\\.\\s*insert\\s*\\(`, 'g'));
-  const returns = new RegExp(`\\bObject\\s*\\(\\s*${mapVar}\\s*\\)\\s*$`).test(body.trim());
+  // Anchored on the left too: `crate::m::Object(map)` ends the same way.
+  const returned = new RegExp(
+    `(?:^|[;}\\s])((?:serde_json\\s*::\\s*)?Value)\\s*::\\s*Object\\s*\\(\\s*${mapVar}\\s*\\)$`,
+  ).exec(body.trim());
+  const returns = returned !== null;
   if (shape[1] !== mapVar) violation(`the add! macro inserts into \`${shape[1]}\`, not the map \`${mapVar}\``);
   if (mentions !== 3 || inserts !== 1 || !returns) {
     violation(
@@ -453,10 +459,15 @@ function parseRegistry(src) {
     }
   };
   if (/\bmacro_rules\s*!\s*schema_for\b/.test(code)) violation('the registry file defines its own schema_for macro');
-  if (/\bextern\s+crate\b/.test(fileLevel)) violation('an extern crate in the registry file');
+  // The whole file, the function body included, and the bare keyword: comments
+  // and raw identifiers cannot split it, and a real extern block has no business
+  // in the registry either.
+  if (/\bextern\b/.test(code)) violation('an extern item in the registry file');
   pinned('schema_for', 'schemars::schema_for', {});
+  pinned('schemars', 'schemars', { optional: true });
   pinned('serde_json', 'serde_json', { optional: true });
   if (!/\bserde_json\b/.test(lets[0][0])) pinned('Map', 'serde_json::Map', {});
+  if (!/\bserde_json\b/.test(returned[1])) pinned('Value', 'serde_json::Value', {});
 
   const lines = [];
   for (const name of [...names.keys()].sort()) {

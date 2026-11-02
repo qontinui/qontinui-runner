@@ -406,6 +406,23 @@ git -C "$WORK" commit --quiet -m "the form the real lib.rs uses"
 decide_files
 check "  while the alias the real lib.rs declares does not" "pre-existing" "$FILE_ATTRIBUTION_STATE"
 
+# Comments and raw identifiers cannot walk an alias past the allowlist.
+for rebind in \
+    'extern crate self /* c */ as qontinui_types;' \
+    'extern crate self as r#qontinui_types;' \
+    'extern crate self as serde_json;' \
+    'extern crate self as schemars;'
+do
+    fixture
+    mk_tree "$BTREE" $REGISTERED Pending
+    mk_tree "$RTREE" $REGISTERED
+    printf '// lib\n%s\npub mod other;\npub mod schema_export;\n' "$rebind" > "$WORK/src-tauri/src/lib.rs"
+    git -C "$WORK" add -A >/dev/null
+    git -C "$WORK" commit --quiet -m "rebind a trusted crate"
+    decide_files
+    check "lib.rs '$rebind' falls back" "whole-push" "$FILE_ATTRIBUTION_STATE"
+done
+
 # A file under schema_export/ moves presence without an add! line changing.
 fixture
 mk_tree "$BTREE" $REGISTERED Pending
@@ -622,17 +639,19 @@ echo "  -- the hook's errexit context survives a large registry --"
 
 # The hook runs under `set -euo pipefail`. A pipe whose reader exits early
 # can SIGPIPE its writer there and end the hook with no verdict. Run one
-# whole decision that way, over 6000 registrations: about 100 KB of registry
-# rows, well past a 64 KB pipe buffer, with the drifted type (Alpha) sorting
-# first so an early-exiting reader would leave most of them unwritten.
+# whole decision that way, over 12000 registrations: about 216 KB of registry
+# rows, with the drifted type (Alpha) sorting first so an early-exiting reader
+# leaves most of them unwritten. The size matters. A reader takes up to 96 KB
+# before it stops and the pipe holds another 64 KB, so anything much under
+# 160 KB lets the writer finish, and the case passes or fails by timing.
 fixture
-BIG_EXTRA="$(for i in $(seq 1 6000); do printf '    add!("Big%04d", qa::Big%04d);\n' "$i" "$i"; done)"
+BIG_EXTRA="$(for i in $(seq 1 12000); do printf '    add!("Big%05d", qa::Big%05d);\n' "$i" "$i"; done)"
 registry_text "$BIG_EXTRA" > "$UPSTREAM/src-tauri/src/schema_export.rs"
 git -C "$UPSTREAM" add -A >/dev/null
 git -C "$UPSTREAM" commit --quiet -m "base: a large registry"
 git -C "$WORK" fetch --quiet origin
 git -C "$WORK" reset --hard --quiet origin/main
-BIG_NAMES="$REGISTERED $(seq -f 'Big%04g' 1 6000 | tr '\n' ' ')"
+BIG_NAMES="$REGISTERED $(seq -f 'Big%05.0f' 1 12000 | tr '\n' ' ')"
 # shellcheck disable=SC2086
 TREE_CONTENT_Alpha='// Alpha schemas-side' mk_tree "$BTREE" $BIG_NAMES Pending
 # shellcheck disable=SC2086
@@ -647,7 +666,7 @@ commit_change "src-tauri/src/other.rs" "// a runner change"
     printf '%s' "$FILE_ATTRIBUTION_STATE" > "$WORK/.big-state"
 )
 BIG_RC=$?
-check "a 6000-entry decision is not ended by errexit" 0 "$BIG_RC"
+check "a 12000-entry decision is not ended by errexit" 0 "$BIG_RC"
 check "  and reaches its verdict" "pre-existing" "$(cat "$WORK/.big-state" 2>/dev/null)"
 
 echo "  -- the registry reader, directly --"
@@ -748,6 +767,21 @@ check "an unqualified Map from this crate is refused" 1 "$rc"
 
 out="$( { registry_text; printf 'extern crate self as qontinui_types;\n'; } | parse_text)"; rc=$?
 check "an extern crate in the registry file is refused" 1 "$rc"
+
+out="$(registry_text '    extern crate self as qontinui_types;' | parse_text)"; rc=$?
+check "  also inside the function body" 1 "$rc"
+
+out="$(registry_text | sed 's/^use schemars::schema_for;/use crate::m as schemars;\nuse schemars::schema_for;/' | parse_text)"; rc=$?
+check "a rebound schemars is refused" 1 "$rc"
+
+out="$(registry_text | sed 's/    Value::Object(m)/    crate::m::Object(m)/' | parse_text)"; rc=$?
+check "a final Object(m) from this crate is refused" 1 "$rc"
+
+out="$(registry_text | sed 's/^use serde_json::{Map, Value};/use serde_json::Map;\nuse crate::v::Value;/' | parse_text)"; rc=$?
+check "an unqualified Value from this crate is refused" 1 "$rc"
+
+out="$(registry_text | sed 's/    Value::Object(m)/    serde_json::Value::Object(m)/' | parse_text)"; rc=$?
+check "  while a fully qualified serde_json::Value is fine" 0 "$rc"
 
 for bad in \
     'include!("more.rs");' \
