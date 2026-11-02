@@ -2158,8 +2158,9 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // on whichever of this DEVICE's sessions started most recently —
             // i.e. usually a peer's, on a box running many sessions.
             //
-            // `session_status = "finished"` is terminal on coord's work axis and
-            // gates prompting; no coord production writer moves a row off it.
+            // `session_status = "finished"` gates prompting on coord's work axis.
+            // On a row that has started, one door moves it off: `run_progress_advance`,
+            // for an attributable report (a revival, or `/finish-session --undo`).
             //
             // The body also carries the mark's own time as `last_progress_at`
             // (see `finished_body`), so coord stamps the finish at the instant
