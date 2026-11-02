@@ -4690,6 +4690,18 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // freshness proof.
                         poll_lifecycle_store.snapshot_heartbeat();
 
+                        // Session-identity reporter (plan
+                        // 2026-10-19-session-lookup-by-name-shows-claude-account-in-web,
+                        // Phase 2): account root + names of every session id
+                        // this box can resolve, ENDED ones included, posted to
+                        // coord so a session is findable by name after it
+                        // exits. Called here, BEFORE the idle `continue`
+                        // below, because ended sessions need reporting on a
+                        // box with no open record. Paced to its own interval,
+                        // primary-only, and spawned off this tick — it never
+                        // adds latency to the poll.
+                        session::identity_stamp::on_lifecycle_tick();
+
                         // Phase 4: persist the open-session ledger ON CHANGE.
                         // The poll IS the store's periodic tick, so this is
                         // where "on change" naturally lives; the write is
