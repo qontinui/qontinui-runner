@@ -3,7 +3,7 @@ import { autonomousResumeDetector, subscribeCoordDrainState } from "@/hooks/useC
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { LAYOUT_PRESETS, FLOW_GRID_ID } from "./useZoneLayout";
+import { LAYOUT_PRESETS, FLOW_GRID_ID, resolveLayout } from "./useZoneLayout";
 import type { LayoutRequestSource } from "./terminalWorkMode";
 import type { TerminalRefsMap } from "./writeWhenReady";
 import {
@@ -876,9 +876,14 @@ export function mayClaimRecordedZone(
   zoneIndex: number,
   tabId: string,
   assignments: Record<number, string>,
+  zoneCount: number,
 ): boolean {
   if (zoneIndex < 0) return false;
   if (!isDrainRerun) return true;
+  // The grid may have shrunk since the record was written. A tab assigned past
+  // the last zone renders nowhere, and it is not "unassigned" either, so nothing
+  // reports it. Auto-fill gives it a zone that exists.
+  if (zoneIndex >= zoneCount) return false;
   const holder = assignments[zoneIndex];
   return holder === undefined || holder === tabId;
 }
@@ -1465,8 +1470,11 @@ interface UseTerminalInitializationParams {
      */
     placeRestoredTab: (zoneIdx: number, tabId: string) => void;
     setFocusedZone: (zoneIdx: number) => void;
-    /** The grid's assignments — the snapshot's in tmux mode (`useZoneLayout().gridView`). */
-    gridView: { assignments: Record<number, string> };
+    /**
+     * The grid, read live from however long ago this object was captured — the
+     * snapshot's in tmux mode (`useZoneLayout().readGridView`).
+     */
+    readGridView: () => { layoutId: string; assignments: Record<number, string> };
     /**
      * Hold (false) or release (true) the page's auto-trim around a restore
      * run (`useZoneLayout().setRestoreSettled`): while a run drains, a falling
@@ -1625,6 +1633,16 @@ export function useTerminalInitialization({
   // Pages whose restore the drain deferred, so their re-run merges into the
   // tabs that exist by then instead of re-laying the page out.
   const drainDeferredPages = useRef<Set<string>>(new Set());
+  // Pages whose last run was deferred by the drain, so their next run does not
+  // close the trim hold until it knows it is not deferred again. A deferred run
+  // opens the hold, and that state change re-renders the page's scope, which
+  // re-runs the restore effect. Closing the hold at the start of every retry
+  // turned that into a loop that lasted as long as the drain.
+  const deferredRetryPages = useRef<Set<string>>(new Set());
+  // Each page's newest restore run. A re-run can start before an earlier run's
+  // drain timer fires, and that timer must not release the hold the newer run
+  // still needs.
+  const newestRestoreRun = useRef<Map<string, number>>(new Map());
 
   // The two page sets above, PUBLISHED as state for the "Since restart" strip
   // (plan `2026-10-04-runner-session-roster-restore-picker`, Phase 4): it
@@ -1737,10 +1755,26 @@ export function useTerminalInitialization({
     // own (captured with this run), so a drain timer firing after a page
     // switch still releases the right page.
     const setRestoreSettled = zoneLayout.setRestoreSettled;
-    setRestoreSettled(false);
+    const retryingDeferral = deferredRetryPages.current.delete(initPageId);
+    if (!retryingDeferral) setRestoreSettled(false);
+    const thisRun = (newestRestoreRun.current.get(initPageId) ?? 0) + 1;
+    newestRestoreRun.current.set(initPageId, thisRun);
     const openRestoreGate = () => {
       restoreCompletePages.current.add(initPageId);
-      setRestoreSettled(true);
+      if (newestRestoreRun.current.get(initPageId) === thisRun) setRestoreSettled(true);
+    };
+    // What a merging run may place into: its own page's grid as it is now. The
+    // captured `zoneLayout` is the page's own, so this holds through a page
+    // switch, and it reads live because a deferred retry starts with the hold
+    // still open, so a trim can land mid-run. A flow-grid sizes itself to its
+    // highest occupied zone, so it has no limit, and every other layout's zone
+    // count ignores the tab count.
+    const runGridView = zoneLayout.readGridView;
+    const gridZoneCount = () => {
+      const { layoutId } = runGridView();
+      return layoutId === FLOW_GRID_ID
+        ? Number.POSITIVE_INFINITY
+        : resolveLayout(layoutId, 0).zones.length;
     };
     // A re-run for the holder sweep's late settle restores only these. Ids
     // scheduled while this run is in flight wait for its end.
@@ -1810,6 +1844,8 @@ export function useTerminalInitialization({
         const reconnectDecision = decideReconnectOutcome(await reconnectToExistingSessions());
         if (reconnectDecision.kind === "abort-restore") {
           restoreAborted = true;
+          // A deferral retry reaches here with the hold still open.
+          setRestoreSettled(false);
           // Release the guard so the retry can run — this abort must not
           // consume the pageId.
           didInitPages.current.delete(initPageId);
@@ -1847,6 +1883,7 @@ export function useTerminalInitialization({
           // the restore re-runs — merging, not re-laying out — when
           // `drainResumeEpoch` moves.
           restoreDeferred = true;
+          deferredRetryPages.current.add(initPageId);
           drainDeferredPages.current.add(initPageId);
           didInitPages.current.delete(initPageId);
           if (adoptOrphans) didClaimOrphanAdoption.current = false;
@@ -1856,6 +1893,8 @@ export function useTerminalInitialization({
           );
           return;
         }
+        // Not deferred after all, so this retry is a real restore: hold the trim.
+        setRestoreSettled(false);
         const openRecords = restoreSet.records;
         // The default Claude home, for the account rule (`resolveAccountDir`):
         // `null` = unreadable, which makes a dir that may be it needs-account.
@@ -1971,7 +2010,8 @@ export function useTerminalInitialization({
                 isDrainRerun,
                 rec.zoneIndex,
                 tabId,
-                zoneLayout.gridView.assignments,
+                runGridView().assignments,
+                gridZoneCount(),
               )
             ) {
               zoneLayout.placeRestoredTab(rec.zoneIndex, tabId);
@@ -2078,7 +2118,8 @@ export function useTerminalInitialization({
               isDrainRerun,
               rec.zoneIndex,
               tabId,
-              zoneLayout.gridView.assignments,
+              runGridView().assignments,
+              gridZoneCount(),
             )
           ) {
             zoneLayout.placeRestoredTab(rec.zoneIndex, tabId);

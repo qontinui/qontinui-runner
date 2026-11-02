@@ -9,7 +9,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   clearTabFilter,
-  pruneTabFilters,
+  dropTabFilters,
+  tabsClosedOnPage,
   setTabFilter,
   toggleFilterInputTab,
   zoneFiltersFor,
@@ -56,14 +57,21 @@ describe("zone filters keyed by tab", () => {
     expect(toggleFilterInputTab(open, "a")).toBe("a");
   });
 
-  it("pruning drops closed tabs' filters and their open input, same identity otherwise", () => {
+  it("dropping removes closed tabs' filters and their open input, same identity otherwise", () => {
     const filters = setTabFilter(setTabFilter({}, "a", "1"), "gone", "2");
-    expect(pruneTabFilters(filters, "gone", new Set(["a"]))).toStrictEqual({
+    expect(dropTabFilters(filters, "gone", new Set(["gone"]))).toStrictEqual({
       filters: { a: "1" },
       openInput: null,
     });
-    const kept = pruneTabFilters(filters, "a", new Set(["a", "gone"]));
+    const kept = dropTabFilters(filters, "a", new Set(["other"]));
     expect(kept.filters).toBe(filters);
     expect(kept.openInput).toBe("a");
+  });
+
+  it("a tab missing after a page switch is not closed", () => {
+    const before = { pageId: "A", tabIds: new Set(["a", "b"]) };
+    expect(tabsClosedOnPage(before, "B", new Set(["c"]))).toStrictEqual(new Set());
+    expect(tabsClosedOnPage(before, "A", new Set(["a"]))).toStrictEqual(new Set(["b"]));
+    expect(tabsClosedOnPage(before, "A", new Set(["a", "b", "c"]))).toStrictEqual(new Set());
   });
 });

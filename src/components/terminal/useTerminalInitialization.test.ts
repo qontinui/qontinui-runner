@@ -1212,17 +1212,28 @@ describe("fetchRestoreSet — coord device drain", () => {
 
 describe("mayClaimRecordedZone — drain re-run merges with existing tabs", () => {
   it("lets a first restore claim any recorded zone", () => {
-    expect(mayClaimRecordedZone(false, 2, "t-new", { 2: "t-operator" })).toBe(true);
+    expect(mayClaimRecordedZone(false, 2, "t-new", { 2: "t-operator" }, 4)).toBe(true);
   });
 
   it("never lets a drain re-run take a zone an operator tab holds", () => {
-    expect(mayClaimRecordedZone(true, 2, "t-new", { 2: "t-operator" })).toBe(false);
-    expect(mayClaimRecordedZone(true, 2, "t-new", {})).toBe(true);
-    expect(mayClaimRecordedZone(true, 2, "t-same", { 2: "t-same" })).toBe(true);
+    expect(mayClaimRecordedZone(true, 2, "t-new", { 2: "t-operator" }, 4)).toBe(false);
+    expect(mayClaimRecordedZone(true, 2, "t-new", {}, 4)).toBe(true);
+    expect(mayClaimRecordedZone(true, 2, "t-same", { 2: "t-same" }, 4)).toBe(true);
+  });
+
+  it("never lets a drain re-run place a tab past the grid it finds", () => {
+    expect(mayClaimRecordedZone(true, 5, "t-new", {}, 4)).toBe(false);
+    expect(mayClaimRecordedZone(true, 4, "t-new", {}, 4)).toBe(false);
+    expect(mayClaimRecordedZone(true, 3, "t-new", {}, 4)).toBe(true);
+    expect(mayClaimRecordedZone(true, 12, "t-new", {}, Number.POSITIVE_INFINITY)).toBe(true);
+  });
+
+  it("lets a first restore claim past the zone count: the saved layout may yet grow", () => {
+    expect(mayClaimRecordedZone(false, 5, "t-new", {}, 4)).toBe(true);
   });
 
   it("never claims an unzoned record", () => {
-    expect(mayClaimRecordedZone(false, -1, "t", {})).toBe(false);
+    expect(mayClaimRecordedZone(false, -1, "t", {}, 4)).toBe(false);
   });
 });
 
