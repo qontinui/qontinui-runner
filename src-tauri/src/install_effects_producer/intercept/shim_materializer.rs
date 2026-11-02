@@ -2673,6 +2673,119 @@ mod resolve_wait_tests {
         );
     }
 
+    /// The argv the real tool receives when the shim is launched with `args`
+    /// and the pin set, and with the settings and mcp-config env when `hook_env`.
+    fn identity_argv_seen_by_real_tool(args: &[&str], hook_env: bool) -> Vec<String> {
+        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let seen = tmp.path().join("argv");
+        write_exe(
+            &real_dir.join("claude"),
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", seen.display()),
+        );
+        let (settings, mcp) = (tmp.path().join("s.json"), tmp.path().join("m.json"));
+        std::fs::write(&settings, "{}").unwrap();
+        std::fs::write(&mcp, "{}").unwrap();
+        let shim = shim_dir.join("claude");
+        write_exe(&shim, &render_identity_for_test("claude", &shim_dir));
+        let mut cmd = Command::new(bash());
+        cmd.arg(&shim)
+            .args(args)
+            .env_clear()
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:/usr/bin:/bin",
+                    shim_dir.display(),
+                    real_dir.display()
+                ),
+            )
+            .env("QONTINUI_PINNED_SESSION_ID", "pin-1");
+        if hook_env {
+            cmd.env("QONTINUI_CLAUDE_HOOK_SETTINGS", &settings)
+                .env("QONTINUI_MCP_CONFIG", &mcp);
+        }
+        let out = crate::process_helpers::output_with_timeout(cmd, BUDGET).unwrap();
+        assert!(
+            out.status.success(),
+            "shim failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::read_to_string(&seen)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                if l.ends_with("s.json") {
+                    "S".to_string()
+                } else if l.ends_with("m.json") {
+                    "M".to_string()
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect()
+    }
+
+    /// Everything after a `--` is positional, so the shim's flags must land
+    /// ahead of it or they would reach the CLI as prompt words. A continuation's
+    /// argv has this shape, and it reaches the shim by bare name in a reinstall
+    /// window.
+    #[test]
+    fn identity_shim_keeps_its_flags_ahead_of_the_terminator() {
+        assert_eq!(
+            identity_argv_seen_by_real_tool(&["--verbose", "--", "the prompt", "--settings"], true),
+            [
+                "--verbose",
+                "--settings",
+                "S",
+                "--mcp-config",
+                "M",
+                "--session-id",
+                "pin-1",
+                "--",
+                "the prompt",
+                "--settings",
+            ]
+        );
+        // The user-chose branch: no pin, the same placement.
+        assert_eq!(
+            identity_argv_seen_by_real_tool(&["--session-id", "mine", "--", "the prompt"], true),
+            [
+                "--session-id",
+                "mine",
+                "--settings",
+                "S",
+                "--mcp-config",
+                "M",
+                "--",
+                "the prompt",
+            ]
+        );
+        // A session-looking prompt after `--` is not the user choosing one.
+        assert_eq!(
+            identity_argv_seen_by_real_tool(&["--", "resume"], true),
+            [
+                "--settings",
+                "S",
+                "--mcp-config",
+                "M",
+                "--session-id",
+                "pin-1",
+                "--",
+                "resume",
+            ]
+        );
+        // Every array the exec line expands is empty here. Only a bash below
+        // 4.4 can fail this one, which is the shape it guards.
+        assert_eq!(
+            identity_argv_seen_by_real_tool(&[], false),
+            ["--session-id", "pin-1"]
+        );
+    }
+
     #[test]
     fn identity_shim_resolved_tool_never_waits_or_writes_stderr() {
         if system_claude_present() {
