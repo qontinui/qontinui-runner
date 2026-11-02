@@ -31,7 +31,8 @@
 # NOT DETECTED, and no claim is made otherwise:
 #   * anything a gate SHELLS OUT TO. A step is compared by its `run:` TEXT, so
 #     `run: bash scripts/foo.sh` is unchanged when `scripts/foo.sh` is gutted,
-#     and files outside the two trigger globs never reach this job at all.
+#     and files the trigger does not name (its two globs and its one exact path)
+#     never reach this job at all.
 #   * `.github/CODEOWNERS`, a merge gate under the ruleset that lives in
 #     `.github/` but NOT under `workflows/` or `actions/`, so it does not even
 #     trigger this workflow.
@@ -172,7 +173,11 @@ on:
       # guard would never even run. Listed explicitly rather than globbing
       # scripts/**, which is full of non-gating tooling. The scope filter in the
       # job body carries the same path as a `case` arm — a `paths:` entry alone
-      # would trigger the run and then be silently dropped by that filter.
+      # would trigger the run and then be silently dropped by that filter — and
+      # WHOLE_FILE_GATES names it too, or a non-YAML path can never pass. Add a path
+      # to all three, keeping that table on one line because the suite lifts it as
+      # one: scripts/tests/ci-integrity/test-surface.py section 7 fails when they
+      # disagree, and it compares the globs above the same way.
       - 'scripts/check_untimed_subprocess.py'
 
 permissions:
@@ -222,7 +227,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Paths under the trigger globs that are NOT gate logic. Every entry
+          # Paths under the trigger that are NOT gate logic. Every entry
           # needs a justification, because anything listed here is invisible to
           # this guard. Empty is the correct default: a file earns a place only
           # once someone can say why weakening it could not affect a merge.
@@ -271,7 +276,7 @@ jobs:
             exit 1
           fi
 
-          # Scope = the trigger globs, minus NON_GATING.
+          # Scope = the trigger's paths, minus NON_GATING.
           #
           # NO PIPE into `grep -q` anywhere in this job, deliberately.
           # `printf ... | grep -q` is a silent fail-OPEN under `set -o pipefail`:
