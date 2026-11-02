@@ -445,6 +445,23 @@ pub(crate) struct ResourceSample {
     /// are different facts about a device.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) sock_source: Option<String>,
+    /// Per-slice cgroup v2 memory (`ci-runners.slice`, `agent-builds.slice`,
+    /// `qontinui-runner.slice`): `memory.current/high/max` and the
+    /// `memory.events` `high/max/oom_kill` counters, as a JSON map keyed by
+    /// slice (plan `2026-10-19-ci-nodes-run-the-tauri-runner-always-on-as-ci-node-role`
+    /// Phase 0b; shape in [`crate::fleet::slice_telemetry`]). **Host lane only**
+    /// and Linux only: `None` is UNKNOWN, never 0 — see [`Self::slice_source`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cgroup_slices: Option<serde_json::Value>,
+    /// PSI `memory`/`cpu`/`io` `some`/`full` `avg10`/`avg60`, system-wide and
+    /// per slice. `None` = unmeasured (not Linux, PSI disabled), never zeroes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi: Option<serde_json::Value>,
+    /// `"linux_cgroup_v2"` when the cgroup tree was read, `"not_supported"`
+    /// when this host cannot be measured. A lane that never probes (WSL)
+    /// publishes `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) slice_source: Option<String>,
     /// `'runner' | 'supervisor' | 'ci-step'`. Distinguishes this row from the
     /// supervisor's host-lane row for the same device.
     pub(crate) source: String,
@@ -616,6 +633,9 @@ impl ResourceSample {
             sock_established_local: None,
             sock_time_wait_local: None,
             sock_source: None,
+            cgroup_slices: None,
+            psi: None,
+            slice_source: None,
             source: "runner".to_string(),
         }
     }
@@ -1075,6 +1095,15 @@ fn collect_host_lane() -> ResourceSample {
             );
         }
     }
+
+    // Per-slice cgroup memory + PSI (plan 2026-10-19-ci-nodes-run-the-tauri-
+    // runner-always-on-as-ci-node-role, Phase 0b). Host lane only, for the
+    // socket census's reason: the `wsl` lane is a different cgroup tree. Off
+    // Linux this stamps `slice_source = "not_supported"` and nothing else.
+    let t = crate::fleet::slice_telemetry::collect();
+    s.cgroup_slices = t.cgroup_slices;
+    s.psi = t.psi;
+    s.slice_source = t.slice_source;
 
     s
 }
@@ -2775,6 +2804,50 @@ MemAvailable:   15335424 kB
                 "{typo} is not a column coord binds — it would be swallowed by \
                  `unknown_fields` and the real column would stay NULL forever"
             );
+        }
+    }
+
+    /// Coord binds these exact three names (web `slice_tel_01`); a rename lands
+    /// in `unknown_fields` and the real column stays NULL forever. Unmeasured
+    /// is ABSENT from the wire, never 0 or an empty object.
+    #[test]
+    fn the_slice_telemetry_uses_the_migrations_exact_wire_names() {
+        let mut s = ResourceSample::empty(Lane::Host, None);
+        let v = serde_json::to_value(&s).expect("serializes");
+        for key in ["cgroup_slices", "psi", "slice_source"] {
+            assert!(
+                !v.as_object().unwrap().contains_key(key),
+                "{key} must be absent when unmeasured"
+            );
+        }
+        s.cgroup_slices = Some(serde_json::json!({"ci-runners.slice": {"memory_current": 1}}));
+        s.psi = Some(serde_json::json!({"system": {}}));
+        s.slice_source = Some("linux_cgroup_v2".to_string());
+        let v = serde_json::to_value(&s).expect("serializes");
+        let obj = v.as_object().unwrap();
+        assert!(obj["cgroup_slices"]["ci-runners.slice"].is_object());
+        assert!(obj["psi"].is_object());
+        assert_eq!(obj["slice_source"], "linux_cgroup_v2");
+    }
+
+    /// Only the host lane takes the slice reading; off Linux it says
+    /// `not_supported` rather than publishing values.
+    #[test]
+    fn only_the_host_lane_takes_a_slice_reading() {
+        let wsl = parse_meminfo("MemTotal: 1024 kB\n", "Ubuntu-24.04".to_string()).expect("parses");
+        assert_eq!(wsl.slice_source, None);
+        assert_eq!(wsl.cgroup_slices, None);
+        let host = collect_host_lane();
+        let source = host
+            .slice_source
+            .as_deref()
+            .expect("the host lane always states a slice source");
+        assert!(matches!(source, "linux_cgroup_v2" | "not_supported"));
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(source, "not_supported");
+            assert_eq!(host.cgroup_slices, None);
+            assert_eq!(host.psi, None);
         }
     }
 

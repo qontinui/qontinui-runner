@@ -1029,8 +1029,10 @@ bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh ad
   --kind semantic_resource \
   --key "plan:<plan-stem>" \
   --ttl "<ttl_seconds>"
-# --max-runtime 86400 (24h): a single run can span many phases and hours —
-# the 12h default has already been outlived twice by one two-plan chain.
+# --max-runtime 86400 (24h): since the claim heartbeat extends its own cap while the owner is demonstrably
+# alive, this is the EXTENSION period, not a guess at the work's duration; it binds
+# only an owner whose liveness is UNKNOWN, and --max-runtime-hard (default 7 days)
+# is the absolute bound (plan 2026-10-27-the-claim-heartbeat-cap-clears-the-nets-of-a-live-session).
 bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh start --ledger "$CLAIM_LEDGER" --max-runtime 86400
 ```
 
@@ -1059,7 +1061,8 @@ non-optional on `stolen`, so there the verdict word IS the discriminator again.
 `status --ledger "$CLAIM_LEDGER"` prints one line per row and a
 verdict on its exit code: `LIVE` (0), `STALE` (3), `DEAD` (4), `STOLEN` (5),
 `LAPSED` (7), `EMPTY` (8), `MAX_RUNTIME` (9 — the loop ended on its own
-`--max-runtime` ceiling, not a coord verdict; re-`add` then `start`),
+runtime bound: the `--max-runtime` cap with the owner's liveness UNKNOWN, or the
+`--max-runtime-hard` ceiling; not a coord verdict; re-`add` then `start`),
 `OWNER_GONE` (11 — the loop saw its owning session exit or go idle and RELEASED
 every row; Step 0.5's implement→ship net fires on exactly this).
 Anything but `LIVE` means the claim is **UNKNOWN, not held**.
@@ -1718,7 +1721,9 @@ only STOP on them.
 It does **not** prove death, because `claim_terminal` also clears on a key
 **expiry**, and a LIVE session's reserve can expire in several ways:
 - coord was unreachable for longer than the TTL;
-- the loop reached its `--max-runtime` ceiling;
+- the loop reached its runtime bound (the `--max-runtime` cap while the owner's
+  liveness was UNKNOWN — a demonstrably alive owner extends it — or the
+  `--max-runtime-hard` ceiling);
 - the box slept.
 
 Case 2's death clause therefore still needs its own evidence. Any one of these is
@@ -2199,7 +2204,7 @@ bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh st
 
 `LIVE` (exit 0) is the only verdict that means the claims are held. `STALE`
 (3), `DEAD` (4), `STOLEN` (5), `LAPSED` (7), `EMPTY` (8), `MAX_RUNTIME` (9
-— the loop ended on its own `--max-runtime` ceiling, not a coord verdict) and
+— the loop ended on its own runtime bound, not a coord verdict) and
 `OWNER_GONE` (11 — the loop released everything; Step 0.5's implement→ship net
 has fired, so follow its "reads `OWNER_GONE`" paragraph) each
 mean the claim is **UNKNOWN, not held** (`STALE` usually self-heals on the next
@@ -2858,7 +2863,7 @@ bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh st
 `LIVE` (exit 0) is the only verdict under which the claims this run already
 holds — the Step 0.48 plan reserve included — are actually held. `STALE` (3),
 `DEAD` (4), `STOLEN` (5), `LAPSED` (7), `EMPTY` (8), `MAX_RUNTIME` (9 — the
-loop ended on its own `--max-runtime` ceiling, not a coord verdict) and
+loop ended on its own runtime bound, not a coord verdict) and
 `OWNER_GONE` (11 — the implement→ship net has fired; Step 0.5 says what to do)
 each mean
 those claims
@@ -4679,7 +4684,9 @@ established — a clean `gh pr checks` read is not proof of the latter.
    key its parent never took and gets `granted`, so this guard is silent in
    exactly the case it looks like it should catch (measured 2026-09-04). A loop
    left running past this point is a background process renewing claims nobody
-   holds, until its own `--max-runtime` bound expires — which is strictly better
+   holds, until its runtime bound ends it: `--max-runtime` if the owner's
+   liveness is UNKNOWN, otherwise the owner's death or idleness, or at the
+   latest the `--max-runtime-hard` ceiling (default 7 days). That is strictly better
    than stopping one a peer still needs. Exits `9` (the loop outlived KILL, or
    the signal was refused) and `10` (UNKNOWN) are not "stopped" either. Step
    0.48's release block says how to report them, and the releases above still
