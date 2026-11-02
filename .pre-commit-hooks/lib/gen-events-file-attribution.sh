@@ -53,6 +53,7 @@
 #   - `lib.rs` does not declare `pub mod schema_export;` plainly, in the
 #     working tree or (when this change touches it) at the merge-base, or it
 #     rebinds a crate name the registry reader trusts;
+#   - `bin/export_schemas.rs` is not the known exporter;
 #   - the parsed working-tree names differ from the set of files the
 #     regeneration actually emitted;
 #   - the registry changed in this push and its merge-base version cannot be
@@ -60,7 +61,9 @@
 #   - a directory appears in either tree;
 #   - `node` is missing.
 #
-# WHAT IT DOES NOT SEE, stated so nobody mistakes it for a proof:
+# WHAT IT DOES NOT SEE, stated so nobody mistakes it for a proof. CI's
+# `qontinui-types drift` regenerates for real and remains the gate; a clear here
+# costs that much latency, and ships nothing:
 #   - a runner module that changes an external type's schema at RUNTIME. That
 #     would mean code reached from `export_schemas` main (e.g.
 #     `instance_env`) mutating state that a qontinui-schemas `JsonSchema`
@@ -140,37 +143,22 @@ gen_events_registry_parse() {
     return 0
 }
 
-# Does `lib.rs` (content on stdin) declare the registry module plainly? It must
-# hold `pub mod schema_export;` and no `path = ...` anywhere. That covers
-# `#[path = "x.rs"]`, `#[cfg_attr(.., path = "x.rs")]` and its rustfmt-wrapped
-# form, any of which could point `schema_export` at a file the registry reader
-# never sees. The check is deliberately coarse: a `path =` in a comment or in
-# unrelated code also fails it, and failing only costs the per-file rule.
-#
-# It also refuses every `extern` but the one line this crate is known to need,
-# `extern crate self as qontinui_runner_lib;`. An `extern crate .. as <name>`
-# rebinds that name across the whole crate, so one naming a crate the registry
-# reader trusts would make its "external" verdict false. An allowlist rather
-# than a pattern for the bad form: a comment or a raw identifier between the
-# tokens (`.. /* c */ as r#qontinui_types`) walks past a pattern. A comment
-# mentioning the word also fails it, which only costs the per-file rule.
-#
-# `grep >/dev/null`, never `grep -q`: the caller runs under pipefail, and a
-# `-q` that exits on its first match can SIGPIPE the writer and turn a match
-# into a failed pipeline.
-_gen_events_lib_rs_premise() {
-    local content
-    content="$(cat)" || return 1
-    printf '%s\n' "$content" | grep -E '^[[:space:]]*pub[[:space:]]+mod[[:space:]]+schema_export[[:space:]]*;' >/dev/null || return 1
-    if printf '%s\n' "$content" | grep -E '(^|[^A-Za-z0-9_])path[[:space:]]*=' >/dev/null; then
-        return 1
-    fi
-    if printf '%s\n' "$content" | grep -vE '^[[:space:]]*extern crate self as qontinui_runner_lib;[[:space:]]*$' \
-        | grep -E '(^|[^A-Za-z0-9_])extern([^A-Za-z0-9_]|$)' >/dev/null; then
-        return 1
-    fi
-    return 0
+# Run the parser's premise check $1 (`--lib-rs` or `--exporter`) over the file on
+# stdin. Returns 0 only when it holds, so a missing `node` or a temp-file failure
+# fails it too, and failing only costs the per-file rule. The parser holds the
+# rules: it lexes first, so a comment neither satisfies nor trips them.
+_gen_events_file_premise() {
+    local flag="$1" f rc=0
+    command -v node >/dev/null 2>&1 || return 1
+    f="$(mktemp "${TMPDIR:-/tmp}/gen-events-premise.XXXXXX")" || return 1
+    cat > "$f" || { rm -f "$f"; return 1; }
+    node "$(_gen_events_native_path "$GEN_EVENTS_REGISTRY_PARSER")" "$flag" "$(_gen_events_native_path "$f")" \
+        >/dev/null 2>&1 || rc=$?
+    rm -f "$f"
+    return "$rc"
 }
+_gen_events_lib_rs_premise() { _gen_events_file_premise --lib-rs; }
+_gen_events_exporter_premise() { _gen_events_file_premise --exporter; }
 
 # The display label of one attribution source, worded for the stage. These
 # are the labels `gen_events_render_mine` prints beside each input.
@@ -348,6 +336,13 @@ gen_events_file_attribution() {
     if [ "$lib_touched" = "1" ] && ! git -C "$repo" show "$ATTRIBUTION_BASE_SHA:src-tauri/src/lib.rs" 2>/dev/null \
             | _gen_events_lib_rs_premise; then
         FILE_ATTRIBUTION_REASON="src-tauri/src/lib.rs at the merge-base ${ATTRIBUTION_BASE_SHA:0:12} does not declare \`pub mod schema_export;\` plainly, so the registries are not comparable"
+        return 0
+    fi
+    # The registry is also only as good as what the exporter does with its map.
+    # Checked in the working tree, because a post-processing step already on main
+    # would rewrite every binding with the exporter untouched by this push.
+    if ! _gen_events_exporter_premise 2>/dev/null < "$repo/src-tauri/src/bin/export_schemas.rs"; then
+        FILE_ATTRIBUTION_REASON="src-tauri/src/bin/export_schemas.rs is not the known exporter, so a runner module may rewrite what the registry produces (see EXPORTER_SHAPE in lib/gen-events-registry.mjs)"
         return 0
     fi
     adjacent="$(printf '%s' "$adjacent" | LC_ALL=C sort -u | sed '/^$/d')"

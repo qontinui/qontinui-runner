@@ -146,6 +146,38 @@ EOF
 
 REGISTERED="Alpha Beta Gen RunnerLocal"
 
+# The known exporter, as the premise check requires it.
+exporter_text() {
+    cat <<'EOF'
+// exports every schemars::JsonSchema type
+fn main() {
+    qontinui_runner_lib::instance_env::enforce_instance_root_or_exit(false);
+    let args: Vec<String> = std::env::args().collect();
+
+    let schemas = qontinui_runner_lib::schema_export::export_all_schemas();
+
+    if args.iter().any(|a| a == "--list") {
+        if let Some(obj) = schemas.as_object() {
+            for key in obj.keys() {
+                println!("{}", key);
+            }
+        }
+        return;
+    }
+
+    let pretty = args.iter().any(|a| a == "--pretty");
+
+    let output = if pretty {
+        serde_json::to_string_pretty(&schemas).expect("Failed to serialize schemas")
+    } else {
+        serde_json::to_string(&schemas).expect("Failed to serialize schemas")
+    };
+
+    println!("{}", output);
+}
+EOF
+}
+
 fixture() {
     local root
     if ! root="$(mktemp -d -t gen-events-file-attr-XXXXXX)" || [ ! -d "$root" ]; then
@@ -170,7 +202,7 @@ fixture() {
     printf '// other\n' > "$UPSTREAM/src-tauri/src/other.rs"
     # The exporter mentions JsonSchema, which the markdown premise guard of
     # the whole-push attribution expects to find.
-    printf '// exports every schemars::JsonSchema type\n' > "$UPSTREAM/src-tauri/src/bin/export_schemas.rs"
+    exporter_text > "$UPSTREAM/src-tauri/src/bin/export_schemas.rs"
     printf '# gen\n' > "$UPSTREAM/src-tauri/scripts/generate_types.sh"
     printf '// build\n' > "$UPSTREAM/src-tauri/build.rs"
     printf '[package]\n' > "$UPSTREAM/Cargo.toml"
@@ -422,6 +454,49 @@ do
     decide_files
     check "lib.rs '$rebind' falls back" "whole-push" "$FILE_ATTRIBUTION_STATE"
 done
+
+# A declaration that is not the one that compiles, beside one that is.
+for decoy in \
+    '#[cfg(any())]\npub mod schema_export;\nmod real_schema_export;' \
+    '/* pub mod schema_export; */\nmod schema_export { }' \
+    '// pub mod schema_export;\nmod schema_export { }' \
+    'pub mod schema_export;\nmod schema_export { }'
+do
+    fixture
+    mk_tree "$BTREE" $REGISTERED Pending
+    mk_tree "$RTREE" $REGISTERED
+    printf "// lib\npub mod other;\n$decoy\n" > "$WORK/src-tauri/src/lib.rs"
+    git -C "$WORK" add -A >/dev/null
+    git -C "$WORK" commit --quiet -m "a decoy declaration"
+    decide_files
+    check "lib.rs decoy '$(printf '%s' "$decoy" | head -c 34 | tr '\n' ' ')' falls back" "whole-push" "$FILE_ATTRIBUTION_STATE"
+done
+
+# A comment that merely mentions the words is not a reason to fall back.
+fixture
+mk_tree "$BTREE" $REGISTERED Pending
+mk_tree "$RTREE" $REGISTERED
+printf '// lib: path = x, extern crate y\npub mod other;\npub mod schema_export;\n' > "$WORK/src-tauri/src/lib.rs"
+git -C "$WORK" add -A >/dev/null
+git -C "$WORK" commit --quiet -m "a comment naming the words"
+decide_files
+check "a lib.rs comment naming path = and extern does not trip the premise" "pre-existing" "$FILE_ATTRIBUTION_STATE"
+
+# The exporter rewrites what the registry produced: already on main, untouched here.
+fixture
+exporter_text | sed 's/let schemas = \(.*\);/let schemas = qontinui_runner_lib::payloads::post(\1);/' \
+    > "$UPSTREAM/src-tauri/src/bin/export_schemas.rs"
+git -C "$UPSTREAM" add -A >/dev/null
+git -C "$UPSTREAM" commit --quiet -m "base: post-process"
+git -C "$WORK" fetch --quiet origin
+git -C "$WORK" reset --hard --quiet origin/main
+TREE_CONTENT_Alpha='// Alpha schemas-side' mk_tree "$BTREE" $REGISTERED
+mk_tree "$RTREE" $REGISTERED
+commit_change "src-tauri/src/payloads.rs" "// changes every schema"
+decide_files
+check "an exporter that post-processes the map falls back, with that module edited" "whole-push" "$FILE_ATTRIBUTION_STATE"
+check "  naming the exporter" yes \
+    "$(case "$FILE_ATTRIBUTION_REASON" in *"known exporter"*) echo yes ;; *) echo no ;; esac)"
 
 # A file under schema_export/ moves presence without an add! line changing.
 fixture
@@ -783,6 +858,22 @@ check "an unqualified Value from this crate is refused" 1 "$rc"
 out="$(registry_text | sed 's/    Value::Object(m)/    serde_json::Value::Object(m)/' | parse_text)"; rc=$?
 check "  while a fully qualified serde_json::Value is fine" 0 "$rc"
 
+out="$(registry_text '    type Alpha = crate::payloads::Alpha;' | parse_text)"; rc=$?
+check "a type item in the function, shadowing an import, is refused" 1 "$rc"
+
+out="$(registry_text '    bind!();' | parse_text)"; rc=$?
+check "a macro call in the function other than add! is refused" 1 "$rc"
+check "  naming it" yes "$(case "$out" in *bind*) echo yes ;; *) echo no ;; esac)"
+
+out="$(registry_text | sed 's/^pub fn export_all_schemas/rewrite! { pub fn export_all_schemas/; s/^#\[cfg(test)\]/}\n#[cfg(test)]/' | parse_text)"; rc=$?
+check "the function inside a macro call is refused" 1 "$rc"
+
+out="$(registry_text | sed 's/^pub fn export_all_schemas/#[rewrite]\npub fn export_all_schemas/' | parse_text)"; rc=$?
+check "an attribute on the function is refused" 1 "$rc"
+
+out="$(registry_text | sed '1a #![rewrite]' | parse_text)"; rc=$?
+check "an inner attribute in the registry file is refused" 1 "$rc"
+
 for bad in \
     'include!("more.rs");' \
     'mod inner { }' \
@@ -888,6 +979,11 @@ if [ -f "$REAL" ]; then
         "$(printf '%s\n' "$out" | awk -F'\t' '$1=="RunnerFinding"{print $2}')"
     check "  and qontinui_types types (WorkerOutput is external)" "external" \
         "$(printf '%s\n' "$out" | awk -F'\t' '$1=="WorkerOutput"{print $2}')"
+    if _gen_events_exporter_premise < "$SCRIPT_DIR/../src-tauri/src/bin/export_schemas.rs" 2>/dev/null; then
+        check "the real export_schemas.rs is the known exporter" yes yes
+    else
+        check "the real export_schemas.rs is the known exporter (update EXPORTER_SHAPE)" yes no
+    fi
     # The WORKING TREE copy, as the decision reads it: a commit that adds a
     # path attribute must fail here at that commit, not one commit later.
     if _gen_events_lib_rs_premise < "$SCRIPT_DIR/../src-tauri/src/lib.rs" 2>/dev/null; then

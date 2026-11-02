@@ -12,6 +12,11 @@
 //      unrelated runner module.
 //
 // Usage: node gen-events-registry.mjs <path to schema_export.rs>
+//        node gen-events-registry.mjs --lib-rs <path to lib.rs>
+//        node gen-events-registry.mjs --exporter <path to export_schemas.rs>
+//
+// The two flags check a premise and print nothing on success: exit 0 holds,
+// exit 1 prints `@violation <reason>`. See checkLibRs and checkExporter.
 //
 // Output on stdout, exit 0:
 //   @macro <the add! macro's body, whitespace-collapsed>
@@ -44,6 +49,10 @@
 //         the target or build-script cfgs;
 //       - no control flow (`if`, `match`, loops, closures, nested fns,
 //         early returns), so every `add!` runs whenever the function does;
+//       - no item that could shadow an imported name (`type`, `struct`, ...),
+//         and no macro call but `add!`, since a macro can expand to a `use`;
+//       - the function is a plain item: not inside a macro call or a module,
+//         with no attribute on it, in a file with no inner attribute;
 //       - no `mod` item inside it, and no `include!` or path attribute
 //         anywhere in the file, so no code is spliced in from another file;
 //       - every `add!(` invocation parses as `add!("Name", <type>)`;
@@ -347,6 +356,14 @@ function parseRegistry(src) {
   const close = matching(code, open, '{', '}');
   const body = code.slice(open + 1, close);
 
+  // A plain top-level item. Inside `rewrite! { .. }` or under an attribute
+  // macro, the text here is not the code that compiles.
+  const before = code.slice(0, fns[0].index);
+  const depth = (before.match(/[{([]/g) || []).length - (before.match(/[})\]]/g) || []).length;
+  if (depth !== 0) violation('export_all_schemas is not a top-level item');
+  if (/\]\s*(?:pub(?:\s*\([^)]*\))?\s*)?$/.test(before)) violation('an attribute on export_all_schemas');
+  if (/#\s*!\s*\[/.test(code)) violation('an inner attribute in the registry file');
+
   // Nothing may make the set of names conditional, or splice code in.
   if (/\bcfg\b/.test(body)) violation('a cfg inside export_all_schemas');
   if (/\binclude\s*!/.test(code)) violation('an include! in the registry file');
@@ -357,6 +374,10 @@ function parseRegistry(src) {
   // would make "registered" depend on something other than the add! lines.
   const control = /\b(if|else|match|for|while|loop|fn|return|break|continue|async|await|move|unsafe|impl)\b|\|/.exec(body);
   if (control) violation(`control flow inside export_all_schemas ('${control[0]}')`);
+  // A block-scoped item shadows a file-level import of the same name, and this
+  // reader flattens scopes.
+  const item = /\b(type|struct|enum|union|trait|const|static)\b/.exec(body);
+  if (item) violation(`a ${item[1]} item inside export_all_schemas`);
 
   // Exactly one macro, `add`.
   const macros = [...body.matchAll(/\bmacro_rules\s*!\s*([A-Za-z_][A-Za-z0-9_]*)\s*\{/g)];
@@ -366,6 +387,11 @@ function parseRegistry(src) {
   const mOpen = macros[0].index + macros[0][0].length - 1;
   const mClose = matching(body, mOpen, '{', '}');
   const macroBody = body.slice(mOpen + 1, mClose);
+  // Any other macro call could expand to a `use` this reader never sees.
+  const outsideMacro = body.slice(0, mOpen) + ' ' + body.slice(mClose + 1);
+  for (const call of outsideMacro.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*!(?!=)/g)) {
+    if (call[1] !== 'add' && call[1] !== 'macro_rules') violation(`a ${call[1]}! call inside export_all_schemas`);
+  }
   // The macro must key the map by the literal name and nothing else. Its body
   // is checked against the one shape that does, whitespace aside. A string
   // literal is masked to "S<n>" by the lexer, so a key built with one (a
@@ -477,9 +503,53 @@ function parseRegistry(src) {
   return { macro: macroBody.replace(/\s+/g, ' ').trim(), lines };
 }
 
-const file = process.argv[2];
+// ── the two files the registry depends on ───────────────────────────────────
+
+// lib.rs must make schema_export.rs the module that compiles. Read after lexing,
+// so a commented-out declaration does not count, and a `#[cfg(any())]` directly
+// above it (a decoy, beside a real module elsewhere) is refused.
+//
+// `extern` is an allowlist of the one line this crate needs. An `extern crate ..
+// as <name>` rebinds that name across the crate, so naming a crate the registry
+// reader trusts would make its "external" verdict false, and a pattern for the
+// bad form can be walked past with a comment or a raw identifier.
+function checkLibRs(src) {
+  const { code } = lex(src);
+  if (count(code, /\bmod\s+schema_export\b/g) !== 1) violation('not exactly one schema_export module');
+  const decl = /\bpub\s+mod\s+schema_export\s*;/.exec(code);
+  if (!decl) violation('schema_export is not declared `pub mod schema_export;`');
+  if (!/(?:^|[;}])\s*$/.test(code.slice(0, decl.index))) violation('something modifies the schema_export declaration');
+  if (/(^|[^A-Za-z0-9_])path\s*=/.test(code)) violation('a path attribute in lib.rs');
+  const rest = code.replace(/\bextern\s+crate\s+self\s+as\s+qontinui_runner_lib\s*;/, ' ');
+  if (/\bextern\b/.test(rest)) violation('an extern item in lib.rs other than the known one');
+}
+
+// The exporter's whole program, comments aside and string contents masked. An
+// exact shape, because "a runner module post-processes the map" is one ordinary
+// line here and would make every external verdict false. A change to this file
+// falls back to the whole-push rule until this copy is updated, which the suite's
+// "real exporter" case says loudly, and the file changes about twice a year.
+const EXPORTER_SHAPE =
+  'fn main() { qontinui_runner_lib::instance_env::enforce_instance_root_or_exit(false); ' +
+  'let args: Vec<String> = std::env::args().collect(); ' +
+  'let schemas = qontinui_runner_lib::schema_export::export_all_schemas(); ' +
+  'if args.iter().any(|a| a == "S0") { if let Some(obj) = schemas.as_object() { ' +
+  'for key in obj.keys() { println!("S1", key); } } return; } ' +
+  'let pretty = args.iter().any(|a| a == "S2"); ' +
+  'let output = if pretty { serde_json::to_string_pretty(&schemas).expect("S3") } ' +
+  'else { serde_json::to_string(&schemas).expect("S4") }; ' +
+  'println!("S5", output); }';
+
+function checkExporter(src) {
+  const got = lex(src).code.replace(/\s+/g, ' ').trim();
+  if (got !== EXPORTER_SHAPE) violation('bin/export_schemas.rs is not the known exporter, so a runner module may rewrite the map');
+}
+
+const FLAGS = { '--lib-rs': checkLibRs, '--exporter': checkExporter };
+const check = FLAGS[process.argv[2]];
+const file = check ? process.argv[3] : process.argv[2];
 if (!file) {
-  console.error('usage: node gen-events-registry.mjs <schema_export.rs>');
+  console.error('usage: node gen-events-registry.mjs [--lib-rs|--exporter] <file>');
   process.exit(2);
 }
 let src;
@@ -490,8 +560,12 @@ try {
   process.exit(2);
 }
 try {
-  const { macro, lines } = parseRegistry(src);
-  process.stdout.write(`@macro ${macro}\n${lines.join('\n')}\n`);
+  if (check) {
+    check(src);
+  } else {
+    const { macro, lines } = parseRegistry(src);
+    process.stdout.write(`@macro ${macro}\n${lines.join('\n')}\n`);
+  }
 } catch (err) {
   if (err instanceof Violation) {
     process.stdout.write(`@violation ${err.message}\n`);
