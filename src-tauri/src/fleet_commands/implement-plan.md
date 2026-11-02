@@ -211,12 +211,15 @@ sessions are implementing concurrently, not a separate plan.
    never does.
 4. **Step 6's SHIPPED stamp is a whole-plan decision and is UNCHANGED — a
    phase-scoped run does not make it.** When phase N's work lands, record it
-   the same way `/vet-plan` §0.21 point 4 records a phase-scoped vet verdict:
-   `metadata.phase_vets[]` (or, once shipped, the merge-safe `metadata_patch`
-   arm) carries `{phase: N, verdict: "shipped", ...}`. Whether the WHOLE plan
-   is now SHIPPED is a separate question this run does not answer — leave the
-   plan's own status word to whichever session (this one or a later one) is
-   implementing the last remaining phase, or to `/verify-plan-status`.
+   the same way `/vet-plan` §0.21 point 4 records a phase-scoped vet verdict,
+   in the object keyed by phase index, written ONLY as this `metadata_patch`:
+   `{"phase_vets": {"<N>": {"verdict": "shipped", "date": …, "session": …, "pr": …}}}`.
+   Send all four fields, never a read-modify-write and never an array, so it
+   sets `metadata.phase_vets.<N>` and leaves every other phase's entry alone. It replaces that phase's `/vet-plan` entry by design: one verdict per phase, the latest (no consumer reads `phase_vets` today).
+   Whether the WHOLE plan is now SHIPPED is a separate question this run does
+   not answer — leave the plan's own status word to whichever session (this
+   one or a later one) is implementing the last remaining phase, or to
+   `/verify-plan-status`.
 
 Everything else in this skill — Step 0.4's dependency gate, the concurrent-work
 reconnaissance in Step 0.45, the plan reserve in Step 0.48 (still whole-plan;
@@ -4779,12 +4782,22 @@ observable trigger (open-ended TODO) is NOT a gate — skip those.
 phase N."** A deferral that is *purely* an in-graph dependency on another
 work-unit reaching a terminal status is NOT a gate case: declare the edge to
 coord (`POST /coord/work-units/:slug/deps {"depends_on":[<upstream-slug>...]}`, or
-`metadata.depends_on` on upsert if it 503s pre-migration) and set the unit's
-`metadata.dispatch` payload — coord's DAG scheduler auto-dispatches it when the
-upstream reaches terminal status. Reserve gates below for *out-of-graph*
-observable conditions (PR merge, deploy/CI, metric, time window, operator
-approval). (canonical spec: `_gate-registration` → "DAG-dependency dispatch
-supersedes unit_ready for the dependency-gated case".)
+`metadata_patch: {"depends_on": [...]}` on upsert if it 503s pre-migration) and
+set the unit's `metadata.dispatch` payload, also by `metadata_patch` — coord's
+DAG scheduler auto-dispatches it when the upstream reaches terminal status.
+⚠️ On a unit the runner's plan adapter scans, `depends_on` is not yours to
+hold: it is in qontinui-runner `src-tauri/src/plan_workunit_adapter/metadata.rs`
+`SCANNER_OWNED_KEYS` (always sent), re-asserted every scan from the plan
+file's `Depends-On:` line (`[]` where the file has none), so a hand-written
+value is reverted within one cycle. **For a scanned plan the durable write is
+the plan file's own `Depends-On:` line.** A `metadata.dispatch` payload and its
+`dispatched_at` claim persist on such a unit only on runner builds containing
+qontinui-runner `f0cb511f1`; to replace a stored payload, patch it to `null`
+first, because a patch merges key by key and coord validates the dispatch as
+merged since `12591ee50` (2026-10-31; nothing is written: HTTP 422, or a `coord_work_unit_upsert` tool error, with a message beginning `invalid metadata.dispatch`). Reserve gates
+below for *out-of-graph* observable conditions (PR merge, deploy/CI, metric,
+time window, operator approval). (canonical spec: `_gate-registration` →
+"DAG-dependency dispatch supersedes unit_ready for the dependency-gated case".)
 
 - **Default = explicit offer.** Ask via `AskUserQuestion` (header `Register
   gate?`, options Register / Skip), showing the derived anchor, predicate kind,
@@ -4807,14 +4820,25 @@ supersedes unit_ready for the dependency-gated case".)
   REPLACES the stored one whole — every key you left out is dropped EXCEPT
   `attestations`, which coord carries forward from the stored row when the
   object you send omits that key (qontinui-coord#2574, `d9f525e92`, read as the
-  serving build 2026-10-09; an `attestations` key you DO send, `null` included,
-  still wins); `{}` clears the rest — so add no
-  defensive read-merge-write here. If you must set a key (e.g. `area`), read the
-  row and send the full object, `phases` included; the runner's plan adapter
-  re-upserts scanned plans about every 68 s and can land between your read and
-  your write.
-  To set one key without replacing the rest, send `metadata_patch` (the
-  non-clobbering write shape) instead of `metadata`. Separately, VERIFIED against
+  serving build 2026-10-09; once the row holds a ledger, the stored one also
+  wins over an `attestations` key you DO send, `null` included, by `metadata`
+  or `metadata_patch`, because `UPSERT_WORK_UNIT_SQL`'s graft runs after
+  `resolved_metadata_value` in qontinui-coord `work_unit_registry.rs`); `{}`
+  clears the rest — so add no defensive read-merge-write here.
+  To set a key, send `metadata_patch` (an RFC 7396 merge) naming only that
+  key, never a read-modify-write: a concurrent writer's key is lost between
+  your read and your write. On a plan-backed unit (`metadata.source_path`
+  set) the keys in qontinui-runner
+  `src-tauri/src/plan_workunit_adapter/metadata.rs` `SCANNER_OWNED_KEYS`
+  belong to the plan file, which the runner's plan adapter re-asserts from the plan per each key's absent-rule in that roster (read 2026-11-01: `source_path`, `depends_on`, `area`, `archive_path`, `phases`; a scan that detects no phases leaves `phases` alone), so edit those in the plan itself, its `Area:`
+  and `Depends-On:` lines, not on the unit. Every other key persists across
+  scans on runner builds containing qontinui-runner `f0cb511f1`; a build containing `3a8408558` but not `f0cb511f1` still erases it on a plan with detected phases, and an older one on every plan. A patch merges an
+  object-valued key recursively, so to replace one whole (e.g.
+  `metadata.dispatch`), patch it to `null` first; an array is replaced
+  whole, so per-item records belong in an object keyed by item. For
+  `metadata.dispatch` the null-first step also avoids a refused hybrid:
+  coord validates the stored dispatch as merged since `12591ee50`
+  (2026-10-31; nothing is written: HTTP 422, or a `coord_work_unit_upsert` tool error, with a message beginning `invalid metadata.dispatch`). Separately, VERIFIED against
   the serving build's source: an upsert that carries NO vet manifest and does
   not TRANSITION the unit into `vetted` never retires the stored vet manifest
   (coord `f1400f2d8`, an ancestor of serving build `601c2bda` as of 2026-10-07:

@@ -271,19 +271,34 @@ validate_label() {
   esac
 
   # Flag labels (no =). Accepted because live consumers read the rows
-  # (the Tier-7 credibility gate; the migrate self-blocking check).
+  # (the Tier-7 credibility gate; the Tier-8b blast-radius gate; the migrate
+  # self-blocking check).
   #
-  # `credibility-override` is BOUNDED — it relaxes a credibility threshold
-  # inside a gate that still runs. `migrate-repair` is the ODD ONE
-  # OUT, and the asymmetry is deliberate: it is the only flag here that
-  # RELEASES a hold, i.e. can make a land happen that otherwise would not.
-  # coord bounds it at the CONSUMING end rather than here — the validator
-  # only decides whether the label may be SET, and
-  # `merge_scheduler::migrate_self_blocking` independently refuses to honour
-  # it unless the land is genuinely self-blocking. Setting it is cheap and
-  # auditable; acting on it is not, and coord keeps those two decisions
-  # separate. (Value mirrored from `MIGRATE_REPAIR_LABEL_SUFFIX`.)
-  if [[ "$rest" == "credibility-override" || "$rest" == "migrate-repair" ]]; then
+  # All three RELEASE a block — each can make a land happen that otherwise
+  # would not — and only one of them is bounded where it is consumed:
+  #
+  # - `credibility-override` is NOT bounded: with it on the PR, coord's
+  #   Tier 7 (`pr_merge/predicate.rs`) skips the credibility gate outright.
+  # - `blast-radius-override`, its Tier-8b twin, is NOT bounded either: Tier 8b
+  #   skips its `removes-referenced-export` block whatever the removal. It is
+  #   the per-PR escape hatch for a blast-radius false positive. Coord's own
+  #   door (`labels_routes.rs::validate_label`) accepts it only once the paired
+  #   qontinui-coord change lands and is deployed; until then the coord write of it is refused
+  #   (exit 4) after gh has applied the label.
+  # - `migrate-repair` IS bounded, at the CONSUMING end rather than here — the
+  #   validator only decides whether the label may be SET, and
+  #   `merge_scheduler::migrate_self_blocking` independently refuses to honour
+  #   it unless the land is genuinely self-blocking. Setting it is cheap and
+  #   auditable; acting on it is not, and coord keeps those two decisions
+  #   separate. (Value mirrored from `MIGRATE_REPAIR_LABEL_SUFFIX`.)
+  #
+  # Setting credibility-override or migrate-repair notifies the operator
+  # (coord's gate-override notice, `GATE_OVERRIDE_LABELS`), which is the only
+  # control on an unbounded override. blast-radius-override joins that list
+  # only with the same paired qontinui-coord change; until it is deployed, setting
+  # it sends NO notice.
+  if [[ "$rest" == "credibility-override" || "$rest" == "blast-radius-override" \
+        || "$rest" == "migrate-repair" ]]; then
     return 0
   fi
 
