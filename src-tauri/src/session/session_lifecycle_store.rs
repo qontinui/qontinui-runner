@@ -5593,7 +5593,7 @@ pub struct BootRestoreHold {
 /// epoch's `held_unjudged` set, so that the next boot admits it by that hold
 /// ([`awaiting_prior_boot_restore`])? Only a boot-census row
 /// (`awaiting_boot_restore`) whose restore this process has not attempted, or
-/// attempted less than [`RESTORE_PENDING_TTL_MS`] before `now_ms`. A
+/// attempted at most [`RESTORE_PENDING_TTL_MS`] before `now_ms`. A
 /// `restore_pending_at` at or after this boot means the restore ran here:
 /// while it is inside the TTL the resume may still be verifying on a loaded
 /// box, so it is still carried; past the TTL it is a resume that did not
