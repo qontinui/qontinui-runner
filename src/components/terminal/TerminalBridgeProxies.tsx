@@ -79,7 +79,7 @@ export interface TerminalBridgeProxyTab {
   title?: string;
   isAlive?: boolean;
   exitCode?: number | null;
-  type?: "terminal" | "plan";
+  type?: "terminal" | "plan" | "restore-placeholder";
 }
 
 /**
@@ -568,9 +568,12 @@ export const TerminalBridgeProxies = memo(function TerminalBridgeProxies({
 }: {
   tabs: readonly TerminalBridgeProxyTab[];
 }) {
-  // Plan tabs are a markdown viewer with no PTY — they have no `/terminals`
-  // row and must not claim a `terminal-input-*` id.
-  const terminals = useMemo(() => tabs.filter((t) => t.type !== "plan"), [tabs]);
+  // Plan tabs (a markdown viewer) and restore placeholders have no PTY — they
+  // have no `/terminals` row and must not claim a `terminal-input-*` id.
+  const terminals = useMemo(
+    () => tabs.filter((t) => t.type !== "plan" && t.type !== "restore-placeholder"),
+    [tabs],
+  );
   return (
     <div style={HIDDEN_HOST_STYLE} aria-hidden="true" data-terminal-bridge-proxies="">
       {terminals.map((t) => (

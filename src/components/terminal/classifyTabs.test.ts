@@ -128,6 +128,13 @@ describe("classifyTabs — tmux work mode", () => {
     assertExactlyOneOrZeroOwner(result, ["a", "b", "plan", "worker"]);
   });
 
+  it("never mounts a parked restore placeholder — it has no PTY until its Restore", () => {
+    const tabs = [...mixed, { id: "ph", type: "restore-placeholder" as const }];
+    const result = classifyTabs(tabs, { 0: "a" }, false, new Set(), "tmux");
+    expect(result.get("ph")).toBe("offscreen-unmounted");
+    expect(mountOwnerCount(result.get("ph")!)).toBe(0);
+  });
+
   it("classifies nothing hidden — grid's unzoned parking owns no tab in tmux", () => {
     const result = classifyTabs(mixed, { 0: "b" }, false, new Set(), "tmux");
     expect([...result.values()].filter((c) => c === "hidden")).toEqual([]);

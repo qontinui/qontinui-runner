@@ -1932,8 +1932,10 @@ impl ClaudeSession {
         }
 
         // 7. Spawn a fresh CLI with cwd = worktree.path and worktree metadata.
+        //    Spelled `ClaudeSession::spawn` (not `Self::spawn`) so the
+        //    spawn-sites guard (`runner_spawn_sites.rs`) sees this call.
         let session_id = self.session_id.clone();
-        let new_session = Self::spawn(
+        let new_session = ClaudeSession::spawn(
             &worktree_path_str,
             &session_id,
             app_handle,
@@ -1990,13 +1992,32 @@ impl ClaudeSession {
         use crate::ai_provider::{get_effective_config_dir, rotate_account_on_rate_limit};
         use tauri::Manager;
 
-        // 1. Rotate to another account
-        if !rotate_account_on_rate_limit() {
-            warn!(
-                "Session {}: no alternative account available for restart",
-                session_id
-            );
-            return;
+        // 0+1. The restart prepare's account freeze (plan
+        //    `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
+        //    D3) — checked FIRST, before anything rotates — then rotate to
+        //    another account.
+        match rate_limit_rotation(
+            &|id| crate::restart_prep::freeze_hit(id, None),
+            session_id,
+            rotate_account_on_rate_limit,
+        ) {
+            RateLimitRotation::Frozen { row_marked } => {
+                info!(
+                    session_id,
+                    row_marked,
+                    "rate-limit exit during a restart prepare — the account is frozen, so the \
+                     session is not restarted on another account"
+                );
+                return;
+            }
+            RateLimitRotation::NoAlternative => {
+                warn!(
+                    "Session {}: no alternative account available for restart",
+                    session_id
+                );
+                return;
+            }
+            RateLimitRotation::Rotated => {}
         }
 
         let (resolved_config_dir, _config_dir_source) =
@@ -2033,7 +2054,9 @@ impl ClaudeSession {
         // Clone session_ctx for the new session
         let new_session_ctx = session_ctx.cloned();
 
-        match Self::spawn(
+        // Spelled `ClaudeSession::spawn` (not `Self::spawn`) so the
+        // spawn-sites guard (`runner_spawn_sites.rs`) sees this call.
+        match ClaudeSession::spawn(
             working_dir,
             session_id,
             app_handle,
@@ -2210,10 +2233,84 @@ impl std::fmt::Debug for ClaudeSession {
     }
 }
 
+/// What a chat session's rate-limit exit comes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RateLimitRotation {
+    /// A restart prepare froze account moves: nothing rotated.
+    Frozen { row_marked: bool },
+    /// No other account to rotate to.
+    NoAlternative,
+    /// The account was rotated; the restart may proceed.
+    Rotated,
+}
+
+/// The freeze check, then the rotation — in that order, so a frozen account
+/// never rotates (plan
+/// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D3).
+/// `freeze` is `restart_prep::freeze_hit` in production; `rotate` is
+/// `rotate_account_on_rate_limit`.
+pub(crate) fn rate_limit_rotation(
+    freeze: &dyn Fn(&str) -> crate::restart_prep::prepare::FreezeHit,
+    session_id: &str,
+    rotate: impl FnOnce() -> bool,
+) -> RateLimitRotation {
+    if let crate::restart_prep::prepare::FreezeHit::Frozen { row_marked } = freeze(session_id) {
+        return RateLimitRotation::Frozen { row_marked };
+    }
+    if rotate() {
+        RateLimitRotation::Rotated
+    } else {
+        RateLimitRotation::NoAlternative
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    // ---- restart prepare's account freeze on the chat path (plan
+    // `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D3) --
+
+    #[test]
+    fn claude_session_rate_limit_restart_under_a_prepare_does_not_rotate() {
+        use super::{rate_limit_rotation, RateLimitRotation};
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = 1_790_000_000_000;
+        let prep =
+            crate::restart_prep::prepare::active_controller_for_test(dir.path(), &["chat-1"], t0);
+        let rotated = AtomicBool::new(false);
+        let verdict =
+            rate_limit_rotation(&|id| prep.freeze_hit(id, None, t0 + 1), "chat-1", || {
+                rotated.store(true, Ordering::SeqCst);
+                true
+            });
+        assert_eq!(verdict, RateLimitRotation::Frozen { row_marked: true });
+        assert!(
+            !rotated.load(Ordering::SeqCst),
+            "a frozen account never rotates"
+        );
+
+        // No prepare: the rotation runs as it always did.
+        let verdict = rate_limit_rotation(
+            &|_| crate::restart_prep::prepare::FreezeHit::NotFrozen,
+            "chat-1",
+            || {
+                rotated.store(true, Ordering::SeqCst);
+                true
+            },
+        );
+        assert_eq!(verdict, RateLimitRotation::Rotated);
+        assert!(rotated.load(Ordering::SeqCst));
+        assert_eq!(
+            rate_limit_rotation(
+                &|_| crate::restart_prep::prepare::FreezeHit::NotFrozen,
+                "chat-1",
+                || false
+            ),
+            RateLimitRotation::NoAlternative
+        );
+    }
 
     // =======================================================================
     // Bidirectional stream-json spawn seam — production call-site coverage for

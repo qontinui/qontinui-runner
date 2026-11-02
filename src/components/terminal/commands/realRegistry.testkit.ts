@@ -144,6 +144,13 @@ export interface EffectArms {
   /** `ctx.spawnPlain` / `ctx.spawnAi` — all the ids asked for, or one short. */
   spawn: "full" | "short";
   /**
+   * `invoke("restart_prep_prepare")` / `invoke("restart_prep_cancel")` — the
+   * backend's `PrepChanged` reply, or its refusal (a thrown string, as Tauri
+   * rejects a command's `Err`). `/prepare-restart` and `/cancel-restart`
+   * derive their verdict from the reply's record and hold.
+   */
+  restartPrep: "answered" | "refused";
+  /**
    * The fixture's SESSION STATES — a prerequisite arm, not an effect return.
    *
    * `/restart` refuses any zone whose session is not `completed` or `error`,
@@ -179,6 +186,7 @@ export const DEFAULT_ARMS: EffectArms = {
   roster: "none",
   cards: "empty",
   spawn: "full",
+  restartPrep: "answered",
   sessionStates: "waiting",
 };
 
@@ -214,6 +222,7 @@ export const ARM_VARIANTS: ReadonlyArray<{ name: string; arms: Partial<EffectArm
   { name: "roster=two", arms: { roster: "two" } },
   { name: "cards=populated", arms: { cards: "populated" } },
   { name: "spawn=short", arms: { spawn: "short" } },
+  { name: "restartPrep=refused", arms: { restartPrep: "refused" } },
 ];
 
 /** What a loaded real registry gives a spec. */
@@ -386,6 +395,39 @@ async function build(): Promise<RealRegistryHarness> {
           },
         ];
 
+  /**
+   * The `restartPrep` arm's reply: a prepare with two recorded sessions, its
+   * hold confirmed (or released, after a cancel). `started_at_ms` is in the far
+   * future so the prepare reads as started BY this call, whatever the clock.
+   */
+  const restartPrepReply = (state: "preparing" | "cancelled"): unknown => ({
+    record: {
+      prepare_id: "prep-1",
+      started_at_ms: 9_000_000_000_000,
+      started_at: "2255-03-14T16:00:00+00:00",
+      prepared_build: "build-1",
+      state,
+      hold:
+        state === "preparing"
+          ? { status: "confirmed" }
+          : { status: "release_sent", outcome: "released" },
+      cohort: { captured_at_ms: 0, captured_at: "", reason: "restart-prep", rows: [{}, {}] },
+      reason: "operator restart",
+      hold_until_ms: null,
+      hold_until: null,
+      verdict: null,
+    },
+    view: {
+      hold: state === "preparing" ? "confirmed" : "release: released",
+      active: state === "preparing",
+      accounts_frozen: state === "preparing",
+      local_hold: false,
+      same_build_hold: false,
+      hold_expired_at: null,
+      release_failed: null,
+    },
+  });
+
   const syncTerminalRefs = (): void => {
     terminalRefs.clear();
     if (arms.approveDelivery === "all") {
@@ -406,6 +448,14 @@ async function build(): Promise<RealRegistryHarness> {
       }
       if (cmd === "start_orchestration_run") {
         return { id: "run-1", status: "running" };
+      }
+      if (cmd === "restart_prep_prepare" || cmd === "restart_prep_cancel") {
+        if (arms.restartPrep === "refused") {
+          throw cmd === "restart_prep_prepare"
+            ? "restart_prep cohort task failed: lifecycle store not available"
+            : "no prepare is in progress — nothing to cancel";
+        }
+        return restartPrepReply(cmd === "restart_prep_prepare" ? "preparing" : "cancelled");
       }
       return {};
     },
