@@ -52,7 +52,14 @@ vi.mock("./useTerminalWindowActions", () => ({
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { ZoneHoverActions, headerControlsMinPx, hoverActionsSpanPx } from "./ZoneHoverActions";
+import {
+  HEADER_FIXED_ITEMS_PX,
+  HEADER_ROW_GAP_PX,
+  HEADER_TRUNCATING_FLOORS_PX,
+  ZoneHoverActions,
+  headerControlsMinPx,
+  hoverActionsSpanPx,
+} from "./ZoneHoverActions";
 import {
   ZONE_CELL_CONTAINER_CLASS,
   ZONE_HEADER_COLLAPSED_RESERVE_PX,
@@ -61,6 +68,10 @@ import {
   ZONE_HEADER_HOVER_RESERVE_PX,
   ZONE_HEADER_HOVER_RESERVE_REMOTE_CLASS,
   ZONE_HEADER_HOVER_RESERVE_REMOTE_PX,
+  ZONE_HEADER_TOGGLE_CLASS,
+  ZONE_HEADER_TOGGLE_REMOTE_CLASS,
+  ZONE_HEADER_TOGGLES_HIDE_BELOW_PX,
+  ZONE_HEADER_TOGGLES_HIDE_BELOW_REMOTE_PX,
   ZONE_HOVER_COLLAPSE_BELOW_PX,
   ZONE_HOVER_COLLAPSE_BELOW_REMOTE_PX,
   ZONE_HOVER_COLLAPSED_ONLY_CLASS,
@@ -243,8 +254,8 @@ describe("header reserve for the hover overlay", () => {
  */
 describe("narrow zones collapse the hover cluster", () => {
   it("the collapse width is left padding + the header's minimum + the full reserve", () => {
-    expect(headerControlsMinPx()).toBe(256);
-    expect(headerControlsMinPx(true)).toBe(322);
+    expect(headerControlsMinPx()).toBe(280);
+    expect(headerControlsMinPx(true)).toBe(346);
     // The hover padding replaces only the row's right `px-2`; the left 8 stays.
     expect(ZONE_HOVER_COLLAPSE_BELOW_PX).toBe(
       8 + headerControlsMinPx() + ZONE_HEADER_HOVER_RESERVE_PX,
@@ -257,13 +268,45 @@ describe("narrow zones collapse the hover cluster", () => {
   it("the collapsed reserve covers the overflow button and Close (and a remote End)", () => {
     expect(ZONE_HEADER_COLLAPSED_RESERVE_PX).toBe(hoverActionsSpanPx(2) + 4);
     expect(ZONE_HEADER_COLLAPSED_RESERVE_REMOTE_PX).toBe(hoverActionsSpanPx(3) + 4);
-    // Known limit (headerReserve.ts): with every header item present, the
-    // collapsed layout still needs this much; narrower zones overlap.
-    expect(8 + headerControlsMinPx() + ZONE_HEADER_COLLAPSED_RESERVE_PX).toBe(324);
-    expect(8 + headerControlsMinPx(true) + ZONE_HEADER_COLLAPSED_RESERVE_REMOTE_PX).toBe(412);
-    expect(8 + headerControlsMinPx() + ZONE_HEADER_COLLAPSED_RESERVE_PX).toBeLessThan(
-      ZONE_HOVER_COLLAPSE_BELOW_PX,
+  });
+
+  it("the row's toggles hide below what the collapsed layout needs", () => {
+    expect(ZONE_HEADER_TOGGLES_HIDE_BELOW_PX).toBe(
+      8 + headerControlsMinPx() + ZONE_HEADER_COLLAPSED_RESERVE_PX,
     );
+    expect(ZONE_HEADER_TOGGLES_HIDE_BELOW_REMOTE_PX).toBe(
+      8 + headerControlsMinPx(true) + ZONE_HEADER_COLLAPSED_RESERVE_REMOTE_PX,
+    );
+    // Hidden only while the overflow menu that carries them is showing.
+    expect(ZONE_HEADER_TOGGLES_HIDE_BELOW_PX).toBeLessThan(ZONE_HOVER_COLLAPSE_BELOW_PX);
+    expect(ZONE_HEADER_TOGGLES_HIDE_BELOW_REMOTE_PX).toBeLessThan(
+      ZONE_HOVER_COLLAPSE_BELOW_REMOTE_PX,
+    );
+    const hidden =
+      HEADER_FIXED_ITEMS_PX.pin +
+      HEADER_FIXED_ITEMS_PX.filter +
+      HEADER_FIXED_ITEMS_PX.prompts +
+      HEADER_FIXED_ITEMS_PX.scrollToBottom +
+      4 * HEADER_ROW_GAP_PX;
+    expect(hidden).toBe(80);
+    // Known limit (headerReserve.ts): with every item present the row still
+    // needs this much beside the collapsed cluster.
+    const allPresent = 8 + headerControlsMinPx() - hidden + ZONE_HEADER_COLLAPSED_RESERVE_PX;
+    expect(allPresent).toBe(268);
+    expect(8 + headerControlsMinPx(true) - hidden + ZONE_HEADER_COLLAPSED_RESERVE_REMOTE_PX).toBe(
+      356,
+    );
+    // A typical row, with and without a tenant badge: the arithmetic behind the
+    // comment. Only a layout engine observes the real row at a width.
+    const optional =
+      HEADER_TRUNCATING_FLOORS_PX.position +
+      HEADER_TRUNCATING_FLOORS_PX.nonDurable +
+      HEADER_TRUNCATING_FLOORS_PX.reviewBadge +
+      (HEADER_FIXED_ITEMS_PX.labelSlot - 6) +
+      3 * HEADER_ROW_GAP_PX;
+    const withBadge = allPresent - optional;
+    expect(withBadge).toBe(216);
+    expect(withBadge - HEADER_TRUNCATING_FLOORS_PX.tenantBadge - HEADER_ROW_GAP_PX).toBe(192);
   });
 
   it("the classes carry the same numbers against the named zone container", () => {
@@ -275,6 +318,12 @@ describe("narrow zones collapse the hover cluster", () => {
     );
     expect(ZONE_HEADER_HOVER_RESERVE_REMOTE_CLASS.split(" ")).toContain(
       `@max-[${tr}px]/zone:group-hover:pr-[${ZONE_HEADER_COLLAPSED_RESERVE_REMOTE_PX}px]`,
+    );
+    expect(ZONE_HEADER_TOGGLE_CLASS).toBe(
+      `@max-[${ZONE_HEADER_TOGGLES_HIDE_BELOW_PX}px]/zone:hidden`,
+    );
+    expect(ZONE_HEADER_TOGGLE_REMOTE_CLASS).toBe(
+      `@max-[${ZONE_HEADER_TOGGLES_HIDE_BELOW_REMOTE_PX}px]/zone:hidden`,
     );
     expect(ZONE_HOVER_FULL_ONLY_CLASS).toBe(`@max-[${t}px]/zone:hidden`);
     expect(ZONE_HOVER_FULL_ONLY_REMOTE_CLASS).toBe(`@max-[${tr}px]/zone:hidden`);
@@ -303,6 +352,20 @@ describe("narrow zones collapse the hover cluster", () => {
         : openingTag(html, `aria-label="${label}"`);
       expect(tag, label).toContain(ZONE_HOVER_FULL_ONLY_CLASS);
     }
+  });
+
+  it("the overlay stays on the row, and keyboard focus reveals it", () => {
+    state.maximizedZone = null;
+    state.remote = false;
+    const cluster = openingTag(
+      render({ zoneIdx: 0 }),
+      'data-page-element="zone-hover-actions"',
+      "<div",
+    );
+    expect(cluster).toContain("top-1");
+    expect(cluster).not.toContain("/zone:top-");
+    expect(cluster).toContain("has-[:focus-visible]:opacity-100");
+    expect(cluster).toContain("has-[:focus-visible]:pointer-events-auto");
   });
 
   it("keeps Close, and its UI Bridge id, visible in the collapsed cluster", () => {
