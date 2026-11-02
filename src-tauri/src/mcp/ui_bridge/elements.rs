@@ -682,33 +682,14 @@ const SUPPORTED_ACTION_NAMES: &[&str] = &[
     "autocomplete",
 ];
 
-/// Validate a user-supplied action name against [`SUPPORTED_ACTION_NAMES`].
+/// True when `raw` names a built-in action: a member of
+/// [`SUPPORTED_ACTION_NAMES`], after trimming and matched case-sensitively.
 ///
-/// Returns the canonical action name on success (currently the input
-/// unchanged — case-sensitive match — but the indirection keeps the
-/// future option of accepting a kebab-case alias open without churning
-/// every caller).
-///
-/// On failure returns a structured [`UiBridgeError`] with
-/// `code = INVALID_REQUEST` and the full supported list in
-/// `context.supportedActions`, so the handler can build a 400 envelope
-/// that mirrors the `tab/activate` -> `knownTabs` prior art.
-///
-/// Split out from the handler as a pure helper so it's unit-testable
-/// without spinning up an `axum::Router` — see `validate_action_name_tests`
-/// below. This matches the seam established for
-/// `validate_wait_for_element_state_request` / `validate_tab_id`.
-pub(crate) fn validate_action_name(raw: &str) -> Result<&str, UiBridgeError> {
-    let trimmed = raw.trim();
-    if !trimmed.is_empty() && SUPPORTED_ACTION_NAMES.contains(&trimmed) {
-        return Ok(trimmed);
-    }
-    Err(UiBridgeError::invalid_action(
-        raw,
-        None,
-        SUPPORTED_ACTION_NAMES,
-        None,
-    ))
+/// This only classifies the verb. Rejecting one needs the element's own list,
+/// so the 400 is built by the deferred gate in `execute_action_dispatch`
+/// (`action_vocabulary::deferred_unknown_action_error`).
+pub(crate) fn is_builtin_action(raw: &str) -> bool {
+    SUPPORTED_ACTION_NAMES.contains(&raw.trim())
 }
 
 /// True when a `get_element` IPC reply is the frontend's "there is no such
@@ -935,7 +916,7 @@ fn advertise_custom_actions_in_element_response(data: &mut serde_json::Value) {
 /// `false` (don't accuse — degrade gracefully).
 ///
 /// Match semantics mirror `SUPPORTED_ACTION_NAMES` membership in
-/// `validate_action_name`: exact (case-sensitive) string equality. The SDK
+/// `is_builtin_action`: case-sensitive string equality, here untrimmed. The SDK
 /// emits canonical camelCase names in element metadata; aliases like
 /// `scroll_into_view` -> `scrollIntoView` are normalized SDK-side before the
 /// `actions` list is built, so an additional alias-fold here would be a
@@ -1091,7 +1072,7 @@ pub(crate) enum TypeParamError {
 /// NOT flow through `relay-handlers.ts::executeElementAction`, so the
 /// SDK-side gate alone is insufficient. Without this helper a malformed
 /// `{action:"type", params:{value:"foo"}}` request fell through the
-/// `validate_action_name` whitelist (`"type"` is a known action), reached
+/// `is_builtin_action` whitelist (`"type"` is a known action), reached
 /// `execute_action`, IPC-failed because the frontend's type handler needs
 /// `params.text`, then hit the Phase 5 `RecoveryExecutor::llm_fallback`
 /// which synthesized a non-null `commandChosen` and returned HTTP 200
@@ -1425,7 +1406,7 @@ async fn execute_action_dispatch(
     // -> RecoveryExecutor::llm_fallback, which synthesized a click on a
     // random "Active" button and returned HTTP 200 `success:true`
     // (verified empirically 2026-05-21). Mirrors the `tab/activate`
-    // -> `knownTabs` 400 envelope shape; see `validate_action_name`.
+    // -> `knownTabs` 400 envelope shape.
     //
     // BUT: `SUPPORTED_ACTION_NAMES` only enumerates the built-in dispatcher
     // vocabulary — it cannot know about app-registered **custom actions**
@@ -1438,7 +1419,7 @@ async fn execute_action_dispatch(
     // the element's `customActions` and rejects ("Unknown action") only when
     // the name is neither a built-in nor a registered custom action on THIS
     // element. Built-in behavior is unchanged.
-    let action_is_builtin = validate_action_name(&request.action).is_ok();
+    let action_is_builtin = is_builtin_action(&request.action);
 
     // ── Type-action param-shape gate ────────────────────────────────────
     // Reject `{action:"type", params:{value:"foo"}}` and `{action:"type",
@@ -1716,7 +1697,7 @@ async fn execute_action_dispatch(
     //
     // Without this gate, e.g. `scrollIntoView` against a `<button>` whose
     // actions are `["click", "focus", "blur"]` would:
-    //   1. pass the `validate_action_name` whitelist (scrollIntoView is a
+    //   1. pass the `is_builtin_action` whitelist (scrollIntoView is a
     //      runner-known action name),
     //   2. dispatch to IPC,
     //   3. IPC fail with whatever shape the SDK emits for "this element
@@ -6435,93 +6416,56 @@ mod ws_dispatch_selection_tests {
 }
 
 #[cfg(test)]
-mod validate_action_name_tests {
-    //! Validation seam for the invalid-action gate that lives at the top of
-    //! `ui_bridge_execute_action_handler`. Exercises the pure helper so we
-    //! don't need an axum router / live IPC harness — matches the precedent
-    //! set by `validate_wait_for_element_state_request` /
-    //! `validate_tab_id`. Locks down both the accept-list (every known
-    //! action round-trips) and the reject-shape (`INVALID_REQUEST` code +
-    //! `supportedActions` context payload) so a future rename can't
-    //! silently let `press` through to the RecoveryExecutor again.
-    use super::{validate_action_name, SUPPORTED_ACTION_NAMES};
-    use crate::mcp::ui_bridge::types::UiBridgeErrorCode;
+mod is_builtin_action_tests {
+    //! The verb classifier behind the invalid-action gate in
+    //! `ui_bridge_execute_action_handler`. Locks down the accept-list so a
+    //! future rename can't silently let `press` through to the
+    //! RecoveryExecutor again. The 400 a non-built-in verb gets is the deferred
+    //! gate's, tested in `action_vocabulary`.
+    use super::is_builtin_action;
 
+    /// Literal names, so a rename in `SUPPORTED_ACTION_NAMES` fails here.
     #[test]
-    fn every_supported_action_is_accepted() {
-        for name in SUPPORTED_ACTION_NAMES {
-            let got = validate_action_name(name)
-                .unwrap_or_else(|_| panic!("expected {name} to validate"));
-            assert_eq!(got, *name, "validator must return the canonical name");
+    fn the_core_verbs_are_builtin() {
+        for name in [
+            "click",
+            "hoverClick",
+            "doubleClick",
+            "type",
+            "sendKeys",
+            "focus",
+            "hover",
+            "scrollIntoView",
+            "scroll_into_view",
+        ] {
+            assert!(is_builtin_action(name), "expected {name} to be built-in");
         }
     }
 
     #[test]
-    fn canonical_click_round_trips() {
-        // Sanity check the click path explicitly — it's the dominant call
-        // site and the one most likely to regress under refactor.
-        assert_eq!(validate_action_name("click").unwrap(), "click");
+    fn surrounding_whitespace_is_trimmed() {
+        assert!(is_builtin_action("  click "));
     }
 
     #[test]
-    fn unknown_action_is_rejected_with_invalid_request_code() {
-        let err = validate_action_name("press").expect_err("press must not be accepted");
-        assert!(
-            matches!(err.code, UiBridgeErrorCode::InvalidRequest),
-            "expected INVALID_REQUEST code, got {:?}",
-            err.code
-        );
-        assert!(
-            err.message.contains("press"),
-            "message must surface the rejected name, got: {}",
-            err.message
-        );
+    fn unknown_action_is_not_builtin() {
+        assert!(!is_builtin_action("press"));
+        assert!(!is_builtin_action("slap"));
     }
 
     #[test]
-    fn unknown_action_carries_supported_list_in_context() {
-        let err = validate_action_name("slap").expect_err("slap must not be accepted");
-        let ctx = err.context.as_ref().expect("context must be present");
-        let supported = ctx
-            .get("supportedActions")
-            .and_then(|v| v.as_array())
-            .expect("supportedActions must be an array");
-        let names: Vec<&str> = supported.iter().filter_map(|v| v.as_str()).collect();
-        // Spot-check a couple of canonical names — full equality with
-        // SUPPORTED_ACTION_NAMES is locked down by
-        // `every_supported_action_is_accepted` above.
-        assert!(names.contains(&"click"), "supportedActions must list click");
-        assert!(names.contains(&"type"), "supportedActions must list type");
-        assert!(
-            names.contains(&"scrollIntoView"),
-            "supportedActions must list scrollIntoView"
-        );
-        // And the offending name is echoed back so callers don't have to
-        // remember what they sent.
-        assert_eq!(ctx.get("action").and_then(|v| v.as_str()), Some("slap"));
-    }
-
-    #[test]
-    fn empty_action_is_rejected() {
-        let err = validate_action_name("").expect_err("empty action must be rejected");
-        assert!(matches!(err.code, UiBridgeErrorCode::InvalidRequest));
-    }
-
-    #[test]
-    fn whitespace_only_action_is_rejected() {
-        // Trim-then-check semantics: a body whose `action` field is `"   "`
-        // is the same misuse as an empty string.
-        let err = validate_action_name("   ").expect_err("whitespace-only action must be rejected");
-        assert!(matches!(err.code, UiBridgeErrorCode::InvalidRequest));
+    fn empty_and_whitespace_only_actions_are_not_builtin() {
+        // A body whose `action` field is `"   "` is the same misuse as `""`.
+        assert!(!is_builtin_action(""));
+        assert!(!is_builtin_action("   "));
     }
 
     #[test]
     fn case_sensitive_match_is_enforced() {
-        // `Click` (capital C) is NOT in the SDK vocabulary; rejecting it
-        // here matches what the wrapper SDK's relay-handlers.ts would do
+        // `Click` (capital C) is NOT in the SDK vocabulary; not classifying it
+        // as built-in matches what the wrapper SDK's relay-handlers.ts would do
         // and prevents downstream "no handler" silent failures.
-        let err = validate_action_name("Click").expect_err("Click must not be accepted");
-        assert!(matches!(err.code, UiBridgeErrorCode::InvalidRequest));
+        assert!(!is_builtin_action("Click"));
     }
 }
 
