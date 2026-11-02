@@ -6,7 +6,6 @@
 //! scheduler's shared [`ScheduleZone`].
 
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -37,6 +36,24 @@ fn next_fire_utc(
     }
 }
 
+/// Parse a schedule trigger's config the way its watcher will run it, naming
+/// whichever half is unusable.
+///
+/// The trigger API calls this before storing the row: [`start_schedule`] also
+/// refuses a bad config, but by then the row is stored and the caller has its
+/// success, so the refusal reaches only a log line and the trigger never fires.
+pub fn parse_schedule_config(
+    cron_expression: &str,
+    timezone: &str,
+) -> Result<(cron::Schedule, ScheduleZone), String> {
+    // The scheduler's one parse: 5-field standard cron gets its seconds field,
+    // and a numeric day-of-week reads in standard numbering (0/7 = Sunday,
+    // 1 = Monday) rather than the crate's 1 = Sunday (coord finding 35750774).
+    let schedule = crate::scheduler::parse_cron(cron_expression)
+        .map_err(|e| format!("Invalid cron expression '{}': {}", cron_expression, e))?;
+    Ok((schedule, ScheduleZone::parse(timezone)?))
+}
+
 /// Start a schedule watcher for a trigger.
 ///
 /// Parses the cron expression, calculates the next fire time, sleeps until then,
@@ -48,16 +65,7 @@ pub fn start_schedule(
     tx: mpsc::Sender<TriggerEvent>,
     stop_signal: Arc<AtomicBool>,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
-    // Validate cron expression up front, through the scheduler's one
-    // normalizer: 5-field standard cron gets its seconds field, and a numeric
-    // day-of-week reads in standard numbering (0/7 = Sunday, 1 = Monday)
-    // rather than the crate's 1 = Sunday (coord finding 35750774).
-    let schedule = crate::scheduler::normalize_cron(&cron_expression)
-        .and_then(|c| cron::Schedule::from_str(&c).map_err(|e| e.to_string()))
-        .map_err(|e| format!("Invalid cron expression '{}': {}", cron_expression, e))?;
-
-    // Parse timezone
-    let resolved_tz = ScheduleZone::parse(&timezone)?;
+    let (schedule, resolved_tz) = parse_schedule_config(&cron_expression, &timezone)?;
 
     let tz_display = match resolved_tz {
         ScheduleZone::Utc => "UTC".to_string(),
@@ -167,4 +175,27 @@ pub fn start_schedule(
     });
 
     Ok(handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_schedule_config_names_the_unusable_half() {
+        for good in ["0 */6 * * *", "0 9 * * 1-5", "0 0 * * 0", "30 6 * * Mon"] {
+            assert!(
+                parse_schedule_config(good, "UTC").is_ok(),
+                "'{good}' should parse"
+            );
+        }
+        let bad_cron = parse_schedule_config("30 6 * * 8", "UTC").unwrap_err();
+        assert!(
+            bad_cron.contains("Invalid cron expression '30 6 * * 8'")
+                && bad_cron.contains("invalid day-of-week '8'"),
+            "{bad_cron}"
+        );
+        let bad_zone = parse_schedule_config("0 3 * * *", "Mars/Olympus").unwrap_err();
+        assert!(bad_zone.contains("Mars/Olympus"), "{bad_zone}");
+    }
 }

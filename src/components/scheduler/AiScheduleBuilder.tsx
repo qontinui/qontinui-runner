@@ -32,7 +32,8 @@ import { describeThrown } from "@/lib/utils";
 // ============================================================================
 
 interface AiScheduleBuilderProps {
-  onSubmit: (requests: CreateScheduledTaskRequest[]) => void;
+  /** Resolves to the members of `requests` that were not created. */
+  onSubmit: (requests: CreateScheduledTaskRequest[]) => Promise<CreateScheduledTaskRequest[]>;
   onCancel: () => void;
   onEditManually: (request: CreateScheduledTaskRequest) => void;
   loading: boolean;
@@ -229,8 +230,8 @@ Respond ONLY with a JSON array. Each element must have this exact shape:
 }
 
 Schedule types (pick the best fit):
-- {"type":"Cron","value":"<cron expression>"} — for recurring time-based (use 5-field cron: min hour dom month dow)
-- {"type":"Once","value":"<ISO 8601 datetime>"} — for one-time
+- {"type":"Cron","value":"<cron expression>"} — for recurring time-based (use 5-field cron: min hour dom month dow, where dow 0 or 7 = Sunday and 1 = Monday)
+- {"type":"Once","value":"<RFC 3339 datetime with a UTC offset>"} — for one-time
 - {"type":"Interval","value":<seconds>} — for simple intervals
 - {"type":"Condition","value":{"rearmDelayMinutes":<number>}} — for condition-triggered (no time, runs when conditions met)
 
@@ -304,9 +305,14 @@ Only output the JSON array, nothing else.`;
   }, [prompt, buildAiPrompt]);
 
   // Accept all generated tasks
-  const handleAcceptAll = useCallback(() => {
+  const handleAcceptAll = useCallback(async () => {
     if (!generatedTasks) return;
-    onSubmit(generatedTasks.map((t) => t.request));
+    const requests = generatedTasks.map((t) => t.request);
+    const refused = await onSubmit(requests);
+    // Remove what was created from the CURRENT list: the author may have discarded
+    // or regenerated it while the requests were in flight.
+    const created = requests.filter((r) => !refused.includes(r));
+    setGeneratedTasks((current) => current && current.filter((t) => !created.includes(t.request)));
   }, [generatedTasks, onSubmit]);
 
   // Edit a single generated task in the manual form
@@ -549,7 +555,8 @@ Only output the JSON array, nothing else.`;
                   <button
                     type="button"
                     onClick={() => handleEditTask(idx)}
-                    className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                    disabled={loading}
+                    className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50"
                     title="Edit in manual form"
                   >
                     <Pencil className="w-3 h-3" />
@@ -588,7 +595,8 @@ Only output the JSON array, nothing else.`;
             <button
               type="button"
               onClick={() => setGeneratedTasks(null)}
-              className="px-4 py-2 text-sm text-muted-foreground hover:text-foreground transition-colors"
+              disabled={loading}
+              className="px-4 py-2 text-sm text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50"
             >
               Discard
             </button>

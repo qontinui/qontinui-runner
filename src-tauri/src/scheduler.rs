@@ -430,8 +430,12 @@ impl ScheduleZone {
 /// step) — refusing, rather than handing the crate a field it would read in
 /// its own numbering, is what keeps the old meaning from leaking back.
 ///
-/// Shared by [`compute_next_run`], the reconciler's slot walk and the trigger
-/// system's schedule watcher, so none of them can disagree about a slot.
+/// One divergence from standard cron is NOT translated: when day-of-month AND
+/// day-of-week are both restricted, Vixie cron fires on EITHER, while the crate
+/// requires BOTH, so `0 0 13 * 5` fires only on a Friday the 13th. A single
+/// crate expression cannot spell the union.
+///
+/// Reached through [`parse_cron`], so every caller shares one reading of a slot.
 pub fn normalize_cron(cron_expr: &str) -> Result<String, String> {
     let mut fields: Vec<String> = cron_expr.split_whitespace().map(str::to_string).collect();
     let dow_index = match fields.len() {
@@ -513,6 +517,38 @@ pub fn remap_day_of_week(field: &str) -> Result<String, String> {
     Ok(out.join(","))
 }
 
+/// Parse a cron expression the one way the runner reads cron: through
+/// [`normalize_cron`], then the crate. `Err` carries the reason, in either's
+/// words. Every parse site comes through here — [`cron_after`], the request
+/// validators and the trigger system's schedule watcher.
+pub fn parse_cron(cron_expr: &str) -> Result<cron::Schedule, String> {
+    use std::str::FromStr;
+
+    cron::Schedule::from_str(&normalize_cron(cron_expr)?).map_err(|e| e.to_string())
+}
+
+/// Refuse a schedule that could never fire because its cron or `Once` instant
+/// does not parse.
+///
+/// [`compute_next_run`] answers `None` for either, and `None` is also the honest
+/// answer for a `Once` already in the past, so a caller cannot read a refusal
+/// from it: without this check the task API stores the row and answers `201`
+/// with `next_run: null`, and the task silently never runs. `Interval` and
+/// `Condition` have nothing to parse.
+pub fn validate_schedule(schedule: &ScheduleExpression) -> Result<(), String> {
+    match schedule {
+        ScheduleExpression::Cron(cron_expr) => parse_cron(cron_expr)
+            .map(|_| ())
+            .map_err(|e| format!("Invalid cron expression '{cron_expr}': {e}")),
+        ScheduleExpression::Once(datetime_str) => {
+            chrono::DateTime::parse_from_rfc3339(datetime_str)
+                .map(|_| ())
+                .map_err(|e| format!("Invalid RFC 3339 datetime '{datetime_str}': {e}"))
+        }
+        ScheduleExpression::Interval(_) | ScheduleExpression::Condition(_) => Ok(()),
+    }
+}
+
 /// Every cron instant strictly after `from`, in `zone`, as UTC. The iterator
 /// is unbounded for a repeating expression — callers take what they need.
 pub fn cron_after(
@@ -520,10 +556,15 @@ pub fn cron_after(
     from: chrono::DateTime<chrono::Utc>,
     zone: ScheduleZone,
 ) -> Option<Box<dyn Iterator<Item = chrono::DateTime<chrono::Utc>>>> {
-    use cron::Schedule;
-    use std::str::FromStr;
-
-    let schedule = Schedule::from_str(&normalize_cron(cron_expr).ok()?).ok()?;
+    // A stored row can predate `validate_schedule`, and `None` drops the reason,
+    // so this is the one place left that can name why such a task never fires.
+    let schedule = match parse_cron(cron_expr) {
+        Ok(schedule) => schedule,
+        Err(e) => {
+            tracing::warn!("scheduler: invalid cron '{cron_expr}', no slots: {e}");
+            return None;
+        }
+    };
     // `after` excludes `from` itself, in every zone.
     let iter: Box<dyn Iterator<Item = chrono::DateTime<chrono::Utc>>> = match zone {
         ScheduleZone::Utc => Box::new(schedule.after_owned(from)),
@@ -843,6 +884,64 @@ mod tests {
         assert_eq!(
             compute_next_run(&s, chrono::Utc::now(), ScheduleZone::Utc),
             None
+        );
+    }
+
+    /// The two things `compute_next_run`'s `None` cannot tell apart: a schedule
+    /// that can never fire is refused, with its reason, and a `Once` in the past
+    /// is a legitimate schedule with no further run.
+    #[test]
+    fn validate_schedule_refuses_only_what_cannot_parse() {
+        let bad_dow =
+            validate_schedule(&ScheduleExpression::Cron("30 6 * * 8".to_string())).unwrap_err();
+        assert!(
+            bad_dow.contains("30 6 * * 8") && bad_dow.contains("invalid day-of-week '8'"),
+            "the refusal names the expression and the remap's reason: {bad_dow}"
+        );
+        let bad_crate =
+            validate_schedule(&ScheduleExpression::Cron("not a cron".to_string())).unwrap_err();
+        assert!(bad_crate.contains("not a cron"), "{bad_crate}");
+        // Valid ISO 8601, but no offset: `compute_next_run` could never read it.
+        let bad_once =
+            validate_schedule(&ScheduleExpression::Once("2030-01-01T09:00:00".to_string()))
+                .unwrap_err();
+        assert!(bad_once.contains("2030-01-01T09:00:00"), "{bad_once}");
+
+        for good in [
+            "30 6 * * 1",
+            "0 9 * * 1-5",
+            "0 0 * * 0",
+            "30 6 * * Mon",
+            "0 0 9 * * 2",
+            "0 0 9 * * 2 2030",
+            "@weekly",
+        ] {
+            assert_eq!(
+                validate_schedule(&ScheduleExpression::Cron(good.to_string())),
+                Ok(()),
+                "'{good}' should be accepted"
+            );
+        }
+        for other in [
+            ScheduleExpression::Once("2000-01-01T00:00:00Z".to_string()),
+            ScheduleExpression::Interval(60),
+        ] {
+            assert_eq!(validate_schedule(&other), Ok(()));
+        }
+    }
+
+    /// Pins the divergence `normalize_cron` documents: both day fields
+    /// restricted means BOTH here, where Vixie cron means EITHER. From Sunday
+    /// 2026-11-01, standard cron's next `0 0 13 * 5` is Friday 2026-11-06.
+    #[test]
+    fn restricted_day_of_month_and_day_of_week_must_both_match() {
+        let s = ScheduleExpression::Cron("0 0 13 * 5".to_string());
+        let from = chrono::DateTime::parse_from_rfc3339("2026-11-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            compute_next_run(&s, from, ScheduleZone::Utc).map(|d| d.to_rfc3339()),
+            Some("2026-11-13T00:00:00+00:00".to_string())
         );
     }
 

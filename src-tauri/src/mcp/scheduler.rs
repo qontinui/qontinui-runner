@@ -270,6 +270,9 @@ pub async fn create_scheduled_task(
             .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
     }
 
+    crate::scheduler::validate_schedule(&request.schedule)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
+
     let mut scheduled_task = crate::scheduler::ScheduledTask::new(
         request.name,
         request.description,
@@ -387,6 +390,8 @@ pub async fn update_scheduled_task(
         scheduled_task.enabled = enabled;
     }
     if let Some(schedule) = request.schedule {
+        crate::scheduler::validate_schedule(&schedule)
+            .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
         scheduled_task.schedule = schedule;
     }
     if let Some(task) = request.task {
@@ -1029,6 +1034,53 @@ mod tests {
             .unwrap();
         assert!(update.contains("let write_conditions = request.conditions.is_some();"));
         assert!(update.contains("&read_modified_at, write_conditions)"));
+    }
+
+    /// A cron that cannot parse must be refused by the handlers that store one:
+    /// `compute_next_run` turns it into `next_run: null`, which reads as success.
+    /// An update validates only a schedule it was SENT, so a stored row with a bad
+    /// cron can still be renamed or disabled.
+    #[test]
+    fn the_task_api_validates_a_schedule_before_storing_it() {
+        let src = include_str!("scheduler.rs");
+        let handler_body = |handler: &str| {
+            let (_, body) = src.split_once(handler).expect(handler);
+            body.split_once("\n}\n")
+                .expect("handler ends")
+                .0
+                .to_string()
+        };
+        let create = handler_body("pub async fn create_scheduled_task(");
+        // The statement must refuse: a call whose result is dropped stores the row.
+        let refuses = |from: &str| {
+            let statement = from.split_once(';').expect("statement ends").0;
+            assert!(
+                statement.contains("BAD_REQUEST") && statement.ends_with('?'),
+                "{statement}"
+            );
+        };
+        let validated = create
+            .find("validate_schedule(&request.schedule)")
+            .expect("create validates the schedule");
+        refuses(&create[validated..]);
+        assert!(
+            validated
+                < create
+                    .find("insert_scheduled_task")
+                    .expect("create inserts")
+        );
+
+        let update = handler_body("pub async fn update_scheduled_task(");
+        let (sent, _) = update
+            .split_once("scheduled_task.schedule = schedule;")
+            .expect("update applies a sent schedule");
+        let (_, sent) = sent
+            .rsplit_once("if let Some(schedule) = request.schedule {")
+            .expect("the apply is guarded on a sent schedule");
+        let (_, call) = sent
+            .split_once("validate_schedule(&schedule)")
+            .expect("update validates a sent schedule");
+        refuses(call);
     }
 
     /// `conditions` on an update is three-state: absent leaves them, `null`

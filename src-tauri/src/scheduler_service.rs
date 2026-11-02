@@ -2339,13 +2339,8 @@ fn iter_slots_in_window(
                     // certainly malformed for our use case.
                     .take(100_000)
                     .collect(),
-                None => {
-                    warn!(
-                        "iter_slots_in_window: invalid cron '{}'; returning no slots",
-                        cron_expr
-                    );
-                    Vec::new()
-                }
+                // `cron_after` logged the reason.
+                None => Vec::new(),
             }
         }
         ScheduleExpression::Interval(secs) => {

@@ -66,11 +66,33 @@ async fn list_triggers(
     }
 }
 
+/// Refuse a trigger config whose watcher could never start, before it is stored.
+///
+/// Only the `Schedule` watcher parses its config up front. Registration after the
+/// write cannot do this job: its failure can only be logged, because the row is
+/// already stored.
+fn validate_trigger_config(config: &TriggerConfig) -> Result<(), String> {
+    match config {
+        TriggerConfig::Schedule {
+            cron_expression,
+            timezone,
+        } => crate::trigger_system::watchers::schedule::parse_schedule_config(
+            cron_expression,
+            timezone,
+        )
+        .map(|_| ()),
+        _ => Ok(()),
+    }
+}
+
 /// Create a new trigger.
 async fn create_trigger(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<CreateTriggerRequest>,
 ) -> Result<(StatusCode, Json<ApiResponse<WorkflowTrigger>>), (StatusCode, Json<ApiResponse<()>>)> {
+    validate_trigger_config(&request.trigger_config)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
+
     // Derive trigger_type from config
     let trigger_type = match &request.trigger_config {
         TriggerConfig::Webhook { .. } => "webhook",
@@ -159,6 +181,9 @@ async fn update_trigger(
         trigger.description = desc;
     }
     if let Some(config) = request.trigger_config {
+        if let Err(e) = validate_trigger_config(&config) {
+            return Json(ApiResponse::error(e));
+        }
         trigger.trigger_type = match &config {
             TriggerConfig::Webhook { .. } => "webhook".to_string(),
             TriggerConfig::FileWatch { .. } => "file_watch".to_string(),
@@ -524,5 +549,72 @@ async fn get_status(State(_state): State<Arc<ApiState>>) -> Json<ApiResponse<Tri
             active_executions: 0,
             dropped_events: 0,
         })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_trigger_config_refuses_a_schedule_its_watcher_could_not_start() {
+        let schedule = |cron: &str, timezone: &str| TriggerConfig::Schedule {
+            cron_expression: cron.to_string(),
+            timezone: timezone.to_string(),
+        };
+        assert_eq!(
+            validate_trigger_config(&schedule("0 9 * * 1-5", "UTC")),
+            Ok(())
+        );
+        let bad_cron = validate_trigger_config(&schedule("30 6 * * 8", "UTC")).unwrap_err();
+        assert!(bad_cron.contains("invalid day-of-week '8'"), "{bad_cron}");
+        let bad_zone = validate_trigger_config(&schedule("0 3 * * *", "Mars/Olympus")).unwrap_err();
+        assert!(bad_zone.contains("Mars/Olympus"), "{bad_zone}");
+    }
+
+    /// Both routes must refuse BEFORE the write: registration after it can only
+    /// log, so a late refusal stores a trigger that never fires. An update
+    /// validates only a config it was sent.
+    #[test]
+    fn the_trigger_api_validates_a_config_before_storing_it() {
+        let src = include_str!("triggers.rs");
+        let handler_body = |handler: &str| {
+            let (_, body) = src.split_once(handler).expect(handler);
+            body.split_once("\n}\n")
+                .expect("handler ends")
+                .0
+                .to_string()
+        };
+        let create = handler_body("async fn create_trigger(");
+        let validated = create
+            .find("validate_trigger_config(&request.trigger_config)")
+            .expect("create validates the config");
+        assert!(
+            validated
+                < create
+                    .find(".create_trigger(&trigger)")
+                    .expect("create writes")
+        );
+        // The statement must refuse: a call whose result is dropped stores the row.
+        let statement = create[validated..]
+            .split_once(';')
+            .expect("statement ends")
+            .0;
+        assert!(
+            statement.contains("BAD_REQUEST") && statement.ends_with('?'),
+            "{statement}"
+        );
+
+        let update = handler_body("async fn update_trigger(");
+        let (sent, _) = update
+            .split_once("trigger.trigger_config = config;")
+            .expect("update applies a sent config");
+        let (_, sent) = sent
+            .rsplit_once("if let Some(config) = request.trigger_config {")
+            .expect("the apply is guarded on a sent config");
+        let (_, refusal) = sent
+            .split_once("validate_trigger_config(&config)")
+            .expect("update validates a sent config");
+        assert!(refusal.contains("return Json(ApiResponse::error(e));"));
     }
 }
