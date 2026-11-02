@@ -10,7 +10,7 @@ import { RemoteTabControls } from "../RemoteTabControls";
 import { useTerminalWindowActions } from "../useTerminalWindowActions";
 import { SessionInfoDropdown } from "../SessionInfoDropdown";
 import { TabTitle, useDisplayTitle } from "../displayTitle";
-import { ZONE_HEADER_HOVER_RESERVE_CLASS } from "./headerReserve";
+import { zoneHeaderReserveClass } from "./headerReserve";
 import { formatTotalOutput } from "./outputSize";
 
 /**
@@ -50,13 +50,17 @@ export function zoneHeaderElementSpec(
 /**
  * The header's output figure: the session's total output, labelled as total
  * output (`formatTotalOutput`). Renders nothing while no total is known.
+ *
+ * It truncates (`min-w-0 truncate`) rather than holding its width, so in a
+ * narrow zone it gives way before the toggles do; `title` keeps the full figure
+ * reachable.
  */
 export function TotalOutputLabel({ totalBytes }: { totalBytes: number | undefined }) {
   const text = formatTotalOutput(totalBytes);
   if (text === null || totalBytes === undefined) return null;
   return (
     <span
-      className="text-[9px] text-[#565f89] font-mono ml-1 shrink-0"
+      className="text-[9px] text-[#565f89] font-mono ml-1 min-w-0 truncate"
       title={`Total output this session has produced: ${totalBytes} bytes`}
       data-zone-total-output
     >
@@ -148,7 +152,7 @@ export function ZoneLabel({
       data-claude-session-id={tab.claudeSessionId ?? undefined}
       data-zone-index={zoneIndex}
       data-resume-failed={tab.resumeFailed ? "true" : undefined}
-      className={`absolute top-0 left-0 right-0 flex items-center gap-1.5 px-2 ${ZONE_HEADER_HOVER_RESERVE_CLASS} bg-[#13141f]/80 backdrop-blur-sm z-10 cursor-grab active:cursor-grabbing`}
+      className={`absolute top-0 left-0 right-0 flex items-center gap-1.5 px-2 ${zoneHeaderReserveClass(!!tab.remote)} bg-[#13141f]/80 backdrop-blur-sm z-10 cursor-grab active:cursor-grabbing`}
       style={{ height: `${ZONE_HEADER_HEIGHT_PX}px` }}
       draggable
       onDragStart={(e) => {
@@ -184,9 +188,11 @@ export function ZoneLabel({
       <span className="text-[10px] text-[#a9b1d6] truncate font-medium" title={displayTitle}>
         {displayTitle}
       </span>
+      {/* Truncates like the name (its `title` carries the full position), so a
+          narrow zone keeps its toggles out from under the hover cluster. */}
       {position && (
         <span
-          className="text-[9px] text-[#565f89] font-mono shrink-0"
+          className="text-[9px] text-[#565f89] font-mono min-w-0 truncate"
           title={`${displayTitle} — session ${position.index} of ${position.count}`}
           data-tmux-position={`${position.index}/${position.count}`}
         >
@@ -198,14 +204,16 @@ export function ZoneLabel({
           runner restart ends them. Mirrors the compact-card marker so the
           operator sees it in the full-terminal view too, not only in the
           compact multi-zone overview. */}
+      {/* Truncates (its `title` and `aria-label` carry the full text) so a narrow
+          zone keeps its toggles clear of the hover cluster. */}
       {isNonDurablePty(tab) && (
         <span
-          className="flex items-center gap-0.5 shrink-0 text-[8px] text-[#565f89] bg-[#565f89]/15 px-1 py-0 rounded"
+          className="flex items-center gap-0.5 min-w-0 overflow-hidden text-[8px] text-[#565f89] bg-[#565f89]/15 px-1 py-0 rounded"
           title={NON_DURABLE_TOOLTIP}
           aria-label={`Ephemeral session: ${NON_DURABLE_TOOLTIP}`}
         >
-          <Zap className="w-2.5 h-2.5" />
-          {NON_DURABLE_LABEL}
+          <Zap className="w-2.5 h-2.5 shrink-0" />
+          <span className="truncate">{NON_DURABLE_LABEL}</span>
         </span>
       )}
 
@@ -248,18 +256,18 @@ export function ZoneLabel({
             }}
             onMouseDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
-            className="bg-transparent border-b border-[#565f89] text-[9px] text-[#bb9af7] outline-hidden w-16 shrink-0"
+            className="bg-transparent border-b border-[#565f89] text-[9px] text-[#bb9af7] outline-hidden w-16 min-w-6"
             placeholder="Label..."
           />
         ) : zoneLabel ? (
           <span
-            className="text-[9px] text-[#bb9af7] bg-[#bb9af7]/10 px-1 py-0 rounded cursor-pointer hover:bg-[#bb9af7]/20 transition-colors shrink-0"
+            className="text-[9px] text-[#bb9af7] bg-[#bb9af7]/10 px-1 py-0 rounded cursor-pointer hover:bg-[#bb9af7]/20 transition-colors min-w-0 max-w-[8rem] truncate"
             onDoubleClick={(e) => {
               e.stopPropagation();
               setLabelValue(zoneLabel);
               setEditingLabel(true);
             }}
-            title="Double-click to edit"
+            title={`${zoneLabel} — double-click to edit`}
           >
             {zoneLabel}
           </span>

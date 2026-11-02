@@ -409,6 +409,35 @@ pub(crate) async fn launch(
     })
 }
 
+/// Forward `reader`'s lines to `tx`, decoding lossily. Byte-wise (`read_until`)
+/// rather than `lines()`, which errors on non-UTF-8 and would end the loop,
+/// close the pipe and let the child die on SIGPIPE/EPIPE. Keeps draining until
+/// EOF or a real read error; stops early only when the receiver is gone.
+async fn read_lossy_lines<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
+    prefix: &str,
+    tx: tokio::sync::mpsc::Sender<String>,
+) {
+    use tokio::io::AsyncBufReadExt;
+    let mut reader = BufReader::new(reader);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                while matches!(buf.last(), Some(b'\n' | b'\r')) {
+                    buf.pop();
+                }
+                let line = format!("{prefix}{}", String::from_utf8_lossy(&buf));
+                if tx.send(line).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Copy the child's stdout and stderr, line by line, into the run's log file.
 /// Fail-soft: a log that cannot be opened costs the transcript, not the run.
 pub(crate) async fn pump_to_log(
@@ -441,23 +470,13 @@ pub(crate) async fn pump_to_log(
     if let Some(out) = stdout {
         let tx = tx.clone();
         readers.push(tokio::spawn(async move {
-            let mut lines = BufReader::new(out).lines();
-            while let Ok(Some(l)) = lines.next_line().await {
-                if tx.send(l).await.is_err() {
-                    break;
-                }
-            }
+            read_lossy_lines(out, "", tx).await;
         }));
     }
     if let Some(err) = stderr {
         let tx = tx.clone();
         readers.push(tokio::spawn(async move {
-            let mut lines = BufReader::new(err).lines();
-            while let Ok(Some(l)) = lines.next_line().await {
-                if tx.send(format!("[stderr] {l}")).await.is_err() {
-                    break;
-                }
-            }
+            read_lossy_lines(err, "[stderr] ", tx).await;
         }));
     }
     drop(tx);
@@ -478,6 +497,18 @@ pub(crate) async fn pump_to_log(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn read_lossy_lines_survives_non_utf8_and_keeps_draining() {
+        let data: &[u8] = b"ok\n\xff\xfe bad\r\nafter\n";
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        read_lossy_lines(data, "p:", tx).await;
+        let mut got = Vec::new();
+        while let Some(l) = rx.recv().await {
+            got.push(l);
+        }
+        assert_eq!(got, vec!["p:ok", "p:\u{fffd}\u{fffd} bad", "p:after"]);
+    }
 
     #[test]
     fn prompt_is_first_and_verbatim_when_no_mcp_refs() {
