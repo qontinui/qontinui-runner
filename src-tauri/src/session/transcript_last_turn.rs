@@ -14,11 +14,15 @@
 //!
 //! ## Why the turn and not the file's mtime
 //!
-//! Coord finding `124c0ce9` measured transcript mtimes moving with no new turn,
-//! and a migration COPY gets a fresh mtime while holding only old turns. Either
-//! would make an idle or superseded copy look newest. The mtime is used here
-//! only as half of the cache key — a changed key costs one re-read, never a
-//! wrong answer.
+//! A file's mtime records the last WRITE, and not every write is a turn:
+//! Claude Code appends non-turn lines (summaries, progress records, harness
+//! `isMeta` lines) to a transcript, and an account migration COPIES the whole
+//! file into another root, giving the copy a fresh mtime while it holds only
+//! old turns. Either would make an idle or superseded copy look newest. The
+//! mtime is used here only as half of the cache key — a changed key costs one
+//! re-read, never a wrong answer. (Ordering two copies that hold the SAME
+//! newest turn is a separate question, settled by the newest write in
+//! [`crate::agent_worktree::custody::SessionDirectory`].)
 //!
 //! ## What is read
 //!

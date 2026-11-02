@@ -385,13 +385,20 @@ pub struct TranscriptCopy {
 
 /// Order a session's transcript copies so the one holding the NEWEST turn is
 /// first: a readable turn beats a readable file with no turn, which beats a
-/// copy that could not be read (or was not read). Ties — two copies holding
-/// the same newest turn, which is what a migration copy looks like before the
-/// resumed session writes its first turn — break on the config dir, then the
-/// path, so the order never flaps between walks.
+/// copy that could not be read (or was not read).
 ///
-/// Turn time, never mtime: a migration copy gets a FRESH mtime while holding
-/// only the original's turns.
+/// The turn time decides first, never the mtime alone: a migration copy gets
+/// a FRESH mtime while holding only the original's turns, so once the resumed
+/// session speaks, its copy wins on the turn itself.
+///
+/// Ties on the turn — two copies holding the same newest turn — break on the
+/// most recently WRITTEN copy. That is what a migration looks like when the
+/// resumed session exits before its first turn: the migration wrote the copy
+/// into the target root after the original's last write, and the target root
+/// is the account `--resume` continued under. Ordering such a tie by name
+/// instead would re-stamp a migrated session back onto its OLD account
+/// (coord accepts an equal observation time). Only then the config dir, then
+/// the path, so a tie that mtime cannot settle never flaps between walks.
 pub(crate) fn order_by_newest_turn(
     copies: &mut [TranscriptCopy],
     read: &mut dyn FnMut(&TranscriptCopy) -> crate::session::transcript_last_turn::TurnRead,
@@ -407,8 +414,11 @@ pub(crate) fn order_by_newest_turn(
     };
     let mut keyed: Vec<((u8, i64), TranscriptCopy)> =
         copies.iter().map(|c| (rank(read(c)), c.clone())).collect();
+    let written = |c: &TranscriptCopy| c.stamp.and_then(|s| s.modified_ms);
     keyed.sort_by(|(ra, a), (rb, b)| {
         rb.cmp(ra)
+            // Newest write first; an unknown mtime (`None`) sorts last.
+            .then_with(|| written(b).cmp(&written(a)))
             .then_with(|| a.config_dir.cmp(&b.config_dir))
             .then_with(|| a.path.cmp(&b.path))
     });
@@ -3488,29 +3498,38 @@ mod tests {
     }
 
     /// A migrated session's copies are ordered by their NEWEST TURN; equal
-    /// turns (a migration copy not yet resumed) break on the config dir, so the
+    /// turns break on the most recently written copy (the migration target),
+    /// and only a tie mtime cannot settle falls to the config dir — so the
     /// order never depends on which root the walk met first.
     #[test]
-    fn transcript_copies_order_by_newest_turn_then_config_dir() {
-        use crate::session::transcript_last_turn::TurnRead;
-        let copy = |root: &str| TranscriptCopy {
+    fn transcript_copies_order_by_newest_turn_then_newest_write_then_config_dir() {
+        use crate::session::transcript_last_turn::{FileStamp, TurnRead};
+        let copy = |root: &str, modified_ms: Option<i64>| TranscriptCopy {
             config_dir: PathBuf::from(root),
             path: PathBuf::from(format!("{root}/projects/p/s.jsonl")),
-            stamp: None,
+            stamp: Some(FileStamp {
+                len: 1,
+                modified_ms,
+            }),
         };
         let turn_of = |c: &TranscriptCopy| match c.config_dir.to_str() {
-            Some("/h/.claude-a") => TurnRead::Read(Some(100)),
+            // `a` holds the newest turn but the OLDEST write: the turn wins.
+            Some("/h/.claude-a") => TurnRead::Read(Some(500)),
+            // b, c, f tie on the turn: the newest write wins (f), then the
+            // two with the same mtime fall to the dir (b before c).
             Some("/h/.claude-b") => TurnRead::Read(Some(300)),
             Some("/h/.claude-c") => TurnRead::Read(Some(300)),
+            Some("/h/.claude-f") => TurnRead::Read(Some(300)),
             Some("/h/.claude-d") => TurnRead::Read(None),
             _ => TurnRead::Unreadable,
         };
         let mut copies = vec![
-            copy("/h/.claude-e"),
-            copy("/h/.claude-d"),
-            copy("/h/.claude-c"),
-            copy("/h/.claude-a"),
-            copy("/h/.claude-b"),
+            copy("/h/.claude-e", Some(9_000)),
+            copy("/h/.claude-d", Some(8_000)),
+            copy("/h/.claude-c", Some(2_000)),
+            copy("/h/.claude-a", Some(1_000)),
+            copy("/h/.claude-b", Some(2_000)),
+            copy("/h/.claude-f", Some(7_000)),
         ];
         order_by_newest_turn(&mut copies, &mut |c| turn_of(c));
         let order: Vec<&str> = copies
@@ -3520,11 +3539,12 @@ mod tests {
         assert_eq!(
             order,
             vec![
-                "/h/.claude-b", // newest turn, ties with c, wins on the dir
+                "/h/.claude-a", // newest turn, despite the oldest write
+                "/h/.claude-f", // tied turn, newest write
+                "/h/.claude-b", // tied turn and write: the dir decides
                 "/h/.claude-c",
-                "/h/.claude-a",
                 "/h/.claude-d", // readable, no turn
-                "/h/.claude-e", // unreadable
+                "/h/.claude-e", // unreadable, despite the newest write
             ]
         );
     }
