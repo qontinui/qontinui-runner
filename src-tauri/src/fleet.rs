@@ -53,6 +53,11 @@ use crate::database::pg::PgDb;
 /// Appended in [`host_capabilities`].
 pub(crate) mod imagegen_probe;
 
+/// The `cred` family's regional half: fetches coord's probe catalogue, treats it
+/// as untrusted input, and runs what may run through the family's probe machinery
+/// (plan `2026-10-09-coord-knows-which-box-holds-which-credential`, Phase 3).
+mod cred_probe_specs;
+
 /// The periodic coord heartbeat loop: drives [`heartbeat_to_coord`] under a
 /// per-tick timeout, warns on stalls, and logs a 10-minute summary (plan
 /// `2026-10-29-a-drained-device-is-alerted-as-no-runner-online`, Phase 3).
@@ -1756,8 +1761,8 @@ fn host_capabilities() -> Vec<String> {
 }
 
 /// The heartbeat's host capability set: [`host_capabilities`] plus the
-/// credential-presence family — `probes:cred`, `cred:gh`, `cred:aws-sts` —
-/// read from its own cache (see the section header above
+/// credential-presence family — `probes:cred`, `cred:gh`, `cred:aws-sts` and
+/// the regional tokens coord's catalogue names — read from its own cache (see the section header above
 /// [`CRED_PROBES_MARKER`]); that read never blocks on a probe. The ONLY caller
 /// of [`cred_capabilities`], and called only by `heartbeat_to_coord`.
 fn heartbeat_capabilities() -> Vec<String> {
@@ -2268,7 +2273,9 @@ fn is_executable_file(p: &std::path::Path) -> bool {
 // =============================================================================
 // Credential-presence capability family — `cred:gh`, `cred:aws-sts` and the
 // `probes:cred` marker (plan
-// `2026-10-09-coord-knows-which-box-holds-which-credential`, Phase 2).
+// `2026-10-09-coord-knows-which-box-holds-which-credential`, Phase 2), plus the
+// regional `cred:aws-ssm:<region>` / `cred:aws-ecs:<region>` tokens coord's
+// probe catalogue names (Phase 3, `fleet/cred_probe_specs.rs`).
 //
 // Coord places credential-gated continuations by matching
 // `required_capabilities` against `coord.devices.capabilities` (D1), so a
@@ -2876,11 +2883,29 @@ fn fold_cred_memo(
     }
 }
 
+/// Log one token's verdict — token and state only — at `info!` when its
+/// advertisement flips, `debug!` otherwise.
+fn log_cred_advertisement(token: &str, state: &str, was: bool, is: bool) {
+    if was != is {
+        info!("host_capabilities: {token} state={state} advertised={is}");
+    } else {
+        debug!("host_capabilities: {token} state={state} advertised={is}");
+    }
+}
+
 /// The `cred` family's cache: when it last ran, and each token's memo.
+///
+/// The built-in tokens and the catalogue's regional tokens sit in separate maps
+/// so that nothing a catalogue fetch does can reach `cred:gh` or `cred:aws-sts`:
+/// [`Self::apply_regional`] has no access path to `memos`, and the marker is
+/// derived from `ran_at` alone.
 #[derive(Debug)]
 struct CredFamilyState {
     ran_at: Option<std::time::Instant>,
     memos: std::collections::BTreeMap<&'static str, CredMemo>,
+    /// Keyed by the token [`cred_probe_specs::RegionalProbe::token`] rebuilt from
+    /// a validated spec, so every key is D1-grammar and safe to log.
+    regional: std::collections::BTreeMap<String, CredMemo>,
 }
 
 impl CredFamilyState {
@@ -2888,6 +2913,7 @@ impl CredFamilyState {
         CredFamilyState {
             ran_at: None,
             memos: std::collections::BTreeMap::new(),
+            regional: std::collections::BTreeMap::new(),
         }
     }
 
@@ -2910,17 +2936,7 @@ impl CredFamilyState {
             let after = fold_cred_memo(before, state, now, ttl);
             let was = before.is_some_and(|m| m.present);
             let is = after.is_some_and(|m| m.present);
-            if was != is {
-                info!(
-                    "host_capabilities: {token} state={} advertised={is}",
-                    state.as_str()
-                );
-            } else {
-                debug!(
-                    "host_capabilities: {token} state={} advertised={is}",
-                    state.as_str()
-                );
-            }
+            log_cred_advertisement(token, state.as_str(), was, is);
             match after {
                 Some(m) => {
                     self.memos.insert(token, m);
@@ -2931,6 +2947,94 @@ impl CredFamilyState {
             }
         }
         self.ran_at = Some(now);
+    }
+
+    /// Fold one verdict into one regional token's memo.
+    fn fold_regional(
+        &mut self,
+        token: &str,
+        state: CredState,
+        now: std::time::Instant,
+        ttl: Duration,
+    ) {
+        let before = self.regional.get(token).copied();
+        let after = fold_cred_memo(before, state, now, ttl);
+        // A token never earned and still not held says nothing; logging it
+        // would let a long list of unmeasured rows bypass the refusal-log cap.
+        if before.is_some() || after.is_some() {
+            log_cred_advertisement(
+                token,
+                state.as_str(),
+                before.is_some_and(|m| m.present),
+                after.is_some_and(|m| m.present),
+            );
+        }
+        match after {
+            Some(m) => {
+                self.regional.insert(token.to_string(), m);
+            }
+            None => {
+                self.regional.remove(token);
+            }
+        }
+    }
+
+    /// Fold one catalogue cycle in. D2's three outcomes:
+    ///
+    /// * No answer at all: nothing was measured, so every earned token folds as
+    ///   `Unknown` (its last answer holds for one TTL, then it drops).
+    /// * An answered catalogue: a token it no longer names was REMOVED and retracts
+    ///   here, with no hold, whatever its memo said. Every token it does name folds
+    ///   its own verdict, and a token past the run cap or named by a row of a kind
+    ///   this build does not know folds as `Unknown`: listed, but not measured.
+    /// * An answered catalogue holding an unreadable row: its silence about a token
+    ///   is not a removal, so a token no row names folds as `Unknown`. A token a
+    ///   readable row named and failed a check on still retracts at once.
+    ///
+    /// Never touches `memos` or `ran_at`.
+    fn apply_regional(
+        &mut self,
+        cycle: &cred_probe_specs::RegionalCycle,
+        now: std::time::Instant,
+        ttl: Duration,
+    ) {
+        match cycle {
+            cred_probe_specs::RegionalCycle::NoAnswer => {
+                let earned: Vec<String> = self.regional.keys().cloned().collect();
+                for token in &earned {
+                    self.fold_regional(token, CredState::Unknown, now, ttl);
+                }
+            }
+            cred_probe_specs::RegionalCycle::Answered {
+                verdicts,
+                not_run,
+                unreadable_rows,
+                refused_tokens,
+            } => {
+                let unnamed: Vec<String> = self
+                    .regional
+                    .keys()
+                    .filter(|token| {
+                        !verdicts.iter().any(|(t, _)| t == *token) && !not_run.contains(token)
+                    })
+                    .cloned()
+                    .collect();
+                for token in &unnamed {
+                    if *unreadable_rows && !refused_tokens.contains(token) {
+                        self.fold_regional(token, CredState::Unknown, now, ttl);
+                    } else {
+                        let was = self.regional.remove(token).is_some_and(|m| m.present);
+                        log_cred_advertisement(token, "removed", was, false);
+                    }
+                }
+                for (token, state) in verdicts {
+                    self.fold_regional(token, *state, now, ttl);
+                }
+                for token in not_run {
+                    self.fold_regional(token, CredState::Unknown, now, ttl);
+                }
+            }
+        }
     }
 
     /// The tokens this family contributes to the heartbeat: nothing before
@@ -2946,6 +3050,12 @@ impl CredFamilyState {
                 .iter()
                 .filter(|(_, m)| m.present)
                 .map(|(token, _)| (*token).to_string()),
+        );
+        caps.extend(
+            self.regional
+                .iter()
+                .filter(|(_, m)| m.present)
+                .map(|(token, _)| token.clone()),
         );
         caps
     }
@@ -2977,6 +3087,35 @@ fn cred_capabilities() -> Vec<String> {
     caps
 }
 
+/// One whole family cycle, in the order that keeps the regional half from ever
+/// costing the built-ins anything: `cred:gh`, `cred:aws-sts` and the marker are
+/// settled in the cache BEFORE the catalogue is fetched, so a slow fetch or up to
+/// sixteen slow regional probes cannot delay them, and a failed fetch has nothing
+/// of theirs to disturb. The lock is held only to fold, never across a probe.
+///
+/// Both folds are stamped `started`, the cycle's START, not its end. The next
+/// cycle starts no sooner than `ran_at + ttl`, so consecutive regional folds are
+/// at least `ttl` apart however long the probes took, and D2's "hold for one TTL"
+/// is one cycle rather than two.
+fn run_cred_refresh_cycle(
+    cache: &Mutex<CredFamilyState>,
+    env: &CredProbeEnv,
+    fetch_specs: impl FnOnce() -> Result<Vec<serde_json::Value>, cred_probe_specs::SpecFetchFailure>,
+    started: std::time::Instant,
+    ttl: Duration,
+) {
+    let verdicts = probe_cred_family(env);
+    cache
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .apply(&verdicts, started, ttl);
+    let regional = cred_probe_specs::run_regional_cycle(fetch_specs(), env);
+    cache
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .apply_regional(&regional, started, ttl);
+}
+
 /// Run the family once on a detached thread and fold it into
 /// [`CRED_FAMILY_CACHE`]. The latch is released by a drop guard, so a
 /// panicking probe cannot wedge every later refresh.
@@ -2985,7 +3124,8 @@ fn spawn_cred_refresh() {
     // Hermetic-test seam: a unit-test process must never run the operator's
     // real `gh` / `aws` (a live STS call with real credentials, on a detached
     // thread that outlives the test). Tests drive the family through
-    // `probe_cred_family` with a hermetic `CredProbeEnv` instead.
+    // `probe_cred_family` / `run_cred_refresh_cycle` with a hermetic
+    // `CredProbeEnv` instead.
     if cfg!(test) {
         debug!("host_capabilities: cred probe refresh suppressed under cfg(test)");
         return;
@@ -3003,10 +3143,15 @@ fn spawn_cred_refresh() {
         .name("cred-probe".into())
         .spawn(|| {
             let _release = Release;
+            let started = std::time::Instant::now();
             let env = CredProbeEnv::from_process();
-            let verdicts = probe_cred_family(&env);
-            let mut g = CRED_FAMILY_CACHE.lock().unwrap_or_else(|p| p.into_inner());
-            g.apply(&verdicts, std::time::Instant::now(), HOST_PROBE_TTL);
+            run_cred_refresh_cycle(
+                &CRED_FAMILY_CACHE,
+                &env,
+                cred_probe_specs::fetch_probe_specs,
+                started,
+                HOST_PROBE_TTL,
+            );
         });
     if let Err(e) = spawned {
         CRED_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
@@ -9449,9 +9594,18 @@ mod tests {",
                 },
             );
         }
+        let regional_token = "cred:aws-ssm:eu-central-1";
         let seeded = CredFamilyState {
             ran_at: Some(now),
             memos,
+            regional: std::iter::once((
+                regional_token.to_string(),
+                CredMemo {
+                    present: true,
+                    unknown_since: None,
+                },
+            ))
+            .collect(),
         };
         let _restore = {
             let mut g = CRED_FAMILY_CACHE.lock().unwrap_or_else(|p| p.into_inner());
@@ -9467,6 +9621,7 @@ mod tests {",
                 CRED_PROBES_MARKER,
                 CRED_GH_CAPABILITY,
                 CRED_AWS_STS_CAPABILITY,
+                regional_token,
             ] {
                 assert!(
                     payload_caps.iter().any(|c| c == token),
@@ -9489,13 +9644,40 @@ mod tests {",
     /// A fake secret the shims print on BOTH streams and plant in gh's
     /// `hosts.yml`. It must never surface in a log, the heartbeat payload, a
     /// verdict's Debug rendering or a panic message.
-    const CRED_FAKE_SECRET: &str = "FAKE-SECRET-ghp_credprobecanary0123456789";
+    pub(super) const CRED_FAKE_SECRET: &str = "FAKE-SECRET-ghp_credprobecanary0123456789";
 
-    const CRED_TEST_TTL: Duration = Duration::from_secs(300);
+    pub(super) const CRED_TEST_TTL: Duration = Duration::from_secs(300);
+
+    /// A listed token that was never earned and still is not held says nothing
+    /// in the logs, so a long list of unmeasured catalogue rows cannot bypass the
+    /// refusal-log cap. The token that IS newly advertised in the same fold is the
+    /// control that shows the capture sees this family's lines.
+    #[test]
+    fn an_unearned_listed_token_folds_without_a_log_line() {
+        const NEVER: &str = "cred:aws-ecs:ap-south-1";
+        const SEEN: &str = "cred:aws-ecs:eu-central-1";
+        let (held, logs) = capture_cred_logs(|| {
+            let mut state = CredFamilyState::new();
+            let cycle = super::cred_probe_specs::RegionalCycle::Answered {
+                verdicts: vec![(SEEN.to_string(), CredState::Present)],
+                not_run: vec![NEVER.to_string()],
+                unreadable_rows: false,
+                refused_tokens: Vec::new(),
+            };
+            state.apply_regional(&cycle, std::time::Instant::now(), CRED_TEST_TTL);
+            state.regional.contains_key(NEVER)
+        });
+        assert!(!held, "an unmeasured token is not memoized");
+        assert!(
+            logs.contains(SEEN),
+            "control: the capture saw the fold: {logs}"
+        );
+        assert!(!logs.contains(NEVER), "{logs}");
+    }
 
     /// What a shim does when run.
     #[derive(Clone, Copy)]
-    enum Shim {
+    pub(super) enum Shim {
         /// Print the fake secret on stdout and stderr, then exit with this code.
         Exit(i32),
         /// Print the fake secret, then hang far past any test budget.
@@ -9503,7 +9685,7 @@ mod tests {",
     }
 
     /// Write an executable shim named `name` into `dir` and return its path.
-    fn write_cred_shim(dir: &std::path::Path, name: &str, shim: Shim) -> PathBuf {
+    pub(super) fn write_cred_shim(dir: &std::path::Path, name: &str, shim: Shim) -> PathBuf {
         #[cfg(windows)]
         {
             let path = dir.join(format!("{name}.cmd"));
@@ -9549,7 +9731,7 @@ mod tests {",
     /// child's fd table, which no fork of this process copies, and it is gone
     /// once the child is reaped — before this returns.
     #[cfg(not(windows))]
-    fn write_executable_script(path: &std::path::Path, body: &str) {
+    pub(super) fn write_executable_script(path: &std::path::Path, body: &str) {
         use std::io::Write;
         use std::process::{Command, Stdio};
         let mut writer = Command::new("/bin/sh")
@@ -9672,7 +9854,7 @@ mod tests {",
     ///   each. The null device is `FILE_TYPE_CHAR` (2) with no console mode;
     ///   an inherited console is 2 WITH a console mode, a pipe is 3, a file 1.
     #[cfg(any(windows, target_os = "linux"))]
-    fn write_stdio_report_shim(
+    pub(super) fn write_stdio_report_shim(
         dir: &std::path::Path,
         name: &str,
         report: &std::path::Path,
@@ -9700,7 +9882,7 @@ Add-Content -LiteralPath $Out -Value $lines
             let path = dir.join(format!("{name}.cmd"));
             let body = format!(
                 "@echo off\r\n\
-                 echo args=%*>>\"{report}\"\r\n\
+                 >>\"{report}\" echo args=%*\r\n\
                  \"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{ps1}\" \"{report}\"\r\n\
                  echo {CRED_FAKE_SECRET}\r\n\
                  echo {CRED_FAKE_SECRET} 1>&2\r\n\
@@ -9732,7 +9914,7 @@ Add-Content -LiteralPath $Out -Value $lines
     /// A probe environment rooted in `home`, touching nothing of the real
     /// machine: no binary resolved (both tools "not on PATH"), gh's config dir
     /// pinned under `home`, no aws variables.
-    fn hermetic_cred_env(home: &std::path::Path) -> CredProbeEnv {
+    pub(super) fn hermetic_cred_env(home: &std::path::Path) -> CredProbeEnv {
         CredProbeEnv {
             gh: None,
             aws: None,
@@ -9778,7 +9960,7 @@ Add-Content -LiteralPath $Out -Value $lines
     /// family state — through the same assembly `heartbeat_to_coord` runs
     /// (`build_host_capabilities` + the family's tokens, then
     /// `build_device_capabilities`, then the payload's serialization).
-    fn cred_payload_capabilities(state: &CredFamilyState) -> (Vec<String>, String) {
+    pub(super) fn cred_payload_capabilities(state: &CredFamilyState) -> (Vec<String>, String) {
         let mut host = build_host_capabilities("linux", false, false, false, None);
         host.extend(state.advertised());
         let caps = build_device_capabilities(false, &[], &host);
@@ -9796,7 +9978,7 @@ Add-Content -LiteralPath $Out -Value $lines
 
     /// Run `f` with every `tracing` event on this thread captured (at TRACE,
     /// so `debug!` lines are included) and return the captured text.
-    fn capture_cred_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
+    pub(super) fn capture_cred_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
         #[derive(Clone, Default)]
         struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Buf {
@@ -10634,7 +10816,7 @@ Add-Content -LiteralPath $Out -Value $lines
             };
             let body = format!(
                 "@echo off\r\n\
-                 echo args=%*>>\"{log}\"\r\n\
+                 >>\"{log}\" echo args=%*\r\n\
                  echo {CRED_FAKE_SECRET}\r\n\
                  echo {CRED_FAKE_SECRET} 1>&2\r\n\
                  {refuse}\
