@@ -26,6 +26,11 @@
 //! post-merge follow-up. So there is now exactly one indicator list to extend
 //! and one place the two-read rule lives.
 //!
+//! [`snapshot_looks_idle_tolerating_finished_turn`] is its one sibling, for a
+//! restart prepare's notice and activity read alone; the two reads share one
+//! implementation (`veto_of`) and one debounce
+//! (`TerminalSession::quiescence_probe_with`).
+//!
 //! [`snapshot_shows_dialog`] is a separate conjunct, not part of the idle
 //! predicate: a Claude Code dialog (workspace trust, a permission prompt)
 //! reads idle to it, so a caller about to TYPE into the session checks both.
@@ -65,20 +70,49 @@ pub const PROMPT_MARKER: char = '❯';
 ///
 /// 1. NO processing-indicator text anywhere on screen
 ///    ([`PROCESSING_INDICATORS`]).
-/// 2. NO spinner glyph on screen ([`SPINNER_GLYPHS`], `·` excepted), save on
-///    the static completed-turn line ([`is_completed_turn_line`]).
+/// 2. NO spinner glyph on screen ([`SPINNER_GLYPHS`], `·` excepted). The static
+///    completed-turn line ([`is_completed_turn_line`]) carries one, so it vetoes
+///    here. That errs toward busy, deliberately: this predicate feeds wind-down
+///    and the close primitive, and reading a pane idle wrongly can close a
+///    session that still has work. Only a restart prepare tolerates that line,
+///    through [`snapshot_looks_idle_tolerating_finished_turn`].
 /// 3. A prompt row containing [`PROMPT_MARKER`] (`❯`) is visible.
 /// 4. The cursor sits AT OR BELOW the prompt row (in the input area), not up
 ///    in streaming output.
 pub fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
+    veto_of(lines, cursor_row, FinishedTurnLine::Vetoes).is_none()
+}
+
+/// [`snapshot_looks_idle`], except that the static completed-turn line
+/// ([`is_completed_turn_line`]) does not veto.
+///
+/// For a restart prepare ONLY (plan
+/// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`): it
+/// decides whether one save-and-pause notice may be typed, and whether a pane's
+/// screen is left undecided so Claude Code's own record can answer. It closes
+/// nothing. Never route a close, a wind-down or a mailbox delivery through it
+/// (plan `2026-10-28-one-session-lifecycle-authority`: the shared predicate is
+/// never loosened).
+pub fn snapshot_looks_idle_tolerating_finished_turn(lines: &[String], cursor_row: u16) -> bool {
     idle_veto(lines, cursor_row).is_none()
 }
 
-/// Which of [`snapshot_looks_idle`]'s checks vetoes idle on this snapshot, as
-/// a short human-readable reason; `None` exactly when the snapshot looks idle.
-/// The same checks in the same order — the diagnostic for a pane that keeps
-/// reading busy (see `restart_prep::notice`'s told-but-busy log line).
+/// Which of [`snapshot_looks_idle_tolerating_finished_turn`]'s checks vetoes
+/// idle on this snapshot, as a short human-readable reason; `None` exactly when
+/// that predicate reads idle. The diagnostic for a pane that keeps reading busy
+/// (see `restart_prep::notice`'s told-but-busy log line).
 pub fn idle_veto(lines: &[String], cursor_row: u16) -> Option<String> {
+    veto_of(lines, cursor_row, FinishedTurnLine::Tolerated)
+}
+
+/// What the spinner check makes of the static completed-turn line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinishedTurnLine {
+    Vetoes,
+    Tolerated,
+}
+
+fn veto_of(lines: &[String], cursor_row: u16, finished: FinishedTurnLine) -> Option<String> {
     // (1) any processing-indicator text ⇒ busy.
     for (row, line) in lines.iter().enumerate() {
         let lower = line.to_ascii_lowercase();
@@ -89,10 +123,9 @@ pub fn idle_veto(lines: &[String], cursor_row: u16) -> Option<String> {
         }
     }
 
-    // (2) spinner glyphs (excluding bare `·`) ⇒ busy — except on the static
-    // completed-turn line Claude Code leaves under a finished turn.
+    // (2) spinner glyphs (excluding bare `·`) ⇒ busy.
     for (row, line) in lines.iter().enumerate() {
-        if is_completed_turn_line(line) {
+        if finished == FinishedTurnLine::Tolerated && is_completed_turn_line(line) {
             continue;
         }
         if let Some(ch) = line
@@ -442,7 +475,14 @@ mod tests {
                 "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
             ]);
             assert!(is_completed_turn_line(done), "completed shape: {done:?}");
-            assert!(snapshot_looks_idle(&grid, 5), "must be idle with: {done:?}");
+            assert!(
+                snapshot_looks_idle_tolerating_finished_turn(&grid, 5),
+                "a prepare reads it idle: {done:?}"
+            );
+            assert!(
+                !snapshot_looks_idle(&grid, 5),
+                "the shared predicate is never loosened: {done:?}"
+            );
         }
     }
 
@@ -459,7 +499,11 @@ mod tests {
             "✻ Brewed for 2m 39s · done 11:46 AM",
         ] {
             assert!(is_completed_turn_line(done), "completed: {done:?}");
-            assert!(snapshot_looks_idle(&lines(&[done, "❯ "]), 1), "{done:?}");
+            assert!(
+                snapshot_looks_idle_tolerating_finished_turn(&lines(&[done, "❯ "]), 1),
+                "{done:?}"
+            );
+            assert!(!snapshot_looks_idle(&lines(&[done, "❯ "]), 1), "{done:?}");
         }
         for busy in [
             "✻Brewing…(2m 39s · esc to interrupt)",
@@ -470,6 +514,10 @@ mod tests {
             "✻Brewed fortune 2m",
         ] {
             assert!(!is_completed_turn_line(busy), "not completed: {busy:?}");
+            assert!(
+                !snapshot_looks_idle_tolerating_finished_turn(&lines(&[busy, "❯ "]), 1),
+                "{busy:?}"
+            );
             assert!(!snapshot_looks_idle(&lines(&[busy, "❯ "]), 1), "{busy:?}");
         }
     }
@@ -493,6 +541,10 @@ mod tests {
         ] {
             assert!(!is_completed_turn_line(busy), "not completed: {busy:?}");
             let grid = lines(&[busy, "❯ "]);
+            assert!(
+                !snapshot_looks_idle_tolerating_finished_turn(&grid, 1),
+                "must be busy: {busy:?}"
+            );
             assert!(!snapshot_looks_idle(&grid, 1), "must be busy: {busy:?}");
         }
         // A completed line from the last turn does not hide a live spinner
@@ -502,6 +554,7 @@ mod tests {
             "✶ Pondering… (3s)",
             "❯ ",
         ]);
+        assert!(!snapshot_looks_idle_tolerating_finished_turn(&grid, 2));
         assert!(!snapshot_looks_idle(&grid, 2));
     }
 

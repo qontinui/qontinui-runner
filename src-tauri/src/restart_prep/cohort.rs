@@ -135,7 +135,7 @@ pub struct CohortRow {
     /// Why the last delivery attempt did not paste; it is retried next tick.
     #[serde(default)]
     pub notice_deferred: Option<String>,
-    /// The input arm the notice went through: `idle`, `busy_prompt`, or
+    /// The input arm the notice went through: `idle`, or
     /// `shared_terminal` (the same pane and process were told through another
     /// record).
     #[serde(default)]
@@ -261,7 +261,7 @@ fn state_of(facts: &RowFacts) -> StateAtPrepare {
     if crate::terminal::graceful_exit::shows_busy_marker(screen) {
         return StateAtPrepare::Working;
     }
-    if qontinui_runner_lib::looping_agent::idle::snapshot_looks_idle(
+    if qontinui_runner_lib::looping_agent::idle::snapshot_looks_idle_tolerating_finished_turn(
         &screen.lines,
         screen.cursor_row,
     ) {
@@ -1152,6 +1152,11 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            wind_down_arm: None,
+            last_session_start_at: None,
+            gate_id: None,
+            gate_consuming_device_id: None,
+            gate_bound_boot_ms: None,
         }
     }
 

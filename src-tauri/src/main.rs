@@ -4344,7 +4344,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 claude_session = %csid,
                                 gate_id = %report.gate_id,
                                 detail = %report.detail,
-                                "continuation lost to a runner restart — posting work_unreported"
+                                "prior-generation continuation closed with no outcome — posting work_unreported"
                             );
                             rt_handle.spawn(agent_runtime::post_runner_restart_unreported(
                                 report.gate_id,
@@ -4967,10 +4967,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             // Is this a prior-boot record whose boot restore
                             // is being withheld, or that is still waiting for
                             // its page's restore? Decided BEFORE matching: a
-                            // withheld record gets the id match only (see
-                            // `match_live_terminal`); a waiting one keeps the
-                            // triple fallback and is only kept from the orphan
-                            // close (see `BootRestoreHold`).
+                            // withheld record, or a restart placeholder, gets
+                            // the id match only (see `match_live_terminal`); a
+                            // waiting one keeps the triple fallback and is only
+                            // kept from the orphan close (see `BootRestoreHold`).
                             let awaiting_boot_restore =
                                 tick_boot_census.is_some_and(|c| c.awaits_restore(rec));
                             let boot_hold = boot_restore_hold(

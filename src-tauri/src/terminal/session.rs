@@ -4731,18 +4731,45 @@ impl TerminalSession {
         &self,
         debounce: std::time::Duration,
     ) -> Option<IdleQuiescence> {
-        use qontinui_runner_lib::looping_agent::idle::snapshot_looks_idle;
+        self.quiescence_probe_with(
+            debounce,
+            qontinui_runner_lib::looping_agent::idle::snapshot_looks_idle,
+        )
+        .await
+    }
 
+    /// [`Self::looks_idle_quiescent`] under a finished turn's static line: for
+    /// a restart prepare's notice ONLY, see
+    /// [`qontinui_runner_lib::looping_agent::idle::snapshot_looks_idle_tolerating_finished_turn`].
+    pub async fn looks_idle_quiescent_tolerating_finished_turn(
+        &self,
+        debounce: std::time::Duration,
+    ) -> bool {
+        matches!(
+            self.quiescence_probe_with(
+                debounce,
+                qontinui_runner_lib::looping_agent::idle::snapshot_looks_idle_tolerating_finished_turn,
+            )
+            .await,
+            Some(probe) if probe.idle
+        )
+    }
+
+    /// The one debounce: two reads `debounce` apart, under the caller's
+    /// predicate.
+    async fn quiescence_probe_with(
+        &self,
+        debounce: std::time::Duration,
+        looks_idle: fn(&[String], u16) -> bool,
+    ) -> Option<IdleQuiescence> {
         let (lines_a, cursor_a) = self.grid_text();
-        if !snapshot_looks_idle(&lines_a, cursor_a) {
+        if !looks_idle(&lines_a, cursor_a) {
             return None;
         }
         tokio::time::sleep(debounce).await;
         let (lines_b, cursor_b) = self.grid_text();
         Some(IdleQuiescence {
-            idle: snapshot_looks_idle(&lines_b, cursor_b)
-                && lines_a == lines_b
-                && cursor_a == cursor_b,
+            idle: looks_idle(&lines_b, cursor_b) && lines_a == lines_b && cursor_a == cursor_b,
             lines: lines_b,
         })
     }
@@ -6225,6 +6252,35 @@ pub(crate) mod tests {
         );
         assert_eq!(pane.io.kills(), 0);
         assert!(pane.typed.lock().unwrap().is_empty());
+    }
+
+    /// A finished turn's static line vetoes every shared read of the pane, which
+    /// wind-down and the close primitive build on. Only the prepare's own read
+    /// tolerates it (plan `2026-10-28-one-session-lifecycle-authority`: the
+    /// predicate is never loosened).
+    #[tokio::test(start_paused = true)]
+    async fn only_the_prepares_read_of_a_pane_tolerates_a_finished_turn_line() {
+        use qontinui_runner_lib::wind_down::GridIdle;
+
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        {
+            let grid = session.grid();
+            let mut g = grid.lock().unwrap();
+            let mut parser = vte::Parser::new();
+            g.feed(
+                &mut parser,
+                "\u{273b} Cogitated for 9m 42s \u{b7} done 6:36 AM\r\n\u{276f} ".as_bytes(),
+            );
+        }
+        let debounce = Duration::from_millis(10);
+        assert!(
+            session
+                .looks_idle_quiescent_tolerating_finished_turn(debounce)
+                .await
+        );
+        assert!(!session.looks_idle_quiescent(debounce).await);
+        assert!(session.idle_quiescence_probe(debounce).await.is_none());
+        assert_eq!(session.observe_grid_idle(), GridIdle::Busy);
     }
 
     #[test]

@@ -462,7 +462,10 @@ pub fn note_restore_on(
 /// each attempt and clears it only on a landed restore, so a row whose
 /// restore failed, was refused or waited on a busy box would otherwise keep
 /// it — and a marked record is never orphan-closed by the lifecycle poll,
-/// long after the cohort that explained it is gone.
+/// long after the cohort that explained it is gone. It also releases each such
+/// row from the boot census ([`crate::session::restore_census::release`]),
+/// which would otherwise keep it `open`, offer it to the next page's restore,
+/// and auto-resume it at the next boot.
 pub fn dismiss_on(
     ctl: &RestartPrep,
     prepare_id: &str,
@@ -487,6 +490,7 @@ pub fn dismiss_on(
     };
     for row in rec.cohort.rows.iter().filter(|row| !restored(row)) {
         clear_pending(&row.session.claude_session_id);
+        crate::session::restore_census::release(&row.session.claude_session_id);
     }
     Ok(rec)
 }
@@ -1313,6 +1317,37 @@ mod tests {
         rec.cohort.rows[1].restore = Some(r("skipped(live_terminal)"));
         let waiting = RestoringCohort::of(&rec).unwrap();
         assert!(!waiting.contains("a") && waiting.contains("b"));
+    }
+
+    /// The dismiss releases a row still waiting from the boot census, so neither
+    /// hold keeps it, and never one that came back. Ids unique to this test: the
+    /// released set is process-global.
+    #[test]
+    fn a_dismiss_releases_only_the_rows_not_back() {
+        const BACK: &str = "dismiss-release-back";
+        const WAITING: &str = "dismiss-release-waiting";
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = active_controller_for_test(dir.path(), &[BACK, WAITING], 1_000);
+        let prepare_id = ctl.record().unwrap().prepare_id;
+        ctl.update(&prepare_id, |r| r.state = PrepState::Restoring)
+            .unwrap();
+        note_restore_on(
+            &ctl,
+            &prepare_id,
+            BACK,
+            RowRestore {
+                at_ms: 2_000,
+                at: String::new(),
+                verdict: "resumed".to_string(),
+                effort_applied: None,
+                effort: None,
+            },
+        )
+        .unwrap();
+        dismiss_on(&ctl, &prepare_id, &|_| {}).unwrap();
+        let released = crate::session::restore_census::released_ids();
+        assert!(released.contains(WAITING));
+        assert!(!released.contains(BACK));
     }
 
     #[test]

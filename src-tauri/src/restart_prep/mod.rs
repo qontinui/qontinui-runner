@@ -32,9 +32,8 @@
 //!
 //! ## Phase 4: the notice loop and the verdict
 //!
-//! [`notice`] tells each live session to save its work and pause — through the
-//! session message poller's idle arm, or its busy-prompt arm for a session
-//! still mid-turn (D2) — reads every row's state from the restart census each
+//! [`notice`] tells each live session to save its work and pause, at its next
+//! idle prompt (D2), reads every row's state from the restart census each
 //! tick, and computes `ready_to_restart`, served in the record here and as the
 //! `restart_prep` block of `GET /restart-readiness`.
 //!

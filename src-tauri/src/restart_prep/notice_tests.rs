@@ -17,7 +17,7 @@ use crate::restart_prep::{persist_to, HoldStatus, PrepState, PrepareRecord, RECO
 use crate::session::claude_activity::Activity;
 use crate::session::session_ledger::LedgerEntry;
 use crate::terminal::graceful_exit::probe_fixtures::{
-    screen as probe_screen, BUSY_QUEUED, BUSY_STREAMING, BUSY_TOOL_CALL,
+    screen as probe_screen, BUSY_STREAMING, BUSY_TOOL_CALL,
 };
 use crate::terminal::graceful_exit::ScreenText;
 
@@ -44,6 +44,9 @@ struct FakePane {
 #[async_trait]
 impl InputPane for FakePane {
     async fn looks_idle_quiescent(&self) -> bool {
+        self.cfg.quiescent
+    }
+    async fn looks_idle_quiescent_tolerating_finished_turn(&self) -> bool {
         self.cfg.quiescent
     }
     async fn claude_live(&self) -> Result<(), GateMiss> {
@@ -314,7 +317,7 @@ async fn restart_prep_an_idle_session_is_notified_once() {
 }
 
 #[tokio::test]
-async fn restart_prep_a_working_session_is_told_through_the_busy_arm() {
+async fn restart_prep_a_working_session_is_not_typed_into_until_its_turn_ends() {
     for raw in [BUSY_TOOL_CALL, BUSY_STREAMING] {
         let dir = tempfile::tempdir().unwrap();
         let (ctl, _) = controller(&dir, &record(vec![row("w")], HoldStatus::Confirmed));
@@ -327,26 +330,159 @@ async fn restart_prep_a_working_session_is_told_through_the_busy_arm() {
             matches!(
                 out,
                 TickOutcome::Ran {
-                    delivered: 1,
+                    delivered: 0,
                     ready_to_restart: false,
                     ..
                 }
             ),
             "{out:?}"
         );
+        assert!(terms.sent("term-w").is_empty(), "nothing typed mid-turn");
         let rec = ctl.record().unwrap();
-        assert_eq!(row_of(&rec, "w").notice_arm.as_deref(), Some("busy_prompt"));
-        assert_eq!(terms.sent("term-w").len(), 1);
+        assert_eq!(row_of(&rec, "w").notified_at, None);
+        assert_eq!(row_of(&rec, "w").pause_state, Some(PauseState::Working));
 
-        // Claude Code queued it: the input row now reads `Press up to edit
-        // queued messages`. Nothing more is typed.
-        terms.set("term-w", busy_pane(BUSY_QUEUED));
+        // The turn ends: the next tick tells it, once.
+        terms.set("term-w", idle_pane());
         ctl.notice_tick(&terms, recapture(&["w"], T0 + 2), &ev, T0 + 2)
             .await;
         assert_eq!(terms.sent("term-w").len(), 1);
         let rec = ctl.record().unwrap();
+        assert_eq!(row_of(&rec, "w").notice_arm.as_deref(), Some("idle"));
         assert_eq!(row_of(&rec, "w").pause_state, Some(PauseState::Notified));
     }
+}
+
+/// A finished turn leaves its static line painted, which the strict grid reads
+/// as busy for ever. The notice may still be typed under it.
+#[tokio::test]
+async fn restart_prep_a_finished_turn_line_does_not_keep_a_session_from_being_told() {
+    let finished = PaneCfg {
+        quiescent: true,
+        live: true,
+        screen: screen(
+            &[
+                "✻ Cogitated for 9m 42s · done 6:36 AM",
+                "────",
+                "❯\u{a0}",
+                "────",
+            ],
+            2,
+            2,
+        ),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (ctl, _) = controller(&dir, &record(vec![row("f")], HoldStatus::Confirmed));
+    let terms = FakeTerminals::with(vec![("term-f", finished)]);
+    let ev = census(vec![("f", proc(Activity::Idle, Some(true)))]);
+    ctl.notice_tick(&terms, recapture(&["f"], T0 + 1), &ev, T0 + 1)
+        .await;
+    assert_eq!(terms.sent("term-f").len(), 1);
+    assert_eq!(
+        row_of(&ctl.record().unwrap(), "f").pause_state,
+        Some(PauseState::Notified),
+        "the delivering tick stamps it told"
+    );
+    ctl.notice_tick(&terms, recapture(&["f"], T0 + 2), &ev, T0 + 2)
+        .await;
+    assert_eq!(terms.sent("term-f").len(), 1, "told once");
+    assert_eq!(
+        row_of(&ctl.record().unwrap(), "f").pause_state,
+        Some(PauseState::Paused)
+    );
+}
+
+/// Both doors that read a prepare's activity regrade BEFORE the evidence is
+/// gathered: a pane that already decided gets no record read at all, so a
+/// regrade after the gather would leave the pane `unknown`, never `idle`.
+#[test]
+fn restart_prep_both_doors_regrade_before_gathering_the_evidence() {
+    for (door, source, gather) in [
+        (
+            "the notice loop",
+            include_str!("notice.rs"),
+            "&fresh.observed,",
+        ),
+        (
+            "GET /restart-readiness",
+            include_str!("../mcp/restart_readiness.rs"),
+            "                &observed,\n",
+        ),
+    ] {
+        let regrade = source
+            .find("defer_finished_turn_panes_in(app,")
+            .unwrap_or_else(|| panic!("{door} regrades"));
+        let gathered = source
+            .find(gather)
+            .unwrap_or_else(|| panic!("{door} gathers"));
+        assert!(regrade < gathered, "{door}: regrade first");
+    }
+}
+
+/// Only a pane whose sole veto is the finished-turn line defers to the record.
+#[test]
+fn restart_prep_only_a_finished_turn_line_defers_a_busy_pane_to_the_record() {
+    use crate::session::wind_down_observer::TerminalObservation;
+    use qontinui_runner_lib::wind_down::{GridIdle, Sideband};
+    let obs = |grid| TerminalObservation {
+        sideband: Sideband::NeverReported,
+        grid,
+    };
+    let mut panes: HashMap<String, TerminalObservation> = [
+        ("finished", obs(GridIdle::Busy)),
+        ("spinner", obs(GridIdle::Busy)),
+        ("streaming", obs(GridIdle::Busy)),
+        ("moved", obs(GridIdle::Busy)),
+        ("no-terminal", obs(GridIdle::Busy)),
+        ("idle", obs(GridIdle::Idle { since_ms: 7 })),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+    finished_turn_panes_defer_to_the_record(&mut panes, |terminal_id| match terminal_id {
+        "finished" => Some(screen(
+            &[
+                "✻ Cogitated for 9m 42s · done 6:36 AM",
+                "────",
+                "❯\u{a0}",
+                "────",
+            ],
+            2,
+            2,
+        )),
+        "spinner" => Some(screen(
+            &[
+                "✻ Cogitated for 9m 42s · done 6:36 AM",
+                "✶ Pondering… (3s)",
+                "❯\u{a0}",
+                "────",
+            ],
+            2,
+            2,
+        )),
+        "streaming" => Some(probe_screen(BUSY_STREAMING)),
+        // Reads idle, but no finished-turn line explains the Busy: a pane whose
+        // grid moved between reads. It keeps what the observer saw.
+        "moved" => Some(screen(&["● done.", "────", "❯\u{a0}", "────"], 2, 2)),
+        // The idle pane's screen is not even consulted.
+        "idle" => panic!("only a busy pane is re-read"),
+        _ => None,
+    });
+    assert_eq!(panes["finished"].grid, GridIdle::Unknown);
+    assert_eq!(panes["spinner"].grid, GridIdle::Busy);
+    assert_eq!(panes["streaming"].grid, GridIdle::Busy);
+    assert_eq!(panes["moved"].grid, GridIdle::Busy);
+    assert_eq!(panes["no-terminal"].grid, GridIdle::Busy);
+    assert_eq!(panes["idle"].grid, GridIdle::Idle { since_ms: 7 });
+    // The finished pane now decides nothing: the record answers, either way.
+    assert_eq!(
+        claude_activity::classify_from_pane(&panes["finished"], Some(false), 0),
+        None
+    );
+    assert_eq!(
+        claude_activity::classify_from_pane(&panes["spinner"], Some(false), 0),
+        Some(Activity::Working)
+    );
 }
 
 #[tokio::test]
@@ -417,7 +553,7 @@ async fn restart_prep_a_dialog_or_a_draft_gets_nothing_and_is_retried() {
 
     // The dialog closes and the operator sends the draft: both panes admit a
     // paste now, and the next tick delivers.
-    terms.set("term-d", busy_pane(BUSY_TOOL_CALL));
+    terms.set("term-d", idle_pane());
     terms.set("term-h", idle_pane());
     let out = ctl
         .notice_tick(&terms, recapture(&["d", "h"], T0 + 2), &ev, T0 + 2)
@@ -1088,6 +1224,7 @@ fn restart_prep_the_census_join_reads_each_rows_own_process() {
     use crate::session::tracking_health::{LiveClaudeProcess, TrackingHealthReport};
     let process = |pid: u32, sid: Option<&str>, children: Option<bool>, status: Option<&str>| {
         LiveClaudeProcess {
+            session_status_since: None,
             pid,
             parent_pid: None,
             image: Some("claude".to_string()),
@@ -1302,7 +1439,7 @@ fn restart_prep_the_notice_is_one_fixed_paragraph() {
 }
 
 #[tokio::test]
-async fn restart_prep_admit_prefers_the_idle_arm_and_falls_to_the_busy_one_only_when_not_idle() {
+async fn restart_prep_admit_takes_only_an_idle_prompt() {
     let submitted = Arc::new(Mutex::new(Vec::new()));
     let idle = FakePane {
         cfg: idle_pane(),
@@ -1313,9 +1450,8 @@ async fn restart_prep_admit_prefers_the_idle_arm_and_falls_to_the_busy_one_only_
         cfg: busy_pane(BUSY_TOOL_CALL),
         submitted: submitted.clone(),
     };
-    assert_eq!(admit(&busy).await, Ok(InputArm::BusyPrompt));
-    // An idle prompt holding a draft is refused by the idle arm, and the
-    // busy arm is NOT tried.
+    assert_eq!(admit(&busy).await, Err(GateMiss::NotIdle));
+    // An idle prompt holding a draft is refused.
     let mut draft = idle_pane();
     draft.screen.lines[2] = "❯\u{a0}draft".to_string();
     draft.screen.cursor_col = 7;
@@ -1475,6 +1611,9 @@ struct HalfWritten;
 impl InputPane for HalfWritten {
     async fn looks_idle_quiescent(&self) -> bool {
         true
+    }
+    async fn looks_idle_quiescent_tolerating_finished_turn(&self) -> bool {
+        self.looks_idle_quiescent().await
     }
     async fn claude_live(&self) -> Result<(), GateMiss> {
         Ok(())
@@ -1655,6 +1794,9 @@ struct GatedPane {
 impl InputPane for GatedPane {
     async fn looks_idle_quiescent(&self) -> bool {
         self.cfg.quiescent
+    }
+    async fn looks_idle_quiescent_tolerating_finished_turn(&self) -> bool {
+        self.looks_idle_quiescent().await
     }
     async fn claude_live(&self) -> Result<(), GateMiss> {
         Ok(())

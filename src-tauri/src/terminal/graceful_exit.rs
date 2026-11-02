@@ -65,7 +65,8 @@ use serde::Serialize;
 
 use crate::process_capture::process_tree::{claude_pids_in_inclusive_subtree, ProcessSnapshot};
 use qontinui_runner_lib::looping_agent::idle::{
-    snapshot_looks_idle, DIALOG_CHROME_MARKERS, DIALOG_SCAN_ROWS,
+    snapshot_looks_idle, snapshot_looks_idle_tolerating_finished_turn, DIALOG_CHROME_MARKERS,
+    DIALOG_SCAN_ROWS,
 };
 
 /// The command typed at the prompt. Submitted separately ([`SUBMIT`]) once it
@@ -196,7 +197,7 @@ fn is_box_edge(line: &str) -> bool {
 /// phrases. That errs toward refusing, which is right for `/exit`: a refusal
 /// only postpones a wind-down.
 pub fn exit_prompt_ready(screen: &ScreenText) -> Result<(), String> {
-    prompt_ready_with(screen, DIALOG_MARKERS, true)
+    prompt_ready_with(screen, DIALOG_MARKERS, snapshot_looks_idle)
 }
 
 /// May a message be PASTED into the input box now? The same checks as
@@ -213,35 +214,25 @@ pub fn exit_prompt_ready(screen: &ScreenText) -> Result<(), String> {
 /// selected choice sits on the cursor row as a numbered option, and it prints
 /// the chrome hints.
 pub fn input_prompt_ready(screen: &ScreenText) -> Result<(), String> {
-    prompt_ready_with(screen, DIALOG_CHROME_MARKERS, true)
+    prompt_ready_with(screen, DIALOG_CHROME_MARKERS, snapshot_looks_idle)
 }
 
-/// May a message be typed into the input box of a BUSY turn? (plan
+/// May a restart prepare's one notice be pasted now? (plan
 /// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D2.)
 ///
-/// [`input_prompt_ready`] minus the turn-complete predicate, plus the busy
-/// marker ([`crate::terminal::account_migration::BUSY_MARKER`]): Claude is
-/// mid-turn, AND its input box is the thing under the cursor, empty, with no
-/// numbered choice selected and no dialog chrome showing. Every screen check
-/// [`input_prompt_ready`] makes except "the screen looks idle" is kept, so a
-/// permission dialog that opens during a turn is refused here exactly as it
-/// is there.
+/// [`input_prompt_ready`], except that a finished turn's static line
+/// (`✻ Cogitated for 9m 42s · done 6:36 AM`) does not read as a spinner. Every
+/// other check stands: a dialog, a selected choice, a draft or a live spinner
+/// is refused here exactly as it is there. A busy turn is refused too.
 ///
-/// Requiring the busy marker keeps the two arms disjoint: an idle screen is
-/// [`input_prompt_ready`]'s, never this one's, so a caller cannot reach an
-/// idle pane through the arm that skips the idle check.
-///
-/// Whether Claude Code QUEUES text typed into a busy turn's prompt box, and
-/// delivers it at the next input point, is the plan's Phase 1 probe 2 — this
-/// predicate only says the box is safe to type into.
-pub fn busy_prompt_accepts_input(screen: &ScreenText) -> Result<(), String> {
-    if !shows_busy_marker(screen) {
-        return Err(format!(
-            "no busy marker (`{}`) on screen — not a busy turn",
-            super::account_migration::BUSY_MARKER
-        ));
-    }
-    prompt_ready_with(screen, DIALOG_CHROME_MARKERS, false)
+/// Only the prepare's notice may use this. Mailbox deliveries and `/exit` stay
+/// on the strict predicate.
+pub fn notice_prompt_ready(screen: &ScreenText) -> Result<(), String> {
+    prompt_ready_with(
+        screen,
+        DIALOG_CHROME_MARKERS,
+        snapshot_looks_idle_tolerating_finished_turn,
+    )
 }
 
 /// Whether Claude's busy marker
@@ -255,22 +246,17 @@ pub fn shows_busy_marker(screen: &ScreenText) -> bool {
 }
 
 /// The shared screen check behind [`exit_prompt_ready`],
-/// [`input_prompt_ready`] and [`busy_prompt_accepts_input`].
-///
-/// `require_idle` adds the shared turn-complete predicate
-/// ([`snapshot_looks_idle`]). It is `false` ONLY for the busy arm, which
-/// checks the opposite (the busy marker) itself; every other check — the
-/// cursor-row `❯`, an empty input line, no numbered choice, no dialog text —
-/// applies to both.
+/// [`input_prompt_ready`] and [`notice_prompt_ready`]. `looks_idle` is the
+/// caller's turn-complete predicate; every other check applies to all three.
 fn prompt_ready_with(
     screen: &ScreenText,
     dialog_markers: &[&str],
-    require_idle: bool,
+    looks_idle: fn(&[String], u16) -> bool,
 ) -> Result<(), String> {
     let Some(line) = prompt_line(screen) else {
         return Err("no `❯` input prompt on the cursor row".to_string());
     };
-    if require_idle && !snapshot_looks_idle(&screen.lines, screen.cursor_row) {
+    if !looks_idle(&screen.lines, screen.cursor_row) {
         return Err("the screen does not look idle".to_string());
     }
     if is_numbered_option(&line.input) {
@@ -902,17 +888,18 @@ mod tests {
     }
 
     #[test]
-    fn a_busy_screen_passes_the_busy_arm_and_fails_input_prompt_ready() {
+    fn a_busy_screen_fails_every_typing_gate() {
         let s = busy_turn();
-        assert_eq!(busy_prompt_accepts_input(&s), Ok(()));
         let why = input_prompt_ready(&s).unwrap_err();
+        assert!(why.contains("idle"), "refused for the idle check: {why}");
+        let why = notice_prompt_ready(&s).unwrap_err();
         assert!(why.contains("idle"), "refused for the idle check: {why}");
     }
 
     /// The REAL busy shape (Claude Code 2.1.306): the marker on the bottom
     /// status line, not the spinner line, and the cursor on an empty `❯` row.
     #[test]
-    fn the_real_2_1_306_busy_screens_pass_the_busy_arm_and_fail_the_idle_one() {
+    fn the_real_2_1_306_busy_screens_fail_every_typing_gate() {
         use super::probe_fixtures::{screen, BUSY_STREAMING, BUSY_TOOL_CALL};
         for (name, raw) in [("tool call", BUSY_TOOL_CALL), ("streaming", BUSY_STREAMING)] {
             let s = screen(raw);
@@ -940,7 +927,7 @@ mod tests {
                 .expect("a spinner line");
             assert!(!spinner.contains("esc to interrupt"), "{name}: {spinner}");
             assert!(shows_busy_marker(&s), "{name}");
-            assert_eq!(busy_prompt_accepts_input(&s), Ok(()), "{name}");
+            assert!(notice_prompt_ready(&s).is_err(), "{name}: not idle");
             assert!(input_prompt_ready(&s).is_err(), "{name}: not idle");
             assert!(
                 exit_prompt_ready(&s).is_err(),
@@ -949,56 +936,66 @@ mod tests {
         }
     }
 
-    /// After one message is queued the input row reads `Press up to edit
-    /// queued messages`: the busy arm refuses a second paste until the turn
-    /// ends.
+    /// A finished turn leaves its static line painted. The prepare's notice may
+    /// be typed under it; a mailbox delivery and `/exit` keep reading it as a
+    /// spinner, because the shared predicate is never loosened.
     #[test]
-    fn a_queued_message_line_refuses_a_second_busy_paste() {
+    fn only_the_notice_gate_tolerates_a_finished_turn_line() {
+        let finished = screen(
+            vec![
+                "✻ Cogitated for 9m 42s · done 6:36 AM".to_string(),
+                edge(),
+                "❯\u{a0}".to_string(),
+                edge(),
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)".to_string(),
+            ],
+            2,
+            2,
+        );
+        assert_eq!(notice_prompt_ready(&finished), Ok(()));
+        assert!(input_prompt_ready(&finished).is_err());
+        assert!(exit_prompt_ready(&finished).is_err());
+        // An ordinary idle prompt passes both.
+        assert_eq!(notice_prompt_ready(&empty_prompt()), Ok(()));
+        assert_eq!(input_prompt_ready(&empty_prompt()), Ok(()));
+        // Every other check still refuses the notice: a draft...
+        let mut draft = finished.clone();
+        draft.lines[2] = "❯\u{a0}half a thought".to_string();
+        draft.cursor_col = 16;
+        assert!(notice_prompt_ready(&draft).is_err());
+        draft.cursor_col = 2;
+        assert!(notice_prompt_ready(&draft).is_err());
+        // ...dialog chrome...
+        let mut chrome = finished.clone();
+        chrome.lines[1] = "  Enter to confirm · Esc to cancel".to_string();
+        assert!(notice_prompt_ready(&chrome).is_err());
+        // ...a cursor up in the output...
+        let mut up = finished.clone();
+        up.cursor_row = 0;
+        assert!(notice_prompt_ready(&up).is_err());
+        // ...and a live spinner painted for the next turn.
+        let mut next_turn = finished;
+        next_turn.lines[1] = "✶ Pondering… (3s)".to_string();
+        assert!(notice_prompt_ready(&next_turn).is_err());
+    }
+
+    /// After one message is queued the input row reads `Press up to edit
+    /// queued messages`: nothing more may be typed until the turn ends.
+    #[test]
+    fn a_queued_message_line_refuses_a_paste() {
         use super::probe_fixtures::{screen, BUSY_QUEUED};
         let s = screen(BUSY_QUEUED);
         assert!(s.lines[68].contains("Press up to edit queued messages"));
         assert!(shows_busy_marker(&s));
-        let why = busy_prompt_accepts_input(&s).unwrap_err();
-        assert!(
-            why.contains("not the empty-prompt placeholder"),
-            "refused for the queued line: {why}"
-        );
-        // Wherever the cursor sits on that row, it is refused.
-        let mut end = s.clone();
-        end.cursor_col = 34;
-        assert!(busy_prompt_accepts_input(&end).is_err());
+        assert!(notice_prompt_ready(&s).is_err());
         assert!(input_prompt_ready(&s).is_err());
     }
 
     #[test]
-    fn a_busy_screen_with_a_selected_numbered_choice_fails_both_arms() {
+    fn a_busy_screen_with_a_selected_numbered_choice_fails_both_gates() {
         let s = busy_turn_with_a_selected_choice();
-        let busy = busy_prompt_accepts_input(&s).unwrap_err();
-        assert!(busy.contains("numbered choice"), "busy arm: {busy}");
+        assert!(notice_prompt_ready(&s).is_err());
         assert!(input_prompt_ready(&s).is_err());
-    }
-
-    #[test]
-    fn the_busy_arm_keeps_every_screen_check_but_the_idle_one() {
-        // An idle screen is NOT the busy arm's: no busy marker.
-        let idle = busy_prompt_accepts_input(&empty_prompt()).unwrap_err();
-        assert!(idle.contains("busy marker"), "{idle}");
-        // A half-typed prompt during a turn: the operator's draft.
-        let mut draft = busy_turn();
-        draft.lines[3] = "❯\u{a0}half a thought".to_string();
-        draft.cursor_col = 16;
-        assert!(busy_prompt_accepts_input(&draft).is_err());
-        // Cursor parked at the input start over typed text is refused too.
-        draft.cursor_col = 2;
-        assert!(busy_prompt_accepts_input(&draft).is_err());
-        // Dialog chrome above the cursor during a turn.
-        let mut chrome = busy_turn();
-        chrome.lines[1] = "  Enter to confirm · Esc to cancel".to_string();
-        assert!(busy_prompt_accepts_input(&chrome).is_err());
-        // No `❯` on the cursor row: the cursor is up in streaming output.
-        let mut streaming = busy_turn();
-        streaming.cursor_row = 0;
-        assert!(busy_prompt_accepts_input(&streaming).is_err());
     }
 
     #[test]

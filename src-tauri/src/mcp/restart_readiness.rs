@@ -1376,7 +1376,7 @@ pub async fn restart_readiness_handler(
     let wind_down_observer::FreshPass {
         mut pass,
         status_fetch,
-        observed,
+        mut observed,
         unknowns: pass_unknowns,
     } = fresh;
     // `windDown.custody`: the `finished_close` arm's last verdict for each
@@ -1404,6 +1404,13 @@ pub async fn restart_readiness_handler(
     // wind-down verdicts — no second look at any pane. The record half reads
     // Claude Code's `sessions/<pid>.json` only for processes the pane did not
     // decide, off the executor and under `RECORD_READ_TIMEOUT`.
+    //
+    // While a prepare is in its window, a pane whose only veto is a finished turn's
+    // static line is left to that record too, so this door reads a row the same
+    // way the prepare's own notice loop does. Report-only like the rest of this
+    // axis: the verdict never reads it, and the wind-down verdicts above were
+    // judged on the strict grid.
+    crate::restart_prep::notice::defer_finished_turn_panes_in(app, &mut observed);
     let activity_evidence = match pass.as_ref() {
         Some(p) => {
             gather_activity_evidence(

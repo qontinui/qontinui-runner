@@ -4350,8 +4350,8 @@ pub(crate) async fn post_runner_restart_unreported(
     {
         OutcomeAck::Recorded => {
             info!(
-                "agent_runtime: continuation gate_id={gate_id} was lost to a runner restart — \
-                 recorded work_unreported ({detail})"
+                "agent_runtime: prior-generation continuation gate_id={gate_id} closed with no \
+                 outcome — recorded work_unreported ({detail})"
             );
         }
         OutcomeAck::Superseded(standing) if is_session_work_outcome(&standing) => {

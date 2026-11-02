@@ -773,31 +773,16 @@ fn typed_prompt_ready(screen: &crate::terminal::graceful_exit::ScreenText) -> Re
     crate::terminal::graceful_exit::input_prompt_ready(screen).map_err(|_| GateMiss::PromptNotEmpty)
 }
 
-/// Busy-turn arm (plan
-/// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D2): may
-/// text be typed into the input box of a turn that is still running? Delegates
-/// to [`crate::terminal::graceful_exit::busy_prompt_accepts_input`] — the SAME
-/// shared screen check as [`typed_prompt_ready`] minus the turn-complete
-/// predicate, plus the busy marker. A screen with no busy marker is
-/// [`GateMiss::NotBusy`] (it belongs to the idle arm); a busy screen whose box
-/// is not an empty, focused prompt (a dialog, a selected choice, a draft, or
-/// the `Press up to edit queued messages` line a queued message leaves) is
-/// [`GateMiss::PromptNotEmpty`].
-fn busy_prompt_ready(screen: &crate::terminal::graceful_exit::ScreenText) -> Result<(), GateMiss> {
-    if !crate::terminal::graceful_exit::shows_busy_marker(screen) {
-        return Err(GateMiss::NotBusy);
-    }
-    crate::terminal::graceful_exit::busy_prompt_accepts_input(screen)
-        .map_err(|_| GateMiss::PromptNotEmpty)
-}
-
-/// What the two typed-terminal input arms read off one pane. The live reads
+/// What the typed-terminal input arms read off one pane. The live reads
 /// are [`LivePane`] over a `TerminalSession`; tests stand in their own, so
 /// the arms are exercised against real screen shapes without a PTY.
 #[async_trait::async_trait]
 pub(crate) trait InputPane: Send + Sync {
     /// `TerminalSession::looks_idle_quiescent` under the poller's debounce.
     async fn looks_idle_quiescent(&self) -> bool;
+    /// [`Self::looks_idle_quiescent`] under a finished turn's static line, for
+    /// [`notice_idle_arm`] alone.
+    async fn looks_idle_quiescent_tolerating_finished_turn(&self) -> bool;
     /// [`claude_live`] over a fresh process probe of the pane.
     async fn claude_live(&self) -> Result<(), GateMiss>;
     /// The pane's rendered grid, read NOW.
@@ -811,6 +796,12 @@ pub(crate) struct LivePane(pub Arc<crate::terminal::session::TerminalSession>);
 impl InputPane for LivePane {
     async fn looks_idle_quiescent(&self) -> bool {
         self.0.looks_idle_quiescent(IDLE_QUIESCENCE_DEBOUNCE).await
+    }
+
+    async fn looks_idle_quiescent_tolerating_finished_turn(&self) -> bool {
+        self.0
+            .looks_idle_quiescent_tolerating_finished_turn(IDLE_QUIESCENCE_DEBOUNCE)
+            .await
     }
 
     async fn claude_live(&self) -> Result<(), GateMiss> {
@@ -842,15 +833,18 @@ pub(crate) async fn idle_arm(pane: &dyn InputPane) -> Result<(), GateMiss> {
     typed_prompt_ready(&pane.screen())
 }
 
-/// The `prompt_accepts_input` arm (D2): a live foreground `claude` owns the
-/// pane and its BUSY turn's input box accepts typed text ([`busy_prompt_ready`],
-/// read fresh after the probe). Claude Code queues what is typed there and
-/// delivers it at the next input point (the plan's Phase 1 probe 2). No
-/// quiescence: a busy pane is never quiescent. The session message poller
-/// itself never uses this arm — its messages wait for idle by design.
-pub(crate) async fn prompt_accepts_input_arm(pane: &dyn InputPane) -> Result<(), GateMiss> {
+/// [`idle_arm`] for a restart prepare's notice (plan
+/// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D2): the
+/// same order and every check, except that a finished turn's static line does
+/// not read as a spinner. A busy turn is not admitted: the notice waits for its
+/// next idle prompt. The session message poller itself never uses this arm.
+pub(crate) async fn notice_idle_arm(pane: &dyn InputPane) -> Result<(), GateMiss> {
+    if !pane.looks_idle_quiescent_tolerating_finished_turn().await {
+        return Err(GateMiss::NotIdle);
+    }
     pane.claude_live().await?;
-    busy_prompt_ready(&pane.screen())
+    crate::terminal::graceful_exit::notice_prompt_ready(&pane.screen())
+        .map_err(|_| GateMiss::PromptNotEmpty)
 }
 
 /// Typed-terminal arm: is a `claude` process live in this pane AND reading its
@@ -957,10 +951,6 @@ pub(crate) enum GateMiss {
     /// the process table was unreadable) — the pane may be a bare shell.
     /// Counted as `target_not_live`.
     ClaudeNotLive,
-    /// Busy-turn arm only ([`prompt_accepts_input_arm`]): no busy marker on
-    /// screen, so the pane is not mid-turn — it belongs to the idle arm. The
-    /// poller never takes this arm; counted as `pty_never_idle` if it ever did.
-    NotBusy,
 }
 
 impl GateMiss {
@@ -976,7 +966,6 @@ impl GateMiss {
             GateMiss::ClaudeNotLive => {
                 "no live foreground claude process in the pane (bare shell, or claude suspended)"
             }
-            GateMiss::NotBusy => "no busy marker on screen — the pane is not mid-turn",
         }
     }
 }
@@ -1441,9 +1430,7 @@ async fn report_gate_miss(
             return;
         }
         GateMiss::Gone | GateMiss::ClaudeNotLive => BlockReason::TargetNotLive,
-        GateMiss::NotIdle | GateMiss::PromptNotEmpty | GateMiss::NotBusy => {
-            BlockReason::PtyNeverIdle
-        }
+        GateMiss::NotIdle | GateMiss::PromptNotEmpty => BlockReason::PtyNeverIdle,
     };
     debug!(
         "session_message_poller: terminal {terminal_id}: {} — msg {} stays pending",
@@ -2891,7 +2878,6 @@ mod tests {
             GateMiss::PromptNotEmpty.detail(),
             GateMiss::NotIdle.detail()
         );
-        assert_ne!(GateMiss::NotBusy.detail(), GateMiss::NotIdle.detail());
     }
 
     // -----------------------------------------------------------------------
@@ -2926,6 +2912,9 @@ mod tests {
     #[async_trait::async_trait]
     impl InputPane for StillPane {
         async fn looks_idle_quiescent(&self) -> bool {
+            self.quiescent
+        }
+        async fn looks_idle_quiescent_tolerating_finished_turn(&self) -> bool {
             self.quiescent
         }
         async fn claude_live(&self) -> Result<(), GateMiss> {
@@ -2983,38 +2972,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_prompt_accepts_input_arm_takes_a_real_busy_screen_and_nothing_else() {
+    async fn the_notice_arm_takes_a_finished_turn_line_and_no_busy_screen() {
         use crate::terminal::graceful_exit::probe_fixtures::{
             screen as probe_screen, BUSY_QUEUED, BUSY_STREAMING, BUSY_TOOL_CALL,
         };
-        for raw in [BUSY_TOOL_CALL, BUSY_STREAMING] {
-            assert_eq!(
-                prompt_accepts_input_arm(&StillPane::new(false, true, probe_screen(raw))).await,
-                Ok(())
-            );
-            assert_eq!(
-                prompt_accepts_input_arm(&StillPane::new(false, false, probe_screen(raw))).await,
-                Err(GateMiss::ClaudeNotLive),
-                "a busy-looking pane with no live claude is a shell's"
-            );
-        }
-        assert_eq!(
-            prompt_accepts_input_arm(&StillPane::new(false, true, probe_screen(BUSY_QUEUED))).await,
-            Err(GateMiss::PromptNotEmpty),
-            "a queued message refuses the second paste"
+        let finished = screen(
+            &[
+                "✻ Cogitated for 9m 42s · done 6:36 AM",
+                "────",
+                "❯\u{a0}",
+                "────",
+            ],
+            2,
+            2,
         );
         assert_eq!(
-            prompt_accepts_input_arm(&StillPane::new(false, true, idle_prompt())).await,
-            Err(GateMiss::NotBusy),
-            "an idle screen is the idle arm's, never this one's"
+            notice_idle_arm(&StillPane::new(true, true, finished.clone())).await,
+            Ok(())
         );
-        // A permission dialog opened mid-turn.
-        let mut dialog = probe_screen(BUSY_TOOL_CALL);
-        dialog.lines[68] = " ❯ 1. Yes".to_string();
-        dialog.cursor_col = 3;
+        // The poller's own arm is untouched: it refuses that screen.
         assert_eq!(
-            prompt_accepts_input_arm(&StillPane::new(false, true, dialog)).await,
+            idle_arm(&StillPane::new(true, true, finished.clone())).await,
             Err(GateMiss::PromptNotEmpty)
         );
+        // No live `claude`, or an unsettled pane: nothing.
+        assert_eq!(
+            notice_idle_arm(&StillPane::new(true, false, finished.clone())).await,
+            Err(GateMiss::ClaudeNotLive)
+        );
+        assert_eq!(
+            notice_idle_arm(&StillPane::new(false, true, finished)).await,
+            Err(GateMiss::NotIdle)
+        );
+        // A busy screen is never admitted, even if quiescence lied.
+        for raw in [BUSY_TOOL_CALL, BUSY_STREAMING, BUSY_QUEUED] {
+            assert_eq!(
+                notice_idle_arm(&StillPane::new(true, true, probe_screen(raw))).await,
+                Err(GateMiss::PromptNotEmpty)
+            );
+            assert_eq!(
+                notice_idle_arm(&StillPane::new(false, true, probe_screen(raw))).await,
+                Err(GateMiss::NotIdle)
+            );
+        }
     }
 }

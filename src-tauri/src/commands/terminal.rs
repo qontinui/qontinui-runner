@@ -1839,8 +1839,9 @@ pub fn terminal_session_list_open(
 ) -> Result<CommandResponse, String> {
     // Only a caller that DRAWS restart-cohort placeholders opts in (plan
     // `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
-    // Phase 7). Every other caller gets the restore set exactly as before, so a
-    // cohort row is never withheld from a webview that would not show it.
+    // Phase 7). Every other caller gets no placeholders, so a cohort row still
+    // waiting is never withheld from a webview that would not show it. A row
+    // the operator dismissed is withheld from every caller.
     let placeholders = placeholders == Some(true);
     let is_boot_restore = purpose.as_deref() == Some(LIST_OPEN_PURPOSE_RESTORE);
     // Coord's device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
@@ -1933,6 +1934,15 @@ fn live_restore_set_body(
     rows: Vec<RestoreCandidate>,
     placeholders: bool,
 ) -> serde_json::Value {
+    // A row dismissed from a restart cohort stays in Past Sessions, resumable by
+    // hand; no page's restore auto-resumes it. One the operator did resume by
+    // hand is live again and is served like any other.
+    let released = crate::session::restore_census::released_ids();
+    let boot_ms = crate::session::tracking_health::primary_boot_unix_millis_or_init();
+    let rows: Vec<RestoreCandidate> = rows
+        .into_iter()
+        .filter(|r| !withheld_as_released(&r.record, &released, boot_ms))
+        .collect();
     if !placeholders {
         return restore_set_body(rows, None, |_| None, |_| false, |_| None, false);
     }
@@ -1962,6 +1972,18 @@ fn live_restore_set_body(
             .held
             .is_none(),
     )
+}
+
+/// Is `rec` a row released from this boot's restore that nothing has touched
+/// since? A row touched this boot (the operator resumed it by hand) is not the
+/// release's business any more, and the same id's earlier release says nothing
+/// about it.
+fn withheld_as_released(
+    rec: &TerminalSessionRecord,
+    released: &std::collections::HashSet<String>,
+    boot_ms: i64,
+) -> bool {
+    rec.last_seen_at < boot_ms && released.contains(&rec.claude_session_id)
 }
 
 /// `rows` without the ones `withheld` names: the rows of a prepared restart
@@ -3578,12 +3600,37 @@ mod tests {
             .rfind("restore_set_body(\n")
             .expect("the live restore set builds its body");
         assert!(withheld_at < body_call, "withheld before the body is built");
+        // A row dismissed from a cohort is withheld on BOTH arms, ahead of the
+        // early return a `placeholders: false` caller takes.
+        let released_at = body
+            .find("withheld_as_released(&r.record, &released, boot_ms)")
+            .expect("the live restore set withholds a dismissed row");
+        let early_return = body.find("if !placeholders").expect("the early arm");
+        assert!(released_at < early_return, "released rows leave first");
         // `terminal_session_list_open` answers through it on the undeferred arm.
         let (_, list_open) = src
             .split_once("pub fn terminal_session_list_open(")
             .expect("list_open exists");
         let (list_open, _) = list_open.split_once("\n}\n").expect("its body ends");
         assert!(list_open.contains("live_restore_set_body(&store, rows, placeholders)"));
+    }
+
+    /// A dismissed row stays out of the restore set until something touches it
+    /// this boot: a row the operator resumed by hand is served like any other.
+    #[test]
+    fn a_released_row_is_withheld_only_until_it_is_touched_this_boot() {
+        let boot = 1_000;
+        let released: std::collections::HashSet<String> = ["gone".to_string()].into();
+        let row = |id: &str, last_seen_at: i64| TerminalSessionRecord {
+            last_seen_at,
+            ..restore_candidate_record(id)
+        };
+        assert!(withheld_as_released(&row("gone", 999), &released, boot));
+        assert!(
+            !withheld_as_released(&row("gone", 1_000), &released, boot),
+            "touched at the boot line: hand-resumed"
+        );
+        assert!(!withheld_as_released(&row("other", 999), &released, boot));
     }
 
     /// Phase 6 (plan `2026-10-21-operator-prepare-for-restart-and-progressive-restore`):

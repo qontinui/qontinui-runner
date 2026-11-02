@@ -794,7 +794,7 @@ pub const HTTP_CLOSE_REASON: &str = "explicit";
 ///
 /// EVERY open row on the terminal is closed, not just one: the store can hold
 /// more than one open row on a terminal (a phantom sibling no supersede rule
-/// retired), and `find_open_by_terminal` returns an arbitrary one of them. The
+/// retired), and `find_open_by_terminal` returns only the highest-ranked one. The
 /// loop stops at the first id that comes back after its close — a close that
 /// did not take effect — and is bounded by [`MAX_DELIBERATE_CLOSES`].
 fn close_deliberately<T, E>(

@@ -220,8 +220,12 @@ impl BootCensus {
     /// `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
     /// Phase 4; see
     /// [`crate::session::session_lifecycle_store::withheld_boot_restore_candidate`]).
+    ///
+    /// A row the operator dismissed from a restart cohort ([`release`]) no
+    /// longer awaits anything: it stays resumable by hand from Past Sessions.
     pub fn awaits_restore(&self, rec: &TerminalSessionRecord) -> bool {
         rec.finished_at.is_none()
+            && !is_released(&rec.claude_session_id)
             && self
                 .expected
                 .iter()
@@ -230,6 +234,47 @@ impl BootCensus {
 }
 
 static BOOT_CENSUS: OnceLock<BootCensus> = OnceLock::new();
+
+/// Rows released from the boot-census hold, for this process only. Not
+/// persisted, and that is the point: the row closes `no-terminal` under the
+/// ordinary orphan handling in this process, and a row the operator later
+/// resumed by hand is judged afresh by the next boot's census.
+static RELEASED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
+
+/// Stop holding `claude_session_id` for the boot restore in this process: the
+/// operator dismissed the restart cohort it belonged to. Without this the row
+/// stays `open` (so the resume door refuses it `not_closed`), and the next boot
+/// admits it by the carried hold and auto-resumes what the operator dismissed.
+///
+/// The carry is written on the poll's next tick, so a restart within that tick
+/// (at most 45 s after the dismissal) can still admit the row. Accepted: it is
+/// narrow, and the row is resumed rather than lost.
+pub fn release(claude_session_id: &str) {
+    RELEASED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(Default::default)
+        .insert(claude_session_id.to_string());
+}
+
+/// Every row [`release`]d in this process, which the restore set must not offer
+/// either: the poll never touches a row already closed restart-shaped.
+pub fn released_ids() -> std::collections::HashSet<String> {
+    RELEASED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .unwrap_or_default()
+}
+
+fn is_released(claude_session_id: &str) -> bool {
+    RELEASED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|set| set.contains(claude_session_id))
+}
 
 /// A row's terminal id as the census emits it: `None` for a blank id (an
 /// unbound row has no terminal), the id otherwise — the same rule
@@ -540,6 +585,24 @@ mod tests {
     use crate::session::session_lifecycle_store::{
         RESTORE_TIER_RESUMED, RESTORE_TIER_TERMINAL_ONLY,
     };
+
+    /// A dismissed cohort row stops being held by the census, and an untouched
+    /// row of the same census keeps its hold.
+    #[test]
+    fn a_released_row_no_longer_awaits_the_boot_restore() {
+        let census = BootCensus {
+            boot_at_ms: 1_000,
+            expected: vec![
+                expected("census-release-dismissed", true),
+                expected("census-release-kept", true),
+            ],
+        };
+        let rec = crate::session::session_lifecycle_store::test_open_record;
+        assert!(census.awaits_restore(&rec("census-release-dismissed")));
+        release("census-release-dismissed");
+        assert!(!census.awaits_restore(&rec("census-release-dismissed")));
+        assert!(census.awaits_restore(&rec("census-release-kept")));
+    }
 
     fn expected(id: &str, restorable: bool) -> CensusExpected {
         CensusExpected {

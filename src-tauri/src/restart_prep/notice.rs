@@ -6,19 +6,17 @@
 //!
 //! Each tick while a prepare is in its window, every unfinished cohort row
 //! with a live terminal and no `notified_at` is offered ONE fixed notice
-//! ([`notice_text`]) through the session message poller's two typed-terminal
-//! arms ([`admit`]): the idle arm (`session_message_poller::idle_arm`) for a
-//! session at an idle prompt, and — only when the pane is not idle — the
-//! `prompt_accepts_input` arm (`session_message_poller::prompt_accepts_input_arm`)
-//! for a session still mid-turn whose input box is empty and focused. Both
-//! arms share every screen check (cursor-row `❯`, empty input, no numbered
-//! choice, no dialog chrome) and both require a live foreground `claude`, so a
-//! dialog, a selected choice, an operator's draft or a bare shell gets
-//! nothing, and the row is retried next tick. Claude Code 2.1.306 QUEUES text
-//! typed into a busy turn (Phase 1 probe 2), so a working session reads the
-//! notice at its next input point — possibly mid-turn, which is earlier, not
-//! unsafe. A queued message leaves `Press up to edit queued messages` in the
-//! input row, which the busy arm refuses. The re-send guard is the row's own
+//! ([`notice_text`]) through the session message poller's notice arm
+//! (`session_message_poller::notice_idle_arm`, [`admit`]). A session at an idle
+//! prompt is told; one mid-turn is retried, and reads the notice at its next
+//! idle prompt. The arm requires a live foreground `claude` and an empty,
+//! focused prompt (cursor-row `❯`, empty input, no numbered choice, no dialog
+//! chrome), so a dialog, a selected choice, an operator's draft or a bare shell
+//! gets nothing, and the row is retried next tick. The arm tolerates a finished
+//! turn's static line and nothing else in the shared predicate (plan
+//! `2026-10-28-one-session-lifecycle-authority`: the predicate is never
+//! loosened, and an arm that types into a busy turn is split out of this
+//! feature). The re-send guard is the row's own
 //! `notified_at` AND its terminal: a pane already told (under any of the
 //! session ids its lifecycle records carry) is never told again, and a stamp
 //! is kept in memory even when the record write fails, so a second tick never
@@ -63,7 +61,7 @@
 //! ## Cancel
 //!
 //! A cancelled prepare's rows that WERE told get one "restart cancelled —
-//! resume your work" line ([`resume_text`]) through the same arms, once
+//! resume your work" line ([`resume_text`]) through the same arm, once
 //! (`resume_notified_at`), retried for [`RESUME_NOTICE_WINDOW_MS`].
 
 use std::collections::{HashMap, HashSet};
@@ -78,7 +76,7 @@ use tracing::{info, warn};
 use super::cohort::{merge_recapture, Cohort, CohortRow, PauseState, StateAtPrepare};
 use super::prepare::RestartPrep;
 use super::{rfc3339, HoldStatus, PrepState, PrepareRecord};
-use crate::mcp::session_message_poller::{idle_arm, prompt_accepts_input_arm, GateMiss, InputPane};
+use crate::mcp::session_message_poller::{notice_idle_arm, GateMiss, InputPane};
 use crate::session::claude_activity::{self, Activity, RecordReading};
 use crate::session::tracking_health::{SessionWorkStatus, TrackingHealthReport};
 
@@ -124,20 +122,17 @@ pub fn resume_text(prepare_id: &str) -> String {
 // Delivery
 // ---------------------------------------------------------------------------
 
-/// Which of the two typed-terminal input arms admitted a paste.
+/// Which typed-terminal input arm admitted a paste.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputArm {
-    /// The idle prompt (`session_message_poller::idle_arm`).
+    /// The idle prompt (`session_message_poller::notice_idle_arm`).
     Idle,
-    /// A busy turn's empty input box (`prompt_accepts_input_arm`).
-    BusyPrompt,
 }
 
 impl InputArm {
     pub fn label(self) -> &'static str {
         match self {
             Self::Idle => "idle",
-            Self::BusyPrompt => "busy_prompt",
         }
     }
 }
@@ -145,7 +140,7 @@ impl InputArm {
 /// One pane the notice can be typed into.
 #[async_trait]
 pub trait NoticePane: Send + Sync {
-    /// What the two arms read.
+    /// What the notice arm reads.
     fn input(&self) -> &dyn InputPane;
     /// Submit `text` as one prompt (`TerminalSession::submit_prompt`).
     async fn submit(&self, text: &str) -> Result<(), String>;
@@ -157,17 +152,10 @@ pub trait NoticeTerminals: Send + Sync {
     fn pane(&self, terminal_id: &str) -> Option<Box<dyn NoticePane>>;
 }
 
-/// Try the idle arm; only when the pane is NOT idle, the busy-prompt arm. Any
-/// other refusal (a draft or dialog at an idle prompt, no live `claude`) is
-/// final for this tick.
+/// May the notice be typed now? A pane that is not at an idle prompt is
+/// retried next tick.
 pub async fn admit(pane: &dyn InputPane) -> Result<InputArm, GateMiss> {
-    match idle_arm(pane).await {
-        Ok(()) => Ok(InputArm::Idle),
-        Err(GateMiss::NotIdle) => prompt_accepts_input_arm(pane)
-            .await
-            .map(|()| InputArm::BusyPrompt),
-        Err(miss) => Err(miss),
-    }
+    notice_idle_arm(pane).await.map(|()| InputArm::Idle)
 }
 
 /// [`admit`], then submit. `Err` names why nothing was delivered.
@@ -180,8 +168,8 @@ pub async fn deliver(pane: &dyn NoticePane, text: &str) -> Result<InputArm, Stri
 }
 
 /// Why the notice loop does not try `row` at all: a session that is not Claude
-/// Code. A row whose provider and model are unread is tried — the arms
-/// themselves require a live `claude` in the pane.
+/// Code. A row whose provider and model are unread is tried — the arm itself
+/// requires a live `claude` in the pane.
 fn not_claude(row: &CohortRow) -> Option<String> {
     if let Some(p) = row.provider.as_deref() {
         if !p.eq_ignore_ascii_case(crate::session::session_lifecycle_store::DEFAULT_PROVIDER) {
@@ -562,7 +550,8 @@ pub fn row_state(row: &CohortRow, ev: &CensusEvidence) -> (PauseState, Option<bo
 /// The told-but-busy diagnostic: for a row that was told to pause and still
 /// does not read idle (`notified`), one line naming what the classification
 /// read — the activity, what it was classified from, and which
-/// `snapshot_looks_idle` check vetoes the pane's grid right now (`grid_veto`,
+/// `snapshot_looks_idle_tolerating_finished_turn` check vetoes the pane's grid
+/// right now (`grid_veto`,
 /// from `looping_agent::idle::idle_veto`; `None` = the grid itself reads idle,
 /// so the veto is elsewhere). `None` for any other row.
 ///
@@ -1031,7 +1020,7 @@ impl RestartPrep {
     }
 
     /// A cancelled prepare's resume pass: every row that was told to pause and
-    /// has not had the resume line gets it once, through the same arms.
+    /// has not had the resume line gets it once, through the same arm.
     pub async fn resume_tick(&self, terminals: &dyn NoticeTerminals, now_ms: i64) -> TickOutcome {
         let _op = self.ops.lock().await;
         let Some(rec) = self.record() else {
@@ -1236,14 +1225,70 @@ impl NoticeTerminals for LiveTerminals {
     }
 }
 
+/// A pane whose grid reads busy because a finished turn's static line is still
+/// painted, with nothing else on screen to veto idle, decides nothing: its grid
+/// becomes `Unknown`, so the activity classification falls through to Claude
+/// Code's own record for that process (`claude_activity::classify_from_pane`). A prepare's activity read only: the
+/// wind-down observer's own reading, and every close it can lead to, keep the
+/// strict grid. `screen_of` is `None` for a pane with no live terminal, and
+/// such a pane keeps what the observer saw.
+pub fn finished_turn_panes_defer_to_the_record(
+    by_terminal: &mut HashMap<String, crate::session::wind_down_observer::TerminalObservation>,
+    screen_of: impl Fn(&str) -> Option<crate::terminal::graceful_exit::ScreenText>,
+) {
+    for (terminal_id, observation) in by_terminal.iter_mut() {
+        if observation.grid != qontinui_runner_lib::wind_down::GridIdle::Busy {
+            continue;
+        }
+        let Some(screen) = screen_of(terminal_id) else {
+            continue;
+        };
+        use qontinui_runner_lib::looping_agent::idle::{
+            is_completed_turn_line, snapshot_looks_idle_tolerating_finished_turn,
+        };
+        if screen.lines.iter().any(|l| is_completed_turn_line(l))
+            && snapshot_looks_idle_tolerating_finished_turn(&screen.lines, screen.cursor_row)
+        {
+            observation.grid = qontinui_runner_lib::wind_down::GridIdle::Unknown;
+        }
+    }
+}
+
+/// [`finished_turn_panes_defer_to_the_record`] on the live terminals, while a
+/// prepare is in its window: the only state that reads activity for its rows, so
+/// a box's history never changes what a pane reads afterwards. Called by both
+/// doors that read a prepare's activity, before they gather the evidence: a
+/// process whose pane already decided gets no record read at all
+/// (`pids_needing_a_record`).
+pub fn defer_finished_turn_panes_in(
+    app: &tauri::AppHandle,
+    observed: &mut crate::session::wind_down_observer::ObservedInputs,
+) {
+    use tauri::Manager;
+    let in_window = super::prepare::install_live()
+        .and_then(|ctl| ctl.record())
+        .is_some_and(|rec| rec.in_window());
+    if !in_window {
+        return;
+    }
+    let Some(tm) = app.try_state::<Arc<crate::terminal::TerminalManager>>() else {
+        return;
+    };
+    finished_turn_panes_defer_to_the_record(&mut observed.by_terminal, |terminal_id| {
+        tm.get(terminal_id)
+            .map(|term| crate::mcp::session_message_poller::LivePane(term).screen())
+    });
+}
+
 /// The census and its per-row join, from a fresh pass.
 async fn gather_census(app: &tauri::AppHandle, rec: &PrepareRecord) -> CensusEvidence {
     use crate::mcp::restart_readiness::{gather_activity_evidence, ActivityEvidence};
-    let fresh = crate::session::wind_down_observer::fresh_pass(
+    let mut fresh = crate::session::wind_down_observer::fresh_pass(
         app,
         qontinui_runner_lib::wind_down::grace_from_env(),
     )
     .await;
+    defer_finished_turn_panes_in(app, &mut fresh.observed);
     let activity = match fresh.pass.as_ref() {
         Some(p) => {
             gather_activity_evidence(

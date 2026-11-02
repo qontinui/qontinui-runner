@@ -1775,7 +1775,7 @@ pub async fn cancel_from_app() -> Result<PrepChanged, String> {
     let ctl = install_live().ok_or("restart prepare is not available in this build")?;
     let rec = ctl.cancel(&LiveDoor, now_ms()).await?;
     // The sessions that were told to pause get one "resume your work" line
-    // now, through the same two input arms; the notice loop retries any it
+    // now, through the same input arm; the notice loop retries any it
     // could not reach yet.
     tauri::async_runtime::spawn(super::notice::tick_live());
     Ok(changed_payload(ctl, rec))

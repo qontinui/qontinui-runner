@@ -934,8 +934,15 @@ pub struct TerminalSessionRecord {
 /// report its outcome; the close observer reports it `work_unreported`
 /// (see [`runner_restart_unreported_report`]). `poll-dead` is deliberately
 /// ABSENT: it is restorable, so the session may still be resumed.
-pub const NON_RESTORABLE_CLOSE_REASONS: &[&str] =
-    &["no-terminal", "never-started", "terminal-only-idle"];
+/// [`CLAUDE_ENDED_CLOSE_REASON`] is final too, so a prior-generation gate closed
+/// that way is reported rather than left `spawned` for ever, though not as a
+/// crash (see [`runner_restart_unreported_report`]).
+pub const NON_RESTORABLE_CLOSE_REASONS: &[&str] = &[
+    "no-terminal",
+    "never-started",
+    "terminal-only-idle",
+    CLAUDE_ENDED_CLOSE_REASON,
+];
 
 /// What the close observer posts for a continuation lost to a runner restart:
 /// the gate, the device that claimed it, and the outcome detail.
@@ -979,8 +986,16 @@ pub fn runner_restart_unreported_report(
         return None;
     }
     let after_s = (rec.last_seen_at - rec.opened_at).max(0) / 1000;
+    // A session that ended itself with `/exit` did not crash, and what it did
+    // about its work is not known here: `exit=unknown`, as coord's own backstop
+    // writes for an outcome nobody reported.
+    let (exit, reason) = if close == CLAUDE_ENDED_CLOSE_REASON {
+        ("unknown", "claude_ended")
+    } else {
+        ("crashed", "runner_restart")
+    };
     let detail = format!(
-        "exit=crashed code=none after={after_s}s terminal={} reason=runner_restart close={close}",
+        "exit={exit} code=none after={after_s}s terminal={} reason={reason} close={close}",
         rec.terminal_id
     );
     Some(RunnerRestartUnreported {
@@ -5539,7 +5554,9 @@ pub(crate) fn reset_boot_restore_phase_for_test() {
 ///     NOT take it — it waits as a placeholder for the operator's Restore. The
 ///     hold ends when the row is restored (a this-boot record), Finished (the
 ///     caller passes `false` for a finished record) or the cohort is dismissed
-///     (no longer `restoring`). Deliberately not `mark_restore_pending`, which
+///     (no longer `restoring`; the dismiss also releases the row from the boot
+///     census arm, [`crate::session::restore_census::release`], so neither arm
+///     holds it). Deliberately not `mark_restore_pending`, which
 ///     would stamp a FAILED boot restore on every placeholder nobody has
 ///     restored yet.
 pub fn withheld_boot_restore_candidate(
@@ -13251,17 +13268,17 @@ mod tests {
         use BootRestorePhase::*;
         let boot = Some(1_000);
 
-        let waiting = boot_restore_hold(999, boot, Ran, false, true);
+        let waiting = boot_restore_hold(999, boot, Ran, false, false, true);
         assert!(waiting.hold, "a latched prior-boot row is held after Ran");
         assert!(
             !waiting.id_match_only,
             "the census arm must not disable the triple fallback"
         );
 
-        let withheld = boot_restore_hold(999, boot, Withheld, false, false);
+        let withheld = boot_restore_hold(999, boot, Withheld, false, false, false);
         assert!(withheld.hold && withheld.id_match_only);
 
-        let neither = boot_restore_hold(999, boot, Ran, false, false);
+        let neither = boot_restore_hold(999, boot, Ran, false, false, false);
         assert!(!neither.hold && !neither.id_match_only);
 
         let triple = ("page-1", "claude", "D:/work");
@@ -13366,6 +13383,73 @@ mod tests {
         );
         assert_eq!(store.get("victim-a").unwrap().state, "open");
         assert_eq!(store.get("victim-b").unwrap().state, "closed");
+    }
+
+    /// The boot census and a dismissed restart cohort, composed: a row the
+    /// operator dismissed is no longer held for the boot restore, so the poll
+    /// closes it `no-terminal`, it is not carried to the next boot, and it stops
+    /// being offered. A latched row the operator did not dismiss keeps its hold.
+    #[test]
+    fn a_dismissed_cohort_row_is_not_held_by_the_boot_census() {
+        const DISMISSED: &str = "census-poll-dismissed";
+        const KEPT: &str = "census-poll-kept";
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let crash = 1_700_000_000_000_i64;
+        let boot = crash + 30_000;
+        let confirmed = |mut r: TerminalSessionRecord| {
+            r.confirmed_at = Some(r.opened_at);
+            r
+        };
+        write_fixture(
+            &path,
+            vec![
+                confirmed(fixture_rec(DISMISSED, "open", crash, None, None)),
+                confirmed(fixture_rec(KEPT, "open", crash, None, None)),
+            ],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.set_boot_ms_for_test(boot);
+        #[derive(Debug)]
+        struct NoTranscripts;
+        impl TranscriptProbe for NoTranscripts {
+            fn transcript_exists(&self, _id: &str, _wd: Option<&str>) -> bool {
+                false
+            }
+        }
+        let census = crate::session::restore_census::BootCensus {
+            boot_at_ms: boot,
+            expected: crate::session::restore_census::expected_rows(
+                store.restorable_records(None, false),
+                &NoTranscripts,
+            ),
+        };
+        let dismissed = store.get(DISMISSED).unwrap();
+        assert!(
+            census.awaits_restore(&dismissed),
+            "latched before dismissal"
+        );
+
+        crate::session::restore_census::release(DISMISSED);
+
+        assert!(!carries_boot_restore_hold(
+            &dismissed,
+            Some(boot),
+            census.awaits_restore(&dismissed),
+            boot + 1,
+        ));
+        simulate_no_terminal_poll_ticks_with_census(
+            &store,
+            NO_TERMINAL_ORPHAN_TICKS + 2,
+            Some(boot),
+            BootRestorePhase::Ran,
+            false,
+            Some(&census),
+        );
+        let closed = store.get(DISMISSED).unwrap();
+        assert_eq!(closed.state, "closed");
+        assert_eq!(closed.close_reason.as_deref(), Some("no-terminal"));
+        assert_eq!(store.get(KEPT).unwrap().state, "open");
     }
 
     /// Same plan, Phase 4: the hold survives a SECOND restart before the page
@@ -14050,13 +14134,63 @@ mod gate_continuation_tests {
         assert!(s.adopt_restored_gate(&csid, 200).is_some());
     }
 
+    /// A deliberate `/exit` of a prior-generation continuation is reported, or
+    /// its gate stays `spawned` for ever, but never as a crash: it is not one,
+    /// and coord would re-deliver on `exit=crashed` once qontinui-coord#2729
+    /// lands.
+    #[test]
+    fn a_claude_ended_continuation_is_reported_but_not_as_a_crash() {
+        let report = runner_restart_unreported_report(&closed(gate_row(100), "claude-ended"), 200)
+            .expect("reported");
+        assert_eq!(report.gate_id.to_string(), GATE);
+        assert_eq!(report.consuming_device_id.to_string(), DEVICE);
+        assert!(
+            report.detail.starts_with("exit=unknown code=none "),
+            "{}",
+            report.detail
+        );
+        assert!(
+            report
+                .detail
+                .contains("reason=claude_ended close=claude-ended"),
+            "{}",
+            report.detail
+        );
+        // The crash-shaped reasons keep their detail.
+        let report = runner_restart_unreported_report(&closed(gate_row(100), "no-terminal"), 200)
+            .expect("reported");
+        assert!(
+            report.detail.starts_with("exit=crashed "),
+            "{}",
+            report.detail
+        );
+        assert!(
+            report.detail.contains("reason=runner_restart"),
+            "{}",
+            report.detail
+        );
+        // This generation's own gate is not this path's to report.
+        assert!(
+            runner_restart_unreported_report(&closed(gate_row(200), "claude-ended"), 200).is_none()
+        );
+    }
+
     // (g)
     #[test]
     fn non_restorable_close_reasons_exclude_poll_dead() {
         assert_eq!(
             NON_RESTORABLE_CLOSE_REASONS,
-            &["no-terminal", "never-started", "terminal-only-idle"]
+            &[
+                "no-terminal",
+                "never-started",
+                "terminal-only-idle",
+                "claude-ended"
+            ]
         );
+        // Everything final is reportable, and nothing final is restorable.
+        for reason in NON_RESTORABLE_CLOSE_REASONS {
+            assert_eq!(restorable_grace_ms(reason), None, "{reason}");
+        }
         // Every reason the dead-shell mapping can produce that the restore
         // pass will NOT pick up must be reportable, or a prior-generation
         // continuation closed under it stays `spawned` forever.
