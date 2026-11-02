@@ -1,0 +1,7 @@
+recovered 29 test binaries from the build step
+     Running `/home/runner/work/qontinui-runner/qontinui-runner/src-tauri/target/debug/deps/qontinui_runner_lib-0c1d2e3f`
+
+running 11368 tests
+test a::b ... ok
+/home/runner/work/_temp/0b5e4c1e-7d3a-4f53-9e3b-1c2d3e4f5a6b.sh: line 72: 23817 Killed                  "$exe"
+##[error]Process completed with exit code 137.

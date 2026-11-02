@@ -3136,7 +3136,11 @@ status line, branching on `changed` first. `changed: "marker"` with
 `coord.queued: true`, read back `finishSynced: true` (after the table's
 wait-and-re-read when the first read-back shows the write re-queued), is done,
 and so is a `"none"` / `"reason_only"` with `finishSynced: true` (already
-finished and synced). A `404`, a `"marker"` with `coord.queued: false`, a
+finished and synced). `"reason_only"` comes only from a runner build predating
+plan
+`2026-10-23-coord-records-a-session-finished-but-not-when-so-a-revival-cannot-be-told-from-a-re-finish`
+Phase 3. A build carrying that phase answers a reasoned re-finish with
+`"marker"` and restamps the mark, so the `"marker"` arms here read it. A `404`, a `"marker"` with `coord.queued: false`, a
 `"none"` / `"reason_only"` with `finishSynced: false` and `coord.queued: false`,
 a `finishSynced` still false after that re-read, a body with no `coord` key, or any other status or an empty
 body means the coord half is still owed, and the cascade continues. `9876` is the primary runner's port; Part B Step 1 says when to use
