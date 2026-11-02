@@ -436,3 +436,48 @@ function Find-PublishedLinuxRunner {
     $lines += "hiding exactly the drift this gate exists to catch."
     throw ($lines -join [Environment]::NewLine)
 }
+
+# What the published Linux leg LAUNCHES, given the binary Find-PublishedLinuxRunner
+# returned. A .deb install runs usr/bin/qontinui-runner directly -- that is what
+# the package puts on a user's PATH. An AppImage never runs its inner binary
+# directly: a user's launch goes through AppRun, which applies the bundle's own
+# runtime environment (APPDIR, and the GTK hook's GDK/GTK/XDG_DATA_DIRS/pixbuf
+# settings) before exec'ing the binary. Booting the inner binary bare skips that
+# environment -- a configuration no user runs -- so for an --appimage-extract
+# prefix (an AppDir holding AppRun beside usr/) the launch path is AppRun.
+#
+# AppRun is returned by its own path, NOT its realpath: AppRun resolves APPDIR from
+# where it was invoked, and a symlinked AppRun (-> usr/bin/qontinui-runner) run by
+# its target's name would lose that. The realpath containment check catches only a
+# SYMLINKED AppRun leading out of the AppDir; a script AppRun can exec anything, so
+# what proves the AppDir is the release's is Confirm-PublishedLinuxAssetHash on the
+# AppImage, as for the binary. An AppDir named squashfs-root with no AppRun is not
+# an unpacked AppImage and is refused rather than booted bare.
+function Get-PublishedLinuxLaunchPath {
+    param([string]$BinaryPath)
+
+    if ([string]::IsNullOrWhiteSpace($BinaryPath)) {
+        throw "Get-PublishedLinuxLaunchPath: -BinaryPath is empty ('$BinaryPath')."
+    }
+    # <AppDir>/usr/bin/qontinui-runner -> <AppDir>
+    $appDir = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $BinaryPath))
+    $appRun = Join-Path $appDir 'AppRun'
+    if (-not (Test-Path -LiteralPath $appRun)) {
+        if ((Split-Path -Leaf $appDir) -ceq 'squashfs-root') {
+            throw ("Refusing '$BinaryPath': it sits in an --appimage-extract tree ('$appDir') with no AppRun. " +
+                   "An AppImage is launched through AppRun, which points the loader at the bundled " +
+                   "libraries; booting the inner binary bare would measure a configuration no user runs.")
+        }
+        return $BinaryPath
+    }
+    if (-not (Test-Path -LiteralPath $appRun -PathType Leaf)) {
+        throw "Refusing '$appRun': the AppImage's AppRun is not a file."
+    }
+    $realDir = (Resolve-LinuxRealPath -Path $appDir).TrimEnd('/')
+    $realRun = Resolve-LinuxRealPath -Path $appRun
+    if (-not $realRun.StartsWith($realDir + '/', [StringComparison]::Ordinal)) {
+        throw ("Refusing '$appRun': it resolves to '$realRun', outside its AppDir '$realDir'. AppRun " +
+               "must be the AppImage's own, not a link to something the binary guard never checked.")
+    }
+    return $appRun
+}

@@ -462,6 +462,10 @@ export interface AiSettings {
    * opinion; absent = an older runner). Lets the page re-apply the runner's
    * rule to unsaved form state — see {@link displayedAccountSelection}. */
   fleet_account_selection_mode?: AccountSelectionMode | null;
+  /** READ-ONLY: whether coord has answered the fleet account-selection domain
+   * in this runner process. `false` = a `null` fleet mode means "not yet
+   * asked", not "no fleet opinion"; absent = an older runner. */
+  fleet_account_selection_answered?: boolean;
 }
 
 /** The account-selection mode the Settings page DESCRIBES, which input
@@ -472,7 +476,11 @@ export interface AiSettings {
  * against the raw fleet value the runner reported:
  *   pinned → local mode, source `pinned`;
  *   unpinned and the fleet has a value → the fleet's mode, source `fleet`;
- *   otherwise → local mode, source `local`.
+ *   otherwise → local mode, source `local` — unless the runner reports that
+ *   coord has NOT answered yet, when the source is UNKNOWN (`undefined`,
+ *   `fleetUnread`): the local mode applies now, but the fleet may override it
+ *   on its first answer. A non-null fleet value wins whatever the flag says:
+ *   it can only have come from coord, so it IS an answer.
  * So un-ticking the pin while the fleet has a value immediately shows the
  * fleet's mode, and a different local mode shows at once when it governs.
  *
@@ -483,15 +491,22 @@ export function displayedAccountSelection(settings: AiSettings): {
   mode: AccountSelectionMode | undefined;
   source: AccountSelectionSource | undefined;
   fleetManaged: boolean;
+  fleetUnread: boolean;
 } {
   const local = settings.claude_cli.account_selection_mode;
   const pinned = settings.claude_cli.account_selection_pinned ?? false;
   const fleet = settings.fleet_account_selection_mode;
 
   if (fleet !== undefined) {
-    if (pinned) return { mode: local, source: "pinned", fleetManaged: false };
-    if (fleet !== null) return { mode: fleet, source: "fleet", fleetManaged: true };
-    return { mode: local, source: "local", fleetManaged: false };
+    if (pinned) return { mode: local, source: "pinned", fleetManaged: false, fleetUnread: false };
+    if (fleet !== null)
+      return { mode: fleet, source: "fleet", fleetManaged: true, fleetUnread: false };
+    // Only an explicit `false` is "not yet asked"; an absent key (a runner
+    // predating the field) keeps that runner's own `local` claim.
+    if (settings.fleet_account_selection_answered === false) {
+      return { mode: local, source: undefined, fleetManaged: false, fleetUnread: true };
+    }
+    return { mode: local, source: "local", fleetManaged: false, fleetUnread: false };
   }
 
   // Older runner: no raw fleet value, only its own resolution at load time.
@@ -505,6 +520,7 @@ export function displayedAccountSelection(settings: AiSettings): {
     // at load time.
     source: pinned ? "pinned" : settings.account_selection_source,
     fleetManaged,
+    fleetUnread: false,
   };
 }
 
