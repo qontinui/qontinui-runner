@@ -119,6 +119,27 @@ fn task_is_due(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
         .is_some_and(|next_dt| next_dt.with_timezone(&chrono::Utc) <= now)
 }
 
+/// Offer `due` to `try_start` in order until `slots` of them have started.
+///
+/// A candidate that does not start spends nothing, so a task waiting on its
+/// conditions cannot starve the tasks behind it. Waiting tasks sort first, and
+/// `max_concurrent` is 1 by default: slots taken before the conditions were
+/// checked let `return-to-main`, parked on its quiet probe from 2026-10-28, hold
+/// the other due tasks overdue for days.
+async fn start_due_tasks<T, Fut>(due: Vec<T>, mut slots: usize, mut try_start: impl FnMut(T) -> Fut)
+where
+    Fut: std::future::Future<Output = bool>,
+{
+    for candidate in due {
+        if slots == 0 {
+            break;
+        }
+        if try_start(candidate).await {
+            slots -= 1;
+        }
+    }
+}
+
 /// The `Skipped` history row for a condition wait that timed out.
 ///
 /// It is stamped with the SLOT the wait was for — the task's `next_run`, which
@@ -491,114 +512,151 @@ impl SchedulerService {
             return;
         }
 
-        // Execute due tasks up to the concurrent limit
+        // Only a task that actually starts spends a concurrency slot. A task
+        // parked on its conditions runs nothing, so it must not hold the slot
+        // from the due tasks behind it. The cost: a pass now checks every due
+        // task until the slots are spent, not only the first `max_concurrent`,
+        // so it holds `pass_lock` longer when many tasks are waiting.
         let available_slots = (settings.max_concurrent - running_count) as usize;
-        for mut task in due_tasks.into_iter().take(available_slots) {
-            // Skip if already running
-            {
-                let running = self.running_tasks.read().await;
-                if running.contains(&task.id) {
-                    continue;
-                }
-            }
+        start_due_tasks(due_tasks, available_slots, |task| {
+            self.clone().try_start_due_task(pg, task)
+        })
+        .await;
+    }
 
-            // Check if should skip (completed and skip_if_completed)
-            if task.should_skip() {
-                info!(
-                    "Scheduler: Skipping task '{}' (already completed)",
-                    task.name
-                );
-                self.record_skipped(&task).await;
-                continue;
+    /// Run one due task through its skip and condition checks, starting it if
+    /// they all pass. Returns whether it started, which is what spends a slot
+    /// in [`start_due_tasks`].
+    async fn try_start_due_task(self: Arc<Self>, pg: &PgDb, mut task: ScheduledTask) -> bool {
+        // Skip if already running
+        {
+            let running = self.running_tasks.read().await;
+            if running.contains(&task.id) {
+                return false;
             }
-
-            // For Condition schedule tasks, check rearm delay.
-            if matches!(
-                task.schedule,
-                crate::scheduler::ScheduleExpression::Condition(_)
-            ) {
-                if task.last_run.is_none() {
-                    if let Ok(history) = pg.get_execution_history(&task.id, 1).await {
-                        if let Some(latest) = history.into_iter().next() {
-                            task.last_run = Some(latest);
-                        }
-                    }
-                }
-                if !task.is_rearm_ready() {
-                    continue;
-                }
-            }
-
-            // Check conditions if task has any
-            if task.has_conditions() {
-                match self.gate_conditions(&task, std::time::Instant::now()).await {
-                    ConditionGate::TimedOut => {
-                        info!(
-                            "Scheduler: Task '{}' timed out waiting for conditions",
-                            task.name
-                        );
-                        self.record_condition_timeout(&task).await;
-                        continue;
-                    }
-                    ConditionGate::Wait(status) => {
-                        info!(
-                            "Scheduler: Task '{}' waiting for conditions (idle: {:?}, repos: {:?}, \
-                             probe: {:?} {:?})",
-                            task.name,
-                            status.idle_met,
-                            status.repo_inactive_met,
-                            status.probe_met,
-                            status.probe_detail
-                        );
-                        let status_json = serde_json::to_string(&status).ok();
-                        match pg
-                            .update_task_condition_status(
-                                &task.id,
-                                status_json.as_deref(),
-                                &task.modified_at,
-                            )
-                            .await
-                        {
-                            Ok(true) => {}
-                            Ok(false) => info!(
-                                "Scheduler: task '{}' was edited since this tick read it; \
-                                 its wait state is re-evaluated next tick",
-                                task.name
-                            ),
-                            Err(e) => error!("Failed to update condition status: {}", e),
-                        }
-                        continue;
-                    }
-                    ConditionGate::Fire => {
-                        // Conditions met - clear status before execution. The
-                        // clear is conditional on the snapshot the conditions
-                        // were evaluated against: if the task was edited since,
-                        // this tick's verdict is about a task that no longer
-                        // exists in that form, so it does not run; the next
-                        // tick re-reads and re-evaluates.
-                        match pg
-                            .update_task_condition_status(&task.id, None, &task.modified_at)
-                            .await
-                        {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                info!(
-                                    "Scheduler: task '{}' was edited since this tick read it; \
-                                     not running on the stale verdict — re-evaluating next tick",
-                                    task.name
-                                );
-                                continue;
-                            }
-                            Err(e) => error!("Failed to clear condition status: {}", e),
-                        }
-                        info!("Scheduler: Task '{}' conditions met, executing", task.name);
-                    }
-                }
-            }
-
-            info!("Scheduler: Executing task '{}'", task.name);
-            self.clone().execute_task(task).await;
         }
+
+        // Check if should skip (completed and skip_if_completed)
+        if task.should_skip() {
+            info!(
+                "Scheduler: Skipping task '{}' (already completed)",
+                task.name
+            );
+            self.record_skipped(&task).await;
+            return false;
+        }
+
+        // The drain gate `tick_pass` partitioned on was read once, before the
+        // walk, and each condition check ahead of this task can take seconds
+        // (a due probe waits up to `INLINE_GRACE`). A drain that began
+        // mid-walk must still hold a task that spawns an AI session, so read
+        // it again here. Before the condition checks, not after them: a met
+        // probe verdict is spent by `gate_conditions` and must be run on.
+        // Held, the task stays due and spends no slot, exactly as one held at
+        // the top of the tick.
+        if task_spawns_ai_session(&task.task) {
+            if let crate::coord_drain_state::DrainGate::Defer { reason, .. } =
+                crate::coord_drain_state::drain_gate_for_work(
+                    crate::coord_drain_state::SpawnOrigin::Scheduler,
+                    &format!("scheduled_task:{}", task.id),
+                )
+            {
+                debug!(
+                    "Scheduler: holding task '{}' — the coord drain gate stopped allowing \
+                     autonomous spawns while this tick was walking its due tasks: {}",
+                    task.name, reason
+                );
+                return false;
+            }
+        }
+
+        // For Condition schedule tasks, check rearm delay.
+        if matches!(
+            task.schedule,
+            crate::scheduler::ScheduleExpression::Condition(_)
+        ) {
+            if task.last_run.is_none() {
+                if let Ok(history) = pg.get_execution_history(&task.id, 1).await {
+                    if let Some(latest) = history.into_iter().next() {
+                        task.last_run = Some(latest);
+                    }
+                }
+            }
+            if !task.is_rearm_ready() {
+                return false;
+            }
+        }
+
+        // Check conditions if task has any
+        if task.has_conditions() {
+            match self.gate_conditions(&task, std::time::Instant::now()).await {
+                ConditionGate::TimedOut => {
+                    info!(
+                        "Scheduler: Task '{}' timed out waiting for conditions",
+                        task.name
+                    );
+                    self.record_condition_timeout(&task).await;
+                    return false;
+                }
+                ConditionGate::Wait(status) => {
+                    info!(
+                        "Scheduler: Task '{}' waiting for conditions (idle: {:?}, repos: {:?}, \
+                         probe: {:?} {:?})",
+                        task.name,
+                        status.idle_met,
+                        status.repo_inactive_met,
+                        status.probe_met,
+                        status.probe_detail
+                    );
+                    let status_json = serde_json::to_string(&status).ok();
+                    match pg
+                        .update_task_condition_status(
+                            &task.id,
+                            status_json.as_deref(),
+                            &task.modified_at,
+                        )
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => info!(
+                            "Scheduler: task '{}' was edited since this tick read it; \
+                             its wait state is re-evaluated next tick",
+                            task.name
+                        ),
+                        Err(e) => error!("Failed to update condition status: {}", e),
+                    }
+                    return false;
+                }
+                ConditionGate::Fire => {
+                    // Conditions met - clear status before execution. The
+                    // clear is conditional on the snapshot the conditions
+                    // were evaluated against: if the task was edited since,
+                    // this tick's verdict is about a task that no longer
+                    // exists in that form, so it does not run; the next
+                    // tick re-reads and re-evaluates.
+                    match pg
+                        .update_task_condition_status(&task.id, None, &task.modified_at)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            info!(
+                                "Scheduler: task '{}' was edited since this tick read it; \
+                                 not running on the stale verdict — re-evaluating next tick",
+                                task.name
+                            );
+                            return false;
+                        }
+                        Err(e) => error!("Failed to clear condition status: {}", e),
+                    }
+                    info!("Scheduler: Task '{}' conditions met, executing", task.name);
+                }
+            }
+        }
+
+        info!("Scheduler: Executing task '{}'", task.name);
+        self.clone().execute_task(task).await;
+        true
     }
 
     /// Record a skipped execution
@@ -4097,6 +4155,117 @@ mod tests {
         assert_eq!(service.get_running_tasks().await, vec!["t".to_string()]);
         assert!(!service.try_mark_running("t").await);
         assert!(service.try_mark_running("other").await);
+    }
+
+    /// Offer `due` (true = it starts) with `slots`; returns the candidates
+    /// offered, in order, and the ones that started.
+    async fn walk_start_due_tasks(
+        due: &[(&'static str, bool)],
+        slots: usize,
+    ) -> (Vec<&'static str>, Vec<&'static str>) {
+        let offered = std::cell::RefCell::new(Vec::new());
+        let started = std::cell::RefCell::new(Vec::new());
+        start_due_tasks(due.to_vec(), slots, |(name, starts)| {
+            offered.borrow_mut().push(name);
+            if starts {
+                started.borrow_mut().push(name);
+            }
+            std::future::ready(starts)
+        })
+        .await;
+        (offered.into_inner(), started.into_inner())
+    }
+
+    /// The incident: `return-to-main`, parked on its probe, sat first in the
+    /// queue with one slot available, and nothing behind it ran.
+    #[tokio::test]
+    async fn a_task_waiting_on_conditions_does_not_starve_the_tasks_behind_it() {
+        let (_, started) =
+            walk_start_due_tasks(&[("return-to-main", false), ("fleet-bundle-sync", true)], 1)
+                .await;
+        assert_eq!(started, vec!["fleet-bundle-sync"]);
+    }
+
+    /// The slot limit still binds: once it is spent nothing further is offered,
+    /// so a later task's conditions are not evaluated for a slot it cannot have.
+    #[tokio::test]
+    async fn starting_stops_once_the_slots_are_spent() {
+        let (offered, started) =
+            walk_start_due_tasks(&[("parked", false), ("a", true), ("b", true)], 1).await;
+        assert_eq!(offered, vec!["parked", "a"]);
+        assert_eq!(started, vec!["a"]);
+
+        let (offered, started) =
+            walk_start_due_tasks(&[("a", true), ("b", true), ("c", true)], 2).await;
+        assert_eq!(offered, vec!["a", "b"]);
+        assert_eq!(started, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn every_candidate_is_offered_when_none_starts() {
+        let (offered, started) =
+            walk_start_due_tasks(&[("a", false), ("b", false), ("c", false)], 1).await;
+        assert_eq!(offered, vec!["a", "b", "c"]);
+        assert!(started.is_empty());
+    }
+
+    /// `tick_pass` goes through the slot walk, and only a started task reports
+    /// true, so a skip or a condition wait never spends a slot.
+    #[test]
+    fn the_tick_spends_a_slot_only_on_a_task_it_started() {
+        let src = include_str!("scheduler_service.rs");
+        let (_, tick) = src.split_once("async fn tick_pass(").expect("tick_pass");
+        let (tick, _) = tick
+            .split_once("async fn try_start_due_task(")
+            .expect("try_start_due_task follows tick_pass");
+        assert!(tick.contains("start_due_tasks(due_tasks, available_slots,"));
+        let (_, body) = src
+            .split_once("async fn try_start_due_task(")
+            .expect("try_start_due_task");
+        let (body, _) = body
+            .split_once("/// Record a skipped execution")
+            .expect("fn ends");
+        assert_eq!(body.matches("\n        true\n").count(), 1);
+        assert!(
+            !body.contains("return true"),
+            "a skip or a condition wait must not spend a slot"
+        );
+        let (before_true, _) = body.split_once("\n        true\n").expect("started arm");
+        assert!(before_true
+            .trim_end()
+            .ends_with("self.clone().execute_task(task).await;"));
+    }
+
+    /// The drain gate is read again for each task, before its condition
+    /// checks: one read at the top of the tick goes stale across the checks
+    /// of the tasks ahead of it, and a met probe verdict must not be spent on
+    /// a task the drain then holds.
+    #[test]
+    fn a_task_rereads_the_drain_gate_before_its_conditions() {
+        let src = include_str!("scheduler_service.rs");
+        let (_, body) = src
+            .split_once("async fn try_start_due_task(")
+            .expect("try_start_due_task");
+        let (body, _) = body
+            .split_once("/// Record a skipped execution")
+            .expect("fn ends");
+        let (before_conditions, _) = body
+            .split_once("if task.has_conditions() {")
+            .expect("condition checks");
+        let (_, recheck) = before_conditions
+            .split_once("if task_spawns_ai_session(&task.task) {")
+            .expect("the drain gate is re-read before the condition checks");
+        let (hold, _) = recheck
+            .split_once("// For Condition schedule tasks")
+            .expect("the re-read precedes the rearm check");
+        assert!(hold.contains(
+            "if let crate::coord_drain_state::DrainGate::Defer { reason, .. } =\n                crate::coord_drain_state::drain_gate_for_work("
+        ));
+        assert_eq!(
+            hold.matches("return false;").count(),
+            1,
+            "a held task must return"
+        );
     }
 
     /// `execute_task_with_context` starts only through the atomic mark.
