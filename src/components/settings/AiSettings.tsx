@@ -28,6 +28,10 @@ import { GeminiApiSection } from "./ai-settings/GeminiApiSection";
 import { ProviderHealthStatus } from "./ai-settings/ProviderHealthStatus";
 import { ModelRoutingSection } from "./ai-settings/ModelRoutingSection";
 
+/** How often the page re-reads the account-selection view while the runner
+ * reports that coord has not yet answered the fleet domain. */
+const FLEET_SELECTION_REFRESH_MS = 5000;
+
 interface AiSettingsProps {
   onLog: LogFunction;
 }
@@ -39,12 +43,16 @@ function selectionViewFrom(
   data: AiSettingsType,
 ): Pick<
   AiSettingsType,
-  "effective_account_selection_mode" | "account_selection_source" | "fleet_account_selection_mode"
+  | "effective_account_selection_mode"
+  | "account_selection_source"
+  | "fleet_account_selection_mode"
+  | "fleet_account_selection_answered"
 > {
   return {
     effective_account_selection_mode: data.effective_account_selection_mode,
     account_selection_source: data.account_selection_source,
     fleet_account_selection_mode: data.fleet_account_selection_mode,
+    fleet_account_selection_answered: data.fleet_account_selection_answered,
   };
 }
 
@@ -117,7 +125,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
    * form's own state alone. A failed read keeps the last view: the page then
    * still describes the current form state through
    * `displayedAccountSelection`, which re-applies the runner's rule. */
-  const refreshSelectionView = async () => {
+  const refreshSelectionView = useCallback(async () => {
     try {
       const result = await invoke<TauriResult<AiSettingsType>>("get_ai_settings");
       if (result?.success && result.data) {
@@ -127,7 +135,20 @@ export function AiSettings({ onLog }: AiSettingsProps) {
     } catch (err) {
       console.error("Failed to refresh account-selection view:", err);
     }
-  };
+  }, []);
+
+  // Until coord has answered the fleet account-selection domain, the view's
+  // `null` fleet mode means "not yet asked" and the page says so. Re-read the
+  // view until the runner reports an answer, so the page picks up the fleet's
+  // value (or its "no opinion") without a save or a remount.
+  const fleetSelectionUnanswered = settings.fleet_account_selection_answered === false;
+  useEffect(() => {
+    if (!fleetSelectionUnanswered) return;
+    const timer = setInterval(() => {
+      void refreshSelectionView();
+    }, FLEET_SELECTION_REFRESH_MS);
+    return () => clearInterval(timer);
+  }, [fleetSelectionUnanswered, refreshSelectionView]);
 
   const loadSettings = async () => {
     try {

@@ -268,6 +268,180 @@
 
 set -u
 
+# ----- INTERRUPTED: every catchable termination ends in a typed line ----------
+# Plan 2026-10-23-coord-revive-prints-nothing-when-interrupted-before-its-verdict.
+# Every verdict below prints just before its `exit`, so a signal that lands
+# earlier -- a caller's `timeout`, a Ctrl-C, a closed terminal -- used to leave
+# ZERO bytes on both streams: the client's "no output" mask this script exists
+# to replace, reproduced by the script itself (finding 5f546e6c, a starved
+# Windows box where door resolution alone outlived the caller's `timeout 60`).
+#
+# Installed HERE, at `set -u`, so the preamble is covered too: on a slow box that
+# is where the time goes. The EXIT trap further down stays the cleanup; it cannot
+# do this job, because `$?` reads 0 inside it after a SIGTERM (measured on MSYS),
+# so it cannot tell an interruption from a success.
+#
+# The handler is BUILTINS ONLY -- no `$( )`, no `date`, no `mkdir`. On the box it
+# exists for, every process creation costs about a second, and a fork here would
+# delay the very line it exists to print. It exits 128+n rather than re-raising:
+# on MSYS a re-raise skips the EXIT trap and leaks $TMPD, and a bash parent reads
+# the same `$?` either way.
+#
+# CR_PHASE is advanced at the seams by cr_phase (startup -> door_resolution ->
+# rpc -> reading_result for the verbs; startup -> probing -> verdict / drain for
+# the cascade). When $COORD_REVIVE_TIMING_FILE is named, every move also appends
+# `phase <name> <epoch ms>` there, so a caller can read the last phase reached
+# after a kill no handler sees (TerminateProcess, SIGKILL). Lines in that file are
+# TOKEN-keyed (`rpc_send_ms <ms>`, `phase <name> <ms>`): select by token, never by
+# position.
+CR_T0="${EPOCHREALTIME:-}"
+# The caller's STDERR, duplicated before any redirection exists. A trap runs
+# inside whatever redirection is active when the signal lands -- e.g.
+# `build_rpc ... 2>"$TMPD/rpcerr"`, or a header-staging group sent to
+# /dev/null -- so a handler writing to plain stderr can print its one line INTO
+# A TEMP FILE the EXIT trap then deletes (measured: a TERM during the slow `jq`
+# inside build_rpc printed nothing). Builtins only: `exec` opens no process.
+# Duplicated BARE: if stderr is closed the failure prints nowhere and leaves the
+# name unset (never trust an inherited value), and /dev/null stands in.
+# Bash sets no close-on-exec on it, so the two BACKGROUNDED verb POSTs close it
+# (`{CR_ERR_FD}>&-`): a curl orphaned by a kill no handler sees must not hold
+# the caller's pipe open. Every other child (a cascade probe's `$( )` subshell,
+# say) already held the caller's stderr as its own fd 2, so the copy adds no
+# new hold there.
+# stdout is deliberately NOT duplicated: a copy would be a NEW hold on a
+# stdout-only caller's pipe (`| head`, `v=$(...)`) by every `$( )` probe child
+# under a SIGKILL of bash alone. The cascade's stdout VERDICT therefore goes to
+# fd 1 as it stands when the signal lands -- the caller's stdout everywhere the
+# cascade spends its time.
+unset CR_ERR_FD
+exec {CR_ERR_FD}>&2
+[ -n "${CR_ERR_FD:-}" ] || exec {CR_ERR_FD}>/dev/null
+CR_PHASE=startup
+CR_CHILD=""
+CR_RPC_T0=""
+CR_RPC_BUDGET=""
+CR_RUNG=""
+case "${1:-}" in
+  call|tools|observe) CR_MODE="$1" ;;
+  ''|--floor-claim)   CR_MODE=cascade ;;
+  *)                  CR_MODE=usage ;;
+esac
+# cr_ms <epochrealtime> -> CR_MS, whole milliseconds, or empty when the shell
+# has no $EPOCHREALTIME (a bash older than 5). Empty is UNKNOWN, never zero.
+cr_ms() {
+  local v="${1/[.,]/}"
+  case "$v" in ''|*[!0-9]*) CR_MS="" ;; *) CR_MS="${v%???}" ;; esac
+}
+# cr_phase <name>: advance the phase. NEVER call it between a command and the
+# `$?` capture that reads that command's status -- it resets `$?`.
+cr_phase() {
+  CR_PHASE="$1"
+  [ "$1" = rpc ] && CR_RPC_T0="${EPOCHREALTIME:-}"
+  if [ -n "${COORD_REVIVE_TIMING_FILE:-}" ]; then
+    cr_ms "${EPOCHREALTIME:-}"
+    if [ -n "$CR_MS" ]; then
+      { printf 'phase %s %s\n' "$1" "$CR_MS" >> "$COORD_REVIVE_TIMING_FILE"; } 2>/dev/null
+    fi
+  fi
+  return 0
+}
+# cr_rpc_unknown -> CR_SENT, the clause for a request that may be in flight.
+cr_rpc_unknown() {
+  local until="UNKNOWN (no \$EPOCHREALTIME)" s
+  cr_ms "$CR_RPC_T0"
+  if [ -n "$CR_MS" ] && [ -n "$CR_RPC_BUDGET" ]; then
+    s=$(( CR_MS / 1000 + CR_RPC_BUDGET ))
+    TZ=UTC printf -v until '%(%Y-%m-%dT%H:%M:%SZ)T' "$s" 2>/dev/null || until="its start + ${CR_RPC_BUDGET}s"
+  fi
+  CR_SENT="the request was in flight, so whether the door received it is UNKNOWN; this client would have stopped waiting at $until, but a server that already received it may still apply it after that - for a WRITE, read back before any re-issue, read back again later if the first read misses, and prefer a re-issue that is idempotent"
+}
+cr_interrupted() {
+  # FIRST statement: the state read below is created much later than this trap
+  # is installed (FAILS / DOORS_PROBED, O_LOG, VCE / VCODE), and under nounset a
+  # handler that expands an unset name aborts -- one that expands
+  # ${#FAILS[@]} was measured SWALLOWING the signal and running on to exit 0.
+  set +u
+  local sig="$1" rc="$2" el="" t0="" now="" timing="" ce="" code="" rung st probed="" notprobed="" obs="" ts=""
+  # One-shot: `timeout` delivers TERM twice (to the pid and to its group).
+  trap '' TERM INT HUP
+  # Forward TERM -- never INT, which a background job of a non-interactive shell
+  # starts with ignored -- to the in-flight POST, so it cannot outlive this line.
+  # (A signal landing between the `&` and `CR_CHILD=$!` finds no child to
+  # forward to: that curl is bounded by its own -m and nothing else.)
+  [ -n "$CR_CHILD" ] && kill -0 "$CR_CHILD" 2>/dev/null && kill -TERM "$CR_CHILD" 2>/dev/null
+  cr_ms "$CR_T0"; t0="$CR_MS"
+  cr_ms "${EPOCHREALTIME:-}"; now="$CR_MS"
+  if [ -n "$t0" ] && [ -n "$now" ]; then el="$((now - t0))ms"; else el="UNKNOWN ms"; fi
+  case "$CR_PHASE" in
+    startup|door_resolution)
+      CR_SENT="nothing was sent" ;;
+    rpc)
+      cr_ms "$CR_RPC_T0"
+      if [ -n "$CR_MS" ] && [ -n "$t0" ] && [ -n "$now" ]; then
+        timing=", door resolution $((CR_MS - t0))ms, in flight $((now - CR_MS))ms"
+      fi
+      cr_rpc_unknown ;;
+    reading_result)
+      if [ "$CR_MODE" = observe ]; then ce="$OCE"; code="$OCODE"; else ce="$VCE"; code="$VCODE"; fi
+      case "${ce:-}:${code:-}" in
+        0:401|6:*|7:*) CR_SENT="the request provably reached no handler (curl exit $ce, HTTP ${code:-000})" ;;
+        0:?*)
+          if [ "$CR_MODE" = observe ]; then
+            # The uninterrupted path reports only 0:200 WITH a JSON-RPC result,
+            # and the body was not yet checked: receipt is UNKNOWN, so it is
+            # counted, exactly as that path counts every other answer.
+            CR_SENT="the door answered (HTTP $code) but its body was not yet checked, so whether the observation was received is UNKNOWN"
+          else
+            CR_SENT="the door answered (HTTP $code) but its result was not printed in full"
+          fi ;;
+        *)             cr_rpc_unknown ;;
+      esac ;;
+    probing)
+      CR_SENT="probes may have been sent; an L4/L5 credential mint may have been issued; no verdict was reached" ;;
+    verdict_pending)
+      CR_SENT="a VERDICT line may or may not have been printed above, and if one was it stands; no second verdict follows" ;;
+    verdict)
+      CR_SENT="the VERDICT line above stands; this run was interrupted after it, while printing what follows it" ;;
+    drain)
+      CR_SENT="the VERDICT line above stands; closeout rows were being replayed and their delivery is UNKNOWN - re-run scripts/drain-closeout-spool.sh (push-only; coord de-duplicates)" ;;
+    *)
+      CR_SENT="whether anything was sent is UNKNOWN" ;;
+  esac
+  if [ "$CR_MODE" = observe ]; then
+    if [ -z "${O_LOG:-}" ]; then
+      obs="; not counted: arguments not yet validated"
+    else
+      TZ=UTC printf -v ts '%(%Y-%m-%dT%H:%M:%SZ)T' -1 2>/dev/null
+      if { printf '{"ts":"%s","transport":"%s","reporter":"%s","reporter_step":"mirror","reason":"interrupted_%s"}\n' \
+             "$ts" "$O_RUNG" "$O_REPORTER" "$CR_PHASE" >> "$O_LOG"; } 2>/dev/null; then
+        obs="; COUNTED in $O_LOG as interrupted_$CR_PHASE"
+      else
+        obs="; LOST: $O_LOG could not be appended, so the observation is neither reported nor counted"
+      fi
+    fi
+  fi
+  echo "coord-revive: $CR_MODE -> INTERRUPTED (SIG$sig after $el, phase=$CR_PHASE$timing; $CR_SENT$obs)" >&"$CR_ERR_FD"
+  # The cascade's own channel is the stdout VERDICT, once per run: before a
+  # verdict this IS the verdict; after one, the stderr line above says it stands.
+  if [ "$CR_MODE" = cascade ]; then
+    case "$CR_PHASE" in
+      startup|probing)
+        for rung in L1 L2 L3 L4 L5 L6; do
+          axis_row_status_to st "$rung" 2>/dev/null || st=UNPROBED
+          case "$st" in
+            PROBED|LIVE) probed="${probed:+$probed, }$rung" ;;
+            *)           notprobed="${notprobed:+$notprobed, }$rung" ;;
+          esac
+        done
+        echo "VERDICT: INTERRUPTED (SIG$sig, after $el; doors probed: ${probed:-none}; doors not probed: ${notprobed:-none}; in flight: ${CR_RUNG:-none}). UNKNOWN, NOT dead: this run asserts nothing about a door it did not finish asking." ;;
+    esac
+  fi
+  exit "$rc"
+}
+trap 'cr_interrupted TERM 143' TERM
+trap 'cr_interrupted INT 130' INT
+trap 'cr_interrupted HUP 129' HUP
+
 RPC_LIST='{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 
 # THE END-TO-END PROBE, and why a `tools/list` green is not one.
@@ -378,6 +552,15 @@ case "$PROBE_TOTAL_BUDGET" in
 esac
 # Base 10 explicitly: a leading zero would otherwise read as octal (08 aborts).
 PROBE_TOTAL_BUDGET=$((10#$PROBE_TOTAL_BUDGET))
+# The cascade's FIRST stderr byte, as early as the budget is known (D3 of plan
+# 2026-10-23-coord-revive-prints-nothing-when-interrupted-before-its-verdict):
+# finding c368142e recorded a cascade printing NOTHING for 30 minutes on a
+# starved box, which never reached L1 or even the BREADCRUMB line, so only a
+# line here would have shown it started. Builtins only.
+if [ "$CR_MODE" = cascade ]; then
+  echo "coord-revive: cascade started (budget ${PROBE_TOTAL_BUDGET}s)" >&2
+  cr_phase startup
+fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 # ============================ SHARED COORD-DOOR CLASSIFIER v1 ============================
@@ -1107,7 +1290,10 @@ fi
 # would surface later as AUTH_HEADER_STAGING_FAILED with an empty path — the
 # symptom without the cause.
 TMPD="$(mktemp -d)" || { echo "$DOOR_SCRIPT_NAME: ERROR: mktemp -d failed — cannot stage probe headers (LOCAL fault, not a coord verdict)." >&2; exit 127; }
-trap 'rm -rf "$TMPD"' EXIT
+# The cleanup ignores TERM/INT/HUP: a signal during the `rm` (a fork, ~1 s on a
+# starved box) after a COMPLETED verb would otherwise run cr_interrupted with
+# the last phase and print a false "not printed in full", exit 143.
+trap 'trap "" TERM INT HUP; rm -rf "$TMPD"' EXIT
 
 FAILS=()
 DOORS_PROBED=0
@@ -1994,19 +2180,29 @@ cfg_shape() {
 # Plan 2026-09-06-coord-reachability-verdicts-omit-the-host-axis, Phase 2.
 AXES_UNPROBED=""     # comma-separated keys of the rows that were SKIPPED or UNPROBED
 LIVE_RUNG=""         # set by live_exit from its transport, before the table prints
-axis_row_status() {
-  # <rung> -> LIVE | PROBED | SKIPPED | UNPROBED, from the recorded outcomes.
-  local rung="$1" f n=0 skipped=0
-  [ "$LIVE_RUNG" = "$rung" ] && { echo LIVE; return; }
+axis_row_status_to() {
+  # <var> <rung> -> sets <var> to LIVE | PROBED | SKIPPED | UNPROBED, from the
+  # recorded outcomes. BUILTINS ONLY (printf -v, no echo through a `$( )`):
+  # cr_interrupted calls it from a signal handler, where a fork would delay the
+  # very line the handler exists to print.
+  local __var="$1" rung="$2" f n=0 skipped=0
+  if [ "${LIVE_RUNG:-}" = "$rung" ]; then printf -v "$__var" '%s' LIVE; return 0; fi
   for f in ${FAILS[@]+"${FAILS[@]}"}; do
     case "$f" in "$rung "*)
       n=$((n + 1))
       case "$f" in *": SKIPPED_"*) skipped=$((skipped + 1)) ;; esac ;;
     esac
   done
-  if [ "$n" -eq 0 ]; then echo UNPROBED
-  elif [ "$skipped" -eq "$n" ]; then echo SKIPPED
-  else echo PROBED; fi
+  if [ "$n" -eq 0 ]; then printf -v "$__var" '%s' UNPROBED
+  elif [ "$skipped" -eq "$n" ]; then printf -v "$__var" '%s' SKIPPED
+  else printf -v "$__var" '%s' PROBED; fi
+}
+axis_row_status() {
+  # <rung> -> LIVE | PROBED | SKIPPED | UNPROBED on stdout (axis_row_status_to's
+  # one derivation, for the callers that read it through a `$( )`).
+  local __st
+  axis_row_status_to __st "$1"
+  echo "$__st"
 }
 axis_row_tokens() {
   # <rung> -> the verdict TOKENS recorded for it (the first word after the
@@ -2077,11 +2273,14 @@ live_exit() {
   # of them is a bare LIVE. Printing "LIVE" over a PROXY_LIVE_E2E_UNVERIFIED
   # would be the same overstatement PARTIAL exists to prevent, one layer down.
   # $v carries classify()'s parenthetical, so the line stays self-explaining.
+  CR_PHASE=verdict_pending
   if [ -n "$partial" ]; then
     echo "VERDICT: $v door=$LIVE_FILE url=$LIVE_URL transport=$transport PARTIAL"
+    cr_phase verdict
     echo "$partial"
   else
     echo "VERDICT: $v door=$LIVE_FILE url=$LIVE_URL transport=$transport"
+    cr_phase verdict
   fi
   # The DECLARATION a verified re-issue over this door carries (plan
   # 2026-09-20-first-rung-coord-reachability-is-unmeasured-then-unfixed,
@@ -2182,12 +2381,16 @@ live_exit() {
         echo "DRAIN: replaying unacked closeout rows over this door (push-only; nothing is written to any outbox or cursor). \$COORD_REVIVE_NO_DRAIN=1 opts out."
         # `bash <path>`, never `"$path"`: the resolver admits a readable file
         # without the exec bit (routinely dropped on Windows/MSYS checkouts).
+        # An interruption from here until the drainer returns says so: its
+        # rows' delivery is UNKNOWN, and the VERDICT above stands.
+        cr_phase drain
         bash "$drainer" --header-file "$drain_hdr" 2>&1 | sed 's/^/  /'
         # The pipe to sed spends the drainer's status, and the indented table
         # does not carry it. Its precedence matters when reading it: 4 wins
         # over 5, so a run with BOTH a refused and an undelivered row exits 4 --
         # which is why the 4 line below still points at the table.
         drain_rc="${PIPESTATUS[0]}"
+        cr_phase verdict
         case "$drain_rc" in
           0) echo "DRAIN: exit 0 - every eligible row accepted, or none pending." ;;
           3) echo "DRAIN: exit 3 - no readable spool on THIS box, or no python to parse one; read the drainer's own line above. Absence or a LOCAL fault - not delivery, and not a coord verdict." ;;
@@ -2434,6 +2637,9 @@ usage: coord-revive.sh                          run the transport cascade (defau
                                                 or - when no door carries it - one line appended to
                                                 ~/.qontinui/logs/coord-rung-unreported.jsonl. Exit 0
                                                 reported, 2 counted locally, 4 bad arguments.
+A TERM / INT / HUP before the verdict prints ONE `-> INTERRUPTED (SIG..., phase=...)`
+line instead of nothing, and exits 143 / 130 / 129; an outer `timeout N` must exceed
+COORD_REVIVE_CALL_TIMEOUT (default 60 s, the request only) plus door resolution.
 All three verbs read the nearest .mcp.json above $PWD and never mint a nonce. Its
 coord-mcp entry may be PROXY-shaped (loopback url + nonce header) or a STDIO
 coord-mcp-shim.py entry (command/args naming --credential <file>): the shim's own
@@ -2769,6 +2975,9 @@ if [ "${1:-}" = "observe" ]; then
   esac
   O_HOME="${HOME:-${USERPROFILE:-}}"
   O_LOG="${QONTINUI_RUNG_UNREPORTED_LOG:-$O_HOME/.qontinui/logs/coord-rung-unreported.jsonl}"
+  # Only now -- after the closed-list checks above -- may an interruption
+  # append to the log (cr_interrupted counts it only when O_LOG is set).
+  cr_phase door_resolution
   # o_unreported <reason-token>: the reason is one of this block's own literal
   # tokens, never caller or server text, so the line needs no escaping.
   o_unreported() {
@@ -2817,12 +3026,25 @@ if [ "${1:-}" = "observe" ]; then
     printf 'x-qontinui-reporter-step: mirror\n'
   } 2>/dev/null > "$TMPD/ohdr"
   [ -s "$TMPD/ohdr" ] || o_unreported "header_staging_failed"
-  : > "$TMPD/obody"
-  OCODE=$(curl -sS -o "$(curl_path "$TMPD/obody")" -w '%{http_code}' \
+  : > "$TMPD/obody"; : > "$TMPD/ocode"
+  # Backgrounded and waited on, exactly as the call/tools POST below and for the
+  # same reason: a trap is deferred while a FOREGROUND child runs, and a TERM to
+  # this pid alone never reaches a background curl -- cr_interrupted forwards it.
+  CR_RPC_BUDGET="$PROBE_TIMEOUT"; OCODE=""; OCE=""
+  cr_phase rpc
+  # `command curl`: bypasses any `curl` function inherited through the
+  # environment, so $! is always the curl process the handler forwards TERM to.
+  command curl -sS -o "$(curl_path "$TMPD/obody")" -w '%{http_code}' \
     --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$PROBE_TIMEOUT" \
     -X POST "$CFG_URL" -H "Content-Type: application/json" \
-    -H "@$(curl_path "$TMPD/ohdr")" -d "$RPC_LIST" 2>/dev/null)
+    -H "@$(curl_path "$TMPD/ohdr")" -d "$RPC_LIST" 2>/dev/null > "$TMPD/ocode" {CR_ERR_FD}>&- &
+  CR_CHILD=$!
+  wait "$CR_CHILD"
   OCE=$?
+  CR_CHILD=""
+  { read -r OCODE < "$TMPD/ocode"; } 2>/dev/null
+  # AFTER the capture: cr_phase resets `$?`.
+  cr_phase reading_result
   rm -f "$TMPD/ohdr" "$TMPD/odoorhdr"
   [ -n "$OCODE" ] || OCODE="000"
   if [ "$OCE" = "0" ] && [ "$OCODE" = "200" ] && rpc_has_result < "$TMPD/obody"; then
@@ -2835,6 +3057,7 @@ if [ "${1:-}" = "observe" ]; then
         echo "coord-revive: observe -> the stdio door $CFG_URL did NOT carry the observation (curl exit $OCE, HTTP $OCODE: refused before dispatch or never connected) - retrying ONCE over the proxy-shaped entry in $PX_PATH" >&2
         CFG_URL="$PX_URL"; CFG_KEY="$PX_KEY"; CFG_KEY_HEADER="$PX_KEY_HEADER"
         OWN_CFG_PATH="$PX_PATH"; OWN_CFG_KIND=proxy; CFG_CRED_PATH=""
+        cr_phase door_resolution
         continue ;;
     esac
   fi
@@ -2860,6 +3083,7 @@ if [ $# -gt 0 ]; then
     *) echo "coord-revive: unknown argument '$1'" >&2; verb_usage; exit 4 ;;
   esac
   VERB="$1"; shift
+  cr_phase door_resolution
   V_TOOL=""; V_ARGS="{}"
   if [ "$VERB" = "call" ]; then
     V_TOOL="${1:-}"
@@ -2956,6 +3180,10 @@ if [ $# -gt 0 ]; then
   # so the caller can split door resolution from the RPC itself. Taken from
   # bash's own $EPOCHREALTIME (no fork); a bash without it writes nothing, which
   # the caller reads as unmeasured, never as zero. Best effort, never fatal.
+  # The file also receives cr_phase's `phase <name> <ms>` lines, so its lines
+  # are TOKEN-keyed: a reader selects `rpc_send_ms` by its token, never by its
+  # position (plan 2026-10-23-coord-revive-prints-nothing-when-interrupted-
+  # before-its-verdict).
   if [ -n "${COORD_REVIVE_TIMING_FILE:-}" ]; then
     __vt="${EPOCHREALTIME:-}"; __vt="${__vt/[.,]/}"
     case "$__vt" in
@@ -2963,11 +3191,28 @@ if [ $# -gt 0 ]; then
       *) { printf 'rpc_send_ms %s\n' "${__vt%???}" >> "$COORD_REVIVE_TIMING_FILE"; } 2>/dev/null ;;
     esac
   fi
-  VCODE=$(curl -sS -o "$(curl_path "$TMPD/vbody")" -w '%{http_code}' \
+  # The POST runs in the BACKGROUND and is waited on, so a TERM to this pid is
+  # handled within a bounded time (bash defers a trap until a FOREGROUND child
+  # exits -- up to -m $CALL_TIMEOUT), and cr_interrupted forwards that TERM to
+  # $CR_CHILD so the request cannot outlive the INTERRUPTED line. The http code
+  # goes through a file read with the builtin `read`: the same fork count as the
+  # `$( )` this replaced.
+  : > "$TMPD/vcode"; VCODE=""; VCE=""
+  CR_RPC_BUDGET="$CALL_TIMEOUT"
+  cr_phase rpc
+  # `command curl`: see the observe POST above.
+  command curl -sS -o "$(curl_path "$TMPD/vbody")" -w '%{http_code}' \
     --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$CALL_TIMEOUT" \
     -X POST "$CFG_URL" -H "Content-Type: application/json" \
-    -H "@$(curl_path "$TMPD/vhdr")" --data-binary "@$(curl_path "$TMPD/rpc")" 2>"$TMPD/verr")
+    -H "@$(curl_path "$TMPD/vhdr")" --data-binary "@$(curl_path "$TMPD/rpc")" 2>"$TMPD/verr" > "$TMPD/vcode" {CR_ERR_FD}>&- &
+  CR_CHILD=$!
+  wait "$CR_CHILD"
   VCE=$?
+  CR_CHILD=""
+  { read -r VCODE < "$TMPD/vcode"; } 2>/dev/null
+  # AFTER the `$?` capture: cr_phase resets `$?`, and a failed curl read as 0
+  # would fall into the 0:* arms below.
+  cr_phase reading_result
   rm -f "$TMPD/vhdr" "$TMPD/vdoorhdr"
   VBODY="$(cat "$TMPD/vbody" 2>/dev/null)"
   VCURLERR="$(one_line 200 < "$TMPD/verr")"
@@ -2979,6 +3224,7 @@ if [ $# -gt 0 ]; then
         echo "coord-revive: $VERB -> the stdio door $CFG_URL (credential $CFG_CRED_PATH) did NOT carry the call (curl exit $VCE, HTTP $VCODE: refused before dispatch or never connected) - retrying ONCE over the proxy-shaped entry in $PX_PATH; its outcome is the one reported below" >&2
         CFG_URL="$PX_URL"; CFG_KEY="$PX_KEY"; CFG_KEY_HEADER="$PX_KEY_HEADER"
         OWN_CFG_PATH="$PX_PATH"; OWN_CFG_KIND=proxy; CFG_CRED_PATH=""; V_DOOR_HDRS=""
+        cr_phase door_resolution
         continue ;;
     esac
   fi
@@ -4055,6 +4301,11 @@ floor_capture
 # exists to bound NETWORK doors, or the run would report doors skipped for a
 # reason that has nothing to do with them.
 budget_mark_t0
+# From here an interruption is `probing`: probes are being sent, and an L4/L5
+# mint may be issued. CR_RUNG names the rung in flight, because FAILS[] gains an
+# entry only after a probe RETURNS.
+cr_phase probing
+CR_RUNG=L1
 # $OWN is set in the approval block above -- one variable, one path, two readers.
 if [ -r "$OWN" ] && read_cfg "$OWN"; then
   seen_door "$OWN"
@@ -4068,6 +4319,7 @@ else
 fi
 
 # ----- L2: sibling-key sweep (workspace root + every child repo) --------------
+CR_RUNG=L2
 # Workspace root = the directory containing the repo checkouts. $QONTINUI_ROOT
 # overrides; otherwise the parent of the MAIN checkout, derived from
 # `--git-common-dir`. Same resolution as the /gate Step-2 sweep.
@@ -4431,6 +4683,7 @@ tenant_lines() { # <bearer> <what-was-sent> [claim-only]
 }
 
 # ----- L3: acting-bearer fallback (direct coord MCP over HTTPS) ---------------
+CR_RUNG=L3
 # Resolved by __resolve_fleet_script above, NOT by the fixed three-levels-up
 # path this comment used to teach -- that rung refuses from inside an ordinary
 # repo checkout, which is where this skill runs. The helper's stderr flows
@@ -4463,6 +4716,7 @@ else
 fi
 
 # ----- L4: device-JWT bearer, three sources in the documented order -----------
+CR_RUNG=L4
 # Sources 1 and 2 are STATIC; source 3 mints from a live runner. Independent of
 # BOTH failure modes above: none of them cares that every proxy key rotated
 # (L1/L2), and none needs $COORD_AGENT_JWT (L3).
@@ -5098,6 +5352,7 @@ PARTIAL: tenant established: the minted token's tenant_id claim is $(tenant_labe
 done
 
 # ----- L5: the BOOTSTRAP credential — the first rung that needs no runner ------
+CR_RUNG=L5
 # L1/L2 ARE the runner (it serves the loopback proxy). L4 sources 3 and 4 are
 # credentials the runner mints. L3 needs $COORD_AGENT_JWT, unset on this fleet.
 # So one wedged runner takes every rung above at once, and the two static
@@ -5419,6 +5674,7 @@ print()' < "$BOOT_BODY" 2>/dev/null | tr -d '[:space:]')"
 fi
 
 # ----- L6: the WEB host -- api.qontinui.io, a different program on a different host
+CR_RUNG=L6
 # Every rung above probes ONE remote host. The web backend (qontinui-web,
 # ${WEB_URL}/api/v1/...) is a different program: plan-library and memory live
 # there, and its routes resolve the caller through get_audit_actor_user
@@ -5532,6 +5788,9 @@ else
   fi
 fi
 
+# Every rung has returned: nothing is in flight from here to the verdict.
+CR_RUNG=""
+
 # ----- Honest failure: name the exhausted cascade ------------------------------
 # BUDGET_EXCEEDED IS NOT DEAD, and the distinction is the whole reason it exists.
 # DEAD asserts that every door was probed and none answered; a run that ran out
@@ -5564,15 +5823,18 @@ fi
 # (SCOPE below) and does not by itself withhold DEAD; every other unprobed row
 # does. The `axes:` roster line under the failure list is what a reader (and
 # check #58) reads the verdict against.
+CR_PHASE=verdict_pending   # stderr-only from here: see cr_interrupted
 if [ -n "$BUDGET_TRIPPED" ]; then
   echo "VERDICT: BUDGET_EXCEEDED - the ${PROBE_TOTAL_BUDGET}s sweep budget ran out after $DOORS_PROBED probe(s) across $DISTINCT_DOORS distinct door(s), with $DOORS_SKIPPED door(s) SKIPPED UNPROBED. This is UNKNOWN, NOT dead: no door answered among the ones reached, and the ones below marked SKIPPED_BUDGET_EXCEEDED were never asked (the AXES table above names them; axes: unprobed= carries them). Raise \$COORD_REVIVE_TOTAL_BUDGET (default 60) to finish the sweep, or read the skipped list and probe one by hand:"
-  floor_claim_block BUDGET
+  cr_phase verdict; floor_claim_block BUDGET
 elif [ "$AXES_UNPROBED" != "native-coord-mcp-tools" ]; then
   echo "VERDICT: UNKNOWN - no door answered among the axes this run asked, and at least one axis was NOT asked: unprobed=$AXES_UNPROBED. Not DEAD: a verdict is only as wide as the axes it was computed from, and this one was computed over fewer than all of them. Probe the unprobed axis (drop the opt-out, or probe it by hand) before writing 'coord is unreachable' anywhere. What WAS asked - $DOORS_PROBED probe(s) across $DISTINCT_DOORS distinct door(s):"
+  cr_phase verdict
   # An unprobed axis is not a floor: the claim reads UNKNOWN with the axis named.
   floor_claim_block UNPROBED
 else
   echo "VERDICT: DEAD - no OUT-OF-BAND door on ANY probed axis, $DOORS_PROBED probe(s) across $DISTINCT_DOORS distinct door(s): L1 (own $OWN), L2 (sibling sweep under $ROOT), L3 (acting-bearer), L4 (\$COORD_DEVICE_JWT, ~/.qontinui/coord-device-jwt, the in-process nonce mint, then the UI-Bridge mint), L5 (the runner-independent bootstrap credential), L6 (the web host $WEB_URL). Every row in the AXES table above is PROBED; the one axis not asked is your native coord_* tools (SCOPE below):"
+  cr_phase verdict
   # The stamped claim, and the ONE verdict about the floor: FLOOR only when
   # the box was not under its own load, else UNKNOWN with the reason and exit 5.
   floor_claim_block DEAD

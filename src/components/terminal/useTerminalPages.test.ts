@@ -13,8 +13,11 @@
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 
 import { instanceStorage } from "@/lib/instance-storage";
+import { setPageBindings } from "@/lib/pageBindings";
 import { resolveSpawnWorkingDir } from "./useTerminalManager";
 import {
   reconcilePages,
@@ -28,6 +31,7 @@ import {
   resolveProjectPage,
   loadPages,
   PAGES_STORAGE_KEY,
+  useTerminalPages,
   type TerminalPageConfig,
 } from "./useTerminalPages";
 
@@ -464,5 +468,52 @@ describe("emptyPageIds (close empty tabs)", () => {
 
   it("returns nothing when all pages are occupied", () => {
     expect(emptyPageIds([a, b], new Set(["a", "b"]))).toEqual([]);
+  });
+});
+
+describe("useTerminalPages allPages vs pages (the list-pages roster)", () => {
+  // A one-render harness: no React Testing Library here, so the hook runs
+  // inside `renderToStaticMarkup` and its return value is captured. State
+  // initializers and memos run on that render (effects do not), which is
+  // exactly where `allPages` (from storage) and `pages` (minus bound pages)
+  // are computed.
+  beforeEach(() => {
+    const store = new Map<string, string>();
+    (globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => void store.set(k, v),
+      removeItem: (k: string) => void store.delete(k),
+      key: (i: number) => [...store.keys()][i] ?? null,
+      get length() {
+        return store.size;
+      },
+      clear: () => store.clear(),
+    };
+  });
+
+  function renderUseTerminalPages(): ReturnType<typeof useTerminalPages> {
+    let out: ReturnType<typeof useTerminalPages> | null = null;
+    function Probe() {
+      out = useTerminalPages();
+      return null;
+    }
+    renderToStaticMarkup(createElement(Probe));
+    expect(out).not.toBeNull();
+    return out!;
+  }
+
+  it("keeps a page bound to a pop-out in allPages while pages drops it", () => {
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, [
+      { id: "p-docked", name: "docked work", createdAt: 1 },
+      { id: "p-popped", name: "popped work", createdAt: 2 },
+    ]);
+    setPageBindings({ "p-popped": "terminal-popout-3" });
+
+    const hook = renderUseTerminalPages();
+
+    expect(hook.allPages.map((p) => p.id)).toEqual(["p-docked", "p-popped"]);
+    expect(hook.allPages.map((p) => p.name)).toEqual(["docked work", "popped work"]);
+    expect(hook.pages.map((p) => p.id)).toEqual(["p-docked"]);
+    expect(hook.boundPages).toEqual({ "p-popped": "terminal-popout-3" });
   });
 });

@@ -3449,6 +3449,80 @@ async fn handle_page_scroll_dispatch(
     }
 }
 
+// ============================================================================
+// Text visibility — a dev control (plan
+// 2026-10-13-image-generation-and-visual-judgment, Phase 16). The SDK app
+// enforces the dev-controls gate itself: an app that has not opted in answers
+// `capability_unavailable_in_build`. Validation is shared with the direct
+// route (`ui_bridge/text_visibility.rs`). The SDK's hide and restore are
+// synchronous, so — unlike the media override's page-side wait — there is
+// nothing to fit to a transport budget and both arms are sent the same body.
+// Not a journey action (`journey/route_coverage.rs` R21): it changes what the
+// page renders for a capture, then is undone.
+// ============================================================================
+
+/// The `/sdk/` text-visibility body, over what a test can construct: the
+/// dispatcher and the SDK connection the axum handler reads out of `ApiState`.
+/// Validation runs HERE, before anything is dispatched, so a test entering
+/// through this function observes it.
+pub(crate) async fn sdk_text_visibility(
+    dispatcher: &super::app_dispatch::AppDispatcher,
+    sdk_connection: &Arc<tokio::sync::Mutex<SdkConnectionManager>>,
+    body: serde_json::Value,
+    bump: impl Fn(),
+    bump_after_ttl: impl FnOnce(u64),
+) -> serde_json::Value {
+    use crate::mcp::ui_bridge::text_visibility;
+    if let Err(e) = text_visibility::validate_text_visibility_body(&body) {
+        return serde_json::json!({ "success": false, "code": "INVALID_REQUEST", "error": e });
+    }
+    let ttl_bump = text_visibility::ttl_bump_delay_ms(&body);
+    // The app's rendered pixels change between these two bumps, so a vision
+    // capture cached on either side of the change is not reused across it.
+    bump();
+    let out = match dispatcher
+        .dispatch_active(
+            sdk_connection,
+            text_visibility::SDK_ACTION,
+            Method::POST,
+            text_visibility::SDK_PATH,
+            body,
+        )
+        .await
+    {
+        Ok(data) => data,
+        Err(e) => serde_json::json!({ "success": false, "error": dispatch_err_to_string(e) }),
+    };
+    bump();
+    // The app's TTL restores its page with no request this runner sees: the
+    // bump is counted from the reply, by which time the app's timer runs
+    // (`text_visibility::TTL_BUMP_MARGIN_MS`).
+    if let Some(delay_ms) = ttl_bump {
+        bump_after_ttl(delay_ms);
+    }
+    out
+}
+
+/// POST /ui-bridge/sdk/control/text-visibility — Hide or restore every glyph in the SDK app
+async fn handle_text_visibility(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let bump = || crate::mcp::ui_bridge::vision_routes::bump_mutation_id(&state);
+    let bump_after_ttl =
+        |delay_ms| crate::mcp::ui_bridge::text_visibility::schedule_mutation_bump(&state, delay_ms);
+    Json(
+        sdk_text_visibility(
+            &state.app_dispatcher,
+            &state.sdk_connection,
+            body,
+            bump,
+            bump_after_ttl,
+        )
+        .await,
+    )
+}
+
 /// GET /ui-bridge/sdk/debug/metrics — Debug metrics
 async fn handle_debug_metrics(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     match sdk_request(&state, Method::GET, "/debug/metrics", None).await {
@@ -7298,6 +7372,11 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/ui-bridge/sdk/control/page/scroll",
             post(handle_page_scroll),
         )
+        // Text visibility (dev control; Phase 16)
+        .route(
+            "/ui-bridge/sdk/control/text-visibility",
+            post(handle_text_visibility),
+        )
         // Viewport
         .route(
             "/ui-bridge/sdk/control/viewport",
@@ -9446,5 +9525,231 @@ mod element_filters_tests {
         let filters = ElementFilters::from_query(&q);
         assert!(filters.keeps(&json!({"type": "button"})));
         assert!(filters.keeps(&json!({"category": "content"})));
+    }
+}
+
+/// The `/sdk/` text visibility, entered through its handler body with a real
+/// [`AppDispatcher`](super::app_dispatch::AppDispatcher): an HTTP-registered
+/// app that echoes what it is sent, and a WebSocket-registered one whose frame
+/// is read off the socket.
+#[cfg(test)]
+mod text_visibility_dispatch_tests {
+    use super::{sdk_text_visibility, SdkAppInfo, SdkConnection, SdkConnectionManager};
+    use crate::mcp::app_discovery::DiscoveredApp;
+    use crate::mcp::app_dispatch::AppDispatcher;
+    use crate::mcp::app_registry::{AppRegistry, AppTransport};
+    use crate::mcp::command_relay::CommandRelay;
+    use crate::mcp::ws_relay::WsConnectionManager;
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex;
+
+    fn sample_app(app_id: &str, base_url: &str) -> DiscoveredApp {
+        DiscoveredApp {
+            app_id: app_id.to_string(),
+            app_name: "t".into(),
+            app_type: "web".into(),
+            framework: None,
+            url: base_url.to_string(),
+            port: 0,
+            base_path: "".into(),
+            version: None,
+            capabilities: vec![],
+            element_count: None,
+            component_count: None,
+            discovered_at: 0,
+        }
+    }
+
+    /// An SDK connection manager whose active connection is `app_id` at `url`,
+    /// primed "responsive" so an HTTP dispatch skips the `/health` probe.
+    fn active(app_id: &str, url: &str) -> Arc<Mutex<SdkConnectionManager>> {
+        let mut mgr = SdkConnectionManager::new();
+        mgr.connections.insert(
+            url.to_string(),
+            SdkConnection {
+                app_url: url.to_string(),
+                base_path: String::new(),
+                app_info: SdkAppInfo {
+                    app_id: app_id.to_string(),
+                    app_name: "t".into(),
+                    app_type: "web".into(),
+                    framework: None,
+                    version: None,
+                    capabilities: vec![],
+                    port: 0,
+                },
+                client: reqwest::Client::new(),
+                connected_at: 0,
+                transport_kind: None,
+                physical_device_id: None,
+                activated_by: None,
+            },
+        );
+        mgr.active_url = Some(url.to_string());
+        mgr.active_responsive = Some(true);
+        mgr.active_responsive_checked_at = chrono::Utc::now().timestamp_millis();
+        Arc::new(Mutex::new(mgr))
+    }
+
+    /// A loopback HTTP app answering any method and path with `{success: true,
+    /// path, got: <the JSON body it was sent>}`.
+    async fn json_echo_app() -> String {
+        let app = axum::Router::new().fallback(
+            |uri: axum::http::Uri, bytes: axum::body::Bytes| async move {
+                let got: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                axum::Json(json!({"success": true, "path": uri.path(), "got": got}))
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        url
+    }
+
+    async fn http_target() -> (Arc<AppDispatcher>, Arc<Mutex<SdkConnectionManager>>) {
+        let registry = AppRegistry::new();
+        let url = json_echo_app().await;
+        registry
+            .upsert(
+                sample_app("happ", &url),
+                None,
+                AppTransport::Http,
+                None,
+                None,
+            )
+            .await;
+        let relay = CommandRelay::new(WsConnectionManager::new());
+        (AppDispatcher::new(registry, relay), active("happ", &url))
+    }
+
+    #[tokio::test]
+    async fn an_invalid_body_is_refused_before_anything_is_dispatched() {
+        let (d, c) = http_target().await;
+        for (body, needle) in [
+            (json!({}), "hidden must be a boolean"),
+            (
+                json!({"hidden": true, "ttlMs": 10}),
+                "ttlMs must be an integer",
+            ),
+        ] {
+            let out = sdk_text_visibility(&d, &c, body, || {}, |_| {}).await;
+            assert_eq!(out["code"], json!("INVALID_REQUEST"), "{out}");
+            assert!(
+                out["error"].as_str().unwrap_or("").contains(needle),
+                "{out}"
+            );
+            assert!(
+                out.get("got").is_none(),
+                "the app must not have been sent it: {out}"
+            );
+        }
+    }
+
+    /// The runner arm's own fields are refused here too — answered, like every
+    /// `/sdk/` validation failure, as `{success: false, code: INVALID_REQUEST}`.
+    #[tokio::test]
+    async fn the_arm_only_fields_are_refused_before_anything_is_dispatched() {
+        let (d, c) = http_target().await;
+        for body in [
+            json!({"hidden": false, "query": true}),
+            json!({"hidden": true, "onlyIfVisible": true}),
+        ] {
+            let out = sdk_text_visibility(&d, &c, body.clone(), || {}, |_| {}).await;
+            assert_eq!(out["success"], json!(false), "{body}: {out}");
+            assert_eq!(out["code"], json!("INVALID_REQUEST"), "{body}: {out}");
+            assert!(
+                out["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("reserved for the runner's internal capture arm"),
+                "{body}: {out}"
+            );
+            assert!(
+                out.get("got").is_none(),
+                "{body}: the app must not have been sent it"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_http_app_is_sent_the_body_at_its_text_visibility_route() {
+        let (d, c) = http_target().await;
+        let body = json!({"hidden": true, "ttlMs": 5_000});
+        let bumps = std::sync::atomic::AtomicU32::new(0);
+        let ttl = std::sync::Mutex::new(Vec::new());
+        let out = sdk_text_visibility(
+            &d,
+            &c,
+            body.clone(),
+            || {
+                bumps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            },
+            |ms| ttl.lock().unwrap().push(ms),
+        )
+        .await;
+        assert_eq!(
+            *ttl.lock().unwrap(),
+            [5_000 + crate::mcp::ui_bridge::text_visibility::TTL_BUMP_MARGIN_MS],
+            "the app's TTL restore gets its own scheduled bump"
+        );
+        assert_eq!(out["path"], json!("/control/text-visibility"), "{out}");
+        assert_eq!(out["got"], body, "{out}");
+        assert_eq!(
+            bumps.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the vision mutation id is bumped before and after the change"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_websocket_app_is_sent_the_text_visibility_command_with_the_body() {
+        let registry = AppRegistry::new();
+        let ws = WsConnectionManager::new();
+        let (_conn_id, mut outbound_rx) = ws.test_register("wapp").await;
+        registry
+            .upsert(
+                sample_app("wapp", "ws-app://wapp"),
+                None,
+                AppTransport::Websocket,
+                Some(1),
+                None,
+            )
+            .await;
+        let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
+        let (d, c) = (
+            AppDispatcher::new(registry, relay),
+            active("wapp", "ws-app://wapp"),
+        );
+        let pending = tokio::spawn(async move {
+            sdk_text_visibility(&d, &c, json!({"hidden": false}), || {}, |_| {}).await
+        });
+        let frame = tokio::time::timeout(Duration::from_secs(5), outbound_rx.recv())
+            .await
+            .expect("no frame within 5 s")
+            .expect("outbound channel closed");
+        pending.abort();
+        let frame: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(frame["action"], json!("textVisibility"), "{frame}");
+        assert_eq!(frame["payload"], json!({"hidden": false}), "{frame}");
+    }
+
+    /// The real handler wires the real TTL-restore bump (pinned by source: a
+    /// handler needs an `ApiState`, which no test builds).
+    #[test]
+    fn the_sdk_handler_wires_the_real_ttl_bump() {
+        let src = include_str!("sdk_client.rs");
+        let (_, body) = src
+            .split_once("async fn handle_text_visibility(")
+            .expect("handler");
+        let (body, _) = body.split_once("\n}\n").expect("handler ends");
+        assert!(
+            body.contains("text_visibility::schedule_mutation_bump(&state, delay_ms)"),
+            "{body}"
+        );
+        assert!(body.contains("bump_after_ttl,"), "{body}");
     }
 }
