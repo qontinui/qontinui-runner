@@ -52,10 +52,15 @@
 //!   answers `422 too_many_rows` above that and never truncates. The runner has
 //!   no read telling it which ids coord lacks, so it rotates: rows are sent
 //!   oldest-reported first (never-reported first of all, most recently acted
-//!   first among those).
+//!   first among those). LIVE rows with an unaccepted fact go ahead of that
+//!   rotation on every pass: coord inserts a never-seen ended session as
+//!   CLOSED and reopens it on a later `live: true` report, so a resumed
+//!   session must not wait out a backlog of ended ones to be reopened.
 //! - **Watermark.** A local per-id record of the facts last ACCEPTED by coord
-//!   (`config_dir`, `tag_name`, `last_acted_at`, and `registry_name` when one
-//!   is known). A row whose facts are unchanged is not re-sent; a changed fact
+//!   (`live`, `config_dir`, `tag_name`, `last_acted_at`, and `registry_name`
+//!   when one is known). `live` is part of it, so a session first reported
+//!   ended and later seen live is re-sent as live even when every other fact
+//!   is unchanged. A row whose facts are unchanged is not re-sent; a changed fact
 //!   is. An absent `registry_name` (the session ended) does not count as a
 //!   change — it means "no live registry fact", not "the name was removed".
 //!   Persisted beside the session ledger
@@ -166,6 +171,7 @@ pub struct IdentityRow {
 impl IdentityRow {
     fn facts(&self) -> ReportedFacts {
         ReportedFacts {
+            live: self.live,
             config_dir: self.config_dir.clone(),
             tag_name: self.tag_name.clone(),
             last_acted_at: self.last_acted_at.clone(),
@@ -407,6 +413,11 @@ pub fn build_candidates(
 /// The facts coord last accepted for one id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReportedFacts {
+    /// Whether the row was reported live. `#[serde(default)]`: an entry
+    /// written before `live` was part of the key loads as `false` (ended),
+    /// which at worst re-sends a live row once.
+    #[serde(default)]
+    pub live: bool,
     pub config_dir: String,
     pub tag_name: Option<String>,
     pub last_acted_at: Option<String>,
@@ -453,16 +464,19 @@ impl Watermark {
         let Some(e) = self.entries.get(&row.session_id) else {
             return true;
         };
-        e.facts.config_dir != row.config_dir
+        e.facts.live != row.live
+            || e.facts.config_dir != row.config_dir
             || e.facts.tag_name != row.tag_name
             || e.facts.last_acted_at != row.last_acted_at
             || (row.registry_name.is_some() && e.facts.registry_name != row.registry_name)
     }
 
-    /// The next window: rows with an unaccepted fact, oldest-reported first —
-    /// never-reported first of all, most recently acted first among those —
-    /// at most `window` of them. A row quarantined with these exact facts is
-    /// skipped.
+    /// The next window: rows with an unaccepted fact, at most `window` of them.
+    /// LIVE rows go first on every pass — a resumed session is reopened by
+    /// coord on its `live: true` report, so it must not queue behind the
+    /// ended backlog — then oldest-reported first: never-reported first of
+    /// all, most recently acted first among those. A row quarantined with
+    /// these exact facts is skipped.
     pub fn select(
         &self,
         rows: &[IdentityRow],
@@ -476,7 +490,9 @@ impl Watermark {
             .map(|r| (r, self.entries.get(&r.session_id).map(|e| e.reported_at_ms)))
             .collect();
         pending.sort_by(|(a, ra), (b, rb)| {
-            ra.cmp(rb)
+            b.live
+                .cmp(&a.live)
+                .then_with(|| ra.cmp(rb))
                 .then_with(|| b.last_acted_at.cmp(&a.last_acted_at))
                 .then_with(|| a.session_id.cmp(&b.session_id))
         });
@@ -1309,14 +1325,29 @@ mod tests {
         moved.config_dir = "/h/.claude-gmail".to_string();
         assert_eq!(wm.select(std::slice::from_ref(&moved), 500, &q).len(), 1);
 
-        // A live registry name is a fact; its later absence (the session
-        // ended) is not a change.
+        // A live registry name is a fact; its later absence is not a change
+        // — absent means "no operator-chosen registry fact this pass", not
+        // "renamed to nothing", and the watermark keeps the accepted name.
         let mut live = r.clone();
         live.live = true;
         live.registry_name = Some("spaceship-latency".to_string());
         assert_eq!(wm.select(std::slice::from_ref(&live), 500, &q).len(), 1);
         assert_eq!(wm.record_sent(std::slice::from_ref(&live), 2), 0);
-        assert!(wm.select(std::slice::from_ref(&r), 500, &q).is_empty());
+        let live_unnamed = IdentityRow {
+            registry_name: None,
+            ..live.clone()
+        };
+        assert!(wm
+            .select(std::slice::from_ref(&live_unnamed), 500, &q)
+            .is_empty());
+        // The session ending IS a change (`live` is part of the key), and the
+        // accepted registry name survives it.
+        assert_eq!(wm.select(std::slice::from_ref(&r), 500, &q).len(), 1);
+        wm.record_sent(std::slice::from_ref(&r), 3);
+        assert_eq!(
+            wm.entries[SID_A].facts.registry_name.as_deref(),
+            Some("spaceship-latency")
+        );
     }
 
     #[test]
@@ -1673,6 +1704,55 @@ mod tests {
             got.rows[0].last_acted_at.as_deref(),
             Some("2026-10-19T12:00:00.000Z")
         );
+    }
+
+    #[test]
+    fn a_session_reported_ended_then_seen_live_is_resent_as_live_next_pass() {
+        let q = HashMap::new();
+        let mut wm = Watermark::default();
+        let ended = row(SID_A, "2026-10-19T09:00:00.000Z");
+        wm.record_sent(std::slice::from_ref(&ended), 1);
+        assert!(wm.select(std::slice::from_ref(&ended), 500, &q).is_empty());
+
+        // Resumed: the same config dir, tag name and newest turn, now live and
+        // with no operator-chosen registry name — only `live` changed.
+        let resumed = IdentityRow {
+            live: true,
+            ..ended.clone()
+        };
+        assert_eq!(
+            wm.select(std::slice::from_ref(&resumed), 500, &q),
+            vec![resumed.clone()],
+            "the live report that reopens the session must be sent"
+        );
+        wm.record_sent(std::slice::from_ref(&resumed), 2);
+        assert!(wm
+            .select(std::slice::from_ref(&resumed), 500, &q)
+            .is_empty());
+        // And ending again is a change too.
+        assert_eq!(wm.select(std::slice::from_ref(&ended), 500, &q).len(), 1);
+    }
+
+    #[test]
+    fn live_rows_win_the_window_over_never_reported_transcript_rows() {
+        let q = HashMap::new();
+        let mut wm = Watermark::default();
+        let mut rows = many_rows(600);
+        // Two live sessions: one already reported ended (so it is NOT
+        // never-reported, and the rotation alone would put it last), one new
+        // with the OLDEST turn of all.
+        let resumed_id = rows[0].session_id.clone();
+        wm.record_sent(&rows[..1], 1);
+        rows[0].live = true;
+        rows[1].live = true;
+        rows[1].last_acted_at = Some("2020-01-01T00:00:00.000Z".to_string());
+
+        let got = wm.select(&rows, MAX_ROWS_PER_POST, &q);
+        assert_eq!(got.len(), MAX_ROWS_PER_POST);
+        assert!(got[0].live && got[1].live, "live rows lead the window");
+        let ids: HashSet<&str> = got.iter().map(|r| r.session_id.as_str()).collect();
+        assert!(ids.contains(resumed_id.as_str()));
+        assert!(ids.contains(rows[1].session_id.as_str()));
     }
 
     #[test]
