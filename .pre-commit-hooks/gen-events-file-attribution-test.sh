@@ -849,8 +849,11 @@ check "  also inside the function body" 1 "$rc"
 out="$(registry_text | sed 's/^use schemars::schema_for;/use crate::m as schemars;\nuse schemars::schema_for;/' | parse_text)"; rc=$?
 check "a rebound schemars is refused" 1 "$rc"
 
-out="$(registry_text | sed 's/    Value::Object(m)/    crate::m::Object(m)/' | parse_text)"; rc=$?
+out="$(registry_text | sed 's/    Value::Object(m)/    crate::wrap::Object(m)/' | parse_text)"; rc=$?
 check "a final Object(m) from this crate is refused" 1 "$rc"
+
+out="$(registry_text | sed 's/    Value::Object(m)/    crate::wrap::Value::Object(m)/' | parse_text)"; rc=$?
+check "  also when it ends with the expected words" 1 "$rc"
 
 out="$(registry_text | sed 's/^use serde_json::{Map, Value};/use serde_json::Map;\nuse crate::v::Value;/' | parse_text)"; rc=$?
 check "an unqualified Value from this crate is refused" 1 "$rc"

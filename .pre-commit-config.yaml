@@ -140,7 +140,7 @@ repos:
         language: system
         stages: [pre-commit]
         verbose: true
-        files: '^(\.pre-commit-hooks/(lib/(gen-events-file-attribution\.sh|gen-events-registry\.mjs|gen-events-attribution\.sh|push-range\.sh)|gen-events-file-attribution-test\.sh|gen-events-drift\.sh)|src-tauri/src/(schema_export|lib)\.rs)$'
+        files: '^(\.pre-commit-hooks/(lib/(gen-events-file-attribution\.sh|gen-events-registry\.mjs|gen-events-attribution\.sh|push-range\.sh)|gen-events-file-attribution-test\.sh|gen-events-drift\.sh)|src-tauri/src/(schema_export|lib|bin/export_schemas)\.rs)$'
         pass_filenames: false
 
       # How the drift hook finds the repo root. The commit-sourced pre-push shim

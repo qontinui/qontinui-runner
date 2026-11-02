@@ -70,6 +70,10 @@
 #     impl reads while it builds its schema. No impl does that today, and
 #     only regenerating at the merge-base would catch it. Regenerating there
 #     was rejected because it doubles a release build that measured 2m32s.
+#   - a deliberately misleading lib.rs: `pub mod schema_export;` inside a dead
+#     `macro_rules!`, with `pub use payloads as schema_export;` as the one that
+#     compiles. A reader this size cannot expand macros, and no refactor writes
+#     that by accident.
 #   - a qontinui-schemas checkout whose Rust and TS halves disagree. That is
 #     drift, but no runner push can cause it or clear it, and the
 #     content rule rightly calls it pre-existing.
