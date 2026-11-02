@@ -2773,6 +2773,37 @@ mod tests {
         );
     }
 
+    /// The error text a gate continuation's retry and coord's classifier key on
+    /// survives the holder route: a failed exec in the fallback spawn still names
+    /// the launch failure. Fails if this door stops embedding the fallback's error.
+    #[cfg(unix)]
+    #[test]
+    fn pty_holder_fallback_failed_exec_error_carries_the_launch_marker() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("bad-interp.sh");
+        std::fs::write(&script, "#!/nonexistent/qontinui-interp\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cmd = portable_pty::CommandBuilder::new(&script);
+        cmd.cwd(dir.path());
+        let result = spawn_holder_pane_or_fallback_in(
+            Err("no holder in this test".into()),
+            Err("unused".into()),
+            "fallback-exec-term",
+            ScrubbedCommand::seal(cmd),
+            80,
+            24,
+        );
+        let err = match result {
+            Ok(_) => panic!("a failed exec in the fallback must come back as Err"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains(crate::terminal::pane_io::PTY_SPAWN_FAILED),
+            "{err}"
+        );
+    }
+
     /// With no holder available, the switch-on path falls back to an
     /// in-process PTY and the pane SAYS so before its first byte.
     #[test]

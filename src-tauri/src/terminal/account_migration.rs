@@ -1044,7 +1044,7 @@ pub(crate) fn spawn_resumed_pane(
         spec.correlation_topic,
         spec.intent_repo,
         Some(command),
-        None,
+        &mut None,
         capture_hint,
         Some(spec.page_id),
         spec.resource_override,

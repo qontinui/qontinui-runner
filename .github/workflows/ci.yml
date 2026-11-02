@@ -318,6 +318,15 @@ jobs:
       - name: Run CI-tooling unit tests (ci-flake-analyze, ci-test-results-ingest, ci-expiry-phase-summary)
         run: node --test scripts/__tests__/ci-flake-analyze.test.mjs scripts/__tests__/ci-test-results-ingest.test.mjs scripts/__tests__/ci-expiry-phase-summary.test.mjs
 
+      # The provenance lists must match each other and the manifests, or a crate
+      # reaches the binary without moving the hash. Linux only: the file's git
+      # fixtures create symlinks, which the Windows leg has never been verified
+      # against, and one OS is enough to compare these lists. Also needs no
+      # `pnpm install`; it does need `git`.
+      - name: Run provenance unit tests (frontend-provenance)
+        if: runner.os == 'Linux'
+        run: node --test scripts/__tests__/frontend-provenance.test.mjs
+
       # Pin matches rust-toolchain.toml (channel = "1.95.0"). The toolchain
       # file overrides any other channel for every cargo invocation, so the
       # rustfmt/clippy components must be installed for 1.95.0 specifically —

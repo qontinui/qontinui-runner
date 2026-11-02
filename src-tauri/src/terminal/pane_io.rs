@@ -223,6 +223,27 @@ impl ScrubbedCommand {
     }
 }
 
+/// How the error from [`OpenedPty::spawn`] begins: the child could not be
+/// launched, so nothing ran. With the vendored portable-pty patch that covers
+/// a failed `exec` as well as portable-pty's own pre-fork checks. A caller that
+/// retries a failed launch keys on this text, because the spawn seam returns
+/// `String`.
+pub(crate) const PTY_SPAWN_FAILED: &str = "Failed to spawn shell:";
+
+/// How the error from [`LocalPty::open`] begins: no PTY, so no child either.
+pub(crate) const PTY_OPEN_FAILED: &str = "Failed to open PTY:";
+
+/// Where a launch failure's own text starts in an error from the spawn seam, or
+/// `None` when the error is something else. Mid-string on the holder route, whose
+/// fallback wraps the error. A holder's refusal to fall back carries neither
+/// marker, and rightly: its command may have run.
+pub(crate) fn launch_failure_at(e: &str) -> Option<usize> {
+    [PTY_SPAWN_FAILED, PTY_OPEN_FAILED]
+        .iter()
+        .filter_map(|marker| e.find(marker))
+        .min()
+}
+
 /// A PTY pair that has been opened but not yet given a child.
 ///
 /// Two steps rather than one because `TerminalSession::spawn` opens the PTY
@@ -241,7 +262,7 @@ impl OpenedPty {
         let child = pair
             .slave
             .spawn_command(cmd.0)
-            .map_err(|e| format!("Failed to spawn shell: {}", e))?;
+            .map_err(|e| format!("{PTY_SPAWN_FAILED} {e}"))?;
         let pid = child.process_id();
         // Our own handle on the root, taken while the child is certainly
         // alive and ours: while it is open the pid cannot be reused, so the
@@ -302,7 +323,7 @@ impl LocalPty {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|e| format!("Failed to open PTY: {}", e))?;
+            .map_err(|e| format!("{PTY_OPEN_FAILED} {e}"))?;
         Ok(OpenedPty {
             label: label.to_string(),
             pair,

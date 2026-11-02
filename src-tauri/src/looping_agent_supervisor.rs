@@ -1420,7 +1420,7 @@ async fn spawn_looping_agent_terminal(
             Some(format!("looping-agent:{}", def.id)),
             def.repos.first().cloned(),
             command,
-            None,
+            &mut None,
             capture_hint,
             Some(target_page),
             // UNATTENDED spawn — respect the critical floor. A looping agent is

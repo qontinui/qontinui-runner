@@ -1891,12 +1891,32 @@ impl TerminalSession {
         // Spawn the child process. `seal` is the type-level half of the
         // credential-scrub obligation (see `pane_io`); `finalize_child_env`
         // above already ran the same scrub as the production env tail.
+        let resumes_a_session = Self::explicit_ids_from(&cmd).0.is_some();
         let sealed = ScrubbedCommand::seal(cmd);
-        let io: Arc<dyn PaneIo> = match opened {
-            Some(opened) => Arc::new(opened.spawn(sealed)?),
+        let spawned: Result<Arc<dyn PaneIo>, String> = match opened {
+            Some(opened) => opened
+                .spawn(sealed)
+                .map(|io| Arc::new(io) as Arc<dyn PaneIo>),
             None => crate::terminal::daemon_pane_io::spawn_holder_pane_or_fallback(
                 &id, sealed, cols, rows,
-            )?,
+            ),
+        };
+        let io = match spawned {
+            Ok(io) => io,
+            Err(e) => {
+                if let Some(store) = tauri::Manager::try_state::<
+                    Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>,
+                >(&app_handle)
+                {
+                    Self::retire_session_of_failed_launch(
+                        &store,
+                        &pinned_session_id,
+                        &e,
+                        resumes_a_session,
+                    );
+                }
+                return Err(e);
+            }
         };
 
         Self::spawn_with_io(
@@ -3120,6 +3140,14 @@ impl TerminalSession {
     /// omits `--session-id` when both are specified. Getting this backwards
     /// would re-introduce the phantom for that argv shape.
     fn explicit_session_id_from(cmd: &CommandBuilder) -> Option<String> {
+        let (resume_id, session_id) = Self::explicit_ids_from(cmd);
+        // resume beats session-id (launch_spec.rs:225-235).
+        resume_id.or(session_id)
+    }
+
+    /// What argv names, as `(resume id, session id)`: see
+    /// [`Self::explicit_session_id_from`] for the grammar.
+    fn explicit_ids_from(cmd: &CommandBuilder) -> (Option<String>, Option<String>) {
         let argv = cmd.get_argv();
         // The ambiguous SHORT form only when the child IS claude — see
         // `argv_head_is_claude`.
@@ -3154,8 +3182,25 @@ impl TerminalSession {
             }
         }
 
-        // resume beats session-id (launch_spec.rs:225-235).
-        resume_id.or(session_id)
+        (resume_id, session_id)
+    }
+
+    /// After a failed spawn, close the session the identity seam just recorded, if
+    /// nothing ran ([`crate::terminal::pane_io::launch_failure_at`]) and the id is not
+    /// a `--resume` id, which names a real session a failed launch must not retire.
+    ///
+    /// With no pane, no exit hook will close it. Left open, the row matches the
+    /// caller's next terminal by page, title and workdir, and a restart restores a
+    /// session that never ran.
+    fn retire_session_of_failed_launch(
+        store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+        session_id: &str,
+        e: &str,
+        resumes_a_session: bool,
+    ) {
+        if !resumes_a_session && crate::terminal::pane_io::launch_failure_at(e).is_some() {
+            store.record_close(session_id, "never-started");
+        }
     }
 
     /// The id a `--flag`-prefixed argv token names: the attached `=<id>` form,
@@ -6885,6 +6930,65 @@ pub(crate) mod tests {
         assert_eq!(TerminalSession::explicit_session_id_from(&cmd), None);
         let cmd = claude_argv(&["--resumeX", "abc-123"]);
         assert_eq!(TerminalSession::explicit_session_id_from(&cmd), None);
+    }
+
+    #[test]
+    fn a_failed_launch_retires_only_a_session_that_never_ran() {
+        use crate::session::session_lifecycle_store::{SessionLifecycleStore, DEFAULT_PROVIDER};
+
+        let resumes = |args: &[&str]| {
+            TerminalSession::explicit_ids_from(&claude_argv(args))
+                .0
+                .is_some()
+        };
+        assert!(resumes(&["--resume", "abc-123"]));
+        assert!(resumes(&["--session-id", "aaa-111", "-r", "bbb-222"]));
+        assert!(!resumes(&["--session-id", "abc-123"]));
+        assert!(!resumes(&["--continue"]));
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let close_reason_after = |id: &str, e: &str, resumes_a_session: bool| {
+            crate::commands::terminal::record_pinned_session_open(
+                &store,
+                id.to_string(),
+                format!("term-{id}"),
+                None,
+                dir.path().to_string_lossy().into_owned(),
+                "title".to_string(),
+                "page".to_string(),
+                0,
+                DEFAULT_PROVIDER.to_string(),
+                None,
+            );
+            TerminalSession::retire_session_of_failed_launch(&store, id, e, resumes_a_session);
+            store.get(id).expect("the seam's row").close_reason
+        };
+
+        for (i, launch) in [
+            "Failed to spawn shell: No such file or directory (os error 2)",
+            "PTY holder unavailable (x); in-process fallback failed: Failed to spawn shell: y",
+            "PTY holder unavailable (x); in-process fallback failed: Failed to open PTY: y",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                close_reason_after(&format!("fresh-{i}"), launch, false).as_deref(),
+                Some("never-started"),
+                "{launch}"
+            );
+            assert_eq!(
+                close_reason_after(&format!("resumed-{i}"), launch, true),
+                None,
+                "{launch}"
+            );
+        }
+        // A holder that refused to fall back may have run the command.
+        let may_have_run = "a PTY holder already ran this tab's command and exited before it \
+                            could be attached (x); no in-process fallback, which would run the \
+                            command a second time";
+        assert_eq!(close_reason_after("holder", may_have_run, false), None);
     }
 
     /// The id the seam hands back to the spawn — and so the id the coord row

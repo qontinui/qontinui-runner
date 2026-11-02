@@ -2485,7 +2485,7 @@ pub(crate) fn create_tracked_terminal_session_backend(
     correlation_topic: Option<String>,
     intent_repo: Option<String>,
     command: Option<Vec<String>>,
-    isolated_ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    isolated_ctx: &mut Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
     capture_hint: SessionCaptureHint,
     page_id: Option<String>,
     resource_override: bool,
@@ -2519,8 +2519,10 @@ pub(crate) fn create_tracked_terminal_session_backend(
 /// Unlike [`terminal_create`] this does NOT acquire a worktree itself — the
 /// gate-continuation path already acquired one (with its heartbeat) in P0.1 and
 /// hands the resulting `IsolatedEditContext` in via `isolated_ctx` so ownership
-/// (and the heartbeat) transfers to the terminal session. Returns the new
-/// terminal id and the coord session id (when registration succeeded).
+/// (and the heartbeat) transfers to the terminal session. The transfer happens
+/// only once the PTY exists: on `Err` the context stays in the caller's slot, so
+/// a caller that retries the spawn keeps its claim. Returns the new terminal id
+/// and the coord session id (when registration succeeded).
 ///
 /// Prefer [`create_tracked_terminal_session_backend`] — the `capture_hint:
 /// Option<_>` shape here exists only for a path that genuinely cannot know
@@ -2537,7 +2539,7 @@ pub(crate) fn create_terminal_session_backend(
     correlation_topic: Option<String>,
     intent_repo: Option<String>,
     command: Option<Vec<String>>,
-    isolated_ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    isolated_ctx: &mut Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
     capture_hint: Option<SessionCaptureHint>,
     page_id: Option<String>,
     // Part D — forwarded to the spawn-time resource gate. Threaded through
@@ -2661,7 +2663,7 @@ pub(crate) fn create_terminal_session_backend(
     // Park the pre-acquired isolated edit context on the session so its
     // heartbeat + claim live as long as the PTY and release on close — the
     // visible session keeps the SAME claim bookkeeping the headless path holds.
-    if let Some(ctx) = isolated_ctx {
+    if let Some(ctx) = isolated_ctx.take() {
         if let Some(session) = terminal_manager.get(&info.id) {
             session.set_isolated_edit_ctx(ctx);
         }

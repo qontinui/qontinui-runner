@@ -6410,8 +6410,8 @@ async fn run_gate_continuation_inner(
     // successful acquire leaves the runner's own allocation naming an id that
     // never ran a session — the allocate already carried it. The outcome post
     // and the dispatch-allocation report below do NOT bind it in that case.
-    // The same holds for a terminal start that needed a local never-started
-    // retry: the retry runs under a fresh id (see [`run_continuation_terminal`]),
+    // The same holds for a terminal start that needed a local retry, after a
+    // failed launch or a never-started pane: the retry runs under a fresh id (see [`run_continuation_terminal`]),
     // which the outcome and the report bind, while the runner's own allocation
     // keeps naming the first attempt's id.
     //
@@ -6991,8 +6991,8 @@ async fn run_continuation_terminal(
     // legal next write is a `work_*` token (`spawned → spawn_failed` is
     // refused), and nothing re-delivers a claimed continuation. So the
     // `spawned` verdict is withheld until [`await_continuation_start`] has
-    // seen the session start, a never-started attempt is retried locally
-    // (bounded by [`CONTINUATION_START_MAX_ATTEMPTS`]), and only an
+    // seen the session start, a never-started attempt or a failed launch is
+    // retried locally (bounded by [`CONTINUATION_START_MAX_ATTEMPTS`]), and only an
     // exhausted retry surfaces as an `Err` — which the caller posts as the
     // FIRST outcome, `spawn_failed: <detail>`, the token gate_doctor flags at
     // once.
@@ -7002,9 +7002,10 @@ async fn run_continuation_terminal(
         // Pre-pin the Claude session id (#548 Phase 1): the registry records
         // synchronously at spawn instead of mtime-guessing from transcripts.
         // Attempt 1 runs under the caller's id — the one the worktree allocate
-        // carried. A never-started retry gets a fresh id: the dead pane stays
-        // visible under the old one and its coord session row was just closed,
-        // so the id is never reused (the CLI also refuses a reused id).
+        // carried. Any retry gets a fresh id. After a never-started pane, the dead
+        // pane stays visible under the old one and its coord session row was just
+        // closed; after a failed launch, the old id's record was just closed. So
+        // the id is never reused (the CLI also refuses a reused id).
         let attempt_session_id = continuation_attempt_session_id(attempt, pinned_session_id);
         let pinned_session_id = attempt_session_id.to_string();
 
@@ -7163,7 +7164,7 @@ async fn run_continuation_terminal(
             payload.anchor_key.clone(),
             intent_repo.clone(),
             command,
-            ctx.take(),
+            &mut ctx,
             capture_hint,
             Some(target_page),
             // UNATTENDED spawn — resource_override: false, i.e. this path RESPECTS
@@ -7181,6 +7182,29 @@ async fn run_continuation_terminal(
         let (terminal_id, coord_session_id) = match result {
             Ok(created) => created,
             Err(e) => {
+                // The child could not be launched, which is the same transient the
+                // never-started retry below exists for (`claude` mid-reinstall),
+                // reaching us by the other door: a failed exec used to leave a dead
+                // pane and now comes back as `Err` (vendored portable-pty patch).
+                // No pane exists, the spawn closed the record its seam opened, and
+                // the failed create left the worktree claim in `ctx`, so the retry
+                // inherits it.
+                if continuation_create_error_is_retryable(&e, attempt) {
+                    warn!(
+                        "agent_runtime: gate-continuation launch failed \
+                         (attempt {attempt}/{CONTINUATION_START_MAX_ATTEMPTS}): {e} — \
+                         retrying in {}s",
+                        CONTINUATION_START_RETRY_DELAY.as_secs()
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(CONTINUATION_START_RETRY_DELAY).await;
+                    // Re-resolve, as the never-started retry does: the path that
+                    // failed may be the one the reinstall window took away.
+                    claude_bin = spawn_blocking_tracked(resolve_claude_bin)
+                        .await
+                        .unwrap_or_else(|_| claude_bin_path());
+                    continue;
+                }
                 // The PTY seam returns text, so a trust-gate refusal arrives as the
                 // gate's own `spawn_blocked …` string rather than as the typed
                 // `SpawnBlocked` the headless funnel downcasts. Classify it by its
@@ -7190,8 +7214,20 @@ async fn run_continuation_terminal(
                 // (it names the failing conjuncts) rather than wrapped as a create
                 // failure.
                 let (reason, phase) = classify_pty_spawn_error(&e);
-                report_spawn_failed_in_phase(agent_id, &reason, None, 0, None, phase).await;
-                return Err(anyhow::anyhow!(e));
+                report_spawn_failed_in_phase(
+                    agent_id,
+                    &reason,
+                    None,
+                    attempt.saturating_sub(1),
+                    None,
+                    phase,
+                )
+                .await;
+                return Err(anyhow::anyhow!(continuation_spawn_failure_detail(
+                    &e,
+                    &claude_bin,
+                    workdir
+                )));
             }
         };
 
@@ -7316,7 +7352,7 @@ async fn run_continuation_terminal(
 
 /// The Claude session id a terminal continuation's start `attempt` (1-based)
 /// runs under: the caller's pinned id on attempt 1, a fresh one on every
-/// never-started retry.
+/// retry.
 fn continuation_attempt_session_id(attempt: u32, pinned: uuid::Uuid) -> uuid::Uuid {
     if attempt <= 1 {
         pinned
@@ -7329,8 +7365,8 @@ fn continuation_attempt_session_id(attempt: u32, pinned: uuid::Uuid) -> uuid::Uu
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TerminalStart {
     /// The Claude session id the started attempt runs under: the caller's
-    /// pinned id when the first attempt started, a fresh one after a
-    /// never-started retry. This is the id coord may bind.
+    /// pinned id when the first attempt started, a fresh one after any retry.
+    /// This is the id coord may bind.
     session_id: uuid::Uuid,
     /// `Some(terminal_id)` for a session that started and had ALREADY exited by
     /// its verdict: the caller fires the exit path for it once `spawned` is
@@ -7339,8 +7375,8 @@ struct TerminalStart {
 }
 
 /// How many times a gate-continuation terminal is created before a session that
-/// never STARTS is given up on and reported `spawn_failed` (1 initial + 2
-/// retries).
+/// cannot be launched or never STARTS is given up on and reported `spawn_failed`
+/// (1 initial + 2 retries, one budget across both).
 ///
 /// Bounded small on purpose: the transient this exists for (a package manager
 /// briefly unlinking `claude` mid-reinstall, ~2 s) clears in one retry, and a
@@ -7348,7 +7384,7 @@ struct TerminalStart {
 /// gate_doctor as `spawn_failed`, not in a retry loop.
 const CONTINUATION_START_MAX_ATTEMPTS: u32 = 3;
 
-/// Pause between never-started attempts — longer than npm's reify window so a
+/// Pause between attempts — longer than npm's reify window so a
 /// retry does not land inside the same one.
 const CONTINUATION_START_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -7545,6 +7581,72 @@ fn condition_check_never_started_reason(start: &ContinuationStart) -> Option<Str
             "condition-check never started: {}",
             never_started_detail(evidence)
         )),
+    }
+}
+
+/// Whether a failed gate-continuation create gets another attempt: only while
+/// attempts remain, and only when the child could not be launched
+/// ([`crate::terminal::pane_io::PTY_SPAWN_FAILED`], which a holder fallback's
+/// error carries mid-string). Every other create error is a verdict, not the
+/// reinstall transient: the resource floor and the trust gate refuse on purpose,
+/// and coord re-dispatches on the floor once the box has room. The marker does not
+/// tell a transient exec failure from a permanent one, so a permanent one spends
+/// the attempts too, about 10 s, before it is reported.
+fn continuation_create_error_is_retryable(e: &str, attempt: u32) -> bool {
+    attempt < CONTINUATION_START_MAX_ATTEMPTS
+        && e.contains(crate::terminal::pane_io::PTY_SPAWN_FAILED)
+}
+
+/// The `spawn_failed` detail for a create error that survived the local retries.
+///
+/// coord classifies a detail by its head and keeps only its first 200 characters,
+/// so the launch failure has to come first. Without this the default Linux route
+/// posts `PTY holder unavailable (…); in-process fallback failed: Failed to spawn
+/// shell: …`, which coord reads as deterministic: an alert and no redrive, for the
+/// transients its retry table exists for. The wrapper comes off every launch
+/// failure, which is enough for a `Failed to open PTY` out of descriptors. A
+/// transient exec errno, or portable-pty's own `Unable to spawn` check, takes the
+/// head the headless path uses for the same failure
+/// ([`crate::claude_cli_spawn::CLI_UNAVAILABLE_HEAD`]); the program here is always
+/// `claude`. Two launch failures stay out of that class. A workdir that is gone
+/// reads as the deterministic refusal, whatever the launch said, because a redrive
+/// has nowhere to run. And `CreateProcessW` of the identity shim is the defect
+/// coord lists as deterministic. Any other error is returned as it is.
+fn continuation_spawn_failure_detail(e: &str, bin: &str, workdir: &str) -> String {
+    let Some(at) = crate::terminal::pane_io::launch_failure_at(e) else {
+        return e.to_string();
+    };
+    let launch = &e[at..];
+    if !std::path::Path::new(workdir).is_dir() {
+        return format!(
+            "{}: {workdir}: {launch}",
+            crate::agent_worktree::canonical_paths::WORKDIR_NOT_A_CHECKOUT
+        );
+    }
+    let Some(cause) = launch.strip_prefix(crate::terminal::pane_io::PTY_SPAWN_FAILED) else {
+        return launch.to_string();
+    };
+    if cause.contains("CreateProcessW") && cause.contains("qontinui-identity-") {
+        return launch.to_string();
+    }
+    let cause_error = if cause.trim_start().starts_with("Unable to spawn ") {
+        // The missing and the not-executable CLI share this one text.
+        Some(std::io::Error::from(std::io::ErrorKind::NotFound))
+    } else {
+        cause
+            .rsplit_once("(os error ")
+            .and_then(|(_, tail)| tail.split(')').next()?.parse::<i32>().ok())
+            .map(std::io::Error::from_raw_os_error)
+    };
+    let transient = cause_error.and_then(|err| {
+        crate::claude_cli_spawn::transient_kind_for_spawn(&err, Some(std::path::Path::new(workdir)))
+    });
+    match transient {
+        Some(kind) => format!(
+            "{}{kind}: spawn `{bin}` in {workdir}: {launch}",
+            crate::claude_cli_spawn::CLI_UNAVAILABLE_HEAD
+        ),
+        None => launch.to_string(),
     }
 }
 
@@ -8164,7 +8266,7 @@ async fn run_condition_check_terminal(
         None, // correlation_topic
         None, // intent_repo — no repo edited
         command,
-        None, // isolated_ctx — no worktree acquired
+        &mut None, // isolated_ctx — no worktree acquired
         capture_hint,
         Some(target_page),
         // UNATTENDED spawn — respect the critical floor (see the gate-
@@ -14505,6 +14607,156 @@ mod tests {
             reason,
             "terminal session create failed: resource_guard:critical:free_commit_bytes: commit \
              headroom"
+        );
+    }
+
+    #[test]
+    fn only_a_failed_launch_gets_another_continuation_attempt() {
+        let in_process = "Failed to spawn shell: No such file or directory (os error 2)";
+        let via_holder = "PTY holder unavailable (holder_error=child spawn: x); in-process \
+                          fallback failed: Failed to spawn shell: No such file or directory \
+                          (os error 2)";
+        for launch in [in_process, via_holder] {
+            assert!(
+                continuation_create_error_is_retryable(launch, 1),
+                "{launch}"
+            );
+            assert!(
+                continuation_create_error_is_retryable(launch, CONTINUATION_START_MAX_ATTEMPTS - 1),
+                "{launch}"
+            );
+            assert!(
+                !continuation_create_error_is_retryable(launch, CONTINUATION_START_MAX_ATTEMPTS),
+                "an exhausted launch is reported, not retried: {launch}"
+            );
+        }
+        for verdict in [
+            "resource_guard:critical:free_commit_bytes: commit headroom",
+            "spawn_blocked (rule): the workspace is not trusted",
+            "a PTY holder for this tab is still running its command and could not be reached \
+             (x); no in-process fallback, which would run the command a second time",
+            "Failed to open PTY: out of ptys",
+            "Sessions lock poisoned: x",
+        ] {
+            assert!(
+                !continuation_create_error_is_retryable(verdict, 1),
+                "{verdict}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_exhausted_launch_failure_leads_with_what_coord_classifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().to_str().unwrap();
+        let wrapped = "PTY holder unavailable (x); in-process fallback failed: Failed to spawn \
+                       shell: No such file or directory (os error 2)";
+        assert_eq!(
+            continuation_spawn_failure_detail(wrapped, "/x/claude", workdir),
+            format!(
+                "claude_cli_unavailable:enoent: spawn `/x/claude` in {workdir}: Failed to spawn \
+                 shell: No such file or directory (os error 2)"
+            )
+        );
+        // portable-pty's pre-fork check, in both of its real texts. Only the second
+        // matches coord's own `Unable to spawn` rule, so both take the head.
+        for cause in [
+            "Unable to spawn claude because it doesn't exist on the filesystem and was not \
+             found in PATH",
+            "Unable to spawn /x/claude because it doesn't exist on the filesystem or is not \
+             executable (EACCES: Permission denied)",
+        ] {
+            assert_eq!(
+                continuation_spawn_failure_detail(
+                    &format!("PTY holder unavailable (x); in-process fallback failed: Failed to spawn shell: {cause}"),
+                    "/x/claude",
+                    workdir
+                ),
+                format!(
+                    "claude_cli_unavailable:enoent: spawn `/x/claude` in {workdir}: Failed to \
+                     spawn shell: {cause}"
+                )
+            );
+        }
+        // Out of descriptors, at either step: the wrapper comes off, and the head
+        // left is the one coord's descriptor rule reads.
+        assert_eq!(
+            continuation_spawn_failure_detail(
+                "PTY holder unavailable (x); in-process fallback failed: Failed to open PTY: \
+                 Too many open files",
+                "/x/claude",
+                workdir
+            ),
+            "Failed to open PTY: Too many open files"
+        );
+        assert_eq!(
+            continuation_spawn_failure_detail(
+                "PTY holder unavailable (x); in-process fallback failed: Failed to spawn shell: \
+                 Too many open files (os error 24)",
+                "/x/claude",
+                workdir
+            ),
+            "Failed to spawn shell: Too many open files (os error 24)"
+        );
+        // A workdir that is gone is deterministic in both texts of the launch failure,
+        // one of which coord's own rule would otherwise redrive.
+        let gone = dir.path().join("reclaimed");
+        let gone = gone.to_str().unwrap();
+        for launch in [
+            "Failed to spawn shell: No such file or directory (os error 2)",
+            "Failed to spawn shell: Unable to spawn /x/claude because it doesn't exist on the \
+             filesystem or is not executable (x)",
+        ] {
+            assert_eq!(
+                continuation_spawn_failure_detail(launch, "/x/claude", gone),
+                format!("workdir_not_a_checkout: {gone}: {launch}")
+            );
+        }
+        // The identity shim's measured Windows failure stays the defect it is.
+        let shim = "Failed to spawn shell: CreateProcessW `\"C:\\qontinui-identity-1\\claude\"` \
+                    failed: The system cannot find the file specified. (os error 2)";
+        assert_eq!(
+            continuation_spawn_failure_detail(shim, "/x/claude", workdir),
+            shim
+        );
+        // Not a launch failure: untouched, so the trust gate's reason travels as is.
+        let verdict = "spawn_blocked (rule): the workspace is not trusted";
+        assert_eq!(
+            continuation_spawn_failure_detail(verdict, "/x/claude", workdir),
+            verdict
+        );
+    }
+
+    /// The seam the retry rule keys on, driven for real: a failed exec comes back
+    /// from `OpenedPty::spawn` as an `Err` carrying the marker. Fails if the
+    /// vendored portable-pty patch is dropped (the spawn returns `Ok`) or the
+    /// seam's error text moves away from the marker. The cwd is set so that a
+    /// concurrent test deleting `$HOME` cannot produce the `Err` by failing `chdir`.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_exec_comes_back_as_a_retryable_create_error() {
+        use crate::terminal::pane_io::{LocalPty, ScrubbedCommand};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("bad-interp.sh");
+        std::fs::write(&script, "#!/nonexistent/qontinui-interp\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let opened = LocalPty::open("failed-exec-test", 80, 24).unwrap();
+        let mut cmd = portable_pty::CommandBuilder::new(&script);
+        cmd.cwd(dir.path());
+        let err = match opened.spawn(ScrubbedCommand::seal(cmd)) {
+            Ok(_) => panic!("a failed exec must come back as Err, not as a live pane"),
+            Err(e) => e,
+        };
+        assert!(continuation_create_error_is_retryable(&err, 1), "{err}");
+        // And what coord would read once the retries are spent.
+        let detail =
+            continuation_spawn_failure_detail(&err, "claude", dir.path().to_str().unwrap());
+        assert!(
+            detail.starts_with(crate::claude_cli_spawn::CLI_UNAVAILABLE_HEAD),
+            "{detail}"
         );
     }
 
