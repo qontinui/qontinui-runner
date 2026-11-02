@@ -256,6 +256,10 @@ fn row_to_scheduled_task(row: &tokio_postgres::Row) -> StoredScheduledTask {
         catch_up_grace_seconds: catch_up_grace_seconds.max(0) as u32,
         consecutive_launch_failures: consecutive_launch_failures.max(0) as u32,
         launch_failure_backoff_seconds: launch_failure_backoff_seconds.max(0) as u32,
+        // managed/timezone columns are read by the Phase 4 reconciler (plan
+        // 2026-10-29-recurring-agents-declared-in-coord-reconciled-by-runner).
+        timezone: None,
+        managed: None,
     };
     StoredScheduledTask {
         task,

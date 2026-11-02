@@ -383,6 +383,10 @@ pub fn get_workspace_paths_internal(
 ///   the runner already launches with no window at all
 ///   (`ai_provider::claude_cli`, `agent_runtime::spawn_claude_child`).
 ///
+/// So `python.exe` gets no window. The script's `powershell.exe` child still
+/// opens its own console unless the script passes `CREATE_NO_WINDOW` (fixed
+/// in qontinui-claude-config's `spawn-independent-claude.py`).
+///
 /// Job membership is unaffected either way: neither flag is
 /// `CREATE_BREAKAWAY_FROM_JOB`. Plan
 /// `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`

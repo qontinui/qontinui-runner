@@ -57,7 +57,7 @@
 //!
 //! | Existing provenance | Owner | Conversion here |
 //! |---|---|---|
-//! | `WorkspaceRootKind` (`Declared`/`Discovered`/`HomeDefault`/`Unresolved`) | `qontinui_types::paths` | [`impl From<WorkspaceRootKind> for Rung`](#impl-From<WorkspaceRootKind>-for-Rung) |
+//! | `WorkspaceRootKind` (`Declared`/`Discovered`/`SessionRepoParent`/`HomeDefault`/`Unresolved`) | `qontinui_types::paths` | [`impl From<WorkspaceRootKind> for Rung`](#impl-From<WorkspaceRootKind>-for-Rung) |
 //! | `CommandSource` (`Builtin`/`Served`/`DiskCache`) | [`crate::agent_commands`] | [`impl From<CommandSource> for Rung`](#impl-From<CommandSource>-for-Rung) |
 //! | `AgentSkillSource` (`Builtin`/`Served`/`DiskCache`) | [`crate::agent_skills`] | [`Rung::from_agent_skill_source`] |
 //! | `SkillSource` (`Builtin`/`User`/`Community`/`Other`) | [`crate::skills`] | [`rung_for_skill_source`] |
@@ -420,13 +420,19 @@ impl From<WorkspaceRootKind> for Rung {
     ///   [`crate::workspace_paths::runner_workspace_root_from`] passes
     ///   `exe_anchor(std::env::current_exe().ok())` and nothing else — so
     ///   `Discovered` here is exactly "found relative to where this exe sits".
+    /// - `SessionRepoParent` → [`Rung::OperatorCheckout`]. The folder holding the
+    ///   checkout a session was opened on: a checkout on the operator's disk,
+    ///   inferred rather than declared. The runner's own resolver passes no
+    ///   session repository (it is process-wide), so this arm is reached only by
+    ///   a caller that supplies one; it maps anyway because the match must be
+    ///   total.
     /// - `HomeDefault` → [`Rung::OperatorCheckout`]. `<home>/qontinui-root`, the
     ///   portable last-resort convention. Still a checkout on the operator's
     ///   disk; the fact that convention rather than declaration found it is
     ///   preserved in the row's `detail`, not in the rung.
     /// - `Unresolved` → [`Rung::Unresolved`], one to one.
     ///
-    /// **Two upstream variants collapse onto `OperatorCheckout`, and that loss
+    /// **Three upstream variants collapse onto `OperatorCheckout`, and that loss
     /// is deliberate but must not be silent.** Callers building a row from a
     /// `WorkspaceRoot` are required to put the upstream `kind.wire()` in
     /// [`CapabilityRow::detail`] — [`CapabilityObservation::from_workspace_root_kind`]
@@ -436,6 +442,7 @@ impl From<WorkspaceRootKind> for Rung {
         match kind {
             WorkspaceRootKind::Declared => Rung::OperatorCheckout,
             WorkspaceRootKind::Discovered => Rung::ExeRelativeCheckout,
+            WorkspaceRootKind::SessionRepoParent => Rung::OperatorCheckout,
             WorkspaceRootKind::HomeDefault => Rung::OperatorCheckout,
             WorkspaceRootKind::Unresolved => Rung::Unresolved,
         }
@@ -920,7 +927,7 @@ impl CapabilityObservation {
     /// [`resolved_path`](Self::resolved_path).
     ///
     /// The upstream `kind.wire()` is preserved in
-    /// [`detail`](Self::detail) so the `Declared`/`HomeDefault` collapse
+    /// [`detail`](Self::detail) so the `Declared`/`SessionRepoParent`/`HomeDefault` collapse
     /// documented on [`impl From<WorkspaceRootKind> for Rung`](Rung) is
     /// recoverable from the manifest rather than lost in it.
     #[must_use]
@@ -2165,6 +2172,7 @@ mod tests {
         let all = [
             WorkspaceRootKind::Declared,
             WorkspaceRootKind::Discovered,
+            WorkspaceRootKind::SessionRepoParent,
             WorkspaceRootKind::HomeDefault,
             WorkspaceRootKind::Unresolved,
         ];
@@ -2172,6 +2180,7 @@ mod tests {
             let expected = match kind {
                 WorkspaceRootKind::Declared => Rung::OperatorCheckout,
                 WorkspaceRootKind::Discovered => Rung::ExeRelativeCheckout,
+                WorkspaceRootKind::SessionRepoParent => Rung::OperatorCheckout,
                 WorkspaceRootKind::HomeDefault => Rung::OperatorCheckout,
                 WorkspaceRootKind::Unresolved => Rung::Unresolved,
             };

@@ -441,62 +441,18 @@ fn spawn_phantom_turn_watch(
 /// `PATCH /sessions/:id`, which retries on reconnect. Coord owns the ownership
 /// and uniqueness rules (`session_not_owned_by_caller`,
 /// `harness_session_already_bound`), so nothing here second-guesses them.
+///
+/// The body is the shared seam [`crate::session::coord_identity`] (plan
+/// `2026-10-23-a-hookless-resume-in-a-runner-pane-leaves-the-session-with-no-active-coord-row`
+/// D1), which the reconcile tick's rung-2 binds and the R2 resume also call;
+/// this route is its `hook` source.
 fn confirm_coord_harness_session_id(state: &ApiState, req: &SessionOpenRequest) {
-    use crate::session::SessionRegistry;
-    use crate::terminal::TerminalManager;
-    use tauri::Manager;
-
-    let (Some(terminals), Some(registry)) = (
-        state
-            .app_handle
-            .try_state::<Arc<TerminalManager>>()
-            .map(|s| s.inner().clone()),
-        state
-            .app_handle
-            .try_state::<Arc<SessionRegistry>>()
-            .map(|s| s.inner().clone()),
-    ) else {
-        warn!(
-            terminal_id = %req.terminal_id,
-            session_id = %req.session_id,
-            "control/session-open: terminal manager or session registry not in Tauri state —              coord harness-id confirmation skipped (best-effort)"
-        );
-        return;
-    };
-
-    let Some(coord_session_id) = terminals
-        .get(&req.terminal_id)
-        .and_then(|s| s.coord_session_id())
-    else {
-        // Normal and transient: the coord mirror is registered after the pane
-        // exists. Not a warn.
-        info!(
-            terminal_id = %req.terminal_id,
-            session_id = %req.session_id,
-            "control/session-open: no coord session bound to this terminal yet —              harness-id confirmation skipped"
-        );
-        return;
-    };
-
-    match registry.confirm_claude_code_session_id(coord_session_id, &req.session_id) {
-        Ok(true) => info!(
-            terminal_id = %req.terminal_id,
-            session_id = %req.session_id,
-            coord_session_id = %coord_session_id,
-            "control/session-open: coord row re-keyed to the CONFIRMED harness session id"
-        ),
-        Ok(false) => info!(
-            terminal_id = %req.terminal_id,
-            coord_session_id = %coord_session_id,
-            "control/session-open: coord row already carries the confirmed harness session id"
-        ),
-        Err(e) => warn!(
-            terminal_id = %req.terminal_id,
-            session_id = %req.session_id,
-            coord_session_id = %coord_session_id,
-            "control/session-open: harness-id confirmation not queued: {e}"
-        ),
-    }
+    crate::session::coord_identity::confirm_for_terminal_in_app(
+        &state.app_handle,
+        &req.terminal_id,
+        &req.session_id,
+        crate::session::coord_identity::RekeySource::Hook,
+    );
 }
 
 /// Emit the `session-bound` tab-stamp event for a `/control/session-open`.
@@ -1309,6 +1265,7 @@ fn record_session_open_into(
         page_id,
         zone_index,
         provider.to_string(),
+        None,
     );
     // CONFIRM the record (session-restore-redesign Phase 2 coordinator
     // refinement). This route is hit ONLY by a provider's SessionStart hook,
@@ -2298,6 +2255,65 @@ mod tests {
     // Plan `2026-08-23-single-source-derived-facts`, item 1 step 1.
     // -------------------------------------------------------------------
 
+    /// Review r1 item 4(i): a continuation from an EARLIER boot, marked by this
+    /// boot's restore pass, re-confirmed by the provider's session-open hook on
+    /// its NEW terminal is adopted: the continuation registry holds its gate
+    /// (and stored claimer) for the new terminal, and the generation stamp is
+    /// renewed to this boot.
+    #[test]
+    fn session_open_hook_adopts_a_restored_gate_continuation() {
+        use crate::session::session_lifecycle_store::{
+            SessionLifecycleStore, TerminalSessionRecord,
+        };
+        let _g = crate::agent_runtime::CONTINUATION_REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            SessionLifecycleStore::open(&dir.path().join("terminal-sessions.json")).unwrap();
+        let boot = crate::session::tracking_health::primary_boot_unix_millis_or_init();
+        let csid = "5a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+        let gate = uuid::Uuid::now_v7();
+        let device = uuid::Uuid::now_v7();
+        let rec: TerminalSessionRecord = serde_json::from_value(serde_json::json!({
+            "claudeSessionId": csid,
+            "pageId": "default",
+            "zoneIndex": 0,
+            "terminalId": "term-before-crash",
+            "openedAt": 0,
+            "lastSeenAt": 0,
+            "state": "open",
+            "origin": "authoritative",
+            "gateId": gate.to_string(),
+            "gateConsumingDeviceId": device.to_string(),
+            "gateBoundBootMs": boot - 1,
+        }))
+        .unwrap();
+        store.record_open(rec);
+        store.mark_restore_pending(csid, true);
+
+        let req = SessionOpenRequest {
+            source: Some("resume".to_string()),
+            ..session_open_req("term-after-restore", csid)
+        };
+        assert!(session_open_rejection(&req).is_none());
+        record_session_open_into(&store, &req, "claude");
+
+        let after = store.get(csid).unwrap();
+        assert_eq!(after.terminal_id, "term-after-restore");
+        assert_eq!(
+            after.gate_bound_boot_ms,
+            Some(boot),
+            "stamp renewed to this boot"
+        );
+        assert_eq!(after.gate_id, Some(gate.to_string()), "gate kept (sticky)");
+        assert_eq!(
+            crate::agent_runtime::registered_continuation_gate("term-after-restore"),
+            Some((Some(gate), Some(device)))
+        );
+        crate::agent_runtime::deregister_continuation_for_test("term-after-restore");
+    }
+
     fn session_open_req(terminal_id: &str, session_id: &str) -> SessionOpenRequest {
         SessionOpenRequest {
             terminal_id: terminal_id.to_string(),
@@ -2456,10 +2472,15 @@ mod tests {
             finished_at: None,
             wind_down_outcome: None,
             wind_down_at: None,
+            wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
+            gate_id: None,
+            gate_consuming_device_id: None,
+            gate_bound_boot_ms: None,
         }
     }
 
@@ -2975,10 +2996,15 @@ mod tests {
             finished_at: None,
             wind_down_outcome: None,
             wind_down_at: None,
+            wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
+            gate_id: None,
+            gate_consuming_device_id: None,
+            gate_bound_boot_ms: None,
         });
 
         // The confirming hook fires with bash-flavored context.
@@ -3178,10 +3204,15 @@ mod tests {
                     finished_at: None,
                     wind_down_outcome: None,
                     wind_down_at: None,
+                    wind_down_arm: None,
                     finish_reason: None,
                     finish_synced: false,
                     spawn_device_default: None,
                     adopted_from: None,
+                    last_session_start_at: None,
+                    gate_id: None,
+                    gate_consuming_device_id: None,
+                    gate_bound_boot_ms: None,
                 });
             };
             let hook = |id: &str, source: &str| {
@@ -3274,10 +3305,15 @@ mod tests {
             finished_at: None,
             wind_down_outcome: None,
             wind_down_at: None,
+            wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
+            gate_id: None,
+            gate_consuming_device_id: None,
+            gate_bound_boot_ms: None,
         });
 
         // The provider reports a DIFFERENT id about itself, from bash.
@@ -3361,10 +3397,15 @@ mod tests {
             finished_at: None,
             wind_down_outcome: None,
             wind_down_at: None,
+            wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
+            gate_id: None,
+            gate_consuming_device_id: None,
+            gate_bound_boot_ms: None,
         });
 
         let req = SessionOpenRequest {

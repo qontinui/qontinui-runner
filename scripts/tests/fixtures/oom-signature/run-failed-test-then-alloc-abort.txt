@@ -1,0 +1,8 @@
+recovered 29 test binaries from the build step
+     Running `/home/runner/work/qontinui-runner/qontinui-runner/src-tauri/target/debug/deps/qontinui_runner_lib-0c1d2e3f`
+
+running 3 tests
+test a::slow ... ok
+test fleet::tests::foo ... FAILED
+memory allocation of 2097152 bytes failed
+##[error]Process completed with exit code 134.

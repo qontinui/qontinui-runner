@@ -1263,4 +1263,13 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn snapshot_geometry_refuses_a_collapsed_sliver_not_reported_minimized() {
+        // Capture is where a sliver got persisted, so the shared minimum must
+        // hold here too — maximized or not — while the prior record stands.
+        assert_eq!(snapshot_geometry(false, false, (177, 177), (15, 37)), None);
+        assert_eq!(snapshot_geometry(false, true, (0, 0), (160, 28)), None);
+        assert!(snapshot_geometry(false, false, (100, 100), (200, 150)).is_some());
+    }
 }

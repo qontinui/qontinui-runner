@@ -312,6 +312,19 @@ useful to do in parallel while it runs). Use the default general-purpose
 agent type — it needs `Write` access to create the plan file, which the
 dedicated `Plan` agent type does not have.
 
+**Pass `effort` on that Agent call** (served policy `production-and-cost`
+`spawn-effort-profiles`). Writing a plan is research, so pass the effort of the
+`research` profile in `agent_playbook/spawn-effort-profiles`. Read the playbook
+with `/policy get agent_playbook spawn-effort-profiles`; never take the level
+from this file or from memory. If the playbook cannot be read, pass no `effort`
+and say so in Step 4's report. Never guess a level. If the Agent tool has no
+`effort` parameter (it has none while `CLAUDE_CODE_EFFORT_LEVEL` is set), pass
+none and say so in the same report. `/pvi` is mixed work, so the
+SESSION itself stays on the `implementation` profile. Its research runs in this
+subagent, and in a Workflow agent passing `opts.effort` where the session has a
+Workflow tool and the step fans out. The implementing half (Step 3 →
+`/vet-imp`) follows the same rule for every subagent it spawns.
+
 Prompt it with something self-contained along these lines:
 
 ```

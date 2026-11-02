@@ -215,6 +215,7 @@ mod planning_bridge;
 mod playwright;
 mod pm_detect;
 mod process_capture;
+pub(crate) use qontinui_runner_lib::process_deadline;
 pub(crate) use qontinui_runner_lib::process_helpers;
 /// Projects dashboard — the server-side join over the saved-project
 /// registry (`ProjectSnapshot`). See `commands::saved_projects` for the
@@ -2976,6 +2977,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::remote_attach::terminal_remote_interactivity,
             commands::remote_attach::remote_interactivity_probe,
             commands::remote_end::remote_session_end,
+            commands::sessions_settings::finished_session_close_get,
+            commands::sessions_settings::finished_session_close_set,
             commands::remote_create::remote_create_preference_get,
             commands::remote_create::remote_create_preference_set,
             commands::remote_create::remote_create_preference_reconcile,
@@ -4296,14 +4299,45 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // session, so a close-time re-emit simply overwrites with the
                 // best-informed verdict. Weak store handle for the same
                 // reason as above — the store owns this closure.
+                //
+                // And it is the third `work_unreported` producer (plan
+                // `2026-10-03-a-runner-crash-leaves-its-continuations-spawned-forever-…`
+                // D2): a gate continuation orphaned by a PRIOR process
+                // generation (a runner crash) whose record now closes
+                // non-restorably has no in-process producer left, so report it
+                // here. `record_close` may run off-runtime, hence the runtime
+                // handle captured now.
                 {
                     let reg = std::sync::Arc::downgrade(&ai_coord_registrar);
                     let store = std::sync::Arc::downgrade(&lifecycle_store);
+                    // Tauri's global runtime handle, not `try_current()`:
+                    // setup runs on the tao main thread, which has no tokio
+                    // context, and the close itself may run on a bare thread.
+                    let rt_handle = tauri::async_runtime::handle().inner().clone();
                     lifecycle_store.attach_close_observer(move |csid| {
                         if let Some(r) = reg.upgrade() {
                             r.close_session(csid);
                         }
                         mcp::session_compliance::finalize_on_close(csid, &store);
+                        let report =
+                            session::session_lifecycle_store::runner_restart_report_on_close(
+                                &store,
+                                csid,
+                                session::tracking_health::primary_boot_unix_millis_or_init(),
+                            );
+                        if let Some(report) = report {
+                            tracing::info!(
+                                claude_session = %csid,
+                                gate_id = %report.gate_id,
+                                detail = %report.detail,
+                                "continuation lost to a runner restart — posting work_unreported"
+                            );
+                            rt_handle.spawn(agent_runtime::post_runner_restart_unreported(
+                                report.gate_id,
+                                report.consuming_device_id,
+                                report.detail,
+                            ));
+                        }
                     });
                 }
                 // Session FINISHED marker → coord (plan
@@ -5241,6 +5275,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             )
                             .await;
                             emit_session_bound(&poll_app_handle, &actions);
+                            // Rung-2 binds re-key the pane's coord row (plan
+                            // 2026-10-23-a-hookless-resume-…, Phase 1a).
+                            session::coord_identity::apply_reconcile_tick_in_app(
+                                &poll_app_handle,
+                                &actions,
+                            );
+                        } else {
+                            // No pass this tick, but a refused re-key still
+                            // has to be restored (and, for the hook / R2
+                            // sources, re-queued) on the tick cadence.
+                            session::coord_identity::apply_reconcile_tick_in_app(
+                                &poll_app_handle,
+                                &[],
+                            );
                         }
 
                         // Title convergence (phantom-id plan B6). An in-Claude
@@ -5313,6 +5361,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     let actions =
                         session::reconcile::run_at_boot(&reconcile_lifecycle_store, live).await;
                     emit_session_bound(&reconcile_app_handle, &actions);
+                    session::coord_identity::apply_reconcile_tick_in_app(
+                        &reconcile_app_handle,
+                        &actions,
+                    );
                 });
 
                 // Tier-0 looping-agent supervisor (plan merge-shepherd-fixer,

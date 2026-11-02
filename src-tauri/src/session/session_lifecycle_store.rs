@@ -243,6 +243,15 @@ pub const WIND_DOWN_CLOSE_UNKNOWN: &str = "close_unknown";
 /// is recorded rather than treated as a non-event.
 pub const WIND_DOWN_NOT_ATTEMPTED: &str = "exit_not_submitted";
 
+/// [`TerminalSessionRecord::wind_down_arm`] — the close was made by the
+/// executor's DRAIN arm: coord held this device drained.
+pub const WIND_DOWN_ARM_DRAIN: &str = "drain";
+/// [`TerminalSessionRecord::wind_down_arm`] — the close was made by the
+/// executor's `finished_close` arm: a finished, idle, custody-clean terminal
+/// session past grace, with no drain involved (plan
+/// `2026-10-03-finished-runner-sessions-close-their-window-without-a-drain`).
+pub const WIND_DOWN_ARM_FINISHED_CLOSE: &str = "finished_close";
+
 /// Restore tier: the session was brought back with `claude --resume` and the
 /// provider handshake landed — the transcript continues.
 pub const RESTORE_TIER_RESUMED: &str = "resumed";
@@ -781,6 +790,15 @@ pub struct TerminalSessionRecord {
     /// Unix millis when [`Self::wind_down_outcome`] was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wind_down_at: Option<i64>,
+    /// WHICH executor arm produced [`Self::wind_down_outcome`]:
+    /// [`WIND_DOWN_ARM_DRAIN`] or [`WIND_DOWN_ARM_FINISHED_CLOSE`]. Written
+    /// together with the outcome, so the two always describe the same act.
+    /// `None` on a record no arm acted on — and on every outcome recorded
+    /// before the field existed, all of which were the drain arm's.
+    ///
+    /// Not [`Self::origin`]: that is session-id bind provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wind_down_arm: Option<String>,
     /// Free-text reason recorded alongside [`Self::finished_at`] (e.g.
     /// `"unattended: 6 units, all landed"`). Sticky; searchable in the
     /// Previous-sessions view.
@@ -861,6 +879,142 @@ pub struct TerminalSessionRecord {
     /// field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adopted_from: Option<String>,
+    /// Unix millis of the most recent provider SessionStart hook that reported
+    /// this id ([`SessionLifecycleStore::note_session_start_hook`]) — when its
+    /// process last started (or resumed into) its terminal. The durable half of
+    /// [`SessionLifecycleStore::latest_open_on_terminal`]'s ranking, so a pane
+    /// whose operator ran `/resume` still resolves to the resumed session after
+    /// a restart. `None` = no hook seen, or the record predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_session_start_at: Option<i64>,
+    /// The `coord.gates` row this session is a continuation of — the same value
+    /// injected into its PTY as `QONTINUI_GATE_ID` (plan
+    /// `2026-10-03-a-runner-crash-leaves-its-continuations-spawned-forever-…`,
+    /// D1). `None` for every session that is not a gate continuation, and for a
+    /// work-unit DAG dispatch (which has no gate row).
+    ///
+    /// ## Why the durable record carries it
+    ///
+    /// Both in-process `work_unreported` producers (the PTY exit hook and the
+    /// continuation reaper) die with the runner. After an unclean restart the
+    /// only component that observes the continuation's death is the lifecycle
+    /// poll closing THIS record — and without the gate identity here it could
+    /// not say which gate died, so the gate stayed `spawned` forever.
+    ///
+    /// STICKY in [`SessionLifecycleStore::record_open`]: the session-open hook
+    /// and the boot-restore re-record write this record again carrying no gate,
+    /// and must not blank it. `#[serde(default)]`: older rows read `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_id: Option<String>,
+    /// The device id that CLAIMED [`Self::gate_id`]'s continuation — the value
+    /// injected as `QONTINUI_GATE_DEVICE_ID`. coord's outcome UPDATE is keyed
+    /// `AND continuation_consumed_by = $3`, so a report after a restart must
+    /// present THIS id, never the booting process's local one. Sticky, like
+    /// [`Self::gate_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_consuming_device_id: Option<String>,
+    /// Unix millis of the boot of the runner process that bound
+    /// [`Self::gate_id`] to this record (the spawn, or a boot restore that
+    /// re-registered the resumed session). Compared against the CURRENT
+    /// process's boot instant to tell a continuation orphaned by a prior
+    /// process generation (no in-process producer can report it) from one this
+    /// process owns (its exit hook / reaper will). Deliberately NOT `opened_at`,
+    /// which `record_open` preserves across a restore. Sticky.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_bound_boot_ms: Option<i64>,
+}
+
+/// Close reasons after which a record is FINAL — never resumed by a boot
+/// restore (`restorable_records` grace-matches only `pty-exit` / `poll-dead`).
+/// `terminal-only-idle` ([`close_reason_for_dead_shell`]) is one of them: it
+/// exists precisely so that the next restore pass does NOT pick the record up.
+///
+/// A gate continuation whose record closes with one of these, and whose gate
+/// was bound by a PRIOR process generation, has no producer left that could
+/// report its outcome; the close observer reports it `work_unreported`
+/// (see [`runner_restart_unreported_report`]). `poll-dead` is deliberately
+/// ABSENT: it is restorable, so the session may still be resumed.
+pub const NON_RESTORABLE_CLOSE_REASONS: &[&str] =
+    &["no-terminal", "never-started", "terminal-only-idle"];
+
+/// What the close observer posts for a continuation lost to a runner restart:
+/// the gate, the device that claimed it, and the outcome detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerRestartUnreported {
+    pub gate_id: uuid::Uuid,
+    pub consuming_device_id: uuid::Uuid,
+    pub detail: String,
+}
+
+/// Pure decision for the close observer (plan D2): should this just-closed
+/// record be reported `work_unreported` because a runner restart orphaned its
+/// continuation?
+///
+/// `Some` only when ALL hold:
+/// - the record is closed with a reason in [`NON_RESTORABLE_CLOSE_REASONS`];
+/// - it carries a full, parseable gate identity (gate id + consuming device);
+/// - the gate was bound by a prior process generation
+///   (`gate_bound_boot_ms < current_boot_ms`). A missing stamp is NOT read as
+///   "prior": a record that cannot say when its gate was bound is UNKNOWN, and
+///   a post would race this process's own exit hook.
+///
+/// The detail uses the exit-class grammar proposed by runner#1902, class first,
+/// so that once coord#2729 lands it classifies the loss as `crashed` and
+/// re-delivers it (both PRs are still open).
+pub fn runner_restart_unreported_report(
+    rec: &TerminalSessionRecord,
+    current_boot_ms: i64,
+) -> Option<RunnerRestartUnreported> {
+    if rec.state != "closed" {
+        return None;
+    }
+    let close = rec.close_reason.as_deref()?;
+    if !NON_RESTORABLE_CLOSE_REASONS.contains(&close) {
+        return None;
+    }
+    let gate_id = uuid::Uuid::parse_str(rec.gate_id.as_deref()?.trim()).ok()?;
+    let consuming_device_id =
+        uuid::Uuid::parse_str(rec.gate_consuming_device_id.as_deref()?.trim()).ok()?;
+    if rec.gate_bound_boot_ms? >= current_boot_ms {
+        return None;
+    }
+    let after_s = (rec.last_seen_at - rec.opened_at).max(0) / 1000;
+    let detail = format!(
+        "exit=crashed code=none after={after_s}s terminal={} reason=runner_restart close={close}",
+        rec.terminal_id
+    );
+    Some(RunnerRestartUnreported {
+        gate_id,
+        consuming_device_id,
+        detail,
+    })
+}
+
+/// The close observer's D2 step, as production runs it: read the
+/// just-closed record back through the observer's `Weak` store handle and
+/// decide via [`runner_restart_unreported_report`]. `main.rs`'s close-observer
+/// closure calls exactly this, so a test of it tests the production path.
+/// `None` when the store is gone, the record absent, or the decision says no.
+pub fn runner_restart_report_on_close(
+    store: &std::sync::Weak<SessionLifecycleStore>,
+    claude_session_id: &str,
+    current_boot_ms: i64,
+) -> Option<RunnerRestartUnreported> {
+    let rec = store.upgrade()?.get(claude_session_id)?;
+    runner_restart_unreported_report(&rec, current_boot_ms)
+}
+
+/// `true` when a closed record carries a gate whose outcome something other
+/// than this record already owns. Either this process bound it, so its exit
+/// hook or reaper reports it, or D2's decision holds, so the close observer
+/// reported it or the process that bound it owned it. See
+/// [`SessionLifecycleStore::release_gate_identity`].
+fn gate_outcome_is_owned(rec: &TerminalSessionRecord, current_boot_ms: i64) -> bool {
+    if rec.gate_id.is_none() {
+        return false;
+    }
+    rec.gate_bound_boot_ms.is_some_and(|b| b >= current_boot_ms)
+        || runner_restart_unreported_report(rec, current_boot_ms).is_some()
 }
 
 /// See [`TerminalSessionRecord::spawn_device_default`].
@@ -966,12 +1120,14 @@ pub struct SessionLifecycleStore {
     /// and, per session id, the counter value of the most recent hook that
     /// reported it ([`Self::note_session_start_hook`]). It answers "which of the
     /// open sessions on this terminal STARTED most recently", which
-    /// [`Self::latest_open_on_terminal`] needs and no persisted field can say:
-    /// `confirmed_at` is monotonic (a typed `claude --resume X` of a session
-    /// confirmed earlier keeps X's OLD stamp) and `last_seen_at` is bumped by
-    /// every liveness touch of every open record. Process-local by design: a
-    /// runner restart re-spawns every PTY, and each restored provider fires its
-    /// hook again. LOCK ORDER — `map` then this, never the reverse.
+    /// [`Self::latest_open_on_terminal`] needs: `confirmed_at` is monotonic (a
+    /// typed `claude --resume X` of a session confirmed earlier keeps X's OLD
+    /// stamp) and `last_seen_at` is bumped by every liveness touch of every
+    /// open record. The durable twin is
+    /// [`TerminalSessionRecord::last_session_start_at`], which carries the
+    /// order across a restart — a holder-adopted pane fires no new hook. This
+    /// counter only breaks that stamp's ties and wall-clock steps.
+    /// LOCK ORDER — `map` then this, never the reverse.
     session_start_hooks: Mutex<(u64, HashMap<String, u64>)>,
     /// Optional write-only sink for the append-only snapshot HISTORY
     /// ([`crate::session::snapshot_history`], Phase 4 of the session-restore
@@ -1558,6 +1714,8 @@ impl SessionLifecycleStore {
             tenant_id: non_empty(rec.tenant_id),
             task_run_id: non_empty(rec.task_run_id),
             restore_tier: non_empty(rec.restore_tier),
+            gate_id: non_empty(rec.gate_id),
+            gate_consuming_device_id: non_empty(rec.gate_consuming_device_id),
             ..rec
         };
         let now = Utc::now().timestamp_millis();
@@ -1691,6 +1849,19 @@ impl SessionLifecycleStore {
             }
             if rec.restore_tier.is_some() {
                 entry.restore_tier = rec.restore_tier;
+            }
+            // The gate identity (plan 2026-10-03 D1) is STICKY: the
+            // session-open hook and the boot-restore re-record write this
+            // record again carrying no gate, and blanking it would leave a
+            // continuation unreportable after a runner crash.
+            if rec.gate_id.is_some() {
+                entry.gate_id = rec.gate_id;
+            }
+            if rec.gate_consuming_device_id.is_some() {
+                entry.gate_consuming_device_id = rec.gate_consuming_device_id;
+            }
+            if rec.gate_bound_boot_ms.is_some() {
+                entry.gate_bound_boot_ms = rec.gate_bound_boot_ms;
             }
             // W-B: set ONCE — the default a session was spawned under never
             // changes, so a re-record can fill an absent value but never replace
@@ -1914,7 +2085,7 @@ impl SessionLifecycleStore {
     ///   winner, and report [`CloseOutcome::RedirectedAmbiguous`] naming every
     ///   candidate. A nondeterministic close would be a worse failure than the
     ///   silent no-op it replaces, because it is not reproducible — which is
-    ///   why this must not be a single-match `find_open_by_terminal` call.
+    ///   why this must not be a first-match `.find()` over the map.
     /// * Nothing resolves — [`CloseOutcome::NotFound`], `warn!` with both ids,
     ///   and **no row is mutated and no observer fires**.
     ///
@@ -2284,9 +2455,9 @@ impl SessionLifecycleStore {
     /// `TerminalSession` title, so the durable registry stayed frozen at the
     /// spawn-time title and a restart restored the pane under a stale name.
     /// Keyed by terminal id because the rename call sites hold only that —
-    /// same resolution [`Self::find_open_by_terminal`] performs. No-op (no
-    /// write) if no open record references the terminal, or the title is
-    /// already current.
+    /// the same row [`Self::find_open_by_terminal`] resolves (the session
+    /// running there). No-op (no write) if no open record references the
+    /// terminal, or the title is already current.
     pub fn update_title_by_terminal(&self, terminal_id: &str, title: &str) {
         let changed = {
             let mut m = match self.map.lock() {
@@ -2296,8 +2467,11 @@ impl SessionLifecycleStore {
                     return;
                 }
             };
-            let Some(rec) = m.values_mut().find(|r| open_on_terminal(r, terminal_id)) else {
+            let Some(id) = self.ranked_open_id(&m, terminal_id, |_| true) else {
                 return; // no open record hosts this terminal — nothing to flush
+            };
+            let Some(rec) = m.get_mut(&id) else {
+                return;
             };
             if rec.title.as_deref() == Some(title) {
                 return; // already current — nothing to flush
@@ -2395,8 +2569,11 @@ impl SessionLifecycleStore {
     /// in-memory `TerminalSession.page_id`; without this flush the durable
     /// record stays frozen at the spawn-time page, so a restart would restore
     /// the pane on its original page rather than where the operator moved it.
-    /// Sibling of [`Self::update_title_by_terminal`]. No-op (no write) if no
-    /// open record references the terminal, or the page is already current.
+    /// Sibling of [`Self::update_title_by_terminal`], but applied to EVERY
+    /// open record on the terminal: the page is where the pane sits, not a
+    /// property of whichever session runs in it, and a terminal can carry
+    /// several open rows. No-op (no write) if no open record references the
+    /// terminal, or every page is already current.
     pub fn update_page_by_terminal(&self, terminal_id: &str, page_id: &str) {
         let changed = {
             let mut m = match self.map.lock() {
@@ -2406,23 +2583,27 @@ impl SessionLifecycleStore {
                     return;
                 }
             };
-            let Some(rec) = m.values_mut().find(|r| open_on_terminal(r, terminal_id)) else {
-                return; // no open record hosts this terminal — nothing to flush
-            };
-            if rec.page_id == page_id {
-                return; // already current — nothing to flush
+            let changed: Vec<TerminalSessionRecord> = m
+                .values_mut()
+                .filter(|r| open_on_terminal(r, terminal_id) && r.page_id != page_id)
+                .map(|rec| {
+                    rec.page_id = page_id.to_string();
+                    rec.clone()
+                })
+                .collect();
+            if changed.is_empty() {
+                return; // nothing hosts this terminal, or already current
             }
-            rec.page_id = page_id.to_string();
-            let changed = rec.clone();
-            self.persist(
-                m,
-                &[LifecycleDelta::Upsert {
-                    rec: Box::new(changed.clone()),
-                }],
-            );
+            let deltas: Vec<LifecycleDelta> = changed
+                .iter()
+                .map(|r| LifecycleDelta::Upsert {
+                    rec: Box::new(r.clone()),
+                })
+                .collect();
+            self.persist(m, &deltas);
             changed
         };
-        self.snapshot_change(std::iter::once(changed));
+        self.snapshot_change(changed);
     }
 
     /// Mark a present session as restore-pending (a boot-restore is about to
@@ -2484,6 +2665,62 @@ impl SessionLifecycleStore {
                 rec: Box::new(changed),
             }],
         );
+    }
+
+    /// Drop a CLOSED record's gate identity (`gate_id`,
+    /// `gate_consuming_device_id`, `gate_bound_boot_ms`) before an operator
+    /// resume reopens it, but ONLY when the gate's outcome is already owned
+    /// elsewhere.
+    ///
+    /// The fields are sticky in [`Self::record_open`], so a gate-less reopen
+    /// would otherwise keep them. A later non-restorable close of the reopened
+    /// row would then report `runner_restart` a second time for a gate that is
+    /// already settled.
+    ///
+    /// The gate is released only in two cases:
+    /// - it was bound by THIS process (`gate_bound_boot_ms >= current_boot_ms`),
+    ///   because this process's exit hook or reaper owns the outcome;
+    /// - [`runner_restart_unreported_report`] says `Some` for the closed row.
+    ///   That means either the close observer reported it, or the earlier
+    ///   process that bound it owned it. The observer's post is
+    ///   fire-and-forget, so releasing also gives up the accidental retry
+    ///   that a duplicate report would have been. That covers a dropped
+    ///   observer POST, and an earlier process that crashed between its own
+    ///   close and its exit-hook report. That trade-off is accepted.
+    ///
+    /// Every other gate is kept, and a missing boot stamp keeps it too. The
+    /// usual case is a prior-generation `poll-dead` close, which nothing has
+    /// reported yet. Keeping it lets D2 report it when the reopened row next
+    /// closes non-restorably. Because only an already-owned gate is ever
+    /// dropped, a spawn that fails after this call loses nothing.
+    ///
+    /// Returns `true` only when it removed something. An open, absent or
+    /// gate-less record, or one whose gate is still unreported, is left
+    /// untouched and nothing is written.
+    pub fn release_gate_identity(&self, claude_session_id: &str, current_boot_ms: i64) -> bool {
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on release_gate_identity");
+                return false;
+            }
+        };
+        let changed = match m.get_mut(claude_session_id) {
+            Some(rec) if rec.state == "closed" && gate_outcome_is_owned(rec, current_boot_ms) => {
+                rec.gate_id = None;
+                rec.gate_consuming_device_id = None;
+                rec.gate_bound_boot_ms = None;
+                rec.clone()
+            }
+            _ => return false,
+        };
+        self.persist(
+            m,
+            &[LifecycleDelta::Upsert {
+                rec: Box::new(changed),
+            }],
+        );
+        true
     }
 
     /// Mark a session FINISHED, or unmark it — the WORK axis, orthogonal to
@@ -2705,13 +2942,20 @@ impl SessionLifecycleStore {
     }
 
     /// Record what the wind-down executor did to this session — one of the
-    /// `WIND_DOWN_*` words above. No-op when the record is absent.
+    /// `WIND_DOWN_*` outcome words above — and which arm did it (one of the
+    /// `WIND_DOWN_ARM_*` words). No-op when the record is absent.
     ///
     /// Written whether or not the record is still `open`: the `closed` outcome
     /// is recorded on a record the close itself has usually just flipped, and
     /// the two statements are orthogonal (see
     /// [`TerminalSessionRecord::wind_down_outcome`]).
-    pub fn set_wind_down_outcome(&self, claude_session_id: &str, outcome: &str, at_ms: i64) {
+    pub fn set_wind_down_outcome(
+        &self,
+        claude_session_id: &str,
+        outcome: &str,
+        arm: &str,
+        at_ms: i64,
+    ) {
         let mut m = match self.map.lock() {
             Ok(m) => m,
             Err(e) => {
@@ -2723,6 +2967,7 @@ impl SessionLifecycleStore {
             Some(rec) => {
                 rec.wind_down_outcome = Some(outcome.to_string());
                 rec.wind_down_at = Some(at_ms);
+                rec.wind_down_arm = Some(arm.to_string());
                 rec.clone()
             }
             None => return,
@@ -3000,12 +3245,14 @@ impl SessionLifecycleStore {
                 return false;
             }
         };
-        // The FIRST open record on the terminal. That is the spawn's record
-        // because a terminal hosts at most ONE live provider session — the
-        // single-tenant-terminal invariant `record_open` enforces by superseding
-        // siblings. If that invariant ever loosened, this pick would become a
-        // guess and must be keyed by session id instead.
-        let Some(rec) = m.values_mut().find(|r| open_on_terminal(r, terminal_id)) else {
+        // The open record ranked as the session running on the terminal. A
+        // terminal can carry several open rows (`record_open` supersedes only
+        // unconfirmed siblings), so this is the ranked pick, not a first match;
+        // the `opened_at` gate below still refuses a row older than the spawn.
+        let rec = self
+            .ranked_open_id(&m, terminal_id, |_| true)
+            .and_then(|id| m.get_mut(&id));
+        let Some(rec) = rec else {
             debug!(
                 terminal_id,
                 "session_lifecycle_store: no open record for terminal — spawn default dropped"
@@ -3082,6 +3329,95 @@ impl SessionLifecycleStore {
             tier, "session-restore: record marked as restored from boot"
         );
         self.snapshot_change(std::iter::once(changed));
+    }
+
+    /// Adopt a gate continuation resumed by THIS process generation's boot
+    /// restore (plan `2026-10-03-…` D3): when the OPEN record for
+    /// `claude_session_id` carries a gate identity bound by a PRIOR generation
+    /// (`gate_bound_boot_ms < current_boot_ms`, or no stamp at all) AND this
+    /// boot's restore pass marked it, re-stamp
+    /// `gate_bound_boot_ms = current_boot_ms` and return
+    /// `(terminal_id, gate_id, consuming_device_id)` so the caller can
+    /// re-register the terminal as a live continuation.
+    ///
+    /// **The restore marker is required.** Reopening is not restoring: an
+    /// operator resuming a long-settled continuation by hand days later
+    /// (Past Sessions, shell integration) re-records it through the same doors,
+    /// and adopting that would re-register a continuation for a gate that was
+    /// resolved long ago and hold a cap slot for it. The boot-restore drain
+    /// stamps `restored_from_boot_at` via
+    /// [`Self::mark_restore_pending`] BEFORE it types the resume, i.e. before
+    /// either re-record door can fire, and the stamp is sticky — unlike
+    /// `restore_pending_at`, which the verified branch clears in a race with
+    /// the re-assert. So the predicate is `restored_from_boot_at >=
+    /// current_boot_ms`.
+    ///
+    /// `None` — and no write — for a record that is closed, absent, carries no
+    /// gate, was not restored by this boot, was restored `terminal-only` (no
+    /// agent is running in the pane), or is already bound to this
+    /// generation. That last arm makes the call idempotent.
+    pub fn adopt_restored_gate(
+        &self,
+        claude_session_id: &str,
+        current_boot_ms: i64,
+    ) -> Option<(String, uuid::Uuid, Option<uuid::Uuid>)> {
+        let (changed, adopted) = {
+            let mut m = match self.map.lock() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "session_lifecycle_store: lock poisoned on adopt_restored_gate");
+                    return None;
+                }
+            };
+            let rec = m.get_mut(claude_session_id)?;
+            if rec.state != "open" || rec.terminal_id.trim().is_empty() {
+                return None;
+            }
+            if rec
+                .restored_from_boot_at
+                .is_none_or(|t| t < current_boot_ms)
+            {
+                return None;
+            }
+            // A terminal-only restore brought back no conversation and types
+            // no resume: adopting its bare shell would hold a cap slot for
+            // nothing and re-stamp the generation, so its eventual
+            // `terminal-only-idle` close (D2) could not report.
+            //
+            // `failed` is deliberately NOT refused: `mark_restore_pending`
+            // stamps it BEFORE the resume is typed and only a verified
+            // handshake promotes it to `resumed`, so it is the tier every
+            // adoption door sees for a resume that is in fact running.
+            if rec.restore_tier.as_deref() == Some(RESTORE_TIER_TERMINAL_ONLY) {
+                return None;
+            }
+            let gate_id = uuid::Uuid::parse_str(rec.gate_id.as_deref()?.trim()).ok()?;
+            if rec.gate_bound_boot_ms.is_some_and(|b| b >= current_boot_ms) {
+                return None;
+            }
+            let consuming_device_id = rec
+                .gate_consuming_device_id
+                .as_deref()
+                .and_then(|d| uuid::Uuid::parse_str(d.trim()).ok());
+            rec.gate_bound_boot_ms = Some(current_boot_ms);
+            let changed = rec.clone();
+            self.persist(
+                m,
+                &[LifecycleDelta::Upsert {
+                    rec: Box::new(changed.clone()),
+                }],
+            );
+            let adopted = (changed.terminal_id.clone(), gate_id, consuming_device_id);
+            (changed, adopted)
+        };
+        info!(
+            claude_session_id,
+            terminal_id = %adopted.0,
+            gate_id = %adopted.1,
+            "session-restore: gate continuation re-bound to this process generation"
+        );
+        self.snapshot_change(std::iter::once(changed));
+        Some(adopted)
     }
 
     /// Re-key a record from `old_id` to `new_id`: remove the entry stored under
@@ -3175,21 +3511,20 @@ impl SessionLifecycleStore {
         );
     }
 
-    /// Clone of the open record currently hosted by `terminal_id`, if any.
-    /// Terminal ids are fresh per PTY spawn, so at most one OPEN record can
-    /// reference a given terminal at a time. A blank id resolves to nothing —
-    /// it is how an unbound row (a held one included) is represented.
+    /// Clone of the open record whose session is RUNNING on `terminal_id`, if
+    /// any. A blank id resolves to nothing — it is how an unbound row (a held
+    /// one included) is represented.
+    ///
+    /// A terminal can carry several open rows at once — a pane whose operator
+    /// ran `/resume` (or typed `claude --resume X`) keeps the pane's original
+    /// confirmed row open beside the resumed one, because the hook bind evicts
+    /// only UNCONFIRMED siblings. So this is NOT a first match over the
+    /// `HashMap`: it picks the same row [`Self::latest_open_on_terminal`]
+    /// ranks highest. A first match once made the token-exhaustion migration
+    /// resume a 7-day-stale pane session and close the pane running the real
+    /// one (2026-10-29, terminal `5b27af82`).
     pub fn find_open_by_terminal(&self, terminal_id: &str) -> Option<TerminalSessionRecord> {
-        match self.map.lock() {
-            Ok(m) => m
-                .values()
-                .find(|r| open_on_terminal(r, terminal_id))
-                .cloned(),
-            Err(e) => {
-                warn!(error = %e, "session_lifecycle_store: lock poisoned on find_open_by_terminal");
-                None
-            }
-        }
+        self.ranked_open_on_terminal(terminal_id, |_| true)
     }
 
     /// Like [`Self::find_open_by_terminal`], but only returns a CONFIRMED
@@ -3218,24 +3553,49 @@ impl SessionLifecycleStore {
         &self,
         terminal_id: &str,
     ) -> Option<TerminalSessionRecord> {
-        self.find_open_by_terminal(terminal_id)
-            .filter(|r| r.confirmed_at.is_some())
+        self.ranked_open_on_terminal(terminal_id, |r| r.confirmed_at.is_some())
     }
 
     /// Record that a provider's SessionStart hook just reported
     /// `claude_session_id` — the process that hook came from is now the one
-    /// running in its terminal. Feeds [`Self::latest_open_on_terminal`].
+    /// running in its terminal. Feeds [`Self::latest_open_on_terminal`]: the
+    /// process-local order, and the durable
+    /// [`TerminalSessionRecord::last_session_start_at`] stamp that carries the
+    /// answer across a restart. Never creates a record.
     pub fn note_session_start_hook(&self, claude_session_id: &str) {
-        match self.session_start_hooks.lock() {
-            Ok(mut g) => {
-                g.0 += 1;
-                let seq = g.0;
-                g.1.insert(claude_session_id.to_string(), seq);
+        let now = Utc::now().timestamp_millis();
+        match self.map.lock() {
+            Ok(mut m) => {
+                if let Some(rec) = m.get_mut(claude_session_id) {
+                    rec.last_session_start_at = Some(now);
+                    let changed = rec.clone();
+                    // Not snapshotted or mirrored: the stamp is a ranking
+                    // input for terminal lookups, not layout or wire state.
+                    self.persist(
+                        m,
+                        &[LifecycleDelta::Upsert {
+                            rec: Box::new(changed),
+                        }],
+                    );
+                }
             }
             Err(e) => {
                 warn!(error = %e, "session_lifecycle_store: lock poisoned on note_session_start_hook");
             }
         }
+        let mut g = self.hook_order();
+        g.0 += 1;
+        let seq = g.0;
+        g.1.insert(claude_session_id.to_string(), seq);
+    }
+
+    /// The process-local hook order. A poisoned lock is recovered rather than
+    /// refused: the guarded data is a counter and a map with no invariant a
+    /// panic can break, and refusing would blank every terminal lookup.
+    fn hook_order(&self) -> std::sync::MutexGuard<'_, (u64, HashMap<String, u64>)> {
+        self.session_start_hooks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     /// The MOST RECENT open session on `terminal_id`, other than `exclude` —
@@ -3245,51 +3605,74 @@ impl SessionLifecycleStore {
     /// pinned to P whose operator then typed `claude --resume X`: the hook
     /// bind evicts only UNCONFIRMED siblings, confirming runs no supersede
     /// scan, and liveness keeps both alive while any provider runs in the
-    /// subtree), so [`Self::find_open_by_terminal`]'s first-match over the
-    /// `HashMap` would pick one by iteration order. This ranks instead, greatest
-    /// wins:
+    /// subtree), so a first match over the `HashMap` would pick one by
+    /// iteration order. This ranks instead, greatest wins:
     ///
     /// 1. the latest SessionStart hook seen for the id in this process
     ///    ([`Self::note_session_start_hook`]) — a row with one outranks a row
     ///    without;
-    /// 2. then `confirmed_at` (a confirmed row outranks an unconfirmed one);
-    /// 3. then `last_seen_at`, then `opened_at`;
-    /// 4. then `claude_session_id`, so the choice is deterministic even on a
+    /// 2. then the durable [`TerminalSessionRecord::last_session_start_at`] —
+    ///    the same fact, surviving a restart or a holder handoff, whose adopted
+    ///    panes fire no new hook;
+    /// 3. then `confirmed_at` (a confirmed row outranks an unconfirmed one);
+    /// 4. then `last_seen_at`, then `opened_at`;
+    /// 5. then `claude_session_id`, so the choice is deterministic even on a
     ///    full tie.
     ///
-    /// The hook order comes first because `confirmed_at` is monotonic: a typed
-    /// resume of a session confirmed BEFORE the pane's own session keeps the
-    /// older stamp and would lose to the pane on `confirmed_at` alone.
+    /// Hook order comes before `confirmed_at` because `confirmed_at` is
+    /// monotonic: a typed resume of a session confirmed BEFORE the pane's own
+    /// session keeps the older stamp and would lose to the pane on
+    /// `confirmed_at` alone. The process-local order leads the durable stamp
+    /// because it cannot be misordered by a wall-clock step.
     pub fn latest_open_on_terminal(
         &self,
         terminal_id: &str,
         exclude: &str,
     ) -> Option<TerminalSessionRecord> {
-        if terminal_id.trim().is_empty() {
-            return None;
-        }
+        self.ranked_open_on_terminal(terminal_id, |r| r.claude_session_id != exclude)
+    }
+
+    /// The open row on `terminal_id` that `admit` accepts and that ranks
+    /// highest by [`Self::latest_open_on_terminal`]'s order — the selector
+    /// behind the "which session is running on this terminal" reads and the
+    /// terminal-keyed writes. (Closing by terminal ranks differently, by
+    /// [`open_authority_key`]: it settles which row a dead PTY's exit closes.)
+    fn ranked_open_on_terminal(
+        &self,
+        terminal_id: &str,
+        admit: impl Fn(&TerminalSessionRecord) -> bool,
+    ) -> Option<TerminalSessionRecord> {
         let m = match self.map.lock() {
             Ok(m) => m,
             Err(e) => {
-                warn!(error = %e, "session_lifecycle_store: lock poisoned on latest_open_on_terminal");
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on ranked_open_on_terminal");
                 return None;
             }
         };
-        let hooks = match self.session_start_hooks.lock() {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(error = %e, "session_lifecycle_store: hook-order lock poisoned on latest_open_on_terminal");
-                return None;
-            }
-        };
+        let id = self.ranked_open_id(&m, terminal_id, admit)?;
+        m.get(&id).cloned()
+    }
+
+    /// Id of the row [`Self::ranked_open_on_terminal`] picks, for a caller
+    /// already holding `map`. Takes the hook-order lock, so it keeps the
+    /// store's LOCK ORDER — `map` then hooks.
+    fn ranked_open_id(
+        &self,
+        m: &HashMap<String, TerminalSessionRecord>,
+        terminal_id: &str,
+        admit: impl Fn(&TerminalSessionRecord) -> bool,
+    ) -> Option<String> {
+        if terminal_id.trim().is_empty() {
+            return None;
+        }
+        let hooks = self.hook_order();
         m.values()
-            .filter(|r| {
-                r.state == "open" && r.terminal_id == terminal_id && r.claude_session_id != exclude
-            })
+            .filter(|r| open_on_terminal(r, terminal_id) && admit(r))
             .max_by(|a, b| {
                 let key = |r: &TerminalSessionRecord| {
                     (
                         hooks.1.get(&r.claude_session_id).copied(),
+                        r.last_session_start_at,
                         r.confirmed_at,
                         r.last_seen_at,
                         r.opened_at,
@@ -3299,7 +3682,7 @@ impl SessionLifecycleStore {
                     .cmp(&key(b))
                     .then_with(|| a.claude_session_id.cmp(&b.claude_session_id))
             })
-            .cloned()
+            .map(|r| r.claude_session_id.clone())
     }
 
     /// Clone of the record for `claude_session_id`, open or closed.
@@ -5503,10 +5886,15 @@ pub(crate) fn test_open_record(id: &str) -> TerminalSessionRecord {
         finished_at: None,
         wind_down_outcome: None,
         wind_down_at: None,
+        wind_down_arm: None,
         finish_reason: None,
         finish_synced: false,
         spawn_device_default: None,
         adopted_from: None,
+        last_session_start_at: None,
+        gate_id: None,
+        gate_consuming_device_id: None,
+        gate_bound_boot_ms: None,
     }
 }
 
@@ -5731,10 +6119,15 @@ mod tests {
             finished_at: None,
             wind_down_outcome: None,
             wind_down_at: None,
+            wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
+            gate_id: None,
+            gate_consuming_device_id: None,
+            gate_bound_boot_ms: None,
         }
     }
 
@@ -6127,6 +6520,107 @@ mod tests {
                 .is_none(),
             "an unknown terminal id resolves to None"
         );
+    }
+
+    /// A pane pinned to P whose operator then ran `/resume X` keeps BOTH rows
+    /// open (the hook bind evicts only unconfirmed siblings), and the terminal
+    /// lookups must name X — the session actually running — every time, not
+    /// whichever row the `HashMap` yields first. Incident 2026-10-29: the
+    /// token-exhaustion migration resolved terminal `5b27af82` to its stale
+    /// pane session, resumed that, and closed the pane running the real one.
+    /// Driven through the same calls `POST /control/session-open` makes.
+    #[test]
+    fn terminal_lookups_name_the_resumed_session_not_the_stale_pane_row() {
+        for _ in 0..32 {
+            let dir = tempdir().unwrap();
+            let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+            for id in ["pane-p", "resumed-x"] {
+                store.record_open(auth_on(id, "term-r"));
+                store.confirm_session(id);
+                store.note_session_start_hook(id);
+            }
+            assert_eq!(
+                store.get("pane-p").unwrap().state,
+                "open",
+                "precondition: the stale pane row survives the resume"
+            );
+            // An unconfirmed row bound later must not displace X from the
+            // confirmed lookup.
+            let mut phantom = rec("phantom");
+            phantom.terminal_id = "term-r".to_string();
+            phantom.origin = Some(ORIGIN_OBSERVED.to_string());
+            store.record_open(phantom);
+
+            assert_eq!(
+                store
+                    .find_open_by_terminal("term-r")
+                    .unwrap()
+                    .claude_session_id,
+                "resumed-x"
+            );
+            assert_eq!(
+                store
+                    .find_confirmed_open_by_terminal("term-r")
+                    .unwrap()
+                    .claude_session_id,
+                "resumed-x"
+            );
+        }
+    }
+
+    /// The same answer after a restart: the process-local hook order is gone
+    /// (a holder-adopted pane fires no new hook), so the durable
+    /// `last_session_start_at` must carry it. The resumed session is given the
+    /// OLDER `confirmed_at` — it was confirmed in another pane before this one
+    /// — which is exactly the case `confirmed_at` alone gets wrong.
+    #[test]
+    fn resumed_session_still_wins_after_reload() {
+        for _ in 0..32 {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("s.json");
+            {
+                let store = SessionLifecycleStore::open(&path).unwrap();
+                let mut x = auth_on("resumed-x", "term-r");
+                x.confirmed_at = Some(1_000);
+                store.record_open(x);
+                store.record_open(auth_on("pane-p", "term-r"));
+                store.confirm_session("pane-p");
+                store.note_session_start_hook("pane-p");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                store.note_session_start_hook("resumed-x");
+                assert_eq!(store.get("pane-p").unwrap().state, "open");
+            }
+            let reloaded = SessionLifecycleStore::open(&path).unwrap();
+            assert!(reloaded
+                .get("resumed-x")
+                .unwrap()
+                .last_session_start_at
+                .is_some());
+            assert_eq!(
+                reloaded
+                    .find_open_by_terminal("term-r")
+                    .unwrap()
+                    .claude_session_id,
+                "resumed-x"
+            );
+        }
+    }
+
+    /// A page move relocates every open row on the pane, so the stale sibling
+    /// cannot be restored on the page the pane left.
+    #[test]
+    fn update_page_by_terminal_moves_every_open_row_on_the_pane() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        for id in ["pane-p", "resumed-x"] {
+            store.record_open(auth_on(id, "term-r"));
+            store.confirm_session(id);
+        }
+        store.record_open(auth_on("elsewhere", "term-other"));
+        store.update_page_by_terminal("term-r", "page-2");
+        assert_eq!(store.get("pane-p").unwrap().page_id, "page-2");
+        assert_eq!(store.get("resumed-x").unwrap().page_id, "page-2");
+        assert_eq!(store.get("elsewhere").unwrap().page_id, "default");
     }
 
     /// `confirm_session` flips provisional→confirmed monotonically, a
@@ -7366,7 +7860,7 @@ mod tests {
     /// with `open_authority_key`, so a CONFIRMED row wins over a newer
     /// unconfirmed one, and every candidate is named.
     ///
-    /// A `find_open_by_terminal`-style single `.find()` over the `HashMap` would
+    /// A first-match `.find()` over the `HashMap` would
     /// close a nondeterministic row here — a worse failure than the silent
     /// no-op it replaces, because it is not reproducible.
     #[test]
@@ -9665,10 +10159,15 @@ mod tests {
             finished_at: None,
             wind_down_outcome: None,
             wind_down_at: None,
+            wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
+            gate_id: None,
+            gate_consuming_device_id: None,
+            gate_bound_boot_ms: None,
         }
     }
 
@@ -12683,5 +13182,361 @@ mod tests {
             vec!["victim".to_string()]
         );
         assert!(sorted_restorable(&store, None).is_empty());
+    }
+}
+
+/// Plan `2026-10-03-a-runner-crash-leaves-its-continuations-spawned-forever-…`
+/// Phase 1 tests (a)–(e), (g) and the store half of (f).
+#[cfg(test)]
+mod gate_continuation_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    const GATE: &str = "7252781b-c49c-4a83-bdc2-4fec9c3dcd91";
+    const DEVICE: &str = "eb2155ed-1111-4222-8333-444455556666";
+
+    /// A row exactly as a build predating the gate fields wrote it.
+    const OLD_ROW: &str = r#"{
+        "claudeSessionId": "44108327-98b7-4642-8f57-72e38fe8d723",
+        "configDir": null,
+        "workingDir": "/repo",
+        "pageId": "default",
+        "zoneIndex": 0,
+        "title": "Continuation",
+        "terminalId": "3f08601c-8fc8-4b1d-835d-c65bab42b85c",
+        "openedAt": 1000,
+        "lastSeenAt": 61000,
+        "state": "open",
+        "closedAt": null,
+        "closeReason": null
+    }"#;
+
+    fn old_row() -> TerminalSessionRecord {
+        serde_json::from_str(OLD_ROW).expect("old row deserializes")
+    }
+
+    fn gate_row(boot: i64) -> TerminalSessionRecord {
+        TerminalSessionRecord {
+            gate_id: Some(GATE.to_string()),
+            gate_consuming_device_id: Some(DEVICE.to_string()),
+            gate_bound_boot_ms: Some(boot),
+            ..old_row()
+        }
+    }
+
+    fn closed(mut rec: TerminalSessionRecord, reason: &str) -> TerminalSessionRecord {
+        rec.state = "closed".to_string();
+        rec.closed_at = Some(rec.last_seen_at);
+        rec.close_reason = Some(reason.to_string());
+        rec
+    }
+
+    fn store() -> (tempfile::TempDir, SessionLifecycleStore) {
+        let dir = tempdir().unwrap();
+        let s = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        (dir, s)
+    }
+
+    // (a)
+    #[test]
+    fn old_row_without_gate_fields_deserializes_to_none() {
+        let rec = old_row();
+        assert_eq!(rec.gate_id, None);
+        assert_eq!(rec.gate_consuming_device_id, None);
+        assert_eq!(rec.gate_bound_boot_ms, None);
+        // And an absent field is not serialized, so the on-disk shape of a
+        // non-gate record is unchanged.
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(!json.contains("gateId"), "{json}");
+    }
+
+    // (b)
+    #[test]
+    fn gate_fields_round_trip_and_survive_a_gateless_re_record() {
+        let (dir, s) = store();
+        s.record_open(gate_row(5_000));
+        // The session-open hook / restore re-record: same csid, no gate.
+        let mut again = old_row();
+        again.terminal_id = "new-terminal".to_string();
+        s.record_open(again);
+        let got = s.get(&old_row().claude_session_id).unwrap();
+        assert_eq!(got.gate_id.as_deref(), Some(GATE));
+        assert_eq!(got.gate_consuming_device_id.as_deref(), Some(DEVICE));
+        assert_eq!(got.gate_bound_boot_ms, Some(5_000));
+        assert_eq!(got.terminal_id, "new-terminal");
+
+        // Durable: a reopened store (a restart) still has all three.
+        drop(s);
+        let reopened =
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let got = reopened.get(&old_row().claude_session_id).unwrap();
+        assert_eq!(got.gate_id.as_deref(), Some(GATE));
+        assert_eq!(got.gate_consuming_device_id.as_deref(), Some(DEVICE));
+        assert_eq!(got.gate_bound_boot_ms, Some(5_000));
+    }
+
+    // (c)
+    #[test]
+    fn prior_generation_no_terminal_close_with_a_gate_reports_once() {
+        let boot = 10_000;
+        let rec = closed(gate_row(boot - 1), "no-terminal");
+        let report = runner_restart_unreported_report(&rec, boot).expect("must report");
+        assert_eq!(report.gate_id.to_string(), GATE);
+        assert_eq!(report.consuming_device_id.to_string(), DEVICE);
+
+        // Exactly once: the close observer fires only on a real open→closed
+        // transition, so a second close of the same record never reaches it.
+        // Wired the way main.rs wires it: a Weak to the store, read back by csid
+        // after the close is persisted.
+        let (_dir, s) = store();
+        let fired = Arc::new(Mutex::new(Vec::<RunnerRestartUnreported>::new()));
+        let s = Arc::new(s);
+        {
+            let fired = fired.clone();
+            let weak = Arc::downgrade(&s);
+            // The SAME function main.rs's close observer calls.
+            s.attach_close_observer(move |csid| {
+                if let Some(r) = runner_restart_report_on_close(&weak, csid, boot) {
+                    fired.lock().unwrap().push(r);
+                }
+            });
+        }
+        s.record_open(gate_row(boot - 1));
+        let csid = old_row().claude_session_id;
+        s.record_close(&csid, "no-terminal");
+        s.record_close(&csid, "no-terminal");
+        assert_eq!(fired.lock().unwrap().len(), 1, "posted exactly once");
+    }
+
+    // (d)
+    #[test]
+    fn decision_refuses_every_wrong_arm() {
+        let boot = 10_000;
+        // This generation bound the gate (a fresh spawn, or a restore that
+        // re-stamped it) — the in-process producers own its death.
+        assert_eq!(
+            runner_restart_unreported_report(&closed(gate_row(boot), "no-terminal"), boot),
+            None
+        );
+        // A record restored THIS generation keeps its preserved `opened_at`
+        // from before the crash; only the re-stamped boot instant says it is
+        // ours, and the decision must key on that.
+        let mut restored = gate_row(boot);
+        restored.opened_at = 1;
+        assert_eq!(
+            runner_restart_unreported_report(&closed(restored, "no-terminal"), boot),
+            None
+        );
+        // A restorable close.
+        assert_eq!(
+            runner_restart_unreported_report(&closed(gate_row(boot - 1), "poll-dead"), boot),
+            None
+        );
+        // No gate at all.
+        assert_eq!(
+            runner_restart_unreported_report(&closed(old_row(), "no-terminal"), boot),
+            None
+        );
+        // A work-unit DAG dispatch: `reportable_gate_id` is `None`, so the
+        // spawn hint carries no gate identity and nothing is recorded.
+        let mut unit = gate_row(boot - 1);
+        unit.gate_id = None;
+        unit.gate_consuming_device_id = None;
+        assert_eq!(
+            runner_restart_unreported_report(&closed(unit, "no-terminal"), boot),
+            None
+        );
+        // Half an identity, or no generation stamp: UNKNOWN, never a post.
+        let mut half = gate_row(boot - 1);
+        half.gate_consuming_device_id = None;
+        assert_eq!(
+            runner_restart_unreported_report(&closed(half, "no-terminal"), boot),
+            None
+        );
+        let mut unstamped = gate_row(boot - 1);
+        unstamped.gate_bound_boot_ms = None;
+        assert_eq!(
+            runner_restart_unreported_report(&closed(unstamped, "no-terminal"), boot),
+            None
+        );
+        // Still open.
+        assert_eq!(
+            runner_restart_unreported_report(&gate_row(boot - 1), boot),
+            None
+        );
+    }
+
+    // (e)
+    #[test]
+    fn detail_is_class_first_in_the_1902_grammar() {
+        let rec = closed(gate_row(1), "never-started");
+        let detail = runner_restart_unreported_report(&rec, 2).unwrap().detail;
+        assert!(detail.starts_with("exit=crashed "), "{detail}");
+        let keys: Vec<&str> = detail
+            .split(' ')
+            .map(|tok| tok.split_once('=').expect("every token is key=value").0)
+            .collect();
+        assert_eq!(
+            keys,
+            ["exit", "code", "after", "terminal", "reason", "close"],
+            "{detail}"
+        );
+        assert_eq!(
+            detail,
+            "exit=crashed code=none after=60s terminal=3f08601c-8fc8-4b1d-835d-c65bab42b85c \
+             reason=runner_restart close=never-started"
+        );
+    }
+
+    // (f), store half: a restored record is re-stamped to this generation.
+    #[test]
+    fn adopt_restored_gate_restamps_once_and_only_for_a_prior_generation() {
+        let (_dir, s) = store();
+        let csid = old_row().claude_session_id;
+        s.record_open(gate_row(100));
+        // Not restored by this boot yet → not adopted.
+        assert_eq!(s.adopt_restored_gate(&csid, 200), None);
+        assert_eq!(s.get(&csid).unwrap().gate_bound_boot_ms, Some(100));
+        // This boot's restore pass marks it.
+        s.mark_restore_pending(&csid, true);
+        let adopted = s
+            .adopt_restored_gate(&csid, 200)
+            .expect("prior generation adopts");
+        assert_eq!(adopted.0, old_row().terminal_id);
+        assert_eq!(adopted.1.to_string(), GATE);
+        assert_eq!(adopted.2.map(|d| d.to_string()).as_deref(), Some(DEVICE));
+        assert_eq!(s.get(&csid).unwrap().gate_bound_boot_ms, Some(200));
+        // Idempotent: already this generation's.
+        assert_eq!(s.adopt_restored_gate(&csid, 200), None);
+        // No gate → nothing.
+        let mut plain = old_row();
+        plain.claude_session_id = "plain".to_string();
+        s.record_open(plain);
+        s.mark_restore_pending("plain", true);
+        assert_eq!(s.adopt_restored_gate("plain", 200), None);
+        // Closed → nothing.
+        s.record_close(&csid, "no-terminal");
+        assert_eq!(s.adopt_restored_gate(&csid, 300), None);
+    }
+
+    /// The resume door's reopen is not a continuation. `release_gate_identity`
+    /// strips a closed record's gate only when its outcome is already owned.
+    /// A reported prior-generation gate is dropped, so a gate-less reopen is
+    /// not reported twice. An unreported one (`poll-dead`) is kept and is
+    /// still reported by D2. An open record is never touched.
+    #[test]
+    fn release_gate_identity_drops_only_an_owned_gate() {
+        let (_dir, s) = store();
+        let csid = old_row().claude_session_id;
+        // A prior-generation gate (bound at boot 100; this boot is 200).
+        s.record_open(gate_row(100));
+        s.mark_restore_pending(&csid, true);
+        // Open: a live continuation keeps its gate.
+        assert!(!s.release_gate_identity(&csid, 200));
+        // Closed non-restorably: D2 reported it, so it is released.
+        s.record_close(&csid, "no-terminal");
+        assert!(runner_restart_unreported_report(&s.get(&csid).unwrap(), 200).is_some());
+        assert!(s.release_gate_identity(&csid, 200));
+        let after = s.get(&csid).unwrap();
+        assert_eq!(after.gate_id, None);
+        assert_eq!(after.gate_consuming_device_id, None);
+        assert_eq!(after.gate_bound_boot_ms, None);
+        assert!(!s.release_gate_identity(&csid, 200));
+        assert!(!s.release_gate_identity("absent", 200));
+        // The door's gate-less reopen. It sets no new restore marker, and
+        // production's follow-on adoption step is skipped here because the
+        // row's demoted `terminal-only` tier refuses it anyway. The sticky
+        // merge no longer carries the gate in.
+        s.record_open(old_row());
+        assert_eq!(s.get(&csid).unwrap().state, "open");
+        assert_eq!(s.get(&csid).unwrap().gate_id, None);
+        // And its next non-restorable close reports nothing a second time.
+        s.record_close(&csid, "no-terminal");
+        assert!(runner_restart_unreported_report(&s.get(&csid).unwrap(), 200).is_none());
+
+        // A prior-generation `poll-dead` gate is UNREPORTED: kept.
+        let mut pd = gate_row(100);
+        pd.claude_session_id = "pd".to_string();
+        s.record_open(pd);
+        s.record_close("pd", "poll-dead");
+        assert!(!s.release_gate_identity("pd", 200));
+        assert_eq!(s.get("pd").unwrap().gate_id.as_deref(), Some(GATE));
+        // ...and after the door's gate-less reopen, D2 still reports it on the
+        // next non-restorable close.
+        let mut reopen = old_row();
+        reopen.claude_session_id = "pd".to_string();
+        s.record_open(reopen);
+        assert_eq!(s.get("pd").unwrap().gate_id.as_deref(), Some(GATE));
+        s.record_close("pd", "no-terminal");
+        assert!(runner_restart_unreported_report(&s.get("pd").unwrap(), 200).is_some());
+
+        // A gate bound by THIS process is owned by its exit hook: released
+        // whatever the close reason.
+        let mut own = gate_row(200);
+        own.claude_session_id = "own".to_string();
+        s.record_open(own);
+        s.record_close("own", "poll-dead");
+        assert!(s.release_gate_identity("own", 200));
+        assert_eq!(s.get("own").unwrap().gate_id, None);
+
+        // A missing boot stamp is UNKNOWN: kept.
+        let mut unstamped = gate_row(100);
+        unstamped.claude_session_id = "unstamped".to_string();
+        unstamped.gate_bound_boot_ms = None;
+        s.record_open(unstamped);
+        s.record_close("unstamped", "no-terminal");
+        assert!(!s.release_gate_identity("unstamped", 200));
+    }
+
+    /// Review of the rebase, item 2: a terminal-only restore of a gate record
+    /// (stamped the way `terminal_session_rebind_terminal` stamps it) is never
+    /// adopted, so its later `terminal-only-idle` close still reports through
+    /// D2 as the prior generation's.
+    #[test]
+    fn a_terminal_only_restore_is_not_adopted_and_still_reports() {
+        let (_dir, s) = store();
+        let csid = old_row().claude_session_id;
+        s.record_open(gate_row(100));
+        s.mark_restored_from_boot(&csid, RESTORE_TIER_TERMINAL_ONLY);
+        assert_eq!(s.adopt_restored_gate(&csid, 200), None);
+        assert_eq!(s.get(&csid).unwrap().gate_bound_boot_ms, Some(100));
+        s.record_close(&csid, "terminal-only-idle");
+        let rec = s.get(&csid).unwrap();
+        assert!(runner_restart_unreported_report(&rec, 200).is_some());
+    }
+
+    /// The real resume sequence: `mark_restore_pending` stamps `failed` before
+    /// the resume is typed, and the adoption doors fire before any verified
+    /// handshake promotes it — so `failed` must still adopt.
+    #[test]
+    fn a_pending_resume_tier_failed_still_adopts() {
+        let (_dir, s) = store();
+        let csid = old_row().claude_session_id;
+        s.record_open(gate_row(100));
+        s.mark_restore_pending(&csid, true);
+        assert_eq!(
+            s.get(&csid).unwrap().restore_tier.as_deref(),
+            Some(RESTORE_TIER_FAILED)
+        );
+        assert!(s.adopt_restored_gate(&csid, 200).is_some());
+    }
+
+    // (g)
+    #[test]
+    fn non_restorable_close_reasons_exclude_poll_dead() {
+        assert_eq!(
+            NON_RESTORABLE_CLOSE_REASONS,
+            &["no-terminal", "never-started", "terminal-only-idle"]
+        );
+        // Every reason the dead-shell mapping can produce that the restore
+        // pass will NOT pick up must be reportable, or a prior-generation
+        // continuation closed under it stays `spawned` forever.
+        assert!(
+            NON_RESTORABLE_CLOSE_REASONS.contains(&close_reason_for_dead_shell(Some(
+                RESTORE_TIER_TERMINAL_ONLY
+            )))
+        );
+        assert!(!NON_RESTORABLE_CLOSE_REASONS.contains(&"poll-dead"));
+        assert!(!NON_RESTORABLE_CLOSE_REASONS.contains(&"pty-exit"));
     }
 }

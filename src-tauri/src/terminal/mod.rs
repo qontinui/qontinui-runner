@@ -5,8 +5,10 @@
 //! with proper environment for running Claude CLI and other dev tools.
 //!
 //! Spawn-path contract: [`runner_context`] renders with zero I/O; the one
-//! bounded I/O a spawn seam performs for it is [`crate::served_corpus::probe`],
-//! whose result the seam passes in beside the per-session `CoordMcpDelivery`.
+//! bounded I/O a spawn seam performs for it is the served-corpus measurement
+//! ([`crate::served_corpus::probe`], or [`crate::served_corpus::probe_start`]
+//! joined later), whose result the seam passes in beside the per-session
+//! `CoordMcpDelivery`.
 
 pub mod account_migration;
 pub mod agent_status_sideband;
@@ -370,8 +372,10 @@ pub const RUNNER_CONTEXT_SOURCE_MARKER: &str = concat!(
 /// 5. the fleet-gated plan-capture clause, on the same condition as before.
 ///
 /// The spawn-path I/O this render needs is done by the SEAM, not here: each
-/// seam calls the bounded [`crate::served_corpus::probe`] on its workdir and
-/// passes the result in as `served`, exactly as it passes `coord_mcp`.
+/// seam measures its workdir with the bounded [`crate::served_corpus::probe`]
+/// (the terminal spawn starts [`crate::served_corpus::probe_start`] early and
+/// joins it) and passes the result in as `served`, exactly as it passes
+/// `coord_mcp`.
 ///
 /// Every degradation — coord unreachable, unpaired runner, absent document, a
 /// body that fails the render-time guard — falls back to the builtin and SAYS

@@ -3056,10 +3056,11 @@ If your task requires running visual automation, use the Runner API to execute w
                 spawn_args.push(std::ffi::OsStr::new(cd.as_str()));
             }
 
-            // Spawn Claude independently using the spawn script, with no
-            // console window: `claude` runs under the script's own
-            // `powershell.exe` child, not in python's console (see
-            // `spawn_python_script`).
+            // Spawn Claude independently using the spawn script. python gets
+            // no window (see `spawn_python_script`); the script's powershell
+            // child opens its own console unless the script passes
+            // CREATE_NO_WINDOW (fixed in qontinui-claude-config's
+            // spawn-independent-claude.py).
             let spawn_result = spawn_python_script("python", &spawn_args, &workspace_root);
 
             match spawn_result {
