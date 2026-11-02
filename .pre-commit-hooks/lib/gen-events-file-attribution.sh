@@ -51,7 +51,8 @@
 # this file existed. The doubts are:
 #   - the registry cannot be read (see the premises in the parser's header);
 #   - `lib.rs` does not declare `pub mod schema_export;` plainly, in the
-#     working tree or (when this change touches it) at the merge-base;
+#     working tree or (when this change touches it) at the merge-base, or it
+#     rebinds a crate name the registry reader trusts;
 #   - the parsed working-tree names differ from the set of files the
 #     regeneration actually emitted;
 #   - the registry changed in this push and its merge-base version cannot be
@@ -146,6 +147,11 @@ gen_events_registry_parse() {
 # never sees. The check is deliberately coarse: a `path =` in a comment or in
 # unrelated code also fails it, and failing only costs the per-file rule.
 #
+# It also refuses an `extern crate .. as <a crate the registry reader trusts>`,
+# which would make that name mean something else across the whole crate. This
+# crate does use the form (`extern crate self as qontinui_runner_lib`), so only
+# the trusted names are refused.
+#
 # `grep >/dev/null`, never `grep -q`: the caller runs under pipefail, and a
 # `-q` that exits on its first match can SIGPIPE the writer and turn a match
 # into a failed pipeline.
@@ -154,6 +160,10 @@ _gen_events_lib_rs_premise() {
     content="$(cat)" || return 1
     printf '%s\n' "$content" | grep -E '^[[:space:]]*pub[[:space:]]+mod[[:space:]]+schema_export[[:space:]]*;' >/dev/null || return 1
     if printf '%s\n' "$content" | grep -E '(^|[^A-Za-z0-9_])path[[:space:]]*=' >/dev/null; then
+        return 1
+    fi
+    if printf '%s\n' "$content" | tr '\n' ' ' \
+        | grep -E '(^|[^A-Za-z0-9_])extern[[:space:]]+crate[[:space:]]+[A-Za-z0-9_]+[[:space:]]+as[[:space:]]+(qontinui_types|qontinui_vision_core|serde_json|schemars)([^A-Za-z0-9_]|$)' >/dev/null; then
         return 1
     fi
     return 0

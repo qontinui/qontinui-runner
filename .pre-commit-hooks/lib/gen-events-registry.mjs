@@ -45,7 +45,13 @@
 //         early returns), so every `add!` runs whenever the function does;
 //       - no `mod` item inside it, and no `include!` or path attribute
 //         anywhere in the file, so no code is spliced in from another file;
-//       - every `add!(` invocation parses as `add!("Name", <type>)`.
+//       - every `add!(` invocation parses as `add!("Name", <type>)`;
+//   * the names the macro body spells mean what they spell. `schema_for` is
+//     imported from `schemars` and from nowhere else, `serde_json` is not
+//     rebound, an unqualified `Map` is `serde_json::Map`, the file defines no
+//     `schema_for` macro, and it declares no `extern crate`. Otherwise the
+//     macro's text can read correctly while a runner module decides every
+//     schema, and that module is a source-only input to the caller.
 //
 // The caller adds the one premise only a regeneration can check: the parsed
 // working-tree names must equal the set of files the regeneration emitted.
@@ -300,6 +306,10 @@ function classify(type, aliases, anyGlob) {
   if (tokens.join('') !== type.replace(/\s+/g, '')) return 'local';
   for (let k = 0; k < tokens.length; k++) {
     const tok = tokens[k];
+    // A `::` with no name before it opens an absolute path (`::krate::T`), and
+    // its first segment is a root the alias walk below would never see. The
+    // crate behind it can be this one, through `extern crate self as ..`.
+    if (tok === '::' && !NAME_RE.test(tokens[k - 1] ?? '')) return 'local';
     if (!NAME_RE.test(tok)) continue;
     if (tokens[k - 1] === '::') continue; // a later segment, not a root
     if (!rootIsExternal(tok, aliases)) return 'local';
@@ -427,6 +437,26 @@ function parseRegistry(src) {
   // Bound beside any `use` of the same name, it makes that name ambiguous,
   // so a block-scoped alias cannot pass a file-level module off as external.
   for (const m of fileLevel.matchAll(/\bmod\s+([A-Za-z_][A-Za-z0-9_]*)\b/g)) bind(m[1], `crate::${m[1]}`);
+
+  // MACRO_SHAPE above checks how the macro body is SPELLED. These check what
+  // the spelling resolves to. A `use crate::x::schema_for;` already on main
+  // leaves the shape intact and hands every schema to a runner module, so a
+  // push editing that module would clear as "external types only".
+  const pinned = (name, want, what) => {
+    const targets = aliases.get(name);
+    if (targets === undefined) {
+      if (what.optional) return;
+      violation(`${name} is not imported in the registry file`);
+    }
+    if (targets.size !== 1 || !targets.has(want)) {
+      violation(`${name} resolves to ${[...targets].join(' and ')}, not ${want}`);
+    }
+  };
+  if (/\bmacro_rules\s*!\s*schema_for\b/.test(code)) violation('the registry file defines its own schema_for macro');
+  if (/\bextern\s+crate\b/.test(fileLevel)) violation('an extern crate in the registry file');
+  pinned('schema_for', 'schemars::schema_for', {});
+  pinned('serde_json', 'serde_json', { optional: true });
+  if (!/\bserde_json\b/.test(lets[0][0])) pinned('Map', 'serde_json::Map', {});
 
   const lines = [];
   for (const name of [...names.keys()].sort()) {
