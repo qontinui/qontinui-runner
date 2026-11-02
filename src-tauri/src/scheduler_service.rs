@@ -514,7 +514,9 @@ impl SchedulerService {
 
         // Only a task that actually starts spends a concurrency slot. A task
         // parked on its conditions runs nothing, so it must not hold the slot
-        // from the due tasks behind it.
+        // from the due tasks behind it. The cost: a pass now checks every due
+        // task until the slots are spent, not only the first `max_concurrent`,
+        // so it holds `pass_lock` longer when many tasks are waiting.
         let available_slots = (settings.max_concurrent - running_count) as usize;
         start_due_tasks(due_tasks, available_slots, |task| {
             self.clone().try_start_due_task(pg, task)
@@ -542,6 +544,30 @@ impl SchedulerService {
             );
             self.record_skipped(&task).await;
             return false;
+        }
+
+        // The drain gate `tick_pass` partitioned on was read once, before the
+        // walk, and each condition check ahead of this task can take seconds
+        // (a due probe waits up to `INLINE_GRACE`). A drain that began
+        // mid-walk must still hold a task that spawns an AI session, so read
+        // it again here. Before the condition checks, not after them: a met
+        // probe verdict is spent by `gate_conditions` and must be run on.
+        // Held, the task stays due and spends no slot, exactly as one held at
+        // the top of the tick.
+        if task_spawns_ai_session(&task.task) {
+            if let crate::coord_drain_state::DrainGate::Defer { reason, .. } =
+                crate::coord_drain_state::drain_gate_for_work(
+                    crate::coord_drain_state::SpawnOrigin::Scheduler,
+                    &format!("scheduled_task:{}", task.id),
+                )
+            {
+                debug!(
+                    "Scheduler: holding task '{}' — the coord drain gate stopped allowing \
+                     autonomous spawns while this tick was walking its due tasks: {}",
+                    task.name, reason
+                );
+                return false;
+            }
         }
 
         // For Condition schedule tasks, check rearm delay.
@@ -4208,6 +4234,38 @@ mod tests {
         assert!(before_true
             .trim_end()
             .ends_with("self.clone().execute_task(task).await;"));
+    }
+
+    /// The drain gate is read again for each task, before its condition
+    /// checks: one read at the top of the tick goes stale across the checks
+    /// of the tasks ahead of it, and a met probe verdict must not be spent on
+    /// a task the drain then holds.
+    #[test]
+    fn a_task_rereads_the_drain_gate_before_its_conditions() {
+        let src = include_str!("scheduler_service.rs");
+        let (_, body) = src
+            .split_once("async fn try_start_due_task(")
+            .expect("try_start_due_task");
+        let (body, _) = body
+            .split_once("/// Record a skipped execution")
+            .expect("fn ends");
+        let (before_conditions, _) = body
+            .split_once("if task.has_conditions() {")
+            .expect("condition checks");
+        let (_, recheck) = before_conditions
+            .split_once("if task_spawns_ai_session(&task.task) {")
+            .expect("the drain gate is re-read before the condition checks");
+        let (hold, _) = recheck
+            .split_once("// For Condition schedule tasks")
+            .expect("the re-read precedes the rearm check");
+        assert!(hold.contains(
+            "if let crate::coord_drain_state::DrainGate::Defer { reason, .. } =\n                crate::coord_drain_state::drain_gate_for_work("
+        ));
+        assert_eq!(
+            hold.matches("return false;").count(),
+            1,
+            "a held task must return"
+        );
     }
 
     /// `execute_task_with_context` starts only through the atomic mark.
