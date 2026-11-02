@@ -1,4 +1,4 @@
-//! Lightweight GitHub REST API client for the PR watcher.
+//! Lightweight read-only GitHub REST API client for the session PR reconciler.
 //!
 //! Uses reqwest with token-based authentication. Rate-limit aware.
 //!
@@ -10,7 +10,7 @@
 //! stating out loud because both were defects before:
 //!
 //! 1. **Back-off reads one bucket.** The rate-limit counters used to live on the
-//!    client instance, and four clients are constructed across this process —
+//!    client instance, and four clients were constructed across this process —
 //!    so four disjoint counters each tracked a quarter of the evidence about one
 //!    shared GitHub bucket. The instance state is gone; back-off now consults
 //!    the process-global reading.
@@ -30,13 +30,9 @@ use reqwest::header::{
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use tracing::{debug, warn};
 
 use crate::github_budget::{self, CacheMode};
-
-/// Maximum total results to accumulate across paginated GitHub API calls.
-const PAGINATION_CAP: usize = 500;
 
 /// Requests left in the shared bucket at or below which a client sleeps until
 /// reset rather than issuing more. Unchanged from the per-instance counters this
@@ -254,29 +250,9 @@ fn prs_by_head_url(owner: &str, repo: &str, branch: &str) -> String {
     )
 }
 
-/// The URL builders below exist so a read and the write that invalidates it
-/// produce the BYTE-IDENTICAL string. The ETag cache keys on the full URL
-/// including its query, so an invalidation spelled out by hand at the write site
-/// would miss by a `?per_page=100` and leave a stale entry behind — a failure
-/// that shows up as a wrong answer, not as an error. Pure, unit-tested.
+/// The URL of one PR, for [`GitHubClient::get_pr`].
 fn pr_url(owner: &str, repo: &str, number: u64) -> String {
     format!("https://api.github.com/repos/{owner}/{repo}/pulls/{number}")
-}
-
-fn check_runs_url(owner: &str, repo: &str, sha: &str) -> String {
-    format!("https://api.github.com/repos/{owner}/{repo}/commits/{sha}/check-runs?per_page=100")
-}
-
-fn pr_reviews_url(owner: &str, repo: &str, number: u64) -> String {
-    format!("https://api.github.com/repos/{owner}/{repo}/pulls/{number}/reviews?per_page=100")
-}
-
-fn issue_comments_url(owner: &str, repo: &str, number: u64) -> String {
-    format!("https://api.github.com/repos/{owner}/{repo}/issues/{number}/comments")
-}
-
-fn job_logs_url(owner: &str, repo: &str, job_id: u64) -> String {
-    format!("https://api.github.com/repos/{owner}/{repo}/actions/jobs/{job_id}/logs")
 }
 
 /// The chip `qontinui-coord` applies to a PR it fast-forward-landed
@@ -348,8 +324,8 @@ pub struct GitHubClient {
     client: reqwest::Client,
     token: String,
     /// Which subsystem's spend this client's calls are attributed to in the
-    /// budget histogram. Several subsystems build their own client over the same
-    /// credential, and telling them apart is the whole point of the row key.
+    /// budget histogram. Other subsystems spend the same credential through their
+    /// own clients, and telling them apart is the whole point of the row key.
     consumer: &'static str,
 }
 
@@ -358,7 +334,6 @@ pub struct PrStatus {
     pub number: u64,
     pub state: String,
     pub merged: bool,
-    pub mergeable: Option<bool>,
     pub head_sha: String,
     /// The PR's BASE branch name (e.g. `"main"`), unprefixed — see
     /// [`HeadPr::base_ref`].
@@ -373,51 +348,9 @@ pub struct PrStatus {
     pub labels: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheckRun {
-    pub id: u64,
-    pub name: String,
-    pub status: String,
-    pub conclusion: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheckRunsResponse {
-    pub total_count: u64,
-    pub check_runs: Vec<CheckRun>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrReview {
-    pub id: u64,
-    pub state: String,
-    pub user: ReviewUser,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReviewUser {
-    pub login: String,
-}
-
-/// Aggregate CI status derived from check runs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CiStatus {
-    Pending,
-    Success,
-    Failure { failed_checks: Vec<String> },
-}
-
-/// Aggregate review status derived from reviews.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReviewStatus {
-    Pending,
-    Approved,
-    ChangesRequested,
-}
-
 impl GitHubClient {
     /// `consumer` is the budget-histogram label for whichever subsystem owns
-    /// this client — `pr_watcher`, `session_pr_reconciler`.
+    /// this client — `session_pr_reconciler`.
     /// It never carries the token.
     pub fn new(token: &str, consumer: &'static str) -> Result<Self, String> {
         let client = reqwest::Client::builder()
@@ -434,8 +367,8 @@ impl GitHubClient {
     /// Wait if the SHARED bucket is close to empty.
     ///
     /// The reading comes from [`crate::github_budget`] rather than from this
-    /// instance, because the bucket is per-credential and this process builds
-    /// several clients over one credential. An instance counter can only ever
+    /// instance, because the bucket is per-credential and this process spends one
+    /// credential through more than one client. An instance counter can only ever
     /// see the fraction of the spend that went through it, so each client backed
     /// off late by however much the others had already drawn down.
     ///
@@ -623,29 +556,6 @@ impl GitHubClient {
         })
     }
 
-    /// Issue a write and drop every cached representation the write changes.
-    ///
-    /// `invalidates` carries FULL urls built by the same builders the reads use
-    /// — the cache is keyed on the exact URL including its query string, so a
-    /// hand-typed near-miss would silently invalidate nothing.
-    async fn send_write(
-        &self,
-        url: &str,
-        invalidates: &[String],
-        request: reqwest::RequestBuilder,
-    ) -> Result<GhResponse, String> {
-        let resp = self
-            .send_metered(url, CacheMode::Uncacheable, request)
-            .await?;
-        if resp.is_success() {
-            for stale in invalidates {
-                github_budget::invalidate(stale);
-                github_budget::invalidate(&link_cache_key(stale));
-            }
-        }
-        Ok(resp)
-    }
-
     fn headers(&self) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -701,7 +611,6 @@ impl GitHubClient {
             number,
             state: body["state"].as_str().unwrap_or("unknown").to_string(),
             merged: body["merged"].as_bool().unwrap_or(false),
-            mergeable: body["mergeable"].as_bool(),
             head_sha: body["head"]["sha"].as_str().unwrap_or("").to_string(),
             base_ref: body["base"]["ref"].as_str().unwrap_or("").to_string(),
             closed_at: body["closed_at"].as_str().map(|s| s.to_string()),
@@ -761,251 +670,6 @@ impl GitHubClient {
                 })
             })
             .collect())
-    }
-
-    /// Fetch check runs for a commit SHA (paginated).
-    pub async fn get_check_runs(
-        &self,
-        owner: &str,
-        repo: &str,
-        sha: &str,
-    ) -> Result<Vec<CheckRun>, String> {
-        let mut all_runs = Vec::new();
-        let mut next_url: Option<String> = Some(check_runs_url(owner, repo, sha));
-
-        while let Some(url) = next_url.take() {
-            let resp = self
-                .send_metered(
-                    &url,
-                    CacheMode::Cached,
-                    self.client.get(&url).headers(self.headers()),
-                )
-                .await?;
-
-            if !resp.is_success() {
-                return Err(format!(
-                    "GitHub API returned {}: {}",
-                    resp.status(),
-                    resp.text()
-                ));
-            }
-
-            let link_header = resp.next_page_url();
-
-            let body: CheckRunsResponse = resp
-                .json()
-                .map_err(|e| format!("Failed to parse check runs: {}", e))?;
-
-            all_runs.extend(body.check_runs);
-
-            if all_runs.len() >= PAGINATION_CAP {
-                warn!(
-                    "get_check_runs: pagination cap ({}) reached for {}/{} sha {}",
-                    PAGINATION_CAP, owner, repo, sha
-                );
-                all_runs.truncate(PAGINATION_CAP);
-                break;
-            }
-
-            next_url = link_header;
-        }
-
-        Ok(all_runs)
-    }
-
-    /// Fetch reviews for a PR (paginated).
-    pub async fn get_pr_reviews(
-        &self,
-        owner: &str,
-        repo: &str,
-        number: u64,
-    ) -> Result<Vec<PrReview>, String> {
-        let mut all_reviews = Vec::new();
-        let mut next_url: Option<String> = Some(pr_reviews_url(owner, repo, number));
-
-        while let Some(url) = next_url.take() {
-            let resp = self
-                .send_metered(
-                    &url,
-                    CacheMode::Cached,
-                    self.client.get(&url).headers(self.headers()),
-                )
-                .await?;
-
-            if !resp.is_success() {
-                return Err(format!(
-                    "GitHub API returned {}: {}",
-                    resp.status(),
-                    resp.text()
-                ));
-            }
-
-            let link_header = resp.next_page_url();
-
-            let reviews: Vec<PrReview> = resp
-                .json()
-                .map_err(|e| format!("Failed to parse reviews: {}", e))?;
-
-            all_reviews.extend(reviews);
-
-            if all_reviews.len() >= PAGINATION_CAP {
-                warn!(
-                    "get_pr_reviews: pagination cap ({}) reached for {}/{} PR #{}",
-                    PAGINATION_CAP, owner, repo, number
-                );
-                all_reviews.truncate(PAGINATION_CAP);
-                break;
-            }
-
-            next_url = link_header;
-        }
-
-        Ok(all_reviews)
-    }
-
-    /// Fetch truncated log for a check run (last 4KB).
-    ///
-    /// Declared [`CacheMode::Fresh`], deliberately. This endpoint answers `302`
-    /// to a signed, short-lived blob URL that reqwest then follows, so the body
-    /// that arrives carries no API validator to condition on; and it is read
-    /// once, at failure-diagnosis time, never polled — so a cache entry would
-    /// spend the ETag store's byte budget on a possibly MB-scale body nothing
-    /// will ask for twice. `fresh` is the honest label for that, and Phase A
-    /// deliberately declines to judge a `fresh` row's hit rate.
-    #[expect(
-        clippy::string_slice,
-        reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-    )]
-    pub async fn get_check_run_log(
-        &self,
-        owner: &str,
-        repo: &str,
-        check_run_id: u64,
-    ) -> Result<String, String> {
-        let url = job_logs_url(owner, repo, check_run_id);
-        let resp = self
-            .send_metered(
-                &url,
-                CacheMode::Fresh,
-                self.client.get(&url).headers(self.headers()),
-            )
-            .await?;
-
-        if !resp.is_success() {
-            return Err(format!(
-                "GitHub API returned {}: {}",
-                resp.status(),
-                resp.text()
-            ));
-        }
-
-        let full_log = resp.text();
-
-        // Truncate to last 4KB for prompt injection (UTF-8 safe)
-        let truncated = if full_log.len() > 4096 {
-            let mut start = full_log.len().saturating_sub(4096);
-            while !full_log.is_char_boundary(start) && start < full_log.len() {
-                start += 1;
-            }
-            format!("...(truncated)\n{}", &full_log[start..])
-        } else {
-            full_log
-        };
-
-        Ok(truncated)
-    }
-
-    /// Post a comment on a PR. Invalidates the issue's comment list, whose
-    /// representation this write changes.
-    pub async fn create_pr_comment(
-        &self,
-        owner: &str,
-        repo: &str,
-        number: u64,
-        body: &str,
-    ) -> Result<(), String> {
-        let url = issue_comments_url(owner, repo, number);
-        let resp = self
-            .send_write(
-                &url,
-                std::slice::from_ref(&url),
-                self.client
-                    .post(&url)
-                    .headers(self.headers())
-                    .json(&serde_json::json!({ "body": body })),
-            )
-            .await?;
-
-        if !resp.is_success() {
-            return Err(format!(
-                "GitHub API returned {}: {}",
-                resp.status(),
-                resp.text()
-            ));
-        }
-
-        Ok(())
-    }
-
-    /// Derive aggregate CI status from check runs.
-    pub fn derive_ci_status(check_runs: &[CheckRun]) -> CiStatus {
-        if check_runs.is_empty() {
-            return CiStatus::Pending;
-        }
-
-        let mut failed = Vec::new();
-        let mut all_complete = true;
-
-        for cr in check_runs {
-            if cr.status != "completed" {
-                all_complete = false;
-                continue;
-            }
-            match cr.conclusion.as_deref() {
-                Some("failure") | Some("timed_out") | Some("cancelled") => {
-                    failed.push(cr.name.clone());
-                }
-                Some("action_required") => {
-                    failed.push(cr.name.clone());
-                }
-                _ => {} // success, neutral, skipped
-            }
-        }
-
-        if !failed.is_empty() {
-            CiStatus::Failure {
-                failed_checks: failed,
-            }
-        } else if all_complete {
-            CiStatus::Success
-        } else {
-            CiStatus::Pending
-        }
-    }
-
-    /// Derive aggregate review status from reviews.
-    /// Uses the last review per reviewer (GitHub semantics).
-    pub fn derive_review_status(reviews: &[PrReview]) -> ReviewStatus {
-        if reviews.is_empty() {
-            return ReviewStatus::Pending;
-        }
-
-        // Take last review per user
-        let mut latest: HashMap<String, &str> = HashMap::new();
-        for review in reviews {
-            latest.insert(review.user.login.clone(), &review.state);
-        }
-
-        let has_changes_requested = latest.values().any(|s| *s == "CHANGES_REQUESTED");
-        let has_approval = latest.values().any(|s| *s == "APPROVED");
-
-        if has_changes_requested {
-            ReviewStatus::ChangesRequested
-        } else if has_approval {
-            ReviewStatus::Approved
-        } else {
-            ReviewStatus::Pending
-        }
     }
 }
 
@@ -1197,32 +861,14 @@ mod tests {
         assert_ne!(key, "https://api.github.com/repos/o/r/pulls/1");
     }
 
-    // -- Write invalidation -------------------------------------------------
+    // -- Cache invalidation -------------------------------------------------
 
-    /// The read and the write that invalidates it must produce the SAME string,
-    /// query included — the cache keys on the full URL, so a near-miss
-    /// invalidates nothing and leaves a stale body behind.
+    /// A typo here fails every reconciler `get_pr`, and no other test would see it.
     #[test]
-    fn write_invalidation_targets_the_exact_urls_the_reads_cached() {
-        assert_eq!(
-            pr_reviews_url("o", "r", 7),
-            "https://api.github.com/repos/o/r/pulls/7/reviews?per_page=100"
-        );
+    fn pr_url_is_the_pulls_route() {
         assert_eq!(
             pr_url("o", "r", 7),
             "https://api.github.com/repos/o/r/pulls/7"
-        );
-        assert_eq!(
-            issue_comments_url("o", "r", 7),
-            "https://api.github.com/repos/o/r/issues/7/comments"
-        );
-        assert_eq!(
-            check_runs_url("o", "r", "deadbeef"),
-            "https://api.github.com/repos/o/r/commits/deadbeef/check-runs?per_page=100"
-        );
-        assert_eq!(
-            job_logs_url("o", "r", 42),
-            "https://api.github.com/repos/o/r/actions/jobs/42/logs"
         );
     }
 
@@ -1231,13 +877,13 @@ mod tests {
     /// page no longer exists.
     #[test]
     fn invalidating_a_read_drops_its_body_and_its_cached_link() {
-        let url = pr_reviews_url("o", "r", 424242);
+        let url = pr_url("o", "r", 424242);
         let key = link_cache_key(&url);
         github_budget::store(&url, "e", Bytes::from_static(b"[]"));
         github_budget::store(&key, "e", Bytes::from_static(b"https://next"));
         assert!(github_budget::replay(&url).is_some());
 
-        // Exactly what `send_write` does on a successful write.
+        // Exactly what `send_metered` does for `CacheAction::DropEntry`.
         github_budget::invalidate(&url);
         github_budget::invalidate(&key);
 

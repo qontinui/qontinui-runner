@@ -1887,7 +1887,11 @@ mod tests {
             out.contains("omitted(len="),
             "the bad-UTF-8 line is kept as evidence: {out}"
         );
-        assert!(!out.contains("bad"), "{out}");
+        // The digest is keyed per process, so its hex can itself spell "bad"
+        // (CI saw `hmac=2a24ab5d7bad`); drop exactly the digests and search
+        // everything else.
+        let digest = regex::Regex::new(r"hmac=[0-9a-f]{12}").unwrap();
+        assert!(!digest.replace_all(&out, "hmac=").contains("bad"), "{out}");
         assert!(out.contains("[line cut]"), "{out}");
         assert!(out.contains("exit_status=2"), "it kept reading: {out}");
         assert!(out.contains("exit_status=3"), "{out}");

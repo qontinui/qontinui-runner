@@ -877,6 +877,16 @@ export function useTerminalPages() {
   }, [isPinned, visiblePages, activePageId, addPage, setActivePageId]);
 
   return {
+    /**
+     * The full persisted page roster in tab order — every page, including ones
+     * detached into a pop-out and the internal `default` page when it exists
+     * (even while empty).
+     * Read by the `list-pages` UI Bridge action (`TerminalPagesBridge`), which
+     * must name every page the operator has, not only the ones this window shows.
+     */
+    allPages,
+    /** `pageId → windowLabel` for pages currently detached into a pop-out. */
+    boundPages,
     pages,
     /**
      * The pages to render as TABS — `pages` minus the internal "default" page

@@ -1,0 +1,231 @@
+# coord-repair: the COMPUTE SANDBOX for coord's repo-declared CI repairs.
+#
+# Plan: 2026-09-24-coord-deterministic-ci-repair-lane, §3 recipes 2 (format)
+# and 3 (regen), §5.1 "Repo-declared workflow (needs a toolchain)".
+#
+# WHO RUNS IT: coord, and nothing else. Coord dispatches this workflow for one
+# PR head whose failing CI step this repo DECLARES as mechanically repairable
+# (a `[[repair]]` block in .qontinui/ci.toml — parsed and validated by
+# src-tauri/src/ci_node/manifest.rs `CiRepair`, never executed by the runner),
+# finds the run by its run-name (`coord-repair <correlation_id>`), downloads
+# the one artifact, re-validates it (paths within allowed_paths,
+# `git apply --check` on head_sha, `git diff -w` empty for a format repair,
+# size cap) and only THEN authors the commit through its own audited push seam.
+#
+# IT PUSHES NOTHING, COMMENTS NOTHING, LABELS NOTHING. `contents: read` is the
+# whole grant and both checkouts drop the credential. A repair that could
+# write from here would be a second writer beside coord's one fenced seam.
+#
+# WHAT DECIDES THE REPAIR: the DEFAULT branch's .qontinui/ci.toml, checked out
+# to `trusted/` — never the PR's, so a PR cannot declare its own repair. The
+# declared `command` and `check` then run in `work/`, the PR head. No matching
+# declaration fails the job with no artifact; coord reads that as a refusal.
+#
+# NO [[repair]] IS DECLARED YET. Declarations land only once runners carrying
+# #1944 (the `repair` field on CiManifest) are rolled out: older runners parse
+# ci.toml with deny_unknown_fields, so a `[[repair]]` block would break their
+# CI-node dispatch for this repo. Until then every dispatch fails at "Select".
+#
+# WHICH CODE RUNS: a declaration must name repo scripts as
+# `../trusted/.github/...` (the default branch's copy, beside work/); the
+# helper's `select` refuses any other spelling. The `check` exit code is
+# forgeable whenever check executes PR code (cargo test, poetry run ...), so
+# coord's own re-validation of the patch is the boundary, not check_exit.
+#
+# INPUTS reach shell code ONLY through `env:`; nothing below interpolates
+# `${{ inputs.* }}` into a `run:` line (script injection). They are validated
+# before either checkout uses them.
+#
+# THE CONTRACT coord relies on — change it only together with coord's
+# dispatcher: the six inputs (pr, head_sha, base_ref, step, kind,
+# correlation_id); the run-name; the artifact name
+# `coord-repair-<correlation_id>` holding exactly `repair.patch` and
+# `report.json` (schema `coord-repair/1`, see .github/scripts/coord-repair-run.py).
+name: coord-repair
+run-name: coord-repair ${{ inputs.correlation_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number whose head is being repaired
+        required: true
+        type: string
+      head_sha:
+        description: The exact 40-hex PR head commit the repair runs against
+        required: true
+        type: string
+      base_ref:
+        description: The PR's base branch (the changed-files merge-base is taken against it)
+        required: true
+        type: string
+      step:
+        description: The failing CI step name (matched against [[repair]].step)
+        required: true
+        type: string
+      kind:
+        description: format | regen (matched against [[repair]].kind)
+        required: true
+        type: string
+      correlation_id:
+        description: Coord's id for this dispatch; names the run and the artifact
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coord-repair-${{ inputs.pr }}-${{ inputs.step }}-${{ inputs.kind }}
+  cancel-in-progress: true
+
+jobs:
+  repair:
+    name: coord-repair
+    # The ubuntu leg of ci.yml's `test` job, which owns both steps a repair
+    # here can name ("Format Rust code check", "Run Rust tests"). Toolchain
+    # and system packages below are copied from that job. Every external
+    # action is pinned by commit SHA (the tag each resolves to in the
+    # comment), unlike the tag pins elsewhere in this repo: this workflow runs
+    # PR-head code by design, so it takes no mutable reference on top of that.
+    runs-on: ubuntu-22.04
+    # Read-only, both. `pull-requests: read` is for the regen's sibling
+    # checkout, which reads the PR's coord dep-edge labels and the named
+    # sibling PR (ci.yml grants the same for the same action); nothing here
+    # can write.
+    permissions:
+      contents: read
+      pull-requests: read
+    # A cold regen build (cargo test of the whole crate, no shared cache:
+    # PR-built artefacts must not land in a cache main later restores) gets 45
+    # minutes; a format repair 30. COORD_REPAIR_BUDGET_SECS is the deadline,
+    # counted from the job's first step, that command + check share; the
+    # remainder of timeout-minutes is left for the artifact upload.
+    timeout-minutes: ${{ inputs.kind == 'regen' && 45 || 30 }}
+    env:
+      COORD_REPAIR_PR: ${{ inputs.pr }}
+      COORD_REPAIR_HEAD_SHA: ${{ inputs.head_sha }}
+      COORD_REPAIR_BASE_REF: ${{ inputs.base_ref }}
+      COORD_REPAIR_STEP: ${{ inputs.step }}
+      COORD_REPAIR_KIND: ${{ inputs.kind }}
+      COORD_REPAIR_CORRELATION_ID: ${{ inputs.correlation_id }}
+      COORD_REPAIR_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      COORD_REPAIR_BUDGET_SECS: ${{ inputs.kind == 'regen' && 2400 || 1320 }}
+      COORD_REPAIR_ARGV_CAP_SECS: ${{ inputs.kind == 'regen' && 2100 || 900 }}
+    steps:
+      - name: Record the job's start (the repair's deadline counts from here)
+        run: echo "COORD_REPAIR_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=coord-repair::$1"; exit 1; }
+          [[ "$COORD_REPAIR_PR" =~ ^[1-9][0-9]{0,9}$ ]] || fail "pr must be a positive integer"
+          [[ "$COORD_REPAIR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "head_sha must be 40 lowercase hex"
+          [[ "$COORD_REPAIR_BASE_REF" =~ ^[A-Za-z0-9._/-]{1,200}$ && "$COORD_REPAIR_BASE_REF" != *..* && "$COORD_REPAIR_BASE_REF" != -* ]] || fail "base_ref must be a plain branch name"
+          [[ "$COORD_REPAIR_KIND" == "format" || "$COORD_REPAIR_KIND" == "regen" ]] || fail "kind must be format or regen"
+          [[ "$COORD_REPAIR_CORRELATION_ID" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || fail "correlation_id must match ^[A-Za-z0-9._-]{1,64}$"
+          [[ -n "${COORD_REPAIR_STEP//[[:space:]]/}" && ${#COORD_REPAIR_STEP} -le 256 ]] || fail "step must be non-empty and <= 256 chars"
+          [[ "$COORD_REPAIR_DEFAULT_BRANCH" =~ ^[A-Za-z0-9._/-]{1,255}$ ]] || fail "default branch name is not a plain ref"
+
+      # The helper needs tomllib (python >= 3.11); ubuntu-22.04's system
+      # python is 3.10.
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Check out the default branch (trusted)
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Select the declared repair
+        run: python3 -B trusted/.github/scripts/coord-repair-run.py select --manifest trusted/.qontinui/ci.toml --out "$RUNNER_TEMP/coord-repair/selected.json"
+
+      # fetch-depth: 0 also fetches every branch to refs/remotes/origin/*,
+      # which is where the helper reads base_ref for the merge-base.
+      - name: Check out the PR head
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ inputs.head_sha }}
+          path: work
+          fetch-depth: 0
+          persist-credentials: false
+
+      # ci.yml `test` job's "Setup Rust" (pin matches rust-toolchain.toml).
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master as of 2026-10-04
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt
+
+      # --- regen only: what compiling the crate needs (ci.yml `test` job) ---
+
+      # src-tauri/Cargo.toml path-depends on ../../qontinui-schemas/rust, i.e.
+      # a sibling of the repo root — beside work/, at the PR head's pin.
+      - name: "Regen: check out sibling qontinui-schemas"
+        if: inputs.kind == 'regen'
+        uses: ./trusted/.github/actions/checkout-sibling
+        with:
+          path: ${{ github.workspace }}/qontinui-schemas
+          pin-file: work/.github/sibling-pins.conf
+          # Not a pull_request event, so name the PR: a declared adaptation
+          # PR then resolves exactly as it does in ci.yml.
+          pr-number: ${{ inputs.pr }}
+
+      - name: "Regen: install dependencies (Ubuntu)"
+        if: inputs.kind == 'regen'
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            libatspi2.0-dev \
+            at-spi2-core
+
+      - name: "Regen: add swapfile (guard against link-time OOM)"
+        if: inputs.kind == 'regen'
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      # tauri_build::build() panics when tauri.conf.json's `frontendDist`
+      # (../dist) is absent; no repair needs a real frontend build, so stub it
+      # (the same stub qontinui-types-drift.yml uses). dist/ is gitignored, so
+      # it never reaches the patch.
+      - name: "Regen: stub the frontend dist"
+        if: inputs.kind == 'regen'
+        run: |
+          mkdir -p work/dist
+          printf '<!DOCTYPE html><html><head></head><body>coord-repair CI stub</body></html>\n' > work/dist/index.html
+
+      - name: Run the repair
+        env:
+          QONTINUI_DISABLE_KEYCHAIN: "1"
+        run: python3 -B trusted/.github/scripts/coord-repair-run.py run --selected "$RUNNER_TEMP/coord-repair/selected.json" --work work --out-dir "$RUNNER_TEMP/coord-repair/out"
+
+      - name: Upload the repair artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coord-repair-${{ inputs.correlation_id }}
+          path: |
+            ${{ runner.temp }}/coord-repair/out/repair.patch
+            ${{ runner.temp }}/coord-repair/out/report.json
+          retention-days: 3
+          if-no-files-found: error

@@ -1549,6 +1549,65 @@ If both Runner and Web are available:
   curl -s -X POST "${BASE:?BASE unbound -- bind it in your arm first}/sdk/connect" -H "Content-Type: application/json" -d '{"url": "https://qontinui.io/api/ui-bridge"}'  # envelope-ok: the reply is printed, never parsed into a verdict; no step observes the connection, so under Phase 5 it stays UNVERIFIED unless the tester sees it on the UI surface
   ```
 
+## Phase 4.5: Cross-Page Journey (run once per app under test)
+
+Phase 3.5 covers each page on its own. This phase covers the paths BETWEEN
+pages: is there a page the user cannot leave, and is there a page that can be
+reached only by typing its URL. Read `journey_dead_ends` and
+`journey_requires_prior_knowledge` (ui-bridge-mcp tools) for the app under
+test, after `journey_health`. Without the MCP tools, use the runner routes
+they wrap. Those routes live on the runner API root, not under `/ui-bridge`,
+on the runner whose action handler carried your clicks: `$TEST_PORT` on the
+temp-runner arm, `9876` on the own-runner arm. All three reads are GETs, so
+they are fine on the READ-ONLY own-runner arm.
+
+The ui-bridge-mcp tools always ask the runner at `QONTINUI_RUNNER_HOST` on
+`QONTINUI_RUNNER_PORT`, and take no per-call host or port. The port defaults
+to `9876`. The host defaults to the first `/etc/resolv.conf` nameserver,
+which is meant for WSL2 but is used whenever that file exists, so on native
+Linux or macOS it is usually not the runner at all. The ledger is
+per-runner. So on the temp-runner arm, and on the own-runner arm of a
+native Linux box, the tools can silently read another runner's ledger, or
+none. Either launch the MCP server with `QONTINUI_RUNNER_HOST=127.0.0.1` and
+`QONTINUI_RUNNER_PORT=<that runner's port>`, or use the guarded GETs below.
+
+Shell state does not carry between calls, so set the port explicitly. An
+unset one stops the block instead of asking a different runner's ledger:
+
+```bash
+: "${JOURNEY_PORT:?set to \$TEST_PORT on the temp-runner arm, 9876 on the own-runner arm}"
+APP_ID=qontinui-web   # the app under test, as in GET /apps
+for q in health dead-ends prior-knowledge; do
+  curl -fsS --max-time 30 "http://127.0.0.1:${JOURNEY_PORT}/apps/$APP_ID/journey/$q" \
+    || echo "journey/$q: no answer -- record UNKNOWN (a 404 from dead-ends/prior-knowledge = a build predating the query routes; a 503 DATABASE_UNAVAILABLE = that runner booted without its database)"
+done
+```
+
+`knowledge-base/qontinui-specific/ui-bridge.md` → "Journey queries" says how
+to read an answer, and whether the door is on your build yet. Read
+`journey_health`'s `LEDGER:` line, then each query answer's `COVERAGE:` line,
+before its `ANSWER:`.
+
+- A `measured` listing goes into the report: each node key, with `backOnly`
+  for a dead end. A `[DEGRADED]` listing is still a finding, and it may be
+  incomplete.
+- `absent` is the only answer that supports "none found", and only under the
+  echoed filter.
+- **`unknown`, a ledger that is not `writing`, or a read gap is reported as
+  UNKNOWN with its code and the open frontier it names. It is never "no
+  defects" and never a PASS.** The one exception is a qualified
+  prior-knowledge finding: every open frontier entry is `effect_write` /
+  `effect_destructive`, and the node lists no other cause. It is reported only
+  by the exact recipe in ui-bridge.md → "A qualified prior-knowledge
+  finding", naming every such affordance. There is no qualified dead end. A qualified finding needs the tools' rendering: on the GET arm, report such a node as UNKNOWN.
+  `health` answers on older builds too, so a 200 from it proves nothing about
+  the query routes. A 404 from `dead-ends` or `prior-knowledge` is a build
+  that predates them, and a 503 `DATABASE_UNAVAILABLE` is a runner that
+  booted without its database. Both are recorded UNKNOWN.
+
+A drive that went through no runner (the web relay or an injected tab) left
+no ledger on that runner to ask, so its result is UNKNOWN too.
+
 ## Phase 5: Report & Evaluate
 
 > **Complete verification (binding).** A task is only PASS when the user-specified

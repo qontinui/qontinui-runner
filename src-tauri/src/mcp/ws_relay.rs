@@ -476,10 +476,12 @@ async fn drive_connection(
     //     Both refuse BEFORE any state is touched.
     let principal = match binding.principal(requester.as_ref(), None, WS_ROUTE) {
         Ok(p) => p,
-        Err(refusal) => return refuse_handshake(sink, &register.app_id, refusal).await,
+        Err(refusal) => {
+            return refuse_handshake(sink, &mut stream, &register.app_id, refusal).await
+        }
     };
     if let Err(refusal) = check_register_frame_origin(&binding, &principal, &register, mode) {
-        return refuse_handshake(sink, &register.app_id, refusal).await;
+        return refuse_handshake(sink, &mut stream, &register.app_id, refusal).await;
     }
 
     // 2. Allocate the connection id, CLAIM the appId under it (R1/R5, checked
@@ -539,7 +541,7 @@ async fn drive_connection(
         )
         .await
     {
-        return refuse_handshake(sink, &register.app_id, refusal).await;
+        return refuse_handshake(sink, &mut stream, &register.app_id, refusal).await;
     }
 
     let displaced = ws_manager
@@ -739,6 +741,7 @@ async fn drive_connection(
 /// `WrapperTransportError` carrying the code, so no client change is needed.
 async fn refuse_handshake(
     mut sink: futures_util::stream::SplitSink<WebSocket, Message>,
+    stream: &mut futures_util::stream::SplitStream<WebSocket>,
     app_id: &str,
     refusal: Refusal,
 ) {
@@ -753,6 +756,20 @@ async fn refuse_handshake(
         let _ = sink.send(Message::Text(frame.into())).await;
     }
     let _ = sink.send(Message::Close(None)).await;
+    // Finish the close handshake before dropping the socket. Dropping it the
+    // instant our Close is queued closes the TCP socket while the peer's own
+    // Close reply (or any frame it already sent) is still unread; on Windows
+    // that sends an RST, and the peer's stack discards its receive buffer --
+    // including the refusal ack we just wrote. Bounded, so a peer that never
+    // answers cannot hold the task.
+    let _ = tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(Ok(msg)) = stream.next().await {
+            if matches!(msg, Message::Close(_)) {
+                break;
+            }
+        }
+    })
+    .await;
 }
 
 /// R4 over the WebSocket handshake: a BROWSER principal's self-declared
