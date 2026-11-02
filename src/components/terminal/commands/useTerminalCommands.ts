@@ -1034,8 +1034,8 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     // Named-group form so the preset is bound to `args.preset` for both
     // pattern and slash-form invocations.
     patterns: [
-      /^layout\s+(?<preset>single|split|quad|six-?pack|full-?grid|[1-9]\d?)$/i,
-      /^(?<preset>single|split|quad|six-?pack|full-?grid)\s+layout$/i,
+      /^layout\s+(?<preset>single|split|triptych|quad|1-plus-4|six-?pack|command-center|full-?grid|flow-?grid|[1-9]\d?)$/i,
+      /^(?<preset>single|split|triptych|quad|1-plus-4|six-?pack|command-center|full-?grid|flow-?grid)\s+layout$/i,
     ],
     handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
       // ONE resolver with the `select-layout` bridge action: preset ids, their
