@@ -44,12 +44,11 @@ pub(crate) const RETRY_DELAYS: [Duration; 3] = [
 /// (qontinui-runner#1925) uses, `claude_cli_unavailable:<kind>`, so the runner
 /// has one word for "the CLI could not be launched".
 ///
-/// For a HEADLESS gate continuation it is the first thing coord receives,
-/// because the `spawn_failed` detail is the error's own first line. Phase 3 of
-/// the plan teaches coord's `continuation_spawn_retry::classify_spawn_failure`
-/// to read that head as a retriable missing CLI. That coord change ships
-/// separately, and until it lands coord classifies the head as deterministic,
-/// the same as the untagged text it replaces. The agent-loop and scheduler
+/// For a gate continuation it is the first thing coord receives, because the
+/// `spawn_failed` detail is the error's own first line, and coord's
+/// `continuation_spawn_retry::classify_spawn_failure` reads it as a retriable
+/// missing CLI. The headless path emits it from here, the terminal path from
+/// `agent_runtime::continuation_spawn_failure_detail`. The agent-loop and scheduler
 /// paths add their own prefixes (`spawn failure: `,
 /// `spawn scheduled session: `). Neither path is a continuation outcome, so
 /// coord's classifier never reads them.

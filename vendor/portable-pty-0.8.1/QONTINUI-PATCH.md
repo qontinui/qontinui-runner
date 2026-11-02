@@ -19,6 +19,14 @@ Observed 6 times 2026-10-17..19 during `claude` reinstall windows.
 CLOEXEC fds are closed by the kernel at a successful exec, so leaving them open
 leaks nothing into the child program.
 
+## What callers see
+
+A failed exec is now an `Err` from `spawn_command` instead of an `Ok` whose pane
+dies at once, so it takes the spawn's error path rather than the dead-pane path.
+A gate continuation retries both (`continuation_create_error_is_retryable` in
+`src-tauri/src/agent_runtime.rs`, keyed on `PTY_SPAWN_FAILED`), and the PTY holder
+reports it as `holder_error=child`, which falls back to an in-process spawn.
+
 ## Removing
 
 Drop the `[patch.crates-io] portable-pty` entry in the root `Cargo.toml` and
