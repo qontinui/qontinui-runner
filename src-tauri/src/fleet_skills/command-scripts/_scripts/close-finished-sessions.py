@@ -3,6 +3,7 @@
 
 Usage: close-finished-sessions.py [--close] [--idle-min N]
                                   [--only ID[,ID..]] [--json] [--port N]
+                                  [--rows-out PATH]
 
 The report is always printed. --close then closes the FINISHED and
 EXITED-FINISHED, CLOSEOUT and FOOTER-FINISHED rows,
@@ -38,7 +39,8 @@ READ_ERRORS = (urllib.error.URLError, OSError, ValueError, EnvelopeUnknown)
 # Closeout PHRASES are a screen, not a verdict: a close rests on a structured
 # finished signal (the runner marker or coord's session_status) plus the
 # idleness proof. A phrase is load-bearing only where no structured finish time
-# exists - a coord-only finish, a session revived and then closed out again, and
+# exists - a coord-only finish whose time the runner does not serve, a runner-
+# marked session revived and then closed out again with no coord time, and
 # the phrase-only CLOSEOUT rows - so it is matched against a WHITELIST of
 # the grammar the fleet's own closeout steps print, and anything hedged is a no.
 # A missed yes leaves a tab open; a missed no closes a live session.
@@ -852,12 +854,198 @@ def selftest():
         bad.append("record_waiting and prompt_not_ready must be named distinctly in the report")
     if "glyph" not in (wind_down_veto({"reason": "prompt_not_ready", "idleEvidence": "glyph:x"}) or ""):
         bad.append("a veto must quote the runner's idleEvidence")
+    two = newest_open_rows([
+        {"terminalId": "t", "state": "open", "claudeSessionId": "new", "openedAt": 20},
+        {"terminalId": "t", "state": "open", "claudeSessionId": "old", "openedAt": 10},
+        {"terminalId": "t", "state": "closed", "claudeSessionId": "gone", "openedAt": 30}])
+    if two["t"]["claudeSessionId"] != "new":
+        bad.append("a terminal with two open rows must resolve to the newest openedAt")
+    finish_cases = finish_time_cases(bad)
     for line in bad:
         print("SELFTEST FAIL: " + line)
     print(f"selftest: {len(PHRASE_CASES)} phrase cases, {len(WIND_DOWN_CASES)} wind-down reason cases, "
-          f"{len(NO_VETO_CASES)} no-veto cases + turn-end, shell "
+          f"{len(NO_VETO_CASES)} no-veto cases, {finish_cases} finish-time cases + turn-end, shell "
           f"and prompt cases, {len(bad)} failure(s)")
     return 1 if bad else 0
+
+
+def finish_time_cases(bad):
+    """classify() on an idle, bound pane (the process, screen and transcript
+    reads stubbed) for each way coord's finish time (sessionStatusSince) and the
+    runner marker meet the last prompt, then transcript_facts' `last_turn_open`
+    on written transcripts. Appends failures to `bad`; returns the case count."""
+    import tempfile
+    now = time.time() * 1000
+    m = 60000
+    lp = int(now - 62 * m)  # the last real prompt
+    plain, closing = "Fixed the bug in parser.py and pushed it.", "PR #3 landed.\n\nSAFE TO CLOSE"
+    base = {"final_text": plain, "final_text_at": now - 60 * m, "last_prompt": lp, "last_prompt_text": "fix the bug",
+            "last_asst": now - 60 * m, "last_activity": now - 60 * m, "pending_tool": False,
+            "last_turn_open": lp, "last_turn_open_text": "fix the bug"}
+    shut = dict(base, final_text=closing)
+    cf = {"sessionStatus": "finished"}
+    before, after = int(now - 90 * m), int(now - 61 * m)  # coord stamps either side of the prompt
+
+    def at(ms_):
+        return dict(cf, sessionStatusSince=int(ms_))
+    marker = {"finished": True, "finishedAt": before}
+    wake = "<task-notification><task-id>b1</task-id> background build finished"
+    prompted = ("coord finished", "then prompted")
+    cases = [  # (registry row, readiness row, transcript, want, reason fragment(s): all must appear, "!x" must not)
+        ({}, at(before), base, "REVIVED", prompted),
+        ({}, at(before), shut, "REVIVED", "predates that prompt"),
+        ({}, at(after), base, "FINISHED", "coord session_status=finished ("),
+        ({}, at(after), shut, "FINISHED", "no prompt since"),
+        # the band leans to keeping the tab: within 1 s either side of the prompt is a revival
+        ({}, at(lp + 1500), base, "FINISHED", "no prompt since"),
+        ({}, at(lp + 1000), base, "FINISHED", "no prompt since"),  # exact edge: prompt == since - 1 s
+        ({}, at(lp + 500), base, "REVIVED", prompted),
+        ({}, at(lp - 500), base, "REVIVED", prompted),
+        ({}, at(lp - 1500), base, "REVIVED", prompted),
+        # with no usable time, the coord-only rule stands: closeout phrase or not
+        ({}, cf, shut, "FINISHED", "coord session_status=finished, closeout phrase"),
+        ({}, cf, base, "REVIVED", "not a closeout"),
+        ({}, dict(cf, sessionStatusSince=None), base, "REVIVED", "not a closeout"),
+        ({}, dict(cf, sessionStatusSince=str(after)), base, "REVIVED", "not a closeout"),
+        ({}, dict(cf, sessionStatusSince=float(after)), base, "REVIVED", "not a closeout"),
+        ({}, dict(cf, sessionStatusSince=True), shut, "FINISHED", "closeout phrase"),
+        ({}, dict(cf, sessionStatusSince=0), base, "REVIVED", "not a closeout"),
+        ({}, dict(cf, sessionStatusSince=-1), base, "REVIVED", "not a closeout"),
+        ({}, dict(cf, sessionStatusSince=1_000_000_000), base, "REVIVED", "not a closeout"),  # seconds, not ms
+        ({}, at(now + 10 * m), base, "REVIVED", "not a closeout"),  # in the future
+        # a stamp ahead of this clock proves an unbounded skew, so it is not compared
+        # with the prompt at all: the coord-only rule decides (closeout phrase or not)
+        ({}, at(now + 2 * m), base, "REVIVED", "not a closeout"),
+        ({}, at(now + 2 * m), shut, "FINISHED", "closeout phrase"),
+        # revived after the runner mark, then closed out: coord's stamp decides whether it re-finished
+        (marker, at(after), shut, "FINISHED", "coord session_status=finished ("),
+        (marker, at(before - m), shut, "REVIVED", "predates that prompt"),
+        (marker, cf, shut, "CLOSEOUT", "closed out again"),
+        # the runner marker says finished after the prompt; coord's earlier stamp wins
+        ({"finished": True, "finishedAt": after}, at(before), base, "REVIVED", prompted),
+        # the runner marker alone keeps its own 1 s band (prompt > finishedAt + 1 s revives)
+        ({"finished": True, "finishedAt": lp - 1000}, {}, base, "FINISHED", "runner finished marker"),
+        ({"finished": True, "finishedAt": lp - 1001}, {}, base, "REVIVED", "marked finished"),
+        # and no runner finishReason rides on a coord-sourced line
+        ({"finished": True, "finishedAt": after, "finishReason": "done"}, at(after), base, "FINISHED",
+         ("no prompt since", "!(done)")),
+        ({"finished": True, "finishedAt": after, "finishReason": "done"}, {}, base, "FINISHED",
+         "runner finished marker (done)"),
+        # a turn opened by something that is not a prompt (a wake) also keeps it open
+        ({}, at(after), dict(base, last_turn_open=now - 40 * m, last_turn_open_text=wake), "REVIVED",
+         ("a turn opened", "task-notification")),
+        ({}, at(after), dict(base, last_turn_open=after - 500, last_turn_open_text=wake), "REVIVED", "a turn opened"),
+        ({}, at(after), dict(base, last_turn_open=after - 1500, last_turn_open_text=wake), "FINISHED",
+         "no prompt since"),
+        # the earlier guards still refuse ahead of coord's time
+        ({}, at(after), dict(base, final_text="The deploy is still running; I'll check it in an hour."), "ACTIVE",
+         "work remains"),
+        ({}, at(now - 40 * m), dict(base, last_prompt=now - 50 * m), "ACTIVE", "has no reply"),
+        # a turn 30m after coord's stamp with no prompt and no closeout keeps it open (finished-criteria cond. 4)
+        ({}, at(after), dict(base, last_asst=now - 30 * m, last_activity=now - 30 * m), "REVIVED",
+         "after coord's finish time"),
+        ({}, at(after), dict(shut, last_asst=now - 30 * m, last_activity=now - 30 * m), "FINISHED", "no prompt since"),
+        # a time on a status that is not finished is no finish time
+        ({"finished": True, "finishedAt": after}, {"sessionStatus": "working", "sessionStatusSince": before},
+         base, "FINISHED", "runner finished marker"),
+    ]
+    g = globals()
+    stubs = {"proc_facts": lambda table, pid, windows=WINDOWS: ([11], [], []),
+             "live_session_ids": lambda claudes: {"s1"}, "raw_tail": lambda tid, chars=30000: "screen",
+             "running_turn": lambda text: False, "prompt_state": lambda raw, cols=None: ("empty", ""),
+             "wrap_cols": lambda term, windows=None: None}
+    saved = {k: g[k] for k in list(stubs) + ["transcript_facts"]}
+    term = {"id": "t1", "isAlive": True, "pid": 10}
+    try:
+        g.update(stubs)
+        for row, rp, tx, want, frag in cases:
+            g["transcript_facts"] = lambda r, tx=tx: dict(tx)
+            got, why = classify(term, dict(row, claudeSessionId="s1"), {10: (1, ["bash"])}, 15, "", {"s1": rp})
+            said_ = "; ".join(why)
+            if got != want or not all((f[1:] not in said_) if f.startswith("!") else (f in said_)
+                                      for f in ((frag,) if isinstance(frag, str) else frag)):
+                bad.append(f"classify(row={row}, readiness={rp}, final={tx['final_text'][:20]!r}) = {got} {why}, "
+                           f"want {want} with {frag!r}")
+        # screen_all carries the time into the row the nudge screen judges.
+        for k, v in {"terminals": lambda: [term], "open_rows": lambda: {"t1": {"claudeSessionId": "s1"}},
+                     "page_names": dict, "proc_table": dict,
+                     "readiness": lambda: ({"s1": dict(cf, sessionStatusSince=7)}, None),
+                     "screen_one": lambda *a: ("FINISHED", [])}.items():
+            saved.setdefault(k, g[k])
+            g[k] = v
+        out = screen_all(15, None)[0]
+        if [r.get("sessionStatusSince") for r in out] != [7]:
+            bad.append(f"screen_all dropped sessionStatusSince: {out}")
+    finally:
+        g.update(saved)
+    # last_turn_open on written transcripts: (records, want offset from t0 in s, want text prefix,
+    # want last_prompt offset or None). A wake never moves last_prompt.
+    t0 = 1_790_000_000_000
+
+    def rec(kind, sec, content, **kw):
+        stamp = dt.datetime.fromtimestamp((t0 + sec * 1000) / 1000, dt.timezone.utc).isoformat()
+        msg = {"role": kind, "content": content}
+        if "stop" in kw:
+            msg["stop_reason"] = kw.pop("stop")
+        return dict({"type": kind, "timestamp": stamp, "message": msg}, **kw)
+
+    def said(sec, stop="end_turn"):
+        return rec("assistant", sec, [{"type": "text", "text": "ok"}], stop=stop)
+    tool = [{"type": "tool_use", "id": "u1", "name": "Bash", "input": {"command": "ls"}}]
+    result = [{"type": "tool_result", "tool_use_id": "u1", "content": "x"}]
+    turn_cases = [
+        # a wake, a peer message (meta), then a turn that injects a skill body mid-turn
+        ([rec("user", 0, "fix the bug"), said(5), rec("user", 60, wake), said(65),
+          rec("user", 120, "<system-reminder>The user named this session x</system-reminder>", isMeta=True),
+          rec("user", 300, "Another Claude session sent a message: hi", isMeta=True),
+          rec("assistant", 301, tool, stop="tool_use"), rec("user", 302, result),
+          rec("user", 303, "Base directory for this skill: /x", isMeta=True), said(304)],
+         300, "Another Claude session", 0),
+        # nothing after the prompt opens a turn: a reminder, a /model answered locally,
+        # a tool result carrying text after a record with no stop_reason, a manual compaction
+        ([rec("user", 0, "fix the bug"), rec("assistant", 10, tool), rec("user", 11, result + [
+            {"type": "text", "text": "hook context"}]), said(12),
+          rec("user", 100, "<system-reminder>The user named this session x</system-reminder>", isMeta=True),
+          rec("user", 125, "Caveat: The messages below were generated by the user while running local commands."),
+          rec("user", 130, "<command-name>/model</command-name>"), rec("user", 131, "<local-command-stdout>ok"),
+          rec("user", 200, "Summary of the earlier conversation", isCompactSummary=True)],
+         0, "fix the bug", None),  # last_prompt reads a tool result's text block as a prompt
+        # an interrupted turn ends there, so the wake after it opens one
+        ([rec("user", 0, "fix the bug"), rec("assistant", 5, tool, stop="tool_use"),
+          rec("user", 6, "[Request interrupted by user for tool use]"), rec("user", 50, wake)],
+         50, "<task-notification>", 0),
+        # coord's Session Bus delivery is a NON-meta system reminder, and it opens a turn
+        ([rec("user", 0, "fix the bug"), said(5),
+          rec("user", 20, "<system-reminder>The user named this session x</system-reminder>", isMeta=True),
+          rec("user", 60, "<system-reminder>Session Bus ci_rework message (blocking priority). Act on it, "
+                          "then coord_ack_message message_id=m1. Message: check #3 went red</system-reminder>"),
+          said(65)],
+         60, "<system-reminder>Session Bus ci_rework", 0),
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "projects", "x"))
+        for k, (recs, want_at, want_text, want_prompt) in enumerate(turn_cases):
+            with open(os.path.join(d, "projects", "x", "s.jsonl"), "w", encoding="utf-8") as fh:
+                fh.write("".join(json.dumps(r) + "\n" for r in recs))
+            got = transcript_facts({"configDir": d, "claudeSessionId": "s"})
+            if got["last_turn_open"] != t0 + want_at * 1000 or not got["last_turn_open_text"].startswith(want_text) \
+                    or (want_prompt is not None and got["last_prompt"] != t0 + want_prompt * 1000):
+                bad.append(f"turn case {k}: last_turn_open={got['last_turn_open']} "
+                           f"({got['last_turn_open_text'][:30]!r}), last_prompt={got['last_prompt']}; "
+                           f"want {t0 + want_at * 1000} ({want_text!r}), last_prompt offset {want_prompt}")
+            if not want_text.startswith("<system-reminder>Session Bus"):
+                continue
+            # ...so a finished session re-tasked that way after coord's stamp stays open.
+            saved = {k: g[k] for k in list(stubs) + ["transcript_facts"]}
+            try:
+                g.update(stubs, transcript_facts=lambda r, got=got: dict(got))
+                v, why = classify(term, {"claudeSessionId": "s1"}, {10: (1, ["bash"])}, 15, "",
+                                  {"s1": at(t0 + 30 * 1000)})
+            finally:
+                g.update(saved)
+            if v != "REVIVED" or "a turn opened" not in "; ".join(why):
+                bad.append(f"a Session Bus delivery after coord's stamp = {v} {why}, want REVIVED (a turn opened)")
+    return len(cases) + 1 + len(turn_cases) + 1
 
 
 # ---------------------------------------------------------------- runner reads
@@ -874,16 +1062,36 @@ def terminals():
     return read("/terminals", "data.terminals")
 
 
+def newest_open_rows(rows):
+    """{terminalId: row} keeping, per terminal, the open row opened LAST.
+
+    A /clear or a resume under another account opens a new row on the same
+    terminal while the old one stays open, so a terminal can carry two. The
+    last one written to the dict used to win, which was whatever order the
+    route served; the newest `openedAt` is the session the pane holds now.
+    live_session_ids still cross-checks it against /proc."""
+    out = {}
+    for r in rows:
+        tid = r.get("terminalId")
+        if r.get("state") != "open" or not tid:
+            continue
+        key = (r.get("openedAt") or 0, r.get("lastSeenAt") or 0)
+        cur = out.get(tid)
+        if cur is None or key > (cur.get("openedAt") or 0, cur.get("lastSeenAt") or 0):
+            out[tid] = r
+    return out
+
+
 def open_rows():
     """{terminalId: registry row} for the open sessions in the runner registry."""
-    return {r["terminalId"]: r for r in read("/sessions/history?limit=5000", "sessions")
-            if r.get("state") == "open" and r.get("terminalId")}
+    return newest_open_rows(read("/sessions/history?limit=5000", "sessions"))
 
 
 def readiness():
     """({claudeSessionId: process row}, None), or ({}, why) when it cannot be read.
 
-    Each row carries coord's `sessionStatus` and the runner's wind-down verdict,
+    Each row carries coord's `sessionStatus` (with its time, `sessionStatusSince`,
+    where the runner serves one: status_since) and the runner's wind-down verdict,
     whose `reason` can veto a close and never approve one (wind_down_veto)."""
     try:
         procs = read("/restart-readiness", "terminal_sessions.processes")
@@ -1501,6 +1709,112 @@ def newest_record(path):
     return None
 
 
+# /next-move as a prompt, in either form: the slash command that ran, or the
+# typed text. nudge-stopped-sessions.py aliases this, so its nudge screen and
+# the segment counts below read one definition.
+NEXT_MOVE_PROMPT = re.compile(r"<command-name>/next-move</command-name>|^/next-move(?![\w-])")
+# A tool call that changes the work, as opposed to /next-move's own
+# classification, which reads files and coord and records an intervention.
+# Every mcp__coord* call is bookkeeping, so only file edits and git/gh writes count,
+# in the session's own transcript or in a subagent's (an `Agent` call itself is
+# not work: /next-move spawns its own fresh-context concurrence subagent).
+WORK_TOOLS = ("Edit", "MultiEdit", "Write", "NotebookEdit")
+WORK_BASH = re.compile(r"\bgit(?:\s+(?:-[Cc]\s+\S+|--?[\w-]+(?:=\S+)?))*\s+(?:commit|push|commit-tree)\b"
+                       r"|\bgh\s+pr\s+(?:create|merge|edit|ready)\b")
+
+
+# Where /next-move writes its own scratch (the E1 row file, recheck evidence):
+# an edit there is classification, not work.
+SCRATCH_PATH = re.compile(r"(?:^|[\\/])(?:\.qontinui[\\/]scratch|scratchpad|\.agent-scratch)(?:[\\/]|$)"
+                          r"|^(?:/tmp|/var/tmp)(?:/|$)|[\\/]AppData[\\/]Local[\\/]Temp(?:[\\/]|$)", re.I)
+
+
+def is_work_tool(block):
+    """True for a tool_use block that edits a file outside a scratch or temp
+    directory, or writes git history / a PR."""
+    name = block.get("name") or ""
+    inp = block.get("input")
+    if name in WORK_TOOLS:
+        target = str((inp or {}).get("file_path") or (inp or {}).get("notebook_path") or "") if isinstance(inp, dict) else ""
+        return not SCRATCH_PATH.search(target)
+    return name == "Bash" and isinstance(inp, dict) and bool(WORK_BASH.search(str(inp.get("command") or "")))
+
+
+def nudge_facts(segments):
+    """(work_tools_since_nudge, nudge_streak) from the prompt segments
+    transcript_facts collects, each {"nudge", "work", "final"}. The streak
+    counts consecutive /next-move segments with no work-class tool call,
+    walking back from the newest; one answered only by a usage-limit notice
+    is skipped (it never ran), and any other prompt or a productive
+    /next-move ends the walk."""
+    last = max((i for i, s in enumerate(segments) if s["nudge"]), default=None)
+    if last is None:
+        return 0, 0
+    work = sum(s["work"] for s in segments[last:])
+    streak = 0
+    for s in reversed(segments):
+        if not s["nudge"]:
+            break
+        if not s["work"] and LIMIT_RE.search(s["final"][-300:]):
+            continue
+        if s["work"]:
+            break
+        streak += 1
+    return work, streak
+
+
+def subagent_work(path, segments):
+    """Add a subagent transcript's work-class tool calls to the segment each
+    falls in by time (the newest segment that started at or before it)."""
+    try:
+        lines = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with lines:
+        for line in lines:
+            try:
+                e = json.loads(line)
+                at = ms(e["timestamp"]) if e.get("type") == "assistant" and e.get("timestamp") else None
+            except (ValueError, TypeError, KeyError, AttributeError):
+                continue
+            content = (e.get("message") or {}).get("content") if at and isinstance(e.get("message"), dict) else None
+            for b in content if isinstance(content, list) else []:
+                if isinstance(b, dict) and b.get("type") == "tool_use" and is_work_tool(b):
+                    seg = next((sg for sg in reversed(segments) if sg["at"] <= at), None)
+                    if seg is not None:
+                        seg["work"] += 1
+
+
+# User records that open no turn even outside one: a local command's caveat and
+# output, an interrupt, and a META system reminder (a /rename writes one). A
+# non-meta <system-reminder> record is a delivery that does open one: coord's
+# Session Bus `ci_rework` / `stuck_pr_nudge` messages arrive that way.
+NOT_A_TURN = ("<local-command", "Caveat:", "<system-reminder>", "[Request interrupted")
+
+
+def turn_open(f, turn, e, content, text, at):
+    """Fold one user record into f["last_turn_open"] / ["last_turn_open_text"]:
+    the newest record that opened a turn, of ANY kind - a real prompt, and
+    also what `last_prompt` leaves out: a <task-notification>, a /loop or
+    ScheduleWakeup wake, a peer message, a usage-limit auto-continuation
+    (meta or not). A record arriving inside a running turn (a tool result, a
+    skill body injected after a Skill call), a compaction summary, a NOT_A_TURN
+    record (a <system-reminder> one only when meta) and a built-in command
+    Claude Code answers itself (/model) open none. `turn` is {"in": a turn is running, "before": the value to restore}."""
+    t = text.lstrip()
+    if t.startswith(LOCAL_OUTPUT):
+        if turn["before"] is not None and f["last_turn_open_text"].startswith("<command-name>"):
+            f["last_turn_open"], f["last_turn_open_text"] = turn["before"]
+        turn["before"] = None
+    elif t.startswith("[Request interrupted"):
+        turn["in"] = False  # the interrupted turn ended without an end_turn record
+    elif not (turn["in"] or not t or e.get("isCompactSummary") or (
+            t.startswith(NOT_A_TURN) and (e.get("isMeta") or not t.startswith("<system-reminder>"))) or (
+            isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content))):
+        turn["before"] = (f["last_turn_open"], f["last_turn_open_text"])
+        f["last_turn_open"], f["last_turn_open_text"] = at, t
+
+
 def transcript_facts(row):
     cd = row.get("configDir") or os.path.expanduser("~/.claude")
     sid = row.get("claudeSessionId") or ""
@@ -1522,11 +1836,18 @@ def transcript_facts(row):
     # but it is not a task. (/rename writes a
     # `system` record, which this reader never counted.) `final_text_at` is when
     # `final_text` was written: a later tool-only assistant turn moves
-    # `last_asst` but not the text.
+    # `last_asst` but not the text. Each real prompt opens a segment, so the
+    # nudge screen can tell a /next-move that led to work from one that only
+    # classified (nudge_facts); `cwd` is the newest user record's.
+    # `last_turn_open` is the newest record that opened a turn of any kind
+    # (turn_open), so a wake that `last_prompt` ignores can still be read.
     f = {"path": path, "last_activity": None, "last_prompt": None, "last_prompt_text": "",
          "last_asst": None, "final_text": "", "final_text_at": None, "pending_tool": False,
-         "task_prompts": 0}
+         "task_prompts": 0, "work_tools_since_nudge": 0, "nudge_streak": 0, "cwd": None,
+         "last_turn_open": None, "last_turn_open_text": ""}
     open_tools = set()
+    turn = {"in": False, "before": None}
+    segments = []
     before = None  # (last_prompt, last_prompt_text) as they stood before the newest prompt
     for line in open(path, encoding="utf-8", errors="replace"):  # never the locale codepage (cp1252 on Windows)
         try:
@@ -1540,44 +1861,78 @@ def transcript_facts(row):
         if e.get("type") in ("user", "assistant"):
             f["last_activity"] = ms(ts)
         if e.get("type") == "user":
+            if e.get("cwd"):
+                f["cwd"] = e["cwd"]
             if isinstance(content, list):
                 for b in content:
                     if isinstance(b, dict) and b.get("type") == "tool_result":
                         open_tools.discard(b.get("tool_use_id"))
-            if e.get("isMeta") or e.get("isCompactSummary"):
-                continue
             text = content if isinstance(content, str) else " ".join(
                 b.get("text", "") for b in content or [] if isinstance(b, dict) and b.get("type") == "text")
+            turn_open(f, turn, e, content, text, ms(ts))
+            if e.get("isMeta") or e.get("isCompactSummary"):
+                continue
             if text.lstrip().startswith(LOCAL_OUTPUT):
                 if before is not None and f["last_prompt_text"].startswith("<command-name>"):
                     f["task_prompts"] -= not f["last_prompt_text"].startswith(CLEAR)
                     f["last_prompt"], f["last_prompt_text"] = before
+                    segments.pop()
                 before = None
             elif text.strip() and not text.lstrip().startswith(NON_PROMPT):
                 before = (f["last_prompt"], f["last_prompt_text"])
                 f["last_prompt"], f["last_prompt_text"] = ms(ts), text.strip()
                 f["task_prompts"] += not text.lstrip().startswith(CLEAR)
+                segments.append({"nudge": bool(NEXT_MOVE_PROMPT.search(text.strip())), "work": 0, "final": "",
+                                 "at": ms(ts)})
         elif e.get("type") == "assistant":
             before = None
+            turn["in"], turn["before"] = e["message"].get("stop_reason") == "tool_use", None
             f["last_asst"] = ms(ts)
             for b in content if isinstance(content, list) else []:
                 if not isinstance(b, dict):
                     continue
                 if b.get("type") == "text" and b.get("text", "").strip():
                     f["final_text"], f["final_text_at"] = b["text"], ms(ts)
+                    if segments:
+                        segments[-1]["final"] = b["text"]
                 elif b.get("type") == "tool_use":
                     open_tools.add(b.get("id"))
+                    if segments and is_work_tool(b):
+                        segments[-1]["work"] += 1
     f["pending_tool"] = bool(open_tools)
     for sub in glob.glob(os.path.join(os.path.dirname(path), sid, "subagents", "*.jsonl")):
         t = newest_record(sub)
         if t and t > (f["last_activity"] or 0):
             f["last_activity"] = t
+        # Only a subagent active since the newest /next-move can add to its count.
+        if segments and segments[-1]["nudge"] and t and t >= segments[-1]["at"]:
+            subagent_work(sub, segments)
+    f["work_tools_since_nudge"], f["nudge_streak"] = nudge_facts(segments)
     return f
 
 
 # ---------------------------------------------------------------- screening
 # CLOSEOUT and FOOTER-FINISHED rows rest on the final reply's own words plus the idleness proof.
 CLOSABLE = {"FINISHED", "CLOSEOUT", "FOOTER-FINISHED", "EXITED-FINISHED"}
+
+
+SINCE_FLOOR_MS = 1_500_000_000_000  # mid-2017: anything earlier is a seconds-scale value, not a stamp
+SINCE_FUTURE_MS = 300_000  # clock skew allowed past now; a stamp later than that is not a time either
+
+
+def status_since(rp, now_ms=None):
+    """Coord's finish time for a session, from the runner's `sessionStatusSince`
+    (unix ms: when coord's session_status last changed; coord also restamps a
+    finished->finished report once plan Phase 2 lands), or None. UNKNOWN, never
+    a time: absent, null, not an integer, a boolean, 0 or negative, and an
+    implausible value (before SINCE_FLOOR_MS, or more than SINCE_FUTURE_MS past
+    `now_ms`). Runner builds that predate the field send none, and the plan's
+    Phase 3(c) contract leaves it absent for unresolved rows and nested subagents."""
+    v = (rp or {}).get("sessionStatusSince")
+    now_ms = time.time() * 1000 if now_ms is None else now_ms
+    if isinstance(v, bool) or not isinstance(v, int) or not SINCE_FLOOR_MS <= v <= now_ms + SINCE_FUTURE_MS:
+        return None
+    return v
 
 
 def classify(term, row, table, idle_min, own_tid, ready):
@@ -1647,12 +2002,46 @@ def classify(term, row, table, idle_min, own_tid, ready):
     pos, neg = phrase_hits(tx["final_text"])
     if neg:
         return "ACTIVE", ["final message says work remains: " + neg[0]]
+    # Coord's finish time, where the runner serves it, is preferred over the
+    # runner marker's: once coord restamps a finished->finished report (plan
+    # Phase 2) and the runner passes the time through (plan Phase 3), it moves
+    # on every finish, where finishedAt stays put on a runner build predating
+    # plan Phase 3. Against it a closeout phrase
+    # neither closes a revived session nor is needed to close a finished one, and
+    # the band leans toward keeping the tab: a
+    # prompt or any other turn-opening record later than since - 1 s revives the
+    # session (finished-criteria cond. 4: a turn newer than the finish stamp).
+    since = status_since(rp) if coord_finished else None
+    if since is not None and since > time.time() * 1000:
+        # The comparison below ASSUMES coord's clock and this box's agree to well
+        # under the 1 s band (NTP-synced). It does not measure skew, so it cannot
+        # see a skew that has already been absorbed by the time a close is
+        # considered (a past stamp says nothing about skew). This guard covers
+        # only the rare case it CAN see: a stamp still ahead of this clock proves
+        # coord runs ahead, so it is not compared with a local prompt time and
+        # the coord-only rule below decides. Closing is the unsafe direction;
+        # status_since still admits the stamp for the nudge side.
+        since = None
+    if since is not None:
+        if tx["last_prompt"] and tx["last_prompt"] > since - 1000:
+            return "REVIVED", [f"coord finished {fmt_age(since)} ago, then prompted {fmt_age(tx['last_prompt'])} "
+                               f"ago: {tx['last_prompt_text'][:60]!r}"] + (
+                ["its reply closes out, but coord's finish time predates that prompt"] if pos else [])
+        opened = tx.get("last_turn_open")
+        if opened and opened > since - 1000:
+            return "REVIVED", [f"coord finished {fmt_age(since)} ago, then a turn opened {fmt_age(opened)} ago "
+                               f"with no prompt: {(tx.get('last_turn_open_text') or '')[:60]!r}"]
+        if tx["last_asst"] and tx["last_asst"] - since > 10 * 60000 and not pos:
+            return "REVIVED", [f"kept working {(tx['last_asst'] - since) / 60000:.0f}m after coord's finish time "
+                               "and its final message is not a closeout"]
+        return "FINISHED", [f"coord session_status=finished ({fmt_age(since)} ago), no prompt since"] + binding
     if finished:
         fa = row.get("finishedAt") or 0
         if tx["last_prompt"] and tx["last_prompt"] > fa + 1000:
             if pos:
-                # A re-finish leaves finishedAt where it was (the runner answers a
-                # re-mark as a no-op), so the closeout in the reply is the evidence.
+                # On a runner build predating plan Phase 3 a re-finish leaves
+                # finishedAt where it was (that runner answers a re-mark as a
+                # no-op), so the closeout in the reply is the evidence.
                 return "CLOSEOUT", [f"revived after its {fmt_age(fa)}-old finish mark, then closed out "
                                     "again in its final reply: " + pos[0]] + binding
             return "REVIVED", [f"marked finished {fmt_age(fa)} ago, then prompted "
@@ -1663,7 +2052,7 @@ def classify(term, row, table, idle_min, own_tid, ready):
         why = row.get("finishReason")
         return "FINISHED", ["runner finished marker" + (f" ({why[:70]})" if why else "")] + binding
     if pos:
-        # coord's status carries no finish time this script can read, so a
+        # With no coord finish time (an older runner, or unresolved), a
         # coord-only finish is only as good as the closeout line in the reply.
         src = "coord session_status=finished, closeout phrase: " if coord_finished else \
             "closeout phrase without a finished marker: "
@@ -1723,6 +2112,7 @@ def screen_all(idle_min, only):
             "claudeSessionId": (row or {}).get("claudeSessionId"),
             "finishedAt": (row or {}).get("finishedAt"),
             "sessionStatus": (ready.get((row or {}).get("claudeSessionId")) or {}).get("sessionStatus"),
+            "sessionStatusSince": (ready.get((row or {}).get("claudeSessionId")) or {}).get("sessionStatusSince"),
         })
     return out, warnings, ready_err
 
@@ -1785,6 +2175,8 @@ def main():
     ap.add_argument("--close", action="store_true")
     ap.add_argument("--idle-min", type=int, default=15)
     ap.add_argument("--only", default="")
+    ap.add_argument("--rows-out", metavar="PATH",
+                    help="append one JSON line per attempted close to PATH (triage-sessions.py's pass ledger)")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--port", help="runner API port (default $QONTINUI_RUNNER_API_PORT or 9876)")
     ap.add_argument("--selftest", action="store_true", help="run the regression table and exit; reads nothing")
@@ -1832,7 +2224,38 @@ def main():
         failed += not ok
         print(f"  {'CLOSED ' if ok else 'SKIPPED'} {r['terminalId'][:8]}  {r['tab']:<14.14}  "
               f"{r['account']:<13.13}  {r['name'][:50]} - {msg}")
+        if a.rows_out:
+            append_rows_out(a.rows_out, {"terminal_id": r["terminalId"], "action": "close",
+                                         "action_outcome": close_outcome(ok, msg),
+                                         "detail": {"screened_as": r["verdict"], "message": msg[:300]}})
     return 1 if failed else 0
+
+
+# close_one starts every message it returns after the DELETE went out with this:
+# "DELETE answered <code>" (the runner refused it), "DELETE sent; read back ..."
+# and "DELETE errored (...); read back ...".
+DELETE_SENT = "DELETE "
+
+
+def close_outcome(ok, msg):
+    """The pass-ledger outcome of one close_one result: done once the close
+    read back; failed when the DELETE reached the runner and was refused or
+    did not read back; skipped when the re-screen held the row before it."""
+    if ok:
+        return "done"
+    return "failed" if msg.startswith(DELETE_SENT) else "skipped"
+
+
+def append_rows_out(path, row):
+    """Append one acted row to a --rows-out file as one JSON line. A write that
+    fails is warned about and never raised: the record must not change what
+    the act did."""
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, separators=(",", ":")) + "\n")
+    except OSError as e:
+        print(f"WARNING: --rows-out {path}: row for {str(row.get('terminal_id'))[:8]} not written ({e})",
+              file=sys.stderr)
 
 
 if __name__ == "__main__":

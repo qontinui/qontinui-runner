@@ -1,0 +1,24 @@
+recovered 29 test binaries from the build step
+     Running `D:\a\qontinui-runner\qontinui-runner\src-tauri\target\debug\deps\qontinui_runner_lib-50d7fbf0.exe`
+
+running 3 tests
+test util::resource_exhaustion::tests::classifies_commit_limit ... FAILED
+test util::resource_exhaustion::tests::message_needle_is_exact ... ok
+test alloc_breadcrumb::tests::records_the_failure ... ok
+
+failures:
+
+---- util::resource_exhaustion::tests::classifies_commit_limit stdout ----
+input: The paging file is too small for this operation to complete. (os error 1455)
+memory allocation of 2097152 bytes failed
+thread 'util::resource_exhaustion::tests::classifies_commit_limit' panicked at src\util\resource_exhaustion.rs:1134:9:
+assertion `left == right` failed
+  left: None
+ right: Some("STATUS_NO_MEMORY 0xc0000017 LNK1102 rustc-LLVM ERROR: out of memory")
+
+failures:
+    util::resource_exhaustion::tests::classifies_commit_limit
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+
+##[error]Process completed with exit code 101.
