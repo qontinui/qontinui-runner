@@ -546,9 +546,39 @@ pub(crate) fn discover_all_elements_payload() -> serde_json::Value {
             // …and content/text elements, NOT only the interactive ones. The
             // SDK's default here is `true`; leaving it unstated is what made
             // `elementCount` under-report on every page.
-            "interactiveOnly": false
+            "interactiveOnly": false,
+            // …and the image rows, stated rather than left to the SDK's
+            // default: an image covering text is an occlusion. Page-health
+            // takes them back out (`page_health_elements`).
+            "includeMedia": true
         }
     })
+}
+
+/// The rows page-health judges: what `discover` returned under `elements`, less
+/// the `category: "media"` rows. The ratios describe a page's content and
+/// controls, and an image row in them would move every one of those ratios.
+fn page_health_elements(discover_data: &serde_json::Value) -> Vec<serde_json::Value> {
+    discover_data
+        .get("elements")
+        .and_then(|v| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter(|el| el.get("category").and_then(|c| c.as_str()) != Some("media"))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every row `discover` returned under `elements`, media rows included: the
+/// count page-health REPORTS as `element_count`, so it matches the
+/// `elementCount` `/control/visibility` reports for the same page.
+fn discovered_row_count(discover_data: &serde_json::Value) -> usize {
+    discover_data
+        .get("elements")
+        .and_then(|v| v.as_array())
+        .map_or(0, Vec::len)
 }
 
 /// Optional request body for page-health endpoint.
@@ -582,14 +612,14 @@ pub async fn ui_bridge_page_health_handler(
             }
         };
 
-    // Elements live under "elements" key returned by discover.
-    let elements = discover_data
-        .get("elements")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let elements = page_health_elements(&discover_data);
 
-    let element_count = elements.len();
+    // `element_count` (reported) counts every row discover returned, the same
+    // set `/control/visibility` counts as `elementCount`, so the two routes
+    // still agree. The checks below judge only `judged_count` rows, and
+    // `media_rows_excluded` states the difference rather than hiding it.
+    let element_count = discovered_row_count(&discover_data);
+    let judged_count = elements.len();
 
     // Visible elements: state.visible == true and state.normalizedRect present.
     let visible: Vec<&serde_json::Value> = elements
@@ -736,7 +766,7 @@ pub async fn ui_bridge_page_health_handler(
         *type_counts.entry(t.to_string()).or_insert(0) += 1;
     }
 
-    let all_nav = element_count > 5 && type_counts.keys().all(|k| nav_types.contains(&k.as_str()));
+    let all_nav = judged_count > 5 && type_counts.keys().all(|k| nav_types.contains(&k.as_str()));
 
     let diversity_severity = if all_nav { "WARNING" } else { "OK" };
 
@@ -746,7 +776,7 @@ pub async fn ui_bridge_page_health_handler(
         "detail": format!(
             "{} type(s) across {} elements{}",
             type_counts.len(),
-            element_count,
+            judged_count,
             if all_nav { " (navigation-only)" } else { "" }
         ),
         "data": {
@@ -979,6 +1009,7 @@ pub async fn ui_bridge_page_health_handler(
         "findings": findings,
         "heatmap": heatmap,
         "element_count": element_count,
+        "media_rows_excluded": element_count.saturating_sub(judged_count),
         "visible_count": visible_count
     });
 
@@ -1514,7 +1545,8 @@ pub async fn ui_bridge_visibility_handler(
         min_ratio, include_expected
     );
 
-    // BOTH filters stated. `includeHidden` alone is only half the ask: the SDK
+    // EVERY filter stated (`includeHidden`, `interactiveOnly`, `includeMedia`).
+    // `includeHidden` alone is only part of the ask: the SDK
     // defaults `interactiveOnly` to `true`, so a payload that leaves it unstated
     // silently drops every heading, paragraph and badge before the sweep ever
     // sees the page — i.e. exactly the elements a reader looks at, and exactly
@@ -1531,7 +1563,7 @@ pub async fn ui_bridge_visibility_handler(
     // `discover_all_elements_payload()` and its guard test accepts either form
     // for exactly this reason. Any sweep added here must ask the same question.
     let discover_payload = serde_json::json!({
-        "options": { "includeHidden": true, "interactiveOnly": false }
+        "options": { "includeHidden": true, "interactiveOnly": false, "includeMedia": true }
     });
     // Concurrent, as `state-summary` does: the wall time is the slower of the
     // two, not their sum.
@@ -1683,8 +1715,9 @@ mod visibility_sweep_payload_tests {
     //! Scanned from source rather than exercised through the handler because
     //! the payload is built inline at the IPC call and never returned: there is
     //! no value to assert on without a live webview. The property being pinned
-    //! is nonetheless exact — BOTH filters stated, in the request this handler
-    //! actually issues.
+    //! is nonetheless exact — EVERY filter stated (`includeHidden`,
+    //! `interactiveOnly`, `includeMedia`; one test each below), in the request
+    //! this handler actually issues.
 
     /// The body of `ui_bridge_visibility_handler`, production source only.
     #[expect(
@@ -1717,6 +1750,16 @@ mod visibility_sweep_payload_tests {
         assert!(
             visibility_handler_body().contains("\"interactiveOnly\": false"),
             "MUST be stated explicitly: the SDK's default is `true`, so leaving              it unstated filtered every heading, paragraph and badge out of the              occlusion sweep and made `elementCount` report 281 where every              sibling route reported 296. `includeHidden` does not compensate -              hidden and non-interactive are INDEPENDENT filters."
+        );
+    }
+
+    #[test]
+    fn visibility_discover_asks_for_media_elements() {
+        assert!(
+            visibility_handler_body().contains("\"includeMedia\": true"),
+            "the occlusion sweep keeps media rows, because an image covering text \
+             is an occlusion; without includeMedia the SDK leaves them out and the \
+             sweep cannot see one (image plan Phase 8)"
         );
     }
 }
@@ -2245,11 +2288,13 @@ mod sweep_discover_tests {
 
     use super::*;
 
-    /// The payload itself. `interactiveOnly: false` is the half that was
-    /// missing: the SDK defaults it to `true`, so every heading, badge and
-    /// paragraph was filtered out before the sweep ever saw the page.
+    /// The payload itself states all three filters. `interactiveOnly: false`
+    /// was once missing: the SDK defaults it to `true`, so every heading,
+    /// badge and paragraph was filtered out before the sweep ever saw the
+    /// page. `includeMedia: true` brings the image rows the L0 image
+    /// assertions judge.
     #[test]
-    fn discover_payload_asks_for_hidden_and_non_interactive_elements() {
+    fn discover_payload_states_every_filter() {
         let payload = discover_all_elements_payload();
         let options = payload
             .get("options")
@@ -2265,6 +2310,68 @@ mod sweep_discover_tests {
             "MUST be stated explicitly: the SDK's default is `true`, and leaving \
              it unstated is what made elementCount under-report on every page"
         );
+        assert_eq!(
+            options.get("includeMedia").and_then(|v| v.as_bool()),
+            Some(true),
+            "the image assertions need the image rows, and an image covering text is \
+             an occlusion"
+        );
+    }
+
+    #[test]
+    fn page_health_leaves_out_the_media_rows_discover_returns() {
+        let discover = serde_json::json!({"elements": [
+            {"id": "h1", "category": "content"},
+            {"id": "buy", "category": "interactive"},
+            {"id": "hero", "category": "media"},
+            {"id": "plain"},
+        ]});
+        let kept: Vec<_> = page_health_elements(&discover)
+            .iter()
+            .filter_map(|el| el.get("id").and_then(|v| v.as_str()).map(str::to_owned))
+            .collect();
+        assert_eq!(kept, ["h1", "buy", "plain"]);
+    }
+
+    /// The reported `element_count` keeps the media rows, so page-health and
+    /// `/control/visibility` count the same set for the same page. Only the
+    /// ratios leave them out (`media_rows_excluded` is the difference).
+    #[test]
+    fn page_health_reports_every_discovered_row_as_its_element_count() {
+        let discover = serde_json::json!({"elements": [
+            {"id": "h1", "category": "content"},
+            {"id": "hero", "category": "media"},
+            {"id": "logo", "category": "media"},
+        ]});
+        assert_eq!(discovered_row_count(&discover), 3);
+        assert_eq!(page_health_elements(&discover).len(), 1);
+        assert_eq!(discovered_row_count(&serde_json::json!({})), 0);
+    }
+
+    /// The handler reports the discovered count, not the judged one. Scanned
+    /// from source, because the report is built inline in the handler.
+    #[test]
+    fn page_health_report_states_the_media_rows_it_left_out() {
+        let source = include_str!("screenshots.rs");
+        // `split_once`, not byte slicing: the crate denies `string_slice`.
+        let (_, rest) = source
+            .split_once("pub async fn ui_bridge_page_health_handler")
+            .expect("the page-health handler is in this file");
+        // The handler ends at the first column-0 closing brace after it.
+        let (body, _) = rest.split_once("\n}\n").expect("the handler body closes");
+        assert!(
+            body.contains("\"media_rows_excluded\": element_count.saturating_sub(judged_count)"),
+            "the report must say how many media rows the ratios left out"
+        );
+        assert!(
+            body.contains("let element_count = discovered_row_count(&discover_data);"),
+            "element_count must count every discovered row, as visibility does"
+        );
+    }
+
+    #[test]
+    fn page_health_reads_no_rows_from_a_reply_without_elements() {
+        assert!(page_health_elements(&serde_json::json!({})).is_empty());
     }
 
     /// DIVERGENCE GUARD.
@@ -2278,10 +2385,11 @@ mod sweep_discover_tests {
     /// ## The rule this pins, and why it is SEMANTIC rather than syntactic
     ///
     /// Every `discover` request issued from this file must ask for the SAME
-    /// element set: `includeHidden: true` AND `interactiveOnly: false`. A site
+    /// element set: `includeHidden: true`, `interactiveOnly: false` AND
+    /// `includeMedia: true`. A site
     /// satisfies that either by calling `discover_all_elements_payload()` —
     /// still the preferred form, since a helper cannot drift — **or** by
-    /// stating both filters in its own literal. Both spellings ask the identical
+    /// stating every filter in its own literal. Both spellings ask the identical
     /// question, and the question is the property worth defending; requiring one
     /// SPELLING of it was an over-reach this guard has now been narrowed out of.
     ///
@@ -2326,9 +2434,10 @@ mod sweep_discover_tests {
                 site_asks_for_every_element(production, at),
                 "a `discover` request site in screenshots.rs does not ask for the \
                  full element set. Every page-wide sweep must ask the SAME \
-                 question — `includeHidden: true` AND `interactiveOnly: false` — \
-                 either by calling discover_all_elements_payload() or by stating \
-                 BOTH filters in its own literal. Stating only `includeHidden` \
+                 question — `includeHidden: true`, `interactiveOnly: false` AND \
+                 `includeMedia: true` — either by calling \
+                 discover_all_elements_payload() or by stating EVERY filter in its \
+                 own literal. Stating only `includeHidden` \
                  leaves the SDK's `interactiveOnly: true` default in force, which \
                  silently drops every heading, paragraph and badge; that is how \
                  the sweeps diverged. Offending site at byte {at}."
@@ -2341,8 +2450,8 @@ mod sweep_discover_tests {
         );
     }
 
-    /// Does the `discover` request at `at` ask for hidden AND non-interactive
-    /// elements?
+    /// Does the `discover` request at `at` ask for hidden, non-interactive AND
+    /// media elements?
     ///
     /// Resolves the payload ARGUMENT rather than eyeballing a fixed window,
     /// because the two accepted spellings sit on opposite sides of the call: a
@@ -2359,7 +2468,7 @@ mod sweep_discover_tests {
             return true;
         }
         // An inline literal — check the argument text itself…
-        if states_both_filters(arg) {
+        if states_every_filter(arg) {
             return true;
         }
         // …otherwise the argument is a binding; read the `let` that made it.
@@ -2368,7 +2477,7 @@ mod sweep_discover_tests {
             return false;
         }
         match production[..at].rfind(&format!("let {ident} ")) {
-            Some(binding) => states_both_filters(&production[binding..at]),
+            Some(binding) => states_every_filter(&production[binding..at]),
             None => false,
         }
     }
@@ -2393,11 +2502,13 @@ mod sweep_discover_tests {
         rest
     }
 
-    /// Both filters stated, whitespace-insensitively — a `json!` body is macro
+    /// Every filter stated, whitespace-insensitively — a `json!` body is macro
     /// input, which rustfmt does not normalize, so its spacing is whatever the
     /// author typed.
-    fn states_both_filters(text: &str) -> bool {
+    fn states_every_filter(text: &str) -> bool {
         let dense: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-        dense.contains("\"includeHidden\":true") && dense.contains("\"interactiveOnly\":false")
+        dense.contains("\"includeHidden\":true")
+            && dense.contains("\"interactiveOnly\":false")
+            && dense.contains("\"includeMedia\":true")
     }
 }

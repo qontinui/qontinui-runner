@@ -1,6 +1,6 @@
 ---
 name: visual-audit
-description: Run a declarative visual audit on a UI Bridge-connected page. Combines six vision-core analyzers (layout, typography, color, dynamic, elements, image) with the 20-assertion DSL (no_overlap, element_above, contains_text, text_fits_container, aligned_*, color_within, typography_consistent, no_layout_shift_since, no_clipping, animation_settled, contrast_meets_wcag, and eight L1 image assertions). Returns structured findings, per-image values + a three-way outcome (passed/failed/unknown) per assertion — never pixels. Use as the canonical "audit this page for visual regressions / a11y violations / layout bugs" entrypoint. Its image arm operates a candidate image IN SITU — swapped into its real slot (the SDK media override, through ui-bridge-inject) across the capture matrix, hover, a throttled network and the loading-to-loaded timeline — then restores the page and proves it did.
+description: Run a declarative visual audit on a UI Bridge-connected page. Combines six vision-core analyzers (layout, typography, color, dynamic, elements, image) with the assertion DSL (no_overlap, element_above, contains_text, text_fits_container, aligned_*, color_within, typography_consistent, no_layout_shift_since, no_clipping, animation_settled, contrast_meets_wcag, eight L1 image assertions, and ten L0 image assertions over the page's media facts). Returns structured findings, per-image values + a three-way outcome (passed/failed/unknown) per assertion — never pixels. Use as the canonical "audit this page for visual regressions / a11y violations / layout bugs" entrypoint. Its image arm operates a candidate image IN SITU — swapped into its real slot (the SDK media override, through ui-bridge-inject) across the capture matrix, hover, a throttled network and the loading-to-loaded timeline — then restores the page and proves it did.
 user-invocable: true
 ---
 
@@ -56,7 +56,7 @@ the projection script:
 # 1. Discover -> project into a real ElementSnapshot.
 #    --stats goes to stderr; READ IT (see below).
 curl -fsS -X POST http://127.0.0.1:9876/ui-bridge/control/discover \
-     -H 'Content-Type: application/json' -d '{"interactive_only":false}' \
+     -H 'Content-Type: application/json' -d '{"interactive_only":false,"includeHidden":true,"includeMedia":true}' \
   | python3 "$ROOT/qontinui-claude-config/scripts/uibridge-to-elementsnapshot.py" \
       --stats > /tmp/snapshot.json
 
@@ -137,7 +137,8 @@ painted under an overlay.
 ### No runner window? The checks still run.
 
 `analyze` and `assert` capture a frame **best-effort**. Layout, typography and
-elements are pure geometry over the snapshot, and only the L1 image assertions
+elements are pure geometry over the snapshot, the L0 image assertions read
+`Element.media` and the facts saying what paints, and only the L1 image assertions
 read the frame, so a runner reporting `frontendState: "window_missing"` still
 answers every geometric question. A failed capture comes back as
 `frameError` in the response — check for it rather than assuming the pixels
@@ -353,6 +354,30 @@ Each assertion is a tagged-JSON object:
 | `salience_order` | `{"type":"salience_order","cta_id":"cta-signup"}` — the CTA is the most salient interactive or media element. Reads the frame. |
 | `image_sharpness_at_least` | `{"type":"image_sharpness_at_least","element":"hero","min_sharpness":50}` — variance of the Laplacian at the rendered scale. Reads the frame. |
 | `image_blockiness_within` | `{"type":"image_blockiness_within","element":"hero","max_blockiness":1.5}` — compression blockiness (~1.0 is clean). Reads the frame. |
+| `image_loaded` | `{"type":"image_loaded"}` (or `"element":"hero"`) — the image finished loading and painted. A failed load fails; still loading is `unknown`. Page-wide, an off-screen lazy image has not been asked to load and is left out. |
+| `image_resolution_sufficient` | `{"type":"image_resolution_sufficient","min_effective":1}` — source pixels per device pixel reach `min_effective`. Vectors, CSS backgrounds and `role=img` are left out. An `img` whose `format` names no raster may be a vector, so where it would fail it answers `unknown`. |
+| `image_not_distorted` | `{"type":"image_not_distorted","max_aspect_delta":0.02}` — only `object-fit: fill` can fail. `contain`, `cover`, `none` and `scale-down` hold without reading a size, so a non-uniform `transform` on one goes unseen. The rendered size is the border box after transforms, so under `fill` a transform, padding, a border or a rotation can read as distortion: set `max_aspect_delta` to suit. |
+| `image_dims_reserved` | `{"type":"image_dims_reserved"}` — the box is sized without waiting for the image. Judges `img`, `picture`, `video`. |
+| `lcp_image_prioritized` | `{"type":"lcp_image_prioritized"}` — the LCP image is not lazy and has `fetchpriority=high`. Any other image is left out. |
+| `image_has_text_alternative` | `{"type":"image_has_text_alternative"}` — decorative, or an alt that is not generic (`image`, `logo`, a bare number). Video and canvas are left out. |
+| `image_not_oversized` | `{"type":"image_not_oversized","max_effective":2.5}` — source pixels per device pixel are at most `max_effective`. Same exclusions as `image_resolution_sufficient`. |
+| `image_weight_within` | `{"type":"image_weight_within","max_bytes":500000}` — `transfer_bytes` is at most `max_bytes`. A hidden image is still weighed. An unfinished off-screen lazy image with a non-zero box is left out with its weight unseen; any other lazy image with no measured weight answers `unknown`. |
+| `offscreen_image_lazy` | `{"type":"offscreen_image_lazy"}` — an `img`/`picture` outside the viewport is lazy. The LCP element is left out. |
+| `no_duplicate_images` | `{"type":"no_duplicate_images"}` — no two rendered images display the same source (`src_digest`). Only valid against an SDK containing ui-bridge `1667c24`: an older one registers each `<picture>` twice, so every `<picture>` reads as a duplicate. Perceptual copies are `no_near_duplicate_images`. |
+
+The ten L0 rows above read `Element.media`, plus the box and `visibility_reason`
+to leave out what paints nothing. They need no frame. Ask for media, as the web
+discover calls here do with `includeMedia`: an older web SDK leaves media rows out
+otherwise. They fold page-wide: any failing image fails the assertion
+and its detail names each id; otherwise any unmeasured image answers
+`outcome: "unknown"`, and so does a snapshot with no rendered `media` at all,
+which cannot be told apart from a producer that was never asked
+(two exceptions: `image_weight_within` still weighs a hidden image, and
+`image_loaded` fails a broken zero-area image and answers `unknown` for
+one still loading). For a
+per-image outcome send one assertion per media id, as the example below does.
+Named explicitly, an image the check cannot judge answers `unknown`, not a pass.
+They need a runner that serves these variants.
 
 Every threshold on an image assertion is the CALLER's (a slot spec or the
 visual system); an omitted one answers `outcome: "unknown"`, never a pass.
@@ -381,7 +406,7 @@ with a disclosed count (a slot placeholder marker on one still fails).
 # PROJECT FIRST. `discover | jq '.data'` is not a snapshot — see the warning at
 # the top of this file; it returns zero findings on a broken page.
 curl -fsS -X POST http://127.0.0.1:9876/ui-bridge/control/discover \
-     -H 'Content-Type: application/json' -d '{"interactive_only":false}' \
+     -H 'Content-Type: application/json' -d '{"interactive_only":false,"includeHidden":true,"includeMedia":true}' \
   | python3 "$ROOT/qontinui-claude-config/scripts/uibridge-to-elementsnapshot.py" \
       --stats > /tmp/snapshot.json
 SNAP=$(cat /tmp/snapshot.json)
@@ -465,6 +490,53 @@ even when you did, because the analyzer decides (`dynamic` never sets it).
 snapshot, so it does not tell you whether the input you posted was stale —
 nothing in either response does yet. `evaluatedAt` dates the answer.
 
+### Example: the page's image block
+
+```bash
+# Uses /tmp/snapshot.json from the block above, and a runner that serves the L0
+# variants. An older one answers 422 `unknown variant` for the whole list, in the
+# body that -f would discard, hence -sS.
+python3 -c '
+import json
+snap = json.load(open("/tmp/snapshot.json"))
+# PLACEHOLDERS, not defaults: replace each from the slot spec or visual system,
+# or drop a threshold you have none for, and that check answers unknown.
+checks = [
+    {"type": "image_loaded"},
+    {"type": "image_resolution_sufficient", "min_effective": 1},
+    {"type": "image_not_distorted", "max_aspect_delta": 0.02},
+    {"type": "image_dims_reserved"},
+    {"type": "lcp_image_prioritized"},
+    {"type": "image_has_text_alternative"},
+    {"type": "image_not_oversized", "max_effective": 2.5},
+    {"type": "image_weight_within", "max_bytes": 500000},
+    {"type": "offscreen_image_lazy"},
+    {"type": "no_duplicate_images"},
+]
+ids = [e["id"] for e in snap["elements"] if e.get("media")]
+per_image = [{**check, "element": id_} for id_ in ids for check in checks]
+# No media: ask page-wide so each check answers unknown. An empty list would
+# come back allPassed:true over nothing.
+print(json.dumps({"snapshot": snap, "assertions": per_image or checks}))
+' | curl -sS -X POST http://127.0.0.1:9876/ui-bridge/vision/assert \
+      -H "Content-Type: application/json" -d @- \
+  | python3 -m json.tool
+```
+
+Read each result, not `allPassed`. Sent per image, `allPassed` is false on any
+page with an `img`: at least one of `lcp_image_prioritized` and
+`offscreen_image_lazy` cannot pass for it, and answers `unknown`. Read the detail,
+not the `code`. A check that does not apply says so in its detail and still carries
+`code: "input_missing"`, and so does a density check on a vector. Drop `element` for
+one page-wide answer per check, with a detail naming each failing id.
+
+Every check `unknown` means no media reached the snapshot, or media with no
+measured facts: read the `--stats` line (`N with media`) before reading that as a
+page with no images. Sent per image, a row whose facts could not be read keeps a
+kind from its tag and answers `unknown` on every check. Page-wide it can be left out
+of a check that then passes, so read this block per image when that matters. One whose tag names no kind (a `div role=img`,
+a CSS background) projects with no `media`, so this block does not name it.
+
 ## Baselines
 
 Register a "what good looks like" snapshot for a route:
@@ -496,7 +568,7 @@ After landing UI changes, run the full audit:
 # PROJECT FIRST — same reason as above. Read the --stats line on stderr:
 # `0 with geometry` is UNKNOWN, not a clean page.
 curl -fsS -X POST http://127.0.0.1:9876/ui-bridge/control/discover \
-     -H 'Content-Type: application/json' -d '{"interactive_only":false}' \
+     -H 'Content-Type: application/json' -d '{"interactive_only":false,"includeHidden":true,"includeMedia":true}' \
   | python3 "$ROOT/qontinui-claude-config/scripts/uibridge-to-elementsnapshot.py" \
       --stats > /tmp/snapshot.json
 SNAP=$(cat /tmp/snapshot.json)
