@@ -6,7 +6,7 @@
 # claims to detect reduces to "does the surface digest change?". A field
 # silently dropped from surface() is a bypass, so every field the header
 # advertises has a case here.
-import hashlib, io, json, os, sys, textwrap, yaml
+import hashlib, io, json, os, re, sys, textwrap, yaml
 
 WF = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -440,6 +440,40 @@ eq("a YAML workflow still goes through surface()",
                  BASE.replace("cargo test", "cargo test || true")))
 eq("token() is unchanged for a .py.yml workflow (no new collision)",
    "ci.py#test", token(".github/workflows/ci.py.yml", "test"))
+
+print("\n7. The three lists of exact gating paths stay in step.")
+# An exact (non-glob) gating path is named THREE times: the `paths:` trigger
+# (or the run never fires), the scope filter's `case` arm (or the run drops it
+# before scanning), and WHOLE_FILE_GATES (or a non-YAML path is the `!PARSE`
+# deadlock section 6 exists for). The scope-filter comment says "either half
+# alone guards nothing"; nothing checked the halves, and the third is new. Adding
+# a gating script to the first two but not the table re-creates the deadlock,
+# and adding it to the table alone guards nothing while reading as guarded.
+wf_doc = yaml.safe_load(io.open(WF, encoding="utf-8"))
+# YAML 1.1 parses a bare `on:` key as the boolean True.
+trigger = (wf_doc.get(True) or wf_doc.get("on") or {})["pull_request_target"]["paths"]
+# `!` too: a negation entry is not a path the trigger fires on.
+trigger_exact = {p for p in trigger if not any(c in p for c in "*?[!")}
+# Exact arms of the scope filter, e.g. `scripts/check_untimed_subprocess.py) ;;`,
+# with an alternation (`a.py|b.py) ;;`) split. A glob arm, the `*) continue ;;`
+# default and the dedup arm all carry a `*`, which the character class excludes.
+case_exact = {a for m in (
+    re.match(r"^\s*([A-Za-z0-9_./|-]+)\)\s*;;\s*(#.*)?$", l) for l in run.split("\n"))
+    if m for a in m.group(1).split("|") if a}
+gates = set(ns["WHOLE_FILE_GATES"])
+eq("the trigger names at least one exact path (else this section is vacuous)",
+   True, bool(trigger_exact))
+eq("scope-filter exact arms == trigger exact paths", sorted(trigger_exact), sorted(case_exact))
+eq("WHOLE_FILE_GATES keys == trigger exact paths", sorted(trigger_exact), sorted(gates))
+# From this file, not from WF: a workflow copy passed as argv[1] for mutation
+# testing lives outside the tree, and the scripts it names do not.
+REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+# A renamed or deleted script leaves all three lists agreeing on a path that no
+# longer exists: the trigger then never fires for the script that replaced it.
+eq("every WHOLE_FILE_GATES path exists in the tree", [],
+   sorted(p for p in gates if not os.path.isfile(os.path.join(REPO, p))))
+tokens = list(ns["WHOLE_FILE_GATES"].values())
+eq("WHOLE_FILE_GATES tokens are distinct", len(tokens), len(set(tokens)))
 
 print()
 if failures:

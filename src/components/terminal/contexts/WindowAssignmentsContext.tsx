@@ -62,7 +62,8 @@ interface WindowAssignmentsValue {
   boundPage: string | null;
 }
 
-function readWindowLabel(): string {
+/** This window's Tauri label; `"main"` outside Tauri (tests / SSR). */
+export function readWindowLabel(): string {
   try {
     return getCurrentWindow().label || MAIN_WINDOW_LABEL;
   } catch {

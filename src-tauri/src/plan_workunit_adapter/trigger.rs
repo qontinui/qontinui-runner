@@ -3276,8 +3276,9 @@ pub struct WorkUnitBackfillSummary {
 ///   would route every unit down `UpsertWithStatus` and bypass the deferral
 ///   entirely — silently overwriting exactly the statuses it protects.
 ///
-/// Dependency edges are deliberately NOT pushed here: `build_metadata` already
-/// carries `depends_on` in the `metadata` JSONB (the documented fallback), and
+/// Dependency edges are deliberately NOT pushed here: the metadata patch
+/// ([`super::metadata::active_dir_patch`]) already carries `depends_on` in the
+/// `metadata` JSONB (the documented fallback), and
 /// the edge table is the reconcile loop's incremental business.
 ///
 /// `scope` is the tenant that owns the corpus being backfilled, resolved once
@@ -11281,14 +11282,12 @@ Body.
                 .iter()
                 .rev()
                 .find(|b| b.slug == slug)
-                .and_then(|b| b.metadata.clone().or_else(|| b.metadata_patch.clone()))
+                .and_then(|b| b.metadata_patch.clone())
                 .expect("the unit was pushed")
         };
-        // A phase-less plan goes out as a patch, where an undeclared area is
-        // an explicit `null` (RFC 7396 delete) rather than an absent key.
-        assert!(meta_for("2026-01-01-bad-area")
-            .get("area")
-            .is_none_or(|a| a.is_null()));
+        // A rejected `Area:` is OMITTED from the patch (the stored area is
+        // kept); an undeclared one would be an explicit `null` (RFC 7396 delete).
+        assert!(meta_for("2026-01-01-bad-area").get("area").is_none());
         assert_eq!(meta_for("2026-01-01-good-area")["area"], "ci-runners");
     }
 
@@ -12478,10 +12477,7 @@ Body.
             let last = upserts.last().expect("at least one upsert");
             assert_eq!(last.title.as_deref(), Some("Renamed twice"));
             assert_eq!(
-                last.metadata
-                    .as_ref()
-                    .or(last.metadata_patch.as_ref())
-                    .expect("metadata")["source_path"],
+                last.metadata_patch.as_ref().expect("metadata")["source_path"],
                 "plans/archive-candidates/a.md",
                 "a moved plan's provenance must follow it"
             );
@@ -14853,7 +14849,7 @@ Body.
         assert_eq!(last.slug, "s");
         assert_eq!(last.status, None, "metadata-only: no status on the wire");
         assert!(
-            last.metadata.is_some() || last.metadata_patch.is_some(),
+            last.metadata_patch.is_some(),
             "provenance keeps reaching coord"
         );
         assert_eq!(
