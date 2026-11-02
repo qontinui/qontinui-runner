@@ -601,10 +601,16 @@ bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh ad
   --kind semantic_resource \
   --key "plan:<plan-stem>" \
   --ttl "<ttl_seconds>"
-# --max-runtime 604800 (7 days): this is the LONGEST lifecycle chain of the
-# three — session 93078f26 ran one vet-imp-style effort for twelve days and
-# lapsed five hand-raised ceilings (12h, 12h, 24h, 48h, 168h) before it gave up.
-bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh start --ledger "$CLAIM_LEDGER" --max-runtime 604800
+# --max-runtime 86400 (24h): since the claim heartbeat extends its own cap while the owner is demonstrably
+# alive, this is the EXTENSION period, not a guess at the work's duration; it binds
+# only an owner whose liveness is UNKNOWN, and --max-runtime-hard (default 7 days)
+# is the absolute bound (plan 2026-10-27-the-claim-heartbeat-cap-clears-the-nets-of-a-live-session).
+# A live chain no longer needs a long value: session 93078f26 lapsed five
+# hand-raised ceilings (12h .. 168h) on one twelve-day effort, which is the
+# guess the extension retires. 604800 here would equal the hard bound, so the
+# loop could never extend and an UNKNOWN-owner orphan would hold the plan
+# reserve for seven days.
+bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh start --ledger "$CLAIM_LEDGER" --max-runtime 86400
 ```
 
 `start` detaches a background loop that re-heartbeats each row when THAT row
@@ -628,7 +634,8 @@ spellings.
 Read the loop at any point with `status`, which prints one line per row plus a
 verdict on its **exit code**: `LIVE` (0), `STALE` (3), `DEAD` (4), `STOLEN` (5),
 `LAPSED` (7), `EMPTY` (8), `MAX_RUNTIME` (9 — the loop ended on its own
-`--max-runtime` ceiling, not a coord verdict; re-`add` then `start`),
+runtime bound: the `--max-runtime` cap with the owner's liveness UNKNOWN, or the
+`--max-runtime-hard` ceiling; not a coord verdict; re-`add` then `start`),
 `OWNER_GONE` (11 — the owning session died and the loop released every row).
 
 ```bash
@@ -866,6 +873,25 @@ argument:
 Skill: vet-plan
 Args: <resolved plan path>
 ```
+
+**Effort on every subagent this chain spawns** (served policy
+`production-and-cost` `spawn-effort-profiles`). `/vet-imp` is mixed work, so the
+SESSION stays on the `implementation` profile of
+`agent_playbook/spawn-effort-profiles`. Read the playbook with
+`/policy get agent_playbook spawn-effort-profiles`; never take a level from this
+file or from memory.
+
+- **Vetting is research.** `/vet-plan`'s one fresh-context reviewer stays the
+  single Agent call its Step 1.5 specifies, passing the `research` profile's
+  `effort`. A Workflow is for research FAN-OUT only (the playbook's rule): where
+  the vet surveys in parallel and the session has a Workflow tool, those agents
+  pass the same level as `opts.effort`.
+- **Implementation is not.** Step 4's phase agents are Agent subagents passing
+  the `implementation` profile's effort, with no Workflow.
+- **An unreadable playbook:** pass no `effort`, and say so in Step 5's report.
+  Never guess a level.
+- **No `effort` parameter:** while `CLAUDE_CODE_EFFORT_LEVEL` is set the Agent
+  tool offers none. Pass none, and say so in Step 5's report.
 
 Let `/vet-plan` run to completion — it audits the claims, edits the plan in
 place, resolves open questions via its Decision policy, and stamps the plan
