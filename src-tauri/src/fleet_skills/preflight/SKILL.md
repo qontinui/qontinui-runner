@@ -685,8 +685,55 @@ bash qontinui-claude-config/scripts/custody-intent-write.sh <this worktree> \
 - Use the plan **slug** as `work_unit_id` — the same canonical cross-agent dedup
   key `coord.plans` / `sessions.plan_slug` use.
 - Pass **explicit** `intent_globs` — never rely on server-side derivation alone.
-  An **empty** `intent_globs` in the response is an **error → re-declare with
-  paths**, not a no-op. (Empty globs are why the incident's intent was invisible.)
+  An **empty** `intent_globs` in the response, or one that lost scope (the next
+  bullet says exactly when), is an **error → re-declare once with paths**
+  (next bullet), not a no-op. (Empty globs are why the incident's intent was invisible.)
+- **Read what was recorded, not what you sent.** coord keeps a PREFIX of the
+  explicit list (8 before plan
+  `2026-10-23-coord-declare-intent-silently-keeps-only-the-first-eight-explicit-globs`
+  Phase 1, up to 64 after), and every dropped path is invisible to peers: their
+  overlap check on it reads no overlap from you, and a `resource:` message for it
+  parks instead of reaching you. The scope is **NOT fully declared** when any of
+  these holds:
+  - the response carries a `warning`, or an `intent_globs_dropped` entry whose
+    `reason` is scope-losing — `absolute`, `overlong`, `over_cap`,
+    `invalid_glob`. A `duplicate` or `blank` drop alone loses no scope and does
+    NOT trigger a re-declare;
+  - the response has **no** `intent_globs_supplied` key — a fixed build always
+    sends one, so its absence means a coord build predating that fix, a
+    per-deployment property, so check every time — and its
+    `intent_globs` is shorter than your own trimmed, de-duplicated list. Compare
+    against the de-duplicated list, so a duplicate or blank you sent never reads
+    as truncation;
+  - the response carries `explicit_globs_rejected: true` — every explicit entry
+    was rejected and derivation replaced them, on any build — unless the list you
+    sent was all blanks, which lost no scope;
+  - an old build answers an uncompilable entry with a tool error naming an
+    invalid glob, after the row persisted — treat it as the `invalid_glob` arm,
+    not as a failed declare.
+
+  Then re-declare ONCE. First rewrite each dropped entry — by its `reason`, or by
+  comparing the two lists on an old build, which sends none, or when
+  `intent_globs_dropped_truncated` is true, because the rows then may not name
+  every lost path. On the tool-error arm, read the glob from the error; it names
+  only the first bad entry, so check the rest of your list before re-sending.
+  By reason: `absolute` → workspace-relative `<repo>/<path>`; `invalid_glob` → fix
+  the syntax. An `overlong` path cannot be recorded exactly and a covering glob is not a
+  substitute (below), so leave it out and treat it as a path not recorded. Then
+  send **exact** globs ordered by collision risk — hub files
+  and cross-repo entries first, because the server keeps a prefix — and at most
+  the cap (64 on a fixed build, 8 on an old one). Spend a trailing `<repo>/**`
+  only on a repo that would otherwise vanish from the recorded scope: it keeps
+  the repo present for repo-level checks (`coord_push_to_branch`, `resource:`
+  routing) but, like any covering glob, matches no narrow-path check. **Never replace an exact glob with a covering
+  one** (`<repo>/<dir>/**`): overlap matching is one-directional, so a covering
+  glob is invisible to a peer's narrow-path `conflict_check`, and the re-declare
+  REPLACES the row — you would trade away visibility the short row still had.
+  After that one re-declare, stop re-declaring even if paths still did not fit
+  (a scope larger than the cap): for each path that was not recorded, run
+  `coord_conflict_check` on it directly and take its step-6 `file_glob` claim,
+  and never read an empty `overlapping_peers` from the declare as covering that
+  path.
 
 ### 6. Acquire `file_glob` claims in globset path form — and heartbeat them
 
@@ -719,8 +766,9 @@ coord_claim_acquire(kind="file_glob", resource_key="<glob>", ttl_seconds=900)   
   bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh add \
     --ledger "$CLAIM_LEDGER" --kind file_glob --key "<glob>" --ttl "<ttl_seconds>"
 
-  # --max-runtime 21600 (6h): /preflight is a short pre-run check, not a
-  # long implementation chain, so it gets the smallest of the three ceilings.
+  # --max-runtime 21600 (6h): the extension period. The loop extends it while
+  # the owner is demonstrably alive, so it binds only an UNKNOWN owner, and
+  # --max-runtime-hard (default 7 days) is the absolute bound.
   bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh start --ledger "$CLAIM_LEDGER" --max-runtime 21600
   ```
 
@@ -729,7 +777,9 @@ coord_claim_acquire(kind="file_glob", resource_key="<glob>", ttl_seconds=900)   
   `ttl_seconds=900` buys: a
   helper that dies leaves a `file_glob` claim lingering up to 15 minutes instead
   of 90 seconds — bounded
-  by `stop` in your try/finally and by the helper's own `--max-runtime`.
+  by `stop` in your try/finally and by the helper's own runtime bound
+  (`--max-runtime` for an owner whose liveness is UNKNOWN, `--max-runtime-hard`
+  for any owner).
 
 - **`status` is the contract — read it, do not assume the loop lives.**
 
@@ -745,14 +795,15 @@ coord_claim_acquire(kind="file_glob", resource_key="<glob>", ttl_seconds=900)   
   aged past its TTL, never confirmed, or a malformed TTL); `EMPTY` (8) — the
   loop lives but the ledger holds no rows, so nothing is renewed (an `add` was
   refused or never ran); `MAX_RUNTIME` (9) — the loop itself ended on its own
-  `--max-runtime` ceiling, not a coord verdict (these grants may still be live
+  runtime bound (the `--max-runtime` cap with the owner's liveness UNKNOWN, or
+  the `--max-runtime-hard` ceiling), not a coord verdict (these grants may still be live
   at coord for up to their remaining ttl); `OWNER_GONE` (11) — the loop saw its
   owning session die, released every row and ended. A row the loop records
   as `stolen`, `lapsed`, `max_runtime` or `owner_gone` is terminal and never beaten again,
   while the loop
   keeps renewing the others; when no renewable row is left the loop ends, and
-  `status` reads `STOLEN` if any row was stolen, `MAX_RUNTIME` if the ceiling
-  ended it, `OWNER_GONE` if owner death ended it, otherwise `DEAD`.
+  `status` reads `STOLEN` if any row was stolen, `MAX_RUNTIME` if its runtime
+  bound ended it, `OWNER_GONE` if owner death ended it, otherwise `DEAD`.
   **Only `LIVE` means the claims are held.** The other seven mean the claim is
   **UNKNOWN** (`STALE` usually self-heals on the next beat; re-acquiring
   anyway is harmless — a held claim answers `renewed`), which is a re-acquire and a line in the report, never a shrug — a
@@ -806,8 +857,12 @@ write the first line.
   deterministic topic `repo:<R>` (e.g. `repo:qontinui-runner`) so `coord_orient`
   sees every peer on the repo without both sides guessing the same ad-hoc string.
   Reserve ad-hoc sub-topics for genuinely-scoped sub-efforts, layered on top.
-- **Always pass explicit globs** to `declare_intent`. An empty `intent_globs`
-  return is a retry trigger, not a no-op (step 5).
+- **Always pass explicit globs** to `declare_intent`, exact and ordered by
+  collision risk. An empty `intent_globs` return, a `warning`, a scope-losing
+  `intent_globs_dropped` entry, `explicit_globs_rejected` on anything but a
+  blank-only list, or (on an old build) a return shorter than your de-duplicated
+  list or an invalid-glob tool error is a one-time re-declare trigger, not a
+  no-op (step 5).
 - **Claim keys in globset path form**, consistent with what `conflict_check`
   scans (step 6).
 - **Scan disk, not just the registry.** A clear `who_is_working_on` /

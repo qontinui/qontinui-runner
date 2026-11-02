@@ -181,10 +181,20 @@ pub fn claude_anchor_in_subtree(root_pid: u32, snapshot: &ProcessSnapshot) -> Op
 /// session-id", `claude_session/launch_spec.rs:225-235`) — the resume id is the
 /// one the process actually runs under.
 ///
+/// FORK: `--resume X --fork-session` names the PARENT, while the process runs a
+/// new id (`--session-id` when it was given one, otherwise one this argv does
+/// not carry). So a fork answers only from `--session-id`.
+///
 /// The UUID-shape gate is the safety net: a stray token that merely follows the
 /// flag text (or a `--session-idX` false prefix) can never be mistaken for a
 /// real id. `None` when no such flag is present or no value is UUID-shaped.
 pub fn parse_session_id_from_cmdline(cmdline: &str) -> Option<String> {
+    if cmdline
+        .split_whitespace()
+        .any(|t| t.trim_matches(|c| c == '"' || c == '\'') == "--fork-session")
+    {
+        return find_flag_uuid(cmdline, "--session-id", false);
+    }
     // resume first — see PRECEDENCE above.
     find_flag_uuid(cmdline, "--resume", false)
         .or_else(|| find_flag_uuid(cmdline, "-r", true))
@@ -1523,6 +1533,22 @@ mod tests {
         // Reject: `--resume` IS recognized now, but its value is not UUID-shaped
         // (and no other id-naming flag is present) → still None.
         assert_eq!(parse_session_id_from_cmdline("claude --resume abc"), None);
+    }
+
+    #[test]
+    fn parse_session_id_on_a_fork_never_names_the_parent() {
+        let parent = "11111111-2222-3333-4444-555555555555";
+        let child = "99999999-8888-7777-6666-555555555555";
+        assert_eq!(
+            parse_session_id_from_cmdline(&format!("claude --resume {parent} --fork-session")),
+            None
+        );
+        assert_eq!(
+            parse_session_id_from_cmdline(&format!(
+                "claude --resume {parent} --session-id {child} --fork-session"
+            )),
+            Some(child.to_string())
+        );
     }
 
     #[test]

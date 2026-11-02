@@ -586,13 +586,20 @@ pub struct AiSettings {
 /// account-selection mode that actually governs this machine and the input
 /// that decided it ([`crate::claude_accounts::effective_selection`]).
 ///
-/// Read-only by construction — it is `Serialize` only, and the three derived
+/// Read-only by construction — it is `Serialize` only, and the four derived
 /// keys (`effective_account_selection_mode`, `account_selection_source`,
-/// `fleet_account_selection_mode`) are never fields of [`AiSettings`]: a
-/// derived value persisted into `settings.json` would be written back by every
-/// save. A client that echoes the view back on `PUT /settings/ai` is harmless,
-/// because `AiSettings` has no `deny_unknown_fields` and the three keys are
-/// dropped on deserialize (pinned by `mcp::settings` tests).
+/// `fleet_account_selection_mode`, `fleet_account_selection_answered`) are
+/// never fields of [`AiSettings`]: a derived value persisted into
+/// `settings.json` would be written back by every save. A client that echoes
+/// the view back on `PUT /settings/ai` is harmless, because `AiSettings` has
+/// no `deny_unknown_fields` and the four keys are dropped on deserialize
+/// (pinned by `mcp::settings` tests).
+///
+/// `account_selection_source` is the RESOLVER's source and stays typed
+/// (`fleet` | `local` | `pinned`); a client that reports it must read it
+/// together with `fleet_account_selection_answered` — an unpinned `local`
+/// while that is `false` is provisional, which the env capture spells
+/// `unknown` ([`crate::claude_accounts::reported_selection_source`]).
 ///
 /// Plan `2026-10-01-fleet-account-selection-effective-mode-visibility-and-pin-safe-saves`
 /// Phase 2.
@@ -606,11 +613,20 @@ pub struct AiSettingsView {
     /// no opinion), so a client can re-apply
     /// [`crate::claude_accounts::resolve_selection`] to UNSAVED form state.
     pub fleet_account_selection_mode: Option<AccountSelectionMode>,
+    /// Whether coord has ANSWERED the fleet account-selection domain in this
+    /// process ([`crate::mcp::fleet_policy_poller::account_selection_answered`]).
+    /// While `false`, `fleet_account_selection_mode: null` means "not yet
+    /// asked", not "the fleet has no opinion", so an unpinned
+    /// `account_selection_source: local` is provisional — the same reason the
+    /// env capture reports `selection_source=unknown` then
+    /// ([`crate::claude_accounts::reported_selection_source`]).
+    pub fleet_account_selection_answered: bool,
 }
 
 impl AiSettingsView {
-    /// PURE constructor from a settings document and an already-resolved
-    /// `(mode, source, fleet)` triple.
+    /// PURE constructor from a settings document, an already-resolved
+    /// `(mode, source, fleet)` triple, and whether the fleet value it was
+    /// resolved against is an answer from coord.
     pub fn from_parts(
         settings: AiSettings,
         (mode, source, fleet): (
@@ -618,20 +634,28 @@ impl AiSettingsView {
             crate::claude_accounts::AccountSelectionSource,
             Option<AccountSelectionMode>,
         ),
+        fleet_answered: bool,
     ) -> Self {
         Self {
             settings,
             effective_account_selection_mode: mode,
             account_selection_source: source,
             fleet_account_selection_mode: fleet,
+            fleet_account_selection_answered: fleet_answered,
         }
     }
 
     /// The current stored settings plus this machine's effective selection.
     pub fn current() -> Self {
+        // Flag FIRST (Acquire), value second: the poller stores the fleet
+        // value and THEN raises the flag (Release), so this order can never
+        // pair a raised flag with the pre-answer `None` — the same ordering
+        // as the env-capture door in `main.rs`.
+        let answered = crate::mcp::fleet_policy_poller::account_selection_answered();
         Self::from_parts(
             get_ai_settings(),
             crate::claude_accounts::effective_selection_with_fleet(),
+            answered,
         )
     }
 }
