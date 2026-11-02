@@ -770,15 +770,23 @@ export const DATA_PLANE_SOURCES: ReadonlySet<string> = new Set(["data_plane", "d
 /** The Tenant row's text when the runner sends no display. */
 export const TENANT_DISPLAY_ABSENT_TEXT = "unknown — runner predates tenancy.display";
 
-/** The bound-set suffix: `· 1 of 4 bound`, withheld on a single binding, and
- * an explicit unknown rather than silence when the set could not be read. */
+/** The bound-set suffix of a row that names a tenant (a `mismatch` lists its
+ * legs instead, with the set in the title): `· 1 of 4 bound`, withheld on a
+ * single binding that holds the named tenant, and an explicit unknown rather
+ * than silence when the set could not be read. A named tenant OUTSIDE the set
+ * is said whatever the set's size: one binding is exactly where the row would
+ * otherwise read as an ordinary single-tenant device. A measured EMPTY set is
+ * an absent binding store (`auth::binding_set_in`), which is per runner
+ * instance, so it says that rather than reading as a membership fault. */
 function boundSuffix(d: TenantDisplay): string {
   if (d.bound.status !== "measured") {
     return ` · bound set unknown — ${d.bound.reason ?? "no reason given"}`;
   }
-  if (d.multiBound !== true) return "";
   const n = d.bound.tenantIds.length;
-  return d.actingInBoundSet === false ? ` · not among ${n} bound` : ` · 1 of ${n} bound`;
+  if (d.actingInBoundSet === false) {
+    return n === 0 ? " · this runner has no bound tenants" : ` · not among ${n} bound`;
+  }
+  return d.multiBound === true ? ` · 1 of ${n} bound` : "";
 }
 
 /** How a `registered` coord row's tenant became known, in words. Pure. */
