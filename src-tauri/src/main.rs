@@ -228,7 +228,7 @@ mod prompt_snippets;
 mod prompts;
 /// The `qontinui-provenance:` frontmatter key both fleet provisioners stamp.
 mod provenance;
-/// The shared tracked-destination guard both fleet provisioners consult.
+/// The shared tracked-destination guard every fleet provisioner consults.
 mod provision_guard;
 mod rag;
 mod recording;

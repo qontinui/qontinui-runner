@@ -1,32 +1,29 @@
-//! The one tracked-file guard both fleet provisioners consult before writing.
+//! The one tracked-file guard every fleet provisioner consults before writing.
 //!
-//! [`crate::fleet_commands`] and [`crate::fleet_skills`] each write a bundled
-//! tree into a spawned session's `<cwd>/.claude/…`, unconditionally. That is
+//! [`crate::fleet_commands`], [`crate::fleet_skills`] and the two layers of
+//! `.claude/agents` ([`crate::fleet_agents`], then the checkout overlay in
+//! `agent_runtime::provision_agent_definitions_from_root`, which copies from a
+//! checkout rather than from the binary) each write a tree into a spawned
+//! session's `<cwd>/.claude/…`. Writing unconditionally is
 //! correct for the case they were built for — a fresh agent worktree, where
 //! nothing tracks those paths and the alternative is a session with no fleet
-//! commands or skills at all.
+//! commands, skills or subagents at all.
 //!
 //! It is wrong where the spawn cwd is a checkout that **tracks** the
 //! destination. An unconditional write there silently replaces the repo's own
-//! content with the binary's embedded copy and leaves the tree dirty, which then
+//! content with the provisioner's copy and leaves the tree dirty, which then
 //! blocks a pull, muddies a diff, and can be committed by an agent that never
 //! touched the file.
 //!
 //! So: **existing + tracked ⇒ skip.** Untracked or absent ⇒ write, as before.
-//! Unknown ⇒ write, too — EXCEPT inside a repository (next section).
+//! Unknown ⇒ write, too — EXCEPT inside a repository (see "UNKNOWN inside a
+//! repository" below).
 //!
-//! ## Which repos this actually changes, measured
+//! ## Which repos this actually changes
 //!
-//! Measured 2026-08-30 with `git ls-files` against both checkouts:
-//!
-//! | Repo | Tracks | Effect of this guard |
-//! |---|---|---|
-//! | `qontinui-claude-config` | **all 7** bundled commands (plus ~90 others) | every command skipped; 0 written |
-//! | `qontinui-dev-notes` | exactly `vet-plan.md` + `implement-plan.md` | those 2 skipped; the other 5 written |
-//!
-//! The `qontinui-claude-config` row is the important one and is **not** the
-//! narrow two-file case: a session spawned with that repo as its cwd now
-//! provisions ZERO fleet commands. That is intended — it is the canonical source
+//! `qontinui-claude-config` is the one that matters, and it is **not** a narrow
+//! case: it tracks every bundled command, so a session spawned with that repo as
+//! its cwd provisions ZERO fleet commands. That is intended — it is the canonical source
 //! of those very bodies, and its own copies are the ones a session there should
 //! resolve — but it is a real blast radius, so it is stated rather than implied.
 //!
@@ -40,8 +37,10 @@
 //!
 //! ## Fail-soft is a hard requirement
 //!
-//! Every failure mode of the probe resolves to "nothing is tracked", i.e. to the
-//! pre-existing write behaviour:
+//! Every failure mode of the probe resolves to "nothing is tracked", which means
+//! the pre-existing write behaviour. A probe that did not answer inside a
+//! repository is narrowed further, as the next section describes. None of them
+//! aborts anything:
 //!
 //! - no `git` binary on `PATH` (spawn error),
 //! - the destination's directory does not exist or is unreadable,
@@ -63,7 +62,8 @@
 //! ## UNKNOWN inside a repository: keep what is already on disk
 //!
 //! One failure arm is narrowed rather than written through: the probe did not
-//! answer (spawn error, timeout, non-zero exit) **and** a `.git` entry exists
+//! answer (spawn error, timeout, non-zero exit, or its output could not be stored
+//! or read back) **and** a `.git` entry exists
 //! at the probed root or one of its ancestors. That is a checkout whose git
 //! could not be asked — exactly the case where an unconditional write is most
 //! likely to overwrite content the repository tracks and leave a dirty tree
@@ -94,15 +94,17 @@
 //!   cost of the second half: a helper the repository really tracks, with no
 //!   tracked `SKILL.md` beside it, is overwritten in this arm — the one case
 //!   where it can dirty a tracked file.
-//! - The probe failure is logged once per probe at `warn`, naming the root and
-//!   which arm it resolved to, so an UNKNOWN never passes silently.
+//! - The probe failure is logged once per probe at `warn`, naming the root,
+//!   which arm it resolved to and the [`ProbeFailure`] that put it there, so an
+//!   UNKNOWN never passes silently. The cause matters most for the non-transient
+//!   case above: `dubious ownership` is only readable in git's own stderr.
 //!
 //! ## One process spawn per provisioning pass, not one per file
 //!
-//! The provisioners write 7 commands and ~13 skill files. Probing each
-//! separately would mean 20 synchronous `git` spawns on the async spawn path,
-//! ahead of terminal creation — on Windows, seconds of added latency for what
-//! used to be a handful of `fs::write` calls. [`TrackedPaths::probe`] instead
+//! The provisioners write dozens of commands and skill files. Probing each
+//! separately would mean that many synchronous `git` spawns on the async spawn
+//! path, ahead of terminal creation — on Windows, seconds of added latency on top
+//! of the file writes themselves. [`TrackedPaths::probe`] instead
 //! runs `git ls-files` ONCE over the destination subtree and answers every
 //! subsequent question from memory.
 
@@ -120,6 +122,47 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How often the probe checks whether the child has exited.
 const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Upper bound, in characters, on the git stderr line a [`ProbeFailure`] carries
+/// into a log line.
+const PROBE_STDERR_MAX_CHARS: usize = 200;
+
+/// Why [`run_bounded_git_ls_files`] could not answer.
+///
+/// Carried only as far as the log line: the keep decision is the same for all
+/// three, and the provisioning report records the keep rather than its cause.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProbeFailure {
+    /// git could not be started (no `git` on `PATH`), could not be polled, or its
+    /// stdout could not be stored or read back. `stage` names which.
+    Io { stage: &'static str, error: String },
+    /// git outlived [`PROBE_TIMEOUT`] and was killed.
+    TimedOut,
+    /// git ran and refused. `code` is `None` for a signal; `stderr` is its first
+    /// non-empty line, bounded. Empty means git said nothing OR that its stderr
+    /// could not be captured, so it never proves git was silent.
+    Exit { code: Option<i32>, stderr: String },
+}
+
+impl std::fmt::Display for ProbeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProbeFailure::Io { stage, error } => write!(f, "{stage}: {error}"),
+            ProbeFailure::TimedOut => write!(f, "git timed out after {PROBE_TIMEOUT:?}"),
+            ProbeFailure::Exit { code, stderr } => {
+                match code {
+                    Some(code) => write!(f, "git exited {code}")?,
+                    None => write!(f, "git was ended by a signal")?,
+                }
+                if stderr.is_empty() {
+                    Ok(())
+                } else {
+                    write!(f, ": {stderr}")
+                }
+            }
+        }
+    }
+}
 
 /// The set of paths git tracks under one destination directory, as paths
 /// RELATIVE to that directory.
@@ -144,39 +187,21 @@ impl TrackedPaths {
     ///
     /// `git -C <root> ls-files -z -- .` lists tracked paths under the cwd,
     /// relative to it, so the output maps straight onto the relative
-    /// destination paths both provisioners already compute. NUL-delimited, so a
+    /// destination paths the provisioners already compute. NUL-delimited, so a
     /// path containing a newline or a quote cannot desync the parse.
     ///
     /// Returns an EMPTY set on every failure — see the module doc's fail-soft
     /// contract — and, when that failure happened inside a repository, marks
-    /// the result UNKNOWN-in-repo so [`Self::should_skip`] reports existing
+    /// the result UNKNOWN-in-repo so [`Self::skip_reason`] reports existing
     /// files as keepable (each provisioner decides how it uses that — see the
     /// module doc). This function never panics and never propagates.
     pub(crate) fn probe(root: &Path) -> Self {
         if !root.is_dir() {
             return Self::default();
         }
-        let Some(stdout) = run_bounded_git_ls_files(root) else {
-            let unknown_in_repo = has_git_ancestor(root);
-            // `warn` only where the answer changes behaviour. Outside any
-            // repository `git ls-files` ALWAYS fails (exit 128), so a warn
-            // there would fire on every spawn into a plain directory and bury
-            // the in-repo warning that matters.
-            if unknown_in_repo {
-                tracing::warn!(
-                    root = %root.display(),
-                    "provision guard: tracked-file probe did not answer (git missing, failed or timed out); root is inside a repository, so existing destinations are kept (fleet_skills decides per skill)"
-                );
-            } else {
-                tracing::debug!(
-                    root = %root.display(),
-                    "provision guard: tracked-file probe did not answer; root is not inside a repository, so destinations are written as before"
-                );
-            }
-            return Self {
-                relative: HashSet::new(),
-                unknown_in_repo,
-            };
+        let stdout = match run_bounded_git_ls_files(root) {
+            Ok(stdout) => stdout,
+            Err(cause) => return Self::unanswered(root, &cause),
         };
         let relative = stdout
             .split(|b| *b == 0)
@@ -190,6 +215,33 @@ impl TrackedPaths {
         }
     }
 
+    /// The fail-soft result of a probe that did not answer: logged at the level
+    /// its arm deserves, and marked UNKNOWN-in-repo when `root` is inside one.
+    fn unanswered(root: &Path, cause: &ProbeFailure) -> Self {
+        let unknown_in_repo = has_git_ancestor(root);
+        // `warn` only where the answer changes behaviour. Outside any
+        // repository `git ls-files` ALWAYS fails (exit 128), so a warn
+        // there would fire on every spawn into a plain directory and bury
+        // the in-repo warning that matters.
+        if unknown_in_repo {
+            tracing::warn!(
+                root = %root.display(),
+                %cause,
+                "provision guard: tracked-file probe did not answer; root is inside a repository, so existing destinations are kept (fleet_skills decides per skill)"
+            );
+        } else {
+            tracing::debug!(
+                root = %root.display(),
+                %cause,
+                "provision guard: tracked-file probe did not answer; root is not inside a repository, so destinations are written as before"
+            );
+        }
+        Self {
+            relative: HashSet::new(),
+            unknown_in_repo,
+        }
+    }
+
     /// True iff the probe could not answer for a root inside a repository.
     pub(crate) fn is_unknown_in_repo(&self) -> bool {
         self.unknown_in_repo
@@ -200,9 +252,11 @@ impl TrackedPaths {
         self.relative.contains(relative)
     }
 
-    /// True iff `dst` should be SKIPPED: it already exists on disk AND either git
-    /// tracks it or the probe was UNKNOWN inside a repository. `relative` is
-    /// `dst`'s path relative to the probed root.
+    /// Why `dst` should be SKIPPED, or `None` when it should be written. It is
+    /// skipped when it already exists on disk AND either git tracks it
+    /// ([`SkipReason::GitTracked`]) or the probe was UNKNOWN inside a repository
+    /// ([`SkipReason::ProbeUnknownInRepo`]). `relative` is `dst`'s path relative
+    /// to the probed root.
     ///
     /// The existence half matters because a tracked path the user has DELETED
     /// is not content this guard can clobber, and skipping it would leave the
@@ -215,15 +269,6 @@ impl TrackedPaths {
     /// When the probe was UNKNOWN inside a repository, every EXISTING `dst` is
     /// skipped whether or not it is tracked: nothing could say it is safe to
     /// overwrite. An absent `dst` is still written.
-    pub(crate) fn should_skip(&self, dst: &Path, relative: &Path) -> bool {
-        self.skip_reason(dst, relative).is_some()
-    }
-
-    /// Why `dst` is skipped, or `None` when it should be written. The two arms
-    /// of [`Self::should_skip`] carry DIFFERENT reasons into the provisioning
-    /// report: a tracked destination is [`SkipReason::GitTracked`], an existing
-    /// destination kept only because the probe could not answer inside a
-    /// repository is [`SkipReason::ProbeUnknownInRepo`].
     pub(crate) fn skip_reason(&self, dst: &Path, relative: &Path) -> Option<SkipReason> {
         if !dst.exists() {
             return None;
@@ -300,8 +345,9 @@ fn has_git_ancestor(root: &Path) -> bool {
     any_git(root) || std::fs::canonicalize(root).is_ok_and(|real| any_git(&real))
 }
 
-/// Spawn `git ls-files` under `root` and return its stdout, or `None` on any
-/// failure — including a child that outlives [`PROBE_TIMEOUT`], which is killed.
+/// Spawn `git ls-files` under `root` and return its stdout, or the
+/// [`ProbeFailure`] that stopped it — including a child that outlives
+/// [`PROBE_TIMEOUT`], which is killed.
 ///
 /// Implementation notes that are load-bearing rather than incidental:
 ///
@@ -319,9 +365,24 @@ fn has_git_ancestor(root: &Path) -> bool {
 ///   a session.
 /// - `--literal-pathspecs` disables pathspec magic and globbing, so no path this
 ///   module is ever handed can be reinterpreted as a pattern.
-fn run_bounded_git_ls_files(root: &Path) -> Option<Vec<u8>> {
-    let out_file = tempfile::NamedTempFile::new().ok()?;
-    let handle = out_file.reopen().ok()?;
+fn run_bounded_git_ls_files(root: &Path) -> Result<Vec<u8>, ProbeFailure> {
+    let io = |stage: &'static str| {
+        move |e: std::io::Error| ProbeFailure::Io {
+            stage,
+            error: e.to_string(),
+        }
+    };
+    let out_file = tempfile::NamedTempFile::new().map_err(io("create the output file"))?;
+    let handle = out_file.reopen().map_err(io("open the output file"))?;
+    // A temp file for the same reason as stdout, and only ever read on failure.
+    // Capturing it is a diagnostic, so it must not be able to change the answer:
+    // a file that cannot be made falls back to discarding stderr rather than
+    // turning a probe that would have answered into an UNKNOWN.
+    let err_file = tempfile::NamedTempFile::new().ok();
+    let err_stdio = err_file
+        .as_ref()
+        .and_then(|f| f.reopen().ok())
+        .map_or_else(Stdio::null, Stdio::from);
 
     // `no_window` rather than `Command::new`: this probe runs on EVERY session
     // spawn, so on Windows a bare `Command` pops a console window every time
@@ -335,10 +396,19 @@ fn run_bounded_git_ls_files(root: &Path) -> Option<Vec<u8>> {
         .arg("--")
         .arg(".")
         .stdin(Stdio::null())
+        // Tracing would put its own lines ahead of git's error, and
+        // `first_stderr_line` would report those instead of the cause. Best
+        // effort: a trace2 target set in git config still applies, and then the
+        // log names a trace line rather than the cause.
+        .env_remove("GIT_TRACE")
+        .env_remove("GIT_TRACE2")
+        .env_remove("GIT_TRACE2_PERF")
+        .env_remove("GIT_TRACE2_EVENT")
+        .env_remove("GIT_TRACE_SETUP")
         .stdout(Stdio::from(handle))
-        .stderr(Stdio::null())
+        .stderr(err_stdio)
         .spawn()
-        .ok()?;
+        .map_err(io("start git"))?;
 
     let deadline = Instant::now() + PROBE_TIMEOUT;
     let status = loop {
@@ -350,25 +420,44 @@ fn run_bounded_git_ls_files(root: &Path) -> Option<Vec<u8>> {
                     // cannot become a zombie for the process's lifetime.
                     let _ = child.kill();
                     let _ = child.wait();
-                    return None;
+                    return Err(ProbeFailure::TimedOut);
                 }
                 std::thread::sleep(PROBE_POLL_INTERVAL);
             }
-            Err(_) => return None,
+            Err(e) => return Err(io("poll git")(e)),
         }
     };
 
     if !status.success() {
-        return None;
+        let stderr = err_file
+            .and_then(|f| std::fs::read(f.path()).ok())
+            .unwrap_or_default();
+        return Err(ProbeFailure::Exit {
+            code: status.code(),
+            stderr: first_stderr_line(&stderr),
+        });
     }
-    std::fs::read(out_file.path()).ok()
+    std::fs::read(out_file.path()).map_err(io("read the output file"))
+}
+
+/// The first non-empty line of git's stderr, bounded to
+/// [`PROBE_STDERR_MAX_CHARS`] so a log line cannot grow with what git printed.
+fn first_stderr_line(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .chars()
+        .take(PROBE_STDERR_MAX_CHARS)
+        .collect()
 }
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    //! Tempdir git helpers shared by this module's tests and by the two
-    //! provisioners' tracked/untracked arm tests, so the three do not each
-    //! re-spell `git init` + `git add`.
+    //! Tempdir git helpers shared by this module's tests and by the tests of the
+    //! modules that consume the guard, so they do not each re-spell `git init` +
+    //! `git add`.
 
     use std::path::Path;
     use std::process::{Command, Stdio};
@@ -449,7 +538,7 @@ mod tests {
 
         let tracked = TrackedPaths::probe(tmp.path());
         assert!(tracked.contains(Path::new("tracked.md")));
-        assert!(tracked.should_skip(&f, Path::new("tracked.md")));
+        assert!(tracked.skip_reason(&f, Path::new("tracked.md")).is_some());
     }
 
     /// The probe reports paths RELATIVE to the probed root, including through
@@ -477,7 +566,9 @@ mod tests {
         let f = tmp.path().join("untracked.md");
         std::fs::write(&f, b"body").unwrap();
 
-        assert!(!TrackedPaths::probe(tmp.path()).should_skip(&f, Path::new("untracked.md")));
+        assert!(!TrackedPaths::probe(tmp.path())
+            .skip_reason(&f, Path::new("untracked.md"))
+            .is_some());
     }
 
     /// Fail-soft: a path in no repository at all must read as NOT tracked, so
@@ -491,7 +582,7 @@ mod tests {
 
         let tracked = TrackedPaths::probe(tmp.path());
         assert!(!tracked.contains(Path::new("loose.md")));
-        assert!(!tracked.should_skip(&f, Path::new("loose.md")));
+        assert!(tracked.skip_reason(&f, Path::new("loose.md")).is_none());
     }
 
     /// A probe that cannot answer INSIDE a repository protects every existing
@@ -520,11 +611,15 @@ mod tests {
             "the probe failed inside a repo"
         );
         assert!(
-            tracked.should_skip(&existing, Path::new("existing.md")),
+            tracked
+                .skip_reason(&existing, Path::new("existing.md"))
+                .is_some(),
             "an existing file must not be overwritten when git could not be asked"
         );
         assert!(
-            !tracked.should_skip(&absent, Path::new("absent.md")),
+            !tracked
+                .skip_reason(&absent, Path::new("absent.md"))
+                .is_some(),
             "an absent destination is still written"
         );
     }
@@ -540,7 +635,7 @@ mod tests {
 
         let tracked = TrackedPaths::probe(tmp.path());
         assert!(!tracked.is_unknown_in_repo());
-        assert!(!tracked.should_skip(&f, Path::new("loose.md")));
+        assert!(tracked.skip_reason(&f, Path::new("loose.md")).is_none());
     }
 
     /// The measured shape: a workspace root (no `.git` anywhere above it) whose
@@ -605,9 +700,9 @@ mod tests {
         assert!(!tracked.contains(Path::new("anything.md")));
     }
 
-    /// `should_skip` requires BOTH halves: a tracked path whose file has been
+    /// `skip_reason` requires BOTH halves: a tracked path whose file has been
     /// deleted is written, not skipped. Pinned because the doc comment on
-    /// `should_skip` explains the cost of that choice, and a silent flip would
+    /// `skip_reason` explains the cost of that choice, and a silent flip would
     /// make that explanation wrong.
     #[test]
     fn a_tracked_but_deleted_path_is_not_skipped() {
@@ -624,8 +719,63 @@ mod tests {
             "git still tracks the path"
         );
         assert!(
-            !tracked.should_skip(&f, Path::new("gone.md")),
+            tracked.skip_reason(&f, Path::new("gone.md")).is_none(),
             "but with no file on disk there is nothing to clobber, so we write"
+        );
+    }
+
+    /// A refusal carries git's exit code and its own words into the failure, so
+    /// the `warn` on a checkout stuck in the UNKNOWN arm names the cause (a
+    /// `safe.directory` refusal is exit 128 too, and only its text tells it from
+    /// any other). Asserted by shape rather than by text: git translates it.
+    #[test]
+    fn a_refused_probe_names_the_exit_code_and_gits_own_words() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join(".git"),
+            b"gitdir: /nonexistent/qontinui-provision-guard-failure-test\n",
+        )
+        .unwrap();
+
+        let failure = run_bounded_git_ls_files(tmp.path()).expect_err("a dead .git refuses");
+        let ProbeFailure::Exit { code, stderr } = &failure else {
+            panic!("a dead .git is a refusal, not {failure:?}");
+        };
+        assert_eq!(*code, Some(128));
+        assert!(!stderr.is_empty(), "git's own words must be captured");
+        assert!(!stderr.contains('\n'), "one line: {stderr:?}");
+        assert_eq!(failure.to_string(), format!("git exited 128: {stderr}"));
+    }
+
+    #[test]
+    fn the_failure_text_says_nothing_it_did_not_observe() {
+        let silent = ProbeFailure::Exit {
+            code: Some(1),
+            stderr: String::new(),
+        };
+        assert_eq!(silent.to_string(), "git exited 1");
+        let signalled = ProbeFailure::Exit {
+            code: None,
+            stderr: String::new(),
+        };
+        assert_eq!(signalled.to_string(), "git was ended by a signal");
+        assert!(ProbeFailure::TimedOut.to_string().contains("timed out"));
+    }
+
+    /// The first line that says anything, cut at a CHARACTER boundary: a byte
+    /// slice would panic on a translated message, and a panic here would be an
+    /// aborted spawn, which the module doc forbids.
+    #[test]
+    fn the_stderr_line_is_the_first_non_empty_one_and_is_bounded() {
+        assert_eq!(
+            first_stderr_line(b"\n  \nfatal: one\nfatal: two\n"),
+            "fatal: one"
+        );
+        assert_eq!(first_stderr_line(b""), "");
+        let long = "é".repeat(PROBE_STDERR_MAX_CHARS + 50);
+        assert_eq!(
+            first_stderr_line(long.as_bytes()).chars().count(),
+            PROBE_STDERR_MAX_CHARS
         );
     }
 }

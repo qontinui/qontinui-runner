@@ -559,11 +559,10 @@ pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
 /// used to replace the repo's own content with the binary's embedded copy and
 /// leave the tree dirty.
 ///
-/// **This is not only the narrow two-file case.** `qontinui-dev-notes` tracks
-/// exactly `vet-plan.md` + `implement-plan.md`, but `qontinui-claude-config`
-/// tracks all seven — so a session spawned there provisions ZERO commands, and
-/// a tracked file outranks an account override. The measured table, and why
-/// that is the intended outcome, are in [`crate::provision_guard`]'s module doc.
+/// **This is not a narrow case.** `qontinui-claude-config` tracks all of them —
+/// so a session spawned there provisions ZERO commands, and a tracked file
+/// outranks an account override. Why that is the intended outcome is in
+/// [`crate::provision_guard`]'s module doc.
 ///
 /// **Fail-soft, and this is a hard requirement.** The tracked probe
 /// ([`crate::provision_guard::TrackedPaths::probe`]) resolves EVERY failure — an
@@ -574,7 +573,7 @@ pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
 /// (see that module's "UNKNOWN inside a repository" section). A skipped write
 /// must never become an aborted spawn, and a failed or slow probe must never
 /// become one either. The probe runs ONCE per pass, not once per
-/// file, so this costs one process spawn rather than seven.
+/// file, so this costs one process spawn rather than one per command.
 pub(crate) fn provision_fleet_commands_into(
     commands_dir: &Path,
     registry: &AgentCommandRegistry,
