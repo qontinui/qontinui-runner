@@ -34,7 +34,11 @@
 //! A migrated session (its transcript copied into another account root and
 //! resumed there) is reported under the root holding its NEWEST turn, with that
 //! turn's time, so an older root reported later can never displace it — coord
-//! keeps the stamp with the newest `account_observed_at`.
+//! keeps the stamp with the newest `account_observed_at`. When both copies hold
+//! the same newest turn (the resumed session exited before speaking), the most
+//! recently WRITTEN copy — the migration target — wins, because coord accepts
+//! an equal observation time and a name-ordered tie would re-stamp the session
+//! back onto its old account.
 //!
 //! ## What it never carries
 //!
@@ -108,9 +112,10 @@ pub const REPORT_INTERVAL: Duration = Duration::from_secs(180);
 /// coord's per-post row ceiling (`422 too_many_rows` above it).
 pub const MAX_ROWS_PER_POST: usize = 500;
 
-/// Uncached transcript tails one pass may read. A box holds ~3,400
-/// transcripts; after a runner start the cache is cold, so the first passes
-/// spread the reads instead of tailing every file at once.
+/// Uncached transcript tails one pass may read. A box holds thousands of
+/// transcripts (8,432 session ids across 17 account homes on one Linux fleet
+/// box, counted 2026-11-02); after a runner start the cache is cold, so the
+/// first passes spread the reads instead of tailing every file at once.
 pub const TAIL_READS_PER_PASS: usize = 1_000;
 
 /// coord refuses a name longer than this; such a name is omitted from the row.
@@ -252,6 +257,10 @@ pub struct Candidates {
     /// Every id the index or the registry knew this pass, reportable or not —
     /// the set the watermark is pruned to.
     pub known_ids: HashSet<String>,
+    /// How many account roots the directory walk actually read. A pass that
+    /// read fewer roots than an earlier one saw LESS, not fewer sessions, so
+    /// it must not prune ([`Reporter::prune_watermark`]).
+    pub roots_scanned: usize,
 }
 
 /// Build every reportable row. `read` is the newest-turn probe
@@ -298,7 +307,10 @@ pub fn build_candidates(
         .filter(|id| is_uuid_shaped(id))
         .collect();
 
-    let mut out = Candidates::default();
+    let mut out = Candidates {
+        roots_scanned: dir.roots_scanned(),
+        ..Candidates::default()
+    };
     for id in ids {
         out.known_ids.insert(id.clone());
         let tag_name = dir.name_of(&id).and_then(bounded_name);
@@ -618,6 +630,9 @@ pub struct Reporter {
     dirty: bool,
     first_reports_since_persist: usize,
     last_persist: Option<Instant>,
+    /// The most account roots any pass in this process has read — the bar a
+    /// pass must meet before its absence of an id counts as the id being gone.
+    roots_high_water: usize,
 }
 
 impl Default for Reporter {
@@ -632,6 +647,7 @@ impl Default for Reporter {
             dirty: false,
             first_reports_since_persist: 0,
             last_persist: None,
+            roots_high_water: 0,
         }
     }
 }
@@ -688,6 +704,28 @@ impl Reporter {
             PostOutcome::Http(s) => PassState::Http(s),
             PostOutcome::Transport => PassState::Transport,
         }
+    }
+
+    /// Drop watermark entries for ids this pass no longer saw — but ONLY when
+    /// the walk read at least as many account roots as any earlier pass in
+    /// this process. An empty or partial read (a root unreadable this pass, an
+    /// unmounted home) is a smaller view, not proof the sessions are gone;
+    /// pruning on it would re-send every row of that root once it reappears.
+    /// The bar is in memory, so a root removed for good stops pruning only
+    /// until the next runner start. Returns how many entries were dropped.
+    fn prune_watermark(&mut self, known: &HashSet<String>, roots_scanned: usize) -> usize {
+        if roots_scanned == 0 || roots_scanned < self.roots_high_water {
+            return 0;
+        }
+        self.roots_high_water = roots_scanned;
+        let dropped = self
+            .watermark
+            .get_or_insert_with(Watermark::default)
+            .retain_ids(known);
+        if dropped > 0 {
+            self.dirty = true;
+        }
+        dropped
     }
 
     fn back_off(&mut self, now: Instant) {
@@ -800,10 +838,8 @@ impl Reporter {
             return PassState::Build;
         };
 
+        self.prune_watermark(&candidates.known_ids, candidates.roots_scanned);
         let wm = self.watermark.get_or_insert_with(Watermark::default);
-        if wm.retain_ids(&candidates.known_ids) > 0 {
-            self.dirty = true;
-        }
         let batch = wm.select(&candidates.rows, self.window, &self.quarantine);
         debug!(
             rows = candidates.rows.len(),
@@ -1052,21 +1088,35 @@ mod tests {
     }
 
     #[test]
-    fn a_ghost_or_a_name_without_a_transcript_yields_no_row() {
+    fn a_ghost_a_name_without_a_transcript_or_a_non_session_stem_yields_no_row() {
         let tmp = tempfile::tempdir().unwrap();
         let q = home(tmp.path(), ".claude-qontinui");
         let names = tmp.path().join("session-names");
-        // B has a name but no transcript in any root: no account to report.
+        // B has a name but no transcript in any root: no account to name, so
+        // no row — never one under an invented account.
         name_file(&names, SID_B, "named-only");
         // A transcript whose stem is not a session id is not a session.
         transcript(&q, "-p", "agent-a1b2c3", &["2026-10-19T08:00:00.000Z"]);
+        // C is a ghost that DOES reach an input the reporter reads: a registry
+        // file left by a crashed process (its pid is not live), with no name
+        // and no transcript anywhere.
+        fs::create_dir_all(q.join("sessions")).unwrap();
+        fs::write(
+            q.join("sessions").join("404.json"),
+            format!(r#"{{"pid":404,"sessionId":"{SID_C}","cwd":"/p","updatedAt":1790000000000}}"#),
+        )
+        .unwrap();
 
-        let dir = SessionDirectory::discover_from(&names, std::slice::from_ref(&q));
-        // C is a ghost: no name, no transcript anywhere.
-        assert!(dir.resolve(SID_C).is_ghost());
-        let got = build_candidates(&dir, &[], &mut unbounded());
+        let homes = vec![q.clone()];
+        let live = read_live_rows(&homes, &HashSet::from([1_u32]));
+        let dir = SessionDirectory::discover_from(&names, &homes);
+        let got = build_candidates(&dir, &live, &mut unbounded());
         assert!(got.rows.is_empty(), "rows: {:?}", got.rows);
-        assert!(!got.known_ids.contains(SID_C));
+        assert!(
+            got.known_ids.is_empty(),
+            "neither the stale ghost, the name-only id nor the non-session stem is known: {:?}",
+            got.known_ids
+        );
     }
 
     #[test]
@@ -1449,6 +1499,63 @@ mod tests {
         assert!(load_watermark(&path).is_empty());
         fs::write(&path, br#"{"version":99,"entries":{}}"#).unwrap();
         assert_eq!(load_watermark(&path), Watermark::default());
+    }
+
+    #[test]
+    fn a_walk_that_read_fewer_roots_never_prunes_the_watermark() {
+        let mut r = Reporter {
+            watermark: Some(Watermark::default()),
+            ..Reporter::default()
+        };
+        r.watermark.as_mut().unwrap().record_sent(
+            &[
+                row(SID_A, "2026-10-19T09:00:00.000Z"),
+                row(SID_B, "2026-10-19T09:00:00.000Z"),
+            ],
+            1,
+        );
+        let both: HashSet<String> = [SID_A.to_string(), SID_B.to_string()].into();
+        let only_a: HashSet<String> = [SID_A.to_string()].into();
+
+        // A full read of three roots sets the bar; nothing is missing yet.
+        assert_eq!(r.prune_watermark(&both, 3), 0);
+        // An empty walk saw nothing: absence is not evidence.
+        assert_eq!(r.prune_watermark(&HashSet::new(), 0), 0);
+        // A partial walk (one root unreadable) does not prune B either.
+        assert_eq!(r.prune_watermark(&only_a, 2), 0);
+        assert_eq!(r.watermark.as_ref().unwrap().len(), 2);
+        assert!(!r.dirty);
+        // A walk as wide as the bar that still lacks B: B is gone.
+        assert_eq!(r.prune_watermark(&only_a, 3), 1);
+        assert_eq!(r.watermark.as_ref().unwrap().len(), 1);
+        assert!(r.dirty);
+    }
+
+    #[test]
+    fn a_migrated_session_that_exited_before_its_first_turn_stays_on_the_new_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gmail = home(tmp.path(), ".claude-gmail");
+        let qontinui = home(tmp.path(), ".claude-qontinui");
+        let turns = ["2026-10-18T10:00:00.000Z", "2026-10-19T12:00:00.000Z"];
+        // The original (gmail) is written first; the migration then copies the
+        // transcript into qontinui. The resumed session exits without a turn,
+        // so both copies hold the same newest turn, and gmail sorts first by
+        // name — only the newer write can name the account it continued under.
+        transcript(&gmail, "-p", SID_D, &turns);
+        std::thread::sleep(Duration::from_millis(20));
+        transcript(&qontinui, "-p", SID_D, &turns);
+
+        let dir = SessionDirectory::discover_from(
+            &tmp.path().join("none"),
+            &[gmail.clone(), qontinui.clone()],
+        );
+        let got = build_candidates(&dir, &[], &mut unbounded());
+        assert_eq!(got.rows.len(), 1);
+        assert_eq!(got.rows[0].account, "qontinui");
+        assert_eq!(
+            got.rows[0].last_acted_at.as_deref(),
+            Some("2026-10-19T12:00:00.000Z")
+        );
     }
 
     #[test]
