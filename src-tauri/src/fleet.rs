@@ -51,6 +51,12 @@ use crate::database::pg::PgDb;
 /// Appended in [`host_capabilities`].
 pub(crate) mod imagegen_probe;
 
+/// The periodic coord heartbeat loop: drives [`heartbeat_to_coord`] under a
+/// per-tick timeout, warns on stalls, and logs a 10-minute summary (plan
+/// `2026-10-29-a-drained-device-is-alerted-as-no-runner-online`, Phase 3).
+pub(crate) mod heartbeat_loop;
+pub use heartbeat_loop::spawn_heartbeat;
+
 /// Per-machine resource samples (plan §A1/§A2). Driven from
 /// [`spawn_budget_republisher`] so it inherits that function's
 /// shared-machine-state ownership gate instead of restating it — see the
@@ -63,6 +69,12 @@ pub(crate) mod resource_sample;
 /// for why the local/remote split is load-bearing and why an unmeasured census
 /// is `None` rather than a row of zeroes.
 pub(crate) mod socket_census;
+
+/// Per-slice cgroup v2 memory and PSI telemetry (plan
+/// `2026-10-19-ci-nodes-run-the-tauri-runner-always-on-as-ci-node-role`,
+/// Phase 0b). Consumed by [`resource_sample`]'s host lane; off Linux it reports
+/// `not_supported` rather than zeroes.
+pub(crate) mod slice_telemetry;
 
 /// §3.2 declared role. Mirrors `qontinui-coord::fleet::MachineRole`.
 /// The runner publishes itself as `Agent`; the supervisor publishes
@@ -3058,7 +3070,17 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
     };
     let bearer_scope = bindings.bearer_scope();
 
-    let claude_code_available = claude_code_probe();
+    // Off the async worker: this loop runs on a current_thread runtime, so the
+    // synchronous probe (a `claude --version` fork, up to its 3s budget) would
+    // block the only worker — and with it the tick timer that bounds this whole
+    // call in `heartbeat_loop::run_tick`. On the blocking pool the await is
+    // bounded by that tick timeout. A failed probe task counts as unavailable.
+    let claude_code_available = spawn_blocking_tracked(claude_code_probe)
+        .await
+        .unwrap_or_else(|e| {
+            warn!("fleet::heartbeat: claude_code_probe task failed ({e}); advertising unavailable");
+            false
+        });
 
     let (capture_preview_count, monitor_crop_count, last_capture_fallback_at) =
         capture_telemetry_snapshot();
@@ -3375,69 +3397,9 @@ fn detect_claude_code_now() -> bool {
     }
 }
 
-/// Spawn the periodic heartbeat task on the ambient tokio runtime.
-///
-/// Interval is read from `COORD_HEARTBEAT_INTERVAL_SECS` (default 30s,
-/// floored at 1s). `MissedTickBehavior::Skip` mirrors the watcher in
-/// `qontinui-coord/src/health_watcher.rs:99-100` — if a tick is missed
-/// (e.g. system suspend), skip catch-up and resume on the next aligned
-/// tick. Heartbeat failures `warn!` and retry on the next interval;
-/// the loop never panics.
-pub fn spawn_heartbeat() {
-    let secs: u64 = std::env::var("COORD_HEARTBEAT_INTERVAL_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30)
-        .max(1);
-
-    info!(
-        "fleet::heartbeat: starting periodic heartbeat task, interval={}s",
-        secs
-    );
-
-    // Supervised (plan 2026-09-03-…-supervisor Phase 4): a panic in a tick
-    // used to kill this task silently and let coord's 120s liveness TTL
-    // expire; the supervisor rebuilds the loop after a bounded backoff and
-    // `/health` `supervised_workers` shows the restart. Per-run state lives
-    // inside the future, so a rebuilt loop re-enters cleanly from the top.
-    crate::worker_supervisor::spawn_supervised_with_heartbeat(
-        "fleet.heartbeat",
-        move |hb| async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(secs));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // Failure-streak counter: each WARN carries the running count (so
-            // log timestamps reveal whether ticks are actually firing every
-            // `secs`), and recovery logs once at info — the success path is
-            // otherwise debug-quiet, which hid the 2026-06-03 outage's
-            // intermittency from the default log level.
-            let mut consecutive_failures: u32 = 0;
-            loop {
-                tick.tick().await;
-                hb.tick();
-                match heartbeat_to_coord().await {
-                    Err(e) => {
-                        consecutive_failures += 1;
-                        warn!(
-                            "fleet::heartbeat: {e} (consecutive_failures={consecutive_failures})"
-                        );
-                        // Three of these in a row make the drain state Unknown.
-                        crate::coord_drain_state::note_heartbeat_failure(&e);
-                    }
-                    Ok(outcome) => {
-                        if consecutive_failures > 0 {
-                            info!(
-                                "fleet::heartbeat: recovered after {consecutive_failures} \
-                                 failed tick(s)"
-                            );
-                            consecutive_failures = 0;
-                        }
-                        crate::coord_drain_state::note_heartbeat(outcome).await;
-                    }
-                }
-            }
-        },
-    );
-}
+// The loop that drives `heartbeat_to_coord` (`spawn_heartbeat`) lives in
+// `fleet/heartbeat_loop.rs`, with its tick timeout, stall warning and periodic
+// summary line.
 
 // =============================================================================
 // Primary-tree state publisher
@@ -3448,7 +3410,7 @@ pub fn spawn_heartbeat() {
 // + `git rev-parse HEAD` + `git symbolic-ref --short HEAD` + mtime-scans the
 // working tree, then POSTs one row per repo to `<base>/coord/trees/upsert`.
 //
-// Mirrors the `heartbeat_to_coord` + `spawn_heartbeat` pair above:
+// Mirrors `heartbeat_to_coord` above and its loop, `heartbeat_loop::spawn_heartbeat`:
 // - Reuses `load_device_file` for identity.
 // - Reuses `profiles::connected_coord_base` for the coord HTTP endpoint.
 // - Best-effort: errors `warn!` and the next tick retries; the loop never
@@ -7245,9 +7207,12 @@ mod tests {",
             (
                 "agent_worktree/census.rs",
                 include_str!("agent_worktree/census.rs"),
-                2,
-                "the periodic walk spawn AND `ChunkPoster::resolve_dest`, the POST chokepoint \
-                 every walk trigger routes through",
+                1,
+                "`runs_machine_census`, the module's one spelling of the rule. Its call \
+                 sites — the periodic walk spawn, `ChunkPoster::resolve_dest` (the POST \
+                 chokepoint every walk trigger routes through) and the volume probe — are \
+                 pinned by census.rs's own `the_census_post_chokepoint_carries_the_guard` and \
+                 `the_walk_spawn_and_the_volume_probe_ask_runs_machine_census`",
             ),
             (
                 "agent_worktree/fs_backstop.rs",
@@ -9227,7 +9192,6 @@ mod tests {",
         }
         #[cfg(not(windows))]
         {
-            use std::os::unix::fs::PermissionsExt;
             let path = dir.join(name);
             let tail = match shim {
                 Shim::Exit(code) => format!("exit {code}\n"),
@@ -9235,10 +9199,139 @@ mod tests {",
             };
             let body =
                 format!("#!/bin/sh\necho {CRED_FAKE_SECRET}\necho {CRED_FAKE_SECRET} >&2\n{tail}");
-            std::fs::write(&path, body).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            write_executable_script(&path, &body);
             path
         }
+    }
+
+    /// Write `body` to `path` as a mode-755 script WITHOUT this process ever
+    /// holding a write descriptor on it, so an exec of it can never fail
+    /// ETXTBSY. Every shim this module's tests exec is written through here.
+    ///
+    /// Why the plain `fs::write` + `set_permissions` this replaced flaked (CI
+    /// job 123922633970, `cred_absent_aws_retracts_on_next_heartbeat_payload`):
+    /// while this thread's write fd is open, a sibling test thread that forks
+    /// copies it into its child, where it stays open until that child execs
+    /// (`O_CLOEXEC` closes it only then). The file's write count is held for
+    /// that window, and an exec of the shim inside it is refused ETXTBSY —
+    /// which `command_exit_within` reads as `SpawnFailed`, i.e. `Unknown`.
+    ///
+    /// Write-to-temp + `rename` does NOT close this: the leaked descriptor
+    /// pins the INODE, and `rename` moves that same inode into place. Handing
+    /// the write to a child `sh` does: the descriptor then exists only in that
+    /// child's fd table, which no fork of this process copies, and it is gone
+    /// once the child is reaped — before this returns.
+    #[cfg(not(windows))]
+    fn write_executable_script(path: &std::path::Path, body: &str) {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut writer = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"cat >"$1" && chmod 755 "$1""#)
+            .arg("sh")
+            .arg(path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn /bin/sh to write the shim");
+        // A writer that died early (say, the directory is missing) closes the
+        // pipe: let the exit-status assert below report its stderr instead.
+        if let Err(e) = writer
+            .stdin
+            .take()
+            .expect("the writer's stdin is piped")
+            .write_all(body.as_bytes())
+        {
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::BrokenPipe,
+                "feed the shim body to its writer: {e}"
+            );
+        }
+        let out = writer.wait_with_output().expect("reap the shim writer");
+        assert!(
+            out.status.success(),
+            "writing the shim {} failed ({}): {}",
+            path.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Iterations of [`cred_shim_is_execable_while_other_threads_fork`].
+    const CRED_SHIM_STRESS_ITERS: usize = 300;
+
+    /// REGRESSION (CI job 123922633970, `cred_absent_aws_retracts_on_next_heartbeat_payload`
+    /// at step 3): a shim the fixture just wrote must exec, even while other
+    /// threads fork. Four threads spawn `true` in a loop for the whole run —
+    /// the shape of a parallel `cargo test` — while this thread rewrites the
+    /// same shim path (step 3's shape) and spawns it. Any spawn refused with
+    /// ETXTBSY is the fixture leaking its write descriptor into a sibling
+    /// fork, which the cred probe reads as `SpawnFailed` -> Unknown. Against
+    /// the old `fs::write` + `set_permissions` fixture this goes red at 300
+    /// iterations on a many-core box (see the PR that added it for counts).
+    #[cfg(unix)]
+    #[test]
+    fn cred_shim_is_execable_while_other_threads_fork() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        /// Stops the forkers however this test exits — a panic in the loop
+        /// must not leave them forking under every later test in the binary.
+        struct StopOnDrop(std::sync::Arc<AtomicBool>);
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_guard = StopOnDrop(stop.clone());
+        let forkers: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new("true")
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status();
+                    }
+                })
+            })
+            .collect();
+        let mut busy = 0usize;
+        let mut other = Vec::new();
+        for i in 0..CRED_SHIM_STRESS_ITERS {
+            let shim = write_cred_shim(&bin, "aws", Shim::Exit(0));
+            match std::process::Command::new(&shim)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+            {
+                Ok(s) if s.code() == Some(0) => {}
+                Ok(s) => other.push(format!("iteration {i}: exit {s:?}")),
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => busy += 1,
+                Err(e) => other.push(format!("iteration {i}: {e}")),
+            }
+        }
+        drop(stop_guard);
+        for f in forkers {
+            f.join().unwrap();
+        }
+        eprintln!(
+            "cred shim stress: {CRED_SHIM_STRESS_ITERS} writes+execs, {busy} ETXTBSY, {} other",
+            other.len()
+        );
+        assert!(other.is_empty(), "unexpected shim outcomes: {other:?}");
+        assert_eq!(
+            busy, 0,
+            "{busy} of {CRED_SHIM_STRESS_ITERS} freshly written shims were refused \
+             with ETXTBSY — the fixture's write descriptor leaked into a sibling fork"
+        );
     }
 
     /// A shim that, before printing the fake secret and exiting 0, records
@@ -9293,7 +9386,6 @@ Add-Content -LiteralPath $Out -Value $lines
         }
         #[cfg(not(windows))]
         {
-            use std::os::unix::fs::PermissionsExt;
             let path = dir.join(name);
             let report = report.display();
             let body = format!(
@@ -9305,8 +9397,7 @@ Add-Content -LiteralPath $Out -Value $lines
                  echo {CRED_FAKE_SECRET} >&2\n\
                  exit 0\n"
             );
-            std::fs::write(&path, body).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            write_executable_script(&path, &body);
             path
         }
     }
@@ -9397,7 +9488,30 @@ Add-Content -LiteralPath $Out -Value $lines
             .with_ansi(false)
             .with_writer(move || writer.clone())
             .finish();
-        let out = tracing::subscriber::with_default(subscriber, f);
+        // Tracing's callsite `Interest` cache is PROCESS-global. While ours is
+        // the ONLY registered dispatcher, tracing-core takes its `JustOne`
+        // path, which computes a newly registered callsite's interest from the
+        // REGISTERING thread's default alone. So when a parallel cred test
+        // reaches `CredFamilyState::apply`'s `info!`/`debug!` first, it caches
+        // them `never` (its default is `NoSubscriber`) and this capture comes
+        // back empty (observed 3 of 3 runs of `cargo test fleet::tests::cred_`).
+        // Two PROCESS-LIFETIME no-op dispatchers keep tracing-core off that
+        // path for good (`has_just_one` is `len <= 1` over the live set), so
+        // every registration consults every live dispatcher, ours included,
+        // under the dispatcher list's lock, and registering ours rebuilds every
+        // callsite. The explicit rebuild below is a guard for the first call,
+        // before both no-op dispatchers are live.
+        static MULTI_DISPATCH: std::sync::OnceLock<[tracing::Dispatch; 2]> =
+            std::sync::OnceLock::new();
+        MULTI_DISPATCH.get_or_init(|| {
+            std::array::from_fn(|_| {
+                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
+            })
+        });
+        let out = tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            f()
+        });
         let text = String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned();
         (out, text)
     }
@@ -10003,6 +10117,7 @@ Add-Content -LiteralPath $Out -Value $lines
             "host_capabilities",
             "capability_tokens",
             "slow_host_probes",
+            "claude_code_probe",
         ] {
             assert!(
                 !calls_fn(&rest, inline),
@@ -10132,17 +10247,14 @@ Add-Content -LiteralPath $Out -Value $lines
         };
         #[cfg(not(windows))]
         let (shim, budget) = {
-            use std::os::unix::fs::PermissionsExt;
             let path = tmp.path().join("aws");
-            std::fs::write(
+            write_executable_script(
                 &path,
-                format!(
+                &format!(
                     "#!/bin/sh\nsleep 120 &\necho $! >'{}'\nwait\n",
                     pid_file.display()
                 ),
-            )
-            .unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            );
             (path, Duration::from_secs(2))
         };
 
@@ -10230,7 +10342,6 @@ Add-Content -LiteralPath $Out -Value $lines
         }
         #[cfg(not(windows))]
         {
-            use std::os::unix::fs::PermissionsExt;
             let path = dir.join(name);
             let refuse = if accepts_active {
                 String::new()
@@ -10246,8 +10357,7 @@ Add-Content -LiteralPath $Out -Value $lines
                  exit 0\n",
                 log = log.display(),
             );
-            std::fs::write(&path, body).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            write_executable_script(&path, &body);
             path
         }
     }

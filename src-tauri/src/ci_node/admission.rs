@@ -445,34 +445,54 @@ pub(crate) fn repo_allowed(allowlist: &[String], repo: &str) -> bool {
         .any(|entry| entry == repo || entry == basename)
 }
 
-/// Pick the volume holding `root` from a `(mount_point, total_bytes,
-/// available_bytes)` list — longest matching mount wins. Pure for tests; the
-/// live caller feeds it `sysinfo::Disks`.
-pub(crate) fn pick_volume<'a>(
-    mounts: &'a [(PathBuf, u64, u64)],
-    root: &Path,
-) -> Option<&'a (PathBuf, u64, u64)> {
-    mounts
-        .iter()
-        .filter(|(mount, _, _)| root.starts_with(mount))
-        .max_by_key(|(mount, _, _)| mount.as_os_str().len())
+/// One mounted volume, as the runner's single `sysinfo::Disks` enumeration
+/// ([`enumerate_mounts`]) reads it.
+///
+/// A named struct rather than the `(mount_point, total_bytes,
+/// available_bytes)` tuple it replaced, because the fourth reading —
+/// `removable` — would have made a positional `(PathBuf, u64, u64, bool)`
+/// that every consumer has to count into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MountReading {
+    /// Where the volume is mounted (`D:\`, `D:\data\`, `/mnt/data`).
+    pub(crate) mount: PathBuf,
+    pub(crate) total: u64,
+    pub(crate) available: u64,
+    /// `sysinfo::Disk::is_removable()`, whose meaning is per-OS (sysinfo
+    /// 0.32). On Windows it is `GetDriveTypeW == DRIVE_REMOVABLE`. On Linux it
+    /// is any device listed under `/dev/disk/by-id/usb-*`, so a USB SSD
+    /// counts as removable too. It is a bus/media signal, not "unimportant":
+    /// the low-disk alarm skips a removable volume only while nothing the
+    /// runner uses is on it (plan
+    /// `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`
+    /// Phase 7). A small stick holding BIOS files is "under the 25 GiB floor"
+    /// forever, and alarming on it buried the real alarms.
+    pub(crate) removable: bool,
 }
 
-/// Live volume probe for `root`: `(mount_point, total_bytes,
-/// available_bytes)`. `None` when the volume can't be resolved — every caller
-/// fails OPEN with a warning (a telemetry gap must not brick the lane; the
-/// 20 GiB floor is a guard, not a security boundary).
+/// Pick the volume holding `root` from a mount list — longest matching mount
+/// wins. Pure for tests; the live caller feeds it [`enumerate_mounts`].
+pub(crate) fn pick_volume<'a>(mounts: &'a [MountReading], root: &Path) -> Option<&'a MountReading> {
+    mounts
+        .iter()
+        .filter(|m| root.starts_with(&m.mount))
+        .max_by_key(|m| m.mount.as_os_str().len())
+}
+
+/// Live volume probe for `root`. `None` when the volume can't be resolved —
+/// every caller fails OPEN with a warning (a telemetry gap must not brick the
+/// lane; the 20 GiB floor is a guard, not a security boundary).
 ///
 /// One probe site, shared by the disk floor and by the A1 resource sample
 /// (`fleet::resource_sample`), so the number the dashboard renders and the
 /// number the gate trips on are literally the same reading. Two probes of "free
 /// disk" that disagree is how an operator ends up debugging the dashboard
 /// instead of the machine.
-pub(crate) fn probe_volume_for(root: &Path) -> Option<(PathBuf, u64, u64)> {
+pub(crate) fn probe_volume_for(root: &Path) -> Option<MountReading> {
     pick_volume(&enumerate_mounts(), root).cloned()
 }
 
-/// Every mounted volume as `(mount_point, total_bytes, available_bytes)`.
+/// Every mounted volume as a [`MountReading`].
 ///
 /// The single `sysinfo::Disks` enumeration site for the whole runner — split
 /// out of [`probe_volume_for`] so the disk-monitoring publisher
@@ -484,23 +504,22 @@ pub(crate) fn probe_volume_for(root: &Path) -> Option<(PathBuf, u64, u64)> {
 ///
 /// An EMPTY result is a failed/blind probe, not "this machine has no disks" —
 /// callers must render it as UNKNOWN and never as zero free space.
-pub(crate) fn enumerate_mounts() -> Vec<(PathBuf, u64, u64)> {
+pub(crate) fn enumerate_mounts() -> Vec<MountReading> {
     let disks = sysinfo::Disks::new_with_refreshed_list();
     disks
         .list()
         .iter()
-        .map(|d| {
-            (
-                d.mount_point().to_path_buf(),
-                d.total_space(),
-                d.available_space(),
-            )
+        .map(|d| MountReading {
+            mount: d.mount_point().to_path_buf(),
+            total: d.total_space(),
+            available: d.available_space(),
+            removable: d.is_removable(),
         })
         .collect()
 }
 
 fn free_disk_gb_for(root: &Path) -> Option<u64> {
-    probe_volume_for(root).map(|(_, _, avail)| avail / (1024 * 1024 * 1024))
+    probe_volume_for(root).map(|m| m.available / (1024 * 1024 * 1024))
 }
 
 /// Verdict of the pre-build disk gate. `Reject` carries the operator-readable
@@ -1603,29 +1622,39 @@ mod tests {
         );
     }
 
+    /// A fixed (non-removable) [`MountReading`] for the pure volume tests.
+    fn mount(path: &str, total: u64, available: u64) -> MountReading {
+        MountReading {
+            mount: PathBuf::from(path),
+            total,
+            available,
+            removable: false,
+        }
+    }
+
     #[test]
     fn volume_pick_prefers_longest_mount_prefix() {
         let mounts = vec![
-            (PathBuf::from("C:\\"), 20 * GIB, 5 * GIB),
-            (PathBuf::from("D:\\"), 200 * GIB, 100 * GIB),
+            mount("C:\\", 20 * GIB, 5 * GIB),
+            mount("D:\\", 200 * GIB, 100 * GIB),
         ];
         // Windows-shaped paths only resolve on Windows path semantics;
         // use starts_with-compatible shapes for a portable test instead.
         let mounts_portable = vec![
-            (PathBuf::from("/"), 20 * GIB, 5 * GIB),
-            (PathBuf::from("/data"), 200 * GIB, 100 * GIB),
+            mount("/", 20 * GIB, 5 * GIB),
+            mount("/data", 200 * GIB, 100 * GIB),
         ];
         assert_eq!(
-            pick_volume(&mounts_portable, Path::new("/data/qontinui-root")).map(|v| v.2),
+            pick_volume(&mounts_portable, Path::new("/data/qontinui-root")).map(|v| v.available),
             Some(100 * GIB)
         );
         // The sample reports total + mount alongside free, from this same pick.
         assert_eq!(
-            pick_volume(&mounts_portable, Path::new("/data/qontinui-root")).map(|v| v.1),
+            pick_volume(&mounts_portable, Path::new("/data/qontinui-root")).map(|v| v.total),
             Some(200 * GIB)
         );
         assert_eq!(
-            pick_volume(&mounts_portable, Path::new("/home/x")).map(|v| v.2),
+            pick_volume(&mounts_portable, Path::new("/home/x")).map(|v| v.available),
             Some(5 * GIB)
         );
         assert_eq!(
@@ -1654,13 +1683,14 @@ mod tests {
     #[test]
     fn external_mount_inside_the_root_wins_the_longest_prefix() {
         let mounts = vec![
-            (PathBuf::from("/data"), 4000 * GIB, 100 * GIB), // internal, nearly full
-            (PathBuf::from("/data/qontinui-ext"), 4000 * GIB, 3900 * GIB), // external
+            mount("/data", 4000 * GIB, 100 * GIB), // internal, nearly full
+            mount("/data/qontinui-ext", 4000 * GIB, 3900 * GIB), // external
         ];
         // A path on the external mount resolves to the EXTERNAL volume's free
         // space, not the internal one it is nested inside.
         assert_eq!(
-            pick_volume(&mounts, Path::new("/data/qontinui-ext/targets/coord")).map(|v| v.2),
+            pick_volume(&mounts, Path::new("/data/qontinui-ext/targets/coord"))
+                .map(|v| v.available),
             Some(3900 * GIB),
             "the longer mount prefix must win — otherwise every external path \
              would report the internal volume's free space"
@@ -1671,7 +1701,7 @@ mod tests {
                 &mounts,
                 Path::new("/data/qontinui-root/qontinui-coord/target")
             )
-            .map(|v| v.2),
+            .map(|v| v.available),
             Some(100 * GIB)
         );
     }

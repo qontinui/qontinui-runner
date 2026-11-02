@@ -88,7 +88,9 @@ mod tests {
             // 535 -> 533: pr_watch_ops.rs `upsert_pr_watch_state` and
             // `get_pr_watch_token_for_task` deleted with the plaintext PR-watch
             // token slot (coord finding e871ac27).
-            baseline: 533,
+            // 533 -> 531: `get_active_pr_watches` and `has_review_subtask_for_pr`
+            // deleted with the PR-watch chain, which had no writer left.
+            baseline: 531,
             gate_wiring: &[
                 ("clippy.toml", "disallowed-methods"),
                 ("clippy.toml", "tokio_postgres::Row::get"),
@@ -123,7 +125,9 @@ mod tests {
             // token and the GitHub review post were deleted (coord finding
             // e871ac27), 430 -> 428 measured. The other 4 were slack left when
             // 93a2ca093 pinned 434 against a measured 430.
-            baseline: 428,
+            // 428 -> 424: the PR-watch chain deleted, which took 2 attributes;
+            // the other 2 were slack, 426 measured before the deletion.
+            baseline: 424,
             gate_wiring: &[
                 ("src-tauri/Cargo.toml", "string_slice = { level = \"deny\""),
                 (
