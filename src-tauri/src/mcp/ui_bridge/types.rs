@@ -577,39 +577,36 @@ impl UiBridgeError {
     /// `knownTabs` prior art: the context carries the accepted-action list so
     /// callers can self-correct without an extra round-trip.
     ///
-    /// With `element_id`, `accepted` is THAT element's own list (built-ins it
-    /// advertises plus its registered custom actions), not the global one.
-    /// The context gains `didYouMean` and `paramsHint` when a synonym or a
-    /// case-only fix the element accepts exists (see
-    /// [`super::action_vocabulary`]), following `type_param_invalid`'s
-    /// `didYouMean` shape.
+    /// `accepted` is `element_id`'s own list (built-ins it advertises plus its
+    /// registered custom actions), not the global one. The context gains
+    /// `didYouMean` and `paramsHint` when a synonym or a spelling-only fix the
+    /// element accepts exists (see [`super::action_vocabulary`]), following
+    /// `type_param_invalid`'s `didYouMean` shape.
     pub fn invalid_action<S: AsRef<str>>(
         unknown: &str,
-        element_id: Option<&str>,
+        element_id: &str,
         accepted: &[S],
         requested_params: Option<&serde_json::Value>,
     ) -> Self {
         let names: Vec<&str> = accepted.iter().map(AsRef::as_ref).collect();
-        let mut message = match element_id {
-            Some(id) => format!(
+        let mut message = if names.is_empty() {
+            format!(
+                "Unknown action '{}' for element '{}'. This element advertises no actions.",
+                unknown, element_id
+            )
+        } else {
+            format!(
                 "Unknown action '{}' for element '{}'. This element accepts: {}.",
                 unknown,
-                id,
+                element_id,
                 names.join(", ")
-            ),
-            None => format!(
-                "Unknown action '{}'. Supported actions: {}.",
-                unknown,
-                names.join(", ")
-            ),
+            )
         };
         let mut context = serde_json::json!({
             "action": unknown,
+            "elementId": element_id,
             "supportedActions": names,
         });
-        if let Some(id) = element_id {
-            context["elementId"] = serde_json::Value::String(id.to_string());
-        }
         if let Some(suggestion) =
             super::action_vocabulary::ActionSuggestion::resolve(unknown, accepted, requested_params)
         {
