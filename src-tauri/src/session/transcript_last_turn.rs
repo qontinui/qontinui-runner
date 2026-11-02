@@ -15,8 +15,11 @@
 //! ## Why the turn and not the file's mtime
 //!
 //! A file's mtime records the last WRITE, and not every write is a turn:
-//! Claude Code appends non-turn lines (summaries, progress records, harness
-//! `isMeta` lines) to a transcript, and an account migration COPIES the whole
+//! Claude Code appends many non-turn lines to a transcript — `last-prompt`,
+//! `attachment`, `permission-mode`, `queue-operation`, `ai-title` and
+//! `custom-title` records, and harness-injected `isMeta` user lines (each seen
+//! in the 400 most recently written transcripts on one Linux fleet box,
+//! 2026-11-02) — and an account migration COPIES the whole
 //! file into another root, giving the copy a fresh mtime while it holds only
 //! old turns. Either would make an idle or superseded copy look newest. The
 //! mtime is used here only as half of the cache key — a changed key costs one
@@ -200,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn the_newest_real_turn_wins_and_meta_and_summary_lines_do_not_count() {
+    fn the_newest_real_turn_wins_and_meta_and_record_lines_do_not_count() {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("a.jsonl");
         write(
@@ -211,8 +214,9 @@ mod tests {
                 // A harness-injected meta line is not a turn.
                 r#"{"type":"user","isMeta":true,"timestamp":"2026-10-01T11:00:00.000Z"}"#
                     .to_string(),
-                // Neither is a summary.
-                r#"{"type":"summary","timestamp":"2026-10-01T12:00:00.000Z"}"#.to_string(),
+                // Nor is a bookkeeping record appended after the last turn.
+                r#"{"type":"last-prompt","timestamp":"2026-10-01T12:00:00.000Z"}"#.to_string(),
+                r#"{"type":"queue-operation","timestamp":"2026-10-01T12:30:00.000Z"}"#.to_string(),
             ],
         );
         let got = last_turn_ms(&p, stamp_of(&p), &mut ReadBudget::Unbounded);
@@ -223,7 +227,7 @@ mod tests {
     fn a_file_with_no_turn_line_reads_as_none_not_as_unreadable() {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("b.jsonl");
-        write(&p, &[r#"{"type":"summary"}"#.to_string()]);
+        write(&p, &[r#"{"type":"permission-mode"}"#.to_string()]);
         assert_eq!(
             last_turn_ms(&p, stamp_of(&p), &mut ReadBudget::Unbounded),
             TurnRead::Read(None)
@@ -239,9 +243,9 @@ mod tests {
     fn a_turn_beyond_the_first_window_is_found_by_the_wide_retry() {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("c.jsonl");
-        // One tool-result line larger than TAIL_FIRST after the last turn.
+        // One non-turn record larger than TAIL_FIRST after the last turn.
         let huge = format!(
-            r#"{{"type":"progress","data":"{}"}}"#,
+            r#"{{"type":"attachment","data":"{}"}}"#,
             "y".repeat(usize::try_from(TAIL_FIRST).unwrap() + 1024)
         );
         write(&p, &[line("assistant", "2026-10-02T09:00:00.000Z"), huge]);

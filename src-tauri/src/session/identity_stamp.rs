@@ -61,7 +61,11 @@
 //!   Persisted beside the session ledger
 //!   ([`watermark_path`]), at most every [`PERSIST_EVERY`] or after a full
 //!   window of first reports: losing the tail of it only re-sends rows coord
-//!   upserts idempotently.
+//!   upserts idempotently. Entries for ids the walk no longer sees are pruned
+//!   only by a walk that read as many account roots as the persisted
+//!   high-water mark ([`Watermark::prune`]), so an unreadable home — even on
+//!   the first pass after a runner start — is never read as its sessions
+//!   being gone.
 //! - **Responses.** `2xx` advances the watermark. `503
 //!   session_identity_unavailable` (the columns are not deployed) is retried
 //!   next pass and NEVER marks a row reported. `404` means the door itself is
@@ -129,6 +133,11 @@ pub const BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
 
 /// The longest a dirty watermark waits before it is written.
 pub const PERSIST_EVERY: Duration = Duration::from_secs(30 * 60);
+
+/// How long the directory walk must keep reading FEWER account roots than the
+/// recorded high-water mark before the smaller set is accepted as the box's
+/// real roster (an account home removed for good) and pruning resumes.
+pub const ROOTS_SHORTFALL_ACCEPTED_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
 const POST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -410,11 +419,21 @@ struct WatermarkEntry {
     reported_at_ms: i64,
 }
 
-/// Per-id record of what coord has accepted, and when.
+/// Per-id record of what coord has accepted, and when — plus the prune guard's
+/// root count, persisted beside it so a runner start does not reset the bar.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Watermark {
     version: u32,
     entries: BTreeMap<String, WatermarkEntry>,
+    /// The most account roots a walk has read while this watermark was kept.
+    /// `#[serde(default)]`: a file written before the guard existed loads with
+    /// `0`, which the first full walk raises.
+    #[serde(default)]
+    roots_high_water: usize,
+    /// When walks first started reading fewer roots than
+    /// [`Self::roots_high_water`] (unix ms); cleared by a full walk.
+    #[serde(default)]
+    roots_short_since_ms: Option<i64>,
 }
 
 impl Default for Watermark {
@@ -422,6 +441,8 @@ impl Default for Watermark {
         Self {
             version: WATERMARK_VERSION,
             entries: BTreeMap::new(),
+            roots_high_water: 0,
+            roots_short_since_ms: None,
         }
     }
 }
@@ -490,6 +511,34 @@ impl Watermark {
             );
         }
         first
+    }
+
+    /// Drop entries for ids a walk no longer saw — but ONLY when that walk
+    /// read at least as many account roots as the recorded high-water mark.
+    ///
+    /// An empty or partial walk (a root unreadable this pass, an unmounted
+    /// home) is a smaller VIEW, not proof the sessions are gone; pruning on it
+    /// would re-send every row of that root once it reappears. The mark is
+    /// persisted with the watermark, so a root that is unreadable on the first
+    /// pass after a runner start is guarded too. A shortfall that lasts
+    /// [`ROOTS_SHORTFALL_ACCEPTED_AFTER`] is accepted as the box's real roster
+    /// (a home removed for good), so the guard can never freeze pruning
+    /// forever. Returns how many entries were dropped.
+    pub fn prune(&mut self, known: &HashSet<String>, roots_scanned: usize, now_ms: i64) -> usize {
+        if roots_scanned == 0 {
+            return 0;
+        }
+        if roots_scanned < self.roots_high_water {
+            let since = *self.roots_short_since_ms.get_or_insert(now_ms);
+            let accepted_after =
+                i64::try_from(ROOTS_SHORTFALL_ACCEPTED_AFTER.as_millis()).unwrap_or(i64::MAX);
+            if now_ms.saturating_sub(since) < accepted_after {
+                return 0;
+            }
+        }
+        self.roots_high_water = roots_scanned;
+        self.roots_short_since_ms = None;
+        self.retain_ids(known)
     }
 
     /// Drop entries for ids neither the index nor the registry knows any more
@@ -630,9 +679,6 @@ pub struct Reporter {
     dirty: bool,
     first_reports_since_persist: usize,
     last_persist: Option<Instant>,
-    /// The most account roots any pass in this process has read — the bar a
-    /// pass must meet before its absence of an id counts as the id being gone.
-    roots_high_water: usize,
 }
 
 impl Default for Reporter {
@@ -647,7 +693,6 @@ impl Default for Reporter {
             dirty: false,
             first_reports_since_persist: 0,
             last_persist: None,
-            roots_high_water: 0,
         }
     }
 }
@@ -706,23 +751,18 @@ impl Reporter {
         }
     }
 
-    /// Drop watermark entries for ids this pass no longer saw — but ONLY when
-    /// the walk read at least as many account roots as any earlier pass in
-    /// this process. An empty or partial read (a root unreadable this pass, an
-    /// unmounted home) is a smaller view, not proof the sessions are gone;
-    /// pruning on it would re-send every row of that root once it reappears.
-    /// The bar is in memory, so a root removed for good stops pruning only
-    /// until the next runner start. Returns how many entries were dropped.
-    fn prune_watermark(&mut self, known: &HashSet<String>, roots_scanned: usize) -> usize {
-        if roots_scanned == 0 || roots_scanned < self.roots_high_water {
-            return 0;
-        }
-        self.roots_high_water = roots_scanned;
-        let dropped = self
-            .watermark
-            .get_or_insert_with(Watermark::default)
-            .retain_ids(known);
-        if dropped > 0 {
+    /// [`Watermark::prune`], marking the watermark dirty when it changed at
+    /// all — a moved root mark must be persisted as much as a dropped entry.
+    fn prune_watermark(
+        &mut self,
+        known: &HashSet<String>,
+        roots_scanned: usize,
+        now_ms: i64,
+    ) -> usize {
+        let wm = self.watermark.get_or_insert_with(Watermark::default);
+        let before = (wm.roots_high_water, wm.roots_short_since_ms);
+        let dropped = wm.prune(known, roots_scanned, now_ms);
+        if dropped > 0 || (wm.roots_high_water, wm.roots_short_since_ms) != before {
             self.dirty = true;
         }
         dropped
@@ -838,7 +878,11 @@ impl Reporter {
             return PassState::Build;
         };
 
-        self.prune_watermark(&candidates.known_ids, candidates.roots_scanned);
+        self.prune_watermark(
+            &candidates.known_ids,
+            candidates.roots_scanned,
+            Utc::now().timestamp_millis(),
+        );
         let wm = self.watermark.get_or_insert_with(Watermark::default);
         let batch = wm.select(&candidates.rows, self.window, &self.quarantine);
         debug!(
@@ -1518,17 +1562,90 @@ mod tests {
         let only_a: HashSet<String> = [SID_A.to_string()].into();
 
         // A full read of three roots sets the bar; nothing is missing yet.
-        assert_eq!(r.prune_watermark(&both, 3), 0);
+        assert_eq!(r.prune_watermark(&both, 3, 1_000), 0);
+        assert!(r.dirty, "a raised root mark is persisted");
+        r.dirty = false;
         // An empty walk saw nothing: absence is not evidence.
-        assert_eq!(r.prune_watermark(&HashSet::new(), 0), 0);
+        assert_eq!(r.prune_watermark(&HashSet::new(), 0, 2_000), 0);
         // A partial walk (one root unreadable) does not prune B either.
-        assert_eq!(r.prune_watermark(&only_a, 2), 0);
+        assert_eq!(r.prune_watermark(&only_a, 2, 3_000), 0);
         assert_eq!(r.watermark.as_ref().unwrap().len(), 2);
-        assert!(!r.dirty);
         // A walk as wide as the bar that still lacks B: B is gone.
-        assert_eq!(r.prune_watermark(&only_a, 3), 1);
+        assert_eq!(r.prune_watermark(&only_a, 3, 4_000), 1);
         assert_eq!(r.watermark.as_ref().unwrap().len(), 1);
         assert!(r.dirty);
+    }
+
+    #[test]
+    fn the_root_mark_survives_a_runner_start_and_an_old_file_without_it_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(WATERMARK_FILE);
+        let mut wm = Watermark::default();
+        wm.record_sent(
+            &[
+                row(SID_A, "2026-10-19T09:00:00.000Z"),
+                row(SID_B, "2026-10-19T09:00:00.000Z"),
+            ],
+            1,
+        );
+        let both: HashSet<String> = [SID_A.to_string(), SID_B.to_string()].into();
+        assert_eq!(wm.prune(&both, 3, 1_000), 0);
+        write_watermark(&path, &wm).unwrap();
+
+        // A runner start: a FRESH reporter loads the file, and its first walk
+        // reads one root fewer. Without the persisted mark that first walk
+        // would set the bar at 2 and prune B.
+        let mut r = Reporter {
+            watermark: Some(load_watermark(&path)),
+            ..Reporter::default()
+        };
+        let only_a: HashSet<String> = [SID_A.to_string()].into();
+        assert_eq!(r.prune_watermark(&only_a, 2, 2_000), 0);
+        assert_eq!(r.watermark.as_ref().unwrap().len(), 2);
+
+        // A file written before the guard existed has no mark: it loads (not
+        // as an empty watermark), and its first full walk sets the bar.
+        let old = format!(
+            r#"{{"version":{WATERMARK_VERSION},"entries":{{"{SID_A}":{{"facts":{{"config_dir":"/h/.claude-q","tag_name":null,"last_acted_at":null,"registry_name":null}},"reported_at_ms":1}}}}}}"#
+        );
+        fs::write(&path, old).unwrap();
+        let loaded = load_watermark(&path);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.roots_high_water, 0);
+    }
+
+    #[test]
+    fn a_shortfall_that_lasts_a_day_is_accepted_as_the_real_roster() {
+        let day = i64::try_from(ROOTS_SHORTFALL_ACCEPTED_AFTER.as_millis()).unwrap();
+        let mut wm = Watermark::default();
+        wm.record_sent(
+            &[
+                row(SID_A, "2026-10-19T09:00:00.000Z"),
+                row(SID_B, "2026-10-19T09:00:00.000Z"),
+            ],
+            1,
+        );
+        let both: HashSet<String> = [SID_A.to_string(), SID_B.to_string()].into();
+        let only_a: HashSet<String> = [SID_A.to_string()].into();
+        assert_eq!(wm.prune(&both, 3, 0), 0);
+        // A home disappears: held for a day, then accepted.
+        assert_eq!(wm.prune(&only_a, 2, 10), 0);
+        assert_eq!(wm.prune(&only_a, 2, 10 + day - 1), 0);
+        assert_eq!(wm.prune(&only_a, 2, 10 + day), 1);
+        assert_eq!(wm.roots_high_water, 2);
+        assert_eq!(wm.roots_short_since_ms, None);
+        // A full walk in between resets the clock.
+        let mut wm2 = Watermark::default();
+        wm2.record_sent(&[row(SID_B, "2026-10-19T09:00:00.000Z")], 1);
+        assert_eq!(wm2.prune(&both, 3, 0), 0);
+        assert_eq!(wm2.prune(&only_a, 2, 10), 0);
+        assert_eq!(wm2.prune(&both, 3, 20), 0);
+        assert_eq!(
+            wm2.prune(&only_a, 2, 10 + day),
+            0,
+            "the shortfall restarted at 10 + day"
+        );
+        assert_eq!(wm2.len(), 1);
     }
 
     #[test]
