@@ -147,10 +147,13 @@ gen_events_registry_parse() {
 # never sees. The check is deliberately coarse: a `path =` in a comment or in
 # unrelated code also fails it, and failing only costs the per-file rule.
 #
-# It also refuses an `extern crate .. as <a crate the registry reader trusts>`,
-# which would make that name mean something else across the whole crate. This
-# crate does use the form (`extern crate self as qontinui_runner_lib`), so only
-# the trusted names are refused.
+# It also refuses every `extern` but the one line this crate is known to need,
+# `extern crate self as qontinui_runner_lib;`. An `extern crate .. as <name>`
+# rebinds that name across the whole crate, so one naming a crate the registry
+# reader trusts would make its "external" verdict false. An allowlist rather
+# than a pattern for the bad form: a comment or a raw identifier between the
+# tokens (`.. /* c */ as r#qontinui_types`) walks past a pattern. A comment
+# mentioning the word also fails it, which only costs the per-file rule.
 #
 # `grep >/dev/null`, never `grep -q`: the caller runs under pipefail, and a
 # `-q` that exits on its first match can SIGPIPE the writer and turn a match
@@ -162,8 +165,8 @@ _gen_events_lib_rs_premise() {
     if printf '%s\n' "$content" | grep -E '(^|[^A-Za-z0-9_])path[[:space:]]*=' >/dev/null; then
         return 1
     fi
-    if printf '%s\n' "$content" | tr '\n' ' ' \
-        | grep -E '(^|[^A-Za-z0-9_])extern[[:space:]]+crate[[:space:]]+[A-Za-z0-9_]+[[:space:]]+as[[:space:]]+(qontinui_types|qontinui_vision_core|serde_json|schemars)([^A-Za-z0-9_]|$)' >/dev/null; then
+    if printf '%s\n' "$content" | grep -vE '^[[:space:]]*extern crate self as qontinui_runner_lib;[[:space:]]*$' \
+        | grep -E '(^|[^A-Za-z0-9_])extern([^A-Za-z0-9_]|$)' >/dev/null; then
         return 1
     fi
     return 0
