@@ -702,6 +702,32 @@ pub fn claude_left(outcome: &GracefulExitOutcome) -> bool {
     )
 }
 
+/// Exit a pane, ending the stray wait loops it leaves behind.
+///
+/// A stray background shell leads its own session and group, so no pane exit
+/// reaches it. It was discounted to let this session close, and left alone it would
+/// run on for ever with nothing left to report it. So: record it FIRST, while it is
+/// still under its `claude`; and end it only once `claude` is gone, because a shell
+/// it still owns is its own to end.
+async fn exit_ending_strays<Strays, EndFut>(
+    record: impl std::future::Future<Output = Strays>,
+    exit: impl std::future::Future<Output = Result<GracefulExitOutcome, String>>,
+    end: impl FnOnce(Strays) -> EndFut,
+    mut log: impl FnMut(&str),
+) -> Result<GracefulExitOutcome, String>
+where
+    EndFut: std::future::Future<Output = Vec<String>>,
+{
+    let strays = record.await;
+    let outcome = exit.await?;
+    if claude_left(&outcome) {
+        for line in end(strays).await {
+            log(&line);
+        }
+    }
+    Ok(outcome)
+}
+
 /// PURE: did this exit attempt POSITIVELY OBSERVE a `claude` in the pane?
 ///
 /// B4-1's evidence. The steward registry needs to know a pane was once
@@ -1562,11 +1588,25 @@ impl CloseEffects for LiveCloseEffects<'_> {
             "wind_down_executor: graceful /exit — eligible past grace"
         );
 
-        // The ONE way this module reaches a pane. Never `TerminalManager::close`.
-        let outcome = self
-            .manager
-            .graceful_exit(terminal_id, EXIT_DEADLINE)
-            .await?;
+        // Only the panes the pass discounted a stray from: every other close reads
+        // nothing extra. A shell not discounted there was work, and this close
+        // would not have been admitted.
+        let claudes: Vec<u32> = self
+            .pass
+            .report
+            .terminal_hosted
+            .iter()
+            .filter(|p| p.session_id.as_deref() == Some(session_id) && p.stray_wait_shells > 0)
+            .map(|p| p.pid)
+            .collect();
+        let outcome = exit_ending_strays(
+            crate::session::stray_wait::record_strays(claudes),
+            // The ONE way this module reaches a pane. Never `TerminalManager::close`.
+            self.manager.graceful_exit(terminal_id, EXIT_DEADLINE),
+            crate::session::stray_wait::end_strays,
+            |line| info!(session_id = %session_id, terminal_id = %terminal_id, "wind_down_executor: {line}"),
+        )
+        .await?;
         if matches!(outcome, GracefulExitOutcome::Exited { .. }) {
             info!(session_id = %session_id, terminal_id = %terminal_id, ?kind, "wind_down_executor: closed");
         } else {
@@ -2142,6 +2182,7 @@ mod tests {
                 kind: SessionKind::Terminal,
                 custody: None,
             }),
+            stray_wait_shells: 0,
         }
     }
 
@@ -2353,6 +2394,51 @@ mod tests {
             kind: SessionKind::Terminal,
             custody: None,
         }
+    }
+
+    /// Recorded before the exit, ended after it, and only when `claude` left.
+    #[tokio::test]
+    async fn strays_are_recorded_before_the_exit_and_ended_only_after_claude_left() {
+        let run = |outcome: Result<GracefulExitOutcome, String>| async move {
+            let order = std::cell::RefCell::new(Vec::new());
+            let lines = std::cell::RefCell::new(Vec::new());
+            let result = exit_ending_strays(
+                async {
+                    order.borrow_mut().push("record");
+                    vec![7u32]
+                },
+                async {
+                    order.borrow_mut().push("exit");
+                    outcome
+                },
+                |strays: Vec<u32>| {
+                    order.borrow_mut().push("end");
+                    async move { vec![format!("ended {strays:?}")] }
+                },
+                |line| lines.borrow_mut().push(line.to_string()),
+            )
+            .await;
+            (result.is_ok(), order.into_inner(), lines.into_inner())
+        };
+        assert_eq!(
+            run(Ok(exited())).await,
+            (
+                true,
+                vec!["record", "exit", "end"],
+                vec!["ended [7]".to_string()]
+            )
+        );
+        // `claude` is still there: every shell under it is still its own.
+        let stuck = GracefulExitOutcome::ExitStuck {
+            waited_ms: 10,
+            claude_pids: vec![42],
+            last_probe_unreadable: false,
+        };
+        assert_eq!(run(Ok(stuck)).await, (true, vec!["record", "exit"], vec![]));
+        assert_eq!(
+            run(Err("no such pane".to_string())).await,
+            (false, vec!["record", "exit"], vec![])
+        );
     }
 
     fn exited() -> GracefulExitOutcome {
