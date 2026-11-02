@@ -87,6 +87,36 @@ Two shapes:
    `[]` means coord looked and found none. For a PR with **no card at all**
    the HTTP twin is `GET /coord/agent-pr-labels?repo=<owner/name>&pr_number=<n>`
    (device or agent JWT; `coord-read.ps1 labels` in the `coord` Agent Skill).
+
+   Always print supersession, read from `superseded_by_status` first. A
+   declaration is intent, not proof that this PR's code landed, so a line never
+   says more than its fields. On `recorded`, print one line per `superseded_by`
+   entry, and always print one line per `superseded_by_refused` entry. Each is a
+   single line, whatever its length:
+
+   ```
+   declared successor: <successor> (<successor_state>, read <successor_read>, successor land <successor_land_stamp>, content <content.tree>, <content.identical>/<content.paths> paths identical) — verify content before closing
+   refused successor: <successor> (<arm>, <author_association>, refused <refused_at>, <successor_state>, read <successor_read>, successor land <successor_land_stamp>) — verify content by hand
+   ```
+
+   Inside either line, any field that is `null` or missing prints `?`, never a
+   guess. `successor land` is the successor's land, not proof this PR's code is
+   on the base, and `content noop` alone is not equivalence: print the counts
+   beside it.
+
+   The other values of `superseded_by_status`, each printed as a single line:
+
+   - `none_recorded`: `superseded by: none recorded (UNKNOWN, not "not
+     superseded")`.
+   - `read_failed`: `superseded by: ? UNKNOWN (read failed)`.
+   - No such key (a coord build predating it): `superseded by: ? UNKNOWN (older
+     coord)`.
+   - `null` or any other value: `superseded by: ? UNKNOWN (unrecognised status
+     <value>)`.
+
+   `superseded_by_refused: []` prints nothing. `null` prints
+   `refused successor: ? UNKNOWN (read failed)`, and a card with no such key
+   prints `refused successor: ? UNKNOWN (older coord)`.
 4. **Never cache the result in memory.** The whole point is that this read is
    always fresh and self-describing. If you want to record something durable
    about the PR, record the **narrative** (why it exists, its recurring failure
