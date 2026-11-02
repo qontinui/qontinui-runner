@@ -25,6 +25,13 @@
 //! the settled screen the old `bool` gate threw away — went in that plan's
 //! post-merge follow-up. So there is now exactly one indicator list to extend
 //! and one place the two-read rule lives.
+//!
+//! [`snapshot_shows_dialog`] is a separate conjunct, not part of the idle
+//! predicate: a Claude Code dialog (workspace trust, a permission prompt)
+//! reads idle to it, so a caller about to TYPE into the session checks both.
+//! The looping-agent supervisor does; `terminal::graceful_exit`'s prompt-ready
+//! checks scan the same [`DIALOG_CHROME_MARKERS`] within the same
+//! [`DIALOG_SCAN_ROWS`], anchored on the cursor row it has and this does not.
 
 /// Working/processing indicators that mean Claude is mid-turn. If ANY appears
 /// on the rendered screen the terminal is NOT idle. Lowercased before match.
@@ -90,6 +97,86 @@ pub fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
 
     // (4) cursor in the input area (at/below the prompt row).
     (cursor_row as usize) >= prompt_row
+}
+
+/// Key hints Claude Code prints beneath a dialog's choices — its own CHROME,
+/// not prose, so they do not turn up in an ordinary finished turn. Shared with
+/// `terminal::graceful_exit`'s prompt-ready checks, which scan for the same
+/// hints. Lowercased before match.
+pub const DIALOG_CHROME_MARKERS: &[&str] = &["esc to cancel", "enter to confirm"];
+
+/// Literal text of Claude Code's workspace-trust dialog (both the current
+/// "Quick safety check" wording and the older "Do you trust the files" one).
+/// Lowercased before match.
+pub const TRUST_DIALOG_MARKERS: &[&str] = &[
+    "yes, i trust this folder",
+    "quick safety check",
+    "do you trust the files in this folder",
+];
+
+/// How many rows above the prompt/cursor a dialog-text scan reads: a dialog
+/// prints its question and hints around its choices, while an idle turn's
+/// transcript sits further up. The ONE value, shared with
+/// `terminal::graceful_exit`'s prompt-ready scan.
+pub const DIALOG_SCAN_ROWS: usize = 8;
+
+/// Does the rendered screen show a Claude Code DIALOG — the workspace-trust
+/// dialog, a tool-permission prompt, or any other select-one-of-N screen —
+/// rather than the empty input prompt? Returns the marker that decided it.
+///
+/// [`snapshot_looks_idle`] cannot tell them apart: a dialog paints no
+/// working indicator, and its selection pointer is the same `❯` glyph as the
+/// input caret, so the trust dialog reads as an idle prompt. That is the
+/// defect in coord finding `9089767f`: the looping-agent supervisor judged the
+/// trust dialog idle and typed its cycle nudge into it; the nudge's
+/// keystrokes answered the dialog with "No, exit" and `claude` exited.
+/// Anything that is about to TYPE into a session (and press Enter) must check
+/// this as well as idleness.
+///
+/// Both signals are anchored on the LAST `❯` row — the live input caret or
+/// the dialog's selection pointer, whichever is painted at the bottom — so
+/// transcript text higher up (a quoted dialog, an echoed `❯ 1. …` line) is
+/// not mistaken for a live dialog:
+/// 1. That row's text is a numbered choice (`❯ 1. Yes, I trust this folder`,
+///    `❯ 1. Yes`) — the selected option of a dialog.
+/// 2. Dialog chrome ([`DIALOG_CHROME_MARKERS`]) or trust-dialog text
+///    ([`TRUST_DIALOG_MARKERS`]) at or below a point [`DIALOG_SCAN_ROWS`]
+///    rows above that row (the whole screen when there is no `❯`).
+pub fn snapshot_shows_dialog(lines: &[String]) -> Option<&'static str> {
+    let last_prompt = lines.iter().rposition(|l| l.contains(PROMPT_MARKER));
+    if last_prompt
+        .and_then(|r| lines.get(r))
+        .is_some_and(|l| prompt_row_is_numbered_choice(l))
+    {
+        return Some("selected numbered choice on a `❯` row");
+    }
+    let first = last_prompt
+        .map(|r| r.saturating_sub(DIALOG_SCAN_ROWS))
+        .unwrap_or(0);
+    for line in lines.iter().skip(first) {
+        let lower = line.to_lowercase();
+        if let Some(m) = DIALOG_CHROME_MARKERS
+            .iter()
+            .chain(TRUST_DIALOG_MARKERS)
+            .find(|m| lower.contains(*m))
+        {
+            return Some(m);
+        }
+    }
+    None
+}
+
+/// `❯ 1. …`: the `❯` marker followed (after whitespace) by digits and `. `.
+fn prompt_row_is_numbered_choice(line: &str) -> bool {
+    let Some((_, after)) = line.split_once(PROMPT_MARKER) else {
+        return false;
+    };
+    let body = after.trim_start_matches(|c: char| c.is_whitespace());
+    let digits = body.chars().take_while(|c| c.is_ascii_digit()).count();
+    digits > 0
+        && body
+            .get(digits..)
+            .is_some_and(|rest| rest.starts_with(". "))
 }
 
 /// Context-low grid markers. The percentage form
@@ -258,6 +345,114 @@ mod tests {
         // A just-spawned tab (blank grid) must read NOT idle — conservative.
         assert!(!snapshot_looks_idle(&lines(&["", "", ""]), 0));
         assert!(!snapshot_looks_idle(&[], 0));
+    }
+
+    // ── snapshot_shows_dialog ────────────────────────────────────────────
+
+    /// Claude Code's workspace-trust dialog as the runner's grid renders it
+    /// (coord finding `9089767f`): literal rows, cursor parked on the
+    /// selected choice (row 13).
+    fn trust_dialog() -> Vec<String> {
+        lines(&[
+            "────────────────────────────────────────────────────────────────",
+            " Accessing workspace:",
+            "",
+            " C:\\Users\\jspin\\.qontinui\\runner\\looping-agents\\merge-shepherd",
+            "",
+            " Quick safety check: Is this a project you created or one you trust? (Like your",
+            " own code, a well-known open source project, or work from your team). If not,",
+            " take a moment to review what's in this folder first.",
+            "",
+            " Claude Code'll be able to read, edit, and execute files here.",
+            "",
+            " Security guide",
+            "",
+            " ❯ 1. Yes, I trust this folder",
+            "   2. No, exit",
+            "",
+            " Enter to confirm · Esc to cancel",
+        ])
+    }
+
+    #[test]
+    fn the_trust_dialog_fools_the_idle_predicate_but_is_a_dialog() {
+        let grid = trust_dialog();
+        // The defect: no working indicator, a `❯` row, cursor on it => "idle".
+        assert!(snapshot_looks_idle(&grid, 13));
+        // The guard: it is a dialog, so nothing may type Enter into it.
+        assert_eq!(
+            snapshot_shows_dialog(&grid),
+            Some("selected numbered choice on a `❯` row")
+        );
+    }
+
+    #[test]
+    fn the_trust_dialog_is_caught_by_its_text_without_the_pointer_row() {
+        // A renderer that drew the selection differently still prints the
+        // dialog's own text and chrome.
+        let mut grid = trust_dialog();
+        grid[13] = "   1. Yes, I trust this folder".to_string();
+        assert_eq!(snapshot_shows_dialog(&grid), Some("quick safety check"));
+        grid[5] = String::new();
+        assert_eq!(
+            snapshot_shows_dialog(&grid),
+            Some("yes, i trust this folder")
+        );
+        grid[13] = String::new();
+        assert_eq!(snapshot_shows_dialog(&grid), Some("esc to cancel"));
+    }
+
+    #[test]
+    fn a_permission_prompt_is_a_dialog() {
+        let grid = lines(&[
+            " Bash command",
+            "   gh pr list --state open",
+            " Do you want to proceed?",
+            " ❯ 1. Yes",
+            "   2. Yes, and don't ask again for gh commands in this project",
+            "   3. No, and tell Claude what to do differently (esc)",
+        ]);
+        assert!(snapshot_looks_idle(&grid, 3));
+        assert_eq!(
+            snapshot_shows_dialog(&grid),
+            Some("selected numbered choice on a `❯` row")
+        );
+    }
+
+    #[test]
+    fn the_idle_input_prompt_is_not_a_dialog() {
+        let grid = lines(&[
+            "● Cycle 12 complete — 3 PRs shepherded, journal updated.",
+            "1. First, run the tests",
+            "╭──────────────────────────────────────────╮",
+            "│ ❯                                          │",
+            "╰──────────────────────────────────────────╯",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+        ]);
+        assert!(snapshot_looks_idle(&grid, 3));
+        assert_eq!(snapshot_shows_dialog(&grid), None);
+        // A typed draft that happens to start with a digit is not `1. ` shaped.
+        let mut draft = grid.clone();
+        draft[3] = "│ ❯ 12 PRs                                  │".to_string();
+        assert_eq!(snapshot_shows_dialog(&draft), None);
+    }
+
+    #[test]
+    fn dialog_text_quoted_far_up_the_transcript_is_not_a_dialog() {
+        let mut rows = vec!["the dialog said: Enter to confirm · Esc to cancel".to_string()];
+        rows.extend((0..10).map(|i| format!("transcript line {i}")));
+        rows.push("│ ❯                                          │".to_string());
+        assert_eq!(snapshot_shows_dialog(&rows), None);
+        // An echoed `❯ 1. …` line up in the transcript is not the live row.
+        let echoed = lines(&[
+            "❯ 1. Fix the flaky test",
+            "● Done.",
+            "│ ❯                                          │",
+        ]);
+        assert_eq!(snapshot_shows_dialog(&echoed), None);
+        // ...but the same text within reach of the prompt is.
+        let near = lines(&["Enter to confirm · Esc to cancel", "│ ❯ │"]);
+        assert_eq!(snapshot_shows_dialog(&near), Some("esc to cancel"));
     }
 
     // ── snapshot_context_low ─────────────────────────────────────────────

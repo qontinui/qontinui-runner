@@ -299,6 +299,42 @@ bash <path-to-this-skill-dir>/coord-revive.sh call coord_memory_search '{"query_
   `CONNECT_REFUSED` / `TIMEOUT` / the classifier's other verdicts; `4` usage
   (arguments must be ONE JSON **object**, parsed and refused locally before any
   request is sent).
+- **An interrupted verb still answers — `INTERRUPTED`, exits `143` / `130` /
+  `129`.** A TERM, INT or HUP that lands before the verdict (a caller's
+  `timeout`, a Ctrl-C, a closed terminal) prints ONE line on stderr instead of
+  nothing: `coord-revive: <call|tools|observe|cascade> -> INTERRUPTED
+  (SIG<name> after <n>ms, phase=<phase>[, door resolution <n>ms, in flight
+  <n>ms]; <sent clause>)`, and the script exits `128+n` (`143` TERM, `130` INT,
+  `129` HUP; a caller's `timeout` itself still reports `124`). The phase says
+  how far it got and the clause says what that means for a write:
+  `startup` / `door_resolution` — *nothing was sent*; `rpc` — the request was in
+  flight, so its delivery is **UNKNOWN**. The line names when this client would
+  have stopped waiting (`-m $COORD_REVIVE_CALL_TIMEOUT` after it started), but a
+  server that already received the request may still apply it after that, so
+  for a WRITE read back before any re-issue, read again later if the first read
+  misses, and prefer an idempotent re-issue; `reading_result` — rendered from
+  what the POST returned (*reached no handler* for `0:401` / curl `6` / `7`,
+  *the door answered* for any other `0:<code>`, the `rpc` UNKNOWN clause for
+  anything else, e.g. curl `28`). The in-flight curl is sent the same TERM, so
+  the CLIENT stops at once; that bounds nothing on the server side. An
+  interrupted `observe` whose arguments were already validated is **counted** —
+  one `interrupted_<phase>` line in
+  `~/.qontinui/logs/coord-rung-unreported.jsonl` — and says so; one the door had
+  already answered 2xx is not counted (it was received), and one whose log
+  directory does not exist says `LOST` (the handler creates nothing). The **cascade**
+  (no verb, or `--floor-claim`) opens every run with `coord-revive: cascade
+  started (budget <n>s)` on stderr; interrupted before a verdict
+  (`startup` / `probing`) it prints `VERDICT: INTERRUPTED (... doors probed:
+  <list>; doors not probed: <rest>; in flight: <rung>)` on **stdout** — UNKNOWN,
+  never `DEAD`; interrupted after one (`verdict`, or `drain` while the closeout
+  spool is replayed — those rows' delivery is UNKNOWN, re-run
+  `scripts/drain-closeout-spool.sh`) it prints the stderr line alone, saying the
+  VERDICT above stands, so stdout never carries two verdicts. A kill no handler
+  can see (SIGKILL, Windows `TerminateProcess`, a harness background limit)
+  still prints nothing: name `$COORD_REVIVE_TIMING_FILE` and read its last
+  `phase <name> <epoch ms>` line for a post-mortem (its lines are token-keyed —
+  `rpc_send_ms <ms>` per POST, `phase <name> <ms>` per phase — so select by
+  token, never by position).
 - **A 401 names its recovery, per caller.** The binding was superseded or
   never registered while the transport stayed healthy. A hand-rolled caller
   re-reads `.mcp.json` — the verb just did, so the key on disk is stale too:
@@ -306,8 +342,22 @@ bash <path-to-this-skill-dir>/coord-revive.sh call coord_memory_search '{"query_
   bearer. The native MCP client **cannot** re-read the file (served policy
   `coordination` `mcp-reconnect-is-not-agent-invocable`), so for it the
   recovery is a **new session** — **never** a runner restart.
-- `COORD_REVIVE_CALL_TIMEOUT` (default 60s) bounds one call; a tool can be
-  legitimately slow, and this is not a probe.
+- `COORD_REVIVE_CALL_TIMEOUT` (default 60s) bounds one call's REQUEST; a tool
+  can be legitimately slow, and this is not a probe. It does **not** bound door
+  resolution (finding the `.mcp.json`, reading it, the shim's `--print-door`),
+  which on a starved box can take longer than the request itself. So:
+  - **An outer `timeout N` must EXCEED the budget plus door resolution.** With N
+    at or below the budget the verb's own typed `TIMEOUT` can never print first
+    and you get `INTERRUPTED` instead (a command-trap row warns on that
+    spelling). Set both when you need a bound: `COORD_REVIVE_CALL_TIMEOUT=<M>
+    timeout -k 5 <N> bash coord-revive.sh call ...` with N comfortably above M.
+  - **Never pipe a verb through `head`** when its exit status matters: the
+    pipeline's status is head's, so a timeout's `124` reads `0` — read
+    `PIPESTATUS`.
+  - **On Windows a slow verb is first a BOX symptom.** Measure the box before
+    the door: `python3 scripts/kernel-object-gauges.py` and `Measure-Command {
+    cmd /c exit }` (`knowledge-base/qontinui-specific/machine-resources.md` §8 —
+    the kernel Token leak makes every process creation cost about a second).
 
 The PowerShell twin is `scripts/coord-read.ps1 call` / `tools`, over the same
 own-config rule (`Get-CoordOwnProxyConfig`), for pi, Codex and CI.
