@@ -88,6 +88,11 @@ pub const SCANNER_OWNED_KEYS: &[ScannerKey] = &[
         source: "status-block `Area:`",
     },
     ScannerKey {
+        name: "initiative_item",
+        absent_rule: AbsentRule::DeleteWhenAbsent,
+        source: "status-block `Initiative-Item:`",
+    },
+    ScannerKey {
         name: "archive_path",
         absent_rule: AbsentRule::SetByArchiveScan,
         source: "the archived file's path, stamped by `push_archive_metadata`",
@@ -104,10 +109,15 @@ pub fn scanner_key(name: &str) -> Option<&'static ScannerKey> {
     SCANNER_OWNED_KEYS.iter().find(|k| k.name == name)
 }
 
-/// True when the parser saw a declaration for `key` and rejected it. Only
-/// `area` has a parser that reports rejection today.
+/// True when the parser saw a declaration for `key` and rejected it. The two
+/// status-block header keys, `area` and `initiative_item`, have parsers that
+/// report rejection.
 fn declaration_rejected(key: &str, u: &ParsedWorkUnit) -> bool {
-    key == "area" && u.area_rejected.is_some()
+    match key {
+        "area" => u.area_rejected.is_some(),
+        "initiative_item" => u.initiative_item_rejected.is_some(),
+        _ => false,
+    }
 }
 
 /// The values the plan file supplies, keyed by roster name. A key the file
@@ -133,6 +143,9 @@ fn build_metadata(u: &ParsedWorkUnit) -> Map<String, Value> {
     }
     if let Some(area) = &u.area {
         m.insert("area".to_string(), Value::String(area.clone()));
+    }
+    if let Some(item) = &u.initiative_item {
+        m.insert("initiative_item".to_string(), Value::String(item.clone()));
     }
     m
 }
@@ -193,7 +206,7 @@ pub fn archive_dir_patch(u: &ParsedWorkUnit) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::super::parser::{AreaRejection, ParsedPhase};
+    use super::super::parser::{HeaderRejection, ParsedPhase};
     use super::super::push::{
         push_archive_metadata, push_work_unit_with_status_write, SetDepsOutcome, StatusWrite,
         TransitionBody, UpsertBody, WorkUnitSink, ADAPTER_ACTOR,
@@ -219,6 +232,8 @@ mod tests {
             depends_on: vec!["2026-01-01-dep".to_string()],
             area: None,
             area_rejected: None,
+            initiative_item: None,
+            initiative_item_rejected: None,
             phases: vec![phase(1)],
             source_path: format!("plans/{slug}.md"),
             content: String::new(),
@@ -557,7 +572,7 @@ mod tests {
 
             let second = ParsedWorkUnit {
                 area: None,
-                area_rejected: Some(AreaRejection::NotKebab("Work Units".to_string())),
+                area_rejected: Some(HeaderRejection::NotKebab("Work Units".to_string())),
                 ..phases_unit("s", &[])
             };
             scan(&model, &second, arm).await;
@@ -579,7 +594,7 @@ mod tests {
         scan(&model, &first, Arm::Create).await;
         let rejected = ParsedWorkUnit {
             area: None,
-            area_rejected: Some(AreaRejection::Misspelled("**Area**:")),
+            area_rejected: Some(HeaderRejection::Misspelled("**Area**:")),
             ..unit("s", "shipped")
         };
         push_archive_metadata(&model, &rejected, TenantScope::Unresolved)
@@ -600,7 +615,7 @@ mod tests {
                         out.push(ParsedWorkUnit {
                             area: area.map(str::to_string),
                             area_rejected: rejected
-                                .then(|| AreaRejection::NotKebab("X".to_string())),
+                                .then(|| HeaderRejection::NotKebab("X".to_string())),
                             depends_on: deps,
                             ..phases_unit("s", phases)
                         });
@@ -867,5 +882,101 @@ mod tests {
         assert_eq!(p["depends_on"][0], "2026-01-01-dep");
         assert!(p["area"].is_null());
         assert!(obj.contains_key("archive_path") && p["archive_path"].is_null());
+    }
+
+    /// `initiative_item` follows `area`'s header rule on the active patch: a
+    /// value when declared, `null` (RFC 7396 delete) when not, and OMITTED
+    /// when the parser rejected the declaration — in both phase arms.
+    #[test]
+    fn active_patch_initiative_item_follows_the_header_rule() {
+        for phases in [&[1u32][..], &[][..]] {
+            let with = ParsedWorkUnit {
+                initiative_item: Some("one-screen-project-state".to_string()),
+                ..phases_unit("s", phases)
+            };
+            assert_eq!(
+                active_dir_patch(&with)["initiative_item"],
+                "one-screen-project-state"
+            );
+            let p = active_dir_patch(&phases_unit("s", phases));
+            assert!(
+                p.as_object().unwrap().contains_key("initiative_item")
+                    && p["initiative_item"].is_null(),
+                "an undeclared initiative item is an explicit null: {p}"
+            );
+            let rejected = ParsedWorkUnit {
+                initiative_item_rejected: Some(HeaderRejection::NotKebab("One Screen".to_string())),
+                ..phases_unit("s", phases)
+            };
+            let p = active_dir_patch(&rejected);
+            assert!(
+                !p.as_object().unwrap().contains_key("initiative_item"),
+                "a rejected initiative item is omitted: {p}"
+            );
+        }
+    }
+
+    /// The archive stamp carries a declared initiative item, an explicit
+    /// `null` when none is declared, and omits a rejected one.
+    #[test]
+    fn archive_stamp_keeps_a_declared_initiative_item() {
+        let with = ParsedWorkUnit {
+            initiative_item: Some("one-screen-project-state".to_string()),
+            ..unit("2026-01-01-archived", "shipped")
+        };
+        assert_eq!(
+            archive_dir_patch(&with)["initiative_item"],
+            "one-screen-project-state"
+        );
+        let none = archive_dir_patch(&unit("2026-01-01-archived-2", "shipped"));
+        assert!(
+            none.as_object().unwrap().contains_key("initiative_item")
+                && none["initiative_item"].is_null()
+        );
+        let rejected = ParsedWorkUnit {
+            initiative_item_rejected: Some(HeaderRejection::Misspelled("**Initiative-Item**:")),
+            ..unit("2026-01-01-archived-3", "shipped")
+        };
+        assert!(!archive_dir_patch(&rejected)
+            .as_object()
+            .unwrap()
+            .contains_key("initiative_item"));
+    }
+
+    /// End to end through coord's merge in every arm: a declared initiative
+    /// item is stored, survives a scan whose `Initiative-Item:` line the
+    /// parser rejected, and is deleted by a scan that declares none — while a
+    /// session-written key beside it survives throughout.
+    #[tokio::test]
+    async fn initiative_item_is_kept_on_rejection_and_deleted_when_undeclared() {
+        for arm in ARMS {
+            let model = CoordMetadataModel::default();
+            let declared = ParsedWorkUnit {
+                initiative_item: Some("one-screen".to_string()),
+                ..phases_unit("s", &[1])
+            };
+            scan(&model, &declared, Arm::Create).await;
+            model.session_patch("s", serde_json::json!({"phase_vets": ["x"]}));
+            assert_eq!(model.stored("s")["initiative_item"], "one-screen");
+
+            let rejected = ParsedWorkUnit {
+                initiative_item_rejected: Some(HeaderRejection::NotKebab("One Screen".to_string())),
+                ..phases_unit("s", &[1])
+            };
+            scan(&model, &rejected, arm).await;
+            assert_eq!(
+                model.stored("s")["initiative_item"],
+                "one-screen",
+                "{arm:?}: a rejected Initiative-Item: keeps the stored value"
+            );
+
+            scan(&model, &phases_unit("s", &[1]), arm).await;
+            let stored = model.stored("s");
+            assert!(
+                !stored.as_object().unwrap().contains_key("initiative_item"),
+                "{arm:?}: an undeclared initiative item is deleted: {stored}"
+            );
+            assert_eq!(stored["phase_vets"], serde_json::json!(["x"]), "{arm:?}");
+        }
     }
 }

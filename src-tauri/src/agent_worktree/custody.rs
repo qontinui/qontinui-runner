@@ -361,8 +361,70 @@ pub struct SessionIdentity {
     pub transcript: bool,
     /// WHICH account root holds it — the `CLAUDE_CONFIG_DIR` a resume line
     /// must name. Resolution sweeps all five roots, so this is not decorative:
-    /// resuming under the wrong root finds no transcript.
+    /// resuming under the wrong root finds no transcript. When the id has a
+    /// copy in several roots (an account migration copies the transcript and
+    /// resumes the same id elsewhere), this is the root whose copy holds the
+    /// NEWEST turn — the one `--resume` must use (see
+    /// [`SessionDirectory::copies_of`]).
     pub config_dir: Option<String>,
+}
+
+/// One on-disk copy of a session's transcript:
+/// `<config_dir>/projects/<encoded cwd>/<session id>.jsonl`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptCopy {
+    /// The account root as discovered — NOT case-normalized, so its basename
+    /// is the account label and the path can be handed to a shell as-is.
+    pub config_dir: PathBuf,
+    /// The transcript file itself.
+    pub path: PathBuf,
+    /// `(len, mtime)` as the walk saw them — the key the newest-turn cache
+    /// validates against. `None` when the metadata could not be read.
+    pub stamp: Option<crate::session::transcript_last_turn::FileStamp>,
+}
+
+/// Order a session's transcript copies so the one holding the NEWEST turn is
+/// first: a readable turn beats a readable file with no turn, which beats a
+/// copy that could not be read (or was not read).
+///
+/// The turn time decides first, never the mtime alone: a migration copy gets
+/// a FRESH mtime while holding only the original's turns, so once the resumed
+/// session speaks, its copy wins on the turn itself.
+///
+/// Ties on the turn — two copies holding the same newest turn — break on the
+/// most recently WRITTEN copy. That is what a migration looks like when the
+/// resumed session exits before its first turn: the migration wrote the copy
+/// into the target root after the original's last write, and the target root
+/// is the account `--resume` continued under. Ordering such a tie by name
+/// instead would re-stamp a migrated session back onto its OLD account
+/// (coord accepts an equal observation time). Only then the config dir, then
+/// the path, so a tie that mtime cannot settle never flaps between walks.
+pub(crate) fn order_by_newest_turn(
+    copies: &mut [TranscriptCopy],
+    read: &mut dyn FnMut(&TranscriptCopy) -> crate::session::transcript_last_turn::TurnRead,
+) {
+    use crate::session::transcript_last_turn::TurnRead;
+    if copies.len() < 2 {
+        return;
+    }
+    let rank = |r: TurnRead| match r {
+        TurnRead::Read(Some(ms)) => (2u8, ms),
+        TurnRead::Read(None) => (1, 0),
+        TurnRead::Deferred | TurnRead::Unreadable => (0, 0),
+    };
+    let mut keyed: Vec<((u8, i64), TranscriptCopy)> =
+        copies.iter().map(|c| (rank(read(c)), c.clone())).collect();
+    let written = |c: &TranscriptCopy| c.stamp.and_then(|s| s.modified_ms);
+    keyed.sort_by(|(ra, a), (rb, b)| {
+        rb.cmp(ra)
+            // Newest write first; an unknown mtime (`None`) sorts last.
+            .then_with(|| written(b).cmp(&written(a)))
+            .then_with(|| a.config_dir.cmp(&b.config_dir))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    for (slot, (_, c)) in copies.iter_mut().zip(keyed) {
+        *slot = c;
+    }
 }
 
 impl SessionIdentity {
@@ -392,11 +454,21 @@ impl SessionIdentity {
 /// transcript for this id exist anywhere" is the question that decides ghost
 /// vs resolvable; asking "does one exist under this path" would manufacture
 /// ghosts out of sessions that simply moved.
+///
+/// ## Every root is kept, not the first
+///
+/// An account migration copies a session's transcript into another account
+/// root and resumes the same id there, so one id can have a copy in several
+/// roots. Keeping only the first root the walk met made the answer depend on
+/// discovery order; every copy is kept instead and the copy holding the
+/// NEWEST turn is put first ([`order_by_newest_turn`]). Only multi-root ids
+/// pay a tail read for that, and the read is cached per `(len, mtime)`
+/// ([`crate::session::transcript_last_turn`]).
 #[derive(Debug, Clone, Default)]
 pub struct SessionDirectory {
     names: HashMap<String, String>,
-    /// id → the account root whose `projects/` holds its transcript.
-    transcripts: HashMap<String, String>,
+    /// id → every copy of its transcript, the newest-turn copy first.
+    transcripts: HashMap<String, Vec<TranscriptCopy>>,
     /// Roots actually walked — reported so an empty index is never mistaken
     /// for "no sessions exist".
     roots_scanned: usize,
@@ -408,12 +480,28 @@ impl SessionDirectory {
     /// counted out of `roots_scanned`, so [`Self::roots_scanned`] stays an
     /// honest statement of coverage.
     pub fn discover() -> Self {
+        Self::discover_from(
+            &session_names_dir(),
+            &crate::terminal::transcript::find_claude_config_dirs(),
+        )
+    }
+
+    /// [`Self::discover`] over an explicit names dir and root list — the
+    /// filesystem-shaped test seam.
+    pub(crate) fn discover_from(names_dir: &Path, roots: &[PathBuf]) -> Self {
+        use crate::session::transcript_last_turn::{last_turn_ms, ReadBudget};
         let mut me = Self::default();
-        me.load_names(&session_names_dir());
-        for root in crate::terminal::transcript::find_claude_config_dirs() {
-            if me.load_transcripts(&root) {
+        me.load_names(names_dir);
+        for root in roots {
+            if me.load_transcripts(root) {
                 me.roots_scanned += 1;
             }
+        }
+        // Unbounded: only ids with a copy in more than one root are read, and
+        // each read is cached until that file changes.
+        let mut budget = ReadBudget::Unbounded;
+        for copies in me.transcripts.values_mut() {
+            order_by_newest_turn(copies, &mut |c| last_turn_ms(&c.path, c.stamp, &mut budget));
         }
         me
     }
@@ -471,6 +559,40 @@ impl SessionDirectory {
         self.transcripts.len()
     }
 
+    /// The fleet tag name for `session_id` (`~/.qontinui/session-names/<id>`),
+    /// if one is recorded.
+    pub fn name_of(&self, session_id: &str) -> Option<&str> {
+        self.names
+            .get(&session_id.trim().to_ascii_lowercase())
+            .map(String::as_str)
+    }
+
+    /// Every transcript copy of `session_id`, the copy holding the newest turn
+    /// first. Empty when no root holds one.
+    pub fn copies_of(&self, session_id: &str) -> &[TranscriptCopy] {
+        self.transcripts
+            .get(&session_id.trim().to_ascii_lowercase())
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Every id that has at least one transcript copy, sorted — the ids whose
+    /// account root this machine can name.
+    pub fn transcribed_ids(&self) -> Vec<&str> {
+        let mut ids: Vec<&str> = self.transcripts.keys().map(String::as_str).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Every transcript file the walk saw, across all roots.
+    pub fn transcript_paths(&self) -> std::collections::HashSet<PathBuf> {
+        self.transcripts
+            .values()
+            .flatten()
+            .map(|c| c.path.clone())
+            .collect()
+    }
+
     fn load_names(&mut self, dir: &Path) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -493,8 +615,9 @@ impl SessionDirectory {
         }
     }
 
-    /// Index `<root>/projects/*/<session-id>.jsonl`. Returns whether the root
-    /// was readable at all.
+    /// Index `<root>/projects/*/<session-id>.jsonl`, keeping EVERY copy (a
+    /// second root's copy of an id is a migration, not a duplicate to drop).
+    /// Returns whether the root was readable at all.
     fn load_transcripts(&mut self, root: &Path) -> bool {
         let projects = root.join("projects");
         let Ok(dirs) = std::fs::read_dir(&projects) else {
@@ -509,10 +632,23 @@ impl SessionDirectory {
                 if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                     continue;
                 }
-                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                    self.transcripts
-                        .entry(stem.to_ascii_lowercase())
-                        .or_insert_with(|| norm(&root.to_string_lossy()));
+                let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let stamp = f
+                    .metadata()
+                    .ok()
+                    .map(|m| crate::session::transcript_last_turn::FileStamp::of(&m));
+                let copies = self
+                    .transcripts
+                    .entry(stem.to_ascii_lowercase())
+                    .or_default();
+                if copies.iter().all(|c| c.path != p) {
+                    copies.push(TranscriptCopy {
+                        config_dir: root.to_path_buf(),
+                        path: p,
+                        stamp,
+                    });
                 }
             }
         }
@@ -526,7 +662,11 @@ impl SessionDirectory {
     /// `roots_scanned` exists to let callers check.
     pub fn resolve(&self, session_id: &str) -> SessionIdentity {
         let key = session_id.trim().to_ascii_lowercase();
-        let config_dir = self.transcripts.get(&key).cloned();
+        let config_dir = self
+            .transcripts
+            .get(&key)
+            .and_then(|copies| copies.first())
+            .map(|c| norm(&c.config_dir.to_string_lossy()));
         SessionIdentity {
             name: self.names.get(&key).cloned(),
             transcript: config_dir.is_some(),
@@ -537,6 +677,7 @@ impl SessionDirectory {
     /// Test seam.
     #[cfg(test)]
     pub fn from_parts(names: &[(&str, &str)], transcripts: &[&str], roots_scanned: usize) -> Self {
+        let root = PathBuf::from("C:/claude/.claude-test");
         Self {
             names: names
                 .iter()
@@ -544,7 +685,15 @@ impl SessionDirectory {
                 .collect(),
             transcripts: transcripts
                 .iter()
-                .map(|t| (t.to_ascii_lowercase(), "C:/claude/.claude-test".to_string()))
+                .map(|t| {
+                    let id = t.to_ascii_lowercase();
+                    let copy = TranscriptCopy {
+                        config_dir: root.clone(),
+                        path: root.join("projects").join("p").join(format!("{id}.jsonl")),
+                        stamp: None,
+                    };
+                    (id, vec![copy])
+                })
                 .collect(),
             roots_scanned,
         }
@@ -3346,5 +3495,57 @@ mod tests {
         );
         assert!(write_session_name("../evil", "x").is_err());
         assert!(write_session_name("", "x").is_err());
+    }
+
+    /// A migrated session's copies are ordered by their NEWEST TURN; equal
+    /// turns break on the most recently written copy (the migration target),
+    /// and only a tie mtime cannot settle falls to the config dir — so the
+    /// order never depends on which root the walk met first.
+    #[test]
+    fn transcript_copies_order_by_newest_turn_then_newest_write_then_config_dir() {
+        use crate::session::transcript_last_turn::{FileStamp, TurnRead};
+        let copy = |root: &str, modified_ms: Option<i64>| TranscriptCopy {
+            config_dir: PathBuf::from(root),
+            path: PathBuf::from(format!("{root}/projects/p/s.jsonl")),
+            stamp: Some(FileStamp {
+                len: 1,
+                modified_ms,
+            }),
+        };
+        let turn_of = |c: &TranscriptCopy| match c.config_dir.to_str() {
+            // `a` holds the newest turn but the OLDEST write: the turn wins.
+            Some("/h/.claude-a") => TurnRead::Read(Some(500)),
+            // b, c, f tie on the turn: the newest write wins (f), then the
+            // two with the same mtime fall to the dir (b before c).
+            Some("/h/.claude-b") => TurnRead::Read(Some(300)),
+            Some("/h/.claude-c") => TurnRead::Read(Some(300)),
+            Some("/h/.claude-f") => TurnRead::Read(Some(300)),
+            Some("/h/.claude-d") => TurnRead::Read(None),
+            _ => TurnRead::Unreadable,
+        };
+        let mut copies = vec![
+            copy("/h/.claude-e", Some(9_000)),
+            copy("/h/.claude-d", Some(8_000)),
+            copy("/h/.claude-c", Some(2_000)),
+            copy("/h/.claude-a", Some(1_000)),
+            copy("/h/.claude-b", Some(2_000)),
+            copy("/h/.claude-f", Some(7_000)),
+        ];
+        order_by_newest_turn(&mut copies, &mut |c| turn_of(c));
+        let order: Vec<&str> = copies
+            .iter()
+            .map(|c| c.config_dir.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "/h/.claude-a", // newest turn, despite the oldest write
+                "/h/.claude-f", // tied turn, newest write
+                "/h/.claude-b", // tied turn and write: the dir decides
+                "/h/.claude-c",
+                "/h/.claude-d", // readable, no turn
+                "/h/.claude-e", // unreadable, despite the newest write
+            ]
+        );
     }
 }
