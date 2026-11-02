@@ -284,6 +284,13 @@ pub struct Candidates {
 ///
 /// An id yields no row when it has no account root this machine can name: a
 /// ghost (no name, no transcript), or a name with no transcript anywhere.
+///
+/// LIVE ids are built first, so they spend the tail-read budget before the
+/// ended backlog does. After a runner start the cache is cold for every
+/// transcript; walking ids in plain sorted order would let thousands of ended
+/// ids exhaust the budget and defer a resumed session's row for many passes —
+/// and for a session coord recorded as closed, that `live: true` row is the
+/// only thing that reopens it.
 pub fn build_candidates(
     dir: &SessionDirectory,
     live: &[LiveRow],
@@ -314,13 +321,16 @@ pub fn build_candidates(
         }
     }
 
-    let ids: BTreeSet<String> = dir
+    // Live ids first (they already passed the UUID check), then every other
+    // transcribed id; each half sorted, so the order is stable between passes.
+    let live_ids: BTreeSet<String> = live_by_id.keys().cloned().collect();
+    let ended_ids: BTreeSet<String> = dir
         .transcribed_ids()
         .into_iter()
+        .filter(|id| is_uuid_shaped(id) && !live_ids.contains(*id))
         .map(str::to_string)
-        .chain(live_by_id.keys().cloned())
-        .filter(|id| is_uuid_shaped(id))
         .collect();
+    let ids = live_ids.into_iter().chain(ended_ids);
 
     let mut out = Candidates {
         roots_scanned: dir.roots_scanned(),
@@ -403,6 +413,7 @@ pub fn build_candidates(
             last_acted_at: last_acted_ms.and_then(ms_to_rfc3339),
         });
     }
+    out.rows.sort_by(|a, b| a.session_id.cmp(&b.session_id));
     out
 }
 
@@ -1279,6 +1290,43 @@ mod tests {
             got.known_ids.contains(SID_B),
             "a deferred id is still known"
         );
+    }
+
+    #[test]
+    fn a_live_session_spends_the_tail_budget_before_the_ended_backlog() {
+        // An ended id that SORTS BEFORE the live one, both with transcripts
+        // the turn cache has never read (a runner start), and a budget of one.
+        const ENDED_FIRST: &str = "00000000-0000-4000-8000-000000000001";
+        let tmp = tempfile::tempdir().unwrap();
+        let q = home(tmp.path(), ".claude-qontinui");
+        transcript(&q, "-p", ENDED_FIRST, &["2026-10-19T08:00:00.000Z"]);
+        transcript(&q, "-p", SID_A, &["2026-10-19T09:00:00.000Z"]);
+        fs::create_dir_all(q.join("sessions")).unwrap();
+        fs::write(
+            q.join("sessions").join("101.json"),
+            format!(r#"{{"pid":101,"sessionId":"{SID_A}","cwd":"/p","name":"spaceship-latency","updatedAt":1790000000000}}"#),
+        )
+        .unwrap();
+        assert!(ENDED_FIRST < SID_A);
+
+        let homes = vec![q.clone()];
+        let live = read_live_rows(&homes, &HashSet::from([101_u32]));
+        let dir = SessionDirectory::discover_from(&tmp.path().join("none"), &homes);
+        let mut one = ReadBudget::Limited(1);
+        let got = build_candidates(&dir, &live, &mut |c| {
+            last_turn_ms(&c.path, c.stamp, &mut one)
+        });
+
+        assert_eq!(got.rows.len(), 1, "rows: {:?}", got.rows);
+        assert_eq!(got.rows[0].session_id, SID_A);
+        assert!(got.rows[0].live);
+        assert_eq!(
+            got.rows[0].last_acted_at.as_deref(),
+            Some("2026-10-19T09:00:00.000Z"),
+            "the live row's turn was READ, not replaced by the registry fallback"
+        );
+        assert_eq!(got.deferred, 1, "the ended id waits for a later pass");
+        assert!(got.known_ids.contains(ENDED_FIRST));
     }
 
     #[test]
