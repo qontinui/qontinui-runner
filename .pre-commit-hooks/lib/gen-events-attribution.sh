@@ -575,8 +575,11 @@ gen_events_markdown_premise_violations() {
 
     # A failed probe prints its ERROR line into whichever list it fed, and
     # `sort` returns 0 over it — so the lists are scanned, not just the flags.
-    if printf '%s\n' "$inc_text" "$md_lit" "$schema" "$inc_dir" "$schemars_attr" "$as_rust" | grep -q '^ERROR'; then
-        printf '%s\n' "$inc_text" "$md_lit" "$schema" "$inc_dir" "$schemars_attr" "$as_rust" | grep '^ERROR'
+    # Plain `grep`, never `grep -q`: -q closes the pipe on its first match, and
+    # under pipefail the SIGPIPE printf then takes reads as "no ERROR" and loses
+    # the line. It is intermittent at the real tree's list sizes and certain
+    # once the lists pass the pipe buffer. Plain grep reads to EOF.
+    if printf '%s\n' "$inc_text" "$md_lit" "$schema" "$inc_dir" "$schemars_attr" "$as_rust" | grep '^ERROR'; then
         probe_failed=1
     fi
     # Decision-time vacuity. A tree that carries the schema toolchain (the
@@ -670,9 +673,9 @@ gen_events_bundle_premise_violations() {
     schema="$(gen_events_premise_grep "$dir" -l -F 'JsonSchema' | LC_ALL=C sort)" || probe_failed=1
     tree_names="$(gen_events_premise_grep "$dir" -l -F 'fleet_skills' | LC_ALL=C sort)" || probe_failed=1
     # As in the markdown premise, a failed probe's ERROR line lands in the list
-    # and `sort` returns 0 over it, so the lists are scanned.
-    if printf '%s\n' "$as_rust" "$names" "$schema" "$tree_names" | grep -q '^ERROR'; then
-        printf '%s\n' "$as_rust" "$names" "$schema" "$tree_names" | grep '^ERROR'
+    # and `sort` returns 0 over it, so the lists are scanned, with plain `grep`
+    # for the same reason.
+    if printf '%s\n' "$as_rust" "$names" "$schema" "$tree_names" | grep '^ERROR'; then
         probe_failed=1
     fi
     _gen_events_premise_arm "include!/path attribute in a file that names fleet_skills or a .sh/.py path" \
@@ -791,15 +794,19 @@ gen_events_attribution() {
         elif [ "$bundle_rc" -eq 1 ]; then
             ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON="fleet_skills .sh/.py may reach schemas.json (${bundle_premise%%$'\n'*})"
         else
-            ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON="the fleet_skills premise probe failed ($(printf '%s\n' "$bundle_premise" | sed -n '/^ERROR/{p;q;}'))"
+            local bundle_error
+            bundle_error="$(sed -n '/^ERROR/{p;q;}' <<< "$bundle_premise")"
+            ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON="the fleet_skills premise probe failed (${bundle_error:-no ERROR line})"
         fi
     elif [ "$premise_rc" -eq 1 ]; then
         ATTRIBUTION_EXCLUDES_DROPPED_REASON="markdown may reach schemas.json (${premise%%$'\n'*})"
     else
         # `sed` rather than `grep -m1 || echo`: under pipefail that form can
-        # print a real line AND the fallback.
+        # print a real line AND the fallback. A here-string rather than a pipe:
+        # `q` closes it, and the SIGPIPE would fail this assignment, which under
+        # the hook's `set -e` ends the hook with 141 and no message.
         local first_error
-        first_error="$(printf '%s\n' "$premise" | sed -n '/^ERROR/{p;q;}')"
+        first_error="$(sed -n '/^ERROR/{p;q;}' <<< "$premise")"
         ATTRIBUTION_EXCLUDES_DROPPED_REASON="the markdown premise probe failed (${first_error:-no ERROR line})"
     fi
     if [ -n "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" ]; then

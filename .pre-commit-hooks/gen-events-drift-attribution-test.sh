@@ -648,7 +648,7 @@ mkdir -p "$PREMISE_FIXTURE/src-tauri/scripts"
 printf '# gen\n' > "$PREMISE_FIXTURE/src-tauri/scripts/generate_types.sh"
 GEN_OUT="$(gen_events_markdown_premise_violations "$PREMISE_FIXTURE")" && GEN_RC=0 || GEN_RC=$?
 check "a generator script with no exporter beside it is UNVERIFIABLE" "2|yes|no" \
-    "$GEN_RC|$(printf '%s\n' "$GEN_OUT" | grep -qF 'exists but src-tauri/src/bin/export_schemas.rs does not' && echo yes || echo no)|$(printf '%s\n' "$GEN_OUT" | grep -qF 'no file mentions JsonSchema' && echo yes || echo no)"
+    "$GEN_RC|$(grep -qF 'exists but src-tauri/src/bin/export_schemas.rs does not' <<< "$GEN_OUT" && echo yes || echo no)|$(grep -qF 'no file mentions JsonSchema' <<< "$GEN_OUT" && echo yes || echo no)"
 premise_case "guard fires: a build script reading markdown" violation \
     'fn main() { let b = std::fs::read_to_string("src/guide.md").unwrap(); }' src-tauri/build.rs
 premise_case "guard fires: a build script filtering on the md extension" violation \
@@ -1063,6 +1063,42 @@ SHIM="$(git_shim_failing bundle-grep '*" grep "*"fleet_skills|"*')"
 check "a failing bundle probe drops only this exclusion, so the .sh is MINE" "mine||yes" \
     "$(cut -d'|' -f1-2 < "$WORK/.state")|$(grep -qF 'the fleet_skills premise probe failed (ERROR' "$WORK/.state" && echo yes || echo no)"
 
+# The ERROR scan and the reason text must not depend on a pipe into a reader that
+# exits early. Past the pipe buffer that SIGPIPE is certain rather than a race, so
+# these cases fail every time the shape comes back. Each key names a probe only
+# the scanned lists read: a key that also feeds an arm (`include_(str|bytes)!`
+# feeds the doc-attribute arm) prints an ERROR line of its own, and the case would
+# pass with the scan broken.
+BIG_LIST="$(printf 'src-tauri/src/module_%06d.rs\n' $(seq 1 12000))"
+scan_output() {
+    # $1 guard, $2 text identifying the one list whose probe fails.
+    (
+        gen_events_premise_grep() {
+            case "$*" in
+                *"$STUB_ERROR_ON"*) echo "ERROR stub probe"; return 2 ;;
+                *) printf '%s\n' "$BIG_LIST" ;;
+            esac
+        }
+        STUB_ERROR_ON="$2"
+        "$1" "$WORK"
+    )
+}
+fixture
+SCAN_OUT="$(scan_output gen_events_markdown_premise_violations '\.md"')"; SCAN_RC=$?
+check "past the pipe buffer, the markdown guard still reports its ERROR line" "2|yes" \
+    "$SCAN_RC|$(grep -qxF 'ERROR stub probe' <<< "$SCAN_OUT" && echo yes || echo no)"
+SCAN_OUT="$(scan_output gen_events_bundle_premise_violations 'fleet_skills|')"; SCAN_RC=$?
+check "past the pipe buffer, the bundle guard still reports its ERROR line" "2|yes" \
+    "$SCAN_RC|$(grep -qxF 'ERROR stub probe' <<< "$SCAN_OUT" && echo yes || echo no)"
+
+# A probe can fail with no ERROR line at all (a `sort` that failed over an empty
+# list). The reason says so rather than printing an empty pair of parentheses.
+fixture
+commit_change "$BUNDLE_SH" "#!/bin/sh"
+( gen_events_bundle_premise_violations() { return 2; }; decide; printf '%s\n' "$ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON" > "$WORK/.state" )
+check "a bundle probe that failed with no ERROR line says so" "the fleet_skills premise probe failed (no ERROR line)" \
+    "$(cat "$WORK/.state")"
+
 echo "  -- the hook runs under set -e: the MINE path must survive it --"
 
 # The hook is `set -euo pipefail`. A non-zero status leaking out of the
@@ -1084,6 +1120,41 @@ commit_change "src-tauri/src/fleet_commands/x.md" "# a body"
 SHIM="$(git_shim_failing grep '*" grep "*')"
 ( PATH="$SHIM:$PATH"; set -euo pipefail; decide; gen_events_render_mine >/dev/null ); SETE_RC=$?
 check "set -e: a failed-probe MINE decision and render exit 0" "0" "$SETE_RC"
+
+# A failed premise with output past the pipe buffer: reading its first ERROR line
+# must not take the hook down with a SIGPIPE.
+fixture
+commit_change "$BUNDLE_SH" "#!/bin/sh"
+( gen_events_bundle_premise_violations() { echo "ERROR stub probe"; printf '%s\n' "$BIG_LIST"; return 2; }
+  set -euo pipefail; decide; printf '%s\n' "$ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON" > "$WORK/.state" ); SETE_RC=$?
+check "set -e: a long failed bundle probe survives, and its reason quotes the ERROR line" \
+    "0|the fleet_skills premise probe failed (ERROR stub probe)" "$SETE_RC|$(cat "$WORK/.state")"
+fixture
+commit_change "src-tauri/src/lib.rs" "// mine"
+( gen_events_markdown_premise_violations() { echo "ERROR stub probe"; printf '%s\n' "$BIG_LIST"; return 2; }
+  set -euo pipefail; decide; printf '%s\n' "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" > "$WORK/.state" ); SETE_RC=$?
+check "set -e: a long failed markdown probe survives, and its reason quotes the ERROR line" \
+    "0|the markdown premise probe failed (ERROR stub probe)" "$SETE_RC|$(cat "$WORK/.state")"
+
+# The shape itself, in the three files this suite covers. Comment lines may name
+# it; the pattern is spelled so it does not match itself.
+PIPE_INTO_QUIET_RE='(^|[^|])\|[[:space:]]*([[:alnum:]_]+=[^[:space:]]*[[:space:]]+)*grep[[:space:]]([^|]*[[:space:]])?-([[:alnum:]]*q|-quiet)'
+QUIET_PIPES="$(grep -nE "$PIPE_INTO_QUIET_RE" \
+    "$SCRIPT_DIR/lib/gen-events-attribution.sh" "$SCRIPT_DIR/gen-events-drift.sh" "$SCRIPT_DIR/gen-events-drift-attribution-test.sh" \
+    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)"
+check "no pipe into grep -q in the library, the hook or this suite" "" "$QUIET_PIPES"
+# Assembled, so the samples are not themselves lines of the shape in this file.
+P='|'
+QUIET_SAMPLES="x $P grep -q y
+x $P grep -E -q y
+x $P grep --quiet y
+x $P grep -E y -q
+x $P LC_ALL=C grep -qF y"
+QUIET_CLEAN="x $P$P grep -q y f
+x $P grep -c y
+grep -q y <<< z"
+check "  and that check sees each spelling, and not an || or a here-string" "5|0" \
+    "$(grep -cE "$PIPE_INTO_QUIET_RE" <<< "$QUIET_SAMPLES")|$(grep -cE "$PIPE_INTO_QUIET_RE" <<< "$QUIET_CLEAN")"
 
 echo "  -- the MINE message the hook prints --"
 
@@ -1132,7 +1203,7 @@ check "  the working-tree note is printed" yes "$(has "$LOCAL_NOTE")"
 # The primary guard: the message runs nothing. The wording check below it
 # only pins that the old "commit or discard" advice did not come back.
 check "  and the message prints no commands" no \
-    "$(printf '%s\n' "$RENDERED" | grep -qE "$NO_COMMANDS_RE" && echo yes || echo no)"
+    "$(grep -qE "$NO_COMMANDS_RE" <<< "$RENDERED" && echo yes || echo no)"
 check "  and it says to set them aside, not to commit them" "yes|no" \
     "$(has "$LOCAL_REMEDY")|$(has 'commit or discard')"
 
@@ -1170,7 +1241,7 @@ check "unstaged and untracked at pre-commit: not this commit's changes" "yes|no"
 check "  labelled not in this commit" "yes|yes" \
     "$(has 'src-tauri/src/lib.rs  (unstaged — not in this commit)')|$(has 'src-tauri/src/new.rs  (untracked — not in this commit)')"
 check "  with the commit-stage note, and no commands" "yes|no" \
-    "$(has "Inputs marked 'not in this commit' are working-tree state")|$(printf '%s\n' "$RENDERED" | grep -qE "$NO_COMMANDS_RE" && echo yes || echo no)"
+    "$(has "Inputs marked 'not in this commit' are working-tree state")|$(grep -qE "$NO_COMMANDS_RE" <<< "$RENDERED" && echo yes || echo no)"
 
 render_with "$(detail_line src-tauri/src/lib.rs committed)"
 check "earlier commits at pre-commit: named as the branch's, not this commit's" "yes|yes|no" \
@@ -1446,21 +1517,21 @@ fi
 decide
 check "odd names are MINE" "mine" "$ATTRIBUTION_STATE"
 check "  é b.rs is labelled by its real name" yes \
-    "$(printf '%s\n' "$ATTRIBUTION_TOUCHED_DETAIL" | grep -qxF "$ODD_E"$'\t'"untracked" && echo yes || echo no)"
+    "$(grep -qxF "$ODD_E"$'\t'"untracked" <<< "$ATTRIBUTION_TOUCHED_DETAIL" && echo yes || echo no)"
 check "  q\"t.rs is labelled by its real name" yes \
-    "$(printf '%s\n' "$ATTRIBUTION_TOUCHED_DETAIL" | grep -qxF "$ODD_Q"$'\t'"untracked" && echo yes || echo no)"
+    "$(grep -qxF "$ODD_Q"$'\t'"untracked" <<< "$ATTRIBUTION_TOUCHED_DETAIL" && echo yes || echo no)"
 if [ -n "$ODD_T" ]; then
     ODD_T_SHOWN="$(printf '%q' "$ODD_T")"
     check "  a tab-named file is kept, in its %q form" yes \
-        "$(printf '%s\n' "$ATTRIBUTION_TOUCHED_DETAIL" | grep -qxF "$ODD_T_SHOWN"$'\t'"untracked" && echo yes || echo no)"
+        "$(grep -qxF "$ODD_T_SHOWN"$'\t'"untracked" <<< "$ATTRIBUTION_TOUCHED_DETAIL" && echo yes || echo no)"
     check "  and counted in the flat list" yes \
-        "$(printf '%s\n' "$ATTRIBUTION_TOUCHED" | grep -qxF "$ODD_T_SHOWN" && echo yes || echo no)"
+        "$(grep -qxF "$ODD_T_SHOWN" <<< "$ATTRIBUTION_TOUCHED" && echo yes || echo no)"
 else
     skip_note "tab-named file: this filesystem refuses a tab in a file name"
 fi
 RENDERED="$(gen_events_render_mine)"
 check "  the message shows é b.rs raw" yes \
-    "$(printf '%s\n' "$RENDERED" | grep -qF "    $ODD_E  (untracked" && echo yes || echo no)"
+    "$(grep -qF "    $ODD_E  (untracked" <<< "$RENDERED" && echo yes || echo no)"
 
 echo "  -- renames and deletions: both halves are inputs --"
 
