@@ -36,6 +36,7 @@ import {
   mayClaimRecordedZone,
   claimInitForPage,
   buildResumeCmd,
+  resumeGateEnv,
   runVerifiedResume,
   classifyRestoreAction,
   resolveRestoreAccount,
@@ -1010,6 +1011,48 @@ describe("buildResumeCmd (backend-rendered resume)", () => {
     expect(out).toBe("failed");
     expect(writes).toEqual([]);
     expect(updateTab).toHaveBeenCalledWith("tab-1", { isReconnecting: false, resumeFailed: true });
+  });
+});
+
+// Plan 2026-10-03 D3 — a resumed gate continuation keeps its gate identity, so
+// the session can still report its own work outcome after a runner restart.
+describe("buildResumeCmd (gate continuation identity)", () => {
+  const GATE = "7252781b-c49c-4a83-bdc2-4fec9c3dcd91";
+  const DEVICE = "eb2155ed-0000-4000-8000-000000000001";
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue({ success: true, message: null, data: { command: "R" } });
+  });
+
+  it("asks the backend to re-inject the gate identity when both halves are present", async () => {
+    await buildResumeCmd("sess-1", undefined, "summary", undefined, {
+      gateId: GATE,
+      gateConsumingDeviceId: DEVICE,
+    });
+    expect(mockInvoke).toHaveBeenCalledWith("build_ai_resume_command", {
+      sessionId: "sess-1",
+      provider: "claude",
+      configDir: null,
+      isWindows: false,
+      fullResume: false,
+      gateId: GATE,
+      gateDeviceId: DEVICE,
+    });
+  });
+
+  it("sends neither half when one is missing or malformed (never interpolates junk)", async () => {
+    expect(resumeGateEnv({ gateId: GATE })).toEqual([]);
+    expect(resumeGateEnv({ gateId: GATE, gateConsumingDeviceId: "x; rm -rf /" })).toEqual([]);
+    expect(resumeGateEnv(undefined)).toEqual([]);
+    await buildResumeCmd("sess-1", undefined, "summary", undefined, { gateId: GATE });
+    expect(mockInvoke).toHaveBeenCalledWith("build_ai_resume_command", {
+      sessionId: "sess-1",
+      provider: "claude",
+      configDir: null,
+      isWindows: false,
+      fullResume: false,
+    });
   });
 });
 

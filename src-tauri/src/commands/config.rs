@@ -748,13 +748,21 @@ fn gateway_launch_dir(
 /// "Resume from summary?" picker for an unattended restore (#548 item 3).
 /// Templates are deliberately not applied: a resume never layered the
 /// operator's launch template, and an opaque alias cannot carry `--resume`.
+///
+/// `gate_id` + `gate_device_id` re-inject a resumed gate continuation's
+/// `QONTINUI_GATE_ID` / `QONTINUI_GATE_DEVICE_ID`, so the session can still
+/// report its own work outcome (plan 2026-10-03 D3). Both or neither — coord
+/// accepts neither half alone — and only as well-formed UUIDs.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn build_ai_resume_command(
     session_id: String,
     provider: Option<String>,
     config_dir: Option<String>,
     is_windows: bool,
     full_resume: bool,
+    gate_id: Option<String>,
+    gate_device_id: Option<String>,
 ) -> Result<CommandResponse, String> {
     if let Some(refusal) = crate::model_gateway::spawn_refusal() {
         return Err(refusal);
@@ -770,11 +778,57 @@ pub fn build_ai_resume_command(
         full_resume,
         &settings::get_claude_session_permission(),
     )?;
+    let (gate_prefix, gate_suffix) =
+        resume_gate_env(gate_id.as_deref(), gate_device_id.as_deref(), is_windows);
+    let command = format!("{gate_prefix}{command}{gate_suffix}");
     Ok(CommandResponse {
         success: true,
         message: None,
         data: Some(serde_json::json!({ "command": command })),
     })
+}
+
+/// The gate-identity env a resumed continuation is typed with, as a
+/// `(prefix, suffix)` pair: both `QONTINUI_GATE_ID` and
+/// `QONTINUI_GATE_DEVICE_ID`, or nothing. Each value is interpolated into a
+/// shell command, so only a well-formed UUID is accepted, and it is re-printed
+/// in canonical form.
+///
+/// The prefix goes ahead of the renderer's own prefix: a posix assignment
+/// before `env` is inherited by it, and a PowerShell `$env:` statement is a
+/// statement. A PowerShell `$env:` assignment outlives the command, so on
+/// Windows the suffix clears both once `claude` returns — otherwise a later,
+/// unrelated `claude` typed into the same pane would report to this gate.
+pub(crate) fn resume_gate_env(
+    gate_id: Option<&str>,
+    gate_device_id: Option<&str>,
+    is_windows: bool,
+) -> (String, String) {
+    let parse = |v: Option<&str>| v.map(str::trim).and_then(|v| uuid::Uuid::parse_str(v).ok());
+    let (Some(gate), Some(device)) = (parse(gate_id), parse(gate_device_id)) else {
+        return (String::new(), String::new());
+    };
+    let vars = [
+        ("QONTINUI_GATE_ID", gate),
+        ("QONTINUI_GATE_DEVICE_ID", device),
+    ];
+    if is_windows {
+        let prefix = vars
+            .iter()
+            .map(|(var, id)| format!("$env:{var}=\"{id}\"; "))
+            .collect();
+        let suffix = format!(
+            "; Remove-Item Env:{}, Env:{} -ErrorAction SilentlyContinue",
+            vars[0].0, vars[1].0
+        );
+        (prefix, suffix)
+    } else {
+        let prefix = vars
+            .iter()
+            .map(|(var, id)| format!("{var}=\"{id}\" "))
+            .collect();
+        (prefix, String::new())
+    }
 }
 
 /// Pure core of [`build_ai_resume_command`].
@@ -893,7 +947,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
 
 #[cfg(test)]
 mod resume_render_tests {
-    use super::render_ai_resume_command;
+    use super::{render_ai_resume_command, resume_gate_env};
     use crate::claude_session::launch_spec::SessionPermissionSetting;
 
     const SID: &str = "230feb99-2dd7-42d7-92bc-6d36c1883089";
@@ -1097,5 +1151,56 @@ mod resume_render_tests {
                 "{dir}"
             );
         }
+    }
+
+    const GATE: &str = "7252781b-c49c-4a83-bdc2-4fec9c3dcd91";
+    const DEVICE: &str = "eb2155ed-0000-4000-8000-000000000001";
+
+    // Plan 2026-10-03 D3: a resumed gate continuation keeps its gate identity.
+    #[test]
+    fn gate_identity_rides_the_resume_on_both_shells() {
+        assert_eq!(
+            resume_gate_env(Some(GATE), Some(DEVICE), false),
+            (
+                format!("QONTINUI_GATE_ID=\"{GATE}\" QONTINUI_GATE_DEVICE_ID=\"{DEVICE}\" "),
+                String::new()
+            )
+        );
+        let (prefix, suffix) = resume_gate_env(Some(GATE), Some(DEVICE), true);
+        assert_eq!(
+            prefix,
+            format!(
+                "$env:QONTINUI_GATE_ID=\"{GATE}\"; $env:QONTINUI_GATE_DEVICE_ID=\"{DEVICE}\"; "
+            )
+        );
+        // PowerShell `$env:` outlives the command: cleared once claude returns.
+        assert_eq!(
+            suffix,
+            "; Remove-Item Env:QONTINUI_GATE_ID, Env:QONTINUI_GATE_DEVICE_ID \
+             -ErrorAction SilentlyContinue"
+        );
+    }
+
+    #[test]
+    fn gate_identity_is_canonicalised_before_it_is_interpolated() {
+        let braced = format!("  {{{}}} ", GATE.to_uppercase());
+        let (prefix, _) = resume_gate_env(Some(&braced), Some(DEVICE), false);
+        assert!(
+            prefix.starts_with(&format!("QONTINUI_GATE_ID=\"{GATE}\" ")),
+            "{prefix}"
+        );
+    }
+
+    #[test]
+    fn gate_identity_is_both_or_neither_and_never_interpolates_junk() {
+        let none = (String::new(), String::new());
+        assert_eq!(resume_gate_env(Some(GATE), None, false), none);
+        assert_eq!(resume_gate_env(None, Some(DEVICE), true), none);
+        assert_eq!(
+            resume_gate_env(Some(GATE), Some("x; rm -rf /"), false),
+            none
+        );
+        assert_eq!(resume_gate_env(Some("\"$(id)\""), Some(DEVICE), true), none);
+        assert_eq!(resume_gate_env(None, None, false), none);
     }
 }
