@@ -67,6 +67,7 @@ pub mod coord_transport_rung; // WHICH transport rung carried a coord call — t
 pub mod create; // Remote-CREATE grants: the `create_request` directive arm + device-bound catch-up poll — the attach twin, so the target verifies a create grant itself instead of trusting the relay (plan 2026-09-11-headless-runner-parity-from-a-headed-runner, Phase 3b)
 pub mod dual_write;
 pub mod handoff;
+pub mod identity_stamp; // Reports every session id this machine can resolve (account root + names, live or ended) to coord's POST /coord/session-identity/:device_id (plan 2026-10-19-session-lookup-by-name-shows-claude-account-in-web, Phase 2)
 pub mod intent;
 pub mod local_store;
 pub mod observation_epoch; // The last instant the liveness poll could SEE the process table — bounds open-row restore admission (plan 2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set, Phase 2)
@@ -96,6 +97,7 @@ pub mod finished_close; // The wind-down executor's `finished_close` arm: switch
 pub mod tracking_health;
 pub mod transcript_autobind; // The watcher binds EVERY transcript it sees to a coord session (plan 2026-10-06-closed-sessions-whose-work-is-unfinished-are-found-fleet-wide-and-resumed, Phase 1)
 pub mod transcript_emitter;
+pub mod transcript_last_turn; // When a transcript last had a TURN, cached per (len, mtime) — orders a migrated session's copies and stamps last_acted_at (plan 2026-10-19-session-lookup-by-name-shows-claude-account-in-web, Phase 2)
 pub mod transport;
 pub mod wind_down_executor; // The wind-down TICK — the only place that closes a session for wind-down, drained (plan 2026-09-13-drained-runner-never-reaches-idle, Phase 4) or finished (plan 2026-10-03-finished-runner-sessions-close-their-window-without-a-drain)
 pub mod wind_down_observer; // Wind-down eligibility observation — the one entry point readiness and the drain wind-down tick share (plan 2026-09-13-drained-runner-never-reaches-idle)

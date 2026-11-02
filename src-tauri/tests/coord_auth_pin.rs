@@ -217,6 +217,14 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     ("orchestration_loop/coord_gate.rs", "device-jwt-required", 1),
     ("pair.rs", "bootstrap", 1),
     ("pair.rs", "not-coord", 2),
+    // The session-identity reporter's POST to coord's
+    // /coord/session-identity/:device_id (plan
+    // `2026-10-19-session-lookup-by-name-shows-claude-account-in-web` Phase 2).
+    // It presents the paired-device JWT it resolved itself via
+    // `device_bearer_scoped(TenantScope::Device)` and returns before the POST
+    // when there is none: the door refuses any other credential, so the
+    // fail-soft defaulting helper (which would send anonymously) is wrong here.
+    ("session/identity_stamp.rs", "device-jwt-required", 1),
     ("session_bus.rs", "device-jwt-required", 1),
     ("session_bus.rs", "not-coord", 1),
     ("terminal/context_watcher.rs", "not-coord", 1),
