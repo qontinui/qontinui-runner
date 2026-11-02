@@ -6,7 +6,8 @@ import { useDisplayTitleResolver } from "./displayTitle";
 import type { LayoutPreset } from "./useZoneLayout";
 import {
   clearTabFilter,
-  pruneTabFilters,
+  dropTabFilters,
+  tabsClosedOnPage,
   setTabFilter,
   toggleFilterInputTab,
   zoneFiltersFor,
@@ -99,7 +100,7 @@ type GridAction =
   | { type: "SET_TAB_FILTER"; tabId: string; value: string }
   | { type: "CLEAR_TAB_FILTER"; tabId: string }
   | { type: "TOGGLE_FILTER_INPUT"; tabId: string }
-  | { type: "PRUNE_TAB_FILTERS"; live: ReadonlySet<string> }
+  | { type: "DROP_TAB_FILTERS"; closed: ReadonlySet<string> }
   | { type: "SET_COL_RATIOS"; ratios: number[] }
   | { type: "SET_ROW_RATIOS"; ratios: number[] }
   | { type: "TICK_UPTIME" };
@@ -116,12 +117,12 @@ function gridReducer(state: GridState, action: GridAction): GridState {
       return { ...state, tabFilters: clearTabFilter(state.tabFilters, action.tabId) };
     case "TOGGLE_FILTER_INPUT":
       return { ...state, filterInputTab: toggleFilterInputTab(state.filterInputTab, action.tabId) };
-    case "PRUNE_TAB_FILTERS": {
-      const pruned = pruneTabFilters(state.tabFilters, state.filterInputTab, action.live);
-      if (pruned.filters === state.tabFilters && pruned.openInput === state.filterInputTab) {
+    case "DROP_TAB_FILTERS": {
+      const kept = dropTabFilters(state.tabFilters, state.filterInputTab, action.closed);
+      if (kept.filters === state.tabFilters && kept.openInput === state.filterInputTab) {
         return state;
       }
-      return { ...state, tabFilters: pruned.filters, filterInputTab: pruned.openInput };
+      return { ...state, tabFilters: kept.filters, filterInputTab: kept.openInput };
     }
     case "SET_COL_RATIOS":
       return { ...state, colRatios: action.ratios };
@@ -284,10 +285,16 @@ function ZoneGridInner({
     [gridState.tabFilters, gridAssignments],
   );
   const showFilterInput = zoneOfTab(gridAssignments, gridState.filterInputTab);
-  // A closed session's filter goes with it.
+  // A filter goes when its tab leaves the page on screen: it closed, or it moved
+  // to another window, whose grid never had the filter. A tab that closes while
+  // its page is not on screen keeps an entry nothing reads; tab ids are not reused.
+  const previousTabs = useRef({ pageId, tabIds: new Set(tabs.map((t) => t.id)) });
   useEffect(() => {
-    dispatch({ type: "PRUNE_TAB_FILTERS", live: new Set(tabs.map((t) => t.id)) });
-  }, [tabs]);
+    const tabIds = new Set(tabs.map((t) => t.id));
+    const closed = tabsClosedOnPage(previousTabs.current, pageId, tabIds);
+    previousTabs.current = { pageId, tabIds };
+    if (closed.size > 0) dispatch({ type: "DROP_TAB_FILTERS", closed });
+  }, [tabs, pageId]);
 
   // ── Prompts panel: which sessions are showing the operator's own prompts ──
   //

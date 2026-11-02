@@ -1267,6 +1267,13 @@ export function useZoneLayout(
         : { layoutId, assignments, focusedZone },
     [workMode, gridSnapshot, layoutId, assignments, focusedZone],
   );
+  // `gridView`, read live. A restore run keeps its `zoneLayout` for as long as it
+  // takes, through trims and page switches, and must place into the grid as it is.
+  const gridViewRef = useRef(gridView);
+  useEffect(() => {
+    gridViewRef.current = gridView;
+  }, [gridView]);
+  const readGridView = useCallback(() => gridViewRef.current, []);
 
   /**
    * The zone whose label, notes, pin, tags and filter a rendered zone shows
@@ -1420,6 +1427,7 @@ export function useZoneLayout(
     replaceTab,
     reportMountedTabs,
     gridView,
+    readGridView,
     cosmeticZoneFor,
     revealRequest,
     requestReveal,

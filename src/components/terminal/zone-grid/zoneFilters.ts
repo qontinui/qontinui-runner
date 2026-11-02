@@ -60,19 +60,33 @@ export function zoneOfTab(
  * closed session's entry does not outlive it. Same identity when nothing was
  * dropped.
  */
-export function pruneTabFilters(
+export function dropTabFilters(
   filters: TabFilters,
   openInput: string | null,
-  live: ReadonlySet<string>,
+  closed: ReadonlySet<string>,
 ): { filters: TabFilters; openInput: string | null } {
   let next: Record<string, string> | null = null;
   for (const tabId of Object.keys(filters)) {
-    if (live.has(tabId)) continue;
+    if (!closed.has(tabId)) continue;
     next ??= { ...filters };
     delete next[tabId];
   }
   return {
     filters: next ?? filters,
-    openInput: openInput !== null && !live.has(openInput) ? null : openInput,
+    openInput: openInput !== null && closed.has(openInput) ? null : openInput,
   };
+}
+
+/**
+ * The tabs that left between two renders of ONE page. The grid survives a page
+ * switch, so a tab missing after a switch is on another page, not gone, and its
+ * filter has to be there when the operator comes back.
+ */
+export function tabsClosedOnPage(
+  previous: { pageId: string; tabIds: ReadonlySet<string> },
+  pageId: string,
+  tabIds: ReadonlySet<string>,
+): ReadonlySet<string> {
+  if (previous.pageId !== pageId) return new Set();
+  return new Set([...previous.tabIds].filter((id) => !tabIds.has(id)));
 }
