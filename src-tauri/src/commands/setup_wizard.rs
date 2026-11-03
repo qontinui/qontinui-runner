@@ -898,78 +898,159 @@ pub async fn github_clone_repo(repo: String, dest_parent: String) -> Result<Valu
 // Claude Config Directory Discovery (pure Rust, no Python CLI)
 // ============================================================================
 
+/// Where Windows fleet boxes keep their per-account Claude config dirs
+/// (`C:\claude\.claude-<id>`).
+const WINDOWS_MULTI_ACCOUNT_ROOT: &str = "C:\\claude";
+
 /// Auto-discover Claude Code config directories on this machine.
 ///
-/// Scans common locations for directories containing a `projects/` subfolder:
-/// - `CLAUDE_CONFIG_DIR` env var
-/// - `C:\claude\.claude-*\` (multi-account setups)
-/// - `%USERPROFILE%\.claude` (standard location)
-/// - `%LOCALAPPDATA%\claude` (alternate install)
+/// Every result has a `projects/` subfolder. In order:
+/// 0. the roster ALREADY configured on this machine (`claude-accounts.json`),
+///    so discovery never offers less than what is configured;
+/// 1. `CLAUDE_CONFIG_DIR`;
+/// 2. per-account `.claude-*` dirs under `C:\claude` (Windows fleet layout)
+///    and under the home directory (`$HOME` on Linux/macOS, `%USERPROFILE%`
+///    on Windows);
+/// 3. the default `.claude` in the home directory, only when no per-account
+///    dir was found;
+/// 4. `%LOCALAPPDATA%\claude`.
+///
+/// Arms 0 and the home half of 2 are what keep the first-run wizard from
+/// EMPTYING the roster on Linux. The wizard pre-checks every result and saves
+/// the checked set over the machine-global roster, and discovery used to look
+/// only in Windows locations, so on a Linux box it found nothing and the
+/// wizard wrote `[]` over 17 configured accounts (nawa, 2026-11-03: every new
+/// session then fell back to the ambient `~/.claude`).
 #[tauri::command]
 pub fn discover_claude_config_dirs() -> Result<Vec<Value>, String> {
     info!("Setup wizard: discovering Claude Code config directories");
+    let configured = settings::get_claude_config_dirs();
+    let results = discover_claude_config_dirs_in(
+        |name| std::env::var(name).ok(),
+        std::path::Path::new(WINDOWS_MULTI_ACCOUNT_ROOT),
+        &configured,
+    );
+    info!(
+        "Discovered {} Claude config directories ({} already configured)",
+        results.len(),
+        configured.len()
+    );
+    Ok(results)
+}
+
+/// The discovery itself, over an injected environment lookup, Windows
+/// multi-account root and configured roster, so tests never read the real
+/// process env, the real home directory or the real roster.
+fn discover_claude_config_dirs_in(
+    env: impl Fn(&str) -> Option<String>,
+    windows_root: &std::path::Path,
+    configured: &[String],
+) -> Vec<Value> {
+    use std::path::{Path, PathBuf};
+
     let mut results: Vec<Value> = Vec::new();
+    // Keyed by the canonical path, so `C:/Users/x/.claude-a` and
+    // `C:\Users\x\.claude-a` (HOME and USERPROFILE on one Windows box) are
+    // one entry. The ORIGINAL spelling is what is returned.
     let mut seen = std::collections::HashSet::new();
 
-    let mut add = |path: std::path::PathBuf, label: &str, source: &str| {
-        let path_str = path.to_string_lossy().to_string();
-        if path.join("projects").exists() && seen.insert(path_str.clone()) {
+    let mut add = |path: PathBuf, label: &str, source: &str| {
+        if !path.join("projects").is_dir() {
+            return;
+        }
+        let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if seen.insert(key) {
             results.push(serde_json::json!({
-                "path": path_str,
+                "path": path.to_string_lossy().to_string(),
                 "label": label,
                 "source": source,
             }));
         }
     };
+    let label_of = |p: &Path, fallback: &str| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| fallback.to_string())
+    };
+
+    // Whether a per-account `.claude-*` config dir is configured or found; it
+    // decides arm 3.
+    let mut found_per_account = false;
+    let is_per_account = |p: &Path| {
+        p.join("projects").is_dir()
+            && p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(".claude-"))
+    };
+
+    // 0. The configured roster.
+    for dir in configured {
+        let p = PathBuf::from(dir);
+        let label = label_of(&p, dir);
+        found_per_account |= is_per_account(&p);
+        add(p, &label, "configured");
+    }
 
     // 1. CLAUDE_CONFIG_DIR env var
-    if let Ok(env_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-        let p = std::path::PathBuf::from(&env_dir);
-        let label = p
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| env_dir.clone());
+    if let Some(env_dir) = env("CLAUDE_CONFIG_DIR").filter(|v| !v.trim().is_empty()) {
+        let p = PathBuf::from(&env_dir);
+        let label = label_of(&p, &env_dir);
         add(p, &label, "CLAUDE_CONFIG_DIR env var");
     }
 
-    // 2. Scan C:\claude\.claude-*\ (multi-account setups on Windows)
-    let mut found_per_account = false;
-    let claude_root = std::path::Path::new("C:\\claude");
-    if claude_root.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(claude_root) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if name.starts_with(".claude-") {
-                            let label = name.to_string();
-                            add(path, &label, "auto-detected");
-                            found_per_account = true;
-                        }
-                    }
-                }
-            }
+    // The home directory: $HOME (Linux/macOS, and Git Bash on Windows) and
+    // %USERPROFILE% (Windows). Both may name the same dir; `seen` dedupes.
+    let homes: Vec<PathBuf> = ["HOME", "USERPROFILE"]
+        .iter()
+        .filter_map(|var| env(var))
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .collect();
+
+    // 2. Per-account `.claude-*` dirs, under the Windows fleet root and home.
+    let mut roots: Vec<PathBuf> = vec![windows_root.to_path_buf()];
+    roots.extend(homes.iter().cloned());
+    for root in &roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        let mut accounts: Vec<(String, PathBuf)> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .filter_map(|p| {
+                let name = p.file_name()?.to_str()?.to_string();
+                name.starts_with(".claude-").then_some((name, p))
+            })
+            .collect();
+        // read_dir order is unspecified; the wizard lists these in order.
+        accounts.sort();
+        for (name, path) in accounts {
+            found_per_account |= is_per_account(&path);
+            add(path, &name, "auto-detected");
         }
     }
 
-    // 3. %USERPROFILE%\.claude (standard location)
-    // Skip the default dir when per-account dirs exist — it always shares
-    // credentials with one of them and would show as a duplicate.
+    // 3. The default `.claude` in the home directory. Skipped when per-account
+    // dirs exist (configured or found): it always shares credentials with one
+    // of them and would show as a duplicate. (A `.claude` that is in the
+    // configured roster was already kept by arm 0.)
     if !found_per_account {
-        if let Ok(home) = std::env::var("USERPROFILE") {
-            let home_claude = std::path::PathBuf::from(&home).join(".claude");
-            add(home_claude, ".claude", "home directory");
+        for home in &homes {
+            add(home.join(".claude"), ".claude", "home directory");
         }
     }
 
     // 4. %LOCALAPPDATA%\claude (alternate install location)
-    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-        let local_claude = std::path::PathBuf::from(&local_app_data).join("claude");
-        add(local_claude, "claude (LocalAppData)", "auto-detected");
+    if let Some(local_app_data) = env("LOCALAPPDATA").filter(|v| !v.trim().is_empty()) {
+        add(
+            PathBuf::from(&local_app_data).join("claude"),
+            "claude (LocalAppData)",
+            "auto-detected",
+        );
     }
 
-    info!("Discovered {} Claude config directories", results.len());
-    Ok(results)
+    results
 }
 
 // ============================================================================
@@ -1999,5 +2080,227 @@ mod tests {
             backend_error_message(&Value::Null, status, "starting the GitHub connect"),
             "starting the GitHub connect failed with status 400 Bad Request"
         );
+    }
+
+    // ── Claude config dir discovery ─────────────────────────────────────────
+    //
+    // Every case runs against a temp HOME and a temp (absent) Windows root,
+    // never the real home directory, roster or process env.
+
+    fn mkdirs(root: &std::path::Path, rels: &[&str]) {
+        for rel in rels {
+            std::fs::create_dir_all(root.join(rel)).unwrap();
+        }
+    }
+
+    fn found_paths(results: &[Value]) -> Vec<String> {
+        results
+            .iter()
+            .map(|v| v["path"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn found_sources(results: &[Value]) -> Vec<String> {
+        results
+            .iter()
+            .map(|v| v["source"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn discovery_finds_per_account_dirs_under_a_unix_home() {
+        // The nawa layout: accounts at $HOME/.claude-<id>, plus the default
+        // $HOME/.claude, plus a `.claude-x` that is not a config dir at all.
+        let home = tempfile::tempdir().unwrap();
+        let no_windows_root = home.path().join("no-such-windows-root");
+        mkdirs(
+            home.path(),
+            &[
+                ".claude-b/projects",
+                ".claude-a/projects",
+                ".claude/projects",
+                ".claude-x",
+            ],
+        );
+        let h = home.path().to_string_lossy().to_string();
+
+        let results =
+            discover_claude_config_dirs_in(env_of(&[("HOME", &h)]), &no_windows_root, &[]);
+
+        assert_eq!(
+            found_paths(&results),
+            vec![
+                home.path().join(".claude-a").to_string_lossy().to_string(),
+                home.path().join(".claude-b").to_string_lossy().to_string(),
+            ],
+            "sorted per-account dirs; the default .claude is skipped beside them; \
+             a .claude-* without projects/ is not a config dir"
+        );
+        assert!(found_sources(&results).iter().all(|s| s == "auto-detected"));
+    }
+
+    #[test]
+    fn discovery_offers_the_default_dir_when_there_are_no_per_account_dirs() {
+        let home = tempfile::tempdir().unwrap();
+        let no_windows_root = home.path().join("no-such-windows-root");
+        // A `.claude-x` without projects/ must not suppress the default dir.
+        mkdirs(home.path(), &[".claude/projects", ".claude-x"]);
+        let h = home.path().to_string_lossy().to_string();
+
+        let results =
+            discover_claude_config_dirs_in(env_of(&[("HOME", &h)]), &no_windows_root, &[]);
+
+        assert_eq!(
+            found_paths(&results),
+            vec![home.path().join(".claude").to_string_lossy().to_string()]
+        );
+        assert_eq!(found_sources(&results), vec!["home directory".to_string()]);
+    }
+
+    #[test]
+    fn discovery_never_offers_less_than_the_configured_roster() {
+        // A configured account outside any scanned location, and one the
+        // home scan also finds: both come back, each exactly once, configured
+        // ones first.
+        let home = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let no_windows_root = home.path().join("no-such-windows-root");
+        mkdirs(home.path(), &[".claude-a/projects", ".claude-b/projects"]);
+        mkdirs(elsewhere.path(), &["acct/projects"]);
+        let h = home.path().to_string_lossy().to_string();
+        let outside = elsewhere.path().join("acct").to_string_lossy().to_string();
+        let scanned_too = home.path().join(".claude-b").to_string_lossy().to_string();
+
+        let results = discover_claude_config_dirs_in(
+            env_of(&[("HOME", &h)]),
+            &no_windows_root,
+            &[outside.clone(), scanned_too.clone()],
+        );
+
+        assert_eq!(
+            found_paths(&results),
+            vec![
+                outside,
+                scanned_too,
+                home.path().join(".claude-a").to_string_lossy().to_string(),
+            ]
+        );
+        assert_eq!(
+            found_sources(&results),
+            vec!["configured", "configured", "auto-detected"]
+        );
+    }
+
+    #[test]
+    fn a_configured_per_account_dir_suppresses_the_default_dir_too() {
+        // The roster names a per-account dir outside every scanned root; the
+        // home holds only the default `.claude`. The skip rule must still
+        // apply, or the wizard pre-checks `.claude` into the rotation.
+        let home = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let no_windows_root = home.path().join("no-such-windows-root");
+        mkdirs(home.path(), &[".claude/projects"]);
+        mkdirs(elsewhere.path(), &[".claude-z/projects"]);
+        let h = home.path().to_string_lossy().to_string();
+        let configured = elsewhere
+            .path()
+            .join(".claude-z")
+            .to_string_lossy()
+            .to_string();
+
+        let results = discover_claude_config_dirs_in(
+            env_of(&[("HOME", &h)]),
+            &no_windows_root,
+            std::slice::from_ref(&configured),
+        );
+
+        assert_eq!(found_paths(&results), vec![configured]);
+    }
+
+    #[test]
+    fn a_configured_default_dir_is_kept_beside_per_account_dirs() {
+        // Arm 0 keeps whatever is configured, the default dir included.
+        let home = tempfile::tempdir().unwrap();
+        let no_windows_root = home.path().join("no-such-windows-root");
+        mkdirs(home.path(), &[".claude/projects", ".claude-a/projects"]);
+        let h = home.path().to_string_lossy().to_string();
+        let default_dir = home.path().join(".claude").to_string_lossy().to_string();
+
+        let results = discover_claude_config_dirs_in(
+            env_of(&[("HOME", &h)]),
+            &no_windows_root,
+            std::slice::from_ref(&default_dir),
+        );
+
+        assert_eq!(
+            found_paths(&results),
+            vec![
+                default_dir,
+                home.path().join(".claude-a").to_string_lossy().to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn discovery_drops_a_configured_dir_that_is_not_a_config_dir() {
+        // save_claude_config_dirs keeps only dirs with projects/, so offering
+        // one without it would only be dropped again at save time.
+        let home = tempfile::tempdir().unwrap();
+        let no_windows_root = home.path().join("no-such-windows-root");
+        let gone = home
+            .path()
+            .join("deleted-account")
+            .to_string_lossy()
+            .to_string();
+
+        let results = discover_claude_config_dirs_in(env_of(&[]), &no_windows_root, &[gone]);
+
+        assert!(results.is_empty(), "got {results:?}");
+    }
+
+    #[test]
+    fn discovery_reads_the_windows_root_and_claude_config_dir() {
+        let base = tempfile::tempdir().unwrap();
+        let windows_root = base.path().join("claude");
+        mkdirs(&windows_root, &[".claude-w/projects"]);
+        mkdirs(base.path(), &["env-dir/projects"]);
+        let env_dir = base.path().join("env-dir").to_string_lossy().to_string();
+
+        let results = discover_claude_config_dirs_in(
+            env_of(&[("CLAUDE_CONFIG_DIR", &env_dir)]),
+            &windows_root,
+            &[],
+        );
+
+        assert_eq!(
+            found_paths(&results),
+            vec![
+                env_dir,
+                windows_root.join(".claude-w").to_string_lossy().to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn discovery_dedupes_home_and_userprofile_naming_one_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let no_windows_root = home.path().join("no-such-windows-root");
+        mkdirs(home.path(), &[".claude-a/projects"]);
+        let h = home.path().to_string_lossy().to_string();
+
+        let results = discover_claude_config_dirs_in(
+            env_of(&[("HOME", &h), ("USERPROFILE", &h)]),
+            &no_windows_root,
+            &[],
+        );
+
+        assert_eq!(results.len(), 1, "got {results:?}");
+    }
+
+    #[test]
+    fn discovery_with_nothing_on_the_machine_is_empty() {
+        let base = tempfile::tempdir().unwrap();
+        let results = discover_claude_config_dirs_in(env_of(&[]), &base.path().join("absent"), &[]);
+        assert!(results.is_empty());
     }
 }
