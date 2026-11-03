@@ -977,7 +977,7 @@ fn read_configured_roster(
 ) -> Result<Vec<String>, String> {
     if let Some(path) = roster_file.filter(|p| crate::claude_accounts::is_unreadable(p)) {
         return Err(format!(
-            "{} exists but cannot be read; repair it or run install-claude-accounts.sh, then retry",
+            "{} exists but cannot be read; repair or remove it, then retry",
             path.display()
         ));
     }
@@ -2432,9 +2432,10 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains(&roster.display().to_string()), "{err}");
-        assert!(err.contains("install-claude-accounts.sh"), "{err}");
+        assert!(err.contains("repair or remove it, then retry"), "{err}");
         assert!(
-            !err.contains("setup"),
+            !err.replace(&roster.display().to_string(), "")
+                .contains("setup"),
             "the message is shared with Settings: {err}"
         );
     }
