@@ -61,10 +61,12 @@ pub struct TypedClaudeResume {
 /// must be a strict UUID (what every restore surface types), so prose
 /// containing "claude" can't false-positive. A bare `claude --resume`
 /// (interactive picker form) has no id and does NOT match. Neither does an
-/// invocation carrying `--fork-session`: it resumes the named session into a
-/// NEW one, so the pane will not run the id the line names, and recording it
+/// invocation that will not run the named id in this pane — recording it
 /// there (authoritatively, for a line the shell read) would bind a session the
-/// pane does not run. The fork's own SessionStart hook reports what it runs.
+/// pane does not run: `--fork-session` resumes the named session into a NEW
+/// one, and `--bg` / `--background` returns at once, continuing the session in
+/// the background or starting a copy of it (Claude Code 2.1.317's `--help`).
+/// Those flags are matched unquoted, as the shell passes them.
 pub fn parse_typed_claude_resume(line: &str) -> Option<TypedClaudeResume> {
     for segment in line.split([';', '&', '|']) {
         let mut tokens = segment.split_whitespace();
@@ -77,10 +79,7 @@ pub fn parse_typed_claude_resume(line: &str) -> Option<TypedClaudeResume> {
             continue;
         }
         let rest: Vec<&str> = tokens.collect();
-        if rest
-            .iter()
-            .any(|t| *t == "--fork-session" || t.starts_with("--fork-session="))
-        {
+        if rest.iter().any(|t| runs_elsewhere_flag(unquoted(t))) {
             continue;
         }
         for (i, t) in rest.iter().enumerate() {
@@ -91,7 +90,7 @@ pub fn parse_typed_claude_resume(line: &str) -> Option<TypedClaudeResume> {
                     .or_else(|| t.strip_prefix("--session-id="))
             };
             let Some(cand) = candidate else { continue };
-            let cand = cand.trim_matches(|c| c == '"' || c == '\'');
+            let cand = unquoted(cand);
             if is_session_uuid(cand) {
                 return Some(TypedClaudeResume {
                     claude_session_id: cand.to_ascii_lowercase(),
@@ -106,10 +105,27 @@ pub fn parse_typed_claude_resume(line: &str) -> Option<TypedClaudeResume> {
     None
 }
 
+/// `token` without the quotes a shell would strip from around it.
+fn unquoted(token: &str) -> &str {
+    token.trim_matches(|c| c == '"' || c == '\'')
+}
+
+/// Whether `flag` (unquoted) makes `claude` run the named session somewhere
+/// other than this pane under that id: `--fork-session` (a NEW id), and
+/// `--bg` / `--background` (in the background, or a copy) — bare or `=`-valued.
+fn runs_elsewhere_flag(flag: &str) -> bool {
+    ["--fork-session", "--bg", "--background"]
+        .iter()
+        .any(|name| {
+            flag.strip_prefix(name)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('='))
+        })
+}
+
 /// Whether `token` names the `claude` CLI — bare, extensioned, or
 /// path-qualified (`/usr/local/bin/claude`, `C:\…\claude.exe`).
 fn is_claude_program(token: &str) -> bool {
-    let t = token.trim_matches(|c| c == '"' || c == '\'');
+    let t = unquoted(token);
     let base = t.rsplit(['/', '\\']).next().unwrap_or(t);
     matches!(base, "claude" | "claude.exe" | "claude.cmd" | "claude.ps1")
 }
@@ -508,6 +524,27 @@ mod tests {
         }
         // Another segment of the same line is judged on its own.
         assert!(parse(&format!("claude --fork-session; claude --resume {id}")).is_some());
+    }
+
+    /// Review N5: the flags are matched as the shell passes them, so a quoted
+    /// `--fork-session` forks all the same; and a `--bg` / `--background`
+    /// launch runs the session in the background (or a copy of it), not in
+    /// the pane.
+    #[test]
+    fn a_quoted_fork_or_a_background_launch_names_no_session_for_the_pane() {
+        let id = "0f9e8d7c-6b5a-4938-8271-605f4e3d2c1b";
+        for line in [
+            format!("claude --resume {id} \"--fork-session\""),
+            format!("claude '--fork-session' --resume {id}"),
+            format!("claude --resume {id} --bg"),
+            format!("claude --background --resume={id}"),
+            format!("claude --resume {id} '--bg'"),
+            format!("claude --resume {id} --background=true"),
+        ] {
+            assert_eq!(parse(&line), None, "{line}");
+        }
+        // A longer flag that merely starts the same way is not one of them.
+        assert!(parse(&format!("claude --resume {id} --bgcolor")).is_some());
     }
 
     #[test]

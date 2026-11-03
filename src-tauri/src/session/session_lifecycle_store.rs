@@ -60,7 +60,7 @@ use tracing::{debug, info, warn};
 
 use crate::session::observation_epoch::{ObservationEpoch, Observed};
 use crate::session::pane_binding::{
-    BindingCounters, PaneEvidence, PaneEvidenceOracle, PaneObservation,
+    BindingCounters, ObserveOutcome, PaneEvidence, PaneEvidenceOracle, PaneObservation,
 };
 use crate::session::restore_record_emitter::RestoreRecordEmitter;
 use crate::session::snapshot_history::{SnapshotHistory, SnapshotSession, TranscriptProbe};
@@ -415,10 +415,11 @@ pub fn describe_restore_status(
 }
 
 /// How recently `r` STARTED on its terminal, as the terminal-keyed readers
-/// rank it ([`SessionLifecycleStore::latest_open_on_terminal`]): the latest
-/// SessionStart hook this process saw for it (`hooks`: session id → hook
-/// order), then the durable hook stamp, then `confirmed_at`, `last_seen_at`
-/// and `opened_at`. Greater is more recent.
+/// rank it ([`SessionLifecycleStore::latest_open_on_terminal`]): its latest
+/// start this process saw — a SessionStart hook, or an authoritative write
+/// that placed its row (`hooks`: session id → start order) — then the durable
+/// start stamp, then `confirmed_at`, `last_seen_at` and `opened_at`. Greater
+/// is more recent.
 fn start_rank(
     hooks: &HashMap<String, u64>,
     r: &TerminalSessionRecord,
@@ -755,11 +756,13 @@ pub struct TerminalSessionRecord {
     /// What it decides: a row read `unknown` still holds its session — against
     /// the reconcile pass's provider-registry and argv rungs and its
     /// transcript correlation (rungs 2b, 2 and 3) — when a strong bind placed
-    /// it, its pane still runs a `claude`, and it is the session that most
+    /// it, its pane still runs a `claude`, it is the session that most
     /// recently started on that pane
-    /// ([`SessionLifecycleStore::latest_started_on_terminal`]). So a row a
-    /// WEAK bind put on the wrong pane, or a strong row its pane has since
-    /// moved past (a `/clear`, an in-TUI `/resume`, an exited `claude`), is
+    /// ([`SessionLifecycleStore::latest_started_on_terminal`]), and that pane's
+    /// current top-level `claude` did not start after it did, beyond a launch
+    /// margin ([`Self::last_session_start_at`]). So a row a WEAK bind put on
+    /// the wrong pane, or a strong row its pane has since moved past (a
+    /// `/clear`, an in-TUI `/resume`, an exited `claude`, a newer `claude`), is
     /// moved from another pane's record. `#[serde(default)]`: rows written
     /// before the field load `false` — healable, as every row was before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1017,12 +1020,17 @@ pub struct TerminalSessionRecord {
     /// field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adopted_from: Option<String>,
-    /// Unix millis of the most recent provider SessionStart hook that reported
-    /// this id ([`SessionLifecycleStore::note_session_start_hook`]) — when its
-    /// process last started (or resumed into) its terminal. The durable half of
-    /// [`SessionLifecycleStore::latest_open_on_terminal`]'s ranking, so a pane
-    /// whose operator ran `/resume` still resolves to the resumed session after
-    /// a restart. `None` = no hook seen, or the record predates the field.
+    /// Unix millis of when this session last STARTED on its terminal: the most
+    /// recent provider SessionStart hook that reported this id
+    /// ([`SessionLifecycleStore::note_session_start_hook`]), or the most recent
+    /// authoritative write that created the row or moved it onto a terminal
+    /// (a rung-2/2b bind, the typed-resume sniff for a line the shell read, a
+    /// pinned spawn — whose process may fire no hook at all), whichever came
+    /// last. The
+    /// durable half of [`SessionLifecycleStore::latest_open_on_terminal`]'s
+    /// ranking, so a pane whose operator ran `/resume` still resolves to the
+    /// resumed session after a restart. `None` = no start seen, or the record
+    /// predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_session_start_at: Option<i64>,
     /// The `coord.gates` row this session is a continuation of — the same value
@@ -1254,9 +1262,11 @@ pub struct SessionLifecycleStore {
     /// superseded PTY cannot outlive the runner that spawned it, so there is
     /// nothing to persist. Consumed on first match.
     superseded_terminals: Mutex<HashSet<String>>,
-    /// Process-local ORDER of provider SessionStart hooks: a monotonic counter
-    /// and, per session id, the counter value of the most recent hook that
-    /// reported it ([`Self::note_session_start_hook`]). It answers "which of the
+    /// Process-local ORDER of session starts: a monotonic counter and, per
+    /// session id, the counter value of its most recent start — a provider
+    /// SessionStart hook that reported it ([`Self::note_session_start_hook`]),
+    /// or an authoritative write that created its row or moved it onto a
+    /// terminal ([`Self::record_open_checked`]). It answers "which of the
     /// open sessions on this terminal STARTED most recently", which
     /// [`Self::latest_open_on_terminal`] needs: `confirmed_at` is monotonic (a
     /// typed `claude --resume X` of a session confirmed earlier keeps X's OLD
@@ -1700,10 +1710,26 @@ impl SessionLifecycleStore {
     }
 
     /// Hand the attached oracle a reconcile pass's observation of the live
-    /// panes. Returns the epoch the oracle gave it — what the verdicts taken
-    /// from it are tagged with. `None` without an oracle.
-    pub fn observe_panes(&self, observation: PaneObservation) -> Option<u64> {
-        self.pane_evidence.get()?.observe(observation)
+    /// panes, and learn what became of it: the epoch it was stored under (what
+    /// the verdicts taken from it are tagged with), or that the oracle already
+    /// holds a LATER read, in which case the pass judges and binds nothing from
+    /// it. [`ObserveOutcome::Unnumbered`] without an oracle.
+    pub fn observe_panes(&self, observation: PaneObservation) -> ObserveOutcome {
+        match self.pane_evidence.get() {
+            Some(oracle) => oracle.observe(observation),
+            None => ObserveOutcome::Unnumbered,
+        }
+    }
+
+    /// When `terminal_id`'s pane's current top-level `claude` started, per the
+    /// attached oracle's fresh observation
+    /// ([`PaneEvidenceOracle::pane_started_ms`]). `None` for a blank id,
+    /// without an oracle, or when unknown.
+    pub(crate) fn pane_started_ms(&self, terminal_id: &str) -> Option<i64> {
+        if terminal_id.trim().is_empty() {
+            return None;
+        }
+        self.pane_evidence.get()?.pane_started_ms(terminal_id)
     }
 
     /// What `terminal_id`'s pane records, per the attached oracle.
@@ -2235,10 +2261,21 @@ impl SessionLifecycleStore {
             }
             // Placement: a strong write that lands the row on a terminal places
             // it strongly; a weak one that creates or moves it, weakly; a weak
-            // one in place leaves the placement as it was.
+            // one in place leaves the placement as it was. A strong write that
+            // creates the row or moves it is also the session's START on that
+            // terminal, stamped here, under the lock that places it, exactly as
+            // a SessionStart hook stamps one: a rung-2/2b bind, the sniff and a
+            // pinned spawn record starts whose process may fire no hook at all,
+            // and an unstamped start would rank below an older hooked row on
+            // the same pane — the row the binder then lets hold the session
+            // against its own pane.
             if !new_terminal_id.trim().is_empty() {
                 if new_is_authoritative {
                     entry.placed_strongly = true;
+                    if moved || is_new_record {
+                        entry.last_session_start_at = Some(now);
+                        self.order_start(&new_id);
+                    }
                 } else if moved || is_new_record {
                     entry.placed_strongly = false;
                 }
@@ -4277,6 +4314,13 @@ impl SessionLifecycleStore {
                 warn!(error = %e, "session_lifecycle_store: lock poisoned on note_session_start_hook");
             }
         }
+        self.order_start(claude_session_id);
+    }
+
+    /// Order `claude_session_id`'s start after every start this process has
+    /// seen so far ([`Self::session_start_hooks`]). Takes the hook-order lock,
+    /// so a caller holding `map` keeps the LOCK ORDER — `map` then hooks.
+    fn order_start(&self, claude_session_id: &str) {
         let mut g = self.hook_order();
         g.0 += 1;
         let seq = g.0;
@@ -4304,9 +4348,10 @@ impl SessionLifecycleStore {
     ///
     /// 0. a row whose [`TerminalSessionRecord::binding_state`] is not `unknown`
     ///    outranks one that is — the pane's own `claude` contradicts that row;
-    /// 1. the latest SessionStart hook seen for the id in this process
-    ///    ([`Self::note_session_start_hook`]) — a row with one outranks a row
-    ///    without;
+    /// 1. the latest start seen for the id in this process — a SessionStart
+    ///    hook ([`Self::note_session_start_hook`]), or an authoritative write
+    ///    that created the row or moved it onto a terminal — a row with one
+    ///    outranks a row without;
     /// 2. then the durable [`TerminalSessionRecord::last_session_start_at`] —
     ///    the same fact, surviving a restart or a holder handoff, whose adopted
     ///    panes fire no new hook;
@@ -9104,7 +9149,7 @@ mod tests {
         let matched_on_a = Some(("term-a".to_string(), BindingState::Matched));
         assert_eq!(served(&store), None, "no observation yet");
 
-        let first = store.observe_panes(PaneObservation::default());
+        let first = store.observe_panes(PaneObservation::default()).epoch();
         assert_eq!(
             store.set_binding_state("s", "term-a", BindingState::Matched, first),
             Some(None)
@@ -9113,7 +9158,7 @@ mod tests {
         store.serve_verdicts_from(first.unwrap());
         assert_eq!(served(&store), matched_on_a);
 
-        let second = store.observe_panes(PaneObservation::default());
+        let second = store.observe_panes(PaneObservation::default()).epoch();
         assert_ne!(first, second);
         assert_eq!(
             served(&store),
@@ -9147,6 +9192,122 @@ mod tests {
             Some(BindingState::Unknown)
         );
         assert!(reloaded.current_binding_verdicts().is_empty());
+    }
+
+    /// Review N6: the floor admits every verdict from the servable
+    /// observation ON — `>=`, not `==`. A bind's `matched` taken from an
+    /// observation newer than the floor (stored after the pass raised it, and
+    /// before the next pass does) is current.
+    #[test]
+    fn a_bind_time_verdict_from_an_observation_past_the_floor_is_current() {
+        use crate::session::claude_activity::LivePid;
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.attach_pane_evidence(Arc::new(
+            crate::session::pane_binding::LivePaneRegistry::new(),
+        ));
+        let floor = store
+            .observe_panes(PaneObservation::default())
+            .epoch()
+            .unwrap();
+        store.serve_verdicts_from(floor);
+        let me = std::process::id();
+        let newer = store
+            .observe_panes(PaneObservation {
+                panes: [(
+                    "term-a".to_string(),
+                    vec![LivePid {
+                        pid: me,
+                        process_started_ms: None,
+                    }],
+                )]
+                .into_iter()
+                .collect(),
+                sessions: [(me, "s".to_string())].into_iter().collect(),
+                read_at: None,
+            })
+            .epoch()
+            .unwrap();
+        assert!(newer > floor, "precondition: an observation past the floor");
+
+        store.record_open(auth_on("s", "term-a"));
+
+        assert_eq!(
+            store
+                .current_binding_verdicts()
+                .get("s")
+                .map(|v| (v.terminal_id.as_str(), v.state)),
+            Some(("term-a", BindingState::Matched)),
+            "the bind's matched, from observation {newer}, is current over floor {floor}"
+        );
+    }
+
+    /// Review F1/F2: an authoritative write that creates a row or moves it onto
+    /// a terminal is that session's START there — stamped under the placing
+    /// lock like a SessionStart hook, so it outranks an older hooked row on the
+    /// same pane. A weak write, and an authoritative one in place, stamp
+    /// nothing.
+    #[test]
+    fn an_authoritative_placement_is_a_start_on_its_terminal() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let started = |id: &str| store.get(id).unwrap().last_session_start_at;
+        let latest_on_a = || store.latest_started_on_terminal("term-a");
+        // Each row is written, then confirmed, as the hook route does: a
+        // confirmed row is no phantom for a later authoritative write's
+        // supersede to retire, so every row below stays open beside the others.
+        let place = |id: &str, terminal: &str| {
+            store.record_open(auth_on(id, terminal));
+            store.confirm_session(id);
+        };
+        place("x", "term-a");
+        store.note_session_start_hook("x");
+        // Placed on ANOTHER pane before y is, so only a start stamped by its
+        // move below can rank it above y.
+        place("s", "term-b");
+        assert_eq!(latest_on_a().as_deref(), Some("x"));
+
+        // A weak write creating a row on the pane is no start.
+        let mut weak = rec("w");
+        weak.terminal_id = "term-a".to_string();
+        weak.origin = Some(ORIGIN_OBSERVED.to_string());
+        store.record_open(weak);
+        store.confirm_session("w");
+        assert_eq!(started("w"), None);
+        assert_eq!(
+            latest_on_a().as_deref(),
+            Some("x"),
+            "the hooked x still leads"
+        );
+
+        // An authoritative write creating one is: y outranks the hooked x.
+        place("y", "term-a");
+        assert!(started("y").is_some());
+        assert_eq!(latest_on_a().as_deref(), Some("y"));
+
+        // So is one moving a row onto the pane...
+        place("s", "term-a");
+        assert_eq!(
+            latest_on_a().as_deref(),
+            Some("s"),
+            "the move started s here"
+        );
+
+        // ...but not one re-recording a row in place.
+        place("y", "term-a");
+        assert_eq!(
+            latest_on_a().as_deref(),
+            Some("s"),
+            "re-asserting y where it already sits is no new start"
+        );
+        for id in ["x", "w", "y", "s"] {
+            let row = store.get(id).unwrap();
+            assert_eq!(
+                (row.state.as_str(), row.terminal_id.as_str()),
+                ("open", "term-a"),
+                "{id}: every row is still open on the pane, competing"
+            );
+        }
     }
 
     /// Review M1(a): the store records how a row was last placed on its
@@ -9208,7 +9369,7 @@ mod tests {
         store.attach_binding_counters(counters.clone());
         store.record_open(auth_on("s", "term-a"));
         let judge = |panes: &[(&str, PaneEvidence)]| {
-            let epoch = store.observe_panes(PaneObservation::default());
+            let epoch = store.observe_panes(PaneObservation::default()).epoch();
             let evidence: HashMap<String, PaneEvidence> = panes
                 .iter()
                 .map(|(t, e)| (t.to_string(), e.clone()))

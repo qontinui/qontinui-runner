@@ -336,11 +336,44 @@ pub trait PaneEvidenceOracle: Send + Sync + std::fmt::Debug {
         (self.pane_evidence(terminal_id), self.current_epoch())
     }
 
-    /// Each reconcile pass hands over what it saw. Returns the epoch the
-    /// observation was given — `None` from an oracle that numbers none, or
-    /// when it was not stored because the oracle holds one read later.
-    fn observe(&self, _observation: PaneObservation) -> Option<u64> {
+    /// When the pane's current top-level `claude` started (the newest of its
+    /// live top-level processes, millis), per a fresh observation. `None` when
+    /// unknown. The reconcile pass decides what it says about a row: one whose
+    /// last start predates it by more than a launch margin was stamped for an
+    /// earlier process ([`crate::session::reconcile`]).
+    fn pane_started_ms(&self, _terminal_id: &str) -> Option<i64> {
         None
+    }
+
+    /// Each reconcile pass hands over what it saw, and learns what became of
+    /// it ([`ObserveOutcome`]).
+    fn observe(&self, _observation: PaneObservation) -> ObserveOutcome {
+        ObserveOutcome::Unnumbered
+    }
+}
+
+/// What became of an observation handed to the oracle
+/// ([`PaneEvidenceOracle::observe`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObserveOutcome {
+    /// Stored and numbered: the verdicts taken from it carry this epoch.
+    Stored(u64),
+    /// Stored by an oracle that numbers nothing (or no oracle at all): the
+    /// verdicts taken from it carry no epoch and are never current.
+    Unnumbered,
+    /// NOT stored: the oracle holds an observation read later. A pass judges
+    /// and binds nothing from it — its evidence is older than what the oracle
+    /// already answers with.
+    Superseded,
+}
+
+impl ObserveOutcome {
+    /// The epoch the verdicts taken from it carry, if it was numbered.
+    pub fn epoch(self) -> Option<u64> {
+        match self {
+            ObserveOutcome::Stored(epoch) => Some(epoch),
+            ObserveOutcome::Unnumbered | ObserveOutcome::Superseded => None,
+        }
     }
 }
 
@@ -511,7 +544,24 @@ impl PaneEvidenceOracle for LivePaneRegistry {
             .flatten()
     }
 
-    fn observe(&self, observation: PaneObservation) -> Option<u64> {
+    fn pane_started_ms(&self, terminal_id: &str) -> Option<i64> {
+        self.with_latest(|observed, fresh| {
+            if !fresh {
+                return None;
+            }
+            observed
+                .observation
+                .panes
+                .get(terminal_id)?
+                .iter()
+                .filter(|p| crate::process_capture::health::pid_alive(p.pid))
+                .filter_map(|p| p.process_started_ms)
+                .max()
+        })
+        .flatten()
+    }
+
+    fn observe(&self, observation: PaneObservation) -> ObserveOutcome {
         // The new observation replaces whatever the lock held, so a poisoned
         // lock is recovered by writing through it — then cleared, and the next
         // poisoning is reported again.
@@ -524,7 +574,7 @@ impl PaneEvidenceOracle for LivePaneRegistry {
         // read before the one held is older evidence, and is not stored (a
         // poisoned lock is still recovered by writing through it).
         if !self.latest.is_poisoned() && held.as_ref().is_some_and(|newer| newer.at > at) {
-            return None;
+            return ObserveOutcome::Superseded;
         }
         // Numbered under the lock, so epochs rise in the order observations
         // are stored; aged from when its records were read.
@@ -540,7 +590,7 @@ impl PaneEvidenceOracle for LivePaneRegistry {
             self.poison_reported.store(false, Ordering::Relaxed);
             info!("session binder: pane registry lock recovered by a new observation");
         }
-        Some(epoch)
+        ObserveOutcome::Stored(epoch)
     }
 }
 
@@ -1063,23 +1113,25 @@ mod tests {
         let registry = LivePaneRegistry::new();
         assert_eq!(registry.pane_evidence("never-seen"), PaneEvidence::NoClaude);
         assert_eq!(registry.current_epoch(), None, "nothing observed yet");
-        let first = registry.observe(PaneObservation {
-            panes: [
-                ("t-empty".to_string(), Vec::new()),
-                // pid 0 is never alive: a claude that has exited since.
-                ("t-exited".to_string(), vec![live(0)]),
-            ]
-            .into_iter()
-            .collect(),
-            sessions: [(0, "s-gone".to_string())].into_iter().collect(),
-            read_at: None,
-        });
+        let first = registry
+            .observe(PaneObservation {
+                panes: [
+                    ("t-empty".to_string(), Vec::new()),
+                    // pid 0 is never alive: a claude that has exited since.
+                    ("t-exited".to_string(), vec![live(0)]),
+                ]
+                .into_iter()
+                .collect(),
+                sessions: [(0, "s-gone".to_string())].into_iter().collect(),
+                read_at: None,
+            })
+            .epoch();
         assert_eq!(registry.pane_evidence("t-empty"), PaneEvidence::NoClaude);
         assert_eq!(registry.pane_evidence("t-exited"), PaneEvidence::NoClaude);
         assert!(registry.panes_naming("s-gone").is_empty());
         assert!(first.is_some());
         assert_eq!(registry.current_epoch(), first);
-        let second = registry.observe(PaneObservation::default());
+        let second = registry.observe(PaneObservation::default()).epoch();
         assert!(
             second > first,
             "each observation is numbered after the last"
@@ -1146,7 +1198,7 @@ mod tests {
         assert_eq!(registry.current_epoch(), None);
         assert!(registry.poison_reported.load(Ordering::Relaxed));
 
-        let epoch = registry.observe(seen());
+        let epoch = registry.observe(seen()).epoch();
         assert!(!registry.latest.is_poisoned(), "recovered by the write");
         assert!(
             !registry.poison_reported.load(Ordering::Relaxed),
@@ -1186,7 +1238,7 @@ mod tests {
         assert_eq!(slow.current_epoch(), None);
 
         let registry = LivePaneRegistry::new();
-        let epoch = registry.observe(seen(Some(Instant::now())));
+        let epoch = registry.observe(seen(Some(Instant::now()))).epoch();
         assert!(epoch.is_some());
         assert_eq!(
             registry.pane_evidence_at("t-seen"),
@@ -1196,8 +1248,9 @@ mod tests {
     }
 
     /// Review N2: two passes can hand over out of order. An observation read
-    /// BEFORE the one held is older evidence: it is not stored, gets no epoch,
-    /// and the held one keeps answering.
+    /// BEFORE the one held is older evidence: it is not stored, and the oracle
+    /// says so (`Superseded`, which ends its pass — review F3), while the held
+    /// one keeps answering.
     #[test]
     fn an_observation_read_before_the_held_one_does_not_replace_it() {
         let me = std::process::id();
@@ -1211,9 +1264,12 @@ mod tests {
         let earlier = Instant::now();
         let later = earlier + Duration::from_millis(1);
         let registry = LivePaneRegistry::new();
-        let held = registry.observe(naming("s-newer", later));
+        let held = registry.observe(naming("s-newer", later)).epoch();
         assert!(held.is_some());
-        assert_eq!(registry.observe(naming("s-older", earlier)), None);
+        assert_eq!(
+            registry.observe(naming("s-older", earlier)),
+            ObserveOutcome::Superseded
+        );
         assert_eq!(
             registry.pane_evidence_at("t-seen"),
             (names("s-newer"), held)
@@ -1300,16 +1356,18 @@ mod tests {
                 &no_proc_start,
                 TranscriptTail::Skip,
             );
-            registry.observe(PaneObservation {
-                panes: [
-                    ("t-live".to_string(), pids),
-                    ("t-dead".to_string(), vec![live(0)]),
-                ]
-                .into_iter()
-                .collect(),
-                sessions: sessions_from_readings(&readings),
-                read_at: None,
-            })
+            registry
+                .observe(PaneObservation {
+                    panes: [
+                        ("t-live".to_string(), pids),
+                        ("t-dead".to_string(), vec![live(0)]),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    sessions: sessions_from_readings(&readings),
+                    read_at: None,
+                })
+                .epoch()
         };
 
         let registry = LivePaneRegistry::new();
@@ -1455,5 +1513,103 @@ mod tests {
             "closed",
             "the healed pane's stale tenant is retired by the confirmed bind"
         );
+    }
+
+    /// Review F3: a pass whose observation the oracle refuses — it already
+    /// holds one read LATER, by a pass that overlapped this one — judges and
+    /// binds nothing: no verdict stored, no transition counted, no row bound
+    /// or retired, and the later observation still answers. The same pass
+    /// over a registry holding nothing newer binds the pane from its record
+    /// and retires the stale row.
+    #[tokio::test]
+    async fn a_pass_whose_observation_is_superseded_judges_and_binds_nothing() {
+        use crate::session::reconcile::{run_reconcile_pass, LivePty, ReconcileAction};
+        const WORKDIR: &str = "/work/superseded";
+        let ambient = crate::test_env::isolated_ambient();
+        let config = ambient.dir().join(".claude");
+        std::fs::create_dir_all(config.join("sessions")).unwrap();
+        let (shell, claude, started) = (4_300_101_u32, 4_300_102_u32, 1_700_000_000_i64);
+        let mut snapshot = ProcessSnapshot::default();
+        snapshot.parent_map.insert(shell, vec![claude]);
+        snapshot.names.insert(shell, "bash".to_string());
+        snapshot.names.insert(claude, "claude".to_string());
+        snapshot.creation_times.insert(claude, started);
+        std::fs::write(
+            config.join(format!("sessions/{claude}.json")),
+            format!(
+                r#"{{"pid":{claude},"sessionId":"s-a","startedAt":{},"status":"idle"}}"#,
+                started * 1000
+            ),
+        )
+        .unwrap();
+        let transcript =
+            crate::terminal::transcript::session_transcript_path(&config, WORKDIR, "s-a");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"user\",\"timestamp\":\"2023-11-14T22:30:00Z\"}\n",
+        )
+        .unwrap();
+        let live = vec![LivePty {
+            terminal_id: "term-a".to_string(),
+            pid: Some(shell),
+            working_dir: WORKDIR.to_string(),
+            page_id: "default".to_string(),
+            title: "term-a".to_string(),
+            ai_pid: None,
+            ai_start_unix: None,
+        }];
+        let store_over = |file: &str, registry: Arc<LivePaneRegistry>| {
+            let store = SessionLifecycleStore::open(ambient.dir().join(file)).unwrap();
+            store.attach_pane_evidence(registry);
+            let counters = Arc::new(BindingCounters::default());
+            store.attach_binding_counters(counters.clone());
+            // An earlier binder left s-x CONFIRMED on the pane, which runs s-a.
+            store.record_open(TerminalSessionRecord {
+                working_dir: Some(WORKDIR.to_string()),
+                confirmed_at: Some(1),
+                ..seam_row("s-x", "term-a")
+            });
+            (store, counters)
+        };
+
+        let later = Arc::new(LivePaneRegistry::new());
+        let held = later
+            .observe(PaneObservation {
+                panes: HashMap::new(),
+                sessions: HashMap::new(),
+                read_at: Some(Instant::now() + Duration::from_secs(3_600)),
+            })
+            .epoch();
+        assert!(held.is_some());
+        let (store, counters) = store_over("superseded.json", later.clone());
+        let actions = run_reconcile_pass(&store, &live, &snapshot, "test").await;
+        assert!(actions.is_empty(), "{actions:?}");
+        assert!(store.get("s-a").is_none(), "nothing bound");
+        let stale = store.get("s-x").unwrap();
+        assert_eq!(
+            (stale.state.as_str(), stale.binding_state),
+            ("open", None),
+            "nothing judged, nothing retired"
+        );
+        assert!(store.current_binding_verdicts().is_empty());
+        assert_eq!(counters.mismatches(), 0);
+        assert_eq!(
+            later.current_epoch(),
+            held,
+            "the later observation still answers"
+        );
+
+        // The control: the same pass, with nothing newer held.
+        let (store, _counters) = store_over("fresh.json", Arc::new(LivePaneRegistry::new()));
+        let actions = run_reconcile_pass(&store, &live, &snapshot, "test").await;
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                ReconcileAction::Bind { session_id, .. } if session_id == "s-a"
+            )),
+            "{actions:?}"
+        );
+        assert_eq!(store.get("s-x").unwrap().state, "closed", "{actions:?}");
     }
 }
