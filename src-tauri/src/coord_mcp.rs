@@ -23783,6 +23783,27 @@ pub(crate) mod doctor {
         let binding_store_unknown = binding_store.is_unknown();
         let binding_store_failed = binding_store.failed();
 
+        // Phase 7 (plan 2026-09-20): what the refresher did about each
+        // binding gap — the per-binding seed attempt and its outcome, and
+        // whether the operator was asked. Scoped to the account exactly as the
+        // UI's `get_binding_gap_asks` is, so it never crosses an account switch.
+        let binding_gap_lapses = {
+            let tenant_slots = am.try_list_tenant_device_jwt_tenants().ok();
+            let legacy_present = am
+                .get_access_token()
+                .map(|t| !t.trim().is_empty())
+                .unwrap_or(false);
+            let account = crate::mcp::device_jwt_refresher::binding_gap_ask_account(
+                legacy_present,
+                tenant_slots.as_deref(),
+                qontinui_runner_lib::pair::read_paired_user_id_from_disk(),
+            );
+            crate::mcp::device_jwt_refresher::binding_gap_lapses_report(
+                crate::mcp::device_jwt_refresher::binding_gap_ask_path().as_deref(),
+                account.as_deref(),
+            )
+        };
+
         let (verdict, layer, detail) = verdict_for(
             &selected,
             &legacy,
@@ -23811,6 +23832,10 @@ pub(crate) mod doctor {
             "binding_store": binding_store,
             "binding_store_failed": binding_store_failed,
             "binding_store_unknown": binding_store_unknown,
+            // `{"lapses": [...]}` or `{"unknown": "<why>"}` — the latter is
+            // NOT "no lapses". A `seed_not_bound: true` lapse opens no ask and
+            // is visible here only.
+            "binding_gap_lapses": binding_gap_lapses,
             "slot_health": crate::mcp::device_jwt_refresher::tenant_slot_health()
                 .map(|h| serde_json::json!({
                     "observed_at_unix": h.observed_at_unix,
