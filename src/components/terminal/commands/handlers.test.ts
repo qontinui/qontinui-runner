@@ -41,7 +41,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { canonicalArgs, run } from "./pipeline.testkit";
 import { ARM_VARIANTS, loadRealRegistry, type RealRegistryHarness } from "./realRegistry.testkit";
@@ -352,6 +352,90 @@ describe("handlers — the no-ops that used to render as effects", () => {
       ["zone.setLayoutId", ["quad", { source: "operator" }]],
     ]);
     expect(reportOf(o.value).affected).toBe(0);
+  });
+
+  /**
+   * `/layout --page` sets the page it names, and every part of the verdict is
+   * read off THAT page. The session on screen is a two-tab quad in grid mode, so
+   * a handler that read the wrong page's `tabs`, `layoutId` or `workMode` reports
+   * something different from each of these.
+   */
+  describe("`/layout --page`", () => {
+    afterEach(() => h.setOtherPages());
+
+    const layout = async (input: string) => {
+      h.reset();
+      return run(input, (id) => h.byId(id));
+    };
+
+    it("sets the named page and leaves the page on screen alone", async () => {
+      h.setOtherPages({ "page-2": { layoutId: "single", tabCount: 3 } });
+      const o = await layout("/layout 4 --page page-2");
+      expect(o.verdict).toBe("ok");
+      expect(h.calls.map((c) => [c.name, c.args])).toEqual([
+        ["page.page-2.setLayoutId", ["quad", { source: "operator" }]],
+      ]);
+      expect(reportOf(o.value).affected).toBe(1);
+    });
+
+    it("predicts auto-grow from the named page's tabs", async () => {
+      h.setOtherPages({ "page-2": { layoutId: "single", tabCount: 7 } });
+      const o = await layout("/layout split --page page-2");
+      expect(reportOf(o.value).detail).toBe("grew to full-grid — 7 sessions do not fit split");
+    });
+
+    it("compares against the named page's layout, not the one on screen", async () => {
+      h.setOtherPages({ "page-2": { layoutId: "split", tabCount: 2 } });
+      expect(reportOf((await layout("/layout split --page page-2")).value).affected).toBe(0);
+      expect(reportOf((await layout("/layout quad --page page-2")).value).affected).toBe(1);
+    });
+
+    it("reports the named page leaving tmux mode", async () => {
+      h.setOtherPages({ "page-2": { layoutId: "single", tabCount: 2, workMode: "tmux" } });
+      const o = await layout("/layout split --page page-2");
+      expect(reportOf(o.value).detail).toBe("left tmux mode — split");
+      expect(reportOf(o.value).affected).toBe(1);
+    });
+
+    it("treats the page on screen's own id as the page on screen", async () => {
+      const o = await layout("/layout split --page page-1");
+      expect(o.verdict).toBe("ok");
+      expect(h.callNames()).toEqual(["zone.setLayoutId"]);
+    });
+
+    it("refuses a page with no scope and sets nothing", async () => {
+      const o = await layout("/layout quad --page nope");
+      expect(o.verdict).toBe("error:no-page");
+      expect(h.calls).toEqual([]);
+    });
+
+    it("refuses a blank page rather than falling back to the page on screen", async () => {
+      h.reset();
+      const result = await h.byId("terminal.layout").handler({ preset: "quad", page: "  " }, {
+        source: "direct",
+      } as never);
+      expect(result).toMatchObject({ ok: false, code: "no-page" });
+      expect(h.calls).toEqual([]);
+    });
+  });
+
+  /**
+   * The typed form accepts what `/layout` accepts. `layout 3` already resolves
+   * to `triptych`, so a `layout triptych` that fell through to the fuzzy tier
+   * would be the command refusing its own answer. Walks `LAYOUT_IDS`, so a new
+   * preset fails here until the patterns name it.
+   */
+  it("every layout id has both typed forms", async () => {
+    const { LAYOUT_IDS } = await import("./useTerminalCommands");
+    const { patterns } = h.byId("terminal.layout");
+    for (const id of LAYOUT_IDS) {
+      expect(patterns?.some((p) => p.test(`layout ${id}`))).toBe(true);
+      expect(patterns?.some((p) => p.test(`${id} layout`))).toBe(true);
+    }
+    h.reset();
+    const o = await run("layout 1-plus-4", (id) => h.byId(id));
+    expect(o.verdict).toBe("ok");
+    expect(h.calls.map((c) => c.args[0])).toEqual(["1-plus-4"]);
   });
 
   /**
