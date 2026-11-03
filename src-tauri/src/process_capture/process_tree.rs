@@ -54,6 +54,12 @@ pub struct ProcessSnapshot {
     /// absent here (access denied, protected process) is treated as a real
     /// image — never as a shim.
     pub exe_paths: HashMap<u32, String>,
+    /// When the enumeration BEGAN ([`snapshot_process_table_public`]) — no
+    /// process in the snapshot was read before it. A consumer that compares
+    /// the snapshot with something that happened since (the session binder,
+    /// against a row placed after it) dates the snapshot from here. `None`: a
+    /// snapshot built by hand.
+    pub taken_at: Option<std::time::Instant>,
 }
 
 /// Skew tolerance (millis) for the PID-reuse creation-time vs the reference
@@ -389,9 +395,13 @@ pub async fn discover_descendants_with_parent_map(
 }
 
 /// Take a fresh process-table snapshot — exposed for `orphan_state` so the
-/// startup reclaim pass can do its PID-reuse check without re-querying.
+/// startup reclaim pass can do its PID-reuse check without re-querying —
+/// stamped with when its enumeration began ([`ProcessSnapshot::taken_at`]).
 pub async fn snapshot_process_table_public() -> ProcessSnapshot {
-    snapshot_process_table().await
+    let taken_at = std::time::Instant::now();
+    let mut snapshot = snapshot_process_table().await;
+    snapshot.taken_at = Some(taken_at);
+    snapshot
 }
 
 /// Convenience wrapper: discover descendants only.

@@ -1820,9 +1820,6 @@ impl TerminalSession {
             )
         }?;
         let pinned_session_id = seam.pinned_session_id;
-        // Read before the command is sealed: whether the child this spawns IS
-        // the pinned `claude`, whose start the spawn then stamps.
-        let child_is_claude = Self::child_is_the_pinned_claude(&cmd, is_shell_pane);
 
         // ---- The canonical runner-context briefing --------------------------
         // Rendered HERE, immediately after the identity seam, and NOT in
@@ -1901,22 +1898,6 @@ impl TerminalSession {
                 &id, sealed, cols, rows,
             )?,
         };
-
-        // The child exists now. When it IS the `claude` the seam pinned (a
-        // direct-command pinned spawn), this is the session's start on the
-        // pane — stamped here, after the fork, and never by the seam's own
-        // record, which every tab writes before its child exists, plain shells
-        // included: a stamped phantom there would outrank the session a
-        // restore rebinds onto the pane. A shell pane's `claude` starts later,
-        // and its hook, its typed line or its bind stamps that start.
-        if child_is_claude {
-            use tauri::Manager;
-            if let Some(store) = app_handle.try_state::<
-                std::sync::Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>,
-            >() {
-                store.note_session_start(&pinned_session_id);
-            }
-        }
 
         Self::spawn_with_io(
             id,
@@ -3218,21 +3199,10 @@ impl TerminalSession {
         Some(t.to_string())
     }
 
-    /// Whether the pane's child IS the `claude` the identity seam pinned: a
-    /// direct command — no shell — whose program is `claude` or whose argv
-    /// names the session it runs ([`Self::explicit_session_id_from`]). Only
-    /// then is the spawn itself the session's start on the pane.
-    fn child_is_the_pinned_claude(cmd: &CommandBuilder, is_shell_pane: bool) -> bool {
-        !is_shell_pane
-            && (Self::argv_head_is_claude(cmd.get_argv())
-                || Self::explicit_session_id_from(cmd).is_some())
-    }
-
     /// True when argv's head names the claude CLI image (basename compare,
     /// tolerant of a path and a `.exe`/`.cmd`/`.bat` suffix).
     ///
-    /// Read by [`Self::child_is_the_pinned_claude`], and gates the SHORT `-r`
-    /// form. `--session-id` / `--resume` are
+    /// Gates the SHORT `-r` form only. `--session-id` / `--resume` are
     /// unambiguous long flags, but `-r` is an extremely common unrelated short
     /// flag (`cp -r`, `grep -r`, `ls -r`) and this seam builds a command for
     /// ARBITRARY direct spawns — an ungated `-r` could pin a path as a session
@@ -3533,10 +3503,6 @@ impl TerminalSession {
                 0,
                 crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
                 None,
-                // Not a start: every tab is recorded here, plain shells
-                // included, before its child exists. `spawn` stamps the start
-                // once the child exists, when it is the `claude`.
-                crate::session::session_lifecycle_store::StartRule::Never,
             );
             // A refusal (another live pane still runs this id) is already
             // logged at warn by `record_pinned_session_open`; the pane spawns
@@ -6779,35 +6745,6 @@ pub(crate) mod tests {
             .get_env(TerminalSession::PATH_ENV_KEY)
             .map(|v| v.to_string_lossy().to_string());
         assert_eq!(read.as_deref(), Some(new_path.as_str()));
-    }
-
-    /// Review F3: the spawn stamps a session's start only when the pane's
-    /// child IS the pinned `claude` — a direct command whose program is
-    /// `claude`, or whose argv names the session it runs — never for a shell
-    /// pane, whatever later runs in it, nor for any other direct command.
-    #[test]
-    fn only_a_direct_claude_child_is_its_sessions_start() {
-        let id = "0f9e8d7c-6b5a-4938-8271-605f4e3d2c1b";
-        let direct = |argv: &[&str]| {
-            TerminalSession::build_command_from(Some(argv.iter().map(|a| a.to_string()).collect()))
-        };
-        let child_is_claude = |cmd: &CommandBuilder, shell: bool| {
-            TerminalSession::child_is_the_pinned_claude(cmd, shell)
-        };
-        assert!(child_is_claude(
-            &direct(&["claude", "--session-id", id]),
-            false
-        ));
-        assert!(child_is_claude(&direct(&["/usr/local/bin/claude"]), false));
-        assert!(
-            child_is_claude(&direct(&["claude-work", "--resume", id]), false),
-            "a launcher whose argv names the session"
-        );
-        assert!(!child_is_claude(&direct(&["bash", "-c", "ls"]), false));
-        assert!(
-            !child_is_claude(&TerminalSession::build_command_from(None), true),
-            "a shell pane"
-        );
     }
 
     #[test]

@@ -61,23 +61,41 @@
 //! nawa (both read 2026-11-03). On those builds a pane's record names the
 //! session its process runs now, and the rules judge current evidence.
 //!
-//! No rule depends on that. On a build whose records do NOT follow switches —
-//! one this has not been read for — two cases go wrong:
+//! The rules assume it. On a build whose records do NOT follow switches — one
+//! this has not been read for — two cases go wrong, and nothing here guards
+//! against them:
 //!
-//! - A session entered by an in-TUI `/resume` is named by no pane, so a stale
-//!   record naming it (in the pane that launched it and has since switched
-//!   away) reads its row `unknown`, counted once per episode, and the census
-//!   withholds that pane's attribution while the `unknown` is current. The
-//!   row stays where its hook — a strong bind — put it, while it is the
-//!   session that most recently started on that pane and the pane still runs
-//!   a `claude` ([`TerminalSessionRecord::placed_strongly`]): rung 2b does not
-//!   move it.
-//! - A pane that ran `/clear` keeps naming its predecessor. Once no live pane
-//!   holds or runs that predecessor, rung 2b binds it back onto the pane,
-//!   authoritatively: a confirmed bind's supersede closes the row of the
+//! - **(i)** A session entered by an in-TUI `/resume` is named by no pane, so
+//!   a stale record naming it — in the pane that launched it and has since
+//!   switched away — reads its row `unknown` wherever its hook placed it,
+//!   counted once per episode, and rung 2b moves the row back onto the pane
+//!   whose stale record names it.
+//! - **(ii)** A pane that ran `/clear` keeps naming its predecessor. Once no
+//!   live pane holds or runs that predecessor, rung 2b binds it back onto the
+//!   pane, authoritatively: a confirmed bind's supersede closes the row of the
 //!   session the pane really runs, the pane's coord session is re-keyed to the
-//!   predecessor, and each later hook from the real session records it again
-//!   — the binding can alternate per hook.
+//!   predecessor, and each later hook from the real session records it again —
+//!   the binding can alternate per hook.
+//!
+//! Neither occurs on 2.1.316 or 2.1.317, whose records follow every switch (the
+//! bundle reading above).
+//!
+//! # A placement is never undone by evidence older than it
+//!
+//! A pass's evidence is the process table it enumerated and the records it
+//! read after that, so it can predate a write that placed a row since — a
+//! hook, the typed-resume sniff, a restore rebind, a spawn's pin. The store
+//! remembers, in memory, when each row was last placed (created, moved onto
+//! another terminal, or re-opened —
+//! [`SessionLifecycleStore::placed_after`]); each [`PaneObservation`] carries
+//! the instant its enumeration began ([`PaneObservation::enumerated_at`]). A
+//! row placed after that instant is not moved by the pass's rungs (2b, 2, 3
+//! and the mtime fallback,
+//! [`SessionLifecycleStore::record_bind_checked`]) and is not read `unknown`
+//! by rule 2 ([`SessionLifecycleStore::set_binding_state_from`]): the next
+//! pass, enumerated after the placement, judges it. `Instant` is monotonic,
+//! so no clock step reorders the two; the memory starts empty after a
+//! restart, which means "no recent placement".
 //!
 //! # Where it is read, and who reads the result
 //!
@@ -128,7 +146,7 @@ use tracing::{info, warn};
 use crate::process_capture::process_tree::{claude_pids_in_inclusive_subtree, ProcessSnapshot};
 use crate::session::claude_activity::{self, LivePid, RecordReading, TranscriptTail};
 use crate::session::session_lifecycle_store::{
-    BindingState, ProcessIdentity, SessionLifecycleStore, TerminalSessionRecord,
+    BindingState, SessionLifecycleStore, TerminalSessionRecord,
 };
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
@@ -288,14 +306,29 @@ pub async fn read_records_off_runtime(
 /// empty list for a live pane with no `claude`), and the session each pid's
 /// own record names. A pane absent from `panes` was not live; a pid absent
 /// from `sessions` has no readable record naming a session.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneObservation {
     pub panes: HashMap<String, Vec<LivePid>>,
     pub sessions: HashMap<u32, String>,
-    /// When the records were read — what the observation's age is measured
-    /// from ([`OBSERVATION_MAX_AGE`]), however long the pass took to hand it
-    /// over. `None`: when the oracle received it.
-    pub read_at: Option<Instant>,
+    /// When the enumeration of the process table it was built from BEGAN —
+    /// before any pid in it was read, and so no later than anything it saw.
+    /// The observation is aged from here ([`OBSERVATION_MAX_AGE`]), ordered
+    /// against other observations by it, and a row placed after it is newer
+    /// than everything it says ([`SessionLifecycleStore::placed_after`]).
+    pub enumerated_at: Instant,
+}
+
+/// An observation of no pane, enumerated now — what a test hands an oracle to
+/// number an epoch.
+#[cfg(test)]
+impl Default for PaneObservation {
+    fn default() -> Self {
+        Self {
+            panes: HashMap::new(),
+            sessions: HashMap::new(),
+            enumerated_at: Instant::now(),
+        }
+    }
 }
 
 impl PaneObservation {
@@ -336,18 +369,6 @@ pub trait PaneEvidenceOracle: Send + Sync + std::fmt::Debug {
         (self.pane_evidence(terminal_id), self.current_epoch())
     }
 
-    /// The process the pane runs as its top-level `claude` — its pid and
-    /// creation time — per a fresh observation, and when that observation was
-    /// read. `None` unless the pane has exactly ONE live top-level `claude`
-    /// whose creation time is known: several (one suspended beside a new one)
-    /// are not one process, and neither the newest nor the oldest of them is
-    /// the pane's. A row's start is bound to this process, and a strong row is
-    /// released when its pane runs another
-    /// ([`SessionLifecycleStore::bind_start_processes`]).
-    fn pane_process(&self, _terminal_id: &str) -> Option<(ProcessIdentity, Instant)> {
-        None
-    }
-
     /// Each reconcile pass hands over what it saw, and learns what became of
     /// it ([`ObserveOutcome`]).
     fn observe(&self, _observation: PaneObservation) -> ObserveOutcome {
@@ -365,9 +386,9 @@ pub enum ObserveOutcome {
     /// `observe`, which keeps nothing at all — or there is no oracle. The
     /// verdicts the pass takes carry no epoch and are never current.
     Unnumbered,
-    /// NOT stored: the oracle holds an observation read later. A pass judges
-    /// and binds nothing from it — its evidence is older than what the oracle
-    /// already answers with.
+    /// NOT stored: the oracle holds an observation enumerated later. A pass
+    /// judges and binds nothing from it — its evidence is older than what the
+    /// oracle already answers with.
     Superseded,
 }
 
@@ -388,7 +409,7 @@ impl ObserveOutcome {
 pub const OBSERVATION_MAX_AGE: Duration = Duration::from_secs(135);
 
 /// The production oracle: the latest reconcile pass's [`PaneObservation`],
-/// numbered by an epoch, aged from when its records were read, and answered
+/// numbered by an epoch, aged from when its enumeration began, and answered
 /// from memory. Each pid is re-checked for
 /// liveness on every query, so a `claude` that has exited since the pass
 /// cannot hold a row there:
@@ -548,30 +569,6 @@ impl PaneEvidenceOracle for LivePaneRegistry {
             .flatten()
     }
 
-    fn pane_process(&self, terminal_id: &str) -> Option<(ProcessIdentity, Instant)> {
-        self.with_latest(|observed, fresh| {
-            if !fresh {
-                return None;
-            }
-            let mut alive = observed
-                .observation
-                .panes
-                .get(terminal_id)?
-                .iter()
-                .filter(|p| crate::process_capture::health::pid_alive(p.pid));
-            let only = alive.next()?;
-            if alive.next().is_some() {
-                return None;
-            }
-            let process = ProcessIdentity {
-                pid: only.pid,
-                started_ms: only.process_started_ms?,
-            };
-            Some((process, observed.at))
-        })
-        .flatten()
-    }
-
     fn observe(&self, observation: PaneObservation) -> ObserveOutcome {
         // The new observation replaces whatever the lock held, so a poisoned
         // lock is recovered by writing through it — then cleared, and the next
@@ -580,15 +577,15 @@ impl PaneEvidenceOracle for LivePaneRegistry {
             self.report_poisoned();
             poisoned.into_inner()
         });
-        let at = observation.read_at.unwrap_or_else(Instant::now);
+        let at = observation.enumerated_at;
         // Two passes overlapping can hand over out of order: an observation
-        // read before the one held is older evidence, and is not stored (a
-        // poisoned lock is still recovered by writing through it).
+        // enumerated before the one held is older evidence, and is not stored
+        // (a poisoned lock is still recovered by writing through it).
         if !self.latest.is_poisoned() && held.as_ref().is_some_and(|newer| newer.at > at) {
             return ObserveOutcome::Superseded;
         }
         // Numbered under the lock, so epochs rise in the order observations
-        // are stored; aged from when its records were read.
+        // are stored; aged from when its enumeration began.
         let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed);
         *held = Some(Observed {
             observation,
@@ -758,11 +755,13 @@ pub fn binding_verdicts(
 /// lock). Every row that NEWLY reads `unknown` is logged and counted once — its
 /// episode lasts until it is matched, moves or closes — and returned. A verdict
 /// for a row that moved or closed since the verdicts were taken is dropped by
-/// the store.
+/// the store, and so is an `unknown` for a row placed after the evidence was
+/// enumerated (`enumerated_at`; [`SessionLifecycleStore::placed_after`]).
 pub fn apply_binding_verdicts(
     store: &SessionLifecycleStore,
     verdicts: &[BindingVerdict],
     epoch: Option<u64>,
+    enumerated_at: Option<Instant>,
 ) -> Vec<BindingVerdict> {
     let mut newly_unknown = Vec::new();
     for v in verdicts {
@@ -770,9 +769,13 @@ pub fn apply_binding_verdicts(
             store.withdraw_matched(&v.claude_session_id, &v.terminal_id);
             continue;
         };
-        let Some(previous) =
-            store.set_binding_state(&v.claude_session_id, &v.terminal_id, state, epoch)
-        else {
+        let Some(previous) = store.set_binding_state_from(
+            &v.claude_session_id,
+            &v.terminal_id,
+            state,
+            epoch,
+            enumerated_at,
+        ) else {
             continue;
         };
         if state == BindingState::Unknown && previous != Some(BindingState::Unknown) {
@@ -1065,6 +1068,7 @@ mod tests {
                 &store,
                 &binding_verdicts(&store.open_records(), &evidence),
                 Some(epoch),
+                None,
             )
         };
         let state = |id: &str| store.get(id).unwrap().binding_state;
@@ -1134,7 +1138,7 @@ mod tests {
                 .into_iter()
                 .collect(),
                 sessions: [(0, "s-gone".to_string())].into_iter().collect(),
-                read_at: None,
+                enumerated_at: Instant::now(),
             })
             .epoch();
         assert_eq!(registry.pane_evidence("t-empty"), PaneEvidence::NoClaude);
@@ -1153,7 +1157,7 @@ mod tests {
         stale.observe(PaneObservation {
             panes: [("t-seen".to_string(), Vec::new())].into_iter().collect(),
             sessions: HashMap::new(),
-            read_at: None,
+            enumerated_at: Instant::now(),
         });
         std::thread::sleep(Duration::from_millis(2));
         assert_eq!(
@@ -1188,7 +1192,7 @@ mod tests {
             sessions: [(std::process::id(), "s-seen".to_string())]
                 .into_iter()
                 .collect(),
-            read_at: None,
+            enumerated_at: Instant::now(),
         };
         registry.observe(seen());
         assert_eq!(registry.pane_evidence("t-seen"), names("s-seen"));
@@ -1220,36 +1224,37 @@ mod tests {
         assert_eq!(registry.current_epoch(), epoch);
     }
 
-    /// Review L5: an observation is aged from when its records were READ, not
-    /// from when the pass handed it over — a pass that spent its time on the
-    /// argv query and the prescan hands over an observation already that old.
-    /// And the evidence comes with the epoch of the observation it was read
-    /// from, in one read (review N2).
+    /// Review L5 (and round 10's L3): an observation is aged from when its
+    /// process table began to be ENUMERATED, not from when the pass handed it
+    /// over — a pass that spent its time reading records, on the argv query
+    /// and on the prescan hands over an observation already that old. And the
+    /// evidence comes with the epoch of the observation it was read from, in
+    /// one read (review N2).
     #[test]
-    fn an_observation_is_aged_from_when_its_records_were_read() {
+    fn an_observation_is_aged_from_when_its_enumeration_began() {
         let me = std::process::id();
-        let seen = |read_at: Option<Instant>| PaneObservation {
+        let seen = |enumerated_at: Instant| PaneObservation {
             panes: [("t-seen".to_string(), vec![live(me)])]
                 .into_iter()
                 .collect(),
             sessions: [(me, "s-seen".to_string())].into_iter().collect(),
-            read_at,
+            enumerated_at,
         };
-        let read_at = Instant::now()
+        let enumerated_at = Instant::now()
             .checked_sub(Duration::from_millis(100))
             .expect("the monotonic clock has run for 100 ms");
 
         let slow = LivePaneRegistry::with_max_age(Duration::from_millis(50));
-        slow.observe(seen(Some(read_at)));
+        let _ = slow.observe(seen(enumerated_at));
         assert_eq!(
             slow.pane_evidence_at("t-seen"),
             (PaneEvidence::Unknown, None),
-            "read 100 ms ago, past its 50 ms max age: stale the moment it is stored"
+            "enumerated 100 ms ago, past its 50 ms max age: stale the moment it is stored"
         );
         assert_eq!(slow.current_epoch(), None);
 
         let registry = LivePaneRegistry::new();
-        let epoch = registry.observe(seen(Some(Instant::now()))).epoch();
+        let epoch = registry.observe(seen(Instant::now())).epoch();
         assert!(epoch.is_some());
         assert_eq!(
             registry.pane_evidence_at("t-seen"),
@@ -1258,115 +1263,19 @@ mod tests {
         assert_eq!(registry.current_epoch(), epoch);
     }
 
-    /// Review N6/N8: a pane's process is its ONE live top-level `claude` with a
-    /// known creation time, read through the production path — the snapshot's
-    /// whole-second creation time made millis by [`top_level_claude`] — and
-    /// comes with the time its observation was read. A dead pid is not the
-    /// pane's process; neither is a `claude` with no creation time; a stale
-    /// observation answers nothing; and two live `claude`s are no single
-    /// process.
+    /// Review N2: two passes can hand over out of order. An observation
+    /// enumerated BEFORE the one held is older evidence: it is not stored, and
+    /// the oracle says so (`Superseded`, which ends its pass — review F3),
+    /// while the held one keeps answering.
     #[test]
-    fn a_pane_process_is_its_single_live_top_level_claude() {
+    fn an_observation_enumerated_before_the_held_one_does_not_replace_it() {
         let me = std::process::id();
-        const SHELL: u32 = 4_300_201;
-        const DEAD_CLAUDE: u32 = 4_300_202;
-        let mut snapshot = ProcessSnapshot::default();
-        snapshot.parent_map.insert(SHELL, vec![me]);
-        snapshot.names.insert(SHELL, "bash".to_string());
-        snapshot.names.insert(me, "claude".to_string());
-        snapshot.creation_times.insert(me, 1_700_000_123);
-        let top = top_level_claude(SHELL, &snapshot);
-        assert_eq!(
-            top,
-            vec![LivePid {
-                pid: me,
-                process_started_ms: Some(1_700_000_123_000)
-            }]
-        );
-        let observed = |panes: Vec<(&str, Vec<LivePid>)>| PaneObservation {
-            panes: panes
-                .into_iter()
-                .map(|(t, pids)| (t.to_string(), pids))
-                .collect(),
-            sessions: HashMap::new(),
-            read_at: None,
-        };
-
-        let registry = LivePaneRegistry::new();
-        let before = Instant::now();
-        let _ = registry.observe(observed(vec![
-            ("t-claude", top.clone()),
-            (
-                "t-dead",
-                vec![LivePid {
-                    pid: DEAD_CLAUDE,
-                    process_started_ms: Some(1_700_000_000_000),
-                }],
-            ),
-            (
-                "t-unknown-start",
-                vec![LivePid {
-                    pid: me,
-                    process_started_ms: None,
-                }],
-            ),
-            ("t-shell", Vec::new()),
-        ]));
-        let (process, read_at) = registry
-            .pane_process("t-claude")
-            .expect("one live top-level claude with a known start");
-        assert_eq!(
-            process,
-            ProcessIdentity {
-                pid: me,
-                started_ms: 1_700_000_123_000
-            }
-        );
-        assert!(read_at >= before, "the observation's own read time");
-        assert_eq!(registry.pane_process("t-dead"), None);
-        assert_eq!(registry.pane_process("t-unknown-start"), None);
-        assert_eq!(registry.pane_process("t-shell"), None);
-        assert_eq!(registry.pane_process("t-never-seen"), None);
-
-        #[cfg(unix)]
-        {
-            let parent = std::os::unix::process::parent_id();
-            let _ = registry.observe(observed(vec![(
-                "t-two",
-                vec![
-                    top[0],
-                    LivePid {
-                        pid: parent,
-                        process_started_ms: Some(1_700_000_000_000),
-                    },
-                ],
-            )]));
-            assert_eq!(
-                registry.pane_process("t-two"),
-                None,
-                "two live claudes are no single process"
-            );
-        }
-
-        let stale = LivePaneRegistry::with_max_age(Duration::ZERO);
-        let _ = stale.observe(observed(vec![("t-claude", top)]));
-        std::thread::sleep(Duration::from_millis(2));
-        assert_eq!(stale.pane_process("t-claude"), None, "a stale observation");
-    }
-
-    /// Review N2: two passes can hand over out of order. An observation read
-    /// BEFORE the one held is older evidence: it is not stored, and the oracle
-    /// says so (`Superseded`, which ends its pass — review F3), while the held
-    /// one keeps answering.
-    #[test]
-    fn an_observation_read_before_the_held_one_does_not_replace_it() {
-        let me = std::process::id();
-        let naming = |session: &str, read_at: Instant| PaneObservation {
+        let naming = |session: &str, enumerated_at: Instant| PaneObservation {
             panes: [("t-seen".to_string(), vec![live(me)])]
                 .into_iter()
                 .collect(),
             sessions: [(me, session.to_string())].into_iter().collect(),
-            read_at: Some(read_at),
+            enumerated_at,
         };
         let earlier = Instant::now();
         let later = earlier + Duration::from_millis(1);
@@ -1398,7 +1307,7 @@ mod tests {
                 sessions: [(std::process::id(), "s-live".to_string())]
                     .into_iter()
                     .collect(),
-                read_at: None,
+                enumerated_at: Instant::now(),
             });
         };
         let store_over = |registry: Arc<LivePaneRegistry>| {
@@ -1472,7 +1381,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                     sessions: sessions_from_readings(&readings),
-                    read_at: None,
+                    enumerated_at: Instant::now(),
                 })
                 .epoch()
         };
@@ -1619,6 +1528,122 @@ mod tests {
             store.get("s-x").unwrap().state,
             "closed",
             "the healed pane's stale tenant is retired by the confirmed bind"
+        );
+    }
+
+    /// Round 10, through the pass as the runner enters it: the pass dates its
+    /// evidence from when its process snapshot's enumeration BEGAN
+    /// ([`ProcessSnapshot::taken_at`]). Pane A ran `s` (hook) and pane B ran
+    /// `x` (hook); the snapshot is taken, then the typed-resume sniff for a
+    /// line B's shell read moves `s` onto B, and only then does the pass read
+    /// the records — still A naming `s`, B naming `x`. Dated from its
+    /// snapshot, that evidence predates the move: `s` stays on B, unjudged.
+    /// The same records dated NOW — a snapshot that carries no time — would be
+    /// newer than the move, and rung 2b would take `s` back to A.
+    #[tokio::test]
+    async fn the_pass_dates_its_evidence_from_its_snapshot_and_leaves_a_later_placement_alone() {
+        use crate::session::reconcile::{run_reconcile_pass, LivePty};
+        use crate::terminal::claude_resume_sniff::{
+            apply_typed_resume_effects, parse_typed_claude_resume, TypedLineTarget,
+        };
+        const WORKDIR: &str = "/work/placed-after";
+        const S: &str = "0f9e8d7c-6b5a-4938-8271-605f4e3d2c1b";
+        let ambient = crate::test_env::isolated_ambient();
+        let config = ambient.dir().join(".claude");
+        std::fs::create_dir_all(config.join("sessions")).unwrap();
+        // Only a dir with a `projects/` subtree is an account home whose
+        // records the pass reads (`session_archive::discovery`).
+        std::fs::create_dir_all(config.join("projects")).unwrap();
+        // (terminal, shell, claude, started secs, the session its record names)
+        let panes = [
+            ("term-a", 4_300_301_u32, 4_300_302_u32, 1_700_000_000_i64, S),
+            ("term-b", 4_300_303, 4_300_305, 1_699_999_900, "x"),
+        ];
+        let snapshot_taken = |taken_at: Option<Instant>| {
+            let mut snapshot = ProcessSnapshot::default();
+            for (_, shell, claude, started, _) in panes {
+                snapshot.parent_map.insert(shell, vec![claude]);
+                snapshot.names.insert(shell, "bash".to_string());
+                snapshot.names.insert(claude, "claude".to_string());
+                snapshot.creation_times.insert(claude, started);
+            }
+            snapshot.taken_at = taken_at;
+            snapshot
+        };
+        let mut live = Vec::new();
+        for (terminal, shell, claude, started, session) in panes {
+            std::fs::write(
+                config.join(format!("sessions/{claude}.json")),
+                format!(
+                    r#"{{"pid":{claude},"sessionId":"{session}","startedAt":{},"status":"idle"}}"#,
+                    started * 1000
+                ),
+            )
+            .unwrap();
+            live.push(LivePty {
+                terminal_id: terminal.to_string(),
+                pid: Some(shell),
+                working_dir: WORKDIR.to_string(),
+                page_id: "default".to_string(),
+                title: terminal.to_string(),
+                ai_pid: None,
+                ai_start_unix: None,
+            });
+        }
+        let store_with_s_moved_onto_b = |file: &str| {
+            let store = SessionLifecycleStore::open(ambient.dir().join(file)).unwrap();
+            store.attach_pane_evidence(Arc::new(LivePaneRegistry::new()));
+            for (id, terminal) in [(S, "term-a"), ("x", "term-b")] {
+                store.record_open(TerminalSessionRecord {
+                    working_dir: Some(WORKDIR.to_string()),
+                    ..seam_row(id, terminal)
+                });
+                store.confirm_session(id);
+                store.note_session_start_hook(id);
+            }
+            store
+        };
+        let sniff_moves_s_onto_b = |store: &SessionLifecycleStore| {
+            let parsed = parse_typed_claude_resume(&format!("claude --resume {S}")).unwrap();
+            apply_typed_resume_effects(
+                Some(store),
+                &parsed,
+                TypedLineTarget::Shell,
+                "term-b",
+                WORKDIR,
+                "default",
+                "term-b",
+                || {},
+                || {},
+            );
+            assert_eq!(store.get(S).unwrap().terminal_id, "term-b", "precondition");
+        };
+
+        let store = store_with_s_moved_onto_b("dated.json");
+        let snapshot = snapshot_taken(Some(Instant::now()));
+        std::thread::sleep(Duration::from_millis(2));
+        sniff_moves_s_onto_b(&store);
+        let actions = run_reconcile_pass(&store, &live, &snapshot, "test").await;
+        assert_eq!(
+            store.get("x").unwrap().binding_state,
+            Some(BindingState::Matched),
+            "the records were read: B's names x ({actions:?})"
+        );
+        let row = store.get(S).unwrap();
+        assert_eq!(
+            (row.terminal_id.as_str(), row.binding_state),
+            ("term-b", None),
+            "evidence older than the move: {actions:?}"
+        );
+
+        let store = store_with_s_moved_onto_b("undated.json");
+        sniff_moves_s_onto_b(&store);
+        std::thread::sleep(Duration::from_millis(2));
+        let actions = run_reconcile_pass(&store, &live, &snapshot_taken(None), "test").await;
+        assert_eq!(
+            store.get(S).unwrap().terminal_id,
+            "term-a",
+            "the same records dated after the move: {actions:?}"
         );
     }
 }

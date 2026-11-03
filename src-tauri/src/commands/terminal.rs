@@ -11,7 +11,7 @@ use crate::commands::CommandResponse;
 use crate::error::AppError;
 use crate::session::pane_store::{PaneKey, PaneSessionStore};
 use crate::session::session_lifecycle_store::{
-    CloseOutcome, RecordOpenOutcome, SessionLifecycleStore, StartRule, TerminalSessionRecord,
+    CloseOutcome, RecordOpenOutcome, SessionLifecycleStore, TerminalSessionRecord,
 };
 use crate::session::{Intent, SessionKind, SessionRegistry};
 use crate::terminal::visibility::VisibilityTier;
@@ -1384,8 +1384,6 @@ pub fn terminal_session_record_open(
         gate_consuming_device_id: None,
         gate_bound_boot_ms: None,
         binding_state: None,
-        placed_strongly: false,
-        start_process: None,
     };
     let session_id = record.claude_session_id.clone();
     let outcome = store.record_open_checked(record);
@@ -2876,9 +2874,6 @@ pub(crate) fn create_terminal_session_backend(
                     record_zone_index,
                     crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
                     gate_identity,
-                    // A re-record of the spawn's own pin: the spawn stamped
-                    // its start when the child is the `claude`.
-                    StartRule::Never,
                 );
                 let verify_dirs: Vec<std::path::PathBuf> = config_dir
                     .iter()
@@ -3048,8 +3043,6 @@ async fn poll_and_record_session<F>(
                 gate_consuming_device_id: gate_consuming_device_id.clone(),
                 gate_bound_boot_ms,
                 binding_state: None,
-                placed_strongly: false,
-                start_process: None,
             };
             match store.record_open_checked(record) {
                 RecordOpenOutcome::Recorded => info!(
@@ -3083,16 +3076,10 @@ async fn poll_and_record_session<F>(
 /// account-migration `--resume <id>` in the spawn argv) the instant the PTY
 /// exists — no transcript mtime race to lose.
 ///
-/// Returns what the store did ([`SessionLifecycleStore::record_open_checked_with`]).
+/// Returns what the store did ([`SessionLifecycleStore::record_open_checked`]).
 /// A pinned record is authoritative — a strong bind — so the binding guard
 /// never refuses it: it lands even off a live pane still running the session,
 /// which is the move an account migration's respawn makes.
-///
-/// `start` says whether the write is also the session's START on the
-/// terminal: always for the SessionStart hook route, which a started process
-/// reports; never for the spawn seam, which records every tab before its child
-/// exists — the spawn stamps that start itself once the child exists, when the
-/// child is the `claude` ([`SessionLifecycleStore::note_session_start`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_pinned_session_open(
     store: &SessionLifecycleStore,
@@ -3105,7 +3092,6 @@ pub(crate) fn record_pinned_session_open(
     zone_index: i32,
     provider: String,
     gate: Option<GateIdentity>,
-    start: StartRule,
 ) -> RecordOpenOutcome {
     let (gate_id, gate_consuming_device_id, gate_bound_boot_ms) = gate_record_fields(gate);
     // D1 account stamp at spawn. The runner genuinely knows the ACCOUNT here —
@@ -3126,57 +3112,52 @@ pub(crate) fn record_pinned_session_open(
     let account = config_dir
         .as_deref()
         .map(|d| crate::session::past_sessions::account_from_config_dir(Some(d)));
-    let outcome = store.record_open_checked_with(
-        TerminalSessionRecord {
-            claude_session_id: claude_session_id.clone(),
-            config_dir,
-            working_dir: Some(working_dir),
-            page_id,
-            zone_index,
-            title: Some(title),
-            terminal_id: terminal_id.clone(),
-            // record_open seeds these from `now`; values here are placeholders.
-            opened_at: 0,
-            last_seen_at: 0,
-            state: "open".to_string(),
-            closed_at: None,
-            close_reason: None,
-            provider,
-            // The runner KNOWS this id — it pre-pinned `--session-id` (or lifted a
-            // typed flag / a hook POSTed it). Authoritative ⇒ auto-resume safe.
-            origin: Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string()),
-            restore_pending_at: None,
-            awaiting_account_since: None,
-            confirmed_at: None,
-            handle: None,
-            account_label: account.as_ref().map(|a| a.label.clone()),
-            account_wrapper: account.as_ref().map(|a| a.wrapper.clone()),
-            // Not knowable at spawn — filled by the confirmation hook / poll.
-            session_name: None,
-            name_source: None,
-            tenant_id: None,
-            task_run_id: None,
-            bypass_permissions: None,
-            restored_from_boot_at: None,
-            restore_tier: None,
-            finished_at: None,
-            wind_down_outcome: None,
-            wind_down_at: None,
-            wind_down_arm: None,
-            finish_reason: None,
-            finish_synced: false,
-            spawn_device_default: None,
-            adopted_from: None,
-            last_session_start_at: None,
-            gate_id,
-            gate_consuming_device_id,
-            gate_bound_boot_ms,
-            binding_state: None,
-            placed_strongly: false,
-            start_process: None,
-        },
-        start,
-    );
+    let outcome = store.record_open_checked(TerminalSessionRecord {
+        claude_session_id: claude_session_id.clone(),
+        config_dir,
+        working_dir: Some(working_dir),
+        page_id,
+        zone_index,
+        title: Some(title),
+        terminal_id: terminal_id.clone(),
+        // record_open seeds these from `now`; values here are placeholders.
+        opened_at: 0,
+        last_seen_at: 0,
+        state: "open".to_string(),
+        closed_at: None,
+        close_reason: None,
+        provider,
+        // The runner KNOWS this id — it pre-pinned `--session-id` (or lifted a
+        // typed flag / a hook POSTed it). Authoritative ⇒ auto-resume safe.
+        origin: Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string()),
+        restore_pending_at: None,
+        awaiting_account_since: None,
+        confirmed_at: None,
+        handle: None,
+        account_label: account.as_ref().map(|a| a.label.clone()),
+        account_wrapper: account.as_ref().map(|a| a.wrapper.clone()),
+        // Not knowable at spawn — filled by the confirmation hook / poll.
+        session_name: None,
+        name_source: None,
+        tenant_id: None,
+        task_run_id: None,
+        bypass_permissions: None,
+        restored_from_boot_at: None,
+        restore_tier: None,
+        finished_at: None,
+        wind_down_outcome: None,
+        wind_down_at: None,
+        wind_down_arm: None,
+        finish_reason: None,
+        finish_synced: false,
+        spawn_device_default: None,
+        adopted_from: None,
+        last_session_start_at: None,
+        gate_id,
+        gate_consuming_device_id,
+        gate_bound_boot_ms,
+        binding_state: None,
+    });
     if outcome != RecordOpenOutcome::Recorded {
         warn!(
             terminal_id = %terminal_id,
@@ -3499,8 +3480,6 @@ mod tests {
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
             binding_state: None,
-            placed_strongly: false,
-            start_process: None,
         }
     }
 
@@ -3978,66 +3957,6 @@ mod tests {
         assert!(store.open_records().is_empty());
     }
 
-    /// Review F3: the spawn seam records every tab before its child exists,
-    /// plain shells included, so its record is no start — or the fresh id it
-    /// mints for a shell would rank above the session a restore then rebinds
-    /// onto that tab, and the tab's OSC title and egress tenant would follow
-    /// the phantom. The restored session, rebound weakly, leads the tab. A
-    /// child that IS the `claude` has its start stamped by the spawn once it
-    /// exists, and then it leads.
-    #[test]
-    fn the_spawn_seam_record_never_outranks_a_session_restored_onto_its_tab() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
-        // The session to restore: confirmed, on its tab from before the
-        // restart, with no start this process saw.
-        store.record_open(TerminalSessionRecord {
-            confirmed_at: Some(1),
-            terminal_id: "term-old".to_string(),
-            ..crate::session::session_lifecycle_store::test_open_record("restored")
-        });
-        // The restore opens a new tab — a shell — whose seam records a minted id.
-        assert!(record_pinned_session_open(
-            &store,
-            "seam".to_string(),
-            "term-new".to_string(),
-            None,
-            "/work".to_string(),
-            "Shell".to_string(),
-            "default".to_string(),
-            0,
-            crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
-            None,
-            StartRule::Never,
-        )
-        .is_recorded());
-        // ...then rebinds the restored session onto it: a weak placement.
-        assert_eq!(
-            store.rebind_terminal_checked("restored", "term-new", 0),
-            RecordOpenOutcome::Recorded
-        );
-        let leader = || {
-            (
-                store
-                    .latest_open_on_terminal("term-new", "")
-                    .map(|r| r.claude_session_id),
-                store.latest_started_on_terminal("term-new"),
-            )
-        };
-        assert_eq!(
-            leader(),
-            (Some("restored".to_string()), Some("restored".to_string())),
-            "the seam's phantom does not lead the tab"
-        );
-
-        // Had the child been the `claude` itself, the spawn stamps its start.
-        store.note_session_start("seam");
-        assert_eq!(
-            leader(),
-            (Some("seam".to_string()), Some("seam".to_string()))
-        );
-    }
-
     /// Plan `2026-10-03-…` D1: the continuation spawn's gate identity reaches
     /// the durable record (it used to be dropped at the hint destructure), with
     /// this process's boot instant as its generation — and the session-open
@@ -4063,7 +3982,6 @@ mod tests {
                 0,
                 crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
                 g,
-                StartRule::Never,
             )
         };
         assert!(record(Some(gate)).is_recorded());
@@ -4124,7 +4042,6 @@ mod tests {
             0,
             crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
             None,
-            StartRule::Never,
         );
         assert!(recorded.is_recorded());
         let verify_cfg = cfg.path().to_path_buf();
