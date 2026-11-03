@@ -1021,9 +1021,9 @@ enum DirtyScope {
 fn probe_checkout(questions: &dyn RepoQuestions, dir: &Path, scope: DirtyScope) -> Probe<Checkout> {
     match questions.locate(dir) {
         Ok(None) => Probe::Measured(Checkout::NotAWorkTree),
-        Ok(Some(located)) => Probe::Measured(Checkout::Repo(measure(
-            questions, dir, located, scope,
-        ))),
+        Ok(Some(located)) => {
+            Probe::Measured(Checkout::Repo(measure(questions, dir, located, scope)))
+        }
         Err(reason) => Probe::Unknown(reason),
     }
 }
@@ -1792,7 +1792,6 @@ impl<'a> Git<'a> {
 /// Phase 1). Test-only: nothing on the population changes until that plan's
 /// Phase 2 decides from these measurements.
 #[cfg(test)]
-#[path = "served_corpus/git2_parity.rs"]
 mod git2_parity;
 
 #[cfg(test)]

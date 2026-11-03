@@ -140,7 +140,9 @@ impl<'a> Git2<'a> {
                 v
             }
             Err(reason) => {
-                self.declines.borrow_mut().push(Decline { question, reason });
+                self.declines
+                    .borrow_mut()
+                    .push(Decline { question, reason });
                 cli()
             }
         }
@@ -159,7 +161,10 @@ impl<'a> Git2<'a> {
         };
         let toplevel = toplevel_of(&repo)?;
         // Inside the git dir the CLI has no toplevel to show.
-        let in_git_dir = match (std::fs::canonicalize(dir), std::fs::canonicalize(repo.path())) {
+        let in_git_dir = match (
+            std::fs::canonicalize(dir),
+            std::fs::canonicalize(repo.path()),
+        ) {
             (Ok(d), Ok(g)) => d.starts_with(g),
             _ => return Err("could not canonicalize the directory or its git dir".to_string()),
         };
@@ -376,7 +381,12 @@ fn ref_exists(repo: &git2::Repository, name: &str) -> Result<bool, String> {
     }
     match repo.find_reference(name).and_then(|r| r.resolve()) {
         Ok(_) => Ok(true),
-        Err(e) if matches!(e.code(), git2::ErrorCode::NotFound | git2::ErrorCode::InvalidSpec) => {
+        Err(e)
+            if matches!(
+                e.code(),
+                git2::ErrorCode::NotFound | git2::ErrorCode::InvalidSpec
+            ) =>
+        {
             Ok(false)
         }
         Err(e) => Err(lib(e)),
@@ -573,7 +583,13 @@ enum Expect {
 
 /// Render `workdir` through both back ends `runs` times (the minimum time
 /// of each is reported), print the row, and assert D1.
-fn check_timed(case: &str, workdir: &Path, extra_env: &[(&str, &str)], expect: Expect, runs: usize) {
+fn check_timed(
+    case: &str,
+    workdir: &Path,
+    extra_env: &[(&str, &str)],
+    expect: Expect,
+    runs: usize,
+) {
     let env = cli_env(extra_env);
     let mut cli = render_cli(workdir, &env);
     let mut g2 = render_git2(workdir, &env);
@@ -634,11 +650,7 @@ fn check_timed(case: &str, workdir: &Path, extra_env: &[(&str, &str)], expect: E
                 pinned,
                 "{case}: diverges, but not as KNOWN_DIVERGENCES pins it (tokens {:?}, cli \
                  ...{}, git2 ...{}); measured tokens {differing:?}\n  cli : {}\n  git2: {}",
-                d.tokens,
-                d.cli_ends,
-                d.git2_ends,
-                cli.line,
-                g2.line
+                d.tokens, d.cli_ends, d.git2_ends, cli.line, g2.line
             );
             println!("git2-parity | {case:<46} | known divergence: {}", d.why);
         }
@@ -806,7 +818,17 @@ fn try_git(dir: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 fn commit(dir: &Path, msg: &str) {
-    git(dir, &["commit", "--quiet", "--allow-empty", "--no-verify", "-m", msg]);
+    git(
+        dir,
+        &[
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "--no-verify",
+            "-m",
+            msg,
+        ],
+    );
 }
 
 /// Write every bundled file under `<dir>/.claude/`, stage and commit them.
@@ -880,8 +902,16 @@ fn plain_repo_dirty() {
     let claude = dir.join(".claude");
     let files = bundled_files();
     // An unstaged edit, a staged edit, an edit outside `.claude/`.
-    std::fs::write(claude.join(&files[0].rel), format!("{}\nedit\n", files[0].body)).unwrap();
-    std::fs::write(claude.join(&files[3].rel), format!("{}\nstaged\n", files[3].body)).unwrap();
+    std::fs::write(
+        claude.join(&files[0].rel),
+        format!("{}\nedit\n", files[0].body),
+    )
+    .unwrap();
+    std::fs::write(
+        claude.join(&files[3].rel),
+        format!("{}\nstaged\n", files[3].body),
+    )
+    .unwrap();
     git(dir, &["add", "--", &format!(".claude/{}", files[3].rel)]);
     std::fs::write(dir.join("README.md"), "changed\n").unwrap();
     // A stamped TRACKED file and a stamped UNTRACKED one, so the probe asks
@@ -929,7 +959,10 @@ fn clone_with_fetched_upstream_behind_and_ahead() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (_origin, clone) = origin_and_clone(tmp.path(), &[]);
     let line = line_for(&clone);
-    assert!(line.contains("upstream=origin/main behind=1 ahead=1"), "{line}");
+    assert!(
+        line.contains("upstream=origin/main behind=1 ahead=1"),
+        "{line}"
+    );
     assert!(!line.contains("as-of=UNKNOWN"), "{line}");
     check_both("clone_behind_ahead", &clone);
 }
@@ -942,7 +975,10 @@ fn shallow_clone() {
         return unproducible("shallow_clone", "the clone is not shallow");
     }
     let line = line_for(&clone);
-    assert!(line.contains("upstream=origin/main behind=1 ahead=1"), "{line}");
+    assert!(
+        line.contains("upstream=origin/main behind=1 ahead=1"),
+        "{line}"
+    );
     check_both("shallow_clone", &clone);
 }
 
@@ -953,12 +989,23 @@ fn linked_worktree() {
     let wt = tmp.path().join("wt");
     git(
         &clone,
-        &["worktree", "add", "--quiet", "-b", "wt", &wt.display().to_string(), "HEAD~1"],
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "wt",
+            &wt.display().to_string(),
+            "HEAD~1",
+        ],
     );
     commit(&wt, "in the worktree");
     let line = line_for(&wt);
     // HEAD~1 of the clone is origin's `second`; origin/main is one past it.
-    assert!(line.contains("upstream=origin/main behind=1 ahead=1"), "{line}");
+    assert!(
+        line.contains("upstream=origin/main behind=1 ahead=1"),
+        "{line}"
+    );
     assert!(!line.contains("as-of=UNKNOWN"), "{line}");
     check_both("linked_worktree", &wt);
 }
@@ -1024,7 +1071,10 @@ fn branch_containing_a_bracket() {
     let repo = checkout_with_bundle();
     git(repo.path(), &["checkout", "--quiet", "-b", "feat]x"]);
     let line = line_for(repo.path());
-    assert!(line.contains(" feat)x@"), "the `]` is cleaned to `)`: {line}");
+    assert!(
+        line.contains(" feat)x@"),
+        "the `]` is cleaned to `)`: {line}"
+    );
     check_both("branch_containing_a_bracket", repo.path());
 }
 
@@ -1120,7 +1170,10 @@ fn sparse_repo(case: &str, sparse_index: bool) -> Option<tempfile::TempDir> {
     } else {
         "--no-sparse-index"
     };
-    if let Err(why) = try_git(dir, &["sparse-checkout", "set", "--cone", index_flag, ".claude"]) {
+    if let Err(why) = try_git(
+        dir,
+        &["sparse-checkout", "set", "--cone", index_flag, ".claude"],
+    ) {
         unproducible(case, &why);
         return None;
     }
@@ -1204,7 +1257,10 @@ fn autocrlf_crlf_working_copy_after_touch() {
         touch(&dir.join(".claude").join(&f.rel));
     }
     let line = line_for(dir);
-    assert!(line.contains("dirty-claude=0]"), "CRLF of LF blobs is clean: {line}");
+    assert!(
+        line.contains("dirty-claude=0]"),
+        "CRLF of LF blobs is clean: {line}"
+    );
     check_both(case, dir);
 }
 
@@ -1213,18 +1269,39 @@ fn filter_clean_driver() {
     let case = "filter_clean_driver";
     let repo = checkout_with_bundle();
     let dir = repo.path();
-    git(dir, &["config", "filter.qontinui-strip.clean", "sed -e s/LOCAL/x/"]);
-    std::fs::write(dir.join(".claude/.gitattributes"), "filtered.txt filter=qontinui-strip\n").unwrap();
+    git(
+        dir,
+        &["config", "filter.qontinui-strip.clean", "sed -e s/LOCAL/x/"],
+    );
+    std::fs::write(
+        dir.join(".claude/.gitattributes"),
+        "filtered.txt filter=qontinui-strip\n",
+    )
+    .unwrap();
     std::fs::write(dir.join(".claude/filtered.txt"), "LOCAL\n").unwrap();
-    git(dir, &["add", "--", ".claude/.gitattributes", ".claude/filtered.txt"]);
+    git(
+        dir,
+        &[
+            "add",
+            "--",
+            ".claude/.gitattributes",
+            ".claude/filtered.txt",
+        ],
+    );
     commit(dir, "filtered");
     let blob = git(dir, &["cat-file", "-p", "HEAD:.claude/filtered.txt"]);
     if blob != "x\n" {
-        return unproducible(case, &format!("the clean driver did not run: blob {blob:?}"));
+        return unproducible(
+            case,
+            &format!("the clean driver did not run: blob {blob:?}"),
+        );
     }
     touch(&dir.join(".claude/filtered.txt"));
     let line = line_for(dir);
-    assert!(line.contains("dirty-claude=0]"), "the driver makes it clean: {line}");
+    assert!(
+        line.contains("dirty-claude=0]"),
+        "the driver makes it clean: {line}"
+    );
     check_both(case, dir);
 }
 
@@ -1369,14 +1446,19 @@ impl Drop for ForeignOwner {
 /// What `git rev-parse --show-toplevel` in `dir` says under `extra` env.
 fn cli_rev_parse(dir: &Path, extra: &[(&str, &str)]) -> Result<String, String> {
     let mut cmd = crate::process_helpers::scrubbed_git(OsStr::new("git"));
-    cmd.arg("-C").arg(dir).args(["rev-parse", "--show-toplevel"]);
+    cmd.arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--show-toplevel"]);
     for (k, v) in cli_env(extra) {
         match v {
             Some(v) => cmd.env(k, v),
             None => cmd.env_remove(k),
         };
     }
-    let out = cmd.stdin(Stdio::null()).output().map_err(|e| e.to_string())?;
+    let out = cmd
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
@@ -1408,13 +1490,18 @@ fn owner_mismatch(case: &str, extra: &[(&str, &str)]) {
         other => {
             return unproducible(
                 case,
-                &format!("the CLI does not see a dubious owner (a global safe.directory?): {other:?}"),
+                &format!(
+                    "the CLI does not see a dubious owner (a global safe.directory?): {other:?}"
+                ),
             )
         }
     }
     if !extra.is_empty() {
         if let Err(e) = cli_rev_parse(repo.path(), extra) {
-            return unproducible(case, &format!("the injected safe.directory did not take: {e}"));
+            return unproducible(
+                case,
+                &format!("the injected safe.directory did not take: {e}"),
+            );
         }
     }
     both.check(case, extra, Expect::Decline);
