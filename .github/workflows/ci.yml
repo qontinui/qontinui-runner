@@ -177,7 +177,9 @@ jobs:
   #
   # WHAT IT BUYS, measured rather than hoped. It does NOT shorten a candidate
   # today: the windows leg is the slowest required job (98-148 min on recent
-  # green main pushes, ubuntu 52-86), and it stays hosted. What moves is ~70
+  # green main pushes, ubuntu 52-86), and it stays hosted unless
+  # RUNNER_CI_WINDOWS_LANE sends it to the Windows pool (`route-windows`
+  # below). What moves is ~70
   # min of hosted 4-core time per push run, off the org's shared hosted pool
   # (14 runs of this repo sat queued for it on 2026-11-03), and a ubuntu leg
   # that ran in 41 min COLD on the pool (52-86 hosted), so it is not the next
@@ -258,12 +260,79 @@ jobs:
           --default-lane hosted
           --hosted-on-rerun
 
+  # ── Where the Windows legs run ──────────────────────────────────────────
+  #
+  # The Windows twin of `route`, for the three Windows legs: `test
+  # (windows-latest)`, `Clippy (windows)` and `Holder crates (windows-latest)`.
+  # The pool is `[self-hosted, Windows, X64, qontinui-runner-ci-windows, ram-40g]`, and
+  # membership IS the `qontinui-runner-ci-windows` label: a host joins by
+  # carrying it (with the size class, ram-40g: every self-hosted job declares
+  # one, qontinui-claude-config scripts/lint-runner-size-class.py; all three
+  # legs share the heaviest leg's class so the router sees them as one queue). On 2026-11-03 that is
+  # `nawa-winvm-1..3`, three registrations in a Windows Server 2025 VM on nawa
+  # (32 vCPU / 90 GiB in its own systemd slice under ci.slice, one non-admin
+  # account per registration, a persistent per-registration cargo target on the
+  # VM's data disk; host scripts in qontinui-claude-config scripts/winvm/). The
+  # VM is network-isolated from its host: it cannot reach the live runner, the
+  # supervisor or any private range. dell-2020-win-runner does NOT carry the
+  # label (finding ba454926 names the condition for it to rejoin).
+  #
+  # Same router, same verbatim script and the same rules as `route`:
+  # pull_request runs never reach the pool, re-runs go to the hosted floor
+  # (decided in each leg's `runs-on`, attempt 1 only), and the repo variable
+  # picks the lane:
+  #
+  #   RUNNER_CI_WINDOWS_LANE = auto         this job runs and decides
+  #                          = self-hosted  this job is SKIPPED; the three legs
+  #                                         go to the pool unconditionally, with
+  #                                         no overflow (a dead pool queues them)
+  #                          = hosted | unset | anything else
+  #                                         this job is SKIPPED; the legs are hosted
+  #
+  # The router reads this repo's queued jobs carrying exactly the pool label set
+  # (all three legs count); `--title` only names the summary row. The label set
+  # is spelled here and in the forced arm of every Windows leg's `runs-on`;
+  # src-tauri/tests/ci_rust_test_steps_split.rs pins them equal.
+  route-windows:
+    if: ${{ github.event_name != 'pull_request' && vars.RUNNER_CI_WINDOWS_LANE == 'auto' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      labels: ${{ steps.route.outputs.labels }}
+      lane: ${{ steps.route.outputs.lane }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Route the Windows legs
+        id: route
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNNER_CI_WINDOWS_LANE: ${{ vars.RUNNER_CI_WINDOWS_LANE }}
+          RUNNER_CI_WINDOWS_LANE_SOURCE: repo variable RUNNER_CI_WINDOWS_LANE
+          RUNNER_CI_WINDOWS_HOSTED_LABEL: windows-latest
+          RUNNER_CI_WINDOWS_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: >-
+          python3 -B .github/scripts/route-ci-lane.py
+          --self-hosted-labels self-hosted,Windows,X64,qontinui-runner-ci-windows,ram-40g
+          --env-prefix RUNNER_CI_WINDOWS
+          --title "the Windows legs (test / clippy-windows / holder-crates)"
+          --default-lane hosted
+          --hosted-on-rerun
+
   test:
-    # `route` decides the ubuntu leg's pool (see above). `!cancelled()` is
-    # load-bearing: on a pull_request `route` is SKIPPED, and without it a job
-    # that needs a skipped job is skipped too, which would turn both required
-    # `test (…)` contexts into `skipped` (= passing to coord) on every PR.
-    needs: route
+    # `route` decides the ubuntu leg's pool and `route-windows` the windows
+    # leg's (see above). `!cancelled()` is load-bearing: on a pull_request both
+    # are SKIPPED, and without it a job that needs a skipped job is skipped
+    # too, which would turn both required `test (…)` contexts into `skipped`
+    # (= passing to coord) on every PR.
+    needs: [route, route-windows]
     if: ${{ !cancelled() }}
     strategy:
       # Surface platform-specific failures independently. Default fail-fast
@@ -278,17 +347,19 @@ jobs:
         # when cross-platform demos / mac users matter.
         platform: [ubuntu-22.04, windows-latest]
 
-    # The windows leg always runs hosted. The ubuntu leg, on a FIRST attempt of
-    # a run that is not a pull_request, goes to the pool when the lane is
-    # forced `self-hosted`, or where `route` said under `auto` (its `labels`
-    # output). Everything else is the hosted floor: a pull_request, any
-    # re-run, the `hosted`/unset lane, and a route job that produced nothing.
-    # The check names stay `test (ubuntu-22.04)` / `test (windows-latest)`:
-    # they come from the matrix value, not from the pool, and both are
-    # required contexts. The pool label set below is spelled twice (here and
-    # in `route`'s --self-hosted-labels); change both together.
-    # coord-pools: [self-hosted, Linux, X64, qontinui-runner-ci, ram-40g] | [ubuntu-22.04] | [windows-latest]
-    runs-on: ${{ fromJSON(matrix.platform == 'windows-latest' && '["windows-latest"]' || (github.run_attempt == 1 && github.event_name != 'pull_request' && vars.RUNNER_CI_LINUX_LANE == 'self-hosted' && '["self-hosted","Linux","X64","qontinui-runner-ci","ram-40g"]') || (github.run_attempt == 1 && needs.route.outputs.labels) || '["ubuntu-22.04"]') }}
+    # Each leg routes the same way through its own lane. On a FIRST attempt of
+    # a run that is not a pull_request it goes to its pool when the lane is
+    # forced `self-hosted`, or where its route job said under `auto` (the
+    # `labels` output): `route` / RUNNER_CI_LINUX_LANE for the ubuntu leg,
+    # `route-windows` / RUNNER_CI_WINDOWS_LANE for the windows leg. Everything
+    # else is the hosted floor: a pull_request, any re-run, the `hosted`/unset
+    # lane, and a route job that produced nothing. The check names stay `test
+    # (ubuntu-22.04)` / `test (windows-latest)`: they come from the matrix
+    # value, not from the pool, and both are required contexts. Each pool's
+    # label set is spelled twice (here and in its route job's
+    # --self-hosted-labels); change both together.
+    # coord-pools: [self-hosted, Linux, X64, qontinui-runner-ci, ram-40g] | [ubuntu-22.04] | [self-hosted, Windows, X64, qontinui-runner-ci-windows, ram-40g] | [windows-latest]
+    runs-on: ${{ fromJSON(matrix.platform == 'windows-latest' && ((github.run_attempt == 1 && github.event_name != 'pull_request' && vars.RUNNER_CI_WINDOWS_LANE == 'self-hosted' && '["self-hosted","Windows","X64","qontinui-runner-ci-windows","ram-40g"]') || (github.run_attempt == 1 && needs['route-windows'].outputs.labels) || '["windows-latest"]') || (github.run_attempt == 1 && github.event_name != 'pull_request' && vars.RUNNER_CI_LINUX_LANE == 'self-hosted' && '["self-hosted","Linux","X64","qontinui-runner-ci","ram-40g"]') || (github.run_attempt == 1 && needs.route.outputs.labels) || '["ubuntu-22.04"]') }}
 
     # Backstop cap for any step in this job that is not individually bounded.
     # This job previously had NO job-level timeout, so the 4h24m apt hang above
@@ -359,14 +430,14 @@ jobs:
       #   2. A HOME of its own. Every registration on the host runs as ONE
       #      account with ONE home, and `Poison ambient state` / `Unpoison`
       #      below write and delete `~/.qontinui/*` by name — two concurrent
-      #      jobs would delete each other's poison mid-suite, and a red suite
-      #      (Unpoison does not run then) would leave it for the next. So the
+      #      jobs would delete each other's poison mid-suite, and a job that
+      #      dies before Unpoison would leave it for the next. So the
       #      job gets HOME and TMPDIR under $RUNNER_TEMP, which the runner
       #      empties per job, while CARGO_HOME / RUSTUP_HOME stay on the
       #      account's persistent toolchain and registry. CI_POOL_HOME keeps
       #      the persistent home for the target cache below.
       - name: "Self-hosted: clear the previous job's sibling checkouts and give the job its own HOME"
-        if: runner.environment == 'self-hosted'
+        if: runner.environment == 'self-hosted' && runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -387,6 +458,30 @@ jobs:
             echo "TMPDIR=$RUNNER_TEMP/tmp"
           } >> "$GITHUB_ENV"
           echo "HOME -> $job_home (persistent home $HOME kept for CARGO_HOME, RUSTUP_HOME and the target cache)"
+
+      # The Windows twin of the step above and of `Self-hosted: system packages,
+      # compile caps and the persistent target` below. Both of those are linux
+      # bash (pkg-config webkit, /proc/meminfo, cgroups, `ln -s`) and
+      # `runner.environment == 'self-hosted'` is ALSO true on a self-hosted
+      # Windows runner, so they are gated `runner.os == 'Linux'` and this ONE
+      # composite step (shared with `clippy-windows` and `holder-crates`) does
+      # the Windows half: clear the previous job's sibling checkouts and any
+      # runner/WebView2 process it left, fail NAMING THE RUNNER when the host
+      # lacks a tool, export CARGO_BUILD_JOBS / RUST_TEST_THREADS /
+      # VITEST_MAX_WORKERS and a TEMP of the job's own, and junction ./target to
+      # the registration's persistent target. There is no HOME redirect: each
+      # Windows registration runs as its OWN account (the step checks that
+      # before it deletes anything), so no two jobs share a profile at the
+      # same time, and what one job leaves in it the next one's prep removes;
+      # `Unpoison ambient state` runs whenever Poison ran. Its id gates the
+      # post-smoke process stop: nothing destructive runs on an account this
+      # step refused.
+      - name: "Self-hosted Windows: sibling cleanup, host preflight, compile caps and the persistent target"
+        id: windows_prep
+        if: runner.environment == 'self-hosted' && runner.os == 'Windows'
+        uses: ./.github/actions/self-hosted-windows-prep
+        with:
+          require-webview2: "true"
 
       # qontinui-runner's frontend cross-repo deps now resolve via npm
       # (see package.json: @qontinui/* moved from link: to ^x.y.z ranges).
@@ -538,7 +633,7 @@ jobs:
       #      stamp every pool build dirty. Bounded: a target over 150 GiB, under
       #      60 GiB free on its filesystem, or unreadable, starts cold.
       - name: "Self-hosted: system packages, compile caps and the persistent target"
-        if: runner.environment == 'self-hosted'
+        if: runner.environment == 'self-hosted' && runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -744,8 +839,11 @@ jobs:
       # revert the test step to JOBS=1 and keep this pagefile. (That happened
       # on 2026-10-27, run 40449994591; the test step is now JOBS=1 on every
       # leg.)
+      # Hosted only: the action needs admin, and a self-hosted Windows runner
+      # account is not one. The pool's host provisions its own pagefile (the
+      # nawa VM: 4 GiB on C: + 64 GiB on its data disk, scripts/winvm/).
       - name: Configure pagefile (Windows — guard against link-time OOM)
-        if: matrix.platform == 'windows-latest'
+        if: matrix.platform == 'windows-latest' && runner.environment == 'github-hosted'
         uses: al-cheb/configure-pagefile-action@v1.4
         with:
           minimum-size: 32GB
@@ -842,7 +940,12 @@ jobs:
       # after this branch was first cut -- this rebuild picks that up.
       - name: Contract-smoke effect-probe verdict (PS 5.1)
         if: matrix.platform == 'windows-latest'
-        run: powershell -File scripts/tests/test-effect-probe.ps1
+        # `-NoProfile -ExecutionPolicy Bypass` (here and on the two smoke steps
+        # below). Bypass: a no-op on hosted and on Windows Server (RemoteSigned),
+        # but a Windows CLIENT host's default policy (Restricted) refuses `-File`.
+        # NoProfile: a self-hosted account persists between jobs, and a profile
+        # one job wrote must not run inside the next.
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tests/test-effect-probe.ps1
         shell: bash
 
       - name: Typecheck frontend code
@@ -950,6 +1053,7 @@ jobs:
       # or removing a STEP, and editing a shell comment inside a `run:` block.
       # A deleted job takes `Gate-Removal:` instead. Then re-run the job.
       - name: Poison ambient state
+        id: poison
         run: |
           set -euo pipefail
 
@@ -1219,7 +1323,13 @@ jobs:
           #     5 GiB, clamped to nproc; that step says why 5); '1' remains its
           #     fallback when that step exported nothing. The hosted arms are
           #     unchanged.
-          CARGO_BUILD_JOBS: ${{ matrix.platform == 'windows-latest' && '1' || (runner.environment == 'self-hosted' && env.CARGO_BUILD_JOBS || '1') }}
+          #   - 2026-11-03: a SELF-HOSTED windows leg (the `route-windows` job,
+          #     the nawa Windows VM) is not the 16 GB hosted VM either. It takes
+          #     the cap the "Self-hosted Windows: sibling cleanup, host
+          #     preflight, compile caps and the persistent target" step exported
+          #     (the host's per-registration memory budget / 5 GiB, clamped to
+          #     nproc), with the same '1' fallback. Hosted windows stays '1'.
+          CARGO_BUILD_JOBS: ${{ matrix.platform == 'windows-latest' && (runner.environment == 'self-hosted' && env.CARGO_BUILD_JOBS || '1') || (runner.environment == 'self-hosted' && env.CARGO_BUILD_JOBS || '1') }}
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             echo "=== free / df before cargo test ==="
@@ -1571,7 +1681,7 @@ jobs:
             echo '```'
             echo
             echo "build step outcome: ${BUILD_OUTCOME} - run step outcome: ${RUN_OUTCOME}"
-            echo "PeakUsage is the pagefile high-water mark for this boot, so it covers the compile that just ran. Compare it against AllocatedBaseSize (the 32 GB the pagefile step configures) before changing CARGO_BUILD_JOBS."
+            echo "PeakUsage is the pagefile high-water mark for this boot, so it covers the compile that just ran. Compare it against AllocatedBaseSize (on a hosted runner, the 32 GB the pagefile step configures; a self-hosted host sizes its own) before changing CARGO_BUILD_JOBS; runner_env says which."
             echo
             echo '```'
             # One machine-greppable line per pagefile. `tr -d '\r'` because
@@ -1579,9 +1689,9 @@ jobs:
             # powershell failed) is reported as UNKNOWN, never as a zero peak.
             mem="$(powershell -NoProfile -Command '$os = Get-CimInstance Win32_OperatingSystem; Get-CimInstance Win32_PageFileUsage | ForEach-Object { $free = if ($os) { $os.FreePhysicalMemory } else { "unknown" }; "MEMPEAK name={0} alloc_mb={1} peak_mb={2} current_mb={3} free_phys_kb={4}" -f $_.Name,$_.AllocatedBaseSize,$_.PeakUsage,$_.CurrentUsage,$free }' | tr -d '\r')" || mem=""
             if [ -n "$mem" ]; then
-              printf '%s\n' "$mem" | sed "s/\$/ build=${BUILD_OUTCOME} run=${RUN_OUTCOME}/"
+              printf '%s\n' "$mem" | sed "s/\$/ build=${BUILD_OUTCOME} run=${RUN_OUTCOME} runner_env=${RUNNER_ENVIRONMENT:-unknown}/"
             else
-              echo "MEMPEAK unknown=1 reason=no-pagefile-reading build=${BUILD_OUTCOME} run=${RUN_OUTCOME}"
+              echo "MEMPEAK unknown=1 reason=no-pagefile-reading build=${BUILD_OUTCOME} run=${RUN_OUTCOME} runner_env=${RUNNER_ENVIRONMENT:-unknown}"
             fi
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
@@ -1743,9 +1853,9 @@ jobs:
           # chunk FAILED, while the step still reported green because it is
           # `continue-on-error`.
           #
-          # Reordering does NOT fix it: `Unpoison` carries no `if: always()`, so
-          # a red suite skips it entirely — and a red suite is exactly the case
-          # this ingest exists to record. A step-level `env:` beats $GITHUB_ENV
+          # Reordering does NOT fix it: `Unpoison` (which runs always() since
+          # the Windows lane) is ordered AFTER this step, and a red suite is
+          # exactly the case this ingest exists to record. A step-level `env:` beats $GITHUB_ENV
           # for this step only, so it is correct on both the green and red paths
           # and independent of where the unpoison sits.
           #
@@ -1778,7 +1888,13 @@ jobs:
       # root resolver trims and skips). The three files are removed by name, not
       # `rm -rf ~/.qontinui`, so a home that was NOT clean (the poison step warns
       # when it sees one) keeps whatever else it held.
+      # Whenever Poison ran, even after a red Rust step: on a self-hosted WINDOWS
+      # runner the poisoned ~/.qontinui is in the account's real, persistent
+      # profile (USERPROFILE), so it must not be left for the registration's next
+      # job. NOT when Poison never ran (a job that died earlier, or one whose
+      # prep step refused the account): then there is nothing of ours to remove.
       - name: Unpoison ambient state
+        if: always() && (steps.poison.outcome == 'success' || steps.poison.outcome == 'failure')
         run: |
           set -u
           homes=("$HOME")
@@ -1913,7 +2029,7 @@ jobs:
       # harness fails here instead of after a full exe boot + 198 route probes.
       - name: Contract-smoke summary invariants (PS 5.1)
         if: matrix.platform == 'windows-latest'
-        run: powershell -File scripts/tests/test-smoke-summary.ps1
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tests/test-smoke-summary.ps1
         shell: bash
 
       # The CI-integrity guard decides whether a gating-workflow change is
@@ -1933,8 +2049,27 @@ jobs:
         if: matrix.platform == 'windows-latest'
         env:
           QONTINUI_ALLOW_NO_DB: "1"
-        run: powershell -File scripts/contract-smoke.ps1 -DirectExe target/debug/qontinui-runner.exe -Profile ci -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/contract-smoke.ps1 -DirectExe target/debug/qontinui-runner.exe -Profile ci -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts
         shell: bash
+
+      # Self-hosted Windows only, and always(): the smoke tears down its own
+      # process tree (Stop-ProcessTree walks Win32_Process.ParentProcessId down
+      # from the runner pid), but a WebView2 host whose parent has already exited
+      # is no longer reachable from that walk, and on a PERSISTENT runner account
+      # it would hold the next job's target/debug/qontinui-runner.exe open. The
+      # same matcher the prep action runs (one script, parse-checked by
+      # powershell-parse.yml): only processes of this job's account, a
+      # qontinui-runner.exe under this workspace or the target behind its
+      # junction, and the msedgewebview2.exe hosts whose command line names it.
+      # Non-fatal here: a survivor is the HOST's problem, annotated as an ::error,
+      # and the next job's prep step stops it again or fails naming the runner.
+      - name: "Self-hosted Windows: stop the smoke's leftover runner and WebView2 processes"
+        if: always() && steps.windows_prep.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh -NoProfile -NonInteractive -Command ". '{0}'"
+        run: |
+          & ./.github/actions/self-hosted-windows-prep/stop-leftover-processes.ps1 -Workspace $env:GITHUB_WORKSPACE -TargetRoot "$env:QONTINUI_CI_TARGET" -Why 'this job'
+          exit $LASTEXITCODE
 
       # Plan 2026-10-27-coord-routes-ci-jobs-by-runner-capability, Phase 2:
       # ONE `::notice title=qontinui-resource-report::{json}` per job saying
@@ -1997,7 +2132,12 @@ jobs:
   # GB saves against the 10 GB repo cache cap.
   clippy-windows:
     name: Clippy (windows)
-    runs-on: windows-latest
+    # Routed like `test`'s windows leg (see `route-windows`); `!cancelled()`
+    # keeps it from being SKIPPED on a pull_request, where route-windows is.
+    needs: route-windows
+    if: ${{ !cancelled() }}
+    # coord-pools: [self-hosted, Windows, X64, qontinui-runner-ci-windows, ram-40g] | [windows-latest]
+    runs-on: ${{ fromJSON((github.run_attempt == 1 && github.event_name != 'pull_request' && vars.RUNNER_CI_WINDOWS_LANE == 'self-hosted' && '["self-hosted","Windows","X64","qontinui-runner-ci-windows","ram-40g"]') || (github.run_attempt == 1 && needs['route-windows'].outputs.labels) || '["windows-latest"]') }}
     # Default-target clippy, 23 successful runs 2026-10-22..10-25 on commits now
     # on main (push and pull_request events; GraphQL check-run timings): job p50
     # 14.9m, p90 17.2m, max 17.8m (Clippy check step p50 11.9m, max 14.0m).
@@ -2012,6 +2152,13 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
+
+      # Self-hosted Windows pool only: the shared host preparation (sibling
+      # cleanup, preflight, compile caps, the persistent ./target junction);
+      # see the `test` job's step of the same name.
+      - name: "Self-hosted Windows: sibling cleanup, host preflight, compile caps and the persistent target"
+        if: runner.environment == 'self-hosted' && runner.os == 'Windows'
+        uses: ./.github/actions/self-hosted-windows-prep
 
       # Rust path-dep on ../../qontinui-schemas/rust + the SDK↔runner manifest
       # diff test read; same rationale as the `test` job's sibling checkout,
@@ -2037,12 +2184,16 @@ jobs:
         uses: pnpm/action-setup@v4
         with:
           version: 10.33.2
+          dest: ${{ runner.environment == 'self-hosted' && format('{0}/setup-pnpm', runner.temp) || '~/setup-pnpm' }}
 
+      # The pnpm-store CACHE is hosted-only, for the reasons the `test` job's
+      # Setup Node.js step gives (both inputs are needed).
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
           node-version: "20"
-          cache: "pnpm"
+          cache: ${{ runner.environment == 'github-hosted' && 'pnpm' || '' }}
+          package-manager-cache: ${{ runner.environment == 'github-hosted' }}
           cache-dependency-path: pnpm-lock.yaml
 
       - name: Setup Rust
@@ -2051,7 +2202,11 @@ jobs:
           toolchain: "1.95.0"
           components: rustfmt, clippy
 
+      # Hosted only, as in `test`: the action needs admin; the pool's host
+      # provisions its own pagefile, and keeps a persistent target instead of
+      # restoring rust-cache.
       - name: Configure pagefile (Windows — guard against link-time OOM)
+        if: runner.environment == 'github-hosted'
         uses: al-cheb/configure-pagefile-action@v1.4
         with:
           minimum-size: 32GB
@@ -2059,6 +2214,7 @@ jobs:
           disk-root: "D:"
 
       - name: Cache Rust dependencies
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
@@ -2142,7 +2298,13 @@ jobs:
       fail-fast: false
       matrix:
         platform: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.platform }}
+    # Only the windows arm routes (like `test`'s windows leg, see
+    # `route-windows`); ubuntu-latest stays hosted. `!cancelled()` keeps both
+    # arms from being SKIPPED on a pull_request, where route-windows is.
+    needs: route-windows
+    if: ${{ !cancelled() }}
+    # coord-pools: [ubuntu-latest] | [self-hosted, Windows, X64, qontinui-runner-ci-windows, ram-40g] | [windows-latest]
+    runs-on: ${{ fromJSON(matrix.platform == 'windows-latest' && ((github.run_attempt == 1 && github.event_name != 'pull_request' && vars.RUNNER_CI_WINDOWS_LANE == 'self-hosted' && '["self-hosted","Windows","X64","qontinui-runner-ci-windows","ram-40g"]') || (github.run_attempt == 1 && needs['route-windows'].outputs.labels) || '["windows-latest"]') || '["ubuntu-latest"]') }}
     # UNMEASURED at introduction: no run of this job exists yet. Both crates
     # are small with few dependencies, so the budget should be dominated by
     # checkout + toolchain + cache restore. 20
@@ -2151,6 +2313,13 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
+
+      # Self-hosted Windows pool only: the shared host preparation (sibling
+      # cleanup, preflight, compile caps, the persistent ./target junction);
+      # see the `test` job's step of the same name.
+      - name: "Self-hosted Windows: sibling cleanup, host preflight, compile caps and the persistent target"
+        if: runner.environment == 'self-hosted' && runner.os == 'Windows'
+        uses: ./.github/actions/self-hosted-windows-prep
 
       # Rust path-dep on ../../qontinui-schemas/rust — needed only so cargo can
       # load the workspace; same action (and declared-adaptation resolution)
@@ -2165,6 +2334,7 @@ jobs:
           components: clippy
 
       - name: Cache Rust dependencies
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
