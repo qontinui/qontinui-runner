@@ -6,8 +6,8 @@
 use super::PgDb;
 use crate::scheduler::{
     scheduled_task_type_default, CatchUpPolicy, ConditionScheduleConfig, ConditionStatus,
-    ScheduleConditions, ScheduleExpression, ScheduledTask, ScheduledTaskStatus, ScheduledTaskType,
-    SchedulerSettings, TaskExecutionRecord,
+    ManagedBy, ScheduleConditions, ScheduleExpression, ScheduledTask, ScheduledTaskStatus,
+    ScheduledTaskType, SchedulerSettings, TaskExecutionRecord,
 };
 use chrono::{DateTime, Utc};
 use tracing::warn;
@@ -32,6 +32,13 @@ use tracing::warn;
 /// `2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one`
 /// Phase 4c neither was read, so every task loaded with no conditions and
 /// every schedule condition was inert.
+///
+/// The trailing six — the managed key (`managed_source`, `managed_tenant_id`,
+/// `managed_agent`), `managed_version`, `managed_digest` and the per-task
+/// `timezone` — are qontinui-web revision `recurring_agents_01_coord_tables`
+/// (plan `2026-10-29-recurring-agents-declared-in-coord-reconciled-by-runner`
+/// Phase 2), self-healed on an embedded PG by `PgDb::verify_and_provision`.
+/// `managed_tenant_id` is a UUID column, read as text.
 const SELECT_TASK_COLS: &str = r#"
     id, name, description, enabled,
     schedule_type, schedule_value, task_config,
@@ -39,8 +46,54 @@ const SELECT_TASK_COLS: &str = r#"
     created_at, modified_at, next_run, last_run_id,
     catch_up_policy, catch_up_grace_seconds,
     consecutive_launch_failures, launch_failure_backoff_seconds,
-    conditions, condition_status
+    conditions, condition_status,
+    managed_source, managed_tenant_id::text, managed_agent,
+    managed_version, managed_digest, timezone
 "#;
+
+/// The `ON CONFLICT` arbiter for the managed key. It must spell the partial
+/// index `uq_scheduled_tasks_managed_key`'s predicate EXACTLY (qontinui-web
+/// `recurring_agents_01_coord_tables`; the self-heal in
+/// `PgDb::verify_and_provision` creates the same index), or PostgreSQL will
+/// not infer that index as the arbiter and the upsert fails.
+const MANAGED_KEY_CONFLICT: &str = "(managed_source, managed_tenant_id, managed_agent) \
+     WHERE managed_source IS NOT NULL \
+       AND managed_tenant_id IS NOT NULL \
+       AND managed_agent IS NOT NULL";
+
+/// Build the [`ManagedBy`] a row carries, from its six managed columns' first
+/// four. All three key columns set = managed; all three NULL = an unmanaged,
+/// user-created task. A PARTIAL key (possible only for a row written around
+/// the runner — the index admits it, no CHECK forbids it) is logged and read
+/// as unmanaged: it is outside the unique key, so no managed upsert can ever
+/// address it, and the reconciler must not adopt it.
+fn managed_from_columns(
+    task_id: &str,
+    source: Option<String>,
+    tenant_id: Option<String>,
+    agent: Option<String>,
+    version: Option<i32>,
+    digest: Option<String>,
+) -> Option<ManagedBy> {
+    match (source, tenant_id, agent) {
+        (Some(source), Some(tenant_id), Some(agent)) => Some(ManagedBy {
+            source,
+            tenant_id,
+            agent,
+            version: version.unwrap_or(0).max(0) as u32,
+            digest,
+        }),
+        (None, None, None) => None,
+        (source, tenant_id, agent) => {
+            warn!(
+                "scheduler: task {task_id} carries a partial managed key \
+                 (source={source:?}, tenant_id={tenant_id:?}, agent={agent:?}); \
+                 reading it as unmanaged"
+            );
+            None
+        }
+    }
+}
 
 /// Whether this store round-trips a task's `ScheduleConditions`: true iff the
 /// column list it reads names a `conditions` column (it does since Phase 4c;
@@ -52,6 +105,52 @@ pub fn task_store_persists_conditions() -> bool {
     SELECT_TASK_COLS
         .split(|c: char| c == ',' || c.is_whitespace())
         .any(|column| column == "conditions")
+}
+
+/// A task's managed key as the five managed columns bind it. All `None` for
+/// an unmanaged task. `managed_tenant_id` binds as text and is cast to UUID in
+/// the SQL (`($n::text)::uuid`), so a caller passes the string it holds.
+struct ManagedColumns {
+    source: Option<String>,
+    tenant_id: Option<String>,
+    agent: Option<String>,
+    version: Option<i32>,
+    digest: Option<String>,
+}
+
+impl ManagedColumns {
+    fn of(task: &ScheduledTask) -> Self {
+        match &task.managed {
+            None => Self {
+                source: None,
+                tenant_id: None,
+                agent: None,
+                version: None,
+                digest: None,
+            },
+            Some(m) => Self {
+                source: Some(m.source.clone()),
+                tenant_id: Some(m.tenant_id.clone()),
+                agent: Some(m.agent.clone()),
+                // A u32 into an INTEGER column; ManagedBy::validate bounds it
+                // to i32::MAX, so saturating is a safety belt.
+                version: Some(m.version.min(i32::MAX as u32) as i32),
+                digest: m.digest.clone(),
+            },
+        }
+    }
+}
+
+/// What [`PgDb::upsert_managed_scheduled_task`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedUpsert {
+    /// No task carried the key; one was inserted with this id.
+    Created(String),
+    /// The task carrying the key (this id) was updated in place.
+    Updated(String),
+    /// A task carries the key but it moved since the caller read it (or the
+    /// caller read none and one appeared): nothing was written.
+    Conflict,
 }
 
 /// Parse a `catch_up_policy` text value from the DB into the typed enum.
@@ -232,6 +331,15 @@ fn row_to_scheduled_task(row: &tokio_postgres::Row) -> StoredScheduledTask {
         Err(e) => (None, Some(e)),
     };
     let condition_status = condition_status_from_text(&id, row.get(19));
+    let managed = managed_from_columns(
+        &id,
+        row.get(20),
+        row.get(21),
+        row.get(22),
+        row.get(23),
+        row.get(24),
+    );
+    let timezone: Option<String> = row.get(25);
 
     let task = ScheduledTask {
         id,
@@ -256,10 +364,8 @@ fn row_to_scheduled_task(row: &tokio_postgres::Row) -> StoredScheduledTask {
         catch_up_grace_seconds: catch_up_grace_seconds.max(0) as u32,
         consecutive_launch_failures: consecutive_launch_failures.max(0) as u32,
         launch_failure_backoff_seconds: launch_failure_backoff_seconds.max(0) as u32,
-        // managed/timezone columns are read by the Phase 4 reconciler (plan
-        // 2026-10-29-recurring-agents-declared-in-coord-reconciled-by-runner).
-        timezone: None,
-        managed: None,
+        timezone,
+        managed,
     };
     StoredScheduledTask {
         task,
@@ -476,6 +582,7 @@ impl PgDb {
             .map(serde_json::to_string)
             .transpose()
             .map_err(|e| format!("Serialize condition_status: {e}"))?;
+        let managed = ManagedColumns::of(task);
 
         conn.execute(
             r#"
@@ -486,9 +593,12 @@ impl PgDb {
                  created_at, modified_at, next_run, last_run_id,
                  catch_up_policy, catch_up_grace_seconds,
                  consecutive_launch_failures, launch_failure_backoff_seconds,
-                 conditions, condition_status)
+                 conditions, condition_status,
+                 managed_source, managed_tenant_id, managed_agent,
+                 managed_version, managed_digest, timezone)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+                    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+                    $21, ($22::text)::uuid, $23, $24, $25, $26)
             "#,
             &[
                 &task.id as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -520,6 +630,12 @@ impl PgDb {
                 &launch_failure_backoff_seconds_i32,
                 &conditions_json,
                 &condition_status_text,
+                &managed.source,
+                &managed.tenant_id,
+                &managed.agent,
+                &managed.version,
+                &managed.digest,
+                &task.timezone,
             ],
         )
         .await
@@ -542,6 +658,10 @@ impl PgDb {
     /// `conditions`): otherwise the stored values are left exactly as they are,
     /// which is also what lets a PUT repair other fields of a row whose stored
     /// conditions are unreadable without the loader ever parsing them.
+    ///
+    /// `timezone` is written from `task` (the caller read it and may have
+    /// changed it). The managed key is NOT written: a task becomes, stays or
+    /// changes managed only through [`Self::upsert_managed_scheduled_task`].
     pub async fn update_scheduled_task(
         &self,
         task: &ScheduledTask,
@@ -589,7 +709,8 @@ impl PgDb {
                 catch_up_grace_seconds = $13,
                 launch_failure_backoff_seconds = $14,
                 conditions = CASE WHEN $17 THEN $18 ELSE conditions END,
-                condition_status = CASE WHEN $17 THEN $19 ELSE condition_status END
+                condition_status = CASE WHEN $17 THEN $19 ELSE condition_status END,
+                timezone = $20
             WHERE id = $15 AND modified_at = $16
             "#,
                 &[
@@ -618,6 +739,7 @@ impl PgDb {
                     &write_conditions,
                     &conditions_json,
                     &condition_status_text,
+                    &task.timezone,
                 ],
             )
             .await
@@ -637,6 +759,198 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG delete_scheduled_task {}: {}", id, e))?;
         Ok(())
+    }
+
+    // ========================================================================
+    // Managed tasks (plan 2026-10-29-recurring-agents-declared-in-coord-
+    // reconciled-by-runner, D5): addressed by the managed key
+    // `(source, tenant_id, agent)`, never by name.
+    // ========================================================================
+
+    /// The stored task carrying the managed key, flagged rather than refused
+    /// when its conditions are unreadable. `tenant_id` must be a UUID (the
+    /// column is one); callers validate it first.
+    pub async fn get_stored_scheduled_task_by_managed_key(
+        &self,
+        source: &str,
+        tenant_id: &str,
+        agent: &str,
+    ) -> Result<Option<StoredScheduledTask>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_opt(
+                &format!(
+                    "SELECT {} FROM scheduled_tasks \
+                     WHERE managed_source = $1 \
+                       AND managed_tenant_id = ($2::text)::uuid \
+                       AND managed_agent = $3",
+                    SELECT_TASK_COLS
+                ),
+                &[&source, &tenant_id, &agent],
+            )
+            .await
+            .map_err(|e| {
+                format!(
+                    "PG get_stored_scheduled_task_by_managed_key {source}/{tenant_id}/{agent}: {e}"
+                )
+            })?;
+        Ok(row.as_ref().map(row_to_scheduled_task))
+    }
+
+    /// Create the task carrying `task.managed`'s key, or update the one that
+    /// already does -- one statement, `INSERT ... ON CONFLICT` on the managed
+    /// key's unique index, so two concurrent upserts of one key can never mint
+    /// two tasks (the exit-3 duplicate every bash installer had to detect).
+    ///
+    /// The key is the identity: an UNMANAGED task with the same name is never
+    /// matched, read or written. On update the row keeps its `id`,
+    /// `created_at`, `last_run_id` and `consecutive_launch_failures`
+    /// (executor-owned); everything else, `managed_version` /
+    /// `managed_digest` and `timezone` included, comes from `task`.
+    ///
+    /// Like [`Self::update_scheduled_task`] the update is CONDITIONAL:
+    /// `expected_modified_at` is the stored row's `modified_at` the caller read
+    /// (`None` = it read no row). The existing row is updated only if it still
+    /// carries that value; otherwise nothing is written and the answer is
+    /// [`ManagedUpsert::Conflict`] -- a stale snapshot never overwrites a newer
+    /// change, and a caller that saw no row never overwrites one that appeared.
+    pub async fn upsert_managed_scheduled_task(
+        &self,
+        task: &ScheduledTask,
+        expected_modified_at: Option<&str>,
+    ) -> Result<ManagedUpsert, String> {
+        if task.managed.is_none() {
+            return Err(format!(
+                "upsert_managed_scheduled_task: task {} carries no managed key",
+                task.id
+            ));
+        }
+        let expected = expected_modified_at.map(parse_modified_at).transpose()?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let (stype, svalue) = schedule_to_parts(&task.schedule);
+        let task_config = serde_json::to_string(&task.task)
+            .map_err(|e| format!("Serialize task_config: {}", e))?;
+        let catch_up_policy_str = catch_up_policy_to_str(task.catch_up_policy).to_string();
+        let catch_up_grace_seconds_i32: i32 =
+            task.catch_up_grace_seconds.min(i32::MAX as u32) as i32;
+        let consecutive_launch_failures_i32: i32 =
+            task.consecutive_launch_failures.min(i32::MAX as u32) as i32;
+        let launch_failure_backoff_seconds_i32: i32 =
+            task.launch_failure_backoff_seconds.min(i32::MAX as u32) as i32;
+        let conditions_json = conditions_to_json(task.conditions.as_ref())?;
+        let condition_status_text: Option<String> = task
+            .condition_status
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| format!("Serialize condition_status: {e}"))?;
+        let managed = ManagedColumns::of(task);
+        let sql = format!(
+            r#"
+            INSERT INTO scheduled_tasks
+                (id, name, description, enabled,
+                 schedule_type, schedule_value, task_config,
+                 skip_if_completed, auto_fix_on_failure, success_criteria,
+                 created_at, modified_at, next_run, last_run_id,
+                 catch_up_policy, catch_up_grace_seconds,
+                 consecutive_launch_failures, launch_failure_backoff_seconds,
+                 conditions, condition_status,
+                 managed_source, managed_tenant_id, managed_agent,
+                 managed_version, managed_digest, timezone)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                    $11, $12, $13, NULL, $14, $15, $16, $17, $18, $19,
+                    $20, ($21::text)::uuid, $22, $23, $24, $25)
+            ON CONFLICT {MANAGED_KEY_CONFLICT}
+            DO UPDATE SET
+                name = EXCLUDED.name,
+                description = EXCLUDED.description,
+                enabled = EXCLUDED.enabled,
+                schedule_type = EXCLUDED.schedule_type,
+                schedule_value = EXCLUDED.schedule_value,
+                task_config = EXCLUDED.task_config,
+                skip_if_completed = EXCLUDED.skip_if_completed,
+                auto_fix_on_failure = EXCLUDED.auto_fix_on_failure,
+                success_criteria = EXCLUDED.success_criteria,
+                modified_at = EXCLUDED.modified_at,
+                next_run = EXCLUDED.next_run,
+                catch_up_policy = EXCLUDED.catch_up_policy,
+                catch_up_grace_seconds = EXCLUDED.catch_up_grace_seconds,
+                launch_failure_backoff_seconds = EXCLUDED.launch_failure_backoff_seconds,
+                conditions = EXCLUDED.conditions,
+                condition_status = EXCLUDED.condition_status,
+                managed_version = EXCLUDED.managed_version,
+                managed_digest = EXCLUDED.managed_digest,
+                timezone = EXCLUDED.timezone
+            WHERE $26::timestamptz IS NOT NULL
+              AND scheduled_tasks.modified_at = $26::timestamptz
+            RETURNING id, (xmax = 0) AS inserted
+            "#
+        );
+        let row = conn
+            .query_opt(
+                &sql,
+                &[
+                    &task.id as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &task.name,
+                    &task.description,
+                    &task.enabled,
+                    &stype.to_string(),
+                    &svalue,
+                    &task_config,
+                    &task.skip_if_completed,
+                    &task.auto_fix_on_failure,
+                    &task.success_criteria,
+                    &task
+                        .created_at
+                        .parse::<DateTime<Utc>>()
+                        .unwrap_or_else(|_| Utc::now()),
+                    &task
+                        .modified_at
+                        .parse::<DateTime<Utc>>()
+                        .unwrap_or_else(|_| Utc::now()),
+                    &task
+                        .next_run
+                        .as_deref()
+                        .and_then(|s| s.parse::<DateTime<Utc>>().ok()),
+                    &catch_up_policy_str,
+                    &catch_up_grace_seconds_i32,
+                    &consecutive_launch_failures_i32,
+                    &launch_failure_backoff_seconds_i32,
+                    &conditions_json,
+                    &condition_status_text,
+                    &managed.source,
+                    &managed.tenant_id,
+                    &managed.agent,
+                    &managed.version,
+                    &managed.digest,
+                    &task.timezone,
+                    &expected,
+                ],
+            )
+            .await
+            .map_err(|e| format!("PG upsert_managed_scheduled_task {}: {}", task.id, e))?;
+        let Some(row) = row else {
+            return Ok(ManagedUpsert::Conflict);
+        };
+        let id: String = row
+            .try_get(0)
+            .map_err(|e| format!("PG upsert_managed_scheduled_task id: {e}"))?;
+        let inserted: bool = row
+            .try_get(1)
+            .map_err(|e| format!("PG upsert_managed_scheduled_task inserted: {e}"))?;
+        Ok(if inserted {
+            ManagedUpsert::Created(id)
+        } else {
+            ManagedUpsert::Updated(id)
+        })
     }
 
     // ========================================================================
@@ -1193,6 +1507,153 @@ mod tests {
         );
     }
 
+    // ---- managed key + per-task timezone (plan 2026-10-29 Phase 4a) ----
+
+    const TENANT: &str = "0b0e9a40-6b1f-4c3e-9d55-5d1b8c4a2f10";
+
+    fn managed(agent: &str, version: u32) -> ManagedBy {
+        ManagedBy {
+            source: crate::scheduler::MANAGED_SOURCE_COORD.to_string(),
+            tenant_id: TENANT.to_string(),
+            agent: agent.to_string(),
+            version,
+            digest: Some("a".repeat(64)),
+        }
+    }
+
+    #[test]
+    fn the_store_reads_the_managed_and_timezone_columns() {
+        let columns: Vec<&str> = SELECT_TASK_COLS
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|c| !c.is_empty())
+            .collect();
+        // Positions are what row_to_scheduled_task indexes by.
+        assert_eq!(
+            &columns[20..],
+            &[
+                "managed_source",
+                "managed_tenant_id::text",
+                "managed_agent",
+                "managed_version",
+                "managed_digest",
+                "timezone"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_complete_managed_key_reads_as_managed_and_none_as_unmanaged() {
+        let m = managed_from_columns(
+            "t",
+            Some("coord".into()),
+            Some(TENANT.into()),
+            Some("cleanup-steward".into()),
+            Some(3),
+            Some("b".repeat(64)),
+        )
+        .expect("managed");
+        assert_eq!(m.agent, "cleanup-steward");
+        assert_eq!(m.version, 3);
+        assert_eq!(m.digest.as_deref(), Some("b".repeat(64).as_str()));
+        assert!(managed_from_columns("t", None, None, None, None, None).is_none());
+    }
+
+    /// A partial key is outside the unique index, so no by-key upsert can
+    /// address it; it must not read as managed (the reconciler would adopt it).
+    #[test]
+    fn a_partial_managed_key_reads_as_unmanaged() {
+        assert!(managed_from_columns(
+            "t",
+            Some("coord".into()),
+            None,
+            Some("a".into()),
+            Some(1),
+            None
+        )
+        .is_none());
+        assert!(managed_from_columns("t", None, Some(TENANT.into()), None, None, None).is_none());
+    }
+
+    #[test]
+    fn managed_columns_bind_the_key_or_nothing() {
+        let mut task = ScheduledTask::new(
+            "t".to_string(),
+            None,
+            ScheduleExpression::Cron("0 20 4 * * *".to_string()),
+            scheduled_task_type_default(),
+        );
+        let none = ManagedColumns::of(&task);
+        assert!(none.source.is_none() && none.tenant_id.is_none() && none.agent.is_none());
+        assert!(none.version.is_none() && none.digest.is_none());
+        task.managed = Some(managed("a", 7));
+        let some = ManagedColumns::of(&task);
+        assert_eq!(some.source.as_deref(), Some("coord"));
+        assert_eq!(some.tenant_id.as_deref(), Some(TENANT));
+        assert_eq!(some.agent.as_deref(), Some("a"));
+        assert_eq!(some.version, Some(7));
+    }
+
+    /// The upsert's ON CONFLICT predicate, the self-heal's index predicate and
+    /// alembic's (qontinui-web recurring_agents_01_coord_tables) must be
+    /// IDENTICAL, or PostgreSQL will not infer the index as the arbiter.
+    #[test]
+    fn the_upsert_arbiter_spells_the_self_healed_index_predicate() {
+        let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let predicate = "(managed_source, managed_tenant_id, managed_agent) \
+             WHERE managed_source IS NOT NULL AND managed_tenant_id IS NOT NULL \
+             AND managed_agent IS NOT NULL";
+        assert_eq!(squash(MANAGED_KEY_CONFLICT), squash(predicate));
+        let heal = include_str!("mod.rs");
+        let (_, heal) = heal
+            .split_once("project.scheduled_tasks managed key + per-task timezone")
+            .expect("managed-key self-heal");
+        let (heal, _) = heal.split_once("END $$;").expect("self-heal block");
+        let heal = squash(heal);
+        assert!(
+            heal.contains(&squash(&format!(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_scheduled_tasks_managed_key \
+                 ON project.scheduled_tasks {predicate};"
+            ))),
+            "self-heal index must match the arbiter: {heal}"
+        );
+        for column in [
+            "managed_source TEXT",
+            "managed_tenant_id UUID",
+            "managed_agent TEXT",
+            "managed_version INTEGER",
+            "managed_digest TEXT",
+            "timezone TEXT",
+        ] {
+            assert!(
+                heal.contains(&format!("ADD COLUMN IF NOT EXISTS {column}")),
+                "self-heal must add {column}"
+            );
+        }
+        assert!(
+            heal.contains("information_schema.columns") && heal.contains("pg_indexes"),
+            "the ALTER and the CREATE INDEX must each be existence-gated"
+        );
+        let (_, upsert) = include_str!("scheduler.rs")
+            .split_once("pub async fn upsert_managed_scheduled_task(")
+            .expect("upsert");
+        assert!(upsert.contains("ON CONFLICT {MANAGED_KEY_CONFLICT}"));
+        assert!(upsert.contains("AND scheduled_tasks.modified_at = $26::timestamptz"));
+    }
+
+    /// A user PUT never writes the managed key.
+    #[test]
+    fn the_user_update_does_not_write_the_managed_key() {
+        let (_, body) = include_str!("scheduler.rs")
+            .split_once("pub async fn update_scheduled_task(")
+            .expect("update");
+        let (body, _) = body
+            .split_once("pub async fn delete_scheduled_task(")
+            .expect("update ends");
+        assert!(!body.contains("managed_source ="));
+        assert!(!body.contains("managed_version ="));
+        assert!(body.contains("timezone = $20"));
+    }
+
     // PG-gated, per the `database/pg/*` convention (see event_log.rs):
     //   DATABASE_URL=... cargo test --bin qontinui-runner \
     //     database::pg::scheduler -- --ignored
@@ -1381,5 +1842,140 @@ mod tests {
         );
 
         db.delete_scheduled_task(&task.id).await.expect("cleanup");
+    }
+
+    /// Phase 4a: `managed` and `timezone` survive insert -> read; the
+    /// by-key upsert creates, then updates the SAME row for the same key, and
+    /// never touches an unmanaged task with the same name; a stale or absent
+    /// read is a Conflict, not a write.
+    #[tokio::test]
+    #[ignore = "requires PG via DATABASE_URL"]
+    async fn managed_key_and_timezone_round_trip_and_upsert_by_key() {
+        let db = PgDb::new_for_test().await;
+        let agent = format!("phase-4a-{}", uuid::Uuid::new_v4());
+        let name = format!("phase-4a same name {agent}");
+
+        // A plain insert carrying both fields reads them back.
+        let mut plain = ScheduledTask::new(
+            name.clone(),
+            None,
+            ScheduleExpression::Cron("0 20 4 * * *".to_string()),
+            scheduled_task_type_default(),
+        );
+        plain.timezone = Some("Europe/Berlin".to_string());
+        db.insert_scheduled_task(&plain).await.expect("insert");
+        let read = db
+            .get_scheduled_task(&plain.id)
+            .await
+            .unwrap()
+            .expect("row");
+        assert_eq!(read.timezone.as_deref(), Some("Europe/Berlin"));
+        assert!(
+            read.managed.is_none(),
+            "an unmanaged insert reads unmanaged"
+        );
+
+        // The user update writes timezone (here: clears it).
+        let mut cleared = read.clone();
+        cleared.timezone = None;
+        cleared.touch();
+        assert!(db
+            .update_scheduled_task(&cleared, &read.modified_at, false)
+            .await
+            .unwrap());
+        let unmanaged = db.get_scheduled_task(&plain.id).await.unwrap().unwrap();
+        assert_eq!(unmanaged.timezone, None);
+
+        // By-key read misses: the same-name task is unmanaged.
+        assert!(db
+            .get_stored_scheduled_task_by_managed_key("coord", TENANT, &agent)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Create.
+        let mut task = ScheduledTask::new(
+            name.clone(),
+            None,
+            ScheduleExpression::Cron("0 20 4 * * *".to_string()),
+            scheduled_task_type_default(),
+        );
+        task.managed = Some(managed(&agent, 1));
+        task.timezone = Some("America/New_York".to_string());
+        let created = db.upsert_managed_scheduled_task(&task, None).await.unwrap();
+        let ManagedUpsert::Created(id) = created else {
+            panic!("expected Created, got {created:?}");
+        };
+        assert_eq!(id, task.id);
+        let stored = db
+            .get_stored_scheduled_task_by_managed_key("coord", TENANT, &agent)
+            .await
+            .unwrap()
+            .expect("by key");
+        assert_eq!(stored.task.id, task.id);
+        assert_eq!(stored.task.managed, Some(managed(&agent, 1)));
+        assert_eq!(stored.task.timezone.as_deref(), Some("America/New_York"));
+
+        // A second create of the same key (caller read no row) is refused,
+        // not a duplicate.
+        let mut dup = task.clone();
+        dup.id = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            db.upsert_managed_scheduled_task(&dup, None).await.unwrap(),
+            ManagedUpsert::Conflict
+        );
+
+        // Update the same key: same row, new version/digest/schedule/zone.
+        let mut next = stored.task.clone();
+        next.id = uuid::Uuid::new_v4().to_string(); // ignored on update
+        next.schedule = ScheduleExpression::Cron("0 30 5 * * *".to_string());
+        let mut m2 = managed(&agent, 2);
+        m2.digest = Some("c".repeat(64));
+        next.managed = Some(m2.clone());
+        next.timezone = None;
+        next.touch();
+        let updated = db
+            .upsert_managed_scheduled_task(&next, Some(&stored.task.modified_at))
+            .await
+            .unwrap();
+        assert_eq!(updated, ManagedUpsert::Updated(task.id.clone()));
+        let after = db.get_scheduled_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(after.managed, Some(m2));
+        assert_eq!(after.timezone, None);
+        assert!(matches!(after.schedule, ScheduleExpression::Cron(ref c) if c == "0 30 5 * * *"));
+        assert!(db.get_scheduled_task(&next.id).await.unwrap().is_none());
+
+        // A stale snapshot cannot overwrite the newer row.
+        assert_eq!(
+            db.upsert_managed_scheduled_task(&next, Some(&stored.task.modified_at))
+                .await
+                .unwrap(),
+            ManagedUpsert::Conflict
+        );
+
+        // The unmanaged same-name task was never touched.
+        let untouched = db.get_scheduled_task(&plain.id).await.unwrap().unwrap();
+        assert_eq!(untouched.modified_at, unmanaged.modified_at);
+        assert!(untouched.managed.is_none());
+        assert!(
+            matches!(untouched.schedule, ScheduleExpression::Cron(ref c) if c == "0 20 4 * * *")
+        );
+        let same_name = db
+            .get_all_scheduled_tasks()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.name == name)
+            .count();
+        assert_eq!(same_name, 2, "one unmanaged + one managed, never merged");
+
+        // An unmanaged task is not upsertable.
+        assert!(db
+            .upsert_managed_scheduled_task(&plain, None)
+            .await
+            .is_err());
+
+        db.delete_scheduled_task(&task.id).await.expect("cleanup");
+        db.delete_scheduled_task(&plain.id).await.expect("cleanup");
     }
 }

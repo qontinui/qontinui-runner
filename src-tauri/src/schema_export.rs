@@ -150,6 +150,22 @@ pub fn export_all_schemas() -> Value {
     add!("NextTaskInfo", qs::NextTaskInfo);
     add!("CreateScheduledTaskRequest", qs::CreateScheduledTaskRequest);
     add!("UpdateScheduledTaskRequest", qs::UpdateScheduledTaskRequest);
+    // Recurring agents declared in coord and reconciled by the runner (plan
+    // 2026-10-29-recurring-agents-declared-in-coord-reconciled-by-runner,
+    // qontinui-schemas#276 / #283): the managed key a ScheduledTask carries,
+    // and the wire types of coord's device read and the status report.
+    add!("ManagedBy", qs::ManagedBy);
+    add!("RecurringAgentDispatchRole", qs::RecurringAgentDispatchRole);
+    add!("RecurringAgentOs", qs::RecurringAgentOs);
+    add!("RecurringAgentTarget", qs::RecurringAgentTarget);
+    add!("RecurringAgentParamKind", qs::RecurringAgentParamKind);
+    add!("RecurringAgentParamDef", qs::RecurringAgentParamDef);
+    add!("RecurringAgentParamSchema", qs::RecurringAgentParamSchema);
+    add!("RecurringAgentSpec", qs::RecurringAgentSpec);
+    add!("RecurringAgentState", qs::RecurringAgentState);
+    add!("RecurringAgentOverride", qs::RecurringAgentOverride);
+    add!("RecurringAgentStatus", qs::RecurringAgentStatus);
+    add!("RecurringAgentStatusReport", qs::RecurringAgentStatusReport);
 
     // ── qontinui-types: workflow frame ──
     add!("RoutingRule", qw::RoutingRule);
@@ -1080,8 +1096,25 @@ mod tests {
         // RequirementFrontmatter, InterfaceMappingFrontmatter, StoryFrontmatter,
         // SpecAcceptanceCriterion, SourceCitation, SourceCitationKind,
         // ExternalRef, TemplateRef, MappingRow, SpecLanguage) = 611.
-        // The codegen's "Processing N top-level types" line should read 611 here.
-        assert_eq!(obj.len(), 611, "Expected 611 schema entries");
+        // + the 12 recurring-agent types (ManagedBy, RecurringAgentDispatchRole,
+        // RecurringAgentOs, RecurringAgentTarget, RecurringAgentParamKind,
+        // RecurringAgentParamDef, RecurringAgentParamSchema, RecurringAgentSpec,
+        // RecurringAgentState, RecurringAgentOverride, RecurringAgentStatus,
+        // RecurringAgentStatusReport — plan
+        // 2026-10-29-recurring-agents-declared-in-coord-reconciled-by-runner
+        // Phase 4a) = 623.
+        // The codegen's "Processing N top-level types" line should read 623 here.
+        assert_eq!(obj.len(), 623, "Expected 623 schema entries");
+        for recurring in [
+            "ManagedBy",
+            "RecurringAgentTarget",
+            "RecurringAgentParamSchema",
+            "RecurringAgentSpec",
+            "RecurringAgentStatus",
+            "RecurringAgentStatusReport",
+        ] {
+            assert!(obj.contains_key(recurring), "Missing {recurring} schema");
+        }
         for journey in [
             "JourneyNode",
             "JourneyTrigger",
