@@ -3710,9 +3710,9 @@ mod tests {
 ///
 /// # `app_handle.exit(0)` is NOT the terminator here
 ///
-/// `AppHandle::exit` (`tauri-2.11.1/src/app.rs:573-580`) calls
+/// `AppHandle::exit` (`tauri-2.12.5/src/app.rs:581-587`) calls
 /// `runtime_handle.request_exit`, whose wry implementation
-/// (`tauri-runtime-wry-2.11.2/src/lib.rs:2751-2757`) is *structurally
+/// (`tauri-runtime-wry-2.12.3/src/lib.rs:2597-2603`) is *structurally
 /// identical to `close`*: a bare `proxy.send_event(Message::RequestExit(code))`
 /// that deliberately bypasses `send_user_message`, carrying upstream's own NOTE
 /// saying so. Its internal `std::process::exit` escape hatch fires only when

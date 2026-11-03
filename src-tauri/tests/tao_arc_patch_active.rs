@@ -129,6 +129,10 @@ fn vendored_tao_linux_window_set_uses_an_atomic_refcount() {
 /// full?..."` once per call (442 calls/second were measured while a pop-out
 /// closed under load). The patched version reclaims the closure, remembers a
 /// destroyed target in `DEAD_TARGET_WINDOWS` and short-circuits later calls.
+/// The target is always the event loop's hidden message window
+/// (`thread_msg_target`), reached through the `EventLoopThreadExecutor` a tao
+/// `Window` holds — not via `EventLoopProxy`, whose `send_event` posts
+/// directly — so a dead target means event-loop teardown.
 #[test]
 fn vendored_tao_execute_in_thread_reclaims_and_tracks_dead_windows() {
     let event_loop_rs =

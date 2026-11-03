@@ -524,11 +524,18 @@ impl EventLoopThreadExecutor {
         return;
       }
 
-      // A window that has already answered ERROR_INVALID_WINDOW_HANDLE is gone
-      // for good — HWNDs are not resurrected. Bail BEFORE boxing, so a caller
-      // that keeps dispatching at the rate a UI thread can produce work (442
-      // calls/second was measured while a pop-out was closing under load) costs
-      // one hash lookup instead of an allocation, a failed syscall and a log line.
+      // `target_window` is never a user (pop-out) window: every executor is made
+      // by `create_thread_executor` and holds the event loop's own hidden
+      // message window, `thread_msg_target` (see `create_thread_executor` and
+      // `create_proxy` above). So ERROR_INVALID_WINDOW_HANDLE here means that
+      // message window has been destroyed — event-loop teardown (`Drop for
+      // EventLoop`) — and for the life of that event loop it will not come
+      // back. Windows DOES reuse HWND values, so the set below is only sound
+      // because a message window is destroyed once, at teardown. Bail BEFORE
+      // boxing, so a caller that keeps dispatching at the rate a UI thread can
+      // produce work (442 calls/second was measured while a pop-out was closing
+      // under load) costs one hash lookup instead of an allocation, a failed
+      // syscall and a log line.
       let target = self.target_window.0 as isize;
       if DEAD_TARGET_WINDOWS.lock().contains(&target) {
         return;
@@ -561,13 +568,16 @@ impl EventLoopThreadExecutor {
       drop(Box::from_raw(raw));
 
       if err.code() == E_INVALID_WINDOW_HANDLE {
-        // The window is destroyed. This is a benign, unavoidable RACE — a
-        // pop-out can close between another thread reading the handle and
-        // posting to it (or a caller outlives the parent
-        // `EventLoopWindowTarget`) — so it is neither an error nor a panic.
+        // The event loop's message window is destroyed: a `Window` (whose
+        // setters/getters are what reach this path off the event-loop thread)
+        // outlived its event loop and is still being driven during teardown. A
+        // pop-out window closing does NOT produce this — its executor targets
+        // the message window, not the pop-out's HWND. Benign at teardown, so
+        // neither an error nor a panic.
         //
         // `insert` returning true means WE are the first to observe this
-        // window's death, which is what bounds the log to one line per window.
+        // message window's death, which bounds the log to one line per event
+        // loop.
         if DEAD_TARGET_WINDOWS.lock().insert(target) {
           warn!(
             "tao: target window {:#x} is destroyed; dropping queued closures \
@@ -602,12 +612,15 @@ type ThreadExecFn = Box<Box<dyn FnMut()>>;
 const E_INVALID_WINDOW_HANDLE: windows::core::HRESULT =
   windows::core::HRESULT(0x8007_0578u32 as i32);
 
-/// Target windows known to be destroyed, keyed by raw `HWND` value.
+/// Event-loop message windows (`thread_msg_target`) known to be destroyed,
+/// keyed by raw `HWND` value.
 ///
-/// Bounded by the number of windows the process ever creates, and entries are
-/// only added on a window's death — so this never grows faster than the window
-/// count it tracks. An `HWND` is not `Send`, which is why the raw `isize` is
-/// stored rather than the handle.
+/// Every `EventLoopThreadExecutor` targets its event loop's hidden message
+/// window, never a user window, so this holds at most about one entry per
+/// event loop — in practice one per process. Windows reuses HWND values, so
+/// an entry is only valid because a message window is destroyed once, at
+/// event-loop teardown. An `HWND` is not `Send`, which is why the raw `isize`
+/// is stored rather than the handle.
 static DEAD_TARGET_WINDOWS: LazyLock<Mutex<HashSet<isize>>> =
   LazyLock::new(|| Mutex::new(HashSet::new()));
 

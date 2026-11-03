@@ -225,8 +225,13 @@ pub fn initialize_overlay(app_handle: &tauri::AppHandle) -> Result<(), String> {
 
     match builder.build() {
         Ok(window) => {
-            // `build()` returning `Ok` proves nothing about the webview — see
-            // `webview_recovery::verify_window_has_a_webview`.
+            // Since tauri 2.12.5 / tauri-runtime-wry 2.12.3 `build()` blocks on
+            // the `Message::CreateWindow` reply, so the ordinary webview
+            // creation failure no longer reaches this arm: it comes back as
+            // the `Err` below, and Tauri registers nothing for the label. The
+            // probe is kept as the independent check — see
+            // `webview_recovery::verify_window_has_a_webview` — for a window
+            // Tauri registered that wry never created.
             //
             // What a probe failure means HERE, decided deliberately rather
             // than copied from the pop-out path: the overlay is a passive
@@ -234,15 +239,17 @@ pub fn initialize_overlay(app_handle: &tauri::AppHandle) -> Result<(), String> {
             // anything else down — the error goes back to the caller and
             // nothing else is touched.
             //
-            // It is **not** retryable, and an earlier version of this comment
-            // claimed it was. Tauri registered the window on `build()`'s `Ok`
-            // (`tauri` 2.11.1 `src/manager/webview.rs`, `attach_webview`) and
-            // only drops a registration on a `Destroyed` event wry can never
-            // emit for a window it never created, so the `click-overlay` label
-            // is burned for the life of the process: a second
-            // `initialize_overlay` re-enters `WebviewWindowBuilder::new` and
-            // fails with `Error::WebviewLabelAlreadyExists`
-            // (`src/manager/webview.rs:436-438`).
+            // A probe failure is **not** retryable, and an earlier version of
+            // this comment claimed it was. Reaching this arm means `build()`
+            // returned `Ok`, so Tauri HAS registered the window (`tauri`
+            // 2.12.5 `src/window/mod.rs:408-430`, `attach_window` /
+            // `attach_webview`) and only drops a registration on a `Destroyed`
+            // event wry can never emit for a window it never created: the
+            // `click-overlay` label is burned for the life of the process, and
+            // a second `initialize_overlay` re-enters `WebviewWindowBuilder::new`
+            // and fails with `Error::WebviewLabelAlreadyExists`
+            // (`src/manager/webview.rs:461-463`). (A `build()` that returns
+            // `Err` registers nothing, so a later call simply builds again.)
             //
             // `OVERLAY_INITIALIZED` therefore stays `false` for **honesty, not
             // recovery**, and that is still the right value: the early-return

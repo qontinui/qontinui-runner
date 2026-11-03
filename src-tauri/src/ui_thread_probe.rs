@@ -7,16 +7,17 @@
 //! # Why this module exists at all
 //!
 //! `tauri::Window::hwnd()` looks like a cheap accessor and is not one. It is an
-//! **unbounded event-loop getter**: `tauri-2.11.1/src/window/mod.rs:1656` →
-//! `get_raw_window_handle` (`tauri-runtime-wry-2.11.2/src/lib.rs:1971`) →
-//! `window_getter!` → `getter!` (`:197-204`), whose last act is `rx.recv()`
+//! **unbounded event-loop getter**: `tauri-2.12.5/src/window/mod.rs:1765` →
+//! `WindowDispatch::window_handle` (`tauri-runtime-wry-2.12.3/src/lib.rs:2000-2006`)
+//! → `get_raw_window_handle` (`:1837-1841`) → `window_getter!` (`:205-210`) →
+//! `getter!` (`:196-203`), whose last act is `rx.recv()`
 //! **with no timeout**. Calling it from a native-hang detector parks the
 //! detector on precisely the thread it was written to observe — the detector
 //! then shares fate with its subject and reports nothing, forever.
 //!
 //! Calling it **once, at startup, on the UI thread** is safe: `send_user_message`
 //! short-circuits to a direct inline call when it is already on the main thread
-//! (`tauri-runtime-wry-2.11.2/src/lib.rs:239-247`), so there is no channel and
+//! (`tauri-runtime-wry-2.12.3/src/lib.rs:263-280`), so there is no channel and
 //! no `recv()`. That is the only place [`set_main_hwnd`] should be called from.
 //!
 //! # Crate choice is load-bearing

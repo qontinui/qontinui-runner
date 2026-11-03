@@ -85,10 +85,16 @@ pub async fn open_project_preview(
     //
     // ⚠ "Already open" is only Tauri's word for it, and it is not enough to
     // act on. Tauri inserts a window into its own registry the moment
-    // `build()` returns `Ok` (`tauri` 2.11.1 `src/manager/webview.rs`,
-    // `attach_webview`) and only removes it on a `Destroyed` event, which can
-    // never fire for a window wry never created — so `get_webview_window`
-    // finds a HOLLOW registration exactly like a healthy one. Both calls below
+    // `build()` returns `Ok` (`tauri` 2.12.5 `src/window/mod.rs:408-430`,
+    // `attach_window` / `attach_webview`) and only removes it on a `Destroyed`
+    // event, which can never fire for a window wry never created. On tauri
+    // 2.11.1 that was the ordinary webview-creation failure (fire-and-forget
+    // `build()` returned `Ok` regardless); since tauri 2.12.5 /
+    // tauri-runtime-wry 2.12.3 `build()` waits for the event loop's reply and
+    // returns that failure as an `Err`, registering nothing, so a hollow
+    // registration needs an `Ok` build whose post-build probe then failed (or
+    // a future regression the probe exists to catch). Where one exists,
+    // `get_webview_window` finds it exactly like a healthy one. Both calls below
     // would then lie: `navigate` and `set_focus` are fire-and-forget
     // `send_user_message` messages whose handler early-returns for a window id
     // absent from wry's map, so both return `Ok` and this command would report
@@ -160,25 +166,30 @@ pub async fn open_project_preview(
             .build()
             .map_err(|e| format!("Failed to open the preview window: {e}"))?;
 
-        // `build()` returning `Ok` proves nothing about the webview. What a
+        // An `Err` from `build()` (above) is, since tauri 2.12.5 /
+        // tauri-runtime-wry 2.12.3, how an ordinary webview creation failure
+        // arrives, and it registers nothing: a later Open simply builds again.
+        // The probe is kept as the independent check that wry really holds the
+        // window (see `webview_recovery::verify_window_has_a_webview`). What a
         // probe failure means HERE, decided rather than copied: the preview is
         // a single operator-requested window with nothing else depending on it,
         // so the honest response is to fail the invoke that asked for it — the
         // operator pressed Open and gets told it did not open, instead of
         // staring at an empty frame.
         //
-        // It is **not** retryable. An earlier version of this comment claimed
-        // "a later Open builds a new window under the same label, so nothing is
-        // latched"; that is false, and it was the premise the reuse branch's
-        // silent `Ok(false)` rested on. Tauri registered this window on
-        // `build()`'s `Ok` and can only drop it on a `Destroyed` event wry will
-        // never emit for a window it never created, so
-        // `project-preview-<id>` is burned for the life of the process:
+        // A probe failure is **not** retryable. An earlier version of this
+        // comment claimed "a later Open builds a new window under the same
+        // label, so nothing is latched"; for this arm that is false, and it was
+        // the premise the reuse branch's silent `Ok(false)` rested on. Tauri
+        // registered this window on `build()`'s `Ok` and can only drop it on a
+        // `Destroyed` event wry will never emit for a window it never created,
+        // so `project-preview-<id>` is burned for the life of the process:
         // rebuilding it returns `Error::WebviewLabelAlreadyExists`
-        // (`tauri` 2.11.1 `src/manager/webview.rs:436-438`). A later Open takes
+        // (`tauri` 2.12.5 `src/manager/webview.rs:461-463`). A later Open takes
         // the reuse branch instead and is failed there by the same probe. This
         // is the same semantics `WindowAssignments::reserved_labels` documents
-        // for `term-N`.
+        // for `term-N` (which, unlike this site, also burns the label on a
+        // `build()` `Err` — a conservative choice tracked separately).
         //
         // A per-attempt label suffix WOULD make it retryable and was
         // considered. Declined: `preview_window_label` is a pure function of

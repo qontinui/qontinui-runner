@@ -89,10 +89,23 @@ What the patched `execute_in_thread` in
 - reclaims the double-boxed closure (`drop(Box::from_raw(raw))`) on EVERY
   `PostMessageW` failure instead of leaking it;
 - treats `ERROR_INVALID_WINDOW_HANDLE` (`E_INVALID_WINDOW_HANDLE`, HRESULT
-  `0x80070578`) as a benign race with window teardown — the target is
-  remembered in `DEAD_TARGET_WINDOWS` and a `warn!` is logged once per window;
+  `0x80070578`) as benign event-loop teardown — the target is remembered in
+  `DEAD_TARGET_WINDOWS` and a `warn!` is logged once per target;
 - logs any other failure with `error!` on every occurrence, naming the window
   and saying the closure was dropped without running.
+
+How a call gets here, and what "target window" means: `execute_in_thread`
+is reached through the `EventLoopThreadExecutor` that tao's Windows `Window`
+holds (`window.rs:98`, made by `create_thread_executor` at `window.rs:1132`),
+whenever a `Window` setter/getter runs off the event-loop thread. It is NOT
+reached via `EventLoopProxy` — `EventLoopProxy::send_event` calls
+`PostMessageW` directly. The executor's `target_window` is always the event
+loop's hidden message window `thread_msg_target` (`event_loop.rs`
+`create_thread_executor`), never a pop-out's HWND. So
+`ERROR_INVALID_WINDOW_HANDLE` means that message window is gone — event-loop
+teardown — not that a pop-out closed, and `DEAD_TARGET_WINDOWS` holds at most
+about one entry per event loop. Windows does reuse HWND values; the set is
+sound only because a message window is destroyed once, at teardown.
 
 Re-derived difference from the 0.35.0 patch: the old patch kept upstream's
 `panic!` for a non-`ERROR_INVALID_WINDOW_HANDLE` failure. Upstream itself has

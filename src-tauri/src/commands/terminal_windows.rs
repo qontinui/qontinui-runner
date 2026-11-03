@@ -114,7 +114,8 @@ fn build_pop_out_webview(
     // user-data folder and its anti-throttling browser args. Without this
     // Tauri forces `%LOCALAPPDATA%\com.qontinui.runner` (the PRIMARY's profile
     // root) on the pop-out, and on a secondary runner WebView2 then fails with
-    // `HRESULT(0x8007139F)`, leaving a window with no webview at all. See
+    // `HRESULT(0x8007139F)` — on tauri 2.11 a window with no webview at all,
+    // since 2.12 an `Err` from `build()` itself. See
     // `webview_recovery::apply_main_window_env_options`.
     builder = crate::webview_recovery::apply_main_window_env_options(builder);
 
@@ -209,11 +210,16 @@ pub async fn open_terminal_window(
             // No record was written, so there is nothing to prune and nothing
             // survives to be retried at the next boot — which is the whole
             // point. The label stays RESERVED (burned) rather than being handed
-            // back: `build()` returning `Ok` already put a webview-less window
-            // into Tauri's own registry, which nothing ever removes, so
-            // rebuilding this label would fail with
-            // `Error::WebviewLabelAlreadyExists` forever. See
-            // `WindowAssignments::reserved_labels`.
+            // back, deliberately and conservatively. Since tauri 2.12.5 /
+            // tauri-runtime-wry 2.12.3 a failed webview creation makes
+            // `build()` itself return `Err` and Tauri registers nothing, so
+            // the label would only be unusable if `build()` returned `Ok` and
+            // the post-build probe then failed (a Tauri registration with no
+            // wry window, which nothing ever removes — rebuilding it would hit
+            // `Error::WebviewLabelAlreadyExists`). `e` does not say which arm
+            // failed, so both burn the label; whether to let a failed
+            // `build()` hand it back for a retry is an open design question
+            // tracked separately. See `WindowAssignments::reserved_labels`.
             //
             // Loud, and loud in the two places that can act on it: this
             // `error!` for the operator reading the log, and the `Err` return
@@ -382,10 +388,10 @@ pub fn restore_pop_out_windows(
 /// destroying, leaving the OS window VISIBLE (observed live — `EnumWindows`
 /// still reports the window `[vis]` after `close()` returned `ok`). `destroy()`
 /// forces the teardown synchronously. `destroy()` fires NO events (tauri
-/// 2.11.1: "does not emit any events"), so the central `CloseRequested` handler
-/// does NOT run on this path — which is why the records are pruned explicitly
-/// below rather than left to it. Returns the labels closed/pruned. Never
-/// touches `"main"`.
+/// 2.12.5 `src/webview/webview_window.rs:2348`: "does not emit any events"),
+/// so the central `CloseRequested` handler does NOT run on this path — which
+/// is why the records are pruned explicitly below rather than left to it.
+/// Returns the labels closed/pruned. Never touches `"main"`.
 ///
 /// Note this sweep deliberately skips PAGE-BOUND pop-outs, so it is not a
 /// backstop for their records; [`close_terminal_window`] owns that teardown.
@@ -622,7 +628,8 @@ pub fn capture_open_geometry(app: &tauri::AppHandle, assignments: &Arc<WindowAss
 ///
 /// `destroy()` forces the teardown but — per its own tauri docs, "Similar to
 /// `close` but **does not emit any events** and force close the window instead"
-/// (tauri 2.11.1) — it does NOT fire `CloseRequested`. So the central
+/// (tauri 2.12.5 `src/webview/webview_window.rs:2348`) — it does NOT fire
+/// `CloseRequested`. So the central
 /// `on_window_event` handler never runs on this path, and this function must
 /// invoke [`handle_window_close`] itself. It previously did not, and the
 /// consequences were severe and PERSISTENT (measured live on the runner
@@ -826,10 +833,11 @@ pub fn handle_window_close(app: &tauri::AppHandle, label: &str) -> bool {
     // closes the window. A pop-out's React tree registers `onCloseRequested`
     // (`useTerminalInitialization.ts`), and `tauri` turns the mere existence of
     // such a JS listener into an automatic `api.prevent_close()`
-    // (`tauri-2.11.1/src/manager/window.rs`, `WindowEvent::CloseRequested`).
-    // `tauri-runtime-wry`'s `on_close_requested` then reads that prevent signal
-    // with a `try_recv` and skips `on_window_close`, so the tao `Window` is
-    // never dropped: the HWND, the webview and tauri's registry entry for this
+    // (`tauri` 2.12.5 `src/manager/window.rs:177-180`,
+    // `WindowEvent::CloseRequested`). `tauri-runtime-wry`'s `on_close_requested`
+    // (2.12.3 `src/lib.rs:4351-4380`) then reads that prevent signal with a
+    // `try_recv` and skips `on_window_close`, so the tao `Window` is never
+    // dropped: the HWND, the webview and tauri's registry entry for this
     // label all survive a close the user experienced as final. The next
     // `open_terminal_window` re-derived the same `term-N` (records are what
     // `next_popout_label` counts, and this one's record had just been removed)
@@ -1102,13 +1110,18 @@ mod tests {
         assert_eq!(wa.reserve_popout_label(), "term-3");
     }
 
-    /// A label burned by a failed build is **never** handed back. `build()`
-    /// returning `Ok` already put a webview-less window into Tauri's own
-    /// registry (`tauri` 2.11.1 `src/manager/webview.rs`, `attach_webview`),
-    /// which nothing removes because no wry-side window exists to raise a
-    /// `Destroyed` event — so rebuilding that label would fail with
-    /// `Error::WebviewLabelAlreadyExists` (`src/manager/webview.rs:437`) for
-    /// the rest of the process's life. The retry must get a fresh label.
+    /// A label burned by a failed build is **never** handed back — a
+    /// deliberately conservative policy, pinned here. On tauri 2.11.1 it was
+    /// forced: fire-and-forget `build()` returned `Ok` and registered a
+    /// webview-less window with Tauri, so reusing the label hit
+    /// `Error::WebviewLabelAlreadyExists` forever. Since tauri 2.12.5 /
+    /// tauri-runtime-wry 2.12.3 a failed webview creation makes `build()`
+    /// itself return `Err` and nothing is registered, so a reuse would only
+    /// collide in the residual case of an `Ok` build whose post-build probe
+    /// failed (a Tauri registration wry never backed). The store burns the
+    /// label either way; whether a failed `build()` should allow the retry to
+    /// reuse it is an open design question tracked separately. Until that is
+    /// decided, the retry must get a fresh label.
     #[test]
     fn a_label_burned_by_a_failed_build_is_not_reused_by_the_retry() {
         let (_d, wa) = store();

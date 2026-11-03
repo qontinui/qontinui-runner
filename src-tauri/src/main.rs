@@ -1342,7 +1342,8 @@ static APP_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::On
 ///
 /// ## What it is capping
 ///
-/// `tauri::async_runtime::default_runtime()` (tauri 2.11.1) builds the app's
+/// `tauri::async_runtime::default_runtime()` (tauri 2.12.5
+/// `src/async_runtime.rs:243-250`) builds the app's
 /// global runtime as `tokio::runtime::Runtime::new()`, which takes EVERY tokio
 /// default: one worker per CPU, and the thread name `tokio-rt-worker`. Tokio's
 /// BLOCKING POOL takes the same name (`runtime/blocking/pool.rs` names each
@@ -5704,7 +5705,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                             // Cache the main window's HWND ONCE, here, on the UI
                             // thread. `Window::hwnd()` is an unbounded event-loop
-                            // getter (`tauri-2.11.1/src/window/mod.rs:1656` →
+                            // getter (`tauri-2.12.5/src/window/mod.rs:1765` →
                             // `getter!` → `rx.recv()` with no timeout) — harmless
                             // on this thread, where `send_user_message`
                             // short-circuits to a direct inline call, and fatal
@@ -6864,7 +6865,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // per-window queries go through `send_user_message`, which
                 // short-circuits to a direct inline Win32 call when it is
                 // already on the main thread
-                // (`tauri-runtime-wry-2.11.2/src/lib.rs:239-247`). From a
+                // (`tauri-runtime-wry-2.12.3/src/lib.rs:263-280`). From a
                 // worker thread the very same calls become `rx.recv()` with NO
                 // timeout and can park forever. They are safe here and only
                 // here. All three are O(1)-ish and non-blocking.
