@@ -70,17 +70,21 @@ fn settled_accepts(accepts: &AtomicUsize) -> usize {
     accepts.load(Ordering::SeqCst)
 }
 
-fn runtime(name: &str) -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_name(name)
-        .enable_all()
-        .build()
-        .expect("test runtime")
+/// A 2-worker test runtime built as a LOCAL, so the disallowed `Runtime` type
+/// is never named (clippy.toml `disallowed-types`; `expect_ratchet.rs`).
+macro_rules! runtime {
+    ($name:expr) => {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name($name)
+            .enable_all()
+            .build()
+            .expect("test runtime")
+    };
 }
 
 /// Park every worker of a 2-worker runtime; returns once both are parked.
-fn park_both_workers(rt: &tokio::runtime::Runtime, for_: Duration) {
+fn park_both_workers(rt: &tokio::runtime::Handle, for_: Duration) {
     let barrier = Arc::new(Barrier::new(3));
     for _ in 0..2 {
         let b = barrier.clone();
@@ -110,8 +114,8 @@ fn a_pooled_connection_is_driven_by_the_runtime_that_opened_it() {
     // Control (ii) gets its OWN server, so `accepts` counts only the shared
     // client's connections.
     let (b_only_url, _b_only_accepts) = keep_alive_server();
-    let rt_a = runtime("conn-test-a");
-    let rt_b = runtime("conn-test-b");
+    let rt_a = runtime!("conn-test-a");
+    let rt_b = runtime!("conn-test-b");
     let shared = super::os_dns::client_builder()
         .pool_max_idle_per_host(1)
         .build()
@@ -131,7 +135,7 @@ fn a_pooled_connection_is_driven_by_the_runtime_that_opened_it() {
         "fixture error — the second request did not reuse A's pooled connection"
     );
 
-    park_both_workers(&rt_a, Duration::from_secs(6));
+    park_both_workers(rt_a.handle(), Duration::from_secs(6));
 
     // Control (ii): a client used only from B is unaffected by A.
     let b_only = super::os_dns::client_builder().build().expect("client");

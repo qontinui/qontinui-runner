@@ -757,16 +757,20 @@ mod tests {
         assert!(now_mono_ms() >= 1, "0 is reserved for never");
     }
 
-    fn runtime(workers: usize) -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(workers)
-            .thread_name("lag-test-rt")
-            .enable_all()
-            .build()
-            .unwrap()
+    /// A test runtime built as a LOCAL, so the disallowed `Runtime` type is
+    /// never named (clippy.toml `disallowed-types`; `expect_ratchet.rs`).
+    macro_rules! runtime {
+        ($workers:expr) => {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads($workers)
+                .thread_name("lag-test-rt")
+                .enable_all()
+                .build()
+                .unwrap()
+        };
     }
 
-    fn park_every_worker(rt: &tokio::runtime::Runtime, workers: usize, for_: Duration) {
+    fn park_every_worker(rt: &tokio::runtime::Handle, workers: usize, for_: Duration) {
         let barrier = Arc::new(Barrier::new(workers + 1));
         for _ in 0..workers {
             let b = barrier.clone();
@@ -801,7 +805,7 @@ mod tests {
     /// synchronous work is reported starved by a watcher on an OS thread.
     #[test]
     fn a_fully_parked_runtime_is_reported_starved_by_the_os_thread_watcher() {
-        let rt = runtime(2);
+        let rt = runtime!(2);
         let probe = Arc::new(RuntimeProbe::new("lag-test-rt", 2));
         spawn_tick_task(rt.handle(), probe.clone(), Duration::from_millis(50));
         std::thread::sleep(Duration::from_millis(200));
@@ -813,7 +817,7 @@ mod tests {
         // Taken BEFORE the park: the workers start sleeping only once the
         // barrier releases, so the park ends no earlier than `park_floor`.
         let park_floor = Instant::now() + park;
-        park_every_worker(&rt, 2, park);
+        park_every_worker(rt.handle(), 2, park);
         let p = probe.clone();
         let seen_at =
             std::thread::spawn(move || observed_starvation(&p, 400, Duration::from_millis(1_200)))
@@ -837,7 +841,7 @@ mod tests {
     /// it is happening.
     #[test]
     fn a_watcher_on_the_measured_runtime_cannot_see_its_starvation() {
-        let rt = runtime(2);
+        let rt = runtime!(2);
         let probe = Arc::new(RuntimeProbe::new("lag-test-rt", 2));
         spawn_tick_task(rt.handle(), probe.clone(), Duration::from_millis(50));
         std::thread::sleep(Duration::from_millis(200));
@@ -845,7 +849,7 @@ mod tests {
         // Taken BEFORE the park: the workers start sleeping only once the
         // barrier releases, so the park cannot end before `park_floor`.
         let park_floor = Instant::now() + park;
-        park_every_worker(&rt, 2, park);
+        park_every_worker(rt.handle(), 2, park);
         // When the on-runtime watcher ran, and whether it saw an episode start.
         let ran: Arc<Mutex<Option<(Instant, bool)>>> = Arc::new(Mutex::new(None));
         let (p, r) = (probe.clone(), ran.clone());
@@ -888,7 +892,7 @@ mod tests {
     #[test]
     fn a_registered_runtime_reads_starved_on_the_report_while_parked() {
         const NAME: &str = "lag-test-registered-rt";
-        let rt = runtime(2);
+        let rt = runtime!(2);
         register_runtime(NAME, rt.handle(), 2);
         let find = || {
             runtime_lag_report()
@@ -909,7 +913,7 @@ mod tests {
         // Taken BEFORE the park, so the deadline is a lower bound on the
         // park's end: every sample before it is a sample while parked.
         let park_floor = Instant::now() + park;
-        park_every_worker(&rt, 2, park);
+        park_every_worker(rt.handle(), 2, park);
         let deadline = park_floor - Duration::from_millis(500);
         let mut seen = None;
         while Instant::now() < deadline {
