@@ -202,13 +202,16 @@ pub(crate) fn typed_line_target(
 /// | target | record | coord | bypass event |
 /// |---|---|---|---|
 /// | `Shell` | authoritative | registered (when recorded) | when the line says so |
-/// | `Unknown` | provisional (`reconciled`, unconfirmed) | no | when the line says so |
+/// | `Unknown` | provisional ([`SessionLifecycleStore::record_open_provisional`]) | no | when the line says so |
 /// | `Claude` | none | no | no — nothing was launched |
 ///
 /// A line a running `claude` read launched nothing, so it records nothing: a
 /// write would re-open a CLOSED session onto this pane (the binding guard only
 /// stands between OPEN rows and a move) and its asserted `reconciled` origin
-/// would downgrade an existing row's grade.
+/// would downgrade an existing row's grade. A line nothing could place
+/// (`Unknown`) may have launched something, so it is recorded — but
+/// provisionally: unconfirmed, never re-opening a closed row, and graded
+/// `reconciled` only on a row it creates, never over an existing row's origin.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_typed_resume_effects(
     store: Option<&SessionLifecycleStore>,
@@ -232,7 +235,7 @@ pub(crate) fn apply_typed_resume_effects(
     let launched = target == TypedLineTarget::Shell;
     match store {
         Some(store) => {
-            let outcome = store.record_open_checked(TerminalSessionRecord {
+            let rec = TerminalSessionRecord {
                 claude_session_id: parsed.claude_session_id.clone(),
                 // config_dir None → restore scans every known config dir.
                 // Zone unknown backend-side → 0 (wrong zone beats a lost
@@ -290,9 +293,19 @@ pub(crate) fn apply_typed_resume_effects(
                 gate_consuming_device_id: None,
                 gate_bound_boot_ms: None,
                 binding_state: None,
-            });
+            };
+            let outcome = if launched {
+                Some(store.record_open_checked(rec))
+            } else {
+                store.record_open_provisional(rec)
+            };
             match outcome {
-                RecordOpenOutcome::Recorded => {
+                None => debug!(
+                    terminal_id = %terminal_id,
+                    claude_session = %parsed.claude_session_id,
+                    "typed claude resume sniff: the session's row is closed and nothing shows the line launched it — left closed"
+                ),
+                Some(RecordOpenOutcome::Recorded) => {
                     info!(
                         terminal_id = %terminal_id,
                         claude_session = %parsed.claude_session_id,
@@ -304,7 +317,7 @@ pub(crate) fn apply_typed_resume_effects(
                         register_coord();
                     }
                 }
-                outcome => warn!(
+                Some(outcome) => warn!(
                     terminal_id = %terminal_id,
                     claude_session = %parsed.claude_session_id,
                     target = ?target,
@@ -722,5 +735,58 @@ mod tests {
         );
         assert!(!coord_registered.get(), "no coord identity");
         assert!(bypass_emitted.get(), "the line's bypass mark is kept");
+    }
+
+    /// Round-3 review L2: a line nothing could place is a claim, not a
+    /// launch. It never re-opens a CLOSED row of the session it names, and it
+    /// never replaces an existing open row's origin with its own `reconciled`
+    /// — the row's terminal, confirmation and grade stay what they were.
+    #[test]
+    fn a_line_not_read_by_the_shell_neither_reopens_nor_downgrades_a_row() {
+        let unplaced = |store: &SessionLifecycleStore, id: &str| {
+            let parsed = parse(&format!("claude --resume {id}")).unwrap();
+            apply_typed_resume_effects(
+                Some(store),
+                &parsed,
+                TypedLineTarget::Unknown,
+                "term-1",
+                "C:/repo",
+                "default",
+                "Terminal 1",
+                || {},
+                || {},
+            );
+        };
+
+        // A closed row stays closed, on the terminal it closed on.
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let mut ended = crate::session::session_lifecycle_store::test_open_record(UUID);
+        ended.terminal_id = "term-elsewhere".to_string();
+        ended.origin = Some(ORIGIN_AUTHORITATIVE.to_string());
+        store.record_open(ended);
+        store.record_close(UUID, "explicit");
+        unplaced(&store, UUID);
+        let row = store.get(UUID).unwrap();
+        assert_eq!(
+            (row.state.as_str(), row.terminal_id.as_str()),
+            ("closed", "term-elsewhere")
+        );
+        assert_eq!(row.origin.as_deref(), Some(ORIGIN_AUTHORITATIVE));
+
+        // An open row keeps its grade: the claim's `reconciled` is not written
+        // over an `authoritative` one.
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let mut live = crate::session::session_lifecycle_store::test_open_record(UUID);
+        live.terminal_id = "term-1".to_string();
+        live.origin = Some(ORIGIN_AUTHORITATIVE.to_string());
+        live.confirmed_at = Some(1_000);
+        store.record_open(live);
+        unplaced(&store, UUID);
+        let row = store.get(UUID).unwrap();
+        assert_eq!(row.state, "open");
+        assert_eq!(row.origin.as_deref(), Some(ORIGIN_AUTHORITATIVE));
+        assert_eq!(row.confirmed_at, Some(1_000));
     }
 }

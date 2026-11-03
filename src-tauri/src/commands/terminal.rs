@@ -4054,7 +4054,7 @@ mod tests {
                 g,
             )
         };
-        record(Some(gate));
+        assert!(record(Some(gate)).is_recorded());
         let boot = crate::session::tracking_health::primary_boot_unix_millis_or_init();
         let check = |what: &str| {
             let rec = store.get(csid).unwrap();
@@ -4067,7 +4067,8 @@ mod tests {
             assert_eq!(rec.gate_bound_boot_ms, Some(boot), "{what}");
         };
         check("spawn record");
-        record(None); // the session-open hook's write
+        // The session-open hook's write.
+        assert!(record(None).is_recorded());
         check("after the gate-less hook re-record");
     }
 
@@ -4100,7 +4101,7 @@ mod tests {
         let store = Arc::new(
             SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
         );
-        record_pinned_session_open(
+        let recorded = record_pinned_session_open(
             &store,
             pinned_id.to_string(),
             "term-pin".to_string(),
@@ -4112,6 +4113,7 @@ mod tests {
             crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
             None,
         );
+        assert!(recorded.is_recorded());
         let verify_cfg = cfg.path().to_path_buf();
         poll_and_verify_pinned_session(
             move || session_transcript_path(&verify_cfg, project_path, pinned_id).exists(),

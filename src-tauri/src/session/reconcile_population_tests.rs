@@ -30,12 +30,15 @@ use crate::session::session_lifecycle_store::SessionLifecycleStore;
 const WORKDIR: &str = "/work/two-panes";
 const S_A: &str = "aaaaaaaa-0000-4000-8000-00000000000a";
 const S_B: &str = "bbbbbbbb-0000-4000-8000-00000000000b";
-// Above Linux's PID_MAX_LIMIT (2^22): no live process can hold them, so the
-// pass's argv query finds nothing — as for a `claude` started without an id.
+// Above Linux's PID_MAX_LIMIT (2^22), so no live Linux process can hold them,
+// and none a multiple of four — every pid Windows has been seen to assign is
+// one (an implementation detail, not a contract; 4_200_004 would be a valid
+// Windows pid). So the pass's argv query finds nothing — as for a `claude`
+// started without an id.
 const SHELL_A: u32 = 4_200_001;
 const CLAUDE_A: u32 = 4_200_002;
-const SHELL_B: u32 = 4_200_003;
-const CLAUDE_B: u32 = 4_200_004;
+const SHELL_B: u32 = 4_200_005;
+const CLAUDE_B: u32 = 4_200_006;
 /// Pane A's `claude` started at 2023-11-14T22:13:20Z, pane B's 100 s earlier.
 const CLAUDE_A_STARTED: i64 = 1_700_000_000;
 const CLAUDE_B_STARTED: i64 = 1_699_999_900;

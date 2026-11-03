@@ -39,14 +39,22 @@
 //! process when `/clear` or an in-TUI `/resume` switches it to another session
 //! is assumed, not measured. Read-only inspection of every
 //! `~/.claude*/sessions/*.json` on nawa on 2026-11-03 found 142 live records:
-//! 139 carried a session id in their process's argv and all 139 equalled the
-//! record's `sessionId`; none of those processes had switched sessions (no
-//! recent transcript holds a `/clear` or `/resume` command), so the sample says
-//! nothing either way. Nothing here takes a record that may lag a switch the
-//! provider's hook already reported as evidence: the lag rule
-//! ([`record_may_lag`]) withholds, in both directions, the verdicts on that
-//! pane, any refusal, claim or bind made on the strength of its record, and the
-//! bind-time `matched`.
+//! 139 carried a session id in their process's argv, and all 139 equalled the
+//! record's `sessionId`. That is what a process that never switched shows, and
+//! also what a record that lags a switch shows, so the sample does not settle
+//! it.
+//!
+//! What follows from not knowing: a record may LAG a switch its own process
+//! made. The lag rule ([`record_may_lag`]) discounts a pane's record when the
+//! store itself knows of such a switch on that pane — a row there adopted from
+//! the named session by a `/clear`, or one whose hook-recorded start on that
+//! pane, inside its current `claude` process, is newer than the named
+//! session's. A discounted record is read as [`PaneEvidence::Unknown`]: it
+//! refuses only a WEAK move (as any unreadable pane does), claims nothing,
+//! binds nothing and earns no `matched`; only arm 2 of [`binding_verdicts`],
+//! which rests on ANOTHER pane's record, still judges the pane's rows. A
+//! switch the store never heard of (a hookless pane) leaves the record taken
+//! at face value — that limit is the assumption's, and it stands.
 //!
 //! # Where it is read, and who reads the result
 //!
@@ -66,9 +74,9 @@
 //!   worker or the Tauri main thread. (The bind's own write-ahead-log append
 //!   is the store's, unchanged.)
 //! - **The tracking-health census** (`/restart-readiness`) attributes each
-//!   terminal-hosted `claude` pid from the same observation
-//!   ([`PaneEvidenceOracle::recorded_sessions`]), so the binding check adds no
-//!   record read to the `/restart-readiness` verdict path either.
+//!   top-level terminal-hosted `claude` pid by the verdict the pass stored for
+//!   the row that owns its pane, so it applies the same rules — the lag rule
+//!   included — and reads no record of its own.
 //!
 //! # What is counted
 //!
@@ -265,15 +273,6 @@ impl PaneObservation {
     }
 }
 
-/// One pid's record as the latest pass read it: the start time the pass's
-/// snapshot gave the pid (so a reader can tell a pid that was reused since),
-/// and the session the record names.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecordedSession {
-    pub process_started_ms: Option<i64>,
-    pub session_id: String,
-}
-
 /// The store's view of the panes' own evidence, attached once at startup
 /// ([`SessionLifecycleStore::attach_pane_evidence`]). The store never reads a
 /// process table or a file itself; this is the whole of what it knows about a
@@ -287,10 +286,18 @@ pub trait PaneEvidenceOracle: Send + Sync + std::fmt::Debug {
     /// Every live pane whose own record names `session_id`.
     fn panes_naming(&self, session_id: &str) -> Vec<String>;
 
-    /// pid → its record, from the latest observation — `None` when there is no
-    /// observation fresh enough to stand on.
-    fn recorded_sessions(&self) -> Option<HashMap<u32, RecordedSession>> {
+    /// When the pane's current top-level `claude` started (the newest of them,
+    /// millis), per a fresh observation — what [`record_may_lag`] measures an
+    /// in-process switch against. `None` when unknown.
+    fn pane_started_ms(&self, _terminal_id: &str) -> Option<i64> {
         None
+    }
+
+    /// Whether the oracle holds an observation fresh enough to stand on — what
+    /// a reader of the verdicts the reconcile pass STORED asks before serving
+    /// them as current (the tracking-health census).
+    fn has_fresh_observation(&self) -> bool {
+        false
     }
 
     /// Each reconcile pass hands over what it saw.
@@ -323,11 +330,14 @@ pub const OBSERVATION_MAX_AGE: Duration = Duration::from_secs(135);
 /// late restore rebind moves a row off.
 ///
 /// A `claude` started in a pane AFTER the last pass is invisible until the next
-/// one (≤ one liveness tick); such a pane answers `NoClaude`, which never
-/// refuses a move, so the gap fails open to the pre-guard behaviour. A pid
-/// reused within that window would keep the old process's record — and every
-/// use of `Names` is conservative (it keeps a row where it is, or spares it
-/// from a supersede), so the error is bounded to keeping a row one tick longer.
+/// one (≤ one liveness tick while the poll runs); such a pane answers
+/// `NoClaude`, which never refuses a move, so the gap fails open to the
+/// pre-guard behaviour. A PANE created after the last observation answers
+/// `NoClaude` too — for as long as the poll stalls, since a stale observation
+/// still never saw it. A pid reused within that window would keep the old
+/// process's record — and every use of `Names` is conservative (it keeps a row
+/// where it is, or spares it from a supersede), so the error is bounded to
+/// keeping a row one tick longer.
 #[derive(Debug)]
 pub struct LivePaneRegistry {
     latest: Mutex<Option<(PaneObservation, Instant)>>,
@@ -354,18 +364,25 @@ impl LivePaneRegistry {
     }
 
     /// The latest observation and whether it is still fresh; `None` when nothing
-    /// was observed yet. A poisoned lock reads as a stale observation of no
-    /// pane — never as agreement.
+    /// was observed yet. A poisoned lock still holds the last observation: it
+    /// is read as STALE, so the panes it saw live answer `Unknown` and no
+    /// other — never agreement, and never a guard switched off for every pane.
     fn latest(&self) -> Option<(PaneObservation, bool)> {
-        let held = match self.latest.lock() {
-            Ok(held) => held,
-            Err(e) => {
-                warn!(error = %e, "session binder: pane registry lock poisoned — pane reads unknown");
-                return Some((PaneObservation::default(), false));
+        match self.latest.lock() {
+            Ok(held) => held
+                .as_ref()
+                .map(|(observation, at)| (observation.clone(), at.elapsed() <= self.max_age)),
+            Err(poisoned) => {
+                warn!(
+                    "session binder: pane registry lock poisoned — its last observation is read as \
+                     stale: the panes it saw live read unknown"
+                );
+                poisoned
+                    .into_inner()
+                    .as_ref()
+                    .map(|(observation, _)| (observation.clone(), false))
             }
-        };
-        held.as_ref()
-            .map(|(observation, at)| (observation.clone(), at.elapsed() <= self.max_age))
+        }
     }
 
     /// The latest observation while it is fresh enough to stand on.
@@ -416,29 +433,19 @@ impl PaneEvidenceOracle for LivePaneRegistry {
         terminals
     }
 
-    fn recorded_sessions(&self) -> Option<HashMap<u32, RecordedSession>> {
+    fn has_fresh_observation(&self) -> bool {
+        self.fresh().is_some()
+    }
+
+    fn pane_started_ms(&self, terminal_id: &str) -> Option<i64> {
         let observation = self.fresh()?;
-        let started: HashMap<u32, Option<i64>> = observation
+        observation
             .panes
-            .values()
-            .flatten()
-            .map(|p| (p.pid, p.process_started_ms))
-            .collect();
-        Some(
-            observation
-                .sessions
-                .iter()
-                .map(|(pid, session)| {
-                    (
-                        *pid,
-                        RecordedSession {
-                            process_started_ms: started.get(pid).copied().flatten(),
-                            session_id: session.clone(),
-                        },
-                    )
-                })
-                .collect(),
-        )
+            .get(terminal_id)?
+            .iter()
+            .filter(|p| crate::process_capture::health::pid_alive(p.pid))
+            .filter_map(|p| p.process_started_ms)
+            .max()
     }
 
     fn observe(&self, observation: PaneObservation) {
@@ -535,74 +542,93 @@ pub fn binding_move_refused_total() -> u64 {
 // ---------------------------------------------------------------------------
 
 /// May pane `terminal_id`'s record naming `named` merely LAG a switch the
-/// provider's hook already reported? True when `named`'s open row has a
-/// hook-recorded start (`last_session_start_at`) and another open row on that
-/// pane has a NEWER one. Then the record is not evidence that the pane runs
-/// `named`: Claude Code may not rewrite it on `/clear` or an in-TUI resume
-/// (UNMEASURED — module docs), and a pane whose hook recorded `S2` starting
-/// after `S` may still name `S`. A row with no hook start orders against
-/// nothing: a hook that never landed is not a switch the hook reported.
+/// pane's own process made — one the store learned of? True when another open
+/// row ON THAT PANE shows it:
+///
+/// - the row was adopted from `named` by a `/clear` there (`adopted_from ==
+///   named`, which the `clear` hook writes) — unless its hook-recorded start
+///   predates the pane's current `claude` process, i.e. that `/clear` happened
+///   in an earlier process whose record this one is not; or
+/// - the row's hook-recorded start (`last_session_start_at`) is newer than
+///   `named`'s own on this pane, and both — or the row's alone, when `named`
+///   has none here — fall inside the pane's current `claude` process (at or
+///   after `pane_started_ms`): a switch that process made, whose record may not
+///   have followed (UNMEASURED — module docs).
+///
+/// Pane-local by construction: a row's stamp is dropped whenever the row moves
+/// to another terminal (the hook route re-stamps the moves it makes), so every
+/// stamp compared here was taken on this pane, and a row that arrived by a
+/// rebind or a strong bind carries none. Without `pane_started_ms` no stamp can
+/// be placed inside the process, and only the `/clear` arm applies.
+///
+/// One gap is left, knowingly: a `/clear` successor that later MOVES keeps its
+/// `adopted_from` (coord's adoption chain reads it), so on its new pane the
+/// `/clear` arm still discounts a record naming its predecessor. A row moved
+/// there wrongly is then judged by arm 2 of [`binding_verdicts`] alone — counted
+/// while another pane's record names it, not once nothing runs it.
 ///
 /// Every reader that takes `Names(S)` as "the pane runs S" applies it: the
 /// verdicts ([`binding_verdicts`], via [`discount_lagging`]), the reconcile
 /// pass's claims and its provider-registry rung, and the store's binding guard,
 /// supersede spare and bind-time `matched`. `open` is every row; closed rows
-/// are skipped.
+/// and rows on other panes are skipped.
 pub fn record_may_lag<'a>(
     open: impl IntoIterator<Item = &'a TerminalSessionRecord>,
     terminal_id: &str,
     named: &str,
+    pane_started_ms: Option<i64>,
 ) -> bool {
-    let mut named_start: Option<Option<i64>> = None;
+    let in_process = |stamp: Option<i64>| match (stamp, pane_started_ms) {
+        (Some(stamp), Some(started)) if stamp >= started => Some(stamp),
+        _ => None,
+    };
+    let predates_process = |stamp: Option<i64>| matches!((stamp, pane_started_ms), (Some(stamp), Some(started)) if stamp < started);
+    let mut named_stamp: Option<i64> = None;
+    let mut cleared_from_named = false;
     let mut newest_other: Option<i64> = None;
-    for r in open.into_iter().filter(|r| r.state == "open") {
+    for r in open
+        .into_iter()
+        .filter(|r| r.state == "open" && r.terminal_id == terminal_id)
+    {
         if r.claude_session_id == named {
-            named_start = Some(r.last_session_start_at);
-        } else if r.terminal_id == terminal_id {
-            if let Some(started) = r.last_session_start_at {
-                newest_other = Some(newest_other.map_or(started, |n| n.max(started)));
-            }
+            named_stamp = in_process(r.last_session_start_at);
+            continue;
+        }
+        if r.adopted_from.as_deref() == Some(named) && !predates_process(r.last_session_start_at) {
+            cleared_from_named = true;
+        }
+        if let Some(stamp) = in_process(r.last_session_start_at) {
+            newest_other = Some(newest_other.map_or(stamp, |n| n.max(stamp)));
         }
     }
-    match (named_start.flatten(), newest_other) {
-        (Some(named_start), Some(other)) => other > named_start,
-        _ => false,
-    }
+    cleared_from_named || newest_other.is_some_and(|other| named_stamp.is_none_or(|n| other > n))
 }
 
 /// `evidence` with every pane whose record may lag ([`record_may_lag`])
-/// answered [`PaneEvidence::Unknown`] instead of `Names`. One pass over `open`
-/// plus each pane's own rows — no per-pane scan of every row.
+/// answered [`PaneEvidence::Unknown`] instead of `Names`. `pane_started` gives
+/// each pane's current `claude` start. One pass over `open` plus each pane's
+/// own rows — no per-pane scan of every row.
 pub fn discount_lagging(
     open: &[TerminalSessionRecord],
     evidence: &HashMap<String, PaneEvidence>,
+    pane_started: &dyn Fn(&str) -> Option<i64>,
 ) -> HashMap<String, PaneEvidence> {
-    let mut start_of: HashMap<&str, Option<i64>> = HashMap::new();
-    let mut started_on: HashMap<&str, Vec<(&str, i64)>> = HashMap::new();
+    let mut rows_on: HashMap<&str, Vec<&TerminalSessionRecord>> = HashMap::new();
     for r in open.iter().filter(|r| r.state == "open") {
-        start_of.insert(r.claude_session_id.as_str(), r.last_session_start_at);
-        if let Some(started) = r.last_session_start_at {
-            started_on
-                .entry(r.terminal_id.as_str())
-                .or_default()
-                .push((r.claude_session_id.as_str(), started));
-        }
+        rows_on.entry(r.terminal_id.as_str()).or_default().push(r);
     }
     evidence
         .iter()
         .map(|(terminal, ev)| {
             let lagging = ev.named_session().is_some_and(|named| {
-                start_of
-                    .get(named)
-                    .copied()
-                    .flatten()
-                    .is_some_and(|named_start| {
-                        started_on.get(terminal.as_str()).is_some_and(|others| {
-                            others
-                                .iter()
-                                .any(|(id, started)| *id != named && *started > named_start)
-                        })
-                    })
+                rows_on.get(terminal.as_str()).is_some_and(|rows| {
+                    record_may_lag(
+                        rows.iter().copied(),
+                        terminal,
+                        named,
+                        pane_started(terminal),
+                    )
+                })
             });
             let effective = if lagging {
                 PaneEvidence::Unknown
@@ -614,27 +640,30 @@ pub fn discount_lagging(
         .collect()
 }
 
-/// The open rows on every pane whose record names a session but may lag it
-/// ([`record_may_lag`]), as (session, terminal). Their stored verdicts are
-/// withdrawn ([`SessionLifecycleStore::clear_binding_state`]): a `matched`
-/// taken before the hook-reported switch is no longer evidenced.
-pub fn rows_on_lagging_panes(
+/// The rows reading `matched` that a pane's record names while it may lag
+/// ([`record_may_lag`]), as (session, terminal): their `matched` was taken
+/// before the switch and is no longer evidenced, so the pass withdraws it —
+/// through [`SessionLifecycleStore::withdraw_lagging_matched`], which re-checks
+/// the condition under the registry lock. A row reading `unknown` keeps its
+/// verdict: withdrawing it would only let the same contradiction be counted
+/// again.
+pub fn matched_rows_on_lagging_panes(
     open: &[TerminalSessionRecord],
     evidence: &HashMap<String, PaneEvidence>,
+    pane_started: &dyn Fn(&str) -> Option<i64>,
 ) -> Vec<(String, String)> {
-    let effective = discount_lagging(open, evidence);
-    let lagging: HashSet<&str> = evidence
-        .iter()
-        .filter(|(terminal, ev)| {
-            ev.named_session().is_some()
+    let effective = discount_lagging(open, evidence, pane_started);
+    open.iter()
+        .filter(|r| r.state == "open" && r.binding_state == Some(BindingState::Matched))
+        .filter(|r| {
+            evidence
+                .get(&r.terminal_id)
+                .and_then(PaneEvidence::named_session)
+                == Some(r.claude_session_id.as_str())
                 && effective
-                    .get(*terminal)
+                    .get(&r.terminal_id)
                     .is_some_and(|e| e.named_session().is_none())
         })
-        .map(|(terminal, _)| terminal.as_str())
-        .collect();
-    open.iter()
-        .filter(|r| r.state == "open" && lagging.contains(r.terminal_id.as_str()))
         .map(|r| (r.claude_session_id.clone(), r.terminal_id.clone()))
         .collect()
 }
@@ -656,36 +685,41 @@ pub struct BindingVerdict {
     pub counted: bool,
 }
 
-/// Pure: a verdict for every open row on a pane whose evidence NAMES a session
-/// `E` — after the lag rule ([`discount_lagging`]): a pane whose record may lag
-/// a switch the hook already reported gives no verdict at all, so neither the
-/// row the record names reads `matched` nor any other row reads `unknown` on
-/// it. A row on a pane with no `claude`, unreadable evidence, or no entry in
-/// `evidence` gets no verdict either, and keeps the state it last read. For a
-/// row `R` on a pane that names `E`:
+/// Pure: a verdict for every open row on a pane whose own record NAMES a
+/// session. A row on a pane with no `claude`, unreadable evidence, or no entry
+/// in `evidence` gets no verdict, and keeps the state it last read.
 ///
-/// 1. `R == E` → `Matched`.
-/// 2. Another live pane's record names `R` → `Unknown`, counted: the row sits
-///    on one pane while its session runs in another — the 2026-10-25 shape.
-/// 3. `E` also has an open row on this pane, and the provider's hook recorded
-///    `E` STARTING here (`last_session_start_at`) — the pane changed sessions
-///    and the store already knows its current one (a `/clear` or an in-TUI
-///    resume): `R` is the pane's PRIOR TENANT → `Unknown`, not counted — its
-///    pane runs another session now, which is routine. (A row the hook
-///    recorded starting later than `E` never reaches this arm: the lag rule
-///    already withheld every verdict on the pane.)
-/// 4. Otherwise → `Unknown` — counted only for a CONFIRMED row. An unconfirmed
+/// The lag rule comes first ([`discount_lagging`], with each pane's current
+/// `claude` start from `pane_started`): a pane whose record may lag a switch
+/// its process made names nothing EFFECTIVELY. For a row `R` on a pane whose
+/// record names `E`:
+///
+/// 1. `R == E`, the record not discounted → `Matched`.
+/// 2. Another live pane's record (not discounted) names `R` → `Unknown`,
+///    counted: the row sits on one pane while its session runs in another —
+///    the 2026-10-25 shape. This arm holds on a DISCOUNTED pane too: it rests
+///    on the other pane's record, not on this one's.
+/// 3. On a discounted pane, nothing else is judged.
+/// 4. `R` is `E`'s PRIOR TENANT on this pane → `Unknown`, not counted: its pane
+///    runs another session now, which is routine. Prior means `E` was adopted
+///    from `R` by a `/clear` (`adopted_from`), or the hook recorded both
+///    starting on this pane, `R` first (stamps are pane-local — a row that
+///    moved here carries none).
+/// 5. Otherwise → `Unknown` — counted only for a CONFIRMED row. An unconfirmed
 ///    row is the spawn seam's pin, a provisional sniff or an unconfirmed bind:
 ///    a pane whose `claude` runs another id than its pin (a duplicate pane, a
 ///    shim-bypassed launch, a hook that has not posted yet, a resume) leaves
-///    exactly such a row behind, routinely.
+///    exactly such a row behind, routinely. A CONFIRMED row its pane's record
+///    contradicts, with no succession to explain it — a restore rebind or a
+///    strong bind that put it on the wrong pane — is the fault this counts.
 pub fn binding_verdicts(
     open: &[TerminalSessionRecord],
     evidence: &HashMap<String, PaneEvidence>,
+    pane_started: &dyn Fn(&str) -> Option<i64>,
 ) -> Vec<BindingVerdict> {
-    let evidence = &discount_lagging(open, evidence);
+    let effective = discount_lagging(open, evidence, pane_started);
     let mut named_by: HashMap<&str, Vec<&str>> = HashMap::new();
-    for (terminal, ev) in evidence {
+    for (terminal, ev) in &effective {
         if let Some(id) = ev.named_session() {
             named_by.entry(id).or_default().push(terminal.as_str());
         }
@@ -696,23 +730,31 @@ pub fn binding_verdicts(
     }
     let mut out = Vec::new();
     for (terminal, rows) in &open_on {
-        let Some(evidenced) = evidence
+        // What the pane's record names at all; `None` = no verdict on this pane.
+        let Some(recorded) = evidence
             .get(*terminal)
             .and_then(PaneEvidence::named_session)
         else {
             continue;
         };
-        let current = rows.iter().find(|r| r.claude_session_id == evidenced);
+        // What it names once the lag rule is applied; `None` = discounted.
+        let effective_named = effective
+            .get(*terminal)
+            .and_then(PaneEvidence::named_session);
+        let current =
+            effective_named.and_then(|named| rows.iter().find(|r| r.claude_session_id == named));
         for row in rows {
             let id = row.claude_session_id.as_str();
-            let (state, counted) = if id == evidenced {
-                (BindingState::Matched, false)
-            } else if named_by
+            let runs_elsewhere = named_by
                 .get(id)
-                .is_some_and(|ts| ts.iter().any(|t| t != terminal))
-            {
+                .is_some_and(|ts| ts.iter().any(|t| t != terminal));
+            let (state, counted) = if Some(id) == effective_named {
+                (BindingState::Matched, false)
+            } else if runs_elsewhere {
                 (BindingState::Unknown, true)
-            } else if current.is_some_and(|c| c.last_session_start_at.is_some()) {
+            } else if effective_named.is_none() {
+                continue;
+            } else if current.is_some_and(|c| succeeded(c, row)) {
                 (BindingState::Unknown, false)
             } else {
                 (BindingState::Unknown, row.confirmed_at.is_some())
@@ -721,7 +763,7 @@ pub fn binding_verdicts(
                 claude_session_id: id.to_string(),
                 terminal_id: (*terminal).to_string(),
                 state,
-                evidenced: evidenced.to_string(),
+                evidenced: recorded.to_string(),
                 counted,
             });
         }
@@ -730,6 +772,17 @@ pub fn binding_verdicts(
         (&a.terminal_id, &a.claude_session_id).cmp(&(&b.terminal_id, &b.claude_session_id))
     });
     out
+}
+
+/// Did `current` succeed `prior` on the pane they share? By a `/clear`
+/// (`current` adopted from `prior`), or by both starting there, `prior` first —
+/// the stamps are pane-local, so both were taken on this pane.
+fn succeeded(current: &TerminalSessionRecord, prior: &TerminalSessionRecord) -> bool {
+    current.adopted_from.as_deref() == Some(prior.claude_session_id.as_str())
+        || matches!(
+            (prior.last_session_start_at, current.last_session_start_at),
+            (Some(prior_start), Some(current_start)) if prior_start < current_start
+        )
 }
 
 /// Write `verdicts` to the store; log + count every row that NEWLY reads
@@ -769,27 +822,44 @@ pub fn apply_binding_verdicts(
 }
 
 /// A fixed oracle for tests across the session modules: each listed terminal
-/// answers its evidence, and any other terminal is not a live pane.
+/// answers its evidence (and, when given, its `claude`'s start), and any other
+/// terminal is not a live pane.
 #[cfg(test)]
 #[derive(Debug, Default)]
-pub(crate) struct FixedPanes(pub HashMap<String, PaneEvidence>);
+pub(crate) struct FixedPanes {
+    pub panes: HashMap<String, PaneEvidence>,
+    pub started: HashMap<String, i64>,
+}
 
 #[cfg(test)]
 impl FixedPanes {
     pub(crate) fn of(panes: &[(&str, PaneEvidence)]) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self(
-            panes
+        Self::of_started(panes, &[])
+    }
+
+    /// [`Self::of`], each listed pane's current `claude` started at the given
+    /// millis.
+    pub(crate) fn of_started(
+        panes: &[(&str, PaneEvidence)],
+        started: &[(&str, i64)],
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            panes: panes
                 .iter()
                 .map(|(terminal, evidence)| (terminal.to_string(), evidence.clone()))
                 .collect(),
-        ))
+            started: started
+                .iter()
+                .map(|(terminal, at)| (terminal.to_string(), *at))
+                .collect(),
+        })
     }
 }
 
 #[cfg(test)]
 impl PaneEvidenceOracle for FixedPanes {
     fn pane_evidence(&self, terminal_id: &str) -> PaneEvidence {
-        self.0
+        self.panes
             .get(terminal_id)
             .cloned()
             .unwrap_or(PaneEvidence::NoClaude)
@@ -797,13 +867,21 @@ impl PaneEvidenceOracle for FixedPanes {
 
     fn panes_naming(&self, session_id: &str) -> Vec<String> {
         let mut terminals: Vec<String> = self
-            .0
+            .panes
             .iter()
             .filter(|(_, ev)| ev.named_session() == Some(session_id))
             .map(|(terminal, _)| terminal.clone())
             .collect();
         terminals.sort();
         terminals
+    }
+
+    fn pane_started_ms(&self, terminal_id: &str) -> Option<i64> {
+        self.started.get(terminal_id).copied()
+    }
+
+    fn has_fresh_observation(&self) -> bool {
+        true
     }
 }
 
@@ -952,7 +1030,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let verdicts = binding_verdicts(&rows, &evidence);
+        let verdicts = binding_verdicts(&rows, &evidence, &|_| Some(0));
         assert_eq!(
             by_id(&verdicts),
             [("s-a", (BindingState::Matched, false))]
@@ -963,7 +1041,7 @@ mod tests {
     }
 
     /// The arms of [`binding_verdicts`] for a row its pane does not name, and the
-    /// lag rule that withholds them.
+    /// lag rule that withholds them — all but arm 2.
     #[test]
     fn a_contradicted_row_counts_only_when_no_routine_succession_explains_it() {
         let rows = vec![
@@ -972,18 +1050,21 @@ mod tests {
             // t-clear ran s-old, then `/clear` (hook-recorded) made it s-new.
             open_row("s-old", "t-clear", Some(100)),
             open_row("s-new", "t-clear", Some(200)),
-            // t-lag: the hook recorded s-next AFTER s-prev, but the pane's
-            // record still names s-prev — it may lag the switch.
+            // t-lag: the hook recorded s-next AFTER s-prev inside the pane's
+            // current process, but the pane's record still names s-prev — it
+            // may lag the switch. s-moved arrived by a bind (no stamp), and
+            // pane t-runs-it runs its session: arm 2 holds even here.
             open_row("s-prev", "t-lag", Some(100)),
             open_row("s-next", "t-lag", Some(200)),
+            open_row("s-moved", "t-lag", None),
             // t-seam: the pane's claude runs s-z, which has no row there; the
             // spawn seam's unconfirmed pin is left behind.
             seam_row("s-pin", "t-seam"),
             // t-stray runs s-y, which no row on it names, and nobody else runs
             // its row's session.
             open_row("s-stray", "t-stray", None),
-            // t-bound: its current row was bound by the reconcile pass from the
-            // record (no hook start), beside an older row.
+            // t-bound: its current row has no hook start; s-wrong's was taken
+            // in an EARLIER process on the pane — no succession explains it.
             open_row("s-wrong", "t-bound", Some(100)),
             open_row("s-real", "t-bound", None),
         ];
@@ -992,13 +1073,16 @@ mod tests {
             ("t-other".to_string(), names("s-a")),
             ("t-clear".to_string(), names("s-new")),
             ("t-lag".to_string(), names("s-prev")),
+            ("t-runs-it".to_string(), names("s-moved")),
+            ("t-seam".to_string(), names("s-z")),
             ("t-stray".to_string(), names("s-y")),
             ("t-bound".to_string(), names("s-real")),
-            ("t-seam".to_string(), names("s-z")),
         ]
         .into_iter()
         .collect();
-        let verdicts = binding_verdicts(&rows, &evidence);
+        // Every pane's current claude started at 0, but t-bound's at 150.
+        let started = |terminal: &str| Some(if terminal == "t-bound" { 150 } else { 0 });
+        let verdicts = binding_verdicts(&rows, &evidence, &started);
         let got = by_id(&verdicts);
         assert_eq!(
             got.get("s-a"),
@@ -1014,8 +1098,13 @@ mod tests {
         assert_eq!(
             (got.get("s-prev"), got.get("s-next")),
             (None, None),
-            "a record that may lag the hook-reported switch gives no verdict on its pane — \
-             neither `matched` for the row it names nor `unknown` for the newer one"
+            "a record that may lag a switch inside its process judges neither the row it names \
+             nor the newer one"
+        );
+        assert_eq!(
+            got.get("s-moved"),
+            Some(&(BindingState::Unknown, true)),
+            "arm 2 rests on another pane's record, so it holds on a discounted pane too"
         );
         assert_eq!(
             got.get("s-pin"),
@@ -1026,7 +1115,7 @@ mod tests {
         assert_eq!(
             got.get("s-wrong"),
             Some(&(BindingState::Unknown, true)),
-            "no hook recorded the current session starting: a fault, not a succession"
+            "a stamp from an earlier process neither lags the record nor makes a succession"
         );
         assert_eq!(got.get("s-real"), Some(&(BindingState::Matched, false)));
     }
@@ -1051,7 +1140,10 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let verdicts = binding_verdicts(&store.open_records(), &evidence);
+        // t-a's current claude started after s-b's hook stamp: that stamp is an
+        // earlier process's, and makes no record on t-a lag.
+        let started = |terminal: &str| Some(if terminal == "t-a" { 150 } else { 0 });
+        let verdicts = binding_verdicts(&store.open_records(), &evidence, &started);
 
         let first = apply_binding_verdicts(&store, &verdicts);
         assert_eq!(
@@ -1076,7 +1168,10 @@ mod tests {
         // later contradiction is a new episode.
         let agree: HashMap<String, PaneEvidence> =
             [("t-a".to_string(), names("s-b"))].into_iter().collect();
-        apply_binding_verdicts(&store, &binding_verdicts(&store.open_records(), &agree));
+        apply_binding_verdicts(
+            &store,
+            &binding_verdicts(&store.open_records(), &agree, &started),
+        );
         assert_eq!(
             store.get("s-b").unwrap().binding_state,
             Some(BindingState::Matched)
@@ -1094,7 +1189,7 @@ mod tests {
     fn a_registry_answers_nothing_it_did_not_observe_and_nothing_stale() {
         let registry = LivePaneRegistry::new();
         assert_eq!(registry.pane_evidence("never-seen"), PaneEvidence::NoClaude);
-        assert_eq!(registry.recorded_sessions(), None);
+        assert_eq!(registry.pane_started_ms("never-seen"), None);
         registry.observe(PaneObservation {
             panes: [
                 ("t-empty".to_string(), Vec::new()),
@@ -1126,7 +1221,46 @@ mod tests {
             "a terminal no observation saw live holds nothing, fresh or stale"
         );
         assert!(stale.panes_naming("s-any").is_empty());
-        assert_eq!(stale.recorded_sessions(), None);
+        assert_eq!(
+            stale.pane_started_ms("t-seen"),
+            None,
+            "a stale observation places no switch inside a process"
+        );
+    }
+
+    /// Round-3 review L5: a poisoned registry lock is read as a STALE
+    /// observation, as its warn line says — the panes it saw live answer
+    /// `Unknown`, every other terminal `NoClaude` — never as agreement and
+    /// never as no evidence for every pane.
+    #[test]
+    fn a_poisoned_registry_reads_as_a_stale_observation() {
+        let registry = Arc::new(LivePaneRegistry::new());
+        registry.observe(PaneObservation {
+            panes: [("t-seen".to_string(), vec![live(std::process::id())])]
+                .into_iter()
+                .collect(),
+            sessions: [(std::process::id(), "s-seen".to_string())]
+                .into_iter()
+                .collect(),
+        });
+        assert_eq!(registry.pane_evidence("t-seen"), names("s-seen"));
+        assert!(registry.has_fresh_observation());
+        let holder = registry.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = holder.latest.lock().unwrap();
+            panic!("poison the registry lock");
+        })
+        .join();
+        assert!(registry.latest.is_poisoned());
+
+        assert_eq!(registry.pane_evidence("t-seen"), PaneEvidence::Unknown);
+        assert_eq!(
+            registry.pane_evidence("t-never-seen"),
+            PaneEvidence::NoClaude
+        );
+        assert!(registry.panes_naming("s-seen").is_empty());
+        assert_eq!(registry.pane_started_ms("t-seen"), None);
+        assert!(!registry.has_fresh_observation());
     }
 
     /// Review M1: while passes are slow (the observation past its max age) a
@@ -1168,40 +1302,76 @@ mod tests {
         );
     }
 
-    /// Review M2: the lag rule applies in both directions. A pane whose hook
-    /// recorded S2 starting after S may still NAME S; that record is evidence
-    /// of nothing, so the pane's verdicts are withheld ([`binding_verdicts`])
-    /// and the evidence reads `Unknown` ([`discount_lagging`]). A row with no
-    /// hook start orders against nothing.
+    /// The lag rule (round-3 review H1/M1): pane-local, and placed inside the
+    /// pane's current `claude` process. It discounts a record when the store
+    /// knows of a switch that process made: a `/clear` (`adopted_from`) or a
+    /// newer in-process hook stamp. A stamp from an earlier process, a row that
+    /// moved here (it carries no stamp), or an unknown process start places
+    /// nothing; the `/clear` arm needs no stamp at all.
     #[test]
-    fn a_record_that_may_lag_a_hook_reported_switch_names_nothing() {
+    fn a_record_lags_only_a_switch_its_own_pane_and_process_made() {
+        let cleared =
+            |id: &str, terminal: &str, from: &str, started: Option<i64>| TerminalSessionRecord {
+                adopted_from: Some(from.to_string()),
+                ..open_row(id, terminal, started)
+            };
         let rows = vec![
+            // t-a: s started at 100, s2 at 200, both in the process (start 50).
             open_row("s", "t-a", Some(100)),
             open_row("s2", "t-a", Some(200)),
-            // t-b's hook never posted for its current row: nothing orders it.
+            // t-b: s-old's stamp predates the pane's process (start 150).
             open_row("s-old", "t-b", Some(100)),
-            open_row("s-hookless", "t-b", None),
+            open_row("s-now", "t-b", None),
+            // t-c: a `/clear` with no stamps at all (a row from before stamps).
+            open_row("c", "t-c", None),
+            cleared("c2", "t-c", "c", None),
+            // t-d: that `/clear` happened in an earlier process (start 150).
+            open_row("d", "t-d", None),
+            cleared("d2", "t-d", "d", Some(100)),
+            // t-e: x was moved onto the pane and carries no stamp; the pane
+            // runs t, stamped in-process.
+            open_row("t", "t-e", Some(100)),
+            open_row("x", "t-e", None),
         ];
-        assert!(record_may_lag(&rows, "t-a", "s"));
+        let started = |terminal: &str| match terminal {
+            "t-b" | "t-d" => Some(150),
+            _ => Some(50),
+        };
+        let lags =
+            |terminal: &str, named: &str| record_may_lag(&rows, terminal, named, started(terminal));
+        assert!(lags("t-a", "s"), "a newer in-process switch on the pane");
+        assert!(!lags("t-a", "s2"), "the newest row is current");
         assert!(
-            !record_may_lag(&rows, "t-a", "s2"),
-            "the newest row is current"
+            !record_may_lag(&rows, "t-a", "s", None),
+            "with no process start, no stamp is placed inside it"
         );
-        assert!(!record_may_lag(&rows, "t-b", "s-hookless"));
         assert!(
-            !record_may_lag(&rows, "t-a", "s-without-a-row"),
-            "a session the store has no row for lags nothing"
+            !lags("t-b", "s-now"),
+            "an earlier process's stamp places nothing"
         );
+        assert!(lags("t-c", "c"), "a `/clear` successor, stamped or not");
+        assert!(
+            record_may_lag(&rows, "t-c", "c", None),
+            "the `/clear` arm needs no process start"
+        );
+        assert!(!lags("t-d", "d"), "a `/clear` in an earlier process");
+        assert!(!lags("t-e", "t"), "a row that moved here makes nothing lag");
+        assert!(
+            lags("t-a", "s-without-a-row"),
+            "a named session with no in-process stamp on the pane lags any in-process switch \
+             there (its row may have moved off since)"
+        );
+
         let evidence: HashMap<String, PaneEvidence> = [
             ("t-a".to_string(), names("s")),
-            ("t-b".to_string(), names("s-hookless")),
+            ("t-b".to_string(), names("s-now")),
         ]
         .into_iter()
         .collect();
-        let effective = discount_lagging(&rows, &evidence);
+        let effective = discount_lagging(&rows, &evidence, &started);
         assert_eq!(effective["t-a"], PaneEvidence::Unknown);
-        assert_eq!(effective["t-b"], names("s-hookless"));
-        let verdicts = binding_verdicts(&rows, &evidence);
+        assert_eq!(effective["t-b"], names("s-now"));
+        let verdicts = binding_verdicts(&rows, &evidence, &started);
         assert!(
             verdicts.iter().all(|v| v.terminal_id != "t-a"),
             "no verdict on the lagging pane: {verdicts:?}"
@@ -1227,7 +1397,10 @@ mod tests {
             .unwrap();
         };
         let pass = |registry: &LivePaneRegistry| {
-            let pids = vec![live(me)];
+            let pids = vec![LivePid {
+                pid: me,
+                process_started_ms: Some(1_234),
+            }];
             let no_proc_start = |_: u32| -> Option<String> { None };
             let readings = claude_activity::read_records(
                 std::slice::from_ref(&config),
@@ -1252,13 +1425,12 @@ mod tests {
         assert_eq!(registry.pane_evidence("t-live"), names("s-first"));
         assert_eq!(registry.panes_naming("s-first"), vec!["t-live".to_string()]);
         assert_eq!(
-            registry.recorded_sessions().unwrap().get(&me),
-            Some(&RecordedSession {
-                process_started_ms: None,
-                session_id: "s-first".to_string()
-            })
+            registry.pane_started_ms("t-live"),
+            Some(1_234),
+            "the live claude's start, as the pass's snapshot gave it"
         );
         assert_eq!(registry.pane_evidence("t-dead"), PaneEvidence::NoClaude);
+        assert_eq!(registry.pane_started_ms("t-dead"), None);
 
         // Rewriting the file changes nothing until the next pass reads it: the
         // registry answers from memory.
@@ -1283,10 +1455,9 @@ mod tests {
     /// panes, each `claude`'s own `sessions/<pid>.json` naming its session, and
     /// pane C's confirmed row naming a session its record contradicts. The pass
     /// reads the records itself, binds every pane from its own record (rung
-    /// 2b), counts the one contradiction, heals it in the same pass, and hands
-    /// what it read to the store's oracle.
+    /// 2b), and counts the one contradiction and heals it in the same pass.
     #[tokio::test]
-    async fn the_pass_binds_each_pane_from_its_own_record_and_publishes_what_it_read() {
+    async fn the_pass_binds_each_pane_from_its_own_record_and_heals_a_contradicted_one() {
         use crate::session::reconcile::{run_reconcile_pass, LivePty};
         const WORKDIR: &str = "/work/three-panes";
         let ambient = crate::test_env::isolated_ambient();
@@ -1386,17 +1557,5 @@ mod tests {
             "closed",
             "the healed pane's stale tenant is retired by the confirmed bind"
         );
-        let recorded = store
-            .recorded_sessions()
-            .expect("the pass published what it read");
-        for (_, _, claude, started, session) in panes {
-            assert_eq!(
-                recorded.get(&claude),
-                Some(&RecordedSession {
-                    process_started_ms: Some(started * 1000),
-                    session_id: session.to_string()
-                })
-            );
-        }
     }
 }

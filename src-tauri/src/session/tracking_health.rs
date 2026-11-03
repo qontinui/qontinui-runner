@@ -66,7 +66,7 @@ use tracing::{debug, warn};
 use crate::process_capture::process_tree::{
     claude_pids_in_inclusive_subtree, claude_present_in_inclusive_subtree, ProcessSnapshot,
 };
-use crate::session::pane_binding::{BindingCounters, RecordedSession};
+use crate::session::pane_binding::BindingCounters;
 use crate::session::session_lifecycle_store::{
     BindingState, SessionLifecycleStore, TerminalSessionRecord,
 };
@@ -490,25 +490,30 @@ pub struct LiveClaudeProcess {
     /// `Unknown`). An ambiguous attribution is an unknown, and unknowns block.
     /// Never a guess.
     pub session_id: Option<String>,
-    /// Does this process's OWN Claude Code record
-    /// (`<config_dir>/sessions/<pid>.json`) name the session the row owning its
-    /// pane holds? Serialized `bindingState`:
+    /// Does this process's pane run the session of the row it is attributed
+    /// to? The verdict the reconcile pass STORED for that row
+    /// ([`TerminalSessionRecord::binding_state`], judged from the pane's own
+    /// Claude Code records, `<config_dir>/sessions/<pid>.json`). Serialized
+    /// `bindingState`:
     ///
-    /// - `"matched"` — it does;
-    /// - `"unknown"` — it names ANOTHER session. The row's id is then NOT
-    ///   echoed: [`Self::session_id`] is withheld (null), no coord work status
-    ///   applies, and the process blocks;
+    /// - `"matched"` — the pane's records name the row's session;
+    /// - `"unknown"` — they name ANOTHER session, or the session runs in
+    ///   another pane. The row's id is then NOT echoed: [`Self::session_id`]
+    ///   is withheld (null), no coord work status applies, and the process
+    ///   blocks;
     /// - ABSENT — not checked: a nested subagent, every non-terminal-hosted
-    ///   process, an attribution already ambiguous, or a record that could not
-    ///   be read (never read as agreement). Absent, not `null`, so the key
-    ///   carries the same contract as `GET /sessions/history`: a consumer that
-    ///   fails closed on any value other than `matched` does not freeze every
-    ///   pane running a nested subagent.
+    ///   process, an attribution already ambiguous, a row the pass has not
+    ///   judged (no readable record, a record that may lag a switch its own
+    ///   process made, a row that moved since), or no fresh pass at all —
+    ///   never read as agreement. Absent, not `null`, so the key carries the
+    ///   same contract as `GET /sessions/history`: a consumer that fails
+    ///   closed on any value other than `matched` does not freeze every pane
+    ///   running a nested subagent.
     ///
     /// Without it the attribution was circular — a pid took the id of whatever
     /// row owned its terminal, so a wrong binding came back out of
     /// `/restart-readiness` as fact. Filled by
-    /// [`TrackingHealthReport::attach_registry_evidence`]; [`evaluate`] leaves
+    /// [`TrackingHealthReport::attach_binding_verdicts`]; [`evaluate`] leaves
     /// it `None`. Plan `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding_state: Option<BindingState>,
@@ -738,30 +743,36 @@ impl TrackingHealthReport {
         }
     }
 
-    /// Cross-check every top-level terminal-hosted process against its OWN
-    /// Claude Code record (`records`, keyed by pid — the latest reconcile pass's
-    /// reading, [`SessionLifecycleStore::recorded_sessions`]) and set
-    /// [`LiveClaudeProcess::binding_state`].
+    /// Set [`LiveClaudeProcess::binding_state`] on every top-level
+    /// terminal-hosted process from the verdict the reconcile pass stored for
+    /// the row it is attributed to (`open`, the rows [`evaluate`] attributed
+    /// by).
     ///
     /// [`evaluate`] attributes a pid to the open row owning its terminal,
     /// which is circular: a row bound to the wrong pane hands the pane's
     /// process its id, and `/restart-readiness` then echoes the wrong binding
-    /// as fact. Here the process speaks for itself. A record naming the row's
-    /// session → `Matched`. A record naming ANOTHER session → `Unknown`, and
-    /// the attribution is withdrawn exactly as for a pid two rows claim:
-    /// `session_id`, `session_status` and `session_status_since` cleared, and
-    /// the process blocks. No record for the pid — or one the pass read for an
-    /// earlier holder of the pid (its start time disagrees by more than
-    /// [`crate::process_capture::process_tree::PID_REUSE_SKEW_MS`]) — leaves the
-    /// process unchecked (`None`, never read as agreement) with today's
-    /// attribution. Nested subagents and already-ambiguous pids are not
-    /// checked: a nested `claude` runs a session of its own.
+    /// as fact. The pass breaks the circle — it judges each row against its
+    /// pane's own records ([`crate::session::pane_binding::binding_verdicts`])
+    /// — and the census takes that verdict rather than judging again, so the
+    /// two can never disagree: the lag rule, the prior-tenant rule and the
+    /// rows the pass leaves unjudged all reach `/restart-readiness` as they
+    /// reach the pass. A `matched` row → `Matched`. An `unknown` row →
+    /// `Unknown`, and the attribution is withdrawn exactly as for a pid two
+    /// rows claim: `session_id`, `session_status` and `session_status_since`
+    /// cleared, and the process blocks. An unjudged row leaves the process
+    /// unchecked (`None`, never read as agreement) with today's attribution.
+    /// Nested subagents and already-ambiguous pids are not checked: a nested
+    /// `claude` runs a session of its own.
     ///
     /// Run BEFORE [`Self::attach_status_since`], which keys on the
     /// `session_status` this may clear. Pure; no I/O — the census reads no
     /// record of its own on the `/restart-readiness` verdict path.
-    pub fn attach_registry_evidence(&mut self, records: &HashMap<u32, RecordedSession>) {
-        let checked_at_ms = self.checked_at_ms;
+    pub fn attach_binding_verdicts(&mut self, open: &[TerminalSessionRecord]) {
+        let verdict_of: HashMap<&str, BindingState> = open
+            .iter()
+            .filter(|r| r.state == "open")
+            .filter_map(|r| Some((r.claude_session_id.as_str(), r.binding_state?)))
+            .collect();
         for process in self.terminal_hosted.iter_mut() {
             if process.nested_under_claude {
                 continue;
@@ -769,25 +780,18 @@ impl TrackingHealthReport {
             let Some(row_session) = process.session_id.as_deref() else {
                 continue;
             };
-            let Some(record) = records.get(&process.pid) else {
-                continue;
-            };
-            let census_started = process.age_s.map(|age_s| checked_at_ms - age_s * 1000);
-            if let (Some(recorded), Some(census)) = (record.process_started_ms, census_started) {
-                if (recorded - census).abs()
-                    > crate::process_capture::process_tree::PID_REUSE_SKEW_MS
-                {
-                    continue; // read for an earlier holder of the pid
+            match verdict_of.get(row_session) {
+                Some(BindingState::Matched) => {
+                    process.binding_state = Some(BindingState::Matched);
                 }
-            }
-            if record.session_id == row_session {
-                process.binding_state = Some(BindingState::Matched);
-            } else {
-                process.binding_state = Some(BindingState::Unknown);
-                process.session_id = None;
-                process.session_status = None;
-                process.session_status_since = None;
-                process.blocks_restart = blocks_restart(None);
+                Some(BindingState::Unknown) => {
+                    process.binding_state = Some(BindingState::Unknown);
+                    process.session_id = None;
+                    process.session_status = None;
+                    process.session_status_since = None;
+                    process.blocks_restart = blocks_restart(None);
+                }
+                None => {}
             }
         }
     }
@@ -1215,8 +1219,8 @@ pub fn evaluate(
             // where that is `None`.
             session_status_since: None,
             session_id,
-            // Filled after the pass by `attach_registry_evidence`, which needs
-            // the processes' own records — I/O this pure function never does.
+            // Filled after the pass by `attach_binding_verdicts`, from the
+            // verdicts the reconcile pass stored on the rows.
             binding_state: None,
             blocks_restart: blocks_restart(status),
             wind_down: None,
@@ -1410,13 +1414,14 @@ pub async fn compute(
         chrono::Utc::now().timestamp_millis(),
         &holders,
     );
-    // Each terminal-hosted `claude` speaks for itself (plan
-    // `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`): its own
-    // record, as the latest reconcile pass read it — no read here, so the
-    // `/restart-readiness` verdict path waits on no disk. No fresh pass (or no
-    // oracle) leaves every process unchecked, i.e. today's attribution.
-    if let Some(records) = store.recorded_sessions() {
-        report.attach_registry_evidence(&records);
+    // Each terminal-hosted `claude` is judged as the reconcile pass judged its
+    // row (plan `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`)
+    // — from the pane's own records, with the pass's rules, and no read here,
+    // so the `/restart-readiness` verdict path waits on no disk. No fresh pass
+    // (or no oracle) leaves every process unchecked, i.e. today's attribution:
+    // a verdict a stalled pass stored is not served as current.
+    if store.pane_observation_is_fresh() {
+        report.attach_binding_verdicts(&open);
     }
     report.attach_status_since(session_status_since_by_id);
 
@@ -3268,51 +3273,44 @@ mod tests {
         }
     }
 
-    fn recorded(session: &str, started_ms: Option<i64>) -> RecordedSession {
-        RecordedSession {
-            process_started_ms: started_ms,
-            session_id: session.to_string(),
-        }
-    }
-
     /// Plan `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`,
-    /// Phase 2: the circular attribution is broken. A terminal-hosted process
-    /// whose OWN record names the row's session is `matched`; one whose record
-    /// names ANOTHER session is ambiguous — `bindingState: unknown`, the row's
-    /// id withheld, no coord status, blocking. No record, a record the pass
-    /// read for an earlier holder of the pid, and a nested subagent change
-    /// nothing (never agreement).
+    /// Phase 2, as the round-3 review (M1) left it: the circular attribution
+    /// is broken by the verdict the reconcile pass stored for each process's
+    /// row. A `matched` row's process is `matched`; an `unknown` row's is
+    /// ambiguous — `bindingState: unknown`, the row's id withheld, no coord
+    /// status, blocking. A row the pass left unjudged (a pane whose record may
+    /// lag a switch its own process made, say), a row the census has no
+    /// verdict for, and a nested subagent change nothing (never agreement).
     #[test]
-    fn a_process_whose_own_record_names_another_session_is_ambiguous() {
-        let attributed = |pid: u32, nested: bool| LiveClaudeProcess {
-            session_id: Some("row-session".to_string()),
+    fn a_process_is_judged_by_its_rows_stored_verdict() {
+        let attributed = |pid: u32, row: &str, nested: bool| LiveClaudeProcess {
+            session_id: Some(row.to_string()),
             session_status: Some("finished".to_string()),
             session_status_since: Some(5),
             blocks_restart: false,
             nested_under_claude: nested,
-            // Started 100 s before the report's `checked_at_ms` (1_000_000).
             age_s: Some(100),
             ..proc_entry(pid)
         };
         let mut report = report_with_terminal_hosted(vec![
-            attributed(1, false),
-            attributed(2, false),
-            attributed(3, false),
-            attributed(4, true),
-            attributed(5, false),
+            attributed(1, "matched-row", false),
+            attributed(2, "contradicted-row", false),
+            attributed(3, "unjudged-row", false),
+            attributed(4, "contradicted-row", true),
+            attributed(5, "no-such-row", false),
         ]);
-        let records: HashMap<u32, RecordedSession> = [
-            (1, recorded("row-session", Some(900_000))),
-            (2, recorded("another-session", None)),
-            (4, recorded("subagent-session", Some(900_000))),
-            // Read for an earlier process that held pid 5: started a minute
-            // before this one.
-            (5, recorded("another-session", Some(840_000))),
-        ]
-        .into_iter()
-        .collect();
+        let judged =
+            |id: &str, terminal: &str, verdict: Option<BindingState>| TerminalSessionRecord {
+                binding_state: verdict,
+                ..record(id, terminal, 1)
+            };
+        let open = vec![
+            judged("matched-row", "t-1", Some(BindingState::Matched)),
+            judged("contradicted-row", "t-2", Some(BindingState::Unknown)),
+            judged("unjudged-row", "t-3", None),
+        ];
 
-        report.attach_registry_evidence(&records);
+        report.attach_binding_verdicts(&open);
         let p = |pid: u32| {
             report
                 .terminal_hosted
@@ -3323,7 +3321,7 @@ mod tests {
         };
 
         assert_eq!(p(1).binding_state, Some(BindingState::Matched));
-        assert_eq!(p(1).session_id.as_deref(), Some("row-session"));
+        assert_eq!(p(1).session_id.as_deref(), Some("matched-row"));
         assert!(
             !p(1).blocks_restart,
             "a matched finished session stays discounted"
@@ -3336,9 +3334,14 @@ mod tests {
         assert_eq!(ambiguous.session_status_since, None);
         assert!(ambiguous.blocks_restart, "an ambiguous process blocks");
 
-        for unchecked in [p(3), p(4), p(5)] {
+        for (unchecked, row) in [
+            (p(3), "unjudged-row"),
+            (p(4), "contradicted-row"),
+            (p(5), "no-such-row"),
+        ] {
             assert_eq!(unchecked.binding_state, None, "pid {}", unchecked.pid);
-            assert_eq!(unchecked.session_id.as_deref(), Some("row-session"));
+            assert_eq!(unchecked.session_id.as_deref(), Some(row));
+            assert!(!unchecked.blocks_restart, "pid {}", unchecked.pid);
         }
 
         let wire = serde_json::to_value(&ambiguous).unwrap();
