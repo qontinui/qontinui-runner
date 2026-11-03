@@ -1088,20 +1088,11 @@ fn the_pool_label_set_is_the_same_in_route_and_in_the_forced_lane() {
         .and_then(|j| j.get("runs-on"))
         .and_then(|v| v.as_str())
         .expect("job `test` must carry a `runs-on` expression string");
-    // The forced arm is the one JSON array literal in `runs-on` that names
-    // `self-hosted` (in any position); the hosted arms name `windows-latest` /
-    // `ubuntu-22.04`.
-    let forced_literal = regex::Regex::new(r#"'\[([^\]]*"self-hosted"[^\]]*)\]'"#)
-        .expect("the forced-arm pattern compiles")
-        .captures(runs_on)
-        .unwrap_or_else(|| {
-            panic!("`test`'s runs-on has no '[\"self-hosted\", …]' forced arm: {runs_on}")
-        })[1]
-        .to_string();
-    let mut forced: Vec<String> = forced_literal
-        .split(',')
-        .map(|label| label.trim().trim_matches('"').to_string())
-        .collect();
+    // The forced arm is the JSON array literal in `runs-on` that names
+    // `self-hosted` AND `Linux`: since the windows leg routes too, the windows
+    // arm also names `self-hosted` (pinned by the Windows twin below), and the
+    // hosted arms name `windows-latest` / `ubuntu-22.04`.
+    let mut forced = forced_label_set(runs_on, "Linux", "test");
 
     routed.sort();
     forced.sort();
@@ -1110,4 +1101,136 @@ fn the_pool_label_set_is_the_same_in_route_and_in_the_forced_lane() {
         "the pool label set differs between `route --self-hosted-labels` and \
          `test`'s forced `self-hosted` arm; change both together"
     );
+}
+
+
+/// Every `'[... "self-hosted" ...]'` JSON array literal in a `runs-on`
+/// expression that also names `os_label`, as one sorted label set. Exactly one
+/// such literal must exist: a second would be a second, unpinned pool.
+fn forced_label_set(runs_on: &str, os_label: &str, job: &str) -> Vec<String> {
+    let literals: Vec<String> = regex::Regex::new(r#"'\[([^\]]*"self-hosted"[^\]]*)\]'"#)
+        .expect("the forced-arm pattern compiles")
+        .captures_iter(runs_on)
+        .map(|c| c[1].to_string())
+        .filter(|lit| lit.contains(&format!("\"{os_label}\"")))
+        .collect();
+    assert_eq!(
+        literals.len(),
+        1,
+        "`{job}`'s runs-on must carry exactly one forced '[\"self-hosted\", \"{os_label}\", …]' \
+         arm, found {}: {runs_on}",
+        literals.len()
+    );
+    let mut set: Vec<String> = literals[0]
+        .split(',')
+        .map(|label| label.trim().trim_matches('"').to_string())
+        .collect();
+    set.sort();
+    set
+}
+
+/// `--self-hosted-labels <set>` of the route-ci-lane.py call in `job`, sorted.
+fn routed_label_set(doc: &serde_yaml::Value, job: &str) -> Vec<String> {
+    let route_run = job_steps(doc, job)
+        .iter()
+        .filter_map(|s| s.get("run").and_then(|v| v.as_str()).map(str::to_string))
+        .find(|run| run.contains("route-ci-lane.py"))
+        .unwrap_or_else(|| panic!("job `{job}` must run .github/scripts/route-ci-lane.py"));
+    let mut set: Vec<String> = route_run
+        .split_whitespace()
+        .skip_while(|word| *word != "--self-hosted-labels")
+        .nth(1)
+        .unwrap_or_else(|| panic!("`{job}` must pass `--self-hosted-labels <set>`: {route_run}"))
+        .split(',')
+        .map(str::to_string)
+        .collect();
+    set.sort();
+    set
+}
+
+fn job_runs_on(doc: &serde_yaml::Value, job: &str) -> String {
+    doc.get("jobs")
+        .and_then(|j| j.get(job))
+        .and_then(|j| j.get("runs-on"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("job `{job}` must carry a `runs-on` expression string"))
+        .to_string()
+}
+
+/// The Windows twin of the test above (plan
+/// `2026-11-03-route-qontinui-runner-windows-ci-legs-to-dell-2020`). The
+/// Windows pool's label set is spelled in `route-windows`' `--self-hosted-labels`
+/// and in the forced arm of EVERY Windows leg's `runs-on` — `test`'s windows
+/// leg, `clippy-windows` and `holder-crates`. A leg edited alone would route
+/// its forced lane to a different pool than `auto` does.
+#[test]
+fn the_windows_pool_label_set_is_the_same_in_route_windows_and_every_forced_windows_arm() {
+    let doc = ci_workflow();
+    let routed = routed_label_set(&doc, "route-windows");
+    assert!(
+        routed.iter().any(|l| l == "Windows") && routed.iter().any(|l| l == "self-hosted"),
+        "`route-windows` must route to a self-hosted Windows pool: {routed:?}"
+    );
+    for job in ["test", "clippy-windows", "holder-crates"] {
+        let runs_on = job_runs_on(&doc, job);
+        assert!(
+            runs_on.contains("needs['route-windows'].outputs.labels"),
+            "`{job}`'s runs-on must take `route-windows`' labels under `auto`: {runs_on}"
+        );
+        assert_eq!(
+            routed,
+            forced_label_set(&runs_on, "Windows", job),
+            "the Windows pool label set differs between `route-windows \
+             --self-hosted-labels` and `{job}`'s forced arm; change them together"
+        );
+    }
+}
+
+/// #2543's two self-hosted steps are linux bash (pkg-config webkit,
+/// /proc/meminfo, cgroups, `ln -s`), and `runner.environment == 'self-hosted'`
+/// is ALSO true on a self-hosted Windows runner — gated on that alone they
+/// would run linux-shaped scripts on the Windows pool and fail every leg there.
+/// So they carry `runner.os == 'Linux'`, and every job that can land on the
+/// Windows pool runs the Windows twin (the shared composite action) instead.
+#[test]
+fn the_self_hosted_steps_are_split_by_operating_system() {
+    let doc = ci_workflow();
+    let test_steps = job_steps(&doc, "test");
+    for name in [
+        "Self-hosted: clear the previous job's sibling checkouts and give the job its own HOME",
+        "Self-hosted: system packages, compile caps and the persistent target",
+    ] {
+        let cond = find_step(&test_steps, name)
+            .get("if")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            cond.contains("runner.environment == 'self-hosted'") && cond.contains("runner.os == 'Linux'"),
+            "`{name}` is linux bash and must be gated to self-hosted LINUX, got `{cond}`"
+        );
+    }
+    const PREP: &str =
+        "Self-hosted Windows: sibling cleanup, host preflight, compile caps and the persistent target";
+    for job in ["test", "clippy-windows", "holder-crates"] {
+        let steps = job_steps(&doc, job);
+        let prep = find_step(&steps, PREP);
+        let cond = prep.get("if").and_then(|v| v.as_str()).unwrap_or_default();
+        assert!(
+            cond.contains("runner.environment == 'self-hosted'") && cond.contains("runner.os == 'Windows'"),
+            "`{job}`'s `{PREP}` must be gated to self-hosted WINDOWS, got `{cond}`"
+        );
+        assert_eq!(
+            prep.get("uses").and_then(|v| v.as_str()),
+            Some("./.github/actions/self-hosted-windows-prep"),
+            "`{job}`'s `{PREP}` must run the shared composite action"
+        );
+        // It must come before anything that compiles or checks out a sibling:
+        // it clears the previous job's sibling trees and junctions ./target.
+        let prep_at = position(&steps, PREP);
+        let first_sibling = position(&steps, "Check out sibling qontinui-schemas");
+        assert!(
+            prep_at < first_sibling,
+            "`{job}`: `{PREP}` must run before the sibling checkouts"
+        );
+    }
 }
