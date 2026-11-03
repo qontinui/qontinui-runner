@@ -5727,6 +5727,13 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_is_merge_safe",
     "coord_land_provenance_backfill",
     "coord_layering_triage",
+    // Plan 2026-10-03-dossier-query-door-filters-sort-cursor Phase 4: the
+    // dossier query door (twin `GET /coord/agent-dossiers`), read-only. coord's
+    // `agent_tool_access::DEVICE_DEFAULT_TOOLS` grants it; without this entry a
+    // runner-proxied session is refused it as METHOD_NOT_ALLOWED and the
+    // `/pvi`, `/unattended` and `/findings-steward` dossier reads cannot reach
+    // it. This list only forwards.
+    "coord_list_dossiers",
     "coord_list_prompt_documents",
     "coord_list_worktrees",
     // Plan 2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run
@@ -18548,6 +18555,29 @@ mod coord_mcp_body_gate_tests {
                 "{tool} must be recorded as a deliberate exclusion, not drift"
             );
         }
+    }
+
+    /// The dossier query door coord grants on its device floor (plan
+    /// 2026-10-03-dossier-query-door-filters-sort-cursor Phase 4) must be
+    /// forwarded: the `/pvi`, `/unattended` and `/findings-steward` dossier
+    /// reads call it through this proxy, and withholding it answered them
+    /// METHOD_NOT_ALLOWED (measured 2026-11-03 on runner `8dae5bb424c1`).
+    #[test]
+    fn dossier_query_door_is_forwarded() {
+        let tool = "coord_list_dossiers";
+        assert!(coord_mcp_tool_is_allowed(tool), "{tool} must be forwarded");
+        assert!(
+            !coord_mcp_withholding_is_deliberate(tool),
+            "{tool} must not be both allowed and listed as a deliberate exclusion"
+        );
+        assert!(
+            gate(serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":tool,"arguments":{}}
+            }))
+            .is_ok(),
+            "{tool} must be callable through the proxy"
+        );
     }
 
     /// The agent escalate-evidence door and the ten device-floor names found
