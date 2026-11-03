@@ -6941,10 +6941,22 @@ async fn run_continuation_terminal(
     // launch template for the shared launch seam below. Resolved BEFORE the argv
     // build so its per-account command can layer in. spawn_blocking: the
     // selector reads settings + cooldown state.
-    let _ = spawn_blocking_tracked(crate::ai_provider::pick_best_account).await;
+    //
+    // The spawn runs under the dir the picker RETURNED, never a re-read of the
+    // process-global it publishes: under the default mode the spawn pick
+    // alternates across the top accounts and is not published at all, and a
+    // published pick can be replaced by a concurrent spawn's before this one
+    // reads it.
+    let picked_config_dir = spawn_blocking_tracked(crate::ai_provider::pick_spawn_account)
+        .await
+        .ok()
+        .flatten();
     let (selected_config_dir, _config_dir_source) = {
         let ai = crate::settings::get_ai_settings();
-        crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
+        crate::ai_provider::get_effective_config_dir_for_pick(
+            &ai.claude_cli,
+            picked_config_dir.as_deref(),
+        )
     };
 
     // Compose the spawn argv through the shared launch seam so the operator's
@@ -8051,11 +8063,18 @@ async fn run_condition_check_terminal(
     // Account selection (fail-loud) — identical posture to the gate path so the
     // spawned `claude` never dies instantly under a quota-exhausted default.
     // Resolved BEFORE the argv build so its per-account launch command can layer
-    // into the shared launch seam.
-    let _ = spawn_blocking_tracked(crate::ai_provider::pick_best_account).await;
+    // into the shared launch seam. From the dir the picker returned, never a
+    // re-read of the global (`ai_provider::pick_spawn_account`).
+    let picked_config_dir = spawn_blocking_tracked(crate::ai_provider::pick_spawn_account)
+        .await
+        .ok()
+        .flatten();
     let (selected_config_dir, _config_dir_source) = {
         let ai = crate::settings::get_ai_settings();
-        crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
+        crate::ai_provider::get_effective_config_dir_for_pick(
+            &ai.claude_cli,
+            picked_config_dir.as_deref(),
+        )
     };
     let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
         selected_config_dir.as_deref(),
@@ -8524,10 +8543,15 @@ async fn run_continuation_headless(
     pinned_session_id: uuid::Uuid,
 ) -> anyhow::Result<HeadlessExit> {
     let log_path = agent_log_path(agent_id);
-    // Select the most-available account once before spawning (pins the resolved
-    // config dir that `spawn_claude_child` reads). spawn_blocking: the selector
+    // Select the account once before spawning, and spawn under the dir the
+    // picker RETURNED: under the default mode a spawn pick alternates across
+    // the top accounts and is never published, so `spawn_claude_child` gets it
+    // handed in rather than re-reading the global. spawn_blocking: the selector
     // reads settings + cooldown state.
-    let _ = spawn_blocking_tracked(crate::ai_provider::pick_best_account).await;
+    let picked_config_dir = spawn_blocking_tracked(crate::ai_provider::pick_spawn_account)
+        .await
+        .ok()
+        .flatten();
     // Provision coord-mcp for the headless session so it receives coord's
     // session-start `instructions` preamble and can call coord_declare_intent —
     // parity with the terminal continuation path.
@@ -8546,7 +8570,7 @@ async fn run_continuation_headless(
     // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`).
     let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
     // No per-spawn pin here: a gate continuation carries no account field —
-    // the `pick_best_account` call above is the whole selection.
+    // the `pick_spawn_account` call above is the whole selection.
     let session_args = headless_agent_args(
         &crate::settings::get_claude_session_permission(),
         pinned_session_args(pinned_session_id),
@@ -8555,6 +8579,7 @@ async fn run_continuation_headless(
         workdir,
         initial_prompt,
         None,
+        picked_config_dir.as_deref(),
         coord_mcp,
         &session_args,
         false,
@@ -9085,9 +9110,10 @@ pub(crate) fn resolve_spawn_account_with(
 /// Production wiring of [`resolve_spawn_account_with`] against the live roster.
 ///
 /// The ONE seam a caller pinning an account must go through — never
-/// [`crate::ai_provider::pick_best_account`], which is a side-effect-only
-/// ROTATION helper (it returns `()`, no-ops unless `account_selection_mode ==
-/// LeastUsage`, and every call site discards it), and never
+/// [`crate::ai_provider::pick_best_account`] or
+/// [`crate::ai_provider::pick_spawn_account`], which are ROTATION helpers (they
+/// pick by the selection mode, publish a pick process-globally, no-op in
+/// `Manual` mode, and never honour a requested account), and never
 /// `switch_claude_account`, which would leak one spawn's account choice into
 /// every later spawn on this runner.
 pub(crate) fn resolve_spawn_account(
@@ -9429,17 +9455,24 @@ async fn run_agent_subprocess(
     // saying `exited` there would tell coord a process ran and stopped.
     let mut final_phase = SpawnPhase::Exited;
 
-    // Select the most-available account once before the (re)spawn loop. On a
-    // mid-run rate-limit the inference path rotates via
-    // `rotate_account_on_rate_limit`, and `spawn_claude_child` re-reads the
-    // resolved dir on each respawn, so retries pick up the rotation.
+    // Select the account once before the (re)spawn loop. The FIRST attempt
+    // spawns under the dir the picker returned (under the default mode a spawn
+    // pick alternates across the top accounts and is never published). A
+    // RESTART passes no pick, so it runs under the published dir — the mode's
+    // single pick, or wherever an in-process rate-limit rotation
+    // (`rotate_account_on_rate_limit`) has since moved it — as restarts always
+    // have.
     //
     // SKIPPED when this spawn carries an account pin: the picker mutates the
     // process-global resolved dir, which is precisely the leak a per-spawn
     // override exists to avoid — and its result would be ignored anyway, since
     // the override is passed to every (re)spawn below.
+    let mut first_attempt_pick: Option<String> = None;
     if pinned_config_dir.is_none() {
-        let _ = spawn_blocking_tracked(crate::ai_provider::pick_best_account).await;
+        first_attempt_pick = spawn_blocking_tracked(crate::ai_provider::pick_spawn_account)
+            .await
+            .ok()
+            .flatten();
     }
 
     loop {
@@ -9456,10 +9489,12 @@ async fn run_agent_subprocess(
             &crate::settings::get_claude_session_permission(),
             session_pins.next_attempt(),
         );
+        let attempt_pick = first_attempt_pick.take();
         match spawn_claude_child(
             &primary_wt,
             &payload.initial_prompt,
             pinned_config_dir.as_deref(),
+            attempt_pick.as_deref(),
             coord_mcp,
             &session_args,
             false,
@@ -10205,6 +10240,12 @@ pub(crate) async fn spawn_claude_child(
     workdir: &str,
     initial_prompt: &str,
     account_config_dir_override: Option<&str>,
+    // The dir this spawn's own `ai_provider::pick_spawn_account` returned, used
+    // when there is no override. It goes through the same credential check and
+    // reports the same auto arm as the published dir it stands in for
+    // (`ai_provider::get_effective_config_dir_for_pick`). `None` reads the
+    // published dir, as before.
+    picked_config_dir: Option<&str>,
     // What THIS session's coord-mcp provisioning did, decided by the caller
     // before it got here (every caller provisions immediately above its spawn).
     // Threaded through to `finalize_headless_child_env`, which renders the
@@ -10251,11 +10292,15 @@ pub(crate) async fn spawn_claude_child(
     // no-op this phase exists to remove: it would make the log claim trust for
     // an account the child never runs under. One resolution cannot drift.
     let ai = crate::settings::get_ai_settings();
-    let (resolved_config_dir, config_dir_source) =
-        crate::ai_provider::get_effective_config_dir_with_override(
+    let (resolved_config_dir, config_dir_source) = match account_config_dir_override {
+        Some(_) => crate::ai_provider::get_effective_config_dir_with_override(
             &ai.claude_cli,
             account_config_dir_override,
-        );
+        ),
+        None => {
+            crate::ai_provider::get_effective_config_dir_for_pick(&ai.claude_cli, picked_config_dir)
+        }
+    };
 
     // Phase 1 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`:
     // the pre-spawn verdicts, computed for the account this spawn RESOLVED.
@@ -10285,8 +10330,9 @@ pub(crate) async fn spawn_claude_child(
     // account instead of inheriting the process-ambient default. Without this a
     // continuation/worker `claude` spawns under whatever account the runner
     // booted with (e.g. a quota-exhausted one) and dies instantly. The caller
-    // calls `pick_best_account()` once per unit of work; here we read the
-    // resolved-or-manual effective dir (already credential-validated).
+    // calls `pick_spawn_account()` once per unit of work and hands its pick in
+    // as `picked_config_dir`; here we read the picked-or-published-or-manual
+    // effective dir (already credential-validated).
     //
     // `None` means no credential-valid account resolved → leaving the env unset
     // would inherit the ambient default. That is only safe if the ambient
@@ -19081,6 +19127,7 @@ mod gateway_spawn_refusal_tests {
         let outcome = super::spawn_claude_child(
             &workdir.to_string_lossy(),
             "hi",
+            None,
             None,
             crate::coord_mcp::CoordMcpDelivery::Provisioned,
             &[],

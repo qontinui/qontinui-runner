@@ -402,10 +402,11 @@ export function compareByHighestExpectedUsage(
 export function compareForAccountSelectionMode(
   mode: AccountSelectionMode | undefined,
 ): typeof compareByUsageHeadroom {
-  // `alternating_handoff` picks the highest-expected under-pace account at
-  // spawn time (its "account 1"), so it shares that comparator. The ordering
-  // it gives `weighted_random` is only a display order: that mode draws, so
-  // it has no single best account (see `hasDeterministicPick`).
+  // `alternating_handoff` ranks by expected usage too: its "account 1" is the
+  // highest-expected under-pace account. The ordering this gives it and
+  // `weighted_random` is only a display order: the first alternates spawns
+  // over the top under-pace accounts and the second draws, so neither has a
+  // single best account (see `hasDeterministicPick`).
   return mode === "highest_expected_usage" ||
     mode === "alternating_handoff" ||
     mode === "weighted_random"
@@ -415,9 +416,10 @@ export function compareForAccountSelectionMode(
 
 /** Whether a mode picks one predictable account, so the UI may mark it as the
  * auto-selected one. `manual` names its account explicitly; `weighted_random`
- * draws a new account on each pick. */
+ * draws a new account on each pick; `alternating_handoff` alternates new
+ * sessions between the top under-pace account and the next four. */
 export function hasDeterministicPick(mode: AccountSelectionMode | undefined): boolean {
-  return mode !== "manual" && mode !== "weighted_random";
+  return mode !== "manual" && mode !== "weighted_random" && mode !== "alternating_handoff";
 }
 
 export interface ClaudeApiSettings {

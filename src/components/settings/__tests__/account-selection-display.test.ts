@@ -14,6 +14,7 @@ import { describe, expect, it } from "vitest";
 import {
   accountSelectionModeLabel,
   displayedAccountSelection,
+  hasDeterministicPick,
   type AccountSelectionMode,
   type AiSettings,
 } from "../types";
@@ -169,5 +170,17 @@ describe("accountSelectionModeLabel", () => {
     expect(accountSelectionModeLabel("highest_expected_usage")).toBe("Highest Expected Usage");
     expect(accountSelectionModeLabel("weighted_random")).toBe("Weighted Random");
     expect(accountSelectionModeLabel("alternating_handoff")).toBe("Alternating Handoff");
+  });
+});
+
+describe("hasDeterministicPick", () => {
+  it("marks a best account only for modes that send every new session to one account", () => {
+    expect(hasDeterministicPick("least_usage")).toBe(true);
+    expect(hasDeterministicPick("highest_expected_usage")).toBe(true);
+    // `manual` names its account; `weighted_random` draws; the default
+    // `alternating_handoff` alternates new sessions over the top accounts.
+    expect(hasDeterministicPick("manual")).toBe(false);
+    expect(hasDeterministicPick("weighted_random")).toBe(false);
+    expect(hasDeterministicPick("alternating_handoff")).toBe(false);
   });
 });

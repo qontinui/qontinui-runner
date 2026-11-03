@@ -314,11 +314,14 @@ pub(crate) async fn launch(
     crate::fleet_skills::provision_fleet_skills_for_session(&workdir_s);
 
     // Most-available account, so the child does not spawn under a
-    // quota-exhausted default and die on its first request.
-    let _ = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(
-        crate::ai_provider::pick_best_account,
+    // quota-exhausted default and die on its first request. The child spawns
+    // under the dir the picker RETURNED (`ai_provider::pick_spawn_account`).
+    let picked_config_dir = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(
+        crate::ai_provider::pick_spawn_account,
     )
-    .await;
+    .await
+    .ok()
+    .flatten();
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let prompt = compose_prompt(&spec.prompt, &spec.mcp_connections);
@@ -330,10 +333,17 @@ pub(crate) async fn launch(
         &crate::settings::get_claude_session_permission(),
     )?;
 
-    let (mut child, _preconditions) =
-        crate::agent_runtime::spawn_claude_child(&workdir_s, &prompt, None, coord_mcp, &args, true)
-            .await
-            .map_err(|e| format!("spawn scheduled session: {e:#}"))?;
+    let (mut child, _preconditions) = crate::agent_runtime::spawn_claude_child(
+        &workdir_s,
+        &prompt,
+        None,
+        picked_config_dir.as_deref(),
+        coord_mcp,
+        &args,
+        true,
+    )
+    .await
+    .map_err(|e| format!("spawn scheduled session: {e:#}"))?;
     // The whole tree, addressable by one kill (see the module doc).
     let tree = crate::process_helpers::ChildTreeGuard::attach_armed_tokio(&child);
 

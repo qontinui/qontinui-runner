@@ -1357,11 +1357,18 @@ async fn spawn_looping_agent_terminal(
     // Account selection (fail-loud): never spawn a `claude` that dies
     // instantly with a 401 under a quota-exhausted/unauthenticated default.
     // Resolved BEFORE the argv build so its per-account launch command can layer
-    // into the shared launch seam.
-    let _ = spawn_blocking_tracked(crate::ai_provider::pick_best_account).await;
+    // into the shared launch seam. From the dir the picker returned, never a
+    // re-read of the global (`ai_provider::pick_spawn_account`).
+    let picked_config_dir = spawn_blocking_tracked(crate::ai_provider::pick_spawn_account)
+        .await
+        .ok()
+        .flatten();
     let (selected_config_dir, _config_dir_source) = {
         let ai = crate::settings::get_ai_settings();
-        crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
+        crate::ai_provider::get_effective_config_dir_for_pick(
+            &ai.claude_cli,
+            picked_config_dir.as_deref(),
+        )
     };
     let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
         selected_config_dir.as_deref(),
