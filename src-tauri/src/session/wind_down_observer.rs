@@ -1050,6 +1050,7 @@ mod tests {
             session_status_since: None,
             blocks_restart: status != Some("finished"),
             wind_down: None,
+            stray_wait_shells: 0,
         }
     }
 
