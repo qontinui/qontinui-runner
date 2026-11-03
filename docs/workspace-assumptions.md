@@ -204,7 +204,7 @@ _No hits._
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
-| `src/commands/setup_wizard.rs` | `discover_claude_config_dirs` | `let claude_root = std::path::Path::new("C:\\claude");` | 1 | fallback_correct — Probes the fleet's C:\claude multi-account convention behind is_dir(); absent everywhere else, where CLAUDE_CONFIG_DIR and ~/.claude still apply. |
+| `src/commands/setup_wizard.rs` | `const WINDOWS_MULTI_ACCOUNT_ROOT` | `const WINDOWS_MULTI_ACCOUNT_ROOT: &str = "C:\\claude";` | 1 | fallback_correct — Probes the fleet's C:\claude multi-account convention, read only on the Windows discovery layout (DiscoveryLayout); an absent dir reads as no accounts. Elsewhere the configured roster, CLAUDE_CONFIG_DIR and ~/.claude apply. Moved from the discover_claude_config_dirs key when the literal became this const (qontinui-runner#2544); same disposition. |
 | `src/mcp/test_fixtures.rs` | `const DEFAULT_TEST_CONFIG_DIR` | `const DEFAULT_TEST_CONFIG_DIR: &str = "C:\\claude\\.claude-test-fixture";` | 1 | dev_only_surface — Debug-gated test-fixture injection endpoints for manual UI testing. |
 | `src/projects/snapshot.rs` | `const NOISE_PREFIXES` | `const NOISE_PREFIXES: [&str; 1] = ["c:\\claude\\"];` | 1 | fallback_correct — Filters the operator's C:\claude agent-scratch rows out of project attribution; on another box it filters nothing, which only leaves some noise rows in the view. |
 | `src/session_archive/discovery.rs` | `discover_account_homes_from_env` | `Some(PathBuf::from("C:\\claude")),` | 1 | fallback_correct — Probes C:/claude behind is_dir() on every platform, per its own doc comment; false everywhere else. |

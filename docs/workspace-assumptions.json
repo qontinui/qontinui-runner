@@ -225,11 +225,11 @@
     {
       "class": "machine_path",
       "file": "src/commands/setup_wizard.rs",
-      "symbol": "discover_claude_config_dirs",
-      "excerpt": "let claude_root = std::path::Path::new(\"C:\\\\claude\");",
+      "symbol": "const WINDOWS_MULTI_ACCOUNT_ROOT",
+      "excerpt": "const WINDOWS_MULTI_ACCOUNT_ROOT: &str = \"C:\\\\claude\";",
       "count": 1,
       "disposition": "fallback_correct",
-      "note": "Probes the fleet's C:\\claude multi-account convention behind is_dir(); absent everywhere else, where CLAUDE_CONFIG_DIR and ~/.claude still apply."
+      "note": "Probes the fleet's C:\\claude multi-account convention, read only on the Windows discovery layout (DiscoveryLayout); an absent dir reads as no accounts. Elsewhere the configured roster, CLAUDE_CONFIG_DIR and ~/.claude apply. Moved from the discover_claude_config_dirs key when the literal became this const (qontinui-runner#2544); same disposition."
     },
     {
       "class": "machine_path",
