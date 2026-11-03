@@ -38,7 +38,7 @@ windows-sys = { version = "0.59", features = [
 # `Win32_Process.Create` is a COM call, and `windows-sys` carries no COM
 # interfaces. The version already in Cargo.lock (tauri/wry pull it in), so this
 # adds an edge, not a crate. Windows-only like the rest.
-windows = { version = "0.61", features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Com",
     "Win32_System_Ole",

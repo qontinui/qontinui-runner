@@ -2070,8 +2070,10 @@ jobs:
         #
         # Drop this ignore once the runner is on tauri-plugin-updater >= 2.14.1,
         # the first release on zip ^9 (published 2026-10-28). That release
-        # requires tauri ^2.12, and this lock is on tauri 2.11.1, so taking it
-        # is a tauri upgrade (watch the vendored tao-0.35.0 patch). Tracking:
+        # requires tauri ^2.12; the lock is now on tauri 2.12.5 /
+        # tauri-plugin-updater 2.14.1 with tao re-vendored as
+        # vendor/tao-0.37.2, so zip 4 is gone and this ignore is dropped by the
+        # follow-up `ci(security)` commit. Tracking:
         # qontinui/qontinui-runner#2500. REVIEW BY 2026-12-02. Re-assess
         # immediately if updater signature checking is ever disabled or
         # bypassed, if runner code starts calling `extract()` on a zip 4

@@ -22,7 +22,7 @@
 //! # Crate choice is load-bearing
 //!
 //! Three `windows`-family crates are in this build at three versions
-//! (`windows-sys 0.59`, `windows 0.58`, and `windows 0.61` renamed to
+//! (`windows-sys 0.59`, `windows 0.58`, and `windows 0.62` renamed to
 //! `windows-capture`), and `HWND` is a *distinct type* in each. This module
 //! stays entirely inside **`windows-sys 0.59`** and hands out a plain `isize`,
 //! so a consumer can cast to whichever `HWND` its own call site needs without

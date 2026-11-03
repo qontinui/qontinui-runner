@@ -269,7 +269,7 @@ GEN_EVENTS_ATTRIBUTION_PATHS=(
     #  `qontinui-runner-win32 = { path = "../crates/runner-win32" }`,
     #  `qontinui-pty-holder = { path = "../crates/pty-holder" }`), and the
     # vendored crate the root manifest's `[patch.crates-io]` substitutes into
-    # the graph (`tao = { path = "vendor/tao-0.35.0" }`). The two runner-*
+    # the graph (`tao = { path = "vendor/tao-0.37.2" }`). The two runner-*
     # crates were missing until 2026-09-30: an edit to either cleared a guilty
     # pusher. `crates/pty-holder` was missing the same way until 2026-10-12.
     # `gen_events_uncovered_path_deps` below now walks the manifests

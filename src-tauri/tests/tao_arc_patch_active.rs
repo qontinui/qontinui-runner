@@ -1,15 +1,20 @@
 //! Guards the `[patch.crates-io] tao` override in the workspace `Cargo.toml`.
 //!
-//! `vendor/tao-0.35.0` is a copy of the crates.io tao 0.35.0 source whose
-//! refcount changes these tests pin (the full delta, including a non-refcount
-//! Windows fix, is in `vendor/tao-0.35.0/QONTINUI-PATCH.md`). On Windows,
+//! `vendor/tao-0.37.2` is a copy of the crates.io tao 0.37.2 source carrying
+//! three changes these tests pin (the full delta is in
+//! `vendor/tao-0.37.2/QONTINUI-PATCH.md`). On Windows,
 //! `EventLoopRunnerShared<T>` is an `Arc`, not an `Rc`; on Linux, so is
-//! `EventLoopWindowTarget::windows`. The Windows
-//! refcount is mutated from background threads (every off-main-thread
-//! `AppHandle::clone()` reaches it through `tauri_runtime_wry`'s
-//! `unsafe impl Send + Sync` on `DispatcherMainThreadContext`), so a
-//! non-atomic count races and corrupts — killing the runner with
-//! `0xc000001d` / `0xc0000409` / `0xc0000374`. See the comment on the
+//! `EventLoopWindowTarget::windows`; and the Windows
+//! `EventLoopThreadExecutor::execute_in_thread` reclaims the closure on a
+//! failed `PostMessageW` and remembers destroyed target windows.
+//!
+//! The refcounts are mutated from background threads: every off-main-thread
+//! `AppHandle::clone()` clones `tauri_runtime_wry::Context<T>` — `unsafe impl
+//! Send + Sync` since tauri-runtime-wry 2.12 (`lib.rs:248-249`) — whose
+//! `main_thread: DispatcherMainThreadContext<T>` field holds the tao
+//! `EventLoopWindowTarget`. So a non-atomic count races and corrupts — killing
+//! the runner with `0xc000001d` / `0xc0000409` / `0xc0000374` on Windows and
+//! glibc heap-corruption aborts on Linux. See the comment on the
 //! `[patch.crates-io]` section for the full forensics.
 //!
 //! Why this test exists: a `[patch]` that does not apply is **not an error**.
@@ -53,14 +58,14 @@ fn tao_resolves_to_the_vendored_patch() {
          workspace Cargo.toml is NOT applying. The non-atomic `Rc` refcount race is back and \
          will crash the runner intermittently with 0xc000001d / 0xc0000409 / 0xc0000374. \
          Most likely cause: a tauri upgrade moved the tree to a tao version other than the \
-         vendored 0.35.0. Fix by re-vendoring the new tao version with the same Rc->Arc change \
-         (see vendor/tao-0.35.0/QONTINUI-PATCH.md), not by deleting this test.\n\
+         vendored 0.37.2. Fix by re-vendoring the new tao version with the same three changes \
+         (see vendor/tao-0.37.2/QONTINUI-PATCH.md), not by deleting this test.\n\
          Lockfile entry was:\n{entry}"
     );
 
     assert!(
-        entry.contains("version = \"0.35.0\""),
-        "`tao` is no longer at 0.35.0; the vendored patch is pinned to that version. \
+        entry.contains("\nversion = \"0.37.2\"\n"),
+        "`tao` is no longer at 0.37.2; the vendored patch is pinned to that version. \
          Re-vendor against the new version before updating this assertion.\n\
          Lockfile entry was:\n{entry}"
     );
@@ -71,22 +76,23 @@ fn tao_resolves_to_the_vendored_patch() {
 #[test]
 fn vendored_tao_still_uses_an_atomic_refcount() {
     let runner_rs =
-        workspace_root().join("vendor/tao-0.35.0/src/platform_impl/windows/event_loop/runner.rs");
+        workspace_root().join("vendor/tao-0.37.2/src/platform_impl/windows/event_loop/runner.rs");
     let src = std::fs::read_to_string(&runner_rs)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", runner_rs.display()));
 
     assert!(
         src.contains("pub(crate) type EventLoopRunnerShared<T> = Arc<EventLoopRunner<T>>;"),
-        "vendor/tao-0.35.0 no longer declares `EventLoopRunnerShared` as an `Arc`. The vendored \
+        "vendor/tao-0.37.2 no longer declares `EventLoopRunnerShared` as an `Arc`. The vendored \
          copy has been reverted or re-synced from upstream, which reintroduces the data race. \
-         Re-apply the Rc->Arc change (see vendor/tao-0.35.0/QONTINUI-PATCH.md)."
+         Re-apply the Rc->Arc change (see vendor/tao-0.37.2/QONTINUI-PATCH.md)."
     );
 }
 
 /// The LINUX half of the same race. On Linux the shared refcount that every
 /// off-main-thread `AppHandle` / `Webview` clone (and drop) reaches is
-/// `EventLoopWindowTarget::windows` — `#[derive(Clone)]` on a struct that
-/// `tauri_runtime_wry::DispatcherMainThreadContext` declares `Send + Sync`.
+/// `EventLoopWindowTarget::windows` — `#[derive(Clone)]` on a struct held by
+/// `tauri_runtime_wry::DispatcherMainThreadContext`, itself the `main_thread`
+/// field of the `unsafe impl Send + Sync` `tauri_runtime_wry::Context<T>`.
 /// Upstream it is an `Rc`, so a background-thread clone/drop races the main
 /// thread's, the count drifts, and the `RcBox` is freed while still
 /// referenced. On the Linux primary that surfaced as glibc heap-corruption
@@ -96,22 +102,65 @@ fn vendored_tao_still_uses_an_atomic_refcount() {
 #[test]
 fn vendored_tao_linux_window_set_uses_an_atomic_refcount() {
     let event_loop_rs =
-        workspace_root().join("vendor/tao-0.35.0/src/platform_impl/linux/event_loop.rs");
+        workspace_root().join("vendor/tao-0.37.2/src/platform_impl/linux/event_loop.rs");
     let src = std::fs::read_to_string(&event_loop_rs)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", event_loop_rs.display()));
 
     assert!(
         src.contains("pub(crate) windows: Arc<RefCell<HashSet<WindowId>>>,")
             && src.contains("windows: Arc::new(RefCell::new(HashSet::new())),"),
-        "vendor/tao-0.35.0's Linux `EventLoopWindowTarget::windows` is no longer an `Arc`. \
+        "vendor/tao-0.37.2's Linux `EventLoopWindowTarget::windows` is no longer an `Arc`. \
          It is cloned and dropped from tokio threads through tauri's `unsafe impl Send + Sync` \
-         on `DispatcherMainThreadContext`, so an `Rc` there is a non-atomic refcount race that \
+         on `tauri_runtime_wry::Context`, so an `Rc` there is a non-atomic refcount race that \
          corrupts the glibc heap. Re-apply the Rc->Arc change \
-         (see vendor/tao-0.35.0/QONTINUI-PATCH.md)."
+         (see vendor/tao-0.37.2/QONTINUI-PATCH.md)."
     );
     assert!(
         !src.contains("Rc<RefCell<HashSet<WindowId>>>"),
         "an `Rc<RefCell<HashSet<WindowId>>>` is back in the Linux tao event loop — that is the \
-         heap-corrupting refcount race (see vendor/tao-0.35.0/QONTINUI-PATCH.md)."
+         heap-corrupting refcount race (see vendor/tao-0.37.2/QONTINUI-PATCH.md)."
+    );
+}
+
+/// The THIRD change, which is not a refcount change and so is the one a
+/// re-vendor is most likely to drop silently (qontinui-runner `d7e1ede77`).
+/// Upstream `execute_in_thread` leaks the double-boxed closure on every failed
+/// `PostMessageW` and logs `"PostMessage failed ; is the messages queue
+/// full?..."` once per call (442 calls/second were measured while a pop-out
+/// closed under load). The patched version reclaims the closure, remembers a
+/// destroyed target in `DEAD_TARGET_WINDOWS` and short-circuits later calls.
+#[test]
+fn vendored_tao_execute_in_thread_reclaims_and_tracks_dead_windows() {
+    let event_loop_rs =
+        workspace_root().join("vendor/tao-0.37.2/src/platform_impl/windows/event_loop.rs");
+    let src = std::fs::read_to_string(&event_loop_rs)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", event_loop_rs.display()));
+
+    let start = src
+        .find("pub(super) fn execute_in_thread<F>")
+        .expect("vendored tao no longer defines `EventLoopThreadExecutor::execute_in_thread`");
+    let end = src[start..]
+        .find("type ThreadExecFn")
+        .map(|i| start + i)
+        .expect("`type ThreadExecFn` no longer follows `execute_in_thread` in the vendored tao");
+    let body = &src[start..end];
+
+    assert!(
+        !body.contains("PostMessage failed ; is the messages queue full?"),
+        "vendor/tao-0.37.2's `execute_in_thread` carries the upstream `PostMessage failed ; is \
+         the messages queue full?` failure branch again, i.e. the vendored copy was re-synced \
+         from upstream and lost the closure-reclaim / dead-window fix. Re-apply it (see \
+         vendor/tao-0.37.2/QONTINUI-PATCH.md, change 3)."
+    );
+    assert!(
+        body.contains("DEAD_TARGET_WINDOWS") && body.contains("drop(Box::from_raw(raw))"),
+        "vendor/tao-0.37.2's `execute_in_thread` no longer consults `DEAD_TARGET_WINDOWS` and \
+         reclaims the closure on a failed post. Re-apply change 3 of \
+         vendor/tao-0.37.2/QONTINUI-PATCH.md."
+    );
+    assert!(
+        src.contains("static DEAD_TARGET_WINDOWS:"),
+        "vendor/tao-0.37.2 no longer declares the `DEAD_TARGET_WINDOWS` set the \
+         `execute_in_thread` fix depends on (QONTINUI-PATCH.md, change 3)."
     );
 }
