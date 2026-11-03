@@ -3214,7 +3214,8 @@ pub fn pair_with_auth_token_with_ids_typed(
 /// returned by ``pair-cli`` so the runner can use a single decoder for
 /// both paths. This struct is named for the field set declared in the
 /// web schema (``app/schemas/pair_code.py::PairCodeRedeemOut``):
-/// ``{user_id, tenant_id, device_id, expires_at?, device_token_jwt}``.
+/// ``{user_id, tenant_id, device_id, expires_at?, device_token_jwt,
+/// device_machine_key?}``.
 ///
 /// The redeem path returns ``device_token_jwt`` (not ``token``) for
 /// disambiguation in the web schema, so we accept both spellings via
@@ -3231,6 +3232,12 @@ pub struct PairCodeRedeemResponse {
     /// the legacy ``token`` alias too in case the API ever renames.
     #[serde(alias = "token")]
     pub device_token_jwt: String,
+    /// Device machine key (`dmk_`) the web redeem auto-mints, so a pair-code
+    /// pairing gets the same >30-day cold-start recovery credential a
+    /// `pair-cli` pairing does. Optional: a web backend predating it omits the
+    /// field, which decodes to `None`.
+    #[serde(default)]
+    pub device_machine_key: Option<String>,
 }
 
 impl PairCodeRedeemResponse {
@@ -3249,8 +3256,7 @@ impl PairCodeRedeemResponse {
             jti: None,
             exp: None,
             tenant_id: Some(self.tenant_id),
-            // The pair-code redeem path does not carry a dmk_ in this phase.
-            device_machine_key: None,
+            device_machine_key: self.device_machine_key,
         }
     }
 }
@@ -3701,7 +3707,10 @@ pub fn pair_via_browser(
 /// LoginScreen. This must NOT be called from any background context — doing so
 /// would let a background write blank an unreadable store. See
 /// `SecureStorage::WriteMode`.
-pub fn persist_pairing(resp: &PairCompleteResponse, tenant_id: uuid::Uuid) -> Result<(), String> {
+pub fn persist_pairing(
+    resp: &PairCompleteResponse,
+    tenant_id: uuid::Uuid,
+) -> Result<PairingPersisted, String> {
     use crate::auth::AuthManager;
     let mgr = AuthManager::new();
     let path = paired_user_path().ok_or_else(|| "could not resolve data_local_dir".to_string())?;
@@ -3721,19 +3730,73 @@ pub fn persist_pairing(resp: &PairCompleteResponse, tenant_id: uuid::Uuid) -> Re
     // Best-effort: if the web pair response auto-minted a device machine key
     // (`dmk_`), persist it so the refresher's Phase-4b cold-start exchange can
     // recover a device JWT after a >30-day outage with no user session. A
-    // missing dmk_ (pre-Phase-3 web / non-cli pairing) is a no-op.
-    if let Some(dmk) = resp
+    // missing dmk_ (an older web backend) is a no-op. A failed store does not
+    // fail the pairing — the device JWT is already saved — but it is reported
+    // in the returned `dmk_stored` and logged at `warn!`.
+    let dmk_stored = if has_device_machine_key(resp) {
+        match crate::secure_storage::SecureStorage::new() {
+            Ok(storage) => persist_device_machine_key(&storage, resp),
+            Err(e) => {
+                tracing::warn!(
+                    "persist_pairing: secure storage unavailable, device machine key NOT stored: {e}"
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+    Ok(PairingPersisted { dmk_stored })
+}
+
+/// What [`persist_pairing`] wrote beyond the mandatory device-JWT persist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairingPersisted {
+    /// `true` only when the pair response carried a non-blank device machine
+    /// key (`dmk_`) AND secure storage holds exactly that key after the write
+    /// (read back, not assumed from the response). `false` when the response
+    /// carried none, or the store or its read-back failed.
+    pub dmk_stored: bool,
+}
+
+fn has_device_machine_key(resp: &PairCompleteResponse) -> bool {
+    resp.device_machine_key
+        .as_deref()
+        .is_some_and(|k| !k.trim().is_empty())
+}
+
+/// Store `resp`'s device machine key into `storage` (explicit-acquisition
+/// `_fresh` write) and confirm it by reading it back. Returns whether storage
+/// now holds that key; every failure is logged at `warn!`.
+pub(crate) fn persist_device_machine_key(
+    storage: &crate::secure_storage::SecureStorage,
+    resp: &PairCompleteResponse,
+) -> bool {
+    let Some(dmk) = resp
         .device_machine_key
         .as_deref()
         .filter(|k| !k.trim().is_empty())
-    {
-        if let Ok(storage) = crate::secure_storage::SecureStorage::new() {
-            if let Err(e) = storage.store_device_machine_key_fresh(dmk) {
-                tracing::debug!("store_device_machine_key non-fatal: {e}");
-            }
+    else {
+        return false;
+    };
+    if let Err(e) = storage.store_device_machine_key_fresh(dmk) {
+        tracing::warn!("persist_pairing: device machine key NOT stored: {e}");
+        return false;
+    }
+    match storage.get_device_machine_key() {
+        Ok(Some(stored)) if stored == dmk => true,
+        Ok(_) => {
+            tracing::warn!(
+                "persist_pairing: device machine key write reported success but the read-back \
+                 does not hold it"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!("persist_pairing: device machine key read-back failed: {e}");
+            false
         }
     }
-    Ok(())
 }
 
 /// Parameterized core of [`persist_pairing`] — explicit `AuthManager` +
@@ -4508,6 +4571,64 @@ mod tests {
         assert_eq!(parsed.device_token_jwt, "legacy.jwt.xyz");
     }
 
+    /// Plan `2026-11-03-pair-code-pairing-mints-no-device-machine-key` Phase 2:
+    /// the redeem response's optional `device_machine_key` decodes when the web
+    /// sends it, and defaults to `None` (also for an explicit `null`) when an
+    /// older backend omits it.
+    #[test]
+    fn pair_code_redeem_response_decodes_optional_device_machine_key() {
+        let base = serde_json::json!({
+            "user_id":          "22222222-2222-4222-8222-222222222222",
+            "tenant_id":        "11111111-2222-3333-4444-555555555555",
+            "device_id":        "00000000-0000-4000-8000-000000000000",
+            "device_token_jwt": "abc.def.ghi",
+        });
+
+        let mut with_key = base.clone();
+        with_key["device_machine_key"] = serde_json::json!("dmk_unit_fixture_placeholder");
+        let parsed: PairCodeRedeemResponse =
+            serde_json::from_value(with_key).expect("decode with device_machine_key");
+        assert_eq!(
+            parsed.device_machine_key.as_deref(),
+            Some("dmk_unit_fixture_placeholder")
+        );
+
+        let parsed: PairCodeRedeemResponse =
+            serde_json::from_value(base.clone()).expect("decode without device_machine_key");
+        assert!(parsed.device_machine_key.is_none());
+
+        let mut null_key = base;
+        null_key["device_machine_key"] = serde_json::Value::Null;
+        let parsed: PairCodeRedeemResponse =
+            serde_json::from_value(null_key).expect("decode null device_machine_key");
+        assert!(parsed.device_machine_key.is_none());
+    }
+
+    /// `persist_device_machine_key` (the dmk_ half of `persist_pairing`)
+    /// reports `true` only when the isolated store actually holds the key the
+    /// response carried, and `false` — writing nothing — when the response
+    /// carried none or a blank one.
+    #[test]
+    fn persist_device_machine_key_reports_what_storage_holds() {
+        let dir = temp_dir_for("persist_dmk_reports_storage");
+        let storage = crate::secure_storage::SecureStorage::with_path(dir.join("tokens.enc"))
+            .expect("test storage");
+
+        let mut resp = pair_resp("jwt.a.1");
+        assert!(!persist_device_machine_key(&storage, &resp), "no key → not stored");
+        resp.device_machine_key = Some("   ".to_string());
+        assert!(!persist_device_machine_key(&storage, &resp), "blank key → not stored");
+        assert!(storage.get_device_machine_key().unwrap().is_none());
+
+        resp.device_machine_key = Some("dmk_unit_fixture_placeholder".to_string());
+        assert!(persist_device_machine_key(&storage, &resp));
+        assert_eq!(
+            storage.get_device_machine_key().unwrap().as_deref(),
+            Some("dmk_unit_fixture_placeholder")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// ``PairCodeRedeemResponse::into_pair_complete`` produces a
     /// ``PairCompleteResponse`` with the same fields callers expect
     /// from ``pair-cli``, so ``persist_pairing`` can consume it
@@ -4520,8 +4641,14 @@ mod tests {
             device_id: "00000000-0000-4000-8000-000000000000".to_string(),
             expires_at: None,
             device_token_jwt: "abc.def.ghi".to_string(),
+            device_machine_key: Some("dmk_unit_fixture_placeholder".to_string()),
         };
         let pc = redeem.into_pair_complete();
+        assert_eq!(
+            pc.device_machine_key.as_deref(),
+            Some("dmk_unit_fixture_placeholder"),
+            "the redeem's machine key must pass through to persist_pairing"
+        );
         assert_eq!(pc.token, "abc.def.ghi");
         assert_eq!(pc.user_id, "22222222-2222-4222-8222-222222222222");
         assert_eq!(
