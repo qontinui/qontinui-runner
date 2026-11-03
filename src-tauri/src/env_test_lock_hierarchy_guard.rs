@@ -80,12 +80,17 @@
 //!   Only an `impl` whose self type is a plain path is recognised as one; a
 //!   method of `impl T for &Foo`, `for [T]` or `for (A, B)` is treated as a
 //!   free fn and can become a wrapper.
-//! * Module-tree scoping starts at `main.rs`, `lib.rs` and `bin/*.rs`. It does
-//!   not follow a `#[path]` on an out-of-line `mod` nested inside an inline
-//!   `mod { … }` block, nor a `#[path]` on the inline block itself. A `mod x;`
-//!   is only found on a line ending in `;` with a space before `mod`, so
-//!   `#[cfg(test)]mod x;` or a trailing comment hides it. A file the tree does
-//!   not reach is scanned as non-test, as before.
+//! * Module-tree scoping starts at `main.rs`, `lib.rs` and `bin/*.rs` and
+//!   resolves `#[path]` as rustc does: at top level, inside an inline
+//!   `mod { … }` block and on the inline block itself, and a file that a
+//!   `path` names is mod-rs for its own children. Every
+//!   `cfg_attr(…, path = …)` is followed whatever its predicate, alongside the
+//!   default name. Not followed: a `mod x;` inside a fn body, or one whose
+//!   tokens a comment splits (`mod /* c */ x;`), which the pre-filter misses.
+//!   A file reached by several edges (by name and through a `path`) takes its
+//!   mod-rs-ness from the edge that walked it last: the first one, or a later
+//!   test-scope edge that re-walks it. A file the tree does not reach is
+//!   scanned as non-test.
 //!
 //! Registered in `main.rs` only, like `env_write_lock_guard`: it walks all of
 //! `src`, so a `lib.rs` twin would only double the work.
@@ -556,8 +561,8 @@ fn normalize(p: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
-fn path_attr(attrs: &[syn::Attribute]) -> Option<String> {
-    attrs.iter().find_map(|a| match &a.meta {
+fn path_value(meta: &syn::Meta) -> Option<String> {
+    match meta {
         syn::Meta::NameValue(nv) if nv.path.is_ident("path") => match &nv.value {
             syn::Expr::Lit(syn::ExprLit {
                 lit: syn::Lit::Str(s),
@@ -566,18 +571,60 @@ fn path_attr(attrs: &[syn::Attribute]) -> Option<String> {
             _ => None,
         },
         _ => None,
-    })
+    }
 }
 
-/// Pass 0: the out-of-line `mod x;` declarations in one file, each as
-/// (candidate child files, declared in test scope).
+/// A module's paths: its unconditional `#[path = "…"]`, and every `path`
+/// inside a `#[cfg_attr(…, path = "…")]` (nested `cfg_attr` included). The
+/// conditional ones are followed whatever their predicate, alongside the
+/// default name: reaching one more file as test scope is the safe direction
+/// for a guard.
+fn path_attrs(attrs: &[syn::Attribute]) -> (Option<String>, Vec<String>) {
+    fn cfg_attr_paths(meta: &syn::Meta, out: &mut Vec<String>) {
+        let syn::Meta::List(list) = meta else {
+            return;
+        };
+        if !list.path.is_ident("cfg_attr") {
+            return;
+        }
+        let Ok(nested) = list.parse_args_with(
+            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+        ) else {
+            return;
+        };
+        for m in nested.iter().skip(1) {
+            match path_value(m) {
+                Some(p) => out.push(p),
+                None => cfg_attr_paths(m, out),
+            }
+        }
+    }
+    let plain = attrs.iter().find_map(|a| path_value(&a.meta));
+    let mut conditional = Vec::new();
+    for a in attrs {
+        cfg_attr_paths(&a.meta, &mut conditional);
+    }
+    (plain, conditional)
+}
+
+/// One out-of-line `mod x;` edge: the candidate files (the first that exists
+/// is the module), whether it is declared in test scope, and whether the
+/// file was named by a `path` — rustc treats such a file as mod-rs, so its
+/// own `mod y;` resolves beside it.
+struct Decl {
+    cands: Vec<PathBuf>,
+    test: bool,
+    via_path: bool,
+}
+
+/// Pass 0: the out-of-line `mod x;` declarations in one file.
 struct ModDecls {
     /// The file's own directory, for a top-level `#[path]`.
     file_dir: PathBuf,
     /// Where `mod x;` resolves at the current inline-module depth.
     dirs: Vec<PathBuf>,
     test_scope: Vec<bool>,
-    out: Vec<(Vec<PathBuf>, bool)>,
+    out: Vec<Decl>,
 }
 
 impl<'ast> Visit<'ast> for ModDecls {
@@ -588,45 +635,75 @@ impl<'ast> Visit<'ast> for ModDecls {
             || m.ident == "test_support";
         let dir = self.dirs.last().cloned().unwrap_or_default();
         let name = m.ident.to_string();
+        // As rustc resolves it, a `path` — on an out-of-line `mod x;` or on an
+        // inline block — is relative to the module's own directory: the
+        // declaring file's directory at top level (even for a non-mod-rs
+        // file), the inline module's directory (`dir`) inside `mod a { … }`.
+        let path_base = if self.dirs.len() == 1 {
+            self.file_dir.clone()
+        } else {
+            dir.clone()
+        };
+        let (plain, conditional) = path_attrs(&m.attrs);
+        // An unconditional `path` is the only location; otherwise every
+        // conditional one, plus the default. `normalize` drops a `..` that
+        // escapes the source root: it reaches no file in the walk.
+        let pathed: Vec<PathBuf> = plain
+            .iter()
+            .chain(&conditional)
+            .filter_map(|p| normalize(&path_base.join(p)))
+            .collect();
+        let with_default = plain.is_none();
         if m.content.is_none() {
-            let cands = match path_attr(&m.attrs) {
-                // Top-level `#[path]` is relative to the declaring file's
-                // directory. Inside an inline block it is not followed (see
-                // Known limits): no candidate, rather than a name-based guess
-                // that could match an unrelated file.
-                Some(p) if self.dirs.len() == 1 => {
-                    normalize(&self.file_dir.join(p)).into_iter().collect()
-                }
-                Some(_) => Vec::new(),
-                None => vec![
-                    dir.join(format!("{name}.rs")),
-                    dir.join(&name).join("mod.rs"),
-                ],
-            };
-            self.out.push((cands, test));
+            for cand in pathed {
+                self.out.push(Decl {
+                    cands: vec![cand],
+                    test,
+                    via_path: true,
+                });
+            }
+            if with_default {
+                self.out.push(Decl {
+                    cands: vec![
+                        dir.join(format!("{name}.rs")),
+                        dir.join(&name).join("mod.rs"),
+                    ],
+                    test,
+                    via_path: false,
+                });
+            }
             return;
         }
-        self.dirs.push(dir.join(&name));
-        self.test_scope.push(test);
-        visit::visit_item_mod(self, m);
-        self.test_scope.pop();
-        self.dirs.pop();
+        // `#[path = "d"] mod a { mod b; }` puts `b` at `<base>/d/b.rs`, not
+        // `<dir>/a/b.rs`. Each candidate directory is walked.
+        let mut inline_dirs = pathed;
+        if with_default {
+            inline_dirs.push(dir.join(&name));
+        }
+        for d in inline_dirs {
+            self.dirs.push(d);
+            self.test_scope.push(test);
+            visit::visit_item_mod(self, m);
+            self.test_scope.pop();
+            self.dirs.pop();
+        }
     }
     // Item-level `mod x;` inside a fn body is not a module-tree edge we follow.
     fn visit_item_fn(&mut self, _f: &'ast syn::ItemFn) {}
 }
 
 /// The out-of-line module declarations of `path` (a file under the source
-/// root), resolved to candidate files. `is_root` marks a crate root, whose
-/// `mod x;` resolves beside it rather than in a directory named after it.
-fn mod_decls(path: &Path, src: &str, is_root: bool) -> syn::Result<Vec<(Vec<PathBuf>, bool)>> {
+/// root). `mod_rs` marks a file whose `mod x;` resolves beside it rather than
+/// in a directory named after it: a crate root, or a file reached through a
+/// `path` (a `mod.rs` is detected here by name).
+fn mod_decls(path: &Path, src: &str, mod_rs: bool) -> syn::Result<Vec<Decl>> {
     let file = syn::parse_file(src)?;
     let file_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or_default();
-    let base = if is_root || stem == "mod" {
+    let base = if mod_rs || stem == "mod" {
         file_dir.clone()
     } else {
         file_dir.join(stem)
@@ -641,6 +718,51 @@ fn mod_decls(path: &Path, src: &str, is_root: bool) -> syn::Result<Vec<(Vec<Path
     Ok(v.out)
 }
 
+/// Cheap pre-filter for the module walk: only a file containing the token
+/// sequence `mod <ident> ;` can declare an out-of-line module, so most files
+/// are never parsed twice. Token-shaped rather than line-shaped, so
+/// `#[cfg(test)]mod x;`, `mod x; /* why */` and a declaration split across
+/// lines all count. A match inside a comment or string only costs a parse.
+fn declares_out_of_line_mod(src: &str) -> bool {
+    let b = src.as_bytes();
+    // Any non-ASCII byte may be part of an identifier (`mod café;`).
+    let ident = |c: u8| c == b'_' || c.is_ascii_alphanumeric() || !c.is_ascii();
+    let mut from = 0;
+    while let Some(off) = b[from..].windows(3).position(|w| w == b"mod") {
+        let at = from + off;
+        from = at + 3;
+        if at > 0 && ident(b[at - 1]) {
+            continue;
+        }
+        let mut i = at + 3;
+        let ws = i;
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i == ws {
+            continue;
+        }
+        // `r#name` is a valid module name.
+        if b[i..].starts_with(b"r#") {
+            i += 2;
+        }
+        let name = i;
+        while i < b.len() && ident(b[i]) {
+            i += 1;
+        }
+        if i == name {
+            continue;
+        }
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if b.get(i) == Some(&b';') {
+            return true;
+        }
+    }
+    false
+}
+
 /// Every file the module tree reaches through test scope, walking from
 /// `roots`. A file reached by both a test and a non-test path is a test file:
 /// it is compiled into the test binary either way, and scanning more is the
@@ -650,19 +772,11 @@ fn test_files(
     sources: &HashMap<PathBuf, String>,
     roots: &[PathBuf],
 ) -> Result<HashSet<PathBuf>, String> {
-    // Cheap pre-filter: only a file with a line shaped like `mod x;` can
-    // declare an out-of-line module, so most files are never parsed here.
-    let declares = |src: &str| {
-        src.lines().any(|l| {
-            let t = l.trim();
-            // Drop a trailing `// …` so `mod x; // why` still counts.
-            let t = t.split("//").next().unwrap_or_default().trim_end();
-            t.ends_with(';') && (t.starts_with("mod ") || t.contains(" mod "))
-        })
-    };
     let mut seen: HashMap<PathBuf, bool> = HashMap::new();
-    let mut work: Vec<(PathBuf, bool)> = roots.iter().map(|r| (r.clone(), false)).collect();
-    while let Some((path, test)) = work.pop() {
+    // (file, in test scope, mod-rs: a crate root or a file named by a `path`).
+    let mut work: Vec<(PathBuf, bool, bool)> =
+        roots.iter().map(|r| (r.clone(), false, true)).collect();
+    while let Some((path, test, mod_rs)) = work.pop() {
         match seen.get(&path) {
             Some(&prev) if prev || !test => continue,
             _ => {}
@@ -671,20 +785,19 @@ fn test_files(
         let Some(src) = sources.get(&path) else {
             continue;
         };
-        if !declares(src) {
+        if !declares_out_of_line_mod(src) {
             continue;
         }
-        let is_root = roots.contains(&path);
-        let decls = mod_decls(&path, src, is_root).map_err(|e| {
+        let decls = mod_decls(&path, src, mod_rs).map_err(|e| {
             format!(
                 "{}:{}: could not parse with syn ({e})",
                 path.display(),
                 e.span().start().line
             )
         })?;
-        for (cands, decl_test) in decls {
-            if let Some(child) = cands.into_iter().find(|c| sources.contains_key(c)) {
-                work.push((child, test || decl_test));
+        for d in decls {
+            if let Some(child) = d.cands.into_iter().find(|c| sources.contains_key(c)) {
+                work.push((child, test || d.test, d.via_path));
             }
         }
     }
@@ -1297,6 +1410,101 @@ fn the_module_walk_scopes_separate_file_test_modules() {
     assert!(!got.contains(Path::new("a/prod.rs")));
     assert!(!got.contains(Path::new("a/inner/deep.rs")));
     assert!(!got.contains(Path::new("orphan.rs")));
+}
+
+/// `#[path]` resolves where rustc resolves it inside and on inline blocks,
+/// every `cfg_attr` path is followed beside the default name, a file named by
+/// a `path` is mod-rs for its children, and a declaration the old
+/// line-shaped pre-filter missed (`]mod x;`, a block comment, a split line)
+/// is still seen.
+#[test]
+fn the_module_walk_follows_inline_paths_and_odd_declaration_shapes() {
+    let src = |s: &str| s.to_string();
+    let sources: HashMap<PathBuf, String> = [
+        (
+            "main.rs",
+            src("mod a;\nmod b;\nmod c;\n#[cfg(test)]mod d; /* why */\n#[cfg(test)]\nmod\n    e\n;\n"),
+        ),
+        // Non-mod-rs `a`: inside `mod inner`, `#[path]` is relative to `a/inner/`.
+        (
+            "a.rs",
+            src("#[cfg(test)]\nmod inner {\n    #[path = \"fixture.rs\"]\n    mod f;\n}\n"),
+        ),
+        ("a/inner/fixture.rs", src("")),
+        ("a/fixture.rs", src("")),
+        // `#[path]` on a top-level inline block is relative to the file's own
+        // directory even in non-mod-rs `b.rs`: children land in `elsewhere/`.
+        (
+            "b.rs",
+            src("#[cfg(test)]\n#[path = \"elsewhere\"]\nmod blk {\n    mod g;\n}\n"),
+        ),
+        ("elsewhere/g.rs", src("")),
+        ("b/elsewhere/g.rs", src("")),
+        ("b/blk/g.rs", src("")),
+        // Every `cfg_attr` path (nested too) and the default name are followed.
+        (
+            "c.rs",
+            src(concat!(
+                "#[cfg(test)]\n",
+                "#[cfg_attr(unix, path = \"unix_tests.rs\")]\n",
+                "#[cfg_attr(windows, cfg_attr(debug_assertions, path = \"win_tests.rs\"))]\n",
+                "mod t;\n",
+            )),
+        ),
+        // Reached through a `path`, so `mod beside;` resolves next to it.
+        ("unix_tests.rs", src("mod beside;\n")),
+        ("beside.rs", src("")),
+        ("unix_tests/beside.rs", src("")),
+        ("win_tests.rs", src("")),
+        ("c/t.rs", src("")),
+        ("d.rs", src("")),
+        ("e.rs", src("")),
+    ]
+    .into_iter()
+    .map(|(p, s)| (PathBuf::from(p), s))
+    .collect();
+    let got = test_files(&sources, &[PathBuf::from("main.rs")]).expect("parses");
+    let mut got: Vec<String> = got
+        .iter()
+        .map(|p| p.display().to_string().replace('\\', "/"))
+        .collect();
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        [
+            "a/inner/fixture.rs",
+            "beside.rs",
+            "c/t.rs",
+            "d.rs",
+            "e.rs",
+            "elsewhere/g.rs",
+            "unix_tests.rs",
+            "win_tests.rs",
+        ]
+    );
+}
+
+#[test]
+fn the_mod_pre_filter_is_token_shaped() {
+    for yes in [
+        "mod x;",
+        "#[cfg(test)]mod x;",
+        "mod x; /* c */",
+        "pub(crate) mod\n  x\n;",
+        "mod r#type;",
+        "mod café;",
+    ] {
+        assert!(declares_out_of_line_mod(yes), "{yes:?}");
+    }
+    for no in [
+        "mod x { }",
+        "fn model() {}",
+        "let mode = 1;",
+        "commod x;",
+        "mod;",
+    ] {
+        assert!(!declares_out_of_line_mod(no), "{no:?}");
+    }
 }
 
 /// A whole file in test scope: its statics are test statics with no `cfg` of
