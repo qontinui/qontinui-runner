@@ -4664,10 +4664,9 @@ mod tests {
     #[test]
     fn provisioning_gate_enforce_env_parsing() {
         let _env_lock = env_lock();
-        // Save/restore the process-global so this test is self-contained. This
-        // is the ONLY test that touches the flag; no sibling reads it, so the
-        // save/restore is sufficient (and there's no parallel reader to race).
-        let prev = std::env::var(PROVISIONING_GATE_ENFORCE_ENV).ok();
+        // Restore the process-global on drop, unwinding included, so a failed
+        // assertion cannot leave the flag set for later tests in the binary.
+        let _restore = crate::test_env::EnvVarRestore::capture(&[PROVISIONING_GATE_ENFORCE_ENV]);
 
         std::env::remove_var(PROVISIONING_GATE_ENFORCE_ENV);
         assert!(
@@ -4688,11 +4687,6 @@ mod tests {
                 provisioning_gate_enforce_enabled(),
                 "{on:?} must read as enforcing"
             );
-        }
-
-        match prev {
-            Some(p) => std::env::set_var(PROVISIONING_GATE_ENFORCE_ENV, p),
-            None => std::env::remove_var(PROVISIONING_GATE_ENFORCE_ENV),
         }
     }
 }

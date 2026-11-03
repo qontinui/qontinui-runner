@@ -14178,7 +14178,7 @@ mod tests {
     fn launchable_or_bare_falls_back_for_a_non_executable_file() {
         use std::os::unix::fs::PermissionsExt;
         let _env_lock = env_lock();
-        let prev_bin = std::env::var("QONTINUI_CLAUDE_BIN").ok();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_CLAUDE_BIN"]);
         std::env::remove_var("QONTINUI_CLAUDE_BIN");
         let tmp = tempfile::tempdir().unwrap();
         let f = tmp.path().join("claude");
@@ -14188,9 +14188,6 @@ mod tests {
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
         let exec = launchable_or_bare(f.to_string_lossy().into_owned());
         let missing = launchable_or_bare(tmp.path().join("gone").to_string_lossy().into_owned());
-        if let Some(v) = prev_bin {
-            std::env::set_var("QONTINUI_CLAUDE_BIN", v);
-        }
         assert_eq!(non_exec, "claude");
         assert_eq!(exec, f.to_string_lossy());
         assert_eq!(missing, "claude");
@@ -14199,13 +14196,9 @@ mod tests {
     #[test]
     fn claude_bin_respects_env_override() {
         let _env_lock = env_lock();
-        let prev = std::env::var("QONTINUI_CLAUDE_BIN").ok();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_CLAUDE_BIN"]);
         std::env::set_var("QONTINUI_CLAUDE_BIN", "/some/fake/claude-fixture");
         assert_eq!(claude_bin_path(), "/some/fake/claude-fixture");
-        match prev {
-            Some(v) => std::env::set_var("QONTINUI_CLAUDE_BIN", v),
-            None => std::env::remove_var("QONTINUI_CLAUDE_BIN"),
-        }
     }
 
     /// Smoke test using a fake claude binary fixture (the existing
@@ -14263,7 +14256,7 @@ mod tests {
     #[tokio::test]
     async fn a_stalled_child_is_reported_but_never_touched() {
         let _env_lock = env_lock();
-        let prev = std::env::var("QONTINUI_SPAWN_STALL_SECS").ok();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_SPAWN_STALL_SECS"]);
         std::env::set_var("QONTINUI_SPAWN_STALL_SECS", "1");
 
         let tmp = std::env::temp_dir();
@@ -14291,11 +14284,6 @@ mod tests {
             exit, 0,
             "the stall watch reports; it must never kill or alter the child"
         );
-
-        match prev {
-            Some(v) => std::env::set_var("QONTINUI_SPAWN_STALL_SECS", v),
-            None => std::env::remove_var("QONTINUI_SPAWN_STALL_SECS"),
-        }
     }
 
     /// The terminal arm launches the `claude` CLI with the prompt as a single
@@ -14307,7 +14295,7 @@ mod tests {
     #[test]
     fn terminal_continuation_command_is_interactive_positional_prompt() {
         let _env_lock = env_lock();
-        let prev = std::env::var("QONTINUI_CLAUDE_BIN").ok();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_CLAUDE_BIN"]);
         std::env::set_var("QONTINUI_CLAUDE_BIN", "/fake/claude");
 
         // Mirror the construction in `run_continuation_terminal` (a fixed-size
@@ -14324,11 +14312,6 @@ mod tests {
             !command.iter().any(|a| a == "--print" || a == "-p"),
             "must NOT use --print/-p: the session must stay interactive"
         );
-
-        match prev {
-            Some(v) => std::env::set_var("QONTINUI_CLAUDE_BIN", v),
-            None => std::env::remove_var("QONTINUI_CLAUDE_BIN"),
-        }
     }
 
     /// Phase 3 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`:
@@ -14819,7 +14802,10 @@ mod tests {
         // The headless arm passes `--session-id <uuid>`, which a bare `sh`
         // rejects as an illegal option, so on Unix the fake is a tiny script
         // that RECORDS its argv (one arg per line) and runs stdin through `sh`.
-        let prev = std::env::var("QONTINUI_CLAUDE_BIN").ok();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[
+            "QONTINUI_CLAUDE_BIN",
+            "QONTINUI_TRUST_GATE_TIER",
+        ]);
         let fake_dir = tempfile::tempdir().expect("tempdir for fake claude");
         let argv_file = fake_dir.path().join("argv");
         let fake_bin = if cfg!(target_os = "windows") {
@@ -14854,7 +14840,6 @@ mod tests {
         // the dial to `proceed` (today's live tenant value) so this test keeps
         // asserting the SPAWN path rather than the gate. The env override is the
         // same injectable seam the dial-flip tests use.
-        let prev_tier = std::env::var("QONTINUI_TRUST_GATE_TIER").ok();
         std::env::set_var("QONTINUI_TRUST_GATE_TIER", "proceed");
         let agent_id = uuid::Uuid::now_v7();
         let pinned = uuid::Uuid::new_v4();
@@ -14866,10 +14851,6 @@ mod tests {
             pinned,
         )
         .await;
-        match prev_tier {
-            Some(v) => std::env::set_var("QONTINUI_TRUST_GATE_TIER", v),
-            None => std::env::remove_var("QONTINUI_TRUST_GATE_TIER"),
-        }
         assert!(
             res.is_ok(),
             "gate-continuation headless dispatch must spawn + return Ok: {res:?}"
@@ -14901,11 +14882,6 @@ mod tests {
                 "the headless child carries its permission flags {expected:?} ahead of \
                  --session-id: {args:?}"
             );
-        }
-
-        match prev {
-            Some(v) => std::env::set_var("QONTINUI_CLAUDE_BIN", v),
-            None => std::env::remove_var("QONTINUI_CLAUDE_BIN"),
         }
     }
 
