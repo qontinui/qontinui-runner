@@ -1591,7 +1591,10 @@ mod nudge_and_exit_tests {
             Some("t1".to_string())
         );
         // Never the live tab itself.
-        assert_eq!(stale_tab_to_close(Liveness::Live, Some("t2"), Some("t2")), None);
+        assert_eq!(
+            stale_tab_to_close(Liveness::Live, Some("t2"), Some("t2")),
+            None
+        );
         assert_eq!(stale_tab_to_close(Liveness::Live, None, Some("t2")), None);
         // Nothing while a restore may be in flight, or with no tab at all.
         for l in [Liveness::PendingRestore, Liveness::Dead] {
