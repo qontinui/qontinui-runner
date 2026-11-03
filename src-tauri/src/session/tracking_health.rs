@@ -498,15 +498,19 @@ pub struct LiveClaudeProcess {
     /// - `"unknown"` — it names ANOTHER session. The row's id is then NOT
     ///   echoed: [`Self::session_id`] is withheld (null), no coord work status
     ///   applies, and the process blocks;
-    /// - `null` — not checked: a nested subagent, every non-terminal-hosted
+    /// - ABSENT — not checked: a nested subagent, every non-terminal-hosted
     ///   process, an attribution already ambiguous, or a record that could not
-    ///   be read (never read as agreement).
+    ///   be read (never read as agreement). Absent, not `null`, so the key
+    ///   carries the same contract as `GET /sessions/history`: a consumer that
+    ///   fails closed on any value other than `matched` does not freeze every
+    ///   pane running a nested subagent.
     ///
     /// Without it the attribution was circular — a pid took the id of whatever
     /// row owned its terminal, so a wrong binding came back out of
     /// `/restart-readiness` as fact. Filled by
     /// [`TrackingHealthReport::attach_registry_evidence`]; [`evaluate`] leaves
     /// it `None`. Plan `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub binding_state: Option<BindingState>,
     /// The coord WORK axis for [`Self::session_id`], verbatim as coord served
     /// it. `None` = not resolved — which is UNKNOWN, not "not finished".
@@ -3346,7 +3350,7 @@ mod tests {
         let wire = serde_json::to_value(&ambiguous).unwrap();
         assert_eq!(wire["bindingState"], "unknown");
         assert!(wire["sessionId"].is_null());
-        assert!(serde_json::to_value(p(3)).unwrap()["bindingState"].is_null());
+        assert!(serde_json::to_value(p(3)).unwrap().get("bindingState").is_none(), "an unchecked process omits the key");
     }
 
     /// `/health` `sessionTracking` serves both binding counters, before and
