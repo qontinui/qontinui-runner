@@ -142,6 +142,7 @@ Before reaching for `sleep N && re-discover` or `page/evaluate + __TAURI_INTERNA
 - **Call a Tauri command** — `GET /ui-bridge/commands` to list, `POST /ui-bridge/invoke/{cmd}` to call. No `page/evaluate` boilerplate.
 - **Recent console errors** — `GET /control/console-errors?since=<epoch-ms-or-ISO>&group=true` (both numeric and ISO-8601 `since` are accepted).
 - **Did that click do anything?** — Read `expectChange` in the click/doubleClick response instead of re-snapshotting.
+- **Can a user get from A to B, or where do they get stuck?** — Read the journey ledger instead of driving the path: `GET /apps/{app_id}/journey/{reachable,steps,dead-ends,prior-knowledge,frontier}` on the runner API root (not under `/ui-bridge`), or the `journey_*` tools in ui-bridge-mcp. How to read an answer, and whether your build has the routes: `knowledge-base/qontinui-specific/ui-bridge.md` → "Journey queries".
 
 ## API Quick Reference
 

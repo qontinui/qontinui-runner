@@ -2678,8 +2678,8 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
 > `phase_name`). `/coord/agent-gates` is the **read** door; the gate **writes**
 > have their own device-authed routes under an `/agent/` **INFIX** —
 > `POST /coord/gates/:gate_id/agent/{reject,reopen,mute,unmute,snooze,
-> continuation-cancel,force-clear,audience,repoint}` (`repoint` is agent-only,
-> with no operator twin). Note the two spellings: `agent-`
+> continuation-cancel,force-clear,audience,repoint,correct}` (`repoint` and
+> `correct` are agent-only, with no operator twin). Note the two spellings: `agent-`
 > PREFIX for reads, `/agent/` INFIX for writes. `attest` **and `withdraw`** are
 > device-authed on their BARE paths (no twin exists, and there is no operator
 > withdraw route at all). `continuation-consumed` / `continuation-deferred` are
