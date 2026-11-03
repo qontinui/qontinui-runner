@@ -1162,9 +1162,10 @@ async fn materialize_restore_registry(
             );
         }
         outcome => {
-            // Refused (another live pane still runs the session — plan
-            // `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`)
-            // or unwritable: nothing was materialized here.
+            // Not written: the registry was unavailable. (The record is
+            // authoritative, which the binding guard never refuses — plan
+            // `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`.)
+            // Nothing was materialized here.
             tracing::warn!(
                 source = %source_session_id,
                 child = %child_id,

@@ -30,11 +30,9 @@ use crate::session::session_lifecycle_store::SessionLifecycleStore;
 const WORKDIR: &str = "/work/two-panes";
 const S_A: &str = "aaaaaaaa-0000-4000-8000-00000000000a";
 const S_B: &str = "bbbbbbbb-0000-4000-8000-00000000000b";
-// Above Linux's PID_MAX_LIMIT (2^22), so no live Linux process can hold them,
-// and none a multiple of four — every pid Windows has been seen to assign is
-// one (an implementation detail, not a contract; 4_200_004 would be a valid
-// Windows pid). So the pass's argv query finds nothing — as for a `claude`
-// started without an id.
+// Each is above 2^22 = 4_194_304, Linux's PID_MAX_LIMIT, and none is divisible
+// by four, so the pass's argv query finds nothing — as for a `claude` started
+// without an id.
 const SHELL_A: u32 = 4_200_001;
 const CLAUDE_A: u32 = 4_200_002;
 const SHELL_B: u32 = 4_200_005;

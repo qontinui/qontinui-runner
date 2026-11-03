@@ -492,20 +492,23 @@ pub struct LiveClaudeProcess {
     pub session_id: Option<String>,
     /// Does this process's pane run the session of the row it is attributed
     /// to? The verdict the reconcile pass STORED for that row
-    /// ([`TerminalSessionRecord::binding_state`], judged from the pane's own
-    /// Claude Code records, `<config_dir>/sessions/<pid>.json`). Serialized
+    /// ([`TerminalSessionRecord::binding_state`], judged from the live panes'
+    /// own Claude Code records, `<config_dir>/sessions/<pid>.json`) — served
+    /// only while it is the CURRENT observation's
+    /// ([`SessionLifecycleStore::current_binding_verdicts`]). Serialized
     /// `bindingState`:
     ///
-    /// - `"matched"` — the pane's records name the row's session;
-    /// - `"unknown"` — they name ANOTHER session, or the session runs in
-    ///   another pane. The row's id is then NOT echoed: [`Self::session_id`]
+    /// - `"matched"` — the pane's own record names the row's session;
+    /// - `"unknown"` — the row's session runs in ANOTHER live pane, whose
+    ///   record names it. The row's id is then NOT echoed: [`Self::session_id`]
     ///   is withheld (null), no coord work status applies, and the process
     ///   blocks;
     /// - ABSENT — not checked: a nested subagent, every non-terminal-hosted
-    ///   process, an attribution already ambiguous, a row the pass has not
-    ///   judged (no readable record, a record that may lag a switch its own
-    ///   process made, a row that moved since), or no fresh pass at all —
-    ///   never read as agreement. Absent, not `null`, so the key carries the
+    ///   process, an attribution already ambiguous, a row the current
+    ///   observation gave no verdict (its pane's record names another session
+    ///   that runs nowhere else, names nothing or cannot be read; the row moved
+    ///   since), or a verdict from an older observation — never read as
+    ///   agreement. Absent, not `null`, so the key carries the
     ///   same contract as `GET /sessions/history`: a consumer that fails
     ///   closed on any value other than `matched` does not freeze every pane
     ///   running a nested subagent.
@@ -744,22 +747,21 @@ impl TrackingHealthReport {
     }
 
     /// Set [`LiveClaudeProcess::binding_state`] on every top-level
-    /// terminal-hosted process from the verdict the reconcile pass stored for
-    /// the row it is attributed to (`open`, the rows [`evaluate`] attributed
-    /// by).
+    /// terminal-hosted process from `current` — the verdict the reconcile pass
+    /// stored for each row, by session id, when the CURRENT observation
+    /// produced it ([`SessionLifecycleStore::current_binding_verdicts`]).
     ///
     /// [`evaluate`] attributes a pid to the open row owning its terminal,
     /// which is circular: a row bound to the wrong pane hands the pane's
     /// process its id, and `/restart-readiness` then echoes the wrong binding
-    /// as fact. The pass breaks the circle — it judges each row against its
-    /// pane's own records ([`crate::session::pane_binding::binding_verdicts`])
-    /// — and the census takes that verdict rather than judging again, so the
-    /// two can never disagree: the lag rule, the prior-tenant rule and the
-    /// rows the pass leaves unjudged all reach `/restart-readiness` as they
-    /// reach the pass. A `matched` row → `Matched`. An `unknown` row →
-    /// `Unknown`, and the attribution is withdrawn exactly as for a pid two
-    /// rows claim: `session_id`, `session_status` and `session_status_since`
-    /// cleared, and the process blocks. An unjudged row leaves the process
+    /// as fact. The pass breaks the circle — it judges each row against the
+    /// live panes' own records
+    /// ([`crate::session::pane_binding::binding_verdicts`]) — and the census
+    /// takes that verdict rather than judging again, so the two can never
+    /// disagree. A `matched` row → `Matched`. An `unknown` row → `Unknown`,
+    /// and the attribution is withdrawn exactly as for a pid two rows claim:
+    /// `session_id`, `session_status` and `session_status_since` cleared, and
+    /// the process blocks. A row with no current verdict leaves the process
     /// unchecked (`None`, never read as agreement) with today's attribution.
     /// Nested subagents and already-ambiguous pids are not checked: a nested
     /// `claude` runs a session of its own.
@@ -767,12 +769,7 @@ impl TrackingHealthReport {
     /// Run BEFORE [`Self::attach_status_since`], which keys on the
     /// `session_status` this may clear. Pure; no I/O — the census reads no
     /// record of its own on the `/restart-readiness` verdict path.
-    pub fn attach_binding_verdicts(&mut self, open: &[TerminalSessionRecord]) {
-        let verdict_of: HashMap<&str, BindingState> = open
-            .iter()
-            .filter(|r| r.state == "open")
-            .filter_map(|r| Some((r.claude_session_id.as_str(), r.binding_state?)))
-            .collect();
+    pub fn attach_binding_verdicts(&mut self, current: &HashMap<String, BindingState>) {
         for process in self.terminal_hosted.iter_mut() {
             if process.nested_under_claude {
                 continue;
@@ -780,7 +777,7 @@ impl TrackingHealthReport {
             let Some(row_session) = process.session_id.as_deref() else {
                 continue;
             };
-            match verdict_of.get(row_session) {
+            match current.get(row_session) {
                 Some(BindingState::Matched) => {
                     process.binding_state = Some(BindingState::Matched);
                 }
@@ -1416,13 +1413,12 @@ pub async fn compute(
     );
     // Each terminal-hosted `claude` is judged as the reconcile pass judged its
     // row (plan `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`)
-    // — from the pane's own records, with the pass's rules, and no read here,
-    // so the `/restart-readiness` verdict path waits on no disk. No fresh pass
-    // (or no oracle) leaves every process unchecked, i.e. today's attribution:
-    // a verdict a stalled pass stored is not served as current.
-    if store.pane_observation_is_fresh() {
-        report.attach_binding_verdicts(&open);
-    }
+    // — from the panes' own records, by the pass's rules, and no read here, so
+    // the `/restart-readiness` verdict path waits on no disk. Only a verdict
+    // the CURRENT observation produced is served: a stalled pass, a verdict
+    // from an older observation or no oracle leaves the process unchecked,
+    // i.e. today's attribution.
+    report.attach_binding_verdicts(&store.current_binding_verdicts());
     report.attach_status_since(session_status_since_by_id);
 
     Some(TrackingHealthPass {
@@ -3274,13 +3270,13 @@ mod tests {
     }
 
     /// Plan `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`,
-    /// Phase 2, as the round-3 review (M1) left it: the circular attribution
-    /// is broken by the verdict the reconcile pass stored for each process's
-    /// row. A `matched` row's process is `matched`; an `unknown` row's is
-    /// ambiguous — `bindingState: unknown`, the row's id withheld, no coord
-    /// status, blocking. A row the pass left unjudged (a pane whose record may
-    /// lag a switch its own process made, say), a row the census has no
-    /// verdict for, and a nested subagent change nothing (never agreement).
+    /// Phase 2: the circular attribution is broken by the verdict the
+    /// reconcile pass stored for each process's row — the CURRENT ones only
+    /// (`current_binding_verdicts`). A `matched` row's process is `matched`;
+    /// an `unknown` row's is ambiguous — `bindingState: unknown`, the row's id
+    /// withheld, no coord status, blocking. A row with no current verdict
+    /// (unjudged, or judged in an older observation, so absent from `current`)
+    /// and a nested subagent change nothing (never agreement).
     #[test]
     fn a_process_is_judged_by_its_rows_stored_verdict() {
         let attributed = |pid: u32, row: &str, nested: bool| LiveClaudeProcess {
@@ -3299,18 +3295,14 @@ mod tests {
             attributed(4, "contradicted-row", true),
             attributed(5, "no-such-row", false),
         ]);
-        let judged =
-            |id: &str, terminal: &str, verdict: Option<BindingState>| TerminalSessionRecord {
-                binding_state: verdict,
-                ..record(id, terminal, 1)
-            };
-        let open = vec![
-            judged("matched-row", "t-1", Some(BindingState::Matched)),
-            judged("contradicted-row", "t-2", Some(BindingState::Unknown)),
-            judged("unjudged-row", "t-3", None),
-        ];
+        let current: HashMap<String, BindingState> = [
+            ("matched-row".to_string(), BindingState::Matched),
+            ("contradicted-row".to_string(), BindingState::Unknown),
+        ]
+        .into_iter()
+        .collect();
 
-        report.attach_binding_verdicts(&open);
+        report.attach_binding_verdicts(&current);
         let p = |pid: u32| {
             report
                 .terminal_hosted

@@ -60,7 +60,7 @@ use tracing::{debug, info, warn};
 
 use crate::session::observation_epoch::{ObservationEpoch, Observed};
 use crate::session::pane_binding::{
-    self, BindingCounters, PaneEvidence, PaneEvidenceOracle, PaneObservation,
+    BindingCounters, PaneEvidence, PaneEvidenceOracle, PaneObservation,
 };
 use crate::session::restore_record_emitter::RestoreRecordEmitter;
 use crate::session::snapshot_history::{SnapshotHistory, SnapshotSession, TranscriptProbe};
@@ -212,10 +212,10 @@ pub const ORIGIN_OBSERVED: &str = "observed";
 pub enum BindingState {
     /// The pane's own `claude` records this session.
     Matched,
-    /// The pane's own `claude` records a DIFFERENT session — a contradiction,
-    /// or (uncounted) the pane's prior tenant after a `/clear` or an in-TUI
-    /// resume the hook recorded. The row's `terminal_id` is not evidenced: no
-    /// surface may label, nudge or close that terminal by this row.
+    /// The session runs in ANOTHER live pane, whose own `claude` records it,
+    /// while this row sits on a pane that does not — the 2026-10-25 shape. The
+    /// row's `terminal_id` is not evidenced: no surface may label, nudge or
+    /// close that terminal by this row.
     Unknown,
 }
 
@@ -231,10 +231,10 @@ pub enum RecordOpenOutcome {
     /// record's terminal. (For a rebind: also a row already current, absent or
     /// closed — nothing to move, nothing refused.)
     Recorded,
-    /// NOT written. Moving the session's row onto the record's terminal would
-    /// have taken it off `held_by`, a live pane that still runs the session —
-    /// or one whose evidence cannot be read while the incoming bind brings no
-    /// proof of its own. Nothing else changes: no row on either pane is marked.
+    /// NOT written. The record is a WEAK bind (not authoritative), and moving
+    /// the session's row onto its terminal would have taken it off `held_by`,
+    /// a live pane whose own `claude` record names the session. Nothing else
+    /// changes: no row on either pane is marked.
     MoveRefused { held_by: String },
     /// NOT written: the registry lock is poisoned.
     Unavailable,
@@ -728,18 +728,22 @@ pub struct TerminalSessionRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmed_at: Option<i64>,
     /// Whether the pane at [`Self::terminal_id`] was last seen running THIS
-    /// session, by its own `claude`'s Claude Code record
-    /// ([`BindingState`]). The store owns it: the reconcile pass writes the
-    /// verdict ([`SessionLifecycleStore::set_binding_state`], see
-    /// [`crate::session::pane_binding::binding_verdicts`]),
+    /// session ([`BindingState`]), by the rules of
+    /// [`crate::session::pane_binding::binding_verdicts`]: `matched` when the
+    /// pane's own `claude` record names it, `unknown` when another live pane's
+    /// record names it. The store owns it: the reconcile pass writes the
+    /// verdict ([`SessionLifecycleStore::set_binding_state`]) and withdraws a
+    /// `matched` its pane no longer evidences
+    /// ([`SessionLifecycleStore::withdraw_matched`]),
     /// [`SessionLifecycleStore::record_open_checked`] sets `matched` when the
     /// bound pane names the session, and a row that MOVES to another terminal
     /// drops it — a verdict is about one pane. Nothing else writes it: a
     /// refused move marks no row, and an incoming record's value is never
-    /// taken.
+    /// taken. Which observation a verdict came from is held beside it, in
+    /// memory ([`SessionLifecycleStore::current_binding_verdicts`]).
     ///
-    /// `None` = never checked: no readable evidence yet, or the row moved since
-    /// its last check. Not a verdict, and never read as agreement.
+    /// `None` = not checked: no verdict from the latest evidence, or the row
+    /// moved since its last check. Not a verdict, and never read as agreement.
     /// `#[serde(default)]`: rows written before the field load as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding_state: Option<BindingState>,
@@ -1001,11 +1005,7 @@ pub struct TerminalSessionRecord {
     /// process last started (or resumed into) its terminal. The durable half of
     /// [`SessionLifecycleStore::latest_open_on_terminal`]'s ranking, so a pane
     /// whose operator ran `/resume` still resolves to the resumed session after
-    /// a restart that keeps its terminal (a holder handoff). `None` = no hook
-    /// seen, the record predates the field, or the row has MOVED since: a stamp
-    /// describes a start on ONE terminal, so a move drops it (the hook route
-    /// re-stamps the moves it makes), which is what keeps the lag rule
-    /// ([`crate::session::pane_binding::record_may_lag`]) pane-local.
+    /// a restart. `None` = no hook seen, or the record predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_session_start_at: Option<i64>,
     /// The `coord.gates` row this session is a continuation of — the same value
@@ -1344,6 +1344,12 @@ pub struct SessionLifecycleStore {
     /// [`BindingCounters::global`], the counters `/health` serves; a test
     /// attaches its own ([`Self::attach_binding_counters`]).
     binding_counters: OnceLock<Arc<BindingCounters>>,
+    /// The pane-observation epoch each stored binding verdict was taken in, by
+    /// session id ([`Self::current_binding_verdicts`]). Process-local: an
+    /// epoch means nothing to another process, so a verdict loaded from disk
+    /// carries none and is never current. Lock order: `map` →
+    /// `verdict_epochs`.
+    verdict_epochs: Mutex<HashMap<String, u64>>,
     /// Serializes [`Self::set_finished`] END TO END — the map mutation AND the
     /// finish-observer hand-off — so the order coord's outbox receives
     /// finished / working rows in is the order the local marker changed in.
@@ -1564,6 +1570,7 @@ impl SessionLifecycleStore {
             declared_moves: Mutex::new(HashMap::new()),
             refused_episodes: Mutex::new(HashMap::new()),
             binding_counters: OnceLock::new(),
+            verdict_epochs: Mutex::new(HashMap::new()),
             finish_forward: Mutex::new(()),
         };
         if replay.applied > 0 || replay.damaged {
@@ -1675,11 +1682,10 @@ impl SessionLifecycleStore {
     }
 
     /// Hand the attached oracle a reconcile pass's observation of the live
-    /// panes. No-op without an oracle.
-    pub fn observe_panes(&self, observation: PaneObservation) {
-        if let Some(oracle) = self.pane_evidence.get() {
-            oracle.observe(observation);
-        }
+    /// panes. Returns the epoch the oracle gave it — what the verdicts taken
+    /// from it are tagged with. `None` without an oracle.
+    pub fn observe_panes(&self, observation: PaneObservation) -> Option<u64> {
+        self.pane_evidence.get()?.observe(observation)
     }
 
     /// What `terminal_id`'s pane records, per the attached oracle.
@@ -1695,34 +1701,6 @@ impl SessionLifecycleStore {
         }
     }
 
-    /// [`Self::pane_evidence_of`] after the lag rule
-    /// ([`crate::session::pane_binding::record_may_lag`]), judged against the
-    /// rows in `m` (the caller holds the map) and the pane's current `claude`
-    /// start: a record naming a session a switch the pane's own process made
-    /// may have left behind is [`PaneEvidence::Unknown`], never `Names` — so it
-    /// refuses only a weak move (as any unreadable pane does), and neither
-    /// spares a sibling nor marks a row `matched` on the strength of what may
-    /// be a stale record.
-    fn effective_pane_evidence(
-        &self,
-        m: &HashMap<String, TerminalSessionRecord>,
-        terminal_id: &str,
-    ) -> PaneEvidence {
-        match self.pane_evidence_of(terminal_id) {
-            PaneEvidence::Names(named)
-                if pane_binding::record_may_lag(
-                    m.values(),
-                    terminal_id,
-                    &named,
-                    self.pane_started_ms(terminal_id),
-                ) =>
-            {
-                PaneEvidence::Unknown
-            }
-            evidence => evidence,
-        }
-    }
-
     /// Every live pane whose own `claude` records `session_id`, per the
     /// attached oracle. Empty without one.
     pub(crate) fn panes_naming(&self, session_id: &str) -> Vec<String> {
@@ -1732,20 +1710,56 @@ impl SessionLifecycleStore {
             .unwrap_or_default()
     }
 
-    /// When `terminal_id`'s current top-level `claude` started (millis), per the
-    /// attached oracle's fresh observation — what the lag rule places a switch
-    /// inside. `None` without an oracle, a fresh observation, or a known start.
-    pub(crate) fn pane_started_ms(&self, terminal_id: &str) -> Option<i64> {
-        self.pane_evidence.get()?.pane_started_ms(terminal_id)
+    /// The epoch of the attached oracle's latest observation while it is
+    /// fresh — the one a verdict must carry to be current. `None` without an
+    /// oracle or a fresh observation.
+    pub(crate) fn pane_epoch(&self) -> Option<u64> {
+        self.pane_evidence.get()?.current_epoch()
     }
 
-    /// Whether the attached oracle holds a fresh observation — whether the
-    /// verdicts the reconcile pass stored on the rows are current. `false`
-    /// without an oracle.
-    pub(crate) fn pane_observation_is_fresh(&self) -> bool {
-        self.pane_evidence
-            .get()
-            .is_some_and(|oracle| oracle.has_fresh_observation())
+    /// The verdict of every open row whose verdict the CURRENT observation
+    /// produced — tagged with [`Self::pane_epoch`] — by session id. A verdict
+    /// from an older observation (a stalled pass, a previous process, an
+    /// `unknown` rule 3 kept) is not in it: its reader serves it as unchecked.
+    /// Empty without a fresh observation.
+    pub fn current_binding_verdicts(&self) -> HashMap<String, BindingState> {
+        let Some(epoch) = self.pane_epoch() else {
+            return HashMap::new();
+        };
+        let m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on current_binding_verdicts");
+                return HashMap::new();
+            }
+        };
+        let Ok(epochs) = self.verdict_epochs.lock() else {
+            return HashMap::new();
+        };
+        m.values()
+            .filter(|r| r.state == "open")
+            .filter_map(|r| {
+                let state = r.binding_state?;
+                (epochs.get(&r.claude_session_id) == Some(&epoch))
+                    .then(|| (r.claude_session_id.clone(), state))
+            })
+            .collect()
+    }
+
+    /// Record which observation `claude_session_id`'s verdict came from —
+    /// `None`, none (it is then never current). The caller holds `map`: lock
+    /// order `map` → `verdict_epochs`.
+    fn tag_verdict(&self, claude_session_id: &str, epoch: Option<u64>) {
+        if let Ok(mut epochs) = self.verdict_epochs.lock() {
+            match epoch {
+                Some(epoch) => {
+                    epochs.insert(claude_session_id.to_string(), epoch);
+                }
+                None => {
+                    epochs.remove(claude_session_id);
+                }
+            }
+        }
     }
 
     /// Count this store's binding mismatches and refused moves into `counters`
@@ -1973,12 +1987,15 @@ impl SessionLifecycleStore {
     /// through here, and a binder can be wrong: on 2026-10-25 one pane's row
     /// came to name the session a live peer pane ran (which binder did it is
     /// UNKNOWN; reconcile rung 3 is one that can — see
-    /// [`crate::session::pane_binding`]). So a move is checked against the pane
-    /// it would leave ([`Self::move_refusal_locked`]) — under the same registry
-    /// lock as the write, so nothing can move the row in between — and refused
-    /// when that pane still runs the session: [`RecordOpenOutcome::MoveRefused`],
+    /// [`crate::session::pane_binding`]). So a WEAK move — a record that is not
+    /// authoritative — is checked against the pane it would leave
+    /// ([`Self::move_refusal_locked`]), under the same registry lock as the
+    /// write so nothing can move the row in between, and refused when that
+    /// pane's own record names the session: [`RecordOpenOutcome::MoveRefused`],
     /// nothing written and nothing marked. A refused move is logged and counted
-    /// once per (session, pane) episode.
+    /// once per (session, pane) episode. A strong (authoritative) record always
+    /// proceeds — the SessionStart hook route, a pinned spawn, a migration's
+    /// respawn — and the next reconcile pass judges where it landed.
     ///
     /// Every other record is written. The row's
     /// [`TerminalSessionRecord::binding_state`] is the store's own: never taken
@@ -2077,7 +2094,7 @@ impl SessionLifecycleStore {
                 &m,
                 &new_id,
                 &new_terminal_id,
-                new_is_authoritative || new_is_confirmed,
+                new_is_authoritative,
                 rec.config_dir.as_deref(),
             ) {
                 drop(m);
@@ -2085,10 +2102,8 @@ impl SessionLifecycleStore {
                 return RecordOpenOutcome::MoveRefused { held_by };
             }
             // What the bound pane's own `claude` records — for the bind-time
-            // `matched` and for sparing the sibling it runs — after the lag
-            // rule: a record a switch the pane's own process made may have
-            // left behind names nothing.
-            let pane = self.effective_pane_evidence(&m, &new_terminal_id);
+            // `matched` and for sparing the sibling it runs.
+            let pane = self.pane_evidence_of(&new_terminal_id);
             // The terminal the row held before this write, if it existed — a
             // binding verdict is about ONE pane, so a move drops it.
             let previous_terminal = m.get(&new_id).map(|r| r.terminal_id.clone());
@@ -2142,23 +2157,22 @@ impl SessionLifecycleStore {
             }
             // The binding verdict (`binding_state`) is the store's own: never
             // taken from the incoming record (normalized away above), dropped
-            // when the row changes pane, and `matched` when the bound pane's
-            // own `claude` names this session. A bind never writes `unknown`:
-            // the pane's record may lag the very switch this bind reports, and
-            // the reconcile pass judges a contradiction with every pane in view.
+            // when the row changes pane, and `matched` — tagged with the
+            // oracle's current epoch, the observation it rests on — when the
+            // bound pane's own `claude` names this session. A bind never writes
+            // `unknown`: that takes every pane in view, which the reconcile
+            // pass has.
             if previous_terminal
                 .as_deref()
                 .is_some_and(|t| t != entry.terminal_id)
             {
                 entry.binding_state = None;
-                // A hook stamp describes a start on the terminal the row is
-                // leaving (the hook route re-stamps the moves it makes).
-                entry.last_session_start_at = None;
             }
             if entry.terminal_id == new_terminal_id
                 && pane.named_session() == Some(entry.claude_session_id.as_str())
             {
                 entry.binding_state = Some(BindingState::Matched);
+                self.tag_verdict(&new_id, self.pane_epoch());
             }
             entry.provider = rec.provider;
             // Unasserted origin (zone-move backstop / boot re-assert) must not
@@ -2301,15 +2315,12 @@ impl SessionLifecycleStore {
             // phantom or a finished tenant, whatever this bind says: it is
             // spared (plan
             // `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`).
-            // If it is THIS pane's, the bind is the suspect one — the pane's
-            // record may lag a hook, and the next pass re-judges both rows; if
-            // it is another pane's, its row belongs there, not in the closed
-            // set.
+            // If it is THIS pane's, the bind is the suspect one, and the next
+            // pass judges both rows; if it is another pane's, its row belongs
+            // there, not in the closed set.
             let mut superseded: Vec<TerminalSessionRecord> = Vec::new();
             if (new_is_authoritative || new_is_confirmed) && !new_terminal_id.is_empty() {
-                // The siblings some live pane's own record names — another
-                // pane's only when that record may not lag a switch its own
-                // process made (the lag rule, as for the bound pane above).
+                // The siblings some live pane's own record names.
                 let spared: HashSet<String> = m
                     .values()
                     .filter(|o| {
@@ -2319,15 +2330,7 @@ impl SessionLifecycleStore {
                     })
                     .filter(|o| {
                         let id = o.claude_session_id.as_str();
-                        pane.named_session() == Some(id)
-                            || self.panes_naming(id).iter().any(|terminal| {
-                                !pane_binding::record_may_lag(
-                                    m.values(),
-                                    terminal,
-                                    id,
-                                    self.pane_started_ms(terminal),
-                                )
-                            })
+                        pane.named_session() == Some(id) || !self.panes_naming(id).is_empty()
                     })
                     .map(|o| o.claude_session_id.clone())
                     .collect();
@@ -2408,20 +2411,13 @@ impl SessionLifecycleStore {
 
     /// The binding guard, run while the caller holds the registry lock (`m`).
     /// `Some(old_terminal)` when writing `session_id` onto `new_terminal` would
-    /// MOVE its open row off `old_terminal` while that pane still runs it:
-    ///
-    /// - the old pane's own `claude` records the session → refused, whatever
-    ///   the incoming bind;
-    /// - the old pane's evidence cannot be read ([`PaneEvidence::Unknown`]) —
-    ///   including a record that may LAG a switch the pane's own process made,
-    ///   as the store knows it ([`Self::effective_pane_evidence`]) → refused
-    ///   only for a
-    ///   WEAK incoming bind (neither authoritative nor
-    ///   confirmed: a transcript-mtime guess, a provisional typed-resume sniff,
-    ///   a restore rebind). A weak bind is no reason to take a row from a pane
-    ///   that may be running it; a strong one keeps the pre-guard behaviour;
-    /// - the old pane runs nothing, or another session, or is not a live pane
-    ///   → allowed.
+    /// MOVE its open row off `old_terminal`, a live pane whose own `claude`
+    /// record names the session, by a WEAK bind — one that is not
+    /// authoritative (`incoming_strong` false): a transcript correlation, an
+    /// mtime fallback, a restore rebind, a provisional typed-resume sniff. A
+    /// strong bind is never refused; neither is a move off a pane that runs
+    /// nothing, runs another session, cannot be read ([`PaneEvidence::Unknown`]
+    /// names nothing) or is not live.
     ///
     /// A move declared through [`Self::declare_move`] — the same session, off
     /// the same terminal, by a bind carrying the declared account
@@ -2437,8 +2433,8 @@ impl SessionLifecycleStore {
         incoming_strong: bool,
         incoming_config_dir: Option<&str>,
     ) -> Option<String> {
-        if new_terminal.trim().is_empty() {
-            return None; // a blank incoming terminal never moves a row
+        if incoming_strong || new_terminal.trim().is_empty() {
+            return None; // a strong bind proceeds; a blank terminal moves nothing
         }
         let row = m.get(session_id)?;
         if row.state != "open"
@@ -2450,11 +2446,7 @@ impl SessionLifecycleStore {
         let old_terminal = row.terminal_id.as_str();
         // No oracle attached: no evidence, so nothing is refused.
         self.pane_evidence.get()?;
-        let refused = match self.effective_pane_evidence(m, old_terminal) {
-            PaneEvidence::Names(id) => id == session_id,
-            PaneEvidence::Unknown => !incoming_strong,
-            PaneEvidence::NoClaude => false,
-        };
+        let refused = self.pane_evidence_of(old_terminal).named_session() == Some(session_id);
         if !refused || self.take_declared_move(session_id, old_terminal, incoming_config_dir) {
             return None;
         }
@@ -2550,16 +2542,20 @@ impl SessionLifecycleStore {
         matches
     }
 
-    /// Record a binding verdict for `claude_session_id`'s row — only while that
-    /// row is still open on `terminal_id`, the pane the verdict is about.
-    /// Returns the PREVIOUS state when the verdict applied (written only on a
-    /// change), `None` when it did not (the row is gone, closed, or moved since
-    /// the verdict was taken; or the lock is poisoned).
+    /// Record a binding verdict for `claude_session_id`'s row, taken from the
+    /// pane observation numbered `epoch` — only while that row is still open
+    /// on `terminal_id`, the pane the verdict is about. The epoch is recorded
+    /// every time, so a verdict re-taken unchanged becomes current again
+    /// ([`Self::current_binding_verdicts`]). Returns the PREVIOUS state when the
+    /// verdict applied (the row written only on a change), `None` when it did
+    /// not (the row is gone, closed, or moved since the verdict was taken; or
+    /// the lock is poisoned).
     pub fn set_binding_state(
         &self,
         claude_session_id: &str,
         terminal_id: &str,
         state: BindingState,
+        epoch: Option<u64>,
     ) -> Option<Option<BindingState>> {
         let mut m = match self.map.lock() {
             Ok(m) => m,
@@ -2572,6 +2568,7 @@ impl SessionLifecycleStore {
         if !open_on_terminal(row, terminal_id) {
             return None;
         }
+        self.tag_verdict(claude_session_id, epoch);
         let previous = row.binding_state;
         if previous != Some(state) {
             row.binding_state = Some(state);
@@ -2588,41 +2585,33 @@ impl SessionLifecycleStore {
         Some(previous)
     }
 
-    /// Withdraw a `matched` the pane no longer evidences: `claude_session_id`'s
-    /// row, still open on `terminal_id` and reading `matched`, whose pane's
-    /// record names it but may lag a switch that pane's process made
-    /// ([`crate::session::pane_binding::record_may_lag`]). The condition is
-    /// re-checked HERE, under the registry lock, against the rows as they are
-    /// now — a `matched` a bind wrote after the reconcile pass took its snapshot
-    /// is not wiped. An `unknown` is never withdrawn: that would only let the
-    /// same contradiction be counted again. Returns whether it withdrew one.
-    pub fn withdraw_lagging_matched(&self, claude_session_id: &str, terminal_id: &str) -> bool {
+    /// Rule 3 of [`crate::session::pane_binding::binding_verdicts`]: withdraw a
+    /// `matched` no live pane evidences any more — `claude_session_id`'s row,
+    /// still open on `terminal_id` and reading `matched`, whose pane's own
+    /// record (the oracle's, now) does not name it. Re-checked HERE, under the
+    /// registry lock, against the row as it is now: a `matched` a bind wrote
+    /// after the reconcile pass took its snapshot is not wiped. An `unknown`
+    /// is never withdrawn: that would only let the same episode be counted
+    /// again. Returns whether it withdrew one.
+    pub fn withdraw_matched(&self, claude_session_id: &str, terminal_id: &str) -> bool {
         let mut m = match self.map.lock() {
             Ok(m) => m,
             Err(e) => {
-                warn!(error = %e, "session_lifecycle_store: lock poisoned on withdraw_lagging_matched");
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on withdraw_matched");
                 return false;
             }
         };
-        let names_it =
-            self.pane_evidence_of(terminal_id).named_session() == Some(claude_session_id);
-        let lagging = names_it
-            && pane_binding::record_may_lag(
-                m.values(),
-                terminal_id,
-                claude_session_id,
-                self.pane_started_ms(terminal_id),
-            );
+        if self.pane_evidence_of(terminal_id).named_session() == Some(claude_session_id) {
+            return false;
+        }
         let Some(row) = m.get_mut(claude_session_id) else {
             return false;
         };
-        if !lagging
-            || !open_on_terminal(row, terminal_id)
-            || row.binding_state != Some(BindingState::Matched)
-        {
+        if !open_on_terminal(row, terminal_id) || row.binding_state != Some(BindingState::Matched) {
             return false;
         }
         row.binding_state = None;
+        self.tag_verdict(claude_session_id, None);
         let changed = row.clone();
         self.persist(
             m,
@@ -3172,9 +3161,9 @@ impl SessionLifecycleStore {
     /// The same binding guard as [`Self::record_open_checked`], under the same
     /// lock as the write. A rebind carries no evidence of its own (it re-points
     /// a restored row at the tab the frontend made for it), so it is a WEAK
-    /// bind: it never takes a row from a live pane that still runs the session
-    /// or cannot be read — [`RecordOpenOutcome::MoveRefused`]. After a restart
-    /// the old pane is gone and the rebind goes through. Every no-op answers
+    /// bind: it never takes a row from a live pane whose own record names the
+    /// session — [`RecordOpenOutcome::MoveRefused`]. After a restart the old
+    /// pane is gone and the rebind goes through. Every no-op answers
     /// [`RecordOpenOutcome::Recorded`]: nothing was refused.
     pub fn rebind_terminal_checked(
         &self,
@@ -3218,9 +3207,8 @@ impl SessionLifecycleStore {
                 return RecordOpenOutcome::Recorded; // already current — no write, no flush
             }
             if rec.terminal_id != terminal_id {
-                // A binding verdict, and a hook stamp, are about one pane.
+                // A binding verdict is about one pane.
                 rec.binding_state = None;
-                rec.last_session_start_at = None;
             }
             rec.terminal_id = terminal_id.to_string();
             rec.zone_index = zone_index;
@@ -8826,17 +8814,21 @@ mod tests {
         assert_eq!(counters.refused_moves(), 2);
     }
 
-    /// The moves the guard ALLOWS — and the one it refuses for a weak bind. A
-    /// moved row drops its old verdict: a verdict is about one pane.
+    /// The moves the guard ALLOWS — every strong bind, and every weak one off
+    /// a pane whose record does not name the session, unreadable included —
+    /// and the one it refuses: a weak bind off a pane whose own record names
+    /// the session. A moved row drops its old verdict: a verdict is about one
+    /// pane.
     #[test]
-    fn record_open_moves_a_row_off_a_pane_that_does_not_vouch_for_it() {
+    fn record_open_refuses_only_a_weak_move_off_a_pane_whose_record_names_it() {
         // (old pane's evidence, incoming is strong?, moved?)
         let cases = [
             (PaneEvidence::NoClaude, false, true),
             (names("another-session"), false, true),
+            (PaneEvidence::Unknown, false, true),
             (PaneEvidence::Unknown, true, true),
-            (PaneEvidence::Unknown, false, false),
-            (names("s"), true, false),
+            (names("s"), true, true),
+            (names("s"), false, false),
         ];
         for (old_pane, strong, moved) in cases {
             let dir = tempdir().unwrap();
@@ -8844,7 +8836,7 @@ mod tests {
             let mut original = rec("s");
             original.terminal_id = "term-old".to_string();
             store.record_open(original);
-            let _ = store.set_binding_state("s", "term-old", BindingState::Matched);
+            let _ = store.set_binding_state("s", "term-old", BindingState::Matched, None);
 
             let mut incoming = rec("s");
             incoming.terminal_id = "term-new".to_string();
@@ -8887,19 +8879,25 @@ mod tests {
         }
     }
 
+    /// A WEAK bind onto `terminal` carrying `config_dir` — what the guard can
+    /// refuse.
+    fn weak_on(id: &str, terminal: &str, config_dir: &str) -> TerminalSessionRecord {
+        let mut r = auth_on(id, terminal);
+        r.origin = Some(ORIGIN_RECONCILED.to_string());
+        r.config_dir = Some(config_dir.to_string());
+        r
+    }
+
     /// A declared move is ONE exact move — this session, off this terminal, by
     /// a bind carrying the declared account — consumed by the bind, and
-    /// withdrawn when its guard drops unconsumed.
+    /// withdrawn when its guard drops unconsumed. (Only a weak bind needs one:
+    /// a strong bind is never refused.)
     #[test]
     fn a_move_declaration_is_exact_consumed_and_withdrawn_on_drop() {
         let dir = tempdir().unwrap();
         let (store, _counters) = guarded_store(dir.path(), &[("term-old", names("s"))]);
         store.record_open(auth_on("s", "term-old"));
-        let onto_new = |config_dir: &str| {
-            let mut r = auth_on("s", "term-new");
-            r.config_dir = Some(config_dir.to_string());
-            r
-        };
+        let onto_new = |config_dir: &str| weak_on("s", "term-new", config_dir);
 
         // Withdrawn on drop: the guard is back in force.
         drop(store.declare_move("s", "term-old", "C:/dst"));
@@ -8939,16 +8937,16 @@ mod tests {
         let first = store.declare_move("s", "term-old", "C:/dst");
         let _second = store.declare_move("s", "term-old", "C:/dst");
         drop(first);
-        let mut onto_new = auth_on("s", "term-new");
-        onto_new.config_dir = Some("C:/dst".to_string());
-        assert!(store.record_open_checked(onto_new).is_recorded());
+        assert!(store
+            .record_open_checked(weak_on("s", "term-new", "C:/dst"))
+            .is_recorded());
     }
 
     /// Bind-time verdict: a record bound onto a pane whose own `claude` names
-    /// THIS session reads `matched` at once. A bind never reads `unknown` —
-    /// the pane's record may lag the very switch the bind reports; the
-    /// reconcile pass judges contradictions. An incoming record's own
-    /// `binding_state` is never taken.
+    /// THIS session reads `matched` at once, tagged with the oracle's epoch. A
+    /// bind never reads `unknown` — that takes every pane in view, which the
+    /// reconcile pass has. An incoming record's own `binding_state` is never
+    /// taken.
     #[test]
     fn record_open_marks_a_bind_matched_only_when_its_pane_names_it() {
         let dir = tempdir().unwrap();
@@ -8968,6 +8966,11 @@ mod tests {
         assert_eq!(
             store.get("s-a").unwrap().binding_state,
             Some(BindingState::Matched)
+        );
+        assert_eq!(
+            store.current_binding_verdicts().get("s-a"),
+            Some(&BindingState::Matched),
+            "the bind-time verdict is the current observation's"
         );
         // No evidence for a pane: no verdict.
         store.record_open(auth_on("s-c", "term-c"));
@@ -9023,7 +9026,7 @@ mod tests {
         assert!(store.find_confirmed_open_by_terminal("term-a").is_some());
 
         assert_eq!(
-            store.set_binding_state("s-b", "term-a", BindingState::Unknown),
+            store.set_binding_state("s-b", "term-a", BindingState::Unknown, None),
             Some(None),
             "applied; the row was unchecked before"
         );
@@ -9044,25 +9047,25 @@ mod tests {
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
         store.record_open(auth_on("s", "term-a"));
         assert_eq!(
-            store.set_binding_state("s", "term-b", BindingState::Matched),
+            store.set_binding_state("s", "term-b", BindingState::Matched, None),
             None
         );
         assert_eq!(
-            store.set_binding_state("absent", "term-a", BindingState::Matched),
+            store.set_binding_state("absent", "term-a", BindingState::Matched, None),
             None
         );
         assert_eq!(
-            store.set_binding_state("s", "term-a", BindingState::Matched),
+            store.set_binding_state("s", "term-a", BindingState::Matched, None),
             Some(None)
         );
         assert_eq!(
-            store.set_binding_state("s", "term-a", BindingState::Matched),
+            store.set_binding_state("s", "term-a", BindingState::Matched, None),
             Some(Some(BindingState::Matched)),
             "a repeat reports the state it found"
         );
         store.record_close("s", "explicit");
         assert_eq!(
-            store.set_binding_state("s", "term-a", BindingState::Unknown),
+            store.set_binding_state("s", "term-a", BindingState::Unknown, None),
             None
         );
     }
@@ -9096,132 +9099,107 @@ mod tests {
         );
     }
 
-    /// Review M2 (round 2) and M1 (round 3): the guard applies the lag rule.
-    /// Pane A's hook recorded `s2` starting after `s`, inside A's current
-    /// process, by a `/clear` — but A's record still names `s`. When the
-    /// operator resumes `s` in pane B, B's hook moves `s` there: a record that
-    /// may lag refuses no strong bind, and a `matched` it no longer evidences
-    /// is withdrawn. Then B's hook re-stamps `s` on B — and the next pass still
-    /// reads A's record as lagging, so `s2`, A's real session, is never counted
-    /// as a mismatch. Without the newer row the same record refuses the move.
+    /// The census reads only CURRENT verdicts: tagged with the epoch of the
+    /// oracle's latest fresh observation. A verdict from an older observation
+    /// — the pass has not judged since, or it came off disk — reads as
+    /// unchecked; re-judging it makes it current again.
     #[test]
-    fn a_record_that_may_lag_a_hook_reported_switch_refuses_no_move() {
+    fn only_a_verdict_from_the_current_observation_is_current() {
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
-        // Both panes' current claude started at 50; both records name `s`.
-        store.attach_pane_evidence(FixedPanes::of_started(
-            &[("term-a", names("s")), ("term-b", names("s"))],
-            &[("term-a", 50), ("term-b", 50)],
-        ));
-        let counters = Arc::new(BindingCounters::default());
-        store.attach_binding_counters(counters.clone());
-        // `s` started on A (its hook stamped the start and confirmed it).
-        let mut s_on_a = auth_on("s", "term-a");
-        s_on_a.last_session_start_at = Some(100);
-        s_on_a.confirmed_at = Some(100);
-        store.record_open(s_on_a);
-        assert_eq!(
-            store.get("s").unwrap().binding_state,
-            Some(BindingState::Matched)
-        );
-        assert_eq!(
-            store.record_open_checked(auth_on("s", "term-b")),
-            RecordOpenOutcome::MoveRefused {
-                held_by: "term-a".to_string()
-            },
-            "precondition: with no newer row the record holds s on A"
-        );
+        let registry = Arc::new(crate::session::pane_binding::LivePaneRegistry::new());
+        store.attach_pane_evidence(registry.clone());
+        store.record_open(auth_on("s", "term-a"));
         assert!(
-            !store.withdraw_lagging_matched("s", "term-a"),
-            "nothing lags yet"
+            store.current_binding_verdicts().is_empty(),
+            "no observation yet"
         );
 
-        // `/clear` on A: the hook records s2 (unconfirmed, as the hook route
-        // writes it), confirms it, stamps it and marks what it continued.
-        let mut s2_on_a = auth_on("s2", "term-a");
-        s2_on_a.last_session_start_at = Some(200);
-        store.record_open(s2_on_a);
-        store.confirm_session("s2");
-        store.mark_adopted_from("s2", "s");
-        assert!(
-            store.withdraw_lagging_matched("s", "term-a"),
-            "the `matched` taken before the switch is withdrawn"
-        );
-        // A provisional re-record of s on A marks nothing matched: the record
-        // naming s may lag the switch.
-        let mut again = auth_on("s", "term-a");
-        again.origin = None;
-        store.record_open(again);
-        assert_eq!(store.get("s").unwrap().binding_state, None);
-
+        let first = store.observe_panes(PaneObservation::default());
         assert_eq!(
-            store.record_open_checked(auth_on("s", "term-b")),
-            RecordOpenOutcome::Recorded,
-            "B's hook takes s: A's record is evidence of nothing"
+            store.set_binding_state("s", "term-a", BindingState::Matched, first),
+            Some(None)
         );
-        let moved = store.get("s").unwrap();
-        assert_eq!(moved.terminal_id, "term-b");
         assert_eq!(
-            moved.last_session_start_at, None,
-            "a move drops the stamp taken on A"
+            store.current_binding_verdicts().get("s"),
+            Some(&BindingState::Matched)
         );
-        assert_eq!(store.get("s2").unwrap().state, "open");
-        // B's hook route re-stamps the move it made.
-        store.note_session_start_hook("s");
 
-        // The next pass: A's record still names s, and still lags (s2 was
-        // adopted from s, inside A's process) — s2 is judged on nothing.
-        let evidence: HashMap<String, PaneEvidence> = [
-            ("term-a".to_string(), names("s")),
-            ("term-b".to_string(), names("s")),
-        ]
-        .into_iter()
-        .collect();
-        let verdicts =
-            pane_binding::binding_verdicts(&store.open_records(), &evidence, &|_| Some(50));
+        let second = store.observe_panes(PaneObservation::default());
+        assert_ne!(first, second);
         assert!(
-            verdicts.iter().all(|v| v.claude_session_id != "s2"),
-            "{verdicts:?}"
+            store.current_binding_verdicts().is_empty(),
+            "a verdict from an older observation is not served"
         );
-        pane_binding::apply_binding_verdicts(&store, &verdicts);
         assert_eq!(
             store.get("s").unwrap().binding_state,
             Some(BindingState::Matched),
-            "s is matched where it now runs"
+            "the row keeps it; only its currency lapsed"
         );
-        assert_eq!(store.get("s2").unwrap().binding_state, None);
-        assert_eq!(counters.mismatches(), 0);
-        assert_eq!(counters.refused_moves(), 1);
+        let _ = store.set_binding_state("s", "term-a", BindingState::Matched, second);
+        assert_eq!(
+            store.current_binding_verdicts().get("s"),
+            Some(&BindingState::Matched)
+        );
+
+        // A verdict stored with no epoch is never current, and a reload
+        // carries none.
+        let _ = store.set_binding_state("s", "term-a", BindingState::Unknown, None);
+        assert!(store.current_binding_verdicts().is_empty());
+        let _ = store.set_binding_state("s", "term-a", BindingState::Unknown, second);
+        drop(store);
+        let reloaded = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        reloaded.attach_pane_evidence(registry);
+        assert_eq!(
+            reloaded.get("s").unwrap().binding_state,
+            Some(BindingState::Unknown)
+        );
+        assert!(reloaded.current_binding_verdicts().is_empty());
     }
 
-    /// Round-3 review H1: a hook stamp describes a start on ONE terminal, so a
-    /// move — a bind or a restore rebind — drops it, and no row that moved onto
-    /// a pane can make that pane's record read as lagging.
+    /// Rule 3's withdrawal is re-checked under the registry lock: it takes a
+    /// `matched` off a row its pane's record no longer names, never one the
+    /// pane names now (a bind that landed after the pass's snapshot), never an
+    /// `unknown`, and never a row that moved or closed.
     #[test]
-    fn a_move_drops_the_hook_stamp_taken_on_the_terminal_it_leaves() {
+    fn withdraw_matched_takes_only_a_matched_its_pane_no_longer_names() {
         let dir = tempdir().unwrap();
-        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
-        let mut bound = auth_on("bound", "term-old");
-        bound.last_session_start_at = Some(100);
-        store.record_open(bound);
-        let mut rebound = auth_on("rebound", "term-old-2");
-        rebound.last_session_start_at = Some(100);
-        store.record_open(rebound);
-
-        store.record_open(auth_on("bound", "term-new"));
-        assert_eq!(store.get("bound").unwrap().last_session_start_at, None);
-        assert_eq!(
-            store.rebind_terminal_checked("rebound", "term-new-2", 0),
-            RecordOpenOutcome::Recorded
+        let (store, _counters) = guarded_store(
+            dir.path(),
+            &[
+                ("term-a", names("named")),
+                ("term-b", PaneEvidence::NoClaude),
+            ],
         );
-        assert_eq!(store.get("rebound").unwrap().last_session_start_at, None);
+        store.record_open(auth_on("named", "term-a"));
+        assert_eq!(
+            store.get("named").unwrap().binding_state,
+            Some(BindingState::Matched)
+        );
+        assert!(
+            !store.withdraw_matched("named", "term-a"),
+            "the pane names it now"
+        );
 
-        // A re-record in place keeps it.
-        store.note_session_start_hook("bound");
-        let stamped = store.get("bound").unwrap().last_session_start_at;
-        assert!(stamped.is_some());
-        store.record_open(auth_on("bound", "term-new"));
-        assert_eq!(store.get("bound").unwrap().last_session_start_at, stamped);
+        store.record_open(auth_on("gone", "term-b"));
+        let _ = store.set_binding_state("gone", "term-b", BindingState::Matched, Some(0));
+        assert!(
+            !store.withdraw_matched("gone", "term-elsewhere"),
+            "not open there"
+        );
+        assert!(store.withdraw_matched("gone", "term-b"));
+        assert_eq!(store.get("gone").unwrap().binding_state, None);
+        assert!(!store.current_binding_verdicts().contains_key("gone"));
+
+        let _ = store.set_binding_state("gone", "term-b", BindingState::Unknown, Some(0));
+        assert!(
+            !store.withdraw_matched("gone", "term-b"),
+            "an unknown is kept"
+        );
+        assert_eq!(
+            store.get("gone").unwrap().binding_state,
+            Some(BindingState::Unknown)
+        );
     }
 
     /// Review L4: a row its pane contradicts never outranks one it does not,
@@ -9250,8 +9228,8 @@ mod tests {
             Some("contradicted".to_string()),
             "precondition: by hook order alone it wins"
         );
-        let _ = store.set_binding_state("contradicted", "term-a", BindingState::Unknown);
-        let _ = store.set_binding_state("matched", "term-a", BindingState::Matched);
+        let _ = store.set_binding_state("contradicted", "term-a", BindingState::Unknown, None);
+        let _ = store.set_binding_state("matched", "term-a", BindingState::Matched, None);
         assert_eq!(
             store
                 .find_open_by_terminal("term-a")
@@ -9267,13 +9245,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
         store.record_open(auth_on("s", "term-a"));
-        let _ = store.set_binding_state("s", "term-a", BindingState::Unknown);
+        let _ = store.set_binding_state("s", "term-a", BindingState::Unknown, None);
         store.record_close("s", "explicit");
         let closed = store.get("s").unwrap();
         assert_eq!(closed.state, "closed");
         assert_eq!(closed.binding_state, None);
         assert!(
-            !store.withdraw_lagging_matched("s", "term-a"),
+            !store.withdraw_matched("s", "term-a"),
             "nothing to withdraw on a closed row"
         );
     }
@@ -9287,7 +9265,7 @@ mod tests {
         {
             let store = SessionLifecycleStore::open(&path).unwrap();
             store.record_open(auth_on("s", "term-a"));
-            store.set_binding_state("s", "term-a", BindingState::Matched);
+            store.set_binding_state("s", "term-a", BindingState::Matched, None);
             store.compact();
         }
         let reopened = SessionLifecycleStore::open(&path).unwrap();
