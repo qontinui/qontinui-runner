@@ -131,12 +131,13 @@ detail() {
 }
 
 # run_case <name> <accept> [pr-number]  -> sets RC, OUT (log), REF, SHA, SOURCE
+# $PIN, when set, is the pin-file input (relative to $FIX, the workspace root).
 run_case() {
   local out_file="$FIX/github_output"
   : > "$out_file"
   set +e
   OUT="$(env GH_TOKEN=x PR_NUMBER="${3-$PR}" THIS_REPO="$THIS" SIBLING_REPO="$SIB" \
-           ACCEPT_TRAILING="$2" PIN_FILE='' GITHUB_OUTPUT="$out_file" \
+           ACCEPT_TRAILING="$2" PIN_FILE="${PIN:-}" GITHUB_OUTPUT="$out_file" \
            GITHUB_WORKSPACE="$FIX" GITHUB_ACTION_PATH="$FIX" \
            bash "$step" 2>&1)"
   RC=$?
@@ -319,6 +320,61 @@ jq -c '. + [{number: 266, labels: [{name: "coord:downstream-of=qontinui-runner#1
 detail 266 open main "$SIB"
 run_case paged true
 expect_refused "trailing claimants found past page 1" "Contradictory declarations"
+
+# --- The pin manifest (lowest-priority answer) --------------------------------
+PINSHA=$(printf 'a%.0s' $(seq 40))
+pins() { printf '%s\n' "$@" > "$FIX/pins.conf"; }
+PIN=pins.conf
+
+new_case pin-none
+pins "# header" "$SIB $PINSHA  # trailing comment"
+run_case pin-none false
+expect_ok "no declaration, sibling pinned" main none+pinned
+if [ "$SHA" = "$PINSHA" ]; then pass "pinned SHA is emitted"; else fail "pinned SHA" "got '$SHA'"; fi
+
+new_case pin-trailing
+pins "$SIB $PINSHA"
+sibling_pr 9 "coord:downstream-of=qontinui-runner#100"
+run_case pin-trailing false
+expect_ok "trailing declined, sibling pinned" main trailing-declined+pinned
+
+new_case pin-outranked
+pins "$SIB $PINSHA"
+self_labels "coord:downstream-of=ui-bridge#5"
+detail 5 open main "$SIB"
+run_case pin-outranked false
+expect_ok "a declaration outranks the pin" feat-5 downstream-of
+if [ "$SHA" = "$(printf '%040d' 5)" ]; then pass "declared head SHA, not the pin"; else fail "pin outranked SHA" "got '$SHA'"; fi
+
+new_case pin-unlisted
+pins "qontinui/qontinui-schemas $PINSHA"
+run_case pin-unlisted false
+expect_ok "sibling absent from the manifest" main none
+
+new_case pin-missing-file
+run_case pin-missing-file false
+expect_ok "manifest file absent" main none
+
+new_case pin-no-sha
+pins "$SIB"
+run_case pin-no-sha false
+expect_refused "pinned entry with no SHA" "no commit SHA"
+
+new_case pin-dup
+pins "$SIB $PINSHA" "$SIB $PINSHA"
+run_case pin-dup false
+expect_refused "sibling listed twice" "times"
+
+new_case pin-bad-sha
+pins "$SIB deadbeef"
+run_case pin-bad-sha false
+expect_refused "pin is not a full SHA" "not a 40-character"
+
+new_case pin-extra-field
+pins "$SIB $PINSHA extra"
+run_case pin-extra-field false
+expect_refused "pin entry with trailing text" "expected exactly 2"
+unset PIN
 
 echo
 echo "$passes passed, $failures failed"
