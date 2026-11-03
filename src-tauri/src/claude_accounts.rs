@@ -472,19 +472,15 @@ pub fn update(mutate: impl FnOnce(&mut ClaudeAccountsFile)) -> Result<(), String
     save(&file)
 }
 
-/// `Some(path)` when `claude-accounts.json` EXISTS but cannot be read or
-/// parsed.
+/// `true` when the roster file at `path` EXISTS but cannot be read or parsed.
 ///
 /// [`load`] reads such a file as absent (fail-open, so settings load always
-/// succeeds), which makes an unreadable roster indistinguishable from "nothing
-/// configured". A caller about to WRITE the roster from what it read must ask
-/// this first, or it overwrites the real roster with whatever the fallback
-/// produced.
-pub fn unreadable_roster_file() -> Option<PathBuf> {
-    claude_accounts_file_path().filter(|p| is_unreadable_at(p))
-}
-
-fn is_unreadable_at(path: &Path) -> bool {
+/// succeeds), and the roster copy in the per-instance `settings.json` then
+/// applies instead. That copy is a shadow that whole-`Settings` saves keep
+/// rewriting, so it may be stale or empty. A caller about to WRITE the roster
+/// from what it read must check this first, or it overwrites the real roster
+/// with that copy.
+pub fn is_unreadable(path: &Path) -> bool {
     path.exists() && load_from(path).is_none()
 }
 
@@ -645,7 +641,7 @@ mod tests {
 
         assert!(err.contains("cannot be read"), "{err}");
         assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
-        assert!(is_unreadable_at(&path));
+        assert!(is_unreadable(&path));
     }
 
     #[test]
@@ -672,9 +668,9 @@ mod tests {
     fn readable_and_absent_rosters_are_not_unreadable() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(CLAUDE_ACCOUNTS_FILE);
-        assert!(!is_unreadable_at(&path), "absent is not unreadable");
+        assert!(!is_unreadable(&path), "absent is not unreadable");
         save_to(&path, &ClaudeAccountsFile::default()).unwrap();
-        assert!(!is_unreadable_at(&path), "a valid file is readable");
+        assert!(!is_unreadable(&path), "a valid file is readable");
     }
 
     #[test]

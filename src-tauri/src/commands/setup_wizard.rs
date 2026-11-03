@@ -939,7 +939,8 @@ impl DiscoveryLayout {
 ///
 /// Every dir from steps 1-4 has a `projects/` subfolder. Refuses with an error
 /// when `claude-accounts.json` exists but cannot be read: the settings overlay
-/// would report that as an empty roster.
+/// then falls back to the per-instance `settings.json` copy of the roster,
+/// which may be stale or empty, so what it reports is not the roster.
 ///
 /// Before qontinui-runner#2544 only the Windows locations were searched, so on
 /// Linux this found nothing and the wizard saved that over the roster (coord
@@ -947,26 +948,40 @@ impl DiscoveryLayout {
 #[tauri::command]
 pub fn discover_claude_config_dirs() -> Result<Vec<Value>, String> {
     info!("Setup wizard: discovering Claude Code config directories");
-    let results = discover_for_wizard(
+    let results = discover_on_this_machine(
         |name| std::env::var(name).ok(),
         &DiscoveryLayout::this_platform(),
-        read_configured_roster,
+        crate::claude_accounts::claude_accounts_file_path(),
     )?;
     info!("Discovered {} Claude config directories", results.len());
     Ok(results)
 }
 
-/// The configured roster, or an error when `claude-accounts.json` exists but
-/// cannot be read.
-fn read_configured_roster() -> Result<Vec<String>, String> {
-    if let Some(path) = crate::claude_accounts::unreadable_roster_file() {
+/// What [`discover_claude_config_dirs`] runs, with the machine's env, layout
+/// and roster-file path injected, so a test can drive the real roster read.
+fn discover_on_this_machine(
+    env: impl Fn(&str) -> Option<String>,
+    layout: &DiscoveryLayout,
+    roster_file: Option<std::path::PathBuf>,
+) -> Result<Vec<Value>, String> {
+    discover_for_wizard(env, layout, || {
+        read_configured_roster(roster_file.as_deref(), settings::get_claude_config_dirs)
+    })
+}
+
+/// The configured roster (`configured`, the effective settings roster), or an
+/// error when the roster file exists but cannot be read.
+fn read_configured_roster(
+    roster_file: Option<&std::path::Path>,
+    configured: impl FnOnce() -> Vec<String>,
+) -> Result<Vec<String>, String> {
+    if let Some(path) = roster_file.filter(|p| crate::claude_accounts::is_unreadable(p)) {
         return Err(format!(
-            "{} exists but cannot be read; fix it or re-save the accounts in Settings before \
-             finishing setup",
+            "{} exists but cannot be read; repair it or run install-claude-accounts.sh, then retry",
             path.display()
         ));
     }
-    Ok(settings::get_claude_config_dirs())
+    Ok(configured())
 }
 
 /// Discovery over an injected env, layout and roster reader.
@@ -2396,6 +2411,56 @@ mod tests {
 
         assert_eq!(found_paths(&results), vec![acct]);
         assert_eq!(found_sources(&results), vec!["configured"]);
+    }
+
+    #[test]
+    fn the_command_path_refuses_an_unreadable_roster_file() {
+        // Drives the code the Tauri command runs, with only the roster-file
+        // PATH swapped for a temp one: an unreadable claude-accounts.json must
+        // stop discovery before any roster is read or anything is offered.
+        let base = tempfile::tempdir().unwrap();
+        mkdirs(base.path(), &[".claude/projects"]);
+        let roster = base.path().join("claude-accounts.json");
+        std::fs::write(&roster, b"{ not json").unwrap();
+        let h = s(base.path().to_path_buf());
+
+        let err = discover_on_this_machine(
+            env_of(&[("HOME", &h)]),
+            &unix_layout(base.path()),
+            Some(roster.clone()),
+        )
+        .unwrap_err();
+
+        assert!(err.contains(&roster.display().to_string()), "{err}");
+        assert!(err.contains("install-claude-accounts.sh"), "{err}");
+        assert!(
+            !err.contains("setup"),
+            "the message is shared with Settings: {err}"
+        );
+    }
+
+    #[test]
+    fn the_roster_reader_passes_a_readable_or_absent_roster_through() {
+        let base = tempfile::tempdir().unwrap();
+        let roster = base.path().join("claude-accounts.json");
+        let configured = || vec!["/home/u/.claude-a".to_string()];
+
+        // Absent file: the effective roster applies.
+        assert_eq!(
+            read_configured_roster(Some(&roster), configured).unwrap(),
+            configured()
+        );
+        // A readable file: the effective roster (which the overlay took from it).
+        std::fs::write(&roster, br#"{"claude_config_dirs": ["/home/u/.claude-a"]}"#).unwrap();
+        assert_eq!(
+            read_configured_roster(Some(&roster), configured).unwrap(),
+            configured()
+        );
+        // No resolvable path at all.
+        assert_eq!(
+            read_configured_roster(None, configured).unwrap(),
+            configured()
+        );
     }
 
     #[test]
