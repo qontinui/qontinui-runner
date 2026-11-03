@@ -2027,6 +2027,14 @@ pub fn route_entries() -> &'static [(&'static str, &'static str, bool)] {
 }
 
 pub fn routes() -> Router<Arc<ApiState>> {
+    route_table()
+}
+
+/// The one route table, generic over the router state because no handler
+/// here extracts `State`. [`routes`] mounts it on the live stack, and the
+/// tests drive the SAME table, so a test request enters exactly where the
+/// population's request enters rather than through a hand-copied list.
+fn route_table<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
         .route("/plan-library/artifacts", post(write_artifact_handler))
         .route("/plan-library/links", post(create_link_handler))
@@ -3525,17 +3533,20 @@ mod tests {
     fn route_entries_covers_every_route_registration_in_this_file() {
         // Both built at runtime so this test's own source cannot match itself.
         let needle = format!(".{}(", "route");
-        let fn_header = format!("pub fn {}() -> Router<Arc<ApiState>> {{", "routes");
+        let fn_header = format!(
+            "fn {}<S: Clone + Send + Sync + 'static>() -> Router<S> {{",
+            "route_table"
+        );
         let src = include_str!("plan_library.rs");
 
         let start = src
             .find(fn_header.as_str())
-            .expect("routes() signature — update this test if it changes");
+            .expect("route_table() signature — update this test if it changes");
         let body = &src[start..];
         // The function's own closing brace is the first one at column 0.
         let end = body
             .find("\n}")
-            .expect("routes() must be closed by a brace at column 0");
+            .expect("route_table() must be closed by a brace at column 0");
         let registered = body[..end].matches(needle.as_str()).count();
 
         let mut paths: Vec<&str> = route_entries().iter().map(|(_, p, _)| *p).collect();
@@ -3733,26 +3744,11 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    /// The routes driven here, typed for a stateless test server. The handlers
-    /// take no `State`, so `routes()`'s `Router<Arc<ApiState>>` and this are
-    /// the same route table. The by-id read is included ONLY for its pre-dial
-    /// 400, which returns before any network call.
+    /// The live route table ([`route_table`], which [`routes`] mounts), typed
+    /// for a stateless test server. Read routes are driven only up to a
+    /// refusal that precedes any network call, or at a stub upstream.
     fn test_app() -> Router {
-        Router::new()
-            .route("/plan-library/artifacts", post(write_artifact_handler))
-            .route("/plan-library/artifacts/{id}", get(read_artifact_handler))
-            .route(
-                "/plan-library/artifacts/{id}/export",
-                get(export_artifact_handler),
-            )
-            .route("/plan-library/links", post(create_link_handler))
-            .route(
-                "/plan-library/links/{id}",
-                delete(retract_link_handler).put(correct_link_handler),
-            )
-            .route("/plan-library/search", get(search_handler))
-            .route("/plan-library/candidates", get(candidates_handler))
-            .route("/plan-library/scan-roots", get(scan_roots_handler))
+        route_table()
     }
 
     /// A non-UUID id is refused by the door itself, before the forward — so
