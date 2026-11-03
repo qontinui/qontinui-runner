@@ -758,10 +758,12 @@ impl TrackingHealthReport {
     /// true: what [`crate::session::stray_wait::stray_shells`] is asked about.
     /// Empty wherever no work axis was consulted, so the periodic census never
     /// reads an argv. Pure; no I/O.
-    pub fn stray_candidates(&self, snapshot: &ProcessSnapshot) -> Vec<u32> {
+    /// Each candidate is `(parent, child)`: the verdict re-checks the parent on its
+    /// own fresh process table, so a pid reused since this snapshot is not judged.
+    pub fn stray_candidates(&self, snapshot: &ProcessSnapshot) -> Vec<(u32, u32)> {
         let mut out = Vec::new();
         for p in self.finished_with_live_children() {
-            out.extend(work_children(p.pid, snapshot));
+            out.extend(work_children(p.pid, snapshot).map(|kid| (p.pid, kid)));
         }
         out
     }
@@ -3129,7 +3131,11 @@ mod tests {
     #[test]
     fn only_a_finished_sessions_children_are_candidates() {
         let (snap, report) = stray_fixture();
-        let mut got = report.stray_candidates(&snap);
+        let mut got: Vec<u32> = report
+            .stray_candidates(&snap)
+            .into_iter()
+            .map(|(_, kid)| kid)
+            .collect();
         got.sort_unstable();
         assert_eq!(
             got,
