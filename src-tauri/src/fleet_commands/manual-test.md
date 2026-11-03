@@ -1562,14 +1562,12 @@ temp-runner arm, `9876` on the own-runner arm. All three reads are GETs, so
 they are fine on the READ-ONLY own-runner arm.
 
 The ui-bridge-mcp tools always ask the runner at `QONTINUI_RUNNER_HOST` on
-`QONTINUI_RUNNER_PORT`, and take no per-call host or port. The port defaults
-to `9876`. The host defaults to the first `/etc/resolv.conf` nameserver,
-which is meant for WSL2 but is used whenever that file exists, so on native
-Linux or macOS it is usually not the runner at all. The ledger is
-per-runner. So on the temp-runner arm, and on the own-runner arm of a
-native Linux box, the tools can silently read another runner's ledger, or
-none. Either launch the MCP server with `QONTINUI_RUNNER_HOST=127.0.0.1` and
-`QONTINUI_RUNNER_PORT=<that runner's port>`, or use the guarded GETs below.
+`QONTINUI_RUNNER_PORT`, and take no per-call host or port. They default to
+`127.0.0.1:9876`. The ledger is per-runner, so on the temp-runner arm
+default-configured tools silently read the `9876` runner's ledger, or none.
+Either launch the MCP server with `QONTINUI_RUNNER_PORT=<that runner's port>`,
+or use the guarded GETs below. An install with no `journey_*` tools predates
+ui-bridge-mcp `63cfddf`; use the GETs there too.
 
 Shell state does not carry between calls, so set the port explicitly. An
 unset one stops the block instead of asking a different runner's ledger:
@@ -1579,7 +1577,7 @@ unset one stops the block instead of asking a different runner's ledger:
 APP_ID=qontinui-web   # the app under test, as in GET /apps
 for q in health dead-ends prior-knowledge; do
   curl -fsS --max-time 30 "http://127.0.0.1:${JOURNEY_PORT}/apps/$APP_ID/journey/$q" \
-    || echo "journey/$q: no answer -- record UNKNOWN (a 404 from dead-ends/prior-knowledge = a build predating the query routes; a 503 DATABASE_UNAVAILABLE = that runner booted without its database)"
+    || echo "journey/$q: no answer -- record UNKNOWN (a 404 from dead-ends/prior-knowledge = a build predating the query routes; a 503 DATABASE_UNAVAILABLE = that runner's database is unavailable right now)"
 done
 ```
 
@@ -1588,7 +1586,7 @@ to read an answer, and whether the door is on your build yet. Read
 `journey_health`'s `LEDGER:` line, then each query answer's `COVERAGE:` line,
 before its `ANSWER:`.
 
-- A `measured` listing goes into the report: each node key, with `backOnly`
+- A `measured` listing goes into Phase 5's Cross-Page Journey section: each node key, with `backOnly`
   for a dead end. A `[DEGRADED]` listing is still a finding, and it may be
   incomplete.
 - `absent` is the only answer that supports "none found", and only under the
@@ -1602,8 +1600,8 @@ before its `ANSWER:`.
   finding", naming every such affordance. There is no qualified dead end. A qualified finding needs the tools' rendering: on the GET arm, report such a node as UNKNOWN.
   `health` answers on older builds too, so a 200 from it proves nothing about
   the query routes. A 404 from `dead-ends` or `prior-knowledge` is a build
-  that predates them, and a 503 `DATABASE_UNAVAILABLE` is a runner that
-  booted without its database. Both are recorded UNKNOWN.
+  that predates them, and a 503 `DATABASE_UNAVAILABLE` is a runner whose
+  database is unavailable right now. Both are recorded UNKNOWN.
 
 A drive that went through no runner (the web relay or an injected tab) left
 no ledger on that runner to ask, so its result is UNKNOWN too.
@@ -1649,6 +1647,21 @@ For each task attempted, report:
 - **Steps taken:** [numbered list of UI Bridge interactions]
 - **Result:** PASS / FAIL / PARTIAL / BLOCKED
 - **Notes:** [what happened, any unexpected behavior]
+```
+
+### Cross-Page Journey
+
+Report Phase 4.5 once per app under test. A phase that could not run still gets
+an entry here, written UNKNOWN with the reason.
+
+```
+## Cross-Page Journey
+
+### App: [app id] (runner port asked: [port])
+- **Ledger:** [the state journey_health reports]
+- **Dead ends:** measured [node keys, with backOnly] / DEGRADED [node keys, with backOnly + the unmeasured dimensions] / absent [the echoed filter] / UNKNOWN [code + the open frontier]
+- **Reached only by URL:** measured [node keys] / DEGRADED [node keys + the unmeasured dimensions] / qualified [node keys + every affordance named] / absent [the echoed filter] / UNKNOWN [code + the open frontier]
+- **Coverage:** [the COVERAGE line each answer was computed over]
 ```
 
 ### UI Bridge Evaluation
@@ -1723,6 +1736,7 @@ Draw from everything surfaced in Phases 1–5:
 - **Pain points & friction** (Phase 5: Pain Points & Friction) — workarounds, multi-step sequences that should be one call, discoverability gaps
 - **Missing functionality** (Phase 5: Missing Functionality) — capabilities the UI Bridge lacks that would make testing easier
 - **Task failures** (Phase 5: Test Results) — any task that came back FAIL / PARTIAL / BLOCKED
+- **Cross-page defects** (Phase 5: Cross-Page Journey) — every measured or `[DEGRADED]` dead end or URL-only page, and every qualified prior-knowledge finding. An UNKNOWN answer stays UNKNOWN in the report; it is not evidence of a defect in the app
 
 If Phase 5 turned up no deficiencies, say so explicitly and skip to the "No deficiencies" note below.
 
@@ -1834,6 +1848,8 @@ After the per-repo sections, add an **Execution order** section — a numbered l
 - **ALWAYS run Phase 3.5 on every page you visit** — an element being in the
   `discover` payload is not evidence a human can read it, and no functional
   check in Phase 2 or 3 looks at legibility
+- **ALWAYS run Phase 4.5 once per app under test** and report it in Phase 5,
+  even when the answer is UNKNOWN — no per-page phase can see a defect between pages
 - **ALWAYS call discover** if snapshot returns empty or stale data
 - **ALWAYS wait 2 seconds after navigation/clicks** that change the view, then re-discover
 - **ALWAYS use scrollIntoView** before interacting with off-screen elements
