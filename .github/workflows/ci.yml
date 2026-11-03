@@ -513,10 +513,15 @@ jobs:
       #      job (20 jobs) peaked at 54.1 GiB — two `qontinui_runner` rustc
       #      processes alone held 17-24 GiB each, so the giant crates, not the
       #      job count, set the floor, and 3 GiB per job left ~6 GiB of
-      #      headroom under MemoryHigh. RUST_TEST_THREADS is 4, the hosted
-      #      leg's own value (nproc of its 4-core VM): the suite's concurrency
-      #      regime does not change with the machine it lands on, and coord's
-      #      ingest keeps recording both under the one `ubuntu-22.04` shard.
+      #      headroom under MemoryHigh. RUST_TEST_THREADS and
+      #      VITEST_MAX_WORKERS are 4, the hosted leg's own value (nproc of its
+      #      4-core VM): the suite's concurrency regime does not change with the
+      #      machine it lands on, and coord's ingest keeps recording both under
+      #      the one `ubuntu-22.04` shard. vitest's default pool is nproc - 1
+      #      workers; measured on nawa-runner-2 (nproc 128, 2026-11-03, runs
+      #      41703593573 and 41709340100), it timed seven test files' hooks out
+      #      at 10 s (import 4070 s summed across workers), so `Run frontend
+      #      unit tests` failed on every pool run.
       #   3. A WARM, PERSISTENT TARGET. actions/checkout cleans with `git clean
       #      -ffdx`, which deletes ./target on every job. So the target lives
       #      outside the workspace, under the account's persistent home
@@ -571,7 +576,8 @@ jobs:
           [ "$threads" -le "$cpus" ] || threads=$cpus
           echo "CARGO_BUILD_JOBS=$jobs" >> "$GITHUB_ENV"
           echo "RUST_TEST_THREADS=$threads" >> "$GITHUB_ENV"
-          echo "memory budget $((budget_kb / 1048576)) GiB, nproc $cpus -> CARGO_BUILD_JOBS=$jobs RUST_TEST_THREADS=$threads"
+          echo "VITEST_MAX_WORKERS=$threads" >> "$GITHUB_ENV"
+          echo "memory budget $((budget_kb / 1048576)) GiB, nproc $cpus -> CARGO_BUILD_JOBS=$jobs RUST_TEST_THREADS=$threads VITEST_MAX_WORKERS=$threads"
 
           cache="$CI_POOL_HOME/.cache/qontinui-runner-ci/$RUNNER_NAME/target"
           mkdir -p "$cache"
