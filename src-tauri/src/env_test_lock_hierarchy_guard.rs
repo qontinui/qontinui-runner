@@ -85,8 +85,7 @@
 //!   `mod { … }` block and on the inline block itself, and a file that a
 //!   `path` names is mod-rs for its own children. Every
 //!   `cfg_attr(…, path = …)` is followed whatever its predicate, alongside the
-//!   default name. Not followed: a `mod x;` inside a fn body, or one whose
-//!   tokens a comment splits (`mod /* c */ x;`), which the pre-filter misses.
+//!   default name. Not followed: a `mod x;` inside a fn body.
 //!   A file reached by several edges (by name and through a `path`) takes its
 //!   mod-rs-ness from the edge that walked it last: the first one, or a later
 //!   test-scope edge that re-walks it. A file the tree does not reach is
@@ -722,9 +721,56 @@ fn mod_decls(path: &Path, src: &str, mod_rs: bool) -> syn::Result<Vec<Decl>> {
 /// sequence `mod <ident> ;` can declare an out-of-line module, so most files
 /// are never parsed twice. Token-shaped rather than line-shaped, so
 /// `#[cfg(test)]mod x;`, `mod x; /* why */` and a declaration split across
-/// lines all count. A match inside a comment or string only costs a parse.
+/// lines all count, and so does one whose tokens a comment or non-ASCII
+/// whitespace separates (`mod /* c */ x;`). A match inside a comment or
+/// string only costs a parse.
 fn declares_out_of_line_mod(src: &str) -> bool {
     let b = src.as_bytes();
+    // Past whitespace (Rust's Pattern_White_Space, non-ASCII members
+    // included) and comments, nested block comments too.
+    let skip_trivia = |mut i: usize| -> usize {
+        const NON_ASCII_WS: [&[u8]; 5] = [
+            "\u{85}".as_bytes(),
+            "\u{200E}".as_bytes(),
+            "\u{200F}".as_bytes(),
+            "\u{2028}".as_bytes(),
+            "\u{2029}".as_bytes(),
+        ];
+        loop {
+            let rest = &b[i..];
+            // `is_ascii_whitespace` omits the vertical tab (0x0B), which Rust counts.
+            if rest
+                .first()
+                .is_some_and(|c| c.is_ascii_whitespace() || *c == 0x0B)
+            {
+                i += 1;
+            } else if let Some(ws) = NON_ASCII_WS.iter().find(|w| rest.starts_with(w)) {
+                i += ws.len();
+            } else if rest.starts_with(b"//") {
+                i += rest.iter().position(|&c| c == b'\n').unwrap_or(rest.len());
+            } else if rest.starts_with(b"/*") {
+                let mut depth = 0usize;
+                let mut j = 0;
+                while j < rest.len() {
+                    if rest[j..].starts_with(b"/*") {
+                        depth += 1;
+                        j += 2;
+                    } else if rest[j..].starts_with(b"*/") {
+                        depth -= 1;
+                        j += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        j += 1;
+                    }
+                }
+                i += j;
+            } else {
+                return i;
+            }
+        }
+    };
     // Any non-ASCII byte may be part of an identifier (`mod café;`).
     let ident = |c: u8| c == b'_' || c.is_ascii_alphanumeric() || !c.is_ascii();
     let mut from = 0;
@@ -734,12 +780,8 @@ fn declares_out_of_line_mod(src: &str) -> bool {
         if at > 0 && ident(b[at - 1]) {
             continue;
         }
-        let mut i = at + 3;
-        let ws = i;
-        while i < b.len() && b[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i == ws {
+        let mut i = skip_trivia(at + 3);
+        if i == at + 3 {
             continue;
         }
         // `r#name` is a valid module name.
@@ -753,9 +795,7 @@ fn declares_out_of_line_mod(src: &str) -> bool {
         if i == name {
             continue;
         }
-        while i < b.len() && b[i].is_ascii_whitespace() {
-            i += 1;
-        }
+        i = skip_trivia(i);
         if b.get(i) == Some(&b';') {
             return true;
         }
@@ -1493,6 +1533,10 @@ fn the_mod_pre_filter_is_token_shaped() {
         "pub(crate) mod\n  x\n;",
         "mod r#type;",
         "mod café;",
+        "mod /* c */ x /* d /* nested */ */ ;",
+        "mod // c\n x;",
+        "mod\u{2028}x;",
+        "mod\u{0B}x;",
     ] {
         assert!(declares_out_of_line_mod(yes), "{yes:?}");
     }
