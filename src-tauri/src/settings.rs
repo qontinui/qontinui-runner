@@ -6005,6 +6005,11 @@ pub fn save_claude_config_dirs(dirs: Vec<String>) -> Result<(), String> {
     crate::config_facade::save_claude_config_dirs(dirs)
 }
 
+/// Add Claude Code config directories to the roster, never removing one
+pub fn append_claude_config_dirs(dirs: &[String]) -> Result<usize, String> {
+    crate::config_facade::append_claude_config_dirs(dirs)
+}
+
 /// Get custom launch commands per account config directory
 pub fn get_claude_account_launch_commands() -> std::collections::HashMap<String, String> {
     crate::config_facade::get_claude_account_launch_commands()

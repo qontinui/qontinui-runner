@@ -718,6 +718,20 @@ pub fn save_claude_config_dirs(dirs: Vec<String>) -> Result<(), String> {
     crate::claude_accounts::update(move |roster| roster.claude_config_dirs = dirs)
 }
 
+/// ADD Claude Code config directories to the machine-global roster, never
+/// removing one (`crate::claude_accounts::append_config_dirs`). Returns how
+/// many were added. The first-run setup wizard uses this; the Settings page's
+/// replace-style [`save_claude_config_dirs`] stays the only way to remove one.
+pub fn append_claude_config_dirs(dirs: &[String]) -> Result<usize, String> {
+    let added = crate::claude_accounts::append_config_dirs(dirs)?;
+    info!(
+        "Added {} of {} Claude config dirs (machine-global claude-accounts.json, add-only)",
+        added,
+        dirs.len()
+    );
+    Ok(added)
+}
+
 /// Get custom launch commands per account config directory.
 pub fn get_claude_account_launch_commands() -> std::collections::HashMap<String, String> {
     load_settings().claude_account_launch_commands

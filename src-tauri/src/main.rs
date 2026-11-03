@@ -3466,6 +3466,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::setup_wizard::complete_setup,
             commands::setup_wizard::detect_project_framework_for_setup,
             commands::setup_wizard::discover_claude_config_dirs,
+            commands::setup_wizard::add_claude_config_dirs_from_setup,
             commands::setup_wizard::github_clone_repo,
             commands::setup_wizard::github_connect_url,
             commands::setup_wizard::github_list_repos,
