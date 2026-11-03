@@ -448,6 +448,7 @@ mod tests {
                 &qontinui_runner_lib::wind_down::Eligibility::Eligible { since_ms: 1 },
                 SessionKind::Terminal,
             )),
+            stray_wait_shells: 0,
         };
         let mut processes = vec![process("fc-a"), process("fc-b")];
         attach_last_custody(&mut processes);

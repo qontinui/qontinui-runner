@@ -396,6 +396,10 @@ pub const SESSION_START_CHILD_WINDOW_S: i64 = 60;
 /// only: `terminal::graceful_exit` still refuses any `claude` holding a child
 /// process, these MCP servers included, so an idle session that holds one is
 /// still not closed.
+///
+/// A shell is always work HERE, because this reads images alone. The one
+/// discount, a proven-stray wait loop under a FINISHED session, needs argv and
+/// is applied after the pass: [`TrackingHealthReport::discount_stray_shells`].
 pub fn child_signals_work(
     image: Option<&str>,
     child_created_s: Option<i64>,
@@ -416,6 +420,35 @@ pub fn child_signals_work(
         }
         _ => true,
     }
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
+}
+
+impl LiveClaudeProcess {
+    fn is_finished_with_live_children(&self) -> bool {
+        self.has_live_children == Some(true)
+            && self.session_status.as_deref()
+                == Some(SessionWorkStatus::Finished.as_wire().as_str())
+    }
+}
+
+/// `pid`'s direct children that [`child_signals_work`] counts, over one snapshot.
+fn work_children(pid: u32, snapshot: &ProcessSnapshot) -> impl Iterator<Item = u32> + '_ {
+    snapshot
+        .parent_map
+        .get(&pid)
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(move |kid| {
+            child_signals_work(
+                snapshot.names.get(kid).map(String::as_str),
+                snapshot.creation_times.get(kid).copied(),
+                snapshot.creation_times.get(&pid).copied(),
+            )
+        })
 }
 
 /// One live `claude` process in the runner's inclusive subtree, with every
@@ -458,7 +491,9 @@ pub struct LiveClaudeProcess {
     /// **HINT, NOT A VERDICT.** `Some(true)` iff this pid has at least one
     /// child in the same snapshot that signals WORK — a shell, or a child
     /// whose image could not be read ([`child_signals_work`]). Session
-    /// infrastructure (its stdio MCP servers) does not count. A `claude`
+    /// infrastructure (its stdio MCP servers) does not count, and neither does
+    /// a proven-stray wait loop under a FINISHED session, which
+    /// `stray_wait_shells` then counts instead. A `claude`
     /// mid-tool-call has such a child (the shell running a `cargo`, a `git`);
     /// a `claude` between turns has none and is NOT
     /// therefore idle, abandoned, or safe to kill. Read it as "there is
@@ -551,6 +586,12 @@ pub struct LiveClaudeProcess {
     /// close). So `eligible` here is a candidacy, never a prediction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wind_down: Option<qontinui_runner_lib::wind_down::WindDownView>,
+    /// How many proven-stray wait loops were discounted from `has_live_children`
+    /// ([`TrackingHealthReport::discount_stray_shells`]), so a row reading "no live
+    /// children" above a live `bash` says why. The operator closer's `N stray wait
+    /// loop(s)` note; absent when 0.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub stray_wait_shells: usize,
 }
 
 /// An open lifecycle record whose terminal is gone or whose subtree contains
@@ -711,6 +752,54 @@ impl TrackingHealthReport {
                 };
             }
         }
+    }
+
+    /// The direct children holding a FINISHED process's `has_live_children`
+    /// true: what [`crate::session::stray_wait::stray_shells`] is asked about.
+    /// Empty wherever no work axis was consulted, so the periodic census never
+    /// reads an argv. Pure; no I/O.
+    pub fn stray_candidates(&self, snapshot: &ProcessSnapshot) -> Vec<u32> {
+        let mut out = Vec::new();
+        for p in self.finished_with_live_children() {
+            out.extend(work_children(p.pid, snapshot));
+        }
+        out
+    }
+
+    /// A finished session whose only work children are proven-stray wait loops
+    /// has no live children: nothing it started can ever end, and nothing it
+    /// owes is running. Every other process keeps its reading, so an unfinished
+    /// session held by the same loop stays busy here, and one real child beside
+    /// any number of strays keeps a finished one busy too. Pure; no I/O.
+    pub fn discount_stray_shells(&mut self, snapshot: &ProcessSnapshot, strays: &HashSet<u32>) {
+        for class in [
+            &mut self.terminal_hosted,
+            &mut self.holder_hosted,
+            &mut self.ai_plane,
+            &mut self.headless_exempt,
+            &mut self.live_untracked,
+        ] {
+            for p in class.iter_mut() {
+                if !p.is_finished_with_live_children() {
+                    continue;
+                }
+                let work: Vec<u32> = work_children(p.pid, snapshot).collect();
+                if work.iter().all(|kid| strays.contains(kid)) {
+                    p.has_live_children = Some(false);
+                    p.stray_wait_shells = work.len();
+                }
+            }
+        }
+    }
+
+    fn finished_with_live_children(&self) -> impl Iterator<Item = &LiveClaudeProcess> {
+        self.terminal_hosted
+            .iter()
+            .chain(&self.holder_hosted)
+            .chain(&self.ai_plane)
+            .chain(&self.headless_exempt)
+            .chain(&self.live_untracked)
+            .filter(|p| p.is_finished_with_live_children())
     }
 
     /// Holder panes this runner cannot drive (unknown or incompatible). Each
@@ -1104,17 +1193,10 @@ pub fn evaluate(
             // `parent_map` entry genuinely means "no children", while a pid
             // absent there was not seen at all and its children are
             // UNCOMPUTABLE rather than absent.
-            has_live_children: snapshot.creation_times.contains_key(&pid).then(|| {
-                snapshot.parent_map.get(&pid).is_some_and(|kids| {
-                    kids.iter().any(|kid| {
-                        child_signals_work(
-                            snapshot.names.get(kid).map(String::as_str),
-                            snapshot.creation_times.get(kid).copied(),
-                            snapshot.creation_times.get(&pid).copied(),
-                        )
-                    })
-                })
-            }),
+            has_live_children: snapshot
+                .creation_times
+                .contains_key(&pid)
+                .then(|| work_children(pid, snapshot).next().is_some()),
             nested_under_claude,
             session_status: status.map(|s| s.as_wire()),
             // Filled after the pass by `attach_status_since`, keyed on the
@@ -1124,6 +1206,7 @@ pub fn evaluate(
             session_id,
             blocks_restart: blocks_restart(status),
             wind_down: None,
+            stray_wait_shells: 0,
         }
     };
 
@@ -1315,6 +1398,13 @@ pub async fn compute(
         &holders,
     );
     report.attach_status_since(session_status_since_by_id);
+    // Only a finished session's work children, and only once it reads as held.
+    // Bounded inside: a loop can name any path, and this route must still answer.
+    let stray_candidates = report.stray_candidates(&snap);
+    if !stray_candidates.is_empty() {
+        let strays = crate::session::stray_wait::stray_shells(stray_candidates).await;
+        report.discount_stray_shells(&snap, &strays);
+    }
 
     Some(TrackingHealthPass {
         report,
@@ -1510,6 +1600,7 @@ mod tests {
             session_status_since: None,
             blocks_restart: true,
             wind_down: None,
+            stray_wait_shells: 0,
         }
     }
 
@@ -2907,6 +2998,162 @@ mod tests {
             now_ms,
             census,
         )
+    }
+
+    /// Plan `2026-10-23-finished-sessions-stay-busy-behind-background-wait-loops-that-can-never-exit`
+    /// Phase 4, through the path production takes: a real open record per terminal,
+    /// because only a terminal-hosted process can read as finished. Under terminal
+    /// 5, finished claude 20 with one shell. Under 6, unfinished claude 30 with the
+    /// same shell. Under 7, finished claude 40 with a shell and a later non-shell
+    /// child. Under 8, finished claude 60, whose only child is nested claude 61 with
+    /// a shell of its own.
+    fn stray_fixture() -> (ProcessSnapshot, TrackingHealthReport) {
+        let now_ms = 1_800_000_000_000;
+        let snap = snap_with(
+            &[
+                (1, &[5, 6, 7, 8]),
+                (5, &[20]),
+                (20, &[21]),
+                (6, &[30]),
+                (30, &[31]),
+                (7, &[40]),
+                (40, &[41, 42]),
+                (8, &[60]),
+                (60, &[61]),
+                (61, &[62]),
+            ],
+            &[],
+            &[
+                (20, "claude"),
+                (21, "bash"),
+                (30, "claude"),
+                (31, "bash"),
+                (40, "claude"),
+                (41, "bash"),
+                (42, "rg"),
+                (60, "claude"),
+                (61, "claude"),
+                (62, "bash"),
+            ],
+        );
+        let records = vec![
+            record("sess-20", "t-5", now_ms - 60_000),
+            record("sess-30", "t-6", now_ms - 60_000),
+            record("sess-40", "t-7", now_ms - 60_000),
+            record("sess-60", "t-8", now_ms - 60_000),
+        ];
+        let terminal_pids: HashMap<String, u32> =
+            [("t-5", 5u32), ("t-6", 6), ("t-7", 7), ("t-8", 8)]
+                .into_iter()
+                .map(|(t, p)| (t.to_string(), p))
+                .collect();
+        let statuses: HashMap<String, SessionWorkStatus> = [
+            ("sess-20", SessionWorkStatus::Finished),
+            ("sess-30", SessionWorkStatus::Working),
+            ("sess-40", SessionWorkStatus::Finished),
+            ("sess-60", SessionWorkStatus::Finished),
+        ]
+        .into_iter()
+        .map(|(id, status)| (id.to_string(), status))
+        .collect();
+        let report = evaluate(
+            &snap,
+            1,
+            &records,
+            &terminal_pids,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &statuses,
+            now_ms - 3_600_000,
+            now_ms,
+            &HolderCensus::default(),
+        );
+        (snap, report)
+    }
+
+    fn stray_row(report: &TrackingHealthReport, pid: u32) -> (Option<bool>, usize) {
+        let p = report
+            .terminal_hosted
+            .iter()
+            .find(|p| p.pid == pid)
+            .expect("terminal-hosted");
+        (p.has_live_children, p.stray_wait_shells)
+    }
+
+    #[test]
+    fn a_finished_session_held_only_by_proven_strays_has_no_live_children() {
+        let (snap, mut report) = stray_fixture();
+        assert_eq!(
+            stray_row(&report, 20),
+            (Some(true), 0),
+            "before the discount"
+        );
+        report.discount_stray_shells(&snap, &[21u32, 31, 41, 62].into_iter().collect());
+        assert_eq!(stray_row(&report, 20), (Some(false), 1));
+    }
+
+    #[test]
+    fn a_stray_never_discounts_an_unfinished_session() {
+        let (snap, mut report) = stray_fixture();
+        report.discount_stray_shells(&snap, &[21u32, 31, 41, 62].into_iter().collect());
+        assert_eq!(stray_row(&report, 30), (Some(true), 0));
+    }
+
+    #[test]
+    fn one_real_child_beside_a_stray_keeps_a_finished_session_held() {
+        let (snap, mut report) = stray_fixture();
+        report.discount_stray_shells(&snap, &[41u32].into_iter().collect());
+        assert_eq!(stray_row(&report, 40), (Some(true), 0), "rg is still work");
+    }
+
+    #[test]
+    fn a_shell_not_proven_stray_keeps_a_finished_session_held() {
+        let (snap, mut report) = stray_fixture();
+        report.discount_stray_shells(&snap, &HashSet::new());
+        assert_eq!(stray_row(&report, 20), (Some(true), 0));
+    }
+
+    /// A nested `claude` is never discounted by its ancestor's declaration, and it
+    /// is work to that ancestor whatever runs under it.
+    #[test]
+    fn a_nested_session_is_never_discounted() {
+        let (snap, mut report) = stray_fixture();
+        report.discount_stray_shells(&snap, &[62u32].into_iter().collect());
+        assert_eq!(stray_row(&report, 61), (Some(true), 0));
+        assert_eq!(stray_row(&report, 60), (Some(true), 0));
+    }
+
+    /// Only a finished session's children are read, so a pass with no work axis
+    /// (the periodic census) reads no argv at all.
+    #[test]
+    fn only_a_finished_sessions_children_are_candidates() {
+        let (snap, report) = stray_fixture();
+        let mut got = report.stray_candidates(&snap);
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![21, 41, 42, 61],
+            "not 31 (working), not 62 (nested)"
+        );
+    }
+
+    /// The readers of `/restart-readiness`: an unaffected row reads as it always did.
+    #[test]
+    fn the_stray_count_is_on_the_wire_only_when_it_is_not_zero() {
+        let (snap, mut report) = stray_fixture();
+        report.discount_stray_shells(&snap, &[21u32].into_iter().collect());
+        let row = |pid: u32| {
+            let p = report
+                .terminal_hosted
+                .iter()
+                .find(|p| p.pid == pid)
+                .unwrap();
+            serde_json::to_value(p).unwrap()
+        };
+        assert_eq!(row(20)["strayWaitShells"], 1);
+        assert_eq!(row(20)["hasLiveChildren"], false);
+        assert!(row(30).get("strayWaitShells").is_none());
     }
 
     /// Risk 2, the failure Phase 5 exists to prevent: before the census, a box
