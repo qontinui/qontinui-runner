@@ -2234,6 +2234,9 @@ async fn run_heartbeat_sender(api_state: Arc<ApiState>, writer: RelayWriter) {
                 pg_reachable,
                 pg_schema_ok,
                 relay_connected,
+                // As `/health` does: a starved `app-rt` is DEGRADED, never
+                // errored. Plan 2026-10-19-runner-ui-wedge-signal-…, Phase 3.
+                app_runtime_starved: crate::ui_error::app_runtime_starved_now(),
                 ..Default::default()
             })
             .to_string();
