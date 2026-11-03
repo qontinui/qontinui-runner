@@ -1056,3 +1056,58 @@ fn every_heavy_rust_job_emits_one_resource_report() {
         "`{REPORT}` must not parse the MEMPEAK lines; it reads the pagefile itself"
     );
 }
+
+/// The self-hosted pool's label set is spelled TWICE: once in `route`'s
+/// `--self-hosted-labels` (where the `auto` lane routes the ubuntu leg) and
+/// once as the forced `self-hosted` arm of `test`'s `runs-on`. Both spellings
+/// stay valid label sets when one of them is edited alone, so nothing else
+/// notices the drift: the two lanes would simply send the leg to different
+/// pools. This pins them to one set (order-insensitive, as GitHub's label
+/// matching is).
+#[test]
+fn the_pool_label_set_is_the_same_in_route_and_in_the_forced_lane() {
+    let doc = ci_workflow();
+
+    let route_run = job_steps(&doc, "route")
+        .iter()
+        .filter_map(|s| s.get("run").and_then(|v| v.as_str()).map(str::to_string))
+        .find(|run| run.contains("route-ci-lane.py"))
+        .expect("job `route` must run .github/scripts/route-ci-lane.py");
+    let mut routed: Vec<String> = route_run
+        .split_whitespace()
+        .skip_while(|word| *word != "--self-hosted-labels")
+        .nth(1)
+        .unwrap_or_else(|| panic!("`route` must pass `--self-hosted-labels <set>`: {route_run}"))
+        .split(',')
+        .map(str::to_string)
+        .collect();
+
+    let runs_on = doc
+        .get("jobs")
+        .and_then(|j| j.get("test"))
+        .and_then(|j| j.get("runs-on"))
+        .and_then(|v| v.as_str())
+        .expect("job `test` must carry a `runs-on` expression string");
+    // The forced arm is the one JSON array literal in `runs-on` that names
+    // `self-hosted` (in any position); the hosted arms name `windows-latest` /
+    // `ubuntu-22.04`.
+    let forced_literal = regex::Regex::new(r#"'\[([^\]]*"self-hosted"[^\]]*)\]'"#)
+        .expect("the forced-arm pattern compiles")
+        .captures(runs_on)
+        .unwrap_or_else(|| {
+            panic!("`test`'s runs-on has no '[\"self-hosted\", …]' forced arm: {runs_on}")
+        })[1]
+        .to_string();
+    let mut forced: Vec<String> = forced_literal
+        .split(',')
+        .map(|label| label.trim().trim_matches('"').to_string())
+        .collect();
+
+    routed.sort();
+    forced.sort();
+    assert_eq!(
+        routed, forced,
+        "the pool label set differs between `route --self-hosted-labels` and \
+         `test`'s forced `self-hosted` arm; change both together"
+    );
+}

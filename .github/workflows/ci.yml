@@ -163,7 +163,108 @@ env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
+  # ── Where the Linux `test` leg runs ─────────────────────────────────────
+  #
+  # On every run that is NOT a pull_request (merge-candidate*/** and main
+  # pushes, workflow_dispatch) this job decides whether `test (ubuntu-22.04)`
+  # runs on the self-hosted pool `[self-hosted, Linux, X64, qontinui-runner-ci,
+  # ram-40g]` — on 2026-11-03 two registrations on nawa (`nawa-runner-1/2`,
+  # 64 GiB / 60 GiB-high units in the host's ci-runners.slice, a persistent
+  # per-runner cargo target) — or on the free GitHub-hosted `ubuntu-22.04`
+  # floor. pull_request runs never reach the pool and pay nothing for this job
+  # (it is skipped): the pool is sized for the train, and a PR backlog would
+  # saturate it and push candidates back to the floor.
+  #
+  # WHAT IT BUYS, measured rather than hoped. It does NOT shorten a candidate
+  # today: the windows leg is the slowest required job (98-148 min on recent
+  # green main pushes, ubuntu 52-86), and it stays hosted. What moves is ~70
+  # min of hosted 4-core time per push run, off the org's shared hosted pool
+  # (14 runs of this repo sat queued for it on 2026-11-03), and a ubuntu leg
+  # that ran in 41 min COLD on the pool (52-86 hosted), so it is not the next
+  # bottleneck once the windows leg gets faster. The cost, under `auto` only:
+  # the windows leg waits for this job, which itself needs a hosted runner —
+  # ~13 s when hosted runners are free, but on 2026-11-03, with the org's
+  # hosted queue saturated, run 41646964958's `route` sat queued 10 m 40 s
+  # while the pool idled, and the windows leg then queued another 7 m 22 s,
+  # starting 18 min after the run was created. A forced lane skips this job
+  # entirely (below). `hosted` costs nothing. `self-hosted` adds no latency
+  # but gives up ALL of the router's overflow (pool down, stalled, saturated):
+  # `timeout-minutes` does not count time spent queued, so a dead or full pool
+  # holds the leg until a pool runner comes online or GitHub cancels a
+  # self-hosted job queued for 24 h. Setting the lane back only moves runs
+  # created afterwards; to free a stuck one, cancel the run and re-run it (a
+  # re-run goes hosted).
+  #
+  # The decision is the fleet's route-with-a-hosted-floor router: a VERBATIM
+  # copy of qontinui-claude-config `scripts/route-ci-lane.py` (blob c67b16e7,
+  # itself a parameterised copy of qontinui-coord
+  # `.github/scripts/route_rust_ci.py`; its hermetic test is
+  # `scripts/route-ci-lane-test.py` there). Re-sync by copying the file again
+  # and checking `git hash-object` against ccfg's blob — never by editing it
+  # here. With `actions: read` it reads THIS repo's queued jobs and routes to
+  # the floor when the pool is STALLED (a pool job queued >= 10 min), SATURATED
+  # (>= 4 queued) or its signal is unreadable. The repo variable picks the lane:
+  #
+  #   RUNNER_CI_LINUX_LANE = auto         this job runs and decides
+  #                        = self-hosted  this job is SKIPPED; `test` goes to
+  #                                       the pool unconditionally, with no
+  #                                       overflow (a dead pool queues it 24 h)
+  #                        = hosted | unset | anything else
+  #                                       this job is SKIPPED; `test` is hosted
+  #
+  # RE-RUNS GO TO THE FLOOR, and that is decided in `test`'s `runs-on`, not
+  # here. A pool that picks jobs up and then fails them reads healthy to the
+  # queue signal, so a retry must not land on it again. coord retries with
+  # "re-run failed jobs", which does not re-run a `route` that succeeded: the
+  # retried `test` would reuse attempt 1's labels, so the router's own
+  # `--hosted-on-rerun` alone never fires for coord's retries. `runs-on` reads
+  # `needs.route.outputs.labels` only on attempt 1.
+  #
+  # `hosted` is the kill switch for new runs; every re-run is hosted anyway.
+  # The router ALWAYS exits 0 with outputs written, and `test` runs under
+  # `!cancelled()` with a hosted fallback, so a route job that fails, times
+  # out or is skipped leaves the leg on the floor (or, forced, on the pool) —
+  # never SKIPPED, which coord's check classification would count as passing.
+  route:
+    if: ${{ github.event_name != 'pull_request' && vars.RUNNER_CI_LINUX_LANE == 'auto' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      labels: ${{ steps.route.outputs.labels }}
+      lane: ${{ steps.route.outputs.lane }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Route the Linux test leg
+        id: route
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNNER_CI_LINUX_LANE: ${{ vars.RUNNER_CI_LINUX_LANE }}
+          RUNNER_CI_LINUX_LANE_SOURCE: repo variable RUNNER_CI_LINUX_LANE
+          RUNNER_CI_LINUX_HOSTED_LABEL: ubuntu-22.04
+          RUNNER_CI_LINUX_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: >-
+          python3 -B .github/scripts/route-ci-lane.py
+          --self-hosted-labels self-hosted,Linux,X64,qontinui-runner-ci,ram-40g
+          --env-prefix RUNNER_CI_LINUX
+          --title "test (ubuntu-22.04)"
+          --default-lane hosted
+          --hosted-on-rerun
+
   test:
+    # `route` decides the ubuntu leg's pool (see above). `!cancelled()` is
+    # load-bearing: on a pull_request `route` is SKIPPED, and without it a job
+    # that needs a skipped job is skipped too, which would turn both required
+    # `test (…)` contexts into `skipped` (= passing to coord) on every PR.
+    needs: route
+    if: ${{ !cancelled() }}
     strategy:
       # Surface platform-specific failures independently. Default fail-fast
       # cancels ubuntu/windows the moment macos clippy trips, masking
@@ -177,7 +278,17 @@ jobs:
         # when cross-platform demos / mac users matter.
         platform: [ubuntu-22.04, windows-latest]
 
-    runs-on: ${{ matrix.platform }}
+    # The windows leg always runs hosted. The ubuntu leg, on a FIRST attempt of
+    # a run that is not a pull_request, goes to the pool when the lane is
+    # forced `self-hosted`, or where `route` said under `auto` (its `labels`
+    # output). Everything else is the hosted floor: a pull_request, any
+    # re-run, the `hosted`/unset lane, and a route job that produced nothing.
+    # The check names stay `test (ubuntu-22.04)` / `test (windows-latest)`:
+    # they come from the matrix value, not from the pool, and both are
+    # required contexts. The pool label set below is spelled twice (here and
+    # in `route`'s --self-hosted-labels); change both together.
+    # coord-pools: [self-hosted, Linux, X64, qontinui-runner-ci, ram-40g] | [ubuntu-22.04] | [windows-latest]
+    runs-on: ${{ fromJSON(matrix.platform == 'windows-latest' && '["windows-latest"]' || (github.run_attempt == 1 && github.event_name != 'pull_request' && vars.RUNNER_CI_LINUX_LANE == 'self-hosted' && '["self-hosted","Linux","X64","qontinui-runner-ci","ram-40g"]') || (github.run_attempt == 1 && needs.route.outputs.labels) || '["ubuntu-22.04"]') }}
 
     # Backstop cap for any step in this job that is not individually bounded.
     # This job previously had NO job-level timeout, so the 4h24m apt hang above
@@ -233,6 +344,49 @@ jobs:
         with:
           fetch-depth: 0
           filter: blob:none
+
+      # SELF-HOSTED ONLY (the `route` job above put the ubuntu leg on the
+      # pool). Two things a hosted VM gets for free and a persistent host does
+      # not:
+      #
+      #   1. A FRESH `_work`. A self-hosted runner keeps it between jobs, and
+      #      checkout-sibling REFUSES a destination that already exists
+      #      ("refusing to overwrite a checkout that is already there"), so the
+      #      second job on a registration would fail at the first sibling. The
+      #      previous job's three sibling trees are removed; they are this
+      #      registration's own scratch, at $GITHUB_WORKSPACE/.. exactly where
+      #      checkout-sibling writes them.
+      #   2. A HOME of its own. Every registration on the host runs as ONE
+      #      account with ONE home, and `Poison ambient state` / `Unpoison`
+      #      below write and delete `~/.qontinui/*` by name — two concurrent
+      #      jobs would delete each other's poison mid-suite, and a red suite
+      #      (Unpoison does not run then) would leave it for the next. So the
+      #      job gets HOME and TMPDIR under $RUNNER_TEMP, which the runner
+      #      empties per job, while CARGO_HOME / RUSTUP_HOME stay on the
+      #      account's persistent toolchain and registry. CI_POOL_HOME keeps
+      #      the persistent home for the target cache below.
+      - name: "Self-hosted: clear the previous job's sibling checkouts and give the job its own HOME"
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          parent="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
+          for name in qontinui-schemas qontinui-web ui-bridge; do
+            if [ -e "$parent/$name" ]; then
+              rm -rf "${parent:?}/$name"
+              echo "removed the previous job's $parent/$name"
+            fi
+          done
+          job_home="$RUNNER_TEMP/home"
+          mkdir -p "$job_home" "$RUNNER_TEMP/tmp"
+          {
+            echo "CI_POOL_HOME=$HOME"
+            echo "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}"
+            echo "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}"
+            echo "HOME=$job_home"
+            echo "TMPDIR=$RUNNER_TEMP/tmp"
+          } >> "$GITHUB_ENV"
+          echo "HOME -> $job_home (persistent home $HOME kept for CARGO_HOME, RUSTUP_HOME and the target cache)"
 
       # qontinui-runner's frontend cross-repo deps now resolve via npm
       # (see package.json: @qontinui/* moved from link: to ^x.y.z ranges).
@@ -291,16 +445,28 @@ jobs:
         with:
           repo: qontinui/ui-bridge
 
+      # On the self-hosted pool `dest` is per-JOB ($RUNNER_TEMP), so two
+      # concurrent jobs never install into one tree. Hosted runs keep the
+      # action's default (~/setup-pnpm), which the pnpm cache entries below
+      # are keyed against.
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
           version: 10.33.2
+          dest: ${{ runner.environment == 'self-hosted' && format('{0}/setup-pnpm', runner.temp) || '~/setup-pnpm' }}
 
+      # The pnpm-store CACHE is hosted-only. On the pool the store lives under
+      # the per-job `dest` (action-setup points PNPM_HOME there), so a restore
+      # would only download a store nobody keeps, and a save would put a
+      # pool-built entry into this repo's 10 GB cache beside main's rust cache.
+      # BOTH inputs are needed: setup-node v5 also caches on its own whenever
+      # package.json names a `packageManager` and `cache` is empty.
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
           node-version: "20"
-          cache: "pnpm"
+          cache: ${{ runner.environment == 'github-hosted' && 'pnpm' || '' }}
+          package-manager-cache: ${{ runner.environment == 'github-hosted' }}
           cache-dependency-path: pnpm-lock.yaml
 
       # Gates the pure-JS parsers that `Report test results to coord` below
@@ -328,6 +494,108 @@ jobs:
         with:
           toolchain: "1.95.0"
           components: rustfmt, clippy
+
+      # SELF-HOSTED ONLY. Three things a hosted VM hands every job and a
+      # persistent host has to be told:
+      #
+      #   1. THE SYSTEM PACKAGES. `Install dependencies (Ubuntu)` below runs
+      #      `sudo apt-get`, and a pool job account has no sudo
+      #      (qontinui-claude-config volunteer-ci-runners.md section 2), so the
+      #      host is provisioned once and this step checks it. A missing package
+      #      fails HERE, naming the runner: that red is the host's, not the PR's.
+      #   2. A MEMORY-DERIVED COMPILE CAP. Every cargo step in this job runs at
+      #      cargo's default parallelism (= nproc), which on a 128-thread host is
+      #      a memory spike no unit cap survives. CARGO_BUILD_JOBS is the
+      #      smallest of MemTotal and every cgroup memory.max/memory.high above
+      #      this job, / 5 GiB, clamped to nproc, and 1 at or below 8 GiB.
+      #      Why 5 and not qontinui-coord's 3: measured on nawa-runner-2
+      #      (2026-11-03, 60 GiB unit), the cold `Build Rust tests` at 3 GiB per
+      #      job (20 jobs) peaked at 54.1 GiB — two `qontinui_runner` rustc
+      #      processes alone held 17-24 GiB each, so the giant crates, not the
+      #      job count, set the floor, and 3 GiB per job left ~6 GiB of
+      #      headroom under MemoryHigh. RUST_TEST_THREADS is 4, the hosted
+      #      leg's own value (nproc of its 4-core VM): the suite's concurrency
+      #      regime does not change with the machine it lands on, and coord's
+      #      ingest keeps recording both under the one `ubuntu-22.04` shard.
+      #   3. A WARM, PERSISTENT TARGET. actions/checkout cleans with `git clean
+      #      -ffdx`, which deletes ./target on every job. So the target lives
+      #      outside the workspace, under the account's persistent home
+      #      (CI_POOL_HOME, set above), ONE per runner registration (two jobs
+      #      never share a cargo build lock), and ./target is a symlink to it:
+      #      the clean removes the link, never the tree behind it.
+      #      CARGO_TARGET_DIR is deliberately NOT set. The link is added to
+      #      .git/info/exclude, because `target/` in .gitignore does not match
+      #      a symlink, and build.rs's `git status --porcelain` would otherwise
+      #      stamp every pool build dirty. Bounded: a target over 150 GiB, under
+      #      60 GiB free on its filesystem, or unreadable, starts cold.
+      - name: "Self-hosted: system packages, compile caps and the persistent target"
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          missing=""
+          if command -v pkg-config >/dev/null; then
+            for pc in webkit2gtk-4.1 javascriptcoregtk-4.1 libsoup-3.0 gtk+-3.0 \
+                      ayatana-appindicator3-0.1 librsvg-2.0 dbus-1 atspi-2 openssl; do
+              pkg-config --exists "$pc" || missing="$missing $pc"
+            done
+          else
+            missing="$missing pkg-config"
+          fi
+          for tool in cc make curl wget file git python3; do
+            command -v "$tool" >/dev/null || missing="$missing $tool"
+          done
+          python3 -c 'import yaml' 2>/dev/null || missing="$missing python3-yaml"
+          if [ -n "$missing" ]; then
+            echo "::error title=self-hosted host not provisioned::runner '$RUNNER_NAME' lacks:$missing. The HOST is at fault, not this change: provision it. A re-run goes to the hosted floor; RUNNER_CI_LINUX_LANE=hosted keeps new runs off the pool."
+            exit 1
+          fi
+
+          budget_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+          cg="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          while [ "$cg" != "/sys/fs/cgroup" ] && [ -n "$cg" ]; do
+            for f in memory.max memory.high; do
+              v=$(cat "$cg/$f" 2>/dev/null || echo max)
+              case "$v" in ''|*[!0-9]*) continue ;; esac
+              if [ $((v / 1024)) -lt "$budget_kb" ]; then budget_kb=$((v / 1024)); fi
+            done
+            cg="${cg%/*}"
+          done
+          cpus=$(nproc)
+          jobs=$(( budget_kb / 5242880 ))
+          [ "$budget_kb" -gt 8388608 ] || jobs=1
+          [ "$jobs" -ge 1 ] || jobs=1
+          [ "$jobs" -le "$cpus" ] || jobs=$cpus
+          threads=4
+          [ "$threads" -le "$cpus" ] || threads=$cpus
+          echo "CARGO_BUILD_JOBS=$jobs" >> "$GITHUB_ENV"
+          echo "RUST_TEST_THREADS=$threads" >> "$GITHUB_ENV"
+          echo "memory budget $((budget_kb / 1048576)) GiB, nproc $cpus -> CARGO_BUILD_JOBS=$jobs RUST_TEST_THREADS=$threads"
+
+          cache="$CI_POOL_HOME/.cache/qontinui-runner-ci/$RUNNER_NAME/target"
+          mkdir -p "$cache"
+          if ! used_kb=$(du -sk "$cache" 2>/dev/null | cut -f1) || [ -z "$used_kb" ]; then
+            echo "::notice title=persistent target reset::du could not read $cache: starting cold"
+            chmod -R u+rwX "${cache:?}" 2>/dev/null || true
+            rm -rf "${cache:?}"
+            mkdir -p "$cache"
+            used_kb=0
+          fi
+          free_kb=$(df -Pk "$cache" | awk 'NR == 2 {print $4}')
+          if [ "$used_kb" -gt $((150 * 1048576)) ] || [ "$free_kb" -lt $((60 * 1048576)) ]; then
+            echo "::notice title=persistent target reset::$((used_kb / 1048576)) GiB used, $((free_kb / 1048576)) GiB free on its filesystem: starting cold"
+            chmod -R u+rwX "${cache:?}" 2>/dev/null || true
+            rm -rf "${cache:?}"
+            mkdir -p "$cache"
+            used_kb=0
+          fi
+          if [ -e target ] && [ ! -L target ]; then rm -rf target; fi
+          ln -sfn "$cache" target
+          exclude="$(git rev-parse --git-path info/exclude)"
+          mkdir -p "$(dirname "$exclude")"
+          grep -qx '/target' "$exclude" 2>/dev/null || echo '/target' >> "$exclude"
+          echo "target -> $cache ($((used_kb / 1048576)) GiB already built)"
 
       # Cargo.lock must match the PINNED qontinui-schemas tree (plan
       # 2026-08-31-schemas-releases-strand-consumer-cargo-locks §7.4 Phase 3).
@@ -373,8 +641,11 @@ jobs:
       # above it — 624s, 1370s, 3634s — are deliberately cut) while
       # converting a hang into a fast, obvious failure and an immediate
       # re-propose.
+      # Hosted only: a self-hosted job account has no sudo, and the pool host
+      # carries these packages already (checked by the "Self-hosted: system
+      # packages, ..." step above).
       - name: Install dependencies (Ubuntu)
-        if: matrix.platform == 'ubuntu-22.04'
+        if: matrix.platform == 'ubuntu-22.04' && runner.environment == 'github-hosted'
         timeout-minutes: 10
         run: |
           sudo apt-get update
@@ -404,8 +675,10 @@ jobs:
       # crate gdk-sys was not found" — gdk-sys compile fails). android + dotnet +
       # haskell + docker-images alone reclaim ~20 GB, which is ample headroom
       # without touching the apt libs installed above.
+      # Hosted only: on a persistent self-hosted host this would `sudo rm -rf`
+      # toolchains and prune docker images that belong to the host.
       - name: Free disk space (Ubuntu)
-        if: matrix.platform == 'ubuntu-22.04'
+        if: matrix.platform == 'ubuntu-22.04' && runner.environment == 'github-hosted'
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: false
@@ -426,8 +699,11 @@ jobs:
       # CARGO_BUILD_JOBS alone wasn't enough — link is single-threaded.
       # Pre-allocate paging space so the OS can absorb the spike instead
       # of the runner agent dying.
+      # Hosted only: `sudo swapoff -a` on a shared self-hosted host would take
+      # the swap from every other tenant; the pool unit's memory is bounded by
+      # its own cgroup instead.
       - name: Add swapfile (Ubuntu — guard against link-time OOM)
-        if: matrix.platform == 'ubuntu-22.04'
+        if: matrix.platform == 'ubuntu-22.04' && runner.environment == 'github-hosted'
         run: |
           sudo swapoff -a || true
           sudo fallocate -l 12G /swapfile
@@ -491,7 +767,14 @@ jobs:
       # saves from merge-candidate/* refs are invisible to sibling
       # candidates. The cache that matters is the one saved by `main` runs
       # (every land), which all candidates and PRs can restore.
+      # Hosted only. A self-hosted job builds in its registration's persistent
+      # target (set up above), and must never SAVE into this repo's GitHub
+      # cache: the key carries the OS but not the distro, so a cache saved by a
+      # Debian 13 pool host on a main push would be restored by the next hosted
+      # ubuntu-22.04 run — build-script and proc-macro binaries linked against a
+      # newer glibc than ubuntu-22.04's 2.35.
       - name: Cache Rust dependencies
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           # Workspace root is the repo root: ./Cargo.toml -> ./target
@@ -917,7 +1200,14 @@ jobs:
           #     on purpose. The legs are throttled for different reasons, and
           #     ci_rust_test_steps_split.rs pins that each stays separately
           #     tunable.
-          CARGO_BUILD_JOBS: ${{ matrix.platform == 'windows-latest' && '1' || '1' }}
+          #   - 2026-11-03: a SELF-HOSTED ubuntu leg (the `route` job) is not
+          #     the 16 GB hosted VM this ladder was measured on. It takes the
+          #     memory-derived cap the "Self-hosted: system packages, compile
+          #     caps and the persistent target" step exported (cgroup budget /
+          #     5 GiB, clamped to nproc; that step says why 5); '1' remains its
+          #     fallback when that step exported nothing. The hosted arms are
+          #     unchanged.
+          CARGO_BUILD_JOBS: ${{ matrix.platform == 'windows-latest' && '1' || (runner.environment == 'self-hosted' && env.CARGO_BUILD_JOBS || '1') }}
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             echo "=== free / df before cargo test ==="
