@@ -3,10 +3,28 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { FolderSearch, Plus, Loader2, X } from "lucide-react";
 
-interface DiscoveredDir {
+export interface DiscoveredDir {
   path: string;
   label: string;
   source: string;
+}
+
+/**
+ * The roster this step should save, or `null` to leave the configured roster
+ * untouched.
+ *
+ * `save_claude_config_dirs` REPLACES the machine-global roster
+ * (`claude-accounts.json`) with exactly the list it is given. So an empty
+ * selection must not be saved: on 2026-11-03 this step found nothing on a Linux
+ * box (discovery only looked in Windows locations), saved `[]`, and emptied a
+ * 17-account roster, after which every new session fell back to the ambient
+ * `~/.claude`. Discovery now returns the configured roster too, so a non-empty
+ * selection already contains it. Removing every account is a deliberate act
+ * for the Settings page, not a side effect of finishing the first-run wizard.
+ */
+export function claudeDirsToSave(dirs: DiscoveredDir[], checked: Set<string>): string[] | null {
+  const selected = dirs.filter((d) => checked.has(d.path)).map((d) => d.path);
+  return selected.length > 0 ? selected : null;
 }
 
 interface ClaudeConfigStepProps {
@@ -82,8 +100,11 @@ export function ClaudeConfigStep({ onComplete, onBack }: ClaudeConfigStepProps) 
   const handleFinish = useCallback(async () => {
     setSaving(true);
     try {
-      const selectedDirs = dirs.filter((d) => checked.has(d.path)).map((d) => d.path);
-      await invoke("save_claude_config_dirs", { dirs: selectedDirs });
+      const selectedDirs = claudeDirsToSave(dirs, checked);
+      // null = nothing selected: keep the configured roster (see claudeDirsToSave).
+      if (selectedDirs !== null) {
+        await invoke("save_claude_config_dirs", { dirs: selectedDirs });
+      }
     } catch (err) {
       console.error("Failed to save Claude config dirs:", err);
     } finally {
