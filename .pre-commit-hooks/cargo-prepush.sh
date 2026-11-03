@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Pre-push guard: mirrors CI's Rust gate so a correctness failure is surfaced
-# in 60-90s of local cycle time instead of 8-15 min of CI roundtrip per push.
+# Pre-push guard: mirrors the default-target clippy/fmt gate of CI's ubuntu leg so a
+# correctness failure is surfaced in 60-90s of local cycle time instead of
+# 8-15 min of CI roundtrip per push. CI's parallel `clippy-windows` job ALSO
+# lints test targets (`--all-targets`), so a deny-tier lint in shared
+# #[cfg(test)] code passes this hook and fails that job (see the T1 note below).
 # Tiered per plan 2026-07-05-lint-tiers-and-diff-scoped-gates: formatting
 # auto-applies (never blocks), and clippy runs plain (no `-D warnings`) so only
 # deny-tier (correctness/suspicious) lints from Cargo.toml [lints.clippy] block.
@@ -88,8 +91,8 @@ if [[ -f "$PUSH_RANGE_LIB" && -f "$CRATE_INPUTS_LIB" ]]; then
     echo "[pre-push] no upstream, origin/HEAD or origin/main to scope the diff against — running the full gate"
   else
     # THE SCOPE IS NOT `src-tauri/`, and the gap is not only about embeds.
-    # `cd src-tauri && cargo clippy` — this hook's own command, and CI's —
-    # also compiles the in-repo path dependencies (`crates/spec-check`,
+    # `cd src-tauri && cargo clippy` — this hook's own command, and CI's
+    # (clippy-windows adds `--all-targets`) — also compiles the in-repo path dependencies (`crates/spec-check`,
     # `crates/runner-stats`, `crates/runner-win32`, `vendor/tao-0.35.0`), reads
     # what `build.rs` declares (`src/components/app/tab-types.ts`, whose
     # absence build.rs turns into a deliberate `panic!`), and takes its verdict
@@ -443,8 +446,12 @@ if [[ "$SKIP_CLIPPY" == "1" ]]; then
 fi
 
 # T1 (correctness) — block. Plain `cargo clippy`: NO `--all-targets` (that
-# compiles #[cfg(test)] modules this PR didn't touch — stricter than CI and a
-# frequent source of unrelated-lint push blocks) and NO `-D warnings` (that
+# compiles #[cfg(test)] modules this PR didn't touch, a frequent source of
+# unrelated-lint push blocks, and it would lengthen every push on fleet
+# hosts). This makes the hook LOOSER than CI's `clippy-windows` job for test
+# code — that job runs `--all-targets` per PR (qontinui-runner#2392), so a
+# deny-tier lint in shared #[cfg(test)] code is caught there, not here; the
+# ubuntu leg stays default-target like this hook. Also NO `-D warnings` (that
 # would promote every warning to an error and neuter the Cargo.toml tiering).
 # Lint levels come solely from `[lints.clippy]` in src-tauri/Cargo.toml: a
 # `deny`-tier (correctness/suspicious) lint still exits non-zero and blocks,
@@ -501,7 +508,7 @@ case "$GUARD_RC" in
     echo "[pre-push] CANNOT RUN CLIPPY GUARDED — ${SHARED_TARGET_GUARD_REASON:-guard rc $GUARD_RC}." >&2
     echo "[pre-push]   A clippy run without the tree lock can replay a PEER worktree's build as" >&2
     echo "[pre-push]   Fresh and report errors that are not in this tree, so it is not run." >&2
-    echo "[pre-push]   CI still gates clippy ('test (ubuntu-22.04)', 'clippy-windows'); fmt above" >&2
+    echo "[pre-push]   CI still gates clippy ('test (ubuntu-22.04)', 'Clippy (windows)'); fmt above" >&2
     echo "[pre-push]   still ran. This costs LATENCY, NOT COVERAGE." >&2
     if [[ "$STRICT" == "1" ]]; then
       echo "[pre-push]   QONTINUI_PREPUSH_STRICT=1 — treating this as a failure." >&2
