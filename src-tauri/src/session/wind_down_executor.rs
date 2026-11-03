@@ -2128,6 +2128,7 @@ mod tests {
             session_id: session_id.map(str::to_string),
             session_status: Some("finished".to_string()),
             session_status_since: None,
+            binding_state: None,
             blocks_restart: false,
             wind_down: verdict.map(|eligibility| wind_down::WindDownView {
                 eligibility: match eligibility {
@@ -2910,6 +2911,7 @@ mod tests {
                 gate_id: None,
                 gate_consuming_device_id: None,
                 gate_bound_boot_ms: None,
+                binding_state: None,
             },
         );
         assert!(store.get("s1").unwrap().wind_down_outcome.is_none());

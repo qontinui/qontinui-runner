@@ -772,6 +772,7 @@ pub async fn dispatch_subtask(
                 gate_id: None,
                 gate_consuming_device_id: None,
                 gate_bound_boot_ms: None,
+                binding_state: None,
             },
         );
         info!(

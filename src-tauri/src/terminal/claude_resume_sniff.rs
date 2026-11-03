@@ -12,13 +12,32 @@
 //! Consumes the SAME completed-line stream as the L3 git-warn observer
 //! (`TerminalSession::observe_input`). Best-effort and SOFT throughout: never
 //! blocks input; all effects dispatch on a detached async task.
+//!
+//! ## A line typed INTO a running `claude` is not a launch
+//!
+//! The stream is every line written to the pane, so a prompt pasted into a
+//! running `claude` that happens to start `claude --resume <id>` parses like a
+//! shell command. Recording that authoritatively binds a session the pane does
+//! not run (plan `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`,
+//! Phase 3c). So the effects first ask where the line went
+//! ([`typed_line_target`]): only a line the pane's SHELL read is recorded
+//! authoritatively and registered with coord. Otherwise the record is
+//! PROVISIONAL — `reconciled`, unconfirmed: it supersedes nothing, and the
+//! store's binding guard never lets such a weak bind take a row from a live
+//! pane that runs the session or cannot be read — pending the pane's own
+//! registry record, which the reconcile pass binds from (rung 2b) if the
+//! session really runs there.
 
 use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter, Manager};
 use tracing::{debug, info, warn};
 
-use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
+use crate::session::session_lifecycle_store::{
+    RecordOpenOutcome, SessionLifecycleStore, TerminalSessionRecord, ORIGIN_AUTHORITATIVE,
+    ORIGIN_RECONCILED,
+};
+use crate::terminal::graceful_exit::ClaudeProbe;
 
 /// A typed input line recognized as a `claude` invocation carrying an
 /// explicit session id.
@@ -98,6 +117,64 @@ fn is_session_uuid(s: &str) -> bool {
         })
 }
 
+/// Who read a typed line — decides how far the sniff may trust it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TypedLineTarget {
+    /// The pane's shell read it: whatever `claude` the line launches runs the
+    /// id it names. Recorded authoritatively.
+    Shell,
+    /// A `claude` already running in the pane and reading the terminal read it
+    /// — the line was input to that session, not a launch. Recorded
+    /// provisionally.
+    Claude,
+    /// The pane's processes could not be read, or a `claude` reading the
+    /// terminal has no start time to place before or after the line. Recorded
+    /// provisionally.
+    Unknown,
+}
+
+/// A `claude` that started at least this many seconds before the line was the
+/// one reading it; one that started later is the one the line launched.
+/// Process start times are whole seconds, so one second of rounding either way
+/// plus a beat for the probe.
+const LAUNCH_SKEW_SECS: i64 = 2;
+
+/// Where the line completed at `line_at_ms` went, from a probe of the pane
+/// taken just after it. `reads_terminal` says whether a pid owns the pane's
+/// terminal now (the foreground process group on Linux — a `claude` suspended
+/// with Ctrl-Z or started with `&` leaves the shell reading). Pure.
+///
+/// The probe runs AFTER the line, so the `claude` the line itself launched may
+/// already be in it; that one started at or after the line and is not counted.
+/// A `claude` that started before the line and reads the terminal read the
+/// line.
+pub(crate) fn typed_line_target(
+    probe: &ClaudeProbe,
+    line_at_ms: i64,
+    reads_terminal: impl Fn(u32) -> bool,
+) -> TypedLineTarget {
+    let ClaudeProbe::Readable(pane) = probe else {
+        return TypedLineTarget::Unknown;
+    };
+    let line_at_secs = line_at_ms / 1000;
+    let mut start_unknown = false;
+    for claude in &pane.subtree_claude {
+        if !reads_terminal(claude.pid) {
+            continue;
+        }
+        if claude.started_at <= 0 {
+            start_unknown = true;
+        } else if claude.started_at + LAUNCH_SKEW_SECS <= line_at_secs {
+            return TypedLineTarget::Claude;
+        }
+    }
+    if start_unknown {
+        TypedLineTarget::Unknown
+    } else {
+        TypedLineTarget::Shell
+    }
+}
+
 /// Apply the three effects of a recognized typed resume line: (1) `record_open`
 /// the session in the lifecycle store — a NEW writer arm beside the existing
 /// frontend-command / continuation-poller writers (structural dedup by
@@ -111,9 +188,19 @@ fn is_session_uuid(s: &str) -> bool {
 /// invoke `emit_bypass` (production emits `terminal-bypass-permissions`).
 /// Split out from [`spawn_register_typed_resume`] so the trio is testable
 /// without a Tauri app.
+///
+/// `target` decides how far each effect goes ([`TypedLineTarget`]):
+///
+/// | target | record | coord | bypass event |
+/// |---|---|---|---|
+/// | `Shell` | authoritative | registered (when recorded) | when the line says so |
+/// | `Unknown` | provisional (`reconciled`, unconfirmed) | no | when the line says so |
+/// | `Claude` | provisional | no | no — nothing was launched |
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_typed_resume_effects(
     store: Option<&SessionLifecycleStore>,
     parsed: &TypedClaudeResume,
+    target: TypedLineTarget,
     terminal_id: &str,
     working_dir: &str,
     page_id: &str,
@@ -121,9 +208,10 @@ pub(crate) fn apply_typed_resume_effects(
     register_coord: impl FnOnce(),
     emit_bypass: impl FnOnce(),
 ) {
+    let launched = target == TypedLineTarget::Shell;
     match store {
         Some(store) => {
-            store.record_open(TerminalSessionRecord {
+            let outcome = store.record_open(TerminalSessionRecord {
                 claude_session_id: parsed.claude_session_id.clone(),
                 // config_dir None → restore scans every known config dir.
                 // Zone unknown backend-side → 0 (wrong zone beats a lost
@@ -140,10 +228,17 @@ pub(crate) fn apply_typed_resume_effects(
                 closed_at: None,
                 close_reason: None,
                 provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
-                // Exact id lifted from the typed `--resume`/`--session-id`
-                // flag — authoritative, same as the spawn-argv pre-pin path.
+                // A line the shell read: the exact id lifted from the typed
+                // `--resume`/`--session-id` flag — authoritative, same as the
+                // spawn-argv pre-pin path. Any other line is a claim nothing
+                // has launched: provisional, the conservative grade.
                 origin: Some(
-                    crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string(),
+                    if launched {
+                        ORIGIN_AUTHORITATIVE
+                    } else {
+                        ORIGIN_RECONCILED
+                    }
+                    .to_string(),
                 ),
                 restore_pending_at: None,
                 awaiting_account_since: None,
@@ -173,14 +268,29 @@ pub(crate) fn apply_typed_resume_effects(
                 gate_id: None,
                 gate_consuming_device_id: None,
                 gate_bound_boot_ms: None,
+                binding_state: None,
             });
-            info!(
-                terminal_id = %terminal_id,
-                claude_session = %parsed.claude_session_id,
-                bypass = parsed.bypass_permissions,
-                "typed claude resume sniff: session durably recorded"
-            );
-            register_coord();
+            match outcome {
+                RecordOpenOutcome::Recorded => {
+                    info!(
+                        terminal_id = %terminal_id,
+                        claude_session = %parsed.claude_session_id,
+                        bypass = parsed.bypass_permissions,
+                        target = ?target,
+                        "typed claude resume sniff: session durably recorded"
+                    );
+                    if launched {
+                        register_coord();
+                    }
+                }
+                outcome => warn!(
+                    terminal_id = %terminal_id,
+                    claude_session = %parsed.claude_session_id,
+                    target = ?target,
+                    outcome = ?outcome,
+                    "typed claude resume sniff: session NOT recorded"
+                ),
+            }
         }
         None => warn!(
             terminal_id = %terminal_id,
@@ -188,7 +298,7 @@ pub(crate) fn apply_typed_resume_effects(
             "typed claude resume sniff: lifecycle store not managed — session not recorded"
         ),
     }
-    if parsed.bypass_permissions {
+    if parsed.bypass_permissions && target != TypedLineTarget::Claude {
         emit_bypass();
     }
 }
@@ -198,6 +308,11 @@ pub(crate) fn apply_typed_resume_effects(
 /// task, all failures swallowed. `tauri::async_runtime::spawn` (not bare
 /// `tokio::spawn`) so dispatch works from any caller thread —
 /// `TerminalSession::write` is reachable from bare OS threads.
+///
+/// `child_pid` is the pane's PTY child and `line_at_ms` the instant the line
+/// completed: the task probes the pane (one process-table snapshot) to decide
+/// [`TypedLineTarget`] before any effect.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_register_typed_resume(
     app_handle: AppHandle,
     terminal_id: String,
@@ -205,8 +320,16 @@ pub fn spawn_register_typed_resume(
     page_id: String,
     title: String,
     parsed: TypedClaudeResume,
+    child_pid: Option<u32>,
+    line_at_ms: i64,
 ) {
     tauri::async_runtime::spawn(async move {
+        let probe = crate::terminal::graceful_exit::probe_claude_under(child_pid, Vec::new()).await;
+        let target = typed_line_target(
+            &probe,
+            line_at_ms,
+            crate::mcp::session_message_poller::pid_reads_its_terminal,
+        );
         let store = app_handle
             .try_state::<Arc<SessionLifecycleStore>>()
             .map(|s| s.inner().clone());
@@ -235,6 +358,7 @@ pub fn spawn_register_typed_resume(
         apply_typed_resume_effects(
             store.as_deref(),
             &parsed,
+            target,
             &terminal_id,
             &working_dir,
             &page_id,
@@ -341,6 +465,7 @@ mod tests {
         apply_typed_resume_effects(
             Some(&store),
             &parsed,
+            TypedLineTarget::Shell,
             "term-1",
             "C:/repo",
             "default",
@@ -374,6 +499,7 @@ mod tests {
         apply_typed_resume_effects(
             Some(&store),
             &parsed,
+            TypedLineTarget::Shell,
             "term-1",
             "C:/repo",
             "default",
@@ -397,6 +523,7 @@ mod tests {
         apply_typed_resume_effects(
             None,
             &parsed,
+            TypedLineTarget::Shell,
             "term-1",
             "C:/repo",
             "default",
@@ -409,5 +536,125 @@ mod tests {
             "no store record → no coord registration"
         );
         assert!(bypass_emitted.get());
+    }
+
+    use crate::terminal::graceful_exit::{PaneProcesses, ProcIdentity};
+
+    /// The line completed at t = 10 000 s.
+    const LINE_AT_MS: i64 = 10_000_000;
+
+    fn pane(claude: &[(u32, i64)]) -> ClaudeProbe {
+        ClaudeProbe::Readable(PaneProcesses {
+            subtree_claude: claude
+                .iter()
+                .map(|&(pid, started_at)| ProcIdentity { pid, started_at })
+                .collect(),
+            top_level_children: 0,
+            tracked_alive: Vec::new(),
+        })
+    }
+
+    /// Plan `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`,
+    /// Phase 3c: only a line the pane's SHELL read is a launch.
+    #[test]
+    fn typed_line_target_tells_a_shell_line_from_a_prompt_typed_into_claude() {
+        let all = |_: u32| true;
+        // No claude in the pane: the shell read it.
+        assert_eq!(
+            typed_line_target(&pane(&[]), LINE_AT_MS, all),
+            TypedLineTarget::Shell
+        );
+        // A claude running since long before the line, reading the terminal:
+        // the line was a prompt to it.
+        assert_eq!(
+            typed_line_target(&pane(&[(7, 9_000)]), LINE_AT_MS, all),
+            TypedLineTarget::Claude
+        );
+        // The claude the line itself launched (it started with the line) is
+        // not the reader.
+        assert_eq!(
+            typed_line_target(&pane(&[(7, 10_000)]), LINE_AT_MS, all),
+            TypedLineTarget::Shell
+        );
+        assert_eq!(
+            typed_line_target(&pane(&[(7, 9_999)]), LINE_AT_MS, all),
+            TypedLineTarget::Shell,
+            "within the launch skew"
+        );
+        // A claude that does not own the terminal (Ctrl-Z, `&`) leaves the
+        // shell reading.
+        assert_eq!(
+            typed_line_target(&pane(&[(7, 9_000)]), LINE_AT_MS, |_| false),
+            TypedLineTarget::Shell
+        );
+        // A reading claude with no start time cannot be placed: unknown.
+        assert_eq!(
+            typed_line_target(&pane(&[(7, 0)]), LINE_AT_MS, all),
+            TypedLineTarget::Unknown
+        );
+        // ... unless another one demonstrably predates the line.
+        assert_eq!(
+            typed_line_target(&pane(&[(7, 0), (8, 9_000)]), LINE_AT_MS, all),
+            TypedLineTarget::Claude
+        );
+        // An unreadable pane says nothing.
+        assert_eq!(
+            typed_line_target(&ClaudeProbe::Unreadable("x".into()), LINE_AT_MS, all),
+            TypedLineTarget::Unknown
+        );
+    }
+
+    /// A line a running `claude` read is recorded PROVISIONALLY: reconciled and
+    /// unconfirmed — so it supersedes nothing on the pane — with no coord
+    /// identity and no bypass event (nothing was launched). An unreadable pane
+    /// is provisional too, but keeps the bypass mark the line carries.
+    #[test]
+    fn a_line_not_read_by_the_shell_is_recorded_provisionally() {
+        for (target, bypass_expected) in [
+            (TypedLineTarget::Claude, false),
+            (TypedLineTarget::Unknown, true),
+        ] {
+            let dir = tempdir().unwrap();
+            let store =
+                SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+            // The pane's own session, pinned at spawn.
+            let mut own = crate::session::session_lifecycle_store::test_open_record("pane-own");
+            own.terminal_id = "term-1".to_string();
+            own.origin = Some(ORIGIN_AUTHORITATIVE.to_string());
+            store.record_open(own);
+
+            let parsed = parse(&format!(
+                "claude --resume {UUID} --dangerously-skip-permissions"
+            ))
+            .unwrap();
+            let coord_registered = Cell::new(false);
+            let bypass_emitted = Cell::new(false);
+            apply_typed_resume_effects(
+                Some(&store),
+                &parsed,
+                target,
+                "term-1",
+                "C:/repo",
+                "default",
+                "Terminal 1",
+                || coord_registered.set(true),
+                || bypass_emitted.set(true),
+            );
+
+            let sniffed = store.get(UUID).expect("provisional row recorded");
+            assert_eq!(
+                sniffed.origin.as_deref(),
+                Some(ORIGIN_RECONCILED),
+                "{target:?}"
+            );
+            assert!(sniffed.confirmed_at.is_none(), "{target:?}");
+            assert_eq!(
+                store.get("pane-own").unwrap().state,
+                "open",
+                "{target:?}: a provisional record supersedes nothing"
+            );
+            assert!(!coord_registered.get(), "{target:?}: no coord identity");
+            assert_eq!(bypass_emitted.get(), bypass_expected, "{target:?}");
+        }
     }
 }

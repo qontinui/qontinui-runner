@@ -84,8 +84,21 @@ pub struct PastSession {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub close_reason: Option<String>,
     /// Runner terminal id that hosted the session (registry rows only).
+    /// Withheld when [`Self::binding_state`] is `unknown`: that pane's own
+    /// `claude` records ANOTHER session, so pairing this row's name with the
+    /// terminal would label the pane with a session it does not run — the
+    /// 2026-10-25 symptom (plan
+    /// `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_id: Option<String>,
+    /// Does the pane at the row's terminal run THIS session, by its own
+    /// `claude`'s record? `"matched"` / `"unknown"`
+    /// ([`crate::session::session_lifecycle_store::BindingState`]); absent
+    /// while unchecked and on every snapshot-sourced row. A consumer that
+    /// labels, nudges or closes a terminal by this row must treat `unknown`
+    /// as UNKNOWN — and an absent field as an older runner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding_state: Option<crate::session::session_lifecycle_store::BindingState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -340,6 +353,8 @@ fn build_enriched(
         state,
         close_reason,
         terminal_id,
+        // Set by `past_from_record` — the only source that carries one.
+        binding_state: None,
         config_dir,
         working_dir,
         resume_dir,
@@ -364,8 +379,10 @@ fn build_enriched(
 }
 
 fn past_from_record(rec: &TerminalSessionRecord) -> PastSession {
+    use crate::session::session_lifecycle_store::BindingState;
     let confirmed = rec.confirmed_at.is_some();
-    build_enriched(
+    let unevidenced = rec.binding_state == Some(BindingState::Unknown);
+    let mut row = build_enriched(
         rec.claude_session_id.clone(),
         rec.config_dir.clone(),
         rec.working_dir.clone(),
@@ -374,7 +391,8 @@ fn past_from_record(rec: &TerminalSessionRecord) -> PastSession {
         rec.state.clone(),
         rec.close_reason.clone(),
         // Blank = unbound (a row held for an account choice): no terminal.
-        Some(rec.terminal_id.clone()).filter(|t| !t.trim().is_empty()),
+        // An unevidenced binding names no terminal either (see the field).
+        Some(rec.terminal_id.clone()).filter(|t| !t.trim().is_empty() && !unevidenced),
         rec.provider.clone(),
         rec.last_seen_at,
         rec.opened_at,
@@ -385,7 +403,9 @@ fn past_from_record(rec: &TerminalSessionRecord) -> PastSession {
         rec.restore_tier.as_deref(),
         rec.restore_pending_at,
         rec.finished_at.map(|at| (at, rec.finish_reason.clone())),
-    )
+    );
+    row.binding_state = rec.binding_state;
+    row
 }
 
 fn past_from_snapshot(s: &SnapshotSession) -> PastSession {
@@ -662,6 +682,7 @@ mod tests {
             state: "closed".to_string(),
             close_reason: None,
             terminal_id: None,
+            binding_state: None,
             config_dir: None,
             working_dir: None,
             resume_dir: None,
@@ -700,5 +721,38 @@ mod tests {
         // Exactly two distinct cohorts.
         let distinct: std::collections::HashSet<_> = sessions.iter().map(|s| s.cohort_id).collect();
         assert_eq!(distinct.len(), 2);
+    }
+
+    /// Plan `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`: a
+    /// `/sessions/history` row serves the binding verdict as `bindingState`,
+    /// and a row whose pane runs ANOTHER session names no terminal — so a
+    /// consumer mapping terminals to rows cannot label (or nudge, or close)
+    /// that pane with this session's name. An unchecked row serves neither key
+    /// change.
+    #[test]
+    fn a_history_row_serves_binding_state_and_withholds_an_unevidenced_terminal() {
+        use crate::session::session_lifecycle_store::{test_open_record, BindingState};
+        let row = |state: Option<BindingState>| {
+            let mut rec = test_open_record("s-b");
+            rec.terminal_id = "term-a".to_string();
+            rec.binding_state = state;
+            serde_json::to_value(past_from_record(&rec)).unwrap()
+        };
+
+        let unknown = row(Some(BindingState::Unknown));
+        assert_eq!(unknown["bindingState"], "unknown");
+        assert!(unknown.get("terminalId").is_none(), "{unknown}");
+        assert_eq!(
+            unknown["claudeSessionId"], "s-b",
+            "the session itself stays listed"
+        );
+
+        let matched = row(Some(BindingState::Matched));
+        assert_eq!(matched["bindingState"], "matched");
+        assert_eq!(matched["terminalId"], "term-a");
+
+        let unchecked = row(None);
+        assert!(unchecked.get("bindingState").is_none(), "{unchecked}");
+        assert_eq!(unchecked["terminalId"], "term-a");
     }
 }

@@ -3757,6 +3757,11 @@ impl TerminalSession {
                     self.page_id(),
                     title,
                     parsed,
+                    // Who read the line is decided against the pane's
+                    // processes and the instant it completed (plan
+                    // 2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session).
+                    self.child_pid(),
+                    chrono::Utc::now().timestamp_millis(),
                 );
             }
             if super::coord_warn::is_branch_mutating_git(&line) {

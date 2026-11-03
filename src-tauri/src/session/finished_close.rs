@@ -434,6 +434,7 @@ mod tests {
             session_id: Some(sid.to_string()),
             session_status: Some("finished".to_string()),
             session_status_since: None,
+            binding_state: None,
             blocks_restart: false,
             wind_down: Some(qontinui_runner_lib::wind_down::WindDownView::from_verdict(
                 &qontinui_runner_lib::wind_down::Eligibility::Eligible { since_ms: 1 },

@@ -4444,6 +4444,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     std::sync::Arc::new(session::reconcile::DiskTranscriptIndex::discover());
                 lifecycle_store.attach_transcript_probe(transcript_index.clone());
 
+                // Pane-binding evidence (plan
+                // 2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session):
+                // what each pane's own `claude` records. The store asks it
+                // before moving a row off another pane, and for the bind-time
+                // verdict; the reconcile pass keeps it current every tick.
+                lifecycle_store.attach_pane_evidence(std::sync::Arc::new(
+                    session::pane_binding::LivePaneRegistry::new(),
+                ));
+
                 // Observation epoch (plan 2026-10-28-force-exited-runner-strands-
                 // open-sessions-out-of-the-restore-set): latch the PRIOR
                 // process's last successful observation BEFORE the census
@@ -4744,18 +4753,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         let live_terminal_ids: std::collections::HashSet<String> =
                             live.iter().map(|i| i.id.clone()).collect();
 
-                        // Transcript-anchored reconcile steady-state guard
-                        // (Phase 2 / G1). The reconcile pass disk-scans every
-                        // config dir, so only run it when it can matter: when a
-                        // LIVE PTY lacks a CONFIRMED record (spawn-record AND
-                        // hook both missed — the capture-miss the reconcile
-                        // recovers). Any live terminal that is absent from the
+                        // Does a LIVE PTY lack a CONFIRMED record (spawn-record
+                        // AND hook both missed — the capture-miss the reconcile
+                        // recovers)? Any live terminal that is absent from the
                         // open set, or present but unconfirmed, is not in
                         // `confirmed_terminals` below, so `needs_reconcile`
-                        // fires. In the common steady state (every live PTY
-                        // already confirmed) this stays false and we never
-                        // disk-scan. Fail-open — a false negative just defers to
-                        // the next tick / boot.
+                        // fires. It now decides only the idle early-continue
+                        // below: the reconcile pass itself runs every tick that
+                        // gets past it, and skips its own transcript disk work
+                        // when every live pane is confirmed.
                         let confirmed_terminals: std::collections::HashSet<String> = open
                             .iter()
                             .filter(|r| r.confirmed_at.is_some())
@@ -5254,54 +5260,53 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // `claude.exe` that bypasses the PATH shim entirely)
                         // within one poll interval, while its PTY is still live,
                         // instead of only at the next boot. REUSES this tick's
-                        // `snap` (no 2nd process scan) and the steady-state
-                        // `needs_reconcile` guard above (skips the disk scan when
-                        // every live PTY is already confirmed). Runs even when
-                        // `open` was empty — that IS the capture-miss case. The
-                        // pass itself resolves each PTY's claude anchor from
-                        // `snap` and issues the targeted `--session-id` cmdline
-                        // query for the unbound anchors only. Fail-open: every
-                        // store / cmdline / snapshot op inside swallows its own
-                        // errors, so a failure degrades to "bound nothing this
-                        // tick", never a panic that would break the liveness loop.
-                        if needs_reconcile {
-                            let live_ptys: Vec<session::reconcile::LivePty> = live
-                                .iter()
-                                .map(|i| session::reconcile::LivePty {
-                                    terminal_id: i.id.clone(),
-                                    pid: i.pid,
-                                    working_dir: i.working_dir.clone(),
-                                    page_id: i.page_id.clone(),
-                                    title: i.title.clone(),
-                                    // run_reconcile_pass resolves the claude
-                                    // anchor from the snapshot it is handed.
-                                    ai_pid: None,
-                                    ai_start_unix: None,
-                                })
-                                .collect();
-                            let actions = session::reconcile::run_reconcile_pass(
-                                &poll_lifecycle_store,
-                                &live_ptys,
-                                &snap,
-                                "periodic",
-                            )
-                            .await;
-                            emit_session_bound(&poll_app_handle, &actions);
-                            // Rung-2 binds re-key the pane's coord row (plan
-                            // 2026-10-23-a-hookless-resume-…, Phase 1a).
-                            session::coord_identity::apply_reconcile_tick_in_app(
-                                &poll_app_handle,
-                                &actions,
-                            );
-                        } else {
-                            // No pass this tick, but a refused re-key still
-                            // has to be restored (and, for the hook / R2
-                            // sources, re-queued) on the tick cadence.
-                            session::coord_identity::apply_reconcile_tick_in_app(
-                                &poll_app_handle,
-                                &[],
-                            );
-                        }
+                        // `snap` (no 2nd process scan). Runs even when `open`
+                        // was empty — that IS the capture-miss case.
+                        //
+                        // It runs on EVERY tick (plan
+                        // 2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session):
+                        // besides binding, the pass checks every live pane's
+                        // open rows against the pane's own `claude` record, and
+                        // a wrong binding is precisely a pane that already
+                        // reads confirmed — the state the old `needs_reconcile`
+                        // gate skipped. The pass keeps the steady state cheap by
+                        // itself: no cmdline query and no transcript prescan
+                        // unless some pane is unbound; per tick it reads only
+                        // each live `claude`'s small `sessions/<pid>.json`.
+                        // Fail-open: every store / cmdline / snapshot op inside
+                        // swallows its own errors, so a failure degrades to
+                        // "bound nothing this tick", never a panic that would
+                        // break the liveness loop.
+                        let live_ptys: Vec<session::reconcile::LivePty> = live
+                            .iter()
+                            .map(|i| session::reconcile::LivePty {
+                                terminal_id: i.id.clone(),
+                                pid: i.pid,
+                                working_dir: i.working_dir.clone(),
+                                page_id: i.page_id.clone(),
+                                title: i.title.clone(),
+                                // run_reconcile_pass resolves the claude
+                                // anchor from the snapshot it is handed.
+                                ai_pid: None,
+                                ai_start_unix: None,
+                            })
+                            .collect();
+                        let actions = session::reconcile::run_reconcile_pass(
+                            &poll_lifecycle_store,
+                            &live_ptys,
+                            &snap,
+                            "periodic",
+                        )
+                        .await;
+                        emit_session_bound(&poll_app_handle, &actions);
+                        // Rung-2 binds re-key the pane's coord row (plan
+                        // 2026-10-23-a-hookless-resume-…, Phase 1a); a refused
+                        // re-key is restored (and, for the hook / R2 sources,
+                        // re-queued) on the same tick cadence.
+                        session::coord_identity::apply_reconcile_tick_in_app(
+                            &poll_app_handle,
+                            &actions,
+                        );
 
                         // Title convergence (phantom-id plan B6). An in-Claude
                         // `/rename` emits NO OSC-0 title, so the runner's rename
@@ -5310,11 +5315,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // pane mislabelled). This adopts the provider's own
                         // session name from its live-session index.
                         //
-                        // Deliberately OUTSIDE the `needs_reconcile` guard: that
-                        // guard is false precisely when every live PTY is bound
-                        // and confirmed — which is exactly the state a session
-                        // gets renamed in. Gating this on it would mean it never
-                        // ran. Reuses this tick's `snap`; fail-open.
+                        // Never gate this on `needs_reconcile`: that is false
+                        // precisely when every live PTY is bound and confirmed —
+                        // which is exactly the state a session gets renamed in.
+                        // Reuses this tick's `snap`; fail-open.
                         let live_for_titles: Vec<session::reconcile::LivePty> = live
                             .iter()
                             .map(|i| session::reconcile::LivePty {

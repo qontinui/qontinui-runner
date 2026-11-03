@@ -160,6 +160,22 @@ pub struct RecordEvidence {
     /// only for `busy`/`shell` records. `None` when not read, not located, or
     /// no such line was in the tail.
     pub last_message_ms: Option<i64>,
+    /// The `sessionId` the record names — the session this process runs NOW
+    /// (Claude Code rewrites it on `/clear` and on an in-TUI resume). `None`
+    /// when absent or blank. Read by the pane-binding check
+    /// ([`crate::session::pane_binding`]); the activity classification ignores
+    /// it.
+    pub session_id: Option<String>,
+}
+
+/// Whether [`read_records`] reads a `busy`/`shell` session's transcript tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptTail {
+    /// Read it: the activity classification needs the last message's age.
+    Read,
+    /// Skip it: the caller wants only the record's identity (`sessionId`), so
+    /// up to [`TRANSCRIPT_TAIL_BYTES`] per busy session would be wasted I/O.
+    Skip,
 }
 
 /// A live `claude` pid whose record should be read, with the start time the
@@ -284,6 +300,12 @@ fn parse_record(bytes: &str, pid: u32) -> Result<(RawRecord, RecordEvidence), ()
         status: raw.status.clone().unwrap_or_default(),
         status_updated_at_ms: raw.status_updated_at,
         last_message_ms: None,
+        session_id: raw
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
     };
     Ok((raw, evidence))
 }
@@ -365,13 +387,15 @@ pub fn read_tail_lossy(path: &Path, max: u64) -> Option<String> {
 /// Read Claude Code's record for each of `pids` across `config_dirs`.
 ///
 /// Each `sessions/` dir is listed ONCE and only the wanted `<pid>.json` files
-/// are opened; the transcript tail is read only for `busy`/`shell` records.
+/// are opened; the transcript tail is read only for `busy`/`shell` records,
+/// and only when `tail` is [`TranscriptTail::Read`].
 /// `proc_start` is [`proc_start_ticks`] in production and injectable in tests.
 /// Blocking file I/O — call it off the async executor.
 pub fn read_records(
     config_dirs: &[PathBuf],
     pids: &[LivePid],
     proc_start: &dyn Fn(u32) -> Option<String>,
+    tail: TranscriptTail,
 ) -> HashMap<u32, RecordReading> {
     let wanted: std::collections::HashSet<u32> = pids.iter().map(|p| p.pid).collect();
     // pid -> every (config dir, record path) that names it.
@@ -400,7 +424,7 @@ pub fn read_records(
         .map(|&live| {
             let reading = match found.get(&live.pid) {
                 None => RecordReading::Missing,
-                Some(candidates) => read_one(live, candidates, proc_start),
+                Some(candidates) => read_one(live, candidates, proc_start, tail),
             };
             (live.pid, reading)
         })
@@ -411,6 +435,7 @@ fn read_one(
     live: LivePid,
     candidates: &[(PathBuf, PathBuf)],
     proc_start: &dyn Fn(u32) -> Option<String>,
+    tail: TranscriptTail,
 ) -> RecordReading {
     let mut parsed: Vec<(&Path, RawRecord, RecordEvidence)> = Vec::new();
     let mut reused = false;
@@ -448,7 +473,7 @@ fn read_one(
             RecordReading::Unparseable
         };
     };
-    if ev.status == "busy" || ev.status == "shell" {
+    if tail == TranscriptTail::Read && (ev.status == "busy" || ev.status == "shell") {
         if let (Some(cwd), Some(session_id)) = (raw.cwd.as_deref(), raw.session_id.as_deref()) {
             let transcript =
                 crate::terminal::transcript::session_transcript_path(dir, cwd, session_id);
@@ -476,6 +501,7 @@ mod tests {
             status: status.to_string(),
             status_updated_at_ms: status_age_min.map(|m| NOW - m * MIN),
             last_message_ms: msg_age_min.map(|m| NOW - m * MIN),
+            session_id: None,
         })
     }
 
@@ -808,6 +834,7 @@ mod tests {
             &[dir.clone(), other, root.path().join("absent")],
             &pids,
             &no_proc,
+            TranscriptTail::Read,
         );
         let class = |pid: u32| classify_from_record(&readings[&pid], NOW);
         assert_eq!(class(10), Activity::Working, "{:?}", readings[&10]);
@@ -873,7 +900,7 @@ mod tests {
             at(10),
             at(11),
         ];
-        let readings = read_records(&[dir], &pids, &kernel);
+        let readings = read_records(&[dir], &pids, &kernel, TranscriptTail::Read);
         for pid in [1, 3, 5, 6, 7, 8, 10] {
             assert_eq!(
                 classify_from_record(&readings[&pid], NOW),
@@ -904,8 +931,63 @@ mod tests {
             ),
         )
         .unwrap();
-        let readings = read_records(&[dir], &[live(20)], &no_proc);
+        let readings = read_records(&[dir], &[live(20)], &no_proc, TranscriptTail::Read);
         assert_eq!(classify_from_record(&readings[&20], NOW), Activity::Stale);
+    }
+
+    /// The record's `sessionId` rides along on every parsed reading (the
+    /// pane-binding check reads it), blank reads as absent, and
+    /// `TranscriptTail::Skip` never opens the transcript.
+    #[test]
+    fn a_parsed_record_carries_its_session_id_and_skip_reads_no_tail() {
+        let root = scratch("session-id");
+        let dir = root.path().join(".claude");
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        let cwd = "/work/repo";
+        std::fs::write(
+            dir.join("sessions/30.json"),
+            format!(r#"{{"pid":30,"sessionId":"s30","cwd":"{cwd}","status":"busy"}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("sessions/31.json"),
+            r#"{"pid":31,"sessionId":"  ","status":"idle"}"#,
+        )
+        .unwrap();
+        let transcript = crate::terminal::transcript::session_transcript_path(&dir, cwd, "s30");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-09-29T10:00:00Z\"}\n",
+        )
+        .unwrap();
+
+        let pids = [live(30), live(31)];
+        let with_tail = read_records(
+            std::slice::from_ref(&dir),
+            &pids,
+            &no_proc,
+            TranscriptTail::Read,
+        );
+        let RecordReading::Parsed(ev) = &with_tail[&30] else {
+            panic!("{:?}", with_tail[&30]);
+        };
+        assert_eq!(ev.session_id.as_deref(), Some("s30"));
+        assert!(
+            ev.last_message_ms.is_some(),
+            "Read reads the busy session's tail"
+        );
+        let RecordReading::Parsed(blank) = &with_tail[&31] else {
+            panic!("{:?}", with_tail[&31]);
+        };
+        assert_eq!(blank.session_id, None, "a blank sessionId is absent");
+
+        let skipped = read_records(&[dir], &pids, &no_proc, TranscriptTail::Skip);
+        let RecordReading::Parsed(ev) = &skipped[&30] else {
+            panic!("{:?}", skipped[&30]);
+        };
+        assert_eq!(ev.session_id.as_deref(), Some("s30"));
+        assert_eq!(ev.last_message_ms, None, "Skip never opens the transcript");
     }
 
     /// An invalid UTF-8 byte costs its own line, not the whole read.

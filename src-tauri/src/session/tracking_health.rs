@@ -66,7 +66,10 @@ use tracing::{debug, warn};
 use crate::process_capture::process_tree::{
     claude_pids_in_inclusive_subtree, claude_present_in_inclusive_subtree, ProcessSnapshot,
 };
-use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
+use crate::session::claude_activity::{LivePid, RecordReading};
+use crate::session::session_lifecycle_store::{
+    BindingState, SessionLifecycleStore, TerminalSessionRecord,
+};
 use crate::terminal::TerminalManager;
 
 /// How often the periodic cross-reference runs.
@@ -481,9 +484,30 @@ pub struct LiveClaudeProcess {
     /// The `claude_session_id` this process is attributed to — the key coord
     /// addresses a session by (`claude_code_session_id`). `None` for every
     /// non-terminal-hosted class (nothing attributes them), and `None` where
-    /// two different open records claim the same pid: an AMBIGUOUS attribution
-    /// is an unknown, and unknowns block. Never a guess.
+    /// the attribution is AMBIGUOUS: two different open records claim the
+    /// same pid, or the process's own Claude Code record names a different
+    /// session than the row that owns its pane ([`Self::binding_state`]
+    /// `Unknown`). An ambiguous attribution is an unknown, and unknowns block.
+    /// Never a guess.
     pub session_id: Option<String>,
+    /// Does this process's OWN Claude Code record
+    /// (`<config_dir>/sessions/<pid>.json`) name the session the row owning its
+    /// pane holds? Serialized `bindingState`:
+    ///
+    /// - `"matched"` — it does;
+    /// - `"unknown"` — it names ANOTHER session. The row's id is then NOT
+    ///   echoed: [`Self::session_id`] is withheld (null), no coord work status
+    ///   applies, and the process blocks;
+    /// - `null` — not checked: a nested subagent, every non-terminal-hosted
+    ///   process, an attribution already ambiguous, or a record that could not
+    ///   be read (never read as agreement).
+    ///
+    /// Without it the attribution was circular — a pid took the id of whatever
+    /// row owned its terminal, so a wrong binding came back out of
+    /// `/restart-readiness` as fact. Filled by
+    /// [`TrackingHealthReport::attach_registry_evidence`]; [`evaluate`] leaves
+    /// it `None`. Plan `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`.
+    pub binding_state: Option<BindingState>,
     /// The coord WORK axis for [`Self::session_id`], verbatim as coord served
     /// it. `None` = not resolved — which is UNKNOWN, not "not finished".
     ///
@@ -710,6 +734,65 @@ impl TrackingHealthReport {
         }
     }
 
+    /// Cross-check every top-level terminal-hosted process against its OWN
+    /// Claude Code record (`records`, keyed by pid — see
+    /// [`crate::session::pane_binding`]) and set
+    /// [`LiveClaudeProcess::binding_state`].
+    ///
+    /// [`evaluate`] attributes a pid to the open row owning its terminal,
+    /// which is circular: a row bound to the wrong pane hands the pane's
+    /// process its id, and `/restart-readiness` then echoes the wrong binding
+    /// as fact. Here the process speaks for itself. A record naming the row's
+    /// session → `Matched`. A record naming ANOTHER session → `Unknown`, and
+    /// the attribution is withdrawn exactly as for a pid two rows claim:
+    /// `session_id`, `session_status` and `session_status_since` cleared, and
+    /// the process blocks. A record that cannot be read leaves the process
+    /// unchecked (`None`) — never read as agreement — with today's
+    /// attribution. Nested subagents and already-ambiguous pids are not
+    /// checked: a nested `claude` runs a session of its own.
+    ///
+    /// Run BEFORE [`Self::attach_status_since`], which keys on the
+    /// `session_status` this may clear. Pure; no I/O.
+    pub fn attach_registry_evidence(&mut self, records: &HashMap<u32, RecordReading>) {
+        for process in self.terminal_hosted.iter_mut() {
+            if process.nested_under_claude {
+                continue;
+            }
+            let Some(row_session) = process.session_id.as_deref() else {
+                continue;
+            };
+            let Some(RecordReading::Parsed(record)) = records.get(&process.pid) else {
+                continue;
+            };
+            let Some(recorded_session) = record.session_id.as_deref() else {
+                continue;
+            };
+            if recorded_session == row_session {
+                process.binding_state = Some(BindingState::Matched);
+            } else {
+                process.binding_state = Some(BindingState::Unknown);
+                process.session_id = None;
+                process.session_status = None;
+                process.session_status_since = None;
+                process.blocks_restart = blocks_restart(None);
+            }
+        }
+    }
+
+    /// The top-level terminal-hosted processes, as the [`LivePid`]s whose
+    /// records [`Self::attach_registry_evidence`] reads — each with the start
+    /// time this pass's snapshot implies, for the record's pid-reuse check.
+    pub fn registry_check_pids(&self) -> Vec<LivePid> {
+        self.terminal_hosted
+            .iter()
+            .filter(|p| !p.nested_under_claude && p.session_id.is_some())
+            .map(|p| LivePid {
+                pid: p.pid,
+                process_started_ms: p.age_s.map(|age_s| self.checked_at_ms - age_s * 1000),
+            })
+            .collect()
+    }
+
     /// Holder panes this runner cannot drive (unknown or incompatible). Each
     /// one blocks a restart; see [`HolderPane::is_unresolved`].
     pub fn holder_unresolved_count(&self) -> usize {
@@ -827,10 +910,14 @@ fn store_latest(report: TrackingHealthReport) {
 }
 
 /// The `/health` `sessionTracking` object: last run timestamp + drift counts
-/// (fields null before the first pass), plus the untracked-backend-spawn
-/// counter (always live — it counts spawns, not checks).
+/// (fields null before the first pass), plus the always-live counters — the
+/// untracked-backend-spawn counter (it counts spawns, not checks) and the two
+/// pane-binding counters (`bindingMismatchTotal`, `bindingMoveRefusedTotal`;
+/// see [`crate::session::pane_binding`]).
 pub fn health_json() -> serde_json::Value {
     let counter = untracked_backend_spawn_total();
+    let mismatches = crate::session::pane_binding::binding_mismatch_total();
+    let refused_moves = crate::session::pane_binding::binding_move_refused_total();
     match latest() {
         Some(r) => serde_json::json!({
             "lastCheckAt": r.checked_at_ms,
@@ -855,12 +942,16 @@ pub fn health_json() -> serde_json::Value {
             "holderPanes": r.holder_panes,
             "holderCensusError": r.holder_census_error,
             "untrackedBackendSpawnsTotal": counter,
+            "bindingMismatchTotal": mismatches,
+            "bindingMoveRefusedTotal": refused_moves,
         }),
         None => serde_json::json!({
             "lastCheckAt": serde_json::Value::Null,
             "liveUntracked": serde_json::Value::Null,
             "trackedDead": serde_json::Value::Null,
             "untrackedBackendSpawnsTotal": counter,
+            "bindingMismatchTotal": mismatches,
+            "bindingMoveRefusedTotal": refused_moves,
         }),
     }
 }
@@ -1119,6 +1210,9 @@ pub fn evaluate(
             // where that is `None`.
             session_status_since: None,
             session_id,
+            // Filled after the pass by `attach_registry_evidence`, which needs
+            // the processes' own records — I/O this pure function never does.
+            binding_state: None,
             blocks_restart: blocks_restart(status),
             wind_down: None,
         }
@@ -1311,6 +1405,16 @@ pub async fn compute(
         chrono::Utc::now().timestamp_millis(),
         &holders,
     );
+    // Each terminal-hosted `claude` speaks for itself (plan
+    // `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`): its own
+    // record, read off the runtime under a bound. A read that fails or overruns
+    // leaves every process unchecked, i.e. today's attribution.
+    let records = crate::session::pane_binding::read_records_off_runtime(
+        report.registry_check_pids(),
+        crate::session::pane_binding::RECORD_READ_BOUND,
+    )
+    .await;
+    report.attach_registry_evidence(&records);
     report.attach_status_since(session_status_since_by_id);
 
     Some(TrackingHealthPass {
@@ -1489,6 +1593,7 @@ mod tests {
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
+            binding_state: None,
         }
     }
 
@@ -1505,6 +1610,7 @@ mod tests {
             session_id: None,
             session_status: None,
             session_status_since: None,
+            binding_state: None,
             blocks_restart: true,
             wind_down: None,
         }
@@ -3138,5 +3244,117 @@ mod tests {
         // A different proven pid does not lift the guard for this one.
         assert!(!present(&[999].into_iter().collect()));
         assert_eq!(pid_reuse_reference(5, &HashSet::new(), boot_ms), boot_ms);
+    }
+
+    /// A report whose only live processes are `terminal_hosted`.
+    fn report_with_terminal_hosted(
+        terminal_hosted: Vec<LiveClaudeProcess>,
+    ) -> TrackingHealthReport {
+        TrackingHealthReport {
+            checked_at_ms: 1_000_000,
+            live_claude_total: terminal_hosted.len(),
+            tracked_open_total: 1,
+            terminal_hosted,
+            ai_plane: vec![],
+            headless_exempt: vec![],
+            live_untracked: vec![],
+            tracked_dead: vec![],
+            holder_hosted: vec![],
+            holder_panes: vec![],
+            holder_census_error: None,
+        }
+    }
+
+    fn recorded(session: Option<&str>) -> RecordReading {
+        RecordReading::Parsed(crate::session::claude_activity::RecordEvidence {
+            status: "idle".to_string(),
+            status_updated_at_ms: None,
+            last_message_ms: None,
+            session_id: session.map(str::to_string),
+        })
+    }
+
+    /// Plan `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`,
+    /// Phase 2: the circular attribution is broken. A terminal-hosted process
+    /// whose OWN record names the row's session is `matched`; one whose record
+    /// names ANOTHER session is ambiguous — `bindingState: unknown`, the row's
+    /// id withheld, no coord status, blocking. An unreadable record changes
+    /// nothing (never agreement); a nested subagent is not checked.
+    #[test]
+    fn a_process_whose_own_record_names_another_session_is_ambiguous() {
+        let attributed = |pid: u32, nested: bool| LiveClaudeProcess {
+            session_id: Some("row-session".to_string()),
+            session_status: Some("finished".to_string()),
+            session_status_since: Some(5),
+            blocks_restart: false,
+            nested_under_claude: nested,
+            ..proc_entry(pid)
+        };
+        let mut report = report_with_terminal_hosted(vec![
+            attributed(1, false),
+            attributed(2, false),
+            attributed(3, false),
+            attributed(4, true),
+        ]);
+        assert_eq!(
+            report
+                .registry_check_pids()
+                .iter()
+                .map(|p| p.pid)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "nested subagents are not checked"
+        );
+        let records: HashMap<u32, RecordReading> = [
+            (1, recorded(Some("row-session"))),
+            (2, recorded(Some("another-session"))),
+            (3, RecordReading::Missing),
+            (4, recorded(Some("subagent-session"))),
+        ]
+        .into_iter()
+        .collect();
+
+        report.attach_registry_evidence(&records);
+        let p = |pid: u32| {
+            report
+                .terminal_hosted
+                .iter()
+                .find(|p| p.pid == pid)
+                .unwrap()
+                .clone()
+        };
+
+        assert_eq!(p(1).binding_state, Some(BindingState::Matched));
+        assert_eq!(p(1).session_id.as_deref(), Some("row-session"));
+        assert!(
+            !p(1).blocks_restart,
+            "a matched finished session stays discounted"
+        );
+
+        let ambiguous = p(2);
+        assert_eq!(ambiguous.binding_state, Some(BindingState::Unknown));
+        assert_eq!(ambiguous.session_id, None, "the row's id is not echoed");
+        assert_eq!(ambiguous.session_status, None);
+        assert_eq!(ambiguous.session_status_since, None);
+        assert!(ambiguous.blocks_restart, "an ambiguous process blocks");
+
+        for unchecked in [p(3), p(4)] {
+            assert_eq!(unchecked.binding_state, None, "pid {}", unchecked.pid);
+            assert_eq!(unchecked.session_id.as_deref(), Some("row-session"));
+        }
+
+        let wire = serde_json::to_value(&ambiguous).unwrap();
+        assert_eq!(wire["bindingState"], "unknown");
+        assert!(wire["sessionId"].is_null());
+        assert!(serde_json::to_value(p(3)).unwrap()["bindingState"].is_null());
+    }
+
+    /// `/health` `sessionTracking` serves both binding counters, before and
+    /// after the first pass.
+    #[test]
+    fn health_json_serves_the_binding_counters() {
+        let v = health_json();
+        assert!(v["bindingMismatchTotal"].is_u64(), "{v}");
+        assert!(v["bindingMoveRefusedTotal"].is_u64(), "{v}");
     }
 }

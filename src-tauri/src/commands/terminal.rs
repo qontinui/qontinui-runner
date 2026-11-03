@@ -11,7 +11,7 @@ use crate::commands::CommandResponse;
 use crate::error::AppError;
 use crate::session::pane_store::{PaneKey, PaneSessionStore};
 use crate::session::session_lifecycle_store::{
-    CloseOutcome, SessionLifecycleStore, TerminalSessionRecord,
+    CloseOutcome, RecordOpenOutcome, SessionLifecycleStore, TerminalSessionRecord,
 };
 use crate::session::{Intent, SessionKind, SessionRegistry};
 use crate::terminal::visibility::VisibilityTier;
@@ -1383,16 +1383,21 @@ pub fn terminal_session_record_open(
         gate_id: None,
         gate_consuming_device_id: None,
         gate_bound_boot_ms: None,
+        binding_state: None,
     };
     let session_id = record.claude_session_id.clone();
-    store.record_open(record);
+    let outcome = store.record_open(record);
     // The verified-resume re-assert of a boot restore lands here: adopt a
     // resumed gate continuation into this generation (plan 2026-10-03 D3).
     adopt_restored_continuation(&store, &session_id);
     Ok(CommandResponse {
         success: true,
         message: None,
-        data: Some(record_open_confirmation_report(&store, &session_id)),
+        data: Some(record_open_confirmation_report(
+            &store,
+            &session_id,
+            &outcome,
+        )),
     })
 }
 
@@ -1453,11 +1458,22 @@ const CONFIRM_DOOR: &str = "POST /control/session-open";
 /// it". That sends a reader to confirm a row that does not exist, in precisely
 /// the failure this payload was added to make legible. One lookup now answers
 /// both bits, so they cannot disagree about whether the row is there.
+///
+/// A write the store REFUSED (`outcome` is
+/// [`RecordOpenOutcome::MoveRefused`]) reads `recorded: false` even though the
+/// session's row exists — it exists on `heldBy`, the live pane that still runs
+/// the session, not on the terminal this call named. `heldBy` is `null` for
+/// every other outcome.
 fn record_open_confirmation_report(
     store: &SessionLifecycleStore,
     claude_session_id: &str,
+    outcome: &RecordOpenOutcome,
 ) -> serde_json::Value {
-    let row = store.get(claude_session_id);
+    let held_by = match outcome {
+        RecordOpenOutcome::MoveRefused { held_by } => Some(held_by.clone()),
+        RecordOpenOutcome::Recorded | RecordOpenOutcome::Unavailable => None,
+    };
+    let row = store.get(claude_session_id).filter(|_| held_by.is_none());
     let recorded = row.is_some();
     let confirmed = row.and_then(|r| r.confirmed_at).is_some();
     // `confirmBy` is emitted unconditionally so the payload has one stable
@@ -1467,6 +1483,7 @@ fn record_open_confirmation_report(
         "recorded": recorded,
         "confirmed": confirmed,
         "confirmBy": CONFIRM_DOOR,
+        "heldBy": held_by,
     })
 }
 
@@ -2981,13 +2998,21 @@ async fn poll_and_record_session<F>(
                 gate_id: gate_id.clone(),
                 gate_consuming_device_id: gate_consuming_device_id.clone(),
                 gate_bound_boot_ms,
+                binding_state: None,
             };
-            store.record_open(record);
-            info!(
-                terminal_id = %terminal_id,
-                claude_session = %claude_session_id,
-                "create_terminal_session_backend: continuation session durably recorded"
-            );
+            match store.record_open(record) {
+                RecordOpenOutcome::Recorded => info!(
+                    terminal_id = %terminal_id,
+                    claude_session = %claude_session_id,
+                    "create_terminal_session_backend: continuation session durably recorded"
+                ),
+                outcome => warn!(
+                    terminal_id = %terminal_id,
+                    claude_session = %claude_session_id,
+                    outcome = ?outcome,
+                    "create_terminal_session_backend: continuation session NOT recorded"
+                ),
+            }
             return;
         }
         if std::time::Instant::now() >= deadline {
@@ -3006,6 +3031,11 @@ async fn poll_and_record_session<F>(
 /// Durably record a PRE-PINNED session (`--session-id <id>` /
 /// account-migration `--resume <id>` in the spawn argv) the instant the PTY
 /// exists — no transcript mtime race to lose.
+///
+/// Returns what the store did: a record that would move a session's row off a
+/// live pane still running it is refused (see
+/// [`SessionLifecycleStore::record_open`]); an account migration declares its
+/// move first ([`SessionLifecycleStore::declare_move`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_pinned_session_open(
     store: &SessionLifecycleStore,
@@ -3018,7 +3048,7 @@ pub(crate) fn record_pinned_session_open(
     zone_index: i32,
     provider: String,
     gate: Option<GateIdentity>,
-) {
+) -> RecordOpenOutcome {
     let (gate_id, gate_consuming_device_id, gate_bound_boot_ms) = gate_record_fields(gate);
     // D1 account stamp at spawn. The runner genuinely knows the ACCOUNT here —
     // it just placed `config_dir` into the PTY env — so derive the label +
@@ -3038,7 +3068,7 @@ pub(crate) fn record_pinned_session_open(
     let account = config_dir
         .as_deref()
         .map(|d| crate::session::past_sessions::account_from_config_dir(Some(d)));
-    store.record_open(TerminalSessionRecord {
+    let outcome = store.record_open(TerminalSessionRecord {
         claude_session_id: claude_session_id.clone(),
         config_dir,
         working_dir: Some(working_dir),
@@ -3082,7 +3112,17 @@ pub(crate) fn record_pinned_session_open(
         gate_id,
         gate_consuming_device_id,
         gate_bound_boot_ms,
+        binding_state: None,
     });
+    if outcome != RecordOpenOutcome::Recorded {
+        warn!(
+            terminal_id = %terminal_id,
+            claude_session = %claude_session_id,
+            outcome = ?outcome,
+            "create_terminal_session_backend: pinned session NOT recorded"
+        );
+        return outcome;
+    }
     info!(
         terminal_id = %terminal_id,
         claude_session = %claude_session_id,
@@ -3094,6 +3134,7 @@ pub(crate) fn record_pinned_session_open(
     if gate.is_none() {
         adopt_restored_continuation(store, &claude_session_id);
     }
+    outcome
 }
 
 /// The three durable gate fields for a record written by THIS process (plan
@@ -3394,6 +3435,7 @@ mod tests {
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
+            binding_state: None,
         }
     }
 
@@ -4024,7 +4066,8 @@ mod tests {
         record.confirmed_at = None;
         store.record_open(record);
 
-        let report = record_open_confirmation_report(&store, "sess-1");
+        let report =
+            record_open_confirmation_report(&store, "sess-1", &RecordOpenOutcome::Recorded);
         assert_eq!(report["recorded"], serde_json::Value::Bool(true));
         assert_eq!(
             report["confirmed"],
@@ -4062,7 +4105,8 @@ mod tests {
         // A re-record (the frontend re-asserting the tab) passes no
         // confirmation of its own…
         store.record_open(record);
-        let report = record_open_confirmation_report(&store, "sess-2");
+        let report =
+            record_open_confirmation_report(&store, "sess-2", &RecordOpenOutcome::Recorded);
         assert_eq!(
             report["confirmed"],
             serde_json::Value::Bool(true),
@@ -4082,7 +4126,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json"))
             .expect("store opens");
-        let report = record_open_confirmation_report(&store, "never-recorded");
+        let report =
+            record_open_confirmation_report(&store, "never-recorded", &RecordOpenOutcome::Recorded);
         assert_eq!(report["confirmed"], serde_json::Value::Bool(false));
         assert_eq!(
             report["recorded"],
@@ -4101,14 +4146,15 @@ mod tests {
         let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json"))
             .expect("store opens");
 
-        let before = record_open_confirmation_report(&store, "sess-3");
+        let before =
+            record_open_confirmation_report(&store, "sess-3", &RecordOpenOutcome::Recorded);
         assert_eq!(before["recorded"], serde_json::Value::Bool(false));
 
         let mut record = restore_candidate_record("sess-3");
         record.confirmed_at = None;
         store.record_open(record);
 
-        let after = record_open_confirmation_report(&store, "sess-3");
+        let after = record_open_confirmation_report(&store, "sess-3", &RecordOpenOutcome::Recorded);
         assert_eq!(
             after["recorded"],
             serde_json::Value::Bool(true),

@@ -189,6 +189,12 @@ pub(crate) enum MigrationRefusal {
     Unknown { session: String },
     /// The session's lifecycle record is closed: there is no pane to migrate.
     Closed { session: String },
+    /// The pane the record names runs a DIFFERENT session by its own `claude`
+    /// record (`binding_state` unknown — plan
+    /// `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`).
+    /// Migrating would resume this session elsewhere and then close a pane
+    /// running another one.
+    BindingUnknown { session: String, terminal: String },
 }
 
 impl std::fmt::Display for MigrationRefusal {
@@ -203,6 +209,13 @@ impl std::fmt::Display for MigrationRefusal {
                 write!(
                     f,
                     "session {session} is closed — there is no pane to migrate"
+                )
+            }
+            Self::BindingUnknown { session, terminal } => {
+                write!(
+                    f,
+                    "terminal {terminal} runs a different session than {session} by its own \
+                     claude record — refusing to migrate (and close) it"
                 )
             }
         }
@@ -282,7 +295,9 @@ pub(crate) fn begin_migration(
 /// as read NOW): it must still exist ([`MigrationRefusal::Unknown`]), be open
 /// ([`MigrationRefusal::Closed`]), and run under `src_config_dir` in the
 /// caller's terminal ([`MigrationRefusal::AlreadyMoved`]); an unpinned record
-/// (no `config_dir`) stands for `src_config_dir`.
+/// (no `config_dir`) stands for `src_config_dir`. And that terminal's own
+/// `claude` must not record a different session
+/// ([`MigrationRefusal::BindingUnknown`]): the migration closes the pane.
 ///
 /// Run twice per migration, both times under the session's in-flight guard:
 /// by [`begin_migration`] as it takes the guard, and by [`migrate_session`]
@@ -318,6 +333,13 @@ fn still_migratable(
     if current.terminal_id != caller_record.terminal_id {
         return Err(MigrationRefusal::AlreadyMoved {
             to: format!("terminal {}", current.terminal_id),
+        });
+    }
+    if current.binding_state == Some(crate::session::session_lifecycle_store::BindingState::Unknown)
+    {
+        return Err(MigrationRefusal::BindingUnknown {
+            session: sid.clone(),
+            terminal: current.terminal_id,
         });
     }
     Ok(())
@@ -1368,6 +1390,13 @@ fn migrate_session(
     let carried_continuation =
         crate::agent_runtime::take_continuation_registration(&record.terminal_id);
 
+    // The respawn's pinned record moves this row off a pane whose `claude` is
+    // still running the session (step 4 closes it) — the one move the store's
+    // binding guard must let through. Declared here, withdrawn right after the
+    // spawn: consumed when the respawn recorded, moot when it failed. Neither
+    // call can exit early (see GUARD above).
+    store.declare_move(&record.claude_session_id, &record.terminal_id);
+
     // 3. Respawn under the target account, through the SHARED resume seam
     // ([`spawn_resumed_pane`]) — the same code path the respawn receiver
     // (`crate::session::respawn`) uses, so the two never drift. The pinned-id
@@ -1429,6 +1458,7 @@ fn migrate_session(
             gate_identity: carried_gate_identity,
         },
     );
+    store.withdraw_move(&record.claude_session_id);
     // GUARD: anchor-held window closes at the `restore_continuation_registration`
     // call INSIDE each arm below, not at this line — an early exit added in
     // the `Ok` arm before that call would still drop the permit and free the
@@ -2191,6 +2221,19 @@ mod tests {
             still_migratable(&seen, "C:/a", None),
             Err(MigrationRefusal::Unknown {
                 session: sid.to_string()
+            })
+        );
+        // The pane runs ANOTHER session by its own claude record (plan
+        // 2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session): the
+        // migration would close the wrong session's pane.
+        let mut contradicted = seen.clone();
+        contradicted.binding_state =
+            Some(crate::session::session_lifecycle_store::BindingState::Unknown);
+        assert_eq!(
+            still_migratable(&seen, "C:/a", Some(contradicted)),
+            Err(MigrationRefusal::BindingUnknown {
+                session: sid.to_string(),
+                terminal: "t-1".to_string(),
             })
         );
         assert_eq!(

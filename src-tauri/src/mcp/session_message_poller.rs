@@ -803,9 +803,11 @@ fn claude_live(
 
 /// Does `pid` belong to the foreground process group of its controlling
 /// terminal, and is it not stopped? Read from `/proc/<pid>/stat`; an
-/// unreadable file is `false` (fail closed).
+/// unreadable file is `false` (fail closed). Also the typed-resume sniff's
+/// "did a running `claude` read this line?" test
+/// (`terminal::claude_resume_sniff::typed_line_target`).
 #[cfg(target_os = "linux")]
-fn pid_reads_its_terminal(pid: u32) -> bool {
+pub(crate) fn pid_reads_its_terminal(pid: u32) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .map(|stat| stat_says_foreground(&stat))
         .unwrap_or(false)
@@ -815,7 +817,7 @@ fn pid_reads_its_terminal(pid: u32) -> bool {
 /// backgrounded away from the console the way a Unix shell does it, so
 /// existence in the subtree is the whole answer there.
 #[cfg(windows)]
-fn pid_reads_its_terminal(_pid: u32) -> bool {
+pub(crate) fn pid_reads_its_terminal(_pid: u32) -> bool {
     true
 }
 
@@ -825,7 +827,7 @@ fn pid_reads_its_terminal(_pid: u32) -> bool {
 /// never delivers on macOS either way; this keeps that true if the probe is
 /// ever made to work.)
 #[cfg(all(unix, not(target_os = "linux")))]
-fn pid_reads_its_terminal(_pid: u32) -> bool {
+pub(crate) fn pid_reads_its_terminal(_pid: u32) -> bool {
     false
 }
 
@@ -985,19 +987,25 @@ fn resolve_open_record(
 /// - `confirmed_at` is set: a provider's SessionStart hook proved a real
 ///   session started in this terminal. Every PTY gets a provisional `open`
 ///   record at spawn, including a plain shell that never runs `claude`.
+/// - `binding_state` is not `Unknown`: the pane's own `claude` does not record
+///   a DIFFERENT session. If it does, the message would be typed into another
+///   session's prompt (plan
+///   `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`).
 ///
-/// A record that fails either test resolves nothing, so the message stays
+/// A record that fails any test resolves nothing, so the message stays
 /// pending (counted `target_not_live`) and is collected on the recipient's
 /// next `coord_inbox` drain.
 fn typed_record_is_bound(
     rec: &crate::session::session_lifecycle_store::TerminalSessionRecord,
 ) -> bool {
-    use crate::session::session_lifecycle_store::{ORIGIN_AUTHORITATIVE, ORIGIN_OBSERVED};
+    use crate::session::session_lifecycle_store::{
+        BindingState, ORIGIN_AUTHORITATIVE, ORIGIN_OBSERVED,
+    };
     let origin_known = matches!(
         rec.origin.as_deref(),
         Some(ORIGIN_AUTHORITATIVE) | Some(ORIGIN_OBSERVED)
     );
-    origin_known && rec.confirmed_at.is_some()
+    origin_known && rec.confirmed_at.is_some() && rec.binding_state != Some(BindingState::Unknown)
 }
 
 /// Resolve coord's `to_session` to a live local session, or `None` if this
@@ -2290,7 +2298,23 @@ mod tests {
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
+            binding_state: None,
         }
+    }
+
+    /// Plan `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`: a
+    /// row whose pane's own `claude` records ANOTHER session must not route a
+    /// message there — it would be typed into the other session's prompt.
+    #[test]
+    fn a_typed_record_does_not_route_when_its_pane_runs_another_session() {
+        use crate::session::session_lifecycle_store::BindingState;
+        let mut rec = open_record("csid-b", "term-a");
+        assert!(typed_record_is_bound(&rec), "precondition");
+        rec.binding_state = Some(BindingState::Unknown);
+        assert!(!typed_record_is_bound(&rec));
+        assert_eq!(resolve_open_record(&rec), None);
+        rec.binding_state = Some(BindingState::Matched);
+        assert!(typed_record_is_bound(&rec));
     }
 
     #[test]

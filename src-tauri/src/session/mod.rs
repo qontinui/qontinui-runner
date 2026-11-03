@@ -73,6 +73,7 @@ pub mod local_store;
 pub mod observation_epoch; // The last instant the liveness poll could SEE the process table — bounds open-row restore admission (plan 2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set, Phase 2)
 pub mod operator_touch; // Operator-touch idempotency-key + payload builder, shared by every B2 trigger (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)
 pub mod output_pipe;
+pub mod pane_binding; // Does a pane run the session its lifecycle row names? Its own `claude`'s `<config>/sessions/<pid>.json` decides (plan 2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session)
 pub mod pane_store;
 pub mod past_sessions;
 pub mod provider_adapter;
