@@ -14,9 +14,8 @@
 //!
 //! The classifier is the Python's, function for function: same names, same order,
 //! and every row of that script's `stray_selftest` table is a test below. (Its
-//! unreadable-table case in `end_strays_selftest` has no twin here.) A
-//! differential over 60,000 generated commands and over every live shell on one
-//! box found the differences below. Each errs toward work unless it says otherwise:
+//! unreadable-table case in `end_strays_selftest` has no twin here.) The
+//! deliberate differences are below. Each errs toward work unless it says otherwise:
 //!
 //! - **No own-tree exclusion.** The Python screener is a short-lived `python3`, so
 //!   it drops its own tree from the targets and from a file's holders. The
@@ -56,7 +55,7 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -83,7 +82,15 @@ const END_BUDGET_MAX: Duration = Duration::from_secs(60);
 /// A blocking read cannot be cancelled, so a stuck one must not be joined by
 /// another. One flag per path: a poll of the census must not cost a close its record.
 static CENSUS_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-static CLOSE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// Separate from [`END_IN_FLIGHT`]: an end still running past its budget must not
+/// cost the NEXT close its record, or that close's strays outlive it unrecorded.
+static RECORD_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static END_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// After a census that did not answer inside [`CENSUS_BUDGET`], skip it until this
+/// unix second: on a box too loaded to walk `/proc` in time, paying the budget on
+/// every `/restart-readiness` poll would push each answer past the client timeout.
+static CENSUS_SKIP_UNTIL: AtomicU64 = AtomicU64::new(0);
+const CENSUS_COOLDOWN_SECS: u64 = 30;
 
 /// What a Linux tool shell sources.
 const SNAPSHOT: &str = "shell-snapshots/snapshot-";
@@ -119,8 +126,7 @@ static BOUNDED_RE: LazyLock<Regex> = LazyLock::new(|| {
 static LOOP_WORD_RE: LazyLock<Regex> = LazyLock::new(|| re(r"\b(?:until|while)\b"));
 /// A harness task's output file: `.../claude-<uid>/<project dir>/<session
 /// uuid>/tasks/<id>.output`, the project dir being the session's cwd with every
-/// `/` turned into `-` (measured on every live task file on one Linux box,
-/// 2026-10-24). Only this layout is the harness's.
+/// `/` turned into `-`. Only this layout is the harness's.
 static HARNESS_TASK_FILE_RE: LazyLock<Regex> = LazyLock::new(|| {
     re(
         r"/claude-\d+/-[^/]*/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/tasks/[^/]+\.output$",
@@ -2167,13 +2173,13 @@ mod live {
         lines
     }
 
-    pub(super) fn verdicts(candidates: &[u32], idle_min: u64) -> HashSet<u32> {
+    pub(super) fn verdicts(candidates: &[(u32, u32)], idle_min: u64) -> HashSet<u32> {
         // A finished session with a real child is ordinary and pays for its own
         // argv alone. Only a shell that really runs a wait loop costs a table walk.
-        let loops: Vec<u32> = candidates
+        let loops: Vec<(u32, u32)> = candidates
             .iter()
             .copied()
-            .filter(|&pid| read_argv(pid).is_some_and(|argv| wait_loop(&argv).is_ok()))
+            .filter(|&(_, pid)| read_argv(pid).is_some_and(|argv| wait_loop(&argv).is_ok()))
             .collect();
         if loops.is_empty() {
             return HashSet::new();
@@ -2184,6 +2190,10 @@ mod live {
         let facts = LiveFacts::new();
         loops
             .into_iter()
+            // The snapshot named this pid a child of `parent`; the fresh table must
+            // agree, or the pid was reused since and the verdict is about someone else.
+            .filter(|&(parent, pid)| table.get(&pid).is_some_and(|(ppid, _)| *ppid == parent))
+            .map(|(_, pid)| pid)
             .filter(|&pid| {
                 let verdict = stray_verdict(&table, pid, &facts, idle_min);
                 if verdict.stray {
@@ -2232,20 +2242,49 @@ async fn bounded<T: Send + 'static>(
 /// Which of `candidates` are proven-stray wait loops on a fresh process table.
 /// Empty off Linux, past the budget, and whenever the table cannot be read: a shell
 /// not proven stray is work.
-pub async fn stray_shells(candidates: Vec<u32>) -> HashSet<u32> {
+pub async fn stray_shells(candidates: Vec<(u32, u32)>) -> HashSet<u32> {
     #[cfg(target_os = "linux")]
     {
-        bounded(&CENSUS_IN_FLIGHT, CENSUS_BUDGET, move || {
+        let now = unix_now_secs();
+        if now < CENSUS_SKIP_UNTIL.load(Ordering::Acquire) {
+            return HashSet::new();
+        }
+        match bounded(&CENSUS_IN_FLIGHT, CENSUS_BUDGET, move || {
             live::verdicts(&candidates, IDLE_MIN)
         })
         .await
-        .unwrap_or_default()
+        {
+            Some(strays) => strays,
+            None => {
+                CENSUS_SKIP_UNTIL.store(census_skip_until(now), Ordering::Release);
+                HashSet::new()
+            }
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (candidates, &CENSUS_IN_FLIGHT, CENSUS_BUDGET);
+        let _ = (
+            candidates,
+            &CENSUS_IN_FLIGHT,
+            CENSUS_BUDGET,
+            &CENSUS_SKIP_UNTIL,
+        );
+        let _ = census_skip_until;
+        let _ = unix_now_secs;
         HashSet::new()
     }
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// PURE: when a census that did not answer at `now` may next be attempted.
+fn census_skip_until(now: u64) -> u64 {
+    now.saturating_add(CENSUS_COOLDOWN_SECS)
 }
 
 /// Record the proven strays under `claudes` before their pane is closed. The
@@ -2259,7 +2298,7 @@ pub async fn record_strays(claudes: Vec<u32>) -> Vec<RecordedStray> {
     }
     #[cfg(target_os = "linux")]
     {
-        let recorded = bounded(&CLOSE_IN_FLIGHT, RECORD_BUDGET, move || {
+        let recorded = bounded(&RECORD_IN_FLIGHT, RECORD_BUDGET, move || {
             live::record(&claudes, IDLE_MIN)
         })
         .await;
@@ -2272,7 +2311,7 @@ pub async fn record_strays(claudes: Vec<u32>) -> Vec<RecordedStray> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (&CLOSE_IN_FLIGHT, RECORD_BUDGET);
+        let _ = (&RECORD_IN_FLIGHT, RECORD_BUDGET);
         Vec::new()
     }
 }
@@ -2289,7 +2328,7 @@ pub async fn end_strays(recorded: Vec<RecordedStray>) -> Vec<String> {
         let budget = END_BUDGET_PER_STRAY
             .saturating_mul(count)
             .min(END_BUDGET_MAX);
-        bounded(&CLOSE_IN_FLIGHT, budget, move || {
+        bounded(&END_IN_FLIGHT, budget, move || {
             live::end(&recorded, IDLE_MIN, Duration::from_secs(5))
         })
         .await
@@ -2297,7 +2336,7 @@ pub async fn end_strays(recorded: Vec<RecordedStray>) -> Vec<String> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (END_BUDGET_PER_STRAY, END_BUDGET_MAX);
+        let _ = (END_BUDGET_PER_STRAY, END_BUDGET_MAX, &END_IN_FLIGHT);
         Vec::new()
     }
 }
@@ -2939,6 +2978,23 @@ mod tests {
             assert!(reaped_shortly(&mut child));
         }
 
+        /// The census judges a candidate only while the fresh table still names the
+        /// parent the snapshot named: a pid reused since then is someone else's shell.
+        #[test]
+        fn a_candidate_whose_parent_changed_is_not_judged() {
+            let dir = tempfile::tempdir().unwrap();
+            let token = format!("stray-wait-parent-{}", std::process::id());
+            let cmd = format!("until ! pgrep -f \"{token}\" >/dev/null; do sleep 1; done");
+            let (_child, stray) = start_loop(dir.path(), &cmd, "a");
+            let parent = live::read_table().unwrap()[&stray.pid].0;
+            assert_eq!(
+                live::verdicts(&[(parent, stray.pid)], 0),
+                [stray.pid].into_iter().collect::<HashSet<u32>>()
+            );
+            let not_the_parent = parent.wrapping_add(1).max(1);
+            assert!(live::verdicts(&[(not_the_parent, stray.pid)], 0).is_empty());
+        }
+
         /// A loop whose condition flipped moves on to its post-loop commands in the
         /// same process, with the same argv and start time: identity alone cannot
         /// tell, so the re-check on a fresh table has to, and that work must survive.
@@ -3009,6 +3065,13 @@ mod tests {
             );
             assert!(live::read_table().unwrap().contains_key(&pid));
         }
+    }
+
+    /// A census that did not answer is not retried on every readiness poll.
+    #[test]
+    fn a_census_that_did_not_answer_cools_down() {
+        assert_eq!(census_skip_until(100), 100 + CENSUS_COOLDOWN_SECS);
+        assert_eq!(census_skip_until(u64::MAX), u64::MAX);
     }
 
     /// A read past its budget, or a second read while one is stuck, answers `None`
