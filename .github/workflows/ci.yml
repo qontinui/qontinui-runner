@@ -503,8 +503,9 @@ jobs:
       #      (qontinui-claude-config volunteer-ci-runners.md section 2), so the
       #      host is provisioned once and this step checks it. A missing package
       #      fails HERE, naming the runner: that red is the host's, not the PR's.
-      #   2. COMPILE AND TEST CONCURRENCY CAPS. Every cargo step in this job runs at
-      #      cargo's default parallelism (= nproc), which on a 128-thread host is
+      #   2. COMPILE AND TEST CONCURRENCY CAPS. Every cargo step in this job
+      #      runs at cargo's default parallelism (= nproc), which on a 128-thread
+      #      host is
       #      a memory spike no unit cap survives. CARGO_BUILD_JOBS is the
       #      smallest of MemTotal and every cgroup memory.max/memory.high above
       #      this job, / 5 GiB, clamped to nproc, and 1 at or below 8 GiB.
@@ -517,13 +518,14 @@ jobs:
       #      leg's own value (nproc of its 4-core VM), and VITEST_MAX_WORKERS
       #      is 3, vitest's own default there (its worker count, maxWorkers, is
       #      nproc - 1): the suites' concurrency regime does not change with the
-      #      machine they land on, and coord's ingest keeps recording both lanes
-      #      under the one `ubuntu-22.04` shard. Uncapped, vitest runs 127
-      #      workers here. On 2026-11-03 that passed `Run frontend unit tests`
-      #      in four pool runs (~26 s) and failed it in both trial runs
-      #      (41703593573 and 41709340100) where Windows legs compiled on nawa
-      #      VMs at the same time: 10 s beforeAll timeouts, import 2963 s /
-      #      4070 s summed across workers.
+      #      machine they land on (and, for the Rust suite, coord's ingest keeps
+      #      recording both lanes under the one `ubuntu-22.04` shard). Uncapped,
+      #      vitest runs 127 workers here. On 2026-11-03 that passed `Run
+      #      frontend unit tests` in four pool runs (~27 s, vitest's own figure)
+      #      and failed it in both trial runs (41703593573 and 41709340100),
+      #      where a `Clippy (windows)` compile on nawa-winvm-3 overlapped the
+      #      step: 10 s beforeAll timeouts, import 2963 s / 4070 s summed across
+      #      workers.
       #   3. A WARM, PERSISTENT TARGET. actions/checkout cleans with `git clean
       #      -ffdx`, which deletes ./target on every job. So the target lives
       #      outside the workspace, under the account's persistent home
