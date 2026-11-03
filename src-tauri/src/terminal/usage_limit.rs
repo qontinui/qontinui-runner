@@ -299,8 +299,7 @@ mod tests {
         // Priority order, not just reachability: these labels are what the
         // migration reads, so a co-painted generic phrase must not take over.
         assert_eq!(
-            window_indicates_usage_limit("out of extra usage
-You've hit your weekly limit"),
+            window_indicates_usage_limit("out of extra usage\nYou've hit your weekly limit"),
             Some("hit your weekly limit")
         );
         assert_eq!(
