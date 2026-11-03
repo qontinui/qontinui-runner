@@ -178,7 +178,8 @@ pub fn step(probe: &RuntimeProbe, now_ms: u64, starved_after_ms: u64) -> Transit
             probe.episode_start_ms.store(last, Ordering::Relaxed);
             probe.last_episode_start_ms.store(last, Ordering::Relaxed);
             probe.episodes.fetch_add(1, Ordering::Relaxed);
-            probe.in_episode.store(true, Ordering::Relaxed);
+            // Release: a reader that sees `in_episode` also sees the start.
+            probe.in_episode.store(true, Ordering::Release);
             last
         };
         probe
@@ -190,12 +191,16 @@ pub fn step(probe: &RuntimeProbe, now_ms: u64, starved_after_ms: u64) -> Transit
             Transition::Started
         }
     } else if was {
-        let start = probe.episode_start_ms.swap(0, Ordering::Relaxed);
-        probe.in_episode.store(false, Ordering::Relaxed);
+        let start = probe.episode_start_ms.load(Ordering::Relaxed);
         // The episode ended at the tick that just landed.
         let dur = last.saturating_sub(start);
         probe.longest_episode_ms.fetch_max(dur, Ordering::Relaxed);
-        probe.starved_total_ms.fetch_add(dur, Ordering::Relaxed);
+        // Add to the closed total BEFORE closing the episode, so a concurrent
+        // `starved_total_at` can only double-count it (which leans toward
+        // firing the wedge rung), never miss it (which would over-mask).
+        probe.starved_total_ms.fetch_add(dur, Ordering::Release);
+        probe.in_episode.store(false, Ordering::Release);
+        probe.episode_start_ms.store(0, Ordering::Release);
         Transition::Ended(dur)
     } else {
         Transition::None
@@ -584,13 +589,17 @@ pub fn app_runtime_starved() -> Option<bool> {
 /// Cumulative starved ms of `p` at monotonic `now`: every ended episode plus
 /// the open one's elapsed time.
 fn starved_total_at(p: &RuntimeProbe, now: u64) -> u64 {
-    let closed = p.starved_total_ms.load(Ordering::Relaxed);
-    let start = p.episode_start_ms.load(Ordering::Relaxed);
-    let open = if p.in_episode.load(Ordering::Relaxed) && start > 0 {
+    // Open episode first, closed total LAST (pairs with `step`'s Ended
+    // order): a read torn across an episode's end double-counts it rather
+    // than missing it.
+    let in_episode = p.in_episode.load(Ordering::Acquire);
+    let start = p.episode_start_ms.load(Ordering::Acquire);
+    let open = if in_episode && start > 0 {
         now.saturating_sub(start)
     } else {
         0
     };
+    let closed = p.starved_total_ms.load(Ordering::Acquire);
     closed.saturating_add(open)
 }
 

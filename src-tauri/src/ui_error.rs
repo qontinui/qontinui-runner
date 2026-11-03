@@ -411,7 +411,10 @@ static LAST_EVENT_PONG_STARVED_TOTAL_MS: std::sync::atomic::AtomicU64 =
 
 /// How many ms `app-rt` has spent starved since the newest event pong was
 /// recorded. `None` = UNKNOWN: no snapshot beside that pong, or the probe
-/// cannot answer now.
+/// cannot answer now. An upper bound, not exact: an episode's start is
+/// backdated to its last tick, so a pong landing in the up-to-~5.25 s before
+/// the watcher notices that episode has the episode's pre-pong part counted
+/// here too (at most once per pong; small against the 90 s dead window).
 pub fn app_runtime_starved_since_last_event_pong_ms() -> Option<u64> {
     let at = LAST_EVENT_PONG_STARVED_TOTAL_MS.load(std::sync::atomic::Ordering::Relaxed);
     if at == 0 {
