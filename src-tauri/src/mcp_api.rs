@@ -2200,7 +2200,7 @@ async fn health(
             ping: crate::ui_error::ping_ask_from(last_ping_emit_ok, ping_now_ms),
         }),
         app_runtime_starved,
-        crate::ui_error::app_runtime_last_episode_end_age_ms_now(),
+        crate::ui_error::app_runtime_starved_since_last_event_pong_ms(),
     );
     let derived_status = crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
         has_ui_error: ui_error_snapshot.is_some(),

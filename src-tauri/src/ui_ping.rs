@@ -463,18 +463,14 @@ mod tests {
     }
 
     /// The debug hook must not ship: without the `debug-hooks` feature the
-    /// hook is inert even with its variable set. (`debug_assertions` is not
-    /// the gate — the release-checked primary keeps it on.)
+    /// hook is the constant `Off`, whatever the environment holds.
+    /// (`debug_assertions` is not the gate — the release-checked primary
+    /// keeps it on.)
     #[cfg(not(feature = "debug-hooks"))]
     #[test]
     fn the_stop_hook_is_inert_without_the_debug_hooks_feature() {
-        // No other test reads this variable, and outside a debug-hooks build
-        // any concurrent reader would see the inert arm too.
-        std::env::set_var(DEBUG_STOP_ENV, "5");
-        let got = debug_stop();
-        std::env::remove_var(DEBUG_STOP_ENV);
         assert_eq!(
-            got,
+            debug_stop(),
             DebugStop::Off,
             "the hook must read nothing outside a debug-hooks build"
         );

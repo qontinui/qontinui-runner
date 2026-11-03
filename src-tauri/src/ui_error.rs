@@ -392,7 +392,33 @@ pub fn record_event_pong() {
 /// [`record_event_pong`] with the instant passed in — the one place the
 /// forward-only rule is spelled, so no call site can forget it.
 fn record_event_pong_at(now_ms: u64) {
-    LAST_EVENT_PONG_MS.fetch_max(now_ms, std::sync::atomic::Ordering::Relaxed);
+    let prev = LAST_EVENT_PONG_MS.fetch_max(now_ms, std::sync::atomic::Ordering::Relaxed);
+    if now_ms >= prev {
+        // This pong is the newest: pair it with `app-rt`'s cumulative starved
+        // time, so a later reader can tell how much of the pong's age was
+        // starvation ([`app_runtime_starved_since_last_event_pong_ms`]).
+        let snapshot = qontinui_runner_lib::runtime_lag::app_runtime_starved_total_ms()
+            .map_or(0, |t| t.saturating_add(1));
+        LAST_EVENT_PONG_STARVED_TOTAL_MS.store(snapshot, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `app-rt`'s cumulative starved ms (`runtime_lag::app_runtime_starved_total_ms`)
+/// as read when the newest event pong was recorded, PLUS 1; 0 = UNKNOWN (no
+/// pong yet, or the probe could not answer then).
+static LAST_EVENT_PONG_STARVED_TOTAL_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many ms `app-rt` has spent starved since the newest event pong was
+/// recorded. `None` = UNKNOWN: no snapshot beside that pong, or the probe
+/// cannot answer now.
+pub fn app_runtime_starved_since_last_event_pong_ms() -> Option<u64> {
+    let at = LAST_EVENT_PONG_STARVED_TOTAL_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if at == 0 {
+        return None;
+    }
+    let now = qontinui_runner_lib::runtime_lag::app_runtime_starved_total_ms()?;
+    Some(now.saturating_sub(at - 1))
 }
 
 /// The last event-provenance pong stamp (ms since epoch), or 0 if none has
@@ -1412,14 +1438,16 @@ pub struct NativeUiLiveness {
 /// Phase 3.
 ///
 /// The same holds AFTER an episode ends: the pings sent and unanswered during
-/// it are not evidence about the loop. So the rung is also withdrawn when the
-/// last event pong predates the end of the most recent episode plus one ping
-/// interval ([`crate::ui_ping::UI_PING_CADENCE`]) — the first point at which a
-/// pong could have landed again — until a full [`UI_EVENT_DEAD_AFTER_MS`]
-/// window has been MEASURED after that point. Past it, the stale pong is
-/// evidence again and the verdict stands. `last_episode_end_age_ms` of `None`
-/// (UNKNOWN, or no episode ended since boot) and an unknown pong age change
-/// nothing on this arm.
+/// it are not evidence about the loop. So only UN-starved time counts: with
+/// `starved_since_pong_ms` = how long `app-rt` was starved since the last
+/// event pong, the pong's un-starved age is `pong_age - starved_since_pong`,
+/// and the rung is withdrawn while that is under [`UI_EVENT_DEAD_AFTER_MS`]
+/// plus one ping interval ([`crate::ui_ping::UI_PING_CADENCE`]). Recurring
+/// episodes therefore delay a real wedge only by the time they actually
+/// starved, never forever — and as a hard cap this arm never applies once the
+/// pong is older than 3 × [`UI_EVENT_DEAD_AFTER_MS`]. No starvation since the
+/// pong (`Some(0)`), `starved_since_pong_ms` of `None` (UNKNOWN) and an
+/// unknown pong age change nothing on this arm.
 ///
 /// Pure. Only the `events_undelivered` rung is withdrawn: a Win32 probe that
 /// timed out, or the caller's own unresponsive getter, measured the loop
@@ -1433,13 +1461,13 @@ pub struct NativeUiLiveness {
 pub fn apply_app_runtime_starvation(
     mut v: NativeUiLiveness,
     app_runtime_starved: Option<bool>,
-    last_episode_end_age_ms: Option<u64>,
+    starved_since_pong_ms: Option<u64>,
 ) -> NativeUiLiveness {
     if !v.events_undelivered {
         return v;
     }
     let starved_now = app_runtime_starved == Some(true);
-    if !starved_now && !stale_pong_is_from_a_starvation_episode(&v, last_episode_end_age_ms) {
+    if !starved_now && !stale_pong_is_from_a_starvation_episode(&v, starved_since_pong_ms) {
         return v;
     }
     v.events_undelivered = false;
@@ -1455,33 +1483,28 @@ pub fn apply_app_runtime_starvation(
     v
 }
 
-/// The post-episode arm of [`apply_app_runtime_starvation`]. With `end` =
-/// the episode's end and `c` = one ping interval, both as ages from now:
-/// the pong predates `end + c` (`end_age - c < pong_age`) AND fewer than
-/// [`UI_EVENT_DEAD_AFTER_MS`] have passed since `end + c`
-/// (`end_age < c + dead`).
+/// The post-episode arm of [`apply_app_runtime_starvation`]: some starvation
+/// since the pong, the pong no older than the 3 × dead hard cap, and its
+/// un-starved age (`pong_age - starved_since_pong`) under dead + one ping
+/// interval.
 fn stale_pong_is_from_a_starvation_episode(
     v: &NativeUiLiveness,
-    last_episode_end_age_ms: Option<u64>,
+    starved_since_pong_ms: Option<u64>,
 ) -> bool {
-    let (Some(end_age), Some(pong_age)) = (last_episode_end_age_ms, v.event_pong_age_ms) else {
+    let (Some(starved), Some(pong_age)) = (starved_since_pong_ms, v.event_pong_age_ms) else {
         return false;
     };
+    if starved == 0 || pong_age > UI_EVENT_DEAD_AFTER_MS.saturating_mul(3) {
+        return false;
+    }
     let cadence = crate::ui_ping::UI_PING_CADENCE.as_millis() as u64;
-    end_age.saturating_sub(cadence) < pong_age
-        && end_age < cadence.saturating_add(UI_EVENT_DEAD_AFTER_MS)
+    pong_age.saturating_sub(starved) < UI_EVENT_DEAD_AFTER_MS.saturating_add(cadence)
 }
 
 /// Is `app-rt` starved right now, per the runtime-lag probe? `None` = not
 /// registered or never ticked (UNKNOWN).
 pub fn app_runtime_starved_now() -> Option<bool> {
     qontinui_runner_lib::runtime_lag::app_runtime_starved()
-}
-
-/// How long ago the most recent `app-rt` starvation episode ended, per the
-/// runtime-lag probe. `None` = UNKNOWN or no episode ended since boot.
-pub fn app_runtime_last_episode_end_age_ms_now() -> Option<u64> {
-    qontinui_runner_lib::runtime_lag::app_runtime_last_episode_end_age_ms()
 }
 
 /// Classify the native message loop. Pure — no clock, no atomics, no runtime.
@@ -1604,7 +1627,7 @@ pub fn native_ui_liveness_now(last_pong: &std::sync::atomic::AtomicU64) -> Nativ
             ping,
         }),
         app_runtime_starved_now(),
-        app_runtime_last_episode_end_age_ms_now(),
+        app_runtime_starved_since_last_event_pong_ms(),
     )
 }
 
@@ -1905,40 +1928,40 @@ mod tests {
     #[test]
     fn the_post_episode_window_withdraws_a_pong_stale_from_the_episode() {
         let cadence = crate::ui_ping::UI_PING_CADENCE.as_millis() as u64;
-        // `fired_by_events` has a pong `UI_EVENT_DEAD_AFTER_MS + 1` old.
-        let pong_age = UI_EVENT_DEAD_AFTER_MS + 1;
-        // Inside: the episode ended 1 s ago (the pong predates it), not
-        // starved now — the stale pong is the episode's, not the loop's.
-        let v = apply_app_runtime_starvation(fired_by_events(None), Some(false), Some(1_000));
+        let dead = UI_EVENT_DEAD_AFTER_MS;
+        // `fired_by_events` has a pong `dead + 1` old.
+        // Inside: 5 s of that age was starvation — un-starved age 85 s.
+        let v = apply_app_runtime_starvation(fired_by_events(None), Some(false), Some(5_000));
         assert!(!v.events_undelivered, "inside the post-episode window");
         assert_eq!(v.wedged, None);
         assert_eq!(v.reason, "app_runtime_starved");
-        // Also inside: UNKNOWN starved-now, episode ended just under a full
-        // dead window past `end + cadence`.
-        let end_age = cadence + UI_EVENT_DEAD_AFTER_MS - 1;
-        assert!(end_age - cadence < pong_age);
-        let v = apply_app_runtime_starvation(fired_by_events(None), None, Some(end_age));
+        // Just inside the edge: un-starved age dead + cadence - 1.
+        let mut edge = fired_by_events(None);
+        edge.event_pong_age_ms = Some(dead + cadence + 9_999);
+        let v = apply_app_runtime_starvation(edge, None, Some(10_000));
         assert!(!v.events_undelivered, "still inside the window");
 
-        // After: a full dead window has been measured since `end + cadence`
-        // with no pong — the staleness is evidence again.
-        let end_age = cadence + UI_EVENT_DEAD_AFTER_MS;
-        let v = apply_app_runtime_starvation(fired_by_events(None), Some(false), Some(end_age));
+        // After: un-starved age reached dead + cadence — evidence again.
+        let v = apply_app_runtime_starvation(edge, Some(false), Some(9_999));
         assert!(v.events_undelivered, "after the window the verdict stands");
         assert_eq!(v.wedged, Some(true));
         assert_eq!(v.reason, "events_undelivered");
 
-        // After, the other way: the pong landed after `end + cadence` and
-        // still went stale — not the episode's doing.
-        let mut late = fired_by_events(None);
-        late.event_pong_age_ms = Some(30_000);
-        let v = apply_app_runtime_starvation(late, Some(false), Some(30_000 + cadence + 1));
+        // No starvation since the pong: not the episode's doing.
+        let v = apply_app_runtime_starvation(fired_by_events(None), Some(false), Some(0));
         assert!(
             v.events_undelivered,
-            "a pong that post-dates the window stands"
+            "a pong with no starvation since stands"
         );
 
-        // UNKNOWN episode end, or no pong age: nothing changes.
+        // Hard cap: past 3 × dead the arm never applies, however much of the
+        // age was starvation.
+        let mut ancient = fired_by_events(None);
+        ancient.event_pong_age_ms = Some(dead * 3 + 1);
+        let v = apply_app_runtime_starvation(ancient, Some(false), Some(dead * 3));
+        assert!(v.events_undelivered, "the 3 × dead cap");
+
+        // UNKNOWN starvation since the pong, or no pong age: nothing changes.
         assert_eq!(
             apply_app_runtime_starvation(fired_by_events(None), Some(false), None),
             fired_by_events(None)
@@ -1949,6 +1972,44 @@ mod tests {
             apply_app_runtime_starvation(no_age, Some(false), Some(1_000)),
             no_age
         );
+    }
+
+    /// Recurring episodes must not mask a real wedge forever: only un-starved
+    /// time is discounted. A pong at t = 0, then two 30 s episodes 60 s apart
+    /// (t = 10..40 s and t = 100..130 s) with no pong since. The rung stays
+    /// withdrawn until the un-starved age reaches dead + one ping interval
+    /// (t = 153 s here), and fires from then on.
+    #[test]
+    fn recurring_episodes_delay_the_wedge_only_by_their_starved_time() {
+        let cadence = crate::ui_ping::UI_PING_CADENCE.as_millis() as u64;
+        let dead = UI_EVENT_DEAD_AFTER_MS;
+        let episodes = [(10_000u64, 40_000u64), (100_000, 130_000)];
+        let starved_by = |t: u64| -> u64 { episodes.iter().map(|&(s, e)| t.clamp(s, e) - s).sum() };
+        let total_starved = starved_by(u64::MAX / 2);
+        assert_eq!(total_starved, 60_000);
+        let fires_at = dead + cadence + total_starved;
+        // Only ages past `dead` matter: below it `events_undelivered` never
+        // fires in the first place.
+        let mut t = dead + 1;
+        while t <= 200_000 {
+            let mut v = fired_by_events(None);
+            v.event_pong_age_ms = Some(t);
+            let out = apply_app_runtime_starvation(v, None, Some(starved_by(t)));
+            if t < fires_at {
+                assert!(
+                    !out.events_undelivered,
+                    "t={t} ms: un-starved age {} < dead + cadence — withdrawn",
+                    t - starved_by(t)
+                );
+            } else {
+                assert!(
+                    out.events_undelivered,
+                    "t={t} ms: {} ms of un-starved time accumulated — the rung fires",
+                    t - starved_by(t)
+                );
+            }
+            t += 500;
+        }
     }
 
     #[test]

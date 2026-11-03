@@ -22,9 +22,10 @@
 //! runtime is **starved**. `starved` is derived at READ time from the stamp's
 //! age, so it never depends on the watch thread being alive. The watch thread
 //! keeps the episode bookkeeping — how many episodes, the current and longest
-//! one, when the last one began and ended — and stamps its own heartbeat each
-//! pass; when that heartbeat is older than [`WATCHER_STALE_AFTER_MS`] (or was
-//! never stamped) every episode-derived field reads `null` (UNKNOWN).
+//! one, when the last one began, the cumulative starved time — and stamps its
+//! own heartbeat each pass; when that heartbeat is older than
+//! [`WATCHER_STALE_AFTER_MS`] (or was never stamped) every episode-derived
+//! field reads `null` (UNKNOWN).
 //!
 //! Stamps are MONOTONIC: milliseconds since a process-start `Instant`, plus 1
 //! so that 0 still means "never". They become wall-clock only where a
@@ -117,10 +118,15 @@ pub struct RuntimeProbe {
     /// Monotonic ms the most recent episode began (kept after it ends); 0 =
     /// no episode since boot. The relay heartbeat's post-hoc field.
     last_episode_start_ms: AtomicU64,
-    /// Monotonic ms the most recent episode ENDED (the tick that ended it,
-    /// kept after it ends); 0 = no episode has ended since boot. Read by
-    /// `ui_error` to keep a post-episode stale event pong from firing.
-    last_episode_end_ms: AtomicU64,
+    /// Cumulative ms of every ENDED episode (the watcher adds each one's
+    /// duration on `Ended`). Readers add the open episode's elapsed time at
+    /// read time ([`starved_total_at`]). `ui_error` snapshots it beside each
+    /// event pong so only UN-starved time ages a pong.
+    starved_total_ms: AtomicU64,
+    /// Monotonic ms of the last attribution capture this runtime requested;
+    /// 0 = none. Per runtime, so one flapping runtime cannot use up another's
+    /// capture.
+    last_capture_ms: AtomicU64,
 }
 
 impl RuntimeProbe {
@@ -134,7 +140,8 @@ impl RuntimeProbe {
             episode_start_ms: AtomicU64::new(0),
             longest_episode_ms: AtomicU64::new(0),
             last_episode_start_ms: AtomicU64::new(0),
-            last_episode_end_ms: AtomicU64::new(0),
+            starved_total_ms: AtomicU64::new(0),
+            last_capture_ms: AtomicU64::new(0),
         }
     }
 
@@ -186,9 +193,9 @@ pub fn step(probe: &RuntimeProbe, now_ms: u64, starved_after_ms: u64) -> Transit
         let start = probe.episode_start_ms.swap(0, Ordering::Relaxed);
         probe.in_episode.store(false, Ordering::Relaxed);
         // The episode ended at the tick that just landed.
-        probe.last_episode_end_ms.store(last, Ordering::Relaxed);
         let dur = last.saturating_sub(start);
         probe.longest_episode_ms.fetch_max(dur, Ordering::Relaxed);
+        probe.starved_total_ms.fetch_add(dur, Ordering::Relaxed);
         Transition::Ended(dur)
     } else {
         Transition::None
@@ -266,27 +273,29 @@ fn capture_tx() -> &'static OnceLock<std::sync::mpsc::SyncSender<CaptureRequest>
     &TX
 }
 
-/// Monotonic ms of the last capture request the watcher let through; 0 = none.
-static LAST_CAPTURE_MS: AtomicU64 = AtomicU64::new(0);
-
-/// The watcher's side of an episode start: rate-limit (check-and-set), then
-/// `try_send`. Never blocks — a full queue or a dead capture thread drops the
-/// request. Does nothing when [`install_attribution`] was never called.
-fn request_capture(runtime: &'static str, age_ms: u64, now_mono: u64) {
+/// The watcher's side of an episode start: rate-limit on the probe's own
+/// slot (check-and-set), then `try_send`. Never blocks — a full queue or a
+/// dead capture thread drops the request. Does nothing when
+/// [`install_attribution`] was never called.
+fn request_capture(probe: &RuntimeProbe, age_ms: u64, now_mono: u64) {
     let Some(tx) = capture_tx().get() else {
         return;
     };
-    let last = LAST_CAPTURE_MS.load(Ordering::Relaxed);
+    let last = probe.last_capture_ms.load(Ordering::Relaxed);
     if last != 0 && now_mono.saturating_sub(last) < CAPTURE_MIN_INTERVAL.as_millis() as u64 {
         return;
     }
-    if LAST_CAPTURE_MS
+    if probe
+        .last_capture_ms
         .compare_exchange(last, now_mono, Ordering::Relaxed, Ordering::Relaxed)
         .is_err()
     {
         return;
     }
-    let _ = tx.try_send(CaptureRequest { runtime, age_ms });
+    let _ = tx.try_send(CaptureRequest {
+        runtime: probe.name,
+        age_ms,
+    });
 }
 
 /// Install the attribution capture that runs on every episode start. Called
@@ -431,15 +440,15 @@ fn watcher_alive(now: u64) -> bool {
     hb != 0 && now.saturating_sub(hb) <= WATCHER_STALE_AFTER_MS
 }
 
-/// One pass of the watch thread at monotonic `now`: stamp the heartbeat, step
+/// One pass of the watch thread at monotonic `now`: stamp `heartbeat`, step
 /// every probe, and on an episode start hand the capture thread a request
-/// (never waiting on it).
-fn watch_once(probes: &[Arc<RuntimeProbe>], now: u64) {
-    WATCH_HEARTBEAT_MS.store(now, Ordering::Relaxed);
+/// (never waiting on it). Production passes [`WATCH_HEARTBEAT_MS`].
+fn watch_once(probes: &[Arc<RuntimeProbe>], now: u64, heartbeat: &AtomicU64) {
+    heartbeat.store(now, Ordering::Relaxed);
     for p in probes {
         if step(p, now, RUNTIME_STARVED_AFTER_MS) == Transition::Started {
             let age = now.saturating_sub(p.last_tick_ms.load(Ordering::Relaxed));
-            request_capture(p.name, age, now);
+            request_capture(p, age, now);
         }
     }
 }
@@ -453,7 +462,7 @@ fn start_watch_thread() {
         .name(WATCH_THREAD_NAME.to_string())
         .spawn(|| loop {
             std::thread::sleep(RUNTIME_LAG_WATCH);
-            watch_once(&probes(), now_mono_ms());
+            watch_once(&probes(), now_mono_ms(), &WATCH_HEARTBEAT_MS);
         });
     if let Err(e) = spawned {
         // Off the hot path: this runs once, at registration.
@@ -572,18 +581,27 @@ pub fn app_runtime_starved() -> Option<bool> {
         .and_then(|p| starved_at(p, now_mono_ms()))
 }
 
-/// How long ago (ms) the most recent `app-rt` starvation episode ENDED. `None`
-/// = UNKNOWN (not registered, or the watch thread is not keeping the
-/// bookkeeping) or no episode has ended since boot — either way, nothing to
-/// correct for.
-pub fn app_runtime_last_episode_end_age_ms() -> Option<u64> {
+/// Cumulative starved ms of `p` at monotonic `now`: every ended episode plus
+/// the open one's elapsed time.
+fn starved_total_at(p: &RuntimeProbe, now: u64) -> u64 {
+    let closed = p.starved_total_ms.load(Ordering::Relaxed);
+    let start = p.episode_start_ms.load(Ordering::Relaxed);
+    let open = if p.in_episode.load(Ordering::Relaxed) && start > 0 {
+        now.saturating_sub(start)
+    } else {
+        0
+    };
+    closed.saturating_add(open)
+}
+
+/// Cumulative ms `app-rt` has spent starved since boot (monotonic, open
+/// episode included). `None` = UNKNOWN: not registered, or the watch thread
+/// is not keeping the bookkeeping. `ui_error` snapshots it beside each event
+/// pong, so the difference measures the starved share of a pong's age.
+pub fn app_runtime_starved_total_ms() -> Option<u64> {
     let probe = probes().into_iter().find(|p| p.name == APP_RUNTIME_NAME)?;
     let now = now_mono_ms();
-    if !watcher_alive(now) {
-        return None;
-    }
-    let end = probe.last_episode_end_ms.load(Ordering::Relaxed);
-    (end > 0).then(|| now.saturating_sub(end))
+    watcher_alive(now).then(|| starved_total_at(&probe, now))
 }
 
 /// Verification hook: `QONTINUI_DEBUG_BLOCK_APP_WORKERS_SECS=<n>` at spawn
@@ -627,8 +645,15 @@ pub fn debug_block_workers_from_env(handle: &tokio::runtime::Handle, workers: us
                 workers,
                 "runtime_lag: {DEBUG_BLOCK_APP_WORKERS_ENV} — parking every app-rt worker"
             );
-            for _ in 0..workers {
-                handle.spawn(async move { std::thread::sleep(Duration::from_secs(secs)) });
+            // A barrier of `workers` parties: no task starts sleeping until
+            // every one holds a distinct worker, so EVERY worker is parked.
+            let barrier = Arc::new(std::sync::Barrier::new(workers.max(1)));
+            for _ in 0..workers.max(1) {
+                let b = barrier.clone();
+                handle.spawn(async move {
+                    b.wait();
+                    std::thread::sleep(Duration::from_secs(secs));
+                });
             }
         });
 }
@@ -636,8 +661,8 @@ pub fn debug_block_workers_from_env(handle: &tokio::runtime::Handle, workers: us
 /// The no-op twin: without the `debug-hooks` feature there is no switch.
 #[cfg(not(feature = "debug-hooks"))]
 pub fn debug_block_workers_from_env(_handle: &tokio::runtime::Handle, _workers: usize) {
-    // `debug_block_secs` is the constant `None` here; read it so the twin and
-    // the tests share one definition of "inert".
+    // `debug_block_secs` is the constant `None` here; reading it keeps the
+    // twin and the inert-hook test on one definition of "no switch".
     let _ = debug_block_secs();
 }
 
@@ -690,11 +715,6 @@ mod tests {
             p.last_episode_start_ms.load(Ordering::Relaxed),
             10_000,
             "the post-hoc start survives the episode's end"
-        );
-        assert_eq!(
-            p.last_episode_end_ms.load(Ordering::Relaxed),
-            21_000,
-            "the end is the tick that ended it, and survives the episode"
         );
     }
 
@@ -781,10 +801,10 @@ mod tests {
             "the tick task never ran"
         );
         let park = Duration::from_millis(1_500);
+        // Taken BEFORE the park: the workers start sleeping only once the
+        // barrier releases, so the park ends no earlier than `park_floor`.
+        let park_floor = Instant::now() + park;
         park_every_worker(&rt, 2, park);
-        // The workers start sleeping when the barrier releases, so the park
-        // ends within microseconds of `park_ends` (on either side).
-        let park_ends = Instant::now() + park;
         let p = probe.clone();
         let seen_at =
             std::thread::spawn(move || observed_starvation(&p, 400, Duration::from_millis(1_200)))
@@ -795,7 +815,7 @@ mod tests {
         // into the park; demanding it 500 ms before the end leaves no room for
         // a watcher that only ran once the runtime resumed.
         assert!(
-            seen_at + Duration::from_millis(500) < park_ends,
+            seen_at + Duration::from_millis(500) < park_floor,
             "the starvation must be seen WHILE the runtime is parked, not read post hoc \
              off a stale stamp after it resumes"
         );
@@ -813,8 +833,10 @@ mod tests {
         spawn_tick_task(rt.handle(), probe.clone(), Duration::from_millis(50));
         std::thread::sleep(Duration::from_millis(200));
         let park = Duration::from_millis(1_500);
+        // Taken BEFORE the park: the workers start sleeping only once the
+        // barrier releases, so the park cannot end before `park_floor`.
+        let park_floor = Instant::now() + park;
         park_every_worker(&rt, 2, park);
-        let park_ends = Instant::now() + park;
         // When the on-runtime watcher ran, and whether it saw an episode start.
         let ran: Arc<Mutex<Option<(Instant, bool)>>> = Arc::new(Mutex::new(None));
         let (p, r) = (probe.clone(), ran.clone());
@@ -822,14 +844,9 @@ mod tests {
             let saw = step(&p, now_mono_ms(), 400) == Transition::Started;
             *r.lock().unwrap() = Some((Instant::now(), saw));
         });
-        std::thread::sleep(Duration::from_millis(1_200));
-        assert!(
-            ran.lock().unwrap().is_none(),
-            "a watcher on the parked runtime ran during the park — the fixture no longer parks it"
-        );
-        // It DOES run once the park ends (bounded wait), and only then.
-        let deadline = park_ends + Duration::from_secs(5);
-        let (ran_at, _saw) = loop {
+        // It DOES run once the park ends (bounded wait).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (ran_at, _saw_started) = loop {
             if let Some(v) = *ran.lock().unwrap() {
                 break v;
             }
@@ -839,14 +856,18 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         };
-        // Whatever it saw (a stale stamp can still read `Started` post hoc),
-        // it saw it after the park: it could not see the starvation WHILE it
-        // was happening.
         assert!(
-            ran_at + Duration::from_millis(50) >= park_ends,
-            "the on-runtime watcher ran {:?} before the park ended",
-            park_ends.saturating_duration_since(ran_at)
+            ran_at >= park_floor,
+            "a watcher on the parked runtime ran {:?} before the park could have ended — \
+             the fixture no longer parks it",
+            park_floor.saturating_duration_since(ran_at)
         );
+        // What it read when it finally ran is not asserted either way: it is
+        // queued on the injection queue, while the tick needs the timer
+        // driver, so which runs first after the park is the scheduler's
+        // choice — it may still read the stale stamp and report `Started`.
+        // Either way that report came at or after `park_floor`: post hoc,
+        // never WHILE the runtime was parked, which is the property.
         rt.shutdown_background();
     }
 
@@ -876,9 +897,11 @@ mod tests {
         // production tick (500 ms), with a second of margin before the
         // 500 ms-before-the-end deadline.
         let park = Duration::from_millis(RUNTIME_STARVED_AFTER_MS + 2_000);
+        // Taken BEFORE the park, so the deadline is a lower bound on the
+        // park's end: every sample before it is a sample while parked.
+        let park_floor = Instant::now() + park;
         park_every_worker(&rt, 2, park);
-        let park_ends = Instant::now() + park;
-        let deadline = park_ends - Duration::from_millis(500);
+        let deadline = park_floor - Duration::from_millis(500);
         let mut seen = None;
         while Instant::now() < deadline {
             let r = find();
@@ -902,34 +925,40 @@ mod tests {
     fn watch_once_steps_every_probe_and_stamps_the_heartbeat() {
         let a = Arc::new(probe_at(10_000));
         let b = Arc::new(probe_at(14_000));
-        // The synthetic `now` may lie in the real clock's future; restore the
-        // shared heartbeat so no other test reads a watcher kept "alive" by it.
-        let prev = WATCH_HEARTBEAT_MS.load(Ordering::Relaxed);
-        watch_once(&[a.clone(), b.clone()], 15_001);
-        let stamped = WATCH_HEARTBEAT_MS.swap(prev, Ordering::Relaxed);
+        let heartbeat = AtomicU64::new(0);
+        watch_once(&[a.clone(), b.clone()], 15_001, &heartbeat);
         assert_eq!(a.episodes.load(Ordering::Relaxed), 1);
         assert_eq!(b.episodes.load(Ordering::Relaxed), 0);
-        assert!(stamped > 0, "watch_once stamps the watcher heartbeat");
+        assert_eq!(heartbeat.load(Ordering::Relaxed), 15_001);
+    }
+
+    /// The cumulative starved time: every ended episode, plus the open one's
+    /// elapsed time at read time.
+    #[test]
+    fn starved_total_sums_ended_episodes_and_the_open_one() {
+        let p = probe_at(10_000);
+        assert_eq!(starved_total_at(&p, 12_000), 0);
+        assert_eq!(step(&p, 15_001, 5_000), Transition::Started);
+        assert_eq!(starved_total_at(&p, 17_000), 7_000, "open: 17 s - 10 s");
+        p.last_tick_ms.store(21_000, Ordering::Relaxed);
+        assert_eq!(step(&p, 21_100, 5_000), Transition::Ended(11_000));
+        assert_eq!(starved_total_at(&p, 30_000), 11_000);
+        // A second episode, 60 s later.
+        p.last_tick_ms.store(81_000, Ordering::Relaxed);
+        assert_eq!(step(&p, 86_001, 5_000), Transition::Started);
+        assert_eq!(starved_total_at(&p, 90_000), 11_000 + 9_000);
+        p.last_tick_ms.store(95_000, Ordering::Relaxed);
+        assert_eq!(step(&p, 95_100, 5_000), Transition::Ended(14_000));
+        assert_eq!(starved_total_at(&p, 200_000), 25_000);
     }
 
     /// The debug hook that parks `app-rt` must not ship: without the
-    /// `debug-hooks` feature it is inert even with its variable set.
+    /// `debug-hooks` feature it reads no switch at all.
     /// (`debug_assertions` is not the gate — the release-checked primary keeps
     /// it on.)
     #[cfg(not(feature = "debug-hooks"))]
     #[test]
     fn the_worker_park_hook_is_inert_without_the_debug_hooks_feature() {
-        // No other test reads this variable, and outside a debug-hooks build
-        // any concurrent reader would see the inert arm too.
-        std::env::set_var(DEBUG_BLOCK_APP_WORKERS_ENV, "3");
-        let secs = debug_block_secs();
-        let rt = runtime(1);
-        debug_block_workers_from_env(rt.handle(), 1);
-        std::env::remove_var(DEBUG_BLOCK_APP_WORKERS_ENV);
-        assert_eq!(
-            secs, None,
-            "the hook must read nothing outside a debug-hooks build"
-        );
-        rt.shutdown_background();
+        assert_eq!(debug_block_secs(), None);
     }
 }

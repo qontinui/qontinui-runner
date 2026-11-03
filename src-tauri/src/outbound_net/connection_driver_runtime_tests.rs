@@ -20,20 +20,25 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 /// A loopback HTTP/1.1 server on plain threads (no tokio, so no runtime under
 /// test can starve it). Answers every request on a connection with `ok` and
-/// keeps the connection alive.
-fn keep_alive_server() -> String {
+/// keeps the connection alive. Returns the URL and the count of accepted
+/// connections, so a test can prove which requests shared one connection.
+fn keep_alive_server() -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let addr = listener.local_addr().expect("local addr");
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let counter = accepts.clone();
     std::thread::Builder::new()
         .name("test-http-server".into())
         .spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
+                counter.fetch_add(1, Ordering::SeqCst);
                 std::thread::spawn(move || {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 1024];
@@ -55,7 +60,14 @@ fn keep_alive_server() -> String {
             }
         })
         .expect("server thread");
-    format!("http://{addr}/")
+    (format!("http://{addr}/"), accepts)
+}
+
+/// Give the pool ~200 ms to settle (a connection opened late shows up as an
+/// accept), then read the count.
+fn settled_accepts(accepts: &AtomicUsize) -> usize {
+    std::thread::sleep(Duration::from_millis(200));
+    accepts.load(Ordering::SeqCst)
 }
 
 fn runtime(name: &str) -> tokio::runtime::Runtime {
@@ -94,7 +106,10 @@ async fn get(client: &reqwest::Client, url: &str) -> Result<String, String> {
 
 #[test]
 fn a_pooled_connection_is_driven_by_the_runtime_that_opened_it() {
-    let url = keep_alive_server();
+    let (url, accepts) = keep_alive_server();
+    // Control (ii) gets its OWN server, so `accepts` counts only the shared
+    // client's connections.
+    let (b_only_url, _b_only_accepts) = keep_alive_server();
     let rt_a = runtime("conn-test-a");
     let rt_b = runtime("conn-test-b");
     let shared = super::os_dns::client_builder()
@@ -110,19 +125,32 @@ fn a_pooled_connection_is_driven_by_the_runtime_that_opened_it() {
         Ok("ok".into()),
         "control (i): a request from B on A's pooled connection succeeds while A is healthy"
     );
+    assert_eq!(
+        settled_accepts(&accepts),
+        1,
+        "fixture error — the second request did not reuse A's pooled connection"
+    );
 
     park_both_workers(&rt_a, Duration::from_secs(6));
 
     // Control (ii): a client used only from B is unaffected by A.
     let b_only = super::os_dns::client_builder().build().expect("client");
     assert_eq!(
-        rt_b.block_on(get(&b_only, &url)),
+        rt_b.block_on(get(&b_only, &b_only_url)),
         Ok("ok".into()),
         "control (ii): a B-only client succeeds while A is parked"
     );
 
     // The hypothesis: the shared client's pooled connection is driven by A.
     let shared_from_b = rt_b.block_on(get(&shared, &url));
+    // Checked FIRST, so a request that went out on a new connection reads as
+    // a fixture error rather than as a refuted hypothesis.
+    assert_eq!(
+        settled_accepts(&accepts),
+        1,
+        "fixture error — the request from B opened a NEW connection instead of using A's \
+         pooled one, so its outcome says nothing about the hypothesis"
+    );
     assert_eq!(
         shared_from_b,
         Err("timed out after 2s".into()),

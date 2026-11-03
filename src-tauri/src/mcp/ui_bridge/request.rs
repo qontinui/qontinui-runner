@@ -622,7 +622,7 @@ pub(super) async fn gather_ui_error_signals(
             ping: crate::ui_error::ping_ask_now(),
         }),
         app_runtime_starved,
-        crate::ui_error::app_runtime_last_episode_end_age_ms_now(),
+        crate::ui_error::app_runtime_starved_since_last_event_pong_ms(),
     );
     let (pg_reachable, pg_schema_ok) = crate::database::pg::health::status_pg_inputs();
     let derived_status = crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
