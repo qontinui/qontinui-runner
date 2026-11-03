@@ -1550,13 +1550,16 @@ fn cmd_device_pair(
             // runner still heals: the first 2xx it forwards with the new
             // credential resets that tenant's streak. A runner started after this
             // pairing begins with no streak at all.
-            if let Err(e) = persist_pairing(&resp, effective_tenant_id) {
-                eprintln!(
-                    "error: pairing succeeded but persisting locally failed: {}",
-                    e
-                );
-                return ExitCode::from(2);
-            }
+            let persisted = match persist_pairing(&resp, effective_tenant_id) {
+                Ok(persisted) => persisted,
+                Err(e) => {
+                    eprintln!(
+                        "error: pairing succeeded but persisting locally failed: {}",
+                        e
+                    );
+                    return ExitCode::from(2);
+                }
+            };
             // Running `device pair` IS an explicit interactive credential
             // acquisition, so it ends any interactive logout — same rule as a
             // Cognito sign-in or a pair-code redeem in the UI. Without this the
@@ -1589,11 +1592,9 @@ fn cmd_device_pair(
                 .map(|dt| dt.to_rfc3339())
                 .or_else(|| decode_jwt_exp_display(&resp.token))
                 .unwrap_or_else(|| "<unknown>".to_string());
-            let dmk_stored = resp
-                .device_machine_key
-                .as_deref()
-                .map(|k| !k.trim().is_empty())
-                .unwrap_or(false);
+            // What secure storage holds after the write, not whether the
+            // response carried a key: a failed store prints `false`.
+            let dmk_stored = persisted.dmk_stored;
             let success_line = format!(
                 "device paired: user_id={} device_id={} tenant_id={} token_expires={} \
                  dmk_stored={} (device-token JWT saved to auth_tokens.enc)",
