@@ -415,8 +415,10 @@ pub(crate) fn log_upgrade_failure(lane: &str, e: &tungstenite::Error) {
                 403 => {
                     " — not admitted: no credential was sent (coord code \
                         subscription_scope_required), the credential verified but is a \
-                        capability grant rather than a principal, or the principal cannot \
-                        resolve this subscription"
+                        capability grant rather than a principal, the principal cannot \
+                        resolve this subscription, or (coord code pattern_removed) coord \
+                        received an anonymous `?pattern=` with no `?subscribe=`, a shape this \
+                        module never sends — look for a proxy rewrite of the URL"
                 }
                 _ => "",
             };
