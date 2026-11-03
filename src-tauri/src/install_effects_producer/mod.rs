@@ -288,7 +288,25 @@ async fn post_session_open(
 
     match store {
         Some(store) => {
-            record_session_open_into(&store, &req, &provider);
+            let outcome = record_session_open_into(&store, &req, &provider);
+            if !outcome.is_recorded() {
+                // Plan `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`:
+                // the store refused the bind (another live pane's own `claude`
+                // still runs this session) or could not write it. Nothing was
+                // recorded on this terminal, so nothing is confirmed, stamped,
+                // emitted to the tab or re-keyed in coord — each would report a
+                // binding the store does not hold. 200 all the same: the hook
+                // must never wedge the provider's startup.
+                warn!(
+                    terminal_id = %req.terminal_id,
+                    session_id = %req.session_id,
+                    provider = %provider,
+                    source = %req.source.as_deref().unwrap_or("?"),
+                    outcome = ?outcome,
+                    "control/session-open: session NOT recorded — no confirmation, tab stamp or coord re-key"
+                );
+                return Ok(Json(ApiResponse::success(())));
+            }
             info!(
                 terminal_id = %req.terminal_id,
                 session_id = %req.session_id,
@@ -1201,11 +1219,17 @@ fn normalize_msys_cwd(cwd: &str) -> String {
 /// the SAME TERMINAL before falling back to the hook's own context. The terminal
 /// is the right key — the grid page and zone are properties of where the PTY
 /// sits, not of whichever session id currently owns it.
+///
+/// Returns what the store did with the record. Every step after the write —
+/// confirmation, the session-start stamp, the `/clear` adoption marker, the
+/// identity stamp — runs only when it was recorded: on a refusal the row is
+/// another pane's, and stamping it from this hook would describe this
+/// terminal's process on that pane's row.
 fn record_session_open_into(
     store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
     req: &SessionOpenRequest,
     provider: &str,
-) {
+) -> crate::session::session_lifecycle_store::RecordOpenOutcome {
     let existing = store.get(&req.session_id);
     // The most recent OTHER session open on this terminal, read before
     // `record_open` below can supersede it. Deterministic, not a first match:
@@ -1255,7 +1279,7 @@ fn record_session_open_into(
         .clone()
         .or_else(|| existing.as_ref().and_then(|r| r.config_dir.clone()))
         .or_else(|| terminal_prior.as_ref().and_then(|r| r.config_dir.clone()));
-    crate::commands::terminal::record_pinned_session_open(
+    let outcome = crate::commands::terminal::record_pinned_session_open(
         store,
         req.session_id.clone(),
         req.terminal_id.clone(),
@@ -1267,6 +1291,9 @@ fn record_session_open_into(
         provider.to_string(),
         None,
     );
+    if !outcome.is_recorded() {
+        return outcome;
+    }
     // CONFIRM the record (session-restore-redesign Phase 2 coordinator
     // refinement). This route is hit ONLY by a provider's SessionStart hook,
     // which fires only when a REAL provider session actually started in this
@@ -1320,6 +1347,7 @@ fn record_session_open_into(
     {
         store.update_identity(&req.session_id, &live.identity_update());
     }
+    outcome
 }
 
 /// `POST /install-effects/run`.
@@ -2297,7 +2325,7 @@ mod tests {
             ..session_open_req("term-after-restore", csid)
         };
         assert!(session_open_rejection(&req).is_none());
-        record_session_open_into(&store, &req, "claude");
+        let _ = record_session_open_into(&store, &req, "claude");
 
         let after = store.get(csid).unwrap();
         assert_eq!(after.terminal_id, "term-after-restore");
@@ -2395,7 +2423,7 @@ mod tests {
 
         // Drive the handler's own contract: reject first, write only on accept.
         if session_open_rejection(&bad).is_none() {
-            record_session_open_into(&store, &bad, "claude");
+            let _ = record_session_open_into(&store, &bad, "claude");
         }
 
         assert!(
@@ -2416,7 +2444,7 @@ mod tests {
         // emptiness above is the gate working rather than a broken writer.
         let good = session_open_req("term-1", "good-id_1");
         if session_open_rejection(&good).is_none() {
-            record_session_open_into(&store, &good, "claude");
+            let _ = record_session_open_into(&store, &good, "claude");
         }
         assert!(
             store.get("good-id_1").is_some(),
@@ -2916,7 +2944,7 @@ mod tests {
             config_dir: Some("C:/cfg".to_string()),
             cwd: Some("C:/repos/widget".to_string()),
         };
-        record_session_open_into(&store, &req, "claude");
+        let _ = record_session_open_into(&store, &req, "claude");
 
         let open = store.open_records();
         assert_eq!(open.len(), 1, "exactly one record written");
@@ -2944,7 +2972,7 @@ mod tests {
         // and refreshes the row rather than duplicating it.
         let mut resume = req;
         resume.source = Some("resume".to_string());
-        record_session_open_into(&store, &resume, "claude");
+        let _ = record_session_open_into(&store, &resume, "claude");
         assert_eq!(
             store.open_records().len(),
             1,
@@ -3018,7 +3046,7 @@ mod tests {
             config_dir: None, // hook may omit — must not erase the known one
             cwd: Some("/d/qontinui-root".to_string()),
         };
-        record_session_open_into(&store, &req, "claude");
+        let _ = record_session_open_into(&store, &req, "claude");
 
         let rec = store.get("sess-1").unwrap();
         assert_eq!(rec.page_id, "bf44dfd5-real-page", "page preserved");
@@ -3063,7 +3091,7 @@ mod tests {
                 config_dir: Some(config.clone()),
                 cwd: None,
             };
-            record_session_open_into(&store, &req, "claude");
+            let _ = record_session_open_into(&store, &req, "claude");
         };
         // Each terminal first hosts an open session, then the hook reports a
         // NEW id on it under each source.
@@ -3122,7 +3150,7 @@ mod tests {
                     config_dir: Some(config.clone()),
                     cwd: None,
                 };
-                record_session_open_into(&store, &req, "claude");
+                let _ = record_session_open_into(&store, &req, "claude");
             };
             // Vary which id sorts first too, so a tie-break on the id cannot
             // pass the test by accident either.
@@ -3227,7 +3255,7 @@ mod tests {
                     config_dir: Some(config.clone()),
                     cwd: None,
                 };
-                record_session_open_into(&store, &req, "claude");
+                let _ = record_session_open_into(&store, &req, "claude");
             };
             let (pane, resumed) = if round % 2 == 0 {
                 ("aaaa-pane", "zzzz-resumed")
@@ -3329,7 +3357,7 @@ mod tests {
             config_dir: None,
             cwd: Some("/d/qontinui-root".to_string()),
         };
-        record_session_open_into(&store, &req, "claude");
+        let _ = record_session_open_into(&store, &req, "claude");
 
         let rec = store
             .get("provider-adopted-id")
@@ -3421,7 +3449,7 @@ mod tests {
             config_dir: None,
             cwd: Some("/d/qontinui-root".to_string()),
         };
-        record_session_open_into(&store, &req, "claude");
+        let _ = record_session_open_into(&store, &req, "claude");
 
         let rec = store.get("fresh-id").expect("hook record written");
         assert_eq!(
@@ -3470,7 +3498,7 @@ mod tests {
             cwd: None,
         };
         // The handler computes `provider`; mirror its default here.
-        record_session_open_into(&store, &req, "claude");
+        let _ = record_session_open_into(&store, &req, "claude");
         let rec = store.get("s").unwrap();
         // No cwd ⇒ title falls back to the provider name.
         assert_eq!(rec.title.as_deref(), Some("claude"));

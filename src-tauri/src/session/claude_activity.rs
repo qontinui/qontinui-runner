@@ -160,8 +160,10 @@ pub struct RecordEvidence {
     /// only for `busy`/`shell` records. `None` when not read, not located, or
     /// no such line was in the tail.
     pub last_message_ms: Option<i64>,
-    /// The `sessionId` the record names — the session this process runs NOW
-    /// (Claude Code rewrites it on `/clear` and on an in-TUI resume). `None`
+    /// The `sessionId` the record names — the session the process runs, by
+    /// Claude Code's own account. (Whether Claude Code rewrites it when `/clear`
+    /// or an in-TUI resume switches the process to another session is assumed,
+    /// UNMEASURED — see [`crate::session::pane_binding`].) `None`
     /// when absent or blank. Read by the pane-binding check
     /// ([`crate::session::pane_binding`]); the activity classification ignores
     /// it.

@@ -133,6 +133,9 @@ pub(crate) enum TypedLineTarget {
     Unknown,
 }
 
+/// How long the sniff waits before its one retry of an unreadable pane probe.
+const PROBE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// A `claude` that started at least this many seconds before the line was the
 /// one reading it; one that started later is the one the line launched.
 /// Process start times are whole seconds, so one second of rounding either way
@@ -142,7 +145,12 @@ const LAUNCH_SKEW_SECS: i64 = 2;
 /// Where the line completed at `line_at_ms` went, from a probe of the pane
 /// taken just after it. `reads_terminal` says whether a pid owns the pane's
 /// terminal now (the foreground process group on Linux — a `claude` suspended
-/// with Ctrl-Z or started with `&` leaves the shell reading). Pure.
+/// with Ctrl-Z or started with `&` leaves the shell reading). On Windows a
+/// console has no job control, so a `claude` in the pane cannot have left the
+/// console to the shell: there `reads_terminal` is existence
+/// ([`crate::mcp::session_message_poller::pid_reads_its_terminal`], the same
+/// predicate the message poller routes by), and a `claude` that started before
+/// the line read it. Pure.
 ///
 /// The probe runs AFTER the line, so the `claude` the line itself launched may
 /// already be in it; that one started at or after the line and is not counted.
@@ -211,7 +219,7 @@ pub(crate) fn apply_typed_resume_effects(
     let launched = target == TypedLineTarget::Shell;
     match store {
         Some(store) => {
-            let outcome = store.record_open(TerminalSessionRecord {
+            let outcome = store.record_open_checked(TerminalSessionRecord {
                 claude_session_id: parsed.claude_session_id.clone(),
                 // config_dir None → restore scans every known config dir.
                 // Zone unknown backend-side → 0 (wrong zone beats a lost
@@ -311,7 +319,12 @@ pub(crate) fn apply_typed_resume_effects(
 ///
 /// `child_pid` is the pane's PTY child and `line_at_ms` the instant the line
 /// completed: the task probes the pane (one process-table snapshot) to decide
-/// [`TypedLineTarget`] before any effect.
+/// [`TypedLineTarget`] before any effect. A probe that cannot read the table is
+/// retried once after [`PROBE_RETRY_DELAY`]: an unreadable pane records the
+/// line provisionally and registers no coord row, so one transient snapshot
+/// failure must not cost a launch its coord identity. (The retry sees any
+/// `claude` the line itself launched; one that started at or after the line is
+/// never counted as the reader.)
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_register_typed_resume(
     app_handle: AppHandle,
@@ -324,7 +337,16 @@ pub fn spawn_register_typed_resume(
     line_at_ms: i64,
 ) {
     tauri::async_runtime::spawn(async move {
-        let probe = crate::terminal::graceful_exit::probe_claude_under(child_pid, Vec::new()).await;
+        let mut probe =
+            crate::terminal::graceful_exit::probe_claude_under(child_pid, Vec::new()).await;
+        if let ClaudeProbe::Unreadable(reason) = &probe {
+            debug!(
+                reason = %reason,
+                "typed claude resume sniff: pane probe unreadable — retrying once"
+            );
+            tokio::time::sleep(PROBE_RETRY_DELAY).await;
+            probe = crate::terminal::graceful_exit::probe_claude_under(child_pid, Vec::new()).await;
+        }
         let target = typed_line_target(
             &probe,
             line_at_ms,

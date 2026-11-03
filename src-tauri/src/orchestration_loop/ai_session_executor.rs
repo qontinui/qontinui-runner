@@ -720,7 +720,7 @@ pub async fn dispatch_subtask(
         .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
     {
         let trid_str = task_run_id.to_string();
-        store.record_open(
+        let outcome = store.record_open_checked(
             crate::session::session_lifecycle_store::TerminalSessionRecord {
                 claude_session_id: trid_str.clone(),
                 config_dir: None,
@@ -775,10 +775,20 @@ pub async fn dispatch_subtask(
                 binding_state: None,
             },
         );
-        info!(
-            "dispatch_subtask: worker durably recorded on page_id={} (task_run_id={})",
-            run_id, task_run_id
-        );
+        if outcome.is_recorded() {
+            info!(
+                "dispatch_subtask: worker durably recorded on page_id={} (task_run_id={})",
+                run_id, task_run_id
+            );
+        } else {
+            // A fresh task-run id is never open elsewhere, so this is only a
+            // poisoned registry in practice — but a refusal is reported, not
+            // assumed away.
+            warn!(
+                "dispatch_subtask: worker NOT recorded on page_id={} (task_run_id={}): {:?}",
+                run_id, task_run_id, outcome
+            );
+        }
     } else {
         warn!(
             "dispatch_subtask: SessionLifecycleStore not available; worker {} will not surface on the run's grid page",

@@ -66,7 +66,7 @@ use tracing::{debug, warn};
 use crate::process_capture::process_tree::{
     claude_pids_in_inclusive_subtree, claude_present_in_inclusive_subtree, ProcessSnapshot,
 };
-use crate::session::claude_activity::{LivePid, RecordReading};
+use crate::session::pane_binding::{BindingCounters, RecordedSession};
 use crate::session::session_lifecycle_store::{
     BindingState, SessionLifecycleStore, TerminalSessionRecord,
 };
@@ -739,8 +739,8 @@ impl TrackingHealthReport {
     }
 
     /// Cross-check every top-level terminal-hosted process against its OWN
-    /// Claude Code record (`records`, keyed by pid — see
-    /// [`crate::session::pane_binding`]) and set
+    /// Claude Code record (`records`, keyed by pid — the latest reconcile pass's
+    /// reading, [`SessionLifecycleStore::recorded_sessions`]) and set
     /// [`LiveClaudeProcess::binding_state`].
     ///
     /// [`evaluate`] attributes a pid to the open row owning its terminal,
@@ -750,14 +750,18 @@ impl TrackingHealthReport {
     /// session → `Matched`. A record naming ANOTHER session → `Unknown`, and
     /// the attribution is withdrawn exactly as for a pid two rows claim:
     /// `session_id`, `session_status` and `session_status_since` cleared, and
-    /// the process blocks. A record that cannot be read leaves the process
-    /// unchecked (`None`) — never read as agreement — with today's
+    /// the process blocks. No record for the pid — or one the pass read for an
+    /// earlier holder of the pid (its start time disagrees by more than
+    /// [`crate::process_capture::process_tree::PID_REUSE_SKEW_MS`]) — leaves the
+    /// process unchecked (`None`, never read as agreement) with today's
     /// attribution. Nested subagents and already-ambiguous pids are not
     /// checked: a nested `claude` runs a session of its own.
     ///
     /// Run BEFORE [`Self::attach_status_since`], which keys on the
-    /// `session_status` this may clear. Pure; no I/O.
-    pub fn attach_registry_evidence(&mut self, records: &HashMap<u32, RecordReading>) {
+    /// `session_status` this may clear. Pure; no I/O — the census reads no
+    /// record of its own on the `/restart-readiness` verdict path.
+    pub fn attach_registry_evidence(&mut self, records: &HashMap<u32, RecordedSession>) {
+        let checked_at_ms = self.checked_at_ms;
         for process in self.terminal_hosted.iter_mut() {
             if process.nested_under_claude {
                 continue;
@@ -765,13 +769,18 @@ impl TrackingHealthReport {
             let Some(row_session) = process.session_id.as_deref() else {
                 continue;
             };
-            let Some(RecordReading::Parsed(record)) = records.get(&process.pid) else {
+            let Some(record) = records.get(&process.pid) else {
                 continue;
             };
-            let Some(recorded_session) = record.session_id.as_deref() else {
-                continue;
-            };
-            if recorded_session == row_session {
+            let census_started = process.age_s.map(|age_s| checked_at_ms - age_s * 1000);
+            if let (Some(recorded), Some(census)) = (record.process_started_ms, census_started) {
+                if (recorded - census).abs()
+                    > crate::process_capture::process_tree::PID_REUSE_SKEW_MS
+                {
+                    continue; // read for an earlier holder of the pid
+                }
+            }
+            if record.session_id == row_session {
                 process.binding_state = Some(BindingState::Matched);
             } else {
                 process.binding_state = Some(BindingState::Unknown);
@@ -781,20 +790,6 @@ impl TrackingHealthReport {
                 process.blocks_restart = blocks_restart(None);
             }
         }
-    }
-
-    /// The top-level terminal-hosted processes, as the [`LivePid`]s whose
-    /// records [`Self::attach_registry_evidence`] reads — each with the start
-    /// time this pass's snapshot implies, for the record's pid-reuse check.
-    pub fn registry_check_pids(&self) -> Vec<LivePid> {
-        self.terminal_hosted
-            .iter()
-            .filter(|p| !p.nested_under_claude && p.session_id.is_some())
-            .map(|p| LivePid {
-                pid: p.pid,
-                process_started_ms: p.age_s.map(|age_s| self.checked_at_ms - age_s * 1000),
-            })
-            .collect()
     }
 
     /// Holder panes this runner cannot drive (unknown or incompatible). Each
@@ -919,9 +914,15 @@ fn store_latest(report: TrackingHealthReport) {
 /// pane-binding counters (`bindingMismatchTotal`, `bindingMoveRefusedTotal`;
 /// see [`crate::session::pane_binding`]).
 pub fn health_json() -> serde_json::Value {
+    health_json_with(BindingCounters::global())
+}
+
+/// [`health_json`] serving `binding` as the pane-binding counters — so a test
+/// asserts the exact values it caused.
+pub fn health_json_with(binding: &BindingCounters) -> serde_json::Value {
     let counter = untracked_backend_spawn_total();
-    let mismatches = crate::session::pane_binding::binding_mismatch_total();
-    let refused_moves = crate::session::pane_binding::binding_move_refused_total();
+    let mismatches = binding.mismatches();
+    let refused_moves = binding.refused_moves();
     match latest() {
         Some(r) => serde_json::json!({
             "lastCheckAt": r.checked_at_ms,
@@ -1411,14 +1412,12 @@ pub async fn compute(
     );
     // Each terminal-hosted `claude` speaks for itself (plan
     // `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`): its own
-    // record, read off the runtime under a bound. A read that fails or overruns
-    // leaves every process unchecked, i.e. today's attribution.
-    let records = crate::session::pane_binding::read_records_off_runtime(
-        report.registry_check_pids(),
-        crate::session::pane_binding::RECORD_READ_BOUND,
-    )
-    .await;
-    report.attach_registry_evidence(&records);
+    // record, as the latest reconcile pass read it — no read here, so the
+    // `/restart-readiness` verdict path waits on no disk. No fresh pass (or no
+    // oracle) leaves every process unchecked, i.e. today's attribution.
+    if let Some(records) = store.recorded_sessions() {
+        report.attach_registry_evidence(&records);
+    }
     report.attach_status_since(session_status_since_by_id);
 
     Some(TrackingHealthPass {
@@ -3269,21 +3268,20 @@ mod tests {
         }
     }
 
-    fn recorded(session: Option<&str>) -> RecordReading {
-        RecordReading::Parsed(crate::session::claude_activity::RecordEvidence {
-            status: "idle".to_string(),
-            status_updated_at_ms: None,
-            last_message_ms: None,
-            session_id: session.map(str::to_string),
-        })
+    fn recorded(session: &str, started_ms: Option<i64>) -> RecordedSession {
+        RecordedSession {
+            process_started_ms: started_ms,
+            session_id: session.to_string(),
+        }
     }
 
     /// Plan `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`,
     /// Phase 2: the circular attribution is broken. A terminal-hosted process
     /// whose OWN record names the row's session is `matched`; one whose record
     /// names ANOTHER session is ambiguous — `bindingState: unknown`, the row's
-    /// id withheld, no coord status, blocking. An unreadable record changes
-    /// nothing (never agreement); a nested subagent is not checked.
+    /// id withheld, no coord status, blocking. No record, a record the pass
+    /// read for an earlier holder of the pid, and a nested subagent change
+    /// nothing (never agreement).
     #[test]
     fn a_process_whose_own_record_names_another_session_is_ambiguous() {
         let attributed = |pid: u32, nested: bool| LiveClaudeProcess {
@@ -3292,6 +3290,8 @@ mod tests {
             session_status_since: Some(5),
             blocks_restart: false,
             nested_under_claude: nested,
+            // Started 100 s before the report's `checked_at_ms` (1_000_000).
+            age_s: Some(100),
             ..proc_entry(pid)
         };
         let mut report = report_with_terminal_hosted(vec![
@@ -3299,21 +3299,15 @@ mod tests {
             attributed(2, false),
             attributed(3, false),
             attributed(4, true),
+            attributed(5, false),
         ]);
-        assert_eq!(
-            report
-                .registry_check_pids()
-                .iter()
-                .map(|p| p.pid)
-                .collect::<Vec<_>>(),
-            vec![1, 2, 3],
-            "nested subagents are not checked"
-        );
-        let records: HashMap<u32, RecordReading> = [
-            (1, recorded(Some("row-session"))),
-            (2, recorded(Some("another-session"))),
-            (3, RecordReading::Missing),
-            (4, recorded(Some("subagent-session"))),
+        let records: HashMap<u32, RecordedSession> = [
+            (1, recorded("row-session", Some(900_000))),
+            (2, recorded("another-session", None)),
+            (4, recorded("subagent-session", Some(900_000))),
+            // Read for an earlier process that held pid 5: started a minute
+            // before this one.
+            (5, recorded("another-session", Some(840_000))),
         ]
         .into_iter()
         .collect();
@@ -3342,7 +3336,7 @@ mod tests {
         assert_eq!(ambiguous.session_status_since, None);
         assert!(ambiguous.blocks_restart, "an ambiguous process blocks");
 
-        for unchecked in [p(3), p(4)] {
+        for unchecked in [p(3), p(4), p(5)] {
             assert_eq!(unchecked.binding_state, None, "pid {}", unchecked.pid);
             assert_eq!(unchecked.session_id.as_deref(), Some("row-session"));
         }
@@ -3350,15 +3344,33 @@ mod tests {
         let wire = serde_json::to_value(&ambiguous).unwrap();
         assert_eq!(wire["bindingState"], "unknown");
         assert!(wire["sessionId"].is_null());
-        assert!(serde_json::to_value(p(3)).unwrap().get("bindingState").is_none(), "an unchecked process omits the key");
+        assert!(
+            serde_json::to_value(p(3))
+                .unwrap()
+                .get("bindingState")
+                .is_none(),
+            "an unchecked process omits the key"
+        );
     }
 
-    /// `/health` `sessionTracking` serves both binding counters, before and
-    /// after the first pass.
+    /// `/health` `sessionTracking` serves the binding counters it is handed,
+    /// exactly — the production door hands it the global ones.
     #[test]
     fn health_json_serves_the_binding_counters() {
-        let v = health_json();
-        assert!(v["bindingMismatchTotal"].is_u64(), "{v}");
-        assert!(v["bindingMoveRefusedTotal"].is_u64(), "{v}");
+        let counters = BindingCounters::default();
+        let zero = health_json_with(&counters);
+        assert_eq!(zero["bindingMismatchTotal"], 0, "{zero}");
+        assert_eq!(zero["bindingMoveRefusedTotal"], 0, "{zero}");
+
+        counters.note_mismatch("t-a", "s-b", "s-a");
+        counters.note_mismatch("t-c", "s-d", "s-c");
+        counters.note_move_refused("s-e", "t-f", "t-g");
+        let counted = health_json_with(&counters);
+        assert_eq!(counted["bindingMismatchTotal"], 2, "{counted}");
+        assert_eq!(counted["bindingMoveRefusedTotal"], 1, "{counted}");
+
+        let global = health_json();
+        assert!(global["bindingMismatchTotal"].is_u64(), "{global}");
+        assert!(global["bindingMoveRefusedTotal"].is_u64(), "{global}");
     }
 }

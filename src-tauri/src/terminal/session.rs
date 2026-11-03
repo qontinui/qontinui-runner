@@ -3489,7 +3489,7 @@ impl TerminalSession {
             let _span =
                 tracing::debug_span!("terminal_spawn.record_open", terminal_id = %terminal_id)
                     .entered();
-            crate::commands::terminal::record_pinned_session_open(
+            let outcome = crate::commands::terminal::record_pinned_session_open(
                 store.inner(),
                 pinned.clone(),
                 terminal_id.to_string(),
@@ -3504,11 +3504,16 @@ impl TerminalSession {
                 crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
                 None,
             );
-            info!(
-                terminal_id = %terminal_id,
-                session_id = %pinned,
-                "session-restore: session recorded authoritatively at spawn"
-            );
+            // A refusal (another live pane still runs this id) is already
+            // logged at warn by `record_pinned_session_open`; the pane spawns
+            // regardless and the binder judges what it runs.
+            if outcome.is_recorded() {
+                info!(
+                    terminal_id = %terminal_id,
+                    session_id = %pinned,
+                    "session-restore: session recorded authoritatively at spawn"
+                );
+            }
         }
 
         // The served-corpus measurement for the briefing's header line,

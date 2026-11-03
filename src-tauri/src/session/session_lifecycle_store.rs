@@ -58,9 +58,10 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use crate::session::claude_activity::LivePid;
 use crate::session::observation_epoch::{ObservationEpoch, Observed};
-use crate::session::pane_binding::{self, PaneEvidence, PaneEvidenceOracle};
+use crate::session::pane_binding::{
+    BindingCounters, PaneEvidence, PaneEvidenceOracle, PaneObservation, RecordedSession,
+};
 use crate::session::restore_record_emitter::RestoreRecordEmitter;
 use crate::session::snapshot_history::{SnapshotHistory, SnapshotSession, TranscriptProbe};
 
@@ -211,28 +212,84 @@ pub const ORIGIN_OBSERVED: &str = "observed";
 pub enum BindingState {
     /// The pane's own `claude` records this session.
     Matched,
-    /// The pane's own `claude` records a DIFFERENT session, or a bind for this
-    /// pane was refused because another live pane still runs that session.
-    /// The row's `terminal_id` is not evidenced: no surface may label, nudge
-    /// or close that terminal by this row.
+    /// The pane's own `claude` records a DIFFERENT session — a contradiction,
+    /// or (uncounted) the pane's prior tenant after a `/clear` or an in-TUI
+    /// resume the hook recorded. The row's `terminal_id` is not evidenced: no
+    /// surface may label, nudge or close that terminal by this row.
     Unknown,
 }
 
-/// What [`SessionLifecycleStore::record_open`] did with a record.
+/// What [`SessionLifecycleStore::record_open_checked`] (or
+/// [`SessionLifecycleStore::rebind_terminal_checked`]) did with a bind.
+///
+/// `#[must_use]`: a caller that goes on to confirm, stamp, emit or re-key as if
+/// the bind landed after a refusal reports a binding the store does not hold.
+#[must_use = "a refused bind wrote nothing; act on the outcome before confirming, stamping, emitting or re-keying"]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordOpenOutcome {
     /// Written: the row was created, refreshed in place, or moved onto the
-    /// record's terminal.
+    /// record's terminal. (For a rebind: also a row already current, absent or
+    /// closed — nothing to move, nothing refused.)
     Recorded,
     /// NOT written. Moving the session's row onto the record's terminal would
     /// have taken it off `held_by`, a live pane that still runs the session —
     /// or one whose evidence cannot be read while the incoming bind brings no
-    /// proof of its own. The refused pane's open rows read
-    /// [`BindingState::Unknown`] unless that pane's own `claude` vouches for
-    /// them.
+    /// proof of its own. Nothing else changes: no row on either pane is marked.
     MoveRefused { held_by: String },
     /// NOT written: the registry lock is poisoned.
     Unavailable,
+}
+
+impl RecordOpenOutcome {
+    /// Whether the bind was written.
+    pub fn is_recorded(&self) -> bool {
+        matches!(self, RecordOpenOutcome::Recorded)
+    }
+}
+
+/// How long a declared move ([`SessionLifecycleStore::declare_move`]) stays
+/// claimable. The migration that declares one consumes it within the
+/// synchronous spawn that follows, so two minutes only bounds a declaration a
+/// crashed or wedged caller never withdrew.
+pub const DECLARED_MOVE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A refusal of the same move (session, refused pane) that recurs within this
+/// gap of the previous one is the SAME episode: logged at debug, not counted.
+/// Several liveness ticks (45 s), so a refusal re-proposed every pass is one
+/// episode for as long as it recurs.
+pub const REFUSAL_EPISODE_GAP: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A deliberate move, declared ahead of the bind that performs it.
+#[derive(Debug, Clone)]
+struct DeclaredMove {
+    /// The terminal the row leaves while its pane still runs the session.
+    from_terminal: String,
+    /// The account the bind that performs the move carries — a bind from any
+    /// other account is not this move.
+    to_config_dir: String,
+    declared_at: std::time::Instant,
+    /// Which declaration, so a guard never withdraws a newer one.
+    token: u64,
+}
+
+/// A declared move, withdrawn when dropped unless a bind consumed it first
+/// ([`SessionLifecycleStore::declare_move`]).
+#[must_use = "dropping the declaration withdraws it — hold it across the bind that performs the move"]
+#[derive(Debug)]
+pub struct MoveDeclaration<'a> {
+    store: &'a SessionLifecycleStore,
+    session: String,
+    token: u64,
+}
+
+impl Drop for MoveDeclaration<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut moves) = self.store.declared_moves.lock() {
+            if moves.get(&self.session).map(|m| m.token) == Some(self.token) {
+                moves.remove(&self.session);
+            }
+        }
+    }
 }
 
 /// The `zone_index` sentinel for "this session sits in no zone".
@@ -464,7 +521,7 @@ pub fn durable_name_source(registry_value: Option<&str>) -> String {
 /// keep what is stored". An empty/whitespace-only string is the same statement
 /// spelled differently, so it must normalize to `None` BEFORE the merge, or a
 /// blank would clobber a known-good value (exactly the trap `config_dir`
-/// already normalizes away at the top of [`SessionLifecycleStore::record_open`]).
+/// already normalizes away at the top of [`SessionLifecycleStore::record_open_checked`]).
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|s| !s.trim().is_empty())
 }
@@ -638,7 +695,7 @@ pub struct TerminalSessionRecord {
     /// never closes it `no-terminal`. The hold never refreshes `last_seen_at`,
     /// so a held row can never move the restore anchor. Durable, so the hold
     /// survives any number of restarts without a re-mark. Cleared by
-    /// [`SessionLifecycleStore::record_open`] (a verified resume is new life),
+    /// [`SessionLifecycleStore::record_open_checked`] (a verified resume is new life),
     /// a close, Finish, and the poll once the hold has expired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub awaiting_account_since: Option<i64>,
@@ -668,12 +725,14 @@ pub struct TerminalSessionRecord {
     pub confirmed_at: Option<i64>,
     /// Whether the pane at [`Self::terminal_id`] was last seen running THIS
     /// session, by its own `claude`'s Claude Code record
-    /// ([`BindingState`]). The store owns it: the reconcile pass and
-    /// [`SessionLifecycleStore::record_open`]'s bind-time check write the
-    /// verdict ([`SessionLifecycleStore::set_binding_state`]), a refused move
-    /// marks the refused pane's rows, and a row that MOVES to another terminal
-    /// drops it — a verdict is about one pane. An incoming record's value is
-    /// never taken.
+    /// ([`BindingState`]). The store owns it: the reconcile pass writes the
+    /// verdict ([`SessionLifecycleStore::set_binding_state`], see
+    /// [`crate::session::pane_binding::binding_verdicts`]),
+    /// [`SessionLifecycleStore::record_open_checked`] sets `matched` when the
+    /// bound pane names the session, and a row that MOVES to another terminal
+    /// drops it — a verdict is about one pane. Nothing else writes it: a
+    /// refused move marks no row, and an incoming record's value is never
+    /// taken.
     ///
     /// `None` = never checked: no readable evidence yet, or the row moved since
     /// its last check. Not a verdict, and never read as agreement.
@@ -714,7 +773,7 @@ pub struct TerminalSessionRecord {
     /// confirmation, and every liveness-poll tick that finds the session in the
     /// live registry. Last write wins, but a read that does NOT see the session
     /// must never blank a stored value: **absent ⇒ keep**. Enforced in
-    /// [`SessionLifecycleStore::record_open`] and
+    /// [`SessionLifecycleStore::record_open_checked`] and
     /// [`SessionLifecycleStore::update_identity`], both of which take an
     /// incoming value only when it is `Some` and non-blank. This is exactly the
     /// `config_dir` rule.
@@ -955,7 +1014,7 @@ pub struct TerminalSessionRecord {
     /// poll closing THIS record — and without the gate identity here it could
     /// not say which gate died, so the gate stayed `spawned` forever.
     ///
-    /// STICKY in [`SessionLifecycleStore::record_open`]: the session-open hook
+    /// STICKY in [`SessionLifecycleStore::record_open_checked`]: the session-open hook
     /// and the boot-restore re-record write this record again carrying no gate,
     /// and must not blank it. `#[serde(default)]`: older rows read `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1159,7 +1218,7 @@ pub struct SessionLifecycleStore {
     /// Terminal ids whose session has MOVED to another terminal while the
     /// old PTY was still alive — the account-migration order is spawn the
     /// replacement first, then close the source, so for a moment two PTYs
-    /// carry one session. [`Self::record_open`] re-keys the row onto the new
+    /// carry one session. [`Self::record_open_checked`] re-keys the row onto the new
     /// terminal; the old PTY's later exit-close names `(session id, old
     /// terminal)`, which no open row owns any more, and would otherwise read
     /// as a MIS-BOUND close (`NotFound`, a `warn!`) on the fleet's most
@@ -1205,7 +1264,7 @@ pub struct SessionLifecycleStore {
     prior_teardown_complete: OnceLock<bool>,
     /// Optional restore-registry → coord mirror (plan
     /// `2026-07-09-runner-session-history-cloud-sync` §3.4, Phase 4). When
-    /// attached, every open-record write/refresh ([`record_open`](Self::record_open))
+    /// attached, every open-record write/refresh ([`record_open_checked`](Self::record_open_checked))
     /// and every confirmation flip ([`confirm_session`](Self::confirm_session)
     /// — confirmation changes the record's honest `restore_tier`) hands the
     /// merged record to the emitter, which gates (`session_metadata_sync_enabled`),
@@ -1259,17 +1318,24 @@ pub struct SessionLifecycleStore {
     /// with [`Self::set_boot_ms_for_test`].
     boot_ms: AtomicI64,
     /// What each pane's own `claude` records — asked before a row is moved off
-    /// another terminal, and for the bind-time binding verdict
-    /// ([`Self::attach_pane_evidence`]). Unattached (tests that do not care,
-    /// ephemeral fallbacks) → no evidence: no move is refused and no verdict is
-    /// written, the pre-guard behaviour.
+    /// another terminal, for the bind-time binding verdict and for the
+    /// supersede scan ([`Self::attach_pane_evidence`]). It answers from memory,
+    /// so it is asked while the registry lock is held. Unattached (tests that
+    /// do not care, ephemeral fallbacks) → no evidence: no move is refused and
+    /// no verdict is written, the pre-guard behaviour.
     pane_evidence: OnceLock<Arc<dyn PaneEvidenceOracle>>,
     /// Deliberate moves declared ahead of the bind that performs them
-    /// ([`Self::declare_move`]): session id → the terminal it is leaving while
-    /// that pane still runs it. Process-local and consumed by the move, like
-    /// [`Self::superseded_terminals`]: a declaration cannot outlive the runner
-    /// that made it.
-    declared_moves: Mutex<HashMap<String, String>>,
+    /// ([`Self::declare_move`]), by session id. Process-local, consumed by the
+    /// move, withdrawn by the declaration's drop and claimable for at most
+    /// [`DECLARED_MOVE_TTL`]. Lock order: `map` → `declared_moves`.
+    declared_moves: Mutex<HashMap<String, DeclaredMove>>,
+    /// The refusal episodes already reported: (session, refused terminal) →
+    /// when last refused ([`REFUSAL_EPISODE_GAP`]). Process-local.
+    refused_episodes: Mutex<HashMap<(String, String), std::time::Instant>>,
+    /// Where this store counts binding mismatches and refused moves. Unset →
+    /// [`BindingCounters::global`], the counters `/health` serves; a test
+    /// attaches its own ([`Self::attach_binding_counters`]).
+    binding_counters: OnceLock<Arc<BindingCounters>>,
     /// Serializes [`Self::set_finished`] END TO END — the map mutation AND the
     /// finish-observer hand-off — so the order coord's outbox receives
     /// finished / working rows in is the order the local marker changed in.
@@ -1488,6 +1554,8 @@ impl SessionLifecycleStore {
             boot_ms: AtomicI64::new(default_boot_ms()),
             pane_evidence: OnceLock::new(),
             declared_moves: Mutex::new(HashMap::new()),
+            refused_episodes: Mutex::new(HashMap::new()),
+            binding_counters: OnceLock::new(),
             finish_forward: Mutex::new(()),
         };
         if replay.applied > 0 || replay.damaged {
@@ -1590,32 +1658,65 @@ impl SessionLifecycleStore {
 
     /// Attach the pane-evidence oracle (once, at startup): what each pane's own
     /// `claude` records ([`crate::session::pane_binding`]). Production attaches
-    /// a [`pane_binding::LivePaneRegistry`], which the reconcile pass keeps
-    /// current through [`Self::observe_panes`].
+    /// a [`crate::session::pane_binding::LivePaneRegistry`], which the
+    /// reconcile pass keeps current through [`Self::observe_panes`].
     pub fn attach_pane_evidence(&self, oracle: Arc<dyn PaneEvidenceOracle>) {
         if self.pane_evidence.set(oracle).is_err() {
             warn!("session_lifecycle_store: pane evidence oracle already attached — ignoring");
         }
     }
 
-    /// Hand the attached oracle a pass's view of every live pane's top-level
-    /// `claude` processes. No-op without an oracle.
-    pub fn observe_panes(&self, panes: &HashMap<String, Vec<LivePid>>) {
+    /// Hand the attached oracle a reconcile pass's observation of the live
+    /// panes. No-op without an oracle.
+    pub fn observe_panes(&self, observation: PaneObservation) {
         if let Some(oracle) = self.pane_evidence.get() {
-            oracle.observe_panes(panes);
+            oracle.observe(observation);
         }
     }
 
     /// What `terminal_id`'s pane records, per the attached oracle.
     /// [`PaneEvidence::Unknown`] for a blank id and when no oracle is attached
     /// — no evidence is never evidence of anything.
-    fn pane_evidence_of(&self, terminal_id: &str) -> PaneEvidence {
+    pub(crate) fn pane_evidence_of(&self, terminal_id: &str) -> PaneEvidence {
         if terminal_id.trim().is_empty() {
             return PaneEvidence::Unknown;
         }
         match self.pane_evidence.get() {
             Some(oracle) => oracle.pane_evidence(terminal_id),
             None => PaneEvidence::Unknown,
+        }
+    }
+
+    /// Every live pane whose own `claude` records `session_id`, per the
+    /// attached oracle. Empty without one.
+    pub(crate) fn panes_naming(&self, session_id: &str) -> Vec<String> {
+        self.pane_evidence
+            .get()
+            .map(|oracle| oracle.panes_naming(session_id))
+            .unwrap_or_default()
+    }
+
+    /// pid → its Claude Code record, from the latest reconcile pass — what the
+    /// tracking-health census attributes a terminal-hosted pid by, with no read
+    /// of its own. `None` without an oracle or a fresh observation.
+    pub fn recorded_sessions(&self) -> Option<HashMap<u32, RecordedSession>> {
+        self.pane_evidence.get()?.recorded_sessions()
+    }
+
+    /// Count this store's binding mismatches and refused moves into `counters`
+    /// rather than the process-wide ones `/health` serves. Once; tests use it
+    /// to assert exact counts.
+    pub fn attach_binding_counters(&self, counters: Arc<BindingCounters>) {
+        if self.binding_counters.set(counters).is_err() {
+            warn!("session_lifecycle_store: binding counters already attached — ignoring");
+        }
+    }
+
+    /// The counters this store counts into.
+    pub(crate) fn binding_counters(&self) -> &BindingCounters {
+        match self.binding_counters.get() {
+            Some(counters) => counters.as_ref(),
+            None => BindingCounters::global(),
         }
     }
 
@@ -1790,6 +1891,15 @@ impl SessionLifecycleStore {
         history.record_heartbeat(self.snapshot_sessions(records));
     }
 
+    /// Insert or refresh a session by `claude_session_id`, discarding what the
+    /// store did with it. For callers with nothing to do on a refusal — tests.
+    /// Production code calls [`Self::record_open_checked`], whose outcome is
+    /// `#[must_use]`, and acts on a [`RecordOpenOutcome::MoveRefused`].
+    #[cfg(test)]
+    pub fn record_open(&self, rec: TerminalSessionRecord) {
+        let _ = self.record_open_checked(rec);
+    }
+
     /// Insert or refresh a session by `claude_session_id`. If a record
     /// already exists, its `opened_at` is preserved; the record is always
     /// (re-)marked `open` (clearing `closed_at` / `close_reason`), its
@@ -1801,15 +1911,25 @@ impl SessionLifecycleStore {
     ///
     /// Rows are keyed by session, so a record naming a terminal other than the
     /// one its session's open row sits on MOVES that row. Every binder writes
-    /// through here, and a binder can be wrong (2026-10-25: reconcile rung 3
-    /// moved a live peer pane's session onto another pane, and the supersede
-    /// scan evicted that pane's own session). So a move is checked against the
-    /// pane it would leave ([`Self::move_refusal`]) and refused —
-    /// [`RecordOpenOutcome::MoveRefused`], nothing written — when that pane
-    /// still runs the session. Every other record is written, and the row then
-    /// gets the incoming pane's bind-time verdict ([`BindingState`]) when that
-    /// pane's own `claude` names a session.
-    pub fn record_open(&self, rec: TerminalSessionRecord) -> RecordOpenOutcome {
+    /// through here, and a binder can be wrong: on 2026-10-25 one pane's row
+    /// came to name the session a live peer pane ran (which binder did it is
+    /// UNKNOWN; reconcile rung 3 is one that can — see
+    /// [`crate::session::pane_binding`]). So a move is checked against the pane
+    /// it would leave ([`Self::move_refusal_locked`]) — under the same registry
+    /// lock as the write, so nothing can move the row in between — and refused
+    /// when that pane still runs the session: [`RecordOpenOutcome::MoveRefused`],
+    /// nothing written and nothing marked. A refused move is logged and counted
+    /// once per (session, pane) episode.
+    ///
+    /// Every other record is written. The row's
+    /// [`TerminalSessionRecord::binding_state`] is the store's own: never taken
+    /// from the incoming record, dropped when the row changes pane, and set
+    /// `matched` here when the bound pane's own `claude` names this session. A
+    /// bind never sets `unknown` — the reconcile pass judges that, with every
+    /// pane's evidence in view ([`crate::session::pane_binding::binding_verdicts`]).
+    /// The supersede scan spares a sibling a live pane's own `claude` still
+    /// runs.
+    pub fn record_open_checked(&self, rec: TerminalSessionRecord) -> RecordOpenOutcome {
         // Normalize a stray empty/whitespace-only config_dir to None: it must
         // never become a bogus `CLAUDE_CONFIG_DIR=""` on resume, and the sticky
         // guard below must treat "no account reported" uniformly as None (so an
@@ -1828,6 +1948,9 @@ impl SessionLifecycleStore {
             restore_tier: non_empty(rec.restore_tier),
             gate_id: non_empty(rec.gate_id),
             gate_consuming_device_id: non_empty(rec.gate_consuming_device_id),
+            // The binding verdict is the store's own, never a caller's — a new
+            // row is created from `rec` below and must not inherit one.
+            binding_state: None,
             ..rec
         };
         let now = Utc::now().timestamp_millis();
@@ -1843,23 +1966,6 @@ impl SessionLifecycleStore {
         // `observed` bind). `confirmed_at` is `Option<i64>` (Copy) — safe to
         // read here before `rec`'s fields are moved into the entry below.
         let new_is_confirmed = rec.confirmed_at.is_some();
-        // The binding guard, asked BEFORE the merge and outside the map lock
-        // (the oracle may read files): never move a row off a live pane that
-        // still runs its session.
-        if let Some(held_by) = self.move_refusal(
-            &new_id,
-            &new_terminal_id,
-            new_is_authoritative || new_is_confirmed,
-        ) {
-            self.refuse_move(&new_id, &held_by, &new_terminal_id);
-            return RecordOpenOutcome::MoveRefused { held_by };
-        }
-        // Bind-time evidence for the pane this record binds — also asked
-        // outside the lock.
-        let pane = self.pane_evidence_of(&new_terminal_id);
-        // Set when this write turns the row's verdict `Unknown`: the
-        // evidenced session, for the mismatch line logged after the lock.
-        let mut newly_mismatched: Option<String> = None;
         let (merged, superseded) = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
@@ -1868,6 +1974,23 @@ impl SessionLifecycleStore {
                     return RecordOpenOutcome::Unavailable;
                 }
             };
+            // The binding guard, asked UNDER the lock that the write below
+            // takes: the oracle answers from memory, and a row moved between a
+            // check and a write would make the check moot.
+            if let Some(held_by) = self.move_refusal_locked(
+                &m,
+                &new_id,
+                &new_terminal_id,
+                new_is_authoritative || new_is_confirmed,
+                rec.config_dir.as_deref(),
+            ) {
+                drop(m);
+                self.report_refusal(&new_id, &held_by, &new_terminal_id);
+                return RecordOpenOutcome::MoveRefused { held_by };
+            }
+            // What the bound pane's own `claude` records — for the bind-time
+            // `matched` and for sparing the sibling it runs.
+            let pane = self.pane_evidence_of(&new_terminal_id);
             // The terminal the row held before this write, if it existed — a
             // binding verdict is about ONE pane, so a move drops it.
             let previous_terminal = m.get(&new_id).map(|r| r.terminal_id.clone());
@@ -1920,29 +2043,21 @@ impl SessionLifecycleStore {
                 entry.terminal_id = rec.terminal_id;
             }
             // The binding verdict (`binding_state`) is the store's own: never
-            // taken from the incoming record, dropped when the row changes
-            // pane, and re-judged from the incoming pane's evidence when that
-            // pane's `claude` names a session.
+            // taken from the incoming record (normalized away above), dropped
+            // when the row changes pane, and `matched` when the bound pane's
+            // own `claude` names this session. A bind never writes `unknown`:
+            // the pane's record may lag the very switch this bind reports, and
+            // the reconcile pass judges a contradiction with every pane in view.
             if previous_terminal
                 .as_deref()
                 .is_some_and(|t| t != entry.terminal_id)
             {
                 entry.binding_state = None;
             }
-            if let Some(evidenced) = pane.named_session() {
-                if entry.terminal_id == new_terminal_id {
-                    let verdict = if evidenced == entry.claude_session_id {
-                        BindingState::Matched
-                    } else {
-                        BindingState::Unknown
-                    };
-                    if verdict == BindingState::Unknown
-                        && entry.binding_state != Some(BindingState::Unknown)
-                    {
-                        newly_mismatched = Some(evidenced.to_string());
-                    }
-                    entry.binding_state = Some(verdict);
-                }
+            if entry.terminal_id == new_terminal_id
+                && pane.named_session() == Some(entry.claude_session_id.as_str())
+            {
+                entry.binding_state = Some(BindingState::Matched);
             }
             entry.provider = rec.provider;
             // Unasserted origin (zone-move backstop / boot re-assert) must not
@@ -2033,7 +2148,7 @@ impl SessionLifecycleStore {
             // for an account choice — the verified resume that re-asserts it
             // ends the wait. A re-record that leaves the row unbound (a blank
             // incoming terminal over a held, detached row) is not a bind, so
-            // the hold stays — the same rule as [`Self::rebind_terminal`].
+            // the hold stays — the same rule as [`Self::rebind_terminal_checked`].
             if !entry.terminal_id.trim().is_empty() {
                 entry.awaiting_account_since = None;
             }
@@ -2077,8 +2192,20 @@ impl SessionLifecycleStore {
             //     `new_is_confirmed`: only a NEW CONFIRMED binding retires a prior
             //     confirmed sibling — an authoritative-but-UNCONFIRMED incoming
             //     (itself not yet proven) must NOT evict a confirmed row.
+            //
+            // A sibling some live pane's own `claude` still RUNS is never a
+            // phantom or a finished tenant, whatever this bind says: it is
+            // spared (plan
+            // `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`).
+            // If it is THIS pane's, the bind is the suspect one — the pane's
+            // record may lag a hook, and the next pass re-judges both rows; if
+            // it is another pane's, its row belongs there, not in the closed
+            // set.
             let mut superseded: Vec<TerminalSessionRecord> = Vec::new();
             if (new_is_authoritative || new_is_confirmed) && !new_terminal_id.is_empty() {
+                let pane_runs = |id: &str| {
+                    pane.named_session() == Some(id) || !self.panes_naming(id).is_empty()
+                };
                 for other in m.values_mut() {
                     // A row held for an account choice is never a sibling: the
                     // hold detached its terminal, so it cannot share this one.
@@ -2086,6 +2213,15 @@ impl SessionLifecycleStore {
                         || other.terminal_id != new_terminal_id
                         || other.state != "open"
                     {
+                        continue;
+                    }
+                    if pane_runs(&other.claude_session_id) {
+                        debug!(
+                            terminal_id = %new_terminal_id,
+                            spared = %other.claude_session_id,
+                            by = %new_id,
+                            "session-restore: spared a sibling a live pane's own claude still runs"
+                        );
                         continue;
                     }
                     if other.confirmed_at.is_none() {
@@ -2135,20 +2271,19 @@ impl SessionLifecycleStore {
         // Phase 4 cloud mirror — emit AFTER the durable local write, from
         // the MERGED record (origin/confirmation preservation applied).
         self.mirror_restore_record(&merged);
-        if let Some(evidenced) = newly_mismatched {
-            pane_binding::note_binding_mismatch(
-                &new_terminal_id,
-                &new_id,
-                Some(&evidenced),
-                "bind",
-            );
+        // The session landed on this terminal: a refusal episode for this very
+        // move is over. One onto another terminal is not — a re-record on the
+        // pane that already holds the session (a hook, a refresh) must not
+        // turn the next tick's identical refusal into a new episode.
+        if let Ok(mut episodes) = self.refused_episodes.lock() {
+            episodes.remove(&(new_id.clone(), merged.terminal_id.clone()));
         }
         RecordOpenOutcome::Recorded
     }
 
-    /// The binding guard. `Some(old_terminal)` when writing `session_id` onto
-    /// `new_terminal` would MOVE its open row off `old_terminal` while that
-    /// pane still runs it:
+    /// The binding guard, run while the caller holds the registry lock (`m`).
+    /// `Some(old_terminal)` when writing `session_id` onto `new_terminal` would
+    /// MOVE its open row off `old_terminal` while that pane still runs it:
     ///
     /// - the old pane's own `claude` records the session → refused, whatever
     ///   the incoming bind;
@@ -2160,126 +2295,130 @@ impl SessionLifecycleStore {
     /// - the old pane runs nothing, or another session, or is not a live pane
     ///   → allowed.
     ///
-    /// A move declared through [`Self::declare_move`] is always allowed (and
-    /// consumes the declaration). With no oracle attached nothing is refused.
-    fn move_refusal(
+    /// A move declared through [`Self::declare_move`] — the same session, off
+    /// the same terminal, by a bind carrying the declared account
+    /// (`incoming_config_dir`), within [`DECLARED_MOVE_TTL`] — is allowed and
+    /// consumes the declaration. With no oracle attached nothing is refused.
+    /// The oracle answers from memory, and `declared_moves` is taken after the
+    /// map lock, never before.
+    fn move_refusal_locked(
         &self,
+        m: &HashMap<String, TerminalSessionRecord>,
         session_id: &str,
         new_terminal: &str,
         incoming_strong: bool,
+        incoming_config_dir: Option<&str>,
     ) -> Option<String> {
         if new_terminal.trim().is_empty() {
             return None; // a blank incoming terminal never moves a row
         }
-        let old_terminal = {
-            let m = self.map.lock().ok()?;
-            let row = m.get(session_id)?;
-            if row.state != "open"
-                || row.terminal_id.trim().is_empty()
-                || row.terminal_id == new_terminal
-            {
-                return None;
-            }
-            row.terminal_id.clone()
-        };
-        if self.take_declared_move(session_id, &old_terminal) {
+        let row = m.get(session_id)?;
+        if row.state != "open"
+            || row.terminal_id.trim().is_empty()
+            || row.terminal_id == new_terminal
+        {
             return None;
         }
+        let old_terminal = row.terminal_id.as_str();
         let oracle = self.pane_evidence.get()?;
-        match oracle.pane_evidence(&old_terminal) {
-            PaneEvidence::Names(id) if id == session_id => Some(old_terminal),
-            PaneEvidence::Unknown if !incoming_strong => Some(old_terminal),
-            PaneEvidence::Names(_) | PaneEvidence::Unknown | PaneEvidence::NoClaude => None,
+        let refused = match oracle.pane_evidence(old_terminal) {
+            PaneEvidence::Names(id) => id == session_id,
+            PaneEvidence::Unknown => !incoming_strong,
+            PaneEvidence::NoClaude => false,
+        };
+        if !refused || self.take_declared_move(session_id, old_terminal, incoming_config_dir) {
+            return None;
         }
+        Some(old_terminal.to_string())
     }
 
-    /// Make a refused move visible: log + count it, and mark every open row
-    /// on the refused pane [`BindingState::Unknown`] unless that pane's own
-    /// `claude` names the row's session. Something claimed the refused pane
-    /// runs `session_id`; until the pane's own record says what it runs, its
-    /// rows are not evidenced.
-    fn refuse_move(&self, session_id: &str, held_by: &str, refused_terminal: &str) {
-        pane_binding::note_move_refused(session_id, held_by, refused_terminal);
-        let vouched = self.pane_evidence_of(refused_terminal);
-        let marked: Vec<String> = {
-            let mut m = match self.map.lock() {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(error = %e, "session_lifecycle_store: lock poisoned on refuse_move");
-                    return;
-                }
-            };
-            let mut changed: Vec<TerminalSessionRecord> = Vec::new();
-            for row in m.values_mut() {
-                if !open_on_terminal(row, refused_terminal)
-                    || vouched.named_session() == Some(row.claude_session_id.as_str())
-                    || row.binding_state == Some(BindingState::Unknown)
-                {
-                    continue;
-                }
-                row.binding_state = Some(BindingState::Unknown);
-                changed.push(row.clone());
+    /// Make a refused move visible — once per episode: the first refusal of
+    /// this (session, refused terminal), or the first after a quiet
+    /// [`REFUSAL_EPISODE_GAP`], is logged at warn and counted; a repeat inside
+    /// the episode is logged at debug. Nothing is written: a refusal is a fact
+    /// about the bind, not about any row (plan
+    /// `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`).
+    fn report_refusal(&self, session_id: &str, held_by: &str, refused_terminal: &str) {
+        let now = std::time::Instant::now();
+        let new_episode = match self.refused_episodes.lock() {
+            Ok(mut episodes) => {
+                episodes.retain(|_, at| now.duration_since(*at) <= REFUSAL_EPISODE_GAP);
+                episodes
+                    .insert((session_id.to_string(), refused_terminal.to_string()), now)
+                    .is_none()
             }
-            let ids = changed
-                .iter()
-                .map(|r| r.claude_session_id.clone())
-                .collect();
-            if !changed.is_empty() {
-                let deltas: Vec<LifecycleDelta> = changed
-                    .into_iter()
-                    .map(|r| LifecycleDelta::Upsert { rec: Box::new(r) })
-                    .collect();
-                self.persist(m, &deltas);
-            }
-            ids
+            Err(_) => true,
         };
-        for id in marked {
-            pane_binding::note_binding_mismatch(
-                refused_terminal,
-                &id,
-                vouched.named_session(),
-                "refused-move",
+        if new_episode {
+            self.binding_counters()
+                .note_move_refused(session_id, held_by, refused_terminal);
+        } else {
+            debug!(
+                claude_session = session_id,
+                held_by, refused_terminal, "session binder: move refused again (same episode)"
             );
         }
     }
 
     /// Declare that `claude_session_id`'s open row is about to MOVE off
     /// `from_terminal_id` deliberately, while that pane still runs the session —
-    /// the account migration spawns the replacement before it closes the
-    /// source. The binding guard lets exactly that move through, once: the bind
-    /// that performs it consumes the declaration. Withdraw an unconsumed one
-    /// with [`Self::withdraw_move`].
-    pub fn declare_move(&self, claude_session_id: &str, from_terminal_id: &str) {
+    /// the account migration spawns the replacement under `to_config_dir`
+    /// before it closes the source. The binding guard lets exactly that move
+    /// through, once: a bind of this session, off that terminal, carrying that
+    /// account, within [`DECLARED_MOVE_TTL`]. The declaration is withdrawn when
+    /// the returned guard drops unless a bind consumed it first — hold it
+    /// across the bind.
+    pub fn declare_move(
+        &self,
+        claude_session_id: &str,
+        from_terminal_id: &str,
+        to_config_dir: &str,
+    ) -> MoveDeclaration<'_> {
+        static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
         match self.declared_moves.lock() {
             Ok(mut moves) => {
+                moves.retain(|_, m| m.declared_at.elapsed() <= DECLARED_MOVE_TTL);
                 moves.insert(
                     claude_session_id.to_string(),
-                    from_terminal_id.trim().to_string(),
+                    DeclaredMove {
+                        from_terminal: from_terminal_id.trim().to_string(),
+                        to_config_dir: to_config_dir.trim().to_string(),
+                        declared_at: std::time::Instant::now(),
+                        token,
+                    },
                 );
             }
             Err(e) => warn!(error = %e, "session_lifecycle_store: lock poisoned on declare_move"),
         }
-    }
-
-    /// Withdraw a [`Self::declare_move`] no bind consumed (the replacement never
-    /// came up). Harmless for an undeclared session.
-    pub fn withdraw_move(&self, claude_session_id: &str) {
-        if let Ok(mut moves) = self.declared_moves.lock() {
-            moves.remove(claude_session_id);
+        MoveDeclaration {
+            store: self,
+            session: claude_session_id.to_string(),
+            token,
         }
     }
 
-    /// Consume the declaration for this exact move, if one was made.
-    fn take_declared_move(&self, claude_session_id: &str, from_terminal_id: &str) -> bool {
+    /// Consume the declaration for this exact move, if one was made and is
+    /// still claimable. Called with the map lock held (lock order: `map` →
+    /// `declared_moves`).
+    fn take_declared_move(
+        &self,
+        claude_session_id: &str,
+        from_terminal_id: &str,
+        incoming_config_dir: Option<&str>,
+    ) -> bool {
         let Ok(mut moves) = self.declared_moves.lock() else {
             return false;
         };
-        if moves.get(claude_session_id).map(String::as_str) == Some(from_terminal_id) {
+        let matches = moves.get(claude_session_id).is_some_and(|m| {
+            m.from_terminal == from_terminal_id
+                && incoming_config_dir.map(str::trim) == Some(m.to_config_dir.as_str())
+                && m.declared_at.elapsed() <= DECLARED_MOVE_TTL
+        });
+        if matches {
             moves.remove(claude_session_id);
-            true
-        } else {
-            false
         }
+        matches
     }
 
     /// Record a binding verdict for `claude_session_id`'s row — only while that
@@ -2346,7 +2485,7 @@ impl SessionLifecycleStore {
     /// `old_terminal_id` is answered with [`CloseOutcome::TerminalSuperseded`] instead
     /// of being resolved against the map (where it would land as a
     /// mis-bound `NotFound`). Call it AFTER the replacement's
-    /// [`Self::record_open`] and BEFORE tearing the old PTY down — the
+    /// [`Self::record_open_checked`] and BEFORE tearing the old PTY down — the
     /// account migration's step 4.
     pub fn mark_terminal_superseded(&self, old_terminal_id: &str, new_terminal_id: &str) {
         let old = old_terminal_id.trim();
@@ -2393,7 +2532,7 @@ impl SessionLifecycleStore {
     /// ## Why this exists
     ///
     /// The durable binding is established as a `(terminal_id,
-    /// claude_session_id)` PAIR by [`Self::record_open`], and was historically
+    /// claude_session_id)` PAIR by [`Self::record_open_checked`], and was historically
     /// dissolved by `claude_session_id` ALONE. A frontend tab can legitimately
     /// carry a `claudeSessionId` that no longer keys the record for *its own*
     /// terminal — a provisional spawn-seam id, a restored id whose PTY was
@@ -2600,7 +2739,7 @@ impl SessionLifecycleStore {
     /// row has no pane by design, and its old terminal id may already host
     /// another session — see [`awaiting_account_hold`]. `page_id` and
     /// `zone_index` stay, for placement. Only a bind ends the hold and re-binds
-    /// the row ([`Self::record_open`] on a verified resume).
+    /// the row ([`Self::record_open_checked`] on a verified resume).
     ///
     /// No write when nothing changes. Absent, closed or finished record (none
     /// of which the hold can hold) → no-op.
@@ -2855,24 +2994,35 @@ impl SessionLifecycleStore {
     /// (the map is keyed by `claude_session_id`, so a swapped call puts a
     /// session id in the terminal slot and would silently rebind a record onto
     /// a "terminal" that is really another session).
-    pub fn rebind_terminal(&self, claude_session_id: &str, terminal_id: &str, zone_index: i32) {
-        // The same binding guard as `record_open`. A rebind carries no evidence
-        // of its own (it re-points a restored row at the tab the frontend made
-        // for it), so it is a WEAK bind: it never takes a row from a live pane
-        // that still runs the session or cannot be read. After a restart the
-        // old pane is gone and the rebind goes through.
-        if let Some(held_by) = self.move_refusal(claude_session_id, terminal_id, false) {
-            self.refuse_move(claude_session_id, &held_by, terminal_id);
-            return;
-        }
+    ///
+    /// The same binding guard as [`Self::record_open_checked`], under the same
+    /// lock as the write. A rebind carries no evidence of its own (it re-points
+    /// a restored row at the tab the frontend made for it), so it is a WEAK
+    /// bind: it never takes a row from a live pane that still runs the session
+    /// or cannot be read — [`RecordOpenOutcome::MoveRefused`]. After a restart
+    /// the old pane is gone and the rebind goes through. Every no-op answers
+    /// [`RecordOpenOutcome::Recorded`]: nothing was refused.
+    pub fn rebind_terminal_checked(
+        &self,
+        claude_session_id: &str,
+        terminal_id: &str,
+        zone_index: i32,
+    ) -> RecordOpenOutcome {
         let changed = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
                 Err(e) => {
                     warn!(error = %e, "session_lifecycle_store: lock poisoned on rebind_terminal");
-                    return;
+                    return RecordOpenOutcome::Unavailable;
                 }
             };
+            if let Some(held_by) =
+                self.move_refusal_locked(&m, claude_session_id, terminal_id, false, None)
+            {
+                drop(m);
+                self.report_refusal(claude_session_id, &held_by, terminal_id);
+                return RecordOpenOutcome::MoveRefused { held_by };
+            }
             // Checked WHILE the guard is already held — taking the lock a
             // second time to answer this would deadlock on a non-reentrant
             // Mutex. `debug_assert!` compiles out of release entirely, so this
@@ -2885,13 +3035,13 @@ impl SessionLifecycleStore {
                  claude_session_id={claude_session_id:?})"
             );
             let Some(rec) = m.get_mut(claude_session_id) else {
-                return; // unknown session — nothing to rebind
+                return RecordOpenOutcome::Recorded; // unknown session — nothing to rebind
             };
             if rec.state != "open" {
-                return; // closed/exited records are not restore targets
+                return RecordOpenOutcome::Recorded; // closed/exited records are not restore targets
             }
             if rec.terminal_id == terminal_id && rec.zone_index == zone_index {
-                return; // already current — no write, no flush
+                return RecordOpenOutcome::Recorded; // already current — no write, no flush
             }
             if rec.terminal_id != terminal_id {
                 // A binding verdict is about one pane.
@@ -2915,6 +3065,13 @@ impl SessionLifecycleStore {
             changed
         };
         self.snapshot_change(std::iter::once(changed));
+        RecordOpenOutcome::Recorded
+    }
+
+    /// [`Self::rebind_terminal_checked`], discarding the outcome — for tests.
+    #[cfg(test)]
+    pub fn rebind_terminal(&self, claude_session_id: &str, terminal_id: &str, zone_index: i32) {
+        let _ = self.rebind_terminal_checked(claude_session_id, terminal_id, zone_index);
     }
 
     /// Mirror a terminal-page move into the durable registry, resolved by
@@ -3025,7 +3182,7 @@ impl SessionLifecycleStore {
     /// resume reopens it, but ONLY when the gate's outcome is already owned
     /// elsewhere.
     ///
-    /// The fields are sticky in [`Self::record_open`], so a gate-less reopen
+    /// The fields are sticky in [`Self::record_open_checked`], so a gate-less reopen
     /// would otherwise keep them. A later non-restorable close of the reopened
     /// row would then report `runner_restart` a second time for a gate that is
     /// already settled.
@@ -4802,7 +4959,7 @@ pub enum CloseOutcome {
     /// observer, the workdir nonce kept. See
     /// [`SessionLifecycleStore::mark_terminal_superseded`].
     ///
-    /// Distinct from the `close_reason: "superseded"` that [`SessionLifecycleStore::record_open`]
+    /// Distinct from the `close_reason: "superseded"` that [`SessionLifecycleStore::record_open_checked`]
     /// writes when another session binds a ROW's terminal — that closes a row;
     /// this retires a terminal and closes nothing.
     #[serde(rename_all = "camelCase")]
@@ -5185,8 +5342,8 @@ fn open_on_terminal(r: &TerminalSessionRecord, terminal_id: &str) -> bool {
 ///
 /// A held row has no pane by design, so it holds no terminal: the hold
 /// detaches `terminal_id` (blank = unbound, as for any uncorrelated row) and
-/// only a bind ends it ([`SessionLifecycleStore::record_open`],
-/// [`SessionLifecycleStore::rebind_terminal`]). That one rule keeps it out of
+/// only a bind ends it ([`SessionLifecycleStore::record_open_checked`],
+/// [`SessionLifecycleStore::rebind_terminal_checked`]). That one rule keeps it out of
 /// every terminal contest — the restore dedupe, the boot collision repair,
 /// `record_open`'s supersede arms, the poll's direct match and the frontend's
 /// reconnect — without an exemption in any of them.
@@ -8344,19 +8501,11 @@ mod tests {
     /// no observer (coord must not see a `Closed` for a live session), and
     /// the entry is consumed so a genuinely stale close of the same id later
     /// still surfaces as `NotFound`.
-    ///
-    /// Since plan `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`
-    /// the move itself is DECLARED: the old pane's `claude` still runs the
-    /// session, so an undeclared re-key is refused by the binding guard.
     #[test]
     fn record_close_checked_answers_a_superseded_terminal_without_touching_the_live_row() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
-        store.attach_pane_evidence(FixedPanes::of(&[(
-            "term-old",
-            PaneEvidence::Names("moving".to_string()),
-        )]));
         let fired = std::sync::Arc::new(AtomicUsize::new(0));
         {
             let fired = fired.clone();
@@ -8364,23 +8513,10 @@ mod tests {
                 fired.fetch_add(1, Ordering::SeqCst);
             });
         }
-        // The session opens on the old terminal. An UNDECLARED re-key onto
-        // another terminal is refused: the old pane still runs it.
+        // The session opens on the old terminal, then the respawn re-keys the
+        // SAME row onto the new one (what `record_pinned_session_open` does).
         store.record_open(auth_on("moving", "term-old"));
-        assert_eq!(
-            store.record_open(auth_on("moving", "term-new")),
-            RecordOpenOutcome::MoveRefused {
-                held_by: "term-old".to_string()
-            }
-        );
-        assert_eq!(store.get("moving").unwrap().terminal_id, "term-old");
-        // The migration declares the move; the respawn then re-keys the SAME
-        // row onto the new terminal (what `record_pinned_session_open` does).
-        store.declare_move("moving", "term-old");
-        assert_eq!(
-            store.record_open(auth_on("moving", "term-new")),
-            RecordOpenOutcome::Recorded
-        );
+        store.record_open(auth_on("moving", "term-new"));
         assert_eq!(store.get("moving").unwrap().terminal_id, "term-new");
 
         store.mark_terminal_superseded("term-old", "term-new");
@@ -8425,33 +8561,50 @@ mod tests {
         PaneEvidence::Names(id.to_string())
     }
 
+    /// A store whose panes answer `panes` and whose binding counters are its
+    /// own, so a count is asserted exactly.
+    fn guarded_store(
+        dir: &std::path::Path,
+        panes: &[(&str, PaneEvidence)],
+    ) -> (SessionLifecycleStore, Arc<BindingCounters>) {
+        let store = SessionLifecycleStore::open(dir.join("s.json")).unwrap();
+        store.attach_pane_evidence(FixedPanes::of(panes));
+        let counters = Arc::new(BindingCounters::default());
+        store.attach_binding_counters(counters.clone());
+        (store, counters)
+    }
+
     /// The binding guard (plan
     /// `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`, Phase 3):
-    /// the 2026-10-25 write — S_B bound `observed` + confirmed onto pane A —
-    /// is REFUSED while B's own `claude` still runs S_B. Nothing is written:
-    /// S_B stays on B, and A's own session is not superseded.
+    /// a confirmed `observed` bind of S_B onto pane A — the write rung 3 makes
+    /// in the Phase 1 reproduction — is REFUSED while B's own `claude` still
+    /// runs S_B. Nothing is written, nothing on either pane is marked, and the
+    /// refusal counts once however often it is retried.
     #[test]
     fn record_open_refuses_to_move_a_row_off_a_pane_that_still_runs_it() {
         let dir = tempdir().unwrap();
-        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
-        store.attach_pane_evidence(FixedPanes::of(&[
-            ("term-a", names("s-a")),
-            ("term-b", names("s-b")),
-        ]));
+        let (store, counters) = guarded_store(
+            dir.path(),
+            &[("term-a", PaneEvidence::Unknown), ("term-b", names("s-b"))],
+        );
         store.record_open(auth_on("s-a", "term-a"));
         store.record_open(auth_on("s-b", "term-b"));
-        let refused_before = pane_binding::binding_move_refused_total();
 
-        let mut thief = rec("s-b");
-        thief.terminal_id = "term-a".to_string();
-        thief.origin = Some(ORIGIN_OBSERVED.to_string());
-        thief.confirmed_at = Some(999);
-        assert_eq!(
-            store.record_open(thief),
-            RecordOpenOutcome::MoveRefused {
-                held_by: "term-b".to_string()
-            }
-        );
+        let thief = || {
+            let mut thief = rec("s-b");
+            thief.terminal_id = "term-a".to_string();
+            thief.origin = Some(ORIGIN_OBSERVED.to_string());
+            thief.confirmed_at = Some(999);
+            thief
+        };
+        for _ in 0..3 {
+            assert_eq!(
+                store.record_open_checked(thief()),
+                RecordOpenOutcome::MoveRefused {
+                    held_by: "term-b".to_string()
+                }
+            );
+        }
 
         let b = store.get("s-b").unwrap();
         assert_eq!(
@@ -8467,36 +8620,26 @@ mod tests {
             (a.state.as_str(), a.terminal_id.as_str()),
             ("open", "term-a")
         );
-        assert_ne!(
-            a.binding_state,
-            Some(BindingState::Unknown),
-            "A's own claude vouches for S_A, so the refusal does not mark it"
+        assert_eq!(
+            (a.binding_state, b.binding_state),
+            (None, Some(BindingState::Matched)),
+            "a refusal marks no row: the refused pane's evidence names nothing, and \
+             S_B keeps the verdict its own pane gave it at bind time"
         );
-        assert!(pane_binding::binding_move_refused_total() > refused_before);
-    }
+        assert_eq!(counters.refused_moves(), 1, "one episode, three refusals");
+        assert_eq!(counters.mismatches(), 0);
 
-    /// A refused move makes the conflict visible on the REFUSED pane: its open
-    /// rows read `unknown` unless the pane's own `claude` names them.
-    #[test]
-    fn a_refused_move_marks_the_refused_panes_unvouched_rows_unknown() {
-        let dir = tempdir().unwrap();
-        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
-        store.attach_pane_evidence(FixedPanes::of(&[
-            ("term-a", PaneEvidence::Unknown),
-            ("term-b", names("s-b")),
-        ]));
-        store.record_open(auth_on("s-a", "term-a"));
+        // A re-record on the pane that holds the session (a hook, a refresh)
+        // does not end the episode: the next identical refusal is still the
+        // same one.
         store.record_open(auth_on("s-b", "term-b"));
-
-        assert!(matches!(
-            store.record_open(auth_on("s-b", "term-a")),
-            RecordOpenOutcome::MoveRefused { .. }
-        ));
-
-        let a = store.get("s-a").unwrap();
-        assert_eq!(a.binding_state, Some(BindingState::Unknown));
-        let wire = serde_json::to_value(&a).unwrap();
-        assert_eq!(wire["bindingState"], "unknown");
+        assert!(!store.record_open_checked(thief()).is_recorded());
+        assert_eq!(counters.refused_moves(), 1);
+        // A different refused destination is a different episode.
+        let mut elsewhere = thief();
+        elsewhere.terminal_id = "term-c".to_string();
+        assert!(!store.record_open_checked(elsewhere).is_recorded());
+        assert_eq!(counters.refused_moves(), 2);
     }
 
     /// The moves the guard ALLOWS — and the one it refuses for a weak bind. A
@@ -8513,12 +8656,11 @@ mod tests {
         ];
         for (old_pane, strong, moved) in cases {
             let dir = tempdir().unwrap();
-            let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
-            store.attach_pane_evidence(FixedPanes::of(&[("term-old", old_pane.clone())]));
+            let (store, counters) = guarded_store(dir.path(), &[("term-old", old_pane.clone())]);
             let mut original = rec("s");
             original.terminal_id = "term-old".to_string();
             store.record_open(original);
-            store.set_binding_state("s", "term-old", BindingState::Matched);
+            let _ = store.set_binding_state("s", "term-old", BindingState::Matched);
 
             let mut incoming = rec("s");
             incoming.terminal_id = "term-new".to_string();
@@ -8530,7 +8672,7 @@ mod tests {
                 }
                 .to_string(),
             );
-            let outcome = store.record_open(incoming);
+            let outcome = store.record_open_checked(incoming);
 
             let row = store.get("s").unwrap();
             if moved {
@@ -8541,6 +8683,7 @@ mod tests {
                 );
                 assert_eq!(row.terminal_id, "term-new", "{old_pane:?} strong={strong}");
                 assert_eq!(row.binding_state, None, "the old pane's verdict is dropped");
+                assert_eq!(counters.refused_moves(), 0);
             } else {
                 assert_eq!(
                     outcome,
@@ -8550,49 +8693,92 @@ mod tests {
                     "{old_pane:?} strong={strong}"
                 );
                 assert_eq!(row.terminal_id, "term-old", "{old_pane:?} strong={strong}");
+                assert_eq!(
+                    row.binding_state,
+                    Some(BindingState::Matched),
+                    "the held row keeps its own verdict"
+                );
+                assert_eq!(counters.refused_moves(), 1);
             }
         }
     }
 
-    /// A withdrawn declaration leaves the guard in force, and a declaration is
-    /// for one exact move: the wrong source terminal does not unlock it.
+    /// A declared move is ONE exact move — this session, off this terminal, by
+    /// a bind carrying the declared account — consumed by the bind, and
+    /// withdrawn when its guard drops unconsumed.
     #[test]
-    fn a_move_declaration_is_exact_and_withdrawable() {
+    fn a_move_declaration_is_exact_consumed_and_withdrawn_on_drop() {
         let dir = tempdir().unwrap();
-        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
-        store.attach_pane_evidence(FixedPanes::of(&[("term-old", names("s"))]));
+        let (store, _counters) = guarded_store(dir.path(), &[("term-old", names("s"))]);
         store.record_open(auth_on("s", "term-old"));
+        let onto_new = |config_dir: &str| {
+            let mut r = auth_on("s", "term-new");
+            r.config_dir = Some(config_dir.to_string());
+            r
+        };
 
-        store.declare_move("s", "term-old");
-        store.withdraw_move("s");
-        assert!(matches!(
-            store.record_open(auth_on("s", "term-new")),
-            RecordOpenOutcome::MoveRefused { .. }
-        ));
-        store.declare_move("s", "term-elsewhere");
-        assert!(matches!(
-            store.record_open(auth_on("s", "term-new")),
-            RecordOpenOutcome::MoveRefused { .. }
-        ));
-        assert_eq!(store.get("s").unwrap().terminal_id, "term-old");
+        // Withdrawn on drop: the guard is back in force.
+        drop(store.declare_move("s", "term-old", "C:/dst"));
+        assert!(!store.record_open_checked(onto_new("C:/dst")).is_recorded());
+
+        {
+            let _declared = store.declare_move("s", "term-elsewhere", "C:/dst");
+            assert!(
+                !store.record_open_checked(onto_new("C:/dst")).is_recorded(),
+                "the wrong source terminal does not unlock it"
+            );
+        }
+        {
+            let _declared = store.declare_move("s", "term-old", "C:/dst");
+            assert!(
+                !store
+                    .record_open_checked(onto_new("C:/other"))
+                    .is_recorded(),
+                "a bind from another account is not the declared move"
+            );
+            assert_eq!(
+                store.record_open_checked(onto_new("C:/dst")),
+                RecordOpenOutcome::Recorded,
+                "the declared move goes through"
+            );
+        }
+        assert_eq!(store.get("s").unwrap().terminal_id, "term-new");
     }
 
-    /// Bind-time verdict (Phase 2): a record bound onto a pane is judged
-    /// against that pane's own `claude` right away — `unknown` when it names
-    /// another session (counted once), `matched` when it names this one.
+    /// A newer declaration for the same session survives the older guard's
+    /// drop: a guard withdraws only its own declaration.
     #[test]
-    fn record_open_judges_the_row_against_its_panes_own_claude_at_bind_time() {
+    fn a_stale_move_declaration_guard_never_withdraws_a_newer_one() {
         let dir = tempdir().unwrap();
-        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
-        store.attach_pane_evidence(FixedPanes::of(&[("term-a", names("s-a"))]));
-        let before = pane_binding::binding_mismatch_total();
+        let (store, _counters) = guarded_store(dir.path(), &[("term-old", names("s"))]);
+        store.record_open(auth_on("s", "term-old"));
+        let first = store.declare_move("s", "term-old", "C:/dst");
+        let _second = store.declare_move("s", "term-old", "C:/dst");
+        drop(first);
+        let mut onto_new = auth_on("s", "term-new");
+        onto_new.config_dir = Some("C:/dst".to_string());
+        assert!(store.record_open_checked(onto_new).is_recorded());
+    }
 
-        store.record_open(auth_on("s-x", "term-a"));
+    /// Bind-time verdict: a record bound onto a pane whose own `claude` names
+    /// THIS session reads `matched` at once. A bind never reads `unknown` —
+    /// the pane's record may lag the very switch the bind reports; the
+    /// reconcile pass judges contradictions. An incoming record's own
+    /// `binding_state` is never taken.
+    #[test]
+    fn record_open_marks_a_bind_matched_only_when_its_pane_names_it() {
+        let dir = tempdir().unwrap();
+        let (store, counters) = guarded_store(dir.path(), &[("term-a", names("s-a"))]);
+
+        let mut claims_matched = auth_on("s-x", "term-a");
+        claims_matched.binding_state = Some(BindingState::Matched);
+        store.record_open(claims_matched);
         assert_eq!(
             store.get("s-x").unwrap().binding_state,
-            Some(BindingState::Unknown)
+            None,
+            "neither matched (the pane names s-a) nor unknown, and never the caller's value"
         );
-        assert!(pane_binding::binding_mismatch_total() > before);
+        assert_eq!(counters.mismatches(), 0);
 
         store.record_open(auth_on("s-a", "term-a"));
         assert_eq!(
@@ -8602,6 +8788,43 @@ mod tests {
         // No evidence for a pane: no verdict.
         store.record_open(auth_on("s-c", "term-c"));
         assert_eq!(store.get("s-c").unwrap().binding_state, None);
+    }
+
+    /// The supersede scan spares a sibling some live pane's own `claude` still
+    /// runs: a bind onto a pane can be wrong (or ahead of the pane's record),
+    /// and closing a session that runs is not a phantom eviction.
+    #[test]
+    fn a_bind_never_supersedes_a_sibling_a_live_pane_runs() {
+        let dir = tempdir().unwrap();
+        let (store, _counters) = guarded_store(
+            dir.path(),
+            &[
+                ("term-a", names("runs-here")),
+                ("term-b", names("runs-there")),
+            ],
+        );
+        let mut here = auth_on("runs-here", "term-a");
+        here.origin = None; // unconfirmed and not authoritative: a phantom by shape
+        store.record_open(here);
+        let mut there = auth_on("runs-there", "term-a");
+        there.origin = None;
+        store.record_open(there);
+        let mut phantom = auth_on("phantom", "term-a");
+        phantom.origin = None;
+        store.record_open(phantom);
+
+        let mut incoming = auth_on("incoming", "term-a");
+        incoming.confirmed_at = Some(1);
+        assert!(store.record_open_checked(incoming).is_recorded());
+
+        let state = |id: &str| store.get(id).unwrap().state;
+        assert_eq!(state("runs-here"), "open", "the pane's own claude runs it");
+        assert_eq!(state("runs-there"), "open", "another pane's claude runs it");
+        assert_eq!(
+            state("phantom"),
+            "closed",
+            "nothing runs it: evicted as before"
+        );
     }
 
     /// A row its pane contradicts never lights up a tab: `terminal_list`'s
@@ -8661,19 +8884,32 @@ mod tests {
     }
 
     /// The restore rebind is a weak bind under the same guard: it never takes
-    /// a row from a live pane that still runs it.
+    /// a row from a live pane that still runs it, and says so.
     #[test]
     fn rebind_terminal_never_takes_a_row_from_a_live_pane_that_runs_it() {
         let dir = tempdir().unwrap();
-        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
-        store.attach_pane_evidence(FixedPanes::of(&[("term-a", names("s"))]));
+        let (store, counters) = guarded_store(dir.path(), &[("term-a", names("s"))]);
         store.record_open(auth_on("s", "term-a"));
-        store.rebind_terminal("s", "term-b", 3);
+        assert_eq!(
+            store.rebind_terminal_checked("s", "term-b", 3),
+            RecordOpenOutcome::MoveRefused {
+                held_by: "term-a".to_string()
+            }
+        );
         assert_eq!(store.get("s").unwrap().terminal_id, "term-a");
+        assert_eq!(counters.refused_moves(), 1);
         // A pane gone since (no evidence) lets the rebind through.
         store.record_open(auth_on("t", "term-gone"));
-        store.rebind_terminal("t", "term-b", 3);
+        assert_eq!(
+            store.rebind_terminal_checked("t", "term-b", 3),
+            RecordOpenOutcome::Recorded
+        );
         assert_eq!(store.get("t").unwrap().terminal_id, "term-b");
+        assert_eq!(
+            store.rebind_terminal_checked("absent", "term-b", 3),
+            RecordOpenOutcome::Recorded,
+            "nothing to move is not a refusal"
+        );
     }
 
     /// `bindingState` round-trips camelCase through the snapshot, and a row

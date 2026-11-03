@@ -1150,15 +1150,31 @@ async fn materialize_restore_registry(
         .get("restore_tier")
         .and_then(|v| v.as_str())
         .unwrap_or("<absent>");
-    lifecycle_store.record_open(record);
-    tracing::info!(
-        source = %source_session_id,
-        child = %child_id,
-        session = %session_key,
-        tier = materialized_tier,
-        mirrored_tier = %mirrored_tier,
-        "session handoff: materialized restore-registry record"
-    );
+    match lifecycle_store.record_open_checked(record) {
+        crate::session::session_lifecycle_store::RecordOpenOutcome::Recorded => {
+            tracing::info!(
+                source = %source_session_id,
+                child = %child_id,
+                session = %session_key,
+                tier = materialized_tier,
+                mirrored_tier = %mirrored_tier,
+                "session handoff: materialized restore-registry record"
+            );
+        }
+        outcome => {
+            // Refused (another live pane still runs the session — plan
+            // `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`)
+            // or unwritable: nothing was materialized here.
+            tracing::warn!(
+                source = %source_session_id,
+                child = %child_id,
+                session = %session_key,
+                tier = materialized_tier,
+                outcome = ?outcome,
+                "session handoff: restore-registry record NOT materialized"
+            );
+        }
+    }
 }
 
 /// Read the durable-replay window of `GET /sessions/:id/events` (SSE) and

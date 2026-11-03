@@ -1392,10 +1392,17 @@ fn migrate_session(
 
     // The respawn's pinned record moves this row off a pane whose `claude` is
     // still running the session (step 4 closes it) — the one move the store's
-    // binding guard must let through. Declared here, withdrawn right after the
-    // spawn: consumed when the respawn recorded, moot when it failed. Neither
-    // call can exit early (see GUARD above).
-    store.declare_move(&record.claude_session_id, &record.terminal_id);
+    // binding guard must let through: this session, off this terminal, by a
+    // bind under the TARGET account. Declared here and held across the spawn;
+    // the respawn's record consumes it, and dropping the declaration right
+    // after the spawn withdraws it if the spawn never recorded (a lost guard
+    // still expires after `DECLARED_MOVE_TTL`). Declaring cannot exit early
+    // (see GUARD above).
+    let declared_move = store.declare_move(
+        &record.claude_session_id,
+        &record.terminal_id,
+        dst_config_dir,
+    );
 
     // 3. Respawn under the target account, through the SHARED resume seam
     // ([`spawn_resumed_pane`]) — the same code path the respawn receiver
@@ -1458,7 +1465,7 @@ fn migrate_session(
             gate_identity: carried_gate_identity,
         },
     );
-    store.withdraw_move(&record.claude_session_id);
+    drop(declared_move);
     // GUARD: anchor-held window closes at the `restore_continuation_registration`
     // call INSIDE each arm below, not at this line — an early exit added in
     // the `Ok` arm before that call would still drop the permit and free the

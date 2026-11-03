@@ -1296,7 +1296,7 @@ pub fn terminal_collect_session_metadata(
 /// existing record in place (structural dedup), which is what prevents the
 /// duplicate-session bug.
 ///
-/// Synchronous + fast: [`SessionLifecycleStore::record_open`] fsyncs the
+/// Synchronous + fast: [`SessionLifecycleStore::record_open_checked`] fsyncs the
 /// atomic write before returning, so the frontend can rely on durability the
 /// instant this resolves.
 ///
@@ -1386,10 +1386,14 @@ pub fn terminal_session_record_open(
         binding_state: None,
     };
     let session_id = record.claude_session_id.clone();
-    let outcome = store.record_open(record);
+    let outcome = store.record_open_checked(record);
     // The verified-resume re-assert of a boot restore lands here: adopt a
-    // resumed gate continuation into this generation (plan 2026-10-03 D3).
-    adopt_restored_continuation(&store, &session_id);
+    // resumed gate continuation into this generation (plan 2026-10-03 D3) —
+    // only when the record landed. A refused bind wrote nothing on this
+    // terminal; the report below names the pane that holds the session.
+    if outcome.is_recorded() {
+        adopt_restored_continuation(&store, &session_id);
+    }
     Ok(CommandResponse {
         success: true,
         message: None,
@@ -1415,7 +1419,7 @@ pub fn terminal_session_record_open(
 ///
 /// `config_dir` is deliberately not checked. The seed path writes its record
 /// straight to the file, but this one goes through
-/// [`SessionLifecycleStore::record_open`], whose `non_empty` normalization
+/// [`SessionLifecycleStore::record_open_checked`], whose `non_empty` normalization
 /// already folds a blank config dir to `None`. A blank there is handled
 /// correctly today, and erroring on it would reject callers for a problem they
 /// do not have.
@@ -1497,7 +1501,7 @@ fn record_open_confirmation_report(
 ///
 /// Deliberately NOT `terminal_session_record_open`: that refreshes
 /// `last_seen_at` and would make ghost rows immortal. See
-/// [`SessionLifecycleStore::rebind_terminal`].
+/// [`SessionLifecycleStore::rebind_terminal_checked`].
 ///
 /// ## Also stamps the TERMINAL-ONLY restore tier (restore census, plan D6/P5)
 ///
@@ -1522,16 +1526,53 @@ pub fn terminal_session_rebind_terminal(
     terminal_id: String,
     zone_index: i32,
 ) -> Result<CommandResponse, String> {
-    store.rebind_terminal(&claude_session_id, &terminal_id, zone_index);
-    store.mark_restored_from_boot(
+    Ok(rebind_terminal_response(
+        &store,
         &claude_session_id,
-        crate::session::session_lifecycle_store::RESTORE_TIER_TERMINAL_ONLY,
-    );
-    Ok(CommandResponse {
-        success: true,
-        message: None,
-        data: None,
-    })
+        &terminal_id,
+        zone_index,
+    ))
+}
+
+/// [`terminal_session_rebind_terminal`]'s body, testable without Tauri state.
+///
+/// A rebind the store REFUSED (plan
+/// `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`: the row's
+/// current pane is live and still runs the session) re-pointed nothing, so it
+/// stamps no restore tier — the tile it would describe does not host the
+/// session — and answers `success: false` with `heldBy`, the pane that does.
+/// The frontend's restore path treats the call as fire-and-forget either way.
+fn rebind_terminal_response(
+    store: &SessionLifecycleStore,
+    claude_session_id: &str,
+    terminal_id: &str,
+    zone_index: i32,
+) -> CommandResponse {
+    match store.rebind_terminal_checked(claude_session_id, terminal_id, zone_index) {
+        RecordOpenOutcome::Recorded => {
+            store.mark_restored_from_boot(
+                claude_session_id,
+                crate::session::session_lifecycle_store::RESTORE_TIER_TERMINAL_ONLY,
+            );
+            CommandResponse {
+                success: true,
+                message: None,
+                data: None,
+            }
+        }
+        RecordOpenOutcome::MoveRefused { held_by } => CommandResponse {
+            success: false,
+            message: Some(format!(
+                "not rebound: terminal {held_by} is live and still runs session {claude_session_id}"
+            )),
+            data: Some(serde_json::json!({ "rebound": false, "heldBy": held_by })),
+        },
+        RecordOpenOutcome::Unavailable => CommandResponse {
+            success: false,
+            message: Some("not rebound: the session registry is unavailable".to_string()),
+            data: Some(serde_json::json!({ "rebound": false, "heldBy": null })),
+        },
+    }
 }
 
 /// Mark a session restore-pending in the lifecycle registry: a resume is
@@ -2818,8 +2859,11 @@ pub(crate) fn create_terminal_session_backend(
             let record_zone_index = hint_zone_index.unwrap_or(0);
             if let Some(pinned) = pinned_session_id {
                 // Pre-pinned id: record synchronously, then verify async that
-                // the transcript appears. NEVER rebinds from transcripts.
-                record_pinned_session_open(
+                // the transcript appears. NEVER rebinds from transcripts. A
+                // refusal (another live pane still runs this id) is logged by
+                // `record_pinned_session_open`; the verify below only stamps a
+                // row that exists, wherever it lives.
+                let _ = record_pinned_session_open(
                     &store,
                     pinned.clone(),
                     terminal_id.clone(),
@@ -2913,7 +2957,7 @@ fn resolve_latest_claude_session_id(
 }
 
 /// Poll `resolve` until it yields a Claude session id (or `timeout` elapses),
-/// then durably record the session via [`SessionLifecycleStore::record_open`].
+/// then durably record the session via [`SessionLifecycleStore::record_open_checked`].
 ///
 /// LAST-RESORT BACKSTOP (session-restore redesign Phase 4/5): this is the
 /// DEMOTED mtime-race recorder, no longer the primary identity path. The
@@ -3000,7 +3044,7 @@ async fn poll_and_record_session<F>(
                 gate_bound_boot_ms,
                 binding_state: None,
             };
-            match store.record_open(record) {
+            match store.record_open_checked(record) {
                 RecordOpenOutcome::Recorded => info!(
                     terminal_id = %terminal_id,
                     claude_session = %claude_session_id,
@@ -3034,7 +3078,7 @@ async fn poll_and_record_session<F>(
 ///
 /// Returns what the store did: a record that would move a session's row off a
 /// live pane still running it is refused (see
-/// [`SessionLifecycleStore::record_open`]); an account migration declares its
+/// [`SessionLifecycleStore::record_open_checked`]); an account migration declares its
 /// move first ([`SessionLifecycleStore::declare_move`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_pinned_session_open(
@@ -3068,7 +3112,7 @@ pub(crate) fn record_pinned_session_open(
     let account = config_dir
         .as_deref()
         .map(|d| crate::session::past_sessions::account_from_config_dir(Some(d)));
-    let outcome = store.record_open(TerminalSessionRecord {
+    let outcome = store.record_open_checked(TerminalSessionRecord {
         claude_session_id: claude_session_id.clone(),
         config_dir,
         working_dir: Some(working_dir),
@@ -4085,6 +4129,90 @@ mod tests {
         assert!(
             store.find_confirmed_open_by_terminal("term-1").is_none(),
             "reporting the state must never flip it"
+        );
+    }
+
+    /// A store whose pane `term-live` is a live pane whose own `claude` runs
+    /// `sess-held` (plan
+    /// `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`), with
+    /// that session's row open there.
+    fn store_with_a_held_session(dir: &std::path::Path) -> SessionLifecycleStore {
+        let store =
+            SessionLifecycleStore::open(dir.join("terminal-sessions.json")).expect("store opens");
+        store.attach_pane_evidence(crate::session::pane_binding::FixedPanes::of(&[(
+            "term-live",
+            crate::session::pane_binding::PaneEvidence::Names("sess-held".to_string()),
+        )]));
+        let mut held = restore_candidate_record("sess-held");
+        held.terminal_id = "term-live".to_string();
+        store.record_open(held);
+        store
+    }
+
+    /// The MoveRefused arm: a record the store refused reads `recorded: false`
+    /// with `heldBy` naming the live pane that still runs the session — even
+    /// though the session's row exists (it exists THERE, not on the terminal
+    /// the call named).
+    #[test]
+    fn record_open_report_names_the_pane_that_holds_a_refused_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_with_a_held_session(dir.path());
+        let mut moving = restore_candidate_record("sess-held");
+        moving.terminal_id = "term-other".to_string();
+        let outcome = store.record_open_checked(moving);
+        assert_eq!(
+            outcome,
+            RecordOpenOutcome::MoveRefused {
+                held_by: "term-live".to_string()
+            }
+        );
+
+        let report = record_open_confirmation_report(&store, "sess-held", &outcome);
+        assert_eq!(report["recorded"], false, "{report}");
+        assert_eq!(report["confirmed"], false, "{report}");
+        assert_eq!(report["heldBy"], "term-live", "{report}");
+        assert_eq!(report["confirmBy"], CONFIRM_DOOR, "{report}");
+        assert_eq!(
+            store.get("sess-held").unwrap().terminal_id,
+            "term-live",
+            "nothing moved"
+        );
+        let landed =
+            record_open_confirmation_report(&store, "sess-held", &RecordOpenOutcome::Recorded);
+        assert!(landed["heldBy"].is_null(), "{landed}");
+    }
+
+    /// The restore rebind the store refuses re-points nothing, stamps no
+    /// restore tier, and says which pane holds the session; one it allows
+    /// stamps the tier as before.
+    #[test]
+    fn a_refused_rebind_stamps_no_restore_tier_and_names_the_holder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_with_a_held_session(dir.path());
+
+        let refused = rebind_terminal_response(&store, "sess-held", "term-restored", 2);
+        assert!(!refused.success);
+        assert_eq!(
+            refused.data,
+            Some(serde_json::json!({ "rebound": false, "heldBy": "term-live" }))
+        );
+        let row = store.get("sess-held").unwrap();
+        assert_eq!(row.terminal_id, "term-live");
+        assert_eq!(
+            row.restore_tier, None,
+            "no tier stamped for a tile that does not host it"
+        );
+
+        let mut gone = restore_candidate_record("sess-gone");
+        gone.terminal_id = "term-dead".to_string();
+        store.record_open(gone);
+        let rebound = rebind_terminal_response(&store, "sess-gone", "term-restored", 2);
+        assert!(rebound.success);
+        let row = store.get("sess-gone").unwrap();
+        assert_eq!(row.terminal_id, "term-restored");
+        assert_eq!(
+            row.restore_tier.as_deref(),
+            Some(crate::session::session_lifecycle_store::RESTORE_TIER_TERMINAL_ONLY)
         );
     }
 
