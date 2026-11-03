@@ -29,15 +29,17 @@
 //!
 //! # File semantics
 //!
-//! The log file is a *last panic* record, not a history: every panic
-//! rewrites it whole ([`write_panic_log`] uses `File::create`), and
+//! The log file is a *last panic* record, not a history: every panic that
+//! reaches [`write_panic_log`] rewrites it whole (`File::create`; a
+//! recursive panic or a failed write leaves the previous contents), and
 //! installing the hook does NOT truncate it. A runner that boots cleanly
 //! therefore leaves an OLDER process's panic on disk until its own next
 //! panic overwrites it, so a reader must not take the file's presence as
-//! this process's panic. The supervisor ties a panic to a spawn by the
-//! header's pid (else by its date against the spawn), not by the file
-//! existing; its exit monitor additionally requires the panic to be dated
-//! within 60 s of the exit.
+//! this process's panic — the `pid=` on the header line is what names the
+//! process. For how the supervisor matches a panic to a spawn (and any
+//! time window it applies), see qontinui-supervisor's
+//! `dev_action::attribution::is_startup_panic_of` and
+//! `process::manager::check_and_record_panic_log`.
 //!
 //! # Log dir resolution
 //!
@@ -56,7 +58,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// File name inside the log dir. One file per startup — overwritten.
+/// File name inside the log dir. Holds only the most recent panic; each
+/// panic that reaches [`write_panic_log`] overwrites it whole.
 pub const PANIC_LOG_FILENAME: &str = "runner-panic.log";
 
 /// Re-entrancy guard so a panic *inside* the panic hook doesn't recurse.
