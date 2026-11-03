@@ -525,6 +525,7 @@ fn bind_record(
         gate_consuming_device_id: None,
         gate_bound_boot_ms: None,
         binding_state: None,
+        placed_strongly: false,
     }
 }
 
@@ -629,17 +630,24 @@ pub fn run_reconcile_at_epoch<I: TranscriptIndex>(
     for r in &open_now {
         *rows_on_terminal.entry(r.terminal_id.as_str()).or_default() += 1;
     }
-    // ...and, per session, the live panes that hold it (an open row, confirmed
-    // or not, not read `unknown`) or whose own record names it. A pane may
-    // never take a session a PEER holds or runs (plan
+    // ...and, per session, the live panes that hold it or whose own record
+    // names it. A pane holds a session by an open row of it, confirmed or not,
+    // that is not read `unknown` — or that is, but a STRONG bind placed there
+    // (`placed_strongly`: a hook, a pinned spawn, a rung-2/2b bind). A pane
+    // may never take a session a PEER holds or runs (plan
     // `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`):
     // claiming only confirmed rows is what let rung 3, in the Phase 1
     // reproduction, move a live peer's unconfirmed session onto another pane.
-    // A pane may always re-take a session whose row it holds itself.
+    // So rung 2b heals only a row a WEAK bind put on the wrong pane — the
+    // 2026-10-25 shape — and never moves a row a hook put where its session
+    // runs, whatever a stale record elsewhere says. A pane may always re-take
+    // a session whose row it holds itself.
     let mut holders: HashMap<&str, HashSet<&str>> = HashMap::new();
     let mut held_here: HashMap<&str, HashSet<&str>> = HashMap::new();
     for r in &open_now {
-        if live_terminal_ids.contains(r.terminal_id.as_str()) && !contradicted(r) {
+        if live_terminal_ids.contains(r.terminal_id.as_str())
+            && (!contradicted(r) || r.placed_strongly)
+        {
             holders
                 .entry(r.claude_session_id.as_str())
                 .or_default()
@@ -950,10 +958,14 @@ fn apply_verdicts(
 /// names nothing is bound iff it holds a confirmed open row not read
 /// `unknown`.
 ///
-/// If a record does NOT follow an in-process switch (UNMEASURED —
-/// [`crate::session::pane_binding`]), one case binds wrongly: a pane that ran
-/// `/clear`, whose record still names the predecessor once no live pane holds
-/// or runs that predecessor any more, has the predecessor bound back onto it.
+/// Records follow an in-process switch in Claude Code 2.1.316 and 2.1.317
+/// ([`crate::session::pane_binding`], "The verdict"), so on those builds the
+/// session a pane's record names is the one it runs. On a build whose records
+/// do NOT follow switches, a pane that ran `/clear` keeps naming its
+/// predecessor; once no live pane holds or runs that predecessor, this rule
+/// leaves the pane unbound and rung 2b binds the predecessor back onto it —
+/// authoritatively, so a confirmed bind's supersede closes the row of the
+/// session the pane really runs, and the pane's coord session is re-keyed.
 fn bound_panes(
     open: &[TerminalSessionRecord],
     evidence: &HashMap<String, PaneEvidence>,
@@ -1545,6 +1557,9 @@ pub async fn run_reconcile_pass(
     } else {
         HashMap::new()
     };
+    // The observation is aged from here, the start of the read: the argv
+    // query and the prescan below must not make it look younger.
+    let read_at = std::time::Instant::now();
     let readings = pane_binding::read_records_off_runtime(
         panes.values().flatten().copied().collect(),
         pane_binding::RECORD_READ_BOUND,
@@ -1553,6 +1568,7 @@ pub async fn run_reconcile_pass(
     let observation = PaneObservation {
         panes,
         sessions: pane_binding::sessions_from_readings(&readings),
+        read_at: Some(read_at),
     };
     let evidence = observation.evidence_map();
 
@@ -2182,6 +2198,7 @@ mod tests {
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
             binding_state: None,
+            placed_strongly: false,
         }
     }
 
@@ -2662,6 +2679,7 @@ mod tests {
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
             binding_state: None,
+            placed_strongly: false,
         };
         store.record_open(phantom);
 
@@ -2858,6 +2876,7 @@ mod tests {
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
             binding_state: None,
+            placed_strongly: false,
         });
 
         let live = vec![pty_anchored("live-term", 4242, 1_000, "C:/repo")];
@@ -2960,6 +2979,7 @@ mod tests {
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
             binding_state: None,
+            placed_strongly: false,
         });
 
         let live = vec![pty_anchored("live-term", 4242, 1_000, "C:/repo")];
@@ -3625,6 +3645,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                     sessions: claude.map(|id| (me, id.to_string())).into_iter().collect(),
+                    read_at: None,
                 };
                 let evidence = observation.evidence_map();
                 let epoch = store.observe_panes(observation);
@@ -3695,22 +3716,26 @@ mod tests {
         }
     }
 
-    /// The 2026-10-25 shape: a bind moved `s-b` off live pane B, which still
-    /// runs it, onto pane A, which runs `s-a` — and `s-a`'s row was superseded
-    /// by the move. (The move is made before any pane evidence exists, as a
-    /// bind from before the guard would have been.) The victim row reads
-    /// `unknown` and is counted ONCE — its session runs in B — then rung 2b
-    /// heals both panes from their own records, and the next pass counts
-    /// nothing.
+    /// The 2026-10-25 shape: rung 3 — a WEAK bind — moved `s-b` off live pane
+    /// B, which still runs it, onto pane A, which runs `s-a`, and `s-a`'s row
+    /// was superseded by the move. (The move is made before any pane evidence
+    /// exists, as a bind from before the guard would have been.) The victim
+    /// row reads `unknown` and is counted ONCE — its session runs in B — then
+    /// rung 2b heals both panes from their own records, and the next pass
+    /// counts nothing.
     #[test]
     fn the_2026_10_25_shape_is_counted_once_and_healed_from_the_records() {
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
         store.record_open(title_rec("s-a", "term-a", Some("T")));
         store.record_open(title_rec("s-b", "term-b", Some("T")));
-        // The wrong move: a confirmed bind of s-b onto A.
-        store.record_open(title_rec("s-b", "term-a", Some("T")));
+        // The wrong move: rung 3's confirmed `observed` bind of s-b onto A.
+        store.record_open(TerminalSessionRecord {
+            origin: Some(ORIGIN_OBSERVED.to_string()),
+            ..title_rec("s-b", "term-a", Some("T"))
+        });
         assert_eq!(store.get("s-a").unwrap().state, "closed");
+        assert!(!store.get("s-b").unwrap().placed_strongly);
         let panes = [("term-a", names("s-a")), ("term-b", names("s-b"))];
         store.attach_pane_evidence(pane_binding::FixedPanes::of(&panes));
         let counters = std::sync::Arc::new(pane_binding::BindingCounters::default());
@@ -3759,6 +3784,64 @@ mod tests {
             "{again:?}"
         );
         assert_eq!((counters.mismatches(), counters.refused_moves()), (1, 0));
+    }
+
+    /// Review M1, case (i), on a build whose records do NOT follow a switch:
+    /// pane B launched `x`, then resumed `s` inside its TUI — B's hook moved
+    /// `s`'s row there, a strong bind — while pane A, which launched `s` and
+    /// has since run `/clear`, still names `s`, and B still names `x`. `s`
+    /// reads `unknown`, counted once for the episode, but stays on B pass after
+    /// pass: a row a strong bind placed holds its session against A's
+    /// provider-registry rung, so nothing moves it back.
+    #[test]
+    fn a_row_a_hook_placed_is_never_moved_back_by_a_stale_record() {
+        let dir = tempdir().unwrap();
+        let panes = [("term-a", names("s")), ("term-b", names("x"))];
+        let (store, counters) = store_with_panes(dir.path(), &panes);
+        // A launched `s`; its `/clear` made `s2` there (hook-reported).
+        store.record_open(title_rec("s", "term-a", Some("T")));
+        store.record_open(TerminalSessionRecord {
+            adopted_from: Some("s".to_string()),
+            ..title_rec("s2", "term-a", Some("T"))
+        });
+        // B launched `x`, then resumed `s` inside its TUI: B's hook moves `s`.
+        store.record_open(title_rec("x", "term-b", Some("T")));
+        assert_eq!(
+            store.record_open_checked(title_rec("s", "term-b", Some("T"))),
+            RecordOpenOutcome::Recorded
+        );
+        assert!(store.get("s").unwrap().placed_strongly);
+        let (live, _) = two_panes_one_workdir();
+
+        for _ in 0..3 {
+            let actions = run_reconcile(
+                &store,
+                &live,
+                &ProcessSnapshot::default(),
+                &transcripts(&["s", "s2", "x"], 1_500),
+                &no_cmdlines(),
+                &evidence(&panes),
+            );
+            assert!(
+                !actions.iter().any(|a| matches!(
+                    a,
+                    ReconcileAction::Bind { session_id, .. } if session_id == "s"
+                )),
+                "{actions:?}"
+            );
+            let row = store.get("s").unwrap();
+            assert_eq!(
+                (row.state.as_str(), row.terminal_id.as_str()),
+                ("open", "term-b"),
+                "{actions:?}"
+            );
+        }
+        assert_eq!(
+            store.get("s").unwrap().binding_state,
+            Some(BindingState::Unknown)
+        );
+        assert_eq!(counters.mismatches(), 1, "one episode, counted once");
+        assert_eq!(counters.refused_moves(), 0);
     }
 
     /// Round-3 review L1: a confirmed row on a DEAD terminal does not stop the

@@ -30,9 +30,12 @@ use crate::session::session_lifecycle_store::SessionLifecycleStore;
 const WORKDIR: &str = "/work/two-panes";
 const S_A: &str = "aaaaaaaa-0000-4000-8000-00000000000a";
 const S_B: &str = "bbbbbbbb-0000-4000-8000-00000000000b";
-// Each is above 2^22 = 4_194_304, Linux's PID_MAX_LIMIT, and none is divisible
-// by four, so the pass's argv query finds nothing — as for a `claude` started
-// without an id.
+// Each is above 2^22 = 4_194_304, Linux's PID_MAX_LIMIT, so no Linux process
+// holds them. On another OS a process holding one would still give the pass's
+// argv rung nothing unless its command line carried a UUID-shaped
+// `--session-id`, `--resume` or `-r` value — all that rung reads
+// (`parse_session_id_from_cmdline`). So the argv query finds nothing — as for
+// a `claude` started without an id.
 const SHELL_A: u32 = 4_200_001;
 const CLAUDE_A: u32 = 4_200_002;
 const SHELL_B: u32 = 4_200_005;

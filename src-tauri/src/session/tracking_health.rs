@@ -844,6 +844,12 @@ pub struct TrackingHealthPass {
     pub report: TrackingHealthReport,
     /// The open lifecycle records `report` was cross-referenced against.
     pub open_records: Vec<TerminalSessionRecord>,
+    /// The binding verdicts the CURRENT pane observation produced, by session
+    /// id ([`SessionLifecycleStore::current_binding_verdicts`]) — the only ones
+    /// any surface of this pass serves: `processes[]` here, and `sessions[]`
+    /// from `open_records`. A verdict a record stored from an older
+    /// observation is not in it.
+    pub current_verdicts: HashMap<String, BindingState>,
 }
 
 /// Reference instant for the PID-reuse guard: the runner primary's OWN boot
@@ -1418,12 +1424,14 @@ pub async fn compute(
     // the CURRENT observation produced is served: a stalled pass, a verdict
     // from an older observation or no oracle leaves the process unchecked,
     // i.e. today's attribution.
-    report.attach_binding_verdicts(&store.current_binding_verdicts());
+    let current_verdicts = store.current_binding_verdicts();
+    report.attach_binding_verdicts(&current_verdicts);
     report.attach_status_since(session_status_since_by_id);
 
     Some(TrackingHealthPass {
         report,
         open_records: open,
+        current_verdicts,
     })
 }
 
@@ -1598,6 +1606,7 @@ mod tests {
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
             binding_state: None,
+            placed_strongly: false,
         }
     }
 

@@ -24,9 +24,9 @@
 //! authoritatively and registered with coord. Otherwise the record is
 //! PROVISIONAL — `reconciled`, unconfirmed: it supersedes nothing, and the
 //! store's binding guard never lets such a weak bind take a row from a live
-//! pane that runs the session or cannot be read — pending the pane's own
-//! registry record, which the reconcile pass binds from (rung 2b) if the
-//! session really runs there.
+//! pane whose own record names the session — pending the pane's own registry
+//! record, which the reconcile pass binds from (rung 2b) if the session really
+//! runs there.
 
 use std::sync::Arc;
 
@@ -293,6 +293,7 @@ pub(crate) fn apply_typed_resume_effects(
                 gate_consuming_device_id: None,
                 gate_bound_boot_ms: None,
                 binding_state: None,
+                placed_strongly: false,
             };
             let outcome = if launched {
                 Some(store.record_open_checked(rec))

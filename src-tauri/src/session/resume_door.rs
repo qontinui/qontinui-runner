@@ -879,6 +879,7 @@ mod tests {
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
             binding_state: None,
+            placed_strongly: false,
         }
     }
 

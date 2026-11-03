@@ -1384,6 +1384,7 @@ pub fn terminal_session_record_open(
         gate_consuming_device_id: None,
         gate_bound_boot_ms: None,
         binding_state: None,
+        placed_strongly: false,
     };
     let session_id = record.claude_session_id.clone();
     let outcome = store.record_open_checked(record);
@@ -3043,6 +3044,7 @@ async fn poll_and_record_session<F>(
                 gate_consuming_device_id: gate_consuming_device_id.clone(),
                 gate_bound_boot_ms,
                 binding_state: None,
+                placed_strongly: false,
             };
             match store.record_open_checked(record) {
                 RecordOpenOutcome::Recorded => info!(
@@ -3076,10 +3078,10 @@ async fn poll_and_record_session<F>(
 /// account-migration `--resume <id>` in the spawn argv) the instant the PTY
 /// exists — no transcript mtime race to lose.
 ///
-/// Returns what the store did: a record that would move a session's row off a
-/// live pane still running it is refused (see
-/// [`SessionLifecycleStore::record_open_checked`]); an account migration declares its
-/// move first ([`SessionLifecycleStore::declare_move`]).
+/// Returns what the store did ([`SessionLifecycleStore::record_open_checked`]).
+/// A pinned record is authoritative — a strong bind — so the binding guard
+/// never refuses it: it lands even off a live pane still running the session,
+/// which is the move an account migration's respawn makes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_pinned_session_open(
     store: &SessionLifecycleStore,
@@ -3157,6 +3159,7 @@ pub(crate) fn record_pinned_session_open(
         gate_consuming_device_id,
         gate_bound_boot_ms,
         binding_state: None,
+        placed_strongly: false,
     });
     if outcome != RecordOpenOutcome::Recorded {
         warn!(
@@ -3480,6 +3483,7 @@ mod tests {
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
             binding_state: None,
+            placed_strongly: false,
         }
     }
 

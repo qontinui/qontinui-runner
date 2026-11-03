@@ -204,7 +204,7 @@ use qontinui_runner_lib::wind_down::{self, WindDownView};
 /// What the subtree cross-reference structurally cannot see. Emitted verbatim
 /// on every response so a reader is never invited to infer omniscience from a
 /// confident-looking count.
-pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree and in every PTY holder pane's process tree (see `holder_sessions`) — each process, so a nested subagent counts alongside the agent that spawned it (`nestedUnderClaude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `hasLiveChildren` is a hint that a child process signalling WORK is attached right now (a shell, a nested `claude`, an unreadable image, or any child spawned after the session's first 60 s — a stdio MCP server the session started at boot is infrastructure and does not count), never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `sessionStatus` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; `sessionStatusSince` is when coord's row entered that `sessionStatus` (coord's `state_started_at`, served as `since`), in unix MILLISECONDS — for `finished` it is coord's finish time, which a later finish moves again ONLY on a coord build carrying plan `2026-10-23-coord-records-a-session-finished-but-not-when-so-a-revival-cannot-be-told-from-a-re-finish` Phase 2 (an older coord moves it only when the status actually changes, so after a re-finish of a row coord still reads `finished` it can lag the runner's `finishedAt`) — and it is null wherever `sessionStatus` is null and wherever coord served no `since`, null meaning UNKNOWN, never \"now\"; it is coord's time BESIDE the runner's own `finishedAt` marker, never a replacement for it; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `bindingState` on each top-level terminal-hosted process is the verdict the reconcile pass stored for the row that process is attributed to (that row's `sessions[].bindingState`, judged from the live panes' own Claude Code records, `sessions/<pid>.json`), served ONLY when the current pane observation produced it — `matched` when the pane's own record names the row's session, `unknown` when another live pane's record names it (the attribution is then ambiguous: `sessionId` is null, no coord status applies, and it blocks), and the key is ABSENT when not checked (a nested subagent, a non-terminal-hosted process, an ambiguous attribution, a row the current observation gave no verdict — its pane's record names another session that runs nowhere else, names nothing, or cannot be read; the row moved since — a verdict from an older observation, or no reconcile pass in about the last two minutes; this check reads no record of its own; never read as agreement); `sessions[].bindingState` is the row's own verdict, and a row reading `unknown` names no `terminal_id`; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a wind-down eligibility report — THIS ENDPOINT closes nothing, but the wind-down executor acts on the same verdict in two arms: its drain arm closes any `eligible` session WHILE COORD HOLDS THIS DEVICE DRAINED, and its `finished_close` arm closes a finished TERMINAL session after grace with NO drain at all, once every worktree that session touched is clean and pushed (looping agents and stewards are closed only under a drain); they are computed whether or not the runner is drained, the executor's own extra gates (the drain, the `finished_close` switch and its custody gate, a wall-clock-jump quarantine, the arm's census cadence, and a per-tick close budget) are NOT reflected in `eligibility`, so `eligible` is a candidacy and never a prediction; `windDown.custody` appears only when the `finished_close` arm judged that session on its latest pass and is that pass's verdict (`clean` / `dirty` / `unknown`, with the worktree it is about), never a probe made by this request — absent means \"not judged\", never \"clean\"; and a grid-idle window is only as old as the first observation that saw the pane idle with no grid change since; `live_claude.by_activity` classifies the same `total` processes as working / idle / stale / unknown from the pane observation where decisive, else Claude Code's internal `sessions/<pid>.json` record (a `busy`/`shell` status is `working` only with a transcript message in the last 30 min, else `stale`) — it is REPORT-ONLY, the verdict never reads it, an `idle` session still dies on a restart, and a missing, unparseable, ambiguous or unrecognised record is `unknown`, never `idle`; `holder_sessions` adds what the PTY-holder census sees — a pane's `claude` is counted even when its holder has left this runner's subtree, a holder that holds its lock but does not answer within the census deadline is `unknown` and one with no common protocol version is `incompatible`, and each such PANE blocks a restart whatever processes it shows (`live_claude.holder_unresolved_panes`); a holder pane is NOT treated as surviving a restart";
+pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree and in every PTY holder pane's process tree (see `holder_sessions`) — each process, so a nested subagent counts alongside the agent that spawned it (`nestedUnderClaude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `hasLiveChildren` is a hint that a child process signalling WORK is attached right now (a shell, a nested `claude`, an unreadable image, or any child spawned after the session's first 60 s — a stdio MCP server the session started at boot is infrastructure and does not count), never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `sessionStatus` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; `sessionStatusSince` is when coord's row entered that `sessionStatus` (coord's `state_started_at`, served as `since`), in unix MILLISECONDS — for `finished` it is coord's finish time, which a later finish moves again ONLY on a coord build carrying plan `2026-10-23-coord-records-a-session-finished-but-not-when-so-a-revival-cannot-be-told-from-a-re-finish` Phase 2 (an older coord moves it only when the status actually changes, so after a re-finish of a row coord still reads `finished` it can lag the runner's `finishedAt`) — and it is null wherever `sessionStatus` is null and wherever coord served no `since`, null meaning UNKNOWN, never \"now\"; it is coord's time BESIDE the runner's own `finishedAt` marker, never a replacement for it; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `bindingState` on each top-level terminal-hosted process is the verdict the reconcile pass stored for the row that process is attributed to (that row's `sessions[].bindingState`, judged from the live panes' own Claude Code records, `sessions/<pid>.json`), served ONLY when the current pane observation produced it — `matched` when the pane's own record names the row's session, `unknown` when another live pane's record names it (the attribution is then ambiguous: `sessionId` is null, no coord status applies, and it blocks), and the key is ABSENT when not checked (a nested subagent, a non-terminal-hosted process, an ambiguous attribution, a row the current observation gave no verdict — its pane's record names another session that runs nowhere else, names nothing, or cannot be read; the row moved since — a verdict from an older observation, or no reconcile pass in about the last two minutes; this check reads no record of its own; never read as agreement); `sessions[].bindingState` is the row's verdict under the same rule — served only when the current pane observation produced it — and a row whose current verdict is `unknown` names no `terminal_id`; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a wind-down eligibility report — THIS ENDPOINT closes nothing, but the wind-down executor acts on the same verdict in two arms: its drain arm closes any `eligible` session WHILE COORD HOLDS THIS DEVICE DRAINED, and its `finished_close` arm closes a finished TERMINAL session after grace with NO drain at all, once every worktree that session touched is clean and pushed (looping agents and stewards are closed only under a drain); they are computed whether or not the runner is drained, the executor's own extra gates (the drain, the `finished_close` switch and its custody gate, a wall-clock-jump quarantine, the arm's census cadence, and a per-tick close budget) are NOT reflected in `eligibility`, so `eligible` is a candidacy and never a prediction; `windDown.custody` appears only when the `finished_close` arm judged that session on its latest pass and is that pass's verdict (`clean` / `dirty` / `unknown`, with the worktree it is about), never a probe made by this request — absent means \"not judged\", never \"clean\"; and a grid-idle window is only as old as the first observation that saw the pane idle with no grid change since; `live_claude.by_activity` classifies the same `total` processes as working / idle / stale / unknown from the pane observation where decisive, else Claude Code's internal `sessions/<pid>.json` record (a `busy`/`shell` status is `working` only with a transcript message in the last 30 min, else `stale`) — it is REPORT-ONLY, the verdict never reads it, an `idle` session still dies on a restart, and a missing, unparseable, ambiguous or unrecognised record is `unknown`, never `idle`; `holder_sessions` adds what the PTY-holder census sees — a pane's `claude` is counted even when its holder has left this runner's subtree, a holder that holds its lock but does not answer within the census deadline is `unknown` and one with no common protocol version is `incompatible`, and each such PANE blocks a restart whatever processes it shows (`live_claude.holder_unresolved_panes`); a holder pane is NOT treated as surviving a restart";
 
 /// `drain.covers` — the constant, honest scope of `POST /drain`.
 ///
@@ -242,10 +242,13 @@ pub struct SessionEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     /// The row's [`BindingState`] (terminal plane only): `"matched"` /
-    /// `"unknown"`, absent while unchecked and for every AI-plane entry. Spelled
-    /// `bindingState` — the same key `GET /sessions/history` rows and
-    /// `processes[]` entries carry — so a consumer matches one name on every
-    /// surface. Plan `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`.
+    /// `"unknown"`, served only while the CURRENT pane observation produced it
+    /// — absent while unchecked, for a verdict from an older observation, and
+    /// for every AI-plane entry. A current `unknown` withholds `terminal_id`.
+    /// Spelled `bindingState` — the same key `GET /sessions/history` rows and
+    /// `processes[]` entries carry, with the same currency rule — so a
+    /// consumer matches one name on every surface. Plan
+    /// `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`.
     #[serde(rename = "bindingState", skip_serializing_if = "Option::is_none")]
     pub binding_state: Option<BindingState>,
 }
@@ -593,7 +596,11 @@ fn oldest_process(procs: &[LiveClaudeProcess]) -> Option<i64> {
 /// Shape the terminal plane from one [`tracking_health`] pass.
 ///
 /// `sessions` is the open records MINUS the pass's `tracked_dead` set (a stale
-/// row masquerading as a restorable session is not live work).
+/// row masquerading as a restorable session is not live work). Each serves
+/// the verdict `current` holds for it (the pass's
+/// [`crate::session::session_lifecycle_store::SessionLifecycleStore::current_binding_verdicts`]),
+/// and nothing for a verdict the row stored from an older observation; a
+/// current `unknown` withholds its terminal.
 ///
 /// ⚠ `count` is the pass's **`terminal_hosted`** class, not `live_claude_total`.
 /// Before 2026-09-07 it was the total, which meant a box whose every live
@@ -604,6 +611,7 @@ fn oldest_process(procs: &[LiveClaudeProcess]) -> Option<i64> {
 pub fn terminal_plane_from(
     report: &TrackingHealthReport,
     open_records: &[TerminalSessionRecord],
+    current: &HashMap<String, BindingState>,
     now_ms: i64,
 ) -> TerminalPlane {
     let dead: std::collections::HashSet<&str> = report
@@ -616,14 +624,15 @@ pub fn terminal_plane_from(
         .iter()
         .filter(|r| !dead.contains(r.claude_session_id.as_str()))
         .map(|r| {
-            let unevidenced = r.binding_state == Some(BindingState::Unknown);
+            let binding_state = current.get(&r.claude_session_id).copied();
+            let unevidenced = binding_state == Some(BindingState::Unknown);
             SessionEntry {
                 id: r.claude_session_id.clone(),
                 age_s: age_s_from(r.opened_at, now_ms),
                 state: r.state.clone(),
                 terminal_id: (!unevidenced).then(|| r.terminal_id.clone()),
                 title: r.title.clone(),
-                binding_state: r.binding_state,
+                binding_state,
             }
         })
         .collect();
@@ -1422,7 +1431,7 @@ pub async fn restart_readiness_handler(
 
     let terminal = pass
         .as_ref()
-        .map(|p| terminal_plane_from(&p.report, &p.open_records, now_ms));
+        .map(|p| terminal_plane_from(&p.report, &p.open_records, &p.current_verdicts, now_ms));
     let headless = pass.as_ref().map(|p| headless_plane_from(&p.report));
     let holder = pass.as_ref().map(|p| holder_plane_from(&p.report));
     let totals = pass
@@ -1553,6 +1562,7 @@ mod tests {
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
             binding_state: None,
+            placed_strongly: false,
         }
     }
 
@@ -1596,10 +1606,11 @@ mod tests {
 
     /// A census pass with every class empty — an idle box.
     /// Plan `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`: a
-    /// session row whose pane's own `claude` records ANOTHER session serves
+    /// session row whose session currently runs in ANOTHER pane serves
     /// `bindingState: "unknown"` and names no terminal — the census never pairs
     /// a session with a pane that does not run it. A matched row serves both;
-    /// an unchecked row serves its terminal and no `bindingState` key.
+    /// a row with no CURRENT verdict serves its terminal and no `bindingState`
+    /// key, whatever it stored.
     #[test]
     fn a_session_its_pane_contradicts_names_no_terminal_in_the_census() {
         use crate::session::session_lifecycle_store::BindingState;
@@ -1612,9 +1623,16 @@ mod tests {
         let records = vec![
             with_state("s-wrong", "t-a", Some(BindingState::Unknown)),
             with_state("s-right", "t-b", Some(BindingState::Matched)),
-            with_state("s-unchecked", "t-c", None),
+            // Stored, but no current observation produced it.
+            with_state("s-unchecked", "t-c", Some(BindingState::Unknown)),
         ];
-        let plane = terminal_plane_from(&empty_report(now_ms), &records, now_ms);
+        let current: HashMap<String, BindingState> = [
+            ("s-wrong".to_string(), BindingState::Unknown),
+            ("s-right".to_string(), BindingState::Matched),
+        ]
+        .into_iter()
+        .collect();
+        let plane = terminal_plane_from(&empty_report(now_ms), &records, &current, now_ms);
         let wire = serde_json::to_value(&plane).unwrap();
         let entry = |id: &str| {
             wire["sessions"]
@@ -1635,6 +1653,92 @@ mod tests {
         let unchecked = entry("s-unchecked");
         assert!(unchecked.get("bindingState").is_none(), "{unchecked}");
         assert_eq!(unchecked["terminal_id"], "t-c", "{unchecked}");
+    }
+
+    /// Review M2: `sessions[]` and `GET /sessions/history` serve a row's
+    /// verdict only while the CURRENT pane observation produced it — as
+    /// `processes[]` does. A `matched` (and an `unknown`) reloaded from disk
+    /// reads absent on both surfaces, its terminal served, until a pass judges
+    /// it; then both are served, and only the current `unknown` withholds its
+    /// terminal.
+    #[test]
+    fn a_reloaded_verdict_reads_absent_on_both_surfaces_until_a_pass_judges_it() {
+        use crate::session::pane_binding::{LivePaneRegistry, PaneObservation};
+        use crate::session::past_sessions::{build_past_sessions, PastSessionsOpts};
+        use crate::session::session_lifecycle_store::{BindingState, SessionLifecycleStore};
+        let now_ms = 1_800_000_000_000;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let judge = |store: &SessionLifecycleStore| {
+            let epoch = store.observe_panes(PaneObservation::default());
+            let _ = store.set_binding_state("s-matched", "t-a", BindingState::Matched, epoch);
+            let _ = store.set_binding_state("s-unknown", "t-b", BindingState::Unknown, epoch);
+        };
+        {
+            let store = SessionLifecycleStore::open(&path).unwrap();
+            store.attach_pane_evidence(std::sync::Arc::new(LivePaneRegistry::new()));
+            store.record_open(record("s-matched", "t-a", now_ms - 60_000));
+            store.record_open(record("s-unknown", "t-b", now_ms - 60_000));
+            judge(&store);
+        }
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.attach_pane_evidence(std::sync::Arc::new(LivePaneRegistry::new()));
+        let serve = |store: &SessionLifecycleStore| {
+            let plane = terminal_plane_from(
+                &empty_report(now_ms),
+                &store.open_records(),
+                &store.current_binding_verdicts(),
+                now_ms,
+            );
+            let sessions = serde_json::to_value(&plane).unwrap()["sessions"].clone();
+            let history = build_past_sessions(
+                store,
+                &dir.path().join("no-snapshot-history.jsonl"),
+                &PastSessionsOpts {
+                    include_shells: true,
+                    ..Default::default()
+                },
+            );
+            (sessions, history)
+        };
+        let entry = |sessions: &serde_json::Value, id: &str| {
+            sessions
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["id"] == id)
+                .unwrap()
+                .clone()
+        };
+
+        assert_eq!(
+            store.get("s-matched").unwrap().binding_state,
+            Some(BindingState::Matched),
+            "precondition: the reloaded row still stores its verdict"
+        );
+        let (sessions, history) = serve(&store);
+        for (id, terminal) in [("s-matched", "t-a"), ("s-unknown", "t-b")] {
+            let served = entry(&sessions, id);
+            assert!(served.get("bindingState").is_none(), "{served}");
+            assert_eq!(served["terminal_id"], terminal, "{served}");
+            let past = history.iter().find(|p| p.claude_session_id == id).unwrap();
+            assert_eq!(past.binding_state, None, "{id}");
+            assert_eq!(past.terminal_id.as_deref(), Some(terminal), "{id}");
+        }
+
+        judge(&store);
+        let (sessions, history) = serve(&store);
+        let matched = entry(&sessions, "s-matched");
+        assert_eq!(matched["bindingState"], "matched", "{matched}");
+        assert_eq!(matched["terminal_id"], "t-a", "{matched}");
+        let unknown = entry(&sessions, "s-unknown");
+        assert_eq!(unknown["bindingState"], "unknown", "{unknown}");
+        assert!(unknown.get("terminal_id").is_none(), "{unknown}");
+        let past = |id: &str| history.iter().find(|p| p.claude_session_id == id).unwrap();
+        assert_eq!(past("s-matched").binding_state, Some(BindingState::Matched));
+        assert_eq!(past("s-matched").terminal_id.as_deref(), Some("t-a"));
+        assert_eq!(past("s-unknown").binding_state, Some(BindingState::Unknown));
+        assert_eq!(past("s-unknown").terminal_id, None);
     }
 
     fn empty_report(now_ms: i64) -> TrackingHealthReport {
@@ -1670,7 +1774,12 @@ mod tests {
         now_ms: i64,
     ) -> RestartReadiness {
         build_verdict(
-            Some(terminal_plane_from(report, open_records, now_ms)),
+            Some(terminal_plane_from(
+                report,
+                open_records,
+                &HashMap::new(),
+                now_ms,
+            )),
             Some(headless_plane_from(report)),
             Some(holder_plane_from(report)),
             ai,
@@ -2091,7 +2200,7 @@ mod tests {
             now_ms,
             &crate::session::tracking_health::HolderCensus::default(),
         );
-        let t = terminal_plane_from(&report, &records, now_ms);
+        let t = terminal_plane_from(&report, &records, &HashMap::new(), now_ms);
 
         // POST-SPLIT: `count` is terminal-hosted ONLY — pid 10. The untracked
         // stray (pid 20) is no longer folded in here; it stays in
@@ -2480,7 +2589,7 @@ mod tests {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let report = empty_report(now_ms);
         let v = build_verdict(
-            Some(terminal_plane_from(&report, &[], now_ms)),
+            Some(terminal_plane_from(&report, &[], &HashMap::new(), now_ms)),
             None,
             None,
             Some(ai_plane_from(&[], &[], now_ms)),
@@ -2597,8 +2706,13 @@ mod tests {
 
         // `root_count` IS correct: it lives on TerminalPlane, which has no
         // `rename_all`.
-        let plane =
-            serde_json::to_value(terminal_plane_from(&empty_report(now_ms), &[], now_ms)).unwrap();
+        let plane = serde_json::to_value(terminal_plane_from(
+            &empty_report(now_ms),
+            &[],
+            &HashMap::new(),
+            now_ms,
+        ))
+        .unwrap();
         assert!(plane.get("root_count").is_some(), "{plane}");
         assert!(BOUNDARY.contains("`root_count`"));
 
@@ -3081,7 +3195,12 @@ mod tests {
         let (snap, records, tpids) = three_terminal_sessions(now_ms);
         let report = evaluate_with_status(&snap, &records, &tpids, &HashMap::new(), now_ms);
         let v = build_verdict(
-            Some(terminal_plane_from(&report, &records, now_ms)),
+            Some(terminal_plane_from(
+                &report,
+                &records,
+                &HashMap::new(),
+                now_ms,
+            )),
             Some(headless_plane_from(&report)),
             Some(holder_plane_from(&report)),
             Some(ai_plane_from(&[], &[], now_ms)),
@@ -3133,7 +3252,7 @@ mod tests {
             ]),
             now_ms,
         );
-        let t = terminal_plane_from(&report, &records, now_ms);
+        let t = terminal_plane_from(&report, &records, &HashMap::new(), now_ms);
         let json = serde_json::to_value(&t).unwrap();
         let procs = json["processes"].as_array().expect("processes");
         assert_eq!(procs.len(), 3);
@@ -3552,7 +3671,7 @@ mod tests {
         let totals = live_claude_totals_observed(&one, &idle_everywhere);
         assert_eq!(totals.by_activity.idle, 1);
         let v = build_verdict(
-            Some(terminal_plane_from(&one, &[], ACT_NOW)),
+            Some(terminal_plane_from(&one, &[], &HashMap::new(), ACT_NOW)),
             Some(headless_plane_from(&one)),
             Some(holder_plane_from(&one)),
             Some(ai_plane_from(&[], &[], ACT_NOW)),
@@ -3569,7 +3688,7 @@ mod tests {
     fn by_activity_serializes_under_live_claude_in_the_modules_snake_case() {
         let report = activity_report();
         let v = build_verdict(
-            Some(terminal_plane_from(&report, &[], ACT_NOW)),
+            Some(terminal_plane_from(&report, &[], &HashMap::new(), ACT_NOW)),
             Some(headless_plane_from(&report)),
             Some(holder_plane_from(&report)),
             Some(ai_plane_from(&[], &report.ai_plane, ACT_NOW)),
@@ -4126,7 +4245,7 @@ mod tests {
 
         let empty = empty_report(now_ms);
         let v = build_verdict(
-            Some(terminal_plane_from(&empty, &[], now_ms)),
+            Some(terminal_plane_from(&empty, &[], &HashMap::new(), now_ms)),
             Some(headless_plane_from(&empty)),
             None,
             Some(ai_plane_from(&[], &[], now_ms)),

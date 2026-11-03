@@ -1378,6 +1378,7 @@ fn registry_record_from_restore_payload(
         gate_consuming_device_id: None,
         gate_bound_boot_ms: None,
         binding_state: None,
+        placed_strongly: false,
     }
 }
 
