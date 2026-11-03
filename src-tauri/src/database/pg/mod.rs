@@ -1073,6 +1073,61 @@ impl PgDb {
         .await
         .map_err(|e| format!("scheduled_tasks.conditions self-heal failed: {}", e))?;
 
+        // project.scheduled_tasks managed key + per-task timezone. AUTHORED by
+        // qontinui-web alembic revision `recurring_agents_01_coord_tables`
+        // (plan 2026-10-29-recurring-agents-declared-in-coord-reconciled-by-runner
+        // Phase 2): six nullable, undefaulted columns — `managed_source`,
+        // `managed_tenant_id` (UUID), `managed_agent`, `managed_version`,
+        // `managed_digest`, `timezone` — and the UNIQUE partial index
+        // `uq_scheduled_tasks_managed_key`. Mirrored here for the same reason
+        // as `conditions` above: an embedded Postgres never runs alembic, and
+        // every scheduled-task query now names these columns. Same gating:
+        // the ALTER runs only when the table exists AND a column is missing,
+        // the CREATE INDEX only when the table exists AND the index is absent,
+        // so a warm boot takes no lock. The index spells alembic's predicate
+        // EXACTLY — the managed upsert's `ON CONFLICT` (MANAGED_KEY_CONFLICT in
+        // `scheduler.rs`) must infer it as the arbiter. Not CONCURRENTLY: a DO
+        // block is a transaction, and an embedded install's table is small.
+        conn.batch_execute(
+            "DO $$
+             BEGIN
+               IF EXISTS (
+                 SELECT 1 FROM information_schema.tables
+                 WHERE table_schema = 'project' AND table_name = 'scheduled_tasks'
+               ) AND (
+                 SELECT count(*) FROM information_schema.columns
+                 WHERE table_schema = 'project' AND table_name = 'scheduled_tasks'
+                   AND column_name IN ('managed_source', 'managed_tenant_id',
+                                       'managed_agent', 'managed_version',
+                                       'managed_digest', 'timezone')
+               ) < 6 THEN
+                 ALTER TABLE project.scheduled_tasks
+                     ADD COLUMN IF NOT EXISTS managed_source TEXT,
+                     ADD COLUMN IF NOT EXISTS managed_tenant_id UUID,
+                     ADD COLUMN IF NOT EXISTS managed_agent TEXT,
+                     ADD COLUMN IF NOT EXISTS managed_version INTEGER,
+                     ADD COLUMN IF NOT EXISTS managed_digest TEXT,
+                     ADD COLUMN IF NOT EXISTS timezone TEXT;
+               END IF;
+               IF EXISTS (
+                 SELECT 1 FROM information_schema.tables
+                 WHERE table_schema = 'project' AND table_name = 'scheduled_tasks'
+               ) AND NOT EXISTS (
+                 SELECT 1 FROM pg_indexes
+                 WHERE schemaname = 'project'
+                   AND indexname = 'uq_scheduled_tasks_managed_key'
+               ) THEN
+                 CREATE UNIQUE INDEX IF NOT EXISTS uq_scheduled_tasks_managed_key
+                     ON project.scheduled_tasks (managed_source, managed_tenant_id, managed_agent)
+                     WHERE managed_source IS NOT NULL
+                       AND managed_tenant_id IS NOT NULL
+                       AND managed_agent IS NOT NULL;
+               END IF;
+             END $$;",
+        )
+        .await
+        .map_err(|e| format!("scheduled_tasks managed-key self-heal failed: {}", e))?;
+
         // spec-multi-app Stream E.1: backfill `app_id` onto
         // atlas_managed.proposal_events. The table predates the multi-tenant
         // model, so existing rows are migrated under the bootstrap app_id

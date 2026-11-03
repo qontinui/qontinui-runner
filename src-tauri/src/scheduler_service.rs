@@ -24,9 +24,10 @@
 use crate::commands::AppState;
 use crate::database::pg::PgDb;
 use crate::scheduler::{
-    compute_next_run, condition_status_default, CatchUpPolicy, ConditionStatus, RepositoryWatch,
-    ScheduleExpression, ScheduleZone, ScheduledTask, ScheduledTaskExt, ScheduledTaskStatus,
-    ScheduledTaskType, TaskExecutionRecord, TaskExecutionRecordExt,
+    compute_task_next_run, condition_status_default, task_next_run_rfc3339, CatchUpPolicy,
+    ConditionStatus, RepositoryWatch, ScheduleExpression, ScheduleZone, ScheduledTask,
+    ScheduledTaskExt, ScheduledTaskStatus, ScheduledTaskType, TaskExecutionRecord,
+    TaskExecutionRecordExt,
 };
 use chrono::{DateTime, Utc};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -373,7 +374,7 @@ impl SchedulerService {
 
         for task in &tasks {
             let next = if task.enabled {
-                compute_next_run(&task.schedule, now, zone).map(|dt| dt.to_rfc3339())
+                task_next_run_rfc3339(task, now, zone)
             } else {
                 None
             };
@@ -1061,7 +1062,13 @@ impl SchedulerService {
 
         let now = Utc::now();
         let zone = self.schedule_zone().await;
-        let normal_next = compute_next_run(&task.schedule, now, zone);
+        let normal_next = match compute_task_next_run(&task, now, zone) {
+            Ok(next) => next,
+            Err(e) => {
+                error!("apply_launch_failure_backoff: task {task_id} has an unusable {e}; backing off without a scheduled next run");
+                None
+            }
+        };
         let next_run = compute_launch_failed_next_run(normal_next, backoff, now);
         let backoff_seconds = backoff.map(|d| d.num_seconds()).unwrap_or(0);
         warn!(
@@ -1580,7 +1587,7 @@ impl SchedulerService {
 
         let now = chrono::Utc::now();
         let zone = self.schedule_zone().await;
-        let next = compute_next_run(&task.schedule, now, zone).map(|dt| dt.to_rfc3339());
+        let next = task_next_run_rfc3339(&task, now, zone);
 
         match pg
             .update_task_next_run(task_id, next.as_deref(), &task.modified_at)
@@ -2301,7 +2308,7 @@ fn plan_catch_up_actions(
 /// - `Cron`: uses [`cron::Schedule::after(&from)`] to seek strictly past
 ///   `from`, then takes while `t <= to`, evaluating the expression in
 ///   `zone` (see [`ScheduleZone`]). Times are returned in `Utc`, matching
-///   the runner's convention (see [`compute_next_run`]).
+///   the runner's convention (see [`compute_next_run`](crate::scheduler::compute_next_run)).
 /// - `Interval(secs)`: synthesises slots at `from + secs`, `from + 2*secs`,
 ///   …, while each is `<= to`.
 /// - `Once(iso)`: returns the single parsed timestamp if it lies in
@@ -2449,7 +2456,20 @@ impl SchedulerService {
                 continue;
             }
 
-            if let Err(e) = self.clone().reconcile_task(&task, now, zone).await {
+            // The task's own zone ahead of the scheduler's (plan 2026-10-29
+            // D5). An unusable one skips the catch-up for this task rather
+            // than walking its slots in a zone it was not declared in.
+            let task_zone = match ScheduleZone::for_task(task.timezone.as_deref(), zone) {
+                Ok(z) => z,
+                Err(e) => {
+                    error!(
+                        "Scheduler reconciler: task '{}' (id={}) has an unusable {}; not reconciled",
+                        task.name, task.id, e
+                    );
+                    continue;
+                }
+            };
+            if let Err(e) = self.clone().reconcile_task(&task, now, task_zone).await {
                 error!(
                     "Scheduler reconciler: task '{}' (id={}) failed: {}",
                     task.name, task.id, e
@@ -3513,7 +3533,9 @@ mod tests {
     // policy and are unit-tested here without a database.
     // ========================================================================
 
-    use crate::scheduler::{schedule_expression_default, scheduled_task_type_default};
+    use crate::scheduler::{
+        compute_next_run, schedule_expression_default, scheduled_task_type_default,
+    };
 
     fn fixture_task(base_backoff: u32) -> ScheduledTask {
         let mut task = ScheduledTask::new(

@@ -1779,6 +1779,7 @@ PUT /reflection-fixes/{id}/effectiveness update_fix_effectiveness_handler
 PUT /reflection/settings update_reflection_settings_handler
 PUT /saved-api-requests/{id} update_saved_api_request
 PUT /scheduler/settings update_scheduler_settings
+PUT /scheduler/tasks/by-key/{source}/{tenant_id}/{agent} upsert_managed_task
 PUT /scheduler/tasks/{id} update_scheduled_task
 PUT /sessions/{session_id}/review/hunks mark_hunks_handler
 PUT /settings/agentic save_agentic_settings
