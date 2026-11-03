@@ -6,6 +6,13 @@
 //! see — prompts written into ad-hoc worktree directories, and **the edges**,
 //! which only the agent that ran the prompt→plan chain knows.
 //!
+//! An edge may be **one-ended**: a relation in
+//! `writeVocabulary.open_target_relation` (`spawned_followup`) records work an
+//! artifact surfaced and did not do, sent as `from_id` plus `"to_id": null` on
+//! `/plan-library/links` or with neither end inline, and may carry its
+//! `anchors`, `size_class` and `unanchored_reason`, which the web edge route
+//! validates ([`edge_body`] holds the one validator both edge doors call).
+//!
 //! | route | forwards to | requires a nonce |
 //! |---|---|---|
 //! | `POST /plan-library/artifacts` | `POST {web}/api/v1/plan-library` (+ edges) | **yes** |
@@ -122,6 +129,9 @@ use std::sync::{Arc, OnceLock};
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use qontinui_runner_lib::plan_workunit_adapter::body_push::ArtifactUpsert;
+
+// The one edge-body validator and renderer both edge write doors call.
+mod edge_body;
 
 type ApiResult = Result<Json<ApiResponse<Value>>, (StatusCode, Json<ApiResponse<()>>)>;
 
@@ -517,6 +527,8 @@ fn write_capability() -> serde_json::Map<String, Value> {
     // cannot drift from what the door enforces (`relation`, via
     // `EdgeRelation`'s parse) or from what the adapter itself writes (`kind`,
     // via `ArtifactKind`, whose serde-free `as_str()` is the wire string).
+    // Beside them, `open_target_relation`: the subset of `relation` that may
+    // omit both ends, rendered from the constant the edge validator reads.
     m.insert("writeVocabulary".to_string(), write_vocabulary());
     // How a wrong durable write is corrected, per door — the fact an agent
     // otherwise learns only after it has written something it cannot take back.
@@ -532,11 +544,27 @@ fn write_capability() -> serde_json::Map<String, Value> {
 /// no serde derives). One object rather than one sibling key per field, so a
 /// further closed field is one more entry here, not a second key describing the
 /// same concept.
+///
+/// One entry is NOT a body field: `open_target_relation` is the subset of
+/// `relation` whose edge may omit both ends (a one-ended `spawned_followup`),
+/// rendered from [`edge_body::OPEN_TARGET_RELATIONS`], the same constant the
+/// edge validator enforces, so the advert cannot drift from enforcement (D3 of
+/// `2026-11-03-runner-link-door-refuses-an-unowned-follow-up`). Its absence
+/// means a runner build that predates the one-ended form: UNKNOWN, never "the
+/// door refuses".
 fn write_vocabulary() -> Value {
     use qontinui_runner_lib::plan_workunit_adapter::body_push::ArtifactKind;
     let relation: Vec<&str> = EdgeRelation::ALL.iter().map(|r| r.as_str()).collect();
     let kind: Vec<&str> = ArtifactKind::ALL.iter().map(|k| k.as_str()).collect();
-    serde_json::json!({ "relation": relation, "kind": kind })
+    let open_target_relation: Vec<&str> = edge_body::OPEN_TARGET_RELATIONS
+        .iter()
+        .map(|r| r.as_str())
+        .collect();
+    serde_json::json!({
+        "relation": relation,
+        "kind": kind,
+        "open_target_relation": open_target_relation,
+    })
 }
 
 /// The qontinui-web PR that adds the upstream route the loopback
@@ -582,6 +610,10 @@ fn write_correction() -> Value {
 /// where the closed vocabularies are published (`writeVocabulary`) and the
 /// two edge-correction verbs added by Phase 5 of
 /// `2026-09-20-a-recorded-delivery-scope-is-permanent-so-a-mis-declared-phase-is-uncorrectable`.
+/// It also states the one-ended `spawned_followup` form on both edge doors,
+/// and that its dedup key includes `/plan-library/links`' attribution suffix,
+/// whose silent failure is a second follow-up rather than an error (plan
+/// `2026-11-03-runner-link-door-refuses-an-unowned-follow-up`).
 ///
 /// `source_repo` is the one that used to be undiscoverable in the damaging
 /// direction — nothing in the briefing clause or these read routes said it was
@@ -604,7 +636,21 @@ Every closed field the write doors accept is published structured on this same r
 (on `POST /plan-library/artifacts` edges, `POST /plan-library/links` and \
 `PUT /plan-library/links/{id}`), `writeVocabulary.kind` the set an artifact's `kind` must come \
 from — so a caller does not have to trigger a refusal to learn either; a `relation` outside \
-the set is refused 400 at this door before any upstream call. How a wrong write is corrected, \
+the set is refused 400 at this door before any upstream call. \
+`writeVocabulary.open_target_relation` is not a body field: it is the subset of `relation` \
+whose edge may omit the far end. Such an edge (`spawned_followup`) records work an artifact \
+surfaced and did not do, which has no artifact of its own yet: on `POST /plan-library/links` \
+send `from_id` plus `\"to_id\": null` (or no `to_id`); on an inline `edges` entry send neither \
+`to_id` nor `from_id`. It needs a non-blank `note`, judged on the note you sent before this \
+door appends anything, and may carry `anchors`, `size_class` and `unanchored_reason` (on that \
+relation only), whose values the web edge route validates: its 422 is forwarded here \
+verbatim. An open follow-up is idempotent on its trimmed note, and the note \
+`POST /plan-library/links` forwards includes this door's attribution suffix \
+`(agent write by <principal>, session <label>)`, so a re-run records the SAME follow-up only \
+when it sends the same `session_id` from the same principal through the same door; anything \
+else records a second one. Every edge body (`POST /plan-library/links`, inline `edges`, and \
+`PUT` / `DELETE /plan-library/links/{id}`) refuses an unknown key 400, naming it, rather than \
+dropping it and answering 2xx. How a wrong write is corrected, \
 per door, is `writeCorrection` — including whether the web route the two edge-correction \
 verbs below forward to is deployed yet. A recorded edge is meant to be CORRECTABLE, not only \
 appendable: `POST /plan-library/links` re-posting an identical (from_id, to_id, relation) \
@@ -804,18 +850,30 @@ fn relation_refusal(got: &str) -> String {
     } else {
         // Echo a bounded prefix only: the value is caller-supplied and ends up
         // in a response body and logs.
-        const ECHO_MAX_CHARS: usize = 64;
-        let mut echoed: String = got.chars().take(ECHO_MAX_CHARS).collect();
-        if got.chars().count() > ECHO_MAX_CHARS {
-            echoed.push('…');
-        }
+        let echoed = edge_body::bounded_echo(got);
         format!("`relation` `{echoed}` is not one of ({set})")
     }
 }
 
 /// One provenance edge to create alongside an artifact write. Exactly one of
-/// `to_id` / `from_id`, matching the web edge route's own rule.
+/// `to_id` / `from_id`, or, for a relation in
+/// `writeVocabulary.open_target_relation`, neither: a one-ended
+/// `spawned_followup`. That is the web edge route's own rule, checked by
+/// [`edge_body::render`] for every edge BEFORE the artifact upsert.
+///
+/// ## Unknown keys are refused (D4 of `2026-11-03-runner-link-door-refuses-an-unowned-follow-up`)
+///
+/// `deny_unknown_fields` on all four edge bodies (this one, [`LinkRequest`],
+/// [`LinkRetractRequest`], [`LinkCorrectRequest`]), mirroring the web's
+/// `extra="forbid"`. Serde's default dropped an unknown key silently, so a typo
+/// such as `sizeClass` answered 2xx with the field lost; it now answers 400
+/// naming the key. The allowlist is also a confused-deputy guard: this door
+/// forwards under the RUNNER's credential, so passing unknown keys through
+/// would hand any future privileged web field to every nonce holder. Serde
+/// cannot combine `flatten` with `deny_unknown_fields`, which is why the three
+/// follow-up facts are declared here and on [`LinkRequest`] separately.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EdgeSpec {
     #[serde(default)]
     pub to_id: Option<String>,
@@ -826,8 +884,41 @@ pub struct EdgeSpec {
     /// request body is parsed, i.e. before the artifact upsert, so it can never
     /// leave an artifact written without its edges.
     pub relation: EdgeRelation,
+    /// Forwarded unfolded: an inline edge carries no attribution suffix (the
+    /// inline door's provenance is on the artifact's version row instead).
     #[serde(default)]
     pub note: Option<String>,
+    /// The files a `spawned_followup` is about, each
+    /// `{repo, path, line_start?, line_end?, symbol?}`, forwarded as given;
+    /// the web route judges them. `spawned_followup` only.
+    #[serde(default)]
+    pub anchors: Option<Vec<Value>>,
+    /// `trivial` | `small` | `plan_sized` on the web route, which judges it.
+    /// `spawned_followup` only.
+    #[serde(default)]
+    pub size_class: Option<String>,
+    /// Why a `spawned_followup` names no file. Never beside a non-empty
+    /// `anchors`. `spawned_followup` only.
+    #[serde(default)]
+    pub unanchored_reason: Option<String>,
+}
+
+impl EdgeSpec {
+    /// This edge as [`edge_body::render`] takes it. The note R3 judges and the
+    /// note forwarded are the same one, because the inline door folds no
+    /// attribution into an edge note.
+    fn draft(&self) -> edge_body::EdgeDraft<'_> {
+        edge_body::EdgeDraft {
+            relation: self.relation,
+            to_id: self.to_id.as_deref(),
+            from_id: self.from_id.as_deref(),
+            caller_note: self.note.as_deref(),
+            forwarded_note: self.note.as_deref(),
+            anchors: self.anchors.as_deref(),
+            size_class: self.size_class.as_deref(),
+            unanchored_reason: self.unanchored_reason.as_deref(),
+        }
+    }
 }
 
 /// `POST /plan-library/artifacts` body.
@@ -894,28 +985,72 @@ pub struct ArtifactWriteRequest {
     pub edges: Vec<EdgeSpec>,
 }
 
-/// `POST /plan-library/links` body — one edge between two existing artifacts.
+/// `POST /plan-library/links` body — one edge out of an existing artifact:
+/// to another existing artifact, or, for a relation in
+/// `writeVocabulary.open_target_relation`, to none yet (`"to_id": null`, or no
+/// `to_id`), a one-ended `spawned_followup` recording work `from_id` surfaced.
 ///
-/// Flat and symmetric (`from_id` + `to_id`), unlike the web route's
-/// anchor-relative shape, because an agent linking a prompt to the plan it
-/// produced knows both ends and should not have to decide which is "the path
-/// artifact".
+/// Flat (`from_id` + `to_id`), unlike the web route's anchor-relative shape,
+/// because an agent linking a prompt to the plan it produced knows both ends
+/// and should not have to decide which is "the path artifact". `from_id` is the
+/// one the door anchors on: it becomes the upstream path segment, so it is
+/// required and must be an artifact UUID ([`edge_body::link_anchor`]).
+///
+/// Unknown keys are refused, as on every edge body (see [`EdgeSpec`]).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LinkRequest {
     pub from_id: String,
-    pub to_id: String,
+    /// The far end. Omittable (or `null`) only for a relation in
+    /// `writeVocabulary.open_target_relation`.
+    #[serde(default)]
+    pub to_id: Option<String>,
     /// One of [`EdgeRelation::ALL`]; refused at parse otherwise.
     pub relation: EdgeRelation,
+    /// Forwarded with this door's attribution folded in
+    /// ([`provenance_note`]). Required and non-blank on a `spawned_followup`,
+    /// judged BEFORE the fold.
     #[serde(default)]
     pub note: Option<String>,
+    /// As on [`EdgeSpec`]: `spawned_followup` only, judged by the web route.
+    #[serde(default)]
+    pub anchors: Option<Vec<Value>>,
+    /// As on [`EdgeSpec`]: `spawned_followup` only, judged by the web route.
+    #[serde(default)]
+    pub size_class: Option<String>,
+    /// As on [`EdgeSpec`]: `spawned_followup` only, judged by the web route.
+    #[serde(default)]
+    pub unanchored_reason: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
 }
 
+impl LinkRequest {
+    /// This link as [`edge_body::render`] takes it. `from_id` is NOT an end of
+    /// the body: it is the anchor, the upstream path segment
+    /// ([`edge_body::link_anchor`]), so the body's only end is the outgoing
+    /// `to_id`. `forwarded_note` is the attribution fold of the caller's note;
+    /// R3 still judges the caller's own (D6).
+    fn draft<'a>(&'a self, forwarded_note: Option<&'a str>) -> edge_body::EdgeDraft<'a> {
+        edge_body::EdgeDraft {
+            relation: self.relation,
+            to_id: self.to_id.as_deref(),
+            from_id: None,
+            caller_note: self.note.as_deref(),
+            forwarded_note,
+            anchors: self.anchors.as_deref(),
+            size_class: self.size_class.as_deref(),
+            unanchored_reason: self.unanchored_reason.as_deref(),
+        }
+    }
+}
+
 /// `DELETE /plan-library/links/{id}` body — soft-delete a wrongly-recorded
 /// edge. `reason` is required and non-blank: an unexplained retraction is
-/// exactly the silent correction this door exists to prevent.
+/// exactly the silent correction this door exists to prevent. Unknown keys are
+/// refused, as on every edge body (see [`EdgeSpec`]).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LinkRetractRequest {
     pub reason: String,
     /// Same caller-chosen label as [`LinkRequest::session_id`]: folded into
@@ -929,8 +1064,10 @@ pub struct LinkRetractRequest {
 /// `relation` / `to_id` / `note` in place, a correction rather than a fresh
 /// observation. Same [`EdgeRelation`] vocabulary as [`EdgeSpec`]; `to_id` is
 /// omittable only for `spawned_followup`, exactly as on create. `reason` is
-/// required and non-blank, same rationale as [`LinkRetractRequest`].
+/// required and non-blank, same rationale as [`LinkRetractRequest`]. Unknown
+/// keys are refused, as on every edge body (see [`EdgeSpec`]).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LinkCorrectRequest {
     /// One of [`EdgeRelation::ALL`]; refused at parse otherwise.
     pub relation: EdgeRelation,
@@ -1559,31 +1696,6 @@ fn missing_replace_fields(req: &ArtifactWriteRequest) -> Vec<&'static str> {
     missing
 }
 
-/// Validate one [`EdgeSpec`] and render it as the web edge route's
-/// anchor-relative payload.
-///
-/// Returns only the **body**: every arm anchored on the artifact just written,
-/// so returning the anchor was returning the caller's own argument back to it —
-/// a second value that could never differ from the first and only invited a
-/// reader to wonder when it might.
-fn edge_payload(spec: &EdgeSpec) -> Result<Value, String> {
-    // No relation check here: `spec.relation` is an [`EdgeRelation`], so a
-    // blank or unknown value was already refused when the request body was
-    // parsed — before the artifact upsert, which is what keeps a bad relation
-    // from leaving a half-written artifact-without-its-edges.
-    match (&spec.to_id, &spec.from_id) {
-        (Some(_), Some(_)) | (None, None) => Err(
-            "supply exactly one of `to_id` (outgoing) or `from_id` (incoming) per edge".to_string(),
-        ),
-        (Some(to), None) => {
-            Ok(serde_json::json!({"to_id": to, "relation": spec.relation, "note": spec.note}))
-        }
-        (None, Some(from)) => {
-            Ok(serde_json::json!({"from_id": from, "relation": spec.relation, "note": spec.note}))
-        }
-    }
-}
-
 // ===========================================================================
 // Handlers
 // ===========================================================================
@@ -1623,13 +1735,18 @@ pub async fn write_artifact_handler(headers: HeaderMap, body: Bytes) -> ApiResul
 
     let body = resolve_body(&req).map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
 
-    // Validate every edge BEFORE the upsert, so a malformed edge cannot leave a
-    // half-written artifact behind: the artifact write is not transactional with
-    // the edges, and the cheapest way to keep the two consistent is to refuse
-    // the whole request up front.
-    for spec in &req.edges {
-        edge_payload(spec).map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
-    }
+    // Validate and render every edge BEFORE the upsert, so a malformed edge
+    // cannot leave a half-written artifact behind: the artifact write is not
+    // transactional with the edges, and the cheapest way to keep the two
+    // consistent is to refuse the whole request up front. Each body is rendered
+    // once, here, and posted as rendered below.
+    let edge_bodies = req
+        .edges
+        .iter()
+        .enumerate()
+        .map(|(i, spec)| edge_body::render(&spec.draft()).map_err(|e| format!("`edges[{i}]`: {e}")))
+        .collect::<Result<Vec<Value>, String>>()
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
 
     let payload =
         serde_json::to_value(build_agent_upsert(&req, body, &principal)).map_err(|e| {
@@ -1644,20 +1761,16 @@ pub async fn write_artifact_handler(headers: HeaderMap, body: Bytes) -> ApiResul
         .map_err(|e| (StatusCode::BAD_GATEWAY, Json(api_error(e))))?;
 
     // Edges, one call each — the web route takes one edge per request and is
-    // idempotent on `(from_id, to_id, relation)`. Reported per edge rather than
-    // aborting: the artifact already landed, and a caller needs to know WHICH
-    // edge failed, not just that something did.
+    // idempotent on `(from_id, to_id, relation)` (an open follow-up: on its
+    // trimmed note). Reported per edge rather than aborting: the artifact
+    // already landed, and a caller needs to know WHICH edge failed, not just
+    // that something did. A value the web refuses (an anchor path, say) fails
+    // only its own edge, and the caller can retry it through
+    // `POST /plan-library/links`.
+    let path = format!("/api/v1/plan-library/{artifact_id}/edges");
     let mut edge_results: Vec<Value> = Vec::new();
-    for spec in &req.edges {
-        let edge_body = match edge_payload(spec) {
-            Ok(v) => v,
-            Err(e) => {
-                edge_results.push(serde_json::json!({"ok": false, "error": e}));
-                continue;
-            }
-        };
-        let path = format!("/api/v1/plan-library/{artifact_id}/edges");
-        match upstream_post(&path, &edge_body).await {
+    for edge_json in &edge_bodies {
+        match upstream_post(&path, edge_json).await {
             Ok(v) => edge_results.push(serde_json::json!({"ok": true, "edge": v})),
             Err((code, err)) => edge_results.push(serde_json::json!({
                 "ok": false,
@@ -1676,25 +1789,25 @@ pub async fn write_artifact_handler(headers: HeaderMap, body: Bytes) -> ApiResul
     Ok(Json(ApiResponse::success(out)))
 }
 
-/// `POST /plan-library/links` — link two existing artifacts.
-/// **Nonce-authorized, then kill switch, then dial** ([`authorize_write`]).
+/// `POST /plan-library/links` — record one edge out of an existing artifact:
+/// to another existing one, or, for a relation in
+/// `writeVocabulary.open_target_relation`, to none yet (a one-ended
+/// `spawned_followup`). **Nonce-authorized, then kill switch, then dial**
+/// ([`authorize_write`]).
 pub async fn create_link_handler(headers: HeaderMap, body: Bytes) -> ApiResult {
     let principal = authorize_write(&headers)?;
     let req: LinkRequest = parse_write_body(&body)?;
-    if req.from_id.trim().is_empty() || req.to_id.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(api_error("`from_id` and `to_id` are required")),
-        ));
-    }
+    let refused = |e: String| (StatusCode::BAD_REQUEST, Json(api_error(e)));
     // Flat (from, to) → the web route's anchor-relative shape: anchor on
-    // `from_id`, far end as `to_id`, which is the OUTGOING direction.
-    let path = format!("/api/v1/plan-library/{}/edges", req.from_id);
-    let body = serde_json::json!({
-        "to_id": req.to_id,
-        "relation": req.relation,
-        "note": provenance_note(req.note.as_deref(), &principal, req.session_id.as_deref()),
-    });
+    // `from_id`, far end (if any) as `to_id`, the OUTGOING direction. The
+    // anchor becomes a PATH SEGMENT sent under the runner's own device
+    // credential, so only its canonical UUID ever reaches the wire.
+    let anchor = edge_body::link_anchor(&req.from_id).map_err(refused)?;
+    // R3 judges the CALLER's note; the body carries this door's attribution
+    // fold of it, which is never blank (D6).
+    let note = provenance_note(req.note.as_deref(), &principal, req.session_id.as_deref());
+    let body = edge_body::render(&req.draft(note.as_deref())).map_err(refused)?;
+    let path = format!("/api/v1/plan-library/{anchor}/edges");
     let upstream = upstream_post(&path, &body).await?;
     Ok(Json(ApiResponse::success(upstream)))
 }
@@ -2904,31 +3017,19 @@ mod tests {
     }
 
     // ---- edges -----------------------------------------------------------
-
-    #[test]
-    fn an_edge_needs_exactly_one_end() {
-        let both = EdgeSpec {
-            to_id: Some("a".into()),
-            from_id: Some("b".into()),
-            relation: EdgeRelation::Feeds,
-            note: None,
-        };
-        assert!(edge_payload(&both).is_err());
-
-        let neither = EdgeSpec {
-            to_id: None,
-            from_id: None,
-            relation: EdgeRelation::Feeds,
-            note: None,
-        };
-        assert!(edge_payload(&neither).is_err());
-    }
+    //
+    // The five edge rules themselves (R1 ends, R2 ids, R3 note, R4 facts
+    // placement, R5 reason) are pinned where they live, in `edge_body`'s own
+    // test module; R1's enumeration of every relation by every shape of ends is
+    // `an_edge_needs_exactly_one_end_unless_its_relation_may_omit_both` there.
+    // What is pinned HERE is each door's mapping onto that renderer, and the
+    // doors themselves over HTTP.
 
     /// A blank or unknown `relation` is refused while the body is PARSED — the
     /// same step for all three structs that carry one — with the set named.
     /// Parse precedes the artifact upsert, so a bad relation can never leave a
     /// written artifact without its edges (the half-written state the old
-    /// blank-only check in `edge_payload` existed to prevent).
+    /// blank-only check in the inline edge renderer existed to prevent).
     #[test]
     fn a_blank_or_unknown_relation_is_refused_at_parse_with_the_set_named() {
         for relation in ["", "   ", "\t"] {
@@ -3069,9 +3170,42 @@ mod tests {
         }
     }
 
+    /// `OPEN_TARGET` is a LITERAL copy of the web's
+    /// `RELATIONS_ALLOWING_OPEN_TARGET` (`backend/app/models/work_artifact.py`):
+    /// the relations whose edge may omit both ends. Both the typed source and
+    /// the published `writeVocabulary.open_target_relation` must equal it, so
+    /// a runner-side edit that does not update the literal goes red.
+    #[test]
+    fn the_open_target_vocabulary_matches_the_web_literal() {
+        const OPEN_TARGET: [&str; 1] = ["spawned_followup"];
+
+        let open: Vec<&str> = edge_body::OPEN_TARGET_RELATIONS
+            .iter()
+            .map(|r| r.as_str())
+            .collect();
+        assert_eq!(open, OPEN_TARGET, "OPEN_TARGET_RELATIONS drifted");
+
+        let _pin = pin("off");
+        let cap = with_flag(None, || with_write_capability(serde_json::json!({})));
+        let published: Vec<&str> = cap["writeVocabulary"]["open_target_relation"]
+            .as_array()
+            .expect("writeVocabulary.open_target_relation is a published array")
+            .iter()
+            .map(|v| v.as_str().expect("each entry is a string"))
+            .collect();
+        assert_eq!(
+            published, OPEN_TARGET,
+            "writeVocabulary.open_target_relation must be exactly the web's open-target set"
+        );
+    }
+
     /// Both new capability keys exist with the right SHAPES, on every read —
     /// the capability tests above assert individual keys, so this is the one
     /// that goes red when `writeVocabulary` or `writeCorrection` is dropped.
+    ///
+    /// `writeVocabulary` is keyed by body field, with ONE entry that is not a
+    /// body field: `open_target_relation`, the subset of `relation` whose edge
+    /// may omit both ends. So it is pinned as a subset of `relation` here.
     #[test]
     fn write_capability_advertises_vocabulary_and_correction() {
         let _pin = pin("off");
@@ -3087,13 +3221,20 @@ mod tests {
                 .expect("writeVocabulary is an object keyed by field");
             let mut fields: Vec<&str> = vocab.keys().map(String::as_str).collect();
             fields.sort_unstable();
-            assert_eq!(fields, ["kind", "relation"]);
+            assert_eq!(fields, ["kind", "open_target_relation", "relation"]);
             for (field, values) in vocab {
                 let values = values
                     .as_array()
                     .unwrap_or_else(|| panic!("{field} is an array"));
                 assert!(!values.is_empty(), "{field} is empty");
                 assert!(values.iter().all(Value::is_string), "{field}: {values:?}");
+            }
+            let relations = vocab["relation"].as_array().unwrap();
+            for open in vocab["open_target_relation"].as_array().unwrap() {
+                assert!(
+                    relations.contains(open),
+                    "open_target_relation {open} is not a `relation`: {relations:?}"
+                );
             }
 
             let correction = cap["writeCorrection"]
@@ -3130,33 +3271,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn an_outgoing_edge_carries_only_the_far_end() {
-        let spec = EdgeSpec {
-            to_id: Some("peer".into()),
-            from_id: None,
-            relation: EdgeRelation::AuthoredPlan,
-            note: Some("chain".into()),
-        };
-        let body = edge_payload(&spec).unwrap();
-        assert_eq!(body["to_id"], serde_json::json!("peer"));
-        assert_eq!(body["relation"], serde_json::json!("authored_plan"));
-        assert!(body.get("from_id").is_none());
-    }
-
-    #[test]
-    fn an_incoming_edge_carries_only_the_far_end() {
-        let spec = EdgeSpec {
-            to_id: None,
-            from_id: Some("producer".into()),
-            relation: EdgeRelation::ProducedReport,
-            note: None,
-        };
-        let body = edge_payload(&spec).unwrap();
-        assert_eq!(body["from_id"], serde_json::json!("producer"));
-        assert!(body.get("to_id").is_none());
     }
 
     // ---- query forwarding -------------------------------------------------
@@ -3751,6 +3865,18 @@ mod tests {
         route_table()
     }
 
+    /// [`test_app`] under the live stack's envelope layer
+    /// (`mcp_api.rs` mounts the same middleware), which stamps the
+    /// status-derived `code` onto a JSON error envelope: `INVALID_JSON` for
+    /// this door's own 400s, `INVALID_REQUEST` for a forwarded 422. Its
+    /// stamping counters are process-global but asserted only as deltas, so
+    /// layering it here disturbs no other test.
+    fn enveloped_app() -> Router {
+        test_app().layer(axum::middleware::from_fn(
+            crate::mcp::envelope::envelope_rewrite_middleware,
+        ))
+    }
+
     /// A non-UUID id is refused by the door itself, before the forward — so
     /// this is hermetic — the `{id}` segment does not shadow the write route it
     /// shares a prefix with, and the refusal still carries the capability block
@@ -4101,8 +4227,18 @@ mod tests {
     /// the one `pub(crate)` registration helper (`coord_mcp.rs`). The
     /// principal then resolves to `Agent { agent_id }`.
     fn registered_nonce() -> String {
+        registered_agent_nonce().0
+    }
+
+    /// [`registered_nonce`] plus the two facts `/links`' attribution fold
+    /// renders from it: the agent id (the principal reads `agent:<id>`) and
+    /// the workdir it was provisioned into (the session label when a request
+    /// sends no `session_id`; an agent binding has no terminal).
+    fn registered_agent_nonce() -> (String, uuid::Uuid, String) {
         let wd = format!("D:/plan-library-door-test-{}", uuid::Uuid::now_v7());
-        crate::coord_mcp::register_agent_proxy_nonce(&wd, uuid::Uuid::new_v4())
+        let agent_id = uuid::Uuid::new_v4();
+        let nonce = crate::coord_mcp::register_agent_proxy_nonce(&wd, agent_id);
+        (nonce, agent_id, wd)
     }
 
     /// A key this runner never minted.
@@ -4123,6 +4259,19 @@ mod tests {
         headers: &[(&str, &str)],
         body: &str,
     ) -> (StatusCode, Value) {
+        raw_request_on(test_app(), method, uri, headers, body).await
+    }
+
+    /// [`raw_request`] against a router of the caller's choosing — the
+    /// [`enveloped_app`] when a test asserts the `code` a caller actually
+    /// reads, which only the live stack's envelope layer stamps.
+    async fn raw_request_on(
+        app: Router,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (StatusCode, Value) {
         let mut b = Request::builder()
             .method(method)
             .uri(uri)
@@ -4131,7 +4280,7 @@ mod tests {
             b = b.header(*k, *v);
         }
         let req = b.body(Body::from(body.to_string())).unwrap();
-        let resp = test_app().oneshot(req).await.unwrap();
+        let resp = app.oneshot(req).await.unwrap();
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
             .await
@@ -4519,7 +4668,7 @@ mod tests {
         assert!(body["error"]
             .as_str()
             .unwrap()
-            .contains("`from_id` and `to_id` are required"));
+            .contains("`from_id` is required"));
 
         // A malformed body is a 400 too — but only once the nonce has passed.
         let bearer = format!("Bearer {nonce}");
@@ -4653,5 +4802,608 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["code"], serde_json::json!(CODE_DIAL_UNANSWERED));
+    }
+
+    // ---- the edge doors against a stub upstream ----------------------------
+    //
+    // These let a WRITE door dial. Each points `web_base()` at a `StubUpstream`
+    // this module binds itself, with the settings writer `web_base()` reaches
+    // redirected ([`redirect_upstream`]): the hermetic shape
+    // `the_handler_dials_upstream_with_only_the_allowlisted_param` set for the
+    // reads. The refusal tests use the stub for a second reason: its empty
+    // request log is how they prove a refusal came BEFORE any upstream call.
+    // Fixtures are placeholders only: repo `o/r`, made-up UUIDs.
+
+    /// One request a [`StubUpstream`] received.
+    #[derive(Debug, Clone)]
+    struct SeenRequest {
+        /// The request line, e.g. `POST /api/v1/plan-library HTTP/1.1`.
+        line: String,
+        /// The body parsed as JSON; `Value::Null` when there was none.
+        body: Value,
+    }
+
+    /// A local listener standing in for the qontinui-web backend. It records
+    /// every request in arrival order and answers the n-th with the n-th
+    /// scripted `(status line, JSON body)`, repeating the last, then closes the
+    /// connection so a pooled client cannot pipeline onto a finished socket.
+    struct StubUpstream {
+        base: String,
+        seen: Arc<std::sync::Mutex<Vec<SeenRequest>>>,
+    }
+
+    impl StubUpstream {
+        async fn start(answers: Vec<(&'static str, String)>) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = Arc::clone(&seen);
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let mut served = 0usize;
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    let request = read_stub_request(&mut sock).await;
+                    log.lock().unwrap().push(request);
+                    let last = answers.len().saturating_sub(1);
+                    let Some((status, json)) = answers.get(served.min(last)) else {
+                        break;
+                    };
+                    served += 1;
+                    let _ = sock
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                                 Connection: close\r\nContent-Length: {}\r\n\r\n{json}",
+                                json.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                }
+            });
+            Self { base, seen }
+        }
+
+        /// Every request received so far, in arrival order.
+        fn requests(&self) -> Vec<SeenRequest> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    /// Read one HTTP/1.1 request off `sock`: the header block, then exactly
+    /// `Content-Length` body bytes. A short read would truncate the very thing
+    /// these tests assert on, so this reads until both are complete, or EOF.
+    async fn read_stub_request(sock: &mut tokio::net::TcpStream) -> SeenRequest {
+        use tokio::io::AsyncReadExt;
+        let mut acc = Vec::new();
+        let mut buf = [0u8; 4096];
+        let header_end = loop {
+            if let Some(i) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+            match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => break acc.len(),
+                Ok(n) => acc.extend_from_slice(&buf[..n]),
+            }
+        };
+        let head = String::from_utf8_lossy(acc.get(..header_end).unwrap_or_default()).to_string();
+        let content_length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        while acc.len() < header_end + content_length {
+            match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => acc.extend_from_slice(&buf[..n]),
+            }
+        }
+        SeenRequest {
+            line: head.lines().next().unwrap_or_default().to_string(),
+            body: acc
+                .get(header_end..header_end + content_length)
+                .and_then(|bytes| serde_json::from_slice(bytes).ok())
+                .unwrap_or(Value::Null),
+        }
+    }
+
+    /// The env a dialing write test holds for its whole body, restored on
+    /// drop: `web_base()` aimed at a stub, the kill switch cleared, and BOTH
+    /// roots of the settings writer `web_base()` reaches moved into a temp dir
+    /// (see `the_handler_dials_upstream_with_only_the_allowlisted_param` for
+    /// why both, and why the roster half is Linux/macOS-only). Fields drop in
+    /// order, so the env is restored before the temp dir goes.
+    #[must_use = "the redirect lasts only while this guard is alive; bind it for the test body"]
+    struct UpstreamRedirect {
+        _restore: crate::test_env::EnvVarRestore,
+        _cfg: tempfile::TempDir,
+    }
+
+    /// Point the doors at `base`. Call it HOLDING `env_lock()`.
+    fn redirect_upstream(base: &str) -> UpstreamRedirect {
+        let restore = crate::test_env::EnvVarRestore::capture(&[
+            PLAN_LIBRARY_WRITE_FLAG,
+            WEB_BACKEND_URL_ENV_FOR_TEST,
+            "QONTINUI_CONFIG_DIR",
+            "XDG_CONFIG_HOME",
+        ]);
+        let cfg = tempfile::tempdir().expect("temp config dir");
+        std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+        std::env::set_var("QONTINUI_CONFIG_DIR", cfg.path());
+        std::env::set_var("XDG_CONFIG_HOME", cfg.path());
+        std::env::set_var(WEB_BACKEND_URL_ENV_FOR_TEST, base);
+        UpstreamRedirect {
+            _restore: restore,
+            _cfg: cfg,
+        }
+    }
+
+    /// The `/links` mapping: `from_id` is the anchor, never an end of the body,
+    /// so the body's only end is `to_id` (or none), and the note that travels
+    /// is the fold handed in while R3 judges the caller's own.
+    #[test]
+    fn a_link_renders_its_far_end_only_and_forwards_the_folded_note() {
+        let link: LinkRequest = serde_json::from_value(serde_json::json!({
+            "from_id": "0d2f2a6e-7c1b-4f38-9a3e-1b2c3d4e5f60",
+            "to_id": null,
+            "relation": "spawned_followup",
+            "note": "n",
+            "size_class": "small",
+        }))
+        .unwrap();
+        assert_eq!(link.to_id, None, "`to_id: null` parses to no far end");
+        assert_eq!(
+            edge_body::render(&link.draft(Some("n (agent write by device)"))).unwrap(),
+            serde_json::json!({
+                "relation": "spawned_followup",
+                "note": "n (agent write by device)",
+                "size_class": "small",
+            })
+        );
+
+        let blank: LinkRequest = serde_json::from_value(serde_json::json!({
+            "from_id": "0d2f2a6e-7c1b-4f38-9a3e-1b2c3d4e5f60",
+            "relation": "spawned_followup",
+            "note": "  ",
+        }))
+        .unwrap();
+        let err = edge_body::render(&blank.draft(Some("   (agent write by device)"))).unwrap_err();
+        assert!(err.contains("requires a non-empty `note`"), "{err}");
+    }
+
+    /// The contract on every read states the one-ended form for BOTH edge
+    /// doors, where the follow-up facts are judged, that the open follow-up's
+    /// dedup key includes this door's attribution suffix, and that unknown keys
+    /// are refused: the four rules a driver would otherwise learn from a
+    /// refusal or, worse, from a silent duplicate.
+    #[test]
+    fn the_contract_states_the_one_ended_form_its_dedup_key_and_the_key_allowlist() {
+        let _pin = pin("off");
+        let v = with_flag(None, || with_write_capability(serde_json::json!({})));
+        let contract = v["writeContract"].as_str().unwrap();
+        for claim in [
+            "`writeVocabulary.open_target_relation` is not a body field",
+            "`from_id` plus `\"to_id\": null`",
+            "send neither `to_id` nor `from_id`",
+            "non-blank `note`, judged on the note you sent",
+            "`anchors`, `size_class` and `unanchored_reason`",
+            "its 422 is forwarded here verbatim",
+            "idempotent on its trimmed note",
+            "`(agent write by <principal>, session <label>)`",
+            "same `session_id`",
+            "refuses an unknown key 400, naming it",
+        ] {
+            assert!(
+                contract.contains(claim),
+                "the write contract omits `{claim}`: {contract}"
+            );
+        }
+    }
+
+    /// The canonical spelling of the anchor these tests link from.
+    const ANCHOR: &str = "0d2f2a6e-7c1b-4f38-9a3e-1b2c3d4e5f60";
+
+    /// (a) `/links` forwards a one-ended follow-up: the anchor canonical in the
+    /// upstream path (it was sent upper-case), and a body equal to the literal
+    /// below, whose note carries this door's attribution with the caller's
+    /// `session_id` and which has no `to_id` key at all.
+    #[tokio::test]
+    async fn a_one_ended_followup_link_reaches_upstream_at_the_canonical_anchor() {
+        let _pin = pin("record");
+        let _guard = crate::test_env::env_lock();
+        let stub = StubUpstream::start(vec![(
+            "201 Created",
+            r#"{"id":"44444444-4444-4444-4444-444444444444"}"#.to_string(),
+        )])
+        .await;
+        let _redirect = redirect_upstream(&stub.base);
+        let (nonce, agent_id, _) = registered_agent_nonce();
+
+        let (status, body) = post_json(
+            "/plan-library/links",
+            Some(&nonce),
+            serde_json::json!({
+                "from_id": "0D2F2A6E-7C1B-4F38-9A3E-1B2C3D4E5F60",
+                "to_id": null,
+                "relation": "spawned_followup",
+                "note": "n",
+                "anchors": [{"repo": "o/r", "path": "a.rs"}],
+                "size_class": "small",
+                "session_id": "s",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["data"]["id"],
+            serde_json::json!("44444444-4444-4444-4444-444444444444"),
+            "the upstream answer rides back: {body}"
+        );
+
+        let seen = stub.requests();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(
+            seen[0].line,
+            format!("POST /api/v1/plan-library/{ANCHOR}/edges HTTP/1.1")
+        );
+        assert_eq!(
+            seen[0].body,
+            serde_json::json!({
+                "relation": "spawned_followup",
+                "note": format!("n (agent write by agent:{agent_id}, session s)"),
+                "anchors": [{"repo": "o/r", "path": "a.rs"}],
+                "size_class": "small",
+            })
+        );
+    }
+
+    /// (b) The web's 422 reaches the caller VERBATIM. The loopback judges shape
+    /// only (D2), so an anchor path with a `..` segment is forwarded; the web
+    /// refuses it, and the door answers 422 with the upstream body after
+    /// `upstream_failure`'s prefix in its envelope's `error`. Through the live
+    /// stack's envelope layer that is `code: INVALID_REQUEST`, which a caller
+    /// can tell from this door's own shape refusals (`INVALID_JSON`).
+    #[tokio::test]
+    async fn a_web_422_on_a_followup_link_reaches_the_caller_verbatim() {
+        const DETAIL: &str = r#"{"detail":[{"type":"value_error","loc":["body","anchors",0,"path"],"msg":"Value error, path has a '..' segment"}]}"#;
+        let _pin = pin("record");
+        let _guard = crate::test_env::env_lock();
+        let stub =
+            StubUpstream::start(vec![("422 Unprocessable Entity", DETAIL.to_string())]).await;
+        let _redirect = redirect_upstream(&stub.base);
+        let bearer = format!("Bearer {}", registered_nonce());
+
+        let link = serde_json::json!({
+            "from_id": ANCHOR,
+            "to_id": null,
+            "relation": "spawned_followup",
+            "note": "n",
+            "anchors": [{"repo": "o/r", "path": "../a.rs"}],
+            "size_class": "small",
+        });
+        let (status, body) = raw_request_on(
+            enveloped_app(),
+            "POST",
+            "/plan-library/links",
+            &[("authorization", &bearer)],
+            &link.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(
+            body["error"],
+            serde_json::json!(format!(
+                "/api/v1/plan-library/{ANCHOR}/edges: upstream 422 Unprocessable Entity: {DETAIL}"
+            ))
+        );
+        assert_eq!(body["code"], serde_json::json!("INVALID_REQUEST"), "{body}");
+
+        let seen = stub.requests();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(
+            seen[0].body["anchors"],
+            serde_json::json!([{"repo": "o/r", "path": "../a.rs"}]),
+            "the loopback forwards a value it does not own"
+        );
+    }
+
+    /// (c) Inline: the artifact upsert goes first, then the one-ended edge POST
+    /// at the new artifact, carrying the literal body. Its note is the caller's
+    /// own, unfolded: the inline door adds no attribution to an edge note.
+    #[tokio::test]
+    async fn an_inline_one_ended_followup_is_posted_after_the_upsert() {
+        const ARTIFACT: &str = "55555555-5555-5555-5555-555555555555";
+        let _pin = pin("record");
+        let _guard = crate::test_env::env_lock();
+        let stub = StubUpstream::start(vec![
+            (
+                "201 Created",
+                format!(r#"{{"artifact":{{"id":"{ARTIFACT}"}}}}"#),
+            ),
+            (
+                "201 Created",
+                r#"{"id":"66666666-6666-6666-6666-666666666666"}"#.to_string(),
+            ),
+        ])
+        .await;
+        let _redirect = redirect_upstream(&stub.base);
+        let nonce = registered_nonce();
+
+        let mut artifact = valid_artifact();
+        artifact["edges"] = serde_json::json!([{
+            "relation": "spawned_followup",
+            "note": "n",
+            "anchors": [{"repo": "o/r", "path": "a.rs"}],
+            "size_class": "small",
+        }]);
+        let (status, body) = post_json("/plan-library/artifacts", Some(&nonce), artifact).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["data"]["edges"],
+            serde_json::json!([
+                {"ok": true, "edge": {"id": "66666666-6666-6666-6666-666666666666"}}
+            ]),
+            "{body}"
+        );
+
+        let seen = stub.requests();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0].line, "POST /api/v1/plan-library HTTP/1.1");
+        assert_eq!(
+            seen[1].line,
+            format!("POST /api/v1/plan-library/{ARTIFACT}/edges HTTP/1.1")
+        );
+        assert_eq!(
+            seen[1].body,
+            serde_json::json!({
+                "relation": "spawned_followup",
+                "note": "n",
+                "anchors": [{"repo": "o/r", "path": "a.rs"}],
+                "size_class": "small",
+            })
+        );
+    }
+
+    /// The request finding `92904dd2` recorded, shape for shape: compact JSON,
+    /// keys in the order it was sent, `to_id: null` second. Placeholder values
+    /// only (this repository is public).
+    const FINDING_92904DD2_LINK: &str = r#"{"from_id":"0d2f2a6e-7c1b-4f38-9a3e-1b2c3d4e5f60","to_id":null,"relation":"spawned_followup","note":"n","anchors":[{"repo":"o/r","path":"a.rs"}],"size_class":"small"}"#;
+
+    /// Regression for finding `92904dd2`: a session holding only its runner
+    /// nonce sent a one-ended `spawned_followup` to `/plan-library/links` and
+    /// got 400 `INVALID_JSON` ("invalid type: null, expected a string at line
+    /// 1 column 62"), because `LinkRequest.to_id` was a required `String`.
+    ///
+    /// The fixture is first shown to BE that request: parsed with the pre-fix
+    /// struct shape it reproduces the recorded serde text byte for byte,
+    /// column included. Then the same bytes go through the live envelope
+    /// stack, and are forwarded instead of refused.
+    #[tokio::test]
+    async fn regression_92904dd2_a_one_ended_followup_link_is_forwarded_not_refused() {
+        /// `LinkRequest` as it stood when the finding was recorded.
+        #[derive(Debug, Deserialize)]
+        struct LinkRequestBeforeTheFix {
+            from_id: String,
+            to_id: String,
+            relation: EdgeRelation,
+            #[serde(default)]
+            note: Option<String>,
+            #[serde(default)]
+            session_id: Option<String>,
+        }
+        let err = serde_json::from_str::<LinkRequestBeforeTheFix>(FINDING_92904DD2_LINK)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err, "invalid type: null, expected a string at line 1 column 62",
+            "the fixture must be the request the finding recorded"
+        );
+
+        let _pin = pin("record");
+        let _guard = crate::test_env::env_lock();
+        let stub = StubUpstream::start(vec![(
+            "201 Created",
+            r#"{"id":"77777777-7777-7777-7777-777777777777"}"#.to_string(),
+        )])
+        .await;
+        let _redirect = redirect_upstream(&stub.base);
+        let (nonce, agent_id, workdir) = registered_agent_nonce();
+        let bearer = format!("Bearer {nonce}");
+
+        let (status, body) = raw_request_on(
+            enveloped_app(),
+            "POST",
+            "/plan-library/links",
+            &[("authorization", &bearer)],
+            FINDING_92904DD2_LINK,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_ne!(body["code"], serde_json::json!("INVALID_JSON"), "{body}");
+
+        let seen = stub.requests();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(
+            seen[0].line,
+            format!("POST /api/v1/plan-library/{ANCHOR}/edges HTTP/1.1")
+        );
+        // No `session_id` was sent, so the label is what the runner knows of
+        // the nonce's session: an agent binding's workdir.
+        assert_eq!(
+            seen[0].body,
+            serde_json::json!({
+                "relation": "spawned_followup",
+                "note": format!("n (agent write by agent:{agent_id}, session workdir {workdir})"),
+                "anchors": [{"repo": "o/r", "path": "a.rs"}],
+                "size_class": "small",
+            })
+        );
+    }
+
+    /// R3 driven through `/links`, where the fold would otherwise have made
+    /// every note non-blank: an absent, `null`, empty or whitespace note on a
+    /// `spawned_followup`, one-ended AND owned, is a 400 naming the rule, and
+    /// nothing reaches upstream.
+    #[tokio::test]
+    async fn a_blank_followup_note_is_refused_at_links_although_the_fold_would_fill_it() {
+        let _pin = pin("record");
+        let _guard = crate::test_env::env_lock();
+        let stub = StubUpstream::start(vec![("201 Created", "{}".to_string())]).await;
+        let _redirect = redirect_upstream(&stub.base);
+        let nonce = registered_nonce();
+
+        for note in [
+            None,
+            Some(Value::Null),
+            Some(serde_json::json!("")),
+            Some(serde_json::json!("   ")),
+        ] {
+            for to_id in [
+                Value::Null,
+                serde_json::json!("3f2504e0-4f89-11d3-9a0c-0305e82c3301"),
+            ] {
+                let mut link = serde_json::json!({
+                    "from_id": ANCHOR,
+                    "to_id": to_id,
+                    "relation": "spawned_followup",
+                    "session_id": "s",
+                });
+                if let Some(note) = &note {
+                    link["note"] = note.clone();
+                }
+                let (status, body) = post_json("/plan-library/links", Some(&nonce), link).await;
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_REQUEST,
+                    "note={note:?} to_id={to_id}: {body}"
+                );
+                let err = body["error"].as_str().unwrap();
+                assert!(
+                    err.contains("`spawned_followup` requires a non-empty `note`"),
+                    "note={note:?} to_id={to_id}: {err}"
+                );
+            }
+        }
+        let seen = stub.requests();
+        assert!(
+            seen.is_empty(),
+            "a refused follow-up reached upstream: {seen:?}"
+        );
+    }
+
+    /// A malformed inline edge refuses the WHOLE write before the upsert,
+    /// naming which edge: no artifact is written without the edges it was sent
+    /// with. A blank-noted one-ended follow-up is the new case this covers.
+    #[tokio::test]
+    async fn a_malformed_inline_followup_is_refused_before_the_artifact_is_written() {
+        let _pin = pin("record");
+        let _guard = crate::test_env::env_lock();
+        let stub = StubUpstream::start(vec![("201 Created", "{}".to_string())]).await;
+        let _redirect = redirect_upstream(&stub.base);
+        let nonce = registered_nonce();
+
+        let mut artifact = valid_artifact();
+        artifact["edges"] = serde_json::json!([
+            {"to_id": ANCHOR, "relation": "feeds"},
+            {"relation": "spawned_followup", "note": " "},
+        ]);
+        let (status, body) = post_json("/plan-library/artifacts", Some(&nonce), artifact).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let err = body["error"].as_str().unwrap();
+        assert!(err.starts_with("`edges[1]`: "), "{err}");
+        assert!(err.contains("requires a non-empty `note`"), "{err}");
+        let seen = stub.requests();
+        assert!(seen.is_empty(), "the artifact was written: {seen:?}");
+    }
+
+    /// D4: an unknown key is a 400 naming it on all four edge bodies, never a
+    /// 2xx that silently dropped it. For the inline case that refusal comes
+    /// before the upsert, so the stub receives NO request at all.
+    #[tokio::test]
+    async fn an_unknown_key_is_refused_naming_it_on_every_edge_body() {
+        let _pin = pin("record");
+        let _guard = crate::test_env::env_lock();
+        let stub = StubUpstream::start(vec![("200 OK", "{}".to_string())]).await;
+        let _redirect = redirect_upstream(&stub.base);
+        let nonce = registered_nonce();
+
+        let link = serde_json::json!({
+            "from_id": ANCHOR,
+            "to_id": null,
+            "relation": "spawned_followup",
+            "note": "n",
+            "sizeClass": "small",
+        });
+        let mut artifact = valid_artifact();
+        artifact["edges"] = serde_json::json!([
+            {"relation": "spawned_followup", "note": "n", "sizeClass": "small"}
+        ]);
+        let mut correction = valid_correction();
+        correction["sizeClass"] = serde_json::json!("small");
+        let mut retraction = valid_retraction();
+        retraction["sizeClass"] = serde_json::json!("small");
+
+        for (method, uri, body) in [
+            ("POST", "/plan-library/links", link),
+            ("POST", "/plan-library/artifacts", artifact),
+            ("PUT", EDGE_ID_URI, correction),
+            ("DELETE", EDGE_ID_URI, retraction),
+        ] {
+            let (status, json) = json_with_nonce(method, uri, Some(&nonce), body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {uri}: {json}");
+            let err = json["error"].as_str().unwrap();
+            assert!(
+                err.contains("unknown field `sizeClass`"),
+                "{method} {uri}: {err}"
+            );
+        }
+        let seen = stub.requests();
+        assert!(
+            seen.is_empty(),
+            "a body with an unknown key reached upstream: {seen:?}"
+        );
+    }
+
+    /// Why 5 / finding `80cde6f7`: `/links`' `from_id` becomes a path segment
+    /// under the runner's own credential, so anything that is not a UUID is
+    /// refused before the dial, and nothing path-like reaches the wire.
+    #[tokio::test]
+    async fn a_link_from_id_that_is_not_a_uuid_never_reaches_the_upstream_path() {
+        let _pin = pin("record");
+        let _guard = crate::test_env::env_lock();
+        let stub = StubUpstream::start(vec![("201 Created", "{}".to_string())]).await;
+        let _redirect = redirect_upstream(&stub.base);
+        let nonce = registered_nonce();
+
+        for from_id in [
+            "../candidates",
+            "0d2f2a6e-7c1b-4f38-9a3e-1b2c3d4e5f60/../scan-roots",
+            "?include_coord=true",
+            "not-a-uuid",
+            "",
+            "   ",
+        ] {
+            let (status, body) = post_json(
+                "/plan-library/links",
+                Some(&nonce),
+                serde_json::json!({
+                    "from_id": from_id,
+                    "to_id": "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+                    "relation": "feeds",
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{from_id:?}: {body}");
+            let err = body["error"].as_str().unwrap();
+            assert!(err.contains("`from_id`"), "{from_id:?}: {err}");
+        }
+        let seen = stub.requests();
+        assert!(seen.is_empty(), "a non-UUID anchor was dialled: {seen:?}");
     }
 }
