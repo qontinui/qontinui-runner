@@ -459,11 +459,13 @@ fn spawn_streak_clears(liveness: Liveness, spawn_grace_elapsed: bool) -> bool {
 /// failed coord read (Withhold, promoted to a block on the interactive PTY),
 /// and backing it off would keep the agent down for up to 15 minutes after
 /// coord recovers — the same reason the resource-guard refusal takes none.
-fn trust_refusal_backs_off(dial: &crate::claude_session::trust_gate::DialResolution) -> bool {
-    !matches!(
-        dial,
-        crate::claude_session::trust_gate::DialResolution::Unresolved { .. }
-    )
+///
+/// Decided from the refusal TEXT, which names the dial the gate actually
+/// decided on ([`crate::claude_session::trust_gate::annotate_unread_dial`]),
+/// never from a second peek: the dial cache can refresh or expire between the
+/// gate's decision and this read.
+fn trust_refusal_backs_off(refusal: &str) -> bool {
+    !crate::claude_session::trust_gate::refusal_rests_on_unread_dial(refusal)
 }
 
 /// Supervise a single agent for one tick: observe, decide (pure), act.
@@ -1232,12 +1234,10 @@ async fn do_spawn(
             // coord read, not a verdict, and takes no backoff
             // ([`trust_refusal_backs_off`]) — the next tick re-asks, exactly as
             // the resource-guard refusal does.
-            let dial = crate::claude_session::trust_gate::peek_dial();
-            if trust_refusal_backs_off(&dial) {
+            if trust_refusal_backs_off(&e) {
                 warn!(
                     agent = %def.id,
                     error = %e,
-                    dial = ?dial,
                     "looping_agent_supervisor: spawn refused by the workspace-trust gate — \
                      a policy verdict, backing off; trust the agent's home dir for the pinned \
                      account or move the tenant's autonomy dial"
@@ -1247,7 +1247,6 @@ async fn do_spawn(
                 warn!(
                     agent = %def.id,
                     error = %e,
-                    dial = ?dial,
                     "looping_agent_supervisor: spawn refused by the workspace-trust gate \
                      because the tenant's autonomy dial could not be read — retrying on the \
                      next tick, no backoff"
@@ -1625,14 +1624,29 @@ mod nudge_and_exit_tests {
 
     #[test]
     fn a_trust_refusal_backs_off_unless_the_dial_could_not_be_read() {
-        use crate::claude_session::trust_gate::{AutonomyTier, DialResolution};
-        assert!(!trust_refusal_backs_off(&DialResolution::Unresolved {
-            error: "coord unreachable".to_string()
-        }));
-        assert!(trust_refusal_backs_off(&DialResolution::Fresh {
+        use crate::claude_session::trust_gate::{
+            annotate_unread_dial, AutonomyTier, DialResolution, TrustGateDecision,
+        };
+        let block = || TrustGateDecision::SpawnBlocked {
+            rule: "dial-withholds-underived-mint-on-interactive-pty",
+            failed: vec!["coord_allocation_row=unsatisfied (no row)".to_string()],
+        };
+        // The refusal the gate renders from the dial it DECIDED on — never a
+        // later peek of the cache.
+        let rendered = |dial: DialResolution| {
+            annotate_unread_dial(block(), &dial)
+                .refusal()
+                .expect("a block renders a refusal")
+        };
+        assert!(!trust_refusal_backs_off(&rendered(
+            DialResolution::Unresolved {
+                error: "coord unreachable".to_string()
+            }
+        )));
+        assert!(trust_refusal_backs_off(&rendered(DialResolution::Fresh {
             tier: AutonomyTier::DraftRequired
-        }));
-        assert!(trust_refusal_backs_off(&DialResolution::Absent));
+        })));
+        assert!(trust_refusal_backs_off(&rendered(DialResolution::Absent)));
     }
 
     #[test]
