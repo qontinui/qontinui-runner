@@ -452,6 +452,8 @@ async fn serve_on_dedicated_runtime(
         .worker_threads(API_RUNTIME_WORKER_THREADS)
         .enable_all()
         .thread_name("mcp-api-rt")
+        .on_thread_park(qontinui_runner_lib::runtime_lag::note_worker_thread)
+        .on_thread_stop(qontinui_runner_lib::runtime_lag::forget_worker_thread)
         .build()
     {
         Ok(rt) => rt,
@@ -471,6 +473,14 @@ async fn serve_on_dedicated_runtime(
             return axum::serve(listener, router).await.map_err(Into::into);
         }
     };
+
+    // Plan 2026-10-19-runner-ui-wedge-signal-fires-when-the-app-runtime-is-
+    // starved-by-process-spawns, Phase 0: the API runtime's own lag row.
+    qontinui_runner_lib::runtime_lag::register_runtime(
+        "mcp-api-rt",
+        rt.handle(),
+        API_RUNTIME_WORKER_THREADS,
+    );
 
     // `Runtime::spawn` schedules onto `rt`'s workers from this (app-runtime)
     // thread, so no raw thread handoff is needed and there is no window in

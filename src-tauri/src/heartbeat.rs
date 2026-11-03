@@ -59,6 +59,17 @@ struct HeartbeatPayload {
     /// relay state rich enough to tell a FLAPPING relay from one that never
     /// connected. See [`HeartbeatRelay`].
     relay: HeartbeatRelay,
+    /// `app-rt` starvation HISTORY (plan
+    /// `2026-10-19-runner-ui-wedge-signal-fires-when-the-app-runtime-is-starved-by-process-spawns`,
+    /// Phase 3): `episodes`, `longestEpisodeMs`, `lastEpisodeStartedAt`.
+    ///
+    /// Post-hoc BY CONSTRUCTION: this heartbeat is sent from `app-rt`, so it
+    /// cannot run — and so can never say `starved: true` — while `app-rt` is
+    /// starved. The live value rides the fleet heartbeat on `fleet-hb-rt`.
+    /// `null` = the probe is not registered (UNKNOWN), never zero episodes;
+    /// each inner field is `null` (UNKNOWN) while the probe's watch thread is
+    /// not keeping the episode bookkeeping.
+    app_runtime: Option<qontinui_runner_lib::runtime_lag::AppRuntimeEpisodes>,
 }
 
 /// Snake-case projection of [`crate::crash_dumps::RecentCrash`] for the
@@ -119,6 +130,8 @@ pub(crate) struct HeartbeatUiThread {
     /// "window_getter_unresponsive" | "events_undelivered"`. `ping_not_emitted`
     /// (additive, 2026-10-24) is a non-wedged UNKNOWN: the event pong is stale
     /// but pings were not sent and left unanswered for the whole window.
+    /// `app_runtime_starved` (additive, 2026-10-30) is the same staleness read
+    /// while `app-rt` was starved — see `ui_error::apply_app_runtime_starvation`.
     reason: &'static str,
     /// The Win32 `SendMessageTimeoutW` rung. `null` = could not ask
     /// (non-Windows, or no main-window handle cached yet) — UNKNOWN, not fine.
@@ -438,6 +451,7 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                     pg_reachable,
                     pg_schema_ok,
                     relay_connected,
+                    app_runtime_starved: crate::ui_error::app_runtime_starved_now(),
                     ..Default::default()
                 });
 
@@ -633,6 +647,7 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                     recent_crash: recent_crash_snapshot.clone(),
                     ui_thread: HeartbeatUiThread::new(native_ui, ping_report),
                     relay: relay.clone(),
+                    app_runtime: qontinui_runner_lib::runtime_lag::app_runtime_episodes(),
                 };
 
                 match client.post(&heartbeat_url).json(&payload).send().await {
@@ -690,6 +705,7 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                     // primary's /instances aggregation sees a flapping
                     // secondary and not just a boolean.
                     "relay": relay,
+                    "app_runtime": qontinui_runner_lib::runtime_lag::app_runtime_episodes(),
                 });
 
                 match client.post(&url).json(&body).send().await {
@@ -839,6 +855,7 @@ mod tests {
                 no_ping_evidence(),
             ),
             relay: parked_relay(),
+            app_runtime: None,
         };
 
         let json = serde_json::to_value(&payload).expect("payload serializes");
@@ -980,6 +997,7 @@ mod tests {
             recent_crash: None,
             ui_thread: HeartbeatUiThread::new(native, no_ping_evidence()),
             relay: parked_relay(),
+            app_runtime: None,
         };
         let json = serde_json::to_value(&payload).expect("payload serializes");
         let ui_thread = json["ui_thread"]
@@ -1198,6 +1216,7 @@ mod tests {
                 no_ping_evidence(),
             ),
             relay: parked_relay(),
+            app_runtime: None,
         };
 
         let json = serde_json::to_value(&payload).expect("payload serializes");

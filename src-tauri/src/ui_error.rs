@@ -1394,8 +1394,94 @@ pub struct NativeUiLiveness {
     /// but pings were not sent and left unanswered for the whole window — the
     /// input the `events_undelivered` reading depends on was never measured,
     /// so the verdict is UNKNOWN, not wedged. A Win32 probe that answered
-    /// outranks it (`"pumping"`).
+    /// outranks it (`"pumping"`). `"app_runtime_starved"` (additive,
+    /// 2026-10-30) means the same staleness was read while the runtime-lag
+    /// probe reported `app-rt` starved — see [`apply_app_runtime_starvation`].
     pub reason: &'static str,
+}
+
+/// Correct a [`classify_native_ui`] verdict for a starved APP runtime.
+///
+/// While `app-rt` is starved (`runtime_lag::app_runtime_starved()`), an event
+/// pong that could only have arrived over the Tauri-event fallback — a JS
+/// `emit`, which is an async Tauri command served on `app-rt` — cannot land.
+/// Its staleness is then a fact about the RUNTIME, not about the native loop,
+/// so `events_undelivered` is an input that was not measured and must not fire
+/// the wedge [policy: an-unknown-input-must-not-fire-a-detector]. Plan
+/// `2026-10-19-runner-ui-wedge-signal-fires-when-the-app-runtime-is-starved-by-process-spawns`,
+/// Phase 3.
+///
+/// The same holds AFTER an episode ends: the pings sent and unanswered during
+/// it are not evidence about the loop. So the rung is also withdrawn when the
+/// last event pong predates the end of the most recent episode plus one ping
+/// interval ([`crate::ui_ping::UI_PING_CADENCE`]) — the first point at which a
+/// pong could have landed again — until a full [`UI_EVENT_DEAD_AFTER_MS`]
+/// window has been MEASURED after that point. Past it, the stale pong is
+/// evidence again and the verdict stands. `last_episode_end_age_ms` of `None`
+/// (UNKNOWN, or no episode ended since boot) and an unknown pong age change
+/// nothing on this arm.
+///
+/// Pure. Only the `events_undelivered` rung is withdrawn: a Win32 probe that
+/// timed out, or the caller's own unresponsive getter, measured the loop
+/// directly and still fires. When nothing else fired, `wedged` is the probe's
+/// answer, as in [`classify_native_ui`] — `Some(false)` with reason
+/// `"pumping"` when it came back, otherwise `None` with reason
+/// `"app_runtime_starved"`. A starved runtime triggers NO recovery: recreating
+/// a webview cannot fix it, and the recovery gate reads `wedged`, which this
+/// never raises. `starved` of `None` (UNKNOWN) or `Some(false)` with no
+/// recent episode changes nothing.
+pub fn apply_app_runtime_starvation(
+    mut v: NativeUiLiveness,
+    app_runtime_starved: Option<bool>,
+    last_episode_end_age_ms: Option<u64>,
+) -> NativeUiLiveness {
+    if !v.events_undelivered {
+        return v;
+    }
+    let starved_now = app_runtime_starved == Some(true);
+    if !starved_now && !stale_pong_is_from_a_starvation_episode(&v, last_episode_end_age_ms) {
+        return v;
+    }
+    v.events_undelivered = false;
+    let measured_fire = v.probe_wedged == Some(true) || v.window_getter_unresponsive;
+    if !measured_fire {
+        v.wedged = v.probe_wedged;
+        v.reason = if v.probe_wedged == Some(false) {
+            "pumping"
+        } else {
+            "app_runtime_starved"
+        };
+    }
+    v
+}
+
+/// The post-episode arm of [`apply_app_runtime_starvation`]. With `end` =
+/// the episode's end and `c` = one ping interval, both as ages from now:
+/// the pong predates `end + c` (`end_age - c < pong_age`) AND fewer than
+/// [`UI_EVENT_DEAD_AFTER_MS`] have passed since `end + c`
+/// (`end_age < c + dead`).
+fn stale_pong_is_from_a_starvation_episode(
+    v: &NativeUiLiveness,
+    last_episode_end_age_ms: Option<u64>,
+) -> bool {
+    let (Some(end_age), Some(pong_age)) = (last_episode_end_age_ms, v.event_pong_age_ms) else {
+        return false;
+    };
+    let cadence = crate::ui_ping::UI_PING_CADENCE.as_millis() as u64;
+    end_age.saturating_sub(cadence) < pong_age
+        && end_age < cadence.saturating_add(UI_EVENT_DEAD_AFTER_MS)
+}
+
+/// Is `app-rt` starved right now, per the runtime-lag probe? `None` = not
+/// registered or never ticked (UNKNOWN).
+pub fn app_runtime_starved_now() -> Option<bool> {
+    qontinui_runner_lib::runtime_lag::app_runtime_starved()
+}
+
+/// How long ago the most recent `app-rt` starvation episode ended, per the
+/// runtime-lag probe. `None` = UNKNOWN or no episode ended since boot.
+pub fn app_runtime_last_episode_end_age_ms_now() -> Option<u64> {
+    qontinui_runner_lib::runtime_lag::app_runtime_last_episode_end_age_ms()
 }
 
 /// Classify the native message loop. Pure — no clock, no atomics, no runtime.
@@ -1507,15 +1593,19 @@ pub fn native_ui_liveness_now(last_pong: &std::sync::atomic::AtomicU64) -> Nativ
     let last_pong = last_pong.load(std::sync::atomic::Ordering::Relaxed);
     let last_event_pong = last_event_pong();
     let ping = ping_ask_at(now_ms);
-    classify_native_ui(NativeUiInputs {
-        probe_wedged: native_ui_probe_verdict(),
-        window_getter_unresponsive: false,
-        last_pong,
-        pong_age_ms: now_ms.saturating_sub(last_pong),
-        last_event_pong,
-        event_pong_age_ms: now_ms.saturating_sub(last_event_pong),
-        ping,
-    })
+    apply_app_runtime_starvation(
+        classify_native_ui(NativeUiInputs {
+            probe_wedged: native_ui_probe_verdict(),
+            window_getter_unresponsive: false,
+            last_pong,
+            pong_age_ms: now_ms.saturating_sub(last_pong),
+            last_event_pong,
+            event_pong_age_ms: now_ms.saturating_sub(last_event_pong),
+            ping,
+        }),
+        app_runtime_starved_now(),
+        app_runtime_last_episode_end_age_ms_now(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1657,6 +1747,15 @@ pub struct HealthInputs {
     /// runner whose every spawned session has no coord access, which is the
     /// defect the coord-credential posture exists to make visible.
     pub coord_credential_can_answer: Option<bool>,
+    /// The runtime-lag probe reports `app-rt` starved
+    /// (`runtime_lag::app_runtime_starved()`). `Some(true)` contributes
+    /// `degraded`, never `errored`: recreating a webview cannot fix a starved
+    /// runtime, so this signal triggers no recovery. `None` is UNKNOWN (not
+    /// registered, never ticked, or a sink that does not read it) and never
+    /// degrades. Plan
+    /// `2026-10-19-runner-ui-wedge-signal-fires-when-the-app-runtime-is-starved-by-process-spawns`,
+    /// Phase 3.
+    pub app_runtime_starved: Option<bool>,
 }
 
 pub fn compute_derived_status(i: &HealthInputs) -> &'static str {
@@ -1671,6 +1770,7 @@ pub fn compute_derived_status(i: &HealthInputs) -> &'static str {
         || matches!(i.pg_schema_ok, Some(false))
         || matches!(i.relay_connected, Some(false))
         || matches!(i.coord_credential_can_answer, Some(false))
+        || matches!(i.app_runtime_starved, Some(true))
     {
         "degraded"
     } else {
@@ -1737,6 +1837,147 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── app-rt starvation (plan 2026-10-19-runner-ui-wedge-signal-…, Phase 3) ──
+
+    fn fired_by_events(probe_wedged: Option<bool>) -> NativeUiLiveness {
+        NativeUiLiveness {
+            probe_wedged,
+            window_getter_unresponsive: false,
+            events_undelivered: true,
+            event_pong_age_ms: Some(UI_EVENT_DEAD_AFTER_MS + 1),
+            wedged: Some(true),
+            reason: "events_undelivered",
+        }
+    }
+
+    #[test]
+    fn a_starved_app_runtime_withdraws_the_events_undelivered_wedge() {
+        let v = apply_app_runtime_starvation(fired_by_events(None), Some(true), None);
+        assert!(!v.events_undelivered);
+        assert_eq!(v.wedged, None, "UNKNOWN, never wedged and never `false`");
+        assert_eq!(v.reason, "app_runtime_starved");
+    }
+
+    #[test]
+    fn under_starvation_a_probe_that_answered_still_reads_pumping() {
+        let v = apply_app_runtime_starvation(fired_by_events(Some(false)), Some(true), None);
+        assert!(!v.events_undelivered);
+        assert_eq!(v.wedged, Some(false));
+        assert_eq!(v.reason, "pumping");
+    }
+
+    #[test]
+    fn under_starvation_a_measured_wedge_still_fires() {
+        let mut probe = fired_by_events(Some(true));
+        probe.reason = "native_probe_wedged";
+        let v = apply_app_runtime_starvation(probe, Some(true), None);
+        assert_eq!(
+            v.wedged,
+            Some(true),
+            "the Win32 probe measured the loop directly"
+        );
+        assert_eq!(v.reason, "native_probe_wedged");
+        assert!(
+            !v.events_undelivered,
+            "the unmeasured rung is still withdrawn"
+        );
+
+        let mut getter = fired_by_events(None);
+        getter.window_getter_unresponsive = true;
+        getter.reason = "window_getter_unresponsive";
+        let v = apply_app_runtime_starvation(getter, Some(true), None);
+        assert_eq!(v.wedged, Some(true));
+        assert_eq!(v.reason, "window_getter_unresponsive");
+    }
+
+    #[test]
+    fn starvation_unknown_or_false_changes_nothing() {
+        for starved in [None, Some(false)] {
+            assert_eq!(
+                apply_app_runtime_starvation(fired_by_events(None), starved, None),
+                fired_by_events(None),
+                "starved={starved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_post_episode_window_withdraws_a_pong_stale_from_the_episode() {
+        let cadence = crate::ui_ping::UI_PING_CADENCE.as_millis() as u64;
+        // `fired_by_events` has a pong `UI_EVENT_DEAD_AFTER_MS + 1` old.
+        let pong_age = UI_EVENT_DEAD_AFTER_MS + 1;
+        // Inside: the episode ended 1 s ago (the pong predates it), not
+        // starved now — the stale pong is the episode's, not the loop's.
+        let v = apply_app_runtime_starvation(fired_by_events(None), Some(false), Some(1_000));
+        assert!(!v.events_undelivered, "inside the post-episode window");
+        assert_eq!(v.wedged, None);
+        assert_eq!(v.reason, "app_runtime_starved");
+        // Also inside: UNKNOWN starved-now, episode ended just under a full
+        // dead window past `end + cadence`.
+        let end_age = cadence + UI_EVENT_DEAD_AFTER_MS - 1;
+        assert!(end_age - cadence < pong_age);
+        let v = apply_app_runtime_starvation(fired_by_events(None), None, Some(end_age));
+        assert!(!v.events_undelivered, "still inside the window");
+
+        // After: a full dead window has been measured since `end + cadence`
+        // with no pong — the staleness is evidence again.
+        let end_age = cadence + UI_EVENT_DEAD_AFTER_MS;
+        let v = apply_app_runtime_starvation(fired_by_events(None), Some(false), Some(end_age));
+        assert!(v.events_undelivered, "after the window the verdict stands");
+        assert_eq!(v.wedged, Some(true));
+        assert_eq!(v.reason, "events_undelivered");
+
+        // After, the other way: the pong landed after `end + cadence` and
+        // still went stale — not the episode's doing.
+        let mut late = fired_by_events(None);
+        late.event_pong_age_ms = Some(30_000);
+        let v = apply_app_runtime_starvation(late, Some(false), Some(30_000 + cadence + 1));
+        assert!(
+            v.events_undelivered,
+            "a pong that post-dates the window stands"
+        );
+
+        // UNKNOWN episode end, or no pong age: nothing changes.
+        assert_eq!(
+            apply_app_runtime_starvation(fired_by_events(None), Some(false), None),
+            fired_by_events(None)
+        );
+        let mut no_age = fired_by_events(None);
+        no_age.event_pong_age_ms = None;
+        assert_eq!(
+            apply_app_runtime_starvation(no_age, Some(false), Some(1_000)),
+            no_age
+        );
+    }
+
+    #[test]
+    fn a_starved_app_runtime_degrades_and_never_errors() {
+        let starved = HealthInputs {
+            app_runtime_starved: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(compute_derived_status(&starved), "degraded");
+        for unknown in [None, Some(false)] {
+            assert_eq!(
+                compute_derived_status(&HealthInputs {
+                    app_runtime_starved: unknown,
+                    ..Default::default()
+                }),
+                "healthy",
+                "starved={unknown:?} must not degrade"
+            );
+        }
+        // A real error still outranks it.
+        assert_eq!(
+            compute_derived_status(&HealthInputs {
+                app_runtime_starved: Some(true),
+                native_ui_wedged: Some(true),
+                ..Default::default()
+            }),
+            "errored"
+        );
+    }
 
     #[tokio::test]
     async fn first_report_sets_count_and_timestamps() {
