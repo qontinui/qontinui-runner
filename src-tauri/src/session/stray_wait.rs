@@ -2210,15 +2210,26 @@ mod live {
     }
 }
 
-/// Run `read` on the blocking pool, single-flight on `flag`, for at most `budget`.
-/// `None` when it is already running, took too long or panicked: every caller reads
-/// that as "no proven strays". A read still running past its budget keeps its flag.
+/// Why a [`bounded`] read gave no answer. Every caller reads either as "no proven
+/// strays"; only the census also cares which, because a read that is merely BUSY
+/// says nothing about how slow the box is.
 #[cfg(target_os = "linux")]
-async fn bounded<T: Send + 'static>(
+#[derive(Debug, PartialEq, Eq)]
+enum Miss {
+    /// Another read on the same flag is still running.
+    Busy,
+    /// It ran past its budget or panicked.
+    Late,
+}
+
+/// Run `read` on the blocking pool, single-flight on `flag`, for at most `budget`.
+/// A read still running past its budget keeps its flag.
+#[cfg(target_os = "linux")]
+async fn bounded_outcome<T: Send + 'static>(
     flag: &'static AtomicBool,
     budget: Duration,
     read: impl FnOnce() -> T + Send + 'static,
-) -> Option<T> {
+) -> Result<T, Miss> {
     struct Release(&'static AtomicBool);
     impl Drop for Release {
         fn drop(&mut self) {
@@ -2229,14 +2240,27 @@ async fn bounded<T: Send + 'static>(
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        return None;
+        return Err(Miss::Busy);
     }
     let release = Release(flag);
     let handle = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
         let _release = release;
         read()
     });
-    tokio::time::timeout(budget, handle).await.ok()?.ok()
+    match tokio::time::timeout(budget, handle).await {
+        Ok(Ok(value)) => Ok(value),
+        _ => Err(Miss::Late),
+    }
+}
+
+/// [`bounded_outcome`] for a caller that does not care why there was no answer.
+#[cfg(target_os = "linux")]
+async fn bounded<T: Send + 'static>(
+    flag: &'static AtomicBool,
+    budget: Duration,
+    read: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    bounded_outcome(flag, budget, read).await.ok()
 }
 
 /// Which of `candidates` are proven-stray wait loops on a fresh process table.
@@ -2249,13 +2273,15 @@ pub async fn stray_shells(candidates: Vec<(u32, u32)>) -> HashSet<u32> {
         if now < CENSUS_SKIP_UNTIL.load(Ordering::Acquire) {
             return HashSet::new();
         }
-        match bounded(&CENSUS_IN_FLIGHT, CENSUS_BUDGET, move || {
+        match bounded_outcome(&CENSUS_IN_FLIGHT, CENSUS_BUDGET, move || {
             live::verdicts(&candidates, IDLE_MIN)
         })
         .await
         {
-            Some(strays) => strays,
-            None => {
+            Ok(strays) => strays,
+            // A poll overlapping a healthy census is not evidence of a slow box.
+            Err(Miss::Busy) => HashSet::new(),
+            Err(Miss::Late) => {
                 CENSUS_SKIP_UNTIL.store(census_skip_until(now), Ordering::Release);
                 HashSet::new()
             }
@@ -3081,16 +3107,16 @@ mod tests {
     async fn a_stuck_read_is_abandoned_and_not_joined() {
         static FLAG: AtomicBool = AtomicBool::new(false);
         let (release, gate) = std::sync::mpsc::channel::<()>();
-        let stuck = bounded(&FLAG, Duration::from_millis(50), move || {
+        let stuck = bounded_outcome(&FLAG, Duration::from_millis(50), move || {
             let _ = gate.recv();
             1
         })
         .await;
-        assert_eq!(stuck, None, "past its budget");
+        assert_eq!(stuck, Err(Miss::Late), "past its budget");
         assert_eq!(
-            bounded(&FLAG, Duration::from_secs(5), || 2).await,
-            None,
-            "a stuck read is not joined"
+            bounded_outcome(&FLAG, Duration::from_secs(5), || 2).await,
+            Err(Miss::Busy),
+            "a stuck read is not joined, and says it was busy, not late"
         );
         release.send(()).unwrap();
         for _ in 0..100 {
