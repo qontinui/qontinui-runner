@@ -503,7 +503,7 @@ jobs:
       #      (qontinui-claude-config volunteer-ci-runners.md section 2), so the
       #      host is provisioned once and this step checks it. A missing package
       #      fails HERE, naming the runner: that red is the host's, not the PR's.
-      #   2. A MEMORY-DERIVED COMPILE CAP. Every cargo step in this job runs at
+      #   2. COMPILE AND TEST CONCURRENCY CAPS. Every cargo step in this job runs at
       #      cargo's default parallelism (= nproc), which on a 128-thread host is
       #      a memory spike no unit cap survives. CARGO_BUILD_JOBS is the
       #      smallest of MemTotal and every cgroup memory.max/memory.high above
@@ -513,15 +513,17 @@ jobs:
       #      job (20 jobs) peaked at 54.1 GiB — two `qontinui_runner` rustc
       #      processes alone held 17-24 GiB each, so the giant crates, not the
       #      job count, set the floor, and 3 GiB per job left ~6 GiB of
-      #      headroom under MemoryHigh. RUST_TEST_THREADS and
-      #      VITEST_MAX_WORKERS are 4, the hosted leg's own value (nproc of its
-      #      4-core VM): the suite's concurrency regime does not change with the
-      #      machine it lands on, and coord's ingest keeps recording both under
-      #      the one `ubuntu-22.04` shard. vitest's default pool is nproc - 1
-      #      workers; measured on nawa-runner-2 (nproc 128, 2026-11-03, runs
-      #      41703593573 and 41709340100), it timed seven test files' hooks out
-      #      at 10 s (import 4070 s summed across workers), so `Run frontend
-      #      unit tests` failed on every pool run.
+      #      headroom under MemoryHigh. RUST_TEST_THREADS is 4, the hosted
+      #      leg's own value (nproc of its 4-core VM), and VITEST_MAX_WORKERS
+      #      is 3, vitest's own default there (its worker count, maxWorkers, is
+      #      nproc - 1): the suites' concurrency regime does not change with the
+      #      machine they land on, and coord's ingest keeps recording both lanes
+      #      under the one `ubuntu-22.04` shard. Uncapped, vitest runs 127
+      #      workers here. On 2026-11-03 that passed `Run frontend unit tests`
+      #      in four pool runs (~26 s) and failed it in both trial runs
+      #      (41703593573 and 41709340100) where Windows legs compiled on nawa
+      #      VMs at the same time: 10 s beforeAll timeouts, import 2963 s /
+      #      4070 s summed across workers.
       #   3. A WARM, PERSISTENT TARGET. actions/checkout cleans with `git clean
       #      -ffdx`, which deletes ./target on every job. So the target lives
       #      outside the workspace, under the account's persistent home
@@ -574,10 +576,12 @@ jobs:
           [ "$jobs" -le "$cpus" ] || jobs=$cpus
           threads=4
           [ "$threads" -le "$cpus" ] || threads=$cpus
+          vitest_workers=3
+          [ "$vitest_workers" -le "$cpus" ] || vitest_workers=$cpus
           echo "CARGO_BUILD_JOBS=$jobs" >> "$GITHUB_ENV"
           echo "RUST_TEST_THREADS=$threads" >> "$GITHUB_ENV"
-          echo "VITEST_MAX_WORKERS=$threads" >> "$GITHUB_ENV"
-          echo "memory budget $((budget_kb / 1048576)) GiB, nproc $cpus -> CARGO_BUILD_JOBS=$jobs RUST_TEST_THREADS=$threads VITEST_MAX_WORKERS=$threads"
+          echo "VITEST_MAX_WORKERS=$vitest_workers" >> "$GITHUB_ENV"
+          echo "memory budget $((budget_kb / 1048576)) GiB, nproc $cpus -> CARGO_BUILD_JOBS=$jobs RUST_TEST_THREADS=$threads VITEST_MAX_WORKERS=$vitest_workers"
 
           cache="$CI_POOL_HOME/.cache/qontinui-runner-ci/$RUNNER_NAME/target"
           mkdir -p "$cache"
