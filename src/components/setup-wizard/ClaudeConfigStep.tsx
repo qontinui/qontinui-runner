@@ -41,6 +41,9 @@ export function ClaudeConfigStep({ onComplete, onBack }: ClaudeConfigStepProps) 
   // Discovery refuses (e.g. an unreadable claude-accounts.json); then Finish
   // adds nothing, because what is configured could not be read.
   const [discoveryError, setDiscoveryError] = useState<string | null>(null);
+  // The add was refused or failed: shown inline, and the wizard stays on this
+  // step so the user sees it rather than finishing with nothing added.
+  const [addError, setAddError] = useState<string | null>(null);
 
   const discoverDirs = async () => {
     setLoading(true);
@@ -110,6 +113,7 @@ export function ClaudeConfigStep({ onComplete, onBack }: ClaudeConfigStepProps) 
 
   const handleFinish = useCallback(async () => {
     setSaving(true);
+    setAddError(null);
     try {
       const toAdd = discoveryError === null ? claudeDirsToAdd(dirs, checked) : [];
       if (toAdd.length > 0) {
@@ -117,10 +121,12 @@ export function ClaudeConfigStep({ onComplete, onBack }: ClaudeConfigStepProps) 
       }
     } catch (err) {
       console.error("Failed to add Claude config dirs:", err);
-    } finally {
+      setAddError(String(err));
       setSaving(false);
-      onComplete();
+      return;
     }
+    setSaving(false);
+    onComplete();
   }, [dirs, checked, discoveryError, onComplete]);
 
   const handleSkip = useCallback(() => {
@@ -200,12 +206,24 @@ export function ClaudeConfigStep({ onComplete, onBack }: ClaudeConfigStepProps) 
         <button
           className="btn-secondary w-full flex items-center justify-center gap-2"
           onClick={handleAddDirectory}
+          // A folder picked while the roster cannot be read would be neither
+          // shown nor added, so picking one is not offered.
+          disabled={discoveryError !== null}
           data-testid="claude-config-add-directory"
         >
           <Plus className="w-4 h-4" />
           Add Directory
         </button>
       </div>
+
+      {addError !== null && (
+        <p
+          className="max-w-xl mx-auto w-full text-sm text-red-400"
+          data-testid="claude-config-add-error"
+        >
+          Could not add the selected Claude accounts: {addError}
+        </p>
+      )}
 
       {/* Navigation */}
       <div className="flex justify-between max-w-xl mx-auto w-full pt-4">

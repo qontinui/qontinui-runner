@@ -41,13 +41,19 @@ afterEach(() => {
   container.remove();
 });
 
-/** Discovery answers `discovered` (or rejects with `discoveryError`). */
-function stubBackend(discovered: DiscoveredDir[], discoveryError?: string) {
+/**
+ * Discovery answers `discovered` (or rejects with `discoveryError`); the add
+ * resolves, or rejects with `addError`.
+ */
+function stubBackend(discovered: DiscoveredDir[], discoveryError?: string, addError?: string) {
   invoke.mockImplementation((cmd: string) => {
     if (cmd === "discover_claude_config_dirs") {
       return discoveryError === undefined
         ? Promise.resolve(discovered)
         : Promise.reject(new Error(discoveryError));
+    }
+    if (cmd === "add_claude_config_dirs_from_setup" && addError !== undefined) {
+      return Promise.reject(new Error(addError));
     }
     return Promise.resolve({ added: 0, dirs: [] });
   });
@@ -156,16 +162,39 @@ describe("ClaudeConfigStep Finish", () => {
     });
   });
 
-  it("when discovery cannot read the roster, writes nothing", async () => {
+  it("when discovery cannot read the roster, writes nothing and offers no folder picker", async () => {
     stubBackend([], "claude-accounts.json exists but cannot be read");
     openDialog.mockResolvedValue("/picked/acct");
     await renderStep();
     expect(byTestId("claude-config-discovery-error")).toHaveLength(1);
+    const addDirectory = byTestId<HTMLButtonElement>("claude-config-add-directory")[0];
+    expect(addDirectory.disabled).toBe(true);
 
-    await click(byTestId("claude-config-add-directory")[0]);
+    await click(addDirectory);
     await click(byTestId("claude-config-finish")[0]);
 
+    expect(openDialog).not.toHaveBeenCalled();
     expect(commandsCalled()).toEqual(["discover_claude_config_dirs"]);
     expect(onComplete).toHaveBeenCalledTimes(1);
+  });
+
+  it("a refused add is shown inline and the wizard stays on this step", async () => {
+    stubBackend(
+      [foundB],
+      undefined,
+      "/cfg/claude-accounts.json exists but cannot be read; refusing to write",
+    );
+    await renderStep();
+
+    await click(byTestId("claude-config-finish")[0]);
+
+    expect(invoke).toHaveBeenCalledWith("add_claude_config_dirs_from_setup", {
+      dirs: ["/home/u/.claude-b"],
+    });
+    const shown = byTestId("claude-config-add-error");
+    expect(shown).toHaveLength(1);
+    expect(shown[0].textContent).toContain("refusing to write");
+    expect(onComplete).not.toHaveBeenCalled();
+    expect(byTestId<HTMLButtonElement>("claude-config-finish")[0].disabled).toBe(false);
   });
 });
