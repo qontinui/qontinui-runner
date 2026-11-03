@@ -3011,6 +3011,8 @@ mod tests {
     /// a shell of its own.
     fn stray_fixture() -> (ProcessSnapshot, TrackingHealthReport) {
         let now_ms = 1_800_000_000_000;
+        // After the runner's boot (`now_ms - 3_600_000` below), or nothing is tracked.
+        let t0 = now_ms / 1_000 - 1_800;
         let snap = snap_with(
             &[
                 (1, &[5, 6, 7, 8]),
@@ -3024,7 +3026,24 @@ mod tests {
                 (60, &[61]),
                 (61, &[62]),
             ],
-            &[],
+            // Every pid enumerated (an unseen pid reads "could not look"), and each
+            // child started well past the session-start window, so it counts as work.
+            &[
+                (5, t0),
+                (6, t0),
+                (7, t0),
+                (8, t0),
+                (20, t0),
+                (30, t0),
+                (40, t0),
+                (60, t0),
+                (21, t0 + 600),
+                (31, t0 + 600),
+                (41, t0 + 600),
+                (42, t0 + 600),
+                (61, t0 + 600),
+                (62, t0 + 1_200),
+            ],
             &[
                 (20, "claude"),
                 (21, "bash"),
