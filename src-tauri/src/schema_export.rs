@@ -158,6 +158,10 @@ pub fn export_all_schemas() -> Value {
     add!("RecurringAgentDispatchRole", qs::RecurringAgentDispatchRole);
     add!("RecurringAgentOs", qs::RecurringAgentOs);
     add!("RecurringAgentTarget", qs::RecurringAgentTarget);
+    add!(
+        "RecurringAgentExcludedValue",
+        qs::RecurringAgentExcludedValue
+    );
     add!("RecurringAgentParamKind", qs::RecurringAgentParamKind);
     add!("RecurringAgentParamDef", qs::RecurringAgentParamDef);
     add!("RecurringAgentParamSchema", qs::RecurringAgentParamSchema);
@@ -1096,18 +1100,20 @@ mod tests {
         // RequirementFrontmatter, InterfaceMappingFrontmatter, StoryFrontmatter,
         // SpecAcceptanceCriterion, SourceCitation, SourceCitationKind,
         // ExternalRef, TemplateRef, MappingRow, SpecLanguage) = 611.
-        // + the 12 recurring-agent types (ManagedBy, RecurringAgentDispatchRole,
-        // RecurringAgentOs, RecurringAgentTarget, RecurringAgentParamKind,
+        // + the 13 recurring-agent types (ManagedBy, RecurringAgentDispatchRole,
+        // RecurringAgentOs, RecurringAgentTarget, RecurringAgentExcludedValue,
+        // RecurringAgentParamKind,
         // RecurringAgentParamDef, RecurringAgentParamSchema, RecurringAgentSpec,
         // RecurringAgentState, RecurringAgentOverride, RecurringAgentStatus,
         // RecurringAgentStatusReport — plan
         // 2026-10-29-recurring-agents-declared-in-coord-reconciled-by-runner
-        // Phase 4a) = 623.
-        // The codegen's "Processing N top-level types" line should read 623 here.
-        assert_eq!(obj.len(), 623, "Expected 623 schema entries");
+        // Phase 4a) = 624.
+        // The codegen's "Processing N top-level types" line should read 624 here.
+        assert_eq!(obj.len(), 624, "Expected 624 schema entries");
         for recurring in [
             "ManagedBy",
             "RecurringAgentTarget",
+            "RecurringAgentExcludedValue",
             "RecurringAgentParamSchema",
             "RecurringAgentSpec",
             "RecurringAgentStatus",

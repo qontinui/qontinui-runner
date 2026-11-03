@@ -139,6 +139,52 @@ fn refuse_bad_timezone(timezone: Option<&str>) -> Result<(), (StatusCode, Json<A
     }
 }
 
+/// Refuse every caller of the managed-task upsert that is not NonBrowser (the
+/// in-process reconciler is not an HTTP caller at all; installers and agents
+/// are NonBrowser) or the runner's own webview. A managed task runs
+/// unattended on this device, so no browser class — Trusted included — may
+/// write one, under any route policy. An absent principal is UNKNOWN and
+/// refused.
+pub(crate) fn refuse_browser_caller(principal: Option<&RequesterPrincipal>) -> Result<(), String> {
+    match principal.map(|p| p.class) {
+        Some(OriginClass::NonBrowser | OriginClass::FirstParty) => Ok(()),
+        class => Err(format!(
+            "a managed scheduled task runs unattended on this device; only a non-browser \
+             caller or the runner's own UI may upsert one (requester class: {})",
+            class.map(OriginClass::as_str).unwrap_or("unknown")
+        )),
+    }
+}
+
+/// Refuse a managed key that is not already in its one stored spelling: the
+/// source must be [`crate::scheduler::MANAGED_SOURCE_COORD`] (the only source
+/// today), and no segment may carry leading or trailing whitespace — `" a"`
+/// and `"a"` would otherwise be two keys for one agent.
+pub(crate) fn refuse_unnormalized_key(
+    source: &str,
+    tenant_id: &str,
+    agent: &str,
+) -> Result<(), String> {
+    for (field, value) in [
+        ("source", source),
+        ("tenantId", tenant_id),
+        ("agent", agent),
+    ] {
+        if value.trim() != value {
+            return Err(format!(
+                "managed.{field} has leading or trailing whitespace: {value:?}"
+            ));
+        }
+    }
+    if source != crate::scheduler::MANAGED_SOURCE_COORD {
+        return Err(format!(
+            "managed.source must be {:?} (the only managed source); got {source:?}",
+            crate::scheduler::MANAGED_SOURCE_COORD
+        ));
+    }
+    Ok(())
+}
+
 /// Request body for updating scheduler settings
 #[derive(Debug, Deserialize)]
 pub struct UpdateSchedulerSettingsRequest {
@@ -814,10 +860,13 @@ pub async fn reconcile_now(
 /// this route only ever reads and writes the row whose
 /// `(managed_source, managed_tenant_id, managed_agent)` equals the path. 201 =
 /// created, 200 = updated, 400 = a malformed key / version / digest /
-/// timezone / conditions, 403 = the same Script / requireProbe refusals as
-/// the other two task-write routes (an existing managed task's stored value
-/// is the echo baseline), 409 = the task moved between this read and the
-/// conditional write.
+/// timezone / conditions, 403 = any browser caller (this route is a
+/// `CREDENTIAL_DOORS` entry AND refuses every browser class itself, so it
+/// holds under every route policy) plus the same Script / requireProbe
+/// refusals as the other two task-write routes (an existing managed task's
+/// stored value is the echo baseline), 409 = the task moved or vanished
+/// between this read and the conditional write, 503 = the managed-key index
+/// is missing on this database.
 pub async fn upsert_managed_task(
     State(state): State<Arc<ApiState>>,
     principal: Option<axum::Extension<RequesterPrincipal>>,
@@ -825,6 +874,10 @@ pub async fn upsert_managed_task(
     Json(request): Json<UpsertManagedTaskRequest>,
 ) -> Result<(StatusCode, Json<ApiResponse<serde_json::Value>>), (StatusCode, Json<ApiResponse<()>>)>
 {
+    refuse_browser_caller(principal.as_ref().map(|p| &p.0))
+        .map_err(|e| (StatusCode::FORBIDDEN, Json(api_error(e))))?;
+    refuse_unnormalized_key(&source, &tenant_id, &agent)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
     let pg = &state.app_state.pg_db;
     let managed = crate::scheduler::ManagedBy {
         source,
@@ -944,10 +997,22 @@ pub async fn upsert_managed_task(
         .upsert_managed_scheduled_task(&task, expected_modified_at.as_deref())
         .await
         .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to upsert managed task: {}", e))),
-            )
+            use crate::database::pg::scheduler::ManagedUpsertError;
+            match e {
+                ManagedUpsertError::KeyIndexMissing(e) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(api_error(format!(
+                        "the managed-key index uq_scheduled_tasks_managed_key is missing or \
+                         invalid on this database, so a managed task cannot be upserted; the \
+                         runner's startup self-heal (or qontinui-web revision \
+                         recurring_agents_01_coord_tables) creates it: {e}"
+                    ))),
+                ),
+                ManagedUpsertError::Other(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Failed to upsert managed task: {}", e))),
+                ),
+            }
         })?;
     use crate::database::pg::scheduler::ManagedUpsert;
     let status = match outcome {
@@ -1399,5 +1464,50 @@ mod tests {
         assert!(body.contains("StatusCode::CONFLICT"));
         assert!(src.contains(r#""/scheduler/tasks/by-key/{source}/{tenant_id}/{agent}""#));
         assert!(src.contains("put(upsert_managed_task)"));
+    }
+
+    #[test]
+    fn only_non_browser_and_first_party_may_upsert_a_managed_task() {
+        for class in [OriginClass::NonBrowser, OriginClass::FirstParty] {
+            assert!(refuse_browser_caller(Some(&principal(class))).is_ok());
+        }
+        for class in [
+            OriginClass::Trusted,
+            OriginClass::Extension,
+            OriginClass::Foreign,
+        ] {
+            let refusal = refuse_browser_caller(Some(&principal(class))).unwrap_err();
+            assert!(refusal.contains(class.as_str()), "{refusal}");
+        }
+        assert!(refuse_browser_caller(None).unwrap_err().contains("unknown"));
+    }
+
+    #[test]
+    fn the_managed_key_must_be_coord_with_no_surrounding_whitespace() {
+        let tenant = "0b0e9a40-6b1f-4c3e-9d55-5d1b8c4a2f10";
+        assert!(refuse_unnormalized_key("coord", tenant, "cleanup-steward").is_ok());
+        assert!(refuse_unnormalized_key("Coord", tenant, "a").is_err());
+        assert!(refuse_unnormalized_key("other", tenant, "a").is_err());
+        assert!(refuse_unnormalized_key(" coord", tenant, "a").is_err());
+        assert!(refuse_unnormalized_key("coord", &format!("{tenant} "), "a").is_err());
+        assert!(refuse_unnormalized_key("coord", tenant, " a").is_err());
+        assert!(refuse_unnormalized_key("coord", tenant, "a\t").is_err());
+    }
+
+    /// The by-key handler refuses a browser caller and an unnormalized key
+    /// before it touches the database.
+    #[test]
+    fn the_by_key_handler_refuses_browsers_and_bad_keys_first() {
+        let src = include_str!("scheduler.rs");
+        let (_, body) = src
+            .split_once("pub async fn upsert_managed_task(")
+            .expect("by-key handler");
+        let (before_db, _) = body
+            .split_once("let pg = &state.app_state.pg_db;")
+            .expect("pg");
+        assert!(before_db.contains("refuse_browser_caller("));
+        assert!(before_db.contains("refuse_unnormalized_key("));
+        assert!(body.contains("ManagedUpsertError::KeyIndexMissing"));
+        assert!(body.contains("StatusCode::SERVICE_UNAVAILABLE"));
     }
 }
