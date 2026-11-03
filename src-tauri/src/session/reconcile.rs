@@ -559,6 +559,11 @@ pub fn run_reconcile<I: TranscriptIndex>(
     //    `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`).
     apply_verdicts(store, evidence, &mut actions);
     let open_now = store.open_records();
+    // What the panes' records evidence after the lag rule
+    // ([`pane_binding::discount_lagging`]): a record that may lag a
+    // hook-reported switch neither claims its session for the pane nor binds
+    // it there.
+    let effective = pane_binding::discount_lagging(&open_now, evidence);
     let contradicted = |r: &TerminalSessionRecord| r.binding_state == Some(BindingState::Unknown);
     // Every index this pass needs, built ONCE (a fully bound fleet then costs
     // no per-pane scan of the rows): the panes already bound...
@@ -601,7 +606,7 @@ pub fn run_reconcile<I: TranscriptIndex>(
                 .insert(r.claude_session_id.as_str());
         }
     }
-    for (terminal, ev) in evidence {
+    for (terminal, ev) in &effective {
         if let Some(id) = ev.named_session() {
             holders.entry(id).or_default().insert(terminal.as_str());
         }
@@ -648,7 +653,7 @@ pub fn run_reconcile<I: TranscriptIndex>(
             .ai_pid
             .and_then(|pid| cmdline_ids.get(&pid))
             .map(|s| s.as_str());
-        let registry_sid: Option<&str> = evidence
+        let registry_sid: Option<&str> = effective
             .get(&pty.terminal_id)
             .and_then(PaneEvidence::named_session);
         // This pane's claims: the pass-wide set plus every session a PEER live
@@ -697,6 +702,14 @@ pub fn run_reconcile<I: TranscriptIndex>(
                     .as_ref()
                     .map(|r| r.zone_index)
                     .unwrap_or(UNZONED_ZONE_INDEX);
+                // A re-bind that writes nothing new: the row is already open
+                // here, under this origin, at least this confirmed.
+                let unchanged = bind_is_unchanged(
+                    store.get(session_id).as_ref(),
+                    &pty.terminal_id,
+                    *origin,
+                    *confirmed,
+                );
                 // A confirmed bind is written CONFIRMED (see `bind_record`) so
                 // `record_open_checked`'s supersede retires the identity seam's
                 // unconfirmed sibling on this terminal in the same write.
@@ -755,6 +768,17 @@ pub fn run_reconcile<I: TranscriptIndex>(
                             claude_session = %session_id,
                             confirmed = *confirmed,
                             "session binder: bound authoritative session from typed --session-id cmdline"
+                        );
+                    }
+                    // A hookless pane whose recorded session has no transcript
+                    // yet is re-bound, unchanged, every tick: say so once, at
+                    // info, only when the bind changed the row.
+                    BindOrigin::ProviderRegistry if unchanged => {
+                        tracing::debug!(
+                            terminal_id = %pty.terminal_id,
+                            claude_session = %session_id,
+                            confirmed = *confirmed,
+                            "session binder: re-bound the session the pane's own claude records (unchanged)"
                         );
                     }
                     BindOrigin::ProviderRegistry => {
@@ -832,7 +856,13 @@ fn apply_verdicts(
     evidence: &HashMap<String, PaneEvidence>,
     actions: &mut Vec<ReconcileAction>,
 ) {
-    let verdicts = pane_binding::binding_verdicts(&store.open_records(), evidence);
+    let open = store.open_records();
+    // A pane whose record may lag a hook-reported switch gives no verdict, and
+    // a verdict its rows carry from before the switch is withdrawn.
+    for (session, terminal) in pane_binding::rows_on_lagging_panes(&open, evidence) {
+        store.clear_binding_state(&session, &terminal);
+    }
+    let verdicts = pane_binding::binding_verdicts(&open, evidence);
     for mismatch in pane_binding::apply_binding_verdicts(store, &verdicts) {
         actions.push(ReconcileAction::BindingMismatch {
             terminal_id: mismatch.terminal_id,
@@ -1481,6 +1511,11 @@ pub async fn run_reconcile_pass(
         // empty map when no pane is live: a pane absent here is not live.
         store.observe_panes(observation);
     }
+    let before: HashMap<String, TerminalSessionRecord> = store
+        .open_records()
+        .into_iter()
+        .map(|r| (r.claude_session_id.clone(), r))
+        .collect();
     let actions = run_reconcile(store, &live, snapshot, &index, &cmdline_ids, &evidence);
 
     let bound = actions
@@ -1515,9 +1550,26 @@ pub async fn run_reconcile_pass(
         .iter()
         .filter(|a| matches!(a, ReconcileAction::BindingMismatch { .. }))
         .count();
-    if bound > 0 || pruned > 0 || ambiguous > 0 || refused > 0 || mismatched > 0 {
+    // Binds that changed a row. A refusal, or a re-bind that wrote nothing new,
+    // recurs every tick for as long as its cause lasts (a hookless pane, the
+    // same session in two panes): those log at debug, so INFO says what moved.
+    let changed = actions
+        .iter()
+        .filter(|a| match a {
+            ReconcileAction::Bind {
+                terminal_id,
+                session_id,
+                origin,
+                confirmed,
+                ..
+            } => !bind_is_unchanged(before.get(session_id), terminal_id, *origin, *confirmed),
+            _ => false,
+        })
+        .count();
+    if changed > 0 || pruned > 0 || ambiguous > 0 || mismatched > 0 {
         tracing::info!(
             bound,
+            changed,
             observed,
             ambiguous,
             pruned,
@@ -1527,8 +1579,33 @@ pub async fn run_reconcile_pass(
             context,
             "session reconcile: pass complete"
         );
+    } else if bound > 0 || refused > 0 {
+        tracing::debug!(
+            bound,
+            refused,
+            live = live.len(),
+            context,
+            "session reconcile: pass complete (nothing changed)"
+        );
     }
     actions
+}
+
+/// Whether a bind of `session_id` onto `terminal_id` writes nothing new over
+/// `existing`, the session's row before it: already open on that terminal,
+/// under the same origin, and confirmed if the bind is.
+fn bind_is_unchanged(
+    existing: Option<&TerminalSessionRecord>,
+    terminal_id: &str,
+    origin: BindOrigin,
+    confirmed: bool,
+) -> bool {
+    existing.is_some_and(|r| {
+        r.state == "open"
+            && r.terminal_id == terminal_id
+            && r.origin.as_deref() == Some(origin.as_origin_const())
+            && (r.confirmed_at.is_some() || !confirmed)
+    })
 }
 
 /// Boot entrypoint: take a fresh process snapshot, project the live PTY set, and
@@ -3155,13 +3232,16 @@ mod tests {
     /// M2: the same session running in TWO panes (both records name it, its
     /// row on B). A's registry rung never proposes it — another pane holds it —
     /// so nothing is refused, nothing counted, and the row stays on B, tick
-    /// after tick.
+    /// after tick. A still carries its spawn seam's unconfirmed pin (the
+    /// production shape, round-2 review M3): that pin reads `unknown` — its
+    /// pane runs another session — but is never counted as a fault.
     #[test]
     fn a_session_two_panes_run_is_never_proposed_for_the_pane_that_does_not_hold_it() {
         let dir = tempdir().unwrap();
         let panes = [("term-a", names("s-b")), ("term-b", names("s-b"))];
         let (store, counters) = store_with_panes(dir.path(), &panes);
         store.record_open(unconfirmed_on("s-b", "term-b"));
+        store.record_open(unconfirmed_on("pin-a", "term-a"));
         let (live, _) = two_panes_one_workdir();
 
         for _ in 0..3 {
@@ -3187,6 +3267,53 @@ mod tests {
             );
         }
         assert_eq!(store.get("s-b").unwrap().terminal_id, "term-b");
+        assert_eq!(
+            store.get("pin-a").unwrap().binding_state,
+            Some(BindingState::Unknown),
+            "the pin's pane runs another session"
+        );
+        assert_eq!((counters.mismatches(), counters.refused_moves()), (0, 0));
+    }
+
+    /// Round-2 review M2, at the pass: pane A's hook recorded `s2` starting
+    /// after `s`, but A's record still names `s`. The pass withdraws the
+    /// `matched` `s` carried from before the switch, judges nothing on A, and
+    /// counts nothing.
+    #[test]
+    fn a_pane_whose_record_may_lag_a_hook_reported_switch_is_judged_on_nothing() {
+        let dir = tempdir().unwrap();
+        let panes = [("term-a", names("s")), ("term-b", PaneEvidence::Unknown)];
+        let (store, counters) = store_with_panes(dir.path(), &panes);
+        let started = |id: &str, start: i64| TerminalSessionRecord {
+            last_session_start_at: Some(start),
+            ..title_rec(id, "term-a", Some("T"))
+        };
+        store.record_open(started("s", 100));
+        let _ = store.set_binding_state("s", "term-a", BindingState::Matched);
+        store.record_open(TerminalSessionRecord {
+            confirmed_at: None,
+            ..started("s2", 200)
+        });
+        store.confirm_session("s2");
+        let (live, _) = two_panes_one_workdir();
+
+        let actions = run_reconcile(
+            &store,
+            &live,
+            &ProcessSnapshot::default(),
+            &no_transcripts(),
+            &no_cmdlines(),
+            &evidence(&panes),
+        );
+
+        assert_eq!(store.get("s").unwrap().binding_state, None, "{actions:?}");
+        assert_eq!(store.get("s2").unwrap().binding_state, None, "{actions:?}");
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, ReconcileAction::BindingMismatch { .. })),
+            "{actions:?}"
+        );
         assert_eq!((counters.mismatches(), counters.refused_moves()), (0, 0));
     }
 
@@ -3314,5 +3441,45 @@ mod tests {
             BindOrigin::ProviderRegistry.as_origin_const(),
             ORIGIN_AUTHORITATIVE
         );
+    }
+
+    /// Round-2 review L7: a re-bind that writes nothing new — the row already
+    /// open on the pane, under the same origin, at least as confirmed — is
+    /// "unchanged", and a pass made only of those (and of refusals) logs at
+    /// debug, not info.
+    #[test]
+    fn a_re_bind_that_writes_nothing_new_is_unchanged() {
+        let row = TerminalSessionRecord {
+            confirmed_at: None,
+            ..title_rec("s", "term-a", None)
+        };
+        assert!(bind_is_unchanged(
+            Some(&row),
+            "term-a",
+            BindOrigin::ProviderRegistry,
+            false
+        ));
+        assert!(
+            !bind_is_unchanged(Some(&row), "term-a", BindOrigin::ProviderRegistry, true),
+            "confirming the row changes it"
+        );
+        assert!(!bind_is_unchanged(
+            Some(&row),
+            "term-b",
+            BindOrigin::ProviderRegistry,
+            false
+        ));
+        assert!(!bind_is_unchanged(
+            Some(&row),
+            "term-a",
+            BindOrigin::Observed,
+            false
+        ));
+        assert!(!bind_is_unchanged(
+            None,
+            "term-a",
+            BindOrigin::ProviderRegistry,
+            false
+        ));
     }
 }

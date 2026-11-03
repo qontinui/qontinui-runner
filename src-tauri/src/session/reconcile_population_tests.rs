@@ -12,7 +12,16 @@
 //!
 //! Kept in its own file, using only what the pass's callers use, so it compiles
 //! with or without the change it observes — the arming proof runs it both ways
-//! (`scripts/arming-record.sh`).
+//! (`qontinui-claude-config/scripts/arming-record.sh`, which lives in the
+//! workspace's config repo, not in this one).
+//!
+//! What it does NOT do: production also attaches a
+//! `pane_binding::LivePaneRegistry` to the store (`main.rs`, beside the
+//! transcript probe). This test cannot, because that API is the change's own
+//! — naming it would enter on the producer side, and the file would no longer
+//! compile without the change. The pass reads the panes' records itself either
+//! way; without a registry the store's binding guard has no evidence and never
+//! refuses, so what this test observes is the reconcile pass's own choice.
 
 use crate::process_capture::process_tree::ProcessSnapshot;
 use crate::session::reconcile::{run_reconcile_pass, LivePty};
@@ -89,7 +98,13 @@ fn process_table() -> ProcessSnapshot {
 /// readable. S_A's transcript carries no timestamp in its first lines, so no
 /// start anchor admits it; S_B's started after BOTH panes' `claude`, so for
 /// pane A it is the one transcript rung 3 would correlate. Pane A must not
-/// take it, and pane B's session must stay on pane B.
+/// take it, pane B's session must stay on pane B — and pane B, whose own
+/// transcript is the one found, ends CONFIRMED there (which also proves the
+/// fixture transcripts were discovered at all).
+///
+/// The terminal manager lists panes in no order this test may rely on, and
+/// the pass binds them in list order, so both orders are run, each on a fresh
+/// store.
 #[tokio::test]
 async fn a_live_peers_unconfirmed_session_stays_on_its_pane_through_the_reconcile_pass() {
     let ambient = crate::test_env::isolated_ambient();
@@ -108,27 +123,35 @@ async fn a_live_peers_unconfirmed_session_stays_on_its_pane_through_the_reconcil
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, transcript).unwrap();
     }
-    let store_path = ambient.dir().join("terminal-sessions.json");
-    std::fs::write(&store_path, snapshot_file()).unwrap();
-    let store = SessionLifecycleStore::open(&store_path).unwrap();
 
-    let live = vec![pane("term-a", SHELL_A), pane("term-b", SHELL_B)];
-    let actions = run_reconcile_pass(&store, &live, &process_table(), "test").await;
+    let a_then_b = vec![pane("term-a", SHELL_A), pane("term-b", SHELL_B)];
+    let b_then_a = vec![pane("term-b", SHELL_B), pane("term-a", SHELL_A)];
+    for (order, live) in [("A then B", a_then_b), ("B then A", b_then_a)] {
+        let store_path = ambient
+            .dir()
+            .join(format!("terminal-sessions-{}.json", live[0].terminal_id));
+        std::fs::write(&store_path, snapshot_file()).unwrap();
+        let store = SessionLifecycleStore::open(&store_path).unwrap();
 
-    let where_is = |id: &str| {
-        store
-            .get(id)
-            .map(|row| (row.state, row.terminal_id))
-            .unwrap_or_default()
-    };
-    assert_eq!(
-        where_is(S_A),
-        ("open".to_string(), "term-a".to_string()),
-        "pane A keeps its own session (actions: {actions:?})"
-    );
-    assert_eq!(
-        where_is(S_B),
-        ("open".to_string(), "term-b".to_string()),
-        "pane B's session stays on pane B (actions: {actions:?})"
-    );
+        let actions = run_reconcile_pass(&store, &live, &process_table(), "test").await;
+
+        let where_is = |id: &str| {
+            store
+                .get(id)
+                .map(|row| (row.state, row.terminal_id, row.confirmed_at.is_some()))
+                .unwrap_or_default()
+        };
+        let (a_state, a_terminal, _) = where_is(S_A);
+        assert_eq!(
+            (a_state.as_str(), a_terminal.as_str()),
+            ("open", "term-a"),
+            "{order}: pane A keeps its own session (actions: {actions:?})"
+        );
+        assert_eq!(
+            where_is(S_B),
+            ("open".to_string(), "term-b".to_string(), true),
+            "{order}: pane B's session stays on pane B, confirmed from its own transcript \
+             (actions: {actions:?})"
+        );
+    }
 }

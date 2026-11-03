@@ -60,7 +60,7 @@ use tracing::{debug, info, warn};
 
 use crate::session::observation_epoch::{ObservationEpoch, Observed};
 use crate::session::pane_binding::{
-    BindingCounters, PaneEvidence, PaneEvidenceOracle, PaneObservation, RecordedSession,
+    self, BindingCounters, PaneEvidence, PaneEvidenceOracle, PaneObservation, RecordedSession,
 };
 use crate::session::restore_record_emitter::RestoreRecordEmitter;
 use crate::session::snapshot_history::{SnapshotHistory, SnapshotSession, TranscriptProbe};
@@ -479,6 +479,10 @@ fn reap_restore_marker_on_close(rec: &mut TerminalSessionRecord) {
     // stamp behind for a later re-open to mistake for a running hold.
     rec.awaiting_account_since = None;
     rec.restore_pending_at = None;
+    // A binding verdict is about a LIVE pane: a closed row has none, so
+    // `/sessions/history` never serves a stale `matched` with its terminal, nor
+    // withholds the terminal of a session that has ended.
+    rec.binding_state = None;
     if rec.restore_tier.as_deref() == Some(RESTORE_TIER_FAILED) {
         rec.restore_tier = Some(RESTORE_TIER_TERMINAL_ONLY.to_string());
     }
@@ -1687,6 +1691,28 @@ impl SessionLifecycleStore {
         }
     }
 
+    /// [`Self::pane_evidence_of`] after the lag rule
+    /// ([`crate::session::pane_binding::record_may_lag`]), judged against the
+    /// rows in `m` (the caller holds the map): a record naming a session the
+    /// pane's hook-reported switch may have left behind is
+    /// [`PaneEvidence::Unknown`], never `Names` — so it neither refuses a move
+    /// nor spares a sibling nor marks a row `matched` on the strength of what
+    /// may be a stale record.
+    fn effective_pane_evidence(
+        &self,
+        m: &HashMap<String, TerminalSessionRecord>,
+        terminal_id: &str,
+    ) -> PaneEvidence {
+        match self.pane_evidence_of(terminal_id) {
+            PaneEvidence::Names(named)
+                if pane_binding::record_may_lag(m.values(), terminal_id, &named) =>
+            {
+                PaneEvidence::Unknown
+            }
+            evidence => evidence,
+        }
+    }
+
     /// Every live pane whose own `claude` records `session_id`, per the
     /// attached oracle. Empty without one.
     pub(crate) fn panes_naming(&self, session_id: &str) -> Vec<String> {
@@ -1989,8 +2015,10 @@ impl SessionLifecycleStore {
                 return RecordOpenOutcome::MoveRefused { held_by };
             }
             // What the bound pane's own `claude` records — for the bind-time
-            // `matched` and for sparing the sibling it runs.
-            let pane = self.pane_evidence_of(&new_terminal_id);
+            // `matched` and for sparing the sibling it runs — after the lag
+            // rule: a record a hook-reported switch may have left behind names
+            // nothing.
+            let pane = self.effective_pane_evidence(&m, &new_terminal_id);
             // The terminal the row held before this write, if it existed — a
             // binding verdict is about ONE pane, so a move drops it.
             let previous_terminal = m.get(&new_id).map(|r| r.terminal_id.clone());
@@ -2203,9 +2231,25 @@ impl SessionLifecycleStore {
             // set.
             let mut superseded: Vec<TerminalSessionRecord> = Vec::new();
             if (new_is_authoritative || new_is_confirmed) && !new_terminal_id.is_empty() {
-                let pane_runs = |id: &str| {
-                    pane.named_session() == Some(id) || !self.panes_naming(id).is_empty()
-                };
+                // The siblings some live pane's own record names — another
+                // pane's only when that record may not lag a hook-reported
+                // switch (the lag rule, as for the bound pane above).
+                let spared: HashSet<String> = m
+                    .values()
+                    .filter(|o| {
+                        o.claude_session_id != new_id
+                            && o.terminal_id == new_terminal_id
+                            && o.state == "open"
+                    })
+                    .filter(|o| {
+                        let id = o.claude_session_id.as_str();
+                        pane.named_session() == Some(id)
+                            || self.panes_naming(id).iter().any(|terminal| {
+                                !pane_binding::record_may_lag(m.values(), terminal, id)
+                            })
+                    })
+                    .map(|o| o.claude_session_id.clone())
+                    .collect();
                 for other in m.values_mut() {
                     // A row held for an account choice is never a sibling: the
                     // hold detached its terminal, so it cannot share this one.
@@ -2215,7 +2259,7 @@ impl SessionLifecycleStore {
                     {
                         continue;
                     }
-                    if pane_runs(&other.claude_session_id) {
+                    if spared.contains(&other.claude_session_id) {
                         debug!(
                             terminal_id = %new_terminal_id,
                             spared = %other.claude_session_id,
@@ -2287,8 +2331,10 @@ impl SessionLifecycleStore {
     ///
     /// - the old pane's own `claude` records the session → refused, whatever
     ///   the incoming bind;
-    /// - the old pane's evidence cannot be read ([`PaneEvidence::Unknown`]) →
-    ///   refused only for a WEAK incoming bind (neither authoritative nor
+    /// - the old pane's evidence cannot be read ([`PaneEvidence::Unknown`]) —
+    ///   including a record that may LAG a switch the pane's hook already
+    ///   reported ([`Self::effective_pane_evidence`]) → refused only for a
+    ///   WEAK incoming bind (neither authoritative nor
     ///   confirmed: a transcript-mtime guess, a provisional typed-resume sniff,
     ///   a restore rebind). A weak bind is no reason to take a row from a pane
     ///   that may be running it; a strong one keeps the pre-guard behaviour;
@@ -2320,8 +2366,9 @@ impl SessionLifecycleStore {
             return None;
         }
         let old_terminal = row.terminal_id.as_str();
-        let oracle = self.pane_evidence.get()?;
-        let refused = match oracle.pane_evidence(old_terminal) {
+        // No oracle attached: no evidence, so nothing is refused.
+        self.pane_evidence.get()?;
+        let refused = match self.effective_pane_evidence(m, old_terminal) {
             PaneEvidence::Names(id) => id == session_id,
             PaneEvidence::Unknown => !incoming_strong,
             PaneEvidence::NoClaude => false,
@@ -2457,6 +2504,37 @@ impl SessionLifecycleStore {
             );
         }
         Some(previous)
+    }
+
+    /// Withdraw a verdict: `claude_session_id`'s row, still open on
+    /// `terminal_id`, reads unchecked again. The reconcile pass does this for
+    /// every row on a pane whose record may lag a hook-reported switch
+    /// ([`crate::session::pane_binding::record_may_lag`]): a `matched` taken
+    /// before the switch is no longer evidenced. Returns whether a verdict was
+    /// withdrawn.
+    pub fn clear_binding_state(&self, claude_session_id: &str, terminal_id: &str) -> bool {
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on clear_binding_state");
+                return false;
+            }
+        };
+        let Some(row) = m.get_mut(claude_session_id) else {
+            return false;
+        };
+        if !open_on_terminal(row, terminal_id) || row.binding_state.is_none() {
+            return false;
+        }
+        row.binding_state = None;
+        let changed = row.clone();
+        self.persist(
+            m,
+            &[LifecycleDelta::Upsert {
+                rec: Box::new(changed),
+            }],
+        );
+        true
     }
 
     /// Mark an open session closed. No-op (no error) if the session is
@@ -4126,6 +4204,8 @@ impl SessionLifecycleStore {
     /// subtree), so a first match over the `HashMap` would pick one by
     /// iteration order. This ranks instead, greatest wins:
     ///
+    /// 0. a row whose [`TerminalSessionRecord::binding_state`] is not `unknown`
+    ///    outranks one that is — the pane's own `claude` contradicts that row;
     /// 1. the latest SessionStart hook seen for the id in this process
     ///    ([`Self::note_session_start_hook`]) — a row with one outranks a row
     ///    without;
@@ -4189,6 +4269,13 @@ impl SessionLifecycleStore {
             .max_by(|a, b| {
                 let key = |r: &TerminalSessionRecord| {
                     (
+                        // A row its pane's own `claude` contradicts never
+                        // outranks one it does not (plan
+                        // `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`):
+                        // every terminal-keyed reader — the egress tenant, the
+                        // migration's source row — would otherwise act on the
+                        // session the pane does not run.
+                        r.binding_state != Some(BindingState::Unknown),
                         hooks.1.get(&r.claude_session_id).copied(),
                         r.last_session_start_at,
                         r.confirmed_at,
@@ -8909,6 +8996,106 @@ mod tests {
             store.rebind_terminal_checked("absent", "term-b", 3),
             RecordOpenOutcome::Recorded,
             "nothing to move is not a refusal"
+        );
+    }
+
+    /// Review M2: the guard applies the lag rule. Pane A's hook recorded `s2`
+    /// starting after `s`, but A's record still names `s` — it may lag the
+    /// `/clear`. When the operator resumes `s` in pane B, B's hook moves `s`
+    /// there: a record that may lag refuses no strong bind, and marks nothing
+    /// `matched`. Without the newer row the same record refuses the move.
+    #[test]
+    fn a_record_that_may_lag_a_hook_reported_switch_refuses_no_move() {
+        let dir = tempdir().unwrap();
+        let (store, counters) = guarded_store(dir.path(), &[("term-a", names("s"))]);
+        // `s` started on A (its hook stamped the start and confirmed it).
+        let mut s_on_a = auth_on("s", "term-a");
+        s_on_a.last_session_start_at = Some(100);
+        s_on_a.confirmed_at = Some(100);
+        store.record_open(s_on_a);
+        assert_eq!(
+            store.record_open_checked(auth_on("s", "term-b")),
+            RecordOpenOutcome::MoveRefused {
+                held_by: "term-a".to_string()
+            },
+            "precondition: with no newer row the record holds s on A"
+        );
+        assert!(store.clear_binding_state("s", "term-a"));
+
+        // `/clear` on A: the hook records s2 starting there (unconfirmed, as
+        // the hook route writes it), then confirms it.
+        let mut s2_on_a = auth_on("s2", "term-a");
+        s2_on_a.last_session_start_at = Some(200);
+        store.record_open(s2_on_a);
+        store.confirm_session("s2");
+        // A provisional re-record of s on A marks nothing matched: the record
+        // naming s may lag the switch.
+        let mut again = auth_on("s", "term-a");
+        again.origin = None;
+        store.record_open(again);
+        assert_eq!(store.get("s").unwrap().binding_state, None);
+
+        assert_eq!(
+            store.record_open_checked(auth_on("s", "term-b")),
+            RecordOpenOutcome::Recorded,
+            "B's hook takes s: A's record is evidence of nothing"
+        );
+        assert_eq!(store.get("s").unwrap().terminal_id, "term-b");
+        assert_eq!(store.get("s2").unwrap().state, "open");
+        assert_eq!(counters.refused_moves(), 1);
+    }
+
+    /// Review L4: a row its pane contradicts never outranks one it does not,
+    /// whatever the hook order — every terminal-keyed reader (the egress
+    /// tenant, the migration's source row) takes the uncontradicted row.
+    #[test]
+    fn a_contradicted_row_never_outranks_a_matched_one_on_its_terminal() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        // Two open rows on one terminal, as a `/clear` leaves them: the older
+        // one confirmed, the newer one written by its hook (authoritative,
+        // unconfirmed — which supersedes only unconfirmed siblings).
+        let mut older = auth_on("matched", "term-a");
+        older.last_session_start_at = Some(100);
+        older.confirmed_at = Some(100);
+        let mut newer = auth_on("contradicted", "term-a");
+        newer.last_session_start_at = Some(200);
+        store.record_open(older);
+        store.record_open(newer);
+        assert_eq!(store.get("matched").unwrap().state, "open");
+        store.note_session_start_hook("contradicted");
+        assert_eq!(
+            store
+                .find_open_by_terminal("term-a")
+                .map(|r| r.claude_session_id),
+            Some("contradicted".to_string()),
+            "precondition: by hook order alone it wins"
+        );
+        let _ = store.set_binding_state("contradicted", "term-a", BindingState::Unknown);
+        let _ = store.set_binding_state("matched", "term-a", BindingState::Matched);
+        assert_eq!(
+            store
+                .find_open_by_terminal("term-a")
+                .map(|r| r.claude_session_id),
+            Some("matched".to_string())
+        );
+    }
+
+    /// Review L9: a verdict is about a live pane, so a close clears it — a
+    /// closed row serves neither a stale `matched` nor a withheld terminal.
+    #[test]
+    fn closing_a_row_clears_its_binding_verdict() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(auth_on("s", "term-a"));
+        let _ = store.set_binding_state("s", "term-a", BindingState::Unknown);
+        store.record_close("s", "explicit");
+        let closed = store.get("s").unwrap();
+        assert_eq!(closed.state, "closed");
+        assert_eq!(closed.binding_state, None);
+        assert!(
+            !store.clear_binding_state("s", "term-a"),
+            "nothing to withdraw on a closed row"
         );
     }
 

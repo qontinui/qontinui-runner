@@ -349,37 +349,58 @@ pub async fn terminal_create(
     let pinned_session_id = terminal_manager
         .get(&info.id)
         .map(|session| session.pinned_session_id().to_string());
+    // A spawn whose pinned record the binding guard refused registers no coord
+    // row under that id: another live pane's own `claude` still runs the
+    // session, and its coord row is that pane's.
+    let held_elsewhere = pinned_session_id
+        .as_deref()
+        .and_then(|pinned| pinned_session_held_elsewhere(&repo_detect_handle, pinned, &info.id));
     // Phase 0 instrumentation: the coord-registration segment of spawn
     // latency. `register_external` is synchronous and does no HTTP (it queues
     // an outbox row, contending on the process-global outbox `write_lock` +
     // fsync); `resume_external` additionally does a live `PATCH /sessions/:id`
     // probe. The span separates the two in the log.
-    let registration: Result<uuid::Uuid, crate::session::SessionError> = match persisted {
-        Some(prior_id) => {
-            use tracing::Instrument;
-            registry
-                .resume_external(prior_id, intent, pinned_session_id)
-                .instrument(tracing::debug_span!(
-                    "terminal_spawn.coord_register",
-                    terminal_id = %info.id,
-                    resume = true
-                ))
-                .await
+    let registration: Option<Result<uuid::Uuid, crate::session::SessionError>> = match (
+        persisted,
+        &held_elsewhere,
+    ) {
+        (_, Some(held_by)) => {
+            warn!(
+                terminal_id = %info.id,
+                claude_session = ?pinned_session_id,
+                held_by = %held_by,
+                "terminal_create: the pinned session runs in another live pane — no coord row registered for this one"
+            );
+            None
         }
-        None => {
+        (Some(prior_id), None) => {
+            use tracing::Instrument;
+            Some(
+                registry
+                    .resume_external(prior_id, intent, pinned_session_id)
+                    .instrument(tracing::debug_span!(
+                        "terminal_spawn.coord_register",
+                        terminal_id = %info.id,
+                        resume = true
+                    ))
+                    .await,
+            )
+        }
+        (None, None) => {
             let _span = tracing::debug_span!(
                 "terminal_spawn.coord_register",
                 terminal_id = %info.id,
                 resume = false
             )
             .entered();
-            registry.register_external_with_lineage(intent, None, pinned_session_id)
+            Some(registry.register_external_with_lineage(intent, None, pinned_session_id))
         }
     };
 
     let mut coord_session_id: Option<uuid::Uuid> = None;
     match registration {
-        Ok(coord_id) => {
+        None => {}
+        Some(Ok(coord_id)) => {
             coord_session_id = Some(coord_id);
             // Persist (or refresh) the pane → coord-id mapping so the NEXT
             // restart resumes this same row. On the fallback path `coord_id`
@@ -448,7 +469,7 @@ pub async fn terminal_create(
                 "terminal_create: coord session ready"
             );
         }
-        Err(e) => {
+        Some(Err(e)) => {
             warn!(
                 terminal_id = %info.id,
                 error = %e,
@@ -1403,6 +1424,34 @@ pub fn terminal_session_record_open(
             &outcome,
         )),
     })
+}
+
+/// The live pane holding `pinned`'s open lifecycle row when that pane is not
+/// `terminal_id` — what a spawn's pinned record leaves behind when the binding
+/// guard refused it (plan
+/// `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`): the seam
+/// records the pin on every spawn, so a row still on another terminal is a row
+/// another live pane's own `claude` still runs. A spawn registers no coord row
+/// under that id then — it would claim the session for a second pane. `None`
+/// with no store, no open row, or the row on this terminal.
+fn pinned_session_held_elsewhere(
+    app: &tauri::AppHandle,
+    pinned: &str,
+    terminal_id: &str,
+) -> Option<String> {
+    let store = app.try_state::<Arc<SessionLifecycleStore>>()?;
+    store_holds_pinned_session_elsewhere(&store, pinned, terminal_id)
+}
+
+/// [`pinned_session_held_elsewhere`]'s answer from a store.
+fn store_holds_pinned_session_elsewhere(
+    store: &SessionLifecycleStore,
+    pinned: &str,
+    terminal_id: &str,
+) -> Option<String> {
+    let row = store.get(pinned)?;
+    (row.state == "open" && !row.terminal_id.trim().is_empty() && row.terminal_id != terminal_id)
+        .then_some(row.terminal_id)
 }
 
 /// Refuse a blank `claudeSessionId` / `terminalId` before either reaches the
@@ -2758,13 +2807,34 @@ pub(crate) fn create_terminal_session_backend(
     let (parent_session_id, claude_code_session_id_override) =
         registration_lineage_args(capture_hint.as_ref());
 
+    // As in `terminal_create`: a spawn whose pinned record the binding guard
+    // refused registers no coord row under that id.
+    let held_elsewhere = terminal_manager.get(&info.id).and_then(|session| {
+        pinned_session_held_elsewhere(
+            &app_handle_for_spawn_name,
+            session.pinned_session_id(),
+            &info.id,
+        )
+    });
+    let registration = match &held_elsewhere {
+        Some(held_by) => {
+            warn!(
+                terminal_id = %info.id,
+                held_by = %held_by,
+                "create_terminal_session_backend: the pinned session runs in another live pane — no coord row registered for this one"
+            );
+            None
+        }
+        None => Some(session_registry.register_external_with_lineage(
+            intent,
+            parent_session_id,
+            claude_code_session_id_override,
+        )),
+    };
     let mut coord_session_id: Option<uuid::Uuid> = None;
-    match session_registry.register_external_with_lineage(
-        intent,
-        parent_session_id,
-        claude_code_session_id_override,
-    ) {
-        Ok(coord_id) => {
+    match registration {
+        None => {}
+        Some(Ok(coord_id)) => {
             coord_session_id = Some(coord_id);
             if let Some(session) = terminal_manager.get(&info.id) {
                 terminal_manager.bind_coord_session(&session, coord_id);
@@ -2813,7 +2883,7 @@ pub(crate) fn create_terminal_session_backend(
                 "create_terminal_session_backend: coord session ready"
             );
         }
-        Err(e) => {
+        Some(Err(e)) => {
             warn!(
                 terminal_id = %info.id,
                 error = %e,
@@ -4180,6 +4250,40 @@ mod tests {
         let landed =
             record_open_confirmation_report(&store, "sess-held", &RecordOpenOutcome::Recorded);
         assert!(landed["heldBy"].is_null(), "{landed}");
+    }
+
+    /// Round-2 review L8: a spawn whose pinned record the guard refused leaves
+    /// the session's row on the live pane that runs it — and that is what the
+    /// spawn's coord registration checks, so it registers no row for the new
+    /// pane under the same harness id.
+    #[test]
+    fn a_spawn_whose_pinned_record_was_refused_finds_the_session_held_elsewhere() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_with_a_held_session(dir.path());
+        let mut pin = restore_candidate_record("sess-held");
+        pin.terminal_id = "term-new".to_string();
+        assert!(!store.record_open_checked(pin).is_recorded());
+
+        assert_eq!(
+            store_holds_pinned_session_elsewhere(&store, "sess-held", "term-new"),
+            Some("term-live".to_string())
+        );
+        assert_eq!(
+            store_holds_pinned_session_elsewhere(&store, "sess-held", "term-live"),
+            None,
+            "the pane that holds it registers as before"
+        );
+        assert_eq!(
+            store_holds_pinned_session_elsewhere(&store, "fresh-pin", "term-new"),
+            None,
+            "a fresh pin is held nowhere"
+        );
+        store.record_close("sess-held", "explicit");
+        assert_eq!(
+            store_holds_pinned_session_elsewhere(&store, "sess-held", "term-new"),
+            None,
+            "a closed row holds nothing"
+        );
     }
 
     /// The restore rebind the store refuses re-points nothing, stamps no

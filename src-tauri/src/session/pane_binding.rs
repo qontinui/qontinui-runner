@@ -40,10 +40,13 @@
 //! is assumed, not measured. Read-only inspection of every
 //! `~/.claude*/sessions/*.json` on nawa on 2026-11-03 found 142 live records:
 //! 139 carried a session id in their process's argv and all 139 equalled the
-//! record's `sessionId`; none of those processes had switched sessions, so the
-//! sample says nothing either way. The verdicts are therefore built so a record
-//! that LAGS a switch the provider's hook already reported never reads the
-//! newer row `unknown` ([`binding_verdicts`]).
+//! record's `sessionId`; none of those processes had switched sessions (no
+//! recent transcript holds a `/clear` or `/resume` command), so the sample says
+//! nothing either way. Nothing here takes a record that may lag a switch the
+//! provider's hook already reported as evidence: the lag rule
+//! ([`record_may_lag`]) withholds, in both directions, the verdicts on that
+//! pane, any refusal, claim or bind made on the strength of its record, and the
+//! bind-time `matched`.
 //!
 //! # Where it is read, and who reads the result
 //!
@@ -58,12 +61,14 @@
 //! - **`record_open_checked` and `rebind_terminal_checked`** ask the attached
 //!   [`PaneEvidenceOracle`] before moving a row off another terminal: a pane
 //!   that still runs that session keeps it. [`LivePaneRegistry`] answers from
-//!   the pass's observation — no file I/O, only a liveness probe per pid — so a
-//!   bind on a tokio worker or the Tauri main thread never waits on a disk.
+//!   the pass's observation — it reads no Claude Code record, only a liveness
+//!   probe per pid — so the guard adds no record read to a bind on a tokio
+//!   worker or the Tauri main thread. (The bind's own write-ahead-log append
+//!   is the store's, unchanged.)
 //! - **The tracking-health census** (`/restart-readiness`) attributes each
 //!   terminal-hosted `claude` pid from the same observation
-//!   ([`PaneEvidenceOracle::recorded_sessions`]), so the census never reads a
-//!   file on its verdict path either.
+//!   ([`PaneEvidenceOracle::recorded_sessions`]), so the binding check adds no
+//!   record read to the `/restart-readiness` verdict path either.
 //!
 //! # What is counted
 //!
@@ -302,13 +307,20 @@ pub const OBSERVATION_MAX_AGE: Duration = Duration::from_secs(135);
 /// answered from memory. Each pid is re-checked for liveness on every query,
 /// so a `claude` that has exited since the pass cannot hold a row there:
 ///
-/// - nothing observed yet, a pane the pass did not see live, a pane it saw
-///   with no `claude`, or one whose `claude` has since exited →
-///   [`PaneEvidence::NoClaude`];
+/// - nothing observed yet, or a pane the latest pass did not see live →
+///   [`PaneEvidence::NoClaude`] — fresh or stale, the registry knows nothing
+///   that could hold a row there (a pane from before a restart, a pane closed
+///   since);
 /// - an observation older than its max age ([`OBSERVATION_MAX_AGE`]) →
-///   [`PaneEvidence::Unknown`];
-/// - otherwise the pass's records for the pids still alive decide
-///   ([`evidence_from`]).
+///   [`PaneEvidence::Unknown`] for the panes it saw live, whatever it saw in
+///   them: a `claude` may have started, exited or switched since;
+/// - otherwise a pane seen with no `claude`, or whose `claude` has since
+///   exited, → [`PaneEvidence::NoClaude`], and the pass's records for the pids
+///   still alive decide the rest ([`evidence_from`]).
+///
+/// So slow or stalled passes refuse a WEAK bind only off a pane that was live
+/// when last seen — never off a dead or never-seen terminal, which is what a
+/// late restore rebind moves a row off.
 ///
 /// A `claude` started in a pane AFTER the last pass is invisible until the next
 /// one (≤ one liveness tick); such a pane answers `NoClaude`, which never
@@ -341,21 +353,25 @@ impl LivePaneRegistry {
         }
     }
 
-    /// The latest observation, `Err(())` when it is too old to stand on (or the
-    /// lock is poisoned) and `Ok(None)` when nothing was observed yet.
-    fn fresh(&self) -> Result<Option<PaneObservation>, ()> {
+    /// The latest observation and whether it is still fresh; `None` when nothing
+    /// was observed yet. A poisoned lock reads as a stale observation of no
+    /// pane — never as agreement.
+    fn latest(&self) -> Option<(PaneObservation, bool)> {
         let held = match self.latest.lock() {
             Ok(held) => held,
             Err(e) => {
                 warn!(error = %e, "session binder: pane registry lock poisoned — pane reads unknown");
-                return Err(());
+                return Some((PaneObservation::default(), false));
             }
         };
-        match held.as_ref() {
-            None => Ok(None),
-            Some((_, at)) if at.elapsed() > self.max_age => Err(()),
-            Some((observation, _)) => Ok(Some(observation.clone())),
-        }
+        held.as_ref()
+            .map(|(observation, at)| (observation.clone(), at.elapsed() <= self.max_age))
+    }
+
+    /// The latest observation while it is fresh enough to stand on.
+    fn fresh(&self) -> Option<PaneObservation> {
+        self.latest()
+            .and_then(|(observation, fresh)| fresh.then_some(observation))
     }
 
     /// The evidence of one pane of `observation`, over its pids still alive.
@@ -374,15 +390,18 @@ impl LivePaneRegistry {
 
 impl PaneEvidenceOracle for LivePaneRegistry {
     fn pane_evidence(&self, terminal_id: &str) -> PaneEvidence {
-        match self.fresh() {
-            Err(()) => PaneEvidence::Unknown,
-            Ok(None) => PaneEvidence::NoClaude,
-            Ok(Some(observation)) => Self::live_evidence(&observation, terminal_id),
+        match self.latest() {
+            None => PaneEvidence::NoClaude,
+            Some((observation, true)) => Self::live_evidence(&observation, terminal_id),
+            Some((observation, false)) if observation.panes.contains_key(terminal_id) => {
+                PaneEvidence::Unknown
+            }
+            Some((_, false)) => PaneEvidence::NoClaude,
         }
     }
 
     fn panes_naming(&self, session_id: &str) -> Vec<String> {
-        let Ok(Some(observation)) = self.fresh() else {
+        let Some(observation) = self.fresh() else {
             return Vec::new();
         };
         let mut terminals: Vec<String> = observation
@@ -398,7 +417,7 @@ impl PaneEvidenceOracle for LivePaneRegistry {
     }
 
     fn recorded_sessions(&self) -> Option<HashMap<u32, RecordedSession>> {
-        let observation = self.fresh().ok()??;
+        let observation = self.fresh()?;
         let started: HashMap<u32, Option<i64>> = observation
             .panes
             .values()
@@ -512,6 +531,115 @@ pub fn binding_move_refused_total() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// The lag rule
+// ---------------------------------------------------------------------------
+
+/// May pane `terminal_id`'s record naming `named` merely LAG a switch the
+/// provider's hook already reported? True when `named`'s open row has a
+/// hook-recorded start (`last_session_start_at`) and another open row on that
+/// pane has a NEWER one. Then the record is not evidence that the pane runs
+/// `named`: Claude Code may not rewrite it on `/clear` or an in-TUI resume
+/// (UNMEASURED — module docs), and a pane whose hook recorded `S2` starting
+/// after `S` may still name `S`. A row with no hook start orders against
+/// nothing: a hook that never landed is not a switch the hook reported.
+///
+/// Every reader that takes `Names(S)` as "the pane runs S" applies it: the
+/// verdicts ([`binding_verdicts`], via [`discount_lagging`]), the reconcile
+/// pass's claims and its provider-registry rung, and the store's binding guard,
+/// supersede spare and bind-time `matched`. `open` is every row; closed rows
+/// are skipped.
+pub fn record_may_lag<'a>(
+    open: impl IntoIterator<Item = &'a TerminalSessionRecord>,
+    terminal_id: &str,
+    named: &str,
+) -> bool {
+    let mut named_start: Option<Option<i64>> = None;
+    let mut newest_other: Option<i64> = None;
+    for r in open.into_iter().filter(|r| r.state == "open") {
+        if r.claude_session_id == named {
+            named_start = Some(r.last_session_start_at);
+        } else if r.terminal_id == terminal_id {
+            if let Some(started) = r.last_session_start_at {
+                newest_other = Some(newest_other.map_or(started, |n| n.max(started)));
+            }
+        }
+    }
+    match (named_start.flatten(), newest_other) {
+        (Some(named_start), Some(other)) => other > named_start,
+        _ => false,
+    }
+}
+
+/// `evidence` with every pane whose record may lag ([`record_may_lag`])
+/// answered [`PaneEvidence::Unknown`] instead of `Names`. One pass over `open`
+/// plus each pane's own rows — no per-pane scan of every row.
+pub fn discount_lagging(
+    open: &[TerminalSessionRecord],
+    evidence: &HashMap<String, PaneEvidence>,
+) -> HashMap<String, PaneEvidence> {
+    let mut start_of: HashMap<&str, Option<i64>> = HashMap::new();
+    let mut started_on: HashMap<&str, Vec<(&str, i64)>> = HashMap::new();
+    for r in open.iter().filter(|r| r.state == "open") {
+        start_of.insert(r.claude_session_id.as_str(), r.last_session_start_at);
+        if let Some(started) = r.last_session_start_at {
+            started_on
+                .entry(r.terminal_id.as_str())
+                .or_default()
+                .push((r.claude_session_id.as_str(), started));
+        }
+    }
+    evidence
+        .iter()
+        .map(|(terminal, ev)| {
+            let lagging = ev.named_session().is_some_and(|named| {
+                start_of
+                    .get(named)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|named_start| {
+                        started_on.get(terminal.as_str()).is_some_and(|others| {
+                            others
+                                .iter()
+                                .any(|(id, started)| *id != named && *started > named_start)
+                        })
+                    })
+            });
+            let effective = if lagging {
+                PaneEvidence::Unknown
+            } else {
+                ev.clone()
+            };
+            (terminal.clone(), effective)
+        })
+        .collect()
+}
+
+/// The open rows on every pane whose record names a session but may lag it
+/// ([`record_may_lag`]), as (session, terminal). Their stored verdicts are
+/// withdrawn ([`SessionLifecycleStore::clear_binding_state`]): a `matched`
+/// taken before the hook-reported switch is no longer evidenced.
+pub fn rows_on_lagging_panes(
+    open: &[TerminalSessionRecord],
+    evidence: &HashMap<String, PaneEvidence>,
+) -> Vec<(String, String)> {
+    let effective = discount_lagging(open, evidence);
+    let lagging: HashSet<&str> = evidence
+        .iter()
+        .filter(|(terminal, ev)| {
+            ev.named_session().is_some()
+                && effective
+                    .get(*terminal)
+                    .is_some_and(|e| e.named_session().is_none())
+        })
+        .map(|(terminal, _)| terminal.as_str())
+        .collect();
+    open.iter()
+        .filter(|r| r.state == "open" && lagging.contains(r.terminal_id.as_str()))
+        .map(|r| (r.claude_session_id.clone(), r.terminal_id.clone()))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Verdicts
 // ---------------------------------------------------------------------------
 
@@ -529,9 +657,12 @@ pub struct BindingVerdict {
 }
 
 /// Pure: a verdict for every open row on a pane whose evidence NAMES a session
-/// `E`. A row on a pane with no `claude`, unreadable evidence, or no entry in
-/// `evidence` gets no verdict and keeps the state it last read. For a row `R`
-/// on such a pane:
+/// `E` — after the lag rule ([`discount_lagging`]): a pane whose record may lag
+/// a switch the hook already reported gives no verdict at all, so neither the
+/// row the record names reads `matched` nor any other row reads `unknown` on
+/// it. A row on a pane with no `claude`, unreadable evidence, or no entry in
+/// `evidence` gets no verdict either, and keeps the state it last read. For a
+/// row `R` on a pane that names `E`:
 ///
 /// 1. `R == E` → `Matched`.
 /// 2. Another live pane's record names `R` → `Unknown`, counted: the row sits
@@ -539,22 +670,20 @@ pub struct BindingVerdict {
 /// 3. `E` also has an open row on this pane, and the provider's hook recorded
 ///    `E` STARTING here (`last_session_start_at`) — the pane changed sessions
 ///    and the store already knows its current one (a `/clear` or an in-TUI
-///    resume):
-///    - when the hook recorded `R` starting LATER than `E`, the record may
-///      simply lag the switch the hook reported → no verdict. This is the arm
-///      that keeps a newer, hook-recorded row from reading `unknown` if the
-///      record does not follow `/clear` (see the module docs: that it does is
-///      unmeasured);
-///    - otherwise `R` is the pane's PRIOR TENANT → `Unknown`, not counted: its
-///      pane runs another session now, which is routine.
-/// 4. Otherwise → `Unknown`, counted: the pane runs a session its rows do not
-///    name — including a pane whose current row exists only because the
-///    reconcile pass just bound it from that very record (no hook recorded it
-///    starting).
+///    resume): `R` is the pane's PRIOR TENANT → `Unknown`, not counted — its
+///    pane runs another session now, which is routine. (A row the hook
+///    recorded starting later than `E` never reaches this arm: the lag rule
+///    already withheld every verdict on the pane.)
+/// 4. Otherwise → `Unknown` — counted only for a CONFIRMED row. An unconfirmed
+///    row is the spawn seam's pin, a provisional sniff or an unconfirmed bind:
+///    a pane whose `claude` runs another id than its pin (a duplicate pane, a
+///    shim-bypassed launch, a hook that has not posted yet, a resume) leaves
+///    exactly such a row behind, routinely.
 pub fn binding_verdicts(
     open: &[TerminalSessionRecord],
     evidence: &HashMap<String, PaneEvidence>,
 ) -> Vec<BindingVerdict> {
+    let evidence = &discount_lagging(open, evidence);
     let mut named_by: HashMap<&str, Vec<&str>> = HashMap::new();
     for (terminal, ev) in evidence {
         if let Some(id) = ev.named_session() {
@@ -583,16 +712,10 @@ pub fn binding_verdicts(
                 .is_some_and(|ts| ts.iter().any(|t| t != terminal))
             {
                 (BindingState::Unknown, true)
-            } else if let Some(current_start) = current.and_then(|c| c.last_session_start_at) {
-                if row
-                    .last_session_start_at
-                    .is_some_and(|start| start > current_start)
-                {
-                    continue;
-                }
+            } else if current.is_some_and(|c| c.last_session_start_at.is_some()) {
                 (BindingState::Unknown, false)
             } else {
-                (BindingState::Unknown, true)
+                (BindingState::Unknown, row.confirmed_at.is_some())
             };
             out.push(BindingVerdict {
                 claude_session_id: id.to_string(),
@@ -787,11 +910,23 @@ mod tests {
         }
     }
 
+    /// A CONFIRMED open row for `id` on `terminal`, whose hook recorded it
+    /// starting at `started` (when given).
     fn open_row(id: &str, terminal: &str, started: Option<i64>) -> TerminalSessionRecord {
         TerminalSessionRecord {
             terminal_id: terminal.to_string(),
             last_session_start_at: started,
+            confirmed_at: Some(1),
             ..crate::session::session_lifecycle_store::test_open_record(id)
+        }
+    }
+
+    /// The spawn seam's pin of a pane: authoritative, never confirmed.
+    fn seam_row(id: &str, terminal: &str) -> TerminalSessionRecord {
+        TerminalSessionRecord {
+            confirmed_at: None,
+            origin: Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string()),
+            ..open_row(id, terminal, None)
         }
     }
 
@@ -827,7 +962,8 @@ mod tests {
         );
     }
 
-    /// The four arms of [`binding_verdicts`] for a row its pane does not name.
+    /// The arms of [`binding_verdicts`] for a row its pane does not name, and the
+    /// lag rule that withholds them.
     #[test]
     fn a_contradicted_row_counts_only_when_no_routine_succession_explains_it() {
         let rows = vec![
@@ -837,9 +973,12 @@ mod tests {
             open_row("s-old", "t-clear", Some(100)),
             open_row("s-new", "t-clear", Some(200)),
             // t-lag: the hook recorded s-next AFTER s-prev, but the pane's
-            // record still names s-prev.
+            // record still names s-prev — it may lag the switch.
             open_row("s-prev", "t-lag", Some(100)),
             open_row("s-next", "t-lag", Some(200)),
+            // t-seam: the pane's claude runs s-z, which has no row there; the
+            // spawn seam's unconfirmed pin is left behind.
+            seam_row("s-pin", "t-seam"),
             // t-stray runs s-y, which no row on it names, and nobody else runs
             // its row's session.
             open_row("s-stray", "t-stray", None),
@@ -855,6 +994,7 @@ mod tests {
             ("t-lag".to_string(), names("s-prev")),
             ("t-stray".to_string(), names("s-y")),
             ("t-bound".to_string(), names("s-real")),
+            ("t-seam".to_string(), names("s-z")),
         ]
         .into_iter()
         .collect();
@@ -871,11 +1011,16 @@ mod tests {
             Some(&(BindingState::Unknown, false)),
             "a prior tenant is unknown, not a fault"
         );
-        assert_eq!(got.get("s-prev"), Some(&(BindingState::Matched, false)));
         assert_eq!(
-            got.get("s-next"),
-            None,
-            "a row newer than the one the record names gets no verdict"
+            (got.get("s-prev"), got.get("s-next")),
+            (None, None),
+            "a record that may lag the hook-reported switch gives no verdict on its pane — \
+             neither `matched` for the row it names nor `unknown` for the newer one"
+        );
+        assert_eq!(
+            got.get("s-pin"),
+            Some(&(BindingState::Unknown, false)),
+            "an unconfirmed pin the pane's claude has moved on from is not a fault"
         );
         assert_eq!(got.get("s-stray"), Some(&(BindingState::Unknown, true)));
         assert_eq!(
@@ -894,7 +1039,12 @@ mod tests {
         store.attach_binding_counters(counters.clone());
         store.record_open(open_row("s-b", "t-a", Some(100)));
         store.record_open(open_row("s-old", "t-c", Some(100)));
-        store.record_open(open_row("s-new", "t-c", Some(200)));
+        // Recorded the way the hook route records it — unconfirmed — so the
+        // write supersedes nothing: both rows stay open on t-c.
+        store.record_open(TerminalSessionRecord {
+            confirmed_at: None,
+            ..open_row("s-new", "t-c", Some(200))
+        });
         let evidence: HashMap<String, PaneEvidence> = [
             ("t-a".to_string(), names("s-a")),
             ("t-c".to_string(), names("s-new")),
@@ -960,14 +1110,102 @@ mod tests {
         assert!(registry.panes_naming("s-gone").is_empty());
 
         let stale = LivePaneRegistry::with_max_age(Duration::ZERO);
-        stale.observe(PaneObservation::default());
+        stale.observe(PaneObservation {
+            panes: [("t-seen".to_string(), Vec::new())].into_iter().collect(),
+            sessions: HashMap::new(),
+        });
         std::thread::sleep(Duration::from_millis(2));
         assert_eq!(
-            stale.pane_evidence("t-any"),
+            stale.pane_evidence("t-seen"),
             PaneEvidence::Unknown,
-            "an observation past its max age concludes nothing"
+            "a pane a stale observation saw live may run anything now"
         );
+        assert_eq!(
+            stale.pane_evidence("t-never-seen"),
+            PaneEvidence::NoClaude,
+            "a terminal no observation saw live holds nothing, fresh or stale"
+        );
+        assert!(stale.panes_naming("s-any").is_empty());
         assert_eq!(stale.recorded_sessions(), None);
+    }
+
+    /// Review M1: while passes are slow (the observation past its max age) a
+    /// late restore rebind still moves a row off a DEAD terminal — one the
+    /// stale observation never saw live — and is refused only off a pane it
+    /// saw live.
+    #[test]
+    fn a_stale_registry_lets_a_rebind_off_a_dead_terminal_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let registry = Arc::new(LivePaneRegistry::with_max_age(Duration::ZERO));
+        store.attach_pane_evidence(registry.clone());
+        store.record_open(open_row("s-restored", "t-dead", None));
+        store.record_open(open_row("s-live", "t-live", None));
+        registry.observe(PaneObservation {
+            panes: [("t-live".to_string(), vec![live(std::process::id())])]
+                .into_iter()
+                .collect(),
+            sessions: [(std::process::id(), "s-live".to_string())]
+                .into_iter()
+                .collect(),
+        });
+        std::thread::sleep(Duration::from_millis(2));
+
+        assert_eq!(
+            store.rebind_terminal_checked("s-restored", "t-restored-tab", 1),
+            crate::session::session_lifecycle_store::RecordOpenOutcome::Recorded
+        );
+        assert_eq!(
+            store.get("s-restored").unwrap().terminal_id,
+            "t-restored-tab"
+        );
+        assert_eq!(
+            store.rebind_terminal_checked("s-live", "t-other-tab", 1),
+            crate::session::session_lifecycle_store::RecordOpenOutcome::MoveRefused {
+                held_by: "t-live".to_string()
+            },
+            "a weak bind is still refused off a pane the stale observation saw live"
+        );
+    }
+
+    /// Review M2: the lag rule applies in both directions. A pane whose hook
+    /// recorded S2 starting after S may still NAME S; that record is evidence
+    /// of nothing, so the pane's verdicts are withheld ([`binding_verdicts`])
+    /// and the evidence reads `Unknown` ([`discount_lagging`]). A row with no
+    /// hook start orders against nothing.
+    #[test]
+    fn a_record_that_may_lag_a_hook_reported_switch_names_nothing() {
+        let rows = vec![
+            open_row("s", "t-a", Some(100)),
+            open_row("s2", "t-a", Some(200)),
+            // t-b's hook never posted for its current row: nothing orders it.
+            open_row("s-old", "t-b", Some(100)),
+            open_row("s-hookless", "t-b", None),
+        ];
+        assert!(record_may_lag(&rows, "t-a", "s"));
+        assert!(
+            !record_may_lag(&rows, "t-a", "s2"),
+            "the newest row is current"
+        );
+        assert!(!record_may_lag(&rows, "t-b", "s-hookless"));
+        assert!(
+            !record_may_lag(&rows, "t-a", "s-without-a-row"),
+            "a session the store has no row for lags nothing"
+        );
+        let evidence: HashMap<String, PaneEvidence> = [
+            ("t-a".to_string(), names("s")),
+            ("t-b".to_string(), names("s-hookless")),
+        ]
+        .into_iter()
+        .collect();
+        let effective = discount_lagging(&rows, &evidence);
+        assert_eq!(effective["t-a"], PaneEvidence::Unknown);
+        assert_eq!(effective["t-b"], names("s-hookless"));
+        let verdicts = binding_verdicts(&rows, &evidence);
+        assert!(
+            verdicts.iter().all(|v| v.terminal_id != "t-a"),
+            "no verdict on the lagging pane: {verdicts:?}"
+        );
     }
 
     /// The production chain end to end over a real config dir: a REAL
@@ -1105,8 +1343,8 @@ mod tests {
         store.attach_binding_counters(counters.clone());
         let unconfirmed = |id: &str, terminal: &str| TerminalSessionRecord {
             working_dir: Some(WORKDIR.to_string()),
-            origin: Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string()),
-            ..open_row(id, terminal, None)
+            confirmed_at: None,
+            ..seam_row(id, terminal)
         };
         store.record_open(unconfirmed("s-a", "term-a"));
         store.record_open(unconfirmed("s-b", "term-b"));

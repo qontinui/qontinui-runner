@@ -203,7 +203,12 @@ pub(crate) fn typed_line_target(
 /// |---|---|---|---|
 /// | `Shell` | authoritative | registered (when recorded) | when the line says so |
 /// | `Unknown` | provisional (`reconciled`, unconfirmed) | no | when the line says so |
-/// | `Claude` | provisional | no | no — nothing was launched |
+/// | `Claude` | none | no | no — nothing was launched |
+///
+/// A line a running `claude` read launched nothing, so it records nothing: a
+/// write would re-open a CLOSED session onto this pane (the binding guard only
+/// stands between OPEN rows and a move) and its asserted `reconciled` origin
+/// would downgrade an existing row's grade.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_typed_resume_effects(
     store: Option<&SessionLifecycleStore>,
@@ -216,6 +221,14 @@ pub(crate) fn apply_typed_resume_effects(
     register_coord: impl FnOnce(),
     emit_bypass: impl FnOnce(),
 ) {
+    if target == TypedLineTarget::Claude {
+        debug!(
+            terminal_id = %terminal_id,
+            claude_session = %parsed.claude_session_id,
+            "typed claude resume sniff: the line was input to a running claude — nothing launched, nothing recorded"
+        );
+        return;
+    }
     let launched = target == TypedLineTarget::Shell;
     match store {
         Some(store) => {
@@ -626,57 +639,88 @@ mod tests {
         );
     }
 
-    /// A line a running `claude` read is recorded PROVISIONALLY: reconciled and
+    /// Round-2 review L5: a line a running `claude` read launched nothing, so it
+    /// records nothing — not even over a CLOSED row of the session it names,
+    /// which a write would re-open onto this pane, and not over an existing
+    /// row's origin — and registers no coord identity and emits no bypass.
+    #[test]
+    fn a_line_a_running_claude_read_records_nothing() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let mut ended = crate::session::session_lifecycle_store::test_open_record(UUID);
+        ended.terminal_id = "term-elsewhere".to_string();
+        ended.origin = Some(ORIGIN_AUTHORITATIVE.to_string());
+        store.record_open(ended);
+        store.record_close(UUID, "explicit");
+
+        let parsed = parse(&format!(
+            "claude --resume {UUID} --dangerously-skip-permissions"
+        ))
+        .unwrap();
+        let coord_registered = Cell::new(false);
+        let bypass_emitted = Cell::new(false);
+        apply_typed_resume_effects(
+            Some(&store),
+            &parsed,
+            TypedLineTarget::Claude,
+            "term-1",
+            "C:/repo",
+            "default",
+            "Terminal 1",
+            || coord_registered.set(true),
+            || bypass_emitted.set(true),
+        );
+
+        let row = store.get(UUID).unwrap();
+        assert_eq!(
+            (row.state.as_str(), row.terminal_id.as_str()),
+            ("closed", "term-elsewhere")
+        );
+        assert_eq!(row.origin.as_deref(), Some(ORIGIN_AUTHORITATIVE));
+        assert!(!coord_registered.get());
+        assert!(!bypass_emitted.get());
+    }
+
+    /// A line on an unreadable pane is recorded PROVISIONALLY: reconciled and
     /// unconfirmed — so it supersedes nothing on the pane — with no coord
-    /// identity and no bypass event (nothing was launched). An unreadable pane
-    /// is provisional too, but keeps the bypass mark the line carries.
+    /// identity, keeping the bypass mark the line carries.
     #[test]
     fn a_line_not_read_by_the_shell_is_recorded_provisionally() {
-        for (target, bypass_expected) in [
-            (TypedLineTarget::Claude, false),
-            (TypedLineTarget::Unknown, true),
-        ] {
-            let dir = tempdir().unwrap();
-            let store =
-                SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
-            // The pane's own session, pinned at spawn.
-            let mut own = crate::session::session_lifecycle_store::test_open_record("pane-own");
-            own.terminal_id = "term-1".to_string();
-            own.origin = Some(ORIGIN_AUTHORITATIVE.to_string());
-            store.record_open(own);
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        // The pane's own session, pinned at spawn.
+        let mut own = crate::session::session_lifecycle_store::test_open_record("pane-own");
+        own.terminal_id = "term-1".to_string();
+        own.origin = Some(ORIGIN_AUTHORITATIVE.to_string());
+        store.record_open(own);
 
-            let parsed = parse(&format!(
-                "claude --resume {UUID} --dangerously-skip-permissions"
-            ))
-            .unwrap();
-            let coord_registered = Cell::new(false);
-            let bypass_emitted = Cell::new(false);
-            apply_typed_resume_effects(
-                Some(&store),
-                &parsed,
-                target,
-                "term-1",
-                "C:/repo",
-                "default",
-                "Terminal 1",
-                || coord_registered.set(true),
-                || bypass_emitted.set(true),
-            );
+        let parsed = parse(&format!(
+            "claude --resume {UUID} --dangerously-skip-permissions"
+        ))
+        .unwrap();
+        let coord_registered = Cell::new(false);
+        let bypass_emitted = Cell::new(false);
+        apply_typed_resume_effects(
+            Some(&store),
+            &parsed,
+            TypedLineTarget::Unknown,
+            "term-1",
+            "C:/repo",
+            "default",
+            "Terminal 1",
+            || coord_registered.set(true),
+            || bypass_emitted.set(true),
+        );
 
-            let sniffed = store.get(UUID).expect("provisional row recorded");
-            assert_eq!(
-                sniffed.origin.as_deref(),
-                Some(ORIGIN_RECONCILED),
-                "{target:?}"
-            );
-            assert!(sniffed.confirmed_at.is_none(), "{target:?}");
-            assert_eq!(
-                store.get("pane-own").unwrap().state,
-                "open",
-                "{target:?}: a provisional record supersedes nothing"
-            );
-            assert!(!coord_registered.get(), "{target:?}: no coord identity");
-            assert_eq!(bypass_emitted.get(), bypass_expected, "{target:?}");
-        }
+        let sniffed = store.get(UUID).expect("provisional row recorded");
+        assert_eq!(sniffed.origin.as_deref(), Some(ORIGIN_RECONCILED));
+        assert!(sniffed.confirmed_at.is_none());
+        assert_eq!(
+            store.get("pane-own").unwrap().state,
+            "open",
+            "a provisional record supersedes nothing"
+        );
+        assert!(!coord_registered.get(), "no coord identity");
+        assert!(bypass_emitted.get(), "the line's bypass mark is kept");
     }
 }
