@@ -1320,7 +1320,9 @@ pub(crate) trait CloseEffects {
 ///   included. The drain arm never consults custody.
 ///
 /// In `shadow`, every one of those checks still runs, and the close is logged
-/// instead of made.
+/// instead of made. `graceful_exit`'s own refusals (a child process, a nested
+/// `claude`, a screen not at an empty prompt) are not among them, so a logged
+/// "would close" can still be refused under `on`.
 pub(crate) async fn close_batch<E: CloseEffects + Sync>(
     arm: CloseArm,
     candidates: Vec<(String, String)>,
@@ -1524,7 +1526,7 @@ impl CloseEffects for LiveCloseEffects<'_> {
             judged_at_ms = self.observed.now_ms,
             grace_s = self.grace.as_secs(),
             custody = %custody,
-            "wind_down_executor: SHADOW — would close {session_id} (finished, idle past grace, re-checked custody {custody}); closing nothing"
+            "wind_down_executor: SHADOW — would close {session_id} (finished, idle past grace, re-checked custody {custody}; graceful_exit's process and screen checks not run); closing nothing"
         );
     }
 
