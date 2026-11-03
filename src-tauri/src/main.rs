@@ -5383,10 +5383,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Tier-0 looping-agent supervisor (plan merge-shepherd-fixer,
                 // Phase 1): opens/seeds the durable looping-agents registry
-                // (built-in Merge Shepherd, DISABLED until the operator flips
-                // it), manages it for the control-surface commands, and starts
-                // the supervised tick loop (idle-nudge on cadence, context-low
-                // / K-cycle fresh relaunch, dead-tab respawn). Placed after the
+                // (built-in Merge Shepherd, ENABLED by default; spawning still
+                // needs a coord slot lease), manages it for the control-surface
+                // commands, and starts the supervised tick loop (idle-nudge on
+                // cadence, context-low / K-cycle fresh relaunch, dead-tab
+                // respawn). Placed after the
                 // lifecycle store manage so restart re-attach can resolve
                 // boot-restored tabs; the loop itself waits a boot-settle delay
                 // before its first tick.

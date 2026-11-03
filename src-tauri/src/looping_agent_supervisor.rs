@@ -163,8 +163,9 @@ fn default_journal_path(agent_id: &str) -> String {
 }
 
 /// Open (or fall back for) the registry, seed the built-in Merge Shepherd
-/// (DISABLED — the operator flips it on explicitly), manage the registry in
-/// Tauri state for the control-surface commands, and start the supervised
+/// (ENABLED by default — the operator turns it off with
+/// `looping_agent_set_enabled`; an existing row is never reseeded), manage the
+/// registry in Tauri state for the control-surface commands, and start the supervised
 /// tick loop. Call once from `main.rs` setup.
 pub(crate) fn start(app: &tauri::AppHandle) {
     let path = registry_path();
