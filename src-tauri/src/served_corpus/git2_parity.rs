@@ -1455,9 +1455,8 @@ fn cli_rev_parse(dir: &Path, extra: &[(&str, &str)]) -> Result<String, String> {
             None => cmd.env_remove(k),
         };
     }
-    let out = cmd
-        .stdin(Stdio::null())
-        .output()
+    cmd.stdin(Stdio::null());
+    let out = crate::process_helpers::output_with_timeout(cmd, std::time::Duration::from_secs(60))
         .map_err(|e| e.to_string())?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
