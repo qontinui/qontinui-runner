@@ -17,15 +17,24 @@
 //! `graceful_exit` call that file's kill-path tripwire pins. Everything here
 //! is either pure or a small read; nothing here reaches a pane.
 //!
+//! `Eligible` plus `Clean` is the arm's verdict, not the close. `graceful_exit`
+//! still refuses any session whose `claude` holds a child process, and that
+//! count has no image or age filter, so the stdio MCP servers a session starts
+//! at boot (a fleet session holds `coord-mcp-shim.py`) keep it open. The
+//! boot-time MCP exemption in `tracking_health::child_signals_work` changes
+//! only the idleness reading; it does not reach that refusal.
+//!
 //! ## The switch (D3)
 //!
 //! Settings → General → Sessions → "Close finished sessions after grace":
 //! `on` (the default) / `shadow` / `off`, re-read on every tick.
 //! [`KILL_ENV`]`=0` in the runner's spawn environment is a machine kill switch
 //! that wins over the setting, and `QONTINUI_WIND_DOWN_EXECUTOR=0` still
-//! disables the whole executor. `shadow` runs the arm in full — census,
+//! disables the whole executor. `shadow` runs the arm's own checks — census,
 //! custody probes and the per-close re-checks — and logs "would close" where
-//! `on` would close.
+//! `on` would call `graceful_exit`. It never reaches that primitive, so a
+//! session it logs can still be refused there (a child process, a nested
+//! `claude`, a screen that is not at an empty prompt).
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
