@@ -66,6 +66,12 @@ fail() { printf '  FAIL  %s: %s\n' "$1" "$2"; failures=$((failures + 1)); }
 curl() {
   local url="${*: -1}"
   [ -e "$FIX/transport_down" ] && return 7
+  # api() parses the status off a `-w '\n%{http_code}'` trailer. Serve one only
+  # when it was asked for, so a regression dropping that flag fails here too.
+  case " $* " in
+    *'%{http_code}'*) : ;;
+    *) printf 'garbled'; return 0 ;;
+  esac
   case "$url" in
     */issues/*/labels*)
       printf '%s\n%s' "$(cat "$FIX/labels.json")" "$(cat "$FIX/labels.status" 2>/dev/null || echo 200)" ;;
