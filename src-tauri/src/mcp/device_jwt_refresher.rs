@@ -3232,6 +3232,83 @@ pub(crate) fn open_binding_gap_asks(
     )
 }
 
+/// The per-tenant lapse records — Phase 7's seed attempt and the Phase 4 ask —
+/// for the `/coord-mcp/doctor` report, so an agent can see WHY a bound tenant
+/// still has no slot without the desktop UI.
+///
+/// The UI's [`open_binding_gap_asks`] serves only OPENED asks, which leaves two
+/// states visible nowhere but a log line: a seed attempt still awaiting its
+/// fallback pass, and a `403 not_bound` answer, which deliberately opens no
+/// ask for the rest of the lapse. This read covers both.
+///
+/// Unlike [`load_gap_ask_state`], it does not fail soft. An unresolvable path,
+/// an unreadable file or a malformed record is `{"unknown": "<why>"}`, never an
+/// empty list. An ABSENT file is a real empty list, because no lapse has ever
+/// been recorded. A record written for another account is withheld as
+/// `{"unknown": ...}`: asks never cross an account switch, and neither do their
+/// diagnostics.
+pub(crate) fn binding_gap_lapses_report(
+    path: Option<&std::path::Path>,
+    account: Option<&str>,
+) -> serde_json::Value {
+    let Some(path) = path else {
+        return serde_json::json!({"unknown": "the lapse record's path does not resolve"});
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return serde_json::json!({"lapses": []});
+        }
+        Err(e) => {
+            return serde_json::json!({"unknown": format!("lapse record unreadable: {e}")});
+        }
+    };
+    let state: GapAskState = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            return serde_json::json!({"unknown": format!("lapse record malformed: {e}")});
+        }
+    };
+    // Scope BEFORE reading the tenants, so even an empty answer is only ever
+    // given to the account the record belongs to.
+    match (account, state.account.as_deref()) {
+        (Some(current), Some(owner)) if current == owner => {}
+        (None, _) => {
+            return serde_json::json!({
+                "unknown": "no signed-in, paired account to scope the lapse record to"
+            });
+        }
+        (Some(_), None) if state.tenants.is_empty() => {
+            return serde_json::json!({"lapses": []});
+        }
+        (Some(_), None) => {
+            return serde_json::json!({
+                "unknown": "the lapse record names no owning account"
+            });
+        }
+        _ => {
+            return serde_json::json!({
+                "unknown": "the lapse record belongs to another account"
+            });
+        }
+    }
+    let lapses: Vec<serde_json::Value> = state
+        .tenants
+        .iter()
+        .map(|(tenant, r)| {
+            serde_json::json!({
+                "tenant_id": tenant,
+                "first_seen": r.first_seen,
+                "seed_attempted": r.seed_attempted,
+                "seed_outcome": (!r.seed_outcome.is_empty()).then(|| r.seed_outcome.clone()),
+                "seed_not_bound": r.seed_not_bound,
+                "asked": r.notified,
+            })
+        })
+        .collect();
+    serde_json::json!({"lapses": lapses})
+}
+
 /// Forget the evidence behind every ask — for a full sign-out or a
 /// credential-store reset, after which the recorded tenants may belong to
 /// another account.
@@ -6327,9 +6404,10 @@ async fn refresher_loop(
         // pass's answer.
         let gap_report = binding_gaps_from(&sweep_inputs);
         publish_binding_gaps(gap_report.clone());
-        // D3 (Phase 4, as revised by the route-around review): act on that
-        // report by ASKING the operator once per tenant per lapse — never by
-        // minting. The ask is driven by the act-grade twin of the report (a
+        // D3 (Phase 4, as revised by the route-around review, plus Phase 7):
+        // act on that report by seeding once per tenant per lapse through
+        // coord's per-binding door (`run_due_seeds` below — never pair-cli),
+        // then, if no slot appeared, ASKING the operator once. The ask is driven by the act-grade twin of the report (a
         // sidecar inside BINDING_GAP_ASK_MAX_AGE_SECS), is persisted, and is
         // read back by the UI through `get_binding_gap_asks`; the event below
         // is only a nudge. A lapse that closes because a slot now exists
@@ -15186,5 +15264,101 @@ mod tenant_seed_arm_tests {
         ] {
             assert!(!body.contains(forbidden), "seed arm names {forbidden}");
         }
+    }
+
+    // ---- the doctor's read of the lapse record (`binding_gap_lapses_report`) ----
+
+    fn lapse(seed_attempted: bool, outcome: &str, not_bound: bool, asked: bool) -> GapAskRecord {
+        GapAskRecord {
+            notified: asked,
+            first_seen: 1_700_000_000,
+            reason: String::new(),
+            seed_attempted,
+            seed_outcome: outcome.to_string(),
+            seed_not_bound: not_bound,
+        }
+    }
+
+    fn write_state(path: &std::path::Path, account: &str, recs: &[(uuid::Uuid, GapAskRecord)]) {
+        let state = GapAskState {
+            account: Some(account.to_string()),
+            tenants: recs
+                .iter()
+                .map(|(t, r)| (t.to_string(), r.clone()))
+                .collect(),
+        };
+        assert!(save_gap_ask_state(path, &state), "fixture write");
+    }
+
+    /// The two states no UI ask shows — a seed awaiting its fallback pass, and
+    /// a `not_bound` answer that opens no ask at all — are both on the report.
+    #[test]
+    fn lapses_report_serves_the_seed_states_no_ask_shows() {
+        let path = gap_state_path("lapses_report");
+        let pending = tenant(1);
+        let not_bound = tenant(2);
+        let refused = SeedOutcome::Refused {
+            status: 403,
+            code: "not_bound".into(),
+        };
+        write_state(
+            &path,
+            ACCT,
+            &[
+                (pending, lapse(true, "", false, false)),
+                (not_bound, lapse(true, &refused.describe(), true, false)),
+            ],
+        );
+        let report = binding_gap_lapses_report(Some(&path), Some(ACCT));
+        let lapses = report["lapses"].as_array().expect("known");
+        assert_eq!(lapses.len(), 2);
+        let by = |t: uuid::Uuid| {
+            lapses
+                .iter()
+                .find(|l| l["tenant_id"] == t.to_string())
+                .expect("tenant present")
+                .clone()
+        };
+        let p = by(pending);
+        assert_eq!(p["seed_attempted"], true);
+        assert!(
+            p["seed_outcome"].is_null(),
+            "no outcome yet is null, not \"\""
+        );
+        assert_eq!(p["asked"], false);
+        let nb = by(not_bound);
+        assert_eq!(nb["seed_not_bound"], true);
+        assert_eq!(nb["asked"], false);
+        assert!(nb["seed_outcome"].as_str().unwrap().contains("not_bound"));
+    }
+
+    /// Absent is a real empty list; every way of not knowing is `unknown`.
+    #[test]
+    fn lapses_report_never_renders_unknown_as_empty() {
+        let absent = gap_state_path("lapses_absent");
+        assert_eq!(
+            binding_gap_lapses_report(Some(&absent), Some(ACCT)),
+            serde_json::json!({"lapses": []})
+        );
+        assert!(binding_gap_lapses_report(None, Some(ACCT))["unknown"].is_string());
+
+        let malformed = gap_state_path("lapses_malformed");
+        std::fs::write(&malformed, b"{not json").expect("write");
+        assert!(binding_gap_lapses_report(Some(&malformed), Some(ACCT))["unknown"].is_string());
+
+        let other = gap_state_path("lapses_other_account");
+        write_state(
+            &other,
+            "someone-else",
+            &[(tenant(3), lapse(true, "x", false, true))],
+        );
+        let r = binding_gap_lapses_report(Some(&other), Some(ACCT));
+        assert!(
+            r["unknown"].is_string(),
+            "another account's record is withheld: {r}"
+        );
+        assert!(r.get("lapses").is_none());
+        let r = binding_gap_lapses_report(Some(&other), None);
+        assert!(r["unknown"].is_string(), "signed-out is withheld: {r}");
     }
 }
