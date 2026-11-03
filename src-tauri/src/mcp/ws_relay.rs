@@ -453,7 +453,7 @@ async fn drive_connection(
         Ok(r) => r,
         Err(reason) => {
             warn!("[ws-relay] rejected handshake: {}", reason);
-            let _ = sink.send(Message::Close(None)).await;
+            close_gracefully(sink, &mut stream).await;
             return;
         }
     };
@@ -464,7 +464,7 @@ async fn drive_connection(
                 "[ws-relay] rejected handshake: transport '{}' != 'websocket'",
                 declared
             );
-            let _ = sink.send(Message::Close(None)).await;
+            close_gracefully(sink, &mut stream).await;
             return;
         }
     }
@@ -755,14 +755,30 @@ async fn refuse_handshake(
     if let Ok(frame) = serde_json::to_string(&refusal.ws_ack()) {
         let _ = sink.send(Message::Text(frame.into())).await;
     }
-    let _ = sink.send(Message::Close(None)).await;
-    // Finish the close handshake before dropping the socket. Dropping it the
-    // instant our Close is queued closes the TCP socket while the peer's own
-    // Close reply (or any frame it already sent) is still unread; on Windows
-    // that sends an RST, and the peer's stack discards its receive buffer --
-    // including the refusal ack we just wrote. Bounded, so a peer that never
-    // answers cannot hold the task.
-    let _ = tokio::time::timeout(Duration::from_secs(1), async {
+    close_gracefully(sink, stream).await;
+}
+
+/// Bound on how long a refusing close waits for the peer's Close reply.
+const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Send our Close and finish the close handshake before dropping the socket.
+///
+/// Dropping it the instant our Close is queued closes the TCP socket while the
+/// peer's own Close reply (or any frame it already sent) is still unread; on
+/// Windows that sends an RST, and the peer's stack discards its receive buffer
+/// -- including any refusal ack written just before. Every pre-registration
+/// refusal goes through here so none of them turns a clean close into a
+/// `ConnectionReset`. The send AND the drain are bounded together by
+/// [`CLOSE_DRAIN_TIMEOUT`], so a peer that never answers, or has stopped
+/// reading, cannot hold the task. A stream that has already ended (the peer
+/// closed first) returns at once; when the peer's Close arrived first, the
+/// drain's poll is what flushes the auto-queued Close reply.
+async fn close_gracefully(
+    mut sink: futures_util::stream::SplitSink<WebSocket, Message>,
+    stream: &mut futures_util::stream::SplitStream<WebSocket>,
+) {
+    let _ = tokio::time::timeout(CLOSE_DRAIN_TIMEOUT, async {
+        let _ = sink.send(Message::Close(None)).await;
         while let Some(Ok(msg)) = stream.next().await {
             if matches!(msg, Message::Close(_)) {
                 break;
