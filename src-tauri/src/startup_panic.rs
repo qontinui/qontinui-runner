@@ -29,11 +29,15 @@
 //!
 //! # File semantics
 //!
-//! The log file is a *last crash* record, not a history: each startup
-//! truncates it on install. If the runner boots successfully, the file
-//! stays there until the next panic overwrites it. The supervisor uses
-//! mtime-within-60s of exit to decide whether a given exit corresponds
-//! to the panic on disk.
+//! The log file is a *last panic* record, not a history: every panic
+//! rewrites it whole ([`write_panic_log`] uses `File::create`), and
+//! installing the hook does NOT truncate it. A runner that boots cleanly
+//! therefore leaves an OLDER process's panic on disk until its own next
+//! panic overwrites it, so a reader must not take the file's presence as
+//! this process's panic. The supervisor ties a panic to a spawn by the
+//! header's pid (else by its date against the spawn), not by the file
+//! existing; its exit monitor additionally requires the panic to be dated
+//! within 60 s of the exit.
 //!
 //! # Log dir resolution
 //!
