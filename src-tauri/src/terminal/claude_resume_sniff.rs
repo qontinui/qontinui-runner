@@ -60,7 +60,11 @@ pub struct TypedClaudeResume {
 /// skipped and the first real token must be the `claude` program. The id
 /// must be a strict UUID (what every restore surface types), so prose
 /// containing "claude" can't false-positive. A bare `claude --resume`
-/// (interactive picker form) has no id and does NOT match.
+/// (interactive picker form) has no id and does NOT match. Neither does an
+/// invocation carrying `--fork-session`: it resumes the named session into a
+/// NEW one, so the pane will not run the id the line names, and recording it
+/// there (authoritatively, for a line the shell read) would bind a session the
+/// pane does not run. The fork's own SessionStart hook reports what it runs.
 pub fn parse_typed_claude_resume(line: &str) -> Option<TypedClaudeResume> {
     for segment in line.split([';', '&', '|']) {
         let mut tokens = segment.split_whitespace();
@@ -73,6 +77,12 @@ pub fn parse_typed_claude_resume(line: &str) -> Option<TypedClaudeResume> {
             continue;
         }
         let rest: Vec<&str> = tokens.collect();
+        if rest
+            .iter()
+            .any(|t| *t == "--fork-session" || t.starts_with("--fork-session="))
+        {
+            continue;
+        }
         for (i, t) in rest.iter().enumerate() {
             let candidate = if *t == "--resume" || *t == "--session-id" {
                 rest.get(i + 1).copied()
@@ -480,6 +490,24 @@ mod tests {
         ] {
             assert!(parse(&line).is_some(), "must parse: {line}");
         }
+    }
+
+    /// Review M1: `--fork-session` resumes the named session into a NEW one,
+    /// so the pane will not run the id the line names — the line records
+    /// nothing, wherever the flag sits.
+    #[test]
+    fn a_fork_session_line_names_no_session_for_the_pane() {
+        let id = "0f9e8d7c-6b5a-4938-8271-605f4e3d2c1b";
+        for line in [
+            format!("claude --resume {id} --fork-session"),
+            format!("claude --fork-session --resume {id}"),
+            format!("claude --resume={id} --fork-session --dangerously-skip-permissions"),
+            format!("cd /repo && claude --session-id {id} --fork-session"),
+        ] {
+            assert_eq!(parse(&line), None, "{line}");
+        }
+        // Another segment of the same line is judged on its own.
+        assert!(parse(&format!("claude --fork-session; claude --resume {id}")).is_some());
     }
 
     #[test]

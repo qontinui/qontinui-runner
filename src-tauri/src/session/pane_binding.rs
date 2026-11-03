@@ -68,8 +68,10 @@
 //!   record naming it (in the pane that launched it and has since switched
 //!   away) reads its row `unknown`, counted once per episode, and the census
 //!   withholds that pane's attribution while the `unknown` is current. The
-//!   row stays where its hook — a strong bind — put it
-//!   ([`TerminalSessionRecord::placed_strongly`]): rung 2b does not move it.
+//!   row stays where its hook — a strong bind — put it, while it is the
+//!   session that most recently started on that pane and the pane still runs
+//!   a `claude` ([`TerminalSessionRecord::placed_strongly`]): rung 2b does not
+//!   move it.
 //! - A pane that ran `/clear` keeps naming its predecessor. Once no live pane
 //!   holds or runs that predecessor, rung 2b binds it back onto the pane,
 //!   authoritatively: a confirmed bind's supersede closes the row of the
@@ -100,10 +102,13 @@
 //!   bind's own write-ahead-log append is the store's, unchanged.)
 //! - **The tracking-health census** (`/restart-readiness`) attributes each
 //!   top-level terminal-hosted `claude` pid by the verdict the pass stored for
-//!   the row that owns its pane, served only while that verdict carries the
-//!   oracle's current epoch
-//!   ([`SessionLifecycleStore::current_binding_verdicts`]): a verdict from an
-//!   older observation reads as unchecked. It reads no record of its own.
+//!   the row that owns its pane, served only while it is CURRENT
+//!   ([`SessionLifecycleStore::current_binding_verdicts`]: taken from an
+//!   observation the pass has started judging from, while the latest one is
+//!   fresh) and only on the terminal it was judged on. A verdict from an older
+//!   observation reads as unchecked. It reads no record of its own; nor do
+//!   `sessions[]` and `/sessions/history`, which serve the same verdicts by
+//!   the same rule.
 //!
 //! # What is counted
 //!
@@ -332,7 +337,8 @@ pub trait PaneEvidenceOracle: Send + Sync + std::fmt::Debug {
     }
 
     /// Each reconcile pass hands over what it saw. Returns the epoch the
-    /// observation was given — `None` from an oracle that numbers none.
+    /// observation was given — `None` from an oracle that numbers none, or
+    /// when it was not stored because the oracle holds one read later.
     fn observe(&self, _observation: PaneObservation) -> Option<u64> {
         None
     }
@@ -513,10 +519,16 @@ impl PaneEvidenceOracle for LivePaneRegistry {
             self.report_poisoned();
             poisoned.into_inner()
         });
+        let at = observation.read_at.unwrap_or_else(Instant::now);
+        // Two passes overlapping can hand over out of order: an observation
+        // read before the one held is older evidence, and is not stored (a
+        // poisoned lock is still recovered by writing through it).
+        if !self.latest.is_poisoned() && held.as_ref().is_some_and(|newer| newer.at > at) {
+            return None;
+        }
         // Numbered under the lock, so epochs rise in the order observations
         // are stored; aged from when its records were read.
         let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed);
-        let at = observation.read_at.unwrap_or_else(Instant::now);
         *held = Some(Observed {
             observation,
             at,
@@ -1152,7 +1164,6 @@ mod tests {
     /// from, in one read (review N2).
     #[test]
     fn an_observation_is_aged_from_when_its_records_were_read() {
-        let registry = LivePaneRegistry::with_max_age(Duration::from_secs(60));
         let me = std::process::id();
         let seen = |read_at: Option<Instant>| PaneObservation {
             panes: [("t-seen".to_string(), vec![live(me)])]
@@ -1161,17 +1172,20 @@ mod tests {
             sessions: [(me, "s-seen".to_string())].into_iter().collect(),
             read_at,
         };
-        let two_minutes_ago = Instant::now()
-            .checked_sub(Duration::from_secs(120))
-            .expect("the monotonic clock has run for over two minutes");
-        registry.observe(seen(Some(two_minutes_ago)));
-        assert_eq!(
-            registry.pane_evidence_at("t-seen"),
-            (PaneEvidence::Unknown, None),
-            "read two minutes ago: stale the moment it is stored"
-        );
-        assert_eq!(registry.current_epoch(), None);
+        let read_at = Instant::now()
+            .checked_sub(Duration::from_millis(100))
+            .expect("the monotonic clock has run for 100 ms");
 
+        let slow = LivePaneRegistry::with_max_age(Duration::from_millis(50));
+        slow.observe(seen(Some(read_at)));
+        assert_eq!(
+            slow.pane_evidence_at("t-seen"),
+            (PaneEvidence::Unknown, None),
+            "read 100 ms ago, past its 50 ms max age: stale the moment it is stored"
+        );
+        assert_eq!(slow.current_epoch(), None);
+
+        let registry = LivePaneRegistry::new();
         let epoch = registry.observe(seen(Some(Instant::now())));
         assert!(epoch.is_some());
         assert_eq!(
@@ -1179,6 +1193,31 @@ mod tests {
             (names("s-seen"), epoch)
         );
         assert_eq!(registry.current_epoch(), epoch);
+    }
+
+    /// Review N2: two passes can hand over out of order. An observation read
+    /// BEFORE the one held is older evidence: it is not stored, gets no epoch,
+    /// and the held one keeps answering.
+    #[test]
+    fn an_observation_read_before_the_held_one_does_not_replace_it() {
+        let me = std::process::id();
+        let naming = |session: &str, read_at: Instant| PaneObservation {
+            panes: [("t-seen".to_string(), vec![live(me)])]
+                .into_iter()
+                .collect(),
+            sessions: [(me, session.to_string())].into_iter().collect(),
+            read_at: Some(read_at),
+        };
+        let earlier = Instant::now();
+        let later = earlier + Duration::from_millis(1);
+        let registry = LivePaneRegistry::new();
+        let held = registry.observe(naming("s-newer", later));
+        assert!(held.is_some());
+        assert_eq!(registry.observe(naming("s-older", earlier)), None);
+        assert_eq!(
+            registry.pane_evidence_at("t-seen"),
+            (names("s-newer"), held)
+        );
     }
 
     /// The guard over the production registry: a WEAK bind (a restore rebind)
@@ -1391,9 +1430,11 @@ mod tests {
             );
             assert_eq!(row.binding_state, Some(BindingState::Matched), "{session}");
             assert_eq!(
-                current.get(session),
-                Some(&BindingState::Matched),
-                "{session}: the verdict is the pass's own epoch"
+                current
+                    .get(session)
+                    .map(|v| (v.terminal_id.as_str(), v.state)),
+                Some((terminal, BindingState::Matched)),
+                "{session}: the verdict is the pass's own epoch, on its pane"
             );
             assert!(
                 row.confirmed_at.is_some(),

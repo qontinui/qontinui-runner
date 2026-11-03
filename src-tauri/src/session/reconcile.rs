@@ -608,6 +608,11 @@ pub fn run_reconcile_at_epoch<I: TranscriptIndex>(
     //    step 1 leaves alone, which is where a wrong binding lives (plan
     //    `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`).
     apply_verdicts(store, evidence, epoch, &mut actions);
+    // The observation's verdicts are servable now that its first judgement is
+    // stored; until this line the previous observation's stayed served.
+    if let Some(epoch) = epoch {
+        store.serve_verdicts_from(epoch);
+    }
     let open_now = store.open_records();
     let contradicted = |r: &TerminalSessionRecord| r.binding_state == Some(BindingState::Unknown);
     // Every index this pass needs, built ONCE (a fully bound fleet then costs
@@ -632,21 +637,31 @@ pub fn run_reconcile_at_epoch<I: TranscriptIndex>(
     }
     // ...and, per session, the live panes that hold it or whose own record
     // names it. A pane holds a session by an open row of it, confirmed or not,
-    // that is not read `unknown` — or that is, but a STRONG bind placed there
-    // (`placed_strongly`: a hook, a pinned spawn, a rung-2/2b bind). A pane
-    // may never take a session a PEER holds or runs (plan
+    // that is not read `unknown` — or that is, but a STRONG bind placed it
+    // there (`placed_strongly`: a hook, a pinned spawn, a rung-2/2b bind), the
+    // pane still runs a `claude`, and it is the session that most recently
+    // started on that pane (`latest_started_on_terminal`). A pane may never
+    // take a session a PEER holds or runs (plan
     // `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`):
     // claiming only confirmed rows is what let rung 3, in the Phase 1
     // reproduction, move a live peer's unconfirmed session onto another pane.
-    // So rung 2b heals only a row a WEAK bind put on the wrong pane — the
-    // 2026-10-25 shape — and never moves a row a hook put where its session
-    // runs, whatever a stale record elsewhere says. A pane may always re-take
-    // a session whose row it holds itself.
+    // So rung 2b heals a row a WEAK bind put on the wrong pane — the shape
+    // rung 3 reproduces — and a strong row its pane has since moved past (a
+    // `/clear`, an in-TUI `/resume`, an exited `claude`), but not the row a
+    // hook placed last on a pane that still runs it, whatever a stale record
+    // elsewhere says. A pane may always re-take a session whose row it holds
+    // itself.
+    let holds_against_its_contradiction = |r: &TerminalSessionRecord| {
+        r.placed_strongly
+            && evidence.get(&r.terminal_id) != Some(&PaneEvidence::NoClaude)
+            && store.latest_started_on_terminal(&r.terminal_id).as_deref()
+                == Some(r.claude_session_id.as_str())
+    };
     let mut holders: HashMap<&str, HashSet<&str>> = HashMap::new();
     let mut held_here: HashMap<&str, HashSet<&str>> = HashMap::new();
     for r in &open_now {
         if live_terminal_ids.contains(r.terminal_id.as_str())
-            && (!contradicted(r) || r.placed_strongly)
+            && (!contradicted(r) || holds_against_its_contradiction(r))
         {
             holders
                 .entry(r.claude_session_id.as_str())
@@ -3699,8 +3714,11 @@ mod tests {
                 "hook={hook}"
             );
             assert_eq!(
-                store.current_binding_verdicts().get("s-new"),
-                Some(&BindingState::Matched),
+                store
+                    .current_binding_verdicts()
+                    .get("s-new")
+                    .map(|v| (v.terminal_id.as_str(), v.state)),
+                Some(("term-a", BindingState::Matched)),
                 "hook={hook}: the pass's own epoch"
             );
             assert_ne!(
@@ -3716,9 +3734,10 @@ mod tests {
         }
     }
 
-    /// The 2026-10-25 shape: rung 3 — a WEAK bind — moved `s-b` off live pane
-    /// B, which still runs it, onto pane A, which runs `s-a`, and `s-a`'s row
-    /// was superseded by the move. (The move is made before any pane evidence
+    /// The 2026-10-25 shape, as rung 3 reproduces it (which binder made the
+    /// real move is UNKNOWN): a WEAK bind moved `s-b` off live pane B, which
+    /// still runs it, onto pane A, which runs `s-a`, and `s-a`'s row was
+    /// superseded by the move. (The move is made before any pane evidence
     /// exists, as a bind from before the guard would have been.) The victim
     /// row reads `unknown` and is counted ONCE — its session runs in B — then
     /// rung 2b heals both panes from their own records, and the next pass
@@ -3786,31 +3805,127 @@ mod tests {
         assert_eq!((counters.mismatches(), counters.refused_moves()), (1, 0));
     }
 
+    /// What the SessionStart hook route does for `id` on `terminal`: an
+    /// authoritative record written UNCONFIRMED, then the confirmation and the
+    /// start stamp, separately (`install_effects_producer`). Its write never
+    /// retires a confirmed sibling.
+    fn hook(store: &SessionLifecycleStore, id: &str, terminal: &str) {
+        assert!(store
+            .record_open_checked(TerminalSessionRecord {
+                confirmed_at: None,
+                ..title_rec(id, terminal, Some("T"))
+            })
+            .is_recorded());
+        store.confirm_session(id);
+        store.note_session_start_hook(id);
+    }
+
+    /// Review M1, on a build whose records follow a switch: P ran `s` (hook),
+    /// then `/clear` made `s2` there (hook). The hook route's unconfirmed write
+    /// retires no confirmed sibling, so `s`'s row stays open on P, strongly
+    /// placed, while P's record names `s2`. Then `s` is resumed in pane Q with
+    /// no hook, and Q's record names it. `s` reads `unknown` on P — and, no
+    /// longer the session that most recently started there, holds nothing: Q's
+    /// registry rung takes it in ONE pass.
+    #[test]
+    fn a_strong_row_its_pane_has_moved_past_goes_to_the_pane_that_runs_it() {
+        let dir = tempdir().unwrap();
+        let panes = [("term-a", names("s2")), ("term-b", names("s"))];
+        let (store, counters) = store_with_panes(dir.path(), &panes);
+        hook(&store, "s", "term-a");
+        hook(&store, "s2", "term-a");
+        store.mark_adopted_from("s2", "s");
+        let stale = store.get("s").unwrap();
+        assert_eq!(
+            (stale.state.as_str(), stale.placed_strongly),
+            ("open", true),
+            "precondition: the /clear left s open and strong on P"
+        );
+        let (live, _) = two_panes_one_workdir();
+
+        let actions = run_reconcile(
+            &store,
+            &live,
+            &ProcessSnapshot::default(),
+            &transcripts(&["s", "s2"], 1_500),
+            &no_cmdlines(),
+            &evidence(&panes),
+        );
+
+        assert!(
+            actions.contains(&ReconcileAction::Bind {
+                terminal_id: "term-b".to_string(),
+                session_id: "s".to_string(),
+                config_dir: "C:/cfg".to_string(),
+                origin: BindOrigin::ProviderRegistry,
+                confirmed: true,
+            }),
+            "{actions:?}"
+        );
+        let s = store.get("s").unwrap();
+        assert_eq!(
+            (s.terminal_id.as_str(), s.binding_state),
+            ("term-b", Some(BindingState::Matched))
+        );
+        assert_eq!(
+            store.get("s2").unwrap().binding_state,
+            Some(BindingState::Matched)
+        );
+        assert_eq!(counters.mismatches(), 1, "s read unknown on P once");
+    }
+
+    /// A strong row on a pane whose `claude` has EXITED holds nothing: nothing
+    /// there can be running it. P ran `s` (hook) and its `claude` exited; `s`
+    /// was resumed in pane Q with no hook. `s` moves to Q in one pass.
+    #[test]
+    fn a_strong_row_on_a_pane_with_no_claude_holds_nothing() {
+        let dir = tempdir().unwrap();
+        let panes = [("term-a", PaneEvidence::NoClaude), ("term-b", names("s"))];
+        let (store, _counters) = store_with_panes(dir.path(), &panes);
+        hook(&store, "s", "term-a");
+        let (live, _) = two_panes_one_workdir();
+
+        run_reconcile(
+            &store,
+            &live,
+            &ProcessSnapshot::default(),
+            &transcripts(&["s"], 1_500),
+            &no_cmdlines(),
+            &evidence(&panes),
+        );
+
+        let s = store.get("s").unwrap();
+        assert_eq!(
+            (s.terminal_id.as_str(), s.binding_state),
+            ("term-b", Some(BindingState::Matched))
+        );
+    }
+
     /// Review M1, case (i), on a build whose records do NOT follow a switch:
     /// pane B launched `x`, then resumed `s` inside its TUI — B's hook moved
-    /// `s`'s row there, a strong bind — while pane A, which launched `s` and
-    /// has since run `/clear`, still names `s`, and B still names `x`. `s`
-    /// reads `unknown`, counted once for the episode, but stays on B pass after
-    /// pass: a row a strong bind placed holds its session against A's
-    /// provider-registry rung, so nothing moves it back.
+    /// `s`'s row there, a strong bind, and it is the session that most
+    /// recently started on B — while pane A, which launched `s` and has since
+    /// run `/clear`, still names `s`, and B still names `x`. `s` reads
+    /// `unknown`, counted once for the episode, but stays on B pass after
+    /// pass: it holds its session against A's provider-registry rung, so
+    /// nothing moves it back.
     #[test]
     fn a_row_a_hook_placed_is_never_moved_back_by_a_stale_record() {
         let dir = tempdir().unwrap();
         let panes = [("term-a", names("s")), ("term-b", names("x"))];
         let (store, counters) = store_with_panes(dir.path(), &panes);
-        // A launched `s`; its `/clear` made `s2` there (hook-reported).
-        store.record_open(title_rec("s", "term-a", Some("T")));
-        store.record_open(TerminalSessionRecord {
-            adopted_from: Some("s".to_string()),
-            ..title_rec("s2", "term-a", Some("T"))
-        });
+        // A launched `s`; its `/clear` made `s2` there.
+        hook(&store, "s", "term-a");
+        hook(&store, "s2", "term-a");
+        store.mark_adopted_from("s2", "s");
         // B launched `x`, then resumed `s` inside its TUI: B's hook moves `s`.
-        store.record_open(title_rec("x", "term-b", Some("T")));
-        assert_eq!(
-            store.record_open_checked(title_rec("s", "term-b", Some("T"))),
-            RecordOpenOutcome::Recorded
-        );
+        hook(&store, "x", "term-b");
+        hook(&store, "s", "term-b");
         assert!(store.get("s").unwrap().placed_strongly);
+        assert_eq!(
+            store.latest_started_on_terminal("term-b").as_deref(),
+            Some("s")
+        );
         let (live, _) = two_panes_one_workdir();
 
         for _ in 0..3 {

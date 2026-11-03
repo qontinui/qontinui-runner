@@ -219,6 +219,18 @@ pub enum BindingState {
     Unknown,
 }
 
+/// A binding verdict a reader may serve now
+/// ([`SessionLifecycleStore::current_binding_verdicts`]): the state, and the
+/// terminal the row sat on when it was judged. A surface serves it only for a
+/// row or process on that same terminal — a heal between its own read of the
+/// rows and its read of the verdicts must not pair a session with a pane it
+/// has left.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentVerdict {
+    pub terminal_id: String,
+    pub state: BindingState,
+}
+
 /// What [`SessionLifecycleStore::record_open_checked`] (or
 /// [`SessionLifecycleStore::rebind_terminal_checked`]) did with a bind.
 ///
@@ -402,6 +414,24 @@ pub fn describe_restore_status(
     }
 }
 
+/// How recently `r` STARTED on its terminal, as the terminal-keyed readers
+/// rank it ([`SessionLifecycleStore::latest_open_on_terminal`]): the latest
+/// SessionStart hook this process saw for it (`hooks`: session id → hook
+/// order), then the durable hook stamp, then `confirmed_at`, `last_seen_at`
+/// and `opened_at`. Greater is more recent.
+fn start_rank(
+    hooks: &HashMap<String, u64>,
+    r: &TerminalSessionRecord,
+) -> (Option<u64>, Option<i64>, Option<i64>, i64, i64) {
+    (
+        hooks.get(&r.claude_session_id).copied(),
+        r.last_session_start_at,
+        r.confirmed_at,
+        r.last_seen_at,
+        r.opened_at,
+    )
+}
+
 /// Reap the restore-pending marker on a record that is about to become
 /// `closed`, demoting a still-pessimistic `failed` tier to
 /// [`RESTORE_TIER_TERMINAL_ONLY`].
@@ -442,8 +472,10 @@ fn reap_restore_marker_on_close(rec: &mut TerminalSessionRecord) {
     rec.restore_pending_at = None;
     // A binding verdict is about a LIVE pane: a closed row has none, so
     // `/sessions/history` never serves a stale `matched` with its terminal, nor
-    // withholds the terminal of a session that has ended.
+    // withholds the terminal of a session that has ended. Nor does it keep a
+    // placement: a weak re-open in place must not inherit a strong one.
     rec.binding_state = None;
+    rec.placed_strongly = false;
     if rec.restore_tier.as_deref() == Some(RESTORE_TIER_FAILED) {
         rec.restore_tier = Some(RESTORE_TIER_TERMINAL_ONLY.to_string());
     }
@@ -698,10 +730,12 @@ pub struct TerminalSessionRecord {
     /// ([`SessionLifecycleStore::withdraw_matched`]),
     /// [`SessionLifecycleStore::record_open_checked`] sets `matched` when the
     /// bound pane names the session, and a row that MOVES to another terminal
-    /// drops it — a verdict is about one pane. Nothing else writes it: a
-    /// refused move marks no row, and an incoming record's value is never
-    /// taken. Which observation a verdict came from is held beside it, in
-    /// memory ([`SessionLifecycleStore::current_binding_verdicts`]).
+    /// drops it — a verdict is about one pane. So do a close
+    /// (`reap_restore_marker_on_close`, which every close path calls) and an
+    /// account hold's detach. Nothing else writes it: a refused move marks no
+    /// row, and an incoming record's value is never taken. Which observation a
+    /// verdict came from is held beside it, in memory
+    /// ([`SessionLifecycleStore::current_binding_verdicts`]).
     ///
     /// `None` = not checked: no verdict from the latest evidence, or the row
     /// moved since its last check. Not a verdict, and never read as agreement.
@@ -710,17 +744,24 @@ pub struct TerminalSessionRecord {
     pub binding_state: Option<BindingState>,
     /// Whether the write that last placed this row on [`Self::terminal_id`]
     /// was a STRONG bind — an authoritative one: the SessionStart hook route,
-    /// a pinned spawn, reconcile's argv and provider-registry rungs. A weak
-    /// write that creates or moves the row (a transcript correlation, an mtime
-    /// fallback, a restore rebind, a provisional sniff, an unasserted
-    /// re-record) clears it; a weak write in place keeps it. The store owns it:
-    /// an incoming record's value is never taken.
+    /// a pinned spawn, the frontend's authoritative pin, the typed-resume
+    /// sniff for a line the pane's shell read, reconcile's argv and
+    /// provider-registry rungs. A weak write that creates or moves the row (a
+    /// transcript correlation, an mtime fallback, a restore rebind, a
+    /// provisional sniff, an unasserted re-record) clears it, and so do a
+    /// close and an account hold's detach; a weak write in place keeps it. The
+    /// store owns it: an incoming record's value is never taken.
     ///
-    /// What it decides: a row read `unknown` still holds its session against
-    /// the reconcile pass's provider-registry rung when a strong bind placed
-    /// it, so only a row a WEAK bind put on the wrong pane is moved from
-    /// another pane's record. `#[serde(default)]`: rows written before the
-    /// field load `false` — healable, as every row was before.
+    /// What it decides: a row read `unknown` still holds its session — against
+    /// the reconcile pass's provider-registry and argv rungs and its
+    /// transcript correlation (rungs 2b, 2 and 3) — when a strong bind placed
+    /// it, its pane still runs a `claude`, and it is the session that most
+    /// recently started on that pane
+    /// ([`SessionLifecycleStore::latest_started_on_terminal`]). So a row a
+    /// WEAK bind put on the wrong pane, or a strong row its pane has since
+    /// moved past (a `/clear`, an in-TUI `/resume`, an exited `claude`), is
+    /// moved from another pane's record. `#[serde(default)]`: rows written
+    /// before the field load `false` — healable, as every row was before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub placed_strongly: bool,
     /// Coord-minted stable fleet session handle (`fsh_…`) for this session
@@ -1321,6 +1362,12 @@ pub struct SessionLifecycleStore {
     /// carries none and is never current. Lock order: `map` →
     /// `verdict_epochs`.
     verdict_epochs: Mutex<HashMap<String, u64>>,
+    /// The oldest observation epoch whose verdicts are served
+    /// ([`Self::current_binding_verdicts`]); raised by the reconcile pass once
+    /// its FIRST judgement of an observation is stored
+    /// ([`Self::serve_verdicts_from`]). Until then the previous observation's
+    /// verdicts stay served. `None`: no pass has judged in this process.
+    servable_epoch: Mutex<Option<u64>>,
     /// Serializes [`Self::set_finished`] END TO END — the map mutation AND the
     /// finish-observer hand-off — so the order coord's outbox receives
     /// finished / working rows in is the order the local marker changed in.
@@ -1541,6 +1588,7 @@ impl SessionLifecycleStore {
             refused_episodes: Mutex::new(HashMap::new()),
             binding_counters: OnceLock::new(),
             verdict_epochs: Mutex::new(HashMap::new()),
+            servable_epoch: Mutex::new(None),
             finish_forward: Mutex::new(()),
         };
         if replay.applied > 0 || replay.damaged {
@@ -1698,13 +1746,29 @@ impl SessionLifecycleStore {
         self.pane_evidence.get()?.current_epoch()
     }
 
-    /// The verdict of every open row whose verdict the CURRENT observation
-    /// produced — tagged with [`Self::pane_epoch`] — by session id. A verdict
-    /// from an older observation (a stalled pass, a previous process, an
-    /// `unknown` rule 3 kept) is not in it: its reader serves it as unchecked.
-    /// Empty without a fresh observation.
-    pub fn current_binding_verdicts(&self) -> HashMap<String, BindingState> {
-        let Some(epoch) = self.pane_epoch() else {
+    /// Serve the verdicts taken from observation `epoch` (and any newer one)
+    /// from now on: the reconcile pass calls this once its FIRST judgement of
+    /// that observation is stored, so a reader never sees the new observation
+    /// before a single verdict was taken from it. Only ever raised.
+    pub(crate) fn serve_verdicts_from(&self, epoch: u64) {
+        if let Ok(mut servable) = self.servable_epoch.lock() {
+            *servable = Some(servable.map_or(epoch, |current| current.max(epoch)));
+        }
+    }
+
+    /// The verdict of every open row whose verdict is CURRENT, by session id:
+    /// taken from an observation at or after the servable epoch
+    /// ([`Self::serve_verdicts_from`]), while the oracle's latest observation is
+    /// still fresh ([`Self::pane_epoch`]). Each carries the terminal the row
+    /// sat on when judged ([`CurrentVerdict`]). A verdict from an older
+    /// observation (a stalled pass, a previous process, an `unknown` rule 3
+    /// kept) is not in it: its reader serves it as unchecked. Empty without a
+    /// fresh observation or before any pass has judged.
+    pub fn current_binding_verdicts(&self) -> HashMap<String, CurrentVerdict> {
+        if self.pane_epoch().is_none() {
+            return HashMap::new();
+        }
+        let Some(floor) = self.servable_epoch.lock().ok().and_then(|s| *s) else {
             return HashMap::new();
         };
         let m = match self.map.lock() {
@@ -1721,8 +1785,18 @@ impl SessionLifecycleStore {
             .filter(|r| r.state == "open")
             .filter_map(|r| {
                 let state = r.binding_state?;
-                (epochs.get(&r.claude_session_id) == Some(&epoch))
-                    .then(|| (r.claude_session_id.clone(), state))
+                epochs
+                    .get(&r.claude_session_id)
+                    .is_some_and(|epoch| *epoch >= floor)
+                    .then(|| {
+                        (
+                            r.claude_session_id.clone(),
+                            CurrentVerdict {
+                                terminal_id: r.terminal_id.clone(),
+                                state,
+                            },
+                        )
+                    })
             })
             .collect()
     }
@@ -4300,15 +4374,34 @@ impl SessionLifecycleStore {
                         // migration's source row — would otherwise act on the
                         // session the pane does not run.
                         r.binding_state != Some(BindingState::Unknown),
-                        hooks.1.get(&r.claude_session_id).copied(),
-                        r.last_session_start_at,
-                        r.confirmed_at,
-                        r.last_seen_at,
-                        r.opened_at,
+                        start_rank(&hooks.1, r),
                     )
                 };
                 key(a)
                     .cmp(&key(b))
+                    .then_with(|| a.claude_session_id.cmp(&b.claude_session_id))
+            })
+            .map(|r| r.claude_session_id.clone())
+    }
+
+    /// The open row on `terminal_id` that most recently STARTED there:
+    /// [`Self::latest_open_on_terminal`]'s ordering without its verdict key, so
+    /// a row read `unknown` competes on how recently it started like any
+    /// other. What the reconcile pass asks before letting a contradicted,
+    /// strongly placed row keep holding its session
+    /// ([`TerminalSessionRecord::placed_strongly`]). `None` for a blank id, no
+    /// open row, or a poisoned lock.
+    pub(crate) fn latest_started_on_terminal(&self, terminal_id: &str) -> Option<String> {
+        if terminal_id.trim().is_empty() {
+            return None;
+        }
+        let m = self.map.lock().ok()?;
+        let hooks = self.hook_order();
+        m.values()
+            .filter(|r| open_on_terminal(r, terminal_id))
+            .max_by(|a, b| {
+                start_rank(&hooks.1, a)
+                    .cmp(&start_rank(&hooks.1, b))
                     .then_with(|| a.claude_session_id.cmp(&b.claude_session_id))
             })
             .map(|r| r.claude_session_id.clone())
@@ -8852,10 +8945,14 @@ mod tests {
             store.get("s-a").unwrap().binding_state,
             Some(BindingState::Matched)
         );
+        store.serve_verdicts_from(0);
         assert_eq!(
-            store.current_binding_verdicts().get("s-a"),
-            Some(&BindingState::Matched),
-            "the bind-time verdict is the current observation's"
+            store
+                .current_binding_verdicts()
+                .get("s-a")
+                .map(|v| (v.terminal_id.as_str(), v.state)),
+            Some(("term-a", BindingState::Matched)),
+            "the bind-time verdict is the current observation's, on its pane"
         );
         // No evidence for a pane: no verdict.
         store.record_open(auth_on("s-c", "term-c"));
@@ -8984,37 +9081,50 @@ mod tests {
         );
     }
 
-    /// The census reads only CURRENT verdicts: tagged with the epoch of the
-    /// oracle's latest fresh observation. A verdict from an older observation
-    /// — the pass has not judged since, or it came off disk — reads as
-    /// unchecked; re-judging it makes it current again.
+    /// The census reads only CURRENT verdicts: taken from an observation at
+    /// or after the servable epoch, which the reconcile pass raises once its
+    /// first judgement of an observation is stored (review L3) — so between a
+    /// new observation and that judgement the previous observation's verdicts
+    /// stay served — and only while the latest observation is fresh. A verdict
+    /// from an older observation reads as unchecked; re-judging it makes it
+    /// current again. Each comes with the terminal it was judged on.
     #[test]
-    fn only_a_verdict_from_the_current_observation_is_current() {
+    fn only_a_verdict_from_the_servable_observation_on_is_current() {
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
         let registry = Arc::new(crate::session::pane_binding::LivePaneRegistry::new());
         store.attach_pane_evidence(registry.clone());
         store.record_open(auth_on("s", "term-a"));
-        assert!(
-            store.current_binding_verdicts().is_empty(),
-            "no observation yet"
-        );
+        let served = |store: &SessionLifecycleStore| {
+            store
+                .current_binding_verdicts()
+                .get("s")
+                .map(|v| (v.terminal_id.clone(), v.state))
+        };
+        let matched_on_a = Some(("term-a".to_string(), BindingState::Matched));
+        assert_eq!(served(&store), None, "no observation yet");
 
         let first = store.observe_panes(PaneObservation::default());
         assert_eq!(
             store.set_binding_state("s", "term-a", BindingState::Matched, first),
             Some(None)
         );
-        assert_eq!(
-            store.current_binding_verdicts().get("s"),
-            Some(&BindingState::Matched)
-        );
+        assert_eq!(served(&store), None, "no pass has judged yet");
+        store.serve_verdicts_from(first.unwrap());
+        assert_eq!(served(&store), matched_on_a);
 
         let second = store.observe_panes(PaneObservation::default());
         assert_ne!(first, second);
-        assert!(
-            store.current_binding_verdicts().is_empty(),
-            "a verdict from an older observation is not served"
+        assert_eq!(
+            served(&store),
+            matched_on_a,
+            "until the new observation is judged, the previous one's verdicts stay served"
+        );
+        store.serve_verdicts_from(second.unwrap());
+        assert_eq!(
+            served(&store),
+            None,
+            "once it is, a verdict it did not re-take is not served"
         );
         assert_eq!(
             store.get("s").unwrap().binding_state,
@@ -9022,15 +9132,12 @@ mod tests {
             "the row keeps it; only its currency lapsed"
         );
         let _ = store.set_binding_state("s", "term-a", BindingState::Matched, second);
-        assert_eq!(
-            store.current_binding_verdicts().get("s"),
-            Some(&BindingState::Matched)
-        );
+        assert_eq!(served(&store), matched_on_a);
 
         // A verdict stored with no epoch is never current, and a reload
         // carries none.
         let _ = store.set_binding_state("s", "term-a", BindingState::Unknown, None);
-        assert!(store.current_binding_verdicts().is_empty());
+        assert_eq!(served(&store), None);
         let _ = store.set_binding_state("s", "term-a", BindingState::Unknown, second);
         drop(store);
         let reloaded = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
@@ -9111,18 +9218,17 @@ mod tests {
                 &binding_verdicts(&store.open_records(), &evidence),
                 epoch,
             );
+            store.serve_verdicts_from(epoch.unwrap());
         };
+        let served = || store.current_binding_verdicts().get("s").map(|v| v.state);
         let runs_elsewhere = [("term-a", names("x")), ("term-b", names("s"))];
 
         judge(&runs_elsewhere);
-        assert_eq!(
-            store.current_binding_verdicts().get("s"),
-            Some(&BindingState::Unknown)
-        );
+        assert_eq!(served(), Some(BindingState::Unknown));
         judge(&runs_elsewhere);
         assert_eq!(
-            store.current_binding_verdicts().get("s"),
-            Some(&BindingState::Unknown),
+            served(),
+            Some(BindingState::Unknown),
             "re-derived in a new epoch: still served"
         );
         assert_eq!(counters.mismatches(), 1, "and not counted again");
@@ -9133,10 +9239,7 @@ mod tests {
             Some(BindingState::Unknown),
             "rule 3 keeps the unknown"
         );
-        assert!(
-            !store.current_binding_verdicts().contains_key("s"),
-            "but this observation did not produce it"
-        );
+        assert_eq!(served(), None, "but this observation did not produce it");
     }
 
     /// Rule 3's withdrawal is re-checked under the registry lock: it takes a

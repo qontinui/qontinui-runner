@@ -380,16 +380,20 @@ fn build_enriched(
     }
 }
 
-/// `current`: the verdicts the current pane observation produced, by session
-/// id ([`SessionLifecycleStore::current_binding_verdicts`]) — the only ones
-/// served; a stored verdict outside it reads as not checked.
+/// `current`: the CURRENT verdicts, by session id, each with the terminal it
+/// was judged on ([`SessionLifecycleStore::current_binding_verdicts`]) — the
+/// only ones served, and only for a row on that terminal; any other stored
+/// verdict reads as not checked.
 fn past_from_record(
     rec: &TerminalSessionRecord,
-    current: &HashMap<String, crate::session::session_lifecycle_store::BindingState>,
+    current: &HashMap<String, crate::session::session_lifecycle_store::CurrentVerdict>,
 ) -> PastSession {
     use crate::session::session_lifecycle_store::BindingState;
     let confirmed = rec.confirmed_at.is_some();
-    let binding_state = current.get(&rec.claude_session_id).copied();
+    let binding_state = current
+        .get(&rec.claude_session_id)
+        .filter(|v| v.terminal_id == rec.terminal_id)
+        .map(|v| v.state);
     let unevidenced = binding_state == Some(BindingState::Unknown);
     let mut row = build_enriched(
         rec.claude_session_id.clone(),
@@ -738,20 +742,33 @@ mod tests {
     /// `bindingState`, and a row whose session currently runs in ANOTHER pane
     /// names no terminal — so a consumer mapping terminals to rows cannot
     /// label (or nudge, or close) that pane with this session's name. A row
-    /// with no current verdict serves neither key change, whatever the row
-    /// stored.
+    /// with no current verdict — or one judged on another terminal — serves
+    /// neither key change, whatever the row stored.
     #[test]
     fn a_history_row_serves_binding_state_and_withholds_an_unevidenced_terminal() {
-        use crate::session::session_lifecycle_store::{test_open_record, BindingState};
-        let row = |state: Option<BindingState>| {
+        use crate::session::session_lifecycle_store::{
+            test_open_record, BindingState, CurrentVerdict,
+        };
+        let judged_on = |terminal: &str, state: Option<BindingState>| {
             let mut rec = test_open_record("s-b");
             rec.terminal_id = "term-a".to_string();
             // What the row stored never decides it: only `current` does.
             rec.binding_state = Some(BindingState::Unknown);
-            let current: HashMap<String, BindingState> =
-                state.map(|s| ("s-b".to_string(), s)).into_iter().collect();
+            let current: HashMap<String, CurrentVerdict> = state
+                .map(|state| {
+                    (
+                        "s-b".to_string(),
+                        CurrentVerdict {
+                            terminal_id: terminal.to_string(),
+                            state,
+                        },
+                    )
+                })
+                .into_iter()
+                .collect();
             serde_json::to_value(past_from_record(&rec, &current)).unwrap()
         };
+        let row = |state: Option<BindingState>| judged_on("term-a", state);
 
         let unknown = row(Some(BindingState::Unknown));
         assert_eq!(unknown["bindingState"], "unknown");
@@ -768,5 +785,9 @@ mod tests {
         let unchecked = row(None);
         assert!(unchecked.get("bindingState").is_none(), "{unchecked}");
         assert_eq!(unchecked["terminalId"], "term-a");
+
+        let elsewhere = judged_on("term-z", Some(BindingState::Unknown));
+        assert!(elsewhere.get("bindingState").is_none(), "{elsewhere}");
+        assert_eq!(elsewhere["terminalId"], "term-a");
     }
 }

@@ -194,7 +194,9 @@ use serde::Serialize;
 use crate::mcp::session_work_status::{self, SessionStatusSource};
 use crate::mcp::types::ApiState;
 use crate::session::claude_activity::{self, ActivityCounts, LivePid, RecordReading};
-use crate::session::session_lifecycle_store::{BindingState, TerminalSessionRecord};
+use crate::session::session_lifecycle_store::{
+    BindingState, CurrentVerdict, TerminalSessionRecord,
+};
 use crate::session::tracking_health::{
     self, HolderPane, HolderPaneState, LiveClaudeProcess, TrackingHealthReport,
 };
@@ -598,9 +600,11 @@ fn oldest_process(procs: &[LiveClaudeProcess]) -> Option<i64> {
 /// `sessions` is the open records MINUS the pass's `tracked_dead` set (a stale
 /// row masquerading as a restorable session is not live work). Each serves
 /// the verdict `current` holds for it (the pass's
-/// [`crate::session::session_lifecycle_store::SessionLifecycleStore::current_binding_verdicts`]),
-/// and nothing for a verdict the row stored from an older observation; a
-/// current `unknown` withholds its terminal.
+/// [`crate::session::session_lifecycle_store::SessionLifecycleStore::current_binding_verdicts`])
+/// when that verdict was judged on the row's own terminal, and nothing for a
+/// verdict the row stored from an older observation or one judged on another
+/// terminal (the pass moved the row after the rows were read); a current
+/// `unknown` withholds its terminal.
 ///
 /// ⚠ `count` is the pass's **`terminal_hosted`** class, not `live_claude_total`.
 /// Before 2026-09-07 it was the total, which meant a box whose every live
@@ -611,7 +615,7 @@ fn oldest_process(procs: &[LiveClaudeProcess]) -> Option<i64> {
 pub fn terminal_plane_from(
     report: &TrackingHealthReport,
     open_records: &[TerminalSessionRecord],
-    current: &HashMap<String, BindingState>,
+    current: &HashMap<String, CurrentVerdict>,
     now_ms: i64,
 ) -> TerminalPlane {
     let dead: std::collections::HashSet<&str> = report
@@ -624,7 +628,10 @@ pub fn terminal_plane_from(
         .iter()
         .filter(|r| !dead.contains(r.claude_session_id.as_str()))
         .map(|r| {
-            let binding_state = current.get(&r.claude_session_id).copied();
+            let binding_state = current
+                .get(&r.claude_session_id)
+                .filter(|v| v.terminal_id == r.terminal_id)
+                .map(|v| v.state);
             let unevidenced = binding_state == Some(BindingState::Unknown);
             SessionEntry {
                 id: r.claude_session_id.clone(),
@@ -1625,10 +1632,17 @@ mod tests {
             with_state("s-right", "t-b", Some(BindingState::Matched)),
             // Stored, but no current observation produced it.
             with_state("s-unchecked", "t-c", Some(BindingState::Unknown)),
+            // Judged after the pass moved it to t-z; read here on t-d.
+            with_state("s-moved", "t-d", Some(BindingState::Unknown)),
         ];
-        let current: HashMap<String, BindingState> = [
-            ("s-wrong".to_string(), BindingState::Unknown),
-            ("s-right".to_string(), BindingState::Matched),
+        let verdict = |terminal: &str, state| CurrentVerdict {
+            terminal_id: terminal.to_string(),
+            state,
+        };
+        let current: HashMap<String, CurrentVerdict> = [
+            ("s-wrong".to_string(), verdict("t-a", BindingState::Unknown)),
+            ("s-right".to_string(), verdict("t-b", BindingState::Matched)),
+            ("s-moved".to_string(), verdict("t-z", BindingState::Unknown)),
         ]
         .into_iter()
         .collect();
@@ -1653,6 +1667,12 @@ mod tests {
         let unchecked = entry("s-unchecked");
         assert!(unchecked.get("bindingState").is_none(), "{unchecked}");
         assert_eq!(unchecked["terminal_id"], "t-c", "{unchecked}");
+        let moved = entry("s-moved");
+        assert!(
+            moved.get("bindingState").is_none(),
+            "a verdict from another terminal is not this row's: {moved}"
+        );
+        assert_eq!(moved["terminal_id"], "t-d", "{moved}");
     }
 
     /// Review M2: `sessions[]` and `GET /sessions/history` serve a row's
@@ -1673,6 +1693,7 @@ mod tests {
             let epoch = store.observe_panes(PaneObservation::default());
             let _ = store.set_binding_state("s-matched", "t-a", BindingState::Matched, epoch);
             let _ = store.set_binding_state("s-unknown", "t-b", BindingState::Unknown, epoch);
+            store.serve_verdicts_from(epoch.unwrap());
         };
         {
             let store = SessionLifecycleStore::open(&path).unwrap();
