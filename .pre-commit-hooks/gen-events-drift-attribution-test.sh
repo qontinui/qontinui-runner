@@ -356,15 +356,43 @@ check "my own Rust commit atop a peer's is still MINE" "mine" "$ATTRIBUTION_STAT
 # in-repo path dependency or the toolchain pin can move it without any
 # `src-tauri/src` file changing. Pinned here because the asymmetry only works
 # while the list stays complete — a narrowed list clears a guilty pusher.
-for input in rust-toolchain.toml src-tauri/clorinde/src/lib.rs crates/spec-check/Cargo.toml \
-    crates/runner-stats/src/lib.rs crates/runner-win32/src/lib.rs crates/pty-holder/src/lib.rs vendor/tao-0.35.0/src/lib.rs \
-    src-tauri/.cargo/config.toml .cargo/config.toml src-tauri/.cargo/config .cargo/config \
-    rust-toolchain src-tauri/rust-toolchain.toml src-tauri/rust-toolchain; do
+#
+# Hand-kept rather than derived from GEN_EVENTS_ATTRIBUTION_PATHS: a derived
+# loop would shrink with the list and so could never catch a narrowing. The
+# completeness check after the loop closes the other direction — an entry
+# added to the list with no pin here (crates/pty-holder, 2026-10-12, until
+# #2175) now fails the suite instead of passing unnoticed.
+CODEGEN_INPUT_PINS=(
+    src-tauri/src/lib.rs src-tauri/build.rs src-tauri/Cargo.toml
+    src-tauri/scripts/generate_types.sh Cargo.toml Cargo.lock
+    rust-toolchain.toml src-tauri/clorinde/src/lib.rs crates/spec-check/Cargo.toml
+    crates/runner-stats/src/lib.rs crates/runner-win32/src/lib.rs crates/pty-holder/src/lib.rs
+    vendor/tao-0.35.0/src/lib.rs vendor/portable-pty-0.8.1/src/lib.rs
+    src-tauri/.cargo/config.toml .cargo/config.toml src-tauri/.cargo/config .cargo/config
+    rust-toolchain src-tauri/rust-toolchain.toml src-tauri/rust-toolchain
+)
+for input in "${CODEGEN_INPUT_PINS[@]}"; do
     fixture
     commit_change "$input" "# touched"
     decide
     check "$input is a codegen input, so it is MINE" "mine" "$ATTRIBUTION_STATE"
 done
+
+# Every list entry is pinned by at least one case above: a FILE entry by an
+# identical pin, a DIRECTORY entry (trailing `/`) by a pin beneath it.
+UNPINNED=""
+for entry in "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}"; do
+    pinned=no
+    for input in "${CODEGEN_INPUT_PINS[@]}"; do
+        case "$entry" in
+            */) case "$input" in "$entry"*) pinned=yes ;; esac ;;
+            *)  [ "$input" = "$entry" ] && pinned=yes ;;
+        esac
+        [ "$pinned" = yes ] && break
+    done
+    [ "$pinned" = yes ] || UNPINNED+=" $entry"
+done
+check "every GEN_EVENTS_ATTRIBUTION_PATHS entry has a codegen-input pin" "" "$UNPINNED"
 
 echo "  -- fail closed when the question cannot be answered --"
 
