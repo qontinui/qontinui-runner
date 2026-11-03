@@ -1379,6 +1379,7 @@ fn registry_record_from_restore_payload(
         gate_bound_boot_ms: None,
         binding_state: None,
         placed_strongly: false,
+        start_process: None,
     }
 }
 

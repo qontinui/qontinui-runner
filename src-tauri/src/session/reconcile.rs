@@ -526,6 +526,7 @@ fn bind_record(
         gate_bound_boot_ms: None,
         binding_state: None,
         placed_strongly: false,
+        start_process: None,
     }
 }
 
@@ -604,6 +605,10 @@ pub fn run_reconcile_at_epoch<I: TranscriptIndex>(
     let live_terminal_ids: HashSet<&str> = live.iter().map(|p| p.terminal_id.as_str()).collect();
     let mut actions = Vec::new();
 
+    // Bind each start stamped since the last pass to the process its pane now
+    // runs — what decides, below, whether a strong row still holds.
+    store.bind_start_processes();
+
     // 0) Judge every open row on a live pane — including the confirmed panes
     //    step 1 leaves alone, which is where a wrong binding lives (plan
     //    `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`).
@@ -640,25 +645,26 @@ pub fn run_reconcile_at_epoch<I: TranscriptIndex>(
     // that is not read `unknown` — or that is, but a STRONG bind placed it
     // there (`placed_strongly`: a hook, a pinned spawn, a rung-2/2b bind), the
     // pane still runs a `claude`, it is the session that most recently
-    // started on that pane (`latest_started_on_terminal`), and the pane's
-    // current top-level `claude` did not start after it did, beyond the launch
-    // margin (`pane_claude_started_after`). A pane may never take a session a
+    // started on that pane (`latest_started_on_terminal`), and the pane runs
+    // no other process than the one that start belongs to
+    // (`runs_another_process`: pid and creation time, bound at the first
+    // observation read after the start). A pane may never take a session a
     // PEER holds or runs (plan
     // `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`):
     // claiming only confirmed rows is what let rung 3, in the Phase 1
     // reproduction, move a live peer's unconfirmed session onto another pane.
     // So rung 2b heals a row a WEAK bind put on the wrong pane — the shape
     // rung 3 reproduces — and a strong row its pane has since moved past (a
-    // `/clear`, an in-TUI `/resume`, an exited `claude`, a newer `claude`
-    // nothing stamped), but not the row placed last on a pane that still runs
-    // it, whatever a stale record elsewhere says. A pane may always re-take a
-    // session whose row it holds itself.
+    // `/clear`, an in-TUI `/resume`, an exited `claude`, another `claude`
+    // process nothing stamped), but not the row placed last on a pane that
+    // still runs it, whatever a stale record elsewhere says. A pane may always
+    // re-take a session whose row it holds itself.
     let holds_against_its_contradiction = |r: &TerminalSessionRecord| {
         r.placed_strongly
             && evidence.get(&r.terminal_id) != Some(&PaneEvidence::NoClaude)
             && store.latest_started_on_terminal(&r.terminal_id).as_deref()
                 == Some(r.claude_session_id.as_str())
-            && !pane_claude_started_after(store, r)
+            && !store.runs_another_process(r)
     };
     let mut holders: HashMap<&str, HashSet<&str>> = HashMap::new();
     let mut held_here: HashMap<&str, HashSet<&str>> = HashMap::new();
@@ -963,36 +969,6 @@ fn apply_verdicts(
             session_id: mismatch.claude_session_id,
             runs_on: mismatch.runs_on.unwrap_or_default(),
         });
-    }
-}
-
-/// How much later than a row's last start its pane's top-level `claude` must
-/// read as started to be a DIFFERENT process from the one that start was for.
-/// A process start time is whole seconds and never reads late — every source
-/// truncates (`/proc` both the boot time and the start offset, WMI the
-/// sub-second part) — so a process already running when the row's start was
-/// stamped, by its own hook or by a bind that observed it, never qualifies.
-/// The margin is for the launch paths that stamp a start BEFORE the process
-/// they launch forks (the typed-resume sniff, a pinned spawn): a fork up to
-/// this long after its own stamp is still taken for the process the stamp
-/// was for. The same two seconds the sniff allows a launch
-/// ([`crate::terminal::claude_resume_sniff`]).
-const PANE_START_SKEW_MS: i64 = 2_000;
-
-/// Whether `r`'s pane runs a top-level `claude` that started after `r` last
-/// started there ([`TerminalSessionRecord::last_session_start_at`]) by at
-/// least [`PANE_START_SKEW_MS`], per the store oracle's fresh observation
-/// ([`SessionLifecycleStore::pane_started_ms`]). That `claude` is not the
-/// process `r`'s start was for — a `claude` started since, which no hook or
-/// bind has stamped — so `r` holds nothing against its contradiction. `false`
-/// whenever either time is unknown: no evidence releases nothing.
-fn pane_claude_started_after(store: &SessionLifecycleStore, r: &TerminalSessionRecord) -> bool {
-    match (
-        r.last_session_start_at,
-        store.pane_started_ms(&r.terminal_id),
-    ) {
-        (Some(row), Some(pane)) => pane >= row.saturating_add(PANE_START_SKEW_MS),
-        _ => false,
     }
 }
 
@@ -1565,10 +1541,12 @@ fn anchor_live_ptys(live: &[LivePty], snapshot: &ProcessSnapshot) -> Vec<LivePty
 /// ([`SessionLifecycleStore::observe_panes`]) just before the binds and
 /// verdicts. The oracle numbers it: the verdicts carry that number, and the
 /// binding guard and the tracking-health census answer from it rather than
-/// reading again. An observation the oracle does not take — it already holds
-/// one read later, by a pass that overlapped this one
+/// reading again. From that hand-over to its last bind a pass holds the
+/// store's pass lock, so overlapping passes judge one at a time, and an
+/// observation the oracle does not take — it already holds one read later
 /// ([`ObserveOutcome::Superseded`]) — ends the pass there: nothing is judged
-/// or bound from evidence older than what every reader answers from.
+/// or bound from evidence older than what every reader answers from
+/// ([`judge_observation`]).
 ///
 /// `context` tags the INFO log ("boot" / "periodic") so a binder-only recovery is
 /// attributable to the pass that made it (the "no silent cap" observability
@@ -1684,26 +1662,55 @@ pub async fn run_reconcile_pass(
     // this pass's verdicts carry that number, and a verdict from the previous
     // observation stays current until this pass replaces it — not through the
     // argv query and the prescan.
-    //
-    // An observation the oracle did not take — it already holds one read
-    // LATER, by a pass that overlapped this one — is older evidence than what
-    // every reader now answers from. Nothing is judged or bound from it: its
-    // verdicts would overwrite newer ones and untag their epochs, its rule-2
-    // transitions would be counted again, and its binds would move rows on
-    // what the panes ran before.
-    let epoch = if snapshot_ok {
-        match store.observe_panes(observation) {
-            ObserveOutcome::Superseded => {
-                tracing::debug!(
-                    context,
-                    "session reconcile: a later pass's pane observation is already held — this pass judges and binds nothing"
-                );
-                return Vec::new();
-            }
-            outcome => outcome.epoch(),
+    judge_observation(
+        store,
+        &live,
+        snapshot,
+        &index,
+        &cmdline_ids,
+        &evidence,
+        snapshot_ok.then_some(observation),
+        context,
+    )
+}
+
+/// The judging half of [`run_reconcile_pass`]: hand `observation` to the
+/// store's oracle, then judge and bind from it ([`run_reconcile_at_epoch`]),
+/// all under the store's pass lock
+/// ([`SessionLifecycleStore::reconcile_pass_lock`]) — so a pass that overlaps
+/// another (the boot pass and a periodic tick) waits for it rather than
+/// interleaving verdicts from an older observation with the newer one's.
+/// `None`: the snapshot failed, so nothing is handed over and no pane has
+/// evidence.
+///
+/// An observation the oracle does not take — it already holds one read LATER,
+/// by a pass that overlapped this one ([`ObserveOutcome::Superseded`]) — is
+/// older evidence than what every reader now answers from. Nothing is judged
+/// or bound from it: its verdicts would overwrite newer ones and untag their
+/// epochs, its rule-2 transitions would be counted again, and its binds would
+/// move rows on what the panes ran before.
+#[allow(clippy::too_many_arguments)]
+fn judge_observation<I: TranscriptIndex>(
+    store: &SessionLifecycleStore,
+    live: &[LivePty],
+    snapshot: &ProcessSnapshot,
+    index: &I,
+    cmdline_ids: &HashMap<u32, String>,
+    evidence: &HashMap<String, PaneEvidence>,
+    observation: Option<PaneObservation>,
+    context: &str,
+) -> Vec<ReconcileAction> {
+    let pass = store.reconcile_pass_lock();
+    let epoch = match observation.map(|observation| store.observe_panes(observation)) {
+        Some(ObserveOutcome::Superseded) => {
+            tracing::debug!(
+                context,
+                "session reconcile: a later pass's pane observation is already held — this pass judges and binds nothing"
+            );
+            return Vec::new();
         }
-    } else {
-        None
+        Some(outcome) => outcome.epoch(),
+        None => None,
     };
 
     let before: HashMap<String, TerminalSessionRecord> = store
@@ -1711,15 +1718,9 @@ pub async fn run_reconcile_pass(
         .into_iter()
         .map(|r| (r.claude_session_id.clone(), r))
         .collect();
-    let actions = run_reconcile_at_epoch(
-        store,
-        &live,
-        snapshot,
-        &index,
-        &cmdline_ids,
-        &evidence,
-        epoch,
-    );
+    let actions =
+        run_reconcile_at_epoch(store, live, snapshot, index, cmdline_ids, evidence, epoch);
+    drop(pass);
 
     let bound = actions
         .iter()
@@ -1970,7 +1971,10 @@ pub fn session_bound_payloads(actions: &[ReconcileAction]) -> Vec<SessionBoundPa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::session_lifecycle_store::BindingState;
+    use crate::session::pane_binding::PaneEvidenceOracle;
+    use crate::session::session_lifecycle_store::{BindingState, ProcessIdentity, StartRule};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
 
     // ── Item 3b: the transcript walk must not run on a tokio worker ──────
@@ -2266,6 +2270,7 @@ mod tests {
             gate_bound_boot_ms: None,
             binding_state: None,
             placed_strongly: false,
+            start_process: None,
         }
     }
 
@@ -2747,6 +2752,7 @@ mod tests {
             gate_bound_boot_ms: None,
             binding_state: None,
             placed_strongly: false,
+            start_process: None,
         };
         store.record_open(phantom);
 
@@ -2944,6 +2950,7 @@ mod tests {
             gate_bound_boot_ms: None,
             binding_state: None,
             placed_strongly: false,
+            start_process: None,
         });
 
         let live = vec![pty_anchored("live-term", 4242, 1_000, "C:/repo")];
@@ -3047,6 +3054,7 @@ mod tests {
             gate_bound_boot_ms: None,
             binding_state: None,
             placed_strongly: false,
+            start_process: None,
         });
 
         let live = vec![pty_anchored("live-term", 4242, 1_000, "C:/repo")];
@@ -3857,19 +3865,22 @@ mod tests {
         assert_eq!((counters.mismatches(), counters.refused_moves()), (1, 0));
     }
 
-    /// What the SessionStart hook route does for `id` on `terminal`: an
-    /// authoritative record written UNCONFIRMED, then the confirmation and the
-    /// start stamp, separately (`install_effects_producer`). Its write never
-    /// retires a confirmed sibling.
+    /// What the SessionStart hook route does for `id` on `terminal`
+    /// (`install_effects_producer`): an authoritative record written
+    /// UNCONFIRMED that is also the session's start there
+    /// ([`StartRule::Always`]), then the confirmation. Its write never retires
+    /// a confirmed sibling.
     fn hook(store: &SessionLifecycleStore, id: &str, terminal: &str) {
         assert!(store
-            .record_open_checked(TerminalSessionRecord {
-                confirmed_at: None,
-                ..title_rec(id, terminal, Some("T"))
-            })
+            .record_open_checked_with(
+                TerminalSessionRecord {
+                    confirmed_at: None,
+                    ..title_rec(id, terminal, Some("T"))
+                },
+                StartRule::Always,
+            )
             .is_recorded());
         store.confirm_session(id);
-        store.note_session_start_hook(id);
     }
 
     /// Review M1, on a build whose records follow a switch: P ran `s` (hook),
@@ -4151,39 +4162,65 @@ mod tests {
         );
     }
 
-    /// Review F1, a start nothing can bind: P ran `x` (hook), then a `claude`
-    /// started in P with no hook and a record nothing can read, so no rung
-    /// binds it and no write stamps it; `x` was resumed in pane Q, whose
-    /// record names it. A `claude` on P that started before `x` last started
-    /// there — the one `x`'s hook came from — or within the launch skew after
-    /// it keeps the hold; one that started later is not `x`'s process, so `x`
-    /// holds nothing on P and Q takes it.
+    /// A store over a live pane registry — the oracle that knows each pane's
+    /// process — with binding counters of its own.
+    fn store_with_registry(
+        dir: &std::path::Path,
+    ) -> (SessionLifecycleStore, Arc<pane_binding::LivePaneRegistry>) {
+        let store = SessionLifecycleStore::open(dir.join("s.json")).unwrap();
+        let registry = Arc::new(pane_binding::LivePaneRegistry::new());
+        store.attach_pane_evidence(registry.clone());
+        store.attach_binding_counters(Arc::new(pane_binding::BindingCounters::default()));
+        (store, registry)
+    }
+
+    /// Hand the store's oracle an observation read NOW in which `terminal`'s
+    /// single top-level `claude` is `pid`, created at `started_ms`, with a
+    /// record nothing can read. Sleeps first: two `Instant`s taken back to back
+    /// can tie, and a start binds only to an observation read after it.
+    fn observe_pane_process(
+        store: &SessionLifecycleStore,
+        terminal: &str,
+        pid: u32,
+        started_ms: Option<i64>,
+    ) -> Option<u64> {
+        std::thread::sleep(Duration::from_millis(2));
+        store
+            .observe_panes(PaneObservation {
+                panes: [(
+                    terminal.to_string(),
+                    vec![LivePid {
+                        pid,
+                        process_started_ms: started_ms,
+                    }],
+                )]
+                .into_iter()
+                .collect(),
+                sessions: HashMap::new(),
+                read_at: None,
+            })
+            .epoch()
+    }
+
+    fn binds_session(actions: &[ReconcileAction], session: &str) -> bool {
+        actions
+            .iter()
+            .any(|a| matches!(a, ReconcileAction::Bind { session_id, .. } if session_id == session))
+    }
+
+    /// Review F1/F4, the process-identity rule: P ran `x` (hook). P's record
+    /// cannot be read, so nothing binds or stamps whatever P runs; `x` was
+    /// resumed in pane Q, whose record names it. The first observation read
+    /// after `x`'s start that shows P's single `claude` with its creation time
+    /// binds the start to that process (this test's own pid, created at `T`),
+    /// and `x` holds P while P runs it. The same pid created at another time
+    /// is another process: `x` holds nothing there and moves to Q.
     #[test]
-    fn a_strong_row_holds_nothing_on_a_pane_whose_claude_started_after_it() {
+    fn a_strong_row_holds_its_pane_until_the_pane_runs_another_process() {
         let dir = tempdir().unwrap();
-        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
-        store.attach_pane_evidence(std::sync::Arc::new(pane_binding::LivePaneRegistry::new()));
+        let (store, _registry) = store_with_registry(dir.path());
         hook(&store, "x", "term-a");
-        let x_started = store.get("x").unwrap().last_session_start_at.unwrap();
         let me = std::process::id();
-        let observe = |claude_started_ms: i64| {
-            store
-                .observe_panes(PaneObservation {
-                    panes: [(
-                        "term-a".to_string(),
-                        vec![LivePid {
-                            pid: me,
-                            process_started_ms: Some(claude_started_ms),
-                        }],
-                    )]
-                    .into_iter()
-                    .collect(),
-                    // P's record cannot be read: it names nothing.
-                    sessions: HashMap::new(),
-                    read_at: None,
-                })
-                .epoch()
-        };
         let panes = [("term-a", PaneEvidence::Unknown), ("term-b", names("x"))];
         let (live, _) = two_panes_one_workdir();
         let pass = |epoch| {
@@ -4197,38 +4234,286 @@ mod tests {
                 epoch,
             )
         };
-        let moves_x = |actions: &[ReconcileAction]| {
-            actions
-                .iter()
-                .any(|a| matches!(a, ReconcileAction::Bind { session_id, .. } if session_id == "x"))
-        };
+        const T: i64 = 1_700_000_000_000;
 
-        for (claude_started, why) in [
-            (x_started - 60_000, "the claude x's own hook came from"),
-            (
-                x_started + PANE_START_SKEW_MS - 1,
-                "a fork a beat after a launch path's own stamp",
-            ),
-        ] {
-            let actions = pass(observe(claude_started));
-            assert!(!moves_x(&actions), "{why}: {actions:?}");
-            assert_eq!(store.get("x").unwrap().terminal_id, "term-a", "{why}");
+        // P's creation time is unknown: no process to bind the start to, and
+        // an unbound start releases nothing.
+        let actions = pass(observe_pane_process(&store, "term-a", me, None));
+        assert!(!binds_session(&actions, "x"), "{actions:?}");
+        assert_eq!(store.get("x").unwrap().start_process, None);
+
+        for _ in 0..2 {
+            let actions = pass(observe_pane_process(&store, "term-a", me, Some(T)));
+            assert!(!binds_session(&actions, "x"), "{actions:?}");
+            let x = store.get("x").unwrap();
+            assert_eq!(
+                (x.terminal_id.as_str(), x.start_process),
+                (
+                    "term-a",
+                    Some(ProcessIdentity {
+                        pid: me,
+                        started_ms: T
+                    })
+                ),
+                "bound at the first observation, and held"
+            );
         }
 
-        let actions = pass(observe(x_started + 10_000));
+        let actions = pass(observe_pane_process(&store, "term-a", me, Some(T + 1_000)));
         assert!(
             actions.iter().any(|a| matches!(
                 a,
                 ReconcileAction::Bind { terminal_id, session_id, origin: BindOrigin::ProviderRegistry, .. }
                     if terminal_id == "term-b" && session_id == "x"
             )),
-            "{actions:?}"
+            "the same pid created a second later is another process: {actions:?}"
         );
         let x = store.get("x").unwrap();
         assert_eq!(
             (x.terminal_id.as_str(), x.binding_state),
             ("term-b", Some(BindingState::Matched))
         );
+    }
+
+    /// Review F1/F4: another pid is another process too — this test's parent,
+    /// alive for the whole run.
+    #[cfg(unix)]
+    #[test]
+    fn a_strong_row_holds_nothing_once_its_pane_runs_another_pid() {
+        let dir = tempdir().unwrap();
+        let (store, _registry) = store_with_registry(dir.path());
+        hook(&store, "x", "term-a");
+        let panes = [("term-a", PaneEvidence::Unknown), ("term-b", names("x"))];
+        let (live, _) = two_panes_one_workdir();
+        let pass = |epoch| {
+            run_reconcile_at_epoch(
+                &store,
+                &live,
+                &ProcessSnapshot::default(),
+                &no_transcripts(),
+                &no_cmdlines(),
+                &evidence(&panes),
+                epoch,
+            )
+        };
+        const T: i64 = 1_700_000_000_000;
+        let actions = pass(observe_pane_process(
+            &store,
+            "term-a",
+            std::process::id(),
+            Some(T),
+        ));
+        assert!(!binds_session(&actions, "x"), "{actions:?}");
+
+        let parent = std::os::unix::process::parent_id();
+        let actions = pass(observe_pane_process(&store, "term-a", parent, Some(T)));
+        assert!(binds_session(&actions, "x"), "{actions:?}");
+        assert_eq!(store.get("x").unwrap().terminal_id, "term-b");
+    }
+
+    /// Review F1: the spawn stamps a pinned session's start once the pane's
+    /// child exists — and the `claude` can fork long after that (a spawn seam
+    /// that waits on its probes, an account launcher that records before its
+    /// command runs). The start binds to whatever single `claude` the first
+    /// observation read after it shows, however late that one started: `s`
+    /// holds B against A's stale record, pass after pass, and is `matched` once
+    /// B's own record names it.
+    #[test]
+    fn a_pinned_spawn_whose_claude_forks_late_holds_its_pane() {
+        let dir = tempdir().unwrap();
+        let (store, _registry) = store_with_registry(dir.path());
+        // A ran `s`; A's record still names it.
+        hook(&store, "s", "term-a");
+        // The seam records `s` on B before B's child exists — no start — and
+        // the spawn stamps the start once the child, the `claude`, exists.
+        assert!(crate::commands::terminal::record_pinned_session_open(
+            &store,
+            "s".to_string(),
+            "term-b".to_string(),
+            None,
+            "C:/repo".to_string(),
+            "T".to_string(),
+            "default".to_string(),
+            0,
+            DEFAULT_PROVIDER.to_string(),
+            None,
+            StartRule::Never,
+        )
+        .is_recorded());
+        store.note_session_start("s");
+        let stamped = store.get("s").unwrap().last_session_start_at.unwrap();
+        let me = std::process::id();
+        // B's `claude` forked 5.6 s after the stamp; its record is not written.
+        let forked = stamped + 5_600;
+        let (live, _) = two_panes_one_workdir();
+        // No transcripts: no correlation rung competes with the registry rung.
+        let pass = |panes: &[(&str, PaneEvidence)], epoch| {
+            run_reconcile_at_epoch(
+                &store,
+                &live,
+                &ProcessSnapshot::default(),
+                &no_transcripts(),
+                &no_cmdlines(),
+                &evidence(panes),
+                epoch,
+            )
+        };
+        let stale = [("term-a", names("s")), ("term-b", PaneEvidence::Unknown)];
+
+        for _ in 0..2 {
+            let actions = pass(
+                &stale,
+                observe_pane_process(&store, "term-b", me, Some(forked)),
+            );
+            assert!(!binds_session(&actions, "s"), "{actions:?}");
+            let s = store.get("s").unwrap();
+            assert_eq!(
+                (s.terminal_id.as_str(), s.start_process),
+                (
+                    "term-b",
+                    Some(ProcessIdentity {
+                        pid: me,
+                        started_ms: forked
+                    })
+                ),
+                "{actions:?}"
+            );
+        }
+
+        let named = [("term-a", PaneEvidence::NoClaude), ("term-b", names("s"))];
+        let actions = pass(
+            &named,
+            observe_pane_process(&store, "term-b", me, Some(forked)),
+        );
+        let s = store.get("s").unwrap();
+        assert_eq!(
+            (s.terminal_id.as_str(), s.binding_state),
+            ("term-b", Some(BindingState::Matched)),
+            "{actions:?}"
+        );
+    }
+
+    /// The pane a superseded-or-not pass judges: `term-a`, whose own `claude`
+    /// (this test's pid) names `s-a`, beside a stale confirmed row `s-x` an
+    /// earlier binder left there.
+    fn a_pane_naming_s_a(read_at: Instant) -> PaneObservation {
+        let me = std::process::id();
+        PaneObservation {
+            panes: [(
+                "term-a".to_string(),
+                vec![LivePid {
+                    pid: me,
+                    process_started_ms: None,
+                }],
+            )]
+            .into_iter()
+            .collect(),
+            sessions: [(me, "s-a".to_string())].into_iter().collect(),
+            read_at: Some(read_at),
+        }
+    }
+
+    /// Review F3 (round 8) and N8: an observation read BEFORE the one the
+    /// oracle holds ends its pass — no verdict stored, no transition counted,
+    /// no row bound or retired — and the later observation still answers. The
+    /// same pass with nothing newer held binds `s-a` and retires `s-x`. Both
+    /// reads are in the past: the held one is simply read later.
+    #[test]
+    fn a_pass_whose_observation_is_superseded_judges_and_binds_nothing() {
+        let read_first = Instant::now();
+        std::thread::sleep(Duration::from_millis(2));
+        let live = vec![pty_anchored("term-a", 100, 1_000, "C:/repo")];
+        let judge = |store: &SessionLifecycleStore| {
+            let observation = a_pane_naming_s_a(read_first);
+            let evidence = observation.evidence_map();
+            judge_observation(
+                store,
+                &live,
+                &ProcessSnapshot::default(),
+                &transcripts(&["s-a"], 1_500),
+                &no_cmdlines(),
+                &evidence,
+                Some(observation),
+                "test",
+            )
+        };
+        let with_stale_row = |file: &str| {
+            let dir = tempdir().unwrap();
+            let store = SessionLifecycleStore::open(dir.path().join(file)).unwrap();
+            let registry = Arc::new(pane_binding::LivePaneRegistry::new());
+            store.attach_pane_evidence(registry.clone());
+            let counters = Arc::new(pane_binding::BindingCounters::default());
+            store.attach_binding_counters(counters.clone());
+            store.record_open(title_rec("s-x", "term-a", Some("T")));
+            (dir, store, registry, counters)
+        };
+
+        let (_dir, store, registry, counters) = with_stale_row("superseded.json");
+        let held = registry.observe(a_pane_naming_s_a(Instant::now())).epoch();
+        assert!(held.is_some());
+        let actions = judge(&store);
+        assert!(actions.is_empty(), "{actions:?}");
+        assert!(store.get("s-a").is_none(), "nothing bound");
+        let stale = store.get("s-x").unwrap();
+        assert_eq!(
+            (stale.state.as_str(), stale.binding_state),
+            ("open", None),
+            "nothing judged, nothing retired"
+        );
+        assert!(store.current_binding_verdicts().is_empty());
+        assert_eq!(counters.mismatches(), 0);
+        assert_eq!(
+            registry.current_epoch(),
+            held,
+            "the later read still answers"
+        );
+
+        let (_dir, store, _registry, _counters) = with_stale_row("fresh.json");
+        let actions = judge(&store);
+        assert!(binds_session(&actions, "s-a"), "{actions:?}");
+        assert_eq!(store.get("s-x").unwrap().state, "closed", "{actions:?}");
+    }
+
+    /// Review F5: a pass hands its observation over and judges only while it
+    /// holds the store's pass lock, so a pass overlapping another waits for it
+    /// rather than interleaving verdicts from an older observation with the
+    /// newer one's.
+    #[test]
+    fn a_pass_waits_for_the_store_pass_lock_before_it_observes_or_judges() {
+        let dir = tempdir().unwrap();
+        let (store, registry) = store_with_registry(dir.path());
+        let live = vec![pty_anchored("term-a", 100, 1_000, "C:/repo")];
+        let index = transcripts(&["s-a"], 1_500);
+        let other_pass = store.reconcile_pass_lock();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let observation = a_pane_naming_s_a(Instant::now());
+                let evidence = observation.evidence_map();
+                let actions = judge_observation(
+                    &store,
+                    &live,
+                    &ProcessSnapshot::default(),
+                    &index,
+                    &no_cmdlines(),
+                    &evidence,
+                    Some(observation),
+                    "test",
+                );
+                done.send(actions).unwrap();
+            });
+            assert!(
+                finished.recv_timeout(Duration::from_millis(300)).is_err(),
+                "the pass waits while another holds the lock"
+            );
+            assert_eq!(registry.current_epoch(), None, "nothing handed over yet");
+            assert!(store.get("s-a").is_none(), "nothing bound yet");
+            drop(other_pass);
+            let actions = finished
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the pass runs once the lock is free");
+            assert!(binds_session(&actions, "s-a"), "{actions:?}");
+        });
     }
 
     /// Round-3 review L1: a confirmed row on a DEAD terminal does not stop the

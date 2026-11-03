@@ -34,8 +34,8 @@ use tauri::{AppHandle, Emitter, Manager};
 use tracing::{debug, info, warn};
 
 use crate::session::session_lifecycle_store::{
-    RecordOpenOutcome, SessionLifecycleStore, TerminalSessionRecord, ORIGIN_AUTHORITATIVE,
-    ORIGIN_RECONCILED,
+    RecordOpenOutcome, SessionLifecycleStore, StartRule, TerminalSessionRecord,
+    ORIGIN_AUTHORITATIVE, ORIGIN_RECONCILED,
 };
 use crate::terminal::graceful_exit::ClaudeProbe;
 
@@ -227,7 +227,7 @@ pub(crate) fn typed_line_target(
 ///
 /// | target | record | coord | bypass event |
 /// |---|---|---|---|
-/// | `Shell` | authoritative | registered (when recorded) | when the line says so |
+/// | `Shell` | authoritative, and a start ([`StartRule::Always`]) | registered (when recorded) | when the line says so |
 /// | `Unknown` | provisional ([`SessionLifecycleStore::record_open_provisional`]) | no | when the line says so |
 /// | `Claude` | none | no | no — nothing was launched |
 ///
@@ -238,6 +238,11 @@ pub(crate) fn typed_line_target(
 /// (`Unknown`) may have launched something, so it is recorded — but
 /// provisionally: unconfirmed, never re-opening a closed row, and graded
 /// `reconciled` only on a row it creates, never over an existing row's origin.
+///
+/// A line the shell read STARTED the session in this pane, even when the row
+/// already sat here (a restore's weak rebind, then the resume it types): the
+/// write stamps the start, which outranks every earlier start on the pane and
+/// is bound to the process that runs it at the next observation.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_typed_resume_effects(
     store: Option<&SessionLifecycleStore>,
@@ -320,9 +325,10 @@ pub(crate) fn apply_typed_resume_effects(
                 gate_bound_boot_ms: None,
                 binding_state: None,
                 placed_strongly: false,
+                start_process: None,
             };
             let outcome = if launched {
-                Some(store.record_open_checked(rec))
+                Some(store.record_open_checked_with(rec, StartRule::Always))
             } else {
                 store.record_open_provisional(rec)
             };
@@ -600,6 +606,66 @@ mod tests {
             "coord registration effect must fire when the store recorded"
         );
         assert!(bypass_emitted.get(), "bypass event effect must fire");
+    }
+
+    /// Review F2: a line the pane's shell read STARTS the session there even
+    /// when its row already sits on the pane — a restore's weak rebind, then
+    /// the resume it types — so it outranks a sibling that started earlier. A
+    /// line nothing could place records provisionally and starts nothing.
+    #[test]
+    fn a_shell_read_resume_over_its_own_row_is_a_start_and_an_unplaced_one_is_not() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        // Each written, then confirmed, as the hook route does: a confirmed
+        // row is no phantom for a later authoritative write to retire, so both
+        // stay open on the pane.
+        let place = |id: &str| {
+            store.record_open(TerminalSessionRecord {
+                origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
+                terminal_id: "term-1".to_string(),
+                ..crate::session::session_lifecycle_store::test_open_record(id)
+            });
+            store.confirm_session(id);
+        };
+        place(UUID);
+        place("sibling");
+        let latest = || store.latest_started_on_terminal("term-1");
+        assert_eq!(latest().as_deref(), Some("sibling"), "precondition");
+        let parsed = parse(&format!("claude --resume {UUID}")).unwrap();
+        let typed = |target| {
+            apply_typed_resume_effects(
+                Some(&store),
+                &parsed,
+                target,
+                "term-1",
+                "C:/repo",
+                "default",
+                "Terminal 1",
+                || {},
+                || {},
+            )
+        };
+
+        typed(TypedLineTarget::Unknown);
+        assert_eq!(
+            latest().as_deref(),
+            Some("sibling"),
+            "a provisional line starts nothing"
+        );
+        typed(TypedLineTarget::Shell);
+        assert_eq!(
+            latest().as_deref(),
+            Some(UUID),
+            "the shell read it: a start in place"
+        );
+        for id in [UUID, "sibling"] {
+            let row = store.get(id).unwrap();
+            assert_eq!(
+                (row.state.as_str(), row.terminal_id.as_str()),
+                ("open", "term-1"),
+                "{id}: both rows stay open on the pane"
+            );
+        }
     }
 
     #[test]

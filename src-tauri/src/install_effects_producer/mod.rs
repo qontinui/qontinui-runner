@@ -1290,6 +1290,12 @@ fn record_session_open_into(
         zone_index,
         provider.to_string(),
         None,
+        // This id's process is now the one running in the terminal: the write
+        // stamps its START under the lock that places the row — the order
+        // `latest_open_on_terminal` ranks by, and a pending binding of the
+        // start to that process. `terminal_latest` was read before it, and
+        // excludes this id anyway.
+        crate::session::session_lifecycle_store::StartRule::Always,
     );
     if !outcome.is_recorded() {
         return outcome;
@@ -1303,10 +1309,6 @@ fn record_session_open_into(
     // a provider therefore never gets a hook and stays provisional, so Phase 4's
     // restore classifier won't try to `--resume` a phantom shell "session".
     store.confirm_session(&req.session_id);
-    // This id's process is now the one running in the terminal — the order
-    // `latest_open_on_terminal` ranks by. Stamped AFTER `terminal_latest` was
-    // read (which excludes this id anyway).
-    store.note_session_start_hook(&req.session_id);
 
     // ADOPTION marker. `source: "clear"` is the provider reporting that
     // `/clear` minted a NEW harness id inside the process already running on
@@ -2511,6 +2513,7 @@ mod tests {
             gate_bound_boot_ms: None,
             binding_state: None,
             placed_strongly: false,
+            start_process: None,
         }
     }
 
@@ -3037,6 +3040,7 @@ mod tests {
             gate_bound_boot_ms: None,
             binding_state: None,
             placed_strongly: false,
+            start_process: None,
         });
 
         // The confirming hook fires with bash-flavored context.
@@ -3247,6 +3251,7 @@ mod tests {
                     gate_bound_boot_ms: None,
                     binding_state: None,
                     placed_strongly: false,
+                    start_process: None,
                 });
             };
             let hook = |id: &str, source: &str| {
@@ -3350,6 +3355,7 @@ mod tests {
             gate_bound_boot_ms: None,
             binding_state: None,
             placed_strongly: false,
+            start_process: None,
         });
 
         // The provider reports a DIFFERENT id about itself, from bash.
@@ -3444,6 +3450,7 @@ mod tests {
             gate_bound_boot_ms: None,
             binding_state: None,
             placed_strongly: false,
+            start_process: None,
         });
 
         let req = SessionOpenRequest {

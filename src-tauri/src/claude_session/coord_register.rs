@@ -3834,6 +3834,7 @@ mod tests {
                 gate_bound_boot_ms: None,
                 binding_state: None,
                 placed_strongly: false,
+                start_process: None,
             },
         );
         let finished_at = store
@@ -3943,6 +3944,7 @@ mod tests {
                 gate_bound_boot_ms: None,
                 binding_state: None,
                 placed_strongly: false,
+                start_process: None,
             },
         );
         let coord_id = reg

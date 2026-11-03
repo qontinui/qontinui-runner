@@ -1093,6 +1093,7 @@ mod tests {
             gate_bound_boot_ms: None,
             binding_state: None,
             placed_strongly: false,
+            start_process: None,
         };
         let s = SnapshotSession::from(&rec);
         assert_eq!(s.claude_session_id, "sess-1");
@@ -1168,6 +1169,7 @@ mod tests {
             gate_bound_boot_ms: None,
             binding_state: None,
             placed_strongly: false,
+            start_process: None,
         }
     }
 
