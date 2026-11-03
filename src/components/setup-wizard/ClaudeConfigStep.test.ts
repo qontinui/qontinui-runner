@@ -1,16 +1,13 @@
 /**
- * The first-run wizard must never empty the Claude account roster.
- *
- * `save_claude_config_dirs` replaces the machine-global roster with exactly the
- * list it is given, so the step's save decision is the guard: an empty
- * selection saves nothing. The component needs jsdom to render, which this
- * repo's vitest setup (`environment: "node"`) does not have, so the decision is
- * exported and tested directly (the TierStep pattern).
+ * The setup wizard's Claude step only ever ADDS accounts: `claudeDirsToAdd`
+ * picks the checked dirs that are not already configured. The rendered step
+ * (Finish, Add Directory, configured rows) is covered by
+ * `ClaudeConfigStep.render.test.tsx`.
  */
 
 import { describe, expect, it } from "vitest";
 
-import { claudeDirsToSave, type DiscoveredDir } from "./ClaudeConfigStep";
+import { CONFIGURED_SOURCE, claudeDirsToAdd, type DiscoveredDir } from "./ClaudeConfigStep";
 
 const dir = (path: string, source = "auto-detected"): DiscoveredDir => ({
   path,
@@ -18,32 +15,33 @@ const dir = (path: string, source = "auto-detected"): DiscoveredDir => ({
   source,
 });
 
-describe("claudeDirsToSave", () => {
-  it("saves nothing when discovery found nothing (the Linux wipe)", () => {
-    expect(claudeDirsToSave([], new Set())).toBeNull();
+describe("claudeDirsToAdd", () => {
+  it("adds nothing when discovery found nothing", () => {
+    expect(claudeDirsToAdd([], new Set())).toEqual([]);
   });
 
-  it("saves nothing when every found dir was unchecked", () => {
-    const dirs = [dir("/home/u/.claude-a", "configured"), dir("/home/u/.claude-b")];
-    expect(claudeDirsToSave(dirs, new Set())).toBeNull();
+  it("never re-adds a configured dir, checked or not", () => {
+    const dirs = [dir("/home/u/.claude-a", CONFIGURED_SOURCE), dir("/home/u/.claude-b")];
+    expect(claudeDirsToAdd(dirs, new Set(["/home/u/.claude-a"]))).toEqual([]);
+    expect(claudeDirsToAdd(dirs, new Set())).toEqual([]);
   });
 
-  it("saves the checked dirs in discovery order", () => {
+  it("adds the checked new dirs in discovery order", () => {
     const dirs = [
-      dir("/home/u/.claude-a", "configured"),
+      dir("/home/u/.claude-a", CONFIGURED_SOURCE),
       dir("/home/u/.claude-b"),
       dir("/home/u/.claude-c"),
+      dir("/picked", "manual"),
     ];
-    expect(claudeDirsToSave(dirs, new Set(["/home/u/.claude-c", "/home/u/.claude-a"]))).toEqual([
-      "/home/u/.claude-a",
-      "/home/u/.claude-c",
-    ]);
+    expect(
+      claudeDirsToAdd(dirs, new Set(["/picked", "/home/u/.claude-c", "/home/u/.claude-a"])),
+    ).toEqual(["/home/u/.claude-c", "/picked"]);
   });
 
   it("ignores a checked path that is no longer listed (a removed manual dir)", () => {
-    const dirs = [dir("/home/u/.claude-a")];
-    expect(claudeDirsToSave(dirs, new Set(["/home/u/.claude-a", "/gone"]))).toEqual([
-      "/home/u/.claude-a",
+    const dirs = [dir("/home/u/.claude-b")];
+    expect(claudeDirsToAdd(dirs, new Set(["/home/u/.claude-b", "/gone"]))).toEqual([
+      "/home/u/.claude-b",
     ]);
   });
 });

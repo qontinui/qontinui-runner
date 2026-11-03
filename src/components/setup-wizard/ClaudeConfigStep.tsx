@@ -9,22 +9,23 @@ export interface DiscoveredDir {
   source: string;
 }
 
+/** The source discovery gives a dir that is already in the roster. */
+export const CONFIGURED_SOURCE = "configured";
+
 /**
- * The roster this step should save, or `null` to leave the configured roster
- * untouched.
+ * The dirs this step should ADD to the roster: the checked ones that are not
+ * already configured.
  *
- * `save_claude_config_dirs` REPLACES the machine-global roster
- * (`claude-accounts.json`) with exactly the list it is given. So an empty
- * selection must not be saved: on 2026-11-03 this step found nothing on a Linux
- * box (discovery only looked in Windows locations), saved `[]`, and emptied a
- * 17-account roster, after which every new session fell back to the ambient
- * `~/.claude`. Discovery now returns the configured roster too, so a non-empty
- * selection already contains it. Removing every account is a deliberate act
- * for the Settings page, not a side effect of finishing the first-run wizard.
+ * Finishing the wizard only ever adds accounts (`add_claude_config_dirs_from_setup`,
+ * which never removes one and skips dirs already present). Removing an account
+ * is done in Settings. Before qontinui-runner#2544 this step saved its checked
+ * list through the replace-style `save_claude_config_dirs`, and an empty
+ * selection emptied the roster (coord finding `bc9fdc87`).
  */
-export function claudeDirsToSave(dirs: DiscoveredDir[], checked: Set<string>): string[] | null {
-  const selected = dirs.filter((d) => checked.has(d.path)).map((d) => d.path);
-  return selected.length > 0 ? selected : null;
+export function claudeDirsToAdd(dirs: DiscoveredDir[], checked: Set<string>): string[] {
+  return dirs
+    .filter((d) => d.source !== CONFIGURED_SOURCE && checked.has(d.path))
+    .map((d) => d.path);
 }
 
 interface ClaudeConfigStepProps {
@@ -37,16 +38,22 @@ export function ClaudeConfigStep({ onComplete, onBack }: ClaudeConfigStepProps) 
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  // Discovery refuses (e.g. an unreadable claude-accounts.json); then Finish
+  // adds nothing, because what is configured could not be read.
+  const [discoveryError, setDiscoveryError] = useState<string | null>(null);
 
   const discoverDirs = async () => {
     setLoading(true);
     try {
       const found = await invoke<DiscoveredDir[]>("discover_claude_config_dirs");
       setDirs(found);
-      // Pre-check all discovered dirs
+      setDiscoveryError(null);
+      // Pre-check all discovered dirs (configured ones stay checked: they are
+      // shown, not offered).
       setChecked(new Set(found.map((d) => d.path)));
     } catch (err) {
       console.error("Failed to discover Claude config dirs:", err);
+      setDiscoveryError(String(err));
     } finally {
       setLoading(false);
     }
@@ -62,17 +69,21 @@ export function ClaudeConfigStep({ onComplete, onBack }: ClaudeConfigStepProps) 
     };
   }, []);
 
-  const toggleDir = useCallback((path: string) => {
-    setChecked((prev) => {
-      const next = new Set(prev);
-      if (next.has(path)) {
-        next.delete(path);
-      } else {
-        next.add(path);
-      }
-      return next;
-    });
-  }, []);
+  const toggleDir = useCallback(
+    (path: string) => {
+      if (dirs.some((d) => d.path === path && d.source === CONFIGURED_SOURCE)) return;
+      setChecked((prev) => {
+        const next = new Set(prev);
+        if (next.has(path)) {
+          next.delete(path);
+        } else {
+          next.add(path);
+        }
+        return next;
+      });
+    },
+    [dirs],
+  );
 
   const removeDir = useCallback((path: string) => {
     setDirs((prev) => prev.filter((d) => d.path !== path));
@@ -100,18 +111,17 @@ export function ClaudeConfigStep({ onComplete, onBack }: ClaudeConfigStepProps) 
   const handleFinish = useCallback(async () => {
     setSaving(true);
     try {
-      const selectedDirs = claudeDirsToSave(dirs, checked);
-      // null = nothing selected: keep the configured roster (see claudeDirsToSave).
-      if (selectedDirs !== null) {
-        await invoke("save_claude_config_dirs", { dirs: selectedDirs });
+      const toAdd = discoveryError === null ? claudeDirsToAdd(dirs, checked) : [];
+      if (toAdd.length > 0) {
+        await invoke("add_claude_config_dirs_from_setup", { dirs: toAdd });
       }
     } catch (err) {
-      console.error("Failed to save Claude config dirs:", err);
+      console.error("Failed to add Claude config dirs:", err);
     } finally {
       setSaving(false);
       onComplete();
     }
-  }, [dirs, checked, onComplete]);
+  }, [dirs, checked, discoveryError, onComplete]);
 
   const handleSkip = useCallback(() => {
     onComplete();
@@ -122,8 +132,8 @@ export function ClaudeConfigStep({ onComplete, onBack }: ClaudeConfigStepProps) 
       <div className="text-center">
         <h2 className="text-h2 mb-2">Claude Code Sessions</h2>
         <p className="text-body text-muted-foreground">
-          Select Claude Code config directories to browse session transcripts. These are
-          auto-detected from your system.
+          Select Claude Code config directories to add. Accounts that are already configured are
+          listed and kept; remove an account in Settings.
         </p>
       </div>
 
@@ -132,6 +142,13 @@ export function ClaudeConfigStep({ onComplete, onBack }: ClaudeConfigStepProps) 
           <div className="flex items-center justify-center gap-2 py-8 text-muted-foreground">
             <Loader2 className="w-5 h-5 animate-spin" />
             <span className="text-sm">Scanning for Claude Code installations...</span>
+          </div>
+        ) : discoveryError !== null ? (
+          <div className="text-center py-8" data-testid="claude-config-discovery-error">
+            <p className="text-sm text-red-400">
+              Could not read the configured Claude accounts, so none will be changed here:{" "}
+              {discoveryError}
+            </p>
           </div>
         ) : dirs.length === 0 ? (
           <div className="text-center py-8">
@@ -149,13 +166,20 @@ export function ClaudeConfigStep({ onComplete, onBack }: ClaudeConfigStepProps) 
             >
               <input
                 type="checkbox"
-                checked={checked.has(dir.path)}
+                checked={dir.source === CONFIGURED_SOURCE || checked.has(dir.path)}
+                disabled={dir.source === CONFIGURED_SOURCE}
                 onChange={() => toggleDir(dir.path)}
                 className="w-4 h-4 rounded border-zinc-600 accent-primary"
+                data-testid="claude-config-dir-checkbox"
               />
               <div className="flex-1 min-w-0">
                 <div className="text-sm font-medium truncate">{dir.label}</div>
                 <div className="text-xs text-muted-foreground truncate">{dir.path}</div>
+                {dir.source === CONFIGURED_SOURCE && (
+                  <div className="text-xs text-muted-foreground">
+                    Already configured. Remove it in Settings.
+                  </div>
+                )}
               </div>
               <span className="text-xs text-zinc-500 shrink-0">{dir.source}</span>
               {dir.source === "manual" && (
@@ -176,6 +200,7 @@ export function ClaudeConfigStep({ onComplete, onBack }: ClaudeConfigStepProps) 
         <button
           className="btn-secondary w-full flex items-center justify-center gap-2"
           onClick={handleAddDirectory}
+          data-testid="claude-config-add-directory"
         >
           <Plus className="w-4 h-4" />
           Add Directory
@@ -194,6 +219,7 @@ export function ClaudeConfigStep({ onComplete, onBack }: ClaudeConfigStepProps) 
           <button
             className="btn-primary flex items-center gap-2"
             onClick={handleFinish}
+            data-testid="claude-config-finish"
             disabled={saving}
           >
             {saving && <Loader2 className="w-4 h-4 animate-spin" />}
