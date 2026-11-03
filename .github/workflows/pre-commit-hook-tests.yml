@@ -1,0 +1,120 @@
+name: pre-commit hook tests
+
+# Runs the toolchain-free test suites for the repo's own git hooks
+# (`.pre-commit-hooks/*-test.sh`) on Linux.
+#
+# WHY THIS EXISTS: those suites were registered only as local `pre-commit`
+# hooks, so they ran on the author's box or not at all. On Windows several fail
+# for reasons that have nothing to do with the change (NTFS cannot hold some
+# fixture filenames), so authors there commit with
+# `SKIP=push-range-test,…` — and qontinui-runner#2435 did exactly that, on
+# the stated assumption that "CI runs them on Linux". Nothing did. This job
+# makes that assumption true: a hook change is now tested on a filesystem
+# where every fixture works, whatever box it was authored on.
+#
+# WHAT IT DOES NOT COVER:
+#   * shared-target-test's real-library arm needs qontinui-claude-config
+#     (a PRIVATE repo) beside the checkout; this public repo's CI does not
+#     check it out, so that arm SKIPS here and prints why. The stub-library
+#     arms in push-range-test still pin the hook-side wiring.
+#   * ts-codegen-deps-test's npm rung (opt-in via
+#     QONTINUI_TS_CODEGEN_DEPS_TEST_NPM=1) is not exercised: it needs a
+#     registry and is a local-environment probe, not hook logic.
+#   * Windows. The suites are not NTFS-clean today; making them so is a
+#     separate change, and a red Windows leg here would only be that.
+#
+# NOT a required status context: it is path-filtered, and a path-filtered
+# trigger creates no check-run on a non-matching PR, so a required context
+# would wedge every unrelated PR. Red CI is the merge-stopper.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".pre-commit-hooks/**"
+      - ".pre-commit-config.yaml"
+      - "src-tauri/scripts/generate_types.sh"
+      - "src-tauri/build.rs"
+      - "src-tauri/Cargo.toml"
+      - "Cargo.toml"
+      - ".github/workflows/pre-commit-hook-tests.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".pre-commit-hooks/**"
+      - ".pre-commit-config.yaml"
+      - "src-tauri/scripts/generate_types.sh"
+      - "src-tauri/build.rs"
+      - "src-tauri/Cargo.toml"
+      - "Cargo.toml"
+      - ".github/workflows/pre-commit-hook-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# PR-scoped supersession; same single-expression group as the other
+# path-filtered selftests (see oom-signature-tests.yml for the reasoning).
+concurrency:
+  group: ${{ (github.event_name == 'pull_request' && github.run_attempt == 1) && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}-{2}', github.workflow, github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
+
+jobs:
+  hook-tests:
+    name: pre-commit hook tests (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # The suites never touch a terminal; this also keeps guard_shared_target's
+      # /dev/tty notice off a runner that has none.
+      QONTINUI_PREPUSH_NO_TTY: "1"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Several suites build throwaway repos and worktrees from this one.
+          fetch-depth: 0
+
+      - name: Git identity for fixture commits
+        run: |
+          git config --global user.name "hook-tests"
+          git config --global user.email "hook-tests@users.noreply.github.com"
+
+      # One step per suite so a red names its suite, and every suite runs even
+      # when an earlier one fails (`if: !cancelled()`).
+      - name: crate-inputs-test
+        if: ${{ !cancelled() }}
+        run: bash .pre-commit-hooks/crate-inputs-test.sh
+      - name: gen-events-drift-attribution-test
+        if: ${{ !cancelled() }}
+        run: bash .pre-commit-hooks/gen-events-drift-attribution-test.sh
+      - name: gen-events-drift-root-test
+        if: ${{ !cancelled() }}
+        run: bash .pre-commit-hooks/gen-events-drift-root-test.sh
+      - name: push-range-test
+        if: ${{ !cancelled() }}
+        run: bash .pre-commit-hooks/push-range-test.sh
+      - name: scratch-cleanup-test
+        if: ${{ !cancelled() }}
+        run: bash .pre-commit-hooks/scratch-cleanup-test.sh
+      - name: shared-target-test
+        if: ${{ !cancelled() }}
+        run: bash .pre-commit-hooks/shared-target-test.sh
+      - name: ts-codegen-deps-test
+        if: ${{ !cancelled() }}
+        run: bash .pre-commit-hooks/ts-codegen-deps-test.sh
+
+      # A new `*-test.sh` added without a step above would silently never run
+      # here — the gap this file closes. Fail on any suite not listed.
+      - name: Every hook test suite has a step
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for t in .pre-commit-hooks/*-test.sh; do
+            n="$(basename "$t")"
+            if ! grep -qF "run: bash .pre-commit-hooks/$n" .github/workflows/pre-commit-hook-tests.yml; then
+              echo "::error file=$t::$n has no step in pre-commit-hook-tests.yml, so CI never runs it"
+              missing=1
+            fi
+          done
+          exit "$missing"
