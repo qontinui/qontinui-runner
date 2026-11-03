@@ -83,6 +83,13 @@ pub struct RecentCrash {
     /// panics (fatal — cross WebView2 FFI) from tokio-rt-worker panics
     /// (usually recoverable but still crash-dumped).
     pub thread: Option<String>,
+    /// Pid of the process that crashed, read from the dump's `Pid:` header
+    /// (written by `logging::write_crash_dump` from `std::process::id()` in
+    /// the dying process). Serialised as `pid`. `None` — emitted as JSON
+    /// `null` — for a dump written before that header existed or whose
+    /// header is unparseable: the reader is never handed a guessed pid
+    /// (in particular never the CURRENT process's, which is a survivor).
+    pub pid: Option<u32>,
 }
 
 /// Shared in-memory holder for the most recent crash summary.
@@ -238,13 +245,33 @@ fn parse_crash_dump(path: &Path, mtime: SystemTime) -> Option<RecentCrash> {
             .to_string()
     });
 
+    let pid = extract_pid(&content);
+
     Some(RecentCrash {
         file_path: path.to_string_lossy().into_owned(),
         reported_at,
         panic_location,
         panic_message,
         thread,
+        pid,
     })
+}
+
+/// Read the crashing process's pid from the dump's header block (the lines
+/// before the first `=== ... ===` section after the title). Only the header
+/// is searched, so a `Pid:` string inside a panic message or backtrace can
+/// never be mistaken for it. Absent or unparseable -> `None`.
+pub(crate) fn extract_pid(content: &str) -> Option<u32> {
+    content
+        .lines()
+        .skip(1) // the `=== QONTINUI RUNNER CRASH DUMP ===` title
+        .take_while(|line| !line.trim_start().starts_with("==="))
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix(crate::logging::CRASH_DUMP_PID_PREFIX)
+                .map(|rest| rest.trim().parse::<u32>().ok())
+        })
+        .flatten()
 }
 
 /// Return the first non-empty trimmed line following a section header.
@@ -353,6 +380,79 @@ mod tests {
         assert_eq!(crash.panic_location, None);
         assert_eq!(crash.panic_message, None);
         assert_eq!(crash.thread, None);
+        assert_eq!(crash.pid, None);
+    }
+
+    /// A legacy dump (written before the `Pid:` header existed) reports no
+    /// pid — never a guessed one such as the current process's.
+    #[test]
+    fn parse_legacy_dump_has_no_pid() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_dump(tmp.path(), "crash_legacy.txt", SAMPLE_DUMP);
+        let crash = parse_crash_dump(&path, SystemTime::now()).expect("parse");
+        assert_eq!(crash.pid, None);
+    }
+
+    #[test]
+    fn parse_reads_pid_header() {
+        let tmp = TempDir::new().unwrap();
+        let with_pid = SAMPLE_DUMP.replacen("Version: 1.0.0\n", "Version: 1.0.0\nPid: 48213\n", 1);
+        assert_ne!(with_pid, SAMPLE_DUMP, "fixture must gain the Pid header");
+        let path = write_dump(tmp.path(), "crash_pid.txt", &with_pid);
+        let crash = parse_crash_dump(&path, SystemTime::now()).expect("parse");
+        assert_eq!(crash.pid, Some(48213));
+    }
+
+    #[test]
+    fn extract_pid_ignores_body_sections_and_garbage() {
+        // A `Pid:` line inside the panic message is not the header.
+        let in_body =
+            "=== QONTINUI RUNNER CRASH DUMP ===\nVersion: 1\n\n=== PANIC MESSAGE ===\nPid: 7\n";
+        assert_eq!(extract_pid(in_body), None);
+        let garbage = "=== QONTINUI RUNNER CRASH DUMP ===\nPid: not-a-number\n";
+        assert_eq!(extract_pid(garbage), None);
+    }
+
+    /// End to end: a dump produced by the real writer's formatter carries
+    /// the writer's pid through the parser.
+    #[test]
+    fn dump_written_by_logging_formatter_round_trips_pid() {
+        let tmp = TempDir::new().unwrap();
+        let body = crate::logging::format_crash_dump("a.rs:1:1", "boom", "<bt>", 31337);
+        let path = write_dump(tmp.path(), "crash_rt.txt", &body);
+        let crash = parse_crash_dump(&path, SystemTime::now()).expect("parse");
+        assert_eq!(crash.pid, Some(31337));
+        assert_eq!(crash.panic_message.as_deref(), Some("boom"));
+    }
+
+    fn crash_with_pid(pid: Option<u32>) -> RecentCrash {
+        RecentCrash {
+            file_path: "/tmp/crash_x.txt".to_string(),
+            reported_at: Utc::now(),
+            panic_location: None,
+            panic_message: None,
+            thread: None,
+            pid,
+        }
+    }
+
+    /// The `/health.recent_crash` JSON (built with `serde_json::to_value`
+    /// on this struct) carries the pid under the key `pid` — the key the
+    /// supervisor's `RecentCrashSummary.pid` will read (that field arrives
+    /// with the supervisor half of the same plan, Phase 4).
+    #[test]
+    fn health_serialisation_carries_pid() {
+        let v = serde_json::to_value(crash_with_pid(Some(4242))).unwrap();
+        assert_eq!(v["pid"], serde_json::json!(4242));
+    }
+
+    /// A legacy dump's pid serialises as an explicit `null`, not a value.
+    #[test]
+    fn health_serialisation_nulls_pid_for_legacy_dump() {
+        let v = serde_json::to_value(crash_with_pid(None)).unwrap();
+        let obj = v.as_object().expect("object");
+        assert!(obj.contains_key("pid"));
+        assert!(obj["pid"].is_null());
     }
 
     #[test]
@@ -417,6 +517,7 @@ mod tests {
                 panic_location: None,
                 panic_message: None,
                 thread: None,
+                pid: None,
             })
             .await;
         assert!(state.get().await.is_some());
