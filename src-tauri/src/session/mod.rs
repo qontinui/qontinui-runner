@@ -78,6 +78,8 @@ pub mod pane_store;
 pub mod past_sessions;
 pub mod provider_adapter;
 pub mod reconcile;
+#[cfg(test)]
+mod reconcile_population_tests; // The reconcile pass entered where the runner enters it — the arming test of plan 2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session
 pub mod redact;
 pub mod respawn;
 pub mod restore_census; // Pre/post-restart session census — the G6 outcome check behind GET /control/sessions/restore-census
