@@ -1999,17 +1999,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # cargo audit walks the workspace and resolves path: deps. The runner's
-      # src-tauri/Cargo.toml depends on `qontinui-types` from a sibling repo.
-      # Same sibling checkout as the test job — including the
-      # declared-adaptation resolution, so `cargo audit` resolves the path dep
-      # against the very tree the `test` job compiled. Frontend link: deps have
-      # moved to npm so ui-bridge no longer needs cloning here, and schemas is
-      # the only sibling this job needs — hence no "Checkout sibling repos"
-      # step at all.
-      - name: Check out sibling qontinui-schemas
-        uses: ./.github/actions/checkout-sibling
-
       - name: Run security audit on Rust dependencies
         # Cargo.lock lives at the workspace root (./Cargo.lock), not under
         # src-tauri/. cargo-audit doesn't auto-walk to the workspace root,
@@ -2030,54 +2019,13 @@ jobs:
         # --ignore RUSTSEC-2026-0194 + RUSTSEC-2026-0195: two quick-xml
         # < 0.41 DoS advisories published together on 2026-07-02 (quadratic
         # attribute-duplicate check; unbounded NsReader namespace-declaration
-        # allocation). The tree carries FOUR quick-xml versions
-        # (0.30/0.37/0.38/0.39), all pinned transitively by the tauri/gtk
-        # stack — none upgradeable to 0.41 from this repo. The runner does
+        # allocation). The tree carries THREE quick-xml versions
+        # (0.30/0.38/0.39, as of the tauri 2.12 upgrade), all pinned
+        # transitively by the tauri/gtk/zbus stack — none upgradeable to 0.41
+        # from this repo. The runner does
         # not parse untrusted network XML through these paths (build-time
         # manifests/plists). These are the ONLY two quick-xml advisories in
         # the DB as of 2026-07-02. Revisit when tauri/gtk bump to >= 0.41.
-        #
-        # --ignore RUSTSEC-2026-0367 + RUSTSEC-2026-0368 + RUSTSEC-2026-0369
-        # + RUSTSEC-2026-0429: four zip < 9.0.0 extraction advisories (SUID/SGID
-        # bits preserved; symlink targets outside the destination; permissions
-        # applied through symlinks; and, 0429, dated 2026-10-22 and first seen
-        # red-ing `security` on main 2026-11-02, the process ABORTS on a
-        # symlink entry with a large declared size). All four live in
-        # `ZipArchive::extract()` and `ZipStreamReader::extract()`. The
-        # runner's OWN zip dependency is bumped to 9 (patched), and runner code
-        # never calls `extract()`.
-        #
-        # The ignore covers the SECOND copy, zip 4.6.1, which enters only as
-        #
-        #   qontinui-runner -> tauri-plugin-updater -> zip ^4
-        #
-        # and every tauri-plugin-updater through 2.14.0 requires `zip ^4`.
-        # 2.14.1, the first on `zip ^9`, requires tauri ^2.12, so it is not
-        # reachable from here without a tauri upgrade. Not exploitable in that
-        # path. The updater calls `extract()` only from its Windows
-        # `extract_zip`. 0367 and 0369 need Unix permission bits, which zip 4
-        # never applies on Windows. 0368 and 0429
-        # are NOT ruled out by the platform: zip 4 creates symlinks on Windows
-        # too, and 0429's abort is a denial of service on any OS.
-        # What rules out all four is that `extract_zip` runs only AFTER
-        # `verify_signature` checks the downloaded bundle against our updater
-        # public key, so the archive is not attacker-controlled. For 0429 that
-        # means triggering the abort needs the updater signing key, and whoever
-        # holds that key can already ship arbitrary code. The runner reaches
-        # the updater only through `download_and_install`
-        # (commands/execution/system_ops.rs), and the frontend is granted no
-        # `updater:` permission.
-        #
-        # Drop this ignore once the runner is on tauri-plugin-updater >= 2.14.1,
-        # the first release on zip ^9 (published 2026-10-28). That release
-        # requires tauri ^2.12; the lock is now on tauri 2.12.5 /
-        # tauri-plugin-updater 2.14.1 with tao re-vendored as
-        # vendor/tao-0.37.2, so zip 4 is gone and this ignore is dropped by the
-        # follow-up `ci(security)` commit. Tracking:
-        # qontinui/qontinui-runner#2500. REVIEW BY 2026-12-02. Re-assess
-        # immediately if updater signature checking is ever disabled or
-        # bypassed, if runner code starts calling `extract()` on a zip 4
-        # archive, or if the updater extracts on Unix.
         #
         # --ignore RUSTSEC-2026-0387: crypto-bigint 0.5.5, timing variability
         # in operations meant to be constant-time. Dated 2026-10-23, and it
@@ -2129,7 +2077,7 @@ jobs:
           # and reds this job on every PR (an upstream ecosystem drift, not a
           # runner vulnerability). --locked pins to cargo-audit's tested deps.
           cargo install cargo-audit --locked
-          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369 --ignore RUSTSEC-2026-0429 --ignore RUSTSEC-2026-0387
+          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0387
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
