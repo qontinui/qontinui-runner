@@ -921,6 +921,16 @@ fn probe_with_opts(
     canonical: Option<&crate::canonical_corpus::CanonicalCorpus>,
 ) -> ServedCorpus {
     let git = Git::until(git_program, budget, deadline, spawner);
+    probe_with_questions(workdir, &git, canonical)
+}
+
+/// The measurement over any [`RepoQuestions`] back end: the git CLI in
+/// production ([`probe_with_opts`]), git2 beside it in the parity harness.
+fn probe_with_questions(
+    workdir: &Path,
+    questions: &dyn RepoQuestions,
+    canonical: Option<&crate::canonical_corpus::CanonicalCorpus>,
+) -> ServedCorpus {
     let claude = workdir.join(".claude");
     let corpus = match std::fs::canonicalize(&claude) {
         Ok(p) if p.is_dir() => Probe::Measured(p),
@@ -944,12 +954,12 @@ fn probe_with_opts(
     );
 
     let checkout = match &corpus {
-        Probe::Measured(dir) => probe_checkout(&git, dir, DirtyScope::Subtree),
+        Probe::Measured(dir) => probe_checkout(questions, dir, DirtyScope::Subtree),
         Probe::Unknown(_) => Probe::Unknown("no served corpus".to_string()),
     };
     identity.in_checkout = match (&corpus, &checkout) {
         (Probe::Measured(dir), Probe::Measured(c)) => {
-            bundle_in_checkout(&git, dir, c, &identity.stamped_rels)
+            bundle_in_checkout(questions, dir, c, &identity.stamped_rels)
         }
         (Probe::Unknown(_), _) => BundleInCheckout::Unknown(CountUnknown::NoServedCorpus),
         (Probe::Measured(_), Probe::Unknown(_)) => {
@@ -958,7 +968,7 @@ fn probe_with_opts(
     };
     let bundle = Probe::Measured(identity);
 
-    let cwd = probe_cwd(&git, workdir, &checkout);
+    let cwd = probe_cwd(questions, workdir, &checkout);
 
     ServedCorpus {
         corpus,
@@ -972,11 +982,11 @@ fn probe_with_opts(
 /// The `cwd` token: `same checkout` when the workdir's work tree is the served
 /// corpus's, else the workdir measured on its own.
 fn probe_cwd(
-    git: &Git<'_>,
+    questions: &dyn RepoQuestions,
     workdir: &Path,
     corpus_checkout: &Probe<Checkout>,
 ) -> Probe<CwdCheckout> {
-    let located = match locate(git, workdir) {
+    let located = match questions.locate(workdir) {
         Ok(l) => l,
         Err(reason) => return Probe::Unknown(reason),
     };
@@ -992,7 +1002,7 @@ fn probe_cwd(
         }
     }
     Probe::Measured(CwdCheckout::Other(Checkout::Repo(measure(
-        git,
+        questions,
         workdir,
         located,
         DirtyScope::WholeTree,
@@ -1000,7 +1010,7 @@ fn probe_cwd(
 }
 
 /// Which paths `dirty` counts.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DirtyScope {
     /// Only under the probed directory — the served `.claude/`.
     Subtree,
@@ -1008,19 +1018,22 @@ enum DirtyScope {
     WholeTree,
 }
 
-fn probe_checkout(git: &Git<'_>, dir: &Path, scope: DirtyScope) -> Probe<Checkout> {
-    match locate(git, dir) {
+fn probe_checkout(questions: &dyn RepoQuestions, dir: &Path, scope: DirtyScope) -> Probe<Checkout> {
+    match questions.locate(dir) {
         Ok(None) => Probe::Measured(Checkout::NotAWorkTree),
-        Ok(Some(located)) => Probe::Measured(Checkout::Repo(measure(git, dir, located, scope))),
+        Ok(Some(located)) => Probe::Measured(Checkout::Repo(measure(
+            questions, dir, located, scope,
+        ))),
         Err(reason) => Probe::Unknown(reason),
     }
 }
 
 /// The bundle roster against the served checkout's git: which stamped files
-/// it tracks (one `git ls-files`, run only when a stamped file exists) and
-/// which roster paths the checkout's `git status` already reported changed.
+/// it tracks (one [`RepoQuestions::tracked`], asked only when a stamped file
+/// exists) and which roster paths the checkout's `git status` already reported
+/// changed.
 fn bundle_in_checkout(
-    git: &Git<'_>,
+    questions: &dyn RepoQuestions,
     corpus: &Path,
     checkout: &Checkout,
     stamped_rels: &[String],
@@ -1060,18 +1073,12 @@ fn bundle_in_checkout(
     let stamped_tracked = if stamped_rels.is_empty() {
         Ok(0)
     } else {
-        match git.run(corpus, &["ls-files", "-z", "--full-name", "--", "."]) {
-            Err(e) => Err(CountUnknown::Git(e.code)),
-            Ok(out) if !out.success => Err(CountUnknown::LsFilesFailed),
-            Ok(out) => {
-                let tracked: std::collections::HashSet<&str> =
-                    out.stdout.split('\0').filter(|p| !p.is_empty()).collect();
-                Ok(stamped_rels
-                    .iter()
-                    .filter(|rel| tracked.contains(in_repo(rel).as_str()))
-                    .count())
-            }
-        }
+        questions.tracked(corpus).map(|tracked| {
+            stamped_rels
+                .iter()
+                .filter(|rel| tracked.contains(&in_repo(rel)))
+                .count()
+        })
     };
 
     BundleInCheckout::Repo {
@@ -1088,60 +1095,177 @@ struct Located {
     head: Probe<Head>,
 }
 
-/// `Ok(None)` when `dir` is not inside a git work tree.
-fn locate(git: &Git<'_>, dir: &Path) -> Result<Option<Located>, String> {
-    let out = git.run(
-        dir,
-        &[
-            "rev-parse",
-            "--show-toplevel",
-            "--absolute-git-dir",
-            "--git-common-dir",
-            "HEAD",
-            "--abbrev-ref",
-            "HEAD",
-        ],
-    )?;
-    if !out.success && out.stderr.contains("not a git repository") {
-        return Ok(None);
-    }
-    let lines: Vec<&str> = out.stdout.lines().collect();
-    let (Some(top), Some(gd), Some(cd)) = (lines.first(), lines.get(1), lines.get(2)) else {
-        return Err(format!("git rev-parse failed: {}", first_line(&out.stderr)));
-    };
-    let toplevel = std::fs::canonicalize(top).unwrap_or_else(|_| PathBuf::from(top));
-    let git_dir = PathBuf::from(gd);
-    // `--git-common-dir` is relative to the directory git ran in.
-    let common_dir = {
-        let p = PathBuf::from(cd);
-        if p.is_absolute() {
-            p
-        } else {
-            dir.join(p)
-        }
-    };
-    let head = if out.success {
-        match (lines.get(3), lines.get(4)) {
-            (Some(sha), Some(branch)) => Probe::Measured(Head {
-                sha: (*sha).to_string(),
-                branch: (*branch != "HEAD").then(|| (*branch).to_string()),
-            }),
-            _ => Probe::Unknown("git rev-parse printed no HEAD".to_string()),
-        }
-    } else if out.stderr.contains("unknown revision") {
-        Probe::Unknown("no commit on HEAD".to_string())
-    } else {
-        Probe::Unknown(format!("git rev-parse failed: {}", first_line(&out.stderr)))
-    };
-    Ok(Some(Located {
-        toplevel,
-        git_dir,
-        common_dir,
-        head,
-    }))
+/// The `HEAD` reason both back ends give for a branch with no commit yet.
+const NO_COMMIT_ON_HEAD: &str = "no commit on HEAD";
+
+/// The `upstream=` reason both back ends give when the upstream ref is absent.
+fn no_upstream_ref(upstream_short: &str) -> String {
+    format!("no {upstream_short} ref")
 }
 
-fn measure(git: &Git<'_>, dir: &Path, located: Located, scope: DirtyScope) -> RepoState {
+/// The four questions one measurement asks a repository, by MEANING rather
+/// than by argv (plan
+/// `2026-10-24-served-corpus-probe-git2-parity-decides-whether-terminal-create-needs-a-process`,
+/// D3). [`Git`] answers them with the git CLI; the test-only
+/// `git2_parity::Git2` answers them in-process and is measured against it
+/// token by token. Every answer is already in the module's own vocabulary, so
+/// the rendering never knows which back end produced it.
+trait RepoQuestions {
+    /// Q1 — the work tree around `dir`: `Ok(None)` when `dir` is not inside a
+    /// git work tree, `Err(reason)` when that could not be told.
+    fn locate(&self, dir: &Path) -> Result<Option<Located>, String>;
+
+    /// Q2 — how far `HEAD` (of the repository around `dir`) is from the LOCAL
+    /// ref `upstream_ref`, which renders as `upstream_short`. Asked only when
+    /// [`locate`](Self::locate) measured a `HEAD`.
+    fn ahead_behind(&self, dir: &Path, upstream_ref: &str, upstream_short: &str)
+        -> Probe<Upstream>;
+
+    /// Q3 — the toplevel-relative paths of tracked entries with staged or
+    /// unstaged changes: no untracked files, no renames, no submodules, and
+    /// under `dir` only for [`DirtyScope::Subtree`].
+    fn changed(&self, dir: &Path, scope: DirtyScope) -> Probe<Vec<String>>;
+
+    /// Q4 — the toplevel-relative path of every index entry under `dir`.
+    fn tracked(&self, dir: &Path) -> Result<std::collections::HashSet<String>, CountUnknown>;
+}
+
+impl RepoQuestions for Git<'_> {
+    fn locate(&self, dir: &Path) -> Result<Option<Located>, String> {
+        let out = self.run(
+            dir,
+            &[
+                "rev-parse",
+                "--show-toplevel",
+                "--absolute-git-dir",
+                "--git-common-dir",
+                "HEAD",
+                "--abbrev-ref",
+                "HEAD",
+            ],
+        )?;
+        if !out.success && out.stderr.contains("not a git repository") {
+            return Ok(None);
+        }
+        let lines: Vec<&str> = out.stdout.lines().collect();
+        let (Some(top), Some(gd), Some(cd)) = (lines.first(), lines.get(1), lines.get(2)) else {
+            return Err(format!("git rev-parse failed: {}", first_line(&out.stderr)));
+        };
+        let toplevel = std::fs::canonicalize(top).unwrap_or_else(|_| PathBuf::from(top));
+        let git_dir = PathBuf::from(gd);
+        // `--git-common-dir` is relative to the directory git ran in.
+        let common_dir = {
+            let p = PathBuf::from(cd);
+            if p.is_absolute() {
+                p
+            } else {
+                dir.join(p)
+            }
+        };
+        let head = if out.success {
+            match (lines.get(3), lines.get(4)) {
+                (Some(sha), Some(branch)) => Probe::Measured(Head {
+                    sha: (*sha).to_string(),
+                    branch: (*branch != "HEAD").then(|| (*branch).to_string()),
+                }),
+                _ => Probe::Unknown("git rev-parse printed no HEAD".to_string()),
+            }
+        } else if out.stderr.contains("unknown revision") {
+            Probe::Unknown(NO_COMMIT_ON_HEAD.to_string())
+        } else {
+            Probe::Unknown(format!("git rev-parse failed: {}", first_line(&out.stderr)))
+        };
+        Ok(Some(Located {
+            toplevel,
+            git_dir,
+            common_dir,
+            head,
+        }))
+    }
+
+    fn ahead_behind(
+        &self,
+        dir: &Path,
+        upstream_ref: &str,
+        upstream_short: &str,
+    ) -> Probe<Upstream> {
+        let range = format!("{upstream_ref}...HEAD");
+        match self.run(dir, &["rev-list", "--count", "--left-right", &range]) {
+            Err(e) => Probe::Unknown(e.reason),
+            Ok(out) if !out.success => {
+                if out.stderr.contains("unknown revision") || out.stderr.contains("bad revision") {
+                    Probe::Unknown(no_upstream_ref(upstream_short))
+                } else {
+                    Probe::Unknown(format!("git rev-list failed: {}", first_line(&out.stderr)))
+                }
+            }
+            Ok(out) => {
+                let mut counts = out.stdout.split_whitespace().map(str::parse::<u64>);
+                match (counts.next(), counts.next()) {
+                    (Some(Ok(behind)), Some(Ok(ahead))) => Probe::Measured(Upstream {
+                        name: upstream_short.to_string(),
+                        behind,
+                        ahead,
+                    }),
+                    _ => Probe::Unknown("git rev-list printed no counts".to_string()),
+                }
+            }
+        }
+    }
+
+    fn changed(&self, dir: &Path, scope: DirtyScope) -> Probe<Vec<String>> {
+        // Tracked changes only, the cheapest status git offers: no untracked
+        // walk, no rename detection, no descent into submodules. `-z` porcelain
+        // paths are toplevel-relative and unquoted.
+        const STATUS: &[&str] = &[
+            "status",
+            "--porcelain",
+            "-z",
+            "--untracked-files=no",
+            "--no-renames",
+            "--ignore-submodules=all",
+        ];
+        let mut status_args: Vec<&str> = STATUS.to_vec();
+        if let DirtyScope::Subtree = scope {
+            status_args.extend(["--", "."]);
+        }
+        match self.run(dir, &status_args) {
+            Err(e) => Probe::Unknown(e.reason),
+            Ok(out) if !out.success => {
+                Probe::Unknown(format!("git status failed: {}", first_line(&out.stderr)))
+            }
+            // Each record is `XY <path>`.
+            Ok(out) => Probe::Measured(
+                out.stdout
+                    .split('\0')
+                    .filter_map(|r| r.get(3..))
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            ),
+        }
+    }
+
+    fn tracked(&self, dir: &Path) -> Result<std::collections::HashSet<String>, CountUnknown> {
+        match self.run(dir, &["ls-files", "-z", "--full-name", "--", "."]) {
+            Err(e) => Err(CountUnknown::Git(e.code)),
+            Ok(out) if !out.success => Err(CountUnknown::LsFilesFailed),
+            Ok(out) => Ok(out
+                .stdout
+                .split('\0')
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect()),
+        }
+    }
+}
+
+fn measure(
+    questions: &dyn RepoQuestions,
+    dir: &Path,
+    located: Located,
+    scope: DirtyScope,
+) -> RepoState {
     let upstream_ref = upstream_ref(&located.common_dir);
     let upstream_short = upstream_ref
         .strip_prefix("refs/remotes/")
@@ -1150,66 +1274,12 @@ fn measure(git: &Git<'_>, dir: &Path, located: Located, scope: DirtyScope) -> Re
 
     let upstream = match &located.head {
         Probe::Unknown(r) => Probe::Unknown(r.clone()),
-        Probe::Measured(_) => {
-            let range = format!("{upstream_ref}...HEAD");
-            match git.run(dir, &["rev-list", "--count", "--left-right", &range]) {
-                Err(e) => Probe::Unknown(e.reason),
-                Ok(out) if !out.success => {
-                    if out.stderr.contains("unknown revision")
-                        || out.stderr.contains("bad revision")
-                    {
-                        Probe::Unknown(format!("no {upstream_short} ref"))
-                    } else {
-                        Probe::Unknown(format!("git rev-list failed: {}", first_line(&out.stderr)))
-                    }
-                }
-                Ok(out) => {
-                    let mut counts = out.stdout.split_whitespace().map(str::parse::<u64>);
-                    match (counts.next(), counts.next()) {
-                        (Some(Ok(behind)), Some(Ok(ahead))) => Probe::Measured(Upstream {
-                            name: upstream_short.clone(),
-                            behind,
-                            ahead,
-                        }),
-                        _ => Probe::Unknown("git rev-list printed no counts".to_string()),
-                    }
-                }
-            }
-        }
+        Probe::Measured(_) => questions.ahead_behind(dir, &upstream_ref, &upstream_short),
     };
 
     let as_of = fetch_age(&located, &upstream_ref);
 
-    // Tracked changes only, the cheapest status git offers: no untracked
-    // walk, no rename detection, no descent into submodules. `-z` porcelain
-    // paths are toplevel-relative and unquoted.
-    const STATUS: &[&str] = &[
-        "status",
-        "--porcelain",
-        "-z",
-        "--untracked-files=no",
-        "--no-renames",
-        "--ignore-submodules=all",
-    ];
-    let mut status_args: Vec<&str> = STATUS.to_vec();
-    if let DirtyScope::Subtree = scope {
-        status_args.extend(["--", "."]);
-    }
-    let changed: Probe<Vec<String>> = match git.run(dir, &status_args) {
-        Err(e) => Probe::Unknown(e.reason),
-        Ok(out) if !out.success => {
-            Probe::Unknown(format!("git status failed: {}", first_line(&out.stderr)))
-        }
-        // Each record is `XY <path>`.
-        Ok(out) => Probe::Measured(
-            out.stdout
-                .split('\0')
-                .filter_map(|r| r.get(3..))
-                .filter(|p| !p.is_empty())
-                .map(str::to_string)
-                .collect(),
-        ),
-    };
+    let changed = questions.changed(dir, scope);
     let dirty = match &changed {
         Probe::Measured(paths) => Probe::Measured(paths.len()),
         Probe::Unknown(r) => Probe::Unknown(r.clone()),
@@ -1543,6 +1613,15 @@ struct Git<'a> {
     deadline: Instant,
     spawner: crate::process_deadline::Spawner,
     dead: std::cell::RefCell<Option<GitError>>,
+    /// Test-only: child environment set (`Some`) or removed (`None`) after
+    /// the scrub, so the parity harness states every config variable its CLI
+    /// child sees instead of inheriting the test process's.
+    #[cfg(test)]
+    env: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>,
+    /// Test-only: total process-creation time of every run so far, so the
+    /// parity harness can time the CLI from after `spawn()` returns.
+    #[cfg(test)]
+    spawn_spent: std::cell::Cell<Duration>,
 }
 
 impl<'a> Git<'a> {
@@ -1571,7 +1650,18 @@ impl<'a> Git<'a> {
             deadline,
             spawner,
             dead: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            env: Vec::new(),
+            #[cfg(test)]
+            spawn_spent: std::cell::Cell::new(Duration::ZERO),
         }
+    }
+
+    /// This runner with `env` applied to every child after the scrub.
+    #[cfg(test)]
+    fn with_env(mut self, env: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>) -> Self {
+        self.env = env;
+        self
     }
 
     /// The error for a question the spent budget cut short: `code` says
@@ -1597,6 +1687,13 @@ impl<'a> Git<'a> {
             // `git status` otherwise refreshes and rewrites the index: this
             // probe never writes.
             .env("GIT_OPTIONAL_LOCKS", "0");
+        #[cfg(test)]
+        for (k, v) in &self.env {
+            match v {
+                Some(v) => cmd.env(k, v),
+                None => cmd.env_remove(k),
+            };
+        }
         cmd
     }
 
@@ -1633,6 +1730,8 @@ impl<'a> Git<'a> {
         span.record("outcome", outcome);
         if let Some(d) = result.as_ref().ok().and_then(|r| r.spawn_elapsed) {
             span.record("spawn_ms", u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+            #[cfg(test)]
+            self.spawn_spent.set(self.spawn_spent.get() + d);
         }
         drop(span);
         match result {
@@ -1687,6 +1786,15 @@ impl<'a> Git<'a> {
     }
 }
 
+/// The git2 back end of [`RepoQuestions`] and the harness that measures it
+/// against the CLI, token by token (plan
+/// `2026-10-24-served-corpus-probe-git2-parity-decides-whether-terminal-create-needs-a-process`,
+/// Phase 1). Test-only: nothing on the population changes until that plan's
+/// Phase 2 decides from these measurements.
+#[cfg(test)]
+#[path = "served_corpus/git2_parity.rs"]
+mod git2_parity;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1697,7 +1805,7 @@ mod tests {
 
     /// Run git in `dir` with no dependence on the user's global hooks or
     /// signing config.
-    fn git(dir: &Path, args: &[&str]) -> String {
+    pub(super) fn git(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
             .arg("-C")
             .arg(dir)
@@ -1761,7 +1869,7 @@ mod tests {
     }
 
     /// A committed checkout whose `.claude/` holds every bundled file verbatim.
-    fn checkout_with_bundle() -> tempfile::TempDir {
+    pub(super) fn checkout_with_bundle() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().expect("tempdir");
         git(tmp.path(), &["init", "--quiet"]);
         for f in bundled_files() {
@@ -1777,7 +1885,7 @@ mod tests {
         tmp
     }
 
-    fn line_for(dir: &Path) -> String {
+    pub(super) fn line_for(dir: &Path) -> String {
         probe_with(dir, OsStr::new("git"), PROBE_BUDGET, None).render_line()
     }
 
