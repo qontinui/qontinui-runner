@@ -35,8 +35,8 @@ on:
       - ".pre-commit-config.yaml"
       - "src-tauri/scripts/generate_types.sh"
       - "src-tauri/build.rs"
-      - "src-tauri/Cargo.toml"
-      - "Cargo.toml"
+      # crate-inputs-test's real-repo arm reads every workspace manifest.
+      - "**/Cargo.toml"
       - ".github/workflows/pre-commit-hook-tests.yml"
   pull_request:
     branches: [main]
@@ -45,9 +45,15 @@ on:
       - ".pre-commit-config.yaml"
       - "src-tauri/scripts/generate_types.sh"
       - "src-tauri/build.rs"
-      - "src-tauri/Cargo.toml"
-      - "Cargo.toml"
+      # crate-inputs-test's real-repo arm reads every workspace manifest.
+      - "**/Cargo.toml"
       - ".github/workflows/pre-commit-hook-tests.yml"
+  # crate-inputs-test's real-repo arm also parses every include_str! /
+  # include_dir! under src-tauri/src, which is too broad a path to trigger
+  # on; a daily run catches a source change that breaks it within a day,
+  # instead of on the next unrelated hook PR.
+  schedule:
+    - cron: "17 6 * * *"
   workflow_dispatch:
 
 permissions:
@@ -109,10 +115,17 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
+          shopt -s nullglob
+          suites=(.pre-commit-hooks/*-test.sh)
+          if [ "${#suites[@]}" -eq 0 ]; then
+            echo "::error::no .pre-commit-hooks/*-test.sh found; this job tests nothing"
+            exit 1
+          fi
           missing=0
-          for t in .pre-commit-hooks/*-test.sh; do
+          for t in "${suites[@]}"; do
             n="$(basename "$t")"
-            if ! grep -qF "run: bash .pre-commit-hooks/$n" .github/workflows/pre-commit-hook-tests.yml; then
+            # Anchored: a commented-out `# run: bash …` step must not count.
+            if ! grep -qxF "        run: bash .pre-commit-hooks/$n" .github/workflows/pre-commit-hook-tests.yml; then
               echo "::error file=$t::$n has no step in pre-commit-hook-tests.yml, so CI never runs it"
               missing=1
             fi
