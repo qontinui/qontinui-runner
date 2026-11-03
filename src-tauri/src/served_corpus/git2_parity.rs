@@ -385,27 +385,48 @@ fn ref_exists(repo: &git2::Repository, name: &str) -> Result<bool, String> {
 
 // ── The harness ─────────────────────────────────────────────────────────────
 
-/// A git2 answer that changes a token, named with why, for Phase 2's
-/// allowlist (D4) to route to the CLI. A case listed here MUST diverge: one
-/// that agrees again fails its test.
-const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
-    (
-        "filter_clean_driver/corpus",
-        "libgit2 runs no external `filter.<x>.clean` driver: it hashes the raw \
-         working-tree bytes, so a file the driver rewrites reads modified \
-         (dirty-claude=1) where the CLI, which runs the driver, reads it clean",
-    ),
-    (
-        "filter_clean_driver/cwd",
-        "the same driver over the whole tree: git2 dirty=1 where the CLI reads 0",
-    ),
-    (
-        "sparse_cone_index_sparse_false/cwd",
-        "a cone sparse checkout with a FULL index: over the whole tree git2 counts \
-         the two skip-worktree entries outside the cone (absent from disk by \
-         design) as changed, dirty=3 where the CLI reads 1. Inside the cone \
-         (`/corpus`, the .claude-scoped status) the two agree",
-    ),
+/// A git2 answer that changes a token, for Phase 2's allowlist (D4) to
+/// route to the CLI.
+struct KnownDivergence {
+    case: &'static str,
+    /// Exactly the tokens that differ; any other set fails the case.
+    tokens: &'static [&'static str],
+    /// How each differing token ends on the CLI line, and on the git2 line:
+    /// the measured values, pinned.
+    cli_ends: &'static str,
+    git2_ends: &'static str,
+    why: &'static str,
+}
+
+/// A case listed here MUST diverge exactly as stated: one that agrees again,
+/// or differs in another token or value, fails its test.
+const KNOWN_DIVERGENCES: &[KnownDivergence] = &[
+    KnownDivergence {
+        case: "filter_clean_driver/corpus",
+        tokens: &["checkout"],
+        cli_ends: "dirty-claude=0",
+        git2_ends: "dirty-claude=1",
+        why: "libgit2 runs no external `filter.<x>.clean` driver: it hashes the raw \
+              working-tree bytes, so a file the driver rewrites reads modified where \
+              the CLI, which runs the driver, reads it clean",
+    },
+    KnownDivergence {
+        case: "filter_clean_driver/cwd",
+        tokens: &["cwd"],
+        cli_ends: "dirty=0",
+        git2_ends: "dirty=1",
+        why: "the same clean driver, over the whole tree",
+    },
+    KnownDivergence {
+        case: "sparse_cone_index_sparse_false/cwd",
+        tokens: &["cwd"],
+        cli_ends: "dirty=1",
+        git2_ends: "dirty=3",
+        why: "a cone sparse checkout with a FULL index: over the whole tree git2 \
+              counts the two skip-worktree entries outside the cone (absent from \
+              disk by design) as changed. Inside the cone (`/corpus`, the \
+              .claude-scoped status) the two agree",
+    },
 ];
 
 /// Ample for every fixture, so no CLI answer is a deadline UNKNOWN.
@@ -537,13 +558,16 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
 
-/// Whether a case must see git2 decline at least one question.
+/// Which back end a case must see answer. Every fixture states one, so a
+/// case can never pass because git2 quietly declined everything and the CLI
+/// was compared with itself.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Expect {
-    /// Answer or decline, as libgit2 can.
-    Either,
+    /// libgit2 reads this repository: git2 must answer EVERY question.
+    Answer,
     /// libgit2 cannot read this repository (an index extension, a ref
-    /// backend, an ownership rule it cannot be told about).
+    /// backend, an ownership rule it cannot be told about): git2 must decline
+    /// at least one question.
     Decline,
 }
 
@@ -563,12 +587,22 @@ fn check_timed(case: &str, workdir: &Path, extra_env: &[(&str, &str)], expect: E
             g2 = g;
         }
     }
+    // A token missing from both lines would compare equal: every one must be
+    // rendered on both.
+    for k in TOKENS {
+        assert!(
+            token(&cli.line, k).is_some() && token(&g2.line, k).is_some(),
+            "{case}: the [{k}: …] token is missing\n  cli : {}\n  git2: {}",
+            cli.line,
+            g2.line
+        );
+    }
     let differing: Vec<&str> = TOKENS
         .iter()
         .copied()
         .filter(|k| token(&cli.line, k) != token(&g2.line, k))
         .collect();
-    let known = KNOWN_DIVERGENCES.iter().find(|(name, _)| *name == case);
+    let known = KNOWN_DIVERGENCES.iter().find(|d| d.case == case);
     let verdict = match (differing.is_empty(), known) {
         (true, None) if g2.declines.is_empty() => "identical".to_string(),
         (true, None) => "identical (git2 declined, the CLI answered)".to_string(),
@@ -590,7 +624,24 @@ fn check_timed(case: &str, workdir: &Path, extra_env: &[(&str, &str)], expect: E
     );
     match (differing.is_empty(), known) {
         (true, None) => {}
-        (false, Some((_, why))) => println!("git2-parity | {case:<46} | known divergence: {why}"),
+        (false, Some(d)) => {
+            let pinned = differing == d.tokens
+                && d.tokens.iter().all(|k| {
+                    token(&cli.line, k).is_some_and(|v| v.ends_with(d.cli_ends))
+                        && token(&g2.line, k).is_some_and(|v| v.ends_with(d.git2_ends))
+                });
+            assert!(
+                pinned,
+                "{case}: diverges, but not as KNOWN_DIVERGENCES pins it (tokens {:?}, cli \
+                 ...{}, git2 ...{}); measured tokens {differing:?}\n  cli : {}\n  git2: {}",
+                d.tokens,
+                d.cli_ends,
+                d.git2_ends,
+                cli.line,
+                g2.line
+            );
+            println!("git2-parity | {case:<46} | known divergence: {}", d.why);
+        }
         (false, None) => panic!(
             "{case}: a git2 ANSWER changed {differing:?} (D1)\n  cli : {}\n  git2: {}\n  \
              git2 declines: {:?}",
@@ -601,6 +652,15 @@ fn check_timed(case: &str, workdir: &Path, extra_env: &[(&str, &str)], expect: E
              remove the entry (and re-measure Phase 2's allowlist)\n  line: {}",
             cli.line
         ),
+    }
+    if expect == Expect::Answer {
+        assert!(
+            g2.declines.is_empty(),
+            "{case}: expected libgit2 to answer every question, but it declined {:?}\n  \
+             line: {}",
+            g2.declines,
+            g2.line
+        );
     }
     if expect == Expect::Decline {
         assert!(
@@ -655,7 +715,7 @@ impl Layouts {
 }
 
 fn check_both(case: &str, repo: &Path) {
-    layouts(case, repo).check(case, &[], Expect::Either);
+    layouts(case, repo).check(case, &[], Expect::Answer);
 }
 
 /// A fixture this machine cannot produce: a failure under `CI`, a printed
@@ -800,6 +860,7 @@ fn origin_and_clone(tmp: &Path, clone_args: &[&str]) -> (tempfile::TempDir, Path
 #[test]
 fn plain_repo_clean() {
     let repo = checkout_with_bundle();
+    assert!(line_for(repo.path()).contains("dirty-claude=0]"));
     check_both("plain_repo_clean", repo.path());
     // The `&dyn` path production takes renders what the parity CLI renders.
     let production = line_for(repo.path());
@@ -852,13 +913,13 @@ fn not_a_work_tree() {
     let tmp = tempfile::tempdir().expect("tempdir");
     crate::provision_guard::test_support::assert_not_in_any_repo(tmp.path());
     write_bundle_in(tmp.path());
-    check("not_a_work_tree/corpus", tmp.path(), &[], Expect::Either);
+    check("not_a_work_tree/corpus", tmp.path(), &[], Expect::Answer);
     // A workdir outside any repository serving another checkout's corpus.
     let corpus = checkout_with_bundle();
     let wd = tmp.path().join("wd");
     std::fs::create_dir_all(&wd).unwrap();
     match link_dir(&corpus.path().join(".claude"), &wd.join(".claude")) {
-        Ok(()) => check("not_a_work_tree/cwd", &wd, &[], Expect::Either),
+        Ok(()) => check("not_a_work_tree/cwd", &wd, &[], Expect::Answer),
         Err(why) => unproducible("not_a_work_tree/cwd", &why),
     }
 }
@@ -922,7 +983,7 @@ fn corpus_symlinked_from_another_checkout() {
         "corpus_symlinked_from_another_checkout",
         work.path(),
         &[],
-        Expect::Either,
+        Expect::Answer,
     );
 }
 
@@ -962,6 +1023,8 @@ fn branch_named_like_a_tag() {
 fn branch_containing_a_bracket() {
     let repo = checkout_with_bundle();
     git(repo.path(), &["checkout", "--quiet", "-b", "feat]x"]);
+    let line = line_for(repo.path());
+    assert!(line.contains(" feat)x@"), "the `]` is cleaned to `)`: {line}");
     check_both("branch_containing_a_bracket", repo.path());
 }
 
@@ -993,6 +1056,10 @@ fn repo_with_submodule() -> (tempfile::TempDir, tempfile::TempDir) {
 #[test]
 fn submodule_clean() {
     let (repo, _sub) = repo_with_submodule();
+    let status = git(repo.path(), &["status", "--porcelain"]);
+    assert!(status.is_empty(), "{status}");
+    let line = line_for(repo.path());
+    assert!(line.contains("dirty-claude=0]"), "{line}");
     check_both("submodule_clean", repo.path());
 }
 
@@ -1000,6 +1067,11 @@ fn submodule_clean() {
 fn submodule_with_modified_content() {
     let (repo, _sub) = repo_with_submodule();
     std::fs::write(repo.path().join(".claude/vendor-sub/file.txt"), "edited\n").unwrap();
+    // git itself sees the submodule modified; the probe ignores submodules.
+    let status = git(repo.path(), &["status", "--porcelain"]);
+    assert!(status.contains(" M .claude/vendor-sub"), "{status}");
+    let line = line_for(repo.path());
+    assert!(line.contains("dirty-claude=0]"), "{line}");
     check_both("submodule_modified_content", repo.path());
 }
 
@@ -1011,6 +1083,8 @@ fn submodule_with_a_staged_gitlink_change() {
     git(repo.path(), &["add", "--", ".claude/vendor-sub"]);
     let status = git(repo.path(), &["status", "--porcelain"]);
     assert!(status.contains("M  .claude/vendor-sub"), "{status}");
+    let line = line_for(repo.path());
+    assert!(line.contains("dirty-claude=0]"), "{line}");
     check_both("submodule_staged_gitlink", repo.path());
 }
 
@@ -1025,6 +1099,9 @@ fn non_ascii_path() {
     git(&dir, &["add", "--", ".claude"]);
     commit(&dir, "bundle");
     std::fs::write(dir.join(".claude/ñandú.md"), "changed\n").unwrap();
+    let line = line_for(&dir);
+    assert!(line.contains("[checkout: répertoire-ü-корпус "), "{line}");
+    assert!(line.contains("dirty-claude=1]"), "{line}");
     check_both("non_ascii_path", &dir);
 }
 
@@ -1066,6 +1143,8 @@ fn sparse_repo(case: &str, sparse_index: bool) -> Option<tempfile::TempDir> {
 fn sparse_checkout_cone_full_index() {
     let case = "sparse_cone_index_sparse_false";
     if let Some(repo) = sparse_repo(case, false) {
+        let line = line_for(repo.path());
+        assert!(line.contains("dirty-claude=1]"), "{line}");
         check_both(case, repo.path());
     }
 }
@@ -1124,6 +1203,8 @@ fn autocrlf_crlf_working_copy_after_touch() {
     for f in bundled_files().iter().take(5) {
         touch(&dir.join(".claude").join(&f.rel));
     }
+    let line = line_for(dir);
+    assert!(line.contains("dirty-claude=0]"), "CRLF of LF blobs is clean: {line}");
     check_both(case, dir);
 }
 
@@ -1142,6 +1223,8 @@ fn filter_clean_driver() {
         return unproducible(case, &format!("the clean driver did not run: blob {blob:?}"));
     }
     touch(&dir.join(".claude/filtered.txt"));
+    let line = line_for(dir);
+    assert!(line.contains("dirty-claude=0]"), "the driver makes it clean: {line}");
     check_both(case, dir);
 }
 
@@ -1154,9 +1237,12 @@ fn fsmonitor_hook_script() {
     let hooks = tempfile::tempdir().expect("tempdir");
     let log = hooks.path().join("calls.log");
     let hook = hooks.path().join("fsmonitor-hook");
+    // Git runs `core.fsmonitor` through `sh -c`, which eats a Windows
+    // backslash: both paths it reads are spelled with forward slashes.
+    let slashed = |p: &Path| p.display().to_string().replace('\\', "/");
     let body = format!(
         "#!/bin/sh\necho \"$@\" >> '{}'\nprintf 'qontinui-token\\0/\\0'\n",
-        log.display()
+        slashed(&log)
     );
     #[cfg(unix)]
     crate::canonical_corpus::test_support::executable_script(&hook, &body);
@@ -1164,11 +1250,14 @@ fn fsmonitor_hook_script() {
     std::fs::write(&hook, &body).unwrap();
     let dir = tmp.path();
     git(dir, &["init", "--quiet"]);
-    git(dir, &["config", "core.fsmonitor", &hook.display().to_string()]);
+    git(dir, &["config", "core.fsmonitor", &slashed(&hook)]);
     git(dir, &["config", "core.fsmonitorHookVersion", "2"]);
     commit_bundle_in(dir);
     let first = &bundled_files()[0];
     std::fs::write(dir.join(".claude").join(&first.rel), "edited\n").unwrap();
+    let line = line_for(dir);
+    assert!(line.contains("dirty-claude=1]"), "{line}");
+    // Cleared now, so a non-empty log below proves the parity runs asked it.
     let _ = std::fs::remove_file(&log);
     check_both(case, dir);
     if std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0) == 0 {
@@ -1379,10 +1468,10 @@ fn large_tree_whole_tree_cwd() {
         Ok(wd) => wd,
         Err(why) => return unproducible(case, &why),
     };
-    check_timed(&format!("{case}/fresh"), &wd, &[], Expect::Either, 3);
+    check_timed(&format!("{case}/fresh"), &wd, &[], Expect::Answer, 3);
     std::thread::sleep(Duration::from_millis(1100));
     // A refresh re-stats every entry and writes the index; it stages nothing,
     // so the one edit stays changed.
     let _ = try_git(dir, &["update-index", "-q", "--refresh"]);
-    check_timed(&format!("{case}/aged"), &wd, &[], Expect::Either, 3);
+    check_timed(&format!("{case}/aged"), &wd, &[], Expect::Answer, 3);
 }
