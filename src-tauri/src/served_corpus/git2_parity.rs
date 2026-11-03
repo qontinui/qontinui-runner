@@ -677,8 +677,13 @@ fn workdir_in(repo: &Path, corpus_checkout: &Path) -> Result<PathBuf, String> {
     Ok(wd)
 }
 
+// `#[cfg(test)]` again on the items that spawn a process: the module is
+// already test-only (its `mod` line in served_corpus.rs), but the
+// process_helpers spawn guards read one file at a time and skip only items
+// they can see are test-only.
 /// A directory link: a symlink on Unix; on Windows a directory symlink, or a
 /// junction where symlinks need a privilege the box lacks.
+#[cfg(test)]
 fn link_dir(target: &Path, link: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -708,6 +713,7 @@ fn link_dir(target: &Path, link: &Path) -> Result<(), String> {
 }
 
 /// [`git`] for a step that may legitimately fail on this machine.
+#[cfg(test)]
 fn try_git(dir: &Path, args: &[&str]) -> Result<String, String> {
     let out = Command::new("git")
         .arg("-C")
@@ -1204,6 +1210,7 @@ struct ForeignOwner {
     restore: String,
 }
 
+#[cfg(test)]
 impl ForeignOwner {
     #[cfg(unix)]
     fn take(dir: &Path) -> Result<Self, String> {
@@ -1248,6 +1255,7 @@ impl ForeignOwner {
     }
 }
 
+#[cfg(test)]
 impl Drop for ForeignOwner {
     fn drop(&mut self) {
         #[cfg(unix)]
