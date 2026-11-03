@@ -115,7 +115,7 @@ description: >-
 # runner-consumer-check.yml:404-405 and silently misses every bare-form label,
 # reddening pairs that ARE properly declared.
 #
-# ALL FOUR forms are evaluated UNCONDITIONALLY, even when the primary hits,
+# ALL FOUR forms are evaluated UNCONDITIONALLY, even when one of them hits,
 # and EVERY declaration in each form is collected rather than taking the first
 # or the last. That is not redundant work — it is the only way to detect two
 # declarations naming DIFFERENT sibling PRs. We can check out exactly one tree,
