@@ -16,7 +16,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `fleet_host_name` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `fleet_device_uuid` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
-| `os_bound_tooling` | 98 | 99 | 96 | 2 | 0 | 0 |
+| `os_bound_tooling` | 99 | 100 | 96 | 3 | 0 | 0 |
 
 ## `repo_layout` (79 rows)
 
@@ -257,7 +257,7 @@ _No hits._
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `let existing = get_setting::<PathSettings>().plans_dir;` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `update_setting::<PathSettings, _>(\|paths\| paths.plans_dir = Some(value.clone()))?;` | 1 | unreviewed |
 
-## `os_bound_tooling` (98 rows)
+## `os_bound_tooling` (99 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -348,6 +348,7 @@ _No hits._
 | `src/wedge_diagnostics.rs` | `census` | `cfg(windows)-only fn 'census' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/wedge_diagnostics.rs` | `names` | `cfg(windows)-only fn 'names' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/wedge_diagnostics.rs` | `own_threads` | `cfg(windows)-only fn 'own_threads' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/wedge_diagnostics.rs` | `rows` | `cfg(windows)-only fn 'rows' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — The Windows-only per-thread join (NtQuerySystemInformation + GetThreadDescription) behind capture_thread_rows. The public entry point has a Linux arm (/proc/self/task comm + stat) and a None arm for every other OS, so nothing outside Windows calls this fn and a non-Windows runner still gets its tally, or an honest UNKNOWN. |
 | `src/wedge_diagnostics.rs` | `thread_description` | `cfg(windows)-only fn 'thread_description' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/win32_compat.rs` | `ThreadDpiContextGuard::drop` | `cfg(windows)-only fn 'drop' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/win32_compat.rs` | `ThreadDpiContextGuard::is_active` | `cfg(windows)-only fn 'is_active' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |

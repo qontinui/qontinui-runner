@@ -968,6 +968,15 @@
     {
       "class": "os_bound_tooling",
       "file": "src/wedge_diagnostics.rs",
+      "symbol": "rows",
+      "excerpt": "cfg(windows)-only fn `rows` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "The Windows-only per-thread join (NtQuerySystemInformation + GetThreadDescription) behind capture_thread_rows. The public entry point has a Linux arm (/proc/self/task comm + stat) and a None arm for every other OS, so nothing outside Windows calls this fn and a non-Windows runner still gets its tally, or an honest UNKNOWN."
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/wedge_diagnostics.rs",
       "symbol": "thread_description",
       "excerpt": "cfg(windows)-only fn `thread_description` has no cfg(not(windows)) sibling in this file",
       "count": 1,
