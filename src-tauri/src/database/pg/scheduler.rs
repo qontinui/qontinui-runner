@@ -148,10 +148,62 @@ pub enum ManagedUpsert {
     Created(String),
     /// The task carrying the key (this id) was updated in place.
     Updated(String),
-    /// A task carries the key but it moved since the caller read it (or the
-    /// caller read none and one appeared): nothing was written.
+    /// Nothing was written: the task the caller read moved or was deleted
+    /// since, or the caller read none and one appeared.
     Conflict,
 }
+
+/// Why [`PgDb::upsert_managed_scheduled_task`] failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedUpsertError {
+    /// SQLSTATE 42P10: `uq_scheduled_tasks_managed_key` is missing or
+    /// INVALID, so the INSERT's `ON CONFLICT` arbiter cannot be inferred.
+    KeyIndexMissing(String),
+    /// Anything else.
+    Other(String),
+}
+
+impl std::fmt::Display for ManagedUpsertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::KeyIndexMissing(e) | Self::Other(e) => f.write_str(e),
+        }
+    }
+}
+
+/// The conditional update of the task carrying a managed key (see
+/// [`PgDb::upsert_managed_scheduled_task`]): every user-visible column plus
+/// `managed_version`, `managed_digest` and `timezone`, keyed on the managed
+/// key AND the `modified_at` the caller read. The key columns themselves are
+/// never rewritten; `id`, `created_at`, `last_run_id` and
+/// `consecutive_launch_failures` are left alone.
+const MANAGED_UPDATE_SQL: &str = r#"
+    UPDATE scheduled_tasks SET
+        name = $1,
+        description = $2,
+        enabled = $3,
+        schedule_type = $4,
+        schedule_value = $5,
+        task_config = $6,
+        skip_if_completed = $7,
+        auto_fix_on_failure = $8,
+        success_criteria = $9,
+        modified_at = $10,
+        next_run = $11,
+        catch_up_policy = $12,
+        catch_up_grace_seconds = $13,
+        launch_failure_backoff_seconds = $14,
+        conditions = $15,
+        condition_status = $16,
+        managed_version = $17,
+        managed_digest = $18,
+        timezone = $19
+    WHERE managed_source = $20
+      AND managed_tenant_id = ($21::text)::uuid
+      AND managed_agent = $22
+      AND modified_at = $23
+    RETURNING id
+"#;
 
 /// Parse a `catch_up_policy` text value from the DB into the typed enum.
 /// Falls back to [`CatchUpPolicy::default`] for unknown / null values so
@@ -802,9 +854,19 @@ impl PgDb {
     }
 
     /// Create the task carrying `task.managed`'s key, or update the one that
-    /// already does -- one statement, `INSERT ... ON CONFLICT` on the managed
-    /// key's unique index, so two concurrent upserts of one key can never mint
-    /// two tasks (the exit-3 duplicate every bash installer had to detect).
+    /// already does. Two statements, chosen by what the caller read:
+    ///
+    /// - `expected_modified_at = Some(t)` (the caller read a row): a plain
+    ///   `UPDATE … WHERE <key> AND modified_at = t`. Zero rows — the row moved
+    ///   OR was deleted since the read — is [`ManagedUpsert::Conflict`]; it
+    ///   never falls through to an INSERT, so a task deleted mid-request is not
+    ///   resurrected (with the stored Script/probe the caller's refusal checks
+    ///   were made against).
+    /// - `None` (the caller read no row): `INSERT … ON CONFLICT <key> DO
+    ///   NOTHING`, on the managed key's unique index, so two concurrent
+    ///   creates of one key can never mint two tasks (the exit-3 duplicate
+    ///   every bash installer had to detect). A row that appeared since the
+    ///   read is [`ManagedUpsert::Conflict`].
     ///
     /// The key is the identity: an UNMANAGED task with the same name is never
     /// matched, read or written. On update the row keeps its `id`,
@@ -812,32 +874,34 @@ impl PgDb {
     /// (executor-owned); everything else, `managed_version` /
     /// `managed_digest` and `timezone` included, comes from `task`.
     ///
-    /// Like [`Self::update_scheduled_task`] the update is CONDITIONAL:
-    /// `expected_modified_at` is the stored row's `modified_at` the caller read
-    /// (`None` = it read no row). The existing row is updated only if it still
-    /// carries that value; otherwise nothing is written and the answer is
-    /// [`ManagedUpsert::Conflict`] -- a stale snapshot never overwrites a newer
-    /// change, and a caller that saw no row never overwrites one that appeared.
+    /// A missing or INVALID managed-key index makes the INSERT's arbiter
+    /// uninferable (SQLSTATE 42P10); that is
+    /// [`ManagedUpsertError::KeyIndexMissing`], not a generic failure.
     pub async fn upsert_managed_scheduled_task(
         &self,
         task: &ScheduledTask,
         expected_modified_at: Option<&str>,
-    ) -> Result<ManagedUpsert, String> {
+    ) -> Result<ManagedUpsert, ManagedUpsertError> {
+        use ManagedUpsertError::Other;
         if task.managed.is_none() {
-            return Err(format!(
+            return Err(Other(format!(
                 "upsert_managed_scheduled_task: task {} carries no managed key",
                 task.id
-            ));
+            )));
         }
-        let expected = expected_modified_at.map(parse_modified_at).transpose()?;
+        let expected = expected_modified_at
+            .map(parse_modified_at)
+            .transpose()
+            .map_err(Other)?;
         let conn = self
             .pool
             .get()
             .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
+            .map_err(|e| Other(format!("PG pool error: {}", e)))?;
         let (stype, svalue) = schedule_to_parts(&task.schedule);
+        let stype = stype.to_string();
         let task_config = serde_json::to_string(&task.task)
-            .map_err(|e| format!("Serialize task_config: {}", e))?;
+            .map_err(|e| Other(format!("Serialize task_config: {}", e)))?;
         let catch_up_policy_str = catch_up_policy_to_str(task.catch_up_policy).to_string();
         let catch_up_grace_seconds_i32: i32 =
             task.catch_up_grace_seconds.min(i32::MAX as u32) as i32;
@@ -845,14 +909,78 @@ impl PgDb {
             task.consecutive_launch_failures.min(i32::MAX as u32) as i32;
         let launch_failure_backoff_seconds_i32: i32 =
             task.launch_failure_backoff_seconds.min(i32::MAX as u32) as i32;
-        let conditions_json = conditions_to_json(task.conditions.as_ref())?;
+        let conditions_json = conditions_to_json(task.conditions.as_ref()).map_err(Other)?;
         let condition_status_text: Option<String> = task
             .condition_status
             .as_ref()
             .map(serde_json::to_string)
             .transpose()
-            .map_err(|e| format!("Serialize condition_status: {e}"))?;
+            .map_err(|e| Other(format!("Serialize condition_status: {e}")))?;
         let managed = ManagedColumns::of(task);
+        let created_at = task
+            .created_at
+            .parse::<DateTime<Utc>>()
+            .unwrap_or_else(|_| Utc::now());
+        let modified_at = task
+            .modified_at
+            .parse::<DateTime<Utc>>()
+            .unwrap_or_else(|_| Utc::now());
+        let next_run = task
+            .next_run
+            .as_deref()
+            .and_then(|s| s.parse::<DateTime<Utc>>().ok());
+        let failed = |e: tokio_postgres::Error| {
+            if e.code() == Some(&tokio_postgres::error::SqlState::INVALID_COLUMN_REFERENCE) {
+                ManagedUpsertError::KeyIndexMissing(format!(
+                    "PG upsert_managed_scheduled_task {}: {e}",
+                    task.id
+                ))
+            } else {
+                Other(format!("PG upsert_managed_scheduled_task {}: {e}", task.id))
+            }
+        };
+
+        if let Some(expected) = expected {
+            let row = conn
+                .query_opt(
+                    MANAGED_UPDATE_SQL,
+                    &[
+                        &task.name as &(dyn tokio_postgres::types::ToSql + Sync),
+                        &task.description,
+                        &task.enabled,
+                        &stype,
+                        &svalue,
+                        &task_config,
+                        &task.skip_if_completed,
+                        &task.auto_fix_on_failure,
+                        &task.success_criteria,
+                        &modified_at,
+                        &next_run,
+                        &catch_up_policy_str,
+                        &catch_up_grace_seconds_i32,
+                        &launch_failure_backoff_seconds_i32,
+                        &conditions_json,
+                        &condition_status_text,
+                        &managed.version,
+                        &managed.digest,
+                        &task.timezone,
+                        &managed.source,
+                        &managed.tenant_id,
+                        &managed.agent,
+                        &expected,
+                    ],
+                )
+                .await
+                .map_err(failed)?;
+            return match row {
+                None => Ok(ManagedUpsert::Conflict),
+                Some(row) => row
+                    .try_get::<_, String>(0)
+                    .map(ManagedUpsert::Updated)
+                    .map_err(|e| Other(format!("PG upsert_managed_scheduled_task id: {e}"))),
+            };
+        }
+
         let sql = format!(
             r#"
             INSERT INTO scheduled_tasks
@@ -868,30 +996,8 @@ impl PgDb {
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                     $11, $12, $13, NULL, $14, $15, $16, $17, $18, $19,
                     $20, ($21::text)::uuid, $22, $23, $24, $25)
-            ON CONFLICT {MANAGED_KEY_CONFLICT}
-            DO UPDATE SET
-                name = EXCLUDED.name,
-                description = EXCLUDED.description,
-                enabled = EXCLUDED.enabled,
-                schedule_type = EXCLUDED.schedule_type,
-                schedule_value = EXCLUDED.schedule_value,
-                task_config = EXCLUDED.task_config,
-                skip_if_completed = EXCLUDED.skip_if_completed,
-                auto_fix_on_failure = EXCLUDED.auto_fix_on_failure,
-                success_criteria = EXCLUDED.success_criteria,
-                modified_at = EXCLUDED.modified_at,
-                next_run = EXCLUDED.next_run,
-                catch_up_policy = EXCLUDED.catch_up_policy,
-                catch_up_grace_seconds = EXCLUDED.catch_up_grace_seconds,
-                launch_failure_backoff_seconds = EXCLUDED.launch_failure_backoff_seconds,
-                conditions = EXCLUDED.conditions,
-                condition_status = EXCLUDED.condition_status,
-                managed_version = EXCLUDED.managed_version,
-                managed_digest = EXCLUDED.managed_digest,
-                timezone = EXCLUDED.timezone
-            WHERE $26::timestamptz IS NOT NULL
-              AND scheduled_tasks.modified_at = $26::timestamptz
-            RETURNING id, (xmax = 0) AS inserted
+            ON CONFLICT {MANAGED_KEY_CONFLICT} DO NOTHING
+            RETURNING id
             "#
         );
         let row = conn
@@ -902,24 +1008,15 @@ impl PgDb {
                     &task.name,
                     &task.description,
                     &task.enabled,
-                    &stype.to_string(),
+                    &stype,
                     &svalue,
                     &task_config,
                     &task.skip_if_completed,
                     &task.auto_fix_on_failure,
                     &task.success_criteria,
-                    &task
-                        .created_at
-                        .parse::<DateTime<Utc>>()
-                        .unwrap_or_else(|_| Utc::now()),
-                    &task
-                        .modified_at
-                        .parse::<DateTime<Utc>>()
-                        .unwrap_or_else(|_| Utc::now()),
-                    &task
-                        .next_run
-                        .as_deref()
-                        .and_then(|s| s.parse::<DateTime<Utc>>().ok()),
+                    &created_at,
+                    &modified_at,
+                    &next_run,
                     &catch_up_policy_str,
                     &catch_up_grace_seconds_i32,
                     &consecutive_launch_failures_i32,
@@ -932,25 +1029,17 @@ impl PgDb {
                     &managed.version,
                     &managed.digest,
                     &task.timezone,
-                    &expected,
                 ],
             )
             .await
-            .map_err(|e| format!("PG upsert_managed_scheduled_task {}: {}", task.id, e))?;
-        let Some(row) = row else {
-            return Ok(ManagedUpsert::Conflict);
-        };
-        let id: String = row
-            .try_get(0)
-            .map_err(|e| format!("PG upsert_managed_scheduled_task id: {e}"))?;
-        let inserted: bool = row
-            .try_get(1)
-            .map_err(|e| format!("PG upsert_managed_scheduled_task inserted: {e}"))?;
-        Ok(if inserted {
-            ManagedUpsert::Created(id)
-        } else {
-            ManagedUpsert::Updated(id)
-        })
+            .map_err(failed)?;
+        match row {
+            None => Ok(ManagedUpsert::Conflict),
+            Some(row) => row
+                .try_get::<_, String>(0)
+                .map(ManagedUpsert::Created)
+                .map_err(|e| Other(format!("PG upsert_managed_scheduled_task id: {e}"))),
+        }
     }
 
     // ========================================================================
@@ -1630,28 +1719,107 @@ mod tests {
             );
         }
         assert!(
-            heal.contains("information_schema.columns") && heal.contains("pg_indexes"),
-            "the ALTER and the CREATE INDEX must each be existence-gated"
+            heal.contains("information_schema.columns")
+                && heal.contains("pg_index")
+                && heal.contains("indisvalid"),
+            "the ALTER and the CREATE INDEX must each be existence-gated, and an \
+             INVALID index must be rebuilt rather than skipped"
         );
+        assert!(heal.contains("DROP INDEX IF EXISTS project.uq_scheduled_tasks_managed_key"));
         let (_, upsert) = include_str!("scheduler.rs")
             .split_once("pub async fn upsert_managed_scheduled_task(")
             .expect("upsert");
-        assert!(upsert.contains("ON CONFLICT {MANAGED_KEY_CONFLICT}"));
-        assert!(upsert.contains("AND scheduled_tasks.modified_at = $26::timestamptz"));
+        let (upsert, _) = upsert
+            .split_once("// Execution helpers (single-column updates)")
+            .expect("upsert ends");
+        assert!(upsert.contains("ON CONFLICT {MANAGED_KEY_CONFLICT} DO NOTHING"));
+        assert!(
+            !upsert.contains("DO UPDATE") && !upsert.contains("xmax"),
+            "a read row is updated by a conditional UPDATE, never an INSERT fall-through"
+        );
+        assert!(upsert.contains("INVALID_COLUMN_REFERENCE"));
     }
 
-    /// A user PUT never writes the managed key.
+    /// The managed UPDATE writes every non-key managed column and timezone,
+    /// and is keyed on all three key columns AND the modified_at read.
+    #[test]
+    fn the_managed_update_writes_every_managed_column_and_is_conditional() {
+        let sql = MANAGED_UPDATE_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for set in [
+            "managed_version = $17,",
+            "managed_digest = $18,",
+            "timezone = $19",
+        ] {
+            assert!(sql.contains(set), "missing SET {set}: {sql}");
+        }
+        assert!(sql.contains(
+            "WHERE managed_source = $20 AND managed_tenant_id = ($21::text)::uuid \
+             AND managed_agent = $22 AND modified_at = $23 RETURNING id"
+        ));
+        // The key columns are the WHERE, never a SET target.
+        for key in ["managed_source =", "managed_tenant_id =", "managed_agent ="] {
+            let (set_list, _) = sql.split_once(" WHERE ").unwrap();
+            assert!(!set_list.contains(key), "{key} must not be rewritten");
+        }
+        // The INSERT names all six columns, binding the tenant through a UUID cast.
+        let (_, insert) = include_str!("scheduler.rs")
+            .split_once("pub async fn upsert_managed_scheduled_task(")
+            .unwrap();
+        let insert = insert.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(insert.contains(
+            "managed_source, managed_tenant_id, managed_agent, managed_version, managed_digest, timezone)"
+        ));
+        assert!(insert.contains("$20, ($21::text)::uuid, $22, $23, $24, $25)"));
+    }
+
+    /// A user PUT never writes the managed key; it writes timezone. The plain
+    /// insert writes all six columns.
     #[test]
     fn the_user_update_does_not_write_the_managed_key() {
-        let (_, body) = include_str!("scheduler.rs")
+        let src = include_str!("scheduler.rs");
+        let (_, body) = src
             .split_once("pub async fn update_scheduled_task(")
             .expect("update");
         let (body, _) = body
             .split_once("pub async fn delete_scheduled_task(")
             .expect("update ends");
-        assert!(!body.contains("managed_source ="));
-        assert!(!body.contains("managed_version ="));
+        for column in [
+            "managed_source",
+            "managed_tenant_id",
+            "managed_agent",
+            "managed_version",
+            "managed_digest",
+        ] {
+            assert!(
+                !body.contains(column),
+                "the user update must not name {column}"
+            );
+        }
         assert!(body.contains("timezone = $20"));
+        let (_, insert) = src
+            .split_once("pub async fn insert_scheduled_task(")
+            .expect("insert");
+        let (insert, _) = insert
+            .split_once("pub async fn update_scheduled_task(")
+            .expect("insert ends");
+        let insert = insert.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(insert.contains(
+            "managed_source, managed_tenant_id, managed_agent, managed_version, managed_digest, timezone)"
+        ));
+        assert!(insert.contains("$21, ($22::text)::uuid, $23, $24, $25, $26)"));
+        for bind in [
+            "&managed.source,",
+            "&managed.tenant_id,",
+            "&managed.agent,",
+            "&managed.version,",
+            "&managed.digest,",
+            "&task.timezone,",
+        ] {
+            assert!(insert.contains(bind), "insert must bind {bind}");
+        }
     }
 
     // PG-gated, per the `database/pg/*` convention (see event_log.rs):
@@ -1953,6 +2121,26 @@ mod tests {
             ManagedUpsert::Conflict
         );
 
+        // Deleted mid-request: the caller read a row (expected = Some), the
+        // row is gone by the write. That is a Conflict and NOTHING is
+        // recreated — no INSERT fall-through.
+        let read_before_delete = db.get_scheduled_task(&task.id).await.unwrap().unwrap();
+        db.delete_scheduled_task(&task.id).await.expect("delete");
+        let mut resurrect = read_before_delete.clone();
+        resurrect.touch();
+        assert_eq!(
+            db.upsert_managed_scheduled_task(&resurrect, Some(&read_before_delete.modified_at))
+                .await
+                .unwrap(),
+            ManagedUpsert::Conflict
+        );
+        assert!(db
+            .get_stored_scheduled_task_by_managed_key("coord", TENANT, &agent)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db.get_scheduled_task(&task.id).await.unwrap().is_none());
+
         // The unmanaged same-name task was never touched.
         let untouched = db.get_scheduled_task(&plain.id).await.unwrap().unwrap();
         assert_eq!(untouched.modified_at, unmanaged.modified_at);
@@ -1967,7 +2155,10 @@ mod tests {
             .into_iter()
             .filter(|t| t.name == name)
             .count();
-        assert_eq!(same_name, 2, "one unmanaged + one managed, never merged");
+        assert_eq!(
+            same_name, 1,
+            "only the unmanaged task: the deleted managed one was not recreated"
+        );
 
         // An unmanaged task is not upsertable.
         assert!(db

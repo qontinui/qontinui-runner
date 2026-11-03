@@ -1083,7 +1083,8 @@ impl PgDb {
         // as `conditions` above: an embedded Postgres never runs alembic, and
         // every scheduled-task query now names these columns. Same gating:
         // the ALTER runs only when the table exists AND a column is missing,
-        // the CREATE INDEX only when the table exists AND the index is absent,
+        // the CREATE INDEX only when the table exists AND no VALID index of
+        // that name exists (an invalid one is dropped first),
         // so a warm boot takes no lock. The index spells alembic's predicate
         // EXACTLY — the managed upsert's `ON CONFLICT` (MANAGED_KEY_CONFLICT in
         // `scheduler.rs`) must infer it as the arbiter. Not CONCURRENTLY: a DO
@@ -1109,13 +1110,29 @@ impl PgDb {
                      ADD COLUMN IF NOT EXISTS managed_digest TEXT,
                      ADD COLUMN IF NOT EXISTS timezone TEXT;
                END IF;
+               -- An INVALID index (a killed CREATE INDEX CONCURRENTLY, e.g.
+               -- alembic's) is listed by pg_indexes but is no ON CONFLICT
+               -- arbiter: drop it so the CREATE below rebuilds it.
+               IF EXISTS (
+                 SELECT 1 FROM pg_index i
+                 JOIN pg_class c ON c.oid = i.indexrelid
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = 'project'
+                   AND c.relname = 'uq_scheduled_tasks_managed_key'
+                   AND NOT i.indisvalid
+               ) THEN
+                 DROP INDEX IF EXISTS project.uq_scheduled_tasks_managed_key;
+               END IF;
                IF EXISTS (
                  SELECT 1 FROM information_schema.tables
                  WHERE table_schema = 'project' AND table_name = 'scheduled_tasks'
                ) AND NOT EXISTS (
-                 SELECT 1 FROM pg_indexes
-                 WHERE schemaname = 'project'
-                   AND indexname = 'uq_scheduled_tasks_managed_key'
+                 SELECT 1 FROM pg_index i
+                 JOIN pg_class c ON c.oid = i.indexrelid
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = 'project'
+                   AND c.relname = 'uq_scheduled_tasks_managed_key'
+                   AND i.indisvalid
                ) THEN
                  CREATE UNIQUE INDEX IF NOT EXISTS uq_scheduled_tasks_managed_key
                      ON project.scheduled_tasks (managed_source, managed_tenant_id, managed_agent)

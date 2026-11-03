@@ -1062,14 +1062,19 @@ impl SchedulerService {
 
         let now = Utc::now();
         let zone = self.schedule_zone().await;
-        let normal_next = match compute_task_next_run(&task, now, zone) {
-            Ok(next) => next,
+        // An unusable task zone stores NO next run at all — not now+backoff:
+        // the task must not fire again until its timezone is corrected (the
+        // same rule every other next_run site applies).
+        let next_run = match compute_task_next_run(&task, now, zone) {
+            Ok(normal_next) => compute_launch_failed_next_run(normal_next, backoff, now),
             Err(e) => {
-                error!("apply_launch_failure_backoff: task {task_id} has an unusable {e}; backing off without a scheduled next run");
+                error!(
+                    "apply_launch_failure_backoff: task {task_id} has an unusable {e}; \
+                     storing no next run (no backoff retry) until it is corrected"
+                );
                 None
             }
         };
-        let next_run = compute_launch_failed_next_run(normal_next, backoff, now);
         let backoff_seconds = backoff.map(|d| d.num_seconds()).unwrap_or(0);
         warn!(
             task_id = %task_id,
