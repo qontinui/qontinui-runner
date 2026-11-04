@@ -384,10 +384,12 @@ const STUB_ZONE_FACTS: ZoneViewFacts = {
  * `zoneViewSignature("restore", …)` resolves as the restore signature.
  */
 const STUB_ARGS: Record<string, unknown[]> = {
-  zoneViewSignature: [undefined, STUB_ZONE_FACTS],
-  popOutPageSignature: ["default", 1],
-  selectLayoutSignature: [1],
-  loadProfileSignature: [{}, 0],
+  zoneViewSignature: [undefined, { current: STUB_ZONE_FACTS }],
+  popOutPageSignature: [{ current: { activePageId: "default", activePageTerminals: 1 } }],
+  popOutActiveTerminalSignature: [{ current: null }],
+  moveTerminalSignature: [{ current: null }],
+  selectLayoutSignature: [{ current: 1 }],
+  loadProfileSignature: [{ current: { profiles: {}, liveTabCount: 0 } }],
   workModeSignature: [() => "grid"],
 };
 
