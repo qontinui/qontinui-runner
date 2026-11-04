@@ -112,6 +112,13 @@ fn latest_cell() -> &'static Mutex<Option<BuildDriftStatus>> {
 
 /// The repo-relative paths that may declare the four consts, tried in order.
 ///
+/// Since plan
+/// `2026-11-04-runner-generated-and-ledger-files-are-merge-neutral-and-land-behind-a-drain`
+/// Phase 3a the consts are GENERATED from [`TOOL_POLICY_DIR_ROOTS`] and no
+/// source file declares them, so this list is the SECOND arm of
+/// [`tool_policy_from_listing_or_source`]: it is what still reads a trunk that
+/// predates that cutover. It can be deleted once no supported trunk does.
+///
 /// The split of `mcp_api.rs` (plan
 /// `2026-10-04-runner-mcp-api-rs-holds-the-http-composition-root-health-and-five-proxies-in-one-file`
 /// D4) moves the consts to `mcp_api/coord_mcp_proxy/tool_policy.rs`, so that
@@ -320,6 +327,108 @@ fn resolve_trunk_tip(repo: &Path) -> Option<(String, &'static str)> {
     None
 }
 
+/// Where the one-file-per-entry layout keeps the policy lists (plan
+/// `2026-11-04-runner-generated-and-ledger-files-are-merge-neutral-and-land-behind-a-drain`
+/// Phase 3a): `<root>/<list>/<name>.md`, and `build.rs` generates the consts
+/// from it. Spelled from the runner repo root first and the `src-tauri` crate
+/// root second, as [`TOOL_POLICY_SOURCE_PATHS`] is.
+pub(crate) const TOOL_POLICY_DIR_ROOTS: &[&str] = &["src-tauri/coord-mcp-proxy", "coord-mcp-proxy"];
+
+/// The four list directories the trunk reader needs, in [`ParsedToolPolicy`]
+/// field order. `allowed-methods/` is not one: methods play no part in a
+/// refusal's `cause`.
+const TOOL_POLICY_LIST_DIRS: [&str; 4] = [
+    "allowed-tools",
+    "allowed-tool-prefixes",
+    "deliberate-exclusions",
+    "deliberate-exclusion-prefixes",
+];
+
+/// The tool policy from a recursive listing of [`TOOL_POLICY_DIR_ROOTS`] —
+/// repo-relative FILE paths, as `git ls-tree -r --full-tree --name-only`
+/// prints them. Pure over its input, so the working-tree self-test and the
+/// git-backed fixture test drive the same function production runs.
+///
+/// An entry is a list directory's `<name>.md`, minus `.md`; `README.md` is
+/// not an entry, but it is what makes a directory with no entries exist in
+/// git, so all four list directories must appear for a root to count. The
+/// name grammar is `build.rs`'s (`^[a-z0-9_/.-]+$`, no sub-directory in
+/// these four lists). `None` when no root carries all four directories, or
+/// when one carries a file NAME that grammar refuses — UNKNOWN, never a
+/// best-effort guess. It checks names only, not entry bodies or front
+/// matter: it labels refusals, it grants nothing, and `build.rs` is what
+/// refuses a malformed body (a trunk that cannot build is classified from
+/// its names regardless).
+pub(crate) fn tool_policy_from_listing(paths: &[String]) -> Option<ParsedToolPolicy> {
+    fn valid(name: &str) -> bool {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-".contains(&b))
+    }
+    for root in TOOL_POLICY_DIR_ROOTS {
+        let mut lists: [Option<Vec<String>>; 4] = Default::default();
+        for path in paths {
+            let Some(rest) = path.strip_prefix(root).and_then(|r| r.strip_prefix('/')) else {
+                continue;
+            };
+            let Some((dir, file)) = rest.split_once('/') else {
+                continue; // a file directly under the root, e.g. its README.md
+            };
+            let Some(slot) = TOOL_POLICY_LIST_DIRS.iter().position(|d| *d == dir) else {
+                continue; // `allowed-methods/` and anything else
+            };
+            let names = lists[slot].get_or_insert_with(Vec::new);
+            if file == "README.md" {
+                continue;
+            }
+            match file.strip_suffix(".md") {
+                Some(name) if valid(name) => names.push(name.to_string()),
+                _ => return None,
+            }
+        }
+        if let [Some(mut allowed), Some(mut allowed_prefixes), Some(mut deliberate), Some(mut deliberate_prefixes)] =
+            lists
+        {
+            for v in [
+                &mut allowed,
+                &mut allowed_prefixes,
+                &mut deliberate,
+                &mut deliberate_prefixes,
+            ] {
+                v.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            }
+            return Some(ParsedToolPolicy {
+                allowed,
+                allowed_prefixes,
+                deliberate,
+                deliberate_prefixes,
+            });
+        }
+    }
+    None
+}
+
+/// The tool policy from the directory layout when `listing` carries it, else
+/// from the first source file that declares the consts. Production
+/// ([`read_trunk_tool_policy`]) and the working-tree self-test both select
+/// through this, so the test cannot pass on a path production would not take.
+///
+/// The directory reader goes FIRST and the source parse SECOND: a trunk
+/// after the cutover has the directories and an `mcp_api.rs` without the
+/// consts, a trunk before it has only the consts, and this binary must read
+/// either. Without the source arm, every box built after the cutover would
+/// read a pre-cutover trunk as `cause: "unknown"`; without the directory arm,
+/// every box would read a post-cutover trunk that way.
+pub(crate) fn tool_policy_from_listing_or_source(
+    listing: Option<Vec<String>>,
+    read: impl Fn(&str) -> Option<String>,
+) -> Option<ParsedToolPolicy> {
+    listing
+        .and_then(|paths| tool_policy_from_listing(&paths))
+        .or_else(|| first_parsable_tool_policy(read))
+}
+
 /// The tool policy from the first of [`TOOL_POLICY_SOURCE_PATHS`] that is
 /// readable through `read` AND parses. `None` when no path does.
 ///
@@ -336,10 +445,15 @@ pub(crate) fn first_parsable_tool_policy(
         .find_map(|p| read(p).and_then(|text| parse_tool_policy_consts(&text)))
 }
 
-/// Read trunk's tool policy at an already-resolved tip, from whichever of
-/// [`TOOL_POLICY_SOURCE_PATHS`] declares it. `None` when no path is readable
-/// at that sha with the consts parsing — the caller keeps the sha regardless
-/// (see [`resolve_trunk_tip`]).
+/// Read trunk's tool policy at an already-resolved tip: from the
+/// [`TOOL_POLICY_DIR_ROOTS`] directory layout when trunk has it, else from
+/// whichever of [`TOOL_POLICY_SOURCE_PATHS`] declares the consts
+/// ([`tool_policy_from_listing_or_source`]). `None` when neither reads — the
+/// caller keeps the sha regardless (see [`resolve_trunk_tip`]).
+///
+/// The directory listing is ONE `git ls-tree -r` whose exit is 0 with empty
+/// output when trunk predates the layout, so a pre-cutover trunk costs one
+/// quiet call and no WARN before the source arm runs.
 ///
 /// Only paths [`present_tool_policy_paths`] lists are `git show`n. Most of the
 /// list is ABSENT on any given trunk (the split's new path before the move,
@@ -360,9 +474,13 @@ fn read_trunk_tool_policy(
     trunk_sha: &str,
     source: &'static str,
 ) -> Option<TrunkToolPolicy> {
-    let present = present_tool_policy_paths(repo, trunk_sha)?;
-    let policy = first_parsable_tool_policy(|p| {
-        if present.iter().any(|q| q == p) {
+    let listing = trunk_tool_policy_listing(repo, trunk_sha);
+    // Listed lazily: on a post-cutover trunk the directory arm answers and
+    // the source listing is never run.
+    let present = std::cell::OnceCell::new();
+    let policy = tool_policy_from_listing_or_source(listing, |p| {
+        let present = present.get_or_init(|| present_tool_policy_paths(repo, trunk_sha));
+        if present.as_ref()?.iter().any(|q| q == p) {
             git_output(repo, &["show", &format!("{trunk_sha}:{p}")])
         } else {
             None
@@ -374,6 +492,22 @@ fn read_trunk_tool_policy(
         source,
         policy,
     })
+}
+
+/// Every file under [`TOOL_POLICY_DIR_ROOTS`] at `trunk_sha`, recursively, in
+/// ONE git call whose exit is 0 whether or not the directories exist. `None`
+/// when the listing fails or is empty (a trunk that predates the layout).
+fn trunk_tool_policy_listing(repo: &Path, trunk_sha: &str) -> Option<Vec<String>> {
+    let mut args = vec![
+        "ls-tree",
+        "-r",
+        "--full-tree",
+        "--name-only",
+        trunk_sha,
+        "--",
+    ];
+    args.extend_from_slice(TOOL_POLICY_DIR_ROOTS);
+    git_output(repo, &args).map(|listing| listing.lines().map(str::to_string).collect())
 }
 
 /// Which of [`TOOL_POLICY_SOURCE_PATHS`] exist at `trunk_sha`, in ONE git call
@@ -1019,6 +1153,98 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
         assert_eq!(p.allowed_prefixes, vec!["coord_query_"]);
     }
 
+    /// The directory layout (plan
+    /// `2026-11-04-runner-generated-and-ledger-files-are-merge-neutral-and-land-behind-a-drain`
+    /// Phase 3a) as `git ls-tree -r` lists it.
+    fn dir_listing(root: &str) -> Vec<String> {
+        [
+            "README.md",
+            "allowed-methods/README.md",
+            "allowed-methods/notifications/cancelled.md",
+            "allowed-methods/ping.md",
+            "allowed-tool-prefixes/README.md",
+            "allowed-tool-prefixes/coord_query_.md",
+            "allowed-tools/README.md",
+            "allowed-tools/coord_beta.md",
+            "allowed-tools/coord_alpha.md",
+            "allowed-tools/coord_gamma.md",
+            "deliberate-exclusion-prefixes/README.md",
+            "deliberate-exclusion-prefixes/coord_onboard.md",
+            "deliberate-exclusions/README.md",
+            "deliberate-exclusions/coord_create_pr.md",
+        ]
+        .iter()
+        .map(|f| format!("{root}/{f}"))
+        .collect()
+    }
+
+    #[test]
+    fn reads_the_policy_from_the_directory_layout() {
+        for root in TOOL_POLICY_DIR_ROOTS {
+            let p = tool_policy_from_listing(&dir_listing(root)).expect("the layout reads");
+            assert_eq!(p.allowed, vec!["coord_alpha", "coord_beta", "coord_gamma"]);
+            assert_eq!(p.allowed_prefixes, vec!["coord_query_"]);
+            assert_eq!(p.deliberate, vec!["coord_create_pr"]);
+            assert_eq!(p.deliberate_prefixes, vec!["coord_onboard"]);
+        }
+        // A list directory holding only its README is an EMPTY list, not a
+        // missing one.
+        let only_readme: Vec<String> = dir_listing("src-tauri/coord-mcp-proxy")
+            .into_iter()
+            .filter(|p| !p.ends_with("coord_onboard.md"))
+            .collect();
+        let p = tool_policy_from_listing(&only_readme).expect("an empty list still reads");
+        assert!(p.deliberate_prefixes.is_empty());
+    }
+
+    /// A missing list directory, or a file `build.rs` would refuse, is
+    /// UNKNOWN — never a list with a hole in it.
+    #[test]
+    fn a_partial_or_malformed_layout_is_none() {
+        let root = "src-tauri/coord-mcp-proxy";
+        let missing: Vec<String> = dir_listing(root)
+            .into_iter()
+            .filter(|p| !p.contains("/deliberate-exclusions/"))
+            .collect();
+        assert!(tool_policy_from_listing(&missing).is_none());
+        for bad in [
+            "allowed-tools/Coord_X.md",
+            "allowed-tools/coord_x.txt",
+            "allowed-tools/sub/coord_x.md",
+        ] {
+            let mut listing = dir_listing(root);
+            listing.push(format!("{root}/{bad}"));
+            assert!(
+                tool_policy_from_listing(&listing).is_none(),
+                "{bad} must be refused"
+            );
+        }
+        assert!(tool_policy_from_listing(&[]).is_none());
+    }
+
+    /// The directory arm goes FIRST: with both layouts present (the cutover
+    /// commit itself, or a stale copy of the consts) the directories win, and
+    /// without them the source parse still answers.
+    #[test]
+    fn the_directory_layout_is_read_before_the_source_consts() {
+        let read = tree(&[(
+            "src-tauri/src/mcp_api.rs",
+            &SAMPLE.replace("coord_alpha", "coord_from_source"),
+        )]);
+        let p = tool_policy_from_listing_or_source(
+            Some(dir_listing("src-tauri/coord-mcp-proxy")),
+            &read,
+        )
+        .expect("reads");
+        assert_eq!(p.allowed[0], "coord_alpha", "the directories win");
+        let p = tool_policy_from_listing_or_source(None, &read).expect("the source arm answers");
+        assert_eq!(p.allowed[0], "coord_from_source");
+        // A listing that does not carry the layout falls through to the source.
+        let p = tool_policy_from_listing_or_source(Some(vec!["README.md".to_string()]), &read)
+            .expect("the source arm answers");
+        assert_eq!(p.allowed[0], "coord_from_source");
+    }
+
     /// No path parses: UNKNOWN, never a guess.
     #[test]
     fn no_parsable_path_is_none() {
@@ -1097,6 +1323,33 @@ const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
             read.policy.allowed,
             vec!["coord_alpha", "coord_beta", "coord_gamma"]
         );
+    }
+
+    /// A post-cutover trunk end to end through `git ls-tree`: the directories
+    /// are read, and `mcp_api.rs` — still present, without the consts — does
+    /// not hide them.
+    #[test]
+    fn read_trunk_tool_policy_reads_the_directory_layout_through_git() {
+        let mut files: Vec<(String, String)> = dir_listing("src-tauri/coord-mcp-proxy")
+            .into_iter()
+            .map(|p| (p, "rationale\n".to_string()))
+            .collect();
+        files.push((
+            "src-tauri/src/mcp_api.rs".to_string(),
+            "include!(concat!(env!(\"OUT_DIR\"), \"/coord_mcp_lists.rs\"));\n".to_string(),
+        ));
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(p, t)| (p.as_str(), t.as_str()))
+            .collect();
+        let (dir, sha) = git_fixture(&refs);
+        let read = read_trunk_tool_policy(dir.path(), &sha, "fetched")
+            .expect("the directory layout is read through git ls-tree");
+        assert_eq!(
+            read.policy.allowed,
+            vec!["coord_alpha", "coord_beta", "coord_gamma"]
+        );
+        assert_eq!(read.policy.deliberate_prefixes, vec!["coord_onboard"]);
     }
 
     /// The PRE-split trunk every box reads today: the consts are in

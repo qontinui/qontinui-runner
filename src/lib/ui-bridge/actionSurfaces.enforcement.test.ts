@@ -48,6 +48,7 @@ import {
   isFixtureFile,
   sourceFiles,
   registryHandlerCallSites,
+  formCounts,
   renderInventory,
   scanTree,
   unresolvedDelegates,
@@ -471,7 +472,41 @@ describe("UI Bridge action surfaces — the inventory", () => {
     // A diff here is not a failure to fix by re-generating without reading it:
     // it is the list of action surfaces this app exposes to the wire, and a
     // new line in it is a new thing an agent can invoke.
-    expect(rendered).toBe(readFileSync(GOLDEN, "utf8").split("\r\n").join("\n"));
+    // The golden carries no count line (renderInventory's doc comment says
+    // why), so the tally is printed here, where a reader of a red sees it.
+    expect(
+      rendered,
+      `the action-surface inventory changed — this tree has ${formCounts(SURFACES)}`,
+    ).toBe(readFileSync(GOLDEN, "utf8").split("\r\n").join("\n"));
+  });
+
+  // The golden is keyed on the surface's IDENTITY, never on where it happens
+  // to sit today. Without this, `:${s.line}` can come back in one character
+  // and the only thing that notices is the next three unrelated PRs.
+  it("carries no line coordinate, so an edit ABOVE a surface cannot red it", () => {
+    const rows = renderInventory(SURFACES)
+      .split("\n")
+      .filter((l) => l && !l.startsWith("#"));
+    expect(rows.length).toBeGreaterThan(50); // non-vacuity: there are rows to check
+    const keyed = rows.filter((l) => /^[^\t]*:\d+\t/.test(l));
+    expect(keyed).toEqual([]);
+    // Nor may the line come back as a column of its own: every row is exactly
+    // the seven identity fields.
+    const misshapen = rows.filter((l) => l.split("\t").length !== 7);
+    expect(misshapen).toEqual([]);
+  });
+
+  // Duplicates are the reason no occurrence ordinal is needed: the document is
+  // compared whole, so N identical rows and N-1 identical rows differ. If this
+  // ever became a dedupe, a second identical surface would land silently.
+  it("keeps duplicate identity rows rather than folding them", () => {
+    const rows = renderInventory(SURFACES)
+      .split("\n")
+      .filter((l) => l && !l.startsWith("#"));
+    expect(rows.length).toBe(SURFACES.length);
+    // Non-vacuity: the tree really does hold repeated identity rows, so the
+    // length check above is exercising the case it exists for.
+    expect(new Set(rows).size).toBeLessThan(rows.length);
   });
 });
 

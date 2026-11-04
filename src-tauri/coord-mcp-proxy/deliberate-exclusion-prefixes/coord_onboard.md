@@ -1,0 +1,17 @@
+Deliberately-excluded FAMILIES by prefix. `coord_onboard` is deliberately
+short of a trailing underscore so it covers both the `coord_onboard_*` calls
+and `coord_onboarding_doctor`, which the exclusion note treats as one family.
+
+DELIBERATELY EXCLUDED (add only with a security rationale): the onboarding
+/ enrollment family (`coord_onboard_*`, `coord_onboarding_doctor`,
+`coord_enroll_repo`), privilege escalation (`coord_attest_escalate_override`,
+`coord_attest_advisory_ci_override`), merge authority (`coord_request_merge`,
+`coord_cancel_merge`, `coord_pr_merge_verdict`, `coord_pr_merge_profile`,
+`coord_set_pr_draft`), code publication (`coord_create_pr`,
+`coord_push_to_branch`, `coord_push_credential` — sessions open PRs via the
+dedicated `/vcs/pull-requests` loopback route, not this proxy), reservations
+(`coord_migration_reserve`, `coord_reserve_resource`), policy/state
+mutation (`coord_request_policy`, `coord_flag_state`, `coord_flag_states`),
+and per-agent levers coord would also hand to every un-curated agent
+(`coord_fleet_drain`, `coord_fleet_undrain`, `coord_fleet_drain_host`,
+`coord_fleet_undrain_host`).

@@ -1,0 +1,1 @@
+os_bound_tooling	is_claude_program	c548d789ac2ea532

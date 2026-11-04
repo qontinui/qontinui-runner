@@ -21,16 +21,27 @@
 //! with `#[expect(<lint>, reason = …)]`, inserted by
 //! `scripts/row-get-expect-sweep.py --lint <lint>` (run once per required
 //! clippy leg — ubuntu and `x86_64-pc-windows-msvc`) or by hand where the sweep
-//! cannot attribute a site to an item, and this module pins each
-//! attribute count as a CEILING: it only falls. A fn that migrates (to
-//! `try_get`; to `str::get` / `char_indices` / `str_utils::truncate_str`) must
-//! drop its attribute — `unfulfilled_lint_expectations`, also `deny`, reds the
-//! build otherwise — and then lower that entry's `baseline` here.
+//! cannot attribute a site to an item, and this module pins each FILE's
+//! attribute count in a per-lint LEDGER, `src-tauri/expect-ratchet/<lint>.tsv`
+//! (sorted `<file><TAB><count>` lines): the count only falls. A fn that
+//! migrates (to `try_get`; to `str::get` / `char_indices` /
+//! `str_utils::truncate_str`) must drop its attribute —
+//! `unfulfilled_lint_expectations`, also `deny`, reds the build otherwise — and
+//! then lower that file's ledger line (or delete it at zero).
+//!
+//! The ledger is per file, not one total per lint, because a total is a cell
+//! every PR that migrates a site rewrites: two such PRs conflicted on it
+//! whatever files they touched. Now two PRs conflict only where they touch the
+//! same file's line, as they would on the source. Plan
+//! `2026-11-04-runner-generated-and-ledger-files-are-merge-neutral-and-land-behind-a-drain`,
+//! Phase 2b, which also made a FALL fail until its line is lowered (a total
+//! only printed it), so a gain is held the way an exact ratchet holds it.
 //!
 //! Three source-scan tests, DB-free, over the same directories the sweep
 //! counts, each iterating the table:
 //!
-//! 1. the attribute count is `<= baseline`, and non-vacuously `> 0`;
+//! 1. every file's attribute count equals its ledger line (above is a new
+//!    grandfathered site; below is a gain to hold), and non-vacuously `> 0`;
 //! 2. no `#[allow(<lint>` and no inner (`#![…]`) expectation anywhere — an
 //!    `allow` never fires the unfulfilled-expectation check, and a crate- or
 //!    module-level attribute leaves a whole file open to new sites;
@@ -60,11 +71,6 @@ mod tests {
         /// sweep-script cross-reference — the classifier matches the lint name
         /// anywhere in the attribute's lint list, deliberately.
         expect_needle: &'static str,
-        /// The ceiling — the number of item-level `#[expect(<lint>, …)]`
-        /// attributes the sweep placed when the gate landed. **Lower it when
-        /// you migrate a fn; never raise it.** A new site is not grandfathered
-        /// — it is a deny error until it is rewritten.
-        baseline: usize,
         /// `(file relative to the repo root, needle)` pairs that must each
         /// appear in that file's non-comment lines for the gate to count as
         /// wired.
@@ -80,17 +86,6 @@ mod tests {
         Ratchet {
             lint: "clippy::disallowed_methods",
             expect_needle: "#[expect(clippy::disallowed_methods",
-            // 537 -> 536: qontinui_specs.rs `table_exists` migrated to
-            // try_get (plan 2026-05-14-atlas-wave-6-triage).
-            // 536 -> 535: task_run_events.rs `count_task_run_table` deleted —
-            // the per-run log pages carry a window count (plan
-            // 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus, 5b).
-            // 535 -> 533: pr_watch_ops.rs `upsert_pr_watch_state` and
-            // `get_pr_watch_token_for_task` deleted with the plaintext PR-watch
-            // token slot (coord finding e871ac27).
-            // 533 -> 531: `get_active_pr_watches` and `has_review_subtask_for_pr`
-            // deleted with the PR-watch chain, which had no writer left.
-            baseline: 531,
             gate_wiring: &[
                 ("clippy.toml", "disallowed-methods"),
                 ("clippy.toml", "tokio_postgres::Row::get"),
@@ -117,17 +112,6 @@ mod tests {
         Ratchet {
             lint: "clippy::string_slice",
             expect_needle: "#[expect(clippy::string_slice",
-            // 435 -> 434: graphql `task_run_output` moved to char-boundary
-            // `str::get` slicing in `graphql::output_page` (plan
-            // 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus, 5b).
-            // 434 -> 428: pr_watcher.rs `poll_active_prs` and review_subtask.rs
-            // `process_review_outcome` lost their only slices when the per-watch
-            // token and the GitHub review post were deleted (coord finding
-            // e871ac27), 430 -> 428 measured. The other 4 were slack left when
-            // 93a2ca093 pinned 434 against a measured 430.
-            // 428 -> 424: the PR-watch chain deleted, which took 2 attributes;
-            // the other 2 were slack, 426 measured before the deletion.
-            baseline: 424,
             gate_wiring: &[
                 ("src-tauri/Cargo.toml", "string_slice = { level = \"deny\""),
                 (
@@ -156,7 +140,6 @@ mod tests {
         Ratchet {
             lint: "clippy::disallowed_types",
             expect_needle: "#[expect(clippy::disallowed_types",
-            baseline: 10,
             gate_wiring: &[
                 ("clippy.toml", "disallowed-types"),
                 ("clippy.toml", "tokio::runtime::Runtime"),
@@ -178,6 +161,108 @@ mod tests {
         fn bare_lint(&self) -> &'static str {
             self.lint.strip_prefix("clippy::").unwrap_or(self.lint)
         }
+
+        /// This lint's ledger, relative to the repo root.
+        fn ledger_path(&self) -> String {
+            format!("{LEDGER_DIR}/{}.tsv", self.bare_lint())
+        }
+    }
+
+    /// Where the per-lint ledgers live, relative to the repo root.
+    const LEDGER_DIR: &str = "src-tauri/expect-ratchet";
+
+    /// A lint's ledger: `<file relative to the repo root>` -> the number of
+    /// `#[expect]` attributes it may carry. The file is hand-edited, so its
+    /// shape is checked: sorted, unique, `<file><TAB><count>` with count > 0.
+    fn read_ledger(text: &str) -> Result<std::collections::BTreeMap<String, usize>, String> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut prev: Option<&str> = None;
+        for (i, line) in text.lines().enumerate() {
+            let at = i + 1;
+            let Some((file, n)) = line.split_once('\t') else {
+                return Err(format!("line {at}: {line:?} is not `<file><TAB><count>`"));
+            };
+            let n: usize = n
+                .parse()
+                .map_err(|e| format!("line {at}: count {n:?} for {file}: {e}"))?;
+            if n == 0 {
+                return Err(format!("line {at}: {file} has count 0 — delete the line"));
+            }
+            if prev.is_some_and(|p| p >= file) {
+                return Err(format!(
+                    "line {at}: {file} is out of order or repeated (`LC_ALL=C sort`)"
+                ));
+            }
+            prev = Some(file);
+            out.insert(file.to_string(), n);
+        }
+        Ok(out)
+    }
+
+    /// The exact per-file ratchet. `Err` names every file whose count moved
+    /// and the ledger line it needs.
+    fn check_ledger(
+        lint: &str,
+        needle: &str,
+        ledger_path: &str,
+        measured: &std::collections::BTreeMap<String, usize>,
+        ledger: &std::collections::BTreeMap<String, usize>,
+    ) -> Result<(), String> {
+        let files: std::collections::BTreeSet<&String> =
+            measured.keys().chain(ledger.keys()).collect();
+        let (mut above, mut below) = (Vec::new(), Vec::new());
+        for f in files {
+            let (got, allowed) = (
+                measured.get(f).copied().unwrap_or(0),
+                ledger.get(f).copied().unwrap_or(0),
+            );
+            if got > allowed {
+                above.push(format!("{f}: {got} > {allowed}"));
+            } else if got < allowed {
+                below.push(if got == 0 {
+                    format!("{f}: 0 < {allowed} — delete the line `{f}\t{allowed}`")
+                } else {
+                    format!("{f}: {got} < {allowed} — make the line `{f}\t{got}`")
+                });
+            }
+        }
+        let mut msg = Vec::new();
+        if !above.is_empty() {
+            msg.push(format!(
+                "{lint}: `{needle}` count ABOVE its {ledger_path} line — a new site was \
+                 grandfathered with an `#[expect]` instead of being rewritten; rewrite it \
+                 (the ledger only falls):\n    {}",
+                above.join("\n    ")
+            ));
+        }
+        if !below.is_empty() {
+            msg.push(format!(
+                "{lint}: `{needle}` count BELOW its {ledger_path} line — a site migrated; \
+                 lower the line so the gain is held:\n    {}",
+                below.join("\n    ")
+            ));
+        }
+        if !above.is_empty() && !below.is_empty() {
+            msg.push(format!(
+                "{lint}: if an `#[expect]` only MOVED between files (a fn moved, a file split \
+                 or renamed), move its count between the {ledger_path} lines rather than \
+                 rewriting the site."
+            ));
+        }
+        if msg.is_empty() {
+            Ok(())
+        } else {
+            Err(msg.join("\n"))
+        }
+    }
+
+    /// `path` relative to the repo root, with `/` separators — the ledger's key.
+    fn repo_relative(path: &Path) -> String {
+        let root = repo_root();
+        path.strip_prefix(&root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
     }
 
     /// The directories the sweep script counts over — kept in lockstep with
@@ -348,43 +433,92 @@ mod tests {
     #[test]
     fn the_expect_count_only_falls() {
         let sources = walk_sources();
+        let mut problems = Vec::new();
         for ratchet in &RATCHETS {
-            let mut per_file: Vec<(String, usize)> = Vec::new();
-            let mut total = 0usize;
+            let mut measured = std::collections::BTreeMap::new();
             for (path, text) in &sources {
                 let n = flatten_attributes(text)
                     .iter()
                     .filter(|a| a.is_expect_of_lint(ratchet.bare_lint()))
                     .count();
                 if n > 0 {
-                    per_file.push((path.display().to_string(), n));
-                    total += n;
+                    measured.insert(repo_relative(path), n);
                 }
             }
-            let (lint, baseline, needle) = (ratchet.lint, ratchet.baseline, ratchet.expect_needle);
-            // Non-vacuity: while the baseline is above zero the walk must find
-            // attributes, or the ceiling is being compared against a walker
-            // that read nothing.
-            if baseline > 0 {
+            let (lint, needle, ledger_path) =
+                (ratchet.lint, ratchet.expect_needle, ratchet.ledger_path());
+            let text = std::fs::read_to_string(repo_root().join(&ledger_path))
+                .unwrap_or_else(|e| panic!("{lint}: cannot read its ledger {ledger_path}: {e}"));
+            let ledger = read_ledger(&text).unwrap_or_else(|e| panic!("{ledger_path}: {e}"));
+            let (total, allowed): (usize, usize) = (measured.values().sum(), ledger.values().sum());
+            println!("expect_ratchet: {lint}: {total} attribute(s), ledger {allowed}");
+            // Non-vacuity: while the ledger allows any, the walk must find
+            // attributes, or it is being compared against a walker that read
+            // nothing.
+            if allowed > 0 {
                 assert!(
                     total > 0,
-                    "{lint}: baseline is {baseline} but the walk found no `{needle}` attribute — \
-                     the walker or the needle is wrong"
+                    "{lint}: {ledger_path} allows {allowed} but the walk found no `{needle}` \
+                     attribute — the walker or the needle is wrong"
                 );
             }
-            assert!(
-                total <= baseline,
-                "{lint}: the count only falls — lower the baseline when you migrate a fn. \
-                 Found {total} `{needle}` attribute(s), baseline is {baseline}. A count ABOVE \
-                 the baseline means a new site was grandfathered with an `#[expect]` instead \
-                 of being rewritten; rewrite it. Per file: {per_file:?}"
-            );
-            if total < baseline {
-                eprintln!(
-                    "expect_ratchet: {lint}: {total} attribute(s) < baseline {baseline} — lower \
-                     that entry's baseline in src-tauri/src/expect_ratchet.rs to {total}"
-                );
+            if let Err(e) = check_ledger(lint, needle, &ledger_path, &measured, &ledger) {
+                problems.push(e);
             }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n\n"));
+    }
+
+    /// The exact per-file ratchet, on fixtures: equal passes; a file above its
+    /// line, or with no line, is a new site; a file below its line, or gone, is
+    /// a gain that must be held.
+    #[test]
+    fn the_ledger_is_exact_per_file() {
+        let map = |pairs: &[(&str, usize)]| -> std::collections::BTreeMap<String, usize> {
+            pairs.iter().map(|(f, n)| (f.to_string(), *n)).collect()
+        };
+        let check = |m: &[(&str, usize)], l: &[(&str, usize)]| {
+            check_ledger("clippy::x", "#[expect(clippy::x", "x.tsv", &map(m), &map(l))
+        };
+        let ledger = [("a.rs", 2), ("b.rs", 1)];
+        assert!(check(&ledger, &ledger).is_ok());
+
+        let err = check(&[("a.rs", 3), ("b.rs", 1)], &ledger).expect_err("a new site");
+        assert!(
+            err.contains("ABOVE") && err.contains("a.rs: 3 > 2"),
+            "{err}"
+        );
+        let err = check(&[("a.rs", 2), ("b.rs", 1), ("c.rs", 1)], &ledger).expect_err("new file");
+        assert!(err.contains("c.rs: 1 > 0"), "{err}");
+
+        let err = check(&[("a.rs", 1), ("b.rs", 1)], &ledger).expect_err("a migration");
+        assert!(
+            err.contains("BELOW") && err.contains("make the line `a.rs\t1`"),
+            "{err}"
+        );
+        let err = check(&[("a.rs", 2)], &ledger).expect_err("a file migrated fully");
+        assert!(err.contains("delete the line `b.rs\t1`"), "{err}");
+
+        // A swap between files keeps the total equal and is still two reds.
+        let err = check(&[("a.rs", 3)], &ledger).expect_err("a swap");
+        assert!(
+            err.contains("a.rs: 3 > 2") && err.contains("b.rs\t1"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn read_ledger_checks_its_shape() {
+        assert_eq!(read_ledger("a.rs\t2\nb.rs\t1\n").unwrap().len(), 2);
+        for (bad, want) in [
+            ("b.rs\t1\na.rs\t2\n", "out of order"),
+            ("a.rs\t1\na.rs\t1\n", "out of order or repeated"),
+            ("a.rs\t0\n", "count 0"),
+            ("a.rs 2\n", "is not `<file><TAB><count>`"),
+            ("a.rs\tx\n", "count \"x\""),
+        ] {
+            let err = read_ledger(bad).expect_err(bad);
+            assert!(err.contains(want), "{bad:?}: {err}");
         }
     }
 
@@ -562,6 +696,41 @@ struct A;
                 "`{needle}` (both the four-line spelling scripts/row-get-expect-sweep.py writes \
                  and the one-line one) must be counted for {}",
                 ratchet.lint
+            );
+        }
+    }
+
+    /// CUTOVER-ONLY (plan
+    /// `2026-11-04-runner-generated-and-ledger-files-are-merge-neutral-and-land-behind-a-drain`
+    /// Phase 2b; drop after the land). The per-file ledgers replaced one
+    /// `baseline` ceiling per lint. Their sums must equal what the walk
+    /// measures on the cutover tree and must not exceed the ceilings they
+    /// replaced, so the conversion loosened nothing.
+    #[test]
+    fn cutover_the_ledgers_sum_to_the_measured_counts_under_the_old_baselines() {
+        let old_baselines = [
+            ("clippy::disallowed_methods", 531),
+            ("clippy::string_slice", 424),
+            ("clippy::disallowed_types", 10),
+        ];
+        let sources = walk_sources();
+        for (ratchet, (lint, old)) in RATCHETS.iter().zip(old_baselines) {
+            assert_eq!(ratchet.lint, lint);
+            let measured: usize = sources
+                .iter()
+                .map(|(_, text)| {
+                    flatten_attributes(text)
+                        .iter()
+                        .filter(|a| a.is_expect_of_lint(ratchet.bare_lint()))
+                        .count()
+                })
+                .sum();
+            let text = std::fs::read_to_string(repo_root().join(ratchet.ledger_path())).unwrap();
+            let ledger: usize = read_ledger(&text).unwrap().values().sum();
+            assert_eq!(ledger, measured, "{lint}: ledger sum vs measured");
+            assert!(
+                ledger <= old,
+                "{lint}: ledger {ledger} > old baseline {old}"
             );
         }
     }

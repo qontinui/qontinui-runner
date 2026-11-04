@@ -93,6 +93,10 @@ docs/*
 !docs/workspace-assumptions.md
 !docs/workspace-assumptions.json
 !docs/workspace-assumptions.dispositions.toml
+# ...and so is the unreviewed ratchet's per-row ledger (plan
+# 2026-11-04-runner-generated-and-ledger-files-are-merge-neutral-and-land-behind-a-drain
+# Phase 2a), which the same test reads and checks is not ignored.
+!docs/workspace-assumptions/
 # Same local-only documentation convention applies to nested docs/ dirs.
 python-bridge/docs/*
 

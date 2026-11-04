@@ -623,8 +623,8 @@ pub fn render_onboarding_doc() -> String {
     out.push_str("## Allowlist changes land before they are delivered\n\n");
     out.push_str(
         "`COORD_MCP_ALLOWED_TOOLS` and `COORD_MCP_DELIBERATE_EXCLUSIONS` \
-         (`src-tauri/src/mcp_api.rs`) are compiled into the runner binary. A PR \
-         that edits either list is **not delivered when it lands**: every box \
+         (generated from one file per entry under `src-tauri/coord-mcp-proxy/`) \
+         are compiled into the runner binary. A PR that edits either list is **not delivered when it lands**: every box \
          keeps refusing the tool with `-32601` until it rebuilds from a sha that \
          contains the change (measured 2026-08-24..28: runner#1127 landed on the \
          24th and the primary still served a build 101 commits behind on the \
@@ -636,7 +636,8 @@ pub fn render_onboarding_doc() -> String {
          in full. Until that gate clears, a `-32601` for the tool on that box \
          carries `data.cause: \"stale_binary\"`, which is the refusal saying the \
          same thing; `GET /coord-mcp/tool-policy` shows the lists this binary \
-         actually compiled. Convention detail: the doc comments above both \
+         actually compiled. Convention detail: \
+         `src-tauri/coord-mcp-proxy/README.md`, beside the files that generate both \
          consts, and `coord-gates-and-access.md` in `qontinui-claude-config`.\n\n",
     );
     out.push_str("---\n\n");

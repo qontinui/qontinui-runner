@@ -1,0 +1,2 @@
+os_bound_tooling	ShellCommandHandler::get_shell_type	a9d24d6a62e2c1c2
+os_bound_tooling	ShellCommandHandler::run_command	4ae953ae46bc3177

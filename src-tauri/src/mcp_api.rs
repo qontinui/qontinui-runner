@@ -5136,738 +5136,36 @@ fn lifecycle_workdir_matches(
     }
 }
 
-/// JSON-RPC methods the loopback `/coord-mcp` proxy forwards (credential-
-/// hygiene Task 4). Everything else is rejected BEFORE any bearer is read or
-/// any byte reaches coord. The MCP handshake + tool surface is exactly:
-/// `initialize` / `notifications/*` housekeeping / `ping` / `tools/list` /
-/// `tools/call` — and `tools/call` is further gated per tool name by
-/// [`coord_mcp_tool_is_allowed`]. Sorted for `binary_search`.
-const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
-    "initialize",
-    "notifications/cancelled",
-    "notifications/initialized",
-    "notifications/progress",
-    "ping",
-    "tools/call",
-    "tools/list",
-];
-
-/// Coord MCP tools a proxied session may invoke (credential-hygiene Task 4).
-///
-/// Same posture as the sibling [`ClaimsReadTarget`] / [`CoordWriteTarget`]
-/// enums: the per-session nonce authenticates a *session*, not an operator,
-/// so its authority is an ENUMERATED set — the legitimate session-coordination
-/// surface (introspection reads + the coordination writes: declare-intent,
-/// work-unit upsert/transition, gate register/attest, claims, expectations,
-/// findings/messaging/memory, orient/status/conflict-check/blockers). A leaked
-/// nonce must not reach anything beyond that with the runner's device
-/// identity. Coord is being hardened server-side in parallel; this list is
-/// defense-in-depth, not the sole authority.
-///
-/// DELIBERATELY EXCLUDED (add only with a security rationale): the onboarding
-/// / enrollment family (`coord_onboard_*`, `coord_onboarding_doctor`,
-/// `coord_enroll_repo`), privilege escalation (`coord_attest_escalate_override`,
-/// `coord_attest_advisory_ci_override`), merge authority (`coord_request_merge`,
-/// `coord_cancel_merge`, `coord_pr_merge_verdict`, `coord_pr_merge_profile`,
-/// `coord_set_pr_draft`), code publication (`coord_create_pr`,
-/// `coord_push_to_branch`, `coord_push_credential` — sessions open PRs via the
-/// dedicated `/vcs/pull-requests` loopback route, not this proxy), reservations
-/// (`coord_migration_reserve`, `coord_reserve_resource`), policy/state
-/// mutation (`coord_request_policy`, `coord_flag_state`, `coord_flag_states`),
-/// and per-agent levers coord would also hand to every un-curated agent
-/// (`coord_fleet_drain`, `coord_fleet_undrain`, `coord_fleet_drain_host`,
-/// `coord_fleet_undrain_host`).
-///
-/// LOAD-BEARING, do not strip as "reads nobody uses": `coord_list_prompt_documents`
-/// and `coord_get_prompt_document` are how the fleet reads served POLICY, and the
-/// `/policy` skill's transport cascade calls them through THIS proxy (a
-/// `tools/call` POST to `/coord-mcp` with the `.mcp.json` nonce). Every session is
-/// required to read policy before substantive work, so omitting them does not fail
-/// loudly — `/policy` silently falls through to its last-resort `qontinui-dev-notes`
-/// mirrors and the fleet starts booting off stale policy with nothing surfaced.
-/// `coord_gate_list` / `coord_withdraw_gate` are the same story for `/gate-sweep`
-/// and `/gate`, which already document driving them over this proxy.
-///
-/// `coord_write_prompt_document` is IN, and the reason it used to be out no longer
-/// holds. The old rationale — "policy authorship is tenant-gated and belongs to an
-/// operator, not a device nonce" — described a coord that no longer exists: coord
-/// deliberately grants this tool to device/agent principals
-/// (`coord::mcp::agent_tool_access`) precisely so a session can CLOSE a POLICY_GAP
-/// it found instead of recording one that waits on the operator, which was the
-/// bottleneck that made gaps accumulate faster than they could be hand-published.
-/// Withholding it HERE did not re-impose an operator gate; it silently removed a
-/// capability coord had already decided to grant, and the denial surfaced as a bare
-/// `-32601` that reads like "no such tool" rather than "your proxy withholds it".
-///
-/// Nor is the grant unguarded — coord enforces non-loosening server-side, so this
-/// proxy is not the thing standing between a device nonce and a weakened policy:
-/// `append` preserves the existing body verbatim, `create` only authors names that
-/// do not yet exist, `edit_clause` lands only a provable tightening or no-op and
-/// otherwise becomes a pending operator proposal, and the meta-policies
-/// (`session-protocol`, `security-and-autonomy`, `escalation-bar`) are refused
-/// outright in either direction. Tenant comes from the verified `CallerIdentity`,
-/// never an argument; every landed write is versioned, attributed and revertible.
-///
-/// Keep it in. If policy authorship should ever be operator-only again, that is a
-/// decision to make in coord's grant — one place, enforced for every transport —
-/// not by re-diverging this list from it.
-///
-/// `coord_agent_registry_effective` is IN, and it is the same divergence one step
-/// further on. It is a read-only, tenant-scoped fold of (registry row × user
-/// preference) — it records nothing and changes no preference — and it is the ONLY
-/// way to tell a genuinely recorded `degrade` from a `degrade` assumed because the
-/// read failed. Policy binds a gate to exactly that distinction:
-/// `pre-pr-review` makes the user's recorded disposition govern how the review gate
-/// is satisfied, and `registry-unreadable-falls-back-to-degrade` says an unreadable
-/// registry is UNKNOWN and must fall back to the degraded inline self-review.
-///
-/// Withholding it here did not add a gate — it made one permanently unreachable.
-/// Every device/agent session was forced onto the degraded path and could never
-/// observe an `enabled` disposition, so a policy-required `code-reviewer` pass was
-/// silently downgraded to an author reviewing their own diff, for every such session,
-/// regardless of what the user had actually recorded. That is the precise failure
-/// `harness-injected-agent-prohibitions` exists to prevent, arriving by a different
-/// road. Same shape as `coord_write_prompt_document` above: the denial surfaced as a
-/// bare `-32601` that reads like "no such tool" rather than "your proxy withholds it".
-///
-/// And as with that tool, coord had ALREADY decided the other way — this list was the
-/// only thing still dissenting. `coord::mcp::agent_tool_access` grants the tool to
-/// device/agent principals and registers its HTTP twin
-/// `GET /coord/agent-registry/effective` as `DoorAdmits::DeviceAgent` over the shared
-/// `agent_registry::resolve_effective`, with the tenant floor enforced inside that
-/// shared function rather than at either door. Coord's own note on the entry reaches
-/// this same conclusion in its own words: "Masking it was not a boundary, it was a
-/// self-inflicted blind spot … The session bound BY the setting was the one principal
-/// that could not read it." A device JWT could always get this answer over HTTP; the
-/// proxy simply refused the MCP door to the same data.
-///
-/// Reading the registry grants no authority to SPAWN. `agent-spawn-authorization`
-/// still governs that, and a genuine user deselection remains a never — this only
-/// lets a session find out which it is.
-///
-/// `coord_session_worktrees` and `coord_reevaluate_dry` are IN, found by finally
-/// doing the comparison mechanically instead of one `-32601` at a time. Diffing
-/// coord's `mcp::agent_tool_access::DEVICE_DEFAULT_TOOLS` (45 names, coord
-/// `origin/main` 16850b9) against this list turned up FIVE names coord grants a
-/// device and this door refuses. Two are the merge-authority and code-publication
-/// exclusions above, deliberate and documented. The other three — these two plus
-/// `coord_reevaluate` — appear nowhere in that rationale, so they were drift.
-///
-/// The evidence is that SOURCE diff, deliberately, and not a live `-32601`. A
-/// denial from this door reports the allowlist compiled into the RUNNING binary,
-/// which on the primary was 83 commits behind `origin/main` when this was written
-/// — stale enough that `coord_agent_registry_effective` also answered `-32601`
-/// despite having been allowlisted here since `9679a4649`. A refusal observed
-/// live is a rebuild question until `/health` `buildDrift` says otherwise; it can
-/// corroborate this list's contents but can never establish them.
-///
-/// Both earn the grant on their own terms. `coord_session_worktrees` is a
-/// read-only join answering "what did my finished sessions leave behind?" — it
-/// reaps nothing and stamps nothing, and it is how a session satisfies the
-/// worktree-cleanup half of its own closeout. `coord_reevaluate_dry` is the
-/// no-side-effect READ twin of `coord_reevaluate`; coord's own note on granting it
-/// is that withholding a free confirmation step only pushes a caller toward the
-/// destructive rung below it, which is precisely the effect this list was having.
-///
-/// `coord_reevaluate` — the WRITE twin — is now IN. It was held OUT with the note
-/// that it "sits inside the merge-authority family already excluded above; the dry
-/// read is the part a session needs to decide, and the act belongs to the train",
-/// closing with the admission that this was "a judgement, not a mechanical
-/// consequence, and the one entry here worth an operator's second opinion".
-///
-/// **The operator gave that second opinion on 2026-08-31**, as the governing
-/// principle for plan
-/// `2026-08-31-agent-reachable-reevaluate-and-honest-mint-failure`: *all coord
-/// actions should be available to agents; sensitive actions should require posting
-/// a notification, not an operator gate.* The prior paragraph is preserved above
-/// rather than deleted, because the argument it makes is still the reason this is
-/// the LAST entry of the merge-authority family to move — not evidence that it
-/// should not have.
-///
-/// The grant carries no new authority. `POST
-/// /pr-merge/prs/{owner}/{name}/{pr_number}/reevaluate`
-/// (`pr_merge::tenant_routes::post_reevaluate`) is on coord's Tier-2 sub-router
-/// under `require_jwt_or_operator`, whose `Tier2Caller::Coord` arm admits exactly
-/// the device JWT a runner-hosted session already carries, and both doors call
-/// `tenant_remediation::reevaluate_pr_for_tenant` with `RemediationActor::Tenant`.
-/// coord put the tool on `DEVICE_DEFAULT_TOOLS` in `ac9388e9` (2026-08-09) for that
-/// reason. Measured from inside a runner-hosted session on 2026-08-31,
-/// `coord_can(call_tool, coord_reevaluate)` answered `allowed: true` while THIS
-/// list still refused the call — the same shape as the four grants above it.
-///
-/// Nor is the act unguarded, and none of the guards live here: the tenant ownership
-/// floor renders a cross-tenant target as 404, `RemediationActor::Tenant` applies
-/// the per-tenant rate limit and keeps the terminal reap-hardcap unblock at 409, and
-/// the merge predicate still decides merge-vs-hold. Re-running a gate cannot weaken
-/// it. What withholding bought was not a boundary but a bare `-32601` on the one
-/// lever `coord_diagnose` and five `tenant_levers_for_wedge` ladders publish by name
-/// to precisely this principal.
-///
-/// The NOTIFY half of the operator's principle stays where policy already puts it:
-/// `escalation-bar` `do-reversible-mechanical-work` obliges the calling session to
-/// post it, and `coord_notify_sensitive_action` / `coord_post_finding` are both already on
-/// this list. Enforcing the notification AT THIS DOOR is a separate design decision
-/// (would a failed notification block the write?), surfaced as a held fork in the
-/// plan rather than decided here.
-///
-/// Still OUT and unmoved: `coord_cancel_merge`, `coord_request_merge`,
-/// `coord_create_pr`, `coord_push_to_branch` and the rest of
-/// [`COORD_MCP_DELIBERATE_EXCLUSIONS`]. They are not the same shape — two are code
-/// publication and two sit against the standing rule that coord is the sole merge
-/// authority — so each is owed its own argument, not a sweep.
-///
-/// # The gate-verb family is IN — plan `2026-08-10-agent-gate-management-must-ship-in-the-product`, P4
-///
-/// `coord_reject_gate`, `coord_reopen_gate`, `coord_mute_gate`, `coord_unmute_gate`,
-/// `coord_snooze_gate`, `coord_cancel_continuation`, `coord_force_clear_gate` and
-/// `coord_set_gate_audience` were drift of the worst kind: the one this door's own
-/// warning is built to catch, sitting unread for days.
-///
-/// coord unmasked all eight on the device floor — six in `f9c9eef3` (P4a) and the
-/// `force-clear` / `audience` pair on the 2026-08-20 operator decision — and P4
-/// (`df8c2868`) then shipped the `gate_action` dial to govern them. This list never
-/// moved, so from INSIDE the product every one of them answered `-32601`. That is
-/// precisely the plan's own Null A restated one layer out: an interactive runner
-/// session authenticates as the device principal and reaches coord through this
-/// proxy, so a capability this list omits does not exist for the user, whatever
-/// coord grants. The plan's §9 says so in advance — *"`device_default_allow_set()`
-/// returning a name proves masking, not reachability"* — and this drift is what
-/// running that acceptance for the first time actually found.
-///
-/// **The dial is the control surface, not this list.** Withholding `force-clear` or
-/// `audience` here would not add a safety check; it would make `gate_action` unable
-/// to do its job, because a dial can only govern what the door forwards. The real
-/// checks all live downstream and are unaffected by the grant: clearance authority,
-/// `agent_non_author`, the `gate_action` tiers, and a notification on every
-/// sensitive action. Every one of these verbs is also reversible by `reopen`, which
-/// is the invariant the plan requires of anything it grants.
-///
-/// `approve` stays unreachable — and it is unreachable by construction rather than
-/// by this list, because coord defines no `coord_approve_gate` tool at all. The 10s
-/// evaluation sweep already clears any gate whose predicate verifies, so the action
-/// has nothing to do.
-///
-/// `coord_fixer_arm_readiness` came out of the same drift line and is unrelated to
-/// gates: a read coord grants on its READ-ONLY floor, so it carries no authority a
-/// session lacks. It is IN for the same reason the other reads here are.
-///
-/// `coord_work_unit_refresh_citations` is IN, and it is the drift this door's own
-/// warning was built to catch — it appeared nowhere in this file, neither allowed
-/// nor named as an exclusion, which is exactly the state that `warn!` above calls
-/// "drifted from coord's grant". It is a READ: a refresh-through-cache that re-reads
-/// a work unit's cited PRs live from GitHub and updates the stale rows, carrying no
-/// authority a session lacks (it cannot forge a land — coord re-verifies merge state
-/// independently, the same property that makes `coord_work_unit_add_citation` safe).
-///
-/// Withholding it had a specific, measured cost, which is why it is not a sweep.
-/// `coord_work_unit_list_citations` returns `evidence_gaps` whose text NAMES this
-/// tool as the remedy — "`coord_work_unit_refresh_citations` on this slug is the
-/// reader that resolves it, and it is granted to device principals". That sentence
-/// is true of coord and false of this door, so a session that followed its own
-/// tooling's advice got `-32601` and could not distinguish "not landed" from "we
-/// could not look". Measured 2026-09-07 on work unit
-/// `2026-08-24-headless-box-has-no-working-coord-credential-door`, whose cited PRs
-/// are provably on `origin/main` by content while `delivery.shipped` stayed false.
-///
-/// `coord_notify_sensitive_action` is IN because withholding it would withhold a
-/// REPORT, never an action. It is the notify half of NOTIFY-AFTER-ACTION
-/// (`escalation-bar` `do-reversible-mechanical-work`, operator-revised
-/// 2026-08-30): a session that publishes a version or force-pushes a ref does so
-/// through its own shell, not through coord, so filtering the tool cannot stop
-/// the step — it can only stop the operator from hearing about it.
-/// Authority-wise it is the twin of `coord_post_finding`, already granted here:
-/// an append-only, self-attributed row about the caller's own action, whose
-/// `kind` is hard-coded coord-side and whose `actor` is derived from the
-/// credential, so it cannot forge a coord-internal notification.
-///
-/// Until plan `2026-09-18-notifications-are-agent-actions-and-alerts-are-agent-work`
-/// Phase 4 this line named `coord_post_notification` — a name never served on main.
-/// Coord's tool was `coord_notify_irreversible_action`, so the entry allowed
-/// nothing and the real tool answered `-32601` from every runner-proxied session:
-/// the self-report door was unreachable while this list read as if it were open.
-/// Coord renames its tool to `coord_notify_sensitive_action` in the same phase,
-/// and this entry carries the NEW name only — the old name is on no path a
-/// runner session should be steered toward.
-///
-/// `coord_alert_queue`, `coord_alert_claim` and `coord_alert_release` are IN
-/// because alerts are AGENTS' work (same plan, Phase 2): coord routes each alert
-/// kind to a responder domain, and the queue is how a steward session reads its
-/// domain's open alerts, leases one before acting so two sessions do not work the
-/// same condition, and hands the lease back. The queue is a read; claim and
-/// release write only a lease on the alert row — claiming never RESOLVES
-/// (resolution stays with coord's own re-observation), so an agent cannot mark
-/// fixed a condition coord still sees. Coord grants all three on the device floor
-/// (`agent_tool_access.rs` `DEVICE_DEFAULT_TOOLS`); withheld here, the queue the
-/// phase builds would be unreachable from exactly the sessions it exists for.
-///
-/// `coord_memory_supersede` is IN because withholding it would leave the memory
-/// surface able to INSERT but never CORRECT, and that is worse than withholding
-/// both: the backend dedups on content hash rather than title, so a session
-/// obeying served policy `memory-and-notes` `fix-stale-facts` would write a
-/// SECOND live row and leave the disproven one retrievable beside it. Authority
-/// -wise it grants nothing new — same tenant binding from the same verified JWT,
-/// same private-scope clamp as `coord_memory_record` (already granted), and the
-/// coord tool exposes no delete. Added WITH the tool, for the reason the
-/// paragraph above gives: the three drift instances in this list were each found
-/// by a human hitting `-32601`, and a correction door that answers `-32601` is
-/// indistinguishable, from inside a session, from one that does not exist.
-///
-/// `coord_repoint_gate` is IN for the gate-verb family's reason, one verb later
-/// (qontinui-coord#2056, plan
-/// `2026-09-09-pr-fix-autodispatch-arms-into-a-thin-brief-a-fifo-queue-and-a-gate-that-cannot-be-re-armed`
-/// Phase 3a). It moves an OPEN gate's predicate to where a superseded PR went,
-/// carrying the continuation, and withdraws the source — the ONLY way to re-arm a
-/// superseded watch, because `continuation_spawn` is write-once at registration.
-/// coord grants it on the device floor and its core enforces the REGISTRANT rule
-/// (the same floor `coord_withdraw_gate`, already here, rests on). Withheld, the
-/// remedy `coord_gate_doctor`'s `continuation_cancelled_not_rearmed` smell names
-/// would answer `-32601` from inside the product — the supersede would keep losing
-/// its arm silently, which is the defect the verb exists to end.
-///
-/// The registrant rule is no longer the WHOLE rule, so forwarding it does not reach
-/// "only gates this device registered" (plan
-/// `2026-09-23-an-adopter-cannot-re-anchor-a-gate-it-did-not-register`). When the
-/// registrant check fails, coord runs a narrower SUPERSESSION arm: a non-registrant
-/// device may re-point a `pr_merged` gate, including a system-registered one with
-/// no recorded registrant. It may do so only when the source's continuation was
-/// never cancelled, and when coord holds a live, tenant-confined
-/// `supersession_declared` row naming the supplied predicate as a recorded
-/// successor. That is a wider REACH under a coord-provable precondition, not a
-/// wider TRUST. `coord_declare_supersession`, forwarded beside it, is the direct
-/// door that writes that row when the successor's title token recorded nothing.
-/// coord verifies every precondition itself (`record_agent_declaration`): it holds a
-/// record of the predecessor, the caller's tenant owns both repos, the successor
-/// LANDED by coord's own record and is not a fork, the successor's title or body
-/// references the predecessor (the provenance link that stops a device pairing two
-/// arbitrary PRs), its author is trusted or may write to the repo, and the
-/// predecessor has not itself landed. Such a row feeds the gate move, the card's
-/// `superseded_by` and the deferred-fail probe, NEVER a coord close: the
-/// superseded-predecessor closer skips agent-declared rows and closes only on a
-/// title declaration. Without that door, when the title recorded nothing, only the
-/// gate's registrant could move it, and no operator twin of the re-point exists.
-///
-/// `coord_correct_gate` is IN for the same gate-verb family's reason (plan
-/// `2026-09-21-a-cleared-gate-is-uncorrectable-and-every-repair-mints-another-false-green-row`
-/// Phase 8). It corrects a CLEARED gate's recorded predicate or outcome. A
-/// correction is INSERT-only (it appends a correcting row, never edits history),
-/// applies to cleared gates only, and cannot release work: it clears nothing and
-/// approves nothing. Withheld, a cleared-gate error could only be repaired by
-/// registering another gate, which is the false-green row the plan exists to stop.
-///
-/// `coord_citations_reenrich` is IN because it is a SHIPPED REPAIR ROUTE, and a
-/// repair route an agent cannot reach is the defect it was built to close (plan
-/// `2026-09-10-citation-reenrich-is-unrunnable-and-plan-pr-is-unclassifiable`).
-/// It runs coord's citation re-enrich pass — re-hydrating `touched_files` for
-/// cited PRs from GitHub's PR-files API — and that work is mechanical,
-/// idempotent (stamped rows are skipped), tenant-scoped and bounded (optional
-/// `limit`, Background outbound budget). Served policy `production-and-cost`
-/// `shipped-repair-routes-are-pipeline-behavior` makes running such a pass
-/// ordinary pipeline behavior, and `operating-rules`
-/// `operator-asks-are-decisions-never-api-calls` rules out routing it through
-/// the operator instead. Withheld here, it would answer `-32601` from inside the
-/// product and recreate exactly the state the plan names: a pass no agent could
-/// run. coord's own grant (`mcp/agent_tool_access.rs`) is the authority on who
-/// may call it; this list only forwards.
-///
-/// `coord_submit_escalate_evidence` is IN, and it is the reason this paragraph
-/// exists: it is the agent door of the operator ruling
-/// `decision_record/escalate-path-clearance-is-agent-work` — an
-/// `escalate-path-matched` block is cleared by an agent submitting a grounded
-/// evidence bundle for one head, and coord (not the agent) checks it, announces
-/// the clearance, and writes the head-pinned marker. The grant carries no scope
-/// and no glob; coord's refusals (`head_moved`, `disclosure_not_grounded`,
-/// `review_not_for_head`, `credential_not_holder_issued`, …) are the control.
-/// Withheld here it answered `METHOD_NOT_ALLOWED` from every runner-proxied
-/// session, so the blocker line coord prints on every such PR — which names this
-/// tool as the remedy — sent the session to a door this list shut (measured
-/// 2026-09-26 on claude-config#1198 and 2026-09-29 on coord#2638, where the
-/// bundle had to be carried over a hand-minted device JWT instead). Its operator
-/// twin `coord_attest_escalate_override` stays in
-/// [`COORD_MCP_DELIBERATE_EXCLUSIONS`], unmoved.
-///
-/// The same diff of coord's `DEVICE_DEFAULT_TOOLS` / `TWIN_READ_TOOLS` against
-/// this list (coord `mcp/agent_tool_access.rs` on origin/main, 2026-09-29) found
-/// ten more names that were neither allowed nor deliberately excluded — the
-/// drift state `coord_mcp_filter_tools_list_response` warns about. Each is
-/// granted on coord's device floor with a recorded rationale. Eight of them
-/// also have a device-admitting HTTP twin (a `DoorAdmits::DeviceAgent` row that
-/// coord's `device_floor_matches_device_admitting_http_doors` pins), so
-/// withholding those here was a transport asymmetry rather than a boundary. The
-/// other two have no such twin and rest on coord's own grant alone:
-/// `coord_fleet_drain_status` is on coord's read-only observer floor, and
-/// `coord_land_provenance_backfill` is a deliberately bounded agent door onto a
-/// repair pass whose HTTP route is operator-only (coord plan
-/// `2026-09-15-two-admin-only-repair-passes-have-no-agent-door`). That is the
-/// same precedent as `coord_citations_reenrich` above: coord's grant is the
-/// authority on who may call it, and this list only forwards.
-///
-/// * reads — `coord_fleet_drain_status` (a session that cannot see a drain
-///   reads a quiesced machine as idle), `coord_next_step_settings_effective`
-///   (the dial governing the caller's OWN autonomy), `coord_pending_agent_questions`,
-///   `coord_primary_tree_branch_status`, `coord_work_unit_overview`;
-/// * self-scoped or bounded writes — `coord_adopt_pr` (the PR adoption claim a
-///   fixer takes before acting on a PR it did not author),
-///   `coord_answer_agent_question` / `coord_withdraw_agent_question` (the
-///   agent-audience queue's only consumers; neither can write `audience` or
-///   erase an operator answer), `coord_operator_touch_classify` (append-only
-///   classification sidecar), `coord_land_provenance_backfill` (dry-run by
-///   default, precedence-aware re-derive, reversible by re-running).
-///
-/// The overlord's four doors are IN, added WITH coord's grant rather than after a
-/// session hits `-32601` — the order the `coord_memory_supersede` paragraph above
-/// argues for. coord's grant (qontinui-coord#2913 for the proof reads,
-/// qontinui-coord#2957 for the ledger pair) puts all four on the device floor
-/// (`DEVICE_DEFAULT_TOOLS`), each
-/// with a `DoorAdmits::DeviceAgent` HTTP twin, so withholding them here would be
-/// a transport asymmetry rather than a boundary:
-///
-/// * proof reads (plan
-///   `2026-10-03-overlord-never-finishes-a-session-on-an-unproven-claim`) —
-///   `coord_watch_verdict` (twin `GET /coord/overlord/watch-verdict`)
-///   and `coord_session_obligations` (twin
-///   `GET /coord/overlord/session-obligations/:claude_code_session_id`). These are
-///   what lets `/next-move` PROVE a session owes nothing before it calls that
-///   session finished; a session that cannot read them can only assume, and an
-///   assumed "nothing owed" is precisely the false finish the plan exists to end.
-///   Both are reads and carry no authority a session lacks.
-/// * the intervention ledger (plan
-///   `2026-10-01-overlord-session-supervisor-classifies-stops-and-absorbs-avoidable-escalations`
-///   Phase 2) — `coord_overlord_record` (twin
-///   `POST /coord/overlord/interventions`) and `coord_overlord_interventions`
-///   (twin `GET` on the same route), `/next-move`'s store-of-record. The write is
-///   an append-only, self-attributed row about the caller's own intervention, the
-///   same shape as `coord_post_finding`: it records what an overlord did, and
-///   performs nothing.
-///
-/// * the triage-pass ledger (plan
-///   `2026-10-23-the-overlord-keeps-no-record-of-session-flow-so-its-development-runs-on-anecdote`
-///   Phase 2b) — `coord_overlord_pass_record` (twin `POST /coord/overlord/passes`),
-///   the store-of-record for one `/triage-sessions` pass and its per-terminal
-///   rows, so session FLOW (time-to-close, nudge→progress) is measured rather
-///   than recalled. Like `coord_overlord_record` it is an append-only,
-///   self-attributed write that performs nothing. Its reads
-///   (`coord_query_overlord_passes`, `coord_query_overlord_flow`) need no entry:
-///   they ride the `coord_query_` read-family prefix.
-///
-/// Finding `31a69d12` (posted by this runner itself on build `44691aaec4d4`)
-/// reported eleven names that coord ADVERTISED to this door's principal, which
-/// this list neither allowed nor named as deliberate. Each was classified; the
-/// design-fork record is coord finding `4ba64e8b` (correcting `73b15a9b`, which
-/// revised `e652d447`).
-/// None of the eleven is on coord's device floor at coord `origin/main`
-/// `1e720228b802`, so which coord build and principal advertised them is
-/// unestablished. That is why forwarding
-/// is limited to names whose call is harmless if coord refuses it, and safe if
-/// coord grants it. Three are IN:
-///
-/// * `coord_check_repo_name`: an availability probe.
-/// * `coord_create_repo`: creates an EMPTY repository under an owner bound to
-///   the caller's tenant. It publishes no code (its sibling
-///   `coord_push_credential` is excluded), but a repository it creates can be
-///   PUBLIC (`private: false`), which is visible outside the tenant. That side
-///   effect is accepted: the call is owner-bound and rate-limited per caller,
-///   and the repository is empty.
-/// * `coord_pin_worktree`: sets a worktree's retention. Pinning keeps reclaim
-///   off it. Unpinning (`retention: auto`) applies to any `agent_id` in the
-///   tenant and hands the worktree back to reclaim. Reclaim's own dirtiness
-///   guard still refuses to remove a tree with uncommitted work, so nothing is
-///   deleted by this call itself.
-///
-/// The other eight are in [`COORD_MCP_DELIBERATE_EXCLUSIONS`], each with its
-/// reason in that list's note.
-///
-/// **The per-repo tenant binding writes are IN, with their risk stated** (plan
-/// `2026-10-17-per-repo-tenant-binding-overrides-the-org-tenant` Phase 6; the
-/// design fork is coord finding `e28caba2-9727-494a-91a0-4a321c377cb3`).
-/// `coord_bind_repo_tenant` / `coord_unbind_repo_tenant` move a repository's
-/// governance — and with it who coord mints that repo's push and clone tokens
-/// for — from one tenant to another. They are onboarding-family in substance,
-/// named outside the `coord_onboard` prefix on purpose so the sessions coord's
-/// bind door admits can reach them. What a LEAKED device nonce reaches through
-/// them: this proxy presents the paired device JWT, which passes coord's
-/// possession check, so possession is NOT the limit here. The limits are
-/// coord's: the device's USER must hold `admin` in BOTH the losing and the
-/// gaining tenant, the credential's own tenant must be one of the two, coord
-/// itself writes an audit row per tenant and a `repo_bound` / `repo_unbound`
-/// operator notification on every call, and either side undoes it with one
-/// call. Residual risk: tokens minted for the repo while a wrong binding stood
-/// are not taken back by the unbind. This differs from
-/// `coord_request_expedited_land`, withheld because a land cannot be undone and
-/// its only gate is that same possession check. `coord_enroll_repo` stays
-/// withheld as an onboarding-family name (its HTTP twin remains the door); the
-/// binding writes are let through because they carry a both-tenants admin
-/// check and a server-written audit and notification that no other
-/// onboarding-family write has — that is the security rationale the note
-/// above asks for. As of this entry coord does not serve the three binding
-/// tools yet; they are forwarded ahead, which the note below says is harmless.
-///
-/// `coord_merge_order` stays IN although coord keeps it off the device floor.
-/// It is a READ: it composes a safe merge ordering from the queue, the PR
-/// dependency edges and the plan `Depends-On` graph. coord grants it to the
-/// per-agent `merger` role template, and merger agents reach this door with
-/// their own JWT, so coord's allow-set is the gate for each principal: a device
-/// gets coord's refusal, and a merger gets the tool (the runner's merge-shepherd
-/// playbook names it as one of its merge levers). The reverse-parity
-/// observation reports it for a DEVICE principal, and that report is expected.
-/// It is not the only such name: about fifty forwarded names were off coord's
-/// device floor at `origin/main` `2e9c85585` (for example `coord_claim_acquire`,
-/// `coord_build_info`, `coord_yield`). That backlog is why the observation logs
-/// at INFO and is read from `/health`, not raised as a WARN on every boot.
-///
-/// Forwarding a name coord does not yet serve is harmless — coord answers it as
-/// an unknown tool — so these entries may land ahead of the coord side.
-///
-/// `coord_fleet_dispatch_roles` (qontinui-coord#3015, plan
-/// `2026-10-02-fleet-machine-roles-workhorse-bench-ci-node` Phase 3) is the
-/// read-only twin of `GET /coord/fleet/dispatch-roles`: every machine of the
-/// caller's tenant with its dispatch role, per-lane state with the role and
-/// drain layers shown separately, and the role suggestion. That PR landed on
-/// coord `main` (`a5962a19b..602279acd`) granting it on coord's
-/// `READ_ONLY_TOOLS`, `MERGER_TOOLS` and `DEVICE_DEFAULT_TOOLS`; later commits
-/// added `OVERLORD_TOOLS` (`1edd47702`) and `BOOTSTRAP_READ_TOOLS`
-/// (`6b604d803`). As of coord `origin/main` `b8ac37b6b` (read 2026-10-18) it is
-/// on all five (`crates/coord/src/mcp/agent_tool_access.rs`), each beside
-/// `coord_fleet_drain_status`, for the same reason: a session that cannot see
-/// a machine's role reads a bench or CI node as an idle workhorse. Its WRITE
-/// (`PUT /coord/fleet/dispatch-role`) is operator-only there and has no MCP
-/// tool, so there is nothing to exclude. Re-verify against coord
-/// `origin/main` when editing this paragraph.
-///
-/// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
-/// Phase 3). This list is compiled into the binary, so a PR that edits it is
-/// NOT in effect on any box until that box rebuilds from a sha containing the
-/// change — measured 2026-08-24..28: runner#1127 landed on the 24th and the
-/// primary still served a build 101 commits behind on the 28th, refusing all
-/// nine tools it had added. The session that lands such a PR therefore
-/// registers a `runner_served_sha` gate PER DEVICE that must serve it —
-/// `{"kind": "runner_served_sha", "device_id": "<device>", "repo":
-/// "qontinui/qontinui-runner", "expected_sha": "<landed sha>"}`, the pattern
-/// gate `65292ba0` used for #1127 — and reports the gate_id in full. Until it
-/// clears, a `-32601` for the tool on that box carries `data.cause:
-/// "stale_binary"`, which is the refusal saying the same thing.
-///
-/// MUST stay sorted — membership is a `binary_search`.
-const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
-    "coord_ack_message",
-    "coord_adopt_pr",
-    "coord_agent_registry_effective",
-    "coord_alert_claim",
-    "coord_alert_queue",
-    "coord_alert_release",
-    "coord_am_i_clear",
-    "coord_answer_agent_question",
-    "coord_ask_question",
-    "coord_attest_gate",
-    // Plan 2026-10-17-per-repo-tenant-binding-overrides-the-org-tenant Phase 6:
-    // the per-repo tenant binding door, forwarded ahead of coord serving it.
-    // coord will authorize it (the device user must be admin in BOTH tenants);
-    // this list only forwards. Risk and limits: the doc comment above.
-    "coord_bind_repo_tenant",
-    "coord_bind_self_session",
-    "coord_blockers",
-    "coord_build_info",
-    "coord_can",
-    "coord_cancel_continuation",
-    "coord_change_conflict",
-    "coord_check_gate_predicate",
-    "coord_check_install_safety",
-    "coord_check_publish_safety",
-    "coord_check_repo_name",
-    "coord_citations_reenrich",
-    "coord_claim_acquire",
-    "coord_claim_check",
-    "coord_claim_heartbeat",
-    "coord_claim_release",
-    "coord_conflict_check",
-    "coord_correct_gate",
-    "coord_create_repo",
-    "coord_declare_intent",
-    // The direct supersession-declaration door (qontinui-coord, operator
-    // directive 2026-10-03, served policy `git-operations`
-    // `a-landed-adoption-closes-its-predecessor`). It records the declaration
-    // `coord_repoint_gate`'s supersession arm needs when a successor's title
-    // token was missing or not recorded — every precondition (coord knows the
-    // predecessor, tenant owns both repos, successor LANDED and not a fork,
-    // successor's text references the predecessor, author trusted or a repo
-    // writer, predecessor not landed) is verified by coord. Withheld here it
-    // would answer `-32601`, and only the gate's registrant could move it. It
-    // never authorizes a coord CLOSE of the predecessor: the
-    // closer skips agent-declared rows and acts only on a title declaration.
-    "coord_declare_supersession",
-    "coord_diagnose",
-    "coord_diff_impact",
-    "coord_edit_predict",
-    "coord_edit_predict_and_check",
-    "coord_edit_verify",
-    "coord_expectation_checkin",
-    "coord_expectation_close",
-    "coord_expectation_register",
-    // Plan 2026-10-13-coord-expedited-land-lever-for-agents Phase 3b: the
-    // READ-BACK of an expedited-land request. A read — it reports a request's
-    // state, refusal and land sha, and lands nothing. Its write twin,
-    // `coord_request_expedited_land`, is a DELIBERATE exclusion (below).
-    "coord_expedited_land_status",
-    "coord_explain_isolation_decision",
-    "coord_explain_pr_close",
-    "coord_explain_ref_event",
-    "coord_explain_worktree",
-    "coord_find_references",
-    "coord_fixer_arm_readiness",
-    "coord_fleet_dispatch_roles",
-    "coord_fleet_drain_status",
-    "coord_force_clear_gate",
-    "coord_gate_doctor",
-    "coord_gate_inspect",
-    "coord_gate_list",
-    "coord_gate_status",
-    "coord_get_answer",
-    "coord_get_prompt_document",
-    "coord_inbox",
-    "coord_is_commit_live",
-    "coord_is_merge_safe",
-    "coord_land_provenance_backfill",
-    "coord_layering_triage",
-    "coord_list_prompt_documents",
-    "coord_list_worktrees",
-    // Plan 2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run
-    // Phase 2: the triage-stamp door. coord's `agent_tool_access::DEVICE_DEFAULT_TOOLS`
-    // is the grant authority; this list only forwards.
-    "coord_mark_findings_triaged",
-    // Plan 2026-09-21-a-memory-write-receipt-cannot-be-read-back-by-any-door-a-degraded-session-holds
-    // Phase 1: the by-id read-back of a memory write receipt. A pure read; added
-    // WITH the coord tool so the receipt's own door never answers -32601.
-    "coord_memory_get",
-    "coord_memory_overview",
-    "coord_memory_record",
-    "coord_memory_search",
-    "coord_memory_supersede",
-    "coord_merge_order",
-    // Plan 2026-09-17-a-sender-cannot-see-its-ack-and-recon-reads-answer-for-the-credentials-tenant
-    // Phase 1: coord's sender-side receipt read — the messaging family's
-    // sender-side verb beside `coord_send_message` / `coord_inbox` / `coord_ack_message`,
-    // so a sender can see whether its message was delivered and acked. coord's
-    // device grant is the authority; this list only forwards.
-    "coord_message_status",
-    "coord_migration_queue",
-    "coord_mute_gate",
-    "coord_next_step_settings_effective",
-    "coord_notify_sensitive_action",
-    "coord_operator_touch_classify",
-    "coord_orient",
-    "coord_overlord_interventions",
-    // Plan 2026-10-23-the-overlord-keeps-no-record-of-session-flow-so-its-development-runs-on-anecdote
-    // Phase 2b: the triage-PASS ledger write (twin `POST /coord/overlord/passes`).
-    // An append-only, self-attributed record of one /triage-sessions pass and its
-    // per-terminal rows; it records what the overlord observed and did, and
-    // performs nothing. Its two reads (`coord_query_overlord_passes`,
-    // `coord_query_overlord_flow`) ride the `coord_query_` prefix below.
-    "coord_overlord_pass_record",
-    "coord_overlord_record",
-    "coord_pending_agent_questions",
-    "coord_pin_worktree",
-    "coord_post_finding",
-    // The agent-facing coord:* PR-label door (plan
-    // 2026-08-27-coord-pr-label-write-path-single-door Phase 4a) — the pair an
-    // ordinary session calls instead of the retired gh-then-POST skill shape.
-    "coord_pr_label_set",
-    "coord_pr_label_unset",
-    "coord_pr_status",
-    "coord_predict_resource_collisions",
-    "coord_primary_tree_branch_status",
-    // The one-screen project-state read (plan
-    // 2026-09-20-what-is-the-state-of-my-projects-and-what-needs-me-is-answerable-from-one-screen,
-    // Phase 3) — read-only; without it a runner-proxied session is refused it.
-    "coord_project_state",
-    // Plan 2026-09-20-trust-calibration-and-independent-verification-coverage-are-measured-continuously
-    // Phase 4: the post-land re-verification lane's three coord tools. This one
-    // is also covered by the `coord_query_` read-family prefix; it is named here
-    // anyway so the lane's full tool set is visible in one place and survives a
-    // future narrowing of that prefix. coord's `agent_tool_access::DEVICE_DEFAULT_TOOLS`
-    // is the grant authority; this list only forwards.
-    "coord_query_verification_metrics",
-    "coord_recent_errors",
-    "coord_recent_findings",
-    "coord_record_decision",
-    // Plan 2026-09-20-trust-calibration-… Phase 4: the verdict write door the
-    // `/reverify-shipped` lane POSTs through (coord refuses a verifier that is
-    // the unit's author; this list only forwards).
-    "coord_record_verification",
-    // Plan 2026-10-11-reverify-verdicts-are-source-bound-tree-checked-and-judge-agreement-is-measured
-    // Phase 3: the ground-truth label write (twin `POST /coord/verification/labels`)
-    // the judge-agreement measure is scored against. The label door's contract:
-    // coord refuses an operator label from a non-operator principal, and an
-    // agent records `seeded` labels only. Forwarded ahead of coord serving it
-    // (the qontinui-coord label-door PR of the same plan); until that deploys,
-    // coord answers it as an unknown tool. This list only forwards.
-    "coord_record_verification_label",
-    "coord_reevaluate",
-    "coord_reevaluate_dry",
-    "coord_register_gate",
-    "coord_reject_gate",
-    "coord_reopen_gate",
-    // Plan 2026-10-17-per-repo-tenant-binding-overrides-the-org-tenant Phase 6:
-    // the bindings read twin.
-    "coord_repo_tenant_bindings",
-    "coord_repoint_gate",
-    "coord_report_status",
-    "coord_request_handoff",
-    "coord_resolve_origin",
-    "coord_resolve_pr_author_session",
-    "coord_resolve_session",
-    "coord_secret_presence",
-    "coord_send_message",
-    "coord_session_obligations",
-    "coord_session_worktrees",
-    "coord_set_gate_audience",
-    "coord_signature",
-    "coord_slo_metrics",
-    "coord_snooze_gate",
-    "coord_submit_escalate_evidence",
-    "coord_symbol_lookup",
-    // Plan 2026-10-17-per-repo-tenant-binding-… Phase 6: the read twin of
-    // GET /coord/repos/tenants (which tenant governs a repo), previously absent.
-    "coord_tenants_for_repo",
-    "coord_twin_catalog",
-    "coord_typecheck_file",
-    // Plan 2026-10-17-per-repo-tenant-binding-overrides-the-org-tenant Phase 6:
-    // release / reclaim.
-    "coord_unbind_repo_tenant",
-    "coord_unmute_gate",
-    // Plan 2026-09-20-trust-calibration-… Phase 4: the lane's queue read.
-    "coord_verification_queue",
-    "coord_watch_verdict",
-    "coord_who_is_working_on",
-    "coord_withdraw_agent_question",
-    "coord_withdraw_gate",
-    "coord_work_unit_add_citation",
-    // Plan 2026-09-20-coord-delivery-has-no-verb-for-a-phase-that-ships-no-pr
-    // Phase 4 (qontinui-coord#2616): attest a phase that ships no PR. It cannot
-    // forge `shipped` — coord's I1+I2 mean an attestation never creates delivery
-    // nor demotes; it only releases a phase-coverage pin on a unit that already
-    // has a real landed PR, disclosed as a `PHASE ATTESTED WITHOUT A PR` gap.
-    "coord_work_unit_attest_phase",
-    "coord_work_unit_list",
-    "coord_work_unit_list_citations",
-    // Read-only; the project-state door's `row_count` is checked against it
-    // (same plan, Phase 1 acceptance (d)).
-    "coord_work_unit_overview",
-    "coord_work_unit_refresh_citations",
-    "coord_work_unit_remove_citation",
-    // Same plan/phase: the undo of `coord_work_unit_attest_phase`. It writes the
-    // attestation table, not citations, so it cannot erase a citation.
-    "coord_work_unit_retract_phase_attestation",
-    "coord_work_unit_transition",
-    "coord_work_unit_upsert",
-    "coord_write_prompt_document",
-    "coord_yield",
-];
-
-/// Read-only tool FAMILIES allowed by prefix. `coord_query_*` is coord's
-/// naming convention for its read-only twin/drift/state queries (~25 tools,
-/// all reads); enumerating each would drift out of date with every new query
-/// while adding no authority a session doesn't already have via the other
-/// reads.
-const COORD_MCP_ALLOWED_TOOL_PREFIXES: &[&str] = &["coord_query_"];
+// The coord-mcp proxy's policy lists — `COORD_MCP_ALLOWED_METHODS`,
+// `COORD_MCP_ALLOWED_TOOLS`, `COORD_MCP_ALLOWED_TOOL_PREFIXES`,
+// `COORD_MCP_DELIBERATE_EXCLUSIONS`, `COORD_MCP_DELIBERATE_EXCLUSION_DOORS` and
+// `COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES` — GENERATED at build time from one
+// file per entry under `src-tauri/coord-mcp-proxy/<list>/<name>.md`
+// (`src-tauri/build.rs::generate_coord_mcp_lists`; plan
+// `2026-11-04-runner-generated-and-ledger-files-are-merge-neutral-and-land-behind-a-drain`
+// Phase 3a). The file name is the entry and its body is the entry's rationale,
+// which is where the prose that used to sit above these consts now lives; the
+// list-wide notes are each directory's `README.md`. Adding a tool is adding one
+// file: no shared line is edited, so two PRs adding different tools do not
+// conflict. `build.rs` sorts by byte, so membership stays a `binary_search`.
+//
+// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
+// Phase 3). These lists are compiled into the binary, so a PR that edits them is
+// NOT in effect on any box until that box rebuilds from a sha containing the
+// change — measured 2026-08-24..28: runner#1127 landed on the 24th and the
+// primary still served a build 101 commits behind on the 28th, refusing all
+// nine tools it had added. The session that lands such a PR therefore
+// registers a `runner_served_sha` gate PER DEVICE that must serve it —
+// `{"kind": "runner_served_sha", "device_id": "<device>", "repo":
+// "qontinui/qontinui-runner", "expected_sha": "<landed sha>"}`, the pattern
+// gate `65292ba0` used for #1127 — and reports the gate_id in full. Until it
+// clears, a `-32601` for the tool on that box carries `data.cause:
+// "stale_binary"`, which is the refusal saying the same thing.
+//
+// (A `///` doc comment cannot precede an `include!` — rustc's
+// `unused_doc_comments` fires. Hence the plain `//` block; the generated consts
+// carry their own `///` lines.)
+include!(concat!(env!("OUT_DIR"), "/coord_mcp_lists.rs"));
 
 fn coord_mcp_tool_is_allowed(name: &str) -> bool {
     COORD_MCP_ALLOWED_TOOLS.binary_search(&name).is_ok()
@@ -5876,145 +5174,6 @@ fn coord_mcp_tool_is_allowed(name: &str) -> bool {
             .any(|p| name.starts_with(p))
 }
 
-/// The tools this door withholds ON PURPOSE — the "DELIBERATELY EXCLUDED"
-/// families from [`COORD_MCP_ALLOWED_TOOLS`]'s note, restated as data.
-///
-/// The note has been the only record of that intent, which left withholding
-/// with two indistinguishable causes: a security decision someone made, or this
-/// list quietly falling behind coord's grant. The first three instances of the
-/// latter — `coord_write_prompt_document`, `coord_agent_registry_effective`,
-/// `coord_memory_overview` — were each found by a human hitting `-32601` and
-/// going looking, which is why they arrived one at a time over months. Diffing
-/// coord's grant against this list found the remaining two in one pass, which
-/// is the argument for a check that runs on its own.
-///
-/// Naming the intended exclusions makes the remainder meaningful: a tool coord
-/// grants this device that is neither allowed nor listed here is, by
-/// construction, drift. [`coord_mcp_filter_tools_list_response`] sees exactly
-/// that set on every `tools/list`, so the next instance announces itself at the
-/// door instead of waiting for someone to trip over it.
-///
-/// This grants nothing and refuses nothing — [`coord_mcp_tool_is_allowed`]
-/// remains the sole gate. Membership here only changes how a withholding is
-/// REPORTED.
-///
-/// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
-/// Phase 3). This list is compiled into the binary, so a PR that edits it is
-/// NOT in effect on any box until that box rebuilds from a sha containing the
-/// change — measured 2026-08-24..28: runner#1127 landed on the 24th and the
-/// primary still served a build 101 commits behind on the 28th, refusing all
-/// nine tools it had added. The session that lands such a PR therefore
-/// registers a `runner_served_sha` gate PER DEVICE that must serve it —
-/// `{"kind": "runner_served_sha", "device_id": "<device>", "repo":
-/// "qontinui/qontinui-runner", "expected_sha": "<landed sha>"}`, the pattern
-/// gate `65292ba0` used for #1127 — and reports the gate_id in full. Until it
-/// clears, a `-32601` for the tool on that box carries `data.cause:
-/// "stale_binary"`, which is the refusal saying the same thing.
-///
-/// MUST stay sorted — membership is a `binary_search`.
-///
-/// Eight of them were added on the classification of finding `31a69d12` (record:
-/// coord finding `4ba64e8b`, correcting `73b15a9b`). None of them was forwarded
-/// before, so listing it here takes nothing away. Four join an existing family
-/// in the note above, and the fleet-drain writes start a new one (per-agent
-/// grants):
-///
-/// * `coord_fleet_drain`, `coord_fleet_undrain`, `coord_fleet_drain_host`,
-///   `coord_fleet_undrain_host`: coord keeps these off its device floor and
-///   grants them per AGENT (`decision_record/fleet-drain-agent-authority`), so
-///   a dev-ops agent holds them and an ordinary implementation agent does not.
-///   Agents DO reach this door: a nonce bound to an agent (`ProxyPrincipal::Agent`)
-///   forwards with that agent's own JWT. But coord gives an agent token with NO
-///   `coord.agent_tool_access` rows its whole UN-CURATED catalog (`allow ==
-///   None`), which includes these four. Forwarding them would therefore hand a
-///   fleet-wide capacity lever to every spawned agent that has no rows, which is
-///   exactly the agent the decision withholds them from. They stay withheld
-///   here until coord curates row-less agents; then move them to the allowlist
-///   and let coord's per-agent grant decide.
-/// * `coord_push_credential`: code publication. It mints a `contents:write`
-///   token for ANY repository under a tenant-bound owner, including existing
-///   ones, which is a raw push that bypasses the PR path. That is a stronger
-///   form of what `coord_push_to_branch` is excluded for. Its HTTP twin admits
-///   a device, so whether devices should hold it at all is coord's decision to
-///   make in one place; this door does not pre-empt it.
-/// * `coord_enroll_repo`: the onboarding / enrollment family the allowlist note
-///   excludes. The `coord_onboard` prefix does not catch its name, so it is
-///   listed explicitly. Its HTTP twin is on coord's device/agent router, so a
-///   session that created a repository can still enroll it over HTTP.
-/// * `coord_attest_advisory_ci_override`: one of coord's four
-///   `require_strategy_admin` tools. No device or agent token carries
-///   `strategy_admin` today. That is a mint convention, not a structural
-///   guarantee, so this exclusion keeps the override in the operator family. Its
-///   twin `coord_attest_escalate_override` is excluded as privilege escalation
-///   (and is also `require_strategy_admin`).
-/// * `coord_set_pr_draft`: merge authority. A PR's draft state is the
-///   operator's release lever under the served `security-surface-implement-tier`
-///   setting `draft-required` ("the operator undrafts to release it to the
-///   train").
-///
-/// Two more are recorded here because coord grants them on the device floor and
-/// this list masks them on purpose. They were found while classifying the
-/// eleven above:
-///
-/// * `coord_create_pr`: coord grants it on the device floor (operator decision
-///   2026-08-04), and this door MASKS it anyway. That is a recorded deselection,
-///   not drift: served policy `git-operations`
-///   `masked-is-not-missing-and-the-loopback-door-precedes-the-fallback`, and the
-///   non-goal of plan `2026-08-22-primary-runner-build-drift-reads-as-a-policy-boundary`
-///   ("Do not allowlist it"). Sessions open PRs through the loopback
-///   `POST /vcs/pull-requests` door instead.
-/// * `coord_cancel_merge`: coord also put it on the device floor (2026-08-09,
-///   plan `2026-07-30-coord-tenant-self-service-merge-recovery`, coord#1409).
-///   Its HTTP twin `POST /pr-merge/tenant/proposals/:id/cancel` admits a device,
-///   so a session that must withdraw its own tenant's proposal still has that
-///   door. It stays withheld HERE for the same reason as `coord_create_pr`: the
-///   non-goal of plan
-///   `2026-08-22-primary-runner-build-drift-reads-as-a-policy-boundary` names it
-///   among the exclusions that are "decisions, not drift". It was explicitly
-///   left unmoved when `coord_reevaluate` was granted (2026-08-31). Reversing it
-///   is a decision to make on its own, not as a side effect of a parity sweep.
-const COORD_MCP_DELIBERATE_EXCLUSIONS: &[&str] = &[
-    "coord_attest_advisory_ci_override",
-    "coord_attest_escalate_override",
-    "coord_cancel_merge",
-    "coord_create_pr",
-    "coord_enroll_repo",
-    "coord_flag_state",
-    "coord_flag_states",
-    "coord_fleet_drain",
-    "coord_fleet_drain_host",
-    "coord_fleet_undrain",
-    "coord_fleet_undrain_host",
-    "coord_migration_reserve",
-    "coord_pr_merge_profile",
-    "coord_pr_merge_verdict",
-    "coord_push_credential",
-    "coord_push_to_branch",
-    // Plan 2026-10-13-coord-expedited-land-lever-for-agents Phase 3b. Merge
-    // authority, withheld on purpose: through this proxy a call carries the
-    // runner's PAIRED-DEVICE JWT, which passes coord's possession check, and
-    // coord's caller-session check is advisory — so a leaked session nonce
-    // would reach a land lever. Merge tools are owed their own argument, not a
-    // sweep. Sessions use the device-JWT HTTP twin instead
-    // (`COORD_MCP_DELIBERATE_EXCLUSION_DOORS`), which the -32601 names.
-    "coord_request_expedited_land",
-    "coord_request_merge",
-    "coord_request_policy",
-    "coord_reserve_resource",
-    "coord_set_pr_draft",
-];
-
-/// For a deliberate exclusion that HAS a sanctioned door elsewhere, the door a
-/// `-32601` names instead of the generic "reach coord's /mcp directly". A
-/// mechanical pointer, not authority: coord enforces its own checks on that
-/// door (`security-and-autonomy` content trigger 6 — the denial names an
-/// alternative path, deliberately).
-const COORD_MCP_DELIBERATE_EXCLUSION_DOORS: &[(&str, &str)] = &[(
-    "coord_request_expedited_land",
-    "POST /pr-merge/repos/:repo/pulls/:number/agent/expedite on coord with a device JWT and \
-     your session id as X-Coord-Caller-Session (the expedited-land HTTP twin)",
-)];
-
 /// The sanctioned alternative door for a deliberately-excluded tool, if any.
 fn coord_mcp_deliberate_exclusion_door(name: &str) -> Option<&'static str> {
     COORD_MCP_DELIBERATE_EXCLUSION_DOORS
@@ -6022,11 +5181,6 @@ fn coord_mcp_deliberate_exclusion_door(name: &str) -> Option<&'static str> {
         .find(|(t, _)| *t == name)
         .map(|(_, door)| *door)
 }
-
-/// Deliberately-excluded FAMILIES by prefix. `coord_onboard` is deliberately
-/// short of a trailing underscore so it covers both the `coord_onboard_*` calls
-/// and `coord_onboarding_doctor`, which the exclusion note treats as one family.
-const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
 
 /// Was withholding this tool a DECISION (see [`COORD_MCP_DELIBERATE_EXCLUSIONS`])
 /// rather than this list drifting behind coord's grant?
@@ -6919,9 +6073,11 @@ fn coord_mcp_refusal_cause(
             CoordMcpRefusalCause::Drift,
             format!(
                 "if coord lists {tool} in tools/list for this principal, add it to \
-                 COORD_MCP_ALLOWED_TOOLS in src-tauri/src/mcp_api.rs (trunk {} neither \
-                 allows it nor names it in COORD_MCP_DELIBERATE_EXCLUSIONS), or name \
-                 it there if withholding it is the decision — then register a \
+                 COORD_MCP_ALLOWED_TOOLS as src-tauri/coord-mcp-proxy/allowed-tools/{tool}.md \
+                 (trunk {} neither allows it nor names it in \
+                 COORD_MCP_DELIBERATE_EXCLUSIONS), or add \
+                 src-tauri/coord-mcp-proxy/deliberate-exclusions/{tool}.md if withholding it \
+                 is the decision — then register a \
                  runner_served_sha gate for the landed sha, because a landed allowlist change \
                  is not delivered until this box rebuilds.",
                 short_sha(&trunk.trunk_sha)
@@ -7137,8 +6293,9 @@ async fn post_coord_mcp_drift_finding(coord_base: String, bearer: String, drifte
         "body": format!(
             "This runner's compiled COORD_MCP_ALLOWED_TOOLS neither allows nor names as \
              deliberate these tools coord grants its principal: {}. Either the allowlist \
-             fell behind coord's grant (add them in src-tauri/src/mcp_api.rs) or the \
-             exclusion is real and unrecorded (name them in COORD_MCP_DELIBERATE_EXCLUSIONS). \
+             fell behind coord's grant (add a file per tool under \
+             src-tauri/coord-mcp-proxy/allowed-tools/) or the exclusion is real and \
+             unrecorded (add one under src-tauri/coord-mcp-proxy/deliberate-exclusions/). \
              A -32601 on any of them from this build carries `data.cause` naming which. \
              Posted once per (build, set) by the runner itself; GET /coord-mcp/tool-policy \
              on this box serves the live observation.",
@@ -8991,14 +8148,15 @@ async fn coord_mcp_proxy_handler(
                 // allows them nor names them in COORD_MCP_DELIBERATE_EXCLUSIONS
                 // — so either the allowlist fell behind coord's grant, or the
                 // exclusion is real and was never written down. Both are
-                // one-line fixes in this file; neither can be made from a
-                // -32601 an hour later.
+                // one-file fixes under `src-tauri/coord-mcp-proxy/`; neither can
+                // be made from a -32601 an hour later.
                 warn!(
                     drifted_count = drifted.len(),
                     drifted = %drifted.join(","),
                     "coord-mcp proxy: withheld tools coord grants that are NOT deliberate \
                      exclusions — COORD_MCP_ALLOWED_TOOLS has drifted from coord's grant; \
-                     add them there, or name them in COORD_MCP_DELIBERATE_EXCLUSIONS"
+                     add a file per tool under src-tauri/coord-mcp-proxy/allowed-tools/, or \
+                     name them under src-tauri/coord-mcp-proxy/deliberate-exclusions/"
                 );
             }
             // The WARN above gets a reader (plan
@@ -17622,8 +16780,7 @@ mod coord_mcp_body_gate_tests {
     /// must pass the proxy's body gate as a `tools/call`.
     #[test]
     fn verification_lane_tools_are_allowed_and_parse_from_source() {
-        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
-            .expect("mcp_api.rs parses");
+        let parsed = working_tree_tool_policy();
         for tool in [
             "coord_query_verification_metrics",
             "coord_record_verification",
@@ -17668,8 +16825,7 @@ mod coord_mcp_body_gate_tests {
     /// back once.
     #[test]
     fn overlord_proof_and_ledger_tools_are_allowed_and_parse_from_source() {
-        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
-            .expect("mcp_api.rs parses");
+        let parsed = working_tree_tool_policy();
         for tool in [
             "coord_watch_verdict",
             "coord_session_obligations",
@@ -17723,8 +16879,7 @@ mod coord_mcp_body_gate_tests {
     /// back exactly once despite the comment above it.
     #[test]
     fn coord_message_status_is_allowed_beside_its_messaging_siblings() {
-        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
-            .expect("mcp_api.rs parses");
+        let parsed = working_tree_tool_policy();
         for tool in [
             "coord_ack_message",
             "coord_inbox",
@@ -17758,8 +16913,7 @@ mod coord_mcp_body_gate_tests {
     /// despite the comments above them.
     #[test]
     fn repo_tenant_binding_tools_forward_and_are_not_deliberately_withheld() {
-        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
-            .expect("mcp_api.rs parses");
+        let parsed = working_tree_tool_policy();
         for tool in [
             "coord_bind_repo_tenant",
             "coord_repo_tenant_bindings",
@@ -17796,8 +16950,7 @@ mod coord_mcp_body_gate_tests {
     /// the comments above both entries must not hide one or add a phantom.
     #[test]
     fn one_screen_reads_are_allowed_and_parse_from_source() {
-        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
-            .expect("mcp_api.rs parses");
+        let parsed = working_tree_tool_policy();
         for tool in ["coord_project_state", "coord_work_unit_overview"] {
             assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
             assert!(
@@ -18358,6 +17511,12 @@ mod coord_mcp_body_gate_tests {
                 coord_mcp_tool_is_allowed(tool),
                 "{tool} is granted on coord's device floor and must not be withheld here"
             );
+            // The positive half reads the generated list's SOURCE too: the
+            // entry is one file under `coord-mcp-proxy/allowed-tools/`.
+            assert!(
+                working_tree_tool_policy().allowed.iter().any(|t| t == tool),
+                "{tool} must be a file in coord-mcp-proxy/allowed-tools/"
+            );
             assert!(
                 gate(serde_json::json!({
                     "jsonrpc":"2.0","id":1,"method":"tools/call",
@@ -18602,8 +17761,7 @@ mod coord_mcp_body_gate_tests {
     #[test]
     fn fleet_dispatch_roles_read_is_forwarded() {
         let tool = "coord_fleet_dispatch_roles";
-        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
-            .expect("mcp_api.rs parses");
+        let parsed = working_tree_tool_policy();
         assert_eq!(
             parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
             1,
@@ -18722,32 +17880,66 @@ mod coord_mcp_body_gate_tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Every file under `build_drift`'s `TOOL_POLICY_DIR_ROOTS` in this
+    /// working tree, repo-relative with `/` separators and recursively — the
+    /// shape `git ls-tree -r --full-tree --name-only` gives production.
+    fn working_tree_policy_listing() -> Vec<String> {
+        fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else if let Ok(rel) = path.strip_prefix(root) {
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut out = Vec::new();
+        for root in crate::build_drift::TOOL_POLICY_DIR_ROOTS {
+            walk(&repo_root.join(root), &repo_root, &mut out);
+        }
+        out.sort();
+        out
+    }
+
     /// The tool policy as PRODUCTION reads it — through
-    /// [`crate::build_drift::first_parsable_tool_policy`], ONE file at a time
-    /// from its path list — but over this working tree instead of `git show`
-    /// at trunk. Parsing the whole module's concatenation instead would stay
-    /// green while production answered `cause: "unknown"`: consts moved to a
-    /// file not on the path list, or split across two files, both still parse
-    /// as one text.
+    /// [`crate::build_drift::tool_policy_from_listing_or_source`]: the
+    /// `coord-mcp-proxy/` directory layout first, the source consts second —
+    /// but over this working tree instead of `git ls-tree` / `git show` at
+    /// trunk. Reading the compiled consts instead would stay green while
+    /// production answered `cause: "unknown"` (a renamed directory, an entry
+    /// name the reader's grammar refuses).
     fn working_tree_tool_policy() -> crate::build_drift::ParsedToolPolicy {
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        crate::build_drift::first_parsable_tool_policy(|rel| {
-            std::fs::read_to_string(repo_root.join(rel)).ok()
-        })
+        crate::build_drift::tool_policy_from_listing_or_source(
+            Some(working_tree_policy_listing()),
+            |rel| std::fs::read_to_string(repo_root.join(rel)).ok(),
+        )
         .expect(
-            "one file on build_drift's TOOL_POLICY_SOURCE_PATHS declares all four \
-             consts in a shape its parser reads",
+            "build_drift's trunk reader reads this working tree's coord-mcp-proxy/ \
+             directories (or, pre-cutover, the source consts)",
         )
     }
 
-    /// The parser reads THIS module's four consts back exactly as they compiled,
-    /// along production's own path ([`working_tree_tool_policy`]). A reformat
-    /// that breaks the parser, or a move of the consts off the path list, breaks
-    /// this test, not production (production degrades to `cause: "unknown"`),
-    /// so the reader cannot rot silently against the source it exists to read.
+    /// The trunk reader reads the four GENERATED lists back exactly as they
+    /// compiled, along production's own path ([`working_tree_tool_policy`]),
+    /// and it is the DIRECTORY arm that does it — the source consts are gone,
+    /// so a fallback answer here would be a reader that cannot see the
+    /// layout. A directory rename, or an entry the reader's grammar refuses
+    /// while `build.rs` accepts it, breaks this test, not production
+    /// (production degrades to `cause: "unknown"`), so the reader cannot rot
+    /// silently against the tree it exists to read.
     #[test]
-    fn trunk_policy_parser_round_trips_this_files_consts() {
+    fn trunk_policy_reader_round_trips_the_generated_lists() {
+        let from_dirs =
+            crate::build_drift::tool_policy_from_listing(&working_tree_policy_listing())
+                .expect("the directory arm reads this working tree's coord-mcp-proxy/");
         let p = working_tree_tool_policy();
+        assert_eq!(p, from_dirs, "the selector must take the directory arm");
         assert_eq!(p.allowed, strings(COORD_MCP_ALLOWED_TOOLS));
         assert_eq!(
             p.allowed_prefixes,
@@ -18759,6 +17951,49 @@ mod coord_mcp_body_gate_tests {
             strings(super::COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES)
         );
         assert!(!p.allowed.is_empty() && !p.deliberate.is_empty());
+    }
+
+    /// Every entry of every generated list is a file whose body (after any
+    /// front matter) is a non-empty rationale: the file IS the place the
+    /// reason for an entry lives now, so an empty one is a list entry with
+    /// its reason deleted (plan
+    /// `2026-11-04-runner-generated-and-ledger-files-are-merge-neutral-and-land-behind-a-drain`
+    /// Phase 3b).
+    #[test]
+    fn every_allowlist_entry_has_a_rationale() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let listing = working_tree_policy_listing();
+        let entries: Vec<&String> = listing
+            .iter()
+            .filter(|p| p.ends_with(".md") && !p.ends_with("README.md"))
+            .collect();
+        let expected = super::COORD_MCP_ALLOWED_METHODS.len()
+            + COORD_MCP_ALLOWED_TOOLS.len()
+            + super::COORD_MCP_ALLOWED_TOOL_PREFIXES.len()
+            + COORD_MCP_DELIBERATE_EXCLUSIONS.len()
+            + super::COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES.len();
+        assert_eq!(
+            entries.len(),
+            expected,
+            "one file per compiled entry: {entries:?}"
+        );
+        for rel in entries {
+            let text = std::fs::read_to_string(repo_root.join(rel)).expect("readable");
+            let text = text.replace("\r\n", "\n");
+            let body = match text.strip_prefix("---\n") {
+                // build.rs's rule: an empty front matter (`---` twice) is
+                // allowed, and an unclosed one leaves no body.
+                Some(rest) => match rest.strip_prefix("---\n") {
+                    Some(body) => body,
+                    None => rest.split_once("\n---\n").map_or("", |(_, b)| b),
+                },
+                None => text.as_str(),
+            };
+            assert!(
+                !body.trim().is_empty(),
+                "{rel} has no rationale: the body of an entry file is why the entry exists"
+            );
+        }
     }
 
     /// (a) THIS binary's deliberate list decides without any trunk read.
@@ -18813,8 +18048,7 @@ mod coord_mcp_body_gate_tests {
             );
         }
         // The trunk-policy source parser reads both new names exactly once.
-        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
-            .expect("parses");
+        let parsed = working_tree_tool_policy();
         assert_eq!(
             parsed
                 .allowed
@@ -23949,3 +23183,14 @@ mod provision_probe_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+/// CUTOVER-ONLY (plan
+/// `2026-11-04-runner-generated-and-ledger-files-are-merge-neutral-and-land-behind-a-drain`
+/// Phase 3b): the six generated coord-mcp lists equal the hand-written consts
+/// they replaced, byte for byte, and the served `/coord-mcp/tool-policy`
+/// lists render identically. The `OLD_*` consts below are copied VERBATIM from
+/// `src-tauri/src/mcp_api.rs` at qontinui-runner `origin/main` `f5bc9c44e`
+/// (only renamed and indented). Drop this module in the commit after the land:
+/// it pins the move, not the policy, and the next added tool reds it by design.
+#[cfg(test)]
+mod coord_mcp_lists_cutover_equivalence_tests;

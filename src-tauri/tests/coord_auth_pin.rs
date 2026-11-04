@@ -809,7 +809,8 @@ const TENANT_SCOPE_KINDS: &[(&str, &str)] = &[
          `session-noop`, or `escalated`. Watched at ZERO rather than deleted: \
          the session-archive work reopened it at 2 within a week of Phase 5 \
          landing, so the kind is the vocabulary a new site needs, and the \
-         totals row below is what makes a re-opening visible.",
+         `EXPECTED_TENANT_SCOPES` row such a site must add under it is what \
+         makes a re-opening visible.",
     ),
     (
         "work-owed",
@@ -871,114 +872,6 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("repo_tenant.rs", "device", 2),
     ("plan_workunit_adapter/body_push.rs", "work-owed", 3),
     ("session/handoff.rs", "escalated", 1),
-];
-
-/// Totals across the whole table, asserted independently of the per-file rows
-/// so a transcription slip in one direction cannot be cancelled by another.
-/// The Phase-2 census measured 52 sites at `ebbd3c70` (device 18, session-owed
-/// 19, work-owed 14, escalated 1). Phase 5 removed 12 of the 19 from the
-/// DEFAULTING wrapper entirely — they state their tenant in code now, so they
-/// are no longer scanned here at all — and reclassified the remaining seven
-/// (six `session-noop`, one `escalated`), driving the ORIGINAL census's
-/// `session-owed` to 0 (52 − 12 = 40). The session-archive work then shipped
-/// two NEW session-scoped defaulting call sites — the session-repository
-/// upsert sink (`session_archive/push.rs`) and the MCP proxy read helper
-/// (`mcp/session_repository.rs`) — taking it briefly to 2. Both now STATE
-/// their tenant: the sink from the row's own resolved `tenant_id`, the proxy
-/// from the caller's `tenant_id`, so neither is scanned here any more and the
-/// count is 40 again — 41 with `mcp/plan_library.rs`'s raw body-export forward,
-/// a work-owed site. The remote-attach work (plan
-/// `2026-08-31-remote-session-tabs-in-runner-terminal`, Phase 3c) then added
-/// the two write-side twins of `coord_http.rs`'s `coord_get` — `coord_post`
-/// and `coord_put` — taking the base to 43. Unlike `coord_get`, whose 21
-/// cross-class callers force `escalated`, each twin has exactly ONE caller, so
-/// each is classified by its own route: the grant mint is `session-noop` (coord
-/// derives the tenant from the path session's row), the attach-preference
-/// write is `device` (`coord.devices` is keyed by `device_id` with no tenant
-/// dimension). The `session-owed` row stays at 0 on purpose — a debt
-/// count that is deleted the moment it empties cannot show the next
-/// re-opening.
-///
-/// Plan `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions` Phase 1
-/// adds two: the spawn-precondition credential ladder's probe of the allocation
-/// door (`device` — the default binding's credential IS the subject under test,
-/// and the probe allocates nothing) and `agent_runtime`'s `spawn-stalled`
-/// lifecycle post (`session-noop` — keyed by the path `agent_id`, like its
-/// `spawn-complete`/`spawn-failed` siblings). So `device` 19 -> 20 and
-/// `session-noop` 7 -> 8.
-///
-/// The same plan's Phases 2 + 4 add two more. The trust gate's autonomy-dial
-/// read (`claude_session/trust_gate.rs`, `device`) fetches THIS device's own
-/// tenant's `policy/security-and-autonomy` document — the default binding's
-/// tenant IS the subject, and presenting any other credential would answer about
-/// the wrong tenant; it persists nothing. `agent_runtime`'s `spawn-blocked`
-/// lifecycle post is `session-noop` for exactly the reason its `spawn-stalled`
-/// sibling above is: keyed by the path `agent_id`, no tenant persisted. So
-/// `device` 20 -> 21 and `session-noop` 8 -> 9.
-///
-/// Adopting qontinui-runner#1278 (the plan adapter's cold-start seed) adds one
-/// more: `push.rs::list_statuses`, the bulk seed's paged read. It is
-/// `work-owed` for exactly the reason `current_status` beside it is — the
-/// periodic plan scan holds only `self.base` + `self.client`, so there is no
-/// session to ask and the plan's repo is the only tenancy signal. So
-/// `work-owed` 15 -> 16.
-///
-/// Plan `2026-09-11-the-plan-corpus-scan-root-does-not-report-its-own-drift`
-/// Revised Phase 2 adds one more: `body_push.rs::report_scan_root`, the body
-/// sync's post of this device's scan-root reading to qontinui-web. It is
-/// `work-owed`, not `device`, although the web row is keyed per device: the
-/// reading qualifies the corpus the plans dir FEEDS, so it has to land in the
-/// same org as the artifacts that dir produces — and those are the upsert's,
-/// whose tenant is the plan's repo. When Phase 6 resolves that upsert's
-/// tenant, this site moves with it. So `work-owed` 16 -> 17.
-///
-/// Plan `2026-09-13-drained-runner-never-reaches-idle` Phase 3 adds one:
-/// `coord_drain_state.rs`'s `GET /coord/devices/me/drain`. It is `device` and
-/// not an owed class — `me` resolves to the device its own JWT was minted for,
-/// coord's drain row is keyed by device_id, and the request carries no tenant
-/// field for the runner to set or coord to derive. Nothing about it changes
-/// when this device is paired with more tenants, so there is no future phase
-/// for it to owe. So `device` 21 -> 22.
-///
-/// Phase 5 of
-/// `2026-09-20-a-recorded-delivery-scope-is-permanent-so-a-mis-declared-phase-is-uncorrectable`
-/// added two new `mcp/plan_library.rs` forwards to the same qontinui-web base
-/// as its siblings — `upstream_put` (the edge-correction verb) and
-/// `upstream_delete` (the edge-retraction verb) — each with the same
-/// session-less, artifact-keyed posture and the same E3 open question. So
-/// `work-owed` 17 -> 19.
-///
-/// Phase 6 then removed 11 the same way: every `work-owed` site that talks to
-/// COORD now resolves its tenant from the artifact's repo and states it via
-/// `attach_device_auth_for` — `plan_workunit_adapter/push.rs` (5),
-/// `install_effects_producer/coord_client.rs` (2), `agent_worktree/fs_backstop.rs`,
-/// `git_supervision/commit_forwarder.rs`, and `repo_detection.rs`'s own register
-/// call. It also ADDED one `device` site: the canonical-repo READ that backs the
-/// whole resolution (`repo_tenant::fetch_registered_repos`), which cannot itself
-/// be tenant-scoped without circularity. So `device` 22 -> 23 and `work-owed`
-/// 19 -> 8, leaving 23 + 10 + 8 + 2 = 43. The `work-owed` sites that remain post to **qontinui-web**, which
-/// derives `organization_id` from the authenticated principal — lowering them
-/// waits on escalation E3, not on another credential-threading phase. (The two
-/// Phase-5 `mcp/plan_library.rs` forwards are among those that remain: they are
-/// qontinui-web-bound, so Phase 6's coord-side seam does not reach them.)
-///
-/// Plan `2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential`
-/// (review finding 1) then moved `fleet.rs`'s register heartbeat onto the
-/// stating seam: its bearer follows the binding set's source
-/// (`LocalBindingSet::bearer_scope` — the default's own per-tenant slot when
-/// the set came from those slots), so `device` 22 -> 21.
-///
-/// Plan `2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant`
-/// Phase 4 then added `repo_tenant::fetch_repo_tenants`, the cwd resolver's
-/// `GET /coord/repos/tenants` read. It is `device` by the route's contract:
-/// coord answers it over the caller DEVICE's own `tenant_devices` bindings and
-/// refuses any principal that does not prove a device. So `device` 21 -> 22.
-const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
-    ("device", 22),
-    ("session-noop", 11),
-    ("session-owed", 0),
-    ("work-owed", 8),
-    ("escalated", 2),
 ];
 
 /// Extract the kind from `coord-tenant-scope(<kind>):`.
@@ -1115,85 +1008,22 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
          confirm its coord route really has no tenant dimension before you do."
     );
 
-    // Totals, checked independently of the per-file rows.
+    // No checked-in total: the per-kind and overall counts are sums of the rows
+    // above, and as cells of their own they were rewritten by every PR that
+    // added a site, so two such PRs conflicted on them whatever files they
+    // touched (plan
+    // 2026-11-04-runner-generated-and-ledger-files-are-merge-neutral-and-land-behind-a-drain,
+    // Phase 1e). They are printed so a reader sees them, and every scanned site
+    // must still have been classified.
     let mut totals: BTreeMap<&str, usize> = BTreeMap::new();
     for ((_, kind), n) in &found {
         *totals.entry(kind.as_str()).or_default() += n;
     }
-    for (kind, want) in EXPECTED_TENANT_SCOPE_TOTALS {
-        let got = totals.get(kind).copied().unwrap_or(0);
-        assert_eq!(
-            got, *want,
-            "tenant-scope `{kind}`: found {got}, expected {want}. If a phase legitimately moved \
-             sites out of a class, lower the number here in the SAME commit — a debt count that \
-             is not watched is not a debt."
-        );
-    }
-
     let total: usize = totals.values().sum();
+    println!("defaulting call sites: {sites}; by tenant-scope kind: {totals:?}");
     assert_eq!(
         total, sites,
-        "every scanned defaulting call site should have been classified"
-    );
-    assert_eq!(
-        sites, 43,
-        "expected 43 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
-         session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 1 \
-         new work-owed defaulting call site (mcp/plan_library.rs's upstream_get_raw, the \
-         body-export forward, which shares upstream_get's qontinui-web base and its \
-         session-less, artifact-keyed posture). The session-archive work briefly took the \
-         base to 42 with two new session-scoped defaulting sites (mcp/session_repository.rs's \
-         proxy read helper, session_archive/push.rs's upsert sink); both now state their \
-         tenant and are no longer scanned. Phase 3c of the remote-session-tabs plan then added \
-         coord_http.rs's coord_post and coord_put, the write-side twins of coord_get, each with \
-         a single caller and so classified by its own route (session-noop, device) rather than \
-         coord_get's escalated; 41 to 43. The spawn-precondition work (plan \
-         2026-08-20-worktree-spawn-autonomy-and-trust-preconditions Phase 1) then added 2: the \
-         credential ladder's authed read in claude_session/spawn_preconditions.rs (device) and \
-         agent_runtime's spawn-stalled lifecycle post (session-noop); 43 to 45. The same plan's Phases 2 + 4 added 2 more: the \
-         trust gate's autonomy-dial read in claude_session/trust_gate.rs (device) and \
-         agent_runtime's spawn-blocked lifecycle post (session-noop); 45 to 47. Adopting \
-         qontinui-runner#1278 then added the plan adapter's cold-start bulk seed \
-         (plan_workunit_adapter/push.rs::list_statuses, work-owed, the same door and the \
-         same debt as current_status beside it); 47 to 48. Plan \
-         2026-09-11-the-plan-corpus-scan-root-does-not-report-its-own-drift then added \
-         plan_workunit_adapter/body_push.rs::report_scan_root (work-owed, the same web base and \
-         the same debt as the artifact upsert beside it); 48 to 49. Plan \
-         2026-09-13-coord-publishes-agent-jwts-on-a-redis-channel-fronted-by-an-unauthenticated-ws-firehose \
-         Phase 3 then added agent_runtime's credential-door fetch (fetch_agent_credential, \
-         session-noop: the path agent_id is the whole key and coord compares the bearer's \
-         device_id to the agent row); 49 to 50. Plan 2026-09-13-drained-runner-never-reaches-idle Phase 3 then added \
-         coord_drain_state.rs's `GET /coord/devices/me/drain` (device: `me` resolves to the \
-         device its own JWT was minted for, the drain row is keyed by device_id, and the \
-         request carries no tenant field for anyone to set or derive); 50 to 51. Phase 5 of \
-         2026-09-20-a-recorded-delivery-scope-is-permanent-so-a-mis-declared-phase-is-uncorrectable \
-         then added mcp/plan_library.rs's upstream_put and upstream_delete (both work-owed, the \
-         two new edge-correction/retraction forwards sharing upstream_post's qontinui-web base \
-         and session-less, artifact-keyed posture); 51 to 53. Phase 6 then moved the 11 \
-         work-scoped COORD sites onto the stating seam (push.rs 6, repo_detection.rs, \
-         git_supervision/commit_forwarder.rs, install_effects_producer/coord_client.rs 2, \
-         agent_worktree/fs_backstop.rs) and added one `device` read (repo_tenant's \
-         canonical-repo fetch): 53 - 11 + 1 = 43. Phase 7 then moved fleet.rs's \
-         tenant-declaring wire body (request_and_apply_pull) onto the stating seam: 43 - 1 = \
-         42. MERGE NOTE (2026-09-26, conflict-backlog steward restack of #1448 onto main after \
-         its stacked base #1447 ff-landed): the branch carried 40 off a narrative that stopped \
-         at 51, because its base predated Phase 5's two plan_library forwards. main's 53 is the \
-         current derivation, so the count is main's 43 minus the ONE site this commit moves, \
-         never either side's literal. Plan \
-         2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential \
-         (review finding 1) then moved fleet.rs's register heartbeat onto the stating seam \
-         (its bearer follows the binding set's source): 42 - 1 = 41. Plan \
-         2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant \
-         Phase 4 then added repo_tenant.rs's fetch_repo_tenants, the cwd resolver's \
-         `GET /coord/repos/tenants` read (device: coord answers it over the caller DEVICE's own \
-         bindings and refuses any principal that does not prove a device): 41 + 1 = 42. Plan \
-         2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state Phase 4 then \
-         added agent_runtime's report_session_launched (POST /agents/{{agent_id}}/session, \
-         session-noop): 42 to 43. Found {sites}. A change here \
-         is fine — it just has \
-         to be deliberate. It goes DOWN when a site adopts \
-         `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \
-         defaulting caller, which is the event this number exists to make visible."
+        "every scanned defaulting call site should have been classified (by kind: {totals:?})"
     );
 }
 
@@ -1215,12 +1045,6 @@ fn tenant_scope_kinds_are_a_closed_distinct_set() {
         assert!(
             *n > 0,
             "EXPECTED_TENANT_SCOPES row for {file}/{kind} is 0 — delete the row instead"
-        );
-    }
-    for (kind, _) in EXPECTED_TENANT_SCOPE_TOTALS {
-        assert!(
-            seen.contains(*kind),
-            "EXPECTED_TENANT_SCOPE_TOTALS names unknown kind `{kind}`"
         );
     }
 }

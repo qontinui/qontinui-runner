@@ -1,0 +1,5 @@
+os_bound_tooling	ThreadDpiContextGuard::drop	3eb241a6ad0d209d
+os_bound_tooling	ThreadDpiContextGuard::is_active	d7cad6014e48f8cd
+os_bound_tooling	ThreadDpiContextGuard::set_per_monitor_v2	572bb8d1532af7bc
+os_bound_tooling	frame_inset	b5f08ba7c4b95905
+os_bound_tooling	hwnd_from_tauri	3880ae9ae3038fbc

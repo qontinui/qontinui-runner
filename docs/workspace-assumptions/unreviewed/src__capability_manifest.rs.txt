@@ -1,0 +1,6 @@
+os_bound_tooling	render_manifest_doc	645a5f1e7c83ea9f
+repo_layout	Rung::describe	010f5c16c4b354c9
+repo_layout	Rung::describe	b72c4c1b1234896d
+repo_layout	const CAPABILITY_SPECS	100d312056f323cf
+repo_layout	const CAPABILITY_SPECS	245aae676e462b0a
+repo_layout	const CAPABILITY_SPECS	fb6c1133a9cddbd7
