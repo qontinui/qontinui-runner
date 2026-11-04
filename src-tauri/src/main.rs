@@ -3703,6 +3703,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::watchers::update_watcher,
             commands::web_integration::get_settings_health,
             commands::web_integration::get_web_integration_status,
+            commands::web_integration::get_web_frontend_origin,
             commands::web_integration::redeem_pair_code,
             commands::web_integration::save_web_integration_settings,
             commands::web_integration::test_web_integration_connection,
