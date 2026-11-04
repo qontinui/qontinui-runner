@@ -3247,7 +3247,7 @@ impl TerminalSession {
             return; // ships dark — byte-identical child env
         }
         let base_dir = std::env::temp_dir();
-        let port = crate::install_effects_producer::intercept::bound_port();
+        let port = crate::mcp::types::bound_port();
         // The MODE the terminal gets is resolved from the runner's OWN env
         // (`QONTINUI_INSTALL_INTERCEPT_MODE`; default observe, `gate` enables
         // Phase-3 gating, anything else fails open to observe — plan §3 step 3).
@@ -3334,7 +3334,7 @@ impl TerminalSession {
         // this port. Inject it even when install-interception is OFF so the
         // confirmation works out of the box (the var is shared but harmless when
         // install interception is dark — no install shims are on PATH then).
-        let port = crate::install_effects_producer::intercept::bound_port();
+        let port = crate::mcp::types::bound_port();
         cmd.env(shim_materializer::PORT_ENV, port.to_string());
 
         // ---- Claude SessionStart hook delivery (plan §4, Phase 2) -----------

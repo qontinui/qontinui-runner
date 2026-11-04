@@ -11758,7 +11758,7 @@ mod tests {
     /// frame up, correctly named `:9877`.
     #[test]
     fn headless_finalize_child_env_stamps_the_bound_port_not_the_configured_one() {
-        use crate::install_effects_producer::intercept::{set_bound_port, BoundPortRestore};
+        use crate::mcp::types::{set_bound_port, BoundPortRestore};
         let _env_lock = env_lock();
         // `runner_context` reads the process-global plan-capture level AND the
         // briefing-document cache, whose only serializer is this pin (its `Drop`

@@ -54,6 +54,7 @@ mod auth;
 mod auto_commit;
 mod automation_stack; // Can this box drive a GUI? — /health `automationStack` + the shared $DISPLAY resolution
 mod backup;
+mod boot_stage; // How far the boot got toward binding the listener — read by the wedge detector
 mod build_drift;
 // Which RUNG answered for each capability this binary delivers — the spine of
 // the published-vs-development parity check
@@ -806,6 +807,7 @@ const DEGRADED_PLACEHOLDER_DSN: &str = "postgresql://qontinui@127.0.0.1:1/qontin
     reason = "borrows the process-lived APP_RUNTIME during synchronous boot, predates the disallowed_types gate — migrate to a tokio::runtime::Handle; plan 2026-09-12-residual-work-from-the-april-2026-plan-audit"
 )]
 fn boot_embedded_pg(rt: &tokio::runtime::Runtime) -> Arc<crate::database::pg::PgDb> {
+    boot_stage::stamp(boot_stage::BootStage::EmbeddedPostgresBootstrap);
     // Honours `QONTINUI_EMBEDDED_PG_DIR` (blank ⇒ unset), falling back to the
     // machine-shared default. A temp/test runner sets it and gets a cluster of
     // its own — install dir, data dir, password file and attach probe all hang
@@ -1016,6 +1018,7 @@ fn select_db_arm(
         return boot_embedded_pg(rt);
     };
 
+    boot_stage::stamp(boot_stage::BootStage::ConfiguredPostgresConnect);
     info!(
         "Connecting to the configured PostgreSQL via profile '{}'",
         profile.source
@@ -1653,7 +1656,45 @@ fn install_app_runtime() {
 static GLOBAL_ALLOCATOR: qontinui_runner_lib::alloc_breadcrumb::RunnerAlloc =
     qontinui_runner_lib::alloc_breadcrumb::RunnerAlloc::runner();
 
+/// `QONTINUI_TEST_PRE_BIND_DELAY_MS` — DEBUG-BUILD-ONLY fault injection that
+/// delays the MCP API listener's bind by the given milliseconds.
+///
+/// Exists so the wedge detector's never-answered arm (plan
+/// `2026-11-04-runner-wedge-detector-reads-a-boot-as-a-wedge-and-never-bound-is-silent`,
+/// Phase 2) can be driven on a temp runner: a boot that never binds is
+/// otherwise unreproducible on demand. Compiled out of release builds by
+/// `cfg!(debug_assertions)`, so a shipped runner cannot be told to stall its
+/// own boot. Logged loudly when honoured, because a runner that is slow to bind
+/// ON PURPOSE must never be mistaken for one that is slow by accident.
+fn test_pre_bind_delay() -> Option<std::time::Duration> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let raw = std::env::var("QONTINUI_TEST_PRE_BIND_DELAY_MS").ok()?;
+    let ms: u64 = match raw.trim().parse() {
+        Ok(ms) => ms,
+        Err(_) => {
+            warn!(
+                "QONTINUI_TEST_PRE_BIND_DELAY_MS={raw:?} is not a number of milliseconds; ignored"
+            );
+            return None;
+        }
+    };
+    warn!(
+        delay_ms = ms,
+        "QONTINUI_TEST_PRE_BIND_DELAY_MS is set (debug build): FAULT INJECTION — the MCP API \
+         listener will not bind for another {ms} ms. The wedge detector is expected to report \
+         never_bound if this exceeds its grace."
+    );
+    Some(std::time::Duration::from_millis(ms))
+}
+
 fn main() {
+    // Anchor the process clock (`health_monitor::MONOTONIC_EPOCH`) as early as
+    // possible: every boot-stage offset and the bind latency are measured from
+    // it, and the never-answered grace starts from it.
+    boot_stage::stamp(boot_stage::BootStage::ProcessStart);
+
     // A SUBJECT runner (`QONTINUI_INSTANCE_ROOT` set) validates its launch env
     // and roots its locations BEFORE anything below reads a path; a no-op for
     // the primary. First, while still single-threaded — see the fn's doc.
@@ -1800,6 +1841,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start health monitoring to detect resource exhaustion
     health_monitor::start_health_monitor();
+    boot_stage::stamp(boot_stage::BootStage::HealthMonitorStarted);
 
     // Initialize Windows Job Object so spawned AI processes are auto-killed
     // if the runner crashes (safety net for the explicit tree kill in shutdown).
@@ -1900,7 +1942,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             .build()
             .expect("Failed to create tokio runtime for PG initialization");
 
+        boot_stage::stamp(boot_stage::BootStage::DatabaseArmSelect);
         let pg = select_db_arm(&rt, &profile);
+        boot_stage::stamp(boot_stage::BootStage::DevAppsAndOnlineLearning);
 
         // Gated on `pg_available_since_boot()` rather than on the arm: before
         // P4 `bootstrap_dev_apps` sat INSIDE the external arm's success branch,
@@ -2668,6 +2712,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // plugin — it would prevent them from starting since they share the same binary.
     let is_secondary_instance = instance::is_secondary();
 
+    boot_stage::stamp(boot_stage::BootStage::TauriBuilder);
     let mut builder = tauri::Builder::default();
 
     if !is_secondary_instance {
@@ -3755,6 +3800,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         // deleted as each module moves.
         .setup(|app| {
             info!("Tauri application setup starting");
+            boot_stage::stamp(boot_stage::BootStage::TauriSetup);
 
             // Capture the primary's boot instant ONCE, synchronously, before
             // anything can serve a request. It is the reference the PID-reuse
@@ -3817,6 +3863,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // heartbeats from `agent_claims`) can emit Tauri events
             // to the webview without taking an AppHandle parameter.
             tauri_app_handle::set(app.handle().clone());
+            boot_stage::stamp(boot_stage::BootStage::AppHandleSet);
 
             // Plan 2026-05-24-federation-verify-and-gitop.md Phase 4 —
             // initialize the process-wide observable-bridge registry.
@@ -5693,6 +5740,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         is_secondary,
                     };
 
+                    boot_stage::stamp(boot_stage::BootStage::MainWindowBuild);
                     match webview_recovery::build_main_window(app.handle(), &spec) {
                         Ok(win) => {
                             // Phase 1a: subscribe to WebView2 `ProcessFailed` so a
@@ -5779,7 +5827,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             info!("Starting MCP API server on port {}", api_port);
             let mcp_app_handle = app.handle().clone();
             let mcp_instance_manager = app.state::<Arc<instance_manager::InstanceManager>>().inner().clone();
+            boot_stage::stamp(boot_stage::BootStage::ApiServerSpawn);
+            let pre_bind_delay = test_pre_bind_delay();
             tauri::async_runtime::spawn(async move {
+                // Debug-build fault injection: delay the BIND, not the
+                // monitor and not the UI thread — so the sleep is inside the
+                // server task, on the async runtime, never on `.setup`.
+                if let Some(delay) = pre_bind_delay {
+                    tokio::time::sleep(delay).await;
+                    warn!(
+                        delay_ms = delay.as_millis() as u64,
+                        "QONTINUI_TEST_PRE_BIND_DELAY_MS: pre-bind delay elapsed; starting the \
+                         MCP API server now"
+                    );
+                }
                 info!("MCP API server task starting...");
                 match mcp_api::start_server(mcp_app_state, mcp_rag_state, mcp_app_handle, api_port, mcp_instance_manager).await {
                     Ok(_) => info!("MCP API server stopped normally"),
@@ -6767,6 +6828,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             info!("Tauri application setup complete");
+            boot_stage::stamp(boot_stage::BootStage::SetupComplete);
             Ok(())
         })
         .on_window_event(|window, event| {

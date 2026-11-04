@@ -98,119 +98,20 @@
 //! ## Bound-port plumbing (plan §6 — the #1 live-verification footgun)
 //! The shim must loop back to the **actually-bound** runner port, not the
 //! bootstrap default `get_mcp_api_port()` (wrong for secondary/temp runners).
-//! The bound port lives in `app_state.api_port`, but the terminal-spawn call
-//! chain (`TerminalManager::create` → `TerminalSession::spawn`) does NOT carry
-//! `app_state`. Threading it through would churn every caller of `create`. So we
-//! stash the bound port in a process-global [`set_bound_port`] at the SAME place
-//! the server records it (`mcp_api.rs`, right after `api_port.store`). The seam
-//! reads it via [`bound_port`]. This is the "documented OnceLock set-at-bind"
-//! option the plan sanctions when the call chain lacks `app_state`.
+//! The process-global that carries it began here and now lives beside
+//! `get_mcp_api_port` as [`crate::mcp::types::bound_port`] /
+//! [`crate::mcp::types::set_bound_port`], because it is not specific to the
+//! shim: the health monitor's `/livez` self-probe reads it too (plan
+//! `2026-11-04-runner-wedge-detector-reads-a-boot-as-a-wedge-and-never-bound-is-silent`, D3).
 
 pub mod classify;
 pub mod gate;
 pub mod precontext;
 pub mod shim_materializer;
 
-use std::sync::atomic::{AtomicU16, Ordering};
-
-/// Process-global bound runner API port for the interception shim loopback.
-/// `0` = not yet bound (the seam then falls back to the bootstrap port as a
-/// last resort, but in practice `set_bound_port` runs before any terminal can
-/// spawn). Set once by `mcp_api.rs` immediately after the listener binds.
-static BOUND_PORT: AtomicU16 = AtomicU16::new(0);
-
-/// Record the actually-bound runner API port. Called from `mcp_api.rs` right
-/// after `app_state.api_port.store(...)` so the terminal env-seam (which has no
-/// `app_state`) can read the correct port for the shim loopback.
-///
-/// This is the plain atomic store its name says, and nothing else. The
-/// OUT-of-process breadcrumb (plan
-/// `2026-07-17-universal-coord-device-identity-for-any-session` §4 — the
-/// identity shim launching `claude` in a bare terminal has no way to read
-/// [`BOUND_PORT`] or the managed `AppState`) used to be published from here as
-/// a side effect; it is now published one line later by the only production
-/// caller, the bind-success arm of `mcp_api::start_server`, TOGETHER with the
-/// per-port loopback handshake key path the record must name (plan
-/// `2026-09-07-the-runner-loopback-handshake-key-is-box-global-and-a-second-runner-clobbers-it`).
-/// That also removed the `!cfg!(test)` guard this function carried so the bin
-/// crate's unit tests (which call this with synthetic ports) could not write a
-/// fake advertisement into the developer's real `~/.qontinui/runner/`: with no
-/// side effect here there is nothing to guard. See
-/// `qontinui_runner_lib::runner_breadcrumb`.
-pub fn set_bound_port(port: u16) {
-    BOUND_PORT.store(port, Ordering::Relaxed);
-}
-
-/// Test-only RAII restore for [`BOUND_PORT`].
-///
-/// Captures the RAW atomic, which [`bound_port`] cannot give back: that reader
-/// substitutes the bootstrap port when the atomic is `0`, so "save the current
-/// value and put it back" via `bound_port()` writes a fabricated non-zero port
-/// over the genuine not-yet-bound state and destroys it for the rest of the
-/// test binary. Restoring on `Drop` also covers the unwind path — a failing
-/// assertion would otherwise leave a scratch port behind and turn one real
-/// failure into a cascade of unrelated ones.
-///
-/// Restores by storing directly; equivalent to [`set_bound_port`] now that
-/// the latter is a bare store (its former breadcrumb-publish side effect moved
-/// to `mcp_api::start_server`'s bind arm).
-#[cfg(test)]
-pub(crate) struct BoundPortRestore(u16);
-
-#[cfg(test)]
-impl BoundPortRestore {
-    pub(crate) fn capture() -> Self {
-        Self(BOUND_PORT.load(Ordering::Relaxed))
-    }
-}
-
-#[cfg(test)]
-impl Drop for BoundPortRestore {
-    fn drop(&mut self) {
-        BOUND_PORT.store(self.0, Ordering::Relaxed);
-    }
-}
-
-/// The bound runner API port for the shim loopback. Falls back to the bootstrap
-/// port (`get_mcp_api_port`) only if the bind hasn't recorded one yet — a window
-/// that should never be hit in practice (bind precedes terminal spawn).
-pub fn bound_port() -> u16 {
-    let p = BOUND_PORT.load(Ordering::Relaxed);
-    if p != 0 {
-        p
-    } else {
-        crate::mcp::types::get_mcp_api_port()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bound_port_roundtrips_and_falls_back() {
-        // `BOUND_PORT` is process-global and the fallback arm reads
-        // `QONTINUI_PORT`, so this test was only sound while it was the sole
-        // mutator. It is not any more — the spawn seams read it through
-        // `terminal::spawn_seam_api_port`, and those tests set it too.
-        //
-        // The lock serializes the tests that OPT IN to it, which is the three
-        // that assert on a specific port value; it does not exclude production
-        // readers exercised by tests that don't take it (`config_report_cmd`'s
-        // seam capture, for one). That is fine only because those assert
-        // PRESENCE, never a value. Asserting a value there means taking this
-        // lock there too.
-        let _env_lock = crate::test_env::env_lock();
-        let _restore = BoundPortRestore::capture();
-
-        // Fresh process state may already have a value from another test; assert
-        // the set/get contract rather than a specific initial value.
-        set_bound_port(54321);
-        assert_eq!(bound_port(), 54321);
-        set_bound_port(0);
-        // Falls back to the bootstrap port (non-zero) when unset.
-        assert_ne!(bound_port(), 0);
-    }
 
     // =======================================================================
     // BASH-LEVEL SMOKE (plan §4 Phase 3 verify step 5).

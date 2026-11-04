@@ -14269,6 +14269,7 @@ pub async fn start_server(
     // runner ACTUALLY binds, which is unknown until the bind loop settles (a
     // blocked primary port silently promotes the runner onto `port + 1`).
 
+    crate::boot_stage::stamp(crate::boot_stage::BootStage::ApiRouterBuild);
     info!("MCP API server: building router via create_router...");
     let router = create_router(app_state, rag_state, app_handle, instance_manager);
     info!("MCP API server: create_router returned, entering bind loop");
@@ -14287,6 +14288,7 @@ pub async fn start_server(
 
     // Try the requested port first, then fallback ports if zombie connections are blocking
     // This can happen on Windows when previous process crashes leave orphaned sockets
+    crate::boot_stage::stamp(crate::boot_stage::BootStage::ApiBindLoop);
     let ports_to_try = crate::instance::api_ports_to_try(port);
     let mut last_error = None;
 
@@ -14324,7 +14326,18 @@ pub async fn start_server(
                 // `app_state`) injects the CORRECT loopback port for
                 // secondary/temp runners — plan §6's #1 live-verification
                 // footgun. Set HERE, the same place app_state.api_port lands.
-                crate::install_effects_producer::intercept::set_bound_port(try_port);
+                crate::mcp::types::set_bound_port(try_port);
+                crate::boot_stage::stamp(crate::boot_stage::BootStage::ApiListenerBound);
+                // Bind latency from the process clock — the figure the
+                // never-answered grace (`COLD_BUNDLE_BOOT_ALLOWANCE_MS`) was
+                // sized against, logged on every start so it can be re-derived
+                // from evidence, cold boots included.
+                let bind_latency_ms = crate::health_monitor::process_elapsed().as_millis() as u64;
+                info!(
+                    port = try_port,
+                    bind_latency_ms,
+                    "MCP API listener bound {bind_latency_ms} ms after process start"
+                );
 
                 // Rotate this runner start's SAME-USER loopback handshake key at
                 // the BOUND port's path (`~/.qontinui/runner-loopback-key-<port>`)

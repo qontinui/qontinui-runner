@@ -56,7 +56,28 @@ pub fn set_main_hwnd(hwnd: isize) {
         return;
     }
     MAIN_HWND.store(hwnd, std::sync::atomic::Ordering::SeqCst);
-    tracing::info!("ui_thread_probe: cached main-window HWND {hwnd:#x}");
+    let tid = publish_ui_thread_of(hwnd);
+    tracing::info!("ui_thread_probe: cached main-window HWND {hwnd:#x} (UI thread id {tid})");
+}
+
+/// Publish the OS thread id that owns `hwnd` — the native UI thread — so a
+/// `wedge_diagnostics` record can name THAT thread's wait reason rather than
+/// only an anonymous histogram (plan
+/// `2026-11-04-runner-wedge-detector-reads-a-boot-as-a-wedge-and-never-bound-is-silent`,
+/// Phase 1). Returns the id, `0` when the handle names no window.
+///
+/// `GetWindowThreadProcessId` is a message-free window-table read (the same
+/// call the sweep below relies on), so it is safe on every path that caches a
+/// handle, including the fallback one a detector reaches.
+#[cfg(windows)]
+fn publish_ui_thread_of(hwnd: isize) -> u32 {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    // SAFETY: read-only window-table query; a stale handle yields 0. The pid
+    // out-parameter is optional and passed as null.
+    let tid = unsafe { GetWindowThreadProcessId(hwnd as HWND, std::ptr::null_mut()) };
+    qontinui_runner_lib::wedge_diagnostics::set_ui_thread_os_id(tid);
+    tid
 }
 
 /// Forget the cached handle, so the next [`main_hwnd`] re-resolves from
@@ -152,6 +173,7 @@ pub fn main_hwnd() -> Option<isize> {
     // writers necessarily agree (same process, same window), so a plain store
     // is fine.
     MAIN_HWND.store(found, std::sync::atomic::Ordering::SeqCst);
+    publish_ui_thread_of(found);
     STALE_CACHE_LOGGED.store(false, std::sync::atomic::Ordering::SeqCst);
     tracing::info!("ui_thread_probe: resolved main-window HWND {found:#x} via EnumWindows");
     Some(found)

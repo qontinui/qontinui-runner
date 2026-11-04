@@ -174,7 +174,7 @@ pub(crate) const CREDENTIAL_VALUE_ENV_VARS: &[&str] = &[
 /// worse than an absent one. A briefing is the opposite case — it is prose that
 /// must always render, and withholding the port would delete the session's only
 /// pointer at the runner. So this reads
-/// [`crate::install_effects_producer::intercept::bound_port`], the process-global
+/// [`crate::mcp::types::bound_port`], the process-global
 /// recorded in `mcp_api.rs` at the instant the listener binds, which already
 /// carries exactly this bound-else-bootstrap contract and already serves the two
 /// identity/install seams in `session.rs`. It was built for "the terminal
@@ -185,7 +185,7 @@ pub(crate) const CREDENTIAL_VALUE_ENV_VARS: &[&str] = &[
 /// window no session spawn can be inside, since the API server binds during
 /// startup and every seam here runs on a live runner.
 pub(crate) fn spawn_seam_api_port() -> u16 {
-    crate::install_effects_producer::intercept::bound_port()
+    crate::mcp::types::bound_port()
 }
 
 /// Strip [`CREDENTIAL_VALUE_ENV_VARS`] from a PTY child's environment.
@@ -2240,7 +2240,7 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
     /// assertion would have failed.
     #[test]
     fn spawn_seam_api_port_prefers_the_bound_port_over_the_configured_one() {
-        use crate::install_effects_producer::intercept::{set_bound_port, BoundPortRestore};
+        use crate::mcp::types::{set_bound_port, BoundPortRestore};
         // `BOUND_PORT` and `QONTINUI_PORT` are both process-global; hold the
         // bin-wide env lock so a sibling test that also takes it cannot observe
         // or clobber either mid-assertion. Both restores are RAII, so a failing
@@ -2265,7 +2265,7 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
     /// here would delete the session's only pointer at its runner.
     #[test]
     fn spawn_seam_api_port_falls_back_when_no_bind_has_been_recorded() {
-        use crate::install_effects_producer::intercept::{set_bound_port, BoundPortRestore};
+        use crate::mcp::types::{set_bound_port, BoundPortRestore};
         let _env_lock = crate::test_env::env_lock();
         let _env = crate::test_env::EnvVarRestore::capture(&["QONTINUI_PORT"]);
         let _bound = BoundPortRestore::capture();
