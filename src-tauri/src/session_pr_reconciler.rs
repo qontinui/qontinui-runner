@@ -1056,12 +1056,12 @@ async fn refresh_stored_statuses(
                     has_coord_landed_label(&pr.labels),
                     proof,
                 );
-                // `get_pr`'s PrStatus exposes no merged_at; preserve any stamp
-                // the branch path already recorded.
+                // A stamp the branch path already recorded wins; otherwise
+                // take GitHub's own `merged_at` (absent for an ff-land).
                 let status = session_pr_status(
                     &verdict,
                     &pr.state,
-                    row.merged_at,
+                    stored_or_fetched_merged_at(row.merged_at, pr.merged_at.as_deref()),
                     pr.closed_at.as_deref().and_then(parse_ts),
                 );
                 if let Err(e) = pg_db
@@ -1474,6 +1474,16 @@ async fn git_commit_ts(dir: &str, rev: &str) -> Option<i64> {
         .trim()
         .parse::<i64>()
         .ok()
+}
+
+/// CALL SITE 2's `merged_at`: keep a stamp already stored on the row, and
+/// otherwise fall back to the one `get_pr` fetched. A deleted-branch landed PR
+/// reaches only call site 2, so without the fallback its row never gets one.
+fn stored_or_fetched_merged_at(
+    stored: Option<DateTime<Utc>>,
+    fetched: Option<&str>,
+) -> Option<DateTime<Utc>> {
+    stored.or_else(|| fetched.and_then(parse_ts))
 }
 
 /// Parse a GitHub RFC3339 timestamp to `DateTime<Utc>`.
@@ -2165,6 +2175,22 @@ mod tests {
         // a pushed-then-deleted local branch is still attributable.
         assert_eq!(got[2].sha, "remotesha2");
         assert_eq!(got[2].session_ids, vec!["session-b"]);
+    }
+
+    #[test]
+    fn call_site_2_merged_at_prefers_stored_then_fetched() {
+        let stored = parse_ts("2026-08-14T09:00:00Z");
+        let fetched = "2026-08-15T10:00:00Z";
+        // A stamp the branch path recorded is never overwritten.
+        assert_eq!(stored_or_fetched_merged_at(stored, Some(fetched)), stored);
+        // A deleted-branch landed PR has none stored: take GitHub's.
+        assert_eq!(
+            stored_or_fetched_merged_at(None, Some(fetched)),
+            parse_ts(fetched)
+        );
+        // An ff-land carries no merged_at at all, and a junk value is not a time.
+        assert_eq!(stored_or_fetched_merged_at(None, None), None);
+        assert_eq!(stored_or_fetched_merged_at(None, Some("junk")), None);
     }
 
     #[test]
