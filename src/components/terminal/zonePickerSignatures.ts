@@ -19,7 +19,7 @@ import type {
   SemanticSnapshot,
 } from "@qontinui/ui-bridge";
 
-import { LAYOUT_PRESETS } from "./useZoneLayout";
+import { LAYOUT_PRESETS, resolveLayoutArg } from "./useZoneLayout";
 import {
   readSignature,
   preHasPrefix,
@@ -53,13 +53,21 @@ function textParam(params: ActionParams, key: string): string | undefined {
  * preserves in-range assignments and compacts the rest, and which headers that
  * leaves is not stated by the handler, so it is not predicted (an unknown
  * layout id throws before any effect, so nothing is predicted for it either).
+ *
+ * The layout argument resolves through `resolveLayoutArg`, the handler's own
+ * resolver, so a window count (`"1"`) predicts what `"single"` does. A
+ * `pageId` makes no prediction: it may name a page that is not on screen, whose
+ * grid renders none of the headers this registry sees, and `tabCount` is the
+ * on-screen page's count, not that page's.
  */
 export function predictSelectLayout(
   params: ActionParams,
   pre: SemanticSnapshot,
   tabCount: number,
 ): PredictedDelta {
-  const layoutId = textParam(params, "layoutId");
+  if (textParam(params, "pageId") !== undefined) return {};
+  const raw = textParam(params, "layoutId");
+  const layoutId = raw === undefined ? null : resolveLayoutArg(raw);
   const preset = LAYOUT_PRESETS.find((l) => l.id === layoutId);
   if (!preset) return {};
   if (preset.zones.length <= 1 && tabCount <= 1 && preHasPrefix(pre, ZONE_HEADER_PREFIX)) {
@@ -84,6 +92,9 @@ export function selectLayoutSignature(tabCount: number): EffectSignature {
 }
 
 export const LIST_LAYOUTS_SIGNATURE = readSignature("zone-layout-picker.list-layouts");
+
+/** `get-page-layout` — reports one page's grid state and changes nothing. */
+export const GET_PAGE_LAYOUT_SIGNATURE = readSignature("zone-layout-picker.get-page-layout");
 
 // ---------------------------------------------------------------------------
 // zone-profile-picker
