@@ -60,10 +60,9 @@
 //!   answers it 403 — and the co-pilot planner's `POST prompt-home/plan`
 //!   (`lib/co-pilot/planClient.ts`).
 //!   The console's UI Bridge dashboard (`/admin/coord/ui-bridge`, plan
-//!   `2026-10-23-console-presentation-spaces` Phase 6) reuses those hooks and
-//!   makes four relay calls of its own from
-//!   `admin/coord/ui-bridge/_lib/relayReads.ts`, a module that phase's web
-//!   half adds (it is on qontinui-web main once that half lands):
+//!   `2026-10-23-console-presentation-spaces` Phase 6, landed as
+//!   qontinui-web#1992) reuses those hooks and defines four relay calls of
+//!   its own in `admin/coord/ui-bridge/_lib/relayReads.ts`:
 //!   `fetchRunnerHealth` (`GET /health`, listed below);
 //!   `fetchRunnerComponents` (`GET /ui-bridge/control/components`, through
 //!   `runnerProxyGet`) and `fetchRunnerPageHealth`
@@ -71,10 +70,13 @@
 //!   POST twin beside `runnerProxyGet` in the same `runner-relay.ts`), the two
 //!   entries listed for it; and `fetchRunnerVisibility`
 //!   (`POST /ui-bridge/control/visibility`, the occlusion sweep), which this
-//!   arm also answers 403. The dashboard renders that 403 as a labelled
-//!   UNKNOWN, and `the_dashboard_reads_open_nothing_beside_them` pins the
-//!   refusal. The "Two web calls" paragraph below says why `GET /apps` and
-//!   the sweep are refused.
+//!   arm would answer 403. The dashboard never sends that fourth call: the
+//!   sweep's carriage in `relayReads.ts` is `never`, so `isRelayed` answers
+//!   false and the page renders the occlusion row as a labelled UNKNOWN
+//!   without asking. That carriage flips in the same change as an entry here.
+//!   `the_dashboard_reads_open_nothing_beside_them` pins the refusal. The
+//!   "Two web calls" paragraph below says why `GET /apps` and the sweep are
+//!   refused.
 //!
 //! Nothing else in the workspace sends an `http_request` frame.
 //!
