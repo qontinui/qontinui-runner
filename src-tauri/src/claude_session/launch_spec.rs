@@ -235,6 +235,14 @@ pub struct LaunchSpec {
     /// Caller-provided model ⇒ `--model <m>`; subsumes model overrides and any
     /// failover sniff. When set, drops any `--model` from the template.
     pub model: Option<String>,
+    /// Caller-provided effort level ⇒ `--effort <level>` (Claude Code 2.1.305+
+    /// lists `low | medium | high | xhigh | max`). Follows [`Self::model`]: when
+    /// set it drops any `--effort` from the template; when `None` a template
+    /// `--effort` is kept, else the CLI default applies. The caller passes a
+    /// level it has already validated — the restart restore passes only a
+    /// canonical level it read off the session's own pane (plan
+    /// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D5).
+    pub effort: Option<String>,
     /// Display name ⇒ `--name <v>` (shown in the prompt box, `/resume` picker and
     /// terminal title). Passed through [`sanitize_session_name`]; a name that
     /// sanitises to nothing is omitted. When set, drops any `--name` / `-n` (and
@@ -399,7 +407,7 @@ pub fn render_pty_command(spec: &LaunchSpec, cfg: &LaunchConfig, is_windows: boo
 /// The shared flag-composition core. Both renderers build on this so the
 /// composed flag set can never diverge between argv and PTY.
 ///
-/// Order: `[permission] [model] [session] [other template flags…] [extra_required…]`.
+/// Order: `[permission] [model] [effort] [session] [other template flags…] [extra_required…]`.
 /// Precedence per flag: spec field > per-account claude template > global
 /// template > CLI default.
 fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
@@ -433,6 +441,7 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
     let name = spec.name.as_deref().and_then(sanitize_session_name);
 
     let mut template_model: Option<String> = None;
+    let mut template_effort: Option<String> = None;
     let mut other_units: Vec<FlagUnit> = Vec::new();
     let mut session_via_placeholder = false;
 
@@ -461,6 +470,12 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 }
                 // Model is decided below (spec beats template).
                 "--model" => template_model = unit.values.first().cloned(),
+                // Effort is decided below the same way (spec beats template).
+                "--effort" => template_effort = unit.values.first().cloned(),
+                // The attached spelling, `--effort=<level>`, is the same flag.
+                n if n.starts_with("--effort=") => {
+                    template_effort = n.strip_prefix("--effort=").map(str::to_string);
+                }
                 // Name is spec-owned when the caller supplies one: drop the
                 // template's `--name` / `-n` (either spelling) so two never ship.
                 "--name" | "-n" if name.is_some() => {}
@@ -519,6 +534,15 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
     } else if let Some(model) = template_model {
         out.push("--model".to_string());
         out.push(model);
+    }
+
+    // 2b. Effort — spec beats template; else template; else CLI default (omit).
+    if let Some(effort) = &spec.effort {
+        out.push("--effort".to_string());
+        out.push(effort.clone());
+    } else if let Some(effort) = template_effort {
+        out.push("--effort".to_string());
+        out.push(effort);
     }
 
     // 3. Session — appended only when the template did not position it via
@@ -1296,6 +1320,36 @@ mod tests {
         assert_eq!(value_after(&argv, "--model"), Some("opus"));
         assert!(!argv.iter().any(|a| a == "sonnet"));
         assert_eq!(argv.iter().filter(|a| *a == "--model").count(), 1);
+    }
+
+    #[test]
+    fn spec_effort_beats_template_effort_and_is_rendered_once() {
+        let mut s = spec();
+        s.effort = Some("max".to_string());
+        let argv = render_argv(&s, &tmpl("claude --effort low --model sonnet"), "claude");
+        assert_eq!(value_after(&argv, "--effort"), Some("max"));
+        assert!(!argv.iter().any(|a| a == "low"), "{argv:?}");
+        assert_eq!(argv.iter().filter(|a| *a == "--effort").count(), 1);
+        // The template's other flags are untouched.
+        assert_eq!(value_after(&argv, "--model"), Some("sonnet"));
+    }
+
+    #[test]
+    fn template_effort_kept_and_no_effort_flag_without_either() {
+        let argv = render_argv(&spec(), &tmpl("claude --effort low"), "claude");
+        assert_eq!(value_after(&argv, "--effort"), Some("low"));
+        let attached = render_argv(&spec(), &tmpl("claude --effort=low"), "claude");
+        assert_eq!(value_after(&attached, "--effort"), Some("low"));
+        let mut s = spec();
+        s.effort = Some("max".to_string());
+        let over = render_argv(&s, &tmpl("claude --effort=low"), "claude");
+        assert_eq!(value_after(&over, "--effort"), Some("max"));
+        assert!(
+            !over.iter().any(|a| a.starts_with("--effort=")),
+            "the attached template spelling is dropped, not shipped beside the spec: {over:?}"
+        );
+        let bare = render_argv(&spec(), &LaunchConfig::default(), "claude");
+        assert!(!bare.iter().any(|a| a == "--effort"), "{bare:?}");
     }
 
     #[test]

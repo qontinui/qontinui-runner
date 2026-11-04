@@ -434,10 +434,26 @@ pub fn decide_drain(
     state: &crate::coord_drain_state::CoordDrainState,
     admission: &DrainAdmission,
 ) -> Option<SpawnDecision> {
+    decide_drain_with_hold(state, admission, None)
+}
+
+/// PURE: [`decide_drain`] with the restart prepare's runner-local hold applied
+/// (`crate::coord_drain_state::gate_with_local_hold`), so an agent admission
+/// honours the same hold `drain_gate` does.
+pub fn decide_drain_with_hold(
+    state: &crate::coord_drain_state::CoordDrainState,
+    admission: &DrainAdmission,
+    local_hold: Option<&str>,
+) -> Option<SpawnDecision> {
     let DrainAdmission::Origin { origin, .. } = admission else {
         return None;
     };
-    match crate::coord_drain_state::gate_for(state, *origin) {
+    match crate::coord_drain_state::gate_with_local_hold(
+        state,
+        *origin,
+        local_hold,
+        chrono::Utc::now(),
+    ) {
         crate::coord_drain_state::DrainGate::Allow => None,
         crate::coord_drain_state::DrainGate::Defer { reason, class } => {
             Some(SpawnDecision::DeferredByDrain { reason, class })
@@ -460,7 +476,12 @@ fn drain_admission(
         );
         return None;
     }
-    let decision = decide_drain(&crate::coord_drain_state::current(), admission)?;
+    let local_hold = crate::restart_prep::local_hold_reason();
+    let decision = decide_drain_with_hold(
+        &crate::coord_drain_state::current(),
+        admission,
+        local_hold.as_deref(),
+    )?;
     if let DrainAdmission::Origin { origin, work_key } = admission {
         let key = work_key
             .clone()
