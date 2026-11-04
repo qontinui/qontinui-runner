@@ -265,6 +265,16 @@ pub(crate) fn resolve_pinned_coord<'a>(
         .find_map(|(_, coord)| coord)
 }
 
+/// The rule behind [`TerminalManager::has_live_terminal_pinned_to`], over
+/// `(pinned harness id, alive)` for every terminal in the manager. Pure so it is
+/// unit-testable without a PTY.
+pub(crate) fn any_live_terminal_pinned<'a>(
+    mut terminals: impl Iterator<Item = (&'a str, bool)>,
+    claude_session_id: &str,
+) -> bool {
+    terminals.any(|(pinned, alive)| alive && pinned == claude_session_id)
+}
+
 impl TerminalManager {
     /// Create a new terminal manager with an empty interceptor pipeline.
     pub fn new() -> Self {
@@ -315,6 +325,22 @@ impl TerminalManager {
             sessions
                 .values()
                 .map(|s| (s.pinned_session_id(), s.coord_session_id())),
+            pinned_session_id,
+        )
+    }
+
+    /// Is a live terminal in this manager pinned to `pinned_session_id`? Unlike
+    /// [`Self::coord_session_id_for_pinned`] it does not need that terminal to
+    /// have a coord row. A poisoned lock answers `false`, so a caller that reads
+    /// `false` as "not known to be live" stays correct.
+    pub fn has_live_terminal_pinned_to(&self, pinned_session_id: &str) -> bool {
+        let Ok(sessions) = self.sessions.lock() else {
+            return false;
+        };
+        any_live_terminal_pinned(
+            sessions
+                .values()
+                .map(|s| (s.pinned_session_id(), s.is_alive())),
             pinned_session_id,
         )
     }
@@ -1340,6 +1366,28 @@ mod tests {
             None,
             "an id no terminal is pinned to never resolves by terminal"
         );
+    }
+
+    /// A pinned terminal counts only while it is alive, and only for its own id.
+    /// A terminal needs no coord row to count, and one exited pin does not mask a
+    /// live re-spawn under the same id.
+    #[test]
+    fn any_live_terminal_pinned_requires_a_live_terminal_with_that_pin() {
+        use super::any_live_terminal_pinned;
+        let terminals = || {
+            vec![
+                ("alive-1", true),
+                ("exited-1", false),
+                ("respawned", false),
+                ("respawned", true),
+            ]
+            .into_iter()
+        };
+        assert!(any_live_terminal_pinned(terminals(), "alive-1"));
+        assert!(any_live_terminal_pinned(terminals(), "respawned"));
+        assert!(!any_live_terminal_pinned(terminals(), "exited-1"));
+        assert!(!any_live_terminal_pinned(terminals(), "never-seen"));
+        assert!(!any_live_terminal_pinned(std::iter::empty(), "alive-1"));
     }
 
     /// Every close path clears BOTH remote maps. `close` and `close_all`

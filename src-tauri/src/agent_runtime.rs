@@ -349,6 +349,33 @@ pub struct GateContinuationPayload {
     /// and never fails the frame.
     #[serde(default, deserialize_with = "deserialize_lenient_allocation")]
     pub allocation: Option<ContinuationAllocation>,
+    /// The Claude Code session that last held the claim behind a
+    /// `claim_terminal` gate, read by coord from the newest held
+    /// `coord.claims_audit` row inside the gate's bound. Coord omits it for any
+    /// other gate, and when it does not know the holder. Read with
+    /// [`Self::holder_device_id`] through [`Self::holder_ref`], and only ever to
+    /// hold the spawn ([`ContinuationGuard::HolderSessionLive`]).
+    ///
+    /// Lenient like `brief`: a value this build cannot read is `None` and never
+    /// fails the frame. Losing the holder costs a duplicate; losing the frame
+    /// costs the resume the net exists to deliver.
+    #[serde(default, deserialize_with = "deserialize_lenient_opt_string")]
+    pub holder_session_id: Option<String>,
+    /// The device that holder ran on, as a uuid string. See
+    /// [`Self::holder_session_id`].
+    #[serde(default, deserialize_with = "deserialize_lenient_opt_string")]
+    pub holder_device_id: Option<String>,
+}
+
+/// The claim holder a `claim_terminal` continuation names: the session whose
+/// liveness holds the spawn, and the device that session ran on. Both halves or
+/// nothing ([`GateContinuationPayload::holder_ref`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HolderRef {
+    /// Verbatim from the frame: the stamp echoes it, and coord compares the
+    /// stamp's id with the holder it recorded on this dispatch.
+    session_id: String,
+    device_id: uuid::Uuid,
 }
 
 /// The typed half of coord's re-delivery annotation. See
@@ -415,6 +442,40 @@ impl GateContinuationPayload {
     fn retry_attempt(&self) -> u32 {
         self.retry.as_ref().map_or(0, |r| r.attempt)
     }
+
+    /// The holder this frame names, or `None` when it names no usable one: a key
+    /// absent or empty, or a device id that is not a uuid. `None` is UNKNOWN,
+    /// and an unknown holder dispatches as it always has.
+    fn holder_ref(&self) -> Option<HolderRef> {
+        let session_id = self.holder_session_id.as_deref()?;
+        if session_id.is_empty() {
+            return None;
+        }
+        let device_id = self.holder_device_id.as_deref()?;
+        Some(HolderRef {
+            session_id: session_id.to_string(),
+            device_id: uuid::Uuid::parse_str(device_id).ok()?,
+        })
+    }
+}
+
+/// A string-valued frame key that a wrong type degrades to `None` instead of
+/// failing the whole continuation.
+fn deserialize_lenient_opt_string<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(text) => Some(text),
+        serde_json::Value::Null => None,
+        other => {
+            tracing::warn!(
+                "gate continuation: a holder key is not a string ({other}) — treating the \
+                 holder as unknown"
+            );
+            None
+        }
+    })
 }
 
 /// The part of coord's dispatch-time continuation `allocation` this runner
@@ -3344,6 +3405,12 @@ enum ContinuationGuard {
     /// (a dispatch still between the guard and its spawn, or a session
     /// mid-account-migration; see [`AnchorHolder::Reserved`]).
     DuplicateAnchor(AnchorHolder),
+    /// The session that held this `claim_terminal` gate's claim is still running
+    /// on this device, so the net has nothing to recover yet: hold the spawn.
+    /// The row stays pending, so the net still fires when that session dies.
+    /// Carries the holder's session id, the `<id>` of
+    /// [`holder_session_live_stamp_reason`].
+    HolderSessionLive(String),
     /// The machine is short of a measured resource: the spawn seam's own
     /// composed verdict ([`crate::resource_guard::probe_for_spawn`] — the free
     /// memory lane and the thread lane, heavier wins) returned something other
@@ -3363,10 +3430,10 @@ enum ContinuationGuard {
     },
 }
 
-/// Pre-spawn guard: prune dead sessions, then enforce P3 (anchor_key dedup) and
-/// machine load. Pure over (`anchor_key`, `is_live`, the injected load verdict)
-/// so it is unit-testable without a live `TerminalManager` and without a live
-/// reading.
+/// Pre-spawn guard: prune dead sessions, then enforce P3 (anchor_key dedup), the
+/// claim holder's liveness and machine load. Pure over (`anchor_key`, `holder`,
+/// `is_live`, `holder_is_live`, the injected load verdict) so it is unit-testable
+/// without a live `TerminalManager` and without a live reading.
 ///
 /// Order matters:
 ///
@@ -3385,7 +3452,17 @@ enum ContinuationGuard {
 ///    `CreateToolhelp32Snapshot` per row (plus a `settings.json` stat/parse and
 ///    a `GlobalMemoryStatusEx`), landing at the exact instant the machine is
 ///    starved. Taken lazily, a deduped row pays nothing.
-/// 2. **Machine load next** — the heavier of the memory and thread lanes, the
+/// 2. **The claim holder next** (plan
+///    `2026-10-27-the-claim-heartbeat-cap-clears-the-nets-of-a-live-session` D4).
+///    A claim also lapses under a live session (its heartbeat loop was killed, a
+///    provider pause outlived the TTL), and spawning then would start a second
+///    session on work the first is still doing. Live is a POSITIVE signal only;
+///    see [`holder_session_liveness`]. Any other answer is UNKNOWN and dispatches,
+///    because a missed resume costs more than a duplicate, which `/implement-plan`
+///    Step 0.45 stops on the owner's IN PROGRESS marker. Ahead of the load lanes
+///    for the reason dedup is: the verdict is true on an idle box too, and a held
+///    row pays for no reading.
+/// 3. **Machine load last** — the heavier of the memory and thread lanes, the
 ///    same composed verdict the PTY seam enforces. The pre-check used to read
 ///    the thread lane only, so a CRITICAL memory reading was first seen AFTER
 ///    coord's consume claim, at the PTY seam, where it is a terminal
@@ -3472,7 +3549,9 @@ enum ContinuationGuard {
 /// different trip points, chosen by the caller that bears the cost.
 fn evaluate_continuation_guard(
     anchor_key: Option<&str>,
+    holder: Option<&HolderRef>,
     is_live: &dyn Fn(&str) -> bool,
+    holder_is_live: &dyn Fn(&HolderRef) -> bool,
     load_reading: &dyn Fn() -> crate::resource_guard::AdmissionReading,
 ) -> (ContinuationGuard, AnchorReservation) {
     warn_if_retired_cap_env_set();
@@ -3545,6 +3624,19 @@ fn evaluate_continuation_guard(
             AnchorReservation::none()
         }
     };
+    // Outside the registry lock for the reason prune's `is_live` is: the read
+    // takes the terminal manager's. A hold returns the anchor the way a load
+    // deferral does, by dropping the permit, which holds no `reserved_spawns`
+    // unit yet. The later genuine dispatch of this row must find the anchor free.
+    if let Some(holder) = holder {
+        if holder_is_live(holder) {
+            drop(reservation);
+            return (
+                ContinuationGuard::HolderSessionLive(holder.session_id.clone()),
+                AnchorReservation::none(),
+            );
+        }
+    }
     // The registry lock is RELEASED before the load reading is taken. The
     // reading is a synchronous OS read (and, in the live wrapper, a settings
     // load), and holding a process-global mutex across it would park
@@ -3693,13 +3785,43 @@ fn admit_launch(
 /// [`crate::health_monitor::THREAD_READING_TTL`].
 fn evaluate_continuation_guard_live(
     anchor_key: Option<&str>,
+    holder: Option<&HolderRef>,
     is_live: &dyn Fn(&str) -> bool,
+    holder_is_live: &dyn Fn(&HolderRef) -> bool,
 ) -> (ContinuationGuard, AnchorReservation) {
     evaluate_continuation_guard(
         anchor_key,
+        holder,
         is_live,
+        holder_is_live,
         &crate::resource_guard::AdmissionReading::live,
     )
+}
+
+/// The holder this dispatch may be held on. Only a gate row: it alone has both
+/// the deferred stamp coord reads and a re-delivery that fires the net later. A
+/// hold on [`ConsumeTarget::None`] would be a silent drop, since nothing
+/// re-delivers that path.
+fn holder_for_dispatch(
+    payload: &GateContinuationPayload,
+    consume_target: ConsumeTarget,
+) -> Option<HolderRef> {
+    match consume_target {
+        ConsumeTarget::Gate(..) => payload.holder_ref(),
+        ConsumeTarget::Dispatch(_) | ConsumeTarget::None => None,
+    }
+}
+
+/// The holder-liveness rule the guard runs: live ONLY when the holder is on
+/// `local_device` AND a live terminal here is pinned to its session. A holder on
+/// another device cannot be seen from here, and one absent from this runner's
+/// terminals may be anywhere, so both are UNKNOWN rather than dead, and UNKNOWN
+/// dispatches. `pinned_terminal_is_live` is injected the way `is_live` is.
+fn holder_session_liveness(
+    local_device: uuid::Uuid,
+    pinned_terminal_is_live: impl Fn(&str) -> bool,
+) -> impl Fn(&HolderRef) -> bool {
+    move |holder| holder.device_id == local_device && pinned_terminal_is_live(&holder.session_id)
 }
 
 /// The `/health` `spawnAdmission` block: what unattended admission would decide
@@ -4739,6 +4861,23 @@ fn live_terminal_predicate() -> impl Fn(&str) -> bool {
     }
 }
 
+/// Is a live terminal in this runner's manager pinned to this Claude session?
+/// With no runtime there is no manager and the answer is `false`, which the guard
+/// reads as UNKNOWN. Same resolution as [`live_terminal_predicate`].
+fn live_pinned_terminal_predicate() -> impl Fn(&str) -> bool {
+    use std::sync::Arc;
+    let manager: Option<Arc<crate::terminal::TerminalManager>> = crate::tauri_app_handle::current()
+        .and_then(|app| {
+            tauri::Manager::try_state::<Arc<crate::terminal::TerminalManager>>(&app)
+                .map(|s| s.inner().clone())
+        });
+    move |claude_session_id: &str| {
+        manager
+            .as_ref()
+            .is_some_and(|m| m.has_live_terminal_pinned_to(claude_session_id))
+    }
+}
+
 /// Tauri event the frontend listens for to surface a continuation terminal:
 /// switch the main view to the Terminal panel and select the target tab.
 const EVENT_TERMINAL_FOCUS_REQUEST: &str = "terminal-focus-request";
@@ -5648,7 +5787,7 @@ struct ContinuationDeferredBody {
 
 /// The `reason` a `duplicate_anchor` deferral stamps.
 ///
-/// These four constructors exist so the stamp strings have exactly one author.
+/// These constructors exist so the stamp strings have exactly one author.
 /// They are wire values: coord groups pending continuations by the `<class>`
 /// prefix, so a reword here is a schema change at the far end, and a test that
 /// merely *mirrored* the `format!` at each arm would pin nothing (the previous
@@ -5664,6 +5803,14 @@ fn duplicate_anchor_stamp_reason(holder: &AnchorHolder) -> String {
         // kind instead so the class parser still finds a non-empty detail.
         AnchorHolder::Reserved => "duplicate_anchor:reserved".to_string(),
     }
+}
+
+/// The `reason` a claim-holder hold stamps: `holder_session_live:<id>`, with the
+/// holder's Claude session id exactly as coord put it on the frame. Coord keys its
+/// stall and deferral-pressure exemptions and its one message to the holder on
+/// `<id>` equalling the holder it recorded, so this is a wire contract.
+fn holder_session_live_stamp_reason(holder_session_id: &str) -> String {
+    format!("holder_session_live:{holder_session_id}")
 }
 
 /// The `reason` a thread-pressure deferral stamps: the severity word and the
@@ -5890,6 +6037,7 @@ fn spawn_authorization_stamp_reason(label: &str) -> String {
 /// | reason | stamped by | constructor |
 /// |---|---|---|
 /// | `duplicate_anchor:<terminal_id>` \| `duplicate_anchor:reserved` | a live session already owns the anchor \| a permit holder has reserved it (an in-flight dispatch, or a session mid-account-migration) | [`duplicate_anchor_stamp_reason`] |
+/// | `holder_session_live:<holder_session_id>` | the `claim_terminal` gate's claim holder is still running in a live terminal on this device | [`holder_session_live_stamp_reason`] |
 /// | `thread_pressure:<severity>:<observed>_over_<limit>` | the machine is out of OS threads (`severity` = `warn` \| `critical`) | [`thread_pressure_stamp_reason`] |
 /// | `commit_pressure:<severity>:<observed>_under_<limit>` | the machine is short of free memory (bytes of free commit; `MemAvailable` off Windows) | [`commit_pressure_stamp_reason`] |
 /// | `device_drain:<class>` | coord holds this device drained | [`drain_stamp_reason`] |
@@ -6204,8 +6352,13 @@ async fn run_gate_continuation_inner(
     // worktree failure, a presentation fn's early return — gives the anchor
     // back. The
     // two spawn successes disarm it explicitly inside the presentation fns.
-    let (guard_verdict, reservation) =
-        evaluate_continuation_guard_live(payload.anchor_key.as_deref(), &live_terminal_predicate());
+    let holder = holder_for_dispatch(&payload, consume_target);
+    let (guard_verdict, reservation) = evaluate_continuation_guard_live(
+        payload.anchor_key.as_deref(),
+        holder.as_ref(),
+        &live_terminal_predicate(),
+        &holder_session_liveness(device_id, live_pinned_terminal_predicate()),
+    );
     match guard_verdict {
         ContinuationGuard::Proceed => {}
         ContinuationGuard::DuplicateAnchor(holder) => {
@@ -6249,6 +6402,24 @@ async fn run_gate_continuation_inner(
                 consume_target,
                 device_id,
                 duplicate_anchor_stamp_reason(&holder),
+            )
+            .await;
+            return Ok(());
+        }
+        ContinuationGuard::HolderSessionLive(holder_session_id) => {
+            info!(
+                "agent_runtime: gate-continuation held by anchor_key={:?} — its claim holder \
+                 session {holder_session_id} is still live in a terminal on this device; the row \
+                 stays pending and re-delivers until that session is gone",
+                payload.anchor_key
+            );
+            // The release inside `defer_continuation_unclaimed` is what lets the
+            // next listing of this gate reach this guard again. Without it the
+            // first hold would strand the net for the process lifetime.
+            defer_continuation_unclaimed(
+                consume_target,
+                device_id,
+                holder_session_live_stamp_reason(&holder_session_id),
             )
             .await;
             return Ok(());
@@ -14649,6 +14820,8 @@ mod tests {
             brief: None,
             retry: None,
             allocation: None,
+            holder_session_id: None,
+            holder_device_id: None,
         };
         let workdir = std::env::temp_dir().to_string_lossy().to_string();
         let res = run_continuation_terminal(
@@ -15967,6 +16140,23 @@ mod tests {
         crate::resource_guard::SpawnGate::Proceed
     }
 
+    /// [`evaluate_continuation_guard`] for a frame naming no claim holder, which
+    /// is every continuation but a `claim_terminal` one. The holder read panics:
+    /// with no holder it must not be reached.
+    fn guard_anchor_only(
+        anchor_key: Option<&str>,
+        is_live: &dyn Fn(&str) -> bool,
+        load_reading: &dyn Fn() -> crate::resource_guard::AdmissionReading,
+    ) -> (ContinuationGuard, AnchorReservation) {
+        evaluate_continuation_guard(
+            anchor_key,
+            None,
+            is_live,
+            &|_| panic!("no holder, so no holder read"),
+            load_reading,
+        )
+    }
+
     /// Verdict-only wrapper over [`evaluate_continuation_guard`] for the tests
     /// that do not need the permit. Dropping the [`AnchorReservation`] the
     /// instant it is returned is exactly what a dispatch that gives up does, so
@@ -15977,7 +16167,7 @@ mod tests {
         is_live: &dyn Fn(&str) -> bool,
         load_reading: &dyn Fn() -> crate::resource_guard::AdmissionReading,
     ) -> ContinuationGuard {
-        evaluate_continuation_guard(anchor_key, is_live, load_reading).0
+        guard_anchor_only(anchor_key, is_live, load_reading).0
     }
 
     /// The REAL thread verdict for an injected reading, folded through the same
@@ -16172,6 +16362,294 @@ mod tests {
 
     /// Phase 4 of plan
     /// `2026-09-13-one-landed-pr-dispatches-its-follow-up-to-two-sessions-through-two-gate-anchors`:
+    /// A `claim_terminal` frame's holder, on `device`.
+    fn holder_on(device: uuid::Uuid) -> HolderRef {
+        HolderRef {
+            session_id: HOLDER_SESSION.to_string(),
+            device_id: device,
+        }
+    }
+
+    const HOLDER_SESSION: &str = "0190aaaa-1111-7222-8333-444455556666";
+
+    /// One guard pass for `holder` as a runner on `local` sees it, with `pinned`
+    /// the Claude sessions its terminal manager has a live terminal for. Goes
+    /// through the production [`holder_session_liveness`], so the device arm and
+    /// the pinned arm are both the real rule.
+    fn holder_guard(
+        anchor: Option<&str>,
+        holder: Option<&HolderRef>,
+        local: uuid::Uuid,
+        pinned: &[&str],
+    ) -> (ContinuationGuard, AnchorReservation) {
+        let live_all = |_id: &str| true;
+        evaluate_continuation_guard(
+            anchor,
+            holder,
+            &live_all,
+            &holder_session_liveness(local, |id| pinned.contains(&id)),
+            &calm_reading,
+        )
+    }
+
+    #[test]
+    fn holder_live_on_this_device_holds_with_the_wire_stamp() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let device = uuid::Uuid::now_v7();
+
+        let (verdict, permit) = holder_guard(
+            Some("claim:phase-3"),
+            Some(&holder_on(device)),
+            device,
+            &[HOLDER_SESSION],
+        );
+        assert_eq!(
+            verdict,
+            ContinuationGuard::HolderSessionLive(HOLDER_SESSION.to_string())
+        );
+        assert!(permit.held.is_none() && !permit.counted);
+        assert_eq!(
+            holder_session_live_stamp_reason(HOLDER_SESSION),
+            "holder_session_live:0190aaaa-1111-7222-8333-444455556666",
+            "the exact wire value coord's exemptions key on"
+        );
+        clear_continuation_registry();
+    }
+
+    /// Every UNKNOWN reading dispatches: a missed resume costs more than a
+    /// duplicate (plan D4).
+    #[test]
+    fn an_unknown_holder_dispatches_as_today() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let device = uuid::Uuid::now_v7();
+        let elsewhere = uuid::Uuid::now_v7();
+
+        // On another device, even with a same-named pin here.
+        assert_eq!(
+            holder_guard(None, Some(&holder_on(elsewhere)), device, &[HOLDER_SESSION]).0,
+            ContinuationGuard::Proceed
+        );
+        // On this device, with no terminal pinned to it.
+        assert_eq!(
+            holder_guard(None, Some(&holder_on(device)), device, &["another-session"]).0,
+            ContinuationGuard::Proceed
+        );
+        // No holder at all.
+        assert_eq!(
+            holder_guard(None, None, device, &[HOLDER_SESSION]).0,
+            ContinuationGuard::Proceed
+        );
+        clear_continuation_registry();
+    }
+
+    /// The anchor dedup outranks the hold and pays for no holder read: the
+    /// duplicate is true whoever holds the claim, and its stamp is the one that
+    /// names the tab doing the work.
+    #[test]
+    fn duplicate_anchor_outranks_a_live_holder() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let device = uuid::Uuid::now_v7();
+        let holder = holder_on(device);
+        let anchor = "claim:ordered";
+        register_continuation_session("term-ordered".to_string(), Some(anchor.into()), None);
+
+        let live_all = |_id: &str| true;
+        let (verdict, _none) = evaluate_continuation_guard(
+            Some(anchor),
+            Some(&holder),
+            &live_all,
+            &|_| panic!("a deduped row must not read the holder"),
+            &calm_reading,
+        );
+        assert_eq!(
+            verdict,
+            ContinuationGuard::DuplicateAnchor(AnchorHolder::Live("term-ordered".to_string()))
+        );
+        clear_continuation_registry();
+    }
+
+    /// The hold outranks the load lanes, and a held row pays for no reading.
+    #[test]
+    fn a_live_holder_is_decided_before_the_load_reading() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let device = uuid::Uuid::now_v7();
+        let holder = holder_on(device);
+
+        let live_all = |_id: &str| true;
+        let (verdict, _none) = evaluate_continuation_guard(
+            None,
+            Some(&holder),
+            &live_all,
+            &holder_session_liveness(device, |_| true),
+            &|| panic!("a held row must not read the machine"),
+        );
+        assert_eq!(
+            verdict,
+            ContinuationGuard::HolderSessionLive(HOLDER_SESSION.to_string())
+        );
+        clear_continuation_registry();
+    }
+
+    /// The whole re-delivery: a hold takes nothing that outlives it, so when the
+    /// holder dies the SAME gate, delivered again, claims and dispatches. Driven
+    /// through the real [`defer_continuation_unclaimed`], whose POST the spent
+    /// rate-limit window suppresses. Removing that fn's release, or moving the
+    /// arm after the load charge (which leaks a projected spawn), fails here.
+    #[tokio::test]
+    async fn a_hold_leaks_nothing_and_redelivery_after_holder_death_dispatches() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let device = uuid::Uuid::now_v7();
+        let holder = holder_on(device);
+        let gate = uuid::Uuid::now_v7();
+        let anchor = "claim:redelivered";
+        let target = ConsumeTarget::Gate(gate, 0);
+        assert!(should_post_deferred_stamp(gate, std::time::Instant::now()));
+
+        // First delivery: claimed, then held.
+        assert!(claim_gate_dispatch(gate));
+        let (verdict, permit) =
+            holder_guard(Some(anchor), Some(&holder), device, &[HOLDER_SESSION]);
+        assert_eq!(
+            verdict,
+            ContinuationGuard::HolderSessionLive(HOLDER_SESSION.to_string())
+        );
+        drop(permit);
+        assert!(!anchor_is_reserved(anchor), "a hold must free the anchor");
+        assert_eq!(reserved_spawns_now(), 0, "a hold must charge no spawn");
+        defer_continuation_unclaimed(
+            target,
+            device,
+            holder_session_live_stamp_reason(HOLDER_SESSION),
+        )
+        .await;
+
+        // Still live on the next listing: the row reaches the guard and holds
+        // again rather than being dropped as a duplicate delivery.
+        assert!(claim_gate_dispatch(gate), "a hold must release the gate id");
+        let (verdict, permit) =
+            holder_guard(Some(anchor), Some(&holder), device, &[HOLDER_SESSION]);
+        assert!(matches!(verdict, ContinuationGuard::HolderSessionLive(_)));
+        drop(permit);
+        defer_continuation_unclaimed(
+            target,
+            device,
+            holder_session_live_stamp_reason(HOLDER_SESSION),
+        )
+        .await;
+
+        // The holder's terminal is gone: the same gate now dispatches, owning
+        // the anchor and one projected spawn like any other `Proceed`.
+        assert!(claim_gate_dispatch(gate));
+        let (verdict, permit) = holder_guard(Some(anchor), Some(&holder), device, &[]);
+        assert_eq!(verdict, ContinuationGuard::Proceed);
+        assert!(anchor_is_reserved(anchor));
+        assert_eq!(reserved_spawns_now(), 1);
+        drop(permit);
+        clear_continuation_registry();
+    }
+
+    /// The run path must defer the hold through the path that releases the gate
+    /// id and posts the stamp. The live terminal read needs a Tauri runtime, so
+    /// no test can drive that arm; this pins its wiring.
+    #[test]
+    fn the_hold_arm_defers_through_the_shared_path() {
+        let source = include_str!("agent_runtime.rs");
+        let (prod, _) = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("the test module marker");
+        let (_, rest) = prod
+            .split_once("ContinuationGuard::HolderSessionLive(holder_session_id) => {")
+            .expect("the run path matches the hold arm");
+        let (arm, _) = rest
+            .split_once("ContinuationGuard::LoadPressure {")
+            .expect("the load arm follows");
+        assert!(arm.contains("defer_continuation_unclaimed("));
+        assert!(arm.contains("holder_session_live_stamp_reason(&holder_session_id)"));
+    }
+
+    #[test]
+    fn no_runtime_means_no_pinned_terminal() {
+        assert!(!live_pinned_terminal_predicate()(HOLDER_SESSION));
+    }
+
+    fn holder_frame(extra: serde_json::Value) -> GateContinuationPayload {
+        let mut frame = serde_json::json!({
+            "target_device_id": uuid::Uuid::now_v7(),
+            "initial_prompt": "run /implement-plan x",
+            "source": GATE_CONTINUATION_SOURCE,
+        });
+        frame
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(frame).expect("the frame parses")
+    }
+
+    #[test]
+    fn the_holder_keys_parse_from_the_frame_and_default_to_absent() {
+        let device = uuid::Uuid::now_v7();
+
+        let bare = holder_frame(serde_json::json!({}));
+        assert_eq!(bare.holder_session_id, None);
+        assert_eq!(bare.holder_device_id, None);
+        assert_eq!(bare.holder_ref(), None);
+
+        let both = holder_frame(serde_json::json!({
+            "holder_session_id": HOLDER_SESSION,
+            "holder_device_id": device.to_string(),
+        }));
+        assert_eq!(both.holder_ref(), Some(holder_on(device)));
+    }
+
+    /// Half a holder, or an unreadable one, is no holder, and never costs the
+    /// frame.
+    #[test]
+    fn an_unusable_holder_is_unknown_and_never_fails_the_frame() {
+        let device = uuid::Uuid::now_v7().to_string();
+        for extra in [
+            serde_json::json!({"holder_session_id": HOLDER_SESSION}),
+            serde_json::json!({"holder_device_id": device}),
+            serde_json::json!({"holder_session_id": "", "holder_device_id": device}),
+            serde_json::json!({"holder_session_id": HOLDER_SESSION, "holder_device_id": "merytshost"}),
+            serde_json::json!({"holder_session_id": 7, "holder_device_id": device}),
+            serde_json::json!({"holder_session_id": HOLDER_SESSION, "holder_device_id": {"id": 1}}),
+            serde_json::json!({"holder_session_id": null, "holder_device_id": null}),
+        ] {
+            assert_eq!(holder_frame(extra.clone()).holder_ref(), None, "{extra}");
+        }
+    }
+
+    /// Only a gate row can be held. A unit dispatch has no stamp and the legacy
+    /// path has no re-delivery, where a hold would be a silent drop.
+    #[test]
+    fn only_a_gate_dispatch_can_be_held() {
+        let device = uuid::Uuid::now_v7();
+        let frame = holder_frame(serde_json::json!({
+            "holder_session_id": HOLDER_SESSION,
+            "holder_device_id": device.to_string(),
+        }));
+        let id = uuid::Uuid::now_v7();
+        assert_eq!(
+            holder_for_dispatch(&frame, ConsumeTarget::Gate(id, 0)),
+            Some(holder_on(device))
+        );
+        assert_eq!(
+            holder_for_dispatch(&frame, ConsumeTarget::Dispatch(id)),
+            None
+        );
+        assert_eq!(holder_for_dispatch(&frame, ConsumeTarget::None), None);
+    }
+
     /// P3 reserves the anchor INSIDE its critical section, so two evaluations
     /// for one anchor with no registration between them — the burst window,
     /// where every task of one poll iteration used to see the pre-burst
@@ -16186,8 +16664,7 @@ mod tests {
         clear_continuation_registry();
         let live_all = |_id: &str| true;
 
-        let (verdict, _held) =
-            evaluate_continuation_guard(Some("unit:u1:phase-2"), &live_all, &calm_reading);
+        let (verdict, _held) = guard_anchor_only(Some("unit:u1:phase-2"), &live_all, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         assert!(
             anchor_is_reserved("unit:u1:phase-2"),
@@ -16229,8 +16706,7 @@ mod tests {
 
         // 1. Proceed reserves; the twin is deduped; the dispatch gives up
         //    (worktree failure, claim refused, …) → its reservation drops.
-        let (verdict, reservation) =
-            evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
+        let (verdict, reservation) = guard_anchor_only(Some(anchor), &live_all, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         assert!(
             anchor_is_reserved(anchor),
@@ -16247,8 +16723,7 @@ mod tests {
         );
 
         // 2. The third evaluation — a re-delivery — proceeds again.
-        let (verdict, reservation) =
-            evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
+        let (verdict, reservation) = guard_anchor_only(Some(anchor), &live_all, &calm_reading);
         assert_eq!(
             verdict,
             ContinuationGuard::Proceed,
@@ -16274,7 +16749,7 @@ mod tests {
         //    remove this entry anyway — see
         //    `stale_reservation_drop_cannot_steal_a_foreign_reservation`).
         let x1_dead = |id: &str| id != "term-x1";
-        let (verdict, later) = evaluate_continuation_guard(Some(anchor), &x1_dead, &calm_reading);
+        let (verdict, later) = guard_anchor_only(Some(anchor), &x1_dead, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         assert!(
             anchor_is_reserved(anchor),
@@ -16310,8 +16785,7 @@ mod tests {
         let gate = uuid::Uuid::now_v7();
 
         // A continuation is live on the anchor — the session about to migrate.
-        let (verdict, reservation) =
-            evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
+        let (verdict, reservation) = guard_anchor_only(Some(anchor), &live_all, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         reservation.handed_to_registry("term-old".to_string(), Some(gate), None);
 
@@ -16585,7 +17059,7 @@ mod tests {
         let live_all = |_id: &str| true;
         let anchor = "unit:u9:phase-1";
 
-        let (verdict, stale) = evaluate_continuation_guard(Some(anchor), &live_all, &calm_reading);
+        let (verdict, stale) = guard_anchor_only(Some(anchor), &live_all, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
 
         // Force the state the token exists for: this anchor's entry now belongs
@@ -16641,7 +17115,7 @@ mod tests {
                 // registry is read with the permit still alive, which is exactly
                 // the state `run_gate_continuation_inner`'s load arm is in while
                 // it awaits `defer_continuation_unclaimed`'s network POST.
-                let (verdict, held) = evaluate_continuation_guard(Some(anchor), &live_all, loaded);
+                let (verdict, held) = guard_anchor_only(Some(anchor), &live_all, loaded);
                 assert!(
                     matches!(verdict, ContinuationGuard::LoadPressure { .. }),
                     "a loaded machine must defer on every evaluation, got {verdict:?}"
@@ -16957,7 +17431,7 @@ mod tests {
         let mut deferred = 0;
         for i in 0..20 {
             let anchor = format!("burst-{i}");
-            let (verdict, permit) = evaluate_continuation_guard(Some(&anchor), &live_all, &reading);
+            let (verdict, permit) = guard_anchor_only(Some(&anchor), &live_all, &reading);
             match verdict {
                 ContinuationGuard::Proceed => held.push(permit),
                 ContinuationGuard::LoadPressure { observation, .. } => {
@@ -16998,7 +17472,7 @@ mod tests {
         // 200 graded threads, 256 warn ceiling, 10 threads per projected
         // session: pending 0..=5 project <= 250; pending 6 projects 260 > 256.
         let held: Vec<_> = (0..20)
-            .map(|_| evaluate_continuation_guard(None, &live_all, &reading))
+            .map(|_| guard_anchor_only(None, &live_all, &reading))
             .filter(|(v, _)| *v == ContinuationGuard::Proceed)
             .map(|(_, permit)| permit)
             .collect();
@@ -17028,7 +17502,7 @@ mod tests {
                     let reading = || commit_reading(free_with_headroom_for(3));
                     barrier.wait();
                     let anchor = format!("concurrent-{i}");
-                    evaluate_continuation_guard(Some(&anchor), &live_all, &reading)
+                    guard_anchor_only(Some(&anchor), &live_all, &reading)
                 })
             })
             .collect();
@@ -17061,10 +17535,9 @@ mod tests {
         clear_continuation_registry();
         let live_all = |_id: &str| true;
 
-        let (v1, terminal) =
-            evaluate_continuation_guard(Some("settle-a"), &live_all, &calm_reading);
-        let (v2, headless) = evaluate_continuation_guard(None, &live_all, &calm_reading);
-        let (v3, dropped) = evaluate_continuation_guard(Some("settle-c"), &live_all, &calm_reading);
+        let (v1, terminal) = guard_anchor_only(Some("settle-a"), &live_all, &calm_reading);
+        let (v2, headless) = guard_anchor_only(None, &live_all, &calm_reading);
+        let (v3, dropped) = guard_anchor_only(Some("settle-c"), &live_all, &calm_reading);
         assert_eq!(
             (v1, v2, v3),
             (
@@ -17100,7 +17573,7 @@ mod tests {
         );
 
         let (refused, permit) =
-            evaluate_continuation_guard(Some("settle-d"), &live_all, &|| commit_reading(GIB));
+            guard_anchor_only(Some("settle-d"), &live_all, &|| commit_reading(GIB));
         assert!(matches!(refused, ContinuationGuard::LoadPressure { .. }));
         assert_eq!(
             reserved_spawns_now(),
@@ -17133,9 +17606,7 @@ mod tests {
             "nothing pending: admitted"
         );
         let held: Vec<_> = (0..2)
-            .map(|i| {
-                evaluate_continuation_guard(Some(&format!("launch-{i}")), &live_all, &reading).1
-            })
+            .map(|i| guard_anchor_only(Some(&format!("launch-{i}")), &live_all, &reading).1)
             .collect();
         assert_eq!(reserved_spawns_now(), 2);
         let reason =
@@ -17799,6 +18270,8 @@ mod tests {
                 brief: None,
                 retry: None,
                 allocation: None,
+                holder_session_id: None,
+                holder_device_id: None,
             }
         }
         let gate = uuid::Uuid::now_v7();
@@ -18712,6 +19185,7 @@ mod tests {
         for reason in [
             duplicate_anchor_stamp_reason(&AnchorHolder::Live("t1".to_string())),
             duplicate_anchor_stamp_reason(&AnchorHolder::Reserved),
+            holder_session_live_stamp_reason("s1"),
             thread_pressure_stamp_reason(severity, observation),
             commit_pressure_stamp_reason(mem_severity, mem_observation),
         ] {
