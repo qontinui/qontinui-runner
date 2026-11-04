@@ -226,6 +226,11 @@ fn main() {
     // `page/navigate` target actually goes anywhere (iter-12 item 3).
     generate_valid_navigate_pages();
 
+    // Generate the coord-mcp proxy's policy lists FROM one file per entry under
+    // `coord-mcp-proxy/` (plan 2026-11-04-runner-generated-and-ledger-files-are-
+    // merge-neutral-and-land-behind-a-drain, Phase 3a).
+    generate_coord_mcp_lists();
+
     // Stamp tree-state provenance (git dirty bit, tree hash, Rust-source hash,
     // the embedded dist's frontend-source hash) and warn when the embedded dist
     // no longer matches the frontend sources it was built from. Never fatal.
@@ -423,6 +428,251 @@ fn generate_valid_navigate_pages() {
             dest.display()
         )
     });
+}
+
+/// Emit `$OUT_DIR/coord_mcp_lists.rs`: the loopback `/coord-mcp` proxy's six
+/// policy consts (`COORD_MCP_ALLOWED_METHODS`, `COORD_MCP_ALLOWED_TOOLS`,
+/// `COORD_MCP_ALLOWED_TOOL_PREFIXES`, `COORD_MCP_DELIBERATE_EXCLUSIONS`,
+/// `COORD_MCP_DELIBERATE_EXCLUSION_DOORS`,
+/// `COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES`), which `src/mcp_api.rs`
+/// `include!`s.
+///
+/// WHY (plan
+/// `2026-11-04-runner-generated-and-ledger-files-are-merge-neutral-and-land-behind-a-drain`
+/// Phase 3a): the lists used to be hand-sorted `const` arrays with their
+/// rationale as doc-comment prose above them, so every PR that added a tool
+/// edited the same lines as every other, and two PRs that added neighbouring
+/// tools conflicted. Now each entry is ONE FILE under
+/// `src-tauri/coord-mcp-proxy/<dir>/<name>.md` (its body is the rationale),
+/// and this script builds the lists from the directory listing.
+///
+/// Deliberately FATAL on failure, like `generate_valid_tab_ids`: an empty or
+/// malformed list would make the proxy refuse every call (or forward a typo).
+fn generate_coord_mcp_lists() {
+    use std::path::Path;
+
+    const ROOT: &str = "coord-mcp-proxy";
+    // A directory watch makes cargo scan the whole tree under it, so adding,
+    // removing or editing any entry file re-runs this script.
+    println!("cargo:rerun-if-changed={ROOT}");
+    for dir in COORD_MCP_LIST_DIRS {
+        println!("cargo:rerun-if-changed={ROOT}/{}", dir.dir);
+    }
+
+    let out = render_coord_mcp_lists(Path::new(ROOT))
+        .unwrap_or_else(|e| panic!("qontinui-runner build.rs: {ROOT}/: {e}"));
+
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is always set for build scripts");
+    let dest = Path::new(&out_dir).join("coord_mcp_lists.rs");
+    std::fs::write(&dest, out).unwrap_or_else(|e| {
+        panic!(
+            "qontinui-runner build.rs: failed to write {}: {e}",
+            dest.display()
+        )
+    });
+}
+
+/// One generated list: the directory it is read from and the const it becomes.
+struct CoordMcpListDir {
+    dir: &'static str,
+    konst: &'static str,
+    /// Walk sub-directories (method names carry a `/`).
+    recursive: bool,
+    /// An empty list is a build error (an empty allowlist refuses everything).
+    non_empty: bool,
+}
+
+const COORD_MCP_LIST_DIRS: &[CoordMcpListDir] = &[
+    CoordMcpListDir {
+        dir: "allowed-methods",
+        konst: "COORD_MCP_ALLOWED_METHODS",
+        recursive: true,
+        non_empty: true,
+    },
+    CoordMcpListDir {
+        dir: "allowed-tools",
+        konst: "COORD_MCP_ALLOWED_TOOLS",
+        recursive: false,
+        non_empty: true,
+    },
+    CoordMcpListDir {
+        dir: "allowed-tool-prefixes",
+        konst: "COORD_MCP_ALLOWED_TOOL_PREFIXES",
+        recursive: false,
+        non_empty: false,
+    },
+    CoordMcpListDir {
+        dir: "deliberate-exclusions",
+        konst: "COORD_MCP_DELIBERATE_EXCLUSIONS",
+        recursive: false,
+        non_empty: false,
+    },
+    CoordMcpListDir {
+        dir: "deliberate-exclusion-prefixes",
+        konst: "COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES",
+        recursive: false,
+        non_empty: false,
+    },
+];
+
+/// The directory whose entries may carry a `door:` front-matter line.
+const COORD_MCP_DOOR_DIR: &str = "deliberate-exclusions";
+
+/// `^[a-z0-9_/.-]+$`, by hand (no regex build-dependency). A `/` is a
+/// sub-directory, so it can only reach a name from a recursive walk.
+fn coord_mcp_entry_name_is_valid(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_/.-".contains(&b))
+}
+
+/// Split an entry file into its front-matter `(key, value)` pairs and its
+/// body. Front matter is optional: a first line of exactly `---`, then
+/// `key: value` lines, then a closing `---` line.
+fn coord_mcp_split_front_matter(text: &str) -> Result<(Vec<(String, String)>, String), String> {
+    let text = text.replace("\r\n", "\n");
+    let Some(rest) = text.strip_prefix("---\n") else {
+        return Ok((Vec::new(), text));
+    };
+    let (head, body) = match rest.strip_prefix("---\n") {
+        Some(body) => ("", body),
+        None => rest.split_once("\n---\n").ok_or_else(|| {
+            "front matter opened with `---` is never closed by a `---` line".to_string()
+        })?,
+    };
+    let body = body.to_string();
+    let mut pairs = Vec::new();
+    for line in head.lines() {
+        let Some((k, v)) = line.split_once(':') else {
+            return Err(format!("front-matter line {line:?} is not `key: value`"));
+        };
+        pairs.push((k.trim().to_string(), v.trim().to_string()));
+    }
+    Ok((pairs, body))
+}
+
+/// The entries of one list directory: `(name, file path)`, sorted by byte.
+/// `README.md` (at any depth) is not an entry.
+fn coord_mcp_list_entries(
+    dir: &std::path::Path,
+    recursive: bool,
+) -> Result<Vec<(String, std::path::PathBuf)>, String> {
+    fn walk(
+        base: &std::path::Path,
+        dir: &std::path::Path,
+        recursive: bool,
+        out: &mut Vec<(String, std::path::PathBuf)>,
+    ) -> Result<(), String> {
+        let rd =
+            std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+        for ent in rd {
+            let ent = ent.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+            let path = ent.path();
+            let file_type = ent
+                .file_type()
+                .map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
+            if file_type.is_dir() {
+                if !recursive {
+                    return Err(format!(
+                        "{} is a sub-directory, and this list is not walked recursively",
+                        path.display()
+                    ));
+                }
+                walk(base, &path, recursive, out)?;
+                continue;
+            }
+            let rel = path
+                .strip_prefix(base)
+                .map_err(|e| format!("{}: {e}", path.display()))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel == "README.md" || rel.ends_with("/README.md") {
+                continue;
+            }
+            let Some(name) = rel.strip_suffix(".md") else {
+                return Err(format!(
+                    "{} is not a `.md` entry file (the file name minus `.md` is the entry)",
+                    path.display()
+                ));
+            };
+            if !coord_mcp_entry_name_is_valid(name) {
+                return Err(format!(
+                    "{}: entry name {name:?} is not `^[a-z0-9_/.-]+$`",
+                    path.display()
+                ));
+            }
+            out.push((name.to_string(), path));
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, recursive, &mut out)?;
+    out.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    Ok(out)
+}
+
+/// The generated source text for every list under `root`. Pure over the
+/// filesystem under `root`, so the unit tests drive it on a fixture tree.
+fn render_coord_mcp_lists(root: &std::path::Path) -> Result<String, String> {
+    let mut out = String::from(
+        "// @generated by src-tauri/build.rs (generate_coord_mcp_lists) from\n\
+         // src-tauri/coord-mcp-proxy/ — DO NOT EDIT. One file per entry: add, remove or\n\
+         // re-reason an entry by adding, removing or editing its file there.\n",
+    );
+    let mut doors: Vec<(String, String)> = Vec::new();
+    for list in COORD_MCP_LIST_DIRS {
+        let dir = root.join(list.dir);
+        let entries = coord_mcp_list_entries(&dir, list.recursive)?;
+        if list.non_empty && entries.is_empty() {
+            return Err(format!(
+                "{} has no entries — an empty {} would refuse every call",
+                dir.display(),
+                list.konst
+            ));
+        }
+        for (name, path) in &entries {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            let (front, _body) = coord_mcp_split_front_matter(&text)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            for (key, value) in front {
+                match key.as_str() {
+                    "door" if list.dir == COORD_MCP_DOOR_DIR && !value.is_empty() => {
+                        doors.push((name.clone(), value));
+                    }
+                    _ => {
+                        return Err(format!(
+                            "{}: front-matter key {key:?} is not recognised here (only a \
+                             non-empty `door:` in {COORD_MCP_DOOR_DIR}/)",
+                            path.display()
+                        ))
+                    }
+                }
+            }
+        }
+        out.push_str(&format!(
+            "/// Generated from `src-tauri/coord-mcp-proxy/{}/` (one file per entry; the\n\
+             /// file's body is the entry's rationale). Sorted by byte for `binary_search`.\n\
+             const {}: &[&str] = &[\n",
+            list.dir, list.konst
+        ));
+        for (name, _) in &entries {
+            out.push_str(&format!("    {name:?},\n"));
+        }
+        out.push_str("];\n");
+    }
+    out.push_str(
+        "/// Generated from the `door:` front-matter lines in\n\
+         /// `src-tauri/coord-mcp-proxy/deliberate-exclusions/`: for a deliberate\n\
+         /// exclusion that HAS a sanctioned door elsewhere, the door a `-32601` names.\n\
+         const COORD_MCP_DELIBERATE_EXCLUSION_DOORS: &[(&str, &str)] = &[\n",
+    );
+    for (name, door) in &doors {
+        out.push_str(&format!("    ({name:?}, {door:?}),\n"));
+    }
+    out.push_str("];\n");
+    Ok(out)
 }
 
 /// Extract the KEYS of the `PAGE_TO_TAB: Record<string, MainTabId>` object
@@ -1804,5 +2054,145 @@ fn probe_coord_egress_sibling() {
             println!("cargo:rustc-cfg=coord_egress_sibling");
             return;
         }
+    }
+}
+
+/// `generate_coord_mcp_lists` over fixture trees (plan
+/// `2026-11-04-runner-generated-and-ledger-files-are-merge-neutral-and-land-behind-a-drain`
+/// Phase 3a).
+#[cfg(test)]
+mod coord_mcp_list_tests {
+    use super::render_coord_mcp_lists;
+
+    /// A fixture `coord-mcp-proxy/` tree: path relative to the root -> body.
+    fn fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for d in [
+            "allowed-methods",
+            "allowed-tools",
+            "allowed-tool-prefixes",
+            "deliberate-exclusions",
+            "deliberate-exclusion-prefixes",
+        ] {
+            std::fs::create_dir_all(dir.path().join(d)).expect("mkdir");
+        }
+        for (rel, body) in files {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(path, body).expect("write");
+        }
+        dir
+    }
+
+    const MINIMAL: &[(&str, &str)] = &[
+        ("allowed-methods/ping.md", "x"),
+        ("allowed-tools/coord_b.md", "x"),
+        ("allowed-tools/coord_a.md", "x"),
+    ];
+
+    fn render(files: &[(&str, &str)]) -> Result<String, String> {
+        let dir = fixture(files);
+        render_coord_mcp_lists(dir.path())
+    }
+
+    #[test]
+    fn entries_are_file_names_sorted_by_byte_and_readmes_are_skipped() {
+        let mut files = MINIMAL.to_vec();
+        files.push(("allowed-tools/README.md", "list-wide notes"));
+        files.push(("allowed-methods/notifications/cancelled.md", "x"));
+        files.push(("allowed-methods/notifications/README.md", "x"));
+        files.push(("allowed-tool-prefixes/coord_query_.md", "x"));
+        let out = render(&files).expect("renders");
+        assert!(
+            out.contains(
+                "const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[\n    \"coord_a\",\n    \"coord_b\",\n];"
+            ),
+            "{out}"
+        );
+        // The methods directory is walked recursively; the entry keeps its `/`.
+        assert!(
+            out.contains(
+                "const COORD_MCP_ALLOWED_METHODS: &[&str] = &[\n    \
+                 \"notifications/cancelled\",\n    \"ping\",\n];"
+            ),
+            "{out}"
+        );
+        assert!(out.contains(
+            "const COORD_MCP_ALLOWED_TOOL_PREFIXES: &[&str] = &[\n    \"coord_query_\",\n];"
+        ));
+        assert!(out.contains("const COORD_MCP_DELIBERATE_EXCLUSIONS: &[&str] = &[\n];"));
+        assert!(!out.contains("README"), "{out}");
+    }
+
+    #[test]
+    fn a_door_front_matter_line_becomes_a_door_tuple() {
+        let mut files = MINIMAL.to_vec();
+        files.push((
+            "deliberate-exclusions/coord_x.md",
+            "---\ndoor: POST /x with a JWT (the twin)\n---\n\nwhy",
+        ));
+        files.push(("deliberate-exclusions/coord_y.md", "why not"));
+        let out = render(&files).expect("renders");
+        assert!(out.contains(
+            "const COORD_MCP_DELIBERATE_EXCLUSIONS: &[&str] = &[\n    \"coord_x\",\n    \"coord_y\",\n];"
+        ));
+        assert!(
+            out.contains(
+                "const COORD_MCP_DELIBERATE_EXCLUSION_DOORS: &[(&str, &str)] = &[\n    \
+                 (\"coord_x\", \"POST /x with a JWT (the twin)\"),\n];"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn malformed_trees_are_refused() {
+        for (extra, why) in [
+            (("allowed-tools/Coord_Upper.md", "x"), "upper-case name"),
+            (("allowed-tools/coord x.md", "x"), "space in name"),
+            (("allowed-tools/coord_x.txt", "x"), "not a .md file"),
+            (
+                ("allowed-tools/sub/coord_x.md", "x"),
+                "sub-directory of a flat list",
+            ),
+            (
+                ("allowed-tools/coord_x.md", "---\ndoor: d\n---\nwhy"),
+                "door outside deliberate-exclusions",
+            ),
+            (
+                ("deliberate-exclusions/coord_x.md", "---\ndoor: d\nwhy"),
+                "unclosed front matter",
+            ),
+            (
+                (
+                    "deliberate-exclusions/coord_x.md",
+                    "---\nowner: me\n---\nwhy",
+                ),
+                "unknown key",
+            ),
+            (
+                ("deliberate-exclusions/coord_x.md", "---\ndoor:\n---\nwhy"),
+                "empty door",
+            ),
+        ] {
+            let mut files = MINIMAL.to_vec();
+            files.push(extra);
+            assert!(render(&files).is_err(), "{why} must be refused");
+        }
+        // An empty allowlist would refuse every call.
+        assert!(render(&[("allowed-methods/ping.md", "x")]).is_err());
+        // A missing list directory is a build error, never an empty list.
+        let dir = fixture(MINIMAL);
+        std::fs::remove_dir(dir.path().join("deliberate-exclusion-prefixes")).expect("rmdir");
+        assert!(render_coord_mcp_lists(dir.path()).is_err());
+    }
+
+    /// The checked-in tree renders (a malformed entry file fails here as well
+    /// as in the build).
+    #[test]
+    fn the_checked_in_tree_renders() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("coord-mcp-proxy");
+        let out = render_coord_mcp_lists(&root).expect("the checked-in tree renders");
+        assert!(out.contains("\"coord_orient\","), "{out}");
     }
 }
