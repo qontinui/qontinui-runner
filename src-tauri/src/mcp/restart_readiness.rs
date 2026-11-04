@@ -1800,10 +1800,7 @@ mod tests {
         // `compute` returns None on an UNKNOWN table (empty, or the stale
         // last-good one); the handler turns that into this unknown. Assert the
         // composition end of that contract.
-        let cause = "the terminal-session plane could not be determined: the process table is \
-                     unreadable (the fresh process-table read failed or served only the stale \
-                     last-good table, ProcessSnapshot::is_unknown), so live `claude` processes \
-                     cannot be enumerated";
+        let cause = crate::session::wind_down_observer::TERMINAL_PLANE_TABLE_UNKNOWN;
         let v = build_verdict(
             None,
             None,

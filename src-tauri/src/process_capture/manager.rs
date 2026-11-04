@@ -1629,6 +1629,13 @@ impl ProcessCaptureManager {
             ) {
                 return;
             }
+            // And the generation: a restart during the walk (up to two 3 s
+            // sleeps) gives the process a new root pid and a new
+            // `discovery_gate`, so this pass's tree belongs to a process
+            // that no longer runs here and must not overwrite the new one's.
+            if p.runtime.pid != Some(spawned_pid) {
+                return;
+            }
             let new_entries: Vec<PidWithSpawnedAt> = descendants
                 .iter()
                 .filter(|d| !p.runtime.descendant_pids.contains(d))
