@@ -230,6 +230,10 @@ mod provenance;
 mod provision_guard;
 mod rag;
 mod recording;
+// The coord recurring-agent reconciler (plan
+// 2026-10-29-recurring-agents-declared-in-coord-reconciled-by-runner Phase 4b),
+// started beside the scheduler on the primary runner only.
+mod recurring_agent_reconciler;
 mod reflection;
 mod regression_api;
 mod repo_detection;
@@ -5968,6 +5972,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                     scheduler_service::start_scheduler_service(scheduler_pg, scheduler_app_state)
                         .await;
+                });
+                // Same gate as the scheduler: only the primary turns coord's
+                // recurring-agent declarations into managed scheduler tasks
+                // (plan 2026-10-29-recurring-agents-declared-in-coord-reconciled-by-runner D5).
+                let reconciler_pg = app.state::<Arc<commands::AppState>>().pg_db.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    recurring_agent_reconciler::start(reconciler_pg);
                 });
             }
 

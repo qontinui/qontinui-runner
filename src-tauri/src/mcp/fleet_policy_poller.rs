@@ -2380,7 +2380,7 @@ enum ControlsOutcome {
 /// caches are allowed to hold different values; they are not allowed to disagree
 /// about what a 404 means.
 #[derive(Debug, Clone)]
-enum FetchError {
+pub(crate) enum FetchError {
     /// No device JWT yet — this runner is unpaired.
     NoJwt,
     /// Coord said 401 / 404: the policy is absent, or this device isn't
@@ -2835,13 +2835,25 @@ async fn fetch_fleet_policy_with(
     domain: &str,
     device_jwt: &str,
 ) -> Result<FleetPolicyResponse, FetchError> {
+    fetch_coord_json_with(&format!("/coord/fleet-policy?domain={domain}"), device_jwt).await
+}
+
+/// One device-JWT GET against coord, decoded as `T` — the HTTP half every poll
+/// in this module shares, and the one the recurring-agent reconciler
+/// (`crate::recurring_agent_reconciler`) reuses rather than building a second
+/// client stack. `path_and_query` starts with `/`.
+///
+/// Classification is the module's: 401 / 404 are [`FetchError::AuthOrAbsent`],
+/// any other non-2xx, a transport error or an undecodable body is
+/// [`FetchError::Failed`]. A caller's fail-safe decides what each means.
+pub(crate) async fn fetch_coord_json_with<T: serde::de::DeserializeOwned>(
+    path_and_query: &str,
+    device_jwt: &str,
+) -> Result<T, FetchError> {
     // coord base — identical source-of-truth chain to the producer's
     // `coord_base()` (env COORD_HTTP_URL → profile coord_url → default).
     let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
-    let url = format!(
-        "{}/coord/fleet-policy?domain={domain}",
-        base.trim_end_matches('/')
-    );
+    let url = format!("{}{path_and_query}", base.trim_end_matches('/'));
 
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -2851,7 +2863,7 @@ async fn fetch_fleet_policy_with(
         Err(e) => return Err(FetchError::Failed(format!("client build: {e}"))),
     };
 
-    let resp = match client.get(&url).bearer_auth(&device_jwt).send().await {
+    let resp = match client.get(&url).bearer_auth(device_jwt).send().await {
         Ok(r) => r,
         Err(e) => {
             crate::util::egress_context::record_failure(
