@@ -297,9 +297,13 @@ pub async fn github_list_repos() -> Result<Value, String> {
 /// the post-install Setup-URL redirect completes the claim bound to the caller's
 /// tenant.
 ///
-/// Derived from the configured API base (`derive_web_base_url`) so a dev/staging
-/// build pointing at a non-prod backend opens the matching web origin instead of
-/// hard-coding `qontinui.io`.
+/// The origin comes from `github_connect_web_origin` — the same resolver
+/// (`web_origin::resolve_web_frontend_base`) as `qontinui_profile device pair
+/// --browser`, here with the settings rung the CLI lacks:
+/// `$QONTINUI_WEB_FRONTEND_BASE`, then the `web_integration.web_base_url`
+/// setting, then derived from the configured API base — so split local dev
+/// (API :8000, Next.js :3001) and a dev/staging backend both open the page on
+/// the origin that actually serves it instead of hard-coding `qontinui.io`.
 ///
 /// P2 (seamless runner-native claim): the URL carries a runner-minted `state`
 /// nonce. When the web flow was runner-initiated it round-trips this nonce
@@ -345,9 +349,25 @@ pub async fn github_connect_url() -> Result<String, String> {
     let state = arm_pending_connect(connect_state);
     Ok(format!(
         "{}/connect-runner-github?state={}",
-        crate::api_config::derive_web_base_url(&crate::api_config::get_api_base_url()),
+        github_connect_web_origin(),
         state
     ))
+}
+
+/// The web-frontend origin [`github_connect_url`] opens its page on, resolved
+/// by `web_origin::resolve_web_frontend_base`. Before this the setting and the
+/// env override were both ignored here, so a split local-dev runner opened
+/// `/connect-runner-github` on the API port, which serves no pages.
+fn github_connect_web_origin() -> String {
+    let settings = crate::settings::load_settings();
+    let env = std::env::var(qontinui_runner_lib::web_origin::WEB_FRONTEND_BASE_ENV).ok();
+    let (origin, source) = qontinui_runner_lib::web_origin::resolve_web_frontend_base(
+        env.as_deref(),
+        settings.web_integration.web_base_url.as_deref(),
+        &crate::api_config::get_api_base_url(),
+    );
+    info!(origin = %origin, source = ?source, "github_connect_url: web frontend origin");
+    origin
 }
 
 // ---- P2: runner-native claim on the `github-connected` deep-link ----------
