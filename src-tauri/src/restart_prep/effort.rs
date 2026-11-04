@@ -650,8 +650,7 @@ mod tests {
         assert_eq!(transcript_effort_in(not_string), TranscriptEffort::NoRecord);
         // The later record of either shape wins.
         let both = format!(
-            "{sys}
-{}",
+            "{sys}\n{}",
             r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set effort level to low (this session only): Quick</local-command-stdout>"}}"#
         );
         assert_eq!(transcript_effort_in(&both), TranscriptEffort::Level("low"));
