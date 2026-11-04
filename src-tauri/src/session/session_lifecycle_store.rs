@@ -4318,16 +4318,31 @@ impl SessionLifecycleStore {
     /// append, a removed id kept showing up from the older lines that still
     /// carried it. Omitting the entry is therefore behavior-preserving.
     pub fn remove_session(&self, claude_session_id: &str) {
+        let _ = self.remove_session_if(claude_session_id, |_| true);
+    }
+
+    /// [`Self::remove_session`], only if `still_removable` holds for the row as
+    /// it is under the registry lock the removal takes — so a row a write
+    /// confirmed, moved or placed again between a caller's look at it and this
+    /// removal is not removed on that look. `true` when the row was removed.
+    /// The predicate runs under the lock: it may ask this store's in-memory
+    /// placement ([`Self::placed_after`]), never anything that takes `map`.
+    pub fn remove_session_if(
+        &self,
+        claude_session_id: &str,
+        still_removable: impl FnOnce(&TerminalSessionRecord) -> bool,
+    ) -> bool {
         let mut m = match self.map.lock() {
             Ok(m) => m,
             Err(e) => {
                 warn!(error = %e, "session_lifecycle_store: lock poisoned on remove_session");
-                return;
+                return false;
             }
         };
-        if m.remove(claude_session_id).is_none() {
-            return; // absent — nothing to flush
+        if !m.get(claude_session_id).is_some_and(still_removable) {
+            return false; // absent, or no longer removable — nothing to flush
         }
+        m.remove(claude_session_id);
         self.forget_removed([claude_session_id]);
         self.persist(
             m,
@@ -4335,6 +4350,7 @@ impl SessionLifecycleStore {
                 id: claude_session_id.to_string(),
             }],
         );
+        true
     }
 
     /// Clone of the open record whose session is RUNNING on `terminal_id`, if

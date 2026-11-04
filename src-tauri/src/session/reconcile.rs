@@ -927,14 +927,24 @@ pub fn run_reconcile_at_epoch<I: TranscriptIndex>(
         actions.push(action);
     }
 
-    // 2) Prune phantom provisional records (no live PTY, no transcript).
+    // 2) Prune phantom provisional records (no live PTY, no transcript) —
+    //    never one a write placed after this pass's evidence was read: its
+    //    terminal can be a tab spawned since, which `live` cannot list. Both
+    //    are asked again under the registry lock the removal takes
+    //    ([`SessionLifecycleStore::remove_session_if`]).
     let live_terminals: HashSet<String> =
         live_terminal_ids.iter().map(|t| (*t).to_string()).collect();
     for rec in store.open_records() {
         let has_transcript =
             index.transcript_exists(&rec.claude_session_id, rec.working_dir.as_deref());
-        if is_phantom_record(&rec, &live_terminals, has_transcript) {
-            store.remove_session(&rec.claude_session_id);
+        if !is_phantom_record(&rec, &live_terminals, has_transcript) {
+            continue;
+        }
+        let pruned = store.remove_session_if(&rec.claude_session_id, |row| {
+            is_phantom_record(row, &live_terminals, has_transcript)
+                && !enumerated_at.is_some_and(|at| store.placed_after(&row.claude_session_id, at))
+        });
+        if pruned {
             tracing::info!(
                 claude_session = %rec.claude_session_id,
                 terminal_id = %rec.terminal_id,
@@ -1493,6 +1503,40 @@ fn parse_iso_to_unix_secs(s: &str) -> Option<i64> {
         .map(|dt| dt.timestamp())
 }
 
+/// The liveness poll's PID-reuse guard, as the reconcile pass applies it
+/// ([`run_reconcile_pass`]): the reference instant the poll uses for a
+/// terminal root ([`crate::session::tracking_health::pid_reuse_reference`])
+/// and its comparison
+/// ([`crate::process_capture::process_tree::root_predates`], the guard inside
+/// `claude_present_in_inclusive_subtree`). A pane the poll counts as running
+/// no `claude` then yields no evidence to the pass either, so the two never
+/// disagree about the same pane.
+#[derive(Debug, Clone, Default)]
+pub struct PidReuseGuard {
+    /// Terminal pids a PTY holder's lock record proves — the poll's
+    /// `holder_verified` — exempt from the boot comparison.
+    pub verified: HashSet<u32>,
+    /// The poll's reference instant, this runner's boot, in epoch millis. The
+    /// default, `0`, calls no root recycled.
+    pub boot_unix_millis: i64,
+}
+
+impl PidReuseGuard {
+    /// Whether the poll treats terminal root `root_pid` as a recycled pid:
+    /// created before this runner's boot, and not proven by its holder.
+    pub fn recycled(&self, root_pid: u32, snapshot: &ProcessSnapshot) -> bool {
+        crate::process_capture::process_tree::root_predates(
+            root_pid,
+            snapshot,
+            crate::session::tracking_health::pid_reuse_reference(
+                root_pid,
+                &self.verified,
+                self.boot_unix_millis,
+            ),
+        )
+    }
+}
+
 /// Resolve each live PTY's CLAUDE anchor — the claude-image descendant pid + its
 /// process start — from an ALREADY-TAKEN snapshot (no extra sweep). The
 /// correlation must anchor on when CLAUDE started, not on when its shell did (a
@@ -1550,6 +1594,11 @@ fn anchor_live_ptys(live: &[LivePty], snapshot: &ProcessSnapshot) -> Vec<LivePty
 /// or bound from evidence older than what every reader answers from
 /// ([`judge_observation`]).
 ///
+/// `live_read_at` is when the caller read `live` — the first of the pass's
+/// evidence — and `pid_reuse` the liveness poll's PID-reuse guard
+/// ([`PidReuseGuard`]): a pane the poll counts as running no `claude` yields
+/// none here either.
+///
 /// `context` tags the INFO log ("boot" / "periodic") so a binder-only recovery is
 /// attributable to the pass that made it (the "no silent cap" observability
 /// requirement). Fail-open throughout: a snapshot / cmdline / scan failure
@@ -1562,10 +1611,39 @@ fn anchor_live_ptys(live: &[LivePty], snapshot: &ProcessSnapshot) -> Vec<LivePty
 pub async fn run_reconcile_pass(
     store: &SessionLifecycleStore,
     live: &[LivePty],
+    live_read_at: Instant,
     snapshot: &ProcessSnapshot,
+    pid_reuse: &PidReuseGuard,
     context: &str,
 ) -> Vec<ReconcileAction> {
-    let live = anchor_live_ptys(live, snapshot);
+    // A pane whose root the liveness poll's PID-reuse guard calls recycled runs
+    // no `claude` of this runner's, as the poll counts it: it gets no claude
+    // anchor and no top-level `claude` here, so no rung binds from it and its
+    // evidence is "no claude" — never a record the poll would not trust. The
+    // poll closes such a pane's row `poll-dead`; reading its record here
+    // re-opened the row on the next tick, and the two flapped.
+    let recycled: HashSet<String> = live
+        .iter()
+        .filter(|pty| {
+            pty.pid
+                .is_some_and(|root| pid_reuse.recycled(root, snapshot))
+        })
+        .map(|pty| pty.terminal_id.clone())
+        .collect();
+    let live: Vec<LivePty> = anchor_live_ptys(live, snapshot)
+        .into_iter()
+        .map(|pty| {
+            if recycled.contains(&pty.terminal_id) {
+                LivePty {
+                    ai_pid: None,
+                    ai_start_unix: None,
+                    ..pty
+                }
+            } else {
+                pty
+            }
+        })
+        .collect();
 
     // The panes' own evidence — rung 2b's, what decides which panes are bound,
     // and what every row is judged against: each live pane's top-level
@@ -1579,33 +1657,37 @@ pub async fn run_reconcile_pass(
         live.iter()
             .filter_map(|pty| {
                 let root = pty.pid?;
-                Some((
-                    pty.terminal_id.clone(),
-                    pane_binding::top_level_claude(root, snapshot),
-                ))
+                let claude = if recycled.contains(&pty.terminal_id) {
+                    Vec::new()
+                } else {
+                    pane_binding::top_level_claude(root, snapshot)
+                };
+                Some((pty.terminal_id.clone(), claude))
             })
             .collect()
     } else {
         HashMap::new()
     };
-    // The observation dates from when its process table began to be
-    // enumerated — before any pid in it was read — so neither the record read,
-    // the argv query nor the prescan below makes it look younger, and a row
-    // placed after it is newer than all of it. A snapshot with no such time (a
-    // caller that built its own) dates from now, which makes a placement
-    // between the enumeration and now look older than the evidence: said at
-    // warn, since every production snapshot is stamped
+    // The evidence dates from the first of it the pass read: the live pane
+    // list (`live_read_at`), read before the process table began to be
+    // enumerated (`taken_at`), itself before any pid in it was read. So
+    // neither the record read, the argv query nor the prescan below makes the
+    // evidence look younger, and a row placed after it — on a tab spawned
+    // since, which `live` cannot list — is newer than all of it. A snapshot
+    // with no enumeration time (a caller that built its own) cannot say it
+    // was not taken before the live read: said at warn, since every
+    // production snapshot is stamped
     // ([`crate::process_capture::process_tree::snapshot_process_table_public`]).
     let enumerated_at = match snapshot.taken_at {
-        Some(taken_at) => taken_at,
+        Some(taken_at) => taken_at.min(live_read_at),
         None => {
             if snapshot_ok {
                 tracing::warn!(
                     context,
-                    "session reconcile: the process snapshot carries no enumeration time — dating its evidence from now"
+                    "session reconcile: the process snapshot carries no enumeration time — dating its evidence from the live pane read"
                 );
             }
-            Instant::now()
+            live_read_at
         }
     };
     let readings = pane_binding::read_records_off_runtime(
@@ -1874,6 +1956,7 @@ fn rebind_writes_nothing(
 pub async fn run_at_boot(
     store: &SessionLifecycleStore,
     live: Vec<LivePty>,
+    live_read_at: Instant,
 ) -> Vec<ReconcileAction> {
     // One-time P4 registry-corruption repair (plan
     // `2026-07-19-runner-session-restore-mass-strand-and-git-popup`, Phase 3):
@@ -1900,8 +1983,21 @@ pub async fn run_at_boot(
     if live.is_empty() && store.open_records().is_empty() {
         return Vec::new(); // nothing to do
     }
+    // The liveness poll's PID-reuse guard, from the inputs it uses: this
+    // runner's boot instant (the one the tracking-health census keys on; the
+    // poll's own is captured as its task starts, a moment later) and each live
+    // pane's holder proof.
+    let pid_reuse = PidReuseGuard {
+        verified: crate::terminal::holder_census::verified_holder_children(
+            &live
+                .iter()
+                .filter_map(|pty| pty.pid.map(|pid| (pty.terminal_id.clone(), pid)))
+                .collect::<Vec<_>>(),
+        ),
+        boot_unix_millis: crate::session::tracking_health::primary_boot_unix_millis_or_init(),
+    };
     let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
-    run_reconcile_pass(store, &live, &snapshot, "boot").await
+    run_reconcile_pass(store, &live, live_read_at, &snapshot, &pid_reuse, "boot").await
 }
 
 /// Wire payload for the `session-bound` Tauri event — the binder→frontend
@@ -3887,26 +3983,231 @@ mod tests {
         assert_eq!((counters.mismatches(), counters.refused_moves()), (1, 0));
     }
 
-    /// Round 11: a `/clear` leftover is healed uncounted — the other half of
-    /// the 2026-10-25 test above, which stays counted because there the pane's
-    /// own row had been closed. Pane A launched `s` and ran `/clear` into `s2`,
-    /// both hook-confirmed, so `s`'s row stays open beside `s2`'s, and A's
-    /// record names `s2`. Pane B launched `x`, then resumed `s` inside its TUI:
-    /// B's record names `s` before B's hook lands. `s`'s row on A reads
-    /// `unknown` — it runs in B — so A no longer holds it, and rung 2b moves it
-    /// onto B; nothing is counted, and the next pass finds every row matched.
+    /// Round 12: the 2026-10-25 shape with the binding guard attached BEFORE
+    /// the wrong move. Rung 3's weak `observed` bind of `s-b` onto A is
+    /// refused — B's own record names `s-b` — so with the guard in place the
+    /// shape takes a strong write: `s-b` carried with A's terminal, as a hook
+    /// handed the wrong terminal would write it. Its supersede spares `s-a`,
+    /// which A's record names. The pass reads `s-b` on A `unknown` and counts
+    /// it exactly once — `s-a` is no `/clear` successor of `s-b` — then heals
+    /// both panes from their records.
+    #[test]
+    fn the_2026_10_25_shape_from_a_strong_write_past_the_guard_is_counted_once() {
+        let dir = tempdir().unwrap();
+        let panes = [("term-a", names("s-a")), ("term-b", names("s-b"))];
+        let (store, counters) = store_with_panes(dir.path(), &panes);
+        store.record_open(title_rec("s-a", "term-a", Some("T")));
+        store.record_open(title_rec("s-b", "term-b", Some("T")));
+        assert!(
+            matches!(
+                store.record_open_checked(TerminalSessionRecord {
+                    origin: Some(ORIGIN_OBSERVED.to_string()),
+                    ..title_rec("s-b", "term-a", Some("T"))
+                }),
+                RecordOpenOutcome::MoveRefused { .. }
+            ),
+            "the guard refuses rung 3's weak move"
+        );
+        assert!(store
+            .record_open_checked(title_rec("s-b", "term-a", Some("T")))
+            .is_recorded());
+        assert_eq!(store.get("s-b").unwrap().terminal_id, "term-a");
+        assert_eq!(
+            store.get("s-a").unwrap().state,
+            "open",
+            "the strong write's supersede spared A's own row"
+        );
+        let (live, _) = two_panes_one_workdir();
+        let pass = || {
+            run_reconcile(
+                &store,
+                &live,
+                &ProcessSnapshot::default(),
+                &no_transcripts(),
+                &no_cmdlines(),
+                &evidence(&panes),
+            )
+        };
+
+        let actions = pass();
+        assert!(
+            actions.contains(&ReconcileAction::BindingMismatch {
+                terminal_id: "term-a".to_string(),
+                session_id: "s-b".to_string(),
+                runs_on: "term-b".to_string(),
+            }),
+            "{actions:?}"
+        );
+        assert_eq!(counters.mismatches(), 1);
+        for (id, terminal) in [("s-a", "term-a"), ("s-b", "term-b")] {
+            let row = store.get(id).unwrap();
+            assert_eq!(
+                (
+                    row.state.as_str(),
+                    row.terminal_id.as_str(),
+                    row.binding_state
+                ),
+                ("open", terminal, Some(BindingState::Matched)),
+                "{id}: {actions:?}"
+            );
+        }
+
+        let again = pass();
+        assert!(
+            !again
+                .iter()
+                .any(|a| matches!(a, ReconcileAction::BindingMismatch { .. })),
+            "{again:?}"
+        );
+        assert_eq!(
+            (counters.mismatches(), counters.refused_moves()),
+            (1, 1),
+            "one mismatch, and the one refused weak move"
+        );
+    }
+
+    /// Round 12: a strong wrong write onto a readable, occupied pane — here a
+    /// `claude --resume s` line B's SHELL read that launched nothing — with the
+    /// guard's oracle attached from the start. Strong, it is not refused; the
+    /// row of `x`, B's own session, stays open beside it. The pass finds `s`
+    /// running in A while its row sits on B: `unknown`, counted once — `x` is
+    /// no `/clear` successor of `s` — and healed from A's record.
+    #[test]
+    fn a_strong_wrong_write_onto_an_occupied_pane_is_counted() {
+        use crate::terminal::claude_resume_sniff::{
+            apply_typed_resume_effects, parse_typed_claude_resume, TypedLineTarget,
+        };
+        const S: &str = "0f9e8d7c-6b5a-4938-8271-605f4e3d2c1b";
+        let dir = tempdir().unwrap();
+        let panes = [("term-a", names(S)), ("term-b", names("x"))];
+        let (store, counters) = store_with_panes(dir.path(), &panes);
+        hook(&store, S, "term-a");
+        hook(&store, "x", "term-b");
+        let parsed = parse_typed_claude_resume(&format!("claude --resume {S}")).unwrap();
+        apply_typed_resume_effects(
+            Some(&store),
+            &parsed,
+            TypedLineTarget::Shell,
+            "term-b",
+            "C:/repo",
+            "default",
+            "T",
+            || {},
+            || {},
+        );
+        assert_eq!(store.get(S).unwrap().terminal_id, "term-b", "not refused");
+        assert_eq!(store.get("x").unwrap().state, "open", "B's own row stays");
+        let (live, _) = two_panes_one_workdir();
+        let pass = || {
+            // Read after the write: the pass judges it.
+            std::thread::sleep(Duration::from_millis(2));
+            run_reconcile_at_epoch(
+                &store,
+                &live,
+                &ProcessSnapshot::default(),
+                &transcripts(&[S, "x"], 1_500),
+                &no_cmdlines(),
+                &evidence(&panes),
+                store.pane_epoch(),
+                Some(Instant::now()),
+            )
+        };
+
+        let actions = pass();
+        assert!(
+            actions.contains(&ReconcileAction::BindingMismatch {
+                terminal_id: "term-b".to_string(),
+                session_id: S.to_string(),
+                runs_on: "term-a".to_string(),
+            }),
+            "{actions:?}"
+        );
+        for (id, terminal) in [(S, "term-a"), ("x", "term-b")] {
+            let row = store.get(id).unwrap();
+            assert_eq!(
+                (
+                    row.state.as_str(),
+                    row.terminal_id.as_str(),
+                    row.binding_state
+                ),
+                ("open", terminal, Some(BindingState::Matched)),
+                "{id}: {actions:?}"
+            );
+        }
+        let again = pass();
+        assert!(!binds_session(&again, S), "{again:?}");
+        assert_eq!((counters.mismatches(), counters.refused_moves()), (1, 0));
+    }
+
+    /// Round 12: the phantom prune never removes a row placed after the pass's
+    /// evidence was read. A new tab, `term-new`, is spawned after this pass
+    /// read its live pane list; the spawn's pin — authoritative, unconfirmed,
+    /// no transcript yet — sits on a terminal `live` cannot list, phantom-
+    /// shaped, and is left alone. Placed before the evidence was read, the
+    /// same pin is a phantom and is pruned.
+    #[test]
+    fn the_phantom_prune_leaves_a_row_placed_after_the_evidence_alone() {
+        for placed_before_the_evidence in [false, true] {
+            let dir = tempdir().unwrap();
+            let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+            let mut read = Instant::now();
+            std::thread::sleep(Duration::from_millis(2));
+            store.record_open(TerminalSessionRecord {
+                confirmed_at: None,
+                ..title_rec("pin", "term-new", None)
+            });
+            if placed_before_the_evidence {
+                std::thread::sleep(Duration::from_millis(2));
+                read = Instant::now();
+            }
+            let (live, _) = two_panes_one_workdir();
+
+            let actions = run_reconcile_at_epoch(
+                &store,
+                &live,
+                &ProcessSnapshot::default(),
+                &no_transcripts(),
+                &no_cmdlines(),
+                &no_evidence(),
+                None,
+                Some(read),
+            );
+
+            let pruned = actions.contains(&ReconcileAction::PrunePhantom {
+                session_id: "pin".to_string(),
+            });
+            assert_eq!(
+                (pruned, store.get("pin").is_none()),
+                (placed_before_the_evidence, placed_before_the_evidence),
+                "placed_before_the_evidence={placed_before_the_evidence}: {actions:?}"
+            );
+        }
+    }
+
+    /// A `/clear` leftover is healed uncounted. Pane A launched `s` and ran
+    /// `/clear` into `s2`, both hook-confirmed, so `s`'s row stays open beside
+    /// `s2`'s, which the `/clear` hook marks adopted from `s`; A's record names
+    /// `s2`. Pane B launched `x`, then resumed `s` inside its TUI: B's record
+    /// names `s` before B's hook lands. `s`'s row on A reads `unknown` — it
+    /// runs in B — so A no longer holds it, and rung 2b moves it onto B;
+    /// nothing is counted, and the next pass finds every row matched.
     #[test]
     fn a_clear_leftover_resumed_in_another_pane_is_healed_uncounted() {
         let dir = tempdir().unwrap();
         let panes = [("term-a", names("s2")), ("term-b", names("s"))];
         let (store, counters) = store_with_panes(dir.path(), &panes);
         hook(&store, "s", "term-a");
-        hook(&store, "s2", "term-a");
+        clear_hook(&store, "s2", "term-a");
         hook(&store, "x", "term-b");
         assert_eq!(
             store.get("s").unwrap().state,
             "open",
             "precondition: the /clear's hook leaves the predecessor's row open"
+        );
+        assert_eq!(
+            store.get("s2").unwrap().adopted_from.as_deref(),
+            Some("s"),
+            "precondition: and marks its successor adopted from it"
         );
         let (live, _) = two_panes_one_workdir();
         let pass = || {
@@ -3965,6 +4266,17 @@ mod tests {
             .is_recorded());
         store.confirm_session(id);
         store.note_session_start_hook(id);
+    }
+
+    /// What the hook route does for a `/clear` that minted `id` on `terminal`
+    /// (`source: "clear"`): the write [`hook`] makes, then the adoption marker
+    /// naming the session most recently started there, read before the write.
+    fn clear_hook(store: &SessionLifecycleStore, id: &str, terminal: &str) {
+        let predecessor = store.latest_open_on_terminal(terminal, id);
+        hook(store, id, terminal);
+        if let Some(predecessor) = predecessor {
+            store.mark_adopted_from(id, &predecessor.claude_session_id);
+        }
     }
 
     /// Case (i) where records follow a switch (the rules' assumption —

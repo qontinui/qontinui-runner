@@ -4730,6 +4730,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         let open = poll_lifecycle_store.open_records();
+                        // When this tick's live pane list was read: the oldest
+                        // evidence the reconcile pass below judges by
+                        // (`run_reconcile_pass`).
+                        let live_read_at = std::time::Instant::now();
                         let live = poll_tm.list();
 
                         // Keep the SHARED always-on identity shim dir alive
@@ -5291,10 +5295,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 ai_start_unix: None,
                             })
                             .collect();
+                        // The PID-reuse guard the per-record loop above
+                        // applied, so the pass reads no evidence from a pane
+                        // that loop counts as running no `claude`.
+                        let pid_reuse = session::reconcile::PidReuseGuard {
+                            verified: holder_verified,
+                            boot_unix_millis: primary_boot_unix_millis,
+                        };
                         let actions = session::reconcile::run_reconcile_pass(
                             &poll_lifecycle_store,
                             &live_ptys,
+                            live_read_at,
                             &snap,
+                            &pid_reuse,
                             "periodic",
                         )
                         .await;
@@ -5359,6 +5372,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let reconcile_app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    let live_read_at = std::time::Instant::now();
                     let live: Vec<session::reconcile::LivePty> = reconcile_tm
                         .list()
                         .into_iter()
@@ -5374,8 +5388,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             ai_start_unix: None,
                         })
                         .collect();
-                    let actions =
-                        session::reconcile::run_at_boot(&reconcile_lifecycle_store, live).await;
+                    let actions = session::reconcile::run_at_boot(
+                        &reconcile_lifecycle_store,
+                        live,
+                        live_read_at,
+                    )
+                    .await;
                     emit_session_bound(&reconcile_app_handle, &actions);
                     session::coord_identity::apply_reconcile_tick_in_app(
                         &reconcile_app_handle,

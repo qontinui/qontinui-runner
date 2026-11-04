@@ -49,10 +49,11 @@
 //! 2. Otherwise, another live pane's record names `S` — `S` demonstrably runs
 //!    elsewhere → `unknown`, counted once per episode. This is the 2026-10-25
 //!    shape. Not counted when `R` is a leftover ([`BindingVerdict::leftover`]):
-//!    `P` still holds an open row of the session its own record names, as a
-//!    `/clear` leaves its predecessor's confirmed row beside its successor's.
-//!    It is `unknown` and healed all the same. In the 2026-10-25 shape the
-//!    pane's own row had been closed, so that shape is counted.
+//!    `S` is a `/clear` predecessor of the session `P`'s record names, whose
+//!    open row `P` holds — by `adopted_from`, which only the `/clear` hook
+//!    writes. A `/clear` leaves its predecessor's confirmed row open beside its
+//!    successor's, and that row is `unknown` and healed all the same. A row a
+//!    strong write put on an occupied pane is no predecessor, and is counted.
 //! 3. Otherwise → no verdict. A `matched` the row carried is withdrawn; an
 //!    `unknown` is kept, so one episode is never counted twice.
 //!
@@ -71,11 +72,9 @@
 //!
 //! - **(i)** A session entered by an in-TUI `/resume` is named by no pane, so
 //!   a stale record naming it — in the pane that launched it and has since
-//!   switched away — reads its row `unknown` wherever its hook placed it, and
-//!   rung 2b moves the row back onto the pane whose stale record names it.
-//!   That `unknown` is uncounted while the hook's pane still holds an open row
-//!   of the session its own stale record names (its launch session's, which
-//!   the resume's hook leaves open): a leftover.
+//!   switched away — reads its row `unknown` wherever its hook placed it,
+//!   counted once per episode, and rung 2b moves the row back onto the pane
+//!   whose stale record names it.
 //! - **(ii)** A pane that ran `/clear` keeps naming its predecessor. Once no
 //!   live pane holds or runs that predecessor, rung 2b binds it back onto the
 //!   pane, authoritatively: a confirmed bind's supersede closes the row of the
@@ -97,8 +96,12 @@
 //! [`SessionLifecycleStore::record_bind_checked`], which against that instant
 //! moves no row placed after it, re-opens no row closed after it, and spares,
 //! in its supersede, every sibling placed after it. Rule 2 reads no row placed
-//! after it `unknown` ([`SessionLifecycleStore::set_binding_state_from`]).
-//! The next pass, enumerated after the write, judges the row. `Instant` is
+//! after it `unknown` ([`SessionLifecycleStore::set_binding_state_from`]), and
+//! the phantom prune removes none
+//! ([`SessionLifecycleStore::remove_session_if`]). The runner's own pass dates
+//! its observation from the first evidence it read — the live pane list,
+//! before the process table — so a tab spawned after that list was read is
+//! newer than all of it. The next pass judges the row. `Instant` is
 //! monotonic, so no clock step reorders the two; the memory starts empty
 //! after a restart (and after a reload from disk), which means "no recent
 //! placement or close".
@@ -138,8 +141,8 @@
 //!
 //! [`BindingCounters`]: a row that turns `unknown` (rule 2) — once per episode,
 //! which lasts until the row is matched, moves or closes, and never for a
-//! leftover ([`BindingVerdict::leftover`]); and a refused weak move — once per
-//! (session, pane) episode, not once per retry. Served as
+//! `/clear` leftover ([`BindingVerdict::leftover`]); and a refused weak move —
+//! once per (session, pane) episode, not once per retry. Served as
 //! `/health` `sessionTracking.bindingMismatchTotal` and
 //! `bindingMoveRefusedTotal`.
 
@@ -310,18 +313,21 @@ pub async fn read_records_off_runtime(
 // ---------------------------------------------------------------------------
 
 /// What one reconcile pass saw: every live pane's top-level `claude` pids (an
-/// empty list for a live pane with no `claude`), and the session each pid's
+/// empty list for a live pane with no `claude` — or one whose root the
+/// liveness poll's PID-reuse guard calls recycled,
+/// [`crate::session::reconcile::PidReuseGuard`]), and the session each pid's
 /// own record names. A pane absent from `panes` was not live; a pid absent
 /// from `sessions` has no readable record naming a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneObservation {
     pub panes: HashMap<String, Vec<LivePid>>,
     pub sessions: HashMap<u32, String>,
-    /// When the enumeration of the process table it was built from BEGAN —
-    /// before any pid in it was read, and so no later than anything it saw.
-    /// The observation is aged from here ([`OBSERVATION_MAX_AGE`]), ordered
-    /// against other observations by it, and a row placed after it is newer
-    /// than everything it says ([`SessionLifecycleStore::placed_after`]).
+    /// When the evidence it was built from began to be read — the live pane
+    /// list, then the enumeration of the process table — before any pid in it
+    /// was read, and so no later than anything it saw. The observation is
+    /// aged from here ([`OBSERVATION_MAX_AGE`]), ordered against other
+    /// observations by it, and a row placed after it is newer than everything
+    /// it says ([`SessionLifecycleStore::placed_after`]).
     pub enumerated_at: Instant,
 }
 
@@ -700,15 +706,25 @@ pub struct BindingVerdict {
     /// Rule 2: a live pane whose own record names the row's session (the first
     /// in sort order when several do).
     pub runs_on: Option<String>,
-    /// Rule 2 only: the row is a LEFTOVER — its own pane's record names another
-    /// session, and the pane also holds an open row of that one. A `/clear`
-    /// leaves exactly this: the hook's supersede closes only unconfirmed
-    /// siblings, so the predecessor's confirmed row stays open beside its
-    /// successor's, and a later in-TUI `/resume` of the predecessor elsewhere
-    /// names it in another pane before that pane's hook lands. The row is
-    /// `unknown` and healed like any other, but not counted as a mismatch
-    /// ([`apply_binding_verdicts`]). In the 2026-10-25 shape the pane's own
-    /// row had been closed, so it is no leftover, and it is counted.
+    /// Rule 2 only: the row is a LEFTOVER — a `/clear` predecessor of the
+    /// session its pane runs now. Its pane's record names another session, the
+    /// pane holds that session's open row, and that session was adopted from
+    /// this one by a `/clear`, directly or through earlier ones
+    /// ([`TerminalSessionRecord::adopted_from`], which only the `/clear` hook
+    /// writes and a restart keeps). A `/clear` leaves exactly this: the hook's
+    /// supersede closes only unconfirmed siblings, so the predecessor's
+    /// confirmed row stays open beside its successor's, and a later in-TUI
+    /// `/resume` of the predecessor elsewhere names it in another pane before
+    /// that pane's hook lands. The row is `unknown` and healed like any other,
+    /// but not counted as a mismatch ([`apply_binding_verdicts`]).
+    ///
+    /// Nothing else is a leftover. A row a strong write put on an occupied
+    /// pane — whose own row the write's supersede spared, since the pane's
+    /// record names it — is no predecessor of the pane's session, and is
+    /// counted; so is the 2026-10-25 shape, where the pane's own row had been
+    /// closed. A `/clear` whose hook never reported `clear` leaves no marker,
+    /// and its predecessor is counted too: a missing marker never hides a
+    /// mismatch.
     pub leftover: bool,
 }
 
@@ -719,8 +735,8 @@ pub struct BindingVerdict {
 ///
 /// 1. `P`'s own record names `S` → `Matched`.
 /// 2. Otherwise another live pane's record names `S` → `Unknown` — a
-///    [`BindingVerdict::leftover`] when `P` also holds an open row of the
-///    session its own record names.
+///    [`BindingVerdict::leftover`] when `S` is a `/clear` predecessor of the
+///    session `P`'s record names, whose open row `P` holds.
 /// 3. Otherwise → `None`.
 pub fn binding_verdicts(
     open: &[TerminalSessionRecord],
@@ -736,10 +752,19 @@ pub fn binding_verdicts(
         terminals.sort_unstable();
     }
     let open: Vec<&TerminalSessionRecord> = open.iter().filter(|r| r.state == "open").collect();
-    // Every (pane, session) an open row holds: the leftover test.
+    // The leftover test's two indexes: every (pane, session) an open row
+    // holds, and each open row's `/clear` predecessor.
     let held: HashSet<(&str, &str)> = open
         .iter()
         .map(|r| (r.terminal_id.as_str(), r.claude_session_id.as_str()))
+        .collect();
+    let adopted_from: HashMap<&str, &str> = open
+        .iter()
+        .filter_map(|r| {
+            r.adopted_from
+                .as_deref()
+                .map(|predecessor| (r.claude_session_id.as_str(), predecessor))
+        })
         .collect();
     let mut out: Vec<BindingVerdict> = open
         .iter()
@@ -752,9 +777,10 @@ pub fn binding_verdicts(
                 .get(id)
                 .and_then(|terminals| terminals.iter().find(|t| **t != r.terminal_id))
             {
-                let leftover = own
-                    .named_session()
-                    .is_some_and(|named| held.contains(&(r.terminal_id.as_str(), named)));
+                let leftover = own.named_session().is_some_and(|named| {
+                    held.contains(&(r.terminal_id.as_str(), named))
+                        && cleared_from(named, id, &adopted_from)
+                });
                 (
                     Some(BindingState::Unknown),
                     Some((*elsewhere).to_string()),
@@ -776,6 +802,25 @@ pub fn binding_verdicts(
         (&a.terminal_id, &a.claude_session_id).cmp(&(&b.terminal_id, &b.claude_session_id))
     });
     out
+}
+
+/// Whether `predecessor` is a `/clear` predecessor of `session`: reached from
+/// it by following `adopted_from` through open rows (`adopted_from`, open row
+/// → its predecessor). A chain through a row that has closed is not followed,
+/// and a cycle ends the walk: either answers "no", which counts.
+fn cleared_from(session: &str, predecessor: &str, adopted_from: &HashMap<&str, &str>) -> bool {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut at = session;
+    while let Some(&previous) = adopted_from.get(at) {
+        if previous == predecessor {
+            return true;
+        }
+        if !seen.insert(previous) {
+            return false;
+        }
+        at = previous;
+    }
+    false
 }
 
 /// Store `verdicts`, taken from the observation numbered `epoch` (`None`: from
@@ -1090,23 +1135,35 @@ mod tests {
         assert_eq!(got.get("s2"), Some(&None), "judged on nothing, not unknown");
     }
 
-    /// Round 11: a `/clear` leftover is `unknown` but no mismatch. Pane A ran
-    /// `/clear` (`s` → `s2`), so it holds `s`'s confirmed row beside `s2`'s and
-    /// names `s2`; `s` was then resumed inside pane B's TUI, whose record names
-    /// it before B's hook lands. `s`'s row on A reads `unknown` — it runs in B
-    /// — as a leftover: A holds an open row of the session its record names.
-    /// In the 2026-10-25 shape the pane's own row had been closed: the same
-    /// verdict, and no leftover.
+    /// A `/clear` predecessor, adopted from by the session its pane runs now.
+    fn adopted(id: &str, terminal: &str, predecessor: &str) -> TerminalSessionRecord {
+        TerminalSessionRecord {
+            adopted_from: Some(predecessor.to_string()),
+            ..open_row(id, terminal, None)
+        }
+    }
+
+    /// A `/clear` leftover is `unknown` but no mismatch, and nothing else is.
+    /// Pane A ran `/clear` (`s` → `s2`, so `s2` was adopted from `s`): it holds
+    /// `s`'s confirmed row beside `s2`'s and names `s2`; `s` was then resumed
+    /// inside pane B's TUI, whose record names it before B's hook lands. `s`'s
+    /// row on A reads `unknown` — it runs in B — as a leftover, and so it does
+    /// after a second `/clear` (`s2` → `s3`). The same `unknown` is NO leftover
+    /// when A's own row was not adopted from `s` (a strong write put `s` on an
+    /// occupied pane, sparing that row), when A's own row had been closed (the
+    /// 2026-10-25 shape), or when A holds no row of what it names.
     #[test]
-    fn a_clear_leftover_reads_unknown_as_a_leftover_and_the_2026_10_25_shape_does_not() {
-        let evidence: HashMap<String, PaneEvidence> = [
-            ("t-a".to_string(), names("s2")),
-            ("t-b".to_string(), names("s")),
-        ]
-        .into_iter()
-        .collect();
-        let verdict_of_s = |rows: &[TerminalSessionRecord]| {
-            binding_verdicts(rows, &evidence)
+    fn only_a_clear_predecessor_of_the_panes_session_reads_as_a_leftover() {
+        let evidence = |a_names: &str| -> HashMap<String, PaneEvidence> {
+            [
+                ("t-a".to_string(), names(a_names)),
+                ("t-b".to_string(), names("s")),
+            ]
+            .into_iter()
+            .collect()
+        };
+        let verdict_of_s = |rows: &[TerminalSessionRecord], a_names: &str| {
+            binding_verdicts(rows, &evidence(a_names))
                 .into_iter()
                 .find(|v| v.claude_session_id == "s")
                 .map(|v| (v.state, v.runs_on, v.leftover))
@@ -1118,30 +1175,65 @@ mod tests {
                 leftover,
             ))
         };
+        let x_on_b = open_row("x", "t-b", None);
         let cleared = vec![
             open_row("s", "t-a", None),
-            open_row("s2", "t-a", None),
-            open_row("x", "t-b", None),
+            adopted("s2", "t-a", "s"),
+            x_on_b.clone(),
         ];
-        assert_eq!(verdict_of_s(&cleared), unknown_on_b(true));
+        assert_eq!(verdict_of_s(&cleared, "s2"), unknown_on_b(true));
+
+        let cleared_twice = vec![
+            open_row("s", "t-a", None),
+            adopted("s2", "t-a", "s"),
+            adopted("s3", "t-a", "s2"),
+            x_on_b.clone(),
+        ];
+        assert_eq!(
+            verdict_of_s(&cleared_twice, "s3"),
+            unknown_on_b(true),
+            "a predecessor through two clears"
+        );
+
+        let written_over = vec![
+            open_row("s", "t-a", None),
+            open_row("s2", "t-a", None),
+            x_on_b.clone(),
+        ];
+        assert_eq!(
+            verdict_of_s(&written_over, "s2"),
+            unknown_on_b(false),
+            "the pane's own row is no successor of s: a strong write put s there"
+        );
+        let adopted_elsewhere = vec![
+            open_row("s", "t-a", None),
+            adopted("s2", "t-a", "y"),
+            x_on_b.clone(),
+        ];
+        assert_eq!(
+            verdict_of_s(&adopted_elsewhere, "s2"),
+            unknown_on_b(false),
+            "adopted, but not from s"
+        );
 
         let mut moved_over = cleared.clone();
         moved_over[1].state = "closed".to_string();
         assert_eq!(
-            verdict_of_s(&moved_over),
+            verdict_of_s(&moved_over, "s2"),
             unknown_on_b(false),
             "the pane's own row closed: the 2026-10-25 shape"
         );
         assert_eq!(
-            verdict_of_s(&[open_row("s", "t-a", None)]),
+            verdict_of_s(&[open_row("s", "t-a", None)], "s2"),
             unknown_on_b(false),
             "a pane holding no row of what it names"
         );
     }
 
-    /// Round 11: applying a leftover's `unknown` stores it and neither counts
-    /// nor reports it; the same contradiction with the pane's own row closed —
-    /// the 2026-10-25 shape — is counted and reported.
+    /// Applying a leftover's `unknown` stores it and neither counts nor
+    /// reports it. The same contradiction is counted and reported when the
+    /// pane's own row was not adopted from the row (a strong write), and when
+    /// it had been closed (the 2026-10-25 shape).
     #[test]
     fn a_leftover_unknown_is_stored_but_not_counted() {
         let evidence: HashMap<String, PaneEvidence> = [
@@ -1150,21 +1242,40 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        for own_row_closed in [false, true] {
+        // (case, s2 adopted from s, s2's row closed, reported and counted)
+        let cases = [
+            ("a /clear leftover", true, false, (0, 0)),
+            (
+                "a strong write over the pane's own row",
+                false,
+                false,
+                (1, 1),
+            ),
+            ("the 2026-10-25 shape", true, true, (1, 1)),
+        ];
+        for (case, adopted_from_s, own_row_closed, counted) in cases {
             let dir = tempfile::tempdir().unwrap();
             let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
             let counters = Arc::new(BindingCounters::default());
             store.attach_binding_counters(counters.clone());
-            // `s` launched on A; `/clear` made `s2` there — its hook writes it
-            // unconfirmed, so `s`'s confirmed row stays open beside it.
+            // `s` on A, and `s2` beside it — a hook writes `s2` unconfirmed, so
+            // `s`'s confirmed row stays open — adopted from `s` by a `/clear`
+            // as the `/clear` hook marks it, or not.
             store.record_open(open_row("s", "t-a", None));
             store.record_open(TerminalSessionRecord {
                 confirmed_at: None,
                 ..open_row("s2", "t-a", None)
             });
             store.confirm_session("s2");
+            if adopted_from_s {
+                store.mark_adopted_from("s2", "s");
+            }
             store.record_open(open_row("x", "t-b", None));
-            assert_eq!(store.get("s").unwrap().state, "open", "precondition");
+            assert_eq!(
+                store.get("s").unwrap().state,
+                "open",
+                "{case}: precondition"
+            );
             if own_row_closed {
                 store.record_close("s2", "explicit");
             }
@@ -1178,13 +1289,9 @@ mod tests {
             assert_eq!(
                 store.get("s").unwrap().binding_state,
                 Some(BindingState::Unknown),
-                "own_row_closed={own_row_closed}"
+                "{case}"
             );
-            assert_eq!(
-                (reported.len(), counters.mismatches()),
-                if own_row_closed { (1, 1) } else { (0, 0) },
-                "own_row_closed={own_row_closed}"
-            );
+            assert_eq!((reported.len(), counters.mismatches()), counted, "{case}");
         }
     }
 
@@ -1565,7 +1672,7 @@ mod tests {
     /// by C's confirmed bind. Every verdict carries the pass's epoch.
     #[tokio::test]
     async fn the_pass_binds_each_pane_from_its_own_record_and_retires_a_stale_row() {
-        use crate::session::reconcile::{run_reconcile_pass, LivePty};
+        use crate::session::reconcile::{run_reconcile_pass, LivePty, PidReuseGuard};
         const WORKDIR: &str = "/work/three-panes";
         let ambient = crate::test_env::isolated_ambient();
         let config = ambient.dir().join(".claude");
@@ -1632,7 +1739,15 @@ mod tests {
             ..unconfirmed("s-x", "term-c")
         });
 
-        let actions = run_reconcile_pass(&store, &live, &snapshot, "test").await;
+        let actions = run_reconcile_pass(
+            &store,
+            &live,
+            Instant::now(),
+            &snapshot,
+            &PidReuseGuard::default(),
+            "test",
+        )
+        .await;
 
         let current = store.current_binding_verdicts();
         for (terminal, _, _, _, session) in panes {
@@ -1684,7 +1799,7 @@ mod tests {
     /// newer than the move, and rung 2b would take `s` back to A.
     #[tokio::test]
     async fn the_pass_dates_its_evidence_from_its_snapshot_and_leaves_a_later_placement_alone() {
-        use crate::session::reconcile::{run_reconcile_pass, LivePty};
+        use crate::session::reconcile::{run_reconcile_pass, LivePty, PidReuseGuard};
         use crate::terminal::claude_resume_sniff::{
             apply_typed_resume_effects, parse_typed_claude_resume, TypedLineTarget,
         };
@@ -1761,31 +1876,172 @@ mod tests {
             assert_eq!(store.get(S).unwrap().terminal_id, "term-b", "precondition");
         };
 
+        async fn pass(
+            store: &SessionLifecycleStore,
+            live: &[LivePty],
+            live_read_at: Instant,
+            snapshot: ProcessSnapshot,
+        ) -> Vec<crate::session::reconcile::ReconcileAction> {
+            run_reconcile_pass(
+                store,
+                live,
+                live_read_at,
+                &snapshot,
+                &PidReuseGuard::default(),
+                "test",
+            )
+            .await
+        }
+        let left_on_b =
+            |store: &SessionLifecycleStore,
+             why: &str,
+             actions: &[crate::session::reconcile::ReconcileAction]| {
+                assert_eq!(
+                    store.get("x").unwrap().binding_state,
+                    Some(BindingState::Matched),
+                    "the records were read: B's names x ({actions:?})"
+                );
+                let row = store.get(S).unwrap();
+                assert_eq!(
+                    (row.terminal_id.as_str(), row.binding_state),
+                    ("term-b", None),
+                    "{why}: {actions:?}"
+                );
+            };
+
         let store = store_with_s_moved_onto_b("dated.json");
-        let snapshot = snapshot_taken(Some(Instant::now()));
+        let read = Instant::now();
+        let snapshot = snapshot_taken(Some(read));
         std::thread::sleep(Duration::from_millis(2));
         sniff_moves_s_onto_b(&store);
-        let actions = run_reconcile_pass(&store, &live, &snapshot, "test").await;
-        assert_eq!(
-            store.get("x").unwrap().binding_state,
-            Some(BindingState::Matched),
-            "the records were read: B's names x ({actions:?})"
-        );
-        let row = store.get(S).unwrap();
-        assert_eq!(
-            (row.terminal_id.as_str(), row.binding_state),
-            ("term-b", None),
-            "evidence older than the move: {actions:?}"
-        );
+        let actions = pass(&store, &live, read, snapshot).await;
+        left_on_b(&store, "evidence older than the move", &actions);
+
+        // Round 12: the live pane list is evidence too, read before the
+        // process table. A move between the two is newer than the list, so the
+        // pass dates its evidence from the list, not from the table.
+        let store = store_with_s_moved_onto_b("listed-before.json");
+        let live_read_at = Instant::now();
+        std::thread::sleep(Duration::from_millis(2));
+        sniff_moves_s_onto_b(&store);
+        std::thread::sleep(Duration::from_millis(2));
+        let actions = pass(
+            &store,
+            &live,
+            live_read_at,
+            snapshot_taken(Some(Instant::now())),
+        )
+        .await;
+        left_on_b(&store, "a move after the live list was read", &actions);
 
         let store = store_with_s_moved_onto_b("undated.json");
         sniff_moves_s_onto_b(&store);
         std::thread::sleep(Duration::from_millis(2));
-        let actions = run_reconcile_pass(&store, &live, &snapshot_taken(None), "test").await;
+        let actions = pass(&store, &live, Instant::now(), snapshot_taken(None)).await;
         assert_eq!(
             store.get(S).unwrap().terminal_id,
             "term-a",
             "the same records dated after the move: {actions:?}"
+        );
+    }
+
+    /// Round 12, L7: a pane whose root the liveness poll's PID-reuse guard
+    /// calls recycled — created before this runner's boot, with no holder
+    /// proof — yields no evidence, so the pass agrees with the poll that runs
+    /// no `claude` there. The poll closed `s-r`'s row `poll-dead`; the pane's
+    /// `claude` record still names `s-r`, and rung 2b re-opened the row from
+    /// it, tick after tick. With the guard the pass binds nothing there. With
+    /// the root proven by its holder, the same pane binds `s-r` as before.
+    #[tokio::test]
+    async fn a_pane_the_polls_pid_reuse_guard_calls_recycled_yields_no_evidence() {
+        use crate::session::reconcile::{run_reconcile_pass, LivePty, PidReuseGuard};
+        const WORKDIR: &str = "/work/recycled";
+        const SHELL: u32 = 4_300_501;
+        const CLAUDE: u32 = 4_300_502;
+        const BOOT_MS: i64 = 1_700_000_000_000;
+        let ambient = crate::test_env::isolated_ambient();
+        let config = ambient.dir().join(".claude");
+        std::fs::create_dir_all(config.join("sessions")).unwrap();
+        std::fs::create_dir_all(config.join("projects")).unwrap();
+        // The adopted pane: its shell and `claude` both predate the boot.
+        let started = 1_699_000_100_i64;
+        let snapshot_taken = |taken_at: Option<Instant>| {
+            let mut snapshot = ProcessSnapshot::default();
+            snapshot.parent_map.insert(SHELL, vec![CLAUDE]);
+            snapshot.names.insert(SHELL, "bash".to_string());
+            snapshot.names.insert(CLAUDE, "claude".to_string());
+            snapshot.creation_times.insert(SHELL, 1_699_000_000);
+            snapshot.creation_times.insert(CLAUDE, started);
+            snapshot.taken_at = taken_at;
+            snapshot
+        };
+        std::fs::write(
+            config.join(format!("sessions/{CLAUDE}.json")),
+            format!(
+                r#"{{"pid":{CLAUDE},"sessionId":"s-r","startedAt":{},"status":"idle"}}"#,
+                started * 1000
+            ),
+        )
+        .unwrap();
+        let live = vec![LivePty {
+            terminal_id: "term-r".to_string(),
+            pid: Some(SHELL),
+            working_dir: WORKDIR.to_string(),
+            page_id: "default".to_string(),
+            title: "term-r".to_string(),
+            ai_pid: None,
+            ai_start_unix: None,
+        }];
+        let poll_closed_s_r = |file: &str| {
+            let store = SessionLifecycleStore::open(ambient.dir().join(file)).unwrap();
+            store.attach_pane_evidence(Arc::new(LivePaneRegistry::new()));
+            store.record_open(TerminalSessionRecord {
+                working_dir: Some(WORKDIR.to_string()),
+                ..open_row("s-r", "term-r", None)
+            });
+            store.record_close("s-r", "poll-dead");
+            store
+        };
+        let binds_s_r = |actions: &[crate::session::reconcile::ReconcileAction]| {
+            actions.iter().any(|a| {
+                matches!(a, crate::session::reconcile::ReconcileAction::Bind { session_id, .. } if session_id == "s-r")
+            })
+        };
+        // A pass whose evidence is read after the poll's close.
+        let read_now = || {
+            std::thread::sleep(Duration::from_millis(2));
+            let read = Instant::now();
+            (read, snapshot_taken(Some(read)))
+        };
+
+        let store = poll_closed_s_r("recycled.json");
+        let guard = PidReuseGuard {
+            verified: HashSet::new(),
+            boot_unix_millis: BOOT_MS,
+        };
+        assert!(guard.recycled(SHELL, &snapshot_taken(None)), "precondition");
+        let (read, taken) = read_now();
+        let actions = run_reconcile_pass(&store, &live, read, &taken, &guard, "test").await;
+        assert!(!binds_s_r(&actions), "{actions:?}");
+        assert_eq!(store.get("s-r").unwrap().state, "closed", "{actions:?}");
+
+        let store = poll_closed_s_r("proven.json");
+        let proven = PidReuseGuard {
+            verified: [SHELL].into_iter().collect(),
+            boot_unix_millis: BOOT_MS,
+        };
+        assert!(
+            !proven.recycled(SHELL, &snapshot_taken(None)),
+            "precondition"
+        );
+        let (read, taken) = read_now();
+        let actions = run_reconcile_pass(&store, &live, read, &taken, &proven, "test").await;
+        assert!(binds_s_r(&actions), "{actions:?}");
+        let row = store.get("s-r").unwrap();
+        assert_eq!(
+            (row.state.as_str(), row.terminal_id.as_str()),
+            ("open", "term-r"),
+            "{actions:?}"
         );
     }
 }

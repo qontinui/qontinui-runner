@@ -105,11 +105,8 @@ pub fn claude_present_in_inclusive_subtree(
     snapshot: &ProcessSnapshot,
     reference_unix_millis: i64,
 ) -> bool {
-    // PID-reuse guard on the tracked root (seconds → millis before comparing).
-    if let Some(&created_secs) = snapshot.creation_times.get(&root_pid) {
-        if created_secs > 0 && created_secs * 1000 + PID_REUSE_SKEW_MS < reference_unix_millis {
-            return false;
-        }
+    if root_predates(root_pid, snapshot, reference_unix_millis) {
+        return false;
     }
     if is_countable_claude(root_pid, snapshot) {
         return true;
@@ -117,6 +114,25 @@ pub fn claude_present_in_inclusive_subtree(
     bfs_descendants_from(root_pid, &snapshot.parent_map, &snapshot.creation_times)
         .iter()
         .any(|d| is_countable_claude(d.pid, snapshot))
+}
+
+/// The PID-reuse guard of [`claude_present_in_inclusive_subtree`] on its own:
+/// whether `root_pid` was created before `reference_unix_millis` (beyond
+/// [`PID_REUSE_SKEW_MS`]), so it cannot be a process the reference instant's
+/// tree spawned and its subtree is not trusted. An unknown (absent or zero)
+/// creation time is not "before". `creation_times` is epoch SECONDS; the
+/// reference is epoch MILLIS.
+pub fn root_predates(
+    root_pid: u32,
+    snapshot: &ProcessSnapshot,
+    reference_unix_millis: i64,
+) -> bool {
+    snapshot
+        .creation_times
+        .get(&root_pid)
+        .is_some_and(|&created_secs| {
+            created_secs > 0 && created_secs * 1000 + PID_REUSE_SKEW_MS < reference_unix_millis
+        })
 }
 
 /// Every claude-image PID in the **inclusive** subtree rooted at `root_pid`
@@ -398,8 +414,15 @@ pub async fn discover_descendants_with_parent_map(
 /// startup reclaim pass can do its PID-reuse check without re-querying —
 /// stamped with when its enumeration began ([`ProcessSnapshot::taken_at`]).
 pub async fn snapshot_process_table_public() -> ProcessSnapshot {
+    stamped(snapshot_process_table()).await
+}
+
+/// `enumerate`'s snapshot, stamped with an instant taken BEFORE it starts to
+/// run: a future does nothing until it is awaited, so nothing it reads can
+/// predate the stamp ([`ProcessSnapshot::taken_at`]).
+async fn stamped(enumerate: impl std::future::Future<Output = ProcessSnapshot>) -> ProcessSnapshot {
     let taken_at = std::time::Instant::now();
-    let mut snapshot = snapshot_process_table().await;
+    let mut snapshot = enumerate.await;
     snapshot.taken_at = Some(taken_at);
     snapshot
 }
@@ -1247,6 +1270,43 @@ mod tests {
             ProcessSnapshot::default().taken_at,
             None,
             "a hand-built snapshot is not"
+        );
+    }
+
+    /// The stamp is taken BEFORE the enumeration starts to run, not when it
+    /// returns: an enumeration that starts, waits and then returns is stamped
+    /// no later than its own start.
+    #[tokio::test]
+    async fn a_snapshot_is_stamped_before_its_enumeration_starts() {
+        let started = std::sync::Mutex::new(None);
+        let snapshot = stamped(async {
+            *started.lock().unwrap() = Some(std::time::Instant::now());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            ProcessSnapshot::default()
+        })
+        .await;
+        let started = started.into_inner().unwrap().expect("the enumeration ran");
+        assert!(snapshot.taken_at.expect("stamped") <= started);
+    }
+
+    /// The PID-reuse guard alone: a root created before the reference
+    /// (beyond the skew) predates it; one created within the skew, after it,
+    /// or at an unknown time does not.
+    #[test]
+    fn root_predates_only_a_root_created_before_the_reference_beyond_the_skew() {
+        let mut snapshot = ProcessSnapshot::default();
+        for (pid, created_secs) in [(1, 1_000), (2, 1_998), (3, 2_000), (4, 0)] {
+            snapshot.creation_times.insert(pid, created_secs);
+        }
+        let reference = 2_000_000; // 2 000 s, in millis
+        assert!(root_predates(1, &snapshot, reference));
+        assert!(!root_predates(2, &snapshot, reference), "within the skew");
+        assert!(!root_predates(3, &snapshot, reference));
+        assert!(!root_predates(4, &snapshot, reference), "unknown time");
+        assert!(!root_predates(5, &snapshot, reference), "not in the table");
+        assert!(
+            !root_predates(1, &snapshot, i64::MIN),
+            "a holder-proven root"
         );
     }
 
