@@ -44,13 +44,14 @@
 #   D. on restart (log written AFTER the restart only): `previous shutdown was
 #      clean`, never `NOT clean`, no new crash breadcrumb, /health not `errored`.
 #   E. every session this run opened is back as a `claude --resume <its id>`.
-#   G. the first SIGTERM does NOT end the process at once (it runs the graceful
-#      path), and a second one 100 ms later ends it within 1 s, by SIGTERM (the
-#      wait status, observed directly on a launch outside systemd).
+#   G. the first SIGTERM starts the graceful path (the process is alive and
+#      `request_force_close` logged `FORCE-CLOSE accepted (signal SIGTERM)`,
+#      polled for up to 2 s), and a second SIGTERM then ends it within 1 s, by
+#      SIGTERM (the wait status, observed directly on a launch outside systemd).
 #
 # State it leaves: the unit, every process it started and the instance root are
 # removed, and so are the sessions' transcripts under the account's
-# `projects/<encoded root>/`. One thing is NOT removed: accepting claude's
+# `projects/<encoded root>/` (kept, with the root, under --keep). One thing is NOT removed: accepting claude's
 # folder-trust dialog records the (unique, now deleted) temp path as trusted in
 # the account's `.claude.json`. That file is shared with every live session on
 # the account, so the script does not rewrite it; the entry names a path that
@@ -91,7 +92,7 @@ UNIT=qontinui-sigterm-e2e-$PORT
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/qontinui-sigterm-e2e.XXXXXX") && ROOT=$(readlink -f "$ROOT")
 # An empty ROOT would make own_pids match EVERY process (cwd under "/"), and
 # cleanup would signal them all — never continue without a real root.
-if [ -z "$ROOT" ] || [ "$ROOT" = / ] || [ ! -d "$ROOT" ]; then
+if [ -z "$ROOT" ] || [ "$ROOT" = / ] || [ ! -d "$ROOT" ] || [[ "$ROOT" =~ [[:space:]] ]]; then
   echo "could not create the instance root" >&2; exit 2
 fi
 BASE="http://127.0.0.1:$PORT"
@@ -176,7 +177,7 @@ logs_since() {   # $1 = manifest file ('' = from the start)
   local f off
   log_files | while read -r f; do
     off=0
-    [ -n "$1" ] && off=$(awk -v p="$f" '$2==p{print $1}' "$1")
+    [ -n "$1" ] && off=$(awk -v p="$f" '{s=$1; sub(/^[^ ]+ /,""); if ($0==p) print s}' "$1")
     tail -c +"$(( ${off:-0} + 1 ))" "$f" 2>/dev/null
   done
 }
@@ -347,6 +348,7 @@ fi
 
 # ── D/E. the restart ──────────────────────────────────────────────────────────
 OWN_SIDS=$(own_session_ids | tr '\n' ' ')
+TID_ROWS=$(lifecycle_rows "${TIDS[*]:-}")
 CRASH_BEFORE=$(find "$ROOT" -name 'crash_*.txt' | wc -l)
 MANIFEST="$ROOT/.e2e-log-manifest"; log_manifest > "$MANIFEST"
 systemctl --user reset-failed "$UNIT" >/dev/null 2>&1
@@ -364,7 +366,9 @@ echo "claude processes after the restart:"; own_claude_cmdlines
 echo "resumed: $(resume_ids | tr '\n' ' ')"
 MISSING=""
 NOWN=$(echo $OWN_SIDS | wc -w)
-[ "$NOWN" = "${#TIDS[@]}" ] || MISSING="$MISSING (only $NOWN of ${#TIDS[@]} opened sessions have a lifecycle row)"
+for tid in "${TIDS[@]}"; do
+  echo "$TID_ROWS" | awk -v t="$tid" '$4==t{f=1} END{exit !f}' || MISSING="$MISSING (terminal $tid has no lifecycle row)"
+done
 for sid in $OWN_SIDS; do
   resume_ids | grep -q -- "--resume $sid" || MISSING="$MISSING $sid"
 done
@@ -389,17 +393,19 @@ kill -TERM "$PID"
 T1=$(now_ms); GLOG=""
 while [ $(( $(now_ms) - T1 )) -lt 2000 ]; do
   GLOG=$(logs_since "$GMAN")
-  echo "$GLOG" | grep -aq 'SIGTERM received' && break
+  echo "$GLOG" | grep -aqF 'FORCE-CLOSE accepted (signal SIGTERM)' && break
   sleep 0.1
 done
 PSTATE=$(awk '{print $3}' "/proc/$PID/stat" 2>/dev/null)
-# The graceful path's own line can only come from a process that ran it; a
-# pid that merely still exists (dying, or an unreaped zombie) proves nothing.
+# `FORCE-CLOSE accepted` is logged only once `request_force_close` took the
+# teardown — after the watcher's stamp and app lookup — so it cannot come from
+# a watcher that went on to re-raise. A pid that merely still exists (dying,
+# or an unreaped zombie) proves nothing on its own.
 if [ -n "$PSTATE" ] && [ "$PSTATE" != Z ] && [ "$PSTATE" != X ] \
-   && echo "$GLOG" | grep -aq 'SIGTERM received'; then
-  pass "the first SIGTERM started the graceful path (process alive, state $PSTATE, watcher logged it)"
+   && echo "$GLOG" | grep -aqF 'FORCE-CLOSE accepted (signal SIGTERM)'; then
+  pass "the first SIGTERM started the graceful path (process alive, state $PSTATE, request_force_close accepted it)"
 else
-  fail "the first SIGTERM did not start the graceful path (state '${PSTATE:-gone}', watcher line $(echo "$GLOG" | grep -ac 'SIGTERM received'))"
+  fail "the first SIGTERM did not start the graceful path (state '${PSTATE:-gone}', force-close line $(echo "$GLOG" | grep -acF 'FORCE-CLOSE accepted (signal SIGTERM)'))"
 fi
 T0=$(now_ms)
 kill -TERM "$PID" 2>/dev/null

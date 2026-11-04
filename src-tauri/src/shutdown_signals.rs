@@ -404,7 +404,11 @@ mod imp {
         // The signal MASK survives `execve` too: a runner launched with
         // SIGALRM blocked would leave the backstop's alarm pending forever.
         // A process-directed alarm is delivered to any thread not blocking
-        // it, so unblocking it on this (the installing) thread is enough.
+        // it, so unblocking it on this (the installing) thread is enough —
+        // PROVIDED that thread lives as long as the process. It does:
+        // `install()` is called from `run_app` on the MAIN thread, which hosts
+        // the event loop until exit. Moving the call onto a thread that can
+        // exit would silently lose this guarantee.
         // SAFETY: a stack sigset passed to pthread_sigmask.
         unsafe {
             let mut set: libc::sigset_t = std::mem::zeroed();
