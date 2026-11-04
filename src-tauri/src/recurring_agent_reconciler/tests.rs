@@ -236,6 +236,7 @@ fn ctx_with(root: WorkspaceRootRead) -> LocalContext<'static> {
         workspace_root: root,
         bash: Some("/usr/bin/bash".to_string()),
         path_exists: &always,
+        unreadable_conditions: BTreeSet::new(),
     }
 }
 
@@ -276,7 +277,7 @@ fn rendered(agent: Value) -> ScheduledTask {
     let ups = upserts(&p);
     assert_eq!(ups.len(), 1, "{:?}", p.tenants);
     let d = ups[0].1;
-    crate::mcp::scheduler::merge_managed_task(None, upsert_request(d), d.managed.clone())
+    crate::mcp::scheduler::merge_managed_task(None, upsert_request(d, None), d.managed.clone())
 }
 
 fn run(list: DesiredList, local: &[ScheduledTask]) -> Plan {
@@ -917,6 +918,7 @@ fn a_probe_whose_bundled_script_is_absent_is_unapplied_not_installed() {
         workspace_root: WorkspaceRootRead::Set(root()),
         bash: Some("bash".into()),
         path_exists: &never,
+        unreadable_conditions: BTreeSet::new(),
     };
     let p = plan(
         &proven(),
@@ -933,6 +935,7 @@ fn a_probe_whose_bundled_script_is_absent_is_unapplied_not_installed() {
         workspace_root: WorkspaceRootRead::Set(root()),
         bash: None,
         path_exists: &always,
+        unreadable_conditions: BTreeSet::new(),
     };
     let p = plan(
         &proven(),
@@ -1321,4 +1324,235 @@ fn poll_status_maps_every_fetch_outcome() {
         poll_status_for(Ok(fixture()), other_tenant()),
         Err(TenantPollStatus::Malformed(_))
     ));
+}
+
+// ---- review round 2 ----------------------------------------------------------
+
+/// A served list for `tenant` (synced), for multi-tenant cases.
+fn list_for(tenant_id: Uuid, agents: Vec<Value>) -> DesiredList {
+    let body = json!({
+        "tenant_id": tenant_id,
+        "spec_version": 1,
+        "agents": agents.into_iter().map(synced).collect::<Vec<_>>(),
+        "unresolvable": [],
+    });
+    parse_device_list(&body, tenant_id).expect("well-formed list")
+}
+
+fn both_proven() -> BindingsRead {
+    BindingsRead::Proven(vec![tenant(), other_tenant()])
+}
+
+/// W1: a drift-only rewrite (coord's digest unchanged, the render moved) keeps
+/// a local pause; only a new declaration re-asserts coord's `enabled`.
+#[test]
+fn a_drift_only_rewrite_keeps_a_local_pause() {
+    let mut paused = rendered(fixture_agent("cleanup-steward"));
+    paused.enabled = false;
+    let moved = PathBuf::from("/moved/root");
+    let p = plan(
+        &proven(),
+        &[(
+            tenant(),
+            Ok(list_of(vec![fixture_agent("cleanup-steward")])),
+        )],
+        std::slice::from_ref(&paused),
+        &ctx_with(WorkspaceRootRead::Set(moved.clone())),
+    );
+    let ups = upserts(&p);
+    assert_eq!(ups.len(), 1, "the moved root is rewritten");
+    assert!(!ups[0].1.enabled, "the pause survives the drift rewrite");
+    assert_eq!(
+        working_directory(ups[0].1),
+        Some(moved.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        agent_outcome(&p, "cleanup-steward").state,
+        RecurringAgentState::Paused
+    );
+    // The merged row the executor writes carries enabled=false too.
+    let merged = crate::mcp::scheduler::merge_managed_task(
+        Some(&paused),
+        upsert_request(ups[0].1, Some(&paused)),
+        ups[0].1.managed.clone(),
+    );
+    assert!(!merged.enabled);
+
+    // A NEW declaration (digest change) re-asserts coord's enabled.
+    let mut old = paused.clone();
+    old.managed.as_mut().unwrap().digest = Some(DIGEST_B.to_string());
+    let p = run(
+        list_of(vec![fixture_agent("cleanup-steward")]),
+        std::slice::from_ref(&old),
+    );
+    assert!(upserts(&p)[0].1.enabled);
+    assert_eq!(
+        agent_outcome(&p, "cleanup-steward").state,
+        RecurringAgentState::Applied
+    );
+}
+
+/// W2: a same-name row held by ANOTHER proven tenant is a collision, never a
+/// second task.
+#[test]
+fn a_same_name_row_of_another_proven_tenant_blocks_the_create() {
+    let theirs = managed_task("cleanup-steward", OTHER_TENANT, DIGEST_B);
+    let p = plan(
+        &both_proven(),
+        &[
+            (
+                tenant(),
+                Ok(list_of(vec![fixture_agent("cleanup-steward")])),
+            ),
+            (
+                other_tenant(),
+                Err(TenantPollStatus::FetchFailed("503".into())),
+            ),
+        ],
+        std::slice::from_ref(&theirs),
+        &ctx(),
+    );
+    assert!(p.actions.is_empty(), "{:?}", p.actions);
+    let o = p.tenants[0]
+        .agents
+        .iter()
+        .find(|a| a.name == "cleanup-steward")
+        .unwrap();
+    assert_eq!(
+        o.reason.as_deref(),
+        Some(REASON_NAME_COLLISION_OTHER_TENANT)
+    );
+}
+
+/// W2: two proven tenants serving one name in one pass resolve
+/// deterministically — the lexicographically smaller tenant id creates, the
+/// other is reported, whatever order the polls arrive in.
+#[test]
+fn two_proven_tenants_serving_one_name_resolve_to_the_smaller_tenant_id() {
+    let (small, large) = if tenant() < other_tenant() {
+        (tenant(), other_tenant())
+    } else {
+        (other_tenant(), tenant())
+    };
+    for order in [[small, large], [large, small]] {
+        let polls: Vec<_> = order
+            .iter()
+            .map(|t| (*t, Ok(list_for(*t, vec![fixture_agent("cleanup-steward")]))))
+            .collect();
+        let p = plan(&both_proven(), &polls, &[], &ctx());
+        let ups = upserts(&p);
+        assert_eq!(ups.len(), 1, "{order:?}: {:?}", p.tenants);
+        assert_eq!(ups[0].1.managed.tenant_id, small.to_string());
+        let loser = p
+            .tenants
+            .iter()
+            .find(|t| t.tenant_id == large)
+            .unwrap()
+            .agents
+            .iter()
+            .find(|a| a.name == "cleanup-steward")
+            .unwrap();
+        assert_eq!(
+            loser.reason.as_deref(),
+            Some(REASON_NAME_COLLISION_OTHER_TENANT)
+        );
+    }
+    // Once the winner's row exists, the loser is still refused and the winner
+    // is current.
+    let polls: Vec<_> = [small, large]
+        .iter()
+        .map(|t| (*t, Ok(list_for(*t, vec![fixture_agent("cleanup-steward")]))))
+        .collect();
+    let first = plan(&both_proven(), &polls, &[], &ctx());
+    let d = upserts(&first)[0].1;
+    let winner_row =
+        crate::mcp::scheduler::merge_managed_task(None, upsert_request(d, None), d.managed.clone());
+    let p = plan(
+        &both_proven(),
+        &polls,
+        std::slice::from_ref(&winner_row),
+        &ctx(),
+    );
+    assert!(p.actions.is_empty(), "{:?}", p.actions);
+}
+
+/// W2: a proven row that already COEXISTS with a same-name foreign row (or a
+/// row of another managed source) is reported, and not written.
+#[test]
+fn a_proven_row_coexisting_with_another_same_name_row_is_reported() {
+    let mine = managed_task("cleanup-steward", TENANT, DIGEST_B);
+    let foreign = managed_task(
+        "cleanup-steward",
+        "11111111-2222-4333-8444-555555555555",
+        DIGEST_B,
+    );
+    let p = run(
+        list_of(vec![fixture_agent("cleanup-steward")]),
+        &[mine.clone(), foreign],
+    );
+    assert!(p.actions.is_empty(), "{:?}", p.actions);
+    let o = agent_outcome(&p, "cleanup-steward");
+    assert_eq!(
+        o.reason.as_deref(),
+        Some(REASON_NAME_COLLISION_FOREIGN_TENANT)
+    );
+    assert_eq!(o.task_id.as_deref(), Some(mine.id.as_str()));
+
+    let mut other_source = managed_task("cleanup-steward", TENANT, DIGEST_B);
+    other_source.managed.as_mut().unwrap().source = "web".into();
+    let p = run(
+        list_of(vec![fixture_agent("cleanup-steward")]),
+        std::slice::from_ref(&other_source),
+    );
+    assert!(p.actions.is_empty());
+    assert_eq!(
+        agent_outcome(&p, "cleanup-steward").reason.as_deref(),
+        Some(REASON_NAME_COLLISION_OTHER_SOURCE)
+    );
+}
+
+/// W3: a rewrite keeps the three locally-owned fields coord does not declare.
+#[test]
+fn a_rewrite_keeps_the_local_grace_backoff_and_success_criteria() {
+    let mut stored = rendered(fixture_agent("cleanup-steward"));
+    stored.managed.as_mut().unwrap().digest = Some(DIGEST_B.to_string());
+    stored.catch_up_grace_seconds = 900;
+    stored.launch_failure_backoff_seconds = 120;
+    stored.success_criteria = Some("freed space".into());
+    let p = run(
+        list_of(vec![fixture_agent("cleanup-steward")]),
+        std::slice::from_ref(&stored),
+    );
+    let ups = upserts(&p);
+    assert_eq!(ups.len(), 1);
+    let merged = crate::mcp::scheduler::merge_managed_task(
+        Some(&stored),
+        upsert_request(ups[0].1, Some(&stored)),
+        ups[0].1.managed.clone(),
+    );
+    assert_eq!(merged.catch_up_grace_seconds, 900);
+    assert_eq!(merged.launch_failure_backoff_seconds, 120);
+    assert_eq!(merged.success_criteria.as_deref(), Some("freed space"));
+    assert_eq!(merged.id, stored.id);
+}
+
+/// W5: a stored row whose conditions column could not be read is never
+/// current: it is rewritten even when everything else matches.
+#[test]
+fn a_row_with_unreadable_conditions_is_rewritten() {
+    let current = rendered(fixture_agent("cleanup-steward"));
+    let mut c = ctx();
+    c.unreadable_conditions.insert(current.id.clone());
+    let p = plan(
+        &proven(),
+        &[(
+            tenant(),
+            Ok(list_of(vec![fixture_agent("cleanup-steward")])),
+        )],
+        std::slice::from_ref(&current),
+        &c,
+    );
+    let ups = upserts(&p);
+    assert_eq!(ups.len(), 1);
+    assert_eq!(ups[0].0.as_ref().unwrap().id, current.id);
 }
