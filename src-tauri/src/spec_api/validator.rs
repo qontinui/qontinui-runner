@@ -354,7 +354,7 @@ async fn fetch_live_snapshot(
         )
         .await
     {
-        Ok(v) => v,
+        Ok(v) => v.into_raw(),
         Err(e) => {
             warn!(
                 "fetch_live_snapshot: dispatch getControlSnapshot failed for app_id={}: {:?}",

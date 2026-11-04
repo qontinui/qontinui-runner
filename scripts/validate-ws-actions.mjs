@@ -60,7 +60,9 @@ function readFile(path) {
   }
 }
 
-// Match every dispatch entry point that carries a literal action name:
+// Match every dispatch entry point that carries a literal action name
+// (including the strict action-envelope twins
+// dispatch_app_request_action[_typed]):
 //   dispatch_app_request(&state, "<name>", ...
 //   dispatch_app_request_typed(&state, "<name>", ...
 //   dispatch_app_request_by_id(&state, <app_id>, "<name>", ...
@@ -78,7 +80,7 @@ function readFile(path) {
 // disagree about which entry points count. Its one capture group is the
 // action name.
 const DISPATCH_SITE =
-  String.raw`\b(?:(?:dispatch_app_request(?:_typed)?|try_ws_dispatch)\(\s*&state,\s*` +
+  String.raw`\b(?:(?:dispatch_app_request(?:_action)?(?:_typed)?|try_ws_dispatch)\(\s*&state,\s*` +
   String.raw`|dispatch_app_request_by_id\(\s*&state,\s*&?[A-Za-z_][A-Za-z0-9_.]*,\s*)` +
   String.raw`"([^"]+)"`;
 
