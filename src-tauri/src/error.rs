@@ -158,11 +158,26 @@ pub struct UserFacingError {
 ///
 /// **The one emit site for the `"error"` channel**, so a backend module does
 /// not have to invoke a `#[tauri::command]` for its side effect. The frontend
-/// half is `src/components/StatusIndicator.tsx`, mounted app-level in
-/// `src/App.tsx`: a severity-coloured, dismissible card carrying the title,
-/// the message, `details` verbatim inside a collapsed "Technical Details"
-/// `<pre>`, the suggested action and the error code. `severity: Info`
-/// auto-hides after 5 s; everything else stays until dismissed.
+/// half is `src/components/StatusIndicator.tsx` (state in
+/// `errorBannerState.ts`, rendering in `ErrorBanner.tsx`), mounted app-level in
+/// `src/App.tsx`: a severity-coloured banner IN FLOW under the status bar,
+/// carrying the title, the message, `details` verbatim inside a collapsed
+/// "Technical Details" `<pre>`, the suggested action and the error code.
+///
+/// The lifetime contract an emitter has to know:
+///
+/// * `severity: Info` is transient — it auto-hides after 5 s and never touches
+///   a fault.
+/// * Every other severity is a FAULT tracked per `error_code`. A re-emit with
+///   the same code updates it in place (an identical message keeps a dismissal,
+///   a changed one re-opens the banner). Dismissing collapses it to a residual
+///   chip in the status bar that says when it was last seen — it does NOT
+///   remove it.
+/// * Only [`emit_user_facing_error_cleared`] for that `error_code` removes a
+///   fault. An emitter that can observe its condition ending should send it;
+///   one that never does leaves the residual standing for the life of the
+///   window, which is honest but noisy. `error_code` is therefore an identity,
+///   not decoration: two unrelated conditions must not share one.
 ///
 /// A failed emit is BOTH logged and returned, so neither caller has to choose
 /// on the other's behalf: the IPC door propagates it to the frontend that

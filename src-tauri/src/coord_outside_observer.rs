@@ -1807,8 +1807,9 @@ pub async fn probe_door(client: &reqwest::Client, url: &str, scope: TenantScope)
 ///
 /// * the **`"error"` Tauri channel** carrying a
 ///   [`crate::error::UserFacingError`], which `StatusIndicator` renders
-///   app-level as a severity-coloured, dismissible card with the raw read in
-///   its collapsed "Technical Details" `<pre>`. It is the only surface in this
+///   app-level as a severity-coloured in-flow banner with the raw read in
+///   its collapsed "Technical Details" `<pre>` (dismissing it leaves a residual
+///   chip until [`surface_cleared`] reports the episode over). It is the only surface in this
 ///   app whose contract is already title + message + raw body + suggested
 ///   action, which is exactly what "a notification titled for the class and
 ///   carrying the raw read" needs;
@@ -1844,9 +1845,10 @@ fn surface(app: Option<&tauri::AppHandle>, report: &Report) {
         message: report.summary.clone(),
         details: Some(report.raw.clone()),
         error_code: report.class.error_code().to_string(),
-        // Warning, not Error: `StatusIndicator` auto-hides `info` after 5s and
-        // keeps everything else until dismissed, and an operator must not miss
-        // this one. It is not `Critical` — nothing on this runner is lost or
+        // Warning, not Info: `StatusIndicator` auto-hides `info` after 5s,
+        // while a fault stays (as a banner, or a residual once dismissed) until
+        // `surface_cleared` emits `error-cleared` for its code, and an operator
+        // must not miss this one. It is not `Critical` — nothing on this runner is lost or
         // at risk; coord coordination is.
         severity: crate::error::ErrorSeverity::Warning,
         // The condition clears itself the moment coord recovers, and the
