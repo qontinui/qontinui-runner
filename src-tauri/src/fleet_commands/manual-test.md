@@ -298,6 +298,13 @@ Rows 2 and 3 are not rivals: row 2 gives you a *tab*, row 3 gives you a
 *verdict*. If you are verifying your own UI change and then tearing down, you
 want row 3.
 
+**Before a cross-surface verdict** (a finding that the runner and web disagree,
+or a check that one of them regressed against the other), confirm that both
+resolve the same UI Bridge minor. If they do not, the difference you are about
+to report may come from the SDK and not from either app. The check and its exit
+codes are in the UI Bridge reference (`ui-bridge.md`) → "Version agreement
+between the two mandated surfaces".
+
 ### The own-runner arm — READ-ONLY on your live runner
 
 Take it only when your deployment **has no spawner** (declare `SPAWNER_NONE=1`),

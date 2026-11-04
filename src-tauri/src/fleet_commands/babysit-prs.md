@@ -329,6 +329,16 @@ Only once the classification says “real” do you read the failing run log
   `gh run rerun <id> --failed`. At most 2 reruns per head before treating as
   real.
 
+  ⚠️ **`--failed`, never `--job`.** A run's check rows are its LATEST attempt's,
+  so re-running one job of a run that also carries a required check can delete
+  that check's green row: measured once, on `qontinui-coord#3551`, and it held
+  the PR about 4 h. A `--failed` re-run also makes a new attempt; no case of one
+  deleting a green row is recorded, which is not proof it cannot. An orphaned
+  advisory job beside a green required one is left alone, or handled by a fresh
+  head. Read the run's job list before any re-run. Diagnosis and recovery:
+  `/merge-train-steward` (where your deployment provides it), its *A required
+  check VANISHED* row.
+
   ⚠️ **Identify this class from the job's STEPS — `cancelled` is the minority
   shape.** Most infra kills on this fleet arrive as `conclusion: failure`, which
   is indistinguishable from a genuine regression at the RUN level, so the run
@@ -578,9 +588,14 @@ the gap either — `mergeable: MERGEABLE` reports the absence of a textual
 conflict, never the satisfaction of a required-check ruleset. Treat "required
 context missing/never reported" as its own stuck class here, distinct from
 both **red CI** (Step 3) and **green but stuck for some other reason** (queue,
-stacked dependency, coord itself wedged — the rest of 4d's table): it is 4d's
-`required-checks-missing` row, and it is a **Legitimate hold**, never a lesser
-severity than a visible red — a PR can carry zero failing checks and still be
+stacked dependency, coord itself wedged — the rest of 4d's table). The block
+code alone does not settle the row. `required-checks-missing` is that row of 4d,
+a **Legitimate hold**. `merge-state-unsettled` is Transient while young; past the
+dwell it is the phantom arm of 4d's **Coord defect** row, except that a context
+whose workflow died at `startup_failure` or never triggered on this head is a
+**Legitimate hold**, by the two causes named below. Any other code, such as
+`ci-pending`, is not settled by this split. Whatever the code, it is never a
+lesser severity than a visible red — a PR can carry zero failing checks and still be
 unmergeable. Where coord's PR-status surface (`coord_pr_status` / `/pr-status`)
 is available, a `blockers` entry naming an unestablished required-check state
 is the actionable signal here (a companion coord change is adding this
@@ -588,9 +603,23 @@ wording); treat it with the same urgency as a red check, not lower, since
 `gh pr checks` alone will never surface it. Once the missing context is
 identified, `startup_failure` (the workflow started and died) and "never
 triggered" (the trigger/path filter excludes this branch) are different,
-actionable causes — re-run the workflow for the former, fix the
-trigger/path filter for the latter — name which one you found rather than
-treating them as interchangeable.
+actionable causes — name which one you found rather than treating them as
+interchangeable. Fix the trigger/path filter for the latter. For the former,
+**do not re-run, `--failed` included**: the default is to move the head. The one
+exception is a single full re-run (`gh run rerun <id> -R <repo>`, outside Step
+3's 2-rerun bound) of a PR-head run whose latest attempt is `startup_failure`
+with zero jobs, after an earlier attempt of that same run dispatched jobs that
+ran steps. Read each attempt's jobs
+(`GET repos/<r>/actions/runs/<id>/attempts/<n>/jobs`) to test that. Every other
+shape stays un-re-run: the re-run is one-way on an undispatched run, and whether
+`startup_failure` behaves the same is deliberately unmeasured
+(`/merge-train-steward`, where your deployment provides it: the NEVER DISPATCHED
+section and the *A required check VANISHED* and *Runs EXIST but none of them can
+ever conclude* rows). Move the head only on a branch this session owns, otherwise
+hand back to the author; run the carries-the-push check under **Real failure**
+first, and Step 4a.5 if the push is a rebase. If the new head also ends in
+`startup_failure`, treat the cause as not per-run: stop pushing, read the workflow file
+and the run's annotations, and report the PR `blocked-legitimate`.
 
 **4a. GitHub-side sanity** — `gh pr view --json isDraft,mergeable,mergeStateStatus,labels`:
 draft, DIRTY (textual conflict → rebase it yourself), or a `coord:blocked` /
@@ -674,7 +703,7 @@ error, not a missing door.
 |---|---|---|
 | **Transient — wait** | `ci-pending` (**only once you have PROVEN CI actually fired — see the note under this table**), `below-green-dwell`, `merge-state-unsettled` (young), in-flight proposal in `/merge/queue` | Nothing. Reset no clocks; check again next poll. |
 | **Legitimate hold — fix the cause, NEVER bypass** | `ci-not-green`, `main-red` (except on the red-main fix PR itself, labelled `coord:red-main-fix`: it is the one PR that cannot pass a red main, so ask coord's expedited door for it first (Step 5a). Where the door did not serve it, in parallel with the door and unchanged, `scripts/agent-direct-merge.sh` may merge it as before, under `direct-merge-with-notification`. Where it did serve it, the script may merge it only under Step 5a's recovery condition), `main-status-unknown`, `not-open`, `required-checks-missing`, `behind-main-or-unstable` (DIRTY), `auto-merge-disabled`, `dry-run-mode`, `escalate-path-matched`, `has-cross-repo-dependency` via `stacked-on` with parent still open | Fix in-session (rebase, fix CI). For `escalate-path-matched`, read what coord is actually waiting on and fix THAT — see the note under this table; never route around it (no recovery merge, no override you arrange yourself). ⚠️ For `ci-not-green` **and `main-red` alike, run Step 3's step-level classifier on the failed job FIRST**: a Tier-1/2/T kill is not a cause to fix, it is a re-run — of main's own run in the `main-red` case — and it will **never** self-heal on its own. A `main-red` hold is a legitimate hold either way, but the remedy is not the same one. |
-| **Coord defect — recover + remediate** | `has-cross-repo-dependency` where the labeled PR is the UPSTREAM of the edge (`coord:upstream-of=` deadlock — engine parent-resolution inverted); `unlandable_cycle` spinning (cycles > ~5) with all members green; `merge-state-unsettled` dwell > 2× threshold on a fully-green head (phantom required-context wedge, coord#638); latest hydration `head_sha` ≠ current head for > 1h (stale ingest); predicate `result: pass` with no landing and no queue entry for > 1h; `has-blocking-label` on a live PR (retired code — should be extinct) | Step 5 → 6. |
+| **Coord defect — recover + remediate** | `has-cross-repo-dependency` where the labeled PR is the UPSTREAM of the edge (`coord:upstream-of=` deadlock — engine parent-resolution inverted); `unlandable_cycle` spinning (cycles > ~5) with all members green; `merge-state-unsettled` dwell > 2× threshold on a fully-green head (phantom required-context wedge, coord#638 — **unless the missing required context's workflow DID run on this head and that run's latest attempt is a 0-job `startup_failure`, or the workflow never triggered on this head because its own `on:` filter excludes it: that is no coord defect but a Legitimate hold, so follow the matching arm of Step 4's preamble**); latest hydration `head_sha` ≠ current head for > 1h (stale ingest); predicate `result: pass` with no landing and no queue entry for > 1h; `has-blocking-label` on a live PR (retired code — should be extinct) | Step 5 → 6. |
 | **Coord down** | no leader across 4–8 health samples, **and** `bash <session-workdir>/.claude/skills/coord-revive/coord-revive.sh --floor-claim` printed a `FLOOR-CLAIM:` block reading `verdict=FLOOR` — paste it into the report. `verdict=UNKNOWN` (exit 5: sampled under this box's own load) is NOT this class; wait for the builds to finish and sample again | Step 6 directly — the merge through `scripts/agent-direct-merge.sh`; expect exit 5 (merged, notify later) while coord is down. |
 
 **`escalate-path-matched` is a hold with a named pending gate — read it before
@@ -1463,7 +1492,7 @@ an admin-merge happened — produces a plan so the defect class dies:
   and exit 0, 5 or 6) or `handed-to-operator` (exit 4, GitHub refused). Exit 5 is
   a merge whose notification is still owed. Both the PR audit comment (Step 6
   item 1) and the exit report say which.
-- **Bounded loops.** Max 3 CI-fix rounds per PR, 2 infra reruns per head,
+- **Bounded loops.** Max 3 CI-fix rounds per PR, 2 infra reruns per head (plus the one recovery re-run in Step 4's preamble),
   one remediation plan per defect class per run (dedupe: if `$QONTINUI_PLANS_DIR`
   already has a plan for this defect class, reference it instead of writing a
   twin; check before writing). **The directory is not the surface of record** — discovery
