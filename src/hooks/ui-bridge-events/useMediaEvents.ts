@@ -1,11 +1,15 @@
 import { useCallback } from "react";
 import { compareVisualRegression } from "@qontinui/ui-bridge/ai";
+import { runMediaOverrideRequest, type MediaOverrideRequestType } from "./mediaOverrideRequest";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { describeThrown } from "@/lib/utils";
 
 /**
  * Handles: image_diff — the frontend half of the live
- * `POST /ui-bridge/ai/image-diff` (`mcp/ui_bridge/ai_analyze.rs`).
+ * `POST /ui-bridge/ai/image-diff` (`mcp/ui_bridge/ai_analyze.rs`); and
+ * media_override_apply / media_override_restore / media_override_list — the
+ * webview half of `/ui-bridge/control/media/override`
+ * (`mcp/ui_bridge/media_override.rs`, via `./mediaOverrideRequest`).
  *
  * The other media cases (find_media, media_audit, capture_media_snapshot,
  * analyze_media, capture_element_images, get_element_images,
@@ -88,6 +92,24 @@ export function useMediaEvents(context: Pick<UIBridgeEventContext, "sendResponse
               type,
               success: false,
               error: describeThrown(e, "image_diff failed"),
+              timestamp: Date.now(),
+            });
+          }
+          return true;
+        }
+
+        case "media_override_apply":
+        case "media_override_restore":
+        case "media_override_list": {
+          try {
+            const reply = await runMediaOverrideRequest(type as MediaOverrideRequestType, payload);
+            await sendResponse({ requestId, type, ...reply, timestamp: Date.now() });
+          } catch (e) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: describeThrown(e, "Media override failed"),
               timestamp: Date.now(),
             });
           }

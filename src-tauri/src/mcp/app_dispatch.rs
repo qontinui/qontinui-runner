@@ -26,7 +26,7 @@ use reqwest::Method;
 use tokio::sync::Mutex;
 use tracing::debug;
 
-use super::app_registry::{AppRegistry, AppTransport};
+use super::app_registry::{AppRegistry, AppTransport, RegisteredApp};
 use super::command_relay::{CommandRelay, CommandRelayError, WrapperFailure};
 use super::sdk_client::SdkConnectionManager;
 
@@ -34,11 +34,61 @@ use super::sdk_client::SdkConnectionManager;
 /// dispatches use `CommandRelay`'s own 30s timeout.
 const HTTP_DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The request body for each transport arm.
+///
+/// Most commands send one body whichever arm carries them: [`ArmPayloads::Same`],
+/// which `From<Value>` builds. A command whose arms differ names both bodies in
+/// [`ArmPayloads::PerArm`] — named fields, so the two cannot be passed in the
+/// wrong order. The media override fills a page-side wait only for the
+/// engine-direct WebSocket arm, because an HTTP app's own ui-bridge server fits
+/// it to a smaller budget and refuses a larger one; the generic `/dispatch`
+/// route sends a WebSocket wrapper the bare params and an HTTP one the
+/// `{action, params}` envelope.
+///
+/// The body is chosen by [`ArmPayloads::for_transport`] INSIDE `dispatch` /
+/// `dispatch_active`, from the same registry read that picks the arm. Choosing
+/// it in the caller from an earlier read let a registration change between the
+/// two reads send one arm's body down the other arm.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArmPayloads {
+    /// One body for whichever arm carries the command.
+    Same(serde_json::Value),
+    /// One body per arm.
+    PerArm {
+        websocket: serde_json::Value,
+        http: serde_json::Value,
+    },
+}
+
+impl ArmPayloads {
+    /// The body the `transport` arm sends. Moves it out — no copy.
+    pub fn for_transport(self, transport: AppTransport) -> serde_json::Value {
+        match (self, transport) {
+            (Self::Same(body), _) => body,
+            (Self::PerArm { websocket, .. }, AppTransport::Websocket) => websocket,
+            (Self::PerArm { http, .. }, AppTransport::Http) => http,
+        }
+    }
+}
+
+impl From<serde_json::Value> for ArmPayloads {
+    /// The same body on both arms.
+    fn from(body: serde_json::Value) -> Self {
+        Self::Same(body)
+    }
+}
+
 /// Errors returned by `AppDispatcher::{dispatch, dispatch_active, dispatch_active_http}`.
 #[derive(Debug, thiserror::Error)]
 pub enum DispatchError {
     #[error("app '{0}' is not registered")]
     NotRegistered(String),
+
+    /// [`AppDispatcher::dispatch_websocket`] found the app registered over a
+    /// transport other than WebSocket, and refused rather than send a
+    /// WebSocket command down the HTTP arm.
+    #[error("app '{0}' is not registered over websocket")]
+    NotWebsocket(String),
 
     /// `dispatch_active` could not resolve an active SDK app — either no app
     /// has connected yet, or the previously active connection was closed.
@@ -173,16 +223,19 @@ impl AppDispatcher {
     /// - `http_method` / `http_path`: used only by HTTP dispatch. Path is
     ///   joined against the app's `base_url` verbatim (caller supplies any
     ///   `/ui-bridge/...` prefix the app expects).
-    /// - `payload`: the JSON body. For WebSocket, it becomes the frame's
-    ///   `payload` field; for HTTP, it's the request body.
+    /// - `payload`: the JSON body, or one per arm ([`ArmPayloads`]). For
+    ///   WebSocket, it becomes the frame's `payload` field; for HTTP, it's the
+    ///   request body. The arm's body is chosen from the same registry read
+    ///   that picks the arm.
     pub async fn dispatch(
         &self,
         app_id: &str,
         action: &str,
         http_method: Method,
         http_path: &str,
-        payload: serde_json::Value,
+        payload: impl Into<ArmPayloads>,
     ) -> Result<serde_json::Value, DispatchError> {
+        let payload = payload.into();
         // `get_live`, not `get`: the registry retains an expired row for its
         // reservation window so the id stays held for its owner, and routing
         // must not follow a row that stopped heartbeating.
@@ -191,59 +244,10 @@ impl AppDispatcher {
             .get_live(app_id)
             .await
             .ok_or_else(|| DispatchError::NotRegistered(app_id.to_string()))?;
+        let payload = payload.for_transport(entry.transport);
 
         match entry.transport {
-            AppTransport::Websocket => {
-                debug!(
-                    "[app-dispatch] {} via websocket → app='{}' conn_id={:?}",
-                    action, app_id, entry.websocket_conn_id
-                );
-                // Refresh liveness at ENQUEUE, before a command that may sit
-                // in flight for the whole command timeout.
-                //
-                // The window this closes, stated exactly — an earlier version
-                // of this comment claimed both of the socket's refresh points
-                // share one `select!`, and that is WRONG. There are two
-                // tasks: `drive_connection` spawns `send_task`
-                // (`ws_relay.rs`), which owns the 20 s ping tick and its
-                // refresh, while the per-frame refresh runs in the RECV loop
-                // awaited in `drive_connection`'s own task. A parked
-                // `sink.send().await` therefore starves the ping tick ONLY;
-                // inbound frames keep refreshing normally. Anyone reading the
-                // old claim would conclude this touch is redundant whenever
-                // any frame arrives, and delete it.
-                //
-                // The real case is narrower and still sufficient: a wrapper
-                // that sends nothing INBOUND has the ping tick as its only
-                // refresh. Park the send and that refresh stops, while the
-                // recv side's own `HEARTBEAT_TIMEOUT` (45 s) is longer than
-                // `REGISTRATION_TTL_MS` (30 s) — so the connection is not yet
-                // torn down and there is a real window in which the row is
-                // dead and the socket is open. Past round 4 that is no longer
-                // cosmetic, because routing reads `get_live`: the row ages
-                // out, and a connection main would have dispatched to becomes
-                // undispatchable. Touching here is outside `send_task`, so it
-                // cannot be starved by the send it is about to cause.
-                //
-                // The trade, because it is a real cost and not a free win:
-                // this touch is UNCONDITIONAL and happens BEFORE the send, so
-                // a wrapper that is hung but still connected keeps a live row
-                // for as long as traffic keeps arriving. That widens the
-                // window in which callers get a hard 400 from ~30 s (the TTL)
-                // to ~45 s (the heartbeat timeout, which does eventually tear
-                // the connection down). Bounded, and the right way round —
-                // failing to route to a live socket is worse than routing to
-                // a hung one — but it is a widening, not a narrowing.
-                //
-                // Conn-guarded like every other refresh (R2): a displaced or
-                // foreign connection must not keep the holder's row alive.
-                let _ = self
-                    .registry
-                    .touch(app_id, entry.websocket_conn_id, &entry.principal)
-                    .await;
-                let response = self.command_relay.dispatch(app_id, action, payload).await?;
-                Ok(response.result.unwrap_or(serde_json::Value::Null))
-            }
+            AppTransport::Websocket => self.websocket_arm(app_id, action, &entry, payload).await,
             AppTransport::Http => {
                 let base = entry.app.url.trim_end_matches('/');
                 let base_path = entry.app.base_path.trim_end_matches('/');
@@ -292,6 +296,91 @@ impl AppDispatcher {
                 json.ok_or_else(|| DispatchError::InvalidJson(body))
             }
         }
+    }
+
+    /// The WebSocket arm of [`Self::dispatch`], for an `entry` already read
+    /// as WebSocket-registered.
+    async fn websocket_arm(
+        &self,
+        app_id: &str,
+        action: &str,
+        entry: &RegisteredApp,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, DispatchError> {
+        debug!(
+            "[app-dispatch] {} via websocket → app='{}' conn_id={:?}",
+            action, app_id, entry.websocket_conn_id
+        );
+        // Refresh liveness at ENQUEUE, before a command that may sit
+        // in flight for the whole command timeout.
+        //
+        // The window this closes, stated exactly — an earlier version
+        // of this comment claimed both of the socket's refresh points
+        // share one `select!`, and that is WRONG. There are two
+        // tasks: `drive_connection` spawns `send_task`
+        // (`ws_relay.rs`), which owns the 20 s ping tick and its
+        // refresh, while the per-frame refresh runs in the RECV loop
+        // awaited in `drive_connection`'s own task. A parked
+        // `sink.send().await` therefore starves the ping tick ONLY;
+        // inbound frames keep refreshing normally. Anyone reading the
+        // old claim would conclude this touch is redundant whenever
+        // any frame arrives, and delete it.
+        //
+        // The real case is narrower and still sufficient: a wrapper
+        // that sends nothing INBOUND has the ping tick as its only
+        // refresh. Park the send and that refresh stops, while the
+        // recv side's own `HEARTBEAT_TIMEOUT` (45 s) is longer than
+        // `REGISTRATION_TTL_MS` (30 s) — so the connection is not yet
+        // torn down and there is a real window in which the row is
+        // dead and the socket is open. Past round 4 that is no longer
+        // cosmetic, because routing reads `get_live`: the row ages
+        // out, and a connection main would have dispatched to becomes
+        // undispatchable. Touching here is outside `send_task`, so it
+        // cannot be starved by the send it is about to cause.
+        //
+        // The trade, because it is a real cost and not a free win:
+        // this touch is UNCONDITIONAL and happens BEFORE the send, so
+        // a wrapper that is hung but still connected keeps a live row
+        // for as long as traffic keeps arriving. That widens the
+        // window in which callers get a hard 400 from ~30 s (the TTL)
+        // to ~45 s (the heartbeat timeout, which does eventually tear
+        // the connection down). Bounded, and the right way round —
+        // failing to route to a live socket is worse than routing to
+        // a hung one — but it is a widening, not a narrowing.
+        //
+        // Conn-guarded like every other refresh (R2): a displaced or
+        // foreign connection must not keep the holder's row alive.
+        let _ = self
+            .registry
+            .touch(app_id, entry.websocket_conn_id, &entry.principal)
+            .await;
+        let response = self.command_relay.dispatch(app_id, action, payload).await?;
+        Ok(response.result.unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Dispatch to `app_id` over WebSocket ONLY.
+    ///
+    /// For a caller that has already decided, from its own registry read, that
+    /// the app is WebSocket-registered. A registration that has since become
+    /// HTTP is refused with [`DispatchError::NotWebsocket`] — never sent down
+    /// the HTTP arm, where a WebSocket command's frame payload would go out as
+    /// a request to a placeholder path. Routes on its own `get_live`, like
+    /// [`Self::dispatch`].
+    pub async fn dispatch_websocket(
+        &self,
+        app_id: &str,
+        action: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, DispatchError> {
+        let entry = self
+            .registry
+            .get_live(app_id)
+            .await
+            .ok_or_else(|| DispatchError::NotRegistered(app_id.to_string()))?;
+        if entry.transport != AppTransport::Websocket {
+            return Err(DispatchError::NotWebsocket(app_id.to_string()));
+        }
+        self.websocket_arm(app_id, action, &entry, payload).await
     }
 
     /// HTTP-only variant of `dispatch_active` for proxy handlers that hit a
@@ -472,8 +561,9 @@ impl AppDispatcher {
         action: &str,
         http_method: Method,
         http_path: &str,
-        payload: serde_json::Value,
+        payload: impl Into<ArmPayloads>,
     ) -> Result<serde_json::Value, DispatchError> {
+        let payload = payload.into();
         // 1. Snapshot the active connection. Drop the lock before any await
         //    on a remote — responsiveness probe + HTTP request must not pin
         //    the manager Mutex.
@@ -493,19 +583,31 @@ impl AppDispatcher {
         // 2. WS-transport apps short-circuit through the relay — same code
         //    path as `dispatch`, but reached via the active-connection probe
         //    rather than a caller-supplied `app_id`.
-        if let Some(entry) = self.registry.get_live(&app_id).await {
-            if matches!(entry.transport, AppTransport::Websocket) {
-                debug!(
-                    "[app-dispatch] {} via websocket (active) → app='{}' conn_id={:?}",
-                    action, app_id, entry.websocket_conn_id
-                );
-                let response = self
-                    .command_relay
-                    .dispatch(&app_id, action, payload)
-                    .await?;
-                return Ok(response.result.unwrap_or(serde_json::Value::Null));
-            }
+        //    The body is chosen HERE, from this one registry read: a caller's
+        //    earlier read could disagree with it (`ArmPayloads`).
+        let transport = self
+            .registry
+            .get_live(&app_id)
+            .await
+            .map(|entry| (entry.transport, entry.websocket_conn_id));
+        if let Some((AppTransport::Websocket, conn_id)) = transport {
+            debug!(
+                "[app-dispatch] {} via websocket (active) → app='{}' conn_id={:?}",
+                action, app_id, conn_id
+            );
+            let response = self
+                .command_relay
+                .dispatch(
+                    &app_id,
+                    action,
+                    payload.for_transport(AppTransport::Websocket),
+                )
+                .await?;
+            return Ok(response.result.unwrap_or(serde_json::Value::Null));
         }
+        // An HTTP row, or no live row at all (an SDK connection the registry
+        // does not hold), takes the HTTP arm and its body.
+        let payload = payload.for_transport(AppTransport::Http);
 
         // 3. HTTP arm — preserve legacy responsiveness cache semantics.
         self.http_dispatch_inner(
@@ -526,15 +628,27 @@ impl AppDispatcher {
 // Tests
 // ============================================================================
 
+/// Test fixtures for an [`AppDispatcher`], shared with the tests of the
+/// handlers that dispatch through one (`sdk_client`'s `/sdk/` media override).
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use crate::mcp::app_discovery::DiscoveredApp;
     use crate::mcp::sdk_client::{SdkAppInfo, SdkConnection};
-    use crate::mcp::ws_relay::WsConnectionManager;
     use serde_json::json;
 
-    fn sample_app(app_id: &str, base_url: &str) -> DiscoveredApp {
+    /// The next frame sent to a test WebSocket connection — bounded, so a
+    /// dispatch that never sends fails the test instead of hanging it.
+    pub(crate) async fn next_frame(
+        outbound_rx: &mut tokio::sync::mpsc::Receiver<String>,
+    ) -> String {
+        tokio::time::timeout(Duration::from_secs(5), outbound_rx.recv())
+            .await
+            .expect("no frame within 5 s")
+            .expect("outbound channel closed")
+    }
+
+    pub(crate) fn sample_app(app_id: &str, base_url: &str) -> DiscoveredApp {
         DiscoveredApp {
             app_id: app_id.to_string(),
             app_name: "t".into(),
@@ -550,6 +664,76 @@ mod tests {
             discovered_at: 0,
         }
     }
+
+    pub(crate) fn manager_with_active(
+        app_id: &str,
+        url: &str,
+        base_path: &str,
+    ) -> Arc<Mutex<SdkConnectionManager>> {
+        let mut mgr = SdkConnectionManager::new();
+        let info = SdkAppInfo {
+            app_id: app_id.to_string(),
+            app_name: "t".into(),
+            app_type: "web".into(),
+            framework: None,
+            version: None,
+            capabilities: vec![],
+            port: 0,
+        };
+        let conn = SdkConnection {
+            app_url: url.to_string(),
+            base_path: base_path.to_string(),
+            app_info: info,
+            client: reqwest::Client::new(),
+            connected_at: 0,
+            transport_kind: None,
+            physical_device_id: None,
+            activated_by: None,
+        };
+        mgr.connections.insert(url.to_string(), conn);
+        mgr.active_url = Some(url.to_string());
+        Arc::new(Mutex::new(mgr))
+    }
+
+    /// A loopback HTTP app answering ANY method and path with
+    /// `{success: true, got: <the JSON body it was sent, else null>}`, so a
+    /// test can see which arm's body the HTTP arm carried.
+    pub(crate) async fn json_echo_app() -> String {
+        let app = axum::Router::new().fallback(|bytes: axum::body::Bytes| async move {
+            let got: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            axum::Json(json!({"success": true, "got": got}))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        url
+    }
+
+    /// `manager_with_active` with the responsiveness cache primed "responsive"
+    /// as of now, so an HTTP dispatch skips the `/health` probe.
+    pub(crate) async fn responsive_active(
+        app_id: &str,
+        url: &str,
+    ) -> Arc<Mutex<SdkConnectionManager>> {
+        let mgr = manager_with_active(app_id, url, "");
+        {
+            let mut g = mgr.lock().await;
+            g.active_responsive = Some(true);
+            g.active_responsive_checked_at = chrono::Utc::now().timestamp_millis();
+        }
+        mgr
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{manager_with_active, next_frame, sample_app};
+    use super::*;
+    use crate::mcp::ws_relay::WsConnectionManager;
+    use serde_json::json;
 
     #[tokio::test]
     async fn unregistered_app_returns_not_registered() {
@@ -589,7 +773,7 @@ mod tests {
                 .await
         });
 
-        let frame = outbound_rx.recv().await.unwrap();
+        let frame = next_frame(&mut outbound_rx).await;
         let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
         let command_id = v["commandId"].as_str().unwrap().to_string();
         assert_eq!(v["action"], "snap");
@@ -610,36 +794,6 @@ mod tests {
 
         let out = handle.await.unwrap().unwrap();
         assert_eq!(out, json!({"ok": true}));
-    }
-
-    fn manager_with_active(
-        app_id: &str,
-        url: &str,
-        base_path: &str,
-    ) -> Arc<Mutex<SdkConnectionManager>> {
-        let mut mgr = SdkConnectionManager::new();
-        let info = SdkAppInfo {
-            app_id: app_id.to_string(),
-            app_name: "t".into(),
-            app_type: "web".into(),
-            framework: None,
-            version: None,
-            capabilities: vec![],
-            port: 0,
-        };
-        let conn = SdkConnection {
-            app_url: url.to_string(),
-            base_path: base_path.to_string(),
-            app_info: info,
-            client: reqwest::Client::new(),
-            connected_at: 0,
-            transport_kind: None,
-            physical_device_id: None,
-            activated_by: None,
-        };
-        mgr.connections.insert(url.to_string(), conn);
-        mgr.active_url = Some(url.to_string());
-        Arc::new(Mutex::new(mgr))
     }
 
     #[tokio::test]
@@ -683,7 +837,7 @@ mod tests {
                 .await
         });
 
-        let frame = outbound_rx.recv().await.unwrap();
+        let frame = next_frame(&mut outbound_rx).await;
         let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
         let command_id = v["commandId"].as_str().unwrap().to_string();
         assert_eq!(v["action"], "snap");
@@ -744,6 +898,249 @@ mod tests {
             err.to_user_message(),
             "SDK app is not responsive (no active browser tab)"
         );
+    }
+
+    // ── each arm is sent its own body, chosen on the arm's own read ────────
+
+    fn two_arms() -> ArmPayloads {
+        ArmPayloads::PerArm {
+            websocket: json!({"arm": "websocket"}),
+            http: json!({"arm": "http"}),
+        }
+    }
+
+    #[test]
+    fn arm_payloads_give_each_transport_its_own_body() {
+        let arms = two_arms();
+        assert_eq!(
+            arms.clone().for_transport(AppTransport::Websocket),
+            json!({"arm": "websocket"})
+        );
+        assert_eq!(
+            arms.for_transport(AppTransport::Http),
+            json!({"arm": "http"})
+        );
+        let same = ArmPayloads::from(json!({"q": 1}));
+        assert_eq!(same, ArmPayloads::Same(json!({"q": 1})));
+        assert_eq!(
+            same.clone().for_transport(AppTransport::Websocket),
+            json!({"q": 1})
+        );
+        assert_eq!(same.for_transport(AppTransport::Http), json!({"q": 1}));
+    }
+
+    /// A loopback HTTP app answering `POST /echo` with the JSON body it was
+    /// sent, so a test can see which arm's body the HTTP arm carried.
+    async fn echo_app() -> String {
+        use axum::{routing::post, Json, Router};
+        let app = Router::new().route(
+            "/echo",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                Json(json!({"success": true, "got": body}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        url
+    }
+
+    /// The `payload` of the frame a WebSocket-registered app is sent.
+    async fn websocket_frame_payload(
+        outbound_rx: &mut tokio::sync::mpsc::Receiver<String>,
+    ) -> serde_json::Value {
+        let frame = next_frame(outbound_rx).await;
+        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        v["payload"].clone()
+    }
+
+    /// A loopback HTTP app that answers anything and counts the requests.
+    async fn counting_app() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = axum::Router::new().fallback(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async { axum::Json(json!({"success": true})) }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (url, hits)
+    }
+
+    #[tokio::test]
+    async fn dispatch_websocket_refuses_a_non_websocket_app_without_sending() {
+        let registry = AppRegistry::new();
+        let (url, hits) = counting_app().await;
+        registry
+            .upsert(
+                sample_app("happ", &url),
+                None,
+                AppTransport::Http,
+                None,
+                None,
+            )
+            .await;
+        let ws = WsConnectionManager::new();
+        let (_conn_id, mut outbound_rx) = ws.test_register("wapp").await;
+        registry
+            .upsert(
+                sample_app("wapp", "http://unused"),
+                None,
+                AppTransport::Websocket,
+                Some(1),
+                None,
+            )
+            .await;
+        let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
+        let dispatcher = AppDispatcher::new(registry, relay);
+
+        let err = dispatcher
+            .dispatch_websocket("happ", "snap", json!({"q": 1}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DispatchError::NotWebsocket(ref id) if id == "happ"),
+            "got {err:?}"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused WebSocket dispatch must not reach the app over HTTP"
+        );
+        let err = dispatcher
+            .dispatch_websocket("ghost", "snap", json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DispatchError::NotRegistered(_)),
+            "got {err:?}"
+        );
+
+        // A WebSocket-registered app is sent the frame.
+        let d = dispatcher.clone();
+        let pending =
+            tokio::spawn(
+                async move { d.dispatch_websocket("wapp", "snap", json!({"q": 1})).await },
+            );
+        assert_eq!(
+            websocket_frame_payload(&mut outbound_rx).await,
+            json!({"q": 1})
+        );
+        pending.abort();
+    }
+
+    #[tokio::test]
+    async fn dispatch_sends_each_arm_its_own_body() {
+        let registry = AppRegistry::new();
+        let ws = WsConnectionManager::new();
+        let (_conn_id, mut outbound_rx) = ws.test_register("wapp").await;
+        registry
+            .upsert(
+                sample_app("wapp", "http://unused"),
+                None,
+                AppTransport::Websocket,
+                Some(1),
+                None,
+            )
+            .await;
+        let url = echo_app().await;
+        registry
+            .upsert(
+                sample_app("happ", &url),
+                None,
+                AppTransport::Http,
+                None,
+                None,
+            )
+            .await;
+        let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
+        let dispatcher = AppDispatcher::new(registry, relay);
+
+        let d = dispatcher.clone();
+        let pending = tokio::spawn(async move {
+            d.dispatch("wapp", "x", Method::POST, "/echo", two_arms())
+                .await
+        });
+        assert_eq!(
+            websocket_frame_payload(&mut outbound_rx).await,
+            json!({"arm": "websocket"})
+        );
+        pending.abort();
+
+        let out = dispatcher
+            .dispatch("happ", "x", Method::POST, "/echo", two_arms())
+            .await
+            .unwrap();
+        assert_eq!(out["got"], json!({"arm": "http"}));
+    }
+
+    #[tokio::test]
+    async fn dispatch_active_sends_each_arm_its_own_body() {
+        // WebSocket-registered active app: the WebSocket body.
+        let registry = AppRegistry::new();
+        let ws = WsConnectionManager::new();
+        let (_conn_id, mut outbound_rx) = ws.test_register("wapp").await;
+        registry
+            .upsert(
+                sample_app("wapp", "ws-app://wapp"),
+                None,
+                AppTransport::Websocket,
+                Some(1),
+                None,
+            )
+            .await;
+        let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
+        let dispatcher = AppDispatcher::new(registry.clone(), relay);
+        let sdk_conn = manager_with_active("wapp", "ws-app://wapp", "");
+        let (d, c) = (dispatcher.clone(), sdk_conn.clone());
+        let pending = tokio::spawn(async move {
+            d.dispatch_active(&c, "x", Method::POST, "/echo", two_arms())
+                .await
+        });
+        assert_eq!(
+            websocket_frame_payload(&mut outbound_rx).await,
+            json!({"arm": "websocket"})
+        );
+        pending.abort();
+
+        // HTTP-registered active app, and an active app the registry holds no
+        // live row for: both take the HTTP arm, so both get the HTTP body.
+        let url = echo_app().await;
+        for registered in [true, false] {
+            let app_id = if registered { "happ" } else { "unlisted" };
+            if registered {
+                registry
+                    .upsert(
+                        sample_app(app_id, &url),
+                        None,
+                        AppTransport::Http,
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+            let sdk_conn = manager_with_active(app_id, &url, "");
+            {
+                let mut g = sdk_conn.lock().await;
+                g.active_responsive = Some(true);
+                g.active_responsive_checked_at = chrono::Utc::now().timestamp_millis();
+            }
+            let out = dispatcher
+                .dispatch_active(&sdk_conn, "x", Method::POST, "/echo", two_arms())
+                .await
+                .unwrap();
+            assert_eq!(
+                out["got"],
+                json!({"arm": "http"}),
+                "registered={registered}"
+            );
+        }
     }
 
     // ── app-answered HTTP failures carry the app's own code ────────────────
