@@ -40,8 +40,9 @@ pub struct Termination {
     /// A kill was actually delivered to the verified holder.
     pub signalled: bool,
     /// Nothing was signalled because the holder is PROVABLY already gone —
-    /// the pane's lock was free, or no process had its pid when the handle
-    /// was taken. Its death already ended its child (module docs), so a
+    /// the pane's lock was free (also checked when no process had its pid
+    /// when the handle was taken, since a missing pid alone does not prove
+    /// it: an upgraded holder's successor runs under a pid of its own). Its death already ended its child (module docs), so a
     /// caller must not report the child as possibly still running (pty_holder
     /// review follow-up L4). Never true together with `signalled`, and never
     /// true on a refusal whose cause leaves the holder's state open (an
@@ -147,13 +148,27 @@ pub fn terminate_verified_holder(
     imp::terminate(pid, || verify_holder(pane_dir, pane_id, holder_pid))
 }
 
-/// The handle could not be taken because no process has `pid` — the holder
-/// this client attached to has exited (its pid has not been reused either,
-/// or the open would have succeeded and verification would decide).
-fn no_such_process(pid: i32, err: &std::io::Error) -> Termination {
-    Termination::gone(format!(
-        "no process {pid} ({err}) — the holder is already dead"
-    ))
+/// The handle could not be taken because no process has `pid`. That proves
+/// only that THIS pid is gone, not that the pane's holder is: an in-place
+/// upgrade hands the pane to a successor with a pid of its own before the
+/// client's reattach learns it. So the pane's lock still decides — gone only
+/// when verification proves it (the lock is free); any other answer leaves
+/// the holder's state open and refuses.
+fn no_such_process(
+    pid: i32,
+    err: &std::io::Error,
+    verify: impl FnOnce() -> Result<(), Refusal>,
+) -> Termination {
+    match verify() {
+        Err(r) if r.gone => Termination::gone(format!("no process {pid} ({err}) and {}", r.why)),
+        Err(r) => Termination::refused(format!(
+            "no process {pid} ({err}), but the holder's state is open: {}",
+            r.why
+        )),
+        Ok(()) => Termination::refused(format!(
+            "no process {pid} ({err}), but the pane's lock is still held and names it"
+        )),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -170,7 +185,7 @@ mod imp {
                 return super::plain_kill(pid, verify, "pidfd_open unavailable");
             }
             if err.raw_os_error() == Some(libc::ESRCH) {
-                return super::no_such_process(pid, &err);
+                return super::no_such_process(pid, &err, verify);
             }
             return Termination::refused(format!("pidfd_open({pid}): {err}"));
         }
@@ -255,7 +270,7 @@ mod imp {
             // ERROR_INVALID_PARAMETER; access-denied and the rest leave the
             // holder's state open.
             if err.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
-                return super::no_such_process(pid, &err);
+                return super::no_such_process(pid, &err, verify);
             }
             return Termination::refused(format!("OpenProcess({pid}): {err}"));
         }
@@ -387,11 +402,20 @@ mod tests {
             "pid 1 is never signalled"
         );
         // The victim is reaped: no process has its pid now (barring reuse in
-        // these instants), so the handle cannot be taken — gone, not refused.
+        // these instants), so the handle cannot be taken. While the pane's
+        // lock is still held — an upgraded holder's successor, under a pid of
+        // its own — that is NOT proof the holder is gone: refused.
         let t = terminate_verified_holder(&dir, &id, victim.id());
         assert!(!t.signalled, "{t:?}");
-        assert!(t.holder_gone, "a reaped pid is a gone holder: {t:?}");
+        assert!(!t.holder_gone, "a held lock leaves the holder open: {t:?}");
+        // With the lock free as well, the holder is provably gone.
         drop(lock);
+        let t = terminate_verified_holder(&dir, &id, victim.id());
+        assert!(!t.signalled, "{t:?}");
+        assert!(
+            t.holder_gone,
+            "a reaped pid over a free lock is a gone holder: {t:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

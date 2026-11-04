@@ -2098,8 +2098,9 @@ mod tests {
         fail_kill: AtomicBool,
         /// `terminate` reports the holder already gone.
         holder_gone: AtomicBool,
-        /// `kill` takes this long before answering.
-        kill_delay_ms: std::sync::atomic::AtomicU64,
+        /// While set, `kill` does not answer (bounded at 5 s) — a holder slow
+        /// to answer. Cleared by the test to let it through.
+        kill_held: AtomicBool,
     }
 
     impl HolderLink for RecordingLink {
@@ -2112,9 +2113,10 @@ mod tests {
             Ok(())
         }
         fn kill(&self, _budget: Duration) -> Result<(), String> {
-            std::thread::sleep(Duration::from_millis(
-                self.kill_delay_ms.load(Ordering::SeqCst),
-            ));
+            let end = Instant::now() + Duration::from_secs(5);
+            while self.kill_held.load(Ordering::SeqCst) && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             if self.fail_kill.load(Ordering::SeqCst) {
                 return Err("holder unreachable".into());
             }
@@ -2849,15 +2851,17 @@ mod tests {
     /// another thread — and the kill still lands.
     #[test]
     fn pty_holder_drop_does_not_block_on_the_kill() {
+        // Ordering, not timing: `kill` cannot answer until the test lets it,
+        // so a `drop` that ran the kill on this thread would return only
+        // after the kill had answered (at its 5 s cap) and recorded `Kill`.
         let (link, pane) = recorded_pane();
-        link.kill_delay_ms.store(1_500, Ordering::SeqCst);
-        let started = Instant::now();
+        link.kill_held.store(true, Ordering::SeqCst);
         drop(pane);
         assert!(
-            started.elapsed() < Duration::from_millis(750),
-            "drop blocked on the kill: {:?}",
-            started.elapsed()
+            !link.controls().contains(&HolderControl::Kill),
+            "drop returned only after the kill answered: it blocked on it"
         );
+        link.kill_held.store(false, Ordering::SeqCst);
         link.saw(HolderControl::Kill);
     }
 

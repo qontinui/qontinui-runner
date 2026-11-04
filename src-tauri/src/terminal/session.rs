@@ -2011,7 +2011,15 @@ impl TerminalSession {
         }
 
         // Get the input writer from the pane
-        let writer = Arc::new(Mutex::new(io.writer()?));
+        // A failure from here on would leave the spawned child behind a pane
+        // nothing owns, so every early return ends it (`abandon_pane`).
+        let writer = Arc::new(Mutex::new(io.writer().map_err(|e| {
+            abandon_pane(
+                io.as_ref(),
+                &id,
+                format!("Failed to open the pane's writer: {e}"),
+            )
+        })?));
 
         let is_alive = Arc::new(AtomicBool::new(true));
         let exit_code: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
@@ -2041,7 +2049,13 @@ impl TerminalSession {
             .unwrap_or_default()
             .as_millis() as u64;
         // Get an output reader from the pane
-        let mut reader = io.reader()?;
+        let mut reader = io.reader().map_err(|e| {
+            abandon_pane(
+                io.as_ref(),
+                &id,
+                format!("Failed to open the pane's reader: {e}"),
+            )
+        })?;
 
         // Coord mirror identity, populated by `terminal_create` after
         // `register_external` returns. Declared HERE (ahead of the reader
@@ -5217,7 +5231,8 @@ impl TerminalSession {
 }
 
 /// `spawn_with_io` failed after the pane was built (pty_holder review
-/// follow-up L2). When the WAITER thread fails to spawn, the already-running
+/// follow-up L2): its writer or reader could not be opened, or a thread could
+/// not be spawned. When the WAITER thread fails to spawn, the already-running
 /// reader thread holds the pane — through the `WireFlow` and its reader — and
 /// blocks until the pane's output ends, so the pane is never dropped and no
 /// `Drop` ever runs: the child would outlive a spawn that reported failure,
