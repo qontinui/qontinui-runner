@@ -192,13 +192,23 @@ pub(crate) fn ci_reservation_from_root(root: &std::path::Path) -> CiReservation 
         })
         .unwrap_or_default();
     children.sort();
-    let total: Option<u64> = if children.is_empty() {
-        slice_bound_bytes(&ci)
+    // The parent's own bound caps everything under it. With no child slices,
+    // CI runs (if at all) directly in `ci.slice`, so only its own bound can
+    // answer: an unbounded `ci.slice` is UNKNOWN, never zero — zero is only
+    // the answer for a host with no `ci.slice` at all.
+    let parent = slice_bound_bytes(&ci);
+    let children_total: Option<u64> = if children.is_empty() {
+        None
     } else {
         children
             .iter()
             .map(|c| slice_bound_bytes(c))
             .try_fold(0u64, |acc, b| b.map(|b| acc.saturating_add(b)))
+    };
+    let total = match (parent, children_total) {
+        (Some(p), Some(c)) => Some(p.min(c)),
+        (Some(p), None) => Some(p),
+        (None, c) => c,
     };
     match total {
         Some(bytes) => {
@@ -8061,16 +8071,82 @@ mod tests {",
         }
     }
 
+    /// A cgroup v2 fixture. An empty `high` / `max` string leaves that file
+    /// ABSENT, so a slice missing one (or both) bound files can be built.
     fn cgroup_fixture(slices: &[(&str, &str, &str)]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("cgroup.controllers"), "memory cpu\n").unwrap();
         for (name, high, max) in slices {
             let p = dir.path().join(name);
             std::fs::create_dir_all(&p).unwrap();
-            std::fs::write(p.join("memory.high"), format!("{high}\n")).unwrap();
-            std::fs::write(p.join("memory.max"), format!("{max}\n")).unwrap();
+            if !high.is_empty() {
+                std::fs::write(p.join("memory.high"), format!("{high}\n")).unwrap();
+            }
+            if !max.is_empty() {
+                std::fs::write(p.join("memory.max"), format!("{max}\n")).unwrap();
+            }
         }
         dir
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn ci_reservation_edge_cases() {
+        // memory.high file absent, memory.max numeric: max answers.
+        let d = cgroup_fixture(&[
+            ("ci.slice", "max", "max"),
+            ("ci.slice/ci-a.slice", "", &(10 * GIB).to_string()),
+        ]);
+        assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Bounded(10));
+        // A child slice with no memory files at all is unbounded: unknown.
+        let d = cgroup_fixture(&[("ci.slice", "max", "max"), ("ci.slice/ci-a.slice", "", "")]);
+        assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Unbounded);
+        // A parent bound tighter than its children's sum caps it.
+        let d = cgroup_fixture(&[
+            ("ci.slice", &(50 * GIB).to_string(), "max"),
+            ("ci.slice/ci-a.slice", &(40 * GIB).to_string(), "max"),
+            ("ci.slice/ci-b.slice", &(40 * GIB).to_string(), "max"),
+        ]);
+        assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Bounded(50));
+        // A bounded parent covers an unbounded child.
+        let d = cgroup_fixture(&[
+            ("ci.slice", &(64 * GIB).to_string(), "max"),
+            ("ci.slice/ci-a.slice", "max", "max"),
+        ]);
+        assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Bounded(64));
+        // ci.slice with no children: its own bound, else UNKNOWN (never zero).
+        let d = cgroup_fixture(&[("ci.slice", "max", &(8 * GIB).to_string())]);
+        assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Bounded(8));
+        let d = cgroup_fixture(&[("ci.slice", "max", "max")]);
+        assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Unbounded);
+        // One byte over a GiB rounds up.
+        let d = cgroup_fixture(&[
+            ("ci.slice", "max", "max"),
+            ("ci.slice/ci-a.slice", &(GIB + 1).to_string(), "max"),
+        ]);
+        assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Bounded(2));
+    }
+
+    #[test]
+    fn a_ci_node_with_no_cgroup_publishes_its_job_slots_times_16() {
+        let ci = ci_settings(true, 2);
+        let json = serde_json::to_value(build_budget_request(
+            "test-host",
+            MachineRole::Agent,
+            Resources {
+                cpu_cores: 16,
+                memory_gb: 64,
+                disk_total_gb: 1000,
+            },
+            0,
+            &ci,
+            test_host(),
+            CiReservation::NoCgroup,
+        ))
+        .unwrap();
+        let jobs = json["max_concurrent_ci_jobs"].as_i64().expect("ci jobs");
+        assert_eq!(json["ci_reserved_gib"].as_i64(), Some(jobs * 16));
     }
 
     /// nawa's tree as read 2026-11-04: `ci-runners.slice` high 230.4 GiB,
