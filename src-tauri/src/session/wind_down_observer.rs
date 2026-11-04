@@ -261,7 +261,7 @@ pub async fn fresh_pass(app: &tauri::AppHandle, grace: Duration) -> FreshPass {
             Some(pass) => Some(pass),
             None => {
                 unknowns.push(
-                    "the terminal-session plane could not be determined: the process table is unreadable (snapshot_process_table_public returned an empty parent_map), so live `claude` processes cannot be enumerated"
+                    "the terminal-session plane could not be determined: the process table is unreadable (the fresh process-table read failed or served only the stale last-good table, ProcessSnapshot::is_unknown), so live `claude` processes cannot be enumerated"
                         .to_string(),
                 );
                 None
