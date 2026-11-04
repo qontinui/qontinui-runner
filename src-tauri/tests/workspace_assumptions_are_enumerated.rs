@@ -1975,29 +1975,16 @@ fn render_md(roster: &Roster, class_ids: &[String]) -> String {
         by_class.entry(r.class.as_str()).or_default().push(r);
     }
 
-    out.push_str(
-        "| class | rows | hits | unreviewed | fallback_correct | dev_only_surface | defect |\n",
-    );
-    out.push_str("|---|---:|---:|---:|---:|---:|---:|\n");
+    // No per-class summary table and no `(N rows)` on the headings: every
+    // count is recomputable from the rows below, and as checked-in cells they
+    // were rewritten by every PR that added or triaged a row, so two such PRs
+    // conflicted on them whatever rows they touched. The freshness test
+    // prints the per-class totals instead (`per_class_totals`). Plan
+    // 2026-11-04-runner-generated-and-ledger-files-are-merge-neutral-and-land-behind-a-drain,
+    // Phase 1c; `goldens_carry_no_count_cells` keeps them out.
     for c in class_ids {
         let rows = &by_class[c.as_str()];
-        let n = |p: &dyn Fn(&str) -> bool| rows.iter().filter(|r| p(&r.disposition)).count();
-        out.push_str(&format!(
-            "| `{}` | {} | {} | {} | {} | {} | {} |\n",
-            c,
-            rows.len(),
-            rows.iter().map(|r| r.count).sum::<usize>(),
-            n(&|d| d == "unreviewed"),
-            n(&|d| d == "fallback_correct"),
-            n(&|d| d == "dev_only_surface"),
-            n(&|d| d.starts_with("defect(")),
-        ));
-    }
-    out.push('\n');
-
-    for c in class_ids {
-        let rows = &by_class[c.as_str()];
-        out.push_str(&format!("## `{}` ({} rows)\n\n", c, rows.len()));
+        out.push_str(&format!("## `{}`\n\n", c));
         if rows.is_empty() {
             out.push_str("_No hits._\n\n");
             continue;
@@ -2037,6 +2024,32 @@ fn render_md(roster: &Roster, class_ids: &[String]) -> String {
         out.push('\n');
     }
     out
+}
+
+/// One `<class>: rows=… hits=… unreviewed=… fallback_correct=… dev_only_surface=… defect=…`
+/// line per class with rows — the summary the roster markdown no longer
+/// carries (see `render_md`). Printed by the freshness test, so a red shows it.
+fn per_class_totals(rows: &[Row]) -> Vec<String> {
+    let mut by_class: BTreeMap<&str, Vec<&Row>> = BTreeMap::new();
+    for r in rows {
+        by_class.entry(r.class.as_str()).or_default().push(r);
+    }
+    by_class
+        .iter()
+        .map(|(c, rows)| {
+            let n = |p: &dyn Fn(&str) -> bool| rows.iter().filter(|r| p(&r.disposition)).count();
+            format!(
+                "{c}: rows={} hits={} unreviewed={} fallback_correct={} dev_only_surface={} \
+                 defect={}",
+                rows.len(),
+                rows.iter().map(|r| r.count).sum::<usize>(),
+                n(&|d| d == "unreviewed"),
+                n(&|d| d == "fallback_correct"),
+                n(&|d| d == "dev_only_surface"),
+                n(&|d| d.starts_with("defect(")),
+            )
+        })
+        .collect()
 }
 
 fn to_json(roster: &Roster) -> String {
@@ -2124,14 +2137,8 @@ fn workspace_assumption_roster_is_fresh() {
             let _ = writeln!(f, "workspace assumptions: `{counts}`");
         }
     }
-    let mut per_class: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
-    for r in rows {
-        let e = per_class.entry(r.class.as_str()).or_default();
-        e.0 += 1;
-        e.1 += r.count;
-    }
-    for (c, (n_rows, n_hits)) in &per_class {
-        println!("  {c}: rows={n_rows} hits={n_hits}");
+    for line in per_class_totals(rows) {
+        println!("  {line}");
     }
 
     check_floor(&result).unwrap_or_else(|e| panic!("{e}"));
@@ -2254,6 +2261,81 @@ fn workspace_assumption_roster_is_fresh() {
         problems.len(),
         problems.join("\n  ")
     );
+}
+
+/// The generated review files carry no COUNT cell a test can recompute — plan
+/// `2026-11-04-runner-generated-and-ledger-files-are-merge-neutral-and-land-behind-a-drain`,
+/// Phase 1. A count is the one cell every PR adding a row rewrites, so two such
+/// PRs conflict on it even when their rows are files apart, and GitHub's own
+/// merge (which decides `mergeable`) runs no merge driver that could help.
+///
+/// Narrow on purpose: a bare `^#.*\d+` scan would miss the roster's table
+/// cells and hit legitimate prose (`Tier 3`, `91,784`).
+#[test]
+fn goldens_carry_no_count_cells() {
+    let root = crate_root();
+    let header_count =
+        Regex::new(r"^#\s*(total|guarded|literal|registry|delegated|builtin|fixture):\s*\d+$")
+            .unwrap();
+    let inputs_count = Regex::new(r"inputs:\s*\d+").unwrap();
+    let mut found: Vec<String> = Vec::new();
+    for rel in [
+        "../src/lib/ui-bridge/__golden__/action-surfaces.txt",
+        "../src/components/terminal/commands/__golden__/pipeline-golden.txt",
+    ] {
+        let text = fs::read_to_string(root.join(rel))
+            .unwrap_or_else(|e| panic!("{rel}: {e} — a golden this test guards is gone"));
+        for (i, line) in text.lines().enumerate() {
+            if line.starts_with('#') && (header_count.is_match(line) || inputs_count.is_match(line))
+            {
+                found.push(format!("{rel}:{}: {line}", i + 1));
+            }
+        }
+    }
+    found.extend(roster_md_count_cells(
+        &fs::read_to_string(root.join(ROSTER_MD)).expect("roster md"),
+    ));
+    assert!(
+        found.is_empty(),
+        "count cell(s) in a generated review file — compute the count in the test and print \
+         it instead of checking it in:\n  {}",
+        found.join("\n  ")
+    );
+}
+
+/// The roster markdown's count cells: a `(N rows)` heading suffix, or any
+/// table row above the first `## ` heading (where the per-class summary
+/// table used to sit).
+fn roster_md_count_cells(md: &str) -> Vec<String> {
+    let rows_suffix = Regex::new(r"\(\d+ rows\)$").unwrap();
+    let mut out = Vec::new();
+    let mut seen_heading = false;
+    for (i, line) in md.lines().enumerate() {
+        if line.starts_with("## ") {
+            seen_heading = true;
+            if rows_suffix.is_match(line) {
+                out.push(format!("{ROSTER_MD}:{}: {line}", i + 1));
+            }
+        } else if !seen_heading && line.starts_with('|') {
+            out.push(format!("{ROSTER_MD}:{}: {line}", i + 1));
+        }
+    }
+    out
+}
+
+/// The roster check is not vacuous: the shapes it exists to refuse are caught.
+#[test]
+fn roster_md_count_cells_catches_the_old_layout() {
+    let old = "# Workspace assumptions\n\n| class | rows |\n|---|---:|\n| `x` | 3 |\n\n\
+               ## `x` (3 rows)\n\n| file | n |\n|---|---:|\n| `a.rs` | 1 |\n";
+    assert_eq!(
+        roster_md_count_cells(old).len(),
+        4,
+        "{:?}",
+        roster_md_count_cells(old)
+    );
+    let new = "# Workspace assumptions\n\n## `x`\n\n| file | n |\n|---|---:|\n| `a.rs` | 1 |\n";
+    assert!(roster_md_count_cells(new).is_empty());
 }
 
 /// Every class matches its own planted fixture — so a class whose regex rots to

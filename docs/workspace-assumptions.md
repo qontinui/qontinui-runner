@@ -6,19 +6,7 @@ Every place `src-tauri/src` (outside `cfg(test)` and comments) matches one of th
 
 Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption degrades correctly off a workspace), `dev_only_surface` (only a developer box reaches it), `defect(<plan stem>)` (a user-facing path that depends on a workspace, cited to the plan that owns the fix). A disposition covers only the excerpts it was reviewed against; a later excerpt under the same symbol renders `unreviewed` with a `NEW since review` note.
 
-| class | rows | hits | unreviewed | fallback_correct | dev_only_surface | defect |
-|---|---:|---:|---:|---:|---:|---:|
-| `repo_layout` | 79 | 93 | 73 | 6 | 0 | 0 |
-| `dev_ports` | 28 | 28 | 26 | 0 | 2 | 0 |
-| `supervisor_dependency` | 57 | 57 | 0 | 47 | 4 | 6 |
-| `tenant_literal` | 0 | 0 | 0 | 0 | 0 | 0 |
-| `machine_path` | 5 | 5 | 0 | 4 | 1 | 0 |
-| `fleet_host_name` | 0 | 0 | 0 | 0 | 0 | 0 |
-| `fleet_device_uuid` | 0 | 0 | 0 | 0 | 0 | 0 |
-| `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
-| `os_bound_tooling` | 98 | 99 | 96 | 2 | 0 | 0 |
-
-## `repo_layout` (79 rows)
+## `repo_layout`
 
 | file | symbol | excerpt | n | disposition | capability |
 |---|---|---|---:|---|---|
@@ -102,7 +90,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/workspace_paths.rs` | `persist_resolved_workspace_root` | `'paths.workspace_root' was left unset. Set $QONTINUI_ROOT (or the \` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/workspace_paths.rs` | `runner_workspace_root` | `"env QONTINUI_ROOT / QONTINUI_WORKSPACE_ROOT / settings paths.workspace_root (runner_workspace_root)",` | 1 | unreviewed | `workspace_root` |
 
-## `dev_ports` (28 rows)
+## `dev_ports`
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -135,7 +123,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/workflow_generation/specification.rs` | `build_specification_prompt` | `- 'assumptions': list of assumptions you're making (e.g., "Project uses TypeScript", "Frontend runs on localhost:3001")` | 1 | unreviewed |
 | `src/workflow_generation/structured_output.rs` | `detect_backend` | `base_url: "http://localhost:8000".to_string(),` | 1 | unreviewed |
 
-## `supervisor_dependency` (57 rows)
+## `supervisor_dependency`
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -197,11 +185,11 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/orchestration_loop/remote_client.rs` | `SupervisorClient::<impl>` | `impl SupervisorClient {` | 1 | defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor) — restart_runner: the :9875 HTTP call the orchestration loop's restart modes depend on. |
 | `src/orchestration_loop/remote_client.rs` | `struct SupervisorClient` | `pub struct SupervisorClient {` | 1 | defect(2026-09-22-orchestration-loop-restart-modes-depend-on-the-dev-only-supervisor) — The supervisor HTTP client used by the user-facing orchestration loop. |
 
-## `tenant_literal` (0 rows)
+## `tenant_literal`
 
 _No hits._
 
-## `machine_path` (5 rows)
+## `machine_path`
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -211,15 +199,15 @@ _No hits._
 | `src/session_archive/discovery.rs` | `discover_account_homes_from_env` | `Some(PathBuf::from("C:\\claude")),` | 1 | fallback_correct — Probes C:/claude behind is_dir() on every platform, per its own doc comment; false everywhere else. |
 | `src/step_output/script_emitter.rs` | `build_prompt_split` | `"outputPreview: \"# local overrides\\nHOME=/home/jq\\nPATH=/usr/local/bin:/usr/bin:/bin\\nLANG=en_US.UTF-8\\nSHELL=/bin/bash\\nrecent_fil...` | 1 | fallback_correct — A worked example inside an AI prompt (HOME=/home/jq), not a path the runner reads. |
 
-## `fleet_host_name` (0 rows)
+## `fleet_host_name`
 
 _No hits._
 
-## `fleet_device_uuid` (0 rows)
+## `fleet_device_uuid`
 
 _No hits._
 
-## `plans_dir` (34 rows)
+## `plans_dir`
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -258,7 +246,7 @@ _No hits._
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `let existing = get_setting::<PathSettings>().plans_dir;` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `update_setting::<PathSettings, _>(\|paths\| paths.plans_dir = Some(value.clone()))?;` | 1 | unreviewed |
 
-## `os_bound_tooling` (98 rows)
+## `os_bound_tooling`
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
