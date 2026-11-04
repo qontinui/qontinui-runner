@@ -1047,26 +1047,42 @@ mod tests {
         let status = in_child(|| {
             unblock(libc::SIGTERM);
             OWNER.store(1, Ordering::SeqCst);
-            set_disposition_for(libc::SIGTERM, h as *const () as libc::sighandler_t, libc::SA_RESETHAND);
+            set_disposition_for(
+                libc::SIGTERM,
+                h as *const () as libc::sighandler_t,
+                libc::SA_RESETHAND,
+            );
             kill_self(libc::SIGTERM);
             pause_forever();
         });
         assert!(libc::WIFSIGNALED(status), "status {status:#x}");
         assert_eq!(libc::WTERMSIG(status), libc::SIGTERM);
-        assert_eq!(drain(R.load(Ordering::SeqCst), libc::SIGTERM), (0, true), "no wake byte");
+        assert_eq!(
+            drain(R.load(Ordering::SeqCst), libc::SIGTERM),
+            (0, true),
+            "no wake byte"
+        );
 
         // Positive control: the child is its own owner, so the armed path runs.
         let status = in_child(|| {
             unblock(libc::SIGTERM);
             // SAFETY: `getpid` cannot fail.
             OWNER.store(unsafe { libc::getpid() }, Ordering::SeqCst);
-            set_disposition_for(libc::SIGTERM, h as *const () as libc::sighandler_t, libc::SA_RESETHAND);
+            set_disposition_for(
+                libc::SIGTERM,
+                h as *const () as libc::sighandler_t,
+                libc::SA_RESETHAND,
+            );
             kill_self(libc::SIGTERM);
             // SAFETY: cancel the injected backstop before exiting.
             unsafe { libc::alarm(0) };
         });
         assert!(libc::WIFEXITED(status), "status {status:#x}");
-        assert_eq!(drain(R.load(Ordering::SeqCst), libc::SIGTERM), (1, true), "one wake byte");
+        assert_eq!(
+            drain(R.load(Ordering::SeqCst), libc::SIGTERM),
+            (1, true),
+            "one wake byte"
+        );
         W.store(-1, Ordering::SeqCst);
         // SAFETY: closing this test's own ends.
         unsafe {
