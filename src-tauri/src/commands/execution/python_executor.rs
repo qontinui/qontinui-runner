@@ -14,20 +14,19 @@ use tracing::{error, info, warn};
 use super::super::compartments::{BridgeCompartment, ExecutionCompartment};
 use super::super::CommandResponse;
 
-/// Serializes `start_python_executor` / `stop_python_executor` bodies.
+/// Serializes `start_python_executor` / `stop_python_executor` bodies, with
+/// each other and with `POST /executor/restart` (one shared lock,
+/// [`crate::executor::bridge_helpers::executor_lifecycle_lock`]).
 ///
 /// While these were sync commands, Tauri ran them on the main thread, which
 /// serialized them for free. The frontend calls `start_python_executor` twice
 /// at startup; run concurrently on blocking threads, both could see "not
 /// running" and race into `get_or_create_default_bridge`, and the loser would
-/// fail on the GUI lock instead of answering "already running". Holding this
-/// keeps the old one-at-a-time semantics without holding the main thread.
-static EXECUTOR_LIFECYCLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn executor_lifecycle_guard() -> std::sync::MutexGuard<'static, ()> {
-    EXECUTOR_LIFECYCLE_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// fail on the GUI lock instead of answering "already running".
+///
+/// Only call from a blocking thread (`blocking_lock` panics in async context).
+fn executor_lifecycle_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    crate::executor::bridge_helpers::executor_lifecycle_lock().blocking_lock()
 }
 
 /// Start the Python executor.

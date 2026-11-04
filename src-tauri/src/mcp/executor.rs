@@ -15,12 +15,14 @@
 //!   transition is only valid from `Initializing`, so we explicitly reset the
 //!   lifecycle to `Initializing` before spawning (mirrors the pattern used in
 //!   `executor::extraction_executor::ensure_started`).
-//! * A process-wide `RESTART_LOCK` (tokio `Mutex`) serialises restarts so
+//! * The process-wide executor lifecycle lock (tokio `Mutex`, shared with the
+//!   `start_python_executor` / `stop_python_executor` Tauri commands)
+//!   serialises restarts so
 //!   callers can't hammer the endpoint into racing `start`/`stop` pairs.
 
 use axum::{extract::State, http::StatusCode, response::Json};
 use serde::Serialize;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Instant};
@@ -59,9 +61,11 @@ pub struct RestartFailure {
 
 /// Serialises concurrent calls to `/executor/restart` so we never race
 /// stop/start pairs against each other.
+///
+/// The same lock the `start_python_executor` / `stop_python_executor` Tauri
+/// commands take, so a command-driven start never interleaves with a restart.
 fn restart_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    crate::executor::bridge_helpers::executor_lifecycle_lock()
 }
 
 // ---------------------------------------------------------------------------

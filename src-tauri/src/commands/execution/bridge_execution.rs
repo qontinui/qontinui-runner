@@ -73,12 +73,21 @@ pub async fn run_workflow_on_bridge(
         );
     }
 
-    // Execute on the specific bridge
-    let result = manager.with_bridge(&bridge_id, |bridge| {
-        bridge
-            .start_execution_with_params(Some(serde_json::Value::Object(execution_params)))
-            .map_err(|e| format!("Failed to start execution: {}", e))
-    })?;
+    // Execute on the specific bridge. `with_bridge` waits on the bridge's lock
+    // (and the send uses `block_on`), so it runs on a blocking thread, never on
+    // a tokio worker.
+    let result = {
+        let manager = manager.clone();
+        let bridge_id = bridge_id.clone();
+        crate::executor::run_bridge_blocking(move || {
+            manager.with_bridge(&bridge_id, |bridge| {
+                bridge
+                    .start_execution_with_params(Some(serde_json::Value::Object(execution_params)))
+                    .map_err(|e| format!("Failed to start execution: {}", e))
+            })
+        })
+        .await??
+    };
 
     match result {
         Ok(()) => {

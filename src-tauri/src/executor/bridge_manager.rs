@@ -8,6 +8,9 @@ use super::lifecycle::ExecutorLifecycle;
 use super::python_bridge::PythonBridge;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
+use std::ops::{Deref, DerefMut};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
@@ -107,14 +110,89 @@ impl<B> BridgeHandle<B> {
     }
 
     /// Take the bridge out of its slot (waits for an in-flight closure).
-    pub(crate) fn take(&self) -> Option<B> {
-        self.lock().take()
+    ///
+    /// The returned guard PUTS THE BRIDGE BACK when dropped, including when
+    /// the future holding it is cancelled (a `tokio::time::timeout`, a dropped
+    /// HTTP handler). Without that, a cancelled start/stop would leave the
+    /// slot empty forever while the map entry stays, so every caller would
+    /// read [`BRIDGE_BUSY_ERROR`] until the runner restarts. `None` means
+    /// another lifecycle operation already holds the bridge.
+    pub(crate) fn take_guarded(&self) -> Option<TakenBridge<B>> {
+        let bridge = self.lock().take()?;
+        Some(TakenBridge {
+            handle: self.clone(),
+            bridge: Some(bridge),
+        })
     }
 
-    /// Put a bridge back into its slot.
-    pub(crate) fn put(&self, bridge: B) {
+    fn put(&self, bridge: B) {
         *self.lock() = Some(bridge);
     }
+}
+
+/// A bridge taken out of its slot by [`BridgeHandle::take_guarded`]; restores
+/// it on drop unless [`TakenBridge::into_inner`] claimed it.
+pub(crate) struct TakenBridge<B> {
+    handle: BridgeHandle<B>,
+    bridge: Option<B>,
+}
+
+impl<B> TakenBridge<B> {
+    /// Keep the bridge permanently (removal): the slot stays empty.
+    pub(crate) fn into_inner(mut self) -> B {
+        self.bridge
+            .take()
+            .expect("TakenBridge holds its bridge until drop")
+    }
+}
+
+impl<B> Deref for TakenBridge<B> {
+    type Target = B;
+    fn deref(&self) -> &B {
+        self.bridge
+            .as_ref()
+            .expect("TakenBridge holds its bridge until drop")
+    }
+}
+
+impl<B> DerefMut for TakenBridge<B> {
+    fn deref_mut(&mut self) -> &mut B {
+        self.bridge
+            .as_mut()
+            .expect("TakenBridge holds its bridge until drop")
+    }
+}
+
+impl<B> Drop for TakenBridge<B> {
+    fn drop(&mut self) {
+        if let Some(bridge) = self.bridge.take() {
+            self.handle.put(bridge);
+        }
+    }
+}
+
+/// A boxed bridge operation borrowing the bridge for `'a`.
+pub(crate) type BridgeOpFuture<'a, R> = Pin<Box<dyn Future<Output = R> + Send + 'a>>;
+
+/// Take the bridge, `.await` `op` on it with no std guard held, and put it
+/// back, on completion OR cancellation (see [`BridgeHandle::take_guarded`]).
+/// An empty slot answers [`BRIDGE_BUSY_ERROR`].
+pub(crate) async fn run_taken<B, R, F>(handle: &BridgeHandle<B>, op: F) -> Result<R, String>
+where
+    F: for<'a> FnOnce(&'a mut B) -> BridgeOpFuture<'a, R>,
+{
+    let mut taken = handle
+        .take_guarded()
+        .ok_or_else(|| BRIDGE_BUSY_ERROR.to_string())?;
+    Ok(op(&mut taken).await)
+}
+
+fn start_op(bridge: &mut PythonBridge) -> BridgeOpFuture<'_, Result<(), String>> {
+    Box::pin(bridge.start())
+}
+
+fn stop_op(bridge: &mut PythonBridge) -> BridgeOpFuture<'_, Result<(), String>> {
+    Box::pin(bridge.stop())
 }
 
 /// The bridges map. Generic over the bridge type only so the locking contract
@@ -328,21 +406,17 @@ impl BridgeManager {
         let bid = BridgeId::from_string(bridge_id.to_string());
         info!("Removing bridge: {}", bridge_id);
 
-        // Remove from bridges map
-        let managed = {
-            let mut bridges = self.bridges.write().unwrap();
-            bridges.remove(&bid)
-        };
+        // Claim the bridge, then remove its entry. A bridge another lifecycle
+        // operation holds (mid start/stop) is refused, so the entry is never
+        // removed out from under it.
+        let removed = take_for_removal_in(&self.bridges, &bid)?;
 
-        if let Some(managed) = managed {
-            // Stop the bridge (async). `take` waits for an in-flight caller of
-            // this bridge to finish; the owned bridge is then awaited on with
-            // no std guard held.
-            if let Some(mut bridge) = managed.bridge.take() {
-                if let Err(e) = bridge.stop().await {
-                    warn!("Error stopping bridge {}: {}", bridge_id, e);
-                }
+        if let Some((managed, mut bridge)) = removed {
+            // Stop the bridge (async), owned, with no std guard held.
+            if let Err(e) = bridge.stop().await {
+                warn!("Error stopping bridge {}: {}", bridge_id, e);
             }
+            drop(bridge);
 
             // Remove run ID mapping
             if let Some(ref run_id) = managed.run_id {
@@ -802,21 +876,13 @@ impl BridgeManager {
         }
 
         // Take the bridge out of its slot, start it with no guard held, and put
-        // it back regardless of the result. `None` means another lifecycle
-        // operation already holds it.
-        let mut bridge = match handle.take() {
-            Some(b) => b,
-            None => return Ok(false),
-        };
-
-        let result = bridge
-            .start()
-            .await
-            .map_err(|e| format!("Failed to start bridge: {}", e));
-
-        handle.put(bridge);
-
-        result.map(|()| true)
+        // it back on completion or cancellation. An empty slot (another
+        // lifecycle operation holds it) is BRIDGE_BUSY_ERROR, never Ok(false):
+        // the restart route reads Ok(false) as "no bridge, create one".
+        run_taken(&handle, start_op)
+            .await?
+            .map_err(|e| format!("Failed to start bridge: {}", e))
+            .map(|()| true)
     }
 
     /// Stop the default bridge.
@@ -831,17 +897,9 @@ impl BridgeManager {
             None => return Err("Default bridge not found".to_string()),
         };
 
-        // Take, stop with no guard held, put back regardless of the result.
-        let mut bridge = match handle.take() {
-            Some(b) => b,
-            None => return Err(BRIDGE_BUSY_ERROR.to_string()),
-        };
-
-        let result = bridge.stop().await;
-
-        handle.put(bridge);
-
-        result
+        // Take, stop with no guard held, put back on completion or
+        // cancellation (the restart route wraps this in a 3 s timeout).
+        run_taken(&handle, stop_op).await?
     }
 
     /// Get the state of the default bridge (sync version).
@@ -885,6 +943,30 @@ impl BridgeManager {
 pub(crate) fn bridge_handle_in<B>(map: &BridgeMap<B>, bid: &BridgeId) -> Option<BridgeHandle<B>> {
     let bridges = map.read().unwrap();
     bridges.get(bid).map(|m| m.bridge.clone())
+}
+
+/// Claim bridge `bid` for removal: take it out of its slot FIRST, then remove
+/// its map entry. `Ok(None)` = no such bridge; [`BRIDGE_BUSY_ERROR`] = another
+/// lifecycle operation holds the bridge, and the entry is left in place (so
+/// that operation's put-back lands in a live entry, never an orphaned handle).
+pub(crate) fn take_for_removal_in<B>(
+    map: &BridgeMap<B>,
+    bid: &BridgeId,
+) -> Result<Option<(ManagedBridge<B>, B)>, String> {
+    let handle = match bridge_handle_in(map, bid) {
+        Some(h) => h,
+        None => return Ok(None),
+    };
+    let taken = handle
+        .take_guarded()
+        .ok_or_else(|| BRIDGE_BUSY_ERROR.to_string())?;
+    let managed = map.write().unwrap().remove(bid);
+    match managed {
+        // The slot is empty while we hold `taken`, so nobody else could have
+        // removed or replaced the entry in between.
+        Some(managed) => Ok(Some((managed, taken.into_inner()))),
+        None => Ok(None),
+    }
 }
 
 /// Run `f` against the bridge `bid`: map lock for the lookup only, then the
@@ -995,6 +1077,10 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("busy caller never entered the bridge");
 
+        // Warm the async runtime outside the timed window, so the budget
+        // measures the lock wait and not first-use runtime start-up.
+        tauri::async_runtime::block_on(async {});
+
         let started = Instant::now();
         let running = is_default_bridge_running_in(&map);
         let id = default_bridge_id_in(&map);
@@ -1045,16 +1131,17 @@ mod tests {
     }
 
     #[test]
-    fn a_taken_bridge_answers_busy_and_put_restores_it() {
+    fn a_taken_bridge_answers_busy_and_drop_restores_it() {
         let (map, bid) = map_with_one_bridge();
         let handle = bridge_handle_in(&map, &bid).unwrap();
 
-        let taken = handle.take().expect("slot was empty");
+        let taken = handle.take_guarded().expect("slot was empty");
         assert_eq!(
             with_bridge_in(&map, &bid, |b| b.calls).unwrap_err(),
             BRIDGE_BUSY_ERROR
         );
-        handle.put(taken);
+        assert!(handle.take_guarded().is_none());
+        drop(taken);
         assert_eq!(with_bridge_in(&map, &bid, |b| b.calls).unwrap(), 0);
 
         let missing = BridgeId::from_string("nope".to_string());
@@ -1062,5 +1149,63 @@ mod tests {
             with_bridge_in(&map, &missing, |b| b.calls).unwrap_err(),
             "Bridge not found: nope"
         );
+    }
+
+    fn never_finishes(bridge: &mut FakeBridge) -> BridgeOpFuture<'_, ()> {
+        Box::pin(async move {
+            bridge.calls += 1;
+            std::future::pending::<()>().await
+        })
+    }
+
+    fn counts(bridge: &mut FakeBridge) -> BridgeOpFuture<'_, u32> {
+        Box::pin(async move { bridge.calls })
+    }
+
+    /// Review CRITICAL 1: a start/stop future dropped after it took the bridge
+    /// (the restart route's 3 s timeout, a disconnected HTTP client) must put
+    /// the bridge back, not leave the slot empty forever.
+    #[test]
+    fn a_cancelled_lifecycle_op_puts_the_bridge_back() {
+        let (map, bid) = map_with_one_bridge();
+        let handle = bridge_handle_in(&map, &bid).unwrap();
+
+        let timed_out = tauri::async_runtime::block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                run_taken(&handle, never_finishes),
+            )
+            .await
+        });
+        assert!(timed_out.is_err(), "the op should have been cancelled");
+
+        // The op did run (it took the bridge), and the bridge is back.
+        assert_eq!(with_bridge_in(&map, &bid, |b| b.calls).unwrap(), 1);
+        let again = tauri::async_runtime::block_on(run_taken(&handle, counts));
+        assert_eq!(again, Ok(1));
+    }
+
+    /// Review WARNING 2: removal must not pull the entry out from under a
+    /// start/stop in flight (which would later put a live bridge into an
+    /// orphaned handle).
+    #[test]
+    fn removal_refuses_a_bridge_held_by_a_lifecycle_op() {
+        let (map, bid) = map_with_one_bridge();
+        let handle = bridge_handle_in(&map, &bid).unwrap();
+
+        let in_flight = handle.take_guarded().unwrap();
+        assert_eq!(
+            take_for_removal_in(&map, &bid).err().as_deref(),
+            Some(BRIDGE_BUSY_ERROR)
+        );
+        assert!(map.read().unwrap().contains_key(&bid), "entry was removed");
+
+        drop(in_flight);
+        let (managed, bridge) = take_for_removal_in(&map, &bid).unwrap().unwrap();
+        assert_eq!(bridge.calls, 0);
+        assert!(!map.read().unwrap().contains_key(&bid));
+        // The removed handle's slot stays empty: nothing lands in an orphan.
+        assert!(managed.bridge.take_guarded().is_none());
+        assert!(take_for_removal_in(&map, &bid).unwrap().is_none());
     }
 }
