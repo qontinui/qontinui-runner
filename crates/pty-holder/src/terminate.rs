@@ -42,9 +42,10 @@ pub struct Termination {
     /// Nothing was signalled because the holder is PROVABLY already gone —
     /// the pane's lock was free (also checked when no process had its pid
     /// when the handle was taken, since a missing pid alone does not prove
-    /// it: an upgraded holder's successor runs under a pid of its own). Its death already ended its child (module docs), so a
-    /// caller must not report the child as possibly still running (pty_holder
-    /// review follow-up L4). Never true together with `signalled`, and never
+    /// it: an upgraded holder's successor runs under a pid of its own). Its
+    /// death already ended its child (module docs), so a caller must not
+    /// report the child as possibly still running (pty_holder review
+    /// follow-up L4). Never true together with `signalled`, and never
     /// true on a refusal whose cause leaves the holder's state open (an
     /// unreadable lock, a lock naming another pid, a failed signal).
     pub holder_gone: bool,
@@ -408,8 +409,18 @@ mod tests {
         let t = terminate_verified_holder(&dir, &id, victim.id());
         assert!(!t.signalled, "{t:?}");
         assert!(!t.holder_gone, "a held lock leaves the holder open: {t:?}");
-        // With the lock free as well, the holder is provably gone.
+        // With the lock free as well, the holder is provably gone. Wait out
+        // a forked-before-exec child's transient hold first (finding
+        // 9bbe1079), as above, so this is the free-lock case it means to be.
         drop(lock);
+        let end = Instant::now() + Duration::from_secs(5);
+        while !matches!(
+            PaneLock::try_acquire_existing(&lock_file),
+            Ok(TryLock::Acquired(_))
+        ) {
+            assert!(Instant::now() < end, "the dropped lock never became free");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let t = terminate_verified_holder(&dir, &id, victim.id());
         assert!(!t.signalled, "{t:?}");
         assert!(
