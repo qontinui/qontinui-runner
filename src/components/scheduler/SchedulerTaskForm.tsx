@@ -30,6 +30,7 @@ import type {
   McpConnectionRef,
 } from "../../types/scheduler";
 import type { UnifiedWorkflow } from "../../types/unified-workflow";
+import { readOnlyTaskType } from "./readOnlyTaskHelpers";
 import { buildRemoteAgentTask } from "./remoteAgentTaskHelpers";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
@@ -114,7 +115,7 @@ const asScriptTask = (t: unknown): ScriptTask | undefined =>
     ? (t as ScriptTask)
     : undefined;
 
-type TaskType = "workflow" | "prompt" | "autofix" | "remote_agent" | "script";
+type TaskType = "workflow" | "prompt" | "autofix" | "remote_agent" | "script" | "readonly";
 
 const CRON_PRESETS = [
   { label: "Every minute (testing)", value: "* * * * *" },
@@ -189,6 +190,7 @@ export function SchedulerTaskForm({
   const [taskType, setTaskType] = useState<TaskType>(() => {
     if (!initTask) return "workflow";
     if (asScriptTask(initTask)) return "script";
+    if (readOnlyTaskType(initTask)) return "readonly";
     switch (initTask.task_type) {
       case "Workflow":
         return "workflow";
@@ -428,6 +430,10 @@ export function SchedulerTaskForm({
         // the form shows them read-only and round-trips the stored task unchanged.
         if (asScriptTask(initTask)) return initTask as unknown as ScheduledTaskType;
         throw new Error("Script tasks cannot be created from this form");
+      case "readonly":
+        // A task type the form has no editor for (e.g. Watcher): round-trip it unchanged.
+        if (readOnlyTaskType(initTask)) return initTask as unknown as ScheduledTaskType;
+        throw new Error("This task type cannot be created from this form");
       case "workflow":
         return {
           task_type: "Workflow",
@@ -565,6 +571,8 @@ export function SchedulerTaskForm({
     switch (taskType) {
       case "script":
         return asScriptTask(initTask) !== undefined;
+      case "readonly":
+        return readOnlyTaskType(initTask) !== undefined;
       case "workflow":
         return workflowId.trim() !== "" || workflowName.trim() !== "";
       case "prompt":
@@ -1080,6 +1088,15 @@ export function SchedulerTaskForm({
             <pre className="whitespace-pre-wrap rounded bg-black/20 p-2">{asScriptTask(initTask)?.command}</pre>
             <div>Working directory: {asScriptTask(initTask)?.working_directory ?? "(runner default)"}</div>
             <div>Timeout: {asScriptTask(initTask)?.timeout_seconds || 600}s</div>
+          </div>
+        )}
+
+        {taskType === "readonly" && readOnlyTaskType(initTask) && (
+          <div className="space-y-2 text-sm" data-testid="readonly-task-notice">
+            <p className="text-text-secondary">
+              {readOnlyTaskType(initTask)} task (read-only here): this form has no editor for it.
+              Saving keeps the task as stored and changes only the name, schedule and conditions.
+            </p>
           </div>
         )}
 
