@@ -44,8 +44,8 @@ fn main() {
     // bare `cargo check`/`cargo build` doesn't panic inside
     // `tauri::generate_context!` — `tauri.conf.json` pins
     // `frontendDist: "../dist"`, and a hand-created `git worktree` has no `dist/`
-    // until `pnpm run build` runs. The supervisor's spawn path always builds the
-    // frontend first, so this guard only ever fires for local-dev ergonomics.
+    // until `pnpm run build` runs. This is for local-dev ergonomics: the
+    // non-embedding builds (`cargo check`/`clippy`/`test`) need a file there.
     //
     // Touch-if-absent ONLY: we never overwrite a real built `dist/index.html`
     // (a successful `pnpm run build` always produces one before cargo runs, and
@@ -543,6 +543,51 @@ fn unbuilt_embedded_frontend_reason(index_html: Option<&str>) -> Option<&'static
     }
 }
 
+/// What an embedding build does with `../dist/index.html` as found.
+#[derive(Debug, PartialEq, Eq)]
+enum EmbedVerdict {
+    /// A real bundle: embed it.
+    Embed,
+    /// Refuse the build, for this reason.
+    Refuse(String),
+    /// [`ALLOW_PLACEHOLDER_DIST_ENV`] is `1`: embed anyway, warning with this
+    /// reason. `write_placeholder` when no file exists, so
+    /// `generate_context!` has one to read.
+    Allow {
+        reason: String,
+        write_placeholder: bool,
+    },
+}
+
+/// Decide an embedding build from the result of reading `../dist/index.html`
+/// and the value of [`ALLOW_PLACEHOLDER_DIST_ENV`]. Pure, so the tests drive
+/// every arm — the escape hatch included — without a filesystem or env var.
+fn embedded_frontend_verdict(read: &std::io::Result<String>, allow: Option<&str>) -> EmbedVerdict {
+    let (reason, absent) = match read {
+        Ok(body) => match unbuilt_embedded_frontend_reason(Some(body)) {
+            None => return EmbedVerdict::Embed,
+            Some(reason) => (reason.to_string(), false),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
+            unbuilt_embedded_frontend_reason(None)
+                .unwrap_or_default()
+                .to_string(),
+            true,
+        ),
+        // Present but unreadable (permissions, not UTF-8, a directory):
+        // nothing trustworthy to embed, but say what was actually found.
+        Err(e) => (format!("../dist/index.html could not be read ({e})"), false),
+    };
+    if allow == Some("1") {
+        EmbedVerdict::Allow {
+            reason,
+            write_placeholder: absent,
+        }
+    } else {
+        EmbedVerdict::Refuse(reason)
+    }
+}
+
 /// Refuse a `custom-protocol` (frontend-embedding) build whose `../dist/` is
 /// absent or is the dev placeholder. Such a build compiles a runnable exe whose
 /// whole UI is "frontend not built yet", with every step reporting success —
@@ -550,29 +595,24 @@ fn unbuilt_embedded_frontend_reason(index_html: Option<&str>) -> Option<&'static
 /// closes. Exits the build script non-zero (cargo prints the message) unless
 /// [`ALLOW_PLACEHOLDER_DIST_ENV`] is exactly `1`.
 fn refuse_unbuilt_embedded_frontend() {
-    use std::path::Path;
-
-    let dist_index = Path::new("../dist/index.html");
-    let body = std::fs::read_to_string(dist_index).ok();
-    let reason = if body.is_none() && dist_index.exists() {
-        // Present but unreadable (permissions, not UTF-8): nothing trustworthy
-        // to embed, but say what was actually found rather than "absent".
-        "../dist/index.html exists but could not be read as UTF-8 text"
-    } else {
-        match unbuilt_embedded_frontend_reason(body.as_deref()) {
-            Some(reason) => reason,
-            None => return,
+    let read = std::fs::read_to_string("../dist/index.html");
+    let allow = std::env::var(ALLOW_PLACEHOLDER_DIST_ENV).ok();
+    let reason = match embedded_frontend_verdict(&read, allow.as_deref()) {
+        EmbedVerdict::Embed => return,
+        EmbedVerdict::Allow {
+            reason,
+            write_placeholder,
+        } => {
+            println!(
+                "cargo:warning=qontinui-runner: {reason}; embedding it anyway because {ALLOW_PLACEHOLDER_DIST_ENV}=1. This binary has NO real UI."
+            );
+            if write_placeholder {
+                ensure_dist_placeholder();
+            }
+            return;
         }
+        EmbedVerdict::Refuse(reason) => reason,
     };
-    if std::env::var(ALLOW_PLACEHOLDER_DIST_ENV).as_deref() == Ok("1") {
-        println!(
-            "cargo:warning=qontinui-runner: {reason}; embedding it anyway because {ALLOW_PLACEHOLDER_DIST_ENV}=1. This binary has NO real UI."
-        );
-        if body.is_none() {
-            ensure_dist_placeholder();
-        }
-        return;
-    }
     eprintln!(
         "\nerror: qontinui-runner: refusing a `custom-protocol` build: {reason}.\n\
          A custom-protocol build compiles ../dist into the binary, so this would ship a runner\n\
@@ -1911,7 +1951,10 @@ fn probe_coord_egress_sibling() {
 /// left the stub behind are the two cases that shipped a placeholder UI.
 #[cfg(test)]
 mod embedded_frontend_tests {
-    use super::{unbuilt_embedded_frontend_reason, DIST_PLACEHOLDER, DIST_PLACEHOLDER_MARKER};
+    use super::{
+        embedded_frontend_verdict, unbuilt_embedded_frontend_reason, EmbedVerdict,
+        DIST_PLACEHOLDER, DIST_PLACEHOLDER_MARKER,
+    };
 
     /// Fresh checkout: no `dist/index.html`. Must refuse.
     #[test]
@@ -1929,11 +1972,11 @@ mod embedded_frontend_tests {
         assert!(reason.contains("PLACEHOLDER"), "{reason}");
     }
 
-    /// A stub written by an older build.rs (the 370-byte file measured on
-    /// dell-2020), spelled out literally so a change to the constants cannot
-    /// make this test agree with itself.
+    /// The stub as already written into existing trees (the 370-byte file
+    /// measured on dell-2020), spelled out literally so a change to the
+    /// constants or the marker cannot make this test agree with itself.
     #[test]
-    fn the_stub_an_older_build_script_wrote_is_refused() {
+    fn the_stub_already_on_disk_is_refused() {
         let older = "<!doctype html>\n<title>qontinui-runner dev placeholder</title>\n<!-- Auto-generated by src-tauri/build.rs on a worktree with no built dist/.\n     This is a DEV-ONLY stub so `cargo check` can run before `pnpm run build`.\n     A real build (`pnpm run build`) overwrites it with the actual bundle. -->\n<p>qontinui-runner frontend not built yet — run `pnpm run build`.</p>\n";
         assert!(unbuilt_embedded_frontend_reason(Some(older)).is_some());
         assert!(DIST_PLACEHOLDER.contains(DIST_PLACEHOLDER_MARKER));
@@ -1950,5 +1993,78 @@ mod embedded_frontend_tests {
     fn a_built_frontend_is_embedded() {
         let vite = "<!doctype html>\n<html lang=\"en\"><head><meta name=\"build-id\" content=\"b58a81dce-1\"><script type=\"module\" crossorigin src=\"/assets/index-AbC123.js\"></script></head><body><div id=\"root\"></div></body></html>\n";
         assert_eq!(unbuilt_embedded_frontend_reason(Some(vite)), None);
+    }
+
+    fn not_found() -> std::io::Result<String> {
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+    }
+
+    /// The escape hatch: only exactly `1` opens it, and it writes the
+    /// placeholder only when there is no file at all.
+    #[test]
+    fn the_escape_hatch_is_exactly_one() {
+        assert_eq!(
+            embedded_frontend_verdict(&not_found(), Some("1")),
+            EmbedVerdict::Allow {
+                reason: unbuilt_embedded_frontend_reason(None).unwrap().to_string(),
+                write_placeholder: true,
+            }
+        );
+        let stub = Ok(DIST_PLACEHOLDER.to_string());
+        assert!(matches!(
+            embedded_frontend_verdict(&stub, Some("1")),
+            EmbedVerdict::Allow {
+                write_placeholder: false,
+                ..
+            }
+        ));
+        for other in [None, Some("0"), Some("true"), Some(" 1"), Some("")] {
+            assert!(
+                matches!(
+                    embedded_frontend_verdict(&stub, other),
+                    EmbedVerdict::Refuse(_)
+                ),
+                "{other:?} must not open the escape hatch"
+            );
+            assert!(matches!(
+                embedded_frontend_verdict(&not_found(), other),
+                EmbedVerdict::Refuse(_)
+            ));
+        }
+    }
+
+    /// Present but unreadable: refused, naming the read error rather than
+    /// calling the file absent, and never overwritten by the placeholder.
+    #[test]
+    fn an_unreadable_index_is_refused_with_its_error() {
+        let unreadable = Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied for the test",
+        ));
+        match embedded_frontend_verdict(&unreadable, None) {
+            EmbedVerdict::Refuse(reason) => {
+                assert!(reason.contains("denied for the test"), "{reason}");
+                assert!(!reason.contains("ABSENT"), "{reason}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(matches!(
+            embedded_frontend_verdict(&unreadable, Some("1")),
+            EmbedVerdict::Allow {
+                write_placeholder: false,
+                ..
+            }
+        ));
+    }
+
+    /// A real bundle embeds whatever the escape hatch says.
+    #[test]
+    fn a_built_frontend_embeds_regardless_of_the_escape_hatch() {
+        let vite = Ok("<!doctype html><div id=\"root\"></div>".to_string());
+        assert_eq!(embedded_frontend_verdict(&vite, None), EmbedVerdict::Embed);
+        assert_eq!(
+            embedded_frontend_verdict(&vite, Some("1")),
+            EmbedVerdict::Embed
+        );
     }
 }
