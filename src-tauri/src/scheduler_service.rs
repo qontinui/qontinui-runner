@@ -119,6 +119,28 @@ fn task_is_due(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
         .is_some_and(|next_dt| next_dt.with_timezone(&chrono::Utc) <= now)
 }
 
+/// The order a tick offers due tasks for a start slot: tasks parked on their
+/// conditions first (longest-waiting first), then the rest by `next_run`.
+///
+/// Waiters lead so a task whose condition has just passed takes the first slot
+/// rather than queueing behind newly due work. That ordering is only safe
+/// because [`start_due_tasks`] spends a slot on a START, not on an inspection: a
+/// waiter whose condition still fails costs the tasks behind it nothing.
+fn due_task_order(a: &ScheduledTask, b: &ScheduledTask) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (&a.condition_status, &b.condition_status) {
+        (Some(a_status), Some(b_status)) => a_status.waiting_since.cmp(&b_status.waiting_since),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => match (&a.next_run, &b.next_run) {
+            (Some(a_time), Some(b_time)) => a_time.cmp(b_time),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        },
+    }
+}
+
 /// Offer `due` to `try_start` in order until `slots` of them have started.
 ///
 /// A candidate that does not start spends nothing, so a task waiting on its
@@ -460,23 +482,7 @@ impl SchedulerService {
             .filter(|task| task_is_due(task, now))
             .collect();
 
-        // Sort by: waiting tasks first (by waiting_since), then by next_run time
-        due_tasks.sort_by(|a, b| {
-            // Waiting tasks come first
-            match (&a.condition_status, &b.condition_status) {
-                (Some(a_status), Some(b_status)) => {
-                    a_status.waiting_since.cmp(&b_status.waiting_since)
-                }
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => match (&a.next_run, &b.next_run) {
-                    (Some(a_time), Some(b_time)) => a_time.cmp(b_time),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => std::cmp::Ordering::Equal,
-                },
-            }
-        });
+        due_tasks.sort_by(due_task_order);
 
         // Coord device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
         // Phase 3): tasks that spawn an AI session are held while autonomous
@@ -4207,6 +4213,68 @@ mod tests {
             walk_start_due_tasks(&[("a", false), ("b", false), ("c", false)], 1).await;
         assert_eq!(offered, vec!["a", "b", "c"]);
         assert!(started.is_empty());
+    }
+
+    fn ordered_task(name: &str, next_run: &str, waiting_since: Option<&str>) -> ScheduledTask {
+        use crate::scheduler::{schedule_expression_default, scheduled_task_type_default};
+        let mut task = ScheduledTask::new(
+            name.to_string(),
+            None,
+            schedule_expression_default(),
+            scheduled_task_type_default(),
+        );
+        task.next_run = Some(next_run.to_string());
+        task.condition_status = waiting_since.map(|since| {
+            let mut status = condition_status_default();
+            status.waiting_since = since.to_string();
+            status
+        });
+        task
+    }
+
+    /// A task parked on its conditions is offered ahead of an overdue cron
+    /// task, even one due long before it started waiting, so a waiter whose
+    /// condition has just passed takes the first slot.
+    #[test]
+    fn a_waiting_task_sorts_ahead_of_an_overdue_cron_task() {
+        let mut due = vec![
+            ordered_task("overdue-cron", "2026-10-28T02:47:00Z", None),
+            ordered_task("later-cron", "2026-10-29T02:47:00Z", None),
+            ordered_task(
+                "parked-late",
+                "2026-10-30T00:00:00Z",
+                Some("2026-10-30T00:00:00Z"),
+            ),
+            ordered_task(
+                "parked-early",
+                "2026-10-30T00:00:00Z",
+                Some("2026-10-29T00:00:00Z"),
+            ),
+        ];
+        due.sort_by(due_task_order);
+        let names: Vec<&str> = due.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["parked-early", "parked-late", "overdue-cron", "later-cron"]
+        );
+    }
+
+    /// `tick_pass` orders its candidates with [`due_task_order`] and nothing
+    /// else, so the order the test above pins is the order a tick uses.
+    #[test]
+    fn the_tick_orders_due_tasks_with_due_task_order() {
+        let src = include_str!("scheduler_service.rs");
+        let (_, tick) = src.split_once("async fn tick_pass(").expect("tick_pass");
+        let (tick, _) = tick
+            .split_once("async fn try_start_due_task(")
+            .expect("try_start_due_task follows tick_pass");
+        assert_eq!(tick.matches(".sort_by(").count(), 1);
+        assert!(tick.contains("due_tasks.sort_by(due_task_order);"));
+        let sort_at = tick.find("due_tasks.sort_by(due_task_order);").unwrap();
+        let walk_at = tick
+            .find("start_due_tasks(due_tasks, available_slots,")
+            .unwrap();
+        assert!(sort_at < walk_at, "the sort must precede the slot walk");
     }
 
     /// `tick_pass` goes through the slot walk, and only a started task reports
