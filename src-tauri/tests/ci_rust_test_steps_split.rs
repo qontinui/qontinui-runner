@@ -1246,7 +1246,9 @@ fn every_windows_pool_arm_carries_its_pull_request_and_rerun_guards() {
         );
         for at in windows_literals {
             assert!(
-                runs_on[..at + 2].ends_with(&forced_guard),
+                runs_on
+                    .get(..at + 2)
+                    .is_some_and(|before| before.ends_with(&forced_guard)),
                 "`{job}`'s forced Windows arm must be guarded by `{forced_guard}`: {runs_on}"
             );
         }
@@ -1257,11 +1259,60 @@ fn every_windows_pool_arm_carries_its_pull_request_and_rerun_guards() {
         );
         for at in routed {
             assert!(
-                runs_on[..at].ends_with(ROUTED_GUARD),
+                runs_on
+                    .get(..at)
+                    .is_some_and(|before| before.ends_with(ROUTED_GUARD)),
                 "`{job}`'s routed arm must be guarded by `{ROUTED_GUARD}`: {runs_on}"
             );
         }
     }
+}
+
+/// Both leftover-process stops run one script, and it must exist where both call it.
+/// Neither call runs on a pull_request run or while the Windows lane is hosted, so no
+/// green check would show a wrong path until the lane flips; this pins it instead.
+#[test]
+fn both_leftover_process_stops_call_the_tracked_script() {
+    const SCRIPT: &str = "scripts/ci/stop-leftover-processes.ps1";
+    let root = repo_root();
+    assert!(
+        root.join(SCRIPT).is_file(),
+        "`{SCRIPT}` is missing, and both leftover-process stops call it"
+    );
+    let action_path = root
+        .join(".github")
+        .join("actions")
+        .join("self-hosted-windows-prep")
+        .join("action.yml");
+    let action_text = std::fs::read_to_string(&action_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", action_path.display()));
+    let action: serde_yaml::Value = serde_yaml::from_str(&action_text)
+        .unwrap_or_else(|e| panic!("parse {}: {e}", action_path.display()));
+    // The CALL, not the path text: a comment, or a line that only names the path,
+    // must not satisfy this.
+    let prep_calls = action
+        .get("runs")
+        .and_then(|r| r.get("steps"))
+        .and_then(|s| s.as_sequence())
+        .unwrap_or_else(|| panic!("{} has no `runs.steps`", action_path.display()))
+        .iter()
+        .filter_map(|step| step.get("run").and_then(|r| r.as_str()))
+        .flat_map(str::lines)
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .any(|l| l.contains(&format!("& (Join-Path $env:GITHUB_WORKSPACE '{SCRIPT}')")));
+    assert!(
+        prep_calls,
+        "the prep action must call `{SCRIPT}` from the workspace root"
+    );
+    let doc = ci_workflow();
+    let steps = job_steps(&doc, "test");
+    const STOP: &str =
+        "Self-hosted Windows: stop the smoke's leftover runner and WebView2 processes";
+    let body = command_lines(find_step(&steps, STOP), STOP);
+    assert!(
+        body.contains(&format!("& ./{SCRIPT} ")),
+        "`{STOP}` must call `./{SCRIPT}`: {body}"
+    );
 }
 
 /// The two `always()` cleanups of `test` act only on what THIS job set up: Unpoison
