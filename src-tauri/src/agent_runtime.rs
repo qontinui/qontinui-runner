@@ -6462,9 +6462,21 @@ async fn run_gate_continuation_inner(
     // so the probe and the spawn cannot disagree about which file they mean.
     // An unlaunchable CLI defers UNCLAIMED like every local guard above: a
     // claimed continuation whose spawn then fails is burned.
-    let (claude_bin, cli_readiness) = spawn_blocking_tracked(|| {
+    // The headless arm execs `launchable_or_bare(claude_bin)` (a non-executable
+    // file falls back to the bare name, which `execvp` resolves past), so the
+    // probe reads THAT string for headless; the terminal arm execs the
+    // resolved path itself.
+    let headless = matches!(payload.presentation, Presentation::Headless);
+    let probe_target = move |bin: &str| {
+        if headless {
+            launchable_or_bare(bin.to_string())
+        } else {
+            bin.to_string()
+        }
+    };
+    let (claude_bin, cli_readiness) = spawn_blocking_tracked(move || {
         let bin = resolve_claude_bin();
-        let readiness = crate::continuation_spawn_readiness::probe_claude_cli(&bin);
+        let readiness = crate::continuation_spawn_readiness::probe_claude_cli(&probe_target(&bin));
         (bin, readiness)
     })
     .await
@@ -6799,8 +6811,8 @@ async fn ack_gate_spawn_result<P, PFut, D, DFut>(
     gate_id: uuid::Uuid,
     result: &anyhow::Result<Option<uuid::Uuid>>,
     claim_sent: Option<ClaimSent>,
-    cli_probe: &dyn Fn(&str) -> crate::continuation_spawn_readiness::CliReadiness,
-    critical_now: &dyn Fn() -> crate::resource_guard::SpawnGate,
+    cli_probe: &(dyn Fn(&str) -> crate::continuation_spawn_readiness::CliReadiness + Sync),
+    critical_now: &(dyn Fn() -> crate::resource_guard::SpawnGate + Sync),
     post: P,
     defer_unclaimed: D,
 ) -> GateAck
@@ -10676,7 +10688,10 @@ pub(crate) async fn spawn_claude_child(
             // `2026-11-04-gate-continuation-defers-unclaimed-on-unlaunchable-claude-cli-and-unsent-claim`, D-C).
             .map_err(|f| {
                 let detail = f.describe(&bin, workdir);
-                anyhow::Error::new(f).context(detail)
+                anyhow::Error::new(crate::claude_cli_spawn::DescribedCliSpawnFailure {
+                    failure: f,
+                    detail,
+                })
             })?;
     if let Some(mut stdin) = child.stdin.take() {
         let prompt = initial_prompt.to_string();
@@ -16028,7 +16043,9 @@ mod tests {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
         };
-        let client = reqwest::Client::new();
+        // `.no_proxy()`: a system/registry proxy would otherwise take the
+        // 127.0.0.1 request and the refusal would never reach this client.
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let refused = send_continuation_claim(
             client
                 .post(format!(

@@ -165,7 +165,37 @@ pub(crate) fn exec_seam_access(path: &Path) -> io::Result<()> {
 /// [`claude_cli_readiness`] with the production predicate. Blocking (one
 /// `access` + one `stat`); cheap enough to share the resolve's blocking task.
 pub(crate) fn probe_claude_cli(resolved: &str) -> CliReadiness {
-    claude_cli_readiness(resolved, &exec_seam_access)
+    match claude_cli_readiness(resolved, &exec_seam_access) {
+        // A bare name is what the headless arm execs after `launchable_or_bare`
+        // rejected a non-executable resolution; `execvp` searches PATH for it,
+        // so it is launchable exactly when some PATH entry holds a launchable
+        // file of that name.
+        CliReadiness::Unresolved
+            if bare_name_on_path(resolved, std::env::var_os("PATH").as_deref()) =>
+        {
+            CliReadiness::Ready
+        }
+        other => other,
+    }
+}
+
+/// `execvp`'s search, with the exec seam's predicate: does any non-empty entry
+/// of `path_var` hold a launchable file named `name`? Unix only — on Windows a
+/// bare name already proceeds ([`CliReadiness::Unresolved`]).
+#[cfg(unix)]
+pub(crate) fn bare_name_on_path(name: &str, path_var: Option<&std::ffi::OsStr>) -> bool {
+    if name.is_empty() || name.contains('/') {
+        return false;
+    }
+    path_var.is_some_and(|p| {
+        std::env::split_paths(p)
+            .any(|d| !d.as_os_str().is_empty() && exec_seam_access(&d.join(name)).is_ok())
+    })
+}
+
+#[cfg(not(unix))]
+pub(crate) fn bare_name_on_path(_name: &str, _path_var: Option<&std::ffi::OsStr>) -> bool {
+    false
 }
 
 /// The kind a readiness reading defers on, per OS — `None` proceeds.
@@ -371,8 +401,10 @@ pub(crate) fn classify_seam_refusal(
     cli_probe: &dyn Fn(&str) -> CliReadiness,
     critical_now: &dyn Fn() -> SpawnGate,
 ) -> Option<SeamRefusal> {
-    if let Some(failure) = err.downcast_ref::<crate::claude_cli_spawn::CliSpawnFailure>() {
-        return failure
+    if let Some(described) = err.downcast_ref::<crate::claude_cli_spawn::DescribedCliSpawnFailure>()
+    {
+        return described
+            .failure
             .transient_kind
             .map(|kind| SeamRefusal::ClaudeCli(CliKind::Known(kind)));
     }

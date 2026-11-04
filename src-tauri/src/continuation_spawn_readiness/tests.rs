@@ -430,10 +430,18 @@ fn a_headless_cli_failure_downcasts_and_keeps_its_text() {
         transient_kind: Some("enoent"),
     };
     let describe = failure.describe("/x/bin/claude", "/w");
-    let err = anyhow::Error::new(failure).context(describe.clone());
+    let err = anyhow::Error::new(crate::claude_cli_spawn::DescribedCliSpawnFailure {
+        failure,
+        detail: describe.clone(),
+    });
     assert_eq!(err.to_string(), describe, "the detail text must not change");
+    assert_eq!(
+        format!("{err:#}"),
+        describe,
+        "no doubled io error under {{:#}}"
+    );
     assert!(err
-        .downcast_ref::<crate::claude_cli_spawn::CliSpawnFailure>()
+        .downcast_ref::<crate::claude_cli_spawn::DescribedCliSpawnFailure>()
         .is_some());
     assert_eq!(
         classify_seam_refusal(&err, &never_probed, &calm),
@@ -492,4 +500,33 @@ fn a_cli_refusal_detail_leads_with_the_retriable_head() {
     // double-prefixed.
     let headless = "claude_cli_unavailable:enoent: spawn `/x/claude` in /w: not found";
     assert_eq!(outcome_detail(Some(&cli), headless), headless);
+}
+
+/// Review M1: the headless arm execs the BARE name after `launchable_or_bare`
+/// rejects a non-executable resolution, and `execvp` searches PATH past it —
+/// so a bare name with a launchable PATH entry is Ready, and without one it
+/// is not.
+#[cfg(unix)]
+#[test]
+fn a_bare_name_is_launchable_only_when_a_path_entry_holds_an_executable() {
+    use std::os::unix::fs::PermissionsExt;
+    let stub = tempfile::tempdir().unwrap();
+    let real = tempfile::tempdir().unwrap();
+    let s = stub.path().join("claude");
+    std::fs::write(&s, b"#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&s, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let only_stub = std::env::join_paths([stub.path()]).unwrap();
+    assert!(!bare_name_on_path("claude", Some(&only_stub)));
+    let r = real.path().join("claude");
+    std::fs::write(&r, b"#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&r, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let both = std::env::join_paths([stub.path(), real.path()]).unwrap();
+    assert!(bare_name_on_path("claude", Some(&both)));
+    // A directory named `claude` is skipped, as execve would refuse it.
+    let dir_only = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir_only.path().join("claude")).unwrap();
+    let dirs = std::env::join_paths([dir_only.path()]).unwrap();
+    assert!(!bare_name_on_path("claude", Some(&dirs)));
+    assert!(!bare_name_on_path("claude", None));
+    assert!(!bare_name_on_path("a/claude", Some(&both)));
 }
