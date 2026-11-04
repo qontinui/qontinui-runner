@@ -849,6 +849,72 @@ pub async fn reconcile_now(
     }))))
 }
 
+/// The task a managed upsert writes for one managed key: `request` (a whole
+/// declaration) over the stored row the caller read, if any. Shared by the
+/// by-key HTTP route and the in-process coord reconciler
+/// (`crate::recurring_agent_reconciler`), so both converge a task the same way.
+///
+/// Keeps the stored row's identity and executor-owned state (`id`,
+/// `created_at`, `last_run`, `consecutive_launch_failures`); `enabled` absent
+/// keeps the stored value (a local pause) and is `true` on create; a condition
+/// wait in progress survives only an unchanged `conditions`. `next_run` and
+/// `modified_at` are the caller's to set (they need the scheduler zone).
+pub(crate) fn merge_managed_task(
+    existing: Option<&crate::scheduler::ScheduledTask>,
+    request: UpsertManagedTaskRequest,
+    managed: crate::scheduler::ManagedBy,
+) -> crate::scheduler::ScheduledTask {
+    let fresh = crate::scheduler::ScheduledTask::new(
+        request.name,
+        request.description,
+        request.schedule,
+        request.task,
+    );
+    let mut task = match existing {
+        // Keep the stored row's identity and executor-owned state; the upsert
+        // never writes `last_run_id` / `consecutive_launch_failures` anyway.
+        Some(stored) => crate::scheduler::ScheduledTask {
+            id: stored.id.clone(),
+            created_at: stored.created_at.clone(),
+            enabled: request.enabled.unwrap_or(stored.enabled),
+            last_run: stored.last_run.clone(),
+            consecutive_launch_failures: stored.consecutive_launch_failures,
+            ..fresh
+        },
+        None => crate::scheduler::ScheduledTask {
+            enabled: request.enabled.unwrap_or(true),
+            ..fresh
+        },
+    };
+    task.skip_if_completed = request.skip_if_completed;
+    task.auto_fix_on_failure = request.auto_fix_on_failure;
+    task.success_criteria = request.success_criteria;
+    // A condition wait in progress survives a re-PUT of the SAME conditions;
+    // changed conditions restart it (as the ordinary update does).
+    task.condition_status = existing.and_then(|stored| {
+        let same = serde_json::to_value(&stored.conditions).ok()
+            == serde_json::to_value(&request.conditions).ok();
+        if same {
+            stored.condition_status.clone()
+        } else {
+            None
+        }
+    });
+    task.conditions = request.conditions;
+    if let Some(policy) = request.catch_up_policy {
+        task.catch_up_policy = policy;
+    }
+    if let Some(grace) = request.catch_up_grace_seconds {
+        task.catch_up_grace_seconds = grace;
+    }
+    if let Some(backoff) = request.launch_failure_backoff_seconds {
+        task.launch_failure_backoff_seconds = backoff;
+    }
+    task.timezone = request.timezone;
+    task.managed = Some(managed);
+    task
+}
+
 /// `PUT /scheduler/tasks/by-key/{source}/{tenant_id}/{agent}` — create or
 /// update the ONE task carrying that managed key (plan
 /// `2026-10-29-recurring-agents-declared-in-coord-reconciled-by-runner` D5),
@@ -932,55 +998,8 @@ pub async fn upsert_managed_task(
             .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
     }
 
-    let fresh = crate::scheduler::ScheduledTask::new(
-        request.name,
-        request.description,
-        request.schedule,
-        request.task,
-    );
     let expected_modified_at = existing.as_ref().map(|t| t.modified_at.clone());
-    let mut task = match &existing {
-        // Keep the stored row's identity and executor-owned state; the upsert
-        // never writes `last_run_id` / `consecutive_launch_failures` anyway.
-        Some(stored) => crate::scheduler::ScheduledTask {
-            id: stored.id.clone(),
-            created_at: stored.created_at.clone(),
-            enabled: request.enabled.unwrap_or(stored.enabled),
-            last_run: stored.last_run.clone(),
-            consecutive_launch_failures: stored.consecutive_launch_failures,
-            ..fresh
-        },
-        None => crate::scheduler::ScheduledTask {
-            enabled: request.enabled.unwrap_or(true),
-            ..fresh
-        },
-    };
-    task.skip_if_completed = request.skip_if_completed;
-    task.auto_fix_on_failure = request.auto_fix_on_failure;
-    task.success_criteria = request.success_criteria;
-    // A condition wait in progress survives a re-PUT of the SAME conditions;
-    // changed conditions restart it (as the ordinary update does).
-    task.condition_status = existing.as_ref().and_then(|stored| {
-        let same = serde_json::to_value(&stored.conditions).ok()
-            == serde_json::to_value(&request.conditions).ok();
-        if same {
-            stored.condition_status.clone()
-        } else {
-            None
-        }
-    });
-    task.conditions = request.conditions;
-    if let Some(policy) = request.catch_up_policy {
-        task.catch_up_policy = policy;
-    }
-    if let Some(grace) = request.catch_up_grace_seconds {
-        task.catch_up_grace_seconds = grace;
-    }
-    if let Some(backoff) = request.launch_failure_backoff_seconds {
-        task.launch_failure_backoff_seconds = backoff;
-    }
-    task.timezone = request.timezone;
-    task.managed = Some(managed);
+    let mut task = merge_managed_task(existing.as_ref(), request, managed);
 
     let now = chrono::Utc::now();
     let zone = crate::scheduler::ScheduleZone::from_settings(
