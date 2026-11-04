@@ -3472,6 +3472,22 @@ fn collect_claude_accounts_from(
 // `outside-workspace` when it resolves somewhere else. A setting spelled
 // relative is published normalized and verbatim — defensive only, since the
 // setting is documented as absolute.
+//
+// **`harness_scope_kind` says which rung resolved the root.** Relative
+// renderings make two roots comparable only when both were resolved as the
+// same concept, so — like `repos_scope_kind` — the section publishes the
+// resolution kind beside its readings. qontinui-web classifies it `derived`:
+// reported, excluded from `in_sync`, never an apply line.
+
+/// The provenance key: WHICH KIND of workspace-root resolution the harness
+/// observations were taken under. The value is `WorkspaceRootKind::wire()`
+/// (`declared` / `discovered` / `home_default`; `unresolved` is in the enum but
+/// never published, because an unresolved root yields no section at all) — NOT
+/// `ProbeScopeKind`, which is what `versions.probe_scope_kind` carries.
+/// qontinui-web registers it as a derived key
+/// (`devenv_section_policy._DERIVED_KEYS["harness"]`), so a pure provenance
+/// difference never reads as drift; renaming it breaks that registration.
+pub(crate) const HARNESS_SCOPE_KEY: &str = "harness_scope_kind";
 
 /// The bin crate's `paths.plans_dir` door, published as a FUNCTION for the
 /// same reason [`WorkspaceRootFn`] is: the setting is operator-editable and
@@ -4372,6 +4388,7 @@ pub fn collect_harness() -> Option<Section> {
             rejected.describe()
         );
     }
+    let kind = resolved.kind;
     let root = resolved.into_root()?;
     let plans_dir = match PLANS_DIR_DOOR.get() {
         Some(door) => PlansDirReading::Read(door()),
@@ -4384,19 +4401,22 @@ pub fn collect_harness() -> Option<Section> {
         &plans_dir,
         config_root.as_deref(),
         home.as_deref(),
+        kind,
     ))
 }
 
 /// Injectable core of [`collect_harness`]: `root` is the workspace root,
 /// `plans_dir` the settings door's answer, `config_root` the platform config
 /// dir the accounts roster lives under, `home` the user's home dir (the
-/// agent-skills install root and the global git config live under it). Every
+/// agent-skills install root and the global git config live under it), `kind`
+/// the rung that resolved `root` — published as [`HARNESS_SCOPE_KEY`]. Every
 /// value is a `Value::String`.
 fn collect_harness_under(
     root: &Path,
     plans_dir: &PlansDirReading,
     config_root: Option<&Path>,
     home: Option<&Path>,
+    kind: qontinui_types::paths::WorkspaceRootKind,
 ) -> Section {
     let config_repo = root.join(HARNESS_CONFIG_REPO_DIR);
     let mut section = Section::new();
@@ -4510,6 +4530,12 @@ fn collect_harness_under(
         "invariant_class",
         invariant_class(&shape, &tracked),
     );
+    // Every key above is a probe under `root` or a rendering relative to it,
+    // so the section carries WHICH rung resolved that root — exactly as
+    // `repos` does with `REPOS_SCOPE_KEY`. Without it, two boxes whose roots
+    // were resolved by different rungs compare these readings with nothing
+    // saying they did not measure the same concept.
+    put(&mut section, HARNESS_SCOPE_KEY, kind.wire());
 
     section
 }
@@ -4519,6 +4545,7 @@ mod tests {
     use super::*;
 
     use crate::test_env::env_lock;
+    use qontinui_types::paths::WorkspaceRootKind;
 
     #[test]
     fn sanitize_url_strips_password() {
@@ -7122,6 +7149,7 @@ dependencies = [
             &PlansDirReading::Read(Some(plans)),
             None,
             Some(&home),
+            WorkspaceRootKind::Declared,
         );
 
         for (k, v) in &section {
@@ -7161,7 +7189,13 @@ dependencies = [
     #[test]
     fn harness_bare_root_reads_absent_everywhere() {
         let root = harness_root("bare");
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         for key in [
             "link_claude_dir",
             "link_claude_md",
@@ -7180,6 +7214,30 @@ dependencies = [
         );
         assert_eq!(harness_value(&section, "plans_dir_relative"), "unset");
         assert_eq!(harness_value(&section, "invariant_class"), "(a)");
+        assert_eq!(harness_value(&section, HARNESS_SCOPE_KEY), "declared");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The section publishes WHICH rung resolved the root it probed, verbatim
+    /// from `WorkspaceRootKind::wire()` — the value set qontinui-web's
+    /// `_DERIVED_KEYS["harness"]` registration documents. Every variant, so a
+    /// new rung cannot ship unpublished, and the key name itself is pinned
+    /// because the web registration is keyed on it.
+    #[test]
+    fn harness_publishes_the_workspace_root_kind() {
+        assert_eq!(HARNESS_SCOPE_KEY, "harness_scope_kind");
+        let root = harness_root("scope");
+        for (kind, wire) in [
+            (WorkspaceRootKind::Declared, "declared"),
+            (WorkspaceRootKind::Discovered, "discovered"),
+            (WorkspaceRootKind::HomeDefault, "home_default"),
+            (WorkspaceRootKind::Unresolved, "unresolved"),
+        ] {
+            let section =
+                collect_harness_under(&root, &PlansDirReading::Read(None), None, None, kind);
+            assert_eq!(harness_value(&section, HARNESS_SCOPE_KEY), wire);
+            assert!(section[HARNESS_SCOPE_KEY].is_string(), "envelope contract");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -7194,7 +7252,13 @@ dependencies = [
         std::fs::create_dir_all(&tracked).unwrap();
 
         if make_link(&root.join("plans"), &tracked, true) {
-            let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+            let section = collect_harness_under(
+                &root,
+                &PlansDirReading::Read(None),
+                None,
+                None,
+                WorkspaceRootKind::Declared,
+            );
             assert_eq!(harness_value(&section, "invariant_class"), "(b)");
             // Remove the link only (never the target). On Windows a directory
             // symlink/junction is removed as a directory.
@@ -7208,7 +7272,13 @@ dependencies = [
 
         std::fs::create_dir_all(root.join("plans")).unwrap();
         std::fs::write(root.join("plans").join("stray.md"), "# a second corpus\n").unwrap();
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(harness_value(&section, "invariant_class"), "(c)");
         assert!(
             root.join("plans").join("stray.md").is_file(),
@@ -7231,7 +7301,13 @@ dependencies = [
             let _ = std::fs::remove_dir_all(&root);
             return;
         }
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(harness_value(&section, "link_claude_dir"), "foreign");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -7253,13 +7329,25 @@ dependencies = [
         )
         .unwrap();
         std::fs::create_dir_all(root.join(".claude")).unwrap();
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(harness_value(&section, "link_claude_md"), "present");
         assert_eq!(harness_value(&section, "link_dev_start"), "present");
         assert_eq!(harness_value(&section, "link_claude_dir"), "foreign");
 
         std::fs::write(root.join("CLAUDE.md"), "# my own guidelines\n").unwrap();
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(harness_value(&section, "link_claude_md"), "foreign");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -7354,7 +7442,13 @@ dependencies = [
             matches!(shape, PathShape::Link { resolved: None, .. }),
             "expected a dangling link shape, got {shape:?}"
         );
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(harness_value(&section, "link_claude_dir"), "foreign");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -7832,7 +7926,13 @@ dependencies = [
             "#!/bin/sh\n",
         )
         .unwrap();
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(harness_value(&section, "installer_git_hooks"), "present");
 
         std::fs::write(
@@ -7840,7 +7940,13 @@ dependencies = [
             "[core]\n\thooksPath = .githooks\n",
         )
         .unwrap();
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(
             harness_value(&section, "installer_git_hooks"),
             "absent",
@@ -7852,7 +7958,13 @@ dependencies = [
             "#!/bin/sh\n",
         )
         .unwrap();
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(None),
+            None,
+            None,
+            WorkspaceRootKind::Declared,
+        );
         assert_eq!(harness_value(&section, "installer_git_hooks"), "present");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -8300,6 +8412,7 @@ dependencies = [
             &PlansDirReading::Read(None),
             Some(&config_root),
             None,
+            WorkspaceRootKind::Declared,
         );
         assert_eq!(
             harness_value(&section, "installer_claude_accounts"),
@@ -8318,6 +8431,7 @@ dependencies = [
             &PlansDirReading::Read(None),
             Some(&config_root),
             None,
+            WorkspaceRootKind::Declared,
         );
         assert_eq!(
             harness_value(&section, "installer_claude_accounts"),
