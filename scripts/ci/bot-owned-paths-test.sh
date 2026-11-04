@@ -87,15 +87,27 @@ run_case "schemas-pair adaptation, code + pin -> pass (arm c), applier named" 0 
   "jspinak" "$S2" "$CODE"$'\n'"$PINS"$'\n'"$LOCK" "labeled${T}${S2}${T}jspinak"
 run_case "schemas-pair adaptation, owner-qualified -> pass (arm c)" 0 "arm (c)" \
   "jspinak" "coord:downstream-of=qontinui/qontinui-schemas#812" "$CODE"$'\n'"$PINS"
-run_case "pair-follow pushed the pin after the label was stripped -> pass (arm c)" 0 "arm (c): declared schemas-leads adaptation ($S2, since removed)" \
+run_case "pair-follow pushed the pin after the label was stripped -> pass (arm c)" 0 "arm (c): declared schemas-leads adaptation ($S2, since removed by automation)" \
   "jspinak" "coord:landed" "$CODE"$'\n'"$PINS"$'\n'"$LOCK" \
   "labeled${T}${S2}${T}jspinak"$'\n'"unlabeled${T}${S2}${T}qontinui-merge-orchestrator[bot]"
+run_case "pair-follow's own GITHUB_TOKEN delete also keeps arm (c)" 0 "arm (c)" \
+  "jspinak" "" "$CODE"$'\n'"$PINS" \
+  "labeled${T}${S2}${T}jspinak"$'\n'"unlabeled${T}${S2}${T}github-actions[bot]"
+run_case "a schemas label a PERSON withdrew is not a declaration -> fail" 1 "FAIL:" \
+  "jspinak" "" "$CODE"$'\n'"$PINS" \
+  "labeled${T}${S2}${T}jspinak"$'\n'"unlabeled${T}${S2}${T}jspinak"
+run_case "re-added by automation, then withdrawn by a person -> fail" 1 "FAIL:" \
+  "jspinak" "" "$CODE"$'\n'"$PINS" \
+  "labeled${T}${S2}${T}jspinak"$'\n'"unlabeled${T}${S2}${T}qontinui-merge-orchestrator[bot]"$'\n'"labeled${T}${S2}${T}github-actions[bot]"$'\n'"unlabeled${T}${S2}${T}octo"
+run_case "every applier is named (a restore does not hide the person)" 0 "applied by jspinak,github-actions[bot]" \
+  "jspinak" "$S2" "$CODE"$'\n'"$PINS" \
+  "labeled${T}${S2}${T}jspinak"$'\n'"unlabeled${T}${S2}${T}github-actions[bot]"$'\n'"labeled${T}${S2}${T}github-actions[bot]"
 run_case "downstream-of a RUNNER PR is not arm (c) -> fail" 1 "FAIL:" \
   "jspinak" "coord:downstream-of=qontinui-runner#2531" "$CODE"$'\n'"$PINS" \
   "labeled${T}coord:downstream-of=qontinui-runner#2531${T}jspinak"
 run_case "near-miss schemas label (suffix) is not arm (c) -> fail" 1 "FAIL:" \
   "jspinak" "coord:downstream-of=qontinui-schemas#812x" "$CODE"$'\n'"$PINS"
-run_case "override label -> pass, label and applier named (arm d)" 0 "AUDIT: label ci:bot-owned-path-override (applied by jspinak)" \
+run_case "override label -> pass, label, applier and paths named (arm d)" 0 "AUDIT: label ci:bot-owned-path-override (applied by jspinak) overrides bot-owned-paths for: .github/sibling-pins.conf" \
   "jspinak" "ci:gate-change=declared"$'\n'"ci:bot-owned-path-override" "$CODE"$'\n'"$PINS" \
   "labeled${T}ci:bot-owned-path-override${T}jspinak"
 run_case "override applier unknown -> still named as UNKNOWN" 0 "applied by UNKNOWN" \
@@ -111,23 +123,24 @@ run_case "a nested Cargo.lock is not arm (b) scope -> fail" 1 "FAIL:" \
   "jspinak" "" "$PINS"$'\n'"vendor/tao-0.35.0/Cargo.lock"
 run_case "fleet_commands.rs (the module, not the bundle) -> no bot path" 0 "no bot-owned path touched" \
   "jspinak" "" "src-tauri/src/fleet_commands.rs"$'\n'"src-tauri/src/fleet_commands_index.rs"
-run_case "a % in a file name is escaped in the ::error command" 1 "::error title=bot-owned-paths::a bot-owned path (src-tauri/src/fleet_commands/a%250A::error::injected.md)" \
+run_case "a % in a file name is escaped (%25) in the ::error command" 1 "::error title=bot-owned-paths::a bot-owned path (src-tauri/src/fleet_commands/a%250A::error::injected.md)" \
   "jspinak" "" "$CODE"$'\n'"src-tauri/src/fleet_commands/a%0A::error::injected.md"
 
 # --- `pr` against a stubbed gh -----------------------------------------------
 # The stub maps `gh api [--paginate] <path> [--jq <filter>]` to the fixture file
 # $GH_FIX/<path with non-alphanumerics as _>; a sibling `.fail` file makes the
-# call exit 1. Every fixture is the raw API JSON.
+# call exit 1. Every fixture is the raw API JSON. A list endpoint read without
+# --paginate fails, so dropping pagination reds the pr cases.
 mkdir -p "$work/bin"
 cat >"$work/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
 [ "${1:-}" = "api" ] || { echo "stub gh: only 'api' is stubbed" >&2; exit 2; }
 shift
-path="" jqf=""
+path="" jqf="" paged=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --paginate) shift ;;
+    --paginate) paged=1; shift ;;
     --jq) jqf="$2"; shift 2 ;;
     *) path="$1"; shift ;;
   esac
@@ -135,6 +148,11 @@ done
 f="$GH_FIX/$(printf '%s' "$path" | sed 's#[^A-Za-z0-9]#_#g')"
 [ ! -e "$f.fail" ] || { echo "stub gh: HTTP 502 for $path" >&2; exit 1; }
 [ -f "$f" ] || { echo "stub gh: no fixture for $path" >&2; exit 1; }
+# A list endpoint read without --paginate would silently stop at one page.
+case "$path" in
+  */labels*|*/events*|*/files*)
+    [ "$paged" = 1 ] || { echo "stub gh: list endpoint $path read without --paginate" >&2; exit 1; } ;;
+esac
 if [ -n "$jqf" ]; then jq -r "$jqf" "$f"; else cat "$f"; fi
 STUB
 chmod +x "$work/bin/gh"

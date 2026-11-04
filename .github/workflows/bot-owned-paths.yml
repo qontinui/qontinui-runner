@@ -2,8 +2,8 @@ name: bot-owned-paths
 
 # Flags a PR that edits a BOT-OWNED path (`.github/sibling-pins.conf`,
 # `src-tauri/src/fleet_{commands,skills,agents}/**`) alongside other work. The
-# rule, its four passing arms and the remedies live in scripts/ci/bot-owned-paths.sh.
-# Its fixture suite, scripts/ci/bot-owned-paths-test.sh, runs first in the same job.
+# rule, its four passing arms and the remedies live in scripts/ci/bot-owned-paths.sh;
+# its fixture suite is scripts/ci/bot-owned-paths-test.sh.
 #
 # Plan: qontinui-dev-notes plans/2026-11-04-runner-generated-and-ledger-files-are-
 # merge-neutral-and-land-behind-a-drain.md, Phase 0 and Design decision 4.
@@ -14,12 +14,19 @@ name: bot-owned-paths
 # action the plan surfaces. When that happens, drop "(advisory)" from the job name
 # in the same change, because a required context is matched by name.
 #
-# THE VERDICT RUNS MAIN'S SCRIPT. A `pull_request` run checks out the PR's merge
-# ref, so a PR could otherwise loosen the rule in its own copy and pass. The
-# decision step therefore runs the script from a checkout of the default branch.
-# It falls back to the PR's copy only while main has no script, which is true for
-# the PR that adds it, and it says so. The fixture suite runs the PR's copy,
-# because that is the change under test.
+# THE VERDICT RUNS MAIN'S SCRIPT, IN A JOB THAT RUNS NO PR CODE. A `pull_request`
+# run checks out the PR's merge ref, so a PR could otherwise loosen the rule in its
+# own copy. Running the PR's fixture suite in the same job would be no better: it
+# runs on the same disk first, and could overwrite main's copy or plant a `gh` on
+# $GITHUB_PATH before the decision. So the work is split in two:
+#   * `bot-owned-paths (advisory)`, the context to require, checks out ONLY the
+#     default branch and runs main's script over API reads. It falls back to the
+#     PR's copy only while main has no script, which holds for the PR that adds
+#     it, and it says so in a ::warning.
+#   * `bot-owned-paths selftest` runs the PR's fixture suite, which is the change
+#     under test, on its own runner.
+# Residual bound, stated plainly: a PR can still edit THIS workflow. That edit is
+# caught only by ci-integrity.yml's gate-change declaration, not here.
 #
 # NO `paths:` FILTER, deliberately. The verdict is about the PR's whole diff, and
 # a required context that is path-filtered never reports on the PRs it skips, so
@@ -31,9 +38,9 @@ name: bot-owned-paths
 #     schemas-pair label must re-decide without a push. Labels and their history
 #     are read live through the API, not from the event payload.
 #   * `edited`: covers a base re-target, which changes the diff.
-#   * `push`: runs only the fixture suite. It covers main and the same
-#     merge-candidate globs ci.yml lists, so the context reports on every sha
-#     coord validates once it is required.
+#   * `push`: the selftest runs, and the advisory job reports a no-op success. It
+#     covers main and the same merge-candidate globs ci.yml lists, so the context
+#     reports on every sha coord validates once it is required.
 #   * Closed PRs are skipped. Label churn after a land (e.g. `coord:landed`)
 #     would otherwise re-run it for nothing.
 
@@ -67,14 +74,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Check out the change under test
-        uses: actions/checkout@v5
-        with:
-          path: change
-          persist-credentials: false
-          sparse-checkout: scripts/ci
+      # On a push (main, merge-candidate) there is no PR to decide. The job still
+      # reports, so the context exists on every sha coord validates.
+      - name: Nothing to decide on a push
+        if: github.event_name != 'pull_request'
+        run: echo "push to ${GITHUB_REF}; no PR diff to decide"
 
-      - name: Check out main's rule
+      - name: Check out main's rule (no PR code)
         if: github.event_name == 'pull_request'
         uses: actions/checkout@v5
         with:
@@ -83,9 +89,13 @@ jobs:
           persist-credentials: false
           sparse-checkout: scripts/ci
 
-      - name: Fixture suite (no network)
-        shell: bash
-        run: bash change/scripts/ci/bot-owned-paths-test.sh
+      - name: Bootstrap only - main has no rule yet, take the PR's copy
+        if: github.event_name == 'pull_request' && hashFiles('trusted/scripts/ci/bot-owned-paths.sh') == ''
+        uses: actions/checkout@v5
+        with:
+          path: change
+          persist-credentials: false
+          sparse-checkout: scripts/ci
 
       - name: Decide this PR
         if: github.event_name == 'pull_request'
@@ -98,7 +108,22 @@ jobs:
           set -euo pipefail
           script=trusted/scripts/ci/bot-owned-paths.sh
           if [ ! -f "$script" ]; then
-            echo "::notice::main has no bot-owned-paths.sh yet; deciding with this PR's copy"
+            echo "::warning::main has no bot-owned-paths.sh yet; deciding with this PR's copy"
             script=change/scripts/ci/bot-owned-paths.sh
           fi
           bash "$script" pr "$REPO" "$PR_NUMBER"
+
+  selftest:
+    name: bot-owned-paths selftest
+    if: github.event_name != 'pull_request' || github.event.pull_request.state != 'closed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/ci
+
+      - name: Fixture suite (no network)
+        shell: bash
+        run: bash scripts/ci/bot-owned-paths-test.sh

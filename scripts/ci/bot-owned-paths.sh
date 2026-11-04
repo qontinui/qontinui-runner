@@ -16,7 +16,9 @@
 #                                    and by schemas-pair-follow.yml
 #   src-tauri/src/fleet_commands/**  bytes copied from qontinui-claude-config and
 #   src-tauri/src/fleet_skills/**    resynced by the fleet-bundle-sync PRs
-#   src-tauri/src/fleet_agents/**    (author qontinui-dev[bot], e.g. #2549)
+#   src-tauri/src/fleet_agents/**    (author qontinui-dev[bot], e.g. #2549; the three
+#                                    directories are qontinui-claude-config
+#                                    scripts/fleet-bundle-sync.sh's PAIRS)
 # Sweep 2's conflict census (2026-11-04) found 21 conflicting PRs on the pin file
 # and 27 on fleet_commands/**, almost all of them feature PRs that carried a pin
 # bump or a hand copy of a bundled file beside their code, then collided with the
@@ -30,13 +32,16 @@
 #   (a) its author login is github-actions[bot] or qontinui-dev[bot];
 #   (b) EVERY changed file is a bot-owned path or the root Cargo.lock (a pin bump
 #       must move Cargo.lock with it);
-#   (c) it carries — or ever carried — `coord:downstream-of=[qontinui/]qontinui-schemas#N`,
-#       a declared schemas-leads adaptation (form 2 of scripts/schemas-pair-follow.sh)
-#       where the pin and the lock MUST ride with the code. "Ever carried" because
-#       coord strips the label when the partner lands and schemas-pair-follow.sh
-#       deletes any remaining copy before it pushes the pin into the PR: the push
-#       that brings the pin in is exactly the run that no longer sees the label.
-#       The verdict prints an AUDIT line naming the label and who applied it;
+#   (c) it carries `coord:downstream-of=[qontinui/]qontinui-schemas#N`, a declared
+#       schemas-leads adaptation (form 2 of scripts/schemas-pair-follow.sh) where
+#       the pin and the lock MUST ride with the code — OR its label history shows
+#       that label last REMOVED BY AUTOMATION: coord's App strips it when the
+#       partner lands, and schemas-pair-follow.sh deletes a remaining copy (as
+#       github-actions[bot]) before it pushes the pin in. So the push that brings
+#       the pin in is exactly the run that no longer sees the label. A label a
+#       person removed is NOT a declaration, the same rule schemas-pair-follow.sh's
+#       stripped_by_coord applies. The verdict prints an AUDIT line naming the
+#       label and everyone who applied it;
 #   (d) it carries the label `ci:bot-owned-path-override`. The verdict prints an
 #       AUDIT line naming the label, who applied it, and the paths it covered.
 # A PR touching no bot-owned path passes untouched. The arms are tried in the
@@ -109,11 +114,18 @@ audit() {
   summary "$1"
 }
 
-# applier EVENTS-FILE LABEL -> the actor of the LAST `labeled` event for LABEL, or UNKNOWN.
+# Who may remove a form-2 label without withdrawing the declaration (arm c):
+# coord's App, and schemas-pair-follow.sh's own GITHUB_TOKEN delete.
+STRIP_ACTOR_COORD="qontinui-merge-orchestrator[bot]"
+STRIP_ACTOR_ACTIONS="github-actions[bot]"
+
+# applier EVENTS-FILE LABEL -> every distinct actor of a `labeled` event for LABEL,
+# in first-seen order and comma-joined, or UNKNOWN. All of them, because a label
+# re-added by automation (pair-follow's restore) would otherwise hide the person.
 applier() {
   local events="$1" label="$2" a=""
   if [ -n "$events" ] && [ -f "$events" ]; then
-    a="$(awk -F'\t' -v l="$label" '$1 == "labeled" && $2 == l { a = $3 } END { print a }' "$events")"
+    a="$(awk -F'\t' -v l="$label" '$1 == "labeled" && $2 == l && !seen[$3]++ { out = out (out == "" ? "" : ",") $3 } END { print out }' "$events")"
   fi
   printf '%s' "${a:-UNKNOWN}"
 }
@@ -155,8 +167,12 @@ cmd_check() {
     if [[ "$l" =~ $SCHEMAS_FORM2_RE ]]; then form2="$l"; state="present"; break; fi
   done <"$labels_file"
   if [ -z "$form2" ] && [ -n "$events_file" ]; then
-    form2="$(awk -F'\t' -v re="$SCHEMAS_FORM2_RE" '$1 == "labeled" && $2 ~ re { l = $2 } END { print l }' "$events_file")"
-    [ -z "$form2" ] || state="since removed"
+    # The LAST event per form-2 label decides; accept one last unlabeled by automation.
+    form2="$(awk -F'\t' -v re="$SCHEMAS_FORM2_RE" -v s1="$STRIP_ACTOR_COORD" -v s2="$STRIP_ACTOR_ACTIONS" '
+      $2 ~ re { ev[$2] = $1; who[$2] = $3; if (!($2 in ord)) { ord[$2] = ++k; name[k] = $2 } }
+      END { for (i = 1; i <= k; i++) { l = name[i]; if (ev[l] == "unlabeled" && (who[l] == s1 || who[l] == s2)) last = l } print last }
+    ' "$events_file")"
+    [ -z "$form2" ] || state="since removed by automation"
   fi
   if [ -n "$form2" ]; then
     audit "AUDIT: arm (c) label $form2 ($state; applied by $(applier "$events_file" "$form2")) admits bot-owned paths: ${owned[*]}"
@@ -213,12 +229,16 @@ cmd_pr() {
     --jq '.[] | select(.event == "labeled" or .event == "unlabeled") | [.event, .label.name, (.actor.login // "UNKNOWN")] | @tsv' \
     >"$tmp/events" || { err "UNKNOWN: could not read PR #$pr label history"; exit 3; }
 
-  # ONE walk of the file list, so the listed files and their count cannot come
-  # from two different heads. One JSON array per entry: [filename, previous_filename].
+  # ONE walk of the file list, so the names and their count come from the same
+  # read. `changed_files` comes from the earlier PR read: a head that moves
+  # between the two is caught only when the count changes, and a mismatch fails
+  # safe (exit 3). One JSON array per entry: [filename, previous_filename].
   gh api --paginate "repos/$repo/pulls/$pr/files?per_page=100" \
     --jq '.[] | [.filename, (.previous_filename // "")] | @json' >"$tmp/files.jsonl" ||
     { err "UNKNOWN: could not read PR #$pr changed files"; exit 3; }
   # GET /pulls/{n}/files silently truncates at 3000 entries (see ci-integrity.yml).
+  # KNOWN LIMIT: a PR over 3000 files is therefore always UNKNOWN, and no arm,
+  # not even the override, can clear it. Split the PR.
   local seen
   seen="$(grep -c . "$tmp/files.jsonl" || true)"
   if [ "$seen" != "$declared" ]; then
