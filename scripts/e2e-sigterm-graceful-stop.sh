@@ -92,8 +92,12 @@ UNIT=qontinui-sigterm-e2e-$PORT
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/qontinui-sigterm-e2e.XXXXXX") && ROOT=$(readlink -f "$ROOT")
 # An empty ROOT would make own_pids match EVERY process (cwd under "/"), and
 # cleanup would signal them all — never continue without a real root.
-if [ -z "$ROOT" ] || [ "$ROOT" = / ] || [ ! -d "$ROOT" ] || [[ "$ROOT" =~ [[:space:]] ]]; then
+if [ -z "$ROOT" ] || [ "$ROOT" = / ] || [ ! -d "$ROOT" ]; then
   echo "could not create the instance root" >&2; exit 2
+fi
+if [[ "$ROOT" =~ [[:space:]] ]]; then
+  rmdir "$ROOT" 2>/dev/null
+  echo "the instance root '$ROOT' contains whitespace (from TMPDIR); set a TMPDIR without spaces" >&2; exit 2
 fi
 BASE="http://127.0.0.1:$PORT"
 FAILS=0
