@@ -65,8 +65,11 @@
 //! Windows keeps settings its own install depends on — `http.sslBackend`,
 //! `core.autocrlf` and the like — in the system file). The global file's empty
 //! `helper =` is read AFTER the system file, so it still clears every system
-//! credential helper, URL-scoped ones included. **The recorded residual:** a
-//! system-level `url.<x>.insteadOf` on a Windows node still applies.
+//! credential helper, URL-scoped ones included. **The recorded residual:**
+//! everything ELSE in the system file still applies on a Windows node — a
+//! `url.<x>.insteadOf`, an `http.<url>.extraHeader`, an `include`/`includeIf`,
+//! a `core.hooksPath` or `init.templateDir`. Only its credential helpers are
+//! cleared.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -125,6 +128,13 @@ impl SiblingGitEnv {
     /// `dispatch_root` and build the environment against THIS process's
     /// inherited variables.
     pub(super) fn isolated(dispatch_root: &Path) -> Result<Self, String> {
+        // Every path below is handed to git children with DIFFERENT cwds. A
+        // relative GIT_CONFIG_GLOBAL would resolve per child to a missing file
+        // (not an error to git), dropping the helper reset — on Windows that
+        // revives the system helper, failing OPEN — and git ignores a
+        // relative ceiling entry. So anchor the root once, here.
+        let dispatch_root = &std::path::absolute(dispatch_root)
+            .map_err(|e| format!("absolutize {}: {e}", dispatch_root.display()))?;
         std::fs::create_dir_all(dispatch_root)
             .map_err(|e| format!("create {}: {e}", dispatch_root.display()))?;
         let global = dispatch_root.join(GLOBAL_CONFIG_FILE);
@@ -552,26 +562,34 @@ mod tests {
         .await
     }
 
-    /// Every `credential.helper` value git reads, each with the scope it came
-    /// from (`git config --show-scope`; git 2.26 has it, so the 2.32 floor does).
-    const HELPER_SCOPES: [&str; 4] = ["config", "--get-all", "--show-scope", "credential.helper"];
+    /// Every credential helper git reads — the bare `credential.helper` AND
+    /// every URL-scoped `credential.<url>.helper`, which is how the original
+    /// leak arrived — each with the scope it came from (`--show-scope`; git
+    /// 2.26 has it, so the 2.32 floor does). Lines read `<scope>\t<key> <value>`.
+    const HELPER_SCOPES: [&str; 4] = [
+        "config",
+        "--show-scope",
+        "--get-regexp",
+        r"^credential\..*helper$",
+    ];
 
-    /// The effective helper list is empty: the LAST value read is the global
-    /// file's empty `helper =`, which clears every value read before it. On
-    /// Unix (`GIT_CONFIG_NOSYSTEM=1`) nothing else may be read at all. On
-    /// Windows the system file is still read (D5's fallback), so a SYSTEM
-    /// helper may precede the reset — Git for Windows ships
-    /// `helper = manager` there — but a value from any other scope may not.
+    /// The effective helper list is empty: the LAST helper read is the global
+    /// file's empty `helper =`, which clears every helper read before it,
+    /// URL-scoped ones included. On Unix (`GIT_CONFIG_NOSYSTEM=1`) nothing
+    /// else may be read at all. On Windows the system file is still read
+    /// (D5's fallback), so a SYSTEM helper may precede the reset — Git for
+    /// Windows ships `helper = manager` there — but one from any other scope
+    /// may not.
     fn assert_only_the_reset_is_effective(show_scope_out: &str) {
         let lines: Vec<&str> = show_scope_out.lines().collect();
         let (last, earlier) = lines
             .split_last()
             .unwrap_or_else(|| panic!("no helper at all, not even the reset: {show_scope_out:?}"));
-        let (scope, value) = last.split_once('\t').unwrap_or((last, ""));
+        let (scope, entry) = last.split_once('\t').unwrap_or((last, ""));
         assert_eq!(
-            (scope, value.trim()),
-            ("global", ""),
-            "the last helper read must be the global reset: {show_scope_out:?}"
+            (scope, entry.trim()),
+            ("global", "credential.helper"),
+            "the last helper read must be the global empty reset: {show_scope_out:?}"
         );
         for line in earlier {
             let scope = line.split_once('\t').map_or(*line, |(s, _)| s);
@@ -603,8 +621,13 @@ mod tests {
     }
 
     fn plain_git(cwd: &Path, args: &[&str]) {
+        // An exported GIT_DIR / GIT_WORK_TREE (a hook shell, a worktree)
+        // would aim `init` and `config` at the CALLER's repo and write a
+        // plaintext-store helper and an insteadOf into its real .git/config.
         let out = std::process::Command::new("git")
             .current_dir(cwd)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
             .args(args)
             .output()
             .unwrap();
