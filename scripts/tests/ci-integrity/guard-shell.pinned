@@ -1,0 +1,142 @@
+set -euo pipefail
+read -r -d '' NON_GATING <<'NONGATING' || true
+CHANGED="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" \
+--jq '.[] | .filename, (.previous_filename // empty)')"
+DECLARED_COUNT="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.changed_files')"
+SEEN_COUNT="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" --jq '.[].filename' | wc -l)"
+case "${DECLARED_COUNT}" in "" | *[!0-9]*) BAD=1 ;; *) BAD=0 ;; esac
+case "${SEEN_COUNT}"     in "" | *[!0-9]*) BAD=1 ;; esac
+if [ "${BAD}" -ne 0 ]; then
+echo "::error::Could not read this PR's file counts from the API"
+echo "(changed_files='${DECLARED_COUNT}', listed='${SEEN_COUNT}'). Without them the"
+echo "gating scan cannot be shown to cover the whole diff, so it certifies nothing."
+exit 1
+fi
+if [ "${SEEN_COUNT}" -lt "${DECLARED_COUNT}" ]; then
+echo "::error::This PR reports ${DECLARED_COUNT} changed files but the API listed"
+echo "only ${SEEN_COUNT} (GitHub caps /pulls/files at 3000). The gating scan would"
+echo "cover a prefix of the diff, so it cannot certify anything. Split the PR."
+exit 1
+fi
+HIT_PATHS=""
+while IFS= read -r f; do
+[ -z "${f}" ] && continue
+case "${f}" in
+.github/workflows/*|.github/actions/*) ;;
+scripts/check_untimed_subprocess.py) ;;
+*) continue ;;
+esac
+if grep -qxF "${f}" <<< "${NON_GATING}"; then continue; fi
+case $'\n'"${HIT_PATHS}" in
+*$'\n'"${f}"$'\n'*) continue ;;
+esac
+HIT_PATHS="${HIT_PATHS}${f}"$'\n'
+done <<< "${CHANGED}"
+if [ -z "${HIT_PATHS}" ]; then
+echo "No gating workflow modified — CI integrity intact."
+exit 0
+fi
+echo "Gating file(s) touched by this PR:"
+printf '%s' "${HIT_PATHS}" | sed 's/^/  - /'
+echo ""
+MERGE_BASE="$(gh api "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" \
+--jq '.merge_base_commit.sha')"
+if [ -z "${MERGE_BASE}" ]; then
+echo "::error::Could not resolve the merge base; refusing to guess."
+exit 1
+fi
+echo "Comparing ${MERGE_BASE} (merge base) -> ${HEAD_SHA} (head)"
+echo ""
+export HIT_PATHS MERGE_BASE
+python3 - <<'PY' > "${RUNNER_TEMP}/findings.tsv"
+FINDINGS="$(cat "${RUNNER_TEMP}/findings.tsv")"
+if grep -q '^!PARSE' <<< "${FINDINGS}"; then
+echo "::error::Could not parse a gating file at the merge base or head:"
+grep '^!PARSE' <<< "${FINDINGS}" | cut -f2 | sed 's/^/  - /'
+echo "An unverifiable gate cannot be declared away."
+exit 1
+fi
+if grep -q '^!ALIAS' <<< "${FINDINGS}"; then
+echo "::error::A gating file uses YAML anchors, aliases or a merge key at head:"
+grep '^!ALIAS' <<< "${FINDINGS}" | cut -f2 | sed 's/^/  - /'
+echo "GitHub Actions does not support them, while this check RESOLVES them --"
+echo "so an anchored rewrite can digest as unchanged while the gate stops"
+echo "running. Write the file without anchors so it can be verified."
+exit 1
+fi
+LABELS="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name')"
+DECLARED=""
+if grep -qxF 'ci:gate-change=declared'      <<< "${LABELS}"; then DECLARED="declared"; fi
+if grep -qxF 'ci:gate-change=alters-a-gate' <<< "${LABELS}"; then DECLARED="alters-a-gate"; fi
+if [ -z "${DECLARED}" ]; then
+echo "::error::This PR changes gating workflow(s) without declaring it:"
+printf '%s' "${HIT_PATHS}" | sed 's/^/  - /'
+echo ""
+echo "Declare it, then RE-RUN this job — applying a label does not"
+echo "re-trigger this workflow on its own:"
+echo "  gh pr edit ${PR_NUMBER} --add-label 'ci:gate-change=declared'"
+echo "An agent applies this itself with gh; no operator and no coord call is needed."
+exit 1
+fi
+if [ -n "${FINDINGS}" ]; then
+echo "Existing gate surface altered by this PR:"
+while IFS=$'\t' read -r kind path tok; do
+[ -z "${tok:-}" ] && continue
+echo "  ${kind}  ${tok}   (${path})"
+done <<< "${FINDINGS}"
+echo ""
+BODY="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.body // ""')"
+MISSING=""
+while IFS=$'\t' read -r kind path tok; do
+if [ -z "${tok:-}" ]; then
+echo "::error::Internal: a finding carried no token; refusing to pass."
+exit 1
+fi
+case "${kind}" in
+REMOVED) directive="Gate-Removal" ;;
+*)       directive="Gate-Change"  ;;
+esac
+if ! grep -qxF "${directive}: ${tok}" <<< "${BODY//$'\r'/}"; then
+MISSING="${MISSING}  ${directive}: ${tok}"$'\n'
+fi
+done <<< "${FINDINGS}"
+if [ "${DECLARED}" != "alters-a-gate" ] || [ -n "${MISSING}" ]; then
+echo "::error::This PR alters an existing gate. That needs the stronger"
+echo "label AND each altered item named on its own line in the PR body,"
+echo "so the change is recorded explicitly rather than buried in a diff:"
+echo ""
+echo "  gh pr edit ${PR_NUMBER} --add-label 'ci:gate-change=alters-a-gate'"
+echo ""
+if [ -n "${MISSING}" ]; then
+echo "and add exactly these line(s) to the PR body:"
+printf '%s' "${MISSING}"
+echo ""
+fi
+echo "Then re-run this job. No operator is involved."
+exit 1
+fi
+fi
+{
+echo "### Gating change — declared and verified"
+echo ""
+echo "Declaration: \`ci:gate-change=${DECLARED}\`"
+echo "Compared \`${MERGE_BASE}\` (merge base) to \`${HEAD_SHA}\` (head)."
+echo ""
+echo "Gating file(s) changed:"
+printf '%s' "${HIT_PATHS}" | sed 's/^/- `/;s/$/`/'
+echo ""
+if [ -n "${FINDINGS}" ]; then
+echo "Existing gate surface altered (each named in the PR body):"
+while IFS=$'\t' read -r kind path tok; do
+[ -z "${tok:-}" ] && continue
+echo "- \`${kind}\` \`${tok}\`"
+done <<< "${FINDINGS}"
+else
+echo "No existing gate surface was altered — this change is purely additive."
+fi
+} > "${RUNNER_TEMP}/notice.md"
+cat "${RUNNER_TEMP}/notice.md" >> "${GITHUB_STEP_SUMMARY}"
+gh pr comment "${PR_NUMBER}" --repo "${REPO}" --body-file "${RUNNER_TEMP}/notice.md"
+echo ""
+echo "Gating change declared, verified and recorded — CI integrity intact."
+PY body sha256 987a96ea10572a39d813bb3506335e254d81837eedd90c2ce62b084c36dc90aa
