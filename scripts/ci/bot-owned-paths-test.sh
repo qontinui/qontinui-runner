@@ -201,6 +201,10 @@ pr_fixture "$FX/strip" 15 jspinak 3 \
   '[{"event":"labeled","label":{"name":"coord:downstream-of=qontinui-schemas#812"},"actor":{"login":"jspinak"}},{"event":"commented"},{"event":"unlabeled","label":{"name":"coord:downstream-of=qontinui-schemas#812"},"actor":{"login":"qontinui-merge-orchestrator[bot]"}}]'
 run_pr "pr: stripped schemas label read from the history -> pass (arm c)" 0 "applied by jspinak" "$FX/strip" 15
 
+pr_fixture "$FX/nl" 17 jspinak 2 '[{"filename":"Cargo.lock\nCargo.lock"},{"filename":".github/sibling-pins.conf"}]'
+# (The bad name is FIRST on purpose: a check that read only jq's last output would miss it.)
+run_pr "pr: a file name with a newline -> UNKNOWN (3), never split into fake paths" 3 "name contains CR or LF" "$FX/nl" 17
+
 pr_fixture "$FX/ovr" 16 jspinak 2 \
   '[{"filename":"src-tauri/src/mcp_api.rs"},{"filename":"src-tauri/src/fleet_skills/x/SKILL.md"}]' \
   '[{"name":"ci:bot-owned-path-override"}]' \

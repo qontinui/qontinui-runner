@@ -39,9 +39,15 @@
 #       partner lands, and schemas-pair-follow.sh deletes a remaining copy (as
 #       github-actions[bot]) before it pushes the pin in. So the push that brings
 #       the pin in is exactly the run that no longer sees the label. A label a
-#       person removed is NOT a declaration, the same rule schemas-pair-follow.sh's
-#       stripped_by_coord applies. The verdict prints an AUDIT line naming the
-#       label and everyone who applied it;
+#       person removed is NOT a declaration. That is the intent of
+#       schemas-pair-follow.sh's stripped_by_coord, but the rule here is stricter:
+#       the LAST event per label decides, and two automations count (coord's App
+#       and github-actions[bot]). stripped_by_coord accepts a coord strip anywhere
+#       in the history, so a strip, a re-add and then a hand removal satisfies it
+#       and fails here. One residual: if the events API has not yet shown
+#       pair-follow's delete when its push fires `synchronize`, that run reds. It
+#       fails safe, and the next label event or push re-decides. The verdict
+#       prints an AUDIT line naming the label and everyone who applied it;
 #   (d) it carries the label `ci:bot-owned-path-override`. The verdict prints an
 #       AUDIT line naming the label, who applied it, and the paths it covered.
 # A PR touching no bot-owned path passes untouched. The arms are tried in the
@@ -243,6 +249,13 @@ cmd_pr() {
   seen="$(grep -c . "$tmp/files.jsonl" || true)"
   if [ "$seen" != "$declared" ]; then
     err "UNKNOWN: PR #$pr declares $declared changed files but the files API listed $seen (truncated, or the head moved)"
+    exit 3
+  fi
+  # The decision reads one path per line, so a name carrying CR or LF would be
+  # split into fake entries (and could satisfy arm (b)). Refuse it as UNKNOWN.
+  # -s: one verdict over every entry (-e alone reads only the LAST output).
+  if ! jq -s -e 'all(.[][]; test("[\r\n]") | not)' "$tmp/files.jsonl" >/dev/null; then
+    err "UNKNOWN: PR #$pr has a changed file whose name contains CR or LF"
     exit 3
   fi
   # Both names of a rename: moving a bot-owned file away is an edit to it.
