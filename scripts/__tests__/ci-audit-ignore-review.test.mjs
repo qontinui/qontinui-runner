@@ -17,30 +17,26 @@ import {
   ISSUE_TITLE,
   findProblems,
   firedAdvisories,
-  parseIgnores,
+  ignoreIdOf,
   parseReviewDates,
+  readIgnores,
+  readIgnoresDir,
   planAction,
   renderBody,
 } from "../ci-audit-ignore-review.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const script = join(here, "..", "ci-audit-ignore-review.mjs");
-const realCiYml = join(here, "..", "..", ".github", "workflows", "ci.yml");
+const realIgnoresDir = join(here, "..", "..", ".github", "audit-ignores");
 
-const CI = `
-      - name: audit
-        # --ignore RUSTSEC-2026-0001: one advisory.
-        # REVIEW BY 2026-11-04 (or sooner).
-        #
-        # --ignore RUSTSEC-2026-0002 + RUSTSEC-2026-0003
-        # + RUSTSEC-2026-0004: a block whose heading wraps.
-        # Tracking: #1. REVIEW BY 2026-12-02. Re-assess if it changes.
-        #
-        # --ignore RUSTSEC-2026-0005: no date on this one.
-        run: |
-          # cargo audit --file Cargo.lock --ignore RUSTSEC-1999-0001
-          cargo audit --file Cargo.lock --ignore RUSTSEC-2026-0001 --ignore RUSTSEC-2026-0002 --ignore RUSTSEC-2026-0003
-`;
+// The ignores directory as readIgnores sees it: one file per advisory.
+const FILES = [
+  { name: "README.md", text: "Not an ignore. REVIEW BY anything goes here? No: the README is skipped whole.\n" },
+  { name: "RUSTSEC-2026-0001.md", text: "# RUSTSEC-2026-0001\n\nOne advisory.\nREVIEW BY 2026-11-04 (or sooner).\n\nDrop when x.\n" },
+  { name: "RUSTSEC-2026-0003.md", text: "Shared block.\nTracking: #1. REVIEW BY 2026-12-02. Re-assess if it changes.\n\nDrop when y.\n" },
+  { name: "RUSTSEC-2026-0002.md", text: "Shared block.\nTracking: #1. REVIEW BY 2026-12-02. Re-assess if it changes.\n\nDrop when y.\n" },
+  { name: "RUSTSEC-2026-0005.md", text: "No date on this one.\r\n\r\nDrop when z.\r\n" },
+];
 
 function report({ ids = [], warnings = {}, ...over } = {}) {
   return {
@@ -53,109 +49,83 @@ function report({ ids = [], warnings = {}, ...over } = {}) {
   };
 }
 
-test("parseIgnores reads the live command line, not a commented-out one", () => {
-  assert.deepEqual(parseIgnores(CI), ["RUSTSEC-2026-0001", "RUSTSEC-2026-0002", "RUSTSEC-2026-0003"]);
-});
-
-test("parseIgnores accepts a command with no ignores left", () => {
-  assert.deepEqual(parseIgnores("  cargo audit --file Cargo.lock\n"), []);
-});
-
-test("parseIgnores takes only the real command", () => {
-  const ci = "  cargo audit-x --ignore RUSTSEC-1999-0001\n  cargo audit --ignore RUSTSEC-2026-0001\n";
-  assert.deepEqual(parseIgnores(ci), ["RUSTSEC-2026-0001"]);
-});
-
-test("parseIgnores refuses anything it cannot read completely", () => {
-  const cases = [
-    ["run: cargo build\n", /found 0/],
-    ["  cargo audit --ignore RUSTSEC-2026-0001\n  cargo audit --ignore RUSTSEC-2026-0002\n", /found 2/],
-    ["  cargo audit --ignore RUSTSEC-2026-0001 \\\n    --ignore RUSTSEC-2026-0002\n", /continues onto the next line/],
-    ["  cargo audit --ignore RUSTSEC-2026-0001 \\\n    $MORE\n", /cannot read/],
-    ["  cargo audit --ignore RUSTSEC-2026-0001 --ignore=RUSTSEC-2026-0002\n", /cannot read/],
-    ["  cargo audit --ignore RUSTSEC-2026-0001 $MORE\n", /cannot read/],
-    ["  cargo audit --ignore RUSTSEC-2026-0001 # --ignore RUSTSEC-2026-0002\n", /cannot read/],
-    ["  cargo audit --ignore RUSTSEC-2026-0001 || true\n", /cannot read/],
-    ["  cargo audit --ignore RUSTSEC-2026-0001 --ignore GHSA-aaaa-bbbb-cccc\n", /not a RUSTSEC id/],
-    ["  cargo audit --ignore RUSTSEC-2026-12345\n", /not a RUSTSEC id/],
-    ["  cargo audit --ignore\n", /not a RUSTSEC id/],
-    ["  cargo audit --file Cargo.lock\n  --ignore RUSTSEC-2026-0001\n", /continues onto the next line/],
-    ["  cargo audit --file src-tauri/Cargo.lock\n", /cannot read/],
-    ["  cargo audit --file --ignore --ignore RUSTSEC-2026-0001\n", /cannot read/],
-  ];
-  for (const [ci, want] of cases) assert.throws(() => parseIgnores(ci), want, ci);
-});
-
-test("parseReviewDates ties each date to its block, across a wrapped heading", () => {
-  assert.deepEqual(parseReviewDates(CI), [
+test("readIgnores takes the ids from the file names, sorted, and skips the README", () => {
+  const { ignores, reviewDates } = readIgnores(FILES);
+  assert.deepEqual(ignores, ["RUSTSEC-2026-0001", "RUSTSEC-2026-0002", "RUSTSEC-2026-0003", "RUSTSEC-2026-0005"]);
+  assert.deepEqual(reviewDates, [
     { date: "2026-11-04", ids: ["RUSTSEC-2026-0001"] },
-    { date: "2026-12-02", ids: ["RUSTSEC-2026-0002", "RUSTSEC-2026-0003", "RUSTSEC-2026-0004"] },
+    { date: "2026-12-02", ids: ["RUSTSEC-2026-0002"] },
+    { date: "2026-12-02", ids: ["RUSTSEC-2026-0003"] },
   ]);
 });
 
+test("readIgnores accepts a directory with no ignores left", () => {
+  assert.deepEqual(readIgnores([]), { ignores: [], reviewDates: [] });
+  assert.deepEqual(readIgnores([{ name: "README.md", text: "" }]), { ignores: [], reviewDates: [] });
+});
+
+test("ignoreIdOf refuses any file it cannot read as one ignore", () => {
+  for (const name of [
+    "RUSTSEC-2026-12345.md",
+    "RUSTSEC-2026-0001",
+    "RUSTSEC-2026-0001.txt",
+    "rustsec-2026-0001.md",
+    "GHSA-aaaa-bbbb-cccc.md",
+    "notes.md",
+    "readme.md",
+  ]) {
+    assert.throws(() => ignoreIdOf(name), /not a <RUSTSEC-YYYY-NNNN>\.md file/, name);
+  }
+  assert.equal(ignoreIdOf("README.md"), null);
+  assert.equal(ignoreIdOf("RUSTSEC-2026-0001.md"), "RUSTSEC-2026-0001");
+});
+
 test("parseReviewDates refuses a reworded date instead of reading it as no date", () => {
-  const wrap = (text) => `# --ignore RUSTSEC-2026-0001: x.\n${text}\n  cargo audit --ignore RUSTSEC-2026-0001\n`;
   for (const text of [
-    "# Review by 2026-11-04",
-    "# REVIEW BY: 2026-11-04",
-    "# REVIEW  BY 2026-11-04",
-    "# REVIEW BY 2026/11/04",
-    "# REVIEW-BY 2026-11-04",
-    "# REVIEW_BY 2026-11-04",
-    "# REVIEWBY 2026-11-04",
-    "# REVIEW BY",
-    "# REVIEW BY\n# 2026-11-04",
-    "# text REVIEW\n# BY 2026-11-04",
-    "# REVIEW BY 2026-13-45",
-    "# REVIEW BY 2026-02-30",
-    "# REVIEW BY 2026-11-04, or review by then",
+    "Review by 2026-11-04",
+    "REVIEW BY: 2026-11-04",
+    "REVIEW  BY 2026-11-04",
+    "REVIEW BY 2026/11/04",
+    "REVIEW-BY 2026-11-04",
+    "REVIEW_BY 2026-11-04",
+    "REVIEWBY 2026-11-04",
+    "REVIEW BY",
+    "REVIEW BY\n2026-11-04",
+    "text REVIEW\nBY 2026-11-04",
+    "REVIEW BY 2026-13-45",
+    "REVIEW BY 2026-02-30",
+    "REVIEW BY 2026-11-04, or review by then",
+    "REVIEW BY 2020-01-01-99.",
   ]) {
-    assert.throws(() => parseReviewDates(wrap(text)), /REVIEW BY YYYY-MM-DD/, text);
+    assert.throws(() => parseReviewDates("RUSTSEC-2026-0001", text), /REVIEW BY YYYY-MM-DD/, text);
   }
 });
 
-test("parseReviewDates refuses a date with no heading above it", () => {
-  for (const ci of [
-    "# REVIEW BY 2026-11-04\n# --ignore RUSTSEC-2026-0001: x.\n  cargo audit --ignore RUSTSEC-2026-0001\n",
-    "# Ignoring RUSTSEC-2026-0001.\n# REVIEW BY 2026-11-04\n  cargo audit --ignore RUSTSEC-2026-0001\n",
-  ]) {
-    assert.throws(() => parseReviewDates(ci), /under a `# --ignore` heading/, ci);
-  }
+test("parseReviewDates treats other wording as prose, and needs a word boundary", () => {
+  const dates = (text) => parseReviewDates("RUSTSEC-2026-0001", text);
+  assert.deepEqual(dates("Disclosed 2026-05-13.\nRe-assess by 2020-01-01."), []);
+  assert.deepEqual(dates("a preview by the team."), []);
+  assert.deepEqual(dates("PREVIEW BY 2020-01-01."), []);
+  assert.deepEqual(dates("Cites RUSTSEC-2026-0002. REVIEW BY 2026-11-04."), [{ date: "2026-11-04", ids: ["RUSTSEC-2026-0001"] }]);
+  assert.throws(() => parseReviewDates("not-an-id", ""), /not a RUSTSEC id/);
 });
 
-test("parseReviewDates takes ids from the heading only, and needs a word boundary", () => {
-  const ids = (block) => parseReviewDates(`${block}\n  cargo audit --ignore RUSTSEC-2026-0001\n`).map((r) => r.ids);
-  assert.deepEqual(ids("# --ignore RUSTSEC-2026-0001: see RUSTSEC-2026-0002.\n# REVIEW BY 2026-11-04."), [["RUSTSEC-2026-0001"]]);
-  assert.deepEqual(
-    ids("# --ignore RUSTSEC-2026-0001: x.\n# quoting # --ignore RUSTSEC-2020-0001 here\n# REVIEW BY 2026-11-04."),
-    [["RUSTSEC-2026-0001"]],
+test("readIgnores surfaces a bad file or a bad date, never a shorter list", () => {
+  assert.throws(() => readIgnores([...FILES, { name: "notes.md", text: "" }]), /notes\.md/);
+  assert.throws(
+    () => readIgnores([...FILES, { name: "RUSTSEC-2026-0009.md", text: "Review by 2026-11-04\n" }]),
+    /RUSTSEC-2026-0009\.md:1/,
   );
-  assert.deepEqual(ids("# --ignore RUSTSEC-2026-0001: x.\n# a preview by the team."), []);
-  assert.deepEqual(ids("# --ignore RUSTSEC-2026-0001: x.\n# PREVIEW BY 2020-01-01."), []);
-  assert.throws(() => ids("# --ignore RUSTSEC-2026-0001: x.\n# REVIEW BY 2020-01-01-99."), /REVIEW BY YYYY-MM-DD/);
 });
 
-test("parseReviewDates treats other wording as prose", () => {
-  const ci = "# --ignore RUSTSEC-2026-0001: x. Disclosed 2026-05-13.\n# Re-assess by 2020-01-01.\n  cargo audit --ignore RUSTSEC-2026-0001\n";
-  assert.deepEqual(parseReviewDates(ci), []);
-});
-
-test("parseReviewDates stops at the step boundary, however the step starts", () => {
-  const ci = "# REVIEW BY 2020-01-01\n- run: echo\n- id: audit\n  cargo audit --ignore RUSTSEC-2026-0001\n";
-  assert.deepEqual(parseReviewDates(ci), []);
-});
-
-test("parseReviewDates only reads the comments of the step holding the command", () => {
-  const ci = [
-    "# an earlier job, up for review by a human",
-    "- name: audit",
-    "# --ignore RUSTSEC-2026-0001: x.",
-    '  run: echo "REVIEW BY 2020-01-01"',
-    "  cargo audit --ignore RUSTSEC-2026-0001",
-    "# a later job, review by anyone, REVIEW BY 2020-01-01",
-  ].join("\n");
-  assert.deepEqual(parseReviewDates(ci), []);
-  assert.throws(() => parseReviewDates("# REVIEW BY 2026-11-04\n"), /no `cargo audit/);
+test("readIgnoresDir refuses a sub-directory", () => {
+  const dir = mkdtempSync(join(tmpdir(), "audit-ignores-"));
+  mkdirSync(join(dir, "RUSTSEC-2026-0001.md"));
+  try {
+    assert.throws(() => readIgnoresDir(dir), /is not a file/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("firedAdvisories counts warnings, and allows a yanked crate with no advisory", () => {
@@ -260,17 +230,18 @@ test("renderBody names each problem", () => {
   assert.doesNotMatch(renderBody({ expired: [{ date: "2026-11-04", ids: [] }], stale: [] }), /no longer firing/);
 });
 
-// The parser has to keep working on the file it exists to read. The count catches
-// a date the parser lost. It cannot assert a minimum, since the last dated ignore
-// may well go away one day.
-test("the real ci.yml parses: every date is read and names advisories on the command", () => {
-  const ci = readFileSync(realCiYml, "utf8");
-  const ignores = parseIgnores(ci);
-  const reviews = parseReviewDates(ci);
-  const dated = ci.split("\n").filter((l) => /^\s*#.*\bREVIEW BY\b/.test(l));
-  assert.equal(reviews.length, dated.length);
-  for (const review of reviews) {
-    for (const id of review.ids) assert.ok(ignores.includes(id), `${id} is not on the command`);
+// The reader has to keep working on the directory it exists to read. The count
+// catches a date the parser lost. It cannot assert a minimum, since the last
+// dated ignore may well go away one day.
+test("the real .github/audit-ignores/ reads: every date is read and names an ignore", () => {
+  const files = readIgnoresDir(realIgnoresDir);
+  const { ignores, reviewDates } = readIgnores(files);
+  const dated = files
+    .filter((f) => f.name !== "README.md")
+    .flatMap((f) => f.text.split("\n").filter((l) => /\bREVIEW BY\b/.test(l)));
+  assert.equal(reviewDates.length, dated.length);
+  for (const review of reviewDates) {
+    for (const id of review.ids) assert.ok(ignores.includes(id), `${id} is not an ignore`);
   }
 });
 
@@ -291,10 +262,10 @@ fi
 exit 0
 `;
 
-const CLI_CI = `# --ignore RUSTSEC-2026-0001: x.
-# REVIEW BY 2026-11-04.
-  cargo audit --file Cargo.lock --ignore RUSTSEC-2026-0001 --ignore RUSTSEC-2026-0002
-`;
+const CLI_IGNORES = {
+  "RUSTSEC-2026-0001.md": "x.\nREVIEW BY 2026-11-04.\n\nDrop when x.\n",
+  "RUSTSEC-2026-0002.md": "y.\n\nDrop when y.\n",
+};
 
 // RUSTSEC-2026-0002 fires nowhere, so this input always has a stale ignore.
 const FINDINGS = { expired: [], stale: ["RUSTSEC-2026-0002"] };
@@ -309,11 +280,12 @@ function cli({ issues = [], env = {}, reportText, today = "2026-11-02", extra = 
   const log = join(dir, "gh.log");
   const issuesFile = join(dir, "issues.json");
   writeFileSync(issuesFile, JSON.stringify(issues));
-  const ciYml = join(dir, "ci.yml");
-  writeFileSync(ciYml, CLI_CI);
+  const ignoresDir = join(dir, "audit-ignores");
+  mkdirSync(ignoresDir);
+  for (const [name, text] of Object.entries(CLI_IGNORES)) writeFileSync(join(ignoresDir, name), text);
   const reportFile = join(dir, "report.json");
   writeFileSync(reportFile, reportText ?? JSON.stringify(report({ ids: ["RUSTSEC-2026-0001"] })));
-  const args = { "--audit-json": reportFile, "--repo": "o/r", "--ci-yml": ciYml, "--today": today };
+  const args = { "--audit-json": reportFile, "--repo": "o/r", "--ignores-dir": ignoresDir, "--today": today };
   const argv = Object.entries(args).filter(([k]) => !omit.includes(k)).flat();
   const res = spawnSync(process.execPath, [script, ...argv, ...extra], {
     encoding: "utf8",
@@ -408,7 +380,7 @@ test("cli: a blind run exits 1 and never touches gh", () => {
 });
 
 test("cli: the error annotation escapes workflow-command data", () => {
-  const { status, stdout } = cli({ extra: ["--ci-yml", "/nonexistent/100%done"] });
+  const { status, stdout } = cli({ extra: ["--ignores-dir", "/nonexistent/100%done"] });
   assert.equal(status, 1);
   assert.match(stdout, /100%25done/);
 });
@@ -431,4 +403,61 @@ test("cli: bad usage exits 2 without calling gh", () => {
     assert.equal(run.status, 2);
     assert.equal(run.log, "");
   }
+});
+
+// ---- the CI lint and the flags script, on fixture trees ----
+// The lint must refuse what the reader above refuses, or a PR goes green and
+// the nightly goes blind. Each case is one fixture tree; each must exit 1.
+
+const lintScript = join(here, "..", "ci", "audit-ignores-test.sh");
+const flagsScript = join(here, "..", "ci", "audit-ignore-flags.sh");
+const GOOD = "x.\nREVIEW BY 2026-11-04.\n\nDrop when x.\n";
+
+function lint({ ignores = { "RUSTSEC-2026-0001.md": GOOD }, workflows = { "ci.yml": "run: cargo audit $flags\n" } } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), "audit-ignores-lint-"));
+  const ign = join(dir, "ignores");
+  const wf = join(dir, "workflows");
+  mkdirSync(ign);
+  mkdirSync(wf);
+  for (const [name, text] of Object.entries(ignores)) writeFileSync(join(ign, name), text);
+  for (const [name, text] of Object.entries(workflows)) writeFileSync(join(wf, name), text);
+  const lintRun = spawnSync("bash", [lintScript, ign, wf], { encoding: "utf8" });
+  const flagsRun = spawnSync("bash", [flagsScript, ign], { encoding: "utf8" });
+  rmSync(dir, { recursive: true, force: true });
+  return { status: lintRun.status, stderr: lintRun.stderr, flags: flagsRun };
+}
+
+test("lint: a clean tree passes, and the flags script prints one pair per file", () => {
+  const run = lint({ ignores: { "README.md": "notes", "RUSTSEC-2026-0001.md": GOOD, "RUSTSEC-2026-0002.md": "y.\n\nDrop when y.\n" } });
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(run.flags.status, 0);
+  assert.equal(run.flags.stdout.trim(), "--ignore RUSTSEC-2026-0001 --ignore RUSTSEC-2026-0002");
+  const empty = lint({ ignores: {} });
+  assert.equal(empty.status, 0, empty.stderr);
+  assert.equal(empty.flags.stdout.trim(), "");
+});
+
+test("lint: refuses each malformed tree the reader refuses", () => {
+  const cases = [
+    [{ ignores: { "RUSTSEC-26-1.md": GOOD } }, /not a <RUSTSEC-YYYY-NNNN>\.md file/],
+    [{ ignores: { ".gitkeep": "" } }, /not a <RUSTSEC-YYYY-NNNN>\.md file/],
+    [{ ignores: { "RUSTSEC-2026-0001.md": "x.\n" } }, /Drop when/],
+    [{ ignores: { "RUSTSEC-2026-0001.md": "REVIEW BY 2026-02-30\nDrop when x.\n" } }, /not a real date/],
+    [{ ignores: { "RUSTSEC-2026-0001.md": "Review by 2026-11-04\nDrop when x.\n" } }, /REVIEW BY YYYY-MM-DD/],
+    [{ ignores: { "RUSTSEC-2026-0001.md": "see REVIEW\nBY 2026-01-01\nDrop when x.\n" } }, /on one line/],
+    [{ workflows: { "ci.yml": "run: cargo audit $flags --ignore RUSTSEC-2023-0071\n" } }, /inline/],
+    [{ workflows: { "other.yaml": "run: cargo audit --ignore=RUSTSEC-2023-0071\n" } }, /inline/],
+  ];
+  for (const [fixture, want] of cases) {
+    const run = lint(fixture);
+    assert.equal(run.status, 1, JSON.stringify(fixture));
+    assert.match(run.stderr, want, JSON.stringify(fixture));
+  }
+  assert.equal(lint({ ignores: { ".gitkeep": "" } }).flags.status, 1, "the flags script refuses a dotfile too");
+});
+
+test("lint and reader agree on prose that is not a date", () => {
+  const text = "a preview by Bob.\nRe-assess by 2020-01-01.\nwrapped preview\nby Bob.\n\nDrop when x.\n";
+  assert.equal(lint({ ignores: { "RUSTSEC-2026-0001.md": text } }).status, 0);
+  assert.deepEqual(readIgnores([{ name: "RUSTSEC-2026-0001.md", text }]).reviewDates, []);
 });

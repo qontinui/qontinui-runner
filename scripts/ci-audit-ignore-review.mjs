@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 /**
- * ci-audit-ignore-review.mjs — say when a `cargo audit --ignore` in ci.yml's
- * `security` job needs someone to look at it again.
+ * ci-audit-ignore-review.mjs — say when a `cargo audit` ignore needs someone to
+ * look at it again. The ignores are `.github/audit-ignores/<RUSTSEC-id>.md`, one
+ * file per advisory, and ci.yml's `security` job builds its `--ignore` flags from
+ * that directory (scripts/ci/audit-ignore-flags.sh).
  *
  * Two things go wrong with an ignore, and neither reds anything:
  *
- *   1. Its `REVIEW BY <date>` passes. The date is prose in a comment.
+ *   1. Its `REVIEW BY <date>` passes. The date is prose in the ignore's file.
  *   2. It goes STALE: the advisory no longer fires on Cargo.lock, so the flag
  *      matches nothing today and would hide the advisory if the crate came
  *      back. Measured 2026-11-02: RUSTSEC-2026-0118/-0119 had been stale since
@@ -20,7 +22,7 @@
  *
  * Usage:
  *   node scripts/ci-audit-ignore-review.mjs --audit-json <file> --repo <owner/name>
- *        [--ci-yml .github/workflows/ci.yml] [--today YYYY-MM-DD] [--dry-run]
+ *        [--ignores-dir .github/audit-ignores] [--today YYYY-MM-DD] [--dry-run]
  *
  * <file> holds the output of `cargo audit --file Cargo.lock --json` with NO
  * --ignore flags. cargo-audit exits non-zero when a vulnerability fires, so the
@@ -28,7 +30,7 @@
  *
  * Exit codes:
  *   0  read everything; the issue is up to date (or --dry-run printed the plan)
- *   1  could not read: ci.yml's ignores or dates are not in the expected form,
+ *   1  could not read: an ignore file's name or dates are not in the expected form,
  *      the audit report is unusable, or a `gh` call failed. A red run means
  *      "this check is blind". A green run with no issue must keep meaning
  *      "nothing needs review", so every parser here refuses rather than guesses.
@@ -38,52 +40,27 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 export const ISSUE_TITLE = "cargo-audit ignores need review";
 
 const ADVISORY_ID = /^RUSTSEC-\d{4}-\d{4}$/;
-const ADVISORY_ID_IN_TEXT = /\bRUSTSEC-\d{4}-\d{4}\b/g;
-
-function isCommandLine(line) {
-  return /^\s*cargo audit(\s|$)/.test(line);
-}
+const IGNORE_FILE = /^(RUSTSEC-\d{4}-\d{4})\.md$/;
 
 /**
- * The ids on the `cargo audit` command line. Comment lines never match, so a
- * commented-out command cannot stand in for the real one. Only `--file Cargo.lock`
- * (the lock the workflow audits) and `--ignore <id>` are understood, and anything
- * else is refused: an id this cannot see (a `$VAR`, a wrapped line) is an id never
- * checked. No ignores at all is a fine answer, and is what the list looks like once
- * the last one goes.
+ * The advisory id a file in the ignores directory names, or null for the
+ * directory's README.md. Anything else is refused: a file this cannot read as an
+ * ignore is one the `security` job's flags script also refuses, and skipping it
+ * here would review a different list from the one CI applies.
  */
-export function parseIgnores(ciYaml) {
-  const all = ciYaml.split("\n");
-  const lines = all.filter(isCommandLine);
-  if (lines.length !== 1) {
-    throw new Error(`expected exactly one \`cargo audit\` line, found ${lines.length}`);
-  }
-  // A folded `run: >-` carries the command on across lines with no trailing `\`.
-  if (/^\s*--/.test(all[all.indexOf(lines[0]) + 1] ?? "")) {
-    throw new Error("the `cargo audit` command continues onto the next line; keep it on one line");
-  }
-  const tokens = lines[0].trim().split(/\s+/).slice(2);
-  const ids = [];
-  for (let i = 0; i < tokens.length; i += 2) {
-    const [flag, value] = [tokens[i], tokens[i + 1]];
-    if (flag === "--file" && value === "Cargo.lock") continue;
-    if (flag !== "--ignore") {
-      throw new Error(`cannot read \`${flag} ${value ?? ""}\` on the \`cargo audit\` line; only --file Cargo.lock and --ignore <id> are understood`);
-    }
-    if (!ADVISORY_ID.test(value ?? "")) {
-      throw new Error(`\`--ignore\` is followed by \`${value}\`, not a RUSTSEC id`);
-    }
-    ids.push(value);
-  }
-  return [...new Set(ids)];
+export function ignoreIdOf(fileName) {
+  if (fileName === "README.md") return null;
+  const m = IGNORE_FILE.exec(fileName);
+  if (!m) throw new Error(`${fileName} in the ignores directory is not a <RUSTSEC-YYYY-NNNN>.md file`);
+  return m[1];
 }
 
 function isRealDate(text) {
@@ -92,46 +69,55 @@ function isRealDate(text) {
 }
 
 /**
- * Every `REVIEW BY <date>` in the comments of the step holding the command, with
- * the ids of the block it belongs to: the nearest `# --ignore` heading, including
- * the heading's continuation lines. A misspelling of the phrase (`Review by:`,
- * `REVIEW-BY`, a wrapped date) is refused, and so is a date with no heading above
- * it, because reading either as no date would make the date disappear and the issue
- * close itself. Other wording (`Re-assess by <date>`) is prose and is not read: this
- * block legitimately holds other dates, so a date alone cannot mean a deadline.
+ * Every `REVIEW BY <date>` in one ignore file's body, each tied to that file's
+ * advisory. A misspelling of the phrase (`Review by:`, `REVIEW-BY`, a wrapped
+ * date) is refused, because reading it as no date would make the date disappear
+ * and the issue close itself. Other wording (`Re-assess by <date>`) is prose and
+ * is not read: a body legitimately holds other dates, so a date alone cannot mean
+ * a deadline.
  */
-export function parseReviewDates(ciYaml) {
-  const lines = ciYaml.split("\n");
-  const command = lines.findIndex(isCommandLine);
-  if (command < 0) throw new Error("no `cargo audit` line");
-  const start = lines.slice(0, command).findLastIndex((l) => /^\s*- \w+:/.test(l)) + 1;
-  const refuse = (i) =>
-    new Error(`ci.yml:${i + 1} mentions a review date but not as \`REVIEW BY YYYY-MM-DD\` under a \`# --ignore\` heading`);
+export function parseReviewDates(id, text) {
+  if (!ADVISORY_ID.test(id)) throw new Error(`\`${id}\` is not a RUSTSEC id`);
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
   const out = [];
-  let ids = [];
-  let inHeading = false;
-  for (let i = start; i < command; i += 1) {
+  for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
-    const isComment = /^\s*#/.test(line);
-    // Ids before the first colon only: what follows it is prose, and may cite others.
-    const named = (l) => l.split(":")[0].match(ADVISORY_ID_IN_TEXT) ?? [];
-    if (/^\s*#\s*--ignore\s+RUSTSEC-/.test(line)) {
-      ids = named(line);
-      inHeading = true;
-    } else if (inHeading && /^\s*#\s*\+\s*RUSTSEC-/.test(line)) {
-      ids = [...ids, ...named(line)];
-    } else {
-      inHeading = false;
-    }
-    if (!isComment) continue;
     const mentions = [...line.matchAll(/\breview[\s_-]*by\b/gi)].length;
     const dates = [...line.matchAll(/\bREVIEW BY (\d{4}-\d{2}-\d{2})(?![-\d])/g)].map((m) => m[1]);
-    const wrapped = /\breview\s*$/i.test(line) && /^\s*#\s*by\b/i.test(lines[i + 1] ?? "");
-    if (wrapped || mentions !== dates.length || !dates.every(isRealDate)) throw refuse(i);
-    if (dates.length && !ids.length) throw refuse(i);
-    for (const date of dates) out.push({ date, ids });
+    const wrapped = /\breview\s*$/i.test(line) && /^\s*by\b/i.test(lines[i + 1] ?? "");
+    if (wrapped || mentions !== dates.length || !dates.every(isRealDate)) {
+      throw new Error(`${id}.md:${i + 1} mentions a review date but not as \`REVIEW BY YYYY-MM-DD\``);
+    }
+    for (const date of dates) out.push({ date, ids: [id] });
   }
   return out;
+}
+
+/**
+ * The ignores and their review dates, from the directory `ci.yml`'s `security`
+ * job builds its `--ignore` flags from (`.github/audit-ignores/<id>.md`, one file
+ * per advisory). `files` is `[{ name, text }]`, so this stays pure; `main` reads
+ * the directory. No ignores at all is a fine answer, and is what the directory
+ * looks like once the last one goes.
+ */
+export function readIgnores(files) {
+  const ignores = [];
+  const reviewDates = [];
+  for (const { name, text } of [...files].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
+    const id = ignoreIdOf(name);
+    if (id === null) continue;
+    ignores.push(id);
+    reviewDates.push(...parseReviewDates(id, text));
+  }
+  return { ignores, reviewDates };
+}
+
+/** `[{ name, text }]` for every entry of `dir`; a sub-directory is refused. */
+export function readIgnoresDir(dir) {
+  return readdirSync(dir, { withFileTypes: true }).map((entry) => {
+    if (!entry.isFile()) throw new Error(`${entry.name} in ${dir} is not a file`);
+    return { name: entry.name, text: readFileSync(join(dir, entry.name), "utf8") };
+  });
 }
 
 /**
@@ -192,15 +178,15 @@ export function renderBody({ expired, stale }) {
   if (expired.length) {
     parts.push(
       "## `REVIEW BY` date passed\n\n" +
-        "Re-check the justification in the `security` job's comment block in `ci.yml`. " +
-        "Then drop the ignore, or set a new date and say what you checked.\n\n" +
+        "Re-check the justification in `.github/audit-ignores/<id>.md`. " +
+        "Then drop the ignore (delete the file), or set a new date and say what you checked.\n\n" +
         expired.map((r) => `- ${r.date}: ${r.ids.join(", ")}`).join("\n"),
     );
   }
   if (stale.length) {
     parts.push(
       "## Ignored, but no longer firing on `Cargo.lock`\n\n" +
-        "Remove the `--ignore` and its comment. A leftover flag matches nothing " +
+        "Delete its `.github/audit-ignores/<id>.md`. A leftover ignore matches nothing " +
         "today and would hide the advisory if the crate came back.\n\n" +
         stale.map((id) => `- ${id}`).join("\n"),
     );
@@ -296,7 +282,7 @@ function main(argv) {
       args: argv,
       options: {
         "audit-json": { type: "string" },
-        "ci-yml": { type: "string", default: ".github/workflows/ci.yml" },
+        "ignores-dir": { type: "string", default: ".github/audit-ignores" },
         repo: { type: "string" },
         today: { type: "string", default: new Date().toISOString().slice(0, 10) },
         "dry-run": { type: "boolean", default: false },
@@ -309,16 +295,16 @@ function main(argv) {
   if (!values["audit-json"] || !values.repo || !isRealDate(values.today)) {
     process.stderr.write(
       "Usage: ci-audit-ignore-review.mjs --audit-json <file> --repo <owner/name> " +
-        "[--ci-yml <file>] [--today YYYY-MM-DD] [--dry-run]\n",
+        "[--ignores-dir <dir>] [--today YYYY-MM-DD] [--dry-run]\n",
     );
     return 2;
   }
   try {
     // Everything local is read first, so a blind run never touches GitHub.
-    const ciYaml = readFileSync(values["ci-yml"], "utf8");
+    const { ignores, reviewDates } = readIgnores(readIgnoresDir(values["ignores-dir"]));
     const problems = findProblems({
-      ignores: parseIgnores(ciYaml),
-      reviewDates: parseReviewDates(ciYaml),
+      ignores,
+      reviewDates,
       fired: firedAdvisories(readReport(values["audit-json"])),
       today: values.today,
     });

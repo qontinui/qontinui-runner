@@ -1,8 +1,9 @@
 name: audit ignore review
 
-# Says when a `cargo audit --ignore` in ci.yml's `security` job needs another
-# look: its `REVIEW BY` date passed, or the advisory stopped firing on
-# Cargo.lock. scripts/ci-audit-ignore-review.mjs upserts one issue for it.
+# Says when a `cargo audit` ignore (`.github/audit-ignores/<id>.md`, one file
+# per advisory, from which ci.yml's `security` job builds its `--ignore` flags)
+# needs another look: its `REVIEW BY` date passed, or the advisory stopped
+# firing on Cargo.lock. scripts/ci-audit-ignore-review.mjs upserts one issue for it.
 #
 # THE NIGHTLY GATES NOTHING, deliberately. A check on a date reds with no change
 # in the tree, and it would red every open PR at once. That is the failure the
@@ -10,10 +11,12 @@ name: audit ignore review
 # and it is not worth copying to enforce a comment. A red nightly means only that
 # the check is blind: see the script's exit codes.
 #
-# The unit tests can red a PR, but only one that edits this tool or ci.yml, and
-# never because of the date. ci.yml is in `paths` because the script parses it,
-# and a PR that rewrites the command or a date's form should find out there
-# rather than from a blind nightly.
+# The unit tests can red a PR, but only one that edits this tool or the ignores,
+# and never because of the date. `.github/audit-ignores/**` is in `paths`
+# because the script reads it (the unit tests read the real directory), and a
+# PR that adds a misnamed file or misspells a date should find out there rather
+# than from a blind nightly. The flags script is in `paths` too, and the unit
+# job runs its lint, because it is the other reader of that directory.
 #
 # Trigger posture follows flake-escalation.yml: a daily schedule because this is
 # a repo-level fact rather than a verdict on one branch, a dispatch with
@@ -41,7 +44,9 @@ on:
       - scripts/ci-audit-ignore-review.mjs
       - scripts/__tests__/ci-audit-ignore-review.test.mjs
       - .github/workflows/audit-ignore-review.yml
-      - .github/workflows/ci.yml
+      - .github/audit-ignores/**
+      - scripts/ci/audit-ignore-flags.sh
+      - scripts/ci/audit-ignores-test.sh
 
 permissions:
   contents: read
@@ -66,6 +71,7 @@ jobs:
         run: |
           node --version
           node --test scripts/__tests__/ci-audit-ignore-review.test.mjs
+          bash scripts/ci/audit-ignores-test.sh
 
   audit:
     name: Audit Cargo.lock with no ignores
@@ -82,7 +88,7 @@ jobs:
           set -euo pipefail
           # --locked for the reason given in ci.yml's `security` job.
           cargo install cargo-audit --locked
-          # Unlike that job, this passes no --ignore: it is measuring which
+          # Unlike that job, this passes no ignore flags: it is measuring which
           # ignores still fire. So it exits non-zero on most days, and the
           # script is what decides whether the report is usable.
           # --file reads the lockfile alone, so no sibling checkout is needed.
