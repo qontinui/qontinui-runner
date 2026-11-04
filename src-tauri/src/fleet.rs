@@ -114,7 +114,7 @@ pub struct Resources {
 // same table coord pins; keep the two in step.
 
 /// MiB of RAM one interactive agent session is charged.
-const SESSION_COST_MEM_MIB: u32 = 1024;
+const SESSION_COST_MEM_MIB: u32 = 512;
 /// Milli-cores one interactive session is charged.
 const SESSION_COST_CPU_MILLI: u32 = 200;
 /// GiB no session may eat into (OS, runner, proxies).
@@ -131,18 +131,103 @@ fn derive_max_builds(memory_gb: u32, cpu_cores: u32) -> u32 {
 
 /// How many concurrent agent sessions this machine can carry:
 /// `max(MIN_DEVICE_AGENTS, min(mem_term, cpu_term))`, where
-/// `mem_term = (memory_gb − 8 − builds × 4) / 1 GiB` and
+/// `mem_term = (memory_gb − 8 − builds × 4 − ci_reserved_gib) / 0.5 GiB` and
 /// `cpu_term = (cpu_cores − max(2, ceil(cores / 10))) / 0.2`.
-pub fn derive_max_agents(memory_gb: u32, cpu_cores: u32) -> u32 {
+pub fn derive_max_agents(memory_gb: u32, cpu_cores: u32, ci_reserved_gib: u32) -> u32 {
     let build_reserve = derive_max_builds(memory_gb, cpu_cores).saturating_mul(BUILD_MEM_GIB);
     let session_mem_gib = memory_gb
         .saturating_sub(OS_RESERVE_GIB)
-        .saturating_sub(build_reserve);
+        .saturating_sub(build_reserve)
+        .saturating_sub(ci_reserved_gib);
     let mem_term = u64::from(session_mem_gib) * 1024 / u64::from(SESSION_COST_MEM_MIB);
     let session_cores = cpu_cores.saturating_sub(cpu_cores.div_ceil(10).max(2));
     let cpu_term = u64::from(session_cores) * 1000 / u64::from(SESSION_COST_CPU_MILLI);
     let derived = mem_term.min(cpu_term).min(u64::from(u32::MAX)) as u32;
     derived.max(MIN_DEVICE_AGENTS)
+}
+
+/// GiB one CI job slot is charged off Linux, where no cgroup bound can be read:
+/// the 16 GB size of the hosted runner the CI jobs are written for (coord's
+/// `fleet_placement::C1_SLOT_MEM_GIB`).
+const CI_JOB_MEM_GIB: u32 = 16;
+
+/// What this host's cgroup tree says CI may take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CiReservation {
+    /// The sum of each `ci.slice/*.slice` bound, rounded UP to a GiB; `0` when
+    /// the host has no `ci.slice`.
+    Bounded(u32),
+    /// A CI slice exists with neither `memory.high` nor `memory.max` set, so
+    /// CI may take the whole box: the reservation is UNKNOWN, never zero.
+    Unbounded,
+    /// No unified cgroup v2 tree to read (Windows, macOS, cgroup v1).
+    NoCgroup,
+}
+
+/// A slice's memory bound in bytes: `memory.high` when numeric, else
+/// `memory.max` when numeric. cgroup v2 spells "no limit" as `max`.
+fn slice_bound_bytes(dir: &std::path::Path) -> Option<u64> {
+    ["memory.high", "memory.max"].iter().find_map(|f| {
+        std::fs::read_to_string(dir.join(f))
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
+}
+
+/// [`CiReservation`] read from a cgroup v2 root (`/sys/fs/cgroup` in
+/// production; a fixture directory in tests).
+pub(crate) fn ci_reservation_from_root(root: &std::path::Path) -> CiReservation {
+    if !root.join("cgroup.controllers").exists() {
+        return CiReservation::NoCgroup;
+    }
+    let ci = root.join("ci.slice");
+    if !ci.is_dir() {
+        return CiReservation::Bounded(0);
+    }
+    let mut children: Vec<std::path::PathBuf> = std::fs::read_dir(&ci)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_dir() && p.extension().is_some_and(|x| x == "slice"))
+                .collect()
+        })
+        .unwrap_or_default();
+    children.sort();
+    let total: Option<u64> = if children.is_empty() {
+        slice_bound_bytes(&ci)
+    } else {
+        children
+            .iter()
+            .map(|c| slice_bound_bytes(c))
+            .try_fold(0u64, |acc, b| b.map(|b| acc.saturating_add(b)))
+    };
+    match total {
+        Some(bytes) => {
+            let gib = bytes.div_ceil(1024 * 1024 * 1024);
+            CiReservation::Bounded(gib.min(u64::from(u32::MAX)) as u32)
+        }
+        None => CiReservation::Unbounded,
+    }
+}
+
+/// This host's [`CiReservation`].
+fn probe_ci_reservation() -> CiReservation {
+    if cfg!(target_os = "linux") {
+        ci_reservation_from_root(std::path::Path::new("/sys/fs/cgroup"))
+    } else {
+        CiReservation::NoCgroup
+    }
+}
+
+/// The `ci_reserved_gib` this runner publishes: the cgroup bound on Linux,
+/// the CI job slots × [`CI_JOB_MEM_GIB`] where no cgroup can be read, and
+/// `None` (omitted, so coord keeps its last stored agent count) when a CI
+/// slice is unbounded.
+fn published_ci_reserved_gib(reservation: CiReservation, ci_jobs: u32) -> Option<u32> {
+    match reservation {
+        CiReservation::Bounded(gib) => Some(gib),
+        CiReservation::Unbounded => None,
+        CiReservation::NoCgroup => Some(ci_jobs.saturating_mul(CI_JOB_MEM_GIB)),
+    }
 }
 
 /// Detect cpu_cores / memory_gb / disk_total_gb on the current host.
@@ -687,6 +772,12 @@ struct DeviceBudgetRequest {
     disk_total_gb: i64,
     disk_reserved_gb: i64,
     max_concurrent_agents: i32,
+    /// GiB of host memory this host's CI may take ([`published_ci_reserved_gib`]).
+    /// coord derives the stored `max_concurrent_agents` from it, and OMITTED
+    /// (an unbounded CI slice) means "unknown": coord then keeps its last
+    /// stored value rather than reading CI as zero.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    ci_reserved_gib: Option<u32>,
     /// CI job slots — the column this runner unambiguously owns, read only by
     /// coord's `ci_dispatch` for devices advertising the `ci_node` capability.
     ///
@@ -923,7 +1014,14 @@ fn build_budget_request(
     disk_reserved_gb: u64,
     ci: &crate::settings::CiNodeSettings,
     host: crate::ci_node::host_sizing::HostCapacity,
+    ci_reservation: CiReservation,
 ) -> DeviceBudgetRequest {
+    let ci_jobs = if ci.enabled {
+        ci.configured_or_suggested_builds(host)
+    } else {
+        0
+    };
+    let ci_reserved_gib = published_ci_reserved_gib(ci_reservation, ci_jobs);
     DeviceBudgetRequest {
         hostname: hostname.to_string(),
         cpu_cores: resources.cpu_cores.min(i32::MAX as u32) as i32,
@@ -931,9 +1029,16 @@ fn build_budget_request(
         disk_total_gb: resources.disk_total_gb.min(i64::MAX as u64) as i64,
         disk_reserved_gb: disk_reserved_gb.min(i64::MAX as u64) as i64,
         max_concurrent_agents: match role {
-            MachineRole::Agent => derive_max_agents(resources.memory_gb, resources.cpu_cores) as i32,
+            // Advisory: coord stores its own derivation (and keeps its last
+            // stored value when `ci_reserved_gib` is omitted).
+            MachineRole::Agent => derive_max_agents(
+                resources.memory_gb,
+                resources.cpu_cores,
+                ci_reserved_gib.unwrap_or(0),
+            ) as i32,
             MachineRole::Build => 0,
         },
+        ci_reserved_gib,
         // `ci.max_concurrent_builds` is the RUNNER-LOCAL settings key
         // (`ci_node.max_concurrent_builds`; unset ⇒ the host suggestion for
         // `host`) — resolved through the same accessor `ci_node/admission.rs`
@@ -942,11 +1047,7 @@ fn build_budget_request(
         // the split is about which coord COLUMN carries the number, not about
         // what the node calls its own capacity. `host` is passed in rather than
         // probed here so this function stays pure over its arguments.
-        max_concurrent_ci_jobs: if ci.enabled {
-            ci.configured_or_suggested_builds(host).min(i32::MAX as u32) as i32
-        } else {
-            0
-        },
+        max_concurrent_ci_jobs: ci_jobs.min(i32::MAX as u32) as i32,
     }
 }
 
@@ -1019,6 +1120,7 @@ pub async fn publish_budget(
         disk_reserved_gb,
         &ci,
         crate::ci_node::host_sizing::probe(),
+        probe_ci_reservation(),
     );
 
     // Cache the payload regardless of whether the POST succeeds — this is
@@ -7396,6 +7498,7 @@ mod tests {",
             0,
             ci,
             test_host(),
+            CiReservation::Bounded(0),
         ))
         .expect("budget payload must serialize")
     }
@@ -7435,7 +7538,7 @@ mod tests {",
         // fix inverts into the mirror-image outage.
         assert_eq!(
             json.get("max_concurrent_agents").and_then(|v| v.as_i64()),
-            Some(derive_max_agents(32, 8) as i64),
+            Some(derive_max_agents(32, 8, 0) as i64),
             "the runner owns the agent cap and must keep publishing it"
         );
         // Machine-resource fields describe the BOX, not this process — both
@@ -7472,6 +7575,7 @@ mod tests {",
                     0,
                     &ci_settings(enabled, 2),
                     test_host(),
+                    CiReservation::Bounded(0),
                 ))
                 .expect("budget payload must serialize");
                 assert!(
@@ -7942,21 +8046,89 @@ mod tests {",
     /// (`derive_agent_capacity_matches_plan_examples`).
     #[test]
     fn derive_max_agents_examples() {
-        for (name, mem, cores, want) in [
-            ("nawa / nilan", 503, 128, 367),
-            ("merytshost", 368, 48, 215),
-            ("spaceship", 125, 32, 85),
-            ("2024dell", 95, 32, 55),
-            ("64 GB desktop, 16 threads", 64, 16, 40),
-            ("2020Dell", 63, 20, 35),
-            ("monster", 31, 8, 15),
-            ("MSI", 31, 16, 7),
-            ("16 GB laptop, 8 threads", 16, 8, 3),
-            ("nomad", 15, 8, 3),
-            ("empty", 0, 0, 3),
+        for (name, mem, cores, ci, want) in [
+            ("nawa", 503, 128, 327, 80),
+            ("nilan", 503, 128, 231, 272),
+            ("merytshost", 368, 48, 200, 215),
+            ("64 GB desktop, 16 threads, no CI", 64, 16, 0, 70),
+            ("monster", 31, 8, 0, 30),
+            ("MSI", 31, 16, 0, 14),
+            ("16 GB laptop, 8 threads", 16, 8, 0, 3),
+            ("nomad", 15, 8, 0, 3),
+            ("empty", 0, 0, 0, 3),
         ] {
-            assert_eq!(derive_max_agents(mem, cores), want, "{name}");
+            assert_eq!(derive_max_agents(mem, cores, ci), want, "{name}");
         }
+    }
+
+    fn cgroup_fixture(slices: &[(&str, &str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("cgroup.controllers"), "memory cpu\n").unwrap();
+        for (name, high, max) in slices {
+            let p = dir.path().join(name);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("memory.high"), format!("{high}\n")).unwrap();
+            std::fs::write(p.join("memory.max"), format!("{max}\n")).unwrap();
+        }
+        dir
+    }
+
+    /// nawa's tree as read 2026-11-04: `ci-runners.slice` high 230.4 GiB,
+    /// `ci-winvm.slice` high `max` / max 96 GiB -> 327 GiB (rounded up).
+    #[test]
+    fn ci_reservation_sums_each_slice_high_else_max() {
+        let d = cgroup_fixture(&[
+            ("ci.slice", "max", "max"),
+            ("ci.slice/ci-runners.slice", "247389487104", "274877906944"),
+            ("ci.slice/ci-winvm.slice", "max", "103079215104"),
+        ]);
+        assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Bounded(327));
+    }
+
+    #[test]
+    fn an_unbounded_ci_slice_is_unknown_and_omitted() {
+        let d = cgroup_fixture(&[
+            ("ci.slice", "max", "max"),
+            ("ci.slice/ci-runners.slice", "247389487104", "max"),
+            ("ci.slice/ci-other.slice", "max", "max"),
+        ]);
+        assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Unbounded);
+        assert_eq!(published_ci_reserved_gib(CiReservation::Unbounded, 4), None);
+    }
+
+    #[test]
+    fn no_ci_slice_is_zero_and_no_cgroup_falls_back_to_ci_jobs() {
+        let d = cgroup_fixture(&[]);
+        assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Bounded(0));
+        let bare = tempfile::tempdir().unwrap();
+        assert_eq!(ci_reservation_from_root(bare.path()), CiReservation::NoCgroup);
+        assert_eq!(published_ci_reserved_gib(CiReservation::NoCgroup, 2), Some(32));
+        assert_eq!(published_ci_reserved_gib(CiReservation::NoCgroup, 0), Some(0));
+    }
+
+    #[test]
+    fn budget_payload_omits_an_unknown_ci_reservation() {
+        let ci = ci_settings(false, 2);
+        let mk = |r| {
+            serde_json::to_value(build_budget_request(
+                "test-host",
+                MachineRole::Agent,
+                Resources {
+                    cpu_cores: 128,
+                    memory_gb: 503,
+                    disk_total_gb: 1000,
+                },
+                0,
+                &ci,
+                test_host(),
+                r,
+            ))
+            .unwrap()
+        };
+        let known = mk(CiReservation::Bounded(327));
+        assert_eq!(known["ci_reserved_gib"].as_i64(), Some(327));
+        assert_eq!(known["max_concurrent_agents"].as_i64(), Some(80));
+        assert!(mk(CiReservation::Unbounded).get("ci_reserved_gib").is_none());
     }
 
     #[test]
