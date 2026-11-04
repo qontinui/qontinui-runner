@@ -200,7 +200,10 @@ mod tests {
         assert!(BootStage::ApiRouterBuild > BootStage::SetupComplete);
         assert!(BootStage::SetupComplete > BootStage::ApiServerSpawn);
         assert!(BootStage::ApiListenerBound > BootStage::ApiBindLoop);
-        // Process-global, so only assert monotonicity of what this test adds.
+        // `FURTHEST` / `REACHED_AT_MS` are process-globals shared with every
+        // other test in this binary, and nothing resets them: this test only
+        // asserts what its own stamps guarantee (>=, is_some), never an exact
+        // value another test's stamp could move.
         stamp(BootStage::ApiRouterBuild);
         stamp(BootStage::SetupComplete);
         assert!(furthest() >= BootStage::ApiRouterBuild);
