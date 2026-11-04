@@ -1042,6 +1042,37 @@ impl PgDb {
         }
     }
 
+    /// Delete the task `id` ONLY while it still carries exactly this managed
+    /// key. Returns whether a row was deleted. The coord reconciler's one
+    /// delete path (plan 2026-10-29 D5): keyed on the managed columns as well
+    /// as the id, so an unmanaged task — or one re-keyed since it was read —
+    /// can never be deleted by it. History is cascade-deleted by FK.
+    pub async fn delete_managed_scheduled_task(
+        &self,
+        id: &str,
+        source: &str,
+        tenant_id: &str,
+        agent: &str,
+    ) -> Result<bool, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM scheduled_tasks \
+                 WHERE id = $1 \
+                   AND managed_source = $2 \
+                   AND managed_tenant_id = ($3::text)::uuid \
+                   AND managed_agent = $4",
+                &[&id, &source, &tenant_id, &agent],
+            )
+            .await
+            .map_err(|e| format!("PG delete_managed_scheduled_task {id}: {e}"))?;
+        Ok(deleted == 1)
+    }
+
     // ========================================================================
     // Execution helpers (single-column updates)
     // ========================================================================
