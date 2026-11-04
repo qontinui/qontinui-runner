@@ -15,9 +15,12 @@ import type { PastSession } from "./usePastSessions";
 
 /**
  * Close reasons recorded so that a restore does NOT pick the session up again
- * (Rust `NON_RESTORABLE_CLOSE_REASONS`, session_lifecycle_store.rs).
+ * (Rust `NON_RESTORABLE_CLOSE_REASONS`, session_lifecycle_store.rs). A hand
+ * copy: `unfinishedSessions.test.ts` reads the Rust constant and fails when the
+ * two disagree, so a reason added there cannot leave this list offering a
+ * Resume for a session the runner deliberately does not restore.
  */
-const NON_RESTORABLE_CLOSE_REASONS: ReadonlySet<string> = new Set([
+export const NON_RESTORABLE_CLOSE_REASONS: ReadonlySet<string> = new Set([
   "no-terminal",
   "never-started",
   "terminal-only-idle",
