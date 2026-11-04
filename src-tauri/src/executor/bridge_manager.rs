@@ -412,18 +412,27 @@ impl BridgeManager {
         let removed = take_for_removal_in(&self.bridges, &bid)?;
 
         if let Some((managed, mut bridge)) = removed {
-            // Stop the bridge (async), owned, with no std guard held.
-            if let Err(e) = bridge.stop().await {
-                warn!("Error stopping bridge {}: {}", bridge_id, e);
-            }
-            drop(bridge);
-
-            // Remove run ID mapping
+            // Remove the run ID mapping BEFORE any await, so a cancelled removal
+            // cannot leave a run id pointing at a bridge that is gone.
             if let Some(ref run_id) = managed.run_id {
                 let mut run_map = self.run_id_map.write().unwrap();
                 run_map.remove(run_id);
             }
 
+            // Stop the bridge (async), owned, with no std guard held. If this
+            // future is cancelled here, dropping `bridge` runs
+            // `PythonBridge::drop` -> `stop_sync`, which kills the process.
+            if let Err(e) = bridge.stop().await {
+                warn!("Error stopping bridge {}: {}", bridge_id, e);
+            }
+            drop(bridge);
+
+            // TODO(wedge-plan phase 3 review N3): a removal cancelled during the
+            // stop above never reaches this release, so the GUI lock stays held
+            // by a removed bridge until something force-releases it. Releasing
+            // it before the stop instead would let a new GUI bridge start while
+            // the old process is still shutting down; that trade wants its own
+            // decision.
             // Release GUI lock if held
             if managed.mode == BridgeMode::Gui {
                 self.gui_lock.release(&bid).await;
