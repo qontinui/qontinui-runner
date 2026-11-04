@@ -126,6 +126,19 @@ fn clear_held_slot(agent_id: &str) -> Option<HeldSlot> {
     guard.as_mut().and_then(|m| m.remove(agent_id))
 }
 
+/// Last observed `(running, tab_alive, idle, cadence_elapsed)` per agent, for
+/// edge-triggered tick-state logging (see [`log_tick_state`]).
+#[allow(clippy::type_complexity)]
+static LAST_TICK_STATE: Mutex<Option<HashMap<String, (bool, bool, bool, bool)>>> = Mutex::new(None);
+
+/// When each agent last got the "cadence elapsed but the tab never looks idle"
+/// warning, so a stuck gate is reported every [`STUCK_IDLE_WARN_EVERY_MS`], not
+/// every 5s tick.
+static LAST_STUCK_IDLE_WARN: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
+
+/// Re-warn interval for a tab that is overdue for a nudge but not idle.
+const STUCK_IDLE_WARN_EVERY_MS: i64 = 10 * 60 * 1000;
+
 /// Last-logged effective posture per agent, so the posture line is
 /// edge-triggered rather than emitted every 5s tick (the same
 /// log-only-on-transition discipline `fleet_policy_poller` uses).
@@ -681,6 +694,19 @@ async fn supervise_one(
         relaunch_every_cycles: rec.def.lifecycle_policy.relaunch_every_cycles,
     };
 
+    log_tick_state(
+        &rec.def.id,
+        &input,
+        live.is_some(),
+        overdue_ms(
+            now_ms,
+            rec.runtime.last_cycle_started_at_ms,
+            rec.def.cadence_secs,
+        ),
+        rec.def.cadence_secs,
+        now_ms,
+    );
+
     // See [`spawn_streak_clears`]: the streak clears only once a spawn has
     // proven itself, never at spawn time.
     if spawn_streak_clears(liveness, input.spawn_grace_elapsed) {
@@ -1068,6 +1094,136 @@ async fn reconcile_slot_lease(
         }
     }
     false
+}
+
+/// Make the nudge gate observable. Without this a tab that is overdue for its
+/// next cycle but never looks idle (a processing indicator or spinner glyph on
+/// screen, no `❯` prompt row, or a dialog — see `looping_agent::idle` and
+/// [`nudge_safe_idle`]) produces no log line at all, so "no further cycles"
+/// cannot be told apart from "the agent is disabled".
+///
+/// Edge-triggered at info on any change of
+/// `(running, tab_alive, idle, cadence_elapsed)` ([`tick_state_changed`]), plus a rate-limited warn
+/// ([`stuck_idle_warn_due`]) once a probed tab has been held back by the idle
+/// gate alone for a long time.
+fn log_tick_state(
+    agent_id: &str,
+    input: &TickInput,
+    probed: bool,
+    overdue_ms: Option<i64>,
+    cadence_secs: u64,
+    now_ms: i64,
+) {
+    if let Some((running, tab_alive, idle, cadence_elapsed)) =
+        tick_state_changed(&LAST_TICK_STATE, agent_id, input)
+    {
+        info!(
+            agent = %agent_id,
+            running,
+            tab_alive,
+            idle,
+            cadence_elapsed,
+            "looping_agent_supervisor: tick state changed"
+        );
+    }
+    if stuck_idle_warn_due(
+        &LAST_STUCK_IDLE_WARN,
+        agent_id,
+        input,
+        probed,
+        overdue_ms,
+        now_ms,
+    ) {
+        warn!(
+            agent = %agent_id,
+            cadence_secs,
+            overdue_secs = overdue_ms.map(|ms| ms / 1000),
+            "looping_agent_supervisor: next cycle is overdue but the tab has not looked idle \
+             (processing text / spinner on screen, no input prompt row, or a dialog) — \
+             not nudging"
+        );
+    }
+}
+
+/// The agent's `(running, tab_alive, idle, cadence_elapsed)` when it differs
+/// from the last tick's (recording it in `memo`), `None` when unchanged. A stopped agent is
+/// recorded with `idle` and `cadence_elapsed` folded to `false`: `decide` never
+/// acts on them, so their flips are not news.
+#[allow(clippy::type_complexity)]
+fn tick_state_changed(
+    memo: &Mutex<Option<HashMap<String, (bool, bool, bool, bool)>>>,
+    agent_id: &str,
+    input: &TickInput,
+) -> Option<(bool, bool, bool, bool)> {
+    let running = input.enabled && input.desired_running;
+    let state = (
+        running,
+        input.tab_alive,
+        running && input.idle,
+        running && input.cadence_elapsed,
+    );
+    let mut guard = memo.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    if map.get(agent_id) == Some(&state) {
+        return None;
+    }
+    map.insert(agent_id.to_string(), state);
+    Some(state)
+}
+
+/// How long past its cadence the next cycle is: `now - (last start + cadence)`.
+/// `None` when no cycle has started yet (the first cycle has no due time).
+fn overdue_ms(
+    now_ms: i64,
+    last_cycle_started_at_ms: Option<i64>,
+    cadence_secs: u64,
+) -> Option<i64> {
+    last_cycle_started_at_ms.map(|t| {
+        now_ms
+            .saturating_sub(t)
+            .saturating_sub((cadence_secs as i64).saturating_mul(1000))
+    })
+}
+
+/// Whether the "overdue but not idle" warning fires this tick.
+///
+/// Only on the exact branch where [`policy::decide`] withholds a nudge because
+/// of `idle` alone (running, live tab past its spawn grace, cadence elapsed,
+/// not idle), only for a tab whose grid was actually probed (a pending restore
+/// reads `tab_alive` with nothing to probe), and only once the cycle is
+/// [`STUCK_IDLE_WARN_EVERY_MS`] past due, so an ordinary turn that runs past
+/// its cadence is not reported. At most once per that interval per agent; the
+/// memo is cleared whenever the condition stops holding, so a new stuck
+/// episode is reported on its own schedule.
+fn stuck_idle_warn_due(
+    memo: &Mutex<Option<HashMap<String, i64>>>,
+    agent_id: &str,
+    input: &TickInput,
+    probed: bool,
+    overdue_ms: Option<i64>,
+    now_ms: i64,
+) -> bool {
+    let idle_gate_holds = input.enabled
+        && input.desired_running
+        && input.tab_alive
+        && input.spawn_grace_elapsed
+        && input.cadence_elapsed
+        && !input.idle;
+    let long_overdue = overdue_ms.is_some_and(|ms| ms >= STUCK_IDLE_WARN_EVERY_MS);
+    let mut guard = memo.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    if !(idle_gate_holds && probed && long_overdue) {
+        map.remove(agent_id);
+        return false;
+    }
+    let due = map
+        .get(agent_id)
+        // A wall clock stepped backwards re-arms rather than silencing.
+        .is_none_or(|at| now_ms < *at || now_ms - *at >= STUCK_IDLE_WARN_EVERY_MS);
+    if due {
+        map.insert(agent_id.to_string(), now_ms);
+    }
+    due
 }
 
 /// Edge-triggered posture logging: emit a line only when an agent's effective
@@ -1534,6 +1690,189 @@ mod nudge_and_exit_tests {
 
     fn lines(rows: &[&str]) -> Vec<String> {
         rows.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn tick(tab_alive: bool, idle: bool, cadence_elapsed: bool) -> TickInput {
+        TickInput {
+            enabled: true,
+            desired_running: true,
+            tab_alive,
+            ever_spawned: true,
+            spawn_backoff_elapsed: true,
+            spawn_grace_elapsed: true,
+            idle,
+            context_low: false,
+            cadence_elapsed,
+            cycles_since_relaunch: 1,
+            relaunch_every_cycles: 10,
+        }
+    }
+
+    /// The "overdue but not idle" warning fires only on the branch where the
+    /// idle gate alone withholds the nudge, for a probed tab that is long
+    /// overdue, and then at most once per interval per agent.
+    #[test]
+    fn the_stuck_idle_warning_is_rate_limited_and_only_for_a_long_overdue_busy_tab() {
+        let memo = Mutex::new(None);
+        let long = Some(STUCK_IDLE_WARN_EVERY_MS);
+        let stuck = tick(true, false, true);
+        let due = |input: &TickInput, probed: bool, overdue: Option<i64>, now: i64| {
+            stuck_idle_warn_due(&memo, "a", input, probed, overdue, now)
+        };
+        // Not the idle gate: idle, cadence not elapsed, no live tab.
+        assert!(!due(&tick(true, true, true), true, long, 0));
+        assert!(!due(&tick(true, false, false), true, long, 0));
+        assert!(!due(&tick(false, false, true), true, long, 0));
+        // Disabled / stopped agents are left alone on purpose.
+        assert!(!due(
+            &TickInput {
+                enabled: false,
+                ..stuck
+            },
+            true,
+            long,
+            0
+        ));
+        assert!(!due(
+            &TickInput {
+                desired_running: false,
+                ..stuck
+            },
+            true,
+            long,
+            0
+        ));
+        // Still inside the spawn grace: the grace, not idle, holds the nudge.
+        assert!(!due(
+            &TickInput {
+                spawn_grace_elapsed: false,
+                ..stuck
+            },
+            true,
+            long,
+            0
+        ));
+        // A pending restore reads tab_alive with no grid to probe.
+        assert!(!due(&stuck, false, long, 0));
+        // An ordinary turn running a little past its cadence is not reported,
+        // nor is an agent with no cycle started yet.
+        assert!(!due(&stuck, true, Some(STUCK_IDLE_WARN_EVERY_MS - 1), 0));
+        assert!(!due(&stuck, true, None, 0));
+        // First long-overdue tick warns; later ticks inside the interval do not.
+        assert!(due(&stuck, true, long, 1_000));
+        assert!(!due(&stuck, true, long, 6_000));
+        assert!(!due(
+            &stuck,
+            true,
+            long,
+            1_000 + STUCK_IDLE_WARN_EVERY_MS - 1
+        ));
+        // Another agent is tracked separately.
+        assert!(stuck_idle_warn_due(&memo, "b", &stuck, true, long, 6_000));
+        // Once the interval has passed, it warns again.
+        assert!(due(&stuck, true, long, 1_000 + STUCK_IDLE_WARN_EVERY_MS));
+        // Leaving the stuck state clears the memo, so a new episode warns at
+        // once instead of waiting out the old interval.
+        assert!(!due(
+            &tick(true, true, true),
+            true,
+            long,
+            1_000 + STUCK_IDLE_WARN_EVERY_MS + 5
+        ));
+        assert!(due(
+            &stuck,
+            true,
+            long,
+            1_000 + STUCK_IDLE_WARN_EVERY_MS + 10
+        ));
+    }
+
+    #[test]
+    fn the_tick_state_line_fires_on_a_change_only() {
+        let memo = Mutex::new(None);
+        let changed = |id: &str, input: &TickInput| tick_state_changed(&memo, id, input);
+        let busy = tick(true, false, true);
+        assert_eq!(
+            changed("a", &busy),
+            Some((true, true, false, true)),
+            "first sight logs"
+        );
+        assert_eq!(changed("a", &busy), None, "same state is quiet");
+        assert!(changed("a", &tick(true, true, true)).is_some());
+        assert!(changed("a", &tick(true, true, false)).is_some());
+        assert!(changed("a", &tick(false, false, false)).is_some());
+        assert!(
+            changed("b", &tick(false, false, false)).is_some(),
+            "per agent"
+        );
+        // A stopped agent logs once, with idle / cadence folded to false so
+        // the line matches what is recorded; their flips are not news.
+        let stopped = TickInput {
+            enabled: false,
+            ..busy
+        };
+        assert_eq!(changed("c", &stopped), Some((false, true, false, false)));
+        assert_eq!(
+            changed(
+                "c",
+                &TickInput {
+                    idle: true,
+                    ..stopped
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            changed(
+                "c",
+                &TickInput {
+                    cadence_elapsed: false,
+                    ..stopped
+                }
+            ),
+            None
+        );
+        // ...but its tab going away still is.
+        assert_eq!(
+            changed(
+                "c",
+                &TickInput {
+                    tab_alive: false,
+                    ..stopped
+                }
+            ),
+            Some((false, false, false, false))
+        );
+        // Starting it again is news.
+        assert!(changed("c", &busy).is_some());
+    }
+
+    #[test]
+    fn a_clock_stepped_back_rearms_the_stuck_warning() {
+        let memo = Mutex::new(None);
+        let stuck = tick(true, false, true);
+        let long = Some(STUCK_IDLE_WARN_EVERY_MS);
+        assert!(stuck_idle_warn_due(
+            &memo, "a", &stuck, true, long, 1_000_000
+        ));
+        assert!(stuck_idle_warn_due(&memo, "a", &stuck, true, long, 10_000));
+        // The re-arm records the new time, so it does not then fire every tick.
+        assert!(!stuck_idle_warn_due(&memo, "a", &stuck, true, long, 15_000));
+        assert!(stuck_idle_warn_due(
+            &memo,
+            "a",
+            &stuck,
+            true,
+            long,
+            10_000 + STUCK_IDLE_WARN_EVERY_MS
+        ));
+    }
+
+    #[test]
+    fn overdue_is_measured_past_the_cadence_not_from_the_cycle_start() {
+        assert_eq!(overdue_ms(100_000, None, 60), None);
+        assert_eq!(overdue_ms(100_000, Some(0), 60), Some(40_000));
+        assert_eq!(overdue_ms(30_000, Some(0), 60), Some(-30_000));
     }
 
     /// The screen the Merge Shepherd sat on when the nudge's Enter answered
