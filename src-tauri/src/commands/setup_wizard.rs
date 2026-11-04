@@ -297,7 +297,7 @@ pub async fn github_list_repos() -> Result<Value, String> {
 /// the post-install Setup-URL redirect completes the claim bound to the caller's
 /// tenant.
 ///
-/// The origin comes from `github_connect_web_origin` — the same resolver
+/// The origin comes from `web_integration::resolve_gui_web_frontend_origin` — the same resolver
 /// (`web_origin::resolve_web_frontend_base`) as `qontinui_profile device pair
 /// --browser`, here with the settings rung the CLI lacks:
 /// `$QONTINUI_WEB_FRONTEND_BASE`, then the `web_integration.web_base_url`
@@ -349,25 +349,9 @@ pub async fn github_connect_url() -> Result<String, String> {
     let state = arm_pending_connect(connect_state);
     Ok(format!(
         "{}/connect-runner-github?state={}",
-        github_connect_web_origin(),
+        crate::commands::web_integration::resolve_gui_web_frontend_origin("github_connect_url"),
         state
     ))
-}
-
-/// The web-frontend origin [`github_connect_url`] opens its page on, resolved
-/// by `web_origin::resolve_web_frontend_base`. Before this the setting and the
-/// env override were both ignored here, so a split local-dev runner opened
-/// `/connect-runner-github` on the API port, which serves no pages.
-fn github_connect_web_origin() -> String {
-    let settings = crate::settings::load_settings();
-    let env = std::env::var(qontinui_runner_lib::web_origin::WEB_FRONTEND_BASE_ENV).ok();
-    let (origin, source) = qontinui_runner_lib::web_origin::resolve_web_frontend_base(
-        env.as_deref(),
-        settings.web_integration.web_base_url.as_deref(),
-        &crate::api_config::get_api_base_url(),
-    );
-    info!(origin = %origin, source = ?source, "github_connect_url: web frontend origin");
-    origin
 }
 
 // ---- P2: runner-native claim on the `github-connected` deep-link ----------
