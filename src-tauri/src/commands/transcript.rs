@@ -1877,7 +1877,7 @@ mod tests {
 
         // Scoped, not global: the harness runs other tests in parallel and a
         // global subscriber can only be set once per process.
-        tracing::subscriber::with_default(subscriber, || {
+        crate::resource_guard::with_log_capture(subscriber, || {
             let (req_tx, reqs) = std::sync::mpsc::sync_channel::<ScanRequest>(1);
             let (job_tx, job_rx) = std::sync::mpsc::channel::<ScanFn>();
             let (res_tx, res_rx) = std::sync::mpsc::channel::<Vec<transcript::TranscriptSession>>();
@@ -2245,7 +2245,7 @@ mod tests {
             .with_ansi(false)
             .with_max_level(level)
             .finish();
-        let out = tracing::subscriber::with_default(subscriber, f);
+        let out = crate::resource_guard::with_log_capture(subscriber, f);
         let text =
             String::from_utf8_lossy(&buf.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
         (out, text)
