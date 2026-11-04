@@ -4,10 +4,11 @@
 //! Supports both GUI mode (exclusive, with GUI lock) and headless mode (parallel).
 
 use super::gui_lock::{BridgeId, GuiLock, GuiLockInfo};
+use super::lifecycle::ExecutorLifecycle;
 use super::python_bridge::PythonBridge;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
@@ -44,10 +45,90 @@ pub struct BridgeInfo {
     pub created_at: u64,
 }
 
+/// Error returned when a bridge is momentarily out of its slot because
+/// `start_default_bridge` / `stop_default_bridge` / `remove_bridge` holds it.
+pub const BRIDGE_BUSY_ERROR: &str = "Python bridge is starting or stopping; try again shortly";
+
+/// A shared handle to ONE bridge, serializing that bridge's callers only.
+///
+/// The bridges map lock (`BridgeManager::bridges`) is held just long enough to
+/// clone this handle; the caller's closure, which may block for minutes in
+/// `PythonBridge::send_command_and_wait`, runs under this per-bridge mutex
+/// instead. Holding the MAP lock across that wait is what froze the main
+/// thread for ~45 s after most boots: `auto_load_default_state_machine` held
+/// `bridges.write()` across a 45-51 s `load_state_machine` round-trip while
+/// the then-sync `start_python_executor` command waited on `bridges.read()` on
+/// the main thread (plan
+/// `2026-11-04-runner-wedge-detector-reads-a-boot-as-a-wedge-and-never-bound-is-silent`
+/// Phase 3). Map-level reads (`is_default_bridge_running`, `list_bridges`,
+/// `default_bridge_id_sync`, ...) never touch this mutex.
+///
+/// The slot is an `Option` so the async lifecycle paths can TAKE the bridge,
+/// `.await` its `start()`/`stop()` without holding any std guard across the
+/// await, and put it back. While it is out, `with` answers
+/// [`BRIDGE_BUSY_ERROR`].
+pub struct BridgeHandle<B = PythonBridge> {
+    slot: Arc<Mutex<Option<B>>>,
+}
+
+impl<B> Clone for BridgeHandle<B> {
+    fn clone(&self) -> Self {
+        Self {
+            slot: Arc::clone(&self.slot),
+        }
+    }
+}
+
+impl<B> BridgeHandle<B> {
+    /// Wrap a bridge in a fresh handle.
+    pub fn new(bridge: B) -> Self {
+        Self {
+            slot: Arc::new(Mutex::new(Some(bridge))),
+        }
+    }
+
+    /// A panic inside one caller's closure must not brick the bridge for every
+    /// later caller, so a poisoned slot is recovered rather than unwrapped.
+    fn lock(&self) -> MutexGuard<'_, Option<B>> {
+        self.slot.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Run `f` with exclusive access to this bridge (blocks while another
+    /// caller of THIS bridge is inside its closure).
+    pub fn with<F, R>(&self, f: F) -> Result<R, String>
+    where
+        F: FnOnce(&mut B) -> R,
+    {
+        let mut guard = self.lock();
+        match guard.as_mut() {
+            Some(bridge) => Ok(f(bridge)),
+            None => Err(BRIDGE_BUSY_ERROR.to_string()),
+        }
+    }
+
+    /// Take the bridge out of its slot (waits for an in-flight closure).
+    pub(crate) fn take(&self) -> Option<B> {
+        self.lock().take()
+    }
+
+    /// Put a bridge back into its slot.
+    pub(crate) fn put(&self, bridge: B) {
+        *self.lock() = Some(bridge);
+    }
+}
+
+/// The bridges map. Generic over the bridge type only so the locking contract
+/// can be unit-tested without a Tauri `AppHandle` (which `PythonBridge` needs).
+pub(crate) type BridgeMap<B = PythonBridge> = RwLock<HashMap<BridgeId, ManagedBridge<B>>>;
+
 /// A managed bridge instance with metadata.
-pub struct ManagedBridge {
-    /// The actual Python bridge.
-    pub bridge: PythonBridge,
+pub struct ManagedBridge<B = PythonBridge> {
+    /// The actual Python bridge, behind its own per-bridge lock.
+    pub bridge: BridgeHandle<B>,
+    /// The bridge's lifecycle, cached at creation so state reads never need the
+    /// per-bridge lock (`PythonBridge::lifecycle` is set once in `new` and never
+    /// replaced).
+    pub lifecycle: Arc<tokio::sync::RwLock<ExecutorLifecycle>>,
     /// Bridge operating mode.
     pub mode: BridgeMode,
     /// Associated task run ID.
@@ -84,7 +165,7 @@ pub struct BridgeManager {
     /// This is critical: PythonBridge methods use their own tokio runtime internally
     /// (self.runtime.block_on), so the bridges map MUST NOT require a tokio context
     /// to lock - otherwise we'd get nested runtime panics.
-    pub(crate) bridges: RwLock<HashMap<BridgeId, ManagedBridge>>,
+    pub(crate) bridges: BridgeMap,
     /// Map from run ID to bridge ID for quick lookup.
     run_id_map: RwLock<HashMap<String, BridgeId>>,
     /// GUI lock for exclusive GUI access.
@@ -212,7 +293,8 @@ impl BridgeManager {
             .unwrap_or(0);
 
         let managed = ManagedBridge {
-            bridge,
+            lifecycle: bridge.get_lifecycle(),
+            bridge: BridgeHandle::new(bridge),
             mode: effective_mode,
             run_id: run_id.clone(),
             monitor_indices,
@@ -252,10 +334,14 @@ impl BridgeManager {
             bridges.remove(&bid)
         };
 
-        if let Some(mut managed) = managed {
-            // Stop the bridge (async)
-            if let Err(e) = managed.bridge.stop().await {
-                warn!("Error stopping bridge {}: {}", bridge_id, e);
+        if let Some(managed) = managed {
+            // Stop the bridge (async). `take` waits for an in-flight caller of
+            // this bridge to finish; the owned bridge is then awaited on with
+            // no std guard held.
+            if let Some(mut bridge) = managed.bridge.take() {
+                if let Err(e) = bridge.stop().await {
+                    warn!("Error stopping bridge {}: {}", bridge_id, e);
+                }
             }
 
             // Remove run ID mapping
@@ -276,22 +362,25 @@ impl BridgeManager {
         }
     }
 
-    /// Get a bridge by ID for direct access.
+    /// Run `f` with exclusive access to a bridge by ID.
     ///
-    /// Returns a reference that allows calling methods on the bridge.
-    /// The caller must not hold this reference for long periods.
+    /// The bridges map lock is released before `f` runs; only callers of this
+    /// same bridge wait on it (see [`BridgeHandle`]).
     pub fn with_bridge<F, R>(&self, bridge_id: &str, f: F) -> Result<R, String>
     where
         F: FnOnce(&mut PythonBridge) -> R,
     {
-        let bid = BridgeId::from_string(bridge_id.to_string());
-        let mut bridges = self.bridges.write().unwrap();
+        with_bridge_in(
+            &self.bridges,
+            &BridgeId::from_string(bridge_id.to_string()),
+            f,
+        )
+    }
 
-        if let Some(managed) = bridges.get_mut(&bid) {
-            Ok(f(&mut managed.bridge))
-        } else {
-            Err(format!("Bridge not found: {}", bridge_id))
-        }
+    /// Clone the per-bridge handle for `bridge_id` (map lock held only for the
+    /// lookup).
+    pub(crate) fn bridge_handle(&self, bridge_id: &str) -> Option<BridgeHandle> {
+        bridge_handle_in(&self.bridges, &BridgeId::from_string(bridge_id.to_string()))
     }
 
     /// Get a bridge by run ID.
@@ -306,11 +395,9 @@ impl BridgeManager {
         };
 
         if let Some(bid) = bridge_id {
-            let mut bridges = self.bridges.write().unwrap();
-            if let Some(managed) = bridges.get_mut(&bid) {
-                Ok(f(&mut managed.bridge))
-            } else {
-                Err(format!("Bridge not found for run ID: {}", run_id))
+            match bridge_handle_in(&self.bridges, &bid) {
+                Some(handle) => handle.with(f),
+                None => Err(format!("Bridge not found for run ID: {}", run_id)),
             }
         } else {
             Err(format!("No bridge mapped to run ID: {}", run_id))
@@ -339,7 +426,7 @@ impl BridgeManager {
                         managed.run_id.clone(),
                         managed.mode,
                         managed.monitor_indices.clone(),
-                        managed.bridge.get_lifecycle(),
+                        Arc::clone(&managed.lifecycle),
                         managed.created_at,
                     )
                 })
@@ -379,7 +466,7 @@ impl BridgeManager {
                     managed.run_id.clone(),
                     managed.mode,
                     managed.monitor_indices.clone(),
-                    managed.bridge.get_lifecycle(),
+                    Arc::clone(&managed.lifecycle),
                     managed.created_at,
                 )
             })
@@ -635,17 +722,7 @@ impl BridgeManager {
     /// Skips the async GUI lock check and uses only the bridges map.
     /// Prefers GUI-mode bridges, falls back to any bridge.
     pub fn default_bridge_id_sync(&self) -> Option<String> {
-        let bridges = self.bridges.read().unwrap();
-
-        // Prefer GUI mode bridges
-        for (bid, managed) in bridges.iter() {
-            if managed.mode == BridgeMode::Gui {
-                return Some(bid.0.clone());
-            }
-        }
-
-        // Fall back to any bridge
-        bridges.keys().next().map(|bid| bid.0.clone())
+        default_bridge_id_in(&self.bridges)
     }
 
     /// Execute a closure with the default bridge.
@@ -669,14 +746,7 @@ impl BridgeManager {
     /// MUST NOT be called from within a tokio async context. Use `is_default_bridge_running_async()`
     /// instead when in an async context.
     pub fn is_default_bridge_running(&self) -> bool {
-        if let Some(bridge_id) = self.default_bridge_id_sync() {
-            let bid = BridgeId::from_string(bridge_id);
-            let bridges = self.bridges.read().unwrap();
-            if let Some(managed) = bridges.get(&bid) {
-                return managed.bridge.is_running();
-            }
-        }
-        false
+        is_default_bridge_running_in(&self.bridges)
     }
 
     /// Check if the default bridge exists and is running (async version).
@@ -694,7 +764,7 @@ impl BridgeManager {
             let bid = BridgeId::from_string(bridge_id);
             let bridges = self.bridges.read().unwrap();
             match bridges.get(&bid) {
-                Some(managed) => managed.bridge.get_lifecycle(),
+                Some(managed) => Arc::clone(&managed.lifecycle),
                 None => return false,
             }
         };
@@ -716,40 +786,35 @@ impl BridgeManager {
 
         let bid = BridgeId::from_string(bridge_id.clone());
 
-        // Check if already running - get lifecycle without holding lock across await
-        let is_running = {
-            let lifecycle = {
-                let bridges = self.bridges.read().unwrap();
-                match bridges.get(&bid) {
-                    Some(managed) => managed.bridge.get_lifecycle(),
-                    None => return Ok(false),
-                }
-            };
-            let state = lifecycle.read().await.get_state().await;
-            state.can_accept_commands()
-        };
-
-        if is_running {
-            return Ok(false);
-        }
-
-        // Now start the bridge - remove from map, drop guard, start, re-insert
-        let mut managed = {
-            let mut bridges = self.bridges.write().unwrap();
-            match bridges.remove(&bid) {
-                Some(m) => m,
+        // Grab the handle + lifecycle under the map lock, then drop it before
+        // any await.
+        let (handle, lifecycle) = {
+            let bridges = self.bridges.read().unwrap();
+            match bridges.get(&bid) {
+                Some(managed) => (managed.bridge.clone(), Arc::clone(&managed.lifecycle)),
                 None => return Ok(false),
             }
         };
 
-        let result = managed
-            .bridge
+        let state = lifecycle.read().await.get_state().await;
+        if state.can_accept_commands() {
+            return Ok(false);
+        }
+
+        // Take the bridge out of its slot, start it with no guard held, and put
+        // it back regardless of the result. `None` means another lifecycle
+        // operation already holds it.
+        let mut bridge = match handle.take() {
+            Some(b) => b,
+            None => return Ok(false),
+        };
+
+        let result = bridge
             .start()
             .await
             .map_err(|e| format!("Failed to start bridge: {}", e));
 
-        // Re-insert the bridge regardless of start result
-        self.bridges.write().unwrap().insert(bid, managed);
+        handle.put(bridge);
 
         result.map(|()| true)
     }
@@ -761,19 +826,20 @@ impl BridgeManager {
             None => return Err("No default bridge available".to_string()),
         };
 
-        let bid = BridgeId::from_string(bridge_id);
-        let mut managed = {
-            let mut bridges = self.bridges.write().unwrap();
-            match bridges.remove(&bid) {
-                Some(m) => m,
-                None => return Err("Default bridge not found".to_string()),
-            }
+        let handle = match self.bridge_handle(&bridge_id) {
+            Some(h) => h,
+            None => return Err("Default bridge not found".to_string()),
         };
 
-        let result = managed.bridge.stop().await;
+        // Take, stop with no guard held, put back regardless of the result.
+        let mut bridge = match handle.take() {
+            Some(b) => b,
+            None => return Err(BRIDGE_BUSY_ERROR.to_string()),
+        };
 
-        // Re-insert the bridge regardless of stop result
-        self.bridges.write().unwrap().insert(bid, managed);
+        let result = bridge.stop().await;
+
+        handle.put(bridge);
 
         result
     }
@@ -783,10 +849,10 @@ impl BridgeManager {
     /// WARNING: This method uses block_on internally and MUST NOT be called from
     /// within a tokio async context. Use `get_default_bridge_state_async()` instead.
     pub fn get_default_bridge_state(&self) -> Option<crate::executor::ExecutorState> {
-        let bridge_id = self.default_bridge_id_sync()?;
-        let bid = BridgeId::from_string(bridge_id);
-        let bridges = self.bridges.read().unwrap();
-        bridges.get(&bid).map(|m| m.bridge.get_state())
+        let lifecycle = default_lifecycle_in(&self.bridges)?;
+        Some(tauri::async_runtime::block_on(async {
+            lifecycle.read().await.get_state().await
+        }))
     }
 
     /// Get the state of the default bridge (async version).
@@ -799,7 +865,7 @@ impl BridgeManager {
         // Get lifecycle handle under sync lock, then drop it before async call
         let lifecycle = {
             let bridges = self.bridges.read().unwrap();
-            bridges.get(&bid).map(|m| m.bridge.get_lifecycle())
+            bridges.get(&bid).map(|m| Arc::clone(&m.lifecycle))
         };
 
         if let Some(lifecycle) = lifecycle {
@@ -810,9 +876,191 @@ impl BridgeManager {
     }
 }
 
+// =============================================================================
+// Map-level helpers (generic over the bridge type for testability)
+// =============================================================================
+
+/// Clone the handle for `bid`. The map read guard is dropped before returning,
+/// so nothing a caller then does with the handle holds the map lock.
+pub(crate) fn bridge_handle_in<B>(map: &BridgeMap<B>, bid: &BridgeId) -> Option<BridgeHandle<B>> {
+    let bridges = map.read().unwrap();
+    bridges.get(bid).map(|m| m.bridge.clone())
+}
+
+/// Run `f` against the bridge `bid`: map lock for the lookup only, then the
+/// per-bridge lock for `f`.
+pub(crate) fn with_bridge_in<B, F, R>(map: &BridgeMap<B>, bid: &BridgeId, f: F) -> Result<R, String>
+where
+    F: FnOnce(&mut B) -> R,
+{
+    let handle = bridge_handle_in(map, bid).ok_or_else(|| format!("Bridge not found: {}", bid))?;
+    handle.with(f)
+}
+
+/// The default bridge id: the first GUI-mode bridge, else any bridge.
+pub(crate) fn default_bridge_id_in<B>(map: &BridgeMap<B>) -> Option<String> {
+    let bridges = map.read().unwrap();
+
+    // Prefer GUI mode bridges
+    for (bid, managed) in bridges.iter() {
+        if managed.mode == BridgeMode::Gui {
+            return Some(bid.0.clone());
+        }
+    }
+
+    // Fall back to any bridge
+    bridges.keys().next().map(|bid| bid.0.clone())
+}
+
+/// The default bridge's lifecycle handle, read under the map lock only.
+fn default_lifecycle_in<B>(
+    map: &BridgeMap<B>,
+) -> Option<Arc<tokio::sync::RwLock<ExecutorLifecycle>>> {
+    let bid = BridgeId::from_string(default_bridge_id_in(map)?);
+    let bridges = map.read().unwrap();
+    bridges.get(&bid).map(|m| Arc::clone(&m.lifecycle))
+}
+
+/// Whether the default bridge can accept commands. Reads the cached lifecycle,
+/// never the per-bridge lock, so a long in-flight command on the bridge cannot
+/// delay it.
+///
+/// Uses `block_on`: MUST NOT be called from within a tokio async context.
+pub(crate) fn is_default_bridge_running_in<B>(map: &BridgeMap<B>) -> bool {
+    match default_lifecycle_in(map) {
+        Some(lifecycle) => tauri::async_runtime::block_on(async {
+            lifecycle
+                .read()
+                .await
+                .get_state()
+                .await
+                .can_accept_commands()
+        }),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    // Note: These tests would require a mock Tauri app handle,
-    // which is complex to set up. In practice, integration tests
-    // would be more appropriate for the BridgeManager.
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// Stand-in for `PythonBridge` (which needs a Tauri `AppHandle`).
+    struct FakeBridge {
+        calls: u32,
+    }
+
+    fn map_with_one_bridge() -> (Arc<BridgeMap<FakeBridge>>, BridgeId) {
+        let bid = BridgeId::from_string("default".to_string());
+        let mut map = HashMap::new();
+        map.insert(
+            bid.clone(),
+            ManagedBridge {
+                bridge: BridgeHandle::new(FakeBridge { calls: 0 }),
+                lifecycle: Arc::new(tokio::sync::RwLock::new(ExecutorLifecycle::new())),
+                mode: BridgeMode::Gui,
+                run_id: None,
+                monitor_indices: vec![0],
+                created_at: 0,
+                headless_events: None,
+            },
+        );
+        (Arc::new(RwLock::new(map)), bid)
+    }
+
+    /// Phase 3 regression: a long command in flight on the default bridge (the
+    /// 45-51 s `load_state_machine` at boot) must not block a concurrent
+    /// map-level read such as `is_default_bridge_running`, which
+    /// `start_python_executor` makes first.
+    #[test]
+    fn a_busy_bridge_does_not_block_map_level_reads() {
+        let (map, bid) = map_with_one_bridge();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        let busy_map = Arc::clone(&map);
+        let busy_bid = bid.clone();
+        let busy = std::thread::spawn(move || {
+            with_bridge_in(&busy_map, &busy_bid, |bridge| {
+                bridge.calls += 1;
+                entered_tx.send(()).unwrap();
+                // Bounded, so a regression (map lock held across this wait)
+                // fails on the elapsed-time assertion instead of deadlocking.
+                let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            })
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("busy caller never entered the bridge");
+
+        let started = Instant::now();
+        let running = is_default_bridge_running_in(&map);
+        let id = default_bridge_id_in(&map);
+        let elapsed = started.elapsed();
+
+        release_tx.send(()).ok();
+        busy.join().unwrap().unwrap();
+
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "map-level read waited {:?} behind a busy bridge",
+            elapsed
+        );
+        // A fresh lifecycle is `Initializing`, which cannot accept commands.
+        assert!(!running);
+        assert_eq!(id.as_deref(), Some("default"));
+    }
+
+    /// Callers of the SAME bridge still serialize: a second closure cannot run
+    /// while the first is inside its closure.
+    #[test]
+    fn callers_of_one_bridge_still_serialize() {
+        let (map, bid) = map_with_one_bridge();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+
+        let busy_map = Arc::clone(&map);
+        let busy_bid = bid.clone();
+        let busy = std::thread::spawn(move || {
+            with_bridge_in(&busy_map, &busy_bid, |bridge| {
+                entered_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+                bridge.calls += 1;
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let started = Instant::now();
+        let seen = with_bridge_in(&map, &bid, |bridge| bridge.calls).unwrap();
+        let elapsed = started.elapsed();
+        busy.join().unwrap().unwrap();
+
+        assert_eq!(seen, 1, "second caller ran before the first finished");
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "waited only {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn a_taken_bridge_answers_busy_and_put_restores_it() {
+        let (map, bid) = map_with_one_bridge();
+        let handle = bridge_handle_in(&map, &bid).unwrap();
+
+        let taken = handle.take().expect("slot was empty");
+        assert_eq!(
+            with_bridge_in(&map, &bid, |b| b.calls).unwrap_err(),
+            BRIDGE_BUSY_ERROR
+        );
+        handle.put(taken);
+        assert_eq!(with_bridge_in(&map, &bid, |b| b.calls).unwrap(), 0);
+
+        let missing = BridgeId::from_string("nope".to_string());
+        assert_eq!(
+            with_bridge_in(&map, &missing, |b| b.calls).unwrap_err(),
+            "Bridge not found: nope"
+        );
+    }
 }

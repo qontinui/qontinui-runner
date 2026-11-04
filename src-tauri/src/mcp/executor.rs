@@ -347,7 +347,7 @@ async fn reset_default_lifecycle_to_initializing(manager: &Arc<crate::executor::
     let lifecycle = {
         let bridges = manager.bridges.read().unwrap();
         let first = bridges.values().next();
-        first.map(|m| m.bridge.get_lifecycle())
+        first.map(|m| Arc::clone(&m.lifecycle))
     };
 
     if let Some(lc) = lifecycle {

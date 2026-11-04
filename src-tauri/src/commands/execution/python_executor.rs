@@ -5,7 +5,7 @@
 use crate::config::{ConfigLoader, ScreenshotCaptureSettings};
 use crate::executor::{
     get_or_create_default_bridge_compartment, is_default_bridge_running_compartment,
-    stop_default_bridge_compartment, with_default_bridge_compartment,
+    run_bridge_blocking, stop_default_bridge_compartment, with_default_bridge_compartment,
 };
 use crate::settings;
 use tauri::{Emitter, State};
@@ -13,6 +13,22 @@ use tracing::{error, info, warn};
 
 use super::super::compartments::{BridgeCompartment, ExecutionCompartment};
 use super::super::CommandResponse;
+
+/// Serializes `start_python_executor` / `stop_python_executor` bodies.
+///
+/// While these were sync commands, Tauri ran them on the main thread, which
+/// serialized them for free. The frontend calls `start_python_executor` twice
+/// at startup; run concurrently on blocking threads, both could see "not
+/// running" and race into `get_or_create_default_bridge`, and the loser would
+/// fail on the GUI lock instead of answering "already running". Holding this
+/// keeps the old one-at-a-time semantics without holding the main thread.
+static EXECUTOR_LIFECYCLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn executor_lifecycle_guard() -> std::sync::MutexGuard<'static, ()> {
+    EXECUTOR_LIFECYCLE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Start the Python executor.
 ///
@@ -29,16 +45,34 @@ use super::super::CommandResponse;
 /// # Returns
 /// * `Ok(CommandResponse)` - Success message
 /// * `Err(String)` - Error if executor fails to start or is already running
+///
+/// `async`, with the body on a blocking thread: as a sync command Tauri ran it
+/// on the main thread, where it waited on the bridge behind the boot-time
+/// `load_state_machine` round-trip and froze the window for ~45 s (plan
+/// `2026-11-04-runner-wedge-detector-reads-a-boot-as-a-wedge-and-never-bound-is-silent`
+/// Phase 3). The command name and its JS contract are unchanged.
 #[tauri::command]
-pub fn start_python_executor(
+pub async fn start_python_executor(
     app_handle: tauri::AppHandle,
-    bridge: State<BridgeCompartment>,
-    execution: State<ExecutionCompartment>,
+    bridge: State<'_, BridgeCompartment>,
+    execution: State<'_, ExecutionCompartment>,
 ) -> Result<CommandResponse, String> {
+    let bridge = bridge.inner().clone();
+    let execution = execution.inner().clone();
+    run_bridge_blocking(move || start_python_executor_blocking(app_handle, &bridge, &execution))
+        .await?
+}
+
+fn start_python_executor_blocking(
+    app_handle: tauri::AppHandle,
+    bridge: &BridgeCompartment,
+    execution: &ExecutionCompartment,
+) -> Result<CommandResponse, String> {
+    let _serial = executor_lifecycle_guard();
     info!("Starting Python executor");
 
     // Check if already running
-    if is_default_bridge_running_compartment(&bridge) {
+    if is_default_bridge_running_compartment(bridge) {
         info!("Python executor already running, checking if config needs to be reloaded");
 
         // When app restarts but Python is still running, we need to reload the config
@@ -71,7 +105,7 @@ pub fn start_python_executor(
                     // Send debug settings and configuration via bridge manager
                     let debug_settings = settings::get_debug_settings();
                     let config_path_clone = config_path.clone();
-                    let reload_result = with_default_bridge_compartment(&bridge, |bridge| {
+                    let reload_result = with_default_bridge_compartment(bridge, |bridge| {
                         // Send debug settings first
                         if let Err(e) = bridge.set_debug_settings(
                             debug_settings.enable_image_debug,
@@ -127,7 +161,7 @@ pub fn start_python_executor(
     }
 
     // Create and start new bridge via BridgeManager
-    get_or_create_default_bridge_compartment(&bridge).map_err(|e| {
+    get_or_create_default_bridge_compartment(bridge).map_err(|e| {
         error!("Failed to start Python executor: {}", e);
         format!("Failed to start Python executor: {}", e)
     })?;
@@ -148,7 +182,7 @@ pub fn start_python_executor(
 
             // Send debug settings and configuration via bridge manager
             let debug_settings = settings::get_debug_settings();
-            let send_result = with_default_bridge_compartment(&bridge, |bridge| {
+            let send_result = with_default_bridge_compartment(bridge, |bridge| {
                 // Send debug settings first
                 if let Err(e) = bridge.set_debug_settings(
                     debug_settings.enable_image_debug,
@@ -205,10 +239,18 @@ pub fn start_python_executor(
 /// * `Ok(CommandResponse)` - Success message
 /// * `Err(String)` - Error if executor fails to stop
 #[tauri::command]
-pub fn stop_python_executor(bridge: State<BridgeCompartment>) -> Result<CommandResponse, String> {
+pub async fn stop_python_executor(
+    bridge: State<'_, BridgeCompartment>,
+) -> Result<CommandResponse, String> {
+    let bridge = bridge.inner().clone();
+    run_bridge_blocking(move || stop_python_executor_blocking(&bridge)).await?
+}
+
+fn stop_python_executor_blocking(bridge: &BridgeCompartment) -> Result<CommandResponse, String> {
+    let _serial = executor_lifecycle_guard();
     info!("Stopping Python executor");
 
-    stop_default_bridge_compartment(&bridge).map_err(|e| {
+    stop_default_bridge_compartment(bridge).map_err(|e| {
         error!("Failed to stop Python executor: {}", e);
         format!("Failed to stop Python executor: {}", e)
     })?;
@@ -234,20 +276,28 @@ pub fn stop_python_executor(bridge: State<BridgeCompartment>) -> Result<CommandR
 /// * `Ok(CommandResponse)` - Success message
 /// * `Err(String)` - Error if executor not running or update fails
 #[tauri::command]
-pub fn update_capture_settings(
+pub async fn update_capture_settings(
     settings: ScreenshotCaptureSettings,
-    bridge: State<BridgeCompartment>,
+    bridge: State<'_, BridgeCompartment>,
+) -> Result<CommandResponse, String> {
+    let bridge = bridge.inner().clone();
+    run_bridge_blocking(move || update_capture_settings_blocking(settings, &bridge)).await?
+}
+
+fn update_capture_settings_blocking(
+    settings: ScreenshotCaptureSettings,
+    bridge: &BridgeCompartment,
 ) -> Result<CommandResponse, String> {
     info!(
         "Updating screenshot capture settings: enabled={}",
         settings.enabled
     );
 
-    if !is_default_bridge_running_compartment(&bridge) {
+    if !is_default_bridge_running_compartment(bridge) {
         return Err("Python executor is not running. Please start the executor first by clicking 'Start Executor' in the Control tab.".to_string());
     }
 
-    with_default_bridge_compartment(&bridge, |bridge| {
+    with_default_bridge_compartment(bridge, |bridge| {
         bridge.update_capture_settings(settings.clone())
     })
     .map_err(|e| {
