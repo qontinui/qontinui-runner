@@ -770,7 +770,7 @@ fn build_checks(inputs: &DoctorInputs) -> Vec<Check<'_>> {
             } else {
                 (
                     false,
-                    "no authenticated Claude account (no valid ~/.claude/.credentials.json)".into(),
+                    "no authenticated Claude account (no valid ~/.claude/.credentials.json and no long-lived CLAUDE_CODE_OAUTH_TOKEN)".into(),
                 )
             }
         }),
@@ -1210,6 +1210,16 @@ fn creds_path_is_valid(creds_path: &Path) -> bool {
 }
 
 fn claude_account_has_valid_credentials(config_dir: Option<&str>) -> bool {
+    // A long-lived `claude setup-token` token (`settings.json`
+    // `env.CLAUDE_CODE_OAUTH_TOKEN`) is a login with nothing to expire or
+    // refresh on this clock — the account dir's own, else the ambient one
+    // (the same fall-through `find_creds_path` applies to the creds file).
+    let long_lived = config_dir
+        .and_then(|dir| crate::claude_oauth_token::from_config_dir(Path::new(dir)))
+        .or_else(crate::claude_oauth_token::ambient);
+    if long_lived.is_some() {
+        return true;
+    }
     if let Some(path) = find_creds_path(config_dir) {
         if creds_path_is_valid(&path) {
             return true;
