@@ -51,7 +51,7 @@ concurrency:
 jobs:
   selftest:
     name: schemas pair-follow selftest
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_SCHEMAS_PAIR_FOLLOW_TESTS || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui"]' || '"ubuntu-latest"') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5

@@ -57,7 +57,7 @@ jobs:
   unit-tests:
     name: Audit-ignore review unit tests
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_AUDIT_IGNORE_REVIEW || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui"]' || '"ubuntu-latest"') }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
@@ -98,7 +98,7 @@ jobs:
     name: Upsert the review issue
     needs: audit
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_AUDIT_IGNORE_REVIEW || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui"]' || '"ubuntu-latest"') }}
     timeout-minutes: 5
     # A schedule and a dispatch that overlap would otherwise both create the issue.
     concurrency:
