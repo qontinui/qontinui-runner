@@ -1407,6 +1407,56 @@ pub(crate) fn build_visibility_report(
     })
 }
 
+/// What `data.occlusionText` says about the occlusion entries' fields that
+/// name or quote the webview (`element`, `occludedBy`, `label`, `text`):
+/// `"included"` for a local read, `"withheld"` for a relayed one.
+pub(crate) const OCCLUSION_TEXT_INCLUDED: &str = "included";
+/// See [`OCCLUSION_TEXT_INCLUDED`].
+pub(crate) const OCCLUSION_TEXT_WITHHELD: &str = "withheld";
+/// The occlusion-entry fields a relayed report drops
+/// ([`disclose_occlusion_text`]).
+const OCCLUSION_WEBVIEW_FIELDS: &[&str] = &["element", "occludedBy", "label", "text"];
+
+/// Narrow a visibility report for a REMOTE caller: drop every field of each
+/// occlusion entry that names or quotes the webview, keep the rest, and say
+/// so in `occlusionText`.
+///
+/// Four fields go: `label` and `text` quote the covered element, and
+/// `element` and `occludedBy` are ids, which the webview SDK commonly builds
+/// by slugifying an element's accessible label or heading text (e.g.
+/// `heading-3-<slug of the heading>`), or a `tag#domid` descriptor. What
+/// remains per entry is `ratio`, `hidesText`, `isExpectedOverlay` and
+/// `source`; the report's verdict, `occlusionDataObserved` and counts stand.
+/// The relay's only client, the console's UI Bridge dashboard, reads exactly
+/// those (the verdict, the observed flag, the entry count and `hidesText`).
+///
+/// This is defence in depth, not the gate: the response still takes the
+/// snapshot's egress refusal (`backend_relay::http_request_egress_refusal`).
+/// A local read keeps every field and says `included`, so the disclosure is
+/// never absent from a reply.
+pub(crate) fn disclose_occlusion_text(report: &mut serde_json::Value, relayed: bool) {
+    let Some(obj) = report.as_object_mut() else {
+        return;
+    };
+    if relayed {
+        if let Some(entries) = obj.get_mut("occlusions").and_then(|v| v.as_array_mut()) {
+            for entry in entries.iter_mut().filter_map(|e| e.as_object_mut()) {
+                for field in OCCLUSION_WEBVIEW_FIELDS {
+                    entry.remove(*field);
+                }
+            }
+        }
+    }
+    obj.insert(
+        "occlusionText".to_string(),
+        serde_json::json!(if relayed {
+            OCCLUSION_TEXT_WITHHELD
+        } else {
+            OCCLUSION_TEXT_INCLUDED
+        }),
+    );
+}
+
 /// `POST /control/visibility` - WHAT IS COVERING WHAT, page-wide.
 ///
 /// The SDK has declared this route since ui-bridge `4284cd2` (2026-08-26) and
@@ -1439,8 +1489,12 @@ pub(crate) fn build_visibility_report(
 /// hand-written `use*Events` hooks, not through the SDK's own handler table.
 pub async fn ui_bridge_visibility_handler(
     State(state): State<Arc<ApiState>>,
+    headers: axum::http::HeaderMap,
     body: Option<Json<VisibilityRequest>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Read once, up front: a relayed sweep answers without the fields that
+    // name or quote the webview (`disclose_occlusion_text`).
+    let relayed = crate::mcp::relay_path_policy::is_relayed_request(&headers);
     let req = body.map(|b| b.0).unwrap_or_default();
     let min_ratio = req.min_ratio.unwrap_or(0.02);
     // Gate BEFORE the sweep, not after: an out-of-range threshold must not be
@@ -1524,12 +1578,10 @@ pub async fn ui_bridge_visibility_handler(
         .cloned()
         .unwrap_or_default();
 
-    Ok(Json(ApiResponse::success(build_visibility_report(
-        &elements,
-        min_ratio,
-        include_expected,
-        modal_ids.as_ref(),
-    ))))
+    let mut report =
+        build_visibility_report(&elements, min_ratio, include_expected, modal_ids.as_ref());
+    disclose_occlusion_text(&mut report, relayed);
+    Ok(Json(ApiResponse::success(report)))
 }
 
 // ============================================================================
@@ -1639,7 +1691,7 @@ mod visibility_sweep_payload_tests {
         clippy::string_slice,
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
-    fn visibility_handler_body() -> &'static str {
+    pub(super) fn visibility_handler_body() -> &'static str {
         let source = include_str!("screenshots.rs");
         let start = source
             .find("pub async fn ui_bridge_visibility_handler")
@@ -1931,6 +1983,87 @@ mod visibility_tests {
     #[test]
     fn the_route_is_declared_in_the_manifest() {
         assert!(super::route_entries().contains(&("POST", "/ui-bridge/control/visibility")));
+    }
+
+    // ── The relayed sweep withholds the covered elements' text ─────
+
+    /// One occluded element whose label and text are both webview text.
+    fn occluded_report() -> serde_json::Value {
+        let elements = vec![el(
+            "heading-3-fix-billing",
+            "Session label",
+            json!({ "occludedBy": "div.toast", "occludedPct": 60.0, "textContent": "secret pane text" }),
+        )];
+        build_visibility_report(&elements, 0.02, false, None)
+    }
+
+    /// Relayed: no entry keeps `element`, `occludedBy`, `label` or `text`
+    /// (ids are commonly slugs of the element's text), the rest of the entry
+    /// and of the report stand, and the reply says `withheld`. Fails if the
+    /// relayed arm stops stripping any of the four.
+    #[test]
+    fn a_relayed_sweep_carries_no_webview_text() {
+        let mut report = occluded_report();
+        super::disclose_occlusion_text(&mut report, true);
+        assert_eq!(report["occlusionText"], json!("withheld"));
+        let entry = &report["occlusions"][0];
+        for field in ["element", "occludedBy", "label", "text"] {
+            assert!(entry.get(field).is_none(), "{field} survived: {entry}");
+        }
+        assert_eq!(entry["hidesText"], json!(true));
+        assert_eq!(entry["ratio"], json!(0.6));
+        assert_eq!(report["verdict"], json!("occlusions_found"));
+        assert_eq!(report["occlusionDataObserved"], json!(true));
+        assert_eq!(report["elementCount"], json!(1));
+        let wire = report.to_string();
+        for quoted in ["secret pane text", "Session label", "heading-3-fix-billing", "div.toast"] {
+            assert!(!wire.contains(quoted), "{quoted} reached the wire: {wire}");
+        }
+    }
+
+    /// Local: the entry keeps both fields and the reply says `included`, so
+    /// the disclosure is present on every reply. Fails if the local arm
+    /// starts stripping too.
+    #[test]
+    fn a_local_sweep_keeps_the_text_and_says_so() {
+        let mut report = occluded_report();
+        super::disclose_occlusion_text(&mut report, false);
+        assert_eq!(report["occlusionText"], json!("included"));
+        assert_eq!(report["occlusions"][0]["text"], json!("secret pane text"));
+        assert_eq!(report["occlusions"][0]["label"], json!("Session label"));
+        assert_eq!(
+            report["occlusions"][0]["element"],
+            json!("heading-3-fix-billing")
+        );
+        assert_eq!(report["occlusions"][0]["occludedBy"], json!("div.toast"));
+    }
+
+    /// The handler reads the relay marker once and hands it, unchanged, to
+    /// the disclosure, so the pure tests above are the handler's behaviour.
+    /// Source-scanned: the handler cannot run without a webview.
+    #[test]
+    fn the_handler_discloses_by_the_relay_marker() {
+        let body = super::visibility_sweep_payload_tests::visibility_handler_body();
+        assert_eq!(
+            body.matches("let relayed = crate::mcp::relay_path_policy::is_relayed_request(&headers);")
+                .count(),
+            1,
+            "the marker is read exactly once, from the request headers: {body}"
+        );
+        assert_eq!(
+            body.matches("relayed =").count(),
+            1,
+            "`relayed` is never reassigned after it is read: {body}"
+        );
+        assert_eq!(
+            body.matches("disclose_occlusion_text(&mut report, relayed);").count(),
+            1,
+            "{body}"
+        );
+        assert!(
+            body.contains("Ok(Json(ApiResponse::success(report)))"),
+            "the disclosed report is the one returned: {body}"
+        );
     }
 }
 
