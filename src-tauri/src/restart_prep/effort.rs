@@ -649,8 +649,10 @@ mod tests {
         let not_string = r#"{"type":"system","subtype":"local_command","content":[{"type":"text","text":"<local-command-stdout>Set effort level to max"}]}"#;
         assert_eq!(transcript_effort_in(not_string), TranscriptEffort::NoRecord);
         // The later record of either shape wins.
-        let both = format!("{sys}
-{}", r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set effort level to low (this session only): Quick</local-command-stdout>"}}"#);
+        let both = format!(
+            "{sys}\n{}",
+            r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set effort level to low (this session only): Quick</local-command-stdout>"}}"#
+        );
         assert_eq!(transcript_effort_in(&both), TranscriptEffort::Level("low"));
     }
 }
