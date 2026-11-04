@@ -23,9 +23,10 @@
 //!
 //! 1. **Backstop.** The handler calls `alarm(BACKSTOP_SECS)`. `SIGALRM`'s
 //!    default action ends the process even if the watcher never runs.
-//!    `BACKSTOP_SECS` is `shutdown_budget::FORCE_EXIT_BUDGET` + 2 s, computed
-//!    from the budget rather than restated, and it stays under the primary
-//!    unit's `TimeoutStopSec=30`. A death by SIGALRM is an honest record: the
+//!    `BACKSTOP_SECS` is `shutdown_budget::FORCE_EXIT_BUDGET` + 4 s, computed
+//!    from the budget rather than restated (the margin covers the Postgres
+//!    stop that runs after that budget's own hard exit), and it stays under
+//!    the primary unit's `TimeoutStopSec=30`. A death by SIGALRM is an honest record: the
 //!    stop did not finish its graceful path inside the budget.
 //! 2. **A second signal is immediate.** A one-shot latch (`DELIVERED`) sends
 //!    every delivery after the first — of either signal, by any route —
@@ -40,6 +41,14 @@
 //!    and it exited), the write end is `-1` and the handler re-raises at once,
 //!    exactly as before. A disarmed install never leaves a process that ignores
 //!    SIGTERM.
+//!
+//! The watcher does not stamp a signal that lands before this boot has
+//! classified the PREVIOUS run's marker: that stamp would overwrite a prior
+//! crash's `clean:false` before anyone read it, so such a signal ends the
+//! process at once. A forked child that has not exec'd yet inherits the
+//! handler; a signal to it ends the child (the installing pid is recorded).
+//! The handler is installed with `SA_RESTART`, because the process now keeps
+//! running through the teardown.
 //!
 //! Installed only over a `SIG_DFL` disposition: a signal the process inherited
 //! as ignored (`nohup`, `cmd &` without job control) stays ignored, and one
@@ -57,18 +66,33 @@ mod imp {
     pub const SIGNALS: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGHUP];
 
     /// The kernel backstop armed on the first delivery. Computed from the
-    /// force-close budget so widening the budget widens it.
+    /// force-close budget so widening the budget widens it. The +4 s margin
+    /// covers what runs AFTER that budget's own hard exit fires — the AI
+    /// output-log flush and the blocking embedded-Postgres stop — plus the
+    /// marker write the watcher makes before the budget starts; a SIGALRM
+    /// inside the Postgres stop would orphan it. It still ends under the
+    /// primary unit's `TimeoutStopSec=30`.
     pub const BACKSTOP_SECS: libc::c_uint =
-        (crate::shutdown_budget::FORCE_EXIT_BUDGET.as_secs() + 2) as libc::c_uint;
+        (crate::shutdown_budget::FORCE_EXIT_BUDGET.as_secs() + 4) as libc::c_uint;
     const _: () = assert!(
         BACKSTOP_SECS as u64 > crate::shutdown_budget::FORCE_EXIT_BUDGET.as_secs(),
         "the backstop must outlast the graceful quit's own hard-exit budget"
+    );
+    const _: () = assert!(
+        BACKSTOP_SECS < 30,
+        "the backstop must fire before the primary unit's TimeoutStopSec=30 SIGKILL"
     );
 
     /// The self-pipe's write end, or `-1` when the graceful path is unarmed.
     static WAKE_FD: AtomicI32 = AtomicI32::new(-1);
     /// Set on the first delivery of any shutdown signal (D4 property 2).
     static DELIVERED: AtomicBool = AtomicBool::new(false);
+    /// The pid that installed the handler, or 0 before install. A forked child
+    /// that has not exec'd yet inherits the handler AND the pipe's write end;
+    /// a SIGTERM to that child must end the child, never wake the runner's
+    /// watcher (which would quit the runner) or arm an alarm that survives
+    /// `execve` into whatever the child becomes.
+    static INSTALL_PID: AtomicI32 = AtomicI32::new(0);
 
     /// PURE: whether to install over a signal whose current disposition is
     /// `current`. Only the default: never over an inherited `SIG_IGN`, and
@@ -156,6 +180,12 @@ mod imp {
     };
 
     pub(super) extern "C" fn on_signal(sig: libc::c_int) {
+        // SAFETY: `getpid` is async-signal-safe.
+        let owner = INSTALL_PID.load(Ordering::SeqCst);
+        if owner != 0 && owner != unsafe { libc::getpid() } {
+            reraise_default(sig);
+            return;
+        }
         handle(sig, &DELIVERED, &WAKE_FD, &PRODUCTION);
     }
 
@@ -169,17 +199,29 @@ mod imp {
     }
 
     /// The watcher's work after one wake byte, with its effects injected so the
-    /// ORDER is testable: stamp the clean marker FIRST, then resolve the app;
-    /// no app (an early-boot signal) means the old behaviour from thread
-    /// context; a refused force-close means another door owns the exit (the
-    /// backstop still bounds it).
+    /// ORDER is testable. A signal that lands before this boot has classified
+    /// the PREVIOUS run's marker (`classified` false) must not stamp: the
+    /// stamp would overwrite a prior crash's `clean:false` before anyone read
+    /// it, so it re-raises at once — the early-boot behaviour. Otherwise stamp
+    /// the clean marker FIRST, then resolve the app; no app means the old
+    /// behaviour from thread context; a refused force-close means another door
+    /// owns the exit (the backstop still bounds it).
     pub fn on_wake<A>(
         sig: libc::c_int,
+        classified: impl FnOnce() -> bool,
         stamp_clean: impl FnOnce(),
         resolve: impl FnOnce() -> Option<A>,
         request_quit: impl FnOnce(A, String) -> bool,
         reraise: impl FnOnce(libc::c_int),
     ) {
+        if !classified() {
+            info!(
+                "{} before the boot classification ran — ending at once, the previous marker untouched",
+                name(sig)
+            );
+            reraise(sig);
+            return;
+        }
         stamp_clean();
         match resolve() {
             None => reraise(sig),
@@ -230,6 +272,7 @@ mod imp {
         );
         on_wake(
             sig,
+            || crate::session::shutdown_marker::boot_classification().is_some(),
             || {
                 crate::session::shutdown_marker::mark_clean_shutdown(
                     &crate::session::shutdown_marker::marker_path(),
@@ -286,12 +329,12 @@ mod imp {
     }
 
     #[cfg(target_os = "linux")]
-    unsafe fn create_pipe(fds: &mut [libc::c_int; 2]) -> bool {
+    pub unsafe fn create_pipe(fds: &mut [libc::c_int; 2]) -> bool {
         libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) == 0
     }
 
     #[cfg(not(target_os = "linux"))]
-    unsafe fn create_pipe(fds: &mut [libc::c_int; 2]) -> bool {
+    pub unsafe fn create_pipe(fds: &mut [libc::c_int; 2]) -> bool {
         libc::pipe(fds.as_mut_ptr()) == 0
     }
 
@@ -327,7 +370,10 @@ mod imp {
             unsafe {
                 let mut sa: libc::sigaction = std::mem::zeroed();
                 sa.sa_sigaction = on_signal as *const () as libc::sighandler_t;
-                sa.sa_flags = libc::SA_RESETHAND;
+                // SA_RESTART: the process now keeps running for the whole
+                // teardown, so a thread blocked in a syscall when the signal
+                // landed must have it restarted, not failed with EINTR.
+                sa.sa_flags = libc::SA_RESETHAND | libc::SA_RESTART;
                 libc::sigemptyset(&mut sa.sa_mask);
                 libc::sigaction(sig, &sa, std::ptr::null_mut());
             }
@@ -335,6 +381,8 @@ mod imp {
     }
 
     pub fn install() {
+        // SAFETY: `getpid` cannot fail.
+        INSTALL_PID.store(unsafe { libc::getpid() }, Ordering::SeqCst);
         // Arm first so the handler never sees a half-armed state; an unarmed
         // handler re-raises, so either order is safe.
         arm_watcher();
@@ -446,6 +494,10 @@ mod tests {
         let order = std::cell::RefCell::new(Vec::new());
         on_wake::<()>(
             libc::SIGHUP,
+            || {
+                order.borrow_mut().push("classified?");
+                true
+            },
             || order.borrow_mut().push("stamp"),
             || {
                 order.borrow_mut().push("resolve");
@@ -457,7 +509,30 @@ mod tests {
             },
             |sig| order.borrow_mut().push(if sig == libc::SIGHUP { "reraise-hup" } else { "reraise-other" }),
         );
-        assert_eq!(*order.borrow(), vec!["stamp", "resolve", "reraise-hup"]);
+        assert_eq!(*order.borrow(), vec!["classified?", "stamp", "resolve", "reraise-hup"]);
+    }
+
+    /// A signal before the boot classification ran must NOT stamp the clean
+    /// marker (it would hide the previous run's crash) and must not look the
+    /// app up: it re-raises at once.
+    #[test]
+    fn the_watcher_before_the_boot_classification_reraises_without_stamping() {
+        let order = std::cell::RefCell::new(Vec::new());
+        on_wake::<()>(
+            libc::SIGTERM,
+            || false,
+            || order.borrow_mut().push("stamp"),
+            || {
+                order.borrow_mut().push("resolve");
+                None
+            },
+            |_, _| {
+                order.borrow_mut().push("quit");
+                true
+            },
+            |sig| order.borrow_mut().push(if sig == libc::SIGTERM { "reraise-term" } else { "reraise-other" }),
+        );
+        assert_eq!(*order.borrow(), vec!["reraise-term"]);
     }
 
     /// With an app the watcher calls the force-close with a `signal <NAME>`
@@ -468,6 +543,7 @@ mod tests {
         let raised = std::cell::Cell::new(false);
         on_wake(
             libc::SIGTERM,
+            || true,
             || {},
             || Some(7u8),
             |app, r| {
@@ -481,12 +557,13 @@ mod tests {
         assert!(!raised.get(), "a held latch means another door owns the exit");
     }
 
-    /// The watcher hands one byte to its callback; EOF disarms the handler.
+    /// The watcher hands one byte to its callback; a failed read disarms.
     #[test]
     fn the_watcher_reads_one_byte_and_eof_disarms() {
         let mut fds: [libc::c_int; 2] = [-1; 2];
-        // SAFETY: a pipe for this test only.
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: a pipe for this test only, close-on-exec so a process a
+        // parallel test spawns cannot hold an end of it.
+        assert!(unsafe { create_pipe(&mut fds) });
         assert!(write_wake(fds[1], libc::SIGTERM));
         let wake = AtomicI32::new(fds[1]);
         let got = std::cell::Cell::new(0);
@@ -494,14 +571,18 @@ mod tests {
         assert_eq!(got.get(), libc::SIGTERM);
         assert_eq!(wake.load(Ordering::SeqCst), fds[1], "a byte does not disarm");
 
-        // SAFETY: closing this test's own write end.
-        unsafe { libc::close(fds[1]) };
+        // SAFETY: closing this test's own ends.
+        unsafe {
+            libc::close(fds[1]);
+            libc::close(fds[0]);
+        }
+        // A failed read (here EBADF: an fd a forked sibling test can never
+        // hold open, unlike a pipe's write end) disarms the handler. EOF takes
+        // the same branch.
         let called = std::cell::Cell::new(false);
-        watch(fds[0], &wake, |_| called.set(true));
+        watch(-1, &wake, |_| called.set(true));
         assert!(!called.get());
-        assert_eq!(wake.load(Ordering::SeqCst), -1, "EOF disarms");
-        // SAFETY: closing this test's own read end.
-        unsafe { libc::close(fds[0]) };
+        assert_eq!(wake.load(Ordering::SeqCst), -1, "a failed read disarms");
     }
 
     /// Run `child` in a forked process and return its wait status. The child
@@ -736,6 +817,9 @@ mod tests {
                 }
 
                 /// Armed: a second delivery ends the child by the signal at once.
+                /// Installed with `SA_RESETHAND`, so the second delivery meets
+                /// `SIG_DFL` here; the `DELIVERED` latch itself is exercised by
+                /// the cross-signal and chained tests below.
                 #[test]
                 fn armed_second_signal_is_immediate() {
                     let t0 = Instant::now();
@@ -836,7 +920,7 @@ mod tests {
     fn the_watcher_without_an_app_ends_the_process_by_the_signal() {
         let status = in_child(|| {
             unblock(libc::SIGTERM);
-            on_wake::<()>(libc::SIGTERM, || {}, || None, |_, _| true, reraise_default);
+            on_wake::<()>(libc::SIGTERM, || true, || {}, || None, |_, _| true, reraise_default);
         });
         assert!(libc::WIFSIGNALED(status), "status {status:#x}");
         assert_eq!(libc::WTERMSIG(status), libc::SIGTERM);
