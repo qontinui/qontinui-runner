@@ -2395,7 +2395,7 @@ mod tests {
         (
             "commands/ai_settings.rs",
             1,
-            "Claude Code's own `~/.claude/.credentials.json` (the user's Claude login)",
+            "`default_claude_config_dir`: Claude Code's own `~/.claude` (the user's Claude login)",
         ),
         (
             "claude_session/workspace_trust.rs",
