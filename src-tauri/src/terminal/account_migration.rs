@@ -579,7 +579,7 @@ worktree.";
 ///
 /// Painted while Claude is mid-turn — if visible, the session already picked
 /// itself up (or the operator beat us to it) and no nudge is needed.
-const BUSY_MARKER: &str = "esc to interrupt";
+pub(crate) const BUSY_MARKER: &str = "esc to interrupt";
 
 /// What one grid read tells the idle watcher.
 #[derive(Debug, PartialEq, Eq)]
