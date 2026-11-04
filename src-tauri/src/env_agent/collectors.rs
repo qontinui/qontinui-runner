@@ -3480,9 +3480,11 @@ fn collect_claude_accounts_from(
 // reported, excluded from `in_sync`, never an apply line.
 
 /// The provenance key: WHICH KIND of workspace-root resolution the harness
-/// observations were taken under. The value is `WorkspaceRootKind::wire()`
-/// (`declared` / `discovered` / `home_default`; `unresolved` is in the enum but
-/// never published, because an unresolved root yields no section at all) — NOT
+/// observations were taken under. The value is `WorkspaceRootKind::wire()`:
+/// `declared` / `discovered` / `home_default` in practice. `session_repo_parent`
+/// is in the enum but unreachable here, because the process-wide resolver
+/// [`collect_harness`] uses passes no session repo; `unresolved` is in the enum
+/// but never published, because an unresolved root yields no section at all. NOT
 /// `ProbeScopeKind`, which is what `versions.probe_scope_kind` carries.
 /// qontinui-web registers it as a derived key
 /// (`devenv_section_policy._DERIVED_KEYS["harness"]`), so a pure provenance
@@ -7220,19 +7222,32 @@ dependencies = [
 
     /// The section publishes WHICH rung resolved the root it probed, verbatim
     /// from `WorkspaceRootKind::wire()` — the value set qontinui-web's
-    /// `_DERIVED_KEYS["harness"]` registration documents. Every variant, so a
-    /// new rung cannot ship unpublished, and the key name itself is pinned
-    /// because the web registration is keyed on it.
+    /// `_DERIVED_KEYS["harness"]` registration documents. Every variant: the
+    /// table is built through an exhaustive `match` with no wildcard, so a new
+    /// rung fails to COMPILE here until it is given an expected wire value.
+    /// The key name itself is pinned because the web registration is keyed on
+    /// it.
     #[test]
     fn harness_publishes_the_workspace_root_kind() {
+        fn expected_wire(kind: WorkspaceRootKind) -> &'static str {
+            match kind {
+                WorkspaceRootKind::Declared => "declared",
+                WorkspaceRootKind::Discovered => "discovered",
+                WorkspaceRootKind::SessionRepoParent => "session_repo_parent",
+                WorkspaceRootKind::HomeDefault => "home_default",
+                WorkspaceRootKind::Unresolved => "unresolved",
+            }
+        }
         assert_eq!(HARNESS_SCOPE_KEY, "harness_scope_kind");
         let root = harness_root("scope");
-        for (kind, wire) in [
-            (WorkspaceRootKind::Declared, "declared"),
-            (WorkspaceRootKind::Discovered, "discovered"),
-            (WorkspaceRootKind::HomeDefault, "home_default"),
-            (WorkspaceRootKind::Unresolved, "unresolved"),
+        for kind in [
+            WorkspaceRootKind::Declared,
+            WorkspaceRootKind::Discovered,
+            WorkspaceRootKind::SessionRepoParent,
+            WorkspaceRootKind::HomeDefault,
+            WorkspaceRootKind::Unresolved,
         ] {
+            let wire = expected_wire(kind);
             let section =
                 collect_harness_under(&root, &PlansDirReading::Read(None), None, None, kind);
             assert_eq!(harness_value(&section, HARNESS_SCOPE_KEY), wire);
