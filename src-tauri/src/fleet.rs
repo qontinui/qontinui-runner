@@ -8098,7 +8098,10 @@ mod tests {",
             ("ci.slice", "max", "max"),
             ("ci.slice/ci-a.slice", "", &(10 * GIB).to_string()),
         ]);
-        assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Bounded(10));
+        assert_eq!(
+            ci_reservation_from_root(d.path()),
+            CiReservation::Bounded(10)
+        );
         // A child slice with no memory files at all is unbounded: unknown.
         let d = cgroup_fixture(&[("ci.slice", "max", "max"), ("ci.slice/ci-a.slice", "", "")]);
         assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Unbounded);
@@ -8108,16 +8111,25 @@ mod tests {",
             ("ci.slice/ci-a.slice", &(40 * GIB).to_string(), "max"),
             ("ci.slice/ci-b.slice", &(40 * GIB).to_string(), "max"),
         ]);
-        assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Bounded(50));
+        assert_eq!(
+            ci_reservation_from_root(d.path()),
+            CiReservation::Bounded(50)
+        );
         // A bounded parent covers an unbounded child.
         let d = cgroup_fixture(&[
             ("ci.slice", &(64 * GIB).to_string(), "max"),
             ("ci.slice/ci-a.slice", "max", "max"),
         ]);
-        assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Bounded(64));
+        assert_eq!(
+            ci_reservation_from_root(d.path()),
+            CiReservation::Bounded(64)
+        );
         // ci.slice with no children: its own bound, else UNKNOWN (never zero).
         let d = cgroup_fixture(&[("ci.slice", "max", &(8 * GIB).to_string())]);
-        assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Bounded(8));
+        assert_eq!(
+            ci_reservation_from_root(d.path()),
+            CiReservation::Bounded(8)
+        );
         let d = cgroup_fixture(&[("ci.slice", "max", "max")]);
         assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Unbounded);
         // One byte over a GiB rounds up.
@@ -8125,7 +8137,10 @@ mod tests {",
             ("ci.slice", "max", "max"),
             ("ci.slice/ci-a.slice", &(GIB + 1).to_string(), "max"),
         ]);
-        assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Bounded(2));
+        assert_eq!(
+            ci_reservation_from_root(d.path()),
+            CiReservation::Bounded(2)
+        );
     }
 
     #[test]
@@ -8158,7 +8173,10 @@ mod tests {",
             ("ci.slice/ci-runners.slice", "247389487104", "274877906944"),
             ("ci.slice/ci-winvm.slice", "max", "103079215104"),
         ]);
-        assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Bounded(327));
+        assert_eq!(
+            ci_reservation_from_root(d.path()),
+            CiReservation::Bounded(327)
+        );
     }
 
     #[test]
@@ -8175,11 +8193,23 @@ mod tests {",
     #[test]
     fn no_ci_slice_is_zero_and_no_cgroup_falls_back_to_ci_jobs() {
         let d = cgroup_fixture(&[]);
-        assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Bounded(0));
+        assert_eq!(
+            ci_reservation_from_root(d.path()),
+            CiReservation::Bounded(0)
+        );
         let bare = tempfile::tempdir().unwrap();
-        assert_eq!(ci_reservation_from_root(bare.path()), CiReservation::NoCgroup);
-        assert_eq!(published_ci_reserved_gib(CiReservation::NoCgroup, 2), Some(32));
-        assert_eq!(published_ci_reserved_gib(CiReservation::NoCgroup, 0), Some(0));
+        assert_eq!(
+            ci_reservation_from_root(bare.path()),
+            CiReservation::NoCgroup
+        );
+        assert_eq!(
+            published_ci_reserved_gib(CiReservation::NoCgroup, 2),
+            Some(32)
+        );
+        assert_eq!(
+            published_ci_reserved_gib(CiReservation::NoCgroup, 0),
+            Some(0)
+        );
     }
 
     #[test]
@@ -8204,7 +8234,9 @@ mod tests {",
         let known = mk(CiReservation::Bounded(327));
         assert_eq!(known["ci_reserved_gib"].as_i64(), Some(327));
         assert_eq!(known["max_concurrent_agents"].as_i64(), Some(80));
-        assert!(mk(CiReservation::Unbounded).get("ci_reserved_gib").is_none());
+        assert!(mk(CiReservation::Unbounded)
+            .get("ci_reserved_gib")
+            .is_none());
     }
 
     #[test]
