@@ -102,9 +102,11 @@ impl WarmCredential {
 ///    that key rather than silently falling through to the user's OAuth quota.
 /// 2. `$ANTHROPIC_API_KEY` env-var fallback. Useful for CI lanes and local dev
 ///    where neither the OS keychain nor a Claude CLI OAuth file is set up.
-/// 3. OAuth access token from the Claude CLI's `.credentials.json`, skipped
+/// 3. A long-lived `claude setup-token` token for the account in force
+///    (`settings.json` `env.CLAUDE_CODE_OAUTH_TOKEN`).
+/// 4. OAuth access token from the Claude CLI's `.credentials.json`, skipped
 ///    if `expiresAt` is already in the past.
-/// 4. `None` — the warm provider is unavailable; the `auto` path should fall
+/// 5. `None` — the warm provider is unavailable; the `auto` path should fall
 ///    through to `Disabled`.
 pub(super) fn resolve_warm_credential() -> Option<WarmCredential> {
     // 1. Keychain API key wins when present.
@@ -135,7 +137,14 @@ pub(super) fn resolve_warm_credential() -> Option<WarmCredential> {
         }
     }
 
-    // 3. OAuth fallback via the Claude CLI credentials file.
+    // 3. A long-lived `claude setup-token` token for the account in force —
+    //    what a `claude` child under that account authenticates with.
+    if let Some((token, _source)) = crate::commands::ai_settings::find_long_lived_token() {
+        debug!("Warm credential: resolved from a long-lived OAuth token");
+        return Some(WarmCredential::OAuth(token));
+    }
+
+    // 4. OAuth fallback via the Claude CLI credentials file.
     let creds_path = crate::commands::ai_settings::find_claude_credentials_path()?;
     resolve_oauth_from_path(&creds_path).map(WarmCredential::OAuth)
 }
