@@ -119,12 +119,7 @@ mod imp {
     /// action; the armed first delivery writes the wake byte and arms the
     /// backstop, then returns. A failed write re-raises too — nothing would
     /// wake the watcher, so dying now is the only honest outcome.
-    pub fn handle(
-        sig: libc::c_int,
-        delivered: &AtomicBool,
-        wake_fd: &AtomicI32,
-        fx: &Effects,
-    ) {
+    pub fn handle(sig: libc::c_int, delivered: &AtomicBool, wake_fd: &AtomicI32, fx: &Effects) {
         (fx.mark_quitting)();
         let repeat = delivered.swap(true, Ordering::SeqCst);
         let fd = wake_fd.load(Ordering::SeqCst);
@@ -248,9 +243,7 @@ mod imp {
                 on_byte(byte as libc::c_int);
                 return;
             }
-            if n < 0
-                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-            {
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
             let why = if n == 0 {
@@ -476,15 +469,36 @@ mod tests {
             arm_backstop: |s| ALARMED.store(s as i32, Ordering::SeqCst),
             backstop_secs: 27,
         };
-        handle(libc::SIGTERM, &AtomicBool::new(false), &AtomicI32::new(9), &ok);
-        assert_eq!(RAISES.load(Ordering::SeqCst), 0, "armed first delivery returns");
+        handle(
+            libc::SIGTERM,
+            &AtomicBool::new(false),
+            &AtomicI32::new(9),
+            &ok,
+        );
+        assert_eq!(
+            RAISES.load(Ordering::SeqCst),
+            0,
+            "armed first delivery returns"
+        );
         assert_eq!(ALARMED.load(Ordering::SeqCst), 27, "backstop armed");
 
-        let failing = Effects { wake: no_wake, ..ok };
+        let failing = Effects {
+            wake: no_wake,
+            ..ok
+        };
         ALARMED.store(0, Ordering::SeqCst);
-        handle(libc::SIGTERM, &AtomicBool::new(false), &AtomicI32::new(9), &failing);
+        handle(
+            libc::SIGTERM,
+            &AtomicBool::new(false),
+            &AtomicI32::new(9),
+            &failing,
+        );
         assert_eq!(RAISES.load(Ordering::SeqCst), 1, "a failed wake re-raises");
-        assert_eq!(ALARMED.load(Ordering::SeqCst), 0, "and never arms the backstop");
+        assert_eq!(
+            ALARMED.load(Ordering::SeqCst),
+            0,
+            "and never arms the backstop"
+        );
     }
 
     /// The watcher stamps the clean marker BEFORE it reaches the app lookup,
@@ -507,9 +521,18 @@ mod tests {
                 order.borrow_mut().push("quit");
                 true
             },
-            |sig| order.borrow_mut().push(if sig == libc::SIGHUP { "reraise-hup" } else { "reraise-other" }),
+            |sig| {
+                order.borrow_mut().push(if sig == libc::SIGHUP {
+                    "reraise-hup"
+                } else {
+                    "reraise-other"
+                })
+            },
         );
-        assert_eq!(*order.borrow(), vec!["classified?", "stamp", "resolve", "reraise-hup"]);
+        assert_eq!(
+            *order.borrow(),
+            vec!["classified?", "stamp", "resolve", "reraise-hup"]
+        );
     }
 
     /// A signal before the boot classification ran must NOT stamp the clean
@@ -530,7 +553,13 @@ mod tests {
                 order.borrow_mut().push("quit");
                 true
             },
-            |sig| order.borrow_mut().push(if sig == libc::SIGTERM { "reraise-term" } else { "reraise-other" }),
+            |sig| {
+                order.borrow_mut().push(if sig == libc::SIGTERM {
+                    "reraise-term"
+                } else {
+                    "reraise-other"
+                })
+            },
         );
         assert_eq!(*order.borrow(), vec!["reraise-term"]);
     }
@@ -554,7 +583,10 @@ mod tests {
             |_| raised.set(true),
         );
         assert_eq!(*reason.borrow(), "signal SIGTERM");
-        assert!(!raised.get(), "a held latch means another door owns the exit");
+        assert!(
+            !raised.get(),
+            "a held latch means another door owns the exit"
+        );
     }
 
     /// The watcher hands one byte to its callback; a failed read disarms.
@@ -569,7 +601,11 @@ mod tests {
         let got = std::cell::Cell::new(0);
         watch(fds[0], &wake, |b| got.set(b));
         assert_eq!(got.get(), libc::SIGTERM);
-        assert_eq!(wake.load(Ordering::SeqCst), fds[1], "a byte does not disarm");
+        assert_eq!(
+            wake.load(Ordering::SeqCst),
+            fds[1],
+            "a byte does not disarm"
+        );
 
         // SAFETY: closing this test's own ends.
         unsafe {
@@ -784,7 +820,11 @@ mod tests {
                     let status = in_child(|| {
                         unblock($sig);
                         let _ = child_pipe(&W);
-                        set_disposition_for($sig, h as *const () as libc::sighandler_t, libc::SA_RESETHAND);
+                        set_disposition_for(
+                            $sig,
+                            h as *const () as libc::sighandler_t,
+                            libc::SA_RESETHAND,
+                        );
                         kill_self($sig);
                         pause_forever();
                     });
@@ -803,7 +843,11 @@ mod tests {
                     let status = in_child(|| {
                         unblock($sig);
                         let r = child_pipe(&W);
-                        set_disposition_for($sig, h as *const () as libc::sighandler_t, libc::SA_RESETHAND);
+                        set_disposition_for(
+                            $sig,
+                            h as *const () as libc::sighandler_t,
+                            libc::SA_RESETHAND,
+                        );
                         kill_self($sig);
                         let (n, all_match) = drain(r, $sig);
                         // SAFETY: cancel the injected backstop before exiting.
@@ -813,7 +857,11 @@ mod tests {
                         }
                     });
                     assert!(libc::WIFEXITED(status), "status {status:#x}");
-                    assert_eq!(libc::WEXITSTATUS(status), 7, "exit 42 = wrong byte count or value");
+                    assert_eq!(
+                        libc::WEXITSTATUS(status),
+                        7,
+                        "exit 42 = wrong byte count or value"
+                    );
                 }
 
                 /// Armed: a second delivery ends the child by the signal at once.
@@ -826,7 +874,11 @@ mod tests {
                     let status = in_child(|| {
                         unblock($sig);
                         let _ = child_pipe(&W);
-                        set_disposition_for($sig, h as *const () as libc::sighandler_t, libc::SA_RESETHAND);
+                        set_disposition_for(
+                            $sig,
+                            h as *const () as libc::sighandler_t,
+                            libc::SA_RESETHAND,
+                        );
                         kill_self($sig);
                         kill_self($sig);
                         pause_forever();
@@ -866,7 +918,11 @@ mod tests {
             unblock(libc::SIGTERM);
             unblock(libc::SIGHUP);
             for sig in [libc::SIGTERM, libc::SIGHUP] {
-                set_disposition_for(sig, h as *const () as libc::sighandler_t, libc::SA_RESETHAND);
+                set_disposition_for(
+                    sig,
+                    h as *const () as libc::sighandler_t,
+                    libc::SA_RESETHAND,
+                );
             }
             kill_self(libc::SIGTERM);
             kill_self(libc::SIGHUP);
@@ -876,7 +932,11 @@ mod tests {
         unsafe { libc::close(fds[1]) };
         assert!(libc::WIFSIGNALED(status), "status {status:#x}");
         assert_eq!(libc::WTERMSIG(status), libc::SIGHUP);
-        assert_eq!(drain(R.load(Ordering::SeqCst), libc::SIGTERM), (1, true), "exactly the first byte");
+        assert_eq!(
+            drain(R.load(Ordering::SeqCst), libc::SIGTERM),
+            (1, true),
+            "exactly the first byte"
+        );
         unsafe { libc::close(fds[0]) };
     }
 
@@ -920,7 +980,14 @@ mod tests {
     fn the_watcher_without_an_app_ends_the_process_by_the_signal() {
         let status = in_child(|| {
             unblock(libc::SIGTERM);
-            on_wake::<()>(libc::SIGTERM, || true, || {}, || None, |_, _| true, reraise_default);
+            on_wake::<()>(
+                libc::SIGTERM,
+                || true,
+                || {},
+                || None,
+                |_, _| true,
+                reraise_default,
+            );
         });
         assert!(libc::WIFSIGNALED(status), "status {status:#x}");
         assert_eq!(libc::WTERMSIG(status), libc::SIGTERM);
