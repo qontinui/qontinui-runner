@@ -36,8 +36,12 @@
 //!
 //! # The contract this module keeps
 //!
-//! - **Digests, never versions.** A task is (re)written only when its stored
-//!   `managed_digest` differs from the served `digest` (plan Phase 2).
+//! - **Digests, never versions.** A task is (re)written when its stored
+//!   `managed_digest` differs from the served `digest` (plan Phase 2), or when
+//!   the task rendered on THIS device this pass differs from the stored row
+//!   (a moved workspace root or bash, or a local edit through the ordinary
+//!   task PUT, which keeps coord's digest). A version-only change writes
+//!   nothing.
 //! - **Fail-safe deletes.** A managed task is deleted only when its tenant's
 //!   poll answered 2xx with a WELL-FORMED list that no longer names it. A 401,
 //!   404, 5xx, timeout, undecodable or malformed body, or a body naming another
@@ -50,7 +54,10 @@
 //!   passes through them. A `Script` command or a `requireProbe` command is
 //!   applied only when the agent has a `catalog_ref` AND the command equals
 //!   THIS binary's own pin for that entry ([`PROBE_PINS`], [`SCRIPT_PINS`]);
-//!   the runner resolves the pin's tokens itself. Custom agents are
+//!   the runner resolves the pin's tokens itself. The pin is over the command
+//!   ARGV only: the script it names is read from
+//!   `<workspace_root>/.claude/skills/...` on disk, and its CONTENTS are not
+//!   checked against this binary's bundled copy. Custom agents are
 //!   `RemoteAgent` only.
 //! - **Tenants are proven, not defaulted.** One poll per tenant in coord's own
 //!   bound set for this device (`pair::coord_bound_tenants_for_ask`, the
@@ -113,6 +120,9 @@ pub const REASON_REFUSED_TASK_TYPE: &str = "refused_task_type";
 pub const REASON_REFUSED_TOOL_WIDENING: &str = "refused_tool_widening";
 pub const REASON_COORD_UNRESOLVABLE_PREFIX: &str = "coord_unresolvable:";
 pub const REASON_SPEC_UNPARSEABLE: &str = "spec_unparseable";
+pub const REASON_SPEC_PROJECTION_MISMATCH: &str = "spec_projection_mismatch";
+pub const REASON_NAME_COLLISION_FOREIGN_TENANT: &str = "name_collision_foreign_tenant";
+pub const REASON_PATH_NOT_UNDER_WORKSPACE_ROOT: &str = "path_not_under_workspace_root";
 pub const REASON_APPLY_CONFLICT: &str = "apply_conflict";
 pub const REASON_APPLY_FAILED: &str = "apply_failed";
 pub const REASON_MANAGED_KEY_INDEX_MISSING: &str = "managed_key_index_missing";
@@ -140,9 +150,10 @@ pub struct ProbePin {
 /// Every probe pin this build carries. One entry per coord catalog entry with a
 /// `ProbePin` at qontinui-coord origin/main `eed57ed83`
 /// (`crates/coord/src/recurring_agents.rs:568-581`: return-to-main only). The
-/// script it names is this binary's own bundled copy
+/// script NAME it carries is one this binary bundles
 /// (`src/fleet_skills/return-to-main/machine-quiesce-check.sh`), pinned by
-/// `tests::every_probe_pin_names_a_script_this_binary_bundles`.
+/// `tests::every_probe_pin_names_a_script_this_binary_bundles`; the pin fixes
+/// the argv, not the bytes of the file found on disk at run time.
 pub static PROBE_PINS: &[ProbePin] = &[ProbePin {
     catalog_ref: "return-to-main",
     pin_id: "return-to-main/machine-quiesce-check",
@@ -224,6 +235,31 @@ pub struct DesiredList {
     pub entries: BTreeMap<String, ServedEntry>,
 }
 
+/// The top-level fields coord serves beside `spec` are projections of it
+/// (`device_entry`, `recurring_agents_store.rs:1038-1055`), and the digest is
+/// over `spec` only. A projection that disagrees with `spec` means the digest
+/// does not describe what would be applied, so such an entry is not applied
+/// (kept as unresolvable). Pairs: (top-level key, `spec` key).
+const SPEC_PROJECTIONS: &[(&str, &str)] = &[
+    ("task_spec", "task"),
+    ("conditions", "conditions"),
+    ("schedule", "schedule"),
+    ("timezone", "timezone"),
+    ("enabled", "enabled"),
+    ("catch_up_policy", "catch_up_policy"),
+    ("catalog_ref", "catalog_ref"),
+    ("params", "params"),
+];
+
+fn projections_match(raw: &Value) -> bool {
+    let Some(spec) = raw.get("spec").filter(|s| s.is_object()) else {
+        return false;
+    };
+    SPEC_PROJECTIONS.iter().all(|(top, inner)| {
+        raw.get(*top).unwrap_or(&Value::Null) == spec.get(*inner).unwrap_or(&Value::Null)
+    })
+}
+
 /// Parse coord's body for a poll made as `requested`. `Err` = not a
 /// well-formed list, which must change NOTHING: an unexpected shape, a
 /// `spec_version` this build does not know, a `tenant_id` echo that is not the
@@ -262,6 +298,9 @@ pub fn parse_device_list(body: &Value, requested: Uuid) -> Result<DesiredList, S
             return Err("an agent entry has no name".to_string());
         };
         let entry = match serde_json::from_value::<RecurringAgentSpec>(raw.clone()) {
+            Ok(_) if !projections_match(raw) => ServedEntry::Unresolvable {
+                reason: REASON_SPEC_PROJECTION_MISMATCH.to_string(),
+            },
             Ok(spec) if spec.name == name => {
                 let body = raw.get("spec");
                 let flag = |k: &str| body.and_then(|b| b.get(k)).and_then(Value::as_bool);
@@ -507,10 +546,17 @@ pub fn plan(
             return out;
         }
     };
+    // Names a coord-managed row of an UNPROVEN tenant occupies: creating a
+    // proven tenant's task under one would leave two tasks firing.
+    let mut foreign_names: BTreeSet<&str> = BTreeSet::new();
     for task in local.iter().filter(|t| is_coord_managed(t)) {
         let key = coord_key(task);
         if key.is_some_and(|(t, _)| proven.contains(&t)) {
             continue;
+        }
+        foreign_names.insert(task.name.as_str());
+        if let Some(m) = &task.managed {
+            foreign_names.insert(m.agent.as_str());
         }
         let agent = task
             .managed
@@ -545,17 +591,57 @@ pub fn plan(
                     list.tenant_id
                 ));
             }
-            Ok(list) => plan_tenant(*tenant, list, local, ctx, &mut out.actions, &mut report),
+            Ok(list) => plan_tenant(
+                *tenant,
+                list,
+                local,
+                &foreign_names,
+                ctx,
+                &mut out.actions,
+                &mut report,
+            ),
         }
         out.tenants.push(report);
     }
     out
 }
 
+/// Does the stored managed task already hold exactly what `desired` would
+/// write? Compared field by field through serde (the stored row is what the
+/// store reads back), plus coord's digest via the managed key. `enabled` is
+/// one-way: a local disable under an enabled declaration is a pause (kept,
+/// reported `paused`), while a task enabled locally under a DISABLED
+/// declaration is not current.
+fn is_current(stored: &ScheduledTask, desired: &DesiredTask) -> bool {
+    fn same<T: Serialize>(a: &T, b: &T) -> bool {
+        serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
+    }
+    // The managed key and coord's DIGEST — never `version`, which is display
+    // only (plan Phase 2): a version-only difference is not a write.
+    let key_and_digest = stored.managed.as_ref().is_some_and(|m| {
+        m.source == desired.managed.source
+            && m.tenant_id == desired.managed.tenant_id
+            && m.agent == desired.managed.agent
+            && m.digest == desired.managed.digest
+    });
+    key_and_digest
+        && stored.name == desired.name
+        && stored.description == desired.description
+        && same(&stored.schedule, &desired.schedule)
+        && same(&stored.task, &desired.task)
+        && same(&stored.conditions, &desired.conditions)
+        && stored.skip_if_completed == desired.skip_if_completed
+        && stored.auto_fix_on_failure == desired.auto_fix_on_failure
+        && same(&stored.catch_up_policy, &desired.catch_up_policy)
+        && stored.timezone == desired.timezone
+        && (desired.enabled || !stored.enabled)
+}
+
 fn plan_tenant(
     tenant: Uuid,
     list: &DesiredList,
     local: &[ScheduledTask],
+    foreign_names: &BTreeSet<&str>,
     ctx: &LocalContext<'_>,
     actions: &mut Vec<PlannedAction>,
     report: &mut TenantReport,
@@ -590,12 +676,41 @@ fn plan_tenant(
             ServedEntry::Agent(a) => a,
         };
         let served = agent.spec.digest.as_deref();
-        let stored_digest = stored
-            .and_then(|t| t.managed.as_ref())
-            .and_then(|m| m.digest.as_deref());
-        if let (Some(task), Some(s)) = (stored, served) {
-            if stored_digest == Some(s) {
-                let state = if !task.enabled && agent.spec.enabled {
+        if stored.is_none() {
+            // Creating would put a second task of this name on the device.
+            let collision = if unmanaged_names.contains(name.as_str()) {
+                Some(REASON_NAME_COLLISION_UNMANAGED)
+            } else if foreign_names.contains(name.as_str()) {
+                // A row an unproven tenant's declaration left behind (e.g.
+                // before a re-bind) still fires; a second one would double it.
+                Some(REASON_NAME_COLLISION_FOREIGN_TENANT)
+            } else {
+                None
+            };
+            if let Some(reason) = collision {
+                report.agents.push(outcome(
+                    tenant,
+                    name,
+                    RecurringAgentState::Unapplied,
+                    Some(reason),
+                    None,
+                    served,
+                ));
+                continue;
+            }
+        }
+        // Rendered EVERY pass, not only on a digest change: the device-resolved
+        // half (workspace root, bash path) can move under an unchanged digest,
+        // and a local edit through the ordinary task PUT keeps coord's digest.
+        match render(tenant, agent, ctx) {
+            Err((state, reason)) => {
+                report
+                    .agents
+                    .push(outcome(tenant, name, state, Some(reason), stored, served));
+            }
+            Ok(desired) if stored.is_some_and(|t| is_current(t, &desired)) => {
+                let task = stored.expect("guarded by is_some_and");
+                let state = if !task.enabled && desired.enabled {
                     RecurringAgentState::Paused
                 } else {
                     RecurringAgentState::Applied
@@ -603,25 +718,6 @@ fn plan_tenant(
                 report
                     .agents
                     .push(outcome(tenant, name, state, None, stored, served));
-                continue;
-            }
-        }
-        if stored.is_none() && unmanaged_names.contains(name.as_str()) {
-            report.agents.push(outcome(
-                tenant,
-                name,
-                RecurringAgentState::Unapplied,
-                Some(REASON_NAME_COLLISION_UNMANAGED),
-                None,
-                served,
-            ));
-            continue;
-        }
-        match render(tenant, agent, ctx) {
-            Err((state, reason)) => {
-                report
-                    .agents
-                    .push(outcome(tenant, name, state, Some(reason), stored, served));
             }
             Ok(desired) => {
                 let mut o = outcome(
@@ -765,6 +861,25 @@ fn render(
             if let Some(probe) = c.require_probe.as_mut() {
                 probe.command = resolve_probe_argv(&probe.command, ctx)?;
             }
+            // A repo-inactivity watch names paths this device stats. Coord
+            // serves none today (no catalog entry carries one, and a custom
+            // agent may carry no `conditions`), so one served here must be
+            // `{workspace_root}[/<relative>]`, resolved under the same rule as
+            // a working directory — never a device path from a fleet-wide row.
+            if let Some(repo) = c.require_repo_inactive.as_mut() {
+                for watch in &mut repo.repositories {
+                    let resolved = watch
+                        .path
+                        .strip_prefix(WORKSPACE_ROOT_TOKEN)
+                        .map(|rest| (rest, workspace_root(ctx)))
+                        .ok_or_else(|| unapplied(REASON_PATH_NOT_UNDER_WORKSPACE_ROOT))?;
+                    let (rest, root) = resolved;
+                    watch.path = join_relative(root?, rest)
+                        .ok_or_else(|| unapplied(REASON_PATH_NOT_UNDER_WORKSPACE_ROOT))?
+                        .to_string_lossy()
+                        .into_owned();
+                }
+            }
             if crate::scheduler_probe::validate_conditions(&c).is_err() {
                 return Err(unapplied(REASON_SPEC_INVALID));
             }
@@ -800,8 +915,18 @@ fn workspace_root<'a>(ctx: &'a LocalContext<'_>) -> Result<&'a Path, Refusal> {
     }
 }
 
-/// `{root}/a/b` → `root` joined with `a`, `b`; refuses empty and `..`
-/// segments. `None` when `rest` is empty.
+/// `{root}/a/b` → `base` joined with `a`, `b`, or `None` when the result could
+/// land anywhere but under `base`. `rest` is empty (→ `base`) or `/`-led.
+///
+/// Every segment must be ONE plain path component on every platform: no `\`
+/// (a Windows separator, so `..\..\x` cannot hide a traversal inside one
+/// `/`-segment), no `:` (a drive or a stream: `C:\Windows` and `C:x` push as
+/// absolute or drive-relative on Windows), no trailing `.` or space (Win32
+/// strips them, so `.. ` and `...` resolve as `..`), no control character,
+/// and exactly one `Component::Normal` (refusing `""`, `.`, `..` and anything
+/// rooted). The
+/// joined path is then required to start with `base`, as a belt over the
+/// segment rule.
 fn join_relative(base: &Path, rest: &str) -> Option<PathBuf> {
     if rest.is_empty() {
         return Some(base.to_path_buf());
@@ -809,12 +934,33 @@ fn join_relative(base: &Path, rest: &str) -> Option<PathBuf> {
     let rest = rest.strip_prefix('/')?;
     let mut p = base.to_path_buf();
     for seg in rest.split('/') {
-        if seg.is_empty() || seg == ".." || seg == "." {
+        if !is_plain_segment(seg) {
             return None;
         }
         p.push(seg);
     }
-    Some(p)
+    p.starts_with(base).then_some(p)
+}
+
+/// One plain path component on every platform (see [`join_relative`]).
+fn is_plain_segment(seg: &str) -> bool {
+    // Win32 path normalization strips a component's trailing dots and spaces,
+    // so `.. ` and `...` resolve as `..` there; a control character (NUL
+    // included) is never a legitimate component. At least as strict as
+    // coord's mirror of this rule (qontinui-coord#3676).
+    if seg.is_empty()
+        || seg == "."
+        || seg == ".."
+        || seg.ends_with(['.', ' '])
+        || seg.chars().any(|c| c == '\\' || c == ':' || c.is_control())
+    {
+        return false;
+    }
+    let mut components = Path::new(seg).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
 }
 
 /// A served working directory is `{workspace_root}` or
@@ -862,7 +1008,7 @@ fn resolve_probe_argv(argv: &[String], ctx: &LocalContext<'_>) -> Result<Vec<Str
             let (skill, rest) = after
                 .split_once('}')
                 .ok_or_else(|| unapplied(REASON_PROBE_UNRESOLVABLE))?;
-            if skill.is_empty() || skill.contains(['/', '\\', '.']) {
+            if skill.is_empty() || skill.contains(['/', '\\', '.', ':']) {
                 return Err(unapplied(REASON_PROBE_UNRESOLVABLE));
             }
             let dir = workspace_root(ctx)?
@@ -1128,8 +1274,21 @@ async fn poll_tenant(tenant: Uuid) -> Result<DesiredList, TenantPollStatus> {
     let Some(bearer) = bearer else {
         return Err(TenantPollStatus::NoCredential);
     };
-    use crate::mcp::fleet_policy_poller::{fetch_coord_json_with, FetchError};
-    match fetch_coord_json_with::<Value>(DEVICE_READ_PATH, &bearer).await {
+    let fetched =
+        crate::mcp::fleet_policy_poller::fetch_coord_json_with::<Value>(DEVICE_READ_PATH, &bearer)
+            .await;
+    poll_status_for(fetched, tenant)
+}
+
+/// One poll's fetch result → the tenant's list, or why there is none. PURE.
+/// Every failure is an `Err` — which the planner turns into "change nothing"
+/// for that tenant — never an empty list.
+fn poll_status_for(
+    fetched: Result<Value, crate::mcp::fleet_policy_poller::FetchError>,
+    tenant: Uuid,
+) -> Result<DesiredList, TenantPollStatus> {
+    use crate::mcp::fleet_policy_poller::FetchError;
+    match fetched {
         Ok(body) => parse_device_list(&body, tenant).map_err(TenantPollStatus::Malformed),
         Err(FetchError::NoJwt) => Err(TenantPollStatus::NoCredential),
         Err(FetchError::AuthOrAbsent(code)) => Err(TenantPollStatus::FetchFailed(format!(

@@ -128,7 +128,23 @@ const COORD_DEVICE_READ_FIXTURE: &str = r#"{
       "version": 1,
       "row_version": 1,
       "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-      "spec": {"description": "Custom recurring agent `daily-digest`. Managed by coord (recurring agents)."}
+      "spec": {
+        "spec_version": 1,
+        "name": "daily-digest",
+        "catalog_ref": null,
+        "description": "Custom recurring agent `daily-digest`. Managed by coord (recurring agents).",
+        "enabled": true,
+        "schedule": {"type": "Cron", "value": "0 7 * * *"},
+        "timezone": "Europe/Berlin",
+        "catch_up_policy": "skip",
+        "task": {"task_type": "RemoteAgent", "prompt": "Summarise yesterday's findings.", "working_directory": "{workspace_root}"},
+        "conditions": null,
+        "pins": {},
+        "params": {},
+        "skip_if_completed": false,
+        "auto_fix_on_failure": false,
+        "outcome_topic": null
+      }
     }
   ],
   "unresolvable": [
@@ -164,6 +180,24 @@ fn fixture_agent(name: &str) -> Value {
 
 /// A served list for `TENANT` carrying exactly `agents`.
 fn list_of(agents: Vec<Value>) -> DesiredList {
+    list_of_raw(agents.into_iter().map(synced).collect())
+}
+
+/// `agent` with its digested `spec` brought in line with the top-level
+/// fields a test edited, as coord would serve it (`device_entry` projects
+/// `spec`). Tests edit the top level; this keeps them well-formed.
+fn synced(mut agent: Value) -> Value {
+    if agent.get("spec").is_some_and(Value::is_object) {
+        for (top, inner) in SPEC_PROJECTIONS {
+            let v = agent.get(*top).cloned().unwrap_or(Value::Null);
+            agent["spec"][*inner] = v;
+        }
+    }
+    agent
+}
+
+/// A served list exactly as given — no [`synced`].
+fn list_of_raw(agents: Vec<Value>) -> DesiredList {
     let body = json!({
         "tenant_id": TENANT,
         "device_id": "c79a07d5-7e40-4b2a-9c1d-0a1b2c3d4e5f",
@@ -232,6 +266,17 @@ fn managed_task(name: &str, tenant: &str, digest: &str) -> ScheduledTask {
         digest: Some(digest.to_string()),
     });
     t
+}
+
+/// The stored row this device would hold after applying `agent` at the
+/// default context: the planner's own render, merged exactly as the executor
+/// merges it.
+fn rendered(agent: Value) -> ScheduledTask {
+    let p = run(list_of(vec![agent]), &[]);
+    let ups = upserts(&p);
+    assert_eq!(ups.len(), 1, "{:?}", p.tenants);
+    let d = ups[0].1;
+    crate::mcp::scheduler::merge_managed_task(None, upsert_request(d), d.managed.clone())
 }
 
 fn run(list: DesiredList, local: &[ScheduledTask]) -> Plan {
@@ -434,11 +479,12 @@ fn a_changed_digest_updates_the_stored_task() {
     assert!(deletes(&p).is_empty());
 }
 
-/// Version is display only: an equal digest with a different version is a
-/// no-op, and a different digest with an equal version is an update.
+/// Version is display only: a stored task that is the current render at the
+/// served digest is left alone whatever the version, and a different digest
+/// with an equal version is an update.
 #[test]
 fn an_equal_digest_is_left_alone_whatever_the_version() {
-    let stored = managed_task("cleanup-steward", TENANT, DIGEST_A);
+    let stored = rendered(fixture_agent("cleanup-steward"));
     let mut bumped = fixture_agent("cleanup-steward");
     bumped["version"] = json!(9);
     let p = run(list_of(vec![bumped]), std::slice::from_ref(&stored));
@@ -448,7 +494,8 @@ fn an_equal_digest_is_left_alone_whatever_the_version() {
     assert_eq!(o.applied_digest.as_deref(), Some(DIGEST_A));
     assert_eq!(o.task_id.as_deref(), Some(stored.id.as_str()));
 
-    let stored_b = managed_task("cleanup-steward", TENANT, DIGEST_B);
+    let mut stored_b = stored.clone();
+    stored_b.managed.as_mut().unwrap().digest = Some(DIGEST_B.to_string());
     let p = run(
         list_of(vec![fixture_agent("cleanup-steward")]),
         std::slice::from_ref(&stored_b),
@@ -456,15 +503,111 @@ fn an_equal_digest_is_left_alone_whatever_the_version() {
     assert_eq!(upserts(&p).len(), 1);
 }
 
+type Edit = Box<dyn Fn(&mut ScheduledTask)>;
+
+/// At coord's digest, a stored row that is NOT what this device renders —
+/// a local edit through the ordinary task PUT, or a moved workspace root — is
+/// rewritten; an identical one is not.
+#[test]
+fn a_stored_row_at_the_served_digest_that_drifted_is_rewritten() {
+    let current = rendered(fixture_agent("cleanup-steward"));
+    let p = run(
+        list_of(vec![fixture_agent("cleanup-steward")]),
+        std::slice::from_ref(&current),
+    );
+    assert!(p.actions.is_empty(), "identical: {:?}", p.actions);
+
+    let edits: Vec<(&str, Edit)> = vec![
+        (
+            "working_directory",
+            Box::new(|t| {
+                if let ScheduledTaskType::RemoteAgent {
+                    working_directory, ..
+                } = &mut t.task
+                {
+                    *working_directory = Some("/somewhere/else".into());
+                }
+            }),
+        ),
+        (
+            "prompt",
+            Box::new(|t| {
+                if let ScheduledTaskType::RemoteAgent { prompt, .. } = &mut t.task {
+                    *prompt = "/cleanup-steward --mode=reap --classes=1,2,3".into();
+                }
+            }),
+        ),
+        (
+            "schedule",
+            Box::new(|t| {
+                t.schedule = crate::scheduler::ScheduleExpression::Cron("* * * * *".into())
+            }),
+        ),
+        (
+            "conditions",
+            Box::new(|t| t.conditions = Some(ScheduleConditions::default())),
+        ),
+        ("timezone", Box::new(|t| t.timezone = Some("UTC".into()))),
+    ];
+    for (what, edit) in edits {
+        let mut drifted = current.clone();
+        edit(&mut drifted);
+        let p = run(
+            list_of(vec![fixture_agent("cleanup-steward")]),
+            std::slice::from_ref(&drifted),
+        );
+        let ups = upserts(&p);
+        assert_eq!(ups.len(), 1, "{what}");
+        assert_eq!(ups[0].0.as_ref().unwrap().id, current.id, "{what}");
+        assert_eq!(
+            working_directory(ups[0].1),
+            Some(root().to_string_lossy().as_ref()),
+            "{what}"
+        );
+    }
+
+    // The workspace root moved on this device: same digest, new render.
+    let moved = PathBuf::from("/moved/root");
+    let p = plan(
+        &proven(),
+        &[(
+            tenant(),
+            Ok(list_of(vec![fixture_agent("cleanup-steward")])),
+        )],
+        std::slice::from_ref(&current),
+        &ctx_with(WorkspaceRootRead::Set(moved.clone())),
+    );
+    let ups = upserts(&p);
+    assert_eq!(ups.len(), 1);
+    assert_eq!(
+        working_directory(ups[0].1),
+        Some(moved.to_string_lossy().as_ref())
+    );
+
+    // A task enabled locally under a DISABLED declaration is rewritten.
+    let mut disabled = fixture_agent("cleanup-steward");
+    disabled["enabled"] = json!(false);
+    disabled["spec"]["enabled"] = json!(false);
+    let mut stored = rendered(disabled.clone());
+    stored.enabled = true;
+    let p = run(list_of(vec![disabled]), std::slice::from_ref(&stored));
+    assert_eq!(upserts(&p).len(), 1);
+    assert!(!upserts(&p)[0].1.enabled);
+}
+
 #[test]
 fn a_locally_disabled_task_at_the_current_digest_is_reported_paused() {
-    let mut stored = managed_task("cleanup-steward", TENANT, DIGEST_A);
+    let mut stored = rendered(fixture_agent("cleanup-steward"));
     stored.enabled = false;
     let p = run(
         list_of(vec![fixture_agent("cleanup-steward")]),
         std::slice::from_ref(&stored),
     );
-    assert!(p.actions.is_empty());
+    assert!(
+        p.actions.is_empty(),
+        "a pause is not drift: {:?}",
+        p.actions
+    );
     assert_eq!(
         agent_outcome(&p, "cleanup-steward").state,
         RecurringAgentState::Paused
@@ -803,7 +946,8 @@ fn a_probe_whose_bundled_script_is_absent_is_unapplied_not_installed() {
 // ---- tenants -----------------------------------------------------------------------
 
 /// Phase 0.1: a managed row whose tenant this device has not proven is left
-/// alone and reported, never adopted or deleted.
+/// alone and reported, never adopted or deleted — and its NAME blocks a
+/// proven tenant's create (both would fire).
 #[test]
 fn a_foreign_tenant_row_is_left_alone_and_reported() {
     let foreign = managed_task("cleanup-steward", OTHER_TENANT, DIGEST_B);
@@ -811,16 +955,29 @@ fn a_foreign_tenant_row_is_left_alone_and_reported() {
         list_of(vec![fixture_agent("cleanup-steward")]),
         std::slice::from_ref(&foreign),
     );
-    // The proven tenant's agent is created as its OWN managed task...
-    let ups = upserts(&p);
-    assert_eq!(ups.len(), 1);
-    assert!(ups[0].0.is_none(), "the foreign row is not adopted");
-    // ...and the foreign row is neither updated nor deleted.
-    assert!(deletes(&p).is_empty());
+    assert!(p.actions.is_empty(), "{:?}", p.actions);
+    let o = agent_outcome(&p, "cleanup-steward");
+    assert_eq!(o.state, RecurringAgentState::Unapplied);
+    assert_eq!(
+        o.reason.as_deref(),
+        Some(REASON_NAME_COLLISION_FOREIGN_TENANT)
+    );
+    assert_eq!(o.task_id, None, "the foreign row is not the agent's task");
     assert_eq!(p.unproven.len(), 1);
     assert_eq!(p.unproven[0].tenant_id, other_tenant());
     assert_eq!(p.unproven[0].reason.as_deref(), Some(REASON_FOREIGN_TENANT));
     assert_eq!(p.unproven[0].task_id.as_deref(), Some(foreign.id.as_str()));
+
+    // A foreign row of ANOTHER name blocks nothing, and is not adopted.
+    let other = managed_task("dev-ops-steward", OTHER_TENANT, DIGEST_B);
+    let p = run(
+        list_of(vec![fixture_agent("cleanup-steward")]),
+        std::slice::from_ref(&other),
+    );
+    let ups = upserts(&p);
+    assert_eq!(ups.len(), 1);
+    assert!(ups[0].0.is_none(), "the foreign row is not adopted");
+    assert!(deletes(&p).is_empty());
 }
 
 /// UNKNOWN bindings withhold everything: no apply, no delete — even with a
@@ -985,4 +1142,183 @@ fn every_unapplied_or_refused_outcome_carries_a_reason_and_no_other_does() {
             .as_deref()
             .is_none_or(|r| !r.trim().is_empty() && r.len() <= 256));
     }
+}
+
+// ---- review round 1 ----------------------------------------------------------
+
+/// No segment may escape the workspace root on ANY platform: Windows
+/// separators, drives, rooted segments and traversals are refused, not
+/// pushed (on Windows `PathBuf::push` of an absolute or rooted segment
+/// REPLACES the base).
+#[test]
+fn join_relative_never_leaves_the_base() {
+    let base = root();
+    for bad in [
+        "/..",
+        "/.",
+        "/a/../b",
+        "/a//b",
+        "/a/",
+        "/..\\..\\Users\\x",
+        "/a\\..\\..\\b",
+        "/C:\\Windows",
+        "/C:x",
+        "/C:",
+        "/\\x",
+        "/\\\\server\\share",
+        "/a:stream",
+        "x",
+        "\\x",
+        // Win32 strips trailing dots and spaces: these resolve as `..` there.
+        "/.. ",
+        "/...",
+        "/a/.. /b",
+        "/a.",
+        "/a ",
+        // Control characters, NUL included.
+        "/a\0b",
+        "/\0",
+        "/a\nb",
+        "/a\tb",
+    ] {
+        assert_eq!(join_relative(&base, bad), None, "{bad:?}");
+    }
+    assert_eq!(join_relative(&base, ""), Some(base.clone()));
+    assert_eq!(
+        join_relative(&base, "/qontinui-dev-notes/plans"),
+        Some(base.join("qontinui-dev-notes").join("plans"))
+    );
+    for good in ["/a", "/a/b.c", "/.hidden", "/a..b", "/a b"] {
+        let p = join_relative(&base, good).expect(good);
+        assert!(p.starts_with(&base), "{good}");
+    }
+}
+
+/// The same refusals reach a served working directory and a served
+/// repo-inactivity path; neither is installed.
+#[test]
+fn a_served_path_that_escapes_the_workspace_root_is_not_applied() {
+    for bad in [
+        "{workspace_root}/..\\..\\Users\\x",
+        "{workspace_root}/C:\\Windows",
+        "{workspace_root}/\\x",
+        "{workspace_root}/C:x",
+        "{workspace_root}/.. ",
+        "{workspace_root}/...",
+        "{workspace_root}/a\0",
+    ] {
+        let mut a = fixture_agent("daily-digest");
+        a["task_spec"]["working_directory"] = json!(bad);
+        a["spec"]["task"]["working_directory"] = json!(bad);
+        let p = run(list_of(vec![a]), &[]);
+        assert!(p.actions.is_empty(), "{bad}");
+        assert_eq!(
+            agent_outcome(&p, "daily-digest").reason.as_deref(),
+            Some(REASON_WORKING_DIRECTORY_NOT_TOKENIZED),
+            "{bad}"
+        );
+    }
+    let repo_inactive = |path: &str| {
+        json!({"requireRepoInactive": {"enabled": true,
+            "repositories": [{"path": path, "inactiveMinutes": 30}]}})
+    };
+    for bad in [
+        "/etc",
+        "C:\\Windows",
+        "{workspace_root}/..\\x",
+        "{workspace_root}/../x",
+    ] {
+        let mut a = fixture_agent("cleanup-steward");
+        a["conditions"] = repo_inactive(bad);
+        a["spec"]["conditions"] = repo_inactive(bad);
+        let p = run(list_of(vec![a]), &[]);
+        assert!(p.actions.is_empty(), "{bad}");
+        assert_eq!(
+            agent_outcome(&p, "cleanup-steward").reason.as_deref(),
+            Some(REASON_PATH_NOT_UNDER_WORKSPACE_ROOT),
+            "{bad}"
+        );
+    }
+    let mut ok = fixture_agent("cleanup-steward");
+    ok["conditions"] = repo_inactive("{workspace_root}/qontinui-runner");
+    ok["spec"]["conditions"] = repo_inactive("{workspace_root}/qontinui-runner");
+    let p = run(list_of(vec![ok]), &[]);
+    let ups = upserts(&p);
+    assert_eq!(ups.len(), 1, "{:?}", p.tenants);
+    let watched = &ups[0]
+        .1
+        .conditions
+        .as_ref()
+        .unwrap()
+        .require_repo_inactive
+        .as_ref()
+        .unwrap()
+        .repositories[0]
+        .path;
+    assert_eq!(
+        watched,
+        &root()
+            .join("qontinui-runner")
+            .to_string_lossy()
+            .into_owned()
+    );
+}
+
+/// The digest is over `spec`; a top-level projection that disagrees with it
+/// is not applied, and the stored task is kept.
+#[test]
+fn a_projection_that_disagrees_with_the_digested_spec_is_kept_unresolvable() {
+    let stored = managed_task("cleanup-steward", TENANT, DIGEST_B);
+    let mut prompt = fixture_agent("cleanup-steward");
+    prompt["task_spec"]["prompt"] = json!("/something-else");
+    let mut conditions = fixture_agent("cleanup-steward");
+    conditions["conditions"] = fixture_agent("return-to-main")["conditions"].clone();
+    let mut no_spec = fixture_agent("cleanup-steward");
+    no_spec.as_object_mut().unwrap().remove("spec");
+    let mut enabled = fixture_agent("cleanup-steward");
+    enabled["enabled"] = json!(false);
+    for a in [prompt, conditions, no_spec, enabled] {
+        let p = run(list_of_raw(vec![a.clone()]), std::slice::from_ref(&stored));
+        assert!(p.actions.is_empty(), "{a}");
+        let o = agent_outcome(&p, "cleanup-steward");
+        assert_eq!(o.state, RecurringAgentState::Unapplied);
+        assert_eq!(o.reason.as_deref(), Some(REASON_SPEC_PROJECTION_MISMATCH));
+        assert_eq!(o.applied_digest.as_deref(), Some(DIGEST_B));
+    }
+}
+
+/// Every fetch failure maps to a status that changes nothing; only a 2xx
+/// body becomes a list, and a 2xx body that is not a list is `Malformed`.
+#[test]
+fn poll_status_maps_every_fetch_outcome() {
+    use crate::mcp::fleet_policy_poller::FetchError;
+    assert_eq!(
+        poll_status_for(Err(FetchError::NoJwt), tenant()).unwrap_err(),
+        TenantPollStatus::NoCredential
+    );
+    for code in [401, 404] {
+        assert_eq!(
+            poll_status_for(Err(FetchError::AuthOrAbsent(code)), tenant()).unwrap_err(),
+            TenantPollStatus::FetchFailed(format!("coord status {code}"))
+        );
+    }
+    assert_eq!(
+        poll_status_for(Err(FetchError::Failed("coord status 503".into())), tenant()).unwrap_err(),
+        TenantPollStatus::FetchFailed("coord status 503".into())
+    );
+    assert!(matches!(
+        poll_status_for(Ok(json!({"error": "schema_migration_pending"})), tenant()),
+        Err(TenantPollStatus::Malformed(_))
+    ));
+    assert!(matches!(
+        poll_status_for(Ok(json!([])), tenant()),
+        Err(TenantPollStatus::Malformed(_))
+    ));
+    let list = poll_status_for(Ok(fixture()), tenant()).expect("coord's body is a list");
+    assert_eq!(list.entries.len(), 4);
+    // Answered for another tenant: Malformed, not a list.
+    assert!(matches!(
+        poll_status_for(Ok(fixture()), other_tenant()),
+        Err(TenantPollStatus::Malformed(_))
+    ));
 }

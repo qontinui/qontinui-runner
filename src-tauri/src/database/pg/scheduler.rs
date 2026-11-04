@@ -174,7 +174,14 @@ impl std::fmt::Display for ManagedUpsertError {
 /// The conditional update of the task carrying a managed key (see
 /// [`PgDb::upsert_managed_scheduled_task`]): every user-visible column plus
 /// `managed_version`, `managed_digest` and `timezone`, keyed on the managed
-/// key AND the `modified_at` the caller read. The key columns themselves are
+/// key AND the `modified_at` the caller read.
+///
+/// `condition_status` is written ONLY when `conditions` changes: the
+/// scheduler's condition-wait writer (`update_task_condition_status`) does not
+/// move `modified_at`, so the caller's snapshot can be stale by the time this
+/// runs, and an unchanged-conditions write keeps the row's CURRENT wait rather
+/// than replaying the snapshot (`SET` expressions read the row's OLD
+/// `conditions`). The key columns themselves are
 /// never rewritten; `id`, `created_at`, `last_run_id` and
 /// `consecutive_launch_failures` are left alone.
 const MANAGED_UPDATE_SQL: &str = r#"
@@ -194,7 +201,8 @@ const MANAGED_UPDATE_SQL: &str = r#"
         catch_up_grace_seconds = $13,
         launch_failure_backoff_seconds = $14,
         conditions = $15,
-        condition_status = $16,
+        condition_status = CASE WHEN conditions IS NOT DISTINCT FROM $15
+                                THEN condition_status ELSE $16 END,
         managed_version = $17,
         managed_digest = $18,
         timezone = $19
@@ -204,6 +212,14 @@ const MANAGED_UPDATE_SQL: &str = r#"
       AND modified_at = $23
     RETURNING id
 "#;
+
+/// [`PgDb::delete_managed_scheduled_task`]'s one statement: the id AND the
+/// whole managed key, so neither an unmanaged task nor a re-keyed one matches.
+const MANAGED_DELETE_SQL: &str = "DELETE FROM scheduled_tasks \
+     WHERE id = $1 \
+       AND managed_source = $2 \
+       AND managed_tenant_id = ($3::text)::uuid \
+       AND managed_agent = $4";
 
 /// Parse a `catch_up_policy` text value from the DB into the typed enum.
 /// Falls back to [`CatchUpPolicy::default`] for unknown / null values so
@@ -1060,14 +1076,7 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
         let deleted = conn
-            .execute(
-                "DELETE FROM scheduled_tasks \
-                 WHERE id = $1 \
-                   AND managed_source = $2 \
-                   AND managed_tenant_id = ($3::text)::uuid \
-                   AND managed_agent = $4",
-                &[&id, &source, &tenant_id, &agent],
-            )
+            .execute(MANAGED_DELETE_SQL, &[&id, &source, &tenant_id, &agent])
             .await
             .map_err(|e| format!("PG delete_managed_scheduled_task {id}: {e}"))?;
         Ok(deleted == 1)
@@ -1769,6 +1778,46 @@ mod tests {
             "a read row is updated by a conditional UPDATE, never an INSERT fall-through"
         );
         assert!(upsert.contains("INVALID_COLUMN_REFERENCE"));
+    }
+
+    /// The reconciler's delete matches the id AND all three managed-key
+    /// columns, so it can never delete an unmanaged (NULL-key) task or one
+    /// whose key changed since it was read.
+    #[test]
+    fn the_managed_delete_is_keyed_on_the_id_and_the_whole_managed_key() {
+        let sql = MANAGED_DELETE_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            sql,
+            "DELETE FROM scheduled_tasks WHERE id = $1 AND managed_source = $2 \
+             AND managed_tenant_id = ($3::text)::uuid AND managed_agent = $4"
+        );
+        let (_, body) = include_str!("scheduler.rs")
+            .split_once("pub async fn delete_managed_scheduled_task(")
+            .expect("delete_managed_scheduled_task");
+        let (body, _) = body.split_once("\n    }\n").expect("fn ends");
+        assert!(body.contains(".execute(MANAGED_DELETE_SQL, &[&id, &source, &tenant_id, &agent])"));
+        assert!(body.contains("Ok(deleted == 1)"));
+    }
+
+    /// An unchanged `conditions` keeps the row's CURRENT `condition_status`
+    /// rather than the caller's snapshot (the wait writer does not move
+    /// `modified_at`, so the snapshot can be stale).
+    #[test]
+    fn the_managed_update_keeps_the_live_condition_status_when_conditions_are_unchanged() {
+        let sql = MANAGED_UPDATE_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            sql.contains(
+                "condition_status = CASE WHEN conditions IS NOT DISTINCT FROM $15 \
+                 THEN condition_status ELSE $16 END,"
+            ),
+            "{sql}"
+        );
     }
 
     /// The managed UPDATE writes every non-key managed column and timezone,
