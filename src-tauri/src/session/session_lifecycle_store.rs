@@ -3933,9 +3933,14 @@ impl SessionLifecycleStore {
     /// (see [`TerminalSessionRecord::adopted_from`]) — and whether
     /// `predecessor` was then the pane's current `matched` row
     /// ([`TerminalSessionRecord::adopted_from_matched`],
-    /// [`Self::matched_now_on`]). Writes only on change; no-op when the session
-    /// is absent, `predecessor` is empty, or names the session itself. Never
-    /// creates a record.
+    /// [`Self::matched_now_on`]). A mark naming the predecessor already
+    /// recorded never downgrades a confirmed link: a duplicate SessionStart
+    /// POST for the same id can land after the next pass, when the
+    /// predecessor is no longer the pane's matched row (the pane runs its
+    /// successor now), and what it reads then says nothing about the `/clear`.
+    /// A different predecessor takes its own flag. Writes only on change;
+    /// no-op when the session is absent, `predecessor` is empty, or names the
+    /// session itself. Never creates a record.
     pub fn mark_adopted_from(
         &self,
         claude_session_id: &str,
@@ -3953,15 +3958,21 @@ impl SessionLifecycleStore {
             }
         };
         let changed = match m.get_mut(claude_session_id) {
-            Some(rec)
-                if rec.adopted_from.as_deref() != Some(predecessor)
-                    || rec.adopted_from_matched != predecessor_matched =>
-            {
+            Some(rec) => {
+                let same_predecessor = rec.adopted_from.as_deref() == Some(predecessor);
+                let matched = if same_predecessor {
+                    predecessor_matched || rec.adopted_from_matched
+                } else {
+                    predecessor_matched
+                };
+                if same_predecessor && rec.adopted_from_matched == matched {
+                    return;
+                }
                 rec.adopted_from = Some(predecessor.to_string());
-                rec.adopted_from_matched = predecessor_matched;
+                rec.adopted_from_matched = matched;
                 rec.clone()
             }
-            _ => return,
+            None => return,
         };
         self.persist(
             m,
@@ -9738,6 +9749,43 @@ mod tests {
         assert_eq!(served(), None);
         store.serve_verdicts_from(0);
         assert_eq!(served(), Some(BindingState::Matched));
+    }
+
+    /// A replayed `/clear` mark never downgrades a confirmed link: a duplicate
+    /// SessionStart POST for the same id, landing after the next pass, reads
+    /// the predecessor no longer matched, and the link stays confirmed. A
+    /// replay that confirms an unconfirmed link does. A mark naming a different
+    /// predecessor takes its own flag, either way.
+    #[test]
+    fn a_replayed_clear_mark_never_downgrades_a_confirmed_link() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(auth_on("s2", "term-a"));
+        let link = || {
+            let rec = store.get("s2").unwrap();
+            (rec.adopted_from, rec.adopted_from_matched)
+        };
+        let to = |predecessor: &str, matched: bool| (Some(predecessor.to_string()), matched);
+
+        store.mark_adopted_from("s2", "s", true);
+        assert_eq!(link(), to("s", true));
+        store.mark_adopted_from("s2", "s", false);
+        assert_eq!(link(), to("s", true), "the replay keeps the confirmation");
+
+        store.mark_adopted_from("s2", "t", false);
+        assert_eq!(
+            link(),
+            to("t", false),
+            "a different predecessor, its own flag"
+        );
+        store.mark_adopted_from("s2", "t", true);
+        assert_eq!(link(), to("t", true), "a replay may confirm");
+        store.mark_adopted_from("s2", "u", false);
+        assert_eq!(
+            link(),
+            to("u", false),
+            "a different predecessor, its own flag"
+        );
     }
 
     /// `adoptedFromMatched` round-trips through the snapshot when set, is left
