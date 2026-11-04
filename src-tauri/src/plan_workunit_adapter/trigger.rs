@@ -2754,6 +2754,35 @@ fn record_ref_listing_gaps(
     }
 }
 
+/// Warn about each status-block header (`Area:`, `Initiative-Item:`) the
+/// parser rejected, once per plan per pass, from every loop that pushes work
+/// units: the active reconcile, the archive stamp and the CLI backfill. Not
+/// from the parse, which is pure and which the plan-library body sync runs
+/// over the same files.
+///
+/// Every one of those patches omits a rejected key, so coord keeps the stored
+/// value, which the plan file no longer vouches for. This warning is the only
+/// thing that shows it. Deliberately repeated every pass: the declaration
+/// stays visible until the plan file is fixed.
+fn warn_if_header_rejected(u: &ParsedWorkUnit) {
+    if let Some(why) = &u.area_rejected {
+        tracing::warn!(
+            slug = %u.slug,
+            path = %u.source_path,
+            "plan adapter: status-block `Area:` rejected — {why}; \
+             metadata.area omitted for this plan, so coord keeps any stored value"
+        );
+    }
+    if let Some(why) = &u.initiative_item_rejected {
+        tracing::warn!(
+            slug = %u.slug,
+            path = %u.source_path,
+            "plan adapter: status-block `Initiative-Item:` rejected — {why}; \
+             metadata.initiative_item omitted for this plan, so coord keeps any stored value"
+        );
+    }
+}
+
 /// Push every parsed unit through the edge-trigger + conflict logic, updating
 /// the client-side `last_applied` memory and the shared metrics. Pure of IO
 /// beyond the sink, so it is unit-tested with a fake sink.
@@ -2772,30 +2801,7 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
         ..Default::default()
     };
     for u in parsed_units {
-        // A status-block `Area:` the parser rejected: warned here, once per
-        // plan per reconcile pass, and nowhere else — the parse is pure, and
-        // the plan-library body sync parses the same files. The push still
-        // runs, with `metadata.area` omitted. Deliberately repeated every
-        // pass: the declaration stays visible until the plan file is fixed.
-        if let Some(why) = &u.area_rejected {
-            tracing::warn!(
-                slug = %u.slug,
-                path = %u.source_path,
-                "plan adapter: status-block `Area:` rejected — {why}; \
-                 metadata.area omitted for this plan"
-            );
-        }
-        // The same rule for `Initiative-Item:`: warned here, every pass, and
-        // the push still runs with `metadata.initiative_item` omitted, so the
-        // stored value is kept (`metadata::declaration_rejected`).
-        if let Some(why) = &u.initiative_item_rejected {
-            tracing::warn!(
-                slug = %u.slug,
-                path = %u.source_path,
-                "plan adapter: status-block `Initiative-Item:` rejected — {why}; \
-                 metadata.initiative_item omitted for this plan"
-            );
-        }
+        warn_if_header_rejected(u);
         // A push coord has already refused is not re-issued: the request would
         // be byte-identical, so the verdict would be too. Stopping here — rather
         // than merely muting the log — is what makes this a fix and not a mute:
@@ -3307,6 +3313,7 @@ pub async fn backfill_work_units_once<S: WorkUnitSink + ?Sized>(
         ..Default::default()
     };
     for u in parsed_units {
+        warn_if_header_rejected(u);
         let seed = match sink.current_status(&u.slug, scope).await {
             Ok(s) => s,
             Err(e) => {
@@ -3404,6 +3411,7 @@ pub async fn reconcile_archive_once<S: WorkUnitSink + ?Sized>(
         ..Default::default()
     };
     for u in archived_units {
+        warn_if_header_rejected(u);
         match push_archive_metadata(sink, u, scope).await {
             Ok(()) => {
                 summary.stamped += 1;
@@ -11228,6 +11236,87 @@ Body.
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    /// The archive stamp and the CLI backfill omit a rejected `Area:` or
+    /// `Initiative-Item:` exactly as the active reconcile does, so coord keeps
+    /// the stored value, and each must warn as the reconcile does. Each pass
+    /// runs over one unit with both headers rejected and one with both
+    /// accepted, and only the rejected one is warned about, once per header.
+    /// The omission is asserted too, because the warning's claim is only true
+    /// while it holds.
+    #[tokio::test]
+    async fn archive_stamp_and_backfill_warn_once_per_pass_for_a_rejected_header() {
+        use super::super::parser::HeaderRejection;
+        let buf = LogBuf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let bad = ParsedWorkUnit {
+            area_rejected: Some(HeaderRejection::NotKebab("agent_worktree".to_string())),
+            initiative_item_rejected: Some(HeaderRejection::NotKebab("One Screen".to_string())),
+            ..unit("2026-01-01-bad-headers", "draft")
+        };
+        let good = ParsedWorkUnit {
+            area: Some("ci-runners".to_string()),
+            initiative_item: Some("one-screen".to_string()),
+            ..unit("2026-01-01-good-headers", "draft")
+        };
+        let units = vec![bad, good];
+        let warned_lines = |header: &str| {
+            let needle = format!("status-block `{header}:` rejected");
+            let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            log.lines()
+                .filter(|l| l.contains(&needle))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+
+        let archive_sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        reconcile_archive_once(&units, &archive_sink, &metrics, TenantScope::Unresolved).await;
+        assert_eq!(
+            warned_lines("Area").len(),
+            1,
+            "the archive stamp warns once"
+        );
+        assert_eq!(
+            warned_lines("Initiative-Item").len(),
+            1,
+            "the archive stamp warns once"
+        );
+
+        let backfill_sink = FakeSink::default();
+        backfill_work_units_once(&units, &backfill_sink, TenantScope::Unresolved).await;
+        for (header, value) in [
+            ("Area", "agent_worktree"),
+            ("Initiative-Item", "One Screen"),
+        ] {
+            let warned = warned_lines(header);
+            assert_eq!(warned.len(), 2, "the backfill warns once more: {warned:?}");
+            assert!(warned
+                .iter()
+                .all(|l| l.contains("2026-01-01-bad-headers") && l.contains(value)));
+        }
+
+        for sink in [&archive_sink, &backfill_sink] {
+            let upserts = sink.upserts.lock().unwrap();
+            let patch = upserts
+                .iter()
+                .find(|b| b.slug == "2026-01-01-bad-headers")
+                .and_then(|b| b.metadata_patch.as_ref())
+                .expect("the rejected unit was still pushed");
+            assert!(patch.get("area").is_none(), "area omitted: {patch}");
+            assert!(
+                patch.get("initiative_item").is_none(),
+                "initiative_item omitted: {patch}"
+            );
         }
     }
 

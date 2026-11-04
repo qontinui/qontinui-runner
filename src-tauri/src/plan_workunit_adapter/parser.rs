@@ -97,8 +97,8 @@ pub struct ParsedWorkUnit {
     /// or rejected; see [`extract_area`].
     pub area: Option<String>,
     /// Why a status-block area declaration was rejected, when one was. Carried
-    /// rather than logged here so the parse stays pure; the work-unit reconcile
-    /// is the one place that warns about it.
+    /// rather than logged here so the parse stays pure; every loop that pushes
+    /// work units warns about it, through `trigger::warn_if_header_rejected`.
     pub area_rejected: Option<HeaderRejection>,
     /// The plan's `Initiative-Item:` from the status blockquote — the key of the
     /// initiative `in_scope` entry this plan serves — pushed as work-unit
@@ -544,8 +544,8 @@ fn header_value(after_key: &str) -> HeaderDecl {
 /// judged by [`is_kebab_case`]: `` `agent_worktree` reclaim `` is rejected as
 /// `agent_worktree`, never guessed into shape.
 ///
-/// Pure: this function and [`parse_work_unit`] log nothing. The work-unit
-/// reconcile warns about a rejection (`trigger::reconcile_once`).
+/// Pure: this function and [`parse_work_unit`] log nothing. Every loop that
+/// pushes work units warns about a rejection (`trigger::warn_if_header_rejected`).
 pub fn extract_area(body: &str) -> HeaderDecl {
     extract_kebab_header(body, &AREA_HEADER)
 }

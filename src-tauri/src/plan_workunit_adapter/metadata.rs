@@ -37,7 +37,7 @@ use serde_json::{Map, Value};
 /// What the active-directory scan sends for a roster key the plan file does not
 /// supply a value for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AbsentRule {
+enum AbsentRule {
     /// The file always yields a value (`[]` for an empty list), so the key is
     /// on every active patch.
     AlwaysSent,
@@ -62,52 +62,48 @@ pub enum AbsentRule {
 
 /// One scanner-owned `metadata` key.
 #[derive(Debug, Clone, Copy)]
-pub struct ScannerKey {
-    pub name: &'static str,
-    pub absent_rule: AbsentRule,
-    /// Where the value comes from, for readers of the roster.
-    pub source: &'static str,
+struct ScannerKey {
+    name: &'static str,
+    absent_rule: AbsentRule,
 }
 
 /// The keys the plan adapter owns on a work unit's `metadata`. The scanner
 /// writes these and nothing else; see the module doc for the contract.
-pub const SCANNER_OWNED_KEYS: &[ScannerKey] = &[
+///
+/// Private with its types on purpose: nothing outside this module may decide
+/// what a patch holds.
+const SCANNER_OWNED_KEYS: &[ScannerKey] = &[
+    // The plan file's repo-relative path.
     ScannerKey {
         name: "source_path",
         absent_rule: AbsentRule::AlwaysSent,
-        source: "the plan file's repo-relative path",
     },
+    // Status-block `Depends-On:` (`[]` when none).
     ScannerKey {
         name: "depends_on",
         absent_rule: AbsentRule::AlwaysSent,
-        source: "status-block `Depends-On:` (`[]` when none)",
     },
+    // Status-block `Area:`.
     ScannerKey {
         name: "area",
         absent_rule: AbsentRule::DeleteWhenAbsent,
-        source: "status-block `Area:`",
     },
+    // Status-block `Initiative-Item:`.
     ScannerKey {
         name: "initiative_item",
         absent_rule: AbsentRule::DeleteWhenAbsent,
-        source: "status-block `Initiative-Item:`",
     },
+    // The archived file's path, stamped by `push_archive_metadata`.
     ScannerKey {
         name: "archive_path",
         absent_rule: AbsentRule::SetByArchiveScan,
-        source: "the archived file's path, stamped by `push_archive_metadata`",
     },
+    // `detect_phases`.
     ScannerKey {
         name: "phases",
         absent_rule: AbsentRule::OmitWhenAbsent,
-        source: "`detect_phases`",
     },
 ];
-
-/// The roster entry for `name`, if the scanner owns it.
-pub fn scanner_key(name: &str) -> Option<&'static ScannerKey> {
-    SCANNER_OWNED_KEYS.iter().find(|k| k.name == name)
-}
 
 /// True when the parser saw a declaration for `key` and rejected it. The two
 /// status-block header keys, `area` and `initiative_item`, have parsers that
@@ -647,7 +643,9 @@ mod tests {
             let archive = archive_dir_patch(&u);
             for (which, patch) in [("active", &active), ("archive", &archive)] {
                 for (k, v) in patch.as_object().expect("a patch is an object") {
-                    let key = scanner_key(k)
+                    let key = SCANNER_OWNED_KEYS
+                        .iter()
+                        .find(|key| key.name == k)
                         .unwrap_or_else(|| panic!("{which} patch emits unregistered key `{k}`"));
                     assert!(
                         !v.is_object(),
