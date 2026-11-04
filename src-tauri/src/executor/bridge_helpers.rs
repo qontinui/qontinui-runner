@@ -97,6 +97,16 @@ where
     })
 }
 
+/// The ONE lock that serializes executor lifecycle operations across every
+/// entry point: the `start_python_executor` / `stop_python_executor` Tauri
+/// commands (on blocking threads, via `blocking_lock`) and the
+/// `POST /executor/restart` route (async, via `lock().await`). Without it a
+/// command-driven start could interleave with an HTTP restart's stop/start.
+pub fn executor_lifecycle_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Run a blocking bridge operation off the calling thread.
 ///
 /// Tauri 2 runs a SYNC `#[tauri::command]` on the main (UI) thread, and every
@@ -320,7 +330,8 @@ pub fn _migration_example() {}
 mod tests {
     use std::path::Path;
 
-    /// Calls that wait on a bridge (its per-bridge lock, or a Python round-trip).
+    /// Calls that wait on a bridge (its per-bridge lock, a Python round-trip,
+    /// or the extraction executor's process).
     const BRIDGE_CALLS: &[&str] = &[
         "with_default_bridge",
         "with_bridge",
@@ -331,6 +342,8 @@ mod tests {
         "stop_default_bridge",
         "get_default_bridge_state",
         "get_bridge_manager",
+        "extraction_executor",
+        "ensure_started",
     ];
 
     fn visit(dir: &Path, out: &mut Vec<(std::path::PathBuf, String)>) {
@@ -344,14 +357,68 @@ mod tests {
         }
     }
 
+    /// From line `start`, up to and including the first column-0 `}`.
+    fn body_from(lines: &[&str], start: usize) -> String {
+        let mut body = String::new();
+        for line in &lines[start..] {
+            body.push_str(line);
+            body.push('\n');
+            if line.starts_with('}') {
+                break;
+            }
+        }
+        body
+    }
+
+    /// Identifiers immediately followed by `(` (optionally after whitespace).
+    fn called_names(body: &str) -> Vec<String> {
+        let chars: Vec<char> = body.chars().collect();
+        let mut names = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i].is_alphabetic() || chars[i] == '_' {
+                let start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let mut k = i;
+                while k < chars.len() && chars[k] == ' ' {
+                    k += 1;
+                }
+                if k < chars.len() && chars[k] == '(' {
+                    names.push(chars[start..i].iter().collect());
+                }
+            } else {
+                i += 1;
+            }
+        }
+        names
+    }
+
+    /// The bodies of same-file `fn`s a command body calls (one level deep), so
+    /// a thin sync wrapper over a `*_impl` helper that reaches the bridge is
+    /// caught too.
+    fn helper_bodies(lines: &[&str], body: &str) -> String {
+        let mut out = String::new();
+        for name in called_names(body) {
+            let call = format!("fn {}(", name);
+            let generic = format!("fn {}<", name);
+            for (k, line) in lines.iter().enumerate() {
+                if line.contains(&call) || line.contains(&generic) {
+                    out.push_str(&body_from(lines, k));
+                }
+            }
+        }
+        out
+    }
+
     /// Tauri 2 runs a SYNC `#[tauri::command]` on the main thread, so a sync
     /// command that waits on the bridge freezes the window for as long as the
     /// bridge is busy: the ~45 s post-boot freeze of plan
     /// `2026-11-04-runner-wedge-detector-reads-a-boot-as-a-wedge-and-never-bound-is-silent`
     /// Phase 3 was `start_python_executor`. Such a command must be `async` and
-    /// run its body through `run_bridge_blocking`. This pins it source-wide.
-    /// (It sees direct calls in the command body only, not calls through a
-    /// helper the command invokes.)
+    /// run its body through `run_bridge_blocking`. This pins it source-wide,
+    /// in the command body and in the same-file helpers it calls (one level).
     #[test]
     fn no_sync_tauri_command_waits_on_the_bridge() {
         let mut files = Vec::new();
@@ -382,16 +449,9 @@ mod tests {
                 if lines[j].contains("async fn") {
                     continue;
                 }
-                // The body runs to the first column-0 closing brace.
-                let mut body = String::new();
-                for line in &lines[j..] {
-                    body.push_str(line);
-                    body.push('\n');
-                    if line.starts_with('}') {
-                        break;
-                    }
-                }
-                if BRIDGE_CALLS.iter().any(|c| body.contains(c)) {
+                let body = body_from(&lines, j);
+                let reach = format!("{}{}", body, helper_bodies(&lines, &body));
+                if BRIDGE_CALLS.iter().any(|c| reach.contains(c)) {
                     offenders.push(format!("{}:{}", path.display(), j + 1));
                 }
             }
@@ -409,5 +469,16 @@ mod tests {
              main thread; make them async + run_bridge_blocking): {:#?}",
             offenders
         );
+    }
+
+    /// The helper indirection is what catches a thin wrapper; pin it on a
+    /// literal so the scanner cannot silently lose it.
+    #[test]
+    fn the_scan_sees_through_a_thin_wrapper_to_its_helper() {
+        let src = "pub fn cmd(state: State<X>) -> R {\n    cmd_impl(&state)\n}\n\nfn cmd_impl(s: &X) -> R {\n    s.extraction_executor().lock()\n}\n";
+        let lines: Vec<&str> = src.lines().collect();
+        let body = body_from(&lines, 0);
+        assert!(!BRIDGE_CALLS.iter().any(|c| body.contains(c)));
+        assert!(helper_bodies(&lines, &body).contains("extraction_executor"));
     }
 }
