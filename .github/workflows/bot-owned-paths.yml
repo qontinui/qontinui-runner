@@ -1,0 +1,71 @@
+name: bot-owned-paths
+
+# Flags a PR that edits a BOT-OWNED path — `.github/sibling-pins.conf` or
+# `src-tauri/src/fleet_commands/**` — alongside other work. The rule, its four
+# passing arms and the remedies live in scripts/ci/bot-owned-paths.sh; its fixture
+# suite is scripts/ci/bot-owned-paths-test.sh and runs first in the same job, so a
+# broken script cannot report a pass.
+#
+# Plan: qontinui-dev-notes plans/2026-11-04-runner-generated-and-ledger-files-are-
+# merge-neutral-and-land-behind-a-drain.md, Phase 0 and Design decision 4.
+#
+# ADVISORY FIRST. The job is named `bot-owned-paths (advisory)` and is NOT in
+# ruleset `main-merge-gates`' required checks. It reds a violating PR but holds
+# nothing for its first week. Promoting it to a required check is an operator
+# action the plan surfaces; when that happens, drop "(advisory)" from the job
+# name in the same change, because a required context is matched by name.
+#
+# NO `paths:` FILTER, deliberately. The verdict is about the PR's whole diff, and a
+# required context that is path-filtered never reports on the PRs it skips, so it
+# would hold them forever (ci-integrity.yml, "WHY THIS IS NOT A REQUIRED STATUS
+# CONTEXT"). A PR touching no bot-owned path passes in seconds.
+#
+# `labeled` / `unlabeled` are triggers because two arms are labels: adding the
+# override or the schemas-pair label must re-decide without a push. Labels are
+# read live through the API, not from the event payload. `edited` covers a base
+# re-target, which changes the diff.
+#
+# `push` on main runs only the fixture suite, so the workflow has a main baseline
+# and the script is tested on the tree that lands.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review, edited]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+# PR-SCOPED SUPERSESSION, the one-expression form schemas-pair-follow-tests.yml
+# explains: a first-attempt PR run replaces the older run for the same PR (label
+# bursts fire several events in a row); every other run gets its own group.
+concurrency:
+  group: ${{ (github.event_name == 'pull_request' && github.run_attempt == 1) && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}-{2}', github.workflow, github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
+
+jobs:
+  bot-owned-paths:
+    name: bot-owned-paths (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/ci
+
+      - name: Fixture suite (no network)
+        shell: bash
+        run: bash scripts/ci/bot-owned-paths-test.sh
+
+      - name: Decide this PR
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: bash scripts/ci/bot-owned-paths.sh pr "$REPO" "$PR_NUMBER"
