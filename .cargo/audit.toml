@@ -1,0 +1,139 @@
+# Accepted RustSec advisories for qontinui-runner. One entry per id, each with a
+# comment line: `# RUSTSEC-YYYY-NNNN: <reason>. REVIEW BY YYYY-MM-DD`.
+# The fleet advisory census (qontinui-claude-config/scripts/advisory-census.sh)
+# reports expired REVIEW BY dates and ignores that no longer match the lock.
+#
+# cargo-audit reads `.cargo/audit.toml` relative to the directory it runs in.
+# This file sits at the repo root, next to the workspace Cargo.lock, which is
+# where ci.yml's `security` job runs `cargo audit --file Cargo.lock`. A local
+# `cargo audit` from the repo root applies the same list. Running it from
+# src-tauri/ would NOT pick this file up.
+#
+# The longer justifications below were carried over verbatim from the comment
+# block on ci.yml's `security` job, where these ignores used to be inline
+# `--ignore` flags (moved 2026-11-04, plan
+# 2026-11-02-rust-advisories-have-no-fleet-consumer Phase 2). Only the zip group
+# carried a review date; every other REVIEW BY was assigned at that migration.
+
+[advisories]
+ignore = [
+    # --- rsa (Marvin Attack) ---------------------------------------------------
+    # Marvin Attack timing sidechannel in rsa 0.9.x, pulled in transitively by
+    # adb_client v3 (ADB device auth). Upstream advisory says "No fixed upgrade
+    # is available!". Threat model is mitigated for desktop ADB host-side use:
+    # attacker would need physical/local access AND the ability to drive many
+    # timing-measured auth attempts. Revisit when rsa ships a fix or adb_client
+    # switches RSA implementations. rsa 0.9.10 has a second dependent,
+    # jsonwebtoken 10.4.0 (`rust_crypto`), reached via the restate chain
+    # described under RUSTSEC-2026-0387 below. That path is never exercised,
+    # because restate verifies EdDSA tokens only.
+    #
+    # RUSTSEC-2023-0071: rsa 0.9.x Marvin timing sidechannel via adb_client v3 (and unexercised jsonwebtoken path); no fixed upgrade, local-access-only threat; review date assigned at migration. REVIEW BY 2027-02-04
+    "RUSTSEC-2023-0071",
+
+    # --- quick-xml < 0.41 DoS --------------------------------------------------
+    # Two quick-xml < 0.41 DoS advisories published together on 2026-07-02
+    # (quadratic attribute-duplicate check; unbounded NsReader
+    # namespace-declaration allocation). The tree carries FOUR quick-xml
+    # versions (0.30/0.37/0.38/0.39), all pinned transitively by the tauri/gtk
+    # stack — none upgradeable to 0.41 from this repo. The runner does not parse
+    # untrusted network XML through these paths (build-time manifests/plists).
+    # These are the ONLY two quick-xml advisories in the DB as of 2026-07-02.
+    # Revisit when tauri/gtk bump to >= 0.41.
+    #
+    # RUSTSEC-2026-0194: quick-xml < 0.41 quadratic attribute-duplicate DoS, pinned by tauri/gtk, no untrusted XML parsed; review date assigned at migration. REVIEW BY 2027-02-04
+    "RUSTSEC-2026-0194",
+    # RUSTSEC-2026-0195: quick-xml < 0.41 unbounded NsReader namespace allocation DoS, pinned by tauri/gtk, no untrusted XML parsed; review date assigned at migration. REVIEW BY 2027-02-04
+    "RUSTSEC-2026-0195",
+
+    # --- zip 4.6.1 via tauri-plugin-updater ------------------------------------
+    # Four zip < 9.0.0 extraction advisories (SUID/SGID bits preserved; symlink
+    # targets outside the destination; permissions applied through symlinks;
+    # and, 0429, dated 2026-10-22 and first seen red-ing `security` on main
+    # 2026-11-02, the process ABORTS on a symlink entry with a large declared
+    # size). All four live in `ZipArchive::extract()` and
+    # `ZipStreamReader::extract()`. The runner's OWN zip dependency is bumped to
+    # 9 (patched), and runner code never calls `extract()`.
+    #
+    # The ignore covers the SECOND copy, zip 4.6.1, which enters only as
+    #
+    #   qontinui-runner -> tauri-plugin-updater -> zip ^4
+    #
+    # and every tauri-plugin-updater through 2.14.0 requires `zip ^4`. 2.14.1,
+    # the first on `zip ^9`, requires tauri ^2.12, so it is not reachable from
+    # here without a tauri upgrade. Not exploitable in that path. The updater
+    # calls `extract()` only from its Windows `extract_zip`. 0367 and 0369 need
+    # Unix permission bits, which zip 4 never applies on Windows. 0368 and 0429
+    # are NOT ruled out by the platform: zip 4 creates symlinks on Windows too,
+    # and 0429's abort is a denial of service on any OS. What rules out all
+    # four is that `extract_zip` runs only AFTER `verify_signature` checks the
+    # downloaded bundle against our updater public key, so the archive is not
+    # attacker-controlled. For 0429 that means triggering the abort needs the
+    # updater signing key, and whoever holds that key can already ship
+    # arbitrary code. The runner reaches the updater only through
+    # `download_and_install` (commands/execution/system_ops.rs), and the
+    # frontend is granted no `updater:` permission.
+    #
+    # Drop this ignore once the runner is on tauri-plugin-updater >= 2.14.1, the
+    # first release on zip ^9 (published 2026-10-28). That release requires
+    # tauri ^2.12, and this lock is on tauri 2.11.1, so taking it is a tauri
+    # upgrade (watch the vendored tao-0.35.0 patch). Tracking:
+    # qontinui/qontinui-runner#2500. Re-assess immediately if updater signature
+    # checking is ever disabled or bypassed, if runner code starts calling
+    # `extract()` on a zip 4 archive, or if the updater extracts on Unix.
+    #
+    # RUSTSEC-2026-0367: zip 4.6.1 (tauri-plugin-updater) preserves SUID/SGID on extract; updater extracts only signature-verified bundles, on Windows only; drop at tauri-plugin-updater >= 2.14.1 (#2500). REVIEW BY 2026-12-02
+    "RUSTSEC-2026-0367",
+    # RUSTSEC-2026-0368: zip 4.6.1 (tauri-plugin-updater) symlink targets outside the destination; updater extracts only signature-verified bundles; drop at tauri-plugin-updater >= 2.14.1 (#2500). REVIEW BY 2026-12-02
+    "RUSTSEC-2026-0368",
+    # RUSTSEC-2026-0369: zip 4.6.1 (tauri-plugin-updater) applies permissions through symlinks; updater extracts only signature-verified bundles, on Windows only; drop at tauri-plugin-updater >= 2.14.1 (#2500). REVIEW BY 2026-12-02
+    "RUSTSEC-2026-0369",
+    # RUSTSEC-2026-0429: zip 4.6.1 (tauri-plugin-updater) aborts on a large symlink entry; triggering needs the updater signing key; drop at tauri-plugin-updater >= 2.14.1 (#2500). REVIEW BY 2026-12-02
+    "RUSTSEC-2026-0429",
+
+    # --- crypto-bigint 0.5.5 via restate -> jsonwebtoken -----------------------
+    # crypto-bigint 0.5.5, timing variability in operations meant to be
+    # constant-time. Dated 2026-10-23, and it red-ed `security` on every runner
+    # PR, docs-only ones included (e.g. #2274), without any change to
+    # Cargo.lock.
+    #
+    # NOT UPGRADABLE FROM HERE. The fix is >= 0.7.6, a semver-MAJOR bump. 0.5.5
+    # is the last 0.5 release, and every elliptic-curve 0.13.x requires
+    # `crypto-bigint ^0.5`. crypto-bigint enters through exactly one chain:
+    #
+    #   qontinui-runner (default `restate` feature) -> restate-sdk 0.10
+    #     -> restate-sdk-shared-core 0.10.0 (`request_identity`)
+    #     -> jsonwebtoken 10.4.0 (`rust_crypto`) -> p256 0.13 / p384 0.13
+    #     -> elliptic-curve 0.13.8 (directly, and via ecdsa / primeorder)
+    #     -> crypto-bigint 0.5.5
+    #
+    # No later release in that chain moves it, semver-major ones included. As
+    # of 2026-10-24, every jsonwebtoken up to the latest, 11.1.0, requires p256
+    # ^0.13.2 and p384 ^0.13.0, and restate-sdk up to the latest, 0.12.1, still
+    # takes jsonwebtoken ^10.3.
+    #
+    # NOT REACHABLE. Only jsonwebtoken's ES256/ES384 code reaches it.
+    # restate-sdk-shared-core's request_identity verifies EdDSA tokens and
+    # nothing else (`Validation::new(Algorithm::EdDSA)`). That path uses
+    # ed25519-dalek, which does not depend on crypto-bigint. Even that check
+    # runs only when an identity key is set through the endpoint builder's
+    # `.identity_key(..)`, and runner code never calls it. So no p256/p384
+    # operation runs. If one did, ECDSA verification works only on public
+    # inputs (key, signature, message), and a timing leak exposes only secret
+    # operands. The runner has no direct dependency on jsonwebtoken, p256, p384
+    # or elliptic-curve.
+    #
+    # Drop this ignore when jsonwebtoken ships on p256/p384 >= 0.14
+    # (elliptic-curve 0.14 -> crypto-bigint 0.7) and restate-sdk adopts that
+    # release. Moving restate-sdk to the `aws_lc_rs` backend with default
+    # features off would also remove p256 from the graph. That swaps the crypto
+    # backend, adds the aws-lc-rs C build, and means re-listing the defaults the
+    # runner needs (`http_server`, for `HttpServer::new` in
+    # src-tauri/src/restate/http_endpoint.rs). So it is not done here.
+    # Re-assess immediately if the runner starts signing with an ES256/ES384
+    # key, or starts using a P-256/P-384 private key through elliptic-curve
+    # 0.13 anywhere.
+    #
+    # RUSTSEC-2026-0387: crypto-bigint 0.5.5 timing variability via restate-sdk -> jsonwebtoken -> p256/p384; not upgradable (semver-major) and not reachable (EdDSA-only, identity key never set); review date assigned at migration. REVIEW BY 2027-02-04
+    "RUSTSEC-2026-0387",
+]
