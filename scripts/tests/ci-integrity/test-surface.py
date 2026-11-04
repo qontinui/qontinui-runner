@@ -441,7 +441,7 @@ eq("a YAML workflow still goes through surface()",
 eq("token() is unchanged for a .py.yml workflow (no new collision)",
    "ci.py#test", token(".github/workflows/ci.py.yml", "test"))
 
-print("\n7. The trigger, the scope filter and WHOLE_FILE_GATES stay in step.")
+print("\n7. The trigger, the scope filter and WHOLE_FILE_GATES stay in step, and the job around them stays pinned.")
 # A gating path is named more than once, and each name does a different job. The
 # `paths:` trigger decides whether the run fires at all. The scope filter's `case`
 # arm decides whether the run drops the path before scanning it; the workflow says
@@ -455,6 +455,14 @@ print("\n7. The trigger, the scope filter and WHOLE_FILE_GATES stay in step.")
 # list still names it. And a glob reading the same on both sides need not match the
 # same paths, because GitHub's `*` stops at a `/` and the shell's does not. That is
 # why a trigger glob must be `<dir>/**`, which does mean what its arm `<dir>/*` means.
+#
+# Agreement and shape still leave the rest of the job open, so its posture is
+# pinned too. The workflow, job and step may carry only the keys they carry now
+# (no `if:`, `continue-on-error`, `shell:`, `defaults` or `BASH_ENV`), and the
+# run block's shell is pinned line for line, its Python by digest. Each of those
+# edits passes the self-guard under an honest `alters-a-gate` declaration, which
+# names the edit but cannot judge it; this suite goes red on it unless the same
+# PR also edits the suite or the pin (see the note at PIN below).
 SCOPE_FILTER_OPEN = 'case "${f}" in'
 # GitHub only runs workflows from the first, and `uses: ./` actions live in the second.
 GATE_DIRECTORIES = {".github/workflows/", ".github/actions/"}
@@ -510,6 +518,60 @@ def gate_lists(wf_text):
         "case_globs": sorted(a.rstrip("*") for a in case_globs),
         "gates": sorted(table),
         "tokens": list(table.values()),
+        **guard_posture(doc, body, opens),
+    }
+
+
+# Everything the guard's job may carry. An allowlist rather than a list of
+# forbidden keys, for the reason surface() captures whole mappings: a job-level
+# `if: false` or `continue-on-error: true`, a step `shell:` that drops `-e`, a
+# `defaults.run.shell`, or a `BASH_ENV` in any env mapping each leave the trigger,
+# the scope filter and WHOLE_FILE_GATES in perfect agreement while the guard no
+# longer gates, and the next way to do that is one nobody has named yet.
+GUARD_WF_KEYS = {"name", True, "on", "permissions", "concurrency", "jobs"}
+GUARD_JOB_KEYS = {"name", "runs-on", "timeout-minutes", "steps"}
+GUARD_STEP_KEYS = {"name", "env", "run"}
+GUARD_STEP_ENV = {"GH_TOKEN", "PR_NUMBER", "REPO", "BASE_SHA", "HEAD_SHA"}
+# The run block's heredocs: NON_GATING's data and the embedded Python. Any other
+# `<<WORD` is reported rather than skipped, so a `: $((1<<true))` cannot hide the
+# lines after it from the pin below.
+HEREDOCS = {"NONGATING", "PY"}
+
+
+def shell_lines(body):
+    """(heredoc openers not in HEREDOCS, stripped shell code). Comment lines and
+    the bodies of the known heredocs are dropped; nothing else is. A terminator
+    ends its heredoc only when the line is EXACTLY the word, as in bash: `<<'X'`
+    (no `-`) does not end on an indented `X`, so the shell after an indented one
+    is heredoc data that never runs, and is read here as never running."""
+    out, odd, term = [], [], None
+    for l in body:
+        if term is not None:
+            if l == term:
+                term = None
+            continue
+        s = l.strip()
+        if not s or s.startswith("#"):
+            continue
+        out.append(s)
+        for m in re.finditer(r"<<-?\s*(['\"]?)(\w+)\1",
+                             s.split(" #")[0].replace("<<<", "   ")):
+            if m.group(2) in HEREDOCS and term is None and "<<-" not in m.group(0):
+                term = m.group(2)
+            else:
+                odd.append(s)
+    return odd, out
+
+
+def guard_posture(doc, body, opens):
+    job = doc["jobs"]["guard-gating-workflows"]
+    steps = job.get("steps") or [{}]
+    return {
+        "wf_keys": sorted(str(k) for k in doc if k not in GUARD_WF_KEYS),
+        "job_keys": sorted(k for k in job if k not in GUARD_JOB_KEYS),
+        "steps": len(steps),
+        "step_keys": sorted(k for k in steps[0] if k not in GUARD_STEP_KEYS),
+        "step_env": sorted(k for k in (steps[0].get("env") or {}) if k not in GUARD_STEP_ENV),
     }
 
 
@@ -524,6 +586,11 @@ TRIG_EXACT = "scope-filter exact arms == trigger exact paths"
 TRIG_GLOB = "scope-filter glob arms == trigger globs"
 TABLE_KEYS = "WHOLE_FILE_GATES keys == trigger exact paths"
 TOKENS = "WHOLE_FILE_GATES tokens are distinct"
+WF_KEYS = "the guard's workflow carries only name/on/permissions/concurrency/jobs (no `defaults`, no `env`)"
+JOB_KEYS = "the guard job carries no key beyond name/runs-on/timeout-minutes/steps (no `if`, `continue-on-error`)"
+STEPS = "the guard job is one step (no earlier step can poison GITHUB_ENV)"
+STEP_KEYS = "the guard step carries only name/env/run (no `if`, `continue-on-error`, `shell`)"
+STEP_ENV = "the guard step's env names only the five values it reads (no BASH_ENV)"
 # (name, expected, actual) per check. One table, so the live workflow and every
 # mutation below are judged by the same rules.
 LIST_CHECKS = [
@@ -538,6 +605,11 @@ LIST_CHECKS = [
     (TRIG_GLOB, lambda l: l["trigger_globs"], lambda l: l["case_globs"]),
     (TABLE_KEYS, lambda l: l["trigger_exact"], lambda l: l["gates"]),
     (TOKENS, lambda l: len(l["tokens"]), lambda l: len(set(l["tokens"]))),
+    (WF_KEYS, lambda l: [], lambda l: l["wf_keys"]),
+    (JOB_KEYS, lambda l: [], lambda l: l["job_keys"]),
+    (STEPS, lambda l: 1, lambda l: l["steps"]),
+    (STEP_KEYS, lambda l: [], lambda l: l["step_keys"]),
+    (STEP_ENV, lambda l: [], lambda l: l["step_env"]),
 ]
 live_lists = gate_lists(io.open(WF, encoding="utf-8").read())
 for name, want, got in LIST_CHECKS:
@@ -549,6 +621,135 @@ REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # longer exists: the trigger then never fires for the script that replaced it.
 eq("every WHOLE_FILE_GATES path exists in the tree", [],
    sorted(p for p in live_lists["gates"] if not os.path.isfile(os.path.join(REPO, p))))
+
+# The run block's shell, pinned line for line in guard-shell.pinned (its comment
+# lines, blank lines and indentation excluded), plus the embedded Python's digest,
+# which covers that body byte for byte, comments included.
+# Rules written per line were tried first and each had a bypass that kept them
+# green while the guard stopped gating: an `exit 0` or `set +e` before the loop,
+# the loop wrapped in `if false`, a second `case "$f"` built from the allowed exit
+# lines, `f` rewritten before the filter, NON_GATING reassigned, MERGE_BASE set to
+# HEAD_SHA, `|| true` on the Python, the declaration-check `exit 1` deleted,
+# `exec true`. An exact pin has no such gaps. What it buys is bounded, though: a
+# drift nobody meant goes red, and a deliberate edit costs a second, visible diff
+# to the pinned file in the same PR. Neither this suite nor the pin is under the
+# guard's own trigger, so a PR that edits both is judged by nothing automated;
+# the pin makes that edit conspicuous, not impossible. To refresh it after a deliberate
+# change: WRITE_GUARD_SHELL_PIN=1 python3 scripts/tests/ci-integrity/test-surface.py
+# rewrites the pinned file from the live workflow; review its diff before committing.
+PIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "guard-shell.pinned")
+
+
+def py_body(run_text):
+    """The embedded Python's lines, verbatim (its indentation is syntax)."""
+    lines, out, inside = run_text.split("\n"), [], False
+    for l in lines:
+        if inside:
+            if l == "PY":
+                return out
+            out.append(l)
+        elif not l.lstrip().startswith("#") and re.search(r"<<\s*'PY'", l):
+            inside = True
+    return None
+
+
+def shell_posture(run_text):
+    odd, code = shell_lines(run_text.split("\n"))
+    body = py_body(run_text)
+    # The Python is pinned by digest, not line by line: a `sys.exit(0)` at its top
+    # empties the findings and every gate edit reads as "purely additive".
+    tag = "PY body sha256 " + (hashlib.sha256("\n".join(body).encode()).hexdigest()
+                               if body is not None else "<no PY heredoc>")
+    return {"heredocs": odd, "shell": code + [tag]}
+
+
+if os.environ.get("WRITE_GUARD_SHELL_PIN") == "1":
+    # Only from the live workflow, only by hand, and only when everything above
+    # passed: regenerating from a mutated copy would pin the mutation, and a
+    # regen in CI would make the pin check unable to fail.
+    live = shell_posture(run)
+    refusal = ("a workflow path was given; regen reads only the live workflow" if len(sys.argv) > 1
+               else "CI is set; the pin is regenerated by hand, never in CI" if os.environ.get("CI")
+               else "%d assertion(s) above failed" % failures if failures
+               else "unknown heredoc(s): %r" % live["heredocs"] if live["heredocs"] else None)
+    if refusal:
+        print("refusing to rewrite %s: %s" % (PIN, refusal)); sys.exit(2)
+    io.open(PIN, "w", encoding="utf-8").write("\n".join(live["shell"]) + "\n")
+    print("rewrote %s" % PIN)
+    sys.exit(0)
+PINNED = io.open(PIN, encoding="utf-8").read().split("\n")
+PINNED = PINNED[:-1] if PINNED and PINNED[-1] == "" else PINNED
+
+HEREDOC_ODD = "the run block's only heredocs are NONGATING and PY, each closed at column 0"
+SHELL_PIN = "the run block's shell (line for line) and its Python (by digest) are guard-shell.pinned"
+
+
+def first_diff(want, got):
+    for i, (w, g) in enumerate(zip(want, got)):
+        if w != g:
+            return "line %d: pinned %r, found %r" % (i + 1, w, g)
+    return "pinned %d lines, found %d" % (len(want), len(got)) if len(want) != len(got) else None
+
+
+SHELL_CHECKS = [
+    (HEREDOC_ODD, lambda p: [], lambda p: p["heredocs"]),
+    # The first differing line, not the whole list: 140 lines in a FAIL row bury it.
+    (SHELL_PIN, lambda p: None, lambda p: first_diff(PINNED, p["shell"])),
+]
+for name, want, got in SHELL_CHECKS:
+    eq(name, want(None), got(shell_posture(run)))
+
+
+def shell_drift(edits):
+    """The SHELL_CHECKS rows the LIVE run block fails after `edits`, or None when an
+    anchor is gone (the row then fails loudly rather than passing vacuously)."""
+    text = run
+    for old, new in edits:
+        if old not in text:
+            return None
+        text = text.replace(old, new, 1)
+    got = shell_posture(text)
+    return sorted(n for n, want, read in SHELL_CHECKS if want(None) != read(got))
+
+
+# Every bypass the per-line rules missed, kept as a row against the live text: the
+# pin is a statement about it. A missing anchor fails the row instead of skipping it.
+SET = "set -euo pipefail\n"
+LOOP = "while IFS= read -r f; do\n"
+FILTER = 'case "${f}" in\n'
+EXPORT = "export HIT_PATHS MERGE_BASE\n"
+PY_OPEN = "python3 - <<'PY' > \"${RUNNER_TEMP}/findings.tsv\""
+for name, edits, fired in [
+    # Stays green.
+    ("a comment line is not code", [(SET, SET + "# exit 0 trap set\n")], []),
+    ("re-indenting a line is not a change", [(LOOP, "    " + LOOP)], []),
+    # Before or inside the scan.
+    ("an early `exit 0`", [(SET, SET + "exit 0\n")], [SHELL_PIN]),
+    ("`set +e` on line 2", [(SET, SET + "set +e\n")], [SHELL_PIN]),
+    ("the loop wrapped in `if false`", [(LOOP, "if false; then\n" + LOOP)], [SHELL_PIN]),
+    ("a second `case` built from allowed exit lines",
+     [(FILTER, 'case "$f" in\n*ci.yml) ;;\n*) continue ;;\nesac\n' + FILTER)], [SHELL_PIN]),
+    ("`f` rewritten before the filter", [(FILTER, 'f="${f/secret-scan/x}"\n' + FILTER)], [SHELL_PIN]),
+    ("NON_GATING reassigned after its heredoc",
+     [("NONGATING\n\n", "NONGATING\nNON_GATING=.github/workflows/ci.yml\n")], [SHELL_PIN]),
+    ("an indented heredoc terminator swallows the script",
+     [("\nNONGATING\n", "\n  NONGATING\n")], [SHELL_PIN]),
+    # After the scan.
+    ("a trap", [(EXPORT, "trap 'exit 0' EXIT\n" + EXPORT)], [SHELL_PIN]),
+    ("`exec true`", [(EXPORT, "exec true\n" + EXPORT)], [SHELL_PIN]),
+    ("MERGE_BASE set to the head", [(EXPORT, 'MERGE_BASE="${HEAD_SHA}"\n' + EXPORT)], [SHELL_PIN]),
+    ("HIT_PATHS rewritten",
+     [(EXPORT, 'HIT_PATHS="$(grep -v ci.yml <<< "${HIT_PATHS}" || true)"\n' + EXPORT)], [SHELL_PIN]),
+    ("`|| true` on the Python", [(PY_OPEN, PY_OPEN + " || true")], [SHELL_PIN]),
+    ("an early `sys.exit(0)` in the Python",
+     [("import base64, hashlib, json, os, subprocess\n",
+       "import base64, hashlib, json, os, subprocess, sys\nsys.exit(0)\n")], [SHELL_PIN]),
+    ("an arithmetic `<<` cannot hide the lines after it",
+     [(EXPORT, ": $((1<<true))\ntrap 'exit 0' EXIT\ntrue\n" + EXPORT)], [HEREDOC_ODD, SHELL_PIN]),
+    ("a `<<WORD` in a trailing comment is not a heredoc",
+     [(EXPORT, EXPORT.rstrip("\n") + "  # <<EOF\n")], [SHELL_PIN]),
+]:
+    eq("shell drift: " + name, sorted(fired), shell_drift(edits))
 
 # The checks above pass on a list extractor that has quietly stopped working, as
 # long as it stopped working the same way on both sides. So each drift they exist
@@ -566,14 +767,28 @@ LIST_FIXTURE = textwrap.dedent("""\
     jobs:
       guard-gating-workflows:
         steps:
-          - run: |
+          - env:
+              PR_NUMBER: "1"
+            run: |
+              set -euo pipefail
+              read -r -d '' NON_GATING <<'NONGATING' || true
+              NONGATING
+              CHANGED="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" \\
+                --jq '.[] | .filename, (.previous_filename // empty)')"
+              HIT_PATHS=""
               while IFS= read -r f; do
+                [ -z "${f}" ] && continue
                 case "${f}" in
                   .github/workflows/*|.github/actions/*) ;;
                   # a shell comment is not an arm
                   scripts/gate.py) ;;
                   *) continue ;;
                 esac
+                if grep -qxF "${f}" <<< "${NON_GATING}"; then continue; fi
+                case $'\\n'"${HIT_PATHS}" in
+                  *$'\\n'"${f}"$'\\n'*) continue ;;
+                esac
+                HIT_PATHS="${HIT_PATHS}${f}"$'\\n'
               done <<< "${CHANGED}"
               case "${OTHER}" in
                 unrelated.py) ;;
@@ -669,6 +884,20 @@ for name, edits, fired in [
     ("the scope filter's opening line is reworded",
      [('case "${f}" in\n', 'case "$f" in\n')], [ONE_FILTER, TRIG_EXACT, TRIG_GLOB]),
     ("a second `case` on the same variable", [('case "${OTHER}" in\n', 'case "${f}" in\n')], [ONE_FILTER]),
+    # Every list agrees in these too, and the job can no longer fail.
+    ("a job-level `if:`", [("    steps:\n", "    if: ${{ false }}\n    steps:\n")], [JOB_KEYS]),
+    ("a job-level `continue-on-error`",
+     [("    steps:\n", "    continue-on-error: true\n    steps:\n")], [JOB_KEYS]),
+    ("a step-level `continue-on-error`",
+     [("        run: |", "        continue-on-error: true\n        run: |")], [STEP_KEYS]),
+    ("a step `shell:` that drops -e",
+     [("        run: |", "        shell: bash {0}\n        run: |")], [STEP_KEYS]),
+    ("a BASH_ENV in the step's env",
+     [('          PR_NUMBER: "1"', '          PR_NUMBER: "1"\n          BASH_ENV: /tmp/x')], [STEP_ENV]),
+    ("workflow `defaults` set the shell",
+     [("jobs:\n", "defaults:\n  run:\n    shell: sh\njobs:\n")], [WF_KEYS]),
+    ("a second step joins the job",
+     [("          PY\n", "          PY\n      - run: echo BASH_ENV=/tmp/x >> \"$GITHUB_ENV\"\n")], [STEPS]),
 ]:
     eq("list drift: " + name, sorted(fired), list_drift(edits))
 
