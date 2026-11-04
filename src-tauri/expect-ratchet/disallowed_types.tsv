@@ -1,0 +1,7 @@
+src-tauri/src/database/pg/error_monitor.rs	1
+src-tauri/src/database/pg/mod.rs	1
+src-tauri/src/database/pg/tiered_info.rs	1
+src-tauri/src/executor/file_registry.rs	2
+src-tauri/src/executor/url_lock.rs	1
+src-tauri/src/main.rs	3
+src-tauri/src/mcp_api.rs	1

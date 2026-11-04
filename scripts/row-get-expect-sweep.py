@@ -15,7 +15,8 @@ all derived from those two. The second use is `clippy::string_slice` —
 byte-slicing a `&str` by an offset that is not a char boundary panics — with
 the reason `legacy str byte slice — migrate to str::get / char_indices /
 str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate`.
-Both ceilings are pinned by `src-tauri/src/expect_ratchet.rs`.
+Both are pinned by `src-tauri/src/expect_ratchet.rs`, per file, in the ledgers
+`src-tauri/expect-ratchet/<lint>.tsv`.
 
 Everything below describes the `Row::get` default; substitute the `--lint` /
 `--reason` pair for any other lint.
@@ -51,8 +52,8 @@ removal, the count); only the four-line one is ever written.
 
 `expect`, never `allow` (a migrated fn's stale attribute is itself a deny error
 via `unfulfilled_lint_expectations`), fn granularity, never file- or
-crate-level. `src-tauri/src/expect_ratchet.rs` pins the attribute count as a
-ceiling that only falls.
+crate-level. `src-tauri/src/expect_ratchet.rs` pins each file's attribute count
+in `src-tauri/expect-ratchet/<lint>.tsv`, a ceiling that only falls.
 
 What this script does, per pass:
 
@@ -164,7 +165,7 @@ FN_LINE = re.compile(
 )
 # The directories the ratchet test walks (relative to the repo root); the final
 # attribute count is taken over the same set so the number printed here IS the
-# baseline. `src-tauri/clorinde` is generated ("Do not modify") and is not
+# sum of the lint's ledger (`src-tauri/expect-ratchet/<lint>.tsv`). `src-tauri/clorinde` is generated ("Do not modify") and is not
 # under `src-tauri/src`, but the walk excludes any `clorinde` component anyway.
 # `src-tauri/tests` is walked because `cargo-guard.sh clippy` defaults to
 # `--all-targets`, which lints the integration tests too.
@@ -683,7 +684,7 @@ def main() -> int:
         if not sites:
             if status == 0 and not unfulfilled:
                 total, files = count_attributes(root)
-                print(f"[done] clean. attribute count (baseline) = {total} across {files} files")
+                print(f"[done] clean. attribute count (ledger sum) = {total} across {files} files")
                 return 0
             if removed and not args.dry_run and removed == len(unfulfilled) and not other_errors:
                 # Only stale attributes stood between this pass and clean; the
