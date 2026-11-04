@@ -165,15 +165,15 @@ env:
 jobs:
   # ── Where the Linux `test` leg runs ─────────────────────────────────────
   #
-  # On every run that is NOT a pull_request (merge-candidate*/** and main
-  # pushes, workflow_dispatch) this job decides whether `test (ubuntu-22.04)`
+  # On every run except a FORK pull_request (merge-candidate*/** and main
+  # pushes, workflow_dispatch, same-repo PRs) this job decides whether `test (ubuntu-22.04)`
   # runs on the self-hosted pool `[self-hosted, Linux, X64, qontinui-runner-ci,
   # ram-40g]` — on 2026-11-03 two registrations on nawa (`nawa-runner-1/2`,
   # 64 GiB / 60 GiB-high units in the host's ci-runners.slice, a persistent
   # per-runner cargo target) — or on the free GitHub-hosted `ubuntu-22.04`
-  # floor. pull_request runs never reach the pool and pay nothing for this job
-  # (it is skipped): the pool is sized for the train, and a PR backlog would
-  # saturate it and push candidates back to the floor.
+  # floor. Same-repo pull_request runs route the same way since 2026-11-04
+  # (decision record v4, "PULL REQUESTS ROUTE TOO" below); only a FORK
+  # pull_request skips this job and stays on the floor.
   #
   # WHAT IT BUYS, measured rather than hoped. It does NOT shorten a candidate
   # today: the windows leg is the slowest required job (98-148 min on recent
@@ -227,8 +227,22 @@ jobs:
   # `!cancelled()` with a hosted fallback, so a route job that fails, times
   # out or is skipped leaves the leg on the floor (or, forced, on the pool) —
   # never SKIPPED, which coord's check classification would count as passing.
+  #
+  # PULL REQUESTS ROUTE TOO (2026-11-04). Decision record
+  # self-hosted-runners-on-public-repos v4 (finding 9ff8a791) lets a public
+  # repo's pull_request runs use the self-hosted pool on the same terms as
+  # push, and supersedes the "pull_request stays hosted" branch this job and
+  # `test` used to carry. The one PR shape still sent to the floor is a FORK
+  # PR (head repo != this repo): an optional free guard the record allows on
+  # top of the fork-approval gate, which stays at all_external_contributors.
+  #
+  # This job stays HOSTED although it queued 10 m 40 s on 2026-11-03: both
+  # required `test (…)` legs need it, and `timeout-minutes` does not count
+  # queue time, so on a self-hosted label a down or saturated nawa would hold
+  # BOTH legs pending for up to 24 h with no fallback. Its hosted wait shrinks
+  # as the light guard workflows leave the hosted queue (RUNNER_CI_LIGHT_LANE).
   route:
-    if: ${{ github.event_name != 'pull_request' && vars.RUNNER_CI_LINUX_LANE == 'auto' }}
+    if: ${{ vars.RUNNER_CI_LINUX_LANE == 'auto' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -277,8 +291,9 @@ jobs:
   # supervisor or any private range. dell-2020-win-runner does NOT carry the
   # label (finding ba454926 names the condition for it to rejoin).
   #
-  # Same router, same verbatim script and the same rules as `route`:
-  # pull_request runs never reach the pool, re-runs go to the hosted floor
+  # Same router and verbatim script as `route`, with one difference: EVERY
+  # pull_request run (fork or same-repo) stays off this pool, where `route`
+  # now lets a same-repo one through. Re-runs go to the hosted floor
   # (decided in each leg's `runs-on`, attempt 1 only), and the repo variable
   # picks the lane:
   #
@@ -328,8 +343,9 @@ jobs:
 
   test:
     # `route` decides the ubuntu leg's pool and `route-windows` the windows
-    # leg's (see above). `!cancelled()` is load-bearing: on a pull_request both
-    # are SKIPPED, and without it a job that needs a skipped job is skipped
+    # leg's (see above). `!cancelled()` is load-bearing: `route` is SKIPPED on a
+    # fork PR or a non-`auto` lane, `route-windows` on every pull_request or a
+    # non-`auto` lane, and without it a job that needs a skipped job is skipped
     # too, which would turn both required `test (…)` contexts into `skipped`
     # (= passing to coord) on every PR.
     needs: [route, route-windows]
@@ -347,19 +363,21 @@ jobs:
         # when cross-platform demos / mac users matter.
         platform: [ubuntu-22.04, windows-latest]
 
-    # Each leg routes the same way through its own lane. On a FIRST attempt of
-    # a run that is not a pull_request it goes to its pool when the lane is
-    # forced `self-hosted`, or where its route job said under `auto` (the
-    # `labels` output): `route` / RUNNER_CI_LINUX_LANE for the ubuntu leg,
-    # `route-windows` / RUNNER_CI_WINDOWS_LANE for the windows leg. Everything
-    # else is the hosted floor: a pull_request, any re-run, the `hosted`/unset
-    # lane, and a route job that produced nothing. The check names stay `test
-    # (ubuntu-22.04)` / `test (windows-latest)`: they come from the matrix
-    # value, not from the pool, and both are required contexts. Each pool's
-    # label set is spelled twice (here and in its route job's
-    # --self-hosted-labels); change both together.
+    # Each leg routes the same way through its own lane. On a FIRST attempt it
+    # goes to its pool when the lane is forced `self-hosted`, or where its route
+    # job said under `auto` (the `labels` output): `route` /
+    # RUNNER_CI_LINUX_LANE for the ubuntu leg, `route-windows` /
+    # RUNNER_CI_WINDOWS_LANE for the windows leg. The ubuntu leg routes
+    # same-repo pull_requests like pushes (decision record v4) and keeps only a
+    # FORK pull_request on the floor; the windows leg still keeps every
+    # pull_request on the floor. Everything else is the hosted floor too: any
+    # re-run, the `hosted`/unset lane, and a route job that produced nothing.
+    # The check names stay `test (ubuntu-22.04)` / `test (windows-latest)`:
+    # they come from the matrix value, not from the pool, and both are
+    # required contexts. Each pool's label set is spelled twice (here and in
+    # its route job's --self-hosted-labels); change both together.
     # coord-pools: [self-hosted, Linux, X64, qontinui-runner-ci, ram-40g] | [ubuntu-22.04] | [self-hosted, Windows, X64, qontinui-runner-ci-windows, ram-40g] | [windows-latest]
-    runs-on: ${{ fromJSON(matrix.platform == 'windows-latest' && ((github.run_attempt == 1 && github.event_name != 'pull_request' && vars.RUNNER_CI_WINDOWS_LANE == 'self-hosted' && '["self-hosted","Windows","X64","qontinui-runner-ci-windows","ram-40g"]') || (github.run_attempt == 1 && needs['route-windows'].outputs.labels) || '["windows-latest"]') || (github.run_attempt == 1 && github.event_name != 'pull_request' && vars.RUNNER_CI_LINUX_LANE == 'self-hosted' && '["self-hosted","Linux","X64","qontinui-runner-ci","ram-40g"]') || (github.run_attempt == 1 && needs.route.outputs.labels) || '["ubuntu-22.04"]') }}
+    runs-on: ${{ fromJSON(matrix.platform == 'windows-latest' && ((github.run_attempt == 1 && github.event_name != 'pull_request' && vars.RUNNER_CI_WINDOWS_LANE == 'self-hosted' && '["self-hosted","Windows","X64","qontinui-runner-ci-windows","ram-40g"]') || (github.run_attempt == 1 && needs['route-windows'].outputs.labels) || '["windows-latest"]') || (github.run_attempt == 1 && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.RUNNER_CI_LINUX_LANE == 'self-hosted' && '["self-hosted","Linux","X64","qontinui-runner-ci","ram-40g"]') || (github.run_attempt == 1 && needs.route.outputs.labels) || '["ubuntu-22.04"]') }}
 
     # Backstop cap for any step in this job that is not individually bounded.
     # This job previously had NO job-level timeout, so the 4h24m apt hang above
@@ -2365,24 +2383,34 @@ jobs:
   # job's introduction, so it is born green and is a real required check.
   frontend-tests:
     name: Frontend unit tests (vitest)
-    runs-on: ubuntu-latest
+    # Light self-hosted lane (RUNNER_CI_LIGHT_LANE, override RUNNER_CI_LANE_CI);
+    # hosted for a fork PR or when the lane is not `self-hosted`.
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_CI || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui"]' || '"ubuntu-latest"') }}
     timeout-minutes: 15
+    env:
+      # vitest defaults to nproc - 1 workers: 3 on the hosted 4-core VM, 127 on
+      # a nawa runner. Pin the hosted value so the suite's concurrency regime is
+      # the same on both lanes (the test leg pins it the same way).
+      VITEST_MAX_WORKERS: 3
 
     steps:
       - uses: actions/checkout@v5
 
       # Mirror the matrix job's frontend setup EXACTLY: pnpm 10.33.2, node 20,
-      # pnpm cache keyed on the root lockfile, frozen-lockfile install.
+      # frozen-lockfile install. On the pool, pnpm installs under the job's own
+      # runner.temp and the pnpm-store cache is hosted-only, as in `test`.
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
           version: 10.33.2
+          dest: ${{ runner.environment == 'self-hosted' && format('{0}/setup-pnpm', runner.temp) || '~/setup-pnpm' }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
           node-version: "20"
-          cache: "pnpm"
+          cache: ${{ runner.environment == 'github-hosted' && 'pnpm' || '' }}
+          package-manager-cache: ${{ runner.environment == 'github-hosted' }}
           cache-dependency-path: pnpm-lock.yaml
 
       - name: Install frontend dependencies
@@ -2407,7 +2435,7 @@ jobs:
   # test_fixtures.rs) asserts the same anchors from inside the debug test leg;
   # this job additionally holds if the whole module is ever removed.
   seam-gate:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_CI || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui"]' || '"ubuntu-latest"') }}
 
     # 90 successful runs, 2026-08-08..08-20: p50 0.1m, p90 0.2m, max 0.4m —
     # a checkout plus three greps. 10 min is a floor rather than a multiple:
@@ -2461,7 +2489,13 @@ jobs:
           echo "Debug test-fixtures seam gate OK — all three cfg anchors intact."
 
   security:
-    runs-on: ubuntu-latest
+    # Light self-hosted lane (RUNNER_CI_LIGHT_LANE, override RUNNER_CI_LANE_CI).
+    # `cargo install cargo-audit` writes into $CARGO_HOME, which on a nawa org
+    # runner is that runner's own (qontinui-claude-config
+    # setup-runner-per-runner-caches.sh), not the ~/.cargo every runner on the
+    # box shares, so concurrent jobs do not race and a later job on the same
+    # runner finds it installed.
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_CI || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui"]' || '"ubuntu-latest"') }}
 
     # 63 successful runs, 2026-08-08..08-20: p50 3.3m, p90 3.5m, max 4.3m.
     # 20 min = ~5.7x p90 / 4.6x the worst observed success, leaving room for a
@@ -2470,6 +2504,21 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+
+      # checkout-sibling writes $GITHUB_WORKSPACE/../qontinui-schemas, which
+      # actions/checkout never cleans, and refuses a destination that already
+      # exists. On a persistent self-hosted runner the previous job's copy is
+      # still there, so clear it first (as `test` does).
+      - name: "Self-hosted: clear the previous job's sibling checkout"
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          parent="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
+          if [ -e "$parent/qontinui-schemas" ]; then
+            rm -r --one-file-system -- "${parent:?}/qontinui-schemas"
+            echo "removed the previous job's $parent/qontinui-schemas"
+          fi
 
       # cargo audit walks the workspace and resolves path: deps. The runner's
       # src-tauri/Cargo.toml depends on `qontinui-types` from a sibling repo.
@@ -2605,6 +2654,7 @@ jobs:
         uses: pnpm/action-setup@v4
         with:
           version: 10.33.2
+          dest: ${{ runner.environment == 'self-hosted' && format('{0}/setup-pnpm', runner.temp) || '~/setup-pnpm' }}
 
       - name: Run pnpm audit
         run: pnpm audit --audit-level=moderate || true
