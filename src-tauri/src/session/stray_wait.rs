@@ -726,11 +726,82 @@ fn exe_base(path: &str) -> String {
 /// for syntax this does not model (bracket classes, back-references, a backslash
 /// inside brackets).
 fn posix_re(pat: &str, ere: bool) -> Option<String> {
-    // The Python's engine refuses these, and this one would read them as a flag
-    // group or a repeated repeat: neither is what grep means.
-    if pat.contains("(?") || pat.contains("^*") || pat.contains("**") {
-        return None;
+    let rx = translate_posix(pat, ere)?;
+    (!python_would_refuse(&rx)).then_some(rx)
+}
+
+/// Whether Python's `re`, which the operator closer's classifier runs on, would
+/// refuse a translated pattern the `regex` crate compiles: an inline flag group,
+/// or a repetition with nothing to repeat or stacked on another (`a**`, `^*`,
+/// `a{2}{3}`, `*a`). Python reads those as "not judged", so this does too. A lazy
+/// `a*?` is refused as well: work is the safe answer.
+fn python_would_refuse(rx: &str) -> bool {
+    let c: Vec<char> = rx.chars().collect();
+    let (mut i, mut repeated, mut at_start) = (0, false, true);
+    while i < c.len() {
+        match c[i] {
+            '\\' => {
+                // A word boundary is zero-width: Python refuses a repeat on it
+                // ("nothing to repeat"). `\<` and `\>` translate to `\b{start}` and
+                // `\b{end}`, whose braces are part of the assertion, not a count.
+                let boundary = matches!(c.get(i + 1), Some('b' | 'B'));
+                i += 2;
+                if boundary && c.get(i) == Some(&'{') {
+                    while i < c.len() && c[i] != '}' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                (repeated, at_start) = (false, boundary);
+                continue;
+            }
+            '[' => {
+                let mut j = i + 1;
+                if c.get(j) == Some(&'^') {
+                    j += 1;
+                }
+                if c.get(j) == Some(&']') {
+                    j += 1;
+                }
+                while j < c.len() && c[j] != ']' {
+                    j += if c[j] == '\\' { 2 } else { 1 };
+                }
+                i = j + 1;
+                (repeated, at_start) = (false, false);
+                continue;
+            }
+            '(' => {
+                if c.get(i + 1) == Some(&'?') {
+                    return true;
+                }
+                (repeated, at_start) = (false, true);
+            }
+            // `$` is zero-width too: `a$*` is "nothing to repeat" in Python.
+            '|' | '^' | '$' => (repeated, at_start) = (false, true),
+            '*' | '+' | '?' => {
+                if repeated || at_start {
+                    return true;
+                }
+                repeated = true;
+            }
+            '{' => {
+                if repeated || at_start {
+                    return true;
+                }
+                while i < c.len() && c[i] != '}' {
+                    i += 1;
+                }
+                repeated = true;
+            }
+            _ => (repeated, at_start) = (false, false),
+        }
+        i += 1;
     }
+    false
+}
+
+/// [`posix_re`]'s translation step, before [`python_would_refuse`].
+fn translate_posix(pat: &str, ere: bool) -> Option<String> {
     let s: Vec<char> = pat.chars().collect();
     let (mut out, mut i) = (String::new(), 0usize);
     while let Some(&c) = s.get(i) {
@@ -1385,7 +1456,13 @@ fn atom(
                 }
                 k += 1;
             }
-            flts.push(Filter::Take(base.clone(), n.unwrap_or(10)));
+            let n = n.unwrap_or(10);
+            if base == "tail" && n == 0 {
+                // `tail -n0` prints nothing, but the Python models it as `lines[-0:]`,
+                // every line. The two would disagree, so neither judges it.
+                return None;
+            }
+            flts.push(Filter::Take(base.clone(), n));
         }
         for (words2, inputs2) in pipe.iter().skip(1) {
             if !PROBES.contains(&exe_base(words2.first()?).as_str()) {
@@ -1396,6 +1473,12 @@ fn atom(
                 return None;
             }
             flts.push(Filter::Grep(spec));
+        }
+        if !flts.iter().any(|f| matches!(f, Filter::Grep(_))) {
+            // No grep stage: the condition's status is the read's own exit status,
+            // and `cat` of an empty file exits 0 however few lines it printed. Such
+            // a loop may already have ended, with the shell in its post-loop work.
+            return None;
         }
         files = file_list;
         test = None;
@@ -1448,7 +1531,14 @@ fn atom(
                 let needs_text = test.as_deref().is_none_or(|t| t == "-s");
                 let text = if needs_text { facts.text(f)? } else { None };
                 if test.is_none() {
-                    lines.extend(split_lines(text.as_deref()?));
+                    let body = text.as_deref()?;
+                    if body.contains('\r') {
+                        // The Python reads text with universal newlines, so a `\r`
+                        // splits a line there and not here: a line ending neither
+                        // side models alike.
+                        return None;
+                    }
+                    lines.extend(split_lines(body));
                 }
                 // A file that passes its own test, in a loop still looping, is a
                 // wait for it to go away. Nothing holds a lock file open and its
@@ -3139,5 +3229,66 @@ mod tests {
         assert!(wait_loop(&tool_argv("sleep 300")).is_err());
         assert!(wait_loop(&sv(&["rg", "x"])).is_err());
         assert!(wait_loop(&tool_argv("until ! pgrep -f x; do sleep 5; done")).is_ok());
+    }
+
+    /// A row on one frozen file, `/s/a.log`, with the given body.
+    fn on_log(cmd: &str, body: &'static str) -> Verdict {
+        one(
+            cmd,
+            &[],
+            &[("/s/a.log", NOW - 3.0 * 3600.0, &[], Some(body))],
+            &[],
+            &[],
+        )
+    }
+
+    /// `cat` of an empty file exits 0: such a loop has ended, and its shell may be in
+    /// its post-loop `sleep`, on the way to real work.
+    #[test]
+    fn a_condition_with_no_grep_stage_is_not_judged() {
+        for cmd in [
+            "until cat /s/a.log >/dev/null; do sleep 5; done; sleep 600; ./deploy.sh",
+            "until tail -n1 /s/a.log >/dev/null; do sleep 5; done; sleep 600",
+            "until head -n1 /s/a.log >/dev/null; do sleep 5; done; sleep 600",
+        ] {
+            let v = on_log(cmd, "");
+            assert!(!v.stray, "{cmd}: {v:?}");
+            assert_eq!(v.why, "loop condition not judged", "{cmd}");
+        }
+    }
+
+    #[test]
+    fn tail_zero_and_a_carriage_return_are_not_judged() {
+        let zero = "until tail -n0 /s/a.log | grep -q done; do sleep 5; done";
+        assert!(!on_log(zero, "x\n").stray);
+        let last = "until tail -n1 /s/a.log | grep -qx done; do sleep 5; done";
+        assert!(!on_log(last, "50%\rdone\n").stray);
+        assert!(on_log(last, "50%\nnot yet\n").stray);
+    }
+
+    /// Patterns Python's `re` refuses read as "not judged" there, so here too, even
+    /// though the `regex` crate compiles them.
+    #[test]
+    fn a_regex_python_would_refuse_is_not_judged() {
+        for pattern in [
+            "a**", "^*", "a{2}{3}", "(?U)a", "*a", "a|*b", "(*a)", "a$*", r"\b*", r"\B?", r"a\b+",
+            r"\<*",
+        ] {
+            assert_eq!(posix_re(pattern, true), None, "{pattern}");
+        }
+        for pattern in [
+            "a*", "a+b?", "a{2}b", "(a|b)*c", "[*+?]*", r"a\*\*", "^a*$", r"\<foo", r"foo\>",
+            r"^\<foo", r"\<a*\>", r"a\bb",
+        ] {
+            assert!(posix_re(pattern, true).is_some(), "{pattern}");
+        }
+        assert_eq!(
+            on_log(
+                "until grep -qE \"a{2}{3}\" /s/a.log; do sleep 5; done",
+                "x\n"
+            )
+            .why,
+            "loop condition not judged"
+        );
     }
 }
