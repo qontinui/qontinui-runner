@@ -343,8 +343,9 @@ fn pr_create(args: &[String]) -> ExitCode {
             eprintln!(
                 "qontinui-pr: no runner session credential found — no `.mcp.json` with a \
                  coord-mcp nonce entry between {} and the filesystem root. A stdio \
-                 shim entry (`coord-mcp-shim.py`) whose `--credential` file is missing \
-                 or unreadable lands here too — check that the file it names exists. \
+                 shim entry (`coord-mcp-shim.py`) whose `--credential` file is missing, \
+                 unreadable, or not a JSON `{{url, headers}}` object lands here too — \
+                 check the file it names. \
                  Otherwise this session was not provisioned by the runner, or \
                  provisioning is degraded (check for a `.coord-mcp-status` breadcrumb \
                  in the session workdir). Fallback: `gh pr create` works where a \
@@ -358,7 +359,7 @@ fn pr_create(args: &[String]) -> ExitCode {
         Some(p) => p,
         None => {
             eprintln!(
-                "qontinui-pr: the session `.mcp.json` coord-mcp URL carries no loopback \
+                "qontinui-pr: the session `.mcp.json` coord-mcp URL carries no \
                  port and ${RUNNER_PORT_ENV} is not set — cannot pair the nonce with \
                  its issuing runner. Fallback: `gh pr create` works where a personal \
                  `gh auth login` exists."
@@ -1426,7 +1427,7 @@ fn repo_from_remote_url(url: &str) -> Option<String> {
 }
 
 /// A discovered session credential: the coord-mcp proxy nonce plus the bound
-/// runner port parsed from the loopback URL (when present).
+/// runner port parsed from the entry's `/coord-mcp` URL (when present).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionMcpConfig {
     nonce: String,
@@ -1987,11 +1988,15 @@ mod tests {
     }
 
     /// The flat `{url, headers}` credential file the shim's `load_credential`
-    /// reads, as the runner writes it.
+    /// reads, as the runner writes it: both the legacy `X-Coord-Mcp-Proxy-Key`
+    /// and the Phase 2 `Authorization: Bearer` header carry the nonce.
     fn write_shim_credential(path: &Path, port: u16, nonce: &str) {
         let cred = serde_json::json!({
             "url": format!("http://127.0.0.1:{port}/coord-mcp"),
-            "headers": { "Authorization": format!("Bearer {nonce}") },
+            "headers": {
+                "X-Coord-Mcp-Proxy-Key": nonce,
+                "Authorization": format!("Bearer {nonce}"),
+            },
         });
         std::fs::write(path, cred.to_string()).unwrap();
     }
@@ -2017,6 +2022,12 @@ mod tests {
 
     /// (b) A nearer stdio-shim entry whose credential file is MISSING resolves
     /// to nothing, and must not mask a valid `.mcp.json` farther up.
+    ///
+    /// (b) and (c) pin the OUTCOME — a bad credential file is never misread as
+    /// a credential, and neither panics nor stops the walk. They cannot tell
+    /// the resolver's failure arm from a raw read of the entry (which carries
+    /// no `url`, so also yields nothing); (a) is the case that pins the
+    /// resolver is used at all.
     #[test]
     fn walk_up_skips_a_shim_entry_with_a_missing_credential_file() {
         let tmp = tempfile::tempdir().unwrap();
