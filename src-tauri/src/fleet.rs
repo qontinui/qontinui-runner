@@ -9488,30 +9488,7 @@ Add-Content -LiteralPath $Out -Value $lines
             .with_ansi(false)
             .with_writer(move || writer.clone())
             .finish();
-        // Tracing's callsite `Interest` cache is PROCESS-global. While ours is
-        // the ONLY registered dispatcher, tracing-core takes its `JustOne`
-        // path, which computes a newly registered callsite's interest from the
-        // REGISTERING thread's default alone. So when a parallel cred test
-        // reaches `CredFamilyState::apply`'s `info!`/`debug!` first, it caches
-        // them `never` (its default is `NoSubscriber`) and this capture comes
-        // back empty (observed 3 of 3 runs of `cargo test fleet::tests::cred_`).
-        // Two PROCESS-LIFETIME no-op dispatchers keep tracing-core off that
-        // path for good (`has_just_one` is `len <= 1` over the live set), so
-        // every registration consults every live dispatcher, ours included,
-        // under the dispatcher list's lock, and registering ours rebuilds every
-        // callsite. The explicit rebuild below is a guard for the first call,
-        // before both no-op dispatchers are live.
-        static MULTI_DISPATCH: std::sync::OnceLock<[tracing::Dispatch; 2]> =
-            std::sync::OnceLock::new();
-        MULTI_DISPATCH.get_or_init(|| {
-            std::array::from_fn(|_| {
-                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
-            })
-        });
-        let out = tracing::subscriber::with_default(subscriber, || {
-            tracing::callsite::rebuild_interest_cache();
-            f()
-        });
+        let out = crate::resource_guard::with_log_capture(subscriber, f);
         let text = String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned();
         (out, text)
     }

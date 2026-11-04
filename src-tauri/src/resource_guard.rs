@@ -3302,6 +3302,55 @@ impl BackgroundShed {
     }
 }
 
+/// Test-only: [`tracing::subscriber::with_default`] for a test that asserts on
+/// what it logged, without a parallel test silently disabling a callsite for it.
+/// A new capture should go through this. Not on it, by class: a capture that
+/// holds a `set_default` guard across an `.await`, which a closure cannot
+/// (`mcp/transport/cloud.rs`, `coord_questions.rs`); one with its own serial
+/// lock, rebuild and retry (`terminal/session.rs`, `secure_storage.rs`); one
+/// over test-local callsites (`logging.rs`); one that asserts on no log line at
+/// all (`otel.rs`, which counts exporter connections); and every lib-crate
+/// module, which cannot reach this bin-crate one (`plan_workunit_adapter/trigger.rs`,
+/// `outbound_net.rs`, `secure_storage.rs`).
+///
+/// Tracing's callsite `Interest` cache is PROCESS-global. While at most one
+/// dispatcher is registered, tracing-core takes its `JustOne` path, which
+/// computes a newly registered callsite's interest from the REGISTERING thread's
+/// default alone. So when a parallel test with no subscriber reaches a callsite
+/// first, it caches `never` (its default is `NoSubscriber`) and the live capture
+/// never sees that line. Observed in 3 of 3 runs of
+/// `cargo test fleet::tests::cred_`. `shed_log_is_edge_triggered` losing an
+/// `info!` once (qontinui-runner#2429's handoff notes) has this shape, though
+/// that one failure was not reproduced.
+///
+/// Two PROCESS-LIFETIME no-op dispatchers keep tracing-core off that path for
+/// good (`has_just_one` is `len <= 1` over the live set), so every registration
+/// consults every live dispatcher, under the dispatcher list's lock, and
+/// registering the capture rebuilds every callsite. The explicit rebuild is a
+/// guard for the first call, when a registration that read `JustOne` before both
+/// no-op dispatchers were live can still store its `never` afterwards.
+///
+/// The side effect is confined to test binaries: no-op dispatchers report no
+/// level hint, so `LevelFilter::current()` reads TRACE. Each capture still
+/// filters at its own level.
+#[cfg(test)]
+pub(crate) fn with_log_capture<S, R>(subscriber: S, f: impl FnOnce() -> R) -> R
+where
+    S: tracing::Subscriber + Send + Sync + 'static,
+{
+    static NO_OP_DISPATCHERS: std::sync::OnceLock<[tracing::Dispatch; 2]> =
+        std::sync::OnceLock::new();
+    NO_OP_DISPATCHERS.get_or_init(|| {
+        std::array::from_fn(
+            |_| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()),
+        )
+    });
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        f()
+    })
+}
+
 /// Test-only: run `f` with a scoped `tracing` subscriber and return what it
 /// logged at INFO and above. Scoped (`with_default`) rather than global because
 /// the harness runs tests in parallel and a global subscriber can be set once.
@@ -3338,7 +3387,7 @@ pub(crate) fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
         .with_ansi(false)
         .with_max_level(tracing::Level::INFO)
         .finish();
-    let out = tracing::subscriber::with_default(subscriber, f);
+    let out = with_log_capture(subscriber, f);
     let text = String::from_utf8_lossy(&buf.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
     (out, text)
 }
@@ -5923,6 +5972,29 @@ mod tests {
             }
         });
         assert!(quiet.is_empty(), "{quiet}");
+    }
+
+    /// The interest race [`with_log_capture`] closes: an uncaptured thread hits
+    /// the callsite FIRST, while this capture is live, and the capture must still
+    /// see the same callsite. Deterministic when run alone. In a full threaded
+    /// run, another test's live dispatcher can hide a removed fix.
+    #[test]
+    fn capture_logs_sees_a_callsite_first_hit_on_an_uncaptured_thread() {
+        fn emit() {
+            tracing::info!("first-hit interest probe");
+        }
+        let ((), logs) = capture_logs(|| {
+            std::thread::spawn(emit)
+                .join()
+                .expect("the uncaptured thread must not panic");
+            emit();
+        });
+        // One, not two: the spawned thread has no subscriber to write to.
+        assert_eq!(
+            logs.matches("first-hit interest probe").count(),
+            1,
+            "{logs}"
+        );
     }
 
     // ── projected_verdict ────────────────────────────────────────────────

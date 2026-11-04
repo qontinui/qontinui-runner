@@ -3344,10 +3344,11 @@ enum ContinuationGuard {
     /// (a dispatch still between the guard and its spawn, or a session
     /// mid-account-migration; see [`AnchorHolder::Reserved`]).
     DuplicateAnchor(AnchorHolder),
-    /// The machine is short of a measured resource: the spawn seam's own
-    /// composed verdict ([`crate::resource_guard::probe_for_spawn`] — the free
-    /// memory lane and the thread lane, heavier wins) returned something other
-    /// than `Proceed`. Defer the spawn.
+    /// The machine is short of a measured resource: the composed verdict over
+    /// the free memory lane and the thread lane (heavier wins), with admitted
+    /// but not yet running continuations charged as projected cost
+    /// ([`crate::resource_guard::AdmissionReading::projected`]), returned
+    /// something other than `Proceed`. Defer the spawn.
     ///
     /// Carries the severity word (`"warn"` / `"critical"`) beside the
     /// observation that produced it, so the log and the coord stamp name the
@@ -3364,7 +3365,7 @@ enum ContinuationGuard {
 }
 
 /// Pre-spawn guard: prune dead sessions, then enforce P3 (anchor_key dedup) and
-/// machine load. Pure over (`anchor_key`, `is_live`, the injected load verdict)
+/// machine load. Pure over (`anchor_key`, `is_live`, the injected load reading)
 /// so it is unit-testable without a live `TerminalManager` and without a live
 /// reading.
 ///
@@ -3379,7 +3380,7 @@ enum ContinuationGuard {
 ///    arrives as a closure rather than as a value. `poll_pending_continuations`
 ///    `tokio::spawn`s one task per row coord returns — a route coord serves with
 ///    no `LIMIT` — so a batch of rows stranded on `duplicate_anchor` runs this
-///    guard concurrently, once per row. Passing `probe_for_spawn()` as an
+///    guard concurrently, once per row. Passing the reading as an
 ///    *argument expression* would evaluate every one of those readings before
 ///    this arm discarded them: on Windows that is a system-wide
 ///    `CreateToolhelp32Snapshot` per row (plus a `settings.json` stat/parse and
@@ -3436,8 +3437,9 @@ enum ContinuationGuard {
 ///   Bounded by NOTHING in steady state — not by the count either, which never
 ///   measured them. A Linux runner's children also share its systemd unit's
 ///   `pids.max` and `kernel.threads-max`, which no lane reads; the burst RATE is
-///   owned by plan
-///   `2026-10-01-runner-spawn-bursts-are-unregulated-coord-must-admit-spawns-per-machine`,
+///   owned by plans
+///   `2026-10-01-runner-spawn-bursts-are-unregulated-coord-must-admit-spawns-per-machine`
+///   and `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`,
 ///   and a task-ceiling lane, if one is needed, by the resource-guard follow-ups.
 ///   The count was never a semaphore either: every task of one poll read the
 ///   same pre-burst count.
@@ -3679,7 +3681,7 @@ fn admit_launch(
 ///
 /// The split exists so the guard itself stays pure over its inputs (the property
 /// its own doc claims and its unit tests rely on): a test injects a closure
-/// returning a [`crate::resource_guard::SpawnGate`], while the one production
+/// returning a [`crate::resource_guard::AdmissionReading`], while the one production
 /// call site — [`run_gate_continuation_inner`]'s step 1 — takes this wrapper and
 /// pays the reading.
 ///
@@ -16920,8 +16922,8 @@ mod tests {
     /// The sibling test above (`dedup_takes_precedence_over_thread_pressure`)
     /// pins which verdict wins; this one pins what a deduped row PAYS. They are
     /// different properties and only one of them is about the incident: on the
-    /// live path the closure is `resource_guard::probe_for_spawn`, whose body is
-    /// a `settings.json` stat + parse, a `claude_accounts` load, a memory read
+    /// live path the closure is `resource_guard::AdmissionReading::live`, whose
+    /// `lane_verdicts` read is a `settings.json` stat + parse, a `claude_accounts` load, a memory read
     /// and — on Windows — a system-wide `CreateToolhelp32Snapshot`. `poll_pending_continuations`
     /// spawns one task per row coord returns, on a route coord serves with no
     /// `LIMIT`, so with the verdict passed as an argument expression a batch of
