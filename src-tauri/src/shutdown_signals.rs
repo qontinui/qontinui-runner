@@ -254,9 +254,12 @@ mod imp {
     /// stays unarmed (re-raise at once) and one `warn!` says why.
     fn arm_watcher() {
         let mut fds: [libc::c_int; 2] = [-1; 2];
-        // SAFETY: `pipe` fills two descriptors; `fcntl` only edits their flags.
+        // SAFETY: `pipe`/`pipe2` fill two descriptors; `fcntl` only edits
+        // their flags. On Linux `pipe2(O_CLOEXEC)` sets close-on-exec
+        // atomically, so a child the runner spawns concurrently can never
+        // inherit either end; elsewhere `fcntl` sets it just after.
         let ok = unsafe {
-            libc::pipe(fds.as_mut_ptr()) == 0
+            create_pipe(&mut fds)
                 && libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC) == 0
                 && libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC) == 0
                 && {
@@ -280,6 +283,16 @@ mod imp {
             return;
         }
         WAKE_FD.store(fds[1], Ordering::SeqCst);
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe fn create_pipe(fds: &mut [libc::c_int; 2]) -> bool {
+        libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) == 0
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    unsafe fn create_pipe(fds: &mut [libc::c_int; 2]) -> bool {
+        libc::pipe(fds.as_mut_ptr()) == 0
     }
 
     fn close_all(fds: &[libc::c_int; 2]) {

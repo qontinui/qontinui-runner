@@ -254,7 +254,7 @@ mod scheduler_service;
 mod schema_registry;
 mod screen;
 mod sdk_features;
-mod shutdown_signals; // SIGTERM/SIGHUP mark the app quitting inside the signal handler, then die by default (round 11 M2)
+mod shutdown_signals; // SIGTERM/SIGHUP run the graceful quit (clean marker + request_force_close) off a self-pipe watcher; a kernel alarm backstop keeps a wedged runner dying
 pub(crate) use qontinui_runner_lib::secure_storage;
 mod security;
 mod semantic_conventions;
