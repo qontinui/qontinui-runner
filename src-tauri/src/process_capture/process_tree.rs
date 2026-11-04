@@ -856,7 +856,8 @@ fn parse_json_rows<T: serde::de::DeserializeOwned>(
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
-    Ok(match serde_json::from_str::<Option<OneOrMany<T>>>(trimmed)? {
+    let parsed: Option<OneOrMany<T>> = serde_json::from_str(trimmed)?;
+    Ok(match parsed {
         None => Vec::new(),
         Some(OneOrMany::Many(rows)) => rows,
         Some(OneOrMany::One(row)) => vec![row],
