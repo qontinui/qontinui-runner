@@ -10,7 +10,9 @@
 //! Source of truth for the entries: the deletion record at the top of
 //! `screenshots.rs` (vision-pipeline plan, Phase 2), which moved every
 //! runner-direct screenshot / element-image / stuck-screen / media-audit
-//! handler onto `/ui-bridge/vision/*` (`vision_routes.rs`).
+//! handler onto `/ui-bridge/vision/*` (`vision_routes.rs`); and, for
+//! `/ui-bridge/sdk/ai/media/*`, ce93e149a (runner#2242), which deleted those
+//! SDK-transport proxies from `sdk_client.rs`.
 //!
 //! The 404's status and `NOT_FOUND` code are unchanged; only the message text
 //! gains the replacement. A path listed here must never also be served. The
@@ -40,9 +42,9 @@ const VISION_FAMILY: &str = "the /ui-bridge/vision/* family, starting at \
      POST /ui-bridge/vision/capture \
      (bytes at GET /ui-bridge/vision/cache/{sha256})";
 
-/// `(path, replacement)`. A `path` ending in `*` matches every path with that
-/// prefix; any other `path` matches exactly (a trailing `/` on the request is
-/// ignored). Matching is method-independent: the route is gone for every
+/// `(path, replacement)`. A `path` ending in `/*` matches that family root and
+/// every path under it; any other `path` matches exactly. A trailing `/` on
+/// the request is ignored either way. Matching is method-independent: the route is gone for every
 /// method.
 pub(crate) const REMOVED_UI_BRIDGE_ROUTES: &[(&str, &str)] = &[
     ("/ui-bridge/control/screenshot", VISION_CAPTURE),
@@ -63,6 +65,8 @@ pub(crate) const REMOVED_UI_BRIDGE_ROUTES: &[(&str, &str)] = &[
     ("/ui-bridge/ai/element-screenshot", VISION_CAPTURE_ELEMENT),
     ("/ui-bridge/sdk/screenshot", VISION_CAPTURE),
     ("/ui-bridge/ai/media/*", VISION_FAMILY),
+    // The SDK-transport proxies of the same family (runner#2242, ce93e149a).
+    ("/ui-bridge/sdk/ai/media/*", VISION_FAMILY),
 ];
 
 /// The replacement for `path` when it names a deliberately removed UI Bridge
@@ -74,8 +78,13 @@ pub(crate) fn removed_route_replacement(path: &str) -> Option<&'static str> {
     };
     REMOVED_UI_BRIDGE_ROUTES
         .iter()
-        .find(|(removed, _)| match removed.strip_suffix('*') {
-            Some(prefix) => path.starts_with(prefix),
+        .find(|(removed, _)| match removed.strip_suffix("/*") {
+            Some(root) => {
+                trimmed == root
+                    || trimmed
+                        .strip_prefix(root)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            }
             None => trimmed == *removed,
         })
         .map(|(_, replacement)| *replacement)
@@ -115,7 +124,21 @@ mod tests {
             removed_route_replacement("/ui-bridge/ai/media/audit/accessibility"),
             Some(VISION_FAMILY)
         );
+        assert_eq!(
+            removed_route_replacement("/ui-bridge/sdk/ai/media/compare"),
+            Some(VISION_FAMILY)
+        );
+        // The family root itself, with or without a trailing slash.
+        assert_eq!(
+            removed_route_replacement("/ui-bridge/ai/media"),
+            Some(VISION_FAMILY)
+        );
+        assert_eq!(
+            removed_route_replacement("/ui-bridge/ai/media/"),
+            Some(VISION_FAMILY)
+        );
         assert!(removed_route_replacement("/ui-bridge/ai/mediax").is_none());
+        assert!(removed_route_replacement("/ui-bridge/sdk/ai/mediax/compare").is_none());
     }
 
     /// The table must never claim a route the runner still serves: that would

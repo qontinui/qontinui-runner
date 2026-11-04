@@ -22980,8 +22980,8 @@ mod not_found_message_tests {
         // count floor went stale the first time an entry was dropped.
         assert!(!REMOVED_UI_BRIDGE_ROUTES.is_empty());
         for (removed, _) in REMOVED_UI_BRIDGE_ROUTES {
-            let path = match removed.strip_suffix('*') {
-                Some(prefix) => format!("{prefix}audit/accessibility"),
+            let path = match removed.strip_suffix("/*") {
+                Some(root) => format!("{root}/audit/accessibility"),
                 None => (*removed).to_string(),
             };
             let msg = not_found_message(&Method::POST, &path);
