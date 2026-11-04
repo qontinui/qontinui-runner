@@ -43,7 +43,7 @@
 //! | resolved | absent for this class, but the agent carries a DISABLE under another class | any | that disable governs — the class default never weakens it (`registry-row-disabled-other-class-floor`; see [`lookup_row`]) |
 //! | resolved | absent, no disable anywhere | `standing_continuation` | `Deny` (default-OFF; needs an explicit opt-in row) |
 //! | resolved | absent, no disable anywhere | other | `Allow` (legacy default, logged) |
-//! | unresolvable, snapshot held and younger than [`MAX_SNAPSHOT_AGE`] | — | — | decided from the stale snapshot, flagged with its age |
+//! | unresolvable, snapshot held and younger than [`max_snapshot_age`] | — | — | decided from the stale snapshot, flagged with its age |
 //! | unresolvable, no usable snapshot | — | `standing_continuation` | `Deny` — a standing opt-in is never presumed |
 //! | unresolvable, no usable snapshot | `policy_required` (cold-start floor) | non-standing | `DegradeToInline` — never silently skip a required gate |
 //! | unresolvable, no usable snapshot | optional | non-standing | `Allow` — a coord outage must not break the fleet |
@@ -59,7 +59,7 @@
 //! * **Stale beats cold, but not forever.** The last-known-good snapshot
 //!   outlives its freshness — that is what keeps a coord outage from tripping
 //!   the `standing_continuation` default-OFF rule on a fleet that has already
-//!   resolved the registry once. But it is capped at [`MAX_SNAPSHOT_AGE`]:
+//!   resolved the registry once. But it is capped at [`max_snapshot_age`]:
 //!   past that, a revoked credential or a permanently unreachable coord would
 //!   otherwise let a day-old snapshot override a preference the user has since
 //!   changed. Beyond the cap the cold matrix applies.
@@ -198,7 +198,15 @@ pub const REGISTRY_CACHE_TTL: Duration = Duration::from_secs(90);
 /// cap, a permanently-failing resolve (revoked device JWT, coord decommissioned)
 /// would honour a snapshot from days ago forever — silently ignoring a
 /// preference the user changed in the meantime.
-const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(12 * 60 * 60);
+///
+/// Read from the spawn-authorization contract (`max_snapshot_age_secs` in
+/// `qontinui-schemas` `rust/src/spawn_authorization.json`), not declared here:
+/// coord's registry fallback applies the same bound to the same switches, and
+/// two literals could drift apart with no test going red. The contract's
+/// `validate()` refuses a zero bound, so this is always positive.
+fn max_snapshot_age() -> Duration {
+    Duration::from_secs(qontinui_types::spawn_authorization::contract().max_snapshot_age_secs)
+}
 
 /// After a failed resolve, how long before another spawn re-attempts the HTTP
 /// call. Without this, every spawn during a coord outage would pay the full
@@ -916,7 +924,7 @@ pub(crate) fn decide(
     }
 }
 
-/// No usable snapshot (never resolved, or aged past [`MAX_SNAPSHOT_AGE`]).
+/// No usable snapshot (never resolved, or aged past [`max_snapshot_age`]).
 fn decide_unresolved(error: &str, agent_name: Option<&str>, path: SpawnPath) -> Verdict {
     let who = describe(agent_name, path);
     if path.outlives_request() {
@@ -1159,7 +1167,7 @@ struct CacheInner {
     /// backoff so an outage does not make every spawn pay the HTTP timeout.
     attempted_at: Option<Instant>,
     /// Last known good — freshness expires first, then the snapshot itself at
-    /// [`MAX_SNAPSHOT_AGE`].
+    /// [`max_snapshot_age`].
     agents: Option<Arc<Vec<RegistryAgent>>>,
     last_error: Option<String>,
     posture: Posture,
@@ -1173,13 +1181,17 @@ impl CacheInner {
         self.fetched_at.map(|t| now.saturating_duration_since(t))
     }
 
-    /// Drop a snapshot that has aged past [`MAX_SNAPSHOT_AGE`].
+    /// Drop a snapshot that has aged past [`max_snapshot_age`].
     fn expire_snapshot(&mut self, now: Instant) {
-        if self.agents.is_some() && self.snapshot_age(now).is_some_and(|a| a > MAX_SNAPSHOT_AGE) {
+        if self.agents.is_none() {
+            return;
+        }
+        let ceiling = max_snapshot_age();
+        if self.snapshot_age(now).is_some_and(|a| a > ceiling) {
             warn!(
                 "agent registry: dropping last-known-good snapshot older than {}s — \
                  falling back to the cold fail-safe matrix",
-                MAX_SNAPSHOT_AGE.as_secs()
+                ceiling.as_secs()
             );
             self.agents = None;
             self.fetched_at = None;
@@ -3008,7 +3020,32 @@ mod tests {
         assert_eq!(cache.attempts().await, 3);
     }
 
-    /// A snapshot older than [`MAX_SNAPSHOT_AGE`] is dropped: a permanently
+    /// The ceiling is read from the embedded spawn-authorization contract,
+    /// whose `contract()` panics on a contract that fails to parse or
+    /// validate. This runs that read in the runner's own suite, so a broken
+    /// contract in the compiled `qontinui-types` fails here rather than on the
+    /// first spawn after a registry resolve. The upper bound catches a runaway
+    /// value that would make a snapshot effectively immortal.
+    #[test]
+    fn snapshot_ceiling_comes_from_a_valid_contract() {
+        let ceiling = max_snapshot_age();
+        assert_eq!(
+            ceiling,
+            Duration::from_secs(
+                qontinui_types::spawn_authorization::contract().max_snapshot_age_secs
+            )
+        );
+        assert!(
+            ceiling > REGISTRY_CACHE_TTL,
+            "the ceiling must outlive freshness"
+        );
+        assert!(
+            ceiling <= Duration::from_secs(7 * 24 * 60 * 60),
+            "a ceiling past a week would let a stale snapshot outlive any user change"
+        );
+    }
+
+    /// A snapshot older than [`max_snapshot_age`] is dropped: a permanently
     /// failing resolve must not honour day-old preferences forever.
     #[tokio::test]
     async fn last_known_good_expires_at_the_ceiling() {
@@ -3022,7 +3059,7 @@ mod tests {
 
         // Just inside the ceiling: still stale-usable.
         let r = cache
-            .resolve_at(t0 + MAX_SNAPSHOT_AGE, || async {
+            .resolve_at(t0 + max_snapshot_age(), || async {
                 Fetched::Err("coord 503".into())
             })
             .await;
@@ -3031,7 +3068,7 @@ mod tests {
         // Past it: the snapshot is dropped and the cold matrix applies, which
         // for a standing spawn means deny.
         let r = cache
-            .resolve_at(t0 + MAX_SNAPSHOT_AGE + Duration::from_secs(1), || async {
+            .resolve_at(t0 + max_snapshot_age() + Duration::from_secs(1), || async {
                 Fetched::Err("coord 503".into())
             })
             .await;
@@ -3066,7 +3103,7 @@ mod tests {
     /// asserting the feature does not exist. A 404 now carries no such meaning,
     /// and "stale beats cold" is the right default for every other failure —
     /// it keeps a recorded user preference in force across a coord blip instead
-    /// of reverting to class defaults. [`MAX_SNAPSHOT_AGE`] still bounds it.
+    /// of reverting to class defaults. [`max_snapshot_age`] still bounds it.
     #[tokio::test]
     async fn a_404_is_an_ordinary_error_and_keeps_the_snapshot() {
         let ttl = Duration::from_secs(90);
@@ -3105,7 +3142,7 @@ mod tests {
         // Past the ceiling the snapshot expires and the cold matrix applies —
         // still a deny for a standing spawn, never an allow-all.
         let r = cache
-            .resolve_at(t0 + MAX_SNAPSHOT_AGE + Duration::from_secs(1), || async {
+            .resolve_at(t0 + max_snapshot_age() + Duration::from_secs(1), || async {
                 Fetched::Err("coord returned 404 Not Found".into())
             })
             .await;
