@@ -484,6 +484,10 @@ describe("UI Bridge action surfaces — the inventory", () => {
     expect(rows.length).toBeGreaterThan(50); // non-vacuity: there are rows to check
     const keyed = rows.filter((l) => /^[^\t]*:\d+\t/.test(l));
     expect(keyed).toEqual([]);
+    // Nor may the line come back as a column of its own: every row is exactly
+    // the seven identity fields.
+    const misshapen = rows.filter((l) => l.split("\t").length !== 7);
+    expect(misshapen).toEqual([]);
   });
 
   // Duplicates are the reason no occurrence ordinal is needed: the document is
@@ -494,6 +498,9 @@ describe("UI Bridge action surfaces — the inventory", () => {
       .split("\n")
       .filter((l) => l && !l.startsWith("#"));
     expect(rows.length).toBe(SURFACES.length);
+    // Non-vacuity: the tree really does hold repeated identity rows, so the
+    // length check above is exercising the case it exists for.
+    expect(new Set(rows).size).toBeLessThan(rows.length);
   });
 });
 
