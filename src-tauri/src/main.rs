@@ -1800,9 +1800,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // as a crash. Installed this EARLY, synchronously, so no boot-time await
     // (the fleet publish's coord backoff ladder) can leave a service stop on
     // the default disposition. It is safe before setup: until this boot has
-    // classified the previous marker, or before the app handle exists, the
-    // watcher ends the process at once without stamping. A raw signal handler,
-    // NOT a runtime listener: see the module.
+    // classified the previous marker, the watcher ends the process at once
+    // WITHOUT stamping (so a prior crash is still read as one); after the
+    // classification but before the app handle exists, it stamps clean (a
+    // requested stop is a planned stop) and then ends at once. A raw signal
+    // handler, NOT a runtime listener: see the module.
     shutdown_signals::install();
 
     // Start health monitoring to detect resource exhaustion

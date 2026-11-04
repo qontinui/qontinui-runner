@@ -384,9 +384,10 @@ mod imp {
         }
     }
 
-    /// The backstop relies on SIGALRM's DEFAULT action. A process launched
-    /// with SIGALRM ignored (inherited `SIG_IGN`) would survive the alarm, so
-    /// an ignored disposition is reset to the default. A handler some other
+    /// The backstop relies on SIGALRM's DEFAULT action being deliverable. A
+    /// process launched with SIGALRM ignored (inherited `SIG_IGN`) or blocked
+    /// would survive the alarm, so an ignored disposition is reset to the
+    /// default and the signal is unblocked. A handler some other
     /// component installed is left alone; nothing in this process installs
     /// one (plan Phase 0: `SigCgt` bit 14 clear on a live runner).
     fn ensure_alarm_is_default() {
@@ -399,6 +400,17 @@ mod imp {
                 libc::sigaction(libc::SIGALRM, &dfl, std::ptr::null_mut());
             }
             warn!("shutdown signals: SIGALRM was inherited as ignored — reset to the default so the shutdown backstop can end a wedged runner");
+        }
+        // The signal MASK survives `execve` too: a runner launched with
+        // SIGALRM blocked would leave the backstop's alarm pending forever.
+        // A process-directed alarm is delivered to any thread not blocking
+        // it, so unblocking it on this (the installing) thread is enough.
+        // SAFETY: a stack sigset passed to pthread_sigmask.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGALRM);
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
         }
     }
 

@@ -83,12 +83,17 @@ done
 if curl -s -m 2 -o /dev/null "http://127.0.0.1:$PORT/health"; then
   echo "port $PORT already answers — pick another with --port" >&2; exit 2
 fi
-if systemctl --user is-active --quiet "qontinui-sigterm-e2e-$PORT"; then
+if [ -n "$(systemctl --user list-units --all --no-legend "qontinui-sigterm-e2e-$PORT.service" 2>/dev/null)" ]; then
   echo "unit qontinui-sigterm-e2e-$PORT already exists (another run?) — pick another --port" >&2; exit 2
 fi
 
 UNIT=qontinui-sigterm-e2e-$PORT
-ROOT=$(mktemp -d "${TMPDIR:-/tmp}/qontinui-sigterm-e2e.XXXXXX")
+ROOT=$(mktemp -d "${TMPDIR:-/tmp}/qontinui-sigterm-e2e.XXXXXX") && ROOT=$(readlink -f "$ROOT")
+# An empty ROOT would make own_pids match EVERY process (cwd under "/"), and
+# cleanup would signal them all — never continue without a real root.
+if [ -z "$ROOT" ] || [ "$ROOT" = / ] || [ ! -d "$ROOT" ]; then
+  echo "could not create the instance root" >&2; exit 2
+fi
 BASE="http://127.0.0.1:$PORT"
 FAILS=0
 fail() { echo "FAIL: $*"; FAILS=$((FAILS + 1)); }
@@ -100,6 +105,7 @@ now_ms() { date +%s%3N; }
 # names it (the runner's own descendants).
 own_pids() {
   local d pid
+  case "$ROOT" in ""|/) return 0 ;; esac
   for d in /proc/[0-9]*; do
     pid=${d#/proc/}
     [ "$pid" = "$$" ] && continue
@@ -131,7 +137,7 @@ cleanup() {
   local cfg enc
   cfg="${ACCOUNT:-$HOME/.claude}"
   enc=$(printf '%s' "$ROOT" | sed 's/[^A-Za-z0-9]/-/g')
-  [ -n "$enc" ] && [ -d "$cfg/projects/$enc" ] && rm -rf "${cfg:?}/projects/$enc"
+  [ "$KEEP" != 1 ] && [ -n "$enc" ] && [ -d "$cfg/projects/$enc" ] && rm -rf "${cfg:?}/projects/$enc"
   if [ "$KEEP" = 1 ]; then echo "kept instance root: $ROOT"; else rm -rf "$ROOT"; fi
 }
 trap cleanup EXIT
@@ -273,7 +279,7 @@ DOWN_B64=$(printf '\033[B' | base64); CR_B64=$(printf '\r' | base64)
 screen() { curl -s "$BASE/terminals/$1/buffer" | jq -r '.data.data // empty' 2>/dev/null | base64 -d 2>/dev/null | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g'; }
 for tid in "${TIDS[@]}"; do
   SCR=$(screen "$tid" | tr -d ' ')
-  if ! echo "$SCR" | grep -aq 'Itrustthisfolder' || ! echo "$SCR" | grep -aq '❯No,exit'; then
+  if ! echo "$SCR" | grep -aq 'Itrustthisfolder' || ! echo "$SCR" | grep -aqE '❯[0-9.]*No,exit'; then
     fail "session $tid: the folder-trust dialog is not showing with 'No, exit' selected — not sending keys blind"
     continue
   fi
@@ -357,11 +363,13 @@ RESUMED=$(resume_ids | grep -c . || true)
 echo "claude processes after the restart:"; own_claude_cmdlines
 echo "resumed: $(resume_ids | tr '\n' ' ')"
 MISSING=""
+NOWN=$(echo $OWN_SIDS | wc -w)
+[ "$NOWN" = "${#TIDS[@]}" ] || MISSING="$MISSING (only $NOWN of ${#TIDS[@]} opened sessions have a lifecycle row)"
 for sid in $OWN_SIDS; do
   resume_ids | grep -q -- "--resume $sid" || MISSING="$MISSING $sid"
 done
-if [ -n "$OWN_SIDS" ] && [ -z "$MISSING" ]; then
-  pass "every session this run opened is back as claude --resume <its id> ($(echo $OWN_SIDS | wc -w) of ${#TIDS[@]})"
+if [ "${#TIDS[@]}" -gt 0 ] && [ -z "$MISSING" ]; then
+  pass "every session this run opened is back as claude --resume <its id> ($NOWN of ${#TIDS[@]})"
 else
   fail "not resumed:${MISSING:- (no session ids recorded)} ($RESUMED --resume process(es) seen)"
 fi
@@ -374,11 +382,24 @@ env ${ACCOUNT:+CLAUDE_CONFIG_DIR="$ACCOUNT"} DISPLAY="$DISP" QONTINUI_INSTANCE_R
   QONTINUI_PORT="$PORT" "$BIN" >/dev/null 2>&1 &
 PID=$!
 wait_healthy || fail "subject did not come back for the second-signal check"
-kill -TERM "$PID"; sleep 0.1
-if kill -0 "$PID" 2>/dev/null; then
-  pass "the first SIGTERM did not end the process at once (graceful path running)"
+GMAN="$ROOT/.e2e-log-manifest-g"; log_manifest > "$GMAN"
+kill -TERM "$PID"
+# Up to 2 s for the watcher's line to reach the file log; the graceful path
+# itself takes several seconds, so the process is still alive meanwhile.
+T1=$(now_ms); GLOG=""
+while [ $(( $(now_ms) - T1 )) -lt 2000 ]; do
+  GLOG=$(logs_since "$GMAN")
+  echo "$GLOG" | grep -aq 'SIGTERM received' && break
+  sleep 0.1
+done
+PSTATE=$(awk '{print $3}' "/proc/$PID/stat" 2>/dev/null)
+# The graceful path's own line can only come from a process that ran it; a
+# pid that merely still exists (dying, or an unreaped zombie) proves nothing.
+if [ -n "$PSTATE" ] && [ "$PSTATE" != Z ] && [ "$PSTATE" != X ] \
+   && echo "$GLOG" | grep -aq 'SIGTERM received'; then
+  pass "the first SIGTERM started the graceful path (process alive, state $PSTATE, watcher logged it)"
 else
-  fail "the first SIGTERM ended the process within 100 ms (no graceful path)"
+  fail "the first SIGTERM did not start the graceful path (state '${PSTATE:-gone}', watcher line $(echo "$GLOG" | grep -ac 'SIGTERM received'))"
 fi
 T0=$(now_ms)
 kill -TERM "$PID" 2>/dev/null
