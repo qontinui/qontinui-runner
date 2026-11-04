@@ -23,6 +23,7 @@ import { LAYOUT_PRESETS, resolveLayoutArg } from "./useZoneLayout";
 import {
   readSignature,
   preHasPrefix,
+  type Live,
   PTY_SPAWN_SETTLE_MS,
   TERMINAL_INPUT_GLOB,
   ZONE_HEADER_GLOB,
@@ -78,13 +79,13 @@ export function predictSelectLayout(
 
 /**
  * `select-layout` — switches the grid preset; another `select-layout` undoes
- * it. `tabCount` is the page's tab count the picker is rendered with — the
- * same count auto-grow keys on.
+ * it. `tabCount` reads the on-screen page's tab count when `predict` runs,
+ * which is the same count auto-grow keys on.
  */
-export function selectLayoutSignature(tabCount: number): EffectSignature {
+export function selectLayoutSignature(tabCount: Live<number>): EffectSignature {
   return {
     id: "zone-layout-picker.select-layout",
-    predicts: (params, pre) => predictSelectLayout(params, pre, tabCount),
+    predicts: (params, pre) => predictSelectLayout(params, pre, tabCount.current),
     scope: { elementIds: [ZONE_HEADER_GLOB] },
     reversibility: "reversible",
     provenance: "declared",
@@ -125,17 +126,24 @@ export function predictLoadProfile(
 /**
  * `load-profile` — `destructive`, so `one-way`: the arrangement it overwrites
  * was never saved, and it can launch `claude --resume` into new tabs. The
- * profiles map and live tab count are the ones the handler closes over. The
- * handler awaits the whole apply (each spawn included), and the PTY settle
- * window covers the last spawned tab's element registering.
+ * profiles map and live tab count are read when `predict` runs. These are the
+ * values the handler acts on, not the ones from the render that registered
+ * the action, where `profiles` is still the empty map from before the DB
+ * load. The handler awaits the whole apply (each spawn included), and the
+ * PTY settle window covers the last spawned tab's element registering.
  */
-export function loadProfileSignature(
-  profiles: Readonly<Record<string, ZoneProfile>>,
-  liveTabCount: number,
-): EffectSignature {
+export interface LoadProfileFacts {
+  profiles: Readonly<Record<string, ZoneProfile>>;
+  liveTabCount: number;
+}
+
+export function loadProfileSignature(facts: Live<LoadProfileFacts>): EffectSignature {
   return {
     id: "zone-profile-picker.load-profile",
-    predicts: (params) => predictLoadProfile(params, profiles, liveTabCount),
+    predicts: (params) => {
+      const { profiles, liveTabCount } = facts.current;
+      return predictLoadProfile(params, profiles, liveTabCount);
+    },
     scope: { elementIds: [TERMINAL_INPUT_GLOB, ZONE_HEADER_GLOB] },
     settleMs: PTY_SPAWN_SETTLE_MS,
     reversibility: "one-way",
