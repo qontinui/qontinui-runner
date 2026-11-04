@@ -48,6 +48,18 @@ pub(super) async fn run_git(
     args: &[&str],
     timeout: Duration,
 ) -> Result<String, String> {
+    run_git_with(repo_dir, args, timeout, |_| {}).await
+}
+
+/// [`run_git`] with a hook that adjusts the command (its environment) after
+/// the host posture is applied and before it is spawned — the seam
+/// [`super::sibling_git_env`] isolates a sibling's git through.
+pub(super) async fn run_git_with(
+    repo_dir: &Path,
+    args: &[&str],
+    timeout: Duration,
+    configure: impl FnOnce(&mut tokio::process::Command),
+) -> Result<String, String> {
     use crate::process_helpers::ChildTreeGuard;
     let mut cmd = crate::process_helpers::tokio_no_window("git");
     // A git call raced against cancellation or cut off by a timeout is
@@ -65,6 +77,7 @@ pub(super) async fn run_git(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    configure(&mut cmd);
     ChildTreeGuard::arm_tokio(&mut cmd);
     let fut = async {
         let child = cmd
