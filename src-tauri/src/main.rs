@@ -254,7 +254,7 @@ mod scheduler_service;
 mod schema_registry;
 mod screen;
 mod sdk_features;
-mod shutdown_signals; // SIGTERM/SIGHUP mark the app quitting inside the signal handler, then die by default (round 11 M2)
+mod shutdown_signals; // SIGTERM/SIGHUP run the graceful quit (clean marker + request_force_close) off a self-pipe watcher; a kernel alarm backstop keeps a wedged runner dying
 pub(crate) use qontinui_runner_lib::secure_storage;
 mod security;
 mod semantic_conventions;
@@ -1795,6 +1795,18 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // harvest_boot_crash_evidence`, wired into Tauri `.setup`).
     crash_observability::install_live_crash_writer();
 
+    // A SIGTERM / SIGHUP is a shutdown request: from here on it runs the
+    // graceful quit (clean marker + `request_force_close`) instead of reading
+    // as a crash. Installed this EARLY, synchronously, so no boot-time await
+    // (the fleet publish's coord backoff ladder) can leave a service stop on
+    // the default disposition. It is safe before setup: until this boot has
+    // classified the previous marker, the watcher ends the process at once
+    // WITHOUT stamping (so a prior crash is still read as one); after the
+    // classification but before the app handle exists, it stamps clean (a
+    // requested stop is a planned stop) and then ends at once. A raw signal
+    // handler, NOT a runtime listener: see the module.
+    shutdown_signals::install();
+
     // Start health monitoring to detect resource exhaustion
     health_monitor::start_health_monitor();
 
@@ -2136,11 +2148,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // lifecycle poll's minutes-long debounce — so a runner killed
                 // meanwhile does not bring it back at boot.
                 session::claude_ended_watch::spawn();
-
-                // A SIGTERM / SIGHUP is a shutdown: mark it BEFORE the panes
-                // die, so their exits stay restart-shaped. Installed as a raw
-                // signal handler, NOT a runtime listener: see the module.
-                shutdown_signals::install();
 
                 // Visibility sweeper (Phase 5 of
                 // `plans/2026-07-28-runner-many-sessions-performance.md`).
