@@ -19,10 +19,18 @@
 //! both are read here and the runner accepts either), discovered by a
 //! **`.mcp.json` walk-up from cwd**.
 //! The runner provisions every session workdir with a `.mcp.json` whose
-//! coord-mcp server entry carries BOTH the nonce header and a loopback URL on
-//! the ACTUALLY-BOUND API port (`coord_mcp::write_coord_mcp_proxy_config` /
+//! coord-mcp server entry yields BOTH the nonce header and a `/coord-mcp` URL
+//! on the ACTUALLY-BOUND API port (`coord_mcp::write_coord_mcp_proxy_config` /
 //! `write_coord_mcp_agent_proxy_config`; the reconciler rewrites it on port
-//! drift). The nonce and the port are read from the SAME entry, so the POST
+//! drift). The entry takes one of two shapes: an `http` entry carrying `url`
+//! and `headers` inline, or a STDIO entry running the fleet shim
+//! (`coord-mcp-shim.py`) that carries neither — its `--credential` argument
+//! names a runner-owned file holding the flat `{url, headers}` pair. Both are
+//! read through the runner's own resolver,
+//! `coord_mcp_config::effective_coord_mcp_entry`, so a shim entry whose
+//! credential file is missing or unparseable resolves to nothing and the
+//! walk-up moves on to the next `.mcp.json` up. The nonce and the port are
+//! read from the SAME resolved entry, so the POST
 //! always lands on the runner that issued the nonce — there is deliberately NO
 //! port probing/scanning fallback (a scan can bind the nonce to a DIFFERENT
 //! runner, which then 401s it).
@@ -334,11 +342,13 @@ fn pr_create(args: &[String]) -> ExitCode {
         None => {
             eprintln!(
                 "qontinui-pr: no runner session credential found — no `.mcp.json` with a \
-                 loopback coord-mcp nonce entry between {} and the filesystem root. \
-                 This session was not provisioned by the runner, or provisioning is \
-                 degraded (check for a `.coord-mcp-status` breadcrumb in the session \
-                 workdir). Fallback: `gh pr create` works where a personal \
-                 `gh auth login` exists.",
+                 coord-mcp nonce entry between {} and the filesystem root. A stdio \
+                 shim entry (`coord-mcp-shim.py`) whose `--credential` file is missing \
+                 or unreadable lands here too — check that the file it names exists. \
+                 Otherwise this session was not provisioned by the runner, or \
+                 provisioning is degraded (check for a `.coord-mcp-status` breadcrumb \
+                 in the session workdir). Fallback: `gh pr create` works where a \
+                 personal `gh auth login` exists.",
                 cwd.display()
             );
             return ExitCode::from(1);
@@ -1442,13 +1452,22 @@ fn find_session_mcp_config(start: &Path) -> Option<SessionMcpConfig> {
     None
 }
 
-/// Parse a `.mcp.json` payload: find a server entry whose URL points at a
-/// loopback `/coord-mcp` proxy and read its proxy nonce — from
+/// Parse a `.mcp.json` payload: find a server entry whose URL contains
+/// `/coord-mcp` and read its proxy nonce — from
 /// `Authorization: Bearer <nonce>` (preferred; the Phase 2 shape) or the legacy
 /// `X-Coord-Mcp-Proxy-Key` header, both matched case-insensitively — plus the
 /// port embedded in the URL. Entries with NEITHER (e.g. a static-bearer config,
 /// whose `Authorization` holds a JWT) are SKIPPED per-entry — a non-nonce
 /// `/coord-mcp` entry must not mask a later valid one.
+///
+/// The `coord-mcp` entry is resolved through
+/// `coord_mcp_config::effective_coord_mcp_entry`: an inline `http` entry is
+/// read as is, a stdio-shim entry is read from the `{url, headers}` credential
+/// file its `--credential` argument names (a missing or unparseable file skips
+/// the entry), and a stdio entry that is NOT the fleet shim is never read as a
+/// credential. The URL is NOT checked to be loopback — only its port is taken.
+/// That is safe because the caller always POSTs to `127.0.0.1:<port>`, so the
+/// nonce cannot leave the box through this path whatever host the URL names.
 ///
 /// The nonce extraction itself is `coord_mcp_config::proxy_nonce_from_header_object`
 /// — the SAME function the runner's own config readers and `coord doctor` use,
@@ -1942,6 +1961,137 @@ mod tests {
         let cfg = find_session_mcp_config(&nested).unwrap();
         assert_eq!(cfg.nonce, "walkup");
         assert_eq!(cfg.port, Some(9878));
+    }
+
+    /// Write a stdio-shim `.mcp.json` into `dir` in the shape
+    /// `coord_mcp::write_coord_mcp_proxy_config` emits when the stdio gate is
+    /// open (pinned by `coord_mcp`'s
+    /// `write_coord_mcp_proxy_config_emits_the_stdio_shim_shape_when_the_gate_is_open`):
+    /// `type: "stdio"`, `args: [<…>/coord-mcp-shim.py, "--credential", <abs path>]`,
+    /// and NO `url`/`headers` in the document itself.
+    fn write_stdio_shim_mcp_json(dir: &Path, credential: &Path) {
+        let doc = serde_json::json!({
+            "mcpServers": {
+                "coord-mcp": {
+                    "type": "stdio",
+                    "command": "python",
+                    "args": [
+                        dir.join("scripts").join("coord-mcp-shim.py").to_string_lossy(),
+                        "--credential",
+                        credential.to_string_lossy(),
+                    ],
+                }
+            }
+        });
+        std::fs::write(dir.join(".mcp.json"), doc.to_string()).unwrap();
+    }
+
+    /// The flat `{url, headers}` credential file the shim's `load_credential`
+    /// reads, as the runner writes it.
+    fn write_shim_credential(path: &Path, port: u16, nonce: &str) {
+        let cred = serde_json::json!({
+            "url": format!("http://127.0.0.1:{port}/coord-mcp"),
+            "headers": { "Authorization": format!("Bearer {nonce}") },
+        });
+        std::fs::write(path, cred.to_string()).unwrap();
+    }
+
+    /// (a) A stdio-shim entry keeps its `url` and `headers` in the credential
+    /// file it names; the walk-up must resolve the nonce AND the port through
+    /// that file (`effective_coord_mcp_entry`), not from the raw entry, which
+    /// carries neither.
+    #[test]
+    fn walk_up_resolves_a_stdio_shim_entry_through_its_credential_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let credential = root.join("coord-mcp-credential.json");
+        write_shim_credential(&credential, 9881, "shimnonce");
+        write_stdio_shim_mcp_json(root, &credential);
+        let nested = root.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let cfg = find_session_mcp_config(&nested).expect("shim entry must resolve");
+        assert_eq!(cfg.nonce, "shimnonce");
+        assert_eq!(cfg.port, Some(9881));
+    }
+
+    /// (b) A nearer stdio-shim entry whose credential file is MISSING resolves
+    /// to nothing, and must not mask a valid `.mcp.json` farther up.
+    #[test]
+    fn walk_up_skips_a_shim_entry_with_a_missing_credential_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let near = root.join("near");
+        std::fs::create_dir_all(&near).unwrap();
+        let missing = near.join("no-such-credential.json");
+        write_stdio_shim_mcp_json(&near, &missing);
+        assert!(
+            parse_mcp_json(&std::fs::read_to_string(near.join(".mcp.json")).unwrap()).is_none(),
+            "a shim entry with no credential file must resolve to nothing"
+        );
+
+        let far_credential = root.join("far-credential.json");
+        write_shim_credential(&far_credential, 9882, "farnonce");
+        write_stdio_shim_mcp_json(root, &far_credential);
+
+        let cfg = find_session_mcp_config(&near).expect("walk-up must reach the farther file");
+        assert_eq!(cfg.nonce, "farnonce");
+        assert_eq!(cfg.port, Some(9882));
+    }
+
+    /// (c) A nearer stdio-shim entry whose credential file is UNPARSEABLE
+    /// resolves to nothing, and must not mask a valid `.mcp.json` farther up.
+    #[test]
+    fn walk_up_skips_a_shim_entry_with_an_unparseable_credential_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let near = root.join("near");
+        std::fs::create_dir_all(&near).unwrap();
+        let garbled = near.join("garbled-credential.json");
+        std::fs::write(&garbled, "{ not json").unwrap();
+        write_stdio_shim_mcp_json(&near, &garbled);
+        assert!(
+            parse_mcp_json(&std::fs::read_to_string(near.join(".mcp.json")).unwrap()).is_none(),
+            "a shim entry with an unparseable credential file must resolve to nothing"
+        );
+
+        std::fs::write(
+            root.join(".mcp.json"),
+            r#"{"mcpServers":{"coord-mcp":{"url":"http://127.0.0.1:9883/coord-mcp","headers":{"Authorization":"Bearer httpnonce"}}}}"#,
+        )
+        .unwrap();
+
+        let cfg = find_session_mcp_config(&near).expect("walk-up must reach the farther file");
+        assert_eq!(cfg.nonce, "httpnonce");
+        assert_eq!(cfg.port, Some(9883));
+    }
+
+    /// (d) A stdio entry that is NOT the fleet shim (`args[0]` is not
+    /// `coord-mcp-shim.py`) must not have its `--credential` argument read as
+    /// a credential file — even when that file holds a well-formed
+    /// `{url, headers}`. Only the shim check (`config_doc_is_stdio_shim`)
+    /// keeps this entry dark, so dropping it reddens this case.
+    #[test]
+    fn walk_up_does_not_read_a_non_shim_stdio_entrys_credential_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let credential = root.join("valid-credential.json");
+        write_shim_credential(&credential, 9884, "notashim");
+        let doc = serde_json::json!({
+            "mcpServers": {
+                "coord-mcp": {
+                    "type": "stdio",
+                    "command": "node",
+                    "args": ["server.js", "--credential", credential.to_string_lossy()],
+                }
+            }
+        });
+        // Parsed directly rather than walked: a walk-up from a temp dir would
+        // continue into the real ancestors, which this case must not depend on.
+        assert!(
+            parse_mcp_json(&doc.to_string()).is_none(),
+            "a non-shim stdio entry's --credential file must not be read as a session credential"
+        );
     }
 
     /// Phase 2 (plan 2026-08-20): the runner now emits the nonce in
