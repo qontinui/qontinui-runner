@@ -1360,13 +1360,9 @@ async fn spawn_looping_agent_terminal(
         crate::session::spawn_prompt::delivery_unless_replacement(policy_delivery, &argv);
     let command = Some(argv);
 
-    if selected_config_dir.is_none()
-        && !crate::ai_provider::oauth_refresh::default_location_has_valid_credentials()
+    if let Some(reason) = crate::ai_provider::spawn_account_refusal(selected_config_dir.as_deref())
     {
-        let instance = crate::instance::instance_name().unwrap_or_else(|| "primary".to_string());
-        return Err(format!(
-            "no authenticated Claude account on this runner — run /login (instance={instance})"
-        ));
+        return Err(reason);
     }
 
     // Spread across non-full pages (same picker + ceiling as continuations).

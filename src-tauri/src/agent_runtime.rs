@@ -5880,6 +5880,14 @@ fn spawn_authorization_stamp_reason(label: &str) -> String {
     format!("spawn_authorization_{label}")
 }
 
+/// The `reason` a no-account deferral stamps:
+/// `no_authenticated_account:<instance>`, where `<instance>` is the runner's
+/// instance name or `primary`. Names the runner because a fix needs a `/login` on
+/// that box, and a device can host more than one instance.
+fn no_account_stamp_reason(instance: &str) -> String {
+    format!("no_authenticated_account:{instance}")
+}
+
 /// POST the NON-CONSUMING deferred stamp for a locally-skipped continuation
 /// (`POST /coord/gates/{gate_id}/continuation-deferred`, body
 /// `{device_id, reason}`).
@@ -5893,6 +5901,7 @@ fn spawn_authorization_stamp_reason(label: &str) -> String {
 /// | `thread_pressure:<severity>:<observed>_over_<limit>` | the machine is out of OS threads (`severity` = `warn` \| `critical`) | [`thread_pressure_stamp_reason`] |
 /// | `commit_pressure:<severity>:<observed>_under_<limit>` | the machine is short of free memory (bytes of free commit; `MemAvailable` off Windows) | [`commit_pressure_stamp_reason`] |
 /// | `device_drain:<class>` | coord holds this device drained | [`drain_stamp_reason`] |
+/// | `no_authenticated_account:<instance>` | no credential-valid Claude account, so a spawn would refuse | [`no_account_stamp_reason`] |
 /// | `spawn_authorization_<label>` | the agent registry refused the spawn | [`spawn_authorization_stamp_reason`] |
 ///
 /// All but the last follow `<class>:<detail>`; `spawn_authorization_` is
@@ -6056,7 +6065,8 @@ fn first_line(msg: &str) -> String {
 /// constructors in [`post_continuation_deferred`]'s table — never spelled
 /// inline. All follow `<class>:<detail>` (`duplicate_anchor:<tid>`,
 /// `thread_pressure:<severity>:<observed>_over_<limit>`,
-/// `commit_pressure:<severity>:<observed>_under_<limit>`, `device_drain:<class>`)
+/// `commit_pressure:<severity>:<observed>_under_<limit>`, `device_drain:<class>`,
+/// `no_authenticated_account:<instance>`)
 /// except `spawn_authorization_<label>`, which predates the grammar. Callers log their own
 /// human-readable line first, at the severity their verdict deserves.
 async fn defer_continuation_unclaimed(
@@ -6070,6 +6080,96 @@ async fn defer_continuation_unclaimed(
         }
     }
     release_local_dispatch_claim(consume_target);
+}
+
+/// [`crate::ai_provider::spawn_account_ready`] on the blocking pool.
+async fn read_spawn_account_ready() -> bool {
+    settle_account_read(spawn_blocking_tracked(
+        crate::ai_provider::spawn_account_ready,
+    ))
+    .await
+}
+
+/// The answer of a blocking account read. A read that did not finish answers
+/// `true`: it says nothing about the accounts, so it must not stamp
+/// `no_authenticated_account` on a row, and the spawn seam still refuses through
+/// the same predicate if there really is none.
+async fn settle_account_read(read: tokio::task::JoinHandle<bool>) -> bool {
+    match read.await {
+        Ok(ready) => ready,
+        Err(e) => {
+            warn!(
+                "agent_runtime: the spawn-account read did not finish ({e}); proceeding to \
+                 the claim, and the spawn seam still refuses if no account is valid"
+            );
+            true
+        }
+    }
+}
+
+/// What [`claim_if_account_ready`] decided.
+#[derive(Debug, PartialEq, Eq)]
+enum PreClaim {
+    /// No credential-valid account: deferred UNCLAIMED, with the stamp posted
+    /// and the local dispatch claim released. The caller returns without
+    /// spawning.
+    Deferred { stamp: String },
+    /// An account is there, or the legacy path, which is never checked.
+    /// `decision` is coord's answer to the consume claim for a
+    /// [`ConsumeTarget::Gate`], and `None` for the targets that post no claim.
+    Ready { decision: Option<SpawnDecision> },
+}
+
+/// The step-1b-to-step-2 transition of [`run_gate_continuation_inner`]: check
+/// that a credential-valid account exists, and only then post the consume CLAIM.
+///
+/// A runner with no logged-in account used to claim the continuation, allocate a
+/// worktree, and only then refuse at the spawn seam. Its caller posted
+/// `spawn_failed: no authenticated Claude account ...`, coord classes that as
+/// deterministic, and nothing re-drives it, so the claim is what burned the row.
+/// The missing account is a LOCAL condition like every other guard in step 1, so
+/// it defers UNCLAIMED and stamped: the row stays pending and re-listed, and
+/// the first `/login` lets the next delivery through. The deferral alone does not
+/// move the row elsewhere.
+///
+/// [`ConsumeTarget::None`] is not checked: the legacy path has no re-delivery, so
+/// a deferral there would be a silent drop. Its spawn seam still refuses.
+///
+/// `account_ready`, `post_claim` and `defer_unclaimed` are injected so that a unit
+/// test drives this fn and counts its posters rather than a re-implementation of
+/// it. Production passes [`read_spawn_account_ready`],
+/// [`post_continuation_claim`] and [`defer_continuation_unclaimed`] in ONE
+/// statement.
+async fn claim_if_account_ready<R, RFut, C, CFut, D, DFut>(
+    consume_target: ConsumeTarget,
+    instance: &str,
+    account_ready: R,
+    post_claim: C,
+    defer_unclaimed: D,
+) -> PreClaim
+where
+    R: FnOnce() -> RFut,
+    RFut: std::future::Future<Output = bool>,
+    C: FnOnce(uuid::Uuid) -> CFut,
+    CFut: std::future::Future<Output = SpawnDecision>,
+    D: FnOnce(String) -> DFut,
+    DFut: std::future::Future<Output = ()>,
+{
+    if !matches!(consume_target, ConsumeTarget::None) && !account_ready().await {
+        let stamp = no_account_stamp_reason(instance);
+        warn!(
+            "agent_runtime: gate-continuation deferred before its claim: no authenticated \
+             Claude account on this runner, run /login. Row left pending for re-delivery \
+             (stamp={stamp}, consume_target={consume_target:?})"
+        );
+        defer_unclaimed(stamp.clone()).await;
+        return PreClaim::Deferred { stamp };
+    }
+    let decision = match consume_target {
+        ConsumeTarget::Gate(gate_id, _) => Some(post_claim(gate_id).await),
+        ConsumeTarget::Dispatch(_) | ConsumeTarget::None => None,
+    };
+    PreClaim::Ready { decision }
 }
 
 /// Spawn the run task for a gate continuation WITHOUT the coord claim/outcome
@@ -6103,7 +6203,9 @@ fn spawn_gate_continuation_task(payload: GateContinuationPayload, device_id: uui
 /// 1. Local guards (anchor_key dedup, then the memory and thread load lanes)
 ///    — run FIRST so a locally-rejected dispatch never burns a coord-side claim
 ///    (contract item 4), and so a machine already short of memory or threads
-///    never pays a `git worktree add` before being told to wait.
+///    never pays a `git worktree add` before being told to wait. The last of
+///    them is the account check ([`claim_if_account_ready`]), immediately before
+///    the claim.
 /// 2. **CLAIM** ([`ConsumeTarget::Gate`] only): POST the consume CLAIM and AWAIT
 ///    it. `409 cancelled` → log INFO + SKIP the spawn entirely; network/other
 ///    error → WARN + PROCEED. The work-unit path has no claim-before-spawn (the
@@ -6341,11 +6443,25 @@ async fn run_gate_continuation_inner(
         return Ok(());
     }
 
-    // Step 2: CLAIM-before-spawn (only with a gate_id / coord configured). Posted
-    // AFTER the #469 guards pass and AWAITED — its result decides whether to
-    // spawn. This closes the poll→cancel→spawn race: if a cancel landed between
-    // the poll and now, coord returns 409 cancelled and we skip the spawn.
-    if let ConsumeTarget::Gate(gate_id, _) = consume_target {
+    // Step 1c + 2: an account check, then CLAIM-before-spawn (only with a
+    // gate_id / coord configured). One statement for the transition, driven by
+    // its unit tests through the same fn. The claim is posted AFTER the #469
+    // guards pass and AWAITED — its result decides whether to spawn. This closes
+    // the poll→cancel→spawn race: if a cancel landed between the poll and now,
+    // coord returns 409 cancelled and we skip the spawn.
+    let decision = match claim_if_account_ready(
+        consume_target,
+        &crate::instance::instance_name().unwrap_or_else(|| "primary".to_string()),
+        read_spawn_account_ready,
+        |gate_id| post_continuation_claim(gate_id, device_id),
+        |stamp| defer_continuation_unclaimed(consume_target, device_id, stamp),
+    )
+    .await
+    {
+        PreClaim::Deferred { .. } => return Ok(()),
+        PreClaim::Ready { decision } => decision,
+    };
+    if let (ConsumeTarget::Gate(gate_id, _), Some(decision)) = (consume_target, decision.as_ref()) {
         // ONE wiring statement. Every per-decision behaviour — which skip
         // releases the local claim, which decision proceeds, and what each
         // logs — lives in `settle_claim_decision`, which the unit test drives
@@ -6358,8 +6474,7 @@ async fn run_gate_continuation_inner(
         // coord, while `settle_claim_decision` is pure-sync and unit-driven.
         // So the DECISION (log + whether the claim is settled here) stays
         // there and only the await lands at this call site.
-        let decision = post_continuation_claim(gate_id, device_id).await;
-        match settle_claim_decision(&decision, consume_target, gate_id) {
+        match settle_claim_decision(decision, consume_target, gate_id) {
             ClaimOutcome::Spawn => {}
             ClaimOutcome::Skip => return Ok(()),
             ClaimOutcome::DeferUnclaimed(class) => {
@@ -6970,13 +7085,8 @@ async fn run_continuation_terminal(
     // `claude` that immediately dies with `401 ... Please run /login`, leaving a
     // dead terminal the operator can't diagnose. Abort with an actionable
     // reason so coord/the operator sees WHY instead of a blank 401 pane.
-    if selected_config_dir.is_none()
-        && !crate::ai_provider::oauth_refresh::default_location_has_valid_credentials()
+    if let Some(reason) = crate::ai_provider::spawn_account_refusal(selected_config_dir.as_deref())
     {
-        let instance = crate::instance::instance_name().unwrap_or_else(|| "primary".to_string());
-        let reason = format!(
-            "no authenticated Claude account on this runner — run /login (instance={instance})"
-        );
         warn!("agent_runtime: gate-continuation terminal aborted — {reason}");
         report_spawn_failed(agent_id, &reason, None, 0, None).await;
         return Err(anyhow::anyhow!(reason));
@@ -8100,13 +8210,8 @@ async fn run_condition_check_terminal(
         crate::session::spawn_prompt::delivery_unless_replacement(policy_delivery, &argv);
     let command = Some(argv);
 
-    if selected_config_dir.is_none()
-        && !crate::ai_provider::oauth_refresh::default_location_has_valid_credentials()
+    if let Some(reason) = crate::ai_provider::spawn_account_refusal(selected_config_dir.as_deref())
     {
-        let instance = crate::instance::instance_name().unwrap_or_else(|| "primary".to_string());
-        let reason = format!(
-            "no authenticated Claude account on this runner — run /login (instance={instance})"
-        );
         warn!("agent_runtime: condition-check aborted — {reason}");
         report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
         return Err(anyhow::anyhow!(reason));
@@ -10298,12 +10403,8 @@ pub(crate) async fn spawn_claude_child(
             Some(dir.to_string())
         }
         None => {
-            if !crate::ai_provider::oauth_refresh::default_location_has_valid_credentials() {
-                let instance =
-                    crate::instance::instance_name().unwrap_or_else(|| "primary".to_string());
-                return Err(anyhow::anyhow!(
-                    "no authenticated Claude account on this runner — run /login (instance={instance})"
-                ));
+            if let Some(reason) = crate::ai_provider::spawn_account_refusal(None) {
+                return Err(anyhow::anyhow!(reason));
             }
             // None + ambient default has live creds → inherit it (single-account
             // / unset-CLAUDE_CONFIG_DIR default — unchanged behavior).
@@ -11122,6 +11223,12 @@ async fn report_launch_deferral(agent_id: uuid::Uuid, reason: &str) {
 // =============================================================================
 // Tests
 // =============================================================================
+
+// Out of line so these tests, which name the symbols of the pre-claim account
+// check, travel with the production hunks that define them. The arming tests in
+// `mod tests` name none of those symbols.
+#[cfg(test)]
+mod no_account_tests;
 
 #[cfg(test)]
 mod tests {
@@ -18778,6 +18885,395 @@ mod tests {
         match prior {
             Some(v) => std::env::set_var(AGENT_JWT_EXP_COMPRESS_ENV, v),
             None => std::env::remove_var(AGENT_JWT_EXP_COMPRESS_ENV),
+        }
+    }
+
+    /// Arming for plan
+    /// `2026-11-03-a-runner-with-no-logged-in-claude-account-keeps-an-open-agent-lane-so-coord-burns-spawns-on-it`
+    /// Phase 2. These enter where the population enters: coord's delivery, through
+    /// the poll that hands each listed row to `dispatch_gate_continuation`. The WS
+    /// frame reaches that same fn from inside the read loop, which no unit test can
+    /// drive. They name nothing the phase added, so they go red rather than fail to
+    /// compile when its production hunks are reverted.
+    ///
+    /// The rows are `presentation: headless` because a terminal row with no Tauri
+    /// runtime stops earlier, at step 0b's boot deferral. Every step after that one
+    /// is shared by both presentations.
+    mod no_account_arming {
+        use super::super::*;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        /// One `coord.gates` continuation (or unit-dispatch) row, as far as the
+        /// delivery can move it.
+        #[derive(Default, Debug)]
+        struct FakeRow {
+            payload: serde_json::Value,
+            consumed_at: bool,
+            outcome: Option<String>,
+            outcome_detail: Option<String>,
+            deferred_reason: Option<String>,
+            deferred_stamps: usize,
+        }
+
+        /// coord as a delivery sees it. Claiming sets `consumed_at`, which takes a
+        /// row off the pending list; a deferred stamp does not.
+        #[derive(Default, Debug)]
+        struct FakeCoord {
+            gates: HashMap<uuid::Uuid, FakeRow>,
+            unit_dispatches: HashMap<uuid::Uuid, FakeRow>,
+            allocates: usize,
+            spawn_failed_posts: usize,
+            poll_reports: Vec<serde_json::Value>,
+        }
+
+        type SharedCoord = Arc<Mutex<FakeCoord>>;
+
+        fn lock(coord: &SharedCoord) -> std::sync::MutexGuard<'_, FakeCoord> {
+            coord.lock().unwrap_or_else(|p| p.into_inner())
+        }
+
+        fn pending_json(
+            rows: &HashMap<uuid::Uuid, FakeRow>,
+            id_key: &str,
+        ) -> axum::Json<serde_json::Value> {
+            let pending: Vec<serde_json::Value> = rows
+                .iter()
+                .filter(|(_, row)| !row.consumed_at)
+                .map(|(id, row)| serde_json::json!({ id_key: id, "payload": row.payload }))
+                .collect();
+            let total = pending.len();
+            axum::Json(serde_json::json!({ "pending": pending, "total": total }))
+        }
+
+        async fn fake_coord_route(
+            axum::extract::State(coord): axum::extract::State<SharedCoord>,
+            uri: axum::http::Uri,
+            body: bytes::Bytes,
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let body: serde_json::Value =
+                serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+            let segments: Vec<&str> = uri.path().trim_matches('/').split('/').collect();
+            let row_id = |raw: &str| uuid::Uuid::parse_str(raw).expect("a row id in the path");
+            let shared = coord;
+            let mut coord = lock(&shared);
+            match segments.as_slice() {
+                ["coord", "agents", "pending-continuations"] => {
+                    pending_json(&coord.gates, "gate_id").into_response()
+                }
+                ["coord", "agents", "pending-unit-dispatches"] => {
+                    pending_json(&coord.unit_dispatches, "dispatch_id").into_response()
+                }
+                ["coord", "agents", "continuation-poll-report"] => {
+                    coord.poll_reports.push(body);
+                    axum::Json(serde_json::json!({})).into_response()
+                }
+                ["coord", "gates", id, "continuation-consumed"] => {
+                    let row = coord.gates.entry(row_id(id)).or_default();
+                    row.consumed_at = true;
+                    if let Some(outcome) = body.get("outcome").and_then(|o| o.as_str()) {
+                        row.outcome = Some(outcome.to_string());
+                        row.outcome_detail = body
+                            .get("detail")
+                            .and_then(|d| d.as_str())
+                            .map(str::to_string);
+                    }
+                    axum::Json(serde_json::json!({ "outcome_recorded": true })).into_response()
+                }
+                ["coord", "gates", id, "continuation-deferred"] => {
+                    let row = coord.gates.entry(row_id(id)).or_default();
+                    row.deferred_stamps += 1;
+                    row.deferred_reason = body
+                        .get("reason")
+                        .and_then(|r| r.as_str())
+                        .map(str::to_string);
+                    axum::Json(serde_json::json!({})).into_response()
+                }
+                ["coord", "agents", "unit-dispatches", id, "consumed"] => {
+                    coord
+                        .unit_dispatches
+                        .entry(row_id(id))
+                        .or_default()
+                        .consumed_at = true;
+                    axum::Json(serde_json::json!({ "consumed": true })).into_response()
+                }
+                ["agents", "allocate"] => {
+                    coord.allocates += 1;
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                }
+                ["agents", _, "spawn-failed"] => {
+                    coord.spawn_failed_posts += 1;
+                    axum::Json(serde_json::json!({})).into_response()
+                }
+                _ => axum::Json(serde_json::json!({})).into_response(),
+            }
+        }
+
+        async fn start_fake_coord() -> (String, SharedCoord) {
+            let coord = SharedCoord::default();
+            let app = axum::Router::new()
+                .fallback(fake_coord_route)
+                .with_state(coord.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind the fake coord");
+            let base = format!("http://{}", listener.local_addr().expect("its address"));
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            (base, coord)
+        }
+
+        fn row_payload(device_id: uuid::Uuid, anchor: String) -> serde_json::Value {
+            serde_json::json!({
+                "target_device_id": device_id,
+                "initial_prompt": "arming: the follow-up this row exists to run",
+                "repos": ["qontinui-runner"],
+                "presentation": "headless",
+                "source": "gate_continuation",
+                "anchor_key": anchor,
+            })
+        }
+
+        /// Puts back what [`NoAccountRunner`] published on process-global state.
+        /// The drain tracker has no pure reset: three misses are what make it read
+        /// `Unknown` again, which is the state a test process otherwise sits in.
+        struct RestoreGlobals {
+            resolved: Option<String>,
+        }
+
+        impl Drop for RestoreGlobals {
+            fn drop(&mut self) {
+                crate::ai_provider::set_resolved_config_dir(self.resolved.take());
+                for _ in 0..3 {
+                    crate::coord_drain_state::note_heartbeat_failure("arming test finished");
+                }
+            }
+        }
+
+        /// A primary runner with no credential-valid account, and everything else
+        /// on the path to the check held open, so the only thing that can stop this
+        /// delivery is the missing account.
+        struct NoAccountRunner {
+            _restore: RestoreGlobals,
+            _dead_default: tempfile::TempDir,
+        }
+
+        impl NoAccountRunner {
+            async fn arrange(
+                amb: &qontinui_runner_lib::ambient::test_support::IsolatedAmbient,
+                coord_base: &str,
+                device_id: uuid::Uuid,
+            ) -> Self {
+                // `dirs` answers the REAL profile on Windows whatever HOME and
+                // USERPROFILE say, so without these two the box's own roster and
+                // `~/.claude` decide the test. An instance root moves the roster
+                // into the fixture, and an existing `$CLAUDE_CONFIG_DIR` file is the
+                // default location's first hit, so an expired, unrefreshable one
+                // reads as no login at all.
+                std::env::set_var("QONTINUI_INSTANCE_ROOT", amb.dir().join("subject"));
+                let dead_default = tempfile::tempdir().expect("tempdir");
+                std::fs::write(
+                    dead_default.path().join(".credentials.json"),
+                    serde_json::json!({
+                        "claudeAiOauth": {
+                            "accessToken": "sk-oauth-expired",
+                            "refreshToken": "",
+                            "expiresAt": 1_000,
+                            "scopes": ["user:inference"],
+                        }
+                    })
+                    .to_string(),
+                )
+                .expect("write the expired credentials");
+                std::env::set_var("CLAUDE_CONFIG_DIR", dead_default.path());
+                std::env::set_var("COORD_HTTP_URL", coord_base);
+                // The registry half of the authorization: `Unpaired` here allows,
+                // and the break-glass covers a fail-safe refusal a sibling left in
+                // the process-wide registry cache.
+                std::env::set_var("QONTINUI_SPAWN_AUTHZ_DISABLED", "1");
+                amb.write_machine_json(&format!("{{\"device_id\":\"{device_id}\"}}"));
+                // This fleet's boxes saturate: a load deferral must not decide this.
+                crate::settings::update_settings(|s| s.session_guard.enabled = false)
+                    .expect("disable the session guard in the fixture");
+
+                let restore = RestoreGlobals {
+                    resolved: crate::ai_provider::get_resolved_config_dir(),
+                };
+                crate::ai_provider::set_resolved_config_dir(None);
+                // A test process boots `Unknown`, which defers every autonomous
+                // spawn with `device_drain:unknown`.
+                crate::coord_drain_state::note_heartbeat(
+                    crate::coord_drain_state::HeartbeatOutcome::Registered {
+                        drain: crate::coord_drain_state::DrainObservation::Clear,
+                    },
+                )
+                .await;
+
+                // The premise: if this does not hold, the box has an account and
+                // nothing below is testing what it claims to.
+                let ai = crate::settings::get_ai_settings();
+                assert_eq!(
+                    crate::ai_provider::get_effective_config_dir(&ai.claude_cli).0,
+                    None,
+                    "the fixture must resolve no account dir"
+                );
+                assert!(
+                    !crate::ai_provider::oauth_refresh::default_location_has_valid_credentials(),
+                    "the fixture's default location must hold no live login"
+                );
+                Self {
+                    _restore: restore,
+                    _dead_default: dead_default,
+                }
+            }
+        }
+
+        const EVIDENCE_DEADLINE: Duration = Duration::from_secs(60);
+
+        /// Poll `done` until it holds, panicking with `what` past the deadline. A
+        /// run that ends with no evidence must not read as a pass.
+        async fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+            let deadline = std::time::Instant::now() + EVIDENCE_DEADLINE;
+            while !done() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no evidence within {EVIDENCE_DEADLINE:?}: {what}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        /// Wait for the run to give its in-process claim back, which is also what
+        /// lets a re-delivery of the row dispatch rather than dedupe.
+        async fn wait_for_gate_release(gate_id: uuid::Uuid) {
+            wait_for("the gate's in-process claim to be released", || {
+                let released = claim_gate_dispatch_attempt(gate_id, 0);
+                if released {
+                    release_gate_dispatch_attempt(gate_id, 0);
+                }
+                released
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        #[cfg_attr(
+            target_os = "macos",
+            ignore = "the default-location check reads the real login Keychain on macOS"
+        )]
+        #[allow(clippy::await_holding_lock)]
+        async fn no_account_gate_continuation_stays_pending_unclaimed_and_stamped_through_coord_delivery(
+        ) {
+            let guards = crate::mcp::fleet_policy_poller::isolated_ambient_with_fleet_pin();
+            let _registry = CONTINUATION_REGISTRY_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let (base, coord) = start_fake_coord().await;
+            let device_id = uuid::Uuid::now_v7();
+            let _runner = NoAccountRunner::arrange(&guards.1, &base, device_id).await;
+            let gate_id = uuid::Uuid::now_v7();
+            lock(&coord).gates.insert(
+                gate_id,
+                FakeRow {
+                    payload: row_payload(device_id, format!("arming-{gate_id}")),
+                    ..Default::default()
+                },
+            );
+
+            poll_pending_continuations(device_id).await;
+            wait_for("the row to be stamped or claimed", || {
+                let coord = lock(&coord);
+                let row = &coord.gates[&gate_id];
+                row.deferred_stamps > 0 || row.consumed_at
+            })
+            .await;
+            // Before the release wait: a claim coord accepted seals the attempt, so
+            // that wait would only time out and hide this.
+            {
+                let coord = lock(&coord);
+                assert!(
+                    !coord.gates[&gate_id].consumed_at,
+                    "the row was CLAIMED, so coord will never re-list it: {coord:?}"
+                );
+            }
+            wait_for_gate_release(gate_id).await;
+
+            {
+                let coord = lock(&coord);
+                let row = &coord.gates[&gate_id];
+                assert_eq!(
+                    row.deferred_reason.as_deref(),
+                    Some("no_authenticated_account:primary"),
+                    "{coord:?}"
+                );
+                assert_eq!(row.outcome, None, "no spawn_failed outcome: {coord:?}");
+                assert_eq!(row.outcome_detail, None, "{coord:?}");
+                assert_eq!(coord.allocates, 0, "no worktree allocated: {coord:?}");
+                assert_eq!(
+                    coord.spawn_failed_posts, 0,
+                    "no lifecycle spawn failure: {coord:?}"
+                );
+            }
+
+            // Still pending means still listed: the next poll delivers it again, it
+            // dispatches rather than deduping, and the stamp stays rate-limited.
+            poll_pending_continuations(device_id).await;
+            wait_for_gate_release(gate_id).await;
+            let coord = lock(&coord);
+            let row = &coord.gates[&gate_id];
+            assert!(!row.consumed_at, "{coord:?}");
+            assert_eq!(row.deferred_stamps, 1, "hourly, not per poll: {coord:?}");
+            assert_eq!(coord.allocates, 0, "{coord:?}");
+            assert_eq!(coord.poll_reports.len(), 2, "{coord:?}");
+            for report in &coord.poll_reports {
+                assert_eq!(report["listed_n"], 1, "{coord:?}");
+                assert_eq!(report["dispatched_n"], 1, "{coord:?}");
+            }
+        }
+
+        /// A unit dispatch has no claim and takes no stamp. What the check saves it
+        /// is the worktree a spawn that cannot start would have allocated.
+        #[tokio::test]
+        #[cfg_attr(
+            target_os = "macos",
+            ignore = "the default-location check reads the real login Keychain on macOS"
+        )]
+        #[allow(clippy::await_holding_lock)]
+        async fn no_account_unit_dispatch_stays_unconsumed_with_no_worktree_through_coord_delivery()
+        {
+            let guards = crate::mcp::fleet_policy_poller::isolated_ambient_with_fleet_pin();
+            let _registry = CONTINUATION_REGISTRY_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let (base, coord) = start_fake_coord().await;
+            let device_id = uuid::Uuid::now_v7();
+            let _runner = NoAccountRunner::arrange(&guards.1, &base, device_id).await;
+            let dispatch_id = uuid::Uuid::now_v7();
+            lock(&coord).unit_dispatches.insert(
+                dispatch_id,
+                FakeRow {
+                    payload: row_payload(device_id, format!("arming-{dispatch_id}")),
+                    ..Default::default()
+                },
+            );
+
+            poll_pending_unit_dispatches(device_id).await;
+            wait_for("the dispatch's in-process claim to be released", || {
+                let released = claim_dispatch_dispatch(dispatch_id);
+                if released {
+                    release_dispatch_dispatch(dispatch_id);
+                }
+                released
+            })
+            .await;
+
+            let coord = lock(&coord);
+            let row = &coord.unit_dispatches[&dispatch_id];
+            assert!(!row.consumed_at, "the row must stay listed: {coord:?}");
+            assert_eq!(coord.allocates, 0, "no worktree allocated: {coord:?}");
+            assert_eq!(coord.spawn_failed_posts, 0, "{coord:?}");
         }
     }
 }
