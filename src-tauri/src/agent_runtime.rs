@@ -2479,6 +2479,24 @@ fn lock_recover<'a, T>(
     })
 }
 
+/// Monotonic counter for [`dispatched_gate_ids`]. Every won claim and every
+/// seal takes the next value ([`next_claim_epoch`]); a poll run reads the
+/// current value ([`current_claim_epoch`]) BEFORE it fetches the pending list,
+/// so an entry whose epoch is larger was claimed or sealed after that list was
+/// read.
+static CLAIM_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The latest claim epoch handed out. A claim made after this read has a
+/// strictly larger epoch.
+fn current_claim_epoch() -> u64 {
+    CLAIM_EPOCH.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Take the next claim epoch (strictly larger than any value read before).
+fn next_claim_epoch() -> u64 {
+    CLAIM_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
 /// Process-wide set of gate_ids whose continuation we have ALREADY dispatched.
 ///
 /// At-least-once delivery means a single continuation can arrive via BOTH the WS
@@ -2495,12 +2513,17 @@ fn lock_recover<'a, T>(
 /// by resetting the SAME gate row, and a gate whose session ran stays claimed
 /// here for the life of the process — so a set of bare ids would drop every
 /// re-delivery to this device forever. A strictly LARGER attempt therefore
-/// claims afresh, while a duplicate of the same attempt (WS + poll) or a stale
-/// older one is still dropped. This is the ONLY guard against a same-device
+/// claims afresh — subject to the poll-row pinning in [`gate_claim_verdict`]
+/// — while a duplicate of the same attempt (WS + poll) or a stale older one is
+/// still dropped. This is the ONLY guard against a same-device
 /// duplicate: coord's consume route answers `consumed` to a re-claim of an
 /// already-consumed row rather than refusing it.
 ///
-/// Each entry is `(attempt, state)`, and a release only TOMBSTONES the entry
+/// Each entry is `(attempt, state, epoch)` — `epoch` is the [`CLAIM_EPOCH`]
+/// value taken when the entry was claimed and taken again when it was SEALED,
+/// which lets a poll row tell a seal coord accepted BEFORE its pending list was
+/// fetched from one accepted after (see [`gate_claim_verdict`]) — and a release
+/// only TOMBSTONES the entry
 /// for the attempt that holds it — it never removes it. An attempt whose claim
 /// coord ACCEPTED is [`GateClaimState::Sealed`]: coord has consumed that row, so
 /// nothing may re-open the attempt locally (a later error release is a no-op),
@@ -2510,9 +2533,9 @@ fn lock_recover<'a, T>(
 /// the newer attempt's second copy — or a stale older frame — would claim and
 /// spawn again on the same device (review round 1 #1).
 fn dispatched_gate_ids(
-) -> &'static std::sync::Mutex<std::collections::HashMap<uuid::Uuid, (u32, GateClaimState)>> {
+) -> &'static std::sync::Mutex<std::collections::HashMap<uuid::Uuid, (u32, GateClaimState, u64)>> {
     static DISPATCHED: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<uuid::Uuid, (u32, GateClaimState)>>,
+        std::sync::Mutex<std::collections::HashMap<uuid::Uuid, (u32, GateClaimState, u64)>>,
     > = std::sync::OnceLock::new();
     DISPATCHED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -2522,10 +2545,13 @@ fn dispatched_gate_ids(
 /// dispatch); `false` if it must skip as a duplicate. Insert-and-test under one
 /// lock so two concurrent deliveries can't both win.
 ///
-/// Wins iff nothing is held for this gate, the held attempt is EARLIER, or the
-/// held attempt is THIS one and was released (a local skip that left the row
-/// pending on coord, so its re-listing must dispatch). Monotone: a frame of an
-/// older attempt never claims again, released or not.
+/// The WS-frame rule, as a bool: wins iff nothing is held for this gate, the
+/// held attempt is EARLIER, or the held attempt is THIS one and was released (a
+/// local skip that left the row pending on coord, so its re-listing must
+/// dispatch). Monotone: a frame of an older attempt never claims again,
+/// released or not. The dispatcher goes through [`gate_claim_verdict`], which
+/// adds the poll-row pinning; this form is the tests' handle on the base rule.
+#[cfg(test)]
 fn claim_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) -> bool {
     try_claim_gate_dispatch_attempt(gate_id, attempt) == GateClaimAttempt::Won
 }
@@ -2539,32 +2565,42 @@ enum GateClaimAttempt {
     /// This call claimed the attempt; the caller dispatches.
     Won,
     /// Dropped: the gate already holds `held_attempt` in `held_state`.
+    /// `after_listing` is true when that entry was claimed or sealed after the
+    /// poll row's pending list was fetched (always false for a WS frame).
     Lost {
         held_attempt: u32,
         held_state: GateClaimState,
+        after_listing: bool,
     },
 }
 
-/// [`claim_gate_dispatch_attempt`], reporting what blocked a losing claim.
-/// The single place the claim rule lives; the `bool` form delegates here.
+/// [`claim_gate_dispatch_attempt`], reporting what blocked a losing claim
+/// (the WS-frame rule: no poll-row pinning).
+#[cfg(test)]
 fn try_claim_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) -> GateClaimAttempt {
-    try_claim_gate_dispatch_attempt_as(gate_id, attempt, false)
+    try_claim_gate_dispatch_attempt_as(gate_id, attempt, None)
 }
 
-/// The claim rule, with one switch: `held_pins_episode` makes a `Held` prior
-/// claim block EVERY attempt, not just earlier-or-equal ones. A poll row
-/// passes `true` — see [`gate_claim_verdict`] for why. Decided under the same
-/// lock as the insert, so a WS frame and a poll row cannot both win.
+/// The single place the claim rule lives. `poll_listed_epoch` is `None` for a
+/// WS frame (plain monotone rule) and, for a poll row, the
+/// [`current_claim_epoch`] read before its pending list was fetched. A poll
+/// row is PINNED — it cannot advance past the prior claim at any attempt — when
+/// that prior is `Held`, or was `Sealed` after the listing; see
+/// [`gate_claim_verdict`] for why. Decided under the same lock as the insert,
+/// so a WS frame and a poll row cannot both win.
 fn try_claim_gate_dispatch_attempt_as(
     gate_id: uuid::Uuid,
     attempt: u32,
-    held_pins_episode: bool,
+    poll_listed_epoch: Option<u64>,
 ) -> GateClaimAttempt {
     let mut held = lock_recover(dispatched_gate_ids(), "dispatched_gate_ids");
     let verdict = match held.get(&gate_id) {
         None => GateClaimAttempt::Won,
-        Some(&(prev, state)) => {
-            let pinned = held_pins_episode && state == GateClaimState::Held;
+        Some(&(prev, state, epoch)) => {
+            let after_listing = poll_listed_epoch.is_some_and(|listed| epoch > listed);
+            let pinned = poll_listed_epoch.is_some()
+                && (state == GateClaimState::Held
+                    || (state == GateClaimState::Sealed && after_listing));
             let advances = attempt > prev && !pinned;
             if advances || (attempt == prev && state == GateClaimState::Released) {
                 GateClaimAttempt::Won
@@ -2572,12 +2608,13 @@ fn try_claim_gate_dispatch_attempt_as(
                 GateClaimAttempt::Lost {
                     held_attempt: prev,
                     held_state: state,
+                    after_listing,
                 }
             }
         }
     };
     if verdict == GateClaimAttempt::Won {
-        held.insert(gate_id, (attempt, GateClaimState::Held));
+        held.insert(gate_id, (attempt, GateClaimState::Held, next_claim_epoch()));
     }
     verdict
 }
@@ -2589,17 +2626,20 @@ fn try_claim_gate_dispatch_attempt_as(
 enum ContinuationDelivery {
     /// The live WS frame (or a work-unit dispatch replay, which carries no
     /// gate-level counter): the attempt is `payload.retry_attempt()` alone.
-    /// A lost claim is a plain duplicate — the frame is a second copy of an
-    /// episode this process already claimed, which is exactly the WS/poll
-    /// double-spawn the dedupe guards.
+    /// A lost claim is classified a plain duplicate — the frame is a copy of an
+    /// episode this process already claimed, or a stale one. (Coord's republish
+    /// of a re-driven row carries no `retry`, so the frame cannot name its
+    /// episode; the poll copy of that episode is what [`gate_claim_verdict`]
+    /// pins against it.)
     Payload,
     /// A row of coord's `pending-continuations` list: the attempt is
     /// [`PendingContinuation::dispatch_attempt`] (the max of the payload's
     /// `retry` and coord's `continuation_spawn_attempts`). A row coord still
     /// lists UN-consumed whose attempt this process holds `Sealed` (coord
     /// accepted that attempt's consume claim) is a contradiction, not a
-    /// duplicate — see [`gate_claim_verdict`].
-    GatePollRow { attempt: u32 },
+    /// duplicate — see [`gate_claim_verdict`]. `listed_epoch` is the
+    /// [`current_claim_epoch`] read before the pending list was fetched.
+    GatePollRow { attempt: u32, listed_epoch: u64 },
 }
 
 impl ContinuationDelivery {
@@ -2607,7 +2647,7 @@ impl ContinuationDelivery {
     fn attempt(self, payload: &GateContinuationPayload) -> u32 {
         match self {
             ContinuationDelivery::Payload => payload.retry_attempt(),
-            ContinuationDelivery::GatePollRow { attempt } => attempt,
+            ContinuationDelivery::GatePollRow { attempt, .. } => attempt,
         }
     }
 }
@@ -2630,9 +2670,10 @@ enum GateClaimVerdict {
     SealedButRelisted,
 }
 
-/// Claim `gate_id` for `delivery` and classify the result. Pure apart from the
-/// process-wide claim map, so the dedupe contract is testable without the
-/// async dispatcher's I/O.
+/// Claim `gate_id` for `delivery` and classify the result. Free of I/O apart
+/// from the process-wide claim map and one rate-limited `warn!` (a poll row
+/// pinned behind a stale-looking `Held` claim), so the dedupe contract is
+/// testable without the async dispatcher's I/O.
 ///
 /// **A poll row that meets a `Held` claim is a duplicate at ANY attempt.**
 /// Coord's main writes no `retry` block, so a WS republish of a re-driven row
@@ -2642,27 +2683,94 @@ enum GateClaimVerdict {
 /// would claim (0, Held) from the frame and then (K, Held) from the poll, and
 /// both would reach coord's consume claim — which carries no attempt and
 /// answers both, so that is a double spawn with nothing behind it to stop it.
-/// Only a `Sealed` prior (coord accepted that attempt; re-drive re-arms only
-/// such rows) or a `Released` one lets the poll's counter open a new episode.
-/// The WS-frame path keeps the plain monotone rule.
+///
+/// **The same holds for a prior SEALED after the row's list was fetched.** A
+/// frame's claim can be made before the fetch and its consume accepted after
+/// it (the consume POST is still in flight while the GET reads the row), or the
+/// whole claim-and-seal can land while the poll loop awaits earlier rows.
+/// Either way the list still names the row at K although the frame has
+/// consumed it, so the row is a duplicate. That is why the seal re-stamps the
+/// entry's epoch. A seal stamped BEFORE the fetch means coord consumed the row
+/// before the list was read, so a row still listed at K > its attempt is a
+/// genuine re-drive. Pinning a late seal costs at most one backstop tick: a
+/// row that really is still pending is listed again next poll, after the seal,
+/// and claims then.
+///
+/// **Accepted gap: a claim that stays `Held` pins its gate for the process
+/// lifetime.** A `SpawnDespiteClaimError` spawn is never sealed (coord may not
+/// have recorded the consume, and its pending list keeps every un-consumed,
+/// un-cancelled, un-expired row), so the row may still be listed for the
+/// episode that already ran. The same pin follows a dispatch task that
+/// panicked before releasing. Pinning is what stops that listing from spawning
+/// a second time; the cost is that a later re-drive of that gate does not run
+/// in this process. It is counted as `already_dispatched`, and a poll row
+/// pinned at a LARGER attempt than the Held one warns (rate-limited per gate)
+/// so the drop is visible. A double spawn is the worse failure.
+///
+/// Otherwise a `Sealed` prior (coord accepted that attempt; re-drive re-arms
+/// only such rows) or a `Released` one lets the poll's counter open a new
+/// episode. The WS-frame path keeps the plain monotone rule.
 fn gate_claim_verdict(
     gate_id: uuid::Uuid,
     delivery: ContinuationDelivery,
     attempt: u32,
 ) -> GateClaimVerdict {
-    let poll_row = matches!(delivery, ContinuationDelivery::GatePollRow { .. });
-    match try_claim_gate_dispatch_attempt_as(gate_id, attempt, poll_row) {
+    let listed_epoch = match delivery {
+        ContinuationDelivery::GatePollRow { listed_epoch, .. } => Some(listed_epoch),
+        ContinuationDelivery::Payload => None,
+    };
+    match try_claim_gate_dispatch_attempt_as(gate_id, attempt, listed_epoch) {
         GateClaimAttempt::Won => GateClaimVerdict::Claim,
         GateClaimAttempt::Lost {
             held_attempt,
             held_state: GateClaimState::Sealed,
-        } if held_attempt == attempt
-            && matches!(delivery, ContinuationDelivery::GatePollRow { .. }) =>
-        {
+            after_listing: false,
+        } if held_attempt == attempt && listed_epoch.is_some() => {
             GateClaimVerdict::SealedButRelisted
+        }
+        GateClaimAttempt::Lost {
+            held_attempt,
+            held_state: GateClaimState::Held,
+            after_listing,
+        } if attempt > held_attempt && listed_epoch.is_some() => {
+            // A claim made after the listing is the ordinary WS/poll race, not
+            // a stuck pin: only a claim older than the listing warns.
+            if !after_listing && should_warn_pinned_behind_held(gate_id, std::time::Instant::now())
+            {
+                warn!(
+                    "agent_runtime: gate-continuation gate_id={gate_id} is listed by coord at \
+                     attempt {attempt}, but this process still holds attempt {held_attempt} \
+                     un-sealed (in flight, or a spawn whose consume claim errored) — dropping \
+                     the row to avoid a double spawn; if attempt {held_attempt} is no longer \
+                     running, this re-drive will not run in this process. Counted as \
+                     already_dispatched (warned once per gate per hour)"
+                );
+            }
+            GateClaimVerdict::Duplicate
         }
         GateClaimAttempt::Lost { .. } => GateClaimVerdict::Duplicate,
     }
+}
+
+/// Per-gate last-warned times for the pinned-behind-Held warning.
+fn pinned_behind_held_last_warn(
+) -> &'static std::sync::Mutex<std::collections::HashMap<uuid::Uuid, std::time::Instant>> {
+    static LAST: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<uuid::Uuid, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    LAST.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Decide-and-record: should the pinned-behind-Held warning fire for
+/// `gate_id` at `now`? At most once per [`SEALED_BUT_RELISTED_WARN_INTERVAL`]
+/// per gate (the same backstop cadence applies).
+fn should_warn_pinned_behind_held(gate_id: uuid::Uuid, now: std::time::Instant) -> bool {
+    rate_limited_per_gate(
+        pinned_behind_held_last_warn(),
+        "pinned_behind_held_last_warn",
+        gate_id,
+        now,
+    )
 }
 
 /// The poll-report outcome of a delivery the in-process dedupe dropped, or
@@ -2699,10 +2807,23 @@ fn sealed_but_relisted_last_warn(
 /// [`SEALED_BUT_RELISTED_WARN_INTERVAL`] per gate. Takes `now` so the window
 /// is unit-testable (the shape of [`should_post_deferred_stamp`]).
 fn should_warn_sealed_but_relisted(gate_id: uuid::Uuid, now: std::time::Instant) -> bool {
-    let mut map = lock_recover(
+    rate_limited_per_gate(
         sealed_but_relisted_last_warn(),
         "sealed_but_relisted_last_warn",
-    );
+        gate_id,
+        now,
+    )
+}
+
+/// `true` at most once per [`SEALED_BUT_RELISTED_WARN_INTERVAL`] per gate in
+/// `last_warn`, recording `now` when it fires.
+fn rate_limited_per_gate(
+    last_warn: &std::sync::Mutex<std::collections::HashMap<uuid::Uuid, std::time::Instant>>,
+    name: &'static str,
+    gate_id: uuid::Uuid,
+    now: std::time::Instant,
+) -> bool {
+    let mut map = lock_recover(last_warn, name);
     if let Some(last) = map.get(&gate_id) {
         if now.saturating_duration_since(*last) < SEALED_BUT_RELISTED_WARN_INTERVAL {
             return false;
@@ -2741,12 +2862,15 @@ enum GateClaimState {
 }
 
 /// Seal the claim `attempt` holds once coord accepted it (see
-/// [`GateClaimState::Sealed`]). No-op for any other attempt.
+/// [`GateClaimState::Sealed`]), re-stamping its epoch so a poll listing read
+/// before this seal is pinned behind it ([`gate_claim_verdict`]). Only a
+/// `Held` claim is sealed. No-op for any other attempt.
 fn seal_gate_dispatch_attempt(gate_id: uuid::Uuid, attempt: u32) {
     let mut held = lock_recover(dispatched_gate_ids(), "dispatched_gate_ids");
     if let Some(entry) = held.get_mut(&gate_id) {
-        if entry.0 == attempt {
+        if entry.0 == attempt && entry.1 == GateClaimState::Held {
             entry.1 = GateClaimState::Sealed;
+            entry.2 = next_claim_epoch();
         }
     }
 }
@@ -5238,7 +5362,7 @@ async fn dispatch_gate_continuation(
             info!(
                 "agent_runtime: gate-continuation gate_id={gate_id} is coord RE-DRIVE attempt \
                  {attempt} (continuation_spawn_attempts on the pending row; the payload carried \
-                 no newer `retry`) — dispatching as a new episode"
+                 no newer `retry`) — claimed as a new episode"
             );
         }
         // One task owns the whole claim → spawn → outcome handshake. The #469
@@ -5354,6 +5478,9 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
         return;
     };
     let url = format!("{base}/coord/agents/pending-continuations?device_id={device_id}");
+    // Read before the fetch: a claim made after this point may have consumed a
+    // row the list still names (see `gate_claim_verdict`).
+    let listed_epoch = current_claim_epoch();
     // Every fetch-failure exit below still self-reports (all-zeros +
     // `skip_reasons.fetch_failed`): coord must be able to tell "poll loop
     // alive but the pull route failing" apart from "poll loop dead".
@@ -5408,7 +5535,7 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
         ..Default::default()
     };
     for row in body.pending {
-        let (payload, delivery) = poll_row_delivery(row);
+        let (payload, delivery) = poll_row_delivery(row, listed_epoch);
         counts.record(dispatch_gate_continuation(payload, device_id, delivery).await);
     }
     post_continuation_poll_report(device_id, counts).await;
@@ -5418,11 +5545,16 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
 /// payload, with the row's authoritative `gate_id` stamped on (so the shared
 /// seam dedupes + acks even if coord omitted it inside `payload`), and the
 /// [`ContinuationDelivery::GatePollRow`] keyed on the row's episode —
-/// `max(payload retry, continuation_spawn_attempts)`. The poll loop's whole
+/// `max(payload retry, continuation_spawn_attempts)`, stamped with the
+/// `listed_epoch` read before the list was fetched. The poll loop's whole
 /// per-row mapping, pure so it is tested as the loop runs it.
-fn poll_row_delivery(row: PendingContinuation) -> (GateContinuationPayload, ContinuationDelivery) {
+fn poll_row_delivery(
+    row: PendingContinuation,
+    listed_epoch: u64,
+) -> (GateContinuationPayload, ContinuationDelivery) {
     let delivery = ContinuationDelivery::GatePollRow {
         attempt: row.dispatch_attempt(),
+        listed_epoch,
     };
     let mut payload = row.payload;
     payload.gate_id = Some(row.gate_id);
@@ -5431,8 +5563,9 @@ fn poll_row_delivery(row: PendingContinuation) -> (GateContinuationPayload, Cont
 
 /// Aggregate counts from one [`poll_pending_continuations`] run, feeding the
 /// coord self-report. `listed_n` = rows fetched; `dispatched_n` = ids NEWLY
-/// claimed this run; the two skip counters are the dedupe-drops and the
-/// not-addressed-to-this-instance drops (skipped = listed − dispatched).
+/// claimed this run; the skip counters are the per-reason drops (dedupe,
+/// sealed-but-relisted, not addressed to this instance, …), and
+/// skipped = listed − dispatched.
 /// `fetch_failed` marks a run whose pending-list pull itself failed (client
 /// build / GET / non-2xx / parse) — reported so coord can tell "poll loop
 /// alive but the pull route failing" apart from "poll loop dead" (the exact
@@ -15418,7 +15551,7 @@ mod tests {
     /// `counts`. Only the I/O around the claim (registry check, coord consume
     /// claim, spawn) is left out; a claimed row is counted as dispatched.
     fn poll_one_row(row: PendingContinuation, counts: &mut PollRunCounts) -> GateClaimVerdict {
-        let (payload, delivery) = poll_row_delivery(row);
+        let (payload, delivery) = poll_row_delivery(row, current_claim_epoch());
         let gate = payload
             .gate_id
             .expect("poll_row_delivery stamps the row's gate_id");
@@ -15429,6 +15562,130 @@ mod tests {
         verdict
     }
 
+    /// A poll-row delivery at `attempt` whose list was fetched NOW (after every
+    /// claim made so far).
+    fn poll_at(attempt: u32) -> ContinuationDelivery {
+        ContinuationDelivery::GatePollRow {
+            attempt,
+            listed_epoch: current_claim_epoch(),
+        }
+    }
+
+    /// Review finding (adoption of #2277): the poll loop reads the pending
+    /// list, then awaits each row; in that gap the WS copy of a re-driven
+    /// episode can claim (0, Held) and be SEALED. The list still names the row
+    /// at K, but the frame already consumed it, so the row must be a duplicate
+    /// — not a new episode (a double spawn) and not `sealed_but_relisted` (a
+    /// false contradiction). Listed again after that claim, a row still
+    /// pending is a genuine re-drive and claims.
+    #[test]
+    fn a_seal_made_after_the_listing_pins_the_listed_row() {
+        for k in [0_u32, 1, 3] {
+            let gate = uuid::Uuid::now_v7();
+            let listed_epoch = current_claim_epoch();
+            claim_and_seal(gate, 0);
+            let stale_listing = ContinuationDelivery::GatePollRow {
+                attempt: k,
+                listed_epoch,
+            };
+            assert_eq!(
+                gate_claim_verdict(gate, stale_listing, k),
+                GateClaimVerdict::Duplicate,
+                "k={k}: the frame consumed the row after the list was read"
+            );
+            let expected = if k == 0 {
+                GateClaimVerdict::SealedButRelisted
+            } else {
+                GateClaimVerdict::Claim
+            };
+            assert_eq!(
+                gate_claim_verdict(gate, poll_at(k), k),
+                expected,
+                "k={k}: a listing made after the seal is read as coord means it"
+            );
+        }
+    }
+
+    /// Re-review finding (adoption of #2277): the frame's claim is made BEFORE
+    /// the poll reads its list, and coord accepts its consume AFTER (the POST
+    /// was in flight while the GET read the row). The seal re-stamps the
+    /// entry, so the listed row is still pinned — not a second spawn.
+    #[test]
+    fn a_claim_before_the_listing_sealed_after_it_pins_the_listed_row() {
+        for k in [0_u32, 2] {
+            let gate = uuid::Uuid::now_v7();
+            assert_eq!(
+                gate_claim_verdict(gate, ContinuationDelivery::Payload, 0),
+                GateClaimVerdict::Claim
+            );
+            let listed_epoch = current_claim_epoch();
+            settle_claim_decision(&SpawnDecision::Spawn, ConsumeTarget::Gate(gate, 0), gate);
+            let listing = ContinuationDelivery::GatePollRow {
+                attempt: k,
+                listed_epoch,
+            };
+            assert_eq!(
+                gate_claim_verdict(gate, listing, k),
+                GateClaimVerdict::Duplicate,
+                "k={k}: consumed after the list was read"
+            );
+        }
+    }
+
+    /// The accepted gap: a `SpawnDespiteClaimError` spawn leaves its claim
+    /// `Held` (coord may still list the row for the episode that ran), so a
+    /// poll row at any attempt stays a duplicate — never a second spawn.
+    #[test]
+    fn a_spawn_despite_claim_error_pins_its_gate() {
+        let gate = uuid::Uuid::now_v7();
+        assert_eq!(
+            gate_claim_verdict(gate, ContinuationDelivery::Payload, 0),
+            GateClaimVerdict::Claim
+        );
+        assert_eq!(
+            settle_claim_decision(
+                &SpawnDecision::SpawnDespiteClaimError {
+                    cause: "coord 503".into()
+                },
+                ConsumeTarget::Gate(gate, 0),
+                gate
+            ),
+            ClaimOutcome::Spawn
+        );
+        for k in [0_u32, 1, 4] {
+            assert_eq!(
+                gate_claim_verdict(gate, poll_at(k), k),
+                GateClaimVerdict::Duplicate,
+                "k={k}"
+            );
+        }
+        assert!(
+            !should_warn_pinned_behind_held(gate, std::time::Instant::now()),
+            "the pinned-behind-Held warning already fired for this gate this hour"
+        );
+
+        // A claim made after the listing is the ordinary race: dropped, but
+        // it does not warn (the limiter is still unarmed for that gate).
+        let raced = uuid::Uuid::now_v7();
+        let listed_epoch = current_claim_epoch();
+        assert_eq!(
+            gate_claim_verdict(raced, ContinuationDelivery::Payload, 0),
+            GateClaimVerdict::Claim
+        );
+        let listing = ContinuationDelivery::GatePollRow {
+            attempt: 2,
+            listed_epoch,
+        };
+        assert_eq!(
+            gate_claim_verdict(raced, listing, 2),
+            GateClaimVerdict::Duplicate
+        );
+        assert!(
+            should_warn_pinned_behind_held(raced, std::time::Instant::now()),
+            "the raced drop did not consume the gate's warning"
+        );
+    }
+
     /// `poll_row_delivery` stamps the row's authoritative gate id onto a
     /// payload that omitted it, and keys the delivery on the row's episode.
     #[test]
@@ -15436,9 +15693,15 @@ mod tests {
         let gate = uuid::Uuid::now_v7();
         let row = pending_row(gate, Some(serde_json::json!(2)));
         assert_eq!(row.payload.gate_id, None, "coord omitted it inside payload");
-        let (payload, delivery) = poll_row_delivery(row);
+        let (payload, delivery) = poll_row_delivery(row, 7);
         assert_eq!(payload.gate_id, Some(gate));
-        assert_eq!(delivery, ContinuationDelivery::GatePollRow { attempt: 2 });
+        assert_eq!(
+            delivery,
+            ContinuationDelivery::GatePollRow {
+                attempt: 2,
+                listed_epoch: 7
+            }
+        );
         assert_eq!(delivery.attempt(&payload), 2);
     }
 
@@ -15594,7 +15857,7 @@ mod tests {
         // classified the same way, not claimed.
         let gate = uuid::Uuid::now_v7();
         claim_and_seal(gate, 0);
-        let poll = ContinuationDelivery::GatePollRow { attempt: 0 };
+        let poll = poll_at(0);
         assert_eq!(
             gate_claim_verdict(gate, poll, 0),
             GateClaimVerdict::SealedButRelisted
@@ -15673,7 +15936,7 @@ mod tests {
         // Even after a re-driven poll claimed attempt 1, a late attempt-0
         // frame stays dropped.
         assert_eq!(
-            gate_claim_verdict(gate, ContinuationDelivery::GatePollRow { attempt: 1 }, 1),
+            gate_claim_verdict(gate, poll_at(1), 1),
             GateClaimVerdict::Claim
         );
         assert_eq!(
@@ -15723,11 +15986,7 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    gate_claim_verdict(
-                        gate,
-                        ContinuationDelivery::GatePollRow { attempt: N + 1 },
-                        N + 1,
-                    )
+                    gate_claim_verdict(gate, poll_at(N + 1), N + 1)
                 })
             })
             .collect();
@@ -15756,7 +16015,7 @@ mod tests {
             GateClaimVerdict::Duplicate
         );
         assert_eq!(
-            gate_claim_verdict(gate, ContinuationDelivery::GatePollRow { attempt: N }, N),
+            gate_claim_verdict(gate, poll_at(N), N),
             GateClaimVerdict::Duplicate
         );
 
@@ -15768,11 +16027,7 @@ mod tests {
             gate,
         );
         assert_eq!(
-            gate_claim_verdict(
-                gate,
-                ContinuationDelivery::GatePollRow { attempt: N + 1 },
-                N + 1
-            ),
+            gate_claim_verdict(gate, poll_at(N + 1), N + 1),
             GateClaimVerdict::SealedButRelisted
         );
     }
