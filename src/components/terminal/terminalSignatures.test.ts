@@ -198,6 +198,14 @@ describe("zone pickers", () => {
     expect(predictSelectLayout(p({ layoutId: "no-such-layout" }), GRID, 1)).toEqual({});
   });
 
+  it("select-layout resolves a window count like the handler, and predicts nothing for a named page", () => {
+    expect(predictSelectLayout(p({ layoutId: "1" }), GRID, 1)).toEqual({
+      elementsDisappear: [{ id: "terminal-zone-header-*" }],
+    });
+    // A pageId may name an off-screen page: its headers are not in this registry.
+    expect(predictSelectLayout(p({ layoutId: "single", pageId: "page-2" }), GRID, 1)).toEqual({});
+  });
+
   it("load-profile predicts spawned tabs only when the profile has more sessions than live tabs", () => {
     const profile = {
       layoutId: "grid-2x2",
