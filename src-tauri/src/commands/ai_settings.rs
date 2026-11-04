@@ -1153,8 +1153,17 @@ fn compute_expected_usage(
     )
 }
 
-/// Read the OAuth access token from a Claude config directory's credentials file.
+/// Read the OAuth token a Claude config directory authenticates with: its
+/// long-lived `claude setup-token` token (`settings.json`
+/// `env.CLAUDE_CODE_OAUTH_TOKEN`) when it has one — that is what a `claude`
+/// child under this dir uses, since Claude Code applies the settings `env`
+/// block — else the access token in its `.credentials.json`.
 pub(crate) fn read_oauth_token(config_dir: &str) -> Result<String, String> {
+    if let Some(token) =
+        qontinui_runner_lib::claude_oauth_token::from_config_dir(std::path::Path::new(config_dir))
+    {
+        return Ok(token);
+    }
     let creds_path = std::path::PathBuf::from(config_dir).join(".credentials.json");
     let content = std::fs::read_to_string(&creds_path).map_err(|e| {
         String::from(AppError::IoError(std::io::Error::new(
@@ -2181,10 +2190,46 @@ pub(crate) fn find_claude_credentials_path() -> Option<std::path::PathBuf> {
     None
 }
 
+/// The long-lived `claude setup-token` token for the account a spawn would
+/// use, with the settings file it came from: the effective (selected or
+/// pinned) config dir's, else — only when no dir is in force — the ambient one
+/// a child with no `CLAUDE_CONFIG_DIR` inherits.
+///
+/// Checked BEFORE [`find_claude_credentials_path`] by its callers because, for
+/// the same account dir, Claude Code authenticates with the settings token in
+/// preference to `.credentials.json`.
+pub(crate) fn find_long_lived_token() -> Option<(String, Option<std::path::PathBuf>)> {
+    use qontinui_runner_lib::claude_oauth_token as tok;
+    let ai_settings = settings::get_ai_settings();
+    let (effective_dir, _source) =
+        crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli);
+    match effective_dir {
+        Some(dir) => {
+            let dir = std::path::PathBuf::from(dir);
+            tok::from_config_dir(&dir).map(|t| (t, Some(tok::settings_path(&dir))))
+        }
+        None => tok::ambient().map(|t| (t, None)),
+    }
+}
+
 /// Read and parse Claude CLI auth status from credentials file.
 pub fn get_cli_auth_status() -> CliAuthStatus {
     let ai_settings = settings::get_ai_settings();
     let is_cli = matches!(ai_settings.provider, AiProvider::ClaudeCli);
+
+    // A long-lived token does not expire on the runner's clock and is never
+    // refreshed, so it reports as valid with no expiry.
+    if let Some((_token, source)) = find_long_lived_token() {
+        return CliAuthStatus {
+            has_credentials: true,
+            expired: false,
+            is_cli_provider: is_cli,
+            expires_at: None,
+            minutes_until_expiry: None,
+            subscription_type: Some("long-lived token".to_string()),
+            credentials_path: source.map(|p| p.to_string_lossy().to_string()),
+        };
+    }
 
     let creds_path = match find_claude_credentials_path() {
         Some(p) => p,

@@ -134,6 +134,7 @@ pub const QONTINUI_HOME_ENV: &str = "QONTINUI_HOME";
 /// hand; the scan cannot see them. Sorted, unique — a test pins both so an
 /// addition has one obvious place.
 pub const AMBIENT_ENV_KEYS: &[&str] = &[
+    "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CONFIG_DIR",
     "COORD_ADMIN_SECRET",
     "COORD_BUDGET_REPUBLISH_SECS",
@@ -776,6 +777,9 @@ pub mod test_support {
     /// configured developer box exports and a clean CI runner does not.
     pub const KEYS_REMOVED: &[&str] = &[
         "CLAUDE_CONFIG_DIR",
+        // A long-lived Claude token an operator shell exports would make a
+        // fixture read as a logged-in account (`claude_oauth_token::ambient`).
+        "CLAUDE_CODE_OAUTH_TOKEN",
         // A subject runner's root: a test that inherited one would run as a
         // secondary with the keychain gated off.
         "QONTINUI_INSTANCE_ROOT",
@@ -2386,6 +2390,12 @@ mod tests {
             1,
             "Claude Code's own `~/.claude/.credentials.json` — the user's Claude login, read \
              only, not runner state",
+        ),
+        (
+            "claude_oauth_token.rs",
+            1,
+            "`ambient`: the default Claude account home's `~/.claude/settings.json`, read for \
+             a long-lived `CLAUDE_CODE_OAUTH_TOKEN` only — Claude Code's own file, not runner state",
         ),
         (
             "ai_provider/oauth_refresh.rs",
