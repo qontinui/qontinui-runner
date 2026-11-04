@@ -170,6 +170,9 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     ("agent_runtime.rs", "capability-token", 1),
     ("agent_token/mod.rs", "agent-jwt", 1),
     ("bin/qontinui_cli.rs", "not-coord", 1),
+    // ops lane (plan 2026-10-19 Phase 4): the result POST is authorised by the
+    // device JWT the subscriber already holds; see the annotation at the call site.
+    ("ci_node/ops.rs", "device-jwt-required", 1),
     ("ci_node/reporting.rs", "device-jwt-required", 2),
     // Shrank 3 -> 1 (plan 2026-10-09-spec-front-end-of-the-software-factory
     // Phase 9): the Claude connection test and the usage probe now build their
