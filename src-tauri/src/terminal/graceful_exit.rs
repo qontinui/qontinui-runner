@@ -1071,8 +1071,11 @@ mod tests {
 
     /// root 100 (shell) -> 200 (claude) ; unrelated 300 ; optional extras.
     fn snapshot(entries: &[(u32, u32, &str, i64)]) -> ProcessSnapshot {
-        let mut snap = ProcessSnapshot::default();
-        snap.stale = false; // a live read
+        // A live read.
+        let mut snap = ProcessSnapshot {
+            stale: false,
+            ..ProcessSnapshot::default()
+        };
         for &(pid, ppid, name, started) in entries {
             snap.parent_map.entry(ppid).or_default().push(pid);
             snap.creation_times.insert(pid, started);

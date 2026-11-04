@@ -305,7 +305,7 @@ impl Provider {
             return;
         }
         let n = self.failures_in_a_row.fetch_add(1, Ordering::Relaxed) + 1;
-        if n == 1 || n % 100 == 0 {
+        if n == 1 || n.is_multiple_of(100) {
             tracing::warn!("process_table: in-process {what} read failed ({n} in a row): {why}");
         } else {
             tracing::debug!("process_table: in-process {what} read failed ({n} in a row): {why}");
