@@ -552,6 +552,36 @@ mod tests {
         .await
     }
 
+    /// Every `credential.helper` value git reads, each with the scope it came
+    /// from (`git config --show-scope`; git 2.26 has it, so the 2.32 floor does).
+    const HELPER_SCOPES: [&str; 4] = ["config", "--get-all", "--show-scope", "credential.helper"];
+
+    /// The effective helper list is empty: the LAST value read is the global
+    /// file's empty `helper =`, which clears every value read before it. On
+    /// Unix (`GIT_CONFIG_NOSYSTEM=1`) nothing else may be read at all. On
+    /// Windows the system file is still read (D5's fallback), so a SYSTEM
+    /// helper may precede the reset — Git for Windows ships
+    /// `helper = manager` there — but a value from any other scope may not.
+    fn assert_only_the_reset_is_effective(show_scope_out: &str) {
+        let lines: Vec<&str> = show_scope_out.lines().collect();
+        let (last, earlier) = lines
+            .split_last()
+            .unwrap_or_else(|| panic!("no helper at all, not even the reset: {show_scope_out:?}"));
+        let (scope, value) = last.split_once('\t').unwrap_or((last, ""));
+        assert_eq!(
+            (scope, value.trim()),
+            ("global", ""),
+            "the last helper read must be the global reset: {show_scope_out:?}"
+        );
+        for line in earlier {
+            let scope = line.split_once('\t').map_or(*line, |(s, _)| s);
+            assert!(
+                cfg!(windows) && scope == "system",
+                "only a Windows system helper may precede the reset: {show_scope_out:?}"
+            );
+        }
+    }
+
     /// End to end against the installed git: a hostile parent's helper and
     /// `insteadOf` rewrite do not reach a sibling's git. Skipped only when no
     /// `git` can be spawned.
@@ -563,14 +593,8 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let env = prepare_isolated_sibling_git(dir.path()).await.unwrap();
-        let helpers = hostile_git(
-            dir.path(),
-            &env,
-            &["config", "--get-all", "credential.helper"],
-        )
-        .await
-        .unwrap();
-        assert_eq!(helpers, "", "only the empty reset may remain: {helpers:?}");
+        let helpers = hostile_git(dir.path(), &env, &HELPER_SCOPES).await.unwrap();
+        assert_only_the_reset_is_effective(&helpers);
         let rewrites = hostile_git(dir.path(), &env, &["config", "--get-regexp", "^url\\."]).await;
         assert!(
             rewrites.is_err(),
@@ -610,10 +634,8 @@ mod tests {
         );
         let root = enclosing.join(".ci-worktrees").join("d-1");
         let env = prepare_isolated_sibling_git(&root).await.unwrap();
-        let helpers = hostile_git(&root, &env, &["config", "--get-all", "credential.helper"])
-            .await
-            .unwrap();
-        assert_eq!(helpers, "", "only the empty reset may remain: {helpers:?}");
+        let helpers = hostile_git(&root, &env, &HELPER_SCOPES).await.unwrap();
+        assert_only_the_reset_is_effective(&helpers);
         let url = hostile_git(
             &root,
             &env,
