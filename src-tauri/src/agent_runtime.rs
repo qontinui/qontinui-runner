@@ -18540,6 +18540,68 @@ mod tests {
         }
     }
 
+    /// Every headless `claude` child this module spawns carries the operator's
+    /// permission posture. `gate_continuation_headless_spawns_child` observes
+    /// the continuation's argv end to end, but the agent loop
+    /// (`run_agent_subprocess`) has no runnable fixture, so before this test its
+    /// flags were pinned by review alone. This pins the wiring at BOTH sites —
+    /// the args handed to `spawn_claude_child` are built by
+    /// [`headless_agent_args`] over the live setting — and pins the caller set,
+    /// so a third caller is RED until it is wired the same way (or deliberately
+    /// added here). A caller that passes bare `pinned_session_args(..)` runs in
+    /// Claude Code's `default` mode and refuses every unapproved tool call.
+    #[test]
+    fn every_headless_spawn_carries_the_permission_posture() {
+        let source = include_str!("agent_runtime.rs");
+        let (prod, _) = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("the test module marker");
+        let body_of = |signature: &str| -> &str {
+            let (_, rest) = prod
+                .split_once(signature)
+                .unwrap_or_else(|| panic!("{signature} exists"));
+            rest.split_once("\n}\n").map_or(rest, |(body, _)| body)
+        };
+        let callers: Vec<&str> = prod
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && t.contains("spawn_claude_child(")
+            })
+            .filter(|l| !l.contains("fn spawn_claude_child("))
+            .collect();
+        assert_eq!(
+            callers.len(),
+            2,
+            "spawn_claude_child has exactly the two agent-runtime callers wired below; \
+             a new caller must carry headless_agent_args and be listed here: {callers:#?}"
+        );
+        for site in [
+            "async fn run_continuation_headless(",
+            "async fn run_agent_subprocess(",
+        ] {
+            let body = body_of(site);
+            let (before, after) = body
+                .split_once("spawn_claude_child(")
+                .unwrap_or_else(|| panic!("{site} spawns a headless child"));
+            let built = before
+                .rsplit_once("let session_args = ")
+                .map(|(_, tail)| tail.split_once(';').map_or(tail, |(expr, _)| expr))
+                .unwrap_or_else(|| panic!("{site} builds session_args before the spawn"));
+            assert!(
+                built.trim_start().starts_with("headless_agent_args(")
+                    && built.contains("crate::settings::get_claude_session_permission()"),
+                "{site} must build its spawn args with headless_agent_args over the live \
+                 permission setting, got: {built}"
+            );
+            let call_args = after.split_once(")\n").map_or(after, |(args, _)| args);
+            assert!(
+                call_args.contains("&session_args,"),
+                "{site} must hand those session_args to spawn_claude_child: {call_args}"
+            );
+        }
+    }
+
     /// `/health` `spawnAdmission`: each lane's verdict, reading and limit, the
     /// composed verdict, and the stamp the pre-check would write — built from
     /// the same `LaneVerdicts` the gate composes. A disabled guard renders its
