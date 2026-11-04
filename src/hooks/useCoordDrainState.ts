@@ -28,7 +28,12 @@ export type CoordDrainStateLabel = "clear" | "drained" | "unknown" | "not_enroll
 /** Mirrors the Rust `CoordDrainSnapshot` (camelCase). */
 export interface CoordDrainSnapshot {
   state: CoordDrainStateLabel;
-  /** Whether autonomous spawns run right now (the drain AND the dispatch role allow them). */
+  /**
+   * Whether autonomous spawns run right now: the EFFECTIVE gate (the drain AND
+   * the dispatch role allow them), so it reads `false` under a restart
+   * prepare's runner-local hold too (`localHold`) — a deferred page restore
+   * re-runs on its false→true edge.
+   */
   autonomousSpawnsAllowed: boolean;
   /**
    * Coord's dispatch role for this device (`workhorse` | `bench` | `ci_node`),
@@ -41,6 +46,11 @@ export interface CoordDrainSnapshot {
    * spawn whatever `state` says. Optional for the same reason as `dispatchRole`.
    */
   agentLaneClosedByRole?: boolean;
+  /**
+   * The restart prepare's runner-local hold while it defers autonomous
+   * spawns, else `null`. Optional: a runner predating the field sends nothing.
+   */
+  localHold?: string | null;
   until: string | null;
   reason: string | null;
   /** For `unknown`: since when. */

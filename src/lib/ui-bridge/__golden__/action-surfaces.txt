@@ -4,10 +4,10 @@
 #   pnpm exec vitest run src/lib/ui-bridge/actionSurfaces.enforcement.test.ts
 # after setting UPDATE_ACTION_SURFACE_GOLDEN=1.
 #
-# total: 186
-#   guarded: 26
-#   literal: 60
-#   registry: 43
+# total: 201
+#   guarded: 25
+#   literal: 74
+#   registry: 45
 #   delegated: 9
 #   builtin: 15
 #   fixture: 33
@@ -52,12 +52,25 @@ src/components/projects/ProjectDetail.tsx	literal	component	work-on-it	schema=no
 src/components/projects/ProjectEmptyState.tsx	literal	component	choose-folder	schema=no	arity=0	effect=write
 src/components/projects/ProjectsPage.tsx	literal	component	find-on-disk	schema=no	arity=0	effect=write
 src/components/projects/ProjectsPage.tsx	literal	component	refresh	schema=no	arity=0	effect=read
-src/components/settings/AiSettings.tsx	guarded	component	set-runner-manages-cli-updates	schema=yes	arity=-	effect=write
 src/components/settings/Settings.tsx	literal	component	save	schema=no	arity=0	effect=write
 src/components/settings/Settings.tsx	literal	component	reset	schema=no	arity=0	effect=write
 src/components/settings/Settings.tsx	guarded	component	switch-tab	schema=yes	arity=-	effect=write
 src/components/settings/Settings.tsx	literal	component	list-tabs	schema=no	arity=0	effect=read
 src/components/terminal/CommandBar.selection.test.ts	fixture	free	-	schema=no	arity=0	effect=-
+src/components/terminal/RestartPrepPanel.tsx	literal	component	open-panel	schema=no	arity=0	effect=read
+src/components/terminal/RestartPrepPanel.tsx	literal	component	prepare	schema=no	arity=0	effect=destructive
+src/components/terminal/RestartPrepPanel.tsx	literal	component	toggle	schema=no	arity=0	effect=write
+src/components/terminal/RestartPrepPanel.tsx	literal	component	refresh	schema=no	arity=0	effect=read
+src/components/terminal/RestartPrepPanel.tsx	literal	component	close	schema=no	arity=0	effect=read
+src/components/terminal/RestartPrepPanel.tsx	literal	component	cancel	schema=no	arity=0	effect=destructive
+src/components/terminal/RestartPrepPanel.tsx	literal	component	extend	schema=no	arity=0	effect=destructive
+src/components/terminal/RestartPrepPanel.tsx	literal	component	dismiss	schema=no	arity=0	effect=destructive
+src/components/terminal/RestoreCohortStrip.tsx	literal	component	restore-all	schema=no	arity=0	effect=destructive
+src/components/terminal/RestoreCohortStrip.tsx	literal	component	dismiss	schema=no	arity=0	effect=destructive
+src/components/terminal/RestorePageBar.tsx	literal	component	restore-all	schema=no	arity=0	effect=destructive
+src/components/terminal/RestorePlaceholderPane.tsx	literal	component	restore	schema=no	arity=0	effect=destructive
+src/components/terminal/RestorePlaceholderPane.tsx	literal	component	finish	schema=no	arity=0	effect=write
+src/components/terminal/RestorePlaceholderPane.tsx	literal	component	toggle-held	schema=no	arity=0	effect=write
 src/components/terminal/SinceRestartSection.tsx	literal	component	resume-selected	schema=no	arity=0	effect=destructive
 src/components/terminal/SinceRestartSection.tsx	literal	component	capture-now	schema=no	arity=0	effect=write
 src/components/terminal/SinceRestartSection.tsx	literal	component	refresh	schema=no	arity=0	effect=read
@@ -176,6 +189,8 @@ src/components/terminal/commands/useTerminalCommands.ts	registry	free	terminal.p
 src/components/terminal/commands/useTerminalCommands.ts	registry	free	terminal.metrics	schema=yes	arity=0	effect=-
 src/components/terminal/commands/useTerminalCommands.ts	registry	free	terminal.history	schema=yes	arity=0	effect=-
 src/components/terminal/commands/useTerminalCommands.ts	registry	free	terminal.copy-names	schema=yes	arity=0	effect=-
+src/components/terminal/commands/useTerminalCommands.ts	registry	free	terminal.prepare-restart	schema=yes	arity=1	effect=-
+src/components/terminal/commands/useTerminalCommands.ts	registry	free	terminal.cancel-restart-prep	schema=yes	arity=0	effect=-
 src/components/terminal/commands/useTerminalCommands.ts	registry	free	terminal.elevated	schema=yes	arity=0	effect=-
 src/components/terminal/createPlainTerminalAction.ts	literal	free	-	schema=no	arity=0	effect=write
 src/components/terminal/terminalLaunchMenuActions.ts	guarded	free	create-plain	schema=yes	arity=-	effect=write

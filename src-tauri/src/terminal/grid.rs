@@ -349,8 +349,17 @@ impl Grid {
         let start = (row as usize) * (self.cols as usize);
         let end = start + self.cols as usize;
         let mut s = String::with_capacity(self.cols as usize);
-        for cell in &self.cells[start..end] {
+        let row_cells = &self.cells[start..end];
+        for (col, cell) in row_cells.iter().enumerate() {
             if cell.attrs & ATTR_WIDE_RIGHT != 0 {
+                // The right half of a glyph whose left half is still there is
+                // covered by that glyph. An ORPHANED right half (its left half
+                // overwritten) covers nothing: it is a blank column, and
+                // dropping it would glue the words either side together.
+                let covered = col > 0 && row_cells[col - 1].attrs & ATTR_WIDE_LEFT != 0;
+                if !covered {
+                    s.push(' ');
+                }
                 continue;
             }
             s.push(cell.ch);
@@ -445,9 +454,39 @@ impl Grid {
 
     fn put_cell(&mut self, row: u16, col: u16, cell: Cell) {
         let i = self.idx(row, col);
-        if let Some(slot) = self.cells.get_mut(i) {
-            *slot = cell;
-            self.dirty = true;
+        let Some(existing) = self.cells.get(i).copied() else {
+            return;
+        };
+        // Overwriting HALF of a width-2 glyph destroys the whole glyph, as a
+        // real terminal does: the other half becomes a blank cell. Left in
+        // place, an orphaned right-half sentinel is skipped by `row_text`, so
+        // the column it occupies vanishes from the text — Claude Code redraws
+        // a row with cursor-forward moves over such cells, and the screen text
+        // read `✻Brewed for2m 39s` instead of `✻ Brewed for 2m 39s`.
+        if existing.attrs & ATTR_WIDE_LEFT != 0 && col + 1 < self.cols {
+            let right = self.idx(row, col + 1);
+            if self.cells[right].attrs & ATTR_WIDE_RIGHT != 0 {
+                self.cells[right] = self.blank_cell();
+            }
+        }
+        // ...but not when this IS the right half of the glyph just written
+        // into `col - 1` (`print_char` writes left, then right).
+        if existing.attrs & ATTR_WIDE_RIGHT != 0 && cell.attrs & ATTR_WIDE_RIGHT == 0 && col > 0 {
+            let left = self.idx(row, col - 1);
+            if self.cells[left].attrs & ATTR_WIDE_LEFT != 0 {
+                self.cells[left] = self.blank_cell();
+            }
+        }
+        self.cells[i] = cell;
+        self.dirty = true;
+    }
+
+    /// The blank a destroyed wide-glyph half becomes: a space in the current
+    /// pen's background, as xterm leaves it.
+    fn blank_cell(&self) -> Cell {
+        Cell {
+            bg: self.cur_bg,
+            ..Cell::default()
         }
     }
 
@@ -455,10 +494,37 @@ impl Grid {
         if row >= self.rows {
             return;
         }
-        let start = self.idx(row, start_col.min(self.cols));
-        let end = self.idx(row, end_col_exclusive.min(self.cols));
+        let start_col = start_col.min(self.cols);
+        let end_col = end_col_exclusive.min(self.cols);
+        // An erase (EL / ED) that starts on a wide glyph's right half, or ends
+        // on its left half, destroys the whole glyph: blank the half outside
+        // the range too, or it would be left orphaned (see `put_cell`).
+        if start_col > 0 && start_col < end_col {
+            let first = self.idx(row, start_col);
+            let before = self.idx(row, start_col - 1);
+            if self.cells[first].attrs & ATTR_WIDE_RIGHT != 0
+                && self.cells[before].attrs & ATTR_WIDE_LEFT != 0
+            {
+                self.cells[before] = self.blank_cell();
+            }
+        }
+        if end_col < self.cols && start_col < end_col {
+            let last = self.idx(row, end_col - 1);
+            let after = self.idx(row, end_col);
+            if self.cells[last].attrs & ATTR_WIDE_LEFT != 0
+                && self.cells[after].attrs & ATTR_WIDE_RIGHT != 0
+            {
+                self.cells[after] = self.blank_cell();
+            }
+        }
+        let start = self.idx(row, start_col);
+        let end = self.idx(row, end_col);
+        // Erased cells take the pen's background, as a destroyed wide-glyph
+        // half does (xterm's background-colour erase); with the default pen
+        // this is the default cell.
+        let blank = self.blank_cell();
         for cell in &mut self.cells[start..end] {
-            *cell = Cell::default();
+            *cell = blank;
         }
         self.dirty = true;
     }
@@ -472,6 +538,8 @@ impl Grid {
         let region_rows = bottom - top + 1;
         let n = (n as usize).min(region_rows);
         let cols = self.cols as usize;
+        // Rows scrolled in take the pen's background (BCE), as erases do.
+        let blank = self.blank_cell();
         for r in top..=bottom {
             let src = r + n;
             if src <= bottom {
@@ -482,7 +550,7 @@ impl Grid {
             } else {
                 let dst_start = r * cols;
                 for cell in &mut self.cells[dst_start..dst_start + cols] {
-                    *cell = Cell::default();
+                    *cell = blank;
                 }
             }
         }
@@ -1375,6 +1443,94 @@ mod tests {
         assert!(snap.cursor.visible);
     }
 
+    /// E2E: a hidden pane's grid read `✻Brewed for2m 39s · done 11:46 AM`.
+    /// `row_text` drops exactly one kind of cell — a width-2 glyph's
+    /// right-half sentinel — so each lost blank was a column whose last
+    /// writer was half of a wide glyph (an emoji in an earlier frame on that
+    /// row) that the new frame skipped with a cursor-forward move: its left
+    /// half overwritten, its orphaned right half silently removed from the
+    /// text. The completed-turn line must read with its spaces.
+    #[test]
+    fn a_cursor_forward_gap_over_an_old_wide_glyph_reads_as_a_space() {
+        let mut grid = Grid::new(40, 3);
+        // The old frame: width-2 glyphs under each column the new frame's
+        // cursor-forward moves skip (1, 8, 12).
+        feed(&mut grid, "\x1b[1;1H🤖\x1b[1;8H🤖\x1b[1;12H🤖".as_bytes());
+        // The new frame, as Claude Code paints it: glyph, CUF, word, CUF, ...
+        feed(
+            &mut grid,
+            "\x1b[1;1H✻\x1b[1CBrewed\x1b[1Cfor\x1b[1C2m 39s · done 11:46 AM\x1b[K".as_bytes(),
+        );
+        assert_eq!(grid.row_text(0), "✻ Brewed for 2m 39s · done 11:46 AM");
+        assert!(
+            qontinui_runner_lib::looping_agent::idle::is_completed_turn_line(&grid.row_text(0))
+        );
+    }
+
+    /// Writing over either half of a wide glyph blanks the other half; writing
+    /// a wide glyph itself is unaffected.
+    #[test]
+    fn overwriting_half_a_wide_glyph_blanks_the_other_half() {
+        let mut grid = Grid::new(10, 1);
+        feed(&mut grid, "日本".as_bytes());
+        assert_eq!(grid.row_text(0), "日本");
+        // Over the LEFT half of 日: its right half becomes a blank.
+        feed(&mut grid, "\x1b[1;1Ha".as_bytes());
+        assert_eq!(grid.row_text(0), "a 本");
+        // Over the RIGHT half of 本 (column 3): its left half becomes a blank.
+        feed(&mut grid, "\x1b[1;4Hb".as_bytes());
+        assert_eq!(grid.row_text(0), "a  b");
+        // A wide glyph written over a wide glyph keeps both of its halves.
+        let mut g2 = Grid::new(10, 1);
+        feed(&mut g2, "日本\x1b[1;1H中".as_bytes());
+        assert_eq!(g2.row_text(0), "中本");
+    }
+
+    /// Nit 1: an erase that cuts a wide glyph in half blanks the other half.
+    #[test]
+    fn an_erase_that_splits_a_wide_glyph_blanks_its_other_half() {
+        // EL 0 from the glyph's right half (column 1).
+        let mut g = Grid::new(10, 1);
+        feed(&mut g, "日x\x1b[1;2H\x1b[K".as_bytes());
+        assert!(
+            g.snapshot().cells[0].attrs & ATTR_WIDE_LEFT == 0,
+            "left half blanked"
+        );
+        assert_eq!(g.row_text(0), "");
+        // EL 1 up to the glyph's left half (column 2) leaves no orphan at 3.
+        let mut g = Grid::new(10, 1);
+        feed(&mut g, "ab日c\x1b[1;3H\x1b[1K".as_bytes());
+        assert!(
+            g.snapshot().cells[3].attrs & ATTR_WIDE_RIGHT == 0,
+            "right half blanked"
+        );
+        assert_eq!(g.row_text(0), "    c");
+    }
+
+    /// Round 10 nit: an erase fills with the pen's background too, like the
+    /// destroyed half (xterm BCE); the default pen erases to the default cell.
+    #[test]
+    fn an_erase_takes_the_pen_background() {
+        let mut g = Grid::new(10, 1);
+        feed(&mut g, "abc\x1b[1;1H\x1b[44m\x1b[K".as_bytes());
+        assert_eq!(g.row_text(0), "");
+        assert!(g.snapshot().cells.iter().all(|c| c.bg != COLOR_DEFAULT));
+        let mut g = Grid::new(10, 1);
+        feed(&mut g, "abc\x1b[1;1H\x1b[K".as_bytes());
+        assert!(g.snapshot().cells.iter().all(|c| *c == Cell::default()));
+    }
+
+    /// Nit 2: the blank takes the current pen's background.
+    #[test]
+    fn a_destroyed_wide_half_takes_the_pen_background() {
+        let mut g = Grid::new(10, 1);
+        feed(&mut g, "日\x1b[1;1H\x1b[41ma".as_bytes());
+        let right = g.snapshot().cells[1];
+        assert_eq!(right.ch, ' ');
+        assert_eq!(right.attrs & ATTR_WIDE_RIGHT, 0);
+        assert_ne!(right.bg, COLOR_DEFAULT, "the pen's red background");
+    }
+
     #[test]
     fn print_hello_advances_cursor() {
         let mut grid = Grid::new(80, 24);
@@ -1409,6 +1565,23 @@ mod tests {
         feed(&mut grid, b"\x1b[10;20H");
         assert_eq!(grid.cursor().row, 9);
         assert_eq!(grid.cursor().col, 19);
+    }
+
+    /// Review round 11 N4: a row scrolled in takes the pen's background
+    /// (BCE), like an erase — not the default background.
+    #[test]
+    fn a_scrolled_in_row_takes_the_pen_background() {
+        let mut grid = Grid::new(10, 3);
+        // Blue background, then scroll by line feeds from the bottom row.
+        feed(&mut grid, b"\x1b[44m\x1b[3;1H\n");
+        let snap = grid.snapshot();
+        let bottom = &snap.cells[20..30];
+        assert!(
+            bottom
+                .iter()
+                .all(|c| c.bg == ansi_color_16(4, false) && c.ch == ' '),
+            "scrolled-in row: {bottom:?}"
+        );
     }
 
     #[test]
