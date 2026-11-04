@@ -26,13 +26,19 @@ concurrency:
   group: page-spec-paths
   cancel-in-progress: false
 
+# Least privilege (zizmor excessive-permissions): with no block every job got
+# the repository's default token scope.
+permissions:
+  contents: read
+
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
           fetch-depth: 1
 
       # No setup-node: the script is pure Node >= 18 stdlib (no npm deps) and

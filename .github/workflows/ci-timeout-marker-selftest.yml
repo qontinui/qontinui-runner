@@ -71,7 +71,9 @@ jobs:
     # A checkout plus a few dozen short bash invocations.
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Test the job-timeout marker and budget tripwire (no network)
         shell: bash

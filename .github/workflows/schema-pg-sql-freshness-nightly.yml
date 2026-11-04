@@ -186,7 +186,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
       - name: Test the refresh-PR step's guards (stubbed gh, no network)
         run: bash scripts/tests/test_schema_pr_step_guards.sh
       - name: Test the draft->ready script (stubbed gh, no network)
@@ -225,8 +227,11 @@ jobs:
 
     steps:
       - name: Checkout qontinui-runner
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          # Explicitly persisted: a later step in this job pushes from this
+          # checkout with this step's token (zizmor artipacked: deliberate).
+          persist-credentials: true
           path: qontinui-runner
           # Withhold the PAT unless we may actually self-heal, so a dispatch on
           # a non-main ref cannot push with elevated credentials.
@@ -238,8 +243,9 @@ jobs:
       # match qontinui-web `main`'s alembic head", and `main` is the only answer
       # to the right-hand side of that.
       - name: Checkout qontinui-web (sibling, main)
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
           repository: qontinui/qontinui-web
           path: qontinui-web
           ref: main
@@ -260,7 +266,7 @@ jobs:
           git clone --depth 1 https://github.com/qontinui/qontinui.git
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
@@ -809,7 +815,7 @@ jobs:
       # artifact-missing error.
       - name: Upload regenerated schema (on drift)
         if: ${{ !cancelled() && steps.fresh_check.outputs.drift == 'true' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: schema.pg.sql.generated-fresh
           path: ${{ runner.temp }}/schema.fresh.sql
