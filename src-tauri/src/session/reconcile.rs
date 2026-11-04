@@ -523,6 +523,7 @@ fn bind_record(
         finish_synced: false,
         spawn_device_default: None,
         adopted_from: None,
+        adopted_from_matched: false,
         last_session_start_at: None,
         gate_id: None,
         gate_consuming_device_id: None,
@@ -2355,6 +2356,7 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            adopted_from_matched: false,
             last_session_start_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
@@ -2835,6 +2837,7 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            adopted_from_matched: false,
             last_session_start_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
@@ -3031,6 +3034,7 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            adopted_from_matched: false,
             last_session_start_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
@@ -3133,6 +3137,7 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            adopted_from_matched: false,
             last_session_start_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
@@ -4151,19 +4156,26 @@ mod tests {
         }
     }
 
-    /// A `/clear` leftover is healed uncounted. Pane A launched `s` and ran
-    /// `/clear` into `s2`, both hook-confirmed, so `s`'s row stays open beside
-    /// `s2`'s, which the `/clear` hook marks adopted from `s`; A's record names
-    /// `s2`. Pane B launched `x`, then resumed `s` inside its TUI: B's record
-    /// names `s` before B's hook lands. `s`'s row on A reads `unknown` — it
-    /// runs in B — so A no longer holds it, and rung 2b moves it onto B;
-    /// nothing is counted, and the next pass finds every row matched.
+    /// A `/clear` leftover is healed uncounted. Pane A launched `s`, and the
+    /// last pass found A's record naming it; A then ran `/clear` into `s2`,
+    /// both hook-confirmed, so `s`'s row stays open beside `s2`'s, which the
+    /// `/clear` hook marks adopted from `s` — confirmed, `s` being A's matched
+    /// row. A's record now names `s2`. Pane B launched `x`, then resumed `s`
+    /// inside its TUI: B's record names `s` before B's hook lands. `s`'s row on
+    /// A reads `unknown` — it runs in B — so A no longer holds it, and rung 2b
+    /// moves it onto B; nothing is counted, and the next pass finds every row
+    /// matched.
     #[test]
     fn a_clear_leftover_resumed_in_another_pane_is_healed_uncounted() {
         let dir = tempdir().unwrap();
         let panes = [("term-a", names("s2")), ("term-b", names("s"))];
         let (store, counters) = store_with_panes(dir.path(), &panes);
         hook(&store, "s", "term-a");
+        // What the pass before the `/clear` stored: A's record named `s`.
+        assert!(store
+            .set_binding_state("s", "term-a", BindingState::Matched, store.pane_epoch())
+            .is_some());
+        store.serve_verdicts_from(0);
         clear_hook(&store, "s2", "term-a");
         hook(&store, "x", "term-b");
         assert_eq!(
@@ -4171,10 +4183,11 @@ mod tests {
             "open",
             "precondition: the /clear's hook leaves the predecessor's row open"
         );
+        let s2 = store.get("s2").unwrap();
         assert_eq!(
-            store.get("s2").unwrap().adopted_from.as_deref(),
-            Some("s"),
-            "precondition: and marks its successor adopted from it"
+            (s2.adopted_from.as_deref(), s2.adopted_from_matched),
+            (Some("s"), true),
+            "precondition: and marks its successor adopted from it, confirmed"
         );
         let (live, _) = two_panes_one_workdir();
         let pass = || {
@@ -4237,12 +4250,16 @@ mod tests {
 
     /// What the hook route does for a `/clear` that minted `id` on `terminal`
     /// (`source: "clear"`): the write [`hook`] makes, then the adoption marker
-    /// naming the session most recently started there, read before the write.
+    /// naming the session most recently started there, and whether that was
+    /// the pane's current `matched` row — both read before the write.
     fn clear_hook(store: &SessionLifecycleStore, id: &str, terminal: &str) {
         let predecessor = store.latest_open_on_terminal(terminal, id);
+        let matched = predecessor
+            .as_ref()
+            .is_some_and(|p| store.matched_now_on(&p.claude_session_id, terminal));
         hook(store, id, terminal);
         if let Some(predecessor) = predecessor {
-            store.mark_adopted_from(id, &predecessor.claude_session_id);
+            store.mark_adopted_from(id, &predecessor.claude_session_id, matched);
         }
     }
 
@@ -4259,8 +4276,7 @@ mod tests {
         let (store, counters) = store_with_panes(dir.path(), &panes);
         // A launched `s`; its `/clear` made `s2` there.
         hook(&store, "s", "term-a");
-        hook(&store, "s2", "term-a");
-        store.mark_adopted_from("s2", "s");
+        clear_hook(&store, "s2", "term-a");
         // B launched `x`, then resumed `s` inside its TUI: B's hook moves `s`.
         hook(&store, "x", "term-b");
         hook(&store, "s", "term-b");

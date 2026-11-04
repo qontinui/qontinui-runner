@@ -977,6 +977,18 @@ pub struct TerminalSessionRecord {
     /// field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adopted_from: Option<String>,
+    /// Whether [`Self::adopted_from`] was the pane's CURRENT `matched` row when
+    /// the `clear` hook recorded it ([`SessionLifecycleStore::mark_adopted_from`]):
+    /// the session the pane's own `claude` was last observed running there.
+    /// Only such a link makes that predecessor a `/clear` leftover whose
+    /// `unknown` goes uncounted
+    /// ([`crate::session::pane_binding::BindingVerdict::leftover`]). An
+    /// unconfirmed link — a quick switch made since the last observation, or a
+    /// row a strong write put on the pane — keeps the lineage the hook
+    /// recorded, and its predecessor's mismatch counts. `false` for a row
+    /// written before the field existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub adopted_from_matched: bool,
     /// Unix millis of the most recent provider SessionStart hook that reported
     /// this id ([`SessionLifecycleStore::note_session_start_hook`]) — when its
     /// process last started (or resumed into) its terminal. The durable half of
@@ -3918,10 +3930,18 @@ impl SessionLifecycleStore {
     /// Record that the provider ADOPTED `claude_session_id` from
     /// `predecessor` — its SessionStart hook reported the id with `source:
     /// "clear"` while `predecessor` was the session open on that terminal
-    /// (see [`TerminalSessionRecord::adopted_from`]). Writes only on change;
-    /// no-op when the session is absent, `predecessor` is empty, or names the
-    /// session itself. Never creates a record.
-    pub fn mark_adopted_from(&self, claude_session_id: &str, predecessor: &str) {
+    /// (see [`TerminalSessionRecord::adopted_from`]) — and whether
+    /// `predecessor` was then the pane's current `matched` row
+    /// ([`TerminalSessionRecord::adopted_from_matched`],
+    /// [`Self::matched_now_on`]). Writes only on change; no-op when the session
+    /// is absent, `predecessor` is empty, or names the session itself. Never
+    /// creates a record.
+    pub fn mark_adopted_from(
+        &self,
+        claude_session_id: &str,
+        predecessor: &str,
+        predecessor_matched: bool,
+    ) {
         if predecessor.trim().is_empty() || predecessor == claude_session_id {
             return;
         }
@@ -3933,8 +3953,12 @@ impl SessionLifecycleStore {
             }
         };
         let changed = match m.get_mut(claude_session_id) {
-            Some(rec) if rec.adopted_from.as_deref() != Some(predecessor) => {
+            Some(rec)
+                if rec.adopted_from.as_deref() != Some(predecessor)
+                    || rec.adopted_from_matched != predecessor_matched =>
+            {
                 rec.adopted_from = Some(predecessor.to_string());
+                rec.adopted_from_matched = predecessor_matched;
                 rec.clone()
             }
             _ => return,
@@ -4484,25 +4508,17 @@ impl SessionLifecycleStore {
     /// subtree), so a first match over the `HashMap` would pick one by
     /// iteration order. This ranks instead, greatest wins:
     ///
-    /// 0. a row whose CURRENT binding verdict is `matched` on this terminal
-    ///    ([`Self::current_binding_verdicts`]) — the pane's own `claude` named it
-    ///    in the latest observation — outranks every other. A row a strong
-    ///    write put on the pane since has no verdict yet, and it must not be
-    ///    taken for the session the pane ran, however recent its hook: a
-    ///    `/clear` marked as continuing it would leave its mismatch uncounted
-    ///    and send coord lineage through it. Without a current verdict (no
-    ///    fresh observation) the order below decides alone;
-    /// 1. a row whose [`TerminalSessionRecord::binding_state`] is not `unknown`
+    /// 0. a row whose [`TerminalSessionRecord::binding_state`] is not `unknown`
     ///    outranks one that is — the pane's own `claude` contradicts that row;
-    /// 2. the latest SessionStart hook seen for the id in this process
+    /// 1. the latest SessionStart hook seen for the id in this process
     ///    ([`Self::note_session_start_hook`]) — a row with one outranks a row
     ///    without;
-    /// 3. then the durable [`TerminalSessionRecord::last_session_start_at`] —
+    /// 2. then the durable [`TerminalSessionRecord::last_session_start_at`] —
     ///    the same fact, surviving a restart or a holder handoff, whose adopted
     ///    panes fire no new hook;
-    /// 4. then `confirmed_at` (a confirmed row outranks an unconfirmed one);
-    /// 5. then `last_seen_at`, then `opened_at`;
-    /// 6. then `claude_session_id`, so the choice is deterministic even on a
+    /// 3. then `confirmed_at` (a confirmed row outranks an unconfirmed one);
+    /// 4. then `last_seen_at`, then `opened_at`;
+    /// 5. then `claude_session_id`, so the choice is deterministic even on a
     ///    full tie.
     ///
     /// Hook order comes before `confirmed_at` because `confirmed_at` is
@@ -4510,25 +4526,29 @@ impl SessionLifecycleStore {
     /// session keeps the older stamp and would lose to the pane on
     /// `confirmed_at` alone. The process-local order leads the durable stamp
     /// because it cannot be misordered by a wall-clock step.
+    ///
+    /// The latest hook is the predecessor a `/clear` records for coord lineage,
+    /// even when the pane's last observation saw another session there — a
+    /// switch made since, which the next pass would see. Whether it WAS that
+    /// observed session is recorded beside it
+    /// ([`TerminalSessionRecord::adopted_from_matched`]): only then is it a
+    /// leftover whose mismatch goes uncounted.
     pub fn latest_open_on_terminal(
         &self,
         terminal_id: &str,
         exclude: &str,
     ) -> Option<TerminalSessionRecord> {
-        let matched_here: HashSet<String> = self
-            .current_binding_verdicts()
-            .into_iter()
-            .filter(|(_, v)| v.terminal_id == terminal_id && v.state == BindingState::Matched)
-            .map(|(id, _)| id)
-            .collect();
-        if !matched_here.is_empty() {
-            if let Some(row) = self.ranked_open_on_terminal(terminal_id, |r| {
-                r.claude_session_id != exclude && matched_here.contains(&r.claude_session_id)
-            }) {
-                return Some(row);
-            }
-        }
         self.ranked_open_on_terminal(terminal_id, |r| r.claude_session_id != exclude)
+    }
+
+    /// Whether `claude_session_id`'s CURRENT binding verdict is `matched` on
+    /// `terminal_id` ([`Self::current_binding_verdicts`]): that pane's own
+    /// `claude` named it in the latest observation. `false` without a fresh,
+    /// judged observation — unknown is never confirmation.
+    pub fn matched_now_on(&self, claude_session_id: &str, terminal_id: &str) -> bool {
+        self.current_binding_verdicts()
+            .get(claude_session_id)
+            .is_some_and(|v| v.terminal_id == terminal_id && v.state == BindingState::Matched)
     }
 
     /// The open row on `terminal_id` that `admit` accepts and that ranks
@@ -6834,6 +6854,7 @@ pub(crate) fn test_open_record(id: &str) -> TerminalSessionRecord {
         finish_synced: false,
         spawn_device_default: None,
         adopted_from: None,
+        adopted_from_matched: false,
         last_session_start_at: None,
         gate_id: None,
         gate_consuming_device_id: None,
@@ -7069,6 +7090,7 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            adopted_from_matched: false,
             last_session_start_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
@@ -9718,6 +9740,64 @@ mod tests {
         assert_eq!(served(), Some(BindingState::Matched));
     }
 
+    /// `adoptedFromMatched` round-trips through the snapshot when set, is left
+    /// out when not, and a row written before the field loads with it `false`
+    /// — an old store confirms no `/clear` link, so it grants no leftover.
+    #[test]
+    fn adopted_from_matched_round_trips_and_legacy_rows_load_it_false() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.json");
+        {
+            let store = SessionLifecycleStore::open(&path).unwrap();
+            store.record_open(auth_on("s", "term-a"));
+            store.record_open(auth_on("s2", "term-a"));
+            store.mark_adopted_from("s2", "s", true);
+            store.record_open(auth_on("t2", "term-b"));
+            store.mark_adopted_from("t2", "t", false);
+            store.compact();
+        }
+        let reopened = SessionLifecycleStore::open(&path).unwrap();
+        let s2 = reopened.get("s2").unwrap();
+        assert_eq!(
+            (s2.adopted_from.as_deref(), s2.adopted_from_matched),
+            (Some("s"), true)
+        );
+        assert_eq!(
+            serde_json::to_value(&s2).unwrap()["adoptedFromMatched"],
+            true
+        );
+        let t2 = reopened.get("t2").unwrap();
+        assert_eq!(
+            (t2.adopted_from.as_deref(), t2.adopted_from_matched),
+            (Some("t"), false)
+        );
+        assert!(serde_json::to_value(&t2)
+            .unwrap()
+            .get("adoptedFromMatched")
+            .is_none());
+
+        let legacy: TerminalSessionRecord = serde_json::from_value(serde_json::json!({
+            "claudeSessionId": "old",
+            "configDir": null,
+            "workingDir": null,
+            "pageId": "default",
+            "zoneIndex": 0,
+            "title": null,
+            "terminalId": "term-old",
+            "openedAt": 1,
+            "lastSeenAt": 1,
+            "state": "open",
+            "closedAt": null,
+            "closeReason": null,
+            "adoptedFrom": "older"
+        }))
+        .unwrap();
+        assert_eq!(
+            (legacy.adopted_from.as_deref(), legacy.adopted_from_matched),
+            (Some("older"), false)
+        );
+    }
+
     /// `bindingState` round-trips camelCase through the snapshot, and a row
     /// written before the field loads as unchecked.
     #[test]
@@ -11884,6 +11964,7 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            adopted_from_matched: false,
             last_session_start_at: None,
             gate_id: None,
             gate_consuming_device_id: None,

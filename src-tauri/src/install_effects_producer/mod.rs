@@ -1239,6 +1239,11 @@ fn record_session_open_into(
     // `SessionLifecycleStore::latest_open_on_terminal`), and the `/clear`
     // predecessor below must be the one that was actually running here.
     let terminal_latest = store.latest_open_on_terminal(&req.terminal_id, &req.session_id);
+    // Whether that session is the one this pane's own `claude` was last
+    // observed running — read, like it, before this hook's write.
+    let terminal_latest_matched = terminal_latest
+        .as_ref()
+        .is_some_and(|prior| store.matched_now_on(&prior.claude_session_id, &req.terminal_id));
     // Layout inheritance consults it only when the provider's id has no record
     // of its own; see the "inherited by TERMINAL" paragraph above.
     let terminal_prior = existing
@@ -1319,10 +1324,18 @@ fn record_session_open_into(
     // pinned to some other id P, both rows stay open, and a `/clear` in X
     // continues X (X's own coord row), never P. Every other source (`resume`,
     // `startup`, `compact`, absent) records no predecessor. See
-    // `TerminalSessionRecord::adopted_from`.
+    // `TerminalSessionRecord::adopted_from`. Beside it, whether the
+    // predecessor was the pane's current `matched` row
+    // (`TerminalSessionRecord::adopted_from_matched`): a session switched to
+    // since the last observation, or a row a strong write put on the pane, is
+    // the latest hook without being that, and its link grants no leftover.
     if req.source.as_deref() == Some(HOOK_SOURCE_CLEAR) {
         if let Some(prior) = terminal_latest.as_ref() {
-            store.mark_adopted_from(&req.session_id, &prior.claude_session_id);
+            store.mark_adopted_from(
+                &req.session_id,
+                &prior.claude_session_id,
+                terminal_latest_matched,
+            );
         }
     }
 
@@ -2507,6 +2520,7 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            adopted_from_matched: false,
             last_session_start_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
@@ -3032,6 +3046,7 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            adopted_from_matched: false,
             last_session_start_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
@@ -3114,6 +3129,10 @@ mod tests {
             Some("prior-on-term-c"),
             "a clear records WHOSE session it continued"
         );
+        assert!(
+            !cleared.adopted_from_matched,
+            "with no observation, the link is not confirmed"
+        );
         for (id, _, source) in &cases[1..] {
             let rec = store.get(id).expect("recorded");
             assert_eq!(
@@ -3128,26 +3147,36 @@ mod tests {
         assert_eq!(store.get("prior-on-term-c").unwrap().adopted_from, None);
     }
 
-    /// A `/clear` continues the session its pane ran — the row the pane's own
-    /// `claude` named in the latest observation, its verdict current and
-    /// `matched` there — not a row a strong wrong write put on the pane since,
-    /// though that row's hook is the more recent (plan
-    /// `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`). Taken
-    /// as the predecessor, the wrong row would read as the `/clear`'s
-    /// leftover, its mismatch uncounted, and coord lineage would run through
-    /// it. On a pane with no current verdict the latest hook decides, as
-    /// before.
+    /// A `/clear` records the latest session on its pane as the predecessor —
+    /// coord lineage follows it — and, beside it, whether that session was the
+    /// pane's current `matched` row (plan
+    /// `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`). Only a
+    /// confirmed link makes the predecessor a leftover whose mismatch goes
+    /// uncounted:
+    ///
+    /// - pane 1, a `/clear` while matched: `a` → `a2`, confirmed; `a` resumed
+    ///   elsewhere is a leftover;
+    /// - pane 2, two switches inside one pass: `b` matched, then `c`'s hook
+    ///   (an in-TUI `/resume`), then a `/clear` → `c2`. The predecessor is `c`
+    ///   — the session the pane really cleared — but unconfirmed, the last
+    ///   observation having seen `b`; `c` resumed elsewhere is counted;
+    /// - pane 3, a wrong row written over the pane: `d` matched, then a hook
+    ///   carrying pane 3's terminal for `e`, which runs elsewhere, then a
+    ///   `/clear` → `d2`. The latest hook is `e`, so the predecessor is `e`,
+    ///   unconfirmed: `e`'s mismatch stays counted.
     #[test]
-    fn a_clear_continues_the_panes_matched_session_not_a_row_written_over_it() {
-        use crate::session::pane_binding::{FixedPanes, PaneEvidence};
+    fn a_clear_records_whether_its_predecessor_was_the_panes_matched_session() {
+        use crate::session::pane_binding::{binding_verdicts, FixedPanes, PaneEvidence};
         use crate::session::session_lifecycle_store::{BindingState, SessionLifecycleStore};
+        let names = |id: &str| PaneEvidence::Names(id.to_string());
         let dir = tempfile::tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
-        // Pane P's own `claude` runs `x`; pane Q's records are not read.
-        store.attach_pane_evidence(FixedPanes::of(&[(
-            "term-p",
-            PaneEvidence::Names("x".to_string()),
-        )]));
+        // What each pane's own `claude` was last observed running.
+        store.attach_pane_evidence(FixedPanes::of(&[
+            ("term-1", names("a")),
+            ("term-2", names("b")),
+            ("term-3", names("d")),
+        ]));
         let config = dir.path().join("cfg").to_string_lossy().into_owned();
         let open = |id: &str, term: &str, source: &str| {
             let req = SessionOpenRequest {
@@ -3160,36 +3189,62 @@ mod tests {
             };
             assert!(record_session_open_into(&store, &req, "claude").is_recorded());
         };
-        for (own, wrong, cleared, term) in [("x", "s", "x2", "term-p"), ("y", "t", "y2", "term-q")]
-        {
-            open(own, term, "startup");
-            // The wrong write: a hook carrying this pane's terminal for a
-            // session that runs elsewhere — later than the pane's own.
-            open(wrong, term, "startup");
-            assert_eq!(store.get(own).unwrap().state, "open", "precondition");
-            if term == "term-p" {
-                store.serve_verdicts_from(0);
-                assert_eq!(
-                    store
-                        .current_binding_verdicts()
-                        .get(own)
-                        .map(|v| (v.terminal_id.as_str(), v.state)),
-                    Some((term, BindingState::Matched)),
-                    "precondition: P's own claude names {own}"
-                );
-            }
-            open(cleared, term, "clear");
+        for (id, term) in [("a", "term-1"), ("b", "term-2"), ("d", "term-3")] {
+            open(id, term, "startup");
         }
+        store.serve_verdicts_from(0);
+        for id in ["a", "b", "d"] {
+            assert_eq!(
+                store.current_binding_verdicts().get(id).map(|v| v.state),
+                Some(BindingState::Matched),
+                "precondition: {id} is its pane's matched row"
+            );
+        }
+        open("c", "term-2", "resume");
+        open("e", "term-3", "startup");
+        open("a2", "term-1", "clear");
+        open("c2", "term-2", "clear");
+        open("d2", "term-3", "clear");
+
+        let link = |id: &str| {
+            let rec = store.get(id).unwrap();
+            (rec.adopted_from, rec.adopted_from_matched)
+        };
+        assert_eq!(link("a2"), (Some("a".to_string()), true), "matched");
         assert_eq!(
-            store.get("x2").unwrap().adopted_from.as_deref(),
-            Some("x"),
-            "the pane's matched session, not the more recent wrong row"
+            link("c2"),
+            (Some("c".to_string()), false),
+            "the session switched to since the last observation"
         );
         assert_eq!(
-            store.get("y2").unwrap().adopted_from.as_deref(),
-            Some("t"),
-            "no current verdict on Q: the latest hook decides"
+            link("d2"),
+            (Some("e".to_string()), false),
+            "the wrong row, by hook order"
         );
+
+        // The panes now run their successors, and each predecessor runs in a
+        // pane of its own: only the confirmed link grants a leftover.
+        let evidence: std::collections::HashMap<String, PaneEvidence> = [
+            ("term-1", "a2"),
+            ("term-2", "c2"),
+            ("term-3", "d2"),
+            ("term-x", "a"),
+            ("term-y", "c"),
+            ("term-z", "e"),
+        ]
+        .into_iter()
+        .map(|(term, id)| (term.to_string(), names(id)))
+        .collect();
+        let verdicts = binding_verdicts(&store.open_records(), &evidence);
+        let leftover = |id: &str| {
+            verdicts
+                .iter()
+                .find(|v| v.claude_session_id == id)
+                .map(|v| (v.state, v.leftover))
+        };
+        assert_eq!(leftover("a"), Some((Some(BindingState::Unknown), true)));
+        assert_eq!(leftover("c"), Some((Some(BindingState::Unknown), false)));
+        assert_eq!(leftover("e"), Some((Some(BindingState::Unknown), false)));
     }
 
     /// A pane pinned to P whose operator exited and typed `claude --resume X`
@@ -3305,6 +3360,7 @@ mod tests {
                     finish_synced: false,
                     spawn_device_default: None,
                     adopted_from: None,
+                    adopted_from_matched: false,
                     last_session_start_at: None,
                     gate_id: None,
                     gate_consuming_device_id: None,
@@ -3407,6 +3463,7 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            adopted_from_matched: false,
             last_session_start_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
@@ -3500,6 +3557,7 @@ mod tests {
             finish_synced: false,
             spawn_device_default: None,
             adopted_from: None,
+            adopted_from_matched: false,
             last_session_start_at: None,
             gate_id: None,
             gate_consuming_device_id: None,

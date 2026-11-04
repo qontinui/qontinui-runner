@@ -50,10 +50,12 @@
 //!    elsewhere → `unknown`, counted once per episode. This is the 2026-10-25
 //!    shape. Not counted when `R` is a leftover ([`BindingVerdict::leftover`]):
 //!    `S` is a `/clear` predecessor of the session `P`'s record names, whose
-//!    open row `P` holds — by `adopted_from`, which only the `/clear` hook
-//!    writes. A `/clear` leaves its predecessor's confirmed row open beside its
-//!    successor's, and that row is `unknown` and healed all the same. A row a
-//!    strong write put on an occupied pane is no predecessor, and is counted.
+//!    open row `P` holds — by `adopted_from` links, which only the `/clear`
+//!    hook writes, each recorded while its predecessor was the pane's current
+//!    `matched` row (`adopted_from_matched`). A `/clear` leaves its
+//!    predecessor's confirmed row open beside its successor's, and that row is
+//!    `unknown` and healed all the same. A row a strong write put on an
+//!    occupied pane is never a confirmed predecessor, and is counted.
 //! 3. Otherwise → no verdict. A `matched` the row carried is withdrawn; an
 //!    `unknown` is kept, so one episode is never counted twice.
 //!
@@ -746,10 +748,12 @@ pub struct BindingVerdict {
     /// Rule 2 only: the row is a LEFTOVER — a `/clear` predecessor of the
     /// session its pane runs now. Its pane's record names another session, the
     /// pane holds that session's open row, and that session was adopted from
-    /// this one by a `/clear`, directly or through earlier ones
-    /// ([`TerminalSessionRecord::adopted_from`], which only the `/clear` hook
-    /// writes and a restart keeps). A `/clear` leaves exactly this: the hook's
-    /// supersede closes only unconfirmed siblings, so the predecessor's
+    /// this one by a `/clear`, directly or through earlier ones, every link
+    /// CONFIRMED: recorded while its predecessor was the pane's current
+    /// `matched` row ([`TerminalSessionRecord::adopted_from`] and
+    /// [`TerminalSessionRecord::adopted_from_matched`], which only the `/clear`
+    /// hook writes and a restart keeps). A `/clear` leaves exactly this: the
+    /// hook's supersede closes only unconfirmed siblings, so the predecessor's
     /// confirmed row stays open beside its successor's, and a later in-TUI
     /// `/resume` of the predecessor elsewhere names it in another pane before
     /// that pane's hook lands. The row is `unknown` and healed like any other,
@@ -757,11 +761,13 @@ pub struct BindingVerdict {
     ///
     /// Nothing else is a leftover. A row a strong write put on an occupied
     /// pane — whose own row the write's supersede spared, since the pane's
-    /// record names it — is no predecessor of the pane's session, and is
-    /// counted; so is the 2026-10-25 shape, where the pane's own row had been
-    /// closed. A `/clear` whose hook never reported `clear` leaves no marker,
-    /// and its predecessor is counted too: a missing marker never hides a
-    /// mismatch.
+    /// record names it — is no confirmed predecessor of the pane's session,
+    /// even when a `/clear` hook took it for the latest session there; it is
+    /// counted, and so is the 2026-10-25 shape, where the pane's own row had
+    /// been closed. So is the predecessor of a `/clear` made after a switch
+    /// the last observation had not seen, of a `/clear` whose hook never
+    /// reported `clear`, and of a chain through a row that has closed: an
+    /// unconfirmed or missing link never hides a mismatch.
     pub leftover: bool,
 }
 
@@ -772,8 +778,8 @@ pub struct BindingVerdict {
 ///
 /// 1. `P`'s own record names `S` → `Matched`.
 /// 2. Otherwise another live pane's record names `S` → `Unknown` — a
-///    [`BindingVerdict::leftover`] when `S` is a `/clear` predecessor of the
-///    session `P`'s record names, whose open row `P` holds.
+///    [`BindingVerdict::leftover`] when `S` is a confirmed `/clear`
+///    predecessor of the session `P`'s record names, whose open row `P` holds.
 /// 3. Otherwise → `None`.
 pub fn binding_verdicts(
     open: &[TerminalSessionRecord],
@@ -790,13 +796,15 @@ pub fn binding_verdicts(
     }
     let open: Vec<&TerminalSessionRecord> = open.iter().filter(|r| r.state == "open").collect();
     // The leftover test's two indexes: every (pane, session) an open row
-    // holds, and each open row's `/clear` predecessor.
+    // holds, and each open row's CONFIRMED `/clear` predecessor — one recorded
+    // while it was the pane's current `matched` row.
     let held: HashSet<(&str, &str)> = open
         .iter()
         .map(|r| (r.terminal_id.as_str(), r.claude_session_id.as_str()))
         .collect();
     let adopted_from: HashMap<&str, &str> = open
         .iter()
+        .filter(|r| r.adopted_from_matched)
         .filter_map(|r| {
             r.adopted_from
                 .as_deref()
@@ -841,10 +849,11 @@ pub fn binding_verdicts(
     out
 }
 
-/// Whether `predecessor` is a `/clear` predecessor of `session`: reached from
-/// it by following `adopted_from` through open rows (`adopted_from`, open row
-/// → its predecessor). A chain through a row that has closed is not followed,
-/// and a cycle ends the walk: either answers "no", which counts.
+/// Whether `predecessor` is a confirmed `/clear` predecessor of `session`:
+/// reached from it by following confirmed `adopted_from` links through open
+/// rows (`adopted_from`, open row → its confirmed predecessor). An unconfirmed
+/// link, a chain through a row that has closed and a cycle all end the walk,
+/// and each answers "no", which counts.
 fn cleared_from(session: &str, predecessor: &str, adopted_from: &HashMap<&str, &str>) -> bool {
     let mut seen: HashSet<&str> = HashSet::new();
     let mut at = session;
@@ -1172,22 +1181,31 @@ mod tests {
         assert_eq!(got.get("s2"), Some(&None), "judged on nothing, not unknown");
     }
 
-    /// A `/clear` predecessor, adopted from by the session its pane runs now.
-    fn adopted(id: &str, terminal: &str, predecessor: &str) -> TerminalSessionRecord {
+    /// A session a `/clear` adopted from `predecessor` — the link confirmed
+    /// when `predecessor` was the pane's current `matched` row then.
+    fn adopted(
+        id: &str,
+        terminal: &str,
+        predecessor: &str,
+        confirmed: bool,
+    ) -> TerminalSessionRecord {
         TerminalSessionRecord {
             adopted_from: Some(predecessor.to_string()),
+            adopted_from_matched: confirmed,
             ..open_row(id, terminal, None)
         }
     }
 
     /// A `/clear` leftover is `unknown` but no mismatch, and nothing else is.
-    /// Pane A ran `/clear` (`s` → `s2`, so `s2` was adopted from `s`): it holds
+    /// Pane A ran `/clear` (`s` → `s2`) while its last observation found it
+    /// running `s`, so `s2` was adopted from `s` by a confirmed link: A holds
     /// `s`'s confirmed row beside `s2`'s and names `s2`; `s` was then resumed
     /// inside pane B's TUI, whose record names it before B's hook lands. `s`'s
     /// row on A reads `unknown` — it runs in B — as a leftover, and so it does
-    /// after a second `/clear` (`s2` → `s3`). The same `unknown` is NO leftover
-    /// when A's own row was not adopted from `s` (a strong write put `s` on an
-    /// occupied pane, sparing that row), when A's own row had been closed (the
+    /// after a second confirmed `/clear` (`s2` → `s3`). The same `unknown` is
+    /// NO leftover when any link is unconfirmed (a switch the observation had
+    /// not seen, a row a strong write put there), when A's own row was not
+    /// adopted from `s` at all, when A's own row had been closed (the
     /// 2026-10-25 shape), or when A holds no row of what it names.
     #[test]
     fn only_a_clear_predecessor_of_the_panes_session_reads_as_a_leftover() {
@@ -1213,24 +1231,40 @@ mod tests {
             ))
         };
         let x_on_b = open_row("x", "t-b", None);
-        let cleared = vec![
-            open_row("s", "t-a", None),
-            adopted("s2", "t-a", "s"),
-            x_on_b.clone(),
-        ];
-        assert_eq!(verdict_of_s(&cleared, "s2"), unknown_on_b(true));
-
-        let cleared_twice = vec![
-            open_row("s", "t-a", None),
-            adopted("s2", "t-a", "s"),
-            adopted("s3", "t-a", "s2"),
-            x_on_b.clone(),
-        ];
+        let cleared = |confirmed: bool| {
+            vec![
+                open_row("s", "t-a", None),
+                adopted("s2", "t-a", "s", confirmed),
+                x_on_b.clone(),
+            ]
+        };
+        assert_eq!(verdict_of_s(&cleared(true), "s2"), unknown_on_b(true));
         assert_eq!(
-            verdict_of_s(&cleared_twice, "s3"),
-            unknown_on_b(true),
-            "a predecessor through two clears"
+            verdict_of_s(&cleared(false), "s2"),
+            unknown_on_b(false),
+            "an unconfirmed link grants nothing"
         );
+
+        let cleared_twice = |first: bool, second: bool| {
+            vec![
+                open_row("s", "t-a", None),
+                adopted("s2", "t-a", "s", first),
+                adopted("s3", "t-a", "s2", second),
+                x_on_b.clone(),
+            ]
+        };
+        assert_eq!(
+            verdict_of_s(&cleared_twice(true, true), "s3"),
+            unknown_on_b(true),
+            "a predecessor through two confirmed clears"
+        );
+        for (first, second) in [(false, true), (true, false)] {
+            assert_eq!(
+                verdict_of_s(&cleared_twice(first, second), "s3"),
+                unknown_on_b(false),
+                "every link must be confirmed: ({first}, {second})"
+            );
+        }
 
         let written_over = vec![
             open_row("s", "t-a", None),
@@ -1244,7 +1278,7 @@ mod tests {
         );
         let adopted_elsewhere = vec![
             open_row("s", "t-a", None),
-            adopted("s2", "t-a", "y"),
+            adopted("s2", "t-a", "y", true),
             x_on_b.clone(),
         ];
         assert_eq!(
@@ -1253,7 +1287,7 @@ mod tests {
             "adopted, but not from s"
         );
 
-        let mut moved_over = cleared.clone();
+        let mut moved_over = cleared(true);
         moved_over[1].state = "closed".to_string();
         assert_eq!(
             verdict_of_s(&moved_over, "s2"),
@@ -1269,8 +1303,9 @@ mod tests {
 
     /// Applying a leftover's `unknown` stores it and neither counts nor
     /// reports it. The same contradiction is counted and reported when the
-    /// pane's own row was not adopted from the row (a strong write), and when
-    /// it had been closed (the 2026-10-25 shape).
+    /// pane's own row was adopted from the row by an unconfirmed link, when it
+    /// was not adopted from it at all (a strong write), and when it had been
+    /// closed (the 2026-10-25 shape).
     #[test]
     fn a_leftover_unknown_is_stored_but_not_counted() {
         let evidence: HashMap<String, PaneEvidence> = [
@@ -1279,18 +1314,20 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        // (case, s2 adopted from s, s2's row closed, reported and counted)
+        // (case, s2's link to s and whether it is confirmed, s2's row
+        // closed, reported and counted)
         let cases = [
-            ("a /clear leftover", true, false, (0, 0)),
+            ("a /clear leftover", Some(true), false, (0, 0)),
+            ("an unconfirmed /clear link", Some(false), false, (1, 1)),
             (
                 "a strong write over the pane's own row",
-                false,
+                None,
                 false,
                 (1, 1),
             ),
-            ("the 2026-10-25 shape", true, true, (1, 1)),
+            ("the 2026-10-25 shape", Some(true), true, (1, 1)),
         ];
-        for (case, adopted_from_s, own_row_closed, counted) in cases {
+        for (case, link_to_s, own_row_closed, counted) in cases {
             let dir = tempfile::tempdir().unwrap();
             let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
             let counters = Arc::new(BindingCounters::default());
@@ -1304,8 +1341,8 @@ mod tests {
                 ..open_row("s2", "t-a", None)
             });
             store.confirm_session("s2");
-            if adopted_from_s {
-                store.mark_adopted_from("s2", "s");
+            if let Some(confirmed) = link_to_s {
+                store.mark_adopted_from("s2", "s", confirmed);
             }
             store.record_open(open_row("x", "t-b", None));
             assert_eq!(
@@ -1348,7 +1385,8 @@ mod tests {
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
         let counters = Arc::new(BindingCounters::default());
         store.attach_binding_counters(counters.clone());
-        // `s` on A, then two `/clear`s there, each hook-written and marked.
+        // `s` on A, then two `/clear`s there, each hook-written and marked —
+        // both links confirmed, so only the closed row breaks the chain.
         store.record_open(open_row("s", "t-a", None));
         for (id, predecessor) in [("s2", "s"), ("s3", "s2")] {
             store.record_open(TerminalSessionRecord {
@@ -1356,7 +1394,7 @@ mod tests {
                 ..open_row(id, "t-a", None)
             });
             store.confirm_session(id);
-            store.mark_adopted_from(id, predecessor);
+            store.mark_adopted_from(id, predecessor, true);
         }
         store.record_open(open_row("x", "t-b", None));
         store.record_close("s2", "explicit");

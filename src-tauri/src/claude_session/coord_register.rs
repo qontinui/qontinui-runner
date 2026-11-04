@@ -3179,7 +3179,9 @@ mod tests {
         rec.terminal_id = terminal.to_string();
         store.record_open(rec);
         if let Some(pred) = adopted_from {
-            store.mark_adopted_from(id, pred);
+            // Lineage follows the link whether or not the pane's last
+            // observation had confirmed the predecessor.
+            store.mark_adopted_from(id, pred, false);
         }
     }
 
@@ -3828,6 +3830,7 @@ mod tests {
                 finish_synced: false,
                 spawn_device_default: None,
                 adopted_from: None,
+                adopted_from_matched: false,
                 last_session_start_at: None,
                 gate_id: None,
                 gate_consuming_device_id: None,
@@ -3936,6 +3939,7 @@ mod tests {
                 finish_synced: false,
                 spawn_device_default: None,
                 adopted_from: None,
+                adopted_from_matched: false,
                 last_session_start_at: None,
                 gate_id: None,
                 gate_consuming_device_id: None,
