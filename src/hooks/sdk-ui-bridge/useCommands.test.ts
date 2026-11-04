@@ -101,7 +101,9 @@ describe("useCommands.sendCommand", () => {
     );
     const r = await useHookUnderTest().executeAction("btn", "click");
     expect(r.success).toBe(false);
+    expect(r.outcome).toBe("failed");
     expect(r.error).toBe("gone");
+    expect(r.data).toEqual({ success: false, error: "gone" });
   });
 
   it("a READ (getSnapshot) with raw app JSON and no success key succeeds", async () => {
