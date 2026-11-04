@@ -16,10 +16,15 @@
 #
 # Usage:
 #   scripts/e2e-sigterm-graceful-stop.sh <runner-binary> [--port N] [--display :D]
-#                                        [--sessions N] [--keep]
+#                                        [--sessions N] [--account A] [--keep]
 #
 # Defaults: --port 9893, --display from $DISPLAY (else :99), --sessions 2.
 # Each session runs `claude` in a runner terminal; the first is sent `/effort max`.
+# --account <config dir> runs every session's `claude` against that Claude
+# config dir (a logged-in account on this box), set as CLAUDE_CONFIG_DIR on the
+# subject itself: an isolated subject has no account roster to name one from.
+# A session is only resumable once it has a conversation on disk, which an
+# unauthenticated `claude` never writes.
 # --keep leaves the temp instance root behind for inspection (the unit and every
 # process the run started are always removed).
 #
@@ -37,8 +42,8 @@
 #   D. on restart (log written AFTER the restart only): `previous shutdown was
 #      clean`, never `NOT clean`, no new crash breadcrumb, /health not `errored`.
 #   E. every session is back as one `claude --resume <id>` process.
-#   G. two SIGTERMs 100 ms apart end the process within 1 s, by SIGTERM (read
-#      from the journal: `code=killed, status=15/TERM`).
+#   G. two SIGTERMs 100 ms apart end the process within 1 s, by SIGTERM (the
+#      wait status, observed directly on a launch outside systemd).
 
 set -u
 
@@ -50,12 +55,14 @@ PORT=9893
 DISP="${DISPLAY:-:99}"
 NSESS=2
 KEEP=0
+ACCOUNT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --port) PORT="$2"; shift 2 ;;
     --display) DISP="$2"; shift 2 ;;
     --sessions) NSESS="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
+    --account) ACCOUNT="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -85,7 +92,7 @@ own_pids() {
     case "$(readlink "$d/cwd" 2>/dev/null)" in
       "$ROOT"|"$ROOT"/*) echo "$pid"; continue ;;
     esac
-    tr '\0' '\n' < "$d/environ" 2>/dev/null | grep -qxF "QONTINUI_INSTANCE_ROOT=$ROOT" && echo "$pid"
+    { tr '\0' '\n' < "$d/environ"; } 2>/dev/null | grep -qxF "QONTINUI_INSTANCE_ROOT=$ROOT" && echo "$pid"
   done
 }
 
@@ -116,6 +123,7 @@ start_unit() {
     --setenv=QONTINUI_INSTANCE_NAME="sigterm-e2e-$PORT" \
     --setenv=QONTINUI_PORT="$PORT" \
     --setenv=PATH="$PATH" \
+    ${ACCOUNT:+--setenv=CLAUDE_CONFIG_DIR="$ACCOUNT"} \
     "$BIN" >/dev/null || { echo "systemd-run failed" >&2; exit 2; }
 }
 
@@ -145,14 +153,18 @@ logs_since() {   # $1 = manifest file ('' = from the start)
 }
 
 # Lifecycle rows as the store would load them: snapshot, then the WAL replayed.
-lifecycle_rows() {
-  python3 - "$ROOT" <<'PY'
+lifecycle_rows() {   # optional: terminal ids to keep (space-separated)
+  python3 - "$ROOT" "${1:-}" <<'PY'
 import json, os, sys
 root = sys.argv[1]
-snaps = [os.path.join(d, f) for d, _, fs in os.walk(root) for f in fs if f == "terminal-sessions.json"]
-if not snaps:
+# The store is a snapshot plus a WAL; before the first compaction only the WAL
+# may exist, so either file locates it.
+found = [os.path.join(d, "terminal-sessions") for d, _, fs in os.walk(root)
+         if "terminal-sessions.json" in fs or "terminal-sessions.wal.jsonl" in fs]
+if not found:
     print("NO_STORE"); sys.exit(0)
-snap = snaps[0]
+base = found[0]
+snap = base + ".json"
 rows = {}
 try:
     data = json.load(open(snap))
@@ -167,7 +179,7 @@ def collect(o):
     elif isinstance(o, list):
         for v in o: collect(v)
 collect(data)
-wal = snap[: -len(".json")] + ".wal.jsonl"
+wal = base + ".wal.jsonl"
 if os.path.exists(wal):
     for line in open(wal):
         try: d = json.loads(line)
@@ -176,16 +188,25 @@ if os.path.exists(wal):
             r = d["rec"]; rows[r.get("claudeSessionId") or r.get("terminalId")] = r
         elif d.get("op") == "remove":
             rows.pop(d.get("id"), None)
+keep = set(sys.argv[2].split()) if len(sys.argv) > 2 and sys.argv[2] else None
 for k, r in rows.items():
-    print(f"{k} {r.get('state')} {r.get('closeReason') or '-'}")
+    if keep is not None and r.get("terminalId") not in keep:
+        continue
+    print(f"{k} {r.get('state')} {r.get('closeReason') or '-'} {r.get('terminalId')}")
 PY
 }
 
 resume_ids() {
   local pid
   for pid in $(own_pids); do
-    tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -o -- '--resume [0-9a-f-]\{36\}' || true
+    { tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null | grep -o -- '--resume [0-9a-f-]\{36\}' || true
   done | sort -u
+}
+own_claude_cmdlines() {
+  local pid
+  for pid in $(own_pids); do
+    { tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null | grep -E '(^|/)claude( |$)' | sed "s/^/  [$pid] /" || true
+  done
 }
 
 echo "== subject: $BIN on :$PORT (display $DISP), root $ROOT, unit $UNIT"
@@ -200,15 +221,40 @@ if (( (16#$SIGCGT >> 13) & 1 )); then fail "SIGALRM (14) is caught (SigCgt=$SIGC
 # Open the sessions.
 TIDS=()
 for n in $(seq 1 "$NSESS"); do
-  tid=$(curl -s -X POST "$BASE/terminals" -H 'Content-Type: application/json' \
-    -d "{\"title\":\"sigterm-e2e-$n\",\"initial_command\":\"claude\",\"working_dir\":\"$ROOT\"}" | jq -r '.data.id // empty')
-  [ -n "$tid" ] || { fail "could not open session $n"; continue; }
+  body=$(jq -nc --arg t "sigterm-e2e-$n" --arg w "$ROOT" \
+    '{title: $t, initial_command: "claude", working_dir: $w}')
+  resp=$(curl -s -X POST "$BASE/terminals" -H 'Content-Type: application/json' -d "$body")
+  tid=$(echo "$resp" | jq -r '.data.id // empty')
+  [ -n "$tid" ] || { fail "could not open session $n: $(echo "$resp" | head -c 300)"; continue; }
   TIDS+=("$tid")
 done
 sleep 20
+# A fresh working dir puts `claude` on its folder-trust dialog first, whose
+# DEFAULT is "No, exit": move to "Yes, I trust this folder" (Down), then Enter.
+# `/terminals/{id}/write` takes base64.
+DOWN_B64=$(printf '\033[B' | base64); CR_B64=$(printf '\r' | base64)
+for tid in "${TIDS[@]}"; do
+  curl -s -o /dev/null -X POST "$BASE/terminals/$tid/write" -H 'Content-Type: application/json' -d "{\"data\":\"$DOWN_B64\"}"
+  sleep 1
+  curl -s -o /dev/null -X POST "$BASE/terminals/$tid/write" -H 'Content-Type: application/json' -d "{\"data\":\"$CR_B64\"}"
+done
+sleep 12
+# A session must have a conversation on disk to be resumable, so each gets one
+# short prompt; the first is also put on `/effort max` (the sibling finding).
 [ "${#TIDS[@]}" -gt 0 ] && curl -s -o /dev/null -X POST "$BASE/terminals/${TIDS[0]}/submit-prompt" \
   -H 'Content-Type: application/json' -d '{"message":"/effort max"}'
-sleep 5
+sleep 3
+for tid in "${TIDS[@]}"; do
+  curl -s -o /dev/null -X POST "$BASE/terminals/$tid/submit-prompt" \
+    -H 'Content-Type: application/json' -d '{"message":"Reply with the single word: ok"}'
+done
+sleep 45
+echo "claude processes before the stop:"; own_claude_cmdlines
+for tid in "${TIDS[@]}"; do
+  echo "screen of $tid (last lines):"
+  curl -s "$BASE/terminals/$tid/buffer" | jq -r '.data.data // empty' 2>/dev/null | base64 -d 2>/dev/null \
+    | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' | tr -s '\r' '\n' | grep -av '^\s*$' | tail -6 | sed 's/^/    /'
+done
 echo "opened ${#TIDS[@]} session(s): ${TIDS[*]:-}"
 echo "lifecycle rows before the stop:"; lifecycle_rows | sed 's/^/  /'
 
@@ -239,8 +285,11 @@ else
 fi
 
 # ── F. lifecycle rows after the stop ──────────────────────────────────────────
-ROWS=$(lifecycle_rows)
-echo "lifecycle rows after the stop:"; echo "$ROWS" | sed 's/^/  /'
+echo "lifecycle rows after the stop (every row):"; lifecycle_rows | sed 's/^/  /'
+# Judged: the rows of the sessions THIS run opened. The subject may open panes
+# of its own, whose bookkeeping (e.g. superseded-terminal-reuse) predates the stop.
+ROWS=$(lifecycle_rows "${TIDS[*]:-}")
+echo "lifecycle rows of this run's sessions:"; echo "$ROWS" | sed 's/^/  /'
 if [ "$ROWS" = NO_STORE ] || [ -z "$ROWS" ]; then
   fail "no lifecycle rows to read"
 else
@@ -262,6 +311,7 @@ CRASH_AFTER=$(find "$ROOT" -name 'crash_*.txt' | wc -l)
 [ "$CRASH_AFTER" = "$CRASH_BEFORE" ] && pass "no new crash breadcrumb" || fail "crash breadcrumbs $CRASH_BEFORE -> $CRASH_AFTER"
 curl -s "$BASE/health" | grep -q '"errored"' && fail "/health reads errored" || pass "/health not errored"
 RESUMED=$(resume_ids | grep -c . || true)
+echo "claude processes after the restart:"; own_claude_cmdlines
 echo "resumed: $(resume_ids | tr '\n' ' ')"
 if [ "${#TIDS[@]}" -gt 0 ] && [ "$RESUMED" -ge "${#TIDS[@]}" ]; then
   pass "$RESUMED claude --resume process(es) for ${#TIDS[@]} session(s)"
@@ -270,19 +320,22 @@ else
 fi
 
 # ── G. the second signal ──────────────────────────────────────────────────────
-PID=$(main_pid)
-SINCE=$(date +%s)
+# Run outside systemd so the wait status is observed directly: systemd counts a
+# death by SIGTERM as a clean stop and logs no exit cause for it.
+systemctl --user stop "$UNIT" >/dev/null 2>&1
+env ${ACCOUNT:+CLAUDE_CONFIG_DIR="$ACCOUNT"} DISPLAY="$DISP" QONTINUI_INSTANCE_ROOT="$ROOT" QONTINUI_INSTANCE_NAME="sigterm-e2e-$PORT" \
+  QONTINUI_PORT="$PORT" "$BIN" >/dev/null 2>&1 &
+PID=$!
+wait_healthy || fail "subject did not come back for the second-signal check"
 T0=$(now_ms)
 kill -TERM "$PID"; sleep 0.1; kill -TERM "$PID" 2>/dev/null
-while kill -0 "$PID" 2>/dev/null && [ $(( $(now_ms) - T0 )) -lt 5000 ]; do sleep 0.02; done
+wait "$PID"; RC=$?
 GONE_MS=$(( $(now_ms) - T0 ))
-sleep 2
-JG=$(journal_since "$SINCE" | grep -E 'Main process exited|Deactivated|Failed' | tr '\n' '|')
-echo "second-signal: gone after ${GONE_MS} ms; journal: $JG"
-if [ "$GONE_MS" -lt 1000 ] && echo "$JG" | grep -q 'code=killed, status=15/TERM'; then
+echo "second-signal: gone after ${GONE_MS} ms, wait status $RC (143 = SIGTERM)"
+if [ "$GONE_MS" -lt 1000 ] && [ "$RC" = 143 ]; then
   pass "a second SIGTERM ends the process at once, by SIGTERM"
 else
-  fail "second SIGTERM: ${GONE_MS} ms, journal '$JG'"
+  fail "second SIGTERM: ${GONE_MS} ms, wait status $RC"
 fi
 
 echo "== $FAILS failure(s)"
