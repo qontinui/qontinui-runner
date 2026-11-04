@@ -165,6 +165,12 @@ export type UIBridgeRequestType =
   | "design_evaluate_diff"
   // Pixel-accurate visual regression diff
   | "image_diff"
+  // In-situ asset override — dev control (plan
+  // 2026-10-13-image-generation-and-visual-judgment, Phase 18); backs
+  // POST / DELETE / GET /ui-bridge/control/media/override.
+  | "media_override_apply"
+  | "media_override_restore"
+  | "media_override_list"
   // Annotations import
   | "annotations_import"
   // Intents NL
@@ -437,7 +443,11 @@ export type AISearchEventTypes =
 
 export type WorkflowEventTypes = "get_workflows" | "run_workflow" | "get_workflow_status";
 
-export type MediaEventTypes = "image_diff";
+export type MediaEventTypes =
+  | "image_diff"
+  | "media_override_apply"
+  | "media_override_restore"
+  | "media_override_list";
 
 export type AnnotationEventTypes =
   | "annotations_list"

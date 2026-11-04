@@ -289,14 +289,6 @@ $SKIP_ROUTES = @{
 # longer declares -- is refused before any probe, -DryRun included.
 # ---------------------------------------------------------------------------
 $SDK_AHEAD_ROUTES = @{
-    # In-situ media override (SDK 835aa75, ui-bridge 0.35.0): handlers are
-    # qontinui-runner#2311 (image plan Phase 18), not on main. The ui-bridge pin
-    # moved past 835aa75 to reach POST /control/text-visibility (ui-bridge#265).
-    # #2311 deletes these three entries, and the three sdk_only_baseline lines
-    # in mod.rs, when it lands.
-    "GET /control/media/override"    = "handlers are qontinui-runner#2311, not on main"
-    "POST /control/media/override"   = "handlers are qontinui-runner#2311, not on main"
-    "DELETE /control/media/override" = "handlers are qontinui-runner#2311, not on main"
 }
 
 # ---------------------------------------------------------------------------
