@@ -4,7 +4,13 @@
 # and fails the next link with LNK1104 / os error 5, which reads as the PR's fault.
 #
 # Called by the prep action (what an earlier job on this registration left) and by
-# ci.yml's post-smoke step (what this job left). Both call it only after the prep
+# ci.yml's post-smoke step (what this job left). It lives here, not beside the action:
+# ci-integrity.yml treats every file under .github/actions/ as gate surface that must
+# parse as YAML, and fails a non-YAML file there closed. Its exit 1 can fail the job
+# on a host fault (a process that will not stop); it judges nothing about the change
+# under test, so leaving its body unseen by ci-integrity, as every scripts/ci/
+# helper's is, costs no verdict. Both call sites stay compared there, and
+# src-tauri/tests/ci_rust_test_steps_split.rs pins that both call it. Both call it only after the prep
 # action's account check passed: a provisioned pool account with no other job running
 # under it, so "this account" means "this registration". The runner exe sits behind the ./target junction, so its
 # image path is matched under the workspace OR the persistent target behind it.

@@ -82,7 +82,7 @@ runs:
         $root = $env:QONTINUI_CI_CARGO_TARGET_ROOT
         if (-not $root) { $root = Join-Path (Split-Path -Parent $env:RUNNER_WORKSPACE) '_qontinui-cargo-target' }
         $target = Join-Path $root $env:RUNNER_NAME
-        & (Join-Path $env:GITHUB_ACTION_PATH 'stop-leftover-processes.ps1') -Workspace $env:GITHUB_WORKSPACE -TargetRoot $target -Why 'an earlier job'
+        & (Join-Path $env:GITHUB_WORKSPACE 'scripts/ci/stop-leftover-processes.ps1') -Workspace $env:GITHUB_WORKSPACE -TargetRoot $target -Why 'an earlier job'
         if ($LASTEXITCODE -ne 0) { exit 1 }
         #    a. PowerShell profiles: a pwsh / Windows PowerShell step loads the
         #       account's profile, and the account persists between jobs, so a

@@ -2068,7 +2068,7 @@ jobs:
         continue-on-error: true
         shell: pwsh -NoProfile -NonInteractive -Command ". '{0}'"
         run: |
-          & ./.github/actions/self-hosted-windows-prep/stop-leftover-processes.ps1 -Workspace $env:GITHUB_WORKSPACE -TargetRoot "$env:QONTINUI_CI_TARGET" -Why 'this job'
+          & ./scripts/ci/stop-leftover-processes.ps1 -Workspace $env:GITHUB_WORKSPACE -TargetRoot "$env:QONTINUI_CI_TARGET" -Why 'this job'
           exit $LASTEXITCODE
 
       # Plan 2026-10-27-coord-routes-ci-jobs-by-runner-capability, Phase 2:
