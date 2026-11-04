@@ -189,19 +189,43 @@ export const OPEN_TERMINAL_WINDOW_SIGNATURE: EffectSignature = {
 };
 
 /**
- * `pop-out-active-terminal` — moves the active tab into a new window. This
- * window stops owning it (`ownedTabs` in `WindowAssignmentsContext`), so its
- * `terminal-input-<id>` leaves this registry. `move-terminal-to-window` moves
- * it back.
+ * Pure core of `pop-out-active-terminal`'s prediction.
+ *
+ * The handler reassigns the active tab in the per-terminal owner map. In an
+ * unbound window that map decides, so the tab's `terminal-input-<id>` leaves
+ * this registry. In a window bound to a page, the page binding outranks the
+ * owner map (`isOwnedBy` in `WindowAssignmentsContext`), so the tab stays
+ * and nothing changes here.
  */
-export const POP_OUT_ACTIVE_TERMINAL_SIGNATURE: EffectSignature = {
-  id: "terminal-page.pop-out-active-terminal",
-  predicts: (): PredictedDelta => ({ elementsDisappear: [{ id: TERMINAL_INPUT_GLOB }] }),
-  scope: TERMINAL_ZONE_SCOPE,
-  settleMs: WINDOW_EVENT_SETTLE_MS,
-  reversibility: "reversible",
-  provenance: "declared",
-};
+export function predictPopOutActiveTerminal(thisWindowBoundPage: string | null): PredictedDelta {
+  return thisWindowBoundPage ? {} : { elementsDisappear: [{ id: TERMINAL_INPUT_GLOB }] };
+}
+
+/**
+ * `pop-out-active-terminal` moves the active tab into a new window, and
+ * `move-terminal-to-window` moves it back. `boundPage` reads this window's
+ * page binding when `predict` runs.
+ */
+export function popOutActiveTerminalSignature(boundPage: Live<string | null>): EffectSignature {
+  return {
+    id: "terminal-page.pop-out-active-terminal",
+    predicts: () => predictPopOutActiveTerminal(boundPage.current),
+    scope: TERMINAL_ZONE_SCOPE,
+    settleMs: WINDOW_EVENT_SETTLE_MS,
+    reversibility: "reversible",
+    provenance: "declared",
+  };
+}
+
+/**
+ * A value a signature reads when `predict` runs: in practice the ref
+ * `useLiveRef` keeps at the latest render. A factory takes the ref itself, not
+ * a value or a closure, because `useUIComponent` keeps the signature it was
+ * first given.
+ */
+export interface Live<T> {
+  readonly current: T;
+}
 
 /** Non-plan tabs: the ones that own a `terminal-input-*` element. */
 export function countTerminalTabs(tabs: ReadonlyArray<{ type?: string }>): number {
@@ -231,14 +255,20 @@ export function predictPopOutPage(
   return hasTabs ? { elementsDisappear: [{ id: TERMINAL_INPUT_GLOB }] } : {};
 }
 
-/** `pop-out-page`, built from the active page and its terminal count. */
-export function popOutPageSignature(
-  activePageId: string,
-  activePageTerminals: number,
-): EffectSignature {
+/** What `pop-out-page`'s prediction reads about the active page. */
+export interface ActivePageFacts {
+  activePageId: string;
+  activePageTerminals: number;
+}
+
+/** `pop-out-page`. `activePage` reads the active page when `predict` runs. */
+export function popOutPageSignature(activePage: Live<ActivePageFacts>): EffectSignature {
   return {
     id: "terminal-page.pop-out-page",
-    predicts: (params, pre) => predictPopOutPage(params, pre, activePageId, activePageTerminals),
+    predicts: (params, pre) => {
+      const { activePageId, activePageTerminals } = activePage.current;
+      return predictPopOutPage(params, pre, activePageId, activePageTerminals);
+    },
     scope: TERMINAL_ZONE_SCOPE,
     settleMs: WINDOW_EVENT_SETTLE_MS,
     reversibility: "reversible",
@@ -259,34 +289,48 @@ function currentWindowLabel(): string {
  * Pure core of `move-terminal-to-window`'s prediction, with the current
  * window label injected so it is testable without Tauri.
  *
- * The handler reassigns ONE tab's owner window. From this window's point of
- * view: a tab it renders that is sent elsewhere disappears; a tab it does not
- * render that is sent here appears; anything else is a no-op here. Missing
- * params make the handler throw before any effect, so nothing is predicted.
+ * The handler reassigns ONE tab in the per-terminal owner map, and a page
+ * binding outranks that map (`isOwnedBy` in `WindowAssignmentsContext`).
+ * - **Window bound to a page:** it renders exactly that page's tabs whatever
+ *   the map says, so nothing is predicted.
+ * - **Unbound window, tab rendered here and sent elsewhere:** the tab
+ *   disappears. A tab this window renders belongs to an unbound page, because
+ *   a bound page renders only in its own window, so the map decides.
+ * - **Unbound window, tab not rendered here and sent here:** nothing is
+ *   predicted. Its page may be bound to another window, and then it stays
+ *   there. The snapshot cannot tell, so an arriving tab reports as `Surprise`.
+ *
+ * Missing params make the handler throw before any effect, so nothing is
+ * predicted.
  */
 export function predictMoveTerminal(
   params: ActionParams,
   pre: SemanticSnapshot,
   thisWindow: string,
+  thisWindowBoundPage: string | null,
 ): PredictedDelta {
+  if (thisWindowBoundPage) return {};
   const terminalId = textParam(params, "terminalId");
   const target = textParam(params, "windowLabel");
   if (!terminalId || !target) return {};
   const elementId = `${TERMINAL_INPUT_PREFIX}${terminalId}`;
   const renderedHere = pre.elements.some((el) => el.id === elementId);
   if (renderedHere && target !== thisWindow) return { elementsDisappear: [{ id: elementId }] };
-  if (!renderedHere && target === thisWindow) return { elementsAppear: [{ id: elementId }] };
   return {};
 }
 
-export const MOVE_TERMINAL_TO_WINDOW_SIGNATURE: EffectSignature = {
-  id: "terminal-page.move-terminal-to-window",
-  predicts: (params, pre) => predictMoveTerminal(params, pre, currentWindowLabel()),
-  scope: { elementIds: [TERMINAL_INPUT_GLOB] },
-  settleMs: WINDOW_EVENT_SETTLE_MS,
-  reversibility: "reversible",
-  provenance: "declared",
-};
+/** `move-terminal-to-window`. `boundPage` reads this window's page binding. */
+export function moveTerminalSignature(boundPage: Live<string | null>): EffectSignature {
+  return {
+    id: "terminal-page.move-terminal-to-window",
+    predicts: (params, pre) =>
+      predictMoveTerminal(params, pre, currentWindowLabel(), boundPage.current),
+    scope: { elementIds: [TERMINAL_INPUT_GLOB] },
+    settleMs: WINDOW_EVENT_SETTLE_MS,
+    reversibility: "reversible",
+    provenance: "declared",
+  };
+}
 
 /** The zone-view state the maximize/restore handlers act on. */
 export interface ZoneViewFacts {
@@ -379,17 +423,18 @@ export function predictZoneView(
  * `maximize-zone` / `restore-zone` / `toggle-maximize-zone` — display state
  * only (`effect: 'read'`: never persisted, undone by its inverse). They change
  * which elements are rendered but modify none, which is what a read effect may
- * predict. Built per render from the zone view as rendered (see
- * `useZoneViewFacts`), which is the state a predict between renders sees.
+ * predict. `facts` reads the zone view as last rendered (see
+ * `useZoneViewFacts`) when `predict` runs, which is the state a predict
+ * between renders sees.
  */
 export function zoneViewSignature(
   kind: "maximize" | "restore" | "toggle",
-  facts: ZoneViewFacts,
+  facts: Live<ZoneViewFacts>,
 ): EffectSignature {
   const actionId = kind === "toggle" ? "toggle-maximize-zone" : `${kind}-zone`;
   return {
     id: `terminal-page.${actionId}`,
-    predicts: (params, pre) => predictZoneView(kind, params, pre, facts),
+    predicts: (params, pre) => predictZoneView(kind, params, pre, facts.current),
     scope: { elementIds: [ZONE_HEADER_GLOB] },
     reversibility: "reversible",
     provenance: "declared",

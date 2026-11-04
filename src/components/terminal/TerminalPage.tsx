@@ -72,15 +72,17 @@ import {
   GET_ZONE_VIEW_STATE_SIGNATURE,
   LIST_RUNNER_WINDOWS_SIGNATURE,
   LIST_TERMINALS_SIGNATURE,
-  MOVE_TERMINAL_TO_WINDOW_SIGNATURE,
   OPEN_TERMINAL_WINDOW_SIGNATURE,
-  POP_OUT_ACTIVE_TERMINAL_SIGNATURE,
   workModeSignature,
   countTerminalTabs,
+  moveTerminalSignature,
+  popOutActiveTerminalSignature,
   popOutPageSignature,
   zoneViewSignature,
 } from "./terminalPageSignatures";
 import { useZoneViewFacts } from "./useZoneViewFacts";
+import { useLiveRef } from "./useLiveRef";
+import { useWindowAssignments } from "./contexts/WindowAssignmentsContext";
 import { useTerminalInitialization, runVerifiedResume } from "./useTerminalInitialization";
 import { ResumeFailedBanner } from "./ResumeFailedBanner";
 import { RemoteRestoreBanner } from "./RemoteRestoreBanner";
@@ -298,7 +300,15 @@ function TerminalPageInner({
     session.workflowGen.setShowSidebar,
   ]);
 
-  const zoneViewFacts = useZoneViewFacts();
+  // Signatures read these when `predict` runs, never from the registering
+  // render: `useUIComponent` keeps the signature it was first given.
+  const zoneViewFactsRef = useLiveRef(useZoneViewFacts());
+  const { boundPage } = useWindowAssignments();
+  const boundPageRef = useLiveRef(boundPage);
+  const activePageRef = useLiveRef({
+    activePageId: pageId,
+    activePageTerminals: countTerminalTabs(tabs),
+  });
 
   // Register page-level UI Bridge actions so AI agents can discover
   // and invoke terminal operations without knowing element IDs.
@@ -380,7 +390,7 @@ function TerminalPageInner({
         // `write` — opens a window and MOVES the live tab into it. The PTY survives the
         // move and `move-terminal-to-window` reverses it, so dim 1 loses nothing.
         effect: "write",
-        signature: POP_OUT_ACTIVE_TERMINAL_SIGNATURE,
+        signature: popOutActiveTerminalSignature(boundPageRef),
         handler: async () => {
           if (!activeId) throw new Error("no active terminal to pop out");
           const rec = await invoke<{ label: string }>("open_terminal_window", {
@@ -402,7 +412,7 @@ function TerminalPageInner({
         // `write` — detaches a whole page (its terminals and zone layout) into a window.
         // Same reasoning as above at page granularity: the sessions are moved, not ended.
         effect: "write",
-        signature: popOutPageSignature(pageId, countTerminalTabs(tabs)),
+        signature: popOutPageSignature(activePageRef),
         // `{pageId: {}}` is TRUTHY, so it sailed past `target || pageId` and
         // reached `popOutPage` as an object — an unvalidated argument reaching
         // an effect, one rung less sharp than the PTY only because the effect
@@ -421,7 +431,7 @@ function TerminalPageInner({
         paramSchema: MOVE_TERMINAL_SCHEMA,
         // `write` — reassigns one tab's host window. Directly reversible.
         effect: "write",
-        signature: MOVE_TERMINAL_TO_WINDOW_SIGNATURE,
+        signature: moveTerminalSignature(boundPageRef),
         // `{terminalId: {}}` is truthy too, so a non-string sessionId used to
         // reach the `assign_session_to_window` Tauri command and the refusal
         // came from serde, in Rust's words.
@@ -457,7 +467,7 @@ function TerminalPageInner({
         // `read` — display state only: `maximizedZone` is plain `useState` in
         // useZoneLayout, never persisted, and restore-zone undoes it without trace.
         effect: "read",
-        signature: zoneViewSignature("maximize", zoneViewFacts),
+        signature: zoneViewSignature("maximize", zoneViewFactsRef),
         // Guarded like its siblings: `planMaximizeZone` validates the VALUE,
         // and the guard refuses a non-object bag and an undeclared key, which
         // the old cast dropped in silence.
@@ -481,7 +491,7 @@ function TerminalPageInner({
           "Leave the maximized view and return to the tiled layout. No params. Returns { maximizedZone: null, previousMaximizedZone, zoneCount, changed } — `changed: false` means nothing was maximized.",
         // `read` — the inverse view toggle; same in-memory `maximizedZone`.
         effect: "read",
-        signature: zoneViewSignature("restore", zoneViewFacts),
+        signature: zoneViewSignature("restore", zoneViewFactsRef),
         handler: async () => {
           const { maximizedZone, zoneCount, setMaximizedZone } = zoneMaximizeRef.current;
           setMaximizedZone(null);
@@ -496,7 +506,7 @@ function TerminalPageInner({
         paramSchema: ZONE_INDEX_SCHEMA,
         // `read` — maximize-zone or restore-zone by the keyboard rule; display state.
         effect: "read",
-        signature: zoneViewSignature("toggle", zoneViewFacts),
+        signature: zoneViewSignature("toggle", zoneViewFactsRef),
         // The ref is read when the ACTION is invoked, never during render:
         // `guardedHandler` only stores `run`. The compiler cannot see through
         // the call, so it reports the closure as a render-time ref read.

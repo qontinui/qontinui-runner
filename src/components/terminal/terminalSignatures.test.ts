@@ -15,7 +15,9 @@ import {
   CREATE_TERMINAL_SIGNATURE,
   LAUNCH_CREATE_PLAIN_SIGNATURE,
   predictMoveTerminal,
+  predictPopOutActiveTerminal,
   predictPopOutPage,
+  zoneViewSignature,
   predictWorkMode,
   predictZoneView,
   PTY_SPAWN_SETTLE_MS,
@@ -25,6 +27,7 @@ import {
   loadProfileSignature,
   predictLoadProfile,
   predictSelectLayout,
+  selectLayoutSignature,
 } from "./zonePickerSignatures";
 import type { ZoneProfile } from "./zoneProfileStorage";
 
@@ -58,7 +61,7 @@ describe("spawn signatures", () => {
   it("spawns wait out the PTY spawn settle window, not the SDK fallback band", () => {
     expect(LAUNCH_CREATE_PLAIN_SIGNATURE.settleMs).toBe(PTY_SPAWN_SETTLE_MS);
     expect(CREATE_TERMINAL_SIGNATURE.settleMs).toBe(PTY_SPAWN_SETTLE_MS);
-    expect(loadProfileSignature({}, 0).settleMs).toBe(PTY_SPAWN_SETTLE_MS);
+    expect(loadProfileSignature({ current: { profiles: {}, liveTabCount: 0 } }).settleMs).toBe(PTY_SPAWN_SETTLE_MS);
     expect(PTY_SPAWN_SETTLE_MS).toBeGreaterThanOrEqual(1000);
   });
 });
@@ -81,26 +84,75 @@ describe("pop-out-page", () => {
 });
 
 describe("move-terminal-to-window", () => {
-  it("a tab rendered here and sent elsewhere disappears", () => {
+  it("in an unbound window, a tab rendered here and sent elsewhere disappears", () => {
     expect(
-      predictMoveTerminal(p({ terminalId: "a", windowLabel: "term-1" }), GRID, "main"),
+      predictMoveTerminal(p({ terminalId: "a", windowLabel: "term-1" }), GRID, "main", null),
     ).toEqual({ elementsDisappear: [{ id: "terminal-input-a" }] });
   });
 
-  it("a tab not rendered here and sent here appears", () => {
-    expect(predictMoveTerminal(p({ terminalId: "z", windowLabel: "main" }), GRID, "main")).toEqual({
-      elementsAppear: [{ id: "terminal-input-z" }],
-    });
+  it("a tab sent here is not predicted: its page may be bound to another window", () => {
+    expect(
+      predictMoveTerminal(p({ terminalId: "z", windowLabel: "main" }), GRID, "main", null),
+    ).toEqual({});
+  });
+
+  it("in a page-bound window the binding outranks the move, so nothing changes", () => {
+    expect(
+      predictMoveTerminal(p({ terminalId: "a", windowLabel: "main" }), GRID, "term-1", "page-1"),
+    ).toEqual({});
   });
 
   it("a move that does not touch this window, or a refused bag, predicts nothing", () => {
-    expect(predictMoveTerminal(p({ terminalId: "a", windowLabel: "main" }), GRID, "main")).toEqual(
-      {},
-    );
     expect(
-      predictMoveTerminal(p({ terminalId: "z", windowLabel: "term-2" }), GRID, "main"),
+      predictMoveTerminal(p({ terminalId: "a", windowLabel: "main" }), GRID, "main", null),
     ).toEqual({});
-    expect(predictMoveTerminal(p({ terminalId: "a" }), GRID, "main")).toEqual({});
+    expect(
+      predictMoveTerminal(p({ terminalId: "z", windowLabel: "term-2" }), GRID, "main", null),
+    ).toEqual({});
+    expect(predictMoveTerminal(p({ terminalId: "a" }), GRID, "main", null)).toEqual({});
+  });
+});
+
+describe("pop-out-active-terminal", () => {
+  it("leaves an unbound window, and stays in a page-bound one", () => {
+    expect(predictPopOutActiveTerminal(null)).toEqual({
+      elementsDisappear: [{ id: "terminal-input-*" }],
+    });
+    expect(predictPopOutActiveTerminal("page-1")).toEqual({});
+  });
+});
+
+describe("signatures read live state when predict runs, not when they were built", () => {
+  // `useUIComponent` keeps the signature object it was first given, so a
+  // value captured at build time would stay at its mount-time value forever.
+  it("load-profile sees profiles loaded after the signature was built", () => {
+    const live = { current: { profiles: {} as Record<string, ZoneProfile>, liveTabCount: 0 } };
+    const sig = loadProfileSignature(live);
+    live.current = {
+      profiles: { p: { sessions: [{}, {}] } as unknown as ZoneProfile },
+      liveTabCount: 0,
+    };
+    expect(sig.predicts(p({ name: "p" }), GRID)).toEqual({
+      elementsAppear: [{ id: "terminal-input-*" }],
+    });
+  });
+
+  it("select-layout sees the tab count at predict time", () => {
+    const tabs = { current: 0 };
+    const sig = selectLayoutSignature(tabs);
+    tabs.current = 3;
+    expect(sig.predicts(p({ layoutId: "single" }), GRID)).toEqual({});
+  });
+
+  it("restore-zone sees a zone maximized after the signature was built", () => {
+    const facts = {
+      current: { maximizedZone: null as number | null, zoneCount: 4, labelledZonesWhenTiled: 2 },
+    };
+    const sig = zoneViewSignature("restore", facts);
+    facts.current = { ...facts.current, maximizedZone: 1 };
+    expect(sig.predicts(p({}), GRID)).toEqual({
+      elementsAppear: [{ id: "terminal-zone-header-*" }],
+    });
   });
 });
 

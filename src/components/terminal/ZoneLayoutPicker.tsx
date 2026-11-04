@@ -11,6 +11,7 @@ import { useUIComponent, UIBridgeComponentScope } from "@qontinui/ui-bridge";
 import { callRegistry, readTextArg, textArg } from "./commands";
 import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
 import { usePageSessionGetter, useTerminalSession } from "./contexts";
+import { useLiveRef } from "./useLiveRef";
 import {
   GET_PAGE_LAYOUT_SIGNATURE,
   LIST_LAYOUTS_SIGNATURE,
@@ -103,6 +104,8 @@ export function ZoneLayoutPicker({
   const getPageSession = usePageSessionGetter();
   const { pageId: activePageId } = useTerminalSession();
   const dropdownRef = useRef<HTMLDivElement>(null);
+  // Read by `select-layout`'s signature when `predict` runs (see `useLiveRef`).
+  const tabCountRef = useLiveRef(tabCount);
 
   useEffect(() => {
     if (!open) return;
@@ -145,7 +148,7 @@ export function ZoneLayoutPicker({
         // terminal is ended: `applyLayout` preserves in-range assignments and only
         // compacts out-of-range ones, and auto-grow re-expands to fit live tabs.
         effect: "write",
-        signature: selectLayoutSignature(tabCount),
+        signature: selectLayoutSignature(tabCountRef),
         // `{layoutId: {}}` is truthy, so it passed `if (!layoutId)` and was
         // stringified into the operator-facing sentence as
         // `Unknown layoutId: "[object Object]"`; `{layoutId: []}` rendered the

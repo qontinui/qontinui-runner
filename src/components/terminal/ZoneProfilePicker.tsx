@@ -16,6 +16,7 @@ import {
   type ZoneSessionInfo,
 } from "./zoneProfileStorage";
 import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
+import { useLiveRef } from "./useLiveRef";
 import { textArg } from "./commands";
 import {
   DELETE_PROFILE_SIGNATURE,
@@ -69,6 +70,8 @@ export function ZoneProfilePicker({
 }: ZoneProfilePickerProps) {
   const [open, setOpen] = useState(false);
   const [profiles, setProfiles] = useState<Record<string, ZoneProfile>>({});
+  // Read by `load-profile`'s signature when `predict` runs (see `useLiveRef`).
+  const loadProfileFactsRef = useLiveRef({ profiles, liveTabCount: tabs?.length ?? 0 });
   const [saveName, setSaveName] = useState("");
   const [showSaveInput, setShowSaveInput] = useState(false);
   const [activeProfileName, setActiveProfileName] = useState<string | null>(null);
@@ -257,7 +260,7 @@ export function ZoneProfilePicker({
         // them. Dim 1: the arrangement it overwrites was never saved anywhere. Dim 3: it
         // widens or narrows auto-approval silently, which is the worst quadrant.
         effect: "destructive",
-        signature: loadProfileSignature(profiles, tabs?.length ?? 0),
+        signature: loadProfileSignature(loadProfileFactsRef),
         // `{name: {}}` used to reach the "Profile not found" sentence as
         // `Profile not found: "[object Object]"` — an operator-facing message
         // quoting a stringified object back as though it had been typed.
