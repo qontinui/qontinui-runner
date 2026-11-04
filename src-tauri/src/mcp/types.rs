@@ -9,6 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 
 use crate::action_service::UnifiedActionService;
@@ -66,6 +67,81 @@ pub fn get_mcp_api_port() -> u16 {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(MCP_API_PORT)
+}
+
+/// Process-global bound runner API port. `0` = not yet bound.
+///
+/// Set once by `mcp_api::start_server` immediately after the listener binds,
+/// at the same place `app_state.api_port` lands. It exists for readers that
+/// have no `app_state`: the install-interception shim's terminal env-seam
+/// (`TerminalManager::create` → `TerminalSession::spawn` does not carry it),
+/// and the health monitor's `/livez` self-probe, which runs on its own OS
+/// thread from before `AppState` exists (plan
+/// `2026-11-04-runner-wedge-detector-reads-a-boot-as-a-wedge-and-never-bound-is-silent`,
+/// D3 — it moved here from `install_effects_producer::intercept` for that
+/// second reader). The bind can fall back off the configured port
+/// (`instance::api_ports_to_try`), so once this is set the configured port is
+/// the wrong one to dial.
+static BOUND_PORT: AtomicU16 = AtomicU16::new(0);
+
+/// Record the actually-bound runner API port. Called from `mcp_api.rs` right
+/// after `app_state.api_port.store(...)`.
+///
+/// This is the plain atomic store its name says, and nothing else. The
+/// OUT-of-process breadcrumb (plan
+/// `2026-07-17-universal-coord-device-identity-for-any-session` §4) is
+/// published one line later by the only production caller, the bind-success
+/// arm of `mcp_api::start_server`, together with the per-port loopback
+/// handshake key path the record must name. With no side effect here, the bin
+/// crate's unit tests can call this with synthetic ports safely. See
+/// `qontinui_runner_lib::runner_breadcrumb`.
+pub fn set_bound_port(port: u16) {
+    BOUND_PORT.store(port, Ordering::Relaxed);
+}
+
+/// The port the listener actually bound, or `None` before the bind.
+///
+/// The raw reading, for a caller whose question is "has the listener bound
+/// yet?" — the never-answered wedge arm tells `never_bound` from
+/// `bound_never_answered` with it. A caller that wants a port to dial uses
+/// [`bound_port`].
+pub fn recorded_bound_port() -> Option<u16> {
+    match BOUND_PORT.load(Ordering::Relaxed) {
+        0 => None,
+        p => Some(p),
+    }
+}
+
+/// The bound runner API port, falling back to the bootstrap port
+/// ([`get_mcp_api_port`]) before the bind has recorded one.
+pub fn bound_port() -> u16 {
+    recorded_bound_port().unwrap_or_else(get_mcp_api_port)
+}
+
+/// Test-only RAII restore for [`BOUND_PORT`].
+///
+/// Captures the RAW atomic, which [`bound_port`] cannot give back: that reader
+/// substitutes the bootstrap port when the atomic is `0`, so "save the current
+/// value and put it back" via `bound_port()` writes a fabricated non-zero port
+/// over the genuine not-yet-bound state and destroys it for the rest of the
+/// test binary. Restoring on `Drop` also covers the unwind path — a failing
+/// assertion would otherwise leave a scratch port behind and turn one real
+/// failure into a cascade of unrelated ones.
+#[cfg(test)]
+pub(crate) struct BoundPortRestore(u16);
+
+#[cfg(test)]
+impl BoundPortRestore {
+    pub(crate) fn capture() -> Self {
+        Self(BOUND_PORT.load(Ordering::Relaxed))
+    }
+}
+
+#[cfg(test)]
+impl Drop for BoundPortRestore {
+    fn drop(&mut self) {
+        BOUND_PORT.store(self.0, Ordering::Relaxed);
+    }
 }
 
 /// The ONE address the runner's HTTP API listens on: the IPv4 loopback.
@@ -1050,5 +1126,27 @@ mod loopback_base_url_tests {
             crate::api_config::get_ipc_response_url(),
             "http://127.0.0.1:9877/ui-bridge/ipc-response"
         );
+    }
+}
+
+#[cfg(test)]
+mod bound_port_tests {
+    use super::*;
+
+    #[test]
+    fn bound_port_roundtrips_and_falls_back() {
+        // `BOUND_PORT` is process-global and the fallback arm reads
+        // `QONTINUI_PORT`; the env lock serializes the tests that assert a
+        // specific port value (they opt in to it).
+        let _env_lock = crate::test_env::env_lock();
+        let _restore = BoundPortRestore::capture();
+
+        set_bound_port(54321);
+        assert_eq!(bound_port(), 54321);
+        assert_eq!(recorded_bound_port(), Some(54321));
+        set_bound_port(0);
+        assert_eq!(recorded_bound_port(), None);
+        // Falls back to the bootstrap port (non-zero) when unset.
+        assert_ne!(bound_port(), 0);
     }
 }
