@@ -1064,20 +1064,27 @@ function classifyCallSite(call: ts.CallExpression, sf: ts.SourceFile): HandlerCa
  * to regenerate the golden without reading it — the one thing the assertion
  * below asks a reader not to do. It also made every concurrent UI PR conflict
  * with every other on this file, and guaranteed a re-break on merge order.
- * The three sibling goldens in `commands/__golden__/` (2,696 rows between
- * them) already key on stable identifiers; this was the only line-keyed one.
+ * The sibling goldens in `src/components/terminal/commands/__golden__/`
+ * already key on stable identifiers; this was the only line-keyed one.
  *
- * Duplicate rows are KEPT, never deduped: three (file, form, position, id)
- * tuples legitimately occur twice in the tree (two `click` builtins in one
- * panel, and so on), so folding them would lose the count and a second
- * identical surface would land silently. Because the comparison is over the
+ * Duplicate rows are KEPT, never deduped: several (file, form, position, id)
+ * tuples legitimately repeat in the tree (several `click` builtins in one
+ * panel, and so on; list them with
+ * `grep -v '^#' action-surfaces.txt | sort | uniq -d`), so
+ * folding them would lose the count and another identical surface would land
+ * silently. Because the comparison is over the
  * whole rendered document, N identical rows and N-1 identical rows are
  * different documents — which is exactly the property that makes an added
  * surface visible without a line number or an occurrence ordinal.
  *
- * Rows stay in discovery order (walk order, then source order within a file),
- * so an insertion above a surface moves nothing: the surfaces' order relative
- * to each other is what is recorded, and that does not change.
+ * Rows are ordered by file, then by line within a file (`scanTree` sorts
+ * them), so an insertion above a surface moves nothing: the surfaces' order
+ * relative to each other is what is recorded, and that does not change.
+ *
+ * What this gives up: moving a surface within its file without passing
+ * another surface, or removing one of several identical surfaces in a file
+ * and adding it back elsewhere in the same file, no longer changes the
+ * golden. A move past a different surface still swaps their rows.
  *
  * To find a surface the inventory names, grep its id — `actionSurfaces.ts`
  * still carries `line` on every `ActionSurface` at runtime for callers that
@@ -1107,7 +1114,8 @@ export function renderInventory(surfaces: ActionSurface[]): string {
   lines.push("");
   for (const s of surfaces) {
     // No `:${s.line}` — see this function's doc comment. Reintroducing it is
-    // pinned red by `the golden carries no line coordinate`.
+    // pinned red by "carries no line coordinate, so an edit ABOVE a surface
+    // cannot red it" in actionSurfaces.enforcement.test.ts.
     lines.push(
       `${s.file}\t${s.form}\t${s.position}\t${s.id ?? "-"}\t` +
         `schema=${s.hasParamSchema ? "yes" : "no"}\tarity=${s.handlerArity ?? "-"}\t` +
