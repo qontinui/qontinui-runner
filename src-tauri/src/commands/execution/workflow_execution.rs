@@ -9,7 +9,9 @@ use tracing::{debug, info};
 
 use super::super::compartments::{BridgeCompartment, ExecutionCompartment};
 use super::super::CommandResponse;
-use crate::executor::{require_running_bridge_compartment, with_default_bridge_compartment};
+use crate::executor::{
+    require_running_bridge_compartment, run_bridge_blocking, with_default_bridge_compartment,
+};
 
 /// Start workflow execution.
 ///
@@ -33,17 +35,45 @@ use crate::executor::{require_running_bridge_compartment, with_default_bridge_co
 /// # Returns
 /// * `Ok(CommandResponse)` - Success message
 /// * `Err(String)` - Error if executor not running or workflow ID missing
+///
+/// `async` with a blocking body: every command here waits on the bridge, and a
+/// sync command would wait on the main thread (plan
+/// `2026-11-04-runner-wedge-detector-reads-a-boot-as-a-wedge-and-never-bound-is-silent`
+/// Phase 3).
 #[tauri::command]
-pub fn start_execution(
+pub async fn start_execution(
     process_id: Option<String>,
     monitor_indices: Option<Vec<i32>>,
     monitor_index: Option<i32>, // Legacy single monitor support
     initial_state_ids: Option<Vec<String>>, // Override for initial active states
-    bridge: State<BridgeCompartment>,
-    execution: State<ExecutionCompartment>,
+    bridge: State<'_, BridgeCompartment>,
+    execution: State<'_, ExecutionCompartment>,
+) -> Result<CommandResponse, String> {
+    let bridge = bridge.inner().clone();
+    let execution = execution.inner().clone();
+    run_bridge_blocking(move || {
+        start_execution_blocking(
+            process_id,
+            monitor_indices,
+            monitor_index,
+            initial_state_ids,
+            &bridge,
+            &execution,
+        )
+    })
+    .await?
+}
+
+fn start_execution_blocking(
+    process_id: Option<String>,
+    monitor_indices: Option<Vec<i32>>,
+    monitor_index: Option<i32>,
+    initial_state_ids: Option<Vec<String>>,
+    bridge: &BridgeCompartment,
+    execution: &ExecutionCompartment,
 ) -> Result<CommandResponse, String> {
     // Check if executor is running first
-    require_running_bridge_compartment(&bridge)?;
+    require_running_bridge_compartment(bridge)?;
 
     // Build params
     let mut params = serde_json::Map::new();
@@ -87,7 +117,7 @@ pub fn start_execution(
         debug!("Using initial state IDs: {:?}", resolved_initial_states);
     }
 
-    with_default_bridge_compartment(&bridge, |bridge| {
+    with_default_bridge_compartment(bridge, |bridge| {
         bridge
             .start_execution_with_params(Some(serde_json::Value::Object(params)))
             .map_err(|e| format!("Failed to start execution: {}", e))
@@ -111,8 +141,15 @@ pub fn start_execution(
 /// * `Ok(CommandResponse)` - Success message
 /// * `Err(String)` - Error if executor not initialized or stop fails
 #[tauri::command]
-pub fn stop_execution(bridge: State<BridgeCompartment>) -> Result<CommandResponse, String> {
-    with_default_bridge_compartment(&bridge, |bridge| {
+pub async fn stop_execution(
+    bridge: State<'_, BridgeCompartment>,
+) -> Result<CommandResponse, String> {
+    let bridge = bridge.inner().clone();
+    run_bridge_blocking(move || stop_execution_blocking(&bridge)).await?
+}
+
+fn stop_execution_blocking(bridge: &BridgeCompartment) -> Result<CommandResponse, String> {
+    with_default_bridge_compartment(bridge, |bridge| {
         bridge
             .stop_execution()
             .map_err(|e| format!("Failed to stop execution: {}", e))
@@ -136,8 +173,15 @@ pub fn stop_execution(bridge: State<BridgeCompartment>) -> Result<CommandRespons
 /// * `Ok(CommandResponse)` - Success message
 /// * `Err(String)` - Error if executor not initialized or pause fails
 #[tauri::command]
-pub fn pause_execution(bridge: State<BridgeCompartment>) -> Result<CommandResponse, String> {
-    with_default_bridge_compartment(&bridge, |bridge| {
+pub async fn pause_execution(
+    bridge: State<'_, BridgeCompartment>,
+) -> Result<CommandResponse, String> {
+    let bridge = bridge.inner().clone();
+    run_bridge_blocking(move || pause_execution_blocking(&bridge)).await?
+}
+
+fn pause_execution_blocking(bridge: &BridgeCompartment) -> Result<CommandResponse, String> {
+    with_default_bridge_compartment(bridge, |bridge| {
         bridge
             .pause_execution()
             .map_err(|e| format!("Failed to pause execution: {}", e))
@@ -161,8 +205,15 @@ pub fn pause_execution(bridge: State<BridgeCompartment>) -> Result<CommandRespon
 /// * `Ok(CommandResponse)` - Success message
 /// * `Err(String)` - Error if executor not initialized or resume fails
 #[tauri::command]
-pub fn resume_execution(bridge: State<BridgeCompartment>) -> Result<CommandResponse, String> {
-    with_default_bridge_compartment(&bridge, |bridge| {
+pub async fn resume_execution(
+    bridge: State<'_, BridgeCompartment>,
+) -> Result<CommandResponse, String> {
+    let bridge = bridge.inner().clone();
+    run_bridge_blocking(move || resume_execution_blocking(&bridge)).await?
+}
+
+fn resume_execution_blocking(bridge: &BridgeCompartment) -> Result<CommandResponse, String> {
+    with_default_bridge_compartment(bridge, |bridge| {
         bridge
             .resume_execution()
             .map_err(|e| format!("Failed to resume execution: {}", e))

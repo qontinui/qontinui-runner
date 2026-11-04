@@ -9,6 +9,11 @@
 //!
 //! The BridgeManager uses std::sync::RwLock for its bridges map, so we can
 //! access bridges directly from any thread without needing async operations.
+//! That map lock is held only to look a bridge up; the closures below run
+//! under the bridge's own lock (`bridge_manager::BridgeHandle`).
+//!
+//! Everything here BLOCKS. Never call it from the main thread; a Tauri command
+//! that needs it is `async` and goes through [`run_bridge_blocking`].
 
 #![allow(dead_code)]
 
@@ -75,25 +80,40 @@ where
         .default_bridge_id_sync()
         .ok_or_else(|| NO_BRIDGE_ERROR.to_string())?;
 
-    let bid = super::gui_lock::BridgeId::from_string(bridge_id);
-    let mut bridges = manager.bridges.write().unwrap();
+    // Clone the per-bridge handle and release the map lock BEFORE running the
+    // closure, so a long call here never blocks map-level reads.
+    let handle = manager
+        .bridge_handle(&bridge_id)
+        .ok_or_else(|| NO_BRIDGE_ERROR.to_string())?;
 
-    if let Some(managed) = bridges.get_mut(&bid) {
+    handle.with(|bridge| {
         // Run the async closure on a scoped thread so the caller remains
         // free of any tokio context.
-        let bridge = &mut managed.bridge;
         std::thread::scope(|s| {
-            s.spawn(|| {
-                // SAFETY: The scoped thread borrows `bridge` which is valid
-                // for the duration of the scope.
-                Ok(tauri::async_runtime::block_on(f(bridge)))
-            })
-            .join()
-            .expect("Bridge async operation thread panicked")
+            s.spawn(|| tauri::async_runtime::block_on(f(bridge)))
+                .join()
+                .expect("Bridge async operation thread panicked")
         })
-    } else {
-        Err(NO_BRIDGE_ERROR.to_string())
-    }
+    })
+}
+
+/// Run a blocking bridge operation off the calling thread.
+///
+/// Tauri 2 runs a SYNC `#[tauri::command]` on the main (UI) thread, and every
+/// bridge helper here can wait: on the per-bridge lock while another caller's
+/// `send_command_and_wait` is in flight (up to its timeout), or on the Python
+/// round-trip itself. A command that touches the bridge is therefore `async`
+/// and runs its body through this, which keeps the main thread pumping (plan
+/// `2026-11-04-runner-wedge-detector-reads-a-boot-as-a-wedge-and-never-bound-is-silent`
+/// Phase 3: the post-boot ~45 s UI-thread freeze).
+pub async fn run_bridge_blocking<F, R>(f: F) -> Result<R, String>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(f)
+        .await
+        .map_err(|e| format!("Bridge task failed: {}", e))
 }
 
 /// Check if the default bridge is running (synchronous wrapper).
@@ -295,3 +315,99 @@ pub fn require_running_bridge_compartment(compartment: &BridgeCompartment) -> Re
 /// ```
 #[doc(hidden)]
 pub fn _migration_example() {}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    /// Calls that wait on a bridge (its per-bridge lock, or a Python round-trip).
+    const BRIDGE_CALLS: &[&str] = &[
+        "with_default_bridge",
+        "with_bridge",
+        "is_default_bridge_running",
+        "require_running_bridge",
+        "get_or_create_default_bridge",
+        "start_default_bridge",
+        "stop_default_bridge",
+        "get_default_bridge_state",
+        "get_bridge_manager",
+    ];
+
+    fn visit(dir: &Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push((path.clone(), std::fs::read_to_string(&path).unwrap()));
+            }
+        }
+    }
+
+    /// Tauri 2 runs a SYNC `#[tauri::command]` on the main thread, so a sync
+    /// command that waits on the bridge freezes the window for as long as the
+    /// bridge is busy: the ~45 s post-boot freeze of plan
+    /// `2026-11-04-runner-wedge-detector-reads-a-boot-as-a-wedge-and-never-bound-is-silent`
+    /// Phase 3 was `start_python_executor`. Such a command must be `async` and
+    /// run its body through `run_bridge_blocking`. This pins it source-wide.
+    /// (It sees direct calls in the command body only, not calls through a
+    /// helper the command invokes.)
+    #[test]
+    fn no_sync_tauri_command_waits_on_the_bridge() {
+        let mut files = Vec::new();
+        visit(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+
+        let mut commands_seen = 0;
+        let mut offenders = Vec::new();
+        for (path, text) in &files {
+            let lines: Vec<&str> = text.lines().collect();
+            for i in 0..lines.len() {
+                if !lines[i].trim_start().starts_with("#[tauri::command") {
+                    continue;
+                }
+                let mut j = i + 1;
+                while j < lines.len() && {
+                    let t = lines[j].trim_start();
+                    t.starts_with("#[") || t.starts_with("//")
+                } {
+                    j += 1;
+                }
+                if j >= lines.len() {
+                    continue;
+                }
+                commands_seen += 1;
+                if lines[j].contains("async fn") {
+                    continue;
+                }
+                // The body runs to the first column-0 closing brace.
+                let mut body = String::new();
+                for line in &lines[j..] {
+                    body.push_str(line);
+                    body.push('\n');
+                    if line.starts_with('}') {
+                        break;
+                    }
+                }
+                if BRIDGE_CALLS.iter().any(|c| body.contains(c)) {
+                    offenders.push(format!("{}:{}", path.display(), j + 1));
+                }
+            }
+        }
+
+        // Positive control: the scan must actually be finding commands.
+        assert!(
+            commands_seen > 50,
+            "scan found only {} tauri commands; the walker is broken",
+            commands_seen
+        );
+        assert!(
+            offenders.is_empty(),
+            "sync #[tauri::command]s that wait on the Python bridge (run on the \
+             main thread; make them async + run_bridge_blocking): {:#?}",
+            offenders
+        );
+    }
+}

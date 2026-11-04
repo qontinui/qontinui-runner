@@ -429,10 +429,15 @@ pub async fn capture_and_upload_screenshot(
 /// # Arguments
 /// * `monitor` - Monitor index (0-based)
 /// * `state` - Application state containing the Python bridge
+///
+/// `async` with a blocking body: it waits on the bridge, and a sync command
+/// would wait on the main thread (plan
+/// `2026-11-04-runner-wedge-detector-reads-a-boot-as-a-wedge-and-never-bound-is-silent`
+/// Phase 3).
 #[tauri::command]
-pub fn capture_screenshot_via_python(
+pub async fn capture_screenshot_via_python(
     monitor: Option<i32>,
-    bridge: State<BridgeCompartment>,
+    bridge: State<'_, BridgeCompartment>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Capturing screenshot via Python bridge for monitor: {:?}",
@@ -441,7 +446,17 @@ pub fn capture_screenshot_via_python(
 
     let bridge_clone = bridge.inner().clone();
 
-    with_default_bridge_compartment(&bridge_clone, |bridge| {
+    crate::executor::run_bridge_blocking(move || {
+        capture_screenshot_via_python_blocking(monitor, &bridge_clone)
+    })
+    .await?
+}
+
+fn capture_screenshot_via_python_blocking(
+    monitor: Option<i32>,
+    bridge_clone: &BridgeCompartment,
+) -> Result<CommandResponse, String> {
+    with_default_bridge_compartment(bridge_clone, |bridge| {
         if !bridge.is_running() {
             return Err("Python executor not running".to_string());
         }
