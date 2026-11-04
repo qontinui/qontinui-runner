@@ -278,7 +278,8 @@ STRICT="${QONTINUI_PREPUSH_STRICT:-0}"
 # DELIBERATE. gen-events-drift.sh truthfully tells you CI does NOT cover its TS
 # domain. Here the reverse is true and verified: ci.yml runs
 # `cargo fmt -- --check` and `cargo clippy` inside the REQUIRED
-# `test (ubuntu-22.04)` context, plus a parallel `clippy-windows` job. Copying
+# `test (ubuntu-22.04)` context, plus a parallel `clippy-windows` job (check
+# context `Clippy (windows)`, run with `--all-targets`). Copying
 # the sibling's wording would tell developers they are unprotected when they
 # are not.
 cannot_evaluate() {
@@ -299,7 +300,8 @@ cannot_evaluate() {
   echo "[pre-push]   Coverage while this is unresolved: CI STILL GATES BOTH HALVES." >&2
   echo "[pre-push]   ci.yml runs 'cargo fmt -- --check' and 'cargo clippy' inside the" >&2
   echo "[pre-push]   required 'test (ubuntu-22.04)' context, plus a parallel" >&2
-  echo "[pre-push]   'clippy-windows' job. Declining here costs LATENCY, NOT COVERAGE:" >&2
+  echo "[pre-push]   'Clippy (windows)' check (which also lints test targets)." >&2
+  echo "[pre-push]   Declining here costs LATENCY, NOT COVERAGE:" >&2
   echo "[pre-push]   you lose the 60-90s local signal, not the gate itself." >&2
   if [[ "$STRICT" == "1" ]]; then
     echo "[pre-push]   QONTINUI_PREPUSH_STRICT=1 — treating this as a failure." >&2
