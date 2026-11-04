@@ -3387,6 +3387,9 @@ impl BrowserPairPage {
         use crate::web_origin::{WebFrontendSource, WEB_FRONTEND_BASE_ENV};
         match &self.frontend_source {
             WebFrontendSource::EnvOverride => format!("${WEB_FRONTEND_BASE_ENV} override"),
+            WebFrontendSource::SettingOverride => {
+                "runner setting web_integration.web_base_url".to_string()
+            }
             WebFrontendSource::DerivedFromApiBase { api_base } => format!(
                 "web frontend derived from API base {api_base}, itself from the {}; set ${} \
                  to override (local dev: http://localhost:3001)",
@@ -3414,7 +3417,7 @@ pub fn resolve_browser_pair_page(
 ) -> BrowserPairPage {
     let (api_base, api_source) = resolve_cli_web_base(web_base_env, profile);
     let (frontend_base, frontend_source) =
-        crate::web_origin::resolve_web_frontend_base(frontend_env, &api_base);
+        crate::web_origin::resolve_web_frontend_base(frontend_env, None, &api_base);
     BrowserPairPage {
         page_url: format!("{frontend_base}/connect-runner"),
         frontend_base,

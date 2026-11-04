@@ -1875,9 +1875,14 @@ pub struct WebIntegrationSettings {
     pub backend_url: String,
 
     /// Optional override for the Next.js web frontend origin — the host that
-    /// serves user-facing pages like `/connect-runner`. When unset, falls
-    /// back to `backend_url`. Only needed in split local-dev setups where
-    /// the API (8000) and SPA (3001) run on different ports.
+    /// serves user-facing pages like `/connect-runner-github`. When unset,
+    /// the origin is derived from the RESOLVED API base (`backend_url`, or
+    /// whatever env/profile rung `api_config` picked) by
+    /// `web_origin::derive_web_base_url` (`https://api.X` → `https://X`;
+    /// any other host unchanged). `$QONTINUI_WEB_FRONTEND_BASE` overrides it
+    /// (`web_origin::resolve_web_frontend_base`). Only needed in split
+    /// local-dev setups where the API (8000) and SPA (3001) run on different
+    /// ports.
     /// No trailing slash required.
     #[serde(default)]
     pub web_base_url: Option<String>,
