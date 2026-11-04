@@ -195,7 +195,8 @@ describe("differential harness — golden snapshot", () => {
       deltas.length,
       `The pipeline no longer behaves the way the golden snapshot records.\n` +
         `If the change is intended, regenerate it — the DIFF is the review artifact:\n` +
-        `  node scripts/terminal-command-corpus.mjs --update\n\n` +
+        `  node scripts/terminal-command-corpus.mjs --update\n` +
+        `inputs: committed golden ${committed.size}, current ${current.size}\n\n` +
         formatDelta(deltas, "committed golden", "current"),
     ).toBe(0);
   });

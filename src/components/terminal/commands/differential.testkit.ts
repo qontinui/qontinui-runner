@@ -357,8 +357,17 @@ const HEADER = [
   "# realRegistry.testkit.ts moving instead — check that first.",
 ];
 
+/**
+ * The header names the TIER but not the input count: the count is
+ * recomputable from the rows, and as a checked-in cell it was rewritten by
+ * every PR that added a pattern, so two such PRs conflicted on it whatever
+ * rows they touched. The golden test prints both sides' counts in its failure
+ * message instead. Plan
+ * `2026-11-04-runner-generated-and-ledger-files-are-merge-neutral-and-land-behind-a-drain`,
+ * Phase 1b.
+ */
 export function formatSnapshot(snapshot: Snapshot, tier: string): string {
-  const lines = [...HEADER, `# tier: ${tier}   inputs: ${snapshot.size}`, ""];
+  const lines = [...HEADER, `# tier: ${tier}`, ""];
   for (const input of Array.from(snapshot.keys()).sort()) {
     const r = snapshot.get(input) as OutcomeRecord;
     lines.push(`${input}\t${r.route}\t${r.actionId}\t${r.args}\t${r.verdict}\t${r.status}`);

@@ -31,7 +31,7 @@
 # A row changing action or args is a semantic change and needs a reason in
 # the PR. A row changing only its verdict may be the stubbed context in
 # realRegistry.testkit.ts moving instead — check that first.
-# tier: golden   inputs: 3196
+# tier: golden
 
 /1-plus-4 layout	pattern	terminal.layout	[["preset","1-plus-4"]]	ok	ok /layout ✓ changed 1 layout — 1-plus-4
 /1-plus-4 layout --tenant	none	-	null	none	-
