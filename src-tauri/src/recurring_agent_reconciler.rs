@@ -122,6 +122,8 @@ pub const REASON_COORD_UNRESOLVABLE_PREFIX: &str = "coord_unresolvable:";
 pub const REASON_SPEC_UNPARSEABLE: &str = "spec_unparseable";
 pub const REASON_SPEC_PROJECTION_MISMATCH: &str = "spec_projection_mismatch";
 pub const REASON_NAME_COLLISION_FOREIGN_TENANT: &str = "name_collision_foreign_tenant";
+pub const REASON_NAME_COLLISION_OTHER_TENANT: &str = "name_collision_other_tenant";
+pub const REASON_NAME_COLLISION_OTHER_SOURCE: &str = "name_collision_other_source";
 pub const REASON_PATH_NOT_UNDER_WORKSPACE_ROOT: &str = "path_not_under_workspace_root";
 pub const REASON_APPLY_CONFLICT: &str = "apply_conflict";
 pub const REASON_APPLY_FAILED: &str = "apply_failed";
@@ -355,6 +357,9 @@ pub struct LocalContext<'a> {
     pub bash: Option<String>,
     /// Whether a resolved bundled-script path exists.
     pub path_exists: &'a (dyn Fn(&Path) -> bool + Sync),
+    /// Ids of stored tasks whose `conditions` column could not be read
+    /// (`StoredScheduledTask::conditions_error`): never current, so rewritten.
+    pub unreadable_conditions: BTreeSet<String>,
 }
 
 /// What the device holds about its tenants.
@@ -546,17 +551,10 @@ pub fn plan(
             return out;
         }
     };
-    // Names a coord-managed row of an UNPROVEN tenant occupies: creating a
-    // proven tenant's task under one would leave two tasks firing.
-    let mut foreign_names: BTreeSet<&str> = BTreeSet::new();
     for task in local.iter().filter(|t| is_coord_managed(t)) {
         let key = coord_key(task);
         if key.is_some_and(|(t, _)| proven.contains(&t)) {
             continue;
-        }
-        foreign_names.insert(task.name.as_str());
-        if let Some(m) = &task.managed {
-            foreign_names.insert(m.agent.as_str());
         }
         let agent = task
             .managed
@@ -572,6 +570,7 @@ pub fn plan(
             None,
         ));
     }
+    let names = NameIndex::new(local, &proven, polls);
     for (tenant, poll) in polls {
         if !proven.contains(tenant) {
             // Never act on a list for a tenant the device has not proven.
@@ -595,7 +594,7 @@ pub fn plan(
                 *tenant,
                 list,
                 local,
-                &foreign_names,
+                &names,
                 ctx,
                 &mut out.actions,
                 &mut report,
@@ -606,15 +605,103 @@ pub fn plan(
     out
 }
 
+/// Who holds each task NAME on this device, across EVERY local row
+/// (unmanaged, another managed source, every coord tenant), plus which proven
+/// tenant claims each served name first this pass.
+///
+/// The device must never end up with two tasks of one name firing: a create
+/// (or a write to a row) for `(coord, tenant, name)` is refused while any
+/// OTHER key holds that name, and when two proven tenants serve one name in
+/// the same pass the lexicographically smaller tenant id wins.
+struct NameIndex<'a> {
+    holders: BTreeMap<&'a str, Vec<&'a ScheduledTask>>,
+    first_claimant: BTreeMap<&'a str, Uuid>,
+    proven: &'a BTreeSet<Uuid>,
+}
+
+impl<'a> NameIndex<'a> {
+    fn new(
+        local: &'a [ScheduledTask],
+        proven: &'a BTreeSet<Uuid>,
+        polls: &'a [(Uuid, Result<DesiredList, TenantPollStatus>)],
+    ) -> Self {
+        let mut holders: BTreeMap<&str, Vec<&ScheduledTask>> = BTreeMap::new();
+        for task in local {
+            holders.entry(task.name.as_str()).or_default().push(task);
+            if let Some(m) = &task.managed {
+                if m.agent != task.name {
+                    holders.entry(m.agent.as_str()).or_default().push(task);
+                }
+            }
+        }
+        let mut first_claimant: BTreeMap<&str, Uuid> = BTreeMap::new();
+        for (tenant, poll) in polls {
+            let Ok(list) = poll else { continue };
+            if !proven.contains(tenant) || list.tenant_id != *tenant {
+                continue;
+            }
+            for (name, entry) in &list.entries {
+                if matches!(entry, ServedEntry::Agent(_)) {
+                    let slot = first_claimant.entry(name.as_str()).or_insert(*tenant);
+                    // Uuid orders by its bytes, i.e. its lexicographic
+                    // lowercase-hex spelling.
+                    if *tenant < *slot {
+                        *slot = *tenant;
+                    }
+                }
+            }
+        }
+        Self {
+            holders,
+            first_claimant,
+            proven,
+        }
+    }
+
+    /// Why `(coord, tenant, name)` may not be written, if another key holds
+    /// `name` (or a smaller proven tenant claims it this pass).
+    fn collision(&self, tenant: Uuid, name: &str) -> Option<&'static str> {
+        let mut reasons: Vec<&'static str> = Vec::new();
+        for task in self.holders.get(name).into_iter().flatten() {
+            let reason = match &task.managed {
+                None => REASON_NAME_COLLISION_UNMANAGED,
+                Some(m) if m.source != MANAGED_SOURCE_COORD => REASON_NAME_COLLISION_OTHER_SOURCE,
+                Some(m) => match Uuid::parse_str(&m.tenant_id) {
+                    Ok(t) if t == tenant && m.agent == name => continue,
+                    Ok(t) if self.proven.contains(&t) => REASON_NAME_COLLISION_OTHER_TENANT,
+                    _ => REASON_NAME_COLLISION_FOREIGN_TENANT,
+                },
+            };
+            reasons.push(reason);
+        }
+        if self.first_claimant.get(name).is_some_and(|w| *w != tenant) {
+            reasons.push(REASON_NAME_COLLISION_OTHER_TENANT);
+        }
+        // Deterministic when several apply.
+        [
+            REASON_NAME_COLLISION_UNMANAGED,
+            REASON_NAME_COLLISION_OTHER_SOURCE,
+            REASON_NAME_COLLISION_FOREIGN_TENANT,
+            REASON_NAME_COLLISION_OTHER_TENANT,
+        ]
+        .into_iter()
+        .find(|r| reasons.contains(r))
+    }
+}
+
 /// Does the stored managed task already hold exactly what `desired` would
 /// write? Compared field by field through serde (the stored row is what the
 /// store reads back), plus coord's digest via the managed key. `enabled` is
 /// one-way: a local disable under an enabled declaration is a pause (kept,
 /// reported `paused`), while a task enabled locally under a DISABLED
-/// declaration is not current.
-fn is_current(stored: &ScheduledTask, desired: &DesiredTask) -> bool {
+/// declaration is not current. A row whose stored conditions could not be
+/// read is never current (it is rewritten).
+fn is_current(stored: &ScheduledTask, desired: &DesiredTask, ctx: &LocalContext<'_>) -> bool {
     fn same<T: Serialize>(a: &T, b: &T) -> bool {
         serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
+    }
+    if ctx.unreadable_conditions.contains(&stored.id) {
+        return false;
     }
     // The managed key and coord's DIGEST — never `version`, which is display
     // only (plan Phase 2): a version-only difference is not a write.
@@ -637,11 +724,15 @@ fn is_current(stored: &ScheduledTask, desired: &DesiredTask) -> bool {
         && (desired.enabled || !stored.enabled)
 }
 
+fn stored_digest(t: &ScheduledTask) -> Option<&str> {
+    t.managed.as_ref().and_then(|m| m.digest.as_deref())
+}
+
 fn plan_tenant(
     tenant: Uuid,
     list: &DesiredList,
     local: &[ScheduledTask],
-    foreign_names: &BTreeSet<&str>,
+    names: &NameIndex<'_>,
     ctx: &LocalContext<'_>,
     actions: &mut Vec<PlannedAction>,
     report: &mut TenantReport,
@@ -652,11 +743,6 @@ fn plan_tenant(
             Some((t_id, agent)) if t_id == tenant => Some((agent, t)),
             _ => None,
         })
-        .collect();
-    let unmanaged_names: BTreeSet<&str> = local
-        .iter()
-        .filter(|t| t.managed.is_none())
-        .map(|t| t.name.as_str())
         .collect();
 
     for (name, entry) in &list.entries {
@@ -676,28 +762,18 @@ fn plan_tenant(
             ServedEntry::Agent(a) => a,
         };
         let served = agent.spec.digest.as_deref();
-        if stored.is_none() {
-            // Creating would put a second task of this name on the device.
-            let collision = if unmanaged_names.contains(name.as_str()) {
-                Some(REASON_NAME_COLLISION_UNMANAGED)
-            } else if foreign_names.contains(name.as_str()) {
-                // A row an unproven tenant's declaration left behind (e.g.
-                // before a re-bind) still fires; a second one would double it.
-                Some(REASON_NAME_COLLISION_FOREIGN_TENANT)
-            } else {
-                None
-            };
-            if let Some(reason) = collision {
-                report.agents.push(outcome(
-                    tenant,
-                    name,
-                    RecurringAgentState::Unapplied,
-                    Some(reason),
-                    None,
-                    served,
-                ));
-                continue;
-            }
+        // Another key holding this name: never a create, and no write to an
+        // existing row either (it is reported, and left as it is).
+        if let Some(reason) = names.collision(tenant, name) {
+            report.agents.push(outcome(
+                tenant,
+                name,
+                RecurringAgentState::Unapplied,
+                Some(reason),
+                stored,
+                served,
+            ));
+            continue;
         }
         // Rendered EVERY pass, not only on a digest change: the device-resolved
         // half (workspace root, bash path) can move under an unchanged digest,
@@ -708,7 +784,7 @@ fn plan_tenant(
                     .agents
                     .push(outcome(tenant, name, state, Some(reason), stored, served));
             }
-            Ok(desired) if stored.is_some_and(|t| is_current(t, &desired)) => {
+            Ok(desired) if stored.is_some_and(|t| is_current(t, &desired, ctx)) => {
                 let task = stored.expect("guarded by is_some_and");
                 let state = if !task.enabled && desired.enabled {
                     RecurringAgentState::Paused
@@ -719,11 +795,23 @@ fn plan_tenant(
                     .agents
                     .push(outcome(tenant, name, state, None, stored, served));
             }
-            Ok(desired) => {
+            Ok(mut desired) => {
+                // A DRIFT-only rewrite (coord's digest unchanged) keeps a local
+                // pause: only a new declaration re-asserts coord's `enabled`.
+                if let Some(t) = stored {
+                    if stored_digest(t).is_some() && stored_digest(t) == served {
+                        desired.enabled = t.enabled && desired.enabled;
+                    }
+                }
+                let paused = !desired.enabled && agent.spec.enabled;
                 let mut o = outcome(
                     tenant,
                     name,
-                    RecurringAgentState::Applied,
+                    if paused {
+                        RecurringAgentState::Paused
+                    } else {
+                        RecurringAgentState::Applied
+                    },
                     None,
                     stored,
                     served,
@@ -1035,24 +1123,33 @@ fn resolve_probe_argv(argv: &[String], ctx: &LocalContext<'_>) -> Result<Vec<Str
 // The executor
 // ===========================================================================
 
-fn upsert_request(d: &DesiredTask) -> crate::mcp::scheduler::UpsertManagedTaskRequest {
+/// The by-key upsert body for `d` over the row the planner read. The route's
+/// contract is a FULL declaration (an absent field takes its create-time
+/// default, 4a), so the three fields coord does not declare —
+/// `catch_up_grace_seconds`, `launch_failure_backoff_seconds`,
+/// `success_criteria` — are sent as the STORED values, or a rewrite would
+/// reset a local setting to its default.
+fn upsert_request(
+    d: &DesiredTask,
+    existing: Option<&ScheduledTask>,
+) -> crate::mcp::scheduler::UpsertManagedTaskRequest {
     crate::mcp::scheduler::UpsertManagedTaskRequest {
         name: d.name.clone(),
         description: d.description.clone(),
         schedule: d.schedule.clone(),
         task: d.task.clone(),
-        // coord's `enabled` is the declaration: it applies on every digest
-        // change. A local disable between changes is left alone and reported
-        // `paused`; surviving a digest change needs D6's override record
-        // (Phase 4c/4d), which this build does not have.
+        // The planner's decision: coord's `enabled` on a digest change, the
+        // stored value ANDed in on a drift-only rewrite (a local pause
+        // survives a moved workspace root, not a new declaration — keeping it
+        // across one needs D6's override record, Phase 4c/4d).
         enabled: Some(d.enabled),
         skip_if_completed: d.skip_if_completed,
         auto_fix_on_failure: d.auto_fix_on_failure,
-        success_criteria: None,
+        success_criteria: existing.and_then(|t| t.success_criteria.clone()),
         conditions: d.conditions.clone(),
         catch_up_policy: Some(d.catch_up_policy),
-        catch_up_grace_seconds: None,
-        launch_failure_backoff_seconds: None,
+        catch_up_grace_seconds: existing.map(|t| t.catch_up_grace_seconds),
+        launch_failure_backoff_seconds: existing.map(|t| t.launch_failure_backoff_seconds),
         timezone: d.timezone.clone(),
         version: d.managed.version,
         digest: d.managed.digest.clone(),
@@ -1074,7 +1171,7 @@ async fn execute(pg: &PgDb, plan: Plan) -> (Vec<TenantReport>, Vec<AgentOutcome>
             PlannedAction::Upsert { existing, desired } => {
                 let tenant = Uuid::parse_str(&desired.managed.tenant_id).unwrap_or_default();
                 let name = desired.managed.agent.clone();
-                let request = upsert_request(&desired);
+                let request = upsert_request(&desired, existing.as_deref());
                 let mut task = crate::mcp::scheduler::merge_managed_task(
                     existing.as_deref(),
                     request,
@@ -1315,7 +1412,7 @@ async fn reconcile_once(pg: &PgDb, log: &mut LogState) {
         .await
         .unwrap_or_else(|e| BindingsRead::Unknown(format!("binding read panicked: {e}")));
     let stored = match pg.get_all_stored_scheduled_tasks().await {
-        Ok(rows) => rows.into_iter().map(|s| s.task).collect::<Vec<_>>(),
+        Ok(rows) => rows,
         Err(e) => {
             warn!("recurring agents: the local task read failed ({e}); nothing reconciled");
             store_report(ReconcileReport {
@@ -1329,6 +1426,12 @@ async fn reconcile_once(pg: &PgDb, log: &mut LogState) {
             return;
         }
     };
+    let unreadable_conditions: BTreeSet<String> = stored
+        .iter()
+        .filter(|s| s.conditions_error.is_some())
+        .map(|s| s.task.id.clone())
+        .collect();
+    let stored: Vec<ScheduledTask> = stored.into_iter().map(|s| s.task).collect();
     let mut polls = Vec::new();
     if let BindingsRead::Proven(tenants) = &bindings {
         for tenant in tenants {
@@ -1354,6 +1457,7 @@ async fn reconcile_once(pg: &PgDb, log: &mut LogState) {
             workspace_root,
             bash,
             path_exists: &exists,
+            unreadable_conditions,
         };
         plan(&bindings, &polls, &stored, &ctx)
     };
