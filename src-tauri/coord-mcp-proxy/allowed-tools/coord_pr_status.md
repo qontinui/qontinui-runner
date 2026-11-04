@@ -1,0 +1,1 @@
+Forwarded as part of the session-coordination surface this allowlist enumerates (see `README.md` in this directory for the posture). No rationale specific to this tool was recorded beside it in `mcp_api.rs` before the list moved to one file per entry.
