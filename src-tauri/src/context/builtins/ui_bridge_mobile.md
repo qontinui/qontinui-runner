@@ -7,17 +7,31 @@ This context documents the UI Bridge elements available in the qontinui-mobile R
 ```python
 from ui_bridge import UIBridgeClient
 
-# Android emulator (special IP for host access)
-client = UIBridgeClient("http://10.0.2.2:8087")
+# Android device or emulator, after `adb forward tcp:8087 tcp:8087` on this host
+client = UIBridgeClient("http://localhost:8087")
 
 # iOS simulator
 client = UIBridgeClient("http://localhost:8087")
 
-# Physical device (use device's IP on your network)
+# Physical device by LAN IP: works only while the app runs an SDK older than
+# @qontinui/ui-bridge-native 0.11.0 (see "Device pairing" below)
 client = UIBridgeClient("http://192.168.1.100:8087")
 ```
 
-**Note:** The server only runs in development mode (`__DEV__`).
+**Device pairing.** From `@qontinui/ui-bridge-native` 0.11.0 (check
+`data.uiBridge.version` from `GET /ui-bridge/health`, which stays open on the
+LAN), the on-device server refuses an unsigned off-device caller on every route
+except `GET /ui-bridge/health` and, with a code armed in the app,
+`POST /ui-bridge/pair`. Control routes answer `401 PAIRING_REQUIRED`, or
+`PAIRING_UNCONFIGURED` on an app with no pairing store, unless the app sets
+`allowUnauthenticatedNetwork`. The Python client cannot sign and the runner does
+not sign device requests yet, so on such an app use `adb forward`. It is
+admitted as on-device only when the app's server adapter passes the socket's
+`remoteAddress` (measured on an Android 11 emulator; physical phones
+unmeasured).
+
+**Note:** The server always runs in development builds (`__DEV__`); a release
+build runs it unless the in-app "Local UI Bridge server" setting turns it off.
 
 ### Available Elements
 
