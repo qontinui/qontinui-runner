@@ -468,7 +468,7 @@ pub(crate) async fn run_dispatch(
 
     // ── Provisioning (tools, siblings, then services) ──
     let provision_started = Instant::now();
-    let provisioning = provision(
+    let provisioning = provision_dispatch(
         &payload,
         &root,
         &worktree,
@@ -649,7 +649,7 @@ fn step_failure_reason(
 /// caller's `DispatchWorkspace` and passed in: a partially-provisioned stack
 /// still names every container it started, and the caller's cleanup removes
 /// them.
-async fn provision(
+async fn provision_dispatch(
     payload: &CiDispatchPayload,
     root: &Path,
     worktree: &Path,
@@ -660,7 +660,7 @@ async fn provision(
 ) -> Result<(Vec<PathBuf>, Vec<(String, String)>), String> {
     let mut log = |line: String| sink.push(&line);
 
-    let tool_dirs = super::tools::provision(root, &manifest.tools, &mut log).await?;
+    let tool_dirs = super::tools::provision_tools(root, &manifest.tools, &mut log).await?;
 
     let dispatch_root = super::checkout::ci_dispatch_root(root, &payload.dispatch_id);
     super::sibling::provision(
@@ -674,7 +674,7 @@ async fn provision(
     .await?;
 
     let service_env = services
-        .provision(&manifest.services, &mut log, cancel)
+        .provision_services(&manifest.services, &mut log, cancel)
         .await?;
 
     Ok((tool_dirs, service_env))
