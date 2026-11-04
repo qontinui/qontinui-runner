@@ -1664,13 +1664,25 @@ static GLOBAL_ALLOCATOR: qontinui_runner_lib::alloc_breadcrumb::RunnerAlloc =
 /// Phase 2) can be driven on a temp runner: a boot that never binds is
 /// otherwise unreproducible on demand. Compiled out of release builds by
 /// `cfg!(debug_assertions)`, so a shipped runner cannot be told to stall its
-/// own boot. Logged loudly when honoured, because a runner that is slow to bind
+/// own boot, and honoured only on a secondary instance (`instance::is_secondary`),
+/// so a variable inherited into a dev-start primary cannot stall it. Logged
+/// loudly when honoured, because a runner that is slow to bind
 /// ON PURPOSE must never be mistaken for one that is slow by accident.
 fn test_pre_bind_delay() -> Option<std::time::Duration> {
     if !cfg!(debug_assertions) {
         return None;
     }
     let raw = std::env::var("QONTINUI_TEST_PRE_BIND_DELAY_MS").ok()?;
+    // Secondary / temp runners only. A dev-start primary is a debug build too,
+    // and an exported variable inherited into it must not stall the box's own
+    // runner.
+    if !instance::is_secondary() {
+        warn!(
+            "QONTINUI_TEST_PRE_BIND_DELAY_MS is set but this is the PRIMARY runner; ignored \
+             (honoured only on a named/secondary instance)"
+        );
+        return None;
+    }
     let ms: u64 = match raw.trim().parse() {
         Ok(ms) => ms,
         Err(_) => {
@@ -1692,7 +1704,9 @@ fn test_pre_bind_delay() -> Option<std::time::Duration> {
 fn main() {
     // Anchor the process clock (`health_monitor::MONOTONIC_EPOCH`) as early as
     // possible: every boot-stage offset and the bind latency are measured from
-    // it, and the never-answered grace starts from it.
+    // it, and the never-answered grace starts from it. This stamp precedes
+    // `init_logging`, so its log line goes nowhere; the stage is still
+    // recorded (it is the `+0` the later stage lines are offsets from).
     boot_stage::stamp(boot_stage::BootStage::ProcessStart);
 
     // A SUBJECT runner (`QONTINUI_INSTANCE_ROOT` set) validates its launch env

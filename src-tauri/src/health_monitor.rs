@@ -170,7 +170,9 @@ pub(crate) fn process_elapsed() -> Duration {
 /// read as a boot in progress rather than reported.
 ///
 /// Plan `2026-11-04-runner-wedge-detector-reads-a-boot-as-a-wedge-and-never-bound-is-silent`,
-/// D2. Warm boots bind 1.26–1.49 s after the monitor starts (n=9); this is
+/// D2. Warm boots bind 1.26–1.49 s after the monitor starts (n=9; runner logs
+/// 2026-10-23..11-03, `Starting health monitor` → `MCP API server listening`);
+/// this is
 /// about 40x that median, with headroom for a cold embedded-Postgres bootstrap
 /// the sample does not contain. It reuses the cold-boot allowance rather than
 /// minting a second number for the same question. The boot-stage markers log
@@ -236,9 +238,29 @@ const PROBE_HARD_DEADLINE_SECS: u64 = 20;
 /// immediately instead of re-waiting the deadline. One thread, not one per
 /// probe: at a 5s cadence an 11-minute wedge would otherwise leave ~130 stuck
 /// threads behind, a leak triggered by the very condition being reported.
+/// One `/livez` probe's verdict.
+///
+/// Three-valued because "the probe could not ask" is neither an answer nor a
+/// failure. Before 2026-11-04 it was folded into `true` ("not a failure"),
+/// which was harmless while every success only reset a streak — but a success
+/// is now also what ends the never-answered arm for good, so a prober that
+/// could not ask would have latched `answered_once` and silenced `never_bound`
+/// for the rest of the process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LivezObservation {
+    /// `/livez` answered 2xx on the bound port.
+    Answered,
+    /// `/livez` did not answer — refused, timed out, non-2xx, or the listener
+    /// has not bound yet.
+    Failed,
+    /// The probe could not be asked: no prober thread, or the HTTP client
+    /// would not build. Never manufactured into a wedge, never into an answer.
+    Unknown,
+}
+
 struct LivezProber {
     req_tx: std::sync::mpsc::SyncSender<()>,
-    res_rx: std::sync::mpsc::Receiver<bool>,
+    res_rx: std::sync::mpsc::Receiver<LivezObservation>,
     /// True while the prober still owes an answer we already gave up on.
     outstanding: bool,
     alive: bool,
@@ -247,7 +269,7 @@ struct LivezProber {
 impl LivezProber {
     fn new() -> Self {
         let (req_tx, req_rx) = std::sync::mpsc::sync_channel::<()>(1);
-        let (res_tx, res_rx) = std::sync::mpsc::channel::<bool>();
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<LivezObservation>();
         // ONE prober thread for the process, not one per probe. A probe every
         // 5s through an 11-minute wedge would otherwise leave ~130 stuck
         // threads behind — a thread leak triggered by the very condition the
@@ -260,12 +282,12 @@ impl LivezProber {
                 let mut last_slow_warn: Option<std::time::Instant> = None;
                 while req_rx.recv().is_ok() {
                     let started = std::time::Instant::now();
-                    let alive = probe_livez_blocking();
+                    let observation = probe_livez_blocking();
                     let elapsed = started.elapsed();
                     // Only a SUCCESSFUL-but-slow probe is reported here; a
                     // failure is already the wedge detector's business, and
                     // double-reporting it would just double the log volume.
-                    if alive
+                    if observation == LivezObservation::Answered
                         && elapsed.as_millis() >= SLOW_PROBE_WARN_MS
                         && last_slow_warn.is_none_or(|t| {
                             t.elapsed() >= Duration::from_secs(SLOW_PROBE_REWARN_SECS)
@@ -281,7 +303,7 @@ impl LivezProber {
                         );
                         last_slow_warn = Some(std::time::Instant::now());
                     }
-                    if res_tx.send(alive).is_err() {
+                    if res_tx.send(observation).is_err() {
                         break;
                     }
                 }
@@ -297,14 +319,14 @@ impl LivezProber {
 
     /// One bounded observation. Never blocks longer than
     /// `PROBE_HARD_DEADLINE_SECS`, whatever the prober is doing.
-    fn probe(&mut self) -> bool {
+    fn probe(&mut self) -> LivezObservation {
         use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
 
         if !self.alive {
-            // No prober: report UNKNOWN as "not a failure" rather than
-            // manufacturing a wedge out of our own defect (the same rule as a
-            // client that will not build).
-            return true;
+            // No prober: UNKNOWN, never a wedge manufactured out of our own
+            // defect (the same rule as a client that will not build) — and
+            // never an answer either.
+            return LivezObservation::Unknown;
         }
 
         if self.outstanding {
@@ -315,29 +337,29 @@ impl LivezProber {
                 Ok(_late) => self.outstanding = false,
                 // Still stuck. `/livez` is not answering; say so, and do NOT
                 // queue more work onto a thread that cannot take it.
-                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Empty) => return LivezObservation::Failed,
                 Err(TryRecvError::Disconnected) => {
                     self.alive = false;
-                    return true;
+                    return LivezObservation::Unknown;
                 }
             }
         }
 
         if self.req_tx.try_send(()).is_err() {
-            return false;
+            return LivezObservation::Failed;
         }
         match self
             .res_rx
             .recv_timeout(Duration::from_secs(PROBE_HARD_DEADLINE_SECS))
         {
-            Ok(alive) => alive,
+            Ok(observation) => observation,
             Err(RecvTimeoutError::Timeout) => {
                 self.outstanding = true;
-                false
+                LivezObservation::Failed
             }
             Err(RecvTimeoutError::Disconnected) => {
                 self.alive = false;
-                true
+                LivezObservation::Unknown
             }
         }
     }
@@ -353,17 +375,22 @@ pub fn ui_thread_wedged() -> bool {
 }
 
 /// The URL the `/livez` self-probe dials: the port the listener ACTUALLY
-/// bound, falling back to the bootstrap port only before the bind.
+/// bound — and `None` before the bind, when there is nothing of ours to dial.
 ///
 /// Plan `2026-11-04-runner-wedge-detector-reads-a-boot-as-a-wedge-and-never-bound-is-silent`,
 /// D3. This used to read `get_mcp_api_port()` (`QONTINUI_PORT` or the default),
 /// so a runner whose bind fell back to another port (`instance::api_ports_to_try`)
-/// probed a port it did not hold and read its own healthy API as a wedge.
-fn livez_probe_url() -> String {
-    format!(
-        "{}/livez",
-        crate::mcp::types::runner_loopback_base(crate::mcp::types::bound_port())
-    )
+/// probed a port it did not hold.
+///
+/// **No fallback to the configured port, deliberately** (unlike
+/// [`crate::mcp::types::bound_port`], which its other callers keep). The bind
+/// loop's `+1`/`+2` fallback exists because the configured port can be held by
+/// ANOTHER live process; a pre-bind probe of it would get that process's `200`,
+/// latch `answered_once`, and silence `never_bound` for a runner that never
+/// bound at all. Before the bind the honest reading is "not answering".
+fn livez_probe_url() -> Option<String> {
+    crate::mcp::types::recorded_bound_port()
+        .map(|port| format!("{}/livez", crate::mcp::types::runner_loopback_base(port)))
 }
 
 /// Blocking `/livez` probe.
@@ -375,23 +402,27 @@ fn livez_probe_url() -> String {
 ///
 /// Call it through [`probe_livez_bounded`], never directly from the probe
 /// loop — on its own it can outlast its own timeout (see there).
-fn probe_livez_blocking() -> bool {
-    let url = livez_probe_url();
+fn probe_livez_blocking() -> LivezObservation {
+    // Not bound yet: nothing of ours is listening, so this tick is a failure —
+    // see `livez_probe_url` for why the configured port is not dialled.
+    let Some(url) = livez_probe_url() else {
+        return LivezObservation::Failed;
+    };
     let client = match reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(SELF_PROBE_TIMEOUT_SECS))
         .build()
     {
         Ok(c) => c,
         Err(e) => {
-            // Cannot build a client: report UNKNOWN as "not a failure" rather
-            // than manufacturing a wedge out of our own defect.
+            // Cannot build a client: UNKNOWN, rather than manufacturing a
+            // wedge (or an answer) out of our own defect.
             warn!("livez self-probe client build failed: {e}");
-            return true;
+            return LivezObservation::Unknown;
         }
     };
     match client.get(&url).send() {
-        Ok(resp) => resp.status().is_success(),
-        Err(_) => false,
+        Ok(resp) if resp.status().is_success() => LivezObservation::Answered,
+        _ => LivezObservation::Failed,
     }
 }
 
@@ -886,6 +917,15 @@ impl WedgeDetector {
     /// released latch reports how long the rung was actually failing for, and
     /// that figure must be measured, not estimated.
     fn step_unknown_at(&mut self, now: Instant) -> WedgeAction {
+        // Before the first `/livez` answer an UNKNOWN changes nothing: it is
+        // not the answer that ends the never-answered arm, and it must not
+        // reset the failures the arm is counting either — a prober that can
+        // ask only intermittently would otherwise postpone `never_bound`
+        // forever. Nothing is latched in this arm, so there is nothing to
+        // release.
+        if self.kind == WedgeKind::Backend && !self.answered_once {
+            return WedgeAction::None;
+        }
         let was = self.consecutive_failures;
         let unresponsive_for = self.elapsed_since_first_failure(now);
         self.consecutive_failures = 0;
@@ -1090,10 +1130,18 @@ impl WedgeDetector {
             } => {
                 // Read the two facts the report names at the moment of the
                 // report: they are process-globals the boot writes, not
-                // detector state.
+                // detector state. STAGE FIRST: `mcp_api` records the port and
+                // only then stamps `ApiListenerBound` (a SeqCst RMW, ordered
+                // after the port store), so a stage read that sees
+                // `ApiListenerBound` guarantees the port read after it sees the
+                // port — the report can never say `never_bound` at stage
+                // `api_listener_bound`. The converse (port seen, stamp not yet)
+                // reads `bound_never_answered` at `api_bind_loop`, which is
+                // true.
+                let boot_stage = crate::boot_stage::furthest();
                 let report = NeverAnsweredReport {
                     bound_port: crate::mcp::types::recorded_bound_port(),
-                    boot_stage: crate::boot_stage::furthest(),
+                    boot_stage,
                     since_process_start_secs: since_process_start.as_secs(),
                     consecutive_failures,
                 };
@@ -2227,7 +2275,11 @@ pub fn start_health_monitor() {
             // BACKEND_WEDGED *before* it writes the breadcrumb, captures the
             // census or logs, so a blocked subscriber can no longer erase the
             // evidence.
-            wedge.observe_at(prober.probe(), probe_started);
+            match prober.probe() {
+                LivezObservation::Answered => wedge.observe_at(true, probe_started),
+                LivezObservation::Failed => wedge.observe_at(false, probe_started),
+                LivezObservation::Unknown => wedge.observe_unknown_at(probe_started),
+            }
 
             // UNKNOWN (no cached HWND yet, non-Windows, a rejected
             // handle) never accumulates toward an escalation — but it is
@@ -2289,8 +2341,12 @@ pub fn start_health_monitor() {
 /// Log the first successful UI-thread `WM_NULL` round-trip with its latency
 /// from process start and from `.setup` returning.
 ///
-/// Probes are 5 s apart, so the figure is an upper bound by up to one probe
-/// interval — it says when the monitor first SAW the loop pumping.
+/// An upper bound, not a measurement of the instant the loop resumed: the
+/// monitor samples every `SELF_PROBE_INTERVAL_SECS` (5 s), and the `/livez`
+/// probe runs first on the same tick and can hold it for up to
+/// `PROBE_HARD_DEADLINE_SECS` (20 s), so the slack is up to 5 s + 20 s (+ the
+/// 3 s round-trip timeout itself). It says when the monitor first SAW the loop
+/// pumping.
 fn log_first_ui_round_trip() {
     let since_start = process_elapsed();
     let since_start_ms = since_start.as_millis() as u64;
@@ -3097,10 +3153,14 @@ mod tests {
         // The count is still published: it is true, and the watchdog's
         // heartbeat file reports it.
         assert_eq!(MONITOR_CONSECUTIVE_FAILURES.load(Ordering::SeqCst), 5);
-        let mut w = WatchdogState::default();
-        let now = 1_000_000i64;
+        // What the watchdog thread itself would read this instant. The metrics
+        // heartbeat is pinned fresh: this test is about the wedge flag, and the
+        // metrics loop does not run in a unit test.
+        let mut live = live_watchdog_sample();
+        live.metrics_heartbeat_ms = live.now_ms;
+        assert!(!live.backend_wedged);
         assert_eq!(
-            w.step(sample(now, now, BACKEND_WEDGED.load(Ordering::SeqCst))),
+            WatchdogState::default().step(live),
             None,
             "the watchdog named a condition for a boot that has not bound"
         );
@@ -3216,9 +3276,12 @@ mod tests {
         ));
     }
 
-    /// (d) The probe dials the port the listener BOUND, not the configured one.
+    /// (d) The probe dials the port the listener BOUND, not the configured
+    /// one — and before the bind it dials nothing and counts a failure, because
+    /// the configured port may belong to another live process whose `200` would
+    /// otherwise end the never-answered arm.
     #[test]
-    fn the_livez_probe_dials_the_bound_port() {
+    fn the_livez_probe_dials_only_the_bound_port() {
         let _env_lock = crate::test_env::env_lock();
         let _env = crate::test_env::EnvVarRestore::capture(&["QONTINUI_PORT"]);
         let _bound = crate::mcp::types::BoundPortRestore::capture();
@@ -3227,13 +3290,50 @@ mod tests {
         crate::mcp::types::set_bound_port(0);
         assert_eq!(
             livez_probe_url(),
-            "http://127.0.0.1:9877/livez",
-            "before the bind the probe falls back to the configured port"
+            None,
+            "before the bind the probe must not dial the configured port"
+        );
+        assert_eq!(
+            probe_livez_blocking(),
+            LivezObservation::Failed,
+            "an unbound listener is not answering"
         );
 
-        // The bind fell back off 9877 (a zombie socket): the probe must follow.
+        // The bind fell back off 9877 (held by another process): follow it.
         crate::mcp::types::set_bound_port(9878);
-        assert_eq!(livez_probe_url(), "http://127.0.0.1:9878/livez");
+        assert_eq!(
+            livez_probe_url().as_deref(),
+            Some("http://127.0.0.1:9878/livez")
+        );
+    }
+
+    /// H1: an UNKNOWN probe before the first answer neither ends the
+    /// never-answered arm nor resets its count — the report still fires once
+    /// the grace has elapsed.
+    #[test]
+    fn an_unknown_probe_before_the_first_answer_is_not_an_answer() {
+        let t0 = Instant::now();
+        let mut d = booting(t0);
+        let secs = Duration::from_secs;
+        for i in 1..=11u64 {
+            let now = t0 + secs(5 * i);
+            if i % 4 == 0 {
+                assert_eq!(d.step_unknown_at(now), WedgeAction::None);
+            } else {
+                assert_eq!(d.step_at(false, now), WedgeAction::None);
+            }
+        }
+        assert!(!d.answered_once, "an UNKNOWN observation set answered_once");
+        assert!(
+            matches!(
+                d.step_at(false, t0 + secs(60)),
+                WedgeAction::NeverAnswered {
+                    consecutive_failures: 10,
+                    ..
+                }
+            ),
+            "the never-answered report did not fire after the grace"
+        );
     }
 
     // ---- Item 4: the detector must be able to report a wedge ----
