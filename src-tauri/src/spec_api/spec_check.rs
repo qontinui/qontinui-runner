@@ -287,8 +287,8 @@ pub(crate) async fn fetch_fresh_snapshot(
     .await
     {
         Ok(value) => {
-            // dispatch_app_request returns the full HTTP response body
-            // (`{success: true, data: {...snapshot...}}`) — wrap_snapshot's
+            // dispatch_app_request returns the `{success: true, data:
+            // {...snapshot...}}` envelope on both transports — wrap_snapshot's
             // strict `serde_json::from_value::<UIBridgeSnapshot>` would parse
             // the envelope as a default zero-element snapshot, silently
             // producing matchRate=0 on every downstream evaluate(). Unwrap

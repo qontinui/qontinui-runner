@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use super::app_dispatch::DispatchError;
+use super::app_dispatch::{ws_result_envelope, DispatchError, Dispatched};
 use super::app_registry::AppTransport;
 use super::types::{ApiResponse, ApiState};
 use super::ui_bridge::ui_bridge_request_sync;
@@ -306,6 +306,10 @@ fn dispatch_err_message(err: &DispatchError) -> String {
 /// still rely on the tri-state shape (they synthesize derived responses
 /// from `getControlSnapshot` for WS apps before falling through to the
 /// dedicated HTTP endpoint).
+///
+/// The `Some` value is the wrapper's BARE result ([`Dispatched::into_raw`]):
+/// a caller that forwards it rather than synthesizing from it wraps it with
+/// [`ws_result_envelope`] itself.
 async fn try_ws_dispatch(
     state: &Arc<ApiState>,
     action: &str,
@@ -334,7 +338,7 @@ async fn try_ws_dispatch(
         .dispatch(&app_id, action, Method::GET, "/", payload)
         .await
     {
-        Ok(value) => Ok(Some(value)),
+        Ok(value) => Ok(Some(value.into_raw())),
         Err(DispatchError::WebSocket(super::command_relay::CommandRelayError::NotConnected(_)))
         | Err(DispatchError::WebSocket(super::command_relay::CommandRelayError::Disconnected)) => {
             Err(format!(
@@ -352,6 +356,12 @@ async fn try_ws_dispatch(
 /// responsiveness cache for HTTP-transport apps. Errors are flattened to
 /// `String` for backward compatibility — handler call sites have not
 /// changed and still pattern-match on a `Result<Value, String>`.
+///
+/// The `Ok` value is ALWAYS the `{success, data}` API envelope, whichever
+/// transport answered ([`Dispatched::into_envelope`]): the HTTP arm's body
+/// already is one, and a WS-transport app's bare result is wrapped. An action
+/// whose result declares its own outcome dispatches through
+/// [`dispatch_app_request_action`] instead.
 pub async fn dispatch_app_request(
     state: &Arc<ApiState>,
     action: &str,
@@ -376,17 +386,142 @@ async fn dispatch_app_request_typed(
     http_path: &str,
     http_body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, DispatchError> {
+    dispatch_app_request_typed_with(
+        &state.sdk_connection,
+        &state.app_registry,
+        &state.app_dispatcher,
+        action,
+        ws_payload,
+        http_method,
+        http_path,
+        http_body,
+    )
+    .await
+}
+
+/// [`dispatch_app_request_typed`] over its three dependencies alone, so a test
+/// drives the real body without building an `ApiState`.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_app_request_typed_with(
+    sdk_connection: &Arc<tokio::sync::Mutex<SdkConnectionManager>>,
+    registry: &super::app_registry::AppRegistry,
+    dispatcher: &super::app_dispatch::AppDispatcher,
+    action: &str,
+    ws_payload: serde_json::Value,
+    http_method: Method,
+    http_path: &str,
+    http_body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, DispatchError> {
+    dispatch_active_tagged(
+        sdk_connection,
+        registry,
+        dispatcher,
+        action,
+        ws_payload,
+        http_method,
+        http_path,
+        http_body,
+    )
+    .await
+    .map(Dispatched::into_envelope)
+}
+
+/// [`dispatch_app_request_typed`] for an ACTION whose SDK result type declares
+/// a boolean `success`: the WS arm's bare result is read with the strict action
+/// reader ([`Dispatched::into_action_envelope`]), so an outcome-less result is
+/// an indeterminate FAILURE, never the `success: true` a read's envelope
+/// defaults to.
+///
+/// Wrapper-reached actions (`executeComponentAction`, `setClipboard`,
+/// `executeWithDiff`) stay on the read envelope: under the wrapper protocol a
+/// frame's `success: true` means the handler ran, and their results carry no
+/// `success` key.
+async fn dispatch_app_request_action_typed(
+    state: &Arc<ApiState>,
+    action: &str,
+    ws_payload: serde_json::Value,
+    http_method: Method,
+    http_path: &str,
+    http_body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, DispatchError> {
+    dispatch_app_request_action_typed_with(
+        &state.sdk_connection,
+        &state.app_registry,
+        &state.app_dispatcher,
+        action,
+        ws_payload,
+        http_method,
+        http_path,
+        http_body,
+    )
+    .await
+}
+
+/// [`dispatch_app_request_action_typed`] over its three dependencies alone, so
+/// a test drives the real body without building an `ApiState`.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_app_request_action_typed_with(
+    sdk_connection: &Arc<tokio::sync::Mutex<SdkConnectionManager>>,
+    registry: &super::app_registry::AppRegistry,
+    dispatcher: &super::app_dispatch::AppDispatcher,
+    action: &str,
+    ws_payload: serde_json::Value,
+    http_method: Method,
+    http_path: &str,
+    http_body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, DispatchError> {
+    dispatch_active_tagged(
+        sdk_connection,
+        registry,
+        dispatcher,
+        action,
+        ws_payload,
+        http_method,
+        http_path,
+        http_body,
+    )
+    .await
+    .map(Dispatched::into_action_envelope)
+}
+
+/// [`dispatch_app_request_action_typed`] with the error flattened to `String`.
+async fn dispatch_app_request_action(
+    state: &Arc<ApiState>,
+    action: &str,
+    ws_payload: serde_json::Value,
+    http_method: Method,
+    http_path: &str,
+    http_body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    dispatch_app_request_action_typed(state, action, ws_payload, http_method, http_path, http_body)
+        .await
+        .map_err(dispatch_err_to_string)
+}
+
+/// The active-app dispatch with its transport TAG kept, for the two
+/// normalizations above.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_active_tagged(
+    sdk_connection: &Arc<tokio::sync::Mutex<SdkConnectionManager>>,
+    registry: &super::app_registry::AppRegistry,
+    dispatcher: &super::app_dispatch::AppDispatcher,
+    action: &str,
+    ws_payload: serde_json::Value,
+    http_method: Method,
+    http_path: &str,
+    http_body: Option<serde_json::Value>,
+) -> Result<Dispatched, DispatchError> {
     // The legacy split fed `ws_payload` to the WS arm and `http_body` to
     // the HTTP arm. Most call sites pass identical bodies; when they
     // differ, prefer `http_body` for the HTTP path to mirror legacy
     // behavior. `dispatch_active` chooses the transport, so we pick the
     // correct payload up-front.
     let payload = {
-        let guard = state.sdk_connection.lock().await;
+        let guard = sdk_connection.lock().await;
         let app_id = guard.active_connection().map(|c| c.app_info.app_id.clone());
         drop(guard);
         match app_id {
-            Some(id) => match state.app_registry.get_live(&id).await.map(|e| e.transport) {
+            Some(id) => match registry.get_live(&id).await.map(|e| e.transport) {
                 Some(AppTransport::Websocket) => ws_payload,
                 _ => http_body.unwrap_or(serde_json::Value::Null),
             },
@@ -394,15 +529,8 @@ async fn dispatch_app_request_typed(
         }
     };
 
-    state
-        .app_dispatcher
-        .dispatch_active(
-            &state.sdk_connection,
-            action,
-            http_method,
-            http_path,
-            payload,
-        )
+    dispatcher
+        .dispatch_active(sdk_connection, action, http_method, http_path, payload)
         .await
 }
 
@@ -502,6 +630,7 @@ async fn dispatch_app_request_by_id_with(
     dispatcher
         .dispatch(app_id, action, http_method, http_path, payload)
         .await
+        .map(Dispatched::into_envelope)
         .map_err(dispatch_err_to_string)
 }
 
@@ -1704,11 +1833,14 @@ fn append_tab_id_query(path: &str, tab_id: Option<&str>) -> String {
 
 /// `(body, success, error)` for the WS/HTTP arm of [`handle_element_action`].
 ///
-/// Normalised at THIS boundary: the app's JSON is forwarded to the caller and
-/// persisted as an `action_executed` event, so a body with no boolean `success`
-/// (a relay frame whose `result` was absent arrives as `null`) is rewritten to
+/// An HTTP-transport app's body arrives verbatim, so it is normalised at THIS
+/// boundary: it is forwarded to the caller and persisted as an
+/// `action_executed` event, so a body with no boolean `success` is rewritten to
 /// an explicit `success: false` + `INDETERMINATE:` error instead of reading as
-/// success here and at every permissive consumer downstream.
+/// success here and at every permissive consumer downstream. A WS result has
+/// already been through the same reader ([`Dispatched::into_action_envelope`])
+/// and carries a boolean `success`, so this only reads its verdict and leaves
+/// the body untouched.
 fn ws_element_action_result(data: serde_json::Value) -> (serde_json::Value, bool, Option<String>) {
     let (data, outcome) = super::ui_bridge::request::normalize_action_result(data);
     let err = outcome.error_message();
@@ -1815,7 +1947,7 @@ async fn handle_element_action(
     // or the runner's own webview when the IPC fallback below runs instead.
     let active_app = active_app_identity(&state).await;
     let mut acted_via_ipc = false;
-    let result = match dispatch_app_request_typed(
+    let result = match dispatch_app_request_action_typed(
         &state,
         "executeElementAction",
         ws_payload,
@@ -1826,12 +1958,8 @@ async fn handle_element_action(
     .await
     {
         Ok(data) => {
-            // Normalised at THIS boundary: the app's JSON is forwarded to the
-            // caller and logged below, so a body with no boolean `success` (a
-            // relay frame whose `result` was absent arrives as `null`) is
-            // rewritten to an explicit `success: false` + `INDETERMINATE:`
-            // error instead of reading as success here and at every
-            // permissive consumer downstream.
+            // The answer is forwarded to the caller and logged below, so it
+            // is read strictly: see `ws_element_action_result`.
             let (data, success, err) = ws_element_action_result(data);
             (Json(data), success, err)
         }
@@ -2499,7 +2627,7 @@ async fn handle_ai_assert(
 async fn handle_clipboard_read(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
     match try_ws_dispatch(&state, "getClipboard", serde_json::json!({})).await {
-        Ok(Some(data)) => return Json(data),
+        Ok(Some(data)) => return Json(ws_result_envelope(data)),
         Ok(None) => {}
         Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
     }
@@ -2532,7 +2660,7 @@ async fn handle_clipboard_write(
 ) -> Json<serde_json::Value> {
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
     match try_ws_dispatch(&state, "setClipboard", body.clone()).await {
-        Ok(Some(data)) => return Json(data),
+        Ok(Some(data)) => return Json(ws_result_envelope(data)),
         Ok(None) => {}
         Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
     }
@@ -3490,7 +3618,7 @@ pub(crate) async fn sdk_text_visibility(
         )
         .await
     {
-        Ok(data) => data,
+        Ok(data) => data.into_envelope(),
         Err(e) => serde_json::json!({ "success": false, "error": dispatch_err_to_string(e) }),
     };
     bump();
@@ -5391,7 +5519,7 @@ async fn handle_execute_batch_action(
         .unwrap_or_default();
     let active_app = active_app_identity(&state).await;
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    let response = match dispatch_app_request(
+    let response = match dispatch_app_request_action(
         &state,
         "executeBatchAction",
         serde_json::json!({ "request": body.clone() }),
@@ -5428,7 +5556,7 @@ async fn handle_control_batch(
     let steps = control_batch_action_steps(&body);
     let active_app = active_app_identity(&state).await;
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    let response = match dispatch_app_request(
+    let response = match dispatch_app_request_action(
         &state,
         "controlBatch",
         body.clone(),
@@ -8034,13 +8162,14 @@ mod tests {
         let src = include_str!("sdk_client.rs");
         // Every dispatch entry point that carries a literal action name —
         // the same set `scripts/validate-ws-actions.mjs` matches (#2480):
-        // `dispatch_app_request` and `dispatch_app_request_typed` and
+        // `dispatch_app_request`, `dispatch_app_request_typed`, their
+        // `_action` / `_action_typed` twins (the strict action envelope) and
         // `try_ws_dispatch` take the action as the 2nd argument;
         // `dispatch_app_request_by_id` takes it as the 3rd (the 2nd is the
         // app id). `\s*` crosses newlines, so rustfmt's multi-line call
         // shape is matched — a literal single-line needle saw 8 of ~145.
         let site = regex::Regex::new(concat!(
-            r#"\b(?:(dispatch_app_request(?:_typed)?|try_ws_dispatch)\(\s*&state,\s*"#,
+            r#"\b(?:(dispatch_app_request(?:_action)?(?:_typed)?|try_ws_dispatch)\(\s*&state,\s*"#,
             r#"|(dispatch_app_request_by_id)\(\s*&state,\s*&?[A-Za-z_][A-Za-z0-9_.]*,\s*)"#,
             r#""([^"]*)""#,
         ))
@@ -8556,7 +8685,8 @@ mod tests {
                 .next()
                 .unwrap_or_default();
             assert!(
-                body.contains("dispatch_app_request_typed("),
+                body.contains("dispatch_app_request_typed(")
+                    || body.contains("dispatch_app_request_action_typed("),
                 "{handler} must keep the typed DispatchError"
             );
             assert!(
@@ -8620,6 +8750,8 @@ mod tests {
                 "dispatch_app_request(",
                 "dispatch_app_request_typed(",
                 "dispatch_app_request_by_id(",
+                "dispatch_app_request_action(",
+                "dispatch_app_request_action_typed(",
                 "dispatch_active(",
                 "sdk_request(",
                 "try_ws_dispatch(",
@@ -8879,6 +9011,111 @@ mod element_action_result_tests {
         let (body, ok, _) = ws_element_action_result(serde_json::Value::Null);
         assert!(!ok);
         assert_eq!(body["success"], json!(false));
+    }
+
+    /// The production half of this file, for the source pins below.
+    fn production_source() -> &'static str {
+        include_str!("sdk_client.rs")
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or_default()
+    }
+
+    /// The body of `async fn <name>(`, up to the next `async fn`.
+    fn fn_body(src: &'static str, name: &str) -> &'static str {
+        src.split(format!("\nasync fn {name}(").as_str())
+            .nth(1)
+            .unwrap_or_else(|| panic!("{name} not found"))
+            .split("\nasync fn ")
+            .next()
+            .unwrap_or_default()
+    }
+
+    /// The three ACTION handlers whose SDK result types declare `success`
+    /// dispatch through the strict action envelope: moved back to a READ
+    /// dispatch, an outcome-less WS result would read as success again.
+    #[test]
+    fn action_handlers_dispatch_through_the_strict_action_envelope() {
+        let production = production_source();
+        for handler in [
+            "handle_element_action",
+            "handle_execute_batch_action",
+            "handle_control_batch",
+        ] {
+            let body = fn_body(production, handler);
+            assert!(
+                body.contains("dispatch_app_request_action_typed(")
+                    || body.contains("dispatch_app_request_action("),
+                "{handler} must dispatch through the strict action envelope"
+            );
+            for read in ["dispatch_app_request_typed(", "dispatch_app_request("] {
+                assert!(
+                    !body.contains(read),
+                    "{handler} still dispatches via {read}"
+                );
+            }
+        }
+        // Every dispatch of those three action names goes through an
+        // `_action` variant, wherever it sits.
+        for action in ["executeElementAction", "executeBatchAction", "controlBatch"] {
+            let quoted = format!("\"{action}\",");
+            let mut seen = 0;
+            for (i, _) in production.match_indices(quoted.as_str()) {
+                let before = production.get(i.saturating_sub(120)..i).unwrap_or_default();
+                let Some(at) = before.rfind("dispatch_app_request") else {
+                    continue; // a mention that is not a dispatch argument
+                };
+                seen += 1;
+                let call = before.get(at..).unwrap_or_default();
+                assert!(
+                    call.starts_with("dispatch_app_request_action"),
+                    "{action} is dispatched through a READ envelope: {call}"
+                );
+            }
+            assert!(seen >= 1, "{action}: no dispatch call found");
+        }
+    }
+
+    /// The `dispatch_app_request*` wrappers already answer the `{success, data}`
+    /// envelope, so no handler wraps their answer a second time: no handler
+    /// that calls one normalizes again, and `ws_result_envelope` only follows
+    /// the bare-result probe `try_ws_dispatch`.
+    #[test]
+    fn no_handler_wraps_an_already_enveloped_result_again() {
+        let production = production_source();
+        // Split on every `async fn`, `pub` and `pub(crate)` ones included.
+        for chunk in production.split("async fn ").skip(1) {
+            let name = chunk.split('(').next().unwrap_or_default();
+            if name.starts_with("dispatch_app_request") || name == "dispatch_active_tagged" {
+                continue;
+            }
+            let dispatches = chunk.contains("dispatch_app_request");
+            if !dispatches {
+                continue;
+            }
+            // (A `{"success": true, "data": data}` around an IPC fallback's
+            // answer is not a dispatch answer, so it is not checked here.)
+            for rewrap in ["into_envelope()", "into_action_envelope()"] {
+                assert!(
+                    !chunk.contains(rewrap),
+                    "{name} wraps an already-enveloped dispatch answer again ({rewrap})"
+                );
+            }
+            if chunk.contains("ws_result_envelope(") {
+                assert!(
+                    chunk.contains("try_ws_dispatch("),
+                    "{name} envelopes a dispatch_app_request answer a second time"
+                );
+            }
+        }
+        // `ws_result_envelope` follows the bare-result probe and nothing else.
+        for (i, _) in production.match_indices("Json(ws_result_envelope(") {
+            let before = production.get(i.saturating_sub(200)..i).unwrap_or_default();
+            assert!(
+                before.contains("try_ws_dispatch("),
+                "ws_result_envelope wraps something other than try_ws_dispatch's bare result"
+            );
+        }
     }
 
     #[test]
@@ -9765,5 +10002,331 @@ mod text_visibility_dispatch_tests {
             "{body}"
         );
         assert!(body.contains("bump_after_ttl,"), "{body}");
+    }
+
+    // ------------------------------------------------------------------
+    // Plan 2026-10-25-websocket-transport-sdk-replies-reach-ui-bridge-mcp-
+    // as-bare-bodies, Phase 1: a WS-transport app's answer reaches every SDK
+    // route in the HTTP arm's `{success, data}` shape.
+    // ------------------------------------------------------------------
+
+    /// A live WS-transport app `wapp`, made the active SDK connection: the
+    /// registry, the dispatcher over it, the connection manager, the relay and
+    /// the socket's (conn id, outbound frames) so a test can answer a command.
+    struct WsTarget {
+        registry: Arc<AppRegistry>,
+        dispatcher: Arc<AppDispatcher>,
+        connection: Arc<Mutex<SdkConnectionManager>>,
+        relay: Arc<CommandRelay>,
+        conn_id: u64,
+        outbound: tokio::sync::mpsc::Receiver<String>,
+    }
+
+    async fn ws_target() -> WsTarget {
+        let registry = AppRegistry::new();
+        let ws = WsConnectionManager::new();
+        let (conn_id, outbound) = ws.test_register("wapp").await;
+        registry
+            .upsert(
+                sample_app("wapp", "ws-app://wapp"),
+                None,
+                AppTransport::Websocket,
+                Some(1),
+                None,
+            )
+            .await;
+        let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(5));
+        WsTarget {
+            dispatcher: AppDispatcher::new(registry.clone(), relay.clone()),
+            registry,
+            connection: active("wapp", "ws-app://wapp"),
+            relay,
+            conn_id,
+            outbound,
+        }
+    }
+
+    /// Answer the next command frame on the socket with a successful frame
+    /// carrying `result`, and return the action the frame named.
+    async fn answer_next(target: &mut WsTarget, result: Option<Value>) -> String {
+        let frame = tokio::time::timeout(Duration::from_secs(5), target.outbound.recv())
+            .await
+            .expect("no frame within 5 s")
+            .expect("outbound channel closed");
+        let frame: Value = serde_json::from_str(&frame).unwrap();
+        target
+            .relay
+            .resolve(
+                target.conn_id,
+                crate::mcp::relay_binding::BindingMode::Enforce,
+                crate::mcp::command_relay::CommandResponse {
+                    command_id: frame["commandId"].as_str().unwrap().to_string(),
+                    success: true,
+                    result,
+                    error: None,
+                },
+            )
+            .await;
+        frame["action"].as_str().unwrap_or_default().to_string()
+    }
+
+    /// The arming test: a pass-through SDK route served by a WS-transport app
+    /// answers a top-level boolean `success`, entering through the body every
+    /// `dispatch_app_request` / `dispatch_app_request_typed` handler runs.
+    #[tokio::test]
+    async fn ws_pass_through_route_answers_top_level_success() {
+        let mut t = ws_target().await;
+        let summary = json!({"title": "Home", "elementCount": 3});
+        let (registry, dispatcher, connection) = (
+            t.registry.clone(),
+            Arc::clone(&t.dispatcher),
+            Arc::clone(&t.connection),
+        );
+        let pending = tokio::spawn(async move {
+            super::dispatch_app_request_typed_with(
+                &connection,
+                &registry,
+                &dispatcher,
+                "getPageSummary",
+                json!({}),
+                reqwest::Method::GET,
+                "/ai/summary",
+                None,
+            )
+            .await
+        });
+        assert_eq!(
+            answer_next(&mut t, Some(summary.clone())).await,
+            "getPageSummary"
+        );
+        let out = pending.await.unwrap().expect("dispatch ok");
+        assert_eq!(out["success"], json!(true), "{out}");
+        assert_eq!(out["data"], summary, "{out}");
+    }
+
+    /// The handler composition for `/ai/find`: a WS `aiFind` result reaches the
+    /// handler's response with `success: true`. The handler needs an
+    /// `ApiState`, which no test builds, so the dispatch is driven through the
+    /// handler's own body and the handler is pinned to forward that value.
+    #[tokio::test]
+    async fn ws_ai_find_result_reaches_handle_ai_find_with_success() {
+        let mut t = ws_target().await;
+        let found = json!({"found": true, "element": {"id": "save"}, "confidence": 0.9});
+        let (registry, dispatcher, connection) = (
+            t.registry.clone(),
+            Arc::clone(&t.dispatcher),
+            Arc::clone(&t.connection),
+        );
+        let pending = tokio::spawn(async move {
+            super::dispatch_app_request_typed_with(
+                &connection,
+                &registry,
+                &dispatcher,
+                "aiFind",
+                json!({"query": "save"}),
+                reqwest::Method::POST,
+                "/ai/find",
+                Some(json!({"query": "save"})),
+            )
+            .await
+        });
+        assert_eq!(answer_next(&mut t, Some(found.clone())).await, "aiFind");
+        let out = pending.await.unwrap().expect("dispatch ok");
+        assert_eq!(out, json!({"success": true, "data": found}));
+
+        let src = include_str!("sdk_client.rs");
+        let body = src
+            .split_once("async fn handle_ai_find(")
+            .expect("handle_ai_find")
+            .1
+            .split("\nasync fn ")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            body.contains("dispatch_app_request_typed("),
+            "handle_ai_find must dispatch through the read envelope"
+        );
+        assert!(
+            body.contains("Ok(data) => Json(data)")
+                || body.contains("Ok(data) => Json(ai_read_envelope(\"ai/find\", data))"),
+            "handle_ai_find must forward the enveloped answer: {body}"
+        );
+    }
+
+    /// The by-id half of the arming: a `?app_id=` route served by a
+    /// WS-transport app answers a top-level boolean `success`.
+    #[tokio::test]
+    async fn ws_by_id_route_answers_top_level_success() {
+        let mut t = ws_target().await;
+        let snapshot = json!({"elements": [{"id": "a"}]});
+        let (registry, dispatcher) = (t.registry.clone(), Arc::clone(&t.dispatcher));
+        let pending = tokio::spawn(async move {
+            super::dispatch_app_request_by_id_with(
+                &registry,
+                &dispatcher,
+                "wapp",
+                "getControlSnapshot",
+                json!({}),
+                reqwest::Method::GET,
+                "/control/snapshot",
+                None,
+            )
+            .await
+        });
+        assert_eq!(
+            answer_next(&mut t, Some(snapshot.clone())).await,
+            "getControlSnapshot"
+        );
+        let out = pending.await.unwrap().expect("dispatch ok");
+        assert_eq!(out, json!({"success": true, "data": snapshot}));
+    }
+
+    /// The action half: an outcome-less WS element action is a FAILURE with
+    /// the `INDETERMINATE:` error, at the dispatch and at the handler's reader.
+    #[tokio::test]
+    async fn ws_outcome_less_element_action_is_indeterminate_failure() {
+        use crate::mcp::ui_bridge::request::INDETERMINATE_ACTION_ERROR;
+        for result in [None, Some(json!({"elementId": "save"}))] {
+            let mut t = ws_target().await;
+            let (registry, dispatcher, connection) = (
+                t.registry.clone(),
+                Arc::clone(&t.dispatcher),
+                Arc::clone(&t.connection),
+            );
+            let pending = tokio::spawn(async move {
+                super::dispatch_app_request_action_typed_with(
+                    &connection,
+                    &registry,
+                    &dispatcher,
+                    "executeElementAction",
+                    json!({"id": "save", "request": {"action": "click"}}),
+                    reqwest::Method::POST,
+                    "/control/element/save/action",
+                    Some(json!({"action": "click"})),
+                )
+                .await
+            });
+            assert_eq!(
+                answer_next(&mut t, result.clone()).await,
+                "executeElementAction"
+            );
+            let out = pending.await.unwrap().expect("dispatch ok");
+            assert_eq!(out["success"], json!(false), "{result:?} -> {out}");
+            assert_eq!(out["error"], json!(INDETERMINATE_ACTION_ERROR), "{out}");
+            let (body, ok, err) = super::ws_element_action_result(out.clone());
+            assert!(!ok, "{result:?} must not read as success");
+            assert_eq!(err.as_deref(), Some(INDETERMINATE_ACTION_ERROR));
+            assert_eq!(body, out, "an enveloped verdict is not re-normalized");
+        }
+    }
+
+    /// An explicit WS action outcome is kept, success or failure.
+    #[tokio::test]
+    async fn ws_element_action_with_an_outcome_keeps_it() {
+        for (result, expect) in [
+            (json!({"success": true, "elementId": "save"}), true),
+            (json!({"success": false, "error": "disabled"}), false),
+        ] {
+            let mut t = ws_target().await;
+            let (registry, dispatcher, connection) = (
+                t.registry.clone(),
+                Arc::clone(&t.dispatcher),
+                Arc::clone(&t.connection),
+            );
+            let pending = tokio::spawn(async move {
+                super::dispatch_app_request_action_typed_with(
+                    &connection,
+                    &registry,
+                    &dispatcher,
+                    "executeElementAction",
+                    json!({}),
+                    reqwest::Method::POST,
+                    "/control/element/save/action",
+                    None,
+                )
+                .await
+            });
+            answer_next(&mut t, Some(result.clone())).await;
+            let out = pending.await.unwrap().expect("dispatch ok");
+            assert_eq!(out["success"], json!(expect), "{out}");
+            assert_eq!(out["data"], result, "{out}");
+            let (_, ok, _) = super::ws_element_action_result(out);
+            assert_eq!(ok, expect);
+        }
+    }
+
+    /// The HTTP arm is byte-identical: the SDK server's body, verbatim, through
+    /// both the read and the action body.
+    #[tokio::test]
+    async fn the_http_arm_answers_the_apps_body_verbatim() {
+        let registry = AppRegistry::new();
+        let url = json_echo_app().await;
+        registry
+            .upsert(
+                sample_app("happ", &url),
+                None,
+                AppTransport::Http,
+                None,
+                None,
+            )
+            .await;
+        let dispatcher = AppDispatcher::new(
+            registry.clone(),
+            CommandRelay::new(WsConnectionManager::new()),
+        );
+        let connection = active("happ", &url);
+        let expected = json!({"success": true, "path": "/ai/find", "got": {"q": 1}});
+        let read = super::dispatch_app_request_typed_with(
+            &connection,
+            &registry,
+            &dispatcher,
+            "aiFind",
+            json!({"ignored": true}),
+            reqwest::Method::POST,
+            "/ai/find",
+            Some(json!({"q": 1})),
+        )
+        .await
+        .expect("read ok");
+        assert_eq!(read, expected);
+        let action = super::dispatch_app_request_action_typed_with(
+            &connection,
+            &registry,
+            &dispatcher,
+            "executeElementAction",
+            json!({"ignored": true}),
+            reqwest::Method::POST,
+            "/ai/find",
+            Some(json!({"q": 1})),
+        )
+        .await
+        .expect("action ok");
+        assert_eq!(action, expected);
+    }
+
+    /// `/control/text-visibility` is a pass-through route too: a WS app's bare
+    /// reply is enveloped.
+    #[tokio::test]
+    async fn a_websocket_apps_text_visibility_reply_is_enveloped() {
+        let mut t = ws_target().await;
+        let (dispatcher, connection) = (Arc::clone(&t.dispatcher), Arc::clone(&t.connection));
+        let pending = tokio::spawn(async move {
+            sdk_text_visibility(
+                &dispatcher,
+                &connection,
+                json!({"hidden": true}),
+                || {},
+                |_| {},
+            )
+            .await
+        });
+        assert_eq!(
+            answer_next(&mut t, Some(json!({"hidden": true, "count": 4}))).await,
+            "textVisibility"
+        );
+        assert_eq!(
+            pending.await.unwrap(),
+            json!({"success": true, "data": {"hidden": true, "count": 4}})
+        );
     }
 }

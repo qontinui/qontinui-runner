@@ -55,7 +55,8 @@ function readFile(path) {
   }
 }
 
-// Match both:
+// Match both (and the strict action-envelope twins
+// dispatch_app_request_action[_typed]):
 //   dispatch_app_request(&state, "<name>", ...
 //   try_ws_dispatch(&state, "<name>", ...
 // `\s*` between tokens crosses newlines, so multi-line call shapes like
@@ -68,7 +69,7 @@ function readFile(path) {
 // "double-quoted" literal.
 function extractRunnerActions(src) {
   const patterns = [
-    /dispatch_app_request\(\s*&state,\s*"([^"]+)"/g,
+    /dispatch_app_request(?:_action(?:_typed)?)?\(\s*&state,\s*"([^"]+)"/g,
     /try_ws_dispatch\(\s*&state,\s*"([^"]+)"/g,
   ];
   const out = new Set();
@@ -115,7 +116,7 @@ function extractRouteTable(src) {
   // The negative lookahead `(?!\nasync fn )` prevents the lazy `[\s\S]*?`
   // from running past the handler's closing brace into the next handler.
   const re =
-    /\/\/\/\s+(GET|POST|PUT|DELETE|PATCH)\s+(\S+)(?:\s+—\s+([^\n]+))?\nasync fn (handle_[a-z0-9_]+)\b((?:(?!\nasync fn )[\s\S])*?)(?:dispatch_app_request|try_ws_dispatch)\(\s*&state,\s*"([^"]+)"/g;
+    /\/\/\/\s+(GET|POST|PUT|DELETE|PATCH)\s+(\S+)(?:\s+—\s+([^\n]+))?\nasync fn (handle_[a-z0-9_]+)\b((?:(?!\nasync fn )[\s\S])*?)(?:dispatch_app_request(?:_action(?:_typed)?)?|try_ws_dispatch)\(\s*&state,\s*"([^"]+)"/g;
   const rows = [];
   for (const m of src.matchAll(re)) {
     rows.push({
