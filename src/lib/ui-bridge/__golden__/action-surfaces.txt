@@ -4,13 +4,6 @@
 #   pnpm exec vitest run src/lib/ui-bridge/actionSurfaces.enforcement.test.ts
 # after setting UPDATE_ACTION_SURFACE_GOLDEN=1.
 #
-# total: 185
-#   guarded: 25
-#   literal: 60
-#   registry: 43
-#   delegated: 9
-#   builtin: 15
-#   fixture: 33
 
 src/App.tsx	literal	component	complete	schema=no	arity=0	effect=write
 src/App.tsx	guarded	component	go-to-step	schema=yes	arity=-	effect=read

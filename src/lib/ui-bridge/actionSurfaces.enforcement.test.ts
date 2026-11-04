@@ -48,6 +48,7 @@ import {
   isFixtureFile,
   sourceFiles,
   registryHandlerCallSites,
+  formCounts,
   renderInventory,
   scanTree,
   unresolvedDelegates,
@@ -471,7 +472,12 @@ describe("UI Bridge action surfaces — the inventory", () => {
     // A diff here is not a failure to fix by re-generating without reading it:
     // it is the list of action surfaces this app exposes to the wire, and a
     // new line in it is a new thing an agent can invoke.
-    expect(rendered).toBe(readFileSync(GOLDEN, "utf8").split("\r\n").join("\n"));
+    // The golden carries no count line (renderInventory's doc comment says
+    // why), so the tally is printed here, where a reader of a red sees it.
+    expect(
+      rendered,
+      `the action-surface inventory changed — this tree has ${formCounts(SURFACES)}`,
+    ).toBe(readFileSync(GOLDEN, "utf8").split("\r\n").join("\n"));
   });
 
   // The golden is keyed on the surface's IDENTITY, never on where it happens
