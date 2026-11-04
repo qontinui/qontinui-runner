@@ -534,7 +534,7 @@ discriminates nothing; its `code` and `error` do.
   (`GET /ui-bridge/_routes`, `GET /ui-bridge/commands`). For a route the UI
   Bridge deliberately deleted (`mcp/ui_bridge/removed_routes.rs`,
   `REMOVED_UI_BRIDGE_ROUTES` — the old screenshot / element-image /
-  stuck-screen / `/ai/media/*` family), the message first says the route was
+  stuck-screen / `/ai/media/*` and `/sdk/ai/media/*` family), the message first says the route was
   removed and names the replacement, `POST /ui-bridge/vision/capture` (bytes at
   `GET /ui-bridge/vision/cache/{sha256}`). Status stays 404 and code stays
   `NOT_FOUND` either way.

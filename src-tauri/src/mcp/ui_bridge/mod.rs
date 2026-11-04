@@ -1112,9 +1112,9 @@ mod manifest_drift_tests {
     }
 
     /// Entries still in [`runner_only_baseline`] that the runner no longer
-    /// serves, each removed by an open PR this branch is stacked behind. They
-    /// are exempt here only so this branch is green before that PR lands;
-    /// delete each line once its PR has merged.
+    /// serves, each deleted from the baseline by a named open PR. They are
+    /// exempt here only until that PR lands; delete each line once it has
+    /// merged.
     const BASELINE_PENDING_REMOVAL: &[(&str, &str, &str)] = &[(
         "POST",
         "/ui-bridge/control/capture-element-images",

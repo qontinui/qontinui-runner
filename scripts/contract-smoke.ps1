@@ -1184,7 +1184,7 @@ try {
                         $hasSuccessFalse = ($names -contains 'success') -and (-not $parsed.success)
                         $hasErrorField = ($names -contains 'error') -and ($null -ne $parsed.error)
                         $isRouteFallback = ($names -contains 'code') -and ($parsed.code -eq 'NOT_FOUND') -and
-                            $hasErrorField -and ([string]$parsed.error).StartsWith('No route for')
+                            $hasErrorField -and ([string]$parsed.error).StartsWith("No route for ", [System.StringComparison]::Ordinal)
                         if (($hasSuccessFalse -or $hasErrorField) -and -not $isRouteFallback) { $isStructuredErr = $true }
                     }
                 } catch {
