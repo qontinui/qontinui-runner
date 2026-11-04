@@ -4615,9 +4615,15 @@ mod tests {
             .expect("test storage");
 
         let mut resp = pair_resp("jwt.a.1");
-        assert!(!persist_device_machine_key(&storage, &resp), "no key → not stored");
+        assert!(
+            !persist_device_machine_key(&storage, &resp),
+            "no key → not stored"
+        );
         resp.device_machine_key = Some("   ".to_string());
-        assert!(!persist_device_machine_key(&storage, &resp), "blank key → not stored");
+        assert!(
+            !persist_device_machine_key(&storage, &resp),
+            "blank key → not stored"
+        );
         assert!(storage.get_device_machine_key().unwrap().is_none());
 
         resp.device_machine_key = Some("dmk_unit_fixture_placeholder".to_string());
