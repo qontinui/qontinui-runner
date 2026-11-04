@@ -5173,10 +5173,30 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// `coord_push_to_branch`, `coord_push_credential` — sessions open PRs via the
 /// dedicated `/vcs/pull-requests` loopback route, not this proxy), reservations
 /// (`coord_migration_reserve`, `coord_reserve_resource`), policy/state
-/// mutation (`coord_request_policy`, `coord_flag_state`, `coord_flag_states`),
-/// and per-agent levers coord would also hand to every un-curated agent
-/// (`coord_fleet_drain`, `coord_fleet_undrain`, `coord_fleet_drain_host`,
-/// `coord_fleet_undrain_host`).
+/// mutation (`coord_request_policy`, `coord_flag_state`, `coord_flag_states`).
+///
+/// The fleet-drain writes (`coord_fleet_drain`, `coord_fleet_undrain`,
+/// `coord_fleet_drain_host`, `coord_fleet_undrain_host`) are IN, beside their
+/// read `coord_fleet_drain_status`. They used to be withheld as "per-agent
+/// levers coord would also hand to every un-curated agent"; served
+/// `decision_record/fleet-drain-default-for-agents` (accepted 2026-11-04,
+/// operator: "agents should have all drain tools"; evidence finding
+/// `f802311d-aef5-40e8-a5f8-4bd3a554b37e`) makes handing them to every agent
+/// the intent, so that rationale no longer holds. coord's half of the decision
+/// puts all five on `DEVICE_DEFAULT_TOOLS`; it is NOT on coord `origin/main` as
+/// of this change (`DEVICE_FLOOR_PRIVILEGED_EXCLUSIONS` still fences the four
+/// writes off the device floor). coord stays the gate on who may call them; what bounds
+/// a call is coord's, unchanged from `decision_record/fleet-drain-agent-authority`:
+/// the ownership floor (the device is in the caller's tenant), the redacted
+/// `drained_by`, an unreadable drain set never reading `Clear`, and the mandatory
+/// `until`, so every drain is reversible and self-expiring. Prefer a lane-scoped
+/// drain (`lanes: ["agent"]`) when only spawns need holding, so CI keeps running.
+/// Forwarding ahead of coord's floor change: until it lands, coord itself
+/// refuses a device principal and an agent curated by a role template, while a
+/// row-less (un-curated) agent, whose catalog is coord's whole surface, gains
+/// the levers at once. That is the outcome the decision intends, not a leak.
+/// Until then a device's `tools/list` will not advertise the four writes, so
+/// they show in `coordMcpForwardedUnadvertised`; that is expected, not drift.
 ///
 /// LOAD-BEARING, do not strip as "reads nobody uses": `coord_list_prompt_documents`
 /// and `coord_get_prompt_document` are how the fleet reads served POLICY, and the
@@ -5573,8 +5593,11 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 ///   guard still refuses to remove a tree with uncommitted work, so nothing is
 ///   deleted by this call itself.
 ///
-/// The other eight are in [`COORD_MCP_DELIBERATE_EXCLUSIONS`], each with its
-/// reason in that list's note.
+/// Four more (`coord_fleet_drain`, `coord_fleet_undrain`, `coord_fleet_drain_host`,
+/// `coord_fleet_undrain_host`) were first classified as deliberate exclusions and
+/// were moved IN by `decision_record/fleet-drain-default-for-agents` (see the
+/// fleet-drain paragraph above). The other four are in
+/// [`COORD_MCP_DELIBERATE_EXCLUSIONS`], each with its reason in that list's note.
 ///
 /// **The per-repo tenant binding writes are IN, with their risk stated** (plan
 /// `2026-10-17-per-repo-tenant-binding-overrides-the-org-tenant` Phase 6; the
@@ -5714,7 +5737,13 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_find_references",
     "coord_fixer_arm_readiness",
     "coord_fleet_dispatch_roles",
+    // decision_record/fleet-drain-default-for-agents (2026-11-04): every agent
+    // holds all five drain tools; coord, not this list, is the gate.
+    "coord_fleet_drain",
+    "coord_fleet_drain_host",
     "coord_fleet_drain_status",
+    "coord_fleet_undrain",
+    "coord_fleet_undrain_host",
     "coord_force_clear_gate",
     "coord_gate_doctor",
     "coord_gate_inspect",
@@ -5920,24 +5949,13 @@ fn coord_mcp_tool_is_allowed(name: &str) -> bool {
 ///
 /// MUST stay sorted — membership is a `binary_search`.
 ///
-/// Eight of them were added on the classification of finding `31a69d12` (record:
+/// Four of them were added on the classification of finding `31a69d12` (record:
 /// coord finding `4ba64e8b`, correcting `73b15a9b`). None of them was forwarded
-/// before, so listing it here takes nothing away. Four join an existing family
-/// in the note above, and the fleet-drain writes start a new one (per-agent
-/// grants):
+/// before, so listing it here takes nothing away. They join existing families
+/// in the note above. (That classification also listed the four fleet-drain
+/// writes here; `decision_record/fleet-drain-default-for-agents`, accepted
+/// 2026-11-04, moved them to [`COORD_MCP_ALLOWED_TOOLS`] — see its note.)
 ///
-/// * `coord_fleet_drain`, `coord_fleet_undrain`, `coord_fleet_drain_host`,
-///   `coord_fleet_undrain_host`: coord keeps these off its device floor and
-///   grants them per AGENT (`decision_record/fleet-drain-agent-authority`), so
-///   a dev-ops agent holds them and an ordinary implementation agent does not.
-///   Agents DO reach this door: a nonce bound to an agent (`ProxyPrincipal::Agent`)
-///   forwards with that agent's own JWT. But coord gives an agent token with NO
-///   `coord.agent_tool_access` rows its whole UN-CURATED catalog (`allow ==
-///   None`), which includes these four. Forwarding them would therefore hand a
-///   fleet-wide capacity lever to every spawned agent that has no rows, which is
-///   exactly the agent the decision withholds them from. They stay withheld
-///   here until coord curates row-less agents; then move them to the allowlist
-///   and let coord's per-agent grant decide.
 /// * `coord_push_credential`: code publication. It mints a `contents:write`
 ///   token for ANY repository under a tenant-bound owner, including existing
 ///   ones, which is a raw push that bypasses the PR path. That is a stronger
@@ -5961,7 +5979,7 @@ fn coord_mcp_tool_is_allowed(name: &str) -> bool {
 ///
 /// Two more are recorded here because coord grants them on the device floor and
 /// this list masks them on purpose. They were found while classifying the
-/// eleven above:
+/// eleven names of finding `31a69d12`:
 ///
 /// * `coord_create_pr`: coord grants it on the device floor (operator decision
 ///   2026-08-04), and this door MASKS it anyway. That is a recorded deselection,
@@ -5988,10 +6006,6 @@ const COORD_MCP_DELIBERATE_EXCLUSIONS: &[&str] = &[
     "coord_enroll_repo",
     "coord_flag_state",
     "coord_flag_states",
-    "coord_fleet_drain",
-    "coord_fleet_drain_host",
-    "coord_fleet_undrain",
-    "coord_fleet_undrain_host",
     "coord_migration_reserve",
     "coord_pr_merge_profile",
     "coord_pr_merge_verdict",
@@ -18521,14 +18535,20 @@ mod coord_mcp_body_gate_tests {
 
     /// Finding `31a69d12`: the eleven names coord advertised that this door had
     /// left unclassified. A literal enumeration of the decision recorded in
-    /// coord finding `4ba64e8b`. Moving any name between the two lists reds
-    /// this test by name, so the decision cannot change by drift.
+    /// coord finding `4ba64e8b`, as amended by
+    /// `decision_record/fleet-drain-default-for-agents` (the four drain writes
+    /// moved to forwarded). Moving any name between the two lists reds this
+    /// test by name, so the decision cannot change by drift.
     #[test]
     fn finding_31a69d12_drift_is_classified() {
         for tool in [
             "coord_check_repo_name",
             "coord_create_repo",
             "coord_pin_worktree",
+            "coord_fleet_drain",
+            "coord_fleet_undrain",
+            "coord_fleet_drain_host",
+            "coord_fleet_undrain_host",
         ] {
             assert!(coord_mcp_tool_is_allowed(tool), "{tool} must be forwarded");
             assert!(
@@ -18537,10 +18557,6 @@ mod coord_mcp_body_gate_tests {
             );
         }
         for tool in [
-            "coord_fleet_drain",
-            "coord_fleet_undrain",
-            "coord_fleet_drain_host",
-            "coord_fleet_undrain_host",
             "coord_push_credential",
             "coord_enroll_repo",
             "coord_attest_advisory_ci_override",
@@ -18658,6 +18674,42 @@ mod coord_mcp_body_gate_tests {
             .is_ok(),
             "{tool} must be callable through the proxy"
         );
+    }
+
+    /// `decision_record/fleet-drain-default-for-agents` (accepted 2026-11-04;
+    /// finding `f802311d-aef5-40e8-a5f8-4bd3a554b37e`): all five fleet-drain
+    /// tools are forwarded, none reads as a deliberate withholding, and a
+    /// refusal for one can never carry `cause: deliberate` again. Pinned by
+    /// name so re-adding any to the exclusions reds this test.
+    #[test]
+    fn fleet_drain_tools_are_forwarded_by_default() {
+        let parsed = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        for tool in [
+            "coord_fleet_drain",
+            "coord_fleet_undrain",
+            "coord_fleet_drain_host",
+            "coord_fleet_undrain_host",
+            "coord_fleet_drain_status",
+        ] {
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must be forwarded");
+            assert!(
+                !coord_mcp_withholding_is_deliberate(tool),
+                "{tool} must not be both allowed and listed as a deliberate exclusion"
+            );
+            assert!(
+                parsed.allows(tool) && !parsed.deliberately_excludes(tool),
+                "the trunk-policy parser must read {tool} as allowed, not deliberate"
+            );
+            assert!(
+                gate(serde_json::json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":tool,"arguments":{}}
+                }))
+                .is_ok(),
+                "{tool} must be callable through the proxy"
+            );
+        }
     }
 
     /// Non-allowlisted tools are refused with the request's id echoed —
