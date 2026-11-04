@@ -1,0 +1,3 @@
+dev_ports	generate_mcp_tool_context	742b0c3efd3be20f
+dev_ports	generate_mcp_tool_context	b02f681d028b8cba
+os_bound_tooling	const AI_SESSION_SUPERVISOR_RESTART_RECIPE	5593571e5b28971e

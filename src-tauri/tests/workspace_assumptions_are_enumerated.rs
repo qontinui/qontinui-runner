@@ -62,23 +62,20 @@
 //! or a row with no hit — plus the vacuity guards (the `scanned_files` floor,
 //! every class matching its own planted fixture, the vocabulary's own examples
 //! and look-alikes through this matcher, an unreadable vocabulary), plus the
-//! UNREVIEWED RATCHET: the `unreviewed` row count must equal the
-//! `unreviewed_ceiling` checked into the dispositions file. Above it, the test
-//! names the new rows (a new assumption is looked at once, by its author, at
-//! PR time); below it, the test asks for the ceiling to be lowered, so a
-//! triage gain is held. Because a NET count cannot see a swap (one assumption
-//! removed, a new one added), regeneration also refuses any unreviewed row
-//! under a `(class, file, symbol)` key the checked-in roster does not carry,
-//! until the dispositions file names that key (reviewed, or an explicit
-//! `disposition = "unreviewed"` acknowledgement). The base for that rule is
-//! the roster at `merge-base HEAD origin/main` (then `main`), never the
-//! working-tree JSON, and it runs in both modes; when that base cannot be read
-//! (no git, a shallow clone) the test prints `SWAP RULE UNKNOWN: <why>` and
-//! does not fail. Its granularity is the KEY: a swap WITHIN a key the base
-//! already carries (one line of a symbol replaced by another) is caught only
-//! if it raises the net count. It does **not** fail on `defect` counts (parent
-//! Non-goal 2 stands). It prints
-//! `unreviewed=<n> unreviewed_ceiling=<n> defect=<n> scanned_files=<n> skipped_files=<n (reason)>`,
+//! UNREVIEWED LEDGER: the set of `unreviewed` rows must EQUAL the per-row
+//! ledger under `docs/workspace-assumptions/unreviewed/` — one shard per source
+//! file (`src/a/b.rs` -> `src__a__b.rs.txt`), one sorted
+//! `class<TAB>symbol<TAB>excerpt-hash` line per unreviewed row. A row the
+//! ledger lacks reds the test with the exact line to add (a new assumption is
+//! looked at once, by its author, at PR time); a ledger line with no row reds
+//! it with the line to delete, so a triage gain is held. Being a set, not a
+//! count, it also sees a SWAP (one assumption removed, a new one added). Plan
+//! `2026-11-04-runner-generated-and-ledger-files-are-merge-neutral-and-land-behind-a-drain`
+//! Phase 2a replaced the single `unreviewed_ceiling = N` cell, which every PR
+//! adding or triaging a row rewrote, and with it the merge-base swap rule the
+//! net count needed. It does **not** fail on `defect` counts (parent Non-goal
+//! 2 stands). It prints
+//! `unreviewed=<n> ledger=<n> defect=<n> scanned_files=<n> skipped_files=<n (reason)>`,
 //! so "0 hits" is distinguishable from "scanned nothing".
 //!
 //! ## Dispositions
@@ -105,9 +102,9 @@
 //!
 //! rewrites `docs/workspace-assumptions.{json,md}` from the scan plus the
 //! dispositions file. Review the diff like any other: a new row is a new
-//! workspace assumption someone just shipped. Regeneration REFUSES when the
-//! unreviewed count would exceed `unreviewed_ceiling` (it names the rows), so
-//! the ratchet cannot be laundered through a regenerate.
+//! workspace assumption someone just shipped. Regeneration NEVER writes the
+//! ledger, and REFUSES while an unreviewed row has no ledger line (it names
+//! the lines), so the ratchet cannot be laundered through a regenerate.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -122,7 +119,7 @@ const PLAN_STEM: &str =
     "2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports";
 
 /// The plan whose Phase A6 re-pointed the class table at `fleet-nouns.toml`
-/// and added the `unreviewed_ceiling` ratchet.
+/// and added the unreviewed ratchet (since made a per-row ledger).
 const VOCABULARY_PLAN_STEM: &str =
     "2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists";
 
@@ -139,6 +136,8 @@ const SCANNED_FILES_FLOOR: usize = 1200;
 const ROSTER_JSON: &str = "../docs/workspace-assumptions.json";
 const ROSTER_MD: &str = "../docs/workspace-assumptions.md";
 const DISPOSITIONS_TOML: &str = "../docs/workspace-assumptions.dispositions.toml";
+/// The unreviewed ratchet's per-row ledger: one shard per source file.
+const UNREVIEWED_LEDGER_DIR: &str = "../docs/workspace-assumptions/unreviewed";
 const FIXTURE_DIR: &str = "tests/fixtures/workspace-assumptions";
 const UPDATE_ENV: &str = "UPDATE_WORKSPACE_ASSUMPTIONS";
 /// The ONE fleet-noun vocabulary, read from the sibling qontinui-schemas
@@ -1513,11 +1512,10 @@ fn check_floor(result: &ScanResult) -> Result<(), String> {
 
 #[derive(Debug, Deserialize)]
 struct DispositionsFile {
-    /// The ratchet: the roster's `unreviewed` ROW count must EQUAL this. More
-    /// is a new, un-looked-at assumption (red, naming the rows); fewer means
-    /// someone triaged one and the ceiling must come down to hold the gain.
-    /// Absent is a red, never "no ceiling".
-    unreviewed_ceiling: Option<usize>,
+    /// The retired ceiling. Present is a red: the ratchet is the per-row
+    /// ledger now (`UNREVIEWED_LEDGER_DIR`), and a count left here would be
+    /// read by nothing.
+    unreviewed_ceiling: Option<toml::Value>,
     #[serde(default)]
     disposition: Vec<DispositionEntry>,
 }
@@ -1587,19 +1585,20 @@ fn valid_disposition(d: &str) -> bool {
 
 type Key = (String, String, String);
 
-fn load_dispositions(root: &Path) -> Result<(BTreeMap<Key, Disposition>, usize), String> {
+fn load_dispositions(root: &Path) -> Result<BTreeMap<Key, Disposition>, String> {
     let path = root.join(DISPOSITIONS_TOML);
     let text =
         fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let parsed: DispositionsFile =
         toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    let ceiling = parsed.unreviewed_ceiling.ok_or_else(|| {
-        format!(
-            "{} has no top-level `unreviewed_ceiling = <n>` — the ratchet's checked-in bound \
-             is required (an absent ceiling is not \"unbounded\")",
+    if parsed.unreviewed_ceiling.is_some() {
+        return Err(format!(
+            "{} carries `unreviewed_ceiling`, which nothing reads: the unreviewed ratchet is \
+             the per-row ledger under {UNREVIEWED_LEDGER_DIR}/ — delete the line and add the \
+             ledger line(s) this test names instead",
             path.display()
-        )
-    })?;
+        ));
+    }
     let mut out = BTreeMap::new();
     for e in parsed.disposition {
         if !valid_disposition(&e.disposition) {
@@ -1629,151 +1628,163 @@ fn load_dispositions(root: &Path) -> Result<(BTreeMap<Key, Disposition>, usize),
             ));
         }
     }
-    Ok((out, ceiling))
+    Ok(out)
 }
 
-/// The exact ratchet on `unreviewed` rows. `fresh` is this scan's roster,
-/// `checked` the checked-in one (used only to NAME what is new).
-fn check_ceiling(fresh: &[Row], checked: &[Row], ceiling: usize) -> Result<(), String> {
-    let unreviewed: Vec<&Row> = fresh
-        .iter()
-        .filter(|r| r.disposition == "unreviewed")
-        .collect();
-    let n = unreviewed.len();
-    if n > ceiling {
-        let was: BTreeSet<String> = checked
-            .iter()
-            .filter(|r| r.disposition == "unreviewed")
-            .map(row_ident)
-            .collect();
-        let new_rows: Vec<String> = unreviewed
-            .iter()
-            .map(|r| row_ident(r))
-            .filter(|k| !was.contains(k))
-            .collect();
-        let named = if new_rows.is_empty() {
-            "(none differ from the checked-in roster, so the ceiling itself was lowered below \
-             the roster's own unreviewed count — restore it)"
-                .to_string()
-        } else {
-            new_rows.join("\n    ")
-        };
-        return Err(format!(
-            "UNREVIEWED ABOVE CEILING: unreviewed={n} > unreviewed_ceiling={ceiling} in \
-             {DISPOSITIONS_TOML}. New unreviewed row(s):\n    {named}\n\
-             Review each: give it a disposition (fallback_correct | dev_only_surface | \
-             defect(<plan stem>)) with its `reviewed` excerpt, or remove the assumption. \
-             Raising the ceiling instead is a visible, reviewable choice — make it only with \
-             the reason in the PR."
-        ));
-    }
-    if n < ceiling {
-        return Err(format!(
-            "UNREVIEWED BELOW CEILING: unreviewed={n} < unreviewed_ceiling={ceiling}. Lower \
-             `unreviewed_ceiling` to {n} in {DISPOSITIONS_TOML} so the gain is held (exact \
-             ratchet)."
-        ));
-    }
-    Ok(())
+/// The ledger shard a source file's unreviewed rows live in:
+/// `src/a/b.rs` -> `src__a__b.rs.txt`.
+fn ledger_shard_name(file: &str) -> String {
+    // `src/a__b.rs` and `src/a/b.rs` would otherwise share a shard.
+    assert!(
+        !file.contains("__"),
+        "{file}: a source path with `__` cannot be told apart from a `/` in its ledger shard \
+         name — rename the file or change the shard encoding"
+    );
+    format!("{}.txt", file.replace('/', "__"))
 }
 
-/// A `git` invocation in `repo` with the repository-selecting variables an
-/// enclosing hook or worktree may export removed, so `current_dir` is
-/// authoritative (the same hazard `fleet_skills/.../lib/git-scope.sh` names).
-fn git_in(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let out = std::process::Command::new("git")
-        .current_dir(repo)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_NAMESPACE")
-        .args(args)
-        .output()
-        .map_err(|e| format!("`git {}` could not run: {e}", args.join(" ")))?;
-    if !out.status.success() {
-        return Err(format!(
-            "`git {}` exited {}: {}",
-            args.join(" "),
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+/// A row's ledger line, `class<TAB>symbol<TAB>excerpt-hash`. The excerpt is
+/// hashed (sha256, 16 hex chars) so the line stays short and tab-free.
+fn ledger_line(r: &Row) -> String {
+    use sha2::{Digest, Sha256};
+    assert!(
+        !r.class.contains(['\t', '\n']) && !r.symbol.contains(['\t', '\n']),
+        "a class or symbol carries a tab or newline, which the ledger cannot hold: {}",
+        row_ident(r)
+    );
+    let hash = hex::encode(Sha256::digest(r.excerpt.as_bytes()));
+    format!("{}\t{}\t{}", r.class, r.symbol, &hash[..16])
 }
 
-/// The roster JSON at `merge-base HEAD <main>` (trying `origin/main`, then
-/// `main`), with a label naming what was read. `Err` says why it could not be
-/// read (no git, no main ref, a shallow clone with no merge base, the file
-/// absent there) — the caller reports that as UNKNOWN.
-fn merge_base_roster(repo: &Path) -> Result<(String, Vec<Row>), String> {
-    let mut why = Vec::new();
-    for main in ["origin/main", "main"] {
-        let spec = format!("{main}^{{commit}}");
-        if let Err(e) = git_in(repo, &["rev-parse", "--verify", "--quiet", &spec]) {
-            why.push(format!("{main}: no such ref ({e})"));
+/// The ledger the fresh roster's `unreviewed` rows require: shard -> lines.
+fn required_ledger(fresh: &[Row]) -> BTreeMap<String, BTreeSet<String>> {
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for r in fresh.iter().filter(|r| r.disposition == "unreviewed") {
+        out.entry(ledger_shard_name(&r.file))
+            .or_default()
+            .insert(ledger_line(r));
+    }
+    out
+}
+
+/// The checked-in ledger: every `*.txt` shard in `dir`, shard -> lines.
+/// Anything else in the directory, an unsorted or duplicated line, a
+/// malformed line or an empty shard is an error — the shards are written by
+/// hand, so their shape is checked rather than trusted.
+fn read_ledger(dir: &Path) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
+    let entries = fs::read_dir(dir).map_err(|e| {
+        format!(
+            "cannot read the unreviewed ledger {}: {e} — an absent ledger is not an empty one",
+            dir.display()
+        )
+    })?;
+    let mut out = BTreeMap::new();
+    let mut bad = Vec::new();
+    for entry in entries {
+        let path = entry.map_err(|e| format!("{}: {e}", dir.display()))?.path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if !path.is_file() || !name.ends_with(".txt") {
+            bad.push(format!("{name}: not a `<source path>.txt` ledger shard"));
             continue;
         }
-        let base = match git_in(repo, &["merge-base", "HEAD", main]) {
-            Ok(b) => b.trim().to_string(),
-            Err(e) => {
-                let shallow = git_in(repo, &["rev-parse", "--is-shallow-repository"])
-                    .map(|s| s.trim() == "true")
-                    .unwrap_or(false);
-                why.push(format!(
-                    "{main}: no merge base{} ({e})",
-                    if shallow {
-                        " — the clone is SHALLOW"
-                    } else {
-                        ""
-                    }
+        let text = fs::read_to_string(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .replace("\r\n", "\n");
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.is_empty() {
+            bad.push(format!("{name}: empty — delete the shard"));
+        }
+        for l in &lines {
+            if l.split('\t').count() != 3 || l.split('\t').any(str::is_empty) {
+                bad.push(format!(
+                    "{name}: malformed line {l:?} (want class<TAB>symbol<TAB>hash)"
                 ));
-                continue;
             }
-        };
-        let object = format!("{base}:docs/workspace-assumptions.json");
-        let text = match git_in(repo, &["show", &object]) {
-            Ok(t) => t,
-            Err(e) => {
-                why.push(format!(
-                    "{main}: roster unreadable at merge base {base} ({e})"
-                ));
-                continue;
-            }
-        };
-        let roster: Roster = serde_json::from_str(&text)
-            .map_err(|e| format!("roster at merge base {base} ({main}) does not parse: {e}"))?;
-        return Ok((format!("merge-base({main}) {base}"), roster.rows));
+        }
+        if lines.windows(2).any(|w| w[0] >= w[1]) {
+            bad.push(format!(
+                "{name}: lines are not sorted and unique (`LC_ALL=C sort -u`)"
+            ));
+        }
+        out.insert(name, lines.iter().map(|l| l.to_string()).collect());
     }
-    Err(why.join("; "))
+    if bad.is_empty() {
+        Ok(out)
+    } else {
+        Err(format!(
+            "the unreviewed ledger {} is malformed:\n    {}",
+            dir.display(),
+            bad.join("\n    ")
+        ))
+    }
 }
 
-/// Unreviewed rows under a `(class, file, symbol)` key the base roster
-/// does not carry at all and the dispositions file does not name. The net
-/// count ratchet cannot see a SWAP (one assumption removed, a new one added);
-/// this can, so regeneration refuses such a row until its author either
-/// reviews it or acknowledges it with an explicit `disposition = "unreviewed"`
-/// entry — a visible line in the hand-edited file either way.
-fn unacknowledged_new_keys(
-    fresh: &[Row],
-    checked: &[Row],
-    explicit: &BTreeSet<Key>,
-) -> Vec<String> {
-    let known: BTreeSet<Key> = checked
-        .iter()
-        .map(|r| (r.class.clone(), r.file.clone(), r.symbol.clone()))
-        .collect();
-    fresh
-        .iter()
-        .filter(|r| r.disposition == "unreviewed")
-        .filter(|r| {
-            let k = (r.class.clone(), r.file.clone(), r.symbol.clone());
-            !known.contains(&k) && !explicit.contains(&k)
-        })
-        .map(row_ident)
-        .collect()
+/// `(lines to add, lines to delete)`, each as `<shard>: <line>`, that would
+/// turn `checked` into `required`.
+fn ledger_diff(
+    required: &BTreeMap<String, BTreeSet<String>>,
+    checked: &BTreeMap<String, BTreeSet<String>>,
+) -> (Vec<String>, Vec<String>) {
+    let empty = BTreeSet::new();
+    let shards: BTreeSet<&String> = required.keys().chain(checked.keys()).collect();
+    let (mut add, mut delete) = (Vec::new(), Vec::new());
+    for shard in shards {
+        let want = required.get(shard).unwrap_or(&empty);
+        let have = checked.get(shard).unwrap_or(&empty);
+        for l in want.difference(have) {
+            add.push(format!("{shard}: {l}"));
+        }
+        for l in have.difference(want) {
+            delete.push(format!("{shard}: {l}"));
+        }
+    }
+    (add, delete)
+}
+
+/// The exact ratchet on `unreviewed` rows: the required ledger must EQUAL the
+/// checked-in one. `Err` names every line to add (a new, un-looked-at
+/// assumption) and every line to delete (a triaged one, so the gain is held).
+fn check_ledger(
+    required: &BTreeMap<String, BTreeSet<String>>,
+    checked: &BTreeMap<String, BTreeSet<String>>,
+) -> Result<(), String> {
+    let (add, delete) = ledger_diff(required, checked);
+    let mut msg = Vec::new();
+    if !add.is_empty() {
+        msg.push(format!(
+            "UNREVIEWED ROW(S) WITH NO LEDGER LINE — new workspace assumption(s). Review each: \
+             give it a disposition (fallback_correct | dev_only_surface | defect(<plan stem>)) \
+             with its `reviewed` excerpt in {DISPOSITIONS_TOML}, or remove the assumption. \
+             Admitting it unreviewed instead is a visible, reviewable choice — add the line to \
+             its shard in {UNREVIEWED_LEDGER_DIR}/ (keep the shard `LC_ALL=C sort -u`) with the \
+             reason in the PR:\n    {}",
+            add.join("\n    ")
+        ));
+    }
+    if !delete.is_empty() {
+        msg.push(format!(
+            "LEDGER LINE(S) WITH NO UNREVIEWED ROW — triaged or removed. Delete each from its \
+             shard in {UNREVIEWED_LEDGER_DIR}/ (and an emptied shard with it) so the gain is \
+             held (exact ratchet):\n    {}",
+            delete.join("\n    ")
+        ));
+    }
+    if !add.is_empty() && !delete.is_empty() {
+        msg.push(
+            "If an assumption only MOVED (a fn renamed or moved to another file), move its \
+             ledger line rather than reviewing it anew."
+                .to_string(),
+        );
+    }
+    if msg.is_empty() {
+        Ok(())
+    } else {
+        Err(msg.join("\n"))
+    }
 }
 
 /// `(capability id, identifier tokens of its anchor)` for every CAPABILITY_SPECS
@@ -1845,10 +1856,6 @@ fn capability_for(hit: &Hit, anchors: &[(String, BTreeSet<String>)]) -> Option<S
 
 struct Built {
     roster: Roster,
-    unreviewed_ceiling: usize,
-    /// Every key with an entry in the dispositions file (any disposition,
-    /// including an explicit `unreviewed`).
-    explicit_keys: BTreeSet<Key>,
     /// A disposition key, or one of its reviewed excerpts, that matches no hit.
     orphan_dispositions: Vec<String>,
     /// Rows under a dispositioned key whose excerpt was never reviewed.
@@ -1856,8 +1863,7 @@ struct Built {
 }
 
 fn build_roster(root: &Path, hits: &[Hit]) -> Result<Built, String> {
-    let (dispositions, unreviewed_ceiling) = load_dispositions(root)?;
-    let explicit_keys: BTreeSet<Key> = dispositions.keys().cloned().collect();
+    let dispositions = load_dispositions(root)?;
     let anchors = capability_anchors(root);
 
     let mut counted: BTreeMap<Hit, usize> = BTreeMap::new();
@@ -1928,8 +1934,6 @@ fn build_roster(root: &Path, hits: &[Hit]) -> Result<Built, String> {
             plan: PLAN_STEM.to_string(),
             rows,
         },
-        unreviewed_ceiling,
-        explicit_keys,
         orphan_dispositions,
         new_since_review,
     })
@@ -1953,9 +1957,9 @@ fn render_md(roster: &Roster, class_ids: &[String]) -> String {
          fixed workspace-assumption patterns — Phase 4 of plan `{PLAN_STEM}`. The fleet-noun \
          classes come from `qontinui-schemas/fleet-nouns.toml` (plan `{VOCABULARY_PLAN_STEM}`, \
          Phase A6); `plans_dir` and `os_bound_tooling` are runner-local. The test fails when \
-         this file is stale, and when the `unreviewed` row count differs from the \
-         `unreviewed_ceiling` checked into the dispositions file (a ratchet: it may only \
-         fall, and each fall lowers the ceiling). It never fails on a `defect` count. \
+         this file is stale, and when the `unreviewed` rows differ from the per-row ledger \
+         under `docs/workspace-assumptions/unreviewed/` (a ratchet: a new row needs its \
+         ledger line, and a triaged row's line is deleted). It never fails on a `defect` count. \
          `docs/workspace-assumptions.json` is the machine-readable twin.\n\n"
     ));
     out.push_str(
@@ -2116,10 +2120,12 @@ fn workspace_assumption_roster_is_fresh() {
         .map(|(k, v)| format!("{v} {k}"))
         .collect::<Vec<_>>()
         .join(", ");
+    let ledger = read_ledger(&root.join(UNREVIEWED_LEDGER_DIR)).unwrap_or_else(|e| panic!("{e}"));
+    let ledger_lines: usize = ledger.values().map(BTreeSet::len).sum();
     let counts = format!(
-        "unreviewed={unreviewed} unreviewed_ceiling={} defect={defect} new_since_review={} \
+        "unreviewed={unreviewed} ledger={ledger_lines} defect={defect} new_since_review={} \
          scanned_files={} skipped_files={skipped_total} ({skipped_detail})",
-        built.unreviewed_ceiling, built.new_since_review, result.scanned_files
+        built.new_since_review, result.scanned_files
     );
     println!("{counts}");
     // CI captures test stdout on a green run; the job summary is where a
@@ -2152,52 +2158,8 @@ fn workspace_assumption_roster_is_fresh() {
     let checked_json = fs::read_to_string(&json_path)
         .unwrap_or_default()
         .replace("\r\n", "\n");
-    let checked_rows: Vec<Row> = serde_json::from_str::<Roster>(&checked_json)
-        .map(|r| r.rows)
-        .unwrap_or_default();
-    let ceiling = check_ceiling(rows, &checked_rows, built.unreviewed_ceiling);
-
-    // The swap rule's base is the roster at the MERGE BASE, never the
-    // working-tree JSON — which a regenerate (after an acknowledgement that is
-    // then deleted) or a hand edit can make carry the new key. Unreadable base
-    // is UNKNOWN: said loudly, never a silent pass.
-    let repo_root = root.parent().unwrap_or(&root).to_path_buf();
-    let unacked: Option<Vec<String>> = match merge_base_roster(&repo_root) {
-        Ok((base, base_rows)) => {
-            println!("swap rule: known keys from the roster at {base}");
-            Some(unacknowledged_new_keys(
-                rows,
-                &base_rows,
-                &built.explicit_keys,
-            ))
-        }
-        Err(why) => {
-            let line = format!("SWAP RULE UNKNOWN: {why}");
-            println!("{line}");
-            eprintln!("{line}");
-            if let Ok(summary) = std::env::var("GITHUB_STEP_SUMMARY") {
-                use std::io::Write;
-                if let Ok(mut f) = fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&summary)
-                {
-                    let _ = writeln!(f, "workspace assumptions: `{line}`");
-                }
-            }
-            None
-        }
-    };
-    let unacked_message = |u: &[String]| {
-        format!(
-            "NEW UNREVIEWED ASSUMPTION(S) under a key the merge-base roster does not carry:\n    \
-             {}\nReview each in {DISPOSITIONS_TOML} (a disposition with its `reviewed` \
-             excerpt), or acknowledge it there with an explicit `disposition = \"unreviewed\"` \
-             entry and a note — the net unreviewed count cannot see a swap, so a new key is \
-             never admitted silently.",
-            u.join("\n    ")
-        )
-    };
+    let required = required_ledger(rows);
+    let ledger_check = check_ledger(&required, &ledger);
 
     if std::env::var(UPDATE_ENV).is_ok_and(|v| v == "1") {
         assert!(
@@ -2206,15 +2168,14 @@ fn workspace_assumption_roster_is_fresh() {
             built.orphan_dispositions
         );
         // Regeneration may not launder a new unreviewed row into the checked-in
-        // roster: above the ceiling it refuses, naming the rows. Below it, the
-        // roster is written and the normal run then asks for the ceiling to fall.
-        if unreviewed > built.unreviewed_ceiling {
-            panic!("{}", ceiling.expect_err("above the ceiling is an error"));
+        // roster, and it never writes the ledger: while a row has no ledger
+        // line it refuses, naming the lines. A ledger line with no row is only
+        // noted; the roster is written and the normal run then asks for the
+        // line to be deleted.
+        if !ledger_diff(&required, &ledger).0.is_empty() {
+            panic!("{}", ledger_check.expect_err("a line to add is an error"));
         }
-        if let Some(u) = unacked.as_ref().filter(|u| !u.is_empty()) {
-            panic!("{}", unacked_message(u));
-        }
-        if let Err(e) = &ceiling {
+        if let Err(e) = &ledger_check {
             println!("NOTE: {e}");
         }
         fs::write(&json_path, &json).expect("write roster json");
@@ -2245,15 +2206,12 @@ fn workspace_assumption_roster_is_fresh() {
     if checked_md != md {
         problems.push("docs/workspace-assumptions.md differs from a fresh render".into());
     }
-    if let Err(e) = ceiling {
+    if let Err(e) = ledger_check {
         problems.push(e);
-    }
-    if let Some(u) = unacked.as_ref().filter(|u| !u.is_empty()) {
-        problems.push(unacked_message(u));
     }
     assert!(
         problems.is_empty(),
-        "\nThe workspace-assumption roster is STALE or off its unreviewed ceiling ({} \
+        "\nThe workspace-assumption roster is STALE or off its unreviewed ledger ({} \
          problem(s)):\n\n  {}\n\n\
          A new row is a new workspace assumption: review it, give it a disposition in \
          docs/workspace-assumptions.dispositions.toml if you can, then regenerate with\n  \
@@ -2647,26 +2605,36 @@ fn row(class: &str, symbol: &str, disposition: &str) -> Row {
     }
 }
 
-/// The exact ratchet: equal passes; one more unreviewed row is a red naming it;
-/// one fewer is a red asking for the ceiling to fall.
+/// The exact ratchet: equal passes; a new unreviewed row is a red naming its
+/// shard and line; a triaged one is a red naming the line to delete; a SWAP
+/// (one out, one in — the net count unchanged) names both.
 #[test]
-fn unreviewed_ceiling_is_an_exact_ratchet() {
+fn unreviewed_ledger_is_an_exact_ratchet() {
     let checked = vec![
         row("dev_ports", "a", "unreviewed"),
         row("dev_ports", "b", "fallback_correct"),
     ];
-    assert!(check_ceiling(&checked, &checked, 1).is_ok());
+    let ledger = required_ledger(&checked);
+    assert_eq!(
+        ledger.keys().collect::<Vec<_>>(),
+        ["src__x.rs.txt"],
+        "one shard per source file, `/` -> `__`"
+    );
+    assert!(check_ledger(&required_ledger(&checked), &ledger).is_ok());
 
     let mut grown = checked.clone();
     grown.push(row("machine_path", "brand_new", "unreviewed"));
-    let err = check_ceiling(&grown, &checked, 1).expect_err("above the ceiling");
-    assert!(err.contains("UNREVIEWED ABOVE CEILING"), "{err}");
+    let err = check_ledger(&required_ledger(&grown), &ledger).expect_err("a new row");
     assert!(
-        err.contains("[machine_path] src/x.rs :: brand_new"),
+        err.contains("UNREVIEWED ROW(S) WITH NO LEDGER LINE"),
         "{err}"
     );
     assert!(
-        !err.contains(":: a ::"),
+        err.contains("src__x.rs.txt: machine_path\tbrand_new\t"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("\ta\t"),
         "an old unreviewed row is not new: {err}"
     );
 
@@ -2674,35 +2642,106 @@ fn unreviewed_ceiling_is_an_exact_ratchet() {
         row("dev_ports", "a", "fallback_correct"),
         row("dev_ports", "b", "fallback_correct"),
     ];
-    let err = check_ceiling(&triaged, &checked, 1).expect_err("below the ceiling");
-    assert!(err.contains("UNREVIEWED BELOW CEILING"), "{err}");
-    assert!(err.contains("to 0"), "{err}");
+    let err = check_ledger(&required_ledger(&triaged), &ledger).expect_err("a triage gain");
+    assert!(
+        err.contains("LEDGER LINE(S) WITH NO UNREVIEWED ROW"),
+        "{err}"
+    );
+    assert!(err.contains("src__x.rs.txt: dev_ports\ta\t"), "{err}");
+
+    let swapped = vec![row("dev_ports", "brand_new", "unreviewed")];
+    let err = check_ledger(&required_ledger(&swapped), &ledger).expect_err("a swap");
+    assert!(err.contains("dev_ports\tbrand_new\t"), "{err}");
+    assert!(err.contains("dev_ports\ta\t"), "{err}");
 }
 
-/// A swap — one unreviewed assumption removed, a new one added — keeps the net
-/// count equal, so the ceiling passes; the new-key check still names the new
-/// row until the dispositions file acknowledges it.
+/// The ledger line is keyed on the excerpt too, so a second excerpt under one
+/// symbol is a second line, and the same excerpt always hashes the same.
 #[test]
-fn a_swapped_in_unreviewed_key_is_not_admitted_silently() {
-    let checked = vec![row("dev_ports", "old", "unreviewed")];
-    let fresh = vec![row("dev_ports", "brand_new", "unreviewed")];
+fn ledger_line_carries_class_symbol_and_an_excerpt_hash() {
+    let a = row("dev_ports", "f", "unreviewed");
+    let mut b = a.clone();
+    b.excerpt = "another".into();
+    let (la, lb) = (ledger_line(&a), ledger_line(&b));
+    assert_ne!(la, lb);
+    assert_eq!(la, ledger_line(&a.clone()));
+    let parts: Vec<&str> = la.split('\t').collect();
+    assert_eq!(parts[..2], ["dev_ports", "f"]);
+    assert_eq!(parts[2].len(), 16);
+    assert!(parts[2].chars().all(|c| c.is_ascii_hexdigit()));
+}
+
+/// The shards are hand-edited, so their shape is checked: an unsorted shard,
+/// an empty one, a malformed line and a stray file are each refused by name,
+/// and an absent ledger is an error rather than an empty one.
+#[test]
+fn read_ledger_refuses_a_malformed_shard() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let d = dir.path();
+    fs::write(
+        d.join("src__ok.rs.txt"),
+        "a\tf\t0123456789abcdef\nb\tg\t0123456789abcdef\n",
+    )
+    .unwrap();
+    assert_eq!(read_ledger(d).unwrap()["src__ok.rs.txt"].len(), 2);
+
+    fs::write(d.join("src__unsorted.rs.txt"), "b\tg\th\na\tf\th\n").unwrap();
+    fs::write(d.join("src__empty.rs.txt"), "").unwrap();
+    fs::write(d.join("src__twocol.rs.txt"), "a\tf\n").unwrap();
+    fs::write(d.join("README.md"), "x").unwrap();
+    let err = read_ledger(d).expect_err("malformed");
+    for want in [
+        "src__unsorted.rs.txt: lines are not sorted",
+        "src__empty.rs.txt: empty",
+        "src__twocol.rs.txt: malformed line",
+        "README.md: not a",
+    ] {
+        assert!(err.contains(want), "{want}: {err}");
+    }
+    assert!(read_ledger(&d.join("absent")).is_err());
+}
+
+/// `docs/*` is gitignored with named re-includes, so a ledger directory the
+/// `.gitignore` forgot would be silently untracked: every shard committed in
+/// one checkout and absent from every other, and the ratchet unreadable.
+/// Checked with `--no-index`, i.e. against the RULES, so it also covers a
+/// shard a future PR adds.
+#[test]
+fn unreviewed_ledger_shards_are_not_gitignored() {
+    let root = crate_root();
+    let repo = root.parent().expect("repo root").to_path_buf();
+    let mut paths: Vec<String> = fs::read_dir(root.join(UNREVIEWED_LEDGER_DIR))
+        .expect("ledger dir")
+        .map(|e| {
+            format!(
+                "docs/workspace-assumptions/unreviewed/{}",
+                e.expect("entry").file_name().to_string_lossy()
+            )
+        })
+        .collect();
     assert!(
-        check_ceiling(&fresh, &checked, 1).is_ok(),
-        "net count is unchanged"
+        !paths.is_empty(),
+        "the ledger has no shards — nothing to check"
     );
-    let got = unacknowledged_new_keys(&fresh, &checked, &BTreeSet::new());
-    assert_eq!(got.len(), 1, "{got:?}");
-    assert!(got[0].contains(":: brand_new ::"), "{got:?}");
-    let acked: BTreeSet<Key> = [(
-        "dev_ports".to_string(),
-        "src/x.rs".to_string(),
-        "brand_new".to_string(),
-    )]
-    .into_iter()
-    .collect();
-    assert!(unacknowledged_new_keys(&fresh, &checked, &acked).is_empty());
-    // A key already in the checked-in roster is not new.
-    assert!(unacknowledged_new_keys(&checked, &checked, &BTreeSet::new()).is_empty());
+    paths.push("docs/workspace-assumptions/unreviewed/src__a_future_shard.rs.txt".into());
+    let out = std::process::Command::new("git")
+        .current_dir(&repo)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .args(["check-ignore", "--no-index", "-v"])
+        .args(&paths)
+        .output()
+        .expect("git check-ignore could not run");
+    // Exit 1 = none of them is ignored; 0 = some are (stdout names the rule).
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "ledger shard(s) are gitignored — re-include `docs/workspace-assumptions/` in \
+         .gitignore beside its other `docs/` negations:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// The runner-local refinements restore what the vocabulary narrowed: a bare
@@ -2748,92 +2787,6 @@ fn runner_refinements_restore_bare_sibling_names_and_port_constants() {
                  fn m() -> &'static str { \"qontinui-runner\" }\n";
     let got = hits(clean);
     assert!(got.is_empty(), "look-alikes produced hits: {got:?}");
-}
-
-fn git_ok(repo: &Path, args: &[&str]) {
-    let mut full = vec![
-        "-c",
-        "user.name=t",
-        "-c",
-        "user.email=t@example.invalid",
-        "-c",
-        "commit.gpgsign=false",
-        "-c",
-        "core.hooksPath=/dev/null",
-    ];
-    full.extend_from_slice(args);
-    git_in(repo, &full).unwrap_or_else(|e| panic!("{e}"));
-}
-
-fn write_roster(repo: &Path, rows: Vec<Row>) {
-    let dir = repo.join("docs");
-    fs::create_dir_all(&dir).expect("mkdir docs");
-    let roster = Roster {
-        schema: 1,
-        generator: "t".into(),
-        plan: "t".into(),
-        rows,
-    };
-    fs::write(dir.join("workspace-assumptions.json"), to_json(&roster)).expect("write roster");
-}
-
-/// Both bypasses of a working-tree base: (a) acknowledge → regenerate →
-/// delete the acknowledgement, and (b) hand-edit the JSON. Either way the
-/// working-tree roster CARRIES the new key; the merge-base roster does not,
-/// so the rule still names the row — committed or not.
-#[test]
-fn swap_rule_base_is_the_merge_base_not_the_working_tree() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let repo = dir.path();
-    git_ok(repo, &["init", "-q", "-b", "main"]);
-    write_roster(repo, vec![row("dev_ports", "old", "unreviewed")]);
-    git_ok(repo, &["add", "-A"]);
-    git_ok(repo, &["commit", "-q", "-m", "base"]);
-    git_ok(repo, &["checkout", "-q", "-b", "feature"]);
-
-    let fresh = vec![
-        row("dev_ports", "old", "unreviewed"),
-        row("dev_ports", "brand_new", "unreviewed"),
-    ];
-    // The bypass state: the working-tree (and even committed) roster already
-    // carries `brand_new`, and no acknowledgement names it.
-    write_roster(repo, fresh.clone());
-    for commit in [false, true] {
-        if commit {
-            git_ok(repo, &["commit", "-q", "-am", "regenerated / hand-edited"]);
-        }
-        let working: Roster = serde_json::from_str(
-            &fs::read_to_string(repo.join("docs/workspace-assumptions.json")).expect("read"),
-        )
-        .expect("parse");
-        assert!(
-            unacknowledged_new_keys(&fresh, &working.rows, &BTreeSet::new()).is_empty(),
-            "precondition: a working-tree base would admit the row"
-        );
-        let (label, base) = merge_base_roster(repo).unwrap_or_else(|e| panic!("{e}"));
-        assert!(label.contains("merge-base(main)"), "{label}");
-        let got = unacknowledged_new_keys(&fresh, &base, &BTreeSet::new());
-        assert_eq!(got.len(), 1, "commit={commit}: {got:?}");
-        assert!(got[0].contains(":: brand_new ::"), "{got:?}");
-    }
-}
-
-/// No main ref to take a merge base against is UNKNOWN with a reason, not an
-/// empty base (which would flag everything) and not a pass.
-#[test]
-fn swap_rule_base_unreadable_is_an_error_with_the_reason() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let repo = dir.path();
-    git_ok(repo, &["init", "-q", "-b", "trunk"]);
-    write_roster(repo, vec![]);
-    git_ok(repo, &["add", "-A"]);
-    git_ok(repo, &["commit", "-q", "-m", "only"]);
-    let err = merge_base_roster(repo).expect_err("no main ref");
-    // Both refs must be tried and reported: `origin/main: …` first, then the
-    // local-`main` fallback after the `; ` separator (`"origin/main:"` alone
-    // already contains `main:`, so that would not prove the fallback ran).
-    assert!(err.starts_with("origin/main:"), "{err}");
-    assert!(err.contains("; main:"), "{err}");
 }
 
 /// The widened bare-port refinement: suffixes and range ends hit; a

@@ -1,0 +1,3 @@
+os_bound_tooling	parse_command_lines_json	1b42d51ede1e42f5
+os_bound_tooling	parse_powershell_snapshot	c8d31b518f5f75d5
+os_bound_tooling	parse_wmi_creation_date	760572eb2748a82a

@@ -1,0 +1,2 @@
+os_bound_tooling	process_owner_sid_blob	1cd23a829fe9922a
+os_bound_tooling	set_owner_only_dacl	e983cfd026d79889

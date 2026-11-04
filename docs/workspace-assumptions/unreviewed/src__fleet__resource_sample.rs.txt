@@ -1,0 +1,6 @@
+os_bound_tooling	attach_wsl_disk	8ada9e832e9fef29
+os_bound_tooling	decode_utf16le	9c1bd93f806b089e
+os_bound_tooling	resolve_wsl_distro	fa46c19713b91a24
+os_bound_tooling	wsl_distro	505ea591ee849b9f
+os_bound_tooling	wsl_distro_base_path	47806b9ebe1c4a8f
+os_bound_tooling	wsl_probe	a0918a6d49861869

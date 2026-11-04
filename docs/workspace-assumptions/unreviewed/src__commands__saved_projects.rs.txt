@@ -1,0 +1,3 @@
+os_bound_tooling	is_drive_rooted	46cc26526ca62608
+os_bound_tooling	resolve_subst_once	6335429ff1ecbb7d
+os_bound_tooling	rewrite_msys_root	e762997ef02b5959

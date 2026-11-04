@@ -1,0 +1,5 @@
+os_bound_tooling	const INTERPRETERS	077b277d937694ed
+os_bound_tooling	const SCRIPT_SUFFIXES	ee0e002d73286e73
+repo_layout	self_path_hit	f96d44040829ca45
+repo_layout	static CONFIG_REPO_CLAUDE_RE	f79721b077eff1ff
+repo_layout	static ROOTED_TOKEN_RE	59deae38b34ce798

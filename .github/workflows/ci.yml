@@ -334,12 +334,14 @@ jobs:
     timeout-minutes: 180
 
     steps:
-      # Full history, blobless: workspace_assumptions_are_enumerated.rs takes its
-      # swap-rule base from `merge-base HEAD origin/main`, which a depth-1 clone
-      # cannot compute (it would print SWAP RULE UNKNOWN and enforce nothing).
-      # `filter: blob:none` keeps the fetch to commits and trees; the one roster
-      # blob it reads at the merge base is fetched lazily. Plan
-      # 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists, A6.
+      # Full history, blobless. Added for workspace_assumptions_are_enumerated.rs's
+      # merge-base swap rule (plan
+      # 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists,
+      # A6), which plan
+      # 2026-11-04-runner-generated-and-ledger-files-are-merge-neutral-and-land-behind-a-drain
+      # Phase 2a deleted: its per-row ledger sees a swap without git. No other
+      # reader of the history has been established, so it stays until a run
+      # with the default depth-1 checkout is shown green.
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
