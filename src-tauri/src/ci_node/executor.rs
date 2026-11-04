@@ -1050,8 +1050,10 @@ mod tests {
     /// the sibling's GitHub URL to a local repository. The sibling's git must
     /// not read it: isolated, the GitHub URL is asked as-is (a repository that
     /// does not exist, so the resolve fails offline or not); unisolated, the
-    /// rewrite answers with the local repository's tip and provisioning goes
-    /// on to succeed.
+    /// rewrite answers the resolve with the local repository's tip, so
+    /// provisioning gets past `resolving …` (and fails later, at the fetch,
+    /// which runs in the sibling's own repo) — the `resolving` error is what
+    /// tells the two apart.
     #[tokio::test]
     async fn a_dispatch_provision_ignores_an_enclosing_repos_url_rewrite() {
         let git = |cwd: &Path, args: &[&str]| {
