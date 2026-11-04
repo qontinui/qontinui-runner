@@ -144,7 +144,7 @@ jobs:
   # wedge, not a saving.
   scope:
     name: Fast lane scope
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_STACKED_PR_FASTLANE || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui"]' || '"ubuntu-latest"') }}
     # A checkout plus a git diff. 5 minutes is a floor, not a multiple: a
     # sub-minute job does not want a sub-minute cap, since network jitter on the
     # checkout alone would flake it. Same reasoning as ci.yml's `seam-gate`.
