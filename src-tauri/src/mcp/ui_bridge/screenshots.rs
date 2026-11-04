@@ -2016,7 +2016,12 @@ mod visibility_tests {
         assert_eq!(report["occlusionDataObserved"], json!(true));
         assert_eq!(report["elementCount"], json!(1));
         let wire = report.to_string();
-        for quoted in ["secret pane text", "Session label", "heading-3-fix-billing", "div.toast"] {
+        for quoted in [
+            "secret pane text",
+            "Session label",
+            "heading-3-fix-billing",
+            "div.toast",
+        ] {
             assert!(!wire.contains(quoted), "{quoted} reached the wire: {wire}");
         }
     }
@@ -2045,8 +2050,10 @@ mod visibility_tests {
     fn the_handler_discloses_by_the_relay_marker() {
         let body = super::visibility_sweep_payload_tests::visibility_handler_body();
         assert_eq!(
-            body.matches("let relayed = crate::mcp::relay_path_policy::is_relayed_request(&headers);")
-                .count(),
+            body.matches(
+                "let relayed = crate::mcp::relay_path_policy::is_relayed_request(&headers);"
+            )
+            .count(),
             1,
             "the marker is read exactly once, from the request headers: {body}"
         );
@@ -2056,7 +2063,8 @@ mod visibility_tests {
             "`relayed` is never reassigned after it is read: {body}"
         );
         assert_eq!(
-            body.matches("disclose_occlusion_text(&mut report, relayed);").count(),
+            body.matches("disclose_occlusion_text(&mut report, relayed);")
+                .count(),
             1,
             "{body}"
         );
