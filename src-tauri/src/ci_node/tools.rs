@@ -688,7 +688,7 @@ fn resolve_executable(dir: &Path, stem: &str) -> Option<PathBuf> {
 /// step PATH in declaration order. Any failure aborts the dispatch: a step
 /// that silently ran without its declared tool is the JUnit-shaped hole this
 /// module exists to close.
-pub(crate) async fn provision(
+pub(crate) async fn provision_tools(
     root: &Path,
     tools: &[CiTool],
     // `+ Send` because a dispatch runs on a `tokio::spawn`ed task and this
