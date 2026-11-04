@@ -4658,16 +4658,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     };
 
                     // Reference instant for `claude_present_in_inclusive_subtree`'s
-                    // PID-reuse guard: this primary's own boot time (captured once,
-                    // at task spawn — effectively boot time), NOT a per-record
-                    // `opened_at`. A per-record timestamp misfires whenever a later
-                    // session record reuses an already-running terminal's
-                    // `terminal_id` (e.g. a reconnect into an existing pane) — the
-                    // tracked PID's real creation legitimately predates that later
-                    // record's `opened_at` by design, not because of PID recycling.
-                    // See the doc comment on `claude_present_in_inclusive_subtree`
-                    // for the full incident writeup (2026-07-03).
-                    let primary_boot_unix_millis = chrono::Utc::now().timestamp_millis();
+                    // PID-reuse guard: this primary's own boot time — the instant
+                    // startup records once, which the tracking-health census and
+                    // the boot reconcile pass key on too, so all three agree —
+                    // NOT a per-record `opened_at`. A per-record timestamp
+                    // misfires whenever a later session record reuses an
+                    // already-running terminal's `terminal_id` (e.g. a reconnect
+                    // into an existing pane) — the tracked PID's real creation
+                    // legitimately predates that later record's `opened_at` by
+                    // design, not because of PID recycling. See the doc comment on
+                    // `claude_present_in_inclusive_subtree` for the full incident
+                    // writeup (2026-07-03).
+                    let primary_boot_unix_millis =
+                        session::tracking_health::primary_boot_unix_millis_or_init();
 
                     // claudeSessionId -> consecutive claude-absent ticks,
                     // carried across ticks to debounce `NeedsConfirm`.
@@ -4806,7 +4809,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // signal needs image names and the PID-reuse guard needs
                         // creation times — both carried on the snapshot.
                         let snap_captured_at_ms = chrono::Utc::now().timestamp_millis();
-                        let snap = crate::process_capture::process_tree::snapshot_process_table_public().await;
+                        let mut snap = crate::process_capture::process_tree::snapshot_process_table_public().await;
                         // A totally-empty system parent_map means the snapshot
                         // helper failed → classify Skips every matched record.
                         let tick_snapshot_ok = !snap.parent_map.is_empty();
@@ -5297,17 +5300,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             .collect();
                         // The PID-reuse guard the per-record loop above
                         // applied, so the pass reads no evidence from a pane
-                        // that loop counts as running no `claude`.
-                        let pid_reuse = session::reconcile::PidReuseGuard {
-                            verified: holder_verified,
-                            boot_unix_millis: primary_boot_unix_millis,
-                        };
+                        // that loop counts as running no `claude`; and the
+                        // snapshot dated from the live pane list, read before
+                        // it, so a tab spawned between the two is newer than
+                        // the pass's evidence.
+                        poll_lifecycle_store.set_pid_reuse_guard(
+                            session::pane_binding::PidReuseGuard {
+                                verified: holder_verified,
+                                boot_unix_millis: primary_boot_unix_millis,
+                            },
+                        );
+                        snap.date_from(live_read_at);
                         let actions = session::reconcile::run_reconcile_pass(
                             &poll_lifecycle_store,
                             &live_ptys,
-                            live_read_at,
                             &snap,
-                            &pid_reuse,
                             "periodic",
                         )
                         .await;

@@ -24,7 +24,7 @@
 //! refuses, so what this test observes is the reconcile pass's own choice.
 
 use crate::process_capture::process_tree::ProcessSnapshot;
-use crate::session::reconcile::{run_reconcile_pass, LivePty, PidReuseGuard};
+use crate::session::reconcile::{run_reconcile_pass, LivePty};
 use crate::session::session_lifecycle_store::SessionLifecycleStore;
 
 const WORKDIR: &str = "/work/two-panes";
@@ -137,15 +137,7 @@ async fn a_live_peers_unconfirmed_session_stays_on_its_pane_through_the_reconcil
         std::fs::write(&store_path, snapshot_file()).unwrap();
         let store = SessionLifecycleStore::open(&store_path).unwrap();
 
-        let actions = run_reconcile_pass(
-            &store,
-            &live,
-            std::time::Instant::now(),
-            &process_table(),
-            &PidReuseGuard::default(),
-            "test",
-        )
-        .await;
+        let actions = run_reconcile_pass(&store, &live, &process_table(), "test").await;
 
         let where_is = |id: &str| {
             store

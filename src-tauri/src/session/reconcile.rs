@@ -118,7 +118,9 @@ use std::time::Instant;
 
 use crate::process_capture::process_tree::ProcessSnapshot;
 use crate::session::claude_activity::LivePid;
-use crate::session::pane_binding::{self, ObserveOutcome, PaneEvidence, PaneObservation};
+use crate::session::pane_binding::{
+    self, ObserveOutcome, PaneEvidence, PaneObservation, PidReuseGuard,
+};
 use crate::session::session_lifecycle_store::{
     BindingState, RecordOpenOutcome, SessionLifecycleStore, TerminalSessionRecord,
     DEFAULT_PROVIDER, ORIGIN_AUTHORITATIVE, ORIGIN_OBSERVED, ORIGIN_RECONCILED, UNZONED_ZONE_INDEX,
@@ -1503,40 +1505,6 @@ fn parse_iso_to_unix_secs(s: &str) -> Option<i64> {
         .map(|dt| dt.timestamp())
 }
 
-/// The liveness poll's PID-reuse guard, as the reconcile pass applies it
-/// ([`run_reconcile_pass`]): the reference instant the poll uses for a
-/// terminal root ([`crate::session::tracking_health::pid_reuse_reference`])
-/// and its comparison
-/// ([`crate::process_capture::process_tree::root_predates`], the guard inside
-/// `claude_present_in_inclusive_subtree`). A pane the poll counts as running
-/// no `claude` then yields no evidence to the pass either, so the two never
-/// disagree about the same pane.
-#[derive(Debug, Clone, Default)]
-pub struct PidReuseGuard {
-    /// Terminal pids a PTY holder's lock record proves — the poll's
-    /// `holder_verified` — exempt from the boot comparison.
-    pub verified: HashSet<u32>,
-    /// The poll's reference instant, this runner's boot, in epoch millis. The
-    /// default, `0`, calls no root recycled.
-    pub boot_unix_millis: i64,
-}
-
-impl PidReuseGuard {
-    /// Whether the poll treats terminal root `root_pid` as a recycled pid:
-    /// created before this runner's boot, and not proven by its holder.
-    pub fn recycled(&self, root_pid: u32, snapshot: &ProcessSnapshot) -> bool {
-        crate::process_capture::process_tree::root_predates(
-            root_pid,
-            snapshot,
-            crate::session::tracking_health::pid_reuse_reference(
-                root_pid,
-                &self.verified,
-                self.boot_unix_millis,
-            ),
-        )
-    }
-}
-
 /// Resolve each live PTY's CLAUDE anchor — the claude-image descendant pid + its
 /// process start — from an ALREADY-TAKEN snapshot (no extra sweep). The
 /// correlation must anchor on when CLAUDE started, not on when its shell did (a
@@ -1594,10 +1562,11 @@ fn anchor_live_ptys(live: &[LivePty], snapshot: &ProcessSnapshot) -> Vec<LivePty
 /// or bound from evidence older than what every reader answers from
 /// ([`judge_observation`]).
 ///
-/// `live_read_at` is when the caller read `live` — the first of the pass's
-/// evidence — and `pid_reuse` the liveness poll's PID-reuse guard
-/// ([`PidReuseGuard`]): a pane the poll counts as running no `claude` yields
-/// none here either.
+/// The caller dates `snapshot` from the first of the pass's evidence it read
+/// ([`ProcessSnapshot::date_from`] — the live pane list comes before the
+/// process table), and sets the liveness poll's PID-reuse guard on the store
+/// ([`SessionLifecycleStore::set_pid_reuse_guard`]): a pane the poll counts as
+/// running no `claude` yields none here either.
 ///
 /// `context` tags the INFO log ("boot" / "periodic") so a binder-only recovery is
 /// attributable to the pass that made it (the "no silent cap" observability
@@ -1611,9 +1580,7 @@ fn anchor_live_ptys(live: &[LivePty], snapshot: &ProcessSnapshot) -> Vec<LivePty
 pub async fn run_reconcile_pass(
     store: &SessionLifecycleStore,
     live: &[LivePty],
-    live_read_at: Instant,
     snapshot: &ProcessSnapshot,
-    pid_reuse: &PidReuseGuard,
     context: &str,
 ) -> Vec<ReconcileAction> {
     // A pane whose root the liveness poll's PID-reuse guard calls recycled runs
@@ -1622,6 +1589,7 @@ pub async fn run_reconcile_pass(
     // evidence is "no claude" — never a record the poll would not trust. The
     // poll closes such a pane's row `poll-dead`; reading its record here
     // re-opened the row on the next tick, and the two flapped.
+    let pid_reuse = store.pid_reuse_guard();
     let recycled: HashSet<String> = live
         .iter()
         .filter(|pty| {
@@ -1668,26 +1636,26 @@ pub async fn run_reconcile_pass(
     } else {
         HashMap::new()
     };
-    // The evidence dates from the first of it the pass read: the live pane
-    // list (`live_read_at`), read before the process table began to be
-    // enumerated (`taken_at`), itself before any pid in it was read. So
-    // neither the record read, the argv query nor the prescan below makes the
-    // evidence look younger, and a row placed after it — on a tab spawned
-    // since, which `live` cannot list — is newer than all of it. A snapshot
-    // with no enumeration time (a caller that built its own) cannot say it
-    // was not taken before the live read: said at warn, since every
-    // production snapshot is stamped
+    // The evidence dates from the snapshot's stamp: when its process table
+    // began to be enumerated, before any pid in it was read — or earlier, when
+    // the caller dated it from evidence it read first, the live pane list
+    // ([`ProcessSnapshot::date_from`]). So neither the record read, the argv
+    // query nor the prescan below makes the evidence look younger, and a row
+    // placed after it — on a tab spawned since, which `live` cannot list — is
+    // newer than all of it. A snapshot with no stamp (a caller that built its
+    // own) dates from now, which makes a placement since look older than the
+    // evidence: said at warn, since every production snapshot is stamped
     // ([`crate::process_capture::process_tree::snapshot_process_table_public`]).
     let enumerated_at = match snapshot.taken_at {
-        Some(taken_at) => taken_at.min(live_read_at),
+        Some(taken_at) => taken_at,
         None => {
             if snapshot_ok {
                 tracing::warn!(
                     context,
-                    "session reconcile: the process snapshot carries no enumeration time — dating its evidence from the live pane read"
+                    "session reconcile: the process snapshot carries no enumeration time — dating its evidence from now"
                 );
             }
-            live_read_at
+            Instant::now()
         }
     };
     let readings = pane_binding::read_records_off_runtime(
@@ -1984,10 +1952,8 @@ pub async fn run_at_boot(
         return Vec::new(); // nothing to do
     }
     // The liveness poll's PID-reuse guard, from the inputs it uses: this
-    // runner's boot instant (the one the tracking-health census keys on; the
-    // poll's own is captured as its task starts, a moment later) and each live
-    // pane's holder proof.
-    let pid_reuse = PidReuseGuard {
+    // runner's boot instant and each live pane's holder proof.
+    store.set_pid_reuse_guard(PidReuseGuard {
         verified: crate::terminal::holder_census::verified_holder_children(
             &live
                 .iter()
@@ -1995,9 +1961,10 @@ pub async fn run_at_boot(
                 .collect::<Vec<_>>(),
         ),
         boot_unix_millis: crate::session::tracking_health::primary_boot_unix_millis_or_init(),
-    };
-    let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
-    run_reconcile_pass(store, &live, live_read_at, &snapshot, &pid_reuse, "boot").await
+    });
+    let mut snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
+    snapshot.date_from(live_read_at);
+    run_reconcile_pass(store, &live, &snapshot, "boot").await
 }
 
 /// Wire payload for the `session-bound` Tauri event — the binder→frontend

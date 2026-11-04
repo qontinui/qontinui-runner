@@ -55,11 +55,25 @@ pub struct ProcessSnapshot {
     /// image — never as a shim.
     pub exe_paths: HashMap<u32, String>,
     /// When the enumeration BEGAN ([`snapshot_process_table_public`]) — no
-    /// process in the snapshot was read before it. A consumer that compares
-    /// the snapshot with something that happened since (the session binder,
-    /// against a row placed after it) dates the snapshot from here. `None`: a
-    /// snapshot built by hand.
+    /// process in the snapshot was read before it — or earlier, once a caller
+    /// dated the snapshot from other evidence it read first
+    /// ([`ProcessSnapshot::date_from`]). A consumer that compares the snapshot
+    /// with something that happened since (the session binder, against a row
+    /// placed after it) dates the snapshot from here. `None`: a snapshot built
+    /// by hand.
     pub taken_at: Option<std::time::Instant>,
+}
+
+impl ProcessSnapshot {
+    /// Date this snapshot from `read_at` — when its caller read other evidence
+    /// it judges together with the snapshot — if that came first: the pair is
+    /// as old as its oldest part. The session binder's callers read the live
+    /// pane list before enumerating the process table, so a tab spawned
+    /// between the two is newer than the evidence
+    /// ([`crate::session::reconcile::run_reconcile_pass`]).
+    pub fn date_from(&mut self, read_at: std::time::Instant) {
+        self.taken_at = Some(self.taken_at.map_or(read_at, |taken| taken.min(read_at)));
+    }
 }
 
 /// Skew tolerance (millis) for the PID-reuse creation-time vs the reference
@@ -1287,6 +1301,30 @@ mod tests {
         .await;
         let started = started.into_inner().unwrap().expect("the enumeration ran");
         assert!(snapshot.taken_at.expect("stamped") <= started);
+    }
+
+    /// A snapshot dated from evidence read before it takes that earlier
+    /// instant; dated from a later read it keeps its own; an unstamped one
+    /// takes the read.
+    #[test]
+    fn a_snapshot_is_dated_from_the_earlier_of_its_stamp_and_a_prior_read() {
+        let earlier = std::time::Instant::now();
+        let later = earlier + std::time::Duration::from_millis(5);
+        let mut stamped_later = ProcessSnapshot {
+            taken_at: Some(later),
+            ..ProcessSnapshot::default()
+        };
+        stamped_later.date_from(earlier);
+        assert_eq!(stamped_later.taken_at, Some(earlier));
+        let mut stamped_earlier = ProcessSnapshot {
+            taken_at: Some(earlier),
+            ..ProcessSnapshot::default()
+        };
+        stamped_earlier.date_from(later);
+        assert_eq!(stamped_earlier.taken_at, Some(earlier));
+        let mut unstamped = ProcessSnapshot::default();
+        unstamped.date_from(later);
+        assert_eq!(unstamped.taken_at, Some(later));
     }
 
     /// The PID-reuse guard alone: a root created before the reference

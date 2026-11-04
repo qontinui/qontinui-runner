@@ -98,10 +98,12 @@
 //! in its supersede, every sibling placed after it. Rule 2 reads no row placed
 //! after it `unknown` ([`SessionLifecycleStore::set_binding_state_from`]), and
 //! the phantom prune removes none
-//! ([`SessionLifecycleStore::remove_session_if`]). The runner's own pass dates
-//! its observation from the first evidence it read — the live pane list,
-//! before the process table — so a tab spawned after that list was read is
-//! newer than all of it. The next pass judges the row. `Instant` is
+//! ([`SessionLifecycleStore::remove_session_if`]). The runner's callers date
+//! the pass's snapshot from the first evidence they read — the live pane list,
+//! before the process table
+//! ([`ProcessSnapshot::date_from`](crate::process_capture::process_tree::ProcessSnapshot::date_from))
+//! — so a tab spawned after that list was read is newer than all of it. The
+//! next pass judges the row. `Instant` is
 //! monotonic, so no clock step reorders the two; the memory starts empty
 //! after a restart (and after a reload from disk), which means "no recent
 //! placement or close".
@@ -315,7 +317,7 @@ pub async fn read_records_off_runtime(
 /// What one reconcile pass saw: every live pane's top-level `claude` pids (an
 /// empty list for a live pane with no `claude` — or one whose root the
 /// liveness poll's PID-reuse guard calls recycled,
-/// [`crate::session::reconcile::PidReuseGuard`]), and the session each pid's
+/// [`PidReuseGuard`]), and the session each pid's
 /// own record names. A pane absent from `panes` was not live; a pid absent
 /// from `sessions` has no readable record naming a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,6 +353,41 @@ impl PaneObservation {
             .iter()
             .map(|(terminal, pids)| (terminal.clone(), evidence_from(pids, &self.sessions)))
             .collect()
+    }
+}
+
+/// The liveness poll's PID-reuse guard, as the reconcile pass applies it
+/// ([`crate::session::reconcile::run_reconcile_pass`]): the reference instant
+/// the poll uses for a terminal root
+/// ([`crate::session::tracking_health::pid_reuse_reference`]) and its
+/// comparison ([`crate::process_capture::process_tree::root_predates`], the
+/// guard inside `claude_present_in_inclusive_subtree`). A pane the poll counts
+/// as running no `claude` then yields no evidence to the pass either, so the
+/// two never disagree about the same pane. Set on the store by each caller of
+/// the pass ([`SessionLifecycleStore::set_pid_reuse_guard`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PidReuseGuard {
+    /// Terminal pids a PTY holder's lock record proves — the poll's
+    /// `holder_verified` — exempt from the boot comparison.
+    pub verified: HashSet<u32>,
+    /// The poll's reference instant, this runner's boot, in epoch millis. The
+    /// default, `0`, calls no root recycled.
+    pub boot_unix_millis: i64,
+}
+
+impl PidReuseGuard {
+    /// Whether the poll treats terminal root `root_pid` as a recycled pid:
+    /// created before this runner's boot, and not proven by its holder.
+    pub fn recycled(&self, root_pid: u32, snapshot: &ProcessSnapshot) -> bool {
+        crate::process_capture::process_tree::root_predates(
+            root_pid,
+            snapshot,
+            crate::session::tracking_health::pid_reuse_reference(
+                root_pid,
+                &self.verified,
+                self.boot_unix_millis,
+            ),
+        )
     }
 }
 
@@ -1295,6 +1332,45 @@ mod tests {
         }
     }
 
+    /// A chain through a row that has closed is not followed. `s3` was adopted
+    /// from `s2`, which was adopted from `s` and has since closed: nothing
+    /// open links the session pane A runs to `s`, so `s`'s `unknown` on A is
+    /// no leftover, and it counts.
+    #[test]
+    fn a_chain_through_a_closed_row_is_no_leftover_and_counts() {
+        let evidence: HashMap<String, PaneEvidence> = [
+            ("t-a".to_string(), names("s3")),
+            ("t-b".to_string(), names("s")),
+        ]
+        .into_iter()
+        .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let counters = Arc::new(BindingCounters::default());
+        store.attach_binding_counters(counters.clone());
+        // `s` on A, then two `/clear`s there, each hook-written and marked.
+        store.record_open(open_row("s", "t-a", None));
+        for (id, predecessor) in [("s2", "s"), ("s3", "s2")] {
+            store.record_open(TerminalSessionRecord {
+                confirmed_at: None,
+                ..open_row(id, "t-a", None)
+            });
+            store.confirm_session(id);
+            store.mark_adopted_from(id, predecessor);
+        }
+        store.record_open(open_row("x", "t-b", None));
+        store.record_close("s2", "explicit");
+
+        let verdicts = binding_verdicts(&store.open_records(), &evidence);
+        let s = verdicts
+            .iter()
+            .find(|v| v.claude_session_id == "s")
+            .expect("s is judged");
+        assert_eq!((s.state, s.leftover), (Some(BindingState::Unknown), false));
+        let reported = apply_binding_verdicts(&store, &verdicts, Some(1), None);
+        assert_eq!((reported.len(), counters.mismatches()), (1, 1));
+    }
+
     /// Applying verdicts: a rule-2 transition is counted once per episode and
     /// reported; a rule-3 row's `matched` is withdrawn and its `unknown` kept,
     /// so the persisting contradiction is not counted again; a row matched
@@ -1672,7 +1748,7 @@ mod tests {
     /// by C's confirmed bind. Every verdict carries the pass's epoch.
     #[tokio::test]
     async fn the_pass_binds_each_pane_from_its_own_record_and_retires_a_stale_row() {
-        use crate::session::reconcile::{run_reconcile_pass, LivePty, PidReuseGuard};
+        use crate::session::reconcile::{run_reconcile_pass, LivePty};
         const WORKDIR: &str = "/work/three-panes";
         let ambient = crate::test_env::isolated_ambient();
         let config = ambient.dir().join(".claude");
@@ -1739,15 +1815,7 @@ mod tests {
             ..unconfirmed("s-x", "term-c")
         });
 
-        let actions = run_reconcile_pass(
-            &store,
-            &live,
-            Instant::now(),
-            &snapshot,
-            &PidReuseGuard::default(),
-            "test",
-        )
-        .await;
+        let actions = run_reconcile_pass(&store, &live, &snapshot, "test").await;
 
         let current = store.current_binding_verdicts();
         for (terminal, _, _, _, session) in panes {
@@ -1799,7 +1867,7 @@ mod tests {
     /// newer than the move, and rung 2b would take `s` back to A.
     #[tokio::test]
     async fn the_pass_dates_its_evidence_from_its_snapshot_and_leaves_a_later_placement_alone() {
-        use crate::session::reconcile::{run_reconcile_pass, LivePty, PidReuseGuard};
+        use crate::session::reconcile::{run_reconcile_pass, LivePty};
         use crate::terminal::claude_resume_sniff::{
             apply_typed_resume_effects, parse_typed_claude_resume, TypedLineTarget,
         };
@@ -1876,22 +1944,6 @@ mod tests {
             assert_eq!(store.get(S).unwrap().terminal_id, "term-b", "precondition");
         };
 
-        async fn pass(
-            store: &SessionLifecycleStore,
-            live: &[LivePty],
-            live_read_at: Instant,
-            snapshot: ProcessSnapshot,
-        ) -> Vec<crate::session::reconcile::ReconcileAction> {
-            run_reconcile_pass(
-                store,
-                live,
-                live_read_at,
-                &snapshot,
-                &PidReuseGuard::default(),
-                "test",
-            )
-            .await
-        }
         let left_on_b =
             |store: &SessionLifecycleStore,
              why: &str,
@@ -1914,30 +1966,27 @@ mod tests {
         let snapshot = snapshot_taken(Some(read));
         std::thread::sleep(Duration::from_millis(2));
         sniff_moves_s_onto_b(&store);
-        let actions = pass(&store, &live, read, snapshot).await;
+        let actions = run_reconcile_pass(&store, &live, &snapshot, "test").await;
         left_on_b(&store, "evidence older than the move", &actions);
 
-        // Round 12: the live pane list is evidence too, read before the
-        // process table. A move between the two is newer than the list, so the
-        // pass dates its evidence from the list, not from the table.
+        // The live pane list is evidence too, read before the process table.
+        // A move between the two is newer than the list, and a caller that
+        // dates its snapshot from the list (`ProcessSnapshot::date_from`, as
+        // both of the runner's callers do) leaves the move alone.
         let store = store_with_s_moved_onto_b("listed-before.json");
         let live_read_at = Instant::now();
         std::thread::sleep(Duration::from_millis(2));
         sniff_moves_s_onto_b(&store);
         std::thread::sleep(Duration::from_millis(2));
-        let actions = pass(
-            &store,
-            &live,
-            live_read_at,
-            snapshot_taken(Some(Instant::now())),
-        )
-        .await;
+        let mut snapshot = snapshot_taken(Some(Instant::now()));
+        snapshot.date_from(live_read_at);
+        let actions = run_reconcile_pass(&store, &live, &snapshot, "test").await;
         left_on_b(&store, "a move after the live list was read", &actions);
 
         let store = store_with_s_moved_onto_b("undated.json");
         sniff_moves_s_onto_b(&store);
         std::thread::sleep(Duration::from_millis(2));
-        let actions = pass(&store, &live, Instant::now(), snapshot_taken(None)).await;
+        let actions = run_reconcile_pass(&store, &live, &snapshot_taken(None), "test").await;
         assert_eq!(
             store.get(S).unwrap().terminal_id,
             "term-a",
@@ -1954,7 +2003,7 @@ mod tests {
     /// the root proven by its holder, the same pane binds `s-r` as before.
     #[tokio::test]
     async fn a_pane_the_polls_pid_reuse_guard_calls_recycled_yields_no_evidence() {
-        use crate::session::reconcile::{run_reconcile_pass, LivePty, PidReuseGuard};
+        use crate::session::reconcile::{run_reconcile_pass, LivePty};
         const WORKDIR: &str = "/work/recycled";
         const SHELL: u32 = 4_300_501;
         const CLAUDE: u32 = 4_300_502;
@@ -2010,8 +2059,7 @@ mod tests {
         // A pass whose evidence is read after the poll's close.
         let read_now = || {
             std::thread::sleep(Duration::from_millis(2));
-            let read = Instant::now();
-            (read, snapshot_taken(Some(read)))
+            snapshot_taken(Some(Instant::now()))
         };
 
         let store = poll_closed_s_r("recycled.json");
@@ -2020,8 +2068,8 @@ mod tests {
             boot_unix_millis: BOOT_MS,
         };
         assert!(guard.recycled(SHELL, &snapshot_taken(None)), "precondition");
-        let (read, taken) = read_now();
-        let actions = run_reconcile_pass(&store, &live, read, &taken, &guard, "test").await;
+        store.set_pid_reuse_guard(guard);
+        let actions = run_reconcile_pass(&store, &live, &read_now(), "test").await;
         assert!(!binds_s_r(&actions), "{actions:?}");
         assert_eq!(store.get("s-r").unwrap().state, "closed", "{actions:?}");
 
@@ -2034,8 +2082,8 @@ mod tests {
             !proven.recycled(SHELL, &snapshot_taken(None)),
             "precondition"
         );
-        let (read, taken) = read_now();
-        let actions = run_reconcile_pass(&store, &live, read, &taken, &proven, "test").await;
+        store.set_pid_reuse_guard(proven);
+        let actions = run_reconcile_pass(&store, &live, &read_now(), "test").await;
         assert!(binds_s_r(&actions), "{actions:?}");
         let row = store.get("s-r").unwrap();
         assert_eq!(

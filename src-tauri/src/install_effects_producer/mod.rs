@@ -3128,6 +3128,70 @@ mod tests {
         assert_eq!(store.get("prior-on-term-c").unwrap().adopted_from, None);
     }
 
+    /// A `/clear` continues the session its pane ran — the row the pane's own
+    /// `claude` named in the latest observation, its verdict current and
+    /// `matched` there — not a row a strong wrong write put on the pane since,
+    /// though that row's hook is the more recent (plan
+    /// `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`). Taken
+    /// as the predecessor, the wrong row would read as the `/clear`'s
+    /// leftover, its mismatch uncounted, and coord lineage would run through
+    /// it. On a pane with no current verdict the latest hook decides, as
+    /// before.
+    #[test]
+    fn a_clear_continues_the_panes_matched_session_not_a_row_written_over_it() {
+        use crate::session::pane_binding::{FixedPanes, PaneEvidence};
+        use crate::session::session_lifecycle_store::{BindingState, SessionLifecycleStore};
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        // Pane P's own `claude` runs `x`; pane Q's records are not read.
+        store.attach_pane_evidence(FixedPanes::of(&[(
+            "term-p",
+            PaneEvidence::Names("x".to_string()),
+        )]));
+        let config = dir.path().join("cfg").to_string_lossy().into_owned();
+        let open = |id: &str, term: &str, source: &str| {
+            let req = SessionOpenRequest {
+                terminal_id: term.to_string(),
+                session_id: id.to_string(),
+                source: Some(source.to_string()),
+                provider: Some("claude".to_string()),
+                config_dir: Some(config.clone()),
+                cwd: None,
+            };
+            assert!(record_session_open_into(&store, &req, "claude").is_recorded());
+        };
+        for (own, wrong, cleared, term) in [("x", "s", "x2", "term-p"), ("y", "t", "y2", "term-q")]
+        {
+            open(own, term, "startup");
+            // The wrong write: a hook carrying this pane's terminal for a
+            // session that runs elsewhere — later than the pane's own.
+            open(wrong, term, "startup");
+            assert_eq!(store.get(own).unwrap().state, "open", "precondition");
+            if term == "term-p" {
+                store.serve_verdicts_from(0);
+                assert_eq!(
+                    store
+                        .current_binding_verdicts()
+                        .get(own)
+                        .map(|v| (v.terminal_id.as_str(), v.state)),
+                    Some((term, BindingState::Matched)),
+                    "precondition: P's own claude names {own}"
+                );
+            }
+            open(cleared, term, "clear");
+        }
+        assert_eq!(
+            store.get("x2").unwrap().adopted_from.as_deref(),
+            Some("x"),
+            "the pane's matched session, not the more recent wrong row"
+        );
+        assert_eq!(
+            store.get("y2").unwrap().adopted_from.as_deref(),
+            Some("t"),
+            "no current verdict on Q: the latest hook decides"
+        );
+    }
+
     /// A pane pinned to P whose operator exited and typed `claude --resume X`
     /// carries TWO open, confirmed rows on one terminal: the hook bind of X
     /// evicts only unconfirmed siblings, and confirming runs no supersede

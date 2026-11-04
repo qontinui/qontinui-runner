@@ -62,6 +62,7 @@ use tracing::{debug, info, warn};
 use crate::session::observation_epoch::{ObservationEpoch, Observed};
 use crate::session::pane_binding::{
     BindingCounters, ObserveOutcome, PaneEvidence, PaneEvidenceOracle, PaneObservation,
+    PidReuseGuard,
 };
 use crate::session::restore_record_emitter::RestoreRecordEmitter;
 use crate::session::snapshot_history::{SnapshotHistory, SnapshotSession, TranscriptProbe};
@@ -1347,6 +1348,10 @@ pub struct SessionLifecycleStore {
     /// process-local like `last_placed`; a row placed again, or gone from the
     /// map, forgets its entry. Lock order: `map` → `last_closed`.
     last_closed: Mutex<HashMap<String, Instant>>,
+    /// The liveness poll's PID-reuse guard, which the reconcile pass applies to
+    /// every pane it reads ([`Self::set_pid_reuse_guard`]). Unset: the
+    /// default, which calls no pane root recycled.
+    pid_reuse_guard: Mutex<PidReuseGuard>,
     /// Held by a reconcile pass from the hand-over of its pane observation to
     /// the oracle through its last verdict and bind
     /// ([`Self::reconcile_pass_lock`]), so overlapping passes judge one at a
@@ -1575,6 +1580,7 @@ impl SessionLifecycleStore {
             servable_epoch: Mutex::new(None),
             last_placed: Mutex::new(HashMap::new()),
             last_closed: Mutex::new(HashMap::new()),
+            pid_reuse_guard: Mutex::new(PidReuseGuard::default()),
             reconcile_pass: Mutex::new(()),
             finish_forward: Mutex::new(()),
         };
@@ -1736,6 +1742,26 @@ impl SessionLifecycleStore {
             .unwrap_or_else(|p| p.into_inner())
             .get(claude_session_id)
             .is_some_and(|closed| *closed > enumerated_at)
+    }
+
+    /// Set the liveness poll's PID-reuse guard the next reconcile pass applies
+    /// ([`PidReuseGuard`]). Each caller of the pass sets it from the inputs the
+    /// poll's own guard uses — this runner's boot instant and the live panes'
+    /// holder proof — as the pane oracle is attached at startup: state the pass
+    /// reads, not a parameter of it. The latest setting wins.
+    pub fn set_pid_reuse_guard(&self, guard: PidReuseGuard) {
+        *self
+            .pid_reuse_guard
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = guard;
+    }
+
+    /// The PID-reuse guard last set ([`Self::set_pid_reuse_guard`]).
+    pub(crate) fn pid_reuse_guard(&self) -> PidReuseGuard {
+        self.pid_reuse_guard
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// The lock a reconcile pass holds from handing its observation to the
@@ -4458,17 +4484,25 @@ impl SessionLifecycleStore {
     /// subtree), so a first match over the `HashMap` would pick one by
     /// iteration order. This ranks instead, greatest wins:
     ///
-    /// 0. a row whose [`TerminalSessionRecord::binding_state`] is not `unknown`
+    /// 0. a row whose CURRENT binding verdict is `matched` on this terminal
+    ///    ([`Self::current_binding_verdicts`]) — the pane's own `claude` named it
+    ///    in the latest observation — outranks every other. A row a strong
+    ///    write put on the pane since has no verdict yet, and it must not be
+    ///    taken for the session the pane ran, however recent its hook: a
+    ///    `/clear` marked as continuing it would leave its mismatch uncounted
+    ///    and send coord lineage through it. Without a current verdict (no
+    ///    fresh observation) the order below decides alone;
+    /// 1. a row whose [`TerminalSessionRecord::binding_state`] is not `unknown`
     ///    outranks one that is — the pane's own `claude` contradicts that row;
-    /// 1. the latest SessionStart hook seen for the id in this process
+    /// 2. the latest SessionStart hook seen for the id in this process
     ///    ([`Self::note_session_start_hook`]) — a row with one outranks a row
     ///    without;
-    /// 2. then the durable [`TerminalSessionRecord::last_session_start_at`] —
+    /// 3. then the durable [`TerminalSessionRecord::last_session_start_at`] —
     ///    the same fact, surviving a restart or a holder handoff, whose adopted
     ///    panes fire no new hook;
-    /// 3. then `confirmed_at` (a confirmed row outranks an unconfirmed one);
-    /// 4. then `last_seen_at`, then `opened_at`;
-    /// 5. then `claude_session_id`, so the choice is deterministic even on a
+    /// 4. then `confirmed_at` (a confirmed row outranks an unconfirmed one);
+    /// 5. then `last_seen_at`, then `opened_at`;
+    /// 6. then `claude_session_id`, so the choice is deterministic even on a
     ///    full tie.
     ///
     /// Hook order comes before `confirmed_at` because `confirmed_at` is
@@ -4481,6 +4515,19 @@ impl SessionLifecycleStore {
         terminal_id: &str,
         exclude: &str,
     ) -> Option<TerminalSessionRecord> {
+        let matched_here: HashSet<String> = self
+            .current_binding_verdicts()
+            .into_iter()
+            .filter(|(_, v)| v.terminal_id == terminal_id && v.state == BindingState::Matched)
+            .map(|(id, _)| id)
+            .collect();
+        if !matched_here.is_empty() {
+            if let Some(row) = self.ranked_open_on_terminal(terminal_id, |r| {
+                r.claude_session_id != exclude && matched_here.contains(&r.claude_session_id)
+            }) {
+                return Some(row);
+            }
+        }
         self.ranked_open_on_terminal(terminal_id, |r| r.claude_session_id != exclude)
     }
 
