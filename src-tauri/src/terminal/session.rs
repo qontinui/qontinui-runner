@@ -3504,9 +3504,10 @@ impl TerminalSession {
                 crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
                 None,
             );
-            // A refusal (another live pane still runs this id) is already
-            // logged at warn by `record_pinned_session_open`; the pane spawns
-            // regardless and the binder judges what it runs.
+            // A pinned record is authoritative, which the binding guard never
+            // refuses; a write the store could not make (`Unavailable`, a
+            // poisoned registry lock) is logged at warn by
+            // `record_pinned_session_open`. The pane spawns regardless.
             if outcome.is_recorded() {
                 info!(
                     terminal_id = %terminal_id,

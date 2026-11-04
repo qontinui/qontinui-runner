@@ -8,9 +8,11 @@
 //! A lifecycle row is keyed by `claude_session_id` and records the
 //! `terminal_id` it lives on. Every binder — the spawn pin, the provider hook,
 //! the typed-resume sniff, reconcile's rungs, the transcript-mtime fallbacks —
-//! writes that pair through
-//! [`SessionLifecycleStore::record_open_checked`](crate::session::session_lifecycle_store::SessionLifecycleStore::record_open_checked),
-//! and until this module nothing checked the pair against the pane itself. On
+//! writes that pair through one store write,
+//! [`SessionLifecycleStore::record_open_checked`](crate::session::session_lifecycle_store::SessionLifecycleStore::record_open_checked)
+//! or one of its two narrower doors (`record_bind_checked`,
+//! `record_open_provisional`), and until this module nothing checked the pair
+//! against the pane itself. On
 //! 2026-10-25 (merytshost) one pane's lifecycle row came to name the session a
 //! LIVE PEER pane was running, and the first pane's own session row was
 //! closed: one pane wore another session's labels, the other wore none, and
@@ -46,30 +48,34 @@
 //! 1. `P`'s own record names `S` → `matched`.
 //! 2. Otherwise, another live pane's record names `S` — `S` demonstrably runs
 //!    elsewhere → `unknown`, counted once per episode. This is the 2026-10-25
-//!    shape.
+//!    shape. Not counted when `R` is a leftover ([`BindingVerdict::leftover`]):
+//!    `P` still holds an open row of the session its own record names, as a
+//!    `/clear` leaves its predecessor's confirmed row beside its successor's.
+//!    It is `unknown` and healed all the same. In the 2026-10-25 shape the
+//!    pane's own row had been closed, so that shape is counted.
 //! 3. Otherwise → no verdict. A `matched` the row carried is withdrawn; an
 //!    `unknown` is kept, so one episode is never counted twice.
 //!
 //! **Does a record follow an in-process switch** (`/clear`, an in-TUI
-//! `/resume`)? In Claude Code 2.1.316 and 2.1.317, yes. The process registers
-//! its `sessions/<pid>.json` together with a subscription to its own
-//! session-change signal, and the subscriber rewrites the record's `sessionId`
-//! on every switch. In the installed 2.1.317 bundle that is the registration's
-//! `ff((H,B)=>{…xn({sessionId:H,parkedJobId:void 0,updatedAt:Date.now()},n)})`,
-//! where `ff` subscribes to the emitter that `xw` — the session switch — fires;
-//! the same rewrite call is in the binary of a 2.1.316 process still running on
-//! nawa (both read 2026-11-03). On those builds a pane's record names the
-//! session its process runs now, and the rules judge current evidence.
-//!
-//! The rules assume it. On a build whose records do NOT follow switches — one
-//! this has not been read for — two cases go wrong, and nothing here guards
-//! against them:
+//! `/resume`)? The rules assume so, and that is UNCONFIRMED. What can be
+//! reproduced is narrower: this box runs Claude Code 2.1.318, whose binary
+//! contains the `liveSessionId` rewrite — a callback the process registers
+//! with its `sessions/<pid>.json` that sets `liveSessionId` and rewrites the
+//! record's `sessionId`. Measure it with
+//! `grep -a -b -o 'parkedJobId:void 0,updatedAt:Date.now()},n)})' /proc/<claude pid>/exe`:
+//! one hit (nawa, 2026-11-04). Whether that callback subscribes to the
+//! session-switch emitter — whether a `/clear` or an in-TUI `/resume` runs it
+//! at all — is unconfirmed. If it does, a pane's record names the session its
+//! process runs now, and the rules judge current evidence. If it does not, two
+//! cases go wrong, and nothing here guards against them:
 //!
 //! - **(i)** A session entered by an in-TUI `/resume` is named by no pane, so
 //!   a stale record naming it — in the pane that launched it and has since
-//!   switched away — reads its row `unknown` wherever its hook placed it,
-//!   counted once per episode, and rung 2b moves the row back onto the pane
-//!   whose stale record names it.
+//!   switched away — reads its row `unknown` wherever its hook placed it, and
+//!   rung 2b moves the row back onto the pane whose stale record names it.
+//!   That `unknown` is uncounted while the hook's pane still holds an open row
+//!   of the session its own stale record names (its launch session's, which
+//!   the resume's hook leaves open): a leftover.
 //! - **(ii)** A pane that ran `/clear` keeps naming its predecessor. Once no
 //!   live pane holds or runs that predecessor, rung 2b binds it back onto the
 //!   pane, authoritatively: a confirmed bind's supersede closes the row of the
@@ -77,25 +83,25 @@
 //!   predecessor, and each later hook from the real session records it again —
 //!   the binding can alternate per hook.
 //!
-//! Neither occurs on 2.1.316 or 2.1.317, whose records follow every switch (the
-//! bundle reading above).
-//!
 //! # A placement is never undone by evidence older than it
 //!
 //! A pass's evidence is the process table it enumerated and the records it
-//! read after that, so it can predate a write that placed a row since — a
-//! hook, the typed-resume sniff, a restore rebind, a spawn's pin. The store
-//! remembers, in memory, when each row was last placed (created, moved onto
-//! another terminal, or re-opened —
-//! [`SessionLifecycleStore::placed_after`]); each [`PaneObservation`] carries
-//! the instant its enumeration began ([`PaneObservation::enumerated_at`]). A
-//! row placed after that instant is not moved by the pass's rungs (2b, 2, 3
-//! and the mtime fallback,
-//! [`SessionLifecycleStore::record_bind_checked`]) and is not read `unknown`
-//! by rule 2 ([`SessionLifecycleStore::set_binding_state_from`]): the next
-//! pass, enumerated after the placement, judges it. `Instant` is monotonic,
-//! so no clock step reorders the two; the memory starts empty after a
-//! restart, which means "no recent placement".
+//! read after that, so it can predate a write that placed or closed a row
+//! since — a hook, the typed-resume sniff, a restore rebind, a spawn's pin, an
+//! operator closing a tab. The store remembers, in memory, when each row was
+//! last placed (created, moved onto another terminal, or re-opened —
+//! [`SessionLifecycleStore::placed_after`]) and when it last closed
+//! ([`SessionLifecycleStore::closed_after`]); each [`PaneObservation`] carries
+//! the instant its enumeration began ([`PaneObservation::enumerated_at`]).
+//! Every reconcile rung (2b, 2, 3, and the degraded rung 4) writes through
+//! [`SessionLifecycleStore::record_bind_checked`], which against that instant
+//! moves no row placed after it, re-opens no row closed after it, and spares,
+//! in its supersede, every sibling placed after it. Rule 2 reads no row placed
+//! after it `unknown` ([`SessionLifecycleStore::set_binding_state_from`]).
+//! The next pass, enumerated after the write, judges the row. `Instant` is
+//! monotonic, so no clock step reorders the two; the memory starts empty
+//! after a restart (and after a reload from disk), which means "no recent
+//! placement or close".
 //!
 //! # Where it is read, and who reads the result
 //!
@@ -131,8 +137,9 @@
 //! # What is counted
 //!
 //! [`BindingCounters`]: a row that turns `unknown` (rule 2) — once per episode,
-//! which lasts until the row is matched, moves or closes; and a refused weak
-//! move — once per (session, pane) episode, not once per retry. Served as
+//! which lasts until the row is matched, moves or closes, and never for a
+//! leftover ([`BindingVerdict::leftover`]); and a refused weak move — once per
+//! (session, pane) episode, not once per retry. Served as
 //! `/health` `sessionTracking.bindingMismatchTotal` and
 //! `bindingMoveRefusedTotal`.
 
@@ -693,6 +700,16 @@ pub struct BindingVerdict {
     /// Rule 2: a live pane whose own record names the row's session (the first
     /// in sort order when several do).
     pub runs_on: Option<String>,
+    /// Rule 2 only: the row is a LEFTOVER — its own pane's record names another
+    /// session, and the pane also holds an open row of that one. A `/clear`
+    /// leaves exactly this: the hook's supersede closes only unconfirmed
+    /// siblings, so the predecessor's confirmed row stays open beside its
+    /// successor's, and a later in-TUI `/resume` of the predecessor elsewhere
+    /// names it in another pane before that pane's hook lands. The row is
+    /// `unknown` and healed like any other, but not counted as a mismatch
+    /// ([`apply_binding_verdicts`]). In the 2026-10-25 shape the pane's own
+    /// row had been closed, so it is no leftover, and it is counted.
+    pub leftover: bool,
 }
 
 /// Pure: the verdict of every open row on a live pane — one with an entry in
@@ -701,7 +718,9 @@ pub struct BindingVerdict {
 /// `S`) on pane `P` (module docs, "The verdict"):
 ///
 /// 1. `P`'s own record names `S` → `Matched`.
-/// 2. Otherwise another live pane's record names `S` → `Unknown`.
+/// 2. Otherwise another live pane's record names `S` → `Unknown` — a
+///    [`BindingVerdict::leftover`] when `P` also holds an open row of the
+///    session its own record names.
 /// 3. Otherwise → `None`.
 pub fn binding_verdicts(
     open: &[TerminalSessionRecord],
@@ -716,27 +735,40 @@ pub fn binding_verdicts(
     for terminals in named_by.values_mut() {
         terminals.sort_unstable();
     }
+    let open: Vec<&TerminalSessionRecord> = open.iter().filter(|r| r.state == "open").collect();
+    // Every (pane, session) an open row holds: the leftover test.
+    let held: HashSet<(&str, &str)> = open
+        .iter()
+        .map(|r| (r.terminal_id.as_str(), r.claude_session_id.as_str()))
+        .collect();
     let mut out: Vec<BindingVerdict> = open
         .iter()
-        .filter(|r| r.state == "open")
         .filter_map(|r| {
             let own = evidence.get(&r.terminal_id)?;
             let id = r.claude_session_id.as_str();
-            let (state, runs_on) = if own.named_session() == Some(id) {
-                (Some(BindingState::Matched), None)
+            let (state, runs_on, leftover) = if own.named_session() == Some(id) {
+                (Some(BindingState::Matched), None, false)
             } else if let Some(elsewhere) = named_by
                 .get(id)
                 .and_then(|terminals| terminals.iter().find(|t| **t != r.terminal_id))
             {
-                (Some(BindingState::Unknown), Some((*elsewhere).to_string()))
+                let leftover = own
+                    .named_session()
+                    .is_some_and(|named| held.contains(&(r.terminal_id.as_str(), named)));
+                (
+                    Some(BindingState::Unknown),
+                    Some((*elsewhere).to_string()),
+                    leftover,
+                )
             } else {
-                (None, None)
+                (None, None, false)
             };
             Some(BindingVerdict {
                 claude_session_id: id.to_string(),
                 terminal_id: r.terminal_id.clone(),
                 state,
                 runs_on,
+                leftover,
             })
         })
         .collect();
@@ -752,11 +784,13 @@ pub fn binding_verdicts(
 /// their state ([`SessionLifecycleStore::set_binding_state`]); rule 3 withdraws
 /// a `matched` and keeps an `unknown`
 /// ([`SessionLifecycleStore::withdraw_matched`], re-checked under the registry
-/// lock). Every row that NEWLY reads `unknown` is logged and counted once — its
-/// episode lasts until it is matched, moves or closes — and returned. A verdict
-/// for a row that moved or closed since the verdicts were taken is dropped by
-/// the store, and so is an `unknown` for a row placed after the evidence was
-/// enumerated (`enumerated_at`; [`SessionLifecycleStore::placed_after`]).
+/// lock). Every row that NEWLY reads `unknown` is logged at warn, counted once —
+/// its episode lasts until it is matched, moves or closes — and returned;
+/// except a leftover ([`BindingVerdict::leftover`]), which is logged at info and
+/// neither counted nor returned. A verdict for a row that moved or closed since
+/// the verdicts were taken is dropped by the store, and so is an `unknown` for
+/// a row placed after the evidence was enumerated (`enumerated_at`;
+/// [`SessionLifecycleStore::placed_after`]).
 pub fn apply_binding_verdicts(
     store: &SessionLifecycleStore,
     verdicts: &[BindingVerdict],
@@ -778,14 +812,24 @@ pub fn apply_binding_verdicts(
         ) else {
             continue;
         };
-        if state == BindingState::Unknown && previous != Some(BindingState::Unknown) {
-            store.binding_counters().note_mismatch(
-                &v.terminal_id,
-                &v.claude_session_id,
-                v.runs_on.as_deref().unwrap_or_default(),
-            );
-            newly_unknown.push(v.clone());
+        if state != BindingState::Unknown || previous == Some(BindingState::Unknown) {
+            continue;
         }
+        if v.leftover {
+            info!(
+                terminal_id = %v.terminal_id,
+                bound_session = %v.claude_session_id,
+                runs_on = v.runs_on.as_deref().unwrap_or_default(),
+                "session binder: a leftover row beside its pane's current session reads unknown — its session runs in another live pane (not counted)"
+            );
+            continue;
+        }
+        store.binding_counters().note_mismatch(
+            &v.terminal_id,
+            &v.claude_session_id,
+            v.runs_on.as_deref().unwrap_or_default(),
+        );
+        newly_unknown.push(v.clone());
     }
     newly_unknown
 }
@@ -1044,6 +1088,104 @@ mod tests {
         let got = by_id(&verdicts);
         assert_eq!(got.get("s"), Some(&Some(BindingState::Matched)));
         assert_eq!(got.get("s2"), Some(&None), "judged on nothing, not unknown");
+    }
+
+    /// Round 11: a `/clear` leftover is `unknown` but no mismatch. Pane A ran
+    /// `/clear` (`s` → `s2`), so it holds `s`'s confirmed row beside `s2`'s and
+    /// names `s2`; `s` was then resumed inside pane B's TUI, whose record names
+    /// it before B's hook lands. `s`'s row on A reads `unknown` — it runs in B
+    /// — as a leftover: A holds an open row of the session its record names.
+    /// In the 2026-10-25 shape the pane's own row had been closed: the same
+    /// verdict, and no leftover.
+    #[test]
+    fn a_clear_leftover_reads_unknown_as_a_leftover_and_the_2026_10_25_shape_does_not() {
+        let evidence: HashMap<String, PaneEvidence> = [
+            ("t-a".to_string(), names("s2")),
+            ("t-b".to_string(), names("s")),
+        ]
+        .into_iter()
+        .collect();
+        let verdict_of_s = |rows: &[TerminalSessionRecord]| {
+            binding_verdicts(rows, &evidence)
+                .into_iter()
+                .find(|v| v.claude_session_id == "s")
+                .map(|v| (v.state, v.runs_on, v.leftover))
+        };
+        let unknown_on_b = |leftover: bool| {
+            Some((
+                Some(BindingState::Unknown),
+                Some("t-b".to_string()),
+                leftover,
+            ))
+        };
+        let cleared = vec![
+            open_row("s", "t-a", None),
+            open_row("s2", "t-a", None),
+            open_row("x", "t-b", None),
+        ];
+        assert_eq!(verdict_of_s(&cleared), unknown_on_b(true));
+
+        let mut moved_over = cleared.clone();
+        moved_over[1].state = "closed".to_string();
+        assert_eq!(
+            verdict_of_s(&moved_over),
+            unknown_on_b(false),
+            "the pane's own row closed: the 2026-10-25 shape"
+        );
+        assert_eq!(
+            verdict_of_s(&[open_row("s", "t-a", None)]),
+            unknown_on_b(false),
+            "a pane holding no row of what it names"
+        );
+    }
+
+    /// Round 11: applying a leftover's `unknown` stores it and neither counts
+    /// nor reports it; the same contradiction with the pane's own row closed —
+    /// the 2026-10-25 shape — is counted and reported.
+    #[test]
+    fn a_leftover_unknown_is_stored_but_not_counted() {
+        let evidence: HashMap<String, PaneEvidence> = [
+            ("t-a".to_string(), names("s2")),
+            ("t-b".to_string(), names("s")),
+        ]
+        .into_iter()
+        .collect();
+        for own_row_closed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+            let counters = Arc::new(BindingCounters::default());
+            store.attach_binding_counters(counters.clone());
+            // `s` launched on A; `/clear` made `s2` there — its hook writes it
+            // unconfirmed, so `s`'s confirmed row stays open beside it.
+            store.record_open(open_row("s", "t-a", None));
+            store.record_open(TerminalSessionRecord {
+                confirmed_at: None,
+                ..open_row("s2", "t-a", None)
+            });
+            store.confirm_session("s2");
+            store.record_open(open_row("x", "t-b", None));
+            assert_eq!(store.get("s").unwrap().state, "open", "precondition");
+            if own_row_closed {
+                store.record_close("s2", "explicit");
+            }
+
+            let reported = apply_binding_verdicts(
+                &store,
+                &binding_verdicts(&store.open_records(), &evidence),
+                Some(1),
+                None,
+            );
+            assert_eq!(
+                store.get("s").unwrap().binding_state,
+                Some(BindingState::Unknown),
+                "own_row_closed={own_row_closed}"
+            );
+            assert_eq!(
+                (reported.len(), counters.mismatches()),
+                if own_row_closed { (1, 1) } else { (0, 0) },
+                "own_row_closed={own_row_closed}"
+            );
+        }
     }
 
     /// Applying verdicts: a rule-2 transition is counted once per episode and

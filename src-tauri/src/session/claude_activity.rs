@@ -161,10 +161,11 @@ pub struct RecordEvidence {
     /// no such line was in the tail.
     pub last_message_ms: Option<i64>,
     /// The `sessionId` the record names — the session the process runs, by
-    /// Claude Code's own account. Claude Code 2.1.316 and 2.1.317 rewrite it
-    /// when `/clear` or an in-TUI `/resume` switches the process to another
-    /// session; other builds are unread (see [`crate::session::pane_binding`]).
-    /// `None` when absent or blank. Read by the pane-binding check
+    /// Claude Code's own account. Whether Claude Code rewrites it when `/clear`
+    /// or an in-TUI `/resume` switches the process to another session is
+    /// unconfirmed: the 2.1.318 binary contains the rewrite, which is not
+    /// proof that a switch runs it ([`crate::session::pane_binding`], "The
+    /// verdict", has the reading). `None` when absent or blank. Read by the pane-binding check
     /// ([`crate::session::pane_binding`]); the activity classification ignores
     /// it.
     pub session_id: Option<String>,

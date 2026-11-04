@@ -596,9 +596,11 @@ pub fn run_reconcile<I: TranscriptIndex>(
 /// [`run_reconcile`] over the observation `evidence` was read from: its
 /// verdicts tagged with `epoch`, the number the oracle gave that observation,
 /// and `enumerated_at`, when its enumeration began, set against each row's
-/// last placement. A row placed after it is neither moved by a bind nor read
-/// `unknown` by rule 2 ([`SessionLifecycleStore::placed_after`]): the
-/// evidence predates the placement, and the next pass judges it.
+/// last placement and close. A row placed after it is neither moved by a bind
+/// nor read `unknown` by rule 2, nor closed by a bind's supersede
+/// ([`SessionLifecycleStore::placed_after`]); a row closed after it is not
+/// re-opened by a bind ([`SessionLifecycleStore::closed_after`]). The evidence
+/// predates the write, and the next pass judges the row.
 #[allow(clippy::too_many_arguments)]
 pub fn run_reconcile_at_epoch<I: TranscriptIndex>(
     store: &SessionLifecycleStore,
@@ -808,13 +810,13 @@ pub fn run_reconcile_at_epoch<I: TranscriptIndex>(
                     match store.record_bind_checked(record, enumerated_at) {
                         Some(outcome) => outcome,
                         None => {
-                            // A write placed the row after this evidence was
-                            // enumerated: the evidence predates it, and the
-                            // next pass's decides.
+                            // A write placed or closed the row after this
+                            // evidence was enumerated: the evidence predates
+                            // it, and the next pass's decides.
                             tracing::debug!(
                                 terminal_id = %pty.terminal_id,
                                 claude_session = %session_id,
-                                "session binder: the row was placed after this pass's evidence was enumerated — left for the next pass"
+                                "session binder: the row was placed or closed after this pass's evidence was enumerated — left for the next pass"
                             );
                             actions.push(ReconcileAction::LeaveAlone {
                                 terminal_id: pty.terminal_id.clone(),
@@ -982,14 +984,14 @@ fn apply_verdicts(
 /// names nothing is bound iff it holds a confirmed open row not read
 /// `unknown`.
 ///
-/// Records follow an in-process switch in Claude Code 2.1.316 and 2.1.317
-/// ([`crate::session::pane_binding`], "The verdict"), so on those builds the
-/// session a pane's record names is the one it runs. On a build whose records
-/// do NOT follow switches, a pane that ran `/clear` keeps naming its
-/// predecessor; once no live pane holds or runs that predecessor, this rule
-/// leaves the pane unbound and rung 2b binds the predecessor back onto it —
-/// authoritatively, so a confirmed bind's supersede closes the row of the
-/// session the pane really runs, and the pane's coord session is re-keyed.
+/// This takes the session a pane's record names to be the one it runs, which
+/// holds only if a record follows an in-process switch — unconfirmed
+/// ([`crate::session::pane_binding`], "The verdict"). If records do NOT follow
+/// switches, a pane that ran `/clear` keeps naming its predecessor; once no
+/// live pane holds or runs that predecessor, this rule leaves the pane unbound
+/// and rung 2b binds the predecessor back onto it — authoritatively, so a
+/// confirmed bind's supersede closes the row of the session the pane really
+/// runs, and the pane's coord session is re-keyed.
 fn bound_panes(
     open: &[TerminalSessionRecord],
     evidence: &HashMap<String, PaneEvidence>,
@@ -1590,8 +1592,22 @@ pub async fn run_reconcile_pass(
     // enumerated — before any pid in it was read — so neither the record read,
     // the argv query nor the prescan below makes it look younger, and a row
     // placed after it is newer than all of it. A snapshot with no such time (a
-    // caller that built its own) dates from now.
-    let enumerated_at = snapshot.taken_at.unwrap_or_else(Instant::now);
+    // caller that built its own) dates from now, which makes a placement
+    // between the enumeration and now look older than the evidence: said at
+    // warn, since every production snapshot is stamped
+    // ([`crate::process_capture::process_tree::snapshot_process_table_public`]).
+    let enumerated_at = match snapshot.taken_at {
+        Some(taken_at) => taken_at,
+        None => {
+            if snapshot_ok {
+                tracing::warn!(
+                    context,
+                    "session reconcile: the process snapshot carries no enumeration time — dating its evidence from now"
+                );
+            }
+            Instant::now()
+        }
+    };
     let readings = pane_binding::read_records_off_runtime(
         panes.values().flatten().copied().collect(),
         pane_binding::RECORD_READ_BOUND,
@@ -3871,6 +3887,71 @@ mod tests {
         assert_eq!((counters.mismatches(), counters.refused_moves()), (1, 0));
     }
 
+    /// Round 11: a `/clear` leftover is healed uncounted — the other half of
+    /// the 2026-10-25 test above, which stays counted because there the pane's
+    /// own row had been closed. Pane A launched `s` and ran `/clear` into `s2`,
+    /// both hook-confirmed, so `s`'s row stays open beside `s2`'s, and A's
+    /// record names `s2`. Pane B launched `x`, then resumed `s` inside its TUI:
+    /// B's record names `s` before B's hook lands. `s`'s row on A reads
+    /// `unknown` — it runs in B — so A no longer holds it, and rung 2b moves it
+    /// onto B; nothing is counted, and the next pass finds every row matched.
+    #[test]
+    fn a_clear_leftover_resumed_in_another_pane_is_healed_uncounted() {
+        let dir = tempdir().unwrap();
+        let panes = [("term-a", names("s2")), ("term-b", names("s"))];
+        let (store, counters) = store_with_panes(dir.path(), &panes);
+        hook(&store, "s", "term-a");
+        hook(&store, "s2", "term-a");
+        hook(&store, "x", "term-b");
+        assert_eq!(
+            store.get("s").unwrap().state,
+            "open",
+            "precondition: the /clear's hook leaves the predecessor's row open"
+        );
+        let (live, _) = two_panes_one_workdir();
+        let pass = || {
+            run_reconcile(
+                &store,
+                &live,
+                &ProcessSnapshot::default(),
+                &transcripts(&["s", "s2", "x"], 1_500),
+                &no_cmdlines(),
+                &evidence(&panes),
+            )
+        };
+
+        let actions = pass();
+        assert!(binds_session(&actions, "s"), "healed: {actions:?}");
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, ReconcileAction::BindingMismatch { .. })),
+            "{actions:?}"
+        );
+        assert_eq!((counters.mismatches(), counters.refused_moves()), (0, 0));
+        for (id, terminal) in [("s", "term-b"), ("s2", "term-a")] {
+            let row = store.get(id).unwrap();
+            assert_eq!(
+                (
+                    row.state.as_str(),
+                    row.terminal_id.as_str(),
+                    row.binding_state
+                ),
+                ("open", terminal, Some(BindingState::Matched)),
+                "{id}: {actions:?}"
+            );
+        }
+        assert_eq!(
+            store.get("x").unwrap().state,
+            "closed",
+            "B's previous tenant is retired by the confirmed bind"
+        );
+
+        let again = pass();
+        assert!(!binds_session(&again, "s"), "{again:?}");
+        assert_eq!((counters.mismatches(), counters.refused_moves()), (0, 0));
+    }
+
     /// What the SessionStart hook route does for `id` on `terminal`: an
     /// authoritative record written UNCONFIRMED, then the confirmation and the
     /// start stamp, separately (`install_effects_producer`). Its write never
@@ -3886,7 +3967,7 @@ mod tests {
         store.note_session_start_hook(id);
     }
 
-    /// Case (i) on a build whose records follow a switch (2.1.316, 2.1.317 —
+    /// Case (i) where records follow a switch (the rules' assumption —
     /// [`crate::session::pane_binding`], "The verdict"): pane A launched `s`
     /// and ran `/clear`, so A's record names `s2`; pane B launched `x`, then
     /// resumed `s` inside its TUI — B's hook moved `s`'s row there, and B's
@@ -4118,6 +4199,139 @@ mod tests {
         assert_eq!(counters.mismatches(), 1);
     }
 
+    /// Round 11: the store's refusal in `record_bind_checked` is what keeps a
+    /// placement made after the enumeration. A respawn pins `s` on a new tab,
+    /// `term-c`, after this pass's process table was enumerated — so the
+    /// pass's live set does not include `term-c`, and nothing there holds `s`
+    /// for it — while pane A's record, read in the same pass, still names `s`.
+    /// Rung 2b binds `s` back onto A, and the store refuses: `s` stays on its
+    /// new tab, and the next pass judges it. Dated before the enumeration
+    /// instead, the same placement is older than the evidence, and A's record
+    /// takes `s`.
+    #[test]
+    fn a_placement_onto_a_tab_the_pass_never_saw_is_not_undone_by_its_evidence() {
+        for placed_before_the_enumeration in [false, true] {
+            let dir = tempdir().unwrap();
+            let panes = [("term-a", names("s")), ("term-b", names("x"))];
+            let (store, counters) = store_with_panes(dir.path(), &panes);
+            hook(&store, "s", "term-a");
+            hook(&store, "x", "term-b");
+            let mut enumerated = Instant::now();
+            std::thread::sleep(Duration::from_millis(2));
+            // The respawn's pin: strong, so the binding guard lets it move `s`
+            // off A.
+            assert!(store
+                .record_open_checked(title_rec("s", "term-c", Some("T")))
+                .is_recorded());
+            if placed_before_the_enumeration {
+                std::thread::sleep(Duration::from_millis(2));
+                enumerated = Instant::now();
+            }
+            let (live, _) = two_panes_one_workdir();
+
+            let actions = run_reconcile_at_epoch(
+                &store,
+                &live,
+                &ProcessSnapshot::default(),
+                &transcripts(&["s", "x"], 1_500),
+                &no_cmdlines(),
+                &evidence(&panes),
+                store.pane_epoch(),
+                Some(enumerated),
+            );
+
+            let row = store.get("s").unwrap();
+            let case = format!("placed_before_the_enumeration={placed_before_the_enumeration}");
+            if placed_before_the_enumeration {
+                assert!(binds_session(&actions, "s"), "{case}: {actions:?}");
+                assert_eq!(
+                    (row.terminal_id.as_str(), row.binding_state),
+                    ("term-a", Some(BindingState::Matched)),
+                    "{case}"
+                );
+            } else {
+                assert!(!binds_session(&actions, "s"), "{case}: {actions:?}");
+                assert!(
+                    actions.contains(&ReconcileAction::LeaveAlone {
+                        terminal_id: "term-a".to_string()
+                    }),
+                    "{case}: {actions:?}"
+                );
+                assert_eq!(
+                    (row.state.as_str(), row.terminal_id.as_str()),
+                    ("open", "term-c"),
+                    "{case}"
+                );
+            }
+            assert_eq!(
+                (counters.mismatches(), counters.refused_moves()),
+                (0, 0),
+                "{case}"
+            );
+        }
+    }
+
+    /// Round 11: a row closed after the enumeration is not re-opened. The
+    /// operator closes pane A's tab mid-pass: `s`'s row closes after this
+    /// pass's process table was enumerated, in which A was live and its record
+    /// named `s`. Rung 2b binds `s` back onto A — which would put the row back
+    /// open on a dead pane, where a restart before the next pass would restore
+    /// a session the operator closed — and the store refuses: `s` stays closed.
+    /// Dated before the enumeration instead, the close is older than the
+    /// evidence, and A's record re-opens `s` as before.
+    #[test]
+    fn a_row_closed_after_the_enumeration_is_not_re_opened_by_its_evidence() {
+        for closed_before_the_enumeration in [false, true] {
+            let dir = tempdir().unwrap();
+            let panes = [("term-a", names("s")), ("term-b", names("x"))];
+            let (store, counters) = store_with_panes(dir.path(), &panes);
+            hook(&store, "s", "term-a");
+            hook(&store, "x", "term-b");
+            let mut enumerated = Instant::now();
+            std::thread::sleep(Duration::from_millis(2));
+            store.record_close("s", "explicit");
+            if closed_before_the_enumeration {
+                std::thread::sleep(Duration::from_millis(2));
+                enumerated = Instant::now();
+            }
+            let (live, _) = two_panes_one_workdir();
+
+            let actions = run_reconcile_at_epoch(
+                &store,
+                &live,
+                &ProcessSnapshot::default(),
+                &transcripts(&["s", "x"], 1_500),
+                &no_cmdlines(),
+                &evidence(&panes),
+                store.pane_epoch(),
+                Some(enumerated),
+            );
+
+            let row = store.get("s").unwrap();
+            let case = format!("closed_before_the_enumeration={closed_before_the_enumeration}");
+            if closed_before_the_enumeration {
+                assert!(binds_session(&actions, "s"), "{case}: {actions:?}");
+                assert_eq!(
+                    (row.state.as_str(), row.terminal_id.as_str()),
+                    ("open", "term-a"),
+                    "{case}"
+                );
+            } else {
+                assert!(!binds_session(&actions, "s"), "{case}: {actions:?}");
+                assert_eq!(
+                    (row.state.as_str(), row.close_reason.as_deref()),
+                    ("closed", Some("explicit")),
+                    "{case}"
+                );
+            }
+            assert_eq!(
+                (counters.mismatches(), counters.refused_moves()),
+                (0, 0),
+                "{case}"
+            );
+        }
+    }
+
     /// The pane a superseded-or-not pass judges: `term-a`, whose own `claude`
     /// (this test's pid) names `s-a`, beside a stale confirmed row `s-x` an
     /// earlier binder left there.
@@ -4142,12 +4356,28 @@ mod tests {
     /// oracle holds ends its pass — no verdict stored, no transition counted,
     /// no row bound or retired — and the later observation still answers. The
     /// same pass with nothing newer held binds `s-a` and retires `s-x`. Both
-    /// reads are in the past: the held one is simply read later.
+    /// reads are in the past: the held one is simply read later. The stale
+    /// row was left before either read — a bind spares a sibling placed after
+    /// its evidence was enumerated.
     #[test]
     fn a_pass_whose_observation_is_superseded_judges_and_binds_nothing() {
+        let live = vec![pty_anchored("term-a", 100, 1_000, "C:/repo")];
+        let with_stale_row = |file: &str| {
+            let dir = tempdir().unwrap();
+            let store = SessionLifecycleStore::open(dir.path().join(file)).unwrap();
+            let registry = Arc::new(pane_binding::LivePaneRegistry::new());
+            store.attach_pane_evidence(registry.clone());
+            let counters = Arc::new(pane_binding::BindingCounters::default());
+            store.attach_binding_counters(counters.clone());
+            store.record_open(title_rec("s-x", "term-a", Some("T")));
+            (dir, store, registry, counters)
+        };
+        let (_dir, store, registry, counters) = with_stale_row("superseded.json");
+        let (_fresh_dir, fresh, _registry, _counters) = with_stale_row("fresh.json");
+        // Two `Instant`s taken back to back can tie.
+        std::thread::sleep(Duration::from_millis(2));
         let read_first = Instant::now();
         std::thread::sleep(Duration::from_millis(2));
-        let live = vec![pty_anchored("term-a", 100, 1_000, "C:/repo")];
         let judge = |store: &SessionLifecycleStore| {
             let observation = a_pane_naming_s_a(read_first);
             let evidence = observation.evidence_map();
@@ -4162,18 +4392,7 @@ mod tests {
                 "test",
             )
         };
-        let with_stale_row = |file: &str| {
-            let dir = tempdir().unwrap();
-            let store = SessionLifecycleStore::open(dir.path().join(file)).unwrap();
-            let registry = Arc::new(pane_binding::LivePaneRegistry::new());
-            store.attach_pane_evidence(registry.clone());
-            let counters = Arc::new(pane_binding::BindingCounters::default());
-            store.attach_binding_counters(counters.clone());
-            store.record_open(title_rec("s-x", "term-a", Some("T")));
-            (dir, store, registry, counters)
-        };
 
-        let (_dir, store, registry, counters) = with_stale_row("superseded.json");
         let held = registry.observe(a_pane_naming_s_a(Instant::now())).epoch();
         assert!(held.is_some());
         let actions = judge(&store);
@@ -4193,10 +4412,9 @@ mod tests {
             "the later read still answers"
         );
 
-        let (_dir, store, _registry, _counters) = with_stale_row("fresh.json");
-        let actions = judge(&store);
+        let actions = judge(&fresh);
         assert!(binds_session(&actions, "s-a"), "{actions:?}");
-        assert_eq!(store.get("s-x").unwrap().state, "closed", "{actions:?}");
+        assert_eq!(fresh.get("s-x").unwrap().state, "closed", "{actions:?}");
     }
 
     /// Review F5: a pass hands its observation over and judges only while it

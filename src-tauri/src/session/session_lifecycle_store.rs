@@ -1326,6 +1326,8 @@ pub struct SessionLifecycleStore {
     /// its FIRST judgement of an observation is stored
     /// ([`Self::serve_verdicts_from`]). Until then the previous observation's
     /// verdicts stay served. `None`: no pass has judged in this process.
+    /// Lock order: `map` → `servable_epoch` (only [`Self::reload_from_disk`]
+    /// nests them).
     servable_epoch: Mutex<Option<u64>>,
     /// When a write last PLACED each open row — created it, moved it onto
     /// another terminal or re-opened it, weak or strong — by session id
@@ -1334,9 +1336,17 @@ pub struct SessionLifecycleStore {
     /// nor reads it `unknown` on such evidence, and waits for its next pass.
     /// Monotonic, so a wall-clock step cannot reorder it; process-local, so a
     /// restart starts it empty — "no recent placement" — which is the truth
-    /// for a store just loaded. A close forgets the row's entry
-    /// ([`Self::forget_closed`]). Lock order: `map` → `last_placed`.
+    /// for a store just loaded (and [`Self::reload_from_disk`] empties it for
+    /// the same reason). A close forgets the row's entry
+    /// ([`Self::note_closed`]). Lock order: `map` → `last_placed`.
     last_placed: Mutex<HashMap<String, Instant>>,
+    /// When each CLOSED row closed, by session id ([`Self::closed_after`]) —
+    /// the counterpart of [`Self::last_placed`]: pane evidence enumerated
+    /// before that instant is older than the close, so a reconcile bind does
+    /// not re-open the row on it ([`Self::record_bind_checked`]). Monotonic and
+    /// process-local like `last_placed`; a row placed again, or gone from the
+    /// map, forgets its entry. Lock order: `map` → `last_closed`.
+    last_closed: Mutex<HashMap<String, Instant>>,
     /// Held by a reconcile pass from the hand-over of its pane observation to
     /// the oracle through its last verdict and bind
     /// ([`Self::reconcile_pass_lock`]), so overlapping passes judge one at a
@@ -1564,6 +1574,7 @@ impl SessionLifecycleStore {
             verdict_epochs: Mutex::new(HashMap::new()),
             servable_epoch: Mutex::new(None),
             last_placed: Mutex::new(HashMap::new()),
+            last_closed: Mutex::new(HashMap::new()),
             reconcile_pass: Mutex::new(()),
             finish_forward: Mutex::new(()),
         };
@@ -1689,12 +1700,18 @@ impl SessionLifecycleStore {
 
     /// Record that a write just PLACED `claude_session_id`'s row: created it,
     /// moved it onto another terminal or re-opened it ([`Self::last_placed`]).
-    /// The caller holds `map`: lock order `map` → `last_placed`.
+    /// A placement ends any close it re-opened ([`Self::last_closed`]). The
+    /// caller holds `map`: lock order `map` → `last_placed`, `map` →
+    /// `last_closed`.
     fn note_placed(&self, claude_session_id: &str) {
         self.last_placed
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(claude_session_id.to_string(), Instant::now());
+        self.last_closed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(claude_session_id);
     }
 
     /// Whether a write placed `claude_session_id`'s row AFTER `enumerated_at`
@@ -1707,6 +1724,18 @@ impl SessionLifecycleStore {
             .unwrap_or_else(|p| p.into_inner())
             .get(claude_session_id)
             .is_some_and(|placed| *placed > enumerated_at)
+    }
+
+    /// Whether `claude_session_id`'s row CLOSED after `enumerated_at` and has
+    /// stayed closed since ([`Self::last_closed`]) — later than anything pane
+    /// evidence enumerated then can know about. Takes the close lock, so a
+    /// caller holding `map` keeps the order `map` → `last_closed`.
+    pub(crate) fn closed_after(&self, claude_session_id: &str, enumerated_at: Instant) -> bool {
+        self.last_closed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(claude_session_id)
+            .is_some_and(|closed| *closed > enumerated_at)
     }
 
     /// The lock a reconcile pass holds from handing its observation to the
@@ -1816,11 +1845,26 @@ impl SessionLifecycleStore {
             .collect()
     }
 
-    /// Drop what this process remembers of rows that closed or left the map —
-    /// their verdict epochs and their last placement — so nothing in memory
-    /// outlives its row. The caller holds `map`: lock order `map` →
-    /// `verdict_epochs`, `map` → `last_placed`.
-    fn forget_closed<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
+    /// Rows that just CLOSED: drop what this process remembers of them
+    /// ([`Self::forget_removed`]), then remember when they closed
+    /// ([`Self::last_closed`]), so pane evidence enumerated before the close
+    /// cannot re-open them. The caller holds `map`: lock order `map` →
+    /// `verdict_epochs`, `map` → `last_placed`, `map` → `last_closed`.
+    fn note_closed<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
+        let ids: Vec<&str> = ids.into_iter().collect();
+        self.forget_removed(ids.iter().copied());
+        let now = Instant::now();
+        let mut closed = self.last_closed.lock().unwrap_or_else(|p| p.into_inner());
+        for id in ids {
+            closed.insert(id.to_string(), now);
+        }
+    }
+
+    /// Rows that LEFT the map (removed, re-keyed away): drop everything this
+    /// process remembers of them — verdict epochs, last placement, last close —
+    /// so nothing in memory outlives its row. The caller holds `map`: the lock
+    /// orders of [`Self::note_closed`].
+    fn forget_removed<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
         let ids: Vec<&str> = ids.into_iter().collect();
         if let Ok(mut epochs) = self.verdict_epochs.lock() {
             for id in &ids {
@@ -1830,6 +1874,11 @@ impl SessionLifecycleStore {
         let mut placed = self.last_placed.lock().unwrap_or_else(|p| p.into_inner());
         for id in &ids {
             placed.remove(*id);
+        }
+        drop(placed);
+        let mut closed = self.last_closed.lock().unwrap_or_else(|p| p.into_inner());
+        for id in &ids {
+            closed.remove(*id);
         }
     }
 
@@ -2100,17 +2149,25 @@ impl SessionLifecycleStore {
                 return RecordOpenOutcome::Unavailable;
             }
         };
-        self.record_open_locked(m, rec, false)
+        self.record_open_locked(m, rec, false, None)
     }
 
     /// [`Self::record_open_checked`] for a reconcile bind taken from pane
-    /// evidence enumerated at `enumerated_at`. `None` — nothing written — when
-    /// it would move the session's open row onto another terminal after a
-    /// write placed that row later than the evidence was enumerated
-    /// ([`Self::placed_after`]): evidence older than a placement says nothing
-    /// about where the row belongs now, so the next pass's decides. Asked
-    /// under the registry lock the write takes, so no placement can land in
-    /// between. `enumerated_at: None` (no observation time) checks nothing.
+    /// evidence enumerated at `enumerated_at`, which says nothing about a write
+    /// made since. `None` — nothing written — when the bind would
+    ///
+    /// - MOVE the session's open row onto another terminal, and a write placed
+    ///   that row after the enumeration ([`Self::placed_after`]); or
+    /// - RE-OPEN the session's closed row, and it closed after the enumeration
+    ///   ([`Self::closed_after`]) — an operator closing the tab mid-pass, say,
+    ///   whose row would otherwise come back open on the dead pane and be
+    ///   restored by a restart before the next pass closed it again.
+    ///
+    /// The next pass, enumerated after the write, decides. A bind that is
+    /// written spares, in its supersede, every sibling placed after the
+    /// enumeration ([`Self::record_open_locked`]). Asked under the registry
+    /// lock the write takes, so no placement or close can land in between.
+    /// `enumerated_at: None` (no observation time) checks nothing.
     #[must_use]
     pub fn record_bind_checked(
         &self,
@@ -2124,16 +2181,20 @@ impl SessionLifecycleStore {
                 return Some(RecordOpenOutcome::Unavailable);
             }
         };
-        let moves_a_fresh_placement = enumerated_at.is_some_and(|at| {
-            !rec.terminal_id.trim().is_empty()
-                && m.get(&rec.claude_session_id)
-                    .is_some_and(|row| row.state == "open" && row.terminal_id != rec.terminal_id)
-                && self.placed_after(&rec.claude_session_id, at)
+        let id = rec.claude_session_id.as_str();
+        let older_than_the_row = enumerated_at.is_some_and(|at| match m.get(id) {
+            Some(row) if row.state == "open" => {
+                !rec.terminal_id.trim().is_empty()
+                    && row.terminal_id != rec.terminal_id
+                    && self.placed_after(id, at)
+            }
+            Some(_) => self.closed_after(id, at),
+            None => false,
         });
-        if moves_a_fresh_placement {
+        if older_than_the_row {
             return None;
         }
-        Some(self.record_open_locked(m, rec, false))
+        Some(self.record_open_locked(m, rec, false, enumerated_at))
     }
 
     /// [`Self::record_open_checked`] for a claim nothing has shown launched
@@ -2157,18 +2218,21 @@ impl SessionLifecycleStore {
         {
             return None;
         }
-        Some(self.record_open_locked(m, rec, true))
+        Some(self.record_open_locked(m, rec, true, None))
     }
 
     /// The write behind [`Self::record_open_checked`],
     /// [`Self::record_bind_checked`] and [`Self::record_open_provisional`],
     /// under the registry lock `m`, which it consumes. `provisional`: an
-    /// existing row's origin is never replaced.
+    /// existing row's origin is never replaced. `enumerated_at`: when a
+    /// reconcile bind's evidence was enumerated — the supersede spares every
+    /// sibling placed after it, which that evidence cannot have seen.
     fn record_open_locked(
         &self,
         m: std::sync::MutexGuard<'_, HashMap<String, TerminalSessionRecord>>,
         rec: TerminalSessionRecord,
         provisional: bool,
+        enumerated_at: Option<Instant>,
     ) -> RecordOpenOutcome {
         // Normalize a stray empty/whitespace-only config_dir to None: it must
         // never become a bogus `CLAUDE_CONFIG_DIR=""` on resume, and the sticky
@@ -2441,10 +2505,13 @@ impl SessionLifecycleStore {
             // `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`).
             // If it is THIS pane's, the bind is the suspect one, and the next
             // pass judges both rows; if it is another pane's, its row belongs
-            // there, not in the closed set.
+            // there, not in the closed set. So is a sibling placed after a
+            // reconcile bind's evidence was enumerated: that evidence predates
+            // it, and the next pass judges it.
             let mut superseded: Vec<TerminalSessionRecord> = Vec::new();
             if (new_is_authoritative || new_is_confirmed) && !new_terminal_id.is_empty() {
-                // The siblings some live pane's own record names.
+                // The siblings some live pane's own record names, and those
+                // placed after the bind's evidence.
                 let spared: HashSet<String> = m
                     .values()
                     .filter(|o| {
@@ -2454,7 +2521,9 @@ impl SessionLifecycleStore {
                     })
                     .filter(|o| {
                         let id = o.claude_session_id.as_str();
-                        pane.named_session() == Some(id) || !self.panes_naming(id).is_empty()
+                        pane.named_session() == Some(id)
+                            || !self.panes_naming(id).is_empty()
+                            || enumerated_at.is_some_and(|at| self.placed_after(id, at))
                     })
                     .map(|o| o.claude_session_id.clone())
                     .collect();
@@ -2472,7 +2541,7 @@ impl SessionLifecycleStore {
                             terminal_id = %new_terminal_id,
                             spared = %other.claude_session_id,
                             by = %new_id,
-                            "session-restore: spared a sibling a live pane's own claude still runs"
+                            "session-restore: spared a sibling a live pane's own claude still runs, or one placed after this bind's evidence"
                         );
                         continue;
                     }
@@ -2507,7 +2576,7 @@ impl SessionLifecycleStore {
                     }
                 }
             }
-            self.forget_closed(superseded.iter().map(|r| r.claude_session_id.as_str()));
+            self.note_closed(superseded.iter().map(|r| r.claude_session_id.as_str()));
             // O(1) durable write: the merged record plus any sibling this open
             // superseded — never the whole map.
             let mut deltas = Vec::with_capacity(1 + superseded.len());
@@ -2923,7 +2992,7 @@ impl SessionLifecycleStore {
                 // Unreachable: `resolve_close_target` only names OPEN rows.
                 _ => return outcome,
             };
-            self.forget_closed([closed.claude_session_id.as_str()]);
+            self.note_closed([closed.claude_session_id.as_str()]);
             let workdir = closed.working_dir.clone();
             // Answered under the lock rather than off a full-map clone — the
             // clone existed only to serve this one query.
@@ -4217,7 +4286,7 @@ impl SessionLifecycleStore {
             let Some(mut rec) = m.remove(old_id) else {
                 return; // old id absent — nothing to re-key
             };
-            self.forget_closed([old_id]);
+            self.forget_removed([old_id]);
             rec.claude_session_id = new_id.to_string();
             m.insert(new_id.to_string(), rec.clone());
             self.persist(
@@ -4259,7 +4328,7 @@ impl SessionLifecycleStore {
         if m.remove(claude_session_id).is_none() {
             return; // absent — nothing to flush
         }
-        self.forget_closed([claude_session_id]);
+        self.forget_removed([claude_session_id]);
         self.persist(
             m,
             &[LifecycleDelta::Remove {
@@ -4808,6 +4877,14 @@ impl SessionLifecycleStore {
             if let Ok(mut epochs) = self.verdict_epochs.lock() {
                 epochs.retain(|id, _| m.contains_key(id));
             }
+            self.last_placed
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain(|id, _| m.contains_key(id));
+            self.last_closed
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain(|id, _| m.contains_key(id));
         }
         // A prune drops an unbounded number of rows and already scanned the
         // whole map, so it is O(N) by construction — fold straight into a fresh
@@ -4935,7 +5012,7 @@ impl SessionLifecycleStore {
             if closed == 0 {
                 return 0; // nothing collapsed — skip the write
             }
-            self.forget_closed(closed_recs.iter().map(|r| r.claude_session_id.as_str()));
+            self.note_closed(closed_recs.iter().map(|r| r.claude_session_id.as_str()));
             (closed_recs, closed)
         };
         // Boot-time bulk repair — one compaction rather than N deltas.
@@ -5033,7 +5110,10 @@ impl SessionLifecycleStore {
     }
 
     /// Re-read this store's on-disk snapshot (+ WAL replay) and REPLACE the
-    /// in-memory map with it. Returns the record count now held.
+    /// in-memory map with it. Returns the record count now held. What this
+    /// process remembered of the replaced rows — verdict epochs, the servable
+    /// epoch, placements and closes — is forgotten with them, so a seeded row
+    /// never serves a stale verdict as current.
     ///
     /// THE DEFECT this exists for: the `seed-lifecycle-store` test seam writes
     /// the snapshot file directly, but a RUNNING runner holds the authoritative
@@ -5078,6 +5158,26 @@ impl SessionLifecycleStore {
             );
         }
         *m = fresh;
+        // What this process remembers of the replaced rows describes them, not
+        // the reloaded ones: no verdict of theirs is current, no placement or
+        // close of theirs is recent, and no observation's verdicts are served
+        // until a pass judges the reloaded rows. Lock order: `map` → each.
+        self.verdict_epochs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        self.last_placed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        self.last_closed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        *self
+            .servable_epoch
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
         let count = m.len();
         if let Err(e) = write_map(&self.path, &m) {
             warn!(error = %e, "session_lifecycle_store: reload snapshot rewrite failed");
@@ -9394,6 +9494,165 @@ mod tests {
             !store.withdraw_matched("s", "term-a"),
             "nothing to withdraw on a closed row"
         );
+    }
+
+    /// Round 11: `record_bind_checked` against the instant its evidence was
+    /// enumerated. A bind that would move the row back off the terminal a
+    /// later write placed it on writes nothing; a re-record where the row
+    /// already is moves nothing and is written; evidence enumerated after the
+    /// placement decides; and a bind with no enumeration time checks nothing.
+    #[test]
+    fn a_reconcile_bind_never_moves_a_row_placed_after_its_evidence() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        // Two `Instant`s taken back to back can tie.
+        let tick = || std::thread::sleep(std::time::Duration::from_millis(2));
+        let on = |terminal: &str| store.get("s").unwrap().terminal_id == terminal;
+        store.record_open(auth_on("s", "term-a"));
+        let enumerated = Instant::now();
+        tick();
+        store.record_open(auth_on("s", "term-b"));
+        assert!(store.placed_after("s", enumerated));
+
+        assert_eq!(
+            store.record_bind_checked(auth_on("s", "term-a"), Some(enumerated)),
+            None
+        );
+        assert!(on("term-b"), "not moved back");
+        assert_eq!(
+            store.record_bind_checked(auth_on("s", "term-b"), Some(enumerated)),
+            Some(RecordOpenOutcome::Recorded),
+            "a re-record where the row already is"
+        );
+        assert_eq!(
+            store.record_bind_checked(auth_on("s", "term-a"), None),
+            Some(RecordOpenOutcome::Recorded),
+            "no enumeration time: nothing to compare"
+        );
+        assert!(on("term-a"));
+        tick();
+        assert_eq!(
+            store.record_bind_checked(auth_on("s", "term-b"), Some(Instant::now())),
+            Some(RecordOpenOutcome::Recorded),
+            "evidence enumerated after the placement decides"
+        );
+        assert!(on("term-b"));
+    }
+
+    /// Round 11: evidence enumerated before a row CLOSED does not re-open it —
+    /// the operator closed the tab mid-pass, and a bind from that evidence
+    /// would put the row back open on the dead pane. Evidence enumerated after
+    /// the close re-opens it as before, and the re-open ends the close.
+    #[test]
+    fn a_reconcile_bind_never_re_opens_a_row_closed_after_its_evidence() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let tick = || std::thread::sleep(std::time::Duration::from_millis(2));
+        store.record_open(auth_on("s", "term-a"));
+        let enumerated = Instant::now();
+        tick();
+        store.record_close("s", "explicit");
+        assert!(store.closed_after("s", enumerated));
+
+        assert_eq!(
+            store.record_bind_checked(auth_on("s", "term-a"), Some(enumerated)),
+            None
+        );
+        assert_eq!(store.get("s").unwrap().state, "closed", "not re-opened");
+        tick();
+        assert_eq!(
+            store.record_bind_checked(auth_on("s", "term-a"), Some(Instant::now())),
+            Some(RecordOpenOutcome::Recorded),
+            "evidence enumerated after the close decides"
+        );
+        assert_eq!(store.get("s").unwrap().state, "open");
+        assert!(!store.closed_after("s", enumerated), "the re-open ends it");
+    }
+
+    /// Round 11: a reconcile bind's supersede spares every sibling placed after
+    /// its evidence was enumerated — a respawn's pin and a hook-confirmed row
+    /// written on the pane mid-pass, which that evidence cannot have seen. A
+    /// bind from evidence enumerated after them retires both, as before.
+    #[test]
+    fn a_reconcile_bind_spares_a_sibling_placed_after_its_evidence() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let enumerated = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let mut hooked = auth_on("hooked", "term-a");
+        hooked.confirmed_at = Some(1);
+        store.record_open(hooked);
+        store.record_open(auth_on("pin", "term-a"));
+        let mut bind = auth_on("s", "term-a");
+        bind.confirmed_at = Some(1);
+        let closed_as = |id: &str| {
+            let row = store.get(id).unwrap();
+            (row.state, row.close_reason)
+        };
+
+        assert_eq!(
+            store.record_bind_checked(bind.clone(), Some(enumerated)),
+            Some(RecordOpenOutcome::Recorded)
+        );
+        assert_eq!(closed_as("pin"), ("open".to_string(), None));
+        assert_eq!(closed_as("hooked"), ("open".to_string(), None));
+
+        assert_eq!(
+            store.record_bind_checked(bind, Some(Instant::now())),
+            Some(RecordOpenOutcome::Recorded)
+        );
+        assert_eq!(
+            closed_as("pin"),
+            ("closed".to_string(), Some("superseded".to_string()))
+        );
+        assert_eq!(
+            closed_as("hooked"),
+            (
+                "closed".to_string(),
+                Some("superseded-terminal-reuse".to_string())
+            )
+        );
+    }
+
+    /// Round 11: a reload from disk forgets what this process remembered of
+    /// the replaced rows. A verdict that was current before is not served as
+    /// current after — the reloaded row keeps its verdict from disk, but no
+    /// observation of this process has judged it — and no placement or close
+    /// of the replaced rows counts as recent.
+    #[test]
+    fn a_reload_from_disk_forgets_the_replaced_rows_verdicts_placements_and_closes() {
+        let dir = tempdir().unwrap();
+        let (store, _counters) = guarded_store(dir.path(), &[("term-a", names("s"))]);
+        let before = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        store.record_open(auth_on("s", "term-a"));
+        store.record_open(auth_on("c", "term-c"));
+        store.record_close("c", "explicit");
+        store.serve_verdicts_from(0);
+        let served = || store.current_binding_verdicts().get("s").map(|v| v.state);
+        assert_eq!(served(), Some(BindingState::Matched), "precondition");
+        assert!(store.placed_after("s", before) && store.closed_after("c", before));
+
+        assert_eq!(store.reload_from_disk().unwrap(), 2);
+        assert_eq!(
+            store.get("s").unwrap().binding_state,
+            Some(BindingState::Matched),
+            "the row keeps its verdict from disk"
+        );
+        assert_eq!(served(), None, "but it is not current");
+        assert!(!store.placed_after("s", before));
+        assert!(!store.closed_after("c", before));
+        // The verdict epochs went with the rows: raising the floor serves
+        // nothing until a pass judges again...
+        store.serve_verdicts_from(0);
+        assert_eq!(served(), None);
+        // ...and the servable epoch goes too: after another reload, a verdict
+        // judged since is not served until its pass raises the floor.
+        assert_eq!(store.reload_from_disk().unwrap(), 2);
+        let _ = store.set_binding_state("s", "term-a", BindingState::Matched, Some(0));
+        assert_eq!(served(), None);
+        store.serve_verdicts_from(0);
+        assert_eq!(served(), Some(BindingState::Matched));
     }
 
     /// `bindingState` round-trips camelCase through the snapshot, and a row

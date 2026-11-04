@@ -2859,10 +2859,12 @@ pub(crate) fn create_terminal_session_backend(
             let record_zone_index = hint_zone_index.unwrap_or(0);
             if let Some(pinned) = pinned_session_id {
                 // Pre-pinned id: record synchronously, then verify async that
-                // the transcript appears. NEVER rebinds from transcripts. A
-                // refusal (another live pane still runs this id) is logged by
-                // `record_pinned_session_open`; the verify below only stamps a
-                // row that exists, wherever it lives.
+                // the transcript appears. NEVER rebinds from transcripts. The
+                // record is authoritative, which the binding guard never
+                // refuses; a write the store could not make (`Unavailable`, a
+                // poisoned registry lock) is logged by
+                // `record_pinned_session_open`, and the verify below only
+                // stamps a row that exists.
                 let _ = record_pinned_session_open(
                     &store,
                     pinned.clone(),

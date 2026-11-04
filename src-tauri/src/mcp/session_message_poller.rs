@@ -801,34 +801,38 @@ fn claude_live(
     }
 }
 
-/// Does `pid` belong to the foreground process group of its controlling
-/// terminal, and is it not stopped? Read from `/proc/<pid>/stat`; an
-/// unreadable file is `false` (fail closed). Also the typed-resume sniff's
+/// Does `pid` read its terminal now — `None` where that cannot be
+/// established. Each caller decides what an unanswered probe means: the typed
+/// arm's idle gate fails closed (no delivery), and the typed-resume sniff's
 /// "did a running `claude` read this line?" test
-/// (`terminal::claude_resume_sniff::typed_line_target`).
+/// (`terminal::claude_resume_sniff::typed_line_target`) answers `Unknown`.
+///
+/// Linux: whether `pid` belongs to the foreground process group of its
+/// controlling terminal and is not stopped, read from `/proc/<pid>/stat`;
+/// `None` when the file is unreadable.
 #[cfg(target_os = "linux")]
-pub(crate) fn pid_reads_its_terminal(pid: u32) -> bool {
+pub(crate) fn pid_reads_its_terminal(pid: u32) -> Option<bool> {
     std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
         .map(|stat| stat_says_foreground(&stat))
-        .unwrap_or(false)
 }
 
 /// Windows has no job control: a process in the pane cannot be suspended or
 /// backgrounded away from the console the way a Unix shell does it, so
 /// existence in the subtree is the whole answer there.
 #[cfg(windows)]
-pub(crate) fn pid_reads_its_terminal(_pid: u32) -> bool {
-    true
+pub(crate) fn pid_reads_its_terminal(_pid: u32) -> Option<bool> {
+    Some(true)
 }
 
 /// Other Unixes (macOS) have job control but no `/proc/<pid>/stat` to read the
-/// foreground group from, so foreground cannot be established: fail closed.
-/// (Today the process probe itself is `Unreadable` there, so the typed arm
-/// never delivers on macOS either way; this keeps that true if the probe is
-/// ever made to work.)
+/// foreground group from, so whether a process reads its terminal cannot be
+/// established: `None`. (Today the process probe itself is `Unreadable` there,
+/// so neither caller gets this far on macOS; this keeps both fail-safe if the
+/// probe is ever made to work.)
 #[cfg(all(unix, not(target_os = "linux")))]
-pub(crate) fn pid_reads_its_terminal(_pid: u32) -> bool {
-    false
+pub(crate) fn pid_reads_its_terminal(_pid: u32) -> Option<bool> {
+    None
 }
 
 /// Parse a `/proc/<pid>/stat` line: `true` when the state is not stopped
@@ -922,7 +926,9 @@ async fn idle_gate(
         // as `graceful_exit::drive` (probe, then screen, then write).
         let probe =
             crate::terminal::graceful_exit::probe_claude_under(term.child_pid(), Vec::new()).await;
-        claude_live(&probe, pid_reads_its_terminal)?;
+        // A pid whose terminal ownership cannot be established is not
+        // reading: fail closed.
+        claude_live(&probe, |pid| pid_reads_its_terminal(pid).unwrap_or(false))?;
         typed_prompt_ready(&term.grid_screen())?;
     }
     Ok(term)

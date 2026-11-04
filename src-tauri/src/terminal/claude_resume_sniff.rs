@@ -65,8 +65,10 @@ pub struct TypedClaudeResume {
 /// there (authoritatively, for a line the shell read) would bind a session the
 /// pane does not run: `--fork-session` resumes the named session into a NEW
 /// one, and `--bg` / `--background` returns at once, continuing the session in
-/// the background or starting a copy of it (Claude Code 2.1.317's `--help`).
-/// Those flags are matched unquoted, as the shell passes them.
+/// the background or starting a copy of it — the option help in the Claude Code
+/// 2.1.318 binary (`grep -a -o '"--fork-session","[^"]*' /proc/<claude pid>/exe`,
+/// and the same for `"--bg, --background","`). Those flags are matched
+/// unquoted, as the shell passes them.
 pub fn parse_typed_claude_resume(line: &str) -> Option<TypedClaudeResume> {
     for segment in line.split([';', '&', '|']) {
         let mut tokens = segment.split_whitespace();
@@ -171,9 +173,10 @@ const LAUNCH_SKEW_SECS: i64 = 2;
 /// Where the line completed at `line_at_ms` went, from a probe of the pane
 /// taken just after it. `reads_terminal` says whether a pid owns the pane's
 /// terminal now (the foreground process group on Linux — a `claude` suspended
-/// with Ctrl-Z or started with `&` leaves the shell reading). On Windows a
-/// console has no job control, so a `claude` in the pane cannot have left the
-/// console to the shell: there `reads_terminal` is existence
+/// with Ctrl-Z or started with `&` leaves the shell reading), or `None` where
+/// that cannot be established — a Unix other than Linux has no probe for it.
+/// On Windows a console has no job control, so a `claude` in the pane cannot
+/// have left the console to the shell: there `reads_terminal` is existence
 /// ([`crate::mcp::session_message_poller::pid_reads_its_terminal`], the same
 /// predicate the message poller routes by), and a `claude` that started before
 /// the line read it. Pure.
@@ -181,28 +184,31 @@ const LAUNCH_SKEW_SECS: i64 = 2;
 /// The probe runs AFTER the line, so the `claude` the line itself launched may
 /// already be in it; that one started at or after the line and is not counted.
 /// A `claude` that started before the line and reads the terminal read the
-/// line.
+/// line. One that started before it — or at a time unknown — whose reading
+/// cannot be established may have: `Unknown`, never `Shell`.
 pub(crate) fn typed_line_target(
     probe: &ClaudeProbe,
     line_at_ms: i64,
-    reads_terminal: impl Fn(u32) -> bool,
+    reads_terminal: impl Fn(u32) -> Option<bool>,
 ) -> TypedLineTarget {
     let ClaudeProbe::Readable(pane) = probe else {
         return TypedLineTarget::Unknown;
     };
     let line_at_secs = line_at_ms / 1000;
-    let mut start_unknown = false;
+    let mut unknown = false;
     for claude in &pane.subtree_claude {
-        if !reads_terminal(claude.pid) {
-            continue;
-        }
-        if claude.started_at <= 0 {
-            start_unknown = true;
-        } else if claude.started_at + LAUNCH_SKEW_SECS <= line_at_secs {
-            return TypedLineTarget::Claude;
+        let started_before_the_line =
+            claude.started_at > 0 && claude.started_at + LAUNCH_SKEW_SECS <= line_at_secs;
+        match reads_terminal(claude.pid) {
+            Some(false) => {}
+            Some(true) if claude.started_at <= 0 => unknown = true,
+            Some(true) if started_before_the_line => return TypedLineTarget::Claude,
+            Some(true) => {}
+            None if claude.started_at <= 0 || started_before_the_line => unknown = true,
+            None => {}
         }
     }
-    if start_unknown {
+    if unknown {
         TypedLineTarget::Unknown
     } else {
         TypedLineTarget::Shell
@@ -671,7 +677,7 @@ mod tests {
     /// Phase 3c: only a line the pane's SHELL read is a launch.
     #[test]
     fn typed_line_target_tells_a_shell_line_from_a_prompt_typed_into_claude() {
-        let all = |_: u32| true;
+        let all = |_: u32| Some(true);
         // No claude in the pane: the shell read it.
         assert_eq!(
             typed_line_target(&pane(&[]), LINE_AT_MS, all),
@@ -697,7 +703,7 @@ mod tests {
         // A claude that does not own the terminal (Ctrl-Z, `&`) leaves the
         // shell reading.
         assert_eq!(
-            typed_line_target(&pane(&[(7, 9_000)]), LINE_AT_MS, |_| false),
+            typed_line_target(&pane(&[(7, 9_000)]), LINE_AT_MS, |_| Some(false)),
             TypedLineTarget::Shell
         );
         // A reading claude with no start time cannot be placed: unknown.
@@ -714,6 +720,44 @@ mod tests {
         assert_eq!(
             typed_line_target(&ClaudeProbe::Unreadable("x".into()), LINE_AT_MS, all),
             TypedLineTarget::Unknown
+        );
+    }
+
+    /// Round 11: where no probe can say whether a process reads its terminal
+    /// (a Unix other than Linux), a `claude` that may have read the line — one
+    /// that started before it, or at a time unknown — makes the answer
+    /// `Unknown`, never `Shell`, so the line is recorded provisionally. The
+    /// `claude` the line itself launched still says nothing.
+    #[test]
+    fn typed_line_target_is_unknown_where_no_probe_says_who_reads_the_terminal() {
+        let no_probe = |_: u32| None;
+        assert_eq!(
+            typed_line_target(&pane(&[(7, 9_000)]), LINE_AT_MS, no_probe),
+            TypedLineTarget::Unknown,
+            "a claude running since before the line"
+        );
+        assert_eq!(
+            typed_line_target(&pane(&[(7, 0)]), LINE_AT_MS, no_probe),
+            TypedLineTarget::Unknown,
+            "a claude with no start time"
+        );
+        assert_eq!(
+            typed_line_target(&pane(&[(7, 10_000)]), LINE_AT_MS, no_probe),
+            TypedLineTarget::Shell,
+            "only the claude the line launched"
+        );
+        assert_eq!(
+            typed_line_target(&pane(&[]), LINE_AT_MS, no_probe),
+            TypedLineTarget::Shell,
+            "no claude in the pane"
+        );
+        // A probe that does answer still decides: one reading claude that
+        // predates the line read it.
+        assert_eq!(
+            typed_line_target(&pane(&[(7, 9_000), (8, 9_000)]), LINE_AT_MS, |pid| {
+                (pid == 8).then_some(true)
+            }),
+            TypedLineTarget::Claude
         );
     }
 

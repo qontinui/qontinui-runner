@@ -291,12 +291,13 @@ async fn post_session_open(
             let outcome = record_session_open_into(&store, &req, &provider);
             if !outcome.is_recorded() {
                 // Plan `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`:
-                // the store refused the bind (another live pane's own `claude`
-                // still runs this session) or could not write it. Nothing was
-                // recorded on this terminal, so nothing is confirmed, stamped,
-                // emitted to the tab or re-keyed in coord — each would report a
-                // binding the store does not hold. 200 all the same: the hook
-                // must never wedge the provider's startup.
+                // the hook's record is authoritative, which the binding guard
+                // never refuses, so this is `Unavailable` — the store could not
+                // take its registry lock (poisoned). Nothing was recorded on
+                // this terminal, so nothing is confirmed, stamped, emitted to
+                // the tab or re-keyed in coord — each would report a binding
+                // the store does not hold. 200 all the same: the hook must
+                // never wedge the provider's startup.
                 warn!(
                     terminal_id = %req.terminal_id,
                     session_id = %req.session_id,
@@ -1222,9 +1223,10 @@ fn normalize_msys_cwd(cwd: &str) -> String {
 ///
 /// Returns what the store did with the record. Every step after the write —
 /// confirmation, the session-start stamp, the `/clear` adoption marker, the
-/// identity stamp — runs only when it was recorded: on a refusal the row is
-/// another pane's, and stamping it from this hook would describe this
-/// terminal's process on that pane's row.
+/// identity stamp — runs only when it was recorded. The record is
+/// authoritative, which the binding guard never refuses; the one other
+/// outcome is `Unavailable` (a poisoned registry lock), and then there is no
+/// row this hook wrote to stamp.
 fn record_session_open_into(
     store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
     req: &SessionOpenRequest,

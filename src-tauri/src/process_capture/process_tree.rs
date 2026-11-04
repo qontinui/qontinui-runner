@@ -1231,6 +1231,25 @@ mod bounded_probe_tests {
 mod tests {
     use super::*;
 
+    /// The session binder dates a pass's evidence from `taken_at` (plan
+    /// `2026-10-31-runner-binds-a-terminal-to-the-wrong-live-session`): every
+    /// production snapshot must carry it, taken before the enumeration
+    /// returned — never left `None`, which the binder would date from a later
+    /// "now".
+    #[tokio::test]
+    async fn a_public_snapshot_is_stamped_with_when_its_enumeration_began() {
+        let before = std::time::Instant::now();
+        let snapshot = snapshot_process_table_public().await;
+        let after = std::time::Instant::now();
+        let taken_at = snapshot.taken_at.expect("a public snapshot is stamped");
+        assert!(before <= taken_at && taken_at <= after);
+        assert_eq!(
+            ProcessSnapshot::default().taken_at,
+            None,
+            "a hand-built snapshot is not"
+        );
+    }
+
     fn pids(items: &[(u32, i64)]) -> Vec<PidWithSpawnedAt> {
         items
             .iter()
