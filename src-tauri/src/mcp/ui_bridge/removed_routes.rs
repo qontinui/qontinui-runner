@@ -13,8 +13,11 @@
 //! handler onto `/ui-bridge/vision/*` (`vision_routes.rs`).
 //!
 //! The 404's status and `NOT_FOUND` code are unchanged; only the message text
-//! gains the replacement. A path listed here must never also be served — the
-//! test `no_removed_route_is_served` pins that against `route_manifest()`.
+//! gains the replacement. A path listed here must never also be served. The
+//! test `no_removed_route_is_served` pins that against `route_manifest()`,
+//! which covers the ui_bridge family only: `/ui-bridge/sdk/*` (sdk_client.rs)
+//! and the tauri_proxy / ai_wait_for / app_discovery routers are NOT checked
+//! by it, so an entry under those prefixes is verified by hand.
 
 /// The replacement every deleted capture route points at.
 const VISION_CAPTURE: &str = "POST /ui-bridge/vision/capture \
@@ -24,6 +27,12 @@ const VISION_CAPTURE: &str = "POST /ui-bridge/vision/capture \
 /// scoped by its `element` or `region` field.
 const VISION_CAPTURE_ELEMENT: &str = "POST /ui-bridge/vision/capture \
      with an `element` id or `region` for the crop \
+     (bytes at GET /ui-bridge/vision/cache/{sha256})";
+
+/// The replacement for the deleted stuck-screen diagnosis: capture twice and
+/// compare, or the still-served SDK diagnosis.
+const VISION_STUCK: &str = "POST /ui-bridge/vision/capture twice and \
+     POST /ui-bridge/vision/diff the two, or POST /ui-bridge/sdk/diagnose-stuck \
      (bytes at GET /ui-bridge/vision/cache/{sha256})";
 
 /// The replacement for the deleted `/ai/media/*` family.
@@ -50,8 +59,7 @@ pub(crate) const REMOVED_UI_BRIDGE_ROUTES: &[(&str, &str)] = &[
         "/ui-bridge/control/get-element-images",
         VISION_CAPTURE_ELEMENT,
     ),
-    ("/ui-bridge/control/diagnose-stuck-screen", VISION_CAPTURE),
-    ("/ui-bridge/control/diagnose-stuck", VISION_CAPTURE),
+    ("/ui-bridge/control/diagnose-stuck", VISION_STUCK),
     ("/ui-bridge/ai/element-screenshot", VISION_CAPTURE_ELEMENT),
     ("/ui-bridge/sdk/screenshot", VISION_CAPTURE),
     ("/ui-bridge/ai/media/*", VISION_FAMILY),
