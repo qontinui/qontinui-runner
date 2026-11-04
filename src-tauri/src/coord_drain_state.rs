@@ -198,8 +198,45 @@ impl DrainGate {
 
 /// The gate for `origin` against the CURRENT cached state. Cheap and
 /// synchronous; never performs I/O.
+///
+/// Also honours the operator restart prepare's RUNNER-LOCAL hold
+/// ([`crate::restart_prep::local_hold_reason`]). That hold exists only where
+/// there is no coord lever to split — a runner that is not a coord device
+/// (`NotEnrolled`), or a secondary instance, which must never drain the device
+/// the primary shares (plan
+/// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D1). On
+/// the primary of an enrolled device the prepare holds spawns through coord's
+/// own drain instead, so there is still one lever per device.
 pub fn drain_gate(origin: SpawnOrigin) -> DrainGate {
-    gate_for(&current(), origin)
+    let local = crate::restart_prep::local_hold_reason();
+    gate_with_local_hold(&current(), origin, local.as_deref(), Utc::now())
+}
+
+/// PURE: [`gate_for_at`] with the restart prepare's runner-local hold applied
+/// first. `local_hold` is the hold's operator-readable description, `None`
+/// when no local hold is active. An operator origin is never held.
+pub fn gate_with_local_hold(
+    state: &CoordDrainState,
+    origin: SpawnOrigin,
+    local_hold: Option<&str>,
+    now: DateTime<Utc>,
+) -> DrainGate {
+    if origin.is_autonomous() {
+        if let Some(hold) = local_hold {
+            return DrainGate::Defer {
+                reason: format!(
+                    "a restart prepare holds this runner's autonomous spawns ({hold}) — the \
+                     {origin} spawn is deferred until the prepare is cancelled or the runner \
+                     is rebuilt"
+                ),
+                // The deferral IS a hold the operator set, which is what
+                // `Drained` / `device_drained` tells every surface; `Unknown`
+                // would claim the state could not be read.
+                class: DeferClass::Drained,
+            };
+        }
+    }
+    gate_for_at(state, origin, now)
 }
 
 /// [`drain_gate`], also recording a deferral of `work_key` so the banner's
@@ -585,6 +622,10 @@ struct Inner {
     /// The state the last event carried, so staleness transitions that happen
     /// between folds are still emitted by the next getter-driven check.
     last_emitted: Option<CoordDrainState>,
+    /// Whether the restart prepare's runner-local hold was gating autonomous
+    /// spawns at the last check — the same getter-driven edge for a hold that
+    /// starts or lifts outside any fold (its `until` passing silently).
+    last_local_hold: Option<bool>,
     /// Whether any read (or failed read) has been folded since boot.
     folded_once: bool,
 }
@@ -610,6 +651,7 @@ fn global() -> &'static Global {
                 deferred: BTreeSet::new(),
                 deferred_capped: false,
                 last_emitted: None,
+                last_local_hold: None,
                 folded_once: false,
             }),
             tx,
@@ -653,15 +695,44 @@ fn current_locked(inner: &Inner) -> CoordDrainState {
     )
 }
 
+/// PURE: whether a getter-driven check owes an event — the coord state moved
+/// since the last event (a staleness flip), or the restart prepare's
+/// runner-local hold started or lifted since the last check (`local` now vs
+/// `last_local`). The first check of either emits nothing: there is no
+/// earlier reading to have moved from.
+fn change_due(
+    last_emitted: Option<&CoordDrainState>,
+    state: &CoordDrainState,
+    last_local: Option<bool>,
+    local: bool,
+) -> bool {
+    let state_moved = last_emitted.is_some_and(|last| last != state);
+    let hold_moved = last_local.is_some_and(|last| last != local);
+    state_moved || hold_moved
+}
+
 /// The current state. Cheap and synchronous: one mutex, no I/O.
+///
+/// Also the getter-driven edge for the restart prepare's runner-local hold:
+/// a hold that lifts by passing its `until` changes nothing a fold sees, so
+/// the next reader (the gate, the banner's poll) emits the snapshot whose
+/// `autonomousSpawnsAllowed` turned true — the edge a deferred boot restore
+/// re-runs on.
 pub fn current() -> CoordDrainState {
+    let local = crate::restart_prep::local_hold_reason().is_some();
     let (state, emit) = {
         let mut inner = lock_inner();
         let state = current_locked(&inner);
-        let emit = inner.last_emitted.as_ref() != Some(&state) && inner.last_emitted.is_some();
+        let emit = change_due(
+            inner.last_emitted.as_ref(),
+            &state,
+            inner.last_local_hold,
+            local,
+        );
+        inner.last_local_hold = Some(local);
         if emit {
             inner.last_emitted = Some(state.clone());
-            if state.allows_autonomous_spawns() {
+            if state.allows_autonomous_spawns() && !local {
                 inner.deferred.clear();
                 inner.deferred_capped = false;
             }
@@ -682,8 +753,15 @@ pub fn current() -> CoordDrainState {
 pub struct CoordDrainSnapshot {
     /// `clear` | `drained` | `unknown` | `not_enrolled`.
     pub state: &'static str,
-    /// Whether autonomous spawns run right now.
+    /// Whether autonomous spawns run right now: the EFFECTIVE gate — coord's
+    /// state allows them AND no restart-prepare runner-local hold defers them
+    /// (`local_hold`). A webview restore the gate deferred re-runs on this
+    /// field's false→true edge, so it must turn false under the local hold
+    /// too, or the hold's lift is no edge at all.
     pub autonomous_spawns_allowed: bool,
+    /// The restart prepare's runner-local hold while it defers autonomous
+    /// spawns (`restart_prep::local_hold_reason`), else `None`.
+    pub local_hold: Option<String>,
     pub until: Option<DateTime<Utc>>,
     pub reason: Option<String>,
     /// For `unknown`: since when.
@@ -706,7 +784,11 @@ pub struct CoordDrainSnapshot {
     pub boot_read_pending: bool,
 }
 
-fn snapshot_of(state: &CoordDrainState, inner: &Inner) -> CoordDrainSnapshot {
+fn snapshot_of(
+    state: &CoordDrainState,
+    local_hold: Option<String>,
+    inner: &Inner,
+) -> CoordDrainSnapshot {
     let mut by_origin: BTreeMap<String, usize> = BTreeMap::new();
     for (origin, _) in &inner.deferred {
         *by_origin.entry(origin.as_wire().to_string()).or_default() += 1;
@@ -721,7 +803,8 @@ fn snapshot_of(state: &CoordDrainState, inner: &Inner) -> CoordDrainSnapshot {
     };
     CoordDrainSnapshot {
         state: state.label(),
-        autonomous_spawns_allowed: state.allows_autonomous_spawns(),
+        autonomous_spawns_allowed: state.allows_autonomous_spawns() && local_hold.is_none(),
+        local_hold,
         until,
         reason,
         since,
@@ -748,16 +831,18 @@ pub fn snapshot_fixture(state: &CoordDrainState) -> CoordDrainSnapshot {
         deferred: BTreeSet::new(),
         deferred_capped: false,
         last_emitted: None,
+        last_local_hold: None,
         folded_once: true,
     };
-    snapshot_of(state, &inner)
+    snapshot_of(state, None, &inner)
 }
 
 /// The current snapshot.
 pub fn snapshot() -> CoordDrainSnapshot {
+    let local_hold = crate::restart_prep::local_hold_reason();
     let state = current();
     let inner = lock_inner();
-    snapshot_of(&state, &inner)
+    snapshot_of(&state, local_hold, &inner)
 }
 
 /// Subscribe to state changes. The value is the state as of the last change.
@@ -778,6 +863,7 @@ fn emit_snapshot() {
 /// Fold under the lock, then publish and emit outside it.
 fn fold(f: impl FnOnce(&mut DrainTracker, DateTime<Utc>) -> Transition) -> Transition {
     let now = Utc::now();
+    let local = crate::restart_prep::local_hold_reason().is_some();
     let (transition, state) = {
         let mut inner = lock_inner();
         let before = current_locked(&inner);
@@ -787,7 +873,7 @@ fn fold(f: impl FnOnce(&mut DrainTracker, DateTime<Utc>) -> Transition) -> Trans
         inner.last_fold_at = now;
         let after = current_locked(&inner);
         let changed = transition.changed || before != after;
-        if after.allows_autonomous_spawns() {
+        if after.allows_autonomous_spawns() && !local {
             inner.deferred.clear();
             inner.deferred_capped = false;
         }
@@ -846,9 +932,12 @@ fn log_transition(state: &CoordDrainState) {
 /// would count CALLS beside a distinct-KEY count, which is not comparable to
 /// the figure it qualifies.
 pub fn record_deferral(origin: SpawnOrigin, key: &str) {
+    // A deferral by the restart prepare's runner-local hold is counted like
+    // one by coord's drain: it is a hold the operator set.
+    let local = crate::restart_prep::local_hold_reason().is_some();
     let emit = {
         let mut inner = lock_inner();
-        if current_locked(&inner).allows_autonomous_spawns() {
+        if current_locked(&inner).allows_autonomous_spawns() && !local {
             false
         } else if inner.deferred.len() >= MAX_DEFERRED_KEYS {
             // At the cap. Flip the flag ONCE (that transition is worth an
@@ -862,6 +951,30 @@ pub fn record_deferral(origin: SpawnOrigin, key: &str) {
     };
     if emit {
         emit_snapshot();
+    }
+}
+
+/// Wake every [`subscribe`]r (and so every [`wait_until_allowed`]) to
+/// re-check the gate. For a change the cached coord state does not carry —
+/// the restart prepare's runner-local hold lifting — which would otherwise
+/// be seen only on the next heartbeat-interval re-check.
+pub fn nudge_waiters() {
+    global().tx.send_replace(current());
+    emit_snapshot();
+}
+
+/// Fold a `GET /coord/devices/me/drain` read another module made (the restart
+/// prepare's hold read-back) into the cached state, exactly as the heartbeat
+/// folds its own: a fresh read is a fresh read, whoever asked.
+pub fn fold_me_drain_read(read: &Result<DrainObservation, String>) {
+    match read {
+        Ok(obs) => {
+            let obs = obs.clone();
+            fold(|tr, now| tr.observe(obs, now));
+        }
+        Err(e) => {
+            debug!("coord_drain_state: an out-of-band me/drain read failed ({e}); not folded")
+        }
     }
 }
 
@@ -1030,7 +1143,7 @@ pub enum HeartbeatOutcome {
 /// a MISS — trending to `Unknown`, which defers. Absent stays `NotEnrolled`.
 /// The network direction already had this right: every non-2xx and transport
 /// error is an `Err` from [`read_me_drain`] and folds as a miss.
-enum Enrollment {
+pub(crate) enum Enrollment {
     /// A coord device, with this base.
     Enrolled(String),
     /// Positively NOT a coord device: the file is genuinely absent, or names no
@@ -1043,7 +1156,7 @@ enum Enrollment {
 
 /// Why this runner is not a coord device, the base if it is, or that the local
 /// files could not answer. See [`Enrollment`].
-fn enrollment() -> Enrollment {
+pub(crate) fn enrollment() -> Enrollment {
     use qontinui_runner_lib::ambient::MachineJsonError;
 
     let machine = match qontinui_runner_lib::ambient::try_read_machine_json() {
@@ -1095,20 +1208,37 @@ fn enrollment() -> Enrollment {
     }
 }
 
-/// `GET {base}/coord/devices/me/drain` → an observation, or the failure cause.
-async fn read_me_drain(base: &str) -> Result<DrainObservation, String> {
-    let url = format!("{}/coord/devices/me/drain", base.trim_end_matches('/'));
-    // A per-read client, like the heartbeat's: the caller may run on the
-    // heartbeat's dedicated current-thread runtime, and a pooled connection
-    // must not outlive the runtime that opened it.
-    // OS resolver (outbound_net::os_dns): the hickory resolver this replaced
-    // spent the whole timeout on DNS on a VPN box.
-    let client = qontinui_runner_lib::outbound_net::os_dns::client_builder()
+/// A per-call client for this module's coord calls.
+///
+/// Per call, like the heartbeat's: the caller may run on the heartbeat's
+/// dedicated current-thread runtime, and a pooled connection must not outlive
+/// the runtime that opened it. OS resolver (`outbound_net::os_dns`): the
+/// hickory resolver this replaced spent the whole timeout on DNS on a VPN box.
+fn device_client() -> Result<reqwest::Client, String> {
+    qontinui_runner_lib::outbound_net::os_dns::client_builder()
         .timeout(ME_DRAIN_TIMEOUT)
         .build()
-        .map_err(|e| format!("reqwest builder: {e}"))?;
-    // coord-tenant-scope(device): the route answers for the device JWT's own device; there is no tenant in the request.
-    let resp = crate::auth::attach_device_auth(client.get(&url))
+        .map_err(|e| format!("reqwest builder: {e}"))
+}
+
+/// The ONE device-JWT seam for this module's coord calls: the drain read, and
+/// the restart prepare's self-hold and release (plan
+/// `2026-10-21-operator-prepare-for-restart-and-progressive-restore`, D1),
+/// which act on the same drain row the read returns.
+fn device_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+) -> reqwest::RequestBuilder {
+    // coord-tenant-scope(device): every route sent through here (`me/drain`, `me/hold`, `me/release`) acts on the device the JWT was minted for; coord keys the drain row by device_id and the request carries no tenant field to set.
+    crate::auth::attach_device_auth(client.request(method, url))
+}
+
+/// `GET {base}/coord/devices/me/drain` → an observation, or the failure cause.
+pub(crate) async fn read_me_drain(base: &str) -> Result<DrainObservation, String> {
+    let url = format!("{}/coord/devices/me/drain", base.trim_end_matches('/'));
+    let client = device_client()?;
+    let resp = device_request(&client, reqwest::Method::GET, &url)
         .send()
         .await
         .map_err(|e| format!("GET {url}: {e}"))?;
@@ -1119,6 +1249,26 @@ async fn read_me_drain(base: &str) -> Result<DrainObservation, String> {
         return Err(format!("GET {url} returned {status}: {excerpt}"));
     }
     Ok(parse_me_drain_response(&body))
+}
+
+/// `POST {base}{path}` with a JSON body under the device JWT → the status and
+/// body as coord gave them (any status — the caller maps them), or the
+/// transport failure. For the restart prepare's `me/hold` and `me/release`.
+pub(crate) async fn post_device_json(
+    base: &str,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<(u16, String), String> {
+    let url = format!("{}{path}", base.trim_end_matches('/'));
+    let client = device_client()?;
+    let resp = device_request(&client, reqwest::Method::POST, &url)
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| format!("POST {url}: {e}"))?;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    Ok((status, text))
 }
 
 /// Fold one heartbeat tick's result. Reads `me/drain` when the tick shows a
@@ -1182,6 +1332,10 @@ pub async fn boot_read() {
     {
         return;
     }
+    // Load the restart prepare's record before the drain read can fold a
+    // `NotEnrolled` that ALLOWS autonomous spawns, so a runner-local hold
+    // persisted by the last process is enforced from the first allowing state.
+    crate::restart_prep::prepare::install_live();
     match enrollment() {
         Enrollment::Enrolled(base) => match read_me_drain(&base).await {
             Ok(obs) => {
@@ -1198,6 +1352,13 @@ pub async fn boot_read() {
             fold(|tr, now| tr.observe(DrainObservation::NotEnrolled { why }, now));
         }
     }
+    // The restart prepare's boot step runs AFTER the drain read and BEFORE
+    // the flag every restore and resume waits on (`await_boot_read`), so a
+    // rebuilt runner's release of its own restart hold lands before any of
+    // them decides against the drain (plan
+    // `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
+    // Phase 3). Bounded by its own coord timeouts.
+    crate::restart_prep::on_boot().await;
     g.boot_read_finished
         .store(true, std::sync::atomic::Ordering::SeqCst);
     g.boot_read_done.notify_waiters();
@@ -1205,6 +1366,14 @@ pub async fn boot_read() {
         state = current().label(),
         "coord_drain_state: boot read complete"
     );
+}
+
+/// Whether [`boot_read`] has completed (including the restart prepare's boot
+/// step).
+pub fn boot_read_complete() -> bool {
+    global()
+        .boot_read_finished
+        .load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Wait (bounded) for [`boot_read`] to have completed, so a boot resume or
@@ -1608,6 +1777,7 @@ mod tests {
             .collect(),
             deferred_capped: false,
             last_emitted: None,
+            last_local_hold: None,
             folded_once: true,
         };
         let snap = snapshot_of(
@@ -1615,6 +1785,7 @@ mod tests {
                 until: None,
                 reason: Some("rebuild".into()),
             },
+            None,
             &inner,
         );
         let json = serde_json::to_value(&snap).unwrap();
@@ -1624,6 +1795,81 @@ mod tests {
         assert_eq!(json["deferredCount"], 3);
         assert_eq!(json["deferredByOrigin"]["looping_agent"], 2);
         assert_eq!(json["deferredByOrigin"]["steward"], 1);
+    }
+
+    /// Finding 2 (review): a webview restore the gate deferred re-runs on a
+    /// false→true edge of `autonomousSpawnsAllowed`. Under the restart
+    /// prepare's runner-local hold the gate defers while coord's state alone
+    /// reads clear, so the field must be the EFFECTIVE gate — else the hold's
+    /// lift is no edge, and the deferred restore never re-runs.
+    #[test]
+    fn the_snapshot_reads_the_local_hold_as_spawns_not_allowed() {
+        let inner = Inner {
+            tracker: DrainTracker::new(t0()),
+            last_fold: Instant::now(),
+            last_fold_at: t0(),
+            deferred: BTreeSet::new(),
+            deferred_capped: false,
+            last_emitted: None,
+            last_local_hold: None,
+            folded_once: true,
+        };
+        for state in [
+            CoordDrainState::Clear,
+            CoordDrainState::NotEnrolled { why: "no coord" },
+        ] {
+            let held = snapshot_of(&state, Some("prepare p — hold local".into()), &inner);
+            let json = serde_json::to_value(&held).unwrap();
+            assert_eq!(json["autonomousSpawnsAllowed"], false, "{state:?}");
+            assert_eq!(json["localHold"], "prepare p — hold local");
+            let lifted = snapshot_of(&state, None, &inner);
+            assert!(lifted.autonomous_spawns_allowed, "{state:?}");
+            assert_eq!(
+                serde_json::to_value(&lifted).unwrap()["localHold"],
+                serde_json::Value::Null
+            );
+        }
+    }
+
+    /// Review round 2, C2: the snapshot the getter and every event serve
+    /// (`snapshot()`) reads the live local hold, not only `snapshot_of`.
+    #[test]
+    fn the_served_snapshot_carries_the_live_local_hold() {
+        crate::restart_prep::prepare::set_test_local_hold(Some("prepare p — hold local"));
+        let held = snapshot();
+        crate::restart_prep::prepare::set_test_local_hold(None);
+        assert!(!held.autonomous_spawns_allowed);
+        assert_eq!(held.local_hold.as_deref(), Some("prepare p — hold local"));
+        assert_eq!(snapshot().local_hold, None, "the hold lifted");
+    }
+
+    /// Finding 2: the hold's lift — including its `until` passing, which no
+    /// fold sees — is an edge the next getter-driven check emits.
+    #[test]
+    fn a_local_hold_starting_or_lifting_is_an_emitted_change() {
+        let clear = CoordDrainState::Clear;
+        assert!(
+            change_due(Some(&clear), &clear, Some(true), false),
+            "the lift"
+        );
+        assert!(
+            change_due(Some(&clear), &clear, Some(false), true),
+            "the start"
+        );
+        assert!(!change_due(Some(&clear), &clear, Some(true), true));
+        assert!(
+            !change_due(Some(&clear), &clear, None, true),
+            "the first look"
+        );
+        assert!(!change_due(None, &clear, None, false));
+        let unknown = CoordDrainState::Unknown {
+            since: t0(),
+            cause: "x".into(),
+        };
+        assert!(
+            change_due(Some(&clear), &unknown, Some(false), false),
+            "a staleness flip"
+        );
     }
 
     #[test]

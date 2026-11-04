@@ -95,11 +95,13 @@ import { useRegistryAwareness } from "./useRegistryAwareness";
 import { useMidSessionProbe, useMidSessionProbeEnabled } from "./useMidSessionProbe";
 import { MidSessionToast } from "./MidSessionToast";
 import { RemoteCloseNotice } from "./RemoteCloseNotice";
+import { RestorePageBar } from "./RestorePageBar";
 import { HoldingLockBanner, shouldShowHoldingBanner } from "./HoldingLockBanner";
 import { WaitingLockBanner } from "./WaitingLockBanner";
 import { DeconflictAdvisoryBanner } from "./DeconflictAdvisoryBanner";
 import { CoordWarningBanner } from "./CoordWarningBanner";
 import { SessionCountBanner } from "./SessionCountBanner";
+import { PrepareRestartButton } from "./RestartPrepPanel";
 import { loadPerfCaps } from "@/lib/perfCaps";
 import { ProjectFolderChip } from "./ProjectFolderChip";
 import { useApplyZoneProfile } from "./useApplyZoneProfile";
@@ -198,6 +200,7 @@ function TerminalPageInner({
     updateTab,
     reconnectToExistingSessions,
     createPlanTab,
+    createRestorePlaceholderTab,
     adoptWorkerTab,
     hiddenWorkers,
     restoreHiddenWorkers,
@@ -997,6 +1000,10 @@ function TerminalPageInner({
   // under the default account fails as "No conversation found".
   const { resumeTarget } = shellIntegration;
   const { setNotification } = workflowGen;
+  const notifyRestorePage = useCallback(
+    (message: string) => setNotification({ message, type: "success" }),
+    [setNotification],
+  );
   const handleResumePastSession = useCallback(
     (ps: PastSession) => {
       void pastSessionResumeNotice(ps, resumeTarget).then((notice) => {
@@ -1037,6 +1044,7 @@ function TerminalPageInner({
       reconnectToExistingSessions,
       createTerminal,
       createPlanTab,
+      createRestorePlaceholderTab,
       adoptWorkerTab,
       setInitialized,
       updateTab,
@@ -1566,6 +1574,13 @@ function TerminalPageInner({
             not subscribe to it. */}
           <SessionCountBanner openPaneCount={tabs.length} />
 
+          {/* Operator "prepare for restart" (plan
+            `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
+            Phase 5): the button, and below it while open the progress panel —
+            the same store `/prepare-restart` drives. In flow, so it never
+            covers a pane. */}
+          <PrepareRestartButton />
+
           {uiState.showTimeline && zoneLayout.isMultiZone && (
             <ZoneTimeline
               tabs={tabs}
@@ -1595,6 +1610,16 @@ function TerminalPageInner({
           {remoteCloseNotice && (
             <RemoteCloseNotice notice={remoteCloseNotice} onDismiss={dismissRemoteCloseNotice} />
           )}
+
+          {/* A prepared restart's placeholders on this page: "Restore all on
+            this page (n)" (plan
+            `2026-10-21-operator-prepare-for-restart-and-progressive-restore`,
+            Phase 7). Renders nothing on a page with none. Keyed by page: this
+            TerminalPage is ONE instance across page switches, and UI Bridge
+            auto-registers a DOM element once under the id it first carried, so
+            a reused button kept `terminal.restore-page-<first page>` after a
+            switch. A remount per page gives each page its own element. */}
+          <RestorePageBar key={pageId} pageId={pageId} notify={notifyRestorePage} />
 
           <div className="flex-1 flex flex-row overflow-hidden">
             {workflowGen.showSidebar && (

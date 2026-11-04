@@ -333,6 +333,9 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "POST /ui-bridge/ios/forward",
     "POST /system/windows/activate",
     "POST /control/session-open",
+    // The SessionEnd hook's deliberate-end report: a forged one would close a
+    // live session non-restorably. Its caller is the hook's curl (no Origin).
+    "POST /sessions/{id}/session-end",
     // Spawns `claude --resume` processes under the user's account for closed
     // sessions (plan 2026-10-06-closed-sessions-whose-work-is-unfinished-are-
     // found-fleet-wide-and-resumed, Phase 4): it drives processes and spends

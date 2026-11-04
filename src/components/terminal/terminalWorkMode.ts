@@ -183,12 +183,12 @@ export interface MountableTab {
 
 /**
  * Can this tab hold a mounted terminal pane off screen? A plan tab (rendered
- * by its viewer, no PTY) and a Conductor worker tab (`sessionBacked`, no PTY)
- * cannot — `classifyTabs` never parks them — so they never take a warm slot.
+ * by its viewer, no PTY), a restore placeholder (no PTY until its Restore) and
+ * a Conductor worker tab (`sessionBacked`, no PTY) cannot — `classifyTabs` never parks them — so they never take a warm slot.
  * An exited PTY tab can: its pane still mounts, showing how the session ended.
  */
 function holdsWarmPane(tab: MountableTab): boolean {
-  return tab.type !== "plan" && !tab.sessionBacked;
+  return tab.type !== "plan" && tab.type !== "restore-placeholder" && !tab.sessionBacked;
 }
 
 /**
