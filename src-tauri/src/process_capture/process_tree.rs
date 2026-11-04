@@ -785,10 +785,13 @@ use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 /// circuit after a failure. The eight callers above read the shared provider.
 #[cfg(windows)]
 pub(super) async fn powershell_snapshot() -> ProcessSnapshot {
-    // ConvertTo-Json on a single row drops the array; force an array with @().
+    // `@(...) | ConvertTo-Json` does NOT keep the array: the pipeline unrolls
+    // it, so a one-row result serializes as a bare object. `-InputObject`
+    // hands the array itself to ConvertTo-Json; `parse_json_rows` accepts
+    // either shape regardless.
     const SCRIPT: &str = "$ErrorActionPreference='SilentlyContinue'; \
-        @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,Name,ExecutablePath) | \
-        ConvertTo-Json -Compress -Depth 3";
+        ConvertTo-Json -InputObject @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,Name,ExecutablePath) \
+        -Compress -Depth 3";
 
     let probe = match spawn_blocking_tracked(|| {
         let mut cmd = crate::process_helpers::no_window("powershell");
@@ -835,9 +838,34 @@ struct WmiProcessRow {
     executable_path: Option<String>,
 }
 
+/// The rows of a PowerShell `ConvertTo-Json` answer, whatever shape it took:
+/// an array (the normal case), a bare object (one row whose array the
+/// pipeline unrolled), or empty / `null` (no rows). `Err` only when the text
+/// is none of those.
+#[cfg(any(windows, test))]
+fn parse_json_rows<T: serde::de::DeserializeOwned>(
+    json: &str,
+) -> Result<Vec<T>, serde_json::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany<T> {
+        Many(Vec<T>),
+        One(T),
+    }
+    let trimmed = json.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(match serde_json::from_str::<Option<OneOrMany<T>>>(trimmed)? {
+        None => Vec::new(),
+        Some(OneOrMany::Many(rows)) => rows,
+        Some(OneOrMany::One(row)) => vec![row],
+    })
+}
+
 #[cfg(windows)]
 fn parse_powershell_snapshot(json: &str) -> ProcessSnapshot {
-    let rows: Vec<WmiProcessRow> = match serde_json::from_str(json) {
+    let rows: Vec<WmiProcessRow> = match parse_json_rows(json) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("process_tree: failed to parse WMI JSON: {e}");
@@ -930,11 +958,15 @@ pub(super) async fn command_lines_for_pids_powershell(
         .map(|p| format!("ProcessId={p}"))
         .collect::<Vec<_>>()
         .join(" or ");
-    // Force an array with @() so ConvertTo-Json on a single row still parses.
+    // `@(...) | ConvertTo-Json` unrolls the array through the pipeline, so a
+    // single-pid answer came back as a bare JSON object and failed to parse
+    // ("invalid type: map, expected a sequence" — 505 times in one box's log).
+    // `-InputObject` passes the array itself; `parse_json_rows` also accepts
+    // the object shape, so either half alone would fix it.
     let script = format!(
         "$ErrorActionPreference='SilentlyContinue'; \
-        @(Get-CimInstance Win32_Process -Filter \"{filter}\" | Select-Object ProcessId,CommandLine) | \
-        ConvertTo-Json -Compress -Depth 3"
+        ConvertTo-Json -InputObject @(Get-CimInstance Win32_Process -Filter \"{filter}\" | Select-Object ProcessId,CommandLine) \
+        -Compress -Depth 3"
     );
 
     // Bounded for the same reason as `powershell_snapshot`: this is the same
@@ -973,11 +1005,7 @@ struct WmiCmdlineRow {
 
 #[cfg(windows)]
 fn parse_command_lines_json(json: &str) -> HashMap<u32, String> {
-    let trimmed = json.trim();
-    if trimmed.is_empty() {
-        return HashMap::new();
-    }
-    let rows: Vec<WmiCmdlineRow> = match serde_json::from_str(trimmed) {
+    let rows: Vec<WmiCmdlineRow> = match parse_json_rows(json) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("process_tree: failed to parse command-line JSON: {e}");
@@ -1982,6 +2010,56 @@ mod tests {
         );
         // Empty stdout → empty map.
         assert!(parse_command_lines_json("").is_empty());
+    }
+
+    /// The single-pid shape `@(...) | ConvertTo-Json` actually emits: the
+    /// pipeline unrolls the one-element array into a bare object. Before the
+    /// fix this failed with "invalid type: map, expected a sequence" and read
+    /// as no command line at all.
+    #[cfg(windows)]
+    #[test]
+    fn parse_command_lines_json_accepts_a_single_row_object() {
+        let single = r#"{"ProcessId":20,"CommandLine":"claude --resume abc"}"#;
+        let map = parse_command_lines_json(single);
+        assert_eq!(map.len(), 1);
+        assert_eq!(
+            map.get(&20).map(|s| s.as_str()),
+            Some("claude --resume abc")
+        );
+        assert!(parse_command_lines_json("null").is_empty());
+    }
+
+    /// Same hardening on the snapshot fallback: one row as a bare object.
+    #[cfg(windows)]
+    #[test]
+    fn parse_powershell_snapshot_accepts_a_single_row_object() {
+        let single = r#"{"ProcessId":7,"ParentProcessId":1,"CreationDate":"/Date(1715911000000)/","Name":"claude.exe","ExecutablePath":null}"#;
+        let snap = parse_powershell_snapshot(single);
+        assert_eq!(
+            snap.parent_map.get(&1).map(|v| v.as_slice()),
+            Some(&[7u32][..])
+        );
+        assert_eq!(snap.names.get(&7).map(|s| s.as_str()), Some("claude.exe"));
+    }
+
+    /// The shape-tolerant row reader every PowerShell JSON parser here uses,
+    /// tested on every OS since the parsers themselves are Windows-only.
+    #[test]
+    fn parse_json_rows_accepts_array_object_null_and_empty() {
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct Row {
+            #[serde(rename = "ProcessId")]
+            pid: u32,
+        }
+        let many: Vec<Row> = parse_json_rows(r#"[{"ProcessId":1},{"ProcessId":2}]"#).unwrap();
+        assert_eq!(many, vec![Row { pid: 1 }, Row { pid: 2 }]);
+        let one: Vec<Row> = parse_json_rows(r#"{"ProcessId":3}"#).unwrap();
+        assert_eq!(one, vec![Row { pid: 3 }]);
+        assert!(parse_json_rows::<Row>("null").unwrap().is_empty());
+        assert!(parse_json_rows::<Row>("  \r\n").unwrap().is_empty());
+        assert!(parse_json_rows::<Row>("[]").unwrap().is_empty());
+        assert!(parse_json_rows::<Row>("not json").is_err());
+        assert!(parse_json_rows::<Row>(r#"{"Other":1}"#).is_err());
     }
 
     #[test]
