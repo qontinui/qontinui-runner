@@ -2046,6 +2046,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // boot resume awaits it; the heartbeat below keeps it fresh.
                 tokio::spawn(coord_drain_state::boot_read());
                 fleet::spawn_heartbeat();
+                // Plan `2026-11-03-a-runner-with-no-logged-in-claude-account-
+                // keeps-an-open-agent-lane-so-coord-burns-spawns-on-it` Phase 3:
+                // while no Claude account is credential-valid, hold this
+                // runner's own agent lane so coord stops placing work here; the
+                // first valid account releases it. Same thread and interval as
+                // the heartbeat, after the boot drain read above.
+                fleet::spawn_claude_account_hold();
                 // Budget re-assert rides THIS thread, not `fleet-publishers`,
                 // for the same reason the heartbeat does: the publisher
                 // runtime's sweeps block their only worker for minutes at a

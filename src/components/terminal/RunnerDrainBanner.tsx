@@ -43,6 +43,20 @@ export interface DrainBannerModel {
 export const UNKNOWN_HEADING = "drain state unknown — autonomous spawns paused";
 
 /**
+ * The reason prefix of the runner's OWN no-account hold (plan
+ * `2026-11-03-a-runner-with-no-logged-in-claude-account-keeps-an-open-agent-lane-so-coord-burns-spawns-on-it`,
+ * Phase 3): coord stores `restart-hold:<prepare_id>: <reason>`, and the runner
+ * holds with `prepare_id` `no-claude-account` while no Claude account is
+ * credential-valid. "Drained by coord" would be false for it — the runner held
+ * itself — and the fix is a `/login`, not waiting on an operator.
+ */
+export const NO_ACCOUNT_REASON_PREFIX = "restart-hold:no-claude-account:";
+
+/** The heading the no-account self-hold carries, verbatim (plan Phase 3). */
+export const NO_ACCOUNT_HEADING =
+  "No Claude account on this runner — run /login; autonomous spawns deferred";
+
+/**
  * Review N3. While the drain holds, `terminal_session_list_open` withholds the
  * RESTORABLE set, so a page whose only tabs are unrestored sessions shows no
  * tab at all for the drain's duration — a blank grid that reads as lost work
@@ -72,10 +86,14 @@ export function drainBannerModel(s: CoordDrainSnapshot | null): DrainBannerModel
   if (s.state === "drained") {
     const parts: string[] = [];
     if (s.until) parts.push(`until ${formatUntil(s.until)}`);
-    if (s.reason) parts.push(s.reason);
+    const noAccount = s.reason?.startsWith(NO_ACCOUNT_REASON_PREFIX) ?? false;
+    // The self-hold's reason restates the heading, so only the deadline stays.
+    if (s.reason && !noAccount) parts.push(s.reason);
     return {
       status: "warning",
-      heading: "Runner drained by coord — autonomous spawns deferred",
+      heading: noAccount
+        ? NO_ACCOUNT_HEADING
+        : "Runner drained by coord — autonomous spawns deferred",
       detail: parts.length > 0 ? parts.join(" · ") : null,
       deferredLabel: deferredLabel(s.deferredCount, s.deferredCapped ?? false),
       restoreNote: RESTORE_NOTE,

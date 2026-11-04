@@ -9,6 +9,7 @@ import { describe, it, expect } from "vitest";
 import {
   drainBannerModel,
   deferredLabel,
+  NO_ACCOUNT_HEADING,
   RESTORE_NOTE,
   UNKNOWN_HEADING,
 } from "./RunnerDrainBanner";
@@ -55,6 +56,38 @@ describe("drainBannerModel", () => {
     expect(m?.heading).toMatch(/drained by coord/);
     expect(m?.detail).toMatch(/^until .+ · rebuild runner$/);
     expect(m?.deferredLabel).toBe("3 deferred work items");
+  });
+
+  it("names the runner's own no-account hold instead of blaming coord", () => {
+    const m = drainBannerModel(
+      snap({
+        state: "drained",
+        autonomousSpawnsAllowed: false,
+        until: "2026-11-05T12:00:00Z",
+        reason:
+          "restart-hold:no-claude-account: no authenticated Claude account on this runner — run /login",
+        deferredCount: 2,
+      }),
+    );
+    expect(m?.status).toBe("warning");
+    expect(m?.heading).toBe(
+      "No Claude account on this runner — run /login; autonomous spawns deferred",
+    );
+    expect(m?.heading).toBe(NO_ACCOUNT_HEADING);
+    expect(m?.heading).not.toMatch(/drained by coord/);
+    expect(m?.detail).toMatch(/^until /);
+    expect(m?.detail).not.toMatch(/restart-hold/);
+    expect(m?.deferredLabel).toBe("2 deferred work items");
+    expect(m?.restoreNote).toBe(RESTORE_NOTE);
+
+    // Another prepare's restart hold, and an operator drain, keep the coord heading.
+    for (const reason of ["restart-hold:prep-42: rebuilding", "disk replacement"]) {
+      const other = drainBannerModel(
+        snap({ state: "drained", autonomousSpawnsAllowed: false, reason }),
+      );
+      expect(other?.heading).toMatch(/drained by coord/);
+      expect(other?.detail).toBe(reason);
+    }
   });
 
   it("carries the exact unknown copy and the cause", () => {

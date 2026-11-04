@@ -907,6 +907,11 @@ mod tests {
                 "fleet.heartbeat",
             ),
             (
+                "fleet/claude_account_hold.rs",
+                "pub fn spawn_claude_account_hold()",
+                "fleet.claude_account_hold",
+            ),
+            (
                 "fleet.rs",
                 "pub fn spawn_budget_republisher(",
                 "fleet.budget_republisher",
@@ -951,10 +956,16 @@ mod tests {
         // signature prefix). They run inside the supervised future, so a bare
         // spawn here escapes supervision exactly as it would in the entry
         // point — but the entry point's region no longer contains them.
-        const SUPERVISED_BODIES: &[(&str, &str)] = &[(
-            "fleet/heartbeat_loop.rs",
-            "pub(crate) async fn run_heartbeat_loop<",
-        )];
+        const SUPERVISED_BODIES: &[(&str, &str)] = &[
+            (
+                "fleet/heartbeat_loop.rs",
+                "pub(crate) async fn run_heartbeat_loop<",
+            ),
+            (
+                "fleet/claude_account_hold.rs",
+                "async fn run_account_hold_loop(",
+            ),
+        ];
         // Calls interleaved with the SUPERVISED set above (main.rs's two
         // fleet-thread blocks, `spawn_heartbeat` through
         // `spawn_auto_fresh_engine`, plus the plan adapter) that the
