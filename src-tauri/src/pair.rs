@@ -4629,6 +4629,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A store that FAILS must report `false`, never the response's word that
+    /// it carried a key: here the token file path is a directory, so the
+    /// write cannot land and `dmk_stored` must read false.
+    #[test]
+    fn persist_device_machine_key_reports_false_when_the_store_fails() {
+        let dir = temp_dir_for("persist_dmk_store_fails");
+        let token_path = dir.join("tokens.enc");
+        let storage = crate::secure_storage::SecureStorage::with_path(token_path.clone())
+            .expect("test storage");
+        std::fs::create_dir_all(&token_path).expect("occupy the token path with a directory");
+
+        let mut resp = pair_resp("jwt.a.1");
+        resp.device_machine_key = Some("dmk_unit_fixture_placeholder".to_string());
+        assert!(
+            !persist_device_machine_key(&storage, &resp),
+            "a failed store must not read as stored"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// ``PairCodeRedeemResponse::into_pair_complete`` produces a
     /// ``PairCompleteResponse`` with the same fields callers expect
     /// from ``pair-cli``, so ``persist_pairing`` can consume it
