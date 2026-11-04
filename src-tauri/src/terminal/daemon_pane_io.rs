@@ -460,8 +460,15 @@ fn spawn_holder_pane_or_fallback_blocking(
     );
     let local = super::pane_io::LocalPty::open(terminal_id, cols, rows)
         .and_then(|opened| opened.spawn(cmd))
+        // The fallback's own error goes FIRST: it is the failure that decided
+        // the outcome, and coord's spawn-failure classifier reads an anchored
+        // prefix of a detail capped at 200 characters
+        // (`continuation_spawn_retry.rs`, `UNABLE_TO_SPAWN_PREFIX`). With the
+        // holder's reason in front, a transient missing-`claude` failure read as
+        // deterministic and its continuation was never re-driven (plan
+        // 2026-11-04-devops-a-claude-reinstall-through-the-pty-holder-reads-as-deterministic-so-the-continuation-is-never-re-driven).
         .map_err(|e| {
-            format!("PTY holder unavailable ({reason}); in-process fallback failed: {e}")
+            format!("{e} (in-process fallback, after PTY holder unavailable: {reason})")
         })?;
     Ok(Arc::new(WithNotice {
         notice: fallback_notice(&reason),
@@ -2975,6 +2982,37 @@ mod tests {
             String::from_utf8_lossy(&got)
         );
         assert!(String::from_utf8_lossy(&got).contains("FALLBACK_MARK"));
+    }
+
+    /// When the holder is unavailable AND the in-process fallback cannot spawn
+    /// the command, the detail leads with the fallback's own error, so the
+    /// 200-character head coord classifies on carries the `Unable to spawn`
+    /// clause rather than the holder's reason.
+    #[cfg(unix)]
+    #[test]
+    fn fallback_spawn_failure_leads_with_the_fallbacks_own_error() {
+        let mut cmd = portable_pty::CommandBuilder::new("/nonexistent/qontinui-test/claude");
+        cmd.cwd(std::env::temp_dir());
+        let err = match spawn_holder_pane_or_fallback_in(
+            Err("no holder in this test".into()),
+            Err("unused".into()),
+            "fallback-fail-term",
+            ScrubbedCommand::seal(cmd),
+            80,
+            24,
+        ) {
+            Ok(_) => panic!("a nonexistent command must not spawn"),
+            Err(e) => e,
+        };
+        let head: String = err.chars().take(200).collect();
+        assert!(
+            head.starts_with(
+                "Failed to spawn shell: Unable to spawn /nonexistent/qontinui-test/claude \
+                 because it doesn't exist on the filesystem or is not executable"
+            ),
+            "head: {head:?}"
+        );
+        assert!(err.contains("no holder in this test"), "full: {err:?}");
     }
 
     /// End to end against the real `qontinui-pty-holder`. Linux only: the
