@@ -32,23 +32,34 @@
 # `FAIL: …`); 2 usage / environment; 3 the subject never became healthy.
 #
 # Checks (plan Phase 2, "Evidence owed"):
-#   0. (Phase 0 probe) the live process does not catch SIGALRM.
+#   0. (Phase 0 probe) the live process catches SIGTERM (the handler is in)
+#      and neither catches nor ignores SIGALRM (the backstop works).
 #   A. `systemctl --user stop` completes in < 27 s and the journal records a
 #      successful deactivation, not a failure.
 #   B. the subject's log carries `signal SIGTERM` and `Shutdown drain:`.
 #   C. last-shutdown.json reads clean:true.
-#   F. every lifecycle row (snapshot + WAL replayed) is restorable:
-#      `open`, or closed `pty-exit`.
+#   F. every lifecycle row of the sessions this run opened (snapshot + WAL
+#      replayed) is restorable: `open`, or closed with a restorable reason
+#      (`pty-exit`, `poll-dead` — RESTORABLE_CLOSE_REASONS).
 #   D. on restart (log written AFTER the restart only): `previous shutdown was
 #      clean`, never `NOT clean`, no new crash breadcrumb, /health not `errored`.
-#   E. every session is back as one `claude --resume <id>` process.
-#   G. two SIGTERMs 100 ms apart end the process within 1 s, by SIGTERM (the
+#   E. every session this run opened is back as a `claude --resume <its id>`.
+#   G. the first SIGTERM does NOT end the process at once (it runs the graceful
+#      path), and a second one 100 ms later ends it within 1 s, by SIGTERM (the
 #      wait status, observed directly on a launch outside systemd).
+#
+# State it leaves: the unit, every process it started and the instance root are
+# removed, and so are the sessions' transcripts under the account's
+# `projects/<encoded root>/`. One thing is NOT removed: accepting claude's
+# folder-trust dialog records the (unique, now deleted) temp path as trusted in
+# the account's `.claude.json`. That file is shared with every live session on
+# the account, so the script does not rewrite it; the entry names a path that
+# no longer exists.
 
 set -u
 
 BIN="${1:-}"
-[ -n "$BIN" ] && [ -x "$BIN" ] || { echo "usage: $0 <runner-binary> [--port N] [--display :D] [--sessions N] [--keep]" >&2; exit 2; }
+[ -n "$BIN" ] && [ -x "$BIN" ] || { echo "usage: $0 <runner-binary> [--port N] [--display :D] [--sessions N] [--account DIR] [--keep]" >&2; exit 2; }
 BIN=$(readlink -f "$BIN")
 shift
 PORT=9893
@@ -71,6 +82,9 @@ for tool in systemd-run systemctl journalctl jq python3 curl; do
 done
 if curl -s -m 2 -o /dev/null "http://127.0.0.1:$PORT/health"; then
   echo "port $PORT already answers — pick another with --port" >&2; exit 2
+fi
+if systemctl --user is-active --quiet "qontinui-sigterm-e2e-$PORT"; then
+  echo "unit qontinui-sigterm-e2e-$PORT already exists (another run?) — pick another --port" >&2; exit 2
 fi
 
 UNIT=qontinui-sigterm-e2e-$PORT
@@ -96,9 +110,12 @@ own_pids() {
   done
 }
 
+UNIT_STARTED=0
 cleanup() {
-  systemctl --user stop "$UNIT" >/dev/null 2>&1
-  systemctl --user reset-failed "$UNIT" >/dev/null 2>&1
+  if [ "$UNIT_STARTED" = 1 ]; then
+    systemctl --user stop "$UNIT" >/dev/null 2>&1
+    systemctl --user reset-failed "$UNIT" >/dev/null 2>&1
+  fi
   local left
   left=$(own_pids | tr '\n' ' ')
   if [ -n "$left" ]; then
@@ -109,7 +126,12 @@ cleanup() {
   fi
   left=$(own_pids | tr '\n' ' ')
   [ -n "$left" ] && echo "WARN: processes still alive after cleanup: $left"
-  systemctl --user is-active --quiet "$UNIT" && echo "WARN: unit $UNIT still active after cleanup"
+  [ "$UNIT_STARTED" = 1 ] && systemctl --user is-active --quiet "$UNIT" && echo "WARN: unit $UNIT still active after cleanup"
+  # The sessions' transcripts, which claude writes under the account dir.
+  local cfg enc
+  cfg="${ACCOUNT:-$HOME/.claude}"
+  enc=$(printf '%s' "$ROOT" | sed 's/[^A-Za-z0-9]/-/g')
+  [ -n "$enc" ] && [ -d "$cfg/projects/$enc" ] && rm -rf "${cfg:?}/projects/$enc"
   if [ "$KEEP" = 1 ]; then echo "kept instance root: $ROOT"; else rm -rf "$ROOT"; fi
 }
 trap cleanup EXIT
@@ -125,6 +147,7 @@ start_unit() {
     --setenv=PATH="$PATH" \
     ${ACCOUNT:+--setenv=CLAUDE_CONFIG_DIR="$ACCOUNT"} \
     "$BIN" >/dev/null || { echo "systemd-run failed" >&2; exit 2; }
+  UNIT_STARTED=1
 }
 
 wait_healthy() {
@@ -196,6 +219,9 @@ for k, r in rows.items():
 PY
 }
 
+# The claudeSessionIds of this run's sessions, from the lifecycle rows.
+own_session_ids() { lifecycle_rows "${TIDS[*]:-}" | awk '{print $1}' | sort -u; }
+
 resume_ids() {
   local pid
   for pid in $(own_pids); do
@@ -215,8 +241,19 @@ wait_healthy || { echo "subject never answered /health"; logs_since '' | tail -4
 echo "subject healthy, pid $(main_pid), $(curl -s "$BASE/health" | jq -c '{gitSha: (.gitSha // .data.gitSha), buildId: (.buildId // .data.buildId)}')"
 
 # ── 0. Phase 0 probe: nothing in the live process catches SIGALRM ────────────
-SIGCGT=$(awk '/^SigCgt:/{print $2}' "/proc/$(main_pid)/status")
-if (( (16#$SIGCGT >> 13) & 1 )); then fail "SIGALRM (14) is caught (SigCgt=$SIGCGT) — the alarm backstop is unsafe"; else pass "SIGALRM not caught (SigCgt=$SIGCGT)"; fi
+SIGCGT=$(awk '/^SigCgt:/{print $2}' "/proc/$(main_pid)/status" 2>/dev/null)
+SIGIGN=$(awk '/^SigIgn:/{print $2}' "/proc/$(main_pid)/status" 2>/dev/null)
+if [ -z "$SIGCGT" ] || [ -z "$SIGIGN" ]; then
+  fail "could not read the subject's signal masks"
+else
+  # bit (signum - 1): SIGTERM 15 -> 14, SIGALRM 14 -> 13
+  (( (16#$SIGCGT >> 14) & 1 )) && pass "SIGTERM is caught (the handler is installed)" || fail "SIGTERM is not caught (SigCgt=$SIGCGT)"
+  if (( (16#$SIGCGT >> 13) & 1 )) || (( (16#$SIGIGN >> 13) & 1 )); then
+    fail "SIGALRM is caught or ignored (SigCgt=$SIGCGT SigIgn=$SIGIGN) — the alarm backstop is unsafe"
+  else
+    pass "SIGALRM neither caught nor ignored (SigCgt=$SIGCGT SigIgn=$SIGIGN)"
+  fi
+fi
 
 # Open the sessions.
 TIDS=()
@@ -233,7 +270,13 @@ sleep 20
 # DEFAULT is "No, exit": move to "Yes, I trust this folder" (Down), then Enter.
 # `/terminals/{id}/write` takes base64.
 DOWN_B64=$(printf '\033[B' | base64); CR_B64=$(printf '\r' | base64)
+screen() { curl -s "$BASE/terminals/$1/buffer" | jq -r '.data.data // empty' 2>/dev/null | base64 -d 2>/dev/null | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g'; }
 for tid in "${TIDS[@]}"; do
+  SCR=$(screen "$tid" | tr -d ' ')
+  if ! echo "$SCR" | grep -aq 'Itrustthisfolder' || ! echo "$SCR" | grep -aq '❯No,exit'; then
+    fail "session $tid: the folder-trust dialog is not showing with 'No, exit' selected — not sending keys blind"
+    continue
+  fi
   curl -s -o /dev/null -X POST "$BASE/terminals/$tid/write" -H 'Content-Type: application/json' -d "{\"data\":\"$DOWN_B64\"}"
   sleep 1
   curl -s -o /dev/null -X POST "$BASE/terminals/$tid/write" -H 'Content-Type: application/json' -d "{\"data\":\"$CR_B64\"}"
@@ -252,8 +295,7 @@ sleep 45
 echo "claude processes before the stop:"; own_claude_cmdlines
 for tid in "${TIDS[@]}"; do
   echo "screen of $tid (last lines):"
-  curl -s "$BASE/terminals/$tid/buffer" | jq -r '.data.data // empty' 2>/dev/null | base64 -d 2>/dev/null \
-    | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' | tr -s '\r' '\n' | grep -av '^\s*$' | tail -6 | sed 's/^/    /'
+  screen "$tid" | tr -s '\r' '\n' | grep -av '^\s*$' | tail -6 | sed 's/^/    /'
 done
 echo "opened ${#TIDS[@]} session(s): ${TIDS[*]:-}"
 echo "lifecycle rows before the stop:"; lifecycle_rows | sed 's/^/  /'
@@ -293,13 +335,14 @@ echo "lifecycle rows of this run's sessions:"; echo "$ROWS" | sed 's/^/  /'
 if [ "$ROWS" = NO_STORE ] || [ -z "$ROWS" ]; then
   fail "no lifecycle rows to read"
 else
-  BAD=$(echo "$ROWS" | awk '!($2=="open" || ($2=="closed" && $3=="pty-exit"))')
-  [ -z "$BAD" ] && pass "every lifecycle row is open or pty-exit" || fail "non-restorable rows: $(echo "$BAD" | tr '\n' ';')"
+  BAD=$(echo "$ROWS" | awk '!($2=="open" || ($2=="closed" && ($3=="pty-exit" || $3=="poll-dead")))')
+  [ -z "$BAD" ] && pass "every lifecycle row is open or closed restorable" || fail "non-restorable rows: $(echo "$BAD" | tr '\n' ';')"
 fi
 
 # ── D/E. the restart ──────────────────────────────────────────────────────────
+OWN_SIDS=$(own_session_ids | tr '\n' ' ')
 CRASH_BEFORE=$(find "$ROOT" -name 'crash_*.txt' | wc -l)
-MANIFEST=$(mktemp); log_manifest > "$MANIFEST"
+MANIFEST="$ROOT/.e2e-log-manifest"; log_manifest > "$MANIFEST"
 systemctl --user reset-failed "$UNIT" >/dev/null 2>&1
 start_unit
 wait_healthy || { fail "subject did not come back"; exit 1; }
@@ -313,10 +356,14 @@ curl -s "$BASE/health" | grep -q '"errored"' && fail "/health reads errored" || 
 RESUMED=$(resume_ids | grep -c . || true)
 echo "claude processes after the restart:"; own_claude_cmdlines
 echo "resumed: $(resume_ids | tr '\n' ' ')"
-if [ "${#TIDS[@]}" -gt 0 ] && [ "$RESUMED" -ge "${#TIDS[@]}" ]; then
-  pass "$RESUMED claude --resume process(es) for ${#TIDS[@]} session(s)"
+MISSING=""
+for sid in $OWN_SIDS; do
+  resume_ids | grep -q -- "--resume $sid" || MISSING="$MISSING $sid"
+done
+if [ -n "$OWN_SIDS" ] && [ -z "$MISSING" ]; then
+  pass "every session this run opened is back as claude --resume <its id> ($(echo $OWN_SIDS | wc -w) of ${#TIDS[@]})"
 else
-  fail "$RESUMED claude --resume process(es) for ${#TIDS[@]} session(s)"
+  fail "not resumed:${MISSING:- (no session ids recorded)} ($RESUMED --resume process(es) seen)"
 fi
 
 # ── G. the second signal ──────────────────────────────────────────────────────
@@ -327,8 +374,14 @@ env ${ACCOUNT:+CLAUDE_CONFIG_DIR="$ACCOUNT"} DISPLAY="$DISP" QONTINUI_INSTANCE_R
   QONTINUI_PORT="$PORT" "$BIN" >/dev/null 2>&1 &
 PID=$!
 wait_healthy || fail "subject did not come back for the second-signal check"
+kill -TERM "$PID"; sleep 0.1
+if kill -0 "$PID" 2>/dev/null; then
+  pass "the first SIGTERM did not end the process at once (graceful path running)"
+else
+  fail "the first SIGTERM ended the process within 100 ms (no graceful path)"
+fi
 T0=$(now_ms)
-kill -TERM "$PID"; sleep 0.1; kill -TERM "$PID" 2>/dev/null
+kill -TERM "$PID" 2>/dev/null
 wait "$PID"; RC=$?
 GONE_MS=$(( $(now_ms) - T0 ))
 echo "second-signal: gone after ${GONE_MS} ms, wait status $RC (143 = SIGTERM)"

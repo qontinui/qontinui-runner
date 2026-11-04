@@ -69,15 +69,12 @@ mod imp {
     /// force-close budget so widening the budget widens it. The +4 s margin
     /// covers what runs AFTER that budget's own hard exit fires — the AI
     /// output-log flush and the blocking embedded-Postgres stop — plus the
-    /// marker write the watcher makes before the budget starts; a SIGALRM
-    /// inside the Postgres stop would orphan it. It still ends under the
-    /// primary unit's `TimeoutStopSec=30`.
+    /// marker write the watcher makes before the budget starts, so an
+    /// ordinary slow teardown ends by its own exit rather than by SIGALRM
+    /// part-way through the Postgres stop. It still ends under the primary
+    /// unit's `TimeoutStopSec=30`.
     pub const BACKSTOP_SECS: libc::c_uint =
         (crate::shutdown_budget::FORCE_EXIT_BUDGET.as_secs() + 4) as libc::c_uint;
-    const _: () = assert!(
-        BACKSTOP_SECS as u64 > crate::shutdown_budget::FORCE_EXIT_BUDGET.as_secs(),
-        "the backstop must outlast the graceful quit's own hard-exit budget"
-    );
     const _: () = assert!(
         BACKSTOP_SECS < 30,
         "the backstop must fire before the primary unit's TimeoutStopSec=30 SIGKILL"
@@ -174,14 +171,28 @@ mod imp {
         backstop_secs: BACKSTOP_SECS,
     };
 
-    pub(super) extern "C" fn on_signal(sig: libc::c_int) {
+    /// [`handle`] behind the owner check: in a process other than the one
+    /// that installed the handler (`owner`, 0 = not recorded) — a forked
+    /// child that has not exec'd yet — the signal ends that process by its
+    /// default action and touches neither the pipe nor the alarm.
+    pub fn handle_owned(
+        sig: libc::c_int,
+        owner: &AtomicI32,
+        delivered: &AtomicBool,
+        wake_fd: &AtomicI32,
+        fx: &Effects,
+    ) {
+        let owner = owner.load(Ordering::SeqCst);
         // SAFETY: `getpid` is async-signal-safe.
-        let owner = INSTALL_PID.load(Ordering::SeqCst);
         if owner != 0 && owner != unsafe { libc::getpid() } {
-            reraise_default(sig);
+            (fx.reraise)(sig);
             return;
         }
-        handle(sig, &DELIVERED, &WAKE_FD, &PRODUCTION);
+        handle(sig, delivered, wake_fd, fx);
+    }
+
+    pub(super) extern "C" fn on_signal(sig: libc::c_int) {
+        handle_owned(sig, &INSTALL_PID, &DELIVERED, &WAKE_FD, &PRODUCTION);
     }
 
     /// The signal's name, for logs and the force-close reason.
@@ -373,9 +384,28 @@ mod imp {
         }
     }
 
+    /// The backstop relies on SIGALRM's DEFAULT action. A process launched
+    /// with SIGALRM ignored (inherited `SIG_IGN`) would survive the alarm, so
+    /// an ignored disposition is reset to the default. A handler some other
+    /// component installed is left alone; nothing in this process installs
+    /// one (plan Phase 0: `SigCgt` bit 14 clear on a live runner).
+    fn ensure_alarm_is_default() {
+        if current(libc::SIGALRM) == Some(libc::SIG_IGN) {
+            // SAFETY: a zeroed sigaction set to the default disposition.
+            unsafe {
+                let mut dfl: libc::sigaction = std::mem::zeroed();
+                dfl.sa_sigaction = libc::SIG_DFL;
+                libc::sigemptyset(&mut dfl.sa_mask);
+                libc::sigaction(libc::SIGALRM, &dfl, std::ptr::null_mut());
+            }
+            warn!("shutdown signals: SIGALRM was inherited as ignored — reset to the default so the shutdown backstop can end a wedged runner");
+        }
+    }
+
     pub fn install() {
         // SAFETY: `getpid` cannot fail.
         INSTALL_PID.store(unsafe { libc::getpid() }, Ordering::SeqCst);
+        ensure_alarm_is_default();
         // Arm first so the handler never sees a half-armed state; an unarmed
         // handler re-raises, so either order is safe.
         arm_watcher();
@@ -591,10 +621,10 @@ mod tests {
 
     /// The watcher hands one byte to its callback; a failed read disarms.
     #[test]
-    fn the_watcher_reads_one_byte_and_eof_disarms() {
+    fn the_watcher_reads_one_byte_and_a_failed_read_disarms() {
         let mut fds: [libc::c_int; 2] = [-1; 2];
-        // SAFETY: a pipe for this test only, close-on-exec so a process a
-        // parallel test spawns cannot hold an end of it.
+        // SAFETY: a pipe for this test only (close-on-exec on Linux, so a
+        // process a parallel test spawns cannot hold an end of it).
         assert!(unsafe { create_pipe(&mut fds) });
         assert!(write_wake(fds[1], libc::SIGTERM));
         let wake = AtomicI32::new(fds[1]);
@@ -972,6 +1002,61 @@ mod tests {
         assert_eq!(libc::WTERMSIG(status), libc::SIGTERM);
         assert_eq!(drain(R.load(Ordering::SeqCst), libc::SIGTERM), (1, true));
         unsafe { libc::close(fds[0]) };
+    }
+
+    /// The owner check: in a process that did NOT install the handler (a
+    /// forked child that has not exec'd), the signal ends that process by the
+    /// signal and writes nothing to the runner's pipe; in the installing
+    /// process the armed path runs (one byte).
+    #[test]
+    fn a_signal_in_a_non_owner_process_ends_it_without_waking_the_watcher() {
+        static D: AtomicBool = AtomicBool::new(false);
+        static W: AtomicI32 = AtomicI32::new(-1);
+        static R: AtomicI32 = AtomicI32::new(-1);
+        static OWNER: AtomicI32 = AtomicI32::new(0);
+        extern "C" fn h(sig: libc::c_int) {
+            handle_owned(sig, &OWNER, &D, &W, &test_fx());
+        }
+        let mut fds: [libc::c_int; 2] = [-1; 2];
+        // SAFETY: a test pipe; the read end non-blocking for `drain`.
+        assert!(unsafe { create_pipe(&mut fds) });
+        unsafe {
+            let fl = libc::fcntl(fds[0], libc::F_GETFL);
+            libc::fcntl(fds[0], libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+        R.store(fds[0], Ordering::SeqCst);
+        W.store(fds[1], Ordering::SeqCst);
+
+        // Foreign owner (pid 1 is never this child): dies by SIGTERM at once.
+        let status = in_child(|| {
+            unblock(libc::SIGTERM);
+            OWNER.store(1, Ordering::SeqCst);
+            set_disposition_for(libc::SIGTERM, h as *const () as libc::sighandler_t, libc::SA_RESETHAND);
+            kill_self(libc::SIGTERM);
+            pause_forever();
+        });
+        assert!(libc::WIFSIGNALED(status), "status {status:#x}");
+        assert_eq!(libc::WTERMSIG(status), libc::SIGTERM);
+        assert_eq!(drain(R.load(Ordering::SeqCst), libc::SIGTERM), (0, true), "no wake byte");
+
+        // Positive control: the child is its own owner, so the armed path runs.
+        let status = in_child(|| {
+            unblock(libc::SIGTERM);
+            // SAFETY: `getpid` cannot fail.
+            OWNER.store(unsafe { libc::getpid() }, Ordering::SeqCst);
+            set_disposition_for(libc::SIGTERM, h as *const () as libc::sighandler_t, libc::SA_RESETHAND);
+            kill_self(libc::SIGTERM);
+            // SAFETY: cancel the injected backstop before exiting.
+            unsafe { libc::alarm(0) };
+        });
+        assert!(libc::WIFEXITED(status), "status {status:#x}");
+        assert_eq!(drain(R.load(Ordering::SeqCst), libc::SIGTERM), (1, true), "one wake byte");
+        W.store(-1, Ordering::SeqCst);
+        // SAFETY: closing this test's own ends.
+        unsafe {
+            libc::close(fds[1]);
+            libc::close(fds[0]);
+        }
     }
 
     /// The watcher with no app handle, in a real process: it re-raises from
