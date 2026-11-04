@@ -5675,8 +5675,9 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// binding writes are let through because they carry a both-tenants admin
 /// check and a server-written audit and notification that no other
 /// onboarding-family write has — that is the security rationale the note
-/// above asks for. As of this entry coord does not serve the three binding
-/// tools yet; they are forwarded ahead, which the note below says is harmless.
+/// above asks for. They were forwarded ahead of coord serving them
+/// (qontinui-runner#2381); coord now serves all three, since qontinui-coord#3522
+/// (`bc72b8534`, the bind door), so the authorization described here is live.
 ///
 /// `coord_merge_order` stays IN although coord keeps it off the device floor.
 /// It is a READ: it composes a safe merge ordering from the queue, the PR
@@ -5736,8 +5737,8 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_ask_question",
     "coord_attest_gate",
     // Plan 2026-10-17-per-repo-tenant-binding-overrides-the-org-tenant Phase 6:
-    // the per-repo tenant binding door, forwarded ahead of coord serving it.
-    // coord will authorize it (the device user must be admin in BOTH tenants);
+    // the per-repo tenant binding door (served by coord since qontinui-coord#3522).
+    // coord authorizes it (the device user must be admin in BOTH tenants);
     // this list only forwards. Risk and limits: the doc comment above.
     "coord_bind_repo_tenant",
     "coord_bind_self_session",
@@ -17869,7 +17870,8 @@ mod coord_mcp_body_gate_tests {
 
     /// Plan `2026-10-17-per-repo-tenant-binding-overrides-the-org-tenant`
     /// Phase 6: the per-repo tenant binding tools and the repo-tenants read
-    /// twin forward (the binding tools ahead of coord serving them). Their
+    /// twin forward (coord serves all four; the binding tools since
+    /// qontinui-coord#3522). Their
     /// names deliberately stay OUT of the `coord_onboard` family, whose prefix
     /// exclusion would mask them from the device-provisioned sessions coord's
     /// bind door is designed to admit — so this pins both that
