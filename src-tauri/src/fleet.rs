@@ -7,8 +7,10 @@
 //!    (already minted by `qontinui_profile device init`).
 //! 2. Detects local resources (cpu_cores, memory_gb, disk_total_gb)
 //!    via `sysinfo`.
-//! 3. Derives the agent-side budget per §3.2:
-//!    `max_concurrent_agents = floor((memory_gb - 4) / 4)`.
+//! 3. Derives the agent-side budget with [`derive_max_agents`] — the minimum
+//!    of a session-memory term and a CPU term, a mirror of coord's
+//!    `fleet::derive_agent_capacity` (coord stores its own derivation on
+//!    ingest, so this number is advisory).
 //! 4. POSTs the budget columns it OWNS — not `role`, which the supervisor
 //!    owns; see [`DeviceBudgetRequest`] — to
 //!    `POST /coord/devices/{device_id}/budget` via coord HTTP. Phase 3
@@ -103,11 +105,44 @@ pub struct Resources {
     pub disk_total_gb: u64,
 }
 
-/// §3.2 default policy: a dev workstation reserves 4 GiB for the OS +
-/// 4 GiB per agent steady-state. Underflow saturates at 0 for tiny
-/// machines.
-pub fn derive_max_agents(memory_gb: u32) -> u32 {
-    memory_gb.saturating_sub(4) / 4
+// Per-session cost model — a MIRROR of qontinui-coord `crates/coord/src/fleet.rs`
+// (plan `2026-11-04-worktree-cap-charges-4gb-per-allocation-so-a-503gb-box-caps-at-124`).
+// coord is the authority: its budget ingest replaces the `max_concurrent_agents`
+// this runner publishes with coord's own derivation from the same publish's
+// `memory_gb` / `cpu_cores`, so a drift here changes only this runner's own log
+// line and `last_budget.json`, never a cap. The worked-example test below is the
+// same table coord pins; keep the two in step.
+
+/// MiB of RAM one interactive agent session is charged.
+const SESSION_COST_MEM_MIB: u32 = 1024;
+/// Milli-cores one interactive session is charged.
+const SESSION_COST_CPU_MILLI: u32 = 200;
+/// GiB no session may eat into (OS, runner, proxies).
+const OS_RESERVE_GIB: u32 = 8;
+/// GiB one build slot is charged.
+const BUILD_MEM_GIB: u32 = 4;
+/// The derivation never answers below this.
+const MIN_DEVICE_AGENTS: u32 = 3;
+
+/// `min(memory_gb / 4, cpu_cores / 4)` — coord's `derive_max_builds`.
+fn derive_max_builds(memory_gb: u32, cpu_cores: u32) -> u32 {
+    (memory_gb / BUILD_MEM_GIB).min(cpu_cores / 4)
+}
+
+/// How many concurrent agent sessions this machine can carry:
+/// `max(MIN_DEVICE_AGENTS, min(mem_term, cpu_term))`, where
+/// `mem_term = (memory_gb − 8 − builds × 4) / 1 GiB` and
+/// `cpu_term = (cpu_cores − max(2, ceil(cores / 10))) / 0.2`.
+pub fn derive_max_agents(memory_gb: u32, cpu_cores: u32) -> u32 {
+    let build_reserve = derive_max_builds(memory_gb, cpu_cores).saturating_mul(BUILD_MEM_GIB);
+    let session_mem_gib = memory_gb
+        .saturating_sub(OS_RESERVE_GIB)
+        .saturating_sub(build_reserve);
+    let mem_term = u64::from(session_mem_gib) * 1024 / u64::from(SESSION_COST_MEM_MIB);
+    let session_cores = cpu_cores.saturating_sub(cpu_cores.div_ceil(10).max(2));
+    let cpu_term = u64::from(session_cores) * 1000 / u64::from(SESSION_COST_CPU_MILLI);
+    let derived = mem_term.min(cpu_term).min(u64::from(u32::MAX)) as u32;
+    derived.max(MIN_DEVICE_AGENTS)
 }
 
 /// Detect cpu_cores / memory_gb / disk_total_gb on the current host.
@@ -896,7 +931,7 @@ fn build_budget_request(
         disk_total_gb: resources.disk_total_gb.min(i64::MAX as u64) as i64,
         disk_reserved_gb: disk_reserved_gb.min(i64::MAX as u64) as i64,
         max_concurrent_agents: match role {
-            MachineRole::Agent => derive_max_agents(resources.memory_gb) as i32,
+            MachineRole::Agent => derive_max_agents(resources.memory_gb, resources.cpu_cores) as i32,
             MachineRole::Build => 0,
         },
         // `ci.max_concurrent_builds` is the RUNNER-LOCAL settings key
@@ -7400,7 +7435,7 @@ mod tests {",
         // fix inverts into the mirror-image outage.
         assert_eq!(
             json.get("max_concurrent_agents").and_then(|v| v.as_i64()),
-            Some(derive_max_agents(32) as i64),
+            Some(derive_max_agents(32, 8) as i64),
             "the runner owns the agent cap and must keep publishing it"
         );
         // Machine-resource fields describe the BOX, not this process — both
@@ -7903,13 +7938,25 @@ mod tests {",
         UNKNOWN_TENANT_WARNED.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// The same worked-example table coord's `fleet.rs` pins
+    /// (`derive_agent_capacity_matches_plan_examples`).
     #[test]
     fn derive_max_agents_examples() {
-        assert_eq!(derive_max_agents(32), 7);
-        assert_eq!(derive_max_agents(16), 3);
-        assert_eq!(derive_max_agents(8), 1);
-        assert_eq!(derive_max_agents(4), 0);
-        assert_eq!(derive_max_agents(0), 0);
+        for (name, mem, cores, want) in [
+            ("nawa / nilan", 503, 128, 367),
+            ("merytshost", 368, 48, 215),
+            ("spaceship", 125, 32, 85),
+            ("2024dell", 95, 32, 55),
+            ("64 GB desktop, 16 threads", 64, 16, 40),
+            ("2020Dell", 63, 20, 35),
+            ("monster", 31, 8, 15),
+            ("MSI", 31, 16, 7),
+            ("16 GB laptop, 8 threads", 16, 8, 3),
+            ("nomad", 15, 8, 3),
+            ("empty", 0, 0, 3),
+        ] {
+            assert_eq!(derive_max_agents(mem, cores), want, "{name}");
+        }
     }
 
     #[test]
