@@ -2818,3 +2818,15 @@ fn bare_port_refinement_covers_suffixes_and_ranges() {
         assert!(!sup(miss), "expected no hit: {miss}");
     }
 }
+
+/// CUTOVER-ONLY (plan
+/// `2026-11-04-runner-generated-and-ledger-files-are-merge-neutral-and-land-behind-a-drain`
+/// Phase 2a; drop after the land). The per-row ledger replaced
+/// `unreviewed_ceiling = 229`; it must hold exactly that many lines, so the
+/// conversion neither admitted nor dropped a row.
+#[test]
+fn cutover_the_unreviewed_ledger_holds_the_old_ceiling() {
+    let ledger = read_ledger(&crate_root().join(UNREVIEWED_LEDGER_DIR)).unwrap();
+    let lines: usize = ledger.values().map(BTreeSet::len).sum();
+    assert_eq!(lines, 229, "the old unreviewed_ceiling");
+}

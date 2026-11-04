@@ -699,4 +699,39 @@ struct A;
             );
         }
     }
+
+    /// CUTOVER-ONLY (plan
+    /// `2026-11-04-runner-generated-and-ledger-files-are-merge-neutral-and-land-behind-a-drain`
+    /// Phase 2b; drop after the land). The per-file ledgers replaced one
+    /// `baseline` ceiling per lint. Their sums must equal what the walk
+    /// measures on the cutover tree and must not exceed the ceilings they
+    /// replaced, so the conversion loosened nothing.
+    #[test]
+    fn cutover_the_ledgers_sum_to_the_measured_counts_under_the_old_baselines() {
+        let old_baselines = [
+            ("clippy::disallowed_methods", 531),
+            ("clippy::string_slice", 424),
+            ("clippy::disallowed_types", 10),
+        ];
+        let sources = walk_sources();
+        for (ratchet, (lint, old)) in RATCHETS.iter().zip(old_baselines) {
+            assert_eq!(ratchet.lint, lint);
+            let measured: usize = sources
+                .iter()
+                .map(|(_, text)| {
+                    flatten_attributes(text)
+                        .iter()
+                        .filter(|a| a.is_expect_of_lint(ratchet.bare_lint()))
+                        .count()
+                })
+                .sum();
+            let text = std::fs::read_to_string(repo_root().join(ratchet.ledger_path())).unwrap();
+            let ledger: usize = read_ledger(&text).unwrap().values().sum();
+            assert_eq!(ledger, measured, "{lint}: ledger sum vs measured");
+            assert!(
+                ledger <= old,
+                "{lint}: ledger {ledger} > old baseline {old}"
+            );
+        }
+    }
 }
