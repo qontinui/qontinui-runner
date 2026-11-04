@@ -195,7 +195,7 @@ pub(super) async fn capture_webview_contents(state: &Arc<ApiState>) -> Result<Ve
     use tauri::Manager;
 
     // webview2-com re-exports the WebView2 COM types as `Microsoft`; they are
-    // generated against `windows 0.61`, which is also what our renamed
+    // generated against `windows 0.62`, which is also what our renamed
     // `windows-capture` dep (alias `win`) provides — so `IStream` /
     // `SHCreateMemStream` here are the *same* types `CapturePreview` expects.
     use webview2_com::CapturePreviewCompletedHandler;

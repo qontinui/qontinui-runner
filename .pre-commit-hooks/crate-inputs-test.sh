@@ -343,6 +343,21 @@ check "every derived EMBED target exists in the tree" "" "$missing"
 # for nothing. What is worth pinning is that the six known targets, each of
 # which reaches the crate through a DIFFERENT spelling or directory, never stop
 # being seen.
+#
+# The vendored tao directory carries its version in its name and moves on
+# every re-vendor (tao 0.35.0 -> 0.37.2 with the tauri 2.12
+# upgrade). This suite derives from HEAD, so a literal pin would red the very
+# commit that renames it — HEAD still holds the old manifest at pre-commit
+# time. Read the path from the `[patch.crates-io] tao = { path = ... }` line of
+# HEAD's root manifest instead, so the pin stays exact (word-for-word below)
+# without naming a version. An empty read is itself a failure: the patch line
+# going away is what this pin exists to notice.
+tao_patch_dir="$(git -C "$REPO_ROOT" show HEAD:Cargo.toml 2>/dev/null \
+    | sed -n 's|^tao = { path = "\(vendor/tao-[^"]*\)" }.*|\1|p' | head -n 1)"
+case "$tao_patch_dir" in
+    vendor/tao-?*) pass_note "real repo: HEAD's root Cargo.toml patches tao from $tao_patch_dir" ;;
+    *) fail_note "real repo: no \`tao = { path = \"vendor/tao-...\" }\` [patch.crates-io] line in HEAD's root Cargo.toml" ;;
+esac
 for want in \
     examples/demo-workflows/setup_calculator.py \
     specs/pages \
@@ -353,7 +368,7 @@ for want in \
     crates/spec-check \
     crates/runner-stats \
     crates/runner-win32 \
-    vendor/tao-0.35.0 \
+    "$tao_patch_dir" \
     src/components/app/tab-types.ts \
     src/components/app/useAppNavigation.ts \
     Cargo.toml \

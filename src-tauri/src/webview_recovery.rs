@@ -474,7 +474,7 @@ fn apply_env_options<'a, R: tauri::Runtime, M: tauri::Manager<R>>(
 /// call this.
 ///
 /// Without it, Tauri forces `%LOCALAPPDATA%\<identifier>` on any webview built
-/// with no `data_directory` (`tauri` 2.11.1 `src/manager/webview.rs`, "in
+/// with no `data_directory` (`tauri` 2.12.5 `src/manager/webview.rs:559`, "in
 /// `windows`, we need to force a data_directory but we do respect
 /// user-specification"). On a secondary runner that is the **primary's**
 /// profile root rather than the secondary's isolated folder, and WebView2
@@ -498,20 +498,27 @@ pub(crate) fn apply_main_window_env_options<'a, R: tauri::Runtime, M: tauri::Man
 ///
 /// # Why a window getter — and why NOT the two obvious checks
 ///
-/// `WebviewWindowBuilder::build()` reports success for a window that has no
-/// webview at all. `WryWindowDispatcher::create_window` (tauri-runtime-wry
-/// 2.11.2 `src/lib.rs:~300-345`) *sends* `Message::CreateWindow` to the event
-/// loop and returns `Ok(DetachedWindow)` immediately — construction has not
-/// been attempted when `build()` returns. The event loop's handler for that
-/// message (`src/lib.rs:4084-4091`) is `Ok(w) => windows.insert(…)` /
-/// `Err(e) => log::error!("{e}")`: on failure it logs and **never inserts the
-/// window into wry's `windows` map**. That `log::error!` *is* the
-/// `ERROR tauri_runtime_wry: failed to create webview: …` line in the runner
-/// logs. Tauri, meanwhile, inserted the window into its OWN registry
-/// unconditionally (`tauri` 2.11.1 `src/manager/webview.rs:610-632`,
-/// `attach_webview`).
+/// On tauri 2.11 (tauri-runtime-wry 2.11.2), `WebviewWindowBuilder::build()`
+/// reported success for a window that had no webview at all:
+/// `create_window` only *sent* `Message::CreateWindow` and returned
+/// `Ok(DetachedWindow)` at once, and the event loop's handler, on failure,
+/// logged `failed to create webview: …` and **never inserted the window into
+/// wry's `windows` map** — while Tauri inserted it into its OWN registry
+/// unconditionally (`attach_webview`).
 ///
-/// So two checks that look obvious both fail **silently open**. Do not
+/// tauri-runtime-wry 2.12 closed that hole upstream. `Context::create_window`
+/// (2.12.3 `src/lib.rs:300-363`) now sends `Message::CreateWindow` with a reply
+/// `Sender` and blocks on `rx.recv()`; the handler (`src/lib.rs:3980-3990`)
+/// answers `Ok(())` after `windows.insert(…)` or `Err(e)` instead of logging,
+/// so `build()` itself now returns the `failed to create webview: …` error and
+/// Tauri never reaches `attach_window` / `attach_webview` (`tauri` 2.12.5
+/// `src/window/mod.rs:408-430`). **This probe is kept anyway**, as the
+/// independent check that the window is really in wry's map: it costs one
+/// getter round-trip, and it is what turns a future dispatcher that goes back
+/// to fire-and-forget (or any other path that registers a window with Tauri but
+/// not with wry) into a reported failure instead of a hollow window.
+///
+/// Two checks that look obvious both fail **silently open**. Do not
 /// reinstate them:
 ///
 /// * *"the label is present in `app.webview_windows()`"* — **always true**.
@@ -519,13 +526,14 @@ pub(crate) fn apply_main_window_env_options<'a, R: tauri::Runtime, M: tauri::Man
 ///   one.
 /// * *"it answers a trivial `eval`"* — **fire-and-forget**. On the default
 ///   (non-`tracing`-feature) arm `WebviewMessage::EvaluateScript` carries no
-///   reply channel (tauri-runtime-wry 2.11.2 `src/lib.rs:3777-3782`), so
+///   reply channel (tauri-runtime-wry 2.12.3 `src/lib.rs:1428`, sent by
+///   `eval_script` at `:1739-1746`, handled at `:3671-3675`), so
 ///   `Webview::eval` returns `Ok(())` whether or not anything ran.
 ///
 /// A **window getter** is the direct falsifier of the mechanism above. The
-/// getter macro (`src/lib.rs:196-211`) sends `Message::Window(window_id, …)`
+/// getter macro (2.12.3 `src/lib.rs:196-210`) sends `Message::Window(window_id, …)`
 /// with a reply `tx` and maps a closed channel to
-/// `Error::FailedToReceiveMessage`; the handler (`src/lib.rs:3372-3381`)
+/// `Error::FailedToReceiveMessage`; the handler (`src/lib.rs:3214-3233`)
 /// early-returns when the id is **absent from wry's `windows` map** — precisely
 /// the state a failed `Message::CreateWindow` leaves behind — dropping `tx`
 /// unsent. So it returns `Err` on exactly this failure and `Ok` on a healthy
@@ -537,20 +545,22 @@ pub(crate) fn apply_main_window_env_options<'a, R: tauri::Runtime, M: tauri::Man
 /// # Properties, stated so nobody "hardens" them away
 ///
 /// * **Ordered, not racy.** `build()` and this probe go through the same
-///   serialized event-loop queue (`send_user_message`, `src/lib.rs:235-243`,
+///   serialized event-loop queue (`send_user_message`, `src/lib.rs:263-280`,
 ///   which runs inline when called on the main thread), so
 ///   `Message::CreateWindow` is always handled before this `Message::Window`.
 ///   **No sleep, no retry loop, no polling** — adding one would be
 ///   cargo-culting.
 /// * **Nested message pumping does not reopen that race, though it looks like
 ///   it should.** wry builds the WebView2 environment under
-///   `webview2_com::wait_with_pump` (webview2-com 0.38.2 `lib.rs:60-81`) — a
+///   `webview2_com::wait_with_pump` (webview2-com 0.39.1 `lib.rs:60-81`) — a
 ///   nested `GetMessageA`/`DispatchMessageA` pump that runs *inside* the
 ///   `Message::CreateWindow` handler and *before* `windows.insert`. A probe
 ///   message pumped there would be dispatched while the window is still
 ///   absent from the map, i.e. every healthy build would report `Err`. It does
-///   not happen: tao 0.35.0 `EventLoopRunner::send_event`
-///   (`platform_impl/windows/event_loop/runner.rs:208-226`) checks
+///   not happen: tao 0.37.2 `EventLoopRunner::send_event`
+///   (upstream `platform_impl/windows/event_loop/runner.rs:208-228`; +8 lines
+///   in `vendor/tao-0.37.2`, whose `EventLoopRunnerShared` comment sits above
+///   it) checks
 ///   `should_buffer()` (`:143-148`, true for as long as `event_handler` is
 ///   taken — which it is, throughout the outer handler) and pushes the event
 ///   onto `event_buffer` instead of dispatching it. The buffer is flushed by
@@ -565,8 +575,10 @@ pub(crate) fn apply_main_window_env_options<'a, R: tauri::Runtime, M: tauri::Man
 /// # Threading — this call blocks, and deliberately has no timeout
 ///
 /// Off the main thread the getter takes the proxy branch and `rx.recv()`s with
-/// **no timeout** (tauri-runtime-wry 2.11.2 `src/lib.rs:196-211`), so it blocks
-/// its thread until the event loop answers. Callers must therefore run it on
+/// **no timeout** (tauri-runtime-wry 2.12.3 `src/lib.rs:196-210`), so it blocks
+/// its thread until the event loop answers — and since tauri 2.12 so does
+/// `build()` itself (`Context::create_window`'s `rx.recv()`, above). Callers
+/// must therefore run the build-and-probe on
 /// the **main thread** (where `send_user_message` dispatches inline) or on a
 /// **blocking** thread (`tauri::async_runtime::spawn_blocking`) — never
 /// directly on a tokio worker, where a cold-profile WebView2 environment
@@ -596,8 +608,9 @@ pub(crate) fn verify_window_has_a_webview(
 /// words the failure identically. It must name the **real** cause rather than
 /// the getter that surfaced it: a getter that cannot answer looks like a
 /// stalled window, but what actually happened is that no webview was ever
-/// created, and the log line proving it is wry's own
-/// `failed to create webview`.
+/// created. The text names `failed to create webview` because that is wry's
+/// own error for it: logged by the event loop on tauri 2.11, returned by
+/// `build()` (and logged by every caller) since tauri 2.12.
 pub(crate) fn no_webview_error(label: &str, backend_error: &str) -> String {
     format!(
         "Window {} was built but has no webview — the windowing backend does not know this \
@@ -2400,7 +2413,7 @@ fn dispatch_reload(window: &tauri::WebviewWindow) -> Result<ReloadDispatch, Stri
             // method). `with_webview` runs this closure on the WebView2 UI
             // thread, which is the thread these objects belong to, and the
             // controller is kept alive by the `PlatformWebview` for the whole
-            // closure. Same plumbing and same `windows 0.61` type family as
+            // closure. Same plumbing and same `windows 0.62` type family as
             // `attach_process_failed` (the webview2-com re-exports), obtained
             // the same way: `wv.controller().CoreWebView2()`.
             let result: Result<(), String> = (|| unsafe {
@@ -2487,20 +2500,15 @@ async fn recreate_main_window(app: &tauri::AppHandle) -> Result<(), String> {
         tokio::time::sleep(std::time::Duration::from_millis(LABEL_RELEASE_POLL_MS)).await;
     }
 
-    // Why `spawn_blocking` — corrected 2026-08-19. The reason this comment used
-    // to give ("`build()` dispatches to the event loop and blocks the calling
-    // thread until it answers") is **false**: off the main thread
-    // `WryWindowDispatcher::create_window` only *sends* `Message::CreateWindow`
-    // and returns `Ok` immediately (tauri-runtime-wry 2.11.2
-    // `src/lib.rs:~300-345`) — that fire-and-forget is the whole reason
-    // `build_main_window` has to probe afterwards at all.
-    //
-    // The real reason is that probe: `verify_window_has_a_webview` is a
-    // `Message::Window` getter whose `rx.recv()` has **no timeout**
-    // (`src/lib.rs:196-211`), so on a non-main thread it blocks until the event
-    // loop answers — seconds while WebView2 builds a cold profile under
-    // `webview2_com::wait_with_pump`, unbounded if the loop is wedged. That
-    // must cost a blocking thread, never a tokio worker.
+    // Why `spawn_blocking`. Off the main thread BOTH halves of
+    // `build_main_window` block on an untimed `rx.recv()` until the event loop
+    // answers: since tauri 2.12, `build()` itself (`Context::create_window`
+    // sends `Message::CreateWindow` with a reply channel, tauri-runtime-wry
+    // 2.12.3 `src/lib.rs:300-363`; on 2.11 it was fire-and-forget), and the
+    // `verify_window_has_a_webview` probe, a `Message::Window` getter
+    // (`src/lib.rs:196-210`). Either takes seconds while WebView2 builds a cold
+    // profile under `webview2_com::wait_with_pump`, and is unbounded if the
+    // loop is wedged. That must cost a blocking thread, never a tokio worker.
     //
     // UNVERIFIED (needs the coordinator's live kill test on a temp runner):
     // whether a WebView2 user-data directory (`spec.data_dir`, set for
@@ -2730,7 +2738,7 @@ fn attach_process_failed(window: &tauri::WebviewWindow, role: ProcessFailedRole)
 
     let dispatch = window.with_webview(move |wv| {
         // webview2-com re-exports the WebView2 COM types as `Microsoft`; they
-        // are generated against `windows 0.61`, which is also what our renamed
+        // are generated against `windows 0.62`, which is also what our renamed
         // `windows-capture` dep provides — so the `Result` type below is the
         // *same* type the generated handler expects. Using our direct
         // `windows 0.58` here would be rejected by the generic bounds. See

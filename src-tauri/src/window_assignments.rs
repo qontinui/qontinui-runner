@@ -178,16 +178,27 @@ pub struct WindowAssignments {
     /// closes that window: allocation stays atomic, while nothing is persisted
     /// until the webview is proven.
     ///
-    /// A reservation is **never handed back** on failure, and that is
-    /// deliberate. Tauri inserts a window into its own registry the moment
-    /// `build()` returns `Ok` (`tauri` 2.11.1 `src/manager/webview.rs`,
-    /// `attach_webview`) and never removes a *webview-less* one — no wry-side
-    /// window exists, so no `Destroyed` event can ever fire for it. Rebuilding
-    /// the same label would therefore fail with
-    /// `Error::WebviewLabelAlreadyExists` (`src/manager/webview.rs:437`) for the
-    /// rest of the process's life. Burning the label costs a monotonically
-    /// higher `N` on the next attempt — exactly what the pre-Phase-3 code did,
-    /// minus the persisted record that survived reboots.
+    /// A reservation is **never handed back** on failure, and that is a
+    /// deliberately conservative choice rather than a forced one. On tauri
+    /// 2.11.1 it was forced: `build()` was fire-and-forget, returned `Ok` for a
+    /// webview-less window and registered it with Tauri anyway, so the label
+    /// was taken for the life of the process. Since tauri 2.12 (tauri 2.12.5 /
+    /// tauri-runtime-wry 2.12.3) `create_window` blocks on the
+    /// `Message::CreateWindow` reply and `build()` itself returns the
+    /// `failed to create webview` error, so Tauri never reaches
+    /// `attach_window` / `attach_webview` (`tauri` 2.12.5
+    /// `src/window/mod.rs:408-430`) and the failed label is NOT registered —
+    /// see `webview_recovery::verify_window_has_a_webview`. A label is still
+    /// held for good in the one remaining hollow case: `build()` returned `Ok`
+    /// but the post-build probe failed, i.e. a window Tauri registered that wry
+    /// never created; nothing can raise `Destroyed` for it, so rebuilding it
+    /// would hit `Error::WebviewLabelAlreadyExists`
+    /// (`src/manager/webview.rs:461-463`). The store does not distinguish the
+    /// two cases and burns the label in both; whether a failed `build()` should
+    /// let the retry reuse its label is an open design question tracked
+    /// separately. Burning costs a monotonically higher `N` on the next attempt
+    /// — exactly what the pre-Phase-3 code did, minus the persisted record that
+    /// survived reboots.
     reserved_labels: Mutex<HashSet<WindowLabel>>,
     /// Sequence for the poisoned-`inner`-lock fallback label only. See
     /// [`WindowAssignments::fallback_label`].
@@ -274,7 +285,7 @@ impl WindowAssignments {
     /// record while leaving the webview alive, because a pop-out's React tree
     /// registers `onCloseRequested` and `tauri`'s own window handler turns any
     /// such JS listener into an automatic `api.prevent_close()`
-    /// (`tauri-2.11.1/src/manager/window.rs`). The OS window is never dropped,
+    /// (`tauri` 2.12.5 `src/manager/window.rs:177-180`). The OS window is never dropped,
     /// but [`next_popout_label`] — which derives `max(N) + 1` over records and
     /// reservations — has just been told `term-1` is free. Handing it back
     /// makes the next `WebviewWindowBuilder::build()` fail with
@@ -286,8 +297,10 @@ impl WindowAssignments {
     /// `destroy()` is an asynchronous message to the event loop and can fail
     /// outright, and the `reserved_labels` doc records a separate way a label
     /// can be permanently taken with no record — a `build()` that returned
-    /// `Ok` for a webview-less window. In both cases the store's own view is
-    /// correct and still not sufficient, so the liveness question is asked of
+    /// `Ok` for a window wry never created (routine on tauri 2.11; since 2.12
+    /// only possible if the post-build probe catches it). In both cases the
+    /// store's own view is correct and still not sufficient, so the liveness
+    /// question is asked of
     /// the runtime that can answer it.
     pub fn reserve_popout_label_where(&self, label_is_taken: impl Fn(&str) -> bool) -> WindowLabel {
         // Lock order in this module: `reserved_labels` BEFORE `inner`. Every

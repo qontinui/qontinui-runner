@@ -727,7 +727,7 @@ async fn ui_bridge_page_hard_refresh_handler_dispatch(
 // Plan `2026-08-19-runner-blocked-ui-thread-cannot-be-closed`, Phase 3.
 //
 // `window.close()` is NOT a call — it is an enqueue.
-// `tauri-runtime-wry-2.11.2/src/lib.rs:2270-2277` deliberately bypasses
+// `tauri-runtime-wry-2.12.3/src/lib.rs:2120-2127` deliberately bypasses
 // `send_user_message` and does a bare
 // `proxy.send_event(Message::Window(id, WindowMessage::Close))`, carrying
 // upstream's own NOTE saying so. Onto a wedged loop that queues exactly like
@@ -1059,8 +1059,8 @@ fn parse_force_close_body(body: &str) -> ForceCloseRequest {
 ///
 /// Everything else routes through the blocked loop.
 /// [`ui_bridge_page_close_request_handler`] enqueues `WindowMessage::Close`;
-/// `AppHandle::exit(0)` (`tauri-2.11.1/src/app.rs:573-580` → `request_exit`,
-/// `tauri-runtime-wry-2.11.2/src/lib.rs:2751-2757`) is *structurally
+/// `AppHandle::exit(0)` (`tauri-2.12.5/src/app.rs:581-587` → `request_exit`,
+/// `tauri-runtime-wry-2.12.3/src/lib.rs:2597-2603`) is *structurally
 /// identical* — a bare `proxy.send_event(Message::RequestExit(code))` that
 /// also bypasses `send_user_message`. Its internal `std::process::exit` escape
 /// hatch fires only when `send_event` returns `Err`, i.e. when the loop is

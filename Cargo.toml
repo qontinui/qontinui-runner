@@ -118,9 +118,12 @@ lto = false
 # tao: make `EventLoopRunnerShared`'s refcount atomic.
 #
 # tao's `EventLoopRunnerShared` is a NON-atomic `Rc<EventLoopRunner>`, but it is
-# reachable from `tauri_runtime_wry::DispatcherMainThreadContext`, which is
-# `unsafe impl Send + Sync`. So every `AppHandle::clone()` / `Webview::clone()`
-# on a background thread races that refcount against the main thread. The
+# reachable from `tauri_runtime_wry::Context<T>`, which is `unsafe impl Send +
+# Sync` (tauri-runtime-wry 2.12.3 `lib.rs:248-249`; in 2.11 the impl sat on
+# `DispatcherMainThreadContext`, now `Context`'s `main_thread` field, which holds
+# tao's `EventLoopWindowTarget`). `Context` is `#[derive(Clone)]`, so every
+# `AppHandle::clone()` / `Webview::clone()` on a background thread races that
+# refcount against the main thread. The
 # corruption surfaces as three different Windows exceptions -- all the same bug:
 #
 #   0xc000001d  count wrapped past usize::MAX -> `inc_strong`'s overflow abort()
@@ -149,20 +152,21 @@ lto = false
 # was patched.
 # Plan `2026-10-01-linux-runner-heap-corruption-tao-windows-rc-race`.
 #
-# The vendored copy is byte-identical to the crates.io 0.35.0 source except for
+# The vendored copy is byte-identical to the crates.io 0.37.2 source except for
 # three changes: `Rc` -> `Arc` on the Windows `EventLoopRunnerShared` alias and
 # on the Linux `EventLoopWindowTarget::windows` field (each with its
 # constructor), and the Windows `execute_in_thread` PostMessage-failure fix
-# (d7e1ede77);
-# `vendor/tao-0.35.0/QONTINUI-PATCH.md` records the delta. Only the REFCOUNT
+# (d7e1ede77, re-derived for 0.37's log-instead-of-assert upstream code);
+# `vendor/tao-0.37.2/QONTINUI-PATCH.md` records the delta. Only the REFCOUNT
 # becomes atomic -- the pointee is still only ever dereferenced on the main
 # thread, so this adds no new soundness assumption, it only removes a data race.
 #
 # `tests/tao_arc_patch_active.rs` fails the build if this patch ever stops
 # applying (e.g. a tauri bump moves the tree to a tao version this doesn't
-# match) -- without that guard the crash would silently return.
+# match), if tao is not 0.37.2, or if the vendored source loses any of the
+# three changes -- without that guard the crash would silently return.
 [patch.crates-io]
-tao = { path = "vendor/tao-0.35.0" }
+tao = { path = "vendor/tao-0.37.2" }
 # portable-pty's pre_exec closed std's exec-error pipe, so a failed exec aborted
 # the child onto the pane instead of returning Err. Delta and removal condition:
 # `vendor/portable-pty-0.8.1/QONTINUI-PATCH.md`; guarded by

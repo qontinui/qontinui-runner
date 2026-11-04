@@ -911,7 +911,7 @@ const RUST_SRC_PATHSPECS: &[&str] = &[
     "crates/spec-check",
     "crates/runner-stats",
     "crates/runner-win32",
-    "vendor/tao-0.35.0",
+    "vendor/tao-0.37.2",
     "Cargo.toml",
     "Cargo.lock",
 ];

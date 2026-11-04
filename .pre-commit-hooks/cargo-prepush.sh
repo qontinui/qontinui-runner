@@ -90,7 +90,7 @@ if [[ -f "$PUSH_RANGE_LIB" && -f "$CRATE_INPUTS_LIB" ]]; then
     # THE SCOPE IS NOT `src-tauri/`, and the gap is not only about embeds.
     # `cd src-tauri && cargo clippy` — this hook's own command, and CI's —
     # also compiles the in-repo path dependencies (`crates/spec-check`,
-    # `crates/runner-stats`, `crates/runner-win32`, `vendor/tao-0.35.0`), reads
+    # `crates/runner-stats`, `crates/runner-win32`, `vendor/tao-0.37.2`), reads
     # what `build.rs` declares (`src/components/app/tab-types.ts`, whose
     # absence build.rs turns into a deliberate `panic!`), and takes its verdict
     # from the workspace build config (`clippy.toml`, `rust-toolchain.toml`,

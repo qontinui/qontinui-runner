@@ -19,12 +19,14 @@
 //!
 //! ## Why the emit is safe from a plain thread
 //!
-//! Verified against the pinned Tauri (2.11.1, `tauri-runtime-wry` 2.11.2):
-//! `Emitter::emit` serialises the payload, then `Webview::emit_js` →
+//! Verified against the pinned Tauri (2.12.5, `tauri-runtime-wry` 2.12.3):
+//! `Emitter::emit` serialises the payload, then `Webview::emit_js`
+//! (`tauri-2.12.5/src/webview/mod.rs:2230-2237`) → `Webview::eval` →
 //! `eval_script`. With the `tracing` feature OFF (it is: `cargo tree -e
 //! features -i tauri-runtime-wry` shows only `x11`, `dbus` and
-//! `common-controls-v6`), `eval_script` is `send_user_message`, which off the
-//! main thread is `EventLoopProxy::send_event` — a non-blocking post. It needs
+//! `common-controls-v6`), `eval_script` (`tauri-runtime-wry-2.12.3/src/lib.rs:1739-1746`)
+//! is `send_user_message` (`:263-280`), which off the main thread is
+//! `EventLoopProxy::send_event` — a non-blocking post. It needs
 //! no tokio runtime and does not wait for the event loop, so a wedged native
 //! loop cannot block this thread: the post succeeds, the pong never comes back,
 //! and the verdict fires for the right reason.
