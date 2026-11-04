@@ -100,9 +100,11 @@ pub(crate) enum CliReadiness {
     Ready,
     /// The resolved absolute path fails it.
     Unlaunchable(CliKind),
-    /// `resolve_claude_bin` fell back to a bare name. On unix that means no
-    /// real CLI was found (it skips the shim dirs and npm's placeholder), so
-    /// the continuation defers. On Windows a bare name is the npm-only `.cmd`
+    /// A bare name with no real launchable PATH entry. On unix that is a
+    /// `resolve_claude_bin` miss (it skips the shim dirs and npm's
+    /// placeholder), so the continuation defers; a bare name that DOES have one
+    /// (the headless arm's `launchable_or_bare` demotion) reads
+    /// [`CliReadiness::Ready`] via [`probe_claude_cli_with_path`]. On Windows a bare name is the npm-only `.cmd`
     /// install shape `resolve_claude_bin` deliberately falls through on, so it
     /// PROCEEDS — fail-open on UNKNOWN.
     Unresolved,
@@ -165,31 +167,53 @@ pub(crate) fn exec_seam_access(path: &Path) -> io::Result<()> {
 /// [`claude_cli_readiness`] with the production predicate. Blocking (one
 /// `access` + one `stat`); cheap enough to share the resolve's blocking task.
 pub(crate) fn probe_claude_cli(resolved: &str) -> CliReadiness {
+    probe_claude_cli_with_path(resolved, std::env::var_os("PATH").as_deref())
+}
+
+/// [`probe_claude_cli`] over an explicit `PATH` value, so tests never read the
+/// real process environment.
+pub(crate) fn probe_claude_cli_with_path(
+    resolved: &str,
+    path_var: Option<&std::ffi::OsStr>,
+) -> CliReadiness {
     match claude_cli_readiness(resolved, &exec_seam_access) {
         // A bare name is what the headless arm execs after `launchable_or_bare`
         // rejected a non-executable resolution; `execvp` searches PATH for it,
-        // so it is launchable exactly when some PATH entry holds a launchable
-        // file of that name.
-        CliReadiness::Unresolved
-            if bare_name_on_path(resolved, std::env::var_os("PATH").as_deref()) =>
-        {
-            CliReadiness::Ready
-        }
+        // so it is launchable exactly when some PATH entry holds a REAL
+        // launchable file of that name. "Real" uses `resolve_claude_bin`'s own
+        // exclusions, so a resolve MISS (only shim dirs or npm's placeholder
+        // stub hold a `claude`) stays Unresolved and defers as `not_on_path`.
+        CliReadiness::Unresolved if bare_name_on_path(resolved, path_var) => CliReadiness::Ready,
         other => other,
     }
 }
 
-/// `execvp`'s search, with the exec seam's predicate: does any non-empty entry
-/// of `path_var` hold a launchable file named `name`? Unix only — on Windows a
-/// bare name already proceeds ([`CliReadiness::Unresolved`]).
+/// `execvp`'s search with the exec seam's predicate and `resolve_claude_bin`'s
+/// exclusions: does any non-empty, non-shim entry of `path_var` hold a
+/// launchable file named `name` that is not npm's placeholder? Unix only — on
+/// Windows a bare name already proceeds ([`CliReadiness::Unresolved`]).
 #[cfg(unix)]
 pub(crate) fn bare_name_on_path(name: &str, path_var: Option<&std::ffi::OsStr>) -> bool {
+    use crate::install_effects_producer::intercept::shim_materializer::{
+        IDENTITY_DIR_PREFIX, SHIM_DIR_PREFIX,
+    };
+    use qontinui_runner_lib::intercept_core::npm_placeholder::is_npm_placeholder;
     if name.is_empty() || name.contains('/') {
         return false;
     }
+    let is_shim_dir = |d: &Path| {
+        d.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(IDENTITY_DIR_PREFIX) || n.starts_with(SHIM_DIR_PREFIX))
+    };
     path_var.is_some_and(|p| {
-        std::env::split_paths(p)
-            .any(|d| !d.as_os_str().is_empty() && exec_seam_access(&d.join(name)).is_ok())
+        std::env::split_paths(p).any(|d| {
+            if d.as_os_str().is_empty() || is_shim_dir(&d) {
+                return false;
+            }
+            let cand = d.join(name);
+            exec_seam_access(&cand).is_ok() && !is_npm_placeholder(&cand)
+        })
     })
 }
 

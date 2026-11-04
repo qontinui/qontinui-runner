@@ -10684,7 +10684,7 @@ pub(crate) async fn spawn_claude_child(
             .await
             // Typed underneath, text unchanged: `to_string()` is still the
             // `describe` line, while step 4 of a gate continuation downcasts the
-            // `CliSpawnFailure` to read its `transient_kind` (plan
+            // `DescribedCliSpawnFailure` to read its `transient_kind` (plan
             // `2026-11-04-gate-continuation-defers-unclaimed-on-unlaunchable-claude-cli-and-unsent-claim`, D-C).
             .map_err(|f| {
                 let detail = f.describe(&bin, workdir);

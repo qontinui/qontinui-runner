@@ -104,7 +104,11 @@ fn a_directory_is_unlaunchable() {
 
 #[test]
 fn a_bare_name_is_unresolved() {
-    assert_eq!(probe_claude_cli("claude"), CliReadiness::Unresolved);
+    // Over an explicit empty PATH, never the real process environment.
+    assert_eq!(
+        probe_claude_cli_with_path("claude", None),
+        CliReadiness::Unresolved
+    );
     // The injected predicate is never consulted for a bare name.
     let consulted = Cell::new(false);
     let access = |_: &Path| -> io::Result<()> {
@@ -419,7 +423,7 @@ fn a_terminal_failure_is_a_cli_refusal_only_when_the_re_probe_says_so() {
     assert_eq!(classify_seam_refusal(&untyped, &never_probed, &calm), None);
 }
 
-/// D-C: the headless failure stays TYPED under `spawn_claude_child`'s context,
+/// D-C: the headless failure stays TYPED as `spawn_claude_child`'s `DescribedCliSpawnFailure`,
 /// and its text is byte-identical to the old `anyhow!("{}", describe)`.
 #[test]
 fn a_headless_cli_failure_downcasts_and_keeps_its_text() {
@@ -456,7 +460,10 @@ fn a_headless_cli_failure_downcasts_and_keeps_its_text() {
         transient_kind: None,
     };
     let text = other.describe("/x/bin/claude", "/w");
-    let err = anyhow::Error::new(other).context(text);
+    let err = anyhow::Error::new(crate::claude_cli_spawn::DescribedCliSpawnFailure {
+        failure: other,
+        detail: text,
+    });
     assert_eq!(classify_seam_refusal(&err, &never_probed, &calm), None);
 }
 
@@ -528,5 +535,26 @@ fn a_bare_name_is_launchable_only_when_a_path_entry_holds_an_executable() {
     let dirs = std::env::join_paths([dir_only.path()]).unwrap();
     assert!(!bare_name_on_path("claude", Some(&dirs)));
     assert!(!bare_name_on_path("claude", None));
+    // A shim dir is skipped even when it holds a launchable `claude`, as
+    // `resolve_claude_bin` skips it: a resolve miss stays a miss.
+    let shim_parent = tempfile::tempdir().unwrap();
+    let shim = shim_parent.path().join(format!(
+        "{}x",
+        crate::install_effects_producer::intercept::shim_materializer::SHIM_DIR_PREFIX
+    ));
+    std::fs::create_dir(&shim).unwrap();
+    let sc = shim.join("claude");
+    std::fs::write(&sc, b"#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&sc, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let shim_only = std::env::join_paths([shim.as_path()]).unwrap();
+    assert!(!bare_name_on_path("claude", Some(&shim_only)));
+    assert_eq!(
+        probe_claude_cli_with_path("claude", Some(&shim_only)),
+        CliReadiness::Unresolved
+    );
+    assert_eq!(
+        probe_claude_cli_with_path("claude", Some(&both)),
+        CliReadiness::Ready
+    );
     assert!(!bare_name_on_path("a/claude", Some(&both)));
 }
