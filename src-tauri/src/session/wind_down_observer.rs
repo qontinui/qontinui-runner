@@ -65,6 +65,11 @@ use qontinui_runner_lib::wind_down::{
     Sideband, SidebandState, WindDownView, WorkStatus,
 };
 
+/// The cause recorded when the terminal-session plane cannot be counted
+/// because `tracking_health::compute` saw an UNKNOWN process table. Shared
+/// with the restart-readiness tests so the two cannot drift.
+pub(crate) const TERMINAL_PLANE_TABLE_UNKNOWN: &str = "the terminal-session plane could not be determined: the process table is unreadable (the fresh process-table read failed or served only the stale last-good table, ProcessSnapshot::is_unknown), so live `claude` processes cannot be enumerated";
+
 /// What one [`observe_and_apply`] pass looked at, kept so a caller that ACTS on
 /// a verdict (the Phase 4 wind-down executor) can log the inputs the verdict
 /// was reached on, and resolve a process's pane and kind. Readiness ignores it.
@@ -260,10 +265,7 @@ pub async fn fresh_pass(app: &tauri::AppHandle, grace: Duration) -> FreshPass {
         {
             Some(pass) => Some(pass),
             None => {
-                unknowns.push(
-                    "the terminal-session plane could not be determined: the process table is unreadable (the fresh process-table read failed or served only the stale last-good table, ProcessSnapshot::is_unknown), so live `claude` processes cannot be enumerated"
-                        .to_string(),
-                );
+                unknowns.push(TERMINAL_PLANE_TABLE_UNKNOWN.to_string());
                 None
             }
         }

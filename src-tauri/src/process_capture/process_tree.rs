@@ -856,6 +856,11 @@ fn parse_json_rows<T: serde::de::DeserializeOwned>(
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
+    if trimmed.starts_with('[') {
+        // Parsed directly so a bad row keeps serde's detailed error (the
+        // untagged enum below reports only "did not match any variant").
+        return serde_json::from_str(trimmed);
+    }
     let parsed: Option<OneOrMany<T>> = serde_json::from_str(trimmed)?;
     Ok(match parsed {
         None => Vec::new(),
@@ -992,7 +997,19 @@ pub(super) async fn command_lines_for_pids_powershell(
         return None;
     };
 
-    Some(parse_command_lines_json(&String::from_utf8_lossy(&stdout)))
+    let lines = parse_command_lines_json(&String::from_utf8_lossy(&stdout))?;
+    // The pids were just listed live, and under `SilentlyContinue` a failed
+    // CIM query prints `[]`: no command line for ANY asked pid is UNKNOWN,
+    // never "none of them holds anything". (A pid that died in between reads
+    // UNKNOWN too, which only ever makes a caller refuse.)
+    if lines.is_empty() {
+        tracing::debug!(
+            pids = pids.len(),
+            "process_tree: WMI command-line query named none of the asked pids; UNKNOWN"
+        );
+        return None;
+    }
+    Some(lines)
 }
 
 #[cfg(windows)]
@@ -1004,13 +1021,17 @@ struct WmiCmdlineRow {
     command_line: Option<String>,
 }
 
+/// `None` when the answer is not parseable: an unreadable answer is UNKNOWN,
+/// never "none of these pids has a command line" (the resume fork guard reads
+/// an empty map as "nobody holds this session"), and `None` also keeps the
+/// provider's fallback circuit counting it as a failure.
 #[cfg(windows)]
-fn parse_command_lines_json(json: &str) -> HashMap<u32, String> {
+fn parse_command_lines_json(json: &str) -> Option<HashMap<u32, String>> {
     let rows: Vec<WmiCmdlineRow> = match parse_json_rows(json) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("process_tree: failed to parse command-line JSON: {e}");
-            return HashMap::new();
+            return None;
         }
     };
     let mut out = HashMap::new();
@@ -1019,7 +1040,7 @@ fn parse_command_lines_json(json: &str) -> HashMap<u32, String> {
             out.insert(row.process_id, cl);
         }
     }
-    out
+    Some(out)
 }
 
 /// The pid owning the listening socket on local TCP `port`, read in-process
@@ -1994,7 +2015,7 @@ mod tests {
             {"ProcessId":11,"CommandLine":null},
             {"ProcessId":12,"CommandLine":"powershell.exe"}
         ]"#;
-        let map = parse_command_lines_json(json);
+        let map = parse_command_lines_json(json).expect("parses");
         assert_eq!(
             map.get(&10).map(|s| s.as_str()),
             Some("C:/bin/claude.exe --session-id abc")
@@ -2005,12 +2026,17 @@ mod tests {
         let single = r#"[{"ProcessId":20,"CommandLine":"claude"}]"#;
         assert_eq!(
             parse_command_lines_json(single)
+                .expect("parses")
                 .get(&20)
                 .map(|s| s.as_str()),
             Some("claude")
         );
-        // Empty stdout → empty map.
-        assert!(parse_command_lines_json("").is_empty());
+        // Empty stdout parses as no rows; the query wrapper, not the
+        // parser, reads "no row for any asked pid" as UNKNOWN.
+        assert_eq!(parse_command_lines_json("").map(|m| m.len()), Some(0));
+        // Unparseable output is UNKNOWN, never an empty map.
+        assert!(parse_command_lines_json("WARNING: something").is_none());
+        assert!(parse_command_lines_json(r#"[{"ProcessId":"x"}]"#).is_none());
     }
 
     /// The single-pid shape `@(...) | ConvertTo-Json` actually emits: the
@@ -2021,13 +2047,13 @@ mod tests {
     #[test]
     fn parse_command_lines_json_accepts_a_single_row_object() {
         let single = r#"{"ProcessId":20,"CommandLine":"claude --resume abc"}"#;
-        let map = parse_command_lines_json(single);
+        let map = parse_command_lines_json(single).expect("parses");
         assert_eq!(map.len(), 1);
         assert_eq!(
             map.get(&20).map(|s| s.as_str()),
             Some("claude --resume abc")
         );
-        assert!(parse_command_lines_json("null").is_empty());
+        assert_eq!(parse_command_lines_json("null").map(|m| m.len()), Some(0));
     }
 
     /// Same hardening on the snapshot fallback: one row as a bare object.
