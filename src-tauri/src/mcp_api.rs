@@ -23183,3 +23183,14 @@ mod provision_probe_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+/// CUTOVER-ONLY (plan
+/// `2026-11-04-runner-generated-and-ledger-files-are-merge-neutral-and-land-behind-a-drain`
+/// Phase 3b): the six generated coord-mcp lists equal the hand-written consts
+/// they replaced, byte for byte, and the served `/coord-mcp/tool-policy`
+/// lists render identically. The `OLD_*` consts below are copied VERBATIM from
+/// `src-tauri/src/mcp_api.rs` at qontinui-runner `origin/main` `f5bc9c44e`
+/// (only renamed and indented). Drop this module in the commit after the land:
+/// it pins the move, not the policy, and the next added tool reds it by design.
+#[cfg(test)]
+mod coord_mcp_lists_cutover_equivalence_tests;
