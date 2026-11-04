@@ -9,40 +9,49 @@
 # ---------------------------------------------------------------------------
 # WHY
 # ---------------------------------------------------------------------------
-# Two paths in this repo have a bot as their author of record:
-#   .github/sibling-pins.conf       moved by sibling-pin-bump.yml (github-actions[bot])
-#                                   and by schemas-pair-follow.yml
-#   src-tauri/src/fleet_commands/** bytes copied from qontinui-claude-config, resynced
-#                                   by the fleet-bundle-sync PRs (qontinui-dev[bot])
+# Bot-owned paths have an automation as their author of record:
+#   .github/sibling-pins.conf        moved by sibling-pin-bump.yml (whose PRs are
+#                                    opened under the CLORINDE_AUTOCOMMIT_TOKEN
+#                                    user, so they pass on arm (b), not arm (a))
+#                                    and by schemas-pair-follow.yml
+#   src-tauri/src/fleet_commands/**  bytes copied from qontinui-claude-config and
+#   src-tauri/src/fleet_skills/**    resynced by the fleet-bundle-sync PRs
+#   src-tauri/src/fleet_agents/**    (author qontinui-dev[bot], e.g. #2549)
 # Sweep 2's conflict census (2026-11-04) found 21 conflicting PRs on the pin file
-# and 27 on the bundle, almost all of them feature PRs that carried a pin bump or a
-# hand copy of a bundled file beside their code, then collided with the bot's next
-# resync. A feature that needs a newer sibling lands a standalone pin bump first and
-# declares the order with `coord:downstream-of=qontinui-runner#<pin PR>`.
+# and 27 on fleet_commands/**, almost all of them feature PRs that carried a pin
+# bump or a hand copy of a bundled file beside their code, then collided with the
+# bot's next resync. A feature that needs a newer sibling lands a standalone pin
+# bump first and declares the order with `coord:downstream-of=qontinui-runner#<pin PR>`.
 #
 # ---------------------------------------------------------------------------
 # THE RULE (decision 4)
 # ---------------------------------------------------------------------------
 # A PR whose changed files include a bot-owned path FAILS unless one arm holds:
 #   (a) its author login is github-actions[bot] or qontinui-dev[bot];
-#   (b) EVERY changed file is .github/sibling-pins.conf, Cargo.lock or under
-#       src-tauri/src/fleet_commands/ (a pin bump must move Cargo.lock with it);
-#   (c) it carries `coord:downstream-of=[qontinui/]qontinui-schemas#N` — a declared
-#       schemas-leads adaptation (form 2 of scripts/schemas-pair-follow.sh), where
-#       the pin and the lock MUST ride with the code;
-#   (d) it carries the label `ci:bot-owned-path-override`. The verdict then prints
-#       an AUDIT line naming the label, who applied it, and the paths it covered.
+#   (b) EVERY changed file is a bot-owned path or the root Cargo.lock (a pin bump
+#       must move Cargo.lock with it);
+#   (c) it carries — or ever carried — `coord:downstream-of=[qontinui/]qontinui-schemas#N`,
+#       a declared schemas-leads adaptation (form 2 of scripts/schemas-pair-follow.sh)
+#       where the pin and the lock MUST ride with the code. "Ever carried" because
+#       coord strips the label when the partner lands and schemas-pair-follow.sh
+#       deletes any remaining copy before it pushes the pin into the PR: the push
+#       that brings the pin in is exactly the run that no longer sees the label.
+#       The verdict prints an AUDIT line naming the label and who applied it;
+#   (d) it carries the label `ci:bot-owned-path-override`. The verdict prints an
+#       AUDIT line naming the label, who applied it, and the paths it covered.
 # A PR touching no bot-owned path passes untouched. The arms are tried in the
 # order above and the first that holds is named in the verdict.
 #
 # ---------------------------------------------------------------------------
 # SUBCOMMANDS
 # ---------------------------------------------------------------------------
-#   check <author> <labels-file> <files-file> [<override-actor>]
-#     Pure decision over local inputs, one label / one path per line. No network.
+#   check <author> <labels-file> <files-file> [<events-file>]
+#     Pure decision over local inputs, one label / one path per line. The optional
+#     events file holds the PR's label history, one `<event>\t<label>\t<actor>`
+#     line per labeled/unlabeled event, oldest first. No network.
 #   pr <owner/repo> <number>
-#     Read the PR's author, labels and changed files (renames contribute both
-#     names) through `gh api`, then run `check`.
+#     Read the PR's author, labels, label history and changed files (renames
+#     contribute both names) through `gh api`, then run `check`.
 #
 # Exit codes: 0 = pass (a named arm, or no bot-owned path touched);
 #             1 = fail (a bot-owned path and no arm holds);
@@ -57,11 +66,23 @@ SCHEMAS_FORM2_RE='^coord:downstream-of=(qontinui/)?qontinui-schemas#[0-9]+$'
 
 err() { printf 'bot-owned-paths: %s\n' "$*" >&2; }
 
+# Workflow-command data must have %, CR and LF escaped, or a crafted file name
+# can end the command early and inject another.
+wf_escape() {
+  local s="$1"
+  s="${s//'%'/%25}"
+  s="${s//$'\r'/%0D}"
+  s="${s//$'\n'/%0A}"
+  printf '%s' "$s"
+}
+
 # is_bot_owned PATH -> 0 when PATH is a bot-owned path.
 is_bot_owned() {
   case "$1" in
     .github/sibling-pins.conf) return 0 ;;
     src-tauri/src/fleet_commands/*) return 0 ;;
+    src-tauri/src/fleet_skills/*) return 0 ;;
+    src-tauri/src/fleet_agents/*) return 0 ;;
   esac
   return 1
 }
@@ -82,11 +103,27 @@ verdict_pass() {
   exit 0
 }
 
+audit() {
+  echo "$1"
+  echo "::warning title=bot-owned-paths audit::$(wf_escape "$1")"
+  summary "$1"
+}
+
+# applier EVENTS-FILE LABEL -> the actor of the LAST `labeled` event for LABEL, or UNKNOWN.
+applier() {
+  local events="$1" label="$2" a=""
+  if [ -n "$events" ] && [ -f "$events" ]; then
+    a="$(awk -F'\t' -v l="$label" '$1 == "labeled" && $2 == l { a = $3 } END { print a }' "$events")"
+  fi
+  printf '%s' "${a:-UNKNOWN}"
+}
+
 cmd_check() {
-  [ $# -ge 3 ] || { err "usage: check <author> <labels-file> <files-file> [<override-actor>]"; exit 2; }
-  local author="$1" labels_file="$2" files_file="$3" actor="${4:-UNKNOWN}"
+  [ $# -ge 3 ] || { err "usage: check <author> <labels-file> <files-file> [<events-file>]"; exit 2; }
+  local author="$1" labels_file="$2" files_file="$3" events_file="${4:-}"
   [ -f "$labels_file" ] || { err "no labels file: $labels_file"; exit 2; }
   [ -f "$files_file" ] || { err "no files file: $files_file"; exit 2; }
+  if [ -n "$events_file" ] && [ ! -f "$events_file" ]; then err "no events file: $events_file"; exit 2; fi
 
   local owned=() others=() f
   while IFS= read -r f || [ -n "$f" ]; do
@@ -108,22 +145,26 @@ cmd_check() {
   done
 
   if [ "${#others[@]}" -eq 0 ]; then
-    verdict_pass "arm (b): the diff touches only sibling-pins.conf, Cargo.lock and/or src-tauri/src/fleet_commands/**"
+    verdict_pass "arm (b): the diff touches only bot-owned paths and/or Cargo.lock"
   fi
 
-  local l
+  # Arm (c): a form-2 label now present first, else one the label history shows.
+  local l state=""
+  local form2=""
   while IFS= read -r l || [ -n "$l" ]; do
-    if [[ "$l" =~ $SCHEMAS_FORM2_RE ]]; then
-      verdict_pass "arm (c): declared schemas-leads adaptation ($l)"
-    fi
+    if [[ "$l" =~ $SCHEMAS_FORM2_RE ]]; then form2="$l"; state="present"; break; fi
   done <"$labels_file"
+  if [ -z "$form2" ] && [ -n "$events_file" ]; then
+    form2="$(awk -F'\t' -v re="$SCHEMAS_FORM2_RE" '$1 == "labeled" && $2 ~ re { l = $2 } END { print l }' "$events_file")"
+    [ -z "$form2" ] || state="since removed"
+  fi
+  if [ -n "$form2" ]; then
+    audit "AUDIT: arm (c) label $form2 ($state; applied by $(applier "$events_file" "$form2")) admits bot-owned paths: ${owned[*]}"
+    verdict_pass "arm (c): declared schemas-leads adaptation ($form2, $state)"
+  fi
 
   if grep -qxF "$OVERRIDE_LABEL" "$labels_file"; then
-    local audit
-    audit="AUDIT: label $OVERRIDE_LABEL (applied by $actor) overrides bot-owned-paths for: ${owned[*]}"
-    echo "$audit"
-    echo "::warning title=bot-owned-paths override::$audit"
-    summary "$audit"
+    audit "AUDIT: label $OVERRIDE_LABEL (applied by $(applier "$events_file" "$OVERRIDE_LABEL")) overrides bot-owned-paths for: ${owned[*]}"
     verdict_pass "arm (d): override label $OVERRIDE_LABEL"
   fi
 
@@ -136,11 +177,13 @@ How to clear it — pick the one that is true:
     and declare the order: coord:downstream-of=qontinui-runner#<pin PR>.
   * This is a schemas-leads adaptation: label it
     coord:downstream-of=qontinui-schemas#<N> (schemas-pair-follow.sh form 2).
-  * You edited a bundled fleet command: change it in qontinui-claude-config and let
-    the fleet-bundle-sync PR carry it here; drop the copy from this PR.
-  * Genuinely neither: add the label ci:bot-owned-path-override. It is audited.
+  * You edited a bundled fleet command, skill or agent: change it in
+    qontinui-claude-config and let the fleet-bundle-sync PR carry it here; drop
+    the copy from this PR.
+  * Genuinely neither (e.g. a pin REMOVAL that must also drop its checkout step
+    from ci.yml): add the label ci:bot-owned-path-override. It is audited.
 EOF
-  echo "::error title=bot-owned-paths::a bot-owned path (${owned[*]}) is edited alongside other work; see the job log for how to clear it"
+  echo "::error title=bot-owned-paths::$(wf_escape "a bot-owned path (${owned[*]}) is edited alongside other work; see the job log for how to clear it")"
   summary "**bot-owned-paths: FAIL** — bot-owned: ${owned[*]}; other files: ${#others[@]}"
   exit 1
 }
@@ -163,35 +206,34 @@ cmd_pr() {
 
   # Labels read live, not from the event payload: a re-run after a label change
   # must see the label set as it is now.
-  gh api --paginate "repos/$repo/issues/$pr/labels" --jq '.[].name' >"$tmp/labels" ||
+  gh api --paginate "repos/$repo/issues/$pr/labels?per_page=100" --jq '.[].name' >"$tmp/labels" ||
     { err "UNKNOWN: could not read PR #$pr labels"; exit 3; }
 
-  # Both names of a rename: moving a bot-owned file away is an edit to it.
-  gh api --paginate "repos/$repo/pulls/$pr/files" \
-    --jq '.[] | .filename, (.previous_filename // empty)' >"$tmp/files" ||
+  gh api --paginate "repos/$repo/issues/$pr/events?per_page=100" \
+    --jq '.[] | select(.event == "labeled" or .event == "unlabeled") | [.event, .label.name, (.actor.login // "UNKNOWN")] | @tsv' \
+    >"$tmp/events" || { err "UNKNOWN: could not read PR #$pr label history"; exit 3; }
+
+  # ONE walk of the file list, so the listed files and their count cannot come
+  # from two different heads. One JSON array per entry: [filename, previous_filename].
+  gh api --paginate "repos/$repo/pulls/$pr/files?per_page=100" \
+    --jq '.[] | [.filename, (.previous_filename // "")] | @json' >"$tmp/files.jsonl" ||
     { err "UNKNOWN: could not read PR #$pr changed files"; exit 3; }
   # GET /pulls/{n}/files silently truncates at 3000 entries (see ci-integrity.yml).
   local seen
-  seen="$(gh api --paginate "repos/$repo/pulls/$pr/files" --jq '.[].filename' | wc -l | tr -d ' ')" ||
-    { err "UNKNOWN: could not count PR #$pr changed files"; exit 3; }
+  seen="$(grep -c . "$tmp/files.jsonl" || true)"
   if [ "$seen" != "$declared" ]; then
-    err "UNKNOWN: PR #$pr declares $declared changed files but the files API listed $seen (truncated?)"
+    err "UNKNOWN: PR #$pr declares $declared changed files but the files API listed $seen (truncated, or the head moved)"
     exit 3
   fi
+  # Both names of a rename: moving a bot-owned file away is an edit to it.
+  jq -r '.[] | select(. != "")' "$tmp/files.jsonl" >"$tmp/files" ||
+    { err "UNKNOWN: could not parse PR #$pr changed files"; exit 3; }
 
-  local actor="UNKNOWN"
-  if grep -qxF "$OVERRIDE_LABEL" "$tmp/labels"; then
-    actor="$(gh api --paginate "repos/$repo/issues/$pr/events" \
-      --jq ".[] | select(.event == \"labeled\" and .label.name == \"$OVERRIDE_LABEL\") | .actor.login" |
-      tail -n 1)" || actor="UNKNOWN"
-    [ -n "$actor" ] || actor="UNKNOWN"
-  fi
-
-  cmd_check "$author" "$tmp/labels" "$tmp/files" "$actor"
+  cmd_check "$author" "$tmp/labels" "$tmp/files" "$tmp/events"
 }
 
 case "${1:-}" in
   check) shift; cmd_check "$@" ;;
   pr) shift; cmd_pr "$@" ;;
-  *) err "usage: $0 check <author> <labels-file> <files-file> [<override-actor>] | pr <owner/repo> <number>"; exit 2 ;;
+  *) err "usage: $0 check <author> <labels-file> <files-file> [<events-file>] | pr <owner/repo> <number>"; exit 2 ;;
 esac

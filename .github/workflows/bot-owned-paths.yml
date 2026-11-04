@@ -1,10 +1,9 @@
 name: bot-owned-paths
 
-# Flags a PR that edits a BOT-OWNED path — `.github/sibling-pins.conf` or
-# `src-tauri/src/fleet_commands/**` — alongside other work. The rule, its four
-# passing arms and the remedies live in scripts/ci/bot-owned-paths.sh; its fixture
-# suite is scripts/ci/bot-owned-paths-test.sh and runs first in the same job, so a
-# broken script cannot report a pass.
+# Flags a PR that edits a BOT-OWNED path (`.github/sibling-pins.conf`,
+# `src-tauri/src/fleet_{commands,skills,agents}/**`) alongside other work. The
+# rule, its four passing arms and the remedies live in scripts/ci/bot-owned-paths.sh.
+# Its fixture suite, scripts/ci/bot-owned-paths-test.sh, runs first in the same job.
 #
 # Plan: qontinui-dev-notes plans/2026-11-04-runner-generated-and-ledger-files-are-
 # merge-neutral-and-land-behind-a-drain.md, Phase 0 and Design decision 4.
@@ -12,36 +11,51 @@ name: bot-owned-paths
 # ADVISORY FIRST. The job is named `bot-owned-paths (advisory)` and is NOT in
 # ruleset `main-merge-gates`' required checks. It reds a violating PR but holds
 # nothing for its first week. Promoting it to a required check is an operator
-# action the plan surfaces; when that happens, drop "(advisory)" from the job
-# name in the same change, because a required context is matched by name.
+# action the plan surfaces. When that happens, drop "(advisory)" from the job name
+# in the same change, because a required context is matched by name.
 #
-# NO `paths:` FILTER, deliberately. The verdict is about the PR's whole diff, and a
-# required context that is path-filtered never reports on the PRs it skips, so it
-# would hold them forever (ci-integrity.yml, "WHY THIS IS NOT A REQUIRED STATUS
+# THE VERDICT RUNS MAIN'S SCRIPT. A `pull_request` run checks out the PR's merge
+# ref, so a PR could otherwise loosen the rule in its own copy and pass. The
+# decision step therefore runs the script from a checkout of the default branch.
+# It falls back to the PR's copy only while main has no script, which is true for
+# the PR that adds it, and it says so. The fixture suite runs the PR's copy,
+# because that is the change under test.
+#
+# NO `paths:` FILTER, deliberately. The verdict is about the PR's whole diff, and
+# a required context that is path-filtered never reports on the PRs it skips, so
+# it would hold them forever (ci-integrity.yml, "WHY THIS IS NOT A REQUIRED STATUS
 # CONTEXT"). A PR touching no bot-owned path passes in seconds.
 #
-# `labeled` / `unlabeled` are triggers because two arms are labels: adding the
-# override or the schemas-pair label must re-decide without a push. Labels are
-# read live through the API, not from the event payload. `edited` covers a base
-# re-target, which changes the diff.
-#
-# `push` on main runs only the fixture suite, so the workflow has a main baseline
-# and the script is tested on the tree that lands.
+# TRIGGERS.
+#   * `labeled` / `unlabeled`: two arms are labels, so adding the override or the
+#     schemas-pair label must re-decide without a push. Labels and their history
+#     are read live through the API, not from the event payload.
+#   * `edited`: covers a base re-target, which changes the diff.
+#   * `push`: runs only the fixture suite. It covers main and the same
+#     merge-candidate globs ci.yml lists, so the context reports on every sha
+#     coord validates once it is required.
+#   * Closed PRs are skipped. Label churn after a land (e.g. `coord:landed`)
+#     would otherwise re-run it for nothing.
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review, edited]
   push:
-    branches: [main]
+    branches:
+      - main
+      - develop
+      - 'merge-candidate/**'
+      - 'merge-candidate-spec/**'
+      - 'merge-candidate-batch/**'
 
 permissions:
   contents: read
   pull-requests: read
   issues: read
 
-# PR-SCOPED SUPERSESSION, the one-expression form schemas-pair-follow-tests.yml
-# explains: a first-attempt PR run replaces the older run for the same PR (label
-# bursts fire several events in a row); every other run gets its own group.
+# PR-SCOPED SUPERSESSION, in the one-expression form that schemas-pair-follow-tests.yml
+# explains. A first-attempt PR run replaces the older run for the same PR, since
+# label bursts fire several events in a row. Every other run gets its own group.
 concurrency:
   group: ${{ (github.event_name == 'pull_request' && github.run_attempt == 1) && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}-{2}', github.workflow, github.run_id, github.run_attempt) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
@@ -49,17 +63,29 @@ concurrency:
 jobs:
   bot-owned-paths:
     name: bot-owned-paths (advisory)
+    if: github.event_name != 'pull_request' || github.event.pull_request.state != 'closed'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
+      - name: Check out the change under test
+        uses: actions/checkout@v5
         with:
+          path: change
+          persist-credentials: false
+          sparse-checkout: scripts/ci
+
+      - name: Check out main's rule
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: trusted
           persist-credentials: false
           sparse-checkout: scripts/ci
 
       - name: Fixture suite (no network)
         shell: bash
-        run: bash scripts/ci/bot-owned-paths-test.sh
+        run: bash change/scripts/ci/bot-owned-paths-test.sh
 
       - name: Decide this PR
         if: github.event_name == 'pull_request'
@@ -68,4 +94,11 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         shell: bash
-        run: bash scripts/ci/bot-owned-paths.sh pr "$REPO" "$PR_NUMBER"
+        run: |
+          set -euo pipefail
+          script=trusted/scripts/ci/bot-owned-paths.sh
+          if [ ! -f "$script" ]; then
+            echo "::notice::main has no bot-owned-paths.sh yet; deciding with this PR's copy"
+            script=change/scripts/ci/bot-owned-paths.sh
+          fi
+          bash "$script" pr "$REPO" "$PR_NUMBER"
