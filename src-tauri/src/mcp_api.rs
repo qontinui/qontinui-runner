@@ -5448,11 +5448,22 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 ///
 /// `coord_correct_gate` is IN for the same gate-verb family's reason (plan
 /// `2026-09-21-a-cleared-gate-is-uncorrectable-and-every-repair-mints-another-false-green-row`
-/// Phase 8). It corrects a CLEARED gate's recorded predicate or outcome. A
-/// correction is INSERT-only (it appends a correcting row, never edits history),
-/// applies to cleared gates only, and cannot release work: it clears nothing and
-/// approves nothing. Withheld, a cleared-gate error could only be repaired by
-/// registering another gate, which is the false-green row the plan exists to stop.
+/// Phase 8). It does NOT correct a gate's predicate or outcome: it records a
+/// `mispredicated` annotation for a CLEARED gate, one row INSERTed into
+/// `coord.gate_corrections`, optionally naming the replacement gate. `coord.gates`
+/// is never touched, so the gate's recorded verdict stays byte-identical (coord
+/// `correct_gate_core`). It applies to cleared gates only and releases no work:
+/// it clears nothing and approves nothing. Nor does it replace registering the
+/// replacement gate, which is still owed; it only lowers the standing of the
+/// green row the wrong question produced. Withheld, that row could be answered
+/// only by another registration, the false-green repeat the plan exists to stop.
+///
+/// It carries a risk `coord_repoint_gate` above does not: there is NO registrant
+/// rule. Any device session in the tenant may irrevocably annotate any cleared
+/// gate in the tenant, with free agent-authored `reason` text served verbatim to
+/// readers, and coord tiers it `GateActionTier::Silent`, so no notification
+/// fires. coord's own grant and its `correct_gate_core` risk model are the
+/// authority on that trade; forwarding it here widens nothing coord did not.
 ///
 /// `coord_citations_reenrich` is IN because it is a SHIPPED REPAIR ROUTE, and a
 /// repair route an agent cannot reach is the defect it was built to close (plan
@@ -18345,11 +18356,11 @@ mod coord_mcp_body_gate_tests {
             // The registrant-only re-point (coord#2056): the only way to carry a
             // superseded gate's continuation onto the replacement PR.
             "coord_repoint_gate",
-            // INSERT-only correction of a CLEARED gate; releases nothing.
-            "coord_correct_gate",
             // ...and the declaration that authorizes a NON-registrant re-point
             // of a superseded PR's system-registered gate.
             "coord_declare_supersession",
+            // INSERT-only annotation of a CLEARED gate; releases nothing.
+            "coord_correct_gate",
             // P4's own addition: mutates nothing, so neither dial-governed nor
             // notifying.
             "coord_gate_doctor",
