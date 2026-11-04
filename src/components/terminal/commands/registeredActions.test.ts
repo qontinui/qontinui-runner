@@ -8,13 +8,16 @@
  * `resolveCount` had a floor but no ceiling. A fixture registry cannot see
  * either, because a fixture declares whatever the test needs.
  *
- * So this file registers the ACTUAL actions (the count is pinned once, in
- * "registers the whole set" below). `useTerminalCommands` is a hook only
- * in the sense that it calls context hooks and `useCommandAction`;
+ * So this file registers the ACTUAL actions ("registers the whole set" below
+ * checks them against the ids the source declares). `useTerminalCommands` is
+ * a hook only in the sense that it calls context hooks and `useCommandAction`;
  * with those mocked it is an ordinary function, which is why this runs under
  * vitest's `environment: "node"` with no React renderer.
  */
 
+import { readFileSync } from "node:fs";
+import { dirname, resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 
 import { getAll, getById } from "./registry";
@@ -157,6 +160,34 @@ beforeAll(async () => {
   } as never);
 });
 
+const HERE = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * The action ids the SOURCE declares: every `id: "terminal.<x>"` literal in
+ * `useTerminalCommands.ts` and in each sibling module it imports (the
+ * registrations live there and in `orchestrateCommand.ts`). Every import is
+ * read, not only the ones that call `useCommandAction` today, so a module
+ * that stops registering still contributes its ids and reds the comparison
+ * rather than leaving both sides together. Read as text, so it is
+ * independent of the registration path under test — comparing `getAll()` with
+ * itself would be a tautology, and a checked-in count or id list is a cell
+ * every PR adding an action rewrites (plan
+ * `2026-11-04-runner-generated-and-ledger-files-are-merge-neutral-and-land-behind-a-drain`,
+ * Phase 1d).
+ */
+function declaredIds(): string[] {
+  const read = (name: string) => readFileSync(resolvePath(HERE, `${name}.ts`), "utf8");
+  const root = read("useTerminalCommands");
+  // A Set: a module both imported and re-exported (`./types`) is read once.
+  const modules = new Set(["useTerminalCommands"]);
+  for (const m of root.matchAll(/from "\.\/([A-Za-z0-9_]+)"/g)) modules.add(m[1]);
+  const ids: string[] = [];
+  for (const name of modules) {
+    for (const m of read(name).matchAll(/\bid:\s*"(terminal\.[a-z0-9-]+)"/g)) ids.push(m[1]);
+  }
+  return ids.sort();
+}
+
 const run = (id: string, args: Record<string, unknown>): Promise<CommandResult> =>
   getById(id)!.handler(args, { source: "test" }) as Promise<CommandResult>;
 
@@ -164,7 +195,14 @@ const err = (r: CommandResult): string => (r.ok ? "OK" : `${r.code}: ${r.message
 
 describe("registered actions — the cost/destruction declarations are not empty", () => {
   it("registers the whole set", () => {
-    expect(getAll().length).toBe(42);
+    const declared = declaredIds();
+    // Non-vacuity: the scan found the declarations it exists to compare.
+    expect(declared.length).toBeGreaterThan(20);
+    expect(
+      getAll()
+        .map((a) => a.id)
+        .sort(),
+    ).toEqual(declared);
   });
 
   /**
