@@ -3,6 +3,8 @@
  *
  * Analyzes terminal sessions across pages and proposes topic-based groupings.
  * Users can preview the proposal, edit page names, and apply the reorganization.
+ * Applying MOVES the sessions (`applyReorganizePlan`) — every one keeps running —
+ * and the done state names what moved, what could not, and which pages went.
  */
 
 import { useState, useCallback } from "react";
@@ -10,19 +12,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { X, Loader2, Check, AlertTriangle } from "lucide-react";
 import { executeAiTask } from "@/hooks/useAiTaskPolling";
 import { getApiPort } from "@/lib/runner-api";
+import type { ReorganizePlan, ReorganizeResult } from "./applyReorganizePlan";
 import type { TerminalPageConfig } from "./useTerminalPages";
 
 interface ReorganizeDialogProps {
   pages: TerminalPageConfig[];
   onClose: () => void;
-  onApply: (plan: ReorganizePlan) => Promise<void>;
-}
-
-export interface ReorganizePlan {
-  pages: Array<{
-    name: string;
-    sessionIds: string[];
-  }>;
+  onApply: (plan: ReorganizePlan) => Promise<ReorganizeResult>;
 }
 
 interface SessionMeta {
@@ -43,6 +39,7 @@ export function ReorganizeDialog({ pages, onClose, onApply }: ReorganizeDialogPr
   );
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [proposal, setProposal] = useState<ReorganizePlan | null>(null);
+  const [result, setResult] = useState<ReorganizeResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const togglePage = (pageId: string) => {
@@ -199,7 +196,7 @@ Return this exact JSON format:
     if (!proposal) return;
     setState("applying");
     try {
-      await onApply(proposal);
+      setResult(await onApply(proposal));
       setState("done");
     } catch (err) {
       setError(String(err));
@@ -303,12 +300,7 @@ Return this exact JSON format:
           )}
 
           {/* Done state */}
-          {state === "done" && (
-            <div className="flex flex-col items-center justify-center py-8 gap-3">
-              <Check className="w-8 h-8 text-[#9ece6a]" />
-              <p className="text-xs text-[#9ece6a]">Pages reorganized successfully!</p>
-            </div>
-          )}
+          {state === "done" && result && <ReorganizeResultView result={result} />}
 
           {/* Error state */}
           {state === "error" && (
@@ -356,6 +348,58 @@ Return this exact JSON format:
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * What an applied reorganize did. A pane whose move failed is named with its
+ * reason — it is still running, on the page it was on.
+ */
+export function ReorganizeResultView({ result }: { result: ReorganizeResult }) {
+  const { moved, unchanged, failed, pagesCreated, pagesRemoved, pagesKept } = result;
+  const clean = failed.length === 0;
+  const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+  return (
+    <div data-ui-bridge-id="terminal.reorganize-result" className="flex flex-col gap-3 py-4">
+      <div className="flex items-center gap-2">
+        {clean ? (
+          <Check className="w-5 h-5 text-[#9ece6a] shrink-0" />
+        ) : (
+          <AlertTriangle className="w-5 h-5 text-[#e0af68] shrink-0" />
+        )}
+        <p className={`text-xs ${clean ? "text-[#9ece6a]" : "text-[#e0af68]"}`}>
+          {plural(moved.length, "session moved", "sessions moved")}
+          {unchanged > 0 && `, ${unchanged} already in place`}
+          {!clean && `, ${failed.length} could not be moved`}. Every session kept running.
+        </p>
+      </div>
+      {failed.length > 0 && (
+        <ul className="space-y-1" data-ui-bridge-id="terminal.reorganize-result-failed">
+          {failed.map((f) => (
+            <li
+              key={f.id}
+              className="text-[10px] text-[#a9b1d6] px-2 py-1 rounded bg-[#13141f]"
+              title={f.id}
+            >
+              <span className="text-[#c0caf5]">{f.title}</span> stayed where it was (not moved to
+              &ldquo;{f.toPage}&rdquo;): {f.reason}
+            </li>
+          ))}
+        </ul>
+      )}
+      {(pagesCreated.length > 0 || pagesRemoved.length > 0 || pagesKept.length > 0) && (
+        <div className="text-[10px] text-[#565f89] space-y-0.5">
+          {pagesCreated.length > 0 && <div>Pages created: {pagesCreated.join(", ")}</div>}
+          {pagesRemoved.length > 0 && <div>Empty pages removed: {pagesRemoved.join(", ")}</div>}
+          {pagesKept.length > 0 && (
+            <div>
+              Pages kept (a terminal is still on them, or they could not be checked):{" "}
+              {pagesKept.join(", ")}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
