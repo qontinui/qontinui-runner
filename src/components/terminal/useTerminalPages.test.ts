@@ -115,7 +115,7 @@ describe("reconcilePages", () => {
   it("synthesizes a 'Terminal' tab for 'default' when the operator layout dropped it but the backend still parks terminals there", () => {
     // The orphaning bug: once the operator has created pages, `loadPages` no
     // longer injects the default page, so it is ABSENT from `persisted`. A
-    // terminal created via `POST /terminals` with no pageId lands on "default"
+    // terminal created via `POST /terminals` with pageId "default" lands there
     // and must still get a visible, selectable tab (regression for the
     // 2026-07-18 fan-out, where API-spawned terminals vanished onto "default").
     const persisted: TerminalPageConfig[] = [

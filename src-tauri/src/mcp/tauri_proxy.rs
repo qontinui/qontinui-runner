@@ -353,10 +353,7 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
             match tm.create(
                 a.title,
                 working_dir,
-                // The browser-mode mirror of the Tauri `terminal_create`
-                // command, carrying the webview's null-for-default encoding:
-                // an operator's spawn, never an automatic placement.
-                Some(crate::terminal::page_placement::operator_page(a.page_id)),
+                a.page_id,
                 a.cols,
                 a.rows,
                 state.app_handle.clone(),
