@@ -1263,6 +1263,11 @@ pub(crate) mod tests {
             spawn_device_default: None,
             adopted_from: None,
             awaiting_account_since: None,
+            wind_down_arm: None,
+            last_session_start_at: None,
+            gate_id: None,
+            gate_consuming_device_id: None,
+            gate_bound_boot_ms: None,
             spawn: None,
             run: RunAccounting::default(),
         }
