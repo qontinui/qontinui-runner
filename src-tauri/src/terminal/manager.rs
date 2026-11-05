@@ -809,9 +809,12 @@ impl TerminalManager {
     /// ([`super::page_placement::pick_page_for_new_session`]) over this
     /// manager's live terminals and `store`'s rows awaiting restore. So no
     /// unpaged caller — `POST /terminals` without `pageId`, the web-relay
-    /// create, stewards, the tauri_proxy create, the SessionRegistry
-    /// transports — can pile onto `default` past the ceiling. Adoption
-    /// (`insert_with_io`) keeps the recorded page and never comes here.
+    /// create, stewards, the SessionRegistry transports — can pile onto
+    /// `default` past the ceiling. `None` here always means "place
+    /// automatically": the operator-attended creates map the webview's
+    /// null-for-default to `"default"` first
+    /// ([`super::page_placement::operator_page`]). Adoption (`insert_with_io`)
+    /// keeps the recorded page and never comes here.
     pub(crate) fn resolve_page_id(
         &self,
         page_id: Option<String>,

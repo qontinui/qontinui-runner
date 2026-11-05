@@ -4,9 +4,15 @@
 //! continuation, the condition check, the looping-agent spawn, and every
 //! [`TerminalManager::create`](super::TerminalManager::create) called with no
 //! page (`POST /terminals` without `pageId`, the web-relay create, stewards,
-//! the tauri_proxy create, the SessionRegistry PTY and claude_cli transports).
-//! An explicit page — an operator spawning on the page they are looking at —
-//! and an adopted holder pane (`insert_with_io`) never come through here.
+//! the SessionRegistry PTY and claude_cli transports).
+//! An explicit page and an adopted holder pane (`insert_with_io`) never come
+//! through here, and neither does an OPERATOR spawn: the webview sends the
+//! `default` page as `null`, so the operator-attended creates (the Tauri
+//! `terminal_create` command and its browser-mode `tauri_proxy` mirror) turn
+//! `None` into `"default"` with [`operator_page`] before calling `create`.
+//! `create`'s `None` therefore always means "place automatically". The
+//! web-relay create (a remote machine's spawn onto this one) names no page on
+//! this box at all, so it is placed automatically.
 //!
 //! **A page's load counts the rows a restore is about to bring back.** Right
 //! after a restart the live terminal list is nearly empty while the boot
@@ -35,6 +41,9 @@
 //!   page, so "the restore has run" is not a signal that an unmarked row will
 //!   not come back; counting it costs at most an extra page, and placing a new
 //!   session onto a page its restore then refills is the defect this fixes.
+//! - A create still in flight is not in the live list yet, so a burst of
+//!   simultaneous automatic spawns can each read the same page as having room.
+//!   That predates this module and is out of its scope.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -86,6 +95,14 @@ pub(crate) fn pick_page(
     }
 
     mint()
+}
+
+/// The page an OPERATOR-attended create lands on: the page named, else
+/// `"default"`. The webview encodes the `default` page as `null`
+/// (`useTerminalManager.ts`: `pageId !== "default" ? pageId : null`), so for
+/// an operator `None` is the default page, never an automatic placement.
+pub(crate) fn operator_page(page_id: Option<String>) -> String {
+    page_id.unwrap_or_else(|| DEFAULT_PAGE.to_string())
 }
 
 /// The lifecycle store a running runner manages, for the placement sites that
@@ -499,6 +516,20 @@ mod tests {
             awaiting_restore(vec![closed_at("exited", BOOT_MS + 5)], unclassified).len(),
             1,
             "before the boot is classified nothing is known to be this process's exit"
+        );
+    }
+
+    /// The operator's wire encoding: `null` is the `default` page, even when
+    /// `default` is full — an operator spawning there means it.
+    #[test]
+    fn an_operator_spawn_with_no_page_stays_on_default() {
+        assert_eq!(operator_page(None), "default");
+        assert_eq!(operator_page(Some("p-op".to_string())), "p-op");
+        let tm = TerminalManager::new();
+        let (_dir, store) = store_with(rows_on("default", 58));
+        assert_eq!(
+            tm.resolve_page_id(Some(operator_page(None)), Some(&store)),
+            "default"
         );
     }
 
