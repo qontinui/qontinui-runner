@@ -65,7 +65,10 @@ NEVER_GATE="@@NEVER_GATE@@"
 # with qontinui-identity- or qontinui-shim-, or it holds the identity-build
 # marker. Trailing separators are ignored, and the name splits on `/` and `\`
 # alike, so the MSYS and Windows spellings of one dir (our own included) read
-# the same. Builtins only (no fork per PATH entry).
+# the same. The name match is ASCII-case-insensitive like the Rust and .cmd
+# copies (a case-changed Windows `Path` entry under Git Bash), spelled as
+# bracket classes because `${x,,}` needs bash 4 and macOS ships 3.2.
+# Builtins only (no fork per PATH entry).
 # ---------------------------------------------------------------------------
 is_qontinui_shim_dir() {
   local d="$1" name
@@ -79,7 +82,8 @@ is_qontinui_shim_dir() {
   name="${d##*/}"
   name="${name##*\\}"
   case "$name" in
-    qontinui-identity-*|qontinui-shim-*) return 0 ;;
+    [qQ][oO][nN][tT][iI][nN][uU][iI]-[iI][dD][eE][nN][tT][iI][tT][yY]-*) return 0 ;;
+    [qQ][oO][nN][tT][iI][nN][uU][iI]-[sS][hH][iI][mM]-*) return 0 ;;
   esac
   [ -e "$d/.qontinui-identity-build" ]
 }

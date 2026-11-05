@@ -2879,9 +2879,6 @@ mod resolve_wait_tests {
         tool: &str,
         render_into: impl Fn(&Path) -> String,
     ) {
-        let Some(timeout) = timeout_bin() else {
-            return; // no coreutils `timeout`: nothing can bound the hang
-        };
         let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let dir_a = tmp.path().join(format!("{family_prefix}a"));
@@ -2903,9 +2900,18 @@ mod resolve_wait_tests {
             real_dir.display()
         );
         for shim_dir in [&dir_a, &dir_b] {
-            let mut cmd = Command::new(timeout);
-            cmd.args(["-k", "2", "5", bash()])
-                .arg(shim_dir.join(tool))
+            // `timeout -k 2 5` where coreutils has one; elsewhere (macOS) the
+            // outer `output_with_timeout` bound alone, so a ping-pong there is
+            // an `Err` from the unwrap below rather than a silent skip.
+            let mut cmd = match timeout_bin() {
+                Some(timeout) => {
+                    let mut c = Command::new(timeout);
+                    c.args(["-k", "2", "5", bash()]);
+                    c
+                }
+                None => Command::new(bash()),
+            };
+            cmd.arg(shim_dir.join(tool))
                 .arg("--version")
                 .current_dir(tmp.path())
                 .env_clear()

@@ -322,15 +322,15 @@ fn persistent_identity_shim_dir() -> Option<&'static str> {
 ///   [`is_qontinui_shim_dir`](crate::install_effects_producer::intercept::shim_materializer::is_qontinui_shim_dir)
 ///   applied to the containing dir (an identity dir `qontinui-identity-*` or
 ///   install-intercept dir `qontinui-shim-*` by name, or any dir sealed by the
-///   identity-build marker), or
+///   identity-build marker; a name miss costs one `stat` for that marker), or
 /// - the persistent identity dir (`persistent_identity_dir`, in prod
 ///   `profile_cli::identity_shim_dir()` = `~/.qontinui/runner/identity-shim`),
 ///   matched by the full containing dir (separator- and case-normalized —
 ///   Windows paths are case-insensitive).
 ///
-/// Pure over its inputs; parsed with manual `/`+`\` splitting (not
-/// `std::path`) so Windows-style snapshot paths behave identically on every
-/// host, mirroring [`is_claude_image`].
+/// Pure over its inputs apart from that marker probe; parsed with manual
+/// `/`+`\` splitting (not `std::path`) so Windows-style snapshot paths behave
+/// identically on every host, mirroring [`is_claude_image`].
 #[expect(
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"

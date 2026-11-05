@@ -3595,7 +3595,14 @@ impl TerminalSession {
             None => {
                 // Fail-open: env vars are still set so a directly-invoked
                 // provider could still be pinned by a future absolute-path
-                // wrapper, but no PATH shim this terminal.
+                // wrapper, but no PATH shim this terminal. The child PATH is
+                // still composed, with no own dir: an inherited foreign shim
+                // dir must not reach this child either (plan
+                // 2026-11-04-identity-shim-foreign-shim-ping-pong-…, Phase 2).
+                // A runner with no PATH at all leaves the child's untouched.
+                if let Ok(current_path) = std::env::var("PATH") {
+                    Self::set_child_path(cmd, &compose_child_path(Some(&current_path), &[]));
+                }
             }
         }
 
@@ -7070,6 +7077,12 @@ pub(crate) mod tests {
             compose_child_path(Some(""), &[&identity]),
             identity.to_string_lossy()
         );
+
+        // No own dir (the identity seam failed open): the foreign dirs are
+        // still stripped and nothing is prepended.
+        let bare = compose_child_path(Some(&runner_path), &[]);
+        let want_bare = [p("cargo-bin"), String::new(), p("node-bin"), p("usr-bin")].join(sep);
+        assert_eq!(bare, want_bare);
     }
 
     #[test]
