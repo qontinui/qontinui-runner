@@ -173,6 +173,60 @@ export function mergeLiveRows(
   return [...transcriptRows, ...buildTabRows({ ...input, representedTabIds })];
 }
 
+/** `===` on every own field, and the same set of fields. */
+function shallowEqual(a: object, b: object): boolean {
+  const aKeys = Object.keys(a);
+  if (aKeys.length !== Object.keys(b).length) return false;
+  const ra = a as Record<string, unknown>;
+  const rb = b as Record<string, unknown>;
+  return aKeys.every((key) => Object.prototype.hasOwnProperty.call(b, key) && ra[key] === rb[key]);
+}
+
+/**
+ * Two rows are the same row when every field is the same value. `_transcript`
+ * is compared by VALUE: the transcript list is refetched every 30 s and each
+ * fetch yields new `TranscriptSession` objects, so comparing it by identity
+ * would re-render every transcript card once per poll even when nothing
+ * changed. Its fields are primitives except the debug-only `injected_tab`
+ * fixture, which a refetch rebuilds — so a fixture row counts as changed on
+ * every poll, the safe direction.
+ */
+function sameRow(a: UnifiedSession, b: UnifiedSession): boolean {
+  const { _transcript: at, ...aRest } = a;
+  const { _transcript: bt, ...bRest } = b;
+  if (!shallowEqual(aRest, bRest)) return false;
+  if (at === bt) return true;
+  return at !== null && bt !== null && shallowEqual(at, bt);
+}
+
+/**
+ * Reuse the previous build's row OBJECT for every row whose fields are all
+ * unchanged, so `memo(SessionCard)` holds for it.
+ *
+ * Every row is rebuilt from scratch whenever any input of the row memo
+ * changes — and `tabs` changes every time a terminal reports a new window
+ * title (OSC 0/2 → `renameTab`), which a working Claude session does
+ * continuously. Without this, one session's title tick handed EVERY card a new
+ * `session` prop, so with ~27 live sessions the panel re-rendered every card
+ * back to back and starved the runner window's main thread (input echo ~30 s;
+ * coord finding 8719a700). Every field is a primitive except `_transcript`,
+ * which `sameRow` compares by value, so a card re-renders only when a value it
+ * is given changes — not on a title tick, and not on a quiet transcript poll.
+ * A reused row carries the previous `_transcript` object, equal in value.
+ *
+ * Pure: `previous` is read, never written. The caller keeps the returned rows
+ * as the next call's `previous`.
+ */
+export function reuseUnchangedRows(
+  previous: ReadonlyMap<string, UnifiedSession>,
+  next: readonly UnifiedSession[],
+): UnifiedSession[] {
+  return next.map((row) => {
+    const prior = previous.get(row.sessionId);
+    return prior && sameRow(prior, row) ? prior : row;
+  });
+}
+
 /**
  * tmux mode: is this row the session on screen? `onScreenTabId` is the hook's
  * `shownTabId`, `null` in grid mode — where no row is marked, since every live
