@@ -1903,17 +1903,28 @@ pub async fn resume_ai_sessions(
         // Every discovered config dir (multi-account) plus the effective dir
         // for the active account is searched.
         let (can_full_resume, resume_account, resume_inherit_ambient) = {
-            let cli = crate::settings::get_ai_settings().claude_cli;
-            let (effective_config_dir, _config_dir_source) =
-                crate::ai_provider::get_effective_config_dir(&cli);
-            match crate::terminal::transcript::resume_account_on_this_machine(
-                effective_config_dir.as_deref(),
-                &working_dir,
-                &task_run_id,
-                &cli,
-            )
-            .into_session_account()
-            {
+            // Blocking (a config-dir sweep, canonicalize, credential reads and,
+            // on macOS, the `security` subprocess): off the async worker.
+            let probe_dir = working_dir.clone();
+            let probe_id = task_run_id.clone();
+            let decision = spawn_blocking_tracked(move || {
+                let cli = crate::settings::get_ai_settings().claude_cli;
+                let (effective_config_dir, _config_dir_source) =
+                    crate::ai_provider::get_effective_config_dir(&cli);
+                crate::terminal::transcript::resume_account_on_this_machine(
+                    effective_config_dir.as_deref(),
+                    &probe_dir,
+                    &probe_id,
+                    &cli,
+                )
+            })
+            .await
+            .unwrap_or_else(|e| {
+                crate::terminal::transcript::ResumeAccount::NotResumable {
+                    reason: format!("the resume-account probe task failed: {e}"),
+                }
+            });
+            match decision.into_session_account() {
                 Ok((account, inherit_ambient)) => (true, account, inherit_ambient),
                 Err(reason) => {
                     info!(

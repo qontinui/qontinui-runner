@@ -341,19 +341,65 @@ pub struct ResolvedSpawnAccount {
 /// production; it is a parameter so a test can prove the spawn holds its OWN
 /// draw even when a sibling's draw rewrites `RESOLVED_CONFIG_DIR` between the
 /// pick and the resolution. It is not called when the caller supplied a
-/// choice. Blocking (the pick reads settings and cooldown state): call it from
-/// a blocking context.
+/// choice — except a caller [`AccountChoice::Picked`] whose dir has since
+/// been COOLED (see [`refresh_cooled_pick`]). Blocking (the pick reads
+/// settings and cooldown state): call it from a blocking context.
 pub fn resolve_spawn_account_choice(
     cli_settings: &settings::ClaudeCliSettings,
     caller: Option<AccountChoice>,
     pick: impl FnOnce() -> Option<String>,
 ) -> ResolvedSpawnAccount {
-    let choice = caller.or_else(|| pick().map(AccountChoice::Picked));
+    let (caller, pick) = match refresh_cooled_pick(caller, pick) {
+        Ok(choice) => (choice, None),
+        Err(pick) => (None, Some(pick)),
+    };
+    let choice = caller.or_else(|| pick.and_then(|p| p()).map(AccountChoice::Picked));
     let (dir, source) = get_effective_config_dir_for(cli_settings, choice.as_ref());
     ResolvedSpawnAccount {
         choice,
         dir,
         source,
+    }
+}
+
+/// A caller-carried [`AccountChoice::Picked`] is the runner's OWN earlier
+/// pick (a workflow picks once and hands it to every phase), not a decision
+/// the caller owns. When rate-limit rotation has since COOLED that dir, the
+/// pick is stale: honour it and every later spawn of the unit re-runs on the
+/// limited account. So a cooled `Picked` is re-drawn with `pick`, and the
+/// re-pick is logged. A [`AccountChoice::Pinned`] is the caller's decision and
+/// is never re-drawn, cooled or not.
+///
+/// `Ok(choice)` — use `choice` as-is (a pin, a live pick, a cooled pick whose
+/// re-draw found nothing better, or a fresh re-pick); `pick` was consumed only
+/// in the re-draw case. `Err(pick)` — the caller supplied nothing; `pick` is
+/// handed back untouched for the no-choice arm.
+pub(crate) fn refresh_cooled_pick<P: FnOnce() -> Option<String>>(
+    caller: Option<AccountChoice>,
+    pick: P,
+) -> Result<Option<AccountChoice>, P> {
+    match caller {
+        None => Err(pick),
+        Some(AccountChoice::Picked(dir)) if is_account_cooled_down(&dir) => match pick() {
+            Some(fresh) => {
+                info!(
+                    "Carried account pick '{}' is cooled down (rate-limited); \
+                     re-picked '{}' for this spawn",
+                    short_label(&dir),
+                    short_label(&fresh)
+                );
+                Ok(Some(AccountChoice::Picked(fresh)))
+            }
+            None => {
+                warn!(
+                    "Carried account pick '{}' is cooled down (rate-limited) and a \
+                     re-pick found no account; keeping it",
+                    short_label(&dir)
+                );
+                Ok(Some(AccountChoice::Picked(dir)))
+            }
+        },
+        Some(choice) => Ok(Some(choice)),
     }
 }
 
@@ -1023,6 +1069,16 @@ pub(crate) mod test_support {
         std::fs::write(dir.path().join(".credentials.json"), body.to_string()).expect("write");
         let path = dir.path().to_string_lossy().to_string();
         (dir, path)
+    }
+
+    /// Remove `dir`'s cooldown from the shared static — a test cools only a
+    /// unique temp dir and clears only that entry.
+    pub(crate) fn clear_cooldown(dir: &str) {
+        if let Ok(mut cooldowns) = super::ACCOUNT_COOLDOWNS.lock() {
+            if let Some(map) = cooldowns.as_mut() {
+                map.remove(dir);
+            }
+        }
     }
 }
 
@@ -1722,5 +1778,58 @@ mod tests {
             });
         assert_eq!(pinned.dir, Some(mine));
         assert_eq!(pinned.source, ClaudeConfigDirSource::RequestOverride);
+    }
+
+    /// **A carried pick that rotation has since cooled is re-drawn.** A
+    /// workflow picks A once and hands `Picked(A)` to every phase; once A is
+    /// rate-limited, the next phase's spawn takes a fresh pick (B) instead of
+    /// re-running on A.
+    #[test]
+    fn a_cooled_carried_pick_takes_a_fresh_pick() {
+        let _amb = crate::test_env::isolated_ambient();
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
+            AccountSelectionMode::WeightedRandom,
+        ));
+        let (_a_guard, a) = dir_with_live_credentials();
+        let (_b_guard, b) = dir_with_live_credentials();
+        mark_account_rate_limited(&a);
+        let cli = auto_mode_cli(None);
+
+        let fresh = b.clone();
+        let resolved =
+            resolve_spawn_account_choice(&cli, Some(AccountChoice::Picked(a.clone())), move || {
+                Some(fresh)
+            });
+        assert_eq!(
+            resolved,
+            ResolvedSpawnAccount {
+                choice: Some(AccountChoice::Picked(b.clone())),
+                dir: Some(b),
+                source: ClaudeConfigDirSource::PickedForThisSpawn,
+            }
+        );
+        clear_dir(&a);
+    }
+
+    /// **A cooled PIN is the caller's decision and is kept** — no re-pick is
+    /// taken, cooled or not.
+    #[test]
+    fn a_cooled_pin_is_not_re_picked() {
+        let _amb = crate::test_env::isolated_ambient();
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
+            AccountSelectionMode::WeightedRandom,
+        ));
+        let (_a_guard, a) = dir_with_live_credentials();
+        mark_account_rate_limited(&a);
+        let cli = auto_mode_cli(None);
+
+        let resolved =
+            resolve_spawn_account_choice(&cli, Some(AccountChoice::Pinned(a.clone())), || {
+                panic!("a pin must not take a re-pick, even when cooled")
+            });
+        assert_eq!(resolved.choice, Some(AccountChoice::Pinned(a.clone())));
+        assert_eq!(resolved.dir, Some(a.clone()));
+        assert_eq!(resolved.source, ClaudeConfigDirSource::RequestOverride);
+        clear_dir(&a);
     }
 }

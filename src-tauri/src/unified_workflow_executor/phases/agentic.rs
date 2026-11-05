@@ -42,9 +42,10 @@ pub(crate) fn apply_resume_account(
     decision: crate::terminal::transcript::ResumeAccount,
 ) -> Result<String, String> {
     let (account, inherit_ambient_account) = decision.into_session_account()?;
-    let label = account
-        .as_ref()
-        .map_or_else(|| "the ambient default account".to_string(), |a| a.dir().to_string());
+    let label = account.as_ref().map_or_else(
+        || "the ambient default account".to_string(),
+        |a| a.dir().to_string(),
+    );
     ai_config.account = account;
     ai_config.inherit_ambient_account = inherit_ambient_account;
     Ok(label)
@@ -1178,16 +1179,31 @@ impl AgenticExecutor {
                 // that wrote it, and the inline child pins CLAUDE_CONFIG_DIR to
                 // the session's account — so resume under the transcript's
                 // account, not the workflow's pick.
+                // Blocking (a config-dir sweep, canonicalize, credential reads
+                // and, on macOS, the `security` subprocess): off the async
+                // worker, as the workflow's own pick is.
                 let cwd = crate::unified_ai_session::workspace_root_for_claude();
-                let decision = crate::terminal::transcript::resume_account_on_this_machine(
-                    self.ai_executor
-                        .account
-                        .as_ref()
-                        .map(crate::ai_provider::AccountChoice::dir),
-                    &cwd,
-                    &prev_cli_id,
-                    &crate::settings::get_ai_settings().claude_cli,
-                );
+                let extra = self
+                    .ai_executor
+                    .account
+                    .as_ref()
+                    .map(|c| c.dir().to_string());
+                let resume_id = prev_cli_id.clone();
+                let decision =
+                    qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+                        crate::terminal::transcript::resume_account_on_this_machine(
+                            extra.as_deref(),
+                            &cwd,
+                            &resume_id,
+                            &crate::settings::get_ai_settings().claude_cli,
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        crate::terminal::transcript::ResumeAccount::NotResumable {
+                            reason: format!("the resume-account probe task failed: {e}"),
+                        }
+                    });
                 match apply_resume_account(&mut ai_config, decision) {
                     Ok(account) => {
                         info!(

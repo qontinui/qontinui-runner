@@ -2060,12 +2060,34 @@ impl ClaudeSession {
         Ok(info)
     }
 
+    /// Which account a rate-limit restart rotates away from, and to.
+    ///
+    /// The limited account is the dir the child RAN UNDER: `limited_config_dir`
+    /// when the spawn set one, else (`None` — e.g. a session resumed via
+    /// `ResumeAccount::Ambient`) the ambient default it inherited, so that dir
+    /// is cooled when it is a roster account instead of the restart giving up.
+    /// `rotate` is `rotate_account_on_rate_limit` in production. Returns
+    /// `(limited, rotated_to)`, or `None` when no dir is nameable or no
+    /// alternative account exists.
+    pub(crate) fn rate_limit_rotation(
+        limited_config_dir: Option<&str>,
+        ambient: Option<std::path::PathBuf>,
+        rotate: impl FnOnce(Option<&str>) -> Option<String>,
+    ) -> Option<(String, String)> {
+        let limited =
+            crate::terminal::transcript::child_config_dir_with(limited_config_dir, ambient)?;
+        let rotated = rotate(Some(&limited))?;
+        Some((limited, rotated))
+    }
+
     /// Auto-restart the session on another account after a rate-limit exit.
     ///
-    /// Rotates away from `limited_config_dir` — the account THIS session ran
-    /// under — reads conversation history from the DB output_log, spawns a new
-    /// ClaudeSession pinned to the rotated-to account with a replay prompt,
-    /// and re-registers it in the SessionManager.
+    /// Rotates away from the account THIS session ran under
+    /// ([`Self::rate_limit_rotation`]: `limited_config_dir`, else the ambient
+    /// default it inherited) — reads conversation history from the DB
+    /// output_log, spawns a new ClaudeSession carrying the rotated-to account
+    /// as `Picked` with a replay prompt, and re-registers it in the
+    /// SessionManager.
     fn auto_restart_on_rate_limit(
         app_handle: &tauri::AppHandle,
         session_id: &str,
@@ -2076,24 +2098,26 @@ impl ClaudeSession {
         use crate::ai_provider::rotate_account_on_rate_limit;
         use tauri::Manager;
 
-        // 1. Rotate away from the account this session ran under. A child that
-        //    inherited the ambient default ran under no roster account, so
-        //    there is nothing to cool and no account to rotate away from.
-        let Some(limited) = limited_config_dir else {
+        // 1. Rotate away from the account this session ran under — for a child
+        //    that inherited the ambient default, that default dir.
+        let Some((limited, new_config_dir)) = Self::rate_limit_rotation(
+            limited_config_dir,
+            crate::terminal::transcript::ambient_claude_config_dir(),
+            rotate_account_on_rate_limit,
+        ) else {
             warn!(
-                "Session {}: ran under the ambient account (no CLAUDE_CONFIG_DIR), \
-                 so there is no roster account to rotate away from; not restarting",
-                session_id
+                "Session {}: no alternative account available for restart (ran under {:?}, \
+                 None = the ambient default)",
+                session_id, limited_config_dir
             );
             return;
         };
-        let Some(new_config_dir) = rotate_account_on_rate_limit(Some(limited)) else {
-            warn!(
-                "Session {}: no alternative account available for restart",
-                session_id
+        if limited_config_dir.is_none() {
+            info!(
+                "Session {}: ran under the ambient default {} (no CLAUDE_CONFIG_DIR); rotated away from it",
+                session_id, limited
             );
-            return;
-        };
+        }
         let label = std::path::Path::new(&new_config_dir)
             .file_name()
             .and_then(|n| n.to_str())
@@ -2567,6 +2591,53 @@ mod account_resolution_tests {
                 None,
                 ClaudeConfigDirSource::RejectedNoCredentials,
             ),
+            None
+        );
+    }
+
+    /// **A rate-limited ambient child rotates away from the ambient dir**
+    /// instead of giving up: with no resolved dir, the dir cooled and rotated
+    /// away from is the ambient default; a resolved dir wins; no alternative
+    /// (or nothing nameable) is no restart.
+    #[test]
+    fn a_rate_limited_ambient_child_rotates_away_from_the_ambient_dir() {
+        use std::path::PathBuf;
+        let ambient = PathBuf::from("/home/u/.claude");
+        let rotation =
+            super::ClaudeSession::rate_limit_rotation(None, Some(ambient.clone()), |limited| {
+                assert_eq!(
+                    limited,
+                    Some("/home/u/.claude"),
+                    "the ambient dir is cooled"
+                );
+                Some("/acct/next".to_string())
+            });
+        assert_eq!(
+            rotation,
+            Some(("/home/u/.claude".to_string(), "/acct/next".to_string()))
+        );
+
+        let resolved = super::ClaudeSession::rate_limit_rotation(
+            Some("/acct/ran"),
+            Some(ambient.clone()),
+            |limited| {
+                assert_eq!(limited, Some("/acct/ran"));
+                Some("/acct/next".to_string())
+            },
+        );
+        assert_eq!(
+            resolved,
+            Some(("/acct/ran".to_string(), "/acct/next".to_string()))
+        );
+
+        assert_eq!(
+            super::ClaudeSession::rate_limit_rotation(None, Some(ambient), |_| None),
+            None
+        );
+        assert_eq!(
+            super::ClaudeSession::rate_limit_rotation(None, None, |_| {
+                panic!("nothing nameable: no rotation is attempted")
+            }),
             None
         );
     }

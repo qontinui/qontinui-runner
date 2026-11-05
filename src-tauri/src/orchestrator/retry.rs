@@ -85,6 +85,13 @@ fn default_feedback_injection() -> bool {
     true
 }
 
+/// Marks an error no retry can fix (e.g. the inline runner's "no
+/// authenticated Claude account" refusal: no back-off makes a login appear).
+/// [`RetryService::should_retry`] gives up on an error carrying it before
+/// consulting `retryable_errors`, so an operator pattern that happens to match
+/// the rest of the message cannot re-spawn a hopeless launch.
+pub const NON_RETRYABLE_MARKER: &str = "[non-retryable]";
+
 fn default_retryable_errors() -> Vec<String> {
     vec![
         "timeout".to_string(),
@@ -272,6 +279,14 @@ impl RetryService {
         if state.exhausted(self.config.max_retries) {
             return RetryDecision::GiveUp {
                 reason: format!("Max retries ({}) exceeded", self.config.max_retries),
+            };
+        }
+
+        // An error that says no retry can fix it is final, whatever the
+        // configured patterns match.
+        if error.contains(NON_RETRYABLE_MARKER) {
+            return RetryDecision::GiveUp {
+                reason: format!("Error is non-retryable: {}", truncate_error(error, 100)),
             };
         }
 
@@ -720,6 +735,32 @@ mod tests {
 
         state.record_attempt("error 3", 1000, false);
         assert!(state.exhausted(3));
+    }
+
+    /// **An error carrying the non-retryable marker is given up on at once**,
+    /// even when a configured pattern matches the rest of it — here both a
+    /// default pattern ("rate limit") and an operator pattern naming the
+    /// refusal text itself.
+    #[test]
+    fn a_non_retryable_marked_error_gives_up_whatever_the_patterns_match() {
+        let mut config = RetryConfig::default();
+        config
+            .retryable_errors
+            .push("no authenticated claude account".to_string());
+        let service = RetryService::new(config);
+        let error = format!(
+            "{NON_RETRYABLE_MARKER} no authenticated Claude account on this runner — run /login (rate limit)"
+        );
+        assert!(
+            service.is_retryable_error(&error),
+            "the patterns alone would retry"
+        );
+        match service.should_retry(&error, &RetryState::new()) {
+            RetryDecision::GiveUp { reason } => {
+                assert!(reason.contains("non-retryable"), "{reason}")
+            }
+            RetryDecision::Retry { .. } => panic!("a marked error must not be retried"),
+        }
     }
 
     #[test]

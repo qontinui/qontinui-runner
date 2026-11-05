@@ -303,7 +303,10 @@ fn run_async_inline<F: std::future::Future>(fut: F) -> F::Output {
 ///
 /// The inline runner takes no pick of its own: its unit of work is the
 /// workflow, whose pick (`loop_controller`) rides `session_ctx.account` as
-/// `AccountChoice::Picked`. With no choice it is the resolver's no-choice arm
+/// `AccountChoice::Picked` — unless rate-limit rotation has since COOLED that
+/// dir, when a fresh pick is taken for this spawn
+/// ([`refresh_cooled_pick`](crate::ai_provider::config::refresh_cooled_pick);
+/// a `Pinned` choice is never re-drawn). With no choice it is the resolver's no-choice arm
 /// (the configured `config_dir`, else nothing) — never the shared
 /// `RESOLVED_CONFIG_DIR`, which a sibling spawn's pick rewrites. The launch
 /// template, the trust pre-accept, federation and the child's
@@ -319,21 +322,33 @@ pub(crate) fn resolve_inline_config_dir(
     cli_settings: &crate::settings::ClaudeCliSettings,
     session_ctx: Option<&AiSessionContext>,
 ) -> Result<Option<String>, String> {
+    // Blocking: this whole function runs on the inline runner's sync worker
+    // thread, so the re-pick (settings + cooldown reads) may run here directly.
     resolve_inline_config_dir_with(
         cli_settings,
         session_ctx,
+        crate::ai_provider::pick_best_account,
         crate::ai_provider::oauth_refresh::default_location_has_valid_credentials,
     )
 }
 
-/// [`resolve_inline_config_dir`] with the ambient-default credential check
-/// injected, so a test can drive both arms without a real login.
+/// [`resolve_inline_config_dir`] with the re-pick and the ambient-default
+/// credential check injected, so a test can drive every arm without a real
+/// login or roster.
 fn resolve_inline_config_dir_with(
     cli_settings: &crate::settings::ClaudeCliSettings,
     session_ctx: Option<&AiSessionContext>,
+    pick: impl FnOnce() -> Option<String>,
     default_location_has_valid_credentials: impl FnOnce() -> bool,
 ) -> Result<Option<String>, String> {
-    let choice = session_ctx.and_then(|c| c.account.as_ref());
+    // No caller choice is NOT re-drawn here (`Err(_)`): the inline runner's
+    // no-choice arm is the configured dir, by design.
+    let choice = crate::ai_provider::config::refresh_cooled_pick(
+        session_ctx.and_then(|c| c.account.clone()),
+        pick,
+    )
+    .unwrap_or(None);
+    let choice = choice.as_ref();
     let (dir, source) = crate::ai_provider::get_effective_config_dir_for(cli_settings, choice);
     if dir.is_some() {
         return Ok(dir);
@@ -351,8 +366,11 @@ fn resolve_inline_config_dir_with(
     }
     if !default_location_has_valid_credentials() {
         let instance = crate::instance::instance_name().unwrap_or_else(|| "primary".to_string());
+        // Marked non-retryable: no back-off makes a login appear, so the
+        // retry wrapper must give up at once rather than re-spawn it.
         return Err(format!(
-            "no authenticated Claude account on this runner — run /login (instance={instance}, config_dir_source={})",
+            "{} no authenticated Claude account on this runner — run /login (instance={instance}, config_dir_source={})",
+            crate::orchestrator::retry::NON_RETRYABLE_MARKER,
             source.as_str()
         ));
     }
@@ -3001,6 +3019,26 @@ mod inline_account_tests {
     use crate::execution_context::AiSessionContext;
     use crate::settings::{AccountSelectionMode, ClaudeCliSettings};
 
+    /// The re-pick for a choice that is not cooled: never called.
+    fn no_pick() -> Option<String> {
+        panic!("a live (or absent) choice must not take a re-pick")
+    }
+
+    /// Hermetic guards for every test here: an isolated ambient FIRST (so a
+    /// host gateway marker or roster cannot change the resolver's arm), then
+    /// the fleet pin. Locals drop in reverse order — the pin first, as
+    /// `EnvLockGuard` requires.
+    fn hermetic(
+        mode: AccountSelectionMode,
+    ) -> (
+        crate::mcp::fleet_policy_poller::AccountSelectionPin,
+        qontinui_runner_lib::ambient::test_support::IsolatedAmbient,
+    ) {
+        let ambient = crate::test_env::isolated_ambient();
+        let pin = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(mode));
+        (pin, ambient)
+    }
+
     fn auto_mode_cli() -> ClaudeCliSettings {
         ClaudeCliSettings {
             account_selection_mode: AccountSelectionMode::WeightedRandom,
@@ -3017,9 +3055,7 @@ mod inline_account_tests {
     /// no choice the global is not read at all.
     #[test]
     fn the_inline_runner_resolves_the_session_ctx_pick_not_the_global() {
-        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
-            AccountSelectionMode::WeightedRandom,
-        ));
+        let _guards = hermetic(AccountSelectionMode::WeightedRandom);
         let (_mine_guard, mine) = dir_with_live_credentials();
         let (_sibling_guard, sibling) = dir_with_live_credentials();
         let _restore = ResolvedConfigDirRestore::capture();
@@ -3028,17 +3064,17 @@ mod inline_account_tests {
         let mut ctx = AiSessionContext::agentic("task-inline", "Inline", 1);
         ctx.account = Some(AccountChoice::Picked(mine.clone()));
         assert_eq!(
-            resolve_inline_config_dir_with(&auto_mode_cli(), Some(&ctx), || true),
+            resolve_inline_config_dir_with(&auto_mode_cli(), Some(&ctx), no_pick, || true),
             Ok(Some(mine))
         );
 
         ctx.account = None;
         assert_eq!(
-            resolve_inline_config_dir_with(&auto_mode_cli(), Some(&ctx), || true),
+            resolve_inline_config_dir_with(&auto_mode_cli(), Some(&ctx), no_pick, || true),
             Ok(None)
         );
         assert_eq!(
-            resolve_inline_config_dir_with(&auto_mode_cli(), None, || true),
+            resolve_inline_config_dir_with(&auto_mode_cli(), None, no_pick, || true),
             Ok(None)
         );
     }
@@ -3050,9 +3086,7 @@ mod inline_account_tests {
     /// that 401s.
     #[test]
     fn a_dead_pick_falls_to_the_ambient_account_only_when_it_is_live() {
-        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
-            AccountSelectionMode::WeightedRandom,
-        ));
+        let _guards = hermetic(AccountSelectionMode::WeightedRandom);
         let dead = tempfile::tempdir().unwrap();
         let mut ctx = AiSessionContext::agentic("task-inline-dead", "Inline", 1);
         ctx.account = Some(AccountChoice::Picked(
@@ -3060,15 +3094,55 @@ mod inline_account_tests {
         ));
 
         assert_eq!(
-            resolve_inline_config_dir_with(&auto_mode_cli(), Some(&ctx), || true),
+            resolve_inline_config_dir_with(&auto_mode_cli(), Some(&ctx), no_pick, || true),
             Ok(None)
         );
-        let err = resolve_inline_config_dir_with(&auto_mode_cli(), Some(&ctx), || false)
+        let err = resolve_inline_config_dir_with(&auto_mode_cli(), Some(&ctx), no_pick, || false)
             .expect_err("no live account anywhere must refuse the spawn");
         assert!(
             err.contains("no authenticated Claude account")
                 && err.contains("rejected_no_credentials"),
             "the refusal names why: {err}"
         );
+        // ...and is final: the retry wrapper gives up on it at once.
+        assert!(
+            matches!(
+                crate::orchestrator::RetryService::with_defaults()
+                    .should_retry(&err, &crate::orchestrator::RetryState::new()),
+                crate::orchestrator::RetryDecision::GiveUp { .. }
+            ) && err.contains(crate::orchestrator::retry::NON_RETRYABLE_MARKER),
+            "the no-account refusal must be non-retryable: {err}"
+        );
+    }
+
+    /// **A workflow pick that rotation has since cooled is re-drawn for the
+    /// inline spawn**, and the re-pick is what the child gets; a cooled
+    /// PIN is the caller's decision and is kept.
+    #[test]
+    fn a_cooled_workflow_pick_is_re_picked_but_a_cooled_pin_is_kept() {
+        let _guards = hermetic(AccountSelectionMode::WeightedRandom);
+        let (_cooled_guard, cooled) = dir_with_live_credentials();
+        let (_fresh_guard, fresh) = dir_with_live_credentials();
+        crate::ai_provider::config::mark_account_rate_limited(&cooled);
+
+        let mut ctx = AiSessionContext::agentic("task-inline-cooled", "Inline", 1);
+        ctx.account = Some(AccountChoice::Picked(cooled.clone()));
+        let fresh_pick = fresh.clone();
+        assert_eq!(
+            resolve_inline_config_dir_with(
+                &auto_mode_cli(),
+                Some(&ctx),
+                move || Some(fresh_pick),
+                || true
+            ),
+            Ok(Some(fresh))
+        );
+
+        ctx.account = Some(AccountChoice::Pinned(cooled.clone()));
+        assert_eq!(
+            resolve_inline_config_dir_with(&auto_mode_cli(), Some(&ctx), no_pick, || true),
+            Ok(Some(cooled.clone()))
+        );
+        crate::ai_provider::config::test_support::clear_cooldown(&cooled);
     }
 }
