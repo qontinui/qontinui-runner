@@ -2988,4 +2988,131 @@ mod script_tests {
         });
         assert_eq!(parsed["terminal_id"], HOSTILE, "under {locale}: {body}");
     }
+
+    /// The bash integration's prompt-state marks on a real pty
+    /// (`resources/shell-integration-marks-test.sh`): with a user
+    /// `PROMPT_COMMAND` in every form, each typed command line gets its 633;C
+    /// before its output and a 633;A after it, and the prompt announces
+    /// `633;P;CommandMarks=1`. The script SKIPs (exit 0) where util-linux
+    /// `script(1)` is missing or bash predates PS0.
+    #[test]
+    fn bash_integration_marks_every_typed_command() {
+        let _serial = exe_guard();
+        let test = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("shell-integration-marks-test.sh");
+        let mut cmd = Command::new("bash");
+        cmd.arg(&test);
+        // Five interactive bash sessions behind `script(1)`, each bounded at
+        // 20 s inside the script; this outer bound only catches a hang.
+        let out = output_with_timeout(cmd, Duration::from_secs(150))
+            .expect("the marks test runs inside its budget");
+        assert!(
+            out.status.success(),
+            "shell-integration-marks-test.sh failed:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// The shell producer half of the webview's prompt-state witness (the project
+/// move's "bare idle shell" reading, `useProjectTerminalReconcile.ts`): every
+/// integration script sends the SAME capability token the webview parses, and
+/// PowerShell arms it only where its 633;C exists. A source scan, so it runs on
+/// every platform without a shell.
+#[cfg(test)]
+mod command_marks_scan_tests {
+    const BASH: &str = include_str!("../../resources/shell-integration.bash");
+    const ZSH: &str = include_str!("../../resources/shell-integration.zsh");
+    const PS1: &str = include_str!("../../resources/shell-integration.ps1");
+    /// The webview constant's source, so the token cannot drift on either side.
+    const WEBVIEW: &str =
+        include_str!("../../../src/components/terminal/shellIntegrationEvents.ts");
+
+    /// `COMMAND_MARKS_CAPABILITY` as the webview declares it.
+    fn webview_token() -> &'static str {
+        let (_, rest) = WEBVIEW
+            .split_once("export const COMMAND_MARKS_CAPABILITY = \"")
+            .expect("shellIntegrationEvents.ts declares COMMAND_MARKS_CAPABILITY");
+        let (token, _) = rest
+            .split_once('"')
+            .expect("the constant is a string literal");
+        token
+    }
+
+    #[test]
+    fn every_integration_script_sends_the_webviews_capability_token() {
+        let token = webview_token();
+        assert_eq!(token, "P;CommandMarks=1");
+        assert!(
+            BASH.contains(&format!("__osc633 \"{token}\"")),
+            "shell-integration.bash must send {token}"
+        );
+        assert!(
+            ZSH.contains(&format!("__qontinui_osc633 \"{token}\"")),
+            "shell-integration.zsh must send {token}"
+        );
+        assert!(
+            PS1.contains(&format!("]633;{token}${{__q_bel}}")),
+            "shell-integration.ps1 must send {token}"
+        );
+    }
+
+    /// bash announces the capability only on the PS0 path (bash >= 4.4), the
+    /// one that marks every typed command line and never a PROMPT_COMMAND entry.
+    #[test]
+    fn bash_announces_the_capability_only_where_ps0_emits_the_command_start() {
+        let token = webview_token();
+        let send = format!("    if [ \"${{__qontinui_command_marks}}\" = \"1\" ]; then\n        __osc633 \"{token}\"\n    fi");
+        assert!(
+            BASH.contains(&send),
+            "the bash announcement must be gated on the PS0 path"
+        );
+        assert!(
+            BASH.contains("PS0='\\e]633;C\\a'\"${PS0}\""),
+            "bash must emit its command start from PS0"
+        );
+        let gate = "if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then\n    __qontinui_command_marks=1\nelse\n    __qontinui_command_marks=0\nfi";
+        assert!(
+            BASH.contains(gate),
+            "the PS0 path must be gated on bash >= 4.4"
+        );
+    }
+
+    /// PowerShell emits 633;C only from its PSReadLine hook, so the flag that
+    /// lets its prompt announce the capability is set TRUE only inside that
+    /// block — initialized false at top level, before the Prompt function reads
+    /// it (StrictMode) — and never announced at a nested prompt.
+    #[test]
+    fn powershell_arms_the_capability_only_inside_the_psreadline_block() {
+        const ARM: &str = "$global:__qontinui_command_marks = $true";
+        const INIT: &str = "$global:__qontinui_command_marks = $false";
+        let arms: Vec<usize> = PS1.match_indices(ARM).map(|(i, _)| i).collect();
+        assert_eq!(arms.len(), 1, "exactly one place may arm the capability");
+        let block = PS1
+            .find("if (Get-Module -Name PSReadLine -ErrorAction SilentlyContinue) {")
+            .expect("the PSReadLine block is present");
+        let block_end = PS1
+            .match_indices("\n}\n")
+            .map(|(i, _)| i)
+            .find(|&i| i > block)
+            .expect("the PSReadLine block closes");
+        assert!(
+            arms[0] > block && arms[0] < block_end,
+            "the capability must be armed inside the PSReadLine block"
+        );
+        let init = PS1.find(INIT).expect("the flag is initialized false");
+        let prompt = PS1
+            .find("function global:Prompt {")
+            .expect("the Prompt function is present");
+        assert!(
+            init < prompt,
+            "the flag must be initialized before the Prompt function reads it"
+        );
+        assert!(
+            PS1.contains("if ($global:__qontinui_command_marks -and $NestedPromptLevel -eq 0) {"),
+            "a nested prompt must not announce the capability"
+        );
+    }
 }

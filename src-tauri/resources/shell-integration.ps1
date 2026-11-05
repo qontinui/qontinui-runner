@@ -28,21 +28,36 @@ function Write-Osc633 {
 # Save original Prompt function
 $__qontinui_original_prompt = $function:Prompt
 
+# P;CommandMarks=1 is announced only while this is $true, and only the
+# PSReadLine branch below sets it (the one place a C mark is emitted). It is
+# initialized here, at top level, so the Prompt function can read it under the
+# user's `Set-StrictMode -Version Latest`: an unset variable would throw on every
+# prompt and the user's prompt would fall back to `PS>`.
+$global:__qontinui_command_marks = $false
+
 # Override Prompt to emit shell integration markers.
 # IMPORTANT: OSC sequences are embedded in the returned string so that ConPTY
 # processes them together with the visible text. Writing them separately via
 # [Console]::Write() can desync the cursor position that PSReadLine reads from
 # the console buffer, causing typed characters to appear in the wrong place.
 function global:Prompt {
-    $exitCode = $LASTEXITCODE
+    # $LASTEXITCODE does not exist until a native command has run; reading it
+    # unset throws under `Set-StrictMode -Version Latest`.
+    $hadExitCode = Test-Path -LiteralPath variable:global:LASTEXITCODE
+    $exitCode = if ($hadExitCode) { $global:LASTEXITCODE } else { $null }
 
     # Build result with embedded OSC 633 sequences (zero-width in the terminal)
     $result = "${__q_esc}]633;D;${exitCode}${__q_bel}"
     $result += "${__q_esc}]633;P;Cwd=$(Get-Location)${__q_bel}"
     # P;CommandMarks=1: this shell marks every command start (633;C). Only the
     # PSReadLine hook below emits C, so only that branch arms the flag; without
-    # it a prompt mark says nothing about whether a command is running.
-    if ($global:__qontinui_command_marks) {
+    # it a prompt mark says nothing about whether a command is running. Never
+    # at a NESTED prompt ($NestedPromptLevel > 0: a debugger breakpoint,
+    # $Host.EnterNestedPrompt()): the outer script is suspended there, not
+    # finished, so the pane must not read idle. The literal is pinned against
+    # the webview's COMMAND_MARKS_CAPABILITY by a source scan in
+    # src-tauri/src/session/spawn_prompt.rs.
+    if ($global:__qontinui_command_marks -and $NestedPromptLevel -eq 0) {
         $result += "${__q_esc}]633;P;CommandMarks=1${__q_bel}"
     }
     $result += "${__q_esc}]633;A${__q_bel}"
@@ -57,8 +72,9 @@ function global:Prompt {
     $result += $text
     $result += "${__q_esc}]633;B${__q_bel}"
 
-    # Restore $LASTEXITCODE so it isn't clobbered by our string operations
-    $global:LASTEXITCODE = $exitCode
+    # Restore $LASTEXITCODE so it isn't clobbered by our string operations (and
+    # never create it where no native command has set it).
+    if ($hadExitCode) { $global:LASTEXITCODE = $exitCode }
     return $result
 }
 
