@@ -620,10 +620,7 @@ mod tests {
     /// Plan 2026-11-04 Phase 4 (the arming test): the socket and its staged
     /// `.upg` twin fit `sun_path` whatever the pane dir, the path is stable,
     /// and the pane dir is part of the name.
-    ///
-    /// It calls the real `socket_root()`, so it creates (if missing) the real
-    /// per-user root — `/run/user/<uid>/qontinui-pty` or
-    /// `/tmp/qontinui-pty-<uid>` — and fails where that root is refused.
+    /// Pure: no root is created or read.
     #[cfg(unix)]
     #[test]
     fn socket_path_fits_sun_path_for_long_pane_dir() {
@@ -633,22 +630,31 @@ mod tests {
         let other = PathBuf::from(format!("/{}", "e".repeat(199)));
         let p = PaneId::new(&"p".repeat(MAX_PANE_ID_LEN)).unwrap();
 
-        // The real root on this machine, and both roots `socket_root` can
-        // choose for the longest 32-bit uid.
+        // Both roots `socket_root` can choose, for the longest 32-bit uid.
         let worst_roots = [
             PathBuf::from(format!("{RUN_USER}/{}/qontinui-pty", u32::MAX)),
             PathBuf::from(format!("{TMP}/qontinui-pty-{}", u32::MAX)),
         ];
-        for root in [socket_root().unwrap()].into_iter().chain(worst_roots) {
+        for root in worst_roots {
             let sock = root.join(socket_name(&long, &p));
             let staged = crate::transport::staged_path(&sock);
             assert!(sock.as_os_str().len() <= max, "{}", sock.display());
             assert!(staged.as_os_str().len() <= max, "{}", staged.display());
             assert_ne!(sock, root.join(socket_name(&other, &p)));
         }
+    }
 
-        // The public function: same answer on every call (spawn and a later
-        // adoption agree), and under the real root.
+    /// The public function under the real root: same answer on every call
+    /// (spawn and a later adoption agree). It creates (if missing) the real
+    /// per-user root — `/run/user/<uid>/qontinui-pty` or
+    /// `/tmp/qontinui-pty-<uid>` — and fails where that root is refused.
+    #[cfg(unix)]
+    #[test]
+    fn pty_holder_socket_path_is_stable_under_the_real_root() {
+        let max = crate::transport::max_path_len();
+        let long = PathBuf::from(format!("/{}", "d".repeat(199)));
+        let other = PathBuf::from(format!("/{}", "e".repeat(199)));
+        let p = PaneId::new(&"p".repeat(MAX_PANE_ID_LEN)).unwrap();
         let sock = socket_path(&long, &p).unwrap();
         assert_eq!(sock, socket_path(&long, &p).unwrap());
         assert_eq!(sock.parent().unwrap(), socket_root().unwrap());
