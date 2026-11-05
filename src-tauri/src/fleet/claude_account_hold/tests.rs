@@ -1,7 +1,10 @@
 //! Tests of the account hold: the table ([`decide_hold_action`]) row by row, the
 //! wire parsing, the memory's answer handling, and the tick driven against a fake
 //! coord over HTTP — the arming test enters through [`account_hold_tick`], the
-//! function [`spawn_claude_account_hold`] runs on every interval.
+//! tick body `run_account_hold_loop` runs on every interval. The loop around it
+//! (the boot-read wait, the ticker, the per-tick timeout) and the `main.rs`
+//! spawn are not driven here; the spawn is pinned by `worker_supervisor`'s
+//! source-text test.
 
 use super::*;
 use chrono::TimeZone;
@@ -335,6 +338,87 @@ fn a_409_waits_for_the_lane_to_change() {
 }
 
 #[test]
+fn a_409_wait_ends_after_the_backoff_even_if_the_lane_never_changes() {
+    let mut mem = streak(5);
+    let lane = LaneView::Clear;
+    mem.apply_hold_reply(
+        &HoldReply::Conflict {
+            code: "lane_unreadable".to_string(),
+        },
+        &lane,
+        t0(),
+    );
+    let mut soon = inputs(false, read(lane.clone()));
+    soon.now = t0() + chrono::Duration::minutes(9);
+    assert_eq!(
+        decide_hold_action(&mem, &soon),
+        HoldAction::Nothing(Idle::WaitingOnConflict)
+    );
+    let mut later = inputs(false, read(lane));
+    later.now = t0() + chrono::Duration::minutes(10);
+    assert_eq!(
+        decide_hold_action(&mem, &later),
+        HoldAction::Hold {
+            until: later.now + chrono::Duration::hours(24)
+        }
+    );
+}
+
+/// A hold this process never saw accepted (the previous run's, or one whose 200
+/// was lost) is recorded from the lane read, so an operator undrain that follows
+/// is respected rather than re-held on the next tick.
+#[test]
+fn an_own_hold_read_from_the_lane_marks_a_later_clear_as_an_operator_undrain() {
+    let until = t0() + chrono::Duration::hours(20);
+    let mut mem = streak(5);
+    assert_eq!(mem.recorded, None);
+    mem.note_lane(&own_lane(until));
+    assert_eq!(
+        mem.recorded,
+        Some(RecordedHold {
+            until,
+            tenant_id: None
+        })
+    );
+    mem.note_lane(&LaneView::Clear);
+    assert_eq!(
+        decide_hold_action(&mem, &inputs(false, read(LaneView::Clear))),
+        HoldAction::Nothing(Idle::OperatorUndrained { until })
+    );
+    // A recorded tenant survives a read that names none, and the later until wins.
+    let tenant = Uuid::from_u128(7);
+    let mut mem = HoldMemory {
+        recorded: Some(RecordedHold {
+            until: t0() + chrono::Duration::hours(1),
+            tenant_id: Some(tenant),
+        }),
+        ..Default::default()
+    };
+    mem.note_lane(&own_lane(until));
+    assert_eq!(
+        mem.recorded,
+        Some(RecordedHold {
+            until,
+            tenant_id: Some(tenant)
+        })
+    );
+    // A lane held by anyone else records nothing.
+    let mut mem = HoldMemory::default();
+    mem.note_lane(&other_lane(until));
+    assert_eq!(mem.recorded, None);
+}
+
+/// The timing constants as literals: a test written against the constants
+/// themselves would pass whatever they were changed to.
+#[test]
+fn the_timing_constants_are_what_the_plan_states() {
+    assert_eq!(HOLD_FOR, chrono::Duration::hours(24));
+    assert_eq!(RENEW_UNDER, chrono::Duration::hours(6));
+    assert_eq!(WRITE_BACKOFF, chrono::Duration::minutes(10));
+    assert_eq!(NOT_READY_TICKS_TO_HOLD, 2);
+}
+
+#[test]
 fn a_403_warns_once_and_retries_every_ten_minutes() {
     let mut mem = streak(5);
     let lane = LaneView::Clear;
@@ -367,7 +451,10 @@ fn a_403_warns_once_and_retries_every_ten_minutes() {
         until: inp.now + HOLD_FOR,
         changed: true,
     };
-    assert_eq!(mem.apply_hold_reply(&held, &lane, inp.now), HoldEffect::Held);
+    assert_eq!(
+        mem.apply_hold_reply(&held, &lane, inp.now),
+        HoldEffect::Held
+    );
     assert!(!mem.refusal_warned);
     assert_eq!(mem.backoff_until, None);
 }
@@ -684,7 +771,9 @@ mod over_http {
                 let changed = match &c.lane {
                     // The door's repeat rule: keep the reason, move the until
                     // only past its 60 s tolerance.
-                    Some((reason, old)) if reason.starts_with(&format!("restart-hold:{prepare}:")) => {
+                    Some((reason, old))
+                        if reason.starts_with(&format!("restart-hold:{prepare}:")) =>
+                    {
                         if (until - *old).num_seconds().abs() > 60 {
                             c.lane = Some((reason.clone(), until));
                             true
@@ -872,8 +961,10 @@ mod over_http {
     /// reason starts `restart-hold:no-claude-account:` on its SECOND not-ready
     /// tick and not before, writes nothing on a repeat, and POSTs a release on
     /// its first ready tick — entered through [`account_hold_tick`], the tick
-    /// [`spawn_claude_account_hold`] runs on every interval, against coord over
-    /// HTTP.
+    /// body `run_account_hold_loop` runs on every interval, against coord over
+    /// HTTP. The loop itself and the spawn are not driven (see the module doc),
+    /// and the fake does not check `Authorization`, so the bearer choice is not
+    /// covered here.
     #[tokio::test]
     #[cfg_attr(
         target_os = "macos",
@@ -941,6 +1032,100 @@ mod over_http {
             "the release's read-back is folded"
         );
         assert_eq!(mem.recorded, None);
+    }
+
+    /// ARMING, through the loop. The supervised loop body
+    /// [`run_account_hold_loop`] — what [`spawn_claude_account_hold`] runs — with
+    /// a short interval: it holds the lane only once two ticks have read no
+    /// account, and releases it after `/login`.
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "the default-location check reads the real login Keychain on macOS"
+    )]
+    async fn the_account_hold_loop_holds_a_lane_with_no_account_and_releases_it_on_login() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let (base, coord) = start_fake_coord().await;
+        let runner = NoAccountRunner::arrange(&base).await;
+        let ticks = Arc::new(AtomicU32::new(0));
+        let counted = ticks.clone();
+        let looped = run_account_hold_loop(Duration::from_millis(100), primary_env(), move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        let watched = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            while lock(&coord).holds.is_empty() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the loop never held"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                ticks.load(Ordering::SeqCst) >= NOT_READY_TICKS_TO_HOLD,
+                "held before two not-ready ticks"
+            );
+            let reason = lock(&coord).lane.clone().expect("coord holds the lane").0;
+            assert!(
+                reason.starts_with("restart-hold:no-claude-account:"),
+                "{reason}"
+            );
+            runner.log_in();
+            while lock(&coord).releases.is_empty() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the loop never released"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let c = lock(&coord);
+            assert_eq!(c.holds.len(), 1, "one hold, no repeat writes: {c:?}");
+            assert!(c.lane.is_none(), "the lane is open again: {c:?}");
+        };
+        tokio::select! {
+            () = looped => unreachable!("the account-hold loop never returns"),
+            () = watched => {}
+        }
+    }
+
+    /// A runner that boots into its own hold (left by the previous run) and is
+    /// then undrained by an operator does not re-hold: the hold it read from the
+    /// lane counts as recorded until its `until`.
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "the default-location check reads the real login Keychain on macOS"
+    )]
+    async fn an_operator_undrain_of_a_hold_left_by_the_previous_run_is_respected() {
+        let (base, coord) = start_fake_coord().await;
+        let _runner = NoAccountRunner::arrange(&base).await;
+        lock(&coord).lane = Some((own_reason(), Utc::now() + chrono::Duration::hours(20)));
+        let env = primary_env();
+        let mut mem = HoldMemory::default();
+
+        account_hold_tick(&mut mem, &env).await;
+        account_hold_tick(&mut mem, &env).await;
+        assert!(
+            lock(&coord).holds.is_empty(),
+            "a held lane with margin writes nothing"
+        );
+        assert!(
+            mem.recorded.is_some(),
+            "the own hold on the lane is recorded"
+        );
+
+        // The operator undrains.
+        lock(&coord).lane = None;
+        let action = account_hold_tick(&mut mem, &env).await;
+        assert!(
+            matches!(action, HoldAction::Nothing(Idle::OperatorUndrained { .. })),
+            "{action:?}"
+        );
+        account_hold_tick(&mut mem, &env).await;
+        assert!(
+            lock(&coord).holds.is_empty(),
+            "an operator undrain is never overridden before the recorded until"
+        );
     }
 
     /// `absent` while the read-back still shows the own reason: the hold is in

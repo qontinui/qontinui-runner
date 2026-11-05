@@ -138,9 +138,7 @@ impl LaneView {
     /// The own hold's `until`, when the lane is held by this module.
     fn own_until(&self) -> Option<Option<DateTime<Utc>>> {
         match self {
-            LaneView::Drained { until, reason } if is_own_reason(reason.as_deref()) => {
-                Some(*until)
-            }
+            LaneView::Drained { until, reason } if is_own_reason(reason.as_deref()) => Some(*until),
             _ => None,
         }
     }
@@ -190,6 +188,12 @@ pub(crate) struct HoldMemory {
     /// A 409 answered a write decided against this lane; no write until the
     /// lane reads differently.
     pub conflict_on: Option<LaneView>,
+    /// When that 409 was answered. The wait ends [`WRITE_BACKOFF`] after it even
+    /// if the lane never reads differently (a `lane_unreadable` whose record the
+    /// merged read never shows, or an operator drain whose `until` this clock
+    /// has passed and coord's has not). `None` with `conflict_on` set waits
+    /// until the lane changes.
+    pub conflict_since: Option<DateTime<Utc>>,
     /// No write before this (after a 401/403 or another refusal).
     pub backoff_until: Option<DateTime<Utc>>,
     /// Whether the refusal that set the backoff was already warned about.
@@ -211,10 +215,27 @@ impl HoldMemory {
         };
     }
 
-    /// A read lane that differs from the one a 409 answered ends the wait.
+    /// Fold one read lane. A lane that differs from the one a 409 answered ends
+    /// the wait. An own hold the lane shows is recorded, so a hold this process
+    /// did not see accepted — one left by the previous run, or one whose 200 was
+    /// lost to a transport error or the tick timeout — still marks a later
+    /// `Clear` as an operator undrain rather than as a lane to hold again.
     pub(crate) fn note_lane(&mut self, lane: &LaneView) {
         if self.conflict_on.as_ref().is_some_and(|c| c != lane) {
             self.conflict_on = None;
+            self.conflict_since = None;
+        }
+        if let Some(Some(until)) = lane.own_until() {
+            self.recorded = Some(match self.recorded {
+                Some(rec) => RecordedHold {
+                    until: rec.until.max(until),
+                    tenant_id: rec.tenant_id,
+                },
+                None => RecordedHold {
+                    until,
+                    tenant_id: None,
+                },
+            });
         }
         if self.release_left_to.is_some() && lane.own_until() != self.release_left_to {
             self.release_left_to = None;
@@ -252,7 +273,9 @@ pub(crate) enum Idle {
     DrainedByOther,
     /// The lane reads clear while the hold this process recorded is unexpired:
     /// an operator undrained. Respected until that `until`.
-    OperatorUndrained { until: DateTime<Utc> },
+    OperatorUndrained {
+        until: DateTime<Utc>,
+    },
     /// A 409 answered the last write against this same lane.
     WaitingOnConflict,
     /// Inside [`WRITE_BACKOFF`] after a refusal.
@@ -267,11 +290,17 @@ pub(crate) enum Idle {
 pub(crate) enum HoldAction {
     Nothing(Idle),
     /// A fresh hold.
-    Hold { until: DateTime<Utc> },
+    Hold {
+        until: DateTime<Utc>,
+    },
     /// Extend the own hold's deadline.
-    Renew { until: DateTime<Utc> },
+    Renew {
+        until: DateTime<Utc>,
+    },
     /// Release the own hold, first under `tenant` when one was recorded.
-    Release { tenant: Option<Uuid> },
+    Release {
+        tenant: Option<Uuid>,
+    },
 }
 
 /// A deadline [`HOLD_FOR`] from `now`, whole seconds (coord's repeat tolerance
@@ -304,8 +333,10 @@ pub(crate) fn decide_hold_action(mem: &HoldMemory, inp: &HoldInputs) -> HoldActi
     let own_until = lane.own_until();
 
     if ready {
-        // A release removes only this hold's own record, whatever the role, so
-        // it does not wait on the role arm below.
+        // A release removes only this hold's own record, so it does not wait on
+        // the role-closes-lane arm below. It does wait on an UNREAD role (above):
+        // coord omits the role when it could not read the lane, and a lane read
+        // coord could not make is no basis for a write.
         let Some(until) = own_until else {
             return Nothing(Idle::Ready);
         };
@@ -323,7 +354,11 @@ pub(crate) fn decide_hold_action(mem: &HoldMemory, inp: &HoldInputs) -> HoldActi
     if role != OPEN_ROLE {
         return Nothing(Idle::RoleClosesLane);
     }
-    if mem.conflict_on.as_ref() == Some(lane) {
+    if mem.conflict_on.as_ref() == Some(lane)
+        && mem
+            .conflict_since
+            .is_none_or(|since| inp.now < since + WRITE_BACKOFF)
+    {
         return Nothing(Idle::WaitingOnConflict);
     }
 
@@ -425,7 +460,11 @@ impl HoldReply {
             } => format!(
                 "200 held until {until} in tenant {} ({})",
                 tenant_id.map_or_else(|| "?".to_string(), |t| t.to_string()),
-                if *changed { "written" } else { "a repeat, nothing written" }
+                if *changed {
+                    "written"
+                } else {
+                    "a repeat, nothing written"
+                }
             ),
             HoldReply::Conflict { code } => format!("409 {code}"),
             HoldReply::Forbidden { status } => format!("{status} refused the credential"),
@@ -645,6 +684,7 @@ impl HoldMemory {
                     tenant_id: *tenant_id,
                 });
                 self.conflict_on = None;
+                self.conflict_since = None;
                 self.backoff_until = None;
                 self.refusal_warned = false;
                 self.release_left_to = None;
@@ -652,6 +692,7 @@ impl HoldMemory {
             }
             HoldReply::Conflict { .. } => {
                 self.conflict_on = Some(lane.clone());
+                self.conflict_since = Some(now);
                 HoldEffect::Conflict
             }
             HoldReply::Forbidden { .. } | HoldReply::Rejected { .. } => self.refused(now),
@@ -712,7 +753,9 @@ async fn read_readiness(env: &HoldEnv) -> Option<bool> {
     match qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(f).await {
         Ok(ready) => Some(ready),
         Err(e) => {
-            warn!("fleet::claude_account_hold: account read did not finish ({e}); skipping this tick");
+            warn!(
+                "fleet::claude_account_hold: account read did not finish ({e}); skipping this tick"
+            );
             None
         }
     }
@@ -782,6 +825,9 @@ pub(crate) async fn account_hold_tick(mem: &mut HoldMemory, env: &HoldEnv) -> Ho
         CoordDrainState::Clear | CoordDrainState::Drained { .. } => {}
     }
 
+    if mem.recorded.is_some_and(|r| r.until <= now) {
+        mem.recorded = None;
+    }
     inputs.ready = read_readiness(env).await;
     let Some(ready) = inputs.ready else {
         return HoldAction::Nothing(Idle::ReadinessUnread);
@@ -789,9 +835,16 @@ pub(crate) async fn account_hold_tick(mem: &mut HoldMemory, env: &HoldEnv) -> Ho
     mem.observe_readiness(ready);
     // Ready and the cached drain shows no own hold: there is nothing to
     // release, so the table can only say "nothing" — skip the read.
-    let cached_own =
-        matches!(&cached, CoordDrainState::Drained { reason, .. } if is_own_reason(reason.as_deref()));
-    if ready && !cached_own {
+    // A cached drain whose reason was never read (the boot read and the
+    // heartbeat's one refresh both failed) may be the own hold, and so may a
+    // hold this process recorded: read in both cases rather than leave the
+    // hold to its 24 h deadline.
+    let cached_maybe_own = matches!(
+        &cached,
+        CoordDrainState::Drained { reason, .. }
+            if reason.is_none() || is_own_reason(reason.as_deref())
+    );
+    if ready && !cached_maybe_own && mem.recorded.is_none() {
         return HoldAction::Nothing(Idle::Ready);
     }
 
@@ -934,7 +987,10 @@ async fn write_release(
             ReleaseReply::Answered { tenant_id, .. } => *tenant_id,
             _ => None,
         });
-        for other in (env.bound_tenants)().into_iter().filter(|t| Some(*t) != tried) {
+        for other in (env.bound_tenants)()
+            .into_iter()
+            .filter(|t| Some(*t) != tried)
+        {
             let Some(r) = post_release(base, Some(other)).await else {
                 return;
             };

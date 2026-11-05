@@ -1157,7 +1157,7 @@ fn device_request(
     method: reqwest::Method,
     url: &str,
 ) -> reqwest::RequestBuilder {
-    // coord-tenant-scope(device): every route sent through here (`me/drain`, `me/hold`, `me/release`) acts on the device the JWT was minted for; coord keys the drain row by device_id and the request carries no tenant field to set.
+    // coord-tenant-scope(device): only the `me/drain` READ is sent through here; it answers for the device the JWT was minted for and carries no tenant to set. The self-hold WRITES name their tenant (`post_device_json`).
     crate::auth::attach_device_auth(client.request(method, url))
 }
 
@@ -1203,6 +1203,12 @@ async fn send_device_json(
 /// `POST {base}{path}` with a JSON body under the device JWT → the status and
 /// body as coord gave them, or the transport failure. For the account hold's
 /// `me/hold` and `me/release`.
+///
+/// coord writes a self-hold into the drain map of the bearer's TENANT, so the
+/// bearer is the one the heartbeat presents ([`crate::fleet::LocalBindingSet::bearer_scope`]):
+/// the hold lands in the tenant the heartbeat reports the lane under, and a
+/// device whose legacy slot is dead still sends a live per-tenant token. With
+/// no binding set resolvable the default binding is the only choice left.
 pub(crate) async fn post_device_json(
     base: &str,
     path: &str,
@@ -1210,12 +1216,12 @@ pub(crate) async fn post_device_json(
 ) -> Result<(u16, String), String> {
     let url = format!("{}{path}", base.trim_end_matches('/'));
     let client = device_client()?;
-    send_device_json(
-        device_request(&client, reqwest::Method::POST, &url),
-        &url,
-        body,
-    )
-    .await
+    let scope = crate::fleet::resolve_heartbeat_binding_set()
+        .map(|b| b.bearer_scope())
+        .unwrap_or(crate::auth::TenantScope::Device);
+    let rb =
+        crate::auth::attach_device_auth_for(client.request(reqwest::Method::POST, &url), scope);
+    send_device_json(rb, &url, body).await
 }
 
 /// [`post_device_json`] under ONE named tenant's credential. A self-hold lives
