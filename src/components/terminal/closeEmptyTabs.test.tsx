@@ -14,6 +14,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 import {
   readOccupiedPageIds,
   closeEmptyPagesWith,
+  pageRemoval,
   type TerminalPageConfig,
 } from "./useTerminalPages";
 import { TerminalPageTabBar } from "./TerminalPageTabBar";
@@ -121,64 +122,154 @@ describe("closeEmptyPagesWith (the close loop)", () => {
   const pg = (id: string): TerminalPageConfig => ({ id, name: id, createdAt: 0 });
   const pages = [pg("a"), pg("b"), pg("c")];
 
-  it("closes only the pages that are empty on both reads", async () => {
-    const removed: string[] = [];
-    const n = await closeEmptyPagesWith(
-      pages,
-      async () => new Set(["a"]),
-      async (id) => {
-        removed.push(id);
+  /** The record-only removal over `read`, recording every page it drops. */
+  function removal(read: () => Promise<Set<string> | null>) {
+    const dropped: string[] = [];
+    const ops = pageRemoval(
+      {
+        markClosed: () => {},
+        dropRecord: (id) => {
+          dropped.push(id);
+          return true;
+        },
       },
+      read,
     );
-    expect(removed).toEqual(["b", "c"]);
+    return { dropped, removeEmpty: ops.removeEmptyPage };
+  }
+
+  it("closes only the pages that are empty on both reads", async () => {
+    const read = async () => new Set(["a"]);
+    const { dropped, removeEmpty } = removal(read);
+    const n = await closeEmptyPagesWith(pages, read, removeEmpty);
+    expect(dropped).toEqual(["b", "c"]);
     expect(n).toBe(2);
   });
 
   it("closes nothing when occupancy is unreadable", async () => {
-    const remove = vi.fn(async () => {});
+    const remove = vi.fn(async () => true);
     expect(await closeEmptyPagesWith(pages, async () => null, remove)).toBe(0);
     expect(remove).not.toHaveBeenCalled();
   });
 
   it("skips a page that became occupied between the first read and its turn", async () => {
-    const removed: string[] = [];
-    // read #1 picks candidates b and c; by the time b's per-page re-check runs,
-    // a terminal has landed on b.
+    // read #1 picks candidates b and c; by the time b's removal re-reads, a
+    // terminal has landed on b.
     const reads = [new Set(["a"]), new Set(["a", "b"]), new Set(["a", "b"])];
-    const n = await closeEmptyPagesWith(
-      pages,
-      async () => reads.shift() ?? null,
-      async (id) => {
-        removed.push(id);
-      },
-    );
-    expect(removed).toEqual(["c"]);
+    const read = async () => reads.shift() ?? null;
+    const { dropped, removeEmpty } = removal(read);
+    const n = await closeEmptyPagesWith(pages, read, removeEmpty);
+    expect(dropped).toEqual(["c"]);
     expect(n).toBe(1);
   });
 
   it("skips a page whose re-check cannot be read", async () => {
-    const removed: string[] = [];
     const reads: Array<Set<string> | null> = [new Set(["a"]), null, new Set(["a"])];
-    const n = await closeEmptyPagesWith(
-      pages,
-      async () => reads.shift() ?? null,
-      async (id) => {
-        removed.push(id);
-      },
-    );
-    expect(removed).toEqual(["c"]);
+    const read = async () => reads.shift() ?? null;
+    const { dropped, removeEmpty } = removal(read);
+    const n = await closeEmptyPagesWith(pages, read, removeEmpty);
+    expect(dropped).toEqual(["c"]);
     expect(n).toBe(1);
   });
 
   it("keeps one page when every visible page is empty", async () => {
-    const removed: string[] = [];
-    await closeEmptyPagesWith(
-      pages,
-      async () => new Set(),
-      async (id) => {
-        removed.push(id);
+    const read = async () => new Set<string>();
+    const { dropped, removeEmpty } = removal(read);
+    await closeEmptyPagesWith(pages, read, removeEmpty);
+    expect(dropped).toEqual(["b", "c"]);
+  });
+});
+
+/**
+ * The removals as the hook wires them (`pageRemoval`), over a fake runner whose
+ * terminal list moves between reads. "Close empty tabs" removes only a page's
+ * RECORD: a terminal that lands on a page after the candidates were picked keeps
+ * its page and is never closed — `removePage`, the explicit per-page close, would
+ * have killed it.
+ */
+describe("pageRemoval (record-only removal of empty pages)", () => {
+  const pg = (id: string): TerminalPageConfig => ({ id, name: id, createdAt: 0 });
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  /** A runner whose `terminal_list` answers `lists` in turn (the last repeats). */
+  function runner(lists: Array<Array<{ id: string; pageId: string }>>) {
+    const closed: string[] = [];
+    invokeMock.mockImplementation(async (cmd: string, args?: { terminalId?: string }) => {
+      if (cmd === "terminal_list") {
+        const terminals = lists.length > 1 ? lists.shift()! : lists[0];
+        return { success: true, data: { terminals } };
+      }
+      if (cmd === "terminal_session_list_open") return { data: { sessions: [] } };
+      if (cmd === "terminal_close") {
+        closed.push(String(args?.terminalId));
+        return { success: true };
+      }
+      throw new Error(`unexpected ${cmd}`);
+    });
+    return closed;
+  }
+
+  function store() {
+    const dropped: string[] = [];
+    return {
+      dropped,
+      store: {
+        markClosed: vi.fn(),
+        dropRecord: (id: string) => {
+          dropped.push(id);
+          return true;
+        },
       },
-    );
-    expect(removed).toEqual(["b", "c"]);
+    };
+  }
+
+  it("a terminal that lands on a page between the fresh read and the removal survives and keeps the page", async () => {
+    // Read #1 (the candidates) sees "b" empty; by "b"'s removal a terminal has
+    // landed there.
+    const closed = runner([
+      [{ id: "t-a", pageId: "a" }],
+      [
+        { id: "t-a", pageId: "a" },
+        { id: "landed", pageId: "b" },
+      ],
+    ]);
+    const { dropped, store: s } = store();
+    const n = await pageRemoval(s).closeEmptyPages([pg("a"), pg("b")]);
+    expect(n).toBe(0);
+    expect(dropped).toEqual([]);
+    expect(closed).toEqual([]);
+  });
+
+  it("removes an empty page's record and closes no terminal", async () => {
+    const closed = runner([[{ id: "t-a", pageId: "a" }]]);
+    const { dropped, store: s } = store();
+    expect(await pageRemoval(s).removeEmptyPage("b")).toBe(true);
+    expect(dropped).toEqual(["b"]);
+    // Nothing is being killed, so nothing needs guarding from the reconcile: a
+    // terminal that lands on "b" later gets its tab back.
+    expect(s.markClosed).not.toHaveBeenCalled();
+    expect(closed).toEqual([]);
+    expect(invokeMock.mock.calls.map((c) => c[0])).not.toContain("terminal_close");
+  });
+
+  it("keeps a page whose occupancy cannot be read", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "terminal_list") return { success: true, data: { terminals: [] } };
+      throw new Error("session list unreadable");
+    });
+    const { dropped, store: s } = store();
+    expect(await pageRemoval(s).removeEmptyPage("b")).toBe(false);
+    expect(dropped).toEqual([]);
+  });
+
+  it("removePage stays the explicit close: it kills the page's terminals", async () => {
+    const closed = runner([[{ id: "t-b", pageId: "b" }]]);
+    const { dropped, store: s } = store();
+    await pageRemoval(s).removePage("b");
+    expect(closed).toEqual(["t-b"]);
+    expect(dropped).toEqual(["b"]);
   });
 });

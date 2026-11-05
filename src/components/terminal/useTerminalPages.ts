@@ -124,7 +124,16 @@ function savePages(pages: TerminalPageConfig[]) {
 export function pageIdsFromTerminals(
   terminals: Array<{ pageId?: string; page_id?: string }>,
 ): string[] {
-  return terminals.map((t) => t.pageId || t.page_id || "default");
+  return terminals.map(terminalPageId);
+}
+
+/**
+ * The page one `terminal_list` entry sits on — the single reading of the wire
+ * field that {@link pageIdsFromTerminals} and the page reorganize share
+ * (`pageId`; see above for why `page_id` is only a fallback).
+ */
+export function terminalPageId(t: { pageId?: string; page_id?: string }): string {
+  return t.pageId || t.page_id || "default";
 }
 
 /**
@@ -449,27 +458,112 @@ export async function readOccupiedPageIds(bestEffort = false): Promise<Set<strin
  * The close loop behind "Close empty tabs", with its two effects injected so the
  * ordering is testable without React or Tauri.
  *
- * Occupancy is read once to pick candidates, then RE-READ immediately before
- * each close: a terminal may have landed on a candidate while earlier pages were
- * being removed (`removePage` kills the page's terminals, so a stale decision is
- * destructive). FAIL-CLOSED: an unreadable occupancy closes nothing. Returns how
- * many pages were closed.
+ * Occupancy is read once to pick candidates; each candidate then goes through
+ * `removeEmpty` ({@link PageRemoval.removeEmptyPage}), which re-reads occupancy
+ * at removal time and removes only the page's RECORD — a terminal that landed on
+ * a candidate after the first read keeps its page and is never closed.
+ * FAIL-CLOSED: an unreadable occupancy closes nothing. Returns how many pages
+ * were closed.
  */
 export async function closeEmptyPagesWith(
   visiblePages: TerminalPageConfig[],
   read: () => Promise<Set<string> | null>,
-  remove: (id: string) => Promise<void>,
+  removeEmpty: (id: string) => Promise<boolean>,
 ): Promise<number> {
   const ids = await read();
   if (!ids) return 0;
   let closed = 0;
   for (const id of emptyPageIds(visiblePages, ids)) {
-    const fresh = await read();
-    if (!fresh || fresh.has(id)) continue;
-    await remove(id);
-    closed++;
+    if (await removeEmpty(id)) closed++;
   }
   return closed;
+}
+
+/**
+ * The page-record half of a page's removal, owned by {@link useTerminalPages}
+ * and injected into {@link pageRemoval} so which PTYs each removal closes is
+ * testable without React.
+ */
+export interface PageRecordStore {
+  /**
+   * Guard `id` against the reconcile re-minting it as "Page N" while the
+   * backend still reports it — the PTYs `removePage` is killing. Called before
+   * any await of that close. `removeEmptyPage` never calls it: it kills
+   * nothing, so a terminal that lands on the id after it is the reconcile's to
+   * give a tab, not to hide.
+   */
+  markClosed: (id: string) => void;
+  /**
+   * Drop `id`'s record — its roster entry, its namespaced storage and, when it
+   * was active, the active-page pointer. Closes nothing. Returns false when the
+   * record was kept (the last remaining page is never removed).
+   */
+  dropRecord: (id: string) => boolean;
+}
+
+/** The two ways a page leaves the roster. */
+export interface PageRemoval {
+  /**
+   * The EXPLICIT per-page close (the tab bar's close): kills every PTY still on
+   * the page, then drops its record.
+   */
+  removePage: (id: string) => Promise<void>;
+  /**
+   * Record-only removal of a page that is empty NOW: re-reads occupancy (live
+   * terminals and restorable sessions) at removal time and keeps the page when
+   * it finds anything there or cannot read the sources. Closes no PTY, ever.
+   * Returns whether the page was removed.
+   */
+  removeEmptyPage: (id: string) => Promise<boolean>;
+  /** "Close empty tabs" over `visiblePages` — see {@link closeEmptyPagesWith}. */
+  closeEmptyPages: (visiblePages: TerminalPageConfig[]) => Promise<number>;
+}
+
+/**
+ * Build the page removals over `store`. `read` is the occupancy source
+ * (default {@link readOccupiedPageIds}); every programmatic removal — "Close
+ * empty tabs", runner#2325's `/close-empty-tabs`, the page reorganize — goes
+ * through `removeEmptyPage`, so none of them can kill a terminal that landed
+ * after it decided the page was empty. Only `removePage`, the operator's
+ * explicit close of one page, closes PTYs.
+ */
+export function pageRemoval(
+  store: PageRecordStore,
+  read: () => Promise<Set<string> | null> = readOccupiedPageIds,
+): PageRemoval {
+  const removeEmptyPage = async (id: string): Promise<boolean> => {
+    const occupied = await read();
+    if (!occupied || occupied.has(id)) return false;
+    return store.dropRecord(id);
+  };
+
+  const removePage = async (id: string): Promise<void> => {
+    // Mark closed BEFORE any await so a reconcile fired by the first
+    // `terminal-exit` cannot resurrect the page.
+    store.markClosed(id);
+    // Close all PTYs belonging to this page
+    try {
+      const result = await invoke<{
+        success: boolean;
+        data?: { terminals: Array<{ id: string; pageId?: string; page_id?: string }> };
+      }>("terminal_list");
+      if (result.success && result.data) {
+        const pageTerminals = result.data.terminals.filter((t) => terminalPageId(t) === id);
+        for (const t of pageTerminals) {
+          invoke("terminal_close", { terminalId: t.id }).catch(() => {});
+        }
+      }
+    } catch {
+      // Best effort
+    }
+    store.dropRecord(id);
+  };
+
+  return {
+    removePage,
+    removeEmptyPage,
+    closeEmptyPages: (visiblePages) => closeEmptyPagesWith(visiblePages, read, removeEmptyPage),
+  };
 }
 
 export function useTerminalPages() {
@@ -572,33 +666,16 @@ export function useTerminalPages() {
     [setActivePageId],
   );
 
-  const removePage = useCallback(async (id: string) => {
-    // Mark closed BEFORE any await so a reconcile fired by the first
-    // `terminal-exit` cannot resurrect the page.
-    // Never for "default" (the internal API-terminal home, not a closable tab)
-    // or the last remaining page (which `setPages` below refuses to remove).
+  // Never for "default" (the internal API-terminal home, not a closable tab)
+  // or the last remaining page (which `dropPageRecord` refuses to remove).
+  const markPageClosed = useCallback((id: string) => {
     if (id !== "default" && allPagesRef.current.length > 1) {
       closedPageIdsRef.current.add(id);
     }
-    // Close all PTYs belonging to this page
-    try {
-      const result = await invoke<{
-        success: boolean;
-        data?: { terminals: Array<{ id: string; pageId?: string; page_id?: string }> };
-      }>("terminal_list");
-      if (result.success && result.data) {
-        // TerminalInfo is `#[serde(rename_all = "camelCase")]`, so the wire
-        // field is `pageId` (the `page_id` fallback is defensive only).
-        const pageTerminals = result.data.terminals.filter(
-          (t) => (t.pageId || t.page_id || "default") === id,
-        );
-        for (const t of pageTerminals) {
-          invoke("terminal_close", { terminalId: t.id }).catch(() => {});
-        }
-      }
-    } catch {
-      // Best effort
-    }
+  }, []);
+
+  const dropPageRecord = useCallback((id: string): boolean => {
+    if (allPagesRef.current.length <= 1) return false; // Can't remove last page
 
     // Clean up namespaced instanceStorage keys
     if (id !== "default") {
@@ -606,6 +683,8 @@ export function useTerminalPages() {
       instanceStorage.removeByPrefix(prefix);
     }
 
+    // Eagerly, so a removal loop sees the roster shrink before React renders.
+    allPagesRef.current = allPagesRef.current.filter((p) => p.id !== id);
     setPages((prev) => {
       if (prev.length <= 1) return prev; // Can't remove last page
       const updated = prev.filter((p) => p.id !== id);
@@ -616,28 +695,37 @@ export function useTerminalPages() {
     // Switch to another page if active was deleted
     setActivePageIdState((currentActive) => {
       if (currentActive === id) {
-        // We need to find the first page that isn't the removed one
-        // Use loadPages() to get the latest from storage after setPages runs
         const fallback = "default";
         instanceStorage.setItem(ACTIVE_PAGE_KEY, fallback);
         return fallback;
       }
       return currentActive;
     });
+    return true;
   }, []);
+
+  // Built inside each handler, never during render: the record store closes
+  // over refs.
+  const removal = useCallback(
+    () => pageRemoval({ markClosed: markPageClosed, dropRecord: dropPageRecord }),
+    [markPageClosed, dropPageRecord],
+  );
+  const removePage = useCallback((id: string) => removal().removePage(id), [removal]);
+  const removeEmptyPage = useCallback((id: string) => removal().removeEmptyPage(id), [removal]);
 
   /**
    * Close every docked page that hosts no terminal ("Close empty tabs").
    *
    * Occupancy is re-read from the backend rather than trusting the cached
    * `occupiedPageIds` (a terminal may have landed since the last debounced
-   * reconcile). FAIL-CLOSED: if either source cannot be read, occupancy is
-   * UNKNOWN and nothing is closed — an unread source must not read as "empty".
-   * Returns the number of pages closed.
+   * reconcile), and again by `removeEmptyPage` at each page's removal, which
+   * drops only the page's record. FAIL-CLOSED: if either source cannot be read,
+   * occupancy is UNKNOWN and nothing is closed — an unread source must not read
+   * as "empty". Returns the number of pages closed.
    */
   const closeEmptyPages = useCallback(
-    () => closeEmptyPagesWith(visiblePagesRef.current, readOccupiedPageIds, removePage),
-    [removePage],
+    () => removal().closeEmptyPages(visiblePagesRef.current),
+    [removal],
   );
 
   const renamePage = useCallback((id: string, name: string) => {
@@ -900,7 +988,10 @@ export function useTerminalPages() {
     setActivePageId,
     addPage,
     openPage,
+    /** The explicit per-page close — kills the page's PTYs (see {@link PageRemoval}). */
     removePage,
+    /** Record-only removal of a page empty at removal time — closes no PTY. */
+    removeEmptyPage,
     closeEmptyPages,
     /** Tabs the Close-empty button would close, per the last-known occupancy (a hint; the click re-reads). */
     emptyPageCount,

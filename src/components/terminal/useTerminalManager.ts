@@ -11,6 +11,7 @@ import {
 import { createLogger } from "@/lib/logger";
 import { spawnWithResourceGuard, type ResourceGuardSource } from "@/lib/resourceGuard";
 import { applyRemoteMark, type RemoteTabIdentity } from "./remoteTabs";
+import { markPageMoveListening } from "./pageMoveListeners";
 import {
   EMPTY_HIDDEN_WORKER_STATE,
   beginRestore,
@@ -47,10 +48,7 @@ export function renameTabIn(tabs: TerminalTab[], id: string, title: string): Ter
  * name is immutable — and returns the SAME array when nothing changed so
  * callers do not churn renders.
  */
-export function applySpawnNames(
-  tabs: TerminalTab[],
-  names: Record<string, string>,
-): TerminalTab[] {
+export function applySpawnNames(tabs: TerminalTab[], names: Record<string, string>): TerminalTab[] {
   let changed = false;
   const next = tabs.map((t) => {
     if (t.spawnName) return t;
@@ -576,6 +574,25 @@ export type SessionIdsByTerminal = Record<
   string,
   { claudeSessionId?: string; configDir?: string | null }
 >;
+
+/**
+ * The remote identity the runner holds for `terminalId`, or `undefined` for a
+ * local tab — and for a failed read, which leaves the tab un-badged (UNKNOWN)
+ * rather than mis-badged.
+ */
+async function remoteIdentityOf(terminalId: string): Promise<RemoteTabIdentity | undefined> {
+  try {
+    const r = await invoke<CommandResponse>("terminal_remote_identities");
+    if (r.success && r.data && typeof r.data === "object") {
+      return (r.data as Record<string, RemoteTabIdentity>)[terminalId];
+    }
+  } catch (err) {
+    logger.warn(
+      `terminal_remote_identities failed; moved tab ${terminalId} stays un-badged: ${err}`,
+    );
+  }
+  return undefined;
+}
 
 /**
  * Attach `claudeSessionId` (and `claudeConfigDir`) to any tab that is
@@ -1117,8 +1134,13 @@ export function useTerminalManager(
   //   - SOURCE page (holds the tab, but is no longer its page) → evict the tab
   //     (unmount) WITHOUT calling `terminal_close`: the PTY lives on and now
   //     belongs to the target page.
+  // Once registered, the listener is recorded in `pageMoveListeners`, which a
+  // mover (the page reorganize) waits on before moving a tab onto a page it has
+  // just created — a move made before this page listens is adopted by nobody.
   useEffect(() => {
     let unlisten: (() => void) | null = null;
+    let releaseListening: (() => void) | null = null;
+    let disposed = false;
     listen<{ id: string; pageId: string }>("terminal-page-changed", (event) => {
       const { id, pageId: targetPageId } = event.payload;
       if (!id) return;
@@ -1127,16 +1149,29 @@ export function useTerminalManager(
         // Adopt onto THIS (target) page. `reduceCreatedTerminal` dedups by id,
         // so an idempotent re-delivery for a tab we already hold is a no-op.
         invoke<CommandResponse>("terminal_list")
-          .then((result) => {
+          .then(async (result) => {
             if (!result.success || !result.data) return;
             const terminals = (result.data as { terminals: TerminalInfo[] }).terminals;
             const info = terminals.find((t) => t.id === id);
             if (!info) return;
+            // A moved tab arrives WITH its identity, not 30s later from the
+            // reconcile sweep: the durable session id from this same response
+            // (a moved AI session that reads as a plain shell is Keep AI's to
+            // close), and a remote tab's identity, which `TerminalInfo` cannot
+            // carry (an unbadged remote tab reads as a local one).
+            const sessionIds =
+              (result.data as { sessionIdsByTerminal?: SessionIdsByTerminal })
+                .sessionIdsByTerminal ?? {};
             const pendingBypass = pendingBypassMarks.current.has(id);
             if (pendingBypass) pendingBypassMarks.current.delete(id);
-            const pendingRemote = pendingRemoteMarks.current.get(id);
-            if (pendingRemote !== undefined) pendingRemoteMarks.current.delete(id);
-            setTabs((prev) => reduceCreatedTerminal(prev, info, pendingBypass, pendingRemote));
+            let remote = pendingRemoteMarks.current.get(id);
+            if (remote !== undefined) pendingRemoteMarks.current.delete(id);
+            else remote = await remoteIdentityOf(id);
+            setTabs((prev) =>
+              backfillClaudeSessionIds(reduceCreatedTerminal(prev, info, pendingBypass, remote), {
+                [id]: sessionIds[id],
+              }),
+            );
             ingestedIds.current.add(id);
             setActiveId(id);
             logger.info(`Terminal ${id} moved onto page ${pageId}`);
@@ -1159,10 +1194,19 @@ export function useTerminalManager(
         });
       }
     }).then((fn) => {
+      // Unmounted before the registration resolved: drop it rather than leak a
+      // listener that would still adopt and evict for a page that is gone.
+      if (disposed) {
+        fn();
+        return;
+      }
       unlisten = fn;
+      releaseListening = markPageMoveListening(pageId);
     });
     return () => {
+      disposed = true;
       unlisten?.();
+      releaseListening?.();
     };
   }, [pageId]);
 
