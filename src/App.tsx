@@ -374,16 +374,6 @@ function AppContent() {
         }
       }
 
-      // Rename existing pages to match the proposal. `renamePage` refuses a
-      // name another page already carries, so a page `addPage` had to call
-      // "<name> 2" keeps that name rather than colliding.
-      for (const group of plan.pages) {
-        const pageId = pageNameToId.get(group.name);
-        if (pageId) {
-          terminalPages.renamePage(pageId, group.name);
-        }
-      }
-
       // Remove pages that are now empty (no sessions assigned to them)
       const assignedPageIds = new Set(
         plan.pages.map((g) => pageNameToId.get(g.name)).filter(Boolean),
