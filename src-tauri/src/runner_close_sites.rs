@@ -13,7 +13,7 @@
 //!
 //! * `TerminalManager::close` or `close_all`;
 //! * a session-level close (`TerminalSession::close`, `close_with_deadline`,
-//!   `close_kill_only`, `close_after_graceful_exit`);
+//!   `close_kill_only`, `close_after_graceful_exit`, `close_for_handoff`);
 //! * the graceful-exit primitive (`TerminalManager::graceful_exit`);
 //! * a relay end: the `remote_terminal_end` frame a source sends.
 //!
@@ -202,6 +202,7 @@ const PRIMITIVE_IMPLS: &[(&str, &str, &str)] = &[
         "close_with_deadline",
     ),
     ("terminal/session.rs", "TerminalSession", "close_kill_only"),
+    ("terminal/session.rs", "TerminalSession", "close_for_handoff"),
     (
         "terminal/session.rs",
         "TerminalSession",
@@ -215,7 +216,12 @@ const PRIMITIVE_IMPLS: &[(&str, &str, &str)] = &[
 ];
 
 /// The session-level close entry points, which must stay terminal-only.
-const SESSION_LEVEL_CLOSES: &[&str] = &["close", "close_with_deadline", "close_kill_only"];
+const SESSION_LEVEL_CLOSES: &[&str] = &[
+    "close",
+    "close_with_deadline",
+    "close_kill_only",
+    "close_for_handoff",
+];
 
 /// The file that defines the close authority, and the type's name.
 const AUTHORITY_FILE: &str = "terminal/close_authority.rs";
@@ -1161,6 +1167,7 @@ fn close_families() -> Vec<(&'static str, Vec<Pattern>)> {
             vec![
                 pat(r"\.\s*close_with_deadline\s*\(", Scope::Anywhere),
                 pat(r"\.\s*close_kill_only\s*\(", Scope::Anywhere),
+                pat(r"\.\s*close_for_handoff\s*\(", Scope::Anywhere),
                 pat(r"\.\s*close_after_graceful_exit\s*\(", Scope::Anywhere),
                 pat(
                     r"\b(?:session|self)\s*\.\s*close\s*\(\s*\)",

@@ -5213,7 +5213,9 @@ impl TerminalSession {
     /// exactly as by [`Self::close_with_deadline`]. Plan
     /// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
     /// D2.
-    pub(crate) fn close_for_handoff(&self, deadline: Option<std::time::Instant>) -> HandoffOutcome {
+    ///
+    /// `pub(super)` — see [`Self::close`].
+    pub(super) fn close_for_handoff(&self, deadline: Option<std::time::Instant>) -> HandoffOutcome {
         self.close_inner(deadline, CloseKind::Handoff)
     }
 
@@ -5499,7 +5501,7 @@ impl TerminalSession {
     /// which the holder reads as a detach, so the process lives on UNCONFIRMED.
     /// The caller must not let the session DROP afterwards — a drop of a live
     /// session closes it, and that close kills.
-    pub(crate) fn abandon_for_handoff(&self) -> HandoffOutcome {
+    pub(super) fn abandon_for_handoff(&self) -> HandoffOutcome {
         let holder_pid = self.io.holder_handoff().map(|h| h.holder_pid).unwrap_or(0);
         CloseIntent::Handoff.store(&self.close_intent);
         if let Some(store) = self.lifecycle_store() {

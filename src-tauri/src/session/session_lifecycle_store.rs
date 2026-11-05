@@ -8207,7 +8207,7 @@ mod tests {
         // D5: the adopted pane's row is still the ONE restore candidate for its
         // session — not closed, so not dropped, and not duplicated.
         let offered: Vec<String> = store
-            .restorable_records(chrono::Utc::now().timestamp_millis(), None, false, None)
+            .restorable_records(None, false)
             .into_iter()
             .map(|r| r.claude_session_id)
             .collect();

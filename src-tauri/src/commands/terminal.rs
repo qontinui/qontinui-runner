@@ -312,13 +312,22 @@ pub(crate) fn rebind_adopted_terminal(
         .inner()
         .clone();
     let resume_registry = registry.clone();
+    // Re-key the resumed row to the harness session id this pane's process was
+    // pinned to at spawn, exactly as `terminal_create`'s resume arm does (plan
+    // 2026-10-23-a-hookless-resume-in-a-runner-pane-leaves-the-session-with-no-active-coord-row,
+    // Phase 2): the adopted pane runs the very same process.
+    let pinned_session_id = Some(session.pinned_session_id().to_string());
     rebind_adopted_coord_session(
         &session,
         &pane_store,
         intent_sharing_from_settings(),
         move |prior, intent| {
-            tauri::async_runtime::block_on(resume_registry.resume_external(prior, intent))
-                .map_err(|e| e.to_string())
+            tauri::async_runtime::block_on(resume_registry.resume_external(
+                prior,
+                intent,
+                pinned_session_id,
+            ))
+            .map_err(|e| e.to_string())
         },
         // The resumed row's registry record carries the binding's tenant and
         // intent, which `wire_coord_session` reads back and re-records.
