@@ -496,6 +496,36 @@ fn pty_holder_long_pane_dir_spawns_connects_and_readopts() {
     let _ = common::remove_pane_dir(&base);
 }
 
+/// Review: a client reaches a holder on a later candidate (here a
+/// pre-Phase-4 holder's `<pane-dir>/<pane-id>.sock`) past a refused socket
+/// file at the preferred path — a dead holder's leftover.
+#[cfg(unix)]
+#[test]
+fn pty_holder_connect_passes_a_refused_socket_for_a_later_candidate() {
+    use std::os::unix::net::UnixListener;
+    let dir = pane_dir("cand");
+    make_private_dir(&dir);
+    let pane = pid("p1");
+    // A dead socket at the preferred path: bound, then its listener dropped.
+    let preferred = socket_path(&dir, &pane).unwrap();
+    let _ = std::fs::remove_file(&preferred);
+    drop(UnixListener::bind(&preferred).unwrap());
+    assert!(preferred.exists());
+    // A live listener at the legacy path.
+    let legacy = dir.join("p1.sock");
+    let listener = UnixListener::bind(&legacy).unwrap();
+    let accepted = std::thread::spawn(move || listener.accept().is_ok());
+    qontinui_pty_holder::transport::connect(&dir, &pane, soon())
+        .expect("the legacy listener is reached");
+    assert!(accepted.join().unwrap());
+    // With nothing listening anywhere, the refusal is what is reported.
+    let _ = std::fs::remove_file(&legacy);
+    let e = qontinui_pty_holder::transport::connect(&dir, &pane, soon()).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::ConnectionRefused, "{e}");
+    let _ = std::fs::remove_file(&preferred);
+    let _ = common::remove_pane_dir(&dir);
+}
+
 /// A held lock with no endpoint (a holder between lock and bind, or one that
 /// lost its endpoint) is UNKNOWN — never Dead, never Absent, never Healthy.
 #[test]
