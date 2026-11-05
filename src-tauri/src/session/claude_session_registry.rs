@@ -239,8 +239,12 @@ pub fn live_pids_from_snapshot(
 /// A `<pid>.json` named for a live pid whose image could host Claude Code
 /// ([`may_host_claude`]) that could not be read or parsed. The session that pid
 /// hosts is then UNKNOWN. Claude Code rewrites the file on every status
-/// change, so this may be a write caught mid-way and gone on the next read —
-/// a read that refuses is retried by its caller's next poll, never here.
+/// change, so this may be a write caught mid-way and gone on the next read.
+/// Nothing here reads it again. A caller that polls (the lifecycle poll's
+/// identity refresh, the identity reporter) reads it on its next tick, but a
+/// caller that reads once — the cold-restore drain, the profile resume —
+/// fails that restore closed on one torn read: it skips the sessions it
+/// cannot prove are not live rather than risk forking one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnreadableRecord {
     pub path: std::path::PathBuf,
@@ -791,8 +795,8 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// A LIVE pid's record that cannot be parsed, even on the second read,
-    /// leaves the session that pid hosts unknown: the read reports the file
+    /// A LIVE pid's record that cannot be parsed leaves the session that pid
+    /// hosts unknown: the read reports the file
     /// and `complete()` refuses, so no caller reads that live session as
     /// closed. A corrupt file for a pid that is NOT live is a stale record and
     /// leaves the read complete.

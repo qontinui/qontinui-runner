@@ -2175,8 +2175,9 @@ pub fn terminal_report_bridge_registration_failure(
 ///
 /// `data` is `{ sessions, unlistable, unreadableRecords }`. The two trailing
 /// lists name what the read could NOT see — `sessions/` dirs that exist and
-/// cannot be listed, and live pids' records that could not be read twice
-/// running — and while either is non-empty a session MISSING from `sessions`
+/// cannot be listed, and records named for live pids that could host Claude
+/// Code that could not be read or parsed — and while either is non-empty a
+/// session MISSING from `sessions`
 /// may still be live. The read still succeeds then, because its two kinds of
 /// caller need different things from it: the unattended restore paths treat
 /// an incomplete read as indeterminate (`fetchLiveClaudeSessionIds` returns

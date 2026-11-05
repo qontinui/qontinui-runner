@@ -153,10 +153,11 @@ pub enum RecordReading {
     /// No `<pid>.json` in any config dir, and every `sessions/` dir was
     /// listed — a positive absence.
     Missing,
-    /// No `<pid>.json` in any dir that COULD be listed, while at least one
-    /// `<dir>/sessions` exists and could not be ([`UnlistableSessionsDir`]).
-    /// The record may well be in that dir, so this is UNKNOWN — never
-    /// [`Self::Missing`].
+    /// No record of THIS process in any dir that COULD be listed — none at
+    /// all, or only an earlier holder's — while at least one `<dir>/sessions`
+    /// exists and could not be ([`UnlistableSessionsDir`]). The live
+    /// process's record may well be in that dir, so this is UNKNOWN — never
+    /// [`Self::Missing`] or [`Self::PidReused`].
     Unlisted,
     /// A file exists but could not be read, did not parse, or named a
     /// different pid.
@@ -501,8 +502,9 @@ pub struct RecordReadings {
     /// One reading per pid asked about.
     pub by_pid: HashMap<u32, RecordReading>,
     /// Every `sessions/` dir that exists but could not be listed. While this
-    /// is non-empty no pid reads [`RecordReading::Missing`]: one with no
-    /// record in the dirs that WERE listed reads [`RecordReading::Unlisted`].
+    /// is non-empty no pid reads [`RecordReading::Missing`] or
+    /// [`RecordReading::PidReused`]: one with no record of its own process in
+    /// the dirs that WERE listed reads [`RecordReading::Unlisted`].
     pub unlistable: Vec<UnlistableSessionsDir>,
 }
 
@@ -622,8 +624,13 @@ pub fn read_records(
                 None => RecordReading::Missing,
                 Some(candidates) => read_one(live, candidates, proc_start, depth),
             };
+            // While a dir is unlistable, "no record of THIS process in the
+            // dirs that listed" is all `Missing` and `PidReused` can say: the
+            // live process's own record may sit in the dir nobody could read.
             let reading = match reading {
-                RecordReading::Missing if !unlistable.is_empty() => RecordReading::Unlisted,
+                RecordReading::Missing | RecordReading::PidReused if !unlistable.is_empty() => {
+                    RecordReading::Unlisted
+                }
                 other => other,
             };
             (live.pid, reading)
@@ -1311,6 +1318,44 @@ mod tests {
             classify_from_record(&readings.by_pid[&12], NOW),
             Activity::Unknown
         );
+    }
+
+    /// While a dir is unlistable, an earlier holder's record in a dir that
+    /// did list is `Unlisted`, not `PidReused`: it says nothing about the live
+    /// process, whose own record may be in the dir nobody could read. Not
+    /// gated: a `sessions` that is not a directory is unlistable to root too.
+    #[test]
+    fn a_reused_record_is_unlisted_while_another_dir_is_unlistable() {
+        let root = scratch("reused-unlisted");
+        let listed = root.path().join(".claude-a");
+        std::fs::create_dir_all(listed.join("sessions")).unwrap();
+        std::fs::write(
+            listed.join("sessions/70.json"),
+            r#"{"pid":70,"sessionId":"old","status":"idle","procStart":"400"}"#,
+        )
+        .unwrap();
+        let broken = root.path().join(".claude-file");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("sessions"), "not a directory").unwrap();
+        let kernel = |_: u32| Some("500".to_string());
+        let readings = read_records(
+            &[listed.clone()],
+            &[live(70)],
+            &kernel,
+            RecordDepth::Identity,
+        );
+        assert_eq!(
+            readings.by_pid[&70],
+            RecordReading::PidReused,
+            "every dir listed"
+        );
+        let readings = read_records(
+            &[listed, broken],
+            &[live(70)],
+            &kernel,
+            RecordDepth::Identity,
+        );
+        assert_eq!(readings.by_pid[&70], RecordReading::Unlisted);
     }
 
     /// A record listed and then deleted before it could be opened (its

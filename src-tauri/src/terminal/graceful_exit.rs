@@ -79,7 +79,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -429,7 +429,7 @@ static UNLISTABLE_SESSIONS_LOG: claude_activity::UnlistableLog = claude_activity
 /// `claude` too, WHATEVER its image. The records are read through
 /// [`claude_activity::read_records`] over the runner's known config dirs
 /// ([`crate::terminal::transcript::find_claude_config_dirs`]), plus the
-/// runner's own `$HOME/.claude` when it holds a `sessions/` dir, plus the own
+/// default config home (`<home>/.claude`) when it holds a `sessions/` dir, plus the own
 /// `CLAUDE_CONFIG_DIR` of each candidate whose image could be a JS runtime
 /// ([`crate::process_capture::process_tree::config_dir_of_pid`]).
 ///
@@ -438,10 +438,10 @@ static UNLISTABLE_SESSIONS_LOG: claude_activity::UnlistableLog = claude_activity
 /// | reading | the pid |
 /// |---|---|
 /// | `Parsed`, `Ambiguous` | a live `claude`, whatever its image: a record names it as the SAME process |
-/// | `PidReused` | judged by its image: `procStart` disagrees with the kernel, or `startedAt` predates the process — an earlier holder's record |
+/// | `PidReused` (every dir listed) | judged by its image: `procStart` disagrees with the kernel, or `startedAt` predates the process — an earlier holder's record |
 /// | `Missing` | judged by its image (see the residual below) |
 /// | `LateStamp`, `Unparseable` | UNDECIDED: either may be the live process's own record |
-/// | `Unlisted` (no record in any dir that listed, and some dir did not) | UNDECIDED |
+/// | `Unlisted` (no record of THIS process — none, or only an earlier holder's — in any dir that listed, and some dir did not) | UNDECIDED |
 /// | the read failed or overran its budget | UNDECIDED, for every pid |
 ///
 /// A record found in a dir that DID list still decides while another dir
@@ -472,7 +472,7 @@ static UNLISTABLE_SESSIONS_LOG: claude_activity::UnlistableLog = claude_activity
 /// reads `Missing`. Discovery keeps only a home with a `projects/` dir, and on
 /// Linux finds a `~/.claude-*` home only through the account roster (the
 /// directory scan is `C:/claude/.claude-*`). The two extra dirs narrow that:
-/// `$HOME/.claude` covers a first session in the default home before it has a
+/// the default config home covers a first session there before it has a
 /// `projects/` dir, and on Linux a candidate's own `CLAUDE_CONFIG_DIR` covers
 /// any home it names. A `node` claude whose record sits under a home that is
 /// neither — off Linux, under an undiscovered non-default home, or with an
@@ -632,18 +632,26 @@ fn with_pid_config_dirs(
     dirs
 }
 
-/// `dirs` plus `<home>/.claude` when it holds a `sessions/` dir and is not
-/// already listed. Discovery keeps only a home with a `projects/` dir, so the
-/// default home's FIRST session — whose `projects/` may not exist yet, and
-/// which carries no `CLAUDE_CONFIG_DIR` to name it — would otherwise be read
-/// nowhere. Blocking file I/O (one `is_dir`).
-fn with_default_home(mut dirs: Vec<PathBuf>, home: Option<&Path>) -> Vec<PathBuf> {
-    if let Some(default_home) = home.map(|home| home.join(".claude")) {
+/// `dirs` plus the DEFAULT Claude config home (`<home>/.claude`) when it holds
+/// a `sessions/` dir and is not already listed. Discovery keeps only a home
+/// with a `projects/` dir, so the default home's FIRST session — whose
+/// `projects/` may not exist yet, and which carries no `CLAUDE_CONFIG_DIR` to
+/// name it — would otherwise be read nowhere. Blocking file I/O (one
+/// `is_dir`).
+fn with_default_home(mut dirs: Vec<PathBuf>, default_home: Option<PathBuf>) -> Vec<PathBuf> {
+    if let Some(default_home) = default_home {
         if !dirs.contains(&default_home) && default_home.join("sessions").is_dir() {
             dirs.push(default_home);
         }
     }
     dirs
+}
+
+/// The default Claude config home, through the runner's one resolver for it
+/// (`commands::terminal::claude_default_config_home`, the allowlisted seam for
+/// reading the user's home — see `ambient`'s `USER_GLOBAL_DIRS_ALLOWLIST`).
+fn default_config_home() -> Option<PathBuf> {
+    crate::commands::terminal::claude_default_config_home().map(PathBuf::from)
 }
 
 /// Read the witness for `candidates` from `config_dirs`. Blocking file I/O.
@@ -709,22 +717,48 @@ fn registry_witness_from(
 /// async executor, bounded by [`REGISTRY_READ_TIMEOUT`] and
 /// [`MAX_REGISTRY_READS_IN_FLIGHT`]. A look whose subtrees hold only `claude`
 /// images needs no read and takes none. Private: [`PaneLook::take`] is the
-/// door.
+/// door. A thin wrapper naming production's sources for
+/// [`read_registry_witness_over`].
 async fn read_registry_witness(roots: &[u32], snapshot: &ProcessSnapshot) -> RegistryWitness {
+    read_registry_witness_over(
+        roots,
+        snapshot,
+        crate::terminal::transcript::find_claude_config_dirs,
+        default_config_home,
+        crate::process_capture::process_tree::config_dir_of_pid,
+        claude_activity::proc_start_ticks,
+    )
+    .await
+}
+
+/// [`read_registry_witness`] with where it looks injected: the discovered
+/// config dirs, the default config home (read when it holds a `sessions/`
+/// dir) and a pid's own `CLAUDE_CONFIG_DIR` (asked only of the candidates
+/// whose image could be a JS runtime).
+async fn read_registry_witness_over<F, H, E>(
+    roots: &[u32],
+    snapshot: &ProcessSnapshot,
+    discovered: F,
+    default_home: H,
+    pid_config_dir: E,
+    proc_start: fn(u32) -> Option<String>,
+) -> RegistryWitness
+where
+    F: FnOnce() -> Vec<PathBuf> + Send + 'static,
+    H: FnOnce() -> Option<PathBuf> + Send + 'static,
+    E: Fn(u32) -> Option<String> + Send + 'static,
+{
     read_registry_witness_with(
         roots,
         snapshot,
-        |js_runtime_pids: &[u32]| {
+        move |js_runtime_pids: &[u32]| {
             with_pid_config_dirs(
-                with_default_home(
-                    crate::terminal::transcript::find_claude_config_dirs(),
-                    dirs::home_dir().as_deref(),
-                ),
+                with_default_home(discovered(), default_home()),
                 js_runtime_pids,
-                crate::process_capture::process_tree::config_dir_of_pid,
+                pid_config_dir,
             )
         },
-        claude_activity::proc_start_ticks,
+        proc_start,
         REGISTRY_READ_TIMEOUT,
         &REGISTRY_READS_IN_FLIGHT,
     )
@@ -1916,31 +1950,97 @@ mod tests {
         );
     }
 
-    /// The runner's own `$HOME/.claude` is read when it holds a `sessions/`
-    /// dir, even when discovery skipped it (no `projects/` yet), so the
-    /// default home's first npm session is seen. Without a `sessions/` dir, or
-    /// already listed, it adds nothing.
+    /// The default config home (`<home>/.claude`) is read when it holds a
+    /// `sessions/` dir, even when discovery skipped it (no `projects/` yet),
+    /// so the default home's first npm session is seen. Without a `sessions/`
+    /// dir, or already listed, it adds nothing.
     #[test]
     fn the_default_home_is_read_when_it_holds_a_sessions_dir() {
         let home = tempfile::tempdir().unwrap();
         let default_home = home.path().join(".claude");
         let other = PathBuf::from("/elsewhere/.claude-x");
         assert_eq!(
-            with_default_home(vec![other.clone()], Some(home.path())),
+            with_default_home(vec![other.clone()], Some(default_home.clone())),
             vec![other.clone()],
             "no sessions/ dir yet: nothing to read"
         );
         std::fs::create_dir_all(default_home.join("sessions")).unwrap();
         assert_eq!(
-            with_default_home(vec![other.clone()], Some(home.path())),
+            with_default_home(vec![other.clone()], Some(default_home.clone())),
             vec![other, default_home.clone()]
         );
         assert_eq!(
-            with_default_home(vec![default_home.clone()], Some(home.path())),
+            with_default_home(vec![default_home.clone()], Some(default_home.clone())),
             vec![default_home],
             "already discovered: listed once"
         );
         assert!(with_default_home(Vec::new(), None).is_empty());
+    }
+
+    /// The read's own wiring, over a temp default home: the default home is
+    /// read (its npm record makes the `node` live), and only the JS-runtime
+    /// candidate is asked for its own `CLAUDE_CONFIG_DIR` — not the shell, not
+    /// the compiler.
+    #[tokio::test]
+    async fn the_read_wires_the_default_home_and_asks_only_js_runtimes_for_their_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let default_home = config_dir(home.path(), ".claude", &[(NODE, npm_record(NODE, 20))]);
+        let asked: Arc<Mutex<Vec<u32>>> = Arc::default();
+        let asked_by_read = Arc::clone(&asked);
+        let snap = snapshot(&[
+            (100, 1, "bash", 10),
+            (NODE, 100, "node", 20),
+            (220, 100, "rustc", 22),
+        ]);
+        let witness = read_registry_witness_over(
+            &[100],
+            &snap,
+            Vec::new,
+            move || Some(default_home),
+            move |pid| {
+                asked_by_read.lock().unwrap().push(pid);
+                None
+            },
+            no_kernel,
+        )
+        .await;
+        assert_eq!(
+            probe_from_snapshot(100, &snap, &[], &witness),
+            readable(&[id(NODE, 20)], 0, &[]),
+            "the default home's record was read"
+        );
+        assert_eq!(*asked.lock().unwrap(), vec![NODE]);
+    }
+
+    /// While another dir cannot be listed, a stale record an EARLIER holder of
+    /// the pid left in a dir that did list says nothing about the live
+    /// process: its own record may sit in the unlistable dir, so the npm
+    /// session reads UNKNOWN, never `absent`.
+    #[tokio::test]
+    async fn a_reused_record_beside_an_unlistable_dir_reads_unknown() {
+        fn kernel_disagrees(_: u32) -> Option<String> {
+            Some("500".to_string())
+        }
+        let root = tempfile::tempdir().unwrap();
+        let stale = config_dir(
+            root.path(),
+            ".claude-a",
+            &[(
+                NODE,
+                format!(r#"{{"pid":{NODE},"sessionId":"old","status":"idle","procStart":"400"}}"#),
+            )],
+        );
+        let broken = root.path().join(".claude-file");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("sessions"), "not a directory").unwrap();
+        let pane = node_pane(vec![stale, broken], kernel_disagrees);
+        assert!(
+            matches!(
+                probe_claude_under(Some(pane.root_pid), vec![]).await,
+                ClaudeProbe::Unreadable(_)
+            ),
+            "a reused record must not settle the npm session absent"
+        );
     }
 
     /// Only a candidate whose image could be a JS runtime has its environment
