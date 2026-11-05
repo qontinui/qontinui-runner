@@ -75,8 +75,9 @@ export interface PruneGuards {
  * (no live terminal, no restorable record). The caller passes only a COMPLETE
  * occupancy read.
  *
- * At least one page other than `default` always survives: if every one of
- * them is a candidate, the first is kept, so the strip never goes blank.
+ * At least one DOCKED page other than `default` always survives (pages bound
+ * to a pop-out do not count: the strip cannot show them): if every one of them
+ * is a candidate, the first is kept, so the strip never goes blank.
  */
 export function prunablePageIds(
   pages: readonly TerminalPageConfig[],
@@ -92,8 +93,8 @@ export function prunablePageIds(
       guards.now - p.createdAt >= PRUNE_MIN_AGE_MS &&
       !occupied.has(p.id),
   );
-  const nonDefault = pages.filter((p) => p.id !== DEFAULT_PAGE_ID).length;
-  if (candidates.length > 0 && candidates.length === nonDefault) candidates.shift();
+  const docked = pages.filter((p) => p.id !== DEFAULT_PAGE_ID && !guards.boundPages[p.id]).length;
+  if (candidates.length > 0 && candidates.length === docked) candidates.shift();
   return candidates.map((p) => p.id);
 }
 
@@ -141,12 +142,18 @@ export function restoreRemovedPages(
 
 /**
  * Pure: the one-time name repair (D2 (b)). A non-default page named "Terminal"
- * takes {@link nextAutoPageName}. Among pages sharing a name, the OLDEST
- * (`createdAt`, then roster order) keeps it and each later one takes
+ * takes {@link nextAutoPageName}. Among pages sharing a name ONE keeps it, in
+ * this order of claim: an OCCUPIED page (the name the operator has been
+ * reading on a populated tab), then an operator page, then the oldest
+ * (`createdAt`, then roster order). Every other holder is renamed: a runner
+ * name (`Page N`) takes {@link nextAutoPageName}, any other name takes
  * {@link uniquePageName}. Ids never change. Returns the renames in the order
  * they were made; an empty list means the roster was already clean.
  */
-export function duplicateNameRepairs(pages: readonly TerminalPageConfig[]): PageRename[] {
+export function duplicateNameRepairs(
+  pages: readonly TerminalPageConfig[],
+  occupied: ReadonlySet<string>,
+): PageRename[] {
   const roster = pages.map((p) => ({ ...p }));
   const renames: PageRename[] = [];
   const rename = (p: TerminalPageConfig, to: string) => {
@@ -160,17 +167,21 @@ export function duplicateNameRepairs(pages: readonly TerminalPageConfig[]): Page
     }
   }
 
-  const byAge = roster
+  const claim = (p: TerminalPageConfig) =>
+    (occupied.has(p.id) ? 0 : 2) + (p.origin === "operator" ? 0 : 1);
+  const byClaim = roster
     .map((p, i) => ({ p, i }))
-    .sort((a, b) => a.p.createdAt - b.p.createdAt || a.i - b.i)
+    .sort((a, b) => claim(a.p) - claim(b.p) || a.p.createdAt - b.p.createdAt || a.i - b.i)
     .map(({ p }) => p);
   const kept = new Set<string>();
-  for (const p of byAge) {
+  for (const p of byClaim) {
     if (!kept.has(p.name)) {
       kept.add(p.name);
       continue;
     }
-    const to = uniquePageName(p.name, roster);
+    const to = AUTO_NAMES[0].test(p.name)
+      ? nextAutoPageName(roster)
+      : uniquePageName(p.name, roster);
     rename(p, to);
     kept.add(to);
   }
@@ -198,25 +209,34 @@ export interface OccupancyRead {
   complete: boolean;
 }
 
+/** What {@link removeEach} removed, and whether every re-read it made was complete. */
+export interface RemovalPass<T> {
+  removed: T[];
+  allReadsComplete: boolean;
+}
+
 /**
  * The removal loop shared by "Close empty tabs" and the auto-prune. Occupancy
  * is RE-READ before each removal: a terminal may have landed on a candidate
  * while earlier pages were being removed. A re-read that is incomplete, or
- * that now lists the page, keeps it. Returns what `remove` actually removed.
+ * that now lists the page, keeps it; an incomplete one is reported, so the
+ * caller can tell a whole pass from a partial one.
  */
 export async function removeEach<T>(
   candidates: readonly string[],
   read: () => Promise<OccupancyRead>,
   remove: (id: string) => Promise<T | null>,
-): Promise<T[]> {
+): Promise<RemovalPass<T>> {
   const removed: T[] = [];
+  let allReadsComplete = true;
   for (const id of candidates) {
     const fresh = await read();
+    if (!fresh.complete) allReadsComplete = false;
     if (!fresh.complete || fresh.ids.has(id)) continue;
     const r = await remove(id);
     if (r !== null) removed.push(r);
   }
-  return removed;
+  return { removed, allReadsComplete };
 }
 
 /** The strip's notice text for an auto-prune and/or repair. */
