@@ -15,6 +15,10 @@
  * broadcast to every window, but a page's tab lives in the window that shows it.
  */
 
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("PageMoveListeners");
+
 /** pageId → how many listeners are registered (StrictMode double-mounts). */
 const listening = new Map<string, number>();
 /** pageId → callbacks waiting for its first listener. */
@@ -78,7 +82,9 @@ export function waitForPageMoveListener(pageId: string, timeoutMs = 8_000): Prom
  * listening only once it RESOLVES (the IPC registered the handler), and the
  * returned cleanup releases both. A registration that resolves after the
  * cleanup ran is unlistened at once and never recorded — the page is gone, and
- * a leaked handler would go on adopting and evicting tabs for it.
+ * a leaked handler would go on adopting and evicting tabs for it. A rejected
+ * registration is logged and the page is never recorded: it is not listening,
+ * so a mover waiting on it times out rather than moving a tab nobody adopts.
  */
 export function holdPageMoveListener(
   pageId: string,
@@ -87,14 +93,21 @@ export function holdPageMoveListener(
   let unlisten: (() => void) | null = null;
   let release: (() => void) | null = null;
   let disposed = false;
-  void registration.then((fn) => {
-    if (disposed) {
-      fn();
-      return;
-    }
-    unlisten = fn;
-    release = markPageMoveListening(pageId);
-  });
+  void registration.then(
+    (fn) => {
+      if (disposed) {
+        fn();
+        return;
+      }
+      unlisten = fn;
+      release = markPageMoveListening(pageId);
+    },
+    (err: unknown) => {
+      logger.warn(
+        `terminal-page-changed listener for page ${pageId} failed to register; moves onto it are not adopted until its next re-sync: ${String(err)}`,
+      );
+    },
+  );
   return () => {
     disposed = true;
     unlisten?.();
