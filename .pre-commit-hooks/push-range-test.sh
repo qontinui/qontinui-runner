@@ -772,6 +772,12 @@ abs_run() {
     if [ -n "${STUB_ABS_RC:-}" ]; then echo "partial clippy output"; return "$STUB_ABS_RC"; fi
     "$@"
 }
+# The deadline's verdict for this hook: present whenever the stub "stopped"
+# the build with 124 (abs_run returns 124 only with a verdict on file).
+abog_deadline_check() {
+    [ "${STUB_ABS_RC:-}" = 124 ] && [ "$1" != 0 ] || return 1
+    ABOG_STOPPED_BY=stall
+}
 STUBABS
 }
 

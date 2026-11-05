@@ -360,9 +360,8 @@ check "a caller's AGENT_BUILD_STALL_SECS / AGENT_BUILD_MAX_WALL_SECS win" \
 
 out="$(abs_case "$FAKE_ABS" FAKE_ABS_RC=124)"
 case "$out" in
-    *"rc=124 stopped=1 tee= reason=the build was stopped by the holder deadline"*)
-        pass_note "exit 124 through the pipeline is a deadline stop, with the reason named" ;;
-    *) fail_note "expected rc=124 stopped=1 and a holder-deadline reason; got: $out" ;;
+    *"rc=124 stopped=0 "*) pass_note "a bare 124 with no deadline verdict is NOT a deadline stop (a timeout(1) inside the build exits 124 too)" ;;
+    *) fail_note "expected rc=124 stopped=0; got: $out" ;;
 esac
 out="$(abs_case "$FAKE_ABS" FAKE_ABS_RC=101)"
 case "$out" in
@@ -391,6 +390,12 @@ case "$out" in
     *) fail_note "expected the verdict to turn 143 into a stall stop; got: $out" ;;
 esac
 check "and the verdict is asked with the hook's tag" "check 143 [t]" "$(grep '^check' "$FAKE_ABS_LOG")"
+out="$(abs_case "$ABS_ROOT/verdict-lib" FAKE_ABS_RC=124 FAKE_VERDICT=stall)"
+case "$out" in
+    *"rc=124 stopped=1 tee= reason=the build was stopped by the holder deadline"*)
+        pass_note "a 124 WITH the deadline's verdict is a deadline stop, with the reason named" ;;
+    *) fail_note "expected rc=124 stopped=1 and a holder-deadline reason; got: $out" ;;
+esac
 out="$(abs_case "$ABS_ROOT/verdict-lib" FAKE_ABS_RC=143)"
 case "$out" in
     *"rc=143 stopped=0 "*) pass_note "a 143 with no verdict is NOT a deadline stop" ;;
