@@ -4577,6 +4577,44 @@ mod tests {
             .contains("Failed to deserialize the JSON body"));
     }
 
+    /// A non-UTF-8 write body, over real HTTP past the gate AND through the
+    /// production envelope middleware: the `INVALID_UTF8` code the handler
+    /// sets must survive the JSON stamping pass rather than be overwritten by
+    /// `code_for_status(400)` = `INVALID_JSON`. The body carries the exact
+    /// `0x97` byte Windows Git Bash curl sends for an em dash.
+    #[tokio::test]
+    async fn a_non_utf8_write_body_answers_invalid_utf8_through_the_envelope() {
+        let _pin = pin("record");
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
+        std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+        let nonce = registered_nonce();
+
+        let app = test_app().layer(axum::middleware::from_fn(
+            crate::mcp::envelope::envelope_rewrite_middleware,
+        ));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/plan-library/artifacts")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {nonce}"))
+            .body(Body::from(
+                b"{\"kind\":\"plan\",\"slug\":\"a \x97 b\"}".to_vec(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], "INVALID_UTF8", "{body}");
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("request body is not valid UTF-8"));
+    }
+
     /// The full-replace guard, driven over real HTTP with the door **OPEN** —
     /// the state that actually matters, and still hermetic because the refusal
     /// happens before `resolve_body` and before any upstream call.
