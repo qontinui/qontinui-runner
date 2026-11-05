@@ -19,12 +19,14 @@ import { resumeInNewTab, type ResumeAttempt, type ResumeTarget } from "./resumeI
  * {@link UseShellIntegrationResult.announcesCommandStarts}).
  *
  * There is no reading at all for a pane that emitted neither mark (a direct
- * exec such as `bash ./job.sh`, `cmd`) or whose marks this window lost track
- * of: output dropped while it was hidden, overrun out of the ring or spliced
- * out of a resync, and its unmount, each clear both readings (the synthetic
- * `unobserved` event). A remount's ring replay is written before the live
- * handler takes over, so its marks are summarised separately
- * (`replayed_marks`) rather than parsed as live.
+ * exec such as `bash ./job.sh`, `cmd`) or whose output this window KNOWS it
+ * did not parse: dropped while the pane was hidden, overrun out of the ring,
+ * spliced out of a resync, painted over by a reconnect, and its unmount each
+ * clear both readings (the synthetic `unobserved` event). Those are the loss
+ * paths the window can see; the clear is only as complete as that list. A
+ * remount's ring replay is parsed in replay mode, its marks summarised once
+ * (`replayed_marks`) rather than reported as live — and not at all when output
+ * was lost while it was in flight.
  */
 export type { ShellPromptMark };
 
@@ -160,7 +162,8 @@ export function useShellIntegration({
         else delete lastPromptMarkRef.current[tabId];
         if (event.announcesCommandStarts) commandMarksRef.current[tabId] = true;
         else delete commandMarksRef.current[tabId];
-        delete pendingCommandMarksRef.current[tabId];
+        if (event.pendingAnnounce) pendingCommandMarksRef.current[tabId] = true;
+        else delete pendingCommandMarksRef.current[tabId];
         return;
       }
       if (event.type === "prompt_start") {

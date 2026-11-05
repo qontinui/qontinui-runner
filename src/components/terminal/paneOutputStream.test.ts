@@ -272,7 +272,7 @@ describe("PaneOutputStream — the reconnect path's late attach", () => {
       const h = reconnect(gate);
       gate.flush(); // counted after the ring read's reset, emitted to no handler
       const snapshot = attachAndSnapshot(gate, h, true);
-      expect(h.stream.lateAttachSettled(true, snapshot)).toBe(0);
+      expect(h.stream.lateAttachSettled(true, snapshot).behind).toBe(0);
       h.settle();
       expect(gate.gap).toBe(0);
       sustainedOutput(gate, h);
@@ -314,7 +314,9 @@ describe("PaneOutputStream — the reconnect path's late attach", () => {
     gate.flush();
     expect(h.hooks.requestResync).not.toHaveBeenCalled();
 
-    expect(h.stream.lateAttachSettled(true, snapshot)).toBe(0);
+    // The paint shows the 35 000 bytes the pane never parsed: reported as
+    // skipped, so the caller can tell the shell-integration marks they are lost.
+    expect(h.stream.lateAttachSettled(true, snapshot)).toEqual({ behind: 0, skipped: 35_000 });
 
     // No ring read: the paint covers everything up to the snapshot.
     expect(h.hooks.requestResync).not.toHaveBeenCalled();
@@ -390,7 +392,7 @@ describe("PaneOutputStream — the reconnect path's late attach", () => {
     const gate = new RunnerGate();
     const h = reconnect(gate);
     h.stream.beginLateAttach();
-    expect(h.stream.lateAttachSettled(true, h.ringEnd - 500)).toBe(500);
+    expect(h.stream.lateAttachSettled(true, h.ringEnd - 500).behind).toBe(500);
     // Set to the snapshot, not left at the ring's end: the resync replays the
     // 500 bytes the paint does not show.
     expect(h.stream.writtenThrough).toBe(h.ringEnd - 500);
@@ -420,7 +422,7 @@ describe("PaneOutputStream — the reconnect path's late attach", () => {
     // The rest of the SGR arrives live.
     expect(h.stream.receive({ bytes: enc("196mworld"), offset: ring.length })).toBe("hold");
 
-    expect(h.stream.lateAttachSettled(true, snapshot)).toBe(7);
+    expect(h.stream.lateAttachSettled(true, snapshot).behind).toBe(7);
 
     const writes: string[] = [];
     h.queue.flush({
@@ -690,7 +692,7 @@ describe("TerminalInstance routes every received byte through PaneOutputStream",
       /stream\.beginLateAttach\(\);\s*outputUnsub = registerTerminalOutputHandler\(terminalId, handleOutputPayload\);\s*await awaitOutputListener\("reconnect fallback"\);/,
     );
     const settle = code.indexOf(
-      "stream.lateAttachSettled(lateAttachPaint.painted, lateAttachPaint.offset);",
+      "stream.lateAttachSettled(\n            lateAttachPaint.painted,\n            lateAttachPaint.offset,\n          );",
       fallback,
     );
     expect(settle).toBeGreaterThan(fallback);

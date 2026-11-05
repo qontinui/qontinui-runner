@@ -146,7 +146,7 @@ describe("useShellIntegration tracks marks across loss and remount", () => {
     const stream = new PaneOutputStream(paneWriter(new RunnerGate()).queue, {
       isPaused: () => state.paused,
       hasBackend: () => true,
-      noteMissedOutput: () => marks.outputLost(),
+      noteMissedOutput: () => marks.outputDropped(),
       requestResync: vi.fn(),
       scheduleFlush: vi.fn(),
     });
@@ -202,5 +202,17 @@ describe("useShellIntegration tracks marks across loss and remount", () => {
     for (const m of ["P;CommandMarks=1", "A", "E;Get-Content -Wait log", "C"]) marks.osc633(m);
     marks.endReplay();
     expect(hook.lastPromptMark("t")).toBe("command_execute");
+  });
+
+  it("a replay that ended on a capability before its A credits the live A that follows", () => {
+    const { hook, marks } = usePane();
+    marks.unmounted();
+    marks.beginReplay();
+    for (const m of ["A", "C", "D;0", "P;CommandMarks=1"]) marks.osc633(m);
+    marks.endReplay();
+    expect(hook.announcesCommandStarts("t")).toBe(false);
+    marks.osc633("A"); // live: the prompt the replayed capability belongs to
+    expect(hook.lastPromptMark("t")).toBe("prompt_start");
+    expect(hook.announcesCommandStarts("t")).toBe(true);
   });
 });

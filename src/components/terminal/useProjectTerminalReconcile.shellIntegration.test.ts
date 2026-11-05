@@ -88,7 +88,7 @@ describe("useProjectTerminalReconcile moveThem over the page's real shell integr
   it("moveThem keeps a pane whose output was dropped unparsed after its last prompt", async () => {
     const { hook, marks, fx } = renderWithShellIntegration();
     // Hidden, and something printed: the drop route reports the lost chunk.
-    marks.outputLost();
+    marks.outputDropped();
 
     await hook.moveThem();
 

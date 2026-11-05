@@ -308,6 +308,38 @@ describe("readBareIdleShell", () => {
     ).toEqual({ bare: false, reason: NO_PROMPT, busy: false });
   });
 
+  it("tells an integrated shell with no current mark how to get one, and any other shell what it is", () => {
+    const idle = (image: string): PaneClaudeProbe => ({
+      state: "absent",
+      sessionIds: [],
+      root: { image, isShell: true, descendants: 0 },
+    });
+    const none = { mark: undefined, announcesCommandStarts: false };
+    for (const image of ["bash", "zsh", "pwsh.exe", "powershell.exe"]) {
+      expect(readBareIdleShell({}, idle(image), none)).toEqual({
+        bare: false,
+        reason: NO_PROMPT,
+        busy: false,
+      });
+    }
+    // These never report prompt state: "press Enter" would loop forever.
+    for (const [image, stem] of [
+      ["cmd.exe", "cmd"],
+      ["C:\\Windows\\System32\\cmd.exe", "cmd"],
+      ["fish", "fish"],
+      ["sh", "sh"],
+      ["dash", "dash"],
+      ["ksh", "ksh"],
+      ["nu", "nu"],
+    ]) {
+      expect(readBareIdleShell({}, idle(image), none)).toEqual({
+        bare: false,
+        reason: `its shell (${stem}) does not report prompt state`,
+        busy: false,
+      });
+    }
+  });
+
   it("keeps a pane at its prompt whose shell never announced command-start marks", () => {
     expect(
       readBareIdleShell(

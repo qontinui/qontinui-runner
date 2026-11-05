@@ -110,7 +110,79 @@ describe("shellMarksSink — lost output", () => {
   });
 });
 
+describe("shellMarksSink — hidden drops", () => {
+  it("queues one clear behind the writes for a run of dropped chunks, and a new one after it ran", () => {
+    const p = pane();
+    p.write("A"); // handed to xterm before the pane went hidden
+    p.sink.outputDropped();
+    p.sink.outputDropped();
+    p.sink.outputDropped();
+    p.parse();
+    // Three immediate clears, the queued prompt, ONE clear behind it.
+    expect(p.events).toEqual([
+      { type: "unobserved" },
+      { type: "unobserved" },
+      { type: "unobserved" },
+      { type: "prompt_start" },
+      { type: "unobserved" },
+    ]);
+    // That clear ran, so the next drop queues its own.
+    p.write("A");
+    p.sink.outputDropped();
+    p.parse();
+    expect(p.events.slice(5)).toEqual([
+      { type: "unobserved" },
+      { type: "prompt_start" },
+      { type: "unobserved" },
+    ]);
+  });
+
+  it("queues an explicit loss's clear even while a drop's clear is pending", () => {
+    const p = pane();
+    p.sink.outputDropped();
+    p.write("A"); // a resync writes past the drop
+    p.sink.outputLost(); // …then reports an overrun at its own position
+    p.parse();
+    expect(p.events.at(-1)).toEqual({ type: "unobserved" });
+  });
+});
+
 describe("shellMarksSink — a mount's ring replay", () => {
+  it("reports no mark when output was lost while the replay was in flight", () => {
+    // A pane mounting hidden drops chunks during its ring read: both clears
+    // fire before the replay parses, so the replay's (older) prompt must not
+    // stand as current (round-4 node/race.mts).
+    const p = pane();
+    p.sink.beginReplay();
+    p.sink.outputDropped();
+    p.parse(); // the drop's queued clear runs first — the replay is not written yet
+    p.write("P;CommandMarks=1", "A");
+    p.parse();
+    p.sink.endReplay();
+    expect(p.events.at(-1)).toEqual({
+      type: "replayed_marks",
+      mark: undefined,
+      announcesCommandStarts: false,
+      pendingAnnounce: false,
+    });
+  });
+
+  it("carries a capability the ring ended on before its prompt's A", () => {
+    // The ring stopped between bash's start and end entries: the capability is
+    // replayed, its A arrives live.
+    const p = pane();
+    p.sink.beginReplay();
+    p.write("A", "C", "D;0", "P;CommandMarks=1");
+    p.parse();
+    p.sink.endReplay();
+    expect(p.events.at(-1)).toEqual({
+      type: "replayed_marks",
+      mark: "command_execute",
+      announcesCommandStarts: false,
+      pendingAnnounce: true,
+    });
+  });
+
   it("summarises a replay that ends at a prompt carrying the capability, and reports nothing else", () => {
     const p = pane();
     p.sink.beginReplay();
@@ -119,7 +191,12 @@ describe("shellMarksSink — a mount's ring replay", () => {
     expect(p.events).toEqual([]);
     p.sink.endReplay();
     expect(p.events).toEqual([
-      { type: "replayed_marks", mark: "prompt_start", announcesCommandStarts: true },
+      {
+        type: "replayed_marks",
+        mark: "prompt_start",
+        announcesCommandStarts: true,
+        pendingAnnounce: false,
+      },
     ]);
     // Live from here: sequences are reported again.
     p.sink.osc633("C");
@@ -133,7 +210,12 @@ describe("shellMarksSink — a mount's ring replay", () => {
     p.parse();
     p.sink.endReplay();
     expect(p.events).toEqual([
-      { type: "replayed_marks", mark: "command_execute", announcesCommandStarts: false },
+      {
+        type: "replayed_marks",
+        mark: "command_execute",
+        announcesCommandStarts: false,
+        pendingAnnounce: false,
+      },
     ]);
   });
 
@@ -145,7 +227,12 @@ describe("shellMarksSink — a mount's ring replay", () => {
     p.parse();
     p.sink.endReplay();
     expect(p.events).toEqual([
-      { type: "replayed_marks", mark: "prompt_start", announcesCommandStarts: false },
+      {
+        type: "replayed_marks",
+        mark: "prompt_start",
+        announcesCommandStarts: false,
+        pendingAnnounce: false,
+      },
     ]);
   });
 
@@ -156,7 +243,12 @@ describe("shellMarksSink — a mount's ring replay", () => {
     p.parse();
     p.sink.endReplay();
     expect(p.events).toEqual([
-      { type: "replayed_marks", mark: undefined, announcesCommandStarts: false },
+      {
+        type: "replayed_marks",
+        mark: undefined,
+        announcesCommandStarts: false,
+        pendingAnnounce: false,
+      },
     ]);
   });
 });
@@ -191,7 +283,11 @@ describe("TerminalInstance wiring onto the sink (source scan)", () => {
     const hook = source.slice(source.indexOf("noteMissedOutput: (end) =>"));
     const body = hook.slice(0, hook.indexOf("requestResync:"));
     expect(body).toContain("paneService.noteMissedOutput(end)");
-    expect(body).toContain("shellMarks.outputLost()");
+    expect(body).toContain("shellMarks.outputDropped()");
+  });
+
+  it("reports the bytes a reconnect paint skipped as lost", () => {
+    expect(source).toContain("if (skipped > 0) shellMarks.outputLost();");
   });
 
   it("reports a resync's lost output through the ring-resync host", () => {
