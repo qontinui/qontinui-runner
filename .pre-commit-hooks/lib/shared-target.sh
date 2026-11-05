@@ -398,9 +398,11 @@ shared_target_build_stopped() {
   local rc="$1" tag="${2:-[pre-push]}" stopped=0
   [ "$SHARED_TARGET_ABS_LOADED" = 1 ] || return 1
   # Called on every status: on 0 it only clears a verdict the build outran.
+  # Only the deadline's own verdict for THIS hook counts. A bare 124 does not:
+  # a build step run under timeout(1) exits 124 too, and reading that as a
+  # deadline stop would turn a real failure into a non-blocking decline.
+  # (abs_run itself returns 124 only when that same verdict exists.)
   if declare -F abog_deadline_check >/dev/null 2>&1 && abog_deadline_check "$rc" "$tag"; then
-    stopped=1
-  elif [ "$rc" = 124 ]; then
     stopped=1
   fi
   [ "$stopped" = 1 ] || return 1
