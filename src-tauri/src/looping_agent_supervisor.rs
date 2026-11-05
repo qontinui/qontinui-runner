@@ -146,6 +146,99 @@ fn clear_last_orphan_release(agent_id: &str) {
     }
 }
 
+/// Displacement memos (`agent_id -> lease::Displacement`): since when every
+/// slot has answered `held` while this agent's tab was live. In memory only,
+/// like [`HELD_SLOTS`] — a restart forgets it and the window restarts, which is
+/// the fail-safe direction.
+static DISPLACEMENT: Mutex<Option<HashMap<String, lease::Displacement>>> = Mutex::new(None);
+
+/// Last-logged displacement verdict per agent, so the displacement lines are
+/// edge-triggered (the `LAST_POSTURE` / `LAST_DIALOG` discipline).
+static LAST_DISPLACEMENT: Mutex<Option<HashMap<String, lease::Displaced>>> = Mutex::new(None);
+
+fn clear_displacement(agent_id: &str) {
+    let mut guard = DISPLACEMENT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = guard.as_mut() {
+        map.remove(agent_id);
+    }
+}
+
+fn last_displaced_for(agent_id: &str) -> Option<lease::Displaced> {
+    let guard = LAST_DISPLACEMENT.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().and_then(|m| m.get(agent_id)).copied()
+}
+
+/// Fold this tick's walk into the agent's displacement memo and return the
+/// verdict (plan `2026-11-05-looping-agent-slot-lease-tracks-tab-liveness`,
+/// D3). Every observation that is not an authoritative all-`held` walk over a
+/// live tab under a coord count resets the memo ([`lease::next_displacement`]).
+fn update_displacement(
+    agent_id: &str,
+    walk: lease::WalkVerdict,
+    obs: &lease::LeaseTickObs,
+    running: bool,
+) -> lease::Displaced {
+    let next = {
+        let mut guard = DISPLACEMENT.lock().unwrap_or_else(|e| e.into_inner());
+        let map = guard.get_or_insert_with(HashMap::new);
+        let next = lease::next_displacement(map.get(agent_id).copied(), walk, obs, running);
+        match next {
+            Some(d) => map.insert(agent_id.to_string(), d),
+            None => map.remove(agent_id),
+        };
+        next
+    };
+    let verdict = lease::displaced_verdict(next.as_ref(), obs.now_ms, obs.spawn_grace_secs);
+    log_displacement_transition(agent_id, verdict, walk, obs);
+    verdict
+}
+
+fn log_displacement_transition(
+    agent_id: &str,
+    verdict: lease::Displaced,
+    walk: lease::WalkVerdict,
+    obs: &lease::LeaseTickObs,
+) {
+    let mut guard = LAST_DISPLACEMENT.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    let prev = map
+        .insert(agent_id.to_string(), verdict)
+        .unwrap_or(lease::Displaced::NotDisplaced);
+    if prev == verdict {
+        return;
+    }
+    match verdict {
+        lease::Displaced::Suspected if prev == lease::Displaced::NotDisplaced => info!(
+            agent = %agent_id,
+            slots = obs.slots,
+            window_ms = lease::displacement_confirm_ms(obs.spawn_grace_secs),
+            "looping_agent_supervisor: slot displaced — every slot is held by another runner; \
+             suspending nudges (confirming over the displacement window)"
+        ),
+        lease::Displaced::Confirmed => info!(
+            agent = %agent_id,
+            slots = obs.slots,
+            "looping_agent_supervisor: slot displacement confirmed — the unslotted tab will be \
+             retired at its next idle tick"
+        ),
+        lease::Displaced::NotDisplaced => {
+            let why = match walk {
+                lease::WalkVerdict::Acquired { .. } => "acquired a slot",
+                lease::WalkVerdict::Unavailable => "coord unavailable",
+                _ if obs.liveness != Liveness::Live => "tab not live",
+                _ if obs.source != DesiredSource::Coord => "count not from coord",
+                _ => "no authoritative walk this tick",
+            };
+            info!(
+                agent = %agent_id,
+                ?walk,
+                "looping_agent_supervisor: displacement cleared — {why}; nudges resume"
+            );
+        }
+        lease::Displaced::Suspected => {}
+    }
+}
+
 /// Update the held-slot memo in place (e.g. stamp `last_proven_alive_ms`).
 fn touch_held_slot(agent_id: &str, f: impl FnOnce(&mut HeldSlot)) {
     let mut guard = HELD_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -666,6 +759,11 @@ async fn supervise_one(
         slots: effective.slots,
     };
     let lease_tick = reconcile_slot_lease(app, rec, &effective, &lease_obs).await;
+    // D3: an authoritative all-`held` walk over our live tab means a live peer
+    // fills every slot. Judged after the walk — a restarted runner re-acquires
+    // (`renewed`) its own slot first and is never displaced by itself.
+    let displaced =
+        update_displacement(&rec.def.id, lease_tick.walk, &lease_obs, effective.running);
 
     // Observe idle/context-low on the live grid, through the ONE quiescence
     // debounce (`TerminalSession::idle_quiescence_probe`) — never nudge into a
@@ -677,12 +775,16 @@ async fn supervise_one(
     // The settled screen must also show no DIALOG ([`nudge_safe_idle`]): every
     // action this `idle` unlocks types into the tab or closes it, and Enter on
     // a dialog answers it (coord finding `9089767f`).
-    let (mut idle, mut context_low) = (false, false);
+    // `quiescent` is the raw turn-complete verdict, BEFORE the dialog veto: it
+    // gates only a displacement retire, which closes the tab rather than typing
+    // into it, so a tab stuck on a dialog can still be retired.
+    let (mut idle, mut context_low, mut quiescent) = (false, false, false);
     if let Some((tid, session)) = &live {
         if let Some(probe) = session
             .idle_quiescence_probe(IDLE_QUIESCENCE_DEBOUNCE)
             .await
         {
+            quiescent = probe.idle;
             let (safe, dialog) = nudge_safe_idle(probe.idle, &probe.lines);
             log_dialog_transition(&rec.def.id, tid, dialog);
             idle = safe;
@@ -828,8 +930,51 @@ async fn supervise_one(
         }
     };
 
+    // D3/D5: the displacement rewrite, applied LAST so nothing downstream can
+    // turn a `Retire` back into a `Nudge`. While coord says every slot is held
+    // by a live peer, no new cycle starts on this unslotted tab; once that has
+    // held for the whole window, the tab is retired at an idle, past-grace tick.
+    let action = lease::displacement_action(action, displaced, quiescent && spawn_grace_elapsed);
+
     match action {
         Action::None => {}
+        Action::Retire => {
+            let Some((tid, _)) = &live else { return };
+            warn!(
+                agent = %rec.def.id,
+                terminal = %tid,
+                slots = effective.slots,
+                window_ms = lease::displacement_confirm_ms(rec.def.lifecycle_policy.spawn_grace_secs),
+                "looping_agent_supervisor: retiring unslotted shepherd tab — every slot has been \
+                 held by a live peer for the whole displacement window"
+            );
+            // `TerminalManager::close`, as the Relaunch arm and the stale-tab
+            // closes use: `graceful_exit` refuses a pane with a live `claude`
+            // until close authority can be minted. "Cleanly" is the timing gate
+            // above — idle, past the spawn grace, after a window of no nudges.
+            // Deliberately NOT routed through any load pre-check: retiring
+            // frees load.
+            let Some(tm) = app.try_state::<Arc<crate::terminal::TerminalManager>>() else {
+                return;
+            };
+            if let Err(e) = tm.inner().close(tid) {
+                warn!(
+                    agent = %rec.def.id,
+                    terminal = %tid,
+                    error = %e,
+                    "looping_agent_supervisor: closing the unslotted tab failed — re-evaluating \
+                     next tick"
+                );
+                return;
+            }
+            registry.update_runtime(&rec.def.id, |rt| {
+                if rt.terminal_id.as_deref() == Some(tid.as_str()) {
+                    rt.terminal_id = None;
+                }
+            });
+            // A standby that later regains a tab starts with a clean window.
+            clear_displacement(&rec.def.id);
+        }
         Action::Spawn(reason) => {
             // A registered tab whose process EXITED (coord finding `9089767f`):
             // close the frozen pane first so the respawn does not leave a dead
@@ -956,7 +1101,9 @@ fn looping_agent_work_key(agent_id: &str) -> String {
 /// `2026-09-13-drained-runner-never-reaches-idle`, D6). While the drain defers
 /// the looping-agent origin, every action that starts or continues work —
 /// `Spawn`, `Relaunch`, `Nudge` — becomes `None`; the live tab, if any, is left
-/// exactly as it is. Under `Allow` the action passes through untouched.
+/// exactly as it is. Under `Allow` the action passes through untouched. A
+/// displacement `Retire` passes either way: it stops work rather than starting
+/// it (and in practice it is produced after this rewrite runs).
 fn drain_rewrite(action: Action, drain: &crate::coord_drain_state::DrainGate) -> Action {
     if drain.allows() {
         return action;
@@ -964,6 +1111,8 @@ fn drain_rewrite(action: Action, drain: &crate::coord_drain_state::DrainGate) ->
     match action {
         Action::Spawn(_) | Action::Relaunch(_) | Action::Nudge => Action::None,
         Action::None => Action::None,
+        // Retiring STOPS work, which is what a drain wants.
+        Action::Retire => Action::Retire,
     }
 }
 
@@ -1639,6 +1788,10 @@ pub(crate) struct LoopingAgentStatus {
     /// also when the grid already reads busy (the dialog check only runs on
     /// a grid the idle predicate passed).
     pub dialog: Option<&'static str>,
+    /// The supervisor's last displacement verdict (`suspected` / `confirmed`)
+    /// when every slot is held by another runner: says WHY a live tab stopped
+    /// being nudged. `None` when not displaced.
+    pub displaced: Option<&'static str>,
 }
 
 /// Assemble the live status for one record.
@@ -1656,6 +1809,9 @@ pub(crate) fn status_snapshot(
         tab_alive: liveness.tab_alive(),
         idle: read.map(|(safe, _)| safe),
         dialog: read.and_then(|(_, dialog)| dialog),
+        displaced: last_displaced_for(&rec.def.id)
+            .filter(|d| *d != lease::Displaced::NotDisplaced)
+            .map(lease::Displaced::label),
     }
 }
 
@@ -1805,24 +1961,33 @@ mod drain_rewrite_tests {
     use crate::coord_drain_state::DrainGate;
     use qontinui_runner_lib::looping_agent::policy::RelaunchReason;
 
-    const ACTIONS: [Action; 6] = [
+    const ACTIONS: [Action; 7] = [
         Action::None,
         Action::Spawn(SpawnReason::FirstSpawn),
         Action::Spawn(SpawnReason::DeathRespawn),
         Action::Nudge,
         Action::Relaunch(RelaunchReason::ContextLow),
         Action::Relaunch(RelaunchReason::CycleBudget),
+        Action::Retire,
     ];
+
+    fn defer() -> DrainGate {
+        DrainGate::Defer {
+            reason: "drained".into(),
+            class: crate::coord_drain_state::DeferClass::Drained,
+        }
+    }
 
     #[test]
     fn a_deferring_drain_turns_spawn_relaunch_and_nudge_into_none() {
-        let defer = DrainGate::Defer {
-            reason: "drained".into(),
-            class: crate::coord_drain_state::DeferClass::Drained,
-        };
-        for action in ACTIONS {
-            assert_eq!(drain_rewrite(action, &defer), Action::None, "{action:?}");
+        for action in ACTIONS.into_iter().filter(|a| *a != Action::Retire) {
+            assert_eq!(drain_rewrite(action, &defer()), Action::None, "{action:?}");
         }
+    }
+
+    #[test]
+    fn a_deferring_drain_lets_retire_through() {
+        assert_eq!(drain_rewrite(Action::Retire, &defer()), Action::Retire);
     }
 
     #[test]
