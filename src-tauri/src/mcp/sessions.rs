@@ -860,9 +860,7 @@ async fn finish_session(
 
 /// Whether a finish outcome is the READ-BACK: a re-finish that wrote nothing
 /// on a session that is (still) finished.
-fn is_finish_read_back(
-    outcome: &crate::session::session_lifecycle_store::FinishOutcome,
-) -> bool {
+fn is_finish_read_back(outcome: &crate::session::session_lifecycle_store::FinishOutcome) -> bool {
     use crate::session::session_lifecycle_store::FinishChange;
     outcome.changed == FinishChange::None && outcome.record.finished_at.is_some()
 }

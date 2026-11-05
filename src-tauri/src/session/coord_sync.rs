@@ -847,7 +847,10 @@ fn classify_push_failure(msg: &str, permanent: bool) -> (&'static str, Option<u1
     // (plan 2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-
     // session-status, Phase 4) — never a `network` or `http_error` fault.
     if super::coord_sync_finish_ack::is_unconfirmed_message(msg) {
-        return (super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_KIND, status);
+        return (
+            super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_KIND,
+            status,
+        );
     }
     let kind = match status {
         Some(429) => "rate_limited",
@@ -2507,9 +2510,9 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                     let body = resp.text().await.unwrap_or_default();
                     return match finished_ack_verdict(status.as_u16(), &body) {
                         FinishedAck::Observed => PushOutcome::Acked,
-                        FinishedAck::Unconfirmed(reason) => PushOutcome::Transport(
-                            unconfirmed_message(status.as_u16(), &reason),
-                        ),
+                        FinishedAck::Unconfirmed(reason) => {
+                            PushOutcome::Transport(unconfirmed_message(status.as_u16(), &reason))
+                        }
                         // Unreachable for a 2xx; never a delivery either way.
                         FinishedAck::Refused => {
                             PushOutcome::PermanentFailure(format!("{status}: {}", snippet(&body)))
