@@ -257,6 +257,12 @@ gen_events_clear_inherited_git_env() {
 # `.cargo/config` are files with no extension. The `/` is stripped when the
 # list becomes git pathspecs and read by the premise derivation below; the
 # self-test checks every marking against the real tree.
+#
+# Adding an entry here also means adding a pin for it to the self-test's
+# `CODEGEN_INPUT_PINS` (`gen-events-drift-attribution-test.sh`): the same path
+# for a file entry, or a file beneath it for a directory entry. The pins are
+# kept by hand so that dropping an entry, or narrowing one past its pin, fails
+# the self-test; and the self-test fails on any entry that has no pin.
 GEN_EVENTS_ATTRIBUTION_PATHS=(
     "src-tauri/src/"
     "src-tauri/build.rs"
@@ -268,10 +274,12 @@ GEN_EVENTS_ATTRIBUTION_PATHS=(
     #  `qontinui-runner-stats = { path = "../crates/runner-stats" }`,
     #  `qontinui-runner-win32 = { path = "../crates/runner-win32" }`,
     #  `qontinui-pty-holder = { path = "../crates/pty-holder" }`), and the
-    # vendored crate the root manifest's `[patch.crates-io]` substitutes into
-    # the graph (`tao = { path = "vendor/tao-0.35.0" }`). The two runner-*
-    # crates were missing until 2026-09-30: an edit to either cleared a guilty
-    # pusher. `crates/pty-holder` was missing the same way until 2026-10-12.
+    # vendored crates the root manifest's `[patch.crates-io]` substitutes into
+    # the graph (`tao = { path = "vendor/tao-0.35.0" }`,
+    #  `portable-pty = { path = "vendor/portable-pty-0.8.1" }`), which the one
+    # `vendor/` entry covers. The two runner-* crates were missing until
+    # 2026-09-30: an edit to either cleared a guilty pusher. `crates/pty-holder`
+    # was missing the same way until 2026-10-12.
     # `gen_events_uncovered_path_deps` below now walks the manifests
     # and reports any in-repo path dependency no entry covers; the
     # `gen-events-path-deps` pre-commit hook runs it on every Cargo.toml edit,
