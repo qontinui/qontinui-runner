@@ -1654,28 +1654,65 @@ mod tests {
         }
     }
 
-    /// Gate verbs coord serves in operator/agent PAIRS: each has a
-    /// device-authed twin one path segment away, under an `/agent/` INFIX —
-    /// `POST /coord/gates/:gate_id/agent/<verb>`. The unprefixed
-    /// `POST /coord/gates/:gate_id/<verb>` is the OPERATOR door and answers a
-    /// device or agent JWT `401 operator context missing; SSO required`.
+    /// What the UNPREFIXED `POST /coord/gates/:gate_id/<verb>` is, for a verb
+    /// whose device-authed twin sits under the `/agent/` INFIX
+    /// (`POST /coord/gates/:gate_id/agent/<verb>`). Either way an agent sent to
+    /// the bare path fails; only the status it gets differs.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum BareRoute {
+        /// The OPERATOR door: a device or agent JWT gets
+        /// `401 operator context missing; SSO required`.
+        Operator401,
+        /// No such route at all. coord built only the `/agent/` form, so the
+        /// bare path falls through to `doors::no_such_route` and answers 404.
+        Absent404,
+    }
+
+    /// Every gate verb with an `/agent/` twin, each with the class of its bare
+    /// route. One table, so a verb cannot be added without a class, and the
+    /// violation message cannot default a 404 verb to the 401 text.
     ///
     /// Ported from `qontinui-claude-config`'s `scripts/lint-gate-route-tier.py`
-    /// (check #21), which cannot hold the line here: it needs a
+    /// (check #21, its `TWIN_VERBS`), which cannot hold the line here: it needs a
     /// `qontinui-claude-config` checkout to exist and be current, and no job in
     /// this repo's CI runs it. Same reasoning as
     /// [`bundled_gate_registration_commands_teach_the_mechanics`] — these bodies
     /// are what actually ship, so the invariant is asserted where the files
     /// live.
-    const OPERATOR_TIER_TWIN_VERBS: &[&str] = &[
-        "reject",
-        "reopen",
-        "mute",
-        "unmute",
-        "snooze",
-        "continuation-cancel",
-        "force-clear",
-        "audience",
+    ///
+    /// **Nothing here checks this table against `TWIN_VERBS`.** Check #32
+    /// (`lint-coord-door-parity.py`) holds `TWIN_VERBS` against its own door
+    /// table, but no check reads this file, so a verb check #21 gains has to be
+    /// added here by hand. That is how `repoint` and `correct` were missing.
+    const GATE_TWIN_VERBS: &[(&str, BareRoute)] = &[
+        ("reject", BareRoute::Operator401),
+        ("reopen", BareRoute::Operator401),
+        ("mute", BareRoute::Operator401),
+        ("unmute", BareRoute::Operator401),
+        ("snooze", BareRoute::Operator401),
+        ("continuation-cancel", BareRoute::Operator401),
+        ("force-clear", BareRoute::Operator401),
+        ("audience", BareRoute::Operator401),
+        // No operator half: the registrant rule fails closed for an operator
+        // bearer, so only `/agent/repoint` exists (qontinui-coord#2056).
+        ("repoint", BareRoute::Absent404),
+        // No operator half: an insert-only annotation of a CLEARED gate, built
+        // at `/agent/correct` only (qontinui-coord#3047).
+        ("correct", BareRoute::Absent404),
+    ];
+
+    /// Gate verbs with NO `/agent/` twin, whose bare path is legitimately what
+    /// an agent (or nobody) uses: `approve` is operator-only; `attest` and
+    /// `withdraw` are device-authed on the bare path; the two continuation acks
+    /// are unauthenticated runner data-plane routes. The union of check #21's
+    /// `OPERATOR_ONLY_VERBS`, `BARE_PATH_DEVICE_AUTHED` and
+    /// `UNAUTHENTICATED_RUNNER_ACK`. None may ever be flagged.
+    const GATE_VERBS_WITHOUT_TWIN: &[&str] = &[
+        "approve",
+        "attest",
+        "withdraw",
+        "continuation-consumed",
+        "continuation-deferred",
     ];
 
     /// Same-line exemption marker, spelled exactly as the Python linter spells
@@ -1708,8 +1745,10 @@ mod tests {
         })
     }
 
-    /// No bundled command may instruct an agent to POST an operator-tier gate
-    /// verb that HAS a device-authed twin.
+    /// No bundled command may instruct an agent to POST the bare route of a gate
+    /// verb that HAS a device-authed `/agent/` twin — the operator's door (401)
+    /// for most of them, a route that does not exist (404) for the rest. The
+    /// name predates the 404 class.
     ///
     /// On 2026-08-20 gate `7902e457` spawned a redundant terminal against a plan
     /// already stamped SHIPPED, because the shipped bodies told agents to POST
@@ -1742,9 +1781,9 @@ mod tests {
     /// matching reports clean forever.
     #[test]
     fn bundled_commands_never_send_agents_to_operator_tier_gate_routes() {
-        let verb_alt = OPERATOR_TIER_TWIN_VERBS
+        let verb_alt = GATE_TWIN_VERBS
             .iter()
-            .map(|v| regex::escape(v))
+            .map(|(v, _)| regex::escape(v))
             .collect::<Vec<_>>()
             .join("|");
         // `/coord/gates/<anchor>/<twin verb>`.
@@ -1777,7 +1816,21 @@ mod tests {
             !candidate.is_match("POST $COORD_HTTP_URL/coord/gates/<gate_id>/agent/mute"),
             "route-tier pattern flags the CORRECT twin form"
         );
-        for verb in ["approve", "attest", "withdraw", "continuation-consumed"] {
+        for (verb, _) in GATE_TWIN_VERBS {
+            assert!(
+                candidate.is_match(&format!("POST /coord/gates/<id>/{verb}")),
+                "route-tier pattern misses the bare {verb:?} route"
+            );
+            assert!(
+                !candidate.is_match(&format!("POST /coord/gates/<id>/agent/{verb}")),
+                "route-tier pattern flags the CORRECT twin form of {verb:?}"
+            );
+            assert!(
+                !GATE_VERBS_WITHOUT_TWIN.contains(verb),
+                "{verb:?} is listed both as a twin verb and as a verb with no twin"
+            );
+        }
+        for verb in GATE_VERBS_WITHOUT_TWIN {
             assert!(
                 !candidate.is_match(&format!("POST /coord/gates/<id>/{verb}")),
                 "route-tier pattern flags {verb:?}, a verb with no `/agent/` twin"
@@ -1828,14 +1881,33 @@ mod tests {
                         continue;
                     }
                     let verb = &caps["verb"];
+                    let bare = GATE_TWIN_VERBS
+                        .iter()
+                        .find(|(v, _)| *v == verb)
+                        .map(|(_, bare)| *bare)
+                        .expect("the candidate pattern is built from GATE_TWIN_VERBS");
+                    // A 404 verb has no operator door, so the `operator`
+                    // exemption is never the fix for it: that would silence a
+                    // real defect. Only the explicit marker is offered; the
+                    // exemption itself still fires for every class, in parity
+                    // with check #21.
+                    let tail = match bare {
+                        BareRoute::Operator401 => format!(
+                            "the unprefixed route is the operator's and answers an agent \
+                             401. If this line IS documenting the operator door, say \
+                             'operator' on it (or add '{ROUTE_TIER_ALLOW_MARKER}')."
+                        ),
+                        BareRoute::Absent404 => format!(
+                            "the unprefixed route does not exist and answers 404; there is \
+                             no operator door to document. If this line deliberately names \
+                             the missing bare path, add '{ROUTE_TIER_ALLOW_MARKER}'."
+                        ),
+                    };
                     violations.push(format!(
                         "  qontinui-claude-config/.claude/commands/{name}.md (bundled here as \
                          src-tauri/src/fleet_commands/{name}.md):{}: `{}` — `{verb}` has a \
                          device-authed twin. An agent must POST \
-                         /coord/gates/<id>/agent/{verb}; the unprefixed route is the \
-                         operator's and answers an agent 401. If this line IS documenting \
-                         the operator door, say 'operator' on it (or add \
-                         '{ROUTE_TIER_ALLOW_MARKER}').",
+                         /coord/gates/<id>/agent/{verb}; {tail}",
                         idx + 1,
                         &caps[0],
                     ));
@@ -1845,9 +1917,10 @@ mod tests {
 
         assert!(
             violations.is_empty(),
-            "bundled agent command(s) send AGENTS to operator-tier gate routes — the agent \
-             twin sits one path segment away, and the 401 it avoids has already cost a real \
-             session (gate 7902e457, 2026-08-20). {} violation(s):\n{}",
+            "bundled agent command(s) send AGENTS to the bare route of a gate verb that has an \
+             `/agent/` twin — the twin sits one path segment away, and the bare route's 401 \
+             has already cost a real session (gate 7902e457, 2026-08-20); a 404 verb fails \
+             the same way. {} violation(s):\n{}",
             violations.len(),
             violations.join("\n")
         );
