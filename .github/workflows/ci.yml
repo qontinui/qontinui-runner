@@ -2436,6 +2436,48 @@ jobs:
         with:
           version: 10.33.2
 
-      - name: Run pnpm audit
-        run: pnpm audit --audit-level=moderate || true
+      # No pnpm cache: the gate below never installs, it only audits lockfiles.
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+
+      # pnpm audit gate — base-vs-head, NOT a plain blocking audit. A plain
+      # audit judges the tree against today's advisory DB, so a newly
+      # published advisory reds every open PR with no change in its tree (what
+      # PR #2501 hit for Cargo.lock). The gate fails only on --prod advisories
+      # (moderate+) present at HEAD and absent at BASE; an unchanged
+      # package.json + pnpm-lock.yaml exits 0 with no network call, and an
+      # audit that cannot run is UNKNOWN and fails. Logic and rationale:
+      # scripts/ci-pnpm-audit-diff.mjs. Plan
+      # 2026-11-02-only-cargo-lock-is-gated-by-a-dependency-audit.
+      - name: pnpm audit (fail on advisories this change introduces)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          node --test scripts/__tests__/ci-pnpm-audit-diff.test.mjs
+
+          # The checkout is depth 1. Fetch HEAD with its parents (enough for a
+          # PR merge commit, whose first parent IS the base tip) and the base
+          # commit, then resolve BASE.
+          git fetch --no-tags --quiet --depth=2 origin "$GITHUB_SHA"
+          if [ "$EVENT_NAME" = "pull_request" ] && [ -n "$PR_BASE_SHA" ]; then
+            git fetch --no-tags --quiet --depth=1 origin "$PR_BASE_SHA"
+            if ! BASE=$(git merge-base HEAD "$PR_BASE_SHA"); then
+              # The shallow history did not reach the fork point; deepen fully.
+              git fetch --no-tags --quiet --unshallow origin
+              BASE=$(git merge-base HEAD "$PR_BASE_SHA")
+            fi
+          elif [ -n "${PUSH_BEFORE:-}" ] && ! [[ "$PUSH_BEFORE" =~ ^0+$ ]] \
+               && git fetch --no-tags --quiet --depth=1 origin "$PUSH_BEFORE"; then
+            BASE="$PUSH_BEFORE"
+          else
+            echo "No usable push 'before' (new ref, or unreachable); comparing against HEAD^."
+            BASE=$(git rev-parse HEAD^)
+          fi
+          echo "pnpm audit gate: BASE=$BASE HEAD=$(git rev-parse HEAD)"
+          node scripts/ci-pnpm-audit-diff.mjs --base "$BASE" --head HEAD
 
