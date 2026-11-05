@@ -3,13 +3,14 @@
 //! One rule, used by every placement the operator did not make: the gate
 //! continuation, the condition check, the looping-agent spawn, and every
 //! [`TerminalManager::create`](super::TerminalManager::create) called with no
-//! page (`POST /terminals` without `pageId`, the web-relay create, stewards,
-//! the SessionRegistry PTY and claude_cli transports).
+//! page (`POST /terminals` without `pageId`, the agent-facing tauri_proxy
+//! create, the web-relay create, stewards, the SessionRegistry PTY and
+//! claude_cli transports).
 //! An explicit page and an adopted holder pane (`insert_with_io`) never come
 //! through here, and neither does an OPERATOR spawn: the webview sends the
-//! `default` page as `null`, so the operator-attended creates (the Tauri
-//! `terminal_create` command and its browser-mode `tauri_proxy` mirror) turn
-//! `None` into `"default"` with [`operator_page`] before calling `create`.
+//! `default` page as `null`, so the Tauri `terminal_create` command (the one
+//! operator-attended create) turns `None` into `"default"` with
+//! [`operator_page`] before calling `create`.
 //! `create`'s `None` therefore always means "place automatically". The
 //! web-relay create (a remote machine's spawn onto this one) names no page on
 //! this box at all, so it is placed automatically.
@@ -36,11 +37,13 @@
 //!   not count, although the restorable set keeps it for a while for the NEXT
 //!   boot.
 //! - A prior-boot row the boot restore declines (a page no window owns, a
-//!   deselected or failed restore) keeps counting until the store prunes it.
+//!   deselected or failed restore) keeps counting, for the life of the process,
+//!   until the store prunes it.
 //!   The restore marks rows one at a time as it reaches them, and is gated per
 //!   page, so "the restore has run" is not a signal that an unmarked row will
-//!   not come back; counting it costs at most an extra page, and placing a new
-//!   session onto a page its restore then refills is the defect this fixes.
+//!   not come back; counting it costs automatic placements that page's room,
+//!   and placing a new session onto a page its restore then refills is the
+//!   defect this fixes.
 //! - A create still in flight is not in the live list yet, so a burst of
 //!   simultaneous automatic spawns can each read the same page as having room.
 //!   That predates this module and is out of its scope.
