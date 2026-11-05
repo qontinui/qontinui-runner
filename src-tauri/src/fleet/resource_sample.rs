@@ -462,6 +462,15 @@ pub(crate) struct ResourceSample {
     /// publishes `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) slice_source: Option<String>,
+    /// The top commit consumers on this host (plan
+    /// `2026-11-05-devops-a-host-commit-climb-to-99-7-percent-names-no-consumer-and-reads-ok-two-minutes-out`,
+    /// D1): ≤ 5 processes by private bytes, plus `scanned` / `unreadable` /
+    /// `attributed_private_bytes` so a list that misses the real consumer does
+    /// not read like one that names it. Host lane only. `None` — the key is
+    /// omitted, UNKNOWN — when the process table could not be enumerated or the
+    /// OS has no reader; never an empty list pretending zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) top_consumers: Option<crate::fleet::top_consumers::TopConsumers>,
     /// `'runner' | 'supervisor' | 'ci-step'`. Distinguishes this row from the
     /// supervisor's host-lane row for the same device.
     pub(crate) source: String,
@@ -636,6 +645,7 @@ impl ResourceSample {
             cgroup_slices: None,
             psi: None,
             slice_source: None,
+            top_consumers: None,
             source: "runner".to_string(),
         }
     }
@@ -1104,6 +1114,15 @@ fn collect_host_lane() -> ResourceSample {
     s.cgroup_slices = t.cgroup_slices;
     s.psi = t.psi;
     s.slice_source = t.slice_source;
+
+    // Top commit consumers (plan
+    // `2026-11-05-devops-a-host-commit-climb-to-99-7-percent-names-no-consumer-and-reads-ok-two-minutes-out`,
+    // D1). Host lane only, for the socket census's reason: the `wsl` lane is a
+    // different process table. A ToolHelp snapshot plus one `OpenProcess` per
+    // process on Windows, a `/proc` walk on Linux — and NO child process:
+    // a host near commit exhaustion cannot be relied on to spawn one
+    // (`0xc0000142`), which is exactly when this reading matters.
+    s.top_consumers = crate::fleet::top_consumers::collect();
 
     s
 }
@@ -3012,6 +3031,52 @@ MemAvailable:   15335424 kB
         let body = &prod[start..];
         let end = body.find("\n}\n").map(|i| i + 3).unwrap_or(body.len());
         &body[..end]
+    }
+
+    /// The production source of `fleet::top_consumers`, test module split off
+    /// for the same reason as [`collect_host_lane_src`].
+    fn top_consumers_prod_src() -> &'static str {
+        const SRC: &str = include_str!("top_consumers.rs");
+        SRC.split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(SRC)
+    }
+
+    /// **The top-consumers reading never spawns a child** (plan
+    /// `2026-11-05-devops-a-host-commit-climb-to-99-7-percent-names-no-consumer-and-reads-ok-two-minutes-out`,
+    /// D1). It matters most on a host near commit exhaustion, which is exactly
+    /// the host that cannot be relied on to spawn one (`0xc0000142`) — so a
+    /// `tasklist` / `ps` fork here would fail precisely when the reading is
+    /// needed. Structural: refuses `Command::` and `spawn(` in the host-lane
+    /// body and in the whole reader module, and pins that the host lane
+    /// actually calls the reader.
+    #[test]
+    fn the_top_consumers_reading_spawns_no_child_process() {
+        let host = collect_host_lane_src();
+        assert!(
+            host.contains("top_consumers::collect()"),
+            "collect_host_lane must publish top_consumers"
+        );
+        for (what, src) in [
+            ("collect_host_lane", host),
+            ("fleet::top_consumers", top_consumers_prod_src()),
+        ] {
+            for needle in ["Command::", "Command::new", "spawn("] {
+                assert!(
+                    !src.contains(needle),
+                    "{what} must not contain `{needle}` — the commit-consumer \
+                     reading is a ToolHelp snapshot / /proc walk, never a child process"
+                );
+            }
+        }
+        // And it never reads a command line: argv carries secrets.
+        let reader = top_consumers_prod_src();
+        for needle in ["/cmdline", "/environ", "GetCommandLine", "PEB"] {
+            assert!(
+                !reader.contains(needle),
+                "fleet::top_consumers must not read `{needle}` — name is the image name only"
+            );
+        }
     }
 
     /// The spawn gate must NOT have grown either reading.

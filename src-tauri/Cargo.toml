@@ -269,6 +269,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Kernel",
+    # VirtualAlloc / VirtualFree — the Windows test for
+    # `fleet::top_consumers` commits 320 MiB and asserts its own PrivateUsage
+    # rose by it (plan 2026-11-05-devops-a-host-commit-climb-…, Phase 3).
+    "Win32_System_Memory",
     # GlobalMemoryStatusEx — free/total COMMIT, the memory quantity every
     # build guard on this machine agrees on (supervisor, cargo-guard.sh, and
     # now ci_node). Physical-available is the wrong number on Windows: builds

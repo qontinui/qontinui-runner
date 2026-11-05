@@ -1411,24 +1411,49 @@ impl HealthMetrics {
 /// the same quantity the `/proc/self/statm` arm below reads on Linux.
 #[cfg(target_os = "windows")]
 fn get_memory_usage() -> u64 {
-    use std::mem::MaybeUninit;
-    use windows_sys::Win32::System::ProcessStatus::{
-        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
-    };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-    unsafe {
-        let handle = GetCurrentProcess();
-        let mut counters = MaybeUninit::<PROCESS_MEMORY_COUNTERS>::uninit();
-        let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: the current-process pseudo-handle is always valid and needs no close.
+    let handle = unsafe { GetCurrentProcess() };
+    process_memory_counters(handle)
+        .map(|c| c.WorkingSetSize as u64)
+        .unwrap_or(0)
+}
 
-        if GetProcessMemoryInfo(handle, counters.as_mut_ptr(), size) != 0 {
-            let counters = counters.assume_init();
-            counters.WorkingSetSize as u64
-        } else {
-            0
-        }
+/// The one per-process memory reader on Windows: `GetProcessMemoryInfo` into
+/// the `_EX` struct, so a caller can take either the working set (resident —
+/// [`get_memory_usage`]) or `PrivateUsage` (the process's COMMIT charge —
+/// `fleet::top_consumers`, which ranks processes on the commit-limit axis).
+///
+/// `handle` must carry `PROCESS_QUERY_LIMITED_INFORMATION` (or be the
+/// current-process pseudo-handle). The caller owns and closes it. `None` when
+/// the call fails — UNKNOWN, never a zero reading.
+#[cfg(target_os = "windows")]
+pub(crate) fn process_memory_counters(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> Option<windows_sys::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS_EX> {
+    use std::mem::MaybeUninit;
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    };
+
+    let mut counters = MaybeUninit::<PROCESS_MEMORY_COUNTERS_EX>::zeroed();
+    let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+    // SAFETY: the buffer is `size` bytes and `_EX` is a layout-compatible
+    // superset of `PROCESS_MEMORY_COUNTERS`; `cb == size_of::<_EX>()` is how the
+    // API is told to fill the extended fields.
+    let ok = unsafe {
+        GetProcessMemoryInfo(
+            handle,
+            counters.as_mut_ptr().cast::<PROCESS_MEMORY_COUNTERS>(),
+            size,
+        )
+    };
+    if ok == 0 {
+        return None;
     }
+    // SAFETY: zero-initialised and filled by a successful call.
+    Some(unsafe { counters.assume_init() })
 }
 
 /// Get current process memory usage in bytes — the RESIDENT set, from

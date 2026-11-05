@@ -76,6 +76,12 @@ pub(crate) mod socket_census;
 /// `not_supported` rather than zeroes.
 pub(crate) mod slice_telemetry;
 
+/// Top commit consumers — the per-process attribution for a machine-total
+/// commit spike (plan
+/// `2026-11-05-devops-a-host-commit-climb-to-99-7-percent-names-no-consumer-and-reads-ok-two-minutes-out`,
+/// D1). Consumed by [`resource_sample`]'s host lane; never spawns a child.
+pub(crate) mod top_consumers;
+
 /// §3.2 declared role. Mirrors `qontinui-coord::fleet::MachineRole`.
 /// The runner publishes itself as `Agent`; the supervisor publishes
 /// as `Build`. Dev workstations collapse both onto one machine_id
