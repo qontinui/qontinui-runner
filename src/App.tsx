@@ -844,6 +844,8 @@ function AppContent() {
                       onReorganize={() => setShowReorganize(true)}
                       onCloseEmptyPages={terminalPages.closeEmptyPages}
                       emptyPageCount={terminalPages.emptyPageCount}
+                      pruneNotice={terminalPages.pruneNotice}
+                      onUndoPrune={terminalPages.undoPrune}
                       isPinned={terminalPages.isPinned}
                       onPopOut={() => {
                         // Open a new pop-out OS window (same process) that hosts its

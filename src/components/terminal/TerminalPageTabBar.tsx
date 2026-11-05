@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from "react";
 import { Plus, X, Shuffle, SquareArrowOutUpRight, BrushCleaning } from "lucide-react";
 import { keyboardReorderTarget, type TerminalPageConfig } from "./useTerminalPages";
 import { NAME_IN_USE } from "./pageNaming";
+import { pruneNoticeText, type PageRename } from "./pagePrune";
 
 /**
  * Sentinel `dragOverId` value for the drop zone AFTER the last tab (the
@@ -37,6 +38,14 @@ interface TerminalPageTabBarProps {
   onCloseEmptyPages?: () => Promise<number>;
   /** Last-known count of tabs the button would close; 0 disables it. Omitted = unknown, stays enabled. */
   emptyPageCount?: number;
+  /**
+   * The last auto-prune of empty auto-created pages and/or the one-time name
+   * repair, while its Undo window is open (the page hook times it out). Shown
+   * in the note slot; `null`/omitted shows nothing.
+   */
+  pruneNotice?: { removed: readonly unknown[]; renames: readonly PageRename[] } | null;
+  /** Put back the pages `pruneNotice` removed. */
+  onUndoPrune?: () => void;
   /** Open a new pop-out OS window (same process) hosting its own terminals. */
   onPopOut?: () => void;
   /** Detach an entire page (all its terminals + layout) into its own window. */
@@ -59,6 +68,8 @@ export function TerminalPageTabBar({
   onReorganize,
   onCloseEmptyPages,
   emptyPageCount,
+  pruneNotice,
+  onUndoPrune,
   onPopOut,
   onPopOutPage,
   isPinned,
@@ -386,6 +397,29 @@ export function TerminalPageTabBar({
         {closeEmptyNote && (
           <span role="status" className="text-[10px] text-[#565f89] px-1">
             {closeEmptyNote}
+          </span>
+        )}
+        {pruneNotice && (pruneNotice.removed.length > 0 || pruneNotice.renames.length > 0) && (
+          <span
+            role="status"
+            data-testid="terminal-page-prune-notice"
+            className="flex items-center gap-1 text-[10px] text-[#a9b1d6] px-1 min-w-0"
+          >
+            <span
+              className="truncate max-w-[360px]"
+              title={pruneNoticeText(pruneNotice.removed.length, pruneNotice.renames)}
+            >
+              {pruneNoticeText(pruneNotice.removed.length, pruneNotice.renames)}
+            </span>
+            {pruneNotice.removed.length > 0 && onUndoPrune && (
+              <button
+                onClick={onUndoPrune}
+                className="shrink-0 px-1 rounded text-[#7aa2f7] hover:bg-[#7aa2f7]/10 transition-colors"
+                title="Put the removed pages back"
+              >
+                Undo
+              </button>
+            )}
           </span>
         )}
         {onPopOut && (
