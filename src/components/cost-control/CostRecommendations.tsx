@@ -10,6 +10,7 @@ import { Lightbulb, TrendingDown, CheckCircle2 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useQuery } from "@tanstack/react-query";
 import type { CostDashboard } from "./types";
+import { LIST_PRICE_EQUIVALENT } from "./costProvenance";
 
 /** Subset of the meta-optimizer Recommendation type relevant to cost display. */
 interface Recommendation {
@@ -106,7 +107,7 @@ function deriveInsights(dashboard: CostDashboard | null): CostInsight[] {
         insights.push({
           id: "phase-dominant",
           title: `"${top.phase}" phase dominates spending`,
-          description: `The ${top.phase} phase accounts for ${(fraction * 100).toFixed(0)}% of total cost ($${top.cost_usd.toFixed(4)}). Optimizing prompts or using a cheaper model for this phase could yield significant savings.`,
+          description: `The ${top.phase} phase accounts for ${(fraction * 100).toFixed(0)}% of total cost ($${top.cost_usd.toFixed(4)}, ${LIST_PRICE_EQUIVALENT}). Optimizing prompts or using a cheaper model for this phase could yield significant savings.`,
           severity: "info",
         });
       }
@@ -118,7 +119,7 @@ function deriveInsights(dashboard: CostDashboard | null): CostInsight[] {
     insights.push({
       id: "cache-savings-good",
       title: "Cache savings are working well",
-      description: `You've saved $${dashboard.cache_savings_usd.toFixed(2)} through prompt caching with a ${(dashboard.cache_hit_rate * 100).toFixed(0)}% hit rate. Keep prompt structures stable to maintain these savings.`,
+      description: `You've saved an estimated $${dashboard.cache_savings_usd.toFixed(2)} (${LIST_PRICE_EQUIVALENT}) through prompt caching with a ${(dashboard.cache_hit_rate * 100).toFixed(0)}% hit rate. Keep prompt structures stable to maintain these savings.`,
       severity: "info",
     });
   }

@@ -6,6 +6,7 @@
 
 import { AlertTriangle } from "lucide-react";
 import type { CostAnomalyEvent } from "./types";
+import { LIST_PRICE_EQUIVALENT } from "./costProvenance";
 
 interface AnomalyFeedProps {
   anomalies: CostAnomalyEvent[];
@@ -41,6 +42,7 @@ export function AnomalyFeed({ anomalies }: AnomalyFeedProps) {
         Anomaly Detection
         <span className="text-xs text-muted-foreground font-normal">({anomalies.length})</span>
       </h3>
+      <p className="text-xs text-muted-foreground mb-2">Costs: {LIST_PRICE_EQUIVALENT}</p>
       <div className="max-h-48 overflow-y-auto space-y-2">
         {anomalies.map((anomaly, i) => (
           <div

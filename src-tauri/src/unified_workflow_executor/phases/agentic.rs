@@ -20,8 +20,7 @@ use super::{
     build_compressed_iteration_history, build_execution_timing_context, build_llm_metrics,
     decode_journalled_ai_output, execute_prompt_response_mode, extract_and_preread_failure_files,
     get_active_sdk_app_name, journalled_step, preread_previously_edited_files,
-    record_phase_token_usage, record_phase_token_usage_with_cache,
-    record_phase_token_usage_with_target, REFLECTION_MODE_PREAMBLE,
+    record_phase_token_usage, record_phase_token_usage_with_cache, REFLECTION_MODE_PREAMBLE,
 };
 
 // =============================================================================
@@ -250,6 +249,9 @@ impl AgenticExecutor {
                             parsed: None,
                             input_tokens: None,
                             output_tokens: None,
+                            cache_creation_tokens: None,
+                            cache_read_tokens: None,
+                            reported_cost_usd: None,
                             tools_used: Vec::new(),
                             tools_rejected: Vec::new(),
                         },
@@ -331,25 +333,28 @@ impl AgenticExecutor {
                                 Some(duration_ms),
                                 resp.cache_creation_tokens,
                                 resp.cache_read_tokens,
+                                None,
                                 target_app.as_deref(),
                                 None,
                             );
                             // Emit realtime cost update event
                             {
-                                let cost_usd = if let (Some(input), Some(output)) =
+                                // No token counts: the cost is UNKNOWN (`None`),
+                                // never a fabricated $0 fed to the budget tracker.
+                                let cost_usd: Option<f64> = if let (Some(input), Some(output)) =
                                     (resp.input_tokens, resp.output_tokens)
                                 {
                                     let cache_create = resp.cache_creation_tokens.unwrap_or(0);
                                     let cache_read = resp.cache_read_tokens.unwrap_or(0);
-                                    crate::ai_pricing::calculate_cost_usd_with_cache(
+                                    Some(crate::ai_pricing::calculate_cost_usd_with_cache(
                                         input,
                                         output,
                                         cache_create,
                                         cache_read,
                                         step_model.as_deref().unwrap_or("claude-sonnet-4-20250514"),
-                                    )
+                                    ))
                                 } else {
-                                    0.0
+                                    None
                                 };
 
                                 let cumulative = self
@@ -368,19 +373,33 @@ impl AgenticExecutor {
                                     resp.output_tokens.unwrap_or(0),
                                     resp.cache_creation_tokens.unwrap_or(0),
                                     resp.cache_read_tokens.unwrap_or(0),
-                                    cost_usd,
+                                    // Display value only; never recorded against the budget.
+                                    cost_usd.unwrap_or(0.0),
                                     cumulative,
                                 );
 
+                                if cost_usd.is_none() {
+                                    warn!(
+                                        "agentic response-mode iteration {}: no token counts — \
+                                         cost UNKNOWN, not recorded in the budget tracker",
+                                        iteration
+                                    );
+                                }
+
                                 // Record cost in budget tracker and check safety limits
                                 let trackers = self.cost_trackers.lock().unwrap().clone();
-                                if let Some(ref trackers) = trackers {
+                                if let Some(trackers) = trackers.as_ref() {
                                     let total_tokens = resp.input_tokens.unwrap_or(0)
                                         + resp.output_tokens.unwrap_or(0);
-                                    let budget_result =
-                                        trackers.budget.record("agentic", total_tokens, cost_usd);
+                                    // An UNKNOWN cost is not recorded (no fabricated $0).
+                                    if let Some(cost_usd) = cost_usd {
+                                        let budget_result = trackers.budget.record(
+                                            "agentic",
+                                            total_tokens,
+                                            cost_usd,
+                                        );
 
-                                    match budget_result {
+                                        match budget_result {
                                         crate::cost_management::budget::BudgetResult::Warning { remaining_fraction, message } => {
                                             warn!("Budget warning ({}% remaining): {}", (remaining_fraction * 100.0) as u32, message);
                                             self.broadcaster.budget_warning(
@@ -398,10 +417,15 @@ impl AgenticExecutor {
                                         }
                                         crate::cost_management::budget::BudgetResult::Ok { .. } => {}
                                     }
+                                    }
 
-                                    // Check circuit breaker
-                                    let cb_result =
-                                        trackers.circuit_breaker.check_single_call(cost_usd);
+                                    // Check circuit breaker. With an UNKNOWN cost, 0.0
+                                    // only consults the tripped flag (0 can neither trip
+                                    // nor warn), so a breaker tripped elsewhere still
+                                    // stops the run.
+                                    let cb_result = trackers
+                                        .circuit_breaker
+                                        .check_single_call(cost_usd.unwrap_or(0.0));
                                     if let crate::cost_management::circuit_breaker::CircuitBreakerResult::Tripped(reason) = &cb_result {
                                         tracing::error!("Cost circuit breaker tripped: {}", reason);
                                         return (AgenticOutcome::BudgetExceeded { reason: reason.clone() }, Vec::new());
@@ -418,8 +442,11 @@ impl AgenticExecutor {
                                         return (AgenticOutcome::BudgetExceeded { reason: reason.clone() }, Vec::new());
                                     }
 
-                                    // Anomaly detection
-                                    if let Ok(mut detector) = trackers.anomaly_detector.lock() {
+                                    // Anomaly detection: only over known costs, so an
+                                    // unknown one does not drag the baseline down.
+                                    if let (Some(cost_usd), Ok(mut detector)) =
+                                        (cost_usd, trackers.anomaly_detector.lock())
+                                    {
                                         if let Some(anomaly) = detector.check(cost_usd) {
                                             warn!(
                                                 "Cost anomaly detected: ${:.4} (z-score: {:.2})",
@@ -525,6 +552,9 @@ impl AgenticExecutor {
                                 parsed: None,
                                 input_tokens: resp.input_tokens,
                                 output_tokens: resp.output_tokens,
+                                cache_creation_tokens: resp.cache_creation_tokens,
+                                cache_read_tokens: resp.cache_read_tokens,
+                                reported_cost_usd: None,
                                 // API-provider path does not surface per-tool
                                 // telemetry (Phase 4); CLI path does.
                                 tools_used: Vec::new(),
@@ -650,6 +680,9 @@ impl AgenticExecutor {
                     parsed,
                     input_tokens: None,
                     output_tokens: None,
+                    cache_creation_tokens: None,
+                    cache_read_tokens: None,
+                    reported_cost_usd: None,
                     tools_used: Vec::new(),
                     tools_rejected: Vec::new(),
                 },
@@ -1321,6 +1354,9 @@ impl AgenticExecutor {
                 parsed: parsed_output,
                 input_tokens: result.input_tokens,
                 output_tokens: result.output_tokens,
+                cache_creation_tokens: result.cache_creation_tokens,
+                cache_read_tokens: result.cache_read_tokens,
+                reported_cost_usd: result.reported_cost_usd,
                 tools_used: session_tools_used,
                 tools_rejected: session_tools_rejected,
             }
@@ -1345,6 +1381,9 @@ impl AgenticExecutor {
                 parsed: parsed_output,
                 input_tokens: result.input_tokens,
                 output_tokens: result.output_tokens,
+                cache_creation_tokens: result.cache_creation_tokens,
+                cache_read_tokens: result.cache_read_tokens,
+                reported_cost_usd: result.reported_cost_usd,
                 tools_used: session_tools_used,
                 tools_rejected: session_tools_rejected,
             }
@@ -1356,11 +1395,13 @@ impl AgenticExecutor {
 
         // Record token usage for the main AI session and build LLM metrics
         let (session_input_tokens, session_output_tokens) = outcome.token_usage();
+        let (session_cache_creation, session_cache_read, session_reported_cost_usd) =
+            outcome.cache_usage_and_reported_cost();
         let session_model = config.resolve_model_for_phase("agentic");
         let session_provider = config.resolve_provider_for_phase("agentic");
         {
             let target_app = get_active_sdk_app_name(&self.app_state);
-            record_phase_token_usage_with_target(
+            record_phase_token_usage_with_cache(
                 &self.app_state.pg_db,
                 &config.execution_id,
                 "agentic",
@@ -1371,26 +1412,38 @@ impl AgenticExecutor {
                 session_input_tokens,
                 session_output_tokens,
                 Some(duration_ms.max(0) as u64),
+                session_cache_creation,
+                session_cache_read,
+                session_reported_cost_usd,
                 target_app.as_deref(),
                 None,
             );
 
             // Emit realtime cost update for the main AI session
             {
-                let cost_usd = if let (Some(input), Some(output)) =
-                    (session_input_tokens, session_output_tokens)
-                {
-                    crate::ai_pricing::calculate_cost_usd_with_cache(
-                        input,
-                        output,
-                        0,
-                        0,
-                        session_model
-                            .as_deref()
-                            .unwrap_or("claude-sonnet-4-20250514"),
-                    )
-                } else {
-                    0.0
+                // The CLI's reported cost is its list-price figure (a
+                // list-price equivalent, not the user's bill); the cache-aware
+                // price table is the fallback when it is absent. With neither
+                // a reported cost nor token counts the cost is UNKNOWN: `None`,
+                // never a fabricated $0 fed to the budget tracker.
+                let cost_usd: Option<f64> = match (
+                    session_reported_cost_usd,
+                    session_input_tokens,
+                    session_output_tokens,
+                ) {
+                    (Some(reported), _, _) => Some(reported),
+                    (None, Some(input), Some(output)) => {
+                        Some(crate::ai_pricing::calculate_cost_usd_with_cache(
+                            input,
+                            output,
+                            session_cache_creation.unwrap_or(0),
+                            session_cache_read.unwrap_or(0),
+                            session_model
+                                .as_deref()
+                                .unwrap_or("claude-sonnet-4-20250514"),
+                        ))
+                    }
+                    _ => None,
                 };
 
                 let cumulative = self
@@ -1407,53 +1460,71 @@ impl AgenticExecutor {
                     Some(iteration),
                     session_input_tokens.unwrap_or(0),
                     session_output_tokens.unwrap_or(0),
-                    0,
-                    0,
-                    cost_usd,
+                    session_cache_creation.unwrap_or(0),
+                    session_cache_read.unwrap_or(0),
+                    // The realtime event's shape has no "unknown"; 0 here is a
+                    // display value only, never recorded against the budget.
+                    cost_usd.unwrap_or(0.0),
                     cumulative,
                 );
 
+                if cost_usd.is_none() {
+                    warn!(
+                        "agentic iteration {}: no reported cost and no token counts — \
+                         cost UNKNOWN, not recorded in the budget tracker",
+                        iteration
+                    );
+                }
+
                 // Record cost in budget tracker and check safety limits
                 let trackers = self.cost_trackers.lock().unwrap().clone();
-                if let Some(ref trackers) = trackers {
+                if let Some(trackers) = trackers.as_ref() {
                     let total_tokens =
                         session_input_tokens.unwrap_or(0) + session_output_tokens.unwrap_or(0);
-                    let budget_result = trackers.budget.record("agentic", total_tokens, cost_usd);
+                    // An UNKNOWN cost is not recorded (no fabricated $0).
+                    if let Some(cost_usd) = cost_usd {
+                        let budget_result =
+                            trackers.budget.record("agentic", total_tokens, cost_usd);
 
-                    match budget_result {
-                        crate::cost_management::budget::BudgetResult::Warning {
-                            remaining_fraction,
-                            message,
-                        } => {
-                            warn!(
-                                "Budget warning ({}% remaining): {}",
-                                (remaining_fraction * 100.0) as u32,
-                                message
-                            );
-                            self.broadcaster.budget_warning(
-                                &config.execution_id,
+                        match budget_result {
+                            crate::cost_management::budget::BudgetResult::Warning {
                                 remaining_fraction,
-                                trackers.budget.snapshot().total_cost_usd,
-                                trackers.budget.snapshot().max_cost_usd,
-                                &message,
-                            );
+                                message,
+                            } => {
+                                warn!(
+                                    "Budget warning ({}% remaining): {}",
+                                    (remaining_fraction * 100.0) as u32,
+                                    message
+                                );
+                                self.broadcaster.budget_warning(
+                                    &config.execution_id,
+                                    remaining_fraction,
+                                    trackers.budget.snapshot().total_cost_usd,
+                                    trackers.budget.snapshot().max_cost_usd,
+                                    &message,
+                                );
+                            }
+                            crate::cost_management::budget::BudgetResult::Exceeded {
+                                ref phase,
+                                overage_usd,
+                            } => {
+                                let reason = format!(
+                                    "Budget exceeded in phase {}: ${:.4} over limit",
+                                    phase, overage_usd
+                                );
+                                tracing::error!("{}", reason);
+                                return (AgenticOutcome::BudgetExceeded { reason }, Vec::new());
+                            }
+                            crate::cost_management::budget::BudgetResult::Ok { .. } => {}
                         }
-                        crate::cost_management::budget::BudgetResult::Exceeded {
-                            ref phase,
-                            overage_usd,
-                        } => {
-                            let reason = format!(
-                                "Budget exceeded in phase {}: ${:.4} over limit",
-                                phase, overage_usd
-                            );
-                            tracing::error!("{}", reason);
-                            return (AgenticOutcome::BudgetExceeded { reason }, Vec::new());
-                        }
-                        crate::cost_management::budget::BudgetResult::Ok { .. } => {}
                     }
 
-                    // Check circuit breaker
-                    let cb_result = trackers.circuit_breaker.check_single_call(cost_usd);
+                    // Check circuit breaker. With an UNKNOWN cost, 0.0 only consults
+                    // the tripped flag (0 can neither trip nor warn), so a breaker
+                    // tripped elsewhere still stops the run.
+                    let cb_result = trackers
+                        .circuit_breaker
+                        .check_single_call(cost_usd.unwrap_or(0.0));
                     if let crate::cost_management::circuit_breaker::CircuitBreakerResult::Tripped(
                         reason,
                     ) = &cb_result
@@ -1467,8 +1538,11 @@ impl AgenticExecutor {
                         );
                     }
 
-                    // Anomaly detection
-                    if let Ok(mut detector) = trackers.anomaly_detector.lock() {
+                    // Anomaly detection: only over known costs, so an unknown one
+                    // does not drag the baseline down.
+                    if let (Some(cost_usd), Ok(mut detector)) =
+                        (cost_usd, trackers.anomaly_detector.lock())
+                    {
                         if let Some(anomaly) = detector.check(cost_usd) {
                             warn!(
                                 "Cost anomaly detected: ${:.4} (z-score: {:.2})",
