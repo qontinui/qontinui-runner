@@ -248,8 +248,9 @@ pub struct LiveRow {
 /// the config dir it came from (`read_live_sessions` reports the account label
 /// but not the path).
 ///
-/// `Err` when any home's `sessions/` dir exists and cannot be listed. A row it
-/// hides is a LIVE session this pass would otherwise report `live: false` —
+/// `Err` when any home's `sessions/` dir exists and cannot be listed, or a live
+/// pid's record in it cannot be read. A row either hides is a LIVE session this
+/// pass would otherwise report `live: false` —
 /// and coord inserts a never-seen ended session as closed — so the pass is
 /// skipped exactly as an indeterminate process snapshot skips it
 /// ([`LiveSessions::complete`](super::claude_session_registry::LiveSessions::complete)).
@@ -687,8 +688,9 @@ pub enum PassState {
     Unpaired,
     /// The process snapshot was indeterminate.
     Snapshot,
-    /// A Claude Code `sessions/` dir exists and could not be listed, so which
-    /// sessions are live was indeterminate.
+    /// Claude Code's session registry could not be read in full — a
+    /// `sessions/` dir that cannot be listed, or a live pid's record that could
+    /// not be read — so which sessions are live was indeterminate.
     Registry,
     /// The blocking build task failed.
     Build,
@@ -999,8 +1001,8 @@ fn log_transition(state: &PassState) {
              would otherwise be reported as ended)"
         ),
         PassState::Registry => warn!(
-            "session identity: a Claude Code sessions dir could not be listed — pass skipped (a \
-             live session recorded there would otherwise be reported as ended)"
+            "session identity: Claude Code's session registry could not be read in full — pass \
+             skipped (a live session recorded there would otherwise be reported as ended)"
         ),
         PassState::Build => warn!("session identity: the build task failed — retrying next pass"),
         PassState::Unavailable => info!(
