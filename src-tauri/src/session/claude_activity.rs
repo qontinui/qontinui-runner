@@ -506,13 +506,16 @@ pub struct RecordReadings {
     pub unlistable: Vec<UnlistableSessionsDir>,
 }
 
-/// One reader's memory of the unlistable `sessions/` dirs it last reported, so
-/// the condition is logged once per TRANSITION — when it appears, when its dir
-/// set changes, when it clears — rather than on every read. A graceful exit
-/// probes every half second and restart-readiness answers every Stop turn, so
-/// a per-read line would bury everything else in the log.
+/// One reader's memory of which `sessions/` dirs it has reported unlistable,
+/// so the condition is logged once per TRANSITION of each dir — a warn when a
+/// dir turns unlistable, an info when it lists again — rather than on every
+/// read. A graceful exit probes every half second and restart-readiness
+/// answers every Stop turn, so a per-read line would bury the log. Keyed per
+/// DIR rather than on the whole set: two reads may be asked about different
+/// dirs (the probe adds each candidate's own config dir), and a dir one read
+/// was not asked about is neither reported again nor declared healed.
 pub struct UnlistableLog {
-    last: std::sync::Mutex<Option<String>>,
+    reported: std::sync::Mutex<std::collections::BTreeSet<PathBuf>>,
     reader: &'static str,
     consequence: &'static str,
 }
@@ -521,41 +524,51 @@ impl UnlistableLog {
     /// `reader` names who read; `consequence` says what the condition costs it.
     pub const fn new(reader: &'static str, consequence: &'static str) -> Self {
         Self {
-            last: std::sync::Mutex::new(None),
+            reported: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             reader,
             consequence,
         }
     }
 
-    /// Record what one read saw, logging only a change.
-    pub fn observe(&self, unlistable: &[UnlistableSessionsDir]) {
-        let now = (!unlistable.is_empty()).then(|| {
-            unlistable
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("; ")
-        });
-        let mut last = self
-            .last
+    /// Record what one read of `config_dirs` saw, logging only a change.
+    pub fn observe(&self, config_dirs: &[PathBuf], unlistable: &[UnlistableSessionsDir]) {
+        let mut reported = self
+            .reported
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *last == now {
-            return;
+        for dir in unlistable {
+            if reported.insert(dir.sessions_dir.clone()) {
+                tracing::warn!(
+                    sessions_dir = %dir.sessions_dir.display(),
+                    error = %dir.error,
+                    "{}: a Claude Code sessions dir exists but cannot be listed — {}",
+                    self.reader,
+                    self.consequence
+                );
+            }
         }
-        match &now {
-            Some(dirs) => tracing::warn!(
-                unlistable = %dirs,
-                "{}: a Claude Code sessions dir exists but cannot be listed — {}",
-                self.reader,
-                self.consequence
-            ),
-            None => tracing::info!(
-                "{}: every Claude Code sessions dir is listable again",
-                self.reader
-            ),
+        for config_dir in config_dirs {
+            let sessions_dir = config_dir.join("sessions");
+            let still_unlistable = unlistable.iter().any(|u| u.sessions_dir == sessions_dir);
+            if !still_unlistable && reported.remove(&sessions_dir) {
+                tracing::info!(
+                    sessions_dir = %sessions_dir.display(),
+                    "{}: a Claude Code sessions dir that could not be listed reads again",
+                    self.reader
+                );
+            }
         }
-        *last = now;
+    }
+
+    /// The dirs currently reported unlistable. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn reported(&self) -> Vec<PathBuf> {
+        self.reported
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
     }
 }
 
@@ -1237,8 +1250,9 @@ mod tests {
 
     /// A `sessions` that is not a directory cannot be listed, and says so —
     /// it is not read as an account with no live session. Not gated on the
-    /// platform or the user: unlike a mode-000 dir it is unlistable to root
-    /// and on Windows too.
+    /// platform or the user, because unlike a mode-000 dir it is unlistable to
+    /// root as well. Measured on Linux; on Windows this test's CI run is the
+    /// first evidence that `read_dir` on a file is not `NotFound` there.
     #[test]
     fn a_sessions_path_that_is_not_a_directory_is_unlistable() {
         let root = scratch("not-a-dir");
@@ -1389,6 +1403,33 @@ mod tests {
         // A short tail starting mid-file drops its partial first line.
         let short = read_tail_lossy(&path, 30).unwrap();
         assert!(!short.contains("timestamp"), "{short:?}");
+    }
+
+    /// The unlistable log tracks each dir: one read reports a dir, a read
+    /// that was not asked about it leaves it reported, and only a read that
+    /// lists it again clears it.
+    #[test]
+    fn the_unlistable_log_tracks_each_dir_separately() {
+        let log = UnlistableLog::new("test", "nothing");
+        let a = PathBuf::from("/h/.claude-a");
+        let b = PathBuf::from("/h/.claude-b");
+        let unlistable_a = [UnlistableSessionsDir {
+            sessions_dir: a.join("sessions"),
+            error: "Permission denied".to_string(),
+        }];
+        log.observe(&[a.clone(), b.clone()], &unlistable_a);
+        assert_eq!(log.reported(), vec![a.join("sessions")]);
+        log.observe(std::slice::from_ref(&b), &[]);
+        assert_eq!(
+            log.reported(),
+            vec![a.join("sessions")],
+            "a read that never asked about a dir does not declare it healed"
+        );
+        log.observe(std::slice::from_ref(&a), &[]);
+        assert!(
+            log.reported().is_empty(),
+            "a dir that lists again is cleared"
+        );
     }
 
     #[test]

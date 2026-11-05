@@ -1934,6 +1934,45 @@ mod tests {
         assert!(!steward_pane_is_emptied(&husk));
     }
 
+    /// R0c-2 through the steward roster's own consumer: a tracked steward pane
+    /// whose `claude` is an npm-installed `node`, named by a Claude Code
+    /// registry record in the look, is found RUNNING — not a vacant husk that
+    /// a start would reap and double.
+    #[tokio::test]
+    async fn a_steward_running_as_an_npm_claude_is_found_running() {
+        use crate::process_capture::process_tree::ProcessSnapshot;
+        use crate::terminal::graceful_exit::{PaneLook, RegistryWitness};
+        use crate::terminal::session::tests::{npm_claude_pane, NPM_CLAUDE_PID};
+
+        let pane = npm_claude_pane();
+        let root = pane.session.child_pid().expect("a local pane");
+        let tm = TerminalManager::new();
+        let id = "steward-r0c2-npm";
+        tm.insert_for_test(id, pane.session.clone());
+        let spec = steward_spec("merge-train").expect("a roster kind");
+        steward_meta_store().lock().unwrap().insert(
+            id.to_string(),
+            StewardMeta {
+                kind: spec.kind.to_string(),
+                mode: spec.default_mode.to_string(),
+                interval: spec.default_interval.to_string(),
+                claude_seen: true,
+            },
+        );
+        let mut snap = ProcessSnapshot::default();
+        for (pid, ppid, name) in [(root, 1, "bash"), (NPM_CLAUDE_PID, root, "node")] {
+            snap.parent_map.entry(ppid).or_default().push(pid);
+            snap.creation_times.insert(pid, 10);
+            snap.names.insert(pid, name.to_string());
+        }
+        let look = PaneLook::from_parts(&[root], snap, RegistryWitness::naming(&[NPM_CLAUDE_PID]));
+
+        let found = find_running_steward_in(&tm, spec.kind, &look).map(|info| info.id);
+        steward_meta_store().lock().unwrap().remove(id);
+
+        assert_eq!(found.as_deref(), Some(id));
+    }
+
     #[test]
     fn roster_kinds_are_unique() {
         // `kind` is both the routing key and the single-instance key, so a

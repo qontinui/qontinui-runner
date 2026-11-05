@@ -850,23 +850,22 @@ pub async fn gather_activity_evidence(
             // Released when the read ENDS (or unwinds), not when the caller
             // stops waiting for it.
             let _guard = guard;
-            claude_activity::read_records(
+            let readings = claude_activity::read_records(
                 &config_dirs,
                 &pids,
                 &proc_start,
                 claude_activity::RecordDepth::Activity,
-            )
+            );
+            // An unlistable `sessions/` dir has already turned every would-be
+            // `Missing` into `Unlisted`, which classifies `unknown` — so the
+            // counts stay honest by construction. The dir is named in the log,
+            // once per transition, because nothing else says WHY those
+            // processes read unknown.
+            UNLISTABLE_SESSIONS_LOG.observe(&config_dirs, &readings.unlistable);
+            readings
         });
         match tokio::time::timeout(read_timeout, read).await {
-            Ok(Ok(readings)) => {
-                // An unlistable `sessions/` dir has already turned every
-                // would-be `Missing` into `Unlisted`, which classifies
-                // `unknown` — so the counts stay honest by construction. The
-                // dir is named in the log, once per transition, because
-                // nothing else says WHY those processes read unknown.
-                UNLISTABLE_SESSIONS_LOG.observe(&readings.unlistable);
-                readings.by_pid
-            }
+            Ok(Ok(readings)) => readings.by_pid,
             Ok(Err(e)) => {
                 tracing::warn!(
                     "restart-readiness: Claude Code session-record read failed ({e}) — \

@@ -304,7 +304,7 @@ pub fn scan_idle_touches_once() {
     // any candidate open, further looks back off exactly as for an unreadable
     // table. The condition itself is logged by the probe once per transition.
     if left_undecided > 0 {
-        if let Some(why) = look.registry().unreadable_reason() {
+        if let Some(why) = look.registry().incomplete_reason() {
             *PROBE_NOT_BEFORE_MS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = now_ms + UNREADABLE_PROBE_BACKOFF_MS;

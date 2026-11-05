@@ -326,14 +326,15 @@ pub(crate) fn config_dir_of_pid(_pid: u32) -> Option<String> {
     None
 }
 
-/// The images a JS-runtime Claude Code runs as: the npm install is `node …
-/// cli.js` (`nodejs` where the distro names the binary so), and a build run
-/// under Bun is `bun`. These are the only images [`is_claude_image`] can miss
-/// a live `claude` behind, so they are the only ones the graceful-exit probe
-/// leaves UNDECIDED when Claude Code's session registry cannot answer
-/// (`crate::terminal::graceful_exit::RegistryWitness`); every other image is
-/// judged by itself, and a shell is never a `claude`. Compared after
-/// [`image_stem`], so `node.exe` and `/usr/bin/node` match too.
+/// The images a JS-runtime Claude Code is known to run as: the npm install is
+/// `node … cli.js` (`nodejs` where the distro names the binary so), and a build
+/// run under Bun is `bun`. These are the known images [`is_claude_image`] can
+/// miss a live `claude` behind — not the only possible ones: `deno`, or a
+/// version-suffixed `node22`, would escape this list too — and they are the
+/// ones the graceful-exit probe leaves UNDECIDED when Claude Code's session
+/// registry cannot answer (`crate::terminal::graceful_exit::RegistryWitness`);
+/// every other image is judged by itself, and a shell is never a `claude`.
+/// Compared after [`image_stem`], so `node.exe` and `/usr/bin/node` match too.
 const JS_RUNTIME_IMAGES: &[&str] = &["node", "nodejs", "bun"];
 
 /// Could `pid` be a JS-runtime Claude Code that its image alone cannot
