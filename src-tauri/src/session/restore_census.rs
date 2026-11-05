@@ -47,14 +47,15 @@
 //! inherit the primary's census, which is the `2026-08-10` regression this
 //! route must never re-introduce.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use serde::Serialize;
 use tracing::{info, warn};
 
+use crate::session::session_ledger::{observe_row, LiveView, Observed};
 use crate::session::session_lifecycle_store::{
-    SessionLifecycleStore, TerminalSessionRecord, RESTORE_TIER_FAILED,
+    SessionLifecycleStore, TerminalSessionRecord, RESTORE_TIER_TERMINAL_ONLY,
 };
 use crate::session::shutdown_marker::BootClassification;
 use crate::session::snapshot_history::{is_restorable_identity, TranscriptProbe};
@@ -124,8 +125,9 @@ pub struct CensusRestored {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_id: Option<String>,
     pub zone_index: i32,
-    /// `"resumed"` | `"terminal-only"`. A `"failed"` tier is NOT a restore —
-    /// it lands in `missing` with [`MISSING_RESUME_FAILED`].
+    /// `"resumed"` in [`RestoreCensusResponse::restored`]; `"terminal-only"` in
+    /// [`RestoreCensusResponse::terminal_only`]. A `"failed"` tier is NOT a
+    /// restore — it lands in `missing` with [`MISSING_RESUME_FAILED`].
     pub restore_tier: Option<String>,
     pub restored_from_boot_at: Option<i64>,
 }
@@ -171,6 +173,12 @@ pub struct RestoreCensusResponse {
     pub clean_shutdown: Option<bool>,
     pub expected: Vec<CensusExpected>,
     pub restored: Vec<CensusRestored>,
+    /// Expected sessions whose terminal came back with NO conversation
+    /// (tier `terminal-only`). Not a restore, and not a miss either: the
+    /// restore did what it could for a row with nothing to resume (plan
+    /// `2026-11-04-unplanned-restart-restore-is-page-gated-and-counts-unverified-resumes`,
+    /// D2). Counted on its own, and it keeps the verdict off `match`.
+    pub terminal_only: Vec<CensusRestored>,
     pub missing: Vec<CensusMissing>,
     pub unexpected: Vec<CensusUnexpected>,
     /// [`RESTORE_VERDICT_MATCH`] | [`RESTORE_VERDICT_PARTIAL`] |
@@ -178,8 +186,9 @@ pub struct RestoreCensusResponse {
     pub verdict: String,
 }
 
-/// One observation of a record that carries a boot-restore stamp from THIS
-/// boot. The pure diff's input, so the diff tests without a store.
+/// One observation of a record THIS boot restored or adopted: it carries this
+/// boot's restore stamp, or it is an `open` row on a live pane whose process
+/// read verifies it. The pure diff's input, so the diff tests without a store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoredObservation {
     pub claude_session_id: String,
@@ -187,6 +196,14 @@ pub struct RestoredObservation {
     pub zone_index: i32,
     pub restore_tier: Option<String>,
     pub restored_from_boot_at: Option<i64>,
+    /// THE back predicate the session ledger serves `returned` from
+    /// ([`crate::session::session_ledger::observe_row`] is
+    /// [`Observed::Back`]): tier `resumed` this boot, or a process read of
+    /// its live pane showing its `claude` running. Only a verified
+    /// observation is a restore, so the census and the ledger cannot
+    /// disagree about a verified pane (plan
+    /// `2026-11-04-unplanned-restart-restore-is-page-gated-and-counts-unverified-resumes`, D2).
+    pub verified: bool,
 }
 
 /// The outcome of [`diff_census`] — the three buckets plus the verdict over
@@ -195,6 +212,7 @@ pub struct RestoredObservation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CensusDiff {
     pub restored: Vec<CensusRestored>,
+    pub terminal_only: Vec<CensusRestored>,
     pub missing: Vec<CensusMissing>,
     pub unexpected: Vec<CensusUnexpected>,
     pub verdict: String,
@@ -339,8 +357,16 @@ pub fn latched() -> Option<&'static BootCensus> {
 /// `unknown`.
 ///
 /// Classification:
-/// - a `failed`-tier stamp is NOT a restore — the tile may exist but the
-///   session did not come back, so it is `missing` / [`MISSING_RESUME_FAILED`];
+/// - only a VERIFIED observation ([`RestoredObservation::verified`]) is a
+///   restore — including a pane this boot ADOPTED with its `claude` still
+///   running, which carries no restore stamp at all;
+/// - an unverified `terminal-only`-tier stamp is NOT a restore — a terminal
+///   came back, the conversation did not — so it is counted in
+///   `terminal_only`, neither restored nor missing, and the verdict is not
+///   `match`;
+/// - any other unverified stamp (a `failed` tier: attempted, not landed) is
+///   NOT a restore either — the tile may exist but the session did not come
+///   back, so it is `missing` / [`MISSING_RESUME_FAILED`];
 /// - a second observation of an already-seen id is
 ///   `unexpected` / [`UNEXPECTED_DUPLICATE`] (2026-07-23 restore duplication);
 /// - an observation of an id not in `expected` is
@@ -355,14 +381,15 @@ pub fn diff_census(
         .iter()
         .map(|e| e.claude_session_id.as_str())
         .collect();
-    // Tier per observed id — consulted when an expected session did NOT come
-    // back, to say WHY.
-    let observed_tier: HashMap<&str, Option<&str>> = observed
+    // Ids this boot attempted — consulted when an expected session did NOT
+    // come back, to say WHY.
+    let attempted: HashSet<&str> = observed
         .iter()
-        .map(|o| (o.claude_session_id.as_str(), o.restore_tier.as_deref()))
+        .map(|o| o.claude_session_id.as_str())
         .collect();
 
     let mut restored: Vec<CensusRestored> = Vec::new();
+    let mut terminal_only: Vec<CensusRestored> = Vec::new();
     let mut unexpected: Vec<CensusUnexpected> = Vec::new();
     let mut seen: HashSet<&str> = HashSet::new();
 
@@ -375,7 +402,8 @@ pub fn diff_census(
             });
             continue;
         }
-        if obs.restore_tier.as_deref() == Some(RESTORE_TIER_FAILED) {
+        let bare_terminal = obs.restore_tier.as_deref() == Some(RESTORE_TIER_TERMINAL_ONLY);
+        if !obs.verified && !bare_terminal {
             // Attempted and not landed — accounted for under `missing` below,
             // never as a restore.
             continue;
@@ -387,13 +415,18 @@ pub fn diff_census(
             });
             continue;
         }
-        restored.push(CensusRestored {
+        let row = CensusRestored {
             claude_session_id: obs.claude_session_id.clone(),
             terminal_id: bound_terminal_id(&obs.terminal_id),
             zone_index: obs.zone_index,
             restore_tier: obs.restore_tier.clone(),
             restored_from_boot_at: obs.restored_from_boot_at,
-        });
+        };
+        if obs.verified {
+            restored.push(row);
+        } else {
+            terminal_only.push(row);
+        }
     }
 
     // Scoped so the `&str`s borrowed out of `restored` are definitively dead
@@ -402,6 +435,7 @@ pub fn diff_census(
     let mut missing: Vec<CensusMissing> = {
         let restored_ids: HashSet<&str> = restored
             .iter()
+            .chain(&terminal_only)
             .map(|r| r.claude_session_id.as_str())
             .collect();
         expected
@@ -411,9 +445,7 @@ pub fn diff_census(
                 claude_session_id: e.claude_session_id.clone(),
                 reason: if !e.restorable {
                     MISSING_NOT_RESTORABLE.to_string()
-                } else if observed_tier.get(e.claude_session_id.as_str())
-                    == Some(&Some(RESTORE_TIER_FAILED))
-                {
+                } else if attempted.contains(e.claude_session_id.as_str()) {
                     MISSING_RESUME_FAILED.to_string()
                 } else {
                     MISSING_NO_ATTEMPT.to_string()
@@ -423,6 +455,7 @@ pub fn diff_census(
     };
 
     restored.sort_by(|a, b| a.claude_session_id.cmp(&b.claude_session_id));
+    terminal_only.sort_by(|a, b| a.claude_session_id.cmp(&b.claude_session_id));
     missing.sort_by(|a, b| a.claude_session_id.cmp(&b.claude_session_id));
     unexpected.sort_by(|a, b| {
         a.claude_session_id
@@ -432,7 +465,7 @@ pub fn diff_census(
 
     let verdict = if clean_shutdown != Some(true) {
         RESTORE_VERDICT_UNKNOWN
-    } else if missing.is_empty() && unexpected.is_empty() {
+    } else if missing.is_empty() && unexpected.is_empty() && terminal_only.is_empty() {
         RESTORE_VERDICT_MATCH
     } else if !restored.is_empty() {
         RESTORE_VERDICT_PARTIAL
@@ -441,6 +474,7 @@ pub fn diff_census(
     };
     CensusDiff {
         restored,
+        terminal_only,
         missing,
         unexpected,
         verdict: verdict.to_string(),
@@ -456,7 +490,12 @@ fn unknown_reason(clean_shutdown: Option<bool>) -> &'static str {
     }
 }
 
-/// Observations of every record carrying a boot-restore stamp from THIS boot.
+/// Observations of every record carrying a boot-restore stamp from THIS boot,
+/// plus every `open` row this boot ADOPTED whose live pane's process read
+/// verifies it (no stamp: a holder pane that survived the restart, its
+/// `claude` still running). Each is judged by the ledger's per-row back
+/// predicate ([`crate::session::session_ledger::observe_row`]) over `live`,
+/// so the two surfaces count the same rows back.
 ///
 /// The `boot_at_ms` gate is load-bearing: `restored_from_boot_at` is STICKY
 /// across restarts by design (a record must not forget it was once restored),
@@ -469,17 +508,22 @@ fn unknown_reason(clean_shutdown: Option<bool>) -> &'static str {
 pub fn observe_restored(
     store: &SessionLifecycleStore,
     boot_at_ms: i64,
+    live: Option<&LiveView>,
 ) -> Vec<RestoredObservation> {
     let mut out: Vec<RestoredObservation> = store
         .all_records()
         .into_iter()
-        .filter(|r| r.restored_from_boot_at.is_some_and(|at| at >= boot_at_ms))
-        .map(|r| RestoredObservation {
-            claude_session_id: r.claude_session_id,
-            terminal_id: r.terminal_id,
-            zone_index: r.zone_index,
-            restore_tier: r.restore_tier,
-            restored_from_boot_at: r.restored_from_boot_at,
+        .filter_map(|r| {
+            let stamped = r.restored_from_boot_at.is_some_and(|at| at >= boot_at_ms);
+            let verified = observe_row(&r, Some(boot_at_ms), live) == Some(Observed::Back);
+            (stamped || verified).then(|| RestoredObservation {
+                claude_session_id: r.claude_session_id,
+                terminal_id: r.terminal_id,
+                zone_index: r.zone_index,
+                restore_tier: r.restore_tier,
+                restored_from_boot_at: r.restored_from_boot_at,
+                verified,
+            })
         })
         .collect();
     out.sort_by(|a, b| a.claude_session_id.cmp(&b.claude_session_id));
@@ -495,10 +539,14 @@ pub fn observe_restored(
 ///   shutdown boundary is unknown.
 /// - `no_clean_shutdown_marker` — the previous shutdown was not clean, so there
 ///   is no trustworthy pre-restart set to compare against (T10).
+///
+/// `live` is the same [`LiveView`] the session ledger reads (`None` when the
+/// terminal manager is unavailable: only `resumed` stamps can then verify).
 pub fn build_census(
     store: &SessionLifecycleStore,
     boot: Option<BootClassification>,
     now_ms: i64,
+    live: Option<&LiveView>,
 ) -> RestoreCensusResponse {
     let clean_shutdown = boot.map(|b| !b.crash_recovery);
     let shutdown_at = boot.and_then(|b| b.prior_marker_at);
@@ -511,12 +559,13 @@ pub fn build_census(
             clean_shutdown,
             expected: Vec::new(),
             restored: Vec::new(),
+            terminal_only: Vec::new(),
             missing: Vec::new(),
             unexpected: Vec::new(),
             verdict: RESTORE_VERDICT_UNKNOWN.to_string(),
         };
     };
-    let observed = observe_restored(store, census.boot_at_ms);
+    let observed = observe_restored(store, census.boot_at_ms, live);
     let diff = diff_census(&census.expected, &observed, clean_shutdown);
     let reason = (diff.verdict == RESTORE_VERDICT_UNKNOWN)
         .then(|| unknown_reason(clean_shutdown).to_string());
@@ -528,6 +577,7 @@ pub fn build_census(
         clean_shutdown,
         expected: census.expected.clone(),
         restored: diff.restored,
+        terminal_only: diff.terminal_only,
         missing: diff.missing,
         unexpected: diff.unexpected,
         verdict: diff.verdict,
@@ -537,9 +587,7 @@ pub fn build_census(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::session_lifecycle_store::{
-        RESTORE_TIER_RESUMED, RESTORE_TIER_TERMINAL_ONLY,
-    };
+    use crate::session::session_lifecycle_store::{RESTORE_TIER_FAILED, RESTORE_TIER_RESUMED};
 
     fn expected(id: &str, restorable: bool) -> CensusExpected {
         CensusExpected {
@@ -560,6 +608,8 @@ mod tests {
             zone_index: 0,
             restore_tier: Some(tier.to_string()),
             restored_from_boot_at: Some(9_000),
+            // A stamp verifies only as `resumed` (the ledger's stamp arm).
+            verified: tier == RESTORE_TIER_RESUMED,
         }
     }
 
@@ -568,13 +618,37 @@ mod tests {
         let exp = [expected("a", true), expected("b", true)];
         let obs = [
             observed("a", RESTORE_TIER_RESUMED),
-            observed("b", RESTORE_TIER_TERMINAL_ONLY),
+            observed("b", RESTORE_TIER_RESUMED),
         ];
         let d = diff_census(&exp, &obs, Some(true));
         assert_eq!(d.restored.len(), 2);
+        assert!(d.terminal_only.is_empty());
         assert!(d.missing.is_empty());
         assert!(d.unexpected.is_empty());
         assert_eq!(d.verdict, RESTORE_VERDICT_MATCH);
+    }
+
+    /// A terminal that came back without its conversation is not a restore:
+    /// counted on its own, never in `restored`, never `missing`, and it keeps
+    /// the verdict off `match` (plan
+    /// `2026-11-04-unplanned-restart-restore-is-page-gated-and-counts-unverified-resumes`, Phase 1).
+    #[test]
+    fn a_terminal_only_restore_is_counted_apart_from_restored() {
+        let exp = [expected("a", true), expected("b", false)];
+        let obs = [
+            observed("a", RESTORE_TIER_RESUMED),
+            observed("b", RESTORE_TIER_TERMINAL_ONLY),
+        ];
+        let d = diff_census(&exp, &obs, Some(true));
+        assert_eq!(d.restored.len(), 1);
+        assert_eq!(d.restored[0].claude_session_id, "a");
+        assert_eq!(d.terminal_only.len(), 1);
+        assert_eq!(d.terminal_only[0].claude_session_id, "b");
+        assert!(d.missing.is_empty(), "{:?}", d.missing);
+        assert_eq!(d.verdict, RESTORE_VERDICT_PARTIAL);
+        // Only terminals came back: nothing expected was restored.
+        let only = diff_census(&exp[1..], &obs[1..], Some(true));
+        assert_eq!(only.verdict, RESTORE_VERDICT_MISMATCH);
     }
 
     #[test]

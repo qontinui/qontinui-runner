@@ -958,12 +958,21 @@ async fn get_sessions_restore_census(
             clean_shutdown: boot.map(|b| !b.crash_recovery),
             expected: Vec::new(),
             restored: Vec::new(),
+            terminal_only: Vec::new(),
             missing: Vec::new(),
             unexpected: Vec::new(),
             verdict: RESTORE_VERDICT_UNKNOWN.to_string(),
         }));
     };
-    Json(ApiResponse::success(build_census(&store, boot, now)))
+    // The same live view the ledger reads, so the two surfaces judge a pane
+    // by one back predicate.
+    let live = crate::session::session_ledger::live_view(&state.app_handle).await;
+    Json(ApiResponse::success(build_census(
+        &store,
+        boot,
+        now,
+        live.as_ref(),
+    )))
 }
 
 /// `GET /control/sessions/ledger` — **the post-rebuild report.**
@@ -977,7 +986,11 @@ async fn get_sessions_restore_census(
 ///     "status": "ok", "verdict": "partial",
 ///     "priorCapturedAt": "2026-08-24T09:02:11Z", "priorReason": "pre-rebuild",
 ///     "expected": [ /* all N */ ],
-///     "returned": [ /* the ones open again */ ],
+///     "returned": [ /* verified back: a process read shows its claude running */ ],
+///     "attemptedUnverified": [ /* a resume attempted this boot, never verified */ ],
+///     "terminalOnly": [ /* a terminal bound to it, no claude in it */ ],
+///     "failed": [ /* a resume attempted this boot that ended without landing */ ],
+///     "unknown": [ /* its pane's process read was unavailable — verdict unknown */ ],
 ///     "missing": [
 ///       { "claudeSessionId": "aaaa…", "sessionName": "amber-otter",
 ///         "worktreePath": "D:/qontinui-root/_wt/foo",
@@ -1005,6 +1018,10 @@ async fn get_sessions_restore_census(
 ///   rather than a guessed one, and the `note` counts how many were omitted
 ///   for that reason.
 /// * **A finished session is never `missing`** — it has its own bucket.
+/// * **`returned` is verified, never inferred** — an attempt stamp, a bare
+///   shell or an unreadable pane is served under its own name, and the
+///   verdict is `match` only when `returned` is the whole expected set
+///   (`session_ledger::observe_returns`).
 /// * Read-only: it stats disk and touches no registry state.
 async fn get_sessions_ledger(
     State(state): State<Arc<ApiState>>,
@@ -1019,7 +1036,7 @@ async fn get_sessions_ledger(
     // The ONE report builder, shared with the Tauri `session_ledger_report`.
     // It stats disk (transcripts, custody records), so it runs off the
     // async executor.
-    let live = crate::session::session_ledger::live_terminal_ids(&state.app_handle);
+    let live = crate::session::session_ledger::live_view(&state.app_handle).await;
     let report = spawn_blocking_tracked(move || {
         crate::session::session_ledger::report(store.as_deref(), live.as_ref())
     })
