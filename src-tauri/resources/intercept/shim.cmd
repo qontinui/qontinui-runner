@@ -221,9 +221,13 @@ if "!DTRIM:~-1!"=="/" (
   set "DTRIM=!DTRIM:~0,-1!"
   goto :is_qontinui_shim_dir_trim
 )
+rem A drive root (C:\ trimmed to C:) has no final name; %%~nx of C: would
+rem name the CURRENT directory on that drive instead.
+if "!DTRIM:~1!"==":" goto :is_qontinui_shim_dir_marker
 set "DNAME="
 for %%N in ("!DTRIM!") do set "DNAME=%%~nxN"
 if /I "!DNAME:~0,18!"=="qontinui-identity-" set "DSKIP=1"
 if /I "!DNAME:~0,14!"=="qontinui-shim-" set "DSKIP=1"
+:is_qontinui_shim_dir_marker
 if exist "!DTRIM!\.qontinui-identity-build" set "DSKIP=1"
 exit /b 0
