@@ -465,7 +465,12 @@ impl TerminalManager {
             },
         }
 
-        let page_id = page_id.unwrap_or_else(|| "default".to_string());
+        let page_id = {
+            use tauri::Manager;
+            let store = app_handle
+                .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>();
+            self.resolve_page_id(page_id, store.as_ref().map(|s| s.inner().as_ref()))
+        };
         let cols = cols.unwrap_or(120);
         let rows = rows.unwrap_or(30);
 
@@ -799,6 +804,22 @@ impl TerminalManager {
     /// Get a terminal session by ID.
     pub fn get(&self, id: &str) -> Option<Arc<TerminalSession>> {
         self.sessions.lock().ok().and_then(|s| s.get(id).cloned())
+    }
+
+    /// The page [`Self::create`] puts a new terminal on: the caller's page when
+    /// it names one, else the one page-capacity rule
+    /// ([`super::page_placement::pick_page_for_new_session`]) over this
+    /// manager's live terminals and `store`'s rows awaiting restore. So no
+    /// unpaged caller — `POST /terminals` without `pageId`, the web-relay
+    /// create, stewards, the tauri_proxy create, the SessionRegistry
+    /// transports — can pile onto `default` past the ceiling. Adoption
+    /// (`insert_with_io`) keeps the recorded page and never comes here.
+    pub(crate) fn resolve_page_id(
+        &self,
+        page_id: Option<String>,
+        store: Option<&crate::session::session_lifecycle_store::SessionLifecycleStore>,
+    ) -> String {
+        page_id.unwrap_or_else(|| super::page_placement::pick_page_for_new_session(self, store))
     }
 
     /// Test seam: mark `id` as being built, as `create` does for the length
