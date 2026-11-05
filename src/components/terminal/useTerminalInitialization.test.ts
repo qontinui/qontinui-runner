@@ -1020,10 +1020,14 @@ describe("buildResumeCmd (gate continuation identity)", () => {
   const GATE = "7252781b-c49c-4a83-bdc2-4fec9c3dcd91";
   const DEVICE = "eb2155ed-0000-4000-8000-000000000001";
 
+  // Pin the host the way the backend-rendered block above does: `isWindows`
+  // reads `navigator.platform`, which in Node reports the real host.
   beforeEach(() => {
     mockInvoke.mockReset();
     mockInvoke.mockResolvedValue({ success: true, message: null, data: { command: "R" } });
+    vi.stubGlobal("navigator", { platform: "Linux x86_64" });
   });
+  afterEach(() => vi.unstubAllGlobals());
 
   it("asks the backend to re-inject the gate identity when both halves are present", async () => {
     await buildResumeCmd("sess-1", undefined, "summary", undefined, {
