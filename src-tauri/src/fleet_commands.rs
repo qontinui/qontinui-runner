@@ -2682,4 +2682,49 @@ mod tests {
              dropping finish-session from the bundle"
         );
     }
+
+    /// `/whereami` documents the `[provisioned: …]` token's
+    /// `skipped-<reason>=<n>` spellings as a closed list, and the renderer
+    /// (`served_corpus::Provisioned::render`) emits one per `SkipReason::wire()`
+    /// with `_` spelled `-`. A reason added without its doc entry renders a
+    /// token the card's reader has never been told about — which is how
+    /// `probe_unknown_in_repo` (qontinui-runner#2304) shipped.
+    ///
+    /// The `match` below is exhaustive, so a new variant fails to compile here
+    /// until it gets an arm. That is a PROMPT to add it to `roster` too, not a
+    /// guarantee: an arm added without a roster entry still compiles. The
+    /// search is confined to the `provisioned` row, so a spelling mentioned
+    /// elsewhere in the card cannot satisfy it.
+    #[test]
+    fn whereami_names_every_skip_reason_the_provisioned_token_can_render() {
+        use crate::capability_manifest::SkipReason;
+        let row = WHEREAMI
+            .lines()
+            .find(|l| l.starts_with("| `provisioned` |"))
+            .expect("whereami.md has a `provisioned` row in its token table");
+        let roster = [
+            SkipReason::GitTracked,
+            SkipReason::ProbeUnknownInRepo,
+            SkipReason::WriteFailed(String::new()),
+            SkipReason::Unresolved(String::new()),
+            SkipReason::Rejected(String::new()),
+            SkipReason::RepoAuthored,
+        ];
+        for reason in &roster {
+            match reason {
+                SkipReason::GitTracked
+                | SkipReason::ProbeUnknownInRepo
+                | SkipReason::WriteFailed(_)
+                | SkipReason::Unresolved(_)
+                | SkipReason::Rejected(_)
+                | SkipReason::RepoAuthored => {}
+            }
+            let spelled = format!("`{}`", reason.wire().replace('_', "-"));
+            assert!(
+                row.contains(&spelled),
+                "whereami.md's `provisioned` row does not name {spelled}; add it there \
+                 (canonical: qontinui-claude-config .claude/commands/whereami.md) and re-vendor"
+            );
+        }
+    }
 }
