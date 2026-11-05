@@ -15037,6 +15037,7 @@ mod tests {
             None,
             AnchorReservation::none(),
             uuid::Uuid::new_v4(),
+            "claude".to_string(),
         )
         .await;
         assert!(
@@ -15164,6 +15165,7 @@ mod tests {
             "echo gate-continuation-proof",
             AnchorReservation::none(),
             pinned,
+            fake_bin.clone(),
         )
         .await;
         assert!(
