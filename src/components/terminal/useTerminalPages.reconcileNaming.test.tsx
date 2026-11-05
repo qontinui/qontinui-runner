@@ -16,7 +16,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }));
 
 import { instanceStorage } from "@/lib/instance-storage";
-import { RESTART_BATCH_PAGE_IDS, ROSTER_BEFORE_RESTART } from "./terminalPageRoster.fixture";
+import { RESTART_BATCH_PAGE_IDS, ROSTER_BEFORE_RESTART } from "./fixtures/terminalPageRoster";
 import { PAGES_STORAGE_KEY, useTerminalPages, type TerminalPageConfig } from "./useTerminalPages";
 
 let container: HTMLDivElement;

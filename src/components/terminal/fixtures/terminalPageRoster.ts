@@ -34,7 +34,7 @@
  *   ordered as the history above (October < the 20:51Z batch < later).
  */
 
-import type { TerminalPageConfig } from "./useTerminalPages";
+import type { TerminalPageConfig } from "../useTerminalPages";
 
 const OCT = Date.UTC(2026, 9, 1); // 2026-10-01
 const OCT_FALLBACK = Date.UTC(2026, 9, 6, 23, 39); // 3e86a8ae

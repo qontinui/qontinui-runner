@@ -1,7 +1,7 @@
 /**
  * The one page-name rule (plan 2026-11-05 Phase 5, D1): pure helpers, and
  * `reconcilePages` / `resolveProjectPage` naming over the roster measured on
- * 2026-11-05 (`terminalPageRoster.fixture.ts`).
+ * 2026-11-05 (`fixtures/terminalPageRoster.ts`).
  */
 
 import { describe, expect, it } from "vitest";
@@ -12,7 +12,7 @@ import {
   RESTART_BATCH_PAGE_IDS,
   ROSTER_2026_11_05,
   ROSTER_BEFORE_RESTART,
-} from "./terminalPageRoster.fixture";
+} from "./fixtures/terminalPageRoster";
 import { reconcilePages, resolveProjectPage, type TerminalPageConfig } from "./useTerminalPages";
 
 const named = (...names: string[]) => names.map((name) => ({ name }));
