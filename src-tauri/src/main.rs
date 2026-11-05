@@ -4833,6 +4833,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     Ok(live_pids) => session::claude_session_registry::read_live_sessions(
                                         &terminal::transcript::find_claude_config_dirs(),
                                         &live_pids,
+                                        &session::claude_session_registry::may_host_claude(&snap),
                                     )
                                     .sessions
                                     .into_iter()

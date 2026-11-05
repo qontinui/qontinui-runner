@@ -2198,8 +2198,11 @@ pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, Stri
     // restore path respawn — fork — every session.
     let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
     let live_pids = crate::session::claude_session_registry::live_pids_from_snapshot(&snapshot)?;
-    let read =
-        crate::session::claude_session_registry::read_live_sessions(&config_dirs, &live_pids);
+    let read = crate::session::claude_session_registry::read_live_sessions(
+        &config_dirs,
+        &live_pids,
+        &crate::session::claude_session_registry::may_host_claude(&snapshot),
+    );
     Ok(CommandResponse {
         success: true,
         message: None,
