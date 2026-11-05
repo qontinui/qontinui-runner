@@ -1685,6 +1685,11 @@ fn main() {
     // Enable backtraces in crash dumps for better diagnostics
     std::env::set_var("RUST_BACKTRACE", "1");
 
+    // Every `claude` the runner spawns inherits DISABLE_AUTOUPDATER=1, so no
+    // runner-hosted session swaps the shared binary under its live peers
+    // (lifecycle plan Phase 82; `session::claude_hook` module docs).
+    session::claude_hook::export_auto_updater_off();
+
     // Export the machine profile's outbound-network settings (HTTPS_PROXY /
     // HTTP_PROXY from `network.proxy_url` when the operator set neither, and
     // NO_PROXY always including loopback) into this process's environment, so

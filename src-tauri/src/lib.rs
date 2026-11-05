@@ -313,6 +313,12 @@ pub mod session_archive;
 /// lib crate because the plan adapter above is its principal consumer.
 pub mod repo_tenant;
 
+/// The context-size reading of a Claude Code `Stop` event (plan
+/// `2026-10-28-one-session-lifecycle-authority` Phase 82, folding
+/// qontinui-claude-config#1915). Pure; the `/lifecycle/hook` route (Phase 83)
+/// is its consumer.
+pub mod stop_context;
+
 // ============================================================================
 // Test-only: shared process-wide env lock
 // ============================================================================

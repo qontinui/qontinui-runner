@@ -1465,7 +1465,9 @@ pub(crate) fn claude_settings_carrier_reading(
         ),
         format!(
             "session::claude_hook::settings_path(session_restore_dir(), \
-             StopHookRegistration::from_env()) — variant read live from env {}",
+             StopHookRegistration::from_env(), LifecycleHooks::from_env()) — the Stop variant \
+             read live from env {}; the lifecycle variant from LIFECYCLE_HOOK_ROUTE_SERVED and \
+             the bound API port",
             crate::mcp::continuation_verdict::FLAG_ENV
         ),
         captured_at,
@@ -1830,6 +1832,7 @@ pub(crate) fn config_report_inputs() -> ConfigReportInputs {
     let hook_path = crate::session::claude_hook::settings_path(
         &crate::session::claude_hook::session_restore_dir(),
         hook_reg,
+        crate::session::claude_hook::LifecycleHooks::from_env(),
     );
     let hook_exists = hook_path.is_file();
     let hook_env = std::env::var(crate::session::claude_hook::CLAUDE_SETTINGS_ENV).ok();

@@ -1,0 +1,207 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:@@RUNNER_API_PORT@@/lifecycle/hook/Stop",
+            "timeout": 1,
+            "headers": {
+              "X-Qontinui-Terminal": "$QONTINUI_TERMINAL_ID"
+            },
+            "allowedEnvVars": [
+              "QONTINUI_TERMINAL_ID"
+            ],
+            "onFailure": "continue"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:@@RUNNER_API_PORT@@/lifecycle/hook/StopFailure",
+            "timeout": 1,
+            "headers": {
+              "X-Qontinui-Terminal": "$QONTINUI_TERMINAL_ID"
+            },
+            "allowedEnvVars": [
+              "QONTINUI_TERMINAL_ID"
+            ],
+            "onFailure": "continue"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:@@RUNNER_API_PORT@@/lifecycle/hook/SubagentStop",
+            "timeout": 1,
+            "headers": {
+              "X-Qontinui-Terminal": "$QONTINUI_TERMINAL_ID"
+            },
+            "allowedEnvVars": [
+              "QONTINUI_TERMINAL_ID"
+            ],
+            "onFailure": "continue"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:@@RUNNER_API_PORT@@/lifecycle/hook/Notification",
+            "timeout": 1,
+            "headers": {
+              "X-Qontinui-Terminal": "$QONTINUI_TERMINAL_ID"
+            },
+            "allowedEnvVars": [
+              "QONTINUI_TERMINAL_ID"
+            ],
+            "onFailure": "continue"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:@@RUNNER_API_PORT@@/lifecycle/hook/PermissionRequest",
+            "timeout": 1,
+            "headers": {
+              "X-Qontinui-Terminal": "$QONTINUI_TERMINAL_ID"
+            },
+            "allowedEnvVars": [
+              "QONTINUI_TERMINAL_ID"
+            ],
+            "onFailure": "continue"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:@@RUNNER_API_PORT@@/lifecycle/hook/UserPromptSubmit",
+            "timeout": 1,
+            "headers": {
+              "X-Qontinui-Terminal": "$QONTINUI_TERMINAL_ID"
+            },
+            "allowedEnvVars": [
+              "QONTINUI_TERMINAL_ID"
+            ],
+            "onFailure": "continue"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:@@RUNNER_API_PORT@@/lifecycle/hook/PreCompact",
+            "timeout": 1,
+            "headers": {
+              "X-Qontinui-Terminal": "$QONTINUI_TERMINAL_ID"
+            },
+            "allowedEnvVars": [
+              "QONTINUI_TERMINAL_ID"
+            ],
+            "onFailure": "continue"
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:@@RUNNER_API_PORT@@/lifecycle/hook/PostCompact",
+            "timeout": 1,
+            "headers": {
+              "X-Qontinui-Terminal": "$QONTINUI_TERMINAL_ID"
+            },
+            "allowedEnvVars": [
+              "QONTINUI_TERMINAL_ID"
+            ],
+            "onFailure": "continue"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:@@RUNNER_API_PORT@@/lifecycle/hook/SessionEnd",
+            "timeout": 1,
+            "headers": {
+              "X-Qontinui-Terminal": "$QONTINUI_TERMINAL_ID"
+            },
+            "allowedEnvVars": [
+              "QONTINUI_TERMINAL_ID"
+            ],
+            "onFailure": "continue"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:@@RUNNER_API_PORT@@/lifecycle/hook/PreToolUse",
+            "timeout": 1,
+            "headers": {
+              "X-Qontinui-Terminal": "$QONTINUI_TERMINAL_ID"
+            },
+            "allowedEnvVars": [
+              "QONTINUI_TERMINAL_ID"
+            ],
+            "onFailure": "continue"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:@@RUNNER_API_PORT@@/lifecycle/hook/PostToolUse",
+            "timeout": 1,
+            "headers": {
+              "X-Qontinui-Terminal": "$QONTINUI_TERMINAL_ID"
+            },
+            "allowedEnvVars": [
+              "QONTINUI_TERMINAL_ID"
+            ],
+            "onFailure": "continue"
+          }
+        ]
+      }
+    ]
+  },
+  "allowedHttpHookUrls": [
+    "http://127.0.0.1:@@RUNNER_API_PORT@@/lifecycle/hook/*"
+  ]
+}

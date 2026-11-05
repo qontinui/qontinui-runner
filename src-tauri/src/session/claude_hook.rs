@@ -29,10 +29,13 @@
 //!     D2/D6). `PermissionRequest`, unconditional: the DECISION is dialled at
 //!     the runner's pad per prompt, never at registration, so the key is in
 //!     both variants.
-//!   * `claude_hook_settings-permreq.json` / `claude_hook_settings-permreq-nostop.json` —
+//!   * `claude_hook_settings-lc.json` / `claude_hook_settings-lc-nostop.json`
+//!     ([`HOOK_SETTINGS_NAME`] / [`HOOK_SETTINGS_NAME_NOSTOP`]; a `-p<port>`
+//!     suffix before `.json` when the lifecycle hooks below are written) —
 //!     `{ "hooks": { "SessionStart": [...], "PreCompact": [...],
 //!     "PermissionRequest": [...], "Stop": [...] },
-//!     "permissions": { "allow": [...] } }`, each `command` pointing at the
+//!     "permissions": { "allow": [...] },
+//!     "env": { "DISABLE_AUTOUPDATER": "1" } }`, each `command` pointing at the
 //!     corresponding materialized script. **`permissions.allow` rides this same
 //!     carrier** (it pre-approves `mcp__coord-mcp`), which is why the file is
 //!     built structurally rather than by text surgery — see [`build_settings`].
@@ -42,6 +45,45 @@
 //!     per assistant turn. The two variants use DISTINCT FILENAMES because the
 //!     hook dir is machine-global — see [`session_restore_dir`].
 //!
+//!   * the LIFECYCLE `type: "http"` hooks ([`LIFECYCLE_HOOKS`], plan
+//!     `2026-10-28-one-session-lifecycle-authority` Phase 82) — Stop,
+//!     StopFailure, SubagentStop, Notification, PermissionRequest,
+//!     UserPromptSubmit, PreCompact, PostCompact, SessionEnd, PreToolUse on
+//!     `Bash` and PostToolUse on the file-writing tools, each POSTing the CLI's
+//!     own payload to the HOSTING runner's `/lifecycle/hook/<event>`. Merged
+//!     into BOTH Stop variants as their own matcher blocks, beside (never
+//!     inside) the command hooks. **Written only by a build that also serves
+//!     that route** ([`LIFECYCLE_HOOK_ROUTE_SERVED`], turned on by Phase 83):
+//!     without the route every Stop, PreToolUse and PostToolUse would get a
+//!     404, a non-blocking error per tool call. Their URL bakes in the runner
+//!     API port, so the port is a filename component whenever they are
+//!     written ([`LifecycleHooks::file_suffix`]); a build that does not write
+//!     them keeps the plain names.
+//!
+//! Every carrier also sets `env.DISABLE_AUTOUPDATER = "1"` (Phase 82): a
+//! runner-spawned session must not have Claude Code swap its own binary under
+//! the live sessions sharing it (`claude.exe: Text file busy`, observed
+//! 2026-10-29). The cost is that a box running only runner-hosted sessions
+//! stays on its installed Claude Code (plugins included — the variable also
+//! stops their background updates) until someone runs `claude update`, which
+//! the variable does not refuse. It narrows the hazard rather than closing it:
+//! a `claude` started OUTSIDE the runner still auto-updates and can still swap
+//! the binary under runner sessions.
+//!
+//! The carrier reaches every session that is HANDED it — the identity shim and
+//! every direct `--settings` spawn alike — but not one that is not: a direct
+//! `claude` exec with no `--settings` in its argv, or any spawn where
+//! [`materialize`] failed open. So the runner also exports the same variable
+//! into its OWN process environment at startup ([`export_auto_updater_off`],
+//! called from `main` while it is still single-threaded), which every child
+//! process it spawns inherits; the carrier's copy covers a session launched by
+//! anything else that hands it the carrier.
+//!
+//! Transcript retention (`cleanupPeriodDays`) is deliberately NOT set here: it
+//! stays Claude Code's default, and a longer one would be an account-wide
+//! choice for the served `claude_settings/baseline`, never a per-session
+//! carrier.
+//!
 //! **This build writes exactly one of its two carrier names per posture**, so
 //! nothing outside this module should name one: in the DEFAULT (dark) posture
 //! the armed name ([`HOOK_SETTINGS_NAME`]) is the file that is NOT written.
@@ -49,15 +91,15 @@
 //! `--settings` carrier" rather than a filename — pinned by
 //! `tests::only_the_stop_script_may_name_a_carrier_file`.
 //!
-//! **The names carry a ROSTER TOKEN (`-permreq`).** The dir is machine-global
+//! **The names carry a ROSTER TOKEN (`-lc`).** The dir is machine-global
 //! (see [`session_restore_dir`]), and an OLDER runner instance on the same box
-//! writes the pre-`PermissionRequest` carrier under the old names
-//! (`claude_hook_settings.json` / `claude_hook_settings-nostop.json`, listed in
-//! [`RETIRED_SETTINGS_NAMES`]). Had this build kept those names, that older
-//! instance would overwrite this build's carrier with a hook-less file while
-//! this process's cache still reported a hit — the per-variant-name rule below,
-//! applied to the roster change. A future roster change takes a new token the
-//! same way.
+//! writes an older carrier under an older roster's names (listed in
+//! [`RETIRED_SETTINGS_NAMES`]): the pre-`PermissionRequest` pair, and the
+//! `-permreq` pair, which carries no `env.DISABLE_AUTOUPDATER`. Had this build
+//! kept one of those names, that older instance would overwrite this build's
+//! carrier with a file missing what this build delivers while this process's
+//! cache still reported a hit — the per-variant-name rule below, applied to
+//! the roster change. A future roster change takes a new token the same way.
 //!
 //! ## Two delivery paths, because only one has a wrapper in the chain
 //!
@@ -97,6 +139,717 @@
 //! committed by a user inspecting their repo.
 
 use std::path::{Path, PathBuf};
+
+// Phase 82 (lifecycle plan): the lifecycle http-hook carrier. Every test that
+// names a symbol Phase 82 added or re-signed (`LifecycleHooks`, the 3-argument
+// `settings_path` / `hook_files`, `merge_lifecycle_hooks`, ...) lives in this
+// module rather than in `tests`, so `tests` still builds against a tree with
+// this phase's production code reverted (the arming proof's revert tree).
+#[cfg(test)]
+mod lifecycle_carrier_tests {
+    use super::*;
+
+    /// `GET /terminals` `permissionRequestHook`, over the three delivery paths.
+    #[test]
+    fn permission_request_hook_follows_the_carrier_each_spawn_path_hands_over() {
+        use PermissionRequestHook::{Absent, Registered};
+        let dir = Path::new("/r/session-restore");
+        let armed = settings_path(
+            dir,
+            StopHookRegistration::Registered,
+            LifecycleHooks::Omitted,
+        );
+        let dark = settings_path(dir, StopHookRegistration::Omitted, LifecycleHooks::Omitted);
+        let old = dir.join("claude_hook_settings-nostop.json");
+        let s = |v: &[&str]| v.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+
+        // 3. The shell pane: the seam's carrier rides the env var to the shim.
+        assert_eq!(permission_request_hook_for(None, Some(&dark)), Registered);
+        assert_eq!(
+            permission_request_hook_for(Some(&[]), Some(&armed)),
+            Registered
+        );
+        assert_eq!(
+            permission_request_hook_for(None, None),
+            Absent,
+            "materialize failed"
+        );
+        assert_eq!(
+            permission_request_hook_for(None, Some(&old)),
+            Absent,
+            "a retired roster's carrier does not register the hook"
+        );
+
+        // 1. A direct exec carrying `--settings` (direct_spawn_settings_args,
+        // the provider adapter's launch spec): judged on THAT path.
+        let direct = s(&[
+            "/bin/claude",
+            "--settings",
+            &dark.to_string_lossy(),
+            "-p",
+            "x",
+        ]);
+        assert_eq!(permission_request_hook_for(Some(&direct), None), Registered);
+        let eq_form = s(&["claude", &format!("--settings={}", armed.display())]);
+        assert_eq!(
+            permission_request_hook_for(Some(&eq_form), None),
+            Registered
+        );
+        let stale = s(&["claude", "--settings", &old.to_string_lossy()]);
+        assert_eq!(
+            permission_request_hook_for(Some(&stale), Some(&dark)),
+            Absent,
+            "the argv's own carrier decides, not the env var"
+        );
+
+        // 2. A direct `claude` exec with no argv carrier: no shim, so Absent
+        // even though the seam materialized one.
+        for program in [
+            "claude",
+            "/usr/local/bin/claude",
+            r"C:\npm\claude.cmd",
+            "CLAUDE.exe",
+        ] {
+            let bare = s(&[program, "--resume", "abc"]);
+            assert_eq!(
+                permission_request_hook_for(Some(&bare), Some(&dark)),
+                Absent,
+                "{program}"
+            );
+        }
+        // An explicit SHELL wrapper goes through the shim like the shell pane.
+        for shell in [
+            "bash",
+            "/bin/sh",
+            "zsh",
+            "pwsh",
+            r"C:\Windows\System32\cmd.exe",
+        ] {
+            let wrapped = s(&[shell, "-lc", "claude"]);
+            assert_eq!(
+                permission_request_hook_for(Some(&wrapped), Some(&dark)),
+                Registered,
+                "{shell}"
+            );
+            assert_eq!(
+                permission_request_hook_for(Some(&wrapped), None),
+                Absent,
+                "{shell} with no materialized carrier"
+            );
+        }
+        // RISK 6: any OTHER program with no argv carrier is absent, however a
+        // carrier was materialized for its env.
+        for argv in [
+            s(&["node", "/opt/claude-code/cli.js"]),
+            s(&["npm", "run", "dev"]),
+            s(&["codex"]),
+            s(&["pi", "--model", "x"]),
+            s(&["python3", "-m", "http.server"]),
+        ] {
+            assert_eq!(
+                permission_request_hook_for(Some(&argv), Some(&dark)),
+                Absent,
+                "{argv:?}"
+            );
+        }
+        assert_eq!(Registered.as_str(), "registered");
+        assert_eq!(Absent.as_str(), "absent");
+    }
+
+    #[test]
+    fn is_current_carrier_names_exactly_the_names_this_build_writes() {
+        let dir = Path::new("/x/session-restore");
+        for reg in [
+            StopHookRegistration::Registered,
+            StopHookRegistration::Omitted,
+        ] {
+            for lifecycle in [
+                LifecycleHooks::Omitted,
+                LifecycleHooks::Registered { port: 9876 },
+            ] {
+                assert!(
+                    is_current_carrier(&settings_path(dir, reg, lifecycle)),
+                    "{reg:?} {lifecycle:?}"
+                );
+            }
+        }
+        for other in [
+            "claude_hook_settings.json",
+            "claude_hook_settings-nostop.json",
+            "claude_hook_settings-permreq.json",
+            "claude_hook_settings-permreq-nostop.json",
+            "settings.json",
+            "claude_hook_settings-lc.json.bak",
+            "claude_hook_settings-lc-p0.json",
+            "claude_hook_settings-lc-p09876.json",
+            "claude_hook_settings-lc-p70000.json",
+            "claude_hook_settings-lc-p+9876.json",
+            "claude_hook_settings-lc-p.json",
+            "claude_hook_settings-lc-nostop-px.json",
+            "",
+        ] {
+            assert!(!is_current_carrier(&dir.join(other)), "{other:?}");
+        }
+        assert!(!is_current_carrier(Path::new("")));
+    }
+
+    /// The caller's half of the fail-open contract: a `None` build must NOT
+    /// leave a partial settings file behind.
+    #[test]
+    fn shipped_template_builds_and_a_none_build_writes_nothing() {
+        // Sanity: the real bundled template is well-formed in both variants —
+        // otherwise the `None` arm below would pass vacuously.
+        let p = Path::new("/tmp/x.sh");
+        for reg in [
+            StopHookRegistration::Registered,
+            StopHookRegistration::Omitted,
+        ] {
+            assert!(
+                build_settings(HOOK_SETTINGS, p, p, p, p, p, reg).is_some(),
+                "the bundled template builds under {reg:?}"
+            );
+        }
+
+        // And the caller propagates a `None` build as `None` WITHOUT writing a
+        // partial settings file — while the scripts (materialization, not
+        // registration) are still written, and the cache is not poisoned.
+        let tmp = tempfile::tempdir().unwrap();
+        for reg in [
+            StopHookRegistration::Registered,
+            StopHookRegistration::Omitted,
+        ] {
+            let settings_path = tmp.path().join(reg.settings_name());
+            assert!(
+                materialize_from_template(tmp.path(), reg, LifecycleHooks::Omitted, "{ not json")
+                    .is_none(),
+                "{reg:?}: a malformed template degrades to no --settings"
+            );
+            assert!(
+                !settings_path.exists(),
+                "{reg:?}: no partial settings file written"
+            );
+            // Materialization is NOT gated on the build succeeding.
+            assert!(tmp.path().join(HOOK_SCRIPT_NAME).exists());
+            assert!(tmp.path().join(STOP_HOOK_SCRIPT_NAME).exists());
+            assert!(tmp.path().join(PRECOMPACT_HOOK_SCRIPT_NAME).exists());
+            assert!(tmp
+                .path()
+                .join(PERMISSION_REQUEST_HOOK_SCRIPT_NAME)
+                .exists());
+        }
+
+        // A later good build still works — the failed attempt cached nothing.
+        let dark_settings = tmp.path().join(HOOK_SETTINGS_NAME_NOSTOP);
+        let ok = materialize_with(tmp.path(), StopHookRegistration::Omitted);
+        assert_eq!(ok.as_deref(), Some(dark_settings.as_path()));
+        assert!(dark_settings.exists());
+    }
+
+    /// The roster [`hook_files`] stats: six entries — five scripts plus the
+    /// variant's carrier — every one of which [`materialize_with`] writes.
+    #[test]
+    fn hook_files_is_the_six_entry_roster_materialize_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        for reg in [
+            StopHookRegistration::Registered,
+            StopHookRegistration::Omitted,
+        ] {
+            let files = hook_files(tmp.path(), reg, LifecycleHooks::Omitted);
+            assert_eq!(files.len(), 6);
+            let names: Vec<String> = files
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                names,
+                [
+                    HOOK_SCRIPT_NAME,
+                    STOP_HOOK_SCRIPT_NAME,
+                    PRECOMPACT_HOOK_SCRIPT_NAME,
+                    POLICY_HOOK_SCRIPT_NAME,
+                    PERMISSION_REQUEST_HOOK_SCRIPT_NAME,
+                    reg.settings_name(),
+                ]
+            );
+            materialize_with(tmp.path(), reg).unwrap();
+            for f in &files {
+                assert!(f.exists(), "{} not materialized", f.display());
+            }
+        }
+    }
+
+    /// The events the lifecycle carrier registers, and each one's matcher.
+    const LIFECYCLE_EVENTS: [(&str, Option<&str>); 11] = [
+        ("Stop", None),
+        ("StopFailure", None),
+        ("SubagentStop", None),
+        ("Notification", None),
+        ("PermissionRequest", None),
+        ("UserPromptSubmit", None),
+        ("PreCompact", None),
+        ("PostCompact", None),
+        ("SessionEnd", None),
+        ("PreToolUse", Some("Bash")),
+        ("PostToolUse", Some("Edit|Write|MultiEdit|NotebookEdit")),
+    ];
+
+    /// A port no real runner uses.
+    const LC: LifecycleHooks = LifecycleHooks::Registered { port: 49_876 };
+
+    fn read_json(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// Every `type: "http"` entry in a parsed carrier, as (event, entry).
+    fn http_entries(v: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
+        let mut out = Vec::new();
+        for (event, blocks) in v["hooks"].as_object().unwrap() {
+            for block in blocks.as_array().unwrap() {
+                for entry in block["hooks"].as_array().unwrap() {
+                    if entry["type"] == "http" {
+                        out.push((event.clone(), entry.clone()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// A build that serves no `/lifecycle/hook` route writes NO lifecycle http
+    /// hook, whatever port it bound — the carrier every spawn of THIS build
+    /// hands over registers command hooks only.
+    #[test]
+    fn this_build_writes_no_lifecycle_hooks_until_the_route_serves() {
+        assert_eq!(
+            LifecycleHooks::resolve(LIFECYCLE_HOOK_ROUTE_SERVED, 9876),
+            LifecycleHooks::Omitted,
+            "LIFECYCLE_HOOK_ROUTE_SERVED is on: Phase 83 turns it on together with \
+             /lifecycle/hook; Phase 82 alone must not"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        for reg in [
+            StopHookRegistration::Registered,
+            StopHookRegistration::Omitted,
+        ] {
+            let path = materialize_variant(
+                tmp.path(),
+                reg,
+                LifecycleHooks::resolve(LIFECYCLE_HOOK_ROUTE_SERVED, 9876),
+            )
+            .unwrap();
+            assert_eq!(
+                path.file_name().unwrap().to_string_lossy(),
+                reg.settings_name()
+            );
+            let v = read_json(&path);
+            assert!(http_entries(&v).is_empty(), "{reg:?} wrote an http hook");
+            assert!(v.get("allowedHttpHookUrls").is_none());
+        }
+    }
+
+    #[test]
+    fn lifecycle_hooks_resolve_needs_the_route_and_a_port() {
+        assert_eq!(
+            LifecycleHooks::resolve(true, 9877),
+            LifecycleHooks::Registered { port: 9877 }
+        );
+        assert_eq!(LifecycleHooks::resolve(true, 0), LifecycleHooks::Omitted);
+        assert_eq!(
+            LifecycleHooks::resolve(false, 9877),
+            LifecycleHooks::Omitted
+        );
+        assert_eq!(LC.file_suffix(), "-p49876");
+        assert_eq!(LifecycleHooks::Omitted.file_suffix(), "");
+    }
+
+    /// Every carrier this build writes — both Stop variants, with and
+    /// without the lifecycle hooks — sets `env.DISABLE_AUTOUPDATER = "1"`, and
+    /// leaves transcript retention at Claude Code's default.
+    #[test]
+    fn every_carrier_disables_the_auto_updater_and_keeps_default_retention() {
+        let tmp = tempfile::tempdir().unwrap();
+        for reg in [
+            StopHookRegistration::Registered,
+            StopHookRegistration::Omitted,
+        ] {
+            for lifecycle in [LifecycleHooks::Omitted, LC] {
+                let v = read_json(&materialize_variant(tmp.path(), reg, lifecycle).unwrap());
+                assert_eq!(
+                    v["env"][DISABLE_AUTOUPDATER_ENV], "1",
+                    "{reg:?} {lifecycle:?}"
+                );
+                assert!(
+                    v.get("cleanupPeriodDays").is_none(),
+                    "retention stays the default"
+                );
+            }
+        }
+    }
+
+    /// The auto-updater value is SET, not read: a template that sets it to
+    /// something else, or carries other env keys, cannot change it; a
+    /// non-object `env` is malformed and fails open.
+    #[test]
+    fn the_auto_updater_value_is_set_by_the_builder_not_the_template() {
+        let p = Path::new("/x/s.sh");
+        let base = r##""hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash '@@HOOK_SCRIPT@@'"}]}],"PreCompact":[{"hooks":[{"type":"command","command":"bash '@@PRECOMPACT_HOOK_SCRIPT@@'"}]}],"PermissionRequest":[{"matcher":"*","hooks":[{"type":"command","command":"bash '@@PERMISSION_REQUEST_HOOK_SCRIPT@@'"}]}]}"##;
+        let overridden = format!(r#"{{{base},"env":{{"DISABLE_AUTOUPDATER":"0","KEEP":"x"}}}}"#);
+        let out = build_settings(&overridden, p, p, p, p, p, StopHookRegistration::Omitted)
+            .expect("builds");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["env"][DISABLE_AUTOUPDATER_ENV], "1");
+        assert_eq!(v["env"]["KEEP"], "x");
+        let bad_env = format!(r#"{{{base},"env":[]}}"#);
+        assert!(build_settings(&bad_env, p, p, p, p, p, StopHookRegistration::Omitted).is_none());
+        // An http entry in the COMMAND template would be written whatever the
+        // route gate says, so it is malformed there. The entry also carries a
+        // resolvable `command`, so the http guard is the ONLY thing that
+        // refuses it: the same entry typed `command` builds.
+        let open_hooks = base
+            .strip_suffix('}')
+            .expect("the template ends by closing its hooks object");
+        let stop_entry = |kind: &str| {
+            format!(
+                r#"{{{open_hooks},"Stop":[{{"hooks":[{{"type":"{kind}","url":"http://127.0.0.1:1/x","command":"bash '@@STOP_HOOK_SCRIPT@@'"}}]}}]}}}}"#
+            )
+        };
+        let with_http = stop_entry("http");
+        assert!(serde_json::from_str::<serde_json::Value>(&with_http).is_ok());
+        assert!(
+            build_settings(&with_http, p, p, p, p, p, StopHookRegistration::Registered).is_none()
+        );
+        assert!(build_settings(
+            &stop_entry("command"),
+            p,
+            p,
+            p,
+            p,
+            p,
+            StopHookRegistration::Registered
+        )
+        .is_some());
+        // The shipped command template carries none.
+        assert!(build_settings(
+            HOOK_SETTINGS,
+            p,
+            p,
+            p,
+            p,
+            p,
+            StopHookRegistration::Registered
+        )
+        .is_some());
+    }
+
+    /// The registered lifecycle carrier: every event POSTs to the HOSTING
+    /// runner's `/lifecycle/hook/<event>`, never blocks the session, names the
+    /// pane through an allowed header, keeps its own matcher, and sits beside —
+    /// never inside — the command hooks.
+    #[test]
+    fn registered_lifecycle_hooks_post_every_event_to_the_hosting_runner() {
+        let tmp = tempfile::tempdir().unwrap();
+        for reg in [
+            StopHookRegistration::Registered,
+            StopHookRegistration::Omitted,
+        ] {
+            let path = materialize_variant(tmp.path(), reg, LC).unwrap();
+            assert_eq!(
+                path.file_name().unwrap().to_string_lossy(),
+                settings_file_name(reg, LC)
+            );
+            assert!(path.to_string_lossy().ends_with("-p49876.json"));
+            let v = read_json(&path);
+            let entries = http_entries(&v);
+            assert_eq!(
+                entries.len(),
+                LIFECYCLE_EVENTS.len(),
+                "{reg:?}: one http hook per event"
+            );
+            for (event, matcher) in LIFECYCLE_EVENTS {
+                let blocks = v["hooks"][event]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{event} absent"));
+                let block = blocks
+                    .iter()
+                    .find(|b| b["hooks"][0]["type"] == "http")
+                    .unwrap_or_else(|| panic!("{event}: no http block"));
+                assert_eq!(
+                    block["hooks"].as_array().unwrap().len(),
+                    1,
+                    "{event}: own block"
+                );
+                assert_eq!(
+                    block.get("matcher").and_then(|m| m.as_str()),
+                    matcher,
+                    "{event}"
+                );
+                let h = &block["hooks"][0];
+                assert_eq!(
+                    h["url"],
+                    format!("http://127.0.0.1:49876/lifecycle/hook/{event}")
+                );
+                assert_eq!(
+                    h["onFailure"], "continue",
+                    "{event} must never block a session"
+                );
+                assert_eq!(h["timeout"], 1);
+                assert_eq!(h["headers"]["X-Qontinui-Terminal"], "$QONTINUI_TERMINAL_ID");
+                assert_eq!(
+                    h["allowedEnvVars"],
+                    serde_json::json!(["QONTINUI_TERMINAL_ID"])
+                );
+            }
+            // SessionStart keeps exactly its two command hooks and gains none.
+            let ss = v["hooks"]["SessionStart"].as_array().unwrap();
+            assert_eq!(ss.len(), 1);
+            assert!(ss[0]["hooks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|h| h["type"] == "command"));
+            // The command hooks are untouched: PermissionRequest's command block
+            // is still first, PreCompact's command still runs our script.
+            assert!(v["hooks"]["PermissionRequest"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains(PERMISSION_REQUEST_HOOK_SCRIPT_NAME));
+            assert!(v["hooks"]["PreCompact"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains(PRECOMPACT_HOOK_SCRIPT_NAME));
+            let stop_commands = v["hooks"]["Stop"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|b| b["hooks"].as_array().unwrap().clone())
+                .filter(|h| h["type"] == "command")
+                .count();
+            assert_eq!(
+                stop_commands,
+                usize::from(reg == StopHookRegistration::Registered),
+                "the dark variant still spawns no bash per turn"
+            );
+            assert_eq!(
+                v["allowedHttpHookUrls"],
+                serde_json::json!(["http://127.0.0.1:49876/lifecycle/hook/*"])
+            );
+        }
+    }
+
+    /// Two runners on two ports never share a carrier, and each names its own
+    /// port — the carrier is instance-keyed, because the URL cannot
+    /// interpolate the port.
+    #[test]
+    fn two_ports_write_two_carriers_each_naming_its_own_port() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = materialize_variant(
+            tmp.path(),
+            StopHookRegistration::Omitted,
+            LifecycleHooks::Registered { port: 40_001 },
+        )
+        .unwrap();
+        let b = materialize_variant(
+            tmp.path(),
+            StopHookRegistration::Omitted,
+            LifecycleHooks::Registered { port: 40_002 },
+        )
+        .unwrap();
+        assert_ne!(a, b);
+        assert!(std::fs::read_to_string(&a)
+            .unwrap()
+            .contains("127.0.0.1:40001/lifecycle/hook/"));
+        assert!(!std::fs::read_to_string(&a).unwrap().contains("40002"));
+        assert!(std::fs::read_to_string(&b)
+            .unwrap()
+            .contains("127.0.0.1:40002/lifecycle/hook/"));
+        assert!(is_current_carrier(&a) && is_current_carrier(&b));
+        // Back to the first port in the same dir: the cache holds B's entry
+        // and every file A needs is on disk, so only the lifecycle half of
+        // the cache comparison stops it handing back B's carrier.
+        let again = materialize_variant(
+            tmp.path(),
+            StopHookRegistration::Omitted,
+            LifecycleHooks::Registered { port: 40_001 },
+        )
+        .unwrap();
+        assert_eq!(again, a, "port A again is served A's carrier, never B's");
+    }
+
+    /// The runner's own environment carries `DISABLE_AUTOUPDATER=1` once
+    /// `main` has run the export, and a `std::process::Command` child inherits
+    /// it. (The PTY seam's `CommandBuilder` seeds its env from the same process
+    /// env; on Windows it also overlays the registry `Environment` values.)
+    #[test]
+    fn the_runner_exports_the_auto_updater_off_into_its_own_environment() {
+        let _lock = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[DISABLE_AUTOUPDATER_ENV]);
+        std::env::remove_var(DISABLE_AUTOUPDATER_ENV);
+        export_auto_updater_off();
+        assert_eq!(std::env::var(DISABLE_AUTOUPDATER_ENV).as_deref(), Ok("1"));
+        #[cfg(unix)]
+        {
+            let out = std::process::Command::new("sh")
+                .args(["-c", "printf %s \"$DISABLE_AUTOUPDATER\""])
+                .output()
+                .expect("sh runs");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                "1",
+                "a child inherits it"
+            );
+        }
+    }
+
+    /// `Omitted` returns the carrier byte for byte, so a build that serves no
+    /// route writes exactly the carrier `build_settings` produced.
+    #[test]
+    fn an_omitted_merge_is_the_identity() {
+        let p = Path::new("/x/s.sh");
+        let built = build_settings(
+            HOOK_SETTINGS,
+            p,
+            p,
+            p,
+            p,
+            p,
+            StopHookRegistration::Registered,
+        )
+        .unwrap();
+        assert_eq!(
+            merge_lifecycle_hooks(&built, LIFECYCLE_HOOKS, LifecycleHooks::Omitted).as_deref(),
+            Some(built.as_str())
+        );
+        // Even a malformed lifecycle template cannot affect an omitted merge.
+        assert_eq!(
+            merge_lifecycle_hooks(&built, "{ not json", LifecycleHooks::Omitted).as_deref(),
+            Some(built.as_str())
+        );
+    }
+
+    /// A malformed lifecycle template fails the whole carrier OPEN (`None`),
+    /// never into a carrier with a hook that blocks, 404s or points elsewhere.
+    #[test]
+    fn a_malformed_lifecycle_template_fails_open() {
+        let p = Path::new("/x/s.sh");
+        let built =
+            build_settings(HOOK_SETTINGS, p, p, p, p, p, StopHookRegistration::Omitted).unwrap();
+        let entry = |url: &str, on_failure: &str, kind: &str| {
+            format!(r#"{{"type":"{kind}","url":"{url}","onFailure":"{on_failure}"}}"#)
+        };
+        let ok_url = "http://127.0.0.1:@@RUNNER_API_PORT@@/lifecycle/hook/Stop";
+        let doc = |hook: &str, patterns: &str| {
+            format!(
+                r#"{{"hooks":{{"Stop":[{{"hooks":[{hook}]}}]}},"allowedHttpHookUrls":{patterns}}}"#
+            )
+        };
+        let good_patterns = r#"["http://127.0.0.1:@@RUNNER_API_PORT@@/lifecycle/hook/*"]"#;
+        let good = doc(&entry(ok_url, "continue", "http"), good_patterns);
+        assert!(
+            merge_lifecycle_hooks(&built, &good, LC).is_some(),
+            "the control case builds"
+        );
+        for (label, template) in [
+            ("not json", "{ not json".to_string()),
+            ("no hooks", r#"{"allowedHttpHookUrls":[]}"#.to_string()),
+            (
+                "empty hooks",
+                r#"{"hooks":{},"allowedHttpHookUrls":[]}"#.to_string(),
+            ),
+            (
+                "unknown placeholder",
+                doc(
+                    &entry(
+                        "http://127.0.0.1:@@PORT@@/lifecycle/hook/Stop",
+                        "continue",
+                        "http",
+                    ),
+                    good_patterns,
+                ),
+            ),
+            (
+                "a command entry",
+                doc(&entry(ok_url, "continue", "command"), good_patterns),
+            ),
+            (
+                "onFailure block",
+                doc(&entry(ok_url, "block", "http"), good_patterns),
+            ),
+            (
+                "onFailure misspelled",
+                doc(&entry(ok_url, "Continue", "http"), good_patterns),
+            ),
+            (
+                "another route",
+                doc(
+                    &entry(
+                        "http://127.0.0.1:@@RUNNER_API_PORT@@/terminals/agent-event",
+                        "continue",
+                        "http",
+                    ),
+                    good_patterns,
+                ),
+            ),
+            (
+                "another event's route",
+                doc(
+                    &entry(
+                        "http://127.0.0.1:@@RUNNER_API_PORT@@/lifecycle/hook/SessionEnd",
+                        "continue",
+                        "http",
+                    ),
+                    good_patterns,
+                ),
+            ),
+            (
+                "another host",
+                doc(
+                    &entry("http://example.com/lifecycle/hook/Stop", "continue", "http"),
+                    good_patterns,
+                ),
+            ),
+            (
+                "no url allowlist",
+                format!(
+                    r#"{{"hooks":{{"Stop":[{{"hooks":[{}]}}]}}}}"#,
+                    entry(ok_url, "continue", "http")
+                ),
+            ),
+            (
+                "an empty url allowlist",
+                doc(&entry(ok_url, "continue", "http"), "[]"),
+            ),
+            (
+                "an allowlist for elsewhere",
+                doc(
+                    &entry(ok_url, "continue", "http"),
+                    r#"["http://example.com/*"]"#,
+                ),
+            ),
+        ] {
+            assert!(
+                merge_lifecycle_hooks(&built, &template, LC).is_none(),
+                "{label}"
+            );
+        }
+    }
+
+    /// The shipped lifecycle template carries exactly the Phase 82 event set.
+    #[test]
+    fn the_shipped_lifecycle_template_is_the_phase_82_event_set() {
+        let v: serde_json::Value = serde_json::from_str(LIFECYCLE_HOOKS).unwrap();
+        let mut events: Vec<&str> = v["hooks"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        events.sort_unstable();
+        let mut want: Vec<&str> = LIFECYCLE_EVENTS.iter().map(|(e, _)| *e).collect();
+        want.sort_unstable();
+        assert_eq!(events, want);
+        assert!(!v["hooks"].as_object().unwrap().contains_key("SessionStart"));
+    }
+}
 
 /// Hook-script template (bundled). Substitutes nothing — it reads everything it
 /// needs from env (`QONTINUI_TERMINAL_ID`, `QONTINUI_INSTALL_INTERCEPT_PORT`)
@@ -175,6 +928,120 @@ const PERMISSION_REQUEST_HOOK_SCRIPT: &str =
 const HOOK_SETTINGS: &str =
     include_str!("../../resources/session-restore/claude_hook_settings.json");
 
+/// The lifecycle `type: "http"` hook entries (bundled) — plan
+/// `2026-10-28-one-session-lifecycle-authority` Phase 82 (architecture node
+/// R3-1), adopting runner#2196's agent-event carrier as its base: the same
+/// template-plus-port shape and the same per-port filename rule, aimed at the
+/// lifecycle module's route and carrying its event set.
+///
+/// Why each property, measured or documented rather than assumed:
+/// - **http, not command**: zero process spawn per event on a saturated box,
+///   no Git Bash. The body is the same JSON a command hook reads on stdin
+///   (runner#2196's probe, 2.1.285; loopback answers in 5–14 ms).
+/// - **`onFailure: "continue"`, spelled exactly**: 2.1.318's `--settings`
+///   http-hook schema is `onFailure: enum ["continue", "block"]`, optional,
+///   with `"continue"` its documented default — so a misspelled value fails
+///   the settings file's validation rather than meaning `continue`, and an
+///   absent one leaves the behaviour to a default this carrier does not
+///   control. Spelling it out keeps the one property that matters fixed: a
+///   down or wedged runner must never hold a session's turn; the 1 s
+///   `timeout` bounds what it costs.
+/// - **the terminal id rides a header**: `X-Qontinui-Terminal:
+///   $QONTINUI_TERMINAL_ID`, interpolated only because `allowedEnvVars` names
+///   it (an unlisted `$VAR` interpolates to the empty string).
+/// - **`allowedHttpHookUrls` names the route**: a settings source that SETS
+///   that allowlist blocks every http hook whose URL matches none of its
+///   patterns, and the arrays MERGE across settings sources, so carrying our
+///   own pattern is what keeps a managed allowlist from silently dropping
+///   these hooks. The cost, recorded for Phase 83 which writes them: where no
+///   other source sets it, this pattern makes the allowlist DEFINED, and a
+///   session's own http hooks to any other URL are then blocked.
+/// - **`PreToolUse` on `Bash` only, `PostToolUse` on the file-writing tools
+///   only**: the touched set (git commands, cwd, command class, written
+///   paths) is all the lifecycle module reads at tool grain; every other tool
+///   call costs nothing.
+/// - **SessionStart is NOT here**: it keeps its two `command` hooks (the
+///   confirmation hook and the policy injection, whose stdout IS the
+///   injected context); the architecture reads http as unsupported there
+///   (SIG-3).
+const LIFECYCLE_HOOKS: &str =
+    include_str!("../../resources/session-restore/claude_lifecycle_hooks.json");
+
+/// The Claude Code env var every carrier sets to `"1"` through its `env` key
+/// (module docs; [`build_settings`]), and the runner exports into its own
+/// environment ([`export_auto_updater_off`]).
+pub const DISABLE_AUTOUPDATER_ENV: &str = "DISABLE_AUTOUPDATER";
+
+/// Set [`DISABLE_AUTOUPDATER_ENV`]`=1` in THIS process's environment, so every
+/// child the runner spawns — a PTY session, a headless `claude`, a direct
+/// `claude` exec with no `--settings`, a spawn whose carrier failed to
+/// materialize — inherits it (module docs). Writing the environment is sound
+/// only while no other thread exists, so `main` calls this beside its other
+/// startup `set_var`s, before any runtime starts.
+pub fn export_auto_updater_off() {
+    std::env::set_var(DISABLE_AUTOUPDATER_ENV, "1");
+}
+
+/// Placeholder for the hosting runner's API port in [`LIFECYCLE_HOOKS`].
+const RUNNER_API_PORT_PLACEHOLDER: &str = "@@RUNNER_API_PORT@@";
+
+/// Whether THIS build serves `/lifecycle/hook/<event>`, the route the
+/// [`LIFECYCLE_HOOKS`] entries POST to. `false` until Phase 83 lands that
+/// route; Phase 83 turns this on in the same change.
+///
+/// It is a build constant, not an env flag, because the question is a fact
+/// about the binary: a carrier naming a route this build does not serve turns
+/// every Stop, PreToolUse and PostToolUse into a 404, a non-blocking error per
+/// tool call, and no runtime setting makes the route exist.
+pub const LIFECYCLE_HOOK_ROUTE_SERVED: bool = false;
+
+/// Whether the delivered carrier registers the [`LIFECYCLE_HOOKS`], and
+/// against which runner API port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LifecycleHooks {
+    /// Register them, POSTing to this (the hosting runner's) port.
+    Registered { port: u16 },
+    /// Omit them: this build serves no `/lifecycle/hook` route, or the port
+    /// did not resolve (a URL naming port 0 fails on every event).
+    Omitted,
+}
+
+impl LifecycleHooks {
+    /// PURE: `served && port != 0` ⇒ `Registered`; anything else ⇒ `Omitted`.
+    pub fn resolve(served: bool, port: u16) -> Self {
+        if served && port != 0 {
+            LifecycleHooks::Registered { port }
+        } else {
+            LifecycleHooks::Omitted
+        }
+    }
+
+    /// Live read: [`LIFECYCLE_HOOK_ROUTE_SERVED`] and the port this runner
+    /// BOUND — the same one a PTY child's `QONTINUI_RUNNER_API_PORT` names, so
+    /// the URL names the HOSTING runner even when several share a box.
+    pub fn from_env() -> Self {
+        Self::resolve(
+            LIFECYCLE_HOOK_ROUTE_SERVED,
+            crate::terminal::spawn_seam_api_port(),
+        )
+    }
+
+    /// The carrier FILENAME component for this variant. The carrier dir is
+    /// shared by every runner instance that shares a `QONTINUI_HOME`, and the
+    /// port is baked into the file's CONTENT, so two runners on different
+    /// ports must never share a name — the rule [`HOOK_SETTINGS_NAME_NOSTOP`]
+    /// documents for the Stop variants. This is also what makes the carrier
+    /// INSTANCE-keyed rather than home-keyed: Claude Code interpolates env vars
+    /// into hook headers only, never into the URL. `Omitted` keeps the plain
+    /// names.
+    fn file_suffix(self) -> String {
+        match self {
+            LifecycleHooks::Registered { port } => format!("-p{port}"),
+            LifecycleHooks::Omitted => String::new(),
+        }
+    }
+}
+
 /// File name of the materialized hook script.
 const HOOK_SCRIPT_NAME: &str = "claude_session_hook.sh";
 /// File name of the materialized Stop-hook script.
@@ -186,9 +1053,9 @@ const POLICY_HOOK_SCRIPT_NAME: &str = "claude_policy_hook.sh";
 /// File name of the materialized PermissionRequest-hook script.
 const PERMISSION_REQUEST_HOOK_SCRIPT_NAME: &str = "claude_permission_request_hook.sh";
 /// File name of the materialized `--settings` file for the ARMED variant
-/// ([`StopHookRegistration::Registered`]). Carries the `-permreq` roster token
-/// — see the module docs and [`RETIRED_SETTINGS_NAMES`].
-const HOOK_SETTINGS_NAME: &str = "claude_hook_settings-permreq.json";
+/// ([`StopHookRegistration::Registered`]). Carries the `-lc` roster token —
+/// see the module docs and [`RETIRED_SETTINGS_NAMES`].
+const HOOK_SETTINGS_NAME: &str = "claude_hook_settings-lc.json";
 /// File name of the materialized `--settings` file for the DARK variant
 /// ([`StopHookRegistration::Omitted`]).
 ///
@@ -204,19 +1071,22 @@ const HOOK_SETTINGS_NAME: &str = "claude_hook_settings-permreq.json";
 /// `coord_mcp.rs` keys its `--mcp-config` filename per workdir+terminal.
 ///
 /// The same rule covers a ROSTER change, which is why both names carry the
-/// `-permreq` token: an older build writes a carrier without the
-/// `PermissionRequest` key, and it must not be able to write it under a name
-/// this build delivers.
-const HOOK_SETTINGS_NAME_NOSTOP: &str = "claude_hook_settings-permreq-nostop.json";
+/// `-lc` token: an older build writes a carrier without the
+/// `PermissionRequest` key or without `env.DISABLE_AUTOUPDATER`, and it must
+/// not be able to write it under a name this build delivers.
+const HOOK_SETTINGS_NAME_NOSTOP: &str = "claude_hook_settings-lc-nostop.json";
 
-/// The carrier names of the PREVIOUS roster (before the `PermissionRequest`
-/// key). This build never writes or delivers them; an older runner instance on
-/// the same box still may, which is exactly why this build moved off them. DO
-/// NOT delete them from disk — that would be reaching into another live
-/// process's delivery (see [`hook_files`]).
-pub const RETIRED_SETTINGS_NAMES: [&str; 2] = [
+/// The carrier names of the PREVIOUS rosters: the pair before the
+/// `PermissionRequest` key, and the `-permreq` pair before
+/// `env.DISABLE_AUTOUPDATER`. This build never writes or delivers them; an
+/// older runner instance on the same box still may, which is exactly why this
+/// build moved off them. DO NOT delete them from disk — that would be reaching
+/// into another live process's delivery (see [`hook_files`]).
+pub const RETIRED_SETTINGS_NAMES: [&str; 4] = [
     "claude_hook_settings.json",
     "claude_hook_settings-nostop.json",
+    "claude_hook_settings-permreq.json",
+    "claude_hook_settings-permreq-nostop.json",
 ];
 
 /// Template placeholders, one per bundled script. These are the substitution
@@ -282,28 +1152,68 @@ impl StopHookRegistration {
     }
 }
 
-/// The absolute path of the `--settings` carrier `base_dir` holds for `reg`.
+/// The absolute path of the `--settings` carrier `base_dir` holds for the
+/// (`reg`, `lifecycle`) pair.
 ///
 /// THE one definition of that path. [`materialize_from_template`] writes it,
 /// [`hook_files`] stats it and `config_report_cmd::claude_settings_carrier_reading`
 /// REPORTS it, all through here — so a diagnostic that names the carrier cannot
 /// name a different file than the spawn seam writes. A second copy of
-/// `base_dir.join(reg.settings_name())` would compile, agree on the day it was
+/// `base_dir.join(settings_file_name(reg, lifecycle))` would compile, agree on the day it was
 /// written, and start lying the first time either half moved, which is exactly
 /// the defect class the config report exists to expose.
-pub fn settings_path(base_dir: &Path, reg: StopHookRegistration) -> PathBuf {
-    base_dir.join(reg.settings_name())
+pub fn settings_path(
+    base_dir: &Path,
+    reg: StopHookRegistration,
+    lifecycle: LifecycleHooks,
+) -> PathBuf {
+    base_dir.join(settings_file_name(reg, lifecycle))
 }
 
-/// Whether `path` names a carrier THIS build writes — one of the two current
-/// roster names, either variant. Every such file registers the
+/// The carrier's file name for a (Stop variant, lifecycle variant) pair:
+/// `claude_hook_settings-lc[-nostop][-p<port>].json`. Every per-process
+/// difference in the carrier's CONTENT is a component of this name.
+fn settings_file_name(reg: StopHookRegistration, lifecycle: LifecycleHooks) -> String {
+    let base = reg.settings_name();
+    let stem = base.strip_suffix(".json").unwrap_or(base);
+    format!("{stem}{}.json", lifecycle.file_suffix())
+}
+
+/// Whether `path` names a carrier THIS build writes — either Stop variant, plain
+/// or port-suffixed ([`settings_file_name`]). Every such file registers the
 /// `PermissionRequest` hook ([`build_settings`] refuses a template without
 /// it), so this is what `GET /terminals` `permissionRequestHook` keys on for a
 /// `--settings` carried in a spawn's argv.
 pub fn is_current_carrier(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| n == HOOK_SETTINGS_NAME || n == HOOK_SETTINGS_NAME_NOSTOP)
+        .is_some_and(is_current_carrier_name)
+}
+
+/// PURE: whether `name` is one of the names [`settings_file_name`] can
+/// produce — either Stop variant, plain or with a `-p<port>` lifecycle suffix
+/// naming a non-zero port.
+fn is_current_carrier_name(name: &str) -> bool {
+    [HOOK_SETTINGS_NAME, HOOK_SETTINGS_NAME_NOSTOP]
+        .iter()
+        .any(|base| {
+            let stem = base.strip_suffix(".json").unwrap_or(base);
+            let Some(rest) = name.strip_prefix(stem) else {
+                return false;
+            };
+            if rest == ".json" {
+                return true;
+            }
+            rest.strip_prefix("-p")
+                .and_then(|r| r.strip_suffix(".json"))
+                .is_some_and(|port| {
+                    // Digits only: `u16::from_str` also takes a leading `+`,
+                    // which `settings_file_name` never writes.
+                    port.bytes().all(|b| b.is_ascii_digit())
+                        && !port.starts_with('0')
+                        && port.parse::<u16>().is_ok_and(|p| p != 0)
+                })
+        })
 }
 
 /// Whether a terminal was handed a carrier that registers the
@@ -459,22 +1369,27 @@ pub fn session_restore_dir() -> PathBuf {
 /// pinned via `--session-id`; only the confirmation hook is absent). The hook
 /// script is marked executable on Unix.
 ///
-/// CACHED PER (`base_dir`, [`StopHookRegistration`]) (Phase 6, B2). The five
-/// SCRIPTS are byte-identical for a given `base_dir` (they are `include_str!`'d
-/// constants), and the settings file is a function of `base_dir` AND the
-/// registration variant — the two variants write DIFFERENT filenames with
-/// different content, so the cache carries the variant both to key the right
-/// file names and to rewrite rather than serve a path built under the other
-/// flag state. Every terminal spawn used to rewrite all of them plus a `chmod`
+/// CACHED PER (`base_dir`, [`StopHookRegistration`], [`LifecycleHooks`])
+/// (Phase 6, B2). The five SCRIPTS are byte-identical for a given `base_dir`
+/// (they are `include_str!`'d constants), and the settings file is a function
+/// of `base_dir` AND both variants — each pair writes a DIFFERENT filename with
+/// different content, so the cache carries the variants both to key the right
+/// file names and to rewrite rather than serve a path built under another
+/// flag state or port. Every terminal spawn used to rewrite all of them plus a `chmod`
 /// each; after the first materialize in this process a spawn with the SAME
 /// variant costs one `stat` per file (proving they are still there) and nothing
 /// else. An externally deleted or modified file — or a variant mismatch — falls
 /// straight through to a full rewrite, so the cache can never serve a path that
 /// is not on disk or whose content disagrees with the wanted variant.
 ///
-/// Reads the live flag; see [`materialize_with`] for the explicit-variant form.
+/// Reads the live flag and [`LifecycleHooks::from_env`]; see
+/// [`materialize_variant`] for the explicit-variant form.
 pub fn materialize(base_dir: &Path) -> Option<PathBuf> {
-    materialize_with(base_dir, StopHookRegistration::from_env())
+    materialize_variant(
+        base_dir,
+        StopHookRegistration::from_env(),
+        LifecycleHooks::from_env(),
+    )
 }
 
 /// The `--settings <path>` argv pair for a spawn that execs `claude` DIRECTLY,
@@ -535,9 +1450,19 @@ fn settings_args_from(path: Option<PathBuf>) -> Vec<String> {
 }
 
 /// [`materialize`] with the `Stop`-hook registration variant supplied
-/// explicitly (the unit-test surface; production reads the env).
+/// explicitly and NO lifecycle hooks (the unit-test surface; production reads
+/// the env).
 pub fn materialize_with(base_dir: &Path, stop: StopHookRegistration) -> Option<PathBuf> {
-    materialize_from_template(base_dir, stop, HOOK_SETTINGS)
+    materialize_variant(base_dir, stop, LifecycleHooks::Omitted)
+}
+
+/// [`materialize`] with both variants supplied explicitly.
+pub fn materialize_variant(
+    base_dir: &Path,
+    stop: StopHookRegistration,
+    lifecycle: LifecycleHooks,
+) -> Option<PathBuf> {
+    materialize_from_template(base_dir, stop, lifecycle, HOOK_SETTINGS)
 }
 
 /// [`materialize_with`] against an explicit settings template. Private seam:
@@ -547,9 +1472,10 @@ pub fn materialize_with(base_dir: &Path, stop: StopHookRegistration) -> Option<P
 fn materialize_from_template(
     base_dir: &Path,
     stop: StopHookRegistration,
+    lifecycle: LifecycleHooks,
     template: &str,
 ) -> Option<PathBuf> {
-    if let Some(settings_path) = cached_materialization(base_dir, stop) {
+    if let Some(settings_path) = cached_materialization(base_dir, stop, lifecycle) {
         return Some(settings_path);
     }
     if let Err(e) = std::fs::create_dir_all(base_dir) {
@@ -622,24 +1548,29 @@ fn materialize_from_template(
         &policy_script_path,
         &permission_request_script_path,
         stop,
-    ) {
+    )
+    .and_then(|built| merge_lifecycle_hooks(&built, LIFECYCLE_HOOKS, lifecycle))
+    {
         Some(s) => s,
         None => {
             tracing::warn!(
-                path = %settings_path(base_dir, stop).display(),
+                path = %settings_path(base_dir, stop, lifecycle).display(),
                 "session-restore: claude hook settings template malformed — --settings hook delivery off (identity still pinned)"
             );
             return None;
         }
     };
-    let settings_path = settings_path(base_dir, stop);
+    let settings_path = settings_path(base_dir, stop, lifecycle);
     if let Err(e) = std::fs::write(&settings_path, settings.as_bytes()) {
         tracing::warn!(error = %e, path = %settings_path.display(), "session-restore: claude hook settings write failed");
         return None;
     }
 
     if let Ok(mut done) = MATERIALIZED.lock() {
-        done.insert(base_dir.to_path_buf(), (stop, settings_path.clone()));
+        done.insert(
+            base_dir.to_path_buf(),
+            (stop, lifecycle, settings_path.clone()),
+        );
     }
     Some(settings_path)
 }
@@ -740,6 +1671,20 @@ fn build_settings(
         hooks.get("SessionStart")?;
         hooks.get("PreCompact")?;
         hooks.get("PermissionRequest")?;
+        // No lifecycle http entry may ride the COMMAND template: those are
+        // merged in afterwards, gated on the route this build serves
+        // ([`merge_lifecycle_hooks`]). One in the template would be written
+        // whatever the gate says.
+        if hooks
+            .values()
+            .filter_map(|blocks| blocks.as_array())
+            .flatten()
+            .filter_map(|block| block.get("hooks").and_then(|h| h.as_array()))
+            .flatten()
+            .any(|entry| entry.get("type").and_then(|t| t.as_str()) == Some("http"))
+        {
+            return None;
+        }
         // SETTLE `Stop` BEFORE resolving, never after. Order is load-bearing:
         // under the dark variant the key is DELETED, so a malformed `Stop` block
         // never reaches the delivered file and must not be able to veto it.
@@ -779,18 +1724,127 @@ fn build_settings(
             ],
         )?;
     }
+    // Every carrier disables Claude Code's auto-updater (module docs). SET here
+    // rather than read from the template, so no template can drop or change
+    // it: a session that swapped the binary would swap it under every other
+    // live session on the box. Any other `env` key the template carries is
+    // kept; a non-object `env` is a malformed template.
+    root.as_object_mut()?
+        .entry("env")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()?
+        .insert(
+            DISABLE_AUTOUPDATER_ENV.to_string(),
+            serde_json::Value::String("1".to_string()),
+        );
+    serde_json::to_string_pretty(&root).ok()
+}
+
+/// PURE: the carrier [`build_settings`] produced (`built`), plus the
+/// [`LIFECYCLE_HOOKS`] entries when `lifecycle` registers them.
+///
+/// `Omitted` returns `built` UNCHANGED — byte for byte, which is what keeps a
+/// build that serves no `/lifecycle/hook` route writing exactly the carrier
+/// [`build_settings`] produced: the command hooks plus the `env` key, no http
+/// entry and no `allowedHttpHookUrls`.
+///
+/// `Registered { port }` renders the port into the template, then adds each
+/// event's blocks as their OWN matcher blocks appended to that event's array —
+/// never inside an existing command block, so the template's own `matcher`
+/// (`Bash`; the file-writing tools) is kept and [`resolve_commands`] never
+/// sees an http entry. It also adds the template's `allowedHttpHookUrls`
+/// patterns to the carrier's list.
+///
+/// `None` — the whole carrier fails open — when the lifecycle template is
+/// malformed, leaves a placeholder unrendered, carries an entry that is not
+/// `type: "http"` with a `url` on this port's `/lifecycle/hook/`, or one whose
+/// `onFailure` is not exactly `"continue"`. The shipped template is pinned
+/// well-formed by a test.
+fn merge_lifecycle_hooks(
+    built: &str,
+    lifecycle_template: &str,
+    lifecycle: LifecycleHooks,
+) -> Option<String> {
+    let LifecycleHooks::Registered { port } = lifecycle else {
+        return Some(built.to_string());
+    };
+    let rendered = lifecycle_template.replace(RUNNER_API_PORT_PLACEHOLDER, &port.to_string());
+    if rendered.contains("@@") {
+        return None;
+    }
+    let lifecycle_root: serde_json::Value = serde_json::from_str(&rendered).ok()?;
+    let route = format!("http://127.0.0.1:{port}/lifecycle/hook/");
+    let lifecycle_hooks = lifecycle_root.get("hooks")?.as_object()?;
+    if lifecycle_hooks.is_empty() {
+        return None;
+    }
+    let mut root: serde_json::Value = serde_json::from_str(built).ok()?;
+    {
+        let hooks = root.get_mut("hooks")?.as_object_mut()?;
+        for (event, blocks) in lifecycle_hooks {
+            let blocks = blocks.as_array()?;
+            if blocks.is_empty() {
+                return None;
+            }
+            for block in blocks {
+                let inner = block.get("hooks")?.as_array()?;
+                if inner.is_empty() {
+                    return None;
+                }
+                for entry in inner {
+                    let well_formed = entry.get("type")?.as_str()? == "http"
+                        && entry
+                            .get("url")?
+                            .as_str()?
+                            .strip_prefix(route.as_str())
+                            .is_some_and(|tail| tail == event)
+                        && entry.get("onFailure")?.as_str()? == "continue";
+                    if !well_formed {
+                        return None;
+                    }
+                }
+            }
+            match hooks.get_mut(event.as_str()) {
+                Some(existing) => existing.as_array_mut()?.extend(blocks.iter().cloned()),
+                None => {
+                    hooks.insert(event.clone(), serde_json::Value::Array(blocks.clone()));
+                }
+            }
+        }
+    }
+    let patterns = lifecycle_root.get("allowedHttpHookUrls")?.as_array()?;
+    if patterns.is_empty()
+        || patterns
+            .iter()
+            .any(|p| !p.as_str().is_some_and(|p| p.starts_with(route.as_str())))
+    {
+        return None;
+    }
+    let obj = root.as_object_mut()?;
+    let list = obj
+        .entry("allowedHttpHookUrls")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()?;
+    for p in patterns {
+        if !list.contains(p) {
+            list.push(p.clone());
+        }
+    }
     serde_json::to_string_pretty(&root).ok()
 }
 
 /// Base dirs whose hook set this process has already materialized, mapped to
-/// the registration variant it was built under and the settings path
-/// [`materialize_with`] returned. The variant is part of the VALUE (not just
-/// the key) so a mismatch is detectable and forces a rewrite.
+/// the Stop registration and lifecycle variant it was built under and the
+/// settings path it returned. Both variants are part of the VALUE (not just
+/// the key) so a mismatch in either is detectable and forces a rewrite.
 static MATERIALIZED: once_cell::sync::Lazy<
-    std::sync::Mutex<std::collections::HashMap<PathBuf, (StopHookRegistration, PathBuf)>>,
+    std::sync::Mutex<
+        std::collections::HashMap<PathBuf, (StopHookRegistration, LifecycleHooks, PathBuf)>,
+    >,
 > = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// Every file a [`materialize`] under `reg` is responsible for, in `base_dir`.
+/// Every file a [`materialize`] under (`reg`, `lifecycle`) is responsible for,
+/// in `base_dir`.
 ///
 /// The five SCRIPTS are variant-INDEPENDENT (they are written unconditionally
 /// — registration is gated, materialization is not), so both variants leave all
@@ -803,19 +1857,24 @@ static MATERIALIZED: once_cell::sync::Lazy<
 /// after a flag flip). That is fine and harmless — every instance's spawn
 /// points `--settings` at its own name — so DO NOT "clean it up": deleting the
 /// other variant's file would be reaching into another live process's delivery.
-fn hook_files(base_dir: &Path, reg: StopHookRegistration) -> [PathBuf; 6] {
+fn hook_files(
+    base_dir: &Path,
+    reg: StopHookRegistration,
+    lifecycle: LifecycleHooks,
+) -> [PathBuf; 6] {
     [
         base_dir.join(HOOK_SCRIPT_NAME),
         base_dir.join(STOP_HOOK_SCRIPT_NAME),
         base_dir.join(PRECOMPACT_HOOK_SCRIPT_NAME),
         base_dir.join(POLICY_HOOK_SCRIPT_NAME),
         base_dir.join(PERMISSION_REQUEST_HOOK_SCRIPT_NAME),
-        settings_path(base_dir, reg),
+        settings_path(base_dir, reg, lifecycle),
     ]
 }
 
 /// The settings path for `base_dir` if this process already materialized it
-/// UNDER THE WANTED VARIANT and all six files are still present. `None` (⇒
+/// UNDER THE WANTED VARIANTS (Stop registration AND lifecycle) and all six
+/// files are still present. `None` (⇒
 /// full rewrite) otherwise, so an operator who deletes the dir gets it back on
 /// the next spawn — and a variant change rewrites rather than serving a file
 /// whose bytes were produced under the other flag state.
@@ -827,12 +1886,20 @@ fn hook_files(base_dir: &Path, reg: StopHookRegistration) -> [PathBuf; 6] {
 /// nothing about what another runner instance sharing the machine-global dir
 /// may have written. What makes that safe is the per-variant FILE NAME, not
 /// this cache — no other instance writes the name this variant reads.
-fn cached_materialization(base_dir: &Path, want: StopHookRegistration) -> Option<PathBuf> {
-    let (cached_variant, settings_path) = MATERIALIZED.lock().ok()?.get(base_dir)?.clone();
-    if cached_variant != want {
+fn cached_materialization(
+    base_dir: &Path,
+    want: StopHookRegistration,
+    want_lifecycle: LifecycleHooks,
+) -> Option<PathBuf> {
+    let (cached_variant, cached_lifecycle, settings_path) =
+        MATERIALIZED.lock().ok()?.get(base_dir)?.clone();
+    if cached_variant != want || cached_lifecycle != want_lifecycle {
         return None;
     }
-    if hook_files(base_dir, want).iter().all(|p| p.exists()) {
+    if hook_files(base_dir, want, want_lifecycle)
+        .iter()
+        .all(|p| p.exists())
+    {
         Some(settings_path)
     } else {
         None
@@ -1328,132 +2395,6 @@ mod tests {
             .exists());
     }
 
-    /// `GET /terminals` `permissionRequestHook`, over the three delivery paths.
-    #[test]
-    fn permission_request_hook_follows_the_carrier_each_spawn_path_hands_over() {
-        use PermissionRequestHook::{Absent, Registered};
-        let dir = Path::new("/r/session-restore");
-        let armed = settings_path(dir, StopHookRegistration::Registered);
-        let dark = settings_path(dir, StopHookRegistration::Omitted);
-        let old = dir.join("claude_hook_settings-nostop.json");
-        let s = |v: &[&str]| v.iter().map(|a| a.to_string()).collect::<Vec<_>>();
-
-        // 3. The shell pane: the seam's carrier rides the env var to the shim.
-        assert_eq!(permission_request_hook_for(None, Some(&dark)), Registered);
-        assert_eq!(
-            permission_request_hook_for(Some(&[]), Some(&armed)),
-            Registered
-        );
-        assert_eq!(
-            permission_request_hook_for(None, None),
-            Absent,
-            "materialize failed"
-        );
-        assert_eq!(
-            permission_request_hook_for(None, Some(&old)),
-            Absent,
-            "a retired roster's carrier does not register the hook"
-        );
-
-        // 1. A direct exec carrying `--settings` (direct_spawn_settings_args,
-        // the provider adapter's launch spec): judged on THAT path.
-        let direct = s(&[
-            "/bin/claude",
-            "--settings",
-            &dark.to_string_lossy(),
-            "-p",
-            "x",
-        ]);
-        assert_eq!(permission_request_hook_for(Some(&direct), None), Registered);
-        let eq_form = s(&["claude", &format!("--settings={}", armed.display())]);
-        assert_eq!(
-            permission_request_hook_for(Some(&eq_form), None),
-            Registered
-        );
-        let stale = s(&["claude", "--settings", &old.to_string_lossy()]);
-        assert_eq!(
-            permission_request_hook_for(Some(&stale), Some(&dark)),
-            Absent,
-            "the argv's own carrier decides, not the env var"
-        );
-
-        // 2. A direct `claude` exec with no argv carrier: no shim, so Absent
-        // even though the seam materialized one.
-        for program in [
-            "claude",
-            "/usr/local/bin/claude",
-            r"C:\npm\claude.cmd",
-            "CLAUDE.exe",
-        ] {
-            let bare = s(&[program, "--resume", "abc"]);
-            assert_eq!(
-                permission_request_hook_for(Some(&bare), Some(&dark)),
-                Absent,
-                "{program}"
-            );
-        }
-        // An explicit SHELL wrapper goes through the shim like the shell pane.
-        for shell in [
-            "bash",
-            "/bin/sh",
-            "zsh",
-            "pwsh",
-            r"C:\Windows\System32\cmd.exe",
-        ] {
-            let wrapped = s(&[shell, "-lc", "claude"]);
-            assert_eq!(
-                permission_request_hook_for(Some(&wrapped), Some(&dark)),
-                Registered,
-                "{shell}"
-            );
-            assert_eq!(
-                permission_request_hook_for(Some(&wrapped), None),
-                Absent,
-                "{shell} with no materialized carrier"
-            );
-        }
-        // RISK 6: any OTHER program with no argv carrier is absent, however a
-        // carrier was materialized for its env.
-        for argv in [
-            s(&["node", "/opt/claude-code/cli.js"]),
-            s(&["npm", "run", "dev"]),
-            s(&["codex"]),
-            s(&["pi", "--model", "x"]),
-            s(&["python3", "-m", "http.server"]),
-        ] {
-            assert_eq!(
-                permission_request_hook_for(Some(&argv), Some(&dark)),
-                Absent,
-                "{argv:?}"
-            );
-        }
-        assert_eq!(Registered.as_str(), "registered");
-        assert_eq!(Absent.as_str(), "absent");
-    }
-
-    #[test]
-    fn is_current_carrier_names_exactly_this_builds_two_files() {
-        let dir = Path::new("/x/session-restore");
-        assert!(is_current_carrier(&settings_path(
-            dir,
-            StopHookRegistration::Registered
-        )));
-        assert!(is_current_carrier(&settings_path(
-            dir,
-            StopHookRegistration::Omitted
-        )));
-        for other in [
-            "claude_hook_settings.json",
-            "claude_hook_settings-nostop.json",
-            "settings.json",
-            "claude_hook_settings-permreq.json.bak",
-            "",
-        ] {
-            assert!(!is_current_carrier(&dir.join(other)), "{other:?}");
-        }
-        assert!(!is_current_carrier(Path::new("")));
-    }
-
     /// The cache's real contract, not the tautology it replaced: `materialize`
     /// returns `base_dir.join(<name>)`, a pure function of its arguments, so
     /// `a == b` would hold with the cache deleted entirely. Observe the
@@ -1531,6 +2472,36 @@ mod tests {
             HOOK_SETTINGS_NAME,
             "an armed flag delivers the Stop-registering settings file"
         );
+    }
+
+    /// ARMING (Phase 82; black box through the production entry point, so it
+    /// builds against the base): whatever the Stop-hook flag says, the carrier
+    /// [`materialize`] hands every spawn turns Claude Code's auto-updater off
+    /// (`env.DISABLE_AUTOUPDATER = "1"`) and registers only command hooks —
+    /// this build serves no lifecycle route, so it writes no http hook.
+    #[test]
+    fn every_spawned_session_carrier_turns_the_auto_updater_off() {
+        use crate::mcp::continuation_verdict::FLAG_ENV;
+        let _lock = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[FLAG_ENV]);
+        for flag in [None, Some("observe")] {
+            match flag {
+                Some(value) => std::env::set_var(FLAG_ENV, value),
+                None => std::env::remove_var(FLAG_ENV),
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let carrier = materialize(dir.path()).expect("the carrier materializes");
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&carrier).unwrap()).unwrap();
+            assert_eq!(v["env"]["DISABLE_AUTOUPDATER"], "1", "{flag:?}: {v}");
+            for blocks in v["hooks"].as_object().unwrap().values() {
+                for block in blocks.as_array().unwrap() {
+                    for entry in block["hooks"].as_array().unwrap() {
+                        assert_eq!(entry["type"], "command", "{flag:?}: {entry}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1988,57 +2959,6 @@ mod tests {
         }
     }
 
-    /// The caller's half of the fail-open contract: a `None` build must NOT
-    /// leave a partial settings file behind.
-    #[test]
-    fn shipped_template_builds_and_a_none_build_writes_nothing() {
-        // Sanity: the real bundled template is well-formed in both variants —
-        // otherwise the negative test above would pass vacuously.
-        let p = Path::new("/tmp/x.sh");
-        for reg in [
-            StopHookRegistration::Registered,
-            StopHookRegistration::Omitted,
-        ] {
-            assert!(
-                build_settings(HOOK_SETTINGS, p, p, p, p, p, reg).is_some(),
-                "the bundled template builds under {reg:?}"
-            );
-        }
-
-        // And the caller propagates a `None` build as `None` WITHOUT writing a
-        // partial settings file — while the scripts (materialization, not
-        // registration) are still written, and the cache is not poisoned.
-        let tmp = tempfile::tempdir().unwrap();
-        for reg in [
-            StopHookRegistration::Registered,
-            StopHookRegistration::Omitted,
-        ] {
-            let settings_path = tmp.path().join(reg.settings_name());
-            assert!(
-                materialize_from_template(tmp.path(), reg, "{ not json").is_none(),
-                "{reg:?}: a malformed template degrades to no --settings"
-            );
-            assert!(
-                !settings_path.exists(),
-                "{reg:?}: no partial settings file written"
-            );
-            // Materialization is NOT gated on the build succeeding.
-            assert!(tmp.path().join(HOOK_SCRIPT_NAME).exists());
-            assert!(tmp.path().join(STOP_HOOK_SCRIPT_NAME).exists());
-            assert!(tmp.path().join(PRECOMPACT_HOOK_SCRIPT_NAME).exists());
-            assert!(tmp
-                .path()
-                .join(PERMISSION_REQUEST_HOOK_SCRIPT_NAME)
-                .exists());
-        }
-
-        // A later good build still works — the failed attempt cached nothing.
-        let dark_settings = tmp.path().join(HOOK_SETTINGS_NAME_NOSTOP);
-        let ok = materialize_with(tmp.path(), StopHookRegistration::Omitted);
-        assert_eq!(ok.as_deref(), Some(dark_settings.as_path()));
-        assert!(dark_settings.exists());
-    }
-
     #[test]
     fn session_restore_dir_is_under_qontinui_runner_not_dot_claude() {
         let _amb = crate::test_env::isolated_ambient();
@@ -2129,39 +3049,6 @@ mod tests {
                     !text.contains(&format!("`{retired}`")),
                     "{script_name} names the retired carrier `{retired}`"
                 );
-            }
-        }
-    }
-
-    /// The roster [`hook_files`] stats: six entries — five scripts plus the
-    /// variant's carrier — every one of which [`materialize_with`] writes.
-    #[test]
-    fn hook_files_is_the_six_entry_roster_materialize_writes() {
-        let tmp = tempfile::tempdir().unwrap();
-        for reg in [
-            StopHookRegistration::Registered,
-            StopHookRegistration::Omitted,
-        ] {
-            let files = hook_files(tmp.path(), reg);
-            assert_eq!(files.len(), 6);
-            let names: Vec<String> = files
-                .iter()
-                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-                .collect();
-            assert_eq!(
-                names,
-                [
-                    HOOK_SCRIPT_NAME,
-                    STOP_HOOK_SCRIPT_NAME,
-                    PRECOMPACT_HOOK_SCRIPT_NAME,
-                    POLICY_HOOK_SCRIPT_NAME,
-                    PERMISSION_REQUEST_HOOK_SCRIPT_NAME,
-                    reg.settings_name(),
-                ]
-            );
-            materialize_with(tmp.path(), reg).unwrap();
-            for f in &files {
-                assert!(f.exists(), "{} not materialized", f.display());
             }
         }
     }
