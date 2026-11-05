@@ -7,10 +7,13 @@
  * anything, this renders the state `useProjectTerminalReconcile` computes as a
  * soft, dismissible advisory with the two honest choices:
  *
- *   [Move them]  — replace each pane that is a bare idle shell with one at the
- *                  project root (closing the original only once its
- *                  replacement exists); every pane with anything running in it
- *                  is kept and named below the prose with the reason;
+ *   [Move them]  — replace a pane with one at the project root only when its
+ *                  process table shows a shell with nothing under it AND its
+ *                  shell's last prompt-state mark is a prompt, both read again
+ *                  just before the original is closed (and only once its
+ *                  replacement exists); every other pane is kept and named
+ *                  below the prose with the reason. While every outside pane
+ *                  was kept, the button reads [Check again];
  *   [Leave them] — dismiss for this project root.
  *
  * Renders nothing when no project is active, when every live terminal is
@@ -40,7 +43,7 @@ export function ProjectFolderChip({ projectRoot, projectName }: ProjectFolderChi
   const root = projectRoot ?? hint?.path ?? null;
   const name = projectName ?? hint?.name ?? null;
 
-  const { count, moving, error, kept, moveThem, dismiss, shouldPrompt } =
+  const { count, moving, error, kept, allKept, moveThem, dismiss, shouldPrompt } =
     useProjectTerminalReconcile(root);
 
   if (!shouldPrompt) return null;
@@ -81,7 +84,7 @@ export function ProjectFolderChip({ projectRoot, projectName }: ProjectFolderChi
                 onClick={() => void moveThem()}
                 className="px-1.5 py-0.5 rounded text-[10px] text-[#e0af68] bg-[#e0af68]/10 hover:bg-[#e0af68]/20 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
               >
-                {moving ? "Moving…" : "Move them"}
+                {moving ? "Moving…" : allKept ? "Check again" : "Move them"}
               </button>
               <button
                 type="button"
