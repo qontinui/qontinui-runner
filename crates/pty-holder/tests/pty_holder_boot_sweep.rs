@@ -18,6 +18,8 @@
 //! sweep is type-checked for `x86_64-pc-windows-msvc` and UNRUN here.
 #![cfg(unix)]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -216,7 +218,7 @@ fn normal_exit_then_boot_sweep(route: RouteRequest, tag: &str) {
         alive(bg),
         "the boot sweep must not reap a normally ended pane's job"
     );
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 #[test]
@@ -274,7 +276,7 @@ fn pty_holder_reap_a_kill_after_a_normal_exit_reaps_nothing() {
     );
     let record = read_record(&lock_path(&dir, &pane)).expect("record");
     assert_eq!(record.ended.as_deref(), Some(ENDED_BY_EXIT), "{record:?}");
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// D8, kill path: a pane that is KILLED (a tab closed) has its tree reaped —
@@ -309,7 +311,7 @@ fn pty_holder_reap_kill_ends_the_child_tree() {
     wait_dead(bg, "the killed pane's SIGHUP-immune background job");
     session.disarm();
     wait_dead(holder, "the holder after its pane was killed");
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// D8, sweep side: a live holder is listed and left alone.
@@ -346,7 +348,7 @@ fn pty_holder_boot_sweep_leaves_a_live_holder_running_and_lists_it() {
         "the record carries the child's start token"
     );
     h.teardown();
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// D8, sweep side: the holder is SIGKILLed; its child ignores the hang-up and
@@ -404,7 +406,7 @@ fn pty_holder_boot_sweep_reaps_the_orphans_of_a_killed_holder() {
         !socket_path(&dir, &pane).unwrap().exists(),
         "and its endpoint"
     );
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// Review round 4, H1: a holder that only speaks a version below the data path
@@ -434,5 +436,5 @@ fn pty_holder_boot_sweep_a_v1_only_holder_is_left_alone() {
         "nothing was touched"
     );
     h.teardown();
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }

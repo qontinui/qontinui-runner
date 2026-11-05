@@ -93,9 +93,9 @@ pub fn lock_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
     pane_dir.join(format!("{}.lock", pane.as_str()))
 }
 
-/// The Unix endpoint: `<root>/<16 hex>.sock`, where `<root>` is
-/// [`socket_root`] and the 16 hex digits are the first 8 bytes of
-/// `sha256(pane-dir bytes ‖ 0x00 ‖ pane-id)`.
+/// The Unix endpoint a holder BINDS: `<root>/<16 hex>.sock`, where `<root>`
+/// is [`socket_root`] and the 16 hex digits are the first 8 bytes of
+/// `sha256(pane-dir bytes ‖ 0x00 ‖ pane-id)` ([`socket_name`]).
 ///
 /// The socket does NOT live in the pane directory, unlike every other per-pane
 /// file. A Unix socket's path must fit `sockaddr_un.sun_path` (107 bytes on
@@ -104,44 +104,96 @@ pub fn lock_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
 /// bytes, so its panes silently fell back to in-process PTYs (plan
 /// `2026-11-04-identity-shim-foreign-shim-ping-pong-and-secondary-runner-pty-socket-overflow`,
 /// Phase 4). Here the length is bounded whatever the pane dir: at most
-/// `/tmp/qontinui-pty-<uid>/` plus 21 bytes, and its staged twin
-/// (`crate::transport::staged_socket_path`) four more.
+/// `/run/user/<uid>/qontinui-pty/` plus 21 bytes (59 for a 10-digit uid), and
+/// its staged twin (`crate::transport::staged_socket_path`) four more.
 ///
-/// The path is a pure function of `(pane_dir, pane, uid)` — never of the
-/// environment — because a holder outlives the runner that spawned it and a
-/// later runner, whose environment may differ, must derive the SAME path to
-/// adopt it (the spec is deleted when the holder reads it, and the lock record
-/// carries no endpoint). The pane dir is hashed in, so two runner instances
-/// sharing a pane id never share a socket.
+/// The path is a function of `(pane_dir, pane, uid)` and the filesystem —
+/// never of the environment — because a holder outlives the runner that
+/// spawned it and a later runner, whose environment may differ, must derive
+/// the same path to adopt it (the spec is deleted when the holder reads it, and
+/// the lock record carries no endpoint). The pane dir is hashed in, so two
+/// runner instances sharing a pane id never share a socket. A CLIENT does not
+/// call this: it tries every [`socket_candidates`] entry, so a holder bound
+/// under the other root (the runtime dir appeared or vanished since) or by a
+/// pre-Phase-4 build (in the pane dir) is still reached.
 ///
-/// Fails when the root cannot be created or is not this user's
-/// ([`socket_root`]); every caller already treats an endpoint error as
-/// "unreachable".
+/// Creates the root when missing. Fails when it cannot be created or is not
+/// this user's ([`socket_root`]); every caller already treats an endpoint
+/// error as "unreachable".
 #[cfg(unix)]
 pub fn socket_path(pane_dir: &Path, pane: &PaneId) -> io::Result<PathBuf> {
-    Ok(socket_path_in(&socket_root()?, pane_dir, pane))
+    Ok(socket_root()?.join(socket_name(pane_dir, pane)))
 }
 
-/// [`socket_path`] under an explicit root (the pure half, unit-tested).
+/// Every path a holder for this pane may be listening on, most likely first,
+/// WITHOUT creating anything: the socket under the preferred root, then under
+/// the other root, then the pre-Phase-4 `<pane-dir>/<pane-id>.sock` (a holder
+/// started by an older build keeps serving there until it ends — a runner
+/// restart onto this build must still reach it to adopt or upgrade it). A
+/// root that does not exist or fails the ownership/mode check
+/// ([`check_socket_root`]) contributes nothing. Used by `transport::connect`
+/// and by the sweep, which removes a dead pane's socket wherever it lies; the
+/// entries are all derived from THIS pane, so no other pane's file is ever
+/// named.
 #[cfg(unix)]
-fn socket_path_in(root: &Path, pane_dir: &Path, pane: &PaneId) -> PathBuf {
+pub fn socket_candidates(pane_dir: &Path, pane: &PaneId) -> Vec<PathBuf> {
+    socket_candidates_in(
+        Path::new(RUN_USER),
+        Path::new(TMP),
+        crate::transport::own_uid(),
+        pane_dir,
+        pane,
+    )
+}
+
+#[cfg(unix)]
+fn socket_candidates_in(
+    run_user: &Path,
+    tmp: &Path,
+    uid: u32,
+    pane_dir: &Path,
+    pane: &PaneId,
+) -> Vec<PathBuf> {
+    let name = socket_name(pane_dir, pane);
+    let mut out: Vec<PathBuf> = root_choices(run_user, tmp, uid)
+        .into_iter()
+        .filter(|root| check_socket_root(root, uid).is_ok())
+        .map(|root| root.join(&name))
+        .collect();
+    out.push(pane_dir.join(format!("{}.sock", pane.as_str())));
+    out
+}
+
+/// The socket's file name: 16 hex of `sha256(pane dir ‖ 0x00 ‖ pane id)` plus
+/// `.sock`. The pane dir is canonicalized first when it exists (it does at
+/// spawn, connect, adoption and sweep), so a pane dir reached through a
+/// symlinked ancestor names the same socket as its real path; a dir that is
+/// gone hashes its spelling, minus any trailing or doubled separator.
+#[cfg(unix)]
+fn socket_name(pane_dir: &Path, pane: &PaneId) -> String {
     use sha2::{Digest, Sha256};
+    use std::fmt::Write;
     use std::os::unix::ffi::OsStrExt;
+    let dir = std::fs::canonicalize(pane_dir).unwrap_or_else(|_| trim_trailing_separators(pane_dir));
     let mut h = Sha256::new();
-    // A trailing or doubled separator must not change the socket.
-    h.update(trim_trailing_separators(pane_dir).as_os_str().as_bytes());
+    h.update(dir.as_os_str().as_bytes());
     h.update([0u8]);
     h.update(pane.as_str().as_bytes());
     let digest = h.finalize();
     let mut name = String::with_capacity(16 + 5);
     for b in &digest[..8] {
-        name.push_str(&format!("{b:02x}"));
+        let _ = write!(name, "{b:02x}");
     }
     name.push_str(".sock");
-    root.join(name)
+    name
 }
 
-/// The directory every pane's socket lives in, for this effective uid:
+#[cfg(unix)]
+const RUN_USER: &str = "/run/user";
+#[cfg(unix)]
+const TMP: &str = "/tmp";
+
+/// The directory a holder binds its socket in, for this effective uid:
 /// `/run/user/<uid>/qontinui-pty` when `/run/user/<uid>` exists, is a real
 /// directory owned by `<uid>` and has mode 0700 (the systemd-logind runtime
 /// dir); otherwise `/tmp/qontinui-pty-<uid>`.
@@ -156,11 +208,16 @@ fn socket_path_in(root: &Path, pane_dir: &Path, pane: &PaneId) -> PathBuf {
 /// `systemd-run --scope` after its runner exits, and the next runner (started
 /// by the supervisor, by systemd, or by hand) may carry a different
 /// environment, so an env-derived root would let spawn and adoption disagree.
+///
+/// A socket here outlives its pane only until the pane's dir is swept (the
+/// sweep removes it with the pane's lock). One whose pane dir is deleted
+/// unswept — a removed temp-runner instance — stays until the root is cleared:
+/// `/run/user/<uid>` at logout or reboot, `/tmp` by the OS's tmp cleaner.
 #[cfg(unix)]
 pub fn socket_root() -> io::Result<PathBuf> {
     socket_root_in(
-        Path::new("/run/user"),
-        Path::new("/tmp"),
+        Path::new(RUN_USER),
+        Path::new(TMP),
         crate::transport::own_uid(),
     )
 }
@@ -169,23 +226,32 @@ pub fn socket_root() -> io::Result<PathBuf> {
 /// the refusals are tested without touching the real `/run/user` or `/tmp`.
 #[cfg(unix)]
 fn socket_root_in(run_user: &Path, tmp: &Path, uid: u32) -> io::Result<PathBuf> {
+    let root = root_choices(run_user, tmp, uid).swap_remove(0);
+    prepare_socket_root(&root, uid)?;
+    Ok(root)
+}
+
+/// The candidate roots, preferred first: the runtime-dir root only while
+/// `<run_user>/<uid>` is a real 0700 directory owned by `uid`, then always the
+/// `/tmp` one.
+#[cfg(unix)]
+fn root_choices(run_user: &Path, tmp: &Path, uid: u32) -> Vec<PathBuf> {
     use std::os::unix::fs::MetadataExt;
     let runtime = run_user.join(uid.to_string());
     let runtime_ok = std::fs::symlink_metadata(&runtime).is_ok_and(|md| {
         md.file_type().is_dir() && md.uid() == uid && md.mode() & 0o777 == 0o700
     });
-    let root = if runtime_ok {
-        runtime.join("qontinui-pty")
+    let tmp_root = tmp.join(format!("qontinui-pty-{uid}"));
+    if runtime_ok {
+        vec![runtime.join("qontinui-pty"), tmp_root]
     } else {
-        tmp.join(format!("qontinui-pty-{uid}"))
-    };
-    prepare_socket_root(&root, uid)?;
-    Ok(root)
+        vec![tmp_root]
+    }
 }
 
 /// Create `root` 0700 if missing (its parent must exist: `/run/user/<uid>` or
-/// `/tmp`), then refuse it unless it is a real directory owned by `uid` and not
-/// group/other-writable; tighten a group/other-readable one to 0700.
+/// `/tmp`), then refuse it unless [`check_socket_root`] passes; tighten a
+/// group/other-readable one to 0700.
 #[cfg(unix)]
 fn prepare_socket_root(root: &Path, uid: u32) -> io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
@@ -194,6 +260,20 @@ fn prepare_socket_root(root: &Path, uid: u32) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
     }
+    check_socket_root(root, uid)?;
+    let md = std::fs::symlink_metadata(root)?;
+    if md.mode() & 0o077 != 0 {
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Refuse a socket root that is a symlink, not a directory, owned by another
+/// uid, or group/other-writable (`PermissionDenied`). `NotFound` passes
+/// through. Creates nothing — the read-only half a client and the sweep use.
+#[cfg(unix)]
+fn check_socket_root(root: &Path, uid: u32) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
     let md = std::fs::symlink_metadata(root)?;
     let refuse = |why: String| {
         Err(io::Error::new(
@@ -215,9 +295,6 @@ fn prepare_socket_root(root: &Path, uid: u32) -> io::Result<()> {
             "mode {:o} is group/other-writable",
             md.mode() & 0o777
         ));
-    }
-    if md.mode() & 0o077 != 0 {
-        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
 }
@@ -530,15 +607,18 @@ mod tests {
         let other = PathBuf::from(format!("/{}", "e".repeat(199)));
         let p = PaneId::new(&"p".repeat(MAX_PANE_ID_LEN)).unwrap();
 
-        // The real root on this machine, and the longest root `socket_root`
-        // can choose for any 32-bit uid.
-        let worst_root = PathBuf::from(format!("/tmp/qontinui-pty-{}", u32::MAX));
-        for root in [socket_root().unwrap(), worst_root] {
-            let sock = socket_path_in(&root, &long, &p);
+        // The real root on this machine, and both roots `socket_root` can
+        // choose for the longest 32-bit uid.
+        let worst_roots = [
+            PathBuf::from(format!("{RUN_USER}/{}/qontinui-pty", u32::MAX)),
+            PathBuf::from(format!("{TMP}/qontinui-pty-{}", u32::MAX)),
+        ];
+        for root in [socket_root().unwrap()].into_iter().chain(worst_roots) {
+            let sock = root.join(socket_name(&long, &p));
             let staged = crate::transport::staged_path(&sock);
             assert!(sock.as_os_str().len() <= max, "{}", sock.display());
             assert!(staged.as_os_str().len() <= max, "{}", staged.display());
-            assert_ne!(sock, socket_path_in(&root, &other, &p));
+            assert_ne!(sock, root.join(socket_name(&other, &p)));
         }
 
         // The public function: same answer on every call (spawn and a later
@@ -556,6 +636,58 @@ mod tests {
         let mut trailing = long.clone().into_os_string();
         trailing.push("/");
         assert_eq!(sock, socket_path(Path::new(&trailing), &p).unwrap());
+    }
+
+    /// A client's candidates: the preferred root, the other root, then the
+    /// pre-Phase-4 path in the pane dir; a root that is missing or refused
+    /// contributes nothing, and nothing is created. A pane dir reached through
+    /// a symlink names the same socket as its real path.
+    #[cfg(unix)]
+    #[test]
+    fn pty_holder_socket_candidates_cover_both_roots_and_the_legacy_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = crate::transport::own_uid();
+        let base = scratch("scand");
+        let run_user = base.join("run-user");
+        let tmp = base.join("tmp");
+        let rt = run_user.join(uid.to_string());
+        std::fs::create_dir_all(&rt).unwrap();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let pane_dir = base.join("panes");
+        prepare_private_dir(&pane_dir).unwrap();
+        let p = PaneId::new("p1").unwrap();
+        let name = socket_name(&pane_dir, &p);
+        let legacy = pane_dir.join("p1.sock");
+
+        // Neither root exists yet: only the legacy path, and nothing created.
+        assert_eq!(
+            socket_candidates_in(&run_user, &tmp, uid, &pane_dir, &p),
+            vec![legacy.clone()]
+        );
+        assert!(!rt.join("qontinui-pty").exists());
+        assert!(!tmp.join(format!("qontinui-pty-{uid}")).exists());
+
+        // Both roots exist: preferred first.
+        let run_root = socket_root_in(&run_user, &tmp, uid).unwrap();
+        let tmp_root = tmp.join(format!("qontinui-pty-{uid}"));
+        prepare_socket_root(&tmp_root, uid).unwrap();
+        assert_eq!(
+            socket_candidates_in(&run_user, &tmp, uid, &pane_dir, &p),
+            vec![run_root.join(&name), tmp_root.join(&name), legacy.clone()]
+        );
+        // A refused root is skipped.
+        std::fs::set_permissions(&tmp_root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(
+            socket_candidates_in(&run_user, &tmp, uid, &pane_dir, &p),
+            vec![run_root.join(&name), legacy.clone()]
+        );
+
+        // Through a symlinked ancestor: the same socket name.
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+        assert_eq!(socket_name(&link.join("panes"), &p), name);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The root is `<run_user>/<uid>/qontinui-pty` only when the runtime dir
