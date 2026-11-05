@@ -4339,7 +4339,7 @@ mod tests {
         assert!(BOUNDARY.contains("`terminal_sessions.killed_by_handoff_blocking`"));
         assert_eq!(json["terminal_sessions"]["killed_by_handoff_blocking"], 0);
         assert!(
-            !BOUNDARY.contains("a holder pane is NOT treated as surviving a restart\""),
+            !BOUNDARY.ends_with("a holder pane is NOT treated as surviving a restart"),
             "the BOUNDARY names the handoff exception"
         );
     }

@@ -158,6 +158,30 @@ pub(crate) fn wire_coord_session(
     pane_store: Option<Arc<PaneSessionStore>>,
     extra: Option<ExtraExitDuty>,
 ) {
+    wire_registry_hook(
+        terminal_manager,
+        session,
+        registry,
+        coord_id,
+        pane_store,
+        extra,
+    );
+    let rx = session.subscribe_output();
+    registry.attach_output_pipe(coord_id, rx, true);
+}
+
+/// [`wire_coord_session`] minus the output pipe, over the real
+/// [`SessionRegistry`]: the binding is read back from the registry's record of
+/// `coord_id`. For a create path that must check liveness between installing
+/// the hook and attaching the pipe (the relay's remote create).
+pub(crate) fn wire_registry_hook(
+    terminal_manager: &TerminalManager,
+    session: &crate::terminal::session::TerminalSession,
+    registry: &Arc<SessionRegistry>,
+    coord_id: uuid::Uuid,
+    pane_store: Option<Arc<PaneSessionStore>>,
+    extra: Option<ExtraExitDuty>,
+) {
     let binding = registry
         .describe_by_id(coord_id)
         .map(|d| CoordBindingIntent::of(&d.intent))
@@ -172,8 +196,6 @@ pub(crate) fn wire_coord_session(
         pane_store,
         extra,
     );
-    let rx = session.subscribe_output();
-    registry.attach_output_pipe(coord_id, rx, true);
 }
 
 /// [`wire_coord_session`] minus the output pipe, over any [`CoordExitTarget`]:
@@ -294,23 +316,73 @@ pub(crate) fn rebind_adopted_coord_session(
     }
 }
 
+/// How long [`rebind_adopted_terminal`] waits for `setup()` to manage the
+/// `SessionRegistry` before it gives the rebind up. The boot sweep starts in
+/// `setup()` well before the registry is managed, so a fast census can adopt a
+/// pane first; the wait is on the sweep's own OS thread.
+const ADOPTION_REGISTRY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Wait (bounded by `bound`, polling) until `ready` answers true. Returns
+/// whether it did.
+fn wait_until(bound: std::time::Duration, ready: impl Fn() -> bool) -> bool {
+    let end = std::time::Instant::now() + bound;
+    loop {
+        if ready() {
+            return true;
+        }
+        if std::time::Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// [`rebind_adopted_coord_session`] wired to this app: the registry and pane
 /// store from managed state, `resume_external` blocked on from the boot
-/// sweep's plain OS thread. A runner missing either state skips the rebind.
+/// sweep's plain OS thread. The sweep can adopt before `setup()` has managed
+/// the `SessionRegistry` ([`crate::tauri_app_handle::mark_runtime_ready`] marks
+/// that), so this waits for it, bounded by [`ADOPTION_REGISTRY_WAIT`]. A runner
+/// still missing either state skips the rebind, and says so.
 pub(crate) fn rebind_adopted_terminal(
     app_handle: &tauri::AppHandle,
     terminal_manager: &TerminalManager,
     terminal_id: &str,
 ) -> Option<uuid::Uuid> {
     let session = terminal_manager.get(terminal_id)?;
-    let registry = app_handle
-        .try_state::<Arc<SessionRegistry>>()?
-        .inner()
-        .clone();
-    let pane_store = app_handle
-        .try_state::<Arc<PaneSessionStore>>()?
-        .inner()
-        .clone();
+    if !wait_until(ADOPTION_REGISTRY_WAIT, || {
+        crate::tauri_app_handle::runtime_ready()
+            || app_handle.try_state::<Arc<SessionRegistry>>().is_some()
+    }) {
+        warn!(
+            terminal_id = %terminal_id,
+            waited = ?ADOPTION_REGISTRY_WAIT,
+            "adoption: the SessionRegistry was never managed — the adopted pane is left \
+             without a coord row"
+        );
+        return None;
+    }
+    let Some(registry) = app_handle
+        .try_state::<Arc<SessionRegistry>>()
+        .map(|s| s.inner().clone())
+    else {
+        warn!(
+            terminal_id = %terminal_id,
+            "adoption: no SessionRegistry in managed state — the adopted pane is left without \
+             a coord row"
+        );
+        return None;
+    };
+    let Some(pane_store) = app_handle
+        .try_state::<Arc<PaneSessionStore>>()
+        .map(|s| s.inner().clone())
+    else {
+        warn!(
+            terminal_id = %terminal_id,
+            "adoption: no PaneSessionStore in managed state — the adopted pane is left without \
+             a coord row"
+        );
+        return None;
+    };
     let resume_registry = registry.clone();
     // Re-key the resumed row to the harness session id this pane's process was
     // pinned to at spawn, exactly as `terminal_create`'s resume arm does (plan
@@ -332,13 +404,25 @@ pub(crate) fn rebind_adopted_terminal(
         // The resumed row's registry record carries the binding's tenant and
         // intent, which `wire_coord_session` reads back and re-records.
         |coord_id, _binding| {
+            // An adopted pane may host a boot-restored gate continuation, so
+            // its death must reach the continuation producer exactly as the
+            // other create paths' does (a no-op for any other terminal).
+            let exited_terminal_id = session.id().to_string();
+            let exit_rt_handle = tauri::async_runtime::handle().inner().clone();
+            let continuation_exit: ExtraExitDuty = Box::new(move |exit| {
+                crate::agent_runtime::notify_continuation_terminal_exit(
+                    &exited_terminal_id,
+                    Some(&exit_rt_handle),
+                    Some(exit),
+                );
+            });
             wire_coord_session(
                 terminal_manager,
                 &session,
                 &registry,
                 coord_id,
                 Some(pane_store.clone()),
-                None,
+                Some(continuation_exit),
             )
         },
     )
@@ -3525,6 +3609,22 @@ mod adoption_coord_tests {
     use crate::terminal::session::tests::{
         make_test_session, FakeHolderIo, RecordingWaiterEffects,
     };
+
+    /// The adoption rebind's wait for the `SessionRegistry`: it returns as
+    /// soon as the state appears (the sweep adopted before `setup()` managed
+    /// it), and gives up at its bound when it never does.
+    #[test]
+    fn the_adoption_wait_returns_when_ready_and_gives_up_at_its_bound() {
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+        assert!(wait_until(std::time::Duration::from_secs(5), || {
+            polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 2
+        }));
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        let start = std::time::Instant::now();
+        assert!(!wait_until(std::time::Duration::from_millis(120), || false));
+        assert!(start.elapsed() >= std::time::Duration::from_millis(120));
+    }
 
     #[derive(Default)]
     struct RecordingTarget {

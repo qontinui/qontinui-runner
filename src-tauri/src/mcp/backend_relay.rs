@@ -5272,30 +5272,22 @@ async fn register_remote_created_session(
             let Some(session) = tm.get(terminal_id) else {
                 return Err(terminal_gone_after_confirm(&registry, coord_id));
             };
-            tm.bind_coord_session(&session, coord_id);
-            // Close the coord mirror the instant the PTY exits, instead of
-            // leaving a ghost for coord's stale watcher to reap. Same
-            // idempotent door the explicit close uses.
-            let close_registry = registry.clone();
-            let exit_pinned_session_id = session.pinned_session_id().to_string();
-            session.set_on_exit(Box::new(move |id, exit| {
-                if let Err(e) = close_registry.close_by_id(id) {
-                    warn!(
-                        coord_session = %id,
-                        error = %e,
-                        "remote create: coord session close failed on PTY exit"
-                    );
-                }
-                // Trigger 4 (session_exit) — plan
-                // 2026-08-27-operator-touch-observation-runner-emitter,
-                // Phase B2 §2b/§2c.
-                crate::session::operator_touch::emit_session_exit_if_nonzero(
-                    &close_registry,
-                    id,
-                    Some(&exit_pinned_session_id),
-                    exit.agent_exit_code(),
-                );
-            }));
+            // Bind, record the holder-pane binding a later adoption resumes,
+            // and install the ONE coord exit hook every create path shares:
+            // the PTY's real exit closes the coord mirror at once (never a
+            // handoff detach), instead of leaving a ghost for coord's stale
+            // watcher to reap.
+            crate::commands::terminal::wire_registry_hook(
+                tm,
+                &session,
+                &registry,
+                coord_id,
+                api_state
+                    .app_handle
+                    .try_state::<Arc<crate::session::pane_store::PaneSessionStore>>()
+                    .map(|s| s.inner().clone()),
+                None,
+            );
             if !session.is_alive() {
                 return Err(terminal_gone_after_confirm(&registry, coord_id));
             }
