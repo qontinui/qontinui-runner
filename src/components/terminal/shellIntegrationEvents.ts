@@ -1,11 +1,27 @@
 /**
  * OSC 633 shell integration, as one pane's `TerminalInstance` reports it.
  *
- * A leaf module (no imports) so the parse and the "marks went unparsed" rule
- * are testable under `environment: "node"`, where `TerminalInstance` itself
- * cannot be imported (it pulls `@xterm/addon-canvas`, which touches `self` at
- * module init). `TerminalInstance` is a thin shell over {@link shellMarksSink}.
+ * Free of xterm and Tauri imports so the parse, the replay summary and the
+ * "marks went unparsed" rule are testable under `environment: "node"`, where
+ * `TerminalInstance` itself cannot be imported (it pulls `@xterm/addon-canvas`,
+ * which touches `self` at module init). `TerminalInstance` is a thin shell over
+ * {@link shellMarksSink}.
  */
+
+/**
+ * The capability payload (`633;P;CommandMarks=1`): this prompt's shell marks
+ * every typed command line with a command start (633;C). Pinned, byte for byte,
+ * against the three shell-integration scripts by a source scan in
+ * `src-tauri/src/session/spawn_prompt.rs`.
+ */
+export const COMMAND_MARKS_CAPABILITY = "P;CommandMarks=1";
+
+/**
+ * The prompt-state half of a pane's shell integration: which of the two marks
+ * this window last parsed from it — `prompt_start` (633;A, the shell drew its
+ * prompt) or `command_execute` (633;C, the shell started a typed command).
+ */
+export type ShellPromptMark = "prompt_start" | "command_execute";
 
 export type ShellIntegrationEvent =
   | { type: "prompt_start" }
@@ -15,20 +31,32 @@ export type ShellIntegrationEvent =
   | { type: "command_line"; command: string }
   | { type: "cwd"; path: string }
   /**
-   * `633;P;CommandMarks=1`: this pane's shell emits a command-start mark
-   * (633;C) for every command it runs. The runner's bash and zsh integrations
-   * announce it with every prompt; PowerShell's only when PSReadLine is loaded,
-   * the one place it can emit 633;C at all.
+   * `633;P;CommandMarks=1`, sent with a prompt (before its 633;A): THIS prompt's
+   * shell marks every typed command line with 633;C. The runner's bash
+   * integration sends it on bash >= 4.4 (C comes from PS0), its zsh integration
+   * always (C from preexec), PowerShell only with PSReadLine and never at a
+   * nested prompt. It is per prompt: a prompt without it is not covered.
    */
   | { type: "command_marks" }
   /**
    * Synthetic, never on the wire: this window stopped parsing the pane's
-   * output — a chunk was dropped unparsed while the pane was hidden, or the
-   * pane unmounted (and a remount's scrollback replay is written before the
-   * OSC handler is registered). Whatever the pane's shell reported before is
-   * no longer known to be its current state.
+   * output, or lost some of it — a chunk dropped unparsed while the pane was
+   * hidden, a resync whose ring no longer held the missed bytes, a spliced
+   * resync, or the pane unmounting. What its shell reported before is no
+   * longer known to be its current state.
    */
-  | { type: "unobserved" };
+  | { type: "unobserved" }
+  /**
+   * Synthetic, never on the wire: the prompt state a mount's scrollback-ring
+   * replay ends in — the replay is contiguous with the live stream, so its last
+   * A/C (and whether that prompt carried the capability) is current. Only the
+   * marks are re-derived; a replay's E/D/cwd are history, never re-reported.
+   */
+  | {
+      type: "replayed_marks";
+      mark: ShellPromptMark | undefined;
+      announcesCommandStarts: boolean;
+    };
 
 /** One OSC 633 payload (the bytes after `633;`) as an event, or `null` for one this window does not read. */
 export function parseOsc633(data: string): ShellIntegrationEvent | null {
@@ -43,7 +71,7 @@ export function parseOsc633(data: string): ShellIntegrationEvent | null {
     return { type: "command_line", command: data.slice(2).replace(/\\x3b/g, ";") };
   }
   if (data.startsWith("P;Cwd=")) return { type: "cwd", path: data.slice(6) };
-  if (data === "P;CommandMarks=1") return { type: "command_marks" };
+  if (data === COMMAND_MARKS_CAPABILITY) return { type: "command_marks" };
   return null;
 }
 
@@ -51,27 +79,87 @@ export function parseOsc633(data: string): ShellIntegrationEvent | null {
 export interface ShellMarksSink {
   /** A parsed OSC 633 sequence. */
   osc633(data: string): void;
-  /** A chunk of the pane's output was dropped unparsed (the hidden tier). */
-  outputMissed(): void;
+  /**
+   * Output of this pane that this window will never parse (dropped while
+   * hidden, overrun out of the ring, spliced out of a resync). Clears the marks
+   * now AND once more behind whatever the backend has already queued: xterm
+   * parses asynchronously, so a chunk written before the loss can still deliver
+   * its 633;A after the first clear.
+   */
+  outputLost(): void;
   /** The pane's `TerminalInstance` unmounted. */
   unmounted(): void;
+  /**
+   * A mount's ring replay starts: until {@link endReplay}, parsed sequences
+   * update only a private summary of the marks — nothing else is reported.
+   */
+  beginReplay(): void;
+  /**
+   * The replay (and whatever was drained behind it) has been PARSED: report
+   * the summary as one `replayed_marks`. Call it from a write callback queued
+   * after the replay, so it runs once xterm's asynchronous parse reached it.
+   */
+  endReplay(): void;
 }
 
 /**
  * The sink a `TerminalInstance` feeds. `callback` is read at call time (the
  * component keeps its latest `onShellIntegration` in a ref), so the event goes
- * to whichever page's handler holds the pane NOW.
+ * to whichever page's handler holds the pane NOW. `queueBehindWrites(cb)` must
+ * run `cb` after every write already handed to the backend has been parsed —
+ * `backend.write(new Uint8Array(0), cb)`.
  */
 export function shellMarksSink(
   callback: () => ((event: ShellIntegrationEvent) => void) | undefined,
+  queueBehindWrites: (cb: () => void) => void,
 ): ShellMarksSink {
   const emit = (event: ShellIntegrationEvent) => callback()?.(event);
+  let replay: {
+    mark: ShellPromptMark | undefined;
+    pendingAnnounce: boolean;
+    announced: boolean;
+  } | null = null;
+  const unobserved = () => emit({ type: "unobserved" });
   return {
     osc633: (data) => {
       const event = parseOsc633(data);
-      if (event) emit(event);
+      if (!event) return;
+      if (replay === null) {
+        emit(event);
+        return;
+      }
+      // Replaying: fold the marks into the summary, report nothing.
+      if (event.type === "command_marks") {
+        replay.pendingAnnounce = true;
+      } else if (event.type === "prompt_start") {
+        replay.mark = "prompt_start";
+        replay.announced = replay.pendingAnnounce;
+        replay.pendingAnnounce = false;
+      } else if (event.type === "command_execute") {
+        replay.mark = "command_execute";
+        replay.pendingAnnounce = false;
+      }
     },
-    outputMissed: () => emit({ type: "unobserved" }),
-    unmounted: () => emit({ type: "unobserved" }),
+    outputLost: () => {
+      unobserved();
+      queueBehindWrites(unobserved);
+    },
+    unmounted: () => {
+      replay = null;
+      unobserved();
+    },
+    beginReplay: () => {
+      replay = { mark: undefined, pendingAnnounce: false, announced: false };
+    },
+    endReplay: () => {
+      if (replay === null) return;
+      const { mark, announced } = replay;
+      replay = null;
+      emit({
+        type: "replayed_marks",
+        mark,
+        announcesCommandStarts: mark === "prompt_start" && announced,
+      });
+    },
   };
 }
