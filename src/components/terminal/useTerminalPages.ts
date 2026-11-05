@@ -414,7 +414,8 @@ export function reconcilePages(
 /**
  * The page ids hosting ≥1 live terminal (`terminal_list`) or restorable session
  * (`terminal_session_list_open`). Returns `null` when a source could not be read
- * (occupancy UNKNOWN) unless `bestEffort`, which returns whatever was read.
+ * or the restore set was withheld by a device drain (occupancy UNKNOWN) unless
+ * `bestEffort`, which returns whatever was read.
  */
 export async function readOccupiedPageIds(bestEffort = false): Promise<Set<string> | null> {
   const ids = new Set<string>();
@@ -439,9 +440,14 @@ export async function readOccupiedPageIds(bestEffort = false): Promise<Set<strin
   // holding only not-yet-restored continuations gets no tab from source 1.
   try {
     const resp = await invoke<{
-      data?: { sessions?: Array<{ pageId?: string }> };
+      data?: { sessions?: Array<{ pageId?: string }>; deferredByDrain?: unknown };
     }>("terminal_session_list_open");
     const sessions = resp?.data?.sessions;
+    // While coord's device drain withholds the restore set (drained, or its
+    // drain state UNKNOWN), `sessions` is empty by deferral, not by count — the
+    // same reading `useTerminalInitialization`'s tree-reset report makes. A page
+    // holding only those withheld records is NOT empty.
+    if (resp?.data?.deferredByDrain) complete = false;
     if (Array.isArray(sessions)) {
       for (const id of pageIdsFromSessions(sessions)) ids.add(id);
     } else {
