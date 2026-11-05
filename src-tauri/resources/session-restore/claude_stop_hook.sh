@@ -8,12 +8,13 @@
 #
 # THIS hook is the one whose REGISTRATION is gated, so — alone among the five
 # bundled scripts — its carrier is fixed: it is only ever registered in
-# `claude_hook_settings-permreq.json`, the ARMED variant. The dark variant
-# (`claude_hook_settings-permreq-nostop.json`) carries no `Stop` key at all,
+# `claude_hook_settings-lc.json`, the ARMED variant (or its `-p<port>` twin,
+# once a build writes the lifecycle http hooks). The dark variant
+# (`claude_hook_settings-lc-nostop.json`) carries no `Stop` COMMAND hook,
 # which is what stops Claude spawning a `bash` for this script once per
-# assistant turn. (An older runner build on the same box writes the previous
-# roster's carrier under the names without `-permreq`; this hook rides those
-# too when such a runner spawned the session.)
+# assistant turn. (An older runner build on the same box writes an earlier
+# roster's carrier under that roster's names; this hook rides those too when
+# such a runner spawned the session.)
 # The short-circuit below therefore no longer covers runner-spawned sessions;
 # it still covers a HAND-STARTED `claude` that picks up an armed carrier left on
 # disk by a previously-armed runner. See `session::claude_hook`.
