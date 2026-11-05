@@ -6,9 +6,8 @@
  *
  * One-render harness (`renderToStaticMarkup`, as `useTerminalPages.test.ts`):
  * the hook renders once and its `moveThem` is called afterwards. The session
- * context and the probe are mocked; the second suite renders the page's REAL
- * `useShellIntegration` beside the hook and feeds it through the same sink a
- * `TerminalInstance` uses.
+ * context and the probe are mocked. The cases over the page's REAL
+ * `useShellIntegration` live in `useProjectTerminalReconcile.shellIntegration.test.ts`.
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -16,7 +15,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import type { PaneClaudeProbe } from "./resumeVerification";
-import type { ShellPromptMark } from "./useShellIntegration";
+import type { ShellPromptMark } from "./shellIntegrationEvents";
 
 const session = vi.hoisted(() => ({ current: null as unknown }));
 const probeMock = vi.hoisted(() => vi.fn());
@@ -28,9 +27,7 @@ vi.mock("./resumeVerification", () => ({
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => ({})) }));
 
-import { shellMarksSink } from "./shellIntegrationEvents";
 import { useProjectTerminalReconcile } from "./useProjectTerminalReconcile";
-import { useShellIntegration } from "./useShellIntegration";
 
 const ROOT = "D:\\projects\\pizzeria";
 const ELSEWHERE = "D:\\projects\\book-notes";
@@ -85,65 +82,5 @@ describe("useProjectTerminalReconcile moveThem (the hook's own entry)", () => {
     expect(probeMock).toHaveBeenCalledWith("pwsh-1");
     expect(fx.createTerminal).not.toHaveBeenCalled();
     expect(fx.closeTerminal).not.toHaveBeenCalled();
-  });
-});
-
-/**
- * The stale-mark case: the pane's shell drew its prompt (and announced command
- * marks) while the pane was live; then a chunk was dropped unparsed while it
- * was hidden. The page's handler must forget the prompt, so the move keeps it.
- */
-describe("useProjectTerminalReconcile moveThem over the page's real shell integration", () => {
-  beforeEach(() => {
-    probeMock.mockReset();
-    probeMock.mockResolvedValue(pwshNoChildren);
-  });
-
-  function renderWithShellIntegration() {
-    const fx = effects();
-    let hook: ReturnType<typeof useProjectTerminalReconcile> | null = null;
-    let shellIntegration: ReturnType<typeof useShellIntegration> | null = null;
-    function Probe() {
-      shellIntegration = useShellIntegration({
-        tabs: [PANE],
-        updateTab: vi.fn(),
-        renameTab: vi.fn(),
-        createTerminal: fx.createTerminal as never,
-        setSessionStates: vi.fn() as never,
-        terminalRefs: { current: new Map() },
-        setRightPanelMode: vi.fn() as never,
-        setSelectedTranscriptSessionId: vi.fn() as never,
-        pageId: "default",
-      });
-      session.current = { tabs: [PANE], ...fx, shellIntegration };
-      hook = useProjectTerminalReconcile(ROOT);
-      return null;
-    }
-    renderToStaticMarkup(createElement(Probe));
-    const si = shellIntegration!;
-    const marks = shellMarksSink(() => (event) => si.handleShellIntegration(PANE.id, event));
-    marks.osc633("P;CommandMarks=1");
-    marks.osc633("A");
-    return { hook: hook!, marks, fx };
-  }
-
-  it("moveThem keeps a pane whose output was dropped unparsed after its last prompt", async () => {
-    const { hook, marks, fx } = renderWithShellIntegration();
-    // Hidden, and something printed: the drop route reports the missed chunk.
-    marks.outputMissed();
-
-    await hook.moveThem();
-
-    expect(fx.createTerminal).not.toHaveBeenCalled();
-    expect(fx.closeTerminal).not.toHaveBeenCalled();
-  });
-
-  it("moveThem replaces the same pane while its prompt mark is current", async () => {
-    const { hook, fx } = renderWithShellIntegration();
-
-    await hook.moveThem();
-
-    expect(fx.createTerminal).toHaveBeenCalledTimes(1);
-    expect(fx.closeTerminal).toHaveBeenCalledWith("pwsh-1");
   });
 });

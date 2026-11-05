@@ -108,38 +108,66 @@ describe("useShellIntegration lastPromptMark", () => {
 });
 
 /**
- * The prompt-state readings go stale the moment this window stops parsing the
- * pane, and must be forgotten then. Wired exactly as `TerminalInstance` wires
- * it: the output stream's missed-output hook and the mount's cleanup both feed
- * the pane's `shellMarksSink`, whose events reach the page's real handler.
+ * The capability is judged per prompt: `633;P;CommandMarks=1` covers the prompt
+ * it is sent with, and a later prompt without it (a PowerShell nested prompt)
+ * withdraws it.
  */
-describe("useShellIntegration forgets marks it stopped parsing", () => {
+describe("useShellIntegration announcesCommandStarts", () => {
+  it("is carried by the prompt it was sent with, and withdrawn by one without it", () => {
+    const hook = useShellIntegrationWith(vi.fn());
+    hook.handleShellIntegration("a", { type: "command_marks" });
+    expect(hook.announcesCommandStarts("a")).toBe(false); // not until its prompt
+    hook.handleShellIntegration("a", { type: "prompt_start" });
+    expect(hook.announcesCommandStarts("a")).toBe(true);
+    hook.handleShellIntegration("a", { type: "command_execute" });
+    // `$Host.EnterNestedPrompt()`: a prompt, but the outer script is suspended.
+    hook.handleShellIntegration("a", { type: "prompt_start" });
+    expect(hook.lastPromptMark("a")).toBe("prompt_start");
+    expect(hook.announcesCommandStarts("a")).toBe(false);
+  });
+});
+
+/**
+ * The prompt-state readings go stale the moment this window stops parsing the
+ * pane, and must be forgotten then; a remount re-derives them from its ring
+ * replay. Wired exactly as `TerminalInstance` wires it: the output stream's
+ * missed-output hook, the mount's cleanup and the replay bracket all feed the
+ * pane's `shellMarksSink`, whose events reach the page's real handler.
+ */
+describe("useShellIntegration tracks marks across loss and remount", () => {
   function usePane() {
     const hook = useShellIntegrationWith(vi.fn());
-    const marks = shellMarksSink(() => (event) => hook.handleShellIntegration("t", event));
+    const queued: Array<() => void> = [];
+    const marks = shellMarksSink(
+      () => (event) => hook.handleShellIntegration("t", event),
+      (cb) => queued.push(cb),
+    );
     const state = { paused: false };
     const stream = new PaneOutputStream(paneWriter(new RunnerGate()).queue, {
       isPaused: () => state.paused,
       hasBackend: () => true,
-      noteMissedOutput: () => marks.outputMissed(),
+      noteMissedOutput: () => marks.outputLost(),
       requestResync: vi.fn(),
       scheduleFlush: vi.fn(),
     });
-    // The pane's shell announced command marks and drew its prompt.
+    // The pane's shell drew a prompt that carried the capability.
     marks.osc633("P;CommandMarks=1");
     marks.osc633("A");
     expect(hook.lastPromptMark("t")).toBe("prompt_start");
     expect(hook.announcesCommandStarts("t")).toBe(true);
-    return { hook, marks, stream, state };
+    const runQueued = () => queued.splice(0).forEach((cb) => cb());
+    return { hook, marks, stream, state, runQueued };
   }
 
   it("a chunk dropped while the pane is hidden clears its prompt mark and capability", () => {
-    const { hook, stream, state } = usePane();
+    const { hook, stream, state, runQueued } = usePane();
     // Hidden: e.g. `Get-Content -Wait` typed into it — echo and 633;C unparsed.
     state.paused = true;
     expect(stream.receive(chunk(0, 64))).toBe("drop");
     expect(hook.lastPromptMark("t")).toBeUndefined();
     expect(hook.announcesCommandStarts("t")).toBe(false);
+    runQueued();
+    expect(hook.lastPromptMark("t")).toBeUndefined();
   });
 
   it("an unmount clears its prompt mark and capability", () => {
@@ -149,10 +177,30 @@ describe("useShellIntegration forgets marks it stopped parsing", () => {
     expect(hook.announcesCommandStarts("t")).toBe(false);
   });
 
-  it("a live, parsed chunk keeps them", () => {
+  it("a chunk routed to the pane's write path (not dropped) leaves them", () => {
     const { hook, stream } = usePane();
-    stream.receive(chunk(0, 64));
+    stream.drainPending(); // the backend is ready: chunks route to "write"
+    expect(stream.receive(chunk(0, 64))).toBe("write");
     expect(hook.lastPromptMark("t")).toBe("prompt_start");
     expect(hook.announcesCommandStarts("t")).toBe(true);
+  });
+
+  it("a remount whose ring replay ends at a covered prompt reads current", () => {
+    const { hook, marks } = usePane();
+    marks.unmounted(); // page switch: this mount goes…
+    marks.beginReplay(); // …and the next one replays the ring
+    for (const m of ["E;make", "C", "D;0", "P;CommandMarks=1", "A", "B"]) marks.osc633(m);
+    marks.endReplay();
+    expect(hook.lastPromptMark("t")).toBe("prompt_start");
+    expect(hook.announcesCommandStarts("t")).toBe(true);
+  });
+
+  it("a remount whose ring replay ends mid-command reads busy", () => {
+    const { hook, marks } = usePane();
+    marks.unmounted();
+    marks.beginReplay();
+    for (const m of ["P;CommandMarks=1", "A", "E;Get-Content -Wait log", "C"]) marks.osc633(m);
+    marks.endReplay();
+    expect(hook.lastPromptMark("t")).toBe("command_execute");
   });
 });

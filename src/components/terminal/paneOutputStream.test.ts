@@ -599,6 +599,9 @@ describe("TerminalInstance routes every received byte through PaneOutputStream",
         "b.write(ring.bytes", // remote earlier-output re-render from the local ring
         "backend.write(ring.bytes", // the mount ring replay
         "backend.write(<literal>", // process-exited notice
+        // Empty writes, carrying only a callback behind xterm's parse queue:
+        "b.write(new Uint8Array(0", // shellMarksSink: a lost-output clear
+        "backend.write(new Uint8Array(0", // shellMarksSink: the mount replay's end
       ].sort(),
     );
     expect(code).toMatch(/ackQueue\.flush\(/);

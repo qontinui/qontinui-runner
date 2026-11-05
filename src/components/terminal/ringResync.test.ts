@@ -43,13 +43,20 @@ function setup(reads: Array<() => Promise<ScrollbackRingWindow | null>>) {
         return r;
       },
       write: (data: Uint8Array | string) => {
-        log.push(data === RESYNC_INCOMPLETE_MARKER ? "incomplete-marker" : "write");
+        log.push(
+          data === RESYNC_INCOMPLETE_MARKER
+            ? "incomplete-marker"
+            : typeof data === "string" && data.includes("bytes of output were lost")
+              ? "lost-marker"
+              : "write",
+        );
         written.push(data);
       },
     }),
     noteRingReplay: vi.fn(),
     noteResynced: vi.fn(() => true),
     noteResyncFailed: vi.fn(() => log.push("failed")),
+    outputLost: vi.fn(() => log.push("lost")),
     flushStaged: vi.fn(() => {
       log.push("flush");
       writer.queue.flush(writer.sink);
@@ -138,5 +145,36 @@ describe("RingResync", () => {
     await vi.waitFor(() => expect(h.log.filter((l) => l === "read")).toHaveLength(2));
     await vi.waitFor(() => expect(h.stream.resyncInFlight).toBe(false));
     expect(h.stream.writtenThrough).toBe(2_000);
+  });
+
+  it("reports an overrun's lost output in front of the slice it replays", async () => {
+    // The pane wrote through 1 000; the ring now holds only 3 000..5 000, so
+    // 2 000 bytes are gone. They are OLDER than the slice, whose marks stay good.
+    const h = setup([async () => ring(3_000, 5_000)]);
+    h.stream.receive(chunk(0, 1_000));
+    h.writer.settle();
+    await h.resync.run();
+    expect(h.host.outputLost).toHaveBeenCalledTimes(1);
+    const lost = h.log.indexOf("lost");
+    expect(h.log.indexOf("lost-marker")).toBeLessThan(lost);
+    expect(h.log.indexOf("write", lost)).toBeGreaterThan(lost);
+  });
+
+  it("does not report a loss for a resync that covered every missed byte", async () => {
+    const h = setup([async () => ring(0, 5_000)]);
+    h.stream.receive(chunk(0, 1_000));
+    h.writer.settle();
+    await h.resync.run();
+    expect(h.host.outputLost).not.toHaveBeenCalled();
+  });
+
+  it("reports a spliced resync's loss behind everything it wrote", async () => {
+    const h = setup([() => Promise.reject(new Error("ipc down"))]);
+    h.stream.receive(chunk(0, 1_000));
+    h.writer.settle();
+    h.stream.receive(chunk(9_000, 500)); // held behind a hole the pass cannot fill
+    await h.resync.run();
+    expect(h.host.outputLost).toHaveBeenCalledTimes(1);
+    expect(h.log.indexOf("lost")).toBeGreaterThan(h.log.indexOf("incomplete-marker"));
   });
 });

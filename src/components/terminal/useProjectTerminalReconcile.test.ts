@@ -14,7 +14,7 @@
 import { describe, it, expect } from "vitest";
 
 import type { PaneClaudeProbe } from "./resumeVerification";
-import type { ShellPromptMark } from "./useShellIntegration";
+import type { ShellPromptMark } from "./shellIntegrationEvents";
 import {
   findTerminalsOutsideProject,
   moveTerminalsToProject,
@@ -24,6 +24,7 @@ import {
 } from "./useProjectTerminalReconcile";
 
 const ROOT = "D:\\projects\\pizzeria";
+const NO_PROMPT = "no prompt seen since this pane was shown — press Enter in it, then Check again";
 
 function tab(over: Partial<ReconcilableTerminal> = {}): ReconcilableTerminal {
   return { id: "t1", title: "Terminal 1", isAlive: true, workingDir: ROOT, ...over };
@@ -180,7 +181,7 @@ describe("moveTerminalsToProject", () => {
       ["other", "vim is running in it"],
       ["unreadable", "its processes could not be read"],
       ["pwshBusy", "its shell last reported a command start"],
-      ["unmarked", "its shell reports no prompt state"],
+      ["unmarked", NO_PROMPT],
       ["noReadline", "its shell does not report command starts"],
     ]);
     expect(result.failed).toEqual([]);
@@ -262,7 +263,7 @@ describe("moveTerminalsToProject", () => {
     });
     const result = await outcome;
     expect(closed).toEqual(["replacement-of-T-bare"]);
-    expect(result.kept[0].reason).toBe("its shell reports no prompt state");
+    expect(result.kept[0].reason).toBe(NO_PROMPT);
   });
 
   it("leaves a bare shell running when its replacement cannot be opened", async () => {
@@ -304,7 +305,7 @@ describe("readBareIdleShell", () => {
         { state: "absent", sessionIds: [], root: bareRoot },
         { mark: undefined, announcesCommandStarts: true },
       ),
-    ).toEqual({ bare: false, reason: "its shell reports no prompt state", busy: false });
+    ).toEqual({ bare: false, reason: NO_PROMPT, busy: false });
   });
 
   it("keeps a pane at its prompt whose shell never announced command-start marks", () => {

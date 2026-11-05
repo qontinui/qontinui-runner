@@ -20,13 +20,20 @@
  *      PowerShell runs cmdlets and scripts in-process (`Get-Content -Wait`, a
  *      `.ps1` loop, `Enter-PSSession`), so a busy pwsh can have no descendant;
  *   2. the SHELL'S OWN PROMPT STATE (OSC 633): the last mark this window
- *      parsed from the pane while it was live is a prompt (633;A), and the
- *      shell has announced (`633;P;CommandMarks=1`) that it marks every
- *      command start (633;C) — PowerShell without PSReadLine draws prompts but
- *      never marks a command, so its prompt mark says nothing. A pane with no
- *      such reading is kept: one whose shell emits no marks (`bash ./job.sh`,
- *      `cmd`), and one whose marks this window stopped parsing — output dropped
- *      while it was hidden, or a remount (its scrollback replay is not parsed).
+ *      parsed from the pane — from its live stream, or from the ring replay a
+ *      remount re-derives it from — is a prompt (633;A), and that prompt
+ *      carried `633;P;CommandMarks=1`: its shell marks every typed command line
+ *      with a command start (633;C). bash < 4.4, PowerShell without PSReadLine
+ *      and a PowerShell nested prompt draw 633;A without that promise, so their
+ *      prompt mark says nothing. A pane with no such reading is kept: one whose
+ *      shell emits no marks (`bash ./job.sh`, `cmd`), and one whose output this
+ *      window lost (dropped while hidden, overrun out of the ring, spliced out
+ *      of a resync) since its last prompt.
+ *
+ * What neither witness sees: work a shell runs in-process and in the
+ * background without a command line — a PowerShell `Start-ThreadJob` (or
+ * `Register-ObjectEvent` action) keeps running at an idle prompt, with no
+ * descendant and no 633;C. Replacing such a pane ends that work.
  *
  * Both are read before the replacement is opened and again just before the
  * original is closed, and the original closes **only after its replacement
@@ -44,7 +51,7 @@ import { useCallback, useMemo, useState } from "react";
 import { useTerminalSession } from "./contexts/TerminalSessionContext";
 import { normalizePathForCompare } from "./pathCompare";
 import { probeClaudeInPane, type PaneClaudeProbe } from "./resumeVerification";
-import type { ShellPromptMark } from "./useShellIntegration";
+import type { ShellPromptMark } from "./shellIntegrationEvents";
 import type { TerminalTab } from "./useTerminalManager";
 
 /** The subset of a tab this reconciliation reads. */
@@ -153,7 +160,11 @@ export function readBareIdleShell(
   // The prompt half is a POSITIVE check: only a parsed prompt mark from a shell
   // that marks command starts reads idle; anything else keeps the pane.
   if (shell.mark === undefined) {
-    return { bare: false, reason: "its shell reports no prompt state", busy: false };
+    return {
+      bare: false,
+      reason: "no prompt seen since this pane was shown — press Enter in it, then Check again",
+      busy: false,
+    };
   }
   if (!shell.announcesCommandStarts) {
     return { bare: false, reason: "its shell does not report command starts", busy: false };
