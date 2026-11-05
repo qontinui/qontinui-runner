@@ -259,6 +259,9 @@ pub struct HandlerContext {
     /// Format: ["ENV_NAME=QCRED_placeholder_token", ...].
     /// Set when CredentialProxy is active.
     pub credential_placeholder_env: Vec<String>,
+    /// The workflow's own account pick, carried into the session context of
+    /// any AI session a handler spawns. `None`: the spawn seam's no-choice arm.
+    pub account: Option<crate::ai_provider::AccountChoice>,
     /// Holds the NetworkMediator alive for the duration of step execution.
     /// Dropped when HandlerContext is dropped, shutting down the proxy.
     #[allow(dead_code)]
@@ -298,6 +301,7 @@ impl HandlerContext {
             audit_logger: crate::security::audit::AuditLogger::noop(),
             network_proxy_url: None,
             credential_placeholder_env: vec![],
+            account: None,
             _network_mediator: None,
         }
     }
@@ -338,6 +342,7 @@ impl HandlerContext {
             audit_logger: crate::security::audit::AuditLogger::noop(),
             network_proxy_url: None,
             credential_placeholder_env: vec![],
+            account: None,
             _network_mediator: None,
         }
     }
@@ -345,6 +350,12 @@ impl HandlerContext {
     /// Set the path scope policy for working directory resolution.
     pub fn with_path_scope_policy(mut self, policy: crate::paths::PathScopePolicy) -> Self {
         self.path_scope_policy = policy;
+        self
+    }
+
+    /// Set the workflow's account pick for AI sessions this context spawns.
+    pub fn with_account(mut self, account: Option<crate::ai_provider::AccountChoice>) -> Self {
+        self.account = account;
         self
     }
 
@@ -650,11 +661,14 @@ impl PromptStepHandler {
 
         // Build session ID and context
         let session_id = format!("{}-verification-review-{}", task_run_id, iteration);
-        let session_ctx = Some(crate::execution_context::AiSessionContext::verification(
+        let mut session_ctx = crate::execution_context::AiSessionContext::verification(
             &task_run_id,
             step.name.as_deref().unwrap_or("AI Review"),
             iteration,
-        ));
+        );
+        // The workflow's own account pick, so this review session runs under it.
+        session_ctx.account = context.account.clone();
+        let session_ctx = Some(session_ctx);
 
         // Get DoctorHandle
         let doctor_handle = context.app_state.doctor_handle.lock().await.clone();

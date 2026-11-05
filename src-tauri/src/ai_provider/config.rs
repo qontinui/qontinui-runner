@@ -294,7 +294,8 @@ pub fn get_effective_config_dir(
 ///   to THIS spawn. Re-checked for credentials and reported as
 ///   [`ClaudeConfigDirSource::PickedForThisSpawn`]; it is the runner's own
 ///   rotation, so it is never recorded as a pin.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "dir", rename_all = "snake_case")]
 pub enum AccountChoice {
     Pinned(String),
     Picked(String),
@@ -306,6 +307,53 @@ impl AccountChoice {
         match self {
             AccountChoice::Pinned(dir) | AccountChoice::Picked(dir) => dir,
         }
+    }
+
+    /// The dir when — and only when — the caller PINNED it. A pick is the
+    /// runner's own rotation, so it answers `None`: this is what
+    /// `SpawnPreconditions.account` records.
+    pub fn pin(&self) -> Option<&str> {
+        match self {
+            AccountChoice::Pinned(dir) => Some(dir),
+            AccountChoice::Picked(_) => None,
+        }
+    }
+}
+
+/// One spawn's account, resolved ONCE by [`resolve_spawn_account_choice`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSpawnAccount {
+    /// What the spawn carried: the caller's choice, else its own fresh pick
+    /// (`None` when the pick published nothing).
+    pub choice: Option<AccountChoice>,
+    /// The config dir the child runs under, per [`get_effective_config_dir_for`].
+    pub dir: Option<String>,
+    /// Which arm of [`get_effective_config_dir_for`] produced `dir`.
+    pub source: ClaudeConfigDirSource,
+}
+
+/// Resolve the account for ONE spawn: the caller's [`AccountChoice`] when it
+/// supplied one (a pin, or a pick it already took for this unit of work), else
+/// a fresh `pick()` of this spawn's own, carried as [`AccountChoice::Picked`] —
+/// then through the one resolver, [`get_effective_config_dir_for`].
+///
+/// `pick` is [`pick_best_account`](super::account_usage::pick_best_account) in
+/// production; it is a parameter so a test can prove the spawn holds its OWN
+/// draw even when a sibling's draw rewrites `RESOLVED_CONFIG_DIR` between the
+/// pick and the resolution. It is not called when the caller supplied a
+/// choice. Blocking (the pick reads settings and cooldown state): call it from
+/// a blocking context.
+pub fn resolve_spawn_account_choice(
+    cli_settings: &settings::ClaudeCliSettings,
+    caller: Option<AccountChoice>,
+    pick: impl FnOnce() -> Option<String>,
+) -> ResolvedSpawnAccount {
+    let choice = caller.or_else(|| pick().map(AccountChoice::Picked));
+    let (dir, source) = get_effective_config_dir_for(cli_settings, choice.as_ref());
+    ResolvedSpawnAccount {
+        choice,
+        dir,
+        source,
     }
 }
 
@@ -703,49 +751,58 @@ pub fn account_known_exhausted(config_dir: &str) -> bool {
     false
 }
 
-/// Rotate to the next available account after a rate-limit hit.
+/// Rotate away from `limited` — the account the failing call or session RAN
+/// UNDER — after a rate-limit hit.
 ///
-/// Marks the current account as rate-limited (with the default cooldown,
-/// **but only if it isn't already marked** — so a precise `Retry-After`
-/// duration set by [`mark_account_rate_limited_with_duration`] survives),
-/// then picks the first non-cooled-down account from the configured
-/// `claude_config_dirs`. Returns `true` if a switch happened, `false` if
-/// no alternative is available.
-pub fn rotate_account_on_rate_limit() -> bool {
+/// Marks `limited` as rate-limited (with the default cooldown, **but only if
+/// it isn't already marked** — so a precise `Retry-After` duration set by
+/// [`mark_account_rate_limited_with_duration`] survives), then picks the first
+/// non-cooled-down account from the configured `claude_config_dirs`. Returns
+/// the dir it rotated to, or `None` when no alternative is available.
+///
+/// The limited account is the caller's to name. It used to be read off the
+/// shared `RESOLVED_CONFIG_DIR`, but under per-spawn draws that global is
+/// usually a concurrent sibling's pick, so the wrong account was cooled and the
+/// exhausted one stayed selectable. The rotated-to dir is still published to
+/// `RESOLVED_CONFIG_DIR` for the display readers and for the API providers,
+/// which read it per call.
+pub fn rotate_account_on_rate_limit(limited: &str) -> Option<String> {
     if crate::model_gateway::gateway_declared() {
         crate::model_gateway::note_subscription_path_off("rotate_account_on_rate_limit");
-        return false;
+        return None;
     }
-    let config_dirs = settings::get_claude_config_dirs();
+    rotate_within(limited, &settings::get_claude_config_dirs())
+}
+
+/// [`rotate_account_on_rate_limit`] over an explicit roster — the seam its
+/// tests drive, since the live roster comes from `settings.json`.
+fn rotate_within(limited: &str, config_dirs: &[String]) -> Option<String> {
     if config_dirs.len() < 2 {
-        return false;
+        return None;
     }
 
-    let current = get_resolved_config_dir();
     let default_cooldown = Duration::from_secs(RATE_LIMIT_COOLDOWN_SECS);
 
-    // Single lock acquisition: mark current as rate-limited + find best alternative
+    // Single lock acquisition: mark the limited account + find best alternative
     let next_dir = if let Ok(mut cooldowns) = ACCOUNT_COOLDOWNS.lock() {
         let map = cooldowns.get_or_insert_with(HashMap::new);
 
-        // Mark the current account as rate-limited — but only if it isn't
+        // Mark the limited account as rate-limited — but only if it isn't
         // already in the map. API providers may have already inserted a
         // precise `Retry-After`-derived duration; don't clobber that with
         // the shorter default.
-        if let Some(ref dir) = current {
-            if !map.contains_key(dir) {
-                info!(
-                    "Marking account '{}' as rate-limited for {}s",
-                    short_label(dir),
-                    default_cooldown.as_secs()
-                );
-                map.insert(dir.clone(), (Instant::now(), default_cooldown));
-            }
+        if !map.contains_key(limited) {
+            info!(
+                "Marking account '{}' as rate-limited for {}s",
+                short_label(limited),
+                default_cooldown.as_secs()
+            );
+            map.insert(limited.to_string(), (Instant::now(), default_cooldown));
         }
 
         // Find the first account that is not in cooldown
         let available = config_dirs.iter().find(|d| {
-            current.as_ref() != Some(*d)
+            d.as_str() != limited
                 && map
                     .get(*d)
                     .is_none_or(|(marked_at, cooldown)| marked_at.elapsed() >= *cooldown)
@@ -758,7 +815,7 @@ pub fn rotate_account_on_rate_limit() -> bool {
             // (smallest remaining = `cooldown - elapsed`).
             let best = config_dirs
                 .iter()
-                .filter(|d| current.as_ref() != Some(*d))
+                .filter(|d| d.as_str() != limited)
                 .min_by_key(|d| {
                     map.get(*d)
                         .map(|(marked_at, cooldown)| cooldown.saturating_sub(marked_at.elapsed()))
@@ -767,29 +824,25 @@ pub fn rotate_account_on_rate_limit() -> bool {
             best.cloned()
         }
     } else {
-        return false;
+        return None;
     };
     // Lock is dropped here before calling set_resolved_config_dir
 
-    if let Some(dir) = next_dir {
-        let was_all_limited = is_account_cooled_down(&dir);
-        if was_all_limited {
-            warn!(
-                "All accounts rate-limited, switching to closest-to-expiry: '{}'",
-                short_label(&dir)
-            );
-        } else {
-            info!(
-                "Rotating account: '{}' -> '{}'",
-                current.as_deref().map(short_label).unwrap_or("none"),
-                short_label(&dir)
-            );
-        }
-        set_resolved_config_dir(Some(dir));
-        true
+    let dir = next_dir?;
+    if is_account_cooled_down(&dir) {
+        warn!(
+            "All accounts rate-limited, switching to closest-to-expiry: '{}'",
+            short_label(&dir)
+        );
     } else {
-        false
+        info!(
+            "Rotating account: '{}' -> '{}'",
+            short_label(limited),
+            short_label(&dir)
+        );
     }
+    set_resolved_config_dir(Some(dir.clone()));
+    Some(dir)
 }
 
 /// How long until the next account becomes available (cooldown expires).
@@ -938,6 +991,33 @@ pub fn switch_to_account(config_dir: &str) -> bool {
     true
 }
 
+/// Test fixtures shared with the spawn seams' own account-resolution tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// A config dir with live credentials: a `.credentials.json` expiring a
+    /// day out and carrying no refresh token, so the check is pure (no
+    /// refresh is ever requested) and passes on expiry alone.
+    pub(crate) fn dir_with_live_credentials() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let expires_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            + 86_400_000;
+        let body = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "sk-oauth-test",
+                "refreshToken": "",
+                "expiresAt": expires_at_ms,
+                "scopes": ["user:inference"],
+            }
+        });
+        std::fs::write(dir.path().join(".credentials.json"), body.to_string()).expect("write");
+        let path = dir.path().to_string_lossy().to_string();
+        (dir, path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1006,28 +1086,7 @@ mod tests {
         );
     }
 
-    /// A config dir with live credentials: a `.credentials.json` expiring a
-    /// day out and carrying no refresh token, so the check is pure (no
-    /// refresh is ever requested) and passes on expiry alone.
-    fn dir_with_live_credentials() -> (tempfile::TempDir, String) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let expires_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64
-            + 86_400_000;
-        let body = serde_json::json!({
-            "claudeAiOauth": {
-                "accessToken": "sk-oauth-test",
-                "refreshToken": "",
-                "expiresAt": expires_at_ms,
-                "scopes": ["user:inference"],
-            }
-        });
-        std::fs::write(dir.path().join(".credentials.json"), body.to_string()).expect("write");
-        let path = dir.path().to_string_lossy().to_string();
-        (dir, path)
-    }
+    use super::test_support::dir_with_live_credentials;
 
     /// **The half-apply guarantee, pinned at the decision site.** Under a fleet
     /// auto mode an UNPINNED machine whose local mode is `Manual` must take an
@@ -1553,5 +1612,74 @@ mod tests {
             remaining.as_secs()
         );
         clear_dir(dir);
+    }
+
+    /// **Rotation cools the account that was limited, not the global's.** The
+    /// shared `RESOLVED_CONFIG_DIR` holds a sibling's draw; the call that hit
+    /// the limit ran under `limited`. Rotation must cool `limited`, leave the
+    /// sibling's account selectable, and rotate to an account other than
+    /// `limited`.
+    #[test]
+    fn rotation_cools_the_dir_it_was_given_not_the_global() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(None);
+        let _restore = ResolvedConfigDirRestore::capture();
+        let limited = "/qontinui-test/rotate-given/limited".to_string();
+        let sibling = "/qontinui-test/rotate-given/sibling".to_string();
+        clear_dir(&limited);
+        clear_dir(&sibling);
+        set_resolved_config_dir(Some(sibling.clone()));
+
+        let rotated = rotate_within(&limited, &[limited.clone(), sibling.clone()]);
+
+        assert!(
+            is_account_cooled_down(&limited),
+            "the limited account is cooled"
+        );
+        assert!(
+            !is_account_cooled_down(&sibling),
+            "the sibling's account (the global) must stay selectable"
+        );
+        assert_eq!(rotated, Some(sibling.clone()));
+        assert_eq!(get_resolved_config_dir(), Some(sibling.clone()));
+        clear_dir(&limited);
+        clear_dir(&sibling);
+    }
+
+    /// A spawn with no caller choice takes its OWN pick and holds it even when
+    /// a sibling's draw rewrites the global between the pick and the
+    /// resolution; a caller's choice is used as-is and no pick is taken.
+    #[test]
+    fn a_spawn_with_no_choice_resolves_its_own_pick_not_the_global() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
+            AccountSelectionMode::WeightedRandom,
+        ));
+        let (_mine_guard, mine) = dir_with_live_credentials();
+        let (_sibling_guard, sibling) = dir_with_live_credentials();
+        let _restore = ResolvedConfigDirRestore::capture();
+        let cli = auto_mode_cli(None);
+
+        let drawn = mine.clone();
+        let raced = sibling.clone();
+        let resolved = resolve_spawn_account_choice(&cli, None, move || {
+            set_resolved_config_dir(Some(drawn.clone()));
+            // A sibling spawn's draw lands before this spawn resolves.
+            set_resolved_config_dir(Some(raced));
+            Some(drawn)
+        });
+        assert_eq!(
+            resolved,
+            ResolvedSpawnAccount {
+                choice: Some(AccountChoice::Picked(mine.clone())),
+                dir: Some(mine.clone()),
+                source: ClaudeConfigDirSource::PickedForThisSpawn,
+            }
+        );
+
+        let pinned =
+            resolve_spawn_account_choice(&cli, Some(AccountChoice::Pinned(mine.clone())), || {
+                panic!("a caller's choice must not take a pick")
+            });
+        assert_eq!(pinned.dir, Some(mine));
+        assert_eq!(pinned.source, ClaudeConfigDirSource::RequestOverride);
     }
 }

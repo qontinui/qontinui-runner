@@ -70,6 +70,11 @@ impl AgenticExecutor {
         self.ai_executor.middleware_chain = Some(chain);
     }
 
+    /// Set the workflow's account pick on the inner AI session executor.
+    pub fn set_account(&mut self, account: Option<crate::ai_provider::AccountChoice>) {
+        self.ai_executor.account = account;
+    }
+
     /// Set the reflection fix context for parsing [REFLECTION_FIX:...] markers.
     pub fn set_reflection_fix_ctx(&mut self, ctx: crate::mcp::shared::ReflectionFixContext) {
         self.reflection_fix_ctx = Some(ctx);

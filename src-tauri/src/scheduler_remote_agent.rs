@@ -313,12 +313,9 @@ pub(crate) async fn launch(
     crate::fleet_commands::provision_fleet_commands_for_session(&workdir_s);
     crate::fleet_skills::provision_fleet_skills_for_session(&workdir_s);
 
-    // Most-available account, so the child does not spawn under a
+    // No account pick here: with no pin, `spawn_claude_child` takes this
+    // spawn's own most-available pick, so the child does not spawn under a
     // quota-exhausted default and die on its first request.
-    let _ = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(
-        crate::ai_provider::pick_best_account,
-    )
-    .await;
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let prompt = compose_prompt(&spec.prompt, &spec.mcp_connections);

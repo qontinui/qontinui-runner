@@ -568,6 +568,11 @@ pub struct UnifiedAiSessionExecutor {
     /// When present, pre_call middleware is applied during prompt transformation
     /// and post_call middleware is applied to the session output.
     pub(crate) middleware_chain: Option<crate::ai_provider::middleware::AiMiddlewareChain>,
+    /// The workflow's own account pick (`loop_controller`), carried into every
+    /// session context this executor builds as its `account`, so the inline
+    /// and interactive children run under the workflow's account rather than
+    /// whatever a sibling spawn last wrote to the shared resolved dir.
+    pub(crate) account: Option<crate::ai_provider::AccountChoice>,
 }
 
 impl UnifiedAiSessionExecutor {
@@ -583,6 +588,7 @@ impl UnifiedAiSessionExecutor {
             pid_tracker,
             session_manager: None,
             middleware_chain: None,
+            account: None,
         }
     }
 
@@ -1160,7 +1166,7 @@ impl UnifiedAiSessionExecutor {
         config: &AiSessionConfig,
         available_tools: Vec<String>,
     ) -> Option<AiSessionContext> {
-        let ctx = match config.phase {
+        let mut ctx = match config.phase {
             WorkflowPhase::Setup => {
                 AiSessionContext::setup(&config.task_run_id, &config.workflow_name)
                     .with_runtime_env()
@@ -1211,6 +1217,8 @@ impl UnifiedAiSessionExecutor {
                     .with_turn_count(completion_turn)
             }
         };
+        // The workflow's own account pick (`AccountChoice::Picked`).
+        ctx.account = self.account.clone();
 
         Some(ctx)
     }

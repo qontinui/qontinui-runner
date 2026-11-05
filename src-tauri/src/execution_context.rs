@@ -444,11 +444,16 @@ pub struct AiSessionContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub available_tools: Option<Vec<String>>,
 
-    /// When `Some`, pins `CLAUDE_CONFIG_DIR` for this spawn to a caller-chosen,
-    /// already-validated account config dir (per-request account selection).
-    /// `None` reproduces the default global account resolution byte-for-byte.
+    /// The account this session's spawn runs under, as the caller decided it:
+    /// [`AccountChoice::Pinned`](crate::ai_provider::AccountChoice::Pinned) for
+    /// a caller-chosen, already-validated account (per-request account
+    /// selection), [`AccountChoice::Picked`](crate::ai_provider::AccountChoice::Picked)
+    /// for the runner's own pick for this unit of work (a workflow's, a
+    /// subtask dispatch's). `None`: the spawn seam decides — `ClaudeSession::spawn`
+    /// takes a fresh pick of its own; the inline print-mode runner resolves
+    /// the resolver's no-choice arm. Never the shared `RESOLVED_CONFIG_DIR`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pinned_config_dir: Option<String>,
+    pub account: Option<crate::ai_provider::AccountChoice>,
 }
 
 impl AiSessionContext {
@@ -471,7 +476,7 @@ impl AiSessionContext {
             is_continuation: false,
             continued_from: None,
             available_tools: None,
-            pinned_config_dir: None,
+            account: None,
         }
     }
 
