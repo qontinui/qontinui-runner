@@ -759,9 +759,11 @@ export function useTerminalPages() {
       };
       instanceStorage.removeByPrefix(prefix);
       const drop = (list: TerminalPageConfig[]) => list.filter((p) => p.id !== id);
-      // The ref is updated eagerly for the synchronous readers of this pass;
-      // storage is written only from the authoritative `prev`, and Undo's index
-      // is taken there too.
+      // The removal is DECIDED here, against the ref (every writer this pass
+      // races — rename, activate, the prune itself — updates it eagerly).
+      // Storage is written only from the authoritative `prev`, and Undo's
+      // index is refined there; a page `prev` no longer holds is already gone,
+      // which Undo's restore tolerates.
       allPagesRef.current = drop(roster);
       setPages((prev) => {
         const at = prev.findIndex((p) => p.id === id);
@@ -877,6 +879,8 @@ export function useTerminalPages() {
 
         let removed: RemovedPage[] = [];
         let allReadsComplete = true;
+        // The freshest complete occupancy, for the repair's claim order.
+        let lastOccupied: ReadonlySet<string> = occupied;
         if (getPerfCaps().prune_empty_auto_pages) {
           const candidates = prunablePageIds(allPagesRef.current, occupied, {
             activePageId: activePageIdRef.current,
@@ -894,6 +898,7 @@ export function useTerminalPages() {
           );
           removed = pass.removed;
           allReadsComplete = pass.allReadsComplete;
+          lastOccupied = pass.lastIds ?? occupied;
         }
 
         // The repair needs the WHOLE pass on complete reads: a candidate kept
@@ -903,7 +908,7 @@ export function useTerminalPages() {
           allReadsComplete &&
           instanceStorage.getItem(PAGES_VERSION_KEY) !== String(PAGES_VERSION)
         ) {
-          renames = duplicateNameRepairs(allPagesRef.current, occupied);
+          renames = duplicateNameRepairs(allPagesRef.current, lastOccupied);
           const writeVersion = () =>
             instanceStorage.setItem(PAGES_VERSION_KEY, String(PAGES_VERSION));
           if (renames.length > 0) {
@@ -939,14 +944,16 @@ export function useTerminalPages() {
     const name = rawName.trim();
     if (!name) return false;
     if (renameRefusal(allPagesRef.current, id, name) !== null) return false;
+    // A name the operator typed is information: the page is theirs now, and
+    // the auto-prune leaves it alone. The ref is updated EAGERLY so an
+    // auto-prune pass already in flight sees the new origin at removal time.
+    const claim = (list: TerminalPageConfig[]) =>
+      list.map((p) => (p.id === id ? { ...p, name, origin: "operator" as const } : p));
+    allPagesRef.current = claim(allPagesRef.current);
     setPages((prev) => {
       // Re-check against the authoritative roster: the ref can lag a tick.
       if (renameRefusal(prev, id, name) !== null) return prev;
-      // A name the operator typed is information: the page is theirs now, and
-      // the auto-prune leaves it alone.
-      const updated = prev.map((p) =>
-        p.id === id ? { ...p, name, origin: "operator" as const } : p,
-      );
+      const updated = claim(prev);
       savePages(updated);
       allPagesRef.current = updated;
       return updated;

@@ -213,6 +213,8 @@ export interface OccupancyRead {
 export interface RemovalPass<T> {
   removed: T[];
   allReadsComplete: boolean;
+  /** The ids of the last complete re-read, or `null` when none was made. */
+  lastIds: Set<string> | null;
 }
 
 /**
@@ -229,14 +231,16 @@ export async function removeEach<T>(
 ): Promise<RemovalPass<T>> {
   const removed: T[] = [];
   let allReadsComplete = true;
+  let lastIds: Set<string> | null = null;
   for (const id of candidates) {
     const fresh = await read();
     if (!fresh.complete) allReadsComplete = false;
+    else lastIds = fresh.ids;
     if (!fresh.complete || fresh.ids.has(id)) continue;
     const r = await remove(id);
     if (r !== null) removed.push(r);
   }
-  return { removed, allReadsComplete };
+  return { removed, allReadsComplete, lastIds };
 }
 
 /** The strip's notice text for an auto-prune and/or repair. */
