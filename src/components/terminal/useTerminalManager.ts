@@ -11,7 +11,7 @@ import {
 import { createLogger } from "@/lib/logger";
 import { spawnWithResourceGuard, type ResourceGuardSource } from "@/lib/resourceGuard";
 import { applyRemoteMark, type RemoteTabIdentity } from "./remoteTabs";
-import { markPageMoveListening } from "./pageMoveListeners";
+import { holdPageMoveListener } from "./pageMoveListeners";
 import {
   EMPTY_HIDDEN_WORKER_STATE,
   beginRestore,
@@ -1136,78 +1136,66 @@ export function useTerminalManager(
   //     belongs to the target page.
   // Once registered, the listener is recorded in `pageMoveListeners`, which a
   // mover (the page reorganize) waits on before moving a tab onto a page it has
-  // just created — a move made before this page listens is adopted by nobody.
+  // just created — a move made before this page listens is not adopted until
+  // this page's next `resyncTabs` (mount, or after a terminal exit).
   useEffect(() => {
-    let unlisten: (() => void) | null = null;
-    let releaseListening: (() => void) | null = null;
-    let disposed = false;
-    listen<{ id: string; pageId: string }>("terminal-page-changed", (event) => {
-      const { id, pageId: targetPageId } = event.payload;
-      if (!id) return;
-      const target = targetPageId || "default";
-      if (target === pageId) {
-        // Adopt onto THIS (target) page. `reduceCreatedTerminal` dedups by id,
-        // so an idempotent re-delivery for a tab we already hold is a no-op.
-        invoke<CommandResponse>("terminal_list")
-          .then(async (result) => {
-            if (!result.success || !result.data) return;
-            const terminals = (result.data as { terminals: TerminalInfo[] }).terminals;
-            const info = terminals.find((t) => t.id === id);
-            if (!info) return;
-            // A moved tab arrives WITH its identity, not 30s later from the
-            // reconcile sweep: the durable session id from this same response
-            // (a moved AI session that reads as a plain shell is Keep AI's to
-            // close), and a remote tab's identity, which `TerminalInfo` cannot
-            // carry (an unbadged remote tab reads as a local one).
-            const sessionIds =
-              (result.data as { sessionIdsByTerminal?: SessionIdsByTerminal })
-                .sessionIdsByTerminal ?? {};
-            const pendingBypass = pendingBypassMarks.current.has(id);
-            if (pendingBypass) pendingBypassMarks.current.delete(id);
-            let remote = pendingRemoteMarks.current.get(id);
-            if (remote !== undefined) pendingRemoteMarks.current.delete(id);
-            else remote = await remoteIdentityOf(id);
-            setTabs((prev) =>
-              backfillClaudeSessionIds(reduceCreatedTerminal(prev, info, pendingBypass, remote), {
-                [id]: sessionIds[id],
-              }),
-            );
-            ingestedIds.current.add(id);
-            setActiveId(id);
-            logger.info(`Terminal ${id} moved onto page ${pageId}`);
-          })
-          .catch((err) => {
-            logger.warn(`terminal-page-changed adopt failed for ${id}: ${err}`);
+    const registration = listen<{ id: string; pageId: string }>(
+      "terminal-page-changed",
+      (event) => {
+        const { id, pageId: targetPageId } = event.payload;
+        if (!id) return;
+        const target = targetPageId || "default";
+        if (target === pageId) {
+          // Adopt onto THIS (target) page. `reduceCreatedTerminal` dedups by id,
+          // so an idempotent re-delivery for a tab we already hold is a no-op.
+          invoke<CommandResponse>("terminal_list")
+            .then(async (result) => {
+              if (!result.success || !result.data) return;
+              const terminals = (result.data as { terminals: TerminalInfo[] }).terminals;
+              const info = terminals.find((t) => t.id === id);
+              if (!info) return;
+              // A moved tab arrives WITH its identity, not 30s later from the
+              // reconcile sweep: the durable session id from this same response
+              // (a moved AI session that reads as a plain shell is Keep AI's to
+              // close), and a remote tab's identity, which `TerminalInfo` cannot
+              // carry (an unbadged remote tab reads as a local one).
+              const sessionIds =
+                (result.data as { sessionIdsByTerminal?: SessionIdsByTerminal })
+                  .sessionIdsByTerminal ?? {};
+              const pendingBypass = pendingBypassMarks.current.has(id);
+              if (pendingBypass) pendingBypassMarks.current.delete(id);
+              let remote = pendingRemoteMarks.current.get(id);
+              if (remote !== undefined) pendingRemoteMarks.current.delete(id);
+              else remote = await remoteIdentityOf(id);
+              setTabs((prev) =>
+                backfillClaudeSessionIds(reduceCreatedTerminal(prev, info, pendingBypass, remote), {
+                  [id]: sessionIds[id],
+                }),
+              );
+              ingestedIds.current.add(id);
+              setActiveId(id);
+              logger.info(`Terminal ${id} moved onto page ${pageId}`);
+            })
+            .catch((err) => {
+              logger.warn(`terminal-page-changed adopt failed for ${id}: ${err}`);
+            });
+        } else {
+          // Evict from THIS page if we hold it — do NOT close the PTY.
+          setTabs((prev) => {
+            if (!prev.some((t) => t.id === id)) return prev;
+            const closedIndex = prev.findIndex((t) => t.id === id);
+            const next = prev.filter((t) => t.id !== id);
+            setActiveId((currentActive) => {
+              if (currentActive !== id) return currentActive;
+              return next[Math.min(closedIndex, next.length - 1)]?.id ?? null;
+            });
+            ingestedIds.current.delete(id);
+            return next;
           });
-      } else {
-        // Evict from THIS page if we hold it — do NOT close the PTY.
-        setTabs((prev) => {
-          if (!prev.some((t) => t.id === id)) return prev;
-          const closedIndex = prev.findIndex((t) => t.id === id);
-          const next = prev.filter((t) => t.id !== id);
-          setActiveId((currentActive) => {
-            if (currentActive !== id) return currentActive;
-            return next[Math.min(closedIndex, next.length - 1)]?.id ?? null;
-          });
-          ingestedIds.current.delete(id);
-          return next;
-        });
-      }
-    }).then((fn) => {
-      // Unmounted before the registration resolved: drop it rather than leak a
-      // listener that would still adopt and evict for a page that is gone.
-      if (disposed) {
-        fn();
-        return;
-      }
-      unlisten = fn;
-      releaseListening = markPageMoveListening(pageId);
-    });
-    return () => {
-      disposed = true;
-      unlisten?.();
-      releaseListening?.();
-    };
+        }
+      },
+    );
+    return holdPageMoveListener(pageId, registration);
   }, [pageId]);
 
   /**

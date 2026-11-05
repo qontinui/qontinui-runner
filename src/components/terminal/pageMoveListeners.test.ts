@@ -7,10 +7,23 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  holdPageMoveListener,
   isPageMoveListening,
   markPageMoveListening,
   waitForPageMoveListener,
 } from "./pageMoveListeners";
+
+/** A `listen()` registration the test resolves by hand. */
+function deferredRegistration() {
+  let resolve!: (unlisten: () => void) => void;
+  const registration = new Promise<() => void>((r) => {
+    resolve = r;
+  });
+  return { registration, resolve };
+}
+
+/** Let the registration's `.then` run. */
+const flush = () => new Promise((r) => setTimeout(r, 0));
 
 describe("pageMoveListeners", () => {
   afterEach(() => {
@@ -50,5 +63,32 @@ describe("pageMoveListeners", () => {
     expect(isPageMoveListening("double")).toBe(true);
     second();
     expect(isPageMoveListening("double")).toBe(false);
+  });
+
+  it("marks a page listening only once its listen() registration resolves, and releases it on cleanup", async () => {
+    const { registration, resolve } = deferredRegistration();
+    const unlisten = vi.fn();
+    const cleanup = holdPageMoveListener("effect-page", registration);
+    await flush();
+    expect(isPageMoveListening("effect-page")).toBe(false);
+
+    resolve(unlisten);
+    await flush();
+    expect(isPageMoveListening("effect-page")).toBe(true);
+
+    cleanup();
+    expect(unlisten).toHaveBeenCalledTimes(1);
+    expect(isPageMoveListening("effect-page")).toBe(false);
+  });
+
+  it("unlistens a registration that resolves after the effect was cleaned up, and never marks it", async () => {
+    const { registration, resolve } = deferredRegistration();
+    const unlisten = vi.fn();
+    const cleanup = holdPageMoveListener("unmounted-page", registration);
+    cleanup();
+    resolve(unlisten);
+    await flush();
+    expect(unlisten).toHaveBeenCalledTimes(1);
+    expect(isPageMoveListening("unmounted-page")).toBe(false);
   });
 });

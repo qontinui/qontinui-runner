@@ -3,8 +3,8 @@
  *
  * Analyzes terminal sessions across pages and proposes topic-based groupings.
  * Users can preview the proposal, edit page names, and apply the reorganization.
- * Applying MOVES the sessions (`applyReorganizePlan`) — every one keeps running —
- * and the done state names what moved, what could not, and which pages went.
+ * Applying MOVES the sessions (`applyReorganizePlan`) and closes nothing; the
+ * done state names what moved, what could not, and which pages went.
  */
 
 import { useState, useCallback } from "react";
@@ -354,7 +354,7 @@ Return this exact JSON format:
 
 /**
  * What an applied reorganize did. A pane whose move failed is named with its
- * reason — it is still running, on the page it was on.
+ * reason — it was not touched and is still on the page it was on.
  */
 export function ReorganizeResultView({ result }: { result: ReorganizeResult }) {
   const { moved, unchanged, failed, pagesCreated, pagesRemoved, pagesKept } = result;
@@ -371,7 +371,7 @@ export function ReorganizeResultView({ result }: { result: ReorganizeResult }) {
         <p className={`text-xs ${clean ? "text-[#9ece6a]" : "text-[#e0af68]"}`}>
           {plural(moved.length, "session moved", "sessions moved")}
           {unchanged > 0 && `, ${unchanged} already in place`}
-          {!clean && `, ${failed.length} could not be moved`}. Every session kept running.
+          {!clean && `, ${failed.length} could not be moved`}. Nothing was closed.
         </p>
       </div>
       {failed.length > 0 && (
