@@ -1265,6 +1265,18 @@ impl Classified {
     }
 }
 
+/// The prior ledger's sessions, each id (case-insensitively) once, first
+/// listing kept — the same set [`classify`] buckets, so `expected` and the
+/// bucket counts agree.
+fn unique_sessions(led: &SessionLedger) -> Vec<LedgerEntry> {
+    let mut seen: HashSet<String> = HashSet::new();
+    led.sessions
+        .iter()
+        .filter(|e| seen.insert(e.claude_session_id.to_ascii_lowercase()))
+        .cloned()
+        .collect()
+}
+
 /// PURE classification of one prior ledger against what this boot observed.
 ///
 /// Back wins (it came back, finished or not); otherwise a FINISHED session —
@@ -1291,12 +1303,8 @@ fn classify(
         verdict: VERDICT_UNKNOWN,
         unknown_reason: None,
     };
-    let mut seen: HashSet<String> = HashSet::new();
-    for e in &prior.sessions {
+    for e in &unique_sessions(prior) {
         let id = e.claude_session_id.to_ascii_lowercase();
-        if !seen.insert(id.clone()) {
-            continue;
-        }
         let is_finished = now.finished.get(&id).copied().unwrap_or(e.finished);
         let seen_now = observed.get(&id).copied();
         if seen_now == Some(Observed::Back) {
@@ -1480,7 +1488,7 @@ pub fn diff(
         generated_at,
         prior_captured_at: Some(prior.captured_at.clone()),
         prior_reason: Some(prior.reason.clone()),
-        expected: prior.sessions.clone(),
+        expected: unique_sessions(prior),
         returned,
         attempted_unverified,
         terminal_only,
@@ -1561,7 +1569,7 @@ pub fn generation_report(
         captured_at: led.captured_at.clone(),
         reason: led.reason.clone(),
         clean_shutdown: led.clean_shutdown,
-        session_count: led.sessions.len(),
+        session_count: unique_sessions(led).len(),
         verdict: verdict.to_string(),
         returned,
         attempted_unverified,
@@ -1675,15 +1683,50 @@ pub struct LiveView {
 /// manager is not in app state, which [`report`] reads as UNKNOWN, never as
 /// "nothing is live". An unreadable process table leaves every pane's read an
 /// `Err`, which [`observe_returns`] reads as [`Observed::Unknown`].
+///
+/// Memoised for [`LIVE_VIEW_TTL`]: the ledger, the census and the strip's
+/// refreshes each ask, and one process-table read (PowerShell WMI on
+/// Windows) answers them all. A memo rather than a roster-only bypass,
+/// because it bounds every caller at one place — including the ones that DO
+/// need the live read — with no per-route flag to keep right.
 pub async fn live_view<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Option<LiveView> {
     use tauri::Manager;
     let tm = app
         .try_state::<std::sync::Arc<crate::terminal::TerminalManager>>()?
         .inner()
         .clone();
+    let now = std::time::Instant::now();
+    let cached = memo_fresh(
+        &live_view_memo().lock().unwrap_or_else(|e| e.into_inner()),
+        now,
+    );
+    if cached.is_some() {
+        return cached;
+    }
     let terminals = alive_terminal_ids(tm.list(), crate::process_capture::health::pid_alive);
     let panes = proc_read::read_panes(&tm, terminals.iter().cloned()).await;
-    Some(LiveView { terminals, panes })
+    let view = LiveView { terminals, panes };
+    *live_view_memo().lock().unwrap_or_else(|e| e.into_inner()) = Some((now, view.clone()));
+    Some(view)
+}
+
+/// How long one [`live_view`] read serves later requests.
+pub const LIVE_VIEW_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn live_view_memo() -> &'static Mutex<Option<(std::time::Instant, LiveView)>> {
+    static MEMO: OnceLock<Mutex<Option<(std::time::Instant, LiveView)>>> = OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(None))
+}
+
+/// PURE: the memoised view when it was read less than [`LIVE_VIEW_TTL`]
+/// before `now`.
+fn memo_fresh(
+    memo: &Option<(std::time::Instant, LiveView)>,
+    now: std::time::Instant,
+) -> Option<LiveView> {
+    memo.as_ref()
+        .filter(|(at, _)| now.saturating_duration_since(*at) < LIVE_VIEW_TTL)
+        .map(|(_, view)| view.clone())
 }
 
 /// The ids of the listed terminals whose PTY process is actually alive. The
@@ -1824,6 +1867,12 @@ pub fn observe_row(
     if stamp == Some(Observed::Back) {
         return stamp;
     }
+    // A CLOSED row that never verified is not a pending outcome of this
+    // boot: nothing holds it, and the resume door takes it. It reads as
+    // `missing` (resumable), so every non-back outcome names an OPEN row.
+    if r.state != "open" {
+        return None;
+    }
     let live_pane = live.filter(|l| r.state == "open" && l.terminals.contains(&r.terminal_id));
     let Some(view) = live_pane else {
         return stamp;
@@ -1838,7 +1887,13 @@ pub fn observe_row(
     };
     Some(match proc_read::judge(procs, &want, &r.terminal_id) {
         Ok(_) => Observed::Back,
+        // A claude runs here and does not verify as this session: wrong cwd
+        // or account, two of them, or one whose command line names no id or
+        // another one (`--continue`, an in-session `/resume`,
+        // `--fork-session`). Not a bare terminal, and not back.
         Err(Some(_)) => Observed::AttemptedUnverified,
+        Err(None) if !procs.is_empty() => Observed::AttemptedUnverified,
+        // The read succeeded and no claude runs in the pane.
         Err(None) => stamp.unwrap_or(Observed::TerminalOnly),
     })
 }
@@ -2984,7 +3039,8 @@ mod tests {
         );
     }
 
-    /// A `claude` for a DIFFERENT session in the pane is not this session.
+    /// A `claude` for a DIFFERENT session in the pane is not this session —
+    /// and not a bare terminal either: a claude runs there, unverified.
     #[test]
     fn a_pane_running_another_sessions_claude_is_not_back() {
         let (_dir, store) = fresh_store();
@@ -2996,8 +3052,97 @@ mod tests {
         )]);
         assert_eq!(
             observe_returns(&store, Some(boot), Some(&live)).get(U1),
-            Some(&Observed::TerminalOnly)
+            Some(&Observed::AttemptedUnverified)
         );
+        // A claude whose command line names no session (`--continue`).
+        let mut bare = resumed_proc(U1);
+        bare.cmdline = "/usr/bin/claude --continue".to_string();
+        let live = view(vec![(format!("term-{U1}").as_str(), Ok(vec![bare]))]);
+        assert_eq!(
+            observe_returns(&store, Some(boot), Some(&live)).get(U1),
+            Some(&Observed::AttemptedUnverified)
+        );
+    }
+
+    /// `judge` rejecting the claude it found (here its cwd is not the row's)
+    /// is an unverified attempt, never back. The same claude in the row's
+    /// own cwd is back, so the comparison really ran.
+    #[test]
+    fn a_claude_in_the_wrong_cwd_is_attempted_unverified() {
+        let (_dir, store) = fresh_store();
+        let boot = boot_a_minute_ago();
+        store.record_open(store_rec(U1));
+        let in_dir = |cwd: &str| {
+            let mut p = resumed_proc(U1);
+            p.cwd = Some(cwd.to_string());
+            view(vec![(format!("term-{U1}").as_str(), Ok(vec![p]))])
+        };
+        let elsewhere = in_dir("/elsewhere");
+        assert_eq!(
+            observe_returns(&store, Some(boot), Some(&elsewhere)).get(U1),
+            Some(&Observed::AttemptedUnverified)
+        );
+        // `store_rec` records working dir `C:/repo`.
+        let home = in_dir("C:/repo");
+        assert_eq!(
+            observe_returns(&store, Some(boot), Some(&home)).get(U1),
+            Some(&Observed::Back)
+        );
+    }
+
+    /// No live view (the terminal manager is not in app state): only this
+    /// boot's stamps speak, and an open unstamped row is not observed at all.
+    #[test]
+    fn without_a_live_view_only_this_boots_stamps_are_observed() {
+        let (_dir, store) = fresh_store();
+        let boot = boot_a_minute_ago();
+        for id in ["resumed", "pending", "open-unstamped"] {
+            store.record_open(store_rec(id));
+        }
+        store.mark_restored_from_boot("resumed", RESTORE_TIER_RESUMED);
+        store.mark_restore_pending("pending", true);
+        let seen = observe_returns(&store, Some(boot), None);
+        assert_eq!(seen.get("resumed"), Some(&Observed::Back));
+        assert_eq!(seen.get("pending"), Some(&Observed::AttemptedUnverified));
+        assert_eq!(seen.get("open-unstamped"), None);
+        assert_eq!(seen.len(), 2);
+    }
+
+    /// A CLOSED row this boot stamped but never verified is not a pending
+    /// outcome: nothing holds it and the door can take it, so it reads as
+    /// `missing`. A closed row whose restore verified did come back.
+    #[test]
+    fn a_closed_unverified_row_is_missing_and_a_closed_verified_one_is_back() {
+        let (_dir, store) = fresh_store();
+        let boot = boot_a_minute_ago();
+        for (id, tier) in [
+            ("closed-shell", RESTORE_TIER_TERMINAL_ONLY),
+            ("closed-back", RESTORE_TIER_RESUMED),
+        ] {
+            store.record_open(store_rec(id));
+            store.mark_restored_from_boot(id, tier);
+            store.record_close(id, "pty-exit");
+            assert_eq!(store.get(id).unwrap().state, "closed");
+        }
+        let seen = observe_returns(&store, Some(boot), Some(&view(Vec::new())));
+        assert_eq!(seen.get("closed-shell"), None);
+        assert_eq!(seen.get("closed-back"), Some(&Observed::Back));
+    }
+
+    /// One process-table read serves requests for [`LIVE_VIEW_TTL`], then
+    /// is read again.
+    #[test]
+    fn the_live_view_memo_serves_within_its_ttl_only() {
+        let at = std::time::Instant::now();
+        let memo = Some((at, view(vec![("t", Ok(Vec::new()))])));
+        assert!(memo_fresh(&memo, at).is_some());
+        assert!(memo_fresh(
+            &memo,
+            at + LIVE_VIEW_TTL - std::time::Duration::from_millis(1)
+        )
+        .is_some());
+        assert!(memo_fresh(&memo, at + LIVE_VIEW_TTL).is_none());
+        assert!(memo_fresh(&None, at).is_none());
     }
 
     /// D2: an unreadable process table is UNKNOWN, never back — and the
@@ -3182,7 +3327,7 @@ mod tests {
             restorable: true,
         }];
         let observed = observe_restored(&store, boot, Some(&live));
-        let census = diff_census(&expected, &observed, Some(true));
+        let census = diff_census(&expected, &observed, Some(true), true);
         assert_eq!(census.restored.len(), 1, "{census:?}");
         assert!(census.missing.is_empty());
         assert_eq!(census.verdict, RESTORE_VERDICT_MATCH);
@@ -3190,6 +3335,20 @@ mod tests {
         // The same pane as a bare shell: neither surface counts it.
         let shell = view(vec![(format!("term-{U1}").as_str(), Ok(Vec::new()))]);
         assert!(observe_restored(&store, boot, Some(&shell)).is_empty());
+
+        // The same pane unreadable: the census sees it, and cannot say.
+        let unread = view(vec![(
+            format!("term-{U1}").as_str(),
+            Err(crate::session::claude_process_read::PaneReadError::CmdlineUnreadable),
+        )]);
+        let observed = observe_restored(&store, boot, Some(&unread));
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].observed, Some(Observed::Unknown));
+        let census = diff_census(&expected, &observed, Some(true), true);
+        assert_eq!(
+            census.verdict,
+            crate::session::restore_census::RESTORE_VERDICT_UNKNOWN
+        );
         let seen = observe_returns(&store, Some(boot), Some(&shell));
         assert!(diff(Some(&prior), &seen, &none(), ledger(Vec::new()), true)
             .returned
@@ -3221,7 +3380,19 @@ mod tests {
         ]);
         let report = diff(Some(&prior), &seen, &none(), ledger(Vec::new()), true);
         assert_eq!(report.returned.len(), 1);
+        assert_eq!(report.expected.len(), 1, "expected agrees with the counts");
         assert_eq!(report.verdict, VERDICT_MATCH);
+        let generation = generation_report(
+            &StoredGeneration {
+                path: PathBuf::from("session-ledger.1.json"),
+                rotated_at_ms: 1,
+                ledger: prior.clone(),
+            },
+            &seen,
+            &none(),
+            true,
+        );
+        assert_eq!(generation.session_count, 1);
         assert!(
             report.note.starts_with("1 of 1 sessions"),
             "{}",

@@ -201,7 +201,8 @@ type UnreturnedOutcome = "attempted-unverified" | "terminal-only" | "failed" | "
 const UNRETURNED: Record<UnreturnedOutcome, { label: string; detail: string }> = {
   "attempted-unverified": {
     label: "resume not verified",
-    detail: "a resume was attempted this boot, and no process read has shown its claude running",
+    detail:
+      "a resume was attempted this boot, or a claude runs in its terminal, and no process read has verified it running as this session",
   },
   "terminal-only": {
     label: "terminal only",
@@ -217,8 +218,8 @@ const UNRETURNED: Record<UnreturnedOutcome, { label: string; detail: string }> =
   },
 };
 
-function isUnreturned(outcome: LedgerOutcome["outcome"]): outcome is UnreturnedOutcome {
-  return Object.hasOwn(UNRETURNED, outcome);
+function isUnreturned(value: string): value is UnreturnedOutcome {
+  return Object.hasOwn(UNRETURNED, value);
 }
 
 /** Sort order: what needs the operator first. */
@@ -298,9 +299,17 @@ export function buildRow(outcome: LedgerOutcome, ctx: RowContext): SinceRestartR
   let blockedReason: string | null = null;
   // A row closed on purpose can still be ticked by hand; it is just never
   // pre-checked (see `preCheckedIds`).
-  if (state !== "missing" && state !== "closed-by-user") {
-    blockedReason =
-      state === "needs-account" ? "choose an account first" : `nothing to resume: ${label}`;
+  if (state === "needs-account") {
+    blockedReason = "choose an account first";
+  } else if (state === "unknown") {
+    // Still open on its terminal, and whether its claude runs is unreadable.
+    blockedReason = "can't resume yet: whether it is still running could not be read";
+  } else if (isUnreturned(state)) {
+    // Every such row is OPEN (the backend reports a closed unverified row as
+    // `missing`), and the resume door takes closed rows only.
+    blockedReason = "can't resume yet: the session is still open on its old terminal";
+  } else if (state !== "missing" && state !== "closed-by-user") {
+    blockedReason = `nothing to resume: ${label}`;
   } else if (!account.known) {
     blockedReason = "the account it ran under is unknown";
   } else if (outcome.reason === "not-restorable") {

@@ -58,6 +58,10 @@ pub enum PaneReadError {
     NoChildPid,
     /// The process table could not be read (the snapshot came back empty).
     TableUnreadable,
+    /// A `claude` was found under the pane and its command line could not be
+    /// read (a WMI timeout or spawn error on Windows, an unreadable
+    /// `/proc/<pid>/cmdline` on Linux), so which session it holds is unknown.
+    CmdlineUnreadable,
 }
 
 /// One pane's read: the `claude` processes in its subtree, or why there is no
@@ -166,7 +170,7 @@ pub async fn snapshot() -> Result<pt::ProcessSnapshot, PaneReadError> {
 /// The `claude` processes under each `(key, root pid)`, from ONE snapshot.
 async fn claude_procs_under(
     roots: &[(String, u32)],
-) -> Result<HashMap<String, Vec<ClaudeProc>>, PaneReadError> {
+) -> Result<HashMap<String, PaneRead>, PaneReadError> {
     let snap = snapshot().await?;
     let per_root: Vec<(String, Vec<u32>)> = roots
         .iter()
@@ -186,20 +190,46 @@ async fn claude_procs_under(
     Ok(per_root
         .into_iter()
         .map(|(key, pids)| {
-            let procs = pids
-                .into_iter()
-                .filter_map(|pid| {
-                    Some(ClaudeProc {
-                        pid,
-                        cmdline: cmdlines.get(&pid)?.clone(),
-                        cwd: cwds.get(&pid).cloned(),
-                        config_dir: config_dir_of_pid(pid),
-                    })
-                })
-                .collect();
-            (key, procs)
+            (
+                key,
+                pane_read_of(&pids, &cmdlines, &cwds, config_dir_of_pid),
+            )
         })
         .collect())
+}
+
+/// PURE: one pane's read from the per-pid facts. A `claude` pid with no
+/// command line makes the whole pane [`PaneReadError::CmdlineUnreadable`]:
+/// dropping it would read a running `claude` as "no claude here". A cwd the
+/// kernel marks ` (deleted)` (Linux, a removed directory) is compared as the
+/// path it names.
+fn pane_read_of(
+    pids: &[u32],
+    cmdlines: &HashMap<u32, String>,
+    cwds: &HashMap<u32, String>,
+    config_dir_of: impl Fn(u32) -> Option<String>,
+) -> PaneRead {
+    pids.iter()
+        .map(|&pid| {
+            let cmdline = cmdlines
+                .get(&pid)
+                .ok_or(PaneReadError::CmdlineUnreadable)?
+                .clone();
+            Ok(ClaudeProc {
+                pid,
+                cmdline,
+                cwd: cwds
+                    .get(&pid)
+                    .map(|c| without_deleted_suffix(c).to_string()),
+                config_dir: config_dir_of(pid),
+            })
+        })
+        .collect()
+}
+
+/// `/proc/<pid>/cwd` of a directory removed since reads `<path> (deleted)`.
+fn without_deleted_suffix(cwd: &str) -> &str {
+    cwd.strip_suffix(" (deleted)").unwrap_or(cwd)
 }
 
 /// Read every pane in `terminal_ids` from one snapshot. Every id gets an
@@ -227,7 +257,7 @@ pub async fn read_panes(
         return out;
     }
     match claude_procs_under(&roots).await {
-        Ok(read) => out.extend(read.into_iter().map(|(id, procs)| (id, Ok(procs)))),
+        Ok(read) => out.extend(read),
         Err(e) => out.extend(roots.into_iter().map(|(id, _)| (id, Err(e)))),
     }
     out
@@ -310,6 +340,40 @@ mod tests {
             .unwrap()
             .starts_with("config_dir_mismatch"));
         assert!(judge(&[proc(&good, Some("/work/"), Some("/cfg"))], &want(), "t").is_ok());
+    }
+
+    /// A `claude` whose command line could not be read is UNKNOWN, never
+    /// dropped: dropping it read a running `claude` as an empty pane.
+    #[test]
+    fn a_claude_pid_with_no_cmdline_makes_the_pane_unreadable() {
+        let cmd: HashMap<u32, String> = [(1, format!("claude --resume {ID}"))].into();
+        let none = HashMap::new();
+        assert_eq!(
+            pane_read_of(&[1, 2], &cmd, &none, |_| None),
+            Err(PaneReadError::CmdlineUnreadable)
+        );
+        // Windows' WMI timeout: an empty command-line map for found pids.
+        assert_eq!(
+            pane_read_of(&[1], &none, &none, |_| None),
+            Err(PaneReadError::CmdlineUnreadable)
+        );
+        // No claude pid at all is a real, readable, empty pane.
+        assert_eq!(pane_read_of(&[], &none, &none, |_| None), Ok(Vec::new()));
+        let one = pane_read_of(&[1], &cmd, &none, |_| Some("/cfg".to_string())).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].config_dir.as_deref(), Some("/cfg"));
+    }
+
+    /// Linux marks the cwd of a removed directory ` (deleted)`; the path it
+    /// names is what the row recorded, so the suffix must not fail the match.
+    #[test]
+    fn a_deleted_cwd_is_compared_as_the_path_it_names() {
+        let cmd: HashMap<u32, String> = [(1, format!("claude --resume {ID}"))].into();
+        let cwd: HashMap<u32, String> = [(1, "/work (deleted)".to_string())].into();
+        let procs = pane_read_of(&[1], &cmd, &cwd, |_| None).unwrap();
+        assert_eq!(procs[0].cwd.as_deref(), Some("/work"));
+        assert!(judge(&procs, &want(), "t").is_ok());
+        assert_eq!(without_deleted_suffix("/work"), "/work");
     }
 
     /// A row that recorded no directory is not compared on it: the read's own

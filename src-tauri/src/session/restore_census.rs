@@ -88,6 +88,9 @@ pub const MISSING_RESUME_FAILED: &str = "resume-failed";
 /// `missing` reason: nothing ever stamped this record as restored — no restore
 /// was attempted for it at all.
 pub const MISSING_NO_ATTEMPT: &str = "no-attempt";
+/// `missing` reason: its live pane's process read was unavailable, so
+/// whether it came back is UNKNOWN — and so is the verdict.
+pub const MISSING_PROCESS_READ_UNAVAILABLE: &str = "process-read-unavailable";
 
 /// `unexpected` reason: a session came back that the pre-restart census never
 /// contained (ghost re-admission, or another instance's session leaking in).
@@ -138,7 +141,7 @@ pub struct CensusRestored {
 pub struct CensusMissing {
     pub claude_session_id: String,
     /// [`MISSING_NOT_RESTORABLE`] | [`MISSING_RESUME_FAILED`] |
-    /// [`MISSING_NO_ATTEMPT`].
+    /// [`MISSING_NO_ATTEMPT`] | [`MISSING_PROCESS_READ_UNAVAILABLE`].
     pub reason: String,
 }
 
@@ -196,14 +199,14 @@ pub struct RestoredObservation {
     pub zone_index: i32,
     pub restore_tier: Option<String>,
     pub restored_from_boot_at: Option<i64>,
-    /// THE back predicate the session ledger serves `returned` from
-    /// ([`crate::session::session_ledger::observe_row`] is
-    /// [`Observed::Back`]): tier `resumed` this boot, or a process read of
-    /// its live pane showing its `claude` running. Only a verified
-    /// observation is a restore, so the census and the ledger cannot
-    /// disagree about a verified pane (plan
+    /// What THE per-row predicate the session ledger serves `returned` from
+    /// ([`crate::session::session_ledger::observe_row`]) says of this row.
+    /// Only [`Observed::Back`] — tier `resumed` this boot, or a process read
+    /// of its live pane showing its `claude` running — is a restore, and
+    /// [`Observed::Unknown`] makes the verdict unknown, so the census and the
+    /// ledger cannot disagree about a pane (plan
     /// `2026-11-04-unplanned-restart-restore-is-page-gated-and-counts-unverified-resumes`, D2).
-    pub verified: bool,
+    pub observed: Option<Observed>,
 }
 
 /// The outcome of [`diff_census`] — the three buckets plus the verdict over
@@ -216,6 +219,8 @@ pub struct CensusDiff {
     pub missing: Vec<CensusMissing>,
     pub unexpected: Vec<CensusUnexpected>,
     pub verdict: String,
+    /// Which unknown, whenever the verdict is [`RESTORE_VERDICT_UNKNOWN`].
+    pub unknown_reason: Option<String>,
 }
 
 /// The once-per-process latch: the pre-restore `expected` set plus the instant
@@ -356,8 +361,14 @@ pub fn latched() -> Option<&'static BootCensus> {
 /// buckets are still populated so an operator can see the evidence behind the
 /// `unknown`.
 ///
+/// `live_read` is whether a live view was read at all. Without one, an open
+/// row can never verify, so no outcome is stated: the verdict is unknown
+/// (`live_view_unavailable`), as it is when any expected row's process read
+/// was unavailable (`process_read_unavailable`).
+///
 /// Classification:
-/// - only a VERIFIED observation ([`RestoredObservation::verified`]) is a
+/// - only a VERIFIED observation ([`RestoredObservation::observed`] is
+///   [`Observed::Back`]) is a
 ///   restore — including a pane this boot ADOPTED with its `claude` still
 ///   running, which carries no restore stamp at all;
 /// - an unverified `terminal-only`-tier stamp is NOT a restore — a terminal
@@ -376,6 +387,7 @@ pub fn diff_census(
     expected: &[CensusExpected],
     observed: &[RestoredObservation],
     clean_shutdown: Option<bool>,
+    live_read: bool,
 ) -> CensusDiff {
     let expected_ids: HashSet<&str> = expected
         .iter()
@@ -385,6 +397,11 @@ pub fn diff_census(
     // come back, to say WHY.
     let attempted: HashSet<&str> = observed
         .iter()
+        .map(|o| o.claude_session_id.as_str())
+        .collect();
+    let unreadable: HashSet<&str> = observed
+        .iter()
+        .filter(|o| o.observed == Some(Observed::Unknown))
         .map(|o| o.claude_session_id.as_str())
         .collect();
 
@@ -402,8 +419,10 @@ pub fn diff_census(
             });
             continue;
         }
-        let bare_terminal = obs.restore_tier.as_deref() == Some(RESTORE_TIER_TERMINAL_ONLY);
-        if !obs.verified && !bare_terminal {
+        let verified = obs.observed == Some(Observed::Back);
+        let bare_terminal = obs.restore_tier.as_deref() == Some(RESTORE_TIER_TERMINAL_ONLY)
+            && obs.observed != Some(Observed::Unknown);
+        if !verified && !bare_terminal {
             // Attempted and not landed — accounted for under `missing` below,
             // never as a restore.
             continue;
@@ -422,7 +441,7 @@ pub fn diff_census(
             restore_tier: obs.restore_tier.clone(),
             restored_from_boot_at: obs.restored_from_boot_at,
         };
-        if obs.verified {
+        if verified {
             restored.push(row);
         } else {
             terminal_only.push(row);
@@ -443,7 +462,9 @@ pub fn diff_census(
             .filter(|e| !restored_ids.contains(e.claude_session_id.as_str()))
             .map(|e| CensusMissing {
                 claude_session_id: e.claude_session_id.clone(),
-                reason: if !e.restorable {
+                reason: if unreadable.contains(e.claude_session_id.as_str()) {
+                    MISSING_PROCESS_READ_UNAVAILABLE.to_string()
+                } else if !e.restorable {
                     MISSING_NOT_RESTORABLE.to_string()
                 } else if attempted.contains(e.claude_session_id.as_str()) {
                     MISSING_RESUME_FAILED.to_string()
@@ -463,7 +484,19 @@ pub fn diff_census(
             .then_with(|| a.reason.cmp(&b.reason))
     });
 
-    let verdict = if clean_shutdown != Some(true) {
+    let any_unreadable = missing
+        .iter()
+        .any(|m| m.reason == MISSING_PROCESS_READ_UNAVAILABLE);
+    let unknown_why = if clean_shutdown != Some(true) {
+        Some(unknown_reason(clean_shutdown))
+    } else if !live_read {
+        Some("live_view_unavailable")
+    } else if any_unreadable {
+        Some("process_read_unavailable")
+    } else {
+        None
+    };
+    let verdict = if unknown_why.is_some() {
         RESTORE_VERDICT_UNKNOWN
     } else if missing.is_empty() && unexpected.is_empty() && terminal_only.is_empty() {
         RESTORE_VERDICT_MATCH
@@ -478,6 +511,7 @@ pub fn diff_census(
         missing,
         unexpected,
         verdict: verdict.to_string(),
+        unknown_reason: unknown_why.map(str::to_string),
     }
 }
 
@@ -515,14 +549,17 @@ pub fn observe_restored(
         .into_iter()
         .filter_map(|r| {
             let stamped = r.restored_from_boot_at.is_some_and(|at| at >= boot_at_ms);
-            let verified = observe_row(&r, Some(boot_at_ms), live) == Some(Observed::Back);
-            (stamped || verified).then(|| RestoredObservation {
+            let observed = observe_row(&r, Some(boot_at_ms), live);
+            // An unstamped row counts only when the predicate has something
+            // to say of THIS boot's pane: it is back, or it cannot be read.
+            let adopted = matches!(observed, Some(Observed::Back | Observed::Unknown));
+            (stamped || adopted).then(|| RestoredObservation {
                 claude_session_id: r.claude_session_id,
                 terminal_id: r.terminal_id,
                 zone_index: r.zone_index,
                 restore_tier: r.restore_tier,
                 restored_from_boot_at: r.restored_from_boot_at,
-                verified,
+                observed,
             })
         })
         .collect();
@@ -566,9 +603,8 @@ pub fn build_census(
         };
     };
     let observed = observe_restored(store, census.boot_at_ms, live);
-    let diff = diff_census(&census.expected, &observed, clean_shutdown);
-    let reason = (diff.verdict == RESTORE_VERDICT_UNKNOWN)
-        .then(|| unknown_reason(clean_shutdown).to_string());
+    let diff = diff_census(&census.expected, &observed, clean_shutdown, live.is_some());
+    let reason = diff.unknown_reason.clone();
     RestoreCensusResponse {
         status: STATUS_OK.to_string(),
         reason,
@@ -608,8 +644,12 @@ mod tests {
             zone_index: 0,
             restore_tier: Some(tier.to_string()),
             restored_from_boot_at: Some(9_000),
-            // A stamp verifies only as `resumed` (the ledger's stamp arm).
-            verified: tier == RESTORE_TIER_RESUMED,
+            // What the ledger's stamp arm says of a row with no live pane.
+            observed: Some(match tier {
+                RESTORE_TIER_RESUMED => Observed::Back,
+                RESTORE_TIER_TERMINAL_ONLY => Observed::TerminalOnly,
+                _ => Observed::Failed,
+            }),
         }
     }
 
@@ -620,7 +660,7 @@ mod tests {
             observed("a", RESTORE_TIER_RESUMED),
             observed("b", RESTORE_TIER_RESUMED),
         ];
-        let d = diff_census(&exp, &obs, Some(true));
+        let d = diff_census(&exp, &obs, Some(true), true);
         assert_eq!(d.restored.len(), 2);
         assert!(d.terminal_only.is_empty());
         assert!(d.missing.is_empty());
@@ -639,7 +679,7 @@ mod tests {
             observed("a", RESTORE_TIER_RESUMED),
             observed("b", RESTORE_TIER_TERMINAL_ONLY),
         ];
-        let d = diff_census(&exp, &obs, Some(true));
+        let d = diff_census(&exp, &obs, Some(true), true);
         assert_eq!(d.restored.len(), 1);
         assert_eq!(d.restored[0].claude_session_id, "a");
         assert_eq!(d.terminal_only.len(), 1);
@@ -647,7 +687,7 @@ mod tests {
         assert!(d.missing.is_empty(), "{:?}", d.missing);
         assert_eq!(d.verdict, RESTORE_VERDICT_PARTIAL);
         // Only terminals came back: nothing expected was restored.
-        let only = diff_census(&exp[1..], &obs[1..], Some(true));
+        let only = diff_census(&exp[1..], &obs[1..], Some(true), true);
         assert_eq!(only.verdict, RESTORE_VERDICT_MISMATCH);
     }
 
@@ -655,7 +695,7 @@ mod tests {
     fn a_missing_session_is_partial_with_a_reason() {
         let exp = [expected("a", true), expected("b", true)];
         let obs = [observed("a", RESTORE_TIER_RESUMED)];
-        let d = diff_census(&exp, &obs, Some(true));
+        let d = diff_census(&exp, &obs, Some(true), true);
         assert_eq!(d.restored.len(), 1);
         assert_eq!(d.missing.len(), 1);
         assert_eq!(d.missing[0].claude_session_id, "b");
@@ -668,7 +708,7 @@ mod tests {
     fn a_never_restorable_expected_session_says_so_rather_than_blaming_the_restore() {
         let exp = [expected("a", true), expected("phantom", false)];
         let obs = [observed("a", RESTORE_TIER_RESUMED)];
-        let d = diff_census(&exp, &obs, Some(true));
+        let d = diff_census(&exp, &obs, Some(true), true);
         assert_eq!(d.missing[0].claude_session_id, "phantom");
         assert_eq!(d.missing[0].reason, MISSING_NOT_RESTORABLE);
         assert_eq!(d.verdict, RESTORE_VERDICT_PARTIAL);
@@ -678,7 +718,7 @@ mod tests {
     fn a_failed_resume_is_missing_resume_failed_never_a_restore() {
         let exp = [expected("a", true)];
         let obs = [observed("a", RESTORE_TIER_FAILED)];
-        let d = diff_census(&exp, &obs, Some(true));
+        let d = diff_census(&exp, &obs, Some(true), true);
         assert!(
             d.restored.is_empty(),
             "a resume that never landed is not a d.restored session"
@@ -697,7 +737,7 @@ mod tests {
             observed("a", RESTORE_TIER_RESUMED),
             observed("stranger", RESTORE_TIER_RESUMED),
         ];
-        let d = diff_census(&exp, &obs, Some(true));
+        let d = diff_census(&exp, &obs, Some(true), true);
         assert_eq!(d.restored.len(), 1);
         assert!(d.missing.is_empty());
         assert_eq!(d.unexpected.len(), 1);
@@ -714,7 +754,7 @@ mod tests {
             observed("a", RESTORE_TIER_RESUMED),
             observed("a", RESTORE_TIER_RESUMED),
         ];
-        let d = diff_census(&exp, &obs, Some(true));
+        let d = diff_census(&exp, &obs, Some(true), true);
         assert_eq!(
             d.restored.len(),
             1,
@@ -726,12 +766,50 @@ mod tests {
         assert_eq!(d.verdict, RESTORE_VERDICT_PARTIAL);
     }
 
+    /// The census states no outcome it could not read: an expected row whose
+    /// pane read was unavailable, or no live view at all, is `unknown` with
+    /// its reason — never `match`, and never a confident `resume-failed`.
+    #[test]
+    fn an_unreadable_pane_or_no_live_view_makes_the_census_unknown() {
+        let exp = [expected("a", true), expected("b", true)];
+        let mut unread = observed("b", RESTORE_TIER_FAILED);
+        unread.observed = Some(Observed::Unknown);
+        let d = diff_census(
+            &exp,
+            &[observed("a", RESTORE_TIER_RESUMED), unread],
+            Some(true),
+            true,
+        );
+        assert_eq!(d.restored.len(), 1);
+        assert_eq!(d.missing[0].reason, MISSING_PROCESS_READ_UNAVAILABLE);
+        assert_eq!(d.verdict, RESTORE_VERDICT_UNKNOWN);
+        assert_eq!(
+            d.unknown_reason.as_deref(),
+            Some("process_read_unavailable")
+        );
+
+        let all = [
+            observed("a", RESTORE_TIER_RESUMED),
+            observed("b", RESTORE_TIER_RESUMED),
+        ];
+        let blind = diff_census(&exp, &all, Some(true), false);
+        assert_eq!(blind.restored.len(), 2, "the evidence is still shown");
+        assert_eq!(blind.verdict, RESTORE_VERDICT_UNKNOWN);
+        assert_eq!(
+            blind.unknown_reason.as_deref(),
+            Some("live_view_unavailable")
+        );
+        let seen = diff_census(&exp, &all, Some(true), true);
+        assert_eq!(seen.verdict, RESTORE_VERDICT_MATCH);
+        assert_eq!(seen.unknown_reason, None);
+    }
+
     /// T10, as a pure test: a hard-crash boot must NEVER claim `match`.
     #[test]
     fn no_clean_shutdown_marker_is_unknown_even_when_everything_came_back() {
         let exp = [expected("a", true)];
         let obs = [observed("a", RESTORE_TIER_RESUMED)];
-        let d = diff_census(&exp, &obs, Some(false));
+        let d = diff_census(&exp, &obs, Some(false), true);
         // The evidence is still shown…
         assert_eq!(d.restored.len(), 1);
         assert!(d.missing.is_empty());
@@ -743,7 +821,7 @@ mod tests {
 
     #[test]
     fn an_unclassified_boot_is_unknown_with_its_own_reason() {
-        let d = diff_census(&[], &[], None);
+        let d = diff_census(&[], &[], None, true);
         assert_eq!(d.verdict, RESTORE_VERDICT_UNKNOWN);
         assert_eq!(unknown_reason(None), "boot_not_classified");
     }
@@ -753,12 +831,12 @@ mod tests {
     /// when a marker PROVES the runner had zero sessions.
     #[test]
     fn empty_expected_is_unknown_without_a_marker_and_match_with_one() {
-        let crashed = diff_census(&[], &[], Some(false)).verdict;
+        let crashed = diff_census(&[], &[], Some(false), true).verdict;
         assert_eq!(
             crashed, RESTORE_VERDICT_UNKNOWN,
             "an empty census after a crash proves nothing"
         );
-        let clean = diff_census(&[], &[], Some(true)).verdict;
+        let clean = diff_census(&[], &[], Some(true), true).verdict;
         assert_eq!(
             clean, RESTORE_VERDICT_MATCH,
             "a clean shutdown marker with zero sessions is a genuine match"
@@ -932,7 +1010,7 @@ mod tests {
         let exp = [expected("a", true)];
         let mut obs = observed("a", RESTORE_TIER_RESUMED);
         obs.terminal_id = "  ".to_string();
-        let d = diff_census(&exp, &[obs], Some(true));
+        let d = diff_census(&exp, &[obs], Some(true), true);
         assert_eq!(d.restored.len(), 1);
         assert_eq!(d.restored[0].terminal_id, None);
         let json = serde_json::to_value(&d.restored[0]).unwrap();

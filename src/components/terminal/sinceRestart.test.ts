@@ -342,6 +342,15 @@ describe("rows the backend did not verify back", () => {
       expect(byId.get(id)?.label).not.toContain("back");
       expect(byId.get(id)?.selectable).toBe(false);
     }
+    // Plain about why: these rows are still open, and the door takes closed ones.
+    for (const id of ["u", "t", "f"]) {
+      expect(byId.get(id)?.blockedReason).toBe(
+        "can't resume yet: the session is still open on its old terminal",
+      );
+    }
+    expect(byId.get("x")?.blockedReason).toBe(
+      "can't resume yet: whether it is still running could not be read",
+    );
     expect(rows.map((r) => r.outcome.claudeSessionId)).toEqual(["f", "u", "t", "x", "b"]);
   });
 
