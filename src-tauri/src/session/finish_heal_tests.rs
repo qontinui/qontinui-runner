@@ -15,7 +15,7 @@ use crate::session::SessionEventKind;
 const ROW: &str = "01a1ab84-1c55-7a2e-9b41-6c0f3d2e8a17";
 const OTHER_ROW: &str = "01a1ab99-0000-7000-8000-000000000002";
 /// 2026-11-05T12:05:42Z.
-const FINISHED_AT: i64 = 1_762_344_342_000;
+const FINISHED_AT: i64 = 1_793_880_342_000;
 const BEFORE: &str = "2026-11-05T11:00:00Z";
 const AFTER: &str = "2026-11-05T13:00:00Z";
 
@@ -84,11 +84,21 @@ fn coord_working_since_after_the_finish_is_a_revival_and_untouched() {
 #[test]
 fn every_unknown_leaves_the_mark_alone() {
     assert_eq!(
-        heal_decision(FINISHED_AT, Some(row()), Observation::Unreadable, FINISHED_AT),
+        heal_decision(
+            FINISHED_AT,
+            Some(row()),
+            Observation::Unreadable,
+            FINISHED_AT
+        ),
         HealDecision::Leave(HealSkip::CoordUnreadable)
     );
     assert_eq!(
-        heal_decision(FINISHED_AT, Some(row()), Observation::Row(None), FINISHED_AT),
+        heal_decision(
+            FINISHED_AT,
+            Some(row()),
+            Observation::Row(None),
+            FINISHED_AT
+        ),
         HealDecision::Leave(HealSkip::NoCoordRow)
     );
     assert_eq!(
@@ -116,7 +126,11 @@ fn every_unknown_leaves_the_mark_alone() {
 #[test]
 fn coord_finished_is_the_healthy_case() {
     assert_eq!(
-        decide(&observed(Some("finished"), Some("2026-11-05T12:05:42Z"), Some(ROW))),
+        decide(&observed(
+            Some("finished"),
+            Some("2026-11-05T12:05:42Z"),
+            Some(ROW)
+        )),
         HealDecision::Leave(HealSkip::CoordFinished)
     );
 }
@@ -194,7 +208,12 @@ fn synced_store(csid: &str) -> (tempfile::TempDir, Arc<SessionLifecycleStore>, i
     (dir, store, at)
 }
 
-fn body(csid: &str, status: serde_json::Value, since: serde_json::Value, coord: &str) -> serde_json::Value {
+fn body(
+    csid: &str,
+    status: serde_json::Value,
+    since: serde_json::Value,
+    coord: &str,
+) -> serde_json::Value {
     json!({
         "statuses": {csid: {"session_status": status, "since": since,
                              "coord_session_id": coord, "state": "closed"}},
@@ -217,14 +236,27 @@ fn a_synced_mark_over_coord_null_is_unstamped_and_requeued_once() {
     let p = port(&store);
     let fetch = fetch_from_body_for_test(body("heal-null", json!(null), json!(null), ROW), 1);
     let out = apply_heal(&store, Some(&p), &store.all_records(), &fetch, at + 1_000);
-    assert_eq!(out, vec![("heal-null".to_string(), HealOutcome::Resent { row: row() })]);
-    assert!(!store.get("heal-null").unwrap().finish_synced, "the stamp is withdrawn");
-    assert_eq!(*p.sent.lock().unwrap(), vec![("heal-null".to_string(), at, row())]);
+    assert_eq!(
+        out,
+        vec![("heal-null".to_string(), HealOutcome::Resent { row: row() })]
+    );
+    assert!(
+        !store.get("heal-null").unwrap().finish_synced,
+        "the stamp is withdrawn"
+    );
+    assert_eq!(
+        *p.sent.lock().unwrap(),
+        vec![("heal-null".to_string(), at, row())]
+    );
 
     // The sweep run again: the mark is no longer synced, so nothing more.
     let again = apply_heal(&store, Some(&p), &store.all_records(), &fetch, at + 2_000);
     assert!(again.is_empty(), "{again:?}");
-    assert_eq!(p.sent.lock().unwrap().len(), 1, "one re-queue across two sweeps");
+    assert_eq!(
+        p.sent.lock().unwrap().len(),
+        1,
+        "one re-queue across two sweeps"
+    );
 }
 
 #[test]
@@ -234,7 +266,8 @@ fn coord_working_since_before_the_finish_requeues_the_mark() {
     let since = chrono::DateTime::<Utc>::from_timestamp_millis(at - 3_600_000)
         .unwrap()
         .to_rfc3339();
-    let fetch = fetch_from_body_for_test(body("heal-working", json!("working"), json!(since), ROW), 1);
+    let fetch =
+        fetch_from_body_for_test(body("heal-working", json!("working"), json!(since), ROW), 1);
     let out = apply_heal(&store, Some(&p), &store.all_records(), &fetch, at + 1_000);
     assert_eq!(out[0].1, HealOutcome::Resent { row: row() });
     assert_eq!(p.sent.lock().unwrap().len(), 1);
@@ -247,10 +280,20 @@ fn coord_working_since_after_the_finish_leaves_the_mark_synced() {
     let since = chrono::DateTime::<Utc>::from_timestamp_millis(at + 3_600_000)
         .unwrap()
         .to_rfc3339();
-    let fetch = fetch_from_body_for_test(body("heal-revived", json!("working"), json!(since), ROW), 1);
-    let out = apply_heal(&store, Some(&p), &store.all_records(), &fetch, at + 7_200_000);
+    let fetch =
+        fetch_from_body_for_test(body("heal-revived", json!("working"), json!(since), ROW), 1);
+    let out = apply_heal(
+        &store,
+        Some(&p),
+        &store.all_records(),
+        &fetch,
+        at + 7_200_000,
+    );
     assert_eq!(out[0].1, HealOutcome::Left(HealSkip::RevivedAfterFinish));
-    assert!(store.get("heal-revived").unwrap().finish_synced, "untouched");
+    assert!(
+        store.get("heal-revived").unwrap().finish_synced,
+        "untouched"
+    );
     assert!(p.sent.lock().unwrap().is_empty());
 }
 
@@ -269,7 +312,10 @@ fn coord_unreachable_leaves_the_mark_and_counts_the_reason() {
     assert_eq!(out[0].1, HealOutcome::Left(HealSkip::CoordUnreadable));
     assert!(store.get("heal-unreachable").unwrap().finish_synced);
     assert!(p.sent.lock().unwrap().is_empty());
-    assert!(count() > before, "the reason is counted in /health finishHeal");
+    assert!(
+        count() > before,
+        "the reason is counted in /health finishHeal"
+    );
 }
 
 #[test]
@@ -277,7 +323,13 @@ fn a_mark_older_than_the_window_is_never_resent() {
     let (_d, store, at) = synced_store("heal-old");
     let p = port(&store);
     let fetch = fetch_from_body_for_test(body("heal-old", json!(null), json!(null), ROW), 1);
-    let out = apply_heal(&store, Some(&p), &store.all_records(), &fetch, at + HEAL_WINDOW_MS + 1);
+    let out = apply_heal(
+        &store,
+        Some(&p),
+        &store.all_records(),
+        &fetch,
+        at + HEAL_WINDOW_MS + 1,
+    );
     assert_eq!(out[0].1, HealOutcome::Left(HealSkip::OutOfWindow));
     assert!(store.get("heal-old").unwrap().finish_synced);
     assert!(p.sent.lock().unwrap().is_empty());
@@ -287,7 +339,8 @@ fn a_mark_older_than_the_window_is_never_resent() {
 fn a_different_row_or_an_unresolved_own_row_changes_nothing() {
     let (_d, store, at) = synced_store("heal-other");
     let p = port(&store);
-    let fetch = fetch_from_body_for_test(body("heal-other", json!(null), json!(null), OTHER_ROW), 1);
+    let fetch =
+        fetch_from_body_for_test(body("heal-other", json!(null), json!(null), OTHER_ROW), 1);
     let out = apply_heal(&store, Some(&p), &store.all_records(), &fetch, at + 1_000);
     assert_eq!(out[0].1, HealOutcome::Left(HealSkip::DifferentRow));
     let blind = FakePort {
@@ -295,7 +348,13 @@ fn a_different_row_or_an_unresolved_own_row_changes_nothing() {
         ..port(&store)
     };
     let fetch = fetch_from_body_for_test(body("heal-other", json!(null), json!(null), ROW), 1);
-    let out = apply_heal(&store, Some(&blind), &store.all_records(), &fetch, at + 1_000);
+    let out = apply_heal(
+        &store,
+        Some(&blind),
+        &store.all_records(),
+        &fetch,
+        at + 1_000,
+    );
     assert_eq!(out[0].1, HealOutcome::Left(HealSkip::MarkRowUnknown));
     assert!(store.get("heal-other").unwrap().finish_synced);
 }
@@ -303,12 +362,21 @@ fn a_different_row_or_an_unresolved_own_row_changes_nothing() {
 #[test]
 fn clear_finish_synced_clears_only_the_matching_synced_mark() {
     let (_d, store, at) = synced_store("clear-me");
-    assert!(!store.clear_finish_synced("clear-me", at + 1), "another mark's time");
+    assert!(
+        !store.clear_finish_synced("clear-me", at + 1),
+        "another mark's time"
+    );
     assert!(store.get("clear-me").unwrap().finish_synced);
     assert!(store.clear_finish_synced("clear-me", at));
     assert!(!store.get("clear-me").unwrap().finish_synced);
-    assert!(store.get("clear-me").unwrap().finished_at == Some(at), "the mark stays");
-    assert!(!store.clear_finish_synced("clear-me", at), "already unsynced");
+    assert!(
+        store.get("clear-me").unwrap().finished_at == Some(at),
+        "the mark stays"
+    );
+    assert!(
+        !store.clear_finish_synced("clear-me", at),
+        "already unsynced"
+    );
     assert!(!store.clear_finish_synced("ghost", at));
 }
 
@@ -425,7 +493,9 @@ fn an_unmark_clears_the_local_mark_before_its_working_is_queued() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(SessionLifecycleStore::open(dir.path().join("lifecycle.json")).unwrap());
     store.record_open(test_open_record("unmark"));
-    store.set_finished("unmark", true, Some("done".into())).unwrap();
+    store
+        .set_finished("unmark", true, Some("done".into()))
+        .unwrap();
     let seen: Arc<std::sync::Mutex<Vec<Option<i64>>>> = Default::default();
     {
         let seen = seen.clone();
@@ -441,7 +511,11 @@ fn an_unmark_clears_the_local_mark_before_its_working_is_queued() {
         });
     }
     store.set_finished("unmark", false, None).unwrap();
-    assert_eq!(*seen.lock().unwrap(), vec![None], "cleared before forwarding");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![None],
+        "cleared before forwarding"
+    );
 }
 
 /// Revival path 3: an interaction with a finished session clears the local
@@ -504,7 +578,11 @@ fn an_interaction_clears_the_local_mark_first_and_a_drain_does_not_revive() {
 
 fn read_back_response(store: &SessionLifecycleStore, csid: &str) -> serde_json::Value {
     let outcome = store.set_finished(csid, true, None).unwrap();
-    assert_eq!(outcome.changed.as_str(), "none", "a read-back writes nothing");
+    assert_eq!(
+        outcome.changed.as_str(),
+        "none",
+        "a read-back writes nothing"
+    );
     outcome.response_json()
 }
 
@@ -537,7 +615,10 @@ fn a_read_back_over_coord_null_heals_and_stops_reading_synced() {
     let (_d, store, at) = synced_store("rb-null");
     let p = port(&store);
     let mut resp = read_back_response(&store, "rb-null");
-    assert_eq!(resp["session"]["finishSynced"], true, "the stored stamp, before the read");
+    assert_eq!(
+        resp["session"]["finishSynced"], true,
+        "the stored stamp, before the read"
+    );
     let fetch = fetch_from_body_for_test(body("rb-null", json!(null), json!(null), ROW), 1);
     let now = chrono::DateTime::<Utc>::from_timestamp_millis(at + 5_000).unwrap();
     let rb = read_back_from(&store, Some(&p), "rb-null", &fetch, now);
@@ -560,7 +641,10 @@ fn a_read_back_with_coord_unreadable_keeps_the_stored_value_and_names_why() {
     let rb = read_back_from(&store, Some(&p), "rb-dark", &fetch, now);
     decorate_read_back(&mut resp, &rb, store.get("rb-dark").as_ref());
     assert_eq!(resp["coord"]["observed"], json!(null));
-    assert_eq!(resp["coord"]["observedReason"], "coord work-status: HTTP 401");
+    assert_eq!(
+        resp["coord"]["observedReason"],
+        "coord work-status: HTTP 401"
+    );
     assert_eq!(resp["session"]["finishSynced"], true, "the stored value");
     assert_eq!(resp["coord"]["heal"]["outcome"], "coord_unreadable");
     assert!(p.sent.lock().unwrap().is_empty());
@@ -580,5 +664,8 @@ fn a_read_back_over_another_rows_finish_does_not_read_synced() {
     decorate_read_back(&mut resp, &rb, store.get("rb-other").as_ref());
     assert_eq!(resp["session"]["finishSynced"], false);
     assert_eq!(resp["coord"]["heal"]["outcome"], "different_row");
-    assert!(store.get("rb-other").unwrap().finish_synced, "the stamp itself is untouched");
+    assert!(
+        store.get("rb-other").unwrap().finish_synced,
+        "the stamp itself is untouched"
+    );
 }

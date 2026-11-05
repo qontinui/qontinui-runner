@@ -443,11 +443,12 @@ pub fn decorate_read_back(
                 .map(SessionWorkStatus::parse)
                 .is_some_and(|s| s == SessionWorkStatus::Finished);
             let own = match rb.own_row {
-                Some(own) => row
-                    .coord_session_id
-                    .as_deref()
-                    .and_then(|s| Uuid::parse_str(s.trim()).ok())
-                    == Some(own),
+                Some(own) => {
+                    row.coord_session_id
+                        .as_deref()
+                        .and_then(|s| Uuid::parse_str(s.trim()).ok())
+                        == Some(own)
+                }
                 None => true,
             };
             stored_synced && finished && own

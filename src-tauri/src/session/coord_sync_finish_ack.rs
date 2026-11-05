@@ -125,9 +125,7 @@ pub(crate) fn finished_ack_verdict(status: u16, body: &str) -> FinishedAck {
         Some(JsonValue::Null) | None => FinishedAck::Unconfirmed(
             "coord's answer carries no session_status — UNKNOWN, never finished".to_string(),
         ),
-        Some(other) => {
-            FinishedAck::Unconfirmed(format!("session_status is {other}, not a string"))
-        }
+        Some(other) => FinishedAck::Unconfirmed(format!("session_status is {other}, not a string")),
     }
 }
 
@@ -158,7 +156,10 @@ mod tests {
     #[test]
     fn a_2xx_whose_row_reads_finished_is_observed() {
         assert_eq!(
-            finished_ack_verdict(200, r#"{"id":"01a1ab84-1c55-7000-8000-000000000001","session_status":"finished"}"#),
+            finished_ack_verdict(
+                200,
+                r#"{"id":"01a1ab84-1c55-7000-8000-000000000001","session_status":"finished"}"#
+            ),
             FinishedAck::Observed
         );
         // Phase 3's coord adds the outcome; `updated: true` keeps it observed.
@@ -235,7 +236,9 @@ mod tests {
         let m = unconfirmed_message(200, "coord's row reads session_status \"working\"");
         assert!(m.starts_with("200: finished_unconfirmed"), "{m}");
         assert!(is_unconfirmed_message(&m));
-        assert!(!is_unconfirmed_message("503 Service Unavailable: {\"error\":\"progress_write_not_applied\"}"));
+        assert!(!is_unconfirmed_message(
+            "503 Service Unavailable: {\"error\":\"progress_write_not_applied\"}"
+        ));
         assert!(!is_unconfirmed_message("[timeout] finished_unconfirmed"));
     }
 }
