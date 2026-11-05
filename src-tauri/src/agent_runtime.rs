@@ -3437,7 +3437,21 @@ enum ContinuationGuard {
 ///
 /// Order matters:
 ///
-/// 1. **Dedup first.** A duplicate of an already-running anchor is reported as a
+/// 1. **The claim holder first** (plan
+///    `2026-10-27-the-claim-heartbeat-cap-clears-the-nets-of-a-live-session` D4).
+///    A claim also lapses under a live session (its heartbeat loop was killed, a
+///    provider pause outlived the TTL), and spawning then would start a second
+///    session on work the first is still doing. Live is a POSITIVE signal only;
+///    see [`holder_session_liveness`], whose answer arrives through
+///    `holder_is_live` (read before this guard, as an async probe). Any other answer is UNKNOWN and dispatches,
+///    because a missed resume costs more than a duplicate, which `/implement-plan`
+///    Step 0.45 stops on the owner's IN PROGRESS marker. Ahead of EVERY
+///    other verdict, dedup included: coord keys its hold on the gate's latest
+///    deferred reason, so any other stamp posted while the holder lives would end
+///    the hold and free coord to re-route the net to another device. The
+///    dispatch seam's authorization refusal, the one stamp that precedes this
+///    guard, defers to the holder the same way ([`held_or`]).
+/// 2. **Dedup next.** A duplicate of an already-running anchor is reported as a
 ///    dedup (the honest reason) rather than "loaded" — and it is also the one
 ///    verdict that is true regardless of machine state: spawning it would be
 ///    wrong on an idle box too.
@@ -3452,17 +3466,6 @@ enum ContinuationGuard {
 ///    `CreateToolhelp32Snapshot` per row (plus a `settings.json` stat/parse and
 ///    a `GlobalMemoryStatusEx`), landing at the exact instant the machine is
 ///    starved. Taken lazily, a deduped row pays nothing.
-/// 2. **The claim holder next** (plan
-///    `2026-10-27-the-claim-heartbeat-cap-clears-the-nets-of-a-live-session` D4).
-///    A claim also lapses under a live session (its heartbeat loop was killed, a
-///    provider pause outlived the TTL), and spawning then would start a second
-///    session on work the first is still doing. Live is a POSITIVE signal only;
-///    see [`holder_session_liveness`], whose answer arrives through
-///    `holder_is_live` (read before this guard, as an async probe). Any other answer is UNKNOWN and dispatches,
-///    because a missed resume costs more than a duplicate, which `/implement-plan`
-///    Step 0.45 stops on the owner's IN PROGRESS marker. Ahead of the load lanes
-///    for the reason dedup is: the verdict is true on an idle box too, and a held
-///    row pays for no reading.
 /// 3. **Machine load last** — the heavier of the memory and thread lanes, the
 ///    same composed verdict the PTY seam enforces. The pre-check used to read
 ///    the thread lane only, so a CRITICAL memory reading was first seen AFTER
@@ -3559,6 +3562,20 @@ fn evaluate_continuation_guard(
     // Prune runs `is_live` OUTSIDE the registry lock (see its doc); the P3
     // scan below then runs under a freshly-acquired lock.
     prune_dead_continuations(is_live);
+    // The hold outranks EVERY other verdict, the anchor dedup included. Coord
+    // keys its hold on the gate's latest deferred reason, so any other stamp
+    // posted while the holder lives would end the hold, and coord could then
+    // re-route the net to another device beside the live holder. Decided before
+    // any permit is taken, so a held row reserves no anchor and charges no
+    // spawn, and the later genuine dispatch finds both free.
+    if let Some(holder) = holder {
+        if holder_is_live(holder) {
+            return (
+                ContinuationGuard::HolderSessionLive(holder.session_id.clone()),
+                AnchorReservation::none(),
+            );
+        }
+    }
     // The permit this evaluation takes, if it takes one, RETURNED OUT of the
     // critical section that mints it — never assigned over a placeholder
     // declared above the lock.
@@ -3625,19 +3642,6 @@ fn evaluate_continuation_guard(
             AnchorReservation::none()
         }
     };
-    // Outside the registry lock for the reason prune's `is_live` is: the read
-    // takes the terminal manager's. A hold returns the anchor the way a load
-    // deferral does, by dropping the permit, which holds no `reserved_spawns`
-    // unit yet. The later genuine dispatch of this row must find the anchor free.
-    if let Some(holder) = holder {
-        if holder_is_live(holder) {
-            drop(reservation);
-            return (
-                ContinuationGuard::HolderSessionLive(holder.session_id.clone()),
-                AnchorReservation::none(),
-            );
-        }
-    }
     // The registry lock is RELEASED before the load reading is taken. The
     // reading is a synchronous OS read (and, in the live wrapper, a settings
     // load), and holding a process-global mutex across it would park
@@ -5135,8 +5139,23 @@ async fn dispatch_gate_continuation(
         // row stays pending and re-listable (no consume claim is taken), but
         // without this stamp coord sees a pending row with a null reason — the
         // shape that stranded 51 continuations for two days.
+        //
+        // A live claim holder outranks the refusal: coord keys its hold on the
+        // latest stamp, so a refusal stamp would end the hold (see `held_or`).
         if let Some(gate_id) = payload.gate_id {
-            let reason = authorization_deferral_stamp_reason(&authz);
+            let holder = reportable_gate_id(&payload).and_then(|_| payload.holder_ref());
+            let held = match &holder {
+                Some(h) => holder_session_liveness(
+                    h,
+                    device_id,
+                    live_pinned_pane_roots(),
+                    claude_under_any_pane,
+                )
+                .await
+                .then_some(h.session_id.as_str()),
+                None => None,
+            };
+            let reason = held_or(held, authorization_deferral_stamp_reason(&authz));
             if should_post_deferred_stamp(gate_id, &reason, std::time::Instant::now()) {
                 post_continuation_deferred(gate_id, device_id, reason).await;
             }
@@ -5919,6 +5938,14 @@ fn duplicate_anchor_stamp_reason(holder: &AnchorHolder) -> String {
 /// `<id>` equalling the holder it recorded, so this is a wire contract.
 fn holder_session_live_stamp_reason(holder_session_id: &str) -> String {
     format!("holder_session_live:{holder_session_id}")
+}
+
+/// The stamp for a gate row the runner is not spawning: the hold's
+/// [`holder_session_live_stamp_reason`] while its claim holder lives, else
+/// `reason`. Coord keys its hold on the LATEST stamp, so while the holder lives
+/// no other reason may be posted for that gate.
+fn held_or(live_holder_session_id: Option<&str>, reason: String) -> String {
+    live_holder_session_id.map_or(reason, holder_session_live_stamp_reason)
 }
 
 /// The `reason` a thread-pressure deferral stamps: the severity word and the
@@ -16732,11 +16759,10 @@ mod tests {
         assert!(!holder_session_liveness(&holder_on(device), device, |_| vec![7], hung).await);
     }
 
-    /// The anchor dedup outranks the hold and pays for no holder read: the
-    /// duplicate is true whoever holds the claim, and its stamp is the one that
-    /// names the tab doing the work.
+    /// The hold outranks the anchor dedup too: a `duplicate_anchor` stamp would
+    /// end coord's hold while the holder lives. And it takes no permit.
     #[test]
-    fn duplicate_anchor_outranks_a_live_holder() {
+    fn a_live_holder_outranks_duplicate_anchor() {
         let _env_lock = env_lock();
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
@@ -16744,18 +16770,113 @@ mod tests {
         let holder = holder_on(device);
         let anchor = "claim:ordered";
         register_continuation_session("term-ordered".to_string(), Some(anchor.into()), None);
-
         let live_all = |_id: &str| true;
+
+        let (verdict, permit) = evaluate_continuation_guard(
+            Some(anchor),
+            Some(&holder),
+            &live_all,
+            &|_| true,
+            &calm_reading,
+        );
+        assert_eq!(
+            verdict,
+            ContinuationGuard::HolderSessionLive(HOLDER_SESSION.to_string())
+        );
+        assert!(permit.held.is_none() && !permit.counted);
+        // Once the holder is gone, the dedup applies as before.
         let (verdict, _none) = evaluate_continuation_guard(
             Some(anchor),
             Some(&holder),
             &live_all,
-            &|_| panic!("a deduped row must not read the holder"),
+            &|_| false,
             &calm_reading,
         );
         assert_eq!(
             verdict,
             ContinuationGuard::DuplicateAnchor(AnchorHolder::Live("term-ordered".to_string()))
+        );
+        clear_continuation_registry();
+    }
+
+    /// Holder live AND the load lanes would defer: the hold wins.
+    #[test]
+    fn a_live_holder_outranks_a_load_deferral() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let device = uuid::Uuid::now_v7();
+        let holder = holder_on(device);
+        let live_all = |_id: &str| true;
+        let loaded = || commit_reading(0);
+        assert!(
+            matches!(
+                guard_anchor_only(None, &live_all, &loaded).0,
+                ContinuationGuard::LoadPressure { .. }
+            ),
+            "precondition: this reading defers a row with no holder"
+        );
+        let (verdict, _none) =
+            evaluate_continuation_guard(None, Some(&holder), &live_all, &|_| true, &loaded);
+        assert_eq!(
+            verdict,
+            ContinuationGuard::HolderSessionLive(HOLDER_SESSION.to_string())
+        );
+        clear_continuation_registry();
+    }
+
+    /// While the holder lives, nothing but the hold's own stamp is ever posted
+    /// for the gate: every poll under load and a live dedup still yields the
+    /// hold, the seam's refusal yields it too, and so the reason-change bypass
+    /// has no other reason to let through.
+    #[test]
+    fn no_other_reason_displaces_a_live_holders_stamp() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let device = uuid::Uuid::now_v7();
+        let holder = holder_on(device);
+        let anchor = "claim:displace";
+        register_continuation_session("term-displace".to_string(), Some(anchor.into()), None);
+        let live_all = |_id: &str| true;
+        let loaded = || commit_reading(0);
+        let hold = holder_session_live_stamp_reason(HOLDER_SESSION);
+
+        let gate = uuid::Uuid::now_v7();
+        let t0 = std::time::Instant::now();
+        let mut posted = Vec::new();
+        for tick in 0..30u64 {
+            let (verdict, _permit) = evaluate_continuation_guard(
+                Some(anchor),
+                Some(&holder),
+                &live_all,
+                &|_| true,
+                &loaded,
+            );
+            let reason = match verdict {
+                ContinuationGuard::HolderSessionLive(id) => holder_session_live_stamp_reason(&id),
+                ContinuationGuard::DuplicateAnchor(h) => duplicate_anchor_stamp_reason(&h),
+                ContinuationGuard::LoadPressure {
+                    severity,
+                    observation,
+                } => load_pressure_stamp_reason(severity, &observation),
+                ContinuationGuard::Proceed => panic!("a held row must not proceed"),
+            };
+            // Every third tick the seam's authorization refusal fires instead.
+            let reason = if tick % 3 == 0 {
+                held_or(Some(HOLDER_SESSION), "spawn_authorization_deny".to_string())
+            } else {
+                reason
+            };
+            if should_post_deferred_stamp(gate, &reason, t0 + Duration::from_secs(tick * 300)) {
+                posted.push(reason);
+            }
+        }
+        assert!(!posted.is_empty());
+        assert!(posted.iter().all(|r| *r == hold), "{posted:?}");
+        assert_eq!(
+            held_or(None, "spawn_authorization_deny".to_string()),
+            "spawn_authorization_deny"
         );
         clear_continuation_registry();
     }
