@@ -253,6 +253,12 @@ impl Holder {
             }
         };
         let spec = crate::spec::consume_spec(pane_dir, pane_id).map_err(StartError::Spec)?;
+        // Resolved ONCE, before the child exists: an unusable socket root is a
+        // refusal with nothing to kill, and the stale-socket unlink and the
+        // bind below cannot land in different roots if the preferred root
+        // changes in between (`crate::pane::socket_root`).
+        #[cfg(unix)]
+        let sock = crate::pane::socket_path(pane_dir, pane_id).map_err(StartError::Io)?;
         let pane = Pane::spawn(&spec).map_err(StartError::Child)?;
         let scrollback = Arc::new(Mutex::new(crate::scrollback::ScrollbackWriter::new(
             pane_dir,
@@ -287,14 +293,17 @@ impl Holder {
             lock.write_record(&record)?;
             #[cfg(unix)]
             {
-                let sock = crate::pane::socket_path(pane_dir, pane_id)?;
                 match std::fs::remove_file(&sock) {
                     Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e),
                 }
+                Listener::bind(&sock)
             }
-            transport::bind(pane_dir, pane_id)
+            #[cfg(windows)]
+            {
+                transport::bind(pane_dir, pane_id)
+            }
         })();
         let listener = match bound {
             Ok(l) => l,

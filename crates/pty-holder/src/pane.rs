@@ -223,6 +223,12 @@ const TMP: &str = "/tmp";
 /// by the supervisor, by systemd, or by hand) may carry a different
 /// environment, so an env-derived root would let spawn and adoption disagree.
 ///
+/// logind removes `/run/user/<uid>` at the user's last logout (without
+/// linger). A holder in a `systemd-run --user --scope` dies with the user
+/// manager then anyway; one on the unprotected spawn route that survives
+/// (`KillUserProcesses=no`) loses its socket and reads UNKNOWN (lock held, no
+/// answer) — a known limit of the plan's root choice.
+///
 /// A socket here outlives its pane only until the pane's dir is swept (the
 /// sweep removes it with the pane's lock). One whose pane dir is deleted
 /// unswept — a removed temp-runner instance — stays until the root is cleared:
