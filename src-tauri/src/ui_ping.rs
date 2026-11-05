@@ -61,12 +61,14 @@ static PING_THREAD_TICK_MS: AtomicU64 = AtomicU64::new(0);
 /// re-entered, or a test) never starts a second thread.
 static STARTED: OnceLock<()> = OnceLock::new();
 
-/// Set only by the debug-build stop hook below; in production nothing sets it
+/// Set only by the debug-hooks stop hook below; in production nothing sets it
 /// and the ping thread lives for the process.
 static STOP: AtomicBool = AtomicBool::new(false);
 
-/// Debug-build verification hook, read once at spawn. Compiled only under
-/// `debug_assertions`; a release build has no such switch.
+/// Verification hook, read once at spawn. Compiled into builds with the
+/// `debug-hooks` cargo feature only (temp/test runners); the release-checked
+/// primary keeps `debug_assertions` on, so `debug_assertions` is not a safe
+/// gate. Every other build has no such switch.
 ///
 /// * `QONTINUI_DEBUG_STOP_UI_PING=<N>` (a positive integer): the thread runs
 ///   normally for N seconds, then STOPS. Pongs have already landed by then, so
@@ -83,6 +85,7 @@ pub const DEBUG_STOP_ENV: &str = "QONTINUI_DEBUG_STOP_UI_PING";
 
 /// What the debug stop hook asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "debug-hooks"), allow(dead_code))]
 enum DebugStop {
     /// No hook: run for the life of the process.
     Off,
@@ -93,6 +96,7 @@ enum DebugStop {
 }
 
 /// Parse the hook's value. Pure, so every arm is testable in any build.
+#[cfg_attr(not(feature = "debug-hooks"), allow(dead_code))]
 fn parse_debug_stop(value: Option<&str>) -> DebugStop {
     match value.map(str::trim) {
         None | Some("") => DebugStop::Off,
@@ -103,12 +107,12 @@ fn parse_debug_stop(value: Option<&str>) -> DebugStop {
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(feature = "debug-hooks")]
 fn debug_stop() -> DebugStop {
     parse_debug_stop(std::env::var(DEBUG_STOP_ENV).ok().as_deref())
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(not(feature = "debug-hooks"))]
 fn debug_stop() -> DebugStop {
     DebugStop::Off
 }
@@ -125,7 +129,7 @@ pub enum PingStart {
     Started,
     /// A previous call already started (or tried to start) it.
     AlreadyStarted,
-    /// The debug-build stop hook asked for no thread at all.
+    /// The debug-hooks stop hook asked for no thread at all.
     SuppressedByDebugHook,
 }
 
@@ -147,7 +151,7 @@ pub fn start_ui_ping_thread<R: tauri::Runtime>(
         DebugStop::NeverStart => {
             tracing::warn!(
                 env = DEBUG_STOP_ENV,
-                "ui_ping: the ui-bridge-ping thread is NOT started (debug-build verification hook)"
+                "ui_ping: the ui-bridge-ping thread is NOT started (debug-hooks verification hook)"
             );
             return Ok(PingStart::SuppressedByDebugHook);
         }
@@ -156,7 +160,7 @@ pub fn start_ui_ping_thread<R: tauri::Runtime>(
                 env = DEBUG_STOP_ENV,
                 stop_after_secs = d.as_secs(),
                 "ui_ping: the ui-bridge-ping thread will STOP after this many seconds \
-                 (debug-build verification hook)"
+                 (debug-hooks verification hook)"
             );
             Some(std::time::Instant::now() + d)
         }
@@ -458,28 +462,18 @@ mod tests {
         }
     }
 
-    /// The debug hook must not ship: the env read exists only in the
-    /// `debug_assertions` arm, and the release arm is the constant `Off`.
+    /// The debug hook must not ship: without the `debug-hooks` feature the
+    /// hook is the constant `Off`, whatever the environment holds.
+    /// (`debug_assertions` is not the gate — the release-checked primary
+    /// keeps it on.)
+    #[cfg(not(feature = "debug-hooks"))]
     #[test]
-    fn the_stop_hook_is_compiled_only_into_debug_builds() {
-        let src = include_str!("ui_ping.rs").replace("\r\n", "\n");
-        let prod = src.split("\n#[cfg(test)]\nmod tests").next().unwrap();
-        let debug_arm = prod
-            .split("#[cfg(debug_assertions)]\nfn debug_stop() -> DebugStop {")
-            .nth(1)
-            .expect("a debug_assertions-gated debug_stop");
-        assert!(debug_arm
-            .trim_start()
-            .starts_with("parse_debug_stop(std::env::var(DEBUG_STOP_ENV)"));
-        let release_arm = prod
-            .split("#[cfg(not(debug_assertions))]\nfn debug_stop() -> DebugStop {")
-            .nth(1)
-            .expect("a release arm");
-        assert!(
-            release_arm.trim_start().starts_with("DebugStop::Off"),
-            "the release arm must be the constant Off, not an env read"
+    fn the_stop_hook_is_inert_without_the_debug_hooks_feature() {
+        assert_eq!(
+            debug_stop(),
+            DebugStop::Off,
+            "the hook must read nothing outside a debug-hooks build"
         );
-        assert_eq!(prod.matches("std::env::var(DEBUG_STOP_ENV)").count(), 1);
     }
 
     /// Production wiring, the other half: `main.rs` setup STARTS the thread,

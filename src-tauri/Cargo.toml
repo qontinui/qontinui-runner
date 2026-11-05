@@ -344,6 +344,12 @@ custom-protocol = ["tauri/custom-protocol"]
 # `cfg(debug_assertions)`; this feature is the explicit opt-in for
 # release-mode regression / smoke harnesses.
 test-fixtures = []
+# Verification hooks that deliberately break the runner for an arming check
+# (`QONTINUI_DEBUG_STOP_UI_PING`, `QONTINUI_DEBUG_BLOCK_APP_WORKERS_SECS`).
+# Temp/test runners only, never `default`: the fleet primary is built
+# `release-checked`, which keeps `debug_assertions` ON, so `debug_assertions`
+# is not a safe gate for a hook that must not ship in the primary.
+debug-hooks = []
 # Stream E (Flywheel) — coverage-growth loop. Gates `spec_authoring`,
 # the proposals endpoints, and the supervisor cron. Off by default for
 # spec-check v1.0 ship; the user-facing `--enable-spec-authoring` alias
