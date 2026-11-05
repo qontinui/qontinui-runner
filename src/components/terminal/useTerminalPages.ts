@@ -4,6 +4,15 @@ import { listen } from "@tauri-apps/api/event";
 import { COORD_DRAIN_STATE_EVENT } from "@/hooks/useCoordDrainState";
 import { instanceStorage } from "@/lib/instance-storage";
 import { getPageBindings, subscribePageBindings } from "@/lib/pageBindings";
+import { DEFAULT_PAGE_NAME, nextAutoPageName, renameRefusal, uniquePageName } from "./pageNaming";
+
+/**
+ * Who made a page. `"auto"`: the runner synthesized it (a reconcile tab for a
+ * backend page id, the no-visible-page fallback). `"operator"`: the operator
+ * asked for it ("+", the reorganize, a project activation, an explicit
+ * `openPage`). Absent on pages persisted before the field existed.
+ */
+export type TerminalPageOrigin = "auto" | "operator";
 
 export interface TerminalPageConfig {
   id: string;
@@ -28,6 +37,8 @@ export interface TerminalPageConfig {
    * before).
    */
   defaultWorkingDir?: string;
+  /** See {@link TerminalPageOrigin}. Optional: legacy pages load without it. */
+  origin?: TerminalPageOrigin;
 }
 
 /**
@@ -100,9 +111,11 @@ function savePages(pages: TerminalPageConfig[]) {
  * then render nowhere. Synthesizing it here (named "Terminal", its canonical
  * name) is what keeps such a terminal reachable instead of orphaned.
  * Operator-created pages and their names are left intact (only ADD missing ids;
- * never rename/remove existing). Synthesized names are sequential ("Page N")
- * based on the count of existing non-default pages, so they're deterministic
- * and survive a reload once persisted.
+ * never rename/remove existing). Synthesized names come from
+ * `nextAutoPageName` over the persisted roster plus the names already
+ * synthesized in the same pass — never from a COUNT, which collided with
+ * existing "Page N" tabs (finding `8c9e1419`). Synthesized pages carry
+ * `origin: "auto"`.
  *
  * Returns the SAME array reference when nothing was added, so callers can skip
  * a redundant state update / persist (keeps the effect idempotent under React
@@ -289,8 +302,11 @@ export function resolveProjectPage(
   const id = bound ?? mintId();
   const page: TerminalPageConfig = {
     id,
-    name: cleanOptional(projectName) ?? "Project",
+    // A project called "tmux" or "Terminal" must not take a name already on
+    // the strip (or the default page's reserved one).
+    name: uniquePageName(cleanOptional(projectName) ?? "Project", pages),
     createdAt: Date.now(),
+    origin: "operator",
   };
   if (dir) page.defaultWorkingDir = dir;
   return { pageId: id, pages: [...pages, page], created: true };
@@ -390,16 +406,19 @@ export function reconcilePages(
   }
   if (missing.length === 0) return persisted;
 
-  let nextN = persisted.filter((p) => p.id !== "default").length + 1;
   const now = Date.now();
-  const synthesized = missing.map((id) => ({
-    id,
+  const roster: TerminalPageConfig[] = [...persisted];
+  for (const id of missing) {
     // "default" keeps its canonical name (matches `loadPages`); any other
-    // minted id gets a sequential "Page N".
-    name: id === "default" ? "Terminal" : `Page ${nextN++}`,
-    createdAt: now,
-  }));
-  return [...persisted, ...synthesized];
+    // minted id gets the next free "Page N" over everything named so far.
+    roster.push({
+      id,
+      name: id === "default" ? DEFAULT_PAGE_NAME : nextAutoPageName(roster),
+      createdAt: now,
+      origin: "auto",
+    });
+  }
+  return roster;
 }
 
 /**
@@ -556,12 +575,26 @@ export function useTerminalPages() {
     visiblePagesRef.current = visiblePages;
   }, [visiblePages]);
 
+  /**
+   * Add a page and activate it. The NAME is decided here, against the full
+   * roster (`prev`, which includes pages detached into a pop-out), never by
+   * the caller: no name → `nextAutoPageName`; a name → `uniquePageName`. The
+   * tab bar cannot see detached pages, so a name it computed would collide.
+   * `origin` defaults to `"operator"`; the no-visible-page fallback passes
+   * `"auto"`.
+   */
   const addPage = useCallback(
-    (name: string) => {
+    (name?: string, origin: TerminalPageOrigin = "operator") => {
       const id = crypto.randomUUID();
       closedPageIdsRef.current.delete(id);
-      const newPage: TerminalPageConfig = { id, name, createdAt: Date.now() };
+      const createdAt = Date.now();
       setPages((prev) => {
+        const newPage: TerminalPageConfig = {
+          id,
+          name: name === undefined ? nextAutoPageName(prev) : uniquePageName(name, prev),
+          createdAt,
+          origin,
+        };
         const updated = [...prev, newPage];
         savePages(updated);
         return updated;
@@ -640,12 +673,23 @@ export function useTerminalPages() {
     [removePage],
   );
 
-  const renamePage = useCallback((id: string, name: string) => {
+  /**
+   * Rename page `id`. REFUSED (returns `false`, nothing persisted) when another
+   * page — docked or detached — already carries the name, or when a non-default
+   * page asks for the reserved "Terminal" (see `renameRefusal`). The tab bar
+   * shows the refusal inline.
+   */
+  const renamePage = useCallback((id: string, name: string): boolean => {
+    if (renameRefusal(allPagesRef.current, id, name) !== null) return false;
     setPages((prev) => {
+      // Re-check against the authoritative roster: the ref can lag a tick.
+      if (renameRefusal(prev, id, name) !== null) return prev;
       const updated = prev.map((p) => (p.id === id ? { ...p, name } : p));
       savePages(updated);
+      allPagesRef.current = updated;
       return updated;
     });
+    return true;
   }, []);
 
   /**
@@ -741,7 +785,13 @@ export function useTerminalPages() {
       closedPageIdsRef.current.delete(id);
       setPages((prev) => {
         if (prev.some((p) => p.id === id)) return prev; // already present — just activate below
-        const updated = [...prev, { id, name, createdAt: Date.now() }];
+        const page: TerminalPageConfig = {
+          id,
+          name: uniquePageName(name, prev),
+          createdAt: Date.now(),
+          origin: "operator",
+        };
+        const updated = [...prev, page];
         savePages(updated);
         return updated;
       });
@@ -867,8 +917,10 @@ export function useTerminalPages() {
       // page left, so mint one. Rare, idempotent (a fresh page is never bound),
       // and converges in one extra render — same exception the reconcile effect
       // above relies on.
+      // Named by the shared rule (never a second "Terminal" — that name is
+      // the default page's), and `auto`: the runner made it, not the operator.
       // eslint-disable-next-line react-hooks/set-state-in-effect
-      addPage("Terminal");
+      addPage(undefined, "auto");
       return;
     }
     if (!visibleIds.includes(activePageId)) {

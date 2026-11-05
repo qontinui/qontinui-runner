@@ -91,8 +91,9 @@ describe("reconcilePages", () => {
     expect(out.slice(0, 3)).toEqual(persisted);
     expect(out.filter((p) => p.id === "default")).toHaveLength(1);
     const synth = out.find((p) => p.id === "minted-x")!;
-    // N = count of existing non-default pages (2) + 1 = 3.
-    expect(synth.name).toBe("Page 3");
+    // No existing "Page N" → the next auto name is "Page 1" (never a count).
+    expect(synth.name).toBe("Page 1");
+    expect(synth.origin).toBe("auto");
   });
 
   it("returns the SAME array reference when every backend id is already persisted", () => {

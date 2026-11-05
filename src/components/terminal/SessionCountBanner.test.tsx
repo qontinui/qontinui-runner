@@ -97,11 +97,16 @@ describe("the banner labels its population", () => {
    * numbers both labelled "sessions" stacked on one page was the defect; the
    * banner's copy must name panes.
    */
-  it('reads "N panes open", never "sessions open"', () => {
+  it('reads "N panes on this page", never "sessions open"', () => {
+    // The count is the ACTIVE page's panes (`TerminalPage` feeds it
+    // `tabs.length`); "N panes open" read like a runner-wide total (finding
+    // `8c9e1419`: "75 panes open" on one page of 22).
     const html = renderToStaticMarkup(
       <bannerModule.SessionCountBanner openPaneCount={4} threshold={4} />,
     );
-    expect(html).toContain("4 panes open");
+    expect(html).toContain("4 panes on this page");
+    expect(html).toContain("render cost grows with the panes on one page");
+    expect(html).not.toContain("panes open");
     expect(html).not.toContain("sessions open");
     expect(html).toContain('data-open-pane-count="4"');
   });

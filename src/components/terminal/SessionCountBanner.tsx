@@ -110,9 +110,9 @@ export function SessionCountBanner({
         <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-[#e0af68] mt-0.5" />
         <div className="text-[11px] text-[#c0caf5] leading-snug flex-1">
           <div>
-            <span className="font-semibold">{openPaneCount} panes open</span> (advisory threshold{" "}
-            {threshold}). Nothing is blocked — this is a heads-up that memory and render cost grow
-            with open panes.
+            <span className="font-semibold">{openPaneCount} panes on this page</span> (advisory
+            threshold {threshold}). Nothing is blocked — this is a heads-up that render cost grows
+            with the panes on one page.
           </div>
           <div className="mt-1 text-[10px] text-[#c0caf5]/70">
             Raise or lower the threshold in Settings → Advanced → Performance &amp; Caps.
