@@ -25,6 +25,59 @@ use super::{
 };
 
 // =============================================================================
+// Agentic resume decision
+// =============================================================================
+
+/// Whether an interrupted agentic iteration resumes its CLI session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AgenticResumeDecision {
+    /// `--resume` under this account — always `AccountChoice::Pinned` to the
+    /// config dir that holds the transcript.
+    Resume(crate::ai_provider::AccountChoice),
+    /// Do not attempt `--resume`: start a fresh session on the workflow's own
+    /// pick. `reason` is what the phase logs.
+    Fresh { reason: String },
+}
+
+/// Decide how an interrupted agentic iteration continues.
+///
+/// The transcript's location is ground truth for which account can resume
+/// it: the first of `search_dirs` holding
+/// `session_transcript_path(dir, cwd, cli_session_id)` is pinned, provided
+/// `has_valid_credentials` passes for it. No dir holding it, or a dir whose
+/// account fails the check, means a `--resume` cannot succeed, so the
+/// iteration starts fresh instead of spending a doomed call.
+pub(crate) fn decide_agentic_resume(
+    search_dirs: &[std::path::PathBuf],
+    cwd: &str,
+    cli_session_id: &str,
+    has_valid_credentials: impl Fn(&str) -> bool,
+) -> AgenticResumeDecision {
+    let Some(dir) = crate::terminal::transcript::config_dir_holding_transcript(
+        search_dirs,
+        cwd,
+        cli_session_id,
+    ) else {
+        return AgenticResumeDecision::Fresh {
+            reason: format!(
+                "no transcript for it under any of {} config dir(s) for cwd {}",
+                search_dirs.len(),
+                cwd
+            ),
+        };
+    };
+    let dir = dir.to_string_lossy().to_string();
+    if !has_valid_credentials(&dir) {
+        return AgenticResumeDecision::Fresh {
+            reason: format!(
+                "its transcript is under {dir}, whose account has no valid credentials"
+            ),
+        };
+    }
+    AgenticResumeDecision::Resume(crate::ai_provider::AccountChoice::Pinned(dir))
+}
+
+// =============================================================================
 // Agentic Phase Executor
 // =============================================================================
 
@@ -1139,11 +1192,38 @@ impl AgenticExecutor {
             .await
         {
             Ok(Some((prev_cli_id, prev_status))) if prev_status == "interrupted" => {
-                info!(
-                    "AGENTIC-PHASE: Found interrupted CLI session {} for iteration {} — will resume",
-                    prev_cli_id, iteration
+                // A `--resume` finds its conversation only under the account
+                // that wrote it, and the inline child pins CLAUDE_CONFIG_DIR to
+                // the session's account — so resume under the transcript's
+                // account, not the workflow's pick.
+                let search_dirs = crate::terminal::transcript::transcript_search_dirs(
+                    self.ai_executor
+                        .account
+                        .as_ref()
+                        .map(crate::ai_provider::AccountChoice::dir),
                 );
-                (prev_cli_id, true)
+                let cwd = crate::unified_ai_session::workspace_root_for_claude();
+                match decide_agentic_resume(&search_dirs, &cwd, &prev_cli_id, |dir| {
+                    crate::ai_provider::oauth_refresh::has_valid_credentials(dir)
+                }) {
+                    AgenticResumeDecision::Resume(account) => {
+                        info!(
+                            "AGENTIC-PHASE: Found interrupted CLI session {} for iteration {} — will resume under the account holding its transcript ({})",
+                            prev_cli_id,
+                            iteration,
+                            account.dir()
+                        );
+                        ai_config.account = Some(account);
+                        (prev_cli_id, true)
+                    }
+                    AgenticResumeDecision::Fresh { reason } => {
+                        warn!(
+                            "AGENTIC-PHASE: Interrupted CLI session {} for iteration {} is not resumable ({}) — starting a fresh session on the workflow's own account pick",
+                            prev_cli_id, iteration, reason
+                        );
+                        (uuid::Uuid::new_v4().to_string(), false)
+                    }
+                }
             }
             Err(e) => {
                 warn!(
@@ -1245,6 +1325,11 @@ impl AgenticExecutor {
                 result.error,
                 result.output.len()
             );
+            // The pin to the transcript's account existed only so `--resume`
+            // could find its conversation. A fresh session has no transcript
+            // to follow, and the failure may have been that account's own
+            // (auth, rate limit), so it goes back to the workflow's own pick.
+            ai_config.account = None;
             // Create a fresh CLI session
             let fresh_cli_id = uuid::Uuid::new_v4().to_string();
             ai_config.cli_session_ctx = Some(crate::claude_session::runner::CliSessionContext {
@@ -1728,5 +1813,77 @@ impl AgenticExecutor {
     fn get_progress_marker_context(&self, _execution_id: &str, _iteration: u32) -> Option<String> {
         // Progress marker context removed — all persistence now via PgDb.
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai_provider::config::test_support::dir_with_live_credentials;
+    use crate::ai_provider::AccountChoice;
+    use std::path::{Path, PathBuf};
+
+    const CWD: &str = "/work/proj";
+    const SESSION: &str = "0a1b2c3d-1111-2222-3333-444455556666";
+
+    fn write_transcript(config_dir: &str) {
+        let path = crate::terminal::transcript::session_transcript_path(
+            Path::new(config_dir),
+            CWD,
+            SESSION,
+        );
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "{}\n").unwrap();
+    }
+
+    fn live(dir: &str) -> bool {
+        crate::ai_provider::oauth_refresh::has_valid_credentials(dir)
+    }
+
+    /// (a) The resume runs under the account whose dir holds the transcript,
+    /// even when the workflow's own pick — searched first — is a different
+    /// account with live credentials.
+    #[test]
+    fn resume_is_pinned_to_the_transcripts_account_not_the_workflows_pick() {
+        let (_pick_guard, workflow_pick) = dir_with_live_credentials();
+        let (_owner_guard, transcript_owner) = dir_with_live_credentials();
+        write_transcript(&transcript_owner);
+        let search_dirs = vec![
+            PathBuf::from(&workflow_pick),
+            PathBuf::from(&transcript_owner),
+        ];
+        assert_eq!(
+            decide_agentic_resume(&search_dirs, CWD, SESSION, live),
+            AgenticResumeDecision::Resume(AccountChoice::Pinned(transcript_owner))
+        );
+    }
+
+    /// (b) No dir holds the transcript → a fresh session, never a `--resume`.
+    #[test]
+    fn no_transcript_anywhere_starts_fresh() {
+        let (_a_guard, a) = dir_with_live_credentials();
+        let (_b_guard, b) = dir_with_live_credentials();
+        let search_dirs = vec![PathBuf::from(&a), PathBuf::from(&b)];
+        assert!(matches!(
+            decide_agentic_resume(&search_dirs, CWD, SESSION, live),
+            AgenticResumeDecision::Fresh { .. }
+        ));
+    }
+
+    /// (c) The transcript's account fails the credential check → a fresh
+    /// session; the resume is not attempted under a dead account.
+    #[test]
+    fn transcript_account_without_credentials_starts_fresh() {
+        let owner = tempfile::tempdir().unwrap();
+        let owner_dir = owner.path().to_string_lossy().to_string();
+        write_transcript(&owner_dir);
+        let search_dirs = vec![PathBuf::from(&owner_dir)];
+        match decide_agentic_resume(&search_dirs, CWD, SESSION, live) {
+            AgenticResumeDecision::Fresh { reason } => assert!(
+                reason.contains("no valid credentials"),
+                "reason names the credential failure: {reason}"
+            ),
+            other => panic!("expected a fresh session, got {other:?}"),
+        }
     }
 }

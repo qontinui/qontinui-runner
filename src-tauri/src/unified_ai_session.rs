@@ -101,6 +101,11 @@ pub struct AiSessionConfig {
     /// checked post-hoc as defense-in-depth. `None` ⇒ byte-for-byte identical
     /// to today's spawn (back-compat).
     pub tool_policy: Option<crate::workflow::dag_schema::ToolPolicy>,
+    /// This one session's account, overriding the executor's (the workflow's
+    /// pick) when `Some`. The agentic resume arm sets it to
+    /// `AccountChoice::Pinned(<dir holding the transcript>)`, because a
+    /// `--resume` finds its conversation only under the account that wrote it.
+    pub account: Option<crate::ai_provider::AccountChoice>,
 }
 
 impl AiSessionConfig {
@@ -129,6 +134,7 @@ impl AiSessionConfig {
             cli_session_ctx: None,
             db_flush_ctx: None,
             tool_policy: None,
+            account: None,
         }
     }
 
@@ -157,6 +163,7 @@ impl AiSessionConfig {
             cli_session_ctx: None,
             db_flush_ctx: None,
             tool_policy: None,
+            account: None,
         }
     }
 
@@ -186,6 +193,7 @@ impl AiSessionConfig {
             cli_session_ctx: None,
             db_flush_ctx: None,
             tool_policy: None,
+            account: None,
         }
     }
 
@@ -553,6 +561,15 @@ fn strip_completion_marker_instructions(prompt: &str) -> String {
 // Unified AI Session Executor
 // =============================================================================
 
+/// The cwd every workflow AI session's `claude` child runs in — and therefore
+/// the project path its transcript is stored under
+/// (`terminal::transcript::session_transcript_path`).
+pub(crate) fn workspace_root_for_claude() -> String {
+    crate::mcp::shared::get_workspace_paths_internal()
+        .map(|(root, _, _)| root.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string())
+}
+
 /// Unified executor for AI sessions across all workflow phases.
 ///
 /// This consolidates the duplicated AI session handling logic from SetupExecutor,
@@ -675,10 +692,7 @@ impl UnifiedAiSessionExecutor {
             };
         }
 
-        // Get workspace root
-        let workspace_root = crate::mcp::shared::get_workspace_paths_internal()
-            .map(|(root, _, _)| root.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string());
+        let workspace_root = workspace_root_for_claude();
 
         // Clone necessary values for the blocking task
         let pid_tracker = self.pid_tracker.clone();
@@ -1217,8 +1231,10 @@ impl UnifiedAiSessionExecutor {
                     .with_turn_count(completion_turn)
             }
         };
-        // The workflow's own account pick (`AccountChoice::Picked`).
-        ctx.account = self.account.clone();
+        // This session's own account when the caller set one (a resume pinned
+        // to its transcript's account), else the workflow's own pick
+        // (`AccountChoice::Picked`).
+        ctx.account = config.account.clone().or_else(|| self.account.clone());
 
         Some(ctx)
     }
