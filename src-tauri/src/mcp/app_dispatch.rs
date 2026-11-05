@@ -204,9 +204,34 @@ impl Dispatched {
 /// true`, so the COMMAND succeeded. But some commands return an outcome object
 /// of their own (an element action's `{success: false, error}`); its
 /// `success` is the answer's, so it is lifted, never overwritten by the
-/// command-level `true`. `data` is always the handler's whole result.
+/// command-level `true`. `data` is the handler's whole result.
+///
+/// Two shapes are not the bare result this assumes:
+/// - a result that is ALREADY an envelope (a boolean `success` beside a
+///   `data` key — wrappers may answer either way) passes through as it is,
+///   so it is never nested a second time;
+/// - a result that is NOTHING BUT an error report — no boolean `success`, a
+///   non-empty string `error`, and no keys beyond `error`, `timestamp`,
+///   `code` and `errorCode` (an in-page read handler's
+///   `{error: "Clipboard access denied", timestamp}`) — is a failed read,
+///   answered `success: false`. A payload that merely CARRIES an `error`
+///   beside its data (a tracked network request whose fetch failed) is a
+///   successful read of that data and is wrapped like any other.
 pub fn ws_result_envelope(result: serde_json::Value) -> serde_json::Value {
-    let inner_success = result.get("success").and_then(serde_json::Value::as_bool);
+    let explicit = result.get("success").and_then(serde_json::Value::as_bool);
+    if explicit.is_some() && result.get("data").is_some() {
+        return result;
+    }
+    const ERROR_REPORT_KEYS: [&str; 4] = ["error", "timestamp", "code", "errorCode"];
+    let bare_error = explicit.is_none()
+        && result.as_object().is_some_and(|obj| {
+            obj.keys().all(|k| ERROR_REPORT_KEYS.contains(&k.as_str()))
+                && obj
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|e| !e.trim().is_empty())
+        });
+    let inner_success = if bare_error { Some(false) } else { explicit };
     // On a failed outcome, the keys a caller branches on travel to the top
     // level, where the HTTP arm carries them: the prose `error` and the
     // machine-readable `code` / `errorCode`.
@@ -1010,9 +1035,64 @@ mod tests {
     /// command-level `true` and lifts nothing.
     #[test]
     fn ws_result_envelope_ignores_a_non_boolean_success() {
-        let out = ws_result_envelope(json!({"success": "no", "error": "x"}));
+        let out = ws_result_envelope(json!({"success": "no", "code": "x"}));
         assert_eq!(out["success"], json!(true));
+        assert!(out.get("code").is_none(), "{out}");
+    }
+
+    /// An in-page read handler that fails answers a bare `{error}` with no
+    /// `success` (ui-bridge `commandHandlers.ts` `getClipboard`,
+    /// `getElementStyles`): that is a failed read, not a successful one.
+    #[test]
+    fn ws_result_envelope_reads_a_bare_error_as_a_failure() {
+        let out = ws_result_envelope(json!({"error": "Clipboard access denied", "timestamp": 1}));
+        assert_eq!(out["success"], json!(false), "{out}");
+        assert_eq!(out["error"], json!("Clipboard access denied"));
+        assert_eq!(out["data"]["timestamp"], json!(1));
+        // A payload that carries an `error` beside real data is a successful
+        // read of that data: in-page `getNetworkRequest` answers a
+        // `TrackedRequest` whose `error` is the tracked fetch's failure.
+        let tracked = json!({
+            "id": "req-1", "url": "/api/x", "method": "GET",
+            "error": "Failed to fetch", "inFlight": false
+        });
+        let out = ws_result_envelope(tracked.clone());
+        assert_eq!(out["success"], json!(true), "{out}");
         assert!(out.get("error").is_none(), "{out}");
+        assert_eq!(out["data"], tracked);
+        // `code` / `errorCode` belong to an error report and are lifted.
+        let out = ws_result_envelope(json!({"error": "denied", "code": "E_PERM", "errorCode": 7}));
+        assert_eq!(out["success"], json!(false), "{out}");
+        assert_eq!(out["code"], json!("E_PERM"));
+        assert_eq!(out["errorCode"], json!(7));
+        // A non-boolean `success` beside an `error` is not an error report.
+        let out = ws_result_envelope(json!({"success": "no", "error": "x"}));
+        assert_eq!(out["success"], json!(true), "{out}");
+        // A whitespace-only `error` is blank.
+        assert_eq!(
+            ws_result_envelope(json!({"error": "  "}))["success"],
+            json!(true)
+        );
+        // A blank or non-string `error` is payload, not a failure.
+        assert_eq!(
+            ws_result_envelope(json!({"error": ""}))["success"],
+            json!(true)
+        );
+        assert_eq!(
+            ws_result_envelope(json!({"error": null}))["success"],
+            json!(true)
+        );
+    }
+
+    /// A wrapper that already answers `{success, data}` is passed through,
+    /// never nested a second time (`ws_collect_components` documents that
+    /// wrappers may answer either way).
+    #[test]
+    fn ws_result_envelope_passes_an_existing_envelope_through() {
+        let env = json!({"success": true, "data": {"elements": [1]}});
+        assert_eq!(ws_result_envelope(env.clone()), env);
+        let failed = json!({"success": false, "error": "no", "data": null});
+        assert_eq!(ws_result_envelope(failed.clone()), failed);
     }
 
     #[test]

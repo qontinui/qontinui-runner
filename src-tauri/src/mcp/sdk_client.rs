@@ -434,8 +434,9 @@ async fn dispatch_app_request_typed_with(
 ///
 /// Wrapper-reached actions (`executeComponentAction`, `setClipboard`,
 /// `executeWithDiff`) stay on the read envelope: under the wrapper protocol a
-/// frame's `success: true` means the handler ran, and their results carry no
-/// `success` key.
+/// frame's `success: true` means the handler ran, so a result of theirs that
+/// carries no `success` key is not a failure. One that does carry a boolean
+/// `success` has it lifted by the read envelope all the same.
 async fn dispatch_app_request_action_typed(
     state: &Arc<ApiState>,
     action: &str,
