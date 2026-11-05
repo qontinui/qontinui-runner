@@ -6,6 +6,16 @@ import type { SessionState } from "./useZoneLayout";
 import type { ResourceGuardSource } from "@/lib/resourceGuard";
 import { resumeInNewTab, type ResumeAttempt, type ResumeTarget } from "./resumeInNewTab";
 
+/**
+ * The prompt-state half of a pane's OSC 633 shell integration: which of the two
+ * marks it emitted LAST — `prompt_start` (633;A, the shell drew its prompt) or
+ * `command_execute` (633;C, the shell started running what was typed). Every
+ * default pane's shell (bash, zsh, PowerShell) emits both; a pane that emitted
+ * neither (a direct exec such as `bash ./job.sh`, `cmd`, a pane whose output
+ * this window never rendered) has no reading at all.
+ */
+export type ShellPromptMark = "prompt_start" | "command_execute";
+
 export interface CommandHistoryEntry {
   command: string;
   exitCode: number;
@@ -64,6 +74,12 @@ interface UseShellIntegrationResult {
   /** THE resume path — see `resumeInNewTab`. */
   resumeTarget: (target: ResumeTarget, spawnSource?: ResourceGuardSource) => Promise<ResumeAttempt>;
   handleFirstInput: (tabId: string, input: string) => void;
+  /**
+   * The last prompt-state mark `tabId`'s shell emitted (see
+   * {@link ShellPromptMark}); `undefined` when it has emitted none. Read at
+   * call time — it is a ref, not state, so a prompt redraw re-renders nothing.
+   */
+  lastPromptMark: (tabId: string) => ShellPromptMark | undefined;
 }
 
 export function useShellIntegration({
@@ -83,9 +99,17 @@ export function useShellIntegration({
     {},
   );
   const pendingCommandRef = useRef<Record<string, string>>({});
+  const lastPromptMarkRef = useRef<Record<string, ShellPromptMark>>({});
+  const lastPromptMark = useCallback(
+    (tabId: string): ShellPromptMark | undefined => lastPromptMarkRef.current[tabId],
+    [],
+  );
 
   const handleShellIntegration = useCallback(
     (tabId: string, event: ShellIntegrationEvent) => {
+      if (event.type === "prompt_start" || event.type === "command_execute") {
+        lastPromptMarkRef.current[tabId] = event.type;
+      }
       if (event.type === "prompt_start") {
         // Shell prompt appeared. A `prompt_start` only means "a shell prompt
         // is being drawn" — NOT that a Claude session is awaiting the user.
@@ -194,5 +218,6 @@ export function useShellIntegration({
     handleResumeSession,
     resumeTarget,
     handleFirstInput,
+    lastPromptMark,
   };
 }

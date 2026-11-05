@@ -12,16 +12,27 @@
  *
  * So this hook writes NOTHING on its own. It only reports which terminals sit
  * outside the project root and exposes `moveThem()` — the explicit,
- * operator-confirmed action. "Move them" REPLACES only a pane the process
- * table positively reads as a bare idle shell (its root process is a shell
- * with nothing at all running under it): it opens a replacement at the root
- * and closes the original **only after its replacement exists** and a second
- * read still finds the original bare. Every other pane — one running `claude`,
- * an npm-installed claude (`node … cli.js`, which the claude image test cannot
- * see), any other process, a remote pane, one whose table cannot be read — is
- * kept where it is and named in the chip with the reason. If a replacement
- * fails to spawn, the original is left running: losing a shell is strictly
- * worse than showing the chip again.
+ * operator-confirmed action. "Move them" REPLACES a pane only when two
+ * independent readings agree it is a shell sitting at its prompt:
+ *
+ *   1. the PROCESS TABLE (`terminal_probe_claude`): the pane's root process is
+ *      a shell and nothing at all runs under it. Necessary, not sufficient —
+ *      PowerShell runs cmdlets and scripts in-process (`Get-Content -Wait`, a
+ *      `.ps1` loop, `Enter-PSSession`), so a busy pwsh can have no descendant;
+ *   2. the SHELL'S OWN PROMPT STATE (OSC 633): the last mark the pane's shell
+ *      emitted is a prompt (633;A), not a command start (633;C). A pane that
+ *      never emitted either — a direct exec such as `bash ./job.sh`, `cmd`, a
+ *      pane this window never rendered — has no such reading and is kept.
+ *
+ * Both are read before the replacement is opened and again just before the
+ * original is closed, and the original closes **only after its replacement
+ * exists** and the second pair of readings still agrees. Every other pane —
+ * `claude`, an npm-installed claude (`node … cli.js`, which the claude image
+ * test cannot see), any other process, a command running in the shell, a
+ * remote pane, one whose table or prompt state cannot be read — is kept where
+ * it is and named in the chip with the reason. If a replacement fails to
+ * spawn, the original is left running: losing a shell is strictly worse than
+ * showing the chip again.
  */
 
 import { useCallback, useMemo, useState } from "react";
@@ -29,6 +40,7 @@ import { useCallback, useMemo, useState } from "react";
 import { useTerminalSession } from "./contexts/TerminalSessionContext";
 import { normalizePathForCompare } from "./pathCompare";
 import { probeClaudeInPane, type PaneClaudeProbe } from "./resumeVerification";
+import type { ShellPromptMark } from "./useShellIntegration";
 import type { TerminalTab } from "./useTerminalManager";
 
 /** The subset of a tab this reconciliation reads. */
@@ -79,37 +91,58 @@ export function findTerminalsOutsideProject<T extends ReconcilableTerminal>(
   });
 }
 
-/** Whether a pane may be replaced, and if not, why. */
-export type BareShellReading = { bare: true } | { bare: false; reason: string };
+/**
+ * Whether a pane may be replaced, and if not, why. `busy` is true only when a
+ * reading POSITIVELY saw something running (claude, another program, a
+ * descendant, a command the shell started) — never for a pane that simply
+ * could not be read.
+ */
+export type BareShellReading = { bare: true } | { bare: false; reason: string; busy: boolean };
 
 /**
- * Does one process-table read show this pane is a BARE IDLE SHELL — its root
- * process a shell (never a `claude` of any install) with no descendant at all?
- * Anything short of that positive reading keeps the pane. PURE.
+ * Is this pane a bare idle shell? Both readings must say so (see the module
+ * docs): the process table — its root a shell (never a `claude` of any install)
+ * with no descendant at all — AND the shell's own last prompt-state mark, a
+ * prompt rather than a command start. Anything short of that keeps the pane.
+ * PURE.
  *
- * `state: "absent"` alone is not that reading: it only says no process NAMED
- * `claude` is in the subtree, and an npm-installed Claude Code runs as
+ * `state: "absent"` alone is not the process half: it only says no process
+ * NAMED `claude` is in the subtree, and an npm-installed Claude Code runs as
  * `node … cli.js`. The root's descendant count is what sees it.
  */
 export function readBareIdleShell(
   tab: Pick<ReconcilableTerminal, "remote">,
   probe: PaneClaudeProbe,
+  mark: ShellPromptMark | undefined,
 ): BareShellReading {
   if (tab.remote || probe.state === "remote") {
-    return { bare: false, reason: "a remote pane — its processes cannot be read here" };
+    return {
+      bare: false,
+      reason: "a remote pane — its processes cannot be read here",
+      busy: false,
+    };
   }
   if (probe.state === "unknown" || !probe.root) {
-    return { bare: false, reason: "its processes could not be read" };
+    return { bare: false, reason: "its processes could not be read", busy: false };
   }
-  if (probe.state === "live") return { bare: false, reason: "claude is running in it" };
+  if (probe.state === "live") return { bare: false, reason: "claude is running in it", busy: true };
   const { image, isShell, descendants } = probe.root;
-  if (image === null) return { bare: false, reason: "its process could not be found" };
-  if (!isShell) return { bare: false, reason: `${image} is running in it` };
+  if (image === null) {
+    return { bare: false, reason: "its process could not be found", busy: false };
+  }
+  if (!isShell) return { bare: false, reason: `${image} is running in it`, busy: true };
   if (descendants > 0) {
     return {
       bare: false,
       reason: `${descendants} process${descendants === 1 ? " is" : "es are"} running in it`,
+      busy: true,
     };
+  }
+  if (mark === undefined) {
+    return { bare: false, reason: "its shell reports no prompt state", busy: false };
+  }
+  if (mark === "command_execute") {
+    return { bare: false, reason: "a command is running in its shell", busy: true };
   }
   return { bare: true };
 }
@@ -125,6 +158,8 @@ export interface KeptTerminal {
 export interface ProjectMoveDeps {
   /** `terminal_probe_claude`, read through {@link probeClaudeInPane}. */
   probe: (tabId: string) => Promise<PaneClaudeProbe>;
+  /** The pane's last OSC 633 prompt-state mark (`useShellIntegration().lastPromptMark`). */
+  shellMark: (tabId: string) => ShellPromptMark | undefined;
   createTerminal: (
     title: string,
     workingDir: string,
@@ -144,11 +179,12 @@ export interface ProjectMoveOutcome {
 }
 
 /**
- * "Move them": for each outside pane, in order — read it; keep it unless it is
- * a bare idle shell; open its replacement at `root`; read it AGAIN and close the
- * original only if it is still bare (a command the operator started meanwhile
- * keeps it, and the just-opened replacement is closed instead). Serial, so a
- * resource-guard refusal mid-move names the move and the terminals still ahead.
+ * "Move them": for each outside pane, in order — read it (process table AND
+ * prompt state); keep it unless both say bare idle shell; open its replacement
+ * at `root`; read both AGAIN and close the original only if they still agree
+ * (otherwise the original is kept and the just-opened replacement is closed
+ * instead). Serial, so a resource-guard refusal mid-move names the move and the
+ * terminals still ahead.
  */
 export async function moveTerminalsToProject(
   outside: readonly ReconcilableTerminal[],
@@ -157,7 +193,7 @@ export async function moveTerminalsToProject(
 ): Promise<ProjectMoveOutcome> {
   const outcome: ProjectMoveOutcome = { replaced: [], kept: [], failed: [] };
   for (const [index, tab] of outside.entries()) {
-    const before = readBareIdleShell(tab, await deps.probe(tab.id));
+    const before = readBareIdleShell(tab, await deps.probe(tab.id), deps.shellMark(tab.id));
     if (!before.bare) {
       outcome.kept.push({ id: tab.id, title: tab.title, reason: before.reason });
       continue;
@@ -179,13 +215,15 @@ export async function moveTerminalsToProject(
       });
       continue;
     }
-    const after = readBareIdleShell(tab, await deps.probe(tab.id));
+    const after = readBareIdleShell(tab, await deps.probe(tab.id), deps.shellMark(tab.id));
     if (!after.bare) {
       deps.closeTerminal(replacementId);
       outcome.kept.push({
         id: tab.id,
         title: tab.title,
-        reason: `${after.reason} (it started during the move)`,
+        // Only a POSITIVE second sighting started "during the move"; a second
+        // read that simply failed says nothing about when.
+        reason: after.busy ? `${after.reason} (it started during the move)` : after.reason,
       });
       continue;
     }
@@ -219,9 +257,15 @@ export interface ProjectTerminalReconcile {
    */
   kept: KeptTerminal[];
   /**
-   * "[Move them]" — replace each outside terminal that is a bare idle shell
-   * with one opened at the project root; keep every other one. Never closes
-   * anything whose replacement failed. Idempotent while in flight.
+   * True when the last `moveThem()` kept EVERY pane still outside the root, so
+   * pressing the button again can only re-check them — the chip says
+   * "Check again" rather than promising a move.
+   */
+  allKept: boolean;
+  /**
+   * "[Move them]" — replace each outside terminal that both readings show is a
+   * bare idle shell with one opened at the project root; keep every other one.
+   * Never closes anything whose replacement failed. Idempotent while in flight.
    */
   moveThem: () => Promise<void>;
   /** "[Leave them]" — dismiss for this root (a new root re-arms the chip). */
@@ -235,7 +279,8 @@ export interface ProjectTerminalReconcile {
 export function useProjectTerminalReconcile(
   projectRoot: string | null | undefined,
 ): ProjectTerminalReconcile {
-  const { tabs, createTerminal, closeTerminal } = useTerminalSession();
+  const { tabs, createTerminal, closeTerminal, shellIntegration } = useTerminalSession();
+  const { lastPromptMark } = shellIntegration;
   // Dismissal is keyed by the NORMALIZED root, so switching projects (or
   // correcting a root's spelling) re-arms the chip while re-activating the
   // same project keeps it dismissed.
@@ -268,6 +313,7 @@ export function useProjectTerminalReconcile(
     try {
       outcome = await moveTerminalsToProject(outside, root, {
         probe: (tabId) => probeClaudeInPane(tabId),
+        shellMark: lastPromptMark,
         createTerminal,
         closeTerminal,
       });
@@ -283,7 +329,7 @@ export function useProjectTerminalReconcile(
         } left where ${failed === 1 ? "it is" : "they are"}.`,
       );
     }
-  }, [root, moving, outside, createTerminal, closeTerminal]);
+  }, [root, moving, outside, createTerminal, closeTerminal, lastPromptMark]);
 
   return {
     projectRoot: root,
@@ -294,6 +340,7 @@ export function useProjectTerminalReconcile(
     shouldPrompt: root !== null && outside.length > 0 && !dismissed,
     error,
     kept,
+    allKept: outside.length > 0 && kept.length === outside.length,
     moveThem,
     dismiss,
   };

@@ -75,3 +75,31 @@ describe("useShellIntegration handleResumeSession", () => {
     expect(newTab.mock.calls[0][1]).toBe("/repo");
   });
 });
+
+/**
+ * The prompt-state witness "Move them" reads (`lastPromptMark`): the LAST of a
+ * pane's 633;A (`prompt_start`) and 633;C (`command_execute`) marks, per tab,
+ * and nothing for a pane that emitted neither.
+ */
+describe("useShellIntegration lastPromptMark", () => {
+  it("tracks each pane's last prompt or command-start mark and nothing else", () => {
+    const hook = useShellIntegrationWith(vi.fn());
+    expect(hook.lastPromptMark("a")).toBeUndefined();
+
+    hook.handleShellIntegration("a", { type: "prompt_start" });
+    expect(hook.lastPromptMark("a")).toBe("prompt_start");
+
+    hook.handleShellIntegration("a", { type: "command_line", command: "Get-Content -Wait x" });
+    hook.handleShellIntegration("a", { type: "command_execute" });
+    expect(hook.lastPromptMark("a")).toBe("command_execute");
+
+    // The command ends: 633;D then the next prompt's 633;A.
+    hook.handleShellIntegration("a", { type: "command_done", exitCode: 0 });
+    expect(hook.lastPromptMark("a")).toBe("command_execute");
+    hook.handleShellIntegration("a", { type: "prompt_start" });
+    expect(hook.lastPromptMark("a")).toBe("prompt_start");
+
+    // Marks are per pane.
+    expect(hook.lastPromptMark("b")).toBeUndefined();
+  });
+});
