@@ -3060,20 +3060,33 @@ mod command_marks_scan_tests {
     }
 
     /// bash announces the capability only on the PS0 path (bash >= 4.4), the
-    /// one that marks every typed command line and never a PROMPT_COMMAND entry.
+    /// one that marks every typed command line and never a PROMPT_COMMAND
+    /// entry, and only at a prompt where PS0 provably carries that C.
     #[test]
     fn bash_announces_the_capability_only_where_ps0_emits_the_command_start() {
         let token = webview_token();
-        let send = format!("    if [ \"${{__qontinui_command_marks}}\" = \"1\" ]; then\n        __osc633 \"{token}\"\n    fi");
-        assert!(
-            BASH.contains(&send),
-            "the bash announcement must be gated on the PS0 path"
+        // Exactly one emission site, as the PowerShell ARM check counts its arm:
+        // an extra ungated `__osc633 "P;CommandMarks=1"` must fail here.
+        let emit = format!("__osc633 \"{token}\"");
+        assert_eq!(
+            BASH.matches(emit.as_str()).count(),
+            1,
+            "bash may announce the capability from exactly one place"
+        );
+        // That one place sends it only while PS0 carries our C, after
+        // re-prefixing a PS0 something reassigned, on the PS0 path only.
+        let gated = format!(
+            "    if [ \"${{__qontinui_ps0_path}}\" = \"1\" ]; then\n        case \"${{PS0-}}\" in\n            *'\\e]633;C\\a'*) ;;\n            *) __qontinui_is_readonly PS0 || PS0='\\e]633;C\\a'\"${{PS0-}}\" ;;\n        esac\n        case \"${{PS0-}}\" in\n            *'\\e]633;C\\a'*) {emit} ;;\n        esac\n    fi"
         );
         assert!(
-            BASH.contains("PS0='\\e]633;C\\a'\"${PS0}\""),
-            "bash must emit its command start from PS0"
+            BASH.contains(&gated),
+            "the bash announcement must be gated on PS0 carrying the command start"
         );
-        let gate = "if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then\n    __qontinui_command_marks=1\nelse\n    __qontinui_command_marks=0\nfi";
+        assert!(
+            BASH.contains("            PS0='\\e]633;C\\a'\"${PS0-}\"\n"),
+            "bash must emit its command start from PS0 (with a `set -u`-safe default)"
+        );
+        let gate = "if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then\n    __qontinui_ps0_path=1\nelse\n    __qontinui_ps0_path=0\nfi";
         assert!(
             BASH.contains(gate),
             "the PS0 path must be gated on bash >= 4.4"

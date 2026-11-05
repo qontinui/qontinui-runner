@@ -18,109 +18,155 @@ __osc633() {
 }
 
 # ── Prompt-state marks ──────────────────────────────────────────────────────
-# Per prompt: D;<code>, P;Cwd=<path>, P;CommandMarks=1 (bash >= 4.4 only, see
-# below), then A — all from PROMPT_COMMAND, so a PROMPT_COMMAND that rewrites
-# PS1 (starship, __git_ps1) cannot drop them. B stays in PS1: it is cosmetic.
-# Per command line: C (and nothing for PROMPT_COMMAND's own entries) — from
-# PS0 on bash >= 4.4, the DEBUG trap before that.
+# The rule: the user's shell must behave as without this block, apart from the
+# OSC 633 bytes. Every PROMPT_COMMAND entry of theirs still runs, in order,
+# seeing `$?`; a PS0 of theirs is kept (ours is prefixed); `set -e` / `set -u`
+# in their rc survive (both entries run where errexit is suspended, every
+# expansion has a default); a readonly PROMPT_COMMAND / PS0 / PS1 and a DEBUG
+# trap of theirs are left alone. shell-integration-marks-test.sh checks the
+# cases it names on a real pty; anything else is held to the same rule.
 #
-# P;CommandMarks=1 tells the runner a prompt mark (A) here means "nothing is
-# running": it is sent only where every typed command line gets a C, i.e. only
-# on the PS0 path. The DEBUG trap cannot promise that — once the user has a
-# PROMPT_COMMAND of their own (history -a, direnv, zoxide) its entries spend the
-# trap's once-per-line C before the typed command runs. It rides every prompt,
-# not just the first: a runner pane that stopped parsing marks (remounted, or
-# hidden) learns it again at the next prompt.
+# Per prompt, from PROMPT_COMMAND (so a PROMPT_COMMAND that rewrites PS1 —
+# starship, __git_ps1 — cannot drop them): the finished command's E and D and
+# the cwd from our FIRST entry; then, from our LAST entry (after every entry of
+# the user's), P;CommandMarks=1 when it is provably true and A. B stays in PS1:
+# it is cosmetic. Per command line: C — from PS0 on bash >= 4.4, the DEBUG trap
+# before that.
+#
+# P;CommandMarks=1 tells the runner this prompt's A means "nothing is running":
+# the next typed command line will get a C first. It is sent ONLY when that is
+# proven at this prompt: bash >= 4.4 (PS0 exists) and PS0 holds our C right
+# now (re-prefixed if something reassigned PS0 — a `source ~/.bashrc` — unless
+# PS0 is readonly). The DEBUG trap is never announced: a user PROMPT_COMMAND's
+# entries can spend its once-per-line C. Without the announcement the runner
+# keeps the pane, which is always safe. It rides every prompt, so a runner pane
+# that stopped parsing marks (remounted, or hidden) learns it again.
 #
 # The shared literal: `P;CommandMarks=1` is pinned against the webview's
 # `COMMAND_MARKS_CAPABILITY` (src/components/terminal/shellIntegrationEvents.ts)
 # by a source scan in src-tauri/src/session/spawn_prompt.rs.
 __osc633_b=$'\033]633;B\007'
 if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
-    __qontinui_command_marks=1
+    __qontinui_ps0_path=1
 else
-    __qontinui_command_marks=0
+    __qontinui_ps0_path=0
 fi
 
-# The history number of the last command line E was sent for (PS0 path).
-# Unset until the first prompt records it, so that prompt never re-sends the
-# last command of a previous session (the history file loads after this rc).
-unset __qontinui_last_histnum
+# Whether the variable named $1 is readonly (a fork; install time and the rare
+# PS0 re-prefix only).
+__qontinui_is_readonly() {
+    local decl attrs
+    decl="$(declare -p "$1" 2>/dev/null)" || return 1
+    attrs="${decl#declare -}"
+    attrs="${attrs%% *}"
+    [[ "${attrs}" == *r* ]]
+}
 
-# First PROMPT_COMMAND entry: the finished command's E (PS0 path: read back
-# from history, so PROMPT_COMMAND entries never masquerade as it), its D, the
-# cwd and the capability. `$?` is still the command's status here.
+# HISTCMD as our LAST entry left it: the number the next history entry will
+# get, read after the user's entries ran (a `history -a; history -c; history -r`
+# among them renumbers the list). Unset until the first prompt.
+unset __qontinui_histcmd
+
+# First PROMPT_COMMAND entry. `$?` is still the finished command's status, and
+# is returned so the user's entries see it. E only when the typed line made a
+# NEW history entry since our last entry (HISTCMD moved): an empty line, an
+# `ignorespace`/`ignoredups` line, or a shell whose HISTCMD is gone sends no E —
+# never a wrong one.
 __qontinui_prompt_start() {
     local code=$?
-    if [ "${__qontinui_command_marks}" = "1" ]; then
-        local line num=0 cmd=
-        line=$(HISTTIMEFORMAT= builtin history 1)
-        if [[ "${line}" =~ ^[[:space:]]*([0-9]+)[*[:space:]]+(.*)$ ]]; then
-            num="${BASH_REMATCH[1]}"
-            cmd="${BASH_REMATCH[2]//$'\n'/ }"
-        fi
-        if [ -z "${__qontinui_last_histnum+set}" ]; then
-            __qontinui_last_histnum="${num}"
-        elif [ "${num}" != "${__qontinui_last_histnum}" ]; then
-            __qontinui_last_histnum="${num}"
+    if [ "${__qontinui_ps0_path}" = "1" ] && [ -n "${__qontinui_histcmd-}" ] &&
+        [ -n "${HISTCMD-}" ] && [ "${HISTCMD-}" != "${__qontinui_histcmd-}" ]; then
+        local line
+        line="$(HISTTIMEFORMAT= builtin history 1)"
+        if [[ "${line}" =~ ^[[:space:]]*[0-9]+[*[:space:]]+(.*)$ ]]; then
+            local cmd="${BASH_REMATCH[1]//$'\n'/ }"
             __osc633 "E;${cmd//;/\\x3b}"
         fi
     fi
     __osc633 "D;${code}"
     __osc633 "P;Cwd=$(pwd)"
-    if [ "${__qontinui_command_marks}" = "1" ]; then
-        __osc633 "P;CommandMarks=1"
-    fi
     return "${code}"
 }
 
-# Last PROMPT_COMMAND entry: A, after every entry of the user's own.
+# Last PROMPT_COMMAND entry, after every entry of the user's: record HISTCMD,
+# then the capability (only if PS0 still carries our C, re-prefixing it where
+# something reassigned PS0) and A.
 __qontinui_prompt_end() {
     local code=$?
+    __qontinui_histcmd="${HISTCMD-}"
+    if [ "${__qontinui_ps0_path}" = "1" ]; then
+        case "${PS0-}" in
+            *'\e]633;C\a'*) ;;
+            *) __qontinui_is_readonly PS0 || PS0='\e]633;C\a'"${PS0-}" ;;
+        esac
+        case "${PS0-}" in
+            *'\e]633;C\a'*) __osc633 "P;CommandMarks=1" ;;
+        esac
+    fi
     __osc633 "A"
     return "${code}"
 }
 
 # Install: our start entry first, our end entry last, the user's (string or
-# array form) untouched between. Newlines, not `;`, join the string form, so a
-# user value ending in `;` stays valid.
-if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
-    PROMPT_COMMAND=("__qontinui_prompt_start" "${PROMPT_COMMAND[@]}" "__qontinui_prompt_end")
-elif [ -n "${PROMPT_COMMAND}" ]; then
-    PROMPT_COMMAND=$'__qontinui_prompt_start\n'"${PROMPT_COMMAND}"$'\n__qontinui_prompt_end'
-else
-    PROMPT_COMMAND=$'__qontinui_prompt_start\n__qontinui_prompt_end'
-fi
+# array form) untouched between. `&& :` / `|| :` run each entry where errexit
+# is suspended, so a nonzero `$?` that the user's `set -e` exempts (`false &&
+# true`) cannot end their shell at the next prompt; `&& :` keeps that `$?` for
+# their entries. Newlines, not `;`, join the string form, so a user value
+# ending in `;` stays valid. An array PROMPT_COMMAND is run element by element
+# only on bash >= 5.1; earlier bash runs element [0] alone, so there it is
+# wrapped as a string in element [0], exactly as that bash would run it.
+if ! __qontinui_is_readonly PROMPT_COMMAND; then
+    __qontinui_pc_start='__qontinui_prompt_start && :'
+    __qontinui_pc_end='__qontinui_prompt_end || :'
+    if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]] &&
+        (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then
+        PROMPT_COMMAND=("${__qontinui_pc_start}" "${PROMPT_COMMAND[@]}" "${__qontinui_pc_end}")
+    elif [ -n "${PROMPT_COMMAND-}" ]; then
+        PROMPT_COMMAND="${__qontinui_pc_start}"$'\n'"${PROMPT_COMMAND-}"$'\n'"${__qontinui_pc_end}"
+    else
+        PROMPT_COMMAND="${__qontinui_pc_start}"$'\n'"${__qontinui_pc_end}"
+    fi
 
-# B (command ready) at the end of the prompt. \[...\] so bash doesn't count the
-# OSC bytes toward the prompt width.
-PS1="${PS1}\[${__osc633_b}\]"
+    # B (command ready) at the end of the prompt. \[...\] so bash doesn't count
+    # the OSC bytes toward the prompt width.
+    if ! __qontinui_is_readonly PS1; then
+        PS1="${PS1-}\[${__osc633_b}\]"
+    fi
 
-if [ "${__qontinui_command_marks}" = "1" ]; then
-    # PS0 is expanded once per command line read, after it is read and before
-    # it runs — never for PROMPT_COMMAND's entries. `\e`/`\a` are prompt
-    # escapes, so this needs no command substitution (and no promptvars).
-    PS0='\e]633;C\a'"${PS0}"
-else
-    # bash < 4.4 has no PS0: E/C from the DEBUG trap, best effort and never
-    # announced (see above).
-    __qontinui_in_command=1
-    __qontinui_debug_trap() {
-        local cmd="${BASH_COMMAND}"
-        case "${cmd}" in
-            __qontinui_*|__osc633*) return ;;
-        esac
-        if [ "${__qontinui_in_command}" = "0" ]; then
-            __qontinui_in_command=1
-            __osc633 "E;${cmd//;/\\x3b}"
-            __osc633 "C"
+    if [ "${__qontinui_ps0_path}" = "1" ]; then
+        # PS0 is expanded once per command line read, after it is read and
+        # before it runs — never for PROMPT_COMMAND's entries. `\e`/`\a` are
+        # prompt escapes, so this needs no command substitution (and no
+        # promptvars). A user PS0 is kept, after ours.
+        if ! __qontinui_is_readonly PS0; then
+            PS0='\e]633;C\a'"${PS0-}"
         fi
-    }
-    __qontinui_reset_command() {
-        __qontinui_in_command=0
-    }
-    PROMPT_COMMAND=$'__qontinui_reset_command\n'"${PROMPT_COMMAND}"
-    trap '__qontinui_debug_trap' DEBUG
+    else
+        # bash < 4.4 has no PS0: E/C from the DEBUG trap, best effort and never
+        # announced (see above). The reset runs LAST, after the user's entries,
+        # so their commands cannot spend the trap's once-per-line E/C.
+        __qontinui_in_command=1
+        __qontinui_debug_trap() {
+            local cmd="${BASH_COMMAND-}"
+            case "${cmd}" in
+                __qontinui_*|__osc633*) return 0 ;;
+            esac
+            if [ "${__qontinui_in_command-}" = "0" ]; then
+                __qontinui_in_command=1
+                __osc633 "E;${cmd//;/\\x3b}"
+                __osc633 "C"
+            fi
+            return 0
+        }
+        __qontinui_reset_command() {
+            __qontinui_in_command=0
+        }
+        PROMPT_COMMAND="${PROMPT_COMMAND-}"$'\n__qontinui_reset_command'
+        # Never over a DEBUG trap of the user's own (bash-preexec and the like).
+        if [ -z "$(trap -p DEBUG)" ]; then
+            trap '__qontinui_debug_trap' DEBUG
+        fi
+    fi
 fi
 
 # ── Claude Code runner context ─────────────────────────────────────────────
