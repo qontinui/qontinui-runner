@@ -488,6 +488,35 @@ pub fn session_transcript_path(config_dir: &Path, project_path: &str, session_id
     project_dir(config_dir, project_path, Some(session_id)).join(format!("{}.jsonl", session_id))
 }
 
+/// The config dirs a `--resume` probe searches: every account on this machine
+/// ([`find_claude_config_dirs`]) plus `extra` — the dir the caller would spawn
+/// under — when the sweep did not already find it.
+pub fn transcript_search_dirs(extra: Option<&str>) -> Vec<PathBuf> {
+    let mut dirs = find_claude_config_dirs();
+    if let Some(extra) = extra {
+        let extra = PathBuf::from(extra);
+        if !dirs.iter().any(|d| d == &extra) {
+            dirs.push(extra);
+        }
+    }
+    dirs
+}
+
+/// The first of `config_dirs` that holds the on-disk transcript of
+/// `(project_path, session_id)` at [`session_transcript_path`] — i.e. the
+/// account a `--resume <session_id>` must run under to find its conversation.
+/// `None` when no dir holds it.
+pub fn config_dir_holding_transcript(
+    config_dirs: &[PathBuf],
+    project_path: &str,
+    session_id: &str,
+) -> Option<PathBuf> {
+    config_dirs
+        .iter()
+        .find(|cfg| session_transcript_path(cfg, project_path, session_id).is_file())
+        .cloned()
+}
+
 // ── Resume-name extraction (previous-sessions listing) ───────────────────────
 //
 // The `--resume` name a user actually sees is NOT the first-message preview
@@ -2193,6 +2222,39 @@ pub fn scan_external_claude_processes(exclude_pids: &[u32]) -> ExternalClaudeSca
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write an (empty) transcript for `(cwd, session_id)` under `config_dir`.
+    fn write_transcript(config_dir: &Path, cwd: &str, session_id: &str) {
+        let path = session_transcript_path(config_dir, cwd, session_id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "{}\n").unwrap();
+    }
+
+    /// The dir returned is the one holding THIS session's transcript for THIS
+    /// cwd: the first such dir in search order, and `None` when none holds it
+    /// (another session's or another cwd's transcript does not count).
+    #[test]
+    fn config_dir_holding_transcript_returns_the_dir_that_holds_it() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let c = tempfile::tempdir().unwrap();
+        let cwd = "/work/proj";
+        let id = "11111111-2222-3333-4444-555555555555";
+        write_transcript(a.path(), cwd, "99999999-2222-3333-4444-555555555555");
+        write_transcript(a.path(), "/work/other", id);
+        write_transcript(b.path(), cwd, id);
+        write_transcript(c.path(), cwd, id);
+        let dirs = vec![
+            a.path().to_path_buf(),
+            b.path().to_path_buf(),
+            c.path().to_path_buf(),
+        ];
+        assert_eq!(
+            config_dir_holding_transcript(&dirs, cwd, id),
+            Some(b.path().to_path_buf())
+        );
+        assert_eq!(config_dir_holding_transcript(&dirs[..1], cwd, id), None);
+    }
 
     /// Transcript-sourced titles can carry raw SGR/OSC escapes (a `/rename`
     /// pasted from colored output, or a summary derived from one). Nothing

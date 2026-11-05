@@ -1471,35 +1471,6 @@ fn build_honest_summary_prompt(replay_prompt: &str, turns_covered: usize) -> Str
     format!("{}{}", honest_summary_marker(turns_covered), replay_prompt)
 }
 
-/// Does an on-disk Claude transcript exist for `(working_dir, cli_session_id)`?
-///
-/// The chat path pins the CLI session id to the `task_run_id` (see
-/// `create_ai_session`), so the transcript lands at
-/// `<config_dir>/projects/<encoded(working_dir)>/<cli_session_id>.jsonl`. When
-/// it exists we can resume LOSSLESSLY via `--resume <cli_session_id>` and skip
-/// the lossy output_log summary entirely. We probe every discovered Claude
-/// config dir (multi-account installs) and the resolved effective dir.
-fn transcript_exists_for(working_dir: &str, cli_session_id: &str) -> bool {
-    use crate::terminal::transcript;
-
-    // The effective config dir for the active account, plus all discovered
-    // config dirs (multi-account). Any hit means the transcript is resumable.
-    let mut config_dirs: Vec<std::path::PathBuf> = transcript::find_claude_config_dirs();
-    let (effective_config_dir, _config_dir_source) = crate::ai_provider::get_effective_config_dir(
-        &crate::settings::get_ai_settings().claude_cli,
-    );
-    if let Some(eff) = effective_config_dir {
-        let p = std::path::PathBuf::from(eff);
-        if !config_dirs.iter().any(|d| d == &p) {
-            config_dirs.push(p);
-        }
-    }
-
-    config_dirs
-        .iter()
-        .any(|cfg| transcript::session_transcript_path(cfg, working_dir, cli_session_id).exists())
-}
-
 /// Re-acquire the coord `kind=worktree` claim(s) for a resumed chat session and
 /// restore its drained WIP state, BEFORE re-spawning the CLI.
 ///
@@ -1922,7 +1893,18 @@ pub async fn resume_ai_sessions(
         // output_log summary entirely. Only when no transcript exists do we
         // fall back to `build_replay_prompt` — and we LABEL it honestly so the
         // operator/agent knows earlier context may be missing.
-        let can_full_resume = transcript_exists_for(&working_dir, &task_run_id);
+        // Every discovered config dir (multi-account) plus the effective dir
+        // for the active account is searched; any hit is resumable.
+        let can_full_resume = {
+            use crate::terminal::transcript;
+            let (effective_config_dir, _config_dir_source) =
+                crate::ai_provider::get_effective_config_dir(
+                    &crate::settings::get_ai_settings().claude_cli,
+                );
+            let search_dirs = transcript::transcript_search_dirs(effective_config_dir.as_deref());
+            transcript::config_dir_holding_transcript(&search_dirs, &working_dir, &task_run_id)
+                .is_some()
+        };
 
         // The replay prompt is only used on the summary fallback. When we have
         // a full transcript we send NO initial prompt (the --resume restores
