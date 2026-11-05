@@ -22,8 +22,13 @@
 #   QONTINUI_PREPUSH_STRICT=1    turn the "cannot load this workspace" DECLINE
 #                                below into a hard failure. Off by default; see
 #                                the preflight's own comment for why declining
-#                                is the right default there.
-#   git push --no-verify         skips both, because git never invokes the hook
+#                                is the right default there. It also turns the
+#                                tree-lock and holder-deadline declines into one.
+#   AGENT_BUILD_STALL_SECS / AGENT_BUILD_MAX_WALL_SECS
+#                                the holder deadline on the guarded clippy
+#                                (defaults here 600 / 2700; lib/shared-target.sh,
+#                                "Bounding the build").
+#   git push --no-verify        skips both, because git never invokes the hook
 #                                at all. Nothing in this file can preserve fmt
 #                                for you in that case; prefer
 #                                QONTINUI_PREPUSH_SKIP=1.
@@ -501,28 +506,54 @@ if declare -F guard_shared_target >/dev/null 2>&1; then
   GUARD_RC=0
   guard_shared_target "$ROOT" "[pre-push]" "$ROOT/src-tauri" || GUARD_RC=$?
 fi
+# The one decline path, shared by a guard that could not be taken and by a
+# guarded build the holder deadline stopped (lib/shared-target.sh, "Bounding
+# the build"): both cost LATENCY, NOT COVERAGE, and both block only under
+# QONTINUI_PREPUSH_STRICT=1. $1 is the reason; the rest are the lines saying
+# why clippy produced no verdict.
+decline_guarded_clippy() {
+  local reason="$1" line; shift
+  echo >&2
+  echo "[pre-push] CANNOT RUN CLIPPY GUARDED — $reason." >&2
+  for line in "$@"; do echo "[pre-push]   $line" >&2; done
+  echo "[pre-push]   CI still gates clippy ('test (ubuntu-22.04)', 'Clippy (windows)'); fmt above" >&2
+  echo "[pre-push]   still ran. This costs LATENCY, NOT COVERAGE." >&2
+  if [[ "$STRICT" == "1" ]]; then
+    echo "[pre-push]   QONTINUI_PREPUSH_STRICT=1 — treating this as a failure." >&2
+    exit 1
+  fi
+  echo "[pre-push]   Not blocking the push. Set QONTINUI_PREPUSH_STRICT=1 to block instead." >&2
+  exit 0
+}
 case "$GUARD_RC" in
   0|10) ;;
   *)
-    echo >&2
-    echo "[pre-push] CANNOT RUN CLIPPY GUARDED — ${SHARED_TARGET_GUARD_REASON:-guard rc $GUARD_RC}." >&2
-    echo "[pre-push]   A clippy run without the tree lock can replay a PEER worktree's build as" >&2
-    echo "[pre-push]   Fresh and report errors that are not in this tree, so it is not run." >&2
-    echo "[pre-push]   CI still gates clippy ('test (ubuntu-22.04)', 'Clippy (windows)'); fmt above" >&2
-    echo "[pre-push]   still ran. This costs LATENCY, NOT COVERAGE." >&2
-    if [[ "$STRICT" == "1" ]]; then
-      echo "[pre-push]   QONTINUI_PREPUSH_STRICT=1 — treating this as a failure." >&2
-      exit 1
-    fi
-    echo "[pre-push]   Not blocking the push. Set QONTINUI_PREPUSH_STRICT=1 to block instead." >&2
-    exit 0
+    decline_guarded_clippy "${SHARED_TARGET_GUARD_REASON:-guard rc $GUARD_RC}" \
+      "A clippy run without the tree lock can replay a PEER worktree's build as" \
+      "Fresh and report errors that are not in this tree, so it is not run."
     ;;
 esac
 
 clippy_rc=0
 # `9>&-`: the tree lock's descriptor (flock arm) must not leak into cargo or a
 # daemon it spawns, which could otherwise hold the lock past this hook's exit.
-cargo clippy 9>&- 2>&1 | tee "$CLIPPY_LOG" || clippy_rc=$?
+#
+# `guarded_build` (lib/shared-target.sh) runs it under the holder deadline
+# (abs_run) when qontinui-claude-config's lib is here, else exactly as a bare
+# `cargo clippy`. As a pipeline element under `pipefail` the pipeline's status
+# is the build's whenever the build is the failing stage (tee does not fail),
+# so `clippy_rc` is cargo's status, or 124 when abs_run returned a deadline
+# stop. On the path where the element exec'd into cargo the status is the
+# SIGTERM's 143, and `shared_target_build_stopped` reads the deadline's own
+# verdict for this hook's pid instead.
+declare -F guarded_build >/dev/null 2>&1 || guarded_build() { "$@"; }
+declare -F shared_target_build_stopped >/dev/null 2>&1 || shared_target_build_stopped() { return 1; }
+guarded_build cargo clippy 9>&- 2>&1 | tee "$CLIPPY_LOG" || clippy_rc=$?
+if shared_target_build_stopped "$clippy_rc" "[pre-push]"; then
+  decline_guarded_clippy "$SHARED_TARGET_GUARD_REASON" \
+    "The run was stopped, not judged: no clippy verdict, and its output above is" \
+    "partial. Retry once the peer build holding cargo's target lock finishes."
+fi
 if [[ "$clippy_rc" -ne 0 ]]; then
   rc="$clippy_rc"
   echo

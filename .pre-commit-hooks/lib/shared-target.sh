@@ -249,6 +249,10 @@ guard_shared_target() {
       libdir="$(dirname "$found")"
     fi
   fi
+  # The holder deadline comes from the same lib dir, and is loaded before the
+  # tree-lock checks below so an rc-10 (unguarded) build is bounded too when
+  # the deadline library is there. See "Bounding the build", below.
+  _shared_target_abs_load "$libdir" "$tag"
   if [ -z "$libdir" ] || [ ! -r "$libdir/cargo-tree-freshness.sh" ] || [ ! -r "$libdir/tree-identity.sh" ]; then
     echo "$tag NOTE — no qontinui-claude-config tree-lock library (lib/cargo-tree-freshness.sh) on this machine, so this build is UNGUARDED."
     echo "$tag        If another checkout shares this target, cargo can replay ITS build as Fresh: an error naming code that exists in this tree may not be yours."
@@ -317,6 +321,90 @@ guard_shared_target() {
     SHARED_TARGET_GUARD_REASON="this tree's files could not be touched, so cargo may still judge them against another checkout's build"
     return 4
   fi
+  return 0
+}
+
+# ── Bounding the build: the holder deadline ──────────────────────────────────
+#
+# THE DEFECT (plan 2026-10-18-a-live-sessions-stalled-cargo-verify-holds-the-
+# tree-lock-with-no-deadline, Phase 1b). The tree lock's ACQUIRE is bounded
+# (300 s above); what the hook does while HOLDING it was not. Measured on
+# merytshost 2026-11-05: a `cargo-prepush.sh` held the runner target-agent tree
+# lock for 33 min while its cargo sat at 0 CPU in `locks_lock_inode_wait` on
+# `<target>/debug/.cargo-lock` — cargo's own flock, held by an unrelated
+# cargo-guard build that takes no tree lock. Every other hook's 300 s wait
+# expired behind it.
+#
+# The fix is one holder bound for every taker of the lock, not a second
+# deadline here: qontinui-claude-config's `lib/agent-build-scope.sh` `abs_run`
+# (the wrapper cargo-guard.sh and cargo-verify.sh already build through) arms
+# the owner guard's watcher, which stops a build that makes no CPU progress for
+# AGENT_BUILD_STALL_SECS or outlives AGENT_BUILD_MAX_WALL_SECS, and a build it
+# stops reports 124. A pre-push hook is interactive and must not hold a shared
+# lock for an hour, so `guarded_build` passes TIGHTER defaults of its own —
+# stall 600 s, wall 2700 s — each still overridable by the caller's env.
+#
+# Where the library or `abs_run` is absent (an open-source checkout, CI) the
+# build runs exactly as before, and one NOTE line says it is unbounded.
+SHARED_TARGET_ABS_LOADED=0
+SHARED_TARGET_STALL_SECS_DEFAULT=600
+SHARED_TARGET_MAX_WALL_SECS_DEFAULT=2700
+
+# _shared_target_abs_load <libdir> <tag> — source <libdir>/agent-build-scope.sh
+# once. Never fails; a miss prints the one NOTE line.
+_shared_target_abs_load() {
+  local libdir="$1" tag="$2" rc=0
+  [ "$SHARED_TARGET_ABS_LOADED" = 1 ] && return 0
+  if [ -n "$libdir" ] && [ -r "$libdir/agent-build-scope.sh" ]; then
+    # `|| rc=$?`: written for callers with `set -e` off or guarded, as above.
+    # shellcheck source=/dev/null
+    . "$libdir/agent-build-scope.sh" || rc=$?
+    if [ "$rc" -eq 0 ] && declare -F abs_run >/dev/null 2>&1; then
+      SHARED_TARGET_ABS_LOADED=1
+      return 0
+    fi
+  fi
+  echo "$tag NOTE — no qontinui-claude-config holder-deadline library (lib/agent-build-scope.sh defining abs_run) on this machine, so this build is UNBOUNDED: nothing stops it if it stalls."
+  return 0
+}
+
+# guarded_build <cmd> [args...] — run the hook's guarded build through abs_run
+# with the hook's own bounds, or exactly as a bare call when abs_run is not
+# loaded. Usable as a pipeline element: there a bare call is EXEC'd, as a bare
+# `cargo` in that position was, and abs_run does the same on its own plain
+# path. Its status is the build's, or 124 when the deadline stopped it on a
+# path where abs_run returns at all; the caller asks
+# `shared_target_build_stopped` either way, which also covers the exec'd path.
+guarded_build() {
+  local rc=0
+  if [ "$SHARED_TARGET_ABS_LOADED" = 1 ] && declare -F abs_run >/dev/null 2>&1; then
+    AGENT_BUILD_STALL_SECS="${AGENT_BUILD_STALL_SECS:-$SHARED_TARGET_STALL_SECS_DEFAULT}" \
+    AGENT_BUILD_MAX_WALL_SECS="${AGENT_BUILD_MAX_WALL_SECS:-$SHARED_TARGET_MAX_WALL_SECS_DEFAULT}" \
+      abs_run "$@" || rc=$?
+    return "$rc"
+  fi
+  [ "${BASHPID:-$$}" != "$$" ] && exec "$@"
+  "$@" || rc=$?
+  return "$rc"
+}
+
+# shared_target_build_stopped <build status> <tag> — 0 when the holder
+# deadline stopped the build (the owner guard's verdict for THIS hook process,
+# or a 124 from abs_run), with SHARED_TARGET_GUARD_REASON naming it; the
+# caller then reports it exactly as it reports a tree-lock timeout. 1 otherwise
+# (nothing printed). Called in the hook's OWN shell after the build, never in
+# `$( )`: the verdict is keyed by the hook's pid, and the reason must survive.
+shared_target_build_stopped() {
+  local rc="$1" tag="${2:-[pre-push]}" stopped=0
+  [ "$SHARED_TARGET_ABS_LOADED" = 1 ] || return 1
+  # Called on every status: on 0 it only clears a verdict the build outran.
+  if declare -F abog_deadline_check >/dev/null 2>&1 && abog_deadline_check "$rc" "$tag"; then
+    stopped=1
+  elif [ "$rc" = 124 ]; then
+    stopped=1
+  fi
+  [ "$stopped" = 1 ] || return 1
+  SHARED_TARGET_GUARD_REASON="the build was stopped by the holder deadline (${ABOG_STOPPED_BY:-deadline}, exit 124; bounds: no CPU progress for ${AGENT_BUILD_STALL_SECS:-$SHARED_TARGET_STALL_SECS_DEFAULT}s, wall ${AGENT_BUILD_MAX_WALL_SECS:-$SHARED_TARGET_MAX_WALL_SECS_DEFAULT}s) — it held the tree lock without finishing, usually blocked on cargo's own target lock behind a peer build"
   return 0
 }
 
