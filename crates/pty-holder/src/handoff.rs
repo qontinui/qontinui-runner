@@ -440,6 +440,15 @@ fn run_upgrade(ctx: &UpgradeCtx, info: &HolderInfo, pane: &Arc<Pane>) -> Upgrade
     // (unlinked under a live holder), `socket_path`: the successor publishes a
     // fresh endpoint there. Resolved before anything is frozen, so an unusable
     // root is a plain refusal with nothing to roll back.
+    //
+    // When the successor publishes somewhere other than `sock` (the preferred
+    // root changed since this holder bound), the file it leaves behind —
+    // this holder's after a commit, the successor's after a take-back — is
+    // NOT removed here: deciding which file is dead would need a second
+    // `socket_path` read that a concurrent root change can make name a live
+    // listener. A dead file only ever answers `ConnectionRefused`, which every
+    // client passes over (`transport::connect`), and the pane's sweep removes
+    // it with the pane.
     let sock = match crate::pane::socket_candidates(&ctx.pane_dir, &info.pane_id)
         .into_iter()
         .find(|p| std::fs::symlink_metadata(p).is_ok())
@@ -610,12 +619,6 @@ fn run_upgrade(ctx: &UpgradeCtx, info: &HolderInfo, pane: &Arc<Pane>) -> Upgrade
                  connect may be refused until its endpoint is in place"
             ),
         ),
-    }
-    // The successor serves at `socket_path`. When this holder's own socket was
-    // elsewhere (another root, or a pre-Phase-4 pane-dir socket), nothing
-    // replaced it: remove it rather than leave a refused file behind.
-    if crate::pane::socket_path(&ctx.pane_dir, &info.pane_id).is_ok_and(|p| p != sock) {
-        let _ = std::fs::remove_file(&sock);
     }
     pane.hand_off_reads();
     UpgradeResult::Committed {
@@ -822,16 +825,7 @@ fn take_pane_back(
     if let Ok(staged) = crate::transport::staged_socket_path(&ctx.pane_dir, &info.pane_id) {
         let _ = std::fs::remove_file(staged);
     }
-    // The dead successor published somewhere other than this holder's own
-    // socket (the preferred root changed since it bound): that file is the
-    // dead successor's listener. Nothing was re-bound there (the inode check
-    // above watches `sock`), so remove it rather than leave a refused file
-    // ahead of this holder's in every client's candidate order.
-    if let Ok(theirs) = crate::pane::socket_path(&ctx.pane_dir, &info.pane_id) {
-        if theirs != sock {
-            let _ = std::fs::remove_file(theirs);
-        }
-    }
+
     match back {
         Back::Lossless(held) => pane.restore_handed_input(held),
         Back::DeclaredLoss { handoff_offset } => {
