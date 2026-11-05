@@ -64,6 +64,7 @@ mod build_drift;
 // and the plan's Design decision 1 requires the SHIPPED app binary to emit it —
 // `bundle.externalBin` ships only two sidecars, so a helper bin would not be in
 // the installer and could not answer the question at all.
+mod build_admission;
 /// The canonical-generation rung: the runner's bare mirror of
 /// `qontinui-claude-config`, refreshed off the spawn path.
 mod canonical_corpus;
