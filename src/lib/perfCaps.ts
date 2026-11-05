@@ -46,6 +46,11 @@ export interface PerfCaps {
   redact_terminal_secrets: boolean | null;
   /** Open-session count past which the advisory banner shows. */
   max_sessions_warn: number;
+  /**
+   * Remove empty terminal pages the runner auto-created once restore has
+   * settled (plan 2026-11-05 Phase 6). Operator-made pages are never pruned.
+   */
+  prune_empty_auto_pages: boolean;
 }
 
 /**
@@ -65,6 +70,7 @@ export const DEFAULT_PERF_CAPS: Readonly<PerfCaps> = Object.freeze({
   share_terminal_output: true,
   redact_terminal_secrets: null,
   max_sessions_warn: 30,
+  prune_empty_auto_pages: true,
 });
 
 let caps: PerfCaps = { ...DEFAULT_PERF_CAPS };
@@ -136,6 +142,10 @@ export function normalizePerfCaps(raw: unknown): PerfCaps {
     redact_terminal_secrets:
       typeof src.redact_terminal_secrets === "boolean" ? src.redact_terminal_secrets : null,
     max_sessions_warn: num("max_sessions_warn", DEFAULT_PERF_CAPS.max_sessions_warn, 0),
+    prune_empty_auto_pages: bool(
+      "prune_empty_auto_pages",
+      DEFAULT_PERF_CAPS.prune_empty_auto_pages,
+    ),
   };
 }
 

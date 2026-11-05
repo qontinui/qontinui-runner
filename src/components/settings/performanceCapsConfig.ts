@@ -110,6 +110,13 @@ export const PERF_CAP_FIELDS: readonly PerfCapField[] = [
     unit: "sessions",
   },
   {
+    key: "prune_empty_auto_pages",
+    type: "boolean",
+    label: "Remove empty auto-created terminal pages",
+    description:
+      'Once restore has settled, remove terminal pages the runner created on its own ("Page N") that hold no terminal and no session waiting to be restored. Pages you made or renamed are never removed, and the tab strip offers Undo for 15 seconds.',
+  },
+  {
     key: "max_webgl_panes",
     type: "number",
     label: "Max WebGL terminal panes",
