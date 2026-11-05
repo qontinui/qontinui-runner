@@ -1,0 +1,7 @@
+● Tests pass; pushing the branch next.
+  ⎿  You've hit your weekly limit · resets Nov 3, 9pm (Europe/Berlin)
+
+───────────────────────────────────────────────────────────────────────────
+❯ 
+───────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

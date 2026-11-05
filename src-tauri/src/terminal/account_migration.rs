@@ -1739,6 +1739,67 @@ mod tests {
         assert!(matches!(probe_idle_prompt(&s), IdlePromptProbe::NotYet(_)));
     }
 
+    // ---- parked limit-stop screens (plan 2026-11-05, Phase 1) ----------------
+    //
+    // The two shapes the plan's vet read on merytshost through the
+    // non-mutating `GET /ui-bridge/sdk/terminal/sessions/{id}/text` (panes
+    // `ac77c109` / `a3982390`, and `131b4908`). Pinned here so Phase 2's
+    // reset-continue knows what the idle watcher does with each.
+
+    fn fixture_screen(
+        text: &str,
+        cursor_row: u16,
+        cursor_col: u16,
+    ) -> crate::terminal::graceful_exit::ScreenText {
+        crate::terminal::graceful_exit::ScreenText {
+            lines: text.lines().map(str::to_string).collect(),
+            cursor_row,
+            cursor_col,
+        }
+    }
+
+    const IDLE_UNDER_WEEKLY_BANNER: &str =
+        include_str!("fixtures/parked_screens/idle_prompt_under_weekly_banner.txt");
+    const RATE_LIMIT_OPTIONS_MENU: &str =
+        include_str!("fixtures/parked_screens/rate_limit_options_menu.txt");
+
+    /// An idle, empty `❯` under the weekly-limit banner, bypass footer: the
+    /// watcher may submit into it, so a reset-continue reaches these panes.
+    #[test]
+    fn a_parked_idle_prompt_under_the_weekly_banner_is_ready() {
+        let s = fixture_screen(IDLE_UNDER_WEEKLY_BANNER, 4, 2);
+        assert_eq!(s.lines[4], "❯\u{a0}");
+        assert!(s.lines[1].contains("You've hit your weekly limit"));
+        assert_eq!(probe_idle_prompt(&s), IdlePromptProbe::Ready);
+    }
+
+    /// The `/rate-limit-options` menu is never `Ready`, wherever the cursor
+    /// sits: the idle watcher gives up on it, which is why Phase 2 adopts
+    /// runner#2417's one-Esc limit-wait gate.
+    #[test]
+    fn the_rate_limit_options_menu_is_never_ready() {
+        let rows = RATE_LIMIT_OPTIONS_MENU.lines().count();
+        assert_eq!(rows, 7);
+        for row in 0..rows as u16 {
+            for col in 0..=6 {
+                let s = fixture_screen(RATE_LIMIT_OPTIONS_MENU, row, col);
+                assert!(
+                    matches!(probe_idle_prompt(&s), IdlePromptProbe::NotYet(_)),
+                    "cursor ({row},{col}) read {:?}",
+                    probe_idle_prompt(&s)
+                );
+            }
+        }
+        // The pointer row itself is refused as a dialog, not as "no prompt".
+        let on_pointer = fixture_screen(RATE_LIMIT_OPTIONS_MENU, 4, 3);
+        assert_eq!(
+            probe_idle_prompt(&on_pointer),
+            IdlePromptProbe::NotYet(
+                "a numbered choice is selected — a dialog, not the input prompt".to_string()
+            )
+        );
+    }
+
     #[test]
     fn ready_is_submitted_only_on_a_second_identical_read() {
         let first = v2_screen(&["❯\u{a0}"], 0, 2);
