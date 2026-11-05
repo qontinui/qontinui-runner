@@ -14,9 +14,10 @@
 //! - Reuses [`crate::fleet::load_device_file`] for identity (`device_id`).
 //! - Reuses [`qontinui_runner_lib::profiles::connected_coord_base`] for the
 //!   coord HTTP endpoint (the single connected-vs-isolated definition).
-//! - Reuses [`crate::terminal::transcript::session_transcript_path`] for the
-//!   `$CLAUDE_CONFIG_DIR/projects/<encoded-cwd>/<session-id>.jsonl` path so we
-//!   never hand-roll Claude's project-path encoding.
+//! - Reuses [`crate::session::past_sessions::resolve_transcript_path`] to find
+//!   each session's transcript (the exact encoded path when the record has a
+//!   `working_dir`, else the by-id sweep), so we never hand-roll Claude's
+//!   project-path encoding and a record with no `working_dir` is still found.
 //! - Reuses [`crate::terminal::transcript::parse_line_for_touched_files`] for
 //!   the Edit/Write/MultiEdit `tool_use` extraction (NotebookEdit is correctly
 //!   excluded by that helper's explicit match arm).
@@ -83,6 +84,7 @@ use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
+use crate::session::session_lifecycle_store::TerminalSessionRecord;
 use crate::terminal::transcript;
 
 /// Is the capture loop enabled? OFF unless `COORD_SESSION_ATTRIBUTION_ENABLED`
@@ -273,25 +275,26 @@ pub(crate) fn extract_attributions_from_new_bytes(
     out
 }
 
-/// Locate the on-disk transcript for a session: the exact encoded path under
-/// the RECORDED `config_dir` (the account the session runs on) when it exists,
-/// else the newest `<session_id>.jsonl` under any Claude config dir on this
-/// machine — newest, not first-found, since a migrated session leaves a frozen
-/// copy at the same encoded path in its old account.
+/// Locate the on-disk transcript for one hosted lifecycle record.
 ///
-/// Returns `None` if no transcript exists for the session in any config dir.
-fn resolve_transcript_path(
-    config_dir: Option<&str>,
-    working_dir: &str,
-    session_id: &str,
-) -> Option<PathBuf> {
-    if let Some(cfg) = config_dir {
-        let p = transcript::session_transcript_path(Path::new(cfg), working_dir, session_id);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    transcript::find_transcript_by_session_id(config_dir.map(Path::new), session_id)
+/// The ONLY place the capture pass decides whether a record has a transcript:
+/// a blank `working_dir` is filtered to `None` and the lookup delegates to
+/// [`crate::session::past_sessions::resolve_transcript_path`], whose by-id
+/// sweep needs no `working_dir` at all. So a record whose `working_dir` is
+/// absent or blank (reachable — see `session_lifecycle_store`'s hook-confirm
+/// merge note) is still attributed, and the only skip left is "no transcript
+/// exists anywhere".
+///
+/// It takes the whole record, not its fields, so the capture loop reads no
+/// `working_dir` of its own and the tests below exercise the exact decision
+/// the loop makes.
+fn transcript_for_record(rec: &TerminalSessionRecord) -> Option<PathBuf> {
+    let working_dir = rec.working_dir.as_deref().filter(|w| !w.trim().is_empty());
+    crate::session::past_sessions::resolve_transcript_path(
+        rec.config_dir.as_deref(),
+        working_dir,
+        &rec.claude_session_id,
+    )
 }
 
 /// One capture pass. Best-effort: per-session errors `warn!`/`debug!` and the
@@ -370,26 +373,17 @@ pub async fn run_attribution_cycle() -> Result<(), String> {
 
     let mut posted = 0usize;
     for rec in open {
+        let transcript_path = transcript_for_record(&rec);
         let session_id = rec.claude_session_id;
-        // A hosted session must know its cwd to locate the transcript.
-        let working_dir = match rec.working_dir.as_deref() {
-            Some(w) if !w.is_empty() => w,
-            _ => {
-                debug!("session_attribution: session {session_id} has no working_dir; skipping");
+        let transcript_path = match transcript_path {
+            Some(p) => p,
+            None => {
+                debug!(
+                    "session_attribution: no transcript found for session {session_id}; skipping"
+                );
                 continue;
             }
         };
-
-        let transcript_path =
-            match resolve_transcript_path(rec.config_dir.as_deref(), working_dir, &session_id) {
-                Some(p) => p,
-                None => {
-                    debug!(
-                    "session_attribution: no transcript found for session {session_id}; skipping"
-                );
-                    continue;
-                }
-            };
 
         // Current transcript length.
         let len = match std::fs::metadata(&transcript_path) {
@@ -604,6 +598,109 @@ pub fn spawn_session_attribution() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- transcript_for_record: a blank working_dir is not a skip ------------
+    //
+    // These read the machine's real Claude config dirs too: the by-id sweep in
+    // `find_transcript_by_session_id` always scans them. A fresh v4 session id
+    // per test keeps a real transcript from ever matching, and every access is
+    // a read.
+
+    fn fresh_session_id() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    /// A minimal open lifecycle record, built through serde so the test does
+    /// not have to track every optional field the store grows.
+    fn record(
+        config_dir: &Path,
+        working_dir: Option<&str>,
+        session_id: &str,
+    ) -> TerminalSessionRecord {
+        serde_json::from_value(serde_json::json!({
+            "claudeSessionId": session_id,
+            "configDir": config_dir.to_str().expect("utf-8 tempdir"),
+            "workingDir": working_dir,
+            "pageId": "page",
+            "zoneIndex": 0,
+            "terminalId": "term",
+            "openedAt": 0,
+            "lastSeenAt": 0,
+            "state": "open",
+        }))
+        .expect("record deserializes")
+    }
+
+    /// Write `<config>/projects/<dir>/<session_id>.jsonl` and return its path.
+    fn write_transcript_under(config: &Path, project_dir: &str, session_id: &str) -> PathBuf {
+        let dir = config.join("projects").join(project_dir);
+        std::fs::create_dir_all(&dir).expect("create project dir");
+        let p = dir.join(format!("{session_id}.jsonl"));
+        std::fs::write(&p, b"{}\n").expect("write transcript");
+        p
+    }
+
+    #[test]
+    fn a_record_with_no_working_dir_still_finds_its_transcript() {
+        let cfg = tempfile::tempdir().expect("tempdir");
+        let sid = fresh_session_id();
+        let written = write_transcript_under(cfg.path(), "some-project", &sid);
+        assert_eq!(
+            transcript_for_record(&record(cfg.path(), None, &sid)),
+            Some(written)
+        );
+    }
+
+    #[test]
+    fn a_record_with_a_blank_working_dir_still_finds_its_transcript() {
+        let cfg = tempfile::tempdir().expect("tempdir");
+        let sid = fresh_session_id();
+        let written = write_transcript_under(cfg.path(), "some-project", &sid);
+        assert_eq!(
+            transcript_for_record(&record(cfg.path(), Some(""), &sid)),
+            Some(written.clone())
+        );
+        assert_eq!(
+            transcript_for_record(&record(cfg.path(), Some("   "), &sid)),
+            Some(written)
+        );
+    }
+
+    /// The exact encoded path wins over the sweep: a NEWER decoy copy under a
+    /// different project dir is what the sweep (newest copy) would return, so
+    /// only the exact-path branch returns `exact`.
+    #[test]
+    fn a_record_with_a_working_dir_resolves_the_exact_encoded_path() {
+        let cfg = tempfile::tempdir().expect("tempdir");
+        let sid = fresh_session_id();
+        let wd = "/home/someone/Projects/qontinui-root/qontinui-runner";
+        let exact = transcript::session_transcript_path(cfg.path(), wd, &sid);
+        std::fs::create_dir_all(exact.parent().expect("parent")).expect("create dir");
+        std::fs::write(&exact, b"{}\n").expect("write transcript");
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&exact)
+            .and_then(|f| f.set_modified(old))
+            .expect("age the exact copy");
+        let decoy = write_transcript_under(cfg.path(), "a-different-project", &sid);
+        assert_ne!(decoy, exact);
+        assert_eq!(
+            transcript_for_record(&record(cfg.path(), Some(wd), &sid)),
+            Some(exact)
+        );
+    }
+
+    #[test]
+    fn a_record_with_no_transcript_anywhere_resolves_to_none() {
+        let cfg = tempfile::tempdir().expect("tempdir");
+        let sid = fresh_session_id();
+        assert_eq!(transcript_for_record(&record(cfg.path(), None, &sid)), None);
+        assert_eq!(
+            transcript_for_record(&record(cfg.path(), Some("/no/such/project"), &sid)),
+            None
+        );
+    }
 
     // ---- WipAttributionPayload wire shape (Phase 8b item 7) -------------------
 
