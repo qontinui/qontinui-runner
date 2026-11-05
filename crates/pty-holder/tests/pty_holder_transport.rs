@@ -19,6 +19,8 @@ use qontinui_pty_holder::client::{
 };
 use qontinui_pty_holder::frame::{KIND_CONTROL, KIND_DATA};
 use qontinui_pty_holder::lock::{read_record, PaneLock, TryLock};
+#[cfg(unix)]
+use qontinui_pty_holder::pane::socket_path;
 use qontinui_pty_holder::pane::{lock_path, PaneId};
 use qontinui_pty_holder::protocol::{
     parse_reply, to_payload, RejectReason, Reply, Request, PROTOCOL_VERSIONS,
@@ -31,8 +33,10 @@ fn soon() -> Instant {
     Instant::now() + Duration::from_secs(5)
 }
 
-/// A fresh, short pane dir. Short because a Unix socket path is capped at
-/// ~104-108 bytes and `$TMPDIR` can be long.
+/// A fresh, short pane dir. (The Unix socket no longer lives in it —
+/// `pane::socket_path` — so its length is no longer what keeps the socket
+/// under `sun_path`; `pty_holder_long_pane_dir_spawns_connects_and_readopts`
+/// covers a long one.)
 fn pane_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -426,7 +430,7 @@ fn pty_holder_killed_holder_is_dead_and_the_pane_is_reusable() {
     }
     #[cfg(unix)]
     assert!(
-        dir.join("p1.sock").exists(),
+        socket_path(&dir, &pid("p1")).unwrap().exists(),
         "a SIGKILLed holder leaves its socket file behind"
     );
 
@@ -440,6 +444,54 @@ fn pty_holder_killed_holder_is_dead_and_the_pane_is_reusable() {
     }
     drop(h2);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Plan 2026-11-04 (socket-overflow) Phase 4: a pane dir far past `sun_path`
+/// (a secondary runner's is ~95 bytes before the file name) still gets a
+/// holder-backed pane. The holder binds, a client connects, and a later
+/// caller — here a fresh census, as a restarted runner's adoption does —
+/// re-derives the SAME endpoint from (pane dir, pane id) alone.
+#[cfg(unix)]
+#[test]
+fn pty_holder_long_pane_dir_spawns_connects_and_readopts() {
+    let base = pane_dir("long");
+    let mut dir = base.clone().into_os_string();
+    dir.push("/");
+    let pad = 200usize.saturating_sub(dir.len()).max(1);
+    dir.push("x".repeat(pad));
+    let dir = PathBuf::from(dir);
+    assert!(dir.as_os_str().len() >= 200, "{}", dir.display());
+    make_private_dir(&dir);
+
+    let (h, line) = spawn_holder(&dir, "p1");
+    assert!(line.starts_with("holder_ready "), "holder did not start: {line}");
+    let sock = socket_path(&dir, &pid("p1")).unwrap();
+    assert!(
+        line.ends_with(&format!("endpoint={}", sock.display())),
+        "the holder bound the derived path: {line}"
+    );
+    assert!(sock.exists());
+    assert!(sock.as_os_str().len() <= qontinui_pty_holder::transport::max_path_len());
+
+    let mut c = connect(&dir, &pid("p1"), soon()).expect("handshake on a long pane dir");
+    assert_eq!(c.hello_ack().holder_pid, h.pid());
+    c.ping(soon()).unwrap();
+    drop(c);
+
+    // Adoption: nothing but (pane dir, pane id) is carried over, and it lands
+    // on the same socket.
+    assert_eq!(socket_path(&dir, &pid("p1")).unwrap(), sock);
+    let cen = census(&dir, Duration::from_secs(5), &[]).unwrap();
+    assert_eq!(cen.len(), 1, "{cen:?}");
+    assert!(
+        matches!(&cen[0].probe, Probe::Healthy { hello_ack } if hello_ack.holder_pid == h.pid()),
+        "{cen:?}"
+    );
+
+    drop(h);
+    // The socket lives in the shared root, not the pane dir: remove ours.
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// A held lock with no endpoint (a holder between lock and bind, or one that
@@ -616,7 +668,7 @@ fn pty_holder_unix_endpoint_and_dir_are_private() {
     let h = spawn_ready(&dir, "p1");
     let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&dir), 0o700);
-    assert_eq!(mode(&dir.join("p1.sock")), 0o600);
+    assert_eq!(mode(&socket_path(&dir, &pid("p1")).unwrap()), 0o600);
     assert_eq!(mode(&dir.join("p1.lock")) & 0o077, 0);
     drop(h);
     let _ = std::fs::remove_dir_all(&dir);
@@ -706,7 +758,7 @@ fn pty_holder_trickling_peer_cannot_stretch_the_probe_deadline() {
         TryLock::Acquired(l) => l,
         TryLock::Held => panic!("fresh"),
     };
-    let listener = UnixListener::bind(dir.join("p1.sock")).unwrap();
+    let listener = UnixListener::bind(socket_path(&dir, &pid("p1")).unwrap()).unwrap();
     let step = Duration::from_millis(150);
     std::thread::spawn(move || {
         if let Ok((mut s, _)) = listener.accept() {
@@ -793,7 +845,7 @@ fn pty_holder_client_is_poisoned_after_a_mid_frame_timeout() {
         TryLock::Acquired(l) => l,
         TryLock::Held => panic!("fresh"),
     };
-    let listener = UnixListener::bind(dir.join("p1.sock")).unwrap();
+    let listener = UnixListener::bind(socket_path(&dir, &pid("p1")).unwrap()).unwrap();
     let (half_sent_tx, half_sent_rx) = std::sync::mpsc::channel::<()>();
     let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     let fake = std::thread::spawn(move || {

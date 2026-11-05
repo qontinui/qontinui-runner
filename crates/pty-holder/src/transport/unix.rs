@@ -222,7 +222,7 @@ impl Drop for StagedListener {
 }
 
 /// `sun_path` capacity minus the terminating NUL (107 on Linux, 103 on macOS).
-fn max_path_len() -> usize {
+pub fn max_path_len() -> usize {
     // SAFETY: sockaddr_un is plain data; zeroed is a valid value.
     let addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     addr.sun_path.len() - 1

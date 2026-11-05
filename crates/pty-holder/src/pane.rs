@@ -10,7 +10,9 @@
 //!
 //! - `<pane-id>.lock` — the advisory lock, taken BEFORE any endpoint exists,
 //!   holding a JSON [`crate::lock::LockRecord`];
-//! - `<pane-id>.sock` — the Unix-domain socket (Unix only);
+//! - (no socket: the Unix-domain socket lives OUTSIDE the pane directory, in
+//!   the per-user [`socket_root`], named by a hash of the pane dir and pane id
+//!   — see [`socket_path`] for why);
 //! - `<pane-id>.spec` — the child spec the RUNNER writes (0600) before it
 //!   spawns the holder, and the holder consumes and unlinks at start-up
 //!   (`crate::spec`);
@@ -91,9 +93,133 @@ pub fn lock_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
     pane_dir.join(format!("{}.lock", pane.as_str()))
 }
 
-/// `<pane-dir>/<pane-id>.sock` — the Unix endpoint.
-pub fn socket_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
-    pane_dir.join(format!("{}.sock", pane.as_str()))
+/// The Unix endpoint: `<root>/<16 hex>.sock`, where `<root>` is
+/// [`socket_root`] and the 16 hex digits are the first 8 bytes of
+/// `sha256(pane-dir bytes ‖ 0x00 ‖ pane-id)`.
+///
+/// The socket does NOT live in the pane directory, unlike every other per-pane
+/// file. A Unix socket's path must fit `sockaddr_un.sun_path` (107 bytes on
+/// Linux, 103 on macOS), and a secondary runner's pane dir alone
+/// (`…/instances/<name>/home/runner/pty-panes/`) already overflowed it at 133
+/// bytes, so its panes silently fell back to in-process PTYs (plan
+/// `2026-11-04-identity-shim-foreign-shim-ping-pong-and-secondary-runner-pty-socket-overflow`,
+/// Phase 4). Here the length is bounded whatever the pane dir: at most
+/// `/tmp/qontinui-pty-<uid>/` plus 21 bytes, and its staged twin
+/// (`crate::transport::staged_socket_path`) four more.
+///
+/// The path is a pure function of `(pane_dir, pane, uid)` — never of the
+/// environment — because a holder outlives the runner that spawned it and a
+/// later runner, whose environment may differ, must derive the SAME path to
+/// adopt it (the spec is deleted when the holder reads it, and the lock record
+/// carries no endpoint). The pane dir is hashed in, so two runner instances
+/// sharing a pane id never share a socket.
+///
+/// Fails when the root cannot be created or is not this user's
+/// ([`socket_root`]); every caller already treats an endpoint error as
+/// "unreachable".
+#[cfg(unix)]
+pub fn socket_path(pane_dir: &Path, pane: &PaneId) -> io::Result<PathBuf> {
+    Ok(socket_path_in(&socket_root()?, pane_dir, pane))
+}
+
+/// [`socket_path`] under an explicit root (the pure half, unit-tested).
+#[cfg(unix)]
+fn socket_path_in(root: &Path, pane_dir: &Path, pane: &PaneId) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
+    let mut h = Sha256::new();
+    // A trailing or doubled separator must not change the socket.
+    h.update(trim_trailing_separators(pane_dir).as_os_str().as_bytes());
+    h.update([0u8]);
+    h.update(pane.as_str().as_bytes());
+    let digest = h.finalize();
+    let mut name = String::with_capacity(16 + 5);
+    for b in &digest[..8] {
+        name.push_str(&format!("{b:02x}"));
+    }
+    name.push_str(".sock");
+    root.join(name)
+}
+
+/// The directory every pane's socket lives in, for this effective uid:
+/// `/run/user/<uid>/qontinui-pty` when `/run/user/<uid>` exists, is a real
+/// directory owned by `<uid>` and has mode 0700 (the systemd-logind runtime
+/// dir); otherwise `/tmp/qontinui-pty-<uid>`.
+///
+/// Created 0700 when missing. A pre-existing root must be a real directory
+/// (not a symlink) owned by this uid and not group/other-writable, or it is
+/// refused with `PermissionDenied` — in a world-writable `/tmp` another user
+/// can create the name first, and anyone who could write there could plant a
+/// socket. A merely group/other-READABLE one is tightened to 0700.
+///
+/// `$XDG_RUNTIME_DIR` is deliberately NOT read: the holder runs on under
+/// `systemd-run --scope` after its runner exits, and the next runner (started
+/// by the supervisor, by systemd, or by hand) may carry a different
+/// environment, so an env-derived root would let spawn and adoption disagree.
+#[cfg(unix)]
+pub fn socket_root() -> io::Result<PathBuf> {
+    socket_root_in(
+        Path::new("/run/user"),
+        Path::new("/tmp"),
+        crate::transport::own_uid(),
+    )
+}
+
+/// [`socket_root`] with its two bases and the uid injected, so the choice and
+/// the refusals are tested without touching the real `/run/user` or `/tmp`.
+#[cfg(unix)]
+fn socket_root_in(run_user: &Path, tmp: &Path, uid: u32) -> io::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let runtime = run_user.join(uid.to_string());
+    let runtime_ok = std::fs::symlink_metadata(&runtime).is_ok_and(|md| {
+        md.file_type().is_dir() && md.uid() == uid && md.mode() & 0o777 == 0o700
+    });
+    let root = if runtime_ok {
+        runtime.join("qontinui-pty")
+    } else {
+        tmp.join(format!("qontinui-pty-{uid}"))
+    };
+    prepare_socket_root(&root, uid)?;
+    Ok(root)
+}
+
+/// Create `root` 0700 if missing (its parent must exist: `/run/user/<uid>` or
+/// `/tmp`), then refuse it unless it is a real directory owned by `uid` and not
+/// group/other-writable; tighten a group/other-readable one to 0700.
+#[cfg(unix)]
+fn prepare_socket_root(root: &Path, uid: u32) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    match std::fs::DirBuilder::new().mode(0o700).create(root) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let md = std::fs::symlink_metadata(root)?;
+    let refuse = |why: String| {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("pty socket root {}: {why}", root.display()),
+        ))
+    };
+    if md.file_type().is_symlink() {
+        return refuse("is a symlink".into());
+    }
+    if !md.is_dir() {
+        return refuse("is not a directory".into());
+    }
+    if md.uid() != uid {
+        return refuse(format!("owned by uid {}, not {uid}", md.uid()));
+    }
+    if md.mode() & 0o022 != 0 {
+        return refuse(format!(
+            "mode {:o} is group/other-writable",
+            md.mode() & 0o777
+        ));
+    }
+    if md.mode() & 0o077 != 0 {
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 /// `<pane-dir>/<pane-id>.spec` — the child spec (`crate::spec`).
@@ -377,12 +503,166 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A unique, private scratch directory under the temp dir.
+    #[cfg(unix)]
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "pty-holder-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        prepare_private_dir(&d).unwrap();
+        d
+    }
+
+    /// Plan 2026-11-04 Phase 4 (the arming test): the socket and its staged
+    /// `.upg` twin fit `sun_path` whatever the pane dir, the path is stable,
+    /// and the pane dir is part of the name.
+    #[cfg(unix)]
+    #[test]
+    fn socket_path_fits_sun_path_for_long_pane_dir() {
+        let max = crate::transport::max_path_len();
+        let long = PathBuf::from(format!("/{}", "d".repeat(199)));
+        assert_eq!(long.as_os_str().len(), 200);
+        let other = PathBuf::from(format!("/{}", "e".repeat(199)));
+        let p = PaneId::new(&"p".repeat(MAX_PANE_ID_LEN)).unwrap();
+
+        // The real root on this machine, and the longest root `socket_root`
+        // can choose for any 32-bit uid.
+        let worst_root = PathBuf::from(format!("/tmp/qontinui-pty-{}", u32::MAX));
+        for root in [socket_root().unwrap(), worst_root] {
+            let sock = socket_path_in(&root, &long, &p);
+            let staged = crate::transport::staged_path(&sock);
+            assert!(sock.as_os_str().len() <= max, "{}", sock.display());
+            assert!(staged.as_os_str().len() <= max, "{}", staged.display());
+            assert_ne!(sock, socket_path_in(&root, &other, &p));
+        }
+
+        // The public function: same answer on every call (spawn and a later
+        // adoption agree), and under the real root.
+        let sock = socket_path(&long, &p).unwrap();
+        assert_eq!(sock, socket_path(&long, &p).unwrap());
+        assert_eq!(sock.parent().unwrap(), socket_root().unwrap());
+        assert!(sock.as_os_str().len() <= max, "{}", sock.display());
+        let staged = crate::transport::staged_socket_path(&long, &p).unwrap();
+        assert!(staged.as_os_str().len() <= max, "{}", staged.display());
+        assert_ne!(sock, socket_path(&other, &p).unwrap());
+        // A different pane in the same dir is a different socket; a trailing
+        // separator is the same dir.
+        assert_ne!(sock, socket_path(&long, &PaneId::new("q").unwrap()).unwrap());
+        let mut trailing = long.clone().into_os_string();
+        trailing.push("/");
+        assert_eq!(sock, socket_path(Path::new(&trailing), &p).unwrap());
+    }
+
+    /// The root is `<run_user>/<uid>/qontinui-pty` only when the runtime dir
+    /// is a real 0700 directory owned by the uid; otherwise `<tmp>/qontinui-pty-<uid>`.
+    #[cfg(unix)]
+    #[test]
+    fn pty_holder_socket_root_choice() {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = crate::transport::own_uid();
+        let mode = |p: &Path| {
+            std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777
+        };
+
+        // A 0700 runtime dir owned by us: the root goes under it, created 0700.
+        let base = scratch("sroot-run");
+        let run_user = base.join("run-user");
+        let tmp = base.join("tmp");
+        std::fs::create_dir_all(run_user.join(uid.to_string())).unwrap();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let rt = run_user.join(uid.to_string());
+        std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = socket_root_in(&run_user, &tmp, uid).unwrap();
+        assert_eq!(root, rt.join("qontinui-pty"));
+        assert_eq!(mode(&root), 0o700);
+        // Idempotent.
+        assert_eq!(socket_root_in(&run_user, &tmp, uid).unwrap(), root);
+
+        // A runtime dir that is not 0700: the /tmp fallback.
+        std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = socket_root_in(&run_user, &tmp, uid).unwrap();
+        assert_eq!(root, tmp.join(format!("qontinui-pty-{uid}")));
+        assert_eq!(mode(&root), 0o700);
+
+        // No runtime dir at all: the /tmp fallback.
+        let none = base.join("no-run-user");
+        assert_eq!(
+            socket_root_in(&none, &tmp, uid).unwrap(),
+            tmp.join(format!("qontinui-pty-{uid}"))
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A root another user owns, a symlink, a non-directory or a
+    /// group/other-writable directory is refused; a readable one is tightened.
+    #[cfg(unix)]
+    #[test]
+    fn pty_holder_socket_root_refusals() {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = crate::transport::own_uid();
+        let base = scratch("sroot-refuse");
+        let none = base.join("no-run-user");
+
+        // Owned by someone else: we create it as ourselves, then ask for it as
+        // `uid + 1` — the ownership check is against the uid asked for. The
+        // runtime dir for that uid is ours too, so it is not chosen either.
+        let other = uid.wrapping_add(1);
+        let run_user = base.join("run-user");
+        std::fs::create_dir_all(run_user.join(other.to_string())).unwrap();
+        std::fs::set_permissions(
+            run_user.join(other.to_string()),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let e = socket_root_in(&run_user, &base, other).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        assert!(e.to_string().contains("owned by uid"), "{e}");
+
+        let tmp = base.join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let root = tmp.join(format!("qontinui-pty-{uid}"));
+
+        // A symlink to a directory we own.
+        let target = base.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &root).unwrap();
+        let e = socket_root_in(&none, &tmp, uid).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        std::fs::remove_file(&root).unwrap();
+
+        // A plain file.
+        std::fs::write(&root, b"").unwrap();
+        let e = socket_root_in(&none, &tmp, uid).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        std::fs::remove_file(&root).unwrap();
+
+        // Group/other-writable: refused, never repaired.
+        std::fs::create_dir(&root).unwrap();
+        for m in [0o770, 0o707, 0o777] {
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(m)).unwrap();
+            let e = socket_root_in(&none, &tmp, uid).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{m:o}");
+        }
+        // Merely readable: tightened.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(socket_root_in(&none, &tmp, uid).unwrap(), root);
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn pty_holder_paths_and_pipe_name() {
         let dir = Path::new("/state/runner-a/panes");
         let p = PaneId::new("p1").unwrap();
         assert_eq!(lock_path(dir, &p), dir.join("p1.lock"));
-        assert_eq!(socket_path(dir, &p), dir.join("p1.sock"));
         assert_eq!(spec_path(dir, &p), dir.join("p1.spec"));
         assert_eq!(log_path(dir, &p), dir.join("p1.log"));
         assert_eq!(scrollback_path(dir, &p), dir.join("p1.scrollback"));

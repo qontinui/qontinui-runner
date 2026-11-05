@@ -62,6 +62,12 @@ mod unix {
         PaneId::new("p1").unwrap()
     }
 
+    /// Pane p1's staged successor socket — in the shared socket root, not in
+    /// the pane dir (`pane::socket_path`).
+    fn staged_socket(dir: &Path) -> PathBuf {
+        qontinui_pty_holder::transport::staged_socket_path(dir, &p1()).unwrap()
+    }
+
     fn alive(pid: u32) -> bool {
         // SAFETY: signal 0 only checks for existence.
         unsafe { libc::kill(pid as i32, 0) == 0 }
@@ -857,7 +863,7 @@ mod unix {
         assert_eq!(hello.child_pid, Some(pane.child_pid));
         no_snapshot_left(&dir);
         assert!(
-            !dir.join("p1.sock.upg").exists(),
+            !staged_socket(&dir).exists(),
             "no staged socket left behind"
         );
         let mut s = attach(&dir, None);
@@ -983,7 +989,7 @@ mod unix {
             assert_eq!(count(&r2.bytes, b"got:held"), 1, "{fault}: held input once");
             no_snapshot_left(&dir);
             assert!(
-                !dir.join("p1.sock.upg").exists(),
+                !staged_socket(&dir).exists(),
                 "{fault}: no staged socket left"
             );
             // The upgrade is not stuck "in progress": a second request runs
@@ -1096,7 +1102,7 @@ mod unix {
         assert_eq!(got.matches("after").count(), 1, "{got:?}");
         let _ = std::fs::remove_dir_all(&out);
         no_snapshot_left(&dir);
-        assert!(!dir.join("p1.sock.upg").exists());
+        assert!(!staged_socket(&dir).exists());
     }
 
     /// Review r3 nit (path C): the successor's endpoint rename FAILS after the

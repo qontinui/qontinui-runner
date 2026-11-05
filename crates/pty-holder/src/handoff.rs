@@ -431,6 +431,15 @@ pub fn prepare_upgrade(ctx: &UpgradeCtx, info: &HolderInfo, pane: &Arc<Pane>) ->
 }
 
 fn run_upgrade(ctx: &UpgradeCtx, info: &HolderInfo, pane: &Arc<Pane>) -> UpgradeResult {
+    // Which socket file serves the pane now — to tell, if the successor dies
+    // after the commit, whether it already replaced it (review r2, D).
+    // Resolved before anything is frozen: an unusable socket root is a plain
+    // refusal, with nothing to roll back.
+    let sock = match crate::pane::socket_path(&ctx.pane_dir, &info.pane_id) {
+        Ok(p) => p,
+        Err(e) => return UpgradeResult::Failed(format!("socket path: {e}")),
+    };
+    let staged = crate::transport::staged_path(&sock);
     if let Err(e) = pane.freeze_input(INPUT_DRAIN_BOUND) {
         return UpgradeResult::Failed(format!("input freeze: {e}"));
     }
@@ -442,9 +451,6 @@ fn run_upgrade(ctx: &UpgradeCtx, info: &HolderInfo, pane: &Arc<Pane>) -> Upgrade
         }
     };
     let snap = snapshot_path(&ctx.pane_dir, &info.pane_id);
-    // Which socket file serves the pane now — to tell, if the successor dies
-    // after the commit, whether it already replaced it (review r2, D).
-    let sock = crate::pane::socket_path(&ctx.pane_dir, &info.pane_id);
     let sock_ino_before = socket_inode(&sock);
     let rollback = |child: Option<&mut Child>, why: String| {
         if let Some(c) = child {
@@ -455,10 +461,7 @@ fn run_upgrade(ctx: &UpgradeCtx, info: &HolderInfo, pane: &Arc<Pane>) -> Upgrade
         let _ = std::fs::remove_file(&snap);
         // A successor killed between its staged bind and its exit leaves the
         // staged socket behind.
-        let _ = std::fs::remove_file(crate::transport::staged_socket_path(
-            &ctx.pane_dir,
-            &info.pane_id,
-        ));
+        let _ = std::fs::remove_file(&staged);
         crate::scrollback::resume_after_handoff(&ctx.scrollback);
         pane.resume_reads();
         pane.unfreeze_input();
@@ -793,10 +796,7 @@ fn take_pane_back(
             );
         }
     }
-    let _ = std::fs::remove_file(crate::transport::staged_socket_path(
-        &ctx.pane_dir,
-        &info.pane_id,
-    ));
+    let _ = std::fs::remove_file(crate::transport::staged_path(sock));
     match back {
         Back::Lossless(held) => pane.restore_handed_input(held),
         Back::DeclaredLoss { handoff_offset } => {
@@ -1050,7 +1050,9 @@ pub fn adopt(snap: &Path) -> Result<Holder, u8> {
     #[cfg(debug_assertions)]
     if fault.as_deref() == Some("fail-publish") {
         // Take the staged socket away, so the rename fails (path C).
-        let _ = std::fs::remove_file(crate::transport::staged_socket_path(&pane_dir, &pane_id));
+        if let Ok(staged) = crate::transport::staged_socket_path(&pane_dir, &pane_id) {
+            let _ = std::fs::remove_file(staged);
+        }
     }
     let (listener, published) = staged.publish();
     #[cfg(debug_assertions)]

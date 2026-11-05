@@ -10,8 +10,9 @@
 //! 3. Consume `<pane-id>.spec` (`crate::spec`): read it, unlink it.
 //! 4. Open the PTY and spawn the child on it (`crate::pty`).
 //! 5. Write the [`LockRecord`] (holder pid, CHILD pid, versions, start time).
-//! 6. Unix: a `<pane-id>.sock` left by a dead holder is unlinked — only now,
-//!    under the lock, when no live holder can own it.
+//! 6. Unix: the pane's socket ([`crate::pane::socket_path`]) left by a dead
+//!    holder is unlinked — only now, under the lock, when no live holder can
+//!    own it.
 //! 7. Bind the endpoint. A failure from 5 on ends the child it just spawned:
 //!    a pane nobody can reach is a leak.
 //!
@@ -286,7 +287,7 @@ impl Holder {
             lock.write_record(&record)?;
             #[cfg(unix)]
             {
-                let sock = crate::pane::socket_path(pane_dir, pane_id);
+                let sock = crate::pane::socket_path(pane_dir, pane_id)?;
                 match std::fs::remove_file(&sock) {
                     Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
