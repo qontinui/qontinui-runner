@@ -1,7 +1,8 @@
 /**
  * The readiness signal a mover waits on before it moves a pane onto a page: a
- * page that is not yet listening for `terminal-page-changed` would let the move
- * go unadopted (the source evicts the tab, nobody mounts it).
+ * page that is not yet listening for `terminal-page-changed` misses the move —
+ * the source evicts the tab at once, and the target does not list it until its
+ * next re-sync (`resyncTabs`, on mount or after a terminal exit).
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -90,5 +91,20 @@ describe("pageMoveListeners", () => {
     await flush();
     expect(unlisten).toHaveBeenCalledTimes(1);
     expect(isPageMoveListening("unmounted-page")).toBe(false);
+  });
+
+  it("logs a rejected listen() registration and never marks the page listening", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let reject!: (err: Error) => void;
+    const registration = new Promise<() => void>((_resolve, r) => {
+      reject = r;
+    });
+    const cleanup = holdPageMoveListener("failed-page", registration);
+    reject(new Error("ipc down"));
+    await flush();
+    expect(isPageMoveListening("failed-page")).toBe(false);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("failed-page"));
+    cleanup();
+    warn.mockRestore();
   });
 });
