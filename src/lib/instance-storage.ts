@@ -12,7 +12,10 @@ function namespacedKey(key: string): string {
  * key, so a key carrying another instance's `:<port>` suffix is not its own.
  * (The old `includes(namespacedKey(prefix))` matched nothing on a secondary —
  * its namespaced prefix is `page:X::<port>` — and matched every instance's
- * keys on the primary.) Exported for tests.
+ * keys on the primary.) The primary's rule assumes none of its own keys ends in
+ * `:<4-5 digits>` — the suffix shape `namespacedKey` gives every other
+ * instance; a key under a prefix that does is read as another instance's.
+ * Exported for tests.
  */
 export function isOwnKeyUnderPrefix(rawKey: string, prefix: string, port: number): boolean {
   if (!rawKey.startsWith(prefix)) return false;

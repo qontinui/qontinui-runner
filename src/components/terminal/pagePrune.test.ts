@@ -184,7 +184,7 @@ describe("removeEach", () => {
       async () => reads.shift()!,
       async (id) => id,
     );
-    expect(pass).toEqual({ removed: ["a"], allReadsComplete: false });
+    expect(pass).toEqual({ removed: ["a"], allReadsComplete: false, lastIds: new Set() });
   });
   it("reports a whole pass as complete", async () => {
     const pass = await removeEach(
@@ -192,7 +192,7 @@ describe("removeEach", () => {
       async () => read("b"),
       async (id) => id,
     );
-    expect(pass).toEqual({ removed: ["a"], allReadsComplete: true });
+    expect(pass).toEqual({ removed: ["a"], allReadsComplete: true, lastIds: new Set(["b"]) });
   });
 });
 

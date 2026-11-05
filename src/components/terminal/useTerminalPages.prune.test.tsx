@@ -348,6 +348,33 @@ describe("what the prune never does", () => {
     expect(ids(hook().allPages)).not.toContain("oct-page-23a");
   });
 
+  it("re-checks the guards at removal time: a page renamed mid-pass is kept", async () => {
+    let fired = false;
+    backend.onRemovalList = () => {
+      if (fired) return;
+      fired = true;
+      expect(latestHook!().renamePage("oct-page-23b", "keepers")).toBe(true);
+    };
+    const hook = await mount();
+    expect(hook().allPages.find((p) => p.id === "oct-page-23b")).toMatchObject({
+      name: "keepers",
+      origin: "operator",
+    });
+    expect(ids(hook().allPages)).not.toContain("oct-page-23a");
+  });
+
+  it("re-checks the guards at removal time: a page popped out mid-pass is kept", async () => {
+    let fired = false;
+    backend.onRemovalList = () => {
+      if (fired) return;
+      fired = true;
+      setPageBindings({ "oct-page-23b": "terminal-popout-1" });
+    };
+    const hook = await mount();
+    expect(ids(hook().allPages)).toContain("oct-page-23b");
+    expect(ids(hook().allPages)).not.toContain("oct-page-23a");
+  });
+
   it("keeps every page when the removal-time terminal list cannot be read", async () => {
     backend.removalListThrows = true;
     const hook = await mount();
