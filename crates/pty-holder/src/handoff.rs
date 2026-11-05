@@ -433,13 +433,24 @@ pub fn prepare_upgrade(ctx: &UpgradeCtx, info: &HolderInfo, pane: &Arc<Pane>) ->
 fn run_upgrade(ctx: &UpgradeCtx, info: &HolderInfo, pane: &Arc<Pane>) -> UpgradeResult {
     // Which socket file serves the pane now — to tell, if the successor dies
     // after the commit, whether it already replaced it (review r2, D).
-    // Resolved before anything is frozen: an unusable socket root is a plain
+    // The socket this holder is SERVING on is the first candidate that exists
+    // (`pane::socket_candidates`) — normally where `socket_path` would bind
+    // now, but not after the preferred root changed since this holder bound.
+    // Resolved before anything is frozen: no socket at all is a plain
     // refusal, with nothing to roll back.
-    let sock = match crate::pane::socket_path(&ctx.pane_dir, &info.pane_id) {
+    let Some(sock) = crate::pane::socket_candidates(&ctx.pane_dir, &info.pane_id)
+        .into_iter()
+        .find(|p| std::fs::symlink_metadata(p).is_ok())
+    else {
+        return UpgradeResult::Failed("socket path: no endpoint file for this pane".into());
+    };
+    // Where the SUCCESSOR binds its staged socket: beside `socket_path`, the
+    // root a holder binds in now (which is also where its publish lands). An
+    // unusable root fails the successor's bind anyway: refuse up front.
+    let staged = match crate::transport::staged_socket_path(&ctx.pane_dir, &info.pane_id) {
         Ok(p) => p,
         Err(e) => return UpgradeResult::Failed(format!("socket path: {e}")),
     };
-    let staged = crate::transport::staged_path(&sock);
     if let Err(e) = pane.freeze_input(INPUT_DRAIN_BOUND) {
         return UpgradeResult::Failed(format!("input freeze: {e}"));
     }
@@ -797,6 +808,9 @@ fn take_pane_back(
         }
     }
     let _ = std::fs::remove_file(crate::transport::staged_path(sock));
+    if let Ok(staged) = crate::transport::staged_socket_path(&ctx.pane_dir, &info.pane_id) {
+        let _ = std::fs::remove_file(staged);
+    }
     match back {
         Back::Lossless(held) => pane.restore_handed_input(held),
         Back::DeclaredLoss { handoff_offset } => {

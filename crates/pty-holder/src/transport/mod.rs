@@ -76,30 +76,27 @@ pub fn connect(pane_dir: &Path, pane: &PaneId, deadline: Instant) -> io::Result<
         // Every place this pane's holder may be listening (`socket_candidates`:
         // both socket roots, then a pre-Phase-4 holder's path in the pane dir),
         // most likely first. A candidate with nothing listening (`NotFound`,
-        // `ConnectionRefused`) or too long to address (`InvalidInput`, only the
-        // legacy path) is passed over; any other answer — a connection, or a
-        // timeout from a wedged holder's full backlog — is THE answer.
-        let mut last = io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("no endpoint for pane {pane}"),
-        );
+        // `ConnectionRefused`) is passed over; any other answer — a
+        // connection, or a timeout from a wedged holder's full backlog — is
+        // THE answer. When none answers, a refusal (a socket file with no
+        // listener: a dead holder's) is reported over a plain absence.
+        let mut refused: Option<io::Error> = None;
         for path in crate::pane::socket_candidates(pane_dir, pane) {
             match unix::connect(&path, deadline) {
                 Ok(conn) => return Ok(conn),
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::NotFound
-                            | io::ErrorKind::ConnectionRefused
-                            | io::ErrorKind::InvalidInput
-                    ) =>
-                {
-                    last = e;
+                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                    refused.get_or_insert(e);
                 }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
         }
-        Err(last)
+        Err(refused.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no endpoint for pane {pane}"),
+            )
+        }))
     }
     #[cfg(windows)]
     {
