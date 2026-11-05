@@ -122,7 +122,14 @@ pub fn lock_path(pane_dir: &Path, pane: &PaneId) -> PathBuf {
 /// error as "unreachable".
 #[cfg(unix)]
 pub fn socket_path(pane_dir: &Path, pane: &PaneId) -> io::Result<PathBuf> {
-    Ok(socket_root()?.join(socket_name(pane_dir, pane)))
+    Ok(socket_path_in(&socket_root()?, pane_dir, pane))
+}
+
+/// [`socket_path`] under an explicit root: the pure half, which the arming
+/// test measures.
+#[cfg(unix)]
+fn socket_path_in(root: &Path, pane_dir: &Path, pane: &PaneId) -> PathBuf {
+    root.join(socket_name(pane_dir, pane))
 }
 
 /// Every path a holder for this pane may be listening on, most likely first,
@@ -618,8 +625,8 @@ mod tests {
     }
 
     /// Plan 2026-11-04 Phase 4 (the arming test): the socket and its staged
-    /// `.upg` twin fit `sun_path` whatever the pane dir, the path is stable,
-    /// and the pane dir is part of the name.
+    /// `.upg` twin fit `sun_path` whatever the pane dir, and the pane dir is
+    /// part of the name.
     /// Pure: no root is created or read.
     #[cfg(unix)]
     #[test]
@@ -636,11 +643,12 @@ mod tests {
             PathBuf::from(format!("{TMP}/qontinui-pty-{}", u32::MAX)),
         ];
         for root in worst_roots {
-            let sock = root.join(socket_name(&long, &p));
+            let sock = socket_path_in(&root, &long, &p);
+            // `transport::staged_socket_path` is exactly this over `socket_path`.
             let staged = crate::transport::staged_path(&sock);
             assert!(sock.as_os_str().len() <= max, "{}", sock.display());
             assert!(staged.as_os_str().len() <= max, "{}", staged.display());
-            assert_ne!(sock, root.join(socket_name(&other, &p)));
+            assert_ne!(sock, socket_path_in(&root, &other, &p));
         }
     }
 
