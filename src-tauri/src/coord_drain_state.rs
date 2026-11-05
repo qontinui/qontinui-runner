@@ -306,8 +306,10 @@ pub enum CoordDrainState {
     Clear,
     Drained {
         until: Option<DateTime<Utc>>,
-        /// Served only by `GET /coord/devices/me/drain`; `None` until that
-        /// read lands (or when the operator gave none).
+        /// Served only by `GET /coord/devices/me/drain` (and a `me/release`
+        /// answer's `read_back`). `None` both before that read lands and when
+        /// the operator gave no reason; [`current_with_reason_read`] tells the
+        /// two apart.
         reason: Option<String>,
     },
     Unknown {
@@ -461,6 +463,11 @@ pub struct Transition {
 pub struct DrainTracker {
     state: CoordDrainState,
     misses: u32,
+    /// The `until` of the drain whose reason a `me/drain` read has supplied
+    /// ([`Self::observe_read`]), so a `reason: None` under it means "the
+    /// operator gave none" rather than "not read yet". Cleared by [`Self::set`]
+    /// whenever the state leaves `Drained` or its `until` moves.
+    reason_read_for: Option<Option<DateTime<Utc>>>,
 }
 
 impl DrainTracker {
@@ -472,11 +479,22 @@ impl DrainTracker {
                 cause: "coord drain state not read yet".to_string(),
             },
             misses: 0,
+            reason_read_for: None,
         }
     }
 
     pub fn state(&self) -> &CoordDrainState {
         &self.state
+    }
+
+    /// Whether the current state is `Drained` and a `me/drain` read has
+    /// supplied the reason for THIS drain (same `until`) — so its `reason` is
+    /// what coord serves, including `None` for a drain given no reason.
+    pub fn reason_read(&self) -> bool {
+        matches!(
+            &self.state,
+            CoordDrainState::Drained { until, .. } if self.reason_read_for == Some(*until)
+        )
     }
 
     fn unknown_since(&self, now: DateTime<Utc>) -> DateTime<Utc> {
@@ -495,6 +513,9 @@ impl DrainTracker {
             (_, CoordDrainState::Drained { .. }) => true,
             _ => false,
         };
+        if entered_drained || !matches!(next, CoordDrainState::Drained { .. }) {
+            self.reason_read_for = None;
+        }
         let changed = self.state != next;
         self.state = next;
         Transition {
@@ -536,6 +557,18 @@ impl DrainTracker {
             DrainObservation::NotEnrolled { why } => CoordDrainState::NotEnrolled { why },
         };
         self.set(next)
+    }
+
+    /// Fold one successful `me/drain` read: [`Self::observe`], and — when the
+    /// folded state is `Drained` — record that this drain's reason has been
+    /// read. The register heartbeat never carries `reason`, so it folds through
+    /// plain [`Self::observe`] and leaves the mark alone.
+    pub fn observe_read(&mut self, obs: DrainObservation, now: DateTime<Utc>) -> Transition {
+        let t = self.observe(obs, now);
+        if let CoordDrainState::Drained { until, .. } = &self.state {
+            self.reason_read_for = Some(*until);
+        }
+        t
     }
 
     /// Fold one FAILED read (heartbeat error, me/drain transport failure).
@@ -686,9 +719,25 @@ fn current_locked(inner: &Inner) -> CoordDrainState {
 
 /// The current state. Cheap and synchronous: one mutex, no I/O.
 pub fn current() -> CoordDrainState {
-    let (state, emit) = {
+    current_and(|_| ()).0
+}
+
+/// [`current`] plus whether its reason has been read
+/// ([`DrainTracker::reason_read`]): `true` only for a `Drained` state whose
+/// `me/drain` read has landed, so its `reason: None` means the operator gave
+/// none. Both come from ONE lock, so the flag always describes the state
+/// returned beside it.
+pub(crate) fn current_with_reason_read() -> (CoordDrainState, bool) {
+    current_and(|inner| inner.tracker.reason_read())
+}
+
+/// The current state and `also(inner)`, read under one lock, emitting a
+/// staleness flip a reader observed.
+fn current_and<T>(also: impl FnOnce(&Inner) -> T) -> (CoordDrainState, T) {
+    let (state, extra, emit) = {
         let mut inner = lock_inner();
         let state = current_locked(&inner);
+        let extra = also(&inner);
         let emit = inner.last_emitted.as_ref() != Some(&state) && inner.last_emitted.is_some();
         if emit {
             inner.last_emitted = Some(state.clone());
@@ -697,14 +746,14 @@ pub fn current() -> CoordDrainState {
                 inner.deferred_capped = false;
             }
         }
-        (state, emit)
+        (state, extra, emit)
     };
     if emit {
         // A staleness flip observed by a reader, not by a fold.
         global().tx.send_replace(state.clone());
         emit_snapshot();
     }
-    state
+    (state, extra)
 }
 
 /// Everything the UI and `/restart-readiness` render.
@@ -1148,18 +1197,22 @@ fn device_client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("reqwest builder: {e}"))
 }
 
-/// The device-JWT seam for this module's `me/drain` read, the heartbeat's and the
-/// account hold's alike. The account hold's writes (plan
-/// `2026-11-03-a-runner-with-no-logged-in-claude-account-keeps-an-open-agent-lane-so-coord-burns-spawns-on-it`,
-/// Phase 3) go through [`post_device_json`] instead, under the heartbeat's
-/// bearer scope.
-fn device_request(
-    client: &reqwest::Client,
-    method: reqwest::Method,
-    url: &str,
-) -> reqwest::RequestBuilder {
-    // coord-tenant-scope(device): only the `me/drain` READ is sent through here; it answers for the device the JWT was minted for and carries no tenant to set. The self-hold writes go through `post_device_json` under the heartbeat's bearer scope instead.
-    crate::auth::attach_device_auth(client.request(method, url))
+/// The bearer scope this module's device-level coord calls present: the one the
+/// register heartbeat presents ([`crate::fleet::LocalBindingSet::bearer_scope`]).
+/// The `me/drain` read and the account hold's `me/hold` / `me/release` writes all
+/// go out under it, so a device whose binding set came from the per-tenant slots
+/// (its legacy slot dead or empty) sends a live per-tenant token rather than
+/// none. With no binding set resolvable the default binding is the only choice
+/// left.
+fn heartbeat_bearer_scope() -> crate::auth::TenantScope {
+    heartbeat_bearer_scope_with(&crate::fleet::BindingSources::production())
+}
+
+/// [`heartbeat_bearer_scope`] over injected binding sources.
+fn heartbeat_bearer_scope_with(src: &crate::fleet::BindingSources<'_>) -> crate::auth::TenantScope {
+    crate::fleet::resolve_heartbeat_binding_set_with(src)
+        .map(|b| b.bearer_scope())
+        .unwrap_or(crate::auth::TenantScope::Device)
 }
 
 /// `GET {base}/coord/devices/me/drain` → an observation, or the failure cause.
@@ -1168,10 +1221,15 @@ async fn read_me_drain(base: &str) -> Result<DrainObservation, String> {
 }
 
 /// [`read_me_drain`] keeping the `dispatch_role` coord serves beside the drain.
+///
+/// Presented under [`heartbeat_bearer_scope`]. coord answers `me/drain` for the
+/// DEVICE the JWT names, over every tenant's drain map, so the scope decides only
+/// which credential authenticates the read, never which drain it returns (plan
+/// `2026-11-05-account-hold-me-drain-read-uses-the-dead-default-binding-and-re-reads-a-reasonless-drain`).
 pub(crate) async fn read_me_drain_with_role(base: &str) -> Result<MeDrainRead, String> {
     let url = format!("{}/coord/devices/me/drain", base.trim_end_matches('/'));
     let client = device_client()?;
-    let resp = device_request(&client, reqwest::Method::GET, &url)
+    let resp = crate::auth::attach_device_auth_for(client.get(&url), heartbeat_bearer_scope())
         .send()
         .await
         .map_err(|e| format!("GET {url}: {e}"))?;
@@ -1206,16 +1264,10 @@ async fn send_device_json(
 /// `me/hold` and `me/release`.
 ///
 /// coord writes a self-hold into the drain map of the bearer's TENANT, so the
-/// bearer is the one the heartbeat presents ([`crate::fleet::LocalBindingSet::bearer_scope`]):
-/// the hold lands in the tenant the heartbeat reports the lane under, and a
-/// device whose legacy slot is dead still sends a live per-tenant token. With
-/// no binding set resolvable the default binding is the only choice left.
-///
-/// Limit: the `me/drain` read the account hold makes before every write still
-/// goes out under the default binding ([`device_request`]), so on a device whose
-/// legacy slot is dead the read fails and no write is reached. That read is
-/// shared with the heartbeat and pinned by `tests/coord_auth_pin.rs`; moving it
-/// is its own change.
+/// bearer is [`heartbeat_bearer_scope`]: the hold lands in the tenant the
+/// heartbeat reports the lane under, and a device whose legacy slot is dead still
+/// sends a live per-tenant token. The `me/drain` read the hold makes before every
+/// write goes out under the same scope ([`read_me_drain_with_role`]).
 pub(crate) async fn post_device_json(
     base: &str,
     path: &str,
@@ -1223,11 +1275,10 @@ pub(crate) async fn post_device_json(
 ) -> Result<(u16, String), String> {
     let url = format!("{}{path}", base.trim_end_matches('/'));
     let client = device_client()?;
-    let scope = crate::fleet::resolve_heartbeat_binding_set()
-        .map(|b| b.bearer_scope())
-        .unwrap_or(crate::auth::TenantScope::Device);
-    let rb =
-        crate::auth::attach_device_auth_for(client.request(reqwest::Method::POST, &url), scope);
+    let rb = crate::auth::attach_device_auth_for(
+        client.request(reqwest::Method::POST, &url),
+        heartbeat_bearer_scope(),
+    );
     send_device_json(rb, &url, body).await
 }
 
@@ -1253,8 +1304,11 @@ pub(crate) async fn post_device_json_for_tenant(
 /// Fold one successful `me/drain` read made outside the heartbeat (the account
 /// hold re-reads after each of its writes, so the cached state and the banner
 /// follow the write at once rather than a heartbeat later).
+///
+/// A me/drain read (or a release's `read_back`, which coord builds from the same
+/// drain wire) carries the reason, so it marks this drain's reason as read.
 pub(crate) fn observe_me_drain(obs: DrainObservation) {
-    fold(|tr, now| tr.observe(obs, now));
+    fold(|tr, now| tr.observe_read(obs, now));
 }
 
 /// Fold one heartbeat tick's result. Reads `me/drain` when the tick shows a
@@ -1270,7 +1324,7 @@ pub async fn note_heartbeat(outcome: HeartbeatOutcome) {
         HeartbeatOutcome::NotSent { why } => match enrollment() {
             Enrollment::Enrolled(base) => match read_me_drain(&base).await {
                 Ok(obs) => {
-                    fold(|tr, now| tr.observe(obs, now));
+                    fold(|tr, now| tr.observe_read(obs, now));
                 }
                 Err(e) => {
                     fold(|tr, now| tr.miss(&format!("{why}; me/drain: {e}"), now));
@@ -1302,7 +1356,7 @@ async fn refresh_reason() {
     };
     match read_me_drain(&base).await {
         Ok(obs @ (DrainObservation::Drained { .. } | DrainObservation::Clear)) => {
-            fold(|tr, now| tr.observe(obs, now));
+            fold(|tr, now| tr.observe_read(obs, now));
         }
         Ok(other) => debug!("coord_drain_state: me/drain reason read answered {other:?}; kept the heartbeat's state"),
         Err(e) => debug!("coord_drain_state: me/drain reason read failed ({e}); kept the heartbeat's state"),
@@ -1321,7 +1375,7 @@ pub async fn boot_read() {
     match enrollment() {
         Enrollment::Enrolled(base) => match read_me_drain(&base).await {
             Ok(obs) => {
-                fold(|tr, now| tr.observe(obs, now));
+                fold(|tr, now| tr.observe_read(obs, now));
             }
             Err(e) => {
                 fold(|tr, now| tr.miss(&format!("boot read: {e}"), now));
@@ -1861,5 +1915,198 @@ mod tests {
         // A stale slot (already past) does not hold anything back.
         let later = t0 + Duration::from_secs(60);
         assert_eq!(next_release_slot(later, Some(t0), spacing, jitter), later);
+    }
+
+    // -----------------------------------------------------------------------
+    // The bearer of this module's device-level calls (plan
+    // 2026-11-05-account-hold-me-drain-read-uses-the-dead-default-binding-and-re-reads-a-reasonless-drain)
+    // -----------------------------------------------------------------------
+
+    fn tenant(n: u128) -> uuid::Uuid {
+        uuid::Uuid::from_u128(n)
+    }
+
+    /// The binding set came from the per-tenant slots (no file, the legacy slot
+    /// empty or dead): the default's own slot, never the dead legacy one.
+    #[test]
+    fn the_bearer_is_the_default_tenants_slot_when_the_set_came_from_the_tenant_slots() {
+        for legacy in [None, Some((tenant(9), false))] {
+            let legacy_fn = move || legacy;
+            let scope = heartbeat_bearer_scope_with(&crate::fleet::BindingSources {
+                file: &|| None,
+                legacy: &legacy_fn,
+                slots: &|| Some(vec![tenant(4), tenant(5)]),
+                bound: &|| qontinui_runner_lib::pair::CoordBoundTenantsRead::Unknown("unrecorded"),
+                active: &|| None,
+            });
+            assert_eq!(
+                scope,
+                crate::auth::TenantScope::Owned(tenant(5)),
+                "{legacy:?}"
+            );
+        }
+    }
+
+    /// `paired_user.json` or the legacy slot's claim answered: the legacy slot
+    /// can answer, so the default binding (`Device`); and with no source at all
+    /// the default binding is the only choice left.
+    #[test]
+    fn the_bearer_is_the_default_binding_for_the_file_the_legacy_claim_and_no_source() {
+        let file = crate::fleet::BindingSources {
+            file: &|| Some((tenant(1), vec![tenant(1), tenant(2)])),
+            legacy: &|| None,
+            slots: &|| panic!("the slots are not read when the file answers"),
+            bound: &|| panic!("the bound set is not read when the file answers"),
+            active: &|| panic!("the active tenant is not read when the file answers"),
+        };
+        assert_eq!(
+            heartbeat_bearer_scope_with(&file),
+            crate::auth::TenantScope::Device,
+            "PairedUserFile"
+        );
+        for legacy in [(tenant(3), true), (tenant(3), false)] {
+            let legacy_fn = move || Some(legacy);
+            let scope = heartbeat_bearer_scope_with(&crate::fleet::BindingSources {
+                file: &|| None,
+                legacy: &legacy_fn,
+                slots: &|| None,
+                bound: &|| qontinui_runner_lib::pair::CoordBoundTenantsRead::Unknown("unrecorded"),
+                active: &|| None,
+            });
+            assert_eq!(
+                scope,
+                crate::auth::TenantScope::Device,
+                "LegacySlotClaim {legacy:?}"
+            );
+        }
+        let nothing = crate::fleet::BindingSources {
+            file: &|| None,
+            legacy: &|| None,
+            slots: &|| None,
+            bound: &|| qontinui_runner_lib::pair::CoordBoundTenantsRead::Unknown("unrecorded"),
+            active: &|| None,
+        };
+        assert_eq!(
+            heartbeat_bearer_scope_with(&nothing),
+            crate::auth::TenantScope::Device,
+            "no binding set"
+        );
+    }
+
+    /// The fake coord in the account hold's tests does not check
+    /// `Authorization`, so this pins the wiring: the `me/drain` read and the
+    /// hold's writes both present [`heartbeat_bearer_scope`], and neither goes
+    /// through the defaulting `attach_device_auth`.
+    #[test]
+    fn the_me_drain_read_and_the_hold_writes_present_the_heartbeat_bearer() {
+        let src = include_str!("coord_drain_state.rs");
+        let body_of = |sig: &str| -> &str {
+            let at = src.find(sig).unwrap_or_else(|| panic!("`{sig}` not found"));
+            let rest = src.get(at..).expect("a char boundary");
+            let end = rest.find("\n}\n").expect("the fn's closing brace");
+            rest.get(..end).expect("a char boundary")
+        };
+        for sig in [
+            "pub(crate) async fn read_me_drain_with_role(",
+            "pub(crate) async fn post_device_json(",
+        ] {
+            let body = body_of(sig);
+            assert!(
+                body.contains("attach_device_auth_for(")
+                    && body.contains("heartbeat_bearer_scope()"),
+                "`{sig}` must present heartbeat_bearer_scope() through attach_device_auth_for:\n{body}"
+            );
+            assert!(
+                !body.contains("attach_device_auth("),
+                "`{sig}` must not take the defaulting attach_device_auth:\n{body}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Whether a drain's reason has been read
+    // -----------------------------------------------------------------------
+
+    fn drained(until: Option<DateTime<Utc>>, reason: Option<&str>) -> DrainObservation {
+        DrainObservation::Drained {
+            until,
+            reason: reason.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_drain_folded_only_from_the_heartbeat_has_no_reason_read() {
+        let mut tr = DrainTracker::new(t0());
+        assert!(!tr.reason_read(), "the boot state");
+        let until = Some(t0() + chrono::Duration::hours(2));
+        tr.observe(drained(until, None), t0());
+        assert!(
+            !tr.reason_read(),
+            "the register heartbeat carries no reason"
+        );
+    }
+
+    #[test]
+    fn a_me_drain_read_marks_the_reason_read_with_or_without_a_reason() {
+        let until = Some(t0() + chrono::Duration::hours(2));
+        for reason in [None, Some("operator: disk replacement")] {
+            let mut tr = DrainTracker::new(t0());
+            tr.observe(drained(until, None), t0());
+            tr.observe_read(drained(until, reason), t0());
+            assert!(tr.reason_read(), "{reason:?}");
+            assert!(matches!(
+                tr.state(),
+                CoordDrainState::Drained { reason: r, .. } if r.as_deref() == reason
+            ));
+        }
+        // A read that is the first fold of the drain marks it too.
+        let mut tr = DrainTracker::new(t0());
+        tr.observe_read(drained(None, None), t0());
+        assert!(tr.reason_read(), "an open-ended drain");
+    }
+
+    #[test]
+    fn a_register_heartbeat_of_the_same_drain_keeps_the_mark() {
+        let until = Some(t0() + chrono::Duration::hours(2));
+        let mut tr = DrainTracker::new(t0());
+        tr.observe_read(drained(until, None), t0());
+        tr.observe(drained(until, None), t0());
+        assert!(tr.reason_read());
+    }
+
+    #[test]
+    fn a_moved_until_or_a_cleared_drain_forgets_the_mark() {
+        let until = Some(t0() + chrono::Duration::hours(2));
+        let mut tr = DrainTracker::new(t0());
+        tr.observe_read(drained(until, None), t0());
+        tr.observe(drained(Some(t0() + chrono::Duration::hours(3)), None), t0());
+        assert!(!tr.reason_read(), "the until moved: a different drain");
+
+        let mut tr = DrainTracker::new(t0());
+        tr.observe_read(drained(until, None), t0());
+        tr.observe(DrainObservation::Clear, t0());
+        tr.observe(drained(until, None), t0());
+        assert!(
+            !tr.reason_read(),
+            "cleared then re-drained with the SAME until: a new drain, unread"
+        );
+    }
+
+    #[test]
+    fn a_miss_keeps_the_mark_until_the_one_that_turns_the_state_unknown() {
+        let until = Some(t0() + chrono::Duration::hours(2));
+        let mut tr = DrainTracker::new(t0());
+        tr.observe_read(drained(until, None), t0());
+        for _ in 1..MISSED_HEARTBEATS_TO_UNKNOWN {
+            tr.miss("x", t0());
+            assert!(tr.reason_read(), "a miss below the threshold");
+        }
+        tr.miss("x", t0());
+        assert!(matches!(tr.state(), CoordDrainState::Unknown { .. }));
+        assert!(!tr.reason_read());
+        // The same drain observed again by the heartbeat reads unread again.
+        tr.observe(drained(until, None), t0());
+        assert!(matches!(tr.state(), CoordDrainState::Drained { .. }));
+        assert!(!tr.reason_read(), "the Unknown in between forgot the read");
     }
 }
