@@ -65,12 +65,13 @@ permissions:
 # same main and re-plans from its current state, so a replaced pending run lost
 # nothing. cancel-in-progress: false, so an admitted scan is never killed
 # mid-push. pull_request and workflow_dispatch runs (including the dispatches
-# `detect` issues) get a unique per-run group, so their behaviour is unchanged.
+# `detect` issues) and EVERY re-run (run_attempt > 1, so an operator's re-run of
+# a schedule run is never replaced by the next tick) get a unique per-run group.
 # One expression, so coord models it as "" (never reaper-at-risk) — see
 # schema-pg-sql-freshness-nightly.yml. Plan:
 # qontinui-dev-notes plans/2026-11-05-devops-runner-schemas-pair-follow-cron-stacks-a-queued-run-per-tick.md
 concurrency:
-  group: ${{ github.event_name == 'schedule' && format('{0}-schedule', github.workflow) || format('{0}-run-{1}-{2}', github.workflow, github.run_id, github.run_attempt) }}
+  group: ${{ (github.event_name == 'schedule' && github.run_attempt == 1) && format('{0}-schedule', github.workflow) || format('{0}-run-{1}-{2}', github.workflow, github.run_id, github.run_attempt) }}
   cancel-in-progress: false
 
 jobs:
