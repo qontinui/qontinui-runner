@@ -535,28 +535,37 @@ mod tests {
     const ALLOC: usize = FLOOR + 64 * 1024 * 1024;
 
     /// Allocate and TOUCH 320 MiB (nonzero bytes, so the pages are anonymous
-    /// and resident), and the reader against `/proc/self` must see ≥ 256 MiB.
+    /// and resident), and the reader against `/proc/self` must see at least
+    /// 256 MiB of private bytes while the buffer is held. An ABSOLUTE floor,
+    /// not a before/after delta: a sibling test freeing its own allocation
+    /// between two readings could otherwise red a delta check under libtest's
+    /// shared-process threads.
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_own_private_bytes_rise_by_the_allocation() {
+    fn linux_own_private_bytes_cover_the_allocation() {
         let me = std::process::id();
-        let read = || {
-            read_proc_dir(std::path::Path::new("/proc/self"), me, None, None)
-                .expect("/proc/self/status must be readable")
-                .private_bytes
-        };
-        let before = read();
         let buf = vec![0xA5u8; ALLOC];
         std::hint::black_box(&buf);
-        let after = read();
+        let held = read_proc_dir(std::path::Path::new("/proc/self"), me, None, None)
+            .expect("/proc/self/status must be readable")
+            .private_bytes;
         assert!(
-            after.saturating_sub(before) >= FLOOR as u64,
-            "private bytes rose {} → {} (Δ {}), expected ≥ {FLOOR}",
-            before,
-            after,
-            after.saturating_sub(before)
+            held >= FLOOR as u64,
+            "own private bytes {held} < {FLOOR} while holding {ALLOC}"
         );
-        // And the full collector, uncapped, names this process.
+        drop(buf);
+    }
+
+    /// The population's own door: the uncapped collector, and nothing below
+    /// it, must name this process with the allocation it holds and a start
+    /// time. Enters only through `collect_top`, so a regression anywhere in
+    /// the `/proc` walk, the status/stat parsing or the btime read reds it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_collector_names_this_process_with_its_allocation() {
+        let me = std::process::id();
+        let buf = vec![0x5Au8; ALLOC];
+        std::hint::black_box(&buf);
         let all = collect_top(usize::MAX).expect("the /proc scan must succeed");
         assert!(all.scanned > 0);
         let mine = all
@@ -564,7 +573,11 @@ mod tests {
             .iter()
             .find(|r| r.pid == me)
             .expect("own pid must appear in the uncapped collector output");
-        assert!(mine.private_bytes >= FLOOR as u64);
+        assert!(
+            mine.private_bytes >= FLOOR as u64,
+            "own private bytes {} < {FLOOR} while holding {ALLOC}",
+            mine.private_bytes
+        );
         assert!(
             mine.started_at.is_some(),
             "started_at must resolve from /proc stat + btime"
