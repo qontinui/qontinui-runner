@@ -71,6 +71,11 @@ describe("readOccupiedPageIds (fail-closed occupancy)", () => {
     expect(await readOccupiedPageIds(true)).toEqual(new Set(["b"]));
   });
 
+  it("returns null while a device drain withholds the restore set", async () => {
+    answer(okTerminals("a"), { data: { sessions: [], deferredByDrain: { state: "drained" } } });
+    expect(await readOccupiedPageIds()).toBeNull();
+  });
+
   it("an empty but well-formed read is an empty set, not null", async () => {
     answer(okTerminals(), okSessions());
     expect(await readOccupiedPageIds()).toEqual(new Set());
@@ -259,6 +264,25 @@ describe("pageRemoval (record-only removal of empty pages)", () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "terminal_list") return { success: true, data: { terminals: [] } };
       throw new Error("session list unreadable");
+    });
+    const { dropped, store: s } = store();
+    expect(await pageRemoval(s).removeEmptyPage("b")).toBe(false);
+    expect(dropped).toEqual([]);
+  });
+
+  it("keeps a page while a device drain withholds the restore set", async () => {
+    // A drained (or drain-UNKNOWN) runner answers `sessions: []` beside
+    // `deferredByDrain`: empty by deferral, not by count. "b" may hold only
+    // withheld restore records, so its emptiness is UNKNOWN.
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "terminal_list") return { success: true, data: { terminals: [] } };
+      if (cmd === "terminal_session_list_open") {
+        return {
+          success: true,
+          data: { sessions: [], deferredByDrain: { state: "unknown", reason: "drain unknown" } },
+        };
+      }
+      throw new Error(`unexpected ${cmd}`);
     });
     const { dropped, store: s } = store();
     expect(await pageRemoval(s).removeEmptyPage("b")).toBe(false);
