@@ -87,7 +87,7 @@ fn read_limit_stop(path: &Path) -> (LimitStopRead, ReadSpan) {
         Ok(f) => f,
         Err(e) => {
             return (
-                unreadable(format!("cannot open transcript: {e}")),
+                LimitStopRead::Unreadable(format!("cannot open transcript: {e}")),
                 ReadSpan::Whole,
             )
         }
@@ -96,17 +96,20 @@ fn read_limit_stop(path: &Path) -> (LimitStopRead, ReadSpan) {
         Ok(m) => m.len(),
         Err(e) => {
             return (
-                unreadable(format!("cannot stat transcript: {e}")),
+                LimitStopRead::Unreadable(format!("cannot stat transcript: {e}")),
                 ReadSpan::Whole,
             )
         }
     };
 
     if len > TAIL_BYTES {
-        match read_from(&mut file, len - TAIL_BYTES) {
+        // Read one byte before the tail too, to tell whether the tail starts
+        // on a line boundary.
+        match read_from(&mut file, len - TAIL_BYTES - 1) {
             Ok(bytes) => {
-                // The tail almost always starts mid-line: drop the partial
-                // first line, which cannot be parsed and is not the end.
+                // Skip through the first newline: when the byte before the
+                // tail is `\n` that drops only that byte; otherwise it drops
+                // the partial first line, which cannot be parsed.
                 let start = bytes
                     .iter()
                     .position(|&b| b == b'\n')
@@ -119,7 +122,7 @@ fn read_limit_stop(path: &Path) -> (LimitStopRead, ReadSpan) {
             }
             Err(e) => {
                 return (
-                    unreadable(format!("cannot read transcript tail: {e}")),
+                    LimitStopRead::Unreadable(format!("cannot read transcript tail: {e}")),
                     ReadSpan::Tail,
                 )
             }
@@ -130,14 +133,14 @@ fn read_limit_stop(path: &Path) -> (LimitStopRead, ReadSpan) {
         Ok(b) => b,
         Err(e) => {
             return (
-                unreadable(format!("cannot read transcript: {e}")),
+                LimitStopRead::Unreadable(format!("cannot read transcript: {e}")),
                 ReadSpan::Whole,
             )
         }
     };
     if bytes.iter().all(u8::is_ascii_whitespace) {
         return (
-            unreadable("transcript is empty".to_string()),
+            LimitStopRead::Unreadable("transcript is empty".to_string()),
             ReadSpan::Whole,
         );
     }
@@ -148,10 +151,6 @@ fn read_limit_stop(path: &Path) -> (LimitStopRead, ReadSpan) {
         Decision::NoConversation => LimitStopRead::NotStopped,
     };
     (read, ReadSpan::Whole)
-}
-
-fn unreadable(why: String) -> LimitStopRead {
-    LimitStopRead::Unreadable(why)
 }
 
 fn read_from(file: &mut File, offset: u64) -> std::io::Result<Vec<u8>> {
@@ -168,12 +167,19 @@ enum Decision {
 
 /// Walk `bytes` from the end and decide on the last conversational entry.
 fn decide(bytes: &[u8]) -> Decision {
-    let text = match std::str::from_utf8(bytes) {
-        Ok(t) => t,
-        Err(e) => return Decision::Decided(unreadable(format!("transcript is not UTF-8: {e}"))),
-    };
-    for (from_end, line) in text.lines().rev().enumerate() {
-        let line = line.trim();
+    // Lines are decoded one at a time, as they are visited: a bad byte above
+    // the deciding entry does not make the read UNKNOWN, one at or below it
+    // does.
+    for (from_end, raw) in bytes.split(|&b| b == b'\n').rev().enumerate() {
+        let line = match std::str::from_utf8(raw) {
+            Ok(l) => l.trim(),
+            Err(e) => {
+                return Decision::Decided(LimitStopRead::Unreadable(format!(
+                    "transcript line {} from the end is not UTF-8: {e}",
+                    from_end + 1
+                )))
+            }
+        };
         if line.is_empty() {
             continue;
         }
@@ -182,7 +188,7 @@ fn decide(bytes: &[u8]) -> Decision {
             // A line that does not parse may be the entry that decides (a
             // truncated final write, a corrupt record): that is UNKNOWN.
             Err(e) => {
-                return Decision::Decided(unreadable(format!(
+                return Decision::Decided(LimitStopRead::Unreadable(format!(
                     "transcript line {} from the end does not parse: {e}",
                     from_end + 1
                 )))
@@ -216,7 +222,7 @@ fn classify(entry: &Value) -> LimitStopRead {
     }
     let Some(entry_uuid) = entry.get("uuid").and_then(Value::as_str) else {
         // A stop with no identity cannot be continued exactly once.
-        return unreadable("usage-limit stop entry carries no uuid".to_string());
+        return LimitStopRead::Unreadable("usage-limit stop entry carries no uuid".to_string());
     };
     let quota = entry.get("quotaLimits");
     let resets_at_ms = quota
@@ -358,6 +364,89 @@ mod tests {
         assert_eq!(read(&body), LimitStopRead::NotStopped);
     }
 
+    /// The seven-day fixture's usage-limit error entry, for single-field edits.
+    fn seven_day_error_entry() -> Value {
+        let line = SEVEN_DAY_STOP
+            .lines()
+            .find(|l| l.contains("usage_limit_reached"))
+            .unwrap();
+        serde_json::from_str(line).unwrap()
+    }
+
+    #[test]
+    fn a_limit_error_not_flagged_as_an_api_error_is_not_stopped() {
+        let mut entry = seven_day_error_entry();
+        entry["isApiErrorMessage"] = Value::Bool(false);
+        assert_eq!(read(&format!("{entry}\n")), LimitStopRead::NotStopped);
+        entry.as_object_mut().unwrap().remove("isApiErrorMessage");
+        assert_eq!(read(&format!("{entry}\n")), LimitStopRead::NotStopped);
+    }
+
+    #[test]
+    fn a_user_entry_carrying_the_limit_fields_is_not_stopped() {
+        let mut entry = seven_day_error_entry();
+        entry["type"] = Value::String("user".to_string());
+        assert_eq!(read(&format!("{entry}\n")), LimitStopRead::NotStopped);
+    }
+
+    /// A stop with no `uuid` cannot be continued exactly once: UNKNOWN.
+    #[test]
+    fn a_limit_stop_without_a_uuid_is_unreadable() {
+        let mut entry = seven_day_error_entry();
+        entry.as_object_mut().unwrap().remove("uuid");
+        assert_eq!(
+            read(&format!("{entry}\n")),
+            LimitStopRead::Unreadable("usage-limit stop entry carries no uuid".to_string())
+        );
+    }
+
+    #[test]
+    fn a_limit_stop_without_quota_limits_has_no_reset_time() {
+        let mut entry = seven_day_error_entry();
+        entry.as_object_mut().unwrap().remove("quotaLimits");
+        assert_eq!(
+            read(&format!("{entry}\n")),
+            LimitStopRead::Stopped(LimitStop {
+                entry_uuid: SEVEN_DAY_UUID.to_string(),
+                resets_at_ms: None,
+                rate_limit_type: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_fractional_or_non_numeric_reset_time() {
+        let mut entry = seven_day_error_entry();
+        entry["quotaLimits"]["resetsAt"] = serde_json::json!(1_793_736_000.0);
+        assert!(matches!(
+            read(&format!("{entry}\n")),
+            LimitStopRead::Stopped(LimitStop {
+                resets_at_ms: Some(SEVEN_DAY_RESETS_AT_MS),
+                ..
+            })
+        ));
+        entry["quotaLimits"]["resetsAt"] = Value::String("soon".to_string());
+        assert!(matches!(
+            read(&format!("{entry}\n")),
+            LimitStopRead::Stopped(LimitStop {
+                resets_at_ms: None,
+                ..
+            })
+        ));
+    }
+
+    /// A bad byte above the deciding entry does not make the read UNKNOWN.
+    #[test]
+    fn a_non_utf8_line_above_the_deciding_entry_is_not_read() {
+        let mut body = b"{\"type\":\"user\",\"x\":\"\xff\"}\n".to_vec();
+        body.extend_from_slice(SEVEN_DAY_STOP.as_bytes());
+        let f = write_transcript(&body);
+        assert!(matches!(
+            transcript_limit_stop(f.path()),
+            LimitStopRead::Stopped(ref s) if s.entry_uuid == SEVEN_DAY_UUID
+        ));
+    }
+
     #[test]
     fn an_empty_file_is_unreadable() {
         assert!(matches!(read(""), LimitStopRead::Unreadable(_)));
@@ -422,6 +511,31 @@ mod tests {
         assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
     }
 
+    /// A tail that starts exactly on a line boundary keeps its first line.
+    #[test]
+    fn a_tail_starting_on_a_line_boundary_keeps_its_first_line() {
+        let pad = format!(
+            "{{\"type\":\"cost-state\",\"pad\":\"{}\"}}\n",
+            "y".repeat(1024)
+        );
+        let mut prefix = String::new();
+        while prefix.len() < 4096 {
+            prefix.push_str(&pad);
+        }
+        // The deciding entry alone, padded with trailing spaces so the whole
+        // tail is exactly TAIL_BYTES and starts at its first byte.
+        let entry = seven_day_error_entry().to_string();
+        let tail = format!(
+            "{entry}{}\n",
+            " ".repeat(TAIL_BYTES as usize - entry.len() - 1)
+        );
+        assert_eq!(tail.len() as u64, TAIL_BYTES);
+        let f = write_transcript(format!("{prefix}{tail}").as_bytes());
+        let (read, span) = read_limit_stop(f.path());
+        assert_eq!(span, ReadSpan::Tail);
+        assert!(matches!(read, LimitStopRead::Stopped(ref s) if s.entry_uuid == SEVEN_DAY_UUID));
+    }
+
     /// A tail of nothing but bookkeeping falls back to the whole file.
     #[test]
     fn a_tail_with_no_conversation_falls_back_to_the_whole_file() {
@@ -433,6 +547,10 @@ mod tests {
         while (body.len() as u64) < TAIL_BYTES * 2 {
             body.push_str(&pad);
         }
+        // The tail offset lands inside a pad line, so the partial-line drop
+        // is exercised by construction, not by chance.
+        let offset = body.len() - TAIL_BYTES as usize;
+        assert_ne!(body.as_bytes()[offset - 1], b'\n');
         let f = write_transcript(body.as_bytes());
         let (read, span) = read_limit_stop(f.path());
         assert_eq!(span, ReadSpan::Whole);
