@@ -122,11 +122,15 @@ export function TerminalPageTabBar({
     setRenameError(null);
   };
 
-  const commitRename = () => {
+  /**
+   * Commit the edit. A refused name never commits a second tab with the same
+   * label: on Enter the input stays open with the reason; on blur (the
+   * operator clicked away) the edit is dropped and the old name kept, so the
+   * input cannot trap focus-less on the strip.
+   */
+  const commitRename = (onRefused: "keep-open" | "revert") => {
     if (editingId && editValue.trim()) {
-      // A refused name keeps the input open with the reason, rather than
-      // silently committing a second tab with the same label.
-      if (onRenamePage(editingId, editValue.trim()) === false) {
+      if (onRenamePage(editingId, editValue.trim()) === false && onRefused === "keep-open") {
         setRenameError(NAME_IN_USE);
         return;
       }
@@ -186,10 +190,10 @@ export function TerminalPageTabBar({
                     setEditValue(e.target.value);
                     setRenameError(null);
                   }}
-                  onBlur={commitRename}
+                  onBlur={() => commitRename("revert")}
                   onKeyDown={(e) => {
                     e.stopPropagation();
-                    if (e.key === "Enter") commitRename();
+                    if (e.key === "Enter") commitRename("keep-open");
                     if (e.key === "Escape") cancelRename();
                   }}
                   aria-invalid={renameError !== null}

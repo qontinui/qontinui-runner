@@ -5,7 +5,9 @@
  * §Why). Shared by the Phase 5 naming tests and the Phase 6 prune/repair tests,
  * so it lives in its own module rather than in one test file.
  *
- * MEASURED (carried literally):
+ * MEASURED — per finding `8c9e1419` as re-read for the plan's §Why on
+ * 2026-11-05 (this module carries the plan's figures; it did not re-read the
+ * store itself):
  * - 40 persisted pages; the backend reports 22 occupied pages.
  * - Two pages named "Terminal": `default`, and `3e86a8ae` (empty, created
  *   2026-10-06T23:39Z by the no-visible-page fallback).
