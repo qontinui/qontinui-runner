@@ -1410,12 +1410,19 @@ pub mod coord {
         Option::<String>::deserialize(d).map(Some)
     }
 
-    /// Page size requested per walk step — coord's own clamp ceiling. A
-    /// pre-cursor coord honours `?limit=` too, so this is also the cap an old
-    /// coord's single page is compared against.
-    pub const PAGE_LIMIT: u32 = 500;
+    /// Page size requested per walk step. A pre-cursor coord honours
+    /// `?limit=` too, so this is also the cap an old coord's single page is
+    /// compared against.
+    ///
+    /// 100, not coord's 500-row clamp ceiling: a 500-row page measured 16-23 s
+    /// on a large tenant (coord finding bc41a3df-4657-43be-a971-06b6b4813f27),
+    /// past [`REQUEST_TIMEOUT`], and a page error fails the whole walk — so
+    /// the survey got no index at all. A smaller page is meant to answer
+    /// inside the deadline (unmeasured at 100 rows), so the walk returns at
+    /// least a PARTIAL index when [`SURVEY_WALK_BUDGET`] runs out.
+    pub const PAGE_LIMIT: u32 = 100;
 
-    /// Hard bound on the walk: 100 pages x 500 rows = 50,000 ledger rows, ~35x
+    /// Hard bound on the walk: 100 pages x 100 rows = 10,000 ledger rows, ~7x
     /// the largest tenant measured (~1,360 live worktrees). Hitting it is
     /// never silent — the index comes back with [`CoordOwnership::partial`]
     /// set.
@@ -1796,7 +1803,7 @@ pub mod coord {
         };
         let (merged, partial) = walk_pages(MAX_PAGES, budget, |cursor| {
             let url = page_url(&base_url, cursor.as_deref());
-            async move { get_json::<CoordSessionWorktrees>(client, &url).await }
+            async move { get_json::<CoordSessionWorktrees>(client, &url, REQUEST_TIMEOUT).await }
         })
         .await?;
         Ok(Some(
@@ -1804,7 +1811,7 @@ pub mod coord {
         ))
     }
 
-    /// `…/coord/sessions/worktrees?limit=500[&cursor=<urlencoded>]`.
+    /// `…/coord/sessions/worktrees?limit=<PAGE_LIMIT>[&cursor=<urlencoded>]`.
     fn page_url(base_url: &str, cursor: Option<&str>) -> String {
         match cursor {
             Some(c) => format!(
@@ -1822,16 +1829,42 @@ pub mod coord {
     /// [`KEYED_CHUNK_IDS`] per request, so it never relies on that report.
     pub const KEYED_MAX_IDS: usize = 500;
 
-    /// Ids per keyed request. Below [`KEYED_MAX_IDS`] on purpose: 500 UUIDs
-    /// make a ~18.5 KB request line, past the ~16 KB that common load
-    /// balancers accept, which would turn a large candidate set into a
-    /// permanent UNKNOWN. 200 keeps the URL near 7.5 KB.
-    pub const KEYED_CHUNK_IDS: usize = 200;
+    /// Ids per keyed request. Sized by coord's measured cost, not by its
+    /// [`KEYED_MAX_IDS`] cap: the keyed read's cost grows with the id count,
+    /// measured 4.8 s at 25 ids, 10-13 s at 69 and 24-27 s at 100-200 (coord
+    /// finding bc41a3df-4657-43be-a971-06b6b4813f27). A 200-id chunk therefore ran
+    /// past the per-request deadline and left every id in it UNKNOWN; 25 keeps
+    /// one chunk near 5 s, so a slow coord costs a few chunks rather than the
+    /// whole read. (It also keeps the request line near 1 KB.)
+    pub const KEYED_CHUNK_IDS: usize = 25;
     const _: () = assert!(KEYED_CHUNK_IDS <= KEYED_MAX_IDS);
 
-    /// Per-request deadline for one session-worktrees read — a keyed chunk or
-    /// one survey page — on the shared [`crate::coord_http::coord_client`],
-    /// which carries no global timeout of its own.
+    /// Keyed chunks in flight at once. coord's cost per keyed request is
+    /// dominated by per-id ledger work, so concurrent chunks spread it across
+    /// coord's workers instead of queueing it end to end: 69 ids (3 chunks)
+    /// take about one chunk's time rather than three. Small on purpose — this
+    /// read runs on every box every tick and must not become a load source.
+    pub const KEYED_CONCURRENCY: usize = 3;
+
+    /// Per-request deadline for one KEYED chunk: about six times the 4.8 s a
+    /// 25-id chunk measured, so a loaded coord still answers inside it. The
+    /// 15 s deadline the 200-id chunk ran under was below the 24.6 s coord
+    /// took to answer it.
+    pub const KEYED_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// The keyed read's overall budget for `chunks` chunks: one
+    /// [`KEYED_REQUEST_TIMEOUT`] per wave of [`KEYED_CONCURRENCY`] chunks, plus
+    /// a little slack for scheduling. Sized to the chunk count rather than
+    /// fixed, so a large candidate set is not cut short by a budget sized for
+    /// a small one; a chunk still running when it expires is UNKNOWN.
+    pub fn keyed_budget(chunks: usize) -> Duration {
+        let waves = chunks.div_ceil(KEYED_CONCURRENCY).max(1);
+        KEYED_REQUEST_TIMEOUT * waves as u32 + Duration::from_secs(5)
+    }
+
+    /// Per-request deadline for one survey page on the shared
+    /// [`crate::coord_http::coord_client`], which carries no global timeout
+    /// of its own. The walk as a whole is bounded by its caller's budget.
     pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
     /// `"<what>: <error>: <source>: …"` — the error with its whole
@@ -1842,18 +1875,14 @@ pub mod coord {
         format!("{what}: {}", crate::util::error_chain::error_chain(e))
     }
 
-    /// GET `url` with the device bearer and [`REQUEST_TIMEOUT`], and decode a
-    /// 2xx body as `T`. Every failure is `Err` with its full cause chain.
+    /// GET `url` with the device bearer and `timeout`, and decode a 2xx body
+    /// as `T`. Every failure is `Err` with its full cause chain.
     async fn get_json<T: serde::de::DeserializeOwned>(
         client: &reqwest::Client,
         url: &str,
+        timeout: Duration,
     ) -> Result<T, String> {
-        send_json(
-            crate::coord_http::coord_get(client, url),
-            url,
-            REQUEST_TIMEOUT,
-        )
-        .await
+        send_json(crate::coord_http::coord_get(client, url), url, timeout).await
     }
 
     /// [`get_json`]'s transport half, over an already-built request — the
@@ -1939,42 +1968,69 @@ pub mod coord {
             .collect()
     }
 
+    /// Why one keyed response cannot be trusted at all, if it cannot: no
+    /// `claudeCodeSessionIds` echo (coord ignored the key), or a
+    /// `sessionBridgeColumnPresent` that is not `true`.
+    fn untrusted_keyed_response(resp: &CoordKeyedSessionWorktrees) -> Option<&'static str> {
+        if resp.claude_code_session_ids.is_none() {
+            return Some(
+                "coord answered the keyed session-worktrees read without the \
+                 `claudeCodeSessionIds` echo, so it ignored the key (a coord predating the keyed \
+                 mode serves page one of the tenant-wide walk instead): the answer is not about \
+                 these sessions",
+            );
+        }
+        if resp.session_bridge_column_present != Some(true) {
+            return Some(
+                "coord's keyed session-worktrees read does not report the claude_code_session_id \
+                 bridge column present, so no session in it can be resolved and an empty answer \
+                 is UNKNOWN, not \"no worktrees\"",
+            );
+        }
+        None
+    }
+
     /// PURE: the custody index from the keyed reads — `(ids sent, coord's
-    /// answer)` per request.
+    /// answer or why there is none)` per chunk.
     ///
-    /// A whole response that cannot be trusted is `Err` (UNKNOWN for every
-    /// session): no `claudeCodeSessionIds` echo (coord ignored the key), or a
-    /// `sessionBridgeColumnPresent` that is not `true`. Within a trusted
-    /// response, an id is answered ONLY by its own `sessions[]` entry
-    /// (`claudeCodeSessionId → sessionId`), whatever that session's state; an
-    /// id that is in `invalid`, missing from the echo (cut by
-    /// `inputTruncated`), in `unknown`, or without exactly one entry is
+    /// **A chunk fails alone.** A chunk whose request failed (transport,
+    /// timeout, non-2xx, decode) or whose response cannot be trusted
+    /// ([`untrusted_keyed_response`]) records exactly ITS ids UNKNOWN with
+    /// that reason; every other chunk's answers still count. Only when there
+    /// were chunks and EVERY one failed is the whole read `Err` (UNKNOWN for
+    /// every session, carrying the first failure).
+    ///
+    /// Within a trusted response, an id is answered ONLY by its own
+    /// `sessions[]` entry (`claudeCodeSessionId → sessionId`), whatever that
+    /// session's state; an id that is in `invalid`, missing from the echo (cut
+    /// by `inputTruncated`), in `unknown`, or without exactly one entry is
     /// recorded UNKNOWN with the reason — never "no worktrees".
     pub fn ownership_from_keyed(
-        chunks: Vec<(Vec<String>, CoordKeyedSessionWorktrees)>,
+        chunks: Vec<(Vec<String>, Result<CoordKeyedSessionWorktrees, String>)>,
     ) -> Result<CoordOwnership, String> {
         fn key(id: &str) -> String {
             id.trim().to_ascii_lowercase()
         }
+        let total = chunks.len();
+        let mut failures: Vec<String> = Vec::new();
         let mut sessions: Vec<CoordSessionRow> = Vec::new();
         let mut resolved: Vec<(String, String)> = Vec::new();
         let mut unanswered: Vec<(String, String)> = Vec::new();
-        for (sent, resp) in chunks {
-            let Some(echo) = resp.claude_code_session_ids.as_ref() else {
-                return Err(
-                    "coord answered the keyed session-worktrees read without the \
-                     `claudeCodeSessionIds` echo, so it ignored the key (a coord predating the \
-                     keyed mode serves page one of the tenant-wide walk instead): the answer is \
-                     not about these sessions"
-                        .to_string(),
-                );
+        for (sent, answer) in chunks {
+            let trusted = answer.and_then(|resp| match untrusted_keyed_response(&resp) {
+                Some(why) => Err(why.to_string()),
+                None => Ok(resp),
+            });
+            let resp = match trusted {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let why = format!("the keyed read of its {}-id chunk failed: {e}", sent.len());
+                    unanswered.extend(sent.iter().map(|id| (key(id), why.clone())));
+                    failures.push(e);
+                    continue;
+                }
             };
-            if resp.session_bridge_column_present != Some(true) {
-                return Err("coord's keyed session-worktrees read does not report the \
-                     claude_code_session_id bridge column present, so no session in it can be \
-                     resolved and an empty answer is UNKNOWN, not \"no worktrees\""
-                    .to_string());
-            }
+            let echo = resp.claude_code_session_ids.as_deref().unwrap_or_default();
             let echoed: std::collections::HashSet<String> = echo.iter().map(|s| key(s)).collect();
             let invalid: std::collections::HashSet<String> =
                 resp.invalid.iter().map(|s| key(s)).collect();
@@ -2019,6 +2075,14 @@ pub mod coord {
                 unanswered.push((k, why.to_string()));
             }
         }
+        if total > 0 && failures.len() == total {
+            let first = failures.swap_remove(0);
+            return Err(if total == 1 {
+                first
+            } else {
+                format!("all {total} keyed session-worktrees chunks failed; the first: {first}")
+            });
+        }
         let mut index = CoordOwnership::from_response(CoordSessionWorktrees {
             sessions,
             session_bridge_column_present: Some(true),
@@ -2029,18 +2093,69 @@ pub mod coord {
         Ok(index)
     }
 
+    /// Fetch every chunk through `fetch`, at most `concurrency` at once, all
+    /// under ONE overall deadline `budget` from now. A chunk that has not
+    /// answered by the deadline is `Err` for that chunk alone; answers are
+    /// returned in chunk order, each paired with the ids it was asked about.
+    pub async fn fetch_keyed_chunks<F, Fut>(
+        chunks: Vec<Vec<String>>,
+        concurrency: usize,
+        budget: Duration,
+        fetch: F,
+    ) -> Vec<(Vec<String>, Result<CoordKeyedSessionWorktrees, String>)>
+    where
+        F: Fn(Vec<String>) -> Fut,
+        Fut: std::future::Future<Output = Result<CoordKeyedSessionWorktrees, String>>,
+    {
+        use futures::stream::StreamExt;
+        let deadline = tokio::time::Instant::now() + budget;
+        // Unordered, so one slow chunk does not hold a slot past its own
+        // answer the way an ordered buffer's head-of-line would; the order is
+        // restored afterwards.
+        let mut answers: Vec<(
+            usize,
+            Vec<String>,
+            Result<CoordKeyedSessionWorktrees, String>,
+        )> = futures::stream::iter(chunks.into_iter().enumerate())
+            .map(|(at, chunk)| {
+                let fut = fetch(chunk.clone());
+                async move {
+                    let answer =
+                        tokio::time::timeout_at(deadline, fut)
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(format!(
+                                    "it did not answer within the keyed read's {}s overall budget",
+                                    budget.as_secs()
+                                ))
+                            });
+                    (at, chunk, answer)
+                }
+            })
+            .buffer_unordered(concurrency.max(1))
+            .collect()
+            .await;
+        answers.sort_by_key(|(at, _, _)| *at);
+        answers
+            .into_iter()
+            .map(|(_, chunk, answer)| (chunk, answer))
+            .collect()
+    }
+
     /// The attributed-worktree index for exactly `claude_session_ids`, read
     /// through coord's KEYED door
     /// (`GET /coord/sessions/worktrees?claude_code_session_ids=<csv>`), one
     /// request — one SQL snapshot of the session pick and its rows — per
-    /// [`KEYED_CHUNK_IDS`] ids.
+    /// [`KEYED_CHUNK_IDS`] ids, [`KEYED_CONCURRENCY`] in flight, each under
+    /// [`KEYED_REQUEST_TIMEOUT`] and all under [`keyed_budget`].
     ///
     /// For a custody gate a missing row reads as "nothing attributed", i.e.
     /// clean, so this fails closed: `Err` (UNKNOWN at the gate) when no coord
-    /// base is configured, when the shared coord client is unavailable, on any
-    /// transport / non-2xx / decode error, and on a response
-    /// [`ownership_from_keyed`] refuses; per id, every answer but the id's own
-    /// `sessions[]` entry is recorded UNKNOWN.
+    /// base is configured, when the shared coord client is unavailable, and
+    /// when every chunk failed. A chunk that fails on its own — transport,
+    /// timeout, non-2xx, decode, or a response [`ownership_from_keyed`]
+    /// refuses — leaves exactly its ids UNKNOWN; per id, every answer but the
+    /// id's own `sessions[]` entry is recorded UNKNOWN.
     ///
     /// This replaced a tenant-wide walk of four state-filtered pages bracketed
     /// by two work-status reads, which on a large tenant timed out on every
@@ -2067,12 +2182,13 @@ pub mod coord {
             );
         };
         let base_url = format!("{}/coord/sessions/worktrees", base.trim_end_matches('/'));
-        let mut answers = Vec::new();
-        for chunk in keyed_chunks(claude_session_ids) {
-            let resp: CoordKeyedSessionWorktrees =
-                get_json(client, &keyed_url(&base_url, &chunk)).await?;
-            answers.push((chunk, resp));
-        }
+        let chunks = keyed_chunks(claude_session_ids);
+        let budget = keyed_budget(chunks.len());
+        let answers = fetch_keyed_chunks(chunks, KEYED_CONCURRENCY, budget, |chunk| {
+            let url = keyed_url(&base_url, &chunk);
+            async move { get_json(client, &url, KEYED_REQUEST_TIMEOUT).await }
+        })
+        .await;
         ownership_from_keyed(answers)
     }
 
@@ -2426,11 +2542,13 @@ pub mod coord {
         fn the_cursor_is_url_encoded_and_the_limit_is_always_sent() {
             assert_eq!(
                 page_url("https://c/coord/sessions/worktrees", None),
-                "https://c/coord/sessions/worktrees?limit=500"
+                format!("https://c/coord/sessions/worktrees?limit={PAGE_LIMIT}")
             );
             assert_eq!(
                 page_url("https://c/coord/sessions/worktrees", Some("a+b/c=")),
-                "https://c/coord/sessions/worktrees?limit=500&cursor=a%2Bb%2Fc%3D"
+                format!(
+                    "https://c/coord/sessions/worktrees?limit={PAGE_LIMIT}&cursor=a%2Bb%2Fc%3D"
+                )
             );
         }
 
@@ -2513,7 +2631,7 @@ pub mod coord {
                 r#"{{"sessionBridgeColumnPresent":true,"nextCursor":null,"sessions":[
                     {{"sessionId":"c-1","claudeCodeSessionId":"{A}","worktrees":[]}}]}}"#
             ));
-            let err = ownership_from_keyed(vec![(ids(&[A]), page_one)]).unwrap_err();
+            let err = ownership_from_keyed(vec![(ids(&[A]), Ok(page_one))]).unwrap_err();
             assert!(err.contains("claudeCodeSessionIds"), "{err}");
         }
 
@@ -2524,7 +2642,7 @@ pub mod coord {
                     r#"{{{bridge}"claudeCodeSessionIds":["{A}"],"sessions":[
                         {{"sessionId":"c-1","claudeCodeSessionId":"{A}","worktrees":[]}}]}}"#
                 ));
-                let err = ownership_from_keyed(vec![(ids(&[A]), resp)]).unwrap_err();
+                let err = ownership_from_keyed(vec![(ids(&[A]), Ok(resp))]).unwrap_err();
                 assert!(err.contains("bridge column"), "{bridge}: {err}");
             }
         }
@@ -2540,7 +2658,7 @@ pub mod coord {
                     "sessions":[{{"sessionId":"c-b","claudeCodeSessionId":"{B}","worktrees":[]}}]}}"#
             ));
             let sent = ids(&[A, B, "not-a-uuid", "cccccccc-0000-0000-0000-000000000003"]);
-            let idx = ownership_from_keyed(vec![(sent, resp)]).unwrap();
+            let idx = ownership_from_keyed(vec![(sent, Ok(resp))]).unwrap();
             assert_eq!(idx.coord_session_for_claude(B), Some("c-b"));
             for (id, why) in [
                 (A, "`unknown`"),
@@ -2560,7 +2678,7 @@ pub mod coord {
             let resp = keyed(
                 r#"{"sessionBridgeColumnPresent":true,"claudeCodeSessionIds":[],"sessions":[]}"#,
             );
-            let idx = ownership_from_keyed(vec![(ids(&[A]), resp)]).unwrap();
+            let idx = ownership_from_keyed(vec![(ids(&[A]), Ok(resp))]).unwrap();
             assert!(idx.unanswered_reason(A).unwrap().contains("did not echo"));
         }
 
@@ -2572,7 +2690,7 @@ pub mod coord {
                     {{"sessionId":"c-1","claudeCodeSessionId":"{B}","worktrees":[]}},
                     {{"sessionId":"c-2","claudeCodeSessionId":"{B}","worktrees":[]}}]}}"#
             ));
-            let idx = ownership_from_keyed(vec![(ids(&[A, B]), resp)]).unwrap();
+            let idx = ownership_from_keyed(vec![(ids(&[A, B]), Ok(resp))]).unwrap();
             assert!(idx.unanswered_reason(A).unwrap().contains("neither"));
             assert!(idx.unanswered_reason(B).unwrap().contains("more than one"));
             assert_eq!(idx.coord_session_for_claude(B), None);
@@ -2591,7 +2709,7 @@ pub mod coord {
                       "worktrees":[{{"worktreePath":"agent-worktrees/b/r","repo":"r"}}]}}]}}"#,
                 B.to_ascii_uppercase()
             ));
-            let idx = ownership_from_keyed(vec![(ids(&[A, B]), resp)]).unwrap();
+            let idx = ownership_from_keyed(vec![(ids(&[A, B]), Ok(resp))]).unwrap();
             assert_eq!(idx.coord_session_for_claude(A), Some("c-a"));
             assert!(idx.unanswered_reason(A).is_none());
             assert!(idx.worktrees_for_session("c-a").is_empty());
@@ -2602,14 +2720,19 @@ pub mod coord {
             );
         }
 
+        fn good(id: &str, sid: &str) -> Result<CoordKeyedSessionWorktrees, String> {
+            Ok(keyed(&format!(
+                r#"{{"sessionBridgeColumnPresent":true,"claudeCodeSessionIds":["{id}"],
+                    "sessions":[{{"sessionId":"{sid}","claudeCodeSessionId":"{id}","worktrees":[]}}]}}"#
+            )))
+        }
+
+        const C: &str = "cccccccc-0000-0000-0000-000000000003";
+
+        /// A failed or untrusted chunk leaves exactly ITS ids UNKNOWN; the
+        /// other chunks' answers still count.
         #[test]
-        fn chunks_are_merged_and_one_bad_chunk_fails_the_read() {
-            let good = |id: &str, sid: &str| {
-                keyed(&format!(
-                    r#"{{"sessionBridgeColumnPresent":true,"claudeCodeSessionIds":["{id}"],
-                        "sessions":[{{"sessionId":"{sid}","claudeCodeSessionId":"{id}","worktrees":[]}}]}}"#
-                ))
-            };
+        fn a_bad_chunk_leaves_only_its_own_ids_unknown() {
             let idx = ownership_from_keyed(vec![
                 (ids(&[A]), good(A, "c-a")),
                 (ids(&[B]), good(B, "c-b")),
@@ -2617,12 +2740,123 @@ pub mod coord {
             .unwrap();
             assert_eq!(idx.coord_session_for_claude(A), Some("c-a"));
             assert_eq!(idx.coord_session_for_claude(B), Some("c-b"));
-            let echo_less = keyed(r#"{"sessionBridgeColumnPresent":true,"sessions":[]}"#);
-            assert!(ownership_from_keyed(vec![
+
+            let echo_less = Ok(keyed(
+                r#"{"sessionBridgeColumnPresent":true,"sessions":[]}"#,
+            ));
+            let timed_out = Err("GET u: operation timed out".to_string());
+            let idx = ownership_from_keyed(vec![
                 (ids(&[A]), good(A, "c-a")),
-                (ids(&[B]), echo_less)
+                (ids(&[B]), echo_less),
+                (ids(&[C]), timed_out),
             ])
-            .is_err());
+            .unwrap();
+            assert_eq!(idx.coord_session_for_claude(A), Some("c-a"));
+            assert!(idx.unanswered_reason(A).is_none());
+            for (id, why) in [(B, "claudeCodeSessionIds"), (C, "timed out")] {
+                assert_eq!(idx.coord_session_for_claude(id), None, "{id}");
+                let reason = idx.unanswered_reason(id).unwrap_or_default();
+                assert!(
+                    reason.contains("1-id chunk failed") && reason.contains(why),
+                    "{id}: {reason}"
+                );
+            }
+        }
+
+        /// Every chunk failing is the whole read failing: `Err`, which the
+        /// gate reads as `ownership_unreadable` for every session.
+        #[test]
+        fn every_chunk_failing_fails_the_read() {
+            let err = ownership_from_keyed(vec![
+                (ids(&[A]), Err("first".to_string())),
+                (ids(&[B]), Err("second".to_string())),
+            ])
+            .unwrap_err();
+            assert!(err.contains("all 2") && err.contains("first"), "{err}");
+            assert!(
+                ownership_from_keyed(vec![]).unwrap().is_empty(),
+                "no ids asked about is no failure"
+            );
+        }
+
+        #[test]
+        fn the_keyed_read_is_tuned_to_coords_measured_cost() {
+            assert_eq!(KEYED_CHUNK_IDS, 25);
+            assert_eq!(KEYED_REQUEST_TIMEOUT, Duration::from_secs(30));
+            assert_eq!(KEYED_CONCURRENCY, 3);
+            assert_eq!(PAGE_LIMIT, 100);
+            // 69 ids (the measured candidate set) is three chunks: one wave.
+            let many: Vec<String> = (0..69)
+                .map(|i| format!("{i:08x}-0000-0000-0000-000000000000"))
+                .collect();
+            let sizes: Vec<usize> = keyed_chunks(&many).iter().map(Vec::len).collect();
+            assert_eq!(sizes, vec![25, 25, 19]);
+            // The budget grows by one request deadline per wave of chunks.
+            assert_eq!(keyed_budget(0), Duration::from_secs(35));
+            assert_eq!(keyed_budget(3), Duration::from_secs(35));
+            assert_eq!(keyed_budget(4), Duration::from_secs(65));
+            assert_eq!(keyed_budget(9), Duration::from_secs(95));
+            assert!(keyed_budget(3) > KEYED_REQUEST_TIMEOUT);
+        }
+
+        /// Chunks run at most `concurrency` at once, under one overall
+        /// deadline; a chunk still running at the deadline is `Err` for that
+        /// chunk alone, and answers come back in chunk order.
+        #[tokio::test(start_paused = true)]
+        async fn chunks_run_bounded_and_a_slow_chunk_times_out_alone() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::sync::Arc;
+            /// Decrements on drop, so a chunk the deadline cancels leaves.
+            struct Leave(Arc<AtomicUsize>);
+            impl Drop for Leave {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            let in_flight = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let chunks = vec![ids(&[A]), ids(&[B]), ids(&[C]), ids(&["d"]), ids(&["e"])];
+            let started = tokio::time::Instant::now();
+            let answers = fetch_keyed_chunks(chunks, 2, Duration::from_secs(25), |chunk| {
+                let (in_flight, peak) = (in_flight.clone(), peak.clone());
+                async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    let _leave = Leave(in_flight);
+                    // C never answers in time; the rest take 10 s each.
+                    let secs = if chunk[0] == C { 1_000 } else { 10 };
+                    tokio::time::sleep(Duration::from_secs(secs)).await;
+                    let id = chunk[0].clone();
+                    good(&id, &format!("c-{id}"))
+                }
+            })
+            .await;
+            assert_eq!(peak.load(Ordering::SeqCst), 2, "bounded concurrency");
+            assert!(
+                started.elapsed() <= Duration::from_secs(25),
+                "one overall deadline"
+            );
+            let order: Vec<&str> = answers.iter().map(|(c, _)| c[0].as_str()).collect();
+            assert_eq!(order, vec![A, B, C, "d", "e"]);
+            for (chunk, answer) in &answers {
+                match chunk[0].as_str() {
+                    C => assert!(
+                        answer.as_ref().unwrap_err().contains("25s overall budget"),
+                        "{answer:?}"
+                    ),
+                    // `e` starts at 20 s (when `d`'s slot frees up) and
+                    // would finish at 30 s: past the deadline, so it too is
+                    // UNKNOWN — the budget, not the request, bounds it.
+                    "e" => assert!(answer.is_err(), "{answer:?}"),
+                    _ => assert!(answer.is_ok(), "{chunk:?}: {answer:?}"),
+                }
+            }
+            let idx = ownership_from_keyed(answers).unwrap();
+            assert_eq!(
+                idx.coord_session_for_claude(A),
+                Some(format!("c-{A}").as_str())
+            );
+            assert!(idx.unanswered_reason(C).unwrap().contains("overall budget"));
         }
 
         /// A timeout reads as a timeout: the rendered error carries reqwest's

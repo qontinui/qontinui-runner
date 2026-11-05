@@ -542,9 +542,10 @@ pub const CUSTODY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 pub type OwnershipRead = Result<CoordOwnership, String>;
 
 /// Read coord's attributed-worktree index for exactly `claude_session_ids` —
-/// `custody::coord::fetch_live_ownership`, coord's keyed one-snapshot read,
-/// which is complete or `Err` and records every id it did not answer as
-/// UNKNOWN.
+/// `custody::coord::fetch_live_ownership`, coord's keyed read (one snapshot
+/// per chunk), which is `Err` only when it could not be read at all and
+/// otherwise records every id it did not answer (including every id of a
+/// chunk that failed) as UNKNOWN.
 pub async fn fetch_ownership(claude_session_ids: &[String]) -> OwnershipRead {
     custody::coord::fetch_live_ownership(claude_session_ids).await
 }
@@ -1445,7 +1446,7 @@ mod tests {
         );
         custody::coord::ownership_from_keyed(vec![(
             asked.iter().map(|s| s.to_string()).collect(),
-            serde_json::from_str(&json).unwrap(),
+            Ok(serde_json::from_str(&json).unwrap()),
         )])
     }
 
