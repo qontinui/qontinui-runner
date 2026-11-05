@@ -225,12 +225,15 @@ jobs:
       checks: write
 
     steps:
-      - uses: actions/checkout@v5
+      - id: checkout
+        uses: actions/checkout@v5
 
       - name: Check out sibling qontinui-schemas
+        id: sibling_schemas
         uses: ./.github/actions/checkout-sibling
 
       - name: Checkout sibling repos
+        id: sibling_repos
         run: |
           cd "$GITHUB_WORKSPACE/.."
           git clone --depth 1 https://github.com/qontinui/qontinui-web.git
@@ -238,11 +241,13 @@ jobs:
         shell: bash
 
       - name: Setup pnpm
+        id: setup_pnpm
         uses: pnpm/action-setup@v4
         with:
           version: 10.33.2
 
       - name: Setup Node.js
+        id: setup_node
         uses: actions/setup-node@v5
         with:
           node-version: "20"
@@ -250,12 +255,14 @@ jobs:
           cache-dependency-path: pnpm-lock.yaml
 
       - name: Setup Rust
+        id: setup_rust
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
           components: rustfmt, clippy
 
       - name: Setup reviewdog
+        id: setup_reviewdog
         uses: reviewdog/action-setup@v1
         with:
           reviewdog_version: latest
@@ -268,6 +275,7 @@ jobs:
       # 10 min = ~13x the healthy p90, matching ci.yml's bound on the identical
       # package list.
       - name: Install dependencies (Ubuntu)
+        id: apt
         timeout-minutes: 10
         run: |
           sudo apt-get update
@@ -285,6 +293,7 @@ jobs:
             at-spi2-core
 
       - name: Free disk space (Ubuntu)
+        id: free_disk
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: false
@@ -296,6 +305,7 @@ jobs:
           swap-storage: false
 
       - name: Add swapfile (Ubuntu — guard against link-time OOM)
+        id: swapfile
         run: |
           sudo swapoff -a || true
           sudo fallocate -l 12G /swapfile
@@ -310,6 +320,7 @@ jobs:
       # so this job never adds a save against the 10 GB repo cache cap. That is
       # PR #792's policy applied here: restore unrestricted, save from main only.
       - name: Cache Rust dependencies
+        id: rust_cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
@@ -318,12 +329,15 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install frontend dependencies
+        id: pnpm_install
         run: pnpm install --frozen-lockfile
 
       - name: Build frontend
+        id: pnpm_build
         run: pnpm run build
 
       - name: Clippy diff-scoped via reviewdog
+        id: clippy
         # Capture clippy JSON to a file first so cargo's non-zero exit (a deny
         # lint) does NOT abort the step under `set -eo pipefail` before
         # reviewdog runs — reviewdog owns the pass/fail decision here, scoped to
@@ -344,3 +358,58 @@ jobs:
             -fail-on-error=true \
             < clippy-report.json
         shell: bash
+
+      # A setup death is NOT a verdict on this PR (plan
+      # 2026-11-05-repair-classifier-reads-why-a-check-failed, Phase 3). When a
+      # step BEFORE clippy fails (an apt hang, a sibling clone, a pnpm build),
+      # the check goes red without clippy ever reading the diff. Name the first
+      # failed setup step in an annotation whose title carries the literal
+      # phrase "(not a verdict on this PR)" -- coord's repair classifier
+      # (author_feedback.rs is_no_verdict_annotation) matches it byte-exact and
+      # re-runs instead of blaming the PR's code. Emits nothing when the
+      # reviewdog step itself failed (that IS a verdict) or no setup step did.
+      # Outcomes arrive via env only; step names below are static literals.
+      - name: Declare a setup death (not a verdict on this PR)
+        if: failure()
+        env:
+          O_CHECKOUT: ${{ steps.checkout.outcome }}
+          O_SIBLING_SCHEMAS: ${{ steps.sibling_schemas.outcome }}
+          O_SIBLING_REPOS: ${{ steps.sibling_repos.outcome }}
+          O_SETUP_PNPM: ${{ steps.setup_pnpm.outcome }}
+          O_SETUP_NODE: ${{ steps.setup_node.outcome }}
+          O_SETUP_RUST: ${{ steps.setup_rust.outcome }}
+          O_SETUP_REVIEWDOG: ${{ steps.setup_reviewdog.outcome }}
+          O_APT: ${{ steps.apt.outcome }}
+          O_FREE_DISK: ${{ steps.free_disk.outcome }}
+          O_SWAPFILE: ${{ steps.swapfile.outcome }}
+          O_RUST_CACHE: ${{ steps.rust_cache.outcome }}
+          O_PNPM_INSTALL: ${{ steps.pnpm_install.outcome }}
+          O_PNPM_BUILD: ${{ steps.pnpm_build.outcome }}
+          O_CLIPPY: ${{ steps.clippy.outcome }}
+        shell: bash
+        run: |
+          if [ "$O_CLIPPY" = "failure" ]; then
+            exit 0
+          fi
+          first=""
+          pick() {
+            if [ -z "$first" ] && [ "$2" = "failure" ]; then
+              first="$1"
+            fi
+          }
+          pick 'actions/checkout@v5' "$O_CHECKOUT"
+          pick 'Check out sibling qontinui-schemas' "$O_SIBLING_SCHEMAS"
+          pick 'Checkout sibling repos' "$O_SIBLING_REPOS"
+          pick 'Setup pnpm' "$O_SETUP_PNPM"
+          pick 'Setup Node.js' "$O_SETUP_NODE"
+          pick 'Setup Rust' "$O_SETUP_RUST"
+          pick 'Setup reviewdog' "$O_SETUP_REVIEWDOG"
+          pick 'Install dependencies (Ubuntu)' "$O_APT"
+          pick 'Free disk space (Ubuntu)' "$O_FREE_DISK"
+          pick 'Add swapfile (Ubuntu — guard against link-time OOM)' "$O_SWAPFILE"
+          pick 'Cache Rust dependencies' "$O_RUST_CACHE"
+          pick 'Install frontend dependencies' "$O_PNPM_INSTALL"
+          pick 'Build frontend' "$O_PNPM_BUILD"
+          if [ -n "$first" ]; then
+            echo "::error title=Clippy diff-scoped (advisory) SETUP FAILED (not a verdict on this PR)::step '${first}' failed before clippy ran"
+          fi
