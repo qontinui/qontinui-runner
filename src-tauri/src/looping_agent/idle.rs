@@ -33,10 +33,16 @@
 //! checks scan the same [`DIALOG_CHROME_MARKERS`] within the same
 //! [`DIALOG_SCAN_ROWS`], anchored on the cursor row it has and this does not.
 
+use std::sync::LazyLock;
+
+use regex::Regex;
+
 /// Working/processing indicators that mean Claude is mid-turn. If ANY appears
 /// on the rendered screen the terminal is NOT idle. Lowercased before match.
 /// Sourced from the Claude Code TUI working line ("… esc to interrupt") and
-/// its transient status lines; conservative — any hit vetoes idle.
+/// its transient status lines; conservative — any hit vetoes idle. An
+/// indicator found only inside Claude Code's idle `/clear` hint
+/// ([`CLEAR_HINT`]) does not count.
 pub const PROCESSING_INDICATORS: &[&str] = &[
     "esc to interrupt",
     "to interrupt)",
@@ -47,6 +53,29 @@ pub const PROCESSING_INDICATORS: &[&str] = &[
     "compacting",
     "summarizing",
 ];
+
+/// Claude Code's IDLE footer hint, `new task? /clear to save 320.4k tokens ·
+/// …`, matched lowercased. It carries the `"tokens ·"` working indicator's
+/// text, so a finished pane at an empty prompt read as busy for as long as
+/// the hint was painted (plan
+/// `2026-11-04-runner-finished-close-closes-nothing-on-any-box` cause 4:
+/// 5 of 48 finished sessions held at `grid_busy` on one box; runner#2369:
+/// 42 of 43 on another, together with the turn-done line). Only the hint
+/// itself is masked, never the rest of its line.
+static CLEAR_HINT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"/clear to save [0-9][0-9.,]*[kmb]? tokens")
+        .expect("CLEAR_HINT is a valid regex")
+});
+
+/// Does `ind` occur in the lowercased row `lower` OUTSIDE the idle `/clear`
+/// hint? `false` both when it does not occur at all and when every
+/// occurrence lies inside the hint.
+fn indicator_outside_clear_hint(lower: &str, ind: &str) -> bool {
+    if !lower.contains("/clear") {
+        return lower.contains(ind);
+    }
+    CLEAR_HINT.replace_all(lower, "").contains(ind)
+}
 
 /// Spinner glyphs the Claude Code TUI animates while working. Their presence
 /// on screen is a strong "busy" signal independent of the text indicators
@@ -101,7 +130,10 @@ pub fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
     // (1) any processing-indicator text ⇒ busy.
     for line in lines {
         let lower = line.to_ascii_lowercase();
-        for ind in PROCESSING_INDICATORS {
+        for ind in PROCESSING_INDICATORS
+            .iter()
+            .filter(|ind| indicator_outside_clear_hint(&lower, ind))
+        {
             if lower.contains(ind) {
                 return false;
             }
@@ -509,6 +541,89 @@ mod tests {
         // ...but the same text within reach of the prompt is.
         let near = lines(&["Enter to confirm · Esc to cancel", "│ ❯ │"]);
         assert_eq!(snapshot_shows_dialog(&near), Some("esc to cancel"));
+    }
+
+    // ── the idle `/clear` hint ───────────────────────────────────────────
+
+    /// Claude Code's idle footer carries `tokens ·`, the working indicator's
+    /// text. A finished pane at an empty prompt showing it must read idle
+    /// (plan `2026-11-04-runner-finished-close-closes-nothing-on-any-box`
+    /// Phase 3; adopted from runner#2369).
+    #[test]
+    fn the_clear_hint_footer_reads_idle() {
+        for hint in [
+            "  new task? /clear to save 320.4k tokens · Checking for updates",
+            "  new task? /clear to save 1.2M tokens · ✔ Update installed · Restart to apply",
+            "  new task? /clear to save 87,512 tokens · Checking for updates",
+            "  new task? /clear to save 912 tokens · …",
+            // Truncated to the pane's width: no `tokens ·` survives, so this
+            // guards against a false busy rather than exercising the mask.
+            "  new task? /clear to save 320.4… · Checking for updates",
+        ] {
+            let grid = lines(&[
+                "● Done — the change is committed.",
+                "",
+                hint,
+                "────────────────────────────────────────",
+                "❯\u{a0}",
+                "────────────────────────────────────────",
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+            ]);
+            assert!(snapshot_looks_idle(&grid, 4), "must be idle with: {hint}");
+            assert_eq!(snapshot_shows_dialog(&grid), None, "{hint}");
+        }
+    }
+
+    /// Only the hint is masked: a real working indicator still vetoes, on
+    /// the hint's own row or on any other.
+    #[test]
+    fn the_clear_hint_does_not_mask_real_work() {
+        let hint = "  new task? /clear to save 320.4k tokens · Checking for updates";
+        for busy in [
+            "✻ Cogitating… (12s · ↑ 1.2k tokens · esc to interrupt)",
+            "  12.3k tokens · esc to interrupt",
+            "  4.5k tokens · thinking)",
+            "Compacting conversation",
+        ] {
+            assert!(
+                !snapshot_looks_idle(&lines(&[busy, hint, "❯ "]), 2),
+                "must be busy with: {busy}"
+            );
+        }
+        // An indicator on the hint's own row, outside the hint.
+        let same_row = "new task? /clear to save 320.4k tokens · 2.0k tokens · esc";
+        assert!(!snapshot_looks_idle(&lines(&[same_row, "❯ "]), 1));
+        // `tokens ·` with no hint around it still vetoes.
+        assert!(!snapshot_looks_idle(&lines(&["  2.0k tokens · ", "❯ "]), 1));
+        // A hint-like string with no token count is not the hint.
+        assert!(!snapshot_looks_idle(
+            &lines(&["/clear to save tokens · now", "❯ "]),
+            1
+        ));
+    }
+
+    /// The hint can sit above a genuine dialog. Masking it must not make the
+    /// dialog guard pass: the dialog is still a dialog.
+    #[test]
+    fn a_dialog_under_the_clear_hint_is_still_a_dialog() {
+        let grid = lines(&[
+            "  new task? /clear to save 320.4k tokens · Checking for updates",
+            " Bash command",
+            "   gh pr list --state open",
+            " Do you want to proceed?",
+            " ❯ 1. Yes",
+            "   2. No, and tell Claude what to do differently (esc)",
+            "",
+            " Enter to confirm · Esc to cancel",
+        ]);
+        // With the hint masked the idle predicate reads this screen idle
+        // (cursor on the `❯ 1. Yes` row), which is exactly why the dialog
+        // guard must be the conjunct that refuses it.
+        assert!(snapshot_looks_idle(&grid, 4));
+        assert_eq!(
+            snapshot_shows_dialog(&grid),
+            Some("selected numbered choice on a `❯` row")
+        );
     }
 
     // ── snapshot_context_low ─────────────────────────────────────────────
