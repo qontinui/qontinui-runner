@@ -11,17 +11,30 @@
  * `pnpm audit --audit-level=moderate || true`, which could never fail.)
  *
  * What it does:
- *   1. Reads package.json + pnpm-lock.yaml at BASE and at HEAD (`git show`).
- *      If both files are byte-identical, the tree is unchanged: exit 0 with NO
- *      network call.
- *   2. Otherwise materialises each side into a temp dir and runs
- *      `pnpm audit --prod --json` there. pnpm audit needs only the lockfile and
- *      package.json — no install. Dev-only tooling is out of scope (--prod).
- *   3. An advisory is the pair (package name, GHSA id — else URL, else npm id).
+ *   0. Resolves BASE (resolveBase): a PR's merge-base with its base branch; a
+ *      push to main/develop's `before` when it is a real ancestor of HEAD; any
+ *      other push (merge-candidate refs, new refs, force pushes) the merge-base
+ *      with origin/main; HEAD^ only as a loudly announced last resort. A
+ *      merge-candidate ref is new (before = all zeros) and may carry several
+ *      commits, so HEAD^ there would miss a lockfile change in an earlier one.
+ *   1. Refuses audit-config drift: a change to package.json `pnpm.auditConfig`
+ *      or to a registry/audit key of .npmrc fails, because either could make
+ *      the HEAD audit lie (ignore an advisory, or ask a registry that answers
+ *      an empty report). Such a change needs its own justification and review.
+ *   2. Reads package.json + pnpm-lock.yaml at BASE and at HEAD. If both are
+ *      byte-identical: exit 0 with NO network call.
+ *   3. Otherwise audits each side in a temp dir holding ONLY those two files,
+ *      with `pnpm audit --prod --json --registry=https://registry.npmjs.org/`
+ *      (no install needed; the explicit registry and the absent .npmrc mean the
+ *      change under test cannot pick who answers). Dev-only tooling is out of
+ *      scope (--prod).
+ *   4. An advisory is the pair (package name, GHSA id — else URL, else npm id).
  *      A pair at HEAD and not at BASE is INTRODUCED; at BASE and not at HEAD it
- *      is FIXED. Introduced moderate/high/critical fail; introduced low (and
- *      info) are warnings; fixed ones are reported.
- *   4. An audit that cannot run, or whose JSON is not an audit report, is
+ *      is FIXED. Introduced info/low are warnings; every other severity —
+ *      moderate, high, critical, and anything unrecognised — blocks. A new
+ *      vulnerable VERSION under a pair already present at BASE is a warning,
+ *      not a block (identity is deliberately package+advisory).
+ *   5. An audit that cannot run, or whose JSON is not an audit report, is
  *      UNKNOWN — never clean. Each audit is tried twice, then the step fails
  *      saying the audit could not be performed. pnpm audit exits non-zero
  *      whenever vulnerabilities exist, so its exit code is NOT the verdict; the
@@ -31,11 +44,16 @@
  *
  * Usage:
  *   node scripts/ci-pnpm-audit-diff.mjs --base <rev> [--head <rev>]
+ *   node scripts/ci-pnpm-audit-diff.mjs            # in GitHub Actions only:
+ *        BASE is resolved from GITHUB_EVENT_NAME, GITHUB_REF, PR_BASE_SHA and
+ *        PUSH_BEFORE, fetching (and unshallowing) as needed. Refused outside
+ *        Actions, because it fetches into the clone it runs in.
  *
  * Exit codes:
- *   0  unchanged, or changed with no introduced moderate+ advisory
- *   1  introduced a moderate+ advisory, OR the audit could not be performed
- *   2  bad usage, or a git read failed
+ *   0  unchanged, or changed with nothing blocking introduced
+ *   1  something blocking introduced, audit-config drift, pnpm-lock.yaml
+ *      deleted, OR the audit could not be performed (UNKNOWN)
+ *   2  bad usage, an unresolvable revision, or BASE could not be determined
  *
  * Imports Node built-ins only, so CI runs it with no install step.
  */
@@ -47,15 +65,20 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
-/** The two files whose identity decides "tree unchanged". */
+/** The two files whose identity decides "tree unchanged", and the only two audited. */
 export const GATED_FILES = ["package.json", "pnpm-lock.yaml"];
-/** Copied alongside when present, so each audit sees its side's npm config. */
-const CONFIG_FILES = [".npmrc"];
-export const BLOCKING_SEVERITIES = new Set(["moderate", "high", "critical"]);
+export const AUDIT_REGISTRY = "https://registry.npmjs.org/";
+/** Severities that warn rather than block. Everything else blocks. */
+export const WARN_SEVERITIES = new Set(["info", "low"]);
 const SEVERITY_ORDER = ["critical", "high", "moderate", "low", "info"];
 const MAX_PATHS_SHOWN = 3;
+const TRUNK_BRANCHES = new Set(["main", "develop"]);
+const MAIN_REFSPEC = "+refs/heads/main:refs/remotes/origin/main";
+const MAIN_REF = "refs/remotes/origin/main";
 
 export class AuditUnreadable extends Error {}
+/** A usage-class failure: bad rev, unresolvable BASE. Exit 2. */
+export class GateUsageError extends Error {}
 
 /**
  * Parse `pnpm audit --json` output into Map<key, advisory>. Throws
@@ -93,22 +116,27 @@ export function parseAudit(text) {
     const advisoryId = a.github_advisory_id || a.url || (a.id != null ? String(a.id) : "");
     if (!advisoryId) throw new AuditUnreadable(`an advisory for ${a.module_name} has no id`);
     const key = `${a.module_name}\u0000${advisoryId}`;
-    const paths = (a.findings ?? []).flatMap((f) => f.paths ?? []);
+    const findings = a.findings ?? [];
+    const paths = findings.flatMap((f) => f.paths ?? []);
+    const versions = findings.map((f) => f.version).filter((v) => typeof v === "string");
     const prev = out.get(key);
     if (prev) {
       prev.paths.push(...paths);
+      for (const v of versions) prev.versions.add(v);
       continue;
     }
     out.set(key, {
       key,
       module: a.module_name,
       advisoryId,
-      severity: String(a.severity ?? "unknown").toLowerCase(),
+      // Kept verbatim (lowercased); an unrecognised or missing severity BLOCKS.
+      severity: typeof a.severity === "string" && a.severity ? a.severity.toLowerCase() : "unknown",
       title: a.title ?? "",
       vulnerable: a.vulnerable_versions ?? "?",
       patched: a.patched_versions ?? "?",
       url: a.url ?? "",
       paths,
+      versions: new Set(versions),
     });
   }
   return out;
@@ -117,18 +145,27 @@ export function parseAudit(text) {
 function bySeverity(a, b) {
   const ra = SEVERITY_ORDER.indexOf(a.severity);
   const rb = SEVERITY_ORDER.indexOf(b.severity);
-  return (ra < 0 ? 99 : ra) - (rb < 0 ? 99 : rb) || a.module.localeCompare(b.module) || a.advisoryId.localeCompare(b.advisoryId);
+  // Unrecognised severities sort FIRST: they block and need a human.
+  return (ra < 0 ? -1 : ra) - (rb < 0 ? -1 : rb) || a.module.localeCompare(b.module) || a.advisoryId.localeCompare(b.advisoryId);
 }
 
 /** Pure: which advisories HEAD introduces and which it fixes, relative to BASE. */
 export function diffAdvisories(base, head) {
   const introduced = [...head.values()].filter((a) => !base.has(a.key)).sort(bySeverity);
   const fixed = [...base.values()].filter((a) => !head.has(a.key)).sort(bySeverity);
+  const newVersions = [];
+  for (const a of head.values()) {
+    const b = base.get(a.key);
+    if (!b) continue;
+    const added = [...a.versions].filter((v) => !b.versions.has(v));
+    if (added.length) newVersions.push({ advisory: a, added });
+  }
   return {
     introduced,
     fixed,
-    blocking: introduced.filter((a) => BLOCKING_SEVERITIES.has(a.severity)),
-    warnings: introduced.filter((a) => !BLOCKING_SEVERITIES.has(a.severity)),
+    newVersions,
+    blocking: introduced.filter((a) => !WARN_SEVERITIES.has(a.severity)),
+    warnings: introduced.filter((a) => WARN_SEVERITIES.has(a.severity)),
   };
 }
 
@@ -146,27 +183,72 @@ export function decide(base, head) {
   const d = diffAdvisories(base, head);
   const lines = [
     `pnpm-audit-diff: base ${base.size} advisories, head ${head.size} (prod scope).`,
-    `Introduced, moderate and above (BLOCKING): ${d.blocking.length}`,
+    `Introduced, blocking (moderate and above, or unrecognised severity): ${d.blocking.length}`,
     ...renderTable(d.blocking),
     `Introduced, low/info (warning only): ${d.warnings.length}`,
     ...renderTable(d.warnings),
+    `New vulnerable versions under an advisory already present at base (warning only): ${d.newVersions.length}`,
+    ...(d.newVersions.length
+      ? d.newVersions.map(({ advisory: a, added }) => `  ${a.severity.padEnd(8)} ${a.module}  ${a.advisoryId}  new version(s) ${added.join(", ")}`)
+      : ["  (none)"]),
     `Fixed by this change: ${d.fixed.length}`,
     ...renderTable(d.fixed),
   ];
   const annotations = [
     ...d.blocking.map((a) => `::error title=pnpm audit::introduced ${a.severity} ${a.advisoryId} in ${a.module} (${a.vulnerable})`),
     ...d.warnings.map((a) => `::warning title=pnpm audit::introduced ${a.severity} ${a.advisoryId} in ${a.module} (${a.vulnerable})`),
+    ...d.newVersions.map(
+      ({ advisory: a, added }) =>
+        `::warning title=pnpm audit::${a.module} ${added.join(", ")} is newly vulnerable to ${a.advisoryId}, already present at base`,
+    ),
   ];
   if (d.blocking.length) {
     lines.push(
-      `FAIL: this change introduces ${d.blocking.length} moderate-or-higher advisor${d.blocking.length === 1 ? "y" : "ies"} ` +
+      `FAIL: this change introduces ${d.blocking.length} blocking advisor${d.blocking.length === 1 ? "y" : "ies"} ` +
         "into the production dependency tree. Upgrade to a patched range, or drop the dependency.",
     );
     return { exitCode: 1, verdict: "introduced", lines, annotations, diff: d };
   }
-  lines.push("PASS: no moderate-or-higher advisory introduced.");
+  lines.push("PASS: no blocking advisory introduced.");
   return { exitCode: 0, verdict: "clean", lines, annotations, diff: d };
 }
+
+// ------------------------------------------------------- audit-config drift
+
+/** The registry/audit-related `key=value` lines of an .npmrc, normalised. */
+export function npmrcAuditKeys(text) {
+  if (text === null) return [];
+  return text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("#") && !l.startsWith(";"))
+    .filter((l) => /registry|audit/i.test(l.split("=")[0]))
+    .map((l) => l.replace(/\s*=\s*/, "="))
+    .sort();
+}
+
+function auditConfigOf(pkgText) {
+  if (pkgText === null) return null;
+  try {
+    return JSON.parse(pkgText)?.pnpm?.auditConfig ?? null;
+  } catch {
+    return "<unparseable package.json>";
+  }
+}
+
+/** Pure: reasons the HEAD audit configuration differs from BASE's ([] = none). */
+export function auditConfigDrift(base, head) {
+  const out = [];
+  const b = JSON.stringify(auditConfigOf(base["package.json"]));
+  const h = JSON.stringify(auditConfigOf(head["package.json"]));
+  if (b !== h) out.push(`package.json pnpm.auditConfig changed: ${b} -> ${h}`);
+  const rb = npmrcAuditKeys(base[".npmrc"]).join("\n");
+  const rh = npmrcAuditKeys(head[".npmrc"]).join("\n");
+  if (rb !== rh) out.push(`.npmrc registry/audit keys changed: [${rb.replace(/\n/g, "; ")}] -> [${rh.replace(/\n/g, "; ")}]`);
+  return out;
+}
+
+// ------------------------------------------------------------------- gate
 
 /** Run one side's audit, retried once; returns a Map or throws AuditUnreadable. */
 export function auditWithRetry(files, audit, log, label) {
@@ -187,30 +269,46 @@ export function auditWithRetry(files, audit, log, label) {
 
 /**
  * The gate, with its I/O injected:
- *   readFile(rev, path) -> string | null   (null = absent at that rev)
+ *   resolveRev(rev)     -> commit sha | null   (null = unresolvable: exit 2)
+ *   readFile(rev, path) -> string | null       (null = absent at that rev)
  *   audit(files)        -> { stdout, error? }  files = { name: content }
  *   log(line)
- * Returns { exitCode, verdict, lines }.
+ * Returns { exitCode, verdict, lines, annotations }. Throws GateUsageError.
  */
-export function runGate({ base, head, readFile, audit, log = () => {} }) {
+export function runGate({ base, head, resolveRev, readFile, audit, log = () => {} }) {
+  for (const rev of [base, head]) {
+    if (!resolveRev(rev)) throw new GateUsageError(`revision ${rev} does not resolve to a commit`);
+  }
   const read = (rev, names) => Object.fromEntries(names.map((n) => [n, readFile(rev, n)]));
-  const baseFiles = read(base, GATED_FILES);
-  const headFiles = read(head, GATED_FILES);
+  const baseFiles = read(base, [...GATED_FILES, ".npmrc"]);
+  const headFiles = read(head, [...GATED_FILES, ".npmrc"]);
+
+  const drift = auditConfigDrift(baseFiles, headFiles);
+  if (drift.length) {
+    const lines = [
+      "pnpm-audit-diff: FAIL — this change alters how the audit itself is configured:",
+      ...drift.map((d) => `  ${d}`),
+      "A change to pnpm.auditConfig or to .npmrc registry/audit keys can make this gate pass falsely, " +
+        "so it is never accepted silently. Land it in its own PR with a stated justification (and, for an " +
+        "ignore, the advisory and why it does not apply).",
+    ];
+    return { exitCode: 1, verdict: "config-drift", lines, annotations: drift.map((d) => `::error title=pnpm audit::${d}`) };
+  }
 
   if (GATED_FILES.every((n) => baseFiles[n] === headFiles[n])) {
     const lines = [`pnpm-audit-diff: ${GATED_FILES.join(" and ")} are unchanged between ${base} and ${head}; nothing to audit (no network call).`];
     return { exitCode: 0, verdict: "unchanged", lines, annotations: [] };
   }
   if (headFiles["pnpm-lock.yaml"] === null) {
-    const lines = [`pnpm-audit-diff: no pnpm-lock.yaml at ${head}; no npm production tree to audit.`];
+    if (baseFiles["pnpm-lock.yaml"] !== null) {
+      const msg = `pnpm-lock.yaml exists at ${base} but is deleted at ${head}; the production tree can no longer be audited.`;
+      return { exitCode: 1, verdict: "lockfile-removed", lines: [`pnpm-audit-diff: FAIL — ${msg}`], annotations: [`::error title=pnpm audit::${msg}`] };
+    }
+    const lines = [`pnpm-audit-diff: no pnpm-lock.yaml at ${base} or ${head}; no npm production tree to audit.`];
     return { exitCode: 0, verdict: "no-lockfile", lines, annotations: [] };
   }
 
-  const withConfig = (rev, files) => {
-    const out = {};
-    for (const [n, c] of Object.entries({ ...files, ...read(rev, CONFIG_FILES) })) if (c !== null) out[n] = c;
-    return out;
-  };
+  const only = (files) => Object.fromEntries(GATED_FILES.filter((n) => files[n] !== null).map((n) => [n, files[n]]));
 
   try {
     let baseAdvisories;
@@ -218,9 +316,9 @@ export function runGate({ base, head, readFile, audit, log = () => {} }) {
       log(`pnpm-audit-diff: no pnpm-lock.yaml at ${base}; every head advisory counts as introduced.`);
       baseAdvisories = new Map();
     } else {
-      baseAdvisories = auditWithRetry(withConfig(base, baseFiles), audit, log, "base");
+      baseAdvisories = auditWithRetry(only(baseFiles), audit, log, "base");
     }
-    const headAdvisories = auditWithRetry(withConfig(head, headFiles), audit, log, "head");
+    const headAdvisories = auditWithRetry(only(headFiles), audit, log, "head");
     return decide(baseAdvisories, headAdvisories);
   } catch (e) {
     if (!(e instanceof AuditUnreadable)) throw e;
@@ -232,26 +330,138 @@ export function runGate({ base, head, readFile, audit, log = () => {} }) {
   }
 }
 
+// ---------------------------------------------------------------- BASE
+
+const ZERO_SHA = /^0+$/;
+
+/**
+ * Decide BASE for a CI run, with git injected:
+ *   git.revParse(rev)             -> sha | null
+ *   git.fetch(refspecs, {depth, refetch?}) -> boolean  (depth: number | "unshallow")
+ *   git.isShallow()               -> boolean
+ *   git.mergeBase(a, b)           -> sha | null
+ *   git.isAncestor(a, b)          -> boolean
+ * ctx = { eventName, ref, prBaseSha, before }. Returns { base, how }; throws
+ * GateUsageError when no BASE can be determined.
+ */
+export function resolveBase(ctx, git, log = () => {}) {
+  const head = git.revParse("HEAD");
+  if (!head) throw new GateUsageError("HEAD does not resolve");
+  // HEAD and its parents: enough for a PR merge commit, whose first parent IS
+  // the base tip, and for a single-commit push. `refetch`: HEAD is already
+  // present (at depth 1), and this fetch exists to deepen it.
+  git.fetch([head], { depth: 2, refetch: true });
+
+  let deepened = false;
+  const deepen = (refspecs) => {
+    if (deepened || !git.isShallow()) return;
+    deepened = true;
+    log("pnpm-audit-diff: shallow history does not reach the comparison point; unshallowing.");
+    git.fetch([head, ...refspecs], { depth: "unshallow" });
+  };
+  const mergeBaseDeep = (other, refspecs) => {
+    let m = git.mergeBase(head, other);
+    if (!m) {
+      deepen(refspecs);
+      m = git.mergeBase(head, other);
+    }
+    return m;
+  };
+
+  if (ctx.eventName === "pull_request") {
+    if (!ctx.prBaseSha) throw new GateUsageError("pull_request event without a base sha");
+    git.fetch([ctx.prBaseSha], { depth: 1 });
+    const m = mergeBaseDeep(ctx.prBaseSha, [ctx.prBaseSha]);
+    if (!m) throw new GateUsageError(`no merge-base between HEAD and PR base ${ctx.prBaseSha}`);
+    return { base: m, how: `merge-base of HEAD with PR base ${ctx.prBaseSha}` };
+  }
+
+  const branch = (ctx.ref ?? "").replace(/^refs\/heads\//, "");
+  const before = ctx.before ?? "";
+  if (ctx.eventName === "push" && TRUNK_BRANCHES.has(branch) && before && !ZERO_SHA.test(before)) {
+    if (git.fetch([before], { depth: 1 })) {
+      let anc = git.isAncestor(before, head);
+      if (!anc) {
+        deepen([before]);
+        anc = git.isAncestor(before, head);
+      }
+      if (anc) return { base: before, how: `push 'before' ${before}` };
+      log(`pnpm-audit-diff: push 'before' ${before} is not an ancestor of HEAD (force push?); using merge-base with main.`);
+    } else {
+      log(`pnpm-audit-diff: push 'before' ${before} could not be fetched; using merge-base with main.`);
+    }
+  }
+
+  if (git.fetch([MAIN_REFSPEC], { depth: 2 })) {
+    const m = mergeBaseDeep(MAIN_REF, [MAIN_REFSPEC]);
+    if (m && m !== head) return { base: m, how: "merge-base of HEAD with origin/main" };
+  }
+
+  let parent = git.revParse("HEAD^");
+  if (!parent) {
+    deepen([]);
+    parent = git.revParse("HEAD^");
+  }
+  if (!parent) throw new GateUsageError("could not determine BASE: no usable before, no merge-base with main, no HEAD^");
+  log(
+    "::warning title=pnpm audit::BASE fell back to HEAD^ (no usable push 'before' and no merge-base with main below HEAD). " +
+      "Only the LAST commit's dependency changes are compared.",
+  );
+  return { base: parent, how: "HEAD^ (LAST RESORT)" };
+}
+
 // ---------------------------------------------------------------- real I/O
 
+function git(args, opts = {}) {
+  return spawnSync("git", args, { encoding: "utf8", maxBuffer: 256 * 1024 * 1024, ...opts });
+}
+
+function gitResolveRev(rev) {
+  const r = git(["rev-parse", "--verify", "--quiet", `${rev}^{commit}`]);
+  return r.status === 0 ? r.stdout.trim() : null;
+}
+
 function gitReadFile(rev, path) {
-  try {
-    execFileSync("git", ["cat-file", "-e", `${rev}:${path}`], { stdio: "ignore" });
-  } catch {
-    return null;
-  }
+  if (git(["cat-file", "-e", `${rev}:${path}`]).status !== 0) return null;
   return execFileSync("git", ["show", `${rev}:${path}`], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
 }
+
+const realGit = {
+  revParse: gitResolveRev,
+  isShallow: () => git(["rev-parse", "--is-shallow-repository"]).stdout.trim() === "true",
+  fetch(refspecs, { depth, refetch = false }) {
+    // A --depth fetch of a commit that is already present RE-TRUNCATES its
+    // history (measured: fetching main == HEAD at depth 1 dropped HEAD^), so a
+    // sha we already hold is never re-fetched with a depth.
+    if (depth !== "unshallow" && !refetch) {
+      refspecs = refspecs.filter((r) => !/^[0-9a-f]{40}$/.test(r) || git(["cat-file", "-e", `${r}^{commit}`]).status !== 0);
+      if (!refspecs.length) return true;
+    }
+    const args = ["fetch", "--no-tags", "--quiet"];
+    // Depth flags only on an already-shallow clone: --depth on a full clone
+    // would MAKE it shallow.
+    if (realGit.isShallow()) args.push(depth === "unshallow" ? "--unshallow" : `--depth=${depth}`);
+    else if (depth === "unshallow") return true;
+    return git([...args, "origin", ...refspecs], { stdio: ["ignore", "inherit", "inherit"] }).status === 0;
+  },
+  mergeBase(a, b) {
+    const r = git(["merge-base", a, b]);
+    return r.status === 0 ? r.stdout.trim() : null;
+  },
+  isAncestor: (a, b) => git(["merge-base", "--is-ancestor", a, b]).status === 0,
+};
 
 function pnpmAudit(files) {
   const dir = mkdtempSync(join(tmpdir(), "pnpm-audit-diff-"));
   try {
     for (const [name, content] of Object.entries(files)) writeFileSync(join(dir, name), content);
-    const res = spawnSync("pnpm", ["audit", "--prod", "--json"], {
+    const res = spawnSync("pnpm", ["audit", "--prod", "--json", `--registry=${AUDIT_REGISTRY}`], {
       cwd: dir,
       encoding: "utf8",
       maxBuffer: 256 * 1024 * 1024,
       shell: process.platform === "win32",
+      // Never let the audited package.json's `packageManager` field swap pnpm.
+      env: { ...process.env, npm_config_manage_package_manager_versions: "false" },
     });
     return { stdout: res.stdout, error: res.error };
   } finally {
@@ -260,6 +470,7 @@ function pnpmAudit(files) {
 }
 
 function main(argv) {
+  const say = (l) => process.stdout.write(`${l}\n`);
   let values;
   try {
     ({ values } = parseArgs({ args: argv, options: { base: { type: "string" }, head: { type: "string", default: "HEAD" } } }));
@@ -267,25 +478,34 @@ function main(argv) {
     process.stderr.write(`${e.message}\n`);
     return 2;
   }
-  if (!values.base) {
-    process.stderr.write("usage: ci-pnpm-audit-diff.mjs --base <rev> [--head <rev>]\n");
-    return 2;
-  }
   let result;
   try {
-    result = runGate({
-      base: values.base,
-      head: values.head,
-      readFile: gitReadFile,
-      audit: pnpmAudit,
-      log: (l) => process.stdout.write(`${l}\n`),
-    });
+    let base = values.base;
+    if (!base) {
+      if (process.env.GITHUB_ACTIONS !== "true") {
+        process.stderr.write("usage: ci-pnpm-audit-diff.mjs --base <rev> [--head <rev>]  (BASE auto-resolution runs in GitHub Actions only)\n");
+        return 2;
+      }
+      const r = resolveBase(
+        {
+          eventName: process.env.GITHUB_EVENT_NAME,
+          ref: process.env.GITHUB_REF,
+          prBaseSha: process.env.PR_BASE_SHA,
+          before: process.env.PUSH_BEFORE,
+        },
+        realGit,
+        say,
+      );
+      base = r.base;
+      say(`pnpm-audit-diff: BASE=${r.base} (${r.how})`);
+    }
+    result = runGate({ base, head: values.head, resolveRev: gitResolveRev, readFile: gitReadFile, audit: pnpmAudit, log: say });
   } catch (e) {
-    process.stdout.write(`::error title=pnpm audit::${e.message}\n`);
+    say(`::error title=pnpm audit::${e.message}`);
     return 2;
   }
-  process.stdout.write(`${result.lines.join("\n")}\n`);
-  for (const a of result.annotations) process.stdout.write(`${a}\n`);
+  say(result.lines.join("\n"));
+  for (const a of result.annotations) say(a);
   if (process.env.GITHUB_STEP_SUMMARY) {
     try {
       appendFileSync(process.env.GITHUB_STEP_SUMMARY, `### pnpm audit (introduced advisories)\n\n\`\`\`\n${result.lines.join("\n")}\n\`\`\`\n`);
