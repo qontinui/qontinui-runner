@@ -202,7 +202,11 @@ const PRIMITIVE_IMPLS: &[(&str, &str, &str)] = &[
         "close_with_deadline",
     ),
     ("terminal/session.rs", "TerminalSession", "close_kill_only"),
-    ("terminal/session.rs", "TerminalSession", "close_for_handoff"),
+    (
+        "terminal/session.rs",
+        "TerminalSession",
+        "close_for_handoff",
+    ),
     (
         "terminal/session.rs",
         "TerminalSession",

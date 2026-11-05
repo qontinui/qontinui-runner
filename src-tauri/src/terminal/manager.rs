@@ -1703,7 +1703,9 @@ mod tests {
 
         let empty = TerminalManager::new();
         assert!(
-            empty.close_all(Instant::now(), super::CloseMode::Kill).complete,
+            empty
+                .close_all(Instant::now(), super::CloseMode::Kill)
+                .complete,
             "nothing to close is a complete teardown"
         );
 
@@ -1712,7 +1714,10 @@ mod tests {
         in_budget.insert_for_test("term-b", session());
         assert!(
             in_budget
-                .close_all(Instant::now() + Duration::from_secs(600), super::CloseMode::Kill)
+                .close_all(
+                    Instant::now() + Duration::from_secs(600),
+                    super::CloseMode::Kill
+                )
                 .complete,
             "every terminal closed inside the budget"
         );
@@ -1722,7 +1727,9 @@ mod tests {
         exhausted.insert_for_test("term-a", session());
         exhausted.insert_for_test("term-b", session());
         assert!(
-            !exhausted.close_all(Instant::now(), super::CloseMode::Kill).complete,
+            !exhausted
+                .close_all(Instant::now(), super::CloseMode::Kill)
+                .complete,
             "a kill-only fallback is a degraded teardown"
         );
         assert_eq!(exhausted.count_checked(), Some(0));
