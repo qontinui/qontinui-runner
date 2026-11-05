@@ -508,7 +508,7 @@ export async function closeEmptyPagesWith<T>(
 ): Promise<number> {
   const first = await read();
   if (!first.complete) return 0;
-  const removed = await removeEach(emptyPageIds(visiblePages, first.ids), read, remove);
+  const { removed } = await removeEach(emptyPageIds(visiblePages, first.ids), read, remove);
   return removed.length;
 }
 
@@ -725,46 +725,61 @@ export function useTerminalPages() {
    * the page config and its `page:<id>:` keys. It closes no PTY — unlike
    * `removePage`, which stays the explicit per-page close. Resolves to what
    * Undo needs to put the page back, or `null` when the page was kept.
+   *
+   * `keep`, when given, is re-evaluated AFTER the terminal re-list (the last
+   * await), against the page as it is then: the auto-prune uses it to re-check
+   * that the page is still not active, not bound and still `auto`.
    */
-  const removeEmptyPage = useCallback(async (id: string): Promise<RemovedPage | null> => {
-    if (id === "default") return null;
-    try {
-      const result = await invoke<{
-        success: boolean;
-        data?: { terminals: Array<{ id: string; pageId?: string; page_id?: string }> };
-      }>("terminal_list");
-      if (!result.success || !result.data) return null;
-      if (pageIdsFromTerminals(result.data.terminals).includes(id)) return null;
-    } catch {
-      return null;
-    }
+  const removeEmptyPage = useCallback(
+    async (
+      id: string,
+      keep?: (page: TerminalPageConfig) => boolean,
+    ): Promise<RemovedPage | null> => {
+      if (id === "default") return null;
+      try {
+        const result = await invoke<{
+          success: boolean;
+          data?: { terminals: Array<{ id: string; pageId?: string; page_id?: string }> };
+        }>("terminal_list");
+        if (!result.success || !result.data) return null;
+        if (pageIdsFromTerminals(result.data.terminals).includes(id)) return null;
+      } catch {
+        return null;
+      }
 
-    const roster = allPagesRef.current;
-    const index = roster.findIndex((p) => p.id === id);
-    if (index < 0 || roster.length <= 1) return null;
-    const prefix = `page:${id}:`;
-    const removed: RemovedPage = {
-      page: roster[index],
-      index,
-      entries: instanceStorage.entriesByPrefix(prefix),
-    };
-    instanceStorage.removeByPrefix(prefix);
-    const drop = (list: TerminalPageConfig[]) => list.filter((p) => p.id !== id);
-    allPagesRef.current = drop(roster);
-    savePages(allPagesRef.current);
-    setPages((prev) => {
-      const updated = drop(prev);
-      if (updated.length === prev.length) return prev;
-      savePages(updated);
-      return updated;
-    });
-    if (activePageIdRef.current === id) {
-      activePageIdRef.current = "default";
-      setActivePageIdState("default");
-      instanceStorage.setItem(ACTIVE_PAGE_KEY, "default");
-    }
-    return removed;
-  }, []);
+      const roster = allPagesRef.current;
+      const index = roster.findIndex((p) => p.id === id);
+      if (index < 0 || roster.length <= 1) return null;
+      if (keep?.(roster[index])) return null;
+      const prefix = `page:${id}:`;
+      const removed: RemovedPage = {
+        page: roster[index],
+        index,
+        entries: instanceStorage.entriesByPrefix(prefix),
+      };
+      instanceStorage.removeByPrefix(prefix);
+      const drop = (list: TerminalPageConfig[]) => list.filter((p) => p.id !== id);
+      // The ref is updated eagerly for the synchronous readers of this pass;
+      // storage is written only from the authoritative `prev`, and Undo's index
+      // is taken there too.
+      allPagesRef.current = drop(roster);
+      setPages((prev) => {
+        const at = prev.findIndex((p) => p.id === id);
+        if (at < 0) return prev;
+        removed.index = at;
+        const updated = drop(prev);
+        savePages(updated);
+        return updated;
+      });
+      if (activePageIdRef.current === id) {
+        activePageIdRef.current = "default";
+        setActivePageIdState("default");
+        instanceStorage.setItem(ACTIVE_PAGE_KEY, "default");
+      }
+      return removed;
+    },
+    [],
+  );
 
   /**
    * Remove every docked page that hosts no terminal ("Close empty tabs").
@@ -777,7 +792,10 @@ export function useTerminalPages() {
    * pages removed.
    */
   const closeEmptyPages = useCallback(
-    () => closeEmptyPagesWith(visiblePagesRef.current, readOccupiedPageIds, removeEmptyPage),
+    () =>
+      closeEmptyPagesWith(visiblePagesRef.current, readOccupiedPageIds, (id) =>
+        removeEmptyPage(id),
+      ),
     [removeEmptyPage],
   );
 
@@ -788,9 +806,21 @@ export function useTerminalPages() {
     setPruneNotice(null);
   }, []);
 
+  /**
+   * Show (or, while one is open, EXTEND) the prune notice and restart its Undo
+   * window: a second pass inside the window must not take away the first
+   * batch's Undo. Removals stay in removal order, which Undo walks backwards.
+   */
   const showPruneNotice = useCallback(
-    (notice: PruneNotice) => {
+    (added: PruneNotice) => {
       if (pruneNoticeTimerRef.current) clearTimeout(pruneNoticeTimerRef.current);
+      const open = pruneNoticeRef.current;
+      const notice: PruneNotice = open
+        ? {
+            removed: [...open.removed, ...added.removed],
+            renames: [...open.renames, ...added.renames],
+          }
+        : added;
       pruneNoticeRef.current = notice;
       setPruneNotice(notice);
       pruneNoticeTimerRef.current = setTimeout(clearPruneNotice, PRUNE_UNDO_MS);
@@ -817,7 +847,6 @@ export function useTerminalPages() {
     for (const r of notice.removed) instanceStorage.restoreEntries(r.entries);
     const restore = (list: TerminalPageConfig[]) => restoreRemovedPages(list, notice.removed);
     allPagesRef.current = restore(allPagesRef.current);
-    savePages(allPagesRef.current);
     setPages((prev) => {
       const updated = restore(prev);
       savePages(updated);
@@ -847,28 +876,47 @@ export function useTerminalPages() {
         if (getPerfCapsLoadState() !== "loaded") return;
 
         let removed: RemovedPage[] = [];
+        let allReadsComplete = true;
         if (getPerfCaps().prune_empty_auto_pages) {
           const candidates = prunablePageIds(allPagesRef.current, occupied, {
             activePageId: activePageIdRef.current,
             boundPages: getPageBindings(),
             now: Date.now(),
           });
-          removed = await removeEach(candidates, readOccupiedPageIds, removeEmptyPage);
+          // The guards are re-checked at removal time: the operator may have
+          // activated, popped out or renamed (→ operator) a candidate mid-pass.
+          const noLongerPrunable = (page: TerminalPageConfig) =>
+            page.origin !== "auto" ||
+            page.id === activePageIdRef.current ||
+            !!getPageBindings()[page.id];
+          const pass = await removeEach(candidates, readOccupiedPageIds, (id) =>
+            removeEmptyPage(id, noLongerPrunable),
+          );
+          removed = pass.removed;
+          allReadsComplete = pass.allReadsComplete;
         }
 
+        // The repair needs the WHOLE pass on complete reads: a candidate kept
+        // by an incomplete re-read could otherwise take a populated page's name.
         let renames: PageRename[] = [];
-        if (instanceStorage.getItem(PAGES_VERSION_KEY) !== String(PAGES_VERSION)) {
-          renames = duplicateNameRepairs(allPagesRef.current);
+        if (
+          allReadsComplete &&
+          instanceStorage.getItem(PAGES_VERSION_KEY) !== String(PAGES_VERSION)
+        ) {
+          renames = duplicateNameRepairs(allPagesRef.current, occupied);
+          const writeVersion = () =>
+            instanceStorage.setItem(PAGES_VERSION_KEY, String(PAGES_VERSION));
           if (renames.length > 0) {
             allPagesRef.current = applyRenames(allPagesRef.current, renames);
-            savePages(allPagesRef.current);
             setPages((prev) => {
               const updated = applyRenames(prev, renames);
               savePages(updated);
+              writeVersion();
               return updated;
             });
+          } else {
+            writeVersion();
           }
-          instanceStorage.setItem(PAGES_VERSION_KEY, String(PAGES_VERSION));
         }
 
         if (removed.length > 0 || renames.length > 0) showPruneNotice({ removed, renames });

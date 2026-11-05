@@ -12,6 +12,7 @@ import {
   duplicateNameRepairs,
   prunablePageIds,
   pruneNoticeText,
+  removeEach,
   restoreRemovedPages,
   withClassifiedOrigins,
   type RemovedPage,
@@ -94,6 +95,12 @@ describe("prunablePageIds (D3)", () => {
     const pages = [page("default", "Terminal"), auto("1"), auto("2")];
     expect(prunablePageIds(pages, new Set(), guards)).toEqual(["2"]);
   });
+
+  it("counts only docked pages for the keep-one rule", () => {
+    const pages = [auto("1"), auto("2"), auto("bound")];
+    const bound = { ...guards, boundPages: { bound: "terminal-popout-1" } };
+    expect(prunablePageIds(pages, new Set(), bound)).toEqual(["2"]);
+  });
 });
 
 describe("duplicateNameRepairs (D2 (b))", () => {
@@ -106,15 +113,38 @@ describe("duplicateNameRepairs (D2 (b))", () => {
       page("tmux", "tmux", { createdAt: 1 }),
       page("tmux-b", "tmux", { createdAt: 2 }),
     ];
-    expect(duplicateNameRepairs(pages)).toEqual([
+    expect(duplicateNameRepairs(pages, new Set())).toEqual([
       { id: "t2", from: "Terminal", to: "Page 6" },
       { id: "tmux-b", from: "tmux", to: "tmux 2" },
-      { id: "p5-new", from: "Page 5", to: "Page 5 2" },
+      // A runner name is renamed by the runner-name rule, not suffixed.
+      { id: "p5-new", from: "Page 5", to: "Page 7" },
+    ]);
+  });
+
+  it("lets an occupied page keep its name over an older empty one", () => {
+    const pages = [
+      page("oct", "Page 20", { createdAt: 1, origin: "auto" }),
+      page("nov", "Page 20", { createdAt: 9, origin: "auto" }),
+    ];
+    expect(duplicateNameRepairs(pages, new Set(["nov"]))).toEqual([
+      { id: "oct", from: "Page 20", to: "Page 21" },
+    ]);
+  });
+
+  it("lets an operator page keep its name over an older auto one", () => {
+    const pages = [
+      page("a", "tmux", { createdAt: 1, origin: "auto" }),
+      page("b", "tmux", { createdAt: 9, origin: "operator" }),
+    ];
+    expect(duplicateNameRepairs(pages, new Set())).toEqual([
+      { id: "a", from: "tmux", to: "tmux 2" },
     ]);
   });
 
   it("changes nothing on a clean roster", () => {
-    expect(duplicateNameRepairs([page("default", "Terminal"), page("a", "Page 1")])).toEqual([]);
+    expect(
+      duplicateNameRepairs([page("default", "Terminal"), page("a", "Page 1")], new Set()),
+    ).toEqual([]);
   });
 });
 
@@ -142,6 +172,27 @@ describe("restoreRemovedPages (Undo)", () => {
       removed,
     );
     expect(restored.map((p) => p.name)).toEqual(["Page 4", "Page 3 2", "Terminal", "Page 3"]);
+  });
+});
+
+describe("removeEach", () => {
+  const read = (...ids: string[]) => ({ ids: new Set(ids), complete: true });
+  it("reports a pass that met an incomplete re-read", async () => {
+    const reads = [read(), { ids: new Set<string>(), complete: false }];
+    const pass = await removeEach(
+      ["a", "b"],
+      async () => reads.shift()!,
+      async (id) => id,
+    );
+    expect(pass).toEqual({ removed: ["a"], allReadsComplete: false });
+  });
+  it("reports a whole pass as complete", async () => {
+    const pass = await removeEach(
+      ["a", "b"],
+      async () => read("b"),
+      async (id) => id,
+    );
+    expect(pass).toEqual({ removed: ["a"], allReadsComplete: true });
   });
 });
 
