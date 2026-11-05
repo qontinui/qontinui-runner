@@ -2686,6 +2686,44 @@ mod tests {
         );
     }
 
+    /// The ids [`observed_back`] counts back this boot, sorted.
+    fn back_ids(
+        store: &SessionLifecycleStore,
+        boot: i64,
+        live: &HashSet<String>,
+    ) -> Vec<String> {
+        observed_back(store, Some(boot), Some(live))
+    }
+
+    /// D2: an attempt stamp is not a return. The frontend stamps
+    /// `restored_from_boot_at` with tier `failed` the moment it ATTEMPTS a
+    /// resume (`mark_restore_pending{boot:true}`); on 2026-11-04 103 rows sat
+    /// there with no `claude` ever typed, and the ledger read them back.
+    #[test]
+    fn a_stamp_only_row_is_not_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let boot = chrono::Utc::now().timestamp_millis() - 60_000;
+        store.record_open(store_rec("stamped"));
+        store.mark_restore_pending("stamped", true);
+        // Its pre-restart terminal is gone: nothing live binds it.
+        let live: HashSet<String> = HashSet::new();
+        assert_eq!(back_ids(&store, boot, &live), Vec::<String>::new());
+    }
+
+    /// D2: a live terminal is not a live conversation. A pane the restore
+    /// created as a plain shell is alive and bound to the row, and no `claude`
+    /// runs in it.
+    #[test]
+    fn an_open_row_bound_to_a_live_bare_shell_is_not_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let boot = chrono::Utc::now().timestamp_millis() - 60_000;
+        store.record_open(store_rec("shell"));
+        let live: HashSet<String> = ["term-shell".to_string()].into_iter().collect();
+        assert_eq!(back_ids(&store, boot, &live), Vec::<String>::new());
+    }
+
     /// Only a terminal whose PTY process is alive binds an `open` row as back:
     /// an exited PTY the manager still lists, or one whose pid is gone, is not.
     #[test]

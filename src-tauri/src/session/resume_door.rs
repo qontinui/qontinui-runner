@@ -936,6 +936,21 @@ mod tests {
         assert_eq!((ok.config_dir.as_str(), ok.zone_index), ("/cfg", 2));
     }
 
+    /// CHARACTERISATION — documents CURRENT behaviour, not the target (plan
+    /// `2026-11-04-unplanned-restart-restore-is-page-gated-and-counts-unverified-resumes`,
+    /// Phase 0 (i)). After an unplanned restart an `open` row stays bound to a
+    /// terminal id that no longer exists in this process, and the door refuses
+    /// it `not_closed` — the 29 rows of 2026-11-04. `classify` reads only the
+    /// row, so the absent terminal changes nothing. Phase 2 (D3) widens
+    /// `classify` for this boot's dead-bound rows and flips this assertion.
+    #[test]
+    fn classify_refuses_an_open_row_whose_bound_terminal_is_absent_not_closed() {
+        let mut dead_bound = rec("open");
+        dead_bound.closed_at = None;
+        dead_bound.terminal_id = "term-from-the-previous-process".to_string();
+        assert_eq!(reason(classify(ID, Some(&dead_bound))), "not_closed");
+    }
+
     #[test]
     fn select_ids_defaults_to_closed_unfinished_newest_first_and_dedups_explicit() {
         let mut a = rec("closed");
