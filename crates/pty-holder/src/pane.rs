@@ -614,6 +614,10 @@ mod tests {
     /// Plan 2026-11-04 Phase 4 (the arming test): the socket and its staged
     /// `.upg` twin fit `sun_path` whatever the pane dir, the path is stable,
     /// and the pane dir is part of the name.
+    ///
+    /// It calls the real `socket_root()`, so it creates (if missing) the real
+    /// per-user root — `/run/user/<uid>/qontinui-pty` or
+    /// `/tmp/qontinui-pty-<uid>` — and fails where that root is refused.
     #[cfg(unix)]
     #[test]
     fn socket_path_fits_sun_path_for_long_pane_dir() {
