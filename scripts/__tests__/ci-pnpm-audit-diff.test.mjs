@@ -13,6 +13,7 @@ import {
   GateUsageError,
   auditConfigDrift,
   diffAdvisories,
+  escapeAnnotation,
   npmrcAuditKeys,
   parseAudit,
   resolveBase,
@@ -461,4 +462,13 @@ test("resolveBase: a non-trunk push with no merge-base even after unshallow is U
     (e) => e instanceof GateUsageError && /no merge-base/.test(e.message),
   );
   assert.ok(f.log.some((l) => l.startsWith("fetch unshallow")));
+});
+
+test("escapeAnnotation escapes %, CR and LF in the message only", () => {
+  assert.equal(
+    escapeAnnotation("::error title=pnpm audit::fatal: 50% done\r\nsecond line"),
+    "::error title=pnpm audit::fatal: 50%25 done%0D%0Asecond line",
+  );
+  assert.equal(escapeAnnotation("::warning title=pnpm audit::plain"), "::warning title=pnpm audit::plain");
+  assert.equal(escapeAnnotation("not a command\nline"), "not a command\nline");
 });

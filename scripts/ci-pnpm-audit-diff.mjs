@@ -512,6 +512,17 @@ function pnpmAudit(files) {
   }
 }
 
+/**
+ * Escape the message part of a workflow command (`::cmd props::message`) so a
+ * `%`, CR or LF inside it (git stderr, for example) is not cut short or
+ * garbled in the annotation. Lines that are not workflow commands pass through.
+ */
+export function escapeAnnotation(line) {
+  const m = /^(::[a-z-]+(?: [^:]*)?::)([\s\S]*)$/.exec(line);
+  if (!m) return line;
+  return m[1] + m[2].replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+}
+
 function main(argv) {
   const say = (l) => process.stdout.write(`${l}\n`);
   let values;
@@ -544,11 +555,11 @@ function main(argv) {
     }
     result = runGate({ base, head: values.head, resolveRev: gitResolveRev, readFile: gitReadFile, audit: pnpmAudit, log: say });
   } catch (e) {
-    say(`::error title=pnpm audit::${e.message}`);
+    say(escapeAnnotation(`::error title=pnpm audit::${e.message}`));
     return 2;
   }
   say(result.lines.join("\n"));
-  for (const a of result.annotations) say(a);
+  for (const a of result.annotations) say(escapeAnnotation(a));
   if (process.env.GITHUB_STEP_SUMMARY) {
     try {
       appendFileSync(process.env.GITHUB_STEP_SUMMARY, `### pnpm audit (introduced advisories)\n\n\`\`\`\n${result.lines.join("\n")}\n\`\`\`\n`);
