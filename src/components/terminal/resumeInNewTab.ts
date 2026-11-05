@@ -20,7 +20,7 @@ import type { ResourceGuardSource } from "@/lib/resourceGuard";
 import { describeThrown } from "@/lib/utils";
 import { loadDefaultConfigHome, resolveAccountDir } from "./defaultConfigHome";
 import { rememberSessionId } from "./lastKnownSessionIds";
-import { fetchLiveClaudeSessionIds } from "./liveClaudeSessions";
+import { fetchVisibleLiveClaudeSessionIds } from "./liveClaudeSessions";
 import {
   buildSessionOpenArgs,
   noteRecordedZone,
@@ -147,10 +147,12 @@ async function resumeAccountDirs(
  * Open a tab for `target` and type its verified `--resume`.
  *
  * A session some live process already hosts is refused (`already-running`):
- * typing `--resume` would fork its transcript. An UNREADABLE live registry
- * does not refuse — unlike the unattended boot restore, which fails closed,
- * this is an operator's explicit click — and the verification still guards the
- * typed command.
+ * typing `--resume` would fork its transcript. The check reads every session
+ * the registry can SEE live, so a session in a readable dir is still refused
+ * while another dir cannot be listed. An UNREADABLE live registry does not
+ * refuse — unlike the unattended boot restore, which fails closed, this is an
+ * operator's explicit click — and the verification still guards the typed
+ * command.
  */
 export async function resumeInNewTab(
   deps: ResumeInNewTabDeps,
@@ -170,7 +172,7 @@ export async function resumeInNewTab(
     return { kind: "failed", failure: "needs-account", tabId: null };
   }
   const { recordDir, typedDir } = dirs;
-  const live = await (deps.liveSessionIds ?? fetchLiveClaudeSessionIds)();
+  const live = await (deps.liveSessionIds ?? fetchVisibleLiveClaudeSessionIds)();
   if (live?.has(claudeSessionId)) {
     return { kind: "failed", failure: "already-running", tabId: null };
   }
