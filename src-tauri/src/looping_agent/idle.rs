@@ -63,8 +63,7 @@ pub const PROCESSING_INDICATORS: &[&str] = &[
 /// 42 of 43 on another, together with the turn-done line). Only the hint
 /// itself is masked, never the rest of its line.
 static CLEAR_HINT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"/clear to save [0-9][0-9.,]*[kmb]? tokens")
-        .expect("CLEAR_HINT is a valid regex")
+    Regex::new(r"/clear to save [0-9][0-9.,]*[kmb]? tokens").expect("CLEAR_HINT is a valid regex")
 });
 
 /// Does `ind` occur in the lowercased row `lower` OUTSIDE the idle `/clear`
