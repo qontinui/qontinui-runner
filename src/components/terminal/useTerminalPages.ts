@@ -679,7 +679,11 @@ export function useTerminalPages() {
    * page asks for the reserved "Terminal" (see `renameRefusal`). The tab bar
    * shows the refusal inline.
    */
-  const renamePage = useCallback((id: string, name: string): boolean => {
+  const renamePage = useCallback((id: string, rawName: string): boolean => {
+    // Store what was checked: a trailing space would otherwise make two tabs
+    // that read identically while `uniquePageName` sees them as different.
+    const name = rawName.trim();
+    if (!name) return false;
     if (renameRefusal(allPagesRef.current, id, name) !== null) return false;
     setPages((prev) => {
       // Re-check against the authoritative roster: the ref can lag a tick.

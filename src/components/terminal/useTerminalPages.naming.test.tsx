@@ -172,5 +172,27 @@ describe("rename", () => {
     expect(container.querySelector('[role="alert"]')?.textContent).toBe("Name in use");
     expect(container.querySelector('input[aria-label="Page name"]')).not.toBeNull();
     expect(persisted().map((p) => p.name)).toEqual(["Page 1", "resumes"]);
+
+    // Clicking away from a refused name drops the edit and keeps the old name.
+    act(() => {
+      input.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
+    });
+    expect(container.querySelector('input[aria-label="Page name"]')).toBeNull();
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(persisted().map((p) => p.name)).toEqual(["Page 1", "resumes"]);
+  });
+
+  it("stores the trimmed name it checked", () => {
+    seed([
+      { id: "a", name: "tmux", createdAt: 1 },
+      { id: "b", name: "Page 2", createdAt: 2 },
+    ]);
+    const { hook } = mount();
+    let ok = true;
+    act(() => void (ok = hook().renamePage("b", "tmux ")));
+    expect(ok).toBe(false);
+    act(() => void (ok = hook().renamePage("b", "  agentic  ")));
+    expect(ok).toBe(true);
+    expect(persisted().map((p) => p.name)).toEqual(["tmux", "agentic"]);
   });
 });
