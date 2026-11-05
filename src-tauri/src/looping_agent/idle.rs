@@ -342,6 +342,27 @@ mod tests {
     }
 
     #[test]
+    fn the_merge_shepherd_idle_screen_with_a_non_ascii_verb_reads_idle() {
+        // The settled screen the merge shepherd's tab sat on for two days
+        // (2026-11-03 to 2026-11-05) while a pre-def4c43e8 runner never nudged
+        // it, replayed from the tab's own PTY bytes. Claude Code's past-tense
+        // verbs are not all ASCII ("Sautéed"), so the summary-row test must
+        // stay Unicode-aware; the footer rows are the real ones too.
+        let grid = lines(&[
+            "  - Clauses not followed: none.",
+            "",
+            "✻ Sautéed for 4m 36s · done 3:36 PM",
+            "",
+            "──────────────────────────────── loop-Merge Shepherd ─",
+            "❯ ",
+            "───────────────────────────────────────────────────────",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)   ✔ Update installed · Restart to apply",
+            "new task? /clear to save 188k tokens",
+        ]);
+        assert!(snapshot_looks_idle(&grid, 7));
+    }
+
+    #[test]
     fn cursor_above_prompt_row_is_not_idle() {
         let grid = lines(&["streaming output", "more", "❯ "]);
         // Cursor up in the output region ⇒ still painting ⇒ not idle.
