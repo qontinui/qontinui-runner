@@ -3548,18 +3548,28 @@ where
 /// refuse it (plan `2026-09-17-runner-loopback-api-accepts-any-origin`, F4).
 /// The self-call is a NonBrowser request and must look like one.
 ///
-/// `cookie` and `authorization` are the END USER's ambient credentials to the
-/// web backend — the browser's session cookie (carrying `access_token`, a
-/// Cognito bearer) and the user's bearer. The runner trusts its own relay
-/// channel, never the end user's credentials, and neither it nor anything on
-/// its box that reads its logs may receive a replayable web credential. The web
-/// backend already drops them (qontinui-web `device_bridge_ws.py`
-/// `_AMBIENT_CREDENTIAL_REQUEST_HEADERS`); this is defense in depth against an
-/// older backend still forwarding them. No runner handler reads either header
-/// from a relayed caller: the routes that read `Authorization` want a session
-/// proxy nonce and none of them is on `RELAY_ALLOWED`, and no route reads a
-/// cookie at all (plan `2026-09-17-retire-the-runner-origin-guard-dev-grace`,
-/// F5 / Phase 5).
+/// The remaining seven are the END USER's ambient credentials, and they are
+/// exactly qontinui-web `device_bridge_ws.py`
+/// `_AMBIENT_CREDENTIAL_REQUEST_HEADERS` — keep the two sets equal. `cookie`
+/// and `authorization` are the browser's session cookie (carrying
+/// `access_token`, a Cognito bearer) and the user's bearer; `proxy-authorization`
+/// and `x-csrf-token` are their siblings; `x-machine-key`,
+/// `x-device-machine-key` and `x-coord-admin-secret` are fleet secrets a
+/// caller of the web backend may present to IT. The runner trusts its own
+/// relay channel, never the end user's credentials, and neither it nor
+/// anything on its box that reads its logs may receive a replayable one. The
+/// web backend already drops them; this is defense in depth against an older
+/// backend still forwarding them.
+///
+/// No runner handler reads any of the seven from a relayed caller. The routes
+/// that read an inbound `Authorization` all want a session proxy nonce —
+/// `/coord-mcp`, `/coord-mcp/doctor`, `nonce_gated_coord_get`,
+/// `coord_write_proxy_handler`, `/vcs/pull-requests`,
+/// `/sessions/transcript-bind` and the plan-library write door — and none of
+/// them is on `RELAY_ALLOWED`. The runner only ever SENDS the three fleet
+/// secrets outbound (env-agent, device-JWT refresh, claims), and no route reads
+/// a cookie, `proxy-authorization` or `x-csrf-token` at all (plan
+/// `2026-09-17-retire-the-runner-origin-guard-dev-grace`, F5 / Phase 5).
 const RELAY_SKIP_REQUEST_HEADERS: &[&str] = &[
     "host",
     "connection",
@@ -3569,6 +3579,11 @@ const RELAY_SKIP_REQUEST_HEADERS: &[&str] = &[
     "sec-fetch-site",
     "cookie",
     "authorization",
+    "proxy-authorization",
+    "x-csrf-token",
+    "x-machine-key",
+    "x-device-machine-key",
+    "x-coord-admin-secret",
 ];
 
 /// Hop-by-hop / framing response headers that must NOT be echoed back over
@@ -7388,48 +7403,65 @@ mod tests {
 
     /// Plan `2026-09-17-retire-the-runner-origin-guard-dev-grace` Phase 5
     /// acceptance test 3: a relayed frame carrying the browser's ambient
-    /// credentials (`cookie`, `authorization`) must reach the loopback
-    /// self-call with neither, while an ordinary header still passes — so the
-    /// test cannot go green by stripping every header.
+    /// credentials must reach the loopback self-call with none of them, while
+    /// an ordinary header still passes — so the test cannot go green by
+    /// stripping every header. Covers the whole web-side
+    /// `_AMBIENT_CREDENTIAL_REQUEST_HEADERS` set, sent mixed-case.
     #[tokio::test]
     async fn relay_strips_ambient_cookie_and_authorization() {
+        const AMBIENT: &[(&str, &str)] = &[
+            ("Cookie", "access_token=x"),
+            ("Authorization", "Bearer y"),
+            ("Proxy-Authorization", "Basic z"),
+            ("X-CSRF-Token", "csrf"),
+            ("X-Machine-Key", "mk"),
+            ("X-Device-Machine-Key", "dmk"),
+            ("X-Coord-Admin-Secret", "admin"),
+        ];
         async fn handler(headers: HeaderMap) -> impl axum::response::IntoResponse {
-            let body = json!({
-                "cookie": headers.get("cookie").and_then(|v| v.to_str().ok()),
-                "authorization": headers.get("authorization").and_then(|v| v.to_str().ok()),
-                "x_test": headers.get("x-test").and_then(|v| v.to_str().ok()),
-            })
-            .to_string();
-            (AxumStatus::OK, [("content-type", "application/json")], body)
+            let mut body = serde_json::Map::new();
+            for (name, _) in AMBIENT {
+                let lk = name.to_ascii_lowercase();
+                let v = headers.get(lk.as_str()).and_then(|v| v.to_str().ok());
+                body.insert(lk, json!(v));
+            }
+            body.insert(
+                "x_test".into(),
+                json!(headers.get("x-test").and_then(|v| v.to_str().ok())),
+            );
+            (
+                AxumStatus::OK,
+                [("content-type", "application/json")],
+                Value::Object(body).to_string(),
+            )
         }
         // `/status` is RELAY_ALLOWED (see the GET round trip above).
         let base = spawn_test_server(Router::new().route("/status", get(handler))).await;
+        let mut headers = serde_json::Map::new();
+        for (name, value) in AMBIENT {
+            headers.insert((*name).into(), json!(value));
+        }
+        headers.insert("x-test".into(), json!("kept"));
         let env = json!({
             "type": "http_request",
             "request_id": "req-ambient-cred",
             "method": "GET",
             "path": "/status",
-            "headers": {
-                "Cookie": "access_token=x",
-                "Authorization": "Bearer y",
-                "x-test": "kept"
-            },
+            "headers": Value::Object(headers),
             "body_b64": ""
         });
         let reply = relay_http_to_base(&base, &env).await;
         assert_eq!(reply["status"], 200);
         let body = String::from_utf8(b64_decode(reply["body_b64"].as_str().unwrap())).unwrap();
         let parsed: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(
-            parsed["cookie"],
-            Value::Null,
-            "cookie must not reach the loopback call"
-        );
-        assert_eq!(
-            parsed["authorization"],
-            Value::Null,
-            "authorization must not reach the loopback call"
-        );
+        for (name, _) in AMBIENT {
+            let lk = name.to_ascii_lowercase();
+            assert_eq!(
+                parsed[lk.as_str()],
+                Value::Null,
+                "{lk} must not reach the loopback call"
+            );
+        }
         assert_eq!(parsed["x_test"], "kept", "ordinary headers still forwarded");
     }
 
