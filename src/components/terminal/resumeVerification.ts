@@ -295,10 +295,41 @@ export async function waitForClaudeHandshake(
  * - `remote`: the pane has no local pid, so its subtree cannot be observed.
  * - `unknown`: a local pane whose table could not be read, an IPC failure, or
  *   an unparseable answer — says nothing either way.
+ *
+ * `root` is the pane's root process from the same table read, present only on
+ * `live` / `absent` when the answer carries all three root fields (an older
+ * runner sends none): its image, whether the runner counts that image as a
+ * shell, and how many processes run under it. `absent` alone is NOT "nothing
+ * is running": an npm-installed claude is `node … cli.js`, which the image test
+ * reads `absent` — only `root` can say the pane is a bare idle shell.
  */
 export interface PaneClaudeProbe {
   state: "live" | "absent" | "remote" | "unknown";
   sessionIds: string[];
+  root?: PaneRootProcess;
+}
+
+/** The pane's root process as `terminal_probe_claude` read it. */
+export interface PaneRootProcess {
+  /** Image name (`bash`, `pwsh.exe`, `node`); `null` when the table lacks the root pid. */
+  image: string | null;
+  /** The runner counts `image` as a shell (never a `claude` of any install). */
+  isShell: boolean;
+  /** Processes under the root, at any depth. */
+  descendants: number;
+}
+
+function readRoot(data: {
+  rootImage?: unknown;
+  rootIsShell?: unknown;
+  rootDescendants?: unknown;
+}): PaneRootProcess | undefined {
+  const { rootImage, rootIsShell, rootDescendants } = data;
+  if (rootImage !== null && typeof rootImage !== "string") return undefined;
+  if (typeof rootIsShell !== "boolean") return undefined;
+  if (typeof rootDescendants !== "number" || !Number.isInteger(rootDescendants)) return undefined;
+  if (rootDescendants < 0) return undefined;
+  return { image: rootImage, isShell: rootIsShell, descendants: rootDescendants };
 }
 
 /**
@@ -318,7 +349,17 @@ export async function probeClaudeInPane(
 ): Promise<PaneClaudeProbe> {
   try {
     const resp = await invoker("terminal_probe_claude", { terminalId: tabId });
-    const data = (resp as { data?: { state?: unknown; sessionIds?: unknown } } | null)?.data;
+    const data = (
+      resp as {
+        data?: {
+          state?: unknown;
+          sessionIds?: unknown;
+          rootImage?: unknown;
+          rootIsShell?: unknown;
+          rootDescendants?: unknown;
+        };
+      } | null
+    )?.data;
     const state = data?.state;
     if (state !== "live" && state !== "absent" && state !== "remote") {
       return { state: "unknown", sessionIds: [] };
@@ -326,7 +367,8 @@ export async function probeClaudeInPane(
     const sessionIds = Array.isArray(data?.sessionIds)
       ? data.sessionIds.filter((v): v is string => typeof v === "string")
       : [];
-    return { state, sessionIds };
+    const root = state === "remote" ? undefined : readRoot(data ?? {});
+    return root ? { state, sessionIds, root } : { state, sessionIds };
   } catch {
     return { state: "unknown", sessionIds: [] };
   }
