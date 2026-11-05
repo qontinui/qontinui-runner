@@ -4,7 +4,22 @@ import { listen } from "@tauri-apps/api/event";
 import { COORD_DRAIN_STATE_EVENT } from "@/hooks/useCoordDrainState";
 import { instanceStorage } from "@/lib/instance-storage";
 import { getPageBindings, subscribePageBindings } from "@/lib/pageBindings";
+import { getPerfCaps, getPerfCapsLoadState, loadPerfCaps } from "@/lib/perfCaps";
 import { DEFAULT_PAGE_NAME, nextAutoPageName, renameRefusal, uniquePageName } from "./pageNaming";
+import {
+  PAGES_VERSION,
+  PAGES_VERSION_KEY,
+  PRUNE_UNDO_MS,
+  applyRenames,
+  duplicateNameRepairs,
+  prunablePageIds,
+  removeEach,
+  restoreRemovedPages,
+  withClassifiedOrigins,
+  type OccupancyRead,
+  type PageRename,
+  type RemovedPage,
+} from "./pagePrune";
 
 /**
  * Who made a page. `"auto"`: the runner synthesized it (a reconcile tab for a
@@ -75,13 +90,18 @@ export function readPinnedPageId(): string | null {
  * every own enumerable field on `TerminalPageConfig` — including the optional
  * `defaultWorkingDir` — survives save/load unchanged, and a page persisted
  * WITHOUT the field loads as a plain `TerminalPageConfig` with it absent.
+ *
+ * A page persisted before `origin` existed is classified here (plan 2026-11-05
+ * Phase 6, D2 (a); see `classifyLegacyOrigin`), so the auto-prune can tell a
+ * runner-made "Page N" from a page the operator named. The classification is
+ * persisted by the next save.
  */
 export function loadPages(): TerminalPageConfig[] {
   const pages = instanceStorage.getJSON<TerminalPageConfig[]>(STORAGE_KEY, []);
   if (pages.length === 0) {
     return [{ id: "default", name: "Terminal", createdAt: 0 }];
   }
-  return pages;
+  return withClassifiedOrigins(pages);
 }
 
 /**
@@ -423,10 +443,14 @@ export function reconcilePages(
 
 /**
  * The page ids hosting ≥1 live terminal (`terminal_list`) or restorable session
- * (`terminal_session_list_open`). Returns `null` when a source could not be read
- * (occupancy UNKNOWN) unless `bestEffort`, which returns whatever was read.
+ * (`terminal_session_list_open`), and whether that read is COMPLETE. `ids` is
+ * always what was read (reconcile mints tabs from it either way); `complete` is
+ * `false` when a source could not be read, or when the session list answered
+ * `deferredByDrain` — coord's drain WITHHOLDS the restorable set, so its empty
+ * `sessions` is UNKNOWN, not "no restorable rows" (plan 2026-11-05 Phase 6).
+ * Only a complete read may decide that a page is empty.
  */
-export async function readOccupiedPageIds(bestEffort = false): Promise<Set<string> | null> {
+export async function readOccupiedPageIds(): Promise<OccupancyRead> {
   const ids = new Set<string>();
   let complete = true;
 
@@ -449,7 +473,7 @@ export async function readOccupiedPageIds(bestEffort = false): Promise<Set<strin
   // holding only not-yet-restored continuations gets no tab from source 1.
   try {
     const resp = await invoke<{
-      data?: { sessions?: Array<{ pageId?: string }> };
+      data?: { sessions?: Array<{ pageId?: string }>; deferredByDrain?: unknown };
     }>("terminal_session_list_open");
     const sessions = resp?.data?.sessions;
     if (Array.isArray(sessions)) {
@@ -457,11 +481,12 @@ export async function readOccupiedPageIds(bestEffort = false): Promise<Set<strin
     } else {
       complete = false;
     }
+    if (resp?.data?.deferredByDrain) complete = false;
   } catch {
     complete = false;
   }
 
-  return complete || bestEffort ? ids : null;
+  return { ids, complete };
 }
 
 /**
@@ -469,26 +494,43 @@ export async function readOccupiedPageIds(bestEffort = false): Promise<Set<strin
  * ordering is testable without React or Tauri.
  *
  * Occupancy is read once to pick candidates, then RE-READ immediately before
- * each close: a terminal may have landed on a candidate while earlier pages were
- * being removed (`removePage` kills the page's terminals, so a stale decision is
- * destructive). FAIL-CLOSED: an unreadable occupancy closes nothing. Returns how
- * many pages were closed.
+ * each removal (`removeEach`): a terminal may have landed on a candidate while
+ * earlier pages were being removed. FAIL-CLOSED: an incomplete read — a source
+ * unreadable, or the restorable set withheld by a drain — removes nothing.
+ * `remove` is the record-only `removeEmptyPage`, which itself keeps a page it
+ * finds a terminal on; it resolves to `null` when it kept the page. Returns how
+ * many pages were removed.
  */
-export async function closeEmptyPagesWith(
+export async function closeEmptyPagesWith<T>(
   visiblePages: TerminalPageConfig[],
-  read: () => Promise<Set<string> | null>,
-  remove: (id: string) => Promise<void>,
+  read: () => Promise<OccupancyRead>,
+  remove: (id: string) => Promise<T | null>,
 ): Promise<number> {
-  const ids = await read();
-  if (!ids) return 0;
-  let closed = 0;
-  for (const id of emptyPageIds(visiblePages, ids)) {
-    const fresh = await read();
-    if (!fresh || fresh.has(id)) continue;
-    await remove(id);
-    closed++;
+  const first = await read();
+  if (!first.complete) return 0;
+  const { removed } = await removeEach(emptyPageIds(visiblePages, first.ids), read, remove);
+  return removed.length;
+}
+
+/**
+ * Whether the runner's PTY-holder boot sweep has SETTLED
+ * (`terminal_holder_sweep_settled`) — a prune precondition: until it has, a
+ * pane a holder kept alive may not be listed by `terminal_list` yet. Anything
+ * but an explicit `settled: true` (a timeout, an error) is "not yet".
+ */
+export async function holderSweepSettled(): Promise<boolean> {
+  try {
+    const resp = await invoke<{ data?: { settled?: boolean } }>("terminal_holder_sweep_settled");
+    return resp?.data?.settled === true;
+  } catch {
+    return false;
   }
-  return closed;
+}
+
+/** What the strip's prune notice shows; `removed` is what Undo puts back. */
+export interface PruneNotice {
+  removed: RemovedPage[];
+  renames: PageRename[];
 }
 
 export function useTerminalPages() {
@@ -535,9 +577,25 @@ export function useTerminalPages() {
     () => new Set<string>(),
   );
 
+  // The active page as the auto-prune must see it at decision time (the prune
+  // runs inside an async reconcile, after the render that captured state).
+  const activePageIdRef = useRef(activePageId);
+  useEffect(() => {
+    activePageIdRef.current = activePageId;
+  }, [activePageId]);
+
+  // The strip's prune notice (Undo lives while it is shown) and the guards that
+  // keep the prune pass single-flight and its sweep probe paid once.
+  const [pruneNotice, setPruneNotice] = useState<PruneNotice | null>(null);
+  const pruneNoticeRef = useRef<PruneNotice | null>(null);
+  const pruneNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const prunePassInFlightRef = useRef(false);
+  const holderSweepSettledRef = useRef(false);
+
   const setActivePageId = useCallback(
     (id: string) => {
       if (isPinned) return; // pinned window: active page is fixed
+      activePageIdRef.current = id;
       setActivePageIdState(id);
       instanceStorage.setItem(ACTIVE_PAGE_KEY, id);
     },
@@ -660,17 +718,218 @@ export function useTerminalPages() {
   }, []);
 
   /**
-   * Close every docked page that hosts no terminal ("Close empty tabs").
+   * Record-only removal of an EMPTY page (lifecycle-authority plan
+   * `2026-10-28-one-session-lifecycle-authority` Phase 15 (a)(3), landed here
+   * first in that shape). It re-lists the page's terminals at removal time and
+   * KEEPS the page when it finds one or cannot read the list; otherwise it drops
+   * the page config and its `page:<id>:` keys. It closes no PTY — unlike
+   * `removePage`, which stays the explicit per-page close. Resolves to what
+   * Undo needs to put the page back, or `null` when the page was kept.
+   *
+   * `keep`, when given, is re-evaluated AFTER the terminal re-list (the last
+   * await), against the page as it is then: the auto-prune uses it to re-check
+   * that the page is still not active, not bound and still `auto`.
+   */
+  const removeEmptyPage = useCallback(
+    async (
+      id: string,
+      keep?: (page: TerminalPageConfig) => boolean,
+    ): Promise<RemovedPage | null> => {
+      if (id === "default") return null;
+      try {
+        const result = await invoke<{
+          success: boolean;
+          data?: { terminals: Array<{ id: string; pageId?: string; page_id?: string }> };
+        }>("terminal_list");
+        if (!result.success || !result.data) return null;
+        if (pageIdsFromTerminals(result.data.terminals).includes(id)) return null;
+      } catch {
+        return null;
+      }
+
+      const roster = allPagesRef.current;
+      const index = roster.findIndex((p) => p.id === id);
+      if (index < 0 || roster.length <= 1) return null;
+      if (keep?.(roster[index])) return null;
+      const prefix = `page:${id}:`;
+      const removed: RemovedPage = {
+        page: roster[index],
+        index,
+        entries: instanceStorage.entriesByPrefix(prefix),
+      };
+      instanceStorage.removeByPrefix(prefix);
+      const drop = (list: TerminalPageConfig[]) => list.filter((p) => p.id !== id);
+      // The removal is DECIDED here, against the ref (every writer this pass
+      // races — rename, activate, the prune itself — updates it eagerly).
+      // Storage is written only from the authoritative `prev`, and Undo's
+      // index is refined there; a page `prev` no longer holds is already gone,
+      // which Undo's restore tolerates.
+      allPagesRef.current = drop(roster);
+      setPages((prev) => {
+        const at = prev.findIndex((p) => p.id === id);
+        if (at < 0) return prev;
+        removed.index = at;
+        const updated = drop(prev);
+        savePages(updated);
+        return updated;
+      });
+      if (activePageIdRef.current === id) {
+        activePageIdRef.current = "default";
+        setActivePageIdState("default");
+        instanceStorage.setItem(ACTIVE_PAGE_KEY, "default");
+      }
+      return removed;
+    },
+    [],
+  );
+
+  /**
+   * Remove every docked page that hosts no terminal ("Close empty tabs").
    *
    * Occupancy is re-read from the backend rather than trusting the cached
    * `occupiedPageIds` (a terminal may have landed since the last debounced
-   * reconcile). FAIL-CLOSED: if either source cannot be read, occupancy is
-   * UNKNOWN and nothing is closed — an unread source must not read as "empty".
-   * Returns the number of pages closed.
+   * reconcile). FAIL-CLOSED: an incomplete read — a source unreadable, or the
+   * restorable set withheld by a drain — is UNKNOWN and removes nothing.
+   * Record-only (`removeEmptyPage`): no PTY is closed. Returns the number of
+   * pages removed.
    */
   const closeEmptyPages = useCallback(
-    () => closeEmptyPagesWith(visiblePagesRef.current, readOccupiedPageIds, removePage),
-    [removePage],
+    () =>
+      closeEmptyPagesWith(visiblePagesRef.current, readOccupiedPageIds, (id) =>
+        removeEmptyPage(id),
+      ),
+    [removeEmptyPage],
+  );
+
+  const clearPruneNotice = useCallback(() => {
+    if (pruneNoticeTimerRef.current) clearTimeout(pruneNoticeTimerRef.current);
+    pruneNoticeTimerRef.current = null;
+    pruneNoticeRef.current = null;
+    setPruneNotice(null);
+  }, []);
+
+  /**
+   * Show (or, while one is open, EXTEND) the prune notice and restart its Undo
+   * window: a second pass inside the window must not take away the first
+   * batch's Undo. Removals stay in removal order, which Undo walks backwards.
+   */
+  const showPruneNotice = useCallback(
+    (added: PruneNotice) => {
+      if (pruneNoticeTimerRef.current) clearTimeout(pruneNoticeTimerRef.current);
+      const open = pruneNoticeRef.current;
+      const notice: PruneNotice = open
+        ? {
+            removed: [...open.removed, ...added.removed],
+            renames: [...open.renames, ...added.renames],
+          }
+        : added;
+      pruneNoticeRef.current = notice;
+      setPruneNotice(notice);
+      pruneNoticeTimerRef.current = setTimeout(clearPruneNotice, PRUNE_UNDO_MS);
+    },
+    [clearPruneNotice],
+  );
+  useEffect(
+    () => () => {
+      if (pruneNoticeTimerRef.current) clearTimeout(pruneNoticeTimerRef.current);
+    },
+    [],
+  );
+
+  /**
+   * Undo the last auto-prune while its notice is shown: re-insert the pages at
+   * their prior indices, with their `page:<id>:` keys, as `origin: "operator"`
+   * — reconcile re-runs on every `terminal-created` / `terminal-exit`, so pages
+   * brought back as `auto` would be pruned again on the next pass.
+   */
+  const undoPrune = useCallback(() => {
+    const notice = pruneNoticeRef.current;
+    clearPruneNotice();
+    if (!notice || notice.removed.length === 0) return;
+    for (const r of notice.removed) instanceStorage.restoreEntries(r.entries);
+    const restore = (list: TerminalPageConfig[]) => restoreRemovedPages(list, notice.removed);
+    allPagesRef.current = restore(allPagesRef.current);
+    setPages((prev) => {
+      const updated = restore(prev);
+      savePages(updated);
+      return updated;
+    });
+  }, [clearPruneNotice]);
+
+  /**
+   * The auto-prune and the one-time roster repair (plan 2026-11-05 Phase 6,
+   * D2 / D3). Runs from `reconcile` ONLY on a complete, non-drain-deferred
+   * occupancy read, once the holder boot sweep has settled and the off-switch
+   * (`performance.prune_empty_auto_pages`) has been READ — an unread setting
+   * prunes nothing. Every removal re-reads occupancy first and is record-only.
+   * Then, once per roster version, the name repair runs over what survived and
+   * the version is written. Single-flight: a reconcile landing mid-pass skips.
+   */
+  const pruneAndRepair = useCallback(
+    async (occupied: ReadonlySet<string>) => {
+      if (prunePassInFlightRef.current) return;
+      prunePassInFlightRef.current = true;
+      try {
+        if (!holderSweepSettledRef.current) {
+          holderSweepSettledRef.current = await holderSweepSettled();
+          if (!holderSweepSettledRef.current) return;
+        }
+        await loadPerfCaps();
+        if (getPerfCapsLoadState() !== "loaded") return;
+
+        let removed: RemovedPage[] = [];
+        let allReadsComplete = true;
+        // The freshest complete occupancy, for the repair's claim order.
+        let lastOccupied: ReadonlySet<string> = occupied;
+        if (getPerfCaps().prune_empty_auto_pages) {
+          const candidates = prunablePageIds(allPagesRef.current, occupied, {
+            activePageId: activePageIdRef.current,
+            boundPages: getPageBindings(),
+            now: Date.now(),
+          });
+          // The guards are re-checked at removal time: the operator may have
+          // activated, popped out or renamed (→ operator) a candidate mid-pass.
+          const noLongerPrunable = (page: TerminalPageConfig) =>
+            page.origin !== "auto" ||
+            page.id === activePageIdRef.current ||
+            !!getPageBindings()[page.id];
+          const pass = await removeEach(candidates, readOccupiedPageIds, (id) =>
+            removeEmptyPage(id, noLongerPrunable),
+          );
+          removed = pass.removed;
+          allReadsComplete = pass.allReadsComplete;
+          lastOccupied = pass.lastIds ?? occupied;
+        }
+
+        // The repair needs the WHOLE pass on complete reads: a candidate kept
+        // by an incomplete re-read could otherwise take a populated page's name.
+        let renames: PageRename[] = [];
+        if (
+          allReadsComplete &&
+          instanceStorage.getItem(PAGES_VERSION_KEY) !== String(PAGES_VERSION)
+        ) {
+          renames = duplicateNameRepairs(allPagesRef.current, lastOccupied);
+          const writeVersion = () =>
+            instanceStorage.setItem(PAGES_VERSION_KEY, String(PAGES_VERSION));
+          if (renames.length > 0) {
+            allPagesRef.current = applyRenames(allPagesRef.current, renames);
+            setPages((prev) => {
+              const updated = applyRenames(prev, renames);
+              savePages(updated);
+              writeVersion();
+              return updated;
+            });
+          } else {
+            writeVersion();
+          }
+        }
+
+        if (removed.length > 0 || renames.length > 0) showPruneNotice({ removed, renames });
+      } finally {
+        prunePassInFlightRef.current = false;
+      }
+    },
+    [removeEmptyPage, showPruneNotice],
   );
 
   /**
@@ -685,10 +944,20 @@ export function useTerminalPages() {
     const name = rawName.trim();
     if (!name) return false;
     if (renameRefusal(allPagesRef.current, id, name) !== null) return false;
+    // A name the operator typed is information: the page is theirs now, and
+    // the auto-prune leaves it alone. The ref is updated EAGERLY so an
+    // auto-prune pass already in flight sees the new origin at removal time.
+    const claim = (list: TerminalPageConfig[]) =>
+      list.map((p) => (p.id === id ? { ...p, name, origin: "operator" as const } : p));
+    allPagesRef.current = claim(allPagesRef.current);
     setPages((prev) => {
       // Re-check against the authoritative roster: the ref can lag a tick.
-      if (renameRefusal(prev, id, name) !== null) return prev;
-      const updated = prev.map((p) => (p.id === id ? { ...p, name } : p));
+      if (renameRefusal(prev, id, name) !== null) {
+        // Undo the eager ref write: state keeps `prev`, so no sync effect runs.
+        allPagesRef.current = prev;
+        return prev;
+      }
+      const updated = claim(prev);
       savePages(updated);
       allPagesRef.current = updated;
       return updated;
@@ -821,11 +1090,12 @@ export function useTerminalPages() {
   // Reconcile backend-known page_ids into the tab list. A backend-spawned gate
   // continuation can land on a freshly-minted page_id that isn't in the
   // persisted tab list, so without this it would render nowhere. We union the
-  // distinct ids from BOTH backend sources and synthesize a tab for any id not
-  // already persisted (see `reconcilePages`). Best-effort: a failed invoke must
-  // not throw out of the effect.
+  // already persisted (see `reconcilePages`). Tabs are minted from whatever was
+  // read, even an incomplete read; only a COMPLETE read goes on to the
+  // auto-prune (`pruneAndRepair`). A failed invoke must not throw out of the
+  // effect.
   const reconcile = useCallback(async () => {
-    const ids = (await readOccupiedPageIds(true)) ?? new Set<string>();
+    const { ids, complete } = await readOccupiedPageIds();
 
     // Record occupancy from the SAME unioned id set: `ids` is exactly the page
     // ids that currently host ≥1 live terminal (terminal_list) or restorable
@@ -843,13 +1113,17 @@ export function useTerminalPages() {
       else reconcileIds.delete(closed);
     }
 
+    const mint = (list: TerminalPageConfig[]) => reconcilePages(list, reconcileIds);
+    allPagesRef.current = mint(allPagesRef.current);
     setPages((prev) => {
-      const next = reconcilePages(prev, reconcileIds);
+      const next = mint(prev);
       if (next === prev) return prev; // nothing missing — no persist / no re-render
       savePages(next);
       return next;
     });
-  }, []);
+
+    if (complete) await pruneAndRepair(ids);
+  }, [pruneAndRepair]);
 
   // Run reconciliation once on mount and on a debounced `terminal-created` OR
   // `terminal-exit` event (a burst of continuations/exits collapses to a single
@@ -960,6 +1234,10 @@ export function useTerminalPages() {
     closeEmptyPages,
     /** Tabs the Close-empty button would close, per the last-known occupancy (a hint; the click re-reads). */
     emptyPageCount,
+    /** The last auto-prune / roster repair, while its Undo window is open; else `null`. */
+    pruneNotice,
+    /** Put back the pages the shown prune notice removed. */
+    undoPrune,
     renamePage,
     reorderPage,
     setPageDefaultWorkingDir,

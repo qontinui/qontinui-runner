@@ -51,6 +51,7 @@ describe("defaults", () => {
       share_terminal_output: true,
       redact_terminal_secrets: null,
       max_sessions_warn: 30,
+      prune_empty_auto_pages: true,
     });
   });
 

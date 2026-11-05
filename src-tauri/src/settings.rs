@@ -4172,6 +4172,13 @@ pub struct PerformanceSettings {
     /// throttle or refuse a spawn, and nothing may (plan §5).
     #[serde(default = "default_max_sessions_warn")]
     pub max_sessions_warn: u32,
+    /// Let the terminal page strip remove EMPTY pages the runner created on
+    /// its own (`origin: "auto"`) once restore has settled (plan
+    /// `2026-11-05-runner-terminal-pages-collide-crowd-and-overfill-and-limit-stalled-sessions-never-resume`
+    /// Phase 6). Read only by the webview (`useTerminalPages`); operator-made
+    /// pages are never pruned whatever this says. Default `true`.
+    #[serde(default = "default_prune_empty_auto_pages")]
+    pub prune_empty_auto_pages: bool,
 }
 
 /// Floor for [`PerformanceSettings::grid_scan_interval_ms`]. Mirrors the
@@ -4210,6 +4217,10 @@ fn default_share_terminal_output() -> bool {
 
 fn default_max_sessions_warn() -> u32 {
     30
+}
+
+fn default_prune_empty_auto_pages() -> bool {
+    true
 }
 
 impl Default for PerformanceSettings {
@@ -7146,6 +7157,7 @@ mod performance_settings_tests {
             "None keeps redaction following share_output, as before"
         );
         assert_eq!(p.max_sessions_warn, 30);
+        assert!(p.prune_empty_auto_pages, "the prune ships enabled");
     }
 
     /// A settings.json written before this key existed must load with every
@@ -7189,6 +7201,7 @@ mod performance_settings_tests {
             share_terminal_output: false,
             redact_terminal_secrets: Some(true),
             max_sessions_warn: 50,
+            prune_empty_auto_pages: false,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let back: PerformanceSettings = serde_json::from_str(&json).expect("deserialize");
