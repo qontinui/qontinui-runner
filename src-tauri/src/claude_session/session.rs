@@ -249,11 +249,19 @@ impl ClaudeSession {
         let pinned_config_dir = session_ctx
             .as_ref()
             .and_then(|c| c.pinned_config_dir.as_deref());
-        let (effective_config_dir, _config_dir_source) =
-            crate::ai_provider::get_effective_config_dir_with_override(
+        // A pin resolves through the one per-spawn resolver as
+        // `AccountChoice::Pinned`; no pin still reads the shared
+        // `RESOLVED_CONFIG_DIR` through `get_effective_config_dir`, unchanged
+        // until plan
+        // `2026-11-05-a-spawn-takes-its-own-account-pick-not-the-shared-resolved-dir`
+        // Phase 2 carries the caller's own pick here as `AccountChoice::Picked`.
+        let (effective_config_dir, _config_dir_source) = match pinned_config_dir {
+            Some(pin) => crate::ai_provider::get_effective_config_dir_for(
                 &ai_settings.claude_cli,
-                pinned_config_dir,
-            );
+                Some(&crate::ai_provider::AccountChoice::Pinned(pin.to_string())),
+            ),
+            None => crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli),
+        };
 
         // Required trailing flags for the interactive stream-json chat. The
         // shared launch seam (below) layers the operator template + the

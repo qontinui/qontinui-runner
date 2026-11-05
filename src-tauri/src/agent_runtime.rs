@@ -9554,9 +9554,9 @@ pub(crate) fn resolve_spawn_account_with(
 /// Production wiring of [`resolve_spawn_account_with`] against the live roster.
 ///
 /// The ONE seam a caller pinning an account must go through — never
-/// [`crate::ai_provider::pick_best_account`], which is a side-effect-only
-/// ROTATION helper (it returns `()`, no-ops unless `account_selection_mode ==
-/// LeastUsage`, and every call site discards it), and never
+/// [`crate::ai_provider::pick_best_account`], which is the runner's own
+/// ROTATION (what it returns is a pick, never a pin, and it publishes nothing
+/// in `Manual` mode), and never
 /// `switch_claude_account`, which would leak one spawn's account choice into
 /// every later spawn on this runner.
 pub(crate) fn resolve_spawn_account(
@@ -10714,17 +10714,27 @@ pub(crate) async fn spawn_claude_child(
     // ONE account resolution, feeding all three consumers below: the
     // precondition verdict, the trust pre-accept, and the `CLAUDE_CONFIG_DIR`
     // pin. It used to be resolved twice — `get_effective_config_dir(..).or(
-    // override)` for the pre-accept and `get_effective_config_dir_with_override`
+    // override)` for the pre-accept and a second override-aware resolution
     // for the pin. The two are equal by construction (an override wins in both),
     // but a verdict computed against a SECOND resolution is precisely the silent
     // no-op this phase exists to remove: it would make the log claim trust for
     // an account the child never runs under. One resolution cannot drift.
     let ai = crate::settings::get_ai_settings();
-    let (resolved_config_dir, config_dir_source) =
-        crate::ai_provider::get_effective_config_dir_with_override(
+    //
+    // A pin resolves through the one per-spawn resolver as
+    // `AccountChoice::Pinned`. A spawn with NO pin still reads the shared
+    // `RESOLVED_CONFIG_DIR` (the caller's earlier `pick_best_account`) through
+    // `get_effective_config_dir` — unchanged behaviour, kept deliberately until
+    // plan `2026-11-05-a-spawn-takes-its-own-account-pick-not-the-shared-resolved-dir`
+    // Phase 2 moves the pick into this function and resolves it as
+    // `AccountChoice::Picked`.
+    let (resolved_config_dir, config_dir_source) = match account_config_dir_override {
+        Some(pin) => crate::ai_provider::get_effective_config_dir_for(
             &ai.claude_cli,
-            account_config_dir_override,
-        );
+            Some(&crate::ai_provider::AccountChoice::Pinned(pin.to_string())),
+        ),
+        None => crate::ai_provider::get_effective_config_dir(&ai.claude_cli),
+    };
 
     // Phase 1 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`:
     // the pre-spawn verdicts, computed for the account this spawn RESOLVED.
