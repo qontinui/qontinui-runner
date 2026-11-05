@@ -64,6 +64,7 @@ use std::time::Duration;
 use qontinui_runner_lib::intercept_core::classify::{self, Classification, ShimTool};
 use qontinui_runner_lib::intercept_core::gate::{should_block, InterceptMode};
 use qontinui_runner_lib::intercept_core::npm_placeholder::is_npm_placeholder;
+use qontinui_runner_lib::intercept_core::shim_dir::is_qontinui_shim_dir;
 use qontinui_runner_lib::intercept_core::types::PackageSpecInput;
 
 const GUARD_ENV: &str = "QONTINUI_INSTALL_INTERCEPT_GUARD";
@@ -1198,15 +1199,21 @@ enum Want {
     Placeholder,
 }
 
-/// First candidate of kind `want` on `path_var`, skipping `own_dirs`.
+/// First candidate of kind `want` on `path_var`, skipping `own_dirs` and
+/// every qontinui shim dir ([`is_qontinui_shim_dir`]) — a foreign shim dir
+/// inherited from another runner session holds an identically named stub, and
+/// resolving it as the "real" tool made two shims dispatch to each other for
+/// ever (plan
+/// `2026-11-04-identity-shim-foreign-shim-ping-pong-and-secondary-runner-pty-socket-overflow`,
+/// Phase 1).
 fn scan_path_in(name: &str, own_dirs: &[PathBuf], path_var: &OsStr, want: Want) -> Option<PathBuf> {
     let own: Vec<PathBuf> = own_dirs.iter().map(|d| normalize_dir(d)).collect();
     for dir in env::split_paths(path_var) {
         if dir.as_os_str().is_empty() {
             continue;
         }
-        if own.contains(&normalize_dir(&dir)) {
-            continue; // skip our own dir(s) — never recurse
+        if own.contains(&normalize_dir(&dir)) || is_qontinui_shim_dir(&dir) {
+            continue; // skip our own dir(s) and any other qontinui shim — never recurse
         }
         // Windows real tools: cargo/pip = .exe; npm-family = .cmd. Prefer .exe.
         for cand_name in candidate_names(name) {
@@ -1638,6 +1645,43 @@ mod tests {
             normalize_dir(got.parent().unwrap()),
             normalize_dir(&realbin),
             "must resolve the real tool OUTSIDE the shim dir"
+        );
+    }
+
+    /// Plan 2026-11-04-identity-shim-foreign-shim-ping-pong-… Phase 1: a
+    /// FOREIGN qontinui shim dir (another runner session's, inherited on PATH
+    /// and absent from `own_dirs`) is skipped too — by name for either family,
+    /// and by the identity marker for a dir named otherwise.
+    #[test]
+    fn resolve_real_skips_a_foreign_qontinui_shim_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let own = tmp.path().join("qontinui-identity-own");
+        let foreign_identity = tmp.path().join("qontinui-identity-foreign");
+        let foreign_install = tmp.path().join("qontinui-shim-foreign");
+        let marked = tmp.path().join("renamed");
+        let realbin = tmp.path().join("realbin");
+        let exe = if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        };
+        for d in [&own, &foreign_identity, &foreign_install, &marked, &realbin] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join(exe), b"\x7fELF stub").unwrap();
+        }
+        std::fs::write(marked.join(".qontinui-identity-build"), b"tag").unwrap();
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let path = [&own, &foreign_identity, &foreign_install, &marked, &realbin]
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(sep);
+        let got = resolve_real_in("claude", std::slice::from_ref(&own), OsStr::new(&path))
+            .expect("must resolve the REAL claude");
+        assert_eq!(
+            normalize_dir(got.parent().unwrap()),
+            normalize_dir(&realbin),
+            "a foreign qontinui shim dir must never be taken for the real tool"
         );
     }
 

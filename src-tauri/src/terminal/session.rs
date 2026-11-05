@@ -1396,6 +1396,63 @@ fn consume_input_bytes(buf: &mut String, data: &[u8]) -> Vec<String> {
     completed
 }
 
+/// The PATH a PTY child gets: `runner_path` with every qontinui shim dir
+/// ([`is_qontinui_shim_dir`]) removed, then `own_dirs` prepended in order.
+///
+/// Two defects this closes (plan
+/// `2026-11-04-identity-shim-foreign-shim-ping-pong-and-secondary-runner-pty-socket-overflow`,
+/// Phase 2):
+///
+/// 1. A runner started from inside another runner's session (a supervisor
+///    launched there, then a temp runner) INHERITS that session's
+///    `qontinui-identity-*` dir. Passed through, it reached every pane's PATH,
+///    where two identity shims could dispatch to each other for ever.
+/// 2. The install-intercept seam rebuilt the child PATH from the runner's own
+///    and discarded the identity seam's prepend. Both seams now build through
+///    here, the install seam passing `[identity_dir, install_dir]`.
+///
+/// An entry equal to one of `own_dirs` is dropped from the tail as well, since
+/// it is already at the head. Every other entry keeps its position and its
+/// spelling, empty entries included. The separator is the platform's.
+///
+/// [`is_qontinui_shim_dir`]: crate::install_effects_producer::intercept::shim_materializer::is_qontinui_shim_dir
+pub(crate) fn compose_child_path(
+    runner_path: Option<&str>,
+    own_dirs: &[&std::path::Path],
+) -> String {
+    use crate::install_effects_producer::intercept::shim_materializer::is_qontinui_shim_dir;
+
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let trim = |s: &str| s.trim_end_matches(['/', '\\']).to_string();
+    let own: Vec<String> = own_dirs
+        .iter()
+        .map(|d| d.to_string_lossy().into_owned())
+        .collect();
+    let own_trimmed: Vec<String> = own.iter().map(|d| trim(d)).collect();
+    let is_own = |entry: &str| {
+        let entry = trim(entry);
+        own_trimmed.iter().any(|o| {
+            if cfg!(windows) {
+                o.eq_ignore_ascii_case(&entry)
+            } else {
+                *o == entry
+            }
+        })
+    };
+    let mut parts: Vec<&str> = own.iter().map(String::as_str).collect();
+    if let Some(path) = runner_path.filter(|p| !p.is_empty()) {
+        for entry in path.split(sep) {
+            if !entry.is_empty()
+                && (is_own(entry) || is_qontinui_shim_dir(std::path::Path::new(entry)))
+            {
+                continue;
+            }
+            parts.push(entry);
+        }
+    }
+    parts.join(&sep.to_string())
+}
+
 /// What [`TerminalSession::apply_identity_seam`] settled for one PTY child.
 ///
 /// A named struct rather than a bare tuple: the second field is a THREE-state
@@ -1419,6 +1476,10 @@ struct IdentitySeamOutcome {
     /// `QONTINUI_CLAUDE_HOOK_SETTINGS`, or `None` when materialization failed.
     /// Feeds [`TerminalSession::permission_request_hook`] for the shim path.
     hook_carrier: Option<std::path::PathBuf>,
+    /// The identity shim dir the seam put at the head of the child PATH, when
+    /// it materialized one. The install-intercept seam that runs after it
+    /// rebuilds the child PATH and must keep this dir ([`compose_child_path`]).
+    identity_dir: Option<std::path::PathBuf>,
 }
 
 /// What the waiter thread knows when a pane's process exits, handed to the
@@ -1917,7 +1978,7 @@ impl TerminalSession {
         // PATH + set the loopback port/mode so an agent that types `npm install …`
         // is transparently declared/observed. Fail-open: any materialize failure
         // injects nothing.
-        Self::apply_install_intercept_env(&mut cmd, &id);
+        Self::apply_install_intercept_env(&mut cmd, &id, seam.identity_dir.as_deref());
 
         // The LAST env mutations before the spawn — account pin, then the
         // credential scrub. Extracted so the ordering is unit-testable; see the
@@ -3121,10 +3182,8 @@ impl TerminalSession {
         cmd: &mut CommandBuilder,
         identity_dir: &std::path::Path,
     ) {
-        use crate::install_effects_producer::intercept::shim_materializer;
-
         let current_path = std::env::var("PATH").ok();
-        let new_path = shim_materializer::prepend_path(identity_dir, current_path.as_deref());
+        let new_path = compose_child_path(current_path.as_deref(), &[identity_dir]);
         Self::set_child_path(cmd, &new_path);
         // The identity shim reads this to skip its own dir in the
         // real-tool scan (reusing the install shim's env contract).
@@ -3288,7 +3347,18 @@ impl TerminalSession {
     /// (`PATH`/`Path`/`path`) — on Windows the runner env var is `Path`, so
     /// setting a bare `"PATH"` could leave the original `Path` (un-shimmed) to
     /// win the loader's case-insensitive resolution.
-    fn apply_install_intercept_env(cmd: &mut CommandBuilder, terminal_id: &str) {
+    ///
+    /// `identity_dir` is the identity seam's dir when that seam injected one.
+    /// The child PATH is rebuilt from the runner's own, so it must carry the
+    /// identity dir again: until plan
+    /// `2026-11-04-identity-shim-foreign-shim-ping-pong-and-secondary-runner-pty-socket-overflow`
+    /// Phase 2 this seam re-read the runner's PATH and silently DROPPED the
+    /// identity prepend whenever interception was on.
+    fn apply_install_intercept_env(
+        cmd: &mut CommandBuilder,
+        terminal_id: &str,
+        identity_dir: Option<&std::path::Path>,
+    ) {
         use crate::install_effects_producer::intercept::shim_materializer;
 
         if !shim_materializer::intercept_enabled() {
@@ -3306,7 +3376,11 @@ impl TerminalSession {
         };
 
         let current_path = std::env::var("PATH").ok();
-        let new_path = shim_materializer::prepend_path(&seam.shim_dir, current_path.as_deref());
+        let own_dirs: Vec<&std::path::Path> = identity_dir
+            .into_iter()
+            .chain(std::iter::once(seam.shim_dir.as_path()))
+            .collect();
+        let new_path = compose_child_path(current_path.as_deref(), &own_dirs);
         Self::set_child_path(cmd, &new_path);
         cmd.env(shim_materializer::PORT_ENV, seam.port.to_string());
         cmd.env(shim_materializer::MODE_ENV, &seam.mode);
@@ -3509,9 +3583,9 @@ impl TerminalSession {
                 .entered();
         let identity = shim_materializer::materialize_identity(&base_dir);
         drop(shim_span);
-        match identity {
+        match &identity {
             Some(identity_dir) => {
-                Self::apply_identity_path_shim(cmd, &identity_dir);
+                Self::apply_identity_path_shim(cmd, identity_dir);
                 info!(
                     terminal_id = %terminal_id,
                     identity_dir = %identity_dir.display(),
@@ -3578,6 +3652,7 @@ impl TerminalSession {
             coord_mcp,
             served,
             hook_carrier: hook_result,
+            identity_dir: identity,
         })
     }
 
@@ -6940,6 +7015,61 @@ pub(crate) mod tests {
         assert_eq!(TerminalSession::PATH_ENV_KEY, "Path");
         #[cfg(not(windows))]
         assert_eq!(TerminalSession::PATH_ENV_KEY, "PATH");
+    }
+
+    #[test]
+    fn compose_child_path_strips_foreign_shim_dirs_and_keeps_both_seams() {
+        // Plan 2026-11-04-identity-shim-foreign-shim-ping-pong-… Phase 2: an
+        // inherited foreign identity dir and a foreign install dir never reach
+        // the child; both of THIS runner's seams' dirs lead, identity first;
+        // everything else keeps its order and spelling, empty entries too.
+        let tmp = tempfile::tempdir().unwrap();
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let p = |name: &str| tmp.path().join(name).to_string_lossy().into_owned();
+        let identity = tmp.path().join("qontinui-identity-ownbuild");
+        let install = tmp.path().join("qontinui-shim-term-1");
+        // A foreign identity dir named otherwise but sealed by the marker.
+        let marked = tmp.path().join("renamed-identity");
+        std::fs::create_dir_all(&marked).unwrap();
+        std::fs::write(marked.join(".qontinui-identity-build"), b"tag").unwrap();
+
+        let runner_path = [
+            p("cargo-bin"),
+            p("qontinui-identity-abc"),
+            String::new(),
+            p("qontinui-shim-xyz"),
+            p("node-bin"),
+            format!("{}/", identity.display()), // our own, already inherited
+            marked.to_string_lossy().into_owned(),
+            p("usr-bin"),
+        ]
+        .join(sep);
+
+        let got = compose_child_path(Some(&runner_path), &[&identity, &install]);
+        let want = [
+            identity.to_string_lossy().into_owned(),
+            install.to_string_lossy().into_owned(),
+            p("cargo-bin"),
+            String::new(),
+            p("node-bin"),
+            p("usr-bin"),
+        ]
+        .join(sep);
+        assert_eq!(got, want);
+
+        // The identity seam alone, and a runner with no PATH at all.
+        let only_identity = compose_child_path(Some(&runner_path), &[&identity]);
+        assert!(only_identity.starts_with(&*identity.to_string_lossy()));
+        assert!(!only_identity.contains("qontinui-shim-xyz"));
+        assert!(!only_identity.contains("qontinui-identity-abc"));
+        assert_eq!(
+            compose_child_path(None, &[&identity]),
+            identity.to_string_lossy()
+        );
+        assert_eq!(
+            compose_child_path(Some(""), &[&identity]),
+            identity.to_string_lossy()
+        );
     }
 
     #[test]

@@ -64,7 +64,37 @@ is_npm_placeholder() {
 }
 
 # ---------------------------------------------------------------------------
-# Scan PATH, skipping SHIM_DIR, for the first candidate of one kind:
+# is_qontinui_shim_dir <dir>: true for ANY qontinui shim dir, not only ours.
+# A PATH inherited from another runner session (a supervisor started inside a
+# session, then a temp runner spawned from it) carries THAT session's shim dir
+# too; resolving its shim as the "real" tool made two shims exec each other for
+# ever, keeping the pid (plan 2026-11-04-identity-shim-foreign-shim-ping-pong-
+# and-secondary-runner-pty-socket-overflow, Phase 1). The same predicate as
+# intercept_core::shim_dir::is_qontinui_shim_dir: the dir's final name starts
+# with qontinui-identity- or qontinui-shim-, or it holds the identity-build
+# marker. Trailing separators are ignored, and the name splits on `/` and `\`
+# alike, so the MSYS and Windows spellings of one dir (our own included) read
+# the same. Builtins only (no fork per PATH entry).
+# ---------------------------------------------------------------------------
+is_qontinui_shim_dir() {
+  local d="$1" name
+  while :; do
+    case "$d" in
+      */|*\\) d="${d%?}" ;;
+      *) break ;;
+    esac
+  done
+  [ -n "$d" ] || return 1
+  name="${d##*/}"
+  name="${name##*\\}"
+  case "$name" in
+    qontinui-identity-*|qontinui-shim-*) return 0 ;;
+  esac
+  [ -e "$d/.qontinui-identity-build" ]
+}
+
+# ---------------------------------------------------------------------------
+# Scan PATH, skipping SHIM_DIR and every other qontinui shim dir, for the first candidate of one kind:
 # `scan_path real` wants a tool that is NOT npm's placeholder stub,
 # `scan_path placeholder` wants the stub itself (only for the give-up message).
 # ---------------------------------------------------------------------------
@@ -77,6 +107,7 @@ scan_path() {
     case "${dir%/}" in
       "${SHIM_DIR%/}") continue ;;
     esac
+    is_qontinui_shim_dir "$dir" && continue
     for cand in "$dir/$TOOL" "$dir/$TOOL.cmd" "$dir/$TOOL.exe"; do
       if [ -x "$cand" ] || [ -f "$cand" ]; then
         if is_npm_placeholder "$cand"; then
@@ -95,7 +126,7 @@ scan_path() {
 }
 
 # Resolve the REAL provider: first match on PATH that is NOT inside SHIM_DIR
-# and is not npm's placeholder stub.
+# (or any other qontinui shim dir) and is not npm's placeholder stub.
 resolve_real() { scan_path real; }
 
 # ---------------------------------------------------------------------------
@@ -183,8 +214,8 @@ exec_with_retry() {
 }
 
 # Run the real provider, replacing this process (we don't need an exit code
-# beyond what exec propagates). Strips our dir from PATH as a last resort when
-# the real tool couldn't be resolved.
+# beyond what exec propagates). Strips our dir, and every other qontinui shim
+# dir, from PATH as a last resort when the real tool couldn't be resolved.
 exec_real() {
   if [ -n "${REAL:-}" ]; then
     QONTINUI_INSTALL_INTERCEPT_GUARD=1 exec_with_retry exec "$REAL" "$@"
@@ -194,6 +225,7 @@ exec_real() {
   local IFS=':'
   for d in $PATH; do
     case "${d%/}" in "${SHIM_DIR%/}") continue ;; esac
+    is_qontinui_shim_dir "$d" && continue
     if [ -z "$newpath" ]; then newpath="$d"; else newpath="$newpath:$d"; fi
   done
   # Whatever answers the name-dispatch below must not wait again: if it is
