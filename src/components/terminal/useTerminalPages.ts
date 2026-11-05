@@ -952,7 +952,11 @@ export function useTerminalPages() {
     allPagesRef.current = claim(allPagesRef.current);
     setPages((prev) => {
       // Re-check against the authoritative roster: the ref can lag a tick.
-      if (renameRefusal(prev, id, name) !== null) return prev;
+      if (renameRefusal(prev, id, name) !== null) {
+        // Undo the eager ref write: state keeps `prev`, so no sync effect runs.
+        allPagesRef.current = prev;
+        return prev;
+      }
       const updated = claim(prev);
       savePages(updated);
       allPagesRef.current = updated;
