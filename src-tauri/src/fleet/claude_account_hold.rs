@@ -42,7 +42,7 @@
 //! | not ready, own hold, under [`RENEW_UNDER`] left | hold again with a new `until` (extends only) |
 //! | not ready, own hold, more left | nothing — so a repeat writes nothing |
 //! | not ready, drained by any other owner | nothing |
-//! | not ready, `clear`, recorded `until` still ahead | nothing, logged once: an operator undrained |
+//! | not ready, `clear`, recorded `until` still ahead | nothing, logged once: an operator undrained (until that `until`, or until an account is valid again) |
 //! | ready, own hold | release, on the first ready reading |
 //!
 //! Then the answers: `released` / `not_owner` end it; `absent` while `me/drain`
@@ -62,7 +62,9 @@
 //! it boots again …, never on a timer". This module is a bounded timer caller,
 //! and that is the doc's concern answered rather than ignored: it re-holds only
 //! while no account is valid, never after an operator undrain until the
-//! recorded `until` passes, and a renewal is about one write per 18 h. coord's
+//! recorded `until` passes or an account is valid again (a ready reading ends
+//! the no-account spell the undrain answered), and a renewal is about one
+//! write per 18 h. coord's
 //! doc is coord's to amend; this note is the runner half.
 //!
 //! ## Only the primary
@@ -281,7 +283,8 @@ pub(crate) enum Idle {
     HeldWithMargin,
     DrainedByOther,
     /// The lane reads clear while the hold this process recorded is unexpired:
-    /// an operator undrained. Respected until that `until`.
+    /// an operator undrained. Respected until that `until`, or until a ready
+    /// reading ends the no-account spell.
     OperatorUndrained {
         until: DateTime<Utc>,
     },
@@ -839,7 +842,10 @@ pub(crate) async fn account_hold_tick(mem: &mut HoldMemory, env: &HoldEnv) -> Ho
     }
     // The heartbeat's cached drain may already show the own hold (a hold whose
     // 200 was lost, read back by the heartbeat before this tick): record it too,
-    // so an undrain that follows is not taken for a lane to hold.
+    // so an undrain that follows is not taken for a lane to hold. This relies on
+    // a release folding its `read_back` into the cache (`write_release`), so a
+    // released hold is not still cached here; a release with no `read_back`
+    // re-reads the drain for the same reason.
     if let CoordDrainState::Drained { until, reason } = &cached {
         if is_own_reason(reason.as_deref()) {
             mem.note_lane(&LaneView::Drained {
@@ -893,9 +899,9 @@ pub(crate) async fn account_hold_tick(mem: &mut HoldMemory, env: &HoldEnv) -> Ho
         // Ready, and the lane carries no own hold: nothing is left to release
         // (a release whose answer was lost landed anyway), and the next
         // not-ready spell is a new one, not an operator undrain.
+        // `note_lane` has already cleared `release_left_to` for such a lane.
         if ready && lane.own_until().is_none() {
             mem.recorded = None;
-            mem.release_left_to = None;
         }
     }
 
@@ -1033,6 +1039,17 @@ async fn write_release(
     match next {
         ReleaseNext::Done => {
             mem.released();
+            // With no read-back folded, the cache may still show the released
+            // hold, and the tick would record it again from there.
+            if !matches!(
+                &reply,
+                ReleaseReply::Answered {
+                    read_back: Some(_),
+                    ..
+                }
+            ) {
+                refold(base).await;
+            }
             info!(
                 "fleet::claude_account_hold: a Claude account is valid again; released this \
                  runner's agent-lane hold ({said})"

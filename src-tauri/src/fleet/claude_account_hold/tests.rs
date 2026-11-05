@@ -1119,6 +1119,42 @@ mod over_http {
         assert!(lock(&coord).holds.is_empty());
     }
 
+    /// The heartbeat's cached drain shows the own hold (its 200 was lost before
+    /// this process recorded it) and the operator undrains before the tick's
+    /// own lane read: the cached hold is recorded, so the clear lane is an
+    /// undrain, not a lane to hold.
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "the default-location check reads the real login Keychain on macOS"
+    )]
+    async fn an_own_hold_seen_only_in_the_cached_drain_is_recorded() {
+        let (base, coord) = start_fake_coord().await;
+        let _runner = NoAccountRunner::arrange(&base).await;
+        let until = Utc::now() + chrono::Duration::hours(20);
+        crate::coord_drain_state::note_heartbeat(
+            crate::coord_drain_state::HeartbeatOutcome::Registered {
+                drain: DrainObservation::Drained {
+                    until: Some(until),
+                    reason: None,
+                },
+            },
+        )
+        .await;
+        crate::coord_drain_state::observe_me_drain(DrainObservation::Drained {
+            until: Some(until),
+            reason: Some(own_reason()),
+        });
+        // The fake coord's lane is clear: the operator already undrained.
+        let mut mem = streak(5);
+        let action = account_hold_tick(&mut mem, &primary_env()).await;
+        assert!(
+            matches!(action, HoldAction::Nothing(Idle::OperatorUndrained { .. })),
+            "{action:?}"
+        );
+        assert!(lock(&coord).holds.is_empty());
+    }
+
     /// A runner that boots into its own hold (left by the previous run) and is
     /// then undrained by an operator does not re-hold: the hold it read from the
     /// lane counts as recorded until its `until`.
