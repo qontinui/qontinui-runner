@@ -711,6 +711,7 @@ mod tests {
                 subtree_claude: Vec::new(),
                 top_level_children: 0,
                 tracked_alive: Vec::new(),
+                root: crate::terminal::graceful_exit::PaneRoot::default(),
             },
         )
     }
@@ -724,6 +725,7 @@ mod tests {
                 }],
                 top_level_children: 0,
                 tracked_alive: Vec::new(),
+                root: crate::terminal::graceful_exit::PaneRoot::default(),
             },
         )
     }

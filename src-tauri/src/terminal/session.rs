@@ -6071,6 +6071,7 @@ pub(crate) mod tests {
                 subtree_claude,
                 top_level_children: 0,
                 tracked_alive: Vec::new(),
+                root: crate::terminal::graceful_exit::PaneRoot::default(),
             },
         );
         let (session, io, typed) = live_prompt_parts(EMPTY_PROMPT, true, Some(scripted.root_pid));
@@ -6122,6 +6123,7 @@ pub(crate) mod tests {
                 subtree_claude: subtree.to_vec(),
                 top_level_children: 0,
                 tracked_alive: alive.to_vec(),
+                root: crate::terminal::graceful_exit::PaneRoot::default(),
             },
         )
     }

@@ -347,6 +347,32 @@ pub struct PaneProcesses {
     pub top_level_children: usize,
     /// Of the identities asked about, those alive ANYWHERE in the table.
     pub tracked_alive: Vec<ProcIdentity>,
+    /// The pane's root process itself, read from the SAME snapshot.
+    pub root: PaneRoot,
+}
+
+/// The pane's root process (the PTY child) as one snapshot shows it.
+///
+/// This is what tells a bare idle shell from a pane with work in it: a shell
+/// pane's root is the shell, and the shell has no descendant at all while it
+/// sits at its prompt. Whether `image` is a shell is the caller's question
+/// (`terminal_probe_claude` answers it against the runner's shell list); the
+/// probe only reports what the table holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PaneRoot {
+    /// The root's image name as the table records it (`bash`, `pwsh.exe`, …);
+    /// `None` when the root pid is not in the table.
+    pub image: Option<String>,
+    /// How many processes descend from the root, at any depth.
+    pub descendants: usize,
+}
+
+/// The pane's root process in `snapshot`. PURE.
+pub fn pane_root_in(root_pid: u32, snapshot: &ProcessSnapshot) -> PaneRoot {
+    PaneRoot {
+        image: snapshot.names.get(&root_pid).cloned(),
+        descendants: crate::process_capture::process_tree::descendant_count(root_pid, snapshot),
+    }
 }
 
 /// What a probe saw.
@@ -405,6 +431,7 @@ pub fn probe_from_snapshot(
         subtree_claude,
         top_level_children,
         tracked_alive,
+        root: pane_root_in(root_pid, snapshot),
     })
 }
 
@@ -1107,6 +1134,50 @@ mod tests {
         assert_eq!(view.tracked_alive, vec![id(200, 20)]);
     }
 
+    /// The root half of the answer comes from the same snapshot as the claude
+    /// half: the root's own image, and every process under it at any depth.
+    #[test]
+    fn probe_reports_the_root_image_and_every_descendant() {
+        // An npm-installed claude: `node … cli.js` under the shell, which
+        // `is_claude_image` does not count — the descendants still do.
+        let busy = snapshot(&[
+            (100, 1, "bash", 10),
+            (200, 100, "node", 20),
+            (210, 200, "rg", 21),
+            (300, 1, "sshd", 5),
+        ]);
+        let ClaudeProbe::Readable(view) = probe_from_snapshot(100, &busy, &[]) else {
+            panic!("readable");
+        };
+        assert!(view.subtree_claude.is_empty());
+        assert_eq!(
+            view.root,
+            PaneRoot {
+                image: Some("bash".to_string()),
+                descendants: 2,
+            }
+        );
+
+        // A bare shell at its prompt: the root is the shell, nothing under it.
+        let idle = snapshot(&[(100, 1, "pwsh.exe", 10), (300, 1, "sshd", 5)]);
+        let ClaudeProbe::Readable(view) = probe_from_snapshot(100, &idle, &[]) else {
+            panic!("readable");
+        };
+        assert_eq!(
+            view.root,
+            PaneRoot {
+                image: Some("pwsh.exe".to_string()),
+                descendants: 0,
+            }
+        );
+
+        // A root pid the table does not hold has no image to report.
+        let ClaudeProbe::Readable(view) = probe_from_snapshot(4242, &idle, &[]) else {
+            panic!("readable");
+        };
+        assert_eq!(view.root, PaneRoot::default());
+    }
+
     #[test]
     fn a_claude_gone_from_the_subtree_but_alive_elsewhere_is_still_alive() {
         // Re-parented to init (pid 1) while still running.
@@ -1148,6 +1219,7 @@ mod tests {
             subtree_claude: subtree.to_vec(),
             top_level_children: children,
             tracked_alive: alive.to_vec(),
+            root: PaneRoot::default(),
         })
     }
 
@@ -1686,6 +1758,7 @@ mod tests {
             subtree_claude: vec![CLAUDE],
             top_level_children: 0,
             tracked_alive: Vec::new(),
+            root: PaneRoot::default(),
         });
         let root = pane.root_pid;
         assert_eq!(

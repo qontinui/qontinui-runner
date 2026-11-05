@@ -485,6 +485,21 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         probe_with_empty_args: false,
         observe_projection: None,
     },
+    // The page twin of `terminal_set_title` — the live move the page
+    // reorganize makes (plan `2026-10-28-one-session-lifecycle-authority`
+    // Phase 15 (a)). The same move `POST /terminals/{id}/move` already serves
+    // over HTTP, so allowlisting it here widens no door; it lets a UI Bridge
+    // caller drive the move the way the webview does.
+    ProxyableCommand {
+        name: "terminal_set_page",
+        dispatch: Dispatch::Frontend,
+        description: "Move a terminal onto another terminal page WITHOUT closing it: the PTY and whatever runs in it (an AI session included) keep running. Mirrors `POST /terminals/{id}/move` — flushes the move into the durable lifecycle registry (a restart restores the pane on its new page) and broadcasts terminal-page-changed, which the target page answers by adopting the tab and the source page by evicting it. Errors on an empty `pageId` and on an unknown `terminalId`.",
+        args_schema: r#"{"type":"object","required":["terminalId","pageId"],"properties":{"terminalId":{"type":"string"},"pageId":{"type":"string","minLength":1}},"additionalProperties":false}"#,
+        response_schema: r#"{"type":"object","required":["success"],"properties":{"success":{"type":"boolean"},"message":{"type":["string","null"]},"data":{"type":["object","null"]}}}"#,
+        // Required args and it moves a live terminal -- never probe it.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
     // ---- Credential door (plan
     // 2026-08-30-every-runner-credential-door-goes-through-one-csp-forbidden-eval) ----
     //
@@ -921,6 +936,8 @@ mod tests {
     #[test]
     fn is_allowlisted_recognizes_coord_terminal_commands() {
         assert!(is_allowlisted("terminal_set_title"));
+        assert!(is_allowlisted("terminal_set_page"));
+        assert_eq!(dispatch_for("terminal_set_page"), Some(Dispatch::Frontend));
     }
 
     /// Plan `2026-09-22-transcript-sync-default-on-with-tenant-and-user-controls`

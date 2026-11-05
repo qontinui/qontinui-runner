@@ -2739,6 +2739,7 @@ mod tests {
             subtree_claude: vec![],
             top_level_children: 0,
             tracked_alive: vec![],
+            root: crate::terminal::graceful_exit::PaneRoot::default(),
         });
         assert_eq!(
             claude_live(&no_claude, |_| true),
@@ -2756,6 +2757,7 @@ mod tests {
             }],
             top_level_children: 0,
             tracked_alive: vec![],
+            root: crate::terminal::graceful_exit::PaneRoot::default(),
         });
         assert_eq!(claude_live(&live, |_| true), Ok(()));
         // A claude that exists but does not own the terminal (Ctrl-Z, `&`)

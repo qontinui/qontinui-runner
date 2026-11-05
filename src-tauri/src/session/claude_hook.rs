@@ -386,7 +386,12 @@ const SHELL_PROGRAMS: [&str; 10] = [
 ];
 
 /// Whether `program` is one of [`SHELL_PROGRAMS`]. PURE.
-fn is_shell_program(program: &str) -> bool {
+///
+/// Also the runner's one answer to "is this process image a shell" — the
+/// project move's bare-idle-shell reading (`terminal_probe_claude`'s
+/// `rootIsShell`) asks it of a pane's root image (`bash`, `pwsh.exe`), which
+/// splits the same way an argv's program does.
+pub(crate) fn is_shell_program(program: &str) -> bool {
     let stem = program_stem(program);
     SHELL_PROGRAMS.iter().any(|s| stem.eq_ignore_ascii_case(s))
 }
