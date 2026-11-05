@@ -308,15 +308,55 @@ fn run_async_inline<F: std::future::Future>(fut: F) -> F::Output {
 /// `RESOLVED_CONFIG_DIR`, which a sibling spawn's pick rewrites. The launch
 /// template, the trust pre-accept, federation and the child's
 /// `CLAUDE_CONFIG_DIR` all take this one value.
+///
+/// `Ok(None)` leaves `CLAUDE_CONFIG_DIR` unset, so the child inherits the
+/// ambient default. That is only safe when the ambient default has live
+/// credentials — the same check `agent_runtime::spawn_claude_child` makes —
+/// so with none it is an `Err` naming why, instead of a child that 401s. A
+/// choice whose credentials failed the re-check is logged with its source,
+/// so a fall to the ambient account is never silent.
 pub(crate) fn resolve_inline_config_dir(
     cli_settings: &crate::settings::ClaudeCliSettings,
     session_ctx: Option<&AiSessionContext>,
-) -> Option<String> {
-    crate::ai_provider::get_effective_config_dir_for(
+) -> Result<Option<String>, String> {
+    resolve_inline_config_dir_with(
         cli_settings,
-        session_ctx.and_then(|c| c.account.as_ref()),
+        session_ctx,
+        crate::ai_provider::oauth_refresh::default_location_has_valid_credentials,
     )
-    .0
+}
+
+/// [`resolve_inline_config_dir`] with the ambient-default credential check
+/// injected, so a test can drive both arms without a real login.
+fn resolve_inline_config_dir_with(
+    cli_settings: &crate::settings::ClaudeCliSettings,
+    session_ctx: Option<&AiSessionContext>,
+    default_location_has_valid_credentials: impl FnOnce() -> bool,
+) -> Result<Option<String>, String> {
+    let choice = session_ctx.and_then(|c| c.account.as_ref());
+    let (dir, source) = crate::ai_provider::get_effective_config_dir_for(cli_settings, choice);
+    if dir.is_some() {
+        return Ok(dir);
+    }
+    if source == crate::ai_provider::ClaudeConfigDirSource::RejectedNoCredentials {
+        warn!(
+            "inline claude session: account {} has no valid credentials \
+             (config_dir_source={}); falling back to the ambient default account",
+            choice.map_or_else(
+                || format!("{:?} (configured config_dir)", cli_settings.config_dir),
+                |c| format!("{c:?}"),
+            ),
+            source.as_str()
+        );
+    }
+    if !default_location_has_valid_credentials() {
+        let instance = crate::instance::instance_name().unwrap_or_else(|| "primary".to_string());
+        return Err(format!(
+            "no authenticated Claude account on this runner — run /login (instance={instance}, config_dir_source={})",
+            source.as_str()
+        ));
+    }
+    Ok(None)
 }
 
 /// Build the inline runner's `claude` child command, fully env-prepared.
@@ -552,7 +592,7 @@ fn run_claude_session_inline(
     // resolved dir (`resolve_inline_config_dir`).
     let config_dir = {
         let ai = crate::settings::get_ai_settings();
-        resolve_inline_config_dir(&ai.claude_cli, session_ctx.as_ref())
+        resolve_inline_config_dir(&ai.claude_cli, session_ctx.as_ref())?
     };
     let launch_cfg =
         crate::claude_session::launch_spec::LaunchConfig::from_settings(config_dir.as_deref());
@@ -2954,7 +2994,7 @@ mod spawn_env_tests {
 
 #[cfg(test)]
 mod inline_account_tests {
-    use super::resolve_inline_config_dir;
+    use super::resolve_inline_config_dir_with;
     use crate::ai_provider::config::test_support::dir_with_live_credentials;
     use crate::ai_provider::config::ResolvedConfigDirRestore;
     use crate::ai_provider::{set_resolved_config_dir, AccountChoice};
@@ -2988,15 +3028,47 @@ mod inline_account_tests {
         let mut ctx = AiSessionContext::agentic("task-inline", "Inline", 1);
         ctx.account = Some(AccountChoice::Picked(mine.clone()));
         assert_eq!(
-            resolve_inline_config_dir(&auto_mode_cli(), Some(&ctx)),
-            Some(mine)
+            resolve_inline_config_dir_with(&auto_mode_cli(), Some(&ctx), || true),
+            Ok(Some(mine))
         );
 
         ctx.account = None;
         assert_eq!(
-            resolve_inline_config_dir(&auto_mode_cli(), Some(&ctx)),
-            None
+            resolve_inline_config_dir_with(&auto_mode_cli(), Some(&ctx), || true),
+            Ok(None)
         );
-        assert_eq!(resolve_inline_config_dir(&auto_mode_cli(), None), None);
+        assert_eq!(
+            resolve_inline_config_dir_with(&auto_mode_cli(), None, || true),
+            Ok(None)
+        );
+    }
+
+    /// **A pick whose credentials died does not silently become the ambient
+    /// account.** It falls to the ambient default only when that default has
+    /// live credentials (the `spawn_claude_child` check); with none the inline
+    /// spawn refuses with an actionable reason instead of starting a child
+    /// that 401s.
+    #[test]
+    fn a_dead_pick_falls_to_the_ambient_account_only_when_it_is_live() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(Some(
+            AccountSelectionMode::WeightedRandom,
+        ));
+        let dead = tempfile::tempdir().unwrap();
+        let mut ctx = AiSessionContext::agentic("task-inline-dead", "Inline", 1);
+        ctx.account = Some(AccountChoice::Picked(
+            dead.path().to_string_lossy().to_string(),
+        ));
+
+        assert_eq!(
+            resolve_inline_config_dir_with(&auto_mode_cli(), Some(&ctx), || true),
+            Ok(None)
+        );
+        let err = resolve_inline_config_dir_with(&auto_mode_cli(), Some(&ctx), || false)
+            .expect_err("no live account anywhere must refuse the spawn");
+        assert!(
+            err.contains("no authenticated Claude account")
+                && err.contains("rejected_no_credentials"),
+            "the refusal names why: {err}"
+        );
     }
 }

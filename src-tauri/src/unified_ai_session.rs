@@ -106,6 +106,12 @@ pub struct AiSessionConfig {
     /// `AccountChoice::Pinned(<dir holding the transcript>)`, because a
     /// `--resume` finds its conversation only under the account that wrote it.
     pub account: Option<crate::ai_provider::AccountChoice>,
+    /// Run this one session under the ambient default account — no account
+    /// set, and no pick taken. The agentic resume arm sets it when the
+    /// transcript is under the ambient default location (see
+    /// `terminal::transcript::ResumeAccount::Ambient`). Ignored when
+    /// `account` is `Some`.
+    pub inherit_ambient_account: bool,
 }
 
 impl AiSessionConfig {
@@ -135,6 +141,7 @@ impl AiSessionConfig {
             db_flush_ctx: None,
             tool_policy: None,
             account: None,
+            inherit_ambient_account: false,
         }
     }
 
@@ -164,6 +171,7 @@ impl AiSessionConfig {
             db_flush_ctx: None,
             tool_policy: None,
             account: None,
+            inherit_ambient_account: false,
         }
     }
 
@@ -194,6 +202,7 @@ impl AiSessionConfig {
             db_flush_ctx: None,
             tool_policy: None,
             account: None,
+            inherit_ambient_account: false,
         }
     }
 
@@ -1234,7 +1243,14 @@ impl UnifiedAiSessionExecutor {
         // This session's own account when the caller set one (a resume pinned
         // to its transcript's account), else the workflow's own pick
         // (`AccountChoice::Picked`).
-        ctx.account = config.account.clone().or_else(|| self.account.clone());
+        // An ambient resume (`inherit_ambient_account`) carries no account at
+        // all — not even the workflow's pick.
+        if config.account.is_none() && config.inherit_ambient_account {
+            ctx.account = None;
+            ctx.inherit_ambient_account = true;
+        } else {
+            ctx.account = config.account.clone().or_else(|| self.account.clone());
+        }
 
         Some(ctx)
     }

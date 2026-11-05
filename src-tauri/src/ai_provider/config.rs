@@ -760,13 +760,19 @@ pub fn account_known_exhausted(config_dir: &str) -> bool {
 /// non-cooled-down account from the configured `claude_config_dirs`. Returns
 /// the dir it rotated to, or `None` when no alternative is available.
 ///
+/// `limited` is `None` when the caller could not name the account it ran under
+/// (an API provider call issued while `RESOLVED_CONFIG_DIR` was unset). Then
+/// nothing is cooled — there is no account to blame — and rotation still
+/// switches to the first non-cooled account, because the API providers read
+/// their account off the published global and need one set to retry under.
+///
 /// The limited account is the caller's to name. It used to be read off the
 /// shared `RESOLVED_CONFIG_DIR`, but under per-spawn draws that global is
 /// usually a concurrent sibling's pick, so the wrong account was cooled and the
 /// exhausted one stayed selectable. The rotated-to dir is still published to
 /// `RESOLVED_CONFIG_DIR` for the display readers and for the API providers,
 /// which read it per call.
-pub fn rotate_account_on_rate_limit(limited: &str) -> Option<String> {
+pub fn rotate_account_on_rate_limit(limited: Option<&str>) -> Option<String> {
     if crate::model_gateway::gateway_declared() {
         crate::model_gateway::note_subscription_path_off("rotate_account_on_rate_limit");
         return None;
@@ -776,7 +782,7 @@ pub fn rotate_account_on_rate_limit(limited: &str) -> Option<String> {
 
 /// [`rotate_account_on_rate_limit`] over an explicit roster — the seam its
 /// tests drive, since the live roster comes from `settings.json`.
-fn rotate_within(limited: &str, config_dirs: &[String]) -> Option<String> {
+fn rotate_within(limited: Option<&str>, config_dirs: &[String]) -> Option<String> {
     if config_dirs.len() < 2 {
         return None;
     }
@@ -791,18 +797,20 @@ fn rotate_within(limited: &str, config_dirs: &[String]) -> Option<String> {
         // already in the map. API providers may have already inserted a
         // precise `Retry-After`-derived duration; don't clobber that with
         // the shorter default.
-        if !map.contains_key(limited) {
-            info!(
-                "Marking account '{}' as rate-limited for {}s",
-                short_label(limited),
-                default_cooldown.as_secs()
-            );
-            map.insert(limited.to_string(), (Instant::now(), default_cooldown));
+        if let Some(limited) = limited {
+            if !map.contains_key(limited) {
+                info!(
+                    "Marking account '{}' as rate-limited for {}s",
+                    short_label(limited),
+                    default_cooldown.as_secs()
+                );
+                map.insert(limited.to_string(), (Instant::now(), default_cooldown));
+            }
         }
 
         // Find the first account that is not in cooldown
         let available = config_dirs.iter().find(|d| {
-            d.as_str() != limited
+            Some(d.as_str()) != limited
                 && map
                     .get(*d)
                     .is_none_or(|(marked_at, cooldown)| marked_at.elapsed() >= *cooldown)
@@ -815,7 +823,7 @@ fn rotate_within(limited: &str, config_dirs: &[String]) -> Option<String> {
             // (smallest remaining = `cooldown - elapsed`).
             let best = config_dirs
                 .iter()
-                .filter(|d| d.as_str() != limited)
+                .filter(|d| Some(d.as_str()) != limited)
                 .min_by_key(|d| {
                     map.get(*d)
                         .map(|(marked_at, cooldown)| cooldown.saturating_sub(marked_at.elapsed()))
@@ -837,7 +845,7 @@ fn rotate_within(limited: &str, config_dirs: &[String]) -> Option<String> {
     } else {
         info!(
             "Rotating account: '{}' -> '{}'",
-            short_label(limited),
+            limited.map_or("<unknown>", short_label),
             short_label(&dir)
         );
     }
@@ -1629,7 +1637,7 @@ mod tests {
         clear_dir(&sibling);
         set_resolved_config_dir(Some(sibling.clone()));
 
-        let rotated = rotate_within(&limited, &[limited.clone(), sibling.clone()]);
+        let rotated = rotate_within(Some(&limited), &[limited.clone(), sibling.clone()]);
 
         assert!(
             is_account_cooled_down(&limited),
@@ -1643,6 +1651,39 @@ mod tests {
         assert_eq!(get_resolved_config_dir(), Some(sibling.clone()));
         clear_dir(&limited);
         clear_dir(&sibling);
+    }
+
+    /// **An unnamed limited account rotates to the first non-cooled account and
+    /// cools nothing.** When the caller cannot name the account it ran under
+    /// (`None`), rotation must still publish an account — the API providers
+    /// read the global — and must not cool any dir, since none is to blame.
+    #[test]
+    fn rotation_with_no_limited_dir_switches_to_the_first_non_cooled_account() {
+        let _fleet = crate::mcp::fleet_policy_poller::pin_account_selection_for_test(None);
+        let _restore = ResolvedConfigDirRestore::capture();
+        let cooled = "/qontinui-test/rotate-unnamed/cooled".to_string();
+        let first_free = "/qontinui-test/rotate-unnamed/first-free".to_string();
+        let second_free = "/qontinui-test/rotate-unnamed/second-free".to_string();
+        clear_dir(&cooled);
+        clear_dir(&first_free);
+        clear_dir(&second_free);
+        mark_account_rate_limited(&cooled);
+        set_resolved_config_dir(None);
+
+        let rotated = rotate_within(
+            None,
+            &[cooled.clone(), first_free.clone(), second_free.clone()],
+        );
+
+        assert_eq!(rotated, Some(first_free.clone()));
+        assert_eq!(get_resolved_config_dir(), Some(first_free.clone()));
+        assert!(
+            !is_account_cooled_down(&first_free) && !is_account_cooled_down(&second_free),
+            "no dir is cooled when the limited account is unknown"
+        );
+        clear_dir(&cooled);
+        clear_dir(&first_free);
+        clear_dir(&second_free);
     }
 
     /// A spawn with no caller choice takes its OWN pick and holds it even when
