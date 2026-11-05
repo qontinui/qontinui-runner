@@ -231,9 +231,11 @@ where
                 return response;
             }
 
-            if let Some(new_account) = call_dir
-                .as_deref()
-                .and_then(super::config::rotate_account_on_rate_limit)
+            // `call_dir` is `None` when the global was unset as the call was
+            // issued: no account is named, so none is cooled, and rotation
+            // still publishes the first non-cooled account for the providers.
+            if let Some(new_account) =
+                super::config::rotate_account_on_rate_limit(call_dir.as_deref())
             {
                 let label = std::path::Path::new(&new_account)
                     .file_name()
@@ -379,10 +381,7 @@ where
         if is_retryable_error(error_msg) {
             // Rotate account on rate-limit before trying fallback
             if is_rate_limit_error(error_msg)
-                && call_dir
-                    .as_deref()
-                    .and_then(super::config::rotate_account_on_rate_limit)
-                    .is_some()
+                && super::config::rotate_account_on_rate_limit(call_dir.as_deref()).is_some()
             {
                 warn!(
                     "{}: rate-limit on primary, rotated account before fallback",

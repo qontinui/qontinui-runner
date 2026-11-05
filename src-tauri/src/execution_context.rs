@@ -454,6 +454,14 @@ pub struct AiSessionContext {
     /// the resolver's no-choice arm. Never the shared `RESOLVED_CONFIG_DIR`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<crate::ai_provider::AccountChoice>,
+
+    /// With no `account`: inherit the ambient default account — the spawn
+    /// takes NO pick of its own and resolves the resolver's no-choice arm. Set
+    /// by a `--resume` whose transcript is under the ambient default location
+    /// (`terminal::transcript::ResumeAccount::Ambient`), which must not be
+    /// pinned explicitly. Ignored when `account` is `Some`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inherit_ambient_account: bool,
 }
 
 impl AiSessionContext {
@@ -477,6 +485,7 @@ impl AiSessionContext {
             continued_from: None,
             available_tools: None,
             account: None,
+            inherit_ambient_account: false,
         }
     }
 

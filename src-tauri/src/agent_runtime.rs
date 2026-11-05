@@ -9892,10 +9892,11 @@ async fn run_agent_subprocess(
     let mut final_phase = SpawnPhase::Exited;
 
     // No account pick before the (re)spawn loop: with no pin, `spawn_claude_child`
-    // takes a fresh pick of its own on EVERY attempt, so a respawn after a
-    // mid-run rate-limit draws again (the limited account is cooled) instead
-    // of re-reading a shared resolved dir a sibling may have rewritten. A pin
-    // is passed to every attempt unchanged and takes no pick at all.
+    // takes a fresh pick of its own on EVERY attempt, so each respawn draws
+    // afresh instead of re-reading a shared resolved dir a sibling may have
+    // rewritten. Nothing on this path detects a mid-run rate limit or cools the
+    // limited account yet, so a respawn's draw can land on that same account
+    // again. A pin is passed to every attempt unchanged and takes no pick at all.
 
     loop {
         // Stop requested during a restart back-off (or before the first spawn):
@@ -10764,8 +10765,9 @@ pub(crate) async fn spawn_claude_child(
     // an account the child never runs under. One resolution cannot drift.
     //
     // With no caller pin this spawn takes its OWN pick here, on every call —
-    // so every respawn attempt draws afresh and a mid-run rate-limit rotation
-    // reaches the retry — and resolves it as `AccountChoice::Picked`. It never
+    // so every respawn attempt draws afresh (nothing here cools an account a
+    // mid-run rate limit hit, so the draw may repeat it) — and resolves it as
+    // `AccountChoice::Picked`. It never
     // reads the shared `RESOLVED_CONFIG_DIR`, which a concurrent sibling's pick
     // may have rewritten since (plan
     // `2026-11-05-a-spawn-takes-its-own-account-pick-not-the-shared-resolved-dir`).

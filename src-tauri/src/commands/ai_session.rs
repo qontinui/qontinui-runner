@@ -1893,17 +1893,36 @@ pub async fn resume_ai_sessions(
         // output_log summary entirely. Only when no transcript exists do we
         // fall back to `build_replay_prompt` — and we LABEL it honestly so the
         // operator/agent knows earlier context may be missing.
+        //
+        // A `--resume` finds its conversation only under the account that
+        // wrote it, so the resumed session runs under THAT account (pinned),
+        // or under the ambient default when that is where the transcript is —
+        // never a fresh pick, which would usually land on another account and
+        // find nothing. A transcript whose account cannot authenticate is
+        // treated as not resumable, so the replay summary is sent instead.
         // Every discovered config dir (multi-account) plus the effective dir
-        // for the active account is searched; any hit is resumable.
-        let can_full_resume = {
-            use crate::terminal::transcript;
+        // for the active account is searched.
+        let (can_full_resume, resume_account, resume_inherit_ambient) = {
+            let cli = crate::settings::get_ai_settings().claude_cli;
             let (effective_config_dir, _config_dir_source) =
-                crate::ai_provider::get_effective_config_dir(
-                    &crate::settings::get_ai_settings().claude_cli,
-                );
-            let search_dirs = transcript::transcript_search_dirs(effective_config_dir.as_deref());
-            transcript::config_dir_holding_transcript(&search_dirs, &working_dir, &task_run_id)
-                .is_some()
+                crate::ai_provider::get_effective_config_dir(&cli);
+            match crate::terminal::transcript::resume_account_on_this_machine(
+                effective_config_dir.as_deref(),
+                &working_dir,
+                &task_run_id,
+                &cli,
+            )
+            .into_session_account()
+            {
+                Ok((account, inherit_ambient)) => (true, account, inherit_ambient),
+                Err(reason) => {
+                    info!(
+                        "AI session resume: {} cannot resume losslessly ({}) — using the replay summary",
+                        task_run_id, reason
+                    );
+                    (false, None, false)
+                }
+            }
         };
 
         // The replay prompt is only used on the summary fallback. When we have
@@ -2000,7 +2019,10 @@ pub async fn resume_ai_sessions(
             .and_then(crate::claude_session::coord_register::AgentLogEmitter::start);
 
         let spawn_result = spawn_blocking_tracked(move || -> Result<(), String> {
-            let session_ctx = AiSessionContext::setup(&trid, &name_for_ctx);
+            let mut session_ctx = AiSessionContext::setup(&trid, &name_for_ctx);
+            // A lossless resume runs under the transcript's account (see (B)).
+            session_ctx.account = resume_account;
+            session_ctx.inherit_ambient_account = resume_inherit_ambient;
 
             // Pin/resume the CLI session id to the task_run_id. `is_resume` is
             // true ONLY when an on-disk transcript exists (→ `--resume`); else
