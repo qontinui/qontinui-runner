@@ -27,8 +27,11 @@
  *      and a PowerShell nested prompt draw 633;A without that promise, so their
  *      prompt mark says nothing. A pane with no such reading is kept: one whose
  *      shell emits no marks (`bash ./job.sh`, `cmd`), and one whose output this
- *      window lost (dropped while hidden, overrun out of the ring, spliced out
- *      of a resync) since its last prompt.
+ *      window knows it did not parse since its last prompt (dropped while
+ *      hidden, overrun out of the ring, spliced out of a resync, painted over
+ *      by a reconnect). The shell side announces the capability only where
+ *      its C path is proven present at that prompt; anywhere it cannot prove
+ *      it, it stays silent and the pane is kept.
  *
  * What neither witness sees: work a shell runs in-process and in the
  * background without a command line — a PowerShell `Start-ThreadJob` (or
@@ -160,9 +163,14 @@ export function readBareIdleShell(
   // The prompt half is a POSITIVE check: only a parsed prompt mark from a shell
   // that marks command starts reads idle; anything else keeps the pane.
   if (shell.mark === undefined) {
+    // Only a shell the runner integrates can be helped by a fresh prompt; for
+    // any other, pressing Enter changes nothing, so say what it is instead.
+    const stem = shellStem(image);
     return {
       bare: false,
-      reason: "no prompt seen since this pane was shown — press Enter in it, then Check again",
+      reason: INTEGRATED_SHELLS.has(stem)
+        ? "no prompt seen since this pane was shown — press Enter in it, then Check again"
+        : `its shell (${stem}) does not report prompt state`,
       busy: false,
     };
   }
@@ -173,6 +181,19 @@ export function readBareIdleShell(
     return { bare: false, reason: "its shell last reported a command start", busy: true };
   }
   return { bare: true };
+}
+
+/**
+ * The shells the runner's shell integration covers (bash, zsh, PowerShell):
+ * the only ones that ever report a prompt mark. Other shells the runner counts
+ * as shells (`cmd`, `fish`, `sh`, `dash`, `ksh`, `nu`) never do.
+ */
+const INTEGRATED_SHELLS: ReadonlySet<string> = new Set(["bash", "zsh", "pwsh", "powershell"]);
+
+/** An image name's lowercase stem: `C:\\…\\pwsh.exe` → `pwsh`. PURE. */
+function shellStem(image: string): string {
+  const base = image.split(/[\\/]/).pop() ?? image;
+  return base.replace(/\.exe$/i, "").toLowerCase();
 }
 
 /** A pane "Move them" left where it is. */

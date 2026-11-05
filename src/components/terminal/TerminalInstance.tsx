@@ -589,7 +589,7 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         hasBackend: () => backendRef.current !== null,
         noteMissedOutput: (end) => {
           paneService.noteMissedOutput(end);
-          shellMarks.outputLost();
+          shellMarks.outputDropped();
         },
         requestResync: () => void resyncFromRing(),
         scheduleFlush: () => scheduleFlush(),
@@ -1500,7 +1500,13 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           // the paint shows them, they are skipped; if not, they are replayed
           // from the ring (a resync), unless the snapshot proves there were
           // none.
-          const behind = stream.lateAttachSettled(lateAttachPaint.painted, lateAttachPaint.offset);
+          const { behind, skipped } = stream.lateAttachSettled(
+            lateAttachPaint.painted,
+            lateAttachPaint.offset,
+          );
+          // Bytes the paint showed but this pane never parsed: their marks
+          // (a 633;C among them) are lost, so the replay's are not current.
+          if (skipped > 0) shellMarks.outputLost();
           if (behind > 0) {
             console.warn(
               `[Terminal ${terminalId}] reconnect paint is ${behind} bytes behind the mount ring; replaying them from the paint`,
@@ -1585,8 +1591,8 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         // bytes reach the (about-to-be-disposed) backend rather than being
         // dropped. Harmless if nothing is staged.
         if (flushScheduled) flushCoalesced();
-        // This mount no longer parses the pane's output; a remount's scrollback
-        // replay is written before its OSC handler exists.
+        // This mount no longer parses the pane's output. The next mount
+        // re-derives the marks from its ring replay (replay mode, above).
         shellMarks.unmounted();
         // Stops the ack timer + observer and hands acking back to the page tap.
         paneService.dispose();

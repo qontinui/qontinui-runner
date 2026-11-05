@@ -56,6 +56,12 @@ export type ShellIntegrationEvent =
       type: "replayed_marks";
       mark: ShellPromptMark | undefined;
       announcesCommandStarts: boolean;
+      /**
+       * A capability the replay ended on before its prompt's 633;A (the ring
+       * stopped between bash's PROMPT_COMMAND entries): it carries over to the
+       * live A that follows.
+       */
+      pendingAnnounce: boolean;
     };
 
 /** One OSC 633 payload (the bytes after `633;`) as an event, or `null` for one this window does not read. */
@@ -81,12 +87,21 @@ export interface ShellMarksSink {
   osc633(data: string): void;
   /**
    * Output of this pane that this window will never parse (dropped while
-   * hidden, overrun out of the ring, spliced out of a resync). Clears the marks
-   * now AND once more behind whatever the backend has already queued: xterm
-   * parses asynchronously, so a chunk written before the loss can still deliver
-   * its 633;A after the first clear.
+   * hidden, overrun out of the ring, spliced out of a resync, painted over by a
+   * reconnect). Clears the marks now AND once more behind whatever the backend
+   * has already queued: xterm parses asynchronously, so a chunk written before
+   * the loss can still deliver its 633;A after the first clear. During a
+   * mount's replay it also spoils the replay's summary: the lost bytes are
+   * newer than the ring, so the ring's last mark is not current.
    */
   outputLost(): void;
+  /**
+   * A chunk dropped unparsed while the pane is hidden: {@link outputLost}, but
+   * the clear behind the write queue is queued only when none is pending — a
+   * hidden pane drops a chunk per event, and nothing it drops is written, so
+   * one pending clear already sits behind everything written before the drops.
+   */
+  outputDropped(): void;
   /** The pane's `TerminalInstance` unmounted. */
   unmounted(): void;
   /**
@@ -118,8 +133,16 @@ export function shellMarksSink(
     mark: ShellPromptMark | undefined;
     pendingAnnounce: boolean;
     announced: boolean;
+    lost: boolean;
   } | null = null;
   const unobserved = () => emit({ type: "unobserved" });
+  // Hidden drops coalesce their clear behind the write queue (see
+  // `outputDropped`); an explicit loss always queues its own, at its position.
+  let dropClearQueued = false;
+  const lost = () => {
+    if (replay !== null) replay.lost = true;
+    unobserved();
+  };
   return {
     osc633: (data) => {
       const event = parseOsc633(data);
@@ -141,25 +164,47 @@ export function shellMarksSink(
       }
     },
     outputLost: () => {
-      unobserved();
+      lost();
       queueBehindWrites(unobserved);
+    },
+    outputDropped: () => {
+      lost();
+      if (!dropClearQueued) {
+        dropClearQueued = true;
+        queueBehindWrites(() => {
+          dropClearQueued = false;
+          unobserved();
+        });
+      }
     },
     unmounted: () => {
       replay = null;
       unobserved();
     },
     beginReplay: () => {
-      replay = { mark: undefined, pendingAnnounce: false, announced: false };
+      replay = { mark: undefined, pendingAnnounce: false, announced: false, lost: false };
     },
     endReplay: () => {
       if (replay === null) return;
-      const { mark, announced } = replay;
+      const { mark, announced, pendingAnnounce, lost } = replay;
       replay = null;
-      emit({
-        type: "replayed_marks",
-        mark,
-        announcesCommandStarts: mark === "prompt_start" && announced,
-      });
+      // Output lost while the replay was in flight is newer than the ring: the
+      // summary would report a mark that is no longer the pane's last.
+      emit(
+        lost
+          ? {
+              type: "replayed_marks",
+              mark: undefined,
+              announcesCommandStarts: false,
+              pendingAnnounce: false,
+            }
+          : {
+              type: "replayed_marks",
+              mark,
+              announcesCommandStarts: mark === "prompt_start" && announced,
+              pendingAnnounce,
+            },
+      );
     },
   };
 }

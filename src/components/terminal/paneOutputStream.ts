@@ -51,6 +51,14 @@ export interface PaneOutputHooks {
   scheduleFlush(): void;
 }
 
+/** {@link PaneOutputStream.lateAttachSettled}'s result. */
+export interface LateAttachResult {
+  /** Bytes the snapshot is behind the mount ring's end; replayed by resync. */
+  behind: number;
+  /** Bytes the paint showed past what the pane had written: never parsed. */
+  skipped: number;
+}
+
 /** {@link PaneOutputStream.receive}'s result: the route, or `discard` when there is no backend. */
 export type ReceiveRoute = OutputRoute | "discard";
 
@@ -252,16 +260,19 @@ export class PaneOutputStream {
    * - Not painted: replay from the mount ring's end, by resync, unless the
    *   snapshot proves nothing was produced since the ring.
    *
-   * Returns how far the snapshot is BEHIND the mount ring's end (0 normally).
-   * A positive value is replayed from the snapshot by the resync requested
-   * here; the caller logs it.
+   * Returns how far the snapshot is BEHIND the mount ring's end (`behind`, 0
+   * normally: a positive value is replayed from the snapshot by the resync
+   * requested here, and the caller logs it), and how many bytes the paint
+   * SKIPPED past what the pane had written (`skipped`): shown by the paint,
+   * never parsed, so whatever OSC 633 marks they carried are lost to the pane.
    */
-  lateAttachSettled(painted: boolean, snapshotOffset: number | undefined): number {
+  lateAttachSettled(painted: boolean, snapshotOffset: number | undefined): LateAttachResult {
     this.awaitingPaint = false;
     const deferred = this.resyncDeferred;
     this.resyncDeferred = false;
     if (painted && snapshotOffset !== undefined) {
       const behind = Math.max(0, this.writtenThrough - snapshotOffset);
+      const skipped = Math.max(0, snapshotOffset - this.writtenThrough);
       this.replayedThrough = snapshotOffset;
       this.writtenThrough = snapshotOffset;
       // `nextExpectedOffset` tracks what the runner has SENT, not what the
@@ -270,12 +281,12 @@ export class PaneOutputStream {
       this.nextExpectedOffset = Math.max(this.nextExpectedOffset ?? 0, snapshotOffset);
       if (!this.drainHeld() || deferred || behind > 0) this.hooks.requestResync();
       else if (!this.queue.isEmpty) this.hooks.scheduleFlush();
-      return behind;
+      return { behind, skipped };
     }
     const noneHeld = this.drainHeld();
     const nothingMissed = snapshotOffset !== undefined && snapshotOffset <= this.writtenThrough;
     if (!noneHeld || !nothingMissed || deferred) this.hooks.requestResync();
-    return 0;
+    return { behind: 0, skipped: 0 };
   }
 
   /** A resync's ring window through `endOffset` was written into the pane. */
