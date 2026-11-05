@@ -2970,6 +2970,46 @@ impl SessionLifecycleStore {
         );
     }
 
+    /// Withdraw a `finish_synced` stamp that coord's own row contradicts — the
+    /// heal's first half (plan
+    /// `2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status`,
+    /// Phase 5, `session::finish_heal`). Clears ONLY the mark whose
+    /// `finished_at` is `finished_at` and which is still finished and synced;
+    /// a mark unmarked or restamped since is left alone. Returns whether it
+    /// cleared.
+    ///
+    /// Taken under `finish_forward`, so it orders against `set_finished`: an
+    /// unmark either lands before (the mark is gone, nothing clears) or after
+    /// (the later re-send, which re-reads under the same lock, finds no
+    /// finished mark and enqueues nothing).
+    pub fn clear_finish_synced(&self, claude_session_id: &str, finished_at: i64) -> bool {
+        let _forward = self
+            .finish_forward
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on clear_finish_synced");
+                return false;
+            }
+        };
+        let changed = match m.get_mut(claude_session_id) {
+            Some(rec) if rec.finished_at == Some(finished_at) && rec.finish_synced => {
+                rec.finish_synced = false;
+                rec.clone()
+            }
+            _ => return false,
+        };
+        self.persist(
+            m,
+            &[LifecycleDelta::Upsert {
+                rec: Box::new(changed),
+            }],
+        );
+        true
+    }
+
     /// Record what the wind-down executor did to this session — one of the
     /// `WIND_DOWN_*` outcome words above — and which arm did it (one of the
     /// `WIND_DOWN_ARM_*` words). No-op when the record is absent.
