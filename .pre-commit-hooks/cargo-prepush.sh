@@ -343,7 +343,16 @@ if [[ "$metadata_rc" -ne 0 ]]; then
     exit 1
   elif [[ "$metadata_rc" -eq 127 ]] || grep -qiE 'command not found|could not execute' "$METADATA_LOG"; then
     echo "[pre-push] FAIL — cargo could not run at all (exit $metadata_rc). This is NOT a lint failure."
-    echo "          Check the toolchain: install Rust via rustup."
+    # The usual cause on an agent box is that Rust is installed but missing from
+    # a non-login shell's PATH. The helper names that case instead of telling the
+    # pusher to install Rust.
+    if [[ -f "$SCRIPT_DIR/lib/cargo-remedy.sh" ]]; then
+      # shellcheck source=lib/cargo-remedy.sh
+      . "$SCRIPT_DIR/lib/cargo-remedy.sh"
+      cargo_unrunnable_remedy
+    else
+      echo "          Check the toolchain: install Rust via rustup."
+    fi
     exit 1
   else
     # Honest terminal: non-zero, but nothing in the log identifies why. Say that
