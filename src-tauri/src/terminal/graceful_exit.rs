@@ -1044,6 +1044,33 @@ mod tests {
         assert!(why.contains("no `❯` input prompt"), "{why}");
     }
 
+    /// Claude Code's idle `/clear to save N tokens · …` footer carries the
+    /// `tokens ·` working-indicator text. A finished pane showing it is ready
+    /// for `/exit`; a dialog showing it is still refused.
+    #[test]
+    fn the_clear_hint_footer_is_ready_and_a_dialog_under_it_is_not() {
+        let hint = "  new task? /clear to save 320.4k tokens · Checking for updates";
+        let mut above_box = empty_prompt();
+        above_box.lines[0] = hint.to_string();
+        assert_eq!(exit_prompt_ready(&above_box), Ok(()));
+        let mut below_box = empty_prompt();
+        below_box.lines[4] = hint.to_string();
+        assert_eq!(exit_prompt_ready(&below_box), Ok(()));
+        assert_eq!(input_prompt_ready(&below_box), Ok(()));
+
+        let mut dialog = permission_dialog();
+        dialog.lines.insert(0, hint.to_string());
+        dialog.cursor_row += 1;
+        // Refused AS A DIALOG — not as "does not look idle", which is what the
+        // hint alone produced before it was masked.
+        for why in [
+            exit_prompt_ready(&dialog).unwrap_err(),
+            input_prompt_ready(&dialog).unwrap_err(),
+        ] {
+            assert!(why.contains("numbered choice"), "{why}");
+        }
+    }
+
     #[test]
     fn echo_detection() {
         assert!(exit_echoed(&echoed_prompt()));
