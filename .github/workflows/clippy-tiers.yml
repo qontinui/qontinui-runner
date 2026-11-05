@@ -224,8 +224,12 @@ jobs:
       pull-requests: write
       checks: write
 
+    # Every step before the `clippy` (reviewdog) step needs an `id`, a matching
+    # `O_*` env entry and a `pick` line in the final "Declare a setup death"
+    # step -- a setup step without them fails silently (no annotation).
     steps:
-      - id: checkout
+      - name: Checkout
+        id: checkout
         uses: actions/checkout@v5
 
       - name: Check out sibling qontinui-schemas
@@ -397,7 +401,7 @@ jobs:
               first="$1"
             fi
           }
-          pick 'actions/checkout@v5' "$O_CHECKOUT"
+          pick 'Checkout' "$O_CHECKOUT"
           pick 'Check out sibling qontinui-schemas' "$O_SIBLING_SCHEMAS"
           pick 'Checkout sibling repos' "$O_SIBLING_REPOS"
           pick 'Setup pnpm' "$O_SETUP_PNPM"
