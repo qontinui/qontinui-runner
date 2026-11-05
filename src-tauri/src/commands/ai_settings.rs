@@ -1610,8 +1610,8 @@ struct UsageRefreshPlan {
 /// behaviour does not change. The fleet report also covers a runner with fewer
 /// than two, by probing the account it spends, because coord's launch budget
 /// has to count it. That probe's only consumer is the report, so it runs only
-/// when `reports_lone_account`: the runner has a coord to report to. Which
-/// lone account a secondary reports is [`spent_account_dir`]'s rule.
+/// when `reports_lone_account`: the runner has a coord to report to and the
+/// account is its own ([`lone_account_is_own`]).
 fn plan_usage_refresh(
     dir_count: usize,
     caller: UsageRefreshCaller,
@@ -1636,18 +1636,14 @@ fn plan_usage_refresh(
 /// roster lists. `None` under a model gateway, which has no subscription
 /// account, and when no candidate exists.
 ///
-/// `include_inherited` is false on a secondary (a named or temp runner, or a
-/// subject under an instance root), which then reports only a pinned account.
-/// The two inherited steps are never its own: `HOME` is not re-rooted for any
-/// runner, and its environment is the one its launcher (the harness, or the
-/// supervisor) runs on, so the inherited `CLAUDE_CONFIG_DIR` and `~/.claude`
-/// are the primary's account, and reporting them would write the primary's
-/// row a second time. A pinned account comes from the secondary's own
-/// roster and settings (a subject's roster sits under its instance root,
-/// `claude_accounts::claude_accounts_file_path`), so it is reported exactly as
-/// a secondary's two-or-more-account roster is. A named runner with no roster
-/// of its own that runs on its launcher's single account is therefore not
-/// reported by it: the primary already reports that account.
+/// `include_inherited` is false on a SUBJECT runner (`QONTINUI_INSTANCE_ROOT`),
+/// which then reports only a pinned account. Its roster and settings sit under
+/// its instance root (`claude_accounts::claude_accounts_file_path`), so a pin
+/// is its own. The two inherited steps are not: `HOME` is not re-rooted for
+/// any runner, and its environment is its launcher's, so the inherited
+/// `CLAUDE_CONFIG_DIR` and `~/.claude` are the harness's account. A named or
+/// temp secondary never reaches this function for a lone account (see
+/// [`lone_account_is_own`]).
 fn spent_account_dir(include_inherited: bool) -> Option<String> {
     if crate::model_gateway::gateway_declared() {
         return None;
@@ -1667,10 +1663,27 @@ fn spent_account_dir(include_inherited: bool) -> Option<String> {
         })
 }
 
+/// Whether a lone account this runner resolves is its own to report. A named
+/// or temp secondary (no instance root) resolves the primary's machine-global
+/// roster and, unless its launcher redirected it, the primary's
+/// `settings.json`, so its pin and its inherited environment are both the
+/// primary's account: reporting it would write the primary's row a second
+/// time. Only the primary and a subject (whose roster sits under its own
+/// instance root) report one. A secondary's two-or-more-account roster is a
+/// different path and still reports, as it did before this.
+fn lone_account_is_own() -> bool {
+    !qontinui_runner_lib::instance_env::is_secondary()
+        || qontinui_runner_lib::instance_env::instance_root().is_some()
+}
+
 async fn refresh_usage(caller: UsageRefreshCaller) -> Vec<AccountUsageInfo> {
     let mut config_dirs = crate::settings::get_claude_config_dirs();
     let report_base = usage_twin_report::report_base();
-    let plan = plan_usage_refresh(config_dirs.len(), caller, report_base.is_some());
+    let plan = plan_usage_refresh(
+        config_dirs.len(),
+        caller,
+        report_base.is_some() && lone_account_is_own(),
+    );
     if !plan.probe_configured {
         config_dirs.clear();
     }
@@ -1678,7 +1691,7 @@ async fn refresh_usage(caller: UsageRefreshCaller) -> Vec<AccountUsageInfo> {
     // selection (`account_infos`, one source with the Tauri command). A lone
     // spent account is in use by construction: it is what a spawn runs on.
     let active_dirs: std::collections::HashSet<String> = if plan.probe_spent {
-        let spent = spent_account_dir(!qontinui_runner_lib::instance_env::is_secondary());
+        let spent = spent_account_dir(qontinui_runner_lib::instance_env::instance_root().is_none());
         config_dirs.extend(spent.clone());
         spent.into_iter().collect()
     } else {
@@ -3162,35 +3175,44 @@ mod usage_report_scope_tests {
         assert_eq!(row["is_active"], serde_json::json!(true), "{row}");
     }
 
-    /// A secondary (named or temp runner, or a subject under an instance
-    /// root) reports a lone account only when it is pinned in its own roster
-    /// and settings. An inherited `CLAUDE_CONFIG_DIR` is its launcher's
-    /// account, which the primary reports, so a second row would duplicate it.
+    /// A named or temp secondary reports no lone account, even a pinned one:
+    /// its roster is the primary's machine-global one, so its row would be the
+    /// primary's written twice. A subject reports the pin in the roster under
+    /// its own instance root, and never its inherited `CLAUDE_CONFIG_DIR`,
+    /// which is the harness's account.
     #[tokio::test]
-    async fn a_secondary_runner_reports_only_a_pinned_lone_account() {
+    async fn only_a_subject_secondary_reports_its_own_pinned_lone_account() {
         let amb = crate::test_env::isolated_ambient();
         let _env = extra_env();
         let coord = FakeCoord::start().await;
         coord.connect();
-        write_roster(&amb, Vec::new(), AccountSelectionMode::Manual, None);
         std::env::set_var("CLAUDE_CONFIG_DIR", logged_out_dir(&amb, ".claude-env"));
 
+        let shared = logged_in_dir(&amb, ".claude-shared", None).await;
+        write_roster(&amb, Vec::new(), AccountSelectionMode::Manual, Some(shared));
         std::env::set_var("QONTINUI_INSTANCE_NAME", "temp-runner");
         let named = refresh_fleet_usage_report().await;
-        assert!(named.is_empty(), "a named secondary reported: {named:?}");
         std::env::remove_var("QONTINUI_INSTANCE_NAME");
-
-        std::env::set_var("QONTINUI_INSTANCE_ROOT", amb.root());
-        let subject = refresh_fleet_usage_report().await;
-        assert!(subject.is_empty(), "a subject reported: {subject:?}");
-        std::env::remove_var("QONTINUI_INSTANCE_ROOT");
+        assert!(named.is_empty(), "a named secondary reported: {named:?}");
         assert!(coord.reported_labels().is_empty());
 
-        std::env::set_var("QONTINUI_INSTANCE_NAME", "temp-runner");
-        let pinned = logged_in_dir(&amb, ".claude-own", None).await;
-        write_roster(&amb, Vec::new(), AccountSelectionMode::Manual, Some(pinned));
+        std::env::set_var("QONTINUI_INSTANCE_ROOT", amb.root());
+        let roster = crate::claude_accounts::claude_accounts_file_path().expect("roster path");
+        assert!(
+            roster.starts_with(amb.root()),
+            "a subject's roster must sit under its instance root: {}",
+            roster.display()
+        );
+        write_roster(&amb, Vec::new(), AccountSelectionMode::Manual, None);
+        let unpinned = refresh_fleet_usage_report().await;
+        assert!(
+            unpinned.is_empty(),
+            "a subject reported its inherited env dir: {unpinned:?}"
+        );
+        let own = logged_in_dir(&amb, ".claude-own", None).await;
+        write_roster(&amb, Vec::new(), AccountSelectionMode::Manual, Some(own));
         refresh_fleet_usage_report().await;
-        std::env::remove_var("QONTINUI_INSTANCE_NAME");
+        std::env::remove_var("QONTINUI_INSTANCE_ROOT");
         assert_eq!(coord.reported_labels(), vec![".claude-own".to_string()]);
     }
 
