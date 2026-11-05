@@ -47,7 +47,7 @@
 //! inherit the primary's census, which is the `2026-08-10` regression this
 //! route must never re-introduce.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use serde::Serialize;
@@ -397,7 +397,29 @@ pub fn diff_census(
         .iter()
         .map(|o| o.claude_session_id.as_str())
         .collect();
-    let unreadable: HashSet<&str> = observed
+    // One observation per session, merged by the ledger's own order (the
+    // strongest `Observed` stands), so a session with a closed stamped row
+    // and an open adopted one reads as the ledger reads it. A DUPLICATE is a
+    // session verified back on more than one row — the restore-duplication
+    // class — not one that merely has history.
+    let mut best: Vec<&RestoredObservation> = Vec::new();
+    let mut slot: HashMap<&str, usize> = HashMap::new();
+    let mut back_rows: HashMap<&str, usize> = HashMap::new();
+    for obs in observed {
+        let id = obs.claude_session_id.as_str();
+        if obs.observed == Some(Observed::Back) {
+            *back_rows.entry(id).or_default() += 1;
+        }
+        match slot.get(id) {
+            Some(&i) if best[i].observed >= obs.observed => {}
+            Some(&i) => best[i] = obs,
+            None => {
+                slot.insert(id, best.len());
+                best.push(obs);
+            }
+        }
+    }
+    let unreadable: HashSet<&str> = best
         .iter()
         .filter(|o| o.observed == Some(Observed::Unknown))
         .map(|o| o.claude_session_id.as_str())
@@ -405,18 +427,18 @@ pub fn diff_census(
 
     let mut restored: Vec<CensusRestored> = Vec::new();
     let mut terminal_only: Vec<CensusRestored> = Vec::new();
-    let mut unexpected: Vec<CensusUnexpected> = Vec::new();
-    let mut seen: HashSet<&str> = HashSet::new();
-
-    for obs in observed {
-        let id = obs.claude_session_id.as_str();
-        if !seen.insert(id) {
-            unexpected.push(CensusUnexpected {
-                claude_session_id: obs.claude_session_id.clone(),
+    let mut unexpected: Vec<CensusUnexpected> = back_rows
+        .iter()
+        .flat_map(|(id, n)| {
+            (1..*n).map(|_| CensusUnexpected {
+                claude_session_id: id.to_string(),
                 reason: UNEXPECTED_DUPLICATE.to_string(),
-            });
-            continue;
-        }
+            })
+        })
+        .collect();
+
+    for obs in best {
+        let id = obs.claude_session_id.as_str();
         let verified = obs.observed == Some(Observed::Back);
         // The ledger's own verdict, so a CLOSED terminal-only stamp (missing
         // there) is not a bare terminal here either.
@@ -803,6 +825,25 @@ mod tests {
         let seen = diff_census(&exp, &all, Some(true), true);
         assert_eq!(seen.verdict, RESTORE_VERDICT_MATCH);
         assert_eq!(seen.unknown_reason, None);
+    }
+
+    /// One session, two rows: a closed row this boot stamped and an open row
+    /// it adopted with its claude verified. The census keeps the strongest
+    /// observation, as the ledger does, so the session reads restored — and
+    /// one verified row is not a duplicate.
+    #[test]
+    fn a_session_is_merged_to_its_strongest_row_before_bucketing() {
+        let exp = [expected("a", true)];
+        let mut closed = observed("a", RESTORE_TIER_FAILED);
+        closed.observed = Some(Observed::StampedClosed);
+        let mut adopted = observed("a", RESTORE_TIER_RESUMED);
+        adopted.restore_tier = None;
+        adopted.restored_from_boot_at = None;
+        let d = diff_census(&exp, &[closed, adopted], Some(true), true);
+        assert_eq!(d.restored.len(), 1, "{d:?}");
+        assert!(d.missing.is_empty());
+        assert!(d.unexpected.is_empty());
+        assert_eq!(d.verdict, RESTORE_VERDICT_MATCH);
     }
 
     /// T10, as a pure test: a hard-crash boot must NEVER claim `match`.

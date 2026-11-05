@@ -378,13 +378,16 @@ fn holder_of(procs: &[proc_read::ClaudeProc], id: &str) -> Option<u32> {
 }
 
 /// Pure: [`holder_of`] over the machine's `claude` pids and their command
-/// lines. A pid that still exists with no readable command line (a WMI
+/// lines. A pid that may be ours with no readable command line (a WMI
 /// timeout, an unreadable `/proc/<pid>/cmdline`) could be the holder, so the
-/// answer is `Err` — a refusal — never "nobody holds it".
+/// answer is `Err` — a refusal of this one door call — never "nobody holds
+/// it". A pid that is gone (exited, a zombie) or another user's cannot be
+/// this user's claude on this transcript, and does not refuse
+/// ([`proc_read::pid_presence`]).
 fn holder_among(
     pids: &[u32],
     cmdlines: &std::collections::HashMap<u32, String>,
-    exists: impl Fn(u32) -> bool,
+    presence: impl Fn(u32) -> proc_read::PidPresence,
     id: &str,
 ) -> Result<Option<u32>, String> {
     let procs = proc_read::pane_read_of(
@@ -392,7 +395,7 @@ fn holder_among(
         cmdlines,
         &std::collections::HashMap::new(),
         |_| None,
-        exists,
+        presence,
     )
     .map_err(|_| "process_cmdline_unreadable".to_string())?;
     Ok(holder_of(&procs, id))
@@ -414,7 +417,7 @@ async fn live_holder(id: &str) -> Result<Option<u32>, String> {
         .filter(|p| pt::is_countable_claude(*p, &snap))
         .collect();
     let cmdlines = pt::command_lines_for_pids(&pids).await;
-    holder_among(&pids, &cmdlines, proc_read::pid_exists, id)
+    holder_among(&pids, &cmdlines, proc_read::pid_presence, id)
 }
 
 // ---------------------------------------------------------------------------
@@ -935,6 +938,7 @@ mod tests {
 
     #[test]
     fn a_live_claude_on_the_id_is_found_by_its_cmdline() {
+        use proc_read::PidPresence::Ours;
         let cmdlines: std::collections::HashMap<u32, String> = [
             (
                 7,
@@ -943,22 +947,32 @@ mod tests {
             (9, format!("/bin/claude --session-id {ID}")),
         ]
         .into();
-        assert_eq!(holder_among(&[7, 9], &cmdlines, |_| true, ID), Ok(Some(9)));
-        assert_eq!(holder_among(&[7], &cmdlines, |_| true, ID), Ok(None));
-        assert_eq!(holder_among(&[], &cmdlines, |_| true, ID), Ok(None));
+        assert_eq!(holder_among(&[7, 9], &cmdlines, |_| Ours, ID), Ok(Some(9)));
+        assert_eq!(holder_among(&[7], &cmdlines, |_| Ours, ID), Ok(None));
+        assert_eq!(holder_among(&[], &cmdlines, |_| Ours, ID), Ok(None));
     }
 
     /// A claude whose command line cannot be read might be the holder: the
     /// door refuses rather than conclude "nobody holds it" and fork the
-    /// transcript. A pid that exited since the snapshot is simply gone.
+    /// transcript. A pid that exited (or a zombie) is gone, and another
+    /// user's claude cannot be the holder, so neither refuses.
     #[test]
     fn an_unreadable_cmdline_refuses_rather_than_reads_as_no_holder() {
+        use proc_read::PidPresence::{Foreign, Gone, Ours};
         let none = std::collections::HashMap::new();
         assert_eq!(
-            holder_among(&[7], &none, |_| true, ID),
+            holder_among(&[7], &none, |_| Ours, ID),
             Err("process_cmdline_unreadable".to_string())
         );
-        assert_eq!(holder_among(&[7], &none, |_| false, ID), Ok(None));
+        assert_eq!(holder_among(&[7], &none, |_| Gone, ID), Ok(None));
+        assert_eq!(holder_among(&[7], &none, |_| Foreign, ID), Ok(None));
+        // One foreign unreadable claude does not hide a readable holder.
+        let cmd: std::collections::HashMap<u32, String> =
+            [(9, format!("/bin/claude --resume {ID}"))].into();
+        assert_eq!(
+            holder_among(&[7, 9], &cmd, |p| if p == 7 { Foreign } else { Ours }, ID),
+            Ok(Some(9))
+        );
     }
 
     #[test]

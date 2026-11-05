@@ -192,29 +192,41 @@ async fn claude_procs_under(
         .map(|(key, pids)| {
             (
                 key,
-                pane_read_of(&pids, &cmdlines, &cwds, config_dir_of_pid, pid_exists),
+                pane_read_of(&pids, &cmdlines, &cwds, config_dir_of_pid, pid_presence),
             )
         })
         .collect())
 }
 
+/// What can be said of a `claude` pid whose command line did not come back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PidPresence {
+    /// It exited (or is a zombie) since the snapshot: nothing to judge.
+    Gone,
+    /// It exists and another user owns it, so it cannot be this user's
+    /// `claude` writing this user's transcript.
+    Foreign,
+    /// It exists and is (or may be) ours — its session is unknown.
+    Ours,
+}
+
 /// PURE: one pane's read from the per-pid facts. A `claude` pid with no
 /// command line makes the whole pane [`PaneReadError::CmdlineUnreadable`]
-/// while that pid still EXISTS (`exists`): dropping it would read a running
-/// `claude` as "no claude here". A pid that exited between the snapshot and
-/// the read is simply gone, and is skipped. A cwd the kernel marks
-/// ` (deleted)` (Linux, a removed directory) is compared as the path it names.
+/// while that pid may still be OURS (`presence`): dropping it would read a
+/// running `claude` as "no claude here". A pid that is gone, or another
+/// user's, is skipped. A cwd the kernel marks ` (deleted)` (Linux, a removed
+/// directory) is compared as the path it names.
 pub(crate) fn pane_read_of(
     pids: &[u32],
     cmdlines: &HashMap<u32, String>,
     cwds: &HashMap<u32, String>,
     config_dir_of: impl Fn(u32) -> Option<String>,
-    exists: impl Fn(u32) -> bool,
+    presence: impl Fn(u32) -> PidPresence,
 ) -> PaneRead {
     let mut out = Vec::with_capacity(pids.len());
     for &pid in pids {
         let Some(cmdline) = cmdlines.get(&pid) else {
-            if exists(pid) {
+            if presence(pid) == PidPresence::Ours {
                 return Err(PaneReadError::CmdlineUnreadable);
             }
             continue;
@@ -231,17 +243,80 @@ pub(crate) fn pane_read_of(
     Ok(out)
 }
 
-/// Does `pid` still exist? Linux reads `/proc/<pid>`. Elsewhere the platform
-/// cannot say cheaply, so every pid is taken to exist: a missing command
-/// line then reads UNKNOWN, never "gone".
-#[cfg(target_os = "linux")]
-pub(crate) fn pid_exists(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
+/// PURE (Linux): [`PidPresence`] from `/proc/<pid>/status`. `None` (no such
+/// file) is gone; `State: Z` (a zombie) is gone; a real uid other than
+/// `our_uid` is foreign. A status that exists but does not parse is ours —
+/// UNKNOWN never reads as gone.
+#[cfg(any(target_os = "linux", test))]
+fn presence_from_status(status: Option<&str>, our_uid: u32) -> PidPresence {
+    let Some(status) = status else {
+        return PidPresence::Gone;
+    };
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .map(str::trim_start)
+    };
+    if field("State:").is_some_and(|v| v.starts_with('Z')) {
+        return PidPresence::Gone;
+    }
+    match field("Uid:")
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|uid| uid.parse::<u32>().ok())
+    {
+        Some(uid) if uid != our_uid => PidPresence::Foreign,
+        _ => PidPresence::Ours,
+    }
 }
 
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn pid_exists(_pid: u32) -> bool {
-    true
+/// Linux: `/proc/<pid>/status` against this process's real uid.
+#[cfg(target_os = "linux")]
+pub(crate) fn pid_presence(pid: u32) -> PidPresence {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok();
+    // SAFETY: `getuid` takes no arguments, cannot fail and touches no memory.
+    let our_uid = unsafe { libc::getuid() };
+    presence_from_status(status.as_deref(), our_uid)
+}
+
+/// Windows: `OpenProcess`. `ERROR_INVALID_PARAMETER` means no such process
+/// (gone); an opened process that is no longer `STILL_ACTIVE` is gone. Any
+/// other refusal — access denied for an elevated or other-user process — is
+/// taken as OURS: no cheap owner check is wired here, so the refusal it
+/// causes stays local to the one door call that asked.
+#[cfg(windows)]
+pub(crate) fn pid_presence(pid: u32) -> PidPresence {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_INVALID_PARAMETER};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+    // SAFETY: plain Win32 calls on a handle this function owns and closes.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return if GetLastError() == ERROR_INVALID_PARAMETER {
+                PidPresence::Gone
+            } else {
+                PidPresence::Ours
+            };
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut code as *mut u32);
+        CloseHandle(handle);
+        if ok != 0 && code != STILL_ACTIVE {
+            PidPresence::Gone
+        } else {
+            PidPresence::Ours
+        }
+    }
+}
+
+/// Elsewhere the platform cannot say cheaply: every pid may be ours, so a
+/// missing command line reads UNKNOWN, never "gone".
+#[cfg(not(any(target_os = "linux", windows)))]
+pub(crate) fn pid_presence(_pid: u32) -> PidPresence {
+    PidPresence::Ours
 }
 
 /// `/proc/<pid>/cwd` of a directory removed since reads `<path> (deleted)`.
@@ -366,20 +441,27 @@ mod tests {
         let cmd: HashMap<u32, String> = [(1, format!("claude --resume {ID}"))].into();
         let none = HashMap::new();
         assert_eq!(
-            pane_read_of(&[1, 2], &cmd, &none, |_| None, |_| true),
+            pane_read_of(&[1, 2], &cmd, &none, |_| None, |_| PidPresence::Ours),
             Err(PaneReadError::CmdlineUnreadable)
         );
         // Windows' WMI timeout: an empty command-line map for found pids.
         assert_eq!(
-            pane_read_of(&[1], &none, &none, |_| None, |_| true),
+            pane_read_of(&[1], &none, &none, |_| None, |_| PidPresence::Ours),
             Err(PaneReadError::CmdlineUnreadable)
         );
         // No claude pid at all is a real, readable, empty pane.
         assert_eq!(
-            pane_read_of(&[], &none, &none, |_| None, |_| true),
+            pane_read_of(&[], &none, &none, |_| None, |_| PidPresence::Ours),
             Ok(Vec::new())
         );
-        let one = pane_read_of(&[1], &cmd, &none, |_| Some("/cfg".to_string()), |_| true).unwrap();
+        let one = pane_read_of(
+            &[1],
+            &cmd,
+            &none,
+            |_| Some("/cfg".to_string()),
+            |_| PidPresence::Ours,
+        )
+        .unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].config_dir.as_deref(), Some("/cfg"));
     }
@@ -390,11 +472,60 @@ mod tests {
     fn an_exited_pid_is_skipped_and_an_existing_unreadable_one_is_not() {
         let cmd: HashMap<u32, String> = [(1, format!("claude --resume {ID}"))].into();
         let none = HashMap::new();
-        let gone = pane_read_of(&[1, 2], &cmd, &none, |_| None, |pid| pid != 2).unwrap();
+        let gone = pane_read_of(
+            &[1, 2],
+            &cmd,
+            &none,
+            |_| None,
+            |pid| {
+                if pid == 2 {
+                    PidPresence::Gone
+                } else {
+                    PidPresence::Ours
+                }
+            },
+        )
+        .unwrap();
         assert_eq!(gone.iter().map(|p| p.pid).collect::<Vec<_>>(), [1]);
         assert_eq!(
-            pane_read_of(&[1, 2], &cmd, &none, |_| None, |_| true),
+            pane_read_of(&[1, 2], &cmd, &none, |_| None, |_| PidPresence::Ours),
             Err(PaneReadError::CmdlineUnreadable)
+        );
+    }
+
+    /// Another user's unreadable claude cannot be ours: skipped, not UNKNOWN.
+    #[test]
+    fn a_foreign_unreadable_pid_is_skipped() {
+        let none = HashMap::new();
+        assert_eq!(
+            pane_read_of(&[3], &none, &none, |_| None, |_| PidPresence::Foreign),
+            Ok(Vec::new())
+        );
+    }
+
+    /// `/proc/<pid>/status`: absent or a zombie is gone, another real uid is
+    /// foreign, ours or unparseable is ours.
+    #[test]
+    fn presence_reads_zombies_as_gone_and_other_users_as_foreign() {
+        let st = |state: &str, uid: &str| {
+            format!("Name:\tclaude\nState:\t{state}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+        };
+        assert_eq!(presence_from_status(None, 1000), PidPresence::Gone);
+        assert_eq!(
+            presence_from_status(Some(&st("Z (zombie)", "1000")), 1000),
+            PidPresence::Gone
+        );
+        assert_eq!(
+            presence_from_status(Some(&st("S (sleeping)", "0")), 1000),
+            PidPresence::Foreign
+        );
+        assert_eq!(
+            presence_from_status(Some(&st("S (sleeping)", "1000")), 1000),
+            PidPresence::Ours
+        );
+        assert_eq!(
+            presence_from_status(Some("garbage"), 1000),
+            PidPresence::Ours
         );
     }
 
@@ -404,7 +535,7 @@ mod tests {
     fn a_deleted_cwd_is_compared_as_the_path_it_names() {
         let cmd: HashMap<u32, String> = [(1, format!("claude --resume {ID}"))].into();
         let cwd: HashMap<u32, String> = [(1, "/work (deleted)".to_string())].into();
-        let procs = pane_read_of(&[1], &cmd, &cwd, |_| None, |_| true).unwrap();
+        let procs = pane_read_of(&[1], &cmd, &cwd, |_| None, |_| PidPresence::Ours).unwrap();
         assert_eq!(procs[0].cwd.as_deref(), Some("/work"));
         assert!(judge(&procs, &want(), "t").is_ok());
         assert_eq!(without_deleted_suffix("/work"), "/work");

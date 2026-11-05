@@ -1711,14 +1711,16 @@ pub struct LiveView {
 ///
 /// Single flight: the memo's lock is held across the refill, so concurrent
 /// misses share one read and no slow older read can overwrite a newer one.
-/// The entry is stamped when its read COMPLETES.
+/// The entry is stamped when its read COMPLETES. The wait for that lock is
+/// bounded by [`LIVE_VIEW_LOCK_WAIT`]: past it the answer is `None`, which
+/// [`report`] and the census read as UNKNOWN, never as an empty view.
 pub async fn live_view<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Option<LiveView> {
     use tauri::Manager;
     let tm = app
         .try_state::<std::sync::Arc<crate::terminal::TerminalManager>>()?
         .inner()
         .clone();
-    let mut memo = live_view_memo().lock().await;
+    let mut memo = lock_within(live_view_memo(), LIVE_VIEW_LOCK_WAIT).await?;
     let terminals = alive_terminal_ids(tm.list(), crate::process_capture::health::pid_alive);
     if let Some(view) = memo_reuse(memo.as_ref(), &terminals, std::time::Instant::now()) {
         return Some(view);
@@ -1734,6 +1736,17 @@ pub async fn live_view<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Option<L
 
 /// How long one [`live_view`] pane read serves later requests.
 pub const LIVE_VIEW_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a [`live_view`] request waits behind another's refill.
+pub const LIVE_VIEW_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// `mutex`'s guard, or `None` once `wait` has passed without it.
+async fn lock_within<T>(
+    mutex: &tokio::sync::Mutex<T>,
+    wait: std::time::Duration,
+) -> Option<tokio::sync::MutexGuard<'_, T>> {
+    tokio::time::timeout(wait, mutex.lock()).await.ok()
+}
 
 /// One completed [`live_view`] read and when it completed.
 #[derive(Debug, Clone)]
@@ -3221,6 +3234,22 @@ mod tests {
         assert!(memo_reuse(Some(&memo), &resumed, at).is_none());
         assert!(memo_reuse(Some(&memo), &HashSet::new(), at).is_none());
         assert!(memo_reuse(None, &same, at).is_none());
+    }
+
+    /// A refill that holds the memo lock past the wait bounds every queued
+    /// request: it gets `None` (UNKNOWN), not a hang.
+    #[tokio::test]
+    async fn a_request_queued_behind_a_stuck_refill_gives_up_unknown() {
+        let mutex = tokio::sync::Mutex::new(());
+        let held = mutex.lock().await;
+        let wait = std::time::Duration::from_millis(20);
+        let gave_up =
+            tokio::time::timeout(std::time::Duration::from_secs(5), lock_within(&mutex, wait))
+                .await
+                .expect("lock_within must give up on its own, not wait for the holder");
+        assert!(gave_up.is_none());
+        drop(held);
+        assert!(lock_within(&mutex, wait).await.is_some());
     }
 
     /// D2: an unreadable process table is UNKNOWN, never back — and the
