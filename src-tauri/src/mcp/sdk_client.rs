@@ -8766,11 +8766,19 @@ mod tests {
         let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let closed_port = closed.local_addr().unwrap().port();
         drop(closed);
+        // The refused probe gets its own generous timeout: Windows retries a
+        // SYN to a closed loopback port for ~2 s before reporting the refusal,
+        // so a short timeout there turns "refused" into "timed out" (seen on
+        // the windows-latest CI job). Linux refuses immediately either way.
+        let refusing_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap();
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_millis(200))
             .build()
             .unwrap();
-        let refused = client
+        let refused = refusing_client
             .get(format!("http://127.0.0.1:{closed_port}/x"))
             .send()
             .await
