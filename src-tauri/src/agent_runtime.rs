@@ -3457,7 +3457,8 @@ enum ContinuationGuard {
 ///    A claim also lapses under a live session (its heartbeat loop was killed, a
 ///    provider pause outlived the TTL), and spawning then would start a second
 ///    session on work the first is still doing. Live is a POSITIVE signal only;
-///    see [`holder_session_liveness`]. Any other answer is UNKNOWN and dispatches,
+///    see [`holder_session_liveness`], whose answer arrives through
+///    `holder_is_live` (read before this guard, as an async probe). Any other answer is UNKNOWN and dispatches,
 ///    because a missed resume costs more than a duplicate, which `/implement-plan`
 ///    Step 0.45 stops on the owner's IN PROGRESS marker. Ahead of the load lanes
 ///    for the reason dedup is: the verdict is true on an idle box too, and a held
@@ -3812,16 +3813,92 @@ fn holder_for_dispatch(
     }
 }
 
-/// The holder-liveness rule the guard runs: live ONLY when the holder is on
-/// `local_device` AND a live terminal here is pinned to its session. A holder on
-/// another device cannot be seen from here, and one absent from this runner's
-/// terminals may be anywhere, so both are UNKNOWN rather than dead, and UNKNOWN
-/// dispatches. `pinned_terminal_is_live` is injected the way `is_live` is.
-fn holder_session_liveness(
+/// The bound on the one process-table read a holder check takes. Above the
+/// Windows snapshot's own `WMI_SNAPSHOT_TIMEOUT` (8 s) so that bound fires
+/// first; a read that outlives this one counts as not live.
+const HOLDER_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The holder-liveness rule: live ONLY when the holder is on `local_device`, a
+/// live pane here is pinned to its session, AND a `claude` process runs inside
+/// one of those panes. Every other answer is UNKNOWN, and UNKNOWN dispatches:
+///
+/// - a holder on another device cannot be seen from here;
+/// - one with no pinned pane here may be anywhere;
+/// - a pinned pane whose `claude` has exited is a shell, not the holder. The pane
+///   alone would hold the net for as long as the shell stays open, with coord's
+///   stall alert suppressed by the stamp, which is the silent failure the hold
+///   must never become. A `/clear`'d pane is the same case: its pin still names
+///   the old session;
+/// - a probe that errors or outlives [`HOLDER_PROBE_TIMEOUT`].
+///
+/// Cost: the two cheap checks run first, so the process-table read happens only
+/// for a holder on this device with a pinned pane here, once per evaluation
+/// however many panes carry the pin. `pinned_pane_roots` and `claude_under_any`
+/// are injected, so the rule is testable without a terminal manager or a
+/// process table.
+async fn holder_session_liveness<P, PF>(
+    holder: &HolderRef,
     local_device: uuid::Uuid,
-    pinned_terminal_is_live: impl Fn(&str) -> bool,
-) -> impl Fn(&HolderRef) -> bool {
-    move |holder| holder.device_id == local_device && pinned_terminal_is_live(&holder.session_id)
+    pinned_pane_roots: impl FnOnce(&str) -> Vec<u32>,
+    claude_under_any: P,
+) -> bool
+where
+    P: FnOnce(Vec<u32>) -> PF,
+    PF: std::future::Future<Output = Result<bool, String>>,
+{
+    if holder.device_id != local_device {
+        return false;
+    }
+    let roots = pinned_pane_roots(&holder.session_id);
+    if roots.is_empty() {
+        return false;
+    }
+    match tokio::time::timeout(HOLDER_PROBE_TIMEOUT, claude_under_any(roots)).await {
+        Ok(Ok(live)) => live,
+        Ok(Err(reason)) => {
+            warn!(
+                "agent_runtime: claim holder {} could not be probed ({reason}) — treating it \
+                 as not live, so the continuation dispatches",
+                holder.session_id
+            );
+            false
+        }
+        Err(_) => {
+            warn!(
+                "agent_runtime: claim holder {} probe outlived {}s — treating it as not \
+                 live, so the continuation dispatches",
+                holder.session_id,
+                HOLDER_PROBE_TIMEOUT.as_secs()
+            );
+            false
+        }
+    }
+}
+
+/// Production `claude_under_any`: ONE snapshot of the process table, read
+/// through [`claude_under_any_root`].
+async fn claude_under_any_pane(roots: Vec<u32>) -> Result<bool, String> {
+    let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
+    claude_under_any_root(&roots, &snapshot)
+}
+
+/// Does any pane root's subtree in `snapshot` hold a countable `claude` (the
+/// shim excluded, [`crate::terminal::graceful_exit::probe_from_snapshot`])? An
+/// unreadable table is an `Err`, which the holder rule reads as not live.
+fn claude_under_any_root(
+    roots: &[u32],
+    snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
+) -> Result<bool, String> {
+    use crate::terminal::graceful_exit::{probe_from_snapshot, ClaudeProbe};
+    let mut unreadable = None;
+    for &root in roots {
+        match probe_from_snapshot(root, snapshot, &[]) {
+            ClaudeProbe::Readable(pane) if !pane.subtree_claude.is_empty() => return Ok(true),
+            ClaudeProbe::Readable(_) => {}
+            ClaudeProbe::Unreadable(reason) => unreadable = Some(reason),
+        }
+    }
+    unreadable.map_or(Ok(false), Err)
 }
 
 /// The `/health` `spawnAdmission` block: what unattended admission would decide
@@ -4861,10 +4938,11 @@ fn live_terminal_predicate() -> impl Fn(&str) -> bool {
     }
 }
 
-/// Is a live terminal in this runner's manager pinned to this Claude session?
-/// With no runtime there is no manager and the answer is `false`, which the guard
-/// reads as UNKNOWN. Same resolution as [`live_terminal_predicate`].
-fn live_pinned_terminal_predicate() -> impl Fn(&str) -> bool {
+/// The process roots of the live panes in this runner's manager pinned to a
+/// Claude session. With no runtime there is no manager and the list is empty,
+/// which the holder rule reads as UNKNOWN. Same resolution as
+/// [`live_terminal_predicate`].
+fn live_pinned_pane_roots() -> impl FnOnce(&str) -> Vec<u32> {
     use std::sync::Arc;
     let manager: Option<Arc<crate::terminal::TerminalManager>> = crate::tauri_app_handle::current()
         .and_then(|app| {
@@ -4874,7 +4952,8 @@ fn live_pinned_terminal_predicate() -> impl Fn(&str) -> bool {
     move |claude_session_id: &str| {
         manager
             .as_ref()
-            .is_some_and(|m| m.has_live_terminal_pinned_to(claude_session_id))
+            .map(|m| m.live_pane_roots_pinned_to(claude_session_id))
+            .unwrap_or_default()
     }
 }
 
@@ -5057,13 +5136,9 @@ async fn dispatch_gate_continuation(
         // without this stamp coord sees a pending row with a null reason — the
         // shape that stranded 51 continuations for two days.
         if let Some(gate_id) = payload.gate_id {
-            if should_post_deferred_stamp(gate_id, std::time::Instant::now()) {
-                post_continuation_deferred(
-                    gate_id,
-                    device_id,
-                    authorization_deferral_stamp_reason(&authz),
-                )
-                .await;
+            let reason = authorization_deferral_stamp_reason(&authz);
+            if should_post_deferred_stamp(gate_id, &reason, std::time::Instant::now()) {
+                post_continuation_deferred(gate_id, device_id, reason).await;
             }
         }
         return DispatchOutcome::Denied;
@@ -5745,32 +5820,65 @@ async fn post_spawn_outcome(
 /// load stall would post ~576 stamps per gate.
 const CONTINUATION_DEFERRED_STAMP_INTERVAL: Duration = Duration::from_secs(3600);
 
-/// Per-gate last-posted times for the deferred stamp (in-process rate limit).
+/// One gate's last posted deferred stamp: when, and under which
+/// [`deferred_stamp_rate_key`].
+type DeferredStampPost = (std::time::Instant, String);
+
+/// Per-gate last posts of the deferred stamp (in-process rate limit).
 fn deferred_stamp_last_post(
-) -> &'static std::sync::Mutex<std::collections::HashMap<uuid::Uuid, std::time::Instant>> {
+) -> &'static std::sync::Mutex<std::collections::HashMap<uuid::Uuid, DeferredStampPost>> {
     static LAST: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<uuid::Uuid, std::time::Instant>>,
+        std::sync::Mutex<std::collections::HashMap<uuid::Uuid, DeferredStampPost>>,
     > = std::sync::OnceLock::new();
     LAST.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Decide-and-record: should a deferred stamp be posted for `gate_id` at
-/// `now`? `true` at most once per [`CONTINUATION_DEFERRED_STAMP_INTERVAL`] per
-/// gate (and records `now` as the last post when it says `true`). Takes `now`
-/// as a parameter so the rate-limit window is unit-testable.
-fn should_post_deferred_stamp(gate_id: uuid::Uuid, now: std::time::Instant) -> bool {
+/// What the rate limit treats as "the same reason": the class (the text before
+/// the first colon), because a load stamp's detail carries live numbers that
+/// change every poll and would otherwise defeat the limit. A
+/// `holder_session_live` stamp keeps its id: coord honours the stamp only for
+/// the holder it recorded, so a new holder is a new reason.
+fn deferred_stamp_rate_key(reason: &str) -> &str {
+    let class = reason.split(':').next().unwrap_or(reason);
+    if class == "holder_session_live" {
+        reason
+    } else {
+        class
+    }
+}
+
+/// Decide-and-record: should a deferred stamp with `reason` be posted for
+/// `gate_id` at `now`? Records `now` and the reason's key when it says `true`.
+/// Takes `now` as a parameter so the window is unit-testable.
+///
+/// `true` at most once per [`CONTINUATION_DEFERRED_STAMP_INTERVAL`] per gate
+/// while the reason stays the same, and AT ONCE when it changes. A change must
+/// not wait: coord reads only the LATEST stamp, and its `holder_session_live`
+/// exemptions need a fresh one, so a hold that followed a `commit_pressure`
+/// deferral would otherwise sit unexempted (and page) for up to an hour.
+///
+/// While a hold persists it is restamped about once per interval, at the first
+/// backstop poll after the window ([`CONTINUATION_BACKSTOP_POLL_SECS_DEFAULT`]),
+/// so the gap stays under coord's freshness window of two restamp intervals.
+/// `the_held_restamp_gap_stays_inside_coords_freshness_window` pins that.
+fn should_post_deferred_stamp(gate_id: uuid::Uuid, reason: &str, now: std::time::Instant) -> bool {
+    let key = deferred_stamp_rate_key(reason);
     let mut map = lock_recover(deferred_stamp_last_post(), "deferred_stamp_last_post");
-    if let Some(last) = map.get(&gate_id) {
-        if now.saturating_duration_since(*last) < CONTINUATION_DEFERRED_STAMP_INTERVAL {
+    if let Some((last, last_key)) = map.get(&gate_id) {
+        if last_key == key
+            && now.saturating_duration_since(*last) < CONTINUATION_DEFERRED_STAMP_INTERVAL
+        {
             return false;
         }
     }
     // Opportunistic bound: entries older than the window can never suppress
     // again — drop them once the map is large so it can't grow unboundedly.
     if map.len() > 1024 {
-        map.retain(|_, t| now.saturating_duration_since(*t) < CONTINUATION_DEFERRED_STAMP_INTERVAL);
+        map.retain(|_, (t, _)| {
+            now.saturating_duration_since(*t) < CONTINUATION_DEFERRED_STAMP_INTERVAL
+        });
     }
-    map.insert(gate_id, now);
+    map.insert(gate_id, (now, key.to_string()));
     true
 }
 
@@ -6057,7 +6165,8 @@ fn spawn_authorization_stamp_reason(label: &str) -> String {
 /// rows that were merely deferred. The stamp leaves the gate's continuation
 /// lifecycle untouched (still pending, still re-deliverable) — it only gives
 /// coord an honest, queryable "a runner saw this and deferred it" signal.
-/// Rate-limited per gate via [`should_post_deferred_stamp`] (once per hour).
+/// Rate-limited per gate via [`should_post_deferred_stamp`] (once per hour while
+/// the reason holds; at once when it changes).
 /// **Best-effort**: the route may 404 until coord's parallel phase deploys —
 /// ANY non-2xx or transport error is `debug!` and we move on.
 async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, reason: String) {
@@ -6213,7 +6322,7 @@ async fn defer_continuation_unclaimed(
     reason: String,
 ) {
     if let ConsumeTarget::Gate(gate_id, _) = consume_target {
-        if should_post_deferred_stamp(gate_id, std::time::Instant::now()) {
+        if should_post_deferred_stamp(gate_id, &reason, std::time::Instant::now()) {
             post_continuation_deferred(gate_id, device_id, reason).await;
         }
     }
@@ -6352,12 +6461,29 @@ async fn run_gate_continuation_inner(
     // worktree failure, a presentation fn's early return — gives the anchor
     // back. The
     // two spawn successes disarm it explicitly inside the presentation fns.
+    //
+    // The holder's liveness is read HERE, before the guard, because it is an
+    // async process-table read and the guard is synchronous. It is the one
+    // input not taken lazily after the dedup arm; the rule's cheap checks keep
+    // the read to a holder on this device with a pinned pane here.
     let holder = holder_for_dispatch(&payload, consume_target);
+    let holder_live = match &holder {
+        Some(h) => {
+            holder_session_liveness(
+                h,
+                device_id,
+                live_pinned_pane_roots(),
+                claude_under_any_pane,
+            )
+            .await
+        }
+        None => false,
+    };
     let (guard_verdict, reservation) = evaluate_continuation_guard_live(
         payload.anchor_key.as_deref(),
         holder.as_ref(),
         &live_terminal_predicate(),
-        &holder_session_liveness(device_id, live_pinned_terminal_predicate()),
+        &|_| holder_live,
     );
     match guard_verdict {
         ContinuationGuard::Proceed => {}
@@ -15659,30 +15785,96 @@ mod tests {
         let gate_a = uuid::Uuid::now_v7();
         let gate_b = uuid::Uuid::now_v7();
         let t0 = std::time::Instant::now();
+        const R: &str = "thread_pressure:warn:300_over_256";
 
         assert!(
-            should_post_deferred_stamp(gate_a, t0),
+            should_post_deferred_stamp(gate_a, R, t0),
             "first stamp for a gate posts"
         );
         assert!(
-            !should_post_deferred_stamp(gate_a, t0),
+            !should_post_deferred_stamp(gate_a, R, t0),
             "an immediate second stamp for the SAME gate is suppressed"
         );
         assert!(
             !should_post_deferred_stamp(
                 gate_a,
+                R,
                 t0 + CONTINUATION_DEFERRED_STAMP_INTERVAL - Duration::from_secs(1)
             ),
             "still suppressed just inside the window"
         );
         assert!(
-            should_post_deferred_stamp(gate_a, t0 + CONTINUATION_DEFERRED_STAMP_INTERVAL),
+            should_post_deferred_stamp(gate_a, R, t0 + CONTINUATION_DEFERRED_STAMP_INTERVAL),
             "posts again once the window has elapsed"
         );
         assert!(
-            should_post_deferred_stamp(gate_b, t0),
+            should_post_deferred_stamp(gate_b, R, t0),
             "a different gate is independent"
         );
+    }
+
+    /// A changed reason posts at once, then the window applies to it again. A
+    /// load stamp's changing numbers are one reason; a new holder id is another.
+    #[test]
+    fn a_changed_deferral_reason_bypasses_the_window_once() {
+        let gate = uuid::Uuid::now_v7();
+        let t0 = std::time::Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let hold = holder_session_live_stamp_reason("s-1");
+
+        assert!(should_post_deferred_stamp(
+            gate,
+            "commit_pressure:warn:1_under_2",
+            t0
+        ));
+        assert!(
+            !should_post_deferred_stamp(gate, "commit_pressure:warn:3_under_4", at(300)),
+            "new numbers are the same class, so the window holds"
+        );
+        assert!(
+            should_post_deferred_stamp(gate, &hold, at(600)),
+            "a hold after a load stamp must not wait out the hour"
+        );
+        assert!(
+            !should_post_deferred_stamp(gate, &hold, at(900)),
+            "the same hold is limited again"
+        );
+        assert!(
+            should_post_deferred_stamp(gate, &holder_session_live_stamp_reason("s-2"), at(1200)),
+            "a different holder is a different reason"
+        );
+    }
+
+    /// While a hold persists, the restamp lands at the first backstop poll after
+    /// the window. With the default poll that is at most one interval plus one
+    /// poll, which must stay inside coord's freshness window of two intervals.
+    #[test]
+    fn the_held_restamp_gap_stays_inside_coords_freshness_window() {
+        let poll = Duration::from_secs(CONTINUATION_BACKSTOP_POLL_SECS_DEFAULT);
+        assert!(
+            CONTINUATION_DEFERRED_STAMP_INTERVAL + poll < 2 * CONTINUATION_DEFERRED_STAMP_INTERVAL
+        );
+
+        // Drive the limiter at the poll cadence through two hours of one hold.
+        let gate = uuid::Uuid::now_v7();
+        let hold = holder_session_live_stamp_reason("s-held");
+        let t0 = std::time::Instant::now();
+        let mut posts = Vec::new();
+        let mut t = Duration::ZERO;
+        while t <= Duration::from_secs(4 * 3600) {
+            if should_post_deferred_stamp(gate, &hold, t0 + t) {
+                posts.push(t);
+            }
+            t += poll;
+        }
+        assert!(posts.len() >= 4, "{posts:?}");
+        for pair in posts.windows(2) {
+            let gap = pair[1] - pair[0];
+            assert!(
+                gap < 2 * CONTINUATION_DEFERRED_STAMP_INTERVAL,
+                "restamp gap {gap:?} would let coord's exemption lapse"
+            );
+        }
     }
 
     /// The poll self-report body serializes to the locked wire shape:
@@ -16372,24 +16564,42 @@ mod tests {
 
     const HOLDER_SESSION: &str = "0190aaaa-1111-7222-8333-444455556666";
 
-    /// One guard pass for `holder` as a runner on `local` sees it, with `pinned`
-    /// the Claude sessions its terminal manager has a live terminal for. Goes
-    /// through the production [`holder_session_liveness`], so the device arm and
-    /// the pinned arm are both the real rule.
+    /// One guard pass with the holder read as `live` (the answer
+    /// [`holder_session_liveness`] gave before the guard ran).
     fn holder_guard(
         anchor: Option<&str>,
         holder: Option<&HolderRef>,
-        local: uuid::Uuid,
-        pinned: &[&str],
+        live: bool,
     ) -> (ContinuationGuard, AnchorReservation) {
         let live_all = |_id: &str| true;
-        evaluate_continuation_guard(
-            anchor,
+        evaluate_continuation_guard(anchor, holder, &live_all, &|_| live, &calm_reading)
+    }
+
+    /// [`holder_session_liveness`] for `holder` on a runner on `local`, whose
+    /// manager has `panes` (pinned id, root pid) live and whose process table
+    /// shows a `claude` under the roots in `claude_roots`, or cannot be read.
+    async fn holder_live(
+        holder: &HolderRef,
+        local: uuid::Uuid,
+        panes: &[(&str, u32)],
+        probe: Result<&[u32], &str>,
+    ) -> bool {
+        let probe = probe.map(<[u32]>::to_vec).map_err(str::to_string);
+        holder_session_liveness(
             holder,
-            &live_all,
-            &holder_session_liveness(local, |id| pinned.contains(&id)),
-            &calm_reading,
+            local,
+            |id| {
+                panes
+                    .iter()
+                    .filter(|(pin, _)| *pin == id)
+                    .map(|(_, root)| *root)
+                    .collect()
+            },
+            move |roots: Vec<u32>| async move {
+                probe.map(|claude_roots| roots.iter().any(|r| claude_roots.contains(r)))
+            },
         )
+        .await
     }
 
     #[test]
@@ -16399,12 +16609,7 @@ mod tests {
         clear_continuation_registry();
         let device = uuid::Uuid::now_v7();
 
-        let (verdict, permit) = holder_guard(
-            Some("claim:phase-3"),
-            Some(&holder_on(device)),
-            device,
-            &[HOLDER_SESSION],
-        );
+        let (verdict, permit) = holder_guard(Some("claim:phase-3"), Some(&holder_on(device)), true);
         assert_eq!(
             verdict,
             ContinuationGuard::HolderSessionLive(HOLDER_SESSION.to_string())
@@ -16418,32 +16623,113 @@ mod tests {
         clear_continuation_registry();
     }
 
-    /// Every UNKNOWN reading dispatches: a missed resume costs more than a
-    /// duplicate (plan D4).
+    /// No holder, or a holder read as not live, dispatches.
     #[test]
-    fn an_unknown_holder_dispatches_as_today() {
+    fn a_holder_not_read_as_live_dispatches_as_today() {
         let _env_lock = env_lock();
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
         let device = uuid::Uuid::now_v7();
-        let elsewhere = uuid::Uuid::now_v7();
-
-        // On another device, even with a same-named pin here.
         assert_eq!(
-            holder_guard(None, Some(&holder_on(elsewhere)), device, &[HOLDER_SESSION]).0,
+            holder_guard(None, Some(&holder_on(device)), false).0,
             ContinuationGuard::Proceed
         );
-        // On this device, with no terminal pinned to it.
-        assert_eq!(
-            holder_guard(None, Some(&holder_on(device)), device, &["another-session"]).0,
-            ContinuationGuard::Proceed
-        );
-        // No holder at all.
-        assert_eq!(
-            holder_guard(None, None, device, &[HOLDER_SESSION]).0,
-            ContinuationGuard::Proceed
-        );
+        assert_eq!(holder_guard(None, None, true).0, ContinuationGuard::Proceed);
         clear_continuation_registry();
+    }
+
+    /// Live only with a `claude` inside a pinned pane on this device.
+    #[tokio::test]
+    async fn a_pinned_pane_holds_only_with_a_live_claude_in_it() {
+        let device = uuid::Uuid::now_v7();
+        let holder = holder_on(device);
+        let pane = [(HOLDER_SESSION, 4242u32)];
+        assert!(
+            holder_live(&holder, device, &pane, Ok(&[4242])).await,
+            "claude running in the pinned pane holds"
+        );
+        assert!(
+            !holder_live(&holder, device, &pane, Ok(&[])).await,
+            "a pinned pane with only its shell left must dispatch"
+        );
+        assert!(
+            !holder_live(
+                &holder,
+                device,
+                &pane,
+                Err("the process table is unreadable")
+            )
+            .await,
+            "an unreadable probe must dispatch"
+        );
+        assert!(
+            holder_live(
+                &holder,
+                device,
+                &[(HOLDER_SESSION, 1), (HOLDER_SESSION, 2)],
+                Ok(&[2])
+            )
+            .await,
+            "any one pane carrying the pin is enough"
+        );
+    }
+
+    /// The cheap checks gate the probe: a holder elsewhere, or with no pinned
+    /// pane here, is UNKNOWN without the process table ever being read.
+    #[tokio::test]
+    async fn an_unseen_holder_is_unknown_and_never_probed() {
+        let device = uuid::Uuid::now_v7();
+        let never = |_: Vec<u32>| async { panic!("the process table must not be read") };
+        let pane = |id: &str| {
+            if id == HOLDER_SESSION {
+                vec![7]
+            } else {
+                vec![]
+            }
+        };
+        assert!(
+            !holder_session_liveness(&holder_on(uuid::Uuid::now_v7()), device, pane, never).await,
+            "a holder on another device"
+        );
+        assert!(
+            !holder_session_liveness(&holder_on(device), device, |_| Vec::new(), never).await,
+            "no pane here carries the pin"
+        );
+    }
+
+    /// The production probe over a real snapshot shape: a pane whose shell has
+    /// a `claude` child is live, a bare shell is not, and an empty table is
+    /// unreadable rather than "no claude".
+    #[test]
+    fn the_pane_probe_finds_claude_only_under_the_pane() {
+        use crate::process_capture::process_tree::ProcessSnapshot;
+        let snapshot = |procs: &[(u32, u32, &str)]| {
+            let mut snap = ProcessSnapshot::default();
+            for &(pid, parent, name) in procs {
+                snap.parent_map.entry(parent).or_default().push(pid);
+                snap.parent_map.entry(pid).or_default();
+                snap.names.insert(pid, name.to_string());
+            }
+            snap
+        };
+        let with_claude = snapshot(&[(100, 1, "bash"), (101, 100, "claude")]);
+        let shell_only = snapshot(&[(100, 1, "bash"), (102, 100, "vim"), (200, 1, "claude")]);
+        assert_eq!(claude_under_any_root(&[100], &with_claude), Ok(true));
+        assert_eq!(
+            claude_under_any_root(&[100], &shell_only),
+            Ok(false),
+            "a claude elsewhere on the box is not in this pane"
+        );
+        assert_eq!(claude_under_any_root(&[300, 100], &with_claude), Ok(true));
+        assert!(claude_under_any_root(&[100], &ProcessSnapshot::default()).is_err());
+    }
+
+    /// A probe that never answers is cut off and reads as not live.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_probe_times_out_as_not_live() {
+        let device = uuid::Uuid::now_v7();
+        let hung = |_: Vec<u32>| std::future::pending::<Result<bool, String>>();
+        assert!(!holder_session_liveness(&holder_on(device), device, |_| vec![7], hung).await);
     }
 
     /// The anchor dedup outranks the hold and pays for no holder read: the
@@ -16484,13 +16770,10 @@ mod tests {
         let holder = holder_on(device);
 
         let live_all = |_id: &str| true;
-        let (verdict, _none) = evaluate_continuation_guard(
-            None,
-            Some(&holder),
-            &live_all,
-            &holder_session_liveness(device, |_| true),
-            &|| panic!("a held row must not read the machine"),
-        );
+        let (verdict, _none) =
+            evaluate_continuation_guard(None, Some(&holder), &live_all, &|_| true, &|| {
+                panic!("a held row must not read the machine")
+            });
         assert_eq!(
             verdict,
             ContinuationGuard::HolderSessionLive(HOLDER_SESSION.to_string())
@@ -16513,12 +16796,15 @@ mod tests {
         let gate = uuid::Uuid::now_v7();
         let anchor = "claim:redelivered";
         let target = ConsumeTarget::Gate(gate, 0);
-        assert!(should_post_deferred_stamp(gate, std::time::Instant::now()));
+        assert!(should_post_deferred_stamp(
+            gate,
+            &holder_session_live_stamp_reason(HOLDER_SESSION),
+            std::time::Instant::now()
+        ));
 
         // First delivery: claimed, then held.
         assert!(claim_gate_dispatch(gate));
-        let (verdict, permit) =
-            holder_guard(Some(anchor), Some(&holder), device, &[HOLDER_SESSION]);
+        let (verdict, permit) = holder_guard(Some(anchor), Some(&holder), true);
         assert_eq!(
             verdict,
             ContinuationGuard::HolderSessionLive(HOLDER_SESSION.to_string())
@@ -16536,8 +16822,7 @@ mod tests {
         // Still live on the next listing: the row reaches the guard and holds
         // again rather than being dropped as a duplicate delivery.
         assert!(claim_gate_dispatch(gate), "a hold must release the gate id");
-        let (verdict, permit) =
-            holder_guard(Some(anchor), Some(&holder), device, &[HOLDER_SESSION]);
+        let (verdict, permit) = holder_guard(Some(anchor), Some(&holder), true);
         assert!(matches!(verdict, ContinuationGuard::HolderSessionLive(_)));
         drop(permit);
         defer_continuation_unclaimed(
@@ -16550,7 +16835,7 @@ mod tests {
         // The holder's terminal is gone: the same gate now dispatches, owning
         // the anchor and one projected spawn like any other `Proceed`.
         assert!(claim_gate_dispatch(gate));
-        let (verdict, permit) = holder_guard(Some(anchor), Some(&holder), device, &[]);
+        let (verdict, permit) = holder_guard(Some(anchor), Some(&holder), false);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         assert!(anchor_is_reserved(anchor));
         assert_eq!(reserved_spawns_now(), 1);
@@ -16578,8 +16863,8 @@ mod tests {
     }
 
     #[test]
-    fn no_runtime_means_no_pinned_terminal() {
-        assert!(!live_pinned_terminal_predicate()(HOLDER_SESSION));
+    fn no_runtime_means_no_pinned_pane() {
+        assert!(live_pinned_pane_roots()(HOLDER_SESSION).is_empty());
     }
 
     fn holder_frame(extra: serde_json::Value) -> GateContinuationPayload {

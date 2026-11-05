@@ -265,14 +265,19 @@ pub(crate) fn resolve_pinned_coord<'a>(
         .find_map(|(_, coord)| coord)
 }
 
-/// The rule behind [`TerminalManager::has_live_terminal_pinned_to`], over
-/// `(pinned harness id, alive)` for every terminal in the manager. Pure so it is
-/// unit-testable without a PTY.
-pub(crate) fn any_live_terminal_pinned<'a>(
-    mut terminals: impl Iterator<Item = (&'a str, bool)>,
+/// The rule behind [`TerminalManager::live_pane_roots_pinned_to`], over
+/// `(pinned harness id, alive, root pid)` for every terminal in the manager:
+/// the root pids of the live ones pinned to `claude_session_id`. A pane with no
+/// local process (a remote pane) has no subtree to probe and is left out. Pure
+/// so it is unit-testable without a PTY.
+pub(crate) fn live_pinned_pane_roots<'a>(
+    terminals: impl Iterator<Item = (&'a str, bool, Option<u32>)>,
     claude_session_id: &str,
-) -> bool {
-    terminals.any(|(pinned, alive)| alive && pinned == claude_session_id)
+) -> Vec<u32> {
+    terminals
+        .filter(|(pinned, alive, _)| *alive && *pinned == claude_session_id)
+        .filter_map(|(_, _, root)| root)
+        .collect()
 }
 
 impl TerminalManager {
@@ -329,18 +334,19 @@ impl TerminalManager {
         )
     }
 
-    /// Is a live terminal in this manager pinned to `pinned_session_id`? Unlike
-    /// [`Self::coord_session_id_for_pinned`] it does not need that terminal to
-    /// have a coord row. A poisoned lock answers `false`, so a caller that reads
-    /// `false` as "not known to be live" stays correct.
-    pub fn has_live_terminal_pinned_to(&self, pinned_session_id: &str) -> bool {
+    /// The root pids of the live panes in this manager pinned to
+    /// `pinned_session_id`, for a probe of what runs inside them. Unlike
+    /// [`Self::coord_session_id_for_pinned`] it does not need a coord row. A
+    /// poisoned lock answers empty, so a caller that reads empty as "not known
+    /// to be live" stays correct.
+    pub fn live_pane_roots_pinned_to(&self, pinned_session_id: &str) -> Vec<u32> {
         let Ok(sessions) = self.sessions.lock() else {
-            return false;
+            return Vec::new();
         };
-        any_live_terminal_pinned(
+        live_pinned_pane_roots(
             sessions
                 .values()
-                .map(|s| (s.pinned_session_id(), s.is_alive())),
+                .map(|s| (s.pinned_session_id(), s.is_alive(), s.child_pid())),
             pinned_session_id,
         )
     }
@@ -1368,26 +1374,27 @@ mod tests {
         );
     }
 
-    /// A pinned terminal counts only while it is alive, and only for its own id.
-    /// A terminal needs no coord row to count, and one exited pin does not mask a
-    /// live re-spawn under the same id.
+    /// A pinned pane counts only while it is alive, only for its own id, and only
+    /// with a local root to probe. A pane needs no coord row to count, and an
+    /// exited pin does not mask a live re-spawn under the same id.
     #[test]
-    fn any_live_terminal_pinned_requires_a_live_terminal_with_that_pin() {
-        use super::any_live_terminal_pinned;
+    fn live_pinned_pane_roots_lists_live_local_panes_with_that_pin() {
+        use super::live_pinned_pane_roots;
         let terminals = || {
             vec![
-                ("alive-1", true),
-                ("exited-1", false),
-                ("respawned", false),
-                ("respawned", true),
+                ("alive-1", true, Some(11)),
+                ("exited-1", false, Some(12)),
+                ("respawned", false, Some(13)),
+                ("respawned", true, Some(14)),
+                ("remote", true, None),
             ]
             .into_iter()
         };
-        assert!(any_live_terminal_pinned(terminals(), "alive-1"));
-        assert!(any_live_terminal_pinned(terminals(), "respawned"));
-        assert!(!any_live_terminal_pinned(terminals(), "exited-1"));
-        assert!(!any_live_terminal_pinned(terminals(), "never-seen"));
-        assert!(!any_live_terminal_pinned(std::iter::empty(), "alive-1"));
+        assert_eq!(live_pinned_pane_roots(terminals(), "alive-1"), vec![11]);
+        assert_eq!(live_pinned_pane_roots(terminals(), "respawned"), vec![14]);
+        assert!(live_pinned_pane_roots(terminals(), "exited-1").is_empty());
+        assert!(live_pinned_pane_roots(terminals(), "remote").is_empty());
+        assert!(live_pinned_pane_roots(terminals(), "never-seen").is_empty());
     }
 
     /// Every close path clears BOTH remote maps. `close` and `close_all`
