@@ -6212,9 +6212,11 @@ fn spawn_gate_continuation_task(payload: GateContinuationPayload, device_id: uui
 ///    — run FIRST so a locally-rejected dispatch never burns a coord-side claim
 ///    (contract item 4), and so a machine already short of memory or threads
 ///    never pays a `git worktree add` before being told to wait.
-/// 1c. Resolve `claude` ONCE and probe it with the exec seam's predicate; an
-///    unlaunchable CLI defers UNCLAIMED (`claude_cli_unavailable:<kind>`), and
-///    the same string is what the presentation execs ([`pre_claim_step`]).
+///
+///    Then (1c) resolve `claude` ONCE and probe it with the exec seam's
+///    predicate; an unlaunchable CLI defers UNCLAIMED
+///    (`claude_cli_unavailable:<kind>`), and the same string is what the
+///    presentation execs ([`pre_claim_step`]).
 /// 2. **CLAIM** ([`ConsumeTarget::Gate`] only): POST the consume CLAIM and AWAIT
 ///    it. `409 cancelled` → log INFO + SKIP the spawn entirely; network/other
 ///    error → WARN + PROCEED. The work-unit path has no claim-before-spawn (the
